@@ -8,6 +8,22 @@ def _run_notebook_until_modeling(nb_path: Path):
     nb = json.loads(nb_path.read_text(encoding="utf-8"))
     g = {"__name__": "__main__"}
 
+    rx_side_factor = float(os.environ.get("RX_SIDE_OFFSET_FACTOR", "1.0"))
+    side_core_surface_gap = float(os.environ.get("SIDE_CORE_SURFACE_GAP", "20.0"))
+    rx_space_width_factor = float(os.environ.get("RX_SIDE_SPACE_WIDTH_FACTOR", "1.0"))
+
+    def _apply_rx_overrides(src: str) -> str:
+        src = src.replace("side_core_surface_gap = 20", f"side_core_surface_gap = {side_core_surface_gap}")
+        src = src.replace(
+            "rx_side_offset = l2 + 1.5*l1",
+            f"rx_side_offset = (l2 + 1.5*l1) * {rx_side_factor}",
+        )
+        src = src.replace(
+            "space_width_side = w1 + 2*side_core_surface_gap",
+            f"space_width_side = (w1 + 2*side_core_surface_gap) * {rx_space_width_factor}",
+        )
+        return src
+
     marker = "# ======== 여기까지가 현재 작업한 코드고 밑에는 예전 코드 입니다 ========"
 
     for idx, cell in enumerate(nb.get("cells", []), start=1):
@@ -17,6 +33,8 @@ def _run_notebook_until_modeling(nb_path: Path):
         src = "".join(cell.get("source", []))
         if not src.strip():
             continue
+
+        src = _apply_rx_overrides(src)
 
         if marker in src:
             print(f"[INFO] Stop at marker cell #{idx}")
@@ -49,9 +67,11 @@ def _save_snapshots(g, out_dir: Path):
     modeler = design.modeler
 
     saved = []
+    seq = os.environ.get("SNAPSHOT_SEQ", "").strip()
+    prefix = f"{seq}_" if seq else ""
 
     # Try AEDT-native preview export (embedded preview image).
-    preview_path = out_dir / "design_preview.jpg"
+    preview_path = out_dir / f"{prefix}design_preview.jpg"
     try:
         if hasattr(design, "export_design_preview_to_jpg"):
             ok = design.export_design_preview_to_jpg(output_file=str(preview_path))
@@ -62,7 +82,7 @@ def _save_snapshots(g, out_dir: Path):
         print(f"[WARN] export_design_preview_to_jpg failed: {e}")
 
     # Preferred: AEDT model window export (does not require pyvista).
-    for orientation, name in [("isometric", "model_isometric.jpg"), ("top", "model_top.jpg")]:
+    for orientation, name in [("isometric", f"{prefix}model_isometric.jpg"), ("top", f"{prefix}model_top.jpg")]:
         out_path = out_dir / name
         try:
             if hasattr(design, "post") and hasattr(design.post, "export_model_picture"):
@@ -81,7 +101,7 @@ def _save_snapshots(g, out_dir: Path):
             print(f"[WARN] export_model_picture failed ({orientation}): {e}")
 
     # Optional: app-level plot export (requires pyvista).
-    plot_path = out_dir / "model_plot.png"
+    plot_path = out_dir / f"{prefix}model_plot.png"
     try:
         if hasattr(design, "plot"):
             result = design.plot(show=False, output_file=str(plot_path))
@@ -93,9 +113,9 @@ def _save_snapshots(g, out_dir: Path):
 
     # Try object-level export_image using representative objects.
     for key, file_name in [
-        ("core", "core_export.png"),
-        ("Tx_windings", "tx_export.png"),
-        ("Rx_windings", "rx_export.png"),
+            ("core", f"{prefix}core_export.png"),
+            ("Tx_windings", f"{prefix}tx_export.png"),
+            ("Rx_windings", f"{prefix}rx_export.png"),
     ]:
         target = g.get(key)
         if target is None:
@@ -114,7 +134,7 @@ def _save_snapshots(g, out_dir: Path):
             print(f"[WARN] export_image failed for {key}: {e}")
 
     # Save model object names as fallback evidence.
-    names_path = out_dir / "model_objects.txt"
+    names_path = out_dir / f"{prefix}model_objects.txt"
     try:
         names = list(modeler.object_names)
         names_path.write_text("\n".join(names), encoding="utf-8")
@@ -129,7 +149,10 @@ def main():
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
     nb_path = root / "test_simulation.ipynb"
+    suffix = os.environ.get("SNAPSHOT_CASE", "").strip()
     out_dir = root / "picture" / "debug_snapshot"
+    if suffix:
+        out_dir = root / "picture" / "debug_sweep" / suffix
 
     g = None
     try:
