@@ -1,0 +1,48 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# OS and logs
+.DS_Store
+Thumbs.db
+*.log
+
+# ANSYS AEDT generated artifacts
+*.aedt.lock
+*.aedtresults/
+*.pyaedt/
+
+# Project runtime artifacts
+simulation_num.txt
+
+# Generated simulation outputs
+simulation/
+!simulation/.gitkeep
+
+# Picture folder image outputs only
+picture/**/*.png
+picture/**/*.jpg
+picture/**/*.jpeg
+picture/**/*.bmp
+picture/**/*.tif
+picture/**/*.tiff
+picture/**/*.gif
