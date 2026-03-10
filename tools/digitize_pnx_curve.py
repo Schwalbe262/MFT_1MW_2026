@@ -14,7 +14,7 @@ Y0, Y1 = 862, 1170
 
 # Axis calibration
 P_MIN, P_MAX = 0.01, 100.0
-B_MIN, B_MAX = 0.1, 1.2
+B_MIN, B_MAX = 0.1, 1.0
 B_AXIS_SCALE = "log10"
 
 # Digitization grid (more granular than 0.2T spacing)
@@ -255,6 +255,17 @@ def build_validation_report(data):
     return {"bounds_checks": checks, "all_passed": all(c["ok"] for c in checks) if checks else True}
 
 
+def max_rel_error_vs_guide(points, guide):
+    pmap = {float(b): float(p) for b, p in points}
+    rels = []
+    for b, g in guide:
+        p = pmap.get(float(b))
+        if p is None:
+            continue
+        rels.append(abs(p - g) / max(abs(g), 1e-12))
+    return max(rels) if rels else float("inf")
+
+
 def p_to_x_local(p):
     return p_to_x(p)
 
@@ -329,6 +340,12 @@ def main():
     for freq, guide in COARSE_GUIDE_POINTS.items():
         if freq not in data or is_curve_suspicious(data[freq]):
             data[freq] = complete_curve(guide, TARGET_B)
+            continue
+
+        # Even if shape checks pass, reject when coarse checkpoints deviate too much.
+        rel = max_rel_error_vs_guide(data[freq], guide)
+        if rel > 0.20:
+            data[freq] = complete_curve(guide, TARGET_B)
 
     enforce_visual_bounds(data)
 
@@ -345,6 +362,26 @@ def main():
             p_fixed = max(p, prev * 1.001 if prev > 0 else p)
             arr[idx] = (arr[idx][0], p_fixed)
             prev = p_fixed
+
+    # Keep B<1.0 points below the anchored 1.0T value per frequency.
+    for f, arr in data.items():
+        p_end = next((p for b, p in arr if abs(b - 1.0) < 1e-12), None)
+        if p_end is None:
+            continue
+        cap = p_end * 0.999
+        fixed = []
+        for b, p in arr:
+            if b < 1.0:
+                fixed.append((b, min(p, cap)))
+            else:
+                fixed.append((b, p))
+        prev = 0.0
+        mono = []
+        for b, p in fixed:
+            pp = max(p, prev * 1.001 if prev > 0 else p)
+            mono.append((b, pp))
+            prev = pp
+        data[f] = mono
 
     validation = build_validation_report(data)
     overlays = export_overlays(img, data)

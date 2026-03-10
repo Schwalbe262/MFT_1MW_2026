@@ -11,7 +11,7 @@ OUT_JSON = Path("material/posco_curves_digitized.json")
 DEBUG_ROOT = Path("picture/digitize_debug/posco_materials")
 
 P_MIN, P_MAX = 0.01, 100.0
-B_MIN, B_MAX = 0.1, 1.2
+B_MIN, B_MAX = 0.1, 1.0
 B_AXIS_SCALE = "log10"
 
 TARGET_B = [round(float(v), 4) for v in np.arange(0.2, 1.0 + 0.5 * 0.05, 0.05)]
@@ -92,7 +92,7 @@ def build_masks(img):
     }
 
 
-def pick_x_near(mask, x0, x1, y0, y1, y, ref_x, y_win=3, x_win=180):
+def pick_x_near(mask, x0, x1, y0, y1, y, ref_x, y_win=3, x_win=120):
     yy0 = max(y0, y - y_win)
     yy1 = min(y1, y + y_win)
     band = mask[yy0 : yy1 + 1, x0 : x1 + 1]
@@ -100,10 +100,40 @@ def pick_x_near(mask, x0, x1, y0, y1, y, ref_x, y_win=3, x_win=180):
     if xs.size == 0:
         return None
     x_abs = xs + x0
+
+    # Exclude right-side legend area on lower half of the plot.
+    if y >= int(y0 + 0.45 * (y1 - y0)):
+        x_abs = x_abs[x_abs < x1 - 45]
+        if x_abs.size == 0:
+            return None
+
     x_abs = x_abs[(x_abs >= ref_x - x_win) & (x_abs <= ref_x + x_win)]
     if x_abs.size == 0:
         return None
     return int(x_abs[np.argmin(np.abs(x_abs - ref_x))])
+
+
+def pick_control_points(mask, x0, x1, y0, y1, guide_points):
+    controls = []
+    for b, g in guide_points:
+        y = b_to_y(float(b), y0, y1)
+        x_ref = p_to_x(float(g), x0, x1)
+        x = pick_x_near(mask, x0, x1, y0, y1, y, x_ref, y_win=4, x_win=90)
+
+        if x is None:
+            controls.append((float(b), float(g), "guide_no_pixel"))
+            continue
+
+        p_ex = x_to_p(x, x0, x1)
+        rel = abs(p_ex - float(g)) / max(abs(float(g)), 1e-12)
+
+        # Keep extracted value only when it stays close to guide checkpoint.
+        if rel <= 0.20:
+            controls.append((float(b), float(p_ex), "pixel_refined"))
+        else:
+            controls.append((float(b), float(g), "guide_outlier_reject"))
+
+    return controls
 
 
 def complete_curve(points):
@@ -162,27 +192,13 @@ def digitize_material(img, cfg):
     x0, y0, x1, y1 = cfg["plot_box"]
     masks = build_masks(img)
     out = {}
+    control_used = {}
     for freq in ["50Hz", "200Hz", "400Hz", "800Hz", "1000Hz"]:
-        seed = cfg["anchor"].get(freq)
-        prev_x = p_to_x(seed, x0, x1) if seed is not None else None
-        pts = []
-        for b in sorted(TARGET_B, reverse=True):
-            y = b_to_y(b, y0, y1)
-            if prev_x is None:
-                continue
-            x = pick_x_near(masks[freq], x0, x1, y0, y1, y, prev_x)
-            if x is None:
-                continue
-            p = x_to_p(x, x0, x1)
-            pts.append((b, p))
-            prev_x = x
-
-        # Blend extracted points with guide checkpoints then complete.
         guide = cfg["guide"][freq]
-        merged = {float(b): float(p) for b, p in guide}
-        for b, p in pts:
-            merged[float(b)] = float(p)
-        completed = complete_curve(sorted(merged.items(), key=lambda t: t[0]))
+        controls = pick_control_points(masks[freq], x0, x1, y0, y1, guide)
+        control_used[freq] = controls
+        control_points = [(b, p) for b, p, _ in controls]
+        completed = complete_curve(sorted(control_points, key=lambda t: t[0]))
 
         # Force 1.0T table anchor for high-frequency columns.
         if freq in cfg["anchor"]:
@@ -201,7 +217,7 @@ def digitize_material(img, cfg):
             arr[idx] = (arr[idx][0], max(p, prev * 1.001 if prev > 0 else p))
             prev = arr[idx][1]
 
-    return out
+    return out, control_used
 
 
 def to_bfp(points_by_freq):
@@ -214,7 +230,7 @@ def to_bfp(points_by_freq):
     return out
 
 
-def save_overlays(material, img, cfg, points_by_freq):
+def save_overlays(material, img, cfg, points_by_freq, control_used):
     x0, y0, x1, y1 = cfg["plot_box"]
     out_dir = DEBUG_ROOT / material
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -240,6 +256,14 @@ def save_overlays(material, img, cfg, points_by_freq):
         color = colors[freq]
         roi = roi_raw.copy()
         d_roi = ImageDraw.Draw(roi)
+
+        # Coarse control points used for fitting (yellow squares).
+        for b, p, src in control_used.get(freq, []):
+            xx = p_to_x(p, x0, x1)
+            yy = b_to_y(b, y0, y1)
+            d_full.rectangle([xx - 4, yy - 4, xx + 4, yy + 4], outline=(255, 220, 0), width=2)
+            d_roi.rectangle([xx - x0 - 4, yy - y0 - 4, xx - x0 + 4, yy - y0 + 4], outline=(255, 220, 0), width=2)
+
         for b, p in arr:
             xx = p_to_x(p, x0, x1)
             yy = b_to_y(b, y0, y1)
@@ -259,7 +283,7 @@ def save_overlays(material, img, cfg, points_by_freq):
     }
 
 
-def build_validation(cfg, points_by_freq):
+def build_validation(cfg, points_by_freq, control_used):
     checks = []
     for freq, guide in cfg["guide"].items():
         arr = points_by_freq[freq]
@@ -271,7 +295,11 @@ def build_validation(cfg, points_by_freq):
                 continue
             rels.append(abs(p - g) / max(abs(g), 1e-12))
         max_rel = max(rels) if rels else None
-        checks.append({"frequency": freq, "max_rel_err_vs_guide": max_rel})
+        src_stats = {"pixel_refined": 0, "guide_outlier_reject": 0, "guide_no_pixel": 0}
+        for _, _, src in control_used.get(freq, []):
+            src_stats[src] = src_stats.get(src, 0) + 1
+
+        checks.append({"frequency": freq, "max_rel_err_vs_guide": max_rel, "control_source_stats": src_stats})
     return checks
 
 
@@ -279,10 +307,10 @@ def main():
     result = {"materials": {}}
     for material, cfg in MATERIALS.items():
         img = load_source_image(cfg)
-        points = digitize_material(img, cfg)
-        overlays = save_overlays(material, img, cfg, points)
+        points, controls = digitize_material(img, cfg)
+        overlays = save_overlays(material, img, cfg, points, controls)
         bfp = to_bfp(points)
-        validation = build_validation(cfg, points)
+        validation = build_validation(cfg, points, controls)
 
         result["materials"][material] = {
             "source": cfg["source"],
@@ -293,6 +321,7 @@ def main():
             },
             "overlay_images": overlays,
             "validation": validation,
+            "control_points": controls,
             "points_by_frequency": points,
             "points_bfp": bfp,
         }
