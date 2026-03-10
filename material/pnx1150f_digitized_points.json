@@ -18,6 +18,29 @@
       "scale": "log10"
     }
   },
+  "validation": {
+    "bounds_checks": [
+      {
+        "frequency": "800Hz",
+        "B": 0.4,
+        "min": 6.0,
+        "max": 7.0,
+        "value": 6.5,
+        "ok": true
+      }
+    ],
+    "all_passed": true
+  },
+  "overlay_images": {
+    "all": "picture/digitize_debug/pnx1150f/overlay_all_freq.png",
+    "per_frequency": {
+      "50Hz": "picture/digitize_debug/pnx1150f/overlay_50hz.png",
+      "200Hz": "picture/digitize_debug/pnx1150f/overlay_200hz.png",
+      "400Hz": "picture/digitize_debug/pnx1150f/overlay_400hz.png",
+      "800Hz": "picture/digitize_debug/pnx1150f/overlay_800hz.png",
+      "1000Hz": "picture/digitize_debug/pnx1150f/overlay_1000hz.png"
+    }
+  },
   "points_by_frequency": {
     "50Hz": [
       [

@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 IMG_PATH = Path("material/PNX1150F.png")
@@ -239,6 +239,72 @@ def enforce_visual_bounds(data):
             data[freq] = complete_curve(arr, TARGET_B)
 
 
+def value_at_b(points, b):
+    idx = next((i for i, (bb, _) in enumerate(points) if abs(float(bb) - float(b)) < 1e-12), None)
+    if idx is None:
+        return None
+    return float(points[idx][1])
+
+
+def build_validation_report(data):
+    checks = []
+    for (freq, b), (lo, hi) in VISUAL_BOUNDS.items():
+        p = value_at_b(data.get(freq, []), b)
+        ok = p is not None and lo <= p <= hi
+        checks.append({"frequency": freq, "B": b, "min": lo, "max": hi, "value": p, "ok": ok})
+    return {"bounds_checks": checks, "all_passed": all(c["ok"] for c in checks) if checks else True}
+
+
+def p_to_x_local(p):
+    return p_to_x(p)
+
+
+def b_to_y_local(b):
+    return b_to_y(b)
+
+
+def export_overlays(img, data):
+    out_dir = Path("picture/digitize_debug/pnx1150f")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    colors = {
+        "50Hz": (0, 0, 0),
+        "200Hz": (220, 60, 60),
+        "400Hz": (40, 120, 220),
+        "800Hz": (60, 170, 90),
+        "1000Hz": (160, 90, 200),
+    }
+
+    full = Image.fromarray(img.copy())
+    d_full = ImageDraw.Draw(full)
+    d_full.rectangle([X0, Y0, X1, Y1], outline=(255, 120, 0), width=2)
+
+    freq_files = {}
+    for freq, pts in data.items():
+        color = colors.get(freq, (255, 255, 0))
+        roi = Image.fromarray(img[Y0 : Y1 + 1, X0 : X1 + 1].copy())
+        d_roi = ImageDraw.Draw(roi)
+        d_roi.rectangle([0, 0, X1 - X0, Y1 - Y0], outline=(255, 120, 0), width=2)
+
+        for b, p in pts:
+            x = p_to_x_local(p)
+            y = b_to_y_local(b)
+            d_full.ellipse([x - 3, y - 3, x + 3, y + 3], fill=color)
+            d_roi.ellipse([x - X0 - 3, y - Y0 - 3, x - X0 + 3, y - Y0 + 3], fill=color)
+
+        path = out_dir / f"overlay_{freq.lower()}.png"
+        roi.save(path)
+        freq_files[freq] = str(path).replace("\\", "/")
+
+    full_path = out_dir / "overlay_all_freq.png"
+    full.save(full_path)
+
+    return {
+        "all": str(full_path).replace("\\", "/"),
+        "per_frequency": freq_files,
+    }
+
+
 def main():
     img = np.array(Image.open(IMG_PATH).convert("RGB"))
     data = extract_points(img)
@@ -280,6 +346,9 @@ def main():
             arr[idx] = (arr[idx][0], p_fixed)
             prev = p_fixed
 
+    validation = build_validation_report(data)
+    overlays = export_overlays(img, data)
+
     payload = {
         "source_image": str(IMG_PATH).replace("\\", "/"),
         "plot_box": {"x0": X0, "x1": X1, "y0": Y0, "y1": Y1},
@@ -287,12 +356,16 @@ def main():
             "core_loss_w_per_kg": {"min": P_MIN, "max": P_MAX, "scale": "log10"},
             "magnetic_flux_density_t": {"min": B_MIN, "max": B_MAX, "scale": B_AXIS_SCALE},
         },
+        "validation": validation,
+        "overlay_images": overlays,
         "points_by_frequency": data,
     }
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUT_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"saved: {OUT_PATH}")
+    print("validation:", validation)
+    print("overlay:", overlays)
     for freq, pts in data.items():
         print(freq, pts)
 
