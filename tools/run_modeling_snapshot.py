@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ def _run_notebook_until_modeling(nb_path: Path):
     rx_side_factor = float(os.environ.get("RX_SIDE_OFFSET_FACTOR", "1.0"))
     side_core_surface_gap = float(os.environ.get("SIDE_CORE_SURFACE_GAP", "20.0"))
     rx_space_width_factor = float(os.environ.get("RX_SIDE_SPACE_WIDTH_FACTOR", "1.0"))
+    core_steel_preset = os.environ.get("CORE_STEEL_PRESET", "").strip()
 
     def _apply_rx_overrides(src: str) -> str:
         src = src.replace("side_core_surface_gap = 20", f"side_core_surface_gap = {side_core_surface_gap}")
@@ -22,6 +24,12 @@ def _run_notebook_until_modeling(nb_path: Path):
             "space_width_side = w1 + 2*side_core_surface_gap",
             f"space_width_side = (w1 + 2*side_core_surface_gap) * {rx_space_width_factor}",
         )
+        if core_steel_preset:
+            src = re.sub(
+                r'selected_core_steel\s*=\s*"[^"]+"',
+                f'selected_core_steel = "{core_steel_preset}"',
+                src,
+            )
         return src
 
     marker = "# ======== 여기까지가 현재 작업한 코드고 밑에는 예전 코드 입니다 ========"

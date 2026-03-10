@@ -38,11 +38,5 @@ simulation_num.txt
 simulation/
 !simulation/.gitkeep
 
-# Picture folder image outputs only
-picture/**/*.png
-picture/**/*.jpg
-picture/**/*.jpeg
-picture/**/*.bmp
-picture/**/*.tif
-picture/**/*.tiff
-picture/**/*.gif
+# Picture debug outputs
+picture/
