@@ -15,8 +15,26 @@ Y0, Y1 = 862, 1170
 # Axis calibration
 P_MIN, P_MAX = 0.01, 100.0
 B_MIN, B_MAX = 0.1, 1.2
+B_AXIS_SCALE = "log10"
 
-TARGET_B = [0.2, 0.4, 0.6, 0.8, 1.0]
+# Digitization grid (more granular than 0.2T spacing)
+B_GRID_START = 0.2
+B_GRID_END = 1.0
+B_GRID_STEP = 0.05
+TARGET_B = [round(float(v), 4) for v in np.arange(B_GRID_START, B_GRID_END + 0.5 * B_GRID_STEP, B_GRID_STEP)]
+
+COARSE_GUIDE_POINTS = {
+    "50Hz": [(0.2, 0.04), (0.4, 0.15), (0.6, 0.35), (0.8, 0.62), (1.0, 0.95)],
+    "200Hz": [(0.2, 0.22), (0.4, 0.85), (0.6, 1.8), (0.8, 3.3), (1.0, 5.1)],
+    "400Hz": [(0.2, 0.55), (0.4, 2.0), (0.6, 4.5), (0.8, 7.8), (1.0, 10.6)],
+    "800Hz": [(0.2, 1.4), (0.4, 6.5), (0.6, 12.0), (0.8, 21.0), (1.0, 27.6)],
+    "1000Hz": [(0.2, 2.0), (0.4, 7.8), (0.6, 16.5), (0.8, 28.0), (1.0, 38.1)],
+}
+
+# Explicit visual sanity bounds from plot-grid inspection.
+VISUAL_BOUNDS = {
+    ("800Hz", 0.4): (6.0, 7.0),
+}
 
 # Anchor at B=1.0T (table or visually estimated)
 ANCHOR_P_AT_B1 = {
@@ -30,7 +48,11 @@ ANCHOR_P_AT_B1 = {
 
 def b_to_y(b):
     h = Y1 - Y0
-    y = Y1 - (float(b) - B_MIN) / (B_MAX - B_MIN) * h
+    if B_AXIS_SCALE == "log10":
+        t = (np.log10(float(b)) - np.log10(B_MIN)) / (np.log10(B_MAX) - np.log10(B_MIN))
+    else:
+        t = (float(b) - B_MIN) / (B_MAX - B_MIN)
+    y = Y1 - t * h
     return int(round(y))
 
 
@@ -139,6 +161,84 @@ def extract_points(img):
     return out
 
 
+def complete_curve(points, target_b):
+    if not points:
+        return []
+
+    pmap = {float(b): float(p) for b, p in points}
+    known = sorted((b, p) for b, p in pmap.items() if p > 0)
+    if len(known) == 1:
+        b0, p0 = known[0]
+        return [(b, p0) for b in target_b]
+
+    def interp_loglog(b, b1, p1, b2, p2):
+        lb = np.log10(float(b))
+        lb1, lb2 = np.log10(float(b1)), np.log10(float(b2))
+        lp1, lp2 = np.log10(float(p1)), np.log10(float(p2))
+        if abs(lb2 - lb1) < 1e-15:
+            return float(p1)
+        t = (lb - lb1) / (lb2 - lb1)
+        lp = lp1 + t * (lp2 - lp1)
+        return float(10 ** lp)
+
+    out = []
+    kb = [b for b, _ in known]
+    kp = [p for _, p in known]
+    for b in target_b:
+        b = float(b)
+        if b in pmap:
+            out.append((b, float(pmap[b])))
+            continue
+
+        if b < kb[0]:
+            p = interp_loglog(b, kb[0], kp[0], kb[1], kp[1])
+        elif b > kb[-1]:
+            p = interp_loglog(b, kb[-2], kp[-2], kb[-1], kp[-1])
+        else:
+            j = 1
+            while j < len(kb) and kb[j] < b:
+                j += 1
+            p = interp_loglog(b, kb[j - 1], kp[j - 1], kb[j], kp[j])
+        out.append((b, p))
+
+    # Enforce monotonic increase with B.
+    fixed = []
+    prev = 0.0
+    for b, p in sorted(out, key=lambda t: t[0]):
+        pp = max(float(p), prev * 1.001 if prev > 0 else float(p))
+        fixed.append((b, pp))
+        prev = pp
+    return fixed
+
+
+def is_curve_suspicious(points):
+    if len(points) != len(TARGET_B):
+        return True
+    vals = [float(p) for _, p in points]
+    if min(vals) <= 0:
+        return True
+    if vals[-1] / vals[0] < 4.0:
+        return True
+    # detect abrupt end jump often caused by legend contamination near high-B point
+    if len(vals) >= 2 and vals[-1] / max(vals[-2], 1e-12) > 2.0:
+        return True
+    # too many non-increasing steps
+    non_inc = sum(1 for i in range(len(vals) - 1) if vals[i + 1] <= vals[i])
+    return non_inc > 1
+
+
+def enforce_visual_bounds(data):
+    for (freq, b), (lo, hi) in VISUAL_BOUNDS.items():
+        arr = data.get(freq, [])
+        idx = next((i for i, (bb, _) in enumerate(arr) if abs(bb - b) < 1e-12), None)
+        if idx is None:
+            continue
+        p = arr[idx][1]
+        if p < lo or p > hi:
+            arr[idx] = (arr[idx][0], min(max(p, lo), hi))
+            data[freq] = complete_curve(arr, TARGET_B)
+
+
 def main():
     img = np.array(Image.open(IMG_PATH).convert("RGB"))
     data = extract_points(img)
@@ -155,24 +255,37 @@ def main():
         pts.sort(key=lambda t: t[0])
         data[freq] = pts
 
-    # Sanity repair for 1000Hz when legend contamination causes non-physical shape.
-    pts1000 = data.get("1000Hz", [])
-    if len(pts1000) == len(TARGET_B):
-        vals = [p for _, p in pts1000]
-        strictly_inc = all(vals[i] < vals[i + 1] for i in range(len(vals) - 1))
-        if not strictly_inc and "800Hz" in data and len(data["800Hz"]) == len(TARGET_B):
-            p800 = [p for _, p in data["800Hz"]]
-            scale = table_anchor["1000Hz"] / table_anchor["800Hz"]
-            repaired = [(b, p * scale) for (b, p) in data["800Hz"]]
-            repaired[-1] = (1.0, table_anchor["1000Hz"])
-            data["1000Hz"] = repaired
+    # Complete each curve over TARGET_B with log-log interpolation/extrapolation.
+    for freq in list(data.keys()):
+        data[freq] = complete_curve(data[freq], TARGET_B)
+
+    # Fallback to coarse guide interpolation when extracted curve looks suspicious.
+    for freq, guide in COARSE_GUIDE_POINTS.items():
+        if freq not in data or is_curve_suspicious(data[freq]):
+            data[freq] = complete_curve(guide, TARGET_B)
+
+    enforce_visual_bounds(data)
+
+    # Cross-frequency monotonicity per B: 50 <= 200 <= 400 <= 800 <= 1000.
+    freq_order = ["50Hz", "200Hz", "400Hz", "800Hz", "1000Hz"]
+    for b in TARGET_B:
+        prev = 0.0
+        for f in freq_order:
+            arr = data.get(f, [])
+            idx = next((i for i, (bb, _) in enumerate(arr) if abs(bb - b) < 1e-12), None)
+            if idx is None:
+                continue
+            p = arr[idx][1]
+            p_fixed = max(p, prev * 1.001 if prev > 0 else p)
+            arr[idx] = (arr[idx][0], p_fixed)
+            prev = p_fixed
 
     payload = {
         "source_image": str(IMG_PATH).replace("\\", "/"),
         "plot_box": {"x0": X0, "x1": X1, "y0": Y0, "y1": Y1},
         "axis": {
             "core_loss_w_per_kg": {"min": P_MIN, "max": P_MAX, "scale": "log10"},
-            "magnetic_flux_density_t": {"min": B_MIN, "max": B_MAX, "scale": "linear"},
+            "magnetic_flux_density_t": {"min": B_MIN, "max": B_MAX, "scale": B_AXIS_SCALE},
         },
         "points_by_frequency": data,
     }
