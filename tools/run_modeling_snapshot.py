@@ -1,11 +1,24 @@
 import json
+import importlib.util
 import os
 import re
 import sys
+import types
+from typing import Any
 from pathlib import Path
 
 
 def _run_notebook_until_modeling(nb_path: Path):
+    if importlib.util.find_spec("portalocker") is None:
+        portalocker_stub: Any = types.ModuleType("portalocker")
+        portalocker_stub.LOCK_EX = 0
+
+        def _lock_stub(*args, **kwargs):
+            return None
+
+        portalocker_stub.lock = _lock_stub
+        sys.modules["portalocker"] = portalocker_stub
+
     nb = json.loads(nb_path.read_text(encoding="utf-8"))
     g = {"__name__": "__main__"}
 
