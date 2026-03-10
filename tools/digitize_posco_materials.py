@@ -79,6 +79,36 @@ def p_to_x(p, x0, x1):
     return int(round(x0 + t * w))
 
 
+def detect_axis_pixels(img, plot_box):
+    x0, y0, x1, y1 = plot_box
+    roi = img[y0 : y1 + 1, x0 : x1 + 1]
+    h, w, _ = roi.shape
+    mask = np.any(roi < 245, axis=2)
+
+    row_counts = mask.sum(axis=1)
+    col_counts = mask.sum(axis=0)
+
+    full_rows = [i for i, v in enumerate(row_counts) if v >= int(w * 0.97)]
+    full_cols = [i for i, v in enumerate(col_counts) if v >= int(h * 0.97)]
+
+    if not full_rows or not full_cols:
+        return x0, y0, x1, y1
+
+    y_bottom_rel = max(full_rows)
+    top_candidates = [r for r in full_rows if 5 < r < y_bottom_rel - 20]
+    y_top_rel = min(top_candidates) if top_candidates else min(full_rows)
+
+    x_left_rel = min(full_cols)
+    x_right_rel = max(full_cols)
+
+    if x_right_rel - x_left_rel < int(0.6 * w):
+        x_left_rel, x_right_rel = 0, w - 1
+    if y_bottom_rel - y_top_rel < int(0.4 * h):
+        y_top_rel, y_bottom_rel = 0, h - 1
+
+    return x0 + x_left_rel, y0 + y_top_rel, x0 + x_right_rel, y0 + y_bottom_rel
+
+
 def build_masks(img):
     r = img[:, :, 0]
     g = img[:, :, 1]
@@ -189,13 +219,15 @@ def load_source_image(cfg):
 
 
 def digitize_material(img, cfg):
-    x0, y0, x1, y1 = cfg["plot_box"]
+    px0, py0, px1, py1 = cfg["plot_box"]
+    ax_x0, ax_y0, ax_x1, ax_y1 = detect_axis_pixels(img, cfg["plot_box"])
+
     masks = build_masks(img)
     out = {}
     control_used = {}
     for freq in ["50Hz", "200Hz", "400Hz", "800Hz", "1000Hz"]:
         guide = cfg["guide"][freq]
-        controls = pick_control_points(masks[freq], x0, x1, y0, y1, guide)
+        controls = pick_control_points(masks[freq], ax_x0, ax_x1, ax_y0, ax_y1, guide)
         control_used[freq] = controls
         control_points = [(b, p) for b, p, _ in controls]
         completed = complete_curve(sorted(control_points, key=lambda t: t[0]))
@@ -217,7 +249,7 @@ def digitize_material(img, cfg):
             arr[idx] = (arr[idx][0], max(p, prev * 1.001 if prev > 0 else p))
             prev = arr[idx][1]
 
-    return out, control_used
+    return out, control_used, {"x0": ax_x0, "y0": ax_y0, "x1": ax_x1, "y1": ax_y1}
 
 
 def to_bfp(points_by_freq):
@@ -230,8 +262,9 @@ def to_bfp(points_by_freq):
     return out
 
 
-def save_overlays(material, img, cfg, points_by_freq, control_used):
+def save_overlays(material, img, cfg, points_by_freq, control_used, axis_pixels):
     x0, y0, x1, y1 = cfg["plot_box"]
+    ax_x0, ax_y0, ax_x1, ax_y1 = axis_pixels["x0"], axis_pixels["y0"], axis_pixels["x1"], axis_pixels["y1"]
     out_dir = DEBUG_ROOT / material
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,6 +279,7 @@ def save_overlays(material, img, cfg, points_by_freq, control_used):
     full = Image.fromarray(img.copy())
     d_full = ImageDraw.Draw(full)
     d_full.rectangle([x0, y0, x1, y1], outline=(255, 130, 0), width=3)
+    d_full.rectangle([ax_x0, ax_y0, ax_x1, ax_y1], outline=(0, 220, 220), width=2)
 
     roi_raw = Image.fromarray(img[y0 : y1 + 1, x0 : x1 + 1].copy())
     roi_raw_path = out_dir / "curve_roi_raw.png"
@@ -256,17 +290,18 @@ def save_overlays(material, img, cfg, points_by_freq, control_used):
         color = colors[freq]
         roi = roi_raw.copy()
         d_roi = ImageDraw.Draw(roi)
+        d_roi.rectangle([ax_x0 - x0, ax_y0 - y0, ax_x1 - x0, ax_y1 - y0], outline=(0, 220, 220), width=2)
 
         # Coarse control points used for fitting (yellow squares).
         for b, p, src in control_used.get(freq, []):
-            xx = p_to_x(p, x0, x1)
-            yy = b_to_y(b, y0, y1)
+            xx = p_to_x(p, ax_x0, ax_x1)
+            yy = b_to_y(b, ax_y0, ax_y1)
             d_full.rectangle([xx - 4, yy - 4, xx + 4, yy + 4], outline=(255, 220, 0), width=2)
             d_roi.rectangle([xx - x0 - 4, yy - y0 - 4, xx - x0 + 4, yy - y0 + 4], outline=(255, 220, 0), width=2)
 
         for b, p in arr:
-            xx = p_to_x(p, x0, x1)
-            yy = b_to_y(b, y0, y1)
+            xx = p_to_x(p, ax_x0, ax_x1)
+            yy = b_to_y(b, ax_y0, ax_y1)
             d_full.ellipse([xx - 3, yy - 3, xx + 3, yy + 3], fill=color)
             d_roi.ellipse([xx - x0 - 3, yy - y0 - 3, xx - x0 + 3, yy - y0 + 3], fill=color)
         fpath = out_dir / f"overlay_{freq.lower()}.png"
@@ -307,14 +342,15 @@ def main():
     result = {"materials": {}}
     for material, cfg in MATERIALS.items():
         img = load_source_image(cfg)
-        points, controls = digitize_material(img, cfg)
-        overlays = save_overlays(material, img, cfg, points, controls)
+        points, controls, axis_pixels = digitize_material(img, cfg)
+        overlays = save_overlays(material, img, cfg, points, controls, axis_pixels)
         bfp = to_bfp(points)
         validation = build_validation(cfg, points, controls)
 
         result["materials"][material] = {
             "source": cfg["source"],
             "plot_box": cfg["plot_box"],
+            "axis_pixels": axis_pixels,
             "axis": {
                 "core_loss_w_per_kg": {"min": P_MIN, "max": P_MAX, "scale": "log10"},
                 "magnetic_flux_density_t": {"min": B_MIN, "max": B_MAX, "scale": B_AXIS_SCALE},

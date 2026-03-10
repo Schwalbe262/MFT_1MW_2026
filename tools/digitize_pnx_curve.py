@@ -12,6 +12,10 @@ OUT_PATH = Path("material/pnx1150f_digitized_points.json")
 X0, X1 = 1215, 1744
 Y0, Y1 = 862, 1170
 
+# Axis calibration pixel bounds inside plot box (auto-detected at runtime)
+AX_X0, AX_X1 = X0, X1
+AX_Y0, AX_Y1 = Y0, Y1
+
 # Axis calibration
 P_MIN, P_MAX = 0.01, 100.0
 B_MIN, B_MAX = 0.1, 1.0
@@ -47,26 +51,55 @@ ANCHOR_P_AT_B1 = {
 
 
 def b_to_y(b):
-    h = Y1 - Y0
+    h = AX_Y1 - AX_Y0
     if B_AXIS_SCALE == "log10":
         t = (np.log10(float(b)) - np.log10(B_MIN)) / (np.log10(B_MAX) - np.log10(B_MIN))
     else:
         t = (float(b) - B_MIN) / (B_MAX - B_MIN)
-    y = Y1 - t * h
+    y = AX_Y1 - t * h
     return int(round(y))
 
 
 def x_to_p(x):
-    w = X1 - X0
-    t = (float(x) - X0) / w
+    w = AX_X1 - AX_X0
+    t = (float(x) - AX_X0) / w
     logp = np.log10(P_MIN) + t * (np.log10(P_MAX) - np.log10(P_MIN))
     return float(10 ** logp)
 
 
 def p_to_x(p):
-    w = X1 - X0
+    w = AX_X1 - AX_X0
     t = (np.log10(float(p)) - np.log10(P_MIN)) / (np.log10(P_MAX) - np.log10(P_MIN))
-    return int(round(X0 + t * w))
+    return int(round(AX_X0 + t * w))
+
+
+def detect_axis_pixels(img):
+    roi = img[Y0 : Y1 + 1, X0 : X1 + 1]
+    h, w, _ = roi.shape
+    mask = np.any(roi < 245, axis=2)
+
+    row_counts = mask.sum(axis=1)
+    col_counts = mask.sum(axis=0)
+
+    full_rows = [i for i, v in enumerate(row_counts) if v >= int(w * 0.97)]
+    full_cols = [i for i, v in enumerate(col_counts) if v >= int(h * 0.97)]
+
+    if not full_rows or not full_cols:
+        return X0, X1, Y0, Y1
+
+    y_bottom_rel = max(full_rows)
+    top_candidates = [r for r in full_rows if 5 < r < y_bottom_rel - 20]
+    y_top_rel = min(top_candidates) if top_candidates else min(full_rows)
+
+    x_left_rel = min(full_cols)
+    x_right_rel = max(full_cols)
+
+    if x_right_rel - x_left_rel < int(0.6 * w):
+        x_left_rel, x_right_rel = 0, w - 1
+    if y_bottom_rel - y_top_rel < int(0.4 * h):
+        y_top_rel, y_bottom_rel = 0, h - 1
+
+    return X0 + x_left_rel, X0 + x_right_rel, Y0 + y_top_rel, Y0 + y_bottom_rel
 
 
 def build_masks(img):
@@ -289,6 +322,7 @@ def export_overlays(img, data):
     full = Image.fromarray(img.copy())
     d_full = ImageDraw.Draw(full)
     d_full.rectangle([X0, Y0, X1, Y1], outline=(255, 120, 0), width=2)
+    d_full.rectangle([AX_X0, AX_Y0, AX_X1, AX_Y1], outline=(0, 220, 220), width=2)
 
     freq_files = {}
     for freq, pts in data.items():
@@ -296,6 +330,7 @@ def export_overlays(img, data):
         roi = Image.fromarray(img[Y0 : Y1 + 1, X0 : X1 + 1].copy())
         d_roi = ImageDraw.Draw(roi)
         d_roi.rectangle([0, 0, X1 - X0, Y1 - Y0], outline=(255, 120, 0), width=2)
+        d_roi.rectangle([AX_X0 - X0, AX_Y0 - Y0, AX_X1 - X0, AX_Y1 - Y0], outline=(0, 220, 220), width=2)
 
         for b, p in pts:
             x = p_to_x_local(p)
@@ -317,7 +352,11 @@ def export_overlays(img, data):
 
 
 def main():
+    global AX_X0, AX_X1, AX_Y0, AX_Y1
+
     img = np.array(Image.open(IMG_PATH).convert("RGB"))
+    AX_X0, AX_X1, AX_Y0, AX_Y1 = detect_axis_pixels(img)
+
     data = extract_points(img)
 
     # Anchor table points for better consistency at B=1.0
@@ -389,6 +428,7 @@ def main():
     payload = {
         "source_image": str(IMG_PATH).replace("\\", "/"),
         "plot_box": {"x0": X0, "x1": X1, "y0": Y0, "y1": Y1},
+        "axis_pixels": {"x0": AX_X0, "x1": AX_X1, "y0": AX_Y0, "y1": AX_Y1},
         "axis": {
             "core_loss_w_per_kg": {"min": P_MIN, "max": P_MAX, "scale": "log10"},
             "magnetic_flux_density_t": {"min": B_MIN, "max": B_MAX, "scale": B_AXIS_SCALE},
