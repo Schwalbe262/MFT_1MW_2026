@@ -7,12 +7,16 @@
 #SBATCH -o ./log/SLURM.%N.%j.out
 #SBATCH -e ./log/SLURM.%N.%j.err
 
-set -euo pipefail
+set -eo pipefail
+export LC_ALL=${LC_ALL:-}
+export LANG=${LANG:-C.UTF-8}
 
 mkdir -p ./log
 
 source /etc/profile || true
 source /etc/profile.d/modules.sh || true
+
+set -u
 
 echo "=== before module ==="
 echo "HOST=$(hostname)"
