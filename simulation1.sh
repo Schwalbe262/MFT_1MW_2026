@@ -27,4 +27,4 @@ echo "HOST=$(hostname)"
 # export HOME=/gpfs/home1/r1jae262
 # cd /gpfs/home1/r1jae262/ANSYS
 
-python run_simulation.py
+python subprocess_run.py

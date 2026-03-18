@@ -133,7 +133,7 @@ def run(simulation=None):
         raise
     
     
-    design1 = project1.create_design(name="mawell_design", solver="maxwell3d", solution="AC Magnetic")
+    design1 = project1.create_design(name="maxwell_design", solver="maxwell3d", solution="AC Magnetic")
 
     # input_parameter = sim1.create_input_parameter()
     # sim1.set_variable(input_parameter)
@@ -195,7 +195,7 @@ except Exception as e:
     raise
 
 
-design1 = project1.create_design(name="mawell_design", solver="maxwell3d", solution="AC Magnetic")
+design1 = project1.create_design(name="maxwell_design", solver="maxwell3d", solution="AC Magnetic")
 
 # input_parameter = sim1.create_input_parameter()
 # sim1.set_variable(input_parameter)
@@ -212,7 +212,11 @@ while True :
 
 set_design_variables(sim.design1, sim.input_df)
 
-create_core(design=sim.design1, name="core", core_material="ferrite")
+sim.design1.set_power_ferrite(cm=1.38, x=1.51, y=1.74) # 1K101 parameter [W/m^3]
+power_ferrite_mat = sim.design1.materials["power_ferrite"]
+power_ferrite_mat.permeability = "3000"
+
+create_core(design=sim.design1, name="core", core_material="power_ferrite")
 
 
 
@@ -287,8 +291,9 @@ Rx_windings3, Rx_N3, Rx_coil_width3, Rx_coil_height3, Rx_coil_gap_x3, Rx_coil_ga
 Tx_neg_sheets, Tx_pos_sheets = create_coil_section(design=sim.design1, winding_obj=Tx_windings, sheet_prefix = None, plane = "ZX", rename_faces = False)
 
 Rx_neg_sheets_center, Rx_pos_sheets_center = create_coil_section(design=sim.design1, winding_obj=Rx_windings1, sheet_prefix = None, plane = "ZX", rename_faces = False)
-Rx_neg_sheets_side1, Rx_pos_sheets_side1 = create_coil_section(design=sim.design1, winding_obj=Rx_windings2, sheet_prefix = None, plane = "ZX", rename_faces = False)
-Rx_neg_sheets_side2, Rx_pos_sheets_side2 = create_coil_section(design=sim.design1, winding_obj=Rx_windings3, sheet_prefix = None, plane = "ZX", rename_faces = False)
+if df_plus["N2_side"].iloc[0] != 0 :
+    Rx_neg_sheets_side1, Rx_pos_sheets_side1 = create_coil_section(design=sim.design1, winding_obj=Rx_windings2, sheet_prefix = None, plane = "ZX", rename_faces = False)
+    Rx_neg_sheets_side2, Rx_pos_sheets_side2 = create_coil_section(design=sim.design1, winding_obj=Rx_windings3, sheet_prefix = None, plane = "ZX", rename_faces = False)
 
 
 tx_winding = sim.design1.assign_winding(
@@ -320,9 +325,10 @@ for idx, sheet in enumerate(Rx_neg_sheets_center, start=1):
     coil = sim.design1.assign_coil(sheet, conductors_number=1, polarity="Negative", name=f"Rx_center_coil{idx}")
     Rx_coil.append(coil)
 
-for idx, sheet in enumerate(Rx_neg_sheets_side1 + Rx_neg_sheets_side2, start=1):
-    coil = sim.design1.assign_coil(sheet, conductors_number=1, polarity="Positive", name=f"Rx_side_coil{idx}")
-    Rx_coil.append(coil)
+if df_plus["N2_side"].iloc[0] != 0 :
+    for idx, sheet in enumerate(Rx_neg_sheets_side1 + Rx_neg_sheets_side2, start=1):
+        coil = sim.design1.assign_coil(sheet, conductors_number=1, polarity="Positive", name=f"Rx_side_coil{idx}")
+        Rx_coil.append(coil)
 
 
 
@@ -332,6 +338,24 @@ sim.design1.add_winding_coils(assignment="Tx_winding", coils=[coil.name for coil
 sim.design1.add_winding_coils(assignment="Rx_winding", coils=[coil.name for coil in Rx_coil])
 
 sim.design1.assign_matrix(matrix_name="Matrix", assignment=["Tx_winding", "Rx_winding"])
+
+
+freq = 1e+3
+
+mu0 = 4 * math.pi * 1e-7
+mu_copper = mu0 
+sigma_copper = 58000000
+omega = 2 * math.pi * freq
+skin_depth = math.sqrt(2 / (omega * mu_copper * sigma_copper)) * 1e3 # in mm
+
+
+Tx_skin_depth_mesh = sim.design1.mesh.assign_skin_depth(
+    assignment=Tx_windings,
+    skin_depth=f'{skin_depth}mm',
+    triangulation_max_length='50mm',
+    layers_number="2",
+    name="Tx_winding_skin_depth"
+)
 
 
 air_region = sim.design1.modeler.create_air_region(x_pos=100.0, y_pos=100.0, z_pos=100.0, x_neg=100.0, y_neg=100.0, z_neg=100.0, is_percentage=True)

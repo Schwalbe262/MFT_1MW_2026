@@ -58,8 +58,13 @@ def create_input_parameter(param_list=None):
         
         N1 = get_random_value(lower=5, upper=10, resolution=1)
         N2 = N1 * 10
-        N2_side = round(N2 * get_random_value(lower=0, upper=0.6, resolution=0.01))
+        N2_side = round(N2 * get_random_value(lower=0, upper=0.5, resolution=0.01))
         N2_main = N2 - N2_side
+
+        # N1 = get_random_value(lower=2, upper=2, resolution=1)
+        # N2 = N1 * 5
+        # N2_side = round(N2 * get_random_value(lower=0, upper=0.6, resolution=0.01))
+        # N2_main = N2 - N2_side
         
         w1 = get_random_value(lower=300, upper=800, resolution=1)
         l1 = get_random_value(lower=50, upper=100, resolution=1)
@@ -194,8 +199,8 @@ def validation_check(input_df) :
     input_df_copy["sl1"] = [sl1]
     input_df_copy["sw1"] = [sw1]
 
-    sl2_main = 2*input_df_copy["l1"].iloc[0] + 2*input_df_copy["w2c_space_y"].iloc[0] + 2*input_df_copy["w1w2_space_y"].iloc[0] + 2*input_df_copy["nwl1"].iloc[0]
-    sw2_main = input_df_copy["w1"].iloc[0] + 2*input_df_copy["w2c_space_x"].iloc[0] + 2*input_df_copy["w1w2_space_x"].iloc[0] + 2*input_df_copy["nwl1"].iloc[0]
+    sl2_main = 2*input_df_copy["l1"].iloc[0] + 2*input_df_copy["w1c_space_y"].iloc[0] + 2*input_df_copy["w1w2_space_y"].iloc[0] + 2*input_df_copy["nwl1"].iloc[0]
+    sw2_main = input_df_copy["w1"].iloc[0] + 2*input_df_copy["w1c_space_x"].iloc[0] + 2*input_df_copy["w1w2_space_x"].iloc[0] + 2*input_df_copy["nwl1"].iloc[0]
     input_df_copy["sl2_main"] = [sl2_main]
     input_df_copy["sw2_main"] = [sw2_main]
 
