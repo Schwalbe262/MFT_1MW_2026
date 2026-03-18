@@ -135,7 +135,7 @@ GUI = False
 
 # with pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True) as desktop:
 
-desktop = pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True)
+desktop = pyDesktop(version="2025.2", non_graphical=GUI, close_on_exit=False, new_desktop=True)
 
 sim = Simulation(desktop=desktop)
 # run(simulation=sim)
