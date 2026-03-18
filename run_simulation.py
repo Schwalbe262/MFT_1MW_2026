@@ -325,6 +325,68 @@ sim.design1.setup.properties["Percent Error"] = 2.5 # 2.5
 sim.design1.setup.properties["Frequency Setup"] = f"1kHz"
 
 
+def save_geometry_views(design, output_dir, prefix="model"):
+    """Save model snapshots from multiple viewpoints."""
+    os.makedirs(output_dir, exist_ok=True)
+    saved_files = []
+
+    # Preferred: AEDT model-window export by orientation.
+    view_map = [
+        ("isometric", f"{prefix}_isometric.jpg"),
+        ("top", f"{prefix}_top.jpg"),
+        ("front", f"{prefix}_front.jpg"),
+        ("right", f"{prefix}_right.jpg"),
+        ("left", f"{prefix}_left.jpg"),
+        ("bottom", f"{prefix}_bottom.jpg"),
+        ("back", f"{prefix}_back.jpg"),
+    ]
+    for orientation, file_name in view_map:
+        out_path = os.path.join(output_dir, file_name)
+        try:
+            if hasattr(design, "post") and hasattr(design.post, "export_model_picture"):
+                design.post.export_model_picture(
+                    full_name=out_path,
+                    show_axis=True,
+                    show_grid=False,
+                    show_ruler=False,
+                    show_region=False,
+                    orientation=orientation,
+                )
+                if os.path.exists(out_path):
+                    saved_files.append(out_path)
+        except Exception as e:
+            print(f"[WARN] export_model_picture failed ({orientation}): {e}")
+
+    # Optional fallback: PyVista-based capture through design.plot.
+    # This works only when the plotting backend is available.
+    pyvista_path = os.path.join(output_dir, f"{prefix}_pyvista.png")
+    try:
+        if hasattr(design, "plot"):
+            design.plot(show=False, output_file=pyvista_path)
+            if os.path.exists(pyvista_path):
+                saved_files.append(pyvista_path)
+    except Exception as e:
+        print(f"[WARN] design.plot failed: {e}")
+
+    print("[INFO] Saved geometry views:")
+    for p in saved_files:
+        print(f" - {p}")
+
+    return saved_files
+
+
+# Save geometry snapshots next to this simulation project.
+save_geometry_views(
+    design=sim.design1,
+    output_dir=sim.project.path,
+    prefix=f"{sim.PROJECT_NAME}_geometry",
+)
+
+
+
+
+
+
 
 # import time
 # start_time = time.time()
