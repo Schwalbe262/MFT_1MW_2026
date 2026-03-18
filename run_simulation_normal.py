@@ -84,24 +84,23 @@ class Simulation() :
 
     def create_simulation_name(self):
 
+
         file_path = "./simulation_num.txt"
         simulation_dir = "./simulation"
         os.makedirs(simulation_dir, exist_ok=True)
 
-        # a+ 모드: 파일이 없으면 생성, 있으면 읽기/쓰기 가능
+        # 파일 생성 및 잠금
         with open(file_path, "a+", encoding="utf-8") as file:
-            # 파일 잠금: LOCK_EX는 배타적 잠금, 블로킹 모드로 실행 (Windows/Linux 호환)
             portalocker.lock(file, portalocker.LOCK_EX)
-
             file.seek(0)
             raw = file.read().strip()
 
-            # 기본은 파일 값 사용, 비어있거나 손상되었으면 복구 로직 사용
+            # simulation 넘버 결정
             if raw.isdigit():
-                content = int(raw)
+                current_num = int(raw)
             else:
-                content = 1
-                # 기존 simulation 폴더 기준으로 번호 복구 (동시 실행/비정상 종료 대비)
+                # 파일에 값이 없거나 손상, simulation 폴더 기준으로 찾기
+                current_num = 1
                 try:
                     existing_nums = []
                     for name in os.listdir(simulation_dir):
@@ -109,18 +108,18 @@ class Simulation() :
                         if m:
                             existing_nums.append(int(m.group(1)))
                     if existing_nums:
-                        content = max(existing_nums) + 1
+                        current_num = max(existing_nums) + 1
                 except Exception:
                     pass
 
-            self.num = content
-            self.PROJECT_NAME = f"simulation{content}"
-            content += 1
+            self.num = current_num
+            self.PROJECT_NAME = f"simulation{current_num}"
+            next_num = current_num + 1
 
-            # 파일 포인터를 처음으로 되돌리고, 파일 내용 초기화 후 새 값 쓰기
+            # 파일에 다음 넘버 저장
             file.seek(0)
             file.truncate()
-            file.write(str(next_content))
+            file.write(str(next_num))
             file.flush()
 
     def create_project(self) :
