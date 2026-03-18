@@ -141,6 +141,27 @@ def run(simulation=None):
     sim.project = project1
     sim.design1 = design1
 
+    oDesign = design1.odesign
+    oDesign.SetDesignSettings(
+        [
+            "NAME:Design Settings Data",
+            "Allow Material Override:=", False,
+            "Perform Minimal validation:=", False,
+            "EnabledObjects:="	, [],
+            "PerfectConductorThreshold:=", 1E+30,
+            "InsulatorThreshold:="	, 1,
+            "SolveFraction:="	, False,
+            "Multiplier:="		, "1",
+            "SkipMeshChecks:="	, True
+        ], 
+        [
+            "NAME:Model Validation Settings",
+            "EntityCheckLevel:="	, "Strict",
+            "IgnoreUnclassifiedObjects:=", False,
+            "SkipIntersectionChecks:=", False
+        ])
+
+
 
 
 
