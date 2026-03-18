@@ -175,8 +175,7 @@ class Simulation() :
         self.design1.main_core = create_core(design=self.design1, name="core", core_material="power_ferrite")
 
     def create_coil(self) :
-
-        self.design1.Tx_winding, self.design1.Rx_winding = self.design1.get_excitation(excitation_name=["Tx_winding", "Rx_winding"])
+        # New design starts without excitations. Windings are created later in assign_winding().
 
         self.Tx_windings, self.Tx_N, self.Tx_coil_width, self.Tx_coil_height, self.Tx_coil_gap_x, self.Tx_coil_gap_z = create_coil(
             design = self.design1,
@@ -265,7 +264,7 @@ class Simulation() :
             winding_type="Current", 
             is_solid=True, 
             current=f"{100*math.sqrt(2)}A",
-            name="Rx_winding1"
+            name="Rx_winding"
         )
 
     def assign_coil(self) :
