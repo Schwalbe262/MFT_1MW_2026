@@ -123,7 +123,7 @@ def create_coil(design, name, window_height, window_length, window_layer, N_inpu
 
             winding = design.modeler.create_polyline(
                 points=points, name=f"{name}_{i}_{j}", material="copper",xsection_orient="Auto",
-                xsection_type=shape, xsection_width=coil_width, xsection_height=coil_height, xsection_num_seg=36, xsection_topwidth=coil_width)
+                xsection_type=shape, xsection_width=coil_width, xsection_height=coil_height, xsection_num_seg=6, xsection_topwidth=coil_width)
             if color != None :
                 winding.color = color
             windings.append(winding)
