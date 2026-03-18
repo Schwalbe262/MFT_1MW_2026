@@ -32,9 +32,9 @@ def get_random_value(lower=None, upper=None, resolution=None):
 
 def create_input_parameter(param_list=None):
 
-    keys = ["N1", "N2", "N2_side", "w1", "l1", "l2", "h1", "w1c_space_x", "w1w2_space_x", "w2c_space_x",
+    keys = ["N1", "N2", "N2_main", "N2_side", "w1", "l1", "l2", "h1", "w1c_space_x", "w1w2_space_x", "w2c_space_x",
             "w1c_space_y", "w1w2_space_y", "w2w2_space_y", "w2c_space_y", "w1c_space_z", "w2c_space_z",
-            "window_ratio", "wh1", "wh2", "wff1", "wff2", "Nff1", "Nff2"]
+            "window_ratio", "wh1", "wh2", "wff1", "wff2"]
 
     # param_list not None case (검증 케이스)
     if param_list is not None:
@@ -57,8 +57,9 @@ def create_input_parameter(param_list=None):
     else:
         
         N1 = get_random_value(lower=5, upper=10, resolution=1)
-        N2 = N1
+        N2 = N1 * 10
         N2_side = round(N2 * get_random_value(lower=0, upper=0.6, resolution=0.01))
+        N2_main = N2 - N2_side
         
         w1 = get_random_value(lower=300, upper=800, resolution=1)
         l1 = get_random_value(lower=50, upper=100, resolution=1)
@@ -82,17 +83,15 @@ def create_input_parameter(param_list=None):
         window_ratio = get_random_value(lower=0.3, upper=0.7, resolution=0.01)
 
         wh1 = get_random_value(lower=0.5, upper=1.0, resolution=0.01)
-        wh2 = get_random_value(lower=0.5, upper=1.0, resolution=0.01)
+        wh2 = get_random_value(lower=0.8, upper=1.0, resolution=0.01)
 
         wff1 = get_random_value(lower=1.0, upper=1.0, resolution=0.01)
-        wff2 = get_random_value(lower=0.5, upper=1.0, resolution=0.01)
-
-        Nff1 = get_random_value(lower=0.5, upper=1.0, resolution=0.01)
-        Nff2 = get_random_value(lower=1.0, upper=1.0, resolution=0.01)
+        wff2 = get_random_value(lower=0.4, upper=0.75, resolution=0.01)
 
         param_values = [
             N1,
             N2,
+            N2_main,
             N2_side,
             w1,
             l1,
@@ -112,8 +111,6 @@ def create_input_parameter(param_list=None):
             wh2,
             wff1,
             wff2,
-            Nff1,
-            Nff2
         ]
         param_df = pd.DataFrame([param_values], columns=keys)
 
@@ -140,5 +137,97 @@ def set_design_variables(design, input_parameter):
         value = input_parameter.iloc[0][key]
         unit = units.get(key, "")
         design.set_variable(variable_name=key, value=value, unit=unit)
+
+
+
+def validation_check(input_df) :
+
+    result = True
+
+    input_df_copy = input_df.copy()
+
+    if input_df_copy["N2_side"].iloc[0] != 0:
+        nwl_t = input_df_copy["l2"].iloc[0] - input_df_copy["w1c_space_y"].iloc[0] - input_df_copy["w1w2_space_y"].iloc[0] - input_df_copy["w2c_space_y"].iloc[0] - input_df_copy["w2w2_space_y"].iloc[0]
+    else:
+        nwl_t = input_df_copy["l2"].iloc[0] - input_df_copy["w1c_space_y"].iloc[0] - input_df_copy["w1w2_space_y"].iloc[0] - input_df_copy["w2c_space_y"].iloc[0]
+    input_df_copy["nwl_t"] = [nwl_t]
+
+    N2_main = input_df_copy["N2_main"].iloc[0]
+    N2_side = input_df_copy["N2_side"].iloc[0]
+
+    # net window length
+    nwl1 = nwl_t * input_df_copy["window_ratio"].iloc[0]
+    nwl2 = nwl_t - nwl1
+    nwl2_main = nwl2 * (N2_main) / (N2_main + N2_side)
+    nwl2_side = nwl2 * (N2_side) / (N2_main + N2_side)
+    input_df_copy["nwl1"] = [nwl1]
+    input_df_copy["nwl2"] = [nwl2]
+    input_df_copy["nwl2_main"] = [nwl2_main]
+    input_df_copy["nwl2_side"] = [nwl2_side]
+    
+    # net window height
+    nwh1 = (input_df_copy["h1"].iloc[0] - 2*input_df_copy["w1c_space_z"].iloc[0]) * input_df_copy["wh1"].iloc[0]
+    nwh2 = (input_df_copy["h1"].iloc[0] - 2*input_df_copy["w2c_space_z"].iloc[0]) * input_df_copy["wh2"].iloc[0]
+    input_df_copy["nwh1"] = [nwh1]
+    input_df_copy["nwh2"] = [nwh2]
+
+    coil_width1 = nwl1 * input_df_copy["wff1"].iloc[0]
+    coil_width2 = (nwl2 * input_df_copy["wff2"].iloc[0]) / input_df_copy["N2"].iloc[0]
+    input_df_copy["coil_width1"] = [coil_width1]
+    input_df_copy["coil_width2"] = [coil_width2]
+
+    
+    # 2차 측의 권선 간 간격
+    coil_gap_layer = (nwl2 - (coil_width2 * input_df_copy["N2"].iloc[0])) / (input_df_copy["N2"].iloc[0] - 1)
+    input_df_copy["coil_gap_layer"] = [coil_gap_layer]
+    # 1차 측의 높이 방향 권선 간 간격
+    coil_gap_height = (nwh1 - (coil_width1 * input_df_copy["N1"].iloc[0])) / (input_df_copy["N1"].iloc[0] - 1)
+    input_df_copy["coil_gap_height"] = [coil_gap_height]
+    # 1차 측의 fill factor
+    fill_factor = coil_width1*input_df_copy["N1"].iloc[0] / nwh1
+    input_df_copy["fill_factor"] = [fill_factor]
+
+
+    # window의 내부 gap 공간 크기 (space length / space width)
+    sl1 = 2*input_df_copy["l1"].iloc[0] + 2*input_df_copy["w1c_space_y"].iloc[0]
+    sw1 = input_df_copy["w1"].iloc[0] + 2*input_df_copy["w1c_space_x"].iloc[0]
+    input_df_copy["sl1"] = [sl1]
+    input_df_copy["sw1"] = [sw1]
+
+    sl2_main = 2*input_df_copy["l1"].iloc[0] + 2*input_df_copy["w2c_space_y"].iloc[0] + 2*input_df_copy["w1w2_space_y"].iloc[0] + 2*input_df_copy["nwl1"].iloc[0]
+    sw2_main = input_df_copy["w1"].iloc[0] + 2*input_df_copy["w2c_space_x"].iloc[0] + 2*input_df_copy["w1w2_space_x"].iloc[0] + 2*input_df_copy["nwl1"].iloc[0]
+    input_df_copy["sl2_main"] = [sl2_main]
+    input_df_copy["sw2_main"] = [sw2_main]
+
+    sl2_side = input_df_copy["l1"].iloc[0] + 2*input_df_copy["w2c_space_y"].iloc[0]
+    sw2_side = input_df_copy["w1"].iloc[0] + 2*input_df_copy["w2c_space_x"].iloc[0]
+    input_df_copy["sl2_side"] = [sl2_side]
+    input_df_copy["sw2_side"] = [sw2_side]
+
+
+
+
+    if nwl_t < 0 :
+        result = False
+    if nwl1 < 0 :
+        result = False
+    if nwl2 < 0 :
+        result = False
+    if nwh1 < 0 :
+        result = False
+    if nwh2 < 0 :
+        result = False
+    if coil_width1 < 20 :
+        result = False
+    if coil_width2 < 0.5 :
+        result = False
+    if coil_gap_layer < 0.3 :
+        result = False
+    if coil_gap_height < 3 :
+        result = False
+
+       
+
+    return result, input_df_copy
 
 
