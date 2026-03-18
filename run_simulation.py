@@ -325,7 +325,7 @@ sim.design1.setup.properties["Percent Error"] = 2.5 # 2.5
 sim.design1.setup.properties["Frequency Setup"] = f"1kHz"
 
 
-def save_geometry_views(design, output_dir, prefix="model"):
+def save_geometry_views(design, output_dir, prefix="model", enable_pyvista_snapshot=False):
     """Save model snapshots from multiple viewpoints."""
     os.makedirs(output_dir, exist_ok=True)
     saved_files = []
@@ -358,15 +358,16 @@ def save_geometry_views(design, output_dir, prefix="model"):
             print(f"[WARN] export_model_picture failed ({orientation}): {e}")
 
     # Optional fallback: PyVista-based capture through design.plot.
-    # This works only when the plotting backend is available.
-    pyvista_path = os.path.join(output_dir, f"{prefix}_pyvista.png")
-    try:
-        if hasattr(design, "plot"):
-            design.plot(show=False, output_file=pyvista_path)
-            if os.path.exists(pyvista_path):
-                saved_files.append(pyvista_path)
-    except Exception as e:
-        print(f"[WARN] design.plot failed: {e}")
+    # Keep this disabled by default because headless Linux clusters can segfault.
+    if enable_pyvista_snapshot:
+        pyvista_path = os.path.join(output_dir, f"{prefix}_pyvista.png")
+        try:
+            if hasattr(design, "plot"):
+                design.plot(show=False, output_file=pyvista_path)
+                if os.path.exists(pyvista_path):
+                    saved_files.append(pyvista_path)
+        except Exception as e:
+            print(f"[WARN] design.plot failed: {e}")
 
     print("[INFO] Saved geometry views:")
     for p in saved_files:
@@ -376,10 +377,13 @@ def save_geometry_views(design, output_dir, prefix="model"):
 
 
 # Save geometry snapshots next to this simulation project.
+enable_pyvista_snapshot = os.environ.get("ENABLE_PYVISTA_SNAPSHOT", "0").strip().lower() in ("1", "true", "yes", "on")
+
 save_geometry_views(
     design=sim.design1,
     output_dir=sim.project.path,
     prefix=f"{sim.PROJECT_NAME}_geometry",
+    enable_pyvista_snapshot=enable_pyvista_snapshot,
 )
 
 
