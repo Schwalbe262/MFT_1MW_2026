@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --partition=gpu5,gpu4,gpu3,gpu6,gpu2,gpu1,cpu1,cpu2
+#SBATCH --partition=gpu4,gpu3,gpu6,gpu2,gpu1,cpu1,cpu2
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:0
 #SBATCH --job-name=ANSYS
