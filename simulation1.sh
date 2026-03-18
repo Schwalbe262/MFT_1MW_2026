@@ -9,25 +9,28 @@
 
 set -euo pipefail
 
-module purge
+mkdir -p ./log
+
+source /etc/profile || true
+source /etc/profile.d/modules.sh || true
+
+echo "=== before module ==="
+echo "HOST=$(hostname)"
+echo "SHELL=$SHELL"
+echo "MODULEPATH=${MODULEPATH:-<empty>}"
+type module || true
+
+module --ignore_cache avail 2>&1 | head -n 50 || true
+module --ignore_cache load ansys-electronics/v252
+module list || true
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate pyaedt2026v1
 
-module load ansys-electronics/v252
-
 export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/AnsysEM
 export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81
 
-mkdir -p ./log
-
-echo "HOST=$(hostname)"
-echo "CONDA_DEFAULT_ENV=$CONDA_DEFAULT_ENV"
-echo "ANSYSEM_ROOT252=$ANSYSEM_ROOT252"
-echo "ANSYSLMD_LICENSE_FILE=$ANSYSLMD_LICENSE_FILE"
 which python
 python --version
-python -c "import sys; print(sys.executable)"
-python -c "import os; print(os.path.exists('/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt'))"
 
 python run_simulation.py
