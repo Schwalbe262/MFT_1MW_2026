@@ -401,7 +401,8 @@ def run_one_loop():
 
     sim.design1.setup.analyze(cores=4)
 
-    
+    sim.get_magnetic_parameter()
+
     result = pd.concat([sim.df_plus, sim.df1], axis=1)
 
     sim.save_results_to_csv(result)
@@ -416,7 +417,7 @@ def main() :
         try:
             run_one_loop()
         except Exception as e:
-            logging.error(f"Error running simulation: {e}")
+            logging.exception(f"Error running simulation: {e}")
             continue
         finally:
             time.sleep(10)
