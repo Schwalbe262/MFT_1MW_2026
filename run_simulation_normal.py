@@ -115,7 +115,7 @@ class Simulation() :
             os.makedirs(simulation_dir, exist_ok=True)
         
         # 절대 경로로 변환
-        project_path = os.path.abspath(os.path.join(simulation_dir, sim.PROJECT_NAME))
+        project_path = os.path.abspath(os.path.join(simulation_dir, self.PROJECT_NAME))
         
         # desktop이 None이거나 유효하지 않은지 확인
         if self.desktop is None:
