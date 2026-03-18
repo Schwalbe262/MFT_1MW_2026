@@ -326,11 +326,89 @@ sim.design1.setup.properties["Frequency Setup"] = f"1kHz"
 
 
 
+# import time
+# start_time = time.time()
+# sim.design1.setup.analyze(cores=16)
+# end_time = time.time()
+# print(f"Analysis execution time: {end_time - start_time:.2f} seconds")
+
+
+import threading
+import time
+
+def _get_odesktop(app):
+    # 버전별 속성명 차이 대응
+    for attr_chain in [
+        ("odesktop",),
+        ("desktop_class", "odesktop"),
+        ("_desktop", "odesktop"),
+    ]:
+        obj = app
+        ok = True
+        for a in attr_chain:
+            if not hasattr(obj, a):
+                ok = False
+                break
+            obj = getattr(obj, a)
+        if ok:
+            return obj
+    return None
+
+def analyze_with_live_messages(app, cores=16, poll_sec=3):
+    odesktop = _get_odesktop(app)
+    project_name = app.project_name
+    design_name = app.design_name
+
+    err = {"e": None}
+    def _run():
+        try:
+            app.analyze(cores=cores)
+        except Exception as e:
+            err["e"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    seen = set()
+    print("[Solve] started")
+
+    while t.is_alive():
+        # AEDT 메시지 매니저 출력 (새 메시지만)
+        if odesktop is not None:
+            try:
+                msgs = odesktop.GetMessages(project_name, design_name, 0)  # 0=all
+                for m in msgs:
+                    if m not in seen:
+                        seen.add(m)
+                        print(m)
+            except Exception:
+                pass
+
+        # 러닝 상태 표시(가능한 경우)
+        try:
+            running = getattr(app.desktop_class, "are_there_simulations_running", None)
+            if running is not None:
+                print(f"[Solve] running={running}")
+        except Exception:
+            pass
+
+        time.sleep(poll_sec)
+
+    t.join()
+
+    if err["e"] is not None:
+        raise err["e"]
+
+    print("[Solve] finished")
+
+
+
 import time
 start_time = time.time()
-sim.design1.setup.analyze(cores=16)
+analyze_with_live_messages(sim.design1, cores=16, poll_sec=2)
 end_time = time.time()
 print(f"Analysis execution time: {end_time - start_time:.2f} seconds")
+
 
 
 
