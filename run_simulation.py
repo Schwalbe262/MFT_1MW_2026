@@ -19,6 +19,7 @@ else:  # Linux/Unix
         # r"/gpfs/home1/r1jae262/jupyter/git/pyaedt_library/src/",
         r"../pyaedt_library/src/",
         os.path.abspath(os.path.join(BASE_DIR, "../git/pyaedt_library/src/")),
+        "/home1/r1jae262/jupyter/git/pyaedt_library/src/",
     ]
     for path in possible_paths:
         if os.path.exists(path):
