@@ -1,49 +1,47 @@
 import subprocess
 import time
+import getpass
+from pathlib import Path
+import shutil
 
-interval_seconds = 8 * 3600  # 3시간 = 10800초
-
-# time.sleep(2*3600)
-
+username = getpass.getuser()
+interval_seconds = 8 * 3600
 itr = 10
 
+base = Path(".")
+
+def rm_if_exists(path: Path):
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    elif path.exists():
+        path.unlink(missing_ok=True)
+
 while True:
-    # 모든 작업 종료
+    print(f"모든 작업 종료(scancel) 실행 중... user={username}")
+    subprocess.run(["scancel", "-u", username, "--signal=KILL"])
 
-    print("모든 작업 종료(scancel) 실행 중...")
-    subprocess.run(["scancel", "-u", "r1jae262", "--signal=kill"])
-    print("rm rf")
-    subprocess.run(["rm", "-rf", "simulation"])
+    print("기존 파일/폴더 정리 중...")
+    rm_if_exists(base / "simulation")
+    rm_if_exists(base / "error")
+    rm_if_exists(base / "log")
+    rm_if_exists(base / "simul_log")
+    rm_if_exists(base / "simulation_log")
+    rm_if_exists(base / "batch.log")
+    rm_if_exists(base / "info.log")
+    rm_if_exists(base / "log.csv")
+    rm_if_exists(base / "log.txt")
+    rm_if_exists(base / "run_debug.log")
 
-    subprocess.run(["rm", "-rf", "error"])
-    subprocess.run(["rm", "-rf", "log"])
-    subprocess.run(["rm", "-rf", "simul_log"])
-    subprocess.run(["mkdir", "simul_log"])
-    subprocess.run(["rm", "-rf", "simulation_log"])
-
-    subprocess.run(["rm", "-rf", "batch.log"])
-    subprocess.run(["rm", "-rf", "info.log"])
-    subprocess.run(["rm", "-rf", "log.csv"])
-    subprocess.run(["rm", "-rf", "log.txt"])
-    subprocess.run(["rm", "-rf", "run_debug.log"])
-
+    (base / "simul_log").mkdir(exist_ok=True)
 
     time.sleep(10)
-    
+
     for i in range(itr):
-        print(f"{i+1}번째 simulation.sh 제출 (sbatch) 실행 중...")
+        print(f"{i+1}번째 simulation1.sh 제출 (sbatch) 실행 중...")
         subprocess.run(["sbatch", "simulation1.sh"])
         time.sleep(5)
-        subprocess.run(["squeue", "-u", "r1jae262"])
+        subprocess.run(["squeue", "-u", username])
         time.sleep(60)
 
-    # for i in range(itr):
-    #     print(f"{i+1}번째 simulation2.sh 제출 (sbatch) 실행 중...")
-    #     subprocess.run(["sbatch", "simulation2.sh"])
-    #     time.sleep(5)
-    #     subprocess.run(["squeue", "-u", "r1jae262"])
-    #     time.sleep(60)
-    
-    # 3시간 대기
-    print(f"6시간 대기 중... ({interval_seconds}초)")
+    print(f"8시간 대기 중... ({interval_seconds}초)")
     time.sleep(interval_seconds)
