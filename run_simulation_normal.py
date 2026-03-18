@@ -137,7 +137,7 @@ class Simulation() :
             raise RuntimeError("Desktop instance is None. Cannot create project.")
         
         try:
-            self.project1 = self.desktop.create_project(path=project_path, name=self.PROJECT_NAME)
+            self.project = self.desktop.create_project(path=project_path, name=self.PROJECT_NAME)
         except Exception as e:
             error_msg = f"Failed to create project '{self.PROJECT_NAME}' at path '{project_path}': {e}\n"
             print(error_msg, file=sys.stderr)
@@ -145,7 +145,7 @@ class Simulation() :
             raise
 
     def create_design(self) :
-        self.design1 = self.project1.create_design(name="maxwell_design", solver="maxwell3d", solution="AC Magnetic")
+        self.design1 = self.project.create_design(name="maxwell_design", solver="maxwell3d", solution="AC Magnetic")
 
         # skip mesh setting
         oDesign = self.design1.odesign
@@ -259,7 +259,7 @@ class Simulation() :
             name="Tx_winding"
         )
 
-        self.rx_winding1 = self.design1.assign_winding(
+        self.rx_winding = self.design1.assign_winding(
             assignment=[], 
             winding_type="Current", 
             is_solid=True, 
@@ -284,6 +284,11 @@ class Simulation() :
             for idx, sheet in enumerate(self.Rx_neg_sheets_side1 + self.Rx_neg_sheets_side2, start=1):
                 coil = self.design1.assign_coil(sheet, conductors_number=1, polarity="Positive", name=f"Rx_side_coil{idx}")
                 self.Rx_coil.append(coil)
+
+        self.design1.add_winding_coils(assignment="Tx_winding", coils=[coil.name for coil in self.Tx_coil])
+        self.design1.add_winding_coils(assignment="Rx_winding", coils=[coil.name for coil in self.Rx_coil])
+
+        self.design1.assign_matrix(matrix_name="Matrix", assignment=["Tx_winding", "Rx_winding"])
 
     def assign_skin_depth(self) :
 
@@ -370,43 +375,40 @@ class Simulation() :
 def run_one_loop():
 
 
-    desktop = pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True)
+    with pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True) as desktop:
+        sim = Simulation(desktop=desktop)
 
-    sim = Simulation(desktop=desktop)
+        sim.create_simulation_name()
+        sim.create_project()
+        sim.create_design()
 
-    sim.create_simulation_name()
+        # create input
+        while True:
+            sim.input_df = create_input_parameter()
+            result, sim.df_plus = validation_check(sim.input_df)
+            if result:
+                break
 
-    sim.create_project()
+        set_design_variables(sim.design1, sim.input_df)
 
-    sim.create_design()
+        sim.create_core()
+        sim.create_coil()
+        sim.create_coil_section()
+        sim.assign_winding()
+        sim.assign_coil()
+        sim.assign_skin_depth()
+        sim.assign_radiation()
+        sim.create_setup()
 
-    # create input
-    while True :
-        sim.input_df = create_input_parameter()
-        result, sim.df_plus = validation_check(sim.input_df)
-        if result :
-            break
+        sim.design1.setup.analyze(cores=4)
 
-    set_design_variables(sim.design1, sim.input_df)
+        sim.get_magnetic_parameter()
 
-    sim.create_core()
-    sim.create_coil()
-    sim.create_coil_section()
-    sim.assign_winding()
-    sim.assign_coil()
-    sim.assign_skin_depth()
-    sim.assign_radiation()
-    sim.create_setup()
+        result = pd.concat([sim.df_plus, sim.df1], axis=1)
 
-    sim.design1.setup.analyze(cores=4)
-
-    sim.get_magnetic_parameter()
-
-    result = pd.concat([sim.df_plus, sim.df1], axis=1)
-
-    sim.save_results_to_csv(result)
-    sim.close_project()
-    sim.delete_project_folder()
+        sim.save_results_to_csv(result)
+        sim.close_project()
+        sim.delete_project_folder()
 
 
 
