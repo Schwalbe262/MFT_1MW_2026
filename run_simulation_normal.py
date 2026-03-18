@@ -24,7 +24,7 @@ else:  # Linux/Unix
         "/home1/dw16/NEC/git/pyaedt_library/src/",
         "/home1/harry261/NEC/git/pyaedt_library/src/",
         "/home1/hmlee31/NEC/git/pyaedt_library/src/",
-        "/home1/jj0930/NEC/git/pyaedt_library/src/",
+        "/home1/jji0930/NEC/git/pyaedt_library/src/",
         "/home1/wjddn5916/NEC/git/pyaedt_library/src/"
     ]
     for path in possible_paths:
