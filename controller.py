@@ -37,12 +37,12 @@ while True:
         subprocess.run(["squeue", "-u", "r1jae262"])
         time.sleep(60)
 
-    for i in range(itr):
-        print(f"{i+1}번째 simulation2.sh 제출 (sbatch) 실행 중...")
-        subprocess.run(["sbatch", "simulation2.sh"])
-        time.sleep(5)
-        subprocess.run(["squeue", "-u", "r1jae262"])
-        time.sleep(60)
+    # for i in range(itr):
+    #     print(f"{i+1}번째 simulation2.sh 제출 (sbatch) 실행 중...")
+    #     subprocess.run(["sbatch", "simulation2.sh"])
+    #     time.sleep(5)
+    #     subprocess.run(["squeue", "-u", "r1jae262"])
+    #     time.sleep(60)
     
     # 3시간 대기
     print(f"6시간 대기 중... ({interval_seconds}초)")
