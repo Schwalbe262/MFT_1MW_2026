@@ -51,6 +51,20 @@ from module.input_parameter import create_input_parameter, set_design_variables,
 from module.modeling import create_core, create_coil, create_coil_section
 
 
+from ansys.aedt.core import settings
+
+settings.skip_license_check = True
+settings.wait_for_license = False
+
+
+
+if os.name == 'nt':  # Windows
+    GUI = False
+else:  # Linux/Unix
+    GUI = True
+
+
+
 
 
 class Simulation() :
@@ -129,12 +143,7 @@ def run(simulation=None):
 
 
 
-itr = 0
-GUI = False
 
-
-print("ANSYSEM_ROOT252 =", os.environ.get("ANSYSEM_ROOT252"))
-print("ANSYSLMD_LICENSE_FILE =", os.environ.get("ANSYSLMD_LICENSE_FILE"))
 
 # with pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True) as desktop:
 

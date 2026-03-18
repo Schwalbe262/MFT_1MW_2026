@@ -16,6 +16,7 @@ conda activate pyaedt_015
 
 module load ansys-electronics/v252
 
+
 # export ANSYSEM_ROOT242=/opt/ohpc/pub/Electronics/v242/Linux64
 # export PATH=$ANSYSEM_ROOT242/ansysedt/bin:$PATH
 # export ANSYSLMD_LICENSE_FILE=1055@172.16.10.81
