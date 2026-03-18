@@ -133,6 +133,9 @@ itr = 0
 GUI = False
 
 
+print("ANSYSEM_ROOT252 =", os.environ.get("ANSYSEM_ROOT252"))
+print("ANSYSLMD_LICENSE_FILE =", os.environ.get("ANSYSLMD_LICENSE_FILE"))
+
 # with pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True) as desktop:
 
 desktop = pyDesktop(version="2025.2", non_graphical=GUI, close_on_exit=False, new_desktop=True)
