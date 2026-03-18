@@ -420,7 +420,7 @@ def _get_odesktop(app):
             return obj
     return None
 
-def analyze_with_live_messages(app, cores=16, poll_sec=3):
+def analyze_with_live_messages(app, cores=4, poll_sec=3):
     odesktop = _get_odesktop(app)
     project_name = app.project_name
     design_name = app.design_name
