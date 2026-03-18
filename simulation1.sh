@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --partition=gpu5,gpu4,gpu3,gpu6,gpu2,gpu1,cpu1,cpu2
-#SBATCH --cpus-per-task=40
+#SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:0
 
 #SBATCH --job-name=ANSYS
@@ -15,6 +15,7 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate pyaedt2026v1
 
 module load ansys-electronics/v252
+simulation1.sh
 
 
 # export ANSYSEM_ROOT242=/opt/ohpc/pub/Electronics/v242/Linux64
