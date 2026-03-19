@@ -64,6 +64,8 @@ while True:
     rm_if_exists(base / "log.txt")
     rm_if_exists(base / "run_debug.log")
     rm_if_exists(base / "simulation_num.txt")
+    for f in base.glob("mono_crash*"):
+        rm_if_exists(f)
 
     (base / "simul_log").mkdir(exist_ok=True)
 
