@@ -259,11 +259,11 @@ class Simulation() :
         self.design1.modeler.subtract(blank_list=[box_center], tool_list=[box_center_sub], keep_originals=False)
 
         box_side1 = self.design1.modeler.create_box(origin=[-(sl2_side+2*nwl2_side)/2-(l1+l2+l1/2), -(sw2_side+2*nwl2_side)/2, -(nwh2)/2], sizes=[sl2_side+2*nwl2_side, sw2_side+2*nwl2_side, nwh2], name="box_side1")
-        box_side1_sub = self.design1.modeler.create_box(origin=[-(sl2_side)/2+(l1+l2+l1/2), -(sw2_side)/2, -(nwh2)/2], sizes=[sl2_side, sw2_side, nwh2], name="box_side1_sub")
+        box_side1_sub = self.design1.modeler.create_box(origin=[-(sl2_side)/2-(l1+l2+l1/2), -(sw2_side)/2, -(nwh2)/2], sizes=[sl2_side, sw2_side, nwh2], name="box_side1_sub")
         self.design1.modeler.subtract(blank_list=[box_side1], tool_list=[box_side1_sub], keep_originals=False)
 
         box_side2 = self.design1.modeler.create_box(origin=[-(sl2_side+2*nwl2_side)/2+(l1+l2+l1/2), -(sw2_side+2*nwl2_side)/2, -(nwh2)/2], sizes=[sl2_side+2*nwl2_side, sw2_side+2*nwl2_side, nwh2], name="box_side2")
-        box_side2_sub = self.design1.modeler.create_box(origin=[-(sl2_side)/2-(l1+l2+l1/2), -(sw2_side)/2, -(nwh2)/2], sizes=[sl2_side, sw2_side, nwh2], name="box_side2_sub")
+        box_side2_sub = self.design1.modeler.create_box(origin=[-(sl2_side)/2+(l1+l2+l1/2), -(sw2_side)/2, -(nwh2)/2], sizes=[sl2_side, sw2_side, nwh2], name="box_side2_sub")
         self.design1.modeler.subtract(blank_list=[box_side2], tool_list=[box_side2_sub], keep_originals=False)
 
         self.design1.modeler.subtract(blank_list=[box_center], tool_list=self.Rx_windings1, keep_originals=True)
@@ -403,42 +403,55 @@ class Simulation() :
 
 def run_one_loop():
 
+    try:
 
-    with pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True) as desktop:
-        sim = Simulation(desktop=desktop)
+        with pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True) as desktop:
+            sim = Simulation(desktop=desktop)
 
-        sim.create_simulation_name()
-        sim.create_project()
-        sim.create_design()
+            sim.create_simulation_name()
+            sim.create_project()
+            sim.create_design()
 
-        # create input
-        while True:
-            sim.input_df = create_input_parameter()
-            result, sim.df_plus = validation_check(sim.input_df)
-            if result:
-                break
+            # create input
+            while True:
+                sim.input_df = create_input_parameter()
+                result, sim.df_plus = validation_check(sim.input_df)
+                if result:
+                    break
 
-        set_design_variables(sim.design1, sim.input_df)
+            set_design_variables(sim.design1, sim.input_df)
 
-        sim.create_core()
-        sim.create_coil()
-        sim.create_coil_section()
-        sim.assign_winding()
-        sim.assign_coil()
-        sim.assign_skin_depth()
-        sim.assign_radiation()
-        sim.create_setup()
+            sim.create_core()
+            sim.create_coil()
+            sim.create_coil_section()
+            sim.assign_winding()
+            sim.assign_coil()
+            sim.assign_skin_depth()
+            sim.assign_radiation()
+            sim.create_setup()
 
-        sim.design1.setup.analyze(cores=4)
+            sim.design1.setup.analyze(cores=4)
 
-        sim.get_magnetic_parameter()
+            sim.get_magnetic_parameter()
 
-        result = pd.concat([sim.df_plus, sim.df1], axis=1)
+            result = pd.concat([sim.df_plus, sim.df1], axis=1)
 
-        try :
-            sim.save_results_to_csv(result)
-        except Exception as e:
-            logging.exception(f"Error saving results to CSV: {e}")
+            try :
+                sim.save_results_to_csv(result)
+            except Exception as e:
+                logging.exception(f"Error saving results to CSV: {e}")
+
+            try :
+                sim.close_project()
+            except Exception as e:
+                logging.exception(f"Error closing project: {e}")
+
+            try :
+                sim.delete_project_folder()
+            except Exception as e:
+                logging.exception(f"Error deleting project folder: {e}")
+            
+    except :
 
         try :
             sim.close_project()
@@ -460,6 +473,7 @@ def main() :
         except Exception as e:
             logging.exception(f"Error running simulation: {e}")
             continue
+        
         finally:
             time.sleep(10)
 
