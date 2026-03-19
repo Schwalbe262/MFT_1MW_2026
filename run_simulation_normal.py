@@ -258,11 +258,11 @@ class Simulation() :
         box_center_sub = self.design1.modeler.create_box(origin=[-(sl2_main)/2, -(sw2_main)/2, -(nwh2)/2], sizes=[sl2_main, sw2_main, nwh2], name="box_center_sub")
         self.design1.modeler.subtract(blank_list=[box_center], tool_list=[box_center_sub], keep_originals=False)
 
-        box_side1 = self.design1.modeler.create_box(origin=[-(sl2_side+2*nwl2_side)/2+(l1+l2+l1/2), -(sw2_side+2*nwl2_side)/2, -(nwh2)/2], sizes=[sl2_side+2*nwl2_side, sw2_side+2*nwl2_side, nwh2], name="box_side1")
+        box_side1 = self.design1.modeler.create_box(origin=[-(sl2_side+2*nwl2_side)/2-(l1+l2+l1/2), -(sw2_side+2*nwl2_side)/2, -(nwh2)/2], sizes=[sl2_side+2*nwl2_side, sw2_side+2*nwl2_side, nwh2], name="box_side1")
         box_side1_sub = self.design1.modeler.create_box(origin=[-(sl2_side)/2+(l1+l2+l1/2), -(sw2_side)/2, -(nwh2)/2], sizes=[sl2_side, sw2_side, nwh2], name="box_side1_sub")
         self.design1.modeler.subtract(blank_list=[box_side1], tool_list=[box_side1_sub], keep_originals=False)
 
-        box_side2 = self.design1.modeler.create_box(origin=[-(sl2_side+2*nwl2_side)/2-(l1+l2+l1/2), -(sw2_side+2*nwl2_side)/2, -(nwh2)/2], sizes=[sl2_side+2*nwl2_side, sw2_side+2*nwl2_side, nwh2], name="box_side2")
+        box_side2 = self.design1.modeler.create_box(origin=[-(sl2_side+2*nwl2_side)/2+(l1+l2+l1/2), -(sw2_side+2*nwl2_side)/2, -(nwh2)/2], sizes=[sl2_side+2*nwl2_side, sw2_side+2*nwl2_side, nwh2], name="box_side2")
         box_side2_sub = self.design1.modeler.create_box(origin=[-(sl2_side)/2-(l1+l2+l1/2), -(sw2_side)/2, -(nwh2)/2], sizes=[sl2_side, sw2_side, nwh2], name="box_side2_sub")
         self.design1.modeler.subtract(blank_list=[box_side2], tool_list=[box_side2_sub], keep_originals=False)
 
