@@ -6,7 +6,7 @@ import shutil
 
 username = getpass.getuser()
 interval_seconds = 8 * 3600
-itr = 5
+itr = 10
 
 base = Path(".")
 
@@ -63,6 +63,7 @@ while True:
     rm_if_exists(base / "log.csv")
     rm_if_exists(base / "log.txt")
     rm_if_exists(base / "run_debug.log")
+    rm_if_exists(base / "simulation_num.txt")
 
     (base / "simul_log").mkdir(exist_ok=True)
 
