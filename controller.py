@@ -6,7 +6,7 @@ import shutil
 
 username = getpass.getuser()
 interval_seconds = 8 * 3600
-itr = 10
+itr = 5
 
 base = Path(".")
 
