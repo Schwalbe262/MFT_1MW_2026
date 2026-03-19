@@ -406,9 +406,20 @@ def run_one_loop():
 
         result = pd.concat([sim.df_plus, sim.df1], axis=1)
 
-        sim.save_results_to_csv(result)
-        sim.close_project()
-        sim.delete_project_folder()
+        try :
+            sim.save_results_to_csv(result)
+        except Exception as e:
+            logging.exception(f"Error saving results to CSV: {e}")
+
+        try :
+            sim.close_project()
+        except Exception as e:
+            logging.exception(f"Error closing project: {e}")
+
+        try :
+            sim.delete_project_folder()
+        except Exception as e:
+            logging.exception(f"Error deleting project folder: {e}")
 
 
 
