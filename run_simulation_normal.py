@@ -402,10 +402,11 @@ class Simulation() :
   
 
 def run_one_loop():
-
+    sim = None
+    desktop = None
     try:
-
-        with pyDesktop(version=None, non_graphical=GUI, close_on_exit=False, new_desktop=True) as desktop:
+        # Use existing Desktop when possible and ensure it closes at context exit.
+        with pyDesktop(version=None, non_graphical=GUI, close_on_exit=True, new_desktop=False) as desktop:
             sim = Simulation(desktop=desktop)
 
             sim.create_simulation_name()
@@ -436,32 +437,38 @@ def run_one_loop():
 
             result = pd.concat([sim.df_plus, sim.df1], axis=1)
 
-            try :
+            try:
                 sim.save_results_to_csv(result)
             except Exception as e:
                 logging.exception(f"Error saving results to CSV: {e}")
 
-            try :
+            try:
                 sim.close_project()
             except Exception as e:
                 logging.exception(f"Error closing project: {e}")
 
-            try :
+            try:
                 sim.delete_project_folder()
             except Exception as e:
                 logging.exception(f"Error deleting project folder: {e}")
-            
-    except :
-
-        try :
-            sim.close_project()
-        except Exception as e:
-            logging.exception(f"Error closing project: {e}")
-
-        try :
-            sim.delete_project_folder()
-        except Exception as e:
-            logging.exception(f"Error deleting project folder: {e}")
+    except Exception as e:
+        logging.exception(f"run_one_loop failed: {e}")
+        if sim is not None:
+            try:
+                sim.close_project()
+            except Exception:
+                pass
+            try:
+                sim.delete_project_folder()
+            except Exception:
+                pass
+    finally:
+        # Safety net: force Desktop release even when internal close fails.
+        if desktop is not None:
+            try:
+                desktop.release_desktop(close_projects=True, close_on_exit=True)
+            except Exception:
+                pass
 
 
 
