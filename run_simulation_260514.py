@@ -429,8 +429,8 @@ class Simulation() :
             oModule.AddNamedExpression(name, "Fields")
             return name
 
-        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[-1].name, "EMLoss", "main_winding_inner")
-        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[0].name, "EMLoss", "main_winding_outer")
+        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[0].name, "EMLoss", "main_winding_inner")
+        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[-1].name, "EMLoss", "main_winding_outer")
         if self.df_plus["N1_side"].iloc[0] == 1 :
             _get_calculator_loss(self.design1, self.design1.Tx_windings_side[-1].name, "EMLoss", "side_winding_inner")
         elif self.df_plus["N1_side"].iloc[0] > 1 :
