@@ -225,9 +225,9 @@ def validation_check(input_df) :
 
     # wff 계산
     wff1_main = cw1 * N1_main_turns / (cw1 * N1_main_turns + coil_gap_layer1 * N1_main_gaps)
-    wff1_side = cw1 * N1_side_turns / (cw1 * N1_side_turns + coil_gap_layer1 * N1_side_gaps)
+    wff1_side = 0 if N1_side_turns == 0 else cw1 * N1_side_turns / (cw1 * N1_side_turns + coil_gap_layer1 * N1_side_gaps)
     wff2_main = cw2 * N2_main_turns / (cw2 * N2_main_turns + coil_gap_layer2 * N2_main_gaps)
-    wff2_side = cw2 * N2_side_turns / (cw2 * N2_side_turns + coil_gap_layer2 * N2_side_gaps)
+    wff2_side = 0 if N2_side_turns == 0 else cw2 * N2_side_turns / (cw2 * N2_side_turns + coil_gap_layer2 * N2_side_gaps)
     inp["wff1_main"] = [wff1_main]
     inp["wff1_side"] = [wff1_side]
     inp["wff2_main"] = [wff2_main]
