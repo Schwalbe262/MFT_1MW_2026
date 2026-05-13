@@ -429,8 +429,19 @@ class Simulation() :
             oModule.AddNamedExpression(name, "Fields")
             return name
 
-        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[-1].name, "EMLoss", "winding_inner")
-        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[0].name, "EMLoss", "winding_outer")
+        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[-1].name, "EMLoss", "main_winding_inner")
+        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[0].name, "EMLoss", "main_winding_outer")
+        if self.df_plus["N1_side"].iloc[0] == 1 :
+            _get_calculator_loss(self.design1, self.design1.Tx_windings_side[-1].name, "EMLoss", "side_winding_inner")
+        elif self.df_plus["N1_side"].iloc[0] > 1 :
+            _get_calculator_loss(self.design1, self.design1.Tx_windings_side[0].name, "EMLoss", "side_winding_inner")
+            _get_calculator_loss(self.design1, self.design1.Tx_windings_side[-1].name, "EMLoss", "side_winding_outer")
+
+        Y_components = ["P_main_winding_inner", "P_main_winding_outer"]
+        if self.df_plus["N1_side"].iloc[0] > 0 :
+            Y_components.append("P_side_winding_inner")
+            Y_components.append("P_side_winding_outer")
+
 
         oDesign = self.design1
         oModule = oDesign.GetModule("ReportSetup")
@@ -465,7 +476,7 @@ class Simulation() :
             ], 
             [
                 "X Component:="		, "Freq",
-                "Y Component:="		, ["P_winding_inner", "P_winding_outer"]
+                "Y Component:="		, Y_components
             ])
 
         dir = self.project.path
@@ -473,9 +484,19 @@ class Simulation() :
         export_path = os.path.join(dir, f"{file_name}.csv")
         oModule.ExportToFile("calculator_report", export_path, False)
         df_original = pd.read_csv(export_path)
-        df = df_original.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
-        df.columns = ["P_winding_inner", "P_winding_outer"]  # 컬럼 이름 변경
-        self.df_calculator = df
+
+        if self.df_plus["N1_side"].iloc[0] > 0 :
+            df = df_original.iloc[:, -4:]  # 마지막 4개 컬럼만 선택
+            df.columns = ["P_main_winding_inner", "P_main_winding_outer", "P_side_winding_inner", "P_side_winding_outer"]  # 컬럼 이름 변경
+            self.df_calculator = df
+        elif self.df_plus["N1_side"].iloc[0] == 0 :
+            df = df_original.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
+            df.columns = ["P_main_winding_inner", "P_main_winding_outer"]  # 컬럼 이름 변경
+            # P_side_winding_inner, P_side_winding_outer 컬럼을 0으로 추가
+            df["P_side_winding_inner"] = 0
+            df["P_side_winding_outer"] = 0
+            self.df_calculator = df[["P_main_winding_inner", "P_main_winding_outer", "P_side_winding_inner", "P_side_winding_outer"]]
+     
 
 
     def save_results_to_csv(self, results_df, filename="simulation_results.csv"):
