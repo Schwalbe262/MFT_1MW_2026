@@ -415,6 +415,69 @@ class Simulation() :
 
         return self.df1
 
+
+    def save_calculation(self) :
+
+        def _get_calculator_loss(self, obj, loss, name) :
+            assignment = obj if isinstance(obj, str) else obj.name
+            oModule = self.ofieldsreporter
+            oModule.CalcStack("clear")
+            oModule.EnterQty(loss)
+            oModule.EnterVol(assignment)
+            oModule.CalcOp("Integrate")
+            name = f"P_{name}"
+            oModule.AddNamedExpression(name, "Fields")
+            return name
+
+        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[-1].name, "EMLoss", "winding_inner")
+        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[0].name, "EMLoss", "winding_outer")
+
+        oDesign = self.design1
+        oModule = oDesign.GetModule("ReportSetup")
+        oModule.CreateReport("calculator_report", "Fields", "Data Table", "Setup1 : LastAdaptive", [], 
+            [
+                "Freq:="		, ["All"],
+                "Phase:="		, ["0deg"],
+                "N1:="			, ["Nominal"],
+                "N2:="			, ["Nominal"],
+                "N1_main:="		, ["Nominal"],
+                "N1_side:="		, ["Nominal"],
+                "N2_main:="		, ["Nominal"],
+                "N2_side:="		, ["Nominal"],
+                "w1:="			, ["Nominal"],
+                "l1:="			, ["Nominal"],
+                "l2:="			, ["Nominal"],
+                "h1:="			, ["Nominal"],
+                "cc_w2c_space_x:="	, ["Nominal"],
+                "w2c_w1c_space_x:="	, ["Nominal"],
+                "w1c_w2s_space_x:="	, ["Nominal"],
+                "w2s_w1s_space_x:="	, ["Nominal"],
+                "w1s_cs_space_x:="	, ["Nominal"],
+                "cc_w2c_space_y:="	, ["Nominal"],
+                "w2c_w1c_space_y:="	, ["Nominal"],
+                "cs_w1s_space_y:="	, ["Nominal"],
+                "w1s_w2s_space_y:="	, ["Nominal"],
+                "window_ratio:="	, ["Nominal"],
+                "wh1:="			, ["Nominal"],
+                "wh2:="			, ["Nominal"],
+                "wff1:="		, ["Nominal"],
+                "wff2:="		, ["Nominal"]
+            ], 
+            [
+                "X Component:="		, "Freq",
+                "Y Component:="		, ["P_winding_inner", "P_winding_outer"]
+            ])
+
+        dir = self.project.path
+        file_name = "calculator_report"
+        export_path = os.path.join(dir, f"{file_name}.csv")
+        oModule.ExportToFile("calculator_report", export_path, False)
+        df_original = pd.read_csv(export_path)
+        df = df_original.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
+        df.columns = ["P_winding_inner", "P_winding_outer"]  # 컬럼 이름 변경
+        self.df_calculator = df
+
+
     def save_results_to_csv(self, results_df, filename="simulation_results.csv"):
         """Saves the DataFrame to a CSV file in a process-safe way."""
         lock_path = filename + ".lock"
@@ -480,7 +543,8 @@ def run_one_loop(param):
             simulation_time = pd.DataFrame({"time": [elapsed_time]})
 
             sim.get_magnetic_parameter()
-            result = pd.concat([sim.df_plus, sim.df1, simulation_time], axis=1)
+            sim.save_calculation()
+            result = pd.concat([sim.df_plus, sim.df1, sim.df_calculator, simulation_time], axis=1)
 
             try:
                 sim.save_results_to_csv(result)
