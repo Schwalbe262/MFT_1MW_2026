@@ -6,7 +6,7 @@ import platform
 
 logging.basicConfig(filename='run_debug.log', level=logging.DEBUG)
 
-script_name = "run_simulation_normal.py"
+script_name = "run_simulation_260514.py"
 script_path = os.path.join(os.getcwd(), script_name)
 
 os_name = platform.system()

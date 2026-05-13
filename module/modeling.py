@@ -137,9 +137,7 @@ def create_coil(design, name, window_height, window_length, window_layer, N_inpu
     return windings, N, coil_width, coil_height,coil_gap_x, coil_gap_z
 
 
-def create_coil_section(design, winding_obj, sheet_prefix = None, plane = "ZX", rename_faces = False):
-
-
+def create_coil_section(design, winding_obj, sheet_prefix=None, plane="ZX", rename_faces=False, mod="both"):
     modeler = design.modeler
 
     def _to_obj_list(obj_or_list):
@@ -222,43 +220,45 @@ def create_coil_section(design, winding_obj, sheet_prefix = None, plane = "ZX", 
         seen.add(n)
         faces.append(o)
 
-    # 3) split by x: smaller-x list and larger-x list
-    x_small_faces = []
-    x_large_faces = []
-    used = set()
+    if mod == "single":
+        # 그냥 있는 face 다 반환
+        return [f.name for f in faces]
+    else:
+        # 3) split by x: smaller-x list and larger-x list
+        x_small_faces = []
+        x_large_faces = []
+        used = set()
 
-    for src in winding_objs:
-        src_name = str(getattr(src, "name", src)).lower()
-        group = [f for f in faces if src_name in str(getattr(f, "name", "")).lower()]
-        if len(group) >= 2:
-            group_sorted = sorted(group, key=_center_x)
-            x_small_faces.append(group_sorted[0])
-            x_large_faces.append(group_sorted[-1])
-            used.add(group_sorted[0].name)
-            used.add(group_sorted[-1].name)
+        for src in winding_objs:
+            src_name = str(getattr(src, "name", src)).lower()
+            group = [f for f in faces if src_name in str(getattr(f, "name", "")).lower()]
+            if len(group) >= 2:
+                group_sorted = sorted(group, key=_center_x)
+                x_small_faces.append(group_sorted[0])
+                x_large_faces.append(group_sorted[-1])
+                used.add(group_sorted[0].name)
+                used.add(group_sorted[-1].name)
 
-    # if some faces are left unmatched, pair by x order
-    remaining = [f for f in faces if getattr(f, "name", "") not in used]
-    remaining_sorted = sorted(remaining, key=_center_x)
-    for i in range(0, len(remaining_sorted) - 1, 2):
-        x_small_faces.append(remaining_sorted[i])
-        x_large_faces.append(remaining_sorted[i + 1])
+        # if some faces are left unmatched, pair by x order
+        remaining = [f for f in faces if getattr(f, "name", "") not in used]
+        remaining_sorted = sorted(remaining, key=_center_x)
+        for i in range(0, len(remaining_sorted) - 1, 2):
+            x_small_faces.append(remaining_sorted[i])
+            x_large_faces.append(remaining_sorted[i + 1])
 
-    # 4) optional rename for separated faces
-    if rename_faces:
-        used_names = set(modeler.object_names)
-        pair_count = min(len(x_small_faces), len(x_large_faces))
-        for i in range(pair_count):
-            if pair_count == 1:
-                base = sheet_prefix
-            else:
-                base = f"{sheet_prefix}_{i + 1}"
+        # 4) optional rename for separated faces
+        if rename_faces:
+            used_names = set(modeler.object_names)
+            pair_count = min(len(x_small_faces), len(x_large_faces))
+            for i in range(pair_count):
+                if pair_count == 1:
+                    base = sheet_prefix
+                else:
+                    base = f"{sheet_prefix}_{i + 1}"
+                _rename_object_safe(x_small_faces[i], f"{base}_neg", used_names)
+                _rename_object_safe(x_large_faces[i], f"{base}_pos", used_names)
 
-            _rename_object_safe(x_small_faces[i], f"{base}_neg", used_names)
-            _rename_object_safe(x_large_faces[i], f"{base}_pos", used_names)
-
-    # x_neg와 x_pos는 각각 2개의 separated face 중 x 값이 작은/큰 face의 name list
-    x_neg = [f.name for f in x_small_faces]
-    x_pos = [f.name for f in x_large_faces]
-
-    return x_neg, x_pos
+        # x_neg와 x_pos는 각각 2개의 separated face 중 x 값이 작은/큰 face의 name list
+        x_neg = [f.name for f in x_small_faces]
+        x_pos = [f.name for f in x_large_faces]
+        return x_neg, x_pos
