@@ -387,7 +387,7 @@ class Simulation() :
         self.design1.setup = self.design1.create_setup(name = "Setup1")
         self.design1.setup.properties["Max. Number of Passes"] = 8 # 10
         self.design1.setup.properties["Min. Number of Passes"] = 1
-        self.design1.setup.properties["Min. Converged Passes"] = 2
+        self.design1.setup.properties["Min. Converged Passes"] = 1
         self.design1.setup.properties["Percent Error"] = 2.5 # 2.5
         self.design1.setup.properties["Frequency Setup"] = f"1kHz"
 
@@ -529,7 +529,7 @@ def run_one_loop(param):
 def main() :
 
     while True :
-        
+
         try:
             run_one_loop(param=None)
         except Exception as e:
