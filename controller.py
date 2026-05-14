@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 
 username = getpass.getuser()
-interval_seconds = 8 * 3600
+interval_seconds = 12 * 3600
 itr = 10
 
 base = Path(".")
