@@ -498,25 +498,25 @@ class Simulation() :
         if self.df_plus["N1_side"].iloc[0] > 0 :
             df = df_original.iloc[:, -4:]  # 마지막 4개 컬럼만 선택
             df.columns = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]  # 컬럼 이름 변경
-            self.df_calculator = df
+            self.df_calculator1 = df
         elif self.df_plus["N1_side"].iloc[0] == 0 :
             df = df_original.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
             df.columns = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer"]  # 컬럼 이름 변경
             # P_side_winding_inner, P_side_winding_outer 컬럼을 0으로 추가
             df["P_Tx_main_winding_inner"] = 0
             df["P_Tx_main_winding_outer"] = 0
-            self.df_calculator = df[["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]]
+            self.df_calculator1 = df[["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]]
 
         if self.df_plus["N2_side"].iloc[0] > 0 :
             df = df_original.iloc[:, -4:]  # 마지막 4개 컬럼만 선택
             df.columns = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer", "P_Rx_side_winding_inner", "P_Rx_side_winding_outer"]  # 컬럼 이름 변경
-            self.df_calculator = df
+            self.df_calculator2 = df
         elif self.df_plus["N2_side"].iloc[0] == 0 :
             df = df_original.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
             df.columns = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]  # 컬럼 이름 변경
             df["P_Rx_side_winding_inner"] = 0
             df["P_Rx_side_winding_outer"] = 0
-            self.df_calculator = df[["P_Rx_main_winding_inner", "P_Rx_main_winding_outer", "P_Rx_side_winding_inner", "P_Rx_side_winding_outer"]]
+            self.df_calculator2 = df[["P_Rx_main_winding_inner", "P_Rx_main_winding_outer", "P_Rx_side_winding_inner", "P_Rx_side_winding_outer"]]
 
 
     def save_results_to_csv(self, results_df, filename="simulation_results.csv"):
@@ -585,7 +585,7 @@ def run_one_loop(param):
 
             sim.get_magnetic_parameter()
             sim.save_calculation()
-            result = pd.concat([sim.df_plus, sim.df1, sim.df_calculator, simulation_time], axis=1)
+            result = pd.concat([sim.df_plus, sim.df1, sim.df_calculator1, sim.df_calculator2, simulation_time], axis=1)
 
             try:
                 sim.save_results_to_csv(result)
