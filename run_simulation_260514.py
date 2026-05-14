@@ -490,9 +490,9 @@ class Simulation() :
             ])
 
         dir = self.project.path
-        file_name = "calculator_report"
+        file_name = "calculator_report1"
         export_path = os.path.join(dir, f"{file_name}.csv")
-        oModule.ExportToFile("calculator_report", export_path, False)
+        oModule.ExportToFile("calculator_report1", export_path, False)
         df_original1 = pd.read_csv(export_path)
 
         if self.df_plus["N1_side"].iloc[0] > 0 :
@@ -551,9 +551,9 @@ class Simulation() :
             ])
 
         dir = self.project.path
-        file_name = "calculator_report"
+        file_name = "calculator_report2"
         export_path = os.path.join(dir, f"{file_name}.csv")
-        oModule.ExportToFile("calculator_report", export_path, False)
+        oModule.ExportToFile("calculator_report2", export_path, False)
         df_original2 = pd.read_csv(export_path)
 
 
