@@ -455,7 +455,7 @@ class Simulation() :
 
         oDesign = self.design1
         oModule = oDesign.GetModule("ReportSetup")
-        oModule.CreateReport("calculator_report", "Fields", "Data Table", "Setup1 : LastAdaptive", [], 
+        oModule.CreateReport("calculator_report1", "Fields", "Data Table", "Setup1 : LastAdaptive", [], 
             [
                 "Freq:="		, ["All"],
                 "Phase:="		, ["0deg"],
@@ -493,26 +493,76 @@ class Simulation() :
         file_name = "calculator_report"
         export_path = os.path.join(dir, f"{file_name}.csv")
         oModule.ExportToFile("calculator_report", export_path, False)
-        df_original = pd.read_csv(export_path)
+        df_original1 = pd.read_csv(export_path)
 
         if self.df_plus["N1_side"].iloc[0] > 0 :
-            df = df_original.iloc[:, -4:]  # 마지막 4개 컬럼만 선택
+            df = df_original1.iloc[:, -4:]  # 마지막 4개 컬럼만 선택
             df.columns = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]  # 컬럼 이름 변경
             self.df_calculator1 = df
         elif self.df_plus["N1_side"].iloc[0] == 0 :
-            df = df_original.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
+            df = df_original1.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
             df.columns = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer"]  # 컬럼 이름 변경
             # P_side_winding_inner, P_side_winding_outer 컬럼을 0으로 추가
-            df["P_Tx_main_winding_inner"] = 0
-            df["P_Tx_main_winding_outer"] = 0
-            self.df_calculator1 = df[["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]]
+            df["P_Tx_side_winding_inner"] = 0
+            df["P_Tx_side_winding_outer"] = 0
+            self.df_calculator1 = df[["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Tx_side_winding_inner", "P_Tx_side_winding_outer"]]
+
+
+
+        Y_components = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]
+        if self.df_plus["N1_side"].iloc[0] > 0 :
+            Y_components.append("P_Rx_side_winding_inner")
+            Y_components.append("P_Rx_side_winding_outer")
+
+        oDesign = self.design1
+        oModule = oDesign.GetModule("ReportSetup")
+        oModule.CreateReport("calculator_report2", "Fields", "Data Table", "Setup1 : LastAdaptive", [], 
+            [
+                "Freq:="		, ["All"],
+                "Phase:="		, ["0deg"],
+                "N1:="			, ["Nominal"],
+                "N2:="			, ["Nominal"],
+                "N1_main:="		, ["Nominal"],
+                "N1_side:="		, ["Nominal"],
+                "N2_main:="		, ["Nominal"],
+                "N2_side:="		, ["Nominal"],
+                "w1:="			, ["Nominal"],
+                "l1:="			, ["Nominal"],
+                "l2:="			, ["Nominal"],
+                "h1:="			, ["Nominal"],
+                "cc_w2c_space_x:="	, ["Nominal"],
+                "w2c_w1c_space_x:="	, ["Nominal"],
+                "w1c_w2s_space_x:="	, ["Nominal"],
+                "w2s_w1s_space_x:="	, ["Nominal"],
+                "w1s_cs_space_x:="	, ["Nominal"],
+                "cc_w2c_space_y:="	, ["Nominal"],
+                "w2c_w1c_space_y:="	, ["Nominal"],
+                "cs_w1s_space_y:="	, ["Nominal"],
+                "w1s_w2s_space_y:="	, ["Nominal"],
+                "window_ratio:="	, ["Nominal"],
+                "wh1:="			, ["Nominal"],
+                "wh2:="			, ["Nominal"],
+                "wff1:="		, ["Nominal"],
+                "wff2:="		, ["Nominal"]
+            ], 
+            [
+                "X Component:="		, "Freq",
+                "Y Component:="		, Y_components
+            ])
+
+        dir = self.project.path
+        file_name = "calculator_report"
+        export_path = os.path.join(dir, f"{file_name}.csv")
+        oModule.ExportToFile("calculator_report", export_path, False)
+        df_original2 = pd.read_csv(export_path)
+
 
         if self.df_plus["N2_side"].iloc[0] > 0 :
-            df = df_original.iloc[:, -4:]  # 마지막 4개 컬럼만 선택
+            df = df_original2.iloc[:, -4:]  # 마지막 4개 컬럼만 선택
             df.columns = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer", "P_Rx_side_winding_inner", "P_Rx_side_winding_outer"]  # 컬럼 이름 변경
             self.df_calculator2 = df
         elif self.df_plus["N2_side"].iloc[0] == 0 :
-            df = df_original.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
+            df = df_original2.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
             df.columns = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]  # 컬럼 이름 변경
             df["P_Rx_side_winding_inner"] = 0
             df["P_Rx_side_winding_outer"] = 0
