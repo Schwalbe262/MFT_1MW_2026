@@ -40,3 +40,6 @@ simulation/
 
 # Picture debug outputs
 picture/
+
+# Ignore all CSV files
+*.csv
