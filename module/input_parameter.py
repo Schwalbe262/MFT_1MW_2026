@@ -72,8 +72,8 @@ def create_input_parameter(param_list=None):
         # N2_side = round(N2 * get_random_value(lower=0, upper=0.6, resolution=0.01))
         # N2_main = N2 - N2_side
         
-        w1 = get_random_value(lower=300, upper=800, resolution=1)
-        l1 = get_random_value(lower=50, upper=100, resolution=1)
+        w1 = get_random_value(lower=200, upper=800, resolution=1)
+        l1 = get_random_value(lower=40, upper=100, resolution=1)
         total_length = get_random_value(lower=500, upper=1200, resolution=1)
         l2 = (total_length - 4*l1) / 2
         total_height = get_random_value(lower=500, upper=1000, resolution=1)
@@ -90,9 +90,6 @@ def create_input_parameter(param_list=None):
         w2c_w1c_space_y = get_random_value(lower=10, upper=50, resolution=0.1)
         cs_w1s_space_y = get_random_value(lower=10, upper=50, resolution=0.1)
         w1s_w2s_space_y = get_random_value(lower=10, upper=50, resolution=0.1)
-
-        w1c_space_z = get_random_value(lower=10, upper=50, resolution=0.1)
-        w2c_space_z = get_random_value(lower=10, upper=50, resolution=0.1)
         
         # 1차 측과 2차 측의 비율
         window_ratio = get_random_value(lower=0.3, upper=0.7, resolution=0.01)
@@ -101,7 +98,7 @@ def create_input_parameter(param_list=None):
         wh1 = get_random_value(lower=0.8, upper=0.95, resolution=0.01)
         wh2 = get_random_value(lower=0.5, upper=0.95, resolution=0.01)
 
-        wff1 = get_random_value(lower=0.3, upper=0.75, resolution=0.01)
+        wff1 = get_random_value(lower=0.4, upper=0.8, resolution=0.01)
         wff2 = get_random_value(lower=0.4, upper=0.75, resolution=0.01)
 
         param_values = [
