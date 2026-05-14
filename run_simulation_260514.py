@@ -388,7 +388,7 @@ class Simulation() :
         self.design1.setup.properties["Max. Number of Passes"] = 10 # 10
         self.design1.setup.properties["Min. Number of Passes"] = 1
         self.design1.setup.properties["Min. Converged Passes"] = 2
-        self.design1.setup.properties["Percent Error"] = 1.0 # 2.5
+        self.design1.setup.properties["Percent Error"] = 2.5 # 2.5
         self.design1.setup.properties["Frequency Setup"] = f"1kHz"
 
     def get_magnetic_parameter(self) :
@@ -431,9 +431,7 @@ class Simulation() :
 
         _get_calculator_loss(self.design1, self.design1.Tx_windings_main[0].name, "EMLoss", "main_winding_inner")
         _get_calculator_loss(self.design1, self.design1.Tx_windings_main[-1].name, "EMLoss", "main_winding_outer")
-        if self.df_plus["N1_side"].iloc[0] == 1 :
-            _get_calculator_loss(self.design1, self.design1.Tx_windings_side[-1].name, "EMLoss", "side_winding_inner")
-        elif self.df_plus["N1_side"].iloc[0] > 1 :
+        if self.df_plus["N1_side"].iloc[0] > 0 :
             _get_calculator_loss(self.design1, self.design1.Tx_windings_side[0].name, "EMLoss", "side_winding_inner")
             _get_calculator_loss(self.design1, self.design1.Tx_windings_side[-1].name, "EMLoss", "side_winding_outer")
 
