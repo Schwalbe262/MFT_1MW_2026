@@ -441,17 +441,16 @@ class Simulation() :
             _get_calculator_loss(self.design1, self.design1.Rx_windings_side[0].name, "EMLoss", "Rx_side_winding_inner")
             _get_calculator_loss(self.design1, self.design1.Rx_windings_side[-1].name, "EMLoss", "Rx_side_winding_outer")
 
+
+
+
+
+
+
         Y_components = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer"]
         if self.df_plus["N1_side"].iloc[0] > 0 :
             Y_components.append("P_Tx_side_winding_inner")
             Y_components.append("P_Tx_side_winding_outer")
-
-        Y_components.append("P_Rx_main_winding_inner")
-        Y_components.append("P_Rx_main_winding_outer")
-        if self.df_plus["N2_side"].iloc[0] > 0 :
-            Y_components.append("P_Rx_side_winding_inner")
-            Y_components.append("P_Rx_side_winding_outer")
-
 
         oDesign = self.design1
         oModule = oDesign.GetModule("ReportSetup")
@@ -506,6 +505,9 @@ class Simulation() :
             df["P_Tx_side_winding_inner"] = 0
             df["P_Tx_side_winding_outer"] = 0
             self.df_calculator1 = df[["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Tx_side_winding_inner", "P_Tx_side_winding_outer"]]
+
+
+
 
 
 
