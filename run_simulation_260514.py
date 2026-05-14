@@ -496,7 +496,7 @@ class Simulation() :
 
         if self.df_plus["N1_side"].iloc[0] > 0 :
             df = df_original1.iloc[:, -4:]  # 마지막 4개 컬럼만 선택
-            df.columns = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]  # 컬럼 이름 변경
+            df.columns = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Tx_side_winding_inner", "P_Tx_side_winding_outer"]  # 컬럼 이름 변경
             self.df_calculator1 = df
         elif self.df_plus["N1_side"].iloc[0] == 0 :
             df = df_original1.iloc[:, -2:]  # 마지막 2개 컬럼만 선택
