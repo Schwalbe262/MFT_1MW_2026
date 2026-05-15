@@ -1,7 +1,8 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=20
+#SBATCH --cpus-per-task=40
+#SBATCH --mem=400G
 #SBATCH --time=12:00:00
 #SBATCH --partition=gpu4,gpu3,gpu6,gpu2,gpu1,cpu1
 #SBATCH --job-name=ANSYS
