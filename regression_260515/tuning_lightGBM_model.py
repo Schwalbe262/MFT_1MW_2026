@@ -477,22 +477,22 @@ MODEL_CONFIGS = [
     },
     {
         "name": "P_main_winding_inner_LightGBM_260515", 
-        "file": "data_P_main_winding_inner.csv",
+        "file": "data_P_Tx_main_winding_inner.csv",
         "wandb_project": "MFT_1MW_260515"
     },
     {
         "name": "P_main_winding_outer_LightGBM_260515", 
-        "file": "data_P_main_winding_outer.csv",
+        "file": "data_P_Tx_main_winding_outer.csv",
         "wandb_project": "MFT_1MW_260515"
     },
     {
         "name": "P_side_winding_inner_LightGBM_260515", 
-        "file": "data_P_side_winding_inner.csv",
+        "file": "data_P_Tx_side_winding_inner.csv",
         "wandb_project": "MFT_1MW_260515"
     },
     {
         "name": "P_side_winding_outer_LightGBM_260515", 
-        "file": "data_P_side_winding_outer.csv",    
+        "file": "data_P_Tx_side_winding_outer.csv",    
         "wandb_project": "MFT_1MW_260515"
     },
     {
