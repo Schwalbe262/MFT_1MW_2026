@@ -43,3 +43,6 @@ picture/
 
 # Ignore all CSV files
 *.csv
+
+# Ignore model foler
+best_model/

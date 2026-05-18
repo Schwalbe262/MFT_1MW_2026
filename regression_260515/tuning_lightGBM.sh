@@ -23,35 +23,7 @@ conda activate lightGBM
 # python tuning_wandb_TT_resonant.py
 
 
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
-python tuning_lightGBM_model.py
+for i in {1..10}
+do
+    python tuning_multi_model.py
+done
