@@ -787,7 +787,7 @@ for target_cfg in BASE_TARGET_CONFIGS:
         pretty_model_nm = "LightGBM" if model_type == "lightgbm" else model_type
         MODEL_CONFIGS.append(
             {
-                "name": f"{target_cfg['target_name']}_{pretty_model_nm}_260515",
+                "name": f"{target_cfg['target_name']}_{pretty_model_nm}_260518",
                 "target_name": target_cfg["target_name"],
                 "file": target_cfg["file"],
                 "wandb_project": target_cfg["wandb_project"],
