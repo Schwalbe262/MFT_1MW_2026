@@ -760,7 +760,7 @@ def get_or_create_sweep_id(sweep_config, project):
 # ================================================
 NUM_WORKER = 1
 NORMALIZE = False
-BASE_PATH = "/gpfs/home1/r1jae262/jupyter/MFT_1MW/MFT_1MW_2026/regression_260515"
+BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 RUN_MODE = "sweep"  # "sweep", "ensemble_baseline", or "ensemble_best"
 SWEEP_COUNT = 10
 OUTER_REPEAT = 100
