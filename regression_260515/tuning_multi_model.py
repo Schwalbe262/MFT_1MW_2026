@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import pickle
 import datetime
 import json
+import hashlib
 import shutil
 import lightgbm as lgb
 from types import SimpleNamespace
@@ -58,6 +59,25 @@ def to_jsonable(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
     return value
+
+
+def is_metric_improved(metric_name, current_value, best_values, key):
+    if current_value is None:
+        return False
+
+    if key not in best_values or best_values[key] is None:
+        return True
+
+    if metric_name == "R2":
+        return current_value > best_values[key]
+
+    return current_value < best_values[key]
+
+
+def make_sweep_id_key(sweep_name, sweep_config):
+    config_json = json.dumps(to_jsonable(sweep_config), sort_keys=True, default=str)
+    config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()[:12]
+    return f"sweep_id_{sweep_name}_{config_hash}"
 
 
 # ================================================
@@ -658,7 +678,7 @@ def sweep_train():
 
     key = "best_val_loss"
     current_val = splits.get("best_val_loss")
-    if key not in base_best_values or (current_val is not None and current_val < base_best_values[key]):
+    if is_metric_improved(key, current_val, base_best_values, key):
         improved_flag = True
 
     for split, metrics in splits.items():
@@ -667,11 +687,7 @@ def sweep_train():
 
         for metric_name, current_value in metrics.items():
             key = f"{split}_{metric_name}"
-            if key not in base_best_values:
-                improved_flag = True
-            elif metric_name == "R2" and current_value > base_best_values[key]:
-                improved_flag = True
-            elif metric_name != "R2" and current_value < base_best_values[key]:
+            if is_metric_improved(metric_name, current_value, base_best_values, key):
                 improved_flag = True
 
     if improved_flag:
@@ -717,12 +733,12 @@ def get_or_create_sweep_id(sweep_config, project):
         else:
             sweep_data = {}
 
-        key = f"sweep_id_{SWEEP_NM}"
+        key = make_sweep_id_key(SWEEP_NM, sweep_config)
         if key in sweep_data:
             sweep_id = sweep_data[key]
             try:
                 _ = wandb.Api().sweep(f"schwalbe-university-of-seoul/{project}/{sweep_id}")
-                print(f"Loaded existing sweep_id: {sweep_id}")
+                print(f"Loaded existing sweep_id for current config: {sweep_id}")
                 return sweep_id
             except Exception as e:
                 print(f"Existing sweep_id {sweep_id} is unavailable. Recreating sweep. Error: {e}")
@@ -754,15 +770,15 @@ STRICT_BEST_CONFIG = True  # if True, raise error when best sweep config is miss
 MODEL_TYPES = ["lightgbm", "random_forest", "extra_trees", "gradient_boosting"]
 
 BASE_TARGET_CONFIGS = [
-    {"target_name": "Lmt", "file": "data_Lmt.csv", "wandb_project": "MFT_1MW_260515"},
-    {"target_name": "Llt", "file": "data_Llt.csv", "wandb_project": "MFT_1MW_260515"},
-    {"target_name": "Tx_loss", "file": "data_Tx_loss.csv", "wandb_project": "MFT_1MW_260515"},
-    {"target_name": "Rx_loss", "file": "data_Rx_loss.csv", "wandb_project": "MFT_1MW_260515"},
-    {"target_name": "P_main_winding_inner", "file": "data_P_Tx_main_winding_inner.csv", "wandb_project": "MFT_1MW_260515"},
-    {"target_name": "P_main_winding_outer", "file": "data_P_Tx_main_winding_outer.csv", "wandb_project": "MFT_1MW_260515"},
-    {"target_name": "P_side_winding_inner", "file": "data_P_Tx_side_winding_inner.csv", "wandb_project": "MFT_1MW_260515"},
-    {"target_name": "P_side_winding_outer", "file": "data_P_Tx_side_winding_outer.csv", "wandb_project": "MFT_1MW_260515"},
-    {"target_name": "time", "file": "data_time.csv", "wandb_project": "MFT_1MW_260515"},
+    {"target_name": "Lmt", "file": "data_Lmt.csv", "wandb_project": "MFT_1MW_260518"},
+    {"target_name": "Llt", "file": "data_Llt.csv", "wandb_project": "MFT_1MW_260518"},
+    {"target_name": "Tx_loss", "file": "data_Tx_loss.csv", "wandb_project": "MFT_1MW_260518"},
+    {"target_name": "Rx_loss", "file": "data_Rx_loss.csv", "wandb_project": "MFT_1MW_260518"},
+    {"target_name": "P_main_winding_inner", "file": "data_P_Tx_main_winding_inner.csv", "wandb_project": "MFT_1MW_260518"},
+    {"target_name": "P_main_winding_outer", "file": "data_P_Tx_main_winding_outer.csv", "wandb_project": "MFT_1MW_260518"},
+    {"target_name": "P_side_winding_inner", "file": "data_P_Tx_side_winding_inner.csv", "wandb_project": "MFT_1MW_260518"},
+    {"target_name": "P_side_winding_outer", "file": "data_P_Tx_side_winding_outer.csv", "wandb_project": "MFT_1MW_260518"},
+    {"target_name": "time", "file": "data_time.csv", "wandb_project": "MFT_1MW_260518"},
 ]
 
 MODEL_CONFIGS = []
@@ -1012,8 +1028,8 @@ def resolve_best_config_file(base_path, model_config):
         return None, artifact_dir
 
     prioritized_candidates = [
-        os.path.join(artifact_dir, "best_config.json"),
         os.path.join(artifact_dir, "best_val_loss", "config.json"),
+        os.path.join(artifact_dir, "best_config.json"),
     ]
     for path in prioritized_candidates:
         if os.path.exists(path):
