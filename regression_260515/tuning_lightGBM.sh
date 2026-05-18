@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 #SBATCH --nodes=1
 #SBATCH --partition=gpu2,gpu3,gpu4,gpu5,gpu6
