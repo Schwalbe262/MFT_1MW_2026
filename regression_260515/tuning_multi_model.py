@@ -761,7 +761,7 @@ def get_or_create_sweep_id(sweep_config, project):
 NUM_WORKER = 1
 NORMALIZE = False
 BASE_PATH = "/gpfs/home1/r1jae262/jupyter/MFT_1MW/MFT_1MW_2026/regression_260515"
-RUN_MODE = "ensemble_best"  # "sweep", "ensemble_baseline", or "ensemble_best"
+RUN_MODE = "sweep"  # "sweep", "ensemble_baseline", or "ensemble_best"
 SWEEP_COUNT = 10
 OUTER_REPEAT = 100
 ENSEMBLE_METHOD = "median"  # "median" or "trimmed_mean"
@@ -1076,6 +1076,19 @@ def load_training_config_for_model(base_path, target_config, model_type, strict=
     return SimpleNamespace(**merged_cfg), merged_cfg, cfg_source
 
 
+def get_missing_best_config_messages(base_path):
+    missing = []
+    for target_config in BASE_TARGET_CONFIGS:
+        for model_type in MODEL_TYPES:
+            model_config = find_model_config_for_target(target_config, model_type)
+            best_config_path, artifact_dir = resolve_best_config_file(base_path, model_config)
+            if best_config_path is None:
+                missing.append(
+                    f"- target={target_config['target_name']}, model={model_type}, expected={artifact_dir}"
+                )
+    return missing
+
+
 def run_sweep(model_type):
     sweep_config = get_sweep_config(model_type)
     sweep_id = get_or_create_sweep_id(sweep_config, project=WANDB_PR)
@@ -1345,6 +1358,16 @@ def main():
         return
 
     if RUN_MODE == "ensemble_best":
+        missing = get_missing_best_config_messages(BASE_PATH)
+        if missing and STRICT_BEST_CONFIG:
+            print("Cannot run RUN_MODE='ensemble_best' because best configs are missing.")
+            print("Run RUN_MODE='sweep' first, then switch back to RUN_MODE='ensemble_best'.")
+            print("Missing best config targets:")
+            print("\n".join(missing[:20]))
+            if len(missing) > 20:
+                print(f"... and {len(missing) - 20} more")
+            raise SystemExit(1)
+
         seed = random.randint(1, 10000)
         for target_cfg in BASE_TARGET_CONFIGS:
             run_ensemble_best(
