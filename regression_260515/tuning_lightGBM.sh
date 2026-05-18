@@ -24,7 +24,7 @@ conda activate lightGBM
 # python tuning_wandb_TT_resonant.py
 
 
-for i in {1..10}
+for i in {1..3}
 do
     python tuning_multi_model.py
 done

@@ -772,13 +772,13 @@ MODEL_TYPES = ["lightgbm", "random_forest", "extra_trees", "gradient_boosting"]
 BASE_TARGET_CONFIGS = [
     {"target_name": "Lmt", "file": "data_Lmt.csv", "wandb_project": "MFT_1MW_260518"},
     {"target_name": "Llt", "file": "data_Llt.csv", "wandb_project": "MFT_1MW_260518"},
-    {"target_name": "Tx_loss", "file": "data_Tx_loss.csv", "wandb_project": "MFT_1MW_260518"},
-    {"target_name": "Rx_loss", "file": "data_Rx_loss.csv", "wandb_project": "MFT_1MW_260518"},
-    {"target_name": "P_main_winding_inner", "file": "data_P_Tx_main_winding_inner.csv", "wandb_project": "MFT_1MW_260518"},
-    {"target_name": "P_main_winding_outer", "file": "data_P_Tx_main_winding_outer.csv", "wandb_project": "MFT_1MW_260518"},
-    {"target_name": "P_side_winding_inner", "file": "data_P_Tx_side_winding_inner.csv", "wandb_project": "MFT_1MW_260518"},
-    {"target_name": "P_side_winding_outer", "file": "data_P_Tx_side_winding_outer.csv", "wandb_project": "MFT_1MW_260518"},
-    {"target_name": "time", "file": "data_time.csv", "wandb_project": "MFT_1MW_260518"},
+    # {"target_name": "Tx_loss", "file": "data_Tx_loss.csv", "wandb_project": "MFT_1MW_260518"},
+    # {"target_name": "Rx_loss", "file": "data_Rx_loss.csv", "wandb_project": "MFT_1MW_260518"},
+    # {"target_name": "P_main_winding_inner", "file": "data_P_Tx_main_winding_inner.csv", "wandb_project": "MFT_1MW_260518"},
+    # {"target_name": "P_main_winding_outer", "file": "data_P_Tx_main_winding_outer.csv", "wandb_project": "MFT_1MW_260518"},
+    # {"target_name": "P_side_winding_inner", "file": "data_P_Tx_side_winding_inner.csv", "wandb_project": "MFT_1MW_260518"},
+    # {"target_name": "P_side_winding_outer", "file": "data_P_Tx_side_winding_outer.csv", "wandb_project": "MFT_1MW_260518"},
+    # {"target_name": "time", "file": "data_time.csv", "wandb_project": "MFT_1MW_260518"},
 ]
 
 MODEL_CONFIGS = []
