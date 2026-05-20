@@ -737,13 +737,13 @@ class TransformerProblem(Problem):
         g8 = Llt4 - target_Llt*(1.0 + Llt_error)
 
         g9 = 1.0 - val # geometry validatiy check
-        g10 = np.where(np.isfinite(B_field), B_field - 0.6, 1e6) # B field check
+        g10 = np.where(np.isfinite(B_field), B_field - 0.75, 1e6) # B field check
 
 
 
 
         cw1 = plus_inp["cw1"].to_numpy(dtype=float)
-        g11 = np.where(np.isfinite(cw1), 3.0 - cw1, 1e6)  # cw1 >= 3
+        g11 = np.where(np.isfinite(cw1), 5.0 - cw1, 1e6)  # cw1 >= 3
         g12 = np.where(np.isfinite(cw1), cw1 - 6.0, 1e6)  # cw1 <= 6
 
 
