@@ -1,4 +1,4 @@
-# load model (txt + pkl 모두 대응)
+﻿# load model (txt + pkl 紐⑤몢 ???
 
 import os
 import pickle
@@ -112,9 +112,9 @@ def load_model_flexible(model_dir):
                     model = pickle.load(f)
             return model, path, kind
         except Exception as e:
-            errors.append(f"{kind} 실패 ({path}): {e}")
+            errors.append(f"{kind} ?ㅽ뙣 ({path}): {e}")
 
-    raise FileNotFoundError("로드 가능한 model.txt/model.pkl/model.pickle 없음\n" + "\n".join(errors))
+    raise FileNotFoundError("濡쒕뱶 媛?ν븳 model.txt/model.pkl/model.pickle ?놁쓬\n" + "\n".join(errors))
 
 models = {}
 model_info = {}
@@ -129,7 +129,7 @@ for name, label in zip(model_names, model_labels):
         model_info[label] = {"path": loaded_path, "type": loaded_type}
         print(f"Loaded: {label} <- {loaded_path} ({loaded_type})")
     except Exception as e:
-        print(f"[실패] {name}")
+        print(f"[?ㅽ뙣] {name}")
         print(e)
 
 
@@ -297,7 +297,7 @@ def plus_input_processing(input_df):
     out_df = pd.concat(out_rows, axis=0).reset_index(drop=True)
     # out_df["is_valid"] = results
 
-    # 1행 입력이면 기존 감각 유지
+    # 1???낅젰?대㈃ 湲곗〈 媛먭컖 ?좎?
     if len(out_df) == 1:
         return results[0], out_df
     return results, out_df
@@ -309,6 +309,7 @@ import pandas as pd
 import random
 import math
 import os
+import time
 
 from pymoo.core.problem import ElementwiseProblem
 from pymoo.algorithms.moo.nsga2 import NSGA2
@@ -319,7 +320,84 @@ from pymoo.operators.repair.rounding import RoundingRepair
 from pymoo.optimize import minimize
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
-# 위에서 IndentationError가 난 라인은 여기에 있으면 안되고, 함수 내에 있어야 함
+
+class SpinFileLock:
+    """
+    Cross-process lock via O_EXCL lock-file creation.
+    Works on multi-node runs when shared filesystem is used.
+    """
+    def __init__(self, lock_path, timeout=600.0, poll_interval=0.2, stale_seconds=7200.0):
+        self.lock_path = lock_path
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self.stale_seconds = stale_seconds
+        self._acquired = False
+
+    def acquire(self):
+        start = time.time()
+        while True:
+            try:
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(f"pid={os.getpid()} time={time.time()}\n")
+                self._acquired = True
+                return
+            except FileExistsError:
+                # Clean up stale lock file (e.g., crashed process)
+                try:
+                    mtime = os.path.getmtime(self.lock_path)
+                    if (time.time() - mtime) > self.stale_seconds:
+                        os.remove(self.lock_path)
+                        continue
+                except FileNotFoundError:
+                    pass
+
+                if (time.time() - start) > self.timeout:
+                    raise TimeoutError(f"Timeout while waiting lock: {self.lock_path}")
+                time.sleep(self.poll_interval)
+
+    def release(self):
+        if self._acquired:
+            try:
+                os.remove(self.lock_path)
+            except FileNotFoundError:
+                pass
+            self._acquired = False
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+def read_int_file(path, default=0):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        if raw == "":
+            return default
+        return int(raw)
+    except Exception:
+        return default
+
+
+def atomic_write_text(path, text):
+    tmp = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1e6)}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def atomic_write_csv(df, path):
+    tmp = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1e6)}"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+# ?꾩뿉??IndentationError媛 ???쇱씤? ?ш린???덉쑝硫??덈릺怨? ?⑥닔 ?댁뿉 ?덉뼱????
 
 inp = np.array([[1,2,3,4,5], [2,3,4,5,6]])
 
@@ -334,16 +412,16 @@ input_setup.append([40, 100, 1]) # l1
 input_setup.append([500, 1200, 1]) # total_length
 input_setup.append([500, 1000, 1]) # total_height
 
-input_setup.append([10, 50, 0.1]) # cc_w2c_space_x (코어~2차 중심 x방향 간격)
-input_setup.append([10, 50, 0.1]) # w2c_w1c_space_x (2차~1차 중심 x방향 간격)
-input_setup.append([10, 100, 0.1]) # w1c_w2s_space_x (1차 중심~2차 사이드 x방향 간격)
-input_setup.append([10, 50, 0.1]) # w2s_w1s_space_x (2차 사이드~1차 사이드 x방향 간격)
-input_setup.append([10, 50, 0.1]) # w1s_cs_space_x (1차 사이드~코어 측판 x방향 간격)
+input_setup.append([10, 50, 0.1]) # cc_w2c_space_x (肄붿뼱~2李?以묒떖 x諛⑺뼢 媛꾧꺽)
+input_setup.append([10, 50, 0.1]) # w2c_w1c_space_x (2李?1李?以묒떖 x諛⑺뼢 媛꾧꺽)
+input_setup.append([10, 100, 0.1]) # w1c_w2s_space_x (1李?以묒떖~2李??ъ씠??x諛⑺뼢 媛꾧꺽)
+input_setup.append([10, 50, 0.1]) # w2s_w1s_space_x (2李??ъ씠??1李??ъ씠??x諛⑺뼢 媛꾧꺽)
+input_setup.append([10, 50, 0.1]) # w1s_cs_space_x (1李??ъ씠??肄붿뼱 痢≫뙋 x諛⑺뼢 媛꾧꺽)
 
-input_setup.append([10, 50, 0.1]) # cc_w2c_space_y (코어~2차 중심 y방향 간격)
-input_setup.append([10, 50, 0.1]) # w2c_w1c_space_y (2차~1차 중심 y방향 간격)
-input_setup.append([10, 50, 0.1]) # cs_w1s_space_y (코어 측판~1차 사이드 y방향 간격)
-input_setup.append([10, 50, 0.1]) # w1s_w2s_space_y (1차 사이드~2차 사이드 y방향 간격)
+input_setup.append([10, 50, 0.1]) # cc_w2c_space_y (肄붿뼱~2李?以묒떖 y諛⑺뼢 媛꾧꺽)
+input_setup.append([10, 50, 0.1]) # w2c_w1c_space_y (2李?1李?以묒떖 y諛⑺뼢 媛꾧꺽)
+input_setup.append([10, 50, 0.1]) # cs_w1s_space_y (肄붿뼱 痢≫뙋~1李??ъ씠??y諛⑺뼢 媛꾧꺽)
+input_setup.append([10, 50, 0.1]) # w1s_w2s_space_y (1李??ъ씠??2李??ъ씠??y諛⑺뼢 媛꾧꺽)
 
 input_setup.append([0.3, 0.7, 0.01]) # window_ratio
 
@@ -364,7 +442,7 @@ def input_processing(input_vector):
     input_vector = np.array(input_vector)
     step = input_setup[:, 2]  # shape: (21,)
 
-    # input_vector가 1D면 (1, 21)로 reshape
+    # input_vector媛 1D硫?(1, 21)濡?reshape
     if input_vector.ndim == 1:
         input_vector = input_vector.reshape(1, -1)
 
@@ -384,7 +462,7 @@ def input_processing(input_vector):
     total_height = scaled_input[:, 6]
     h1 = (total_height - 2*l1)
 
-    # 다음 3개의 변수는 반드시 함수 내부에서 선언되어야 하고, 함수 바깥(글로벌)에서는 들여쓰기가 없어야 합니다.
+    # ?ㅼ쓬 3媛쒖쓽 蹂?섎뒗 諛섎뱶???⑥닔 ?대??먯꽌 ?좎뼵?섏뼱???섍퀬, ?⑥닔 諛붽묑(湲濡쒕쾶)?먯꽌???ㅼ뿬?곌린媛 ?놁뼱???⑸땲??
     cc_w2c_space_x = scaled_input[:, 7]
     w2c_w1c_space_x = scaled_input[:, 8]
     w1c_w2s_space_x = scaled_input[:, 9]
@@ -396,17 +474,17 @@ def input_processing(input_vector):
     cs_w1s_space_y = scaled_input[:, 14]
     w1s_w2s_space_y = scaled_input[:, 15]
     
-    # 1차 측과 2차 측의 비율
+    # 1李?痢↔낵 2李?痢≪쓽 鍮꾩쑉
     window_ratio = scaled_input[:, 16]
 
-    # 높이 비율율
+    # ?믪씠 鍮꾩쑉??
     wh1 = scaled_input[:, 17]
     wh2 = scaled_input[:, 18]
 
     wff1 = scaled_input[:, 19]
     wff2 = scaled_input[:, 20]
 
-    # 결과 stacking for inspection: 모든 주요 파라미터 포함
+    # 寃곌낵 stacking for inspection: 紐⑤뱺 二쇱슂 ?뚮씪誘명꽣 ?ы븿
     result = np.stack([
         N1,            # 0
         N2,            # 1
@@ -551,7 +629,7 @@ class TransformerProblem(Problem):
         X_size, Y_size, Z_size, volume = calculate_volume(plus_inp)
 
   
-        # 사이드 1차 권선 간격 (x)
+        # ?ъ씠??1李?沅뚯꽑 媛꾧꺽 (x)
         valid_mask = plus_inp.notna().all(axis=1).to_numpy()
 
         Tx_loss_lgbm = np.full(n, 1e6, dtype=float)
@@ -677,25 +755,25 @@ class TransformerProblem(Problem):
 
 
         # ======================
-        # 절연
+        # ?덉뿰
         # ======================
         insulation_distance = 15.0
 
 
 
-        # 메인 1차 권선 간격 (x)
+        # 硫붿씤 1李?沅뚯꽑 媛꾧꺽 (x)
         cc_w2c_space_x = plus_inp["cc_w2c_space_x"].to_numpy(dtype=float)
         g17 = np.where(np.isfinite(cc_w2c_space_x), insulation_distance - cc_w2c_space_x, 1e6)
 
-        # 메인 1차 권선 간격 (y)
+        # 硫붿씤 1李?沅뚯꽑 媛꾧꺽 (y)
         cc_w2c_space_y = plus_inp["cc_w2c_space_y"].to_numpy(dtype=float)
         g18 = np.where(np.isfinite(cc_w2c_space_y), insulation_distance - cc_w2c_space_y, 1e6)
 
-        # 메인 2차 권선 간격 (x)
+        # 硫붿씤 2李?沅뚯꽑 媛꾧꺽 (x)
         w2c_w1c_space_x = plus_inp["w2c_w1c_space_x"].to_numpy(dtype=float)
         g19 = np.where(np.isfinite(w2c_w1c_space_x), insulation_distance - w2c_w1c_space_x, 1e6)
 
-        # 메인 2차 권선 간격 (y)
+        # 硫붿씤 2李?沅뚯꽑 媛꾧꺽 (y)
         w2c_w1c_space_y = plus_inp["w2c_w1c_space_y"].to_numpy(dtype=float)
         g20 = np.where(np.isfinite(w2c_w1c_space_y), insulation_distance - w2c_w1c_space_y, 1e6)
 
@@ -704,7 +782,7 @@ class TransformerProblem(Problem):
 
 
 
-        # 사이드 1차 권선 간격 (x) (N1_side = 0일때는 고려 X)
+        # ?ъ씠??1李?沅뚯꽑 媛꾧꺽 (x) (N1_side = 0?쇰븣??怨좊젮 X)
         N1_side = plus_inp["N1_side"].to_numpy(dtype=float)
         gap_w1s_x = plus_inp["w1s_cs_space_x"].to_numpy(dtype=float)
         active_side = N1_side >= 1.0
@@ -712,7 +790,7 @@ class TransformerProblem(Problem):
                        np.where(np.isfinite(gap_w1s_x), insulation_distance - gap_w1s_x, 1e6),
                        0.0)  # if N1_side == 0, unconstrained
 
-        # 사이드 1차 권선 간격 (y) (N1_side = 0일때는 고려 X)
+        # ?ъ씠??1李?沅뚯꽑 媛꾧꺽 (y) (N1_side = 0?쇰븣??怨좊젮 X)
         N1_side = plus_inp["N1_side"].to_numpy(dtype=float)
         gap_w1s_x = plus_inp["cs_w1s_space_y"].to_numpy(dtype=float)
         active_side = N1_side >= 1.0
@@ -720,7 +798,7 @@ class TransformerProblem(Problem):
                        np.where(np.isfinite(gap_w1s_x), insulation_distance - gap_w1s_x, 1e6),
                        0.0)  # if N1_side == 0, unconstrained
 
-        # 사이드 2차 권선 간격 (x)
+        # ?ъ씠??2李?沅뚯꽑 媛꾧꺽 (x)
         N1_side = plus_inp["N1_side"].to_numpy(dtype=float)
         w1s_cs_space_x = plus_inp["w1s_cs_space_x"].to_numpy(dtype=float)
         w2s_w1s_space_x = plus_inp["w2s_w1s_space_x"].to_numpy(dtype=float)
@@ -729,7 +807,7 @@ class TransformerProblem(Problem):
                             w2s_w1s_space_x)
         g23 = np.where(np.isfinite(gap_w2s_x), insulation_distance - gap_w2s_x, 1e6)  # gap_w2s_x >= 20
         
-        # 사이드 2차 권선 간격 (y)
+        # ?ъ씠??2李?沅뚯꽑 媛꾧꺽 (y)
         N1_side = plus_inp["N1_side"].to_numpy(dtype=float)
         w1s_cs_space_y = plus_inp["cs_w1s_space_y"].to_numpy(dtype=float)
         w2s_w1s_space_y = plus_inp["w1s_w2s_space_y"].to_numpy(dtype=float)
@@ -880,7 +958,7 @@ def build_df_from_result(res):
 
 
 # ======================================
-# 메인 실행부
+# 硫붿씤 ?ㅽ뻾遺
 # ======================================
 MU, NGEN = 100, 1000
 CXPB, MUTPB = 0.7, 0.3
@@ -907,58 +985,58 @@ def run_nsga2(seed):
     )
 
 
-# 이전 결과 파일이 있으면 로드
-pareto_file = 'pareto_front.csv'
-if os.path.exists(pareto_file):
-    previous_pareto = pd.read_csv(pareto_file)
-else:
-    previous_pareto = pd.DataFrame()
+# ?댁쟾 寃곌낵 ?뚯씪???덉쑝硫?濡쒕뱶
+pareto_file = "pareto_front.csv"
 
-# 루프 카운터 파일 로드 또는 생성
-loop_counter_file = 'loop_counter.txt'
-if os.path.exists(loop_counter_file):
-    with open(loop_counter_file, 'r') as f:
-        loop_counter = int(f.read().strip())
-else:
-    loop_counter = 0
-
-all_results = []
+# 猷⑦봽 移댁슫???뚯씪 濡쒕뱶 ?먮뒗 ?앹꽦
+loop_counter_file = "loop_counter.txt"
+lock_file = "pareto_front.lock"
 for itr in range(NUM_ITRS):
     print(f"Running NSGA-II {itr+1} / {NUM_ITRS}")
     seed = np.random.randint(0, 1000000)
     res = run_nsga2(seed)
-    
+
     try:
         df = build_df_from_result(res)
-        if df is not None:
-            all_results.append(df)
-            
-            # 현재까지의 결과와 이전 파레토 프론트 결합
-            df_current = pd.concat(all_results + [previous_pareto], ignore_index=True)
-            F = df_current[["volume", "eff"]].to_numpy()
-            F[:, 1] = -F[:, 1]  # 효율 최대화 → 부호 반전
+        if df is not None and not df.empty:
+            with SpinFileLock(lock_file, timeout=1800.0, poll_interval=0.2):
+                # Always re-read shared files inside lock for multi-node safety.
+                if os.path.exists(pareto_file):
+                    previous_pareto = pd.read_csv(pareto_file)
+                else:
+                    previous_pareto = pd.DataFrame()
 
-            # Non-dominated sorting
-            nds = NonDominatedSorting().do(F, only_non_dominated_front=True)
-            df_pareto = df_current.iloc[nds].copy()
-            df_pareto["eff"] = -F[nds, 1]  # 다시 양수로 되돌리기
-            df_pareto = df_pareto.sort_values(by="eff", ascending=False).reset_index(drop=True)
-            
-            # 현재 파레토 프론트 저장
-            df_pareto.to_csv(pareto_file, index=False)
-            
-            # 루프 카운터 증가 및 저장
-            loop_counter += 1
-            with open(loop_counter_file, 'w') as f:
-                f.write(str(loop_counter))
-            
-            # 10번마다 백업 파일 생성
-            if loop_counter % 10 == 0 or loop_counter == 1:
-                backup_file = f'pareto_front_backup_{loop_counter}.csv'
-                df_pareto.to_csv(backup_file, index=False)
+                loop_counter = read_int_file(loop_counter_file, default=0)
+
+                # Merge this iteration's candidates with latest global Pareto.
+                df_current = pd.concat([df, previous_pareto], ignore_index=True)
+                if df_current.empty:
+                    continue
+
+                F = df_current[["volume", "eff"]].to_numpy()
+                F[:, 1] = -F[:, 1]  # maximize eff -> minimize -eff
+
+                nds = NonDominatedSorting().do(F, only_non_dominated_front=True)
+                df_pareto = df_current.iloc[nds].copy()
+                df_pareto["eff"] = -F[nds, 1]
+                df_pareto = df_pareto.sort_values(by="eff", ascending=False).reset_index(drop=True)
+
+                # Atomic writes while lock is held.
+                atomic_write_csv(df_pareto, pareto_file)
+
+                loop_counter += 1
+                atomic_write_text(loop_counter_file, str(loop_counter))
+
+                backup_file = f"pareto_front_backup_{loop_counter}.csv"
+                atomic_write_csv(df_pareto, backup_file)
                 print(f"Backup created: {backup_file}")
-                
+
             print(f"Iteration {itr+1} Pareto front saved (Total loops: {loop_counter})")
+        else:
+            print(f"Iteration {itr+1} skipped: empty result")
+    except TimeoutError as e:
+        print(f"Iteration {itr+1} lock timeout: {str(e)}")
+        continue
     except AttributeError as e:
         print(f"Iteration {itr+1} failed: {str(e)}")
         continue
@@ -966,8 +1044,8 @@ for itr in range(NUM_ITRS):
         print(f"Unexpected error in iteration {itr+1}: {str(e)}")
         continue
 
-# 최종 결과 출력
-if 'df_pareto' in locals():
+if os.path.exists(pareto_file):
+    df_pareto = pd.read_csv(pareto_file)
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', None)
     print("Final Pareto front:")
