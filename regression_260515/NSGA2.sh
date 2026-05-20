@@ -21,4 +21,4 @@ export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 echo "HOST=$(hostname)"
 echo "SLURM_JOB_ID=$SLURM_JOB_ID"
 
-srun --cpu-bind=cores NSGA2_260520.py
+python NSGA2_260520.py
