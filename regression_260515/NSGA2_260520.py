@@ -312,6 +312,10 @@ import os
 
 from pymoo.core.problem import ElementwiseProblem
 from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.operators.sampling.rnd import IntegerRandomSampling
+from pymoo.operators.crossover.sbx import SBX
+from pymoo.operators.mutation.pm import PM
+from pymoo.operators.repair.rounding import RoundingRepair
 from pymoo.optimize import minimize
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
