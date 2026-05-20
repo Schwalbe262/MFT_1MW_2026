@@ -985,12 +985,13 @@ def run_nsga2(seed):
     )
 
 
-# ?댁쟾 寃곌낵 ?뚯씪???덉쑝硫?濡쒕뱶
-pareto_file = "pareto_front.csv"
+# Save all NSGA-II artifacts under NSGA2_result/
+result_dir = os.path.join(os.getcwd(), "NSGA2_result")
+os.makedirs(result_dir, exist_ok=True)
 
-# 猷⑦봽 移댁슫???뚯씪 濡쒕뱶 ?먮뒗 ?앹꽦
-loop_counter_file = "loop_counter.txt"
-lock_file = "pareto_front.lock"
+pareto_file = os.path.join(result_dir, "pareto_front.csv")
+loop_counter_file = os.path.join(result_dir, "loop_counter.txt")
+lock_file = os.path.join(result_dir, "pareto_front.lock")
 for itr in range(NUM_ITRS):
     print(f"Running NSGA-II {itr+1} / {NUM_ITRS}")
     seed = np.random.randint(0, 1000000)
@@ -1027,7 +1028,7 @@ for itr in range(NUM_ITRS):
                 loop_counter += 1
                 atomic_write_text(loop_counter_file, str(loop_counter))
 
-                backup_file = f"pareto_front_backup_{loop_counter}.csv"
+                backup_file = os.path.join(result_dir, f"pareto_front_backup_{loop_counter}.csv")
                 atomic_write_csv(df_pareto, backup_file)
                 print(f"Backup created: {backup_file}")
 
