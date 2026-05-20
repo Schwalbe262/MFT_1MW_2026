@@ -748,10 +748,25 @@ class TransformerProblem(Problem):
 
 
         # Tx loss component upper bounds (<= 200)
-        g13 = np.where(np.isfinite(Tx_loss_main_inner), Tx_loss_main_inner - 200.0, 1e6)
-        g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer - 200.0, 1e6)
-        g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner - 200.0, 1e6)
-        g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer - 200.0, 1e6)
+
+        sl1_main_x = plus_inp["sl1_main_x"].to_numpy(dtype=float)
+        sl1_main_y = plus_inp["sl1_main_y"].to_numpy(dtype=float)
+        sl1_side_x = plus_inp["sl1_side_x"].to_numpy(dtype=float)
+        sl1_side_y = plus_inp["sl1_side_y"].to_numpy(dtype=float)
+        nwl1_main = plus_inp["nwl1_main"].to_numpy(dtype=float)
+        nwl1_side = plus_inp["nwl1_side"].to_numpy(dtype=float)
+
+        main_inner_length = 2*(sl1_main_x + sl1_main_y)
+        main_outer_length = main_inner_length + 4*nwl1_main
+        side_inner_length = 2*(sl1_side_x + sl1_side_y)
+        side_outer_length = side_inner_length + 4*nwl1_side
+
+        # 단위 길이당 최외곽 손실 목표값
+        target_Tx_loss = 0.1 # unit W/mm (1600mm에 150W정도 나옴)
+        g13 = np.where(np.isfinite(Tx_loss_main_inner), Tx_loss_main_inner/ main_inner_length - target_Tx_loss, 1e6)
+        g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer/ main_outer_length - target_Tx_loss, 1e6)
+        g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner/ side_inner_length - target_Tx_loss, 1e6)
+        g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer/ side_outer_length - target_Tx_loss, 1e6)
 
 
         # ======================
