@@ -942,3 +942,25 @@ if 'df_pareto' in locals():
     print(df_pareto)
 else:
     print("No valid results found")
+
+
+
+def run_nsga2(seed):
+    np.random.seed(seed)
+    random.seed(seed)
+
+    algorithm = NSGA2(
+        pop_size=MU,
+        sampling=IntegerRandomSampling(),
+        crossover=SBX(prob=CXPB, eta=15, repair=RoundingRepair()),
+        mutation=PM(eta=20, repair=RoundingRepair()),
+        eliminate_duplicates=True
+    )
+
+    return minimize(
+        problem=TransformerProblem(),
+        algorithm=algorithm,
+        termination=('n_gen', NGEN),
+        seed=seed,
+        verbose=True
+    )
