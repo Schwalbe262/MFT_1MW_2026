@@ -874,6 +874,26 @@ MU, NGEN = 100, 1000
 CXPB, MUTPB = 0.7, 0.3
 NUM_ITRS = 1000
 
+def run_nsga2(seed):
+    np.random.seed(seed)
+    random.seed(seed)
+
+    algorithm = NSGA2(
+        pop_size=MU,
+        sampling=IntegerRandomSampling(),
+        crossover=SBX(prob=CXPB, eta=15, repair=RoundingRepair()),
+        mutation=PM(eta=20, repair=RoundingRepair()),
+        eliminate_duplicates=True
+    )
+
+    return minimize(
+        problem=TransformerProblem(),
+        algorithm=algorithm,
+        termination=('n_gen', NGEN),
+        seed=seed,
+        verbose=True
+    )
+
 
 # 이전 결과 파일이 있으면 로드
 pareto_file = 'pareto_front.csv'
@@ -945,22 +965,3 @@ else:
 
 
 
-def run_nsga2(seed):
-    np.random.seed(seed)
-    random.seed(seed)
-
-    algorithm = NSGA2(
-        pop_size=MU,
-        sampling=IntegerRandomSampling(),
-        crossover=SBX(prob=CXPB, eta=15, repair=RoundingRepair()),
-        mutation=PM(eta=20, repair=RoundingRepair()),
-        eliminate_duplicates=True
-    )
-
-    return minimize(
-        problem=TransformerProblem(),
-        algorithm=algorithm,
-        termination=('n_gen', NGEN),
-        seed=seed,
-        verbose=True
-    )
