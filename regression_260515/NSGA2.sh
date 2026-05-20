@@ -1,27 +1,24 @@
 #!/bin/bash
-
 #SBATCH --nodes=1
-#SBATCH --partition=gpu2,gpu3,gpu4,gpu5,gpu6
-#SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:1
-#SBATCH --job-name=CNN_tuning
-#SBATCH -o ./log/SLURM.%N.%j.out         # STDOUT
-#SBATCH -e ./log/SLURM.%N.%j.err         # STDERR
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --time=12:00:00
+#SBATCH --partition=gpu4,gpu3,gpu6,gpu2,gpu1,cpu1
+#SBATCH --job-name=NSGA2
+#SBATCH -o ./log/SLURM.%N.%j.out
+#SBATCH -e ./log/SLURM.%N.%j.err
 
+mkdir -p ./log
 
+module purge
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate deap_25v1
 
-# python tuning_wandb_Lmt.py
-# python tuning_wandb_Llt.py
-# python tuning_wandb_copperloss_Tx.py
-# python tuning_wandb_ratio_100M.py
-# python tuning_wandb_LT_100M.py
-# python tuning_wandb_LR_100M.py
-# python tuning_wandb_RT_100M.py
-# python tuning_wandb_RR_100M.py
-# python tuning_wandb_TT_resonant.py
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
+echo "HOST=$(hostname)"
+echo "SLURM_JOB_ID=$SLURM_JOB_ID"
 
-python NSGA2_260520.py
+srun --cpu-bind=cores NSGA2_260520.py
