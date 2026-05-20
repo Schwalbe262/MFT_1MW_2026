@@ -507,7 +507,7 @@ def calculate_volume(plus_inp) :
     X_size = (4*l1 + 2*l2) + 2*((w2s_w1s_space_x + w1s_cs_space_x) + (nwl1_side + nwl2_side))
     Y_size_main = (w1) + 2*((cc_w2c_space_y + w2c_w1c_space_y) + (nwl1_main + nwl2_main))
     Y_size_side = (w1) + 2*((cs_w1s_space_y + w1s_w2s_space_y) + (nwl1_side + nwl2_side))
-    Y_size = np.max([Y_size_main, Y_size_side])
+    Y_size = np.maximum(Y_size_main, Y_size_side)
     Z_size = 2*l1 + h1
 
     volume = X_size * Y_size * Z_size * 1e-6 # unit : liter
@@ -642,7 +642,8 @@ class TransformerProblem(Problem):
 
         # 4) objectives
         f1 = np.nan_to_num(volume, nan=1e12, posinf=1e12, neginf=1e12)
-        f2 = np.nan_to_num(eff, nan=1e12, posinf=1e12, neginf=1e12)
+        # f2 is maximized via -f2 in objective, so invalid values must be small (not huge).
+        f2 = np.nan_to_num(eff, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 5) constraints (g <= 0)
         
@@ -664,7 +665,7 @@ class TransformerProblem(Problem):
 
 
         cw1 = plus_inp["cw1"].to_numpy(dtype=float)
-        g11 = np.where(np.isfinite(cw1), 3.0 - cw1, 1e6)  # cw1 >= 4
+        g11 = np.where(np.isfinite(cw1), 3.0 - cw1, 1e6)  # cw1 >= 3
         g12 = np.where(np.isfinite(cw1), cw1 - 6.0, 1e6)  # cw1 <= 6
 
 
@@ -751,14 +752,22 @@ class TransformerProblem(Problem):
 
 def build_df_from_result(res):
 
+    if res.X is None or len(res.X) == 0:
+        return pd.DataFrame()
+
     pareto_X = res.X.astype(int)
-    
     rows = []
 
+    def _scalar(v):
+        return float(np.asarray(v).reshape(-1)[0])
+
     for x in pareto_X:
-        inp = input_processing(res.X[0,:])
+        inp = input_processing(x)
         validation, plus_inp = plus_input_processing(inp)
-        np_inp = np.array(plus_inp)
+
+        # Skip invalid rows that cannot be evaluated by sklearn GB models.
+        if not plus_inp.notna().all(axis=1).iloc[0]:
+            continue
 
         V_core, A_core, B_field, core_loss = calculate_core_loss(plus_inp)
         X_size, Y_size, Z_size, volume = calculate_volume(plus_inp)
@@ -793,7 +802,7 @@ def build_df_from_result(res):
         P_main_winding_inner_rf = models["P_main_winding_inner_random_forest"].predict(plus_inp)
         P_main_winding_inner_avg = np.mean(np.column_stack([P_main_winding_inner_lgbm, P_main_winding_inner_et, P_main_winding_inner_gb, P_main_winding_inner_rf]), axis=1)
 
-        P_main_winding_outer_lgbm = models["P_main_winding_outer_LightGBM"].predict(plus_inp)   
+        P_main_winding_outer_lgbm = models["P_main_winding_outer_LightGBM"].predict(plus_inp)
         P_main_winding_outer_et = models["P_main_winding_outer_extra_trees"].predict(plus_inp)
         P_main_winding_outer_gb = models["P_main_winding_outer_gradient_boosting"].predict(plus_inp)
         P_main_winding_outer_rf = models["P_main_winding_outer_random_forest"].predict(plus_inp)
@@ -813,58 +822,57 @@ def build_df_from_result(res):
 
         total_loss = Tx_loss_avg + Rx_loss_avg + core_loss
 
-        row = plus_inp
+        row = plus_inp.iloc[0].to_dict()
         row.update({
-            "X_size": X_size,
-            "Y_size": Y_size,
-            "Z_size": Z_size,
-            "volume": volume,
-            "B_field": B_field,
-            "core_loss": core_loss,
-            "total_loss": total_loss,
-            "eff" : 1e+3 / (1e+6 + total_loss) * 100,
-            "Lmt_avg": Lmt_avg,
-            "Llt_avg": Llt_avg,
-            "Tx_loss_avg": Tx_loss_avg,
-            "Rx_loss_avg": Rx_loss_avg,
-            "P_main_winding_inner_avg": P_main_winding_inner_avg,
-            "P_main_winding_outer_avg": P_main_winding_outer_avg,
-            "P_side_winding_inner_avg": P_side_winding_inner_avg,
-            "P_side_winding_outer_avg": P_side_winding_outer_avg,
-
-            "Lmt_lgbm": Lmt_lgbm,
-            "Lmt_et": Lmt_et,
-            "Lmt_gb": Lmt_gb,
-            "Lmt_rf": Lmt_rf,
-            "Llt_lgbm": Llt_lgbm,
-            "Llt_et": Llt_et,
-            "Llt_gb": Llt_gb,
-            "Llt_rf": Llt_rf,
-            "Tx_loss_lgbm": Tx_loss_lgbm,
-            "Tx_loss_et": Tx_loss_et,
-            "Tx_loss_gb": Tx_loss_gb,
-            "Tx_loss_rf": Tx_loss_rf,
-            "Rx_loss_lgbm": Rx_loss_lgbm,
-            "Rx_loss_et": Rx_loss_et,
-            "Rx_loss_gb": Rx_loss_gb,
-            "Rx_loss_rf": Rx_loss_rf,
-            "P_main_winding_inner_lgbm": P_main_winding_inner_lgbm,
-            "P_main_winding_inner_et": P_main_winding_inner_et,
-            "P_main_winding_inner_gb": P_main_winding_inner_gb,
-            "P_main_winding_inner_rf": P_main_winding_inner_rf,
-            "P_main_winding_outer_lgbm": P_main_winding_outer_lgbm,
-            "P_main_winding_outer_et": P_main_winding_outer_et,
-            "P_main_winding_outer_gb": P_main_winding_outer_gb,
-            "P_main_winding_outer_rf": P_main_winding_outer_rf,
-            "P_side_winding_inner_lgbm": P_side_winding_inner_lgbm,
-            "P_side_winding_inner_et": P_side_winding_inner_et,
-            "P_side_winding_inner_gb": P_side_winding_inner_gb,
-            "P_side_winding_inner_rf": P_side_winding_inner_rf,
-            "P_side_winding_outer_lgbm": P_side_winding_outer_lgbm,
-            "P_side_winding_outer_et": P_side_winding_outer_et,
-            "P_side_winding_outer_gb": P_side_winding_outer_gb,
-            "P_side_winding_outer_rf": P_side_winding_outer_rf
-            
+            "validation": bool(np.asarray(validation).reshape(-1)[0]),
+            "X_size": _scalar(X_size),
+            "Y_size": _scalar(Y_size),
+            "Z_size": _scalar(Z_size),
+            "volume": _scalar(volume),
+            "B_field": _scalar(B_field),
+            "core_loss": _scalar(core_loss),
+            "total_loss": _scalar(total_loss),
+            "eff": _scalar(1e+6 / (1e+6 + total_loss) * 100),
+            "Lmt_avg": _scalar(Lmt_avg),
+            "Llt_avg": _scalar(Llt_avg),
+            "Tx_loss_avg": _scalar(Tx_loss_avg),
+            "Rx_loss_avg": _scalar(Rx_loss_avg),
+            "P_main_winding_inner_avg": _scalar(P_main_winding_inner_avg),
+            "P_main_winding_outer_avg": _scalar(P_main_winding_outer_avg),
+            "P_side_winding_inner_avg": _scalar(P_side_winding_inner_avg),
+            "P_side_winding_outer_avg": _scalar(P_side_winding_outer_avg),
+            "Lmt_lgbm": _scalar(Lmt_lgbm),
+            "Lmt_et": _scalar(Lmt_et),
+            "Lmt_gb": _scalar(Lmt_gb),
+            "Lmt_rf": _scalar(Lmt_rf),
+            "Llt_lgbm": _scalar(Llt_lgbm),
+            "Llt_et": _scalar(Llt_et),
+            "Llt_gb": _scalar(Llt_gb),
+            "Llt_rf": _scalar(Llt_rf),
+            "Tx_loss_lgbm": _scalar(Tx_loss_lgbm),
+            "Tx_loss_et": _scalar(Tx_loss_et),
+            "Tx_loss_gb": _scalar(Tx_loss_gb),
+            "Tx_loss_rf": _scalar(Tx_loss_rf),
+            "Rx_loss_lgbm": _scalar(Rx_loss_lgbm),
+            "Rx_loss_et": _scalar(Rx_loss_et),
+            "Rx_loss_gb": _scalar(Rx_loss_gb),
+            "Rx_loss_rf": _scalar(Rx_loss_rf),
+            "P_main_winding_inner_lgbm": _scalar(P_main_winding_inner_lgbm),
+            "P_main_winding_inner_et": _scalar(P_main_winding_inner_et),
+            "P_main_winding_inner_gb": _scalar(P_main_winding_inner_gb),
+            "P_main_winding_inner_rf": _scalar(P_main_winding_inner_rf),
+            "P_main_winding_outer_lgbm": _scalar(P_main_winding_outer_lgbm),
+            "P_main_winding_outer_et": _scalar(P_main_winding_outer_et),
+            "P_main_winding_outer_gb": _scalar(P_main_winding_outer_gb),
+            "P_main_winding_outer_rf": _scalar(P_main_winding_outer_rf),
+            "P_side_winding_inner_lgbm": _scalar(P_side_winding_inner_lgbm),
+            "P_side_winding_inner_et": _scalar(P_side_winding_inner_et),
+            "P_side_winding_inner_gb": _scalar(P_side_winding_inner_gb),
+            "P_side_winding_inner_rf": _scalar(P_side_winding_inner_rf),
+            "P_side_winding_outer_lgbm": _scalar(P_side_winding_outer_lgbm),
+            "P_side_winding_outer_et": _scalar(P_side_winding_outer_et),
+            "P_side_winding_outer_gb": _scalar(P_side_winding_outer_gb),
+            "P_side_winding_outer_rf": _scalar(P_side_winding_outer_rf),
         })
         rows.append(row)
 
