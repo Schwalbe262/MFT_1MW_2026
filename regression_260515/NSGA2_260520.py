@@ -725,7 +725,7 @@ class TransformerProblem(Problem):
 
         # 5) constraints (g <= 0)
         
-        target_Llt = 27.0
+        target_Llt = 30.0
         Llt_error = 0.02
         g1 = target_Llt*(1.0 - Llt_error) - Llt1
         g2 = Llt1 - target_Llt*(1.0 + Llt_error)
