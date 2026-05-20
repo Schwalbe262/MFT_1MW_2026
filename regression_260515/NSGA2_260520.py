@@ -535,8 +535,11 @@ def calculate_core_loss(plus_inp) :
     w1 = plus_inp["w1"].to_numpy(dtype=float) * 1e-3
     h1 = plus_inp["h1"].to_numpy(dtype=float) * 1e-3
 
+    fill_factor = 0.8
+
     V_core = 2.0 * (w1 * (2.0*l1 + l2) * (2.0*l1 + h1) - w1 * (l2 * h1))
-    A_core = 2.0 * w1 * l1 * 0.7
+    V_core_effective = V_core * fill_factor
+    A_core = 2.0 * w1 * l1 * fill_factor
 
     denom = 4.0 * N1 * A_core
 
@@ -546,7 +549,7 @@ def calculate_core_loss(plus_inp) :
         B_field = np.divide(m * V1 * Ts, denom)
 
     cm, xx, yy = 1.38, 1.51, 1.74  # 1K101 (W/m^3)
-    core_loss = cm * (freq ** xx) * np.power(B_field, yy) * V_core  # freq[Hz], B[T]
+    core_loss = cm * (freq ** xx) * np.power(B_field, yy) * V_core_effective  # freq[Hz], B[T]
 
 
     return V_core, A_core, B_field, core_loss
