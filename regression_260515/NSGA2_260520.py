@@ -834,6 +834,8 @@ class TransformerProblem(Problem):
                             w2s_w1s_space_y)
         g24 = np.where(np.isfinite(gap_w2s_y), insulation_distance - gap_w2s_y, 1e6)  # gap_w2s_y >= 20
 
+        
+
         # height-direction insulation gaps
         h_gap1 = plus_inp["h_gap1"].to_numpy(dtype=float)
         h_gap2 = plus_inp["h_gap2"].to_numpy(dtype=float)
