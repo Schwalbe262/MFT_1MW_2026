@@ -609,7 +609,7 @@ class TransformerProblem(Problem):
         xu = np.array(max_value.tolist(), dtype=int)
         super().__init__(n_var=len(min_value),
                          n_obj=2,
-                         n_ieq_constr=27,
+                         n_ieq_constr=26,
                          xl=xl,
                          xu=xu,
                          vtype=int)
@@ -718,11 +718,11 @@ class TransformerProblem(Problem):
         Tx_loss_side_inner = np.mean(np.column_stack([Tx_loss_side_inner_lgbm, Tx_loss_side_inner_et, Tx_loss_side_inner_gb, Tx_loss_side_inner_rf]), axis=1)
         Tx_loss_side_outer = np.mean(np.column_stack([Tx_loss_side_outer_lgbm, Tx_loss_side_outer_et, Tx_loss_side_outer_gb, Tx_loss_side_outer_rf]), axis=1)
 
-        total_loss = Tx_loss + Rx_loss + core_loss
+        total_loss = 3*(Tx_loss + Rx_loss) + core_loss
         eff = 1e+6 / (1e+6 + total_loss) * 100
 
         # 4) objectives
-        f1 = np.nan_to_num(X_size*Y_size, nan=1e12, posinf=1e12, neginf=1e12)
+        f1 = np.nan_to_num(volume, nan=1e12, posinf=1e12, neginf=1e12)
         # f2 is maximized via -f2 in objective, so invalid values must be small (not huge).
         f2 = np.nan_to_num(eff, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -740,7 +740,7 @@ class TransformerProblem(Problem):
         g8 = Llt4 - target_Llt*(1.0 + Llt_error)
 
         g9 = 1.0 - val # geometry validatiy check
-        g10 = np.where(np.isfinite(B_field), B_field - 0.75, 1e6) # B field check
+        g10 = np.where(np.isfinite(B_field), B_field - 0.6, 1e6) # B field check
 
 
 
@@ -765,7 +765,7 @@ class TransformerProblem(Problem):
         side_outer_length = side_inner_length + 4*nwl1_side
 
         # 단위 길이당 최외곽 손실 목표값
-        target_Tx_loss = 0.15 # unit W/mm (1600mm에 150W정도 나옴)
+        target_Tx_loss = 0.10 # unit W/mm (1600mm에 150W정도 나옴)
         g13 = np.where(np.isfinite(Tx_loss_main_inner), Tx_loss_main_inner/ main_inner_length - target_Tx_loss, 1e6)
         g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer/ main_outer_length - target_Tx_loss, 1e6)
         g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner/ side_inner_length - target_Tx_loss, 1e6)
@@ -840,14 +840,10 @@ class TransformerProblem(Problem):
         g25 = np.where(np.isfinite(h_gap1), insulation_distance - h_gap1, 1e6)
         g26 = np.where(np.isfinite(h_gap2), insulation_distance - h_gap2, 1e6)
 
-
-        g27 = np.where(np.isfinite(Z_size), Z_size - 600, 1e6)
-
-
         
 
 
-        G = np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27]).astype(float)
+        G = np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26]).astype(float)
         F = np.column_stack([f1, -f2]).astype(float)
 
         out["F"] = F
