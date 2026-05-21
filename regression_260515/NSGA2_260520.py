@@ -718,7 +718,7 @@ class TransformerProblem(Problem):
         Tx_loss_side_inner = np.mean(np.column_stack([Tx_loss_side_inner_lgbm, Tx_loss_side_inner_et, Tx_loss_side_inner_gb, Tx_loss_side_inner_rf]), axis=1)
         Tx_loss_side_outer = np.mean(np.column_stack([Tx_loss_side_outer_lgbm, Tx_loss_side_outer_et, Tx_loss_side_outer_gb, Tx_loss_side_outer_rf]), axis=1)
 
-        total_loss = 3*(Tx_loss + Rx_loss) + core_loss
+        total_loss = 1*(Tx_loss + Rx_loss) + core_loss
         eff = 1e+6 / (1e+6 + total_loss) * 100
 
         # 4) objectives
