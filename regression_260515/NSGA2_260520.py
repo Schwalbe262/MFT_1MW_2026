@@ -310,6 +310,7 @@ import random
 import math
 import os
 import time
+import socket
 
 from pymoo.core.problem import ElementwiseProblem
 from pymoo.algorithms.moo.nsga2 import NSGA2
@@ -774,10 +775,10 @@ class TransformerProblem(Problem):
         # g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer/ main_outer_length - target_Tx_loss, 1e6)
         # g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner/ side_inner_length - target_Tx_loss, 1e6)
         # g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer/ side_outer_length - target_Tx_loss, 1e6)
-        g13 = np.where(np.isfinite(Tx_loss), Tx_loss - target_Tx_loss, 1e6)
-        g14 = np.where(np.isfinite(Tx_loss), Tx_loss - target_Tx_loss, 1e6)
-        g15 = np.where(np.isfinite(Tx_loss), Tx_loss - target_Tx_loss, 1e6)
-        g16 = np.where(np.isfinite(Tx_loss), Tx_loss - target_Tx_loss, 1e6)
+        g13 = np.where(np.isfinite(Tx_loss_main_inner), Tx_loss_main_inner - target_Tx_loss, 1e6)
+        g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer - target_Tx_loss, 1e6)
+        g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner - target_Tx_loss, 1e6)
+        g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer - target_Tx_loss, 1e6)
 
 
         # ======================
@@ -1004,15 +1005,142 @@ MU, NGEN = 100, 1000
 CXPB, MUTPB = 0.7, 0.3
 NUM_ITRS = 1000
 EARLY_STOP_NO_SOLUTION_GENS = 100
+SAVE_CONSTRAINT_DIAGNOSTICS_EACH_RUN = True
+
+CONSTRAINT_INFO = [
+    ("g1", "Llt1 >= 29.4"),
+    ("g2", "Llt1 <= 30.6"),
+    ("g3", "Llt2 >= 29.4"),
+    ("g4", "Llt2 <= 30.6"),
+    ("g5", "Llt3 >= 29.4"),
+    ("g6", "Llt3 <= 30.6"),
+    ("g7", "Llt4 >= 29.4"),
+    ("g8", "Llt4 <= 30.6"),
+    ("g9", "Geometry validation"),
+    ("g10", "B_field <= 0.7"),
+    ("g11", "cw1 >= 5.0"),
+    ("g12", "cw1 <= 6.0"),
+    ("g13", "Tx_loss <= 300"),
+    ("g14", "Tx_loss <= 300"),
+    ("g15", "Tx_loss <= 300"),
+    ("g16", "Tx_loss <= 300"),
+    ("g17", "cc_w2c_space_x >= 30"),
+    ("g18", "cc_w2c_space_y >= 30"),
+    ("g19", "w2c_w1c_space_x >= 30"),
+    ("g20", "w2c_w1c_space_y >= 30"),
+    ("g21", "w1s_cs_space_x >= 30 (if side winding active)"),
+    ("g22", "cs_w1s_space_y >= 30 (if side winding active)"),
+    ("g23", "side w2 spacing x >= 30"),
+    ("g24", "side w2 spacing y >= 30"),
+    ("g25", "w1c_w2s_space_x >= 30"),
+    ("g26", "h_gap1 >= 30"),
+    ("g27", "h_gap2 >= 30"),
+]
+CONSTRAINT_COLUMNS = [k for k, _ in CONSTRAINT_INFO]
+CONSTRAINT_LABELS = dict(CONSTRAINT_INFO)
+
+
+def _sanitize_filename_token(value):
+    return "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in str(value))
+
+
+def _build_run_id():
+    host = _sanitize_filename_token(socket.gethostname())
+    pid = os.getpid()
+    ts_us = int(time.time() * 1e6)
+    return f"{host}_pid{pid}_{ts_us}"
 
 
 class NoSolutionEarlyStopCallback(Callback):
-    def __init__(self, patience=100):
+    def __init__(self, patience=100, constraint_columns=None, constraint_labels=None):
         super().__init__()
         self.patience = int(patience)
         self.no_solution_gens = 0
         self.stopped_early = False
         self.stop_generation = None
+        self.constraint_columns = list(constraint_columns or [])
+        self.constraint_labels = dict(constraint_labels or {})
+
+        self.total_checked = 0
+        self.violation_counts = None
+        self.violation_sum = None
+        self.violation_max = None
+        self.generation_rows = []
+
+    def _ensure_buffers(self, n_constraints):
+        if self.violation_counts is not None and len(self.violation_counts) == n_constraints:
+            return
+        self.violation_counts = np.zeros(n_constraints, dtype=np.int64)
+        self.violation_sum = np.zeros(n_constraints, dtype=float)
+        self.violation_max = np.zeros(n_constraints, dtype=float)
+
+    def _collect_constraint_diagnostics(self, algorithm):
+        pop = getattr(algorithm, "pop", None)
+        if pop is None or len(pop) == 0:
+            return
+
+        try:
+            G = pop.get("G")
+        except Exception:
+            return
+        if G is None:
+            return
+
+        G = np.asarray(G, dtype=float)
+        if G.ndim == 1:
+            G = G.reshape(1, -1)
+        if G.size == 0:
+            return
+
+        n_pop, n_constraints = G.shape
+        self._ensure_buffers(n_constraints)
+
+        safe_G = np.where(np.isfinite(G), G, 1e6)
+        violated = safe_G > 0.0
+        positive_violation = np.where(violated, safe_G, 0.0)
+
+        self.total_checked += n_pop
+        self.violation_counts += violated.sum(axis=0).astype(np.int64)
+        self.violation_sum += positive_violation.sum(axis=0)
+        self.violation_max = np.maximum(self.violation_max, positive_violation.max(axis=0))
+
+        feasible_mask = np.all(safe_G <= 0.0, axis=1)
+        feasible_count = int(np.sum(feasible_mask))
+        infeasible_count = int(n_pop - feasible_count)
+
+        cv_min = np.nan
+        cv_avg = np.nan
+        try:
+            cv = pop.get("CV")
+            if cv is not None:
+                cv = np.asarray(cv, dtype=float).reshape(-1)
+                cv = cv[np.isfinite(cv)]
+                if cv.size > 0:
+                    cv_min = float(np.min(cv))
+                    cv_avg = float(np.mean(cv))
+        except Exception:
+            pass
+
+        per_constraint_counts = violated.sum(axis=0)
+        if per_constraint_counts.size > 0 and np.any(per_constraint_counts > 0):
+            top_idx = int(np.argmax(per_constraint_counts))
+        else:
+            top_idx = -1
+        top_constraint = f"g{top_idx + 1}" if top_idx >= 0 else ""
+        if top_constraint in self.constraint_labels:
+            top_constraint = f"{top_constraint} ({self.constraint_labels[top_constraint]})"
+
+        self.generation_rows.append({
+            "generation": int(getattr(algorithm, "n_gen", getattr(algorithm, "n_iter", -1))),
+            "population_size": int(n_pop),
+            "feasible_count": feasible_count,
+            "infeasible_count": infeasible_count,
+            "feasible_rate": float(feasible_count / n_pop) if n_pop > 0 else 0.0,
+            "cv_min": cv_min,
+            "cv_avg": cv_avg,
+            "top_blocker": top_constraint,
+            "top_blocker_violation_count": int(per_constraint_counts[top_idx]) if top_idx >= 0 else 0,
+        })
 
     @staticmethod
     def _has_feasible_solution(pop):
@@ -1041,7 +1169,61 @@ class NoSolutionEarlyStopCallback(Callback):
 
         return False
 
+    def build_constraint_summary_df(self):
+        cols = [
+            "constraint",
+            "description",
+            "violation_count",
+            "violation_rate",
+            "mean_positive_violation",
+            "max_positive_violation",
+        ]
+
+        if self.violation_counts is None or self.total_checked == 0:
+            return pd.DataFrame(columns=cols)
+
+        n_constraints = len(self.violation_counts)
+        names = list(self.constraint_columns)
+        if len(names) != n_constraints:
+            names = [f"g{i+1}" for i in range(n_constraints)]
+
+        rows = []
+        for i, name in enumerate(names):
+            cnt = int(self.violation_counts[i])
+            rows.append({
+                "constraint": name,
+                "description": self.constraint_labels.get(name, ""),
+                "violation_count": cnt,
+                "violation_rate": float(cnt / self.total_checked),
+                "mean_positive_violation": float(self.violation_sum[i] / cnt) if cnt > 0 else 0.0,
+                "max_positive_violation": float(self.violation_max[i]),
+            })
+
+        df = pd.DataFrame(rows, columns=cols)
+        return df.sort_values(
+            by=["violation_count", "mean_positive_violation"],
+            ascending=[False, False]
+        ).reset_index(drop=True)
+
+    def build_generation_summary_df(self):
+        cols = [
+            "generation",
+            "population_size",
+            "feasible_count",
+            "infeasible_count",
+            "feasible_rate",
+            "cv_min",
+            "cv_avg",
+            "top_blocker",
+            "top_blocker_violation_count",
+        ]
+        if len(self.generation_rows) == 0:
+            return pd.DataFrame(columns=cols)
+        return pd.DataFrame(self.generation_rows, columns=cols)
+
     def notify(self, algorithm):
+        self._collect_constraint_diagnostics(algorithm)
+
         has_solution = self._has_feasible_solution(getattr(algorithm, "opt", None))
         if not has_solution:
             has_solution = self._has_feasible_solution(getattr(algorithm, "pop", None))
@@ -1060,10 +1242,42 @@ class NoSolutionEarlyStopCallback(Callback):
                 else:
                     algorithm.termination.force_termination = True
 
+
+def save_constraint_diagnostics(callback, itr_index, output_dir, run_id="", top_k=5):
+    constraint_df = callback.build_constraint_summary_df()
+    generation_df = callback.build_generation_summary_df()
+
+    run_tag = _sanitize_filename_token(run_id) if run_id else "run"
+    summary_file = os.path.join(output_dir, f"constraint_summary_{run_tag}_itr_{itr_index+1:04d}.csv")
+    generation_file = os.path.join(output_dir, f"generation_summary_{run_tag}_itr_{itr_index+1:04d}.csv")
+
+    atomic_write_csv(constraint_df, summary_file)
+    atomic_write_csv(generation_df, generation_file)
+
+    print(f"Constraint summary saved: {summary_file}")
+    print(f"Generation summary saved: {generation_file}")
+
+    if constraint_df.empty:
+        print("Constraint diagnostics: no constraint data available.")
+        return
+
+    print(f"Top {top_k} blocking constraints:")
+    for _, row in constraint_df.head(top_k).iterrows():
+        print(
+            f"  {row['constraint']}: count={int(row['violation_count'])}, "
+            f"rate={row['violation_rate']:.3f}, "
+            f"mean_violation={row['mean_positive_violation']:.3f}, "
+            f"max_violation={row['max_positive_violation']:.3f} | {row['description']}"
+        )
+
 def run_nsga2(seed):
     np.random.seed(seed)
     random.seed(seed)
-    early_stop_cb = NoSolutionEarlyStopCallback(patience=EARLY_STOP_NO_SOLUTION_GENS)
+    early_stop_cb = NoSolutionEarlyStopCallback(
+        patience=EARLY_STOP_NO_SOLUTION_GENS,
+        constraint_columns=CONSTRAINT_COLUMNS,
+        constraint_labels=CONSTRAINT_LABELS,
+    )
 
     algorithm = NSGA2(
         pop_size=MU,
@@ -1087,6 +1301,10 @@ def run_nsga2(seed):
 # Save all NSGA-II artifacts under NSGA2_result/
 result_dir = os.path.join(os.getcwd(), "NSGA2_result")
 os.makedirs(result_dir, exist_ok=True)
+run_id = _build_run_id()
+diagnostics_dir = result_dir
+print(f"Diagnostics run_id: {run_id}")
+print(f"Diagnostics directory: {diagnostics_dir}")
 
 pareto_file = os.path.join(result_dir, "pareto_front.csv")
 loop_counter_file = os.path.join(result_dir, "loop_counter.txt")
@@ -1095,6 +1313,8 @@ for itr in range(NUM_ITRS):
     print(f"Running NSGA-II {itr+1} / {NUM_ITRS}")
     seed = np.random.randint(0, 1000000)
     res, early_stop_cb = run_nsga2(seed)
+    if SAVE_CONSTRAINT_DIAGNOSTICS_EACH_RUN:
+        save_constraint_diagnostics(early_stop_cb, itr, diagnostics_dir, run_id=run_id, top_k=5)
     if early_stop_cb.stopped_early:
         print(
             f"Iteration {itr+1} early stopped at generation {early_stop_cb.stop_generation} "
@@ -1157,5 +1377,3 @@ if os.path.exists(pareto_file):
     print(df_pareto)
 else:
     print("No valid results found")
-
-
