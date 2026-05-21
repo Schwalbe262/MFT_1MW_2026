@@ -609,7 +609,7 @@ class TransformerProblem(Problem):
         xu = np.array(max_value.tolist(), dtype=int)
         super().__init__(n_var=len(min_value),
                          n_obj=2,
-                         n_ieq_constr=26,
+                         n_ieq_constr=27,
                          xl=xl,
                          xu=xu,
                          vtype=int)
@@ -834,18 +834,21 @@ class TransformerProblem(Problem):
                             w2s_w1s_space_y)
         g24 = np.where(np.isfinite(gap_w2s_y), insulation_distance - gap_w2s_y, 1e6)  # gap_w2s_y >= 20
 
-        
+        # side main gap
+
+        w2s_w1s_space_x = plus_inp["w2s_w1s_space_x"].to_numpy(dtype=float)
+        g25 = np.where(np.isfinite(w2s_w1s_space_x), insulation_distance - w2s_w1s_space_x, 1e6)
 
         # height-direction insulation gaps
         h_gap1 = plus_inp["h_gap1"].to_numpy(dtype=float)
         h_gap2 = plus_inp["h_gap2"].to_numpy(dtype=float)
-        g25 = np.where(np.isfinite(h_gap1), insulation_distance - h_gap1, 1e6)
-        g26 = np.where(np.isfinite(h_gap2), insulation_distance - h_gap2, 1e6)
+        g26 = np.where(np.isfinite(h_gap1), insulation_distance - h_gap1, 1e6)
+        g27 = np.where(np.isfinite(h_gap2), insulation_distance - h_gap2, 1e6)
 
         
 
 
-        G = np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26]).astype(float)
+        G = np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27]).astype(float)
         F = np.column_stack([f1, -f2]).astype(float)
 
         out["F"] = F
