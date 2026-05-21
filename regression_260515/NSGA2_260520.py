@@ -539,7 +539,7 @@ def calculate_core_loss(plus_inp) :
     w1 = plus_inp["w1"].to_numpy(dtype=float) * 1e-3
     h1 = plus_inp["h1"].to_numpy(dtype=float) * 1e-3
 
-    fill_factor = 0.8
+    fill_factor = 0.9
 
     V_core = 2.0 * (w1 * (2.0*l1 + l2) * (2.0*l1 + h1) - w1 * (l2 * h1))
     V_core_effective = V_core * fill_factor
@@ -547,6 +547,9 @@ def calculate_core_loss(plus_inp) :
 
     denom = 4.0 * N1 * A_core
 
+
+    
+    
     # B = m*V1*Ts/4/N1/A
 
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -556,7 +559,20 @@ def calculate_core_loss(plus_inp) :
     core_loss = cm * (freq ** xx) * np.power(B_field, yy) * V_core_effective  # freq[Hz], B[T]
 
 
-    return V_core, A_core, B_field, core_loss
+
+    cold_w1 = (w1 - 20*8)
+    V_core_cold = 2.0 * (cold_w1 * (2.0*l1 + l2) * (2.0*l1 + h1) - cold_w1 * (l2 * h1)) * fill_factor
+    V_core_cold_effective_cold = V_core_cold * fill_factor
+    A_core_cold = 2.0 * cold_w1 * l1 * fill_factor
+
+    denom_cold = 4.0 * N1 * A_core_cold
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        B_field_cold = np.divide(m * V1 * Ts, denom_cold)
+
+    core_loss_cold = cm * (freq ** xx) * np.power(B_field_cold, yy) * V_core_cold_effective_cold
+
+    return V_core, A_core, B_field_cold, core_loss_cold
 
 
 
