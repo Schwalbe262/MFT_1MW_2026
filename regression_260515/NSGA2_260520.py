@@ -609,7 +609,7 @@ class TransformerProblem(Problem):
         xu = np.array(max_value.tolist(), dtype=int)
         super().__init__(n_var=len(min_value),
                          n_obj=2,
-                         n_ieq_constr=28,
+                         n_ieq_constr=27,
                          xl=xl,
                          xu=xu,
                          vtype=int)
@@ -765,7 +765,7 @@ class TransformerProblem(Problem):
         side_outer_length = side_inner_length + 4*nwl1_side
 
         # 단위 길이당 최외곽 손실 목표값
-        target_Tx_loss = 0.10 # unit W/mm (1600mm에 150W정도 나옴)
+        target_Tx_loss = 0.15 # unit W/mm (1600mm에 150W정도 나옴)
         g13 = np.where(np.isfinite(Tx_loss_main_inner), Tx_loss_main_inner/ main_inner_length - target_Tx_loss, 1e6)
         g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer/ main_outer_length - target_Tx_loss, 1e6)
         g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner/ side_inner_length - target_Tx_loss, 1e6)
@@ -810,10 +810,10 @@ class TransformerProblem(Problem):
 
         # ?ъ씠??1李?沅뚯꽑 媛꾧꺽 (y) (N1_side = 0?쇰븣??怨좊젮 X)
         N1_side = plus_inp["N1_side"].to_numpy(dtype=float)
-        gap_w1s_x = plus_inp["cs_w1s_space_y"].to_numpy(dtype=float)
+        gap_w1s_y = plus_inp["cs_w1s_space_y"].to_numpy(dtype=float)
         active_side = N1_side >= 1.0
         g22 = np.where(active_side,
-                       np.where(np.isfinite(gap_w1s_x), insulation_distance - gap_w1s_x, 1e6),
+                       np.where(np.isfinite(gap_w1s_y), insulation_distance - gap_w1s_y, 1e6),
                        0.0)  # if N1_side == 0, unconstrained
 
         # ?ъ씠??2李?沅뚯꽑 媛꾧꺽 (x)
@@ -846,13 +846,13 @@ class TransformerProblem(Problem):
         g27 = np.where(np.isfinite(h_gap2), insulation_distance - h_gap2, 1e6)
 
 
-        N1_main = plus_inp["N1_main"].to_numpy(dtype=float)
-        g28 = np.where(np.isfinite(N1_main), N1_main - 5.0, 1e6)  # N1_main <= 5
+        # N1_main = plus_inp["N1_main"].to_numpy(dtype=float)
+        # g28 = np.where(np.isfinite(N1_main), N1_main - 5.0, 1e6)  # N1_main <= 5
 
         
 
 
-        G = np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27, g28]).astype(float)
+        G = np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27]).astype(float)
         F = np.column_stack([f1, -f2]).astype(float)
 
         out["F"] = F
