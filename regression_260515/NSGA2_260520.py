@@ -750,7 +750,7 @@ class TransformerProblem(Problem):
 
 
         w1 = plus_inp["w1"].to_numpy(dtype=float)
-        effective_w1 = (w1 - 20*8) / w1
+        effective_w1 = (w1 - 20*1) / w1
         
         target_Llt = 27.5 / effective_w1
         Llt_error = 0.02
