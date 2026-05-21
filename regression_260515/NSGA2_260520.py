@@ -560,7 +560,7 @@ def calculate_core_loss(plus_inp) :
 
 
 
-    cold_w1 = (w1 - 20*8)
+    cold_w1 = (w1 - 20e-3*8)
     V_core_cold = 2.0 * (cold_w1 * (2.0*l1 + l2) * (2.0*l1 + h1) - cold_w1 * (l2 * h1)) * fill_factor
     V_core_cold_effective_cold = V_core_cold * fill_factor
     A_core_cold = 2.0 * cold_w1 * l1 * fill_factor
