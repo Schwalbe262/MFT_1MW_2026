@@ -740,7 +740,7 @@ class TransformerProblem(Problem):
         g8 = Llt4 - target_Llt*(1.0 + Llt_error)
 
         g9 = 1.0 - val # geometry validatiy check
-        g10 = np.where(np.isfinite(B_field), B_field - 0.6, 1e6) # B field check
+        g10 = np.where(np.isfinite(B_field), B_field - 0.7, 1e6) # B field check
 
 
 
@@ -765,11 +765,15 @@ class TransformerProblem(Problem):
         side_outer_length = side_inner_length + 4*nwl1_side
 
         # 단위 길이당 최외곽 손실 목표값
-        target_Tx_loss = 0.15 # unit W/mm (1600mm에 150W정도 나옴)
-        g13 = np.where(np.isfinite(Tx_loss_main_inner), Tx_loss_main_inner/ main_inner_length - target_Tx_loss, 1e6)
-        g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer/ main_outer_length - target_Tx_loss, 1e6)
-        g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner/ side_inner_length - target_Tx_loss, 1e6)
-        g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer/ side_outer_length - target_Tx_loss, 1e6)
+        target_Tx_loss = 300 # unit W/mm (1600mm에 150W정도 나옴)
+        # g13 = np.where(np.isfinite(Tx_loss_main_inner), Tx_loss_main_inner/ main_inner_length - target_Tx_loss, 1e6)
+        # g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer/ main_outer_length - target_Tx_loss, 1e6)
+        # g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner/ side_inner_length - target_Tx_loss, 1e6)
+        # g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer/ side_outer_length - target_Tx_loss, 1e6)
+        g13 = np.where(np.isfinite(Tx_loss), Tx_loss - target_Tx_loss, 1e6)
+        g14 = np.where(np.isfinite(Tx_loss), Tx_loss - target_Tx_loss, 1e6)
+        g15 = np.where(np.isfinite(Tx_loss), Tx_loss - target_Tx_loss, 1e6)
+        g16 = np.where(np.isfinite(Tx_loss), Tx_loss - target_Tx_loss, 1e6)
 
 
         # ======================
