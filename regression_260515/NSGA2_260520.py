@@ -609,7 +609,7 @@ class TransformerProblem(Problem):
         xu = np.array(max_value.tolist(), dtype=int)
         super().__init__(n_var=len(min_value),
                          n_obj=2,
-                         n_ieq_constr=26,
+                         n_ieq_constr=27,
                          xl=xl,
                          xu=xu,
                          vtype=int)
@@ -722,7 +722,7 @@ class TransformerProblem(Problem):
         eff = 1e+6 / (1e+6 + total_loss) * 100
 
         # 4) objectives
-        f1 = np.nan_to_num(volume, nan=1e12, posinf=1e12, neginf=1e12)
+        f1 = np.nan_to_num(X_size*Y_size, nan=1e12, posinf=1e12, neginf=1e12)
         # f2 is maximized via -f2 in objective, so invalid values must be small (not huge).
         f2 = np.nan_to_num(eff, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -841,10 +841,13 @@ class TransformerProblem(Problem):
         g26 = np.where(np.isfinite(h_gap2), insulation_distance - h_gap2, 1e6)
 
 
+        g27 = np.where(np.isfinite(Z_size), Z_size - 600, 1e6)
+
+
         
 
 
-        G = np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26]).astype(float)
+        G = np.column_stack([g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27]).astype(float)
         F = np.column_stack([f1, -f2]).astype(float)
 
         out["F"] = F
