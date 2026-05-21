@@ -319,6 +319,10 @@ from pymoo.operators.mutation.pm import PM
 from pymoo.operators.repair.rounding import RoundingRepair
 from pymoo.optimize import minimize
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+try:
+    from pymoo.core.callback import Callback
+except Exception:
+    from pymoo.model.callback import Callback
 
 
 class SpinFileLock:
@@ -999,10 +1003,67 @@ def build_df_from_result(res):
 MU, NGEN = 100, 1000
 CXPB, MUTPB = 0.7, 0.3
 NUM_ITRS = 1000
+EARLY_STOP_NO_SOLUTION_GENS = 50
+
+
+class NoSolutionEarlyStopCallback(Callback):
+    def __init__(self, patience=100):
+        super().__init__()
+        self.patience = int(patience)
+        self.no_solution_gens = 0
+        self.stopped_early = False
+        self.stop_generation = None
+
+    @staticmethod
+    def _has_feasible_solution(pop):
+        if pop is None or len(pop) == 0:
+            return False
+
+        # FEAS exists in newer pymoo; CV-based fallback keeps backward compatibility.
+        try:
+            feas = pop.get("FEAS")
+            if feas is not None:
+                feas = np.asarray(feas).reshape(-1)
+                if feas.size > 0 and np.any(feas):
+                    return True
+        except Exception:
+            pass
+
+        try:
+            cv = pop.get("CV")
+            if cv is not None:
+                cv = np.asarray(cv, dtype=float).reshape(-1)
+                cv = cv[np.isfinite(cv)]
+                if cv.size > 0 and np.any(cv <= 0.0):
+                    return True
+        except Exception:
+            pass
+
+        return False
+
+    def notify(self, algorithm):
+        has_solution = self._has_feasible_solution(getattr(algorithm, "opt", None))
+        if not has_solution:
+            has_solution = self._has_feasible_solution(getattr(algorithm, "pop", None))
+
+        if has_solution:
+            self.no_solution_gens = 0
+            return
+
+        self.no_solution_gens += 1
+        if self.no_solution_gens >= self.patience:
+            self.stopped_early = True
+            self.stop_generation = int(getattr(algorithm, "n_gen", getattr(algorithm, "n_iter", -1)))
+            if hasattr(algorithm, "termination") and algorithm.termination is not None:
+                if hasattr(algorithm.termination, "terminate"):
+                    algorithm.termination.terminate()
+                else:
+                    algorithm.termination.force_termination = True
 
 def run_nsga2(seed):
     np.random.seed(seed)
     random.seed(seed)
+    early_stop_cb = NoSolutionEarlyStopCallback(patience=EARLY_STOP_NO_SOLUTION_GENS)
 
     algorithm = NSGA2(
         pop_size=MU,
@@ -1012,13 +1073,15 @@ def run_nsga2(seed):
         eliminate_duplicates=True
     )
 
-    return minimize(
+    res = minimize(
         problem=TransformerProblem(),
         algorithm=algorithm,
         termination=('n_gen', NGEN),
         seed=seed,
+        callback=early_stop_cb,
         verbose=True
     )
+    return res, early_stop_cb
 
 
 # Save all NSGA-II artifacts under NSGA2_result/
@@ -1031,7 +1094,12 @@ lock_file = os.path.join(result_dir, "pareto_front.lock")
 for itr in range(NUM_ITRS):
     print(f"Running NSGA-II {itr+1} / {NUM_ITRS}")
     seed = np.random.randint(0, 1000000)
-    res = run_nsga2(seed)
+    res, early_stop_cb = run_nsga2(seed)
+    if early_stop_cb.stopped_early:
+        print(
+            f"Iteration {itr+1} early stopped at generation {early_stop_cb.stop_generation} "
+            f"(no feasible solution for {EARLY_STOP_NO_SOLUTION_GENS} generations)"
+        )
 
     try:
         df = build_df_from_result(res)
@@ -1089,6 +1157,5 @@ if os.path.exists(pareto_file):
     print(df_pareto)
 else:
     print("No valid results found")
-
 
 
