@@ -775,9 +775,9 @@ class TransformerProblem(Problem):
         # g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner/ side_inner_length - target_Tx_loss, 1e6)
         # g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer/ side_outer_length - target_Tx_loss, 1e6)
         g13 = np.where(np.isfinite(Tx_loss_main_inner), Tx_loss_main_inner - target_Tx_loss, 1e6)
-        g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer - target_Tx_loss, 1e6)
+        g14 = np.where(np.isfinite(Tx_loss_main_outer), Tx_loss_main_outer - target_Tx_loss/3, 1e6)
         g15 = np.where(np.isfinite(Tx_loss_side_inner), Tx_loss_side_inner - target_Tx_loss, 1e6)
-        g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer - target_Tx_loss, 1e6)
+        g16 = np.where(np.isfinite(Tx_loss_side_outer), Tx_loss_side_outer - target_Tx_loss/3, 1e6)
 
 
         # ======================
