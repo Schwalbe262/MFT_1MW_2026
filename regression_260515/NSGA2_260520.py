@@ -1003,7 +1003,7 @@ def build_df_from_result(res):
 MU, NGEN = 100, 1000
 CXPB, MUTPB = 0.7, 0.3
 NUM_ITRS = 1000
-EARLY_STOP_NO_SOLUTION_GENS = 50
+EARLY_STOP_NO_SOLUTION_GENS = 100
 
 
 class NoSolutionEarlyStopCallback(Callback):
