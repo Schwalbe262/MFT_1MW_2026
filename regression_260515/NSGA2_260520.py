@@ -731,8 +731,12 @@ class TransformerProblem(Problem):
         f2 = np.nan_to_num(eff, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 5) constraints (g <= 0)
+
+
+        w1 = plus_inp["w1"].to_numpy(dtype=float)
+        effective_w1 = (w1 - 20*8) / w1
         
-        target_Llt = 30.0
+        target_Llt = 27.5 / effective_w1
         Llt_error = 0.02
         g1 = target_Llt*(1.0 - Llt_error) - Llt1
         g2 = Llt1 - target_Llt*(1.0 + Llt_error)
