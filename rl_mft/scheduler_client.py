@@ -43,6 +43,7 @@ def submit_dynamic_batch(
 ) -> list[str]:
     candidate_file = remote_candidates_jsonl or f".rl_candidates_loop_{loop:04d}.jsonl"
     env_setup = config.env_setup
+    env_setup += "\nrm -f simulation_results.csv simulation_results.csv.lock"
     if candidates_jsonl_content:
         env_setup += f"\ncat > {candidate_file} <<'MFT_RL_CANDIDATES_EOF'\n"
         env_setup += candidates_jsonl_content.rstrip() + "\n"

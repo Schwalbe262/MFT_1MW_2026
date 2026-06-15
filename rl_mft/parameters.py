@@ -32,6 +32,35 @@ PARAMETER_COLUMNS = [
     "wff2",
 ]
 
+INTEGER_COLUMNS = {"N1", "N2", "N1_main", "N1_side", "N2_main", "N2_side"}
+
+
+def coerce_parameter_types(parameters: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in PARAMETER_COLUMNS:
+        value = parameters[key]
+        if hasattr(value, "item"):
+            value = value.item()
+        if key in INTEGER_COLUMNS:
+            out[key] = int(round(float(value)))
+        else:
+            out[key] = float(value)
+    return out
+
+
+def coerce_partial_parameter_types(parameters: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in parameters.items():
+        if key not in PARAMETER_COLUMNS:
+            continue
+        if hasattr(value, "item"):
+            value = value.item()
+        if key in INTEGER_COLUMNS:
+            out[key] = int(round(float(value)))
+        else:
+            out[key] = float(value)
+    return out
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -49,7 +78,7 @@ def dataframe_row_to_dict(df: Any) -> dict[str, Any]:
         if hasattr(value, "item"):
             value = value.item()
         out[key] = value
-    return out
+    return coerce_parameter_types(out)
 
 
 def _load_existing_parameter_tools() -> tuple[Any, Any] | tuple[None, None]:
@@ -99,6 +128,7 @@ def _fallback_parameters() -> dict[str, Any]:
 
 
 def is_valid(parameters: dict[str, Any]) -> bool:
+    parameters = coerce_parameter_types(parameters)
     create_input_parameter, validation_check = _load_existing_parameter_tools()
     if create_input_parameter is None or validation_check is None:
         return float(parameters["l2"]) > 0 and float(parameters["h1"]) > 0
@@ -129,8 +159,8 @@ def random_candidate(loop: int, index: int) -> Candidate:
     )
 
 
-def mutate_candidate(base: dict[str, Any], loop: int, index: int, scale: float = 0.08) -> Candidate:
-    values = dict(base)
+def mutate_candidate(base: dict[str, Any], loop: int, index: int, scale: float = 0.025) -> Candidate:
+    values = coerce_parameter_types(base)
     for key in ["w1", "l1", "l2", "h1"]:
         values[key] = max(1, round(float(values[key]) * random.uniform(1 - scale, 1 + scale), 3))
     for key in [
@@ -147,6 +177,7 @@ def mutate_candidate(base: dict[str, Any], loop: int, index: int, scale: float =
         values[key] = max(0.1, round(float(values[key]) * random.uniform(1 - scale, 1 + scale), 3))
     for key in ["window_ratio", "wh1", "wh2", "wff1", "wff2"]:
         values[key] = min(0.98, max(0.05, round(float(values[key]) * random.uniform(1 - scale, 1 + scale), 3)))
+    values = coerce_parameter_types(values)
     if not is_valid(values):
         return random_candidate(loop, index)
     return Candidate(candidate_id=f"L{loop:04d}-C{index:04d}", loop=loop, index=index, parameters=values)

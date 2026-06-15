@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import asdict
+from typing import Any
 
 from rl_mft.mock_backend import evaluate as mock_evaluate
-from rl_mft.parameters import propose_batch
+from rl_mft.parameters import coerce_partial_parameter_types, propose_batch
 from rl_mft.records import (
     LoopSummary,
+    OUTPUT_COLUMNS,
     append_insight,
     append_note,
     load_state,
@@ -29,7 +31,23 @@ def best_row(rows: list[dict]) -> dict | None:
 
 
 def parameter_subset(row: dict, template: dict) -> dict:
-    return {key: row[key] for key in template if key in row}
+    return coerce_partial_parameter_types({key: row[key] for key in template if key in row})
+
+
+def output_subset(row: dict) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in OUTPUT_COLUMNS:
+        if key in row and row[key] not in {"", None}:
+            try:
+                out[key] = float(row[key])
+            except (TypeError, ValueError):
+                out[key] = row[key]
+    return out
+
+
+def rows_for_candidates(rows: list[dict], candidates: list[Any]) -> list[dict]:
+    candidate_ids = {candidate.candidate_id for candidate in candidates}
+    return [row for row in rows if row.get("candidate_id") in candidate_ids]
 
 
 def run_loop(args: argparse.Namespace) -> LoopSummary:
@@ -38,7 +56,8 @@ def run_loop(args: argparse.Namespace) -> LoopSummary:
     summary = LoopSummary(loop=loop, backend=args.backend, batch_size=args.batch_size, status="running", started_at=utc_now())
     ldir = loop_dir(loop)
     if args.backend == "slurm":
-        elite_source = state.get("live_elites") or state.get("elites") or []
+        live_best = state.get("live_best_parameters")
+        elite_source = [live_best] if live_best else state.get("live_elites") or state.get("elites") or []
     else:
         elite_source = state.get("elites") or []
     candidates = propose_batch(loop, args.batch_size, elites=elite_source)
@@ -80,11 +99,21 @@ def run_loop(args: argparse.Namespace) -> LoopSummary:
                 fetched = 1 if fetch_remote_result_csv(config, summary.job_ids[0], results_path, remote_file=args.remote_result_file) else 0
             summary.message = f"Slurm jobs finished; fetched shared result file: {fetched}/1."
             rows = read_results(results_path)
+            filtered_rows = rows_for_candidates(rows, candidates)
+            if len(filtered_rows) != len(rows):
+                summary.message += f" Discarded {len(rows) - len(filtered_rows)} stale result row(s)."
+            rows = filtered_rows
             rows = attach_rewards(rows, reward_config) if rows else []
             if rows:
                 write_results(results_path, rows)
+                summary.completed = len(rows)
+                summary.failed = max(0, args.batch_size - len(rows))
+            elif jobs and all(job.get("status") == "completed" for job in jobs):
+                summary.failed = args.batch_size
+                summary.completed = 0
+                summary.message += " No result rows were collected; treating loop as failed."
 
-        evaluated_rows = read_results(results_path)
+        evaluated_rows = rows_for_candidates(read_results(results_path), candidates)
         row = best_row(evaluated_rows)
         previous_best = state.get("best_reward")
         if row:
@@ -92,33 +121,39 @@ def run_loop(args: argparse.Namespace) -> LoopSummary:
             summary.best_reward = reward
             summary.best_candidate_id = row.get("candidate_id")
             parameters = parameter_subset(row, candidates[0].parameters)
+            outputs = output_subset(row)
+            summary.best_outputs = outputs
             if args.backend == "slurm":
                 previous_live_best = state.get("live_best_reward")
                 live_improved = previous_live_best is not None and reward > float(previous_live_best)
                 live_baseline = previous_live_best is None
                 if live_baseline:
-                    append_insight(loop, summary.best_candidate_id or "", reward, parameters, label="live_baseline_candidate")
+                    append_insight(loop, summary.best_candidate_id or "", reward, parameters, outputs, label="live_baseline_candidate")
                 elif live_improved:
-                    append_insight(loop, summary.best_candidate_id or "", reward, parameters, label="live_improved_candidate")
+                    append_insight(loop, summary.best_candidate_id or "", reward, parameters, outputs, label="live_improved_candidate")
                 if live_baseline or live_improved:
                     state["live_best_reward"] = reward
                     state["live_best_candidate_id"] = summary.best_candidate_id
                     state["live_best_parameters"] = parameters
+                    state["live_best_outputs"] = outputs
                 summary.message = (summary.message + " " if summary.message else "") + (
                     "Live baseline established." if live_baseline else f"Live improved: {live_improved}."
                 )
             improved = previous_best is None or reward > float(previous_best)
             if improved and summary.best_candidate_id:
                 if args.backend != "slurm":
-                    append_insight(loop, summary.best_candidate_id, reward, parameters)
+                    append_insight(loop, summary.best_candidate_id, reward, parameters, outputs)
                 state["best_reward"] = reward
                 state["best_candidate_id"] = summary.best_candidate_id
                 state["best_parameters"] = parameters
+                state["best_outputs"] = outputs
             ranked = sorted(evaluated_rows, key=lambda item: float(item.get("reward", "-inf")), reverse=True)
             ranked_parameters = [parameter_subset(row, candidates[0].parameters) for row in ranked[: max(1, args.elite_count)]]
             if args.backend == "slurm":
-                state["live_elites"] = ranked_parameters
-            state["elites"] = ranked_parameters
+                if live_baseline or live_improved:
+                    state["live_elites"] = ranked_parameters
+            else:
+                state["elites"] = ranked_parameters
             state["recent_evaluations"] = ranked[: min(50, len(ranked))]
         state["current_loop"] = loop
         state["failure_rate"] = (summary.failed / max(1, args.batch_size))

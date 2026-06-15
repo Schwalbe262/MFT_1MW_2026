@@ -101,7 +101,11 @@ def index() -> str:
         for loop in loops
     )
     best = state.get("best_parameters") or {}
+    best_outputs = state.get("best_outputs") or {}
+    live_outputs = state.get("live_best_outputs") or {}
     best_rows = "\n".join(f"<tr><th>{key}</th><td>{value}</td></tr>" for key, value in best.items())
+    best_output_rows = "\n".join(f"<tr><th>{key}</th><td>{value}</td></tr>" for key, value in best_outputs.items())
+    live_output_rows = "\n".join(f"<tr><th>{key}</th><td>{value}</td></tr>" for key, value in live_outputs.items())
     token_rows = "\n".join(
         f"<tr><td>{item.get('recorded_at')}</td><td>{item.get('provider')}</td><td>{item.get('project')}</td>"
         f"<td>{item.get('reset_cycle')}</td><td>{item.get('input_tokens')}</td><td>{item.get('output_tokens')}</td>"
@@ -190,6 +194,10 @@ def index() -> str:
     <section>
       <h2>Best Parameters</h2>
       <table><tbody>{best_rows}</tbody></table>
+      <h2>Best Outputs</h2>
+      <table><tbody>{best_output_rows}</tbody></table>
+      <h2>Live Best Outputs</h2>
+      <table><tbody>{live_output_rows}</tbody></table>
     </section>
   </main>
 </body>

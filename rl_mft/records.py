@@ -13,6 +13,7 @@ STATE_PATH = RUNS_DIR / "state.json"
 TOKEN_USAGE_PATH = RUNS_DIR / "token_usage.jsonl"
 NOTE_PATH = Path("note.md")
 INSIGHT_PATH = Path("insight.md")
+OUTPUT_COLUMNS = ["Ltx", "Lrx", "M", "k", "Lmt", "Lmr", "Llt", "Llr", "Tx_loss", "Rx_loss", "time"]
 
 
 def utc_now() -> str:
@@ -32,6 +33,7 @@ class LoopSummary:
     failed: int = 0
     best_reward: float | None = None
     best_candidate_id: str | None = None
+    best_outputs: dict[str, Any] = field(default_factory=dict)
     message: str = ""
 
 
@@ -53,9 +55,11 @@ def load_state() -> dict[str, Any]:
             "best_reward": None,
             "best_candidate_id": None,
             "best_parameters": None,
+            "best_outputs": None,
             "live_best_reward": None,
             "live_best_candidate_id": None,
             "live_best_parameters": None,
+            "live_best_outputs": None,
             "live_elites": [],
             "loops": [],
             "elites": [],
@@ -116,6 +120,9 @@ def append_note(summary: LoopSummary) -> None:
         f"- best_reward: {summary.best_reward if summary.best_reward is not None else '-'}",
         f"- best_candidate_id: {summary.best_candidate_id or '-'}",
     ]
+    if summary.best_outputs:
+        outputs = ", ".join(f"{key}={summary.best_outputs[key]}" for key in OUTPUT_COLUMNS if key in summary.best_outputs)
+        text.append(f"- best_outputs: {outputs}")
     if summary.finished_at:
         text.append(f"- finished_at: {summary.finished_at}")
     if summary.message:
@@ -123,13 +130,25 @@ def append_note(summary: LoopSummary) -> None:
     NOTE_PATH.write_text(NOTE_PATH.read_text(encoding="utf-8") + "\n".join(text) + "\n", encoding="utf-8")
 
 
-def append_insight(loop: int, candidate_id: str, reward: float, parameters: dict[str, Any], label: str = "improved_candidate") -> None:
+def append_insight(
+    loop: int,
+    candidate_id: str,
+    reward: float,
+    parameters: dict[str, Any],
+    outputs: dict[str, Any] | None = None,
+    label: str = "improved_candidate",
+) -> None:
     compact = ", ".join(f"{key}={parameters[key]}" for key in sorted(parameters) if key in {"N1", "N2", "w1", "l1", "l2", "h1", "window_ratio", "wff1", "wff2"})
+    output_text = ""
+    if outputs:
+        compact_outputs = ", ".join(f"{key}={outputs[key]}" for key in OUTPUT_COLUMNS if key in outputs)
+        output_text = f"- key_outputs: {compact_outputs}\n"
     text = (
         f"\n## {utc_now()} - Loop {loop}\n\n"
         f"- {label}: {candidate_id}\n"
         f"- reward: {reward:.6g}\n"
         f"- key_parameters: {compact}\n"
+        f"{output_text}"
     )
     INSIGHT_PATH.write_text(INSIGHT_PATH.read_text(encoding="utf-8") + text, encoding="utf-8")
 
