@@ -33,6 +33,8 @@ Thumbs.db
 
 # Project runtime artifacts
 simulation_num.txt
+simulog_num.txt
+rl_runs/
 
 # Generated simulation outputs
 simulation/

@@ -1,0 +1,14 @@
+{
+  "maximize": {
+    "Lmt": 2.0,
+    "k": 100.0
+  },
+  "minimize": {
+    "Tx_loss": 0.02,
+    "Rx_loss": 0.02,
+    "Llt": 0.5,
+    "Llr": 0.5
+  },
+  "targets": {},
+  "failed_reward": -1000000000.0
+}

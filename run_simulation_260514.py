@@ -604,8 +604,6 @@ def run_one_loop(param):
     try:
         # Use existing Desktop when possible and ensure it closes at context exit.
         with pyDesktop(version=None, non_graphical=GUI, close_on_exit=True, new_desktop=True) as desktop:
-            
-            param = None
             sim = Simulation(desktop=desktop)
 
             sim.create_simulation_name()
@@ -638,6 +636,10 @@ def run_one_loop(param):
             sim.get_magnetic_parameter()
             sim.save_calculation()
             result = pd.concat([sim.df_plus, sim.df1, sim.df_calculator1, sim.df_calculator2, simulation_time], axis=1)
+            if os.environ.get("MFT_RL_CANDIDATE_ID"):
+                result.insert(0, "candidate_id", os.environ["MFT_RL_CANDIDATE_ID"])
+                result.insert(1, "rl_loop", os.environ.get("MFT_RL_LOOP", ""))
+                result.insert(2, "rl_candidate_index", os.environ.get("MFT_RL_CANDIDATE_INDEX", ""))
 
             try:
                 sim.save_results_to_csv(result)
@@ -698,4 +700,3 @@ def main() :
 
 if __name__ == "__main__":
     main()
-
