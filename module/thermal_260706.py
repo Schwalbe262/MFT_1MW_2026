@@ -453,44 +453,29 @@ def _assign_boundaries(ipk, sim, objs, eighth=False):
     except Exception as e:
         logging.warning(f"set_ambient_temp failed: {e}")
 
+    def _fresh_region(**pads):
+        # Icepak 디자인은 생성 시 AEDT가 Region을 자동 삽입함 -> 삭제 후 원하는 패딩으로 재생성.
+        # (이전 코드는 create_air_region이 False를 반환해 경계 전부가 조용히 누락된 채
+        #  밀폐 상자로 해석되는 치명적 버그가 있었음 - 게이트1에서 발견)
+        try:
+            if "Region" in ipk.modeler.object_names:
+                ipk.modeler.delete("Region")
+        except Exception as e:
+            logging.warning(f"default Region delete failed: {e}")
+        region = ipk.modeler.create_air_region(is_percentage=True, **pads)
+        if not region:
+            raise RuntimeError("create_air_region failed (Region conflict?)")
+        return region
+
+    # 경계 실패는 조용히 넘기지 않음: BC가 틀린 열해석은 실패보다 나쁨 (캠페인 데이터 오염)
     if eighth:
         # 1/8: 대칭면 3개(x=0/y=0/z=0)는 region 면을 플러시로 두고 symmetry wall 할당.
         # +y 외곽 = 팬 유입 (양측 팬의 y대칭 유동 가정), -x/+z 외곽 = 배기 opening
-        region = ipk.modeler.create_air_region(x_pos=0.0, y_pos=100.0, z_pos=100.0,
-                                               x_neg=100.0, y_neg=0.0, z_neg=0.0,
-                                               is_percentage=True)
-        try:
-            ipk.assign_symmetry_wall(geometry=region.top_face_x.id, boundary_name="sym_x0")
-            ipk.assign_symmetry_wall(geometry=region.bottom_face_y.id, boundary_name="sym_y0")
-            ipk.assign_symmetry_wall(geometry=region.bottom_face_z.id, boundary_name="sym_z0")
-        except Exception as e:
-            logging.warning(f"Symmetry wall assignment failed: {e}")
-        try:
-            ipk.assign_velocity_free_opening(
-                assignment=[region.top_face_y.id],
-                boundary_name="fan_inlet",
-                temperature=f"{air_temp}cel",
-                velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]
-            )
-            ipk.assign_pressure_free_opening(
-                assignment=[region.bottom_face_x.id],
-                boundary_name="outlet_x",
-                temperature=f"{air_temp}cel"
-            )
-            ipk.assign_pressure_free_opening(
-                assignment=[region.top_face_z.id],
-                boundary_name="outlet_z",
-                temperature=f"{air_temp}cel"
-            )
-        except Exception as e:
-            logging.warning(f"Opening assignment failed: {e}")
-        return region
-
-    # 풀모델: region 전방향 + 팬 유동 (+y -> -y)
-    region = ipk.modeler.create_air_region(x_pos=100.0, y_pos=100.0, z_pos=100.0,
-                                           x_neg=100.0, y_neg=100.0, z_neg=100.0,
-                                           is_percentage=True)
-    try:
+        region = _fresh_region(x_pos=0.0, y_pos=100.0, z_pos=100.0,
+                               x_neg=100.0, y_neg=0.0, z_neg=0.0)
+        ipk.assign_symmetry_wall(geometry=region.top_face_x.id, boundary_name="sym_x0")
+        ipk.assign_symmetry_wall(geometry=region.bottom_face_y.id, boundary_name="sym_y0")
+        ipk.assign_symmetry_wall(geometry=region.bottom_face_z.id, boundary_name="sym_z0")
         ipk.assign_velocity_free_opening(
             assignment=[region.top_face_y.id],
             boundary_name="fan_inlet",
@@ -498,12 +483,31 @@ def _assign_boundaries(ipk, sim, objs, eighth=False):
             velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]
         )
         ipk.assign_pressure_free_opening(
-            assignment=[region.bottom_face_y.id],
-            boundary_name="outlet",
+            assignment=[region.bottom_face_x.id],
+            boundary_name="outlet_x",
             temperature=f"{air_temp}cel"
         )
-    except Exception as e:
-        logging.warning(f"Opening assignment failed: {e}")
+        ipk.assign_pressure_free_opening(
+            assignment=[region.top_face_z.id],
+            boundary_name="outlet_z",
+            temperature=f"{air_temp}cel"
+        )
+        return region
+
+    # 풀모델: region 전방향 + 팬 유동 (+y -> -y)
+    region = _fresh_region(x_pos=100.0, y_pos=100.0, z_pos=100.0,
+                           x_neg=100.0, y_neg=100.0, z_neg=100.0)
+    ipk.assign_velocity_free_opening(
+        assignment=[region.top_face_y.id],
+        boundary_name="fan_inlet",
+        temperature=f"{air_temp}cel",
+        velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]
+    )
+    ipk.assign_pressure_free_opening(
+        assignment=[region.bottom_face_y.id],
+        boundary_name="outlet",
+        temperature=f"{air_temp}cel"
+    )
 
     return region
 
