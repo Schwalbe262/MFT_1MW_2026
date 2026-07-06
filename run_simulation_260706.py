@@ -958,7 +958,11 @@ class Simulation():
             oModule.EnterQty(quantity)
         oModule.EnterVol(obj_name)
         oModule.CalcOp(op)
-        oModule.AddNamedExpression(expr_name, "Fields")
+        try:
+            oModule.AddNamedExpression(expr_name, "Fields")
+        except Exception:
+            # 동일 이름 표현식이 이미 존재 (save_calculation에서 생성된 경우) -> 재사용
+            logging.info(f"named expression {expr_name} already exists - reusing")
         return expr_name
 
     def _calc_group_loss(self, objs, expr_name, quantity="EMLoss"):
@@ -1002,9 +1006,9 @@ class Simulation():
         group_exprs.append(self._calc_group_loss(self.design1.Rx_windings_main, "P_Rx_main_group"))
         if self.design1.Rx_windings_side:
             group_exprs.append(self._calc_group_loss(self.design1.Rx_windings_side, "P_Rx_side_group"))
-        # 플레이트류 개별 손실 (미러 배수를 오브젝트별로 적용하기 위해 개별 적분)
+        # 플레이트류 개별 손실: save_calculation이 이미 P_<name> 표현식을 만들었으므로 재사용
         for p in self.design1.core_plates + self.design1.wcp_plates:
-            plate_exprs.append(self._calc_field_expr(p.name, "EMLoss", "Integrate", f"P_{p.name}"))
+            plate_exprs.append(f"P_{p.name}")
         # Tx는 전 턴 explicit (열모델에서 foil 그대로) -> 턴별 손실
         for w in self.design1.Tx_windings_main:
             turn_exprs.append(self._calc_field_expr(w.name, "EMLoss", "Integrate", f"P_turn_{w.name}"))
