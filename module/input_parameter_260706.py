@@ -22,6 +22,7 @@ KEYS = [
     "full_model",
     "max_passes", "percent_error",
     "freq", "V1_rms", "I1_rated", "I2_rated", "I2_phase_deg",
+    "P_target", "V2_rms",
     "core_cm", "core_x", "core_y",
     "matrix_on", "loss_on", "thermal_on",
     "plate_temp", "air_temp", "fan_velocity",
@@ -69,7 +70,11 @@ def get_drawing_default_params():
         "V1_rms": 1000.0,        # 1차 전압원 [Vrms] (loss 디자인 Tx 여자)
         "I1_rated": 1000.0,      # 1차 정격 전류 [Arms] (matrix 디자인 여자)
         "I2_rated": 100.0,       # 2차 정격 전류 [Arms]
-        "I2_phase_deg": 0.0,     # loss 디자인 Rx 전류 위상 [deg]
+        "I2_phase_deg": 0.0,     # loss 디자인 Rx 전류 위상 [deg] (P_target>0이면 자동 계산값이 우선)
+        # 목표 정격 전력 [W]: >0 이면 design1의 누설 Lk로 DAB 운전 위상 phi를 역산해
+        # I2 위상(-phi/2)을 자동 주입. 0이면 I2_phase_deg 수동값 사용
+        "P_target": 0.0,
+        "V2_rms": 10000.0,       # 2차 전압 [Vrms] (위상 역산용)
         # 코어손실 계수 (2605SA1: P[W/kg]=6.5 f(kHz)^1.51 B^1.74, 밀도 7180kg/m3
         #  -> ANSYS Power Ferrite (W/m3, Hz): cm = 6.5*7180/1000^1.51 = 1.377)
         "core_cm": 1.377, "core_x": 1.51, "core_y": 1.74,
@@ -426,6 +431,7 @@ def validation_check(input_df, strict=False):
 NON_DESIGN_VAR_KEYS = {
     "rx_mesh_mode",
     "freq", "V1_rms", "I1_rated", "I2_rated", "I2_phase_deg",
+    "P_target", "V2_rms",
     "core_cm", "core_x", "core_y",
     "matrix_on", "loss_on", "thermal_on",
     "plate_temp", "air_temp", "fan_velocity",

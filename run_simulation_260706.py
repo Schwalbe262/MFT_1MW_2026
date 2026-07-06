@@ -526,7 +526,10 @@ class Simulation():
             # 주의: 전압 권선의 InputCurrent 리포트는 0으로 표시될 수 있으나 (표시 아티팩트)
             #       실제 해는 유효함 (InducedVoltage ~= V1, 손실/자속 정상).
             V1 = float(self.df_plus["V1_rms"].iloc[0])
-            phase2 = float(self.df_plus["I2_phase_deg"].iloc[0])
+            # P_target 자동 위상이 계산되어 있으면 우선 사용
+            phase2 = getattr(self, "I2_phase_auto", None)
+            if phase2 is None:
+                phase2 = float(self.df_plus["I2_phase_deg"].iloc[0])
 
             self.tx_winding = self.design1.assign_winding(
                 assignment=[],
@@ -971,6 +974,10 @@ class Simulation():
 
         summary["I1_mag_peak"] = [I1_mag]
         summary["I1_phase_deg"] = [I1_phase]
+        summary["phi_deg"] = [getattr(self, "phi_deg", float("nan"))]
+        phase_used = getattr(self, "I2_phase_auto", None)
+        summary["I2_phase_used_deg"] = [phase_used if phase_used is not None
+                                        else float(self.df_plus["I2_phase_deg"].iloc[0])]
 
         self.df_loss_summary = pd.DataFrame(summary)
         return self.df_loss_summary
@@ -1152,6 +1159,27 @@ def run_one_loop(param=None, model_only=False):
         # loss 디자인은 항상 풀모델로 빌드: 손실/자속이 절대값 그대로 나와
         # 열해석에 x2 보정이 불필요하고 여자 관례 문제도 없음.
         if loss_on:
+            # P_target > 0 이면 design1의 누설(Lk = Llt_true)로 DAB 운전 위상을 역산해
+            # I2 위상(-phi/2)을 자동 주입: phi = asin(P w Lk / (V1 V2'))
+            P_t = float(sim.df_plus["P_target"].iloc[0])
+            if P_t > 0 and not model_only:
+                if not matrix_on:
+                    raise RuntimeError("P_target>0 requires matrix_on=1 (Lk needed for phase calculation).")
+                freq = float(sim.df_plus["freq"].iloc[0])
+                V1 = float(sim.df_plus["V1_rms"].iloc[0])
+                V2p = float(sim.df_plus["V2_rms"].iloc[0]) * int(sim.df_plus["N1"].iloc[0]) / int(sim.df_plus["N2"].iloc[0])
+                Llt_true = float(sim.df1["Llt"].iloc[0]) * 1e-6 * (1.0 if sim.full_model else 2.0)
+                omega = 2 * math.pi * freq
+                arg = P_t * omega * Llt_true / (V1 * V2p) if V1 * V2p > 0 else 2.0
+                if arg >= 1.0:
+                    logging.warning(f"P_target unreachable with Lk={Llt_true*1e6:.1f}uH (sin(phi)={arg:.2f}>1) - phi=90deg capped")
+                    phi_deg = 90.0
+                else:
+                    phi_deg = math.degrees(math.asin(arg))
+                sim.I2_phase_auto = -phi_deg / 2.0
+                sim.phi_deg = phi_deg
+                logging.info(f"auto phase: Lk={Llt_true*1e6:.2f}uH, phi={phi_deg:.2f}deg -> I2 phase {sim.I2_phase_auto:.2f}deg")
+
             prev_full = sim.full_model
             sim.full_model = True
             sim.loss_em_full = True
