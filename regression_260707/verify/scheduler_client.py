@@ -18,9 +18,12 @@ def submit_verification(name, workdir, params: dict, profile: dict, mem_mb=32768
     merged.update(profile.get("param_overrides", {}))
     pjson = json.dumps(merged, separators=(",", ":"))
     extra = profile.get("cli_flags", "")
-    cmd = (BASE +
+    lib_clone = ("([ -d pyaedt_library/src ] || { git clone -q --depth 1 "
+                 "https://github.com/Schwalbe262/pyaedt_library.git pyaedt_library.tmp.$$ "
+                 "&& { mv -T pyaedt_library.tmp.$$ pyaedt_library 2>/dev/null || rm -rf pyaedt_library.tmp.$$; }; }) && "
+                 "[ -d pyaedt_library/src ] && ")
+    cmd = (BASE + lib_clone +
            f"([ -d {workdir} ] || git clone -q --depth 1 https://github.com/Schwalbe262/MFT_1MW_2026.git {workdir}) && "
-           f"([ -d pyaedt_library ] || git clone -q --depth 1 https://github.com/Schwalbe262/pyaedt_library.git) && "
            f"cd {workdir} && git pull -q && "
            f"printf '%s' {shlex.quote(pjson)} > cand.json && "
            f"python run_simulation_260706.py --fixed {extra} --params cand.json")

@@ -24,11 +24,16 @@ BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
 
 CAMPAIGN_SETS = "--set percent_error=1.0 --set max_passes=14 --set P_target=1e6"
 
+# 동시 클론 레이스 방지: 임시 디렉토리에 클론 후 원자적 rename (같은 계정에 여러 태스크 배정 시)
+LIB_CLONE = ("([ -d pyaedt_library/src ] || { git clone -q --depth 1 "
+             "https://github.com/Schwalbe262/pyaedt_library.git pyaedt_library.tmp.$$ "
+             "&& { mv -T pyaedt_library.tmp.$$ pyaedt_library 2>/dev/null || rm -rf pyaedt_library.tmp.$$; }; }) && "
+             "[ -d pyaedt_library/src ] && ")
+
 
 def submit(name, workdir, run_args, mem_mb=32768, cpus=4):
-    cmd = (BASE +
+    cmd = (BASE + LIB_CLONE +
            f"([ -d {workdir} ] || git clone -q --depth 1 https://github.com/Schwalbe262/MFT_1MW_2026.git {workdir}) && "
-           f"([ -d pyaedt_library ] || git clone -q --depth 1 https://github.com/Schwalbe262/pyaedt_library.git) && "
            f"cd {workdir} && git pull -q && "
            f"python run_simulation_260706.py {run_args}; "
            f"echo ===RESULT_CSV===; cat simulation_results_260706.csv 2>/dev/null; "
