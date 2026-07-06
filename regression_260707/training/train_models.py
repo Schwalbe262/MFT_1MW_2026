@@ -129,11 +129,23 @@ def main():
 
     df = to_physical(pd.read_parquet(args.dataset))
     feats = feature_columns(df)
-    fam_params = default_family_params()
+    base_params = default_family_params()
+    tuned = {}
     if args.params and os.path.isfile(args.params):
-        loaded = json.load(open(args.params))
-        for fam, p in loaded.items():
-            fam_params.setdefault(fam, {}).update(p)
+        tuned = json.load(open(args.params))
+
+    def fam_params_for(target):
+        """tune_optuna 구조({family: {target: {params: ...}}}) 또는 flat({family: params}) 지원"""
+        out = {}
+        for fam, base in base_params.items():
+            p = dict(base)
+            spec = tuned.get(fam, {})
+            if target in spec and isinstance(spec[target], dict) and "params" in spec[target]:
+                p.update(spec[target]["params"])
+            elif spec and all(not isinstance(v, dict) for v in spec.values()):
+                p.update(spec)  # flat 구조
+            out[fam] = p
+        return out
 
     os.makedirs(REGISTRY, exist_ok=True)
     targets = args.targets or list(TARGETS.keys())
@@ -142,7 +154,7 @@ def main():
         if t not in df.columns:
             print(f"[skip] {t}: 컬럼 없음")
             continue
-        bundle, metrics = train_target(df, feats, t, TARGETS[t], fam_params, args.weight_col)
+        bundle, metrics = train_target(df, feats, t, TARGETS[t], fam_params_for(t), args.weight_col)
         if bundle is None:
             print(f"[skip] {t}: {metrics}")
             continue
