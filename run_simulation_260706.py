@@ -1452,6 +1452,12 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         if fixed_mode or hold:
             print(result)
             sim.save_project()
+        if fixed_mode:
+            # 스케줄러 stdout 회수용: 결과 1행을 JSON 한 줄로 (AL 루프/검증 드라이버가 파싱)
+            try:
+                print("RESULT_JSON " + result.iloc[0].to_json())
+            except Exception as e:
+                logging.warning(f"RESULT_JSON print failed: {e}")
 
         if hold:
             # 결과 확인용: AEDT와 프로젝트를 연 채로 종료 (사용자가 직접 닫을 때까지 유지)
@@ -1530,7 +1536,27 @@ def parse_args():
                         help="해석 완료 후 AEDT/프로젝트를 닫지 않고 유지 (결과 직접 확인용, 1회 실행)")
     parser.add_argument("--golden", action="store_true",
                         help="golden case(고정 기준 케이스) 1회 해석 후 golden_history CSV에 기록 (드리프트 감지용)")
+    parser.add_argument("--set", dest="set_overrides", action="append", default=[],
+                        metavar="KEY=VALUE",
+                        help="파라미터 오버라이드 (반복 가능, fixed/random 공용). 예: --set P_target=1e6 --set percent_error=1.0")
     return parser.parse_args()
+
+
+def _parse_set_overrides(pairs):
+    """--set KEY=VALUE 목록을 타입 변환된 dict로"""
+    out = {}
+    for p in pairs:
+        if "=" not in p:
+            raise ValueError(f"--set 형식 오류 (KEY=VALUE 필요): {p}")
+        k, v = p.split("=", 1)
+        try:
+            out[k] = int(v)
+        except ValueError:
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
+    return out
 
 
 def main():
@@ -1571,6 +1597,7 @@ def main():
             param["loss_on"] = 1 if args.loss_on else 0
         if args.thermal_on is not None:
             param["thermal_on"] = 1 if args.thermal_on else 0
+        param.update(_parse_set_overrides(args.set_overrides))
 
         run_one_loop(param=param, model_only=args.model_only, hold=args.hold)
         return
@@ -1593,6 +1620,7 @@ def main():
         overrides["full_model"] = 1
     if args.hold:
         overrides["keep_project"] = 1
+    overrides.update(_parse_set_overrides(args.set_overrides))
 
     successes = 0
     attempts = 0
