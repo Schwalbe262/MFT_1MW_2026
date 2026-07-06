@@ -23,9 +23,46 @@ DATASET_DIR = os.path.join(HERE, "..", "data", "dataset")
 
 
 def list_tasks(prefix):
-    t = requests.get(f"{SCHEDULER}/api/tasks", timeout=20).json()
-    tasks = t if isinstance(t, list) else t.get("tasks", [])
-    return [x for x in tasks if str(x.get("name", "")).startswith(prefix)]
+    # 신 스케줄러(limit/name_prefix 지원) 우선
+    matched = []
+    try:
+        t = requests.get(f"{SCHEDULER}/api/tasks",
+                         params={"limit": 5000, "name_prefix": prefix}, timeout=30).json()
+        tasks = t if isinstance(t, list) else t.get("tasks", [])
+        matched = [x for x in tasks if str(x.get("name", "")).startswith(prefix)]
+        if len(tasks) > 250:
+            return matched
+    except Exception:
+        pass
+
+    # 구 스케줄러(200개 페이지): ID 연속 스캔으로 누락 보완
+    seen = {x["id"]: x for x in matched}
+    if not seen:
+        return []
+    ids = sorted(seen)
+    lo, hi = ids[0], ids[-1]
+    # 프리픽스 태스크가 연속 ID 구간이라는 가정 하에 경계 밖 miss 20회까지 확장
+    for direction in (-1, +1):
+        cur = lo if direction < 0 else hi
+        misses = 0
+        while misses < 20:
+            cur += direction
+            if cur in seen:
+                misses = 0
+                continue
+            if cur <= 0:
+                break
+            try:
+                x = requests.get(f"{SCHEDULER}/api/tasks/{cur}", timeout=10).json()
+            except Exception:
+                misses += 1
+                continue
+            if str(x.get("name", "")).startswith(prefix):
+                seen[cur] = x
+                misses = 0
+            else:
+                misses += 1
+    return list(seen.values())
 
 
 def fetch_result_rows(task_id):
