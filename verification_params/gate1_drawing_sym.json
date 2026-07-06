@@ -1,0 +1,9 @@
+{
+ "round_corner": 1,
+ "thermal_on": 1,
+ "P_target": 1000000.0,
+ "V2_rms": 10000.0,
+ "keep_project": 0,
+ "loss_sym_on": 1,
+ "thermal_symmetry": "eighth"
+}

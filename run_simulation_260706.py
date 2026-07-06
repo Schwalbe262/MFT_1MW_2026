@@ -74,6 +74,7 @@ from module.input_parameter_260706 import (
     get_tx_y_gaps,
     get_drawing_default_params,
     get_design_var_columns,
+    sym_cut_count,
 )
 from module.modeling_260706 import (
     create_core,
@@ -533,7 +534,7 @@ class Simulation():
         I2 = float(self.df_plus["I2_rated"].iloc[0])
 
         if mode == "loss":
-            # 손실 원샷 여자: Tx 전압원(V1) + Rx 정격 전류원.
+            # 손실 원샷 여자 (풀모델): Tx 전압원(V1) + Rx 정격 전류원.
             # Maxwell이 1차 전류(부하분 + 자화분)를 스스로 풀어 코어 자속이 실제 운전 수준이 됨.
             # 검증: 무부하 케이스에서 코어손실/턴손실이 자화전류(Im=V1/wLm) 주입 방식과 1% 이내 일치.
             # 주의: 전압 권선의 InputCurrent 리포트는 0으로 표시될 수 있으나 (표시 아티팩트)
@@ -551,6 +552,32 @@ class Simulation():
                 voltage=f"{V1 * math.sqrt(2)}V",
                 resistance=0,
                 inductance=0,
+                name="Tx_winding"
+            )
+
+            self.rx_winding = self.design1.assign_winding(
+                assignment=[],
+                winding_type="Current",
+                is_solid=True,
+                current=f"{I2 * math.sqrt(2)}A",
+                phase=f"{phase2}deg",
+                name="Rx_winding"
+            )
+        elif mode == "loss_sym":
+            # 손실 원샷 여자 (대칭 1/8, 캠페인용): 전압원이 대칭 터미널 구조에서 무효이므로
+            # Tx 전류 = 부하분(N2/N1 x I2, Rx와 역상) + 자화분(Im = sqrt(2)V1/(w Lm_true), -90deg)
+            # 페이저 합을 직접 주입. 선형 해석이므로 올바른 복소 전류 = 실제 운전 자속/전류 재현.
+            # (Lm은 design1 매트릭스에서 자동 취득 - run_one_loop에서 self.loss_I1_* 설정)
+            phase2 = getattr(self, "I2_phase_auto", None)
+            if phase2 is None:
+                phase2 = float(self.df_plus["I2_phase_deg"].iloc[0])
+
+            self.tx_winding = self.design1.assign_winding(
+                assignment=[],
+                winding_type="Current",
+                is_solid=True,
+                current=f"{self.loss_I1_peak}A",
+                phase=f"{self.loss_I1_phase_deg}deg",
                 name="Tx_winding"
             )
 
@@ -884,6 +911,40 @@ class Simulation():
         else:
             self.df_calculator3 = pd.DataFrame({"P_core_plate": [0], "P_winding_plate": [0]})
 
+    def _sym_cut_count(self, obj_name):
+        """대칭 1/8 분할 절단면 수 (공용 로직 위임)"""
+        return sym_cut_count(obj_name, self.df_plus)
+
+    def _mirror_mult(self, obj_name):
+        """대칭 loss 디자인에서 삭제된 미러 오브젝트 몫을 총계에 반영하는 배수.
+        (y=0에 걸치지 않는 코어/플레이트/냉각판은 y<0 쪽 미러가 삭제되어 있으므로 x2)
+        풀모델이면 항상 1 (모든 오브젝트가 실존)."""
+        if not getattr(self, "loss_is_sym", False):
+            return 1.0
+        name = obj_name
+        if name.startswith("Tx_main_wcp"):
+            return 2.0  # _p만 잔존 (_n 미러 삭제)
+        if name.startswith("core_plate") or (name.startswith("core_") and not name.startswith("core_plate")):
+            return 1.0 if self._sym_cut_count(name) == 3 else 2.0  # y=0 스팬이면 미러 없음
+        return 1.0
+
+    def _phys_factor(self, expr_name, is_core_loss):
+        """대칭 loss 디자인의 적분값 -> 실물값 환산 계수 (풀모델이면 1)"""
+        if not getattr(self, "loss_is_sym", False):
+            return 1.0
+        # 표현식 이름에서 오브젝트 이름 추출: P_core_3 / P_turn_Rx_main_0_0 / P_Tx_main_group ...
+        name = expr_name
+        for prefix in ("P_turn_", "P_"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        name = name.replace("_group", "")
+        c = self._sym_cut_count(name)
+        if is_core_loss:
+            core_y = float(self.df_plus["core_y"].iloc[0])
+            return (2 ** c) / (2 ** core_y)
+        return (2 ** c) / 4.0
+
     def _calc_field_expr(self, obj_name, quantity, op, expr_name):
         """계산기: quantity를 오브젝트 볼륨에 대해 op(Integrate/Mean/Maximum) 후 named expression 등록.
         quantity="B_peak"는 위상 무관한 자속밀도 페이저 크기 (Mag_B는 Phase=0 순간값이라 부적합)."""
@@ -936,10 +997,14 @@ class Simulation():
         # ---- 권선 그룹 총손실 + explicit 턴 손실 (열해석용) ----
         group_exprs = []
         turn_exprs = []
+        plate_exprs = []
         group_exprs.append(self._calc_group_loss(self.design1.Tx_windings_main, "P_Tx_main_group"))
         group_exprs.append(self._calc_group_loss(self.design1.Rx_windings_main, "P_Rx_main_group"))
         if self.design1.Rx_windings_side:
             group_exprs.append(self._calc_group_loss(self.design1.Rx_windings_side, "P_Rx_side_group"))
+        # 플레이트류 개별 손실 (미러 배수를 오브젝트별로 적용하기 위해 개별 적분)
+        for p in self.design1.core_plates + self.design1.wcp_plates:
+            plate_exprs.append(self._calc_field_expr(p.name, "EMLoss", "Integrate", f"P_{p.name}"))
         # Tx는 전 턴 explicit (열모델에서 foil 그대로) -> 턴별 손실
         for w in self.design1.Tx_windings_main:
             turn_exprs.append(self._calc_field_expr(w.name, "EMLoss", "Integrate", f"P_turn_{w.name}"))
@@ -951,19 +1016,56 @@ class Simulation():
             for w in explicit:
                 turn_exprs.append(self._calc_field_expr(w.name, "EMLoss", "Integrate", f"P_turn_{w.name}"))
 
-        all_exprs = core_exprs + b_mean_exprs + b_max_exprs + group_exprs + turn_exprs
+        all_exprs = core_exprs + b_mean_exprs + b_max_exprs + group_exprs + turn_exprs + plate_exprs
         df_loss = self._export_field_report("calculator_report_loss", all_exprs)
         vals = df_loss.iloc[0, -len(all_exprs):]
         vals.index = all_exprs
         self.loss_map = {k: float(v) for k, v in vals.items()}
 
-        core_total = sum(self.loss_map[e] for e in core_exprs)
-        b_mean = sum(self.loss_map[e] for e in b_mean_exprs) / max(len(b_mean_exprs), 1)
-        b_max = max((self.loss_map[e] for e in b_max_exprs), default=0)
+        # 실물 기준(_phys) 환산: 대칭 loss 디자인이면 오브젝트별 절단면 수로 보정, 풀모델이면 x1
+        b_factor = 0.5 if getattr(self, "loss_is_sym", False) else 1.0
+        self.loss_map_phys = {}
+        for e in core_exprs:
+            self.loss_map_phys[e] = self.loss_map[e] * self._phys_factor(e, is_core_loss=True)
+        for e in group_exprs + turn_exprs + plate_exprs:
+            self.loss_map_phys[e] = self.loss_map[e] * self._phys_factor(e, is_core_loss=False)
+        for e in b_mean_exprs + b_max_exprs:
+            self.loss_map_phys[e] = self.loss_map[e] * b_factor
 
-        summary = {"P_core_total": [core_total], "B_mean_core": [b_mean], "B_max_core": [b_max]}
-        for e in core_exprs + group_exprs + turn_exprs:
-            summary[e] = [self.loss_map[e]]
+        def _obj_of(expr):
+            n = expr
+            for pref in ("P_turn_", "P_"):
+                if n.startswith(pref):
+                    return n[len(pref):].replace("_group", "")
+            return n
+
+        # 총계 (대칭 모델의 삭제된 미러 몫 포함 - 실물 전체 기준)
+        core_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e)) for e in core_exprs)
+        cplate_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
+                           for e in plate_exprs if "core_plate" in e)
+        wcp_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
+                        for e in plate_exprs if "wcp" in e)
+        p_tx = self.loss_map_phys.get("P_Tx_main_group", 0.0)
+        p_rxm = self.loss_map_phys.get("P_Rx_main_group", 0.0)
+        p_rxs_one = self.loss_map_phys.get("P_Rx_side_group", 0.0)
+        winding_total = p_tx + p_rxm + 2 * p_rxs_one  # 측면 링 2개 (좌우 대칭)
+
+        b_mean = sum(self.loss_map_phys[e] for e in b_mean_exprs) / max(len(b_mean_exprs), 1)
+        b_max = max((self.loss_map_phys[e] for e in b_max_exprs), default=0)
+
+        # CSV에는 실물 기준 값을 기본으로 기록 (raw 대칭 적분값은 _raw 접미사)
+        summary = {
+            "P_core_total": [core_total],
+            "P_core_plate_total": [cplate_total],
+            "P_wcp_total": [wcp_total],
+            "P_winding_total": [winding_total],
+            "P_Rx_side_total": [2 * p_rxs_one],
+            "B_mean_core": [b_mean], "B_max_core": [b_max],
+        }
+        for e in core_exprs + group_exprs + turn_exprs + plate_exprs:
+            summary[e] = [self.loss_map_phys[e]]
+            if getattr(self, "loss_is_sym", False):
+                summary[f"{e}_raw"] = [self.loss_map[e]]
 
         # ---- Tx 해석 전류 (전압원 여자 검증용) ----
         I1_mag = float("nan")
@@ -1242,10 +1344,13 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 result_parts.append(sim.get_convergence_info("matrix"))
                 result_parts.append(pd.DataFrame({"time_matrix": [t_matrix]}))
 
-        # ---- design2: 손실 원샷 (Tx = 부하+자화 전류, Rx = 정격 전류, 코어손실 활성) ----
-        # loss 디자인은 항상 풀모델로 빌드: 손실/자속이 절대값 그대로 나와
-        # 열해석에 x2 보정이 불필요하고 여자 관례 문제도 없음.
+        # ---- design2: 손실 원샷 ----
+        # loss_sym_on=1 (캠페인 기본): 대칭 1/8 + 전류 여자 (Tx = 부하+자화 페이저 합)
+        #   -> 추출 시 오브젝트별 상수 보정으로 실물(_phys) 기록. 시간 ~4x 단축.
+        # loss_sym_on=0 (최종 검증): 풀모델 + Tx 전압원 (검증된 물리 기준 경로)
         if loss_on:
+            loss_sym = int(sim.df_plus["loss_sym_on"].iloc[0]) != 0 and not sim.full_model
+
             # P_target > 0 이면 design1의 누설(Lk = Llt_true)로 DAB 운전 위상을 역산해
             # I2 위상(-phi/2)을 자동 주입: phi = asin(P w Lk / (V1 V2'))
             P_t = float(sim.df_plus["P_target"].iloc[0])
@@ -1267,10 +1372,42 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 sim.phi_deg = phi_deg
                 logging.info(f"auto phase: Lk={Llt_true*1e6:.2f}uH, phi={phi_deg:.2f}deg -> I2 phase {sim.I2_phase_auto:.2f}deg")
 
+            if loss_sym and not model_only:
+                if not matrix_on:
+                    raise RuntimeError("loss_sym_on=1 requires matrix_on=1 (Lm needed for magnetizing current).")
+                # Tx 합성 전류: I1 = I_load∠phase2 + Im∠-90 (복소 합)
+                freq = float(sim.df_plus["freq"].iloc[0])
+                V1 = float(sim.df_plus["V1_rms"].iloc[0])
+                I2 = float(sim.df_plus["I2_rated"].iloc[0])
+                N1 = int(sim.df_plus["N1"].iloc[0])
+                N2 = int(sim.df_plus["N2"].iloc[0])
+                phase2 = getattr(sim, "I2_phase_auto", None)
+                if phase2 is None:
+                    phase2 = float(sim.df_plus["I2_phase_deg"].iloc[0])
+                Lm_true = float(sim.df1["Lmt"].iloc[0]) * 1e-6 * 2.0  # 대칭 매트릭스 L은 실물의 1/2
+                omega = 2 * math.pi * freq
+                Im_peak = math.sqrt(2) * V1 / (omega * Lm_true) if Lm_true > 0 else 0.0
+                I_load_peak = math.sqrt(2) * I2 * N2 / N1
+                z = I_load_peak * complex(math.cos(math.radians(phase2)), math.sin(math.radians(phase2))) \
+                    + Im_peak * complex(0, -1)
+                sim.loss_I1_peak = abs(z)
+                sim.loss_I1_phase_deg = math.degrees(math.atan2(z.imag, z.real))
+                logging.info(f"loss_sym excitation: I_load={I_load_peak:.2f}A + Im={Im_peak:.2f}A "
+                             f"-> I1={sim.loss_I1_peak:.2f}A ang {sim.loss_I1_phase_deg:.2f}deg")
+            elif loss_sym and model_only:
+                sim.loss_I1_peak = math.sqrt(2) * float(sim.df_plus["I1_rated"].iloc[0])
+                sim.loss_I1_phase_deg = 0.0
+
             prev_full = sim.full_model
-            sim.full_model = True
-            sim.loss_em_full = True
-            _build_em_design("maxwell_loss", "loss")
+            if loss_sym:
+                sim.loss_em_full = False
+                sim.loss_is_sym = True
+                _build_em_design("maxwell_loss", "loss_sym")
+            else:
+                sim.full_model = True
+                sim.loss_em_full = True
+                sim.loss_is_sym = False
+                _build_em_design("maxwell_loss", "loss")
             sim.design_loss = sim.design1
             if not model_only:
                 t_loss = _analyze_current_design("loss")

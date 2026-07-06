@@ -32,6 +32,7 @@ KEYS = [
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns", "rx_mesh_mode",
     "keep_project",
+    "loss_sym_on", "thermal_symmetry",
 ]
 
 
@@ -100,6 +101,11 @@ def get_drawing_default_params():
         "rx_mesh_mode": "skin",
         # 완료 후 프로젝트 파일 보존 여부 (fixed 기본 보존 / 랜덤·클러스터는 0으로 확실히 삭제)
         "keep_project": 1,
+        # 손실 디자인 대칭화: 1이면 대칭 1/8 + 전류 여자 (캠페인용, 시간 ~4x 단축).
+        # 0이면 풀모델 + 전압원 (최종 검증용). 추출값은 양쪽 모두 _phys(실물 기준)로 보정 기록
+        "loss_sym_on": 1,
+        # 열해석 대칭화: "eighth" = 1/8 (양측 팬 y대칭 + 부력 무시 가정, 캠페인용) / "full" = 최종 검증용
+        "thermal_symmetry": "eighth",
     }
 
 
@@ -274,6 +280,41 @@ def _create_random_parameter_sobol():
         "keep_project": 0,
     })
     return pd.DataFrame([[values[k] for k in KEYS]], columns=KEYS)
+
+
+def sym_cut_count(obj_name, df):
+    """
+    1/8 대칭 분할(x=0, y=0, z=0) 시 원형 오브젝트를 지나는 절단 평면 수 c.
+    보유 체적 분율 = 1/2^c. 실물 환산: EMLoss x 2^c/4, CoreLoss x 2^c/2^core_y, B x 1/2.
+    """
+    name = obj_name
+    if name.startswith("Tx_main_wcp"):
+        return 2  # 냉각판: x,z 절단 (y는 한쪽에만 존재)
+    if name.startswith(("Tx_main", "Rx_main")):
+        return 3  # 중심 권선 링: x,y,z 모두
+    if name.startswith(("Tx_side", "Rx_side")):
+        return 2  # 측면 권선 링: y,z (x=0에 안 걸림)
+
+    w1 = float(df["w1"].iloc[0])
+    n = int(df["n_core_group"].iloc[0])
+    t = float(df["core_plate_t"].iloc[0])
+    d = (w1 - (n + 1) * t) / n
+
+    if name.startswith("core_plate"):
+        try:
+            i = int(name.split("_")[2])  # core_plate_<i> (1-based)
+        except (IndexError, ValueError):
+            return 2
+        y0 = -w1 / 2 + (i - 1) * (t + d)
+        return 3 if (y0 < 0 < y0 + t) else 2
+    if name.startswith("core_"):
+        try:
+            i = int(name.split("_")[1])  # core_<i> (1-based)
+        except (IndexError, ValueError):
+            return 2
+        y0 = -w1 / 2 + i * t + (i - 1) * d
+        return 3 if (y0 < 0 < y0 + d) else 2
+    return 3
 
 
 def get_tx_y_gaps(df):
@@ -566,6 +607,8 @@ def validation_check(input_df, strict=False, return_errors=False):
             errors.append(f"2*n_explicit_turns ({2 * n_exp}) >= N2_side ({N2_side})")
     if str(inp["rx_mesh_mode"].iloc[0]) not in ("skin", "length", "length-coarse"):
         errors.append(f"invalid rx_mesh_mode ({inp['rx_mesh_mode'].iloc[0]})")
+    if str(inp["thermal_symmetry"].iloc[0]) not in ("eighth", "full"):
+        errors.append(f"invalid thermal_symmetry ({inp['thermal_symmetry'].iloc[0]})")
 
     result = len(errors) == 0
 
@@ -594,6 +637,7 @@ NON_DESIGN_VAR_KEYS = {
     "k_ins", "core_k_thermal", "n_explicit_turns",
     "max_passes", "percent_error", "keep_project",
     "core_depth_min", "core_depth_max",
+    "loss_sym_on", "thermal_symmetry",
 }
 
 

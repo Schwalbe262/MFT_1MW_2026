@@ -42,35 +42,43 @@ def _sym_factor(spans_x0, spans_y0, spans_z0):
 
 
 class LossAllocator:
-    """EM loss 디자인의 계산기 결과(loss_map)를 풀모델 열해석 오브젝트에 배분"""
+    """
+    EM loss 디자인의 실물 기준 손실(loss_map_phys)을 열해석 오브젝트에 배분.
+    - full thermal: 오브젝트당 실물값 그대로 (미러 오브젝트는 대응 키 폴백)
+    - eighth thermal: 실물값 x 보유 체적 분율(1/2^c)
+    """
 
-    def __init__(self, sim):
+    def __init__(self, sim, eighth=False):
         self.sim = sim
         self.df = sim.df_plus
-        self.loss_map = getattr(sim, "loss_map", {})
-        # loss 디자인은 항상 풀모델로 해석되므로 (전압원 여자 유효성) 기본적으로 무보정.
-        # 대칭 loss 값이 들어오는 예외 케이스만 오브젝트별 환산 적용.
-        self.full_em = getattr(sim, "loss_em_full", int(self.df["full_model"].iloc[0]) != 0)
+        self.loss_map = getattr(sim, "loss_map_phys", None) or getattr(sim, "loss_map", {})
+        self.eighth = eighth
 
     def _get(self, key):
         v = self.loss_map.get(key)
+        if v is None:
+            # 미러 오브젝트 폴백 (대칭 EM에 없는 y<0 쪽 등): 대응 오브젝트 키로 대체
+            alt = key.replace("Rx_side2", "Rx_side").replace("_n", "_p")
+            v = self.loss_map.get(alt)
         if v is None:
             logging.warning(f"loss_map missing key: {key} (0W assumed)")
             return 0.0
         return float(v)
 
-    def turn_loss(self, expr_key, spans_x0=True, spans_y0=True, spans_z0=True):
-        """개별 턴/오브젝트 손실 [W]"""
-        v = self._get(expr_key)
-        if self.full_em:
-            return v
-        return v * _sym_factor(spans_x0, spans_y0, spans_z0)
+    def _retained_fraction(self, obj_name):
+        if not self.eighth:
+            return 1.0
+        from module.input_parameter_260706 import sym_cut_count
+        return 1.0 / (2 ** sym_cut_count(obj_name, self.df))
 
-    def group_loss(self, expr_key, spans_x0=True, spans_y0=True, spans_z0=True):
-        v = self._get(expr_key)
-        if self.full_em:
-            return v
-        return v * _sym_factor(spans_x0, spans_y0, spans_z0)
+    def turn_loss(self, expr_key, obj_name=None, **_legacy):
+        """개별 턴/오브젝트에 주입할 손실 [W] (열모델 보유 체적 기준)"""
+        name = obj_name or expr_key.replace("P_turn_", "").replace("P_", "")
+        return self._get(expr_key) * self._retained_fraction(name)
+
+    def group_loss(self, expr_key, obj_name=None, **_legacy):
+        name = obj_name or expr_key.replace("P_", "").replace("_group", "")
+        return self._get(expr_key) * self._retained_fraction(name)
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +185,8 @@ def _build_homog_blocks(ipk, df, prefix, name, offset_x, height):
     return blocks
 
 
-def _build_geometry(ipk, sim):
-    """풀모델 열해석 지오메트리 생성. 오브젝트 그룹 dict 반환"""
+def _build_geometry(ipk, sim, eighth=False):
+    """열해석 지오메트리 생성 (eighth=True면 1/8 대칭 분할). 오브젝트 그룹 dict 반환"""
     df = sim.df_plus
     n_exp = int(df["n_explicit_turns"].iloc[0])
     l1 = float(df["l1"].iloc[0])
@@ -263,12 +271,26 @@ def _build_geometry(ipk, sim):
     if int(df["N2_side"].iloc[0]) > 0:
         off = l1 + l2 + l1 / 2
         objs["Rx_side_explicit"], objs["Rx_side_blocks"] = _build_rx_group("side", "Rx_side", -off)
-        objs["Rx_side2_explicit"], objs["Rx_side2_blocks"] = _build_rx_group("side", "Rx_side2", +off)
+        if not eighth:
+            # 1/8 모드에서는 +x 측 링이 어차피 절단 제거되므로 생성 생략 (모델링 시간 절약)
+            objs["Rx_side2_explicit"], objs["Rx_side2_blocks"] = _build_rx_group("side", "Rx_side2", +off)
+
+    if eighth:
+        # EM 대칭 모델과 동일한 옥탄트 유지 (x<=0, y>=0, z>=0)
+        all_objs = []
+        for grp in objs.values():
+            all_objs.extend(grp)
+        ipk.modeler.split(assignment=all_objs, plane="XY", sides="PositiveOnly")
+        ipk.modeler.split(assignment=all_objs, plane="XZ", sides="PositiveOnly")
+        ipk.modeler.split(assignment=all_objs, plane="YZ", sides="NegativeOnly")
+        existing = set(ipk.modeler.object_names)
+        for key in list(objs.keys()):
+            objs[key] = [o for o in objs[key] if o.name in existing]
 
     return objs
 
 
-def _create_probe_sheets(ipk, df, objs):
+def _create_probe_sheets(ipk, df, objs, eighth=False):
     """
     회귀학습용 온도 프로브 시트 생성 (비모델 - 메시에 영향 없음).
 
@@ -299,32 +321,38 @@ def _create_probe_sheets(ipk, df, objs):
             logging.warning(f"probe sheet {name} failed: {e}")
             return None
 
-    # ---- Tx (1차): y- 풍하측 단면 (x=0 평면) + x+ 측면 단면 (y=0 평면) ----
+    # eighth 모드: 보유 옥탄트 (x<=0, y>=0, z>=0) 안에만 시트 배치
+    z_lo = 0.0 if eighth else None
+
+    # ---- Tx (1차): y측 단면 (x=0 평면) + x측 단면 (y=0 평면) ----
     tx_gaps, _ = get_tx_y_gaps(df)
     N1 = int(df["N1_main"].iloc[0])
     tx_x = compute_layer_positions(float(df["sl1_main_x"].iloc[0]) / 2, cw1, [float(df["gap1"].iloc[0])] * (N1 - 1))
     tx_y = compute_layer_positions(float(df["sl1_main_y"].iloc[0]) / 2, cw1, tx_gaps)
     zh = 0.45 * nwh1
-    # YZ 평면 시트 (x=0): y- 런의 단면 [y_in, y_out] x [z]
-    _sheet("Tprobe_Tx_leeward", "YZ", [0, -(tx_y[-1] + cw1 / 2), -zh],
-           [(tx_y[-1] - tx_y[0]) + cw1, 2 * zh])
-    # XZ 평면 시트 (y=0): x+ 런의 단면
-    _sheet("Tprobe_Tx_side", "XZ", [tx_x[0] - cw1 / 2, 0, -zh],
-           [(tx_x[-1] - tx_x[0]) + cw1, 2 * zh])
+
+    def _z_range(zh_):
+        return (0.0, zh_) if eighth else (-zh_, zh_)
+
+    z0, z1 = _z_range(zh)
+    # YZ 평면 시트 (x=0): y측 런의 단면 (eighth: +y측 / full: -y 풍하측)
+    y_sign = 1 if eighth else -1
+    y_start = (tx_y[0] - cw1 / 2) if eighth else -(tx_y[-1] + cw1 / 2)
+    _sheet("Tprobe_Tx_leeward", "YZ", [0, y_start, z0], [(tx_y[-1] - tx_y[0]) + cw1, z1 - z0])
+    # XZ 평면 시트 (y=0): x- 런의 단면 (보유 옥탄트가 x<=0)
+    _sheet("Tprobe_Tx_side", "XZ", [-(tx_x[-1] + cw1 / 2), 0, z0], [(tx_x[-1] - tx_x[0]) + cw1, z1 - z0])
 
     # ---- Rx 그룹 공통 생성기 ----
     def _rx_probes(prefix, name, offset_x):
         N, cw, x_pos, y_pos = _rx_layout(df, prefix)
         zh2 = 0.45 * nwh2
+        za, zb = _z_range(zh2)
         y_in, y_out = y_pos[0] - cw / 2, y_pos[-1] + cw / 2
         x_in, x_out = x_pos[0] - cw / 2, x_pos[-1] + cw / 2
-        # 링 중심을 지나는 세로 평면 (x=offset_x): y- 풍하측 런
-        _sheet(f"Tprobe_{name}_leeward", "YZ", [offset_x, -y_out, -zh2], [y_out - y_in, 2 * zh2])
-        # y=0 평면: 바깥쪽(x가 코어 중심에서 먼 쪽) 런
-        if offset_x <= 0:
-            _sheet(f"Tprobe_{name}_side", "XZ", [offset_x - x_out, 0, -zh2], [x_out - x_in, 2 * zh2])
-        else:
-            _sheet(f"Tprobe_{name}_side", "XZ", [offset_x + x_in, 0, -zh2], [x_out - x_in, 2 * zh2])
+        ys = y_in if eighth else -y_out
+        _sheet(f"Tprobe_{name}_leeward", "YZ", [offset_x, ys, za], [y_out - y_in, zb - za])
+        # y=0 평면: 바깥쪽(코어 중심에서 먼 쪽) 런 - 보유 옥탄트 x<=0 기준
+        _sheet(f"Tprobe_{name}_side", "XZ", [offset_x - x_out, 0, za], [x_out - x_in, zb - za])
 
     _rx_probes("main", "Rx_main", 0.0)
     if int(df["N2_side"].iloc[0]) > 0:
@@ -333,7 +361,8 @@ def _create_probe_sheets(ipk, df, objs):
 
     # ---- 코어: 중심 레그 y=0 단면 ----
     zc = 0.45 * (h1 + 2 * l1)
-    _sheet("Tprobe_core_center", "XZ", [-0.9 * l1, 0, -zc], [1.8 * l1, 2 * zc])
+    zca, zcb = _z_range(zc)
+    _sheet("Tprobe_core_center", "XZ", [-0.9 * l1, 0, zca], [0.9 * l1 if eighth else 1.8 * l1, zcb - zca])
 
     return sheets
 
@@ -342,10 +371,11 @@ def _create_probe_sheets(ipk, df, objs):
 # 손실 주입 / 경계조건
 # ---------------------------------------------------------------------------
 
-def _assign_losses(ipk, sim, objs):
+def _assign_losses(ipk, sim, objs, eighth=False):
+    """실물 기준 손실(loss_map_phys)을 열모델 오브젝트에 주입.
+    eighth 모드에서는 보유 체적 분율(1/2^c)이 LossAllocator에서 자동 적용된다."""
     df = sim.df_plus
-    alloc = LossAllocator(sim)
-    n_exp = int(df["n_explicit_turns"].iloc[0])
+    alloc = LossAllocator(sim, eighth=eighth)
     injected = {}
 
     def _block(obj, watts):
@@ -356,69 +386,49 @@ def _assign_losses(ipk, sim, objs):
         except Exception as e:
             logging.warning(f"assign_solid_block failed for {obj.name}: {e}")
 
-    # Tx 턴별 (3면 절단 -> x2)
+    # Tx 턴별
     for w in objs["Tx"]:
-        _block(w, alloc.turn_loss(f"P_turn_{w.name}"))
+        _block(w, alloc.turn_loss(f"P_turn_{w.name}", w.name))
 
-    # Rx main explicit 턴 (3면 절단 -> x2)
-    p_main_explicit = 0.0
-    for w in objs["Rx_main_explicit"]:
-        p = alloc.turn_loss(f"P_turn_{w.name}")
-        p_main_explicit += p
-        _block(w, p)
+    # Rx 그룹 공통: explicit 턴 + 중간 균질 블록 (그룹 총손실 - explicit, 체적 비례)
+    def _rx_group(explicit_objs, blocks, group_key, name_hint):
+        p_exp_total = 0.0
+        for w in explicit_objs:
+            em_name = w.name.replace("Rx_side2", "Rx_side")
+            p = alloc.turn_loss(f"P_turn_{em_name}", em_name)
+            p_exp_total += p
+            _block(w, p)
+        p_total = alloc.group_loss(group_key, name_hint)
+        p_mid = max(p_total - p_exp_total, 0.0)
+        vols = [abs(b.volume) for b in blocks]
+        vt = sum(vols) or 1.0
+        for b, v in zip(blocks, vols):
+            _block(b, p_mid * v / vt)
 
-    # Rx main 중간 블록: 그룹 총손실 - explicit, 4블록에 체적 비례 배분
-    p_main_total = alloc.group_loss("P_Rx_main_group")
-    p_mid = max(p_main_total - p_main_explicit, 0.0)
-    vols = [abs(b.volume) for b in objs["Rx_main_blocks"]]
-    vtot = sum(vols) or 1.0
-    for b, v in zip(objs["Rx_main_blocks"], vols):
-        _block(b, p_mid * v / vtot)
-
-    # Rx side: 측면 링은 x=0 평면에 안 잘리므로 (2면 절단) 대칭값 = 링 1개 실제값
+    _rx_group(objs["Rx_main_explicit"], objs["Rx_main_blocks"], "P_Rx_main_group", "Rx_main_0_0")
     if objs["Rx_side_explicit"]:
-        def _side_ring(explicit_objs, blocks):
-            p_exp_total = 0.0
-            for i, w in enumerate(explicit_objs):
-                # loss_map 키는 EM 디자인의 좌측 링 이름(Rx_side_i_0) 기준
-                em_name = w.name.replace("Rx_side2", "Rx_side")
-                p = alloc.turn_loss(f"P_turn_{em_name}", spans_x0=False)
-                p_exp_total += p
-                _block(w, p)
-            p_total = alloc.group_loss("P_Rx_side_group", spans_x0=False)
-            p_mid_s = max(p_total - p_exp_total, 0.0)
-            vols_s = [abs(b.volume) for b in blocks]
-            vt = sum(vols_s) or 1.0
-            for b, v in zip(blocks, vols_s):
-                _block(b, p_mid_s * v / vt)
+        _rx_group(objs["Rx_side_explicit"], objs["Rx_side_blocks"], "P_Rx_side_group", "Rx_side_0_0")
+    if objs["Rx_side2_explicit"]:
+        _rx_group(objs["Rx_side2_explicit"], objs["Rx_side2_blocks"], "P_Rx_side_group", "Rx_side_0_0")
 
-        _side_ring(objs["Rx_side_explicit"], objs["Rx_side_blocks"])
-        _side_ring(objs["Rx_side2_explicit"], objs["Rx_side2_blocks"])
-
-    # 코어 그룹: y=0에 걸친 그룹은 x2, 바깥 그룹은 x1 + 미러 복제
+    # 코어 그룹: loss_map_phys에 있는 키 우선, 없으면(풀 열해석 + 대칭 EM 조합의 미러) 대응 그룹
     n_group = int(df["n_core_group"].iloc[0])
-    w1 = float(df["w1"].iloc[0])
-    plate_t = float(df["core_plate_t"].iloc[0])
-    d = (w1 - (n_group + 1) * plate_t) / n_group
-    for i, c in enumerate(objs["core"]):
-        y0 = -w1 / 2 + (i + 1) * plate_t + i * d
-        y1 = y0 + d
-        spans_y0 = (y0 < 0 < y1)
-        if spans_y0:
-            p = alloc.group_loss(f"P_{c.name}")
-        else:
-            # 대칭 모델에는 y>0 그룹만 존재 -> 미러 그룹은 대응 그룹 값 사용
-            mirror_idx = n_group - 1 - i
-            key = f"P_core_{mirror_idx + 1}" if f"P_core_{i + 1}" not in alloc.loss_map else f"P_core_{i + 1}"
-            p = alloc.turn_loss(key, spans_y0=False)
-        _block(c, p)
+    for c in objs["core"]:
+        try:
+            i = int(c.name.split("_")[1])
+        except (IndexError, ValueError):
+            i = 1
+        key = f"P_{c.name}"
+        if key not in alloc.loss_map:
+            key = f"P_core_{n_group + 1 - i}"  # y-미러 그룹
+        _block(c, alloc.turn_loss(key, c.name))
 
     # 콜드플레이트/냉각판은 고정온도 경계라 열원 주입 생략
     sim.thermal_injected = injected
     return injected
 
 
-def _assign_boundaries(ipk, sim, objs):
+def _assign_boundaries(ipk, sim, objs, eighth=False):
     df = sim.df_plus
     plate_temp = float(df["plate_temp"].iloc[0])
     air_temp = float(df["air_temp"].iloc[0])
@@ -443,7 +453,40 @@ def _assign_boundaries(ipk, sim, objs):
     except Exception as e:
         logging.warning(f"set_ambient_temp failed: {e}")
 
-    # region + 팬 유동 (+y -> -y)
+    if eighth:
+        # 1/8: 대칭면 3개(x=0/y=0/z=0)는 region 면을 플러시로 두고 symmetry wall 할당.
+        # +y 외곽 = 팬 유입 (양측 팬의 y대칭 유동 가정), -x/+z 외곽 = 배기 opening
+        region = ipk.modeler.create_air_region(x_pos=0.0, y_pos=100.0, z_pos=100.0,
+                                               x_neg=100.0, y_neg=0.0, z_neg=0.0,
+                                               is_percentage=True)
+        try:
+            ipk.assign_symmetry_wall(geometry=region.top_face_x.id, boundary_name="sym_x0")
+            ipk.assign_symmetry_wall(geometry=region.bottom_face_y.id, boundary_name="sym_y0")
+            ipk.assign_symmetry_wall(geometry=region.bottom_face_z.id, boundary_name="sym_z0")
+        except Exception as e:
+            logging.warning(f"Symmetry wall assignment failed: {e}")
+        try:
+            ipk.assign_velocity_free_opening(
+                assignment=[region.top_face_y.id],
+                boundary_name="fan_inlet",
+                temperature=f"{air_temp}cel",
+                velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]
+            )
+            ipk.assign_pressure_free_opening(
+                assignment=[region.bottom_face_x.id],
+                boundary_name="outlet_x",
+                temperature=f"{air_temp}cel"
+            )
+            ipk.assign_pressure_free_opening(
+                assignment=[region.top_face_z.id],
+                boundary_name="outlet_z",
+                temperature=f"{air_temp}cel"
+            )
+        except Exception as e:
+            logging.warning(f"Opening assignment failed: {e}")
+        return region
+
+    # 풀모델: region 전방향 + 팬 유동 (+y -> -y)
     region = ipk.modeler.create_air_region(x_pos=100.0, y_pos=100.0, z_pos=100.0,
                                            x_neg=100.0, y_neg=100.0, z_neg=100.0,
                                            is_percentage=True)
@@ -476,21 +519,26 @@ def run_thermal_analysis(sim):
     """
     df = sim.df_plus
 
+    eighth = str(df["thermal_symmetry"].iloc[0]) == "eighth"
+
     ipk = sim.project.create_design(name="icepak_thermal", solver="icepak",
                                     solution="SteadyState TemperatureAndFlow")
     sim.design_thermal = ipk
 
     set_design_variables(ipk, sim.input_df)
     _create_thermal_materials(ipk, df)
-    objs = _build_geometry(ipk, sim)
-    probe_sheets = _create_probe_sheets(ipk, df, objs)
-    _assign_losses(ipk, sim, objs)
-    _assign_boundaries(ipk, sim, objs)
+    objs = _build_geometry(ipk, sim, eighth=eighth)
+    probe_sheets = _create_probe_sheets(ipk, df, objs, eighth=eighth)
+    _assign_losses(ipk, sim, objs, eighth=eighth)
+    _assign_boundaries(ipk, sim, objs, eighth=eighth)
 
     setup = ipk.create_setup(name="ThermalSetup")
     try:
         setup.props["Flow Regime"] = "Turbulent"
         setup.props["Convergence Criteria - Max Iterations"] = 250
+        if eighth:
+            # 1/8 대칭의 z대칭은 부력 무시 가정에 기반 -> 중력 비활성
+            setup.props["Include Gravity"] = False
         setup.update()
     except Exception as e:
         logging.warning(f"Thermal setup props: {e}")
