@@ -39,29 +39,34 @@ def list_tasks(prefix):
     seen = {x["id"]: x for x in matched}
     if not seen:
         return []
+    def probe(tid):
+        try:
+            x = requests.get(f"{SCHEDULER}/api/tasks/{tid}", timeout=10).json()
+        except Exception:
+            return None
+        return x if str(x.get("name", "")).startswith(prefix) else False
+
     ids = sorted(seen)
     lo, hi = ids[0], ids[-1]
-    # 프리픽스 태스크가 연속 ID 구간이라는 가정 하에 경계 밖 miss 20회까지 확장
+    # 경계 확장: 프리픽스 연속 구간 가정, 밖으로 miss 20회까지
     for direction in (-1, +1):
         cur = lo if direction < 0 else hi
         misses = 0
-        while misses < 20:
+        while misses < 20 and cur > 0:
             cur += direction
-            if cur in seen:
-                misses = 0
-                continue
-            if cur <= 0:
-                break
-            try:
-                x = requests.get(f"{SCHEDULER}/api/tasks/{cur}", timeout=10).json()
-            except Exception:
-                misses += 1
-                continue
-            if str(x.get("name", "")).startswith(prefix):
-                seen[cur] = x
+            r = probe(cur)
+            if r:
+                seen[cur] = r
                 misses = 0
             else:
                 misses += 1
+    # 범위 내 구멍 채우기 (페이지에 안 담긴 중간 ID)
+    lo, hi = min(seen), max(seen)
+    for tid in range(lo, hi + 1):
+        if tid not in seen:
+            r = probe(tid)
+            if r:
+                seen[tid] = r
     return list(seen.values())
 
 
