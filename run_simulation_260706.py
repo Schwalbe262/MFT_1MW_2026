@@ -1139,7 +1139,7 @@ def log_failed_sample(input_df, reason, filename="failed_samples_260706.csv"):
         logging.warning(f"failed-sample logging failed: {e}")
 
 
-def run_one_loop(param=None, model_only=False, hold=False, golden=False):
+def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrides=None):
     """
     param 이 None  -> 랜덤 파라미터 1회 (검증 실패 시 재추첨), 완료 후 프로젝트 삭제
     param 이 dict 등 -> 해당 값으로 1회 (fixed 모드), 프로젝트 폴더 보존
@@ -1166,6 +1166,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False):
         else:
             while True:
                 sim.input_df = create_input_parameter(None)
+                # CLI 오버라이드 (랜덤 모드에서도 --thermal/--loss 등 플래그 적용)
+                if overrides:
+                    for k, v in overrides.items():
+                        sim.input_df[k] = v
                 result, sim.df_plus, errors = validation_check(sim.input_df, return_errors=True)
                 if result:
                     break
@@ -1435,7 +1439,24 @@ def main():
         return
 
     # 랜덤 스윕: --count N 이면 N회 성공 후 종료 (slurm_scheduler 태스크의 완료 감지용),
-    # 미지정 시 기존처럼 무한루프
+    # 미지정 시 기존처럼 무한루프.
+    # CLI 플래그는 랜덤 모드에도 적용 (--thermal 은 손실 해석이 선행돼야 하므로 loss도 자동 활성화)
+    overrides = {}
+    if args.matrix_on is not None:
+        overrides["matrix_on"] = 1 if args.matrix_on else 0
+    if args.loss_on is not None:
+        overrides["loss_on"] = 1 if args.loss_on else 0
+    if args.thermal_on:
+        overrides["thermal_on"] = 1
+        overrides.setdefault("loss_on", 1)
+        overrides.setdefault("matrix_on", 1)
+    if args.round_corner is not None:
+        overrides["round_corner"] = 1 if args.round_corner else 0
+    if args.full:
+        overrides["full_model"] = 1
+    if args.hold:
+        overrides["keep_project"] = 1
+
     successes = 0
     attempts = 0
     max_attempts = args.count * 3 if args.count else None
@@ -1443,7 +1464,8 @@ def main():
     while True:
 
         try:
-            ok = run_one_loop(param=None, model_only=args.model_only, hold=args.hold)
+            ok = run_one_loop(param=None, model_only=args.model_only, hold=args.hold,
+                              overrides=overrides or None)
             if ok:
                 successes += 1
                 if args.hold:
