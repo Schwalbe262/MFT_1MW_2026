@@ -195,17 +195,36 @@ def _sobol_next():
     return {k: lo + (hi - lo) * float(ui) for (k, lo, hi), ui in zip(_SOBOL_DIMS, u)}
 
 
-def _create_random_parameter_sobol():
-    """
-    Sobol 시퀀스 + 제약 내장 파라미터화 랜덤 샘플러.
+def unit_to_dims(u):
+    """단위 하이퍼큐브 [0,1]^d -> _SOBOL_DIMS 물리 범위 dict (샘플러/NSGA2 공유)"""
+    return {k: lo + (hi - lo) * float(ui) for (k, lo, hi), ui in zip(_SOBOL_DIMS, u)}
 
-    - Sobol: uniform 난수보다 설계공간을 고르게 채움 (배치를 이어 붙여도 균일성 유지)
-    - 제약 내장: 도체 폭(cw1/cw2)을 절대치로 뽑지 않고 "창 너비에서 간격들을 뺀
-      예산(budget)"을 분배해 역산 -> 창 x방향 배치가 구조적으로 항상 성립 (기각률 최소화,
-      기각으로 인한 분포 왜곡 방지)
+
+def _create_random_parameter_sobol():
+    """Sobol 시퀀스 + 제약 내장 파라미터화 랜덤 샘플러 (decode_unit_sample 공유 디코드 사용)"""
+    s = _sobol_next()
+    values = decode_unit_sample(s, allow_space_shrink=True)
+    return pd.DataFrame([[values[k] for k in KEYS]], columns=KEYS)
+
+
+def decode_unit_sample(s, allow_space_shrink=True, space_min=None):
+    """
+    설계공간 디코드 (샘플러와 NSGA-2가 공유하는 단일 소스):
+    _SOBOL_DIMS 값 dict(s) -> 전체 파라미터 dict.
+
+    - 제약 내장: 도체 폭(cw1/cw2)을 "창 예산 - 간격 총합"에서 gap 개수까지 반영해 역산
+      -> 창 x방향 배치가 구조적으로 항상 성립
+    - allow_space_shrink=False (NSGA-2 모드): 간격 비례축소를 하지 않고
+      values["_space_shrink_needed"]에 위반량을 기록 (제약 g로 처리, 절연 하한 불가침 보장)
+    - space_min: 간격 하한 강제 (예: 절연 40mm) - s의 간격 값을 하한으로 클램프
     """
     defaults = get_drawing_default_params()
-    s = _sobol_next()
+    s = dict(s)
+    if space_min is not None:
+        for k in ("cc_w2c_space_x", "w2c_w1c_space_x", "w1c_w2s_space_x", "w1s_cs_space_x",
+                  "cc_w2c_space_y", "w2c_w1c_space_y", "cs_w1s_space_y"):
+            if k in s:
+                s[k] = max(float(s[k]), space_min)
 
     N1 = 5 + int(s["u_N1"] * 5.9999)                     # 5..10
     N1_side = round(N1 * (s["u_N1_side"] * 0.5))
@@ -228,11 +247,15 @@ def _create_random_parameter_sobol():
 
     # ---- 창 x방향 예산 분배 (제약 내장) ----
     spaces = [s["cc_w2c_space_x"], s["w2c_w1c_space_x"], s["w1c_w2s_space_x"], s["w1s_cs_space_x"]]
-    # 간격 합이 창의 45%를 넘으면 비례 축소 (권선 예산 확보)
     total_space = sum(spaces)
+    space_shrink_needed = max(0.0, total_space - 0.45 * l2)
     if total_space > 0.45 * l2:
-        scale = 0.45 * l2 / total_space
-        spaces = [sp * scale for sp in spaces]
+        if allow_space_shrink:
+            # 샘플러 모드: 간격 비례 축소로 권선 예산 확보
+            scale = 0.45 * l2 / total_space
+            spaces = [sp * scale for sp in spaces]
+        # NSGA-2 모드(allow_space_shrink=False): 축소하지 않음 - 절연 하한 불가침.
+        # 위반량은 _space_shrink_needed로 반환되어 제약 g로 처리됨
     cc_x, w21_x, minclear_x, w1s_x = spaces
 
     budget = l2 - sum(spaces)                            # 권선 빌드 총예산
@@ -279,7 +302,8 @@ def _create_random_parameter_sobol():
         # 클러스터 스윕: 저장공간 확보를 위해 완료 즉시 삭제
         "keep_project": 0,
     })
-    return pd.DataFrame([[values[k] for k in KEYS]], columns=KEYS)
+    values["_space_shrink_needed"] = space_shrink_needed
+    return values
 
 
 def sym_cut_count(obj_name, df):
