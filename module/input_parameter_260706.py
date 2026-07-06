@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -18,6 +20,7 @@ KEYS = [
     "w1s_cs_space_x", "cs_w1s_space_y",
     "wcp_t", "wcp_pad_t", "wcp_len_x", "wcp_on",
     "core_plate_pad_t",
+    "core_depth_min", "core_depth_max",
     "round_corner", "corner_radius", "corner_segments",
     "full_model",
     "max_passes", "percent_error",
@@ -57,6 +60,9 @@ def get_drawing_default_params():
         "wcp_t": 20.0, "wcp_pad_t": 2.0, "wcp_len_x": 178.0, "wcp_on": 1,
         # 코어 콜드플레이트도 동일 구조: 20T = 2T 패드 + 16T 알루미늄 + 2T 패드
         "core_plate_pad_t": 2.0,
+        # 코어 1조 깊이 허용 범위 [mm] (랜덤 모드에서 n_core_group 샘플링 제약.
+        # 도면 설계(150mm/조)는 범위 밖이지만 fixed 모드에서는 경고만 하고 통과)
+        "core_depth_min": 60.0, "core_depth_max": 120.0,
         # 모서리 라운드: off, 안쪽 턴 반경 10mm
         # corner_segments: 코너 등각 분할 수 (모든 턴 동일 점 개수 -> 균일한 표시,
         # 많을수록 메시/해석 부담 증가). 0이면 진짜 원호
@@ -166,6 +172,14 @@ def create_input_parameter(param=None):
         h1 = total_height - 2 * l1
         w1 = get_random_value(lower=200, upper=800, resolution=1)
 
+        # 코어 분할 수: 코어 1조 깊이가 [core_depth_min, core_depth_max] 안에 들어가도록 샘플링
+        # d = (w1 - (n+1)*plate_t)/n  ->  n 범위 역산
+        plate_t = defaults["core_plate_t"]
+        d_min, d_max = defaults["core_depth_min"], defaults["core_depth_max"]
+        n_min = max(1, math.ceil((w1 - plate_t) / (d_max + plate_t)))
+        n_max = max(n_min, math.floor((w1 - plate_t) / (d_min + plate_t)))
+        n_core_group = int(get_random_value(lower=n_min, upper=n_max, resolution=1))
+
         cw1 = get_random_value(lower=1, upper=10, resolution=0.1)
         gap1 = get_random_value(lower=0.3, upper=5, resolution=0.1)
         cw2 = get_random_value(lower=0.6, upper=3, resolution=0.005)
@@ -178,6 +192,7 @@ def create_input_parameter(param=None):
         values.update({
             "N1_main": N1_main, "N1_side": N1_side, "N2_main": N2_main, "N2_side": N2_side,
             "l1": l1, "l2": l2, "h1": h1, "w1": w1,
+            "n_core_group": n_core_group,
             "cw1": cw1, "gap1": gap1, "cw2": cw2, "gap2": gap2,
             "nwh1": nwh1, "nwh2": nwh2,
             "cc_w2c_space_x": get_random_value(lower=10, upper=50, resolution=0.1),
@@ -267,6 +282,17 @@ def validation_check(input_df, strict=False):
     inp["core_depth_each"] = [core_depth_each]
     if core_depth_each <= 0:
         errors.append(f"core depth per group <= 0 (w1={w1}, plate_t={core_plate_t})")
+    else:
+        # 코어 1조 깊이 범위: 랜덤 모드에서는 재추첨 사유, fixed 모드에서는 경고만
+        # (도면 설계 150mm/조가 기본 범위(60~120) 밖이므로 fixed는 막지 않는다)
+        d_min = float(inp["core_depth_min"].iloc[0])
+        d_max = float(inp["core_depth_max"].iloc[0])
+        if not (d_min <= core_depth_each <= d_max):
+            if strict:
+                import logging
+                logging.warning(f"core_depth_each {core_depth_each:.1f}mm outside [{d_min}, {d_max}] (fixed mode - allowed)")
+            else:
+                errors.append(f"core_depth_each {core_depth_each:.1f} outside [{d_min}, {d_max}]")
 
     def _build(n, cw, gap):
         # x방향 권선 빌드 (등간격)
@@ -437,6 +463,7 @@ NON_DESIGN_VAR_KEYS = {
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns",
     "max_passes", "percent_error", "keep_project",
+    "core_depth_min", "core_depth_max",
 }
 
 
