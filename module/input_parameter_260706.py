@@ -26,6 +26,7 @@ KEYS = [
     "matrix_on", "loss_on", "thermal_on",
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns", "rx_mesh_mode",
+    "keep_project",
 ]
 
 
@@ -85,6 +86,8 @@ def get_drawing_default_params():
         "n_explicit_turns": 1,   # 하이브리드: 안/밖 각각 explicit으로 남길 턴 수
         # Rx foil 메시 전략: "skin"(기본) / "length" / "length-coarse" (벤치마크용)
         "rx_mesh_mode": "skin",
+        # 완료 후 프로젝트 파일 보존 여부 (fixed 기본 보존 / 랜덤·클러스터는 0으로 확실히 삭제)
+        "keep_project": 1,
     }
 
 
@@ -184,6 +187,8 @@ def create_input_parameter(param=None):
             # 랜덤 스윕은 기존처럼 매트릭스(L/k) 전용 - 손실/열해석은 fixed 모드에서
             "loss_on": 0,
             "thermal_on": 0,
+            # 클러스터 스윕: 저장공간 확보를 위해 완료 즉시 삭제
+            "keep_project": 0,
         })
         param_df = pd.DataFrame([[values[k] for k in KEYS]], columns=KEYS)
 
@@ -425,7 +430,7 @@ NON_DESIGN_VAR_KEYS = {
     "matrix_on", "loss_on", "thermal_on",
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns",
-    "max_passes", "percent_error",
+    "max_passes", "percent_error", "keep_project",
 }
 
 

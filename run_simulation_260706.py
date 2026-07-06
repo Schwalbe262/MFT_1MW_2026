@@ -111,6 +111,16 @@ class Simulation():
 
     def create_simulation_name(self):
 
+        # slurm_scheduler dynamic_packed_srun 모드: SIMULATION_ID 환경변수 기반 이름
+        # (공유 파일시스템에서 카운터 파일 락 경합 없이 고유 이름 보장)
+        sim_id = os.environ.get("SIMULATION_ID")
+        if sim_id:
+            job_id = os.environ.get("SLURM_JOB_ID", "job")
+            self.num = sim_id
+            self.PROJECT_NAME = f"simulation_{job_id}_{sim_id}"
+            os.makedirs("./simulation", exist_ok=True)
+            return
+
         file_path = "./simulation_num.txt"
         simulation_dir = "./simulation"
         os.makedirs(simulation_dir, exist_ok=True)
@@ -510,6 +520,11 @@ class Simulation():
         I2 = float(self.df_plus["I2_rated"].iloc[0])
 
         if mode == "loss":
+            # 손실 원샷 여자: Tx 전압원(V1) + Rx 정격 전류원.
+            # Maxwell이 1차 전류(부하분 + 자화분)를 스스로 풀어 코어 자속이 실제 운전 수준이 됨.
+            # 검증: 무부하 케이스에서 코어손실/턴손실이 자화전류(Im=V1/wLm) 주입 방식과 1% 이내 일치.
+            # 주의: 전압 권선의 InputCurrent 리포트는 0으로 표시될 수 있으나 (표시 아티팩트)
+            #       실제 해는 유효함 (InducedVoltage ~= V1, 손실/자속 정상).
             V1 = float(self.df_plus["V1_rms"].iloc[0])
             phase2 = float(self.df_plus["I2_phase_deg"].iloc[0])
 
@@ -854,11 +869,14 @@ class Simulation():
             self.df_calculator3 = pd.DataFrame({"P_core_plate": [0], "P_winding_plate": [0]})
 
     def _calc_field_expr(self, obj_name, quantity, op, expr_name):
-        """계산기: quantity를 오브젝트 볼륨에 대해 op(Integrate/Mean/Maximum) 후 named expression 등록"""
+        """계산기: quantity를 오브젝트 볼륨에 대해 op(Integrate/Mean/Maximum) 후 named expression 등록.
+        quantity="B_peak"는 위상 무관한 자속밀도 페이저 크기 (Mag_B는 Phase=0 순간값이라 부적합)."""
         oModule = self.design1.ofieldsreporter
         oModule.CalcStack("clear")
-        if quantity == "Mag_B":
-            oModule.CopyNamedExprToStack("Mag_B")
+        if quantity == "B_peak":
+            oModule.EnterQty("B")
+            oModule.CalcOp("CmplxMag")
+            oModule.CalcOp("Mag")
         else:
             oModule.EnterQty(quantity)
         oModule.EnterVol(obj_name)
@@ -896,8 +914,8 @@ class Simulation():
         b_max_exprs = []
         for c in self.design1.core_objs:
             core_exprs.append(self._calc_field_expr(c.name, "CoreLoss", "Integrate", f"P_{c.name}"))
-            b_mean_exprs.append(self._calc_field_expr(c.name, "Mag_B", "Mean", f"B_mean_{c.name}"))
-            b_max_exprs.append(self._calc_field_expr(c.name, "Mag_B", "Maximum", f"B_max_{c.name}"))
+            b_mean_exprs.append(self._calc_field_expr(c.name, "B_peak", "Mean", f"B_mean_{c.name}"))
+            b_max_exprs.append(self._calc_field_expr(c.name, "B_peak", "Maximum", f"B_max_{c.name}"))
 
         # ---- 권선 그룹 총손실 + explicit 턴 손실 (열해석용) ----
         group_exprs = []
@@ -988,15 +1006,36 @@ class Simulation():
         self.design1.close_project()
         self.desktop.release_desktop(close_projects=True, close_on_exit=True)
 
-    def delete_project_folder(self):
-        time.sleep(10)
-        try:
-            project_folder = os.path.join(os.getcwd(), "simulation", self.PROJECT_NAME)
-            if os.path.isdir(project_folder):
-                shutil.rmtree(project_folder)
-                logging.info(f"Successfully deleted project folder: {project_folder}")
-        except Exception as e:
-            logging.error(f"Error deleting project folder {project_folder}: {e}")
+    def delete_project_folder(self, max_attempts=6, wait_s=10):
+        """
+        완료된 시뮬레이션 파일 삭제 (슈퍼컴퓨터 저장공간 확보용 - 반드시 지워져야 함).
+        AEDT가 파일 핸들을 늦게 놓는 경우가 있어 재시도하며, .lock 등 부산물도 제거한다.
+        """
+        project_folder = os.path.join(os.getcwd(), "simulation", self.PROJECT_NAME)
+
+        for attempt in range(1, max_attempts + 1):
+            time.sleep(wait_s)
+            try:
+                if os.path.isdir(project_folder):
+                    shutil.rmtree(project_folder)
+                # 폴더 밖에 생기는 부산물 (.lock, .auto 등)
+                sim_dir = os.path.join(os.getcwd(), "simulation")
+                for name in os.listdir(sim_dir):
+                    if name.startswith(self.PROJECT_NAME + ".") and (
+                            name.endswith(".lock") or name.endswith(".auto")
+                            or name.endswith(".lock.txt") or name.endswith(".asol.lock")):
+                        try:
+                            os.remove(os.path.join(sim_dir, name))
+                        except OSError:
+                            pass
+                if not os.path.isdir(project_folder):
+                    logging.info(f"Successfully deleted project folder: {project_folder}")
+                    return True
+            except Exception as e:
+                logging.warning(f"Delete attempt {attempt}/{max_attempts} failed for {project_folder}: {e}")
+
+        logging.error(f"FAILED to delete project folder after {max_attempts} attempts: {project_folder}")
+        return False
 
 
 def run_one_loop(param=None, model_only=False):
@@ -1094,8 +1133,13 @@ def run_one_loop(param=None, model_only=False):
                 result_parts.append(sim.df1)
                 result_parts.append(pd.DataFrame({"time_matrix": [t_matrix]}))
 
-        # ---- design2: 손실 원샷 (Tx 전압원 + Rx 정격 전류원 + 코어손실) ----
+        # ---- design2: 손실 원샷 (Tx = 부하+자화 전류, Rx = 정격 전류, 코어손실 활성) ----
+        # loss 디자인은 항상 풀모델로 빌드: 손실/자속이 절대값 그대로 나와
+        # 열해석에 x2 보정이 불필요하고 여자 관례 문제도 없음.
         if loss_on:
+            prev_full = sim.full_model
+            sim.full_model = True
+            sim.loss_em_full = True
             _build_em_design("maxwell_loss", "loss")
             sim.design_loss = sim.design1
             if not model_only:
@@ -1105,6 +1149,7 @@ def run_one_loop(param=None, model_only=False):
                 sim.save_loss_reports()     # 코어손실 + B + I1 + 그룹/턴 손실
                 result_parts += [sim.df_calculator1, sim.df_calculator2, sim.df_calculator3,
                                  sim.df_loss_summary, pd.DataFrame({"time_loss": [t_loss]})]
+            sim.full_model = prev_full
 
         # ---- design3: Icepak 열해석 (풀 지오메트리, EM 손실 주입) ----
         if thermal_on and loss_on and not model_only:
@@ -1142,12 +1187,16 @@ def run_one_loop(param=None, model_only=False):
         except Exception as e:
             logging.exception(f"Error closing project: {e}")
 
-        # fixed 모드는 결과 확인을 위해 프로젝트 폴더 보존
-        if not fixed_mode:
+        # 완료된 시뮬레이션 파일 삭제 (fixed 모드는 keep_project=1 기본값으로 보존,
+        # 랜덤/클러스터 스윕은 저장공간 확보를 위해 확실히 삭제)
+        keep_project = int(sim.df_plus["keep_project"].iloc[0]) != 0
+        if not keep_project:
             try:
                 sim.delete_project_folder()
             except Exception as e:
                 logging.exception(f"Error deleting project folder: {e}")
+
+        return True
     except Exception as e:
         logging.exception(f"run_one_loop failed: {e}")
         if fixed_mode:
@@ -1163,6 +1212,7 @@ def run_one_loop(param=None, model_only=False):
                 sim.delete_project_folder()
             except Exception:
                 pass
+        return False
     finally:
         if desktop is not None:
             try:
@@ -1188,6 +1238,8 @@ def parse_args():
                         help="대칭(1/8 분할) 미적용 풀모델로 모델링/해석")
     parser.add_argument("--headless", action="store_true",
                         help="AEDT 창 없이 실행 (해석 중 GUI 조작으로 인한 블로킹 방지)")
+    parser.add_argument("--count", type=int, default=None,
+                        help="랜덤 모드에서 N회 성공 후 종료 (slurm_scheduler fea_bursty/packed 태스크용; 미지정 시 무한루프)")
     parser.add_argument("--no-matrix", dest="matrix_on", action="store_false", default=None,
                         help="design1(L/k 매트릭스) 생략")
     parser.add_argument("--no-loss", dest="loss_on", action="store_false", default=None,
@@ -1231,17 +1283,32 @@ def main():
         run_one_loop(param=param, model_only=args.model_only)
         return
 
-    # 랜덤 스윕 (기존 동작)
+    # 랜덤 스윕: --count N 이면 N회 성공 후 종료 (slurm_scheduler 태스크의 완료 감지용),
+    # 미지정 시 기존처럼 무한루프
+    successes = 0
+    attempts = 0
+    max_attempts = args.count * 3 if args.count else None
+
     while True:
 
         try:
-            run_one_loop(param=None, model_only=args.model_only)
+            ok = run_one_loop(param=None, model_only=args.model_only)
+            if ok:
+                successes += 1
         except Exception as e:
             logging.exception(f"Error running simulation: {e}")
-            continue
 
         finally:
             time.sleep(10)
+
+        attempts += 1
+        if args.count is not None:
+            if successes >= args.count:
+                logging.info(f"Completed {successes}/{args.count} simulations.")
+                sys.exit(0)
+            if attempts >= max_attempts:
+                logging.error(f"Reached max attempts ({attempts}) with only {successes}/{args.count} successes.")
+                sys.exit(0 if successes > 0 else 1)
 
 
 if __name__ == "__main__":

@@ -48,7 +48,9 @@ class LossAllocator:
         self.sim = sim
         self.df = sim.df_plus
         self.loss_map = getattr(sim, "loss_map", {})
-        self.full_em = int(self.df["full_model"].iloc[0]) != 0
+        # loss 디자인은 항상 풀모델로 해석되므로 (전압원 여자 유효성) 기본적으로 무보정.
+        # 대칭 loss 값이 들어오는 예외 케이스만 오브젝트별 환산 적용.
+        self.full_em = getattr(sim, "loss_em_full", int(self.df["full_model"].iloc[0]) != 0)
 
     def _get(self, key):
         v = self.loss_map.get(key)
