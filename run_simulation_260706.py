@@ -1060,7 +1060,7 @@ class Simulation():
         return False
 
 
-def run_one_loop(param=None, model_only=False):
+def run_one_loop(param=None, model_only=False, hold=False):
     """
     param 이 None  -> 랜덤 파라미터 1회 (검증 실패 시 재추첨), 완료 후 프로젝트 삭제
     param 이 dict 등 -> 해당 값으로 1회 (fixed 모드), 프로젝트 폴더 보존
@@ -1069,6 +1069,7 @@ def run_one_loop(param=None, model_only=False):
     fixed_mode = param is not None
     sim = None
     desktop = None
+    held = [False]  # hold 성공 시 finally에서 desktop을 닫지 않기 위한 플래그
     try:
         # pyDesktop을 context manager로 쓰면 release_desktop 이후 __exit__에서
         # close_on_exit 속성 오류가 발생하므로 직접 생성하고 finally에서 해제한다.
@@ -1221,9 +1222,16 @@ def run_one_loop(param=None, model_only=False):
         except Exception as e:
             logging.exception(f"Error saving results to CSV: {e}")
 
-        if fixed_mode:
+        if fixed_mode or hold:
             print(result)
             sim.save_project()
+
+        if hold:
+            # 결과 확인용: AEDT와 프로젝트를 연 채로 종료 (사용자가 직접 닫을 때까지 유지)
+            held[0] = True
+            logging.info(f"HOLD mode: project '{sim.PROJECT_NAME}' left open in AEDT for inspection.")
+            print(f"\n=== HOLD: AEDT에 '{sim.PROJECT_NAME}' 프로젝트가 열린 채 유지됩니다. 확인 후 직접 닫으세요. ===")
+            return True
 
         try:
             sim.close_project()
@@ -1257,7 +1265,7 @@ def run_one_loop(param=None, model_only=False):
                 pass
         return False
     finally:
-        if desktop is not None:
+        if desktop is not None and not held[0]:
             try:
                 desktop.release_desktop(close_projects=True, close_on_exit=True)
                 time.sleep(1)
@@ -1289,6 +1297,8 @@ def parse_args():
                         help="design2(손실 원샷) 생략")
     parser.add_argument("--thermal", dest="thermal_on", action="store_true", default=None,
                         help="design3(Icepak 열해석)까지 수행")
+    parser.add_argument("--hold", action="store_true",
+                        help="해석 완료 후 AEDT/프로젝트를 닫지 않고 유지 (결과 직접 확인용, 1회 실행)")
     return parser.parse_args()
 
 
@@ -1323,7 +1333,7 @@ def main():
         if args.thermal_on is not None:
             param["thermal_on"] = 1 if args.thermal_on else 0
 
-        run_one_loop(param=param, model_only=args.model_only)
+        run_one_loop(param=param, model_only=args.model_only, hold=args.hold)
         return
 
     # 랜덤 스윕: --count N 이면 N회 성공 후 종료 (slurm_scheduler 태스크의 완료 감지용),
@@ -1335,9 +1345,12 @@ def main():
     while True:
 
         try:
-            ok = run_one_loop(param=None, model_only=args.model_only)
+            ok = run_one_loop(param=None, model_only=args.model_only, hold=args.hold)
             if ok:
                 successes += 1
+                if args.hold:
+                    # 확인용 1회 실행 - AEDT를 연 채로 종료
+                    return
         except Exception as e:
             logging.exception(f"Error running simulation: {e}")
 
