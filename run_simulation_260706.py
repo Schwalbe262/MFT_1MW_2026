@@ -962,7 +962,7 @@ class Simulation():
         b_max = max((self.loss_map[e] for e in b_max_exprs), default=0)
 
         summary = {"P_core_total": [core_total], "B_mean_core": [b_mean], "B_max_core": [b_max]}
-        for e in core_exprs + group_exprs:
+        for e in core_exprs + group_exprs + turn_exprs:
             summary[e] = [self.loss_map[e]]
 
         # ---- Tx 해석 전류 (전압원 여자 검증용) ----
