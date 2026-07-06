@@ -268,6 +268,76 @@ def _build_geometry(ipk, sim):
     return objs
 
 
+def _create_probe_sheets(ipk, df, objs):
+    """
+    회귀학습용 온도 프로브 시트 생성 (비모델 - 메시에 영향 없음).
+
+    체적 max 온도는 메시 스파이크에 취약하므로, 대칭면 위치(x=0/y=0 평면)에
+    권선 단면 크기의 시트를 만들어 그 위에서 Temp를 추출한다.
+    위치가 파라미터만으로 결정되므로 모든 샘플에서 기하학적으로 동일 -> 데이터 일관성.
+    팬(+y -> -y) 기준 풍하측(y-) 단면을 잡아 핫스팟 쪽을 캡처한다.
+    """
+    l1 = float(df["l1"].iloc[0])
+    h1 = float(df["h1"].iloc[0])
+    nwh1 = float(df["nwh1"].iloc[0])
+    nwh2 = float(df["nwh2"].iloc[0])
+    l2 = float(df["l2"].iloc[0])
+    cw1 = float(df["cw1"].iloc[0])
+
+    sheets = []
+
+    def _sheet(name, orientation, origin, sizes):
+        try:
+            obj = ipk.modeler.create_rectangle(
+                orientation=orientation, origin=[f"{v}mm" for v in origin],
+                sizes=[f"{v}mm" for v in sizes], name=name
+            )
+            obj.model = False
+            sheets.append(obj)
+            return obj
+        except Exception as e:
+            logging.warning(f"probe sheet {name} failed: {e}")
+            return None
+
+    # ---- Tx (1차): y- 풍하측 단면 (x=0 평면) + x+ 측면 단면 (y=0 평면) ----
+    tx_gaps, _ = get_tx_y_gaps(df)
+    N1 = int(df["N1_main"].iloc[0])
+    tx_x = compute_layer_positions(float(df["sl1_main_x"].iloc[0]) / 2, cw1, [float(df["gap1"].iloc[0])] * (N1 - 1))
+    tx_y = compute_layer_positions(float(df["sl1_main_y"].iloc[0]) / 2, cw1, tx_gaps)
+    zh = 0.45 * nwh1
+    # YZ 평면 시트 (x=0): y- 런의 단면 [y_in, y_out] x [z]
+    _sheet("Tprobe_Tx_leeward", "YZ", [0, -(tx_y[-1] + cw1 / 2), -zh],
+           [(tx_y[-1] - tx_y[0]) + cw1, 2 * zh])
+    # XZ 평면 시트 (y=0): x+ 런의 단면
+    _sheet("Tprobe_Tx_side", "XZ", [tx_x[0] - cw1 / 2, 0, -zh],
+           [(tx_x[-1] - tx_x[0]) + cw1, 2 * zh])
+
+    # ---- Rx 그룹 공통 생성기 ----
+    def _rx_probes(prefix, name, offset_x):
+        N, cw, x_pos, y_pos = _rx_layout(df, prefix)
+        zh2 = 0.45 * nwh2
+        y_in, y_out = y_pos[0] - cw / 2, y_pos[-1] + cw / 2
+        x_in, x_out = x_pos[0] - cw / 2, x_pos[-1] + cw / 2
+        # 링 중심을 지나는 세로 평면 (x=offset_x): y- 풍하측 런
+        _sheet(f"Tprobe_{name}_leeward", "YZ", [offset_x, -y_out, -zh2], [y_out - y_in, 2 * zh2])
+        # y=0 평면: 바깥쪽(x가 코어 중심에서 먼 쪽) 런
+        if offset_x <= 0:
+            _sheet(f"Tprobe_{name}_side", "XZ", [offset_x - x_out, 0, -zh2], [x_out - x_in, 2 * zh2])
+        else:
+            _sheet(f"Tprobe_{name}_side", "XZ", [offset_x + x_in, 0, -zh2], [x_out - x_in, 2 * zh2])
+
+    _rx_probes("main", "Rx_main", 0.0)
+    if int(df["N2_side"].iloc[0]) > 0:
+        off = l1 + l2 + l1 / 2
+        _rx_probes("side", "Rx_side", -off)
+
+    # ---- 코어: 중심 레그 y=0 단면 ----
+    zc = 0.45 * (h1 + 2 * l1)
+    _sheet("Tprobe_core_center", "XZ", [-0.9 * l1, 0, -zc], [1.8 * l1, 2 * zc])
+
+    return sheets
+
+
 # ---------------------------------------------------------------------------
 # 손실 주입 / 경계조건
 # ---------------------------------------------------------------------------
@@ -413,6 +483,7 @@ def run_thermal_analysis(sim):
     set_design_variables(ipk, sim.input_df)
     _create_thermal_materials(ipk, df)
     objs = _build_geometry(ipk, sim)
+    probe_sheets = _create_probe_sheets(ipk, df, objs)
     _assign_losses(ipk, sim, objs)
     _assign_boundaries(ipk, sim, objs)
 
@@ -431,18 +502,23 @@ def run_thermal_analysis(sim):
         pass
 
     # ---- 온도 추출 ----
+    # 프로브 시트 (회귀학습용 주력 데이터: 위치 고정, 보간값이라 메시 스파이크에 강함)
     probe = []
-    probe += [[w.name, f"T_max_{w.name}", "Temp_max"] for w in objs["Tx"]]
-    probe += [[w.name, f"T_max_{w.name}", "Temp_max"] for w in objs["Rx_main_explicit"]]
-    probe += [[b.name, f"T_max_{b.name}", "Temp_max"] for b in objs["Rx_main_blocks"]]
-    probe += [[w.name, f"T_max_{w.name}", "Temp_max"] for w in objs["Rx_side_explicit"] + objs["Rx_side2_explicit"]]
-    probe += [[b.name, f"T_max_{b.name}", "Temp_max"] for b in objs["Rx_side_blocks"] + objs["Rx_side2_blocks"]]
-    probe += [[c.name, f"T_max_{c.name}", "Temp_max"] for c in objs["core"]]
+    for s in probe_sheets:
+        probe.append([s, f"{s.name}_max", "Temp_max"])
+        probe.append([s, f"{s.name}_mean", "Temp_mean"])
+    # 그룹별 체적 평균 (가장 매끄러운 특징량) + 체적 max (참고용 - 메시 의존성 있음)
+    vol_objs = (objs["Tx"] + objs["Rx_main_explicit"] + objs["Rx_main_blocks"]
+                + objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
+                + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"] + objs["core"])
+    for o in vol_objs:
+        probe.append([o, f"T_mean_{o.name}", "Temp_mean"])
+        probe.append([o, f"T_max_{o.name}", "Temp_max"])
 
     try:
         _, df_t = ipk.get_calculator_parameter(dir=sim.project.path, parameters=probe,
                                                report_name="thermal_report", file_name="thermal_report")
-        temps = {c: float(df_t[c].iloc[0]) for c in df_t.columns if c.startswith("T_")}
+        temps = {c: float(df_t[c].iloc[0]) for c in df_t.columns if c.startswith(("T_", "Tprobe_"))}
     except Exception as e:
         logging.warning(f"Temperature extraction failed: {e}")
         temps = {}
