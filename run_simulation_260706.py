@@ -100,6 +100,19 @@ PLATE_COLOR = [144, 190, 144]
 PAD_COLOR = [200, 160, 200]
 
 
+def _git_hash():
+    """데이터 이력 추적용: 이 코드 버전의 git 커밋 해시"""
+    try:
+        import subprocess
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       cwd=BASE_DIR, stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+GIT_HASH = _git_hash()
+
+
 class Simulation():
 
     def __init__(self, desktop=None):
@@ -982,9 +995,49 @@ class Simulation():
         self.df_loss_summary = pd.DataFrame(summary)
         return self.df_loss_summary
 
+    def get_convergence_info(self, label):
+        """수렴 메타데이터 추출: pass 수, 최종 에너지오차/델타에너지 [%], 메시 사면체 수.
+        회귀 데이터 필터링용 (수렴 덜 된 샘플 식별)."""
+        cols = {f"conv_passes_{label}": float("nan"), f"conv_error_pct_{label}": float("nan"),
+                f"conv_delta_pct_{label}": float("nan"), f"mesh_tets_{label}": float("nan")}
+        try:
+            path = os.path.join(self.project.path, f"convergence_{label}.txt")
+            try:
+                variation = self.design1.available_variations.nominal_w_values
+                if isinstance(variation, (list, tuple)):
+                    variation = " ".join(str(v) for v in variation)
+            except Exception:
+                variation = ""
+            self.design1.odesign.ExportConvergence("Setup1", variation, path)
+            rows = []
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = [p.strip() for p in line.replace("|", " ").split()]
+                    if parts and parts[0].isdigit():
+                        rows.append(parts)
+            if rows:
+                last = rows[-1]
+                cols[f"conv_passes_{label}"] = float(last[0])
+                # 형식: pass, tetrahedra, total energy, energy error %, delta energy %
+                if len(last) >= 2:
+                    cols[f"mesh_tets_{label}"] = float(last[1].replace(",", ""))
+                if len(last) >= 4:
+                    cols[f"conv_error_pct_{label}"] = float(last[3])
+                if len(last) >= 5:
+                    cols[f"conv_delta_pct_{label}"] = float(last[4])
+        except Exception as e:
+            logging.warning(f"convergence info extraction failed ({label}): {e}")
+        return pd.DataFrame({k: [v] for k, v in cols.items()})
+
     def save_results_to_csv(self, results_df, filename="simulation_results_260706.csv"):
         """Saves the DataFrame to a CSV file in a process-safe way.
-        기존 파일과 컬럼 구성이 다르면(스키마 변경) 기존 파일을 백업하고 새로 시작한다."""
+        기존 파일과 컬럼 구성이 다르면(스키마 변경) 기존 파일을 백업하고 새로 시작한다.
+        추가로 스키마 진화에 안전한 per-run parquet 파트를 남긴다 (병렬 안전, 락 불필요)."""
+        results_df = results_df.copy()
+        results_df["git_hash"] = GIT_HASH
+        results_df["project_name"] = getattr(self, "PROJECT_NAME", "")
+        results_df["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         lock_path = filename + ".lock"
         with FileLock(lock_path):
             file_exists = os.path.isfile(filename)
@@ -997,6 +1050,18 @@ class Simulation():
                     logging.warning(f"CSV schema changed; old results moved to {backup}")
                     file_exists = False
             results_df.to_csv(filename, mode='a', header=not file_exists, index=False)
+
+        # parquet 파트: 파일명이 유니크해 병렬 인스턴스 간 충돌 없음.
+        # 여러 파트는 pd.concat(map(pd.read_parquet, glob(...)))으로 스키마가 달라도 병합 가능
+        try:
+            parts_dir = "results_parts_260706"
+            os.makedirs(parts_dir, exist_ok=True)
+            part = os.path.join(parts_dir,
+                                f"part_{datetime.now().strftime('%y%m%d_%H%M%S')}_{os.getpid()}_{self.PROJECT_NAME}.parquet")
+            results_df.to_parquet(part, index=False)
+        except Exception as e:
+            logging.warning(f"parquet part skipped (pyarrow 미설치?): {e}")
+
         logging.info(f"Results saved to {filename}")
 
     def save_project(self):
@@ -1060,7 +1125,21 @@ class Simulation():
         return False
 
 
-def run_one_loop(param=None, model_only=False, hold=False):
+def log_failed_sample(input_df, reason, filename="failed_samples_260706.csv"):
+    """실패/기각 샘플 기록 (설계공간 경계 분석용). 파라미터 + 사유."""
+    try:
+        row = input_df.copy()
+        row["fail_reason"] = [str(reason)[:500]]
+        row["fail_time"] = [datetime.now().strftime("%y%m%d_%H%M%S")]
+        lock_path = filename + ".lock"
+        with FileLock(lock_path):
+            file_exists = os.path.isfile(filename)
+            row.to_csv(filename, mode="a", header=not file_exists, index=False)
+    except Exception as e:
+        logging.warning(f"failed-sample logging failed: {e}")
+
+
+def run_one_loop(param=None, model_only=False, hold=False, golden=False):
     """
     param 이 None  -> 랜덤 파라미터 1회 (검증 실패 시 재추첨), 완료 후 프로젝트 삭제
     param 이 dict 등 -> 해당 값으로 1회 (fixed 모드), 프로젝트 폴더 보존
@@ -1087,9 +1166,11 @@ def run_one_loop(param=None, model_only=False, hold=False):
         else:
             while True:
                 sim.input_df = create_input_parameter(None)
-                result, sim.df_plus = validation_check(sim.input_df)
+                result, sim.df_plus, errors = validation_check(sim.input_df, return_errors=True)
                 if result:
                     break
+                # 기각 샘플 기록 (설계공간 경계 데이터)
+                log_failed_sample(sim.input_df, "validation: " + " / ".join(errors))
 
         sim.full_model = int(sim.df_plus["full_model"].iloc[0]) != 0
         matrix_on = int(sim.df_plus["matrix_on"].iloc[0]) != 0
@@ -1154,6 +1235,7 @@ def run_one_loop(param=None, model_only=False, hold=False):
                 total_time += t_matrix
                 sim.get_magnetic_parameter()
                 result_parts.append(sim.df1)
+                result_parts.append(sim.get_convergence_info("matrix"))
                 result_parts.append(pd.DataFrame({"time_matrix": [t_matrix]}))
 
         # ---- design2: 손실 원샷 (Tx = 부하+자화 전류, Rx = 정격 전류, 코어손실 활성) ----
@@ -1192,7 +1274,8 @@ def run_one_loop(param=None, model_only=False, hold=False):
                 sim.save_calculation()      # 권선/플레이트 EMLoss (기존 리포트)
                 sim.save_loss_reports()     # 코어손실 + B + I1 + 그룹/턴 손실
                 result_parts += [sim.df_calculator1, sim.df_calculator2, sim.df_calculator3,
-                                 sim.df_loss_summary, pd.DataFrame({"time_loss": [t_loss]})]
+                                 sim.df_loss_summary, sim.get_convergence_info("loss"),
+                                 pd.DataFrame({"time_loss": [t_loss]})]
             sim.full_model = prev_full
 
         # ---- design3: Icepak 열해석 (풀 지오메트리, EM 손실 주입) ----
@@ -1219,6 +1302,9 @@ def run_one_loop(param=None, model_only=False, hold=False):
 
         try:
             sim.save_results_to_csv(result)
+            if golden:
+                # golden case: 동일 기준 케이스를 주기적으로 재해석해 결과 표류(드리프트) 감지
+                sim.save_results_to_csv(result, filename="golden_history_260706.csv")
         except Exception as e:
             logging.exception(f"Error saving results to CSV: {e}")
 
@@ -1250,6 +1336,8 @@ def run_one_loop(param=None, model_only=False, hold=False):
         return True
     except Exception as e:
         logging.exception(f"run_one_loop failed: {e}")
+        if sim is not None and getattr(sim, "input_df", None) is not None:
+            log_failed_sample(sim.input_df, f"runtime: {e}")
         if fixed_mode:
             # fixed 모드에서는 실패를 조용히 넘기지 않는다
             raise
@@ -1299,6 +1387,8 @@ def parse_args():
                         help="design3(Icepak 열해석)까지 수행")
     parser.add_argument("--hold", action="store_true",
                         help="해석 완료 후 AEDT/프로젝트를 닫지 않고 유지 (결과 직접 확인용, 1회 실행)")
+    parser.add_argument("--golden", action="store_true",
+                        help="golden case(고정 기준 케이스) 1회 해석 후 golden_history CSV에 기록 (드리프트 감지용)")
     return parser.parse_args()
 
 
@@ -1309,6 +1399,14 @@ def main():
 
     if args.headless:
         GUI = True  # non_graphical=True
+
+    if args.golden:
+        # 고정 기준 케이스: 배치마다 같이 돌려 결과 표류를 시계열로 감시
+        golden_path = os.path.join(BASE_DIR, "verification_params", "golden_case.json")
+        with open(golden_path, "r", encoding="utf-8") as f:
+            param = json.load(f)
+        run_one_loop(param=param, golden=True)
+        return
 
     fixed_mode = args.fixed or (args.params is not None)
 

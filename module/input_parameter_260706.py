@@ -1,4 +1,5 @@
 import math
+import os
 
 import numpy as np
 import pandas as pd
@@ -155,64 +156,124 @@ def create_input_parameter(param=None):
             param_df = pd.DataFrame(param, columns=KEYS)
 
     else:
-        # 랜덤 시뮬레이션 케이스 (플레이트/라운드 옵션은 기본값 고정)
-        defaults = get_drawing_default_params()
-
-        N1 = get_random_value(lower=5, upper=10, resolution=1)
-        N1_side = round(N1 * get_random_value(lower=0, upper=0.5, resolution=0.01))
-        N1_main = N1 - N1_side
-        N2 = N1 * 10
-        N2_side = round(N2 * get_random_value(lower=0, upper=0.8, resolution=0.01))
-        N2_main = N2 - N2_side
-
-        l1 = get_random_value(lower=40, upper=100, resolution=1)
-        total_length = get_random_value(lower=500, upper=1200, resolution=1)
-        l2 = (total_length - 4 * l1) / 2
-        total_height = get_random_value(lower=500, upper=1000, resolution=1)
-        h1 = total_height - 2 * l1
-        w1 = get_random_value(lower=200, upper=800, resolution=1)
-
-        # 코어 분할 수: 코어 1조 깊이가 [core_depth_min, core_depth_max] 안에 들어가도록 샘플링
-        # d = (w1 - (n+1)*plate_t)/n  ->  n 범위 역산
-        plate_t = defaults["core_plate_t"]
-        d_min, d_max = defaults["core_depth_min"], defaults["core_depth_max"]
-        n_min = max(1, math.ceil((w1 - plate_t) / (d_max + plate_t)))
-        n_max = max(n_min, math.floor((w1 - plate_t) / (d_min + plate_t)))
-        n_core_group = int(get_random_value(lower=n_min, upper=n_max, resolution=1))
-
-        cw1 = get_random_value(lower=1, upper=10, resolution=0.1)
-        gap1 = get_random_value(lower=0.3, upper=5, resolution=0.1)
-        cw2 = get_random_value(lower=0.6, upper=3, resolution=0.005)
-        gap2 = get_random_value(lower=0.3, upper=2, resolution=0.005)
-
-        nwh1 = round(h1 * get_random_value(lower=0.8, upper=0.95, resolution=0.01), 1)
-        nwh2 = round(h1 * get_random_value(lower=0.5, upper=0.95, resolution=0.01), 1)
-
-        values = dict(defaults)
-        values.update({
-            "N1_main": N1_main, "N1_side": N1_side, "N2_main": N2_main, "N2_side": N2_side,
-            "l1": l1, "l2": l2, "h1": h1, "w1": w1,
-            "n_core_group": n_core_group,
-            "cw1": cw1, "gap1": gap1, "cw2": cw2, "gap2": gap2,
-            "nwh1": nwh1, "nwh2": nwh2,
-            "cc_w2c_space_x": get_random_value(lower=10, upper=50, resolution=0.1),
-            "cc_w2c_space_y": get_random_value(lower=10, upper=50, resolution=0.1),
-            "w2c_w1c_space_x": get_random_value(lower=10, upper=50, resolution=0.1),
-            "w2c_w1c_space_y": get_random_value(lower=10, upper=50, resolution=0.1),
-            "w1c_w2s_space_x": get_random_value(lower=10, upper=100, resolution=0.1),
-            "w2s_w1s_space_x": get_random_value(lower=10, upper=50, resolution=0.1),
-            "w1s_w2s_space_y": get_random_value(lower=10, upper=50, resolution=0.1),
-            "w1s_cs_space_x": get_random_value(lower=10, upper=50, resolution=0.1),
-            "cs_w1s_space_y": get_random_value(lower=10, upper=50, resolution=0.1),
-            # 랜덤 스윕은 기존처럼 매트릭스(L/k) 전용 - 손실/열해석은 fixed 모드에서
-            "loss_on": 0,
-            "thermal_on": 0,
-            # 클러스터 스윕: 저장공간 확보를 위해 완료 즉시 삭제
-            "keep_project": 0,
-        })
-        param_df = pd.DataFrame([[values[k] for k in KEYS]], columns=KEYS)
+        param_df = _create_random_parameter_sobol()
 
     return param_df
+
+
+# Sobol 시퀀스 상태 (프로세스 내 공유; 프로세스마다 다른 seed로 scramble)
+_SOBOL_STATE = {"engine": None}
+
+# Sobol로 뽑는 연속 차원 정의: (키, 하한, 상한)
+_SOBOL_DIMS = [
+    ("u_N1", 0, 1), ("u_N1_side", 0, 1), ("u_N2_side", 0, 1),
+    ("l1", 40, 100), ("total_length", 500, 1200), ("total_height", 500, 1000),
+    ("w1", 200, 800), ("u_ngroup", 0, 1),
+    ("cc_w2c_space_x", 10, 50), ("cc_w2c_space_y", 10, 50),
+    ("w2c_w1c_space_x", 10, 50), ("w2c_w1c_space_y", 10, 50),
+    ("w1c_w2s_space_x", 10, 60), ("w1s_cs_space_x", 10, 50),
+    ("cs_w1s_space_y", 10, 50),
+    ("f1_split", 0.25, 0.60),   # 창 예산 중 1차 권선 몫
+    ("gap1", 0.3, 5.0), ("gap2", 0.3, 2.0),
+    ("wh1", 0.8, 0.95), ("wh2", 0.5, 0.95),
+]
+
+
+def _sobol_next():
+    """Sobol 저불일치 시퀀스에서 다음 점을 뽑아 dict로 반환"""
+    from scipy.stats import qmc
+    if _SOBOL_STATE["engine"] is None:
+        seed = int.from_bytes(os.urandom(4), "little")
+        _SOBOL_STATE["engine"] = qmc.Sobol(d=len(_SOBOL_DIMS), scramble=True, seed=seed)
+    u = _SOBOL_STATE["engine"].random(1)[0]
+    return {k: lo + (hi - lo) * float(ui) for (k, lo, hi), ui in zip(_SOBOL_DIMS, u)}
+
+
+def _create_random_parameter_sobol():
+    """
+    Sobol 시퀀스 + 제약 내장 파라미터화 랜덤 샘플러.
+
+    - Sobol: uniform 난수보다 설계공간을 고르게 채움 (배치를 이어 붙여도 균일성 유지)
+    - 제약 내장: 도체 폭(cw1/cw2)을 절대치로 뽑지 않고 "창 너비에서 간격들을 뺀
+      예산(budget)"을 분배해 역산 -> 창 x방향 배치가 구조적으로 항상 성립 (기각률 최소화,
+      기각으로 인한 분포 왜곡 방지)
+    """
+    defaults = get_drawing_default_params()
+    s = _sobol_next()
+
+    N1 = 5 + int(s["u_N1"] * 5.9999)                     # 5..10
+    N1_side = round(N1 * (s["u_N1_side"] * 0.5))
+    N1_main = N1 - N1_side
+    N2 = N1 * 10
+    N2_side = round(N2 * (s["u_N2_side"] * 0.8))
+    N2_main = N2 - N2_side
+
+    l1 = round(s["l1"])
+    l2 = (round(s["total_length"]) - 4 * l1) / 2
+    h1 = round(s["total_height"]) - 2 * l1
+    w1 = round(s["w1"])
+
+    # 코어 분할 수: 1조 깊이 [core_depth_min, core_depth_max] 제약을 역산해 유효 범위에서 선택
+    plate_t = defaults["core_plate_t"]
+    d_min, d_max = defaults["core_depth_min"], defaults["core_depth_max"]
+    n_min = max(1, math.ceil((w1 - plate_t) / (d_max + plate_t)))
+    n_max = max(n_min, math.floor((w1 - plate_t) / (d_min + plate_t)))
+    n_core_group = n_min + int(s["u_ngroup"] * (n_max - n_min + 0.9999))
+
+    # ---- 창 x방향 예산 분배 (제약 내장) ----
+    spaces = [s["cc_w2c_space_x"], s["w2c_w1c_space_x"], s["w1c_w2s_space_x"], s["w1s_cs_space_x"]]
+    # 간격 합이 창의 45%를 넘으면 비례 축소 (권선 예산 확보)
+    total_space = sum(spaces)
+    if total_space > 0.45 * l2:
+        scale = 0.45 * l2 / total_space
+        spaces = [sp * scale for sp in spaces]
+    cc_x, w21_x, minclear_x, w1s_x = spaces
+
+    budget = l2 - sum(spaces)                            # 권선 빌드 총예산
+    nwl1 = budget * s["f1_split"]                        # 1차 몫 (main + side 합)
+    nwl2_total = budget - nwl1                           # 2차 몫 (main + side 합)
+
+    # 도체 폭 역산: 그룹별 gap 개수까지 정확히 반영해 "빌드 합 = 예산"이 구조적으로 성립
+    gap1 = round(s["gap1"], 1)
+    gap2 = round(s["gap2"], 3)
+    n1_gaps = max(N1_main - 1, 0) + max(N1_side - 1, 0)
+    n2_gaps = max(N2_main - 1, 0) + max(N2_side - 1, 0)
+    cw1 = (nwl1 - n1_gaps * gap1) / N1 if N1 > 0 else 1.0
+    cw2 = (nwl2_total - n2_gaps * gap2) / N2 if N2 > 0 else 0.6
+    # 도체 최소 두께 보장: 부족하면 간격을 줄여 재역산
+    if cw1 < 1.0 and n1_gaps > 0:
+        gap1 = max(0.3, round((nwl1 - 1.0 * N1) / n1_gaps, 1))
+        cw1 = (nwl1 - n1_gaps * gap1) / N1
+    if cw2 < 0.3 and n2_gaps > 0:
+        gap2 = max(0.1, round((nwl2_total - 0.3 * N2) / n2_gaps, 3))
+        cw2 = (nwl2_total - n2_gaps * gap2) / N2
+
+    nwh1 = round(h1 * s["wh1"], 1)
+    nwh2 = round(h1 * s["wh2"], 1)
+
+    values = dict(defaults)
+    values.update({
+        "N1_main": N1_main, "N1_side": N1_side, "N2_main": N2_main, "N2_side": N2_side,
+        "l1": l1, "l2": l2, "h1": h1, "w1": w1,
+        "n_core_group": n_core_group,
+        "cw1": round(cw1, 2), "gap1": gap1, "cw2": round(cw2, 3), "gap2": gap2,
+        "nwh1": nwh1, "nwh2": nwh2,
+        "cc_w2c_space_x": round(cc_x, 1),
+        "cc_w2c_space_y": round(s["cc_w2c_space_y"], 1),
+        "w2c_w1c_space_x": round(w21_x, 1),
+        "w2c_w1c_space_y": round(s["w2c_w1c_space_y"], 1),
+        "w1c_w2s_space_x": round(minclear_x * 0.8, 1),   # 최소 요구 간격은 실제 여유보다 작게
+        "w2s_w1s_space_x": 0.0,
+        "w1s_w2s_space_y": 0.0,
+        "w1s_cs_space_x": round(w1s_x, 1),
+        "cs_w1s_space_y": round(s["cs_w1s_space_y"], 1),
+        # 랜덤 스윕은 기존처럼 매트릭스(L/k) 전용 - 손실/열해석은 fixed 모드에서
+        "loss_on": 0,
+        "thermal_on": 0,
+        # 클러스터 스윕: 저장공간 확보를 위해 완료 즉시 삭제
+        "keep_project": 0,
+    })
+    return pd.DataFrame([[values[k] for k in KEYS]], columns=KEYS)
 
 
 def get_tx_y_gaps(df):
@@ -243,7 +304,68 @@ def get_tx_y_gaps(df):
     return y_gaps, slot_indices
 
 
-def validation_check(input_df, strict=False):
+def _cum_positions(start_half, width, gaps):
+    pos = [start_half + width * 0.5]
+    for g in gaps:
+        pos.append(pos[-1] + width + g)
+    return pos
+
+
+def _add_derived_features(inp):
+    """회귀학습용 파생 물리 특징량 컬럼 (전부 검증된 파생값 이후에 호출)"""
+    l1 = float(inp["l1"].iloc[0]); l2 = float(inp["l2"].iloc[0])
+    h1 = float(inp["h1"].iloc[0]); w1 = float(inp["w1"].iloc[0])
+    cw1 = float(inp["cw1"].iloc[0]); gap1 = float(inp["gap1"].iloc[0])
+    cw2 = float(inp["cw2"].iloc[0]); gap2 = float(inp["gap2"].iloc[0])
+    nwh1 = float(inp["nwh1"].iloc[0]); nwh2 = float(inp["nwh2"].iloc[0])
+    N1m = int(inp["N1_main"].iloc[0]); N2m = int(inp["N2_main"].iloc[0]); N2s = int(inp["N2_side"].iloc[0])
+    d = float(inp["core_depth_each"].iloc[0]); n = int(inp["n_core_group"].iloc[0])
+
+    iron_depth = n * d  # 콜드플레이트 제외 순수 철심 깊이 [mm]
+    Ae_m2 = (2 * l1 * 1e-3) * (iron_depth * 1e-3)          # 중심 레그 단면적
+    face_mm2 = (4 * l1 + 2 * l2) * (h1 + 2 * l1) - 2 * l2 * h1
+    core_vol_m3 = face_mm2 * iron_depth * 1e-9
+    inp["Ae_m2"] = [Ae_m2]
+    inp["core_vol_m3"] = [core_vol_m3]
+    inp["core_mass_kg"] = [core_vol_m3 * 7180.0]           # 2605SA1 밀도
+
+    def _cu(group_N, cw, gaps, slx, sly, height):
+        if group_N <= 0:
+            return 0.0, 0.0
+        xs = _cum_positions(slx / 2, cw, gaps)
+        ys = _cum_positions(sly / 2, cw, gaps)
+        total_len_mm = sum(4 * (x + y) for x, y in zip(xs, ys))
+        vol_m3 = total_len_mm * cw * height * 1e-9
+        return total_len_mm / group_N, vol_m3 * 8940.0     # MLT[mm], 질량[kg]
+
+    tx_gaps, _ = get_tx_y_gaps(inp)
+    mlt_tx, m_tx = _cu(N1m, cw1, [gap1] * (N1m - 1),
+                       float(inp["sl1_main_x"].iloc[0]), float(inp["sl1_main_y"].iloc[0]), nwh1)
+    # Tx y방향 슬롯 반영 (y만 벌어짐 - 근사로 x/y 평균에 슬롯 포함)
+    mlt_rxm, m_rxm = _cu(N2m, cw2, [gap2] * (N2m - 1),
+                         float(inp["sl2_main_x"].iloc[0]), float(inp["sl2_main_y"].iloc[0]), nwh2)
+    mlt_rxs, m_rxs = _cu(N2s, cw2, [gap2] * (N2s - 1),
+                         float(inp["sl2_side_x"].iloc[0]), float(inp["sl2_side_y"].iloc[0]), nwh2)
+    inp["MLT_Tx_mm"] = [mlt_tx]
+    inp["MLT_Rx_main_mm"] = [mlt_rxm]
+    inp["MLT_Rx_side_mm"] = [mlt_rxs]
+    inp["cu_mass_Tx_kg"] = [m_tx]
+    inp["cu_mass_Rx_main_kg"] = [m_rxm]
+    inp["cu_mass_Rx_side_kg"] = [m_rxs * 2]                # 측면 링 2개 (실물 기준)
+    inp["cu_mass_total_kg"] = [m_tx + m_rxm + m_rxs * 2]
+
+    # 창 활용률/종횡비
+    center_stack = (float(inp["cc_w2c_space_x"].iloc[0]) + float(inp["nwl2_main"].iloc[0])
+                    + float(inp["w2c_w1c_space_x"].iloc[0]) + float(inp["nwl1_main"].iloc[0]))
+    side_stack = float(inp["w1s_cs_space_x"].iloc[0]) + float(inp["nwl2_side"].iloc[0])
+    inp["window_fill_x"] = [(center_stack + side_stack) / l2 if l2 > 0 else 0]
+    inp["window_fill_z1"] = [nwh1 / h1 if h1 > 0 else 0]
+    inp["aspect_h1_l2"] = [h1 / l2 if l2 > 0 else 0]
+    inp["aspect_w1_l2"] = [w1 / l2 if l2 > 0 else 0]
+    return inp
+
+
+def validation_check(input_df, strict=False, return_errors=False):
     """
     파생값 계산 + 기하 검증.
     기존 validation_check와 동일한 파생 컬럼명(nwl1_main, wff1_main, sl1_main_x ...)을
@@ -447,9 +569,17 @@ def validation_check(input_df, strict=False):
 
     result = len(errors) == 0
 
+    # 파생 물리 특징량 (회귀학습 입력용) - 검증 통과 여부와 무관하게 계산
+    try:
+        _add_derived_features(inp)
+    except Exception:
+        pass
+
     if strict and not result:
         raise ValueError("Parameter validation failed: " + " / ".join(errors))
 
+    if return_errors:
+        return result, inp, errors
     return result, inp
 
 
