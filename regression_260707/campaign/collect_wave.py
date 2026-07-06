@@ -39,12 +39,14 @@ def list_tasks(prefix):
     seen = {x["id"]: x for x in matched}
     if not seen:
         return []
-    def probe(tid):
-        try:
-            x = requests.get(f"{SCHEDULER}/api/tasks/{tid}", timeout=10).json()
-        except Exception:
-            return None
-        return x if str(x.get("name", "")).startswith(prefix) else False
+    def probe(tid, retries=2):
+        for _ in range(retries + 1):
+            try:
+                x = requests.get(f"{SCHEDULER}/api/tasks/{tid}", timeout=15).json()
+                return x if str(x.get("name", "")).startswith(prefix) else False
+            except Exception:
+                continue
+        return None
 
     ids = sorted(seen)
     lo, hi = ids[0], ids[-1]
