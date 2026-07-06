@@ -1002,7 +1002,22 @@ class Simulation():
                 logging.warning(f"Failed to save project: {e}")
 
     def close_project(self):
-        self.design1.cleanup_solution()
+        # keep_project=1 이면 솔루션 데이터를 보존한 채 닫는다
+        # (cleanup_solution은 저장 프로젝트의 Results를 지워버림 - 삭제 예정일 때만 수행)
+        try:
+            keep = int(self.df_plus["keep_project"].iloc[0]) != 0
+        except Exception:
+            keep = False
+        if not keep:
+            try:
+                self.design1.cleanup_solution()
+            except Exception:
+                pass
+        else:
+            try:
+                self.save_project()
+            except Exception:
+                pass
         self.design1.close_project()
         self.desktop.release_desktop(close_projects=True, close_on_exit=True)
 
