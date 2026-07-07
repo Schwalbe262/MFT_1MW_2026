@@ -564,6 +564,15 @@ def run_thermal_analysis(sim):
     _assign_losses(ipk, sim, objs, eighth=eighth)
     _assign_boundaries(ipk, sim, objs, eighth=eighth)
 
+    # 서멀패드 메시 해상 강제: 패드(2mm)가 메시에 안 잡히면 도체가 고정온도 Al에
+    # 수치적으로 직결되어 온도가 플레이트에 고정됨 (풀 도메인에서 실측된 함정)
+    try:
+        pad_objs = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
+        if pad_objs:
+            ipk.mesh.assign_mesh_level({name: 2 for name in pad_objs}, name="pad_mesh_level")
+    except Exception as e:
+        logging.warning(f"pad mesh op failed: {e}")
+
     setup = ipk.create_setup(name="ThermalSetup")
     try:
         setup.props["Flow Regime"] = "Turbulent"
