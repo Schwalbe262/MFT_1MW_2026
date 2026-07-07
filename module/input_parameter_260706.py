@@ -648,7 +648,7 @@ def validation_check(input_df, strict=False, return_errors=False):
             errors.append(f"2*n_explicit_turns ({2 * n_exp}) >= N2_side ({N2_side})")
     if str(inp["rx_mesh_mode"].iloc[0]) not in ("skin", "length", "length-coarse"):
         errors.append(f"invalid rx_mesh_mode ({inp['rx_mesh_mode'].iloc[0]})")
-    if str(inp["thermal_symmetry"].iloc[0]) not in ("eighth", "full"):
+    if str(inp["thermal_symmetry"].iloc[0]) not in ("eighth", "quarter", "full"):
         errors.append(f"invalid thermal_symmetry ({inp['thermal_symmetry'].iloc[0]})")
     # Tx측면 권선이 있으면 Rx측면과의 절연 간격 필수 (0이면 도체 접촉 -> 솔버 에러)
     if N1_side > 0:

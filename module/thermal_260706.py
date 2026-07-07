@@ -48,11 +48,12 @@ class LossAllocator:
     - eighth thermal: 실물값 x 보유 체적 분율(1/2^c)
     """
 
-    def __init__(self, sim, eighth=False):
+    def __init__(self, sim, eighth=False, mode=None):
         self.sim = sim
         self.df = sim.df_plus
         self.loss_map = getattr(sim, "loss_map_phys", None) or getattr(sim, "loss_map", {})
-        self.eighth = eighth
+        self.mode = mode or ("eighth" if eighth else "full")
+        self.eighth = self.mode == "eighth"
 
     def _get(self, key):
         v = self.loss_map.get(key)
@@ -66,10 +67,13 @@ class LossAllocator:
         return float(v)
 
     def _retained_fraction(self, obj_name):
-        if not self.eighth:
+        if self.mode == "full":
             return 1.0
         from module.input_parameter_260706 import sym_cut_count
-        return 1.0 / (2 ** sym_cut_count(obj_name, self.df))
+        c = sym_cut_count(obj_name, self.df)
+        if self.mode == "quarter":
+            c = max(c - 1, 0)  # z절단 없음 (모든 오브젝트가 z=0 스팬이므로 -1)
+        return 1.0 / (2 ** c)
 
     def turn_loss(self, expr_key, obj_name=None, **_legacy):
         """개별 턴/오브젝트에 주입할 손실 [W] (열모델 보유 체적 기준)"""
@@ -185,8 +189,9 @@ def _build_homog_blocks(ipk, df, prefix, name, offset_x, height):
     return blocks
 
 
-def _build_geometry(ipk, sim, eighth=False):
-    """열해석 지오메트리 생성 (eighth=True면 1/8 대칭 분할). 오브젝트 그룹 dict 반환"""
+def _build_geometry(ipk, sim, eighth=False, mode=None):
+    """열해석 지오메트리 생성. mode: full / quarter(x,y 분할) / eighth(x,y,z 분할)"""
+    mode = mode or ("eighth" if eighth else "full")
     df = sim.df_plus
     n_exp = int(df["n_explicit_turns"].iloc[0])
     l1 = float(df["l1"].iloc[0])
@@ -275,16 +280,17 @@ def _build_geometry(ipk, sim, eighth=False):
     if int(df["N2_side"].iloc[0]) > 0:
         off = l1 + l2 + l1 / 2
         objs["Rx_side_explicit"], objs["Rx_side_blocks"] = _build_rx_group("side", "Rx_side", -off)
-        if not eighth:
-            # 1/8 모드에서는 +x 측 링이 어차피 절단 제거되므로 생성 생략 (모델링 시간 절약)
+        if mode == "full":
+            # 대칭 모드에서는 +x 측 링이 어차피 절단 제거되므로 생성 생략 (모델링 시간 절약)
             objs["Rx_side2_explicit"], objs["Rx_side2_blocks"] = _build_rx_group("side", "Rx_side2", +off)
 
-    if eighth:
-        # EM 대칭 모델과 동일한 옥탄트 유지 (x<=0, y>=0, z>=0)
+    if mode in ("eighth", "quarter"):
+        # EM 대칭 모델과 동일 옥탄트 (x<=0, y>=0[, z>=0])
         all_objs = []
         for grp in objs.values():
             all_objs.extend(grp)
-        ipk.modeler.split(assignment=all_objs, plane="XY", sides="PositiveOnly")
+        if mode == "eighth":
+            ipk.modeler.split(assignment=all_objs, plane="XY", sides="PositiveOnly")
         ipk.modeler.split(assignment=all_objs, plane="XZ", sides="PositiveOnly")
         ipk.modeler.split(assignment=all_objs, plane="YZ", sides="NegativeOnly")
         existing = set(ipk.modeler.object_names)
@@ -294,7 +300,7 @@ def _build_geometry(ipk, sim, eighth=False):
     return objs
 
 
-def _create_probe_sheets(ipk, df, objs, eighth=False):
+def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
     """
     회귀학습용 온도 프로브 시트 생성 (비모델 - 메시에 영향 없음).
 
@@ -325,8 +331,9 @@ def _create_probe_sheets(ipk, df, objs, eighth=False):
             logging.warning(f"probe sheet {name} failed: {e}")
             return None
 
-    # eighth 모드: 보유 옥탄트 (x<=0, y>=0, z>=0) 안에만 시트 배치
-    z_lo = 0.0 if eighth else None
+    mode = mode or ("eighth" if eighth else "full")
+    eighth = mode == "eighth"
+    sym_xy = mode in ("eighth", "quarter")  # x<=0, y>=0 옥탄트 (quarter는 z 전체)
 
     # ---- Tx (1차): y측 단면 (x=0 평면) + x측 단면 (y=0 평면) ----
     tx_gaps, _ = get_tx_y_gaps(df)
@@ -337,6 +344,9 @@ def _create_probe_sheets(ipk, df, objs, eighth=False):
 
     def _z_range(zh_):
         return (0.0, zh_) if eighth else (-zh_, zh_)
+
+    # 이하 배치 로직에서 "eighth"는 x/y 옥탄트 배치를 의미하므로 quarter도 동일하게 취급
+    eighth = sym_xy
 
     z0, z1 = _z_range(zh)
     # YZ 평면 시트: y측 런의 단면 (eighth: +y측 / full: -y 풍하측)
@@ -378,11 +388,11 @@ def _create_probe_sheets(ipk, df, objs, eighth=False):
 # 손실 주입 / 경계조건
 # ---------------------------------------------------------------------------
 
-def _assign_losses(ipk, sim, objs, eighth=False):
+def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
     """실물 기준 손실(loss_map_phys)을 열모델 오브젝트에 주입.
     eighth 모드에서는 보유 체적 분율(1/2^c)이 LossAllocator에서 자동 적용된다."""
     df = sim.df_plus
-    alloc = LossAllocator(sim, eighth=eighth)
+    alloc = LossAllocator(sim, eighth=eighth, mode=mode)
     injected = {}
 
     def _block(obj, watts):
@@ -443,7 +453,8 @@ def _assign_losses(ipk, sim, objs, eighth=False):
     return injected
 
 
-def _assign_boundaries(ipk, sim, objs, eighth=False):
+def _assign_boundaries(ipk, sim, objs, eighth=False, mode=None):
+    mode = mode or ("eighth" if eighth else "full")
     df = sim.df_plus
     plate_temp = float(df["plate_temp"].iloc[0])
     air_temp = float(df["air_temp"].iloc[0])
@@ -483,6 +494,22 @@ def _assign_boundaries(ipk, sim, objs, eighth=False):
         return region
 
     # 경계 실패는 조용히 넘기지 않음: BC가 틀린 열해석은 실패보다 나쁨 (캠페인 데이터 오염)
+    if mode == "quarter":
+        # x/y 대칭 + z 전체 + 부력 on: 부력(z대칭 가정) 분리 검증용
+        region = _fresh_region(x_pos=0.0, y_pos=100.0, z_pos=100.0,
+                               x_neg=100.0, y_neg=0.0, z_neg=100.0)
+        ipk.assign_symmetry_wall(geometry=region.top_face_x.id, boundary_name="sym_x0")
+        ipk.assign_symmetry_wall(geometry=region.bottom_face_y.id, boundary_name="sym_y0")
+        ipk.assign_velocity_free_opening(
+            assignment=[region.top_face_y.id], boundary_name="fan_inlet",
+            temperature=f"{air_temp}cel",
+            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"])
+        for face, nm in [(region.bottom_face_x, "outlet_xn"),
+                         (region.top_face_z, "outlet_zp"), (region.bottom_face_z, "outlet_zn")]:
+            ipk.assign_pressure_free_opening(
+                assignment=[face.id], boundary_name=nm, temperature=f"{air_temp}cel")
+        return region
+
     if eighth:
         # 1/8: 대칭면 3개(x=0/y=0/z=0)는 region 면을 플러시로 두고 symmetry wall 할당.
         # +y 외곽 = 팬 유입 (양측 팬의 y대칭 유동 가정), -x/+z 외곽 = 배기 opening
@@ -551,7 +578,8 @@ def run_thermal_analysis(sim):
     """
     df = sim.df_plus
 
-    eighth = str(df["thermal_symmetry"].iloc[0]) == "eighth"
+    mode = str(df["thermal_symmetry"].iloc[0])
+    eighth = mode == "eighth"
 
     ipk = sim.project.create_design(name="icepak_thermal", solver="icepak",
                                     solution="SteadyState TemperatureAndFlow")
@@ -559,10 +587,10 @@ def run_thermal_analysis(sim):
 
     set_design_variables(ipk, sim.input_df)
     _create_thermal_materials(ipk, df)
-    objs = _build_geometry(ipk, sim, eighth=eighth)
-    probe_sheets = _create_probe_sheets(ipk, df, objs, eighth=eighth)
-    _assign_losses(ipk, sim, objs, eighth=eighth)
-    _assign_boundaries(ipk, sim, objs, eighth=eighth)
+    objs = _build_geometry(ipk, sim, eighth=eighth, mode=mode)
+    probe_sheets = _create_probe_sheets(ipk, df, objs, eighth=eighth, mode=mode)
+    _assign_losses(ipk, sim, objs, eighth=eighth, mode=mode)
+    _assign_boundaries(ipk, sim, objs, eighth=eighth, mode=mode)
 
     # 서멀패드 메시 해상 강제: 패드(2mm)가 메시에 안 잡히면 도체가 고정온도 Al에
     # 수치적으로 직결되어 온도가 플레이트에 고정됨 (풀 도메인에서 실측된 함정)
