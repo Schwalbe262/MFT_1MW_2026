@@ -175,7 +175,7 @@ def create_coil(design, name="coil", window_height=50, window_length=50, window_
                 N_input=1, width_fill_factor=0.6, space_length=10, space_width=10,
                 shape="circle", offset=[0, 0, 0], color=None,
                 y_slot_gaps=None, round_corner=False, corner_radius=None,
-                corner_segments=4):
+                corner_segments=4, material="copper"):
     """
     기존 module.modeling.create_coil 확장판 (시그니처/반환값 호환).
 
@@ -258,7 +258,7 @@ def create_coil(design, name="coil", window_height=50, window_length=50, window_
                 polyline_kwargs = dict(
                     points=points,
                     name=f"{name}_{i}_{j}",
-                    material="copper",
+                    material=material,
                     xsection_orient="Auto",
                     xsection_type=shape,
                     xsection_width=coil_width,
@@ -280,7 +280,7 @@ def create_coil(design, name="coil", window_height=50, window_length=50, window_
                 winding = design.modeler.create_polyline(
                     points=points,
                     name=f"{name}_{i}_{j}",
-                    material="copper",
+                    material=material,
                     xsection_orient="Auto",
                     xsection_type=shape,
                     xsection_width=coil_width,

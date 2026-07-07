@@ -254,10 +254,25 @@ class Simulation():
         self.design1.core_plates = plate_objs
         self.design1.core_pads = pad_objs
 
+    def _op_temp_conductor_material(self):
+        """운전 온도 기준 도전율의 구리 재질 생성 (기본 80C).
+        20C 구리(5.8e7 S/m) 기준이면 실물(~80-100C) 권선손실을 ~25% 과소평가한다.
+        sigma(T) = sigma20 / (1 + 0.00393*(T-20))"""
+        T = float(self.df_plus["conductor_temp_C"].iloc[0])
+        name = f"copper_{int(round(T))}C"
+        mats = self.design1.materials
+        if name not in mats.material_keys:
+            m = mats.add_material(name)
+            m.conductivity = 5.8e7 / (1.0 + 0.00393 * (T - 20.0))
+            m.permeability = 0.999991
+        return name
+
     def create_coil(self):
 
         l1 = self.df_plus["l1"].iloc[0]
         l2 = self.df_plus["l2"].iloc[0]
+
+        conductor_mat = self._op_temp_conductor_material()
 
         round_corner = int(self.df_plus["round_corner"].iloc[0]) != 0
         corner_radius = float(self.df_plus["corner_radius"].iloc[0]) if round_corner else None
@@ -282,7 +297,8 @@ class Simulation():
             y_slot_gaps=tx_y_gaps,
             round_corner=round_corner,
             corner_radius=corner_radius,
-            corner_segments=corner_segments
+            corner_segments=corner_segments,
+            material=conductor_mat
         )
 
         self.design1.Rx_windings_main, self.N_Rx_main, self.Rx_coil_width_main, self.Rx_coil_height_main, self.Rx_coil_gap_x_main, self.Rx_coil_gap_z_main = create_coil(
@@ -300,7 +316,8 @@ class Simulation():
             color=[10, 10, 255],
             round_corner=round_corner,
             corner_radius=corner_radius,
-            corner_segments=corner_segments
+            corner_segments=corner_segments,
+            material=conductor_mat
         )
 
         if self.df_plus["N1_side"].iloc[0] != 0:
@@ -319,7 +336,8 @@ class Simulation():
                 color=[255, 10, 10],
                 round_corner=round_corner,
                 corner_radius=corner_radius,
-                corner_segments=corner_segments
+                corner_segments=corner_segments,
+                material=conductor_mat
             )
 
         if self.df_plus["N2_side"].iloc[0] != 0:
@@ -338,7 +356,8 @@ class Simulation():
                 color=[10, 10, 255],
                 round_corner=round_corner,
                 corner_radius=corner_radius,
-                corner_segments=corner_segments
+                corner_segments=corner_segments,
+                material=conductor_mat
             )
 
         if self.df_plus["N1_side"].iloc[0] == 0:
@@ -377,7 +396,8 @@ class Simulation():
                     color=[255, 10, 10],
                     round_corner=round_corner,
                     corner_radius=corner_radius,
-                    corner_segments=corner_segments
+                    corner_segments=corner_segments,
+                    material=conductor_mat
                 )
             if self.df_plus["N2_side"].iloc[0] != 0:
                 self.design1.Rx_windings_side2, _, _, _, _, _ = create_coil(
@@ -395,7 +415,8 @@ class Simulation():
                     color=[10, 10, 255],
                     round_corner=round_corner,
                     corner_radius=corner_radius,
-                    corner_segments=corner_segments
+                    corner_segments=corner_segments,
+                    material=conductor_mat
                 )
 
         # 1차 권선 냉각 플레이트 (y측면 슬롯, 양측 대칭, 서멀패드|알루미늄|서멀패드)
