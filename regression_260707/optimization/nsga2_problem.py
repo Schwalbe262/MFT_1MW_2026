@@ -59,8 +59,8 @@ class MFTProblem(Problem):
         self.density_gate = density_gate
         self.fixed_overrides = fixed_overrides or {}
         n_var = len(_SOBOL_DIMS)
-        # 제약: Llt band(1) + T(4) + B(1) + shrink(1) + validity(1) + density(1)
-        super().__init__(n_var=n_var, n_obj=2, n_ieq_constr=9,
+        # 제약: Llt band(1) + T(4) + B(1) + shrink(1) + h_gap2(1) + density(1) + 앙상블불일치(1)
+        super().__init__(n_var=n_var, n_obj=2, n_ieq_constr=10,
                          xl=np.zeros(n_var), xu=np.ones(n_var))
 
     # ---- 배치 디코드: 단위 유전자 -> 파생 포함 특징 프레임 ----
@@ -97,7 +97,7 @@ class MFTProblem(Problem):
         frame, shrink, valid = self.decode_batch(X)
 
         F = np.full((n, 2), BIG)
-        G = np.full((n, 9), BIG)
+        G = np.full((n, 10), BIG)
 
         idx = np.where(valid)[0]
         if len(idx):
@@ -142,6 +142,12 @@ class MFTProblem(Problem):
                 G[idx, 8] = self.density_gate(sub)
             else:
                 G[idx, 8] = -1.0
+            # g9: 앙상블 불일치 게이트 - Llt 예측기들의 원공간 폭이 밴드 전폭을 넘으면 신뢰 불가
+            try:
+                dis = self.models["Llt_phys"].disagreement(sub)
+                G[idx, 9] = dis - 2.0 * spec["Llt_tol_uH"]
+            except Exception:
+                G[idx, 9] = -1.0
 
         out["F"] = F
         out["G"] = G
