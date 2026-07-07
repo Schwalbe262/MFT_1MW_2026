@@ -1510,9 +1510,14 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 pass
         return False
     finally:
-        if desktop is not None and not held[0]:
+        if desktop is not None:
             try:
-                desktop.release_desktop(close_projects=True, close_on_exit=True)
+                if held[0]:
+                    # HOLD: 프로젝트/AEDT는 열어둔 채 python의 gRPC 세션만 해제
+                    # (이걸 안 하면 python 프로세스가 AEDT를 붙잡은 채 종료되지 않음)
+                    desktop.release_desktop(close_projects=False, close_on_exit=False)
+                else:
+                    desktop.release_desktop(close_projects=True, close_on_exit=True)
                 time.sleep(1)
             except Exception:
                 pass

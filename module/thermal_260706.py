@@ -435,11 +435,11 @@ def _assign_losses(ipk, sim, objs, eighth=False):
     tx_sum = sum(v for k, v in injected.items() if k.startswith("Tx_"))
     rx_sum = sum(v for k, v in injected.items() if k.startswith("Rx_"))
     core_sum = sum(v for k, v in injected.items() if k.startswith("core"))
-    logging.info(f"thermal injection totals [W]: Tx={tx_sum:.2f} Rx={rx_sum:.2f} core={core_sum:.2f} "
+    logging.warning(f"thermal injection totals [W]: Tx={tx_sum:.2f} Rx={rx_sum:.2f} core={core_sum:.2f} "
                  f"(eighth={eighth}, n_obj={len(injected)})")
     for k, v in injected.items():
         if k.startswith("Tx_main_0"):
-            logging.info(f"  inject {k} = {v:.3f} W")
+            logging.warning(f"  inject {k} = {v:.3f} W")
     return injected
 
 
