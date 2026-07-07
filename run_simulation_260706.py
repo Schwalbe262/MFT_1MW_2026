@@ -1333,7 +1333,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             sim.assign_boundary()
             sim.create_setup()
 
-        def _analyze_current_design(label, max_attempts=2):
+        def _analyze_current_design(label, max_attempts=3):
             # 간헐적으로 solve가 결과 없이 '성공'(고정 ~3분 후)으로 끝나는 케이스가 있어
             # is_solved 확인 후 1회 재시도한다. 재시도도 실패하면 AEDT 메시지를 로그에 남기고 실패 처리.
             elapsed = 0.0
@@ -1348,12 +1348,19 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 if solved:
                     break
                 logging.warning(f"[{label}] analyze attempt {attempt} finished without solution data.")
+                msg_text = ""
                 try:
                     msgs = sim.design1.odesktop.GetMessages(sim.PROJECT_NAME, sim.design1.design_name, 0)
                     for m in list(msgs)[-10:]:
                         logging.warning(f"[AEDT] {m}")
+                    msg_text = " ".join(str(m) for m in msgs)
                 except Exception:
                     pass
+                # 라이선스 서버 과부하(FlexNet -16, WinSock reset 등)면 즉시 재시도해도
+                # 또 실패 - 백오프로 서버 회복 시간을 준다
+                if "license" in msg_text.lower():
+                    logging.warning(f"[{label}] license server distress - 120s backoff before retry")
+                    time.sleep(120)
             else:
                 raise RuntimeError(f"[{label}] Setup1 finished without solution data after {max_attempts} attempts.")
             # 리포트 생성 전에 저장해 솔루션 상태를 프로젝트 파일에 반영

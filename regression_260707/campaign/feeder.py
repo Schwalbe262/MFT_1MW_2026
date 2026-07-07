@@ -20,7 +20,7 @@ from collect_wave import list_tasks
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "feeder_state.json")
 
-TARGET_ACTIVE = 400   # 실행+대기 목표
+TARGET_ACTIVE = 400   # 실행+대기 목표 (--target으로 오버라이드)
 BUFFER = 40           # 대기 버퍼 (슬롯이 비는 순간 즉시 붙도록)
 COUNT_PER_TASK = 5
 
@@ -69,7 +69,12 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", type=int, default=None, help="반복 주기 [s]")
     ap.add_argument("--max-samples", type=int, default=12000)
+    ap.add_argument("--target", type=int, default=None,
+                    help="실행+대기 목표 (라이선스 서버 과부하 시 감속용)")
     args = ap.parse_args()
+    global TARGET_ACTIVE
+    if args.target:
+        TARGET_ACTIVE = args.target
 
     if args.once or not args.loop:
         step(args.max_samples)
