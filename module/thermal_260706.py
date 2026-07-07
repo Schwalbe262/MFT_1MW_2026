@@ -497,20 +497,33 @@ def _assign_boundaries(ipk, sim, objs, eighth=False):
         )
         return region
 
-    # 풀모델: region 전방향 + 팬 유동 (+y -> -y)
+    # 풀모델: region 전방향
     region = _fresh_region(x_pos=100.0, y_pos=100.0, z_pos=100.0,
                            x_neg=100.0, y_neg=100.0, z_neg=100.0)
-    ipk.assign_velocity_free_opening(
-        assignment=[region.top_face_y.id],
-        boundary_name="fan_inlet",
-        temperature=f"{air_temp}cel",
-        velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]
-    )
-    ipk.assign_pressure_free_opening(
-        assignment=[region.bottom_face_y.id],
-        boundary_name="outlet",
-        temperature=f"{air_temp}cel"
-    )
+    fan_config = str(df.get("fan_config", pd.Series(["dual"])).iloc[0])
+    if fan_config == "dual":
+        # 양방향 팬 (냉각 스펙: +-y 양측 유입, 배기 +-x/+-z) - 1/8 모델과 동일 물리
+        ipk.assign_velocity_free_opening(
+            assignment=[region.top_face_y.id], boundary_name="fan_inlet_pos",
+            temperature=f"{air_temp}cel",
+            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"])
+        ipk.assign_velocity_free_opening(
+            assignment=[region.bottom_face_y.id], boundary_name="fan_inlet_neg",
+            temperature=f"{air_temp}cel",
+            velocity=["0m_per_sec", f"{fan_v}m_per_sec", "0m_per_sec"])
+        for face, nm in [(region.top_face_x, "outlet_xp"), (region.bottom_face_x, "outlet_xn"),
+                         (region.top_face_z, "outlet_zp"), (region.bottom_face_z, "outlet_zn")]:
+            ipk.assign_pressure_free_opening(
+                assignment=[face.id], boundary_name=nm, temperature=f"{air_temp}cel")
+    else:
+        # 단방향 팬 (+y -> -y)
+        ipk.assign_velocity_free_opening(
+            assignment=[region.top_face_y.id], boundary_name="fan_inlet",
+            temperature=f"{air_temp}cel",
+            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"])
+        ipk.assign_pressure_free_opening(
+            assignment=[region.bottom_face_y.id], boundary_name="outlet",
+            temperature=f"{air_temp}cel")
 
     return region
 
