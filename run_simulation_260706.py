@@ -1687,10 +1687,16 @@ def main():
         if args.count is not None:
             if successes >= args.count:
                 logging.info(f"Completed {successes}/{args.count} simulations.")
-                sys.exit(0)
+                # os._exit: pyaedt atexit 핸들러의 간헐적 teardown 크래시가
+                # 성공한 런을 실패(exit 1)로 둔갑시키는 것 방지 (파일은 이미 flush됨)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
             if attempts >= max_attempts:
                 logging.error(f"Reached max attempts ({attempts}) with only {successes}/{args.count} successes.")
-                sys.exit(0 if successes > 0 else 1)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0 if successes > 0 else 1)
 
 
 if __name__ == "__main__":

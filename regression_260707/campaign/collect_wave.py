@@ -110,13 +110,20 @@ def main():
     print(f"tasks: {len(tasks)} (completed {len(done)}, failed {len(failed)}, "
           f"running/queued {len(tasks) - len(done) - len(failed)})")
 
+    # 실패 태스크도 stdout에 결과가 있으면 회수 (pyaedt teardown 크래시가
+    # 성공 샘플을 실패로 둔갑시키는 케이스 실측됨 - 데이터는 유효)
     frames = []
-    for t in done:
+    n_salvaged = 0
+    for t in done + failed:
         df = fetch_result_rows(t["id"])
         if df is not None and len(df):
             df["task_id"] = t["id"]
             df["task_name"] = t.get("name", "")
             frames.append(df)
+            if t.get("status") == "failed":
+                n_salvaged += 1
+    if n_salvaged:
+        print(f"salvaged from failed tasks: {n_salvaged}")
 
     if not frames:
         print("no result rows collected")
