@@ -50,6 +50,11 @@ else:  # Linux/Unix
             sys.path.insert(0, path)
             break
 
+
+# FlexNet 클라이언트 타임아웃 상향 (기본 0.1초): 바쁜 라이선스 데몬(lmgrd)의 느린 응답을
+# 연결 리셋으로 판정하지 않게 함. AEDT 기동 전에 설정돼야 하므로 임포트 시점에 적용.
+os.environ.setdefault("FLEXLM_TIMEOUT", "3000000")
+
 import pyaedt_module
 from pyaedt_module.core import pyDesktop
 import os
