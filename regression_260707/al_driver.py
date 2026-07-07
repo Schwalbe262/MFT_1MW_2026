@@ -139,8 +139,27 @@ def stage_wait(st):
     import scheduler_client as sc
     tids = [t for t in st["task_map"].values() if t]
     status = sc.wait_all(tids, poll_s=180, timeout_s=6 * 3600)
-    n_done = sum(1 for s in status.values() if s == "completed")
-    print(f"[al] wait done: {n_done}/{len(tids)} completed")
+    # 실패 후보는 64GB로 1회 재시도 (플랜: 메모리 부족/불안정 대응)
+    rnd = st["round"]
+    front = pd.read_csv(os.path.join(HERE, "al_rounds", f"round_{rnd:02d}", "pareto_front.csv"))
+    from module.input_parameter_260706 import KEYS
+    profile = json.load(open(os.path.join(HERE, "verify", "profiles", "standard.json"), encoding="utf-8"))
+    retried = {}
+    for idx_str, tid in list(st["task_map"].items()):
+        if tid and status.get(tid) != "completed" and not sc.fetch_result_json(tid):
+            row = front.iloc[int(idx_str)]
+            params = {k: (row[k].item() if hasattr(row[k], "item") else row[k])
+                      for k in KEYS if k in front.columns and pd.notna(row[k])}
+            new_tid = sc.submit_verification(f"mft-al-r{rnd:02d}-retry-{idx_str}",
+                                             f"mft_al_r{rnd:02d}_rt{idx_str}", params, profile,
+                                             mem_mb=65536)
+            retried[idx_str] = new_tid
+            st["task_map"][idx_str] = new_tid
+    if retried:
+        print(f"[al] {len(retried)} candidates retried at 64GB")
+        sc.wait_all([t for t in retried.values() if t], poll_s=180, timeout_s=5 * 3600)
+    n_done = sum(1 for tid in st["task_map"].values() if tid and sc.fetch_result_json(tid))
+    print(f"[al] wait done: {n_done}/{len(tids)} with data")
     if n_done < 0.7 * len(tids):
         print("[al] WARNING: <70% completion - 실패 태스크 로그 점검 필요")
     st["stage"] = "INGEST"
