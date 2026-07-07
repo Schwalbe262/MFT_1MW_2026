@@ -467,10 +467,16 @@ class Simulation():
                      + self.design1.Tx_windings_main + self.design1.Rx_windings_main
                      + self.design1.Tx_windings_side + self.design1.Rx_windings_side)
 
-        print(geometrys)
+        # 분할 순서대로 진행하되, 앞 분할에서 통째로 삭제된 오브젝트를 다음 호출에 넘기지 않음
+        # (넘기면 AEDT가 'Part not found' 경고를 배치로 뿜음 - 무해하지만 소음)
+        def _alive(objs):
+            existing = set(self.design1.modeler.object_names)
+            return [o for o in objs if o.name in existing]
 
         self.design1.modeler.split(assignment=geometrys, plane="XY", sides="PositiveOnly")
+        geometrys = _alive(geometrys)
         self.design1.modeler.split(assignment=geometrys, plane="XZ", sides="PositiveOnly")
+        geometrys = _alive(geometrys)
         self.design1.modeler.split(assignment=geometrys, plane="YZ", sides="NegativeOnly")
 
         # 대칭 분할로 완전히 잘려나간 오브젝트(y<0 쪽 콜드플레이트/냉각판 등)를 리스트에서 제거

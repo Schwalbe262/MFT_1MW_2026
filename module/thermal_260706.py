@@ -289,9 +289,15 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
         all_objs = []
         for grp in objs.values():
             all_objs.extend(grp)
+        def _alive(objs):
+            existing = set(ipk.modeler.object_names)
+            return [o for o in objs if o.name in existing]
+
         if mode == "eighth":
             ipk.modeler.split(assignment=all_objs, plane="XY", sides="PositiveOnly")
+            all_objs = _alive(all_objs)
         ipk.modeler.split(assignment=all_objs, plane="XZ", sides="PositiveOnly")
+        all_objs = _alive(all_objs)
         ipk.modeler.split(assignment=all_objs, plane="YZ", sides="NegativeOnly")
         existing = set(ipk.modeler.object_names)
         for key in list(objs.keys()):
