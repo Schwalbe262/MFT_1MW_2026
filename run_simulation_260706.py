@@ -191,7 +191,15 @@ class Simulation():
         self.design1 = self.project.create_design(name=name, solver="maxwell3d", solution="AC Magnetic")
 
         # skip mesh setting
+        # 데스크톱이 바쁠 때 odesign 핸들이 잠시 None으로 오는 경우 실측됨 (COM 지연) -> 재시도
         oDesign = self.design1.odesign
+        for _ in range(6):
+            if oDesign is not None:
+                break
+            time.sleep(10)
+            oDesign = self.design1.odesign
+        if oDesign is None:
+            raise RuntimeError(f"odesign handle is None after design creation ({name}) - desktop unstable")
         oDesign.SetDesignSettings(
             [
                 "NAME:Design Settings Data",
