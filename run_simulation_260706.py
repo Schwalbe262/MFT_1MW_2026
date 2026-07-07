@@ -1702,6 +1702,10 @@ def main():
         for attempt in range(1, 4):
             try:
                 run_one_loop(param=param, model_only=args.model_only, hold=args.hold)
+                # 성공 시 pyaedt atexit teardown 크래시가 exit 1로 둔갑시키는 것 방지
+                if not args.hold:
+                    sys.stdout.flush(); sys.stderr.flush()
+                    os._exit(0)
                 return
             except RuntimeError as e:
                 if "desktop unstable" in str(e) and attempt < 3:
