@@ -196,13 +196,24 @@ class Simulation():
         self.design1 = self.project.create_design(name=name, solver="maxwell3d", solution="AC Magnetic")
 
         # skip mesh setting
-        # 데스크톱이 바쁠 때 odesign 핸들이 잠시 None으로 오는 경우 실측됨 (COM 지연) -> 재시도
+        # pyaedt 0.22: GetActiveDesign이 None을 주면 디자인 삽입 경로가 bool 오류로 무너져
+        # odesign 핸들을 못 받는 케이스 실측 (AEDT에는 디자인이 실제로 생성됨).
+        # -> 짧은 재시도 후, 네이티브 SetActiveDesign으로 생성된 디자인의 핸들을 직접 회수
         oDesign = self.design1.odesign
-        for _ in range(6):
+        for _ in range(3):
             if oDesign is not None:
                 break
-            time.sleep(10)
+            time.sleep(5)
             oDesign = self.design1.odesign
+        if oDesign is None:
+            try:
+                native = self.project.oproject.SetActiveDesign(name)
+                if native is not None and native is not False:
+                    self.design1._odesign = native
+                    oDesign = native
+                    logging.warning(f"odesign recovered via native SetActiveDesign ({name})")
+            except Exception as e:
+                logging.warning(f"native SetActiveDesign fallback failed: {e}")
         if oDesign is None:
             raise RuntimeError(f"odesign handle is None after design creation ({name}) - desktop unstable")
         oDesign.SetDesignSettings(
@@ -1687,7 +1698,18 @@ def main():
             param["thermal_on"] = 1 if args.thermal_on else 0
         param.update(_parse_set_overrides(args.set_overrides))
 
-        run_one_loop(param=param, model_only=args.model_only, hold=args.hold)
+        # 데스크톱 불안정(라이선스 폭풍 중 pyaedt 핸들 유실)은 새 데스크톱으로 재시도 가치가 있음
+        for attempt in range(1, 4):
+            try:
+                run_one_loop(param=param, model_only=args.model_only, hold=args.hold)
+                return
+            except RuntimeError as e:
+                if "desktop unstable" in str(e) and attempt < 3:
+                    print(f"\n=== 데스크톱 불안정으로 실패 -> 새 세션으로 재시도 ({attempt + 1}/3) ===\n",
+                          flush=True)
+                    time.sleep(30)
+                    continue
+                raise
         return
 
     # 랜덤 스윕: --count N 이면 N회 성공 후 종료 (slurm_scheduler 태스크의 완료 감지용),
