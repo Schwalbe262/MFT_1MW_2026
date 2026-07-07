@@ -33,6 +33,7 @@ KEYS = [
     "k_ins", "core_k_thermal", "n_explicit_turns", "rx_mesh_mode",
     "keep_project",
     "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config",
+    "thermal_max_iterations",
 ]
 
 
@@ -110,6 +111,8 @@ def get_drawing_default_params():
         "matrix_skin_mesh": 1,
         # 풀 열해석 팬 구성: "dual" = +-y 양측 유입(냉각 스펙, 1/8과 동일 물리) / "single" = +y->-y
         "fan_config": "dual",
+        # Icepak 최대 iteration (수렴 판정 기준 미달 시 상한) - iteration 배터리 테스트로 캠페인 값 결정
+        "thermal_max_iterations": 250,
     }
 
 
@@ -691,6 +694,7 @@ NON_DESIGN_VAR_KEYS = {
     "max_passes", "percent_error", "keep_project",
     "core_depth_min", "core_depth_max",
     "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config",
+    "thermal_max_iterations",
 }
 
 

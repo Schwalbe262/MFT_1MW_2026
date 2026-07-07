@@ -242,6 +242,8 @@ def _build_geometry(ipk, sim, eighth=False):
         objs["wcp_pads"] = []
 
     # ---- Rx 하이브리드 (main 1조 + side 2조) ----
+    # n_explicit_turns = -1 이면 전 턴 explicit (블록 없음, 균질화 가정 제거).
+    # 2*n_exp >= N 인 경우도 전 턴 explicit으로 처리 (중복/퇴화 블록 방지)
     def _build_rx_group(prefix, name, offset_x):
         windings, _, _, _, _, _ = create_coil(
             design=ipk, name=name,
@@ -255,6 +257,8 @@ def _build_geometry(ipk, sim, eighth=False):
             round_corner=False
         )
         N = len(windings)
+        if n_exp < 0 or 2 * n_exp >= N:
+            return windings, []  # 전 턴 explicit
         explicit = windings[:n_exp] + windings[-n_exp:]
         middle = windings[n_exp:N - n_exp]
         if middle:
@@ -563,7 +567,7 @@ def run_thermal_analysis(sim):
     setup = ipk.create_setup(name="ThermalSetup")
     try:
         setup.props["Flow Regime"] = "Turbulent"
-        setup.props["Convergence Criteria - Max Iterations"] = 250
+        setup.props["Convergence Criteria - Max Iterations"] = int(df["thermal_max_iterations"].iloc[0])
         if eighth:
             # 1/8 대칭의 z대칭은 부력 무시 가정에 기반 -> 중력 비활성
             setup.props["Include Gravity"] = False
