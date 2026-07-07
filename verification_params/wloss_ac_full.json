@@ -1,0 +1,15 @@
+{
+ "round_corner": 1,
+ "thermal_on": 0,
+ "P_target": 0.0,
+ "V2_rms": 10000.0,
+ "keep_project": 0,
+ "loss_sym_on": 0,
+ "thermal_symmetry": "full",
+ "loss_on": 0,
+ "matrix_on": 1,
+ "max_passes": 12,
+ "percent_error": 1.0,
+ "full_model": 1,
+ "freq": 1000.0
+}
