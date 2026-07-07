@@ -27,8 +27,11 @@ def main():
 
     mins = int(args.hours * 60)
     action = "-print" if args.dry_run else "-print -exec rm -rf {} +"
+    # 솔루션 파일(쿼터 주범)은 {hours}h+, 클론 디렉토리 통짜는 7일+ 방치분만
+    # (클론은 웨이브 간 재사용 자산 - 과잉 삭제로 재클론 IO를 유발하지 않음)
     cmd = (f"echo '--- before:'; du -sh . 2>/dev/null; "
-           f"find . -maxdepth 1 -type d -name 'mft_*' -mmin +{mins} {action}; "
+           f"find . -maxdepth 2 -type d -path './mft_*/simulation' -mmin +{mins} {action}; "
+           f"find . -maxdepth 1 -type d -name 'mft_*' -mtime +7 {action}; "
            f"echo '--- after:'; du -sh . 2>/dev/null; true")
     ok = 0
     for i in range(args.accounts):

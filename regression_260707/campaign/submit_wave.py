@@ -39,9 +39,9 @@ def submit(name, workdir, run_args, mem_mb=32768, cpus=4):
            f"python run_simulation_260706.py {run_args}; "
            f"echo ===RESULT_CSV===; cat simulation_results_260706.csv 2>/dev/null; "
            f"echo ===FAILED_CSV===; cat failed_samples_260706.csv 2>/dev/null | head -50; "
-           # 셸 레벨 무조건 클린업: 결과는 stdout으로 이미 회수됐으므로 워크디렉토리 전체 삭제
-           # (클론 400개 x 계정이 사용자 쿼터를 초과하는 것 실측 - 상주 클론 없이 매회 재클론)
-           f"cd .. && rm -rf {workdir} 2>/dev/null; true")
+           # 셸 레벨 클린업: 솔루션 파일(GB급, 쿼터 주범)만 삭제하고 클론(~50MB)은
+           # 다음 웨이브에서 git pull로 재사용 (재클론 IO/트래픽 절약)
+           f"rm -rf simulation aedt_temp *.lock 2>/dev/null; true")
     r = requests.post(f"{SCHEDULER}/tasks", data={
         "name": name, "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__",
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",

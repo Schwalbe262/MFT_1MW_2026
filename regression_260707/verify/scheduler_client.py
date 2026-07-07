@@ -27,7 +27,7 @@ def submit_verification(name, workdir, params: dict, profile: dict, mem_mb=32768
            f"cd {workdir} && git pull -q && "
            f"printf '%s' {shlex.quote(pjson)} > cand.json && "
            f"python run_simulation_260706.py --fixed {extra} --params cand.json; "
-           f"cd .. && rm -rf {workdir}; true")  # 자기-정리 (쿼터 위생)
+           f"rm -rf simulation aedt_temp 2>/dev/null; true")  # 솔루션만 정리 (클론 재사용)
     r = requests.post(f"{SCHEDULER}/tasks", data={
         "name": name, "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__",
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
