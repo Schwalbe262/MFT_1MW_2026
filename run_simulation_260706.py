@@ -1086,7 +1086,8 @@ class Simulation():
             export_path = os.path.join(self.project.path, "winding_current_report.csv")
             oModule.ExportToFile("winding_current_report", export_path, False)
             df_i = pd.read_csv(export_path)
-            I1_mag = float(df_i.iloc[0, -2])
+            # AEDT export 헤더의 [단위]를 존중해 A로 정규화 (mA로 나오는 경우 실측 확인됨)
+            I1_mag = float(df_i.iloc[0, -2]) * _unit_scale(df_i.columns[-2], kind="current")
             I1_phase = float(df_i.iloc[0, -1])
         except Exception as e:
             logging.warning(f"Failed to extract Tx winding current: {e}")
@@ -1549,6 +1550,32 @@ def parse_args():
                         metavar="KEY=VALUE",
                         help="파라미터 오버라이드 (반복 가능, fixed/random 공용). 예: --set P_target=1e6 --set percent_error=1.0")
     return parser.parse_args()
+
+
+_UNIT_SCALES = {
+    # 기준 단위로의 배율: current -> A, inductance -> uH, power -> W, flux -> T, voltage -> V
+    "current": {"fA": 1e-15, "pA": 1e-12, "nA": 1e-9, "uA": 1e-6, "mA": 1e-3, "A": 1.0, "kA": 1e3},
+    "inductance": {"pH": 1e-6, "nH": 1e-3, "uH": 1.0, "mH": 1e3, "H": 1e6},
+    "power": {"nW": 1e-9, "uW": 1e-6, "mW": 1e-3, "W": 1.0, "kW": 1e3, "MW": 1e6},
+    "flux": {"uT": 1e-6, "mT": 1e-3, "T": 1.0, "tesla": 1.0},
+    "voltage": {"uV": 1e-6, "mV": 1e-3, "V": 1.0, "kV": 1e3},
+}
+
+
+def _unit_scale(column_name, kind):
+    """AEDT export 컬럼 헤더의 '[unit]' 접미사를 파싱해 기준 단위 배율 반환.
+    단위 표기가 없으면 1.0 (이미 기준 단위로 가정). 미지 단위는 경고 후 1.0."""
+    m = re.search(r"\[([^\]]*)\]", str(column_name))
+    if not m:
+        return 1.0
+    unit = m.group(1).strip()
+    if not unit:
+        return 1.0
+    table = _UNIT_SCALES.get(kind, {})
+    if unit in table:
+        return table[unit]
+    logging.warning(f"unknown unit '{unit}' in column '{column_name}' (kind={kind}) - no scaling applied")
+    return 1.0
 
 
 def _parse_set_overrides(pairs):
