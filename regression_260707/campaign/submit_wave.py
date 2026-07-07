@@ -37,7 +37,9 @@ def submit(name, workdir, run_args, mem_mb=32768, cpus=4):
            f"cd {workdir} && git pull -q && "
            f"python run_simulation_260706.py {run_args}; "
            f"echo ===RESULT_CSV===; cat simulation_results_260706.csv 2>/dev/null; "
-           f"echo ===FAILED_CSV===; cat failed_samples_260706.csv 2>/dev/null | head -50")
+           f"echo ===FAILED_CSV===; cat failed_samples_260706.csv 2>/dev/null | head -50; "
+           # 셸 레벨 무조건 클린업: 파이썬이 킬당해도 프로젝트 잔재가 쿼터를 먹지 않게
+           f"rm -rf simulation aedt_temp 2>/dev/null; true")
     r = requests.post(f"{SCHEDULER}/tasks", data={
         "name": name, "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__",
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
