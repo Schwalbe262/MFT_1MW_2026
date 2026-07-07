@@ -177,15 +177,19 @@ _SOBOL_DIMS = [
     ("u_N1", 0, 1), ("u_N1_side", 0, 1), ("u_N2_side", 0, 1),
     ("l1", 40, 100), ("total_length", 500, 1200), ("total_height", 500, 1000),
     ("w1", 200, 800), ("u_ngroup", 0, 1),
-    ("cc_w2c_space_x", 10, 50), ("cc_w2c_space_y", 10, 50),
-    ("w2c_w1c_space_x", 10, 50), ("w2c_w1c_space_y", 10, 50),
-    ("w1c_w2s_space_x", 10, 60), ("w1s_cs_space_x", 10, 50),
-    ("cs_w1s_space_y", 10, 50),
+    # HV 절연 간격 4쌍: 설계 타겟 40mm 주변 커버리지 (25~70) - 16mm급 극소 간격은
+    # 실현 불가 영역이라 데이터 예산 낭비 (사용자 확인 2026-07-07)
+    ("cc_w2c_space_x", 25, 70), ("cc_w2c_space_y", 25, 70),
+    ("w2c_w1c_space_x", 25, 70), ("w2c_w1c_space_y", 25, 70),
+    ("w1c_w2s_space_x", 25, 70), ("w1s_cs_space_x", 25, 70),
+    ("cs_w1s_space_y", 25, 70),
     # Tx측면-Rx측면 절연 간격 (N1_side>0일 때만 사용; 0이면 도체가 맞닿아 솔버 에러 - 파일럿에서 발견)
-    ("w2s_w1s_space_x", 10, 50), ("w1s_w2s_space_y", 10, 50),
+    ("w2s_w1s_space_x", 25, 70), ("w1s_w2s_space_y", 25, 70),
     ("f1_split", 0.25, 0.60),   # 창 예산 중 1차 권선 몫
     ("gap1", 0.3, 5.0), ("gap2", 0.3, 2.0),
-    ("wh1", 0.8, 0.95), ("wh2", 0.5, 0.95),
+    # wh2 상한 0.90: h_gap2(2차-요크 z 간격) = h1(1-wh2)/2 이 절연 타겟(40mm) 근방을 벗어나
+    # 극소값이 되지 않게 (h1=500~1000에서 h_gap2 >= 25~50mm 보장)
+    ("wh1", 0.8, 0.93), ("wh2", 0.5, 0.90),
 ]
 
 
@@ -647,6 +651,15 @@ def validation_check(input_df, strict=False, return_errors=False):
             errors.append(f"w2s_w1s_space_x too small for N1_side>0 ({inp['w2s_w1s_space_x'].iloc[0]})")
         if float(inp["w1s_w2s_space_y"].iloc[0]) < 1.0:
             errors.append(f"w1s_w2s_space_y too small for N1_side>0 ({inp['w1s_w2s_space_y'].iloc[0]})")
+
+    # 랜덤 모드 커버리지 하한: HV 절연쌍 실간격 최소 20mm (설계 타겟 40mm 주변 데이터 확보,
+    # 비례축소 후 극소 간격 샘플로 예산 낭비 방지). fixed 모드는 사용자 판단 존중.
+    if not strict:
+        hv_gap_cols = ["cc_w2c_space_x", "cc_w2c_space_y", "w2c_w1c_space_x", "w2c_w1c_space_y",
+                       "w1c_w2s_gap_x_actual", "w1s_cs_space_x", "cs_w1s_space_y"]
+        min_gap = min(float(inp[c].iloc[0]) for c in hv_gap_cols if c in inp.columns)
+        if min_gap < 20.0:
+            errors.append(f"HV insulation coverage floor: min gap {min_gap:.1f} < 20mm")
 
     result = len(errors) == 0
 
