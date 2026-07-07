@@ -657,6 +657,10 @@ def validation_check(input_df, strict=False, return_errors=False):
         if float(inp["w1s_w2s_space_y"].iloc[0]) < 1.0:
             errors.append(f"w1s_w2s_space_y too small for N1_side>0 ({inp['w1s_w2s_space_y'].iloc[0]})")
 
+    # 1차 턴수 상한 (사용자 지시 2026-07-07: N1 <= 10, 구형 N1_side 샘플에서 13T 관측)
+    if not strict and int(inp["N1"].iloc[0]) > 10:
+        errors.append(f"N1 {int(inp['N1'].iloc[0])} > 10 (cap)")
+
     # 랜덤 모드 커버리지 하한: HV 절연쌍 실간격 최소 20mm (설계 타겟 40mm 주변 데이터 확보,
     # 비례축소 후 극소 간격 샘플로 예산 낭비 방지). fixed 모드는 사용자 판단 존중.
     if not strict:
