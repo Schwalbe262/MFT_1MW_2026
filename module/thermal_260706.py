@@ -340,10 +340,11 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
     N1 = int(df["N1_main"].iloc[0])
     tx_x = compute_layer_positions(float(df["sl1_main_x"].iloc[0]) / 2, cw1, [float(df["gap1"].iloc[0])] * (N1 - 1))
     tx_y = compute_layer_positions(float(df["sl1_main_y"].iloc[0]) / 2, cw1, tx_gaps)
-    zh = 0.45 * nwh1
+    zh = 0.48 * nwh1
+    z_half_only = (mode == "eighth")  # quarter/full은 z 전체
 
     def _z_range(zh_):
-        return (0.0, zh_) if eighth else (-zh_, zh_)
+        return (0.0, zh_) if z_half_only else (-zh_, zh_)
 
     # 이하 배치 로직에서 "eighth"는 x/y 옥탄트 배치를 의미하므로 quarter도 동일하게 취급
     eighth = sym_xy
@@ -355,12 +356,13 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
     y_start = (tx_y[0] - cw1 / 2) if eighth else -(tx_y[-1] + cw1 / 2)
     _sheet("Tprobe_Tx_leeward", "YZ", [x_probe, y_start, z0], [(tx_y[-1] - tx_y[0]) + cw1, z1 - z0])
     # XZ 평면 시트 (y=0): x- 런의 단면 (보유 옥탄트가 x<=0)
-    _sheet("Tprobe_Tx_side", "XZ", [-(tx_x[-1] + cw1 / 2), 0, z0], [(tx_x[-1] - tx_x[0]) + cw1, z1 - z0])
+    # 주의: Y-법선("XZ"/"ZX") 사각형의 AEDT 치수 순서는 [z스팬, x스팬] (전치 버그 수정)
+    _sheet("Tprobe_Tx_side", "XZ", [-(tx_x[-1] + cw1 / 2), 0, z0], [z1 - z0, (tx_x[-1] - tx_x[0]) + cw1])
 
     # ---- Rx 그룹 공통 생성기 ----
     def _rx_probes(prefix, name, offset_x):
         N, cw, x_pos, y_pos = _rx_layout(df, prefix)
-        zh2 = 0.45 * nwh2
+        zh2 = 0.48 * nwh2
         za, zb = _z_range(zh2)
         y_in, y_out = y_pos[0] - cw / 2, y_pos[-1] + cw / 2
         x_in, x_out = x_pos[0] - cw / 2, x_pos[-1] + cw / 2
@@ -369,7 +371,7 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
         xs = offset_x if offset_x < 0 else (-1.0 if eighth else offset_x)
         _sheet(f"Tprobe_{name}_leeward", "YZ", [xs, ys, za], [y_out - y_in, zb - za])
         # y=0 평면: 바깥쪽(코어 중심에서 먼 쪽) 런 - 보유 옥탄트 x<=0 기준
-        _sheet(f"Tprobe_{name}_side", "XZ", [offset_x - x_out, 0, za], [x_out - x_in, zb - za])
+        _sheet(f"Tprobe_{name}_side", "XZ", [offset_x - x_out, 0, za], [zb - za, x_out - x_in])
 
     _rx_probes("main", "Rx_main", 0.0)
     if int(df["N2_side"].iloc[0]) > 0:
@@ -377,9 +379,9 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
         _rx_probes("side", "Rx_side", -off)
 
     # ---- 코어: 중심 레그 y=0 단면 ----
-    zc = 0.45 * (h1 + 2 * l1)
+    zc = 0.48 * (h1 + 2 * l1)
     zca, zcb = _z_range(zc)
-    _sheet("Tprobe_core_center", "XZ", [-0.9 * l1, 0, zca], [0.9 * l1 if eighth else 1.8 * l1, zcb - zca])
+    _sheet("Tprobe_core_center", "XZ", [-0.9 * l1, 0, zca], [zcb - zca, 0.9 * l1 if eighth else 1.8 * l1])
 
     return sheets
 
