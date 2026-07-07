@@ -623,7 +623,7 @@ def run_thermal_analysis(sim):
     # 해석 + 라이선스 리셋 대비 재시도 (EM쪽 _analyze_current_design과 동일한 방어)
     import time as _time
     solved = False
-    for attempt in range(1, 4):
+    for attempt in range(1, 5):
         ipk.analyze(cores=sim.NUM_CORE)
         try:
             solved = ipk.setups[0].is_solved
@@ -641,8 +641,8 @@ def run_thermal_analysis(sim):
         except Exception:
             pass
         if "license" in msg_text.lower():
-            logging.warning("[thermal] license server distress - 120s backoff before retry")
-            _time.sleep(120)
+            logging.warning("[thermal] license server distress - 180s backoff before retry")
+            _time.sleep(180)
     if not solved:
         logging.error("[thermal] solve failed after retries - temperatures will be NaN for this sample")
     try:

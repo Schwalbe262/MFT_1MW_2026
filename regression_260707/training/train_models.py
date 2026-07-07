@@ -60,12 +60,12 @@ def make_model(family, params, seed):
     raise ValueError(family)
 
 
-def train_target(df, feats, target, cfg, family_params, sample_weight_col=None):
+def train_target(df, feats, target, cfg, family_params, sample_weight_col=None, min_rows=200):
     from sklearn.model_selection import KFold, train_test_split
 
     sub = df.dropna(subset=[target])
     sub = sub[np.isfinite(sub[target])]
-    if len(sub) < 200:
+    if len(sub) < min_rows:
         return None, f"insufficient rows ({len(sub)})"
 
     X = sub[feats].fillna(0.0).reset_index(drop=True)
@@ -125,6 +125,8 @@ def main():
     ap.add_argument("--targets", nargs="*", default=None)
     ap.add_argument("--params", default=None, help="패밀리별 하이퍼파라미터 JSON (Optuna 결과)")
     ap.add_argument("--weight-col", default="sample_weight")
+    ap.add_argument("--min-rows", type=int, default=200,
+                    help="타겟당 최소 행 수 (리허설용으로 낮출 수 있음)")
     args = ap.parse_args()
 
     df = to_physical(pd.read_parquet(args.dataset))
@@ -154,7 +156,8 @@ def main():
         if t not in df.columns:
             print(f"[skip] {t}: 컬럼 없음")
             continue
-        bundle, metrics = train_target(df, feats, t, TARGETS[t], fam_params_for(t), args.weight_col)
+        bundle, metrics = train_target(df, feats, t, TARGETS[t], fam_params_for(t), args.weight_col,
+                                       min_rows=args.min_rows)
         if bundle is None:
             print(f"[skip] {t}: {metrics}")
             continue
