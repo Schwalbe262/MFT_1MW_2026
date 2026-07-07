@@ -553,27 +553,44 @@ def run_thermal_analysis(sim):
     except Exception:
         pass
 
-    # ---- 온도 추출 ----
+    # ---- 온도 추출 (필드 계산기 직접 평가 - 리포트 기계 미사용) ----
     # 프로브 시트 (회귀학습용 주력 데이터: 위치 고정, 보간값이라 메시 스파이크에 강함)
+    # + 그룹별 체적 평균/최대
+    try:
+        solution = ipk.existing_analysis_sweeps[0]
+    except Exception:
+        solution = "ThermalSetup : SteadyState"
+
+    def _eval_temp(obj, op):
+        """오브젝트/시트의 Temp Maximum/Mean 스칼라를 계산기에서 직접 평가"""
+        ofr = ipk.ofieldsreporter
+        ofr.CalcStack("clear")
+        ofr.EnterQty("Temp")
+        if getattr(obj, "is3d", True):
+            ofr.EnterVol(obj.name)
+        else:
+            ofr.EnterSurf(obj.name)
+        ofr.CalcOp("Maximum" if op == "max" else "Mean")
+        ofr.ClcEval(solution, [])
+        return float(ofr.GetTopEntryValue(solution, [])[0])
+
+    temps = {}
     probe = []
     for s in probe_sheets:
-        probe.append([s, f"{s.name}_max", "Temp_max"])
-        probe.append([s, f"{s.name}_mean", "Temp_mean"])
-    # 그룹별 체적 평균 (가장 매끄러운 특징량) + 체적 max (참고용 - 메시 의존성 있음)
+        probe.append((s, f"{s.name}_max", "max"))
+        probe.append((s, f"{s.name}_mean", "mean"))
     vol_objs = (objs["Tx"] + objs["Rx_main_explicit"] + objs["Rx_main_blocks"]
                 + objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
                 + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"] + objs["core"])
     for o in vol_objs:
-        probe.append([o, f"T_mean_{o.name}", "Temp_mean"])
-        probe.append([o, f"T_max_{o.name}", "Temp_max"])
+        probe.append((o, f"T_mean_{o.name}", "mean"))
+        probe.append((o, f"T_max_{o.name}", "max"))
 
-    try:
-        _, df_t = ipk.get_calculator_parameter(dir=sim.project.path, parameters=probe,
-                                               report_name="thermal_report", file_name="thermal_report")
-        temps = {c: float(df_t[c].iloc[0]) for c in df_t.columns if c.startswith(("T_", "Tprobe_"))}
-    except Exception as e:
-        logging.warning(f"Temperature extraction failed: {e}")
-        temps = {}
+    for obj, col, op in probe:
+        try:
+            temps[col] = _eval_temp(obj, op)
+        except Exception as e:
+            logging.warning(f"Temp eval failed for {col}: {e}")
 
     def _group_max(prefixes):
         vals = [v for k, v in temps.items() if any(p in k for p in prefixes)]

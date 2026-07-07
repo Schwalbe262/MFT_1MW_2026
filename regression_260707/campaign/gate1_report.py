@@ -27,9 +27,13 @@ TIME_KEYS = ["time_matrix", "time_loss", "time_thermal", "time"]
 
 
 def fetch_row(task_name):
-    t = requests.get(f"{SCHEDULER}/api/tasks", params={"limit": 3000}, timeout=30).json()
-    tasks = t if isinstance(t, list) else t.get("tasks", [])
-    cand = [x for x in tasks if x.get("name") == task_name]
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from collect_wave import list_tasks
+    # ID-스캔 지원 목록 조회 (구식 스케줄러의 200개 페이지 제한 대응)
+    prefix = task_name.rsplit("-", 2)[0]
+    cand = [x for x in list_tasks(prefix) if x.get("name") == task_name]
     if not cand:
         return None, f"task not found: {task_name}"
     task = sorted(cand, key=lambda x: x["id"])[-1]
@@ -53,7 +57,11 @@ def compare(sym_row, full_row, label):
             continue
         s, f = float(s), float(f)
         if k == "Llt":
-            s *= 2.0  # 대칭 매트릭스 -> 실물
+            # 매트릭스 기준이 다를 때만 환산 (대칭 매트릭스 = 실물의 1/2)
+            if int(sym_row.get("full_model", 0) or 0) == 0:
+                s *= 2.0
+            if int(full_row.get("full_model", 0) or 0) == 0:
+                f *= 2.0
         dev = (s / f - 1) * 100 if f else np.nan
         flag = "" if abs(dev) <= 10 else "  <-- 주의"
         if k not in ("B_max_core",):
