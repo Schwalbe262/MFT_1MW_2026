@@ -1301,7 +1301,12 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 sim.assign_matrix()
             else:
                 sim.assign_core_loss()
-            sim.assign_skin_depth()
+            # matrix 디자인은 인덕턴스(에너지 적분)가 목적이라 skin 메시를 뺄 수 있는 옵션
+            # (matrix_skin_mesh=0). 단 Llt가 스펙 라벨(+-2% 밴드)이므로 A/B 검증 통과 후에만 캠페인 적용.
+            if mode == "matrix" and int(sim.df_plus["matrix_skin_mesh"].iloc[0]) == 0:
+                logging.info("matrix design: skin-depth mesh ops skipped (matrix_skin_mesh=0)")
+            else:
+                sim.assign_skin_depth()
             sim.assign_plate_settings()
             sim.assign_boundary()
             sim.create_setup()

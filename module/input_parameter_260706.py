@@ -32,7 +32,7 @@ KEYS = [
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns", "rx_mesh_mode",
     "keep_project",
-    "loss_sym_on", "thermal_symmetry",
+    "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh",
 ]
 
 
@@ -106,6 +106,8 @@ def get_drawing_default_params():
         "loss_sym_on": 1,
         # 열해석 대칭화: "eighth" = 1/8 (양측 팬 y대칭 + 부력 무시 가정, 캠페인용) / "full" = 최종 검증용
         "thermal_symmetry": "eighth",
+        # matrix 디자인의 skin 메시 (1=적용). 0이면 인덕턴스 전용 경량 메시 - A/B 검증 후 캠페인 적용 검토
+        "matrix_skin_mesh": 1,
     }
 
 
@@ -673,7 +675,7 @@ NON_DESIGN_VAR_KEYS = {
     "k_ins", "core_k_thermal", "n_explicit_turns",
     "max_passes", "percent_error", "keep_project",
     "core_depth_min", "core_depth_max",
-    "loss_sym_on", "thermal_symmetry",
+    "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh",
 }
 
 
