@@ -620,7 +620,31 @@ def run_thermal_analysis(sim):
     except Exception as e:
         logging.warning(f"Thermal setup props: {e}")
 
-    ipk.analyze(cores=sim.NUM_CORE)
+    # 해석 + 라이선스 리셋 대비 재시도 (EM쪽 _analyze_current_design과 동일한 방어)
+    import time as _time
+    solved = False
+    for attempt in range(1, 4):
+        ipk.analyze(cores=sim.NUM_CORE)
+        try:
+            solved = ipk.setups[0].is_solved
+        except Exception:
+            solved = True  # 확인 불가 시 진행 (기존 동작)
+        if solved:
+            break
+        logging.warning(f"[thermal] analyze attempt {attempt} finished without solution data.")
+        msg_text = ""
+        try:
+            msgs = ipk.odesktop.GetMessages(sim.PROJECT_NAME, ipk.design_name, 0)
+            for m in list(msgs)[-6:]:
+                logging.warning(f"[AEDT] {m}")
+            msg_text = " ".join(str(m) for m in msgs)
+        except Exception:
+            pass
+        if "license" in msg_text.lower():
+            logging.warning("[thermal] license server distress - 120s backoff before retry")
+            _time.sleep(120)
+    if not solved:
+        logging.error("[thermal] solve failed after retries - temperatures will be NaN for this sample")
     try:
         sim.save_project()
     except Exception:
