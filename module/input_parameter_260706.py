@@ -643,12 +643,9 @@ def validation_check(input_df, strict=False, return_errors=False):
         errors.append(f"V1_rms <= 0 ({inp['V1_rms'].iloc[0]}) with loss_on=1")
     n_exp = int(inp["n_explicit_turns"].iloc[0])
     if int(inp["thermal_on"].iloc[0]) != 0:
-        if n_exp < 1:
-            errors.append(f"n_explicit_turns ({n_exp}) < 1")
-        if N2_main > 0 and 2 * n_exp >= N2_main:
-            errors.append(f"2*n_explicit_turns ({2 * n_exp}) >= N2_main ({N2_main})")
-        if N2_side > 0 and 2 * n_exp >= N2_side:
-            errors.append(f"2*n_explicit_turns ({2 * n_exp}) >= N2_side ({N2_side})")
+        # n_exp = -1 또는 2*n_exp >= N 이면 전 턴 explicit으로 처리됨 (thermal_260706에서 지원)
+        if n_exp == 0:
+            errors.append(f"n_explicit_turns ({n_exp}) == 0 (1 이상 또는 -1[전 턴])")
     if str(inp["rx_mesh_mode"].iloc[0]) not in ("skin", "length", "length-coarse"):
         errors.append(f"invalid rx_mesh_mode ({inp['rx_mesh_mode'].iloc[0]})")
     if str(inp["thermal_symmetry"].iloc[0]) not in ("eighth", "quarter", "full"):
