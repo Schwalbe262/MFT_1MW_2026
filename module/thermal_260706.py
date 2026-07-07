@@ -335,10 +335,11 @@ def _create_probe_sheets(ipk, df, objs, eighth=False):
         return (0.0, zh_) if eighth else (-zh_, zh_)
 
     z0, z1 = _z_range(zh)
-    # YZ 평면 시트 (x=0): y측 런의 단면 (eighth: +y측 / full: -y 풍하측)
-    y_sign = 1 if eighth else -1
+    # YZ 평면 시트: y측 런의 단면 (eighth: +y측 / full: -y 풍하측)
+    # eighth 모드에서는 x=0이 region 경계면과 겹쳐 필드 평가가 실패하므로 1mm 안쪽(x<0)에 배치
+    x_probe = -1.0 if eighth else 0.0
     y_start = (tx_y[0] - cw1 / 2) if eighth else -(tx_y[-1] + cw1 / 2)
-    _sheet("Tprobe_Tx_leeward", "YZ", [0, y_start, z0], [(tx_y[-1] - tx_y[0]) + cw1, z1 - z0])
+    _sheet("Tprobe_Tx_leeward", "YZ", [x_probe, y_start, z0], [(tx_y[-1] - tx_y[0]) + cw1, z1 - z0])
     # XZ 평면 시트 (y=0): x- 런의 단면 (보유 옥탄트가 x<=0)
     _sheet("Tprobe_Tx_side", "XZ", [-(tx_x[-1] + cw1 / 2), 0, z0], [(tx_x[-1] - tx_x[0]) + cw1, z1 - z0])
 
@@ -350,7 +351,9 @@ def _create_probe_sheets(ipk, df, objs, eighth=False):
         y_in, y_out = y_pos[0] - cw / 2, y_pos[-1] + cw / 2
         x_in, x_out = x_pos[0] - cw / 2, x_pos[-1] + cw / 2
         ys = y_in if eighth else -y_out
-        _sheet(f"Tprobe_{name}_leeward", "YZ", [offset_x, ys, za], [y_out - y_in, zb - za])
+        # eighth: 링 중심(x=offset)이 0이면 region 경계와 겹침 -> 1mm 안쪽
+        xs = offset_x if offset_x < 0 else (-1.0 if eighth else offset_x)
+        _sheet(f"Tprobe_{name}_leeward", "YZ", [xs, ys, za], [y_out - y_in, zb - za])
         # y=0 평면: 바깥쪽(코어 중심에서 먼 쪽) 런 - 보유 옥탄트 x<=0 기준
         _sheet(f"Tprobe_{name}_side", "XZ", [offset_x - x_out, 0, za], [x_out - x_in, zb - za])
 
