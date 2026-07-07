@@ -88,6 +88,40 @@ def fetch_result_rows(task_id):
         return None
 
 
+# 프로브 전치 버그 수정 커밋 (2026-07-07). 이전 코드로 돌린 행은 _side/core_center
+# 프로브가 전치된 시트에서 평가된 값이라 무효 -> NaN 처리 (T_max_*, leeward는 유효)
+PROBE_FIX_HASHES_OK = None  # lazy: 수정 커밋 이후 해시 집합
+
+
+def sanitize_bad_probes(df):
+    import subprocess
+    global PROBE_FIX_HASHES_OK
+    if "git_hash" not in df.columns:
+        return df, 0
+    if PROBE_FIX_HASHES_OK is None:
+        try:
+            out = subprocess.run(["git", "log", "--format=%h", "8f00000..HEAD"],
+                                 capture_output=True, text=True, cwd=os.path.join(HERE, "..", ".."))
+            # 수정 커밋부터 HEAD까지의 해시 (실패 시 빈 집합 -> 전부 유효 취급 안 함)
+            out2 = subprocess.run(["git", "log", "--format=%h"],
+                                  capture_output=True, text=True, cwd=os.path.join(HERE, "..", ".."))
+            all_h = out2.stdout.split()
+            # 수정 커밋: 'Fix transposed probe sheets' 메시지 기준
+            log = subprocess.run(["git", "log", "--format=%h %s"],
+                                 capture_output=True, text=True, cwd=os.path.join(HERE, "..", "..")).stdout
+            fix_h = next((l.split()[0] for l in log.splitlines() if "transposed probe" in l), None)
+            PROBE_FIX_HASHES_OK = set(all_h[:all_h.index(fix_h) + 1]) if fix_h in all_h else set()
+        except Exception:
+            PROBE_FIX_HASHES_OK = set()
+    bad_cols = [c for c in df.columns
+                if c.startswith("Tprobe_") and ("_side_" in c or "core_center" in c)]
+    mask = ~df["git_hash"].isin(PROBE_FIX_HASHES_OK)
+    n = int(mask.sum())
+    if n and bad_cols:
+        df.loc[mask, bad_cols] = float("nan")
+    return df, n
+
+
 def convergence_filter(df, max_err=1.5):
     keep = pd.Series(True, index=df.index)
     for col in ["conv_error_pct_matrix", "conv_error_pct_loss"]:
@@ -137,6 +171,9 @@ def main():
         merged = merged.drop_duplicates(subset=dedup_keys, keep="last")
         print(f"dedup: {before} -> {len(merged)}")
 
+    merged, n_bad_probe = sanitize_bad_probes(merged)
+    if n_bad_probe:
+        print(f"probe-fix 이전 행 {n_bad_probe}개: side/core_center 프로브 컬럼 NaN 처리 (T_max/leeward는 유지)")
     merged, n_filtered = convergence_filter(merged, args.max_conv_err)
     print(f"convergence filter (<= {args.max_conv_err}%): -{n_filtered} rows")
 
