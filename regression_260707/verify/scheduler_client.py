@@ -26,6 +26,7 @@ def submit_verification(name, workdir, params: dict, profile: dict, mem_mb=32768
     cmd = (BASE + lib_clone +
            f"([ -d {workdir} ] || git clone -q --depth 1 https://github.com/Schwalbe262/MFT_1MW_2026.git {workdir}) && "
            f"cd {workdir} && git pull -q && "
+           f"rm -rf simulation aedt_temp 2>/dev/null; "
            f"printf '%s' {shlex.quote(pjson)} > cand.json && "
            f"python run_simulation_260706.py --fixed {extra} --params cand.json; "
            f"rm -rf simulation aedt_temp 2>/dev/null; true")  # 솔루션만 정리 (클론 재사용)

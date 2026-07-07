@@ -39,6 +39,8 @@ def submit(name, workdir, run_args, mem_mb=32768, cpus=4):
     cmd = (BASE + LIB_CLONE +
            f"([ -d {workdir} ] || git clone -q --depth 1 https://github.com/Schwalbe262/MFT_1MW_2026.git {workdir}) && "
            f"cd {workdir} && git pull -q && "
+           # 시작 시 이전 태스크/실패 샘플 잔재 제거 (라이선스 폭풍 시 개당 5GB+ 누적 실측)
+           f"rm -rf simulation aedt_temp 2>/dev/null; "
            f"python run_simulation_260706.py {run_args}; "
            f"echo ===RESULT_CSV===; cat simulation_results_260706.csv 2>/dev/null; "
            f"echo ===FAILED_CSV===; cat failed_samples_260706.csv 2>/dev/null | head -50; "
