@@ -1713,6 +1713,9 @@ def main():
                 if args.hold:
                     # 확인용 1회 실행 - AEDT를 연 채로 종료
                     return
+            elif args.hold:
+                print(f"\n=== HOLD 모드: 이번 샘플 실패 (라이선스/해석 오류 등) -> "
+                      f"새 랜덤 샘플로 재시도합니다 (시도 {attempts + 1}) ===\n", flush=True)
         except Exception as e:
             logging.exception(f"Error running simulation: {e}")
 
