@@ -21,7 +21,10 @@ import requests
 SCHEDULER = "http://127.0.0.1:8000"
 
 BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
-        "module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; ")
+        "module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; "
+        # 라이선스 데몬 보호: 클라이언트 타임아웃 3초(기본 0.1초 - 바쁜 데몬에서 리셋 유발),
+        # 시작 지터 0-240초로 체크아웃 동시 폭주 분산
+        "export FLEXLM_TIMEOUT=3000000; sleep $((RANDOM % 240)); ")
 
 CAMPAIGN_SETS = "--set percent_error=1.0 --set max_passes=14 --set P_target=1e6"
 

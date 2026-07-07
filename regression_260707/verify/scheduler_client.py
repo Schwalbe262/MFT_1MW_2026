@@ -9,7 +9,8 @@ import requests
 
 SCHEDULER = "http://127.0.0.1:8000"
 BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
-        "module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; ")
+        "module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; "
+        "export FLEXLM_TIMEOUT=3000000; sleep $((RANDOM % 60)); ")
 
 
 def submit_verification(name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4):
