@@ -12,6 +12,7 @@
 """
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -75,7 +76,12 @@ def main():
 
     # golden case 동반
     submit(f"mft-camp-{tag}-golden", f"mft_{tag}_golden", "--golden --headless")
-    print(f"done: {ok}/{args.tasks} tasks + golden submitted (wave {args.wave})")
+
+    # 웨이브마다 스테일 스위퍼 동반 제출 (취소/킬 잔재 자동 청소 - 상시 위생)
+    import subprocess
+    subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                 "sweep_stale.py"), "--hours", "6"], check=False)
+    print(f"done: {ok}/{args.tasks} tasks + golden + sweeper submitted (wave {args.wave})")
 
 
 if __name__ == "__main__":
