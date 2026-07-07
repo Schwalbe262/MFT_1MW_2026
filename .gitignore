@@ -45,4 +45,8 @@ picture/
 *.csv
 
 # Ignore model foler
-best_model/
+best_model/# 캠페인 산출 데이터 (레포 비대화 방지 - parquet은 로컬/수집 파이프라인 자산)
+regression_260707/data/dataset/
+regression_260707/al_rounds/
+regression_260707/training/registry/
+regression_260707/training/learning_curve.csv
