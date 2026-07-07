@@ -1,52 +1,31 @@
-# Python cache and build artifacts
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Virtual environments
-.venv/
-venv/
-env/
-
-# Notebook checkpoints
-.ipynb_checkpoints/
-
-# IDE/editor settings
-.vscode/
-.idea/
-
-# OS and logs
-.DS_Store
-Thumbs.db
-*.log
-
-# ANSYS AEDT generated artifacts
-*.aedt.lock
-*.aedtresults/
-*.pyaedt/
-
-# Project runtime artifacts
-simulation_num.txt
-
-# Generated simulation outputs
+# ==== 시뮬레이션 산출물 (레포 비대화 방지) ====
 simulation/
-!simulation/.gitkeep
-
-# Picture debug outputs
-picture/
-
-# Ignore all CSV files
+results_parts_260706/
 *.csv
+*.lock
+*.aedtresults/
+*.aedb/
 
-# Ignore model foler
-best_model/# 캠페인 산출 데이터 (레포 비대화 방지 - parquet은 로컬/수집 파이프라인 자산)
+# ==== 수집/학습 산출물 ====
 regression_260707/data/dataset/
 regression_260707/al_rounds/
 regression_260707/training/registry/
-regression_260707/training/learning_curve.csv
+regression_260707/campaign/feeder_state.json
+
+# ==== 데이터 폴더 (구세대 스윕 결과) ====
+data/
+data_260514/
+
+# ==== 레거시 사본 (로컬 보관용) ====
+module_old/
+module_old_v2/
+module - 복사본/
+regression/
+regression_260515/NSGA2_result/
+regression_260515/best_model/
+best_model/
+
+# ==== 파이썬/시스템 ====
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
