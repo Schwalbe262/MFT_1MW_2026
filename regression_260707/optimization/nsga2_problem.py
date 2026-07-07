@@ -132,8 +132,11 @@ class MFTProblem(Problem):
             G[idx, 5] = mu_b + q * sg_b - spec["B_limit_T"]
             # g6: 간격 비례축소 필요량 (절연 하한 불가침 위반)
             G[idx, 6] = shrink[idx]
-            # g7: 디코드/검증 유효성 (valid만 왔으므로 통과)
-            G[idx, 7] = -1.0
+            # g7: z방향 절연 - 2차 권선 상하단과 요크 간격 (2차-코어 절연쌍의 z성분)
+            if "h_gap2" in sub.columns:
+                G[idx, 7] = spec["insulation_min_mm"] - sub["h_gap2"].to_numpy(dtype=float)
+            else:
+                G[idx, 7] = -1.0
             # g8: 데이터 밀도 게이트 (외삽 봉쇄)
             if self.density_gate is not None:
                 G[idx, 8] = self.density_gate(sub)
