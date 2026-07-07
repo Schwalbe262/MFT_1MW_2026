@@ -179,6 +179,8 @@ _SOBOL_DIMS = [
     ("w2c_w1c_space_x", 10, 50), ("w2c_w1c_space_y", 10, 50),
     ("w1c_w2s_space_x", 10, 60), ("w1s_cs_space_x", 10, 50),
     ("cs_w1s_space_y", 10, 50),
+    # Tx측면-Rx측면 절연 간격 (N1_side>0일 때만 사용; 0이면 도체가 맞닿아 솔버 에러 - 파일럿에서 발견)
+    ("w2s_w1s_space_x", 10, 50), ("w1s_w2s_space_y", 10, 50),
     ("f1_split", 0.25, 0.60),   # 창 예산 중 1차 권선 몫
     ("gap1", 0.3, 5.0), ("gap2", 0.3, 2.0),
     ("wh1", 0.8, 0.95), ("wh2", 0.5, 0.95),
@@ -222,12 +224,16 @@ def decode_unit_sample(s, allow_space_shrink=True, space_min=None):
     s = dict(s)
     if space_min is not None:
         for k in ("cc_w2c_space_x", "w2c_w1c_space_x", "w1c_w2s_space_x", "w1s_cs_space_x",
-                  "cc_w2c_space_y", "w2c_w1c_space_y", "cs_w1s_space_y"):
+                  "cc_w2c_space_y", "w2c_w1c_space_y", "cs_w1s_space_y",
+                  "w2s_w1s_space_x", "w1s_w2s_space_y"):
             if k in s:
                 s[k] = max(float(s[k]), space_min)
 
     N1 = 5 + int(s["u_N1"] * 5.9999)                     # 5..10
-    N1_side = round(N1 * (s["u_N1_side"] * 0.5))
+    # N1_side(1차 측면 권선)는 캠페인 설계공간에서 제외:
+    # 실제 절연 간격(w2s_w1s 등)을 반영하면 Tx-Rx_side x 간격 예산이 거의 성립하지 않고
+    # (파일럿 84% 대량 실패의 원인), 도면 계열도 N1_side=0. u_N1_side 차원은 호환용으로 유지.
+    N1_side = 0
     N1_main = N1 - N1_side
     N2 = N1 * 10
     N2_side = round(N2 * (s["u_N2_side"] * 0.8))
@@ -292,8 +298,8 @@ def decode_unit_sample(s, allow_space_shrink=True, space_min=None):
         "w2c_w1c_space_x": round(w21_x, 1),
         "w2c_w1c_space_y": round(s["w2c_w1c_space_y"], 1),
         "w1c_w2s_space_x": round(minclear_x * 0.8, 1),   # 최소 요구 간격은 실제 여유보다 작게
-        "w2s_w1s_space_x": 0.0,
-        "w1s_w2s_space_y": 0.0,
+        "w2s_w1s_space_x": float(s["w2s_w1s_space_x"]) if N1_side > 0 else 0.0,
+        "w1s_w2s_space_y": float(s["w1s_w2s_space_y"]) if N1_side > 0 else 0.0,
         "w1s_cs_space_x": round(w1s_x, 1),
         "cs_w1s_space_y": round(s["cs_w1s_space_y"], 1),
         # 랜덤 스윕은 기존처럼 매트릭스(L/k) 전용 - 손실/열해석은 fixed 모드에서
@@ -633,6 +639,12 @@ def validation_check(input_df, strict=False, return_errors=False):
         errors.append(f"invalid rx_mesh_mode ({inp['rx_mesh_mode'].iloc[0]})")
     if str(inp["thermal_symmetry"].iloc[0]) not in ("eighth", "full"):
         errors.append(f"invalid thermal_symmetry ({inp['thermal_symmetry'].iloc[0]})")
+    # Tx측면 권선이 있으면 Rx측면과의 절연 간격 필수 (0이면 도체 접촉 -> 솔버 에러)
+    if N1_side > 0:
+        if float(inp["w2s_w1s_space_x"].iloc[0]) < 1.0:
+            errors.append(f"w2s_w1s_space_x too small for N1_side>0 ({inp['w2s_w1s_space_x'].iloc[0]})")
+        if float(inp["w1s_w2s_space_y"].iloc[0]) < 1.0:
+            errors.append(f"w1s_w2s_space_y too small for N1_side>0 ({inp['w1s_w2s_space_y'].iloc[0]})")
 
     result = len(errors) == 0
 
