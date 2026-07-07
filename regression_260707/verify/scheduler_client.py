@@ -26,7 +26,8 @@ def submit_verification(name, workdir, params: dict, profile: dict, mem_mb=32768
            f"([ -d {workdir} ] || git clone -q --depth 1 https://github.com/Schwalbe262/MFT_1MW_2026.git {workdir}) && "
            f"cd {workdir} && git pull -q && "
            f"printf '%s' {shlex.quote(pjson)} > cand.json && "
-           f"python run_simulation_260706.py --fixed {extra} --params cand.json")
+           f"python run_simulation_260706.py --fixed {extra} --params cand.json; "
+           f"cd .. && rm -rf {workdir}; true")  # 자기-정리 (쿼터 위생)
     r = requests.post(f"{SCHEDULER}/tasks", data={
         "name": name, "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__",
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
