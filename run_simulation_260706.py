@@ -1483,12 +1483,12 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         if fixed_mode or hold:
             print(result)
             sim.save_project()
-        if fixed_mode:
-            # 스케줄러 stdout 회수용: 결과 1행을 JSON 한 줄로 (AL 루프/검증 드라이버가 파싱)
-            try:
-                print("RESULT_JSON " + result.iloc[0].to_json())
-            except Exception as e:
-                logging.warning(f"RESULT_JSON print failed: {e}")
+        # 스케줄러 stdout 회수용: 결과 1행을 JSON 한 줄로 즉시 스트리밍
+        # (랜덤 모드도 포함 - 태스크 완주를 기다리지 않고 샘플 단위로 데이터 회수 가능)
+        try:
+            print("RESULT_JSON " + result.iloc[0].to_json(), flush=True)
+        except Exception as e:
+            logging.warning(f"RESULT_JSON print failed: {e}")
 
         if hold:
             # 결과 확인용: AEDT와 프로젝트를 연 채로 종료 (사용자가 직접 닫을 때까지 유지)

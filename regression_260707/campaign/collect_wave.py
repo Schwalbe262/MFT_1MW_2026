@@ -146,8 +146,12 @@ def main():
 
     # 실패 태스크도 stdout에 결과가 있으면 회수 (pyaedt teardown 크래시가
     # 성공 샘플을 실패로 둔갑시키는 케이스 실측됨 - 데이터는 유효)
+    # + 실행 중 태스크의 RESULT_JSON 라인도 스트리밍 회수 (샘플 단위 실시간성)
+    import json as _json
+    running = [t for t in tasks if t.get("status") in ("running", "attaching")]
     frames = []
     n_salvaged = 0
+    n_streamed = 0
     for t in done + failed:
         df = fetch_result_rows(t["id"])
         if df is not None and len(df):
@@ -156,8 +160,28 @@ def main():
             frames.append(df)
             if t.get("status") == "failed":
                 n_salvaged += 1
+    for t in running:
+        try:
+            out = requests.get(f"{SCHEDULER}/api/tasks/{t['id']}/stdout", timeout=20).text
+        except Exception:
+            continue
+        rows = []
+        for line in out.splitlines():
+            if line.startswith("RESULT_JSON "):
+                try:
+                    rows.append(_json.loads(line[len("RESULT_JSON "):]))
+                except Exception:
+                    pass
+        if rows:
+            df = pd.DataFrame(rows)
+            df["task_id"] = t["id"]
+            df["task_name"] = t.get("name", "")
+            frames.append(df)
+            n_streamed += len(rows)
     if n_salvaged:
         print(f"salvaged from failed tasks: {n_salvaged}")
+    if n_streamed:
+        print(f"streamed from running tasks: {n_streamed} rows")
 
     if not frames:
         print("no result rows collected")
