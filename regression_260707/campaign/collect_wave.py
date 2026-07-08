@@ -218,6 +218,17 @@ def main():
     if n_streamed:
         print(f"streamed from running tasks: {n_streamed} rows")
 
+    # 로컬 생산 라인: 로컬 CSV도 병합 (클러스터 대비 샘플당 15-25x 빠름)
+    local_csv = os.path.join(HERE, "..", "..", "simulation_results_260706.csv")
+    if os.path.isfile(local_csv):
+        try:
+            ldf = pd.read_csv(local_csv, on_bad_lines="skip")
+            ldf["task_name"] = "local"
+            frames.append(ldf)
+            print(f"local rows: {len(ldf)}")
+        except Exception as e:
+            print(f"local csv read failed: {e}")
+
     if not frames:
         print("no result rows collected")
         return

@@ -51,6 +51,7 @@ def submit(name, workdir, run_args, mem_mb=32768, cpus=4):
         "name": name, "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__",
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
         "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
+        "max_workers_per_node": 5,  # 노드 과밀 방지 (진단: 패킹이 노드당 13-20세션 유발)
     }, allow_redirects=False, timeout=20)
     return r.status_code in (200, 303)
 
