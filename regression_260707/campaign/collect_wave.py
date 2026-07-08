@@ -72,6 +72,24 @@ def list_tasks(prefix):
     return list(seen.values())
 
 
+# 터미널 태스크의 회수 결과 캐시: 재수집 시 재조회 생략 (회수 시간 수분 -> 초)
+CACHE_PATH = os.path.join(DATASET_DIR, "collect_cache.json")
+
+
+def _load_cache():
+    try:
+        return json.load(open(CACHE_PATH, encoding="utf-8"))
+    except Exception:
+        return {"nodata": [], "harvested": []}
+
+
+def _save_cache(c):
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    tmp = CACHE_PATH + ".tmp"
+    json.dump(c, open(tmp, "w"), encoding=None if True else None, indent=0, default=str) if False else json.dump(c, open(tmp, "w"))
+    os.replace(tmp, CACHE_PATH)
+
+
 def fetch_result_rows(task_id):
     try:
         out = requests.get(f"{SCHEDULER}/api/tasks/{task_id}/stdout", timeout=30).text
@@ -149,17 +167,29 @@ def main():
     # + 실행 중 태스크의 RESULT_JSON 라인도 스트리밍 회수 (샘플 단위 실시간성)
     import json as _json
     running = [t for t in tasks if t.get("status") in ("running", "attaching")]
+    cache = _load_cache()
+    skip = set(cache.get("nodata", [])) | set(cache.get("harvested", []))
     frames = []
     n_salvaged = 0
     n_streamed = 0
+    n_skipped = 0
     for t in done + failed:
+        if t["id"] in skip:
+            n_skipped += 1
+            continue
         df = fetch_result_rows(t["id"])
         if df is not None and len(df):
             df["task_id"] = t["id"]
             df["task_name"] = t.get("name", "")
             frames.append(df)
+            cache.setdefault("harvested", []).append(t["id"])
             if t.get("status") == "failed":
                 n_salvaged += 1
+        else:
+            cache.setdefault("nodata", []).append(t["id"])
+    if n_skipped:
+        print(f"cache skip: {n_skipped} terminal tasks")
+    _save_cache(cache)
     for t in running:
         try:
             out = requests.get(f"{SCHEDULER}/api/tasks/{t['id']}/stdout", timeout=20).text
