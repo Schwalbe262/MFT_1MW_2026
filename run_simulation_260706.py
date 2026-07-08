@@ -1195,6 +1195,10 @@ class Simulation():
         results_df["git_hash"] = GIT_HASH
         results_df["project_name"] = getattr(self, "PROJECT_NAME", "")
         results_df["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # RESULT_JSON 스트리밍이 동일 메타(특히 dedup 키)를 쓰도록 보관
+        self.last_save_meta = {"git_hash": GIT_HASH,
+                               "project_name": results_df["project_name"].iloc[0],
+                               "saved_at": results_df["saved_at"].iloc[0]}
 
         lock_path = filename + ".lock"
         with FileLock(lock_path):
@@ -1523,7 +1527,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         # 스케줄러 stdout 회수용: 결과 1행을 JSON 한 줄로 즉시 스트리밍
         # (랜덤 모드도 포함 - 태스크 완주를 기다리지 않고 샘플 단위로 데이터 회수 가능)
         try:
-            print("RESULT_JSON " + result.iloc[0].to_json(), flush=True)
+            d = json.loads(result.iloc[0].to_json())
+            d.update(getattr(sim, "last_save_meta", {}))  # git_hash/project_name/saved_at (dedup 키)
+            print("RESULT_JSON " + json.dumps(d), flush=True)
         except Exception as e:
             logging.warning(f"RESULT_JSON print failed: {e}")
 
