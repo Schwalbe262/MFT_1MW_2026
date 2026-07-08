@@ -694,6 +694,7 @@ def run_thermal_analysis(sim):
         return max(vals) if vals else float("nan")
 
     summary = {
+        "thermal_solved": [1 if solved else 0],  # CFD 라이선스 실패 등으로 해가 없으면 0
         "T_max_Tx": [_group_max(["Tx_main"])],
         "T_max_Rx_main": [_group_max(["Rx_main"])],
         "T_max_Rx_side": [_group_max(["Rx_side"])],
