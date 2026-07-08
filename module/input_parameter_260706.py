@@ -97,7 +97,7 @@ def get_drawing_default_params():
         "fan_velocity": 1.5,     # 팬 유속 [m/s], +y -> -y
         "k_ins": 0.2,            # 권선 절연 열전도율 [W/mK]
         "core_k_thermal": 2.0,   # 코어 등가 열전도율 [W/mK] (아몰퍼스, 보수적 등방값)
-        "n_explicit_turns": 4,   # 하이브리드: 안/밖 각각 explicit으로 남길 턴 수
+        "n_explicit_turns": 2,   # 하이브리드: 안/밖 각각 explicit으로 남길 턴 수
         # Rx foil 메시 전략: "skin"(기본) / "length" / "length-coarse" (벤치마크용)
         "rx_mesh_mode": "skin",
         # 완료 후 프로젝트 파일 보존 여부 (fixed 기본 보존 / 랜덤·클러스터는 0으로 확실히 삭제)
@@ -106,7 +106,7 @@ def get_drawing_default_params():
         # 0이면 풀모델 + 전압원 (최종 검증용). 추출값은 양쪽 모두 _phys(실물 기준)로 보정 기록
         "loss_sym_on": 1,
         # 열해석 대칭화: "eighth" = 1/8 (양측 팬 y대칭 + 부력 무시 가정, 캠페인용) / "full" = 최종 검증용
-        "thermal_symmetry": "quarter",
+        "thermal_symmetry": "eighth",
         # matrix 디자인의 skin 메시 (1=적용). 0이면 인덕턴스 전용 경량 메시 - A/B 검증 후 캠페인 적용 검토
         "matrix_skin_mesh": 1,
         # 풀 열해석 팬 구성: "dual" = +-y 양측 유입(냉각 스펙, 1/8과 동일 물리) / "single" = +y->-y

@@ -33,7 +33,7 @@ from optimization.geometry_metrics import bounding_box_lit  # noqa: E402
 DEFAULT_SPEC = {
     "Llt_target_uH": 27.5,
     "Llt_tol_uH": 0.55,          # +-2%
-    "T_limit_C": 100.0,
+    "T_limit_C": 97.0,   # 실스펙 100C - eighth 열모델의 핫스팟 과소평가 2~3C 보상 (게이트1 실측)
     "B_limit_T": 1.2,
     "insulation_min_mm": 40.0,
     "q_sigma": 1.28,             # 불확실성 조임 계수 (컨포멀 보정으로 대체됨)
