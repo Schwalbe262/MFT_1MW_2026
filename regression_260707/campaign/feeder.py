@@ -37,10 +37,26 @@ def save_state(st):
     os.replace(tmp, STATE)
 
 
+def _id_status(tid):
+    import requests
+    try:
+        return requests.get(f"{'http://127.0.0.1:8000'}/api/tasks/{tid}", timeout=10).json().get("status")
+    except Exception:
+        return None
+
+
 def step(max_samples):
     st = load_state()
-    ts = list_tasks("mft-camp-")
-    active = sum(1 for t in ts if t.get("status") in ("running", "attaching", "queued"))
+    # active 집계: 목록 페이지 제한(200)으로 과소집계 -> 폭주 제출 버그 실측.
+    # 자체 장부(제출 ID 직접 조회)로 정확히 센다 (피더가 유일한 제출자).
+    ledger = st.get("outstanding", [])
+    alive = []
+    for tid in ledger:
+        s = _id_status(tid)
+        if s in ("running", "attaching", "queued", None):
+            alive.append(tid)
+    st["outstanding"] = alive
+    active = len(alive)
     deficit = TARGET_ACTIVE + BUFFER - active
     if st["submitted_samples"] >= max_samples:
         print(f"[feeder] max samples reached ({st['submitted_samples']}/{max_samples}) - no refill")
@@ -58,6 +74,16 @@ def step(max_samples):
         if submit(name, wd, run_args):
             ok += 1
             st["submitted_samples"] += COUNT_PER_TASK
+            # 방금 제출한 태스크 ID를 장부에 (이름 역조회)
+            try:
+                import requests
+                t = requests.get("http://127.0.0.1:8000/api/tasks", timeout=10).json()
+                for x in (t if isinstance(t, list) else t.get("tasks", [])):
+                    if x.get("name") == name:
+                        st.setdefault("outstanding", []).append(x["id"])
+                        break
+            except Exception:
+                pass
         time.sleep(0.3)
     save_state(st)
     print(f"[feeder] active {active} -> +{ok} tasks (누적 제출 샘플 {st['submitted_samples']})")
