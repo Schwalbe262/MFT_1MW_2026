@@ -62,10 +62,15 @@ def list_tasks(prefix):
                 misses = 0
             else:
                 misses += 1
-    # 범위 내 구멍 채우기 (페이지에 안 담긴 중간 ID)
+    # 범위 내 구멍 채우기 (페이지에 안 담긴 중간 ID) - 이미 판정된 터미널 ID는 생략
+    try:
+        c = _load_cache()
+        judged = set(c.get("nodata", [])) | set(c.get("harvested", []))
+    except Exception:
+        judged = set()
     lo, hi = min(seen), max(seen)
     for tid in range(lo, hi + 1):
-        if tid not in seen:
+        if tid not in seen and tid not in judged:
             r = probe(tid)
             if r:
                 seen[tid] = r
