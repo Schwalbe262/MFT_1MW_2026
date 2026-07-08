@@ -659,17 +659,29 @@ def run_thermal_analysis(sim):
         solution = "ThermalSetup : SteadyState"
 
     def _eval_temp(obj, op):
-        """오브젝트/시트의 Temp Maximum/Mean 스칼라를 계산기에서 직접 평가"""
-        ofr = ipk.ofieldsreporter
-        ofr.CalcStack("clear")
-        ofr.EnterQty("Temp")
-        if getattr(obj, "is3d", True):
-            ofr.EnterVol(obj.name)
-        else:
-            ofr.EnterSurf(obj.name)
-        ofr.CalcOp("Maximum" if op == "max" else "Mean")
-        ofr.ClcEval(solution, [])
-        return float(ofr.GetTopEntryValue(solution, [])[0])
+        """오브젝트/시트의 Temp Maximum/Mean 스칼라 평가.
+        1차: 계산기 직접 호출 (로컬/윈도우 검증됨)
+        2차: pyaedt get_scalar_field_value (리눅스 gRPC에서 ClcEval 실패 사례 폴백)"""
+        is3d = getattr(obj, "is3d", True)
+        try:
+            ofr = ipk.ofieldsreporter
+            ofr.CalcStack("clear")
+            ofr.EnterQty("Temp")
+            if is3d:
+                ofr.EnterVol(obj.name)
+            else:
+                ofr.EnterSurf(obj.name)
+            ofr.CalcOp("Maximum" if op == "max" else "Mean")
+            ofr.ClcEval(solution, [])
+            return float(ofr.GetTopEntryValue(solution, [])[0])
+        except Exception:
+            v = ipk.post.get_scalar_field_value(
+                "Temp", scalar_function=("Maximum" if op == "max" else "Mean"),
+                solution=solution, object_name=obj.name,
+                object_type=("volume" if is3d else "surface"))
+            if v is None or v is False:
+                raise
+            return float(v)
 
     temps = {}
     probe = []
