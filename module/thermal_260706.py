@@ -267,7 +267,20 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
         explicit = windings[:n_exp] + windings[-n_exp:]
         middle = windings[n_exp:N - n_exp]
         if middle:
-            ipk.modeler.delete([w.name for w in middle])
+            # 대형 샘플에서 일괄 삭제가 gRPC로 부분 실패하는 사례 실측
+            # ('Object does not have mesh' -> 솔버 중단) -> 삭제 후 검증 + 개별 재삭제
+            names = [w.name for w in middle]
+            ipk.modeler.delete(names)
+            survivors = [n for n in names if n in set(ipk.modeler.object_names)]
+            for n in survivors:
+                try:
+                    ipk.modeler.delete(n)
+                except Exception:
+                    pass
+            survivors = [n for n in names if n in set(ipk.modeler.object_names)]
+            if survivors:
+                raise RuntimeError(f"middle turn deletion failed for {len(survivors)} objects "
+                                   f"({survivors[:3]}...) - aborting thermal build")
         blocks = _build_homog_blocks(ipk, df, prefix, name, offset_x, nwh2)
         return explicit, blocks
 
