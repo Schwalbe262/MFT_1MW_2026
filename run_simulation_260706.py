@@ -1594,6 +1594,20 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 time.sleep(1)
             except Exception:
                 pass
+        # 데스크톱 릭 강제 회수: release가 (gRPC 사망 등으로) 조용히 실패하면 AEDT가
+        # 살아남아 count 루프 동안 누적 (노드당 86세션 실측 - 코어 고갈의 주범).
+        # 이 프로세스의 자식으로 남은 AEDT 계열만 정밀 kill (타 태스크 무접촉, HOLD 제외)
+        if not held[0]:
+            try:
+                import psutil
+                for ch in psutil.Process().children(recursive=True):
+                    try:
+                        if any(k in ch.name().lower() for k in ("ansysedt", "3dedy", "ansysem")):
+                            ch.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
 
 def parse_args():
