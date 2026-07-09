@@ -65,6 +65,8 @@ def step(max_samples):
         print(f"[feeder] active {active} >= target - no refill")
         return True
     n_new = min(deficit, (max_samples - st["submitted_samples"] + COUNT_PER_TASK - 1) // COUNT_PER_TASK)
+    # 하드캡: 장부(outstanding) 크기가 target+buffer를 절대 넘지 않게 (262까지 증식 실측)
+    n_new = min(n_new, max(0, TARGET_ACTIVE + BUFFER - len(st.get("outstanding", []))))
     run_args = f"--count {COUNT_PER_TASK} --thermal --headless {CAMPAIGN_SETS}"
     ok = 0
     for _ in range(n_new):
