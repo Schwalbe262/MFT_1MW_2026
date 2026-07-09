@@ -116,6 +116,24 @@ def fetch_result_rows(task_id):
 PROBE_FIX_HASHES_OK = None  # lazy: 수정 커밋 이후 해시 집합
 
 
+
+def fetch_streamed_rows(task_id):
+    """stdout의 RESULT_JSON 라인들 -> DataFrame (새 공유폴더 방식의 기본 회수 경로)"""
+    import io
+    try:
+        out = requests.get(f"{SCHEDULER}/api/tasks/{task_id}/stdout", timeout=30).text
+    except Exception:
+        return None
+    rows = []
+    for l in out.splitlines():
+        if l.startswith("RESULT_JSON "):
+            try:
+                rows.append(json.loads(l[12:]))
+            except Exception:
+                pass
+    return pd.DataFrame(rows) if rows else None
+
+
 def sanitize_bad_probes(df):
     import subprocess
     global PROBE_FIX_HASHES_OK
@@ -183,6 +201,8 @@ def main():
             n_skipped += 1
             continue
         df = fetch_result_rows(t["id"])
+        if df is None or not len(df):
+            df = fetch_streamed_rows(t["id"])
         if df is not None and len(df):
             df["task_id"] = t["id"]
             df["task_name"] = t.get("name", "")
