@@ -671,13 +671,31 @@ def run_thermal_analysis(sim):
     except Exception:
         solution = "ThermalSetup : SteadyState"
 
+    def _fresh_fields_reporter():
+        """pyaedt 0.22 핸들 무효화 대응: 네이티브로 활성 디자인 재획득 후
+        FieldsReporter 모듈을 직접 얻는다 ('NoneType'.CalcStack / gRPC ClcEval 실패의 근원)"""
+        od = ipk.odesign
+        if od is None or getattr(od, "GetModule", None) is None:
+            od = ipk.oproject.SetActiveDesign(ipk.design_name)
+            try:
+                ipk._odesign = od
+            except Exception:
+                pass
+        else:
+            # 활성 디자인이 다른 디자인으로 넘어가 있으면 ClcEval이 잘못된 컨텍스트에서 실행됨
+            try:
+                ipk.oproject.SetActiveDesign(ipk.design_name)
+            except Exception:
+                pass
+        return od.GetModule("FieldsReporter")
+
     def _eval_temp(obj, op):
         """오브젝트/시트의 Temp Maximum/Mean 스칼라 평가.
         1차: 계산기 직접 호출 (로컬/윈도우 검증됨)
         2차: pyaedt get_scalar_field_value (리눅스 gRPC에서 ClcEval 실패 사례 폴백)"""
         is3d = getattr(obj, "is3d", True)
         try:
-            ofr = ipk.ofieldsreporter
+            ofr = _fresh_fields_reporter()
             ofr.CalcStack("clear")
             ofr.EnterQty("Temp")
             if is3d:
