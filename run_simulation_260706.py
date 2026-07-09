@@ -123,8 +123,14 @@ class Simulation():
 
     def __init__(self, desktop=None):
 
-        # SLURM cgroup 코어수에 맞춤 (기본 8; 로컬 등 미설정 환경은 8이 무난)
-        self.NUM_CORE = int(os.environ.get("SLURM_CPUS_PER_TASK", 8) or 8)
+        # 실제 사용가능 코어(cgroup affinity)에 맞춤. SLURM_CPUS_PER_TASK는 packed
+        # 잡에서 잡 전체 값(예: 64)이라 4코어 cgroup에 64스레드를 요청하는 사고 유발
+        # (2026-07-09 심야 전면 저속의 원인). 상한 4 = 검증된 캠페인 구성.
+        try:
+            avail = len(os.sched_getaffinity(0))
+        except AttributeError:
+            avail = 4  # Windows
+        self.NUM_CORE = max(1, min(avail, 4))
         self.NUM_TASK = 1
         self.desktop = desktop
         self.full_model = False
