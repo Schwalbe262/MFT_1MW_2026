@@ -13,7 +13,6 @@ Icepak 열해석 모듈 (설계도면260706 파이프라인 design3)
 
 import math
 import logging
-import os
 
 import pandas as pd
 
@@ -76,6 +75,82 @@ def _require_boundary(result, operation, expected_props=None):
         elif str(actual) != str(expected):
             raise RuntimeError(f"{operation} property {key!r} mismatch: {actual!r} != {expected!r}")
     return result
+
+
+def _require_thermal_geometry(
+    objs,
+    mode,
+    n2_side,
+    require_core_plates=False,
+    require_core_pads=False,
+    require_wcp_plates=False,
+    require_wcp_pads=False,
+):
+    """Require every physical group that the requested thermal model should contain."""
+    required_groups = {
+        "core": objs["core"],
+        "Tx": objs["Tx"],
+        "Rx_main": objs["Rx_main_explicit"] + objs["Rx_main_blocks"],
+    }
+    if int(n2_side) > 0:
+        required_groups["Rx_side"] = objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
+        if mode == "full":
+            required_groups["Rx_side2"] = objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"]
+    if require_core_plates:
+        required_groups["core_plates"] = objs["core_plates"]
+    if require_core_pads:
+        required_groups["core_pads"] = objs["core_pads"]
+    if require_wcp_plates:
+        required_groups["wcp_plates"] = objs["wcp_plates"]
+    if require_wcp_pads:
+        required_groups["wcp_pads"] = objs["wcp_pads"]
+    missing_groups = [name for name, group in required_groups.items() if not group]
+    if missing_groups:
+        raise RuntimeError(f"thermal geometry is missing required groups: {missing_groups}")
+
+
+def _assign_thermal_mesh(ipk, objs):
+    """Apply mandatory mesh controls for thin pads and explicit Rx foil turns."""
+    pad_names = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
+    if pad_names:
+        pad_op_names = ipk.mesh.assign_mesh_level(
+            {name: 2 for name in pad_names}, name="pad_mesh_level"
+        )
+        if not isinstance(pad_op_names, (list, tuple)) or not pad_op_names:
+            raise RuntimeError("pad mesh level assignment returned no mesh operation")
+        operations = {
+            str(getattr(operation, "name", "")): operation
+            for operation in getattr(ipk.mesh, "meshoperations", [])
+        }
+        for item in pad_op_names:
+            operation = item if callable(getattr(item, "update", None)) else operations.get(str(item))
+            update = getattr(operation, "update", None)
+            if not callable(update) or not update():
+                raise RuntimeError(f"pad mesh operation update failed: {item}")
+
+    explicit_rx = []
+    for key in ("Rx_main_explicit", "Rx_side_explicit", "Rx_side2_explicit"):
+        explicit_rx.extend(objs.get(key, []))
+
+    seen = set()
+    for index, obj in enumerate(explicit_rx, start=1):
+        if obj.name in seen:
+            continue
+        seen.add(obj.name)
+        region = ipk.mesh.assign_mesh_region(
+            assignment=[obj.name], level=5, name=f"rx_cutcell_{index:02d}"
+        )
+        if not region:
+            raise RuntimeError(f"Rx cut-cell mesh region creation failed for {obj.name}")
+        settings = getattr(region, "settings", None)
+        if not hasattr(settings, "__setitem__"):
+            raise RuntimeError(f"Rx cut-cell mesh region has no writable settings for {obj.name}")
+        region.auto_update = False
+        settings["MeshRegionResolution"] = 5
+        settings["EnforceCutCellMeshing"] = True
+        update = getattr(region, "update", None)
+        if not callable(update) or not update():
+            raise RuntimeError(f"Rx cut-cell mesh region update failed for {obj.name}")
 
 
 def _split_retained(ipk, objects, plane, sides):
@@ -374,20 +449,20 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
             all_objs = _split_retained(ipk, all_objs, plane="XY", sides="PositiveOnly")
         all_objs = _split_retained(ipk, all_objs, plane="XZ", sides="PositiveOnly")
         _split_retained(ipk, all_objs, plane="YZ", sides="NegativeOnly")
-        existing = set(ipk.modeler.object_names)
-        for key in list(objs.keys()):
-            objs[key] = [o for o in objs[key] if o.name in existing]
 
-        required_groups = {
-            "core": objs["core"],
-            "Tx": objs["Tx"],
-            "Rx_main": objs["Rx_main_explicit"] + objs["Rx_main_blocks"],
-        }
-        if int(df["N2_side"].iloc[0]) > 0:
-            required_groups["Rx_side"] = objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
-        missing_groups = [name for name, group in required_groups.items() if not group]
-        if missing_groups:
-            raise RuntimeError(f"thermal symmetry split removed required groups: {missing_groups}")
+    existing = set(ipk.modeler.object_names)
+    for key in list(objs.keys()):
+        objs[key] = [o for o in objs[key] if o.name in existing]
+
+    _require_thermal_geometry(
+        objs,
+        mode,
+        int(df["N2_side"].iloc[0]),
+        require_core_plates=plate_on,
+        require_core_pads=plate_on and pad_on,
+        require_wcp_plates=wcp_on,
+        require_wcp_pads=wcp_on and float(df["wcp_pad_t"].iloc[0]) > 0,
+    )
 
     return objs
 
@@ -526,9 +601,9 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
             _block(b, p_mid * v / vt)
 
     _rx_group(objs["Rx_main_explicit"], objs["Rx_main_blocks"], "P_Rx_main_group", "Rx_main_0_0")
-    if objs["Rx_side_explicit"]:
+    if objs["Rx_side_explicit"] or objs["Rx_side_blocks"]:
         _rx_group(objs["Rx_side_explicit"], objs["Rx_side_blocks"], "P_Rx_side_group", "Rx_side_0_0")
-    if objs["Rx_side2_explicit"]:
+    if objs["Rx_side2_explicit"] or objs["Rx_side2_blocks"]:
         _rx_group(objs["Rx_side2_explicit"], objs["Rx_side2_blocks"], "P_Rx_side_group", "Rx_side_0_0")
 
     # 코어 그룹: loss_map_phys에 있는 키 우선, 없으면(풀 열해석 + 대칭 EM 조합의 미러) 대응 그룹
@@ -576,12 +651,32 @@ def _assign_boundaries(ipk, sim, objs, eighth=False, mode=None):
             assignment_value=fixed_temperature,
             boundary_name="cold_plates_fixed_T",
         )
-        _require_boundary(
+        boundary = _require_boundary(
             boundary,
             "fixed temperature source cold_plates_fixed_T",
             {
                 "Objects": fixed_objs,
-                "Thermal Condition": "Temperature",
+                "Temperature": fixed_temperature,
+            },
+        )
+        # PyAEDT 0.22 uses ``Temperature`` as its wrapper input, but AEDT
+        # 2025.2 otherwise persists the source as Total Power=0W.
+        old_auto_update = getattr(boundary, "auto_update", None)
+        if old_auto_update is not None:
+            boundary.auto_update = False
+        boundary.props["Thermal Condition"] = "Fixed Temperature"
+        boundary.props["Temperature"] = fixed_temperature
+        update = getattr(boundary, "update", None)
+        if not callable(update) or not update():
+            raise RuntimeError("fixed temperature source cold_plates_fixed_T update failed")
+        if old_auto_update is not None:
+            boundary.auto_update = old_auto_update
+        _require_boundary(
+            boundary,
+            "fixed temperature source cold_plates_fixed_T after update",
+            {
+                "Objects": fixed_objs,
+                "Thermal Condition": "Fixed Temperature",
                 "Temperature": fixed_temperature,
             },
         )
@@ -709,12 +804,7 @@ def run_thermal_analysis(sim):
 
     # 서멀패드 메시 해상 강제: 패드(2mm)가 메시에 안 잡히면 도체가 고정온도 Al에
     # 수치적으로 직결되어 온도가 플레이트에 고정됨 (풀 도메인에서 실측된 함정)
-    try:
-        pad_objs = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
-        if pad_objs:
-            ipk.mesh.assign_mesh_level({name: 2 for name in pad_objs}, name="pad_mesh_level")
-    except Exception as e:
-        logging.warning(f"pad mesh op failed: {e}")
+    _assign_thermal_mesh(ipk, objs)
 
     setup = ipk.create_setup(name="ThermalSetup")
     if not setup:
@@ -769,50 +859,12 @@ def run_thermal_analysis(sim):
     except Exception:
         solution = "ThermalSetup : SteadyState"
 
-    def _fresh_fields_reporter():
-        """pyaedt 0.22 핸들 무효화 대응: 네이티브로 활성 디자인 재획득 후
-        FieldsReporter 모듈을 직접 얻는다 ('NoneType'.CalcStack / gRPC ClcEval 실패의 근원)"""
-        _, od = _activate_thermal_design(ipk)
-        return od.GetModule("FieldsReporter")
-
     def _post_of(app):
-        """래퍼에 따라 .post가 함수인 경우(실측: 'function' object has no attribute
-        'get_scalar_field_value') 호출해서 실제 PostProcessor를 얻는다"""
+        """Return the actual post processor when a wrapper exposes it as a callable."""
         po = app.post
-        if callable(po) and not hasattr(po, "get_scalar_field_value"):
+        if callable(po) and not hasattr(po, "create_field_summary"):
             po = po()
         return po
-
-    def _eval_temp(obj, op):
-        """오브젝트/시트의 Temp Maximum/Mean 스칼라 평가.
-        1차: 계산기 직접 호출 (로컬/윈도우 검증됨)
-        2차: pyaedt get_scalar_field_value (리눅스 gRPC에서 ClcEval 실패 사례 폴백)"""
-        is3d = getattr(obj, "is3d", True)
-        try:
-            ofr = _fresh_fields_reporter()
-            ofr.CalcStack("clear")
-            ofr.EnterQty("Temp")
-            if is3d:
-                ofr.EnterVol(obj.name)
-            else:
-                ofr.EnterSurf(obj.name)
-            ofr.CalcOp("Maximum" if op == "max" else "Mean")
-            ofr.ClcEval(solution, [])
-            value = float(ofr.GetTopEntryValue(solution, [])[0])
-            if not math.isfinite(value):
-                raise ValueError(f"non-finite calculator value for {obj.name}: {value}")
-            return value
-        except Exception:
-            v = _post_of(native_ipk).get_scalar_field_value(
-                "Temp", scalar_function=("Maximum" if op == "max" else "Mean"),
-                solution=solution, object_name=obj.name,
-                object_type=("volume" if is3d else "surface"))
-            if v is None or v is False:
-                raise
-            value = float(v)
-            if not math.isfinite(value):
-                raise ValueError(f"non-finite scalar value for {obj.name}: {value}")
-            return value
 
     temps = {}
     probe = []
@@ -827,8 +879,8 @@ def run_thermal_analysis(sim):
         probe.append((o, f"T_max_{o.name}", "max"))
 
     # ---- 1차: Field Summary 일괄 (호출 1회, GUI/리눅스 공통 신뢰 경로) ----
-    # 계산기(ClcEval) 오브젝트당 호출은 gRPC에서 상습 실패 + 에러 폭탄 유발이라 폴백으로 강등
-    # (2026-07-10 GUI 재현: 계산기/스칼라 전멸 후 field summary가 12/12 구조)
+    # Calculator/ClcEval calls are intentionally excluded: they do not recover
+    # objects with zero mesh volume and repeatedly fail through gRPC.
     def _field_summary_bulk(entries):
         fs = _post_of(native_ipk).create_field_summary()
         seen = set()
@@ -880,30 +932,8 @@ def run_thermal_analysis(sim):
             _time.sleep(10)
     n_fs = len(temps)
 
-    # ---- 2차: Windows에서만 누락분 계산기 폴백 ----
-    # Linux gRPC의 CalcStack/get_scalar_field_value는 개체별로 연속 실패하여
-    # 태스크를 오래 붙잡는다. Windows에서도 필수 max 항목을 우선하고
-    # 최대 16개 항목만 시도한다.
     n_calc = 0
     calc_attempts = 0
-    if os.name == "nt":
-        missing_by_col = {col: (obj, col, op) for obj, col, op in probe if col not in temps}
-        fallback_entries = sorted(
-            missing_by_col.values(),
-            key=lambda entry: (
-                0 if entry[1].startswith("T_max_") else (1 if entry[2] == "max" else 2),
-                entry[1],
-            ),
-        )[:16]
-        for obj, col, op in fallback_entries:
-            calc_attempts += 1
-            try:
-                temps[col] = _eval_temp(obj, op)
-                n_calc += 1
-            except Exception:
-                pass
-    elif any(col not in temps for col in expected_cols):
-        logging.warning("[thermal] Linux calculator fallback skipped; Field Summary remains authoritative.")
 
     missing_cols = [col for col in expected_cols if col not in temps]
     n_fail = len(missing_cols)
@@ -929,18 +959,20 @@ def run_thermal_analysis(sim):
     group_values = {
         key: _group_max(objects) for key, objects in group_objects.items()
     }
-    group_present = {key: bool(objects) for key, objects in group_objects.items()}
     group_bits = {
         "T_max_Tx": 1,
         "T_max_Rx_main": 2,
         "T_max_Rx_side": 4,
         "T_max_core": 8,
     }
-    required_group_mask = sum(bit for key, bit in group_bits.items() if group_present[key])
-    required_group_count = sum(1 for present in group_present.values() if present)
+    required_keys = ["T_max_Tx", "T_max_Rx_main", "T_max_core"]
+    if int(df["N2_side"].iloc[0]) > 0:
+        required_keys.append("T_max_Rx_side")
+    required_group_mask = sum(group_bits[key] for key in required_keys)
+    required_group_count = len(required_keys)
     required_missing_count = sum(
-        1 for key, present in group_present.items()
-        if present and not math.isfinite(float(group_values[key]))
+        1 for key in required_keys
+        if not group_objects[key] or not math.isfinite(float(group_values[key]))
     )
     required_complete = required_missing_count == 0 and required_group_count > 0
     solution_data_available = n_fs > 0

@@ -17,8 +17,17 @@ class _Object:
 
 
 class _Boundary:
-    def __init__(self, props=None):
+    def __init__(self, props=None, update_result=True, post_update_props=None):
         self.props = props or {}
+        self.auto_update = True
+        self.update_result = update_result
+        self.post_update_props = post_update_props or {}
+        self.update_calls = 0
+
+    def update(self):
+        self.update_calls += 1
+        self.props.update(self.post_update_props)
+        return self.update_result
 
 
 class _DesignHandle:
@@ -71,10 +80,19 @@ class _Region:
 
 
 class _BoundaryIcepak:
-    def __init__(self, fail_boundary=None, fixed_temperature=None):
+    def __init__(
+        self,
+        fail_boundary=None,
+        fixed_temperature=None,
+        fixed_update_result=True,
+        fixed_post_update_props=None,
+    ):
         self.fail_boundary = fail_boundary
         self.fixed_temperature = fixed_temperature
+        self.fixed_update_result = fixed_update_result
+        self.fixed_post_update_props = fixed_post_update_props
         self.source_calls = []
+        self.source_boundaries = []
         self.ambient_calls = []
         self.region = _Region()
         self.modeler = SimpleNamespace(
@@ -91,11 +109,13 @@ class _BoundaryIcepak:
         if kwargs["boundary_name"] == self.fail_boundary:
             return False
         temperature = self.fixed_temperature or kwargs["assignment_value"]
-        return _Boundary({
+        boundary = _Boundary({
             "Objects": list(kwargs["assignment"]),
             "Thermal Condition": kwargs["thermal_condition"],
             "Temperature": temperature,
-        })
+        }, self.fixed_update_result, self.fixed_post_update_props)
+        self.source_boundaries.append(boundary)
+        return boundary
 
     def set_ambient_temp(self, value):
         self.ambient_calls.append(value)
@@ -199,6 +219,7 @@ class ThermalStabilityTest(unittest.TestCase):
             df_plus=pd.DataFrame({
                 "thermal_symmetry": ["eighth"],
                 "thermal_max_iterations": [100],
+                "N2_side": [1 if include_side else 0],
             }),
             input_df=pd.DataFrame([{}]),
             NUM_CORE=4,
@@ -226,8 +247,8 @@ class ThermalStabilityTest(unittest.TestCase):
             stack.enter_context(patch.object(thermal, "_create_probe_sheets", return_value=[]))
             stack.enter_context(patch.object(thermal, "_assign_losses"))
             stack.enter_context(patch.object(thermal, "_assign_boundaries"))
+            stack.enter_context(patch.object(thermal, "_assign_thermal_mesh"))
             stack.enter_context(patch("time.sleep"))
-            stack.enter_context(patch.object(thermal.os, "name", "posix"))
             result = thermal.run_thermal_analysis(sim)
         return ipk, result.iloc[0]
 
@@ -298,6 +319,24 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(row["thermal_solution_data_available"], 0)
         self.assertEqual(row["thermal_missing_count"], 6)
 
+    def test_side_requirement_comes_from_input_not_surviving_objects(self):
+        missing_side = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+        }
+        _ipk, row = self._run(None, [missing_side] * 3, include_side=True)
+        self.assertEqual(row["thermal_required_group_mask"], 15)
+        self.assertEqual(row["thermal_required_group_count"], 4)
+        self.assertEqual(row["thermal_required_missing_count"], 1)
+        self.assertEqual(row["thermal_solved"], 0)
+
+        complete = dict(missing_side, Rx_side_0=(89.0, 73.0))
+        _ipk, row = self._run(None, [complete], include_side=True)
+        self.assertEqual(row["thermal_required_group_mask"], 15)
+        self.assertEqual(row["thermal_required_missing_count"], 0)
+        self.assertEqual(row["thermal_solved"], 1)
+
     def test_setup_creation_and_update_fail_hard(self):
         with self.assertRaisesRegex(RuntimeError, "create_setup returned no ThermalSetup"):
             self._run(None, [{}], setup_result=False)
@@ -359,6 +398,31 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(injected, {"Tx_main_0": 12.5})
         self.assertEqual(sim.thermal_injected, injected)
 
+    def test_blocks_only_rx_side_still_receives_group_loss(self):
+        side_block = _Object("Rx_side_block", volume=4.0)
+        objects = self._loss_objects()
+        objects["Tx"] = []
+        objects["Rx_side_blocks"] = [side_block]
+        sim = SimpleNamespace(
+            df_plus=pd.DataFrame({"n_core_group": [0]}),
+            loss_map_phys={"P_Rx_main_group": 0.0, "P_Rx_side_group": 25.0},
+        )
+
+        def assign_solid_block(name, power):
+            return _Boundary({
+                "Block Type": "Solid",
+                "Objects": [name],
+                "Total Power": power,
+            })
+
+        injected = thermal._assign_losses(
+            SimpleNamespace(assign_solid_block=assign_solid_block),
+            sim,
+            objects,
+            mode="full",
+        )
+        self.assertEqual(injected, {"Rx_side_block": 25.0})
+
     def test_fixed_temperature_uses_supported_condition_and_props(self):
         ipk = _BoundaryIcepak()
         objs = {
@@ -370,12 +434,23 @@ class ThermalStabilityTest(unittest.TestCase):
         call = ipk.source_calls[0]
         self.assertEqual(call["thermal_condition"], "Temperature")
         self.assertEqual(call["assignment_value"], "45.0cel")
+        boundary = ipk.source_boundaries[0]
+        self.assertEqual(boundary.update_calls, 1)
+        self.assertEqual(boundary.props["Thermal Condition"], "Fixed Temperature")
+        self.assertEqual(boundary.props["Temperature"], "45.0cel")
+        self.assertTrue(boundary.auto_update)
         self.assertEqual(ipk.ambient_calls, [50.0])
 
     def test_fixed_temperature_props_mismatch_fails_hard(self):
-        ipk = _BoundaryIcepak(fixed_temperature="AmbientTemp")
+        ipk = _BoundaryIcepak(fixed_post_update_props={"Temperature": "AmbientTemp"})
         objs = {"core_plates": [_Object("core_plate")], "wcp_plates": []}
         with self.assertRaisesRegex(RuntimeError, "property 'Temperature' mismatch"):
+            thermal._assign_boundaries(ipk, self._boundary_sim(), objs, eighth=True, mode="eighth")
+
+    def test_fixed_temperature_update_false_fails_hard(self):
+        ipk = _BoundaryIcepak(fixed_update_result=False)
+        objs = {"core_plates": [_Object("core_plate")], "wcp_plates": []}
+        with self.assertRaisesRegex(RuntimeError, "fixed temperature source.*update failed"):
             thermal._assign_boundaries(ipk, self._boundary_sim(), objs, eighth=True, mode="eighth")
 
     def test_fixed_temperature_false_return_fails_hard(self):
@@ -393,6 +468,126 @@ class ThermalStabilityTest(unittest.TestCase):
                     RuntimeError, f"thermal boundary {boundary_name} returned no boundary"
                 ):
                     thermal._assign_boundaries(ipk, self._boundary_sim(), objs, eighth=True, mode="eighth")
+
+    def test_required_geometry_validates_full_side_groups_separately(self):
+        base = {
+            "core": [_Object("core")],
+            "Tx": [_Object("Tx")],
+            "Rx_main_explicit": [_Object("Rx_main")],
+            "Rx_main_blocks": [],
+            "Rx_side_explicit": [_Object("Rx_side")],
+            "Rx_side_blocks": [],
+            "Rx_side2_explicit": [_Object("Rx_side2")],
+            "Rx_side2_blocks": [],
+        }
+        thermal._require_thermal_geometry(base, "full", 1)
+
+        missing_side2 = dict(base, Rx_side2_explicit=[])
+        with self.assertRaisesRegex(RuntimeError, "Rx_side2"):
+            thermal._require_thermal_geometry(missing_side2, "full", 1)
+
+        missing_side = dict(base, Rx_side_explicit=[])
+        with self.assertRaisesRegex(RuntimeError, "Rx_side"):
+            thermal._require_thermal_geometry(missing_side, "full", 1)
+
+        thermal._require_thermal_geometry(missing_side2, "eighth", 1)
+
+    def test_required_geometry_includes_enabled_cooling_hardware(self):
+        base = {
+            "core": [_Object("core")],
+            "Tx": [_Object("Tx")],
+            "Rx_main_explicit": [_Object("Rx_main")],
+            "Rx_main_blocks": [],
+            "Rx_side_explicit": [],
+            "Rx_side_blocks": [],
+            "Rx_side2_explicit": [],
+            "Rx_side2_blocks": [],
+            "core_plates": [],
+            "core_pads": [],
+            "wcp_plates": [],
+            "wcp_pads": [],
+        }
+        for keyword, expected in (
+            ("require_core_plates", "core_plates"),
+            ("require_core_pads", "core_pads"),
+            ("require_wcp_plates", "wcp_plates"),
+            ("require_wcp_pads", "wcp_pads"),
+        ):
+            with self.subTest(keyword=keyword), self.assertRaisesRegex(RuntimeError, expected):
+                thermal._require_thermal_geometry(base, "eighth", 0, **{keyword: True})
+
+    def test_explicit_rx_gets_per_object_cutcell_mesh(self):
+        created = []
+
+        def assign_region(**kwargs):
+            region = SimpleNamespace(
+                settings={}, auto_update=True, update=Mock(return_value=True)
+            )
+            created.append((kwargs, region))
+            return region
+
+        pad_mesh_operation = SimpleNamespace(name="pad_mesh", update=Mock(return_value=True))
+        mesh = SimpleNamespace(
+            assign_mesh_level=Mock(return_value=["pad_mesh"]),
+            assign_mesh_region=Mock(side_effect=assign_region),
+            meshoperations=[pad_mesh_operation],
+        )
+        rx0 = _Object("Rx_main_0")
+        rx1 = _Object("Rx_side_0")
+        objs = {
+            "wcp_pads": [_Object("wcp_pad")],
+            "core_pads": [_Object("core_pad")],
+            "Rx_main_explicit": [rx0],
+            "Rx_side_explicit": [rx1, rx0],
+            "Rx_side2_explicit": [],
+            "Rx_main_blocks": [_Object("Rx_main_block")],
+        }
+        thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), objs)
+
+        mesh.assign_mesh_level.assert_called_once_with(
+            {"wcp_pad": 2, "core_pad": 2}, name="pad_mesh_level"
+        )
+        pad_mesh_operation.update.assert_called_once_with()
+        self.assertEqual(len(created), 2)
+        self.assertEqual([call[0]["assignment"] for call in created], [["Rx_main_0"], ["Rx_side_0"]])
+        for kwargs, region in created:
+            self.assertEqual(kwargs["level"], 5)
+            self.assertEqual(region.settings["MeshRegionResolution"], 5)
+            self.assertTrue(region.settings["EnforceCutCellMeshing"])
+            self.assertFalse(region.auto_update)
+            region.update.assert_called_once_with()
+
+    def test_thermal_mesh_failures_are_not_silenced(self):
+        empty = {
+            "wcp_pads": [],
+            "core_pads": [],
+            "Rx_main_explicit": [_Object("Rx_main_0")],
+            "Rx_side_explicit": [],
+            "Rx_side2_explicit": [],
+        }
+        mesh = SimpleNamespace(
+            assign_mesh_level=Mock(return_value=[]),
+            assign_mesh_region=Mock(return_value=False),
+            meshoperations=[],
+        )
+        with self.assertRaisesRegex(RuntimeError, "creation failed"):
+            thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), empty)
+
+        region = SimpleNamespace(settings={}, auto_update=True, update=Mock(return_value=False))
+        mesh.assign_mesh_region.return_value = region
+        with self.assertRaisesRegex(RuntimeError, "update failed"):
+            thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), empty)
+
+        pad_only = dict(empty, Rx_main_explicit=[], wcp_pads=[_Object("pad")])
+        mesh.assign_mesh_level.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "pad mesh level"):
+            thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), pad_only)
+
+        failed_pad_op = SimpleNamespace(name="pad_mesh", update=Mock(return_value=False))
+        mesh.assign_mesh_level.return_value = ["pad_mesh"]
+        mesh.meshoperations = [failed_pad_op]
+        with self.assertRaisesRegex(RuntimeError, "pad mesh operation update failed"):
+            thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), pad_only)
 
     def test_split_requires_truthy_result_and_live_retained_object(self):
         obj = _Object("core_1")

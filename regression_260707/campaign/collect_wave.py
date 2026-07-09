@@ -9,8 +9,10 @@
   python collect_wave.py --prefix mft-camp --all       # 전체 회수
 """
 import argparse
+import glob
 import io
 import json
+import math
 import os
 import tempfile
 import time
@@ -24,6 +26,13 @@ SCHEDULER = "http://127.0.0.1:8000"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(HERE, "..", "data", "dataset")
 LOCAL_RESULTS_CSV = os.path.join(HERE, "..", "..", "simulation_results_260706.csv")
+LOCAL_RESULTS_PARTS_DIR = os.path.join(HERE, "..", "..", "results_parts_260706")
+
+SOURCE_RANK_COLUMN = "_collector_source_rank"
+SOURCE_RANK_TERMINAL_CSV = 10
+SOURCE_RANK_JSON = 20
+SOURCE_RANK_LOCAL_CSV = 30
+SOURCE_RANK_LOCAL_PART = 40
 
 FETCH_ATTEMPTS = 3
 RETRY_BASE_SECONDS = 0.5
@@ -147,7 +156,7 @@ def _load_cache():
         with open(CACHE_PATH, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"nodata": [], "harvested": []}
+        return {"nodata": [], "harvested": [], "local_parts": []}
 
 
 def _save_cache(c):
@@ -158,15 +167,21 @@ def _save_cache(c):
     os.replace(tmp, CACHE_PATH)
 
 
-def _commit_pending_cache(pending_harvested, pending_nodata):
+def _commit_pending_cache(pending_harvested, pending_nodata, pending_local_parts=()):
     """Merge pending terminal IDs into the latest on-disk cache."""
-    if not pending_harvested and not pending_nodata:
+    if not pending_harvested and not pending_nodata and not pending_local_parts:
         return
     cache = _load_cache()
     harvested = cache.setdefault("harvested", [])
     nodata = cache.setdefault("nodata", [])
+    local_parts = cache.setdefault("local_parts", [])
     harvested.extend(tid for tid in pending_harvested if tid not in harvested)
     nodata.extend(tid for tid in pending_nodata if tid not in nodata)
+    known_local_parts = set(local_parts)
+    for part in pending_local_parts:
+        if part not in known_local_parts:
+            local_parts.append(part)
+            known_local_parts.add(part)
     _save_cache(cache)
 
 
@@ -187,6 +202,7 @@ def fetch_result_rows(task_id, out=None):
 # 프로브 전치 버그 수정 커밋 (2026-07-07). 이전 코드로 돌린 행은 _side/core_center
 # 프로브가 전치된 시트에서 평가된 값이라 무효 -> NaN 처리 (T_max_*, leeward는 유효)
 PROBE_FIX_HASHES_OK = None  # lazy: 수정 커밋 이후 해시 집합
+PROBE_FIX_COMMIT = "6245ae84ba2734d2f1b6619fba3b2a8f15d20f42"
 
 
 
@@ -204,6 +220,69 @@ def fetch_streamed_rows(task_id, out=None):
     return pd.DataFrame(rows) if rows else None
 
 
+def _tag_source(frame, rank):
+    tagged = frame.copy()
+    tagged[SOURCE_RANK_COLUMN] = rank
+    return tagged
+
+
+def _deduplicate_ranked_rows(frame, dedup_keys):
+    """Deduplicate after ordering rows by their durable source precedence."""
+    if SOURCE_RANK_COLUMN in frame.columns:
+        frame = frame.sort_values(SOURCE_RANK_COLUMN, kind="stable")
+    return deduplicate_rows(frame, dedup_keys)
+
+
+def load_local_result_frames(cache):
+    """Load the current CSV and only parquet parts not committed previously."""
+    frames = []
+    pending_parts = []
+    read_errors = 0
+
+    if os.path.isfile(LOCAL_RESULTS_CSV):
+        try:
+            # The producer uses the same lock for append and schema rotation.
+            # saved_at/project_name are its final columns, so requiring both also
+            # rejects a row left truncated by an interrupted append.
+            with FileLock(LOCAL_RESULTS_CSV + ".lock"):
+                frame = pd.read_csv(LOCAL_RESULTS_CSV, on_bad_lines="skip")
+            complete = _complete_key_mask(frame, ["project_name", "saved_at"])
+            incomplete_count = int((~complete).sum())
+            if incomplete_count:
+                print(f"local csv incomplete rows skipped: {incomplete_count}")
+                frame = frame.loc[complete].reset_index(drop=True)
+            if len(frame):
+                frames.append(_tag_source(frame, SOURCE_RANK_LOCAL_CSV))
+                print(f"local csv rows: {len(frame)}")
+        except Exception as exc:
+            read_errors += 1
+            print(f"local csv read failed: {exc}")
+
+    cached_parts = set(cache.get("local_parts", []))
+    pattern = os.path.join(LOCAL_RESULTS_PARTS_DIR, "*.parquet")
+    for path in sorted(glob.glob(pattern)):
+        part_id = os.path.basename(path)
+        if part_id in cached_parts:
+            continue
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as exc:
+            # A part can be visible before its parquet footer is complete. Leave it
+            # uncached so a later collector pass retries it.
+            read_errors += 1
+            print(f"local parquet read failed ({part_id}): {exc}")
+            continue
+        pending_parts.append(part_id)
+        if len(frame):
+            frames.append(_tag_source(frame, SOURCE_RANK_LOCAL_PART))
+
+    if pending_parts:
+        print(f"local parquet parts: {len(pending_parts)} new files")
+    if read_errors:
+        print(f"local read errors: {read_errors} (left uncached for retry)")
+    return frames, pending_parts
+
+
 def sanitize_bad_probes(df):
     import subprocess
     global PROBE_FIX_HASHES_OK
@@ -211,22 +290,45 @@ def sanitize_bad_probes(df):
         return df, 0
     if PROBE_FIX_HASHES_OK is None:
         try:
-            out = subprocess.run(["git", "log", "--format=%h", "8f00000..HEAD"],
-                                 capture_output=True, text=True, cwd=os.path.join(HERE, "..", ".."))
-            # 수정 커밋부터 HEAD까지의 해시 (실패 시 빈 집합 -> 전부 유효 취급 안 함)
-            out2 = subprocess.run(["git", "log", "--format=%h"],
-                                  capture_output=True, text=True, cwd=os.path.join(HERE, "..", ".."))
-            all_h = out2.stdout.split()
-            # 수정 커밋: 'Fix transposed probe sheets' 메시지 기준
-            log = subprocess.run(["git", "log", "--format=%h %s"],
-                                 capture_output=True, text=True, cwd=os.path.join(HERE, "..", "..")).stdout
-            fix_h = next((l.split()[0] for l in log.splitlines() if "transposed probe" in l), None)
-            PROBE_FIX_HASHES_OK = set(all_h[:all_h.index(fix_h) + 1]) if fix_h in all_h else set()
-        except Exception:
-            PROBE_FIX_HASHES_OK = set()
-    bad_cols = [c for c in df.columns
-                if c.startswith("Tprobe_") and ("_side_" in c or "core_center" in c)]
-    mask = ~df["git_hash"].isin(PROBE_FIX_HASHES_OK)
+            git_run = {
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "cwd": os.path.join(HERE, "..", ".."),
+            }
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", PROBE_FIX_COMMIT, "HEAD"],
+                check=True,
+                **git_run,
+            )
+            descendants = subprocess.run(
+                ["git", "rev-list", "--ancestry-path", f"{PROBE_FIX_COMMIT}..HEAD"],
+                check=True,
+                **git_run,
+            ).stdout.split()
+            PROBE_FIX_HASHES_OK = {PROBE_FIX_COMMIT}
+            PROBE_FIX_HASHES_OK.update(descendants)
+        except Exception as exc:
+            raise RuntimeError("probe-fix git ancestry classification failed") from exc
+    bad_cols = [
+        column for column in df.columns
+        if column.startswith("Tprobe_")
+        and (
+            column.endswith("_side_max")
+            or column.endswith("_side_mean")
+            or column.startswith("Tprobe_core_center_")
+        )
+    ]
+    def _is_post_fix(value):
+        if not isinstance(value, str):
+            return False
+        revision = value.strip().lower()
+        if not revision:
+            return False
+        return any(commit.startswith(revision) for commit in PROBE_FIX_HASHES_OK)
+
+    mask = ~df["git_hash"].map(_is_post_fix)
     n = int(mask.sum())
     if n and bad_cols:
         df.loc[mask, bad_cols] = float("nan")
@@ -241,6 +343,57 @@ def convergence_filter(df, max_err=1.5):
     return df[keep], int((~keep).sum())
 
 
+def normalize_thermal_validity(df):
+    """Demote legacy thermal success flags when required physical groups are incomplete."""
+    if "thermal_solved" not in df.columns:
+        return df, 0
+    solved = pd.to_numeric(df["thermal_solved"], errors="coerce").eq(1)
+    if not solved.any():
+        return df, 0
+
+    required = ("T_max_Tx", "T_max_Rx_main", "T_max_core")
+    complete = pd.Series(True, index=df.index)
+    for column in required:
+        if column not in df.columns:
+            complete &= False
+        else:
+            complete &= pd.to_numeric(df[column], errors="coerce").map(math.isfinite)
+
+    if "N2_side" not in df.columns:
+        complete &= False
+        side_required = pd.Series(False, index=df.index)
+    else:
+        n2_side = pd.to_numeric(df["N2_side"], errors="coerce")
+        complete &= n2_side.notna()
+        side_required = n2_side.gt(0)
+    if "T_max_Rx_side" not in df.columns:
+        complete &= ~side_required
+    else:
+        side_finite = pd.to_numeric(df["T_max_Rx_side"], errors="coerce").map(math.isfinite)
+        complete &= ~side_required | side_finite
+
+    expected_mask = pd.Series(11, index=df.index).where(~side_required, 15)
+    for column, predicate in (
+        ("thermal_required_group_mask", lambda values: values.eq(expected_mask)),
+        ("thermal_required_missing_count", lambda values: values.eq(0)),
+        ("thermal_extraction_complete", lambda values: values.eq(1)),
+    ):
+        if column in df.columns:
+            values = pd.to_numeric(df[column], errors="coerce")
+            has_contract = values.notna()
+            complete &= ~has_contract | predicate(values)
+
+    invalid = solved & ~complete
+    count = int(invalid.sum())
+    if count:
+        df = df.copy()
+        df.loc[invalid, "thermal_solved"] = 0
+        if "result_valid_thermal" not in df.columns:
+            df["result_valid_thermal"] = float("nan")
+        df.loc[invalid, "result_valid_thermal"] = 0
+    return df, count
+
+
 def _row_hashes(df, columns):
     normalized = df.loc[:, columns].astype("string").fillna("<NA>")
     return pd.util.hash_pandas_object(normalized, index=False)
@@ -248,7 +401,7 @@ def _row_hashes(df, columns):
 
 def _fallback_columns(frame, other=None):
     """Columns used for legacy identity, excluding collector-added metadata."""
-    excluded = {"task_id", "task_name"}
+    excluded = {"task_id", "task_name", SOURCE_RANK_COLUMN}
     if other is None:
         return [c for c in frame.columns if c not in excluded]
     return [c for c in frame.columns if c in other.columns and c not in excluded]
@@ -282,8 +435,8 @@ def deduplicate_rows(frame, dedup_keys):
 
 
 def select_new_unique_rows(incoming, old, dedup_keys):
-    """Select incoming sample identities that are absent from the master."""
-    incoming = deduplicate_rows(incoming, dedup_keys)
+    """Select absent identities and higher-ranked replacements from the master."""
+    incoming = _deduplicate_ranked_rows(incoming, dedup_keys)
     if old is None or old.empty:
         return incoming.reset_index(drop=True)
 
@@ -292,12 +445,30 @@ def select_new_unique_rows(incoming, old, dedup_keys):
     incoming_complete = _complete_key_mask(incoming, dedup_keys)
     if can_compare_keys and incoming_complete.any():
         old_complete = _complete_key_mask(old, dedup_keys)
-        old_key_hashes = set(
-            _row_hashes(old.loc[old_complete], dedup_keys).tolist())
+        old_key_hash_series = _row_hashes(old.loc[old_complete], dedup_keys)
+        old_key_hashes = set(old_key_hash_series.tolist())
         incoming_key_hashes = _row_hashes(
             incoming.loc[incoming_complete], dedup_keys)
-        new_mask.loc[incoming_complete] = ~incoming_key_hashes.isin(
-            old_key_hashes).to_numpy()
+        accepted = ~incoming_key_hashes.isin(old_key_hashes)
+        if SOURCE_RANK_COLUMN in incoming.columns:
+            if SOURCE_RANK_COLUMN in old.columns:
+                old_ranks = pd.to_numeric(
+                    old.loc[old_complete, SOURCE_RANK_COLUMN], errors="coerce"
+                ).fillna(0)
+            else:
+                old_ranks = pd.Series(0, index=old_key_hash_series.index, dtype=float)
+            old_rank_by_hash = {}
+            for key_hash, rank in zip(old_key_hash_series.tolist(), old_ranks.tolist()):
+                old_rank_by_hash[key_hash] = max(old_rank_by_hash.get(key_hash, 0), rank)
+            incoming_ranks = pd.to_numeric(
+                incoming.loc[incoming_complete, SOURCE_RANK_COLUMN], errors="coerce"
+            ).fillna(0)
+            higher_rank = [
+                rank > old_rank_by_hash.get(key_hash, float("inf"))
+                for key_hash, rank in zip(incoming_key_hashes.tolist(), incoming_ranks.tolist())
+            ]
+            accepted |= pd.Series(higher_rank, index=accepted.index)
+        new_mask.loc[incoming_complete] = accepted.to_numpy()
 
     fallback_mask = ~incoming_complete if can_compare_keys else pd.Series(
         True, index=incoming.index)
@@ -310,6 +481,66 @@ def select_new_unique_rows(incoming, old, dedup_keys):
             new_mask.loc[fallback_mask] = ~incoming_hashes.isin(
                 old_hashes).to_numpy()
     return incoming.loc[new_mask].reset_index(drop=True)
+
+
+def _drop_replaced_key_rows(old, replacements, dedup_keys):
+    """Remove old complete-key rows superseded by accepted incoming rows."""
+    if old is None or old.empty:
+        return old
+    old_complete = _complete_key_mask(old, dedup_keys)
+    replacement_complete = _complete_key_mask(replacements, dedup_keys)
+    if not old_complete.any() or not replacement_complete.any():
+        return old
+    replacement_hashes = set(
+        _row_hashes(replacements.loc[replacement_complete], dedup_keys).tolist())
+    replaced = pd.Series(False, index=old.index)
+    replaced.loc[old_complete] = _row_hashes(
+        old.loc[old_complete], dedup_keys).isin(replacement_hashes).to_numpy()
+    return old.loc[~replaced].reset_index(drop=True)
+
+
+def _source_rank_rows(frame, dedup_keys):
+    """Return one numeric source-rank row per complete sample identity."""
+    columns = list(dedup_keys) + [SOURCE_RANK_COLUMN]
+    if frame is None or frame.empty or not all(c in frame.columns for c in dedup_keys):
+        return pd.DataFrame(columns=columns)
+    complete = _complete_key_mask(frame, dedup_keys)
+    if not complete.any():
+        return pd.DataFrame(columns=columns)
+    ranked = frame.loc[complete, list(dedup_keys)].copy()
+    if SOURCE_RANK_COLUMN in frame.columns:
+        ranked[SOURCE_RANK_COLUMN] = pd.to_numeric(
+            frame.loc[complete, SOURCE_RANK_COLUMN], errors="coerce").fillna(0).to_numpy()
+    else:
+        ranked[SOURCE_RANK_COLUMN] = 0
+    return _deduplicate_ranked_rows(ranked, dedup_keys).reset_index(drop=True)
+
+
+def _attach_source_ranks(frame, sidecar, dedup_keys):
+    """Attach sidecar provenance for comparison without exposing it to training."""
+    if frame is None:
+        return None
+    ranked = frame.copy()
+    if SOURCE_RANK_COLUMN in ranked.columns:
+        legacy_rank = pd.to_numeric(ranked[SOURCE_RANK_COLUMN], errors="coerce").fillna(0)
+        ranked = ranked.drop(columns=[SOURCE_RANK_COLUMN])
+    else:
+        legacy_rank = pd.Series(0, index=ranked.index, dtype=float)
+    ranked["_collector_legacy_rank"] = legacy_rank.to_numpy()
+
+    sidecar = _source_rank_rows(sidecar, dedup_keys)
+    if len(sidecar) and all(c in ranked.columns for c in dedup_keys):
+        sidecar = sidecar.rename(columns={SOURCE_RANK_COLUMN: "_collector_saved_rank"})
+        ranked = ranked.merge(sidecar, on=list(dedup_keys), how="left", sort=False)
+        saved_rank = pd.to_numeric(
+            ranked.pop("_collector_saved_rank"), errors="coerce").fillna(0)
+    else:
+        saved_rank = pd.Series(0, index=ranked.index, dtype=float)
+    legacy_rank = pd.to_numeric(
+        ranked.pop("_collector_legacy_rank"), errors="coerce").fillna(0)
+    ranked[SOURCE_RANK_COLUMN] = pd.concat(
+        [legacy_rank, saved_rank], axis=1).max(axis=1)
+    return ranked
 
 
 def _stage_path(target):
@@ -343,7 +574,7 @@ def _stage_manifest(manifest, target):
 
 
 def _replace_staged(staged_targets):
-    """Install fully serialized files; the master is deliberately replaced last."""
+    """Install fully serialized files in the caller's recovery-safe order."""
     try:
         for staged, target in staged_targets:
             os.replace(staged, target)
@@ -353,24 +584,35 @@ def _replace_staged(staged_targets):
                 os.remove(staged)
 
 
-def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_nodata=()):
+def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_nodata=(),
+                  pending_local_parts=()):
     """Merge rows and terminal cache state under one inter-process lock."""
     master_path = os.path.join(DATASET_DIR, "train.parquet")
     manifest_path = os.path.join(DATASET_DIR, "manifest.json")
+    source_rank_path = os.path.join(DATASET_DIR, "source_ranks.parquet")
     lock_path = master_path + ".lock"
     with FileLock(lock_path):
         old = pd.read_parquet(master_path) if os.path.isfile(master_path) else None
-        new_rows = select_new_unique_rows(merged, old, dedup_keys)
+        source_ranks = (
+            pd.read_parquet(source_rank_path) if os.path.isfile(source_rank_path) else None
+        )
+        ranked_old = _attach_source_ranks(old, source_ranks, dedup_keys)
+        new_rows = select_new_unique_rows(merged, ranked_old, dedup_keys)
         new_unique_rows = len(new_rows)
         if not new_unique_rows:
-            _commit_pending_cache(pending_harvested, pending_nodata)
+            _commit_pending_cache(
+                pending_harvested, pending_nodata, pending_local_parts)
             return new_unique_rows, 0 if old is None else len(old), master_path
 
         stamp = datetime.now().strftime("%y%m%d_%H%M%S_%f")
         part_path = os.path.join(
             DATASET_DIR, f"collected_{prefix.replace('/', '_')}_{stamp}.parquet")
-        allf = new_rows if old is None else pd.concat(
-            [old, new_rows], ignore_index=True, sort=False)
+        retained_old = _drop_replaced_key_rows(ranked_old, new_rows, dedup_keys)
+        ranked_allf = new_rows if retained_old is None else pd.concat(
+            [retained_old, new_rows], ignore_index=True, sort=False)
+        source_ranks = _source_rank_rows(ranked_allf, dedup_keys)
+        persisted_new_rows = new_rows.drop(columns=[SOURCE_RANK_COLUMN], errors="ignore")
+        allf = ranked_allf.drop(columns=[SOURCE_RANK_COLUMN], errors="ignore")
         manifest = {
             "updated": stamp, "total_rows": len(allf), "new_rows": new_unique_rows,
             "new_unique_rows": new_unique_rows,
@@ -381,9 +623,12 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
 
         staged = []
         try:
-            staged.append((_stage_parquet(new_rows, part_path), part_path))
+            staged.append((_stage_parquet(persisted_new_rows, part_path), part_path))
             staged.append((_stage_manifest(manifest, manifest_path), manifest_path))
             staged.append((_stage_parquet(allf, master_path), master_path))
+            # Rank follows master. If this replacement fails, the part remains
+            # uncached and the lower-rank sidecar causes a safe retry next pass.
+            staged.append((_stage_parquet(source_ranks, source_rank_path), source_rank_path))
             _replace_staged(staged)
         except Exception:
             for temp_path, _ in staged:
@@ -391,7 +636,8 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
                     os.remove(temp_path)
             raise
 
-        _commit_pending_cache(pending_harvested, pending_nodata)
+        _commit_pending_cache(
+            pending_harvested, pending_nodata, pending_local_parts)
         return new_unique_rows, len(allf), master_path
 
 
@@ -406,8 +652,15 @@ def main(argv=None):
     tasks = list_tasks(args.prefix)
     done = [t for t in tasks if t.get("status") == "completed"]
     failed = [t for t in tasks if t.get("status") == "failed"]
-    print(f"tasks: {len(tasks)} (completed {len(done)}, failed {len(failed)}, "
-          f"running/queued {len(tasks) - len(done) - len(failed)})")
+    status_counts = {}
+    for task in tasks:
+        status = str(task.get("status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+    active_count = sum(status_counts.get(status, 0) for status in ("queued", "attaching", "running"))
+    print(
+        f"tasks: {len(tasks)} (completed {len(done)}, failed {len(failed)}, "
+        f"active {active_count}, cancelled {status_counts.get('cancelled', 0)})"
+    )
 
     # 실패 태스크도 stdout에 결과가 있으면 회수 (pyaedt teardown 크래시가
     # 성공 샘플을 실패로 둔갑시키는 케이스 실측됨 - 데이터는 유효)
@@ -423,6 +676,7 @@ def main(argv=None):
     n_fetch_errors = 0
     pending_harvested = []
     pending_nodata = []
+    pending_local_parts = []
     for t in done + failed:
         if t["id"] in skip:
             n_skipped += 1
@@ -433,13 +687,20 @@ def main(argv=None):
             n_fetch_errors += 1
             print(f"fetch error task {t['id']}: {exc}")
             continue
-        df = fetch_result_rows(t["id"], out=out)
-        if df is None or not len(df):
-            df = fetch_streamed_rows(t["id"], out=out)
-        if df is not None and len(df):
-            df["task_id"] = t["id"]
-            df["task_name"] = t.get("name", "")
-            frames.append(df)
+        # Read both sources: JSON wins duplicate identities by rank, while the
+        # legacy aggregate can still recover a row whose JSON line was truncated.
+        task_frames = []
+        json_frame = fetch_streamed_rows(t["id"], out=out)
+        if json_frame is not None and len(json_frame):
+            task_frames.append((json_frame, SOURCE_RANK_JSON))
+        csv_frame = fetch_result_rows(t["id"], out=out)
+        if csv_frame is not None and len(csv_frame):
+            task_frames.append((csv_frame, SOURCE_RANK_TERMINAL_CSV))
+        if task_frames:
+            for frame, source_rank in task_frames:
+                frame["task_id"] = t["id"]
+                frame["task_name"] = t.get("name", "")
+                frames.append(_tag_source(frame, source_rank))
             pending_harvested.append(t["id"])
             if t.get("status") == "failed":
                 n_salvaged += 1
@@ -466,7 +727,7 @@ def main(argv=None):
             df = pd.DataFrame(rows)
             df["task_id"] = t["id"]
             df["task_name"] = t.get("name", "")
-            frames.append(df)
+            frames.append(_tag_source(df, SOURCE_RANK_JSON))
             n_streamed += len(rows)
     if n_salvaged:
         print(f"salvaged from failed tasks: {n_salvaged}")
@@ -475,20 +736,18 @@ def main(argv=None):
     if n_fetch_errors:
         print(f"fetch_errors: {n_fetch_errors} (not cached as nodata)")
 
-    # 로컬 생산 라인: 로컬 CSV도 병합 (클러스터 대비 샘플당 15-25x 빠름)
-    if os.path.isfile(LOCAL_RESULTS_CSV):
-        try:
-            ldf = pd.read_csv(LOCAL_RESULTS_CSV, on_bad_lines="skip")
-            ldf["task_name"] = "local"
-            frames.append(ldf)
-            print(f"local rows: {len(ldf)}")
-        except Exception as e:
-            print(f"local csv read failed: {e}")
+    # Local parquet parts are the durable schema-union source. The current CSV is
+    # retained as a lower-ranked fallback when a parquet write failed.
+    local_frames, pending_local_parts = load_local_result_frames(cache)
+    for frame in local_frames:
+        frame["task_name"] = "local"
+        frames.append(frame)
 
     if not frames:
         master_path = os.path.join(DATASET_DIR, "train.parquet")
         with FileLock(master_path + ".lock"):
-            _commit_pending_cache(pending_harvested, pending_nodata)
+            _commit_pending_cache(
+                pending_harvested, pending_nodata, pending_local_parts)
         print("new_unique_rows: 0")
         print("no result rows collected")
         return {"new_unique_rows": 0, "fetch_errors": n_fetch_errors}
@@ -499,18 +758,24 @@ def main(argv=None):
     # every row through the content-hash legacy fallback.
     dedup_keys = ["project_name", "saved_at"]
     before = len(merged)
-    merged = deduplicate_rows(merged, dedup_keys)
+    merged = _deduplicate_ranked_rows(merged, dedup_keys)
     print(f"dedup: {before} -> {len(merged)}")
 
     merged, n_bad_probe = sanitize_bad_probes(merged)
     if n_bad_probe:
         print(f"probe-fix 이전 행 {n_bad_probe}개: side/core_center 프로브 컬럼 NaN 처리 (T_max/leeward는 유지)")
+    merged, n_false_thermal = normalize_thermal_validity(merged)
+    if n_false_thermal:
+        print(
+            f"thermal validity: {n_false_thermal} legacy false-success rows demoted to EM-only"
+        )
     merged, n_filtered = convergence_filter(merged, args.max_conv_err)
     print(f"convergence filter (<= {args.max_conv_err}%): -{n_filtered} rows")
 
     new_unique_rows, total_rows, master_path = merge_dataset(
         merged, dedup_keys, args.prefix,
-        pending_harvested=pending_harvested, pending_nodata=pending_nodata)
+        pending_harvested=pending_harvested, pending_nodata=pending_nodata,
+        pending_local_parts=pending_local_parts)
     print(f"new_unique_rows: {new_unique_rows}")
     if not new_unique_rows:
         print(f"dataset unchanged: {total_rows} rows -> {master_path}")

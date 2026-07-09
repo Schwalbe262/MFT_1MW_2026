@@ -24,6 +24,7 @@ import os
 import re
 import json
 import argparse
+import uuid
 
 try:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -192,6 +193,14 @@ def _completion_exit_code(successes, requested):
     if requested is None:
         return 0
     return 0 if successes >= requested else 1
+
+
+def _project_delete_policy(input_frame, fixed_mode=False, hold=False, model_only=False):
+    """Return whether this run's project is disposable, before validation can fail."""
+    default_keep = 1 if fixed_mode else 0
+    keep_values = input_frame.get("keep_project", pd.Series([default_keep]))
+    keep_project = int(keep_values.iloc[0]) != 0
+    return not (keep_project or hold or model_only)
 
 
 class Simulation():
@@ -1519,9 +1528,7 @@ class Simulation():
         return pd.DataFrame([row])
 
     def save_results_to_csv(self, results_df, filename="simulation_results_260706.csv"):
-        """Saves the DataFrame to a CSV file in a process-safe way.
-        기존 파일과 컬럼 구성이 다르면(스키마 변경) 기존 파일을 백업하고 새로 시작한다.
-        추가로 스키마 진화에 안전한 per-run parquet 파트를 남긴다 (병렬 안전, 락 불필요)."""
+        """Atomically save a per-run parquet part, then append a compatible legacy CSV."""
         results_df = results_df.copy()
         results_df["git_hash"] = GIT_HASH
         results_df["project_name"] = getattr(self, "PROJECT_NAME", "")
@@ -1531,31 +1538,62 @@ class Simulation():
                                "project_name": results_df["project_name"].iloc[0],
                                "saved_at": results_df["saved_at"].iloc[0]}
 
-        lock_path = filename + ".lock"
-        with FileLock(lock_path):
-            file_exists = os.path.isfile(filename)
-            if file_exists:
-                with open(filename, "r", encoding="utf-8") as f:
-                    header = f.readline().strip().split(",")
-                if header != list(results_df.columns):
-                    backup = filename.replace(".csv", f"_old_{datetime.now().strftime('%y%m%d_%H%M%S')}.csv")
-                    shutil.move(filename, backup)
-                    logging.warning(f"CSV schema changed; old results moved to {backup}")
-                    file_exists = False
-            results_df.to_csv(filename, mode='a', header=not file_exists, index=False)
-
-        # parquet 파트: 파일명이 유니크해 병렬 인스턴스 간 충돌 없음.
-        # 여러 파트는 pd.concat(map(pd.read_parquet, glob(...)))으로 스키마가 달라도 병합 가능
+        # Write the authoritative per-run part before touching the legacy CSV.
+        # os.replace keeps collectors from observing a partially written parquet file.
+        part = None
+        part_tmp = None
+        part_saved = False
         try:
             parts_dir = "results_parts_260706"
             os.makedirs(parts_dir, exist_ok=True)
+            part_nonce = uuid.uuid4().hex
             part = os.path.join(parts_dir,
-                                f"part_{datetime.now().strftime('%y%m%d_%H%M%S')}_{os.getpid()}_{self.PROJECT_NAME}.parquet")
-            results_df.to_parquet(part, index=False)
+                                f"part_{datetime.now().strftime('%y%m%d_%H%M%S_%f')}_"
+                                f"{part_nonce}_{os.getpid()}_{self.PROJECT_NAME}.parquet")
+            part_tmp = part + f".tmp-{part_nonce}"
+            results_df.to_parquet(part_tmp, index=False)
+            os.replace(part_tmp, part)
+            part_saved = True
         except Exception as e:
-            logging.warning(f"parquet part skipped (pyarrow 미설치?): {e}")
+            logging.warning(f"parquet part write failed; legacy CSV fallback remains available: {e}")
+            if part_tmp:
+                try:
+                    os.remove(part_tmp)
+                except OSError:
+                    pass
 
-        logging.info(f"Results saved to {filename}")
+        lock_path = filename + ".lock"
+        csv_saved = False
+        with FileLock(lock_path):
+            file_exists = os.path.isfile(filename)
+            schema_matches = True
+            if file_exists:
+                with open(filename, "r", encoding="utf-8", newline="") as stream:
+                    header = next(csv.reader(stream), [])
+                schema_matches = header == list(results_df.columns)
+                if not schema_matches:
+                    logging.warning(
+                        f"CSV schema mismatch; preserving {filename} and skipping append "
+                        f"(existing={len(header)} columns, current={len(results_df.columns)} columns)"
+                    )
+            if schema_matches:
+                results_df.to_csv(filename, mode="a", header=not file_exists, index=False)
+                csv_saved = True
+
+        if not part_saved and not csv_saved:
+            fallback_path = "results_fallback_260706.jsonl"
+            with FileLock(fallback_path + ".lock"):
+                with open(fallback_path, "a", encoding="utf-8", newline="\n") as stream:
+                    for _, row in results_df.iterrows():
+                        stream.write(row.to_json(date_format="iso") + "\n")
+            logging.warning(
+                f"primary result sinks unavailable; saved JSONL fallback to {fallback_path}"
+            )
+
+        if csv_saved:
+            logging.info(f"Results saved to {filename}")
+        if part is not None and os.path.isfile(part):
+            logging.info(f"Result part saved to {part}")
 
     def save_project(self):
         try:
@@ -1596,7 +1634,8 @@ class Simulation():
         project_folder = self.project_path or os.path.join(os.getcwd(), "simulation", self.PROJECT_NAME)
 
         for attempt in range(1, max_attempts + 1):
-            time.sleep(wait_s)
+            if attempt > 1:
+                time.sleep(wait_s)
             try:
                 if os.path.isdir(project_folder):
                     shutil.rmtree(project_folder)
@@ -1692,6 +1731,20 @@ def _terminate_spawned_descendants(baseline_descendants, captured_descendants=No
         logging.warning(f"descendant cleanup failed: {e}")
 
 
+def _finalize_run_cleanup(
+        baseline_descendants, captured_descendants, sim=None,
+        held=False, delete_project=False):
+    """Stop this run's solver children before removing its disposable project."""
+    if held:
+        return
+    _terminate_spawned_descendants(baseline_descendants, captured_descendants)
+    if delete_project and sim is not None:
+        try:
+            sim.delete_project_folder(max_attempts=3, wait_s=1)
+        except Exception as error:
+            logging.exception(f"Error deleting project folder after descendant cleanup: {error}")
+
+
 def log_failed_sample(input_df, reason, filename="failed_samples_260706.jsonl"):
     """Append one schema-independent failure record with the complete input row."""
     try:
@@ -1732,6 +1785,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     sim = None
     desktop = None
     held = [False]  # hold 성공 시 finally에서 desktop을 닫지 않기 위한 플래그
+    delete_project_on_exit = not (fixed_mode or hold or model_only)
     baseline_descendants = _snapshot_descendants()
     try:
         # pyDesktop을 context manager로 쓰면 release_desktop 이후 __exit__에서
@@ -1745,6 +1799,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
         if fixed_mode:
             sim.input_df = create_input_parameter(param)
+            delete_project_on_exit = _project_delete_policy(
+                sim.input_df, fixed_mode=True, hold=hold, model_only=model_only
+            )
             # 위반 시 이유를 담아 ValueError raise
             _, sim.df_plus = validation_check(sim.input_df, strict=True)
         else:
@@ -1754,6 +1811,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 if overrides:
                     for k, v in overrides.items():
                         sim.input_df[k] = v
+                delete_project_on_exit = _project_delete_policy(
+                    sim.input_df, fixed_mode=False, hold=hold, model_only=model_only
+                )
                 result, sim.df_plus, errors = validation_check(sim.input_df, return_errors=True)
                 if result:
                     break
@@ -1970,6 +2030,16 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             print(sim.df_plus)
             sim.save_project()
             logging.info(f"Model-only mode: project '{sim.PROJECT_NAME}' saved, skipping analysis.")
+            if hold:
+                held[0] = True
+                logging.info(
+                    f"HOLD model-only mode: project '{sim.PROJECT_NAME}' left open for inspection."
+                )
+                print(
+                    f"\n=== HOLD: AEDT에 '{sim.PROJECT_NAME}' 모델이 열린 채 유지됩니다. "
+                    "확인 후 직접 닫으세요. ==="
+                )
+                return True
             try:
                 sim.close_project()
             except Exception as e:
@@ -1987,6 +2057,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             result_parts + [sim.get_execution_telemetry(), validity, simulation_time], axis=1
         )
 
+        persistence_error = None
         try:
             sim.save_results_to_csv(result)
             if golden:
@@ -1994,6 +2065,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 sim.save_results_to_csv(result, filename="golden_history_260706.csv")
         except Exception as e:
             logging.exception(f"Error saving results to CSV: {e}")
+            persistence_error = e
 
         if fixed_mode or hold:
             print(result)
@@ -2007,6 +2079,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         except Exception as e:
             logging.warning(f"RESULT_JSON print failed: {e}")
 
+        if persistence_error is not None:
+            raise RuntimeError(f"result persistence failed: {persistence_error}") from persistence_error
+
         if hold:
             # 결과 확인용: AEDT와 프로젝트를 연 채로 종료 (사용자가 직접 닫을 때까지 유지)
             held[0] = True
@@ -2018,15 +2093,6 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             sim.close_project()
         except Exception as e:
             logging.exception(f"Error closing project: {e}")
-
-        # 완료된 시뮬레이션 파일 삭제 (fixed 모드는 keep_project=1 기본값으로 보존,
-        # 랜덤/클러스터 스윕은 저장공간 확보를 위해 확실히 삭제)
-        keep_project = int(sim.df_plus["keep_project"].iloc[0]) != 0
-        if not keep_project:
-            try:
-                sim.delete_project_folder()
-            except Exception as e:
-                logging.exception(f"Error deleting project folder: {e}")
 
         # Partial thermal rows remain streamed and are useful for EM surrogates, but
         # --thermal --count N advances only on thermally valid rows.
@@ -2042,10 +2108,6 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             try:
                 sim.close_project()
                 time.sleep(1)
-            except Exception:
-                pass
-            try:
-                sim.delete_project_folder()
             except Exception:
                 pass
         return False
@@ -2066,8 +2128,13 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 pass
         # release가 조용히 실패하거나 solver가 re-parent되기 전에 PID를 확보해 둔다.
         # 이 프로세스가 이번 run에서 만든 자식만 회수하므로 다른 태스크에는 손대지 않는다.
-        if not held[0]:
-            _terminate_spawned_descendants(baseline_descendants, spawned_descendants)
+        _finalize_run_cleanup(
+            baseline_descendants,
+            spawned_descendants,
+            sim=sim,
+            held=held[0],
+            delete_project=delete_project_on_exit,
+        )
 
 
 def parse_args():
@@ -2141,7 +2208,7 @@ def main():
 
     # model-only는 지오메트리 확인용이므로 항상 1회 실행
     if args.model_only and not fixed_mode:
-        run_one_loop(param=None, model_only=True)
+        run_one_loop(param=None, model_only=True, hold=args.hold)
         return
 
     if fixed_mode:
@@ -2164,11 +2231,16 @@ def main():
         # 데스크톱 불안정(라이선스 폭풍 중 pyaedt 핸들 유실)은 새 데스크톱으로 재시도 가치가 있음
         for attempt in range(1, 4):
             try:
-                run_one_loop(param=param, model_only=args.model_only, hold=args.hold)
+                completed = run_one_loop(
+                    param=param, model_only=args.model_only, hold=args.hold
+                )
                 # 성공 시 pyaedt atexit teardown 크래시가 exit 1로 둔갑시키는 것 방지
                 if not args.hold:
                     sys.stdout.flush(); sys.stderr.flush()
-                    os._exit(0)
+                    exit_code = 0 if args.model_only else _completion_exit_code(
+                        int(bool(completed)), 1
+                    )
+                    os._exit(exit_code)
                 return
             except RuntimeError as e:
                 if "desktop unstable" in str(e) and attempt < 3:
