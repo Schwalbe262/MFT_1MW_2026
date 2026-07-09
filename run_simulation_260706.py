@@ -1442,6 +1442,60 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             sim.assign_boundary()
             sim.create_setup(mode=mode)
 
+        def _build_loss_by_copy():
+            """maxwell_matrix를 복제해 loss_sym 디자인으로 전환 (모델링 절반 절약).
+            레퍼런스: pyaedt_library/example/MFT_TAB second_simulation()"""
+            import math as _m
+            old_design = sim.design1  # 객체 핸들 리매핑용
+            op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
+            op.CopyDesign("maxwell_matrix")
+            op.Paste()
+            # 복제 디자인 바인딩 (활성 디자인 = 방금 붙여넣은 것)
+            new_design = sim.design1.design.get_active_design()
+            try:
+                op.SetActiveDesign(new_design.design_name)
+            except Exception:
+                pass
+            sim.design1 = new_design
+
+            # 모델링 때 래퍼에 저장된 객체 핸들들을 복제 디자인으로 리매핑
+            # (save_calculation/save_loss_reports가 소비 - MFT_TAB 레퍼런스 패턴)
+            for a in ("Tx_windings_main", "Tx_windings_side", "Tx_windings_side2", "Tx_windings",
+                      "Rx_windings_main", "Rx_windings_side", "Rx_windings_side2", "Rx_windings",
+                      "core_objs", "core_plates", "core_pads", "wcp_plates", "wcp_pads"):
+                if hasattr(old_design, a):
+                    try:
+                        setattr(new_design, a, new_design.model3d.find_object(getattr(old_design, a)))
+                    except Exception as e:
+                        logging.warning(f"object remap failed for {a}: {e}")
+
+            # matrix 파라미터 제거 (loss 디자인에는 불필요한 연산)
+            try:
+                od = op.GetActiveDesign()
+                od.GetModule("MaxwellParameterSetup").DeleteParameters(["Matrix"])
+            except Exception as e:
+                logging.warning(f"matrix param delete on copy failed (continuing): {e}")
+
+            # 여자 전류를 loss_sym 페이저로 제자리 수정 (타입 동일: Current)
+            I2 = float(sim.df_plus["I2_rated"].iloc[0])
+            phase2 = getattr(sim, "I2_phase_auto", None)
+            if phase2 is None:
+                phase2 = float(sim.df_plus["I2_phase_deg"].iloc[0])
+            tx, rx = sim.design1.get_excitation(excitation_name=["Tx_winding", "Rx_winding"])
+            tx["Current"] = f"{sim.loss_I1_peak}A"
+            tx["Phase"] = f"{sim.loss_I1_phase_deg}deg"
+            rx["Current"] = f"{I2 * _m.sqrt(2)}A"
+            rx["Phase"] = f"{phase2}deg"
+            sim.tx_winding, sim.rx_winding = tx, rx
+
+            # 코어손실 + skin 메시(손실 정밀용) + 셋업 정밀값
+            sim.assign_core_loss()
+            sim.assign_skin_depth()
+            sim.design1.setup = sim.design1.get_setup(name="Setup1")
+            sim.design1.setup.properties["Max. Number of Passes"] = int(sim.df_plus["max_passes"].iloc[0])
+            sim.design1.setup.properties["Min. Converged Passes"] = int(sim.df_plus["min_converged"].iloc[0])
+            sim.design1.setup.properties["Percent Error"] = float(sim.df_plus["percent_error"].iloc[0])
+
         def _analyze_current_design(label, max_attempts=3):
             # 간헐적으로 solve가 결과 없이 '성공'(고정 ~3분 후)으로 끝나는 케이스가 있어
             # is_solved 확인 후 1회 재시도한다. 재시도도 실패하면 AEDT 메시지를 로그에 남기고 실패 처리.
@@ -1549,7 +1603,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             if loss_sym:
                 sim.loss_em_full = False
                 sim.loss_is_sym = True
-                _build_em_design("maxwell_loss", "loss_sym")
+                if int(sim.df_plus.get("loss_from_copy", pd.Series([1])).iloc[0]):
+                    _build_loss_by_copy()
+                else:
+                    _build_em_design("maxwell_loss", "loss_sym")
             else:
                 sim.full_model = True
                 sim.loss_em_full = True

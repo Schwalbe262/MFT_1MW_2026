@@ -33,7 +33,7 @@ KEYS = [
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns", "rx_mesh_mode",
     "keep_project",
-    "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config",
+    "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config", "loss_from_copy",
     "thermal_max_iterations", "conductor_temp_C",
 ]
 
@@ -112,6 +112,8 @@ def get_drawing_default_params():
         "thermal_symmetry": "eighth",
         # matrix 디자인의 skin 메시 (1=적용). 0이면 인덕턴스 전용 경량 메시 - A/B 검증 후 캠페인 적용 검토
         "matrix_skin_mesh": 0,
+        # loss 디자인을 matrix 복제로 생성 (모델링 1회분 절약, MFT_TAB 패턴)
+        "loss_from_copy": 1,
         # 풀 열해석 팬 구성: "dual" = +-y 양측 유입(냉각 스펙, 1/8과 동일 물리) / "single" = +y->-y
         "fan_config": "dual",
         # Icepak 최대 iteration (수렴 판정 기준 미달 시 상한) - iteration 배터리 테스트로 캠페인 값 결정
@@ -701,7 +703,7 @@ NON_DESIGN_VAR_KEYS = {
     "max_passes", "percent_error", "min_converged",
     "matrix_percent_error", "matrix_max_passes", "matrix_min_converged", "keep_project",
     "core_depth_min", "core_depth_max",
-    "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config",
+    "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config", "loss_from_copy",
     "thermal_max_iterations", "conductor_temp_C",
 }
 
