@@ -20,7 +20,8 @@ import requests
 
 SCHEDULER = "http://127.0.0.1:8000"
 
-CAMPAIGN_SETS = "--set percent_error=1.0 --set max_passes=14 --set P_target=1e6"
+# pe 1.5/10: pe1.0/14 대비 매트릭스 시간 절반 이하, Llt 노이즈 ~1% (밴드 2%의 절반)
+CAMPAIGN_SETS = "--set percent_error=1.5 --set max_passes=10 --set P_target=1e6"
 
 
 def submit(name, workdir, run_args, mem_mb=32768, cpus=4):
