@@ -1488,6 +1488,16 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             rx["Phase"] = f"{phase2}deg"
             sim.tx_winding, sim.rx_winding = tx, rx
 
+            # 복제 디자인이 물려받은 matrix 해를 삭제 - 안 지우면 여자를 바꿔도
+            # 솔버가 재해석 없이 '해 없음 완료'로 끝남 (로컬 랜덤 검증에서 3/3 재현)
+            try:
+                sim.design1.design.odesign.DeleteFullVariation("All", False)
+            except Exception:
+                try:
+                    op.GetActiveDesign().DeleteFullVariation("All", False)
+                except Exception as e:
+                    logging.warning(f"copied-solution delete failed: {e}")
+
             # 코어손실 + skin 메시(손실 정밀용) + 셋업 정밀값
             sim.assign_core_loss()
             sim.assign_skin_depth()
