@@ -24,7 +24,7 @@ SCHEDULER = "http://127.0.0.1:8000"
 CAMPAIGN_SETS = "--set percent_error=1.5 --set max_passes=10 --set P_target=1e6"
 
 
-def submit(name, workdir, run_args, mem_mb=32768, cpus=8):
+def submit(name, workdir, run_args, mem_mb=32768, cpus=4):
     """Project 방식 제출 (2026-07-09 전환): 스케줄러가 배포/경로/환경/git pull 전담.
     workdir 인자는 구버전 호환용으로 무시. 반환: task_id (실패 시 None)."""
     try:
