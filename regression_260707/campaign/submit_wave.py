@@ -20,27 +20,26 @@ import requests
 
 SCHEDULER = "http://127.0.0.1:8000"
 
-BASE = ""  # 환경 준비는 env_profile(MFT_1MW_2026v1)이 전담: conda + ansys 모듈 + FLEXLM + 코드 스테이징
-
 CAMPAIGN_SETS = "--set percent_error=1.0 --set max_passes=14 --set P_target=1e6"
-
-# 공유 프로젝트 폴더 (계정마다 env_profile이 클론/갱신)
-PROJECT_DIR = "~/slurm_scheduler/MFT_1MW_2026v1"
 
 
 def submit(name, workdir, run_args, mem_mb=32768, cpus=4):
-    """workdir 인자는 구버전 호환용으로 무시 - 모든 태스크가 계정 공유 폴더에서 실행.
-    프로젝트명은 SIMULATION_ID(스케줄러 주입) 기반 고유명, 결과는 per-run parquet 파트
-    + RESULT_JSON 스트리밍이라 동시 실행 안전."""
-    cmd = (f"cd {PROJECT_DIR} && "
-           f"python run_simulation_260706.py {run_args}; true")
-    r = requests.post(f"{SCHEDULER}/tasks", data={
-        "name": name, "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__",
-        "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "MFT_1MW_2026v1",
-        "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
-        "max_workers_per_node": 12,  # 12x4c=48코어/노드. 5는 노드 9개에서 실동시 45로 병목 실측
-    }, allow_redirects=False, timeout=20)
-    return r.status_code in (200, 303)
+    """Project 방식 제출 (2026-07-09 전환): 스케줄러가 배포/경로/환경/git pull 전담.
+    workdir 인자는 구버전 호환용으로 무시. 반환: task_id (실패 시 None)."""
+    try:
+        r = requests.post(f"{SCHEDULER}/api/tasks", json={
+            "name": name,
+            "project": "MFT_1MW_2026v1",
+            "entrypoint": "run_simulation_260706.py",
+            "arguments": run_args,
+            "cpus": cpus, "memory_mb": mem_mb,
+            "scheduling_profile": "fea_bursty",
+        }, timeout=20)
+        if r.status_code in (200, 201):
+            return r.json().get("task_id") or r.json().get("id")
+    except Exception:
+        pass
+    return None
 
 
 def main():

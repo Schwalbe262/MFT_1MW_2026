@@ -73,19 +73,11 @@ def step(max_samples):
         st["serial"] += 1
         name = f"mft-camp-c-{st['serial']:05d}"
         wd = f"mft_c_t{st['serial'] % 500:03d}"  # 500개 디렉토리 풀 재사용 (클론 재활용)
-        if submit(name, wd, run_args):
+        tid = submit(name, wd, run_args)
+        if tid:
             ok += 1
             st["submitted_samples"] += COUNT_PER_TASK
-            # 방금 제출한 태스크 ID를 장부에 (이름 역조회)
-            try:
-                import requests
-                t = requests.get("http://127.0.0.1:8000/api/tasks", timeout=10).json()
-                for x in (t if isinstance(t, list) else t.get("tasks", [])):
-                    if x.get("name") == name:
-                        st.setdefault("outstanding", []).append(x["id"])
-                        break
-            except Exception:
-                pass
+            st.setdefault("outstanding", []).append(tid)
         time.sleep(0.3)
     save_state(st)
     print(f"[feeder] active {active} -> +{ok} tasks (누적 제출 샘플 {st['submitted_samples']})")
