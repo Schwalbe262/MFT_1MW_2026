@@ -853,7 +853,19 @@ class Simulation():
         report_name = "magnetic_report"
         file_name = "magnetic_report"
 
-        self.report1, self.df1 = self.design1.get_magnetic_parameter(dir=dir, parameters=params, mod=mod, import_report=import_report, report_name=report_name, file_name=file_name)
+        # 리눅스 gRPC에서 리포트 추출이 간헐적으로 빈 DF를 반환 (pe벤치 16/20 실패 실측)
+        # -> 유효성 검사 + 재시도
+        for attempt in range(3):
+            self.report1, self.df1 = self.design1.get_magnetic_parameter(
+                dir=dir, parameters=params, mod=mod, import_report=import_report,
+                report_name=report_name, file_name=file_name)
+            if (self.df1 is not None and len(self.df1)
+                    and "Llt" in self.df1.columns and pd.notna(self.df1["Llt"].iloc[0])):
+                break
+            logging.warning(f"matrix readout empty/invalid (attempt {attempt + 1}/3) - retry in 20s")
+            time.sleep(20)
+        else:
+            raise RuntimeError("matrix parameter readout empty after 3 attempts (report gRPC flake)")
 
         return self.df1
 
