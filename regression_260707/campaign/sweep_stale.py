@@ -32,7 +32,7 @@ def main():
     cmd = (f"echo '--- before:'; du -sh . 2>/dev/null; "
            f"find . -maxdepth 2 -type d -path './mft_*/simulation' -mmin +{mins} {action}; "
            # 공유 프로젝트 폴더: simulation 아래 개별 프로젝트(6h+)만 스윕 (폴더 자체는 유지)
-           f"find MFT_1MW_2026v1/simulation -mindepth 1 -maxdepth 1 -mmin +{mins} {action} 2>/dev/null; "
+           f"find projects/MFT_1MW_2026v1/MFT_1MW_2026/simulation -mindepth 1 -maxdepth 1 -mmin +{mins} {action} 2>/dev/null; "
            f"find . -maxdepth 1 -type d -name 'mft_*' -mtime +7 {action}; "
            f"echo '--- after:'; du -sh . 2>/dev/null; true")
     ok = 0
