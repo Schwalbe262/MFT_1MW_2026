@@ -831,14 +831,22 @@ class Simulation():
         self.design1.assign_symmetry(assignment=self.air_region.bottom_face_y, symmetry_name="Symmetry3", is_odd=True)
         self.design1.assign_radiation(assignment=[self.air_region.top_face_z, self.air_region.bottom_face_x, self.air_region.top_face_y], radiation="Radiation")
 
-    def create_setup(self):
+    def create_setup(self, mode="loss"):
+        """mode="matrix": 인덕턴스 전용 경량 수렴 (skin 없음 + 완화된 pe)
+        mode="loss": 정밀 수렴 (손실/근접효과 - 기존 설정 유지)"""
+        pfx = "matrix_" if mode == "matrix" else ""
+
+        def _p(key, default):
+            col = pfx + key
+            if col in self.df_plus.columns and pd.notna(self.df_plus[col].iloc[0]):
+                return self.df_plus[col].iloc[0]
+            return self.df_plus[key].iloc[0] if key in self.df_plus.columns else default
 
         self.design1.setup = self.design1.create_setup(name="Setup1")
-        self.design1.setup.properties["Max. Number of Passes"] = int(self.df_plus["max_passes"].iloc[0])
+        self.design1.setup.properties["Max. Number of Passes"] = int(_p("max_passes", 10))
         self.design1.setup.properties["Min. Number of Passes"] = 1
-        self.design1.setup.properties["Min. Converged Passes"] = int(
-            self.df_plus.get("min_converged", pd.Series([2])).iloc[0])
-        self.design1.setup.properties["Percent Error"] = float(self.df_plus["percent_error"].iloc[0])
+        self.design1.setup.properties["Min. Converged Passes"] = int(_p("min_converged", 2))
+        self.design1.setup.properties["Percent Error"] = float(_p("percent_error", 2.0))
         self.design1.setup.properties["Frequency Setup"] = f"{float(self.df_plus['freq'].iloc[0])}Hz"
 
     def get_magnetic_parameter(self):
@@ -1432,7 +1440,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 sim.assign_skin_depth()
             sim.assign_plate_settings()
             sim.assign_boundary()
-            sim.create_setup()
+            sim.create_setup(mode=mode)
 
         def _analyze_current_design(label, max_attempts=3):
             # 간헐적으로 solve가 결과 없이 '성공'(고정 ~3분 후)으로 끝나는 케이스가 있어

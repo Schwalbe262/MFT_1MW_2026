@@ -25,6 +25,7 @@ KEYS = [
     "round_corner", "corner_radius", "corner_segments",
     "full_model",
     "max_passes", "percent_error", "min_converged",
+    "matrix_percent_error", "matrix_max_passes", "matrix_min_converged",
     "freq", "V1_rms", "I1_rated", "I2_rated", "I2_phase_deg",
     "P_target", "V2_rms",
     "core_cm", "core_x", "core_y",
@@ -74,6 +75,8 @@ def get_drawing_default_params():
         "full_model": 0,
         # 해석 수렴 설정
         "max_passes": 10, "percent_error": 2.5, "min_converged": 2,
+        # matrix(인덕턴스 전용) 경량 셋업: 에너지 적분은 메시에 둔감 - 빠른 수렴
+        "matrix_percent_error": 2.0, "matrix_max_passes": 8, "matrix_min_converged": 1,
         # 여자/정격 (도면 설계: 1차 1000Vrms / 1000Arms, 2차 10kVrms / 100Arms, 1kHz)
         "freq": 1000.0,          # [Hz]
         "V1_rms": 1000.0,        # 1차 전압원 [Vrms] (loss 디자인 Tx 여자)
@@ -108,7 +111,7 @@ def get_drawing_default_params():
         # 열해석 대칭화: "eighth" = 1/8 (양측 팬 y대칭 + 부력 무시 가정, 캠페인용) / "full" = 최종 검증용
         "thermal_symmetry": "eighth",
         # matrix 디자인의 skin 메시 (1=적용). 0이면 인덕턴스 전용 경량 메시 - A/B 검증 후 캠페인 적용 검토
-        "matrix_skin_mesh": 1,
+        "matrix_skin_mesh": 0,
         # 풀 열해석 팬 구성: "dual" = +-y 양측 유입(냉각 스펙, 1/8과 동일 물리) / "single" = +y->-y
         "fan_config": "dual",
         # Icepak 최대 iteration (수렴 판정 기준 미달 시 상한) - iteration 배터리 테스트로 캠페인 값 결정
@@ -695,7 +698,8 @@ NON_DESIGN_VAR_KEYS = {
     "matrix_on", "loss_on", "thermal_on",
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns",
-    "max_passes", "percent_error", "min_converged", "keep_project",
+    "max_passes", "percent_error", "min_converged",
+    "matrix_percent_error", "matrix_max_passes", "matrix_min_converged", "keep_project",
     "core_depth_min", "core_depth_max",
     "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config",
     "thermal_max_iterations", "conductor_temp_C",
