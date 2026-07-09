@@ -756,7 +756,9 @@ def run_thermal_analysis(sim):
                 seen.add(key)
                 fs.add_calculation("Object", "Volume" if is3d else "Surface",
                                    obj.name, "Temperature")
-            df_fs = fs.get_field_summary_data(pandas_output=True)
+            df_fs = fs.get_field_summary_data(setup=solution, pandas_output=True)
+            if df_fs is None or isinstance(df_fs, bool) or not hasattr(df_fs, "columns") or not len(df_fs):
+                raise RuntimeError(f"field summary returned {type(df_fs).__name__} (no data)")
             # 컬럼: Entity/Geometry/Quantity/Min/Max/Mean ... (버전에 따라 대소문자 상이)
             cols = {c.lower(): c for c in df_fs.columns}
             name_c = cols.get("geometry name", cols.get("entity name", list(df_fs.columns)[2]))
