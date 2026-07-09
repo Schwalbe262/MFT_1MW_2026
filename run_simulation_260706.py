@@ -829,7 +829,8 @@ class Simulation():
         self.design1.setup = self.design1.create_setup(name="Setup1")
         self.design1.setup.properties["Max. Number of Passes"] = int(self.df_plus["max_passes"].iloc[0])
         self.design1.setup.properties["Min. Number of Passes"] = 1
-        self.design1.setup.properties["Min. Converged Passes"] = 2
+        self.design1.setup.properties["Min. Converged Passes"] = int(
+            self.df_plus.get("min_converged", pd.Series([2])).iloc[0])
         self.design1.setup.properties["Percent Error"] = float(self.df_plus["percent_error"].iloc[0])
         self.design1.setup.properties["Frequency Setup"] = f"{float(self.df_plus['freq'].iloc[0])}Hz"
 

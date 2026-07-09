@@ -24,7 +24,7 @@ KEYS = [
     "core_depth_min", "core_depth_max",
     "round_corner", "corner_radius", "corner_segments",
     "full_model",
-    "max_passes", "percent_error",
+    "max_passes", "percent_error", "min_converged",
     "freq", "V1_rms", "I1_rated", "I2_rated", "I2_phase_deg",
     "P_target", "V2_rms",
     "core_cm", "core_x", "core_y",
@@ -73,7 +73,7 @@ def get_drawing_default_params():
         # 1 이면 대칭(1/8 분할) 미적용 풀모델로 모델링/해석
         "full_model": 0,
         # 해석 수렴 설정
-        "max_passes": 10, "percent_error": 2.5,
+        "max_passes": 10, "percent_error": 2.5, "min_converged": 2,
         # 여자/정격 (도면 설계: 1차 1000Vrms / 1000Arms, 2차 10kVrms / 100Arms, 1kHz)
         "freq": 1000.0,          # [Hz]
         "V1_rms": 1000.0,        # 1차 전압원 [Vrms] (loss 디자인 Tx 여자)
@@ -695,7 +695,7 @@ NON_DESIGN_VAR_KEYS = {
     "matrix_on", "loss_on", "thermal_on",
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns",
-    "max_passes", "percent_error", "keep_project",
+    "max_passes", "percent_error", "min_converged", "keep_project",
     "core_depth_min", "core_depth_max",
     "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config",
     "thermal_max_iterations", "conductor_temp_C",
