@@ -689,6 +689,14 @@ def run_thermal_analysis(sim):
                 pass
         return od.GetModule("FieldsReporter")
 
+    def _post_of(app):
+        """래퍼에 따라 .post가 함수인 경우(실측: 'function' object has no attribute
+        'get_scalar_field_value') 호출해서 실제 PostProcessor를 얻는다"""
+        po = app.post
+        if callable(po) and not hasattr(po, "get_scalar_field_value"):
+            po = po()
+        return po
+
     def _eval_temp(obj, op):
         """오브젝트/시트의 Temp Maximum/Mean 스칼라 평가.
         1차: 계산기 직접 호출 (로컬/윈도우 검증됨)
@@ -706,7 +714,7 @@ def run_thermal_analysis(sim):
             ofr.ClcEval(solution, [])
             return float(ofr.GetTopEntryValue(solution, [])[0])
         except Exception:
-            v = ipk.post.get_scalar_field_value(
+            v = _post_of(ipk).get_scalar_field_value(
                 "Temp", scalar_function=("Maximum" if op == "max" else "Mean"),
                 solution=solution, object_name=obj.name,
                 object_type=("volume" if is3d else "surface"))
@@ -738,7 +746,7 @@ def run_thermal_analysis(sim):
     missing = [(obj, col, op) for obj, col, op in probe if col not in temps]
     if missing:
         try:
-            fs = ipk.post.create_field_summary()
+            fs = _post_of(ipk).create_field_summary()
             seen = set()
             for obj, col, op in missing:
                 is3d = getattr(obj, "is3d", True)
