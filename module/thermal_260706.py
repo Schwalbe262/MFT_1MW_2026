@@ -13,6 +13,7 @@ Icepak 열해석 모듈 (설계도면260706 파이프라인 design3)
 
 import math
 import logging
+import os
 
 import pandas as pd
 
@@ -23,6 +24,72 @@ from module.modeling_260706 import (
     compute_layer_positions,
 )
 from module.input_parameter_260706 import get_tx_y_gaps, set_design_variables
+
+
+def _native_solver(app):
+    """Return the PyAEDT solver behind a pyDesign wrapper."""
+    solver = getattr(app, "solver_instance", None)
+    return solver if solver is not None else app
+
+
+def _activate_thermal_design(app):
+    """Re-acquire the active native design and refresh the raw PyAEDT handle."""
+    solver = _native_solver(app)
+    project = getattr(solver, "oproject", None)
+    set_active = getattr(project, "SetActiveDesign", None)
+    if not callable(set_active):
+        raise RuntimeError("native Icepak project handle has no SetActiveDesign")
+
+    design_name = getattr(solver, "design_name", None) or getattr(app, "design_name", None)
+    if not design_name:
+        raise RuntimeError("thermal design name is unavailable")
+    design = set_active(design_name)
+    if not design or not callable(getattr(design, "GetModule", None)):
+        raise RuntimeError(f"failed to activate thermal design: {design_name}")
+
+    solver._odesign = design
+    design_solutions = getattr(solver, "design_solutions", None)
+    if design_solutions is not None:
+        design_solutions._odesign = design
+    return solver, design
+
+
+def _require_boundary(result, operation, expected_props=None):
+    """Require a created PyAEDT boundary and, when requested, its input props."""
+    if not result:
+        raise RuntimeError(f"{operation} returned no boundary")
+    if expected_props is None:
+        return result
+
+    props = getattr(result, "props", None)
+    if not hasattr(props, "get"):
+        raise RuntimeError(f"{operation} returned a boundary without readable props")
+    for key, expected in expected_props.items():
+        actual = props.get(key)
+        if key == "Objects":
+            actual_names = [actual] if isinstance(actual, str) else list(actual or [])
+            expected_names = [expected] if isinstance(expected, str) else list(expected)
+            if set(map(str, actual_names)) != set(map(str, expected_names)):
+                raise RuntimeError(
+                    f"{operation} property {key!r} mismatch: {actual_names!r} != {expected_names!r}"
+                )
+        elif str(actual) != str(expected):
+            raise RuntimeError(f"{operation} property {key!r} mismatch: {actual!r} != {expected!r}")
+    return result
+
+
+def _split_retained(ipk, objects, plane, sides):
+    """Split geometry and require at least one retained input object to remain live."""
+    if not objects:
+        raise RuntimeError(f"cannot split an empty thermal geometry on {plane}")
+    result = ipk.modeler.split(assignment=objects, plane=plane, sides=sides)
+    if not result:
+        raise RuntimeError(f"thermal geometry split failed on {plane} ({sides})")
+    existing = set(ipk.modeler.object_names)
+    alive = [obj for obj in objects if obj.name in existing]
+    if not alive:
+        raise RuntimeError(f"thermal geometry split on {plane} retained no live objects")
+    return alive
 
 
 # ---------------------------------------------------------------------------
@@ -57,13 +124,14 @@ class LossAllocator:
 
     def _get(self, key):
         v = self.loss_map.get(key)
+        alt = None
         if v is None:
             # 미러 오브젝트 폴백 (대칭 EM에 없는 y<0 쪽 등): 대응 오브젝트 키로 대체
             alt = key.replace("Rx_side2", "Rx_side").replace("_n", "_p")
             v = self.loss_map.get(alt)
         if v is None:
-            logging.warning(f"loss_map missing key: {key} (0W assumed)")
-            return 0.0
+            alias = f" (alias {alt})" if alt and alt != key else ""
+            raise KeyError(f"required thermal loss key missing: {key}{alias}")
         return float(v)
 
     def _retained_fraction(self, obj_name):
@@ -302,19 +370,24 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
         all_objs = []
         for grp in objs.values():
             all_objs.extend(grp)
-        def _alive(objs):
-            existing = set(ipk.modeler.object_names)
-            return [o for o in objs if o.name in existing]
-
         if mode == "eighth":
-            ipk.modeler.split(assignment=all_objs, plane="XY", sides="PositiveOnly")
-            all_objs = _alive(all_objs)
-        ipk.modeler.split(assignment=all_objs, plane="XZ", sides="PositiveOnly")
-        all_objs = _alive(all_objs)
-        ipk.modeler.split(assignment=all_objs, plane="YZ", sides="NegativeOnly")
+            all_objs = _split_retained(ipk, all_objs, plane="XY", sides="PositiveOnly")
+        all_objs = _split_retained(ipk, all_objs, plane="XZ", sides="PositiveOnly")
+        _split_retained(ipk, all_objs, plane="YZ", sides="NegativeOnly")
         existing = set(ipk.modeler.object_names)
         for key in list(objs.keys()):
             objs[key] = [o for o in objs[key] if o.name in existing]
+
+        required_groups = {
+            "core": objs["core"],
+            "Tx": objs["Tx"],
+            "Rx_main": objs["Rx_main_explicit"] + objs["Rx_main_blocks"],
+        }
+        if int(df["N2_side"].iloc[0]) > 0:
+            required_groups["Rx_side"] = objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
+        missing_groups = [name for name, group in required_groups.items() if not group]
+        if missing_groups:
+            raise RuntimeError(f"thermal symmetry split removed required groups: {missing_groups}")
 
     return objs
 
@@ -418,11 +491,20 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
 
     def _block(obj, watts):
         w = max(float(watts), 0.0)
-        try:
-            ipk.assign_solid_block(obj.name, f"{w}W")
-            injected[obj.name] = w
-        except Exception as e:
-            logging.warning(f"assign_solid_block failed for {obj.name}: {e}")
+        if not math.isfinite(w):
+            raise ValueError(f"non-finite thermal loss for {obj.name}: {w}")
+        power = f"{w}W"
+        boundary = ipk.assign_solid_block(obj.name, power)
+        _require_boundary(
+            boundary,
+            f"solid block source for {obj.name}",
+            {
+                "Block Type": "Solid",
+                "Objects": [obj.name],
+                "Total Power": power,
+            },
+        )
+        injected[obj.name] = w
 
     # Tx 턴별
     for w in objs["Tx"]:
@@ -481,24 +563,31 @@ def _assign_boundaries(ipk, sim, objs, eighth=False, mode=None):
     air_temp = float(df["air_temp"].iloc[0])
     fan_v = float(df["fan_velocity"].iloc[0])
 
+    def _bc(result, name):
+        return _require_boundary(result, f"thermal boundary {name}")
+
     # 콜드플레이트 + 권선 냉각판 (Al) 고정온도
     fixed_objs = [o.name for o in objs["core_plates"] + objs["wcp_plates"]]
     if fixed_objs:
-        try:
-            ipk.assign_icepak_source(
-                assignment=fixed_objs,
-                thermal_condition="Fixed Temperature",
-                assignment_value=f"{plate_temp}cel",
-                boundary_name="cold_plates_fixed_T"
-            )
-        except Exception as e:
-            logging.warning(f"Fixed temperature assignment failed: {e}")
+        fixed_temperature = f"{plate_temp}cel"
+        boundary = ipk.assign_source(
+            assignment=fixed_objs,
+            thermal_condition="Temperature",
+            assignment_value=fixed_temperature,
+            boundary_name="cold_plates_fixed_T",
+        )
+        _require_boundary(
+            boundary,
+            "fixed temperature source cold_plates_fixed_T",
+            {
+                "Objects": fixed_objs,
+                "Thermal Condition": "Temperature",
+                "Temperature": fixed_temperature,
+            },
+        )
 
     # 주변온도
-    try:
-        ipk.set_ambient_temp(air_temp)
-    except Exception as e:
-        logging.warning(f"set_ambient_temp failed: {e}")
+    ipk.set_ambient_temp(air_temp)
 
     def _fresh_region(**pads):
         # Icepak 디자인은 생성 시 AEDT가 Region을 자동 삽입함 -> 삭제 후 원하는 패딩으로 재생성.
@@ -519,16 +608,18 @@ def _assign_boundaries(ipk, sim, objs, eighth=False, mode=None):
         # x/y 대칭 + z 전체 + 부력 on: 부력(z대칭 가정) 분리 검증용
         region = _fresh_region(x_pos=0.0, y_pos=100.0, z_pos=100.0,
                                x_neg=100.0, y_neg=0.0, z_neg=100.0)
-        ipk.assign_symmetry_wall(geometry=region.top_face_x.id, boundary_name="sym_x0")
-        ipk.assign_symmetry_wall(geometry=region.bottom_face_y.id, boundary_name="sym_y0")
-        ipk.assign_velocity_free_opening(
+        _bc(ipk.assign_symmetry_wall(
+            geometry=region.top_face_x.id, boundary_name="sym_x0"), "sym_x0")
+        _bc(ipk.assign_symmetry_wall(
+            geometry=region.bottom_face_y.id, boundary_name="sym_y0"), "sym_y0")
+        _bc(ipk.assign_velocity_free_opening(
             assignment=[region.top_face_y.id], boundary_name="fan_inlet",
             temperature=f"{air_temp}cel",
-            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"])
+            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]), "fan_inlet")
         for face, nm in [(region.bottom_face_x, "outlet_xn"),
                          (region.top_face_z, "outlet_zp"), (region.bottom_face_z, "outlet_zn")]:
-            ipk.assign_pressure_free_opening(
-                assignment=[face.id], boundary_name=nm, temperature=f"{air_temp}cel")
+            _bc(ipk.assign_pressure_free_opening(
+                assignment=[face.id], boundary_name=nm, temperature=f"{air_temp}cel"), nm)
         return region
 
     if eighth:
@@ -536,25 +627,28 @@ def _assign_boundaries(ipk, sim, objs, eighth=False, mode=None):
         # +y 외곽 = 팬 유입 (양측 팬의 y대칭 유동 가정), -x/+z 외곽 = 배기 opening
         region = _fresh_region(x_pos=0.0, y_pos=100.0, z_pos=100.0,
                                x_neg=100.0, y_neg=0.0, z_neg=0.0)
-        ipk.assign_symmetry_wall(geometry=region.top_face_x.id, boundary_name="sym_x0")
-        ipk.assign_symmetry_wall(geometry=region.bottom_face_y.id, boundary_name="sym_y0")
-        ipk.assign_symmetry_wall(geometry=region.bottom_face_z.id, boundary_name="sym_z0")
-        ipk.assign_velocity_free_opening(
+        _bc(ipk.assign_symmetry_wall(
+            geometry=region.top_face_x.id, boundary_name="sym_x0"), "sym_x0")
+        _bc(ipk.assign_symmetry_wall(
+            geometry=region.bottom_face_y.id, boundary_name="sym_y0"), "sym_y0")
+        _bc(ipk.assign_symmetry_wall(
+            geometry=region.bottom_face_z.id, boundary_name="sym_z0"), "sym_z0")
+        _bc(ipk.assign_velocity_free_opening(
             assignment=[region.top_face_y.id],
             boundary_name="fan_inlet",
             temperature=f"{air_temp}cel",
             velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]
-        )
-        ipk.assign_pressure_free_opening(
+        ), "fan_inlet")
+        _bc(ipk.assign_pressure_free_opening(
             assignment=[region.bottom_face_x.id],
             boundary_name="outlet_x",
             temperature=f"{air_temp}cel"
-        )
-        ipk.assign_pressure_free_opening(
+        ), "outlet_x")
+        _bc(ipk.assign_pressure_free_opening(
             assignment=[region.top_face_z.id],
             boundary_name="outlet_z",
             temperature=f"{air_temp}cel"
-        )
+        ), "outlet_z")
         return region
 
     # 풀모델: region 전방향
@@ -563,27 +657,27 @@ def _assign_boundaries(ipk, sim, objs, eighth=False, mode=None):
     fan_config = str(df.get("fan_config", pd.Series(["dual"])).iloc[0])
     if fan_config == "dual":
         # 양방향 팬 (냉각 스펙: +-y 양측 유입, 배기 +-x/+-z) - 1/8 모델과 동일 물리
-        ipk.assign_velocity_free_opening(
+        _bc(ipk.assign_velocity_free_opening(
             assignment=[region.top_face_y.id], boundary_name="fan_inlet_pos",
             temperature=f"{air_temp}cel",
-            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"])
-        ipk.assign_velocity_free_opening(
+            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]), "fan_inlet_pos")
+        _bc(ipk.assign_velocity_free_opening(
             assignment=[region.bottom_face_y.id], boundary_name="fan_inlet_neg",
             temperature=f"{air_temp}cel",
-            velocity=["0m_per_sec", f"{fan_v}m_per_sec", "0m_per_sec"])
+            velocity=["0m_per_sec", f"{fan_v}m_per_sec", "0m_per_sec"]), "fan_inlet_neg")
         for face, nm in [(region.top_face_x, "outlet_xp"), (region.bottom_face_x, "outlet_xn"),
                          (region.top_face_z, "outlet_zp"), (region.bottom_face_z, "outlet_zn")]:
-            ipk.assign_pressure_free_opening(
-                assignment=[face.id], boundary_name=nm, temperature=f"{air_temp}cel")
+            _bc(ipk.assign_pressure_free_opening(
+                assignment=[face.id], boundary_name=nm, temperature=f"{air_temp}cel"), nm)
     else:
         # 단방향 팬 (+y -> -y)
-        ipk.assign_velocity_free_opening(
+        _bc(ipk.assign_velocity_free_opening(
             assignment=[region.top_face_y.id], boundary_name="fan_inlet",
             temperature=f"{air_temp}cel",
-            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"])
-        ipk.assign_pressure_free_opening(
+            velocity=["0m_per_sec", f"-{fan_v}m_per_sec", "0m_per_sec"]), "fan_inlet")
+        _bc(ipk.assign_pressure_free_opening(
             assignment=[region.bottom_face_y.id], boundary_name="outlet",
-            temperature=f"{air_temp}cel")
+            temperature=f"{air_temp}cel"), "outlet")
 
     return region
 
@@ -623,45 +717,43 @@ def run_thermal_analysis(sim):
         logging.warning(f"pad mesh op failed: {e}")
 
     setup = ipk.create_setup(name="ThermalSetup")
+    if not setup:
+        raise RuntimeError("create_setup returned no ThermalSetup")
     try:
         setup.props["Flow Regime"] = "Turbulent"
         setup.props["Convergence Criteria - Max Iterations"] = int(df["thermal_max_iterations"].iloc[0])
         if eighth:
             # 1/8 대칭의 z대칭은 부력 무시 가정에 기반 -> 중력 비활성
             setup.props["Include Gravity"] = False
-        setup.update()
+        if not setup.update():
+            raise RuntimeError("ThermalSetup update returned False")
     except Exception as e:
-        logging.warning(f"Thermal setup props: {e}")
+        raise RuntimeError(f"ThermalSetup configuration failed: {e}") from e
 
-    # 해석 + 라이선스 리셋 대비 재시도 (EM쪽 _analyze_current_design과 동일한 방어)
+    # analyze() may return None after a successful blocking solve. Do not query
+    # the setup completion property here: it uses the same unreliable report API that
+    # caused completed thermal solves to be launched repeatedly. Field Summary
+    # data below is the completion gate.
     import time as _time
-    solved = False
-    for attempt in range(1, 5):
-        ipk.analyze(cores=sim.NUM_CORE)
-        try:
-            solved = ipk.setups[0].is_solved
-        except Exception:
-            solved = True  # 확인 불가 시 진행 (기존 동작)
-        if solved:
-            break
-        logging.warning(f"[thermal] analyze attempt {attempt} finished without solution data.")
-        msg_text = ""
+    solve_attempts = 1
+    analyze_call_ok = False
+    analyze_return_false = False
+    try:
+        analyze_result = ipk.analyze(cores=sim.NUM_CORE)
+        analyze_call_ok = True
+        analyze_return_false = analyze_result is False
+        if analyze_return_false:
+            logging.warning(
+                "[thermal] analyze returned False; validating the solve from Field Summary data."
+            )
+    except Exception as e:
+        logging.exception(f"[thermal] analyze invocation failed: {e}")
         try:
             msgs = ipk.odesktop.GetMessages(sim.PROJECT_NAME, ipk.design_name, 0)
             for m in list(msgs)[-20:]:
                 logging.warning(f"[AEDT] {m}")
-            msg_text = " ".join(str(m) for m in msgs)
         except Exception:
             pass
-        if "does not have mesh" in msg_text or "Mesh generation" in msg_text:
-            # 메시 실패는 재시도로 안 고쳐짐 - 시간 낭비 방지 즉시 중단
-            logging.error("[thermal] mesh failure detected - aborting retries")
-            break
-        if "license" in msg_text.lower():
-            logging.warning("[thermal] license server distress - 180s backoff before retry")
-            _time.sleep(180)
-    if not solved:
-        logging.error("[thermal] solve failed after retries - temperatures will be NaN for this sample")
     try:
         sim.save_project()
     except Exception:
@@ -670,27 +762,17 @@ def run_thermal_analysis(sim):
     # ---- 온도 추출 (필드 계산기 직접 평가 - 리포트 기계 미사용) ----
     # 프로브 시트 (회귀학습용 주력 데이터: 위치 고정, 보간값이라 메시 스파이크에 강함)
     # + 그룹별 체적 평균/최대
+    native_ipk = _native_solver(ipk)
     try:
-        solution = ipk.existing_analysis_sweeps[0]
+        _activate_thermal_design(ipk)
+        solution = native_ipk.existing_analysis_sweeps[0]
     except Exception:
         solution = "ThermalSetup : SteadyState"
 
     def _fresh_fields_reporter():
         """pyaedt 0.22 핸들 무효화 대응: 네이티브로 활성 디자인 재획득 후
         FieldsReporter 모듈을 직접 얻는다 ('NoneType'.CalcStack / gRPC ClcEval 실패의 근원)"""
-        od = ipk.odesign
-        if od is None or getattr(od, "GetModule", None) is None:
-            od = ipk.oproject.SetActiveDesign(ipk.design_name)
-            try:
-                ipk._odesign = od
-            except Exception:
-                pass
-        else:
-            # 활성 디자인이 다른 디자인으로 넘어가 있으면 ClcEval이 잘못된 컨텍스트에서 실행됨
-            try:
-                ipk.oproject.SetActiveDesign(ipk.design_name)
-            except Exception:
-                pass
+        _, od = _activate_thermal_design(ipk)
         return od.GetModule("FieldsReporter")
 
     def _post_of(app):
@@ -716,15 +798,21 @@ def run_thermal_analysis(sim):
                 ofr.EnterSurf(obj.name)
             ofr.CalcOp("Maximum" if op == "max" else "Mean")
             ofr.ClcEval(solution, [])
-            return float(ofr.GetTopEntryValue(solution, [])[0])
+            value = float(ofr.GetTopEntryValue(solution, [])[0])
+            if not math.isfinite(value):
+                raise ValueError(f"non-finite calculator value for {obj.name}: {value}")
+            return value
         except Exception:
-            v = _post_of(ipk).get_scalar_field_value(
+            v = _post_of(native_ipk).get_scalar_field_value(
                 "Temp", scalar_function=("Maximum" if op == "max" else "Mean"),
                 solution=solution, object_name=obj.name,
                 object_type=("volume" if is3d else "surface"))
             if v is None or v is False:
                 raise
-            return float(v)
+            value = float(v)
+            if not math.isfinite(value):
+                raise ValueError(f"non-finite scalar value for {obj.name}: {value}")
+            return value
 
     temps = {}
     probe = []
@@ -742,7 +830,7 @@ def run_thermal_analysis(sim):
     # 계산기(ClcEval) 오브젝트당 호출은 gRPC에서 상습 실패 + 에러 폭탄 유발이라 폴백으로 강등
     # (2026-07-10 GUI 재현: 계산기/스칼라 전멸 후 field summary가 12/12 구조)
     def _field_summary_bulk(entries):
-        fs = _post_of(ipk).create_field_summary()
+        fs = _post_of(native_ipk).create_field_summary()
         seen = set()
         for obj, col, op in entries:
             is3d = getattr(obj, "is3d", True)
@@ -756,59 +844,141 @@ def run_thermal_analysis(sim):
         if df_fs is None or isinstance(df_fs, bool) or not hasattr(df_fs, "columns") or not len(df_fs):
             raise RuntimeError(f"field summary returned {type(df_fs).__name__} (no data)")
         # 컬럼: Entity/Geometry/Quantity/Min/Max/Mean ... (버전에 따라 대소문자 상이)
-        cols = {c.lower(): c for c in df_fs.columns}
+        cols = {str(c).strip().lower(): c for c in df_fs.columns}
         name_c = cols.get("geometry name", cols.get("entity name", list(df_fs.columns)[2]))
         got = {}
         for obj, col, op in entries:
-            row = df_fs[df_fs[name_c] == obj.name]
+            row = df_fs[df_fs[name_c].astype(str) == str(obj.name)]
             if not len(row):
                 continue
             want = cols.get("max" if op == "max" else "mean")
             if want is None:
                 continue
             try:
-                got[col] = float(row.iloc[0][want])
+                value = float(row.iloc[0][want])
+                if math.isfinite(value):
+                    got[col] = value
             except Exception:
                 pass
         return got
 
-    for attempt in range(2):
-        try:
-            temps.update(_field_summary_bulk(probe))
+    expected_cols = list(dict.fromkeys(col for _, col, _ in probe))
+    field_summary_attempts = 0
+    for attempt in range(1, 4):
+        missing_entries = [entry for entry in probe if entry[1] not in temps]
+        if not missing_entries:
             break
+        field_summary_attempts = attempt
+        try:
+            _activate_thermal_design(ipk)
+            temps.update(_field_summary_bulk(missing_entries))
         except Exception as e:
-            logging.warning(f"[thermal] field summary attempt {attempt + 1}/2 failed: {e}")
+            logging.warning(f"[thermal] field summary attempt {attempt}/3 failed: {e}")
+        if all(col in temps for col in expected_cols):
+            break
+        if attempt < 3:
             _time.sleep(10)
     n_fs = len(temps)
 
-    # ---- 2차: 누락분만 계산기 폴백 (조용히, 실패는 집계만) ----
+    # ---- 2차: Windows에서만 누락분 계산기 폴백 ----
+    # Linux gRPC의 CalcStack/get_scalar_field_value는 개체별로 연속 실패하여
+    # 태스크를 오래 붙잡는다. Windows에서도 필수 max 항목을 우선하고
+    # 최대 16개 항목만 시도한다.
     n_calc = 0
-    n_fail = 0
-    for obj, col, op in probe:
-        if col in temps:
-            continue
-        try:
-            temps[col] = _eval_temp(obj, op)
-            n_calc += 1
-        except Exception:
-            n_fail += 1
+    calc_attempts = 0
+    if os.name == "nt":
+        missing_by_col = {col: (obj, col, op) for obj, col, op in probe if col not in temps}
+        fallback_entries = sorted(
+            missing_by_col.values(),
+            key=lambda entry: (
+                0 if entry[1].startswith("T_max_") else (1 if entry[2] == "max" else 2),
+                entry[1],
+            ),
+        )[:16]
+        for obj, col, op in fallback_entries:
+            calc_attempts += 1
+            try:
+                temps[col] = _eval_temp(obj, op)
+                n_calc += 1
+            except Exception:
+                pass
+    elif any(col not in temps for col in expected_cols):
+        logging.warning("[thermal] Linux calculator fallback skipped; Field Summary remains authoritative.")
+
+    missing_cols = [col for col in expected_cols if col not in temps]
+    n_fail = len(missing_cols)
     logging.warning(f"[thermal] extraction: field-summary {n_fs}, calculator {n_calc}, "
                     f"failed {n_fail} / total {len(probe)}")
 
-    def _group_max(prefixes):
-        vals = [v for k, v in temps.items() if any(p in k for p in prefixes)]
-        return max(vals) if vals else float("nan")
+    def _group_max(group_objects):
+        # A partial maximum can silently understate component temperature. Require
+        # every modeled maximum for the physical group before emitting its summary.
+        cols = list(dict.fromkeys(f"T_max_{obj.name}" for obj in group_objects))
+        vals = [temps[col] for col in cols if col in temps and math.isfinite(float(temps[col]))]
+        return max(vals) if cols and len(vals) == len(cols) else float("nan")
+
+    group_objects = {
+        "T_max_Tx": list(objs["Tx"]),
+        "T_max_Rx_main": list(objs["Rx_main_explicit"] + objs["Rx_main_blocks"]),
+        "T_max_Rx_side": list(
+            objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
+            + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"]
+        ),
+        "T_max_core": list(objs["core"]),
+    }
+    group_values = {
+        key: _group_max(objects) for key, objects in group_objects.items()
+    }
+    group_present = {key: bool(objects) for key, objects in group_objects.items()}
+    group_bits = {
+        "T_max_Tx": 1,
+        "T_max_Rx_main": 2,
+        "T_max_Rx_side": 4,
+        "T_max_core": 8,
+    }
+    required_group_mask = sum(bit for key, bit in group_bits.items() if group_present[key])
+    required_group_count = sum(1 for present in group_present.values() if present)
+    required_missing_count = sum(
+        1 for key, present in group_present.items()
+        if present and not math.isfinite(float(group_values[key]))
+    )
+    required_complete = required_missing_count == 0 and required_group_count > 0
+    solution_data_available = n_fs > 0
+    solved = analyze_call_ok and solution_data_available and required_complete
 
     summary = {
-        "thermal_solved": [1 if solved else 0],  # CFD 라이선스 실패 등으로 해가 없으면 0
-        "T_max_Tx": [_group_max(["Tx_main"])],
-        "T_max_Rx_main": [_group_max(["Rx_main"])],
-        "T_max_Rx_side": [_group_max(["Rx_side"])],
-        "T_max_core": [_group_max(["core_"])],
+        "thermal_solved": [1 if solved else 0],
+        "thermal_extraction_complete": [1 if not missing_cols else 0],
+        "thermal_missing_count": [len(missing_cols)],
+        "thermal_required_missing_count": [required_missing_count],
+        # Bit mask: Tx=1, Rx_main=2, Rx_side=4, core=8. Rx_side is optional
+        # when N2_side=0 and is then deliberately excluded from the gate.
+        "thermal_required_group_mask": [required_group_mask],
+        "thermal_required_group_count": [required_group_count],
+        "thermal_solve_attempts": [solve_attempts],
+        "thermal_analyze_call_ok": [1 if analyze_call_ok else 0],
+        "thermal_analyze_return_false": [1 if analyze_return_false else 0],
+        "thermal_solution_data_available": [1 if solution_data_available else 0],
+        "thermal_field_summary_attempts": [field_summary_attempts],
+        "thermal_field_summary_value_count": [n_fs],
+        "thermal_calculator_attempts": [calc_attempts],
+        "T_max_Tx": [group_values["T_max_Tx"]],
+        "T_max_Rx_main": [group_values["T_max_Rx_main"]],
+        "T_max_Rx_side": [group_values["T_max_Rx_side"]],
+        "T_max_core": [group_values["T_max_core"]],
     }
+    if not solved:
+        logging.error(
+            "[thermal] validation failed: field-summary-data=%s, required-missing=%d, "
+            "missing-total=%d, analyze-call-ok=%s",
+            solution_data_available,
+            required_missing_count,
+            len(missing_cols),
+            analyze_call_ok,
+        )
     # 개별 값도 함께 저장
-    for k, v in temps.items():
-        summary[k] = [v]
+    for col in expected_cols:
+        summary[col] = [temps.get(col, float("nan"))]
 
     sim.df_thermal = pd.DataFrame(summary)
     return sim.df_thermal

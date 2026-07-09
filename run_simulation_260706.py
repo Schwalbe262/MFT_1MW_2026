@@ -78,7 +78,6 @@ from module.input_parameter_260706 import (
     validation_check,
     get_tx_y_gaps,
     get_drawing_default_params,
-    get_design_var_columns,
     sym_cut_count,
 )
 from module.modeling_260706 import (
@@ -119,6 +118,82 @@ def _git_hash():
 GIT_HASH = _git_hash()
 
 
+class SolutionDataUnavailableError(RuntimeError):
+    """Legacy extraction error retained for compatibility with external callers."""
+
+
+_SOLUTION_UNIT_FACTORS = {
+    "fa": 1e-15, "pa": 1e-12, "na": 1e-9, "ua": 1e-6,
+    "ma": 1e-3, "a": 1.0, "ka": 1e3,
+    "ph": 1e-12, "nh": 1e-9, "uh": 1e-6, "mh": 1e-3, "h": 1.0,
+    "nw": 1e-9, "uw": 1e-6, "mw": 1e-3, "w": 1.0, "kw": 1e3, "megaw": 1e6,
+    "ut": 1e-6, "mt": 1e-3, "t": 1.0, "tesla": 1.0,
+    "rad": 180.0 / math.pi, "deg": 1.0,
+}
+
+
+def _convert_solution_unit(value, source_unit, target_unit):
+    """Convert a scalar returned by SolutionData while tolerating omitted AEDT units."""
+    source_raw = str(source_unit or "").strip().replace("µ", "u").replace("μ", "u")
+    target_raw = str(target_unit or "").strip().replace("µ", "u").replace("μ", "u")
+    source = source_raw.lower()
+    target = target_raw.lower()
+    if not source or not target or source_raw == target_raw:
+        return float(value)
+    # Lower-casing would make megawatts (MW) indistinguishable from milliwatts (mW).
+    source_factor = 1e6 if source_raw == "MW" else _SOLUTION_UNIT_FACTORS.get(source)
+    target_factor = 1e6 if target_raw == "MW" else _SOLUTION_UNIT_FACTORS.get(target)
+    if source_factor is None or target_factor is None:
+        logging.warning(f"unknown SolutionData unit conversion '{source_unit}' -> '{target_unit}'")
+        return float(value)
+    return float(value) * source_factor / target_factor
+
+
+def _thermal_result_is_valid(frame):
+    """Return True only when every required thermal group passed extraction."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return False
+    try:
+        if int(frame["thermal_solved"].iloc[0]) != 1:
+            return False
+        if int(frame["thermal_extraction_complete"].iloc[0]) != 1:
+            return False
+        group_bits = {
+            "T_max_Tx": 1,
+            "T_max_Rx_main": 2,
+            "T_max_Rx_side": 4,
+            "T_max_core": 8,
+        }
+        required_mask = int(frame["thermal_required_group_mask"].iloc[0])
+        if required_mask & 11 != 11 or required_mask & ~15:
+            return False
+        required = [column for column, bit in group_bits.items() if required_mask & bit]
+        return all(math.isfinite(float(frame[column].iloc[0])) for column in required)
+    except (KeyError, TypeError, ValueError, OverflowError, IndexError):
+        return False
+
+
+def _thermal_failure_frame(error):
+    """Build a harvestable EM row marker for a hard thermal-stage failure."""
+    message = str(error).strip() or repr(error)
+    return pd.DataFrame({
+        "thermal_solved": [0],
+        "thermal_extraction_complete": [0],
+        "thermal_required_missing_count": [4],
+        "thermal_required_group_mask": [15],
+        "thermal_required_group_count": [4],
+        "thermal_error_type": [type(error).__name__],
+        "thermal_error_message": [message[:2000]],
+    })
+
+
+def _completion_exit_code(successes, requested):
+    """A bounded batch succeeds only after every requested valid row completes."""
+    if requested is None:
+        return 0
+    return 0 if successes >= requested else 1
+
+
 class Simulation():
 
     def __init__(self, desktop=None):
@@ -134,6 +209,11 @@ class Simulation():
         self.NUM_TASK = 1
         self.desktop = desktop
         self.full_model = False
+        self.project_path = None
+        self.solve_attempts = {"matrix": 0, "loss": 0}
+        self.extraction_attempts = {}
+        self.extraction_backends = {}
+        self.spawned_descendants = {}
 
     def create_simulation_name(self):
 
@@ -145,6 +225,7 @@ class Simulation():
             self.num = sim_id
             self.PROJECT_NAME = f"simulation_{job_id}_{sim_id}"
             os.makedirs("./simulation", exist_ok=True)
+            self.project_path = os.path.abspath(os.path.join("simulation", self.PROJECT_NAME))
             return
 
         # 공유 프로젝트 폴더(MFT_1MW_2026v1) 동시 실행: 카운터 파일은 같은 계정의
@@ -154,6 +235,7 @@ class Simulation():
             self.num = str(os.getpid())
             self.PROJECT_NAME = f"simulation_{slurm_job}_{os.getpid()}"
             os.makedirs("./simulation", exist_ok=True)
+            self.project_path = os.path.abspath(os.path.join("simulation", self.PROJECT_NAME))
             return
 
         file_path = "./simulation_num.txt"
@@ -189,24 +271,53 @@ class Simulation():
             file.write(str(next_num))
             file.flush()
 
+        self.project_path = os.path.abspath(os.path.join(simulation_dir, self.PROJECT_NAME))
+
     def create_project(self):
 
         simulation_dir = "./simulation"
         if not os.path.exists(simulation_dir):
             os.makedirs(simulation_dir, exist_ok=True)
 
-        project_path = os.path.abspath(os.path.join(simulation_dir, self.PROJECT_NAME))
+        if self.project_path is None:
+            self.project_path = os.path.abspath(os.path.join(simulation_dir, self.PROJECT_NAME))
 
         if self.desktop is None:
             raise RuntimeError("Desktop instance is None. Cannot create project.")
 
         try:
-            self.project = self.desktop.create_project(path=project_path, name=self.PROJECT_NAME)
+            self.project = self.desktop.create_project(path=self.project_path, name=self.PROJECT_NAME)
         except Exception as e:
-            error_msg = f"Failed to create project '{self.PROJECT_NAME}' at path '{project_path}': {e}\n"
+            error_msg = f"Failed to create project '{self.PROJECT_NAME}' at path '{self.project_path}': {e}\n"
             print(error_msg, file=sys.stderr)
             sys.stderr.flush()
             raise
+
+    def _native_project_handle(self):
+        """Return the native AEDT project without probing pyProject dynamic attributes."""
+        project_wrapper = getattr(self, "project", None)
+        try:
+            project_state = vars(project_wrapper)
+        except TypeError:
+            project_state = {}
+
+        for attribute in ("project", "proj"):
+            native = project_state.get(attribute)
+            if native is not None and native is not False and callable(
+                getattr(native, "SetActiveDesign", None)
+            ):
+                return native
+
+        design = getattr(self, "design1", None)
+        solver_instance = getattr(design, "solver_instance", None)
+        if solver_instance is not None:
+            native = getattr(solver_instance, "oproject", None)
+            if native is not None and native is not False and callable(
+                getattr(native, "SetActiveDesign", None)
+            ):
+                return native
+
+        raise RuntimeError("native AEDT project handle is unavailable")
 
     def create_design(self, name="maxwell_design"):
         self.design1 = self.project.create_design(name=name, solver="maxwell3d", solution="AC Magnetic")
@@ -217,20 +328,24 @@ class Simulation():
         # -> 짧은 재시도 후, 네이티브 SetActiveDesign으로 생성된 디자인의 핸들을 직접 회수
         oDesign = self.design1.odesign
         for _ in range(3):
-            if oDesign is not None:
+            if oDesign is not None and oDesign is not False:
                 break
             time.sleep(5)
             oDesign = self.design1.odesign
-        if oDesign is None:
+        if oDesign is None or oDesign is False:
             try:
-                native = self.project.oproject.SetActiveDesign(name)
+                native = self._native_project_handle().SetActiveDesign(name)
                 if native is not None and native is not False:
-                    self.design1._odesign = native
+                    solver_instance = self.design1.solver_instance
+                    solver_instance._odesign = native
+                    design_solutions = getattr(solver_instance, "design_solutions", None)
+                    if design_solutions is not None:
+                        design_solutions._odesign = native
                     oDesign = native
                     logging.warning(f"odesign recovered via native SetActiveDesign ({name})")
             except Exception as e:
                 logging.warning(f"native SetActiveDesign fallback failed: {e}")
-        if oDesign is None:
+        if oDesign is None or oDesign is False:
             raise RuntimeError(f"odesign handle is None after design creation ({name}) - desktop unstable")
         oDesign.SetDesignSettings(
             [
@@ -849,140 +964,218 @@ class Simulation():
         self.design1.setup.properties["Percent Error"] = float(_p("percent_error", 2.0))
         self.design1.setup.properties["Frequency Setup"] = f"{float(self.df_plus['freq'].iloc[0])}Hz"
 
+    def _solution_data_frame(self, expressions, aliases=None, target_units=None,
+                             report_category=None, extraction_key="result",
+                             max_attempts=3, retry_delay=5):
+        """Read finite scalar results without creating or exporting an AEDT report file.
+
+        Fields calculator expressions bypass PyAEDT's high-level report object. That
+        object adds every design variable to the sweep selection and returns an
+        unusable SolutionData lookup for scalar Maxwell fields in PyAEDT 0.22.
+        """
+        expressions = list(expressions)
+        aliases = list(aliases or expressions)
+        if len(expressions) != len(aliases):
+            raise ValueError("expressions and aliases must have the same length")
+        target_units = target_units or {}
+        last_error = None
+        backend = (
+            "get_solution_data_per_variation"
+            if report_category == "Fields"
+            else "get_solution_data"
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            self.extraction_attempts[extraction_key] = self.extraction_attempts.get(extraction_key, 0) + 1
+            try:
+                post = self.design1.post
+                if callable(post) and not hasattr(post, "get_solution_data"):
+                    post = post()
+                if report_category == "Fields":
+                    solution = post.get_solution_data_per_variation(
+                        solution_type="Fields",
+                        setup_sweep_name="Setup1 : LastAdaptive",
+                        context=[],
+                        sweeps={"Freq": ["All"], "Phase": ["0deg"]},
+                        expressions=expressions,
+                    )
+                else:
+                    solution = post.get_solution_data(
+                        expressions=expressions,
+                        setup_sweep_name="Setup1 : LastAdaptive",
+                        report_category=report_category,
+                    )
+                if solution is None or solution is False:
+                    last_error = RuntimeError(f"{backend} returned no usable response")
+                else:
+                    units = getattr(solution, "units_data", {}) or {}
+                    row = {}
+                    missing = []
+                    for expression, alias in zip(expressions, aliases):
+                        if hasattr(solution, "get_expression_data"):
+                            _, values = solution.get_expression_data(expression, formula="real")
+                        else:
+                            values = solution.data_real(expression)
+                        if values is None or values is False or len(values) == 0:
+                            missing.append(expression)
+                            continue
+                        try:
+                            value = float(values[0])
+                            value = _convert_solution_unit(
+                                value, units.get(expression, ""), target_units.get(expression, "")
+                            )
+                            if not math.isfinite(value):
+                                missing.append(expression)
+                                continue
+                            row[alias] = value
+                        except (TypeError, ValueError, OverflowError) as e:
+                            missing.append(expression)
+                            last_error = e
+                    if not missing:
+                        self.extraction_backends[extraction_key] = backend
+                        return pd.DataFrame([row], columns=aliases)
+                    last_error = RuntimeError("missing/non-finite expressions: " + ", ".join(missing))
+            except Exception as e:
+                last_error = e
+                logging.warning(
+                    f"[{extraction_key}] get_solution_data failed "
+                    f"(attempt {attempt}/{max_attempts}): {e}"
+                )
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+
+        message = f"[{extraction_key}] result extraction failed after {max_attempts} attempts: {last_error}"
+        raise RuntimeError(message)
+
+    def _fresh_fields_reporter(self, max_attempts=3, retry_delay=2):
+        """Return FieldsReporter from the currently active native design."""
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                design_name = self.design1.design_name
+                oproject = self._native_project_handle()
+                odesign = oproject.SetActiveDesign(design_name)
+                if odesign is None or odesign is False:
+                    odesign = self.design1.odesign
+                if odesign is None or odesign is False:
+                    raise RuntimeError(f"active design handle is unavailable ({design_name})")
+                reporter = odesign.GetModule("FieldsReporter")
+                if reporter is None or reporter is False:
+                    raise RuntimeError(f"FieldsReporter is unavailable ({design_name})")
+                return reporter
+            except Exception as e:
+                last_error = e
+                logging.warning(
+                    f"FieldsReporter reacquire failed (attempt {attempt}/{max_attempts}): {e}"
+                )
+                if attempt < max_attempts:
+                    time.sleep(retry_delay)
+        raise RuntimeError(f"FieldsReporter unavailable after {max_attempts} attempts: {last_error}")
+
+    def _add_field_expression(self, expr_name, stack_builder, max_attempts=3, retry_delay=2):
+        """Build one named expression with a freshly acquired calculator handle."""
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                reporter = self._fresh_fields_reporter(max_attempts=1, retry_delay=0)
+                try:
+                    if reporter.DoesNamedExpressionExists(expr_name):
+                        return expr_name
+                except Exception:
+                    pass
+                reporter.CalcStack("clear")
+                stack_builder(reporter)
+                result = reporter.AddNamedExpression(expr_name, "Fields")
+                if result is False:
+                    try:
+                        if reporter.DoesNamedExpressionExists(expr_name):
+                            return expr_name
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"AddNamedExpression returned False ({expr_name})")
+                return expr_name
+            except Exception as e:
+                last_error = e
+                logging.warning(
+                    f"field expression '{expr_name}' failed (attempt {attempt}/{max_attempts}): {e}"
+                )
+                if attempt < max_attempts:
+                    time.sleep(retry_delay)
+        raise RuntimeError(f"failed to register field expression '{expr_name}': {last_error}")
+
     def get_magnetic_parameter(self):
         params = [
-            ["Matrix.L(Tx_winding,Tx_winding)", f"Ltx", "uH"],
-            ["Matrix.L(Rx_winding,Rx_winding)", f"Lrx", "uH"],
-            ["Matrix.L(Tx_winding,Rx_winding)", f"M", "uH"],
-            ["abs(Matrix.CplCoef(Tx_winding,Rx_winding))", f"k", ""],
-            ["Matrix.L(Tx_winding,Tx_winding)*(abs(Matrix.CplCoef(Tx_winding,Rx_winding))^2)", f"Lmt", "uH"],
-            ["Matrix.L(Rx_winding,Rx_winding)*(abs(Matrix.CplCoef(Tx_winding,Rx_winding))^2)", f"Lmr", "uH"],
-            ["Matrix.L(Tx_winding,Tx_winding)*(1-abs(Matrix.CplCoef(Tx_winding,Rx_winding))^2)", f"Llt", "uH"],
-            ["Matrix.L(Rx_winding,Rx_winding)*(1-abs(Matrix.CplCoef(Tx_winding,Rx_winding))^2)", f"Llr", "uH"],
-            ["PerWindingSolidLoss(Tx_winding)", f"Tx_loss", "W"],
-            ["PerWindingSolidLoss(Rx_winding)", f"Rx_loss", "W"],
+            ["Matrix.L(Tx_winding,Tx_winding)", "Ltx", "uH"],
+            ["Matrix.L(Rx_winding,Rx_winding)", "Lrx", "uH"],
+            ["Matrix.L(Tx_winding,Rx_winding)", "M", "uH"],
+            ["abs(Matrix.CplCoef(Tx_winding,Rx_winding))", "k", ""],
+            ["Matrix.L(Tx_winding,Tx_winding)*(abs(Matrix.CplCoef(Tx_winding,Rx_winding))^2)", "Lmt", "uH"],
+            ["Matrix.L(Rx_winding,Rx_winding)*(abs(Matrix.CplCoef(Tx_winding,Rx_winding))^2)", "Lmr", "uH"],
+            ["Matrix.L(Tx_winding,Tx_winding)*(1-abs(Matrix.CplCoef(Tx_winding,Rx_winding))^2)", "Llt", "uH"],
+            ["Matrix.L(Rx_winding,Rx_winding)*(1-abs(Matrix.CplCoef(Tx_winding,Rx_winding))^2)", "Llr", "uH"],
+            ["PerWindingSolidLoss(Tx_winding)", "Tx_loss", "W"],
+            ["PerWindingSolidLoss(Rx_winding)", "Rx_loss", "W"],
         ]
-
-        dir = self.project.path
-        mod = "write"
-        import_report = None
-        report_name = "magnetic_report"
-        file_name = "magnetic_report"
-
-        # 리눅스에서 리포트 ExportToFile이 파일을 안 쓰는 사례 다발 (magnetic_report.csv
-        # FileNotFoundError로 벤치 31/31 전멸 실측) -> 1차: 라이브러리(report+CSV),
-        # 2차: get_solution_data로 파일 무경유 직접 추출
-        def _valid(df):
-            return (df is not None and len(df)
-                    and "Llt" in df.columns and pd.notna(df["Llt"].iloc[0]))
-
-        def _via_solution_data():
-            po = self.design1.post
-            if callable(po) and not hasattr(po, "get_solution_data"):
-                po = po()
-            sd = po.get_solution_data(expressions=[p[0] for p in params])
-            if sd is None:
-                raise RuntimeError("get_solution_data returned None")
-            scale = {"h": 1e6, "mh": 1e3, "uh": 1.0, "nh": 1e-3,
-                     "w": 1.0, "mw": 1e-3, "kw": 1e3, "": 1.0}
-            row = {}
-            for expr, name, unit in params:
-                vals = sd.data_real(expr)
-                if not vals:
-                    raise RuntimeError(f"no data for {expr}")
-                v = float(vals[0])
-                src_u = str((getattr(sd, "units_data", {}) or {}).get(expr, "") or "").lower()
-                tgt_u = unit.lower()
-                if tgt_u and src_u and src_u != tgt_u:
-                    v = v * scale.get(src_u, 1.0) / scale.get(tgt_u, 1.0)
-                row[name] = v
-            return pd.DataFrame([row])
-
-        last_err = None
-        for attempt in range(3):
-            try:
-                self.report1, self.df1 = self.design1.get_magnetic_parameter(
-                    dir=dir, parameters=params, mod=mod, import_report=import_report,
-                    report_name=report_name, file_name=file_name)
-            except Exception as e:
-                last_err = e
-                logging.warning(f"library matrix readout failed ({e}) - solution-data fallback")
-                self.df1 = None
-            if _valid(self.df1):
-                break
-            try:
-                self.df1 = _via_solution_data()
-            except Exception as e:
-                last_err = e
-                logging.warning(f"solution-data readout failed too (attempt {attempt + 1}/3): {e}")
-            if _valid(self.df1):
-                break
-            time.sleep(20)
-        else:
-            raise RuntimeError(f"matrix readout failed after 3 attempts (last: {last_err})")
-
+        expressions = [p[0] for p in params]
+        self.report1 = None
+        self.df1 = self._solution_data_frame(
+            expressions,
+            aliases=[p[1] for p in params],
+            target_units={p[0]: p[2] for p in params if p[2]},
+            extraction_key="matrix",
+        )
+        # The historical pyaedt_library report path applied abs() to magnetic
+        # parameters. Preserve the established dataset convention for mutual M.
+        self.df1["M"] = self.df1["M"].abs()
         return self.df1
 
-    def _report_variations(self):
-        """디자인 변수 목록에서 리포트 variation 리스트를 동적 생성"""
-        variations = [
-            "Freq:=", ["All"],
-            "Phase:=", ["0deg"],
-        ]
-        for col in get_design_var_columns(self.input_df):
-            variations += [f"{col}:=", ["Nominal"]]
-        return variations
-
     def _export_field_report(self, report_name, Y_components):
-        oDesign = self.design1
-        oModule = oDesign.GetModule("ReportSetup")
-        oModule.CreateReport(
-            report_name, "Fields", "Data Table", "Setup1 : LastAdaptive", [],
-            self._report_variations(),
-            [
-                "X Component:=", "Freq",
-                "Y Component:=", Y_components
-            ])
-
-        dir = self.project.path
-        export_path = os.path.join(dir, f"{report_name}.csv")
-        oModule.ExportToFile(report_name, export_path, False)
-        return pd.read_csv(export_path)
+        # Kept as a compatibility-shaped helper for callers; no AEDT report/file is created.
+        target_units = {
+            expression: ("T" if expression.startswith("B_") else "W")
+            for expression in Y_components
+        }
+        return self._solution_data_frame(
+            Y_components,
+            target_units=target_units,
+            report_category="Fields",
+            extraction_key="loss",
+        )
 
     def save_calculation(self):
 
-        def _get_calculator_loss(self, obj, loss, name):
+        def _get_calculator_loss(obj, loss, name):
             assignment = obj if isinstance(obj, str) else obj.name
-            oModule = self.ofieldsreporter
-            oModule.CalcStack("clear")
-            oModule.EnterQty(loss)
-            oModule.EnterVol(assignment)
-            oModule.CalcOp("Integrate")
             name = f"P_{name}"
-            oModule.AddNamedExpression(name, "Fields")
-            return name
+
+            def _build(reporter):
+                reporter.EnterQty(loss)
+                reporter.EnterVol(assignment)
+                reporter.CalcOp("Integrate")
+
+            return self._add_field_expression(name, _build)
 
         # ---- 1차 권선 손실 ----
-        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[0].name, "EMLoss", "Tx_main_winding_inner")
-        _get_calculator_loss(self.design1, self.design1.Tx_windings_main[-1].name, "EMLoss", "Tx_main_winding_outer")
+        _get_calculator_loss(self.design1.Tx_windings_main[0].name, "EMLoss", "Tx_main_winding_inner")
+        _get_calculator_loss(self.design1.Tx_windings_main[-1].name, "EMLoss", "Tx_main_winding_outer")
         if self.df_plus["N1_side"].iloc[0] > 0:
-            _get_calculator_loss(self.design1, self.design1.Tx_windings_side[0].name, "EMLoss", "Tx_side_winding_inner")
-            _get_calculator_loss(self.design1, self.design1.Tx_windings_side[-1].name, "EMLoss", "Tx_side_winding_outer")
+            _get_calculator_loss(self.design1.Tx_windings_side[0].name, "EMLoss", "Tx_side_winding_inner")
+            _get_calculator_loss(self.design1.Tx_windings_side[-1].name, "EMLoss", "Tx_side_winding_outer")
 
         # ---- 2차 권선 손실 ----
-        _get_calculator_loss(self.design1, self.design1.Rx_windings_main[0].name, "EMLoss", "Rx_main_winding_inner")
-        _get_calculator_loss(self.design1, self.design1.Rx_windings_main[-1].name, "EMLoss", "Rx_main_winding_outer")
+        _get_calculator_loss(self.design1.Rx_windings_main[0].name, "EMLoss", "Rx_main_winding_inner")
+        _get_calculator_loss(self.design1.Rx_windings_main[-1].name, "EMLoss", "Rx_main_winding_outer")
         if self.df_plus["N2_side"].iloc[0] > 0:
-            _get_calculator_loss(self.design1, self.design1.Rx_windings_side[0].name, "EMLoss", "Rx_side_winding_inner")
-            _get_calculator_loss(self.design1, self.design1.Rx_windings_side[-1].name, "EMLoss", "Rx_side_winding_outer")
+            _get_calculator_loss(self.design1.Rx_windings_side[0].name, "EMLoss", "Rx_side_winding_inner")
+            _get_calculator_loss(self.design1.Rx_windings_side[-1].name, "EMLoss", "Rx_side_winding_outer")
 
         # ---- 플레이트 손실 (콜드플레이트 / 권선 냉각판) ----
         core_plate_exprs = []
         for p in self.design1.core_plates:
-            core_plate_exprs.append(_get_calculator_loss(self.design1, p.name, "EMLoss", p.name))
+            core_plate_exprs.append(_get_calculator_loss(p.name, "EMLoss", p.name))
         wcp_exprs = []
         for p in self.design1.wcp_plates:
-            wcp_exprs.append(_get_calculator_loss(self.design1, p.name, "EMLoss", p.name))
+            wcp_exprs.append(_get_calculator_loss(p.name, "EMLoss", p.name))
 
         # ---- report1: Tx 권선 손실 ----
         Y_components = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer"]
@@ -990,43 +1183,47 @@ class Simulation():
             Y_components.append("P_Tx_side_winding_inner")
             Y_components.append("P_Tx_side_winding_outer")
 
-        df_original1 = self._export_field_report("calculator_report1", Y_components)
+        tx_components = list(Y_components)
+
+        # ---- report2: Rx 권선 손실 ----
+        rx_components = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]
+        if self.df_plus["N2_side"].iloc[0] > 0:
+            rx_components.append("P_Rx_side_winding_inner")
+            rx_components.append("P_Rx_side_winding_outer")
+
+        # Tx/Rx/plate를 한 번에 읽어 gRPC 결과 조회 횟수를 최소화한다.
+        plate_exprs = core_plate_exprs + wcp_exprs
+        all_components = tx_components + rx_components + plate_exprs
+        df_all = self._export_field_report("calculator_report", all_components)
+        df_original1 = df_all[tx_components]
 
         if self.df_plus["N1_side"].iloc[0] > 0:
-            df = df_original1.iloc[:, -4:]
+            df = df_original1.iloc[:, -4:].copy()
             df.columns = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Tx_side_winding_inner", "P_Tx_side_winding_outer"]
             self.df_calculator1 = df
         else:
-            df = df_original1.iloc[:, -2:]
+            df = df_original1.iloc[:, -2:].copy()
             df.columns = ["P_Tx_main_winding_inner", "P_Tx_main_winding_outer"]
             df["P_Tx_side_winding_inner"] = 0
             df["P_Tx_side_winding_outer"] = 0
             self.df_calculator1 = df[["P_Tx_main_winding_inner", "P_Tx_main_winding_outer", "P_Tx_side_winding_inner", "P_Tx_side_winding_outer"]]
 
-        # ---- report2: Rx 권선 손실 ----
-        Y_components = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]
-        if self.df_plus["N2_side"].iloc[0] > 0:
-            Y_components.append("P_Rx_side_winding_inner")
-            Y_components.append("P_Rx_side_winding_outer")
-
-        df_original2 = self._export_field_report("calculator_report2", Y_components)
+        df_original2 = df_all[rx_components]
 
         if self.df_plus["N2_side"].iloc[0] > 0:
-            df = df_original2.iloc[:, -4:]
+            df = df_original2.iloc[:, -4:].copy()
             df.columns = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer", "P_Rx_side_winding_inner", "P_Rx_side_winding_outer"]
             self.df_calculator2 = df
         else:
-            df = df_original2.iloc[:, -2:]
+            df = df_original2.iloc[:, -2:].copy()
             df.columns = ["P_Rx_main_winding_inner", "P_Rx_main_winding_outer"]
             df["P_Rx_side_winding_inner"] = 0
             df["P_Rx_side_winding_outer"] = 0
             self.df_calculator2 = df[["P_Rx_main_winding_inner", "P_Rx_main_winding_outer", "P_Rx_side_winding_inner", "P_Rx_side_winding_outer"]]
 
         # ---- report3: 플레이트 손실 ----
-        plate_exprs = core_plate_exprs + wcp_exprs
         if plate_exprs:
-            df_original3 = self._export_field_report("calculator_report3", plate_exprs)
-            df3 = df_original3.iloc[:, -len(plate_exprs):]
+            df3 = df_all[plate_exprs].copy()
             df3.columns = plate_exprs
             P_core_plate = df3[core_plate_exprs].sum(axis=1) if core_plate_exprs else 0
             P_winding_plate = df3[wcp_exprs].sum(axis=1) if wcp_exprs else 0
@@ -1074,36 +1271,50 @@ class Simulation():
     def _calc_field_expr(self, obj_name, quantity, op, expr_name):
         """계산기: quantity를 오브젝트 볼륨에 대해 op(Integrate/Mean/Maximum) 후 named expression 등록.
         quantity="B_peak"는 위상 무관한 자속밀도 페이저 크기 (Mag_B는 Phase=0 순간값이라 부적합)."""
-        oModule = self.design1.ofieldsreporter
-        oModule.CalcStack("clear")
-        if quantity == "B_peak":
-            oModule.EnterQty("B")
-            oModule.CalcOp("CmplxMag")
-            oModule.CalcOp("Mag")
-        else:
-            oModule.EnterQty(quantity)
-        oModule.EnterVol(obj_name)
-        oModule.CalcOp(op)
-        try:
-            oModule.AddNamedExpression(expr_name, "Fields")
-        except Exception:
-            # 동일 이름 표현식이 이미 존재 (save_calculation에서 생성된 경우) -> 재사용
-            logging.info(f"named expression {expr_name} already exists - reusing")
-        return expr_name
+        def _build(reporter):
+            if quantity == "B_peak":
+                reporter.EnterQty("B")
+                reporter.CalcOp("CmplxMag")
+                reporter.CalcOp("Mag")
+            else:
+                reporter.EnterQty(quantity)
+            reporter.EnterVol(obj_name)
+            reporter.CalcOp(op)
+
+        return self._add_field_expression(expr_name, _build)
 
     def _calc_group_loss(self, objs, expr_name, quantity="EMLoss"):
         """여러 오브젝트의 손실 적분 합을 하나의 named expression으로 등록"""
-        oModule = self.design1.ofieldsreporter
-        oModule.CalcStack("clear")
-        for i, o in enumerate(objs):
-            name = o if isinstance(o, str) else o.name
-            oModule.EnterQty(quantity)
-            oModule.EnterVol(name)
-            oModule.CalcOp("Integrate")
-            if i > 0:
-                oModule.CalcOp("+")
-        oModule.AddNamedExpression(expr_name, "Fields")
-        return expr_name
+        def _build(reporter):
+            for i, obj in enumerate(objs):
+                name = obj if isinstance(obj, str) else obj.name
+                reporter.EnterQty(quantity)
+                reporter.EnterVol(name)
+                reporter.CalcOp("Integrate")
+                if i > 0:
+                    reporter.CalcOp("+")
+
+        return self._add_field_expression(expr_name, _build)
+
+    @staticmethod
+    def _select_explicit_turns(turns, count):
+        """Select inner/outer turns once, preserving their original order."""
+        turns = list(turns)
+        if count < 0:
+            candidates = turns
+        elif count == 0:
+            candidates = []
+        else:
+            candidates = turns[:count] + turns[-count:]
+
+        selected = []
+        seen_names = set()
+        for turn in candidates:
+            name = turn if isinstance(turn, str) else turn.name
+            if name not in seen_names:
+                seen_names.add(name)
+                selected.append(turn)
+        return selected
 
     def save_loss_reports(self):
         """
@@ -1142,7 +1353,7 @@ class Simulation():
         for grp in [self.design1.Rx_windings_main, self.design1.Rx_windings_side]:
             if not grp:
                 continue
-            explicit = list(grp[:n_exp]) + list(grp[-n_exp:])
+            explicit = self._select_explicit_turns(grp, n_exp)
             for w in explicit:
                 turn_exprs.append(self._calc_field_expr(w.name, "EMLoss", "Integrate", f"P_turn_{w.name}"))
 
@@ -1201,20 +1412,17 @@ class Simulation():
         I1_mag = float("nan")
         I1_phase = float("nan")
         try:
-            oModule = self.design1.GetModule("ReportSetup")
-            oModule.CreateReport(
-                "winding_current_report", "AC Magnetic", "Data Table", "Setup1 : LastAdaptive", [],
-                self._report_variations(),
-                [
-                    "X Component:=", "Freq",
-                    "Y Component:=", ["mag(InputCurrent(Tx_winding))", "ang_deg(InputCurrent(Tx_winding))"]
-                ])
-            export_path = os.path.join(self.project.path, "winding_current_report.csv")
-            oModule.ExportToFile("winding_current_report", export_path, False)
-            df_i = pd.read_csv(export_path)
-            # AEDT export 헤더의 [단위]를 존중해 A로 정규화 (mA로 나오는 경우 실측 확인됨)
-            I1_mag = float(df_i.iloc[0, -2]) * _unit_scale(df_i.columns[-2], kind="current")
-            I1_phase = float(df_i.iloc[0, -1])
+            current_mag = "mag(InputCurrent(Tx_winding))"
+            current_phase = "ang_deg(InputCurrent(Tx_winding))"
+            df_i = self._solution_data_frame(
+                [current_mag, current_phase],
+                aliases=["I1_mag_peak", "I1_phase_deg"],
+                target_units={current_mag: "A", current_phase: "deg"},
+                report_category="AC Magnetic",
+                extraction_key="winding_current",
+            )
+            I1_mag = float(df_i["I1_mag_peak"].iloc[0])
+            I1_phase = float(df_i["I1_phase_deg"].iloc[0])
         except Exception as e:
             logging.warning(f"Failed to extract Tx winding current: {e}")
 
@@ -1234,7 +1442,9 @@ class Simulation():
         cols = {f"conv_passes_{label}": float("nan"), f"conv_error_pct_{label}": float("nan"),
                 f"conv_delta_pct_{label}": float("nan"), f"mesh_tets_{label}": float("nan")}
         try:
-            path = os.path.join(self.project.path, f"convergence_{label}.txt")
+            if not self.project_path:
+                raise RuntimeError("deterministic project path is unavailable")
+            path = os.path.join(self.project_path, f"convergence_{label}.txt")
             try:
                 variation = self.design1.available_variations.nominal_w_values
                 if isinstance(variation, (list, tuple)):
@@ -1261,6 +1471,52 @@ class Simulation():
         except Exception as e:
             logging.warning(f"convergence info extraction failed ({label}): {e}")
         return pd.DataFrame({k: [v] for k, v in cols.items()})
+
+    def _log_recent_aedt_messages(self, label):
+        try:
+            messages = self.design1.odesktop.GetMessages(
+                self.PROJECT_NAME, self.design1.design_name, 0
+            )
+            for message in list(messages)[-10:]:
+                logging.warning(f"[{label}][AEDT] {message}")
+        except Exception as message_error:
+            logging.warning(f"[{label}] AEDT messages unavailable: {message_error}")
+
+    def analyze_and_extract(self, label, extractor):
+        """Analyze exactly once; result-query failures never justify another solve."""
+        def _analyze_once():
+            self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
+            t0 = time.time()
+            try:
+                # PyAEDT 0.22 Setup.analyze() returns None on a successful invocation.
+                analyze_result = self.design1.setup.analyze(cores=self.NUM_CORE)
+                if analyze_result is False:
+                    raise RuntimeError(f"[{label}] Setup1 analyze returned False")
+            except Exception:
+                self._log_recent_aedt_messages(label)
+                raise
+            elapsed = time.time() - t0
+            self.save_project()
+            return elapsed
+
+        elapsed = _analyze_once()
+        extractor()
+        return elapsed
+
+    def get_execution_telemetry(self):
+        """Return solve/extraction provenance alongside each training row."""
+        row = {}
+        for label in ("matrix", "loss"):
+            row[f"{label}_solve_attempts"] = int(self.solve_attempts.get(label, 0))
+            row[f"{label}_solution_queries"] = int(self.extraction_attempts.get(label, 0))
+            row[f"{label}_extraction_backend"] = self.extraction_backends.get(label, "not_run")
+        row["winding_current_solution_queries"] = int(
+            self.extraction_attempts.get("winding_current", 0)
+        )
+        row["winding_current_extraction_backend"] = self.extraction_backends.get(
+            "winding_current", "not_run"
+        )
+        return pd.DataFrame([row])
 
     def save_results_to_csv(self, results_df, filename="simulation_results_260706.csv"):
         """Saves the DataFrame to a CSV file in a process-safe way.
@@ -1306,11 +1562,13 @@ class Simulation():
             self.design1.save_project()
         except Exception:
             try:
-                self.project.oproject.Save()
+                self._native_project_handle().Save()
             except Exception as e:
                 logging.warning(f"Failed to save project: {e}")
 
     def close_project(self):
+        # Capture solver/session descendants before AEDT release can orphan them.
+        self.spawned_descendants.update(_snapshot_descendants())
         # keep_project=1 이면 솔루션 데이터를 보존한 채 닫는다
         # (cleanup_solution은 저장 프로젝트의 Results를 지워버림 - 삭제 예정일 때만 수행)
         try:
@@ -1335,7 +1593,7 @@ class Simulation():
         완료된 시뮬레이션 파일 삭제 (슈퍼컴퓨터 저장공간 확보용 - 반드시 지워져야 함).
         AEDT가 파일 핸들을 늦게 놓는 경우가 있어 재시도하며, .lock 등 부산물도 제거한다.
         """
-        project_folder = os.path.join(os.getcwd(), "simulation", self.PROJECT_NAME)
+        project_folder = self.project_path or os.path.join(os.getcwd(), "simulation", self.PROJECT_NAME)
 
         for attempt in range(1, max_attempts + 1):
             time.sleep(wait_s)
@@ -1343,7 +1601,7 @@ class Simulation():
                 if os.path.isdir(project_folder):
                     shutil.rmtree(project_folder)
                 # 폴더 밖에 생기는 부산물 (.lock, .auto 등)
-                sim_dir = os.path.join(os.getcwd(), "simulation")
+                sim_dir = os.path.dirname(project_folder)
                 for name in os.listdir(sim_dir):
                     if name.startswith(self.PROJECT_NAME + ".") and (
                             name.endswith(".lock") or name.endswith(".auto")
@@ -1362,16 +1620,104 @@ class Simulation():
         return False
 
 
-def log_failed_sample(input_df, reason, filename="failed_samples_260706.csv"):
-    """실패/기각 샘플 기록 (설계공간 경계 분석용). 파라미터 + 사유."""
+def _snapshot_descendants():
+    """Map recursive child PIDs to (depth, create_time) for PID-reuse-safe cleanup."""
     try:
-        row = input_df.copy()
-        row["fail_reason"] = [str(reason)[:500]]
-        row["fail_time"] = [datetime.now().strftime("%y%m%d_%H%M%S")]
+        import psutil
+
+        root = psutil.Process()
+        root_pid = root.pid
+        snapshot = {}
+        for child in root.children(recursive=True):
+            depth = 1
+            try:
+                parent = child.parent()
+                while parent is not None and parent.pid != root_pid:
+                    depth += 1
+                    parent = parent.parent()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            try:
+                create_time = child.create_time()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            snapshot[child.pid] = (depth, create_time)
+        return snapshot
+    except Exception:
+        return {}
+
+
+def _terminate_spawned_descendants(baseline_descendants, captured_descendants=None, wait_s=5):
+    """Terminate every descendant created by this dedicated simulation run, deepest first."""
+    try:
+        import psutil
+
+        captured = dict(captured_descendants or {})
+        captured.update(_snapshot_descendants())
+        spawned = {
+            pid: metadata for pid, metadata in captured.items()
+            if (
+                pid != os.getpid()
+                and (
+                    pid not in baseline_descendants
+                    or abs(baseline_descendants[pid][1] - metadata[1]) > 0.01
+                )
+            )
+        }
+        processes = []
+        ordered = sorted(spawned.items(), key=lambda item: item[1][0], reverse=True)
+        for pid, (depth, captured_create_time) in ordered:
+            try:
+                process = psutil.Process(pid)
+                if abs(process.create_time() - captured_create_time) > 0.01:
+                    logging.warning(f"skipping reused child pid={pid}")
+                    continue
+                logging.warning(
+                    f"terminating leaked child pid={pid} name={process.name()} depth={depth}"
+                )
+                process.terminate()
+                processes.append(process)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _, alive = psutil.wait_procs(processes, timeout=wait_s)
+        for process in alive:
+            try:
+                logging.warning(f"killing leaked child pid={process.pid} name={process.name()}")
+                process.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=wait_s)
+    except Exception as e:
+        logging.warning(f"descendant cleanup failed: {e}")
+
+
+def log_failed_sample(input_df, reason, filename="failed_samples_260706.jsonl"):
+    """Append one schema-independent failure record with the complete input row."""
+    try:
+        if isinstance(input_df, pd.DataFrame):
+            if input_df.empty:
+                parameters = {}
+            else:
+                parameters = json.loads(input_df.iloc[0].to_json(date_format="iso"))
+        elif isinstance(input_df, dict):
+            parameters = dict(input_df)
+        else:
+            parameters = {"value": str(input_df)}
+        reason_text = str(reason)
+        record = {
+            "parameters": parameters,
+            "fail_reason": reason_text,
+            "failure_stage": reason_text.split(":", 1)[0],
+            "fail_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "git_hash": GIT_HASH,
+        }
         lock_path = filename + ".lock"
         with FileLock(lock_path):
-            file_exists = os.path.isfile(filename)
-            row.to_csv(filename, mode="a", header=not file_exists, index=False)
+            with open(filename, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
     except Exception as e:
         logging.warning(f"failed-sample logging failed: {e}")
 
@@ -1386,6 +1732,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     sim = None
     desktop = None
     held = [False]  # hold 성공 시 finally에서 desktop을 닫지 않기 위한 플래그
+    baseline_descendants = _snapshot_descendants()
     try:
         # pyDesktop을 context manager로 쓰면 release_desktop 이후 __exit__에서
         # close_on_exit 속성 오류가 발생하므로 직접 생성하고 finally에서 해제한다.
@@ -1506,40 +1853,6 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             sim.design1.setup.properties["Min. Converged Passes"] = int(sim.df_plus["min_converged"].iloc[0])
             sim.design1.setup.properties["Percent Error"] = float(sim.df_plus["percent_error"].iloc[0])
 
-        def _analyze_current_design(label, max_attempts=3):
-            # 간헐적으로 solve가 결과 없이 '성공'(고정 ~3분 후)으로 끝나는 케이스가 있어
-            # is_solved 확인 후 1회 재시도한다. 재시도도 실패하면 AEDT 메시지를 로그에 남기고 실패 처리.
-            elapsed = 0.0
-            for attempt in range(1, max_attempts + 1):
-                t0 = time.time()
-                sim.design1.setup.analyze(cores=sim.NUM_CORE)
-                elapsed = time.time() - t0
-                try:
-                    solved = sim.design1.setup.is_solved
-                except Exception:
-                    solved = True  # 확인 불가 시 기존 동작 유지
-                if solved:
-                    break
-                logging.warning(f"[{label}] analyze attempt {attempt} finished without solution data.")
-                msg_text = ""
-                try:
-                    msgs = sim.design1.odesktop.GetMessages(sim.PROJECT_NAME, sim.design1.design_name, 0)
-                    for m in list(msgs)[-10:]:
-                        logging.warning(f"[AEDT] {m}")
-                    msg_text = " ".join(str(m) for m in msgs)
-                except Exception:
-                    pass
-                # 라이선스 서버 과부하(FlexNet -16, WinSock reset 등)면 즉시 재시도해도
-                # 또 실패 - 백오프로 서버 회복 시간을 준다
-                if "license" in msg_text.lower():
-                    logging.warning(f"[{label}] license server distress - 120s backoff before retry")
-                    time.sleep(120)
-            else:
-                raise RuntimeError(f"[{label}] Setup1 finished without solution data after {max_attempts} attempts.")
-            # 리포트 생성 전에 저장해 솔루션 상태를 프로젝트 파일에 반영
-            sim.save_project()
-            return elapsed
-
         result_parts = [sim.df_plus]
         total_time = 0.0
 
@@ -1548,9 +1861,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             _build_em_design("maxwell_matrix", "matrix")
             sim.design_matrix = sim.design1
             if not model_only:
-                t_matrix = _analyze_current_design("matrix")
+                t_matrix = sim.analyze_and_extract("matrix", sim.get_magnetic_parameter)
                 total_time += t_matrix
-                sim.get_magnetic_parameter()
                 result_parts.append(sim.df1)
                 result_parts.append(sim.get_convergence_info("matrix"))
                 result_parts.append(pd.DataFrame({"time_matrix": [t_matrix]}))
@@ -1624,20 +1936,32 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 _build_em_design("maxwell_loss", "loss")
             sim.design_loss = sim.design1
             if not model_only:
-                t_loss = _analyze_current_design("loss")
+                def _extract_loss_results():
+                    sim.save_calculation()
+                    sim.save_loss_reports()
+
+                t_loss = sim.analyze_and_extract("loss", _extract_loss_results)
                 total_time += t_loss
-                sim.save_calculation()      # 권선/플레이트 EMLoss (기존 리포트)
-                sim.save_loss_reports()     # 코어손실 + B + I1 + 그룹/턴 손실
                 result_parts += [sim.df_calculator1, sim.df_calculator2, sim.df_calculator3,
                                  sim.df_loss_summary, sim.get_convergence_info("loss"),
                                  pd.DataFrame({"time_loss": [t_loss]})]
             sim.full_model = prev_full
 
         # ---- design3: Icepak 열해석 (풀 지오메트리, EM 손실 주입) ----
+        thermal_result_valid = not thermal_on
         if thermal_on and loss_on and not model_only:
             from module.thermal_260706 import run_thermal_analysis
             t0 = time.time()
-            df_thermal = run_thermal_analysis(sim)
+            try:
+                df_thermal = run_thermal_analysis(sim)
+            except Exception as thermal_error:
+                logging.exception(f"thermal stage failed: {thermal_error}")
+                log_failed_sample(
+                    sim.input_df,
+                    f"thermal: {type(thermal_error).__name__}: {thermal_error}",
+                )
+                df_thermal = _thermal_failure_frame(thermal_error)
+            thermal_result_valid = _thermal_result_is_valid(df_thermal)
             t_thermal = time.time() - t0
             total_time += t_thermal
             result_parts += [df_thermal, pd.DataFrame({"time_thermal": [t_thermal]})]
@@ -1653,7 +1977,15 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             return
 
         simulation_time = pd.DataFrame({"time": [total_time]})
-        result = pd.concat(result_parts + [simulation_time], axis=1)
+        validity = pd.DataFrame({
+            "result_valid_em": [1],
+            "result_valid_thermal": [
+                int(thermal_result_valid) if thermal_on else float("nan")
+            ],
+        })
+        result = pd.concat(
+            result_parts + [sim.get_execution_telemetry(), validity, simulation_time], axis=1
+        )
 
         try:
             sim.save_results_to_csv(result)
@@ -1696,7 +2028,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             except Exception as e:
                 logging.exception(f"Error deleting project folder: {e}")
 
-        return True
+        # Partial thermal rows remain streamed and are useful for EM surrogates, but
+        # --thermal --count N advances only on thermally valid rows.
+        return bool(thermal_result_valid)
     except Exception as e:
         logging.exception(f"run_one_loop failed: {e}")
         if sim is not None and getattr(sim, "input_df", None) is not None:
@@ -1716,6 +2050,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 pass
         return False
     finally:
+        spawned_descendants = _snapshot_descendants()
+        if sim is not None:
+            spawned_descendants.update(getattr(sim, "spawned_descendants", {}))
         if desktop is not None:
             try:
                 if held[0]:
@@ -1727,20 +2064,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 time.sleep(1)
             except Exception:
                 pass
-        # 데스크톱 릭 강제 회수: release가 (gRPC 사망 등으로) 조용히 실패하면 AEDT가
-        # 살아남아 count 루프 동안 누적 (노드당 86세션 실측 - 코어 고갈의 주범).
-        # 이 프로세스의 자식으로 남은 AEDT 계열만 정밀 kill (타 태스크 무접촉, HOLD 제외)
+        # release가 조용히 실패하거나 solver가 re-parent되기 전에 PID를 확보해 둔다.
+        # 이 프로세스가 이번 run에서 만든 자식만 회수하므로 다른 태스크에는 손대지 않는다.
         if not held[0]:
-            try:
-                import psutil
-                for ch in psutil.Process().children(recursive=True):
-                    try:
-                        if any(k in ch.name().lower() for k in ("ansysedt", "3dedy", "ansysem")):
-                            ch.kill()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            _terminate_spawned_descendants(baseline_descendants, spawned_descendants)
 
 
 def parse_args():
@@ -1775,32 +2102,6 @@ def parse_args():
                         metavar="KEY=VALUE",
                         help="파라미터 오버라이드 (반복 가능, fixed/random 공용). 예: --set P_target=1e6 --set percent_error=1.0")
     return parser.parse_args()
-
-
-_UNIT_SCALES = {
-    # 기준 단위로의 배율: current -> A, inductance -> uH, power -> W, flux -> T, voltage -> V
-    "current": {"fA": 1e-15, "pA": 1e-12, "nA": 1e-9, "uA": 1e-6, "mA": 1e-3, "A": 1.0, "kA": 1e3},
-    "inductance": {"pH": 1e-6, "nH": 1e-3, "uH": 1.0, "mH": 1e3, "H": 1e6},
-    "power": {"nW": 1e-9, "uW": 1e-6, "mW": 1e-3, "W": 1.0, "kW": 1e3, "MW": 1e6},
-    "flux": {"uT": 1e-6, "mT": 1e-3, "T": 1.0, "tesla": 1.0},
-    "voltage": {"uV": 1e-6, "mV": 1e-3, "V": 1.0, "kV": 1e3},
-}
-
-
-def _unit_scale(column_name, kind):
-    """AEDT export 컬럼 헤더의 '[unit]' 접미사를 파싱해 기준 단위 배율 반환.
-    단위 표기가 없으면 1.0 (이미 기준 단위로 가정). 미지 단위는 경고 후 1.0."""
-    m = re.search(r"\[([^\]]*)\]", str(column_name))
-    if not m:
-        return 1.0
-    unit = m.group(1).strip()
-    if not unit:
-        return 1.0
-    table = _UNIT_SCALES.get(kind, {})
-    if unit in table:
-        return table[unit]
-    logging.warning(f"unknown unit '{unit}' in column '{column_name}' (kind={kind}) - no scaling applied")
-    return 1.0
 
 
 def _parse_set_overrides(pairs):
@@ -1934,7 +2235,9 @@ def main():
                 logging.error(f"Reached max attempts ({attempts}) with only {successes}/{args.count} successes.")
                 sys.stdout.flush()
                 sys.stderr.flush()
-                os._exit(0 if successes > 0 else 1)
+                # RESULT_JSON rows already emitted by partial batches remain harvestable,
+                # but the scheduler must not count a short batch as fully completed.
+                os._exit(_completion_exit_code(successes, args.count))
 
 
 if __name__ == "__main__":
