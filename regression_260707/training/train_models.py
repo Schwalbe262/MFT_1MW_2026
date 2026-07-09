@@ -63,6 +63,12 @@ def make_model(family, params, seed):
 def train_target(df, feats, target, cfg, family_params, sample_weight_col=None, min_rows=200):
     from sklearn.model_selection import KFold, train_test_split
 
+    # 온도 타겟: thermal 솔브가 성공한 행만 (thermal_solved 플래그, 2026-07-09)
+
+    if target.startswith('Tprobe') and 'thermal_solved' in df.columns:
+
+        df = df[df['thermal_solved'].fillna(0) == 1]
+
     sub = df.dropna(subset=[target])
     sub = sub[np.isfinite(sub[target])]
     if len(sub) < min_rows:
