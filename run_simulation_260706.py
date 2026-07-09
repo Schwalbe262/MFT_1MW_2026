@@ -140,6 +140,15 @@ class Simulation():
             os.makedirs("./simulation", exist_ok=True)
             return
 
+        # 공유 프로젝트 폴더(MFT_1MW_2026v1) 동시 실행: 카운터 파일은 같은 계정의
+        # 동시 태스크끼리 레이스 -> SLURM 환경이면 job+pid 기반 고유명 사용
+        slurm_job = os.environ.get("SLURM_JOB_ID")
+        if slurm_job:
+            self.num = str(os.getpid())
+            self.PROJECT_NAME = f"simulation_{slurm_job}_{os.getpid()}"
+            os.makedirs("./simulation", exist_ok=True)
+            return
+
         file_path = "./simulation_num.txt"
         simulation_dir = "./simulation"
         os.makedirs(simulation_dir, exist_ok=True)
