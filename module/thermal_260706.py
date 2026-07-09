@@ -648,11 +648,15 @@ def run_thermal_analysis(sim):
         msg_text = ""
         try:
             msgs = ipk.odesktop.GetMessages(sim.PROJECT_NAME, ipk.design_name, 0)
-            for m in list(msgs)[-6:]:
+            for m in list(msgs)[-20:]:
                 logging.warning(f"[AEDT] {m}")
             msg_text = " ".join(str(m) for m in msgs)
         except Exception:
             pass
+        if "does not have mesh" in msg_text or "Mesh generation" in msg_text:
+            # 메시 실패는 재시도로 안 고쳐짐 - 시간 낭비 방지 즉시 중단
+            logging.error("[thermal] mesh failure detected - aborting retries")
+            break
         if "license" in msg_text.lower():
             logging.warning("[thermal] license server distress - 180s backoff before retry")
             _time.sleep(180)
@@ -734,49 +738,62 @@ def run_thermal_analysis(sim):
         probe.append((o, f"T_mean_{o.name}", "mean"))
         probe.append((o, f"T_max_{o.name}", "max"))
 
+    # ---- 1차: Field Summary 일괄 (호출 1회, GUI/리눅스 공통 신뢰 경로) ----
+    # 계산기(ClcEval) 오브젝트당 호출은 gRPC에서 상습 실패 + 에러 폭탄 유발이라 폴백으로 강등
+    # (2026-07-10 GUI 재현: 계산기/스칼라 전멸 후 field summary가 12/12 구조)
+    def _field_summary_bulk(entries):
+        fs = _post_of(ipk).create_field_summary()
+        seen = set()
+        for obj, col, op in entries:
+            is3d = getattr(obj, "is3d", True)
+            key = (obj.name, is3d)
+            if key in seen:
+                continue
+            seen.add(key)
+            fs.add_calculation("Object", "Volume" if is3d else "Surface",
+                               obj.name, "Temperature")
+        df_fs = fs.get_field_summary_data(setup=solution, pandas_output=True)
+        if df_fs is None or isinstance(df_fs, bool) or not hasattr(df_fs, "columns") or not len(df_fs):
+            raise RuntimeError(f"field summary returned {type(df_fs).__name__} (no data)")
+        # 컬럼: Entity/Geometry/Quantity/Min/Max/Mean ... (버전에 따라 대소문자 상이)
+        cols = {c.lower(): c for c in df_fs.columns}
+        name_c = cols.get("geometry name", cols.get("entity name", list(df_fs.columns)[2]))
+        got = {}
+        for obj, col, op in entries:
+            row = df_fs[df_fs[name_c] == obj.name]
+            if not len(row):
+                continue
+            want = cols.get("max" if op == "max" else "mean")
+            if want is None:
+                continue
+            try:
+                got[col] = float(row.iloc[0][want])
+            except Exception:
+                pass
+        return got
+
+    for attempt in range(2):
+        try:
+            temps.update(_field_summary_bulk(probe))
+            break
+        except Exception as e:
+            logging.warning(f"[thermal] field summary attempt {attempt + 1}/2 failed: {e}")
+            _time.sleep(10)
+    n_fs = len(temps)
+
+    # ---- 2차: 누락분만 계산기 폴백 (조용히, 실패는 집계만) ----
+    n_calc = 0
+    n_fail = 0
     for obj, col, op in probe:
+        if col in temps:
+            continue
         try:
             temps[col] = _eval_temp(obj, op)
-        except Exception as e:
-            logging.warning(f"Temp eval failed for {col}: {e}")
-
-    # ---- 폴백 2: Field Summary 일괄 export ----
-    # 리눅스 gRPC에서 필드 계산기(ClcEval/GetTopEntryValue)가 None을 뱉는 사례 실측
-    # -> Icepak 네이티브 Field Summary로 전 항목을 한 번에 뽑아 빈 자리를 채운다
-    missing = [(obj, col, op) for obj, col, op in probe if col not in temps]
-    if missing:
-        try:
-            fs = _post_of(ipk).create_field_summary()
-            seen = set()
-            for obj, col, op in missing:
-                is3d = getattr(obj, "is3d", True)
-                key = (obj.name, is3d)
-                if key in seen:
-                    continue
-                seen.add(key)
-                fs.add_calculation("Object", "Volume" if is3d else "Surface",
-                                   obj.name, "Temperature")
-            df_fs = fs.get_field_summary_data(setup=solution, pandas_output=True)
-            if df_fs is None or isinstance(df_fs, bool) or not hasattr(df_fs, "columns") or not len(df_fs):
-                raise RuntimeError(f"field summary returned {type(df_fs).__name__} (no data)")
-            # 컬럼: Entity/Geometry/Quantity/Min/Max/Mean ... (버전에 따라 대소문자 상이)
-            cols = {c.lower(): c for c in df_fs.columns}
-            name_c = cols.get("geometry name", cols.get("entity name", list(df_fs.columns)[2]))
-            for obj, col, op in missing:
-                row = df_fs[df_fs[name_c] == obj.name]
-                if not len(row):
-                    continue
-                want = cols.get("max" if op == "max" else "mean")
-                if want is None:
-                    continue
-                try:
-                    temps[col] = float(row.iloc[0][want])
-                except Exception:
-                    pass
-            logging.warning(f"[thermal] field-summary fallback filled "
-                            f"{sum(1 for _, c, _ in missing if c in temps)}/{len(missing)} missing temps")
-        except Exception as e:
-            logging.warning(f"[thermal] field-summary fallback failed: {e}")
+            n_calc += 1
+        except Exception:
+            n_fail += 1
+    logging.warning(f"[thermal] extraction: field-summary {n_fs}, calculator {n_calc}, "
+                    f"failed {n_fail} / total {len(probe)}")
 
     def _group_max(prefixes):
         vals = [v for k, v in temps.items() if any(p in k for p in prefixes)]
