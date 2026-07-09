@@ -22,7 +22,7 @@ STATE = os.path.join(HERE, "feeder_state.json")
 
 TARGET_ACTIVE = 400   # 실행+대기 목표 (--target으로 오버라이드)
 BUFFER = 40           # 대기 버퍼 (슬롯이 비는 순간 즉시 붙도록)
-COUNT_PER_TASK = 5
+COUNT_PER_TASK = 20
 
 
 def load_state():
