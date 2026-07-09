@@ -123,7 +123,8 @@ class Simulation():
 
     def __init__(self, desktop=None):
 
-        self.NUM_CORE = 4
+        # SLURM cgroup 코어수에 맞춤 (기본 8; 로컬 등 미설정 환경은 8이 무난)
+        self.NUM_CORE = int(os.environ.get("SLURM_CPUS_PER_TASK", 8) or 8)
         self.NUM_TASK = 1
         self.desktop = desktop
         self.full_model = False
