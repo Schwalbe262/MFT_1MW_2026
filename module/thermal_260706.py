@@ -732,6 +732,42 @@ def run_thermal_analysis(sim):
         except Exception as e:
             logging.warning(f"Temp eval failed for {col}: {e}")
 
+    # ---- 폴백 2: Field Summary 일괄 export ----
+    # 리눅스 gRPC에서 필드 계산기(ClcEval/GetTopEntryValue)가 None을 뱉는 사례 실측
+    # -> Icepak 네이티브 Field Summary로 전 항목을 한 번에 뽑아 빈 자리를 채운다
+    missing = [(obj, col, op) for obj, col, op in probe if col not in temps]
+    if missing:
+        try:
+            fs = ipk.post.create_field_summary()
+            seen = set()
+            for obj, col, op in missing:
+                is3d = getattr(obj, "is3d", True)
+                key = (obj.name, is3d)
+                if key in seen:
+                    continue
+                seen.add(key)
+                fs.add_calculation("Object", "Volume" if is3d else "Surface",
+                                   obj.name, "Temperature")
+            df_fs = fs.get_field_summary_data(pandas_output=True)
+            # 컬럼: Entity/Geometry/Quantity/Min/Max/Mean ... (버전에 따라 대소문자 상이)
+            cols = {c.lower(): c for c in df_fs.columns}
+            name_c = cols.get("geometry name", cols.get("entity name", list(df_fs.columns)[2]))
+            for obj, col, op in missing:
+                row = df_fs[df_fs[name_c] == obj.name]
+                if not len(row):
+                    continue
+                want = cols.get("max" if op == "max" else "mean")
+                if want is None:
+                    continue
+                try:
+                    temps[col] = float(row.iloc[0][want])
+                except Exception:
+                    pass
+            logging.warning(f"[thermal] field-summary fallback filled "
+                            f"{sum(1 for _, c, _ in missing if c in temps)}/{len(missing)} missing temps")
+        except Exception as e:
+            logging.warning(f"[thermal] field-summary fallback failed: {e}")
+
     def _group_max(prefixes):
         vals = [v for k, v in temps.items() if any(p in k for p in prefixes)]
         return max(vals) if vals else float("nan")
