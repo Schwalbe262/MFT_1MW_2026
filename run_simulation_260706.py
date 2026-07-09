@@ -855,19 +855,57 @@ class Simulation():
         report_name = "magnetic_report"
         file_name = "magnetic_report"
 
-        # 리눅스 gRPC에서 리포트 추출이 간헐적으로 빈 DF를 반환 (pe벤치 16/20 실패 실측)
-        # -> 유효성 검사 + 재시도
+        # 리눅스에서 리포트 ExportToFile이 파일을 안 쓰는 사례 다발 (magnetic_report.csv
+        # FileNotFoundError로 벤치 31/31 전멸 실측) -> 1차: 라이브러리(report+CSV),
+        # 2차: get_solution_data로 파일 무경유 직접 추출
+        def _valid(df):
+            return (df is not None and len(df)
+                    and "Llt" in df.columns and pd.notna(df["Llt"].iloc[0]))
+
+        def _via_solution_data():
+            po = self.design1.post
+            if callable(po) and not hasattr(po, "get_solution_data"):
+                po = po()
+            sd = po.get_solution_data(expressions=[p[0] for p in params])
+            if sd is None:
+                raise RuntimeError("get_solution_data returned None")
+            scale = {"h": 1e6, "mh": 1e3, "uh": 1.0, "nh": 1e-3,
+                     "w": 1.0, "mw": 1e-3, "kw": 1e3, "": 1.0}
+            row = {}
+            for expr, name, unit in params:
+                vals = sd.data_real(expr)
+                if not vals:
+                    raise RuntimeError(f"no data for {expr}")
+                v = float(vals[0])
+                src_u = str((getattr(sd, "units_data", {}) or {}).get(expr, "") or "").lower()
+                tgt_u = unit.lower()
+                if tgt_u and src_u and src_u != tgt_u:
+                    v = v * scale.get(src_u, 1.0) / scale.get(tgt_u, 1.0)
+                row[name] = v
+            return pd.DataFrame([row])
+
+        last_err = None
         for attempt in range(3):
-            self.report1, self.df1 = self.design1.get_magnetic_parameter(
-                dir=dir, parameters=params, mod=mod, import_report=import_report,
-                report_name=report_name, file_name=file_name)
-            if (self.df1 is not None and len(self.df1)
-                    and "Llt" in self.df1.columns and pd.notna(self.df1["Llt"].iloc[0])):
+            try:
+                self.report1, self.df1 = self.design1.get_magnetic_parameter(
+                    dir=dir, parameters=params, mod=mod, import_report=import_report,
+                    report_name=report_name, file_name=file_name)
+            except Exception as e:
+                last_err = e
+                logging.warning(f"library matrix readout failed ({e}) - solution-data fallback")
+                self.df1 = None
+            if _valid(self.df1):
                 break
-            logging.warning(f"matrix readout empty/invalid (attempt {attempt + 1}/3) - retry in 20s")
+            try:
+                self.df1 = _via_solution_data()
+            except Exception as e:
+                last_err = e
+                logging.warning(f"solution-data readout failed too (attempt {attempt + 1}/3): {e}")
+            if _valid(self.df1):
+                break
             time.sleep(20)
         else:
-            raise RuntimeError("matrix parameter readout empty after 3 attempts (report gRPC flake)")
+            raise RuntimeError(f"matrix readout failed after 3 attempts (last: {last_err})")
 
         return self.df1
 
