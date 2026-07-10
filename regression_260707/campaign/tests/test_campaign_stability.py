@@ -713,7 +713,7 @@ class CollectorDatasetTests(unittest.TestCase):
         self.assertEqual(cache["local_parts"], [])
         save_cache.assert_not_called()
 
-    def test_duplicate_rows_do_not_rewrite_dataset_outputs(self):
+    def test_duplicate_rows_backfill_thermal_tier_without_creating_data_part(self):
         master = Path(self.dataset_dir) / "train.parquet"
         manifest = Path(self.dataset_dir) / "manifest.json"
         pd.DataFrame(
@@ -736,8 +736,38 @@ class CollectorDatasetTests(unittest.TestCase):
             result = collect_wave.main(["--prefix", "mft-camp"])
 
         self.assertEqual(result["new_unique_rows"], 0)
-        self.assertEqual(master.read_bytes(), before)
-        self.assertEqual(manifest.read_text(encoding="utf-8"), "sentinel")
+        self.assertNotEqual(master.read_bytes(), before)
+        normalized = pd.read_parquet(master)
+        self.assertEqual(normalized["thermal_strict_valid"].tolist(), [0])
+        self.assertEqual(normalized["thermal_training_tier"].tolist(), ["em_only"])
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["new_unique_rows"], 0)
+        self.assertEqual(metadata["total_rows"], 1)
+        self.assertEqual(list(Path(self.dataset_dir).glob("collected_*.parquet")), [])
+
+    def test_empty_collection_cycle_backfills_legacy_thermal_claims(self):
+        master = Path(self.dataset_dir) / "train.parquet"
+        pd.DataFrame([{
+            "project_name": "legacy",
+            "saved_at": "t1",
+            "thermal_solved": 1,
+            "N2_side": 2,
+            "Tprobe_Tx_leeward_max": 75.0,
+        }]).to_parquet(master, index=False)
+        self.write_source_ranks([{
+            "project_name": "legacy",
+            "saved_at": "t1",
+            collect_wave.SOURCE_RANK_COLUMN: collect_wave.SOURCE_RANK_JSON,
+        }])
+
+        with mock.patch.object(collect_wave, "list_tasks", return_value=[]):
+            result = collect_wave.main(["--prefix", "mft-camp"])
+
+        self.assertEqual(result["new_unique_rows"], 0)
+        normalized = pd.read_parquet(master)
+        self.assertEqual(normalized["thermal_solved"].tolist(), [0])
+        self.assertEqual(normalized["thermal_strict_valid"].tolist(), [0])
+        self.assertEqual(normalized["thermal_training_tier"].tolist(), ["em_only"])
         self.assertEqual(list(Path(self.dataset_dir).glob("collected_*.parquet")), [])
 
     def test_terminal_duplicate_commits_harvested_after_locked_merge(self):
@@ -975,12 +1005,18 @@ class ThermalValidityTests(unittest.TestCase):
             },
             {
                 "project_name": "new-complete-contract",
+                "result_valid_em": 1,
+                "result_valid_thermal": 1,
                 "thermal_solved": 1,
                 "N2_side": 0,
+                "n_explicit_turns": 0,
                 "T_max_Tx": 80.0,
                 "T_max_Rx_main": 81.0,
                 "T_max_Rx_side": float("nan"),
                 "T_max_core": 82.0,
+                "Tprobe_Tx_leeward_max": 79.0,
+                "Tprobe_Rx_main_leeward_max": 80.0,
+                "Tprobe_core_center_max": 81.0,
                 "thermal_required_group_mask": 11,
                 "thermal_required_missing_count": 0,
                 "thermal_extraction_complete": 1,
@@ -994,6 +1030,12 @@ class ThermalValidityTests(unittest.TestCase):
                 "thermal_residual_y_velocity": 9e-4,
                 "thermal_residual_z_velocity": 4e-4,
                 "thermal_residual_energy": 4e-9,
+                "thermal_rx_model": "homogenized_blocks",
+                "thermal_rx_power_balance_ok": 1,
+                "thermal_rx_power_balance_group_count": 1,
+                "thermal_rx_power_balance_max_abs_w": 0.0,
+                "thermal_rx_expected_power_w": 60.0,
+                "thermal_rx_assigned_power_w": 60.0,
             },
             {
                 "project_name": "loose-residual-contract",
@@ -1027,8 +1069,13 @@ class ThermalValidityTests(unittest.TestCase):
         self.assertEqual(normalized["result_valid_thermal"].iloc[0], 0)
         self.assertEqual(normalized["result_valid_thermal"].iloc[1], 0)
         self.assertEqual(normalized["result_valid_thermal"].iloc[2], 0)
-        self.assertTrue(pd.isna(normalized["result_valid_thermal"].iloc[3]))
+        self.assertEqual(normalized["result_valid_thermal"].iloc[3], 1)
         self.assertEqual(normalized["result_valid_thermal"].iloc[4], 0)
+        self.assertEqual(normalized["thermal_strict_valid"].tolist(), [0, 0, 0, 1, 0])
+        self.assertEqual(
+            normalized["thermal_training_tier"].tolist(),
+            ["em_only", "em_only", "em_only", "strict_thermal", "em_only"],
+        )
 
 
 class ProvenanceFilterTests(unittest.TestCase):

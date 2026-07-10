@@ -14,13 +14,26 @@ import io
 import json
 import math
 import os
+import sys
 import tempfile
 import time
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
 from filelock import FileLock
+
+REGRESSION_ROOT = Path(__file__).resolve().parents[1]
+if str(REGRESSION_ROOT) not in sys.path:
+    sys.path.insert(0, str(REGRESSION_ROOT))
+
+from thermal_quality import (  # noqa: E402
+    THERMAL_STRICT_VALID_COLUMN,
+    THERMAL_TIER_COLUMN,
+    annotate_thermal_tier,
+    strict_thermal_mask,
+)
 
 SCHEDULER = "http://127.0.0.1:8000"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -370,92 +383,22 @@ def convergence_filter(df, max_err=1.5):
 
 
 def normalize_thermal_validity(df):
-    """Demote thermal success flags without complete physical and convergence evidence."""
-    if "thermal_solved" not in df.columns:
-        return df, 0
-    solved = pd.to_numeric(df["thermal_solved"], errors="coerce").eq(1)
-    if not solved.any():
-        return df, 0
-
-    required = ("T_max_Tx", "T_max_Rx_main", "T_max_core")
-    complete = pd.Series(True, index=df.index)
-    for column in required:
-        if column not in df.columns:
-            complete &= False
-        else:
-            complete &= pd.to_numeric(df[column], errors="coerce").map(math.isfinite)
-
-    if "N2_side" not in df.columns:
-        complete &= False
-        side_required = pd.Series(False, index=df.index)
-    else:
-        n2_side = pd.to_numeric(df["N2_side"], errors="coerce")
-        complete &= n2_side.notna()
-        side_required = n2_side.gt(0)
-    if "T_max_Rx_side" not in df.columns:
-        complete &= ~side_required
-    else:
-        side_finite = pd.to_numeric(df["T_max_Rx_side"], errors="coerce").map(math.isfinite)
-        complete &= ~side_required | side_finite
-
-    expected_mask = pd.Series(11, index=df.index).where(~side_required, 15)
-    for column, predicate in (
-        ("thermal_required_group_mask", lambda values: values.eq(expected_mask)),
-        ("thermal_required_missing_count", lambda values: values.eq(0)),
-        ("thermal_extraction_complete", lambda values: values.eq(1)),
-    ):
-        if column in df.columns:
-            values = pd.to_numeric(df[column], errors="coerce")
-            has_contract = values.notna()
-            complete &= ~has_contract | predicate(values)
-
-    # New solver rows must carry native residual proof. Legacy rows without the
-    # field remain EM-only rather than being silently trusted as thermal data.
-    for column in ("thermal_convergence_available", "thermal_converged"):
-        if column not in df.columns:
-            complete &= False
-        else:
-            complete &= pd.to_numeric(df[column], errors="coerce").eq(1)
-    residual_columns = (
-        "thermal_residual_continuity",
-        "thermal_residual_x_velocity",
-        "thermal_residual_y_velocity",
-        "thermal_residual_z_velocity",
+    """Persist strict thermal tiering while preserving invalid rows for EM use."""
+    strict = strict_thermal_mask(df)
+    solved = (
+        pd.to_numeric(df["thermal_solved"], errors="coerce").eq(1)
+        if "thermal_solved" in df.columns
+        else pd.Series(False, index=df.index, dtype=bool)
     )
-    if "thermal_residual_flow_limit" not in df.columns:
-        complete &= False
-    else:
-        flow_limit = pd.to_numeric(df["thermal_residual_flow_limit"], errors="coerce")
-        complete &= flow_limit.map(math.isfinite) & flow_limit.gt(0) & flow_limit.le(1e-3)
-        for column in residual_columns:
-            if column not in df.columns:
-                complete &= False
-            else:
-                residual = pd.to_numeric(df[column], errors="coerce")
-                complete &= residual.map(math.isfinite) & residual.ge(0) & residual.le(flow_limit)
-    if "thermal_residual_energy_limit" not in df.columns or "thermal_residual_energy" not in df.columns:
-        complete &= False
-    else:
-        energy_limit = pd.to_numeric(df["thermal_residual_energy_limit"], errors="coerce")
-        energy = pd.to_numeric(df["thermal_residual_energy"], errors="coerce")
-        complete &= (
-            energy_limit.map(math.isfinite) & energy_limit.gt(0) & energy_limit.le(1e-7)
-            & energy.map(math.isfinite) & energy.ge(0) & energy.le(energy_limit)
-        )
-    if "thermal_iterations" not in df.columns:
-        complete &= False
-    else:
-        complete &= pd.to_numeric(df["thermal_iterations"], errors="coerce").gt(0)
-
-    invalid = solved & ~complete
-    count = int(invalid.sum())
+    invalid_claim = solved & ~strict
+    out = annotate_thermal_tier(df)
+    count = int(invalid_claim.sum())
     if count:
-        df = df.copy()
-        df.loc[invalid, "thermal_solved"] = 0
-        if "result_valid_thermal" not in df.columns:
-            df["result_valid_thermal"] = float("nan")
-        df.loc[invalid, "result_valid_thermal"] = 0
-    return df, count
+        out.loc[invalid_claim, "thermal_solved"] = 0
+        if "result_valid_thermal" not in out.columns:
+            out["result_valid_thermal"] = float("nan")
+        out.loc[invalid_claim, "result_valid_thermal"] = 0
+    return out, count
 
 
 def reject_explicit_dirty_provenance(df):
@@ -748,6 +691,28 @@ def _replace_staged(staged_targets):
                 os.remove(staged)
 
 
+def _thermal_normalization_changed(original, normalized):
+    if original is None:
+        return False
+    for column in (
+        "thermal_solved",
+        "result_valid_thermal",
+        THERMAL_STRICT_VALID_COLUMN,
+        THERMAL_TIER_COLUMN,
+    ):
+        if (column in original.columns) != (column in normalized.columns):
+            return True
+        if column not in original.columns:
+            continue
+        try:
+            pd.testing.assert_series_equal(
+                original[column], normalized[column], check_dtype=False
+            )
+        except AssertionError:
+            return True
+    return False
+
+
 def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_nodata=(),
                   pending_local_parts=()):
     """Merge rows and terminal cache state under one inter-process lock."""
@@ -756,7 +721,14 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
     source_rank_path = os.path.join(DATASET_DIR, "source_ranks.parquet")
     lock_path = master_path + ".lock"
     with FileLock(lock_path):
-        old = pd.read_parquet(master_path) if os.path.isfile(master_path) else None
+        raw_old = pd.read_parquet(master_path) if os.path.isfile(master_path) else None
+        if raw_old is None:
+            old = None
+            old_thermal_changed = False
+        else:
+            old, _ = normalize_thermal_validity(raw_old)
+            old_thermal_changed = _thermal_normalization_changed(raw_old, old)
+        merged, _ = normalize_thermal_validity(merged)
         source_ranks = (
             pd.read_parquet(source_rank_path) if os.path.isfile(source_rank_path) else None
         )
@@ -766,6 +738,27 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
         new_rows = select_new_unique_rows(merged, ranked_old, dedup_keys)
         new_unique_rows = len(new_rows)
         if not new_unique_rows:
+            if old_thermal_changed:
+                stamp = datetime.now().strftime("%y%m%d_%H%M%S_%f")
+                manifest = {
+                    "updated": stamp,
+                    "total_rows": len(old),
+                    "new_rows": 0,
+                    "new_unique_rows": 0,
+                    "git_hashes": sorted(old["git_hash"].dropna().unique().tolist())
+                    if "git_hash" in old.columns else [],
+                    "prefix": prefix,
+                }
+                staged = []
+                try:
+                    staged.append((_stage_manifest(manifest, manifest_path), manifest_path))
+                    staged.append((_stage_parquet(old, master_path), master_path))
+                    _replace_staged(staged)
+                except Exception:
+                    for temp_path, _ in staged:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                    raise
             _commit_pending_cache(
                 pending_harvested, pending_nodata, pending_local_parts)
             return new_unique_rows, 0 if old is None else len(old), master_path
@@ -779,6 +772,7 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
         source_ranks = _source_rank_rows(ranked_allf, dedup_keys)
         persisted_new_rows = new_rows.drop(columns=[SOURCE_RANK_COLUMN], errors="ignore")
         allf = ranked_allf.drop(columns=[SOURCE_RANK_COLUMN], errors="ignore")
+        allf, _ = normalize_thermal_validity(allf)
         manifest = {
             "updated": stamp, "total_rows": len(allf), "new_rows": new_unique_rows,
             "new_unique_rows": new_unique_rows,
@@ -932,11 +926,14 @@ def main(argv=None):
         frame["task_name"] = "local"
         frames.append(frame)
 
+    dedup_keys = ["project_name", "saved_at"]
     if not frames:
-        master_path = os.path.join(DATASET_DIR, "train.parquet")
-        with FileLock(master_path + ".lock"):
-            _commit_pending_cache(
-                pending_harvested, pending_nodata, pending_local_parts)
+        merge_dataset(
+            pd.DataFrame(), dedup_keys, args.prefix,
+            pending_harvested=pending_harvested,
+            pending_nodata=pending_nodata,
+            pending_local_parts=pending_local_parts,
+        )
         print("new_unique_rows: 0")
         print("no result rows collected")
         return {"new_unique_rows": 0, "fetch_errors": n_fetch_errors}
@@ -949,7 +946,6 @@ def main(argv=None):
     # 중복 제거 (재회수/재시도 대비)
     # Both fields are required for the primary identity. A missing column sends
     # every row through the content-hash legacy fallback.
-    dedup_keys = ["project_name", "saved_at"]
     before = len(merged)
     merged = _deduplicate_ranked_rows(merged, dedup_keys)
     print(f"dedup: {before} -> {len(merged)}")

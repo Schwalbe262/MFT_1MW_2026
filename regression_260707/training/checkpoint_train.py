@@ -9,10 +9,18 @@
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+REGRESSION_ROOT = Path(__file__).resolve().parents[1]
+if str(REGRESSION_ROOT) not in sys.path:
+    sys.path.insert(0, str(REGRESSION_ROOT))
+
+from thermal_quality import target_training_mask  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
@@ -36,7 +44,8 @@ TARGETS = {
 # 특징량: 입력 파라미터 + 파생 물리량 (결과/메타 컬럼 제외)
 EXCLUDE_PREFIXES = ("Ltx", "Lrx", "M", "k", "Lm", "Ll", "Tx_loss", "Rx_loss", "P_", "B_",
                     "I1_", "phi", "I2_phase_used", "T_", "Tprobe_", "time", "conv_", "mesh_",
-                    "git_hash", "project_name", "saved_at", "task_", "fail_")
+                    "thermal_", "result_valid_", "git_hash", "project_name", "saved_at",
+                    "task_", "fail_")
 
 
 def to_physical(df):
@@ -128,10 +137,8 @@ def main():
         if target not in df.columns:
             print(f"  [skip] {target} (컬럼 없음)")
             continue
-        # 온도 타겟: thermal 솔브가 성공한 행만 (thermal_solved 플래그, 2026-07-09)
-        if target.startswith('Tprobe') and 'thermal_solved' in df.columns:
-            df = df[df['thermal_solved'].fillna(0) == 1]
-        sub = df.dropna(subset=[target])
+        # Temperature targets use the shared fail-closed thermal evidence gate.
+        sub = df.loc[target_training_mask(df, target)].dropna(subset=[target])
         sub = sub[np.isfinite(sub[target])]
         if len(sub) < 100:
             print(f"  [skip] {target} (n={len(sub)} < 100)")

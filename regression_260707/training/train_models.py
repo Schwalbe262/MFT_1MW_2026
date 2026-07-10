@@ -26,6 +26,7 @@ REGISTRY = os.path.join(HERE, "registry")
 
 from checkpoint_train import (  # noqa: E402 (동일 디렉토리)
     TARGETS, to_physical, feature_columns, transform_y, inverse_y,
+    target_training_mask,
 )
 
 N_FOLDS = 5
@@ -63,13 +64,7 @@ def make_model(family, params, seed):
 def train_target(df, feats, target, cfg, family_params, sample_weight_col=None, min_rows=200):
     from sklearn.model_selection import KFold, train_test_split
 
-    # 온도 타겟: thermal 솔브가 성공한 행만 (thermal_solved 플래그, 2026-07-09)
-
-    if target.startswith('Tprobe') and 'thermal_solved' in df.columns:
-
-        df = df[df['thermal_solved'].fillna(0) == 1]
-
-    sub = df.dropna(subset=[target])
+    sub = df.loc[target_training_mask(df, target)].dropna(subset=[target])
     sub = sub[np.isfinite(sub[target])]
     if len(sub) < min_rows:
         return None, f"insufficient rows ({len(sub)})"
