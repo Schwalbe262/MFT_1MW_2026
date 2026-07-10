@@ -975,6 +975,36 @@ class ArtifactService:
                 "error": _safe_text(record_value.get("fetch_error") or record_value.get("error"), 500),
             })
 
+        fine_records = state.get("fine_task_records") \
+            if isinstance(state.get("fine_task_records"), dict) else {}
+        fine_queue = state.get("final_candidates") \
+            if isinstance(state.get("final_candidates"), list) else []
+        fine_candidates: list[dict[str, Any]] = []
+        for rank_text, record_value in fine_records.items():
+            if not isinstance(record_value, dict):
+                continue
+            rank = _integer(rank_text, -1)
+            candidate = fine_queue[rank] if 0 <= rank < len(fine_queue) \
+                and isinstance(fine_queue[rank], dict) else {}
+            result = record_value.get("result") \
+                if isinstance(record_value.get("result"), dict) else None
+            fine_candidates.append({
+                "rank": rank,
+                "candidate_id": _safe_text(candidate.get("candidate_digest"), 100),
+                "volume_L": _finite_number(candidate.get("volume_L")),
+                "profile": "fine",
+                "task_id": record_value.get("active_id") or record_value.get("original_id"),
+                "task_status": _safe_text(record_value.get("last_status"), 30),
+                "outcome": _safe_text(record_value.get("outcome"), 50),
+                "attempt": _integer(record_value.get("attempt"), 0),
+                "evaluation": self._evaluate_fea(result, require_full_model=True) if result else None,
+                "error": _safe_text(
+                    record_value.get("unverified_reason")
+                    or record_value.get("fetch_error")
+                    or record_value.get("error"), 500,
+                ),
+            })
+
         verification_counts = state.get("verification_counts") if isinstance(state.get("verification_counts"), dict) else {}
         if verification_counts:
             counts = {
@@ -1028,6 +1058,8 @@ class ArtifactService:
             final_status = "pass"
         elif declared_success or final_payload:
             final_status = "unknown"
+        elif state.get("stage") == "FINE_BLOCKED":
+            final_status = "blocked"
         else:
             final_status = "waiting"
         final = {
@@ -1035,12 +1067,22 @@ class ArtifactService:
             "status": final_status,
             "candidate_id": _safe_text(final_payload.get("candidate_id"), 100) if final_payload else None,
             "profile": _safe_text(final_payload.get("profile"), 30) or ("fine" if final_payload else None),
-            "task_id": final_payload.get("task_id") if final_payload else None,
-            "task_status": _safe_text(final_payload.get("task_status"), 30) if final_payload else None,
+            "task_id": (
+                final_payload.get("fine_task_id") or final_payload.get("task_id")
+            ) if final_payload else None,
+            "task_status": _safe_text(
+                final_payload.get("fine_task_status") or final_payload.get("task_status"), 30
+            ) if final_payload else None,
             "evaluation": final_evaluation,
             "declared_status": declared,
-            "error": _safe_text(final_payload.get("error") or final_payload.get("failure_reason"), 1000) if final_payload else None,
-            "updated_at": _safe_text(final_payload.get("updated_at") or final_payload.get("time"), 80) if final_payload else None,
+            "error": _safe_text(
+                (final_payload.get("error") or final_payload.get("failure_reason"))
+                if final_payload else state.get("fine_block_reason"), 1000,
+            ),
+            "updated_at": _safe_text(
+                final_payload.get("generated_at") or final_payload.get("updated_at")
+                or final_payload.get("time"), 80,
+            ) if final_payload else None,
             "source": final_result.path if final_result.exists else None,
         }
 
@@ -1053,6 +1095,7 @@ class ArtifactService:
             "round": _integer(state.get("round"), 0) if state else None,
             "counts": counts,
             "standard_candidates": standard,
+            "fine_candidates": fine_candidates,
             "verification_errors": errors,
             "agreement": agreement,
             "final": final,

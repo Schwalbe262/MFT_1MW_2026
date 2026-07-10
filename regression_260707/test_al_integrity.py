@@ -65,6 +65,13 @@ def valid_result(**updates):
         "loss_conductor_mesh_operation_count": 3,
         "loss_plate_eddy_on_readback_count": 5,
         "Llt": 13.75,
+        "Ltx": 100.0,
+        "Lrx": 100.0,
+        "M": 86.25,
+        "k": 0.8625,
+        "Lmt": 86.25,
+        "Lmr": 86.25,
+        "Llr": 13.75,
         "full_model": 0,
         "matrix_on": 1,
         "loss_on": 1,
@@ -84,12 +91,26 @@ def valid_result(**updates):
         "P_target": 1_000_000.0,
         "keep_project": 0,
         "B_max_core": 1.1,
+        "B_mean_core": 0.8,
         "N2_side": 2,
+        "conv_passes_matrix": 3,
         "conv_error_pct_matrix": 0.5,
+        "conv_delta_pct_matrix": 0.2,
+        "conv_passes_loss": 3,
         "conv_error_pct_loss": 0.6,
+        "conv_delta_pct_loss": 0.3,
         "P_winding_total": 4000.0,
         "P_core_total": 2000.0,
         "P_core_plate_total": 500.0,
+        "P_wcp_total": 0.0,
+        "cc_w2c_space_x": 40.0,
+        "cc_w2c_space_y": 40.0,
+        "w2c_w1c_space_x": 40.0,
+        "w2c_w1c_space_y": 40.0,
+        "w1c_w2s_gap_x_actual": 40.0,
+        "w1s_cs_space_x": 40.0,
+        "cs_w1s_space_y": 40.0,
+        "h_gap2": 40.0,
         "T_max_Tx": 90.0,
         "T_max_Rx_main": 91.0,
         "T_max_Rx_side": 92.0,
@@ -138,22 +159,22 @@ class ThermalTrainingFilterTests(unittest.TestCase):
     def test_only_complete_unsaturated_rows_feed_temperature_models(self):
         target = "Tprobe_core_center_max"
         frame = pd.DataFrame([
-            {"sample": "valid", "thermal_solved": 1, "result_valid_thermal": 1,
-             target: 92.0},
-            {"sample": "thermal-invalid", "thermal_solved": 1,
-             "result_valid_thermal": 0, target: 93.0},
-            {"sample": "not-solved", "thermal_solved": 0,
-             "result_valid_thermal": 1, target: 94.0},
-            {"sample": "below-cap", "thermal_solved": 1,
-             "result_valid_thermal": 1, target: 4699.9},
-            {"sample": "at-cap", "thermal_solved": 1,
-             "result_valid_thermal": 1, target: 4700.0},
+            valid_result(sample="valid", **{target: 92.0}),
+            valid_result(sample="thermal-invalid", result_valid_thermal=0,
+                         **{target: 93.0}),
+            valid_result(sample="not-solved", thermal_solved=0,
+                         **{target: 94.0}),
+            valid_result(sample="below-cap", **{target: 4699.9}),
+            valid_result(sample="at-cap", **{target: 4700.0}),
         ])
 
         filtered = filter_valid_training_rows(frame, target)
 
         self.assertEqual(filtered["sample"].tolist(), ["valid", "below-cap"])
-        self.assertIs(filter_valid_training_rows(frame, "Llt_phys"), frame)
+        self.assertEqual(
+            filter_valid_training_rows(frame, "Llt")["sample"].tolist(),
+            ["valid", "below-cap"],
+        )
 
 
 def verification_counts(total=3, valid=3, exhausted=0, pending=0):
@@ -655,6 +676,7 @@ class WaitStateIntegrityTests(unittest.TestCase):
                         return_value=pd.DataFrame({"unused": [1]})), \
                     patch.object(al_driver, "save_state") as save, \
                     patch.object(al_driver.time, "sleep"), \
+                    patch.object(al_driver, "EXECUTE_SUBMISSIONS", True), \
                     patch.object(
                         scheduler_client, "submit_verification", return_value=17) as submit:
                 al_driver.stage_submit(state)
@@ -1147,7 +1169,9 @@ class ActiveLearningGateTests(unittest.TestCase):
         self.assertTrue(history["verification_coverage_ok"])
         self.assertTrue(history["verification_rows_complete"])
         self.assertEqual(history["fea_full_spec_pass"], 3)
-        self.assertEqual(state["stage"], "DONE")
+        self.assertEqual(state["stage"], "TRAIN")
+        self.assertTrue(state["post_convergence_retrain_done"])
+        self.assertEqual(state["round"], 2)
 
     def test_hard_cap_is_not_reported_as_verified_done(self):
         state = {

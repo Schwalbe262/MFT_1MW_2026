@@ -1,12 +1,28 @@
 {
- "comment": "최종 검증 프로파일 (게이트5a): 풀모델 + 전압원 loss + 풀 thermal (부력 on) + fine 정밀도",
- "cli_flags": "--thermal --headless --full",
- "param_overrides": {
-  "matrix_on": 1, "loss_on": 1, "thermal_on": 1,
-  "loss_sym_on": 0, "thermal_symmetry": "full",
-  "percent_error": 0.5, "max_passes": 18,
-  "n_explicit_turns": 2,
-  "P_target": 1000000.0, "keep_project": 1
- },
- "mem_mb": 98304, "cpus": 8
+  "comment": "Final exact-geometry FEA: full model, explicit turns, full thermal domain, 0.5% EM convergence",
+  "cli_flags": "--thermal --headless --full",
+  "param_overrides": {
+    "full_model": 1,
+    "matrix_on": 1,
+    "loss_on": 1,
+    "thermal_on": 1,
+    "loss_sym_on": 0,
+    "thermal_symmetry": "full",
+    "n_explicit_turns": 2,
+    "matrix_skin_mesh": 1,
+    "matrix_percent_error": 0.5,
+    "matrix_max_passes": 24,
+    "matrix_min_converged": 2,
+    "percent_error": 0.5,
+    "max_passes": 18,
+    "min_converged": 2,
+    "freq": 1000.0,
+    "loss_from_copy": 1,
+    "P_target": 1000000.0,
+    "keep_project": 1
+  },
+  "mem_mb": 98304,
+  "cpus": 8,
+  "timeout_seconds": 21600,
+  "manufacturing_tolerance_policy": "excluded; exact-as-FEA geometry is assumed"
 }

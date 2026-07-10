@@ -54,6 +54,15 @@ class MFTProblem(Problem):
     """
 
     def __init__(self, models, spec=None, density_gate=None, fixed_overrides=None):
+        required = {
+            "Llt_phys", "P_winding_total", "P_core_total",
+            "P_core_plate_total", "B_max_core", *T_TARGETS,
+        }
+        missing = sorted(required.difference(models))
+        if missing:
+            raise ValueError(f"required surrogate models are missing: {missing}")
+        if density_gate is None:
+            raise ValueError("a strict-full density gate is required")
         self.models = models
         self.spec = dict(DEFAULT_SPEC, **(spec or {}))
         self.density_gate = density_gate
@@ -110,8 +119,7 @@ class MFTProblem(Problem):
             mu_llt, sg_llt = self._predict("Llt_phys", sub)
             mu_pw, sg_pw = self._predict("P_winding_total", sub)
             mu_pc, sg_pc = self._predict("P_core_total", sub)
-            mu_pp, sg_pp = (self._predict("P_core_plate_total", sub)
-                            if "P_core_plate_total" in self.models else (np.zeros(len(sub)),) * 2)
+            mu_pp, sg_pp = self._predict("P_core_plate_total", sub)
             mu_b, sg_b = self._predict("B_max_core", sub)
 
             total_loss = mu_pw + mu_pc + mu_pp
@@ -123,11 +131,8 @@ class MFTProblem(Problem):
             G[idx, 0] = np.abs(mu_llt - spec["Llt_target_uH"]) + q * sg_llt - spec["Llt_tol_uH"]
             # g1..g4: 온도 4종
             for t_i, t_name in enumerate(T_TARGETS):
-                if t_name in self.models:
-                    mu_t, sg_t = self._predict(t_name, sub)
-                    G[idx, 1 + t_i] = mu_t + q * sg_t - spec["T_limit_C"]
-                else:
-                    G[idx, 1 + t_i] = -1.0  # 모델 없으면 비활성 (파일럿 단계)
+                mu_t, sg_t = self._predict(t_name, sub)
+                G[idx, 1 + t_i] = mu_t + q * sg_t - spec["T_limit_C"]
             # g5: B 한계
             G[idx, 5] = mu_b + q * sg_b - spec["B_limit_T"]
             # g6: 간격 비례축소 필요량 (절연 하한 불가침 위반)
@@ -136,18 +141,15 @@ class MFTProblem(Problem):
             if "h_gap2" in sub.columns:
                 G[idx, 7] = spec["insulation_min_mm"] - sub["h_gap2"].to_numpy(dtype=float)
             else:
-                G[idx, 7] = -1.0
+                G[idx, 7] = BIG
             # g8: 데이터 밀도 게이트 (외삽 봉쇄)
-            if self.density_gate is not None:
-                G[idx, 8] = self.density_gate(sub)
-            else:
-                G[idx, 8] = -1.0
+            G[idx, 8] = self.density_gate(sub)
             # g9: 앙상블 불일치 게이트 - Llt 예측기들의 원공간 폭이 밴드 전폭을 넘으면 신뢰 불가
             try:
                 dis = self.models["Llt_phys"].disagreement(sub)
                 G[idx, 9] = dis - 2.0 * spec["Llt_tol_uH"]
             except Exception:
-                G[idx, 9] = -1.0
+                G[idx, 9] = BIG
 
         out["F"] = F
         out["G"] = G

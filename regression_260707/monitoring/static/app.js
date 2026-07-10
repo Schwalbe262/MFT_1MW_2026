@@ -292,7 +292,10 @@
     const counts = payload.counts || {};
     setText("#verify-coverage", counts.total ? `유효 ${number(counts.valid)} / ${number(counts.total)} · coverage ${counts.coverage == null ? "—" : `${number(counts.coverage * 100, 1)}%`}` : "아직 제출된 검증이 없습니다.");
     const tbody = $("#verification-table"); tbody.replaceChildren();
-    const candidates = payload.standard_candidates || [];
+    const candidates = [
+      ...(payload.standard_candidates || []),
+      ...(payload.fine_candidates || []),
+    ];
     candidates.forEach((candidate) => {
       const evaluation = candidate.evaluation || {};
       const row = element("tr", "");
@@ -311,11 +314,11 @@
 
   function renderFinal(final) {
     const status = final.status || "waiting";
-    const statusClass = status === "pass" ? "pass" : status === "fail" ? "fail" : "waiting";
+    const statusClass = status === "pass" ? "pass" : ["fail", "blocked"].includes(status) ? "fail" : "waiting";
     const card = $("#final-card"); card.className = `panel final-card ${statusClass}`;
-    setText("#final-title", status === "pass" ? "최종 설계 확정" : status === "fail" ? "최종 검증 실패" : "최종 검증 대기");
-    const badge = $("#final-badge"); badge.className = `result-badge ${status === "pass" || status === "fail" ? status : "unknown"}`; badge.textContent = status === "pass" ? "PASS" : status === "fail" ? "FAIL" : "WAIT";
-    setText("#final-description", final.available ? "명목 형상 full-model fine FEA의 항목별 판정입니다. 제작공차는 포함하지 않습니다." : "최소 체적 후보가 선정되고 fine FEA가 완료되면 항목별 판정이 고정됩니다.");
+    setText("#final-title", status === "pass" ? "최종 설계 확정" : status === "fail" ? "최종 검증 실패" : status === "blocked" ? "최종 검증 차단" : "최종 검증 대기");
+    const badge = $("#final-badge"); badge.className = `result-badge ${status === "pass" ? "pass" : ["fail", "blocked"].includes(status) ? "fail" : "unknown"}`; badge.textContent = status === "pass" ? "PASS" : status === "fail" ? "FAIL" : status === "blocked" ? "BLOCKED" : "WAIT";
+    setText("#final-description", status === "blocked" ? (final.error || "작은 후보의 fine FEA 증거가 불완전해 최소부피 판정을 차단했습니다.") : final.available ? "명목 형상 full-model fine FEA의 항목별 판정입니다. 제작공차는 포함하지 않습니다." : "최소 체적 후보가 선정되고 fine FEA가 완료되면 항목별 판정이 고정됩니다.");
     makeChecks($("#final-checks"), final.evaluation?.checks || {});
     setText("#final-candidate", final.candidate_id);
     setText("#final-task", final.task_id);

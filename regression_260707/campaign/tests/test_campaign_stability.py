@@ -1033,13 +1033,15 @@ class ThermalValidityTests(unittest.TestCase):
 
         normalized, count = collect_wave.normalize_thermal_validity(frame)
 
-        self.assertEqual(count, 5)
+        # Even the superficially complete legacy row is demoted because it has
+        # no native Rx power-balance proof; stored thermal flags are insufficient.
+        self.assertEqual(count, 6)
         self.assertEqual(normalized["project_name"].tolist(), frame["project_name"].tolist())
-        self.assertEqual(normalized["thermal_solved"].tolist(), [0, 0, 0, 1, 0, 0])
+        self.assertEqual(normalized["thermal_solved"].tolist(), [0, 0, 0, 0, 0, 0])
         self.assertEqual(normalized["result_valid_thermal"].iloc[0], 0)
         self.assertEqual(normalized["result_valid_thermal"].iloc[1], 0)
         self.assertEqual(normalized["result_valid_thermal"].iloc[2], 0)
-        self.assertTrue(pd.isna(normalized["result_valid_thermal"].iloc[3]))
+        self.assertEqual(normalized["result_valid_thermal"].iloc[3], 0)
         self.assertEqual(normalized["result_valid_thermal"].iloc[4], 0)
         self.assertEqual(normalized["result_valid_thermal"].iloc[5], 0)
         self.assertEqual(normalized["result_valid_em"].iloc[5], 1)

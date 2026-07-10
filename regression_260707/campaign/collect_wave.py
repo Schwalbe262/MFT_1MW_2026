@@ -14,6 +14,7 @@ import io
 import json
 import math
 import os
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -381,11 +382,41 @@ def sanitize_bad_probes(df):
 
 
 def convergence_filter(df, max_err=1.5):
-    keep = pd.Series(True, index=df.index)
-    for col in ["conv_error_pct_matrix", "conv_error_pct_loss"]:
-        if col in df.columns:
-            keep &= (df[col].isna()) | (df[col] <= max_err)
-    return df[keep], int((~keep).sum())
+    """Keep the audit stream, but demote forged/legacy EM success flags.
+
+    Partial RESULT_JSON rows remain valuable operational evidence and the
+    collector historically preserves rows with no convergence columns.  They
+    are never admitted to strict training: any explicit success flag is
+    recomputed and demoted here, and ``quality_contract`` builds the actual
+    strict cohort later.
+    """
+    regression_root = os.path.abspath(os.path.join(HERE, ".."))
+    if regression_root not in sys.path:
+        sys.path.insert(0, regression_root)
+    from quality_contract import annotate_validity
+
+    audited = annotate_validity(df)
+    clean = audited.copy()
+    if "result_valid_em" in clean.columns:
+        claimed = pd.to_numeric(clean["result_valid_em"], errors="coerce").eq(1)
+        invalid_claim = claimed & ~clean["_strict_valid_em"].fillna(False).astype(bool)
+        clean.loc[invalid_claim, "result_valid_em"] = 0
+        clean.loc[invalid_claim, "em_validity_reason"] = clean.loc[
+            invalid_claim, "_strict_invalid_reasons"
+        ]
+    keep = pd.Series(True, index=clean.index)
+    for column in ("conv_error_pct_matrix", "conv_error_pct_loss"):
+        if column in clean.columns:
+            values = pd.to_numeric(clean[column], errors="coerce")
+            keep &= values.isna() | values.le(max_err)
+    clean = clean.loc[keep].drop(
+        columns=[
+            "_strict_valid_em", "_strict_valid_thermal",
+            "_strict_valid_full", "_strict_invalid_reasons",
+        ],
+        errors="ignore",
+    )
+    return clean, int((~keep).sum())
 
 
 def normalize_thermal_validity(df):
@@ -476,6 +507,16 @@ def normalize_thermal_validity(df):
     else:
         complete &= pd.to_numeric(df["thermal_iterations"], errors="coerce").gt(0)
 
+    # Recompute the canonical contract as well.  The local checks above retain
+    # compatibility with old audit columns; this adds the previously missing
+    # power-balance and all-temperature saturation evidence.
+    regression_root = os.path.abspath(os.path.join(HERE, ".."))
+    if regression_root not in sys.path:
+        sys.path.insert(0, regression_root)
+    from quality_contract import annotate_validity
+
+    audited = annotate_validity(df)
+    complete &= audited["_strict_valid_thermal"].fillna(False).astype(bool)
     invalid = solved & ~complete
     count = int(invalid.sum())
     if count:

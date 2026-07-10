@@ -25,6 +25,7 @@ import time
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+CODE_ROOT = HERE
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -38,8 +39,16 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "training"))
 sys.path.insert(0, os.path.join(HERE, "verify"))
 
-STATE_PATH = os.path.join(HERE, "al_rounds", "state.json")
-DATASET = os.path.join(HERE, "data", "dataset", "train.parquet")
+RUNTIME_ROOT = HERE
+OUTPUT_ROOT = HERE
+AL_ROOT = os.path.join(OUTPUT_ROOT, "al_rounds")
+STATE_PATH = os.path.join(AL_ROOT, "state.json")
+DATASET = os.path.join(RUNTIME_ROOT, "data", "dataset", "train.parquet")
+REGISTRY = os.path.join(RUNTIME_ROOT, "training", "registry")
+QUALITY_STATUS = os.path.join(RUNTIME_ROOT, "training", "model_quality_status.json")
+EXECUTE_SUBMISSIONS = False
+PINNED_SOLVER_REVISION = None
+PINNED_LIBRARY_REVISION = None
 PY = sys.executable
 
 SPEC = {
@@ -66,6 +75,36 @@ TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 LOSS_COMPONENTS = ("P_winding_total", "P_core_total", "P_core_plate_total")
 SOURCE_RANK_COLUMN = "_collector_source_rank"
 AL_SOURCE_RANK = 50
+
+
+def configure_runtime(
+        runtime_root=None, dataset=None, output_root=None, registry=None,
+        solver_revision=None, library_revision=None):
+    """Point code in this worktree at a live runtime without changing its HEAD."""
+    global RUNTIME_ROOT, OUTPUT_ROOT, AL_ROOT, STATE_PATH, DATASET, REGISTRY, QUALITY_STATUS
+    global PINNED_SOLVER_REVISION, PINNED_LIBRARY_REVISION
+    RUNTIME_ROOT = os.path.abspath(runtime_root or HERE)
+    OUTPUT_ROOT = os.path.abspath(output_root or RUNTIME_ROOT)
+    AL_ROOT = os.path.join(OUTPUT_ROOT, "al_rounds")
+    STATE_PATH = os.path.join(AL_ROOT, "state.json")
+    DATASET = os.path.abspath(
+        dataset or os.path.join(RUNTIME_ROOT, "data", "dataset", "train.parquet")
+    )
+    REGISTRY = os.path.abspath(
+        registry or os.path.join(RUNTIME_ROOT, "training", "registry")
+    )
+    QUALITY_STATUS = os.path.join(
+        RUNTIME_ROOT, "training", "model_quality_status.json"
+    )
+    PINNED_SOLVER_REVISION = solver_revision
+    PINNED_LIBRARY_REVISION = library_revision
+
+
+def _active_al_root():
+    """Honor legacy tests/tools that temporarily redirect ``HERE``."""
+    if RUNTIME_ROOT == CODE_ROOT and OUTPUT_ROOT == CODE_ROOT:
+        return os.path.join(HERE, "al_rounds")
+    return AL_ROOT
 
 
 def _finite(value):
@@ -112,12 +151,30 @@ def _result_passes_spec(result):
                 return False
             if float(result[actual_column]) > SPEC["T_limit_C"]:
                 return False
+        for column in (
+                "cc_w2c_space_x", "cc_w2c_space_y",
+                "w2c_w1c_space_x", "w2c_w1c_space_y",
+                "w1c_w2s_gap_x_actual", "w1s_cs_space_x",
+                "cs_w1s_space_y", "h_gap2"):
+            if (not _finite(result.get(column))
+                    or float(result[column]) < 40.0):
+                return False
+        if _finite(result.get("N1_side")) and float(result["N1_side"]) > 0:
+            for column in ("w2s_w1s_space_x", "w1s_w2s_space_y"):
+                if (not _finite(result.get(column))
+                        or float(result[column]) < 40.0):
+                    return False
         return True
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
 
 
 def _current_solver_revision():
+    if PINNED_SOLVER_REVISION is not None:
+        revision = str(PINNED_SOLVER_REVISION).strip().lower()
+        if len(revision) != 40 or any(ch not in "0123456789abcdef" for ch in revision):
+            raise RuntimeError(f"invalid pinned solver git revision: {revision!r}")
+        return revision
     repo_root = os.path.abspath(os.path.join(HERE, ".."))
     dirty = subprocess.check_output(
         ["git", "status", "--porcelain", "--untracked-files=all", "--",
@@ -134,6 +191,11 @@ def _current_solver_revision():
 
 
 def _current_library_revision():
+    if PINNED_LIBRARY_REVISION is not None:
+        revision = str(PINNED_LIBRARY_REVISION).strip().lower()
+        if len(revision) != 40 or any(ch not in "0123456789abcdef" for ch in revision):
+            raise RuntimeError(f"invalid pinned library git revision: {revision!r}")
+        return revision
     library_root = os.environ.get("MFT_PYAEDT_LIBRARY_ROOT", "").strip()
     if not library_root:
         library_root = os.path.join(HERE, "..", "..", "pyaedt_library")
@@ -224,6 +286,21 @@ def _atomic_write_csv(frame, target):
     os.close(fd)
     try:
         frame.to_csv(staged, index=False)
+        os.replace(staged, target)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
+
+
+def _atomic_write_json(value, target):
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    fd, staged = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", suffix=".tmp",
+        dir=os.path.dirname(target),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=1, default=str)
         os.replace(staged, target)
     finally:
         if os.path.exists(staged):
@@ -440,25 +517,114 @@ def run(cmd, **kw):
 
 
 def stage_train(st):
-    run([PY, os.path.join("training", "train_models.py")])
+    from quality_contract import annotate_validity
+
+    rnd = st["round"]
+    rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
+    os.makedirs(rdir, exist_ok=True)
+    audited = annotate_validity(
+        pd.read_parquet(DATASET),
+        expected_solver_revision=PINNED_SOLVER_REVISION,
+        expected_library_revision=PINNED_LIBRARY_REVISION,
+    )
+    strict = audited.loc[audited["_strict_valid_full"]].drop(
+        columns=[
+            "_strict_valid_em", "_strict_valid_thermal",
+            "_strict_valid_full", "_strict_invalid_reasons",
+        ],
+        errors="ignore",
+    )
+    model_dataset = os.path.join(rdir, "strict_training_snapshot.parquet")
+    _atomic_write_parquet(strict, model_dataset)
+    from training.train_models import (
+        capture_active_generation, discard_inactive_generation,
+        restore_active_generation,
+    )
+    registry_lock = FileLock(REGISTRY + ".training.lock", timeout=1)
+    registry_lock.acquire()
+    previous_generation = None
+    generation_captured = False
+    try:
+        previous_generation = capture_active_generation(REGISTRY)
+        generation_captured = True
+        run([
+            PY, os.path.join("training", "checkpoint_train.py"),
+            "--dataset", model_dataset,
+            "--curve-csv", os.path.join(
+                RUNTIME_ROOT, "training", "learning_curve.csv"
+            ),
+        ])
+        run([
+            PY, os.path.join("training", "train_models.py"),
+            "--dataset", model_dataset, "--registry", REGISTRY,
+        ])
+        run([
+            PY, os.path.join("training", "model_quality_gate.py"),
+            "--dataset", model_dataset, "--registry", REGISTRY,
+            "--status", QUALITY_STATUS,
+        ])
+        with open(os.path.join(REGISTRY, "current.json"), encoding="utf-8") as handle:
+            pointer = json.load(handle)
+        with open(QUALITY_STATUS, encoding="utf-8") as handle:
+            quality_snapshot = json.load(handle)
+        if (not quality_snapshot.get("passed")
+                or quality_snapshot.get("training_run_id") != pointer["training_run_id"]):
+            raise RuntimeError("activated registry and quality snapshot do not match")
+        generation_dir = os.path.abspath(os.path.join(REGISTRY, pointer["generation"]))
+        quality_snapshot_path = os.path.join(rdir, "model_quality_snapshot.json")
+        _atomic_write_json(quality_snapshot, quality_snapshot_path)
+    except Exception:
+        rejected_generation = None
+        pointer_path = os.path.join(REGISTRY, "current.json")
+        if os.path.isfile(pointer_path):
+            try:
+                with open(pointer_path, encoding="utf-8") as handle:
+                    current_pointer = json.load(handle)
+                candidate_generation = os.path.abspath(
+                    os.path.join(REGISTRY, current_pointer["generation"])
+                )
+                prior_path = (
+                    previous_generation.get("generation")
+                    if previous_generation else None
+                )
+                if candidate_generation != prior_path:
+                    rejected_generation = candidate_generation
+            except Exception:
+                rejected_generation = None
+        if generation_captured:
+            restore_active_generation(REGISTRY, previous_generation)
+        discard_inactive_generation(REGISTRY, rejected_generation)
+        raise
+    finally:
+        registry_lock.release()
+    st["training_dataset"] = model_dataset
+    st["training_run_id"] = pointer["training_run_id"]
+    st["training_generation"] = generation_dir
+    st["model_quality_snapshot"] = quality_snapshot
+    st["model_quality_snapshot_path"] = quality_snapshot_path
+    st["training_strict_full_rows"] = int(len(strict))
     st["stage"] = "OPTIMIZE"
 
 
 def stage_optimize(st):
     rnd = st["round"]
-    spec_path = os.path.join(HERE, "al_rounds", f"round_{rnd:02d}_spec.json")
+    spec_path = os.path.join(_active_al_root(), f"round_{rnd:02d}_spec.json")
     os.makedirs(os.path.dirname(spec_path), exist_ok=True)
     # q 적응 배율 반영
     spec = {"q_sigma": 1.28 * st.get("q_mult", 1.0)}
     json.dump(spec, open(spec_path, "w"))
     run([PY, os.path.join("optimization", "run_nsga2.py"),
-         "--restarts", "16", "--round", str(rnd), "--spec", spec_path])
+         "--restarts", "16", "--round", str(rnd), "--spec", spec_path,
+         "--dataset", st["training_dataset"], "--registry", REGISTRY,
+         "--registry-generation", st["training_generation"],
+         "--quality-status", st["model_quality_snapshot_path"],
+         "--output-root", _active_al_root()])
     st["stage"] = "SELECT"
 
 
 def stage_select(st):
     rnd = st["round"]
-    rdir = os.path.join(HERE, "al_rounds", f"round_{rnd:02d}")
+    rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     X = np.load(os.path.join(rdir, "pareto_X.npy"))
     F = np.load(os.path.join(rdir, "pareto_F.npy"))
     front = pd.read_csv(os.path.join(rdir, "pareto_front.csv"))
@@ -472,7 +638,7 @@ def stage_select(st):
     G = -np.column_stack([margin, t_margin])  # select()는 -G를 마진으로 봄
 
     verified_X = None
-    vx_path = os.path.join(HERE, "al_rounds", "verified_X.npy")
+    vx_path = os.path.join(_active_al_root(), "verified_X.npy")
     if os.path.isfile(vx_path):
         verified_X = np.load(vx_path)
 
@@ -489,8 +655,12 @@ def stage_select(st):
 
 
 def stage_submit(st):
+    if not EXECUTE_SUBMISSIONS:
+        raise RuntimeError(
+            "standard FEA submission is disabled; rerun with --execute after reviewing artifacts"
+        )
     rnd = st["round"]
-    rdir = os.path.join(HERE, "al_rounds", f"round_{rnd:02d}")
+    rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     picked = np.load(os.path.join(rdir, "selected_idx.npy")).tolist()
     front = pd.read_csv(os.path.join(rdir, "pareto_front.csv"))
 
@@ -582,7 +752,7 @@ def stage_wait(st):
     # A terminal task with no valid data is retried once at 64 GB. Active or
     # unknown states remain in WAIT and never consume a duplicate allocation.
     rnd = st["round"]
-    front = pd.read_csv(os.path.join(HERE, "al_rounds", f"round_{rnd:02d}", "pareto_front.csv"))
+    front = pd.read_csv(os.path.join(_active_al_root(), f"round_{rnd:02d}", "pareto_front.csv"))
     from module.input_parameter_260706 import KEYS
     profile_path = os.path.join(HERE, "verify", "profiles", "standard.json")
     with open(profile_path, encoding="utf-8") as profile_file:
@@ -688,7 +858,7 @@ def stage_wait(st):
 
 def stage_ingest(st):
     rnd = st["round"]
-    rdir = os.path.join(HERE, "al_rounds", f"round_{rnd:02d}")
+    rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     front = pd.read_csv(os.path.join(rdir, "pareto_front.csv"))
     import scheduler_client as sc
 
@@ -809,7 +979,7 @@ def stage_ingest(st):
             # by re-entering INGEST without duplicating either artifact.
             X = np.load(os.path.join(rdir, "pareto_X.npy"))
             v_new = X[[e["idx"] for e in errs]]
-            vx_path = os.path.join(HERE, "al_rounds", "verified_X.npy")
+            vx_path = os.path.join(_active_al_root(), "verified_X.npy")
             v_all = np.vstack([np.load(vx_path), v_new]) if os.path.isfile(vx_path) else v_new
             _atomic_save_npy(_unique_rows(v_all), vx_path)
 
@@ -924,8 +1094,17 @@ def stage_check(st):
     print(f"[al] round {rnd} check: {hist}")
 
     if agree and ok_specs >= 3 and verification_coverage_ok:
-        st["stage"] = "DONE"
-        print("[al] LOOP CONVERGED")
+        if not st.get("post_convergence_retrain_done"):
+            # The rows just ingested were not in the model that proposed this
+            # front.  One mandatory retrain -> NSGA-II -> standard-FEA round
+            # removes that one-generation lag before fine verification.
+            st["post_convergence_retrain_done"] = True
+            st["round"] = rnd + 1
+            st["stage"] = "TRAIN"
+            print("[al] standard agreement reached; mandatory final retrain scheduled")
+        else:
+            st["stage"] = "FINAL_SELECT"
+            print("[al] standard loop converged; selecting minimum-volume fine candidates")
     elif rnd >= SPEC["max_rounds"]:
         # A compute budget cap is terminal, but it is not a verified design.
         st["stage"] = "HARD_CAP"
@@ -935,22 +1114,329 @@ def stage_check(st):
         st["stage"] = "TRAIN"
 
 
+def stage_final_select(st):
+    from verify.finalize import collect_standard_pass_candidates
+
+    queue = collect_standard_pass_candidates(
+        _active_al_root(), DATASET, limit=None,
+        expected_solver_revision=(
+            st.get("solver_git_revision") or PINNED_SOLVER_REVISION
+        ),
+        expected_library_revision=(
+            st.get("pyaedt_library_git_revision") or PINNED_LIBRARY_REVISION
+        ),
+    )
+    attempted = {
+        item.get("candidate_digest")
+        for item in st.get("fine_attempt_history", [])
+        if isinstance(item, dict) and item.get("candidate_digest")
+    }
+    queue = [
+        candidate for candidate in queue
+        if candidate["candidate_digest"] not in attempted
+    ]
+    if not queue:
+        raise RuntimeError(
+            "no strict standard-FEA spec-pass candidate is available for fine verification"
+        )
+    st["fine_candidate_queue"] = queue
+    st["fine_queue_cursor"] = 0
+    st["fine_batch"] = 0
+    st["final_candidates"] = queue[:3]
+    st["fine_task_records"] = {}
+    results_dir = os.path.join(OUTPUT_ROOT, "verify", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    _atomic_write_csv(
+        pd.DataFrame([
+            {
+                "rank": rank,
+                "round": candidate["round"],
+                "index": candidate["index"],
+                "task_id": candidate["task_id"],
+                "volume_L": candidate["volume_L"],
+                "total_loss_W": candidate["total_loss_W"],
+                "candidate_digest": candidate["candidate_digest"],
+            }
+            for rank, candidate in enumerate(queue)
+        ]),
+        os.path.join(results_dir, "fine_candidate_queue.csv"),
+    )
+    st["stage"] = "FINE_SUBMIT"
+
+
+def stage_fine_submit(st):
+    if not EXECUTE_SUBMISSIONS:
+        raise RuntimeError(
+            "fine FEA submission is disabled; inspect fine_candidate_queue.csv "
+            "and rerun with --execute"
+        )
+    import scheduler_client as sc
+
+    profile_path = os.path.join(HERE, "verify", "profiles", "fine.json")
+    with open(profile_path, encoding="utf-8") as handle:
+        profile = json.load(handle)
+    solver_revision = _current_solver_revision()
+    library_revision = _current_library_revision()
+    st["fine_solver_git_revision"] = solver_revision
+    st["fine_pyaedt_library_git_revision"] = library_revision
+    records = st.setdefault("fine_task_records", {})
+    unknown = []
+    for rank, candidate in enumerate(st["final_candidates"]):
+        key = str(rank)
+        if key in records:
+            if records[key].get("active_id") is None:
+                unknown.append(key)
+            continue
+        batch = int(st.get("fine_batch", 0))
+        name = f"mft-final-fine-r{st['round']:02d}-b{batch:02d}-c{rank:02d}"
+        workdir = f"mft_final_fine_r{st['round']:02d}_b{batch:02d}_c{rank:02d}"
+        task_id = sc.submit_verification(
+            name,
+            workdir,
+            candidate["params"],
+            profile,
+            mem_mb=profile["mem_mb"],
+            cpus=profile["cpus"],
+            solver_revision=solver_revision,
+            library_revision=library_revision,
+        )
+        records[key] = _new_task_record(
+            task_id,
+            name=name,
+            workdir=workdir,
+            solver_revision=solver_revision,
+            library_revision=library_revision,
+        )
+        if task_id is None:
+            unknown.append(key)
+        save_state(st)
+    if unknown:
+        raise RuntimeError(f"fine submissions have unknown identities: {unknown}")
+    st["stage"] = "FINE_WAIT"
+
+
+def stage_fine_wait(st):
+    import scheduler_client as sc
+
+    records = st.get("fine_task_records") or {}
+    if len(records) != len(st.get("final_candidates") or []):
+        raise RuntimeError("fine task inventory is incomplete")
+    pending_records = {
+        key: record for key, record in records.items()
+        if record.get("outcome") not in ("valid", "unverified")
+    }
+    task_ids = [record.get("active_id") for record in pending_records.values()]
+    if any(task_id is None for task_id in task_ids):
+        raise RuntimeError("fine task identity is unknown; refusing duplicate submission")
+    status = sc.wait_all(task_ids, poll_s=180, timeout_s=6 * 3600)
+    with open(
+        os.path.join(HERE, "verify", "profiles", "fine.json"), encoding="utf-8"
+    ) as handle:
+        profile = json.load(handle)
+    retried = 0
+    for key, record in pending_records.items():
+        task_id = record["active_id"]
+        record["last_status"] = status.get(task_id)
+        if record["last_status"] not in TERMINAL_TASK_STATUSES:
+            continue
+        try:
+            fetched = sc.fetch_result(
+                task_id,
+                expected_revision=st["fine_solver_git_revision"],
+                expected_library_revision=st["fine_pyaedt_library_git_revision"],
+                expected_profile=profile["param_overrides"],
+            )
+        except sc.ResultFetchError as exc:
+            record["outcome"] = "fetch_error"
+            record["fetch_error"] = str(exc)
+            save_state(st)
+            raise RuntimeError(f"fine stdout unavailable for task {task_id}") from exc
+        record["last_result_state"] = fetched.state
+        if fetched.state == sc.RESULT_VALID:
+            record["outcome"] = "valid"
+            record["result"] = fetched.result
+        elif int(record.get("attempt", 0)) >= 1:
+            # This is not a physical spec failure.  The smaller candidate
+            # remains unverified and therefore blocks any minimum-volume PASS.
+            record["outcome"] = "unverified"
+            record["unverified_reason"] = fetched.state
+        else:
+            if not EXECUTE_SUBMISSIONS:
+                raise RuntimeError(
+                    "fine retry requires --execute; no larger candidate can be finalized"
+                )
+            rank = int(key)
+            candidate = st["final_candidates"][rank]
+            batch = int(st.get("fine_batch", 0))
+            retry_name = (
+                f"mft-final-fine-r{st['round']:02d}-b{batch:02d}-c{rank:02d}-retry"
+            )
+            retry_workdir = (
+                f"mft_final_fine_r{st['round']:02d}_b{batch:02d}_c{rank:02d}_retry"
+            )
+            new_task_id = sc.submit_verification(
+                retry_name,
+                retry_workdir,
+                candidate["params"],
+                profile,
+                mem_mb=max(int(profile["mem_mb"]), 131072),
+                cpus=profile["cpus"],
+                solver_revision=st["fine_solver_git_revision"],
+                library_revision=st["fine_pyaedt_library_git_revision"],
+            )
+            if new_task_id is None:
+                record["outcome"] = "retry_submission_unknown"
+                save_state(st)
+                raise RuntimeError("fine retry task identity is unknown")
+            record.update({
+                "retry_id": new_task_id,
+                "active_id": new_task_id,
+                "attempt": 1,
+                "outcome": "pending",
+                "last_status": None,
+            })
+            retried += 1
+        save_state(st)
+    if retried:
+        st["stage"] = "FINE_WAIT"
+        return
+    unverified = [
+        key for key, record in records.items()
+        if record.get("outcome") == "unverified"
+    ]
+    if unverified:
+        st["stage"] = "FINE_BLOCKED"
+        st["fine_block_reason"] = (
+            "smaller candidate fine FEA remained invalid/missing after one retry: "
+            + ",".join(unverified)
+        )
+        print(f"[al] FINE BLOCKED: {st['fine_block_reason']}")
+        return
+    if any(
+        record.get("outcome") not in ("valid", "unverified")
+        for record in records.values()
+    ):
+        st["stage"] = "FINE_WAIT"
+        return
+    st["stage"] = "FINAL_REPORT"
+
+
+def stage_final_report(st):
+    from verify.finalize import physical_spec_reasons, write_final_artifacts
+
+    records = st.get("fine_task_records") or {}
+    fine_results = [
+        records.get(str(rank), {}).get("result") or {}
+        for rank in range(len(st.get("final_candidates") or []))
+    ]
+    for rank, candidate in enumerate(st.get("final_candidates") or []):
+        record = records.get(str(rank), {})
+        candidate["fine_task_id"] = record.get("active_id")
+        candidate["fine_task_status"] = record.get("last_status")
+        candidate["fine_attempt"] = record.get("attempt", 0)
+    model_quality = st.get("model_quality_snapshot") or {}
+    if (not model_quality.get("passed")
+            or model_quality.get("training_run_id") != st.get("training_run_id")):
+        raise RuntimeError("final report is blocked by a missing/failed model quality gate")
+    current_pass = any(
+        not physical_spec_reasons(
+            result,
+            candidate.get("geometry_evidence", candidate.get("params", {})),
+        )
+        for candidate, result in zip(st["final_candidates"], fine_results)
+    )
+    cursor = int(st.get("fine_queue_cursor", 0)) + len(st["final_candidates"])
+    queue = st.get("fine_candidate_queue") or st["final_candidates"]
+    if not current_pass and cursor < len(queue):
+        # Every lower-volume candidate in prior batches has a terminal fine
+        # failure.  Continue with the next volume-ordered batch before asking
+        # NSGA-II for more designs.
+        history = st.setdefault("fine_attempt_history", [])
+        for candidate, result in zip(st["final_candidates"], fine_results):
+            history.append({
+                "candidate_digest": candidate["candidate_digest"],
+                "volume_L": candidate["volume_L"],
+                "passed": False,
+                "reasons": physical_spec_reasons(
+                    result,
+                    candidate.get("geometry_evidence", candidate.get("params", {})),
+                ),
+                "fine_result": result,
+            })
+        st["fine_queue_cursor"] = cursor
+        st["fine_batch"] = int(st.get("fine_batch", 0)) + 1
+        st["final_candidates"] = queue[cursor: cursor + 3]
+        st["fine_task_records"] = {}
+        st["stage"] = "FINE_SUBMIT"
+        print("[al] fine batch failed; advancing to next minimum-volume candidates")
+        return
+    artifact = write_final_artifacts(
+        OUTPUT_ROOT,
+        st["final_candidates"],
+        fine_results,
+        model_quality,
+        st["fine_solver_git_revision"],
+        st["fine_pyaedt_library_git_revision"],
+        prior_attempts=st.get("fine_attempt_history"),
+    )
+    st["final_verification"] = {
+        "passed": artifact["passed"],
+        "generated_at": artifact["generated_at"],
+    }
+    st["fine_attempt_history"] = artifact.get("fine_attempts", [])
+    if artifact["passed"]:
+        st["stage"] = "DONE"
+        print("[al] FINAL FINE FEA VERIFIED")
+    elif st["round"] >= SPEC["max_rounds"]:
+        st["stage"] = "HARD_CAP"
+    else:
+        st["q_mult"] = min(st.get("q_mult", 1.0) * 1.25, 3.0)
+        st["round"] += 1
+        st["stage"] = "TRAIN"
+
+
 STAGES = {"TRAIN": stage_train, "OPTIMIZE": stage_optimize, "SELECT": stage_select,
           "SUBMIT": stage_submit, "WAIT": stage_wait, "INGEST": stage_ingest,
-          "CHECK": stage_check}
+          "CHECK": stage_check, "FINAL_SELECT": stage_final_select,
+          "FINE_SUBMIT": stage_fine_submit, "FINE_WAIT": stage_fine_wait,
+          "FINAL_REPORT": stage_final_report}
 
 
 def main():
+    global EXECUTE_SUBMISSIONS
     ap = argparse.ArgumentParser()
     ap.add_argument("--reset", action="store_true")
     ap.add_argument("--max-stages", type=int, default=200)
+    ap.add_argument("--runtime-root", default=HERE)
+    ap.add_argument("--dataset", default=None)
+    ap.add_argument("--output-root", default=None)
+    ap.add_argument("--registry", default=None)
+    ap.add_argument("--solver-revision", default=None)
+    ap.add_argument("--library-revision", default=None)
+    ap.add_argument(
+        "--execute", action="store_true",
+        help="allow standard/fine FEA task submission; submission is disabled by default",
+    )
     args = ap.parse_args()
+
+    configure_runtime(
+        runtime_root=args.runtime_root,
+        dataset=args.dataset,
+        output_root=args.output_root,
+        registry=args.registry,
+        solver_revision=args.solver_revision,
+        library_revision=args.library_revision,
+    )
+    EXECUTE_SUBMISSIONS = bool(args.execute)
+    if EXECUTE_SUBMISSIONS and (
+            not args.solver_revision or not args.library_revision):
+        ap.error("--execute requires full --solver-revision and --library-revision pins")
 
     if args.reset and os.path.isfile(STATE_PATH):
         os.remove(STATE_PATH)
     st = load_state()
     for _ in range(args.max_stages):
-        if st["stage"] in ("DONE", "HARD_CAP"):
+        if st["stage"] in ("DONE", "HARD_CAP", "FINE_BLOCKED"):
             print(f"[al] {st['stage'].lower()}. history:")
             for h in st["history"]:
                 print("  ", h)

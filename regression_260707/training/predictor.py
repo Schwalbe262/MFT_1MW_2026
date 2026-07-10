@@ -3,6 +3,7 @@
 """
 import os
 import pickle
+import json
 
 import numpy as np
 
@@ -21,7 +22,18 @@ class EnsemblePredictor:
 
     @classmethod
     def load(cls, target, registry=REGISTRY):
-        with open(os.path.join(registry, target, "models.pkl"), "rb") as f:
+        generation = registry
+        pointer_path = os.path.join(registry, "current.json")
+        if os.path.isfile(pointer_path):
+            with open(pointer_path, encoding="utf-8") as handle:
+                pointer = json.load(handle)
+            relative = pointer.get("generation")
+            if not isinstance(relative, str) or not relative.strip():
+                raise RuntimeError("registry current.json has no generation")
+            generation = os.path.abspath(os.path.join(registry, relative))
+            if os.path.commonpath([generation, os.path.abspath(registry)]) != os.path.abspath(registry):
+                raise RuntimeError("registry generation escapes registry root")
+        with open(os.path.join(generation, target, "models.pkl"), "rb") as f:
             return cls(pickle.load(f))
 
     def predict_mu_sigma(self, X_df, conformal=True):

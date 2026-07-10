@@ -17,10 +17,10 @@
 | 절연 | 모든 권선 간격 ≥ 40mm (HV 4쌍 + z방향 h_gap2) |
 | B | 코어 ≤ 1.2 T |
 | 운전점 | 1kHz / 1000V / 10kV / 100A / P_target 1MW (DAB 위상 자동 역산) |
-| 기타 | N1 ≤ 10턴, N1_side=0 고정, 구리 80°C 도전율, radiation은 최종검증만 |
+| 기타 | N1 ≤ 10턴, N1_side=0 고정, 구리 80°C 도전율, 제작 형상은 FEA와 정확히 동일하다고 가정 |
 
 **로드맵**: 데이터 1만+ 수집 → 서러게이트 학습 → NSGA-2 → 능동학습(AL) 루프
-→ fine 최종검증. 게이트: ①물리검증(통과) ②파일럿 ③서러게이트 품질 ④AL 수렴 ⑤최종 fine+공차MC.
+→ fine 최종검증. 게이트: ①물리검증 ②파일럿 ③서러게이트 품질 ④AL 수렴 ⑤최종 exact-geometry fine FEA.
 
 ## 2. 현재 상태 (인수 시점)
 
@@ -87,7 +87,7 @@
 ## 5. 상비 운영 (백그라운드)
 
 - 피더: `cd regression_260707/campaign && python feeder.py --loop 600 --max-samples 12000 --target 200`
-- 회수+체크포인트: 시간당 collect_wave + 500/1k/2k/4k/8k행 자동 학습 (auto_collect 루프)
+- 회수+체크포인트: collect_wave + strict-full 500/1k/2k/3k 및 이후 매 1k 자동 재학습
 - 디스크: 4시간 크론(사용자 설정) + sweep_stale.py + 프로젝트 cleanup_globs
 - 감시: Monitor로 유입 가드(시간당, 3연속 정체 시 경보) — 정체 시 로그 정밀 판독부터
 
@@ -96,9 +96,9 @@
 1. **클러스터 신세대 첫 온도샘플 확인** → 통과 시 순수 누적 모드 (목표 1만행)
 2. pe/mc/skin 벤치 40개 표 완성 → 최적 (pe, min_converged, skin) 확정 +
    **skin-off Llt 편향(+0.7~1.3% 예상) 정량화 → NSGA Llt 타겟 보정치 반영**
-3. 500행 → checkpoint_train 자동 → 게이트3 (타겟별 R², conformal 커버리지)
+3. strict-full 500/1k/2k/3k 및 이후 매 1k → 전체 모델 자동 재학습; 3k부터 정확도/불확실성 게이트
 4. 클러스터 thermal 솔브 실패(과거 2/3) 원인 — 새 계측(메시지 20줄 덤프)으로 파악
-5. AL 루프 (verify/al_driver.py, K=33 구성) → 게이트4 → fine 최종검증+공차MC → final_report.md
+5. AL 루프 (al_driver.py, K=33 구성) → 게이트4 → 최소부피 후보 full-model fine FEA → final_report.md
    (뼈대: regression_260707/final_report_skeleton.md)
 6. 모델링 추가 다이어트 (corner_segments 축소 등) — 여유 있을 때
 

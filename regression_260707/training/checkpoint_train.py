@@ -9,12 +9,16 @@
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REGRESSION_ROOT = os.path.abspath(os.path.join(HERE, ".."))
+if REGRESSION_ROOT not in sys.path:
+    sys.path.insert(0, REGRESSION_ROOT)
 DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 CURVE_CSV = os.path.join(HERE, "learning_curve.csv")
 MAX_TRUSTED_TEMPERATURE_C = 4700.0
@@ -36,31 +40,29 @@ TARGETS = {
 }
 
 # 특징량: 입력 파라미터 + 파생 물리량 (결과/메타 컬럼 제외)
-EXCLUDE_PREFIXES = ("Ltx", "Lrx", "M", "k", "Lm", "Ll", "Tx_loss", "Rx_loss", "P_", "B_",
-                    "I1_", "phi", "I2_phase_used", "T_", "Tprobe_", "time", "conv_", "mesh_",
-                    "git_hash", "project_name", "saved_at", "task_", "fail_")
+def filter_valid_training_rows(df, target, profile=None):
+    """Return the shared strict-full cohort used by every surrogate target.
 
+    Using one cohort prevents a model from silently learning from legacy EM
+    false positives while the temperature models see a different population.
+    Validity is recomputed from error, delta, residual, extraction, power
+    balance, temperature saturation, profile, and provenance evidence.
+    """
+    if "_strict_valid_full" not in df.columns:
+        from quality_contract import annotate_validity
 
-def filter_valid_training_rows(df, target):
-    """Restrict thermal targets to rows that passed the complete physical gate."""
-    if not target.startswith("Tprobe"):
-        return df
-    keep = pd.Series(True, index=df.index)
-    for column in ("thermal_solved", "result_valid_thermal"):
-        if column not in df.columns:
-            keep &= False
-        else:
-            keep &= pd.to_numeric(df[column], errors="coerce").fillna(0).eq(1)
+        df = annotate_validity(df, profile)
+    keep = df["_strict_valid_full"].fillna(False).astype(bool)
     if target not in df.columns:
         keep &= False
     else:
         values = pd.to_numeric(df[target], errors="coerce")
-        keep &= (
-            values.map(np.isfinite)
-            & values.gt(MIN_TRUSTED_TEMPERATURE_C)
-            & values.lt(MAX_TRUSTED_TEMPERATURE_C)
-        )
-    return df[keep]
+        keep &= values.map(np.isfinite)
+        if target.startswith("Tprobe"):
+            keep &= values.gt(MIN_TRUSTED_TEMPERATURE_C) & values.lt(
+                MAX_TRUSTED_TEMPERATURE_C
+            )
+    return df.loc[keep]
 
 
 def to_physical(df):
@@ -74,18 +76,25 @@ def to_physical(df):
 
 
 def feature_columns(df):
-    cols = []
-    for c in df.columns:
-        if any(c.startswith(p) for p in EXCLUDE_PREFIXES):
-            continue
-        if c.endswith("_phys") or c.endswith("_raw"):
-            continue
-        if df[c].dtype == object:
-            continue
-        if df[c].nunique(dropna=True) <= 1:
-            continue
-        cols.append(c)
-    return cols
+    """Select design-time inputs only; never post-solve quality/output data."""
+    from campaign.train_io import (
+        DESIGN_INPUT_COLUMNS,
+        GEOMETRY_DERIVED_COLUMNS,
+        PHYSICAL_CONTEXT_COLUMNS,
+    )
+
+    allowed = (
+        *DESIGN_INPUT_COLUMNS,
+        *PHYSICAL_CONTEXT_COLUMNS,
+        *GEOMETRY_DERIVED_COLUMNS,
+    )
+    return [
+        column
+        for column in allowed
+        if column in df.columns
+        and pd.api.types.is_numeric_dtype(df[column])
+        and df[column].nunique(dropna=True) > 1
+    ]
 
 
 def transform_y(y, kind):
@@ -138,14 +147,21 @@ def cv_metrics(X, y, kind, n_splits=5, seed=42):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default=DATASET)
+    ap.add_argument("--curve-csv", default=CURVE_CSV)
+    ap.add_argument("--profile", default=None)
     args = ap.parse_args()
 
-    df = pd.read_parquet(args.dataset)
+    from quality_contract import annotate_validity
+
+    raw = pd.read_parquet(args.dataset)
+    df = annotate_validity(raw, args.profile)
     df = to_physical(df)
     feats = feature_columns(df)
-    n_total = len(df)
+    n_total = int(df["_strict_valid_full"].sum())
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"dataset: {n_total} rows, {len(feats)} features")
+    print(f"dataset: raw={len(df)} strict_full={n_total}, {len(feats)} features")
+    if not feats:
+        raise SystemExit("no design-time training features remain after strict filtering")
 
     rows = []
     for target, cfg in TARGETS.items():
@@ -153,7 +169,7 @@ def main():
             print(f"  [skip] {target} (컬럼 없음)")
             continue
         # 온도 타겟: thermal 솔브가 성공한 행만 (thermal_solved 플래그, 2026-07-09)
-        target_df = filter_valid_training_rows(df, target)
+        target_df = filter_valid_training_rows(df, target, args.profile)
         sub = target_df.dropna(subset=[target])
         sub = sub[np.isfinite(sub[target])]
         if len(sub) < 100:
@@ -178,9 +194,12 @@ def main():
 
     if rows:
         curve = pd.DataFrame(rows)
-        header = not os.path.isfile(CURVE_CSV)
-        curve.to_csv(CURVE_CSV, mode="a", header=header, index=False)
-        print(f"learning curve appended -> {CURVE_CSV}")
+        os.makedirs(os.path.dirname(os.path.abspath(args.curve_csv)), exist_ok=True)
+        header = not os.path.isfile(args.curve_csv)
+        curve.to_csv(args.curve_csv, mode="a", header=header, index=False)
+        print(f"learning curve appended -> {args.curve_csv}")
+    else:
+        raise SystemExit("no target has enough strict-full rows for checkpoint metrics")
 
 
 if __name__ == "__main__":

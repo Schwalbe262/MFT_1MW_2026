@@ -9,6 +9,7 @@ NSGA-2 멀티 재시작 드라이버.
   python run_nsga2.py --restarts 16 --round 1
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -22,25 +23,43 @@ sys.path.insert(0, os.path.join(HERE, "..", "training"))
 
 from optimization.nsga2_problem import MFTProblem, T_TARGETS, DEFAULT_SPEC  # noqa: E402
 
+REQUIRED_MODEL_TARGETS = [
+    "Llt_phys", "k",
+    "P_winding_total", "P_core_total", "P_core_plate_total",
+    "B_max_core", "B_mean_core", *T_TARGETS,
+]
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
 
 def load_models(registry=None):
     from predictor import EnsemblePredictor
     import predictor as predictor_mod
     reg = registry or predictor_mod.REGISTRY
-    targets = ["Llt_phys", "P_winding_total", "P_core_total", "P_core_plate_total",
-               "B_max_core"] + T_TARGETS
     models = {}
-    for t in targets:
-        path = os.path.join(reg, t, "models.pkl")
-        if os.path.isfile(path):
+    for t in REQUIRED_MODEL_TARGETS:
+        try:
             models[t] = EnsemblePredictor.load(t, registry=reg)
+        except (FileNotFoundError, OSError):
+            pass
     return models
 
 
 def build_density_gate(dataset_path, features):
     from predictor import DensityGate
     from checkpoint_train import to_physical
-    df = to_physical(pd.read_parquet(dataset_path))
+    from quality_contract import annotate_validity
+
+    audited = annotate_validity(pd.read_parquet(dataset_path))
+    df = to_physical(audited.loc[audited["_strict_valid_full"]])
+    if df.empty:
+        raise RuntimeError("density gate has no strict-full training rows")
     return DensityGate(df, features)
 
 
@@ -81,18 +100,54 @@ def main():
     ap.add_argument("--pop", type=int, default=200)
     ap.add_argument("--round", type=int, default=0, help="AL 라운드 번호 (출력 디렉토리)")
     ap.add_argument("--dataset", default=os.path.join(HERE, "..", "data", "dataset", "train.parquet"))
+    ap.add_argument("--registry", default=os.path.join(HERE, "..", "training", "registry"))
+    ap.add_argument("--registry-generation", default=None)
+    ap.add_argument("--quality-status", default=None)
+    ap.add_argument("--output-root", default=os.path.join(HERE, "..", "al_rounds"))
+    ap.add_argument(
+        "--quality-thresholds",
+        default=os.path.join(HERE, "..", "training", "model_quality_thresholds.json"),
+    )
     ap.add_argument("--spec", default=None, help="스펙 오버라이드 JSON")
     ap.add_argument("--no-density-gate", action="store_true")
     args = ap.parse_args()
 
-    out_dir = os.path.join(HERE, "..", "al_rounds", f"round_{args.round:02d}")
+    out_dir = os.path.join(args.output_root, f"round_{args.round:02d}")
     os.makedirs(out_dir, exist_ok=True)
 
-    models = load_models()
-    missing = [t for t in ["Llt_phys", "P_winding_total", "P_core_total", "B_max_core"]
-               if t not in models]
+    if bool(args.registry_generation) != bool(args.quality_status):
+        raise SystemExit(
+            "--registry-generation and --quality-status must be supplied together"
+        )
+    registry_for_models = args.registry
+    if args.registry_generation:
+        registry_for_models = os.path.abspath(args.registry_generation)
+        with open(args.quality_status, encoding="utf-8") as handle:
+            quality = json.load(handle)
+        with open(
+            os.path.join(registry_for_models, "train_report.json"), encoding="utf-8"
+        ) as handle:
+            generation_report = json.load(handle)
+        dataset_sha = _sha256(args.dataset)
+        if (not quality.get("passed")
+                or quality.get("dataset_sha256") != dataset_sha
+                or generation_report.get("dataset_sha256") != dataset_sha
+                or generation_report.get("training_run_id") != quality.get("training_run_id")):
+            raise SystemExit("pinned surrogate generation/quality/dataset identity mismatch")
+    else:
+        from model_quality_gate import evaluate_registry
+        with open(args.quality_thresholds, encoding="utf-8") as handle:
+            quality_thresholds = json.load(handle)
+        quality = evaluate_registry(args.registry, args.dataset, quality_thresholds)
+        if not quality["passed"]:
+            raise SystemExit(
+                "surrogate quality gate failed: " + "; ".join(quality["reasons"][:20])
+            )
+
+    models = load_models(registry_for_models)
+    missing = [target for target in REQUIRED_MODEL_TARGETS if target not in models]
     if missing:
-        raise SystemExit(f"필수 모델 미학습: {missing} (train_models.py 먼저)")
+        raise SystemExit(f"required model generation is incomplete: {missing}")
 
     spec = dict(DEFAULT_SPEC)
     if args.spec:
@@ -106,7 +161,7 @@ def main():
 
     # warm start: 이전 라운드 Pareto
     warm = None
-    prev = os.path.join(HERE, "..", "al_rounds", f"round_{args.round - 1:02d}", "pareto_X.npy")
+    prev = os.path.join(args.output_root, f"round_{args.round - 1:02d}", "pareto_X.npy")
     if os.path.isfile(prev):
         warm = np.load(prev)
         print(f"warm start: {len(warm)} points from round {args.round - 1}")
@@ -144,6 +199,20 @@ def main():
         rows.append(row)
     pd.concat([frame.reset_index(drop=True), pd.DataFrame(rows)], axis=1) \
         .to_csv(os.path.join(out_dir, "pareto_front.csv"), index=False)
+
+    with open(os.path.join(out_dir, "optimization_manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "training_run_id": quality.get("training_run_id"),
+            "dataset_sha256": quality.get("dataset_sha256"),
+            "quality_gate_passed": True,
+            "required_models": REQUIRED_MODEL_TARGETS,
+            "restarts": args.restarts,
+            "population": args.pop,
+            "round": args.round,
+            "manufacturing_tolerance_policy": (
+                "excluded; exact-as-FEA geometry is assumed"
+            ),
+        }, handle, indent=1)
 
     print(f"\nmerged Pareto: {len(Xp)} pts -> {out_dir}")
     print(f"volume {Fp[:,0].min():.0f}~{Fp[:,0].max():.0f} L | loss {Fp[:,1].min():.0f}~{Fp[:,1].max():.0f} W")

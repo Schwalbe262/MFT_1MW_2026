@@ -302,7 +302,8 @@ def is_valid_result(
         "Llt", "B_max_core", "full_model", "N2_side",
         "git_dirty", "pyaedt_library_git_dirty",
         "matrix_solve_attempts", "loss_solve_attempts",
-        "conv_error_pct_matrix", "conv_error_pct_loss",
+        "conv_passes_matrix", "conv_error_pct_matrix", "conv_delta_pct_matrix",
+        "conv_passes_loss", "conv_error_pct_loss", "conv_delta_pct_loss",
         "matrix_winding_stranded_count",
         "matrix_conductor_mesh_operation_count",
         "matrix_plate_eddy_off_readback_count",
@@ -324,6 +325,7 @@ def is_valid_result(
     )
     if not all(_finite(result, key) for key in numeric_fields):
         return False
+    expected_full_model = float(profile_contract.get("full_model", 0))
     if (float(result["Llt"]) <= 0
             or float(result["B_max_core"]) < 0
             or float(result["N2_side"]) < 0
@@ -331,23 +333,41 @@ def is_valid_result(
             or float(result["pyaedt_library_git_dirty"]) != 0.0
             or float(result["matrix_solve_attempts"]) != 1.0
             or float(result["loss_solve_attempts"]) != 1.0
-            or float(result["full_model"]) != 0.0):
+            or float(result["full_model"]) != expected_full_model):
         return False
     if result.get("matrix_extraction_backend") != "export_rl_matrix":
         return False
-    if result.get("matrix_conductor_policy") != "stranded_no_eddy_no_skin":
-        return False
     matrix_plate_count = float(result["matrix_plate_eddy_off_readback_count"])
     loss_plate_count = float(result["loss_plate_eddy_on_readback_count"])
-    if (float(result["matrix_winding_stranded_count"]) != 2.0
-            or float(result["matrix_conductor_mesh_operation_count"]) != 0.0
-            or float(result["loss_winding_solid_update_count"]) != 2.0
-            or float(result["loss_winding_mesh_operation_count"]) != 2.0
-            or matrix_plate_count < 0.0
-            or loss_plate_count != matrix_plate_count
-            or float(result["loss_conductor_mesh_operation_count"]) != (
-                2.0 + float(loss_plate_count > 0.0)
-            )):
+    matrix_skin_mesh = float(profile_contract.get("matrix_skin_mesh", 0))
+    if matrix_skin_mesh == 0.0:
+        if (result.get("matrix_conductor_policy") != "stranded_no_eddy_no_skin"
+                or float(result["matrix_winding_stranded_count"]) != 2.0
+                or float(result["matrix_conductor_mesh_operation_count"]) != 0.0
+                or float(result["loss_winding_solid_update_count"]) != 2.0
+                or float(result["loss_winding_mesh_operation_count"]) != 2.0
+                or matrix_plate_count < 0.0
+                or loss_plate_count != matrix_plate_count
+                or float(result["loss_conductor_mesh_operation_count"]) != (
+                    2.0 + float(loss_plate_count > 0.0)
+                )):
+            return False
+    elif matrix_skin_mesh == 1.0:
+        # The fine path creates solid windings and skin operations in the
+        # matrix design.  Its copied loss design inherits them, represented by
+        # the deliberate -1 "not reconfigured" readbacks.
+        if (result.get("matrix_conductor_policy") != "solid_skin"
+                or float(result["matrix_winding_stranded_count"]) != 0.0
+                or float(result["matrix_conductor_mesh_operation_count"]) < 2.0
+                or matrix_plate_count != 0.0
+                or any(float(result[key]) != -1.0 for key in (
+                    "loss_winding_solid_update_count",
+                    "loss_winding_mesh_operation_count",
+                    "loss_conductor_mesh_operation_count",
+                    "loss_plate_eddy_on_readback_count",
+                ))):
+            return False
+    else:
         return False
     for key, expected_value in profile_contract.items():
         actual_value = result.get(key)
@@ -362,9 +382,16 @@ def is_valid_result(
                     return False
             except (TypeError, ValueError, OverflowError):
                 return False
-    if not all(0 <= float(result[key]) <= 1.5 for key in (
-            "conv_error_pct_matrix", "conv_error_pct_loss")):
-        return False
+    for label, tolerance_key, minimum_key in (
+            ("matrix", "matrix_percent_error", "matrix_min_converged"),
+            ("loss", "percent_error", "min_converged")):
+        tolerance = float(result[tolerance_key])
+        minimum_passes = float(profile_contract[minimum_key])
+        if (not 0 < tolerance <= 1.5
+                or float(result[f"conv_passes_{label}"]) < minimum_passes
+                or not 0 <= float(result[f"conv_error_pct_{label}"]) <= tolerance
+                or not 0 <= float(result[f"conv_delta_pct_{label}"]) <= tolerance):
+            return False
     if not all(float(result[key]) >= 0 for key in (
             "P_winding_total", "P_core_total", "P_core_plate_total")):
         return False
@@ -386,8 +413,9 @@ def is_valid_result(
             )
             or not 0.0 <= float(result["thermal_rx_power_balance_max_abs_w"]) <= 1e-9):
         return False
-    if (float(result.get("n_explicit_turns", -1)) == 0.0
-            and result.get("thermal_rx_model") != "homogenized_blocks"):
+    explicit_turns = float(result.get("n_explicit_turns", -1))
+    expected_rx_model = "homogenized_blocks" if explicit_turns == 0.0 else "hybrid_explicit"
+    if result.get("thermal_rx_model") != expected_rx_model:
         return False
     if not all(0 <= float(result[key]) <= flow_limit for key in (
             "thermal_residual_continuity", "thermal_residual_x_velocity",
@@ -428,7 +456,7 @@ def is_valid_result(
 
 def fetch_result(
         task_id, attempts=3, retry_delay=2, expected_revision=None,
-        expected_library_revision=None):
+        expected_library_revision=None, expected_profile=None):
     """Return the latest well-formed RESULT_JSON and its validity state.
 
     Transport failures raise ResultFetchError. A successful stdout read with no
@@ -481,7 +509,8 @@ def fetch_result(
                 return ResultFetch(RESULT_INVALID, result)
         if is_valid_result(
                 result, expected_revision=expected_revision,
-                expected_library_revision=expected_library_revision):
+                expected_library_revision=expected_library_revision,
+                expected_profile=expected_profile):
             return ResultFetch(RESULT_VALID, result)
         return ResultFetch(RESULT_INVALID, result if isinstance(result, dict) else None)
     return ResultFetch(RESULT_MISSING)

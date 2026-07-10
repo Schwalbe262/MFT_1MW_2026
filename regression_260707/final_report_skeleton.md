@@ -1,50 +1,15 @@
-# MFT 1MW 최종 설계 보고서 (뼈대 — 캠페인 완료 시 수치 채움)
+# MFT 1 MW 최종 설계 보고서
 
-## 1. 스펙 (확정)
+이 파일은 구조 참고용이다. 실제 완료 보고서는 `verify/finalize.py`가
+`final_report.md`와 `verify/results/final_verification.json`으로 원자적으로 생성한다.
 
-| 항목 | 값 |
-|---|---|
-| 누설 인덕턴스 Llt | 27.5 µH ± 2% (실물 기준, 대칭 매트릭스 ×2 환산) |
-| 온도 | 전 부품 ≤ 100°C (캠페인 서러게이트 제약 97°C — eighth 편향 보상) |
-| 목적 | 부피(외곽 박스) + 총손실 최소화 (Pareto) |
-| 절연 | 전 권선 간격 ≥ 40 mm (HV 4쌍 + z방향 h_gap2) |
-| B 한계 | 코어 ≤ 1.2 T |
-| 운전점 | 1 kHz / 1000 V / 10 kV / 100 A / 1 MW (DAB 위상 자동) |
+최종 PASS에 필요한 증거:
 
-## 2. 검증 게이트 현황
+- strict-full 데이터 수와 surrogate 전 타겟 정확도/불확실성 게이트
+- NSGA-II 모델 세대, 데이터 fingerprint, Pareto/후보 선택 기록
+- standard FEA 수렴·추출·전력평형·사양 검증과 검증행 재학습
+- 사양 통과 후보 중 부피순 full-model fine FEA 결과
+- 최소부피 fine PASS 후보의 파라미터, 부피, 손실, Llt, B, 온도, revision
 
-- [x] 게이트1: 물리 검증 — 대칭 loss(코어 +0.8%, B +0.4%), quarter-vs-eighth ΔT≤2.94°C,
-      50Hz DC-limit 손실 관례, 도면 실측 (Llt_phys 55.7µH = 스펙 2배 → 최적화 필요성 확인)
-- [ ] 게이트2: 파일럿 검증 (분포/실패율/시간)
-- [ ] 게이트3: 서러게이트 품질 (5-fold R², conformal 커버리지) — 학습곡선 진행 중
-- [ ] 게이트4: 능동학습 수렴 (pred vs FEA 잔차, 후보 세대별)
-- [ ] 게이트5: 최종 후보 fine 검증 (풀모델 + radiation + 공차 MC)
-
-## 3. 데이터 캠페인
-
-- 샘플 정의: 대칭 모델 (matrix 1/8, loss_sym, thermal eighth), pe 1.0/14, 구리 80°C
-- 행수: (진행 중) / 목표 1만+
-- 학습곡선: training/learning_curve.csv
-
-## 4. 서러게이트 (게이트3 결과)
-
-(타겟별 R²/MAPE/conformal q90 표)
-
-## 5. NSGA-2 + 착취 방어
-
-- 유전자 = 20차원 단위 파라미터 (샘플러 공유 디코드)
-- 방어 4층: conformal 조임 / k-NN 밀도 게이트 / 앙상블 불일치 게이트 / FEA 최종 판정
-
-## 6. 능동학습 루프 (게이트4)
-
-(라운드별: 후보 K, pred-vs-FEA 잔차, q 적응 이력)
-
-## 7. 최종 설계
-
-(파라미터 표 + 도면 대비 + fine 검증 수치 + 공차 MC)
-
-## 8. 인프라 기록 (재현용)
-
-- 클러스터: slurm_scheduler Projects(MFT_1MW_2026v1), 130 동시(코어 예산), count 20
-- 사건 로그: 라이선스 데몬 장애(해결), 노드 과밀/AEDT 릭(코드 수정), dhj02 쿼터
-- 관례: RESULT_JSON 스트리밍, git_hash 데이터 계보, thermal_solved 플래그
+제작공차는 실행·합격조건·최종보고에서 제외한다. 제작 형상은 FEA와 정확히
+동일하다고 가정한다.
