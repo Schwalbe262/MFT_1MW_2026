@@ -223,6 +223,8 @@ class ThermalStabilityTest(unittest.TestCase):
         analyze_result,
         responses,
         include_side=False,
+        n1_side=0,
+        probe_names=(),
         setup_result=True,
         setup_update_result=True,
         convergence=None,
@@ -240,6 +242,7 @@ class ThermalStabilityTest(unittest.TestCase):
             df_plus=pd.DataFrame({
                 "thermal_symmetry": ["eighth"],
                 "thermal_max_iterations": [100],
+                "N1_side": [n1_side],
                 "N2_side": [1 if include_side else 0],
                 "n_explicit_turns": [1],
             }),
@@ -261,6 +264,7 @@ class ThermalStabilityTest(unittest.TestCase):
             "wcp_pads": [],
             "core_pads": [],
         }
+        probe_sheets = [SimpleNamespace(name=name, is3d=False) for name in probe_names]
 
         def record_mock_power_balance(_ipk, target_sim, _objects, **_kwargs):
             target_sim.thermal_rx_model = "hybrid_explicit"
@@ -276,7 +280,8 @@ class ThermalStabilityTest(unittest.TestCase):
             stack.enter_context(patch.object(thermal, "set_design_variables"))
             stack.enter_context(patch.object(thermal, "_create_thermal_materials"))
             stack.enter_context(patch.object(thermal, "_build_geometry", return_value=objects))
-            stack.enter_context(patch.object(thermal, "_create_probe_sheets", return_value=[]))
+            stack.enter_context(patch.object(
+                thermal, "_create_probe_sheets", return_value=probe_sheets))
             stack.enter_context(patch.object(
                 thermal, "_assign_losses", side_effect=record_mock_power_balance))
             stack.enter_context(patch.object(thermal, "_assign_boundaries"))
@@ -370,6 +375,35 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertTrue(math.isnan(row["T_max_Rx_main"]))
         self.assertEqual(row["thermal_calculator_attempts"], 0)
         self.assertEqual(ipk.oproject.active_calls, 4)
+
+    def test_missing_tx_side_probe_is_optional_only_without_tx_side_turns(self):
+        complete_groups = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+        }
+        ipk, row = self._run(
+            None,
+            [complete_groups],
+            n1_side=0,
+            probe_names=["Tprobe_Tx_side"],
+        )
+        self.assertEqual(ipk.field_summary_calls, 1)
+        self.assertEqual(row["thermal_solved"], 1)
+        self.assertEqual(row["thermal_extraction_complete"], 1)
+        self.assertEqual(row["thermal_missing_count"], 2)
+        self.assertTrue(math.isnan(row["Tprobe_Tx_side_max"]))
+        self.assertTrue(math.isnan(row["Tprobe_Tx_side_mean"]))
+
+        _ipk, row = self._run(
+            None,
+            [complete_groups],
+            n1_side=1,
+            probe_names=["Tprobe_Tx_side"],
+        )
+        self.assertEqual(row["thermal_solved"], 1)
+        self.assertEqual(row["thermal_extraction_complete"], 0)
+        self.assertEqual(row["thermal_missing_count"], 2)
 
     def test_report_failure_does_not_launch_another_solve(self):
         ipk, row = self._run(None, [False, False, False])
@@ -577,11 +611,16 @@ class ThermalStabilityTest(unittest.TestCase):
                 thermal._require_thermal_geometry(base, "eighth", 0, **{keyword: True})
 
     def test_explicit_rx_gets_one_object_mesh_operation(self):
-        pad_mesh_operation = SimpleNamespace(name="pad_mesh", update=Mock(return_value=True))
-        rx_mesh_operation = SimpleNamespace(name="rx_mesh", update=Mock(return_value=True))
+        pad_mesh_operation = SimpleNamespace(
+            name="pad_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+        rx_block_mesh_operation = SimpleNamespace(
+            name="rx_block_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+        rx_mesh_operation = SimpleNamespace(
+            name="rx_mesh", props={}, auto_update=True, update=Mock(return_value=True))
         mesh = SimpleNamespace(
-            assign_mesh_level=Mock(side_effect=[["pad_mesh"], ["rx_mesh"]]),
-            meshoperations=[pad_mesh_operation, rx_mesh_operation],
+            assign_mesh_level=Mock(
+                side_effect=[["pad_mesh"], ["rx_block_mesh"], ["rx_mesh"]]),
+            meshoperations=[pad_mesh_operation, rx_block_mesh_operation, rx_mesh_operation],
         )
         rx0 = _Object("Rx_main_0")
         rx1 = _Object("Rx_side_0")
@@ -597,9 +636,11 @@ class ThermalStabilityTest(unittest.TestCase):
 
         self.assertEqual(mesh.assign_mesh_level.call_args_list, [
             call({"wcp_pad": 2, "core_pad": 2}, name="pad_mesh_level"),
+            call({"Rx_main_block": 2}, name="rx_block_mesh_level"),
             call({"Rx_main_0": 3, "Rx_side_0": 3}, name="rx_mesh_level"),
         ])
         pad_mesh_operation.update.assert_called_once_with()
+        rx_block_mesh_operation.update.assert_called_once_with()
         rx_mesh_operation.update.assert_called_once_with()
 
     def test_thermal_mesh_failures_are_not_silenced(self):
@@ -617,7 +658,8 @@ class ThermalStabilityTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rx_mesh_level assignment"):
             thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), empty)
 
-        failed_rx_op = SimpleNamespace(name="rx_mesh", update=Mock(return_value=False))
+        failed_rx_op = SimpleNamespace(
+            name="rx_mesh", props={}, auto_update=True, update=Mock(return_value=False))
         mesh.assign_mesh_level.return_value = ["rx_mesh"]
         mesh.meshoperations = [failed_rx_op]
         with self.assertRaisesRegex(RuntimeError, "rx_mesh_level mesh operation update failed"):
@@ -628,7 +670,8 @@ class ThermalStabilityTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "pad_mesh_level assignment"):
             thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), pad_only)
 
-        failed_pad_op = SimpleNamespace(name="pad_mesh", update=Mock(return_value=False))
+        failed_pad_op = SimpleNamespace(
+            name="pad_mesh", props={}, auto_update=True, update=Mock(return_value=False))
         mesh.assign_mesh_level.return_value = ["pad_mesh"]
         mesh.meshoperations = [failed_pad_op]
         with self.assertRaisesRegex(RuntimeError, "pad_mesh_level mesh operation update failed"):

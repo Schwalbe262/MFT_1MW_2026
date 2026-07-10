@@ -147,6 +147,17 @@ def _assign_thermal_mesh(ipk, objs):
     tx_names = list(dict.fromkeys(obj.name for obj in objs.get("Tx", [])))
     _assign_levels({name: 2 for name in tx_names}, "tx_mesh_level")
 
+    rx_blocks = []
+    for key in ("Rx_main_blocks", "Rx_side_blocks", "Rx_side2_blocks"):
+        rx_blocks.extend(objs.get(key, []))
+
+    # Homogenized packs have only a few large solids, but the global cut-cell
+    # mesh can still represent a retained block with a single solution cell.
+    # Level 2 plus separate-object meshing gives each block an interior mesh
+    # without the cell explosion seen on thin explicit foils.
+    rx_block_names = list(dict.fromkeys(obj.name for obj in rx_blocks))
+    _assign_levels({name: 2 for name in rx_block_names}, "rx_block_mesh_level")
+
     explicit_rx = []
     for key in ("Rx_main_explicit", "Rx_side_explicit", "Rx_side2_explicit"):
         explicit_rx.extend(objs.get(key, []))
@@ -1117,6 +1128,10 @@ def run_thermal_analysis(sim):
         probe.append((o, f"T_max_{o.name}", "max"))
 
     expected_cols = list(dict.fromkeys(col for _, col, _ in probe))
+    optional_cols = set()
+    if int(df["N1_side"].iloc[0]) == 0:
+        optional_cols.update({"Tprobe_Tx_side_max", "Tprobe_Tx_side_mean"})
+    required_expected_cols = [col for col in expected_cols if col not in optional_cols]
     group_objects = {
         "T_max_Tx": list(objs["Tx"]),
         "T_max_Rx_main": list(objs["Rx_main_explicit"] + objs["Rx_main_blocks"]),
@@ -1238,7 +1253,7 @@ def run_thermal_analysis(sim):
             temps.update(_field_summary_bulk(missing_entries))
         except Exception as e:
             logging.warning(f"[thermal] field summary attempt {attempt}/3 failed: {e}")
-        if all(col in temps for col in expected_cols):
+        if all(col in temps for col in required_expected_cols):
             break
         if attempt < 3:
             _time.sleep(10)
@@ -1248,9 +1263,13 @@ def run_thermal_analysis(sim):
     calc_attempts = 0
 
     missing_cols = [col for col in expected_cols if col not in temps]
+    required_missing_cols = [col for col in missing_cols if col not in optional_cols]
     n_fail = len(missing_cols)
-    logging.warning(f"[thermal] extraction: field-summary {n_fs}, calculator {n_calc}, "
-                    f"failed {n_fail} / total {len(probe)}")
+    logging.warning(
+        f"[thermal] extraction: field-summary {n_fs}, calculator {n_calc}, "
+        f"failed {n_fail} / total {len(probe)} "
+        f"(required-column failures={len(required_missing_cols)})"
+    )
 
     def _group_max(group_objects):
         # A partial maximum can silently understate component temperature. Require
@@ -1277,7 +1296,7 @@ def run_thermal_analysis(sim):
 
     summary = {
         "thermal_solved": [1 if solved else 0],
-        "thermal_extraction_complete": [1 if not missing_cols else 0],
+        "thermal_extraction_complete": [1 if not required_missing_cols else 0],
         "thermal_missing_count": [len(missing_cols)],
         "thermal_required_missing_count": [required_missing_count],
         # Bit mask: Tx=1, Rx_main=2, Rx_side=4, core=8. Rx_side is optional

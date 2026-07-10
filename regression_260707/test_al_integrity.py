@@ -148,6 +148,30 @@ def task_state(task_id=17, stage="WAIT"):
 
 
 class SchedulerClientIntegrityTests(unittest.TestCase):
+    def test_submit_exports_fork_bootstrap_before_solver_launch(self):
+        submitted = Mock(status_code=201)
+        submitted.json.return_value = {"id": 40}
+
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), \
+                patch.object(
+                    scheduler_client.requests, "post",
+                    return_value=submitted) as post:
+            scheduler_client.submit_verification(
+                "candidate-mpi", "candidate_workdir", {"x": 1}, {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+            )
+
+        command = post.call_args.kwargs["json"]["command"]
+        bootstrap_export = "export I_MPI_HYDRA_BOOTSTRAP=fork;"
+        self.assertEqual(command.count(bootstrap_export), 1)
+        self.assertLess(
+            command.index(bootstrap_export),
+            command.index("python run_simulation_260706.py"),
+        )
+
     def test_submit_groups_preflight_and_simulation_before_preserving_exit_code(self):
         submitted = Mock(status_code=201)
         submitted.json.return_value = {"id": 41, "name": "candidate-41"}
@@ -174,8 +198,15 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             f"candidate_workdir-s{TEST_REVISION[:12]}-"
             f"l{TEST_LIBRARY_REVISION[:12]}-p{parameter_digest}"
         )
-        self.assertIn(f"MFT_GPFS_WORKDIR={isolated}", command)
-        self.assertIn(f"MFT_NVME_WORKDIR=/enroot/{isolated}", command)
+        task_identity = hashlib.sha256(
+            payload["dedupe_key"].encode("utf-8")).hexdigest()[:16]
+        task_workdir = f"{isolated}-t{task_identity}"
+        self.assertIn("MFT_GPFS_ROOT=$PWD", command)
+        self.assertIn(
+            f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{task_workdir}"', command)
+        self.assertIn(f"MFT_NVME_WORKDIR=/enroot/{task_workdir}", command)
+        self.assertEqual(payload["cleanup_globs"], task_workdir)
+        self.assertNotRegex(payload["cleanup_globs"], r"[/\\*?\[]")
         self.assertIn("findmnt -n -o FSTYPE -T /enroot", command)
         self.assertIn(
             f'"${{MFT_ENROOT_FREE_KB:-0}}" -ge '
@@ -202,7 +233,8 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             command.index("python run_simulation_260706.py"))
         self.assertIn("python run_simulation_260706.py --fixed", command)
         self.assertIn(
-            'cleanup() { rm -rf -- "${MFT_WORKDIR}" ', command)
+            'cleanup() { rm -rf -- "${MFT_NVME_WORKDIR}" "${MFT_GPFS_WORKDIR}" ',
+            command)
         self.assertIn("trap cleanup EXIT", command)
         self.assertIn("trap 'exit 143' TERM INT", command)
         self.assertIn(
@@ -216,6 +248,60 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             "limit": 10000,
             "name_prefix": "candidate-41",
         })
+
+    def test_same_candidate_retries_have_distinct_exact_cleanup_ownership(self):
+        submitted = Mock(status_code=201)
+        submitted.json.side_effect = [{"id": 51}, {"id": 52}]
+
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), \
+                patch.object(
+                    scheduler_client.requests, "post",
+                    return_value=submitted) as post:
+            for name in ("candidate-retry", "candidate-retry-r1"):
+                scheduler_client.submit_verification(
+                    name, "shared_workdir", {"x": 1}, {},
+                    solver_revision=TEST_REVISION,
+                    library_revision=TEST_LIBRARY_REVISION,
+                )
+
+        payloads = [call.kwargs["json"] for call in post.call_args_list]
+        cleanup_globs = [payload["cleanup_globs"] for payload in payloads]
+        self.assertEqual(len(set(cleanup_globs)), 2)
+        for payload, cleanup_glob in zip(payloads, cleanup_globs):
+            self.assertNotRegex(cleanup_glob, r"[/\\*?\[]")
+            self.assertIn("MFT_GPFS_ROOT=$PWD", payload["command"])
+            self.assertIn(
+                f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{cleanup_glob}"',
+                payload["command"])
+            self.assertIn(
+                f"MFT_NVME_WORKDIR=/enroot/{cleanup_glob}", payload["command"])
+
+    def test_cleanup_basename_is_scheduler_safe_for_hostile_workdir(self):
+        submitted = Mock(status_code=201)
+        submitted.json.return_value = {"id": 53}
+
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), \
+                patch.object(
+                    scheduler_client.requests, "post",
+                    return_value=submitted) as post:
+            scheduler_client.submit_verification(
+                "candidate-hostile", "prefix/../shared,*?[case]" * 20,
+                {"x": 1}, {}, solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+            )
+
+        payload = post.call_args.kwargs["json"]
+        cleanup_glob = payload["cleanup_globs"]
+        self.assertLessEqual(len(cleanup_glob), 198)
+        self.assertRegex(cleanup_glob, r"^[A-Za-z0-9_-]+$")
+        self.assertNotIn("..", cleanup_glob)
+        self.assertIn(
+            f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{cleanup_glob}"',
+            payload["command"])
 
     def test_terminal_exact_identity_is_reconciled_before_post(self):
         first_post = Mock(status_code=201)

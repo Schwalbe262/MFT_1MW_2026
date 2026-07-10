@@ -784,8 +784,11 @@ class ThermalMeshPolicyTests(unittest.TestCase):
             "wcp_pads": [obj("wcp_pad")],
             "core_pads": [obj("core_pad")],
             "Rx_main_explicit": [obj("rx_main")],
+            "Rx_main_blocks": [obj("rx_main_block")],
             "Rx_side_explicit": [obj("rx_side")],
+            "Rx_side_blocks": [obj("rx_side_block")],
             "Rx_side2_explicit": [],
+            "Rx_side2_blocks": [],
         }
 
     def test_thin_solids_and_tx_turns_are_meshed_as_separate_objects(self):
@@ -796,9 +799,10 @@ class ThermalMeshPolicyTests(unittest.TestCase):
         self.assertEqual(mesh.calls, [
             ({"wcp_pad": 2, "core_pad": 2}, "pad_mesh_level"),
             ({"tx_0": 2, "tx_1": 2}, "tx_mesh_level"),
+            ({"rx_main_block": 2, "rx_side_block": 2}, "rx_block_mesh_level"),
             ({"rx_main": 3, "rx_side": 3}, "rx_mesh_level"),
         ])
-        self.assertEqual(len(mesh.meshoperations), 3)
+        self.assertEqual(len(mesh.meshoperations), 4)
         for operation in mesh.meshoperations:
             self.assertFalse(operation.auto_update)
             self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], True)

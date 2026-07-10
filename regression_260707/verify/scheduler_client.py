@@ -15,7 +15,8 @@ import requests
 SCHEDULER = "http://127.0.0.1:8000"
 BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
         "module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; "
-        "export FLEXLM_TIMEOUT=3000000; sleep $((RANDOM % 60)); ")
+        "export FLEXLM_TIMEOUT=3000000; "
+        "export I_MPI_HYDRA_BOOTSTRAP=fork; sleep $((RANDOM % 60)); ")
 
 RESULT_VALID = "valid"
 RESULT_INVALID = "invalid"
@@ -117,16 +118,23 @@ def submit_verification(
     run_identity = (
         f"s{solver_revision[:12]}-l{library_revision[:12]}-p{parameter_digest}")
     isolated_workdir = f"{workdir}-{run_identity}"
-    scratch_leaf = re.sub(r"[^A-Za-z0-9_.-]+", "_", isolated_workdir).strip("._-")
-    if not scratch_leaf:
-        scratch_leaf = f"mft-{parameter_digest}"
+    safe_workdir = re.sub(
+        r"[^A-Za-z0-9_-]+", "_", isolated_workdir).strip("_-")
+    if not safe_workdir:
+        safe_workdir = f"mft-{parameter_digest}"
+    # The task name is part of the durable dedupe identity. Include its digest
+    # so a retry with the same candidate cannot race terminal cleanup from the
+    # previous task. Keep the basename below common filesystem NAME_MAX limits.
+    task_identity = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()[:16]
+    scratch_leaf = f"{safe_workdir[:180]}-t{task_identity}"
     scratch_workdir = f"{LOCAL_SCRATCH_ROOT}/{scratch_leaf}"
     quoted_workdir = '"${MFT_WORKDIR}"'
     quoted_repo = '"${MFT_WORKDIR}/repo"'
     quoted_library = '"${MFT_WORKDIR}/pyaedt_library"'
-    cleanup_workdir = quoted_workdir
+    cleanup_workdirs = '"${MFT_NVME_WORKDIR}" "${MFT_GPFS_WORKDIR}"'
     select_workdir = (
-        f"MFT_GPFS_WORKDIR={shlex.quote(isolated_workdir)}; "
+        "MFT_GPFS_ROOT=$PWD; "
+        f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{scratch_leaf}"; '
         f"MFT_NVME_WORKDIR={shlex.quote(scratch_workdir)}; "
         f"MFT_ENROOT_FREE_KB=$(df -Pk {LOCAL_SCRATCH_ROOT} 2>/dev/null "
         "| awk 'NR==2 {print $4}'); "
@@ -174,7 +182,7 @@ def submit_verification(
     # scheduler workspace, so unconditional cleanup can target only this clone.
     cmd = (
         BASE
-        + f"( {select_workdir}cleanup() {{ rm -rf -- {cleanup_workdir} 2>/dev/null; }}; "
+        + f"( {select_workdir}cleanup() {{ rm -rf -- {cleanup_workdirs} 2>/dev/null; }}; "
         + "trap cleanup EXIT; trap 'exit 143' TERM INT; "
         + run_group
         + " )"
@@ -185,6 +193,9 @@ def submit_verification(
         "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
         "timeout_seconds": timeout_seconds,
         "dedupe_key": dedupe_key,
+        # Exact per-task basename only. The scheduler applies this cleanup on
+        # every terminal path, including cancellation and allocation loss.
+        "cleanup_globs": scratch_leaf,
     }
     existing = reconcile_task_id(name, dedupe_key)
     if existing is not None:
