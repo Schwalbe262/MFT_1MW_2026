@@ -642,6 +642,8 @@ class ThermalStabilityTest(unittest.TestCase):
         pad_mesh_operation.update.assert_called_once_with()
         rx_block_mesh_operation.update.assert_called_once_with()
         rx_mesh_operation.update.assert_called_once_with()
+        for operation in (pad_mesh_operation, rx_block_mesh_operation, rx_mesh_operation):
+            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
 
     def test_thermal_mesh_failures_are_not_silenced(self):
         empty = {

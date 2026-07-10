@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE / "verify"))
 import al_driver
 import scheduler_client
 import select_candidates
+from training.checkpoint_train import filter_valid_training_rows
 
 TEST_REVISION = "a" * 40
 TEST_LIBRARY_REVISION = "b" * 40
@@ -125,6 +126,28 @@ def complete_errors(spec_pass=(1, 1, 1)):
     }
 
 
+class ThermalTrainingFilterTests(unittest.TestCase):
+    def test_only_complete_unsaturated_rows_feed_temperature_models(self):
+        target = "Tprobe_core_center_max"
+        frame = pd.DataFrame([
+            {"sample": "valid", "thermal_solved": 1, "result_valid_thermal": 1,
+             target: 92.0},
+            {"sample": "thermal-invalid", "thermal_solved": 1,
+             "result_valid_thermal": 0, target: 93.0},
+            {"sample": "not-solved", "thermal_solved": 0,
+             "result_valid_thermal": 1, target: 94.0},
+            {"sample": "below-cap", "thermal_solved": 1,
+             "result_valid_thermal": 1, target: 4699.9},
+            {"sample": "at-cap", "thermal_solved": 1,
+             "result_valid_thermal": 1, target: 4700.0},
+        ])
+
+        filtered = filter_valid_training_rows(frame, target)
+
+        self.assertEqual(filtered["sample"].tolist(), ["valid", "below-cap"])
+        self.assertIs(filter_valid_training_rows(frame, "Llt_phys"), frame)
+
+
 def verification_counts(total=3, valid=3, exhausted=0, pending=0):
     return {
         "round": 1,
@@ -200,7 +223,8 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         )
         task_identity = hashlib.sha256(
             payload["dedupe_key"].encode("utf-8")).hexdigest()[:16]
-        task_workdir = f"{isolated}-t{task_identity}"
+        task_workdir = f"{scheduler_client.SCRATCH_LEAF_PREFIX}{isolated}-t{task_identity}"
+        self.assertEqual(payload["remote_cwd"], scheduler_client.GPFS_RUNS_REMOTE_CWD)
         self.assertIn("MFT_GPFS_ROOT=$PWD", command)
         self.assertIn(
             f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{task_workdir}"', command)
@@ -239,6 +263,20 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertIn("trap 'exit 143' TERM INT", command)
         self.assertIn(
             f"-mmin +{scheduler_client.LOCAL_SCRATCH_STALE_MINUTES}", command)
+        gpfs_sweep = (
+            'find "$MFT_GPFS_ROOT" -mindepth 1 -maxdepth 1 -type d '
+            '-user "$USER" '
+            f"-name {scheduler_client.SCRATCH_LEAF_PATTERN!r} "
+            f"-mmin +{scheduler_client.GPFS_SCRATCH_STALE_MINUTES} "
+            "-exec rm -rf -- {} +"
+        )
+        self.assertIn(gpfs_sweep, command)
+        self.assertEqual(scheduler_client.GPFS_SCRATCH_STALE_MINUTES, 8 * 60)
+        self.assertNotIn(
+            'find "$MFT_GPFS_ROOT" -mindepth 1 -maxdepth 1 -type d '
+            '-user "$USER" -name \'mft_*\'',
+            command,
+        )
         self.assertNotIn("rc=$?; rm -rf simulation aedt_temp", command)
         self.assertGreater(
             command.rindex("MFT_LIBRARY_GIT_HASH"),
@@ -271,6 +309,12 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertEqual(len(set(cleanup_globs)), 2)
         for payload, cleanup_glob in zip(payloads, cleanup_globs):
             self.assertNotRegex(cleanup_glob, r"[/\\*?\[]")
+            self.assertRegex(
+                cleanup_glob,
+                r"^mft_campaign-[A-Za-z0-9_-]+-t[0-9a-f]{16}$",
+            )
+            self.assertEqual(
+                payload["remote_cwd"], scheduler_client.GPFS_RUNS_REMOTE_CWD)
             self.assertIn("MFT_GPFS_ROOT=$PWD", payload["command"])
             self.assertIn(
                 f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{cleanup_glob}"',
@@ -297,7 +341,10 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         cleanup_glob = payload["cleanup_globs"]
         self.assertLessEqual(len(cleanup_glob), 198)
-        self.assertRegex(cleanup_glob, r"^[A-Za-z0-9_-]+$")
+        self.assertRegex(
+            cleanup_glob,
+            r"^mft_campaign-[A-Za-z0-9_-]+-t[0-9a-f]{16}$",
+        )
         self.assertNotIn("..", cleanup_glob)
         self.assertIn(
             f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{cleanup_glob}"',
@@ -510,6 +557,9 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             expected_library_revision=TEST_LIBRARY_REVISION))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(Llt=float("nan"))))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(T_max_core=float("nan"))))
+        self.assertFalse(scheduler_client.is_valid_result(valid_result(T_max_Rx_main=4726.85)))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(Tprobe_core_center_max=4726.85)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_solved=0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_converged=0)))
         self.assertFalse(scheduler_client.is_valid_result(

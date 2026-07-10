@@ -791,7 +791,7 @@ class ThermalMeshPolicyTests(unittest.TestCase):
             "Rx_side2_blocks": [],
         }
 
-    def test_thin_solids_and_tx_turns_are_meshed_as_separate_objects(self):
+    def test_thin_solids_and_windings_share_the_fluid_mesh_region(self):
         mesh = self._Mesh()
 
         _assign_thermal_mesh(SimpleNamespace(mesh=mesh), self._objects())
@@ -805,7 +805,7 @@ class ThermalMeshPolicyTests(unittest.TestCase):
         self.assertEqual(len(mesh.meshoperations), 4)
         for operation in mesh.meshoperations:
             self.assertFalse(operation.auto_update)
-            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], True)
+            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
             self.assertEqual(operation.update_calls, 1)
 
     def test_separate_object_mesh_update_failure_is_fatal(self):
@@ -856,6 +856,10 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
             "T_max_Rx_main": [81.0],
             "T_max_Rx_side": [82.0],
             "T_max_core": [83.0],
+            "Tprobe_Tx_leeward_max": [79.0],
+            "Tprobe_Rx_main_leeward_max": [80.0],
+            "Tprobe_Rx_side_leeward_max": [81.0],
+            "Tprobe_core_center_max": [82.0],
         })
         self.assertTrue(_thermal_result_is_valid(valid))
         invalid = valid.copy()
@@ -881,6 +885,12 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
         self.assertFalse(_thermal_result_is_valid(unbalanced))
         missing_balance = valid.drop(columns=["thermal_rx_power_balance_ok"])
         self.assertFalse(_thermal_result_is_valid(missing_balance))
+        saturated = valid.copy()
+        saturated.loc[0, "T_max_Rx_main"] = 4726.85
+        self.assertFalse(_thermal_result_is_valid(saturated))
+        saturated_probe = valid.copy()
+        saturated_probe.loc[0, "Tprobe_core_center_max"] = 4726.85
+        self.assertFalse(_thermal_result_is_valid(saturated_probe))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"thermal_solved": [0]})))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"other": [1]})))
         self.assertFalse(_thermal_result_is_valid(None))

@@ -112,7 +112,7 @@ def _require_thermal_geometry(
 
 
 def _assign_thermal_mesh(ipk, objs):
-    """Keep thin pads and winding solids represented in the Icepak mesh."""
+    """Keep thin solids represented without isolating their thermal interfaces."""
     def _assign_levels(levels, name):
         if not levels:
             return
@@ -128,15 +128,15 @@ def _assign_thermal_mesh(ipk, objs):
             update = getattr(operation, "update", None)
             if not callable(update):
                 raise RuntimeError(f"{name} mesh operation is unavailable: {item}")
-            # Icepak can omit a complete solid even when a mesh level is assigned.
-            # Set this while Objects still contains live names; parsed operations
-            # expose numeric IDs that cannot be safely edited through PyAEDT.
+            # Separate-object cut-cell regions can leave a retained solid with no
+            # conductive/convective path to the surrounding fluid. Keep the object
+            # level control, but mesh all controlled solids in the shared region.
             operation.auto_update = False
-            operation.props["Mesh Object(s) Separately Enabled"] = True
+            operation.props["Mesh Object(s) Separately Enabled"] = False
             if not update():
                 raise RuntimeError(f"{name} mesh operation update failed: {item}")
-            if operation.props.get("Mesh Object(s) Separately Enabled") is not True:
-                raise RuntimeError(f"{name} separate-object mesh setting was not retained: {item}")
+            if operation.props.get("Mesh Object(s) Separately Enabled") is not False:
+                raise RuntimeError(f"{name} shared-region mesh setting was not retained: {item}")
 
     pad_names = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
     _assign_levels({name: 2 for name in pad_names}, "pad_mesh_level")
@@ -153,8 +153,7 @@ def _assign_thermal_mesh(ipk, objs):
 
     # Homogenized packs have only a few large solids, but the global cut-cell
     # mesh can still represent a retained block with a single solution cell.
-    # Level 2 plus separate-object meshing gives each block an interior mesh
-    # without the cell explosion seen on thin explicit foils.
+    # Level 2 adds interior resolution while the shared region preserves heat paths.
     rx_block_names = list(dict.fromkeys(obj.name for obj in rx_blocks))
     _assign_levels({name: 2 for name in rx_block_names}, "rx_block_mesh_level")
 

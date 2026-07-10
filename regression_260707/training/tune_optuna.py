@@ -19,7 +19,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 OUT = os.path.join(HERE, "best_params.json")
 
-from checkpoint_train import TARGETS, to_physical, feature_columns, transform_y  # noqa: E402
+from checkpoint_train import (  # noqa: E402
+    TARGETS,
+    feature_columns,
+    filter_valid_training_rows,
+    to_physical,
+    transform_y,
+)
 from train_models import make_model  # noqa: E402
 
 
@@ -64,6 +70,7 @@ def tune(target, family, trials, df, feats):
     import optuna
     from sklearn.model_selection import KFold
 
+    df = filter_valid_training_rows(df, target)
     sub = df.dropna(subset=[target])
     sub = sub[np.isfinite(sub[target])]
     X = sub[feats].fillna(0.0).reset_index(drop=True)

@@ -17,6 +17,8 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 CURVE_CSV = os.path.join(HERE, "learning_curve.csv")
+MAX_TRUSTED_TEMPERATURE_C = 4700.0
+MIN_TRUSTED_TEMPERATURE_C = -273.15
 
 # 회귀 타겟 (실물 기준 컬럼명, 변환 후)
 TARGETS = {
@@ -37,6 +39,28 @@ TARGETS = {
 EXCLUDE_PREFIXES = ("Ltx", "Lrx", "M", "k", "Lm", "Ll", "Tx_loss", "Rx_loss", "P_", "B_",
                     "I1_", "phi", "I2_phase_used", "T_", "Tprobe_", "time", "conv_", "mesh_",
                     "git_hash", "project_name", "saved_at", "task_", "fail_")
+
+
+def filter_valid_training_rows(df, target):
+    """Restrict thermal targets to rows that passed the complete physical gate."""
+    if not target.startswith("Tprobe"):
+        return df
+    keep = pd.Series(True, index=df.index)
+    for column in ("thermal_solved", "result_valid_thermal"):
+        if column not in df.columns:
+            keep &= False
+        else:
+            keep &= pd.to_numeric(df[column], errors="coerce").fillna(0).eq(1)
+    if target not in df.columns:
+        keep &= False
+    else:
+        values = pd.to_numeric(df[target], errors="coerce")
+        keep &= (
+            values.map(np.isfinite)
+            & values.gt(MIN_TRUSTED_TEMPERATURE_C)
+            & values.lt(MAX_TRUSTED_TEMPERATURE_C)
+        )
+    return df[keep]
 
 
 def to_physical(df):
@@ -129,9 +153,8 @@ def main():
             print(f"  [skip] {target} (컬럼 없음)")
             continue
         # 온도 타겟: thermal 솔브가 성공한 행만 (thermal_solved 플래그, 2026-07-09)
-        if target.startswith('Tprobe') and 'thermal_solved' in df.columns:
-            df = df[df['thermal_solved'].fillna(0) == 1]
-        sub = df.dropna(subset=[target])
+        target_df = filter_valid_training_rows(df, target)
+        sub = target_df.dropna(subset=[target])
         sub = sub[np.isfinite(sub[target])]
         if len(sub) < 100:
             print(f"  [skip] {target} (n={len(sub)} < 100)")

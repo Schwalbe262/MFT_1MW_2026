@@ -30,6 +30,13 @@ DEFAULT_TASK_TIMEOUT_SECONDS = int(_STANDARD_PROFILE["timeout_seconds"])
 LOCAL_SCRATCH_ROOT = "/enroot"
 LOCAL_SCRATCH_MIN_FREE_KB = 200 * 1024 * 1024
 LOCAL_SCRATCH_STALE_MINUTES = 8 * 60
+GPFS_RUNS_REMOTE_CWD = "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs"
+GPFS_SCRATCH_STALE_MINUTES = 8 * 60
+SCRATCH_LEAF_PREFIX = "mft_campaign-"
+SCRATCH_LEAF_PATTERN = f"{SCRATCH_LEAF_PREFIX}*-t????????????????"
+MAX_SCRATCH_LEAF_LENGTH = 198
+MAX_TRUSTED_TEMPERATURE_C = 4700.0
+MIN_TRUSTED_TEMPERATURE_C = -273.15
 
 MANDATORY_TEMPERATURE_COLUMNS = (
     "T_max_Tx",
@@ -126,7 +133,11 @@ def submit_verification(
     # so a retry with the same candidate cannot race terminal cleanup from the
     # previous task. Keep the basename below common filesystem NAME_MAX limits.
     task_identity = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()[:16]
-    scratch_leaf = f"{safe_workdir[:180]}-t{task_identity}"
+    scratch_suffix = f"-t{task_identity}"
+    safe_workdir_limit = (
+        MAX_SCRATCH_LEAF_LENGTH - len(SCRATCH_LEAF_PREFIX) - len(scratch_suffix))
+    scratch_leaf = (
+        f"{SCRATCH_LEAF_PREFIX}{safe_workdir[:safe_workdir_limit]}{scratch_suffix}")
     scratch_workdir = f"{LOCAL_SCRATCH_ROOT}/{scratch_leaf}"
     quoted_workdir = '"${MFT_WORKDIR}"'
     quoted_repo = '"${MFT_WORKDIR}/repo"'
@@ -136,6 +147,11 @@ def submit_verification(
         "MFT_GPFS_ROOT=$PWD; "
         f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{scratch_leaf}"; '
         f"MFT_NVME_WORKDIR={shlex.quote(scratch_workdir)}; "
+        'find "$MFT_GPFS_ROOT" -mindepth 1 -maxdepth 1 -type d '
+        '-user "$USER" '
+        f"-name {shlex.quote(SCRATCH_LEAF_PATTERN)} "
+        f"-mmin +{GPFS_SCRATCH_STALE_MINUTES} -exec rm -rf -- {{}} + "
+        "2>/dev/null || true; "
         f"MFT_ENROOT_FREE_KB=$(df -Pk {LOCAL_SCRATCH_ROOT} 2>/dev/null "
         "| awk 'NR==2 {print $4}'); "
         f"if [ \"$(findmnt -n -o FSTYPE -T {LOCAL_SCRATCH_ROOT} 2>/dev/null)\" = xfs ] "
@@ -188,7 +204,7 @@ def submit_verification(
         + " )"
     )
     payload = {
-        "name": name, "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__",
+        "name": name, "remote_cwd": GPFS_RUNS_REMOTE_CWD,
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
         "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
         "timeout_seconds": timeout_seconds,
@@ -382,7 +398,11 @@ def is_valid_result(
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
     temperatures = required_temperature_columns(result)
-    return bool(temperatures) and all(_finite(result, key) for key in temperatures)
+    return bool(temperatures) and all(
+        _finite(result, key)
+        and MIN_TRUSTED_TEMPERATURE_C < float(result[key]) < MAX_TRUSTED_TEMPERATURE_C
+        for key in temperatures
+    )
 
 
 def fetch_result(

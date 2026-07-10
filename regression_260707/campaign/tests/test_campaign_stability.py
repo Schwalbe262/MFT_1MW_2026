@@ -951,6 +951,9 @@ class ThermalValidityTests(unittest.TestCase):
                 "T_max_Rx_main": 81.0,
                 "T_max_Rx_side": float("nan"),
                 "T_max_core": 82.0,
+                "Tprobe_Tx_leeward_max": 79.0,
+                "Tprobe_Rx_main_leeward_max": 80.0,
+                "Tprobe_core_center_max": 81.0,
             },
             {
                 "project_name": "no-side-required",
@@ -981,6 +984,9 @@ class ThermalValidityTests(unittest.TestCase):
                 "T_max_Rx_main": 81.0,
                 "T_max_Rx_side": float("nan"),
                 "T_max_core": 82.0,
+                "Tprobe_Tx_leeward_max": 79.0,
+                "Tprobe_Rx_main_leeward_max": 80.0,
+                "Tprobe_core_center_max": 81.0,
                 "thermal_required_group_mask": 11,
                 "thermal_required_missing_count": 0,
                 "thermal_extraction_complete": 1,
@@ -1018,17 +1024,70 @@ class ThermalValidityTests(unittest.TestCase):
                 "thermal_residual_energy": 4e-9,
             },
         ])
+        saturated = frame.iloc[[3]].copy()
+        saturated.loc[:, "project_name"] = "solver-temperature-ceiling"
+        saturated.loc[:, "T_max_Rx_main"] = 4726.85
+        saturated.loc[:, "result_valid_em"] = 1
+        saturated.loc[:, "result_valid_thermal"] = 1
+        frame = pd.concat([frame, saturated], ignore_index=True)
 
         normalized, count = collect_wave.normalize_thermal_validity(frame)
 
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 5)
         self.assertEqual(normalized["project_name"].tolist(), frame["project_name"].tolist())
-        self.assertEqual(normalized["thermal_solved"].tolist(), [0, 0, 0, 1, 0])
+        self.assertEqual(normalized["thermal_solved"].tolist(), [0, 0, 0, 1, 0, 0])
         self.assertEqual(normalized["result_valid_thermal"].iloc[0], 0)
         self.assertEqual(normalized["result_valid_thermal"].iloc[1], 0)
         self.assertEqual(normalized["result_valid_thermal"].iloc[2], 0)
         self.assertTrue(pd.isna(normalized["result_valid_thermal"].iloc[3]))
         self.assertEqual(normalized["result_valid_thermal"].iloc[4], 0)
+        self.assertEqual(normalized["result_valid_thermal"].iloc[5], 0)
+        self.assertEqual(normalized["result_valid_em"].iloc[5], 1)
+
+    def test_existing_master_saturation_is_atomically_demoted(self):
+        row = {
+            "project_name": "simulation438",
+            "thermal_solved": 1,
+            "result_valid_em": 1,
+            "result_valid_thermal": 1,
+            "N2_side": 0,
+            "T_max_Tx": 85.0,
+            "T_max_Rx_main": 4726.85,
+            "T_max_Rx_side": float("nan"),
+            "T_max_core": 76.0,
+            "Tprobe_Tx_leeward_max": 84.0,
+            "Tprobe_Rx_main_leeward_max": 4726.85,
+            "Tprobe_core_center_max": 75.0,
+            "thermal_required_group_mask": 11,
+            "thermal_required_missing_count": 0,
+            "thermal_extraction_complete": 1,
+            "thermal_convergence_available": 1,
+            "thermal_converged": 1,
+            "thermal_iterations": 176,
+            "thermal_residual_flow_limit": 1e-3,
+            "thermal_residual_energy_limit": 1e-7,
+            "thermal_residual_continuity": 8e-4,
+            "thermal_residual_x_velocity": 4e-4,
+            "thermal_residual_y_velocity": 9e-4,
+            "thermal_residual_z_velocity": 4e-4,
+            "thermal_residual_energy": 4e-9,
+        }
+        previous = collect_wave.DATASET_DIR
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                collect_wave.DATASET_DIR = directory
+                master = Path(directory) / "train.parquet"
+                pd.DataFrame([row]).to_parquet(master, index=False)
+
+                self.assertEqual(collect_wave.repair_master_thermal_validity(), 1)
+                repaired = pd.read_parquet(master)
+                self.assertEqual(repaired["thermal_solved"].iloc[0], 0)
+                self.assertEqual(repaired["result_valid_thermal"].iloc[0], 0)
+                self.assertEqual(repaired["result_valid_em"].iloc[0], 1)
+                self.assertEqual(repaired["T_max_Rx_main"].iloc[0], 4726.85)
+                self.assertEqual(collect_wave.repair_master_thermal_validity(), 0)
+        finally:
+            collect_wave.DATASET_DIR = previous
 
 
 class ProvenanceFilterTests(unittest.TestCase):

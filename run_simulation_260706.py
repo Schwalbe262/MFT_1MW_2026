@@ -274,6 +274,22 @@ def _parse_rl_matrix_export(text, frequency_hz, tx_name="Tx_winding", rx_name="R
     }
 
 
+MAX_TRUSTED_TEMPERATURE_C = 4700.0
+MIN_TRUSTED_TEMPERATURE_C = -273.15
+MANDATORY_THERMAL_TEMPERATURE_COLUMNS = (
+    "T_max_Tx",
+    "T_max_Rx_main",
+    "T_max_core",
+    "Tprobe_Tx_leeward_max",
+    "Tprobe_Rx_main_leeward_max",
+    "Tprobe_core_center_max",
+)
+SIDE_THERMAL_TEMPERATURE_COLUMNS = (
+    "T_max_Rx_side",
+    "Tprobe_Rx_side_leeward_max",
+)
+
+
 def _thermal_result_is_valid(frame):
     """Return True only when every required thermal group passed extraction."""
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -339,8 +355,15 @@ def _thermal_result_is_valid(frame):
         required_mask = int(frame["thermal_required_group_mask"].iloc[0])
         if required_mask & 11 != 11 or required_mask & ~15:
             return False
-        required = [column for column, bit in group_bits.items() if required_mask & bit]
-        return all(math.isfinite(float(frame[column].iloc[0])) for column in required)
+        required = list(MANDATORY_THERMAL_TEMPERATURE_COLUMNS)
+        if required_mask & group_bits["T_max_Rx_side"]:
+            required.extend(SIDE_THERMAL_TEMPERATURE_COLUMNS)
+        temperatures = [float(frame[column].iloc[0]) for column in required]
+        return all(
+            math.isfinite(value)
+            and MIN_TRUSTED_TEMPERATURE_C < value < MAX_TRUSTED_TEMPERATURE_C
+            for value in temperatures
+        )
     except (KeyError, TypeError, ValueError, OverflowError, IndexError):
         return False
 

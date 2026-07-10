@@ -39,6 +39,20 @@ FETCH_ATTEMPTS = 3
 RETRY_BASE_SECONDS = 0.5
 RETRY_MAX_SECONDS = 30.0
 MAX_STDOUT_BYTES = 1_048_576
+MAX_TRUSTED_TEMPERATURE_C = 4700.0
+MIN_TRUSTED_TEMPERATURE_C = -273.15
+MANDATORY_THERMAL_TEMPERATURE_COLUMNS = (
+    "T_max_Tx",
+    "T_max_Rx_main",
+    "T_max_core",
+    "Tprobe_Tx_leeward_max",
+    "Tprobe_Rx_main_leeward_max",
+    "Tprobe_core_center_max",
+)
+SIDE_THERMAL_TEMPERATURE_COLUMNS = (
+    "T_max_Rx_side",
+    "Tprobe_Rx_side_leeward_max",
+)
 
 
 class FetchError(RuntimeError):
@@ -377,13 +391,17 @@ def normalize_thermal_validity(df):
     if not solved.any():
         return df, 0
 
-    required = ("T_max_Tx", "T_max_Rx_main", "T_max_core")
     complete = pd.Series(True, index=df.index)
-    for column in required:
+    for column in MANDATORY_THERMAL_TEMPERATURE_COLUMNS:
         if column not in df.columns:
             complete &= False
         else:
-            complete &= pd.to_numeric(df[column], errors="coerce").map(math.isfinite)
+            temperatures = pd.to_numeric(df[column], errors="coerce")
+            complete &= (
+                temperatures.map(math.isfinite)
+                & temperatures.gt(MIN_TRUSTED_TEMPERATURE_C)
+                & temperatures.lt(MAX_TRUSTED_TEMPERATURE_C)
+            )
 
     if "N2_side" not in df.columns:
         complete &= False
@@ -392,11 +410,17 @@ def normalize_thermal_validity(df):
         n2_side = pd.to_numeric(df["N2_side"], errors="coerce")
         complete &= n2_side.notna()
         side_required = n2_side.gt(0)
-    if "T_max_Rx_side" not in df.columns:
-        complete &= ~side_required
-    else:
-        side_finite = pd.to_numeric(df["T_max_Rx_side"], errors="coerce").map(math.isfinite)
-        complete &= ~side_required | side_finite
+    for column in SIDE_THERMAL_TEMPERATURE_COLUMNS:
+        if column not in df.columns:
+            complete &= ~side_required
+        else:
+            side_temperature = pd.to_numeric(df[column], errors="coerce")
+            side_trusted = (
+                side_temperature.map(math.isfinite)
+                & side_temperature.gt(MIN_TRUSTED_TEMPERATURE_C)
+                & side_temperature.lt(MAX_TRUSTED_TEMPERATURE_C)
+            )
+            complete &= ~side_required | side_trusted
 
     expected_mask = pd.Series(11, index=df.index).where(~side_required, 15)
     for column, predicate in (
@@ -748,6 +772,26 @@ def _replace_staged(staged_targets):
                 os.remove(staged)
 
 
+def repair_master_thermal_validity():
+    """Atomically demote thermal rows that predate the current physical gate."""
+    master_path = os.path.join(DATASET_DIR, "train.parquet")
+    if not os.path.isfile(master_path):
+        return 0
+    lock_path = master_path + ".lock"
+    with FileLock(lock_path):
+        frame = pd.read_parquet(master_path)
+        repaired, count = normalize_thermal_validity(frame)
+        if not count:
+            return 0
+        staged = _stage_parquet(repaired, master_path)
+        try:
+            os.replace(staged, master_path)
+        finally:
+            if os.path.exists(staged):
+                os.remove(staged)
+        return count
+
+
 def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_nodata=(),
                   pending_local_parts=()):
     """Merge rows and terminal cache state under one inter-process lock."""
@@ -815,6 +859,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     os.makedirs(DATASET_DIR, exist_ok=True)
+    repaired_master_rows = repair_master_thermal_validity()
+    if repaired_master_rows:
+        print(f"thermal_master_rows_demoted: {repaired_master_rows}")
 
     tasks = list_tasks(args.prefix)
     done = [t for t in tasks if t.get("status") == "completed"]
