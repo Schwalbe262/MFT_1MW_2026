@@ -300,23 +300,33 @@ def _em_result_validation(frame, matrix_on=True, loss_on=True):
     enabled = []
     if matrix_on:
         enabled.append((
-            "matrix", "matrix_percent_error", MATRIX_REQUIRED_RESULT_COLUMNS,
+            "matrix", "matrix_percent_error", "matrix_min_converged",
+            MATRIX_REQUIRED_RESULT_COLUMNS,
         ))
     if loss_on:
-        enabled.append(("loss", "percent_error", LOSS_REQUIRED_RESULT_COLUMNS))
+        enabled.append((
+            "loss", "percent_error", "min_converged", LOSS_REQUIRED_RESULT_COLUMNS,
+        ))
     if not enabled:
         return False, "no EM stage is enabled"
 
     failures = []
-    for label, tolerance_column, required_columns in enabled:
+    for label, tolerance_column, minimum_column, required_columns in enabled:
         tolerance = _finite_result_value(frame, tolerance_column)
+        minimum_passes = _finite_result_value(frame, minimum_column)
         passes = _finite_result_value(frame, f"conv_passes_{label}")
         error = _finite_result_value(frame, f"conv_error_pct_{label}")
         delta = _finite_result_value(frame, f"conv_delta_pct_{label}")
         if tolerance is None or tolerance <= 0:
             failures.append(f"{label}: invalid {tolerance_column}")
-        if passes is None or passes < 1:
+        if minimum_passes is None or minimum_passes < 1:
+            failures.append(f"{label}: invalid {minimum_column}")
+        if passes is None:
             failures.append(f"{label}: convergence pass count is missing")
+        elif minimum_passes is not None and passes < minimum_passes:
+            failures.append(
+                f"{label}: convergence pass count {passes:g} is below {minimum_passes:g}"
+            )
         if error is None or error < 0:
             failures.append(f"{label}: energy error is missing")
         elif tolerance is not None and tolerance > 0 and error > tolerance:

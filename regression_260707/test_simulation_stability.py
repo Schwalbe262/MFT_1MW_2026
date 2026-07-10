@@ -927,6 +927,7 @@ class EmCompletionPolicyTests(unittest.TestCase):
     def _valid_result():
         return pd.DataFrame([{
             "matrix_percent_error": 1.5,
+            "matrix_min_converged": 1,
             "conv_passes_matrix": 6,
             "conv_error_pct_matrix": 1.1,
             "conv_delta_pct_matrix": 0.2,
@@ -939,6 +940,7 @@ class EmCompletionPolicyTests(unittest.TestCase):
             "Llt": 18.0,
             "Llr": 1_800.0,
             "percent_error": 1.5,
+            "min_converged": 2,
             "conv_passes_loss": 4,
             "conv_error_pct_loss": 0.7,
             "conv_delta_pct_loss": 0.3,
@@ -970,6 +972,10 @@ class EmCompletionPolicyTests(unittest.TestCase):
 
         missing_delta = self._valid_result().drop(columns=["conv_delta_pct_loss"])
         self.assertFalse(_em_result_is_valid(missing_delta))
+
+        too_few_passes = self._valid_result()
+        too_few_passes.loc[0, "conv_passes_loss"] = 1
+        self.assertFalse(_em_result_is_valid(too_few_passes))
 
     def test_validates_only_enabled_stages(self):
         matrix_only = self._valid_result().drop(columns=[
