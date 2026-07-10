@@ -799,7 +799,7 @@ class ThermalMeshPolicyTests(unittest.TestCase):
         self.assertEqual(mesh.calls, [
             ({"wcp_pad": 2, "core_pad": 2}, "pad_mesh_level"),
             ({"tx_0": 2, "tx_1": 2}, "tx_mesh_level"),
-            ({"rx_main_block": 3, "rx_side_block": 3}, "rx_block_mesh_level"),
+            ({"rx_main_block": 4, "rx_side_block": 4}, "rx_block_mesh_level"),
             ({"rx_main": 3, "rx_side": 3}, "rx_mesh_level"),
         ])
         self.assertEqual(len(mesh.meshoperations), 4)

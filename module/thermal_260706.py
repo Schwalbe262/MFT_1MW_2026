@@ -151,11 +151,12 @@ def _assign_thermal_mesh(ipk, objs):
     for key in ("Rx_main_blocks", "Rx_side_blocks", "Rx_side2_blocks"):
         rx_blocks.extend(objs.get(key, []))
 
-    # Side packs can be only one or two foil pitches thick. Level 2 omitted every
-    # retained side block for a measured 1.621 mm pack, so use the same level as
-    # explicit Rx foils while preserving the shared-region heat path.
+    # Side packs can be only one or two foil pitches thick. For a measured
+    # 1.621 mm pack, level 3 resolved the main and y-oriented side blocks but
+    # omitted both thin x-oriented side blocks. Level 4 restored their finite
+    # solution volumes while preserving the shared-region heat path.
     rx_block_names = list(dict.fromkeys(obj.name for obj in rx_blocks))
-    _assign_levels({name: 3 for name in rx_block_names}, "rx_block_mesh_level")
+    _assign_levels({name: 4 for name in rx_block_names}, "rx_block_mesh_level")
 
     explicit_rx = []
     for key in ("Rx_main_explicit", "Rx_side_explicit", "Rx_side2_explicit"):
