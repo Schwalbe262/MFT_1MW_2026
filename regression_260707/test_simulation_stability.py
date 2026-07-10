@@ -22,6 +22,7 @@ from run_simulation_260706 import (
 )
 from module.input_parameter_260706 import get_drawing_default_params
 from module.thermal_260706 import (
+    _assign_thermal_mesh,
     _build_homog_blocks,
     _partition_rx_turns,
     _rx_layout,
@@ -744,6 +745,70 @@ class ThermalHomogenizationTests(unittest.TestCase):
 
     def test_production_default_uses_homogenized_rx_blocks(self):
         self.assertEqual(get_drawing_default_params()["n_explicit_turns"], 0)
+
+
+class ThermalMeshPolicyTests(unittest.TestCase):
+    class _Operation:
+        def __init__(self, name, update_ok=True):
+            self.name = name
+            self.props = {}
+            self.auto_update = True
+            self.update_ok = update_ok
+            self.update_calls = 0
+
+        def update(self):
+            self.update_calls += 1
+            return self.update_ok
+
+    class _Mesh:
+        def __init__(self, failing_name=None):
+            self.meshoperations = []
+            self.calls = []
+            self.failing_name = failing_name
+
+        def assign_mesh_level(self, levels, name):
+            self.calls.append((dict(levels), name))
+            operation_name = f"{name}_L"
+            operation = ThermalMeshPolicyTests._Operation(
+                operation_name, update_ok=name != self.failing_name
+            )
+            operation.props.update({"Objects": list(levels), "Level": str(next(iter(levels.values())))})
+            self.meshoperations.append(operation)
+            return [operation_name]
+
+    @staticmethod
+    def _objects():
+        obj = lambda name: SimpleNamespace(name=name)
+        return {
+            "Tx": [obj("tx_0"), obj("tx_1")],
+            "wcp_pads": [obj("wcp_pad")],
+            "core_pads": [obj("core_pad")],
+            "Rx_main_explicit": [obj("rx_main")],
+            "Rx_side_explicit": [obj("rx_side")],
+            "Rx_side2_explicit": [],
+        }
+
+    def test_thin_solids_and_tx_turns_are_meshed_as_separate_objects(self):
+        mesh = self._Mesh()
+
+        _assign_thermal_mesh(SimpleNamespace(mesh=mesh), self._objects())
+
+        self.assertEqual(mesh.calls, [
+            ({"wcp_pad": 2, "core_pad": 2}, "pad_mesh_level"),
+            ({"tx_0": 2, "tx_1": 2}, "tx_mesh_level"),
+            ({"rx_main": 3, "rx_side": 3}, "rx_mesh_level"),
+        ])
+        self.assertEqual(len(mesh.meshoperations), 3)
+        for operation in mesh.meshoperations:
+            self.assertFalse(operation.auto_update)
+            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], True)
+            self.assertEqual(operation.update_calls, 1)
+
+    def test_separate_object_mesh_update_failure_is_fatal(self):
+        mesh = self._Mesh(failing_name="tx_mesh_level")
+
+        with self.assertRaisesRegex(RuntimeError, "tx_mesh_level mesh operation update failed"):
+            _assign_thermal_mesh(SimpleNamespace(mesh=mesh), self._objects())
 
 
 class FailureLogTests(unittest.TestCase):

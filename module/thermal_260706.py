@@ -112,7 +112,7 @@ def _require_thermal_geometry(
 
 
 def _assign_thermal_mesh(ipk, objs):
-    """Apply mandatory mesh controls for thin pads and explicit Rx foil turns."""
+    """Keep thin pads and winding solids represented in the Icepak mesh."""
     def _assign_levels(levels, name):
         if not levels:
             return
@@ -126,11 +126,26 @@ def _assign_thermal_mesh(ipk, objs):
         for item in operation_names:
             operation = item if callable(getattr(item, "update", None)) else operations.get(str(item))
             update = getattr(operation, "update", None)
-            if not callable(update) or not update():
+            if not callable(update):
+                raise RuntimeError(f"{name} mesh operation is unavailable: {item}")
+            # Icepak can omit a complete solid even when a mesh level is assigned.
+            # Set this while Objects still contains live names; parsed operations
+            # expose numeric IDs that cannot be safely edited through PyAEDT.
+            operation.auto_update = False
+            operation.props["Mesh Object(s) Separately Enabled"] = True
+            if not update():
                 raise RuntimeError(f"{name} mesh operation update failed: {item}")
+            if operation.props.get("Mesh Object(s) Separately Enabled") is not True:
+                raise RuntimeError(f"{name} separate-object mesh setting was not retained: {item}")
 
     pad_names = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
     _assign_levels({name: 2 for name in pad_names}, "pad_mesh_level")
+
+    # Tx turns are thicker than the pads, but coarse cut-cell meshing has still
+    # produced zero solution volume for complete turns. One shared level avoids
+    # the cell explosion caused by a separate cut-cell region per turn.
+    tx_names = list(dict.fromkeys(obj.name for obj in objs.get("Tx", [])))
+    _assign_levels({name: 2 for name in tx_names}, "tx_mesh_level")
 
     explicit_rx = []
     for key in ("Rx_main_explicit", "Rx_side_explicit", "Rx_side2_explicit"):
