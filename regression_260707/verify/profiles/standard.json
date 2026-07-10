@@ -7,7 +7,7 @@
   "loss_sym_on": 1, "thermal_symmetry": "eighth",
   "n_explicit_turns": 0,
   "matrix_skin_mesh": 0,
-  "matrix_percent_error": 1.5, "matrix_max_passes": 10, "matrix_min_converged": 1,
+  "matrix_percent_error": 1.5, "matrix_max_passes": 20, "matrix_min_converged": 1,
   "percent_error": 1.5, "max_passes": 10, "min_converged": 2,
   "freq": 1000.0, "loss_from_copy": 1,
   "P_target": 1000000.0, "keep_project": 0

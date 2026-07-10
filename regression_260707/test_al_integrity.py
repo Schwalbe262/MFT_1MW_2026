@@ -74,7 +74,7 @@ def valid_result(**updates):
         "n_explicit_turns": 0,
         "matrix_skin_mesh": 0,
         "matrix_percent_error": 1.5,
-        "matrix_max_passes": 10,
+        "matrix_max_passes": 20,
         "matrix_min_converged": 1,
         "percent_error": 1.5,
         "max_passes": 10,
