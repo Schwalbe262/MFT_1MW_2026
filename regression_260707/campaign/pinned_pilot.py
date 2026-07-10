@@ -274,65 +274,153 @@ def validate_local_gate(solver_revision, library_revision, manifest_dir=None):
     return {"manifest": str(path), "tag": tag, "projects": projects}
 
 
-def validate_p02_predecessor(
-        solver_revision, library_revision, seed, manifest_dir=None):
-    """Require two completed, strict-valid p02 results before p08 executes."""
-    manifest_dir = Path(manifest_dir) if manifest_dir is not None else campaign_manifest_dir()
-    expected_tag = pilot_tag(
-        solver_revision, library_revision, "p02", seed,
-        PILOT_STAGE_CONTRACT["p02"]["offset"],
-    )
-    manifest_path = manifest_dir / f"{expected_tag}.json"
+def load_pilot_stage_manifest(
+        solver_revision, library_revision, stage, seed=260710,
+        manifest_dir=None, required_by=None):
+    """Load and authenticate a submitted pilot ledger without judging results.
+
+    This is the shared boundary used by the strict predecessor gates and by the
+    rapid campaign controller.  Keeping candidate identity checks here prevents
+    an early-promotion observer from accepting a hand-edited or cross-revision
+    manifest.
+    """
+    contract = PILOT_STAGE_CONTRACT.get(stage)
+    if contract is None:
+        raise ValueError(f"unknown pilot stage: {stage}")
+    manifest_dir = (
+        Path(manifest_dir) if manifest_dir is not None else campaign_manifest_dir())
+    tag = pilot_tag(
+        solver_revision, library_revision, stage, seed, contract["offset"])
+    path = manifest_dir / f"{tag}.json"
+    consumer = required_by or "campaign controller"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError) as exc:
         raise RuntimeError(
-            f"p08 requires a readable p02 manifest: {manifest_path}: {exc}") from exc
+            f"{consumer} requires a readable {stage} manifest: {path}: {exc}") from exc
 
-    expected_identity = {
-        "tag": expected_tag,
-        "stage": "p02",
+    expected = {
+        "tag": tag,
+        "stage": stage,
         "solver_revision": solver_revision,
         "library_revision": library_revision,
         "seed": seed,
-        "offset": PILOT_STAGE_CONTRACT["p02"]["offset"],
-        "task_count": PILOT_STAGE_CONTRACT["p02"]["tasks"],
+        "offset": contract["offset"],
+        "task_count": contract["tasks"],
         "executed": True,
     }
     mismatches = {
-        key: (manifest.get(key), expected)
-        for key, expected in expected_identity.items()
-        if manifest.get(key) != expected
+        key: (manifest.get(key), value)
+        for key, value in expected.items() if manifest.get(key) != value
     }
     if mismatches:
-        raise RuntimeError(
-            f"p02 manifest identity does not match the requested p08: {mismatches}")
+        raise RuntimeError(f"{stage} manifest identity is invalid: {mismatches}")
 
     tasks = manifest.get("tasks")
-    if not isinstance(tasks, list) or len(tasks) != expected_identity["task_count"]:
-        raise RuntimeError("p02 manifest must contain exactly two task records")
-
-    candidates = [effective_candidate(candidate) for candidate in deterministic_candidates(
-        PILOT_STAGE_CONTRACT["p02"]["tasks"],
-        offset=PILOT_STAGE_CONTRACT["p02"]["offset"], seed=seed)]
+    if not isinstance(tasks, list) or len(tasks) != contract["tasks"]:
+        raise RuntimeError(
+            f"{stage} manifest must contain exactly {contract['tasks']} task records")
+    candidates = [
+        effective_candidate(candidate)
+        for candidate in deterministic_candidates(
+            contract["tasks"], offset=contract["offset"], seed=seed)
+    ]
     task_ids = []
-    expected_names = []
+    task_names = []
     for index, record in enumerate(tasks):
-        if not isinstance(record, dict) or record.get("index") != index:
-            raise RuntimeError(f"p02 manifest task {index} has an invalid record/index")
-        expected_name = f"mft-pilot-{expected_tag}-{index:02d}"
-        if record.get("name") != expected_name:
-            raise RuntimeError(
-                f"p02 manifest task {index} has an unexpected name: {record.get('name')!r}")
+        expected_name = f"mft-pilot-{tag}-{index:02d}"
+        if (not isinstance(record, dict) or record.get("index") != index
+                or record.get("name") != expected_name):
+            raise RuntimeError(f"{stage} manifest task {index} has an invalid identity")
         if record.get("params_sha256") != candidate_digest(candidates[index]):
-            raise RuntimeError(f"p02 manifest task {index} has an invalid parameter digest")
+            raise RuntimeError(
+                f"{stage} manifest task {index} has an invalid parameter digest")
         task_id = record.get("task_id")
         if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
-            raise RuntimeError(f"p02 manifest task {index} has no valid task ID")
+            raise RuntimeError(f"{stage} manifest task {index} has no valid task ID")
         task_ids.append(task_id)
-        expected_names.append(expected_name)
+        task_names.append(expected_name)
     if len(set(task_ids)) != len(task_ids):
-        raise RuntimeError("p02 manifest contains duplicate task IDs")
+        raise RuntimeError(f"{stage} manifest contains duplicate task IDs")
+    return {
+        "path": path,
+        "manifest": manifest,
+        "tag": tag,
+        "tasks": tasks,
+        "task_ids": task_ids,
+        "task_names": task_names,
+        "candidates": candidates,
+    }
+
+
+def inspect_pilot_stage(
+        solver_revision, library_revision, stage, seed=260710,
+        manifest_dir=None):
+    """Return strict, physical outcomes while a pilot stage is still running."""
+    loaded = load_pilot_stage_manifest(
+        solver_revision, library_revision, stage, seed, manifest_dir=manifest_dir)
+    outcomes = []
+    for index, task_id in enumerate(loaded["task_ids"]):
+        status = scheduler_client.get_status(task_id)
+        if status is None:
+            raise RuntimeError(f"scheduler status is unavailable for {stage} task {task_id}")
+        outcome = {
+            "index": index,
+            "task_id": task_id,
+            "name": loaded["task_names"][index],
+            "status": status,
+            "state": "pending",
+            "reason": None,
+            "result": None,
+        }
+        if status in ("failed", "cancelled"):
+            outcome.update(state="invalid", reason=f"task_{status}")
+        elif status == "completed":
+            try:
+                fetched = scheduler_client.fetch_result(
+                    task_id,
+                    expected_revision=solver_revision,
+                    expected_library_revision=library_revision,
+                )
+            except scheduler_client.ResultFetchError as exc:
+                raise RuntimeError(
+                    f"{stage} task {task_id} result is unavailable: {exc}") from exc
+            outcome["result"] = fetched.result
+            if (fetched.state == scheduler_client.RESULT_VALID
+                    and scheduler_client.is_valid_result(
+                        fetched.result,
+                        expected_revision=solver_revision,
+                        expected_library_revision=library_revision)
+                    and result_matches_candidate(
+                        fetched.result, loaded["candidates"][index])):
+                outcome["state"] = "valid"
+            else:
+                outcome.update(
+                    state="invalid",
+                    reason=(
+                        "candidate_mismatch"
+                        if fetched.state == scheduler_client.RESULT_VALID
+                        else f"result_{fetched.state}"
+                    ),
+                )
+        elif status not in ACTIVE_STATUSES:
+            raise RuntimeError(
+                f"{stage} task {task_id} returned an unknown status: {status!r}")
+        outcomes.append(outcome)
+    return {**loaded, "outcomes": outcomes}
+
+
+def validate_p02_predecessor(
+        solver_revision, library_revision, seed, manifest_dir=None):
+    """Require two completed, strict-valid p02 results before p08 executes."""
+    loaded = load_pilot_stage_manifest(
+        solver_revision, library_revision, "p02", seed, manifest_dir=manifest_dir,
+        required_by="p08",
+    )
+    manifest_path = loaded["path"]
+    task_ids = loaded["task_ids"]
+    expected_names = loaded["task_names"]
+    candidates = loaded["candidates"]
 
     for task_id, expected_name in zip(task_ids, expected_names):
         status = scheduler_client.get_status(task_id)
@@ -362,7 +450,7 @@ def validate_p02_predecessor(
 
     return {
         "manifest": str(manifest_path),
-        "tag": expected_tag,
+        "tag": loaded["tag"],
         "task_ids": task_ids,
     }
 
@@ -370,50 +458,14 @@ def validate_p02_predecessor(
 def validate_p08_completion(
         solver_revision, library_revision, seed=260710, manifest_dir=None):
     """Require all eight p08 tasks to be terminal and strict-valid before refill."""
-    manifest_dir = Path(manifest_dir) if manifest_dir is not None else campaign_manifest_dir()
-    stage = "p08"
-    contract = PILOT_STAGE_CONTRACT[stage]
-    tag = pilot_tag(solver_revision, library_revision, stage, seed, contract["offset"])
-    path = manifest_dir / f"{tag}.json"
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError) as exc:
-        raise RuntimeError(f"feeder requires a readable p08 manifest: {path}: {exc}") from exc
-    expected = {
-        "tag": tag,
-        "stage": stage,
-        "solver_revision": solver_revision,
-        "library_revision": library_revision,
-        "seed": seed,
-        "offset": contract["offset"],
-        "task_count": contract["tasks"],
-        "executed": True,
-    }
-    mismatches = {
-        key: (manifest.get(key), value)
-        for key, value in expected.items() if manifest.get(key) != value
-    }
-    if mismatches:
-        raise RuntimeError(f"p08 manifest identity is invalid: {mismatches}")
-    tasks = manifest.get("tasks")
-    if not isinstance(tasks, list) or len(tasks) != contract["tasks"]:
-        raise RuntimeError("p08 manifest must contain exactly eight task records")
-    candidates = [effective_candidate(candidate) for candidate in deterministic_candidates(
-        contract["tasks"], offset=contract["offset"], seed=seed)]
-    task_ids = []
-    for index, record in enumerate(tasks):
-        expected_name = f"mft-pilot-{tag}-{index:02d}"
-        if (not isinstance(record, dict) or record.get("index") != index
-                or record.get("name") != expected_name):
-            raise RuntimeError(f"p08 manifest task {index} has an invalid identity")
-        if record.get("params_sha256") != candidate_digest(candidates[index]):
-            raise RuntimeError(f"p08 manifest task {index} has an invalid parameter digest")
-        task_id = record.get("task_id")
-        if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
-            raise RuntimeError(f"p08 manifest task {index} has no valid task ID")
-        task_ids.append(task_id)
-    if len(set(task_ids)) != len(task_ids):
-        raise RuntimeError("p08 manifest contains duplicate task IDs")
+    loaded = load_pilot_stage_manifest(
+        solver_revision, library_revision, "p08", seed, manifest_dir=manifest_dir,
+        required_by="feeder",
+    )
+    path = loaded["path"]
+    tag = loaded["tag"]
+    task_ids = loaded["task_ids"]
+    candidates = loaded["candidates"]
     for index, task_id in enumerate(task_ids):
         status = scheduler_client.get_status(task_id)
         if status != "completed":
@@ -447,6 +499,104 @@ def _atomic_manifest(payload, path):
             os.remove(staged)
 
 
+def submit_pilot_stage(
+        solver_revision, library_revision, stage, seed=260710,
+        execute=False, offset=None, manifest_dir=None):
+    """Plan or submit one contract-defined pilot stage.
+
+    All mutation remains behind ``execute=True``.  The function is intentionally
+    reusable by the rapid controller so it cannot drift from the standalone
+    pilot CLI's revision, capacity, candidate, and predecessor gates.
+    """
+    contract = PILOT_STAGE_CONTRACT.get(stage)
+    if contract is None:
+        raise ValueError(f"unknown pilot stage: {stage}")
+    tasks = contract["tasks"]
+    offset = resolve_stage_contract(stage, tasks, offset)
+    solver_revision = str(solver_revision or "").strip().lower()
+    library_revision = str(library_revision or "").strip().lower()
+    if solver_revision != al_driver._current_solver_revision():
+        raise RuntimeError("solver revision is not the current vetted local solver")
+    if library_revision != al_driver._current_library_revision():
+        raise RuntimeError("library revision is not the current clean local library")
+
+    predecessor = None
+    if execute and stage == "p02":
+        if manifest_dir is None:
+            predecessor = validate_local_gate(solver_revision, library_revision)
+        else:
+            predecessor = validate_local_gate(
+                solver_revision, library_revision, manifest_dir=manifest_dir)
+    elif execute and stage == "p08":
+        if manifest_dir is None:
+            predecessor = validate_p02_predecessor(
+                solver_revision, library_revision, seed)
+        else:
+            predecessor = validate_p02_predecessor(
+                solver_revision, library_revision, seed,
+                manifest_dir=manifest_dir)
+
+    profile_path = REGRESSION_ROOT / "verify" / "profiles" / "standard.json"
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    candidates = deterministic_candidates(tasks, offset=offset, seed=seed)
+    snapshot = capacity_snapshot()
+    if snapshot["headroom"] < tasks:
+        raise RuntimeError(
+            f"pilot needs {tasks} slots but conservative headroom is "
+            f"{snapshot['headroom']}: {snapshot}"
+        )
+
+    tag = pilot_tag(
+        solver_revision, library_revision, stage, seed, offset)
+    manifest = {
+        "tag": tag,
+        "stage": stage,
+        "solver_revision": solver_revision,
+        "library_revision": library_revision,
+        "seed": seed,
+        "offset": offset,
+        "task_count": tasks,
+        "profile": profile,
+        "capacity": snapshot,
+        "executed": bool(execute),
+        "predecessor": predecessor,
+        "tasks": [],
+    }
+    for index, params in enumerate(candidates):
+        digest = candidate_digest(effective_candidate(params))
+        name = f"mft-pilot-{tag}-{index:02d}"
+        record = {
+            "index": index,
+            "name": name,
+            "params_sha256": digest,
+            "task_id": None,
+        }
+        if execute:
+            record["task_id"] = scheduler_client.submit_verification(
+                name=name,
+                workdir=name.replace("-", "_"),
+                params=params,
+                profile=profile,
+                mem_mb=MEMORY_MB,
+                cpus=CPUS,
+                solver_revision=solver_revision,
+                library_revision=library_revision,
+            )
+            if record["task_id"] is None:
+                raise RuntimeError(f"scheduler did not return a task ID for {name}")
+        manifest["tasks"].append(record)
+
+    suffix = ".json" if execute else ".preview.json"
+    root = Path(manifest_dir) if manifest_dir is not None else campaign_manifest_dir()
+    manifest_path = root / f"{tag}{suffix}"
+    _atomic_manifest(manifest, manifest_path)
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "capacity": snapshot,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", type=int, choices=(2, 8), required=True)
@@ -462,68 +612,17 @@ def main():
         offset = resolve_stage_contract(args.stage, args.tasks, args.offset)
     except ValueError as exc:
         parser.error(str(exc))
-    solver_revision = args.solver_revision.strip().lower()
-    library_revision = args.library_revision.strip().lower()
-    if solver_revision != al_driver._current_solver_revision():
-        raise RuntimeError("solver revision is not the current vetted local solver")
-    if library_revision != al_driver._current_library_revision():
-        raise RuntimeError("library revision is not the current clean local library")
-
-    predecessor = None
-    if args.execute and args.stage == "p02":
-        predecessor = validate_local_gate(solver_revision, library_revision)
-    elif args.execute and args.stage == "p08":
-        predecessor = validate_p02_predecessor(
-            solver_revision, library_revision, args.seed)
-
-    profile_path = REGRESSION_ROOT / "verify" / "profiles" / "standard.json"
-    profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    candidates = deterministic_candidates(args.tasks, offset=offset, seed=args.seed)
-    snapshot = capacity_snapshot()
-    if snapshot["headroom"] < args.tasks:
-        raise RuntimeError(
-            f"pilot needs {args.tasks} slots but conservative headroom is "
-            f"{snapshot['headroom']}: {snapshot}"
-        )
-
-    tag = pilot_tag(
-        solver_revision, library_revision, args.stage, args.seed, offset)
-    manifest = {
-        "tag": tag,
-        "stage": args.stage,
-        "solver_revision": solver_revision,
-        "library_revision": library_revision,
-        "seed": args.seed,
-        "offset": offset,
-        "task_count": args.tasks,
-        "profile": profile,
-        "capacity": snapshot,
-        "executed": bool(args.execute),
-        "predecessor": predecessor,
-        "tasks": [],
-    }
-    for index, params in enumerate(candidates):
-        digest = candidate_digest(effective_candidate(params))
-        name = f"mft-pilot-{tag}-{index:02d}"
-        record = {"index": index, "name": name, "params_sha256": digest, "task_id": None}
-        if args.execute:
-            record["task_id"] = scheduler_client.submit_verification(
-                name=name,
-                workdir=name.replace("-", "_"),
-                params=params,
-                profile=profile,
-                mem_mb=MEMORY_MB,
-                cpus=CPUS,
-                solver_revision=solver_revision,
-                library_revision=library_revision,
-            )
-            if record["task_id"] is None:
-                raise RuntimeError(f"scheduler did not return a task ID for {name}")
-        manifest["tasks"].append(record)
-
-    suffix = ".json" if args.execute else ".preview.json"
-    manifest_path = campaign_manifest_dir() / f"{tag}{suffix}"
-    _atomic_manifest(manifest, manifest_path)
+    result = submit_pilot_stage(
+        args.solver_revision,
+        args.library_revision,
+        args.stage,
+        seed=args.seed,
+        execute=args.execute,
+        offset=offset,
+    )
+    manifest = result["manifest"]
+    snapshot = result["capacity"]
+    manifest_path = result["manifest_path"]
     print(json.dumps({
         "manifest": str(manifest_path),
         "capacity": snapshot,
