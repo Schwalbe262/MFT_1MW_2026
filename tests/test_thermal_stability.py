@@ -1,8 +1,11 @@
 import math
+import os
+import tempfile
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pandas as pd
 
@@ -198,6 +201,23 @@ class _DesignWrapper:
 
 
 class ThermalStabilityTest(unittest.TestCase):
+    @staticmethod
+    def _convergence(converged=True):
+        return {
+            "thermal_convergence_available": 1,
+            "thermal_converged": 1 if converged else 0,
+            "thermal_iterations": 151 if converged else 142,
+            "thermal_residual_continuity": 7.9912e-4 if converged else 1.0657e18,
+            "thermal_residual_x_velocity": 3.6686e-4 if converged else 1.1056e-1,
+            "thermal_residual_y_velocity": 9.8308e-4 if converged else 5.6684e-2,
+            "thermal_residual_z_velocity": 3.9535e-4 if converged else 1.4627e-1,
+            "thermal_residual_energy": 4.3936e-9 if converged else 1.2163e-1,
+            "thermal_residual_flow_limit": 1e-3,
+            "thermal_residual_energy_limit": 1e-7,
+            "thermal_convergence_reason": "converged" if converged else "residual_threshold",
+            "thermal_monitor_file": "monitor.sd",
+        }
+
     def _run(
         self,
         analyze_result,
@@ -205,6 +225,7 @@ class ThermalStabilityTest(unittest.TestCase):
         include_side=False,
         setup_result=True,
         setup_update_result=True,
+        convergence=None,
     ):
         ipk = _Icepak(
             analyze_result,
@@ -248,6 +269,11 @@ class ThermalStabilityTest(unittest.TestCase):
             stack.enter_context(patch.object(thermal, "_assign_losses"))
             stack.enter_context(patch.object(thermal, "_assign_boundaries"))
             stack.enter_context(patch.object(thermal, "_assign_thermal_mesh"))
+            stack.enter_context(patch.object(
+                thermal,
+                "_thermal_convergence_telemetry",
+                return_value=convergence or self._convergence(),
+            ))
             stack.enter_context(patch("time.sleep"))
             result = thermal.run_thermal_analysis(sim)
         return ipk, result.iloc[0]
@@ -292,6 +318,26 @@ class ThermalStabilityTest(unittest.TestCase):
                 self.assertEqual(ipk.oproject.active_calls, 2)
                 self.assertIs(ipk._odesign, ipk.oproject.last_design)
                 self.assertIs(ipk.design_solutions._odesign, ipk.oproject.last_design)
+                self.assertTrue(
+                    ipk.setup.props["Solution Initialization - Use Model Based Flow Initialization"]
+                )
+                self.assertEqual(ipk.setup.props["Under-relaxation - Pressure"], "0.3")
+                self.assertTrue(
+                    ipk.setup.props["Sequential Solve of Flow and Energy Equations"]
+                )
+
+    def test_unconverged_residuals_skip_field_summary_and_fail_gate(self):
+        complete = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+        }
+        ipk, row = self._run(None, [complete], convergence=self._convergence(False))
+        self.assertEqual(ipk.field_summary_calls, 0)
+        self.assertEqual(row["thermal_solved"], 0)
+        self.assertEqual(row["thermal_converged"], 0)
+        self.assertEqual(row["thermal_extraction_complete"], 0)
+        self.assertEqual(row["thermal_convergence_reason"], "residual_threshold")
 
     def test_partial_field_summary_preserves_values_but_fails_gate(self):
         partial = {
@@ -516,21 +562,12 @@ class ThermalStabilityTest(unittest.TestCase):
             with self.subTest(keyword=keyword), self.assertRaisesRegex(RuntimeError, expected):
                 thermal._require_thermal_geometry(base, "eighth", 0, **{keyword: True})
 
-    def test_explicit_rx_gets_per_object_cutcell_mesh(self):
-        created = []
-
-        def assign_region(**kwargs):
-            region = SimpleNamespace(
-                settings={}, auto_update=True, update=Mock(return_value=True)
-            )
-            created.append((kwargs, region))
-            return region
-
+    def test_explicit_rx_gets_one_object_mesh_operation(self):
         pad_mesh_operation = SimpleNamespace(name="pad_mesh", update=Mock(return_value=True))
+        rx_mesh_operation = SimpleNamespace(name="rx_mesh", update=Mock(return_value=True))
         mesh = SimpleNamespace(
-            assign_mesh_level=Mock(return_value=["pad_mesh"]),
-            assign_mesh_region=Mock(side_effect=assign_region),
-            meshoperations=[pad_mesh_operation],
+            assign_mesh_level=Mock(side_effect=[["pad_mesh"], ["rx_mesh"]]),
+            meshoperations=[pad_mesh_operation, rx_mesh_operation],
         )
         rx0 = _Object("Rx_main_0")
         rx1 = _Object("Rx_side_0")
@@ -544,18 +581,12 @@ class ThermalStabilityTest(unittest.TestCase):
         }
         thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), objs)
 
-        mesh.assign_mesh_level.assert_called_once_with(
-            {"wcp_pad": 2, "core_pad": 2}, name="pad_mesh_level"
-        )
+        self.assertEqual(mesh.assign_mesh_level.call_args_list, [
+            call({"wcp_pad": 2, "core_pad": 2}, name="pad_mesh_level"),
+            call({"Rx_main_0": 3, "Rx_side_0": 3}, name="rx_mesh_level"),
+        ])
         pad_mesh_operation.update.assert_called_once_with()
-        self.assertEqual(len(created), 2)
-        self.assertEqual([call[0]["assignment"] for call in created], [["Rx_main_0"], ["Rx_side_0"]])
-        for kwargs, region in created:
-            self.assertEqual(kwargs["level"], 5)
-            self.assertEqual(region.settings["MeshRegionResolution"], 5)
-            self.assertTrue(region.settings["EnforceCutCellMeshing"])
-            self.assertFalse(region.auto_update)
-            region.update.assert_called_once_with()
+        rx_mesh_operation.update.assert_called_once_with()
 
     def test_thermal_mesh_failures_are_not_silenced(self):
         empty = {
@@ -567,27 +598,105 @@ class ThermalStabilityTest(unittest.TestCase):
         }
         mesh = SimpleNamespace(
             assign_mesh_level=Mock(return_value=[]),
-            assign_mesh_region=Mock(return_value=False),
             meshoperations=[],
         )
-        with self.assertRaisesRegex(RuntimeError, "creation failed"):
+        with self.assertRaisesRegex(RuntimeError, "rx_mesh_level assignment"):
             thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), empty)
 
-        region = SimpleNamespace(settings={}, auto_update=True, update=Mock(return_value=False))
-        mesh.assign_mesh_region.return_value = region
-        with self.assertRaisesRegex(RuntimeError, "update failed"):
+        failed_rx_op = SimpleNamespace(name="rx_mesh", update=Mock(return_value=False))
+        mesh.assign_mesh_level.return_value = ["rx_mesh"]
+        mesh.meshoperations = [failed_rx_op]
+        with self.assertRaisesRegex(RuntimeError, "rx_mesh_level mesh operation update failed"):
             thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), empty)
 
         pad_only = dict(empty, Rx_main_explicit=[], wcp_pads=[_Object("pad")])
         mesh.assign_mesh_level.return_value = []
-        with self.assertRaisesRegex(RuntimeError, "pad mesh level"):
+        with self.assertRaisesRegex(RuntimeError, "pad_mesh_level assignment"):
             thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), pad_only)
 
         failed_pad_op = SimpleNamespace(name="pad_mesh", update=Mock(return_value=False))
         mesh.assign_mesh_level.return_value = ["pad_mesh"]
         mesh.meshoperations = [failed_pad_op]
-        with self.assertRaisesRegex(RuntimeError, "pad mesh operation update failed"):
+        with self.assertRaisesRegex(RuntimeError, "pad_mesh_level mesh operation update failed"):
             thermal._assign_thermal_mesh(SimpleNamespace(mesh=mesh), pad_only)
+
+    def test_native_residual_parser_accepts_428_and_rejects_429(self):
+        stable = (
+            "1.5100000000000000e+02 Continuity(7.9911999999999995e-04)"
+            "XVelocity(3.6685999999999999e-04)YVelocity(9.8308000000000011e-04)"
+            "ZVelocity(3.9534999999999999e-04)Energy(4.3936000000000002e-09)\n"
+        )
+        divergent = (
+            "1.4200000000000000e+02 Continuity(1.0657000000000000e+18)"
+            "XVelocity(1.1056000000000001e-01)YVelocity(5.6683999999999998e-02)"
+            "ZVelocity(1.4627000000000001e-01)Energy(1.2163000000000000e-01)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            stable_path = Path(tmp, "stable.sd")
+            failed_path = Path(tmp, "failed.sd")
+            stable_path.write_text(stable, encoding="utf-8")
+            failed_path.write_text(divergent, encoding="utf-8")
+            self.assertTrue(thermal._parse_thermal_residual_monitor(stable_path)["converged"])
+            parsed = thermal._parse_thermal_residual_monitor(failed_path)
+            self.assertFalse(parsed["converged"])
+            self.assertEqual(parsed["iteration"], 142)
+            self.assertEqual(parsed["values"]["Continuity"], 1.0657e18)
+
+    def test_convergence_reader_uses_latest_history_and_ignores_solution_monitor(self):
+        stable = (
+            "151 Continuity(7e-4)XVelocity(3e-4)YVelocity(9e-4)"
+            "ZVelocity(3e-4)Energy(4e-9)\n"
+        )
+        failed = (
+            "142 Continuity(1e18)XVelocity(1e-1)YVelocity(1e-1)"
+            "ZVelocity(1e-1)Energy(1e-1)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            design = root / "icepak_thermal.results"
+            design.mkdir()
+            old = design / "DV1_S1_MON0_V0.sd"
+            newest = design / "DV1_S2_MON0_V0.sd"
+            ignored = design / "DV1_SOL3_MON0_V0.sd"
+            old.write_text(stable, encoding="utf-8")
+            newest.write_text(failed, encoding="utf-8")
+            ignored.write_text(stable, encoding="utf-8")
+            os.utime(old, (1, 1))
+            os.utime(newest, (2, 2))
+            os.utime(ignored, (3, 3))
+            ipk = SimpleNamespace(
+                design_name="icepak_thermal",
+                results_directory=str(root),
+            )
+            setup = SimpleNamespace(props={
+                "Convergence Criteria - Flow": "0.001",
+                "Convergence Criteria - Energy": "1e-07",
+            })
+            result = thermal._thermal_convergence_telemetry(
+                SimpleNamespace(project_path=None), ipk, setup, attempts=1
+            )
+            self.assertEqual(result["thermal_convergence_available"], 1)
+            self.assertEqual(result["thermal_converged"], 0)
+            self.assertEqual(result["thermal_monitor_file"], newest.name)
+
+    def test_missing_or_malformed_residual_monitor_fails_closed(self):
+        setup = SimpleNamespace(props={})
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            design = root / "icepak_thermal.results"
+            design.mkdir()
+            ipk = SimpleNamespace(design_name="icepak_thermal", results_directory=str(root))
+            missing = thermal._thermal_convergence_telemetry(
+                SimpleNamespace(project_path=None), ipk, setup, attempts=1
+            )
+            self.assertEqual(missing["thermal_converged"], 0)
+            self.assertEqual(missing["thermal_convergence_reason"], "monitor_missing")
+            (design / "DV1_S1_MON0_V0.sd").write_text("not residual data", encoding="utf-8")
+            malformed = thermal._thermal_convergence_telemetry(
+                SimpleNamespace(project_path=None), ipk, setup, attempts=1
+            )
+            self.assertEqual(malformed["thermal_converged"], 0)
+            self.assertEqual(malformed["thermal_convergence_reason"], "monitor_malformed")
 
     def test_split_requires_truthy_result_and_live_retained_object(self):
         obj = _Object("core_1")

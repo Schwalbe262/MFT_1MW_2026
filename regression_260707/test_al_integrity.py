@@ -29,7 +29,17 @@ def valid_result(**updates):
         "result_valid_em": 1,
         "result_valid_thermal": 1,
         "thermal_solved": 1,
+        "thermal_convergence_available": 1,
+        "thermal_converged": 1,
         "thermal_extraction_complete": 1,
+        "thermal_iterations": 151,
+        "thermal_residual_flow_limit": 1e-3,
+        "thermal_residual_energy_limit": 1e-7,
+        "thermal_residual_continuity": 8e-4,
+        "thermal_residual_x_velocity": 4e-4,
+        "thermal_residual_y_velocity": 9e-4,
+        "thermal_residual_z_velocity": 4e-4,
+        "thermal_residual_energy": 4e-9,
         "thermal_required_missing_count": 0,
         "thermal_required_group_mask": 15,
         "git_hash": TEST_REVISION,
@@ -396,6 +406,9 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertFalse(scheduler_client.is_valid_result(valid_result(Llt=float("nan"))))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(T_max_core=float("nan"))))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_solved=0)))
+        self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_converged=0)))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(thermal_residual_continuity=2e-3)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(full_model=2)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(full_model=1)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(loss_sym_on=0)))

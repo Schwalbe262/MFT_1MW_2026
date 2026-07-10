@@ -245,6 +245,8 @@ def is_valid_result(
         return False
     if result.get("thermal_solved") != 1 or result.get("thermal_extraction_complete") != 1:
         return False
+    if result.get("thermal_convergence_available") != 1 or result.get("thermal_converged") != 1:
+        return False
     if result.get("thermal_required_missing_count") != 0:
         return False
     profile_contract = dict(
@@ -255,6 +257,10 @@ def is_valid_result(
         "matrix_solve_attempts", "loss_solve_attempts",
         "conv_error_pct_matrix", "conv_error_pct_loss",
         "P_winding_total", "P_core_total", "P_core_plate_total",
+        "thermal_residual_flow_limit", "thermal_residual_energy_limit",
+        "thermal_residual_continuity", "thermal_residual_x_velocity",
+        "thermal_residual_y_velocity", "thermal_residual_z_velocity",
+        "thermal_residual_energy", "thermal_iterations",
     ) + tuple(
         key for key, value in profile_contract.items()
         if not isinstance(value, str)
@@ -290,6 +296,16 @@ def is_valid_result(
         return False
     if not all(float(result[key]) >= 0 for key in (
             "P_winding_total", "P_core_total", "P_core_plate_total")):
+        return False
+    flow_limit = float(result["thermal_residual_flow_limit"])
+    energy_limit = float(result["thermal_residual_energy_limit"])
+    if flow_limit <= 0 or energy_limit <= 0 or float(result["thermal_iterations"]) <= 0:
+        return False
+    if not all(0 <= float(result[key]) <= flow_limit for key in (
+            "thermal_residual_continuity", "thermal_residual_x_velocity",
+            "thermal_residual_y_velocity", "thermal_residual_z_velocity")):
+        return False
+    if not 0 <= float(result["thermal_residual_energy"]) <= energy_limit:
         return False
     git_hash = str(result.get("git_hash") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", git_hash):

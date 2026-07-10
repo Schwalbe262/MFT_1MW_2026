@@ -281,7 +281,33 @@ def _thermal_result_is_valid(frame):
     try:
         if int(frame["thermal_solved"].iloc[0]) != 1:
             return False
+        if int(frame["thermal_convergence_available"].iloc[0]) != 1:
+            return False
+        if int(frame["thermal_converged"].iloc[0]) != 1:
+            return False
         if int(frame["thermal_extraction_complete"].iloc[0]) != 1:
+            return False
+        flow_limit = float(frame["thermal_residual_flow_limit"].iloc[0])
+        energy_limit = float(frame["thermal_residual_energy_limit"].iloc[0])
+        flow_residuals = [
+            float(frame[column].iloc[0])
+            for column in (
+                "thermal_residual_continuity",
+                "thermal_residual_x_velocity",
+                "thermal_residual_y_velocity",
+                "thermal_residual_z_velocity",
+            )
+        ]
+        energy_residual = float(frame["thermal_residual_energy"].iloc[0])
+        if not (
+            math.isfinite(flow_limit)
+            and flow_limit > 0
+            and math.isfinite(energy_limit)
+            and energy_limit > 0
+            and all(math.isfinite(value) and 0 <= value <= flow_limit for value in flow_residuals)
+            and math.isfinite(energy_residual)
+            and 0 <= energy_residual <= energy_limit
+        ):
             return False
         group_bits = {
             "T_max_Tx": 1,
@@ -303,6 +329,8 @@ def _thermal_failure_frame(error):
     message = str(error).strip() or repr(error)
     return pd.DataFrame({
         "thermal_solved": [0],
+        "thermal_convergence_available": [0],
+        "thermal_converged": [0],
         "thermal_extraction_complete": [0],
         "thermal_required_missing_count": [4],
         "thermal_required_group_mask": [15],

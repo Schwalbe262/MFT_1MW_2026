@@ -13,6 +13,8 @@ Icepak 열해석 모듈 (설계도면260706 파이프라인 design3)
 
 import math
 import logging
+import re
+from pathlib import Path
 
 import pandas as pd
 
@@ -111,46 +113,167 @@ def _require_thermal_geometry(
 
 def _assign_thermal_mesh(ipk, objs):
     """Apply mandatory mesh controls for thin pads and explicit Rx foil turns."""
-    pad_names = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
-    if pad_names:
-        pad_op_names = ipk.mesh.assign_mesh_level(
-            {name: 2 for name in pad_names}, name="pad_mesh_level"
-        )
-        if not isinstance(pad_op_names, (list, tuple)) or not pad_op_names:
-            raise RuntimeError("pad mesh level assignment returned no mesh operation")
+    def _assign_levels(levels, name):
+        if not levels:
+            return
+        operation_names = ipk.mesh.assign_mesh_level(levels, name=name)
+        if not isinstance(operation_names, (list, tuple)) or not operation_names:
+            raise RuntimeError(f"{name} assignment returned no mesh operation")
         operations = {
             str(getattr(operation, "name", "")): operation
             for operation in getattr(ipk.mesh, "meshoperations", [])
         }
-        for item in pad_op_names:
+        for item in operation_names:
             operation = item if callable(getattr(item, "update", None)) else operations.get(str(item))
             update = getattr(operation, "update", None)
             if not callable(update) or not update():
-                raise RuntimeError(f"pad mesh operation update failed: {item}")
+                raise RuntimeError(f"{name} mesh operation update failed: {item}")
+
+    pad_names = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
+    _assign_levels({name: 2 for name in pad_names}, "pad_mesh_level")
 
     explicit_rx = []
     for key in ("Rx_main_explicit", "Rx_side_explicit", "Rx_side2_explicit"):
         explicit_rx.extend(objs.get(key, []))
 
-    seen = set()
-    for index, obj in enumerate(explicit_rx, start=1):
-        if obj.name in seen:
+    # Per-object cut-cell subregions created million-cell meshes with skew above
+    # 0.96 on thin foils. One object-level control keeps the foil represented
+    # without introducing subregion interfaces around every retained turn.
+    rx_names = list(dict.fromkeys(obj.name for obj in explicit_rx))
+    _assign_levels({name: 3 for name in rx_names}, "rx_mesh_level")
+
+
+_THERMAL_RESIDUAL_FIELDS = (
+    "Continuity",
+    "XVelocity",
+    "YVelocity",
+    "ZVelocity",
+    "Energy",
+)
+_THERMAL_RESIDUAL_ROW = re.compile(
+    r"^\s*(?P<iteration>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+)
+_THERMAL_RESIDUAL_VALUE = re.compile(
+    r"(?P<name>Continuity|XVelocity|YVelocity|ZVelocity|Energy)"
+    r"\((?P<value>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\)"
+)
+
+
+def _parse_thermal_residual_monitor(path, flow_limit=1e-3, energy_limit=1e-7):
+    """Parse the final complete Icepak residual row and apply its solve criteria."""
+    rows = []
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        match = _THERMAL_RESIDUAL_ROW.match(line)
+        if not match:
             continue
-        seen.add(obj.name)
-        region = ipk.mesh.assign_mesh_region(
-            assignment=[obj.name], level=5, name=f"rx_cutcell_{index:02d}"
-        )
-        if not region:
-            raise RuntimeError(f"Rx cut-cell mesh region creation failed for {obj.name}")
-        settings = getattr(region, "settings", None)
-        if not hasattr(settings, "__setitem__"):
-            raise RuntimeError(f"Rx cut-cell mesh region has no writable settings for {obj.name}")
-        region.auto_update = False
-        settings["MeshRegionResolution"] = 5
-        settings["EnforceCutCellMeshing"] = True
-        update = getattr(region, "update", None)
-        if not callable(update) or not update():
-            raise RuntimeError(f"Rx cut-cell mesh region update failed for {obj.name}")
+        iteration_value = float(match.group("iteration"))
+        if not math.isfinite(iteration_value) or iteration_value < 0:
+            continue
+        values = {
+            item.group("name"): float(item.group("value"))
+            for item in _THERMAL_RESIDUAL_VALUE.finditer(line)
+        }
+        if set(values) != set(_THERMAL_RESIDUAL_FIELDS):
+            continue
+        if not all(math.isfinite(value) and value >= 0 for value in values.values()):
+            continue
+        rows.append((int(iteration_value), values))
+    if not rows:
+        raise ValueError(f"no complete finite residual rows in {path}")
+
+    iteration, values = rows[-1]
+    flow_max = max(values[name] for name in _THERMAL_RESIDUAL_FIELDS[:-1])
+    converged = flow_max <= float(flow_limit) and values["Energy"] <= float(energy_limit)
+    return {
+        "iteration": iteration,
+        "values": values,
+        "flow_limit": float(flow_limit),
+        "energy_limit": float(energy_limit),
+        "converged": converged,
+    }
+
+
+def _thermal_convergence_telemetry(sim, ipk, setup, attempts=3, retry_seconds=2):
+    """Read the newest native Icepak residual monitor; missing evidence fails closed."""
+    defaults = {
+        "thermal_convergence_available": 0,
+        "thermal_converged": 0,
+        "thermal_iterations": 0,
+        "thermal_residual_continuity": float("nan"),
+        "thermal_residual_x_velocity": float("nan"),
+        "thermal_residual_y_velocity": float("nan"),
+        "thermal_residual_z_velocity": float("nan"),
+        "thermal_residual_energy": float("nan"),
+        "thermal_residual_flow_limit": float("nan"),
+        "thermal_residual_energy_limit": float("nan"),
+        "thermal_convergence_reason": "monitor_missing",
+        "thermal_monitor_file": "",
+    }
+    try:
+        flow_limit = float(setup.props.get("Convergence Criteria - Flow", 1e-3))
+        energy_limit = float(setup.props.get("Convergence Criteria - Energy", 1e-7))
+    except (TypeError, ValueError, OverflowError):
+        return {**defaults, "thermal_convergence_reason": "invalid_setup_criteria"}
+    if not (math.isfinite(flow_limit) and flow_limit > 0
+            and math.isfinite(energy_limit) and energy_limit > 0):
+        return {**defaults, "thermal_convergence_reason": "invalid_setup_criteria"}
+
+    native_ipk = _native_solver(ipk)
+    roots = []
+    results_directory = getattr(native_ipk, "results_directory", None)
+    if results_directory:
+        roots.append(Path(str(results_directory)))
+    project_path = getattr(sim, "project_path", None)
+    if project_path:
+        roots.append(Path(project_path) / f"{sim.PROJECT_NAME}.aedtresults")
+
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        candidates = []
+        for root in roots:
+            design_results = root / f"{ipk.design_name}.results"
+            search_root = design_results if design_results.is_dir() else root
+            if search_root.is_dir():
+                candidates.extend(
+                    path for path in search_root.glob("*_S*_MON*_V*.sd")
+                    if "_SOL" not in path.name
+                )
+        if candidates:
+            monitor = max(
+                set(candidates),
+                key=lambda path: (path.stat().st_mtime_ns, path.name),
+            )
+            try:
+                parsed = _parse_thermal_residual_monitor(
+                    monitor, flow_limit=flow_limit, energy_limit=energy_limit
+                )
+                values = parsed["values"]
+                return {
+                    "thermal_convergence_available": 1,
+                    "thermal_converged": 1 if parsed["converged"] else 0,
+                    "thermal_iterations": parsed["iteration"],
+                    "thermal_residual_continuity": values["Continuity"],
+                    "thermal_residual_x_velocity": values["XVelocity"],
+                    "thermal_residual_y_velocity": values["YVelocity"],
+                    "thermal_residual_z_velocity": values["ZVelocity"],
+                    "thermal_residual_energy": values["Energy"],
+                    "thermal_residual_flow_limit": parsed["flow_limit"],
+                    "thermal_residual_energy_limit": parsed["energy_limit"],
+                    "thermal_convergence_reason": (
+                        "converged" if parsed["converged"] else "residual_threshold"
+                    ),
+                    "thermal_monitor_file": monitor.name,
+                }
+            except (OSError, ValueError) as exc:
+                last_error = exc
+        if attempt < attempts:
+            import time
+            time.sleep(retry_seconds)
+
+    if last_error is not None:
+        logging.error("[thermal] residual monitor validation failed: %s", last_error)
+        return {**defaults, "thermal_convergence_reason": "monitor_malformed"}
+    return defaults
 
 
 def _split_retained(ipk, objects, plane, sides):
@@ -812,6 +935,9 @@ def run_thermal_analysis(sim):
     try:
         setup.props["Flow Regime"] = "Turbulent"
         setup.props["Convergence Criteria - Max Iterations"] = int(df["thermal_max_iterations"].iloc[0])
+        setup.props["Solution Initialization - Use Model Based Flow Initialization"] = True
+        setup.props["Under-relaxation - Pressure"] = "0.3"
+        setup.props["Sequential Solve of Flow and Energy Equations"] = True
         if eighth:
             # 1/8 대칭의 z대칭은 부력 무시 가정에 기반 -> 중력 비활성
             setup.props["Include Gravity"] = False
@@ -849,9 +975,88 @@ def run_thermal_analysis(sim):
     except Exception:
         pass
 
+    convergence = _thermal_convergence_telemetry(sim, ipk, setup)
+    logging.warning(
+        "[thermal] convergence: available=%s converged=%s iteration=%s "
+        "continuity=%s energy=%s reason=%s",
+        convergence["thermal_convergence_available"],
+        convergence["thermal_converged"],
+        convergence["thermal_iterations"],
+        convergence["thermal_residual_continuity"],
+        convergence["thermal_residual_energy"],
+        convergence["thermal_convergence_reason"],
+    )
+
     # ---- 온도 추출 (필드 계산기 직접 평가 - 리포트 기계 미사용) ----
     # 프로브 시트 (회귀학습용 주력 데이터: 위치 고정, 보간값이라 메시 스파이크에 강함)
     # + 그룹별 체적 평균/최대
+    temps = {}
+    probe = []
+    for s in probe_sheets:
+        probe.append((s, f"{s.name}_max", "max"))
+        probe.append((s, f"{s.name}_mean", "mean"))
+    vol_objs = (objs["Tx"] + objs["Rx_main_explicit"] + objs["Rx_main_blocks"]
+                + objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
+                + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"] + objs["core"])
+    for o in vol_objs:
+        probe.append((o, f"T_mean_{o.name}", "mean"))
+        probe.append((o, f"T_max_{o.name}", "max"))
+
+    expected_cols = list(dict.fromkeys(col for _, col, _ in probe))
+    group_objects = {
+        "T_max_Tx": list(objs["Tx"]),
+        "T_max_Rx_main": list(objs["Rx_main_explicit"] + objs["Rx_main_blocks"]),
+        "T_max_Rx_side": list(
+            objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
+            + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"]
+        ),
+        "T_max_core": list(objs["core"]),
+    }
+    group_bits = {
+        "T_max_Tx": 1,
+        "T_max_Rx_main": 2,
+        "T_max_Rx_side": 4,
+        "T_max_core": 8,
+    }
+    required_keys = ["T_max_Tx", "T_max_Rx_main", "T_max_core"]
+    if int(df["N2_side"].iloc[0]) > 0:
+        required_keys.append("T_max_Rx_side")
+    required_group_mask = sum(group_bits[key] for key in required_keys)
+    required_group_count = len(required_keys)
+
+    if not analyze_call_ok or convergence["thermal_converged"] != 1:
+        summary = {
+            "thermal_solved": [0],
+            "thermal_extraction_complete": [0],
+            "thermal_missing_count": [len(expected_cols)],
+            "thermal_required_missing_count": [required_group_count],
+            "thermal_required_group_mask": [required_group_mask],
+            "thermal_required_group_count": [required_group_count],
+            "thermal_solve_attempts": [solve_attempts],
+            "thermal_analyze_call_ok": [1 if analyze_call_ok else 0],
+            "thermal_analyze_return_false": [1 if analyze_return_false else 0],
+            "thermal_solution_data_available": [0],
+            "thermal_field_summary_attempts": [0],
+            "thermal_field_summary_value_count": [0],
+            "thermal_calculator_attempts": [0],
+            "T_max_Tx": [float("nan")],
+            "T_max_Rx_main": [float("nan")],
+            "T_max_Rx_side": [float("nan")],
+            "T_max_core": [float("nan")],
+        }
+        summary.update({key: [value] for key, value in convergence.items()})
+        for col in expected_cols:
+            summary[col] = [float("nan")]
+        logging.error(
+            "[thermal] solve rejected before extraction: analyze-call-ok=%s, "
+            "converged=%s, reason=%s",
+            analyze_call_ok,
+            convergence["thermal_converged"],
+            convergence["thermal_convergence_reason"],
+        )
+        sim.df_thermal = pd.DataFrame(summary)
+        return sim.df_thermal
+
     native_ipk = _native_solver(ipk)
     try:
         _activate_thermal_design(ipk)
@@ -865,18 +1070,6 @@ def run_thermal_analysis(sim):
         if callable(po) and not hasattr(po, "create_field_summary"):
             po = po()
         return po
-
-    temps = {}
-    probe = []
-    for s in probe_sheets:
-        probe.append((s, f"{s.name}_max", "max"))
-        probe.append((s, f"{s.name}_mean", "mean"))
-    vol_objs = (objs["Tx"] + objs["Rx_main_explicit"] + objs["Rx_main_blocks"]
-                + objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
-                + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"] + objs["core"])
-    for o in vol_objs:
-        probe.append((o, f"T_mean_{o.name}", "mean"))
-        probe.append((o, f"T_max_{o.name}", "max"))
 
     # ---- 1차: Field Summary 일괄 (호출 1회, GUI/리눅스 공통 신뢰 경로) ----
     # Calculator/ClcEval calls are intentionally excluded: they do not recover
@@ -914,7 +1107,6 @@ def run_thermal_analysis(sim):
                 pass
         return got
 
-    expected_cols = list(dict.fromkeys(col for _, col, _ in probe))
     field_summary_attempts = 0
     for attempt in range(1, 4):
         missing_entries = [entry for entry in probe if entry[1] not in temps]
@@ -947,36 +1139,21 @@ def run_thermal_analysis(sim):
         vals = [temps[col] for col in cols if col in temps and math.isfinite(float(temps[col]))]
         return max(vals) if cols and len(vals) == len(cols) else float("nan")
 
-    group_objects = {
-        "T_max_Tx": list(objs["Tx"]),
-        "T_max_Rx_main": list(objs["Rx_main_explicit"] + objs["Rx_main_blocks"]),
-        "T_max_Rx_side": list(
-            objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
-            + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"]
-        ),
-        "T_max_core": list(objs["core"]),
-    }
     group_values = {
         key: _group_max(objects) for key, objects in group_objects.items()
     }
-    group_bits = {
-        "T_max_Tx": 1,
-        "T_max_Rx_main": 2,
-        "T_max_Rx_side": 4,
-        "T_max_core": 8,
-    }
-    required_keys = ["T_max_Tx", "T_max_Rx_main", "T_max_core"]
-    if int(df["N2_side"].iloc[0]) > 0:
-        required_keys.append("T_max_Rx_side")
-    required_group_mask = sum(group_bits[key] for key in required_keys)
-    required_group_count = len(required_keys)
     required_missing_count = sum(
         1 for key in required_keys
         if not group_objects[key] or not math.isfinite(float(group_values[key]))
     )
     required_complete = required_missing_count == 0 and required_group_count > 0
     solution_data_available = n_fs > 0
-    solved = analyze_call_ok and solution_data_available and required_complete
+    solved = (
+        analyze_call_ok
+        and convergence["thermal_converged"] == 1
+        and solution_data_available
+        and required_complete
+    )
 
     summary = {
         "thermal_solved": [1 if solved else 0],
@@ -999,6 +1176,7 @@ def run_thermal_analysis(sim):
         "T_max_Rx_side": [group_values["T_max_Rx_side"]],
         "T_max_core": [group_values["T_max_core"]],
     }
+    summary.update({key: [value] for key, value in convergence.items()})
     if not solved:
         logging.error(
             "[thermal] validation failed: field-summary-data=%s, required-missing=%d, "

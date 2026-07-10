@@ -470,7 +470,16 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
     def test_only_complete_finite_thermal_rows_advance_thermal_count(self):
         valid = pd.DataFrame({
             "thermal_solved": [1],
+            "thermal_convergence_available": [1],
+            "thermal_converged": [1],
             "thermal_extraction_complete": [1],
+            "thermal_residual_flow_limit": [1e-3],
+            "thermal_residual_energy_limit": [1e-7],
+            "thermal_residual_continuity": [8e-4],
+            "thermal_residual_x_velocity": [4e-4],
+            "thermal_residual_y_velocity": [9e-4],
+            "thermal_residual_z_velocity": [4e-4],
+            "thermal_residual_energy": [4e-9],
             "thermal_required_group_mask": [15],
             "T_max_Tx": [80.0],
             "T_max_Rx_main": [81.0],
@@ -485,6 +494,11 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
         side_optional.loc[0, "thermal_required_group_mask"] = 11
         side_optional.loc[0, "T_max_Rx_side"] = float("nan")
         self.assertTrue(_thermal_result_is_valid(side_optional))
+        no_convergence = valid.drop(columns=["thermal_converged"])
+        self.assertFalse(_thermal_result_is_valid(no_convergence))
+        divergent = valid.copy()
+        divergent.loc[0, "thermal_residual_continuity"] = 2e-3
+        self.assertFalse(_thermal_result_is_valid(divergent))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"thermal_solved": [0]})))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"other": [1]})))
         self.assertFalse(_thermal_result_is_valid(None))

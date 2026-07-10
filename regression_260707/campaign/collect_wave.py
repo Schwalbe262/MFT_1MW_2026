@@ -370,7 +370,7 @@ def convergence_filter(df, max_err=1.5):
 
 
 def normalize_thermal_validity(df):
-    """Demote legacy thermal success flags when required physical groups are incomplete."""
+    """Demote thermal success flags without complete physical and convergence evidence."""
     if "thermal_solved" not in df.columns:
         return df, 0
     solved = pd.to_numeric(df["thermal_solved"], errors="coerce").eq(1)
@@ -408,6 +408,44 @@ def normalize_thermal_validity(df):
             values = pd.to_numeric(df[column], errors="coerce")
             has_contract = values.notna()
             complete &= ~has_contract | predicate(values)
+
+    # New solver rows must carry native residual proof. Legacy rows without the
+    # field remain EM-only rather than being silently trusted as thermal data.
+    for column in ("thermal_convergence_available", "thermal_converged"):
+        if column not in df.columns:
+            complete &= False
+        else:
+            complete &= pd.to_numeric(df[column], errors="coerce").eq(1)
+    residual_columns = (
+        "thermal_residual_continuity",
+        "thermal_residual_x_velocity",
+        "thermal_residual_y_velocity",
+        "thermal_residual_z_velocity",
+    )
+    if "thermal_residual_flow_limit" not in df.columns:
+        complete &= False
+    else:
+        flow_limit = pd.to_numeric(df["thermal_residual_flow_limit"], errors="coerce")
+        complete &= flow_limit.map(math.isfinite) & flow_limit.gt(0)
+        for column in residual_columns:
+            if column not in df.columns:
+                complete &= False
+            else:
+                residual = pd.to_numeric(df[column], errors="coerce")
+                complete &= residual.map(math.isfinite) & residual.ge(0) & residual.le(flow_limit)
+    if "thermal_residual_energy_limit" not in df.columns or "thermal_residual_energy" not in df.columns:
+        complete &= False
+    else:
+        energy_limit = pd.to_numeric(df["thermal_residual_energy_limit"], errors="coerce")
+        energy = pd.to_numeric(df["thermal_residual_energy"], errors="coerce")
+        complete &= (
+            energy_limit.map(math.isfinite) & energy_limit.gt(0)
+            & energy.map(math.isfinite) & energy.ge(0) & energy.le(energy_limit)
+        )
+    if "thermal_iterations" not in df.columns:
+        complete &= False
+    else:
+        complete &= pd.to_numeric(df["thermal_iterations"], errors="coerce").gt(0)
 
     invalid = solved & ~complete
     count = int(invalid.sum())
