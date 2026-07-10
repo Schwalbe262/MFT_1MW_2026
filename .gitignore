@@ -40,6 +40,7 @@ regression_260707/al_rounds/
 regression_260707/training/registry/
 regression_260707/campaign/feeder_state.json
 regression_260707/campaign/pilot_manifests/
+regression_260707/campaign/provisional_manifests/
 
 # ==== 레거시 사본 (로컬 보관) ====
 module_old/
