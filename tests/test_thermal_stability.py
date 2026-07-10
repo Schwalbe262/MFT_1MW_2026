@@ -636,7 +636,7 @@ class ThermalStabilityTest(unittest.TestCase):
 
         self.assertEqual(mesh.assign_mesh_level.call_args_list, [
             call({"wcp_pad": 2, "core_pad": 2}, name="pad_mesh_level"),
-            call({"Rx_main_block": 2}, name="rx_block_mesh_level"),
+            call({"Rx_main_block": 3}, name="rx_block_mesh_level"),
             call({"Rx_main_0": 3, "Rx_side_0": 3}, name="rx_mesh_level"),
         ])
         pad_mesh_operation.update.assert_called_once_with()
