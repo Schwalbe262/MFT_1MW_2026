@@ -299,7 +299,9 @@ def is_valid_result(
         return False
     flow_limit = float(result["thermal_residual_flow_limit"])
     energy_limit = float(result["thermal_residual_energy_limit"])
-    if flow_limit <= 0 or energy_limit <= 0 or float(result["thermal_iterations"]) <= 0:
+    if (not 0 < flow_limit <= 1e-3
+            or not 0 < energy_limit <= 1e-7
+            or float(result["thermal_iterations"]) <= 0):
         return False
     if not all(0 <= float(result[key]) <= flow_limit for key in (
             "thermal_residual_continuity", "thermal_residual_x_velocity",

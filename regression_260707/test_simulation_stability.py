@@ -472,6 +472,7 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
             "thermal_solved": [1],
             "thermal_convergence_available": [1],
             "thermal_converged": [1],
+            "thermal_iterations": [151],
             "thermal_extraction_complete": [1],
             "thermal_residual_flow_limit": [1e-3],
             "thermal_residual_energy_limit": [1e-7],
@@ -499,6 +500,12 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
         divergent = valid.copy()
         divergent.loc[0, "thermal_residual_continuity"] = 2e-3
         self.assertFalse(_thermal_result_is_valid(divergent))
+        loose_criteria = valid.copy()
+        loose_criteria.loc[0, "thermal_residual_flow_limit"] = 1e-2
+        self.assertFalse(_thermal_result_is_valid(loose_criteria))
+        zero_iterations = valid.copy()
+        zero_iterations["thermal_iterations"] = 0
+        self.assertFalse(_thermal_result_is_valid(zero_iterations))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"thermal_solved": [0]})))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"other": [1]})))
         self.assertFalse(_thermal_result_is_valid(None))

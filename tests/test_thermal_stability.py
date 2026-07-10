@@ -325,6 +325,8 @@ class ThermalStabilityTest(unittest.TestCase):
                 self.assertTrue(
                     ipk.setup.props["Sequential Solve of Flow and Energy Equations"]
                 )
+                self.assertEqual(ipk.setup.props["Convergence Criteria - Flow"], "0.001")
+                self.assertEqual(ipk.setup.props["Convergence Criteria - Energy"], "1e-07")
 
     def test_unconverged_residuals_skip_field_summary_and_fail_gate(self):
         complete = {
@@ -641,6 +643,34 @@ class ThermalStabilityTest(unittest.TestCase):
             self.assertFalse(parsed["converged"])
             self.assertEqual(parsed["iteration"], 142)
             self.assertEqual(parsed["values"]["Continuity"], 1.0657e18)
+
+            invalid_tail = Path(tmp, "invalid_tail.sd")
+            invalid_tail.write_text(
+                stable
+                + "152 Continuity(nan)XVelocity(1e-4)YVelocity(1e-4)"
+                  "ZVelocity(1e-4)Energy(1e-9)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                thermal._parse_thermal_residual_monitor(invalid_tail)
+
+            truncated_tail = Path(tmp, "truncated_tail.sd")
+            truncated_tail.write_text(
+                stable + "152 Continuity(8e-4)XVelocity(4e-4)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                thermal._parse_thermal_residual_monitor(truncated_tail)
+
+            duplicate_tail = Path(tmp, "duplicate_tail.sd")
+            duplicate_tail.write_text(
+                stable
+                + "152 Continuity(8e-4)Continuity(7e-4)XVelocity(4e-4)"
+                  "YVelocity(9e-4)ZVelocity(4e-4)Energy(4e-9)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                thermal._parse_thermal_residual_monitor(duplicate_tail)
 
     def test_convergence_reader_uses_latest_history_and_ignores_solution_monitor(self):
         stable = (

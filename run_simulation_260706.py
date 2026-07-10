@@ -285,6 +285,8 @@ def _thermal_result_is_valid(frame):
             return False
         if int(frame["thermal_converged"].iloc[0]) != 1:
             return False
+        if float(frame["thermal_iterations"].iloc[0]) <= 0:
+            return False
         if int(frame["thermal_extraction_complete"].iloc[0]) != 1:
             return False
         flow_limit = float(frame["thermal_residual_flow_limit"].iloc[0])
@@ -301,9 +303,9 @@ def _thermal_result_is_valid(frame):
         energy_residual = float(frame["thermal_residual_energy"].iloc[0])
         if not (
             math.isfinite(flow_limit)
-            and flow_limit > 0
+            and 0 < flow_limit <= 1e-3
             and math.isfinite(energy_limit)
-            and energy_limit > 0
+            and 0 < energy_limit <= 1e-7
             and all(math.isfinite(value) and 0 <= value <= flow_limit for value in flow_residuals)
             and math.isfinite(energy_residual)
             and 0 <= energy_residual <= energy_limit

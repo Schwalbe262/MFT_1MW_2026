@@ -155,13 +155,13 @@ _THERMAL_RESIDUAL_ROW = re.compile(
 )
 _THERMAL_RESIDUAL_VALUE = re.compile(
     r"(?P<name>Continuity|XVelocity|YVelocity|ZVelocity|Energy)"
-    r"\((?P<value>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\)"
+    r"\((?P<value>[^)]*)\)"
 )
 
 
 def _parse_thermal_residual_monitor(path, flow_limit=1e-3, energy_limit=1e-7):
     """Parse the final complete Icepak residual row and apply its solve criteria."""
-    rows = []
+    last_record = None
     for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
         match = _THERMAL_RESIDUAL_ROW.match(line)
         if not match:
@@ -169,19 +169,28 @@ def _parse_thermal_residual_monitor(path, flow_limit=1e-3, energy_limit=1e-7):
         iteration_value = float(match.group("iteration"))
         if not math.isfinite(iteration_value) or iteration_value < 0:
             continue
-        values = {
-            item.group("name"): float(item.group("value"))
-            for item in _THERMAL_RESIDUAL_VALUE.finditer(line)
+        tokens = list(_THERMAL_RESIDUAL_VALUE.finditer(line))
+        raw_values = {
+            item.group("name"): item.group("value").strip()
+            for item in tokens
         }
-        if set(values) != set(_THERMAL_RESIDUAL_FIELDS):
-            continue
-        if not all(math.isfinite(value) and value >= 0 for value in values.values()):
-            continue
-        rows.append((int(iteration_value), values))
-    if not rows:
-        raise ValueError(f"no complete finite residual rows in {path}")
+        last_record = (iteration_value, raw_values, len(tokens))
+    if last_record is None:
+        raise ValueError(f"no residual rows in {path}")
 
-    iteration, values = rows[-1]
+    iteration_value, raw_values, token_count = last_record
+    if not iteration_value.is_integer() or iteration_value <= 0:
+        raise ValueError(f"final residual iteration is invalid in {path}")
+    iteration = int(iteration_value)
+    if token_count != len(_THERMAL_RESIDUAL_FIELDS) \
+            or set(raw_values) != set(_THERMAL_RESIDUAL_FIELDS):
+        raise ValueError(f"final residual row is incomplete in {path}")
+    try:
+        values = {name: float(raw_values[name]) for name in _THERMAL_RESIDUAL_FIELDS}
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"final residual row is non-numeric in {path}") from exc
+    if not all(math.isfinite(value) and value >= 0 for value in values.values()):
+        raise ValueError(f"final residual row is non-finite in {path}")
     flow_max = max(values[name] for name in _THERMAL_RESIDUAL_FIELDS[:-1])
     converged = flow_max <= float(flow_limit) and values["Energy"] <= float(energy_limit)
     return {
@@ -214,8 +223,8 @@ def _thermal_convergence_telemetry(sim, ipk, setup, attempts=3, retry_seconds=2)
         energy_limit = float(setup.props.get("Convergence Criteria - Energy", 1e-7))
     except (TypeError, ValueError, OverflowError):
         return {**defaults, "thermal_convergence_reason": "invalid_setup_criteria"}
-    if not (math.isfinite(flow_limit) and flow_limit > 0
-            and math.isfinite(energy_limit) and energy_limit > 0):
+    if not (math.isfinite(flow_limit) and 0 < flow_limit <= 1e-3
+            and math.isfinite(energy_limit) and 0 < energy_limit <= 1e-7):
         return {**defaults, "thermal_convergence_reason": "invalid_setup_criteria"}
 
     native_ipk = _native_solver(ipk)
@@ -935,6 +944,8 @@ def run_thermal_analysis(sim):
     try:
         setup.props["Flow Regime"] = "Turbulent"
         setup.props["Convergence Criteria - Max Iterations"] = int(df["thermal_max_iterations"].iloc[0])
+        setup.props["Convergence Criteria - Flow"] = "0.001"
+        setup.props["Convergence Criteria - Energy"] = "1e-07"
         setup.props["Solution Initialization - Use Model Based Flow Initialization"] = True
         setup.props["Under-relaxation - Pressure"] = "0.3"
         setup.props["Sequential Solve of Flow and Energy Equations"] = True

@@ -426,7 +426,7 @@ def normalize_thermal_validity(df):
         complete &= False
     else:
         flow_limit = pd.to_numeric(df["thermal_residual_flow_limit"], errors="coerce")
-        complete &= flow_limit.map(math.isfinite) & flow_limit.gt(0)
+        complete &= flow_limit.map(math.isfinite) & flow_limit.gt(0) & flow_limit.le(1e-3)
         for column in residual_columns:
             if column not in df.columns:
                 complete &= False
@@ -439,7 +439,7 @@ def normalize_thermal_validity(df):
         energy_limit = pd.to_numeric(df["thermal_residual_energy_limit"], errors="coerce")
         energy = pd.to_numeric(df["thermal_residual_energy"], errors="coerce")
         complete &= (
-            energy_limit.map(math.isfinite) & energy_limit.gt(0)
+            energy_limit.map(math.isfinite) & energy_limit.gt(0) & energy_limit.le(1e-7)
             & energy.map(math.isfinite) & energy.ge(0) & energy.le(energy_limit)
         )
     if "thermal_iterations" not in df.columns:

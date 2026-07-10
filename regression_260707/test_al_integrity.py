@@ -409,6 +409,8 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_converged=0)))
         self.assertFalse(scheduler_client.is_valid_result(
             valid_result(thermal_residual_continuity=2e-3)))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(thermal_residual_flow_limit=1e-2)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(full_model=2)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(full_model=1)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(loss_sym_on=0)))
