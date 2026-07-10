@@ -22,6 +22,11 @@ import pandas as pd
 import requests
 from filelock import FileLock
 
+if __package__:
+    from .train_io import build_train_io
+else:  # Direct execution: python campaign/collect_wave.py
+    from train_io import build_train_io
+
 SCHEDULER = "http://127.0.0.1:8000"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(HERE, "..", "data", "dataset")
@@ -749,6 +754,39 @@ def _stage_parquet(frame, target):
         raise
 
 
+def _stage_csv(frame, target):
+    staged = _stage_path(target)
+    try:
+        frame.to_csv(staged, index=False)
+        return staged
+    except Exception:
+        if os.path.exists(staged):
+            os.remove(staged)
+        raise
+
+
+def _stage_train_io_views(master):
+    """Serialize both curated views before either target is replaced."""
+    io_frame = build_train_io(master)
+    parquet_path = os.path.join(DATASET_DIR, "train_io.parquet")
+    csv_path = os.path.join(DATASET_DIR, "train_io.csv")
+    staged = []
+    try:
+        staged.append((_stage_parquet(io_frame, parquet_path), parquet_path))
+        staged.append((_stage_csv(io_frame, csv_path), csv_path))
+        return staged
+    except Exception:
+        for staged_path, _ in staged:
+            if os.path.exists(staged_path):
+                os.remove(staged_path)
+        raise
+
+
+def _replace_train_io_views(master):
+    """Atomically refresh each curated view. Caller must hold the dataset lock."""
+    _replace_staged(_stage_train_io_views(master))
+
+
 def _stage_manifest(manifest, target):
     staged = _stage_path(target)
     try:
@@ -810,6 +848,7 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
         new_rows = select_new_unique_rows(merged, ranked_old, dedup_keys)
         new_unique_rows = len(new_rows)
         if not new_unique_rows:
+            _replace_train_io_views(old if old is not None else pd.DataFrame())
             _commit_pending_cache(
                 pending_harvested, pending_nodata, pending_local_parts)
             return new_unique_rows, 0 if old is None else len(old), master_path
@@ -839,6 +878,7 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
             # Rank follows master. If this replacement fails, the part remains
             # uncached and the lower-rank sidecar causes a safe retry next pass.
             staged.append((_stage_parquet(source_ranks, source_rank_path), source_rank_path))
+            staged.extend(_stage_train_io_views(allf))
             _replace_staged(staged)
         except Exception:
             for temp_path, _ in staged:
@@ -982,6 +1022,11 @@ def main(argv=None):
     if not frames:
         master_path = os.path.join(DATASET_DIR, "train.parquet")
         with FileLock(master_path + ".lock"):
+            master = (
+                pd.read_parquet(master_path)
+                if os.path.isfile(master_path) else pd.DataFrame()
+            )
+            _replace_train_io_views(master)
             _commit_pending_cache(
                 pending_harvested, pending_nodata, pending_local_parts)
         print("new_unique_rows: 0")
