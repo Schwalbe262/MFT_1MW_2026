@@ -16,6 +16,7 @@ from run_simulation_260706 import (
     _parse_rl_matrix_export,
     _thermal_failure_frame,
     _thermal_result_is_valid,
+    _wait_for_ready_copied_loss_design,
     log_failed_sample,
 )
 from module.input_parameter_260706 import get_drawing_default_params
@@ -242,6 +243,145 @@ class CopiedLossMeshPolicyTests(unittest.TestCase):
 
         self.assertTrue(assigned)
         self.assertEqual(calls, ["assign"])
+
+
+class _FakeClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        return self.value
+
+    def sleep(self, seconds):
+        self.value += seconds
+
+
+class _FakeRawDesign:
+    def __init__(self, name, design_type="Maxwell 3D", solution="AC Magnetic", setups=("Setup1",)):
+        self.name = name
+        self.design_type = design_type
+        self.solution = solution
+        self.setups = setups
+
+    def GetName(self):
+        return self.name
+
+    def GetDesignType(self):
+        return self.design_type
+
+    def GetSolutionType(self):
+        return self.solution
+
+    def GetModule(self, name):
+        if name != "AnalysisSetup":
+            raise AssertionError(name)
+        return SimpleNamespace(GetSetups=lambda: self.setups)
+
+
+class _FakeProject:
+    def __init__(self, design_sequences):
+        self.design_sequences = list(design_sequences)
+        self.index = 0
+        self.active_calls = []
+        self.last_designs = []
+
+    def GetDesigns(self):
+        if self.index < len(self.design_sequences):
+            self.last_designs = self.design_sequences[self.index]
+            self.index += 1
+        return self.last_designs
+
+    def SetActiveDesign(self, name):
+        self.active_calls.append(name)
+        return next(design for design in self.last_designs if design.GetName() == name)
+
+
+def _fake_wrapper(solution="AC Magnetic", setup=True):
+    setup_object = SimpleNamespace(properties={}) if setup is True else setup
+    return SimpleNamespace(
+        design_name="copy",
+        solution_type=solution,
+        get_setup=lambda name: setup_object if name == "Setup1" else False,
+    )
+
+
+class CopiedLossReadinessTests(unittest.TestCase):
+    def test_waits_through_wrong_solution_and_missing_setup(self):
+        source = _FakeRawDesign("source")
+        project = _FakeProject([
+            [source],
+            [source, _FakeRawDesign("copy", solution="Magnetostatic")],
+            [source, _FakeRawDesign("copy", setups=())],
+            [source, _FakeRawDesign("copy")],
+            [source, _FakeRawDesign("copy")],
+        ])
+        clock = _FakeClock()
+        factory_calls = []
+
+        wrapper, setup = _wait_for_ready_copied_loss_design(
+            project, {"source"},
+            lambda name, solution: factory_calls.append((name, solution)) or _fake_wrapper(),
+            timeout_s=2, poll_s=0.25, clock=clock, sleeper=clock.sleep,
+        )
+
+        self.assertEqual(wrapper.design_name, "copy")
+        self.assertIs(setup, wrapper.get_setup("Setup1"))
+        self.assertEqual(factory_calls, [("copy", "AC Magnetic")])
+        self.assertEqual(project.active_calls, ["copy"])
+
+    def test_retries_transient_wrapper_state(self):
+        source = _FakeRawDesign("source")
+        ready = _FakeRawDesign("copy")
+        project = _FakeProject([[source, ready]] * 5)
+        wrappers = iter([
+            _fake_wrapper(solution="Magnetostatic"),
+            _fake_wrapper(setup=False),
+            _fake_wrapper(),
+        ])
+        clock = _FakeClock()
+
+        wrapper, setup = _wait_for_ready_copied_loss_design(
+            project, {"source"}, lambda _name, _solution: next(wrappers),
+            timeout_s=2, poll_s=0.25, clock=clock, sleeper=clock.sleep,
+        )
+
+        self.assertEqual(wrapper.solution_type, "AC Magnetic")
+        self.assertTrue(hasattr(setup, "properties"))
+        self.assertEqual(project.active_calls, ["copy", "copy", "copy"])
+
+    def test_timeout_is_fail_closed_and_never_binds_source(self):
+        source = _FakeRawDesign("source")
+        project = _FakeProject([[source]] * 6)
+        clock = _FakeClock()
+        factory_calls = []
+
+        with self.assertRaisesRegex(RuntimeError, "new_names.*\[\]"):
+            _wait_for_ready_copied_loss_design(
+                project, {"source"},
+                lambda *_args: factory_calls.append(True),
+                timeout_s=1, poll_s=0.25, clock=clock, sleeper=clock.sleep,
+            )
+
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(project.active_calls, [])
+
+
+class CoreLossAssignmentTests(unittest.TestCase):
+    @staticmethod
+    def _simulation(result):
+        simulation = Simulation.__new__(Simulation)
+        simulation.design1 = SimpleNamespace(
+            core_objs=[SimpleNamespace(name="core_1")],
+            set_core_losses=lambda **_kwargs: result,
+        )
+        return simulation
+
+    def test_false_core_loss_assignment_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "set_core_losses returned False"):
+            self._simulation(False).assign_core_loss()
+
+    def test_true_core_loss_assignment_continues(self):
+        self.assertIsNone(self._simulation(True).assign_core_loss())
 
 
 class AnalyzePolicyTests(unittest.TestCase):

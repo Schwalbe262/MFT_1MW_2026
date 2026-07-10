@@ -391,6 +391,114 @@ def _configure_loss_copy_skin_mesh(sim):
     return True
 
 
+def _normalized_aedt_token(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _aedt_design_name(value):
+    try:
+        value = value.GetName()
+    except AttributeError:
+        pass
+    return str(value or "").split(";")[-1].strip()
+
+
+def _project_design_entries(project):
+    entries = []
+    for item in project.GetDesigns() or []:
+        entries.append((_aedt_design_name(item), item if hasattr(item, "GetName") else None))
+    return [(name, design) for name, design in entries if name]
+
+
+def _wait_for_ready_copied_loss_design(
+        project, before_names, wrapper_factory, timeout_s=60.0, poll_s=0.25,
+        clock=time.monotonic, sleeper=time.sleep):
+    """Bind a pasted Maxwell design only after its COM and PyAEDT state is stable."""
+    deadline = clock() + max(0.0, float(timeout_s))
+    target_name = None
+    stable_name = None
+    stable_signature = None
+    stable_count = 0
+    last = {
+        "new_names": [], "design_type": None, "solution_type": None,
+        "setups": [], "wrapper": None,
+    }
+
+    while True:
+        try:
+            entries = _project_design_entries(project)
+            new_entries = [(name, raw) for name, raw in entries if name not in before_names]
+            last["new_names"] = [name for name, _raw in new_entries]
+            if target_name is None and len(new_entries) == 1:
+                target_name = new_entries[0][0]
+            candidates = [item for item in new_entries if item[0] == target_name]
+            for name, raw in candidates:
+                if raw is None:
+                    raw = project.SetActiveDesign(name)
+                design_type = str(raw.GetDesignType() or "")
+                solution_type = str(raw.GetSolutionType() or "")
+                setups = tuple(str(item) for item in (
+                    raw.GetModule("AnalysisSetup").GetSetups() or []
+                ))
+                last.update({
+                    "design_type": design_type,
+                    "solution_type": solution_type,
+                    "setups": list(setups),
+                })
+                signature = (name, design_type, solution_type, setups)
+                ready = (
+                    design_type == "Maxwell 3D"
+                    and _normalized_aedt_token(solution_type) == "acmagnetic"
+                    and "Setup1" in setups
+                )
+                if not ready:
+                    if stable_name == name:
+                        stable_name = None
+                        stable_signature = None
+                        stable_count = 0
+                    continue
+                if stable_name == name and stable_signature == signature:
+                    stable_count += 1
+                else:
+                    stable_name = name
+                    stable_signature = signature
+                    stable_count = 1
+                if stable_count < 2:
+                    continue
+
+                project.SetActiveDesign(name)
+                wrapper = wrapper_factory(name, solution_type)
+                wrapper_name = _aedt_design_name(getattr(wrapper, "design_name", ""))
+                wrapper_solution = str(getattr(wrapper, "solution_type", "") or "")
+                wrapper_exists = wrapper is not None and wrapper is not False
+                setup = wrapper.get_setup(name="Setup1") if wrapper_exists else None
+                setup_exists = setup is not None and setup is not False
+                wrapper_ready = (
+                    wrapper_exists
+                    and wrapper_name == name
+                    and _normalized_aedt_token(wrapper_solution) == "acmagnetic"
+                    and setup_exists
+                    and hasattr(setup, "properties")
+                )
+                last["wrapper"] = {
+                    "name": wrapper_name,
+                    "solution_type": wrapper_solution,
+                    "setup_ready": bool(wrapper_ready),
+                }
+                if wrapper_ready:
+                    return wrapper, setup
+        except Exception as error:
+            last["error"] = f"{type(error).__name__}: {error}"
+
+        now = clock()
+        if now >= deadline:
+            raise RuntimeError(
+                "copied loss design did not become ready within "
+                f"{float(timeout_s):g}s; last={last}"
+            )
+        sleeper(min(max(0.0, float(poll_s)), max(0.0, deadline - now)))
+
+
 class Simulation():
 
     def __init__(self, desktop=None):
@@ -1032,13 +1140,14 @@ class Simulation():
 
     def assign_core_loss(self):
         """loss 디자인: 코어 그룹에 코어손실 계산 활성화 (Power Ferrite 계수는 create_core에서 설정)"""
-        try:
-            self.design1.set_core_losses(
-                assignment=[c.name for c in self.design1.core_objs],
-                core_loss_on_field=False
+        assigned = self.design1.set_core_losses(
+            assignment=[c.name for c in self.design1.core_objs],
+            core_loss_on_field=False
+        )
+        if assigned is False:
+            raise RuntimeError(
+                "set_core_losses returned False; copied loss design is not ready"
             )
-        except Exception as e:
-            logging.warning(f"Failed to enable core losses: {e}")
 
     def assign_skin_depth(self):
 
@@ -2094,14 +2203,20 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             import math as _m
             old_design = sim.design1  # 객체 핸들 리매핑용
             op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
+            before_names = {name for name, _raw in _project_design_entries(op)}
+            # The reference implementation gives AEDT five seconds to commit
+            # the solved source design before CopyDesign. Shorter matrix runs
+            # exposed a copied design with no solution type or Setup1.
+            old_design.save_project()
+            time.sleep(5)
             op.CopyDesign("maxwell_matrix")
             op.Paste()
-            # 복제 디자인 바인딩 (활성 디자인 = 방금 붙여넣은 것)
-            new_design = sim.design1.design.get_active_design()
-            try:
-                op.SetActiveDesign(new_design.design_name)
-            except Exception:
-                pass
+            new_design, copied_setup = _wait_for_ready_copied_loss_design(
+                op, before_names,
+                lambda name, solution: sim.project.create_design(
+                    name=name, solver="maxwell3d", solution=solution,
+                ),
+            )
             sim.design1 = new_design
 
             # 모델링 때 래퍼에 저장된 객체 핸들들을 복제 디자인으로 리매핑
@@ -2147,7 +2262,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             # 코어손실 + skin 메시(손실 정밀용) + 셋업 정밀값
             sim.assign_core_loss()
             _configure_loss_copy_skin_mesh(sim)
-            sim.design1.setup = sim.design1.get_setup(name="Setup1")
+            sim.design1.setup = copied_setup
             sim.design1.setup.properties["Max. Number of Passes"] = int(sim.df_plus["max_passes"].iloc[0])
             sim.design1.setup.properties["Min. Converged Passes"] = int(sim.df_plus["min_converged"].iloc[0])
             sim.design1.setup.properties["Percent Error"] = float(sim.df_plus["percent_error"].iloc[0])
