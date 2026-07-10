@@ -1,5 +1,5 @@
 #!/bin/bash
-# Restart the non-destructive campaign feeder and hourly collector.
+# Restart the non-destructive campaign feeder and periodic collector.
 # Usage: bash relaunch.sh [target] [buffer] [solver_revision] [library_revision]
 set -u
 
@@ -132,7 +132,7 @@ nohup "$PY" feeder.py --loop 600 --max-samples 12000 \
   > feeder_relaunch.log 2>&1 &
 echo "feeder pid $!"
 
-echo "=== 4. Hourly collector and checkpoint loop"
+echo "=== 4. Periodic collector and checkpoint loop"
 nohup bash auto_collect_loop.sh > collect_relaunch.log 2>&1 &
 echo "collector pid $!"
 
