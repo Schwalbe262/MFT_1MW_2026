@@ -10,9 +10,11 @@ import pandas as pd
 from run_simulation_260706 import (
     Simulation,
     _finalize_run_cleanup,
+    _git_provenance,
     _project_delete_policy,
     main,
 )
+from module.source_contract import SOLVER_REVISION_PATHS
 
 
 class ResultPersistenceTests(unittest.TestCase):
@@ -166,7 +168,8 @@ class FinalCleanupTests(unittest.TestCase):
 
 class FixedCliCompletionTests(unittest.TestCase):
     @staticmethod
-    def _args(model_only=False, fixed=True, hold=False):
+    def _args(model_only=False, fixed=True, hold=False, count=None,
+              require_consecutive=False):
         return SimpleNamespace(
             headless=False,
             golden=False,
@@ -180,6 +183,8 @@ class FixedCliCompletionTests(unittest.TestCase):
             thermal_on=None,
             set_overrides=[],
             hold=hold,
+            count=count,
+            require_consecutive=require_consecutive,
         )
 
     def test_invalid_fixed_result_exits_nonzero(self):
@@ -191,7 +196,6 @@ class FixedCliCompletionTests(unittest.TestCase):
             main()
 
         exit_process.assert_called_once_with(1)
-
     def test_model_only_fixed_run_can_exit_zero_without_result_row(self):
         with (
             patch(
@@ -214,6 +218,38 @@ class FixedCliCompletionTests(unittest.TestCase):
             main()
 
         run.assert_called_once_with(param=None, model_only=True, hold=True)
+
+    def test_consecutive_random_gate_aborts_on_first_failed_sample(self):
+        args = self._args(
+            fixed=False, count=3, require_consecutive=True)
+        with (
+            patch("run_simulation_260706.parse_args", return_value=args),
+            patch("run_simulation_260706.run_one_loop", return_value=False) as run,
+            patch("run_simulation_260706.time.sleep"),
+            patch(
+                "run_simulation_260706.os._exit", side_effect=SystemExit
+            ) as exit_process,
+        ):
+            with self.assertRaises(SystemExit):
+                main()
+
+        run.assert_called_once()
+        exit_process.assert_called_once_with(1)
+
+
+class SourceProvenanceTests(unittest.TestCase):
+    def test_dirty_check_is_limited_to_shared_solver_contract_paths(self):
+        with patch(
+                "subprocess.check_output",
+                side_effect=["a" * 40 + "\n", ""]) as check_output:
+            revision, dirty = _git_provenance()
+
+        self.assertEqual((revision, dirty), ("a" * 40, 0))
+        status_command = check_output.call_args_list[1].args[0]
+        self.assertIn("--untracked-files=all", status_command)
+        self.assertEqual(
+            tuple(status_command[status_command.index("--") + 1:]),
+            SOLVER_REVISION_PATHS)
 
 
 if __name__ == "__main__":

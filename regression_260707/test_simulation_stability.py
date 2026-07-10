@@ -11,6 +11,7 @@ from run_simulation_260706 import (
     Simulation,
     SolutionDataUnavailableError,
     _completion_exit_code,
+    _parse_rl_matrix_export,
     _thermal_failure_frame,
     _thermal_result_is_valid,
     log_failed_sample,
@@ -59,6 +60,43 @@ def _simulation_with_post(post):
 
 
 class SolutionDataTests(unittest.TestCase):
+    RL_EXPORT = """Inductance Unit: nH
+
+1000Hz
+\tR,L
+\t\t\tTx_winding\tRx_winding
+\t\tTx_winding  1.0E-03, 9.664177569404639E+05  2.0E-03, -9.557699432250109E+06
+\t\tRx_winding  2.0E-03, -9.557699432250109E+06  8.0E-02, 9.634317587777689E+07
+"""
+
+    def test_parses_and_validates_official_rl_matrix_export(self):
+        row = _parse_rl_matrix_export(self.RL_EXPORT, 1000.0)
+
+        self.assertAlmostEqual(row["Ltx"], 966.4177569404639)
+        self.assertAlmostEqual(row["M"], 9557.699432250109)
+        self.assertAlmostEqual(row["Llt"], 18.24869768999621)
+
+    def test_rl_matrix_export_rejects_asymmetry_and_wrong_frequency(self):
+        asymmetric = self.RL_EXPORT.replace(
+            "2.0E-03, -9.557699432250109E+06  8.0E-02",
+            "2.0E-03, -8.557699432250109E+06  8.0E-02",
+        )
+        with self.assertRaisesRegex(RuntimeError, "not symmetric"):
+            _parse_rl_matrix_export(asymmetric, 1000.0)
+        with self.assertRaisesRegex(RuntimeError, "no 900Hz"):
+            _parse_rl_matrix_export(self.RL_EXPORT, 900.0)
+
+    def test_rl_matrix_export_rejects_unknown_unit_and_cross_frequency_section(self):
+        with self.assertRaisesRegex(RuntimeError, "unsupported inductance unit"):
+            _parse_rl_matrix_export(
+                self.RL_EXPORT.replace("Inductance Unit: nH", "Inductance Unit: furlong"),
+                1000.0,
+            )
+
+        missing_target_section = self.RL_EXPORT.replace("\tR,L", "") + "\n2000Hz\n\tR,L\n"
+        with self.assertRaisesRegex(RuntimeError, "no R,L section"):
+            _parse_rl_matrix_export(missing_target_section, 1000.0)
+
     def test_reads_finite_data_and_converts_units(self):
         post = _FakePost([_FakeSolution({"L": [2.0]}, {"L": "H"})])
         simulation = _simulation_with_post(post)
@@ -95,11 +133,14 @@ class SolutionDataTests(unittest.TestCase):
         ]
         values = {expression: [1.0] for expression in params}
         values[params[2]] = [-28.5]
-        simulation = _simulation_with_post(_FakePost([_FakeSolution(values)]))
+        post = _FakePost([_FakeSolution(values)])
+        simulation = _simulation_with_post(post)
 
         frame = simulation.get_magnetic_parameter()
 
         self.assertEqual(frame["M"].iloc[0], 28.5)
+        self.assertEqual(post.calls[0]["report_category"], "AC Magnetic")
+        self.assertEqual(post.calls[0]["context"], "Matrix")
 
     def test_solution_object_with_empty_expression_is_query_failure(self):
         empty = _FakeSolution({"L": []})

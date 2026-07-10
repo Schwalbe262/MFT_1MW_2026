@@ -25,6 +25,7 @@ import re
 import json
 import argparse
 import uuid
+import tempfile
 
 try:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,10 +33,14 @@ except NameError:
     BASE_DIR = os.getcwd()
 
 # 경로 설정 - 플랫폼에 따라 다르게 처리
+library_override = os.environ.get("MFT_PYAEDT_LIBRARY_ROOT", "").strip()
+if library_override and os.path.basename(os.path.normpath(library_override)).lower() != "src":
+    library_override = os.path.join(library_override, "src")
+possible_paths = [library_override] if library_override else []
 if os.name == 'nt':  # Windows
-    sys.path.insert(0, r"Y:/git/pyaedt_library/src/")
+    possible_paths.append(r"Y:/git/pyaedt_library/src/")
 else:  # Linux/Unix
-    possible_paths = [
+    possible_paths += [
         r"../pyaedt_library/src/",
         os.path.abspath(os.path.join(BASE_DIR, "../git/pyaedt_library/src/")),
         "/home1/r1jae262/jupyter/git/pyaedt_library/src/",
@@ -46,10 +51,12 @@ else:  # Linux/Unix
         "/home1/jji0930/NEC/git/pyaedt_library/src/",
         "/home1/wjddn5916/NEC/git/pyaedt_library/src/"
     ]
-    for path in possible_paths:
-        if os.path.exists(path):
-            sys.path.insert(0, path)
-            break
+PYAEDT_LIBRARY_SRC = ""
+for path in possible_paths:
+    if path and os.path.isdir(path):
+        PYAEDT_LIBRARY_SRC = os.path.abspath(path)
+        sys.path.insert(0, PYAEDT_LIBRARY_SRC)
+        break
 
 
 # FlexNet 클라이언트 타임아웃 상향 (기본 0.1초): 바쁜 라이선스 데몬(lmgrd)의 느린 응답을
@@ -100,23 +107,53 @@ else:  # Linux/Unix
 
 from filelock import FileLock
 import shutil
+from module.source_contract import SOLVER_REVISION_PATHS
 
 
 PLATE_COLOR = [144, 190, 144]
 PAD_COLOR = [200, 160, 200]
 
 
-def _git_hash():
-    """데이터 이력 추적용: 이 코드 버전의 git 커밋 해시"""
+def _git_provenance():
+    """Return the full solver revision and tracked-worktree dirty flag."""
     try:
         import subprocess
-        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
-                                       cwd=BASE_DIR, stderr=subprocess.DEVNULL).decode().strip()
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=BASE_DIR,
+            stderr=subprocess.DEVNULL, text=True).strip().lower()
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all", "--",
+             *SOLVER_REVISION_PATHS],
+            cwd=BASE_DIR, stderr=subprocess.DEVNULL, text=True).strip())
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise RuntimeError(f"invalid solver revision {revision!r}")
+        return revision, int(dirty)
     except Exception:
-        return "unknown"
+        return "unknown", 1
 
 
-GIT_HASH = _git_hash()
+GIT_HASH, GIT_DIRTY = _git_provenance()
+
+
+def _library_git_provenance():
+    """Return the imported pyaedt_library full revision and tracked-src dirty flag."""
+    try:
+        import subprocess
+        root = os.path.abspath(os.path.join(PYAEDT_LIBRARY_SRC, os.pardir))
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root,
+            stderr=subprocess.DEVNULL, text=True).strip().lower()
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all", "--", "src"],
+            cwd=root, stderr=subprocess.DEVNULL, text=True).strip())
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise RuntimeError(f"invalid library revision {revision!r}")
+        return revision, int(dirty)
+    except Exception:
+        return "unknown", 1
+
+
+PYAEDT_LIBRARY_GIT_HASH, PYAEDT_LIBRARY_GIT_DIRTY = _library_git_provenance()
 
 
 class SolutionDataUnavailableError(RuntimeError):
@@ -148,6 +185,93 @@ def _convert_solution_unit(value, source_unit, target_unit):
         logging.warning(f"unknown SolutionData unit conversion '{source_unit}' -> '{target_unit}'")
         return float(value)
     return float(value) * source_factor / target_factor
+
+
+_RL_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?"
+
+
+def _parse_rl_matrix_export(text, frequency_hz, tx_name="Tx_winding", rx_name="Rx_winding"):
+    """Parse one validated 2x2 R/L block exported by Maxwell ExportSolnData."""
+    unit_match = re.search(r"(?im)^Inductance Unit:\s*([^\s]+)\s*$", text)
+    if not unit_match:
+        raise RuntimeError("RL matrix export has no inductance unit")
+    source_unit = unit_match.group(1)
+    if source_unit.lower() not in {"ph", "nh", "uh", "mh", "h"}:
+        raise RuntimeError(f"RL matrix export has unsupported inductance unit: {source_unit}")
+    lines = text.splitlines()
+    target_index = None
+    for index, line in enumerate(lines):
+        match = re.fullmatch(rf"\s*({_RL_NUMBER})Hz\s*", line)
+        if match and math.isclose(
+                float(match.group(1)), float(frequency_hz), rel_tol=1e-9, abs_tol=1e-9):
+            target_index = index
+            break
+    if target_index is None:
+        raise RuntimeError(f"RL matrix export has no {float(frequency_hz):g}Hz block")
+
+    block_end = next(
+        (index for index in range(target_index + 1, len(lines))
+         if re.fullmatch(rf"\s*{_RL_NUMBER}Hz\s*", lines[index])),
+        len(lines),
+    )
+    rl_index = next(
+        (index for index in range(target_index + 1, block_end)
+         if lines[index].strip() == "R,L"),
+        None,
+    )
+    if rl_index is None:
+        raise RuntimeError("RL matrix export has no R,L section")
+
+    pair_pattern = re.compile(rf"({_RL_NUMBER})\s*,\s*({_RL_NUMBER})")
+    rows = {}
+    for line in lines[rl_index + 1:block_end]:
+        stripped = line.strip()
+        name = stripped.split(None, 1)[0] if stripped else ""
+        if name not in (tx_name, rx_name):
+            continue
+        pairs = [(float(r), float(l)) for r, l in pair_pattern.findall(stripped)]
+        if len(pairs) == 2:
+            rows[name] = pairs
+        if len(rows) == 2:
+            break
+    if set(rows) != {tx_name, rx_name}:
+        raise RuntimeError("RL matrix export is missing Tx/Rx matrix rows")
+
+    ltx_raw = rows[tx_name][0][1]
+    l12_raw = rows[tx_name][1][1]
+    l21_raw = rows[rx_name][0][1]
+    lrx_raw = rows[rx_name][1][1]
+    symmetry_scale = max(abs(l12_raw), abs(l21_raw), 1.0)
+    if abs(l12_raw - l21_raw) > 1e-9 * symmetry_scale:
+        raise RuntimeError("RL inductance matrix is not symmetric")
+    mutual_raw = 0.5 * (l12_raw + l21_raw)
+    if not all(math.isfinite(value) for value in (ltx_raw, lrx_raw, mutual_raw)):
+        raise RuntimeError("RL inductance matrix contains non-finite values")
+    determinant = ltx_raw * lrx_raw - mutual_raw * mutual_raw
+    if ltx_raw <= 0 or lrx_raw <= 0 or determinant <= 0:
+        raise RuntimeError("RL inductance matrix is not positive definite")
+    k = abs(mutual_raw) / math.sqrt(ltx_raw * lrx_raw)
+    if not math.isfinite(k) or k > 1.0 + 1e-9:
+        raise RuntimeError(f"RL coupling coefficient is invalid: {k}")
+
+    ltx = _convert_solution_unit(ltx_raw, source_unit, "uH")
+    lrx = _convert_solution_unit(lrx_raw, source_unit, "uH")
+    mutual = abs(_convert_solution_unit(mutual_raw, source_unit, "uH"))
+    k2 = min(k, 1.0) ** 2
+    return {
+        "Ltx": ltx,
+        "Lrx": lrx,
+        "M": mutual,
+        "k": min(k, 1.0),
+        "Lmt": ltx * k2,
+        "Lmr": lrx * k2,
+        "Llt": ltx * (1.0 - k2),
+        "Llr": lrx * (1.0 - k2),
+        # Matrix-design solid loss is diagnostic only; the production loss
+        # design supplies authoritative component losses.
+        "Tx_loss": float("nan"),
+        "Rx_loss": float("nan"),
+    }
 
 
 def _thermal_result_is_valid(frame):
@@ -974,7 +1098,8 @@ class Simulation():
         self.design1.setup.properties["Frequency Setup"] = f"{float(self.df_plus['freq'].iloc[0])}Hz"
 
     def _solution_data_frame(self, expressions, aliases=None, target_units=None,
-                             report_category=None, extraction_key="result",
+                             report_category=None, report_context=None,
+                             extraction_key="result",
                              max_attempts=3, retry_delay=5):
         """Read finite scalar results without creating or exporting an AEDT report file.
 
@@ -1013,6 +1138,7 @@ class Simulation():
                         expressions=expressions,
                         setup_sweep_name="Setup1 : LastAdaptive",
                         report_category=report_category,
+                        context=report_context,
                     )
                 if solution is None or solution is False:
                     last_error = RuntimeError(f"{backend} returned no usable response")
@@ -1127,12 +1253,52 @@ class Simulation():
         ]
         expressions = [p[0] for p in params]
         self.report1 = None
-        self.df1 = self._solution_data_frame(
-            expressions,
-            aliases=[p[1] for p in params],
-            target_units={p[0]: p[2] for p in params if p[2]},
-            extraction_key="matrix",
-        )
+        export_path = None
+        self.extraction_attempts["matrix"] = self.extraction_attempts.get("matrix", 0) + 1
+        try:
+            fd, export_path = tempfile.mkstemp(prefix="mft_rl_", suffix=".txt")
+            os.close(fd)
+            os.remove(export_path)
+            started = time.time()
+            exported = self.design1.export_rl_matrix(
+                matrix_name="Matrix",
+                output_file=export_path,
+                is_format_default=False,
+                width=24,
+                precision=15,
+                is_exponential=True,
+                setup="Setup1",
+                default_adaptive="LastAdaptive",
+            )
+            if exported is False:
+                raise RuntimeError("export_rl_matrix returned False")
+            if not os.path.isfile(export_path) or os.path.getsize(export_path) <= 0:
+                raise RuntimeError("export_rl_matrix did not create a non-empty file")
+            if os.path.getmtime(export_path) < started - 2:
+                raise RuntimeError("export_rl_matrix returned a stale file")
+            with open(export_path, encoding="utf-8", errors="strict") as exported_file:
+                row = _parse_rl_matrix_export(
+                    exported_file.read(), float(self.df_plus["freq"].iloc[0]))
+            self.df1 = pd.DataFrame([row])
+            self.extraction_backends["matrix"] = "export_rl_matrix"
+        except Exception as export_error:
+            logging.warning(
+                f"[matrix] export_rl_matrix failed; trying SolutionData: {export_error}"
+            )
+            self.df1 = self._solution_data_frame(
+                expressions,
+                aliases=[p[1] for p in params],
+                target_units={p[0]: p[2] for p in params if p[2]},
+                report_category="AC Magnetic",
+                report_context="Matrix",
+                extraction_key="matrix",
+            )
+        finally:
+            if export_path and os.path.isfile(export_path):
+                try:
+                    os.remove(export_path)
+                except OSError:
+                    pass
         # The historical pyaedt_library report path applied abs() to magnetic
         # parameters. Preserve the established dataset convention for mutual M.
         self.df1["M"] = self.df1["M"].abs()
@@ -1531,10 +1697,16 @@ class Simulation():
         """Atomically save a per-run parquet part, then append a compatible legacy CSV."""
         results_df = results_df.copy()
         results_df["git_hash"] = GIT_HASH
+        results_df["git_dirty"] = GIT_DIRTY
+        results_df["pyaedt_library_git_hash"] = PYAEDT_LIBRARY_GIT_HASH
+        results_df["pyaedt_library_git_dirty"] = PYAEDT_LIBRARY_GIT_DIRTY
         results_df["project_name"] = getattr(self, "PROJECT_NAME", "")
         results_df["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # RESULT_JSON 스트리밍이 동일 메타(특히 dedup 키)를 쓰도록 보관
         self.last_save_meta = {"git_hash": GIT_HASH,
+                               "git_dirty": GIT_DIRTY,
+                               "pyaedt_library_git_hash": PYAEDT_LIBRARY_GIT_HASH,
+                               "pyaedt_library_git_dirty": PYAEDT_LIBRARY_GIT_DIRTY,
                                "project_name": results_df["project_name"].iloc[0],
                                "saved_at": results_df["saved_at"].iloc[0]}
 
@@ -1764,6 +1936,9 @@ def log_failed_sample(input_df, reason, filename="failed_samples_260706.jsonl"):
             "failure_stage": reason_text.split(":", 1)[0],
             "fail_time": datetime.now().astimezone().isoformat(timespec="seconds"),
             "git_hash": GIT_HASH,
+            "git_dirty": GIT_DIRTY,
+            "pyaedt_library_git_hash": PYAEDT_LIBRARY_GIT_HASH,
+            "pyaedt_library_git_dirty": PYAEDT_LIBRARY_GIT_DIRTY,
         }
         lock_path = filename + ".lock"
         with FileLock(lock_path):
@@ -2155,6 +2330,10 @@ def parse_args():
                         help="AEDT 창 없이 실행 (해석 중 GUI 조작으로 인한 블로킹 방지)")
     parser.add_argument("--count", type=int, default=None,
                         help="랜덤 모드에서 N회 성공 후 종료 (slurm_scheduler fea_bursty/packed 태스크용; 미지정 시 무한루프)")
+    parser.add_argument(
+        "--require-consecutive", action="store_true",
+        help="abort a bounded random batch on its first unsuccessful sample",
+    )
     parser.add_argument("--no-matrix", dest="matrix_on", action="store_false", default=None,
                         help="design1(L/k 매트릭스) 생략")
     parser.add_argument("--no-loss", dest="loss_on", action="store_false", default=None,
@@ -2192,6 +2371,10 @@ def main():
     global GUI
 
     args = parse_args()
+    require_consecutive = bool(getattr(args, "require_consecutive", False))
+
+    if require_consecutive and (args.count is None or args.count <= 0):
+        raise ValueError("--require-consecutive requires a positive --count")
 
     if args.headless:
         GUI = True  # non_graphical=True
@@ -2277,6 +2460,7 @@ def main():
 
     while True:
 
+        ok = False
         try:
             ok = run_one_loop(param=None, model_only=args.model_only, hold=args.hold,
                               overrides=overrides or None)
@@ -2296,6 +2480,13 @@ def main():
 
         attempts += 1
         if args.count is not None:
+            if require_consecutive and not ok:
+                logging.error(
+                    f"Consecutive gate failed on attempt {attempts}; "
+                    f"completed {successes}/{args.count} simulations.")
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
             if successes >= args.count:
                 logging.info(f"Completed {successes}/{args.count} simulations.")
                 # os._exit: pyaedt atexit 핸들러의 간헐적 teardown 크래시가

@@ -16,16 +16,24 @@
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import numpy as np
 import pandas as pd
+from filelock import FileLock
+from module.source_contract import SOLVER_REVISION_PATHS
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "training"))
 sys.path.insert(0, os.path.join(HERE, "verify"))
@@ -39,12 +47,376 @@ SPEC = {
     "T_limit_C": 100.0, "B_limit_T": 1.2,
     "agree_llt_med_pct": 0.5, "agree_llt_max_pct": 1.0,
     "agree_T_med_C": 3.0, "agree_T_max_C": 5.0,
-    "agree_P_med_pct": 3.0,
+    "agree_P_med_pct": 3.0, "agree_P_max_pct": 5.0,
+    "verification_min_coverage": 0.70,
+    "convergence_max_pct": 1.5,
     "max_rounds": 10, "K": 33,
 }
 
 T_TARGETS = ["Tprobe_Tx_leeward_max", "Tprobe_Rx_main_leeward_max",
              "Tprobe_Rx_side_leeward_max", "Tprobe_core_center_max"]
+
+ACTUAL_TEMPERATURES = {
+    "Tprobe_Tx_leeward_max": "T_max_Tx",
+    "Tprobe_Rx_main_leeward_max": "T_max_Rx_main",
+    "Tprobe_Rx_side_leeward_max": "T_max_Rx_side",
+    "Tprobe_core_center_max": "T_max_core",
+}
+TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+LOSS_COMPONENTS = ("P_winding_total", "P_core_total", "P_core_plate_total")
+SOURCE_RANK_COLUMN = "_collector_source_rank"
+AL_SOURCE_RANK = 50
+
+
+def _finite(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _required_probe_targets(result):
+    targets = [T_TARGETS[0], T_TARGETS[1], T_TARGETS[3]]
+    if _finite(result.get("N2_side")) and float(result["N2_side"]) > 0:
+        targets.insert(2, T_TARGETS[2])
+    return targets
+
+
+def _physical_llt(result):
+    value = float(result["Llt"])
+    return value if int(float(result["full_model"])) == 1 else 2.0 * value
+
+
+def _result_passes_spec(result):
+    """Apply physical FEA limits, independently from model agreement."""
+    try:
+        llt = _physical_llt(result)
+        if not _finite(llt) or not _finite(result.get("B_max_core")):
+            return False
+        if not all(
+                _finite(result.get(key))
+                and 0 <= float(result[key]) <= SPEC["convergence_max_pct"]
+                for key in ("conv_error_pct_matrix", "conv_error_pct_loss")):
+            return False
+        if not all(
+                _finite(result.get(key)) and float(result[key]) >= 0
+                for key in LOSS_COMPONENTS):
+            return False
+        if abs(llt - SPEC["Llt_target_uH"]) > SPEC["Llt_tol_uH"]:
+            return False
+        if not 0 <= float(result["B_max_core"]) <= SPEC["B_limit_T"]:
+            return False
+        for target in _required_probe_targets(result):
+            actual_column = ACTUAL_TEMPERATURES[target]
+            if not _finite(result.get(actual_column)):
+                return False
+            if float(result[actual_column]) > SPEC["T_limit_C"]:
+                return False
+        return True
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def _current_solver_revision():
+    repo_root = os.path.abspath(os.path.join(HERE, ".."))
+    dirty = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--",
+         *SOLVER_REVISION_PATHS],
+        cwd=repo_root, text=True).strip()
+    if dirty:
+        raise RuntimeError(
+            "solver revision is not vetted: tracked solver inputs differ from HEAD\n" + dirty)
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True).strip().lower()
+    if len(revision) != 40 or any(ch not in "0123456789abcdef" for ch in revision):
+        raise RuntimeError(f"invalid solver git revision: {revision!r}")
+    return revision
+
+
+def _current_library_revision():
+    library_root = os.environ.get("MFT_PYAEDT_LIBRARY_ROOT", "").strip()
+    if not library_root:
+        library_root = os.path.join(HERE, "..", "..", "pyaedt_library")
+    library_root = os.path.abspath(library_root)
+    if not os.path.exists(os.path.join(library_root, ".git")):
+        raise RuntimeError(f"pyaedt_library git checkout is unavailable: {library_root}")
+    dirty = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--", "src"],
+        cwd=library_root, text=True).strip()
+    if dirty:
+        raise RuntimeError(
+            "pyaedt_library revision is not vetted: src differs from HEAD\n" + dirty)
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=library_root, text=True).strip().lower()
+    if len(revision) != 40 or any(ch not in "0123456789abcdef" for ch in revision):
+        raise RuntimeError(f"invalid pyaedt_library git revision: {revision!r}")
+    return revision
+
+
+def _new_task_record(
+        task_id, name=None, workdir=None, solver_revision=None,
+        library_revision=None):
+    return {
+        "original_id": task_id,
+        "retry_id": None,
+        "active_id": task_id,
+        "attempt": 0,
+        "outcome": "pending" if task_id else "submission_unknown",
+        "last_status": None,
+        "result": None,
+        "name": name,
+        "workdir": workdir,
+        "solver_git_revision": solver_revision,
+        "pyaedt_library_git_revision": library_revision,
+    }
+
+
+def _ensure_task_records(st):
+    """Migrate old task_map-only states without discarding task identity."""
+    task_map = st.setdefault("task_map", {})
+    records = st.setdefault("task_records", {})
+    for idx, task_id in list(task_map.items()):
+        key = str(idx)
+        if key not in records:
+            records[key] = _new_task_record(
+                task_id,
+                solver_revision=st.get("solver_git_revision"),
+                library_revision=st.get("pyaedt_library_git_revision"))
+        record = records[key]
+        if record.get("solver_git_revision") is None and st.get("solver_git_revision"):
+            record["solver_git_revision"] = st["solver_git_revision"]
+        if (record.get("pyaedt_library_git_revision") is None
+                and st.get("pyaedt_library_git_revision")):
+            record["pyaedt_library_git_revision"] = st["pyaedt_library_git_revision"]
+        if record.get("active_id") is None and task_id is not None:
+            record["active_id"] = task_id
+        task_map[key] = record.get("active_id")
+    return records
+
+
+def _stage_parquet(frame, target):
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    fd, staged = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=os.path.dirname(target))
+    os.close(fd)
+    try:
+        frame.to_parquet(staged, index=False)
+        return staged
+    except Exception:
+        if os.path.exists(staged):
+            os.remove(staged)
+        raise
+
+
+def _atomic_write_parquet(frame, target):
+    staged = _stage_parquet(frame, target)
+    try:
+        os.replace(staged, target)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
+
+
+def _atomic_write_csv(frame, target):
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    fd, staged = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=os.path.dirname(target))
+    os.close(fd)
+    try:
+        frame.to_csv(staged, index=False)
+        os.replace(staged, target)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
+
+
+def _atomic_save_npy(array, target):
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    fd, staged = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=os.path.dirname(target))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.save(handle, array)
+        os.replace(staged, target)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
+
+
+def _deduplicate_dataset(frame):
+    """Deduplicate replayed AL rows while retaining legacy unidentified rows."""
+    if frame is None or frame.empty:
+        return frame
+    identities = pd.Series(pd.NA, index=frame.index, dtype="object")
+    if {"project_name", "saved_at"}.issubset(frame.columns):
+        primary = (
+            frame["project_name"].notna()
+            & frame["saved_at"].notna()
+            & frame["project_name"].astype(str).str.strip().ne("")
+            & frame["saved_at"].astype(str).str.strip().ne("")
+        )
+        identities.loc[primary] = (
+            "project:"
+            + frame.loc[primary, "project_name"].astype(str)
+            + "|"
+            + frame.loc[primary, "saved_at"].astype(str)
+        )
+    if {"source", "task_id"}.issubset(frame.columns):
+        fallback = identities.isna() & frame["source"].astype(str).str.startswith("al_round_") \
+            & frame["task_id"].notna()
+        identities.loc[fallback] = (
+            "task:"
+            + frame.loc[fallback, "source"].astype(str)
+            + "|"
+            + frame.loc[fallback, "task_id"].astype(str)
+        )
+    identified = identities.notna()
+    keep = ~identified | ~identities.duplicated(keep="last")
+    return frame.loc[keep].reset_index(drop=True)
+
+
+def _unique_rows(array):
+    if len(array) < 2:
+        return array
+    _, indices = np.unique(array, axis=0, return_index=True)
+    return array[np.sort(indices)]
+
+
+def _merge_source_ranks(existing, new_rows):
+    keys = ["project_name", "saved_at"]
+    columns = keys + [SOURCE_RANK_COLUMN]
+    if not all(key in new_rows.columns for key in keys):
+        raise RuntimeError("AL rows are missing source-rank identity columns")
+    incoming = new_rows[keys].copy()
+    incoming[SOURCE_RANK_COLUMN] = AL_SOURCE_RANK
+    frames = [incoming]
+    if existing is not None:
+        missing = [column for column in columns if column not in existing.columns]
+        if missing:
+            raise RuntimeError(f"source rank sidecar schema is invalid; missing {missing}")
+        sidecar = existing[columns].copy()
+        complete = (
+            sidecar["project_name"].notna()
+            & sidecar["saved_at"].notna()
+            & sidecar["project_name"].astype(str).str.strip().ne("")
+            & sidecar["saved_at"].astype(str).str.strip().ne("")
+        )
+        numeric_rank = pd.to_numeric(sidecar[SOURCE_RANK_COLUMN], errors="coerce")
+        if (not complete.all() or not np.isfinite(numeric_rank).all()
+                or (numeric_rank < 0).any()
+                or sidecar.duplicated(keys).any()):
+            raise RuntimeError("source rank sidecar contains invalid or duplicate rows")
+        sidecar[SOURCE_RANK_COLUMN] = numeric_rank
+        frames.insert(0, sidecar)
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    complete = (
+        merged["project_name"].notna()
+        & merged["saved_at"].notna()
+        & merged["project_name"].astype(str).str.strip().ne("")
+        & merged["saved_at"].astype(str).str.strip().ne("")
+    )
+    merged = merged.loc[complete].copy()
+    merged[SOURCE_RANK_COLUMN] = pd.to_numeric(
+        merged[SOURCE_RANK_COLUMN], errors="coerce").fillna(0)
+    merged = merged.sort_values(SOURCE_RANK_COLUMN, kind="stable")
+    return merged.drop_duplicates(keys, keep="last").reset_index(drop=True)
+
+
+def _validated_existing_source_ranks(existing, existing_ranks, recoverable_rows=None):
+    """Validate ranks, repairing only AL identities from an interrupted install."""
+    keys = ["project_name", "saved_at"]
+    empty_incoming = pd.DataFrame(columns=keys)
+    validated = _merge_source_ranks(existing_ranks, empty_incoming)
+    if existing is None or existing.empty:
+        return validated
+    if not all(key in existing.columns for key in keys):
+        raise RuntimeError("existing dataset is missing source-rank identity columns")
+    complete = (
+        existing["project_name"].notna()
+        & existing["saved_at"].notna()
+        & existing["project_name"].astype(str).str.strip().ne("")
+        & existing["saved_at"].astype(str).str.strip().ne("")
+    )
+    identities = existing.loc[complete, keys].drop_duplicates()
+    coverage = identities.merge(validated[keys], on=keys, how="left", indicator=True)
+    missing = coverage.loc[coverage["_merge"].ne("both"), keys]
+    if len(missing):
+        if recoverable_rows is None or not all(
+                key in recoverable_rows.columns for key in keys):
+            raise RuntimeError(
+                "source rank sidecar does not cover every existing dataset identity")
+        recoverable_complete = (
+            recoverable_rows["project_name"].notna()
+            & recoverable_rows["saved_at"].notna()
+            & recoverable_rows["project_name"].astype(str).str.strip().ne("")
+            & recoverable_rows["saved_at"].astype(str).str.strip().ne("")
+        )
+        recoverable = recoverable_rows.loc[recoverable_complete, keys].drop_duplicates()
+        repairable = missing.merge(recoverable, on=keys, how="left", indicator=True)
+        if not repairable["_merge"].eq("both").all():
+            raise RuntimeError(
+                "source rank sidecar does not cover every existing dataset identity")
+        from campaign import collect_wave as collector
+        collector._matching_replay_rows(
+            existing, recoverable_rows, missing, keys)
+        repaired = missing.copy()
+        repaired[SOURCE_RANK_COLUMN] = AL_SOURCE_RANK
+        validated = pd.concat([validated, repaired], ignore_index=True, sort=False)
+    return validated
+
+
+def _merge_ranked_dataset(existing, new_rows, existing_ranks):
+    """Merge AL rows using the collector's source-rank replacement contract."""
+    from campaign import collect_wave as collector
+
+    keys = ["project_name", "saved_at"]
+    incoming = new_rows.copy()
+    incoming[SOURCE_RANK_COLUMN] = AL_SOURCE_RANK
+    validated_ranks = _validated_existing_source_ranks(
+        existing, existing_ranks, recoverable_rows=new_rows)
+    ranked_existing = collector._attach_source_ranks(
+        existing, validated_ranks, keys)
+    accepted = collector.select_new_unique_rows(
+        incoming, ranked_existing, keys)
+    retained = collector._drop_replaced_key_rows(
+        ranked_existing, accepted, keys)
+    ranked = accepted if retained is None else pd.concat(
+        [retained, accepted], ignore_index=True, sort=False)
+    source_ranks = collector._source_rank_rows(ranked, keys)
+    dataset = ranked.drop(columns=[SOURCE_RANK_COLUMN], errors="ignore")
+    return _deduplicate_dataset(dataset), source_ranks
+
+
+def _install_dataset_transaction(dataset, source_ranks, source_rank_path):
+    """Serialize both artifacts before installing master first, then rank."""
+    staged_dataset = _stage_parquet(dataset, DATASET)
+    staged_ranks = None
+    try:
+        staged_ranks = _stage_parquet(source_ranks, source_rank_path)
+        # Master first is recovery-safe: an interrupted write leaves the AL row
+        # at its old lower rank, so replay can still promote it. Rank first could
+        # label the old payload as AL authority and make replay reject the AL row.
+        os.replace(staged_dataset, DATASET)
+        staged_dataset = None
+        os.replace(staged_ranks, source_rank_path)
+        staged_ranks = None
+    finally:
+        for staged in (staged_ranks, staged_dataset):
+            if staged and os.path.exists(staged):
+                os.remove(staged)
+
+
+def _verification_counts(records):
+    total = len(records)
+    valid = sum(record.get("outcome") == "valid" for record in records.values())
+    exhausted = sum(record.get("outcome") == "exhausted" for record in records.values())
+    return {
+        "total": total,
+        "valid": valid,
+        "exhausted": exhausted,
+        "pending": total - valid - exhausted,
+        "coverage": (valid / total) if total else 0.0,
+    }
 
 
 def load_state():
@@ -106,6 +478,11 @@ def stage_select(st):
 
     from select_candidates import select
     picked = select(X, F, G, sig_norm, verified_X=verified_X)
+    if len(picked) != min(SPEC["K"], len(X)):
+        raise RuntimeError(
+            f"candidate selection returned {len(picked)} rows; "
+            f"expected {min(SPEC['K'], len(X))}"
+        )
     np.save(os.path.join(rdir, "selected_idx.npy"), np.array(picked))
     print(f"[al] round {rnd}: {len(picked)} candidates selected")
     st["stage"] = "SUBMIT"
@@ -119,49 +496,193 @@ def stage_submit(st):
 
     from module.input_parameter_260706 import KEYS  # noqa
     import scheduler_client as sc
-    profile = json.load(open(os.path.join(HERE, "verify", "profiles", "standard.json")))
+    with open(os.path.join(HERE, "verify", "profiles", "standard.json"), encoding="utf-8") as profile_file:
+        profile = json.load(profile_file)
 
-    task_map = {}
+    if st.get("task_round") != rnd:
+        st["task_map"] = {}
+        st["task_records"] = {}
+        st["task_round"] = rnd
+        st["solver_git_revision"] = _current_solver_revision()
+        st["pyaedt_library_git_revision"] = _current_library_revision()
+        save_state(st)
+    solver_revision = st.get("solver_git_revision")
+    if not isinstance(solver_revision, str) or len(solver_revision) != 40:
+        raise RuntimeError("AL round has no pinned full solver git revision")
+    library_revision = st.get("pyaedt_library_git_revision")
+    if not isinstance(library_revision, str) or len(library_revision) != 40:
+        raise RuntimeError("AL round has no pinned full pyaedt_library git revision")
+    task_map = st.setdefault("task_map", {})
+    records = st.setdefault("task_records", {})
+    unknown = []
     for j, i in enumerate(picked):
+        idx_str = str(i)
+        if idx_str in records:
+            if records[idx_str].get("outcome") == "submission_unknown":
+                unknown.append(idx_str)
+            continue
         row = front.iloc[i]
         params = {k: (row[k] if not isinstance(row[k], np.generic) else row[k].item())
                   for k in KEYS if k in front.columns and pd.notna(row[k])}
         name = f"mft-al-r{rnd:02d}-c{j:02d}"
-        tid = sc.submit_verification(name, f"mft_al_r{rnd:02d}_c{j:02d}", params, profile,
-                                     mem_mb=profile.get("mem_mb", 32768))
-        task_map[str(i)] = tid
+        workdir = f"mft_al_r{rnd:02d}_c{j:02d}"
+        tid = sc.submit_verification(
+            name, workdir, params, profile,
+            mem_mb=profile.get("mem_mb", 32768), cpus=profile.get("cpus", 4),
+            solver_revision=solver_revision, library_revision=library_revision)
+        task_map[idx_str] = tid
+        records[idx_str] = _new_task_record(
+            tid, name=name, workdir=workdir, solver_revision=solver_revision,
+            library_revision=library_revision)
+        if tid is None:
+            unknown.append(idx_str)
+        # Persist every returned identity. A driver crash cannot silently submit
+        # the same candidate again on the next invocation.
+        save_state(st)
         time.sleep(0.5)
-    st["task_map"] = task_map
+    if unknown:
+        raise RuntimeError(
+            f"scheduler accepted or rejected submissions without recoverable task IDs: {unknown}"
+        )
     st["stage"] = "WAIT"
 
 
 def stage_wait(st):
     import scheduler_client as sc
-    tids = [t for t in st["task_map"].values() if t]
-    status = sc.wait_all(tids, poll_s=180, timeout_s=6 * 3600)
-    # 실패 후보는 64GB로 1회 재시도 (플랜: 메모리 부족/불안정 대응)
+    records = _ensure_task_records(st)
+    solver_revision = st.get("solver_git_revision")
+    if not isinstance(solver_revision, str) or len(solver_revision) != 40:
+        raise RuntimeError("cannot verify tasks without the round's pinned solver revision")
+    library_revision = st.get("pyaedt_library_git_revision")
+    if not isinstance(library_revision, str) or len(library_revision) != 40:
+        raise RuntimeError("cannot verify tasks without the pinned pyaedt_library revision")
+    unresolved = {
+        idx: record for idx, record in records.items()
+        if record.get("outcome") not in ("valid", "exhausted")
+    }
+    unknown_submissions = [
+        idx for idx, record in unresolved.items()
+        if (record.get("active_id") is None
+            or record.get("outcome") in ("submission_unknown", "retry_submission_unknown"))
+    ]
+    if unknown_submissions:
+        st["verification_counts"] = dict(
+            round=st["round"], **_verification_counts(records))
+        st["stage"] = "WAIT"
+        save_state(st)
+        raise RuntimeError(
+            f"cannot safely resubmit candidates with unknown task identity: {unknown_submissions}"
+        )
+
+    tids = [record["active_id"] for record in unresolved.values()]
+    retry_only = bool(tids) and all(record.get("attempt", 0) >= 1 for record in unresolved.values())
+    status = sc.wait_all(
+        tids, poll_s=180, timeout_s=(5 if retry_only else 6) * 3600)
+
+    # A terminal task with no valid data is retried once at 64 GB. Active or
+    # unknown states remain in WAIT and never consume a duplicate allocation.
     rnd = st["round"]
     front = pd.read_csv(os.path.join(HERE, "al_rounds", f"round_{rnd:02d}", "pareto_front.csv"))
     from module.input_parameter_260706 import KEYS
-    profile = json.load(open(os.path.join(HERE, "verify", "profiles", "standard.json"), encoding="utf-8"))
-    retried = {}
-    for idx_str, tid in list(st["task_map"].items()):
-        if tid and status.get(tid) != "completed" and not sc.fetch_result_json(tid):
-            row = front.iloc[int(idx_str)]
-            params = {k: (row[k].item() if hasattr(row[k], "item") else row[k])
-                      for k in KEYS if k in front.columns and pd.notna(row[k])}
-            new_tid = sc.submit_verification(f"mft-al-r{rnd:02d}-retry-{idx_str}",
-                                             f"mft_al_r{rnd:02d}_rt{idx_str}", params, profile,
-                                             mem_mb=65536)
-            retried[idx_str] = new_tid
-            st["task_map"][idx_str] = new_tid
+    profile_path = os.path.join(HERE, "verify", "profiles", "standard.json")
+    with open(profile_path, encoding="utf-8") as profile_file:
+        profile = json.load(profile_file)
+    retried = 0
+    fetch_errors = []
+    submission_unknown = []
+    for idx_str, record in unresolved.items():
+        tid = record["active_id"]
+        task_status = status.get(tid)
+        record["last_status"] = task_status
+        if task_status not in TERMINAL_TASK_STATUSES:
+            continue
+
+        try:
+            expected_revision = record.get("solver_git_revision") or solver_revision
+            expected_library = (
+                record.get("pyaedt_library_git_revision") or library_revision)
+            fetched = sc.fetch_result(
+                tid, expected_revision=expected_revision,
+                expected_library_revision=expected_library)
+        except sc.ResultFetchError as exc:
+            record["outcome"] = "fetch_error"
+            record["fetch_error"] = str(exc)
+            fetch_errors.append((idx_str, str(exc)))
+            save_state(st)
+            continue
+
+        record["last_result_state"] = fetched.state
+        if fetched.state == sc.RESULT_VALID:
+            record["result"] = fetched.result
+            record["outcome"] = "valid"
+            record.pop("fetch_error", None)
+            save_state(st)
+            continue
+
+        if int(record.get("attempt", 0)) >= 1:
+            record["outcome"] = "exhausted"
+            save_state(st)
+            continue
+
+        row = front.iloc[int(idx_str)]
+        params = {k: (row[k].item() if hasattr(row[k], "item") else row[k])
+                  for k in KEYS if k in front.columns and pd.notna(row[k])}
+        retry_name = f"mft-al-r{rnd:02d}-retry-{idx_str}"
+        retry_workdir = f"mft_al_r{rnd:02d}_rt{idx_str}"
+        new_tid = sc.submit_verification(
+            retry_name, retry_workdir, params, profile,
+            mem_mb=65536, cpus=profile.get("cpus", 4),
+            solver_revision=solver_revision, library_revision=library_revision)
+        if new_tid is None:
+            record["outcome"] = "retry_submission_unknown"
+            submission_unknown.append(idx_str)
+            save_state(st)
+            continue
+        record.update({
+            "retry_id": new_tid,
+            "active_id": new_tid,
+            "attempt": 1,
+            "outcome": "pending",
+            "last_status": None,
+            "solver_git_revision": solver_revision,
+            "pyaedt_library_git_revision": library_revision,
+        })
+        st["task_map"][idx_str] = new_tid
+        retried += 1
+        # Persist the original and retry IDs before waiting on the retry.
+        save_state(st)
+
     if retried:
-        print(f"[al] {len(retried)} candidates retried at 64GB")
-        sc.wait_all([t for t in retried.values() if t], poll_s=180, timeout_s=5 * 3600)
-    n_done = sum(1 for tid in st["task_map"].values() if tid and sc.fetch_result_json(tid))
-    print(f"[al] wait done: {n_done}/{len(tids)} with data")
-    if n_done < 0.7 * len(tids):
-        print("[al] WARNING: <70% completion - 실패 태스크 로그 점검 필요")
+        print(f"[al] {retried} candidates retried at 64GB")
+    if submission_unknown:
+        st["verification_counts"] = dict(
+            round=st["round"], **_verification_counts(records))
+        st["stage"] = "WAIT"
+        save_state(st)
+        raise RuntimeError(
+            f"retry submissions have unknown task identity: {submission_unknown}"
+        )
+    if fetch_errors:
+        st["verification_counts"] = dict(
+            round=st["round"], **_verification_counts(records))
+        st["stage"] = "WAIT"
+        save_state(st)
+        raise RuntimeError(
+            f"scheduler stdout remained unavailable; no tasks were resubmitted: {fetch_errors}"
+        )
+
+    counts = _verification_counts(records)
+    st["verification_counts"] = dict(round=st["round"], **counts)
+    n_total = counts["total"]
+    n_done = counts["valid"]
+    n_exhausted = counts["exhausted"]
+    n_pending = counts["pending"]
+    print(f"[al] wait status: valid={n_done}/{n_total}, exhausted={n_exhausted}, pending={n_pending}")
+    if n_pending:
+        st["stage"] = "WAIT"
+        return
+    if n_total and n_done < 0.7 * n_total:
+        print("[al] WARNING: <70% valid completion - 실패 태스크 로그 점검 필요")
     st["stage"] = "INGEST"
 
 
@@ -171,47 +692,133 @@ def stage_ingest(st):
     front = pd.read_csv(os.path.join(rdir, "pareto_front.csv"))
     import scheduler_client as sc
 
+    records = _ensure_task_records(st)
+    solver_revision = st.get("solver_git_revision")
+    if not isinstance(solver_revision, str) or len(solver_revision) != 40:
+        raise RuntimeError("cannot ingest without the round's pinned solver revision")
+    library_revision = st.get("pyaedt_library_git_revision")
+    if not isinstance(library_revision, str) or len(library_revision) != 40:
+        raise RuntimeError("cannot ingest without the pinned pyaedt_library revision")
+    st["verification_counts"] = dict(
+        round=rnd, **_verification_counts(records))
     rows, errs = [], []
-    for idx_str, tid in st["task_map"].items():
-        if not tid:
+    for idx_str, record in records.items():
+        if record.get("outcome") == "exhausted":
             continue
-        res = sc.fetch_result_json(tid)
-        if not res:
-            continue
-        res["source"] = f"al_round_{rnd}"
-        res["sample_weight"] = 3.0
-        rows.append(res)
+        res = record.get("result")
+        if res is None:
+            tid = record.get("active_id")
+            if tid is None:
+                st["stage"] = "WAIT"
+                return
+            try:
+                expected_revision = record.get("solver_git_revision") or solver_revision
+                expected_library = (
+                    record.get("pyaedt_library_git_revision") or library_revision)
+                fetched = sc.fetch_result(
+                    tid, expected_revision=expected_revision,
+                    expected_library_revision=expected_library)
+            except sc.ResultFetchError as exc:
+                record["outcome"] = "fetch_error"
+                record["fetch_error"] = str(exc)
+                st["stage"] = "INGEST"
+                save_state(st)
+                raise RuntimeError(
+                    f"cannot ingest task {tid}: scheduler stdout unavailable"
+                ) from exc
+            if fetched.state != sc.RESULT_VALID:
+                record["last_result_state"] = fetched.state
+                record["outcome"] = "pending"
+                st["stage"] = "WAIT"
+                save_state(st)
+                return
+            res = fetched.result
+            record["result"] = res
+            record["outcome"] = "valid"
+            save_state(st)
+        expected_revision = record.get("solver_git_revision") or solver_revision
+        expected_library = (
+            record.get("pyaedt_library_git_revision") or library_revision)
+        if not sc.is_valid_result(
+                res, expected_revision=expected_revision,
+                expected_library_revision=expected_library):
+            record["outcome"] = "pending"
+            record["result"] = None
+            st["stage"] = "WAIT"
+            save_state(st)
+            return
+        tid = record.get("active_id")
+        row_result = dict(res)
+        row_result["source"] = f"al_round_{rnd}"
+        row_result["sample_weight"] = 3.0
+        row_result["task_id"] = tid
+        rows.append(row_result)
         i = int(idx_str)
         pred = front.iloc[i]
-        llt_fea = 2.0 * float(res.get("Llt", np.nan))  # 대칭 -> 실물
+        llt_fea = _physical_llt(res)
+        llt_pred = float(pred["pred_Llt_phys"]) if _finite(pred.get("pred_Llt_phys")) else np.nan
         err = {
             "idx": i, "task_id": tid,
-            "llt_pred": float(pred["pred_Llt_phys"]), "llt_fea": llt_fea,
-            "dllt_pct": abs(float(pred["pred_Llt_phys"]) - llt_fea) / SPEC["Llt_target_uH"] * 100,
+            "llt_pred": llt_pred, "llt_fea": llt_fea,
+            "dllt_pct": (abs(llt_pred - llt_fea) / SPEC["Llt_target_uH"] * 100
+                           if _finite(llt_pred) else np.nan),
+            "B_fea": float(res["B_max_core"]),
+            "spec_pass": int(_result_passes_spec(res)),
         }
-        for t in T_TARGETS:
-            if f"pred_{t}" in pred and t in res and pd.notna(res.get(t)):
-                err[f"d_{t}"] = abs(float(pred[f"pred_{t}"]) - float(res[t]))
+        predicted_losses = [pred.get(f"pred_{key}", np.nan) for key in LOSS_COMPONENTS]
+        fea_losses = [res.get(key, np.nan) for key in LOSS_COMPONENTS]
+        loss_pred = sum(float(value) for value in predicted_losses) \
+            if all(_finite(value) for value in predicted_losses) else np.nan
+        loss_fea = sum(float(value) for value in fea_losses) \
+            if all(_finite(value) for value in fea_losses) else np.nan
+        err["loss_pred_W"] = loss_pred
+        err["loss_fea_W"] = loss_fea
+        err["dloss_pct"] = (
+            abs(loss_pred - loss_fea) / max(abs(loss_fea), 1e-9) * 100
+            if _finite(loss_pred) and _finite(loss_fea) else np.nan
+        )
+        expected_targets = _required_probe_targets(res)
+        err["temperature_error_expected_count"] = len(expected_targets)
+        for target in expected_targets:
+            prediction = pred.get(f"pred_{target}", np.nan)
+            err[f"d_{target}"] = (
+                abs(float(prediction) - float(res[target]))
+                if _finite(prediction) and _finite(res.get(target)) else np.nan
+            )
+            err[f"fea_{ACTUAL_TEMPERATURES[target]}"] = float(
+                res[ACTUAL_TEMPERATURES[target]])
+        err["temperature_error_complete"] = int(all(
+            _finite(err.get(f"d_{target}")) for target in expected_targets))
         errs.append(err)
 
     if rows:
         new = pd.DataFrame(rows)
-        if os.path.isfile(DATASET):
-            old = pd.read_parquet(DATASET)
-            allf = pd.concat([old, new], ignore_index=True, sort=False)
-        else:
-            allf = new
-        allf.to_parquet(DATASET, index=False)
-        # 검증된 X 축적 (선정 중복 방지)
-        X = np.load(os.path.join(rdir, "pareto_X.npy"))
-        v_new = X[[e["idx"] for e in errs]]
-        vx_path = os.path.join(HERE, "al_rounds", "verified_X.npy")
-        v_all = np.vstack([np.load(vx_path), v_new]) if os.path.isfile(vx_path) else v_new
-        np.save(vx_path, v_all)
+        # The campaign collector uses this exact lock. Re-read under the lock,
+        # deduplicate replayed AL rows, then atomically replace the master file.
+        os.makedirs(os.path.dirname(DATASET), exist_ok=True)
+        with FileLock(DATASET + ".lock", timeout=120):
+            old = pd.read_parquet(DATASET) if os.path.isfile(DATASET) else None
+            source_rank_path = os.path.join(
+                os.path.dirname(DATASET), "source_ranks.parquet")
+            old_ranks = (pd.read_parquet(source_rank_path)
+                         if os.path.isfile(source_rank_path) else None)
+            allf, source_ranks = _merge_ranked_dataset(old, new, old_ranks)
+            _install_dataset_transaction(allf, source_ranks, source_rank_path)
+
+            # Verified X is also replay-safe. A crash between files is repaired
+            # by re-entering INGEST without duplicating either artifact.
+            X = np.load(os.path.join(rdir, "pareto_X.npy"))
+            v_new = X[[e["idx"] for e in errs]]
+            vx_path = os.path.join(HERE, "al_rounds", "verified_X.npy")
+            v_all = np.vstack([np.load(vx_path), v_new]) if os.path.isfile(vx_path) else v_new
+            _atomic_save_npy(_unique_rows(v_all), vx_path)
 
     err_df = pd.DataFrame(errs)
-    err_df.to_csv(os.path.join(rdir, "verification_errors.csv"), index=False)
+    _atomic_write_csv(err_df, os.path.join(rdir, "verification_errors.csv"))
     st["last_errs"] = err_df.to_dict("list") if len(err_df) else {}
+    counts = _verification_counts(records)
+    counts["ingested"] = len(rows)
+    st["verification_counts"] = dict(round=rnd, **counts)
     print(f"[al] ingested {len(rows)} verified rows")
     st["stage"] = "CHECK"
 
@@ -220,43 +827,109 @@ def stage_check(st):
     rnd = st["round"]
     errs = st.get("last_errs") or {}
     hist = {"round": rnd, "time": datetime.now().isoformat(timespec="seconds")}
+    verification = st.get("verification_counts") or {}
+    verification_total = int(verification.get("total") or 0)
+    verification_valid = int(verification.get("valid") or 0)
+    verification_exhausted = int(verification.get("exhausted") or 0)
+    verification_pending = int(verification.get("pending") or 0)
+    verification_ingested = int(verification.get("ingested") or 0)
+    verification_coverage = (
+        verification_valid / verification_total if verification_total else 0.0)
+    verification_coverage_ok = bool(
+        verification.get("round") == rnd
+        and verification_total >= SPEC["K"]
+        and verification_pending == 0
+        and verification_coverage >= SPEC["verification_min_coverage"])
+    hist.update({
+        "verification_total": verification_total,
+        "verification_valid": verification_valid,
+        "verification_exhausted": verification_exhausted,
+        "verification_ingested": verification_ingested,
+        "verification_coverage": verification_coverage,
+        "verification_coverage_ok": verification_coverage_ok,
+    })
 
     ok_specs = 0
     agree = False
     if errs and errs.get("dllt_pct"):
         d = np.array(errs["dllt_pct"], dtype=float)
-        hist["dllt_med_pct"] = float(np.median(d))
-        hist["dllt_max_pct"] = float(np.max(d))
+        verification_rows_complete = bool(
+            len(d) == verification_valid == verification_ingested)
+        hist["verification_rows_complete"] = verification_rows_complete
+        d_finite = d[np.isfinite(d)]
+        d_complete = len(d_finite) == len(d) and len(d) > 0
+        hist["dllt_med_pct"] = float(np.median(d_finite)) if len(d_finite) else None
+        hist["dllt_max_pct"] = float(np.max(d_finite)) if len(d_finite) else None
         t_cols = [k for k in errs if k.startswith("d_Tprobe")]
         dT = np.array([v for k in t_cols for v in errs[k]], dtype=float) if t_cols else np.array([])
+        dT = dT[np.isfinite(dT)]
+        expected_counts = np.array(
+            errs.get("temperature_error_expected_count", []), dtype=float)
+        expected_total = int(expected_counts.sum()) if (
+            len(expected_counts) == len(d) and np.isfinite(expected_counts).all()) else 0
+        coverage_flags = np.array(
+            errs.get("temperature_error_complete", []), dtype=float)
+        rows_complete = bool(
+            len(coverage_flags) == len(d)
+            and np.isfinite(coverage_flags).all()
+            and (coverage_flags == 1).all())
+        hist["temperature_error_count"] = int(len(dT))
+        hist["temperature_error_expected_count"] = expected_total
+        hist["temperature_error_coverage_complete"] = bool(
+            rows_complete and expected_total > 0 and len(dT) == expected_total)
         hist["dT_med"] = float(np.median(dT)) if len(dT) else None
         hist["dT_max"] = float(np.max(dT)) if len(dT) else None
 
-        agree = (hist["dllt_med_pct"] <= SPEC["agree_llt_med_pct"]
-                 and hist["dllt_max_pct"] <= SPEC["agree_llt_max_pct"]
-                 and (hist["dT_med"] is None or hist["dT_med"] <= SPEC["agree_T_med_C"])
-                 and (hist["dT_max"] is None or hist["dT_max"] <= SPEC["agree_T_max_C"]))
+        dloss = np.array(errs.get("dloss_pct", []), dtype=float)
+        dloss_finite = dloss[np.isfinite(dloss)]
+        loss_complete = len(dloss) == len(d) and len(dloss_finite) == len(d)
+        hist["loss_error_count"] = int(len(dloss_finite))
+        hist["loss_error_expected_count"] = int(len(d))
+        hist["loss_error_coverage_complete"] = bool(loss_complete)
+        hist["dP_med_pct"] = (
+            float(np.median(dloss_finite)) if len(dloss_finite) else None)
+        hist["dP_max_pct"] = (
+            float(np.max(dloss_finite)) if len(dloss_finite) else None)
 
-        # 실측 스펙 통과 후보 수 (FEA 기준)
+        agree = (d_complete
+                 and verification_rows_complete
+                 and hist["dllt_med_pct"] <= SPEC["agree_llt_med_pct"]
+                 and hist["dllt_max_pct"] <= SPEC["agree_llt_max_pct"]
+                 and hist["temperature_error_coverage_complete"]
+                 and hist["dT_med"] <= SPEC["agree_T_med_C"]
+                 and hist["dT_max"] <= SPEC["agree_T_max_C"]
+                 and loss_complete
+                 and hist["dP_med_pct"] <= SPEC["agree_P_med_pct"]
+                 and hist["dP_max_pct"] <= SPEC["agree_P_max_pct"])
+
+        # 실측 스펙 통과 후보 수: 동일 후보가 Llt, 모든 적용 온도, B를
+        # 동시에 통과해야 한 건으로 센다.
         llt_fea = np.array(errs["llt_fea"], dtype=float)
         band = np.abs(llt_fea - SPEC["Llt_target_uH"]) <= SPEC["Llt_tol_uH"]
-        ok_specs = int(band.sum())
-        hist["fea_llt_pass"] = ok_specs
+        hist["fea_llt_pass"] = int(band.sum())
+        spec_flags = np.array(errs.get("spec_pass", []), dtype=float)
+        if len(spec_flags) == len(d) and np.isfinite(spec_flags).all():
+            ok_specs = int((spec_flags == 1).sum())
+        hist["fea_full_spec_pass"] = ok_specs
 
         # 예측통과/실측탈락 발생 시 q 조임
-        miss = (~band).sum()
+        miss = len(d) - ok_specs
         if miss > 0:
             st["q_mult"] = min(st.get("q_mult", 1.0) * 1.25, 3.0)
-        elif hist["dllt_max_pct"] < 0.5 * SPEC["agree_llt_max_pct"]:
+        elif hist["dllt_max_pct"] is not None and hist["dllt_max_pct"] < 0.5 * SPEC["agree_llt_max_pct"]:
             st["q_mult"] = max(st.get("q_mult", 1.0) * 0.9, 1.0)
         hist["q_mult"] = st["q_mult"]
 
     st.setdefault("history", []).append(hist)
     print(f"[al] round {rnd} check: {hist}")
 
-    if (agree and ok_specs >= 3) or rnd >= SPEC["max_rounds"]:
+    if agree and ok_specs >= 3 and verification_coverage_ok:
         st["stage"] = "DONE"
-        print("[al] LOOP CONVERGED" if agree else "[al] hard cap reached")
+        print("[al] LOOP CONVERGED")
+    elif rnd >= SPEC["max_rounds"]:
+        # A compute budget cap is terminal, but it is not a verified design.
+        st["stage"] = "HARD_CAP"
+        print("[al] hard cap reached without convergence")
     else:
         st["round"] = rnd + 1
         st["stage"] = "TRAIN"
@@ -277,8 +950,8 @@ def main():
         os.remove(STATE_PATH)
     st = load_state()
     for _ in range(args.max_stages):
-        if st["stage"] == "DONE":
-            print("[al] done. history:")
+        if st["stage"] in ("DONE", "HARD_CAP"):
+            print(f"[al] {st['stage'].lower()}. history:")
             for h in st["history"]:
                 print("  ", h)
             break

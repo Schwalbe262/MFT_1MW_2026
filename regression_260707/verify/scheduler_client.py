@@ -1,9 +1,14 @@
 """
 AL 검증용 스케줄러 클라이언트: 후보 params JSON -> 태스크 제출 -> RESULT_JSON 회수.
 """
+import hashlib
 import json
+import math
+import re
 import shlex
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 import requests
 
@@ -12,41 +17,190 @@ BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
         "module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; "
         "export FLEXLM_TIMEOUT=3000000; sleep $((RANDOM % 60)); ")
 
+RESULT_VALID = "valid"
+RESULT_INVALID = "invalid"
+RESULT_MISSING = "missing"
+MAX_STDOUT_BYTES = 1_048_576
+_STANDARD_PROFILE = json.loads(
+    (Path(__file__).resolve().parent / "profiles" / "standard.json").read_text(
+        encoding="utf-8"))
+STANDARD_PROFILE_CONTRACT = dict(_STANDARD_PROFILE["param_overrides"])
+DEFAULT_TASK_TIMEOUT_SECONDS = int(_STANDARD_PROFILE["timeout_seconds"])
 
-def submit_verification(name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4):
+MANDATORY_TEMPERATURE_COLUMNS = (
+    "T_max_Tx",
+    "T_max_Rx_main",
+    "T_max_core",
+    "Tprobe_Tx_leeward_max",
+    "Tprobe_Rx_main_leeward_max",
+    "Tprobe_core_center_max",
+)
+SIDE_TEMPERATURE_COLUMNS = (
+    "T_max_Rx_side",
+    "Tprobe_Rx_side_leeward_max",
+)
+
+
+class ResultFetchError(RuntimeError):
+    """The scheduler stdout could not be read reliably."""
+
+
+class TaskLookupError(RuntimeError):
+    """The scheduler task inventory could not be reconciled reliably."""
+
+
+class TaskSubmissionUncertain(RuntimeError):
+    """A POST may have succeeded, but its durable task ID is not known yet."""
+
+
+@dataclass(frozen=True)
+class ResultFetch:
+    state: str
+    result: dict | None = None
+
+
+def reconcile_task_id(name, dedupe_key, attempts=3, retry_delay=1):
+    """Find the newest exact task identity, including terminal tasks."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                f"{SCHEDULER}/api/tasks",
+                params={"limit": 10000, "name_prefix": name},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            tasks = payload if isinstance(payload, list) else payload.get("tasks", [])
+            if not isinstance(tasks, list):
+                raise ValueError("task inventory is not a list")
+            matches = [
+                task for task in tasks
+                if task.get("name") == name and task.get("dedupe_key") == dedupe_key
+            ]
+            if not matches:
+                return None
+            return max(int(task["id"]) for task in matches)
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                time.sleep(retry_delay)
+    raise TaskLookupError(
+        f"failed to reconcile task {name!r} after {attempts} attempts: {last_error}"
+    ) from last_error
+
+
+def submit_verification(
+        name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
+        solver_revision=None, library_revision=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
+    if not isinstance(solver_revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", solver_revision):
+        raise ValueError("solver_revision must be a full 40-character git SHA")
+    solver_revision = solver_revision.lower()
+    if not isinstance(library_revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", library_revision):
+        raise ValueError("library_revision must be a full 40-character git SHA")
+    library_revision = library_revision.lower()
     merged = dict(params)
     merged.update(profile.get("param_overrides", {}))
+    timeout_seconds = int(profile.get(
+        "timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS))
+    if timeout_seconds <= 0:
+        raise ValueError("verification timeout_seconds must be positive")
     pjson = json.dumps(merged, separators=(",", ":"))
+    parameter_digest = hashlib.sha256(pjson.encode("utf-8")).hexdigest()[:16]
+    dedupe_key = (
+        f"mft-al:{name}:{solver_revision}:{library_revision}:{parameter_digest}")
     extra = profile.get("cli_flags", "")
-    lib_clone = ("([ -d pyaedt_library/src ] || { git clone -q --depth 1 "
-                 "https://github.com/Schwalbe262/pyaedt_library.git pyaedt_library.tmp.$$ "
-                 "&& { mv -T pyaedt_library.tmp.$$ pyaedt_library 2>/dev/null || rm -rf pyaedt_library.tmp.$$; }; }) && "
-                 "[ -d pyaedt_library/src ] && ")
-    cmd = (BASE + lib_clone +
-           f"([ -d {workdir} ] || git clone -q --depth 1 https://github.com/Schwalbe262/MFT_1MW_2026.git {workdir}) && "
-           f"cd {workdir} && git pull -q && "
-           f"rm -rf simulation aedt_temp 2>/dev/null; "
-           f"printf '%s' {shlex.quote(pjson)} > cand.json && "
-           f"python run_simulation_260706.py --fixed {extra} --params cand.json; "
-           f"rm -rf simulation aedt_temp 2>/dev/null; true")  # 솔루션만 정리 (클론 재사용)
-    r = requests.post(f"{SCHEDULER}/tasks", data={
+    run_identity = (
+        f"s{solver_revision[:12]}-l{library_revision[:12]}-p{parameter_digest}")
+    isolated_workdir = f"{workdir}-{run_identity}"
+    quoted_workdir = shlex.quote(isolated_workdir)
+    repo_dir = f"{isolated_workdir}/repo"
+    library_dir = f"{isolated_workdir}/pyaedt_library"
+    quoted_repo = shlex.quote(repo_dir)
+    quoted_library = shlex.quote(library_dir)
+    cleanup_workdir = shlex.quote(isolated_workdir)
+    lib_clone = (f"([ -d {quoted_library}/.git ] || {{ [ ! -e {quoted_library} ] && "
+                 "git clone -q --depth 1 "
+                 f"https://github.com/Schwalbe262/pyaedt_library.git {quoted_library}.tmp.$$ "
+                  f"&& {{ mv -T {quoted_library}.tmp.$$ {quoted_library} 2>/dev/null "
+                  f"|| rm -rf {quoted_library}.tmp.$$; }}; }}) && "
+                  f"git -C {quoted_library} fetch -q origin {library_revision} && "
+                  f"git -C {quoted_library} checkout -q --detach {library_revision} && "
+                  f"git -C {quoted_library} diff --quiet HEAD -- && "
+                  f"git -C {quoted_library} clean -q -ffd && "
+                  f"git -C {quoted_library} clean -q -ffdX && "
+                  f"test -z \"$(git -C {quoted_library} status --porcelain --untracked-files=all)\" && "
+                  f"test \"$(git -C {quoted_library} rev-parse HEAD)\" = \"{library_revision}\" && "
+                  f"[ -d {quoted_library}/src ] && "
+                  f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n' && ")
+    run_group = (
+        f"mkdir -p {quoted_workdir} && "
+        + lib_clone
+        + f"([ -d {quoted_repo}/.git ] || git clone -q --depth 1 "
+          f"https://github.com/Schwalbe262/MFT_1MW_2026.git {quoted_repo}) && "
+        + f"cd {quoted_repo} && git fetch -q origin {solver_revision} && "
+        + f"git checkout -q --detach {solver_revision} && "
+        + "git diff --quiet HEAD -- && git clean -q -ffd && git clean -q -ffdX && "
+        + "test -z \"$(git status --porcelain --untracked-files=all)\" && "
+        + f"test \"$(git rev-parse HEAD)\" = \"{solver_revision}\" && "
+        + f"printf '%s' {shlex.quote(pjson)} > cand.json && "
+        + f"python run_simulation_260706.py --fixed {extra} --params cand.json; "
+        + "simulation_rc=$?; "
+        + f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n'; "
+        + "exit $simulation_rc"
+    )
+    # Setup and simulation are one fail-fast subshell. The parent remains in the
+    # scheduler workspace, so unconditional cleanup can target only this clone.
+    cmd = (
+        BASE
+        + f"( cleanup() {{ rm -rf -- {cleanup_workdir} 2>/dev/null; }}; "
+        + "trap cleanup EXIT; trap 'exit 143' TERM INT; "
+        + run_group
+        + " )"
+    )
+    payload = {
         "name": name, "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__",
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
         "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
-    }, allow_redirects=False, timeout=20)
-    if r.status_code not in (200, 201, 303):
-        return None
-    # 방금 제출한 태스크 ID 확인 (이름으로 역조회)
-    time.sleep(1)
+        "timeout_seconds": timeout_seconds,
+        "dedupe_key": dedupe_key,
+    }
+    existing = reconcile_task_id(name, dedupe_key)
+    if existing is not None:
+        return existing
     try:
-        t = requests.get(f"{SCHEDULER}/api/tasks", params={"limit": 50}, timeout=15).json()
-        for x in (t if isinstance(t, list) else t.get("tasks", [])):
-            if x.get("name") == name:
-                return x["id"]
+        r = requests.post(f"{SCHEDULER}/api/tasks", json=payload, timeout=20)
+    except Exception as post_error:
+        try:
+            recovered = reconcile_task_id(name, dedupe_key)
+        except TaskLookupError as lookup_error:
+            raise TaskSubmissionUncertain(
+                f"POST response and reconciliation were both unavailable for {name!r}"
+            ) from lookup_error
+        if recovered is not None:
+            return recovered
+        raise TaskSubmissionUncertain(
+            f"POST response was lost and no durable task is visible yet for {name!r}"
+        ) from post_error
+    if r.status_code not in (200, 201):
+        recovered = reconcile_task_id(name, dedupe_key)
+        if recovered is not None:
+            return recovered
+        return None
+    try:
+        response_payload = r.json()
+        task_id = response_payload.get("task_id") or response_payload.get("id")
+        if task_id is not None:
+            return int(task_id)
     except Exception:
         pass
-    return None
+    recovered = reconcile_task_id(name, dedupe_key)
+    if recovered is not None:
+        return recovered
+    raise TaskSubmissionUncertain(
+        f"scheduler accepted {name!r} without returning or exposing its task ID"
+    )
 
 
 def get_status(task_id):
@@ -63,19 +217,175 @@ def cancel(task_id):
         pass
 
 
-def fetch_result_json(task_id):
-    """stdout의 RESULT_JSON 라인 파싱 -> dict 또는 None"""
+def _finite(result, key):
     try:
-        out = requests.get(f"{SCHEDULER}/api/tasks/{task_id}/stdout", timeout=30).text
-    except Exception:
-        return None
-    for line in reversed(out.splitlines()):
-        if line.startswith("RESULT_JSON "):
+        return math.isfinite(float(result[key]))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def required_temperature_columns(result):
+    """Return all physical/probe temperatures required by this candidate."""
+    columns = list(MANDATORY_TEMPERATURE_COLUMNS)
+    try:
+        if float(result["N2_side"]) > 0:
+            columns.extend(SIDE_TEMPERATURE_COLUMNS)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return ()
+    return tuple(columns)
+
+
+def is_valid_result(
+        result, expected_revision=None, expected_library_revision=None,
+        expected_profile=None):
+    """Return whether a row is complete enough for AL verification ingestion."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("result_valid_em") != 1 or result.get("result_valid_thermal") != 1:
+        return False
+    if result.get("thermal_solved") != 1 or result.get("thermal_extraction_complete") != 1:
+        return False
+    if result.get("thermal_required_missing_count") != 0:
+        return False
+    profile_contract = dict(
+        STANDARD_PROFILE_CONTRACT if expected_profile is None else expected_profile)
+    numeric_fields = (
+        "Llt", "B_max_core", "full_model", "N2_side",
+        "git_dirty", "pyaedt_library_git_dirty",
+        "matrix_solve_attempts", "loss_solve_attempts",
+        "conv_error_pct_matrix", "conv_error_pct_loss",
+        "P_winding_total", "P_core_total", "P_core_plate_total",
+    ) + tuple(
+        key for key, value in profile_contract.items()
+        if not isinstance(value, str)
+    )
+    if not all(_finite(result, key) for key in numeric_fields):
+        return False
+    if (float(result["Llt"]) <= 0
+            or float(result["B_max_core"]) < 0
+            or float(result["N2_side"]) < 0
+            or float(result["git_dirty"]) != 0.0
+            or float(result["pyaedt_library_git_dirty"]) != 0.0
+            or float(result["matrix_solve_attempts"]) != 1.0
+            or float(result["loss_solve_attempts"]) != 1.0
+            or float(result["full_model"]) != 0.0):
+        return False
+    if result.get("matrix_extraction_backend") != "export_rl_matrix":
+        return False
+    for key, expected_value in profile_contract.items():
+        actual_value = result.get(key)
+        if isinstance(expected_value, str):
+            if str(actual_value or "").strip().lower() != expected_value.lower():
+                return False
+        else:
             try:
-                return json.loads(line[len("RESULT_JSON "):])
-            except Exception:
-                return None
-    return None
+                if not math.isclose(
+                        float(actual_value), float(expected_value),
+                        rel_tol=1e-12, abs_tol=1e-12):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return False
+    if not all(0 <= float(result[key]) <= 1.5 for key in (
+            "conv_error_pct_matrix", "conv_error_pct_loss")):
+        return False
+    if not all(float(result[key]) >= 0 for key in (
+            "P_winding_total", "P_core_total", "P_core_plate_total")):
+        return False
+    git_hash = str(result.get("git_hash") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", git_hash):
+        return False
+    if expected_revision is not None:
+        expected = str(expected_revision).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", expected) or expected != git_hash:
+            return False
+    library_hash = str(result.get("pyaedt_library_git_hash") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", library_hash):
+        return False
+    if expected_library_revision is not None:
+        expected_library = str(expected_library_revision).strip().lower()
+        if (not re.fullmatch(r"[0-9a-f]{40}", expected_library)
+                or library_hash != expected_library):
+            return False
+    if not str(result.get("project_name") or "").strip() or not str(result.get("saved_at") or "").strip():
+        return False
+    try:
+        expected_mask = 15 if float(result["N2_side"]) > 0 else 11
+        if int(float(result["thermal_required_group_mask"])) != expected_mask:
+            return False
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    temperatures = required_temperature_columns(result)
+    return bool(temperatures) and all(_finite(result, key) for key in temperatures)
+
+
+def fetch_result(
+        task_id, attempts=3, retry_delay=2, expected_revision=None,
+        expected_library_revision=None):
+    """Return the latest well-formed RESULT_JSON and its validity state.
+
+    Transport failures raise ResultFetchError. A successful stdout read with no
+    JSON row is RESULT_MISSING, while a well-formed but incomplete row is
+    RESULT_INVALID. Only the latest well-formed row is authoritative.
+    """
+    out = None
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                f"{SCHEDULER}/api/tasks/{task_id}/stdout",
+                params={"max_bytes": MAX_STDOUT_BYTES}, timeout=30)
+            response.raise_for_status()
+            out = response.text
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                time.sleep(retry_delay)
+    if out is None:
+        raise ResultFetchError(
+            f"failed to fetch stdout for task {task_id} after {attempts} attempts: {last_error}"
+        ) from last_error
+
+    library_hash = None
+    for line in reversed(out.splitlines()):
+        if line.startswith("MFT_LIBRARY_GIT_HASH "):
+            candidate = line[len("MFT_LIBRARY_GIT_HASH "):].strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", candidate):
+                library_hash = candidate
+                break
+    if expected_library_revision is not None:
+        expected_library = str(expected_library_revision).strip().lower()
+        if (not re.fullmatch(r"[0-9a-f]{40}", expected_library)
+                or library_hash != expected_library):
+            return ResultFetch(RESULT_INVALID)
+
+    for line in reversed(out.splitlines()):
+        if not line.startswith("RESULT_JSON "):
+            continue
+        try:
+            result = json.loads(line[len("RESULT_JSON "):])
+        except Exception:
+            continue
+        if isinstance(result, dict) and library_hash:
+            result_library_hash = str(
+                result.get("pyaedt_library_git_hash") or "").strip().lower()
+            if result_library_hash != library_hash:
+                return ResultFetch(RESULT_INVALID, result)
+        if is_valid_result(
+                result, expected_revision=expected_revision,
+                expected_library_revision=expected_library_revision):
+            return ResultFetch(RESULT_VALID, result)
+        return ResultFetch(RESULT_INVALID, result if isinstance(result, dict) else None)
+    return ResultFetch(RESULT_MISSING)
+
+
+def fetch_result_json(task_id):
+    """Compatibility wrapper returning only a valid verification row."""
+    try:
+        fetched = fetch_result(task_id)
+    except ResultFetchError:
+        return None
+    return fetched.result if fetched.state == RESULT_VALID else None
 
 
 def wait_all(task_ids, poll_s=120, timeout_s=6 * 3600, on_progress=None):

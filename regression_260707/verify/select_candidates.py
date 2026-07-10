@@ -114,4 +114,27 @@ def select(X_unit, F, G, sigma_norm_total, incumbent_X=None,
         if not_dup(i):
             picked.append(int(i))
 
+    # Reserve one slot so the documented AL batch size is K=33. Diversity
+    # thresholds above are preferences; they must not silently shrink the
+    # verification evidence below the round contract.
+    target = min(n, k_exploit + k_boundary + k_explore + 1)
+    eligible = []
+    for i in range(n):
+        if i in picked:
+            continue
+        if verified_X is not None and len(verified_X):
+            if np.min(np.linalg.norm(verified_X - X_unit[i], axis=1)) < 0.02:
+                continue
+        eligible.append(i)
+    while len(picked) < target and eligible:
+        if picked:
+            distances = [
+                min(np.linalg.norm(X_unit[i] - X_unit[j]) for j in picked)
+                for i in eligible
+            ]
+            best_position = int(np.argmax(distances))
+        else:
+            best_position = int(np.argmax([sigma_norm_total[i] for i in eligible]))
+        picked.append(int(eligible.pop(best_position)))
+
     return picked

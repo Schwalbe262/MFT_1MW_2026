@@ -14,6 +14,7 @@ sys.path.insert(0, str(CAMPAIGN_DIR))
 
 import collect_wave  # noqa: E402
 import feeder  # noqa: E402
+import pinned_pilot  # noqa: E402
 
 
 class FakeResponse:
@@ -28,6 +29,35 @@ class FakeResponse:
 
 
 class FeederTests(unittest.TestCase):
+    def test_unjudged_terminal_and_legacy_active_outputs_remain_reserved(self):
+        state = {
+            "outstanding": [3, 4],
+            "task_expected_rows": {"4": 1},
+        }
+        tasks = [
+            {"id": 1, "name": "mft-camp-c-legacy", "status": "running"},
+            {"id": 2, "name": "mft-camp-sabc-ldef-2", "status": "completed"},
+            {"id": 3, "name": "mft-camp-sabc-ldef-3", "status": "completed"},
+        ]
+
+        reserved = feeder.reserved_unjudged_rows(state, tasks, judged_ids={3})
+
+        self.assertEqual(reserved, 10)  # legacy 8 + completed 1 + ledger-only 1
+
+    def test_pinned_pilot_capacity_counts_global_tasks_and_warm_cpus(self):
+        statuses = {"queued": 8, "attaching": 1, "running": 142}
+        allocations = [
+            {"state": "active", "resource_pool": "cpu", "total_cpus": 400, "free_cpus": 400},
+            {"state": "warm", "resource_pool": "cpu", "total_cpus": 400, "free_cpus": 400},
+        ]
+
+        snapshot = pinned_pilot.calculate_submission_headroom(
+            statuses, allocations, ready_fit_slots=24)
+
+        self.assertEqual(snapshot["global_active"], 151)
+        self.assertEqual(snapshot["total_slots"], 170)
+        self.assertEqual(snapshot["headroom"], 19)
+
     def test_refill_uses_scheduler_truth_and_cpu_cap_not_ledger(self):
         state = {
             "serial": 100,
@@ -51,22 +81,33 @@ class FeederTests(unittest.TestCase):
         ]
 
         with mock.patch.object(feeder, "load_state", return_value=state), mock.patch.object(
-            feeder, "scheduler_snapshot", return_value=(counts, allocations)
+            feeder, "scheduler_snapshot", return_value=(counts, counts, allocations, 100)
         ), mock.patch.object(
-            feeder, "submit", side_effect=[901, 902, 903, 904, 905]
+            feeder, "dataset_row_count", return_value=0
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(0, set(range(500)))
+        ), mock.patch.object(
+            feeder, "campaign_inventory", return_value=[]
+        ), mock.patch.object(
+            feeder, "cursor_after_valid_candidates", return_value=0
+        ), mock.patch.object(
+            feeder, "next_valid_candidate", return_value=(1, 0, {"candidate": 1})
+        ), mock.patch.object(
+            feeder, "submit", side_effect=[901, 902, 903, 904, 905, 906]
         ) as submit_mock, mock.patch.object(
             feeder, "save_state"
         ) as save_mock, mock.patch.object(
             feeder.time, "sleep"
         ):
-            self.assertTrue(feeder.step(1000, target=130, buffer=40))
+            self.assertTrue(feeder.step(
+                1000, target=130, buffer=40,
+                solver_revision="a" * 40, library_revision="b" * 40))
 
-        # total cap=13, availability cap=(2 running + 1 attaching)+6=9;
-        # scheduler active=4, so exactly five tasks may be admitted.
-        self.assertEqual(submit_mock.call_count, 5)
-        self.assertEqual(state["serial"], 105)
-        self.assertEqual(state["submitted_samples"], 40)
-        self.assertEqual(save_mock.call_count, 5)
+        # free_cpus/4*0.85 is the only admitted new concurrency budget.
+        self.assertEqual(submit_mock.call_count, 6)
+        self.assertEqual(state["serial"], 106)
+        self.assertEqual(state["submitted_samples"], 6)
+        self.assertEqual(save_mock.call_count, 6)
 
     def test_target_plus_buffer_is_an_absolute_hard_cap(self):
         counts = {"queued": 2, "attaching": 0, "running": 0}
@@ -83,7 +124,17 @@ class FeederTests(unittest.TestCase):
             "load_state",
             return_value={"serial": 0, "submitted_samples": 0},
         ), mock.patch.object(
-            feeder, "scheduler_snapshot", return_value=(counts, allocations)
+            feeder, "scheduler_snapshot", return_value=(counts, counts, allocations, 100)
+        ), mock.patch.object(
+            feeder, "dataset_row_count", return_value=0
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(0, set())
+        ), mock.patch.object(
+            feeder, "campaign_inventory", return_value=[]
+        ), mock.patch.object(
+            feeder, "cursor_after_valid_candidates", return_value=0
+        ), mock.patch.object(
+            feeder, "next_valid_candidate", return_value=(1, 0, {"candidate": 1})
         ), mock.patch.object(
             feeder, "submit", return_value=42
         ) as submit_mock, mock.patch.object(
@@ -91,8 +142,66 @@ class FeederTests(unittest.TestCase):
         ), mock.patch.object(
             feeder.time, "sleep"
         ):
-            feeder.step(1000, target=2, buffer=1)
+            feeder.step(
+                1000, target=2, buffer=1,
+                solver_revision="a" * 40, library_revision="b" * 40)
         self.assertEqual(submit_mock.call_count, 1)
+
+    def test_dataset_rows_not_submission_ledger_bound_total(self):
+        state = {"serial": 10, "submitted_samples": 12000}
+        counts = {"queued": 0, "attaching": 0, "running": 0}
+        allocations = [{
+            "state": "active", "resource_pool": "cpu",
+            "total_cpus": 64, "free_cpus": 64,
+        }]
+        with mock.patch.object(feeder, "load_state", return_value=state), mock.patch.object(
+            feeder, "scheduler_snapshot", return_value=(counts, counts, allocations, 20)
+        ), mock.patch.object(
+            feeder, "dataset_row_count", return_value=998
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(998, set())
+        ), mock.patch.object(
+            feeder, "campaign_inventory", return_value=[]
+        ), mock.patch.object(
+            feeder, "cursor_after_valid_candidates", return_value=0
+        ), mock.patch.object(
+            feeder, "next_valid_candidate", return_value=(1, 0, {"candidate": 1})
+        ), mock.patch.object(
+            feeder, "submit", side_effect=[901, 902]
+        ) as submit_mock, mock.patch.object(
+            feeder, "save_state"
+        ), mock.patch.object(feeder.time, "sleep"):
+            self.assertTrue(feeder.step(
+                1000, target=10, buffer=0,
+                solver_revision="a" * 40, library_revision="b" * 40))
+
+        self.assertEqual(submit_mock.call_count, 2)
+
+    def test_active_tasks_reserve_projected_dataset_rows(self):
+        counts = {"queued": 1, "attaching": 0, "running": 1}
+        allocations = [{
+            "state": "active", "resource_pool": "cpu",
+            "total_cpus": 64, "free_cpus": 64,
+        }]
+        with mock.patch.object(
+            feeder, "load_state", return_value={"serial": 0, "submitted_samples": 0}
+        ), mock.patch.object(
+            feeder, "scheduler_snapshot", return_value=(counts, counts, allocations, 20)
+        ), mock.patch.object(
+            feeder, "dataset_row_count", return_value=998
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(998, set())
+        ), mock.patch.object(
+            feeder, "campaign_inventory", return_value=[
+                {"id": 1, "name": "mft-camp-srev-lrev-1", "status": "queued"},
+                {"id": 2, "name": "mft-camp-srev-lrev-2", "status": "running"},
+            ]
+        ), mock.patch.object(feeder, "submit") as submit_mock:
+            self.assertTrue(feeder.step(
+                1000, target=10, buffer=0,
+                solver_revision="a" * 40, library_revision="b" * 40))
+
+        submit_mock.assert_not_called()
 
 
 class CollectorFetchTests(unittest.TestCase):
@@ -120,6 +229,31 @@ class CollectorFetchTests(unittest.TestCase):
                 collect_wave._get_response("/api/missing")
         self.assertEqual(get_mock.call_count, 1)
         sleep_mock.assert_not_called()
+
+    def test_small_scheduler_page_recovers_unseen_durable_ledger_task(self):
+        task = {"id": 99, "name": "mft-camp-ledger-99", "status": "running"}
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "feeder_state.json"
+            state_path.write_text(
+                json.dumps({"outstanding": [99]}), encoding="utf-8")
+
+            def get_json(path, **_kwargs):
+                if path == "/api/tasks":
+                    return {"tasks": []}
+                if path == "/api/tasks/99":
+                    return task
+                raise AssertionError(f"unexpected scheduler probe: {path}")
+
+            with mock.patch.object(
+                    collect_wave, "FEEDER_STATE_PATH", str(state_path)), \
+                    mock.patch.object(
+                        collect_wave, "_load_cache",
+                        return_value={"nodata": [], "harvested": []}), \
+                    mock.patch.object(
+                        collect_wave, "_get_json", side_effect=get_json):
+                tasks = collect_wave.list_tasks("mft-camp")
+
+        self.assertEqual(tasks, [task])
 
 
 class CollectorDatasetTests(unittest.TestCase):
@@ -158,6 +292,76 @@ class CollectorDatasetTests(unittest.TestCase):
 
     def read_source_ranks(self):
         return pd.read_parquet(self.source_rank_path)
+
+    def test_cancelled_task_partial_result_is_harvested(self):
+        tasks = [{
+            "id": 77, "name": "mft-camp-c-77", "status": "cancelled",
+            "started_at": "2026-07-10T01:00:00Z",
+        }]
+        stdout = 'RESULT_JSON {"project_name":"partial","saved_at":"t1","value":1.0}'
+
+        with mock.patch.object(
+                collect_wave, "list_tasks", return_value=tasks), mock.patch.object(
+                    collect_wave, "fetch_stdout", return_value=stdout):
+            result = collect_wave.main([
+                "--prefix", "mft-camp", "--cancelled-fetch-limit", "1"])
+
+        self.assertEqual(result["new_unique_rows"], 1)
+        cache = json.loads(Path(collect_wave.CACHE_PATH).read_text(encoding="utf-8"))
+        self.assertEqual(cache["harvested"], [77])
+
+    def test_never_started_cancelled_task_is_nodata_without_stdout_fetch(self):
+        tasks = [{
+            "id": 78, "name": "mft-camp-c-78", "status": "cancelled",
+            "started_at": None,
+        }]
+        with mock.patch.object(
+                collect_wave, "list_tasks", return_value=tasks), mock.patch.object(
+                    collect_wave, "fetch_stdout") as fetch_stdout:
+            result = collect_wave.main([
+                "--prefix", "mft-camp", "--cancelled-fetch-limit", "1"])
+
+        self.assertEqual(result["new_unique_rows"], 0)
+        fetch_stdout.assert_not_called()
+        cache = json.loads(Path(collect_wave.CACHE_PATH).read_text(encoding="utf-8"))
+        self.assertEqual(cache["nodata"], [78])
+
+    def test_source_rank_sidecar_is_strict_and_replay_recoverable(self):
+        master = pd.DataFrame([
+            {"project_name": "old", "saved_at": "t0", "value": 1.0},
+            {"project_name": "new", "saved_at": "t1", "value": 2.0},
+        ])
+        sidecar = pd.DataFrame([{
+            "project_name": "old", "saved_at": "t0",
+            collect_wave.SOURCE_RANK_COLUMN: 40,
+        }])
+        replay = pd.DataFrame([{
+            "project_name": "new", "saved_at": "t1",
+            "value": 2.0,
+            collect_wave.SOURCE_RANK_COLUMN: 20,
+        }])
+
+        repaired = collect_wave._validated_source_rank_sidecar(
+            master, sidecar, replay, ["project_name", "saved_at"])
+
+        self.assertEqual(
+            repaired.set_index("project_name").loc[
+                "new", collect_wave.SOURCE_RANK_COLUMN], 20)
+        with self.assertRaisesRegex(RuntimeError, "does not cover"):
+            collect_wave._validated_source_rank_sidecar(
+                master, sidecar, replay.iloc[0:0], ["project_name", "saved_at"])
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            collect_wave._validated_source_rank_sidecar(
+                master.iloc[:1], pd.concat([sidecar, sidecar], ignore_index=True),
+                replay, ["project_name", "saved_at"])
+        with self.assertRaisesRegex(RuntimeError, "payload differs"):
+            collect_wave._validated_source_rank_sidecar(
+                master, sidecar, replay.assign(value=3.0),
+                ["project_name", "saved_at"])
+        with self.assertRaisesRegex(RuntimeError, "payload differs"):
+            collect_wave._validated_source_rank_sidecar(
+                master, sidecar, replay.drop(columns="value"),
+                ["project_name", "saved_at"])
 
     def test_dedup_preserves_distinct_null_key_legacy_rows(self):
         rows = pd.DataFrame(
@@ -477,6 +681,10 @@ class CollectorDatasetTests(unittest.TestCase):
         pd.DataFrame(
             [{"project_name": "p1", "saved_at": "t1", "value": 1.0}]
         ).to_parquet(master, index=False)
+        self.write_source_ranks([{
+            "project_name": "p1", "saved_at": "t1",
+            collect_wave.SOURCE_RANK_COLUMN: collect_wave.SOURCE_RANK_LOCAL_PART,
+        }])
         before = master.read_bytes()
         self.local_parts_dir.mkdir()
         part = self.local_parts_dir / "part_pending.parquet"
@@ -563,6 +771,10 @@ class CollectorDatasetTests(unittest.TestCase):
         pd.DataFrame(
             [{"project_name": "p1", "saved_at": "t1", "value": 1.0}]
         ).to_parquet(master, index=False)
+        self.write_source_ranks([{
+            "project_name": "p1", "saved_at": "t1",
+            collect_wave.SOURCE_RANK_COLUMN: collect_wave.SOURCE_RANK_JSON,
+        }])
         before = master.read_bytes()
         cache = {"nodata": [], "harvested": []}
         tasks = [{"id": 12, "name": "mft-camp-c-12", "status": "completed"}]
@@ -597,6 +809,10 @@ class CollectorDatasetTests(unittest.TestCase):
         pd.DataFrame(
             [{"project_name": "p1", "saved_at": "t1", "value": 1.0}]
         ).to_parquet(master, index=False)
+        self.write_source_ranks([{
+            "project_name": "p1", "saved_at": "t1",
+            collect_wave.SOURCE_RANK_COLUMN: collect_wave.SOURCE_RANK_JSON,
+        }])
         tasks = [{"id": 9, "name": "mft-camp-c-9", "status": "running"}]
         stdout = 'RESULT_JSON {"project_name":"p2","saved_at":"t2","value":2.0}'
 
@@ -767,6 +983,23 @@ class ThermalValidityTests(unittest.TestCase):
         self.assertEqual(normalized["result_valid_thermal"].iloc[0], 0)
         self.assertTrue(pd.isna(normalized["result_valid_thermal"].iloc[1]))
         self.assertEqual(normalized["result_valid_thermal"].iloc[2], 0)
+
+
+class ProvenanceFilterTests(unittest.TestCase):
+    def test_explicit_dirty_rows_are_rejected_but_legacy_missing_flags_remain(self):
+        frame = pd.DataFrame([
+            {"sample": "clean", "git_dirty": 0, "pyaedt_library_git_dirty": 0},
+            {"sample": "solver-dirty", "git_dirty": 1, "pyaedt_library_git_dirty": 0},
+            {"sample": "library-dirty", "git_dirty": 0, "pyaedt_library_git_dirty": 1},
+            {"sample": "legacy", "git_dirty": None, "pyaedt_library_git_dirty": None},
+            {"sample": "fallback", "git_dirty": 0, "pyaedt_library_git_dirty": 0,
+             "matrix_extraction_backend": "get_solution_data"},
+        ])
+
+        filtered, rejected = collect_wave.reject_explicit_dirty_provenance(frame)
+
+        self.assertEqual(rejected, 3)
+        self.assertEqual(filtered["sample"].tolist(), ["clean", "legacy"])
 
 
 if __name__ == "__main__":

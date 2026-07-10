@@ -27,6 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(HERE, "..", "data", "dataset")
 LOCAL_RESULTS_CSV = os.path.join(HERE, "..", "..", "simulation_results_260706.csv")
 LOCAL_RESULTS_PARTS_DIR = os.path.join(HERE, "..", "..", "results_parts_260706")
+FEEDER_STATE_PATH = os.path.join(HERE, "feeder_state.json")
 
 SOURCE_RANK_COLUMN = "_collector_source_rank"
 SOURCE_RANK_TERMINAL_CSV = 10
@@ -37,6 +38,7 @@ SOURCE_RANK_LOCAL_PART = 40
 FETCH_ATTEMPTS = 3
 RETRY_BASE_SECONDS = 0.5
 RETRY_MAX_SECONDS = 30.0
+MAX_STDOUT_BYTES = 1_048_576
 
 
 class FetchError(RuntimeError):
@@ -93,7 +95,9 @@ def _get_json(path, *, params=None, timeout=30):
 
 
 def fetch_stdout(task_id, timeout=30):
-    return _get_response(f"/api/tasks/{task_id}/stdout", timeout=timeout).text
+    return _get_response(
+        f"/api/tasks/{task_id}/stdout",
+        params={"max_bytes": MAX_STDOUT_BYTES}, timeout=timeout).text
 
 
 def list_tasks(prefix):
@@ -102,13 +106,9 @@ def list_tasks(prefix):
                   params={"limit": 10000, "name_prefix": prefix}, timeout=30)
     tasks = t if isinstance(t, list) else t.get("tasks", [])
     matched = [x for x in tasks if str(x.get("name", "")).startswith(prefix)]
-    if len(tasks) > 250:
-        return matched
+    page_seen = {x["id"]: x for x in matched}
+    seen = dict(page_seen)
 
-    # 구 스케줄러(200개 페이지): ID 연속 스캔으로 누락 보완
-    seen = {x["id"]: x for x in matched}
-    if not seen:
-        return []
     def probe(tid):
         try:
             x = _get_json(f"/api/tasks/{tid}", timeout=15)
@@ -116,7 +116,32 @@ def list_tasks(prefix):
             return False if exc.status_code == 404 else None
         return x if str(x.get("name", "")).startswith(prefix) else False
 
-    ids = sorted(seen)
+    # The scheduler has no pagination and applies its limit before prefix
+    # filtering. Always recover unseen feeder IDs from the durable local ledger.
+    try:
+        with open(FEEDER_STATE_PATH, encoding="utf-8") as stream:
+            feeder_state = json.load(stream)
+        ledger_ids = {int(task_id) for task_id in feeder_state.get("outstanding", [])}
+    except FileNotFoundError:
+        ledger_ids = set()
+    except (OSError, ValueError, TypeError) as exc:
+        raise FetchError(f"feeder task ledger is unreadable: {exc}") from exc
+    cache = _load_cache()
+    judged = set(cache.get("nodata", [])) | set(cache.get("harvested", []))
+    missing_ids = sorted(ledger_ids - set(seen) - judged)[:500]
+    for task_id in missing_ids:
+        recovered = probe(task_id)
+        if recovered:
+            seen[task_id] = recovered
+    if len(tasks) > 250:
+        return list(seen.values())
+
+    # 구 스케줄러(200개 페이지): ID 연속 스캔으로 누락 보완
+    if not page_seen:
+        return list(seen.values())
+
+    scan_seen = dict(page_seen)
+    ids = sorted(scan_seen)
     lo, hi = ids[0], ids[-1]
     # 경계 확장: 프리픽스 연속 구간 가정, 밖으로 miss 20회까지
     for direction in (-1, +1):
@@ -127,6 +152,7 @@ def list_tasks(prefix):
             r = probe(cur)
             if r:
                 seen[cur] = r
+                scan_seen[cur] = r
                 misses = 0
             elif r is False:
                 misses += 1
@@ -138,7 +164,7 @@ def list_tasks(prefix):
         judged = set(c.get("nodata", [])) | set(c.get("harvested", []))
     except Exception:
         judged = set()
-    lo, hi = min(seen), max(seen)
+    lo, hi = min(scan_seen), max(scan_seen)
     for tid in range(lo, hi + 1):
         if tid not in seen and tid not in judged:
             r = probe(tid)
@@ -394,6 +420,30 @@ def normalize_thermal_validity(df):
     return df, count
 
 
+def reject_explicit_dirty_provenance(df):
+    """Drop rows that explicitly report dirty or untrusted execution provenance."""
+    if df is None or df.empty:
+        return df, 0
+    keep = pd.Series(True, index=df.index)
+    for column in ("git_dirty", "pyaedt_library_git_dirty"):
+        if column not in df.columns:
+            continue
+        raw = df[column]
+        numeric = pd.to_numeric(raw, errors="coerce")
+        keep &= raw.isna() | numeric.eq(0)
+    for column in ("matrix_solve_attempts", "loss_solve_attempts"):
+        if column not in df.columns:
+            continue
+        raw = df[column]
+        numeric = pd.to_numeric(raw, errors="coerce")
+        keep &= raw.isna() | numeric.eq(1)
+    if "matrix_extraction_backend" in df.columns:
+        raw = df["matrix_extraction_backend"]
+        keep &= raw.isna() | raw.astype(str).eq("export_rl_matrix")
+    rejected = int((~keep).sum())
+    return df.loc[keep].reset_index(drop=True), rejected
+
+
 def _row_hashes(df, columns):
     normalized = df.loc[:, columns].astype("string").fillna("<NA>")
     return pd.util.hash_pandas_object(normalized, index=False)
@@ -543,6 +593,82 @@ def _attach_source_ranks(frame, sidecar, dedup_keys):
     return ranked
 
 
+def _matching_replay_rows(master, incoming, identities, dedup_keys):
+    """Return deterministic replay rows only when their persisted payload matches."""
+    if incoming is None:
+        raise RuntimeError(
+            "source rank sidecar does not cover every master dataset identity")
+    replay = _deduplicate_ranked_rows(incoming.copy(), dedup_keys)
+    try:
+        persisted = identities.merge(
+            master, on=dedup_keys, how="left", validate="one_to_one")
+        replayed = identities.merge(
+            replay, on=dedup_keys, how="left", validate="one_to_one",
+            indicator="_replay_merge")
+    except (pd.errors.MergeError, ValueError) as exc:
+        raise RuntimeError("replay payload identity is ambiguous") from exc
+    if not replayed.pop("_replay_merge").eq("both").all():
+        raise RuntimeError(
+            "source rank sidecar does not cover every master dataset identity")
+
+    excluded = {"task_id", "task_name", SOURCE_RANK_COLUMN}
+    payload_columns = sorted(
+        (set(persisted.columns) | set(replayed.columns)) - excluded)
+    persisted = persisted.reindex(columns=payload_columns)
+    replayed = replayed.reindex(columns=payload_columns)
+    try:
+        pd.testing.assert_frame_equal(
+            persisted.reset_index(drop=True), replayed.reset_index(drop=True),
+            check_dtype=False, check_exact=True)
+    except AssertionError as exc:
+        raise RuntimeError(
+            "replay payload differs from persisted master") from exc
+    return replay
+
+
+def _validated_source_rank_sidecar(master, sidecar, incoming, dedup_keys):
+    """Validate rank coverage, repairing only rows replayed after master-first install."""
+    columns = list(dedup_keys) + [SOURCE_RANK_COLUMN]
+    if sidecar is None:
+        validated = pd.DataFrame(columns=columns)
+    else:
+        missing_columns = [column for column in columns if column not in sidecar.columns]
+        if missing_columns:
+            raise RuntimeError(
+                f"source rank sidecar schema is invalid; missing {missing_columns}")
+        validated = sidecar[columns].copy()
+        complete = _complete_key_mask(validated, dedup_keys)
+        ranks = pd.to_numeric(validated[SOURCE_RANK_COLUMN], errors="coerce")
+        if (not complete.all() or not ranks.map(math.isfinite).all()
+                or (ranks < 0).any() or validated.duplicated(dedup_keys).any()):
+            raise RuntimeError("source rank sidecar contains invalid or duplicate rows")
+        validated[SOURCE_RANK_COLUMN] = ranks
+
+    if master is None or master.empty:
+        return validated
+    if not all(key in master.columns for key in dedup_keys):
+        raise RuntimeError("master dataset is missing source-rank identity columns")
+    identities = master.loc[
+        _complete_key_mask(master, dedup_keys), dedup_keys].drop_duplicates()
+    coverage = identities.merge(
+        validated[dedup_keys], on=dedup_keys, how="left", indicator=True)
+    missing = coverage.loc[coverage["_merge"].ne("both"), dedup_keys]
+    if not len(missing):
+        return validated
+
+    replay = _matching_replay_rows(master, incoming, missing, dedup_keys)
+    replay_ranks = _source_rank_rows(replay, dedup_keys)
+    repairable = missing.merge(
+        replay_ranks, on=dedup_keys, how="left", indicator=True)
+    if (not repairable["_merge"].eq("both").all()
+            or not pd.to_numeric(
+                repairable[SOURCE_RANK_COLUMN], errors="coerce").map(math.isfinite).all()):
+        raise RuntimeError(
+            "source rank sidecar does not cover every master dataset identity")
+    repaired = repairable[columns]
+    return pd.concat([validated, repaired], ignore_index=True, sort=False)
+
+
 def _stage_path(target):
     fd, path = tempfile.mkstemp(
         prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=os.path.dirname(target))
@@ -596,6 +722,8 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
         source_ranks = (
             pd.read_parquet(source_rank_path) if os.path.isfile(source_rank_path) else None
         )
+        source_ranks = _validated_source_rank_sidecar(
+            old, source_ranks, merged, dedup_keys)
         ranked_old = _attach_source_ranks(old, source_ranks, dedup_keys)
         new_rows = select_new_unique_rows(merged, ranked_old, dedup_keys)
         new_unique_rows = len(new_rows)
@@ -645,6 +773,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefix", default="mft-camp")
     ap.add_argument("--max-conv-err", type=float, default=1.5)
+    ap.add_argument("--cancelled-fetch-limit", type=int, default=500)
     args = ap.parse_args(argv)
 
     os.makedirs(DATASET_DIR, exist_ok=True)
@@ -652,6 +781,7 @@ def main(argv=None):
     tasks = list_tasks(args.prefix)
     done = [t for t in tasks if t.get("status") == "completed"]
     failed = [t for t in tasks if t.get("status") == "failed"]
+    cancelled = [t for t in tasks if t.get("status") == "cancelled"]
     status_counts = {}
     for task in tasks:
         status = str(task.get("status", "unknown"))
@@ -662,8 +792,10 @@ def main(argv=None):
         f"active {active_count}, cancelled {status_counts.get('cancelled', 0)})"
     )
 
-    # 실패 태스크도 stdout에 결과가 있으면 회수 (pyaedt teardown 크래시가
-    # 성공 샘플을 실패로 둔갑시키는 케이스 실측됨 - 데이터는 유효)
+    # 실패/취소 태스크도 stdout에 결과가 있으면 회수 (pyaedt teardown 크래시나
+    # count 배치 중간 취소 전에 성공한 샘플이 남는 경우가 있음).
+    # A bounded cancelled batch prevents historical backlog from monopolizing
+    # the scheduler API; fresh completed/failed tasks are always handled first.
     # + 실행 중 태스크의 RESULT_JSON 라인도 스트리밍 회수 (샘플 단위 실시간성)
     import json as _json
     running = [t for t in tasks if t.get("status") in ("running", "attaching")]
@@ -675,12 +807,28 @@ def main(argv=None):
     n_skipped = 0
     n_fetch_errors = 0
     pending_harvested = []
-    pending_nodata = []
+    never_started_cancelled = [
+        t for t in cancelled
+        if t["id"] not in skip
+        and "started_at" in t
+        and t["started_at"] is None
+    ]
+    never_started_ids = {t["id"] for t in never_started_cancelled}
+    pending_nodata = list(never_started_ids)
     pending_local_parts = []
-    for t in done + failed:
-        if t["id"] in skip:
-            n_skipped += 1
-            continue
+    terminal = done + failed + cancelled
+    n_skipped = sum(t["id"] in skip for t in terminal)
+    pending_primary = sorted(
+        (t for t in done + failed if t["id"] not in skip),
+        key=lambda task: int(task["id"]), reverse=True,
+    )
+    pending_cancelled = sorted(
+        (t for t in cancelled
+         if t["id"] not in skip and t["id"] not in never_started_ids),
+        key=lambda task: int(task["id"]),
+    )[:max(0, args.cancelled_fetch_limit)]
+    pending_terminal = pending_primary + pending_cancelled
+    for t in pending_terminal:
         try:
             out = fetch_stdout(t["id"])
         except FetchError as exc:
@@ -702,13 +850,16 @@ def main(argv=None):
                 frame["task_name"] = t.get("name", "")
                 frames.append(_tag_source(frame, source_rank))
             pending_harvested.append(t["id"])
-            if t.get("status") == "failed":
+            if t.get("status") in ("failed", "cancelled"):
                 n_salvaged += 1
         else:
             # Only a successful stdout fetch proves that a task has no data.
             pending_nodata.append(t["id"])
     if n_skipped:
         print(f"cache skip: {n_skipped} terminal tasks")
+    if never_started_cancelled:
+        print(
+            f"never-started cancelled: {len(never_started_cancelled)} marked nodata")
     for t in running:
         try:
             out = fetch_stdout(t["id"], timeout=20)
@@ -753,6 +904,10 @@ def main(argv=None):
         return {"new_unique_rows": 0, "fetch_errors": n_fetch_errors}
 
     merged = pd.concat(frames, ignore_index=True, sort=False)
+    merged, n_dirty = reject_explicit_dirty_provenance(merged)
+    if n_dirty:
+        print(f"provenance filter: {n_dirty} explicit dirty-source rows rejected")
+
     # 중복 제거 (재회수/재시도 대비)
     # Both fields are required for the primary identity. A missing column sends
     # every row through the content-hash legacy fallback.
