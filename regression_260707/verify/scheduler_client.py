@@ -26,6 +26,9 @@ _STANDARD_PROFILE = json.loads(
         encoding="utf-8"))
 STANDARD_PROFILE_CONTRACT = dict(_STANDARD_PROFILE["param_overrides"])
 DEFAULT_TASK_TIMEOUT_SECONDS = int(_STANDARD_PROFILE["timeout_seconds"])
+LOCAL_SCRATCH_ROOT = "/enroot"
+LOCAL_SCRATCH_MIN_FREE_KB = 200 * 1024 * 1024
+LOCAL_SCRATCH_STALE_MINUTES = 8 * 60
 
 MANDATORY_TEMPERATURE_COLUMNS = (
     "T_max_Tx",
@@ -114,12 +117,29 @@ def submit_verification(
     run_identity = (
         f"s{solver_revision[:12]}-l{library_revision[:12]}-p{parameter_digest}")
     isolated_workdir = f"{workdir}-{run_identity}"
-    quoted_workdir = shlex.quote(isolated_workdir)
-    repo_dir = f"{isolated_workdir}/repo"
-    library_dir = f"{isolated_workdir}/pyaedt_library"
-    quoted_repo = shlex.quote(repo_dir)
-    quoted_library = shlex.quote(library_dir)
-    cleanup_workdir = shlex.quote(isolated_workdir)
+    scratch_leaf = re.sub(r"[^A-Za-z0-9_.-]+", "_", isolated_workdir).strip("._-")
+    if not scratch_leaf:
+        scratch_leaf = f"mft-{parameter_digest}"
+    scratch_workdir = f"{LOCAL_SCRATCH_ROOT}/{scratch_leaf}"
+    quoted_workdir = '"${MFT_WORKDIR}"'
+    quoted_repo = '"${MFT_WORKDIR}/repo"'
+    quoted_library = '"${MFT_WORKDIR}/pyaedt_library"'
+    cleanup_workdir = quoted_workdir
+    select_workdir = (
+        f"MFT_GPFS_WORKDIR={shlex.quote(isolated_workdir)}; "
+        f"MFT_NVME_WORKDIR={shlex.quote(scratch_workdir)}; "
+        f"MFT_ENROOT_FREE_KB=$(df -Pk {LOCAL_SCRATCH_ROOT} 2>/dev/null "
+        "| awk 'NR==2 {print $4}'); "
+        f"if [ \"$(findmnt -n -o FSTYPE -T {LOCAL_SCRATCH_ROOT} 2>/dev/null)\" = xfs ] "
+        f"&& [ \"${{MFT_ENROOT_FREE_KB:-0}}\" -ge {LOCAL_SCRATCH_MIN_FREE_KB} ]; then "
+        "MFT_WORKDIR=$MFT_NVME_WORKDIR; "
+        f"find {LOCAL_SCRATCH_ROOT} -mindepth 1 -maxdepth 1 -type d "
+        "-user \"$USER\" -name 'mft_*' "
+        f"-mmin +{LOCAL_SCRATCH_STALE_MINUTES} -exec rm -rf -- {{}} + "
+        "2>/dev/null || true; "
+        "else MFT_WORKDIR=$MFT_GPFS_WORKDIR; fi; "
+        "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
+    )
     lib_clone = (f"([ -d {quoted_library}/.git ] || {{ [ ! -e {quoted_library} ] && "
                  "git clone -q --depth 1 "
                  f"https://github.com/Schwalbe262/pyaedt_library.git {quoted_library}.tmp.$$ "
@@ -154,7 +174,7 @@ def submit_verification(
     # scheduler workspace, so unconditional cleanup can target only this clone.
     cmd = (
         BASE
-        + f"( cleanup() {{ rm -rf -- {cleanup_workdir} 2>/dev/null; }}; "
+        + f"( {select_workdir}cleanup() {{ rm -rf -- {cleanup_workdir} 2>/dev/null; }}; "
         + "trap cleanup EXIT; trap 'exit 143' TERM INT; "
         + run_group
         + " )"

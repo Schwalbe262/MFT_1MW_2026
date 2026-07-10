@@ -357,6 +357,15 @@ def _project_delete_policy(input_frame, fixed_mode=False, hold=False, model_only
     return not (keep_project or hold or model_only)
 
 
+def _configure_loss_copy_skin_mesh(sim):
+    """Reuse copied winding mesh ops, or create them when matrix omitted them."""
+    if int(sim.df_plus["matrix_skin_mesh"].iloc[0]) != 0:
+        logging.info("loss copy: reusing inherited winding mesh operations")
+        return False
+    sim.assign_skin_depth()
+    return True
+
+
 class Simulation():
 
     def __init__(self, desktop=None):
@@ -2112,7 +2121,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
             # 코어손실 + skin 메시(손실 정밀용) + 셋업 정밀값
             sim.assign_core_loss()
-            sim.assign_skin_depth()
+            _configure_loss_copy_skin_mesh(sim)
             sim.design1.setup = sim.design1.get_setup(name="Setup1")
             sim.design1.setup.properties["Max. Number of Passes"] = int(sim.df_plus["max_passes"].iloc[0])
             sim.design1.setup.properties["Min. Converged Passes"] = int(sim.df_plus["min_converged"].iloc[0])

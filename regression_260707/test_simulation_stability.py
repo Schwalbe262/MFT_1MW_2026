@@ -11,6 +11,7 @@ from run_simulation_260706 import (
     Simulation,
     SolutionDataUnavailableError,
     _completion_exit_code,
+    _configure_loss_copy_skin_mesh,
     _parse_rl_matrix_export,
     _thermal_failure_frame,
     _thermal_result_is_valid,
@@ -207,6 +208,32 @@ class SolutionDataTests(unittest.TestCase):
             simulation._solution_data_frame(["L"], retry_delay=0)
 
         self.assertNotIsInstance(raised.exception, SolutionDataUnavailableError)
+
+
+class CopiedLossMeshPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _simulation(matrix_skin_mesh):
+        calls = []
+        return SimpleNamespace(
+            df_plus=pd.DataFrame({"matrix_skin_mesh": [matrix_skin_mesh]}),
+            assign_skin_depth=lambda: calls.append("assign"),
+        ), calls
+
+    def test_reuses_winding_mesh_inherited_from_matrix(self):
+        simulation, calls = self._simulation(1)
+
+        assigned = _configure_loss_copy_skin_mesh(simulation)
+
+        self.assertFalse(assigned)
+        self.assertEqual(calls, [])
+
+    def test_assigns_winding_mesh_when_matrix_skipped_it(self):
+        simulation, calls = self._simulation(0)
+
+        assigned = _configure_loss_copy_skin_mesh(simulation)
+
+        self.assertTrue(assigned)
+        self.assertEqual(calls, ["assign"])
 
 
 class AnalyzePolicyTests(unittest.TestCase):

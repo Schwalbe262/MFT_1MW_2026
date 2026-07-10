@@ -167,15 +167,25 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             f"candidate_workdir-s{TEST_REVISION[:12]}-"
             f"l{TEST_LIBRARY_REVISION[:12]}-p{parameter_digest}"
         )
+        self.assertIn(f"MFT_GPFS_WORKDIR={isolated}", command)
+        self.assertIn(f"MFT_NVME_WORKDIR=/enroot/{isolated}", command)
+        self.assertIn("findmnt -n -o FSTYPE -T /enroot", command)
         self.assertIn(
-            f"git -C {isolated}/pyaedt_library fetch -q origin "
+            f'"${{MFT_ENROOT_FREE_KB:-0}}" -ge '
+            f"{scheduler_client.LOCAL_SCRATCH_MIN_FREE_KB}", command)
+        self.assertIn("MFT_WORKDIR=$MFT_NVME_WORKDIR", command)
+        self.assertIn("MFT_WORKDIR=$MFT_GPFS_WORKDIR", command)
+        self.assertIn("MFT_WORKDIR %s", command)
+        self.assertIn(
+            "git -C \"${MFT_WORKDIR}/pyaedt_library\" fetch -q origin "
             f"{TEST_LIBRARY_REVISION}", command)
         self.assertIn(
-            f"git -C {isolated}/pyaedt_library checkout -q --detach "
+            "git -C \"${MFT_WORKDIR}/pyaedt_library\" checkout -q --detach "
             f"{TEST_LIBRARY_REVISION}", command)
         self.assertIn(f"MFT_LIBRARY_GIT_HASH {TEST_LIBRARY_REVISION}", command)
         self.assertIn(
-            f"cd {isolated}/repo && git fetch -q origin {TEST_REVISION}", command)
+            f"cd \"${{MFT_WORKDIR}}/repo\" && git fetch -q origin {TEST_REVISION}",
+            command)
         self.assertIn(f"git checkout -q --detach {TEST_REVISION}", command)
         self.assertIn(f'test "$(git rev-parse HEAD)" = "{TEST_REVISION}"', command)
         self.assertIn("git diff --quiet HEAD -- && git clean -q -ffd", command)
@@ -185,9 +195,11 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             command.index("python run_simulation_260706.py"))
         self.assertIn("python run_simulation_260706.py --fixed", command)
         self.assertIn(
-            f"cleanup() {{ rm -rf -- {isolated} ", command)
+            'cleanup() { rm -rf -- "${MFT_WORKDIR}" ', command)
         self.assertIn("trap cleanup EXIT", command)
         self.assertIn("trap 'exit 143' TERM INT", command)
+        self.assertIn(
+            f"-mmin +{scheduler_client.LOCAL_SCRATCH_STALE_MINUTES}", command)
         self.assertNotIn("rc=$?; rm -rf simulation aedt_temp", command)
         self.assertGreater(
             command.rindex("MFT_LIBRARY_GIT_HASH"),
