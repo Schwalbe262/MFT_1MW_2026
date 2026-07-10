@@ -1,0 +1,127 @@
+import csv
+import json
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import pytest
+
+from regression_260707.monitoring.readers import ArtifactService
+
+
+KST = timezone(timedelta(hours=9))
+FIXED_NOW = datetime(2026, 7, 11, 3, 0, tzinfo=KST)
+
+
+class DummyScheduler:
+    def snapshot(self):
+        return {
+            "connected": True,
+            "url": "http://scheduler.invalid",
+            "read_only": True,
+            "task_prefix": "mft",
+            "total": 12,
+            "running": 4,
+            "pending": 3,
+            "completed": 3,
+            "failed": 1,
+            "cancelled": 1,
+            "other": 0,
+            "statuses": {"running": 4, "pending": 3, "completed": 3, "failed": 1, "cancelled": 1},
+            "error": None,
+            "updated_at": FIXED_NOW.isoformat(),
+        }
+
+
+def write_json(path: Path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def write_csv(path: Path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(rows[0]) if rows else ["empty"]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+@pytest.fixture
+def campaign_root(tmp_path):
+    root = tmp_path / "regression_260707"
+    dataset = root / "data" / "dataset"
+    write_json(dataset / "manifest.json", {
+        "updated": "260711_023000_000000", "total_rows": 2, "new_rows": 1,
+        "new_unique_rows": 1, "git_hashes": ["a" * 40, "b" * 40],
+    })
+    write_csv(dataset / "train_io.csv", [
+        {
+            "saved_at": "2026-07-11 02:30:00", "result_valid_em": "1", "result_valid_thermal": "1",
+            "git_hash": "a" * 40, "project_name": "one",
+        },
+        {
+            "saved_at": "2026-07-11 01:30:00", "result_valid_em": "1", "result_valid_thermal": "0",
+            "git_hash": "b" * 40, "project_name": "two",
+        },
+    ])
+    write_json(dataset / "collect_cache.json", {"harvested": [1, 2], "nodata": [3], "local_parts": ["a.parquet"]})
+
+    registry = root / "training" / "registry"
+    write_json(registry / "train_report.json", {
+        "time": "2026-07-11T02:00:00+09:00",
+        "report": {
+            "Llt_phys": {"n_train": 80, "n_holdout": 20, "r2": .91, "rmse": .2, "mape_pct": 1.2, "p90_ape_pct": 2.1, "q90_conformal": 1.1},
+            "P_winding_total": {"n_train": 80, "n_holdout": 20, "r2": .72, "rmse": 120, "mape_pct": 22, "p90_ape_pct": 30, "q90_conformal": 2.2},
+        },
+    })
+    write_json(registry / "Llt_phys" / "meta.json", {"trained_at": "2026-07-11T02:00:00+09:00"})
+    write_csv(root / "training" / "learning_curve.csv", [
+        {"time": "2026-07-10 10:00:00", "target": "Llt_phys", "n": "60", "r2": ".85", "rmse": ".4", "mape_pct": "2", "p90_ape_pct": "3", "slice": "global"},
+        {"time": "2026-07-11 02:00:00", "target": "Llt_phys", "n": "100", "r2": ".91", "rmse": ".2", "mape_pct": "1.2", "p90_ape_pct": "2.1", "slice": "global"},
+    ])
+
+    front_fields = {
+        "N1_main": 7, "N2_main": 35, "N2_side": 25, "l1": 60, "l2": 350, "h1": 420, "w1": 400,
+        "n_core_group": 4, "core_plate_t": 20, "cw1": 5, "gap1": 3, "cw2": 1, "gap2": 1,
+        "nwh1": 350, "nwh2": 300, "cc_w2c_space_x": 42, "cc_w2c_space_y": 42,
+        "w2c_w1c_space_x": 41, "w2c_w1c_space_y": 41, "w1c_w2s_gap_x_actual": 43,
+        "w1s_cs_space_x": 44, "cs_w1s_space_y": 45, "h_gap2": 46,
+        "pred_Llt_phys": 27.5, "sigma_Llt_phys": .1, "pred_B_max_core": 1.0,
+    }
+    write_csv(root / "al_rounds" / "round_00" / "pareto_front.csv", [
+        {**front_fields, "volume_L": 600, "total_loss_W": 7000},
+    ])
+    write_csv(root / "al_rounds" / "round_02" / "pareto_front.csv", [
+        {**front_fields, "volume_L": 500, "total_loss_W": 8000},
+        {**front_fields, "volume_L": 550, "total_loss_W": 6500, "pred_Llt_phys": 27.7},
+    ])
+    result = {
+        **front_fields,
+        "full_model": 0, "Llt": 13.75, "B_max_core": 1.0, "T_max_Tx": 90,
+        "T_max_Rx_main": 91, "T_max_Rx_side": 92, "T_max_core": 88,
+        "conv_error_pct_matrix": .5, "conv_error_pct_loss": .6,
+        "P_winding_total": 4000, "P_core_total": 2000, "P_core_plate_total": 500,
+        "git_hash": "a" * 40, "pyaedt_library_git_hash": "c" * 40,
+    }
+    write_json(root / "al_rounds" / "state.json", {
+        "round": 2, "stage": "WAIT",
+        "verification_counts": {"total": 1, "valid": 1, "pending": 0, "exhausted": 0, "ingested": 1},
+        "task_records": {"0": {"active_id": 123, "last_status": "completed", "outcome": "valid", "result": result}},
+        "history": [],
+    })
+    fine_result = {**result, "full_model": 1, "Llt_phys": 27.5, "volume_L": 500}
+    write_json(root / "verify" / "results" / "final_verification.json", {
+        "candidate_id": "r02-0000", "task_id": 999, "profile": "fine", "passed": True,
+        "updated_at": "2026-07-11T02:50:00+09:00", "result": fine_result,
+    })
+    return root
+
+
+@pytest.fixture
+def artifact_service(campaign_root):
+    return ArtifactService(
+        campaign_root,
+        scheduler=DummyScheduler(),
+        clock=lambda: FIXED_NOW,
+        record_runtime=False,
+    )
