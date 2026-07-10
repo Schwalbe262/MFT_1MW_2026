@@ -12,5 +12,5 @@
   "freq": 1000.0, "loss_from_copy": 1,
   "P_target": 1000000.0, "keep_project": 0
  },
- "mem_mb": 32768, "cpus": 4, "timeout_seconds": 21600
+ "mem_mb": 32768, "cpus": 4, "timeout_seconds": 7200
 }

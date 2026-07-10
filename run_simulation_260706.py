@@ -274,6 +274,79 @@ def _parse_rl_matrix_export(text, frequency_hz, tx_name="Tx_winding", rx_name="R
     }
 
 
+MATRIX_REQUIRED_RESULT_COLUMNS = (
+    "Ltx", "Lrx", "M", "k", "Lmt", "Lmr", "Llt", "Llr",
+)
+LOSS_REQUIRED_RESULT_COLUMNS = (
+    "P_core_total", "P_core_plate_total", "P_wcp_total",
+    "P_winding_total", "B_mean_core", "B_max_core",
+)
+
+
+def _finite_result_value(frame, column):
+    """Return one finite numeric result value, or None for a missing/bad value."""
+    try:
+        value = float(frame[column].iloc[0])
+    except (KeyError, TypeError, ValueError, OverflowError, IndexError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _em_result_validation(frame, matrix_on=True, loss_on=True):
+    """Validate enabled EM stages against the configured adaptive criteria."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return False, "result frame is missing"
+
+    enabled = []
+    if matrix_on:
+        enabled.append((
+            "matrix", "matrix_percent_error", MATRIX_REQUIRED_RESULT_COLUMNS,
+        ))
+    if loss_on:
+        enabled.append(("loss", "percent_error", LOSS_REQUIRED_RESULT_COLUMNS))
+    if not enabled:
+        return False, "no EM stage is enabled"
+
+    failures = []
+    for label, tolerance_column, required_columns in enabled:
+        tolerance = _finite_result_value(frame, tolerance_column)
+        passes = _finite_result_value(frame, f"conv_passes_{label}")
+        error = _finite_result_value(frame, f"conv_error_pct_{label}")
+        delta = _finite_result_value(frame, f"conv_delta_pct_{label}")
+        if tolerance is None or tolerance <= 0:
+            failures.append(f"{label}: invalid {tolerance_column}")
+        if passes is None or passes < 1:
+            failures.append(f"{label}: convergence pass count is missing")
+        if error is None or error < 0:
+            failures.append(f"{label}: energy error is missing")
+        elif tolerance is not None and tolerance > 0 and error > tolerance:
+            failures.append(
+                f"{label}: energy error {error:g}% exceeds {tolerance:g}%"
+            )
+        if delta is None or delta < 0:
+            failures.append(f"{label}: delta energy is missing")
+        elif tolerance is not None and tolerance > 0 and delta > tolerance:
+            failures.append(
+                f"{label}: delta energy {delta:g}% exceeds {tolerance:g}%"
+            )
+
+        missing_outputs = [
+            column for column in required_columns
+            if _finite_result_value(frame, column) is None
+        ]
+        if missing_outputs:
+            failures.append(
+                f"{label}: non-finite required outputs {missing_outputs}"
+            )
+
+    return not failures, "; ".join(failures) if failures else "valid"
+
+
+def _em_result_is_valid(frame, matrix_on=True, loss_on=True):
+    """Return True only for finite, adaptively converged enabled EM stages."""
+    return _em_result_validation(frame, matrix_on=matrix_on, loss_on=loss_on)[0]
+
+
 MAX_TRUSTED_TEMPERATURE_C = 4700.0
 MIN_TRUSTED_TEMPERATURE_C = -273.15
 MANDATORY_THERMAL_TEMPERATURE_COLUMNS = (
@@ -2640,15 +2713,20 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             return
 
         simulation_time = pd.DataFrame({"time": [total_time]})
-        validity = pd.DataFrame({
-            "result_valid_em": [1],
-            "result_valid_thermal": [
-                int(thermal_result_valid) if thermal_on else float("nan")
-            ],
-        })
         result = pd.concat(
-            result_parts + [sim.get_execution_telemetry(), validity, simulation_time], axis=1
+            result_parts + [sim.get_execution_telemetry(), simulation_time], axis=1
         )
+        em_result_valid, em_validity_reason = _em_result_validation(
+            result, matrix_on=matrix_on, loss_on=loss_on
+        )
+        result["result_valid_em"] = int(em_result_valid)
+        result["em_validity_reason"] = em_validity_reason
+        result["result_valid_thermal"] = (
+            int(thermal_result_valid) if thermal_on else float("nan")
+        )
+        if not em_result_valid:
+            logging.error(f"EM result rejected: {em_validity_reason}")
+            log_failed_sample(sim.input_df, f"em_validation: {em_validity_reason}")
 
         persistence_error = None
         try:
@@ -2680,7 +2758,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             held[0] = True
             logging.info(f"HOLD mode: project '{sim.PROJECT_NAME}' left open in AEDT for inspection.")
             print(f"\n=== HOLD: AEDT에 '{sim.PROJECT_NAME}' 프로젝트가 열린 채 유지됩니다. 확인 후 직접 닫으세요. ===")
-            return True
+            return bool(em_result_valid and thermal_result_valid)
 
         try:
             sim.close_project()
@@ -2689,7 +2767,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
         # Partial thermal rows remain streamed and are useful for EM surrogates, but
         # --thermal --count N advances only on thermally valid rows.
-        return bool(thermal_result_valid)
+        return bool(em_result_valid and thermal_result_valid)
     except Exception as e:
         logging.exception(f"run_one_loop failed: {e}")
         if sim is not None and getattr(sim, "input_df", None) is not None:

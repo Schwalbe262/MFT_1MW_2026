@@ -18,7 +18,7 @@ PROFILE = {
     "cli_flags": "--thermal --headless",
     "param_overrides": dict(
         provisional_wave.scheduler_client.STANDARD_PROFILE_CONTRACT),
-    "timeout_seconds": 21600,
+    "timeout_seconds": provisional_wave.scheduler_client.DEFAULT_TASK_TIMEOUT_SECONDS,
 }
 
 

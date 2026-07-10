@@ -16,6 +16,8 @@ from run_simulation_260706 import (
     _configure_em_conductor_mesh,
     _configure_loss_copy_skin_mesh,
     _delete_copied_solution_or_raise,
+    _em_result_is_valid,
+    _em_result_validation,
     _parse_rl_matrix_export,
     _remap_copied_design_objects,
     _thermal_failure_frame,
@@ -913,7 +915,76 @@ class ThermalHomogenizationTests(unittest.TestCase):
             _volume_weighted_powers([SimpleNamespace(volume=0.0)], 1.0)
 
     def test_production_default_uses_homogenized_rx_blocks(self):
-        self.assertEqual(get_drawing_default_params()["n_explicit_turns"], 0)
+        defaults = get_drawing_default_params()
+        self.assertEqual(defaults["n_explicit_turns"], 0)
+        self.assertEqual(defaults["matrix_percent_error"], 1.5)
+        self.assertEqual(defaults["matrix_max_passes"], 20)
+        self.assertEqual(defaults["percent_error"], 1.5)
+
+
+class EmCompletionPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _valid_result():
+        return pd.DataFrame([{
+            "matrix_percent_error": 1.5,
+            "conv_passes_matrix": 6,
+            "conv_error_pct_matrix": 1.1,
+            "conv_delta_pct_matrix": 0.2,
+            "Ltx": 900.0,
+            "Lrx": 90_000.0,
+            "M": 8_900.0,
+            "k": 0.99,
+            "Lmt": 882.0,
+            "Lmr": 88_200.0,
+            "Llt": 18.0,
+            "Llr": 1_800.0,
+            "percent_error": 1.5,
+            "conv_passes_loss": 4,
+            "conv_error_pct_loss": 0.7,
+            "conv_delta_pct_loss": 0.3,
+            "P_core_total": 1000.0,
+            "P_core_plate_total": 10.0,
+            "P_wcp_total": 20.0,
+            "P_winding_total": 2000.0,
+            "B_mean_core": 0.8,
+            "B_max_core": 1.0,
+        }])
+
+    def test_accepts_finite_converged_matrix_and_loss(self):
+        self.assertTrue(_em_result_is_valid(self._valid_result()))
+
+    def test_rejects_observed_skin_free_matrix_false_positive(self):
+        result = self._valid_result()
+        result.loc[0, "conv_error_pct_matrix"] = 13.254
+        result.loc[0, "conv_delta_pct_matrix"] = 0.1659
+
+        valid, reason = _em_result_validation(result)
+
+        self.assertFalse(valid)
+        self.assertIn("matrix: energy error 13.254% exceeds 1.5%", reason)
+
+    def test_rejects_non_finite_output_or_missing_convergence(self):
+        result = self._valid_result()
+        result.loc[0, "Llt"] = float("nan")
+        self.assertFalse(_em_result_is_valid(result))
+
+        missing_delta = self._valid_result().drop(columns=["conv_delta_pct_loss"])
+        self.assertFalse(_em_result_is_valid(missing_delta))
+
+    def test_validates_only_enabled_stages(self):
+        matrix_only = self._valid_result().drop(columns=[
+            "percent_error", "conv_passes_loss", "conv_error_pct_loss",
+            "conv_delta_pct_loss", *list((
+                "P_core_total", "P_core_plate_total", "P_wcp_total",
+                "P_winding_total", "B_mean_core", "B_max_core",
+            )),
+        ])
+        self.assertTrue(
+            _em_result_is_valid(matrix_only, matrix_on=True, loss_on=False)
+        )
+        self.assertFalse(
+            _em_result_is_valid(matrix_only, matrix_on=False, loss_on=False)
+        )
 
 
 class ThermalMeshPolicyTests(unittest.TestCase):

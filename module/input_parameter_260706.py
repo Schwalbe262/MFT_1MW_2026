@@ -74,9 +74,10 @@ def get_drawing_default_params():
         # 1 이면 대칭(1/8 분할) 미적용 풀모델로 모델링/해석
         "full_model": 0,
         # 해석 수렴 설정
-        "max_passes": 10, "percent_error": 2.5, "min_converged": 2,
-        # matrix(인덕턴스 전용) 경량 셋업: 에너지 적분은 메시에 둔감 - 빠른 수렴
-        "matrix_percent_error": 2.0, "matrix_max_passes": 8, "matrix_min_converged": 1,
+        "max_passes": 10, "percent_error": 1.5, "min_converged": 2,
+        # Skin-free matrix still needs enough adaptive passes: an 8-pass random
+        # run stopped at 13.254% energy error despite a 0.166% delta-energy value.
+        "matrix_percent_error": 1.5, "matrix_max_passes": 20, "matrix_min_converged": 1,
         # 여자/정격 (도면 설계: 1차 1000Vrms / 1000Arms, 2차 10kVrms / 100Arms, 1kHz)
         "freq": 1000.0,          # [Hz]
         "V1_rms": 1000.0,        # 1차 전압원 [Vrms] (loss 디자인 Tx 여자)
