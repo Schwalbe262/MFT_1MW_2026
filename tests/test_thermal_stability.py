@@ -318,11 +318,11 @@ class ThermalStabilityTest(unittest.TestCase):
                 self.assertEqual(ipk.oproject.active_calls, 2)
                 self.assertIs(ipk._odesign, ipk.oproject.last_design)
                 self.assertIs(ipk.design_solutions._odesign, ipk.oproject.last_design)
-                self.assertTrue(
+                self.assertFalse(
                     ipk.setup.props["Solution Initialization - Use Model Based Flow Initialization"]
                 )
-                self.assertEqual(ipk.setup.props["Under-relaxation - Pressure"], "0.3")
-                self.assertTrue(
+                self.assertEqual(ipk.setup.props["Under-relaxation - Pressure"], "0.7")
+                self.assertFalse(
                     ipk.setup.props["Sequential Solve of Flow and Energy Equations"]
                 )
                 self.assertEqual(ipk.setup.props["Convergence Criteria - Flow"], "0.001")

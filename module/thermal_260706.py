@@ -946,9 +946,9 @@ def run_thermal_analysis(sim):
         setup.props["Convergence Criteria - Max Iterations"] = int(df["thermal_max_iterations"].iloc[0])
         setup.props["Convergence Criteria - Flow"] = "0.001"
         setup.props["Convergence Criteria - Energy"] = "1e-07"
-        setup.props["Solution Initialization - Use Model Based Flow Initialization"] = True
-        setup.props["Under-relaxation - Pressure"] = "0.3"
-        setup.props["Sequential Solve of Flow and Energy Equations"] = True
+        setup.props["Solution Initialization - Use Model Based Flow Initialization"] = False
+        setup.props["Under-relaxation - Pressure"] = "0.7"
+        setup.props["Sequential Solve of Flow and Energy Equations"] = False
         if eighth:
             # 1/8 대칭의 z대칭은 부력 무시 가정에 기반 -> 중력 비활성
             setup.props["Include Gravity"] = False
