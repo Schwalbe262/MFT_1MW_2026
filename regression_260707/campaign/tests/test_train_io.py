@@ -20,6 +20,7 @@ def raw_rows():
             "project_name": "sym",
             "saved_at": "2026-07-10 01:00:00",
             "full_model": 0,
+            "matrix_skin_mesh": 0,
             "N1_main": 7,
             "N2_main": 65,
             "N2_side": 5,
@@ -52,6 +53,7 @@ def raw_rows():
             "project_name": "full",
             "saved_at": "2026-07-10 02:00:00",
             "full_model": 1,
+            "matrix_skin_mesh": 1,
             "N1_main": 7,
             "N2_main": 65,
             "N2_side": 5,
@@ -91,6 +93,7 @@ class TrainIoBuilderTests(unittest.TestCase):
         self.assertEqual(view["inductance_to_physical_factor"].tolist(), [2.0, 1.0])
         self.assertEqual(view["Llt_phys"].tolist(), [27.5, 27.5])
         self.assertEqual(view["M_phys"].tolist(), [380.0, 380.0])
+        self.assertEqual(view["matrix_skin_mesh"].tolist(), [0, 1])
         self.assertEqual(view["P_winding_total"].tolist(), [4000.0, 4100.0])
         self.assertEqual(view["T_max_Rx_main"].tolist(), [91.0, 90.0])
         pd.testing.assert_frame_equal(raw, before)

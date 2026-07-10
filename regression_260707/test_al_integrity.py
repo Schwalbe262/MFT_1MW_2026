@@ -56,6 +56,14 @@ def valid_result(**updates):
         "matrix_solve_attempts": 1,
         "loss_solve_attempts": 1,
         "matrix_extraction_backend": "export_rl_matrix",
+        "matrix_conductor_policy": "stranded_no_eddy_no_skin",
+        "matrix_winding_stranded_count": 2,
+        "matrix_conductor_mesh_operation_count": 0,
+        "matrix_plate_eddy_off_readback_count": 5,
+        "loss_winding_solid_update_count": 2,
+        "loss_winding_mesh_operation_count": 2,
+        "loss_conductor_mesh_operation_count": 3,
+        "loss_plate_eddy_on_readback_count": 5,
         "Llt": 13.75,
         "full_model": 0,
         "matrix_on": 1,
@@ -64,7 +72,7 @@ def valid_result(**updates):
         "loss_sym_on": 1,
         "thermal_symmetry": "eighth",
         "n_explicit_turns": 0,
-        "matrix_skin_mesh": 1,
+        "matrix_skin_mesh": 0,
         "matrix_percent_error": 1.5,
         "matrix_max_passes": 10,
         "matrix_min_converged": 1,
@@ -527,7 +535,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
     def test_profile_overrides_isolate_mode_and_parameter_payloads(self):
         submitted = Mock(status_code=201)
         submitted.json.side_effect = [{"id": 51}, {"id": 52}]
-        profile = {"param_overrides": {"full_model": 0, "matrix_skin_mesh": 1}}
+        profile = {"param_overrides": {"full_model": 0, "matrix_skin_mesh": 0}}
         with patch.object(
                 scheduler_client.requests, "get",
                 return_value=task_inventory_response([])), \
@@ -545,7 +553,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertNotEqual(commands[0], commands[1])
         for command in commands:
             self.assertIn('"full_model":0', command)
-            self.assertIn('"matrix_skin_mesh":1', command)
+            self.assertIn('"matrix_skin_mesh":0', command)
         for call in post.call_args_list:
             self.assertEqual(
                 call.kwargs["json"]["timeout_seconds"],
@@ -585,7 +593,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertFalse(scheduler_client.is_valid_result(valid_result(matrix_on=0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(loss_on=0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_on=0)))
-        self.assertFalse(scheduler_client.is_valid_result(valid_result(matrix_skin_mesh=0)))
+        self.assertFalse(scheduler_client.is_valid_result(valid_result(matrix_skin_mesh=1)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(P_target=0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(matrix_max_passes=1)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(git_dirty=1)))
@@ -593,6 +601,10 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             valid_result(matrix_solve_attempts=2)))
         self.assertFalse(scheduler_client.is_valid_result(
             valid_result(matrix_extraction_backend="get_solution_data")))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(matrix_conductor_policy="solid_skin")))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(loss_winding_solid_update_count=1)))
         self.assertFalse(scheduler_client.is_valid_result(
             valid_result(thermal_rx_power_balance_ok=0)))
         self.assertFalse(scheduler_client.is_valid_result(

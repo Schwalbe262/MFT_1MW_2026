@@ -113,8 +113,9 @@ def get_drawing_default_params():
         "loss_sym_on": 1,
         # 열해석 대칭화: "eighth" = 1/8 (양측 팬 y대칭 + 부력 무시 가정, 캠페인용) / "full" = 최종 검증용
         "thermal_symmetry": "eighth",
-        # matrix 디자인의 skin 메시 (1=적용). 0이면 인덕턴스 전용 경량 메시 - A/B 검증 후 캠페인 적용 검토
-        "matrix_skin_mesh": 1,  # skin 제거 시 adaptive 메시 폭발로 solve 무한 (로컬·클러스터 동시 실측)
+        # Inductance-only matrix: stranded windings, plate eddy off, no skin mesh.
+        # The copied loss design restores solid windings and all skin operations.
+        "matrix_skin_mesh": 0,
         # loss 디자인을 matrix 복제로 생성 (모델링 1회분 절약, MFT_TAB 패턴)
         "loss_from_copy": 1,
         # 풀 열해석 팬 구성: "dual" = +-y 양측 유입(냉각 스펙, 1/8과 동일 물리) / "single" = +y->-y

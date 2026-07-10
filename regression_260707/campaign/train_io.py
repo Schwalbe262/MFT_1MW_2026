@@ -122,6 +122,7 @@ GEOMETRY_DERIVED_COLUMNS = (
 
 ANALYSIS_BASIS_COLUMNS = (
     "full_model",
+    "matrix_skin_mesh",
     "loss_sym_on",
     "thermal_symmetry",
     "matrix_on",

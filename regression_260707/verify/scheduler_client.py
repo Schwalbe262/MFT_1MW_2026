@@ -303,6 +303,13 @@ def is_valid_result(
         "git_dirty", "pyaedt_library_git_dirty",
         "matrix_solve_attempts", "loss_solve_attempts",
         "conv_error_pct_matrix", "conv_error_pct_loss",
+        "matrix_winding_stranded_count",
+        "matrix_conductor_mesh_operation_count",
+        "matrix_plate_eddy_off_readback_count",
+        "loss_winding_solid_update_count",
+        "loss_winding_mesh_operation_count",
+        "loss_conductor_mesh_operation_count",
+        "loss_plate_eddy_on_readback_count",
         "P_winding_total", "P_core_total", "P_core_plate_total",
         "thermal_residual_flow_limit", "thermal_residual_energy_limit",
         "thermal_residual_continuity", "thermal_residual_x_velocity",
@@ -327,6 +334,20 @@ def is_valid_result(
             or float(result["full_model"]) != 0.0):
         return False
     if result.get("matrix_extraction_backend") != "export_rl_matrix":
+        return False
+    if result.get("matrix_conductor_policy") != "stranded_no_eddy_no_skin":
+        return False
+    matrix_plate_count = float(result["matrix_plate_eddy_off_readback_count"])
+    loss_plate_count = float(result["loss_plate_eddy_on_readback_count"])
+    if (float(result["matrix_winding_stranded_count"]) != 2.0
+            or float(result["matrix_conductor_mesh_operation_count"]) != 0.0
+            or float(result["loss_winding_solid_update_count"]) != 2.0
+            or float(result["loss_winding_mesh_operation_count"]) != 2.0
+            or matrix_plate_count < 0.0
+            or loss_plate_count != matrix_plate_count
+            or float(result["loss_conductor_mesh_operation_count"]) != (
+                2.0 + float(loss_plate_count > 0.0)
+            )):
         return False
     for key, expected_value in profile_contract.items():
         actual_value = result.get(key)

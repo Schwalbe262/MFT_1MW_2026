@@ -405,12 +405,93 @@ def _project_delete_policy(input_frame, fixed_mode=False, hold=False, model_only
     return not (keep_project or hold or model_only)
 
 
-def _configure_loss_copy_skin_mesh(sim):
-    """Reuse copied winding mesh ops, or create them when matrix omitted them."""
-    if int(sim.df_plus["matrix_skin_mesh"].iloc[0]) != 0:
-        logging.info("loss copy: reusing inherited winding mesh operations")
+def _lightweight_matrix_enabled(sim):
+    return int(sim.df_plus["matrix_skin_mesh"].iloc[0]) == 0
+
+
+def _aedt_bool(value):
+    if isinstance(value, bool):
+        return value
+    token = str(value).strip().lower()
+    if token in {"true", "1", "yes", "on", "solid"}:
+        return True
+    if token in {"false", "0", "no", "off", "stranded"}:
         return False
-    sim.assign_skin_depth()
+    raise RuntimeError(f"unrecognized AEDT boolean readback: {value!r}")
+
+
+def _set_winding_solid_state(winding, is_solid, label):
+    """Update a copied winding and fail before solve if AEDT rejects the edit."""
+    if winding is None or winding is False:
+        raise RuntimeError(f"{label} winding is unavailable")
+    props = winding.props
+    setter = getattr(props, "_setitem_without_update", None)
+    updates = {
+        "IsSolid": bool(is_solid),
+        "Resistance": "0ohm",
+        "Inductance": "0H",
+        "Voltage": "0V",
+        "ParallelBranchesNum": "1",
+    }
+    for key, value in updates.items():
+        if callable(setter):
+            setter(key, value)
+        else:
+            props[key] = value
+    if winding.update() is not True:
+        raise RuntimeError(f"failed to set {label} winding IsSolid={is_solid}")
+    if _aedt_bool(props.get("IsSolid")) != bool(is_solid):
+        raise RuntimeError(f"{label} winding IsSolid readback mismatch")
+    if not str(props.get("Resistance", "")).strip().lower().startswith("0"):
+        raise RuntimeError(f"{label} winding resistance readback is not zero")
+
+
+def _configure_em_conductor_mesh(sim, mode):
+    """Use no skin operations in lightweight matrix and full detail in loss."""
+    if mode == "matrix" and _lightweight_matrix_enabled(sim):
+        logging.info(
+            "matrix design: stranded windings, plate eddy effects off, "
+            "and no skin-depth mesh operations"
+        )
+        plate_count = sim.assign_plate_settings(
+            enable_eddy_effects=False, assign_skin_mesh=False
+        )
+        sim.matrix_conductor_policy = "stranded_no_eddy_no_skin"
+        sim.matrix_winding_stranded_count = 2
+        sim.matrix_conductor_mesh_operation_count = 0
+        sim.matrix_plate_eddy_off_readback_count = int(plate_count)
+        return False
+    winding_mesh_count = sim.assign_skin_depth()
+    plate_count = sim.assign_plate_settings(
+        enable_eddy_effects=True, assign_skin_mesh=True
+    )
+    if mode == "matrix":
+        sim.matrix_conductor_policy = "solid_skin"
+        sim.matrix_winding_stranded_count = 0
+        sim.matrix_conductor_mesh_operation_count = (
+            int(winding_mesh_count) + int(int(plate_count) > 0)
+        )
+        sim.matrix_plate_eddy_off_readback_count = 0
+    return True
+
+
+def _configure_loss_copy_skin_mesh(sim):
+    """Restore precise conductor physics when the matrix used stranded conductors."""
+    if not _lightweight_matrix_enabled(sim):
+        logging.info("loss copy: reusing inherited solid windings and mesh operations")
+        return False
+    _set_winding_solid_state(sim.tx_winding, True, "Tx")
+    _set_winding_solid_state(sim.rx_winding, True, "Rx")
+    winding_mesh_count = sim.assign_skin_depth()
+    plate_count = sim.assign_plate_settings(
+        enable_eddy_effects=True, assign_skin_mesh=True
+    )
+    sim.loss_winding_solid_update_count = 2
+    sim.loss_winding_mesh_operation_count = int(winding_mesh_count)
+    sim.loss_plate_eddy_on_readback_count = int(plate_count)
+    sim.loss_conductor_mesh_operation_count = (
+        int(winding_mesh_count) + int(int(plate_count) > 0)
+    )
     return True
 
 
@@ -579,6 +660,55 @@ def _wait_for_ready_copied_loss_design(
                 f"{float(timeout_s):g}s; last={last}"
             )
         sleeper(min(max(0.0, float(poll_s)), max(0.0, deadline - now)))
+
+
+def _named_object_sequence(value):
+    """Return object names without allowing an unnameable remap entry."""
+    if value is None:
+        return []
+    values = value if isinstance(value, (list, tuple)) else [value]
+    names = []
+    for item in values:
+        if isinstance(item, (list, tuple)):
+            names.extend(_named_object_sequence(item))
+            continue
+        name = item if isinstance(item, str) else getattr(item, "name", None)
+        if not name:
+            raise RuntimeError(f"copied-object remap contains no name: {item!r}")
+        names.append(str(name))
+    return names
+
+
+def _remap_copied_design_objects(old_design, new_design, attributes):
+    """Remap copied objects and reject every missing or reordered object."""
+    for attribute in attributes:
+        if not hasattr(old_design, attribute):
+            continue
+        source = getattr(old_design, attribute)
+        expected_names = _named_object_sequence(source)
+        try:
+            mapped = new_design.model3d.find_object(source)
+        except Exception as error:
+            raise RuntimeError(f"copied-object remap failed for {attribute}") from error
+        actual_names = _named_object_sequence(mapped) if mapped is not None else []
+        if actual_names != expected_names:
+            raise RuntimeError(
+                f"copied-object remap mismatch for {attribute}: "
+                f"expected={expected_names}, actual={actual_names}"
+            )
+        setattr(new_design, attribute, mapped)
+
+
+def _delete_copied_solution_or_raise(primary_design, fallback_design):
+    """Delete inherited fields before loss solve, using one of two COM paths."""
+    errors = []
+    for label, design in (("wrapper", primary_design), ("native", fallback_design)):
+        try:
+            design.DeleteFullVariation("All", False)
+            return label
+        except Exception as error:
+            errors.append(f"{label}={type(error).__name__}: {error}")
+    raise RuntimeError("copied solution deletion failed: " + "; ".join(errors))
 
 
 class Simulation():
@@ -1101,6 +1231,7 @@ class Simulation():
         """
         I1 = float(self.df_plus["I1_rated"].iloc[0])
         I2 = float(self.df_plus["I2_rated"].iloc[0])
+        matrix_is_solid = not (mode == "matrix" and _lightweight_matrix_enabled(self))
 
         if mode == "loss":
             # 손실 원샷 여자 (풀모델): Tx 전압원(V1) + Rx 정격 전류원.
@@ -1162,7 +1293,7 @@ class Simulation():
             self.tx_winding = self.design1.assign_winding(
                 assignment=[],
                 winding_type="Current",
-                is_solid=True,
+                is_solid=matrix_is_solid,
                 current=f"{I1 * math.sqrt(2)}A",
                 name="Tx_winding"
             )
@@ -1170,7 +1301,7 @@ class Simulation():
             self.rx_winding = self.design1.assign_winding(
                 assignment=[],
                 winding_type="Current",
-                is_solid=True,
+                is_solid=matrix_is_solid,
                 current=f"{I2 * math.sqrt(2)}A",
                 name="Rx_winding"
             )
@@ -1248,6 +1379,8 @@ class Simulation():
             layers_number="2",
             name="Tx_winding_skin_depth"
         )
+        if self.Tx_skin_depth_mesh is False or self.Tx_skin_depth_mesh is None:
+            raise RuntimeError("failed to assign Tx winding skin-depth mesh")
 
         rx_mode = str(self.df_plus["rx_mesh_mode"].iloc[0])
         cw2 = float(self.df_plus["cw2"].iloc[0])
@@ -1260,6 +1393,8 @@ class Simulation():
                 maximum_elements=None,
                 name="Rx_winding_length_mesh"
             )
+            if self.Rx_length_mesh is False or self.Rx_length_mesh is None:
+                raise RuntimeError("failed to assign Rx winding length mesh")
         elif rx_mode == "length-coarse":
             # 실험적: foil 두께 1요소 (최대 가속 후보, 벤치마크용)
             self.Rx_length_mesh = self.design1.mesh.assign_length_mesh(
@@ -1268,6 +1403,8 @@ class Simulation():
                 maximum_elements=None,
                 name="Rx_winding_length_mesh"
             )
+            if self.Rx_length_mesh is False or self.Rx_length_mesh is None:
+                raise RuntimeError("failed to assign Rx winding coarse length mesh")
         else:
             # 기본: 기존 skin-depth op (proximity effect 반영 검증된 설정)
             self.Rx_skin_depth_mesh = self.design1.mesh.assign_skin_depth(
@@ -1277,24 +1414,36 @@ class Simulation():
                 layers_number="1",
                 name="Rx_winding_skin_depth"
             )
+            if self.Rx_skin_depth_mesh is False or self.Rx_skin_depth_mesh is None:
+                raise RuntimeError("failed to assign Rx winding skin-depth mesh")
+        return 2
 
-    def assign_plate_settings(self):
+    def assign_plate_settings(self, enable_eddy_effects=True, assign_skin_mesh=True):
         """콜드플레이트/권선 냉각판 (알루미늄) 와전류 설정 + 메시"""
 
         plates = self.design1.core_plates + self.design1.wcp_plates
         if not plates:
-            return
+            return 0
 
         plate_names = [p.name for p in plates]
 
-        try:
-            self.design1.eddy_effects_on(
-                assignment=plate_names,
-                enable_eddy_effects=True,
-                enable_displacement_current=False
-            )
-        except Exception as e:
-            logging.warning(f"Failed to set eddy effects on plates: {e}")
+        result = self.design1.eddy_effects_on(
+            assignment=plate_names,
+            enable_eddy_effects=enable_eddy_effects,
+            enable_displacement_current=False
+        )
+        if result is not True:
+            raise RuntimeError(f"failed to set plate eddy effects={enable_eddy_effects}")
+        for plate_name in plate_names:
+            actual = _aedt_bool(self.design1.oboundary.GetEddyEffect(plate_name))
+            if actual != bool(enable_eddy_effects):
+                raise RuntimeError(
+                    f"plate eddy-effect readback mismatch for {plate_name}: {actual}"
+                )
+
+        if not assign_skin_mesh:
+            logging.info("plate skin-depth mesh skipped")
+            return len(plates)
 
         freq = float(self.df_plus["freq"].iloc[0])
         mu0 = 4 * math.pi * 1e-7
@@ -1302,16 +1451,16 @@ class Simulation():
         omega = 2 * math.pi * freq
         skin_depth = math.sqrt(2 / (omega * mu0 * sigma_al)) * 1e3  # in mm (~2.6mm @1kHz)
 
-        try:
-            self.plate_skin_depth_mesh = self.design1.mesh.assign_skin_depth(
-                assignment=plates,
-                skin_depth=f'{skin_depth}mm',
-                triangulation_max_length='50mm',
-                layers_number="1",
-                name="plate_skin_depth"
-            )
-        except Exception as e:
-            logging.warning(f"Failed to assign skin depth mesh on plates: {e}")
+        self.plate_skin_depth_mesh = self.design1.mesh.assign_skin_depth(
+            assignment=plates,
+            skin_depth=f'{skin_depth}mm',
+            triangulation_max_length='50mm',
+            layers_number="1",
+            name="plate_skin_depth"
+        )
+        if self.plate_skin_depth_mesh is False or self.plate_skin_depth_mesh is None:
+            raise RuntimeError("failed to assign plate skin-depth mesh")
+        return len(plates)
 
     def assign_boundary(self):
 
@@ -1946,6 +2095,19 @@ class Simulation():
         row["winding_current_extraction_backend"] = self.extraction_backends.get(
             "winding_current", "not_run"
         )
+        row["matrix_conductor_policy"] = getattr(
+            self, "matrix_conductor_policy", "not_recorded"
+        )
+        for key in (
+            "matrix_winding_stranded_count",
+            "matrix_conductor_mesh_operation_count",
+            "matrix_plate_eddy_off_readback_count",
+            "loss_winding_solid_update_count",
+            "loss_winding_mesh_operation_count",
+            "loss_conductor_mesh_operation_count",
+            "loss_plate_eddy_on_readback_count",
+        ):
+            row[key] = int(getattr(self, key, -1))
         return pd.DataFrame([row])
 
     def save_results_to_csv(self, results_df, filename="simulation_results_260706.csv"):
@@ -2269,13 +2431,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 sim.assign_matrix()
             else:
                 sim.assign_core_loss()
-            # matrix 디자인은 인덕턴스(에너지 적분)가 목적이라 skin 메시를 뺄 수 있는 옵션
-            # (matrix_skin_mesh=0). 단 Llt가 스펙 라벨(+-2% 밴드)이므로 A/B 검증 통과 후에만 캠페인 적용.
-            if mode == "matrix" and int(sim.df_plus["matrix_skin_mesh"].iloc[0]) == 0:
-                logging.info("matrix design: skin-depth mesh ops skipped (matrix_skin_mesh=0)")
-            else:
-                sim.assign_skin_depth()
-            sim.assign_plate_settings()
+            _configure_em_conductor_mesh(sim, mode)
             sim.assign_boundary()
             sim.create_setup(mode=mode)
 
@@ -2303,21 +2459,23 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
             # 모델링 때 래퍼에 저장된 객체 핸들들을 복제 디자인으로 리매핑
             # (save_calculation/save_loss_reports가 소비 - MFT_TAB 레퍼런스 패턴)
-            for a in ("Tx_windings_main", "Tx_windings_side", "Tx_windings_side2", "Tx_windings",
-                      "Rx_windings_main", "Rx_windings_side", "Rx_windings_side2", "Rx_windings",
-                      "core_objs", "core_plates", "core_pads", "wcp_plates", "wcp_pads"):
-                if hasattr(old_design, a):
-                    try:
-                        setattr(new_design, a, new_design.model3d.find_object(getattr(old_design, a)))
-                    except Exception as e:
-                        logging.warning(f"object remap failed for {a}: {e}")
+            _remap_copied_design_objects(
+                old_design,
+                new_design,
+                (
+                    "Tx_windings_main", "Tx_windings_side", "Tx_windings_side2",
+                    "Tx_windings", "Rx_windings_main", "Rx_windings_side",
+                    "Rx_windings_side2", "Rx_windings", "core_objs", "core_plates",
+                    "core_pads", "wcp_plates", "wcp_pads",
+                ),
+            )
 
             # matrix 파라미터 제거 (loss 디자인에는 불필요한 연산)
+            od = op.GetActiveDesign()
             try:
-                od = op.GetActiveDesign()
                 od.GetModule("MaxwellParameterSetup").DeleteParameters(["Matrix"])
-            except Exception as e:
-                logging.warning(f"matrix param delete on copy failed (continuing): {e}")
+            except Exception as error:
+                raise RuntimeError("matrix parameter deletion failed on loss copy") from error
 
             # 여자 전류를 loss_sym 페이저로 제자리 수정 (타입 동일: Current)
             I2 = float(sim.df_plus["I2_rated"].iloc[0])
@@ -2333,13 +2491,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
             # 복제 디자인이 물려받은 matrix 해를 삭제 - 안 지우면 여자를 바꿔도
             # 솔버가 재해석 없이 '해 없음 완료'로 끝남 (로컬 랜덤 검증에서 3/3 재현)
-            try:
-                sim.design1.design.odesign.DeleteFullVariation("All", False)
-            except Exception:
-                try:
-                    op.GetActiveDesign().DeleteFullVariation("All", False)
-                except Exception as e:
-                    logging.warning(f"copied-solution delete failed: {e}")
+            _delete_copied_solution_or_raise(
+                sim.design1.design.odesign,
+                op.GetActiveDesign(),
+            )
 
             # 코어손실 + skin 메시(손실 정밀용) + 셋업 정밀값
             sim.assign_core_loss()

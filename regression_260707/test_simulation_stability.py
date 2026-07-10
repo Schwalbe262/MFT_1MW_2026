@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -13,8 +13,11 @@ from run_simulation_260706 import (
     SolutionDataUnavailableError,
     _completion_exit_code,
     _configure_copied_loss_setup,
+    _configure_em_conductor_mesh,
     _configure_loss_copy_skin_mesh,
+    _delete_copied_solution_or_raise,
     _parse_rl_matrix_export,
+    _remap_copied_design_objects,
     _thermal_failure_frame,
     _thermal_result_is_valid,
     _wait_for_ready_copied_loss_design,
@@ -222,12 +225,35 @@ class SolutionDataTests(unittest.TestCase):
 
 
 class CopiedLossMeshPolicyTests(unittest.TestCase):
+    class _Winding:
+        def __init__(self, name, update_result=True):
+            self.name = name
+            self.props = {"IsSolid": False}
+            self.update_result = update_result
+            self.update_calls = 0
+
+        def update(self):
+            self.update_calls += 1
+            return self.update_result
+
     @staticmethod
     def _simulation(matrix_skin_mesh):
         calls = []
+
+        def assign_skin_depth():
+            calls.append(("skin", {}))
+            return 2
+
+        def assign_plate_settings(**kwargs):
+            calls.append(("plates", kwargs))
+            return 5
+
         return SimpleNamespace(
             df_plus=pd.DataFrame({"matrix_skin_mesh": [matrix_skin_mesh]}),
-            assign_skin_depth=lambda: calls.append("assign"),
+            tx_winding=CopiedLossMeshPolicyTests._Winding("Tx"),
+            rx_winding=CopiedLossMeshPolicyTests._Winding("Rx"),
+            assign_skin_depth=assign_skin_depth,
+            assign_plate_settings=assign_plate_settings,
         ), calls
 
     def test_reuses_winding_mesh_inherited_from_matrix(self):
@@ -237,14 +263,157 @@ class CopiedLossMeshPolicyTests(unittest.TestCase):
 
         self.assertFalse(assigned)
         self.assertEqual(calls, [])
+        self.assertFalse(simulation.tx_winding.props["IsSolid"])
 
-    def test_assigns_winding_mesh_when_matrix_skipped_it(self):
+    def test_restores_solid_windings_and_all_skin_mesh_for_loss(self):
         simulation, calls = self._simulation(0)
 
         assigned = _configure_loss_copy_skin_mesh(simulation)
 
         self.assertTrue(assigned)
-        self.assertEqual(calls, ["assign"])
+        self.assertTrue(simulation.tx_winding.props["IsSolid"])
+        self.assertTrue(simulation.rx_winding.props["IsSolid"])
+        self.assertEqual(simulation.tx_winding.props["Resistance"], "0ohm")
+        self.assertEqual(simulation.rx_winding.props["ParallelBranchesNum"], "1")
+        self.assertEqual(simulation.tx_winding.update_calls, 1)
+        self.assertEqual(simulation.rx_winding.update_calls, 1)
+        self.assertEqual(simulation.loss_winding_solid_update_count, 2)
+        self.assertEqual(simulation.loss_winding_mesh_operation_count, 2)
+        self.assertEqual(simulation.loss_conductor_mesh_operation_count, 3)
+        self.assertEqual(simulation.loss_plate_eddy_on_readback_count, 5)
+        self.assertEqual(calls, [
+            ("skin", {}),
+            ("plates", {"enable_eddy_effects": True, "assign_skin_mesh": True}),
+        ])
+
+    def test_winding_update_failure_stops_before_loss_mesh(self):
+        simulation, calls = self._simulation(0)
+        simulation.tx_winding.update_result = False
+
+        with self.assertRaisesRegex(RuntimeError, "failed to set Tx winding"):
+            _configure_loss_copy_skin_mesh(simulation)
+
+        self.assertEqual(calls, [])
+
+    def test_lightweight_matrix_has_no_skin_operations(self):
+        simulation, calls = self._simulation(0)
+
+        assigned = _configure_em_conductor_mesh(simulation, "matrix")
+
+        self.assertFalse(assigned)
+        self.assertEqual(simulation.matrix_conductor_policy, "stranded_no_eddy_no_skin")
+        self.assertEqual(simulation.matrix_winding_stranded_count, 2)
+        self.assertEqual(simulation.matrix_conductor_mesh_operation_count, 0)
+        self.assertEqual(simulation.matrix_plate_eddy_off_readback_count, 5)
+        self.assertEqual(calls, [
+            ("plates", {"enable_eddy_effects": False, "assign_skin_mesh": False}),
+        ])
+
+    def test_matrix_windings_are_stranded_when_skin_is_disabled(self):
+        calls = []
+
+        class _Design:
+            def assign_winding(self, **kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace()
+
+        simulation = Simulation.__new__(Simulation)
+        simulation.df_plus = pd.DataFrame({
+            "matrix_skin_mesh": [0],
+            "I1_rated": [1000.0],
+            "I2_rated": [100.0],
+        })
+        simulation.design1 = _Design()
+
+        simulation.assign_winding(mode="matrix")
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call["is_solid"] is False for call in calls))
+
+    def test_lightweight_matrix_disables_plate_eddy_without_mesh(self):
+        calls = []
+        design = SimpleNamespace(
+            core_plates=[SimpleNamespace(name="core_plate")],
+            wcp_plates=[],
+            eddy_effects_on=lambda **kwargs: calls.append(kwargs) or True,
+            oboundary=SimpleNamespace(GetEddyEffect=lambda _name: "false"),
+        )
+        simulation = Simulation.__new__(Simulation)
+        simulation.design1 = design
+
+        simulation.assign_plate_settings(
+            enable_eddy_effects=False, assign_skin_mesh=False
+        )
+
+        self.assertEqual(calls, [{
+            "assignment": ["core_plate"],
+            "enable_eddy_effects": False,
+            "enable_displacement_current": False,
+        }])
+
+    def test_plate_eddy_readback_mismatch_fails_closed(self):
+        design = SimpleNamespace(
+            core_plates=[SimpleNamespace(name="core_plate")],
+            wcp_plates=[],
+            eddy_effects_on=lambda **_kwargs: True,
+            oboundary=SimpleNamespace(GetEddyEffect=lambda _name: "false"),
+        )
+        simulation = Simulation.__new__(Simulation)
+        simulation.design1 = design
+
+        with self.assertRaisesRegex(RuntimeError, "readback mismatch"):
+            simulation.assign_plate_settings(
+                enable_eddy_effects=True, assign_skin_mesh=False
+            )
+
+
+class CopiedLossObjectIntegrityTests(unittest.TestCase):
+    @staticmethod
+    def _object(name):
+        return SimpleNamespace(name=name)
+
+    def test_remap_preserves_every_object_name_and_order(self):
+        old = SimpleNamespace(
+            Tx_windings=[self._object("Tx_0"), self._object("Tx_1")],
+            empty=[],
+        )
+
+        def find_object(source):
+            return [self._object(item.name) for item in source]
+
+        new = SimpleNamespace(model3d=SimpleNamespace(find_object=find_object))
+
+        _remap_copied_design_objects(old, new, ("Tx_windings", "empty"))
+
+        self.assertEqual([item.name for item in new.Tx_windings], ["Tx_0", "Tx_1"])
+        self.assertEqual(new.empty, [])
+
+    def test_remap_rejects_one_missing_turn(self):
+        old = SimpleNamespace(
+            Rx_windings=[self._object("Rx_0"), self._object("Rx_1")]
+        )
+        new = SimpleNamespace(model3d=SimpleNamespace(
+            find_object=lambda _source: [self._object("Rx_0")]
+        ))
+
+        with self.assertRaisesRegex(RuntimeError, "remap mismatch for Rx_windings"):
+            _remap_copied_design_objects(old, new, ("Rx_windings",))
+
+    def test_solution_delete_uses_fallback_after_primary_failure(self):
+        primary = SimpleNamespace(DeleteFullVariation=Mock(side_effect=RuntimeError("grpc")))
+        fallback = SimpleNamespace(DeleteFullVariation=Mock(return_value=None))
+
+        backend = _delete_copied_solution_or_raise(primary, fallback)
+
+        self.assertEqual(backend, "native")
+        fallback.DeleteFullVariation.assert_called_once_with("All", False)
+
+    def test_solution_delete_fails_when_both_paths_fail(self):
+        primary = SimpleNamespace(DeleteFullVariation=Mock(side_effect=RuntimeError("grpc")))
+        fallback = SimpleNamespace(DeleteFullVariation=Mock(side_effect=RuntimeError("com")))
+
+        with self.assertRaisesRegex(RuntimeError, "copied solution deletion failed"):
+            _delete_copied_solution_or_raise(primary, fallback)
 
 
 class _FakeClock:
