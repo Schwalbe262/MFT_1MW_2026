@@ -241,6 +241,7 @@ class ThermalStabilityTest(unittest.TestCase):
                 "thermal_symmetry": ["eighth"],
                 "thermal_max_iterations": [100],
                 "N2_side": [1 if include_side else 0],
+                "n_explicit_turns": [1],
             }),
             input_df=pd.DataFrame([{}]),
             NUM_CORE=4,
@@ -261,12 +262,23 @@ class ThermalStabilityTest(unittest.TestCase):
             "core_pads": [],
         }
 
+        def record_mock_power_balance(_ipk, target_sim, _objects, **_kwargs):
+            target_sim.thermal_rx_model = "hybrid_explicit"
+            target_sim.thermal_rx_power_balance = [{
+                "group": "P_Rx_main_group",
+                "name_hint": "Rx_main_0",
+                "expected_w": 0.0,
+                "assigned_w": 0.0,
+            }]
+            return {}
+
         with ExitStack() as stack:
             stack.enter_context(patch.object(thermal, "set_design_variables"))
             stack.enter_context(patch.object(thermal, "_create_thermal_materials"))
             stack.enter_context(patch.object(thermal, "_build_geometry", return_value=objects))
             stack.enter_context(patch.object(thermal, "_create_probe_sheets", return_value=[]))
-            stack.enter_context(patch.object(thermal, "_assign_losses"))
+            stack.enter_context(patch.object(
+                thermal, "_assign_losses", side_effect=record_mock_power_balance))
             stack.enter_context(patch.object(thermal, "_assign_boundaries"))
             stack.enter_context(patch.object(thermal, "_assign_thermal_mesh"))
             stack.enter_context(patch.object(

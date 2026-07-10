@@ -1,4 +1,5 @@
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,13 @@ from run_simulation_260706 import (
     _thermal_failure_frame,
     _thermal_result_is_valid,
     log_failed_sample,
+)
+from module.input_parameter_260706 import get_drawing_default_params
+from module.thermal_260706 import (
+    _build_homog_blocks,
+    _partition_rx_turns,
+    _rx_layout,
+    _volume_weighted_powers,
 )
 
 
@@ -478,6 +486,75 @@ class FieldsReporterTests(unittest.TestCase):
         self.assertEqual(Simulation._select_explicit_turns(turns, 0), [])
 
 
+class ThermalHomogenizationTests(unittest.TestCase):
+    class _Modeler:
+        def __init__(self):
+            self.calls = []
+
+        def create_box(self, origin, sizes, name, material):
+            numeric_sizes = [float(str(value).removesuffix("mm")) for value in sizes]
+            obj = SimpleNamespace(
+                name=name,
+                volume=math.prod(numeric_sizes),
+                origin=origin,
+                sizes=sizes,
+                material=material,
+            )
+            self.calls.append(obj)
+            return obj
+
+    def test_zero_explicit_turns_partitions_every_turn_into_blocks(self):
+        turns = [SimpleNamespace(name=f"rx_{index}") for index in range(5)]
+
+        explicit, blocked = _partition_rx_turns(turns, 0)
+
+        self.assertEqual(explicit, [])
+        self.assertEqual([turn.name for turn in blocked], [turn.name for turn in turns])
+        explicit, blocked = _partition_rx_turns(turns, 2)
+        self.assertEqual([turn.name for turn in explicit], ["rx_0", "rx_1", "rx_3", "rx_4"])
+        self.assertEqual([turn.name for turn in blocked], ["rx_2"])
+
+    def test_zero_explicit_blocks_span_the_complete_rx_pack(self):
+        frame = pd.DataFrame([{
+            "n_explicit_turns": 0,
+            "cw2": 0.5,
+            "gap2": 0.25,
+            "N2_main": 5,
+            "sl2_main_x": 100.0,
+            "sl2_main_y": 120.0,
+        }])
+        modeler = self._Modeler()
+        ipk = SimpleNamespace(modeler=modeler)
+
+        blocks = _build_homog_blocks(ipk, frame, "main", "Rx_main", 0.0, 80.0)
+
+        _, width, x_pos, y_pos = _rx_layout(frame, "main")
+        x_inner, x_outer = x_pos[0] - width / 2, x_pos[-1] + width / 2
+        y_inner, y_outer = y_pos[0] - width / 2, y_pos[-1] + width / 2
+        by_name = {block.name: block for block in blocks}
+        self.assertEqual(set(by_name), {
+            "Rx_main_block_xp", "Rx_main_block_xn",
+            "Rx_main_block_yp", "Rx_main_block_yn",
+        })
+        self.assertEqual(by_name["Rx_main_block_xp"].origin[0], f"{x_inner}mm")
+        self.assertEqual(by_name["Rx_main_block_xp"].sizes[0], f"{x_outer - x_inner}mm")
+        self.assertEqual(by_name["Rx_main_block_yp"].origin[1], f"{y_inner}mm")
+        self.assertEqual(by_name["Rx_main_block_yp"].sizes[1], f"{y_outer - y_inner}mm")
+
+    def test_volume_weighted_distribution_preserves_group_power(self):
+        blocks = [SimpleNamespace(volume=1.0), SimpleNamespace(volume=3.0)]
+
+        powers = _volume_weighted_powers(blocks, 80.0)
+
+        self.assertEqual(powers, [20.0, 60.0])
+        self.assertAlmostEqual(sum(powers), 80.0)
+        with self.assertRaisesRegex(RuntimeError, "invalid thermal block volumes"):
+            _volume_weighted_powers([SimpleNamespace(volume=0.0)], 1.0)
+
+    def test_production_default_uses_homogenized_rx_blocks(self):
+        self.assertEqual(get_drawing_default_params()["n_explicit_turns"], 0)
+
+
 class FailureLogTests(unittest.TestCase):
     def test_jsonl_accepts_schema_changes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -508,6 +585,12 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
             "thermal_residual_y_velocity": [9e-4],
             "thermal_residual_z_velocity": [4e-4],
             "thermal_residual_energy": [4e-9],
+            "thermal_rx_model": ["homogenized_blocks"],
+            "thermal_rx_power_balance_ok": [1],
+            "thermal_rx_power_balance_group_count": [2],
+            "thermal_rx_power_balance_max_abs_w": [0.0],
+            "thermal_rx_expected_power_w": [120.0],
+            "thermal_rx_assigned_power_w": [120.0],
             "thermal_required_group_mask": [15],
             "T_max_Tx": [80.0],
             "T_max_Rx_main": [81.0],
@@ -533,6 +616,11 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
         zero_iterations = valid.copy()
         zero_iterations["thermal_iterations"] = 0
         self.assertFalse(_thermal_result_is_valid(zero_iterations))
+        unbalanced = valid.copy()
+        unbalanced["thermal_rx_assigned_power_w"] = 119.0
+        self.assertFalse(_thermal_result_is_valid(unbalanced))
+        missing_balance = valid.drop(columns=["thermal_rx_power_balance_ok"])
+        self.assertFalse(_thermal_result_is_valid(missing_balance))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"thermal_solved": [0]})))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"other": [1]})))
         self.assertFalse(_thermal_result_is_valid(None))

@@ -289,6 +289,25 @@ def _thermal_result_is_valid(frame):
             return False
         if int(frame["thermal_extraction_complete"].iloc[0]) != 1:
             return False
+        if int(frame["thermal_rx_power_balance_ok"].iloc[0]) != 1:
+            return False
+        if float(frame["thermal_rx_power_balance_group_count"].iloc[0]) < 1:
+            return False
+        rx_expected = float(frame["thermal_rx_expected_power_w"].iloc[0])
+        rx_assigned = float(frame["thermal_rx_assigned_power_w"].iloc[0])
+        rx_balance_error = float(frame["thermal_rx_power_balance_max_abs_w"].iloc[0])
+        if not (
+            str(frame["thermal_rx_model"].iloc[0])
+            in {"homogenized_blocks", "hybrid_explicit"}
+            and math.isfinite(rx_expected)
+            and rx_expected >= 0
+            and math.isfinite(rx_assigned)
+            and rx_assigned >= 0
+            and math.isclose(rx_assigned, rx_expected, rel_tol=1e-12, abs_tol=1e-9)
+            and math.isfinite(rx_balance_error)
+            and 0 <= rx_balance_error <= 1e-9
+        ):
+            return False
         flow_limit = float(frame["thermal_residual_flow_limit"].iloc[0])
         energy_limit = float(frame["thermal_residual_energy_limit"].iloc[0])
         flow_residuals = [
@@ -337,6 +356,12 @@ def _thermal_failure_frame(error):
         "thermal_required_missing_count": [4],
         "thermal_required_group_mask": [15],
         "thermal_required_group_count": [4],
+        "thermal_rx_model": ["unknown"],
+        "thermal_rx_power_balance_ok": [0],
+        "thermal_rx_power_balance_group_count": [0],
+        "thermal_rx_power_balance_max_abs_w": [float("nan")],
+        "thermal_rx_expected_power_w": [float("nan")],
+        "thermal_rx_assigned_power_w": [float("nan")],
         "thermal_error_type": [type(error).__name__],
         "thermal_error_message": [message[:2000]],
     })

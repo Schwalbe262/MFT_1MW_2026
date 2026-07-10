@@ -281,6 +281,9 @@ def is_valid_result(
         "thermal_residual_continuity", "thermal_residual_x_velocity",
         "thermal_residual_y_velocity", "thermal_residual_z_velocity",
         "thermal_residual_energy", "thermal_iterations",
+        "thermal_rx_power_balance_ok", "thermal_rx_power_balance_group_count",
+        "thermal_rx_power_balance_max_abs_w", "thermal_rx_expected_power_w",
+        "thermal_rx_assigned_power_w",
     ) + tuple(
         key for key, value in profile_contract.items()
         if not isinstance(value, str)
@@ -322,6 +325,21 @@ def is_valid_result(
     if (not 0 < flow_limit <= 1e-3
             or not 0 < energy_limit <= 1e-7
             or float(result["thermal_iterations"]) <= 0):
+        return False
+    if (float(result["thermal_rx_power_balance_ok"]) != 1.0
+            or float(result["thermal_rx_power_balance_group_count"]) < 1.0
+            or float(result["thermal_rx_expected_power_w"]) < 0.0
+            or float(result["thermal_rx_assigned_power_w"]) < 0.0
+            or not math.isclose(
+                float(result["thermal_rx_assigned_power_w"]),
+                float(result["thermal_rx_expected_power_w"]),
+                rel_tol=1e-12,
+                abs_tol=1e-9,
+            )
+            or not 0.0 <= float(result["thermal_rx_power_balance_max_abs_w"]) <= 1e-9):
+        return False
+    if (float(result.get("n_explicit_turns", -1)) == 0.0
+            and result.get("thermal_rx_model") != "homogenized_blocks"):
         return False
     if not all(0 <= float(result[key]) <= flow_limit for key in (
             "thermal_residual_continuity", "thermal_residual_x_velocity",

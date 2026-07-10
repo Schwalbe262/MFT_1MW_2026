@@ -427,16 +427,34 @@ def _rx_layout(df, prefix):
     return N, cw2, x_pos, y_pos
 
 
+def _partition_rx_turns(windings, n_explicit):
+    """Return retained explicit turns and the turns replaced by thermal blocks."""
+    windings = list(windings)
+    count = int(n_explicit)
+    if count < 0 or 2 * count >= len(windings):
+        return windings, []
+    if count == 0:
+        return [], windings
+    return windings[:count] + windings[-count:], windings[count:-count]
+
+
 def _build_homog_blocks(ipk, df, prefix, name, offset_x, height):
-    """Rx 그룹 중간 턴들을 4개 직육면체 블록으로 균질화"""
+    """Replace the selected Rx pack span with four anisotropic solid blocks."""
     n_exp = int(df["n_explicit_turns"].iloc[0])
     N, cw, x_pos, y_pos = _rx_layout(df, prefix)
 
-    # 중간 영역: 안쪽 kept 턴(index n_exp-1)의 바깥면 ~ 바깥 kept 턴(index N-n_exp)의 안쪽면
-    bx_in = x_pos[n_exp - 1] + cw / 2
-    bx_out = x_pos[N - n_exp] - cw / 2
-    by_in = y_pos[n_exp - 1] + cw / 2
-    by_out = y_pos[N - n_exp] - cw / 2
+    if n_exp == 0:
+        # Full-pack homogenization includes every foil and every inter-turn gap.
+        bx_in = x_pos[0] - cw / 2
+        bx_out = x_pos[-1] + cw / 2
+        by_in = y_pos[0] - cw / 2
+        by_out = y_pos[-1] + cw / 2
+    else:
+        # Middle region between the retained inner and outer explicit turns.
+        bx_in = x_pos[n_exp - 1] + cw / 2
+        bx_out = x_pos[N - n_exp] - cw / 2
+        by_in = y_pos[n_exp - 1] + cw / 2
+        by_out = y_pos[N - n_exp] - cw / 2
 
     z0 = -height / 2
     blocks = []
@@ -536,11 +554,9 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
             shape="rectangle", offset=[offset_x, 0, 0], color=[10, 10, 255],
             round_corner=False
         )
-        N = len(windings)
-        if n_exp < 0 or 2 * n_exp >= N:
-            return windings, []  # 전 턴 explicit
-        explicit = windings[:n_exp] + windings[-n_exp:]
-        middle = windings[n_exp:N - n_exp]
+        explicit, middle = _partition_rx_turns(windings, n_exp)
+        if not middle:
+            return explicit, []
         if middle:
             # 대형 샘플에서 일괄 삭제가 gRPC로 부분 실패하는 사례 실측
             # ('Object does not have mesh' -> 솔버 중단) -> 삭제 후 검증 + 개별 재삭제
@@ -689,12 +705,36 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
 # 손실 주입 / 경계조건
 # ---------------------------------------------------------------------------
 
+
+def _volume_weighted_powers(objects, total_power):
+    """Distribute a finite non-negative group loss and preserve it exactly."""
+    total = float(total_power)
+    if not math.isfinite(total) or total < 0:
+        raise ValueError(f"invalid group loss: {total_power}")
+    objects = list(objects)
+    if not objects:
+        if math.isclose(total, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            return []
+        raise RuntimeError(f"cannot distribute {total}W without thermal blocks")
+    volumes = [abs(float(obj.volume)) for obj in objects]
+    if any(not math.isfinite(volume) or volume <= 0 for volume in volumes):
+        raise RuntimeError(f"invalid thermal block volumes: {volumes}")
+    volume_total = sum(volumes)
+    powers = [total * volume / volume_total for volume in volumes]
+    if not math.isclose(sum(powers), total, rel_tol=1e-12, abs_tol=1e-9):
+        raise RuntimeError(
+            f"thermal block power distribution mismatch: {sum(powers)} != {total}"
+        )
+    return powers
+
+
 def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
     """실물 기준 손실(loss_map_phys)을 열모델 오브젝트에 주입.
     eighth 모드에서는 보유 체적 분율(1/2^c)이 LossAllocator에서 자동 적용된다."""
     df = sim.df_plus
     alloc = LossAllocator(sim, eighth=eighth, mode=mode)
     injected = {}
+    rx_power_balance = []
 
     def _block(obj, watts):
         w = max(float(watts), 0.0)
@@ -726,11 +766,26 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
             p_exp_total += p
             _block(w, p)
         p_total = alloc.group_loss(group_key, name_hint)
-        p_mid = max(p_total - p_exp_total, 0.0)
-        vols = [abs(b.volume) for b in blocks]
-        vt = sum(vols) or 1.0
-        for b, v in zip(blocks, vols):
-            _block(b, p_mid * v / vt)
+        p_mid = p_total - p_exp_total
+        if p_mid < -max(1e-9, abs(p_total) * 1e-12):
+            raise RuntimeError(
+                f"explicit Rx loss exceeds group loss for {group_key}: "
+                f"{p_exp_total} > {p_total}"
+            )
+        block_powers = _volume_weighted_powers(blocks, max(p_mid, 0.0))
+        for block, power in zip(blocks, block_powers):
+            _block(block, power)
+        assigned = p_exp_total + sum(block_powers)
+        if not math.isclose(assigned, p_total, rel_tol=1e-12, abs_tol=1e-9):
+            raise RuntimeError(
+                f"Rx thermal power balance failed for {group_key}: {assigned} != {p_total}"
+            )
+        rx_power_balance.append({
+            "group": group_key,
+            "name_hint": name_hint,
+            "expected_w": p_total,
+            "assigned_w": assigned,
+        })
 
     _rx_group(objs["Rx_main_explicit"], objs["Rx_main_blocks"], "P_Rx_main_group", "Rx_main_0_0")
     if objs["Rx_side_explicit"] or objs["Rx_side_blocks"]:
@@ -752,6 +807,18 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
 
     # 콜드플레이트/냉각판은 고정온도 경계라 열원 주입 생략
     sim.thermal_injected = injected
+    if "n_explicit_turns" in df.columns:
+        n_explicit = int(df["n_explicit_turns"].iloc[0])
+    else:
+        has_explicit_rx = any(
+            objs.get(key)
+            for key in ("Rx_main_explicit", "Rx_side_explicit", "Rx_side2_explicit")
+        )
+        n_explicit = 1 if has_explicit_rx else 0
+    sim.thermal_rx_model = (
+        "homogenized_blocks" if n_explicit == 0 else "hybrid_explicit"
+    )
+    sim.thermal_rx_power_balance = rx_power_balance
     tx_sum = sum(v for k, v in injected.items() if k.startswith("Tx_"))
     rx_sum = sum(v for k, v in injected.items() if k.startswith("Rx_"))
     core_sum = sum(v for k, v in injected.items() if k.startswith("core"))
@@ -932,6 +999,27 @@ def run_thermal_analysis(sim):
     objs = _build_geometry(ipk, sim, eighth=eighth, mode=mode)
     probe_sheets = _create_probe_sheets(ipk, df, objs, eighth=eighth, mode=mode)
     _assign_losses(ipk, sim, objs, eighth=eighth, mode=mode)
+    rx_balance = list(getattr(sim, "thermal_rx_power_balance", []))
+    if not rx_balance:
+        raise RuntimeError("thermal Rx power accounting produced no groups")
+    rx_expected_power = sum(float(item["expected_w"]) for item in rx_balance)
+    rx_assigned_power = sum(float(item["assigned_w"]) for item in rx_balance)
+    rx_balance_errors = [
+        abs(float(item["assigned_w"]) - float(item["expected_w"]))
+        for item in rx_balance
+    ]
+    rx_balance_max_abs = max(rx_balance_errors)
+    rx_balance_ok = all(
+        math.isclose(
+            float(item["assigned_w"]),
+            float(item["expected_w"]),
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        )
+        for item in rx_balance
+    )
+    if not rx_balance_ok:
+        raise RuntimeError(f"thermal Rx power accounting mismatch: {rx_balance}")
     _assign_boundaries(ipk, sim, objs, eighth=eighth, mode=mode)
 
     # 서멀패드 메시 해상 강제: 패드(2mm)가 메시에 안 잡히면 도체가 고정온도 Al에
@@ -1050,6 +1138,12 @@ def run_thermal_analysis(sim):
             "thermal_field_summary_attempts": [0],
             "thermal_field_summary_value_count": [0],
             "thermal_calculator_attempts": [0],
+            "thermal_rx_model": [sim.thermal_rx_model],
+            "thermal_rx_power_balance_ok": [1 if rx_balance_ok else 0],
+            "thermal_rx_power_balance_group_count": [len(rx_balance)],
+            "thermal_rx_power_balance_max_abs_w": [rx_balance_max_abs],
+            "thermal_rx_expected_power_w": [rx_expected_power],
+            "thermal_rx_assigned_power_w": [rx_assigned_power],
             "T_max_Tx": [float("nan")],
             "T_max_Rx_main": [float("nan")],
             "T_max_Rx_side": [float("nan")],
@@ -1182,6 +1276,12 @@ def run_thermal_analysis(sim):
         "thermal_field_summary_attempts": [field_summary_attempts],
         "thermal_field_summary_value_count": [n_fs],
         "thermal_calculator_attempts": [calc_attempts],
+        "thermal_rx_model": [sim.thermal_rx_model],
+        "thermal_rx_power_balance_ok": [1 if rx_balance_ok else 0],
+        "thermal_rx_power_balance_group_count": [len(rx_balance)],
+        "thermal_rx_power_balance_max_abs_w": [rx_balance_max_abs],
+        "thermal_rx_expected_power_w": [rx_expected_power],
+        "thermal_rx_assigned_power_w": [rx_assigned_power],
         "T_max_Tx": [group_values["T_max_Tx"]],
         "T_max_Rx_main": [group_values["T_max_Rx_main"]],
         "T_max_Rx_side": [group_values["T_max_Rx_side"]],

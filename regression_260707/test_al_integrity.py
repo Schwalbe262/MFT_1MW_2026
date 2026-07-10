@@ -40,6 +40,12 @@ def valid_result(**updates):
         "thermal_residual_y_velocity": 9e-4,
         "thermal_residual_z_velocity": 4e-4,
         "thermal_residual_energy": 4e-9,
+        "thermal_rx_model": "homogenized_blocks",
+        "thermal_rx_power_balance_ok": 1,
+        "thermal_rx_power_balance_group_count": 2,
+        "thermal_rx_power_balance_max_abs_w": 0.0,
+        "thermal_rx_expected_power_w": 120.0,
+        "thermal_rx_assigned_power_w": 120.0,
         "thermal_required_missing_count": 0,
         "thermal_required_group_mask": 15,
         "git_hash": TEST_REVISION,
@@ -56,6 +62,7 @@ def valid_result(**updates):
         "thermal_on": 1,
         "loss_sym_on": 1,
         "thermal_symmetry": "eighth",
+        "n_explicit_turns": 0,
         "matrix_skin_mesh": 1,
         "matrix_percent_error": 1.5,
         "matrix_max_passes": 10,
@@ -450,6 +457,14 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             valid_result(matrix_solve_attempts=2)))
         self.assertFalse(scheduler_client.is_valid_result(
             valid_result(matrix_extraction_backend="get_solution_data")))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(thermal_rx_power_balance_ok=0)))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(thermal_rx_assigned_power_w=119.0)))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(thermal_rx_model="hybrid_explicit")))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(n_explicit_turns=2)))
 
         no_side = valid_result(N2_side=0)
         no_side.pop("T_max_Rx_side")

@@ -100,7 +100,10 @@ def get_drawing_default_params():
         "fan_velocity": 1.5,     # 팬 유속 [m/s], +y -> -y
         "k_ins": 0.2,            # 권선 절연 열전도율 [W/mK]
         "core_k_thermal": 2.0,   # 코어 등가 열전도율 [W/mK] (아몰퍼스, 보수적 등방값)
-        "n_explicit_turns": 2,   # 하이브리드: 안/밖 각각 explicit으로 남길 턴 수
+        # Production thermal model: represent the complete Rx pack with
+        # anisotropic blocks. Thin explicit foils can disappear from Icepak's
+        # cut-cell mesh even when an object mesh level is assigned.
+        "n_explicit_turns": 0,
         # Rx foil 메시 전략: "skin"(기본) / "length" / "length-coarse" (벤치마크용)
         "rx_mesh_mode": "skin",
         # 완료 후 프로젝트 파일 보존 여부 (fixed 기본 보존 / 랜덤·클러스터는 0으로 확실히 삭제)
@@ -647,10 +650,8 @@ def validation_check(input_df, strict=False, return_errors=False):
     if int(inp["loss_on"].iloc[0]) != 0 and float(inp["V1_rms"].iloc[0]) <= 0:
         errors.append(f"V1_rms <= 0 ({inp['V1_rms'].iloc[0]}) with loss_on=1")
     n_exp = int(inp["n_explicit_turns"].iloc[0])
-    if int(inp["thermal_on"].iloc[0]) != 0:
-        # n_exp = -1 또는 2*n_exp >= N 이면 전 턴 explicit으로 처리됨 (thermal_260706에서 지원)
-        if n_exp == 0:
-            errors.append(f"n_explicit_turns ({n_exp}) == 0 (1 이상 또는 -1[전 턴])")
+    if int(inp["thermal_on"].iloc[0]) != 0 and n_exp < -1:
+        errors.append(f"n_explicit_turns ({n_exp}) < -1")
     if str(inp["rx_mesh_mode"].iloc[0]) not in ("skin", "length", "length-coarse"):
         errors.append(f"invalid rx_mesh_mode ({inp['rx_mesh_mode'].iloc[0]})")
     if str(inp["thermal_symmetry"].iloc[0]) not in ("eighth", "quarter", "full"):

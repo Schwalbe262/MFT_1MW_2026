@@ -5,6 +5,7 @@
   "full_model": 0,
   "matrix_on": 1, "loss_on": 1, "thermal_on": 1,
   "loss_sym_on": 1, "thermal_symmetry": "eighth",
+  "n_explicit_turns": 0,
   "matrix_skin_mesh": 1,
   "matrix_percent_error": 1.5, "matrix_max_passes": 10, "matrix_min_converged": 1,
   "percent_error": 1.5, "max_passes": 10, "min_converged": 2,
