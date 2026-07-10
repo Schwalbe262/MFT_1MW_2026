@@ -12,6 +12,7 @@ from run_simulation_260706 import (
     Simulation,
     SolutionDataUnavailableError,
     _completion_exit_code,
+    _configure_copied_loss_setup,
     _configure_loss_copy_skin_mesh,
     _parse_rl_matrix_export,
     _thermal_failure_frame,
@@ -297,7 +298,14 @@ class _FakeProject:
 
 
 def _fake_wrapper(solution="AC Magnetic", setup=True):
-    setup_object = SimpleNamespace(properties={}) if setup is True else setup
+    setup_object = SimpleNamespace(
+        _child_object=object(),
+        properties={
+            "Max. Number of Passes": 10,
+            "Min. Converged Passes": 1,
+            "Percent Error": 1.5,
+        },
+    ) if setup is True else setup
     return SimpleNamespace(
         design_name="copy",
         solution_type=solution,
@@ -336,6 +344,7 @@ class CopiedLossReadinessTests(unittest.TestCase):
         wrappers = iter([
             _fake_wrapper(solution="Magnetostatic"),
             _fake_wrapper(setup=False),
+            _fake_wrapper(setup=SimpleNamespace(_child_object=None, properties={})),
             _fake_wrapper(),
         ])
         clock = _FakeClock()
@@ -347,7 +356,22 @@ class CopiedLossReadinessTests(unittest.TestCase):
 
         self.assertEqual(wrapper.solution_type, "AC Magnetic")
         self.assertTrue(hasattr(setup, "properties"))
-        self.assertEqual(project.active_calls, ["copy", "copy", "copy"])
+        self.assertEqual(project.active_calls, ["copy", "copy", "copy", "copy"])
+
+    def test_accepts_eddy_current_solution_alias(self):
+        source = _FakeRawDesign("source")
+        ready = _FakeRawDesign("copy", solution="EddyCurrent")
+        project = _FakeProject([[source, ready]] * 2)
+        clock = _FakeClock()
+
+        wrapper, setup = _wait_for_ready_copied_loss_design(
+            project, {"source"},
+            lambda _name, _solution: _fake_wrapper(solution="EddyCurrent"),
+            timeout_s=1, poll_s=0.25, clock=clock, sleeper=clock.sleep,
+        )
+
+        self.assertEqual(wrapper.solution_type, "EddyCurrent")
+        self.assertTrue(setup.properties)
 
     def test_timeout_is_fail_closed_and_never_binds_source(self):
         source = _FakeRawDesign("source")
@@ -382,6 +406,33 @@ class CoreLossAssignmentTests(unittest.TestCase):
 
     def test_true_core_loss_assignment_continues(self):
         self.assertIsNone(self._simulation(True).assign_core_loss())
+
+
+class CopiedLossSetupConfigurationTests(unittest.TestCase):
+    def test_updates_and_reads_back_required_properties(self):
+        setup = _fake_wrapper().get_setup("Setup1")
+
+        configured = _configure_copied_loss_setup(setup, 12, 3, 0.75)
+
+        self.assertIs(configured, setup)
+        self.assertEqual(setup.properties["Max. Number of Passes"], 12)
+        self.assertEqual(setup.properties["Min. Converged Passes"], 3)
+        self.assertEqual(setup.properties["Percent Error"], 0.75)
+
+    def test_rejects_property_updates_that_do_not_reach_com(self):
+        class DiscardingSetup:
+            _child_object = object()
+
+            @property
+            def properties(self):
+                return {
+                    "Max. Number of Passes": 10,
+                    "Min. Converged Passes": 1,
+                    "Percent Error": 1.5,
+                }
+
+        with self.assertRaisesRegex(RuntimeError, "read-back failed"):
+            _configure_copied_loss_setup(DiscardingSetup(), 12, 3, 0.75)
 
 
 class AnalyzePolicyTests(unittest.TestCase):

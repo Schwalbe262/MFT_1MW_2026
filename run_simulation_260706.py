@@ -395,6 +395,61 @@ def _normalized_aedt_token(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
 
 
+def _is_ac_magnetic_solution(value):
+    return _normalized_aedt_token(value) in {"acmagnetic", "eddycurrent"}
+
+
+_LOSS_SETUP_PROPERTY_KEYS = (
+    "Max. Number of Passes",
+    "Min. Converged Passes",
+    "Percent Error",
+)
+
+
+def _ready_loss_setup_properties(setup):
+    if setup is None or setup is False:
+        return None
+    child = getattr(setup, "_child_object", None)
+    if child is None or child is False:
+        return None
+    properties = getattr(setup, "properties", None)
+    if not isinstance(properties, dict):
+        return None
+    if not all(key in properties for key in _LOSS_SETUP_PROPERTY_KEYS):
+        return None
+    return properties
+
+
+def _configure_copied_loss_setup(setup, max_passes, min_converged, percent_error):
+    expected = {
+        "Max. Number of Passes": int(max_passes),
+        "Min. Converged Passes": int(min_converged),
+        "Percent Error": float(percent_error),
+    }
+    properties = _ready_loss_setup_properties(setup)
+    if properties is None:
+        raise RuntimeError("copied loss Setup1 has no live COM property object")
+    for key, value in expected.items():
+        properties[key] = value
+
+    readback = _ready_loss_setup_properties(setup)
+    mismatches = {}
+    if readback is None:
+        mismatches["properties"] = "unavailable after update"
+    else:
+        for key, value in expected.items():
+            actual = readback.get(key)
+            try:
+                matches = float(actual) == float(value)
+            except (TypeError, ValueError):
+                matches = False
+            if not matches:
+                mismatches[key] = {"expected": value, "actual": actual}
+    if mismatches:
+        raise RuntimeError(f"copied loss Setup1 property read-back failed: {mismatches}")
+    return setup
+
+
 def _aedt_design_name(value):
     try:
         value = value.GetName()
@@ -448,7 +503,7 @@ def _wait_for_ready_copied_loss_design(
                 signature = (name, design_type, solution_type, setups)
                 ready = (
                     design_type == "Maxwell 3D"
-                    and _normalized_aedt_token(solution_type) == "acmagnetic"
+                    and _is_ac_magnetic_solution(solution_type)
                     and "Setup1" in setups
                 )
                 if not ready:
@@ -473,17 +528,21 @@ def _wait_for_ready_copied_loss_design(
                 wrapper_exists = wrapper is not None and wrapper is not False
                 setup = wrapper.get_setup(name="Setup1") if wrapper_exists else None
                 setup_exists = setup is not None and setup is not False
+                setup_properties = _ready_loss_setup_properties(setup)
                 wrapper_ready = (
                     wrapper_exists
                     and wrapper_name == name
-                    and _normalized_aedt_token(wrapper_solution) == "acmagnetic"
+                    and _is_ac_magnetic_solution(wrapper_solution)
                     and setup_exists
-                    and hasattr(setup, "properties")
+                    and setup_properties is not None
                 )
                 last["wrapper"] = {
                     "name": wrapper_name,
                     "solution_type": wrapper_solution,
                     "setup_ready": bool(wrapper_ready),
+                    "setup_properties": (
+                        sorted(setup_properties) if setup_properties is not None else []
+                    ),
                 }
                 if wrapper_ready:
                     return wrapper, setup
@@ -2262,10 +2321,12 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             # 코어손실 + skin 메시(손실 정밀용) + 셋업 정밀값
             sim.assign_core_loss()
             _configure_loss_copy_skin_mesh(sim)
-            sim.design1.setup = copied_setup
-            sim.design1.setup.properties["Max. Number of Passes"] = int(sim.df_plus["max_passes"].iloc[0])
-            sim.design1.setup.properties["Min. Converged Passes"] = int(sim.df_plus["min_converged"].iloc[0])
-            sim.design1.setup.properties["Percent Error"] = float(sim.df_plus["percent_error"].iloc[0])
+            sim.design1.setup = _configure_copied_loss_setup(
+                copied_setup,
+                max_passes=sim.df_plus["max_passes"].iloc[0],
+                min_converged=sim.df_plus["min_converged"].iloc[0],
+                percent_error=sim.df_plus["percent_error"].iloc[0],
+            )
 
         result_parts = [sim.df_plus]
         total_time = 0.0
