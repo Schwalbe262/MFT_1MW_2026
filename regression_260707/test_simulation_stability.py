@@ -1008,6 +1008,418 @@ class AnalyzePolicyTests(unittest.TestCase):
         self.assertEqual(simulation.solve_attempts["loss"], 1)
 
 
+class CopiedLossNativeAnalyzeTests(unittest.TestCase):
+    class _AnalysisModule:
+        def __init__(self, setups=("Setup1",)):
+            self.setups = setups
+
+        def GetSetups(self):
+            return self.setups
+
+    class _Design:
+        def __init__(self, name="maxwell_matrix1", analyze_result=0,
+                     design_type="Maxwell 3D", solution="AC Magnetic",
+                     setups=("Setup1",)):
+            self.name = name
+            self.design_type = design_type
+            self.solution = solution
+            self.analysis = CopiedLossNativeAnalyzeTests._AnalysisModule(setups)
+            self.Analyze = Mock(return_value=analyze_result)
+
+        def GetName(self):
+            return self.name
+
+        def GetDesignType(self):
+            return self.design_type
+
+        def GetSolutionType(self):
+            return self.solution
+
+        def GetModule(self, name):
+            if name != "AnalysisSetup":
+                raise AssertionError(name)
+            return self.analysis
+
+    class _Project:
+        def __init__(self, design, name="simulation_native_analyze"):
+            self.design = design
+            self.name = name
+            self.active_calls = []
+            self.Save = Mock(return_value=None)
+
+        def GetName(self):
+            return self.name
+
+        def SetActiveDesign(self, name):
+            self.active_calls.append(name)
+            return self.design
+
+    class _Desktop:
+        def __init__(self, project, registry_failures=0):
+            self.project = project
+            self.registry_failures = registry_failures
+            self.active_config = "Local"
+            self.project_calls = []
+            self.registry_loads = []
+            self.registry_sets = []
+            self.running = False
+
+        def SetActiveProject(self, name):
+            self.project_calls.append(name)
+            return self.project
+
+        def AreThereSimulationsRunning(self):
+            return self.running
+
+        def GetRegistryString(self, _key):
+            if self.registry_failures:
+                self.registry_failures -= 1
+                raise RuntimeError("transient GetRegistryString")
+            return self.active_config
+
+        def SetRegistryFromFile(self, path):
+            self.registry_loads.append(path)
+
+        def SetRegistryString(self, key, value):
+            self.registry_sets.append((key, value))
+            self.active_config = value
+
+    @staticmethod
+    def _acf_text(cores=4, tasks=1):
+        return f"""$begin 'DSOConfig'
+ConfigName='pyaedt_config'
+DesignType='Maxwell 3D'
+MachineName='localhost'
+NumEngines={tasks}
+NumCores={cores}
+NumGPUs=0
+UseAutoSettings=True
+$end 'DSOConfig'
+"""
+
+    def _simulation(self, root, registry_failures=0, analyze_result=0,
+                    design_name="maxwell_matrix1"):
+        matrix_working = Path(root) / "matrix_working"
+        matrix_working.mkdir()
+        (matrix_working / "pyaedt_config.acf").write_text(
+            self._acf_text(), encoding="utf-8"
+        )
+        raw_design = self._Design(
+            name=design_name, analyze_result=analyze_result
+        )
+        project = self._Project(raw_design)
+        desktop = self._Desktop(project, registry_failures=registry_failures)
+        high_level_analyze = Mock(
+            side_effect=AssertionError("copied loss must not use Setup.analyze")
+        )
+        simulation = Simulation.__new__(Simulation)
+        simulation.PROJECT_NAME = "simulation_native_analyze"
+        simulation.project_path = str(root)
+        simulation.desktop = SimpleNamespace(odesktop=desktop)
+        simulation.project = SimpleNamespace(
+            project=project,
+            proj=project,
+            desktop=simulation.desktop,
+        )
+        simulation.design1 = SimpleNamespace(
+            design_name="maxwell_matrix1",
+            setup=SimpleNamespace(analyze=high_level_analyze),
+            save_project=Mock(return_value=None),
+        )
+        simulation.design_matrix = SimpleNamespace(
+            solver_instance=SimpleNamespace(
+                working_directory=str(matrix_working)
+            )
+        )
+        simulation.NUM_CORE = 4
+        simulation.NUM_TASK = 1
+        simulation.loss_native_analyze_required = True
+        simulation.solve_attempts = {}
+        simulation._log_recent_aedt_messages = Mock()
+        return simulation, desktop, project, raw_design, high_level_analyze
+
+    @staticmethod
+    def _no_wait_preflight(simulation, max_attempts=5):
+        original = simulation._prepare_copied_loss_native_analysis
+        simulation._prepare_copied_loss_native_analysis = lambda: original(
+            max_attempts=max_attempts,
+            initial_retry_delay=0,
+            sleeper=lambda _seconds: None,
+        )
+
+    def test_transient_registry_preflight_then_exactly_one_native_solve(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, project, design, high_level = self._simulation(
+                root, registry_failures=2
+            )
+            self._no_wait_preflight(simulation)
+            extracted = []
+
+            simulation.analyze_and_extract(
+                "loss", lambda: extracted.append(True)
+            )
+
+            design.Analyze.assert_called_once_with("Setup1", True)
+            high_level.assert_not_called()
+            self.assertEqual(extracted, [True])
+            self.assertEqual(simulation.solve_attempts, {"loss": 1})
+            self.assertEqual(simulation.design1.save_project.call_count, 2)
+            simulation.project.project.Save.assert_not_called()
+            self.assertEqual(desktop.active_config, "Local")
+            self.assertEqual(len(desktop.registry_loads), 1)
+            self.assertEqual(
+                project.active_calls,
+                ["maxwell_matrix1"] * 6,
+            )
+
+    def test_preflight_exhaustion_never_dispatches_or_extracts(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, _desktop, _project, design, high_level = self._simulation(
+                root, registry_failures=10
+            )
+            self._no_wait_preflight(simulation, max_attempts=3)
+            extracted = []
+
+            with self.assertRaisesRegex(RuntimeError, "preflight failed closed"):
+                simulation.analyze_and_extract(
+                    "loss", lambda: extracted.append(True)
+                )
+
+            design.Analyze.assert_not_called()
+            high_level.assert_not_called()
+            self.assertEqual(extracted, [])
+            self.assertEqual(simulation.solve_attempts, {})
+            simulation.design1.save_project.assert_not_called()
+
+    def test_wrong_design_identity_fails_immediately_without_mutation(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, high_level = self._simulation(
+                root, design_name="maxwell_matrix"
+            )
+            self._no_wait_preflight(simulation)
+
+            with self.assertRaisesRegex(RuntimeError, "design identity mismatch"):
+                simulation.analyze_and_extract("loss", lambda: None)
+
+            self.assertEqual(len(desktop.project_calls), 1)
+            self.assertEqual(desktop.registry_loads, [])
+            design.Analyze.assert_not_called()
+            high_level.assert_not_called()
+            self.assertEqual(simulation.solve_attempts, {})
+
+    def test_ambiguous_or_invalid_native_return_never_retries(self):
+        outcomes = (
+            RuntimeError("response lost after possible dispatch"),
+            False,
+            True,
+            1,
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=repr(outcome)), tempfile.TemporaryDirectory() as root:
+                simulation, desktop, _project, design, high_level = self._simulation(root)
+                if isinstance(outcome, Exception):
+                    design.Analyze.side_effect = outcome
+                else:
+                    design.Analyze.return_value = outcome
+                self._no_wait_preflight(simulation)
+                extracted = []
+
+                with self.assertRaises((RuntimeError, type(outcome)) if isinstance(
+                        outcome, Exception) else RuntimeError):
+                    simulation.analyze_and_extract(
+                        "loss", lambda: extracted.append(True)
+                    )
+
+                design.Analyze.assert_called_once_with("Setup1", True)
+                high_level.assert_not_called()
+                self.assertEqual(extracted, [])
+                self.assertEqual(simulation.solve_attempts, {"loss": 1})
+                self.assertEqual(desktop.active_config, "Local")
+
+    def test_void_native_return_uses_postcheck_and_extraction_as_proof(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, high_level = self._simulation(
+                root, analyze_result=None
+            )
+            self._no_wait_preflight(simulation)
+            extracted = []
+
+            simulation.analyze_and_extract(
+                "loss", lambda: extracted.append(True)
+            )
+
+            design.Analyze.assert_called_once_with("Setup1", True)
+            high_level.assert_not_called()
+            self.assertEqual(extracted, [True])
+            self.assertEqual(simulation.solve_attempts, {"loss": 1})
+            self.assertEqual(desktop.active_config, "Local")
+
+    def test_predispatch_save_failure_restores_dso_without_solve(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, _high_level = self._simulation(root)
+            simulation.design1.save_project.side_effect = RuntimeError(
+                "wrapper save failed"
+            )
+            simulation.project.project.Save.side_effect = RuntimeError(
+                "native save failed"
+            )
+            self._no_wait_preflight(simulation)
+
+            with self.assertRaisesRegex(RuntimeError, "Failed to save project"):
+                simulation.analyze_and_extract("loss", lambda: None)
+
+            design.Analyze.assert_not_called()
+            self.assertEqual(simulation.solve_attempts, {})
+            self.assertEqual(desktop.active_config, "Local")
+
+    def test_predispatch_wrapper_save_failure_uses_verified_native_save(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, _desktop, _project, design, _high_level = self._simulation(root)
+            simulation.design1.save_project.side_effect = RuntimeError(
+                "wrapper save failed"
+            )
+            self._no_wait_preflight(simulation)
+
+            simulation.analyze_and_extract("loss", lambda: None)
+
+            design.Analyze.assert_called_once_with("Setup1", True)
+            self.assertEqual(simulation.project.project.Save.call_count, 2)
+            self.assertEqual(simulation.solve_attempts, {"loss": 1})
+
+    def test_extraction_or_postcheck_failure_never_resolves_again(self):
+        for stage in ("postcheck", "extract"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as root:
+                simulation, _desktop, _project, design, _high_level = self._simulation(root)
+                self._no_wait_preflight(simulation)
+                extracted = []
+                if stage == "postcheck":
+                    simulation._postcheck_copied_loss_native_analysis = Mock(
+                        side_effect=RuntimeError("postcheck failed")
+                    )
+                    extractor = lambda: extracted.append(True)
+                else:
+                    extractor = lambda: (_ for _ in ()).throw(
+                        RuntimeError("extract failed")
+                    )
+
+                with self.assertRaisesRegex(RuntimeError, f"{stage} failed"):
+                    simulation.analyze_and_extract("loss", extractor)
+
+                design.Analyze.assert_called_once_with("Setup1", True)
+                self.assertEqual(simulation.solve_attempts, {"loss": 1})
+                self.assertEqual(extracted, [])
+
+    def test_rejects_matrix_acf_with_wrong_core_contract(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, _desktop, _project, design, _high_level = self._simulation(root)
+            acf = Path(
+                simulation.design_matrix.solver_instance.working_directory
+            ) / "pyaedt_config.acf"
+            acf.write_text(self._acf_text(cores=8), encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "ACF contract mismatch"):
+                simulation.analyze_and_extract("loss", lambda: None)
+
+            design.Analyze.assert_not_called()
+            self.assertEqual(simulation.solve_attempts, {})
+
+    def test_rejects_truncated_matrix_acf_without_dso_end(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, _desktop, _project, design, _high_level = self._simulation(root)
+            acf = Path(
+                simulation.design_matrix.solver_instance.working_directory
+            ) / "pyaedt_config.acf"
+            acf.write_text(
+                self._acf_text().replace("$end 'DSOConfig'\n", ""),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "ACF contract mismatch"):
+                simulation.analyze_and_extract("loss", lambda: None)
+
+            design.Analyze.assert_not_called()
+            self.assertEqual(simulation.solve_attempts, {})
+
+    def test_accepts_nested_crlf_acf_from_path_with_spaces(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, _desktop, _project, _design, _high_level = self._simulation(root)
+            old = Path(simulation.design_matrix.solver_instance.working_directory)
+            spaced = Path(root) / "matrix working directory"
+            old.rename(spaced)
+            simulation.design_matrix.solver_instance.working_directory = str(spaced)
+            inner = self._acf_text().replace("\n", "\r\n")
+            (spaced / "pyaedt_config.acf").write_text(
+                "$begin 'Configs'\r\n" + inner + "$end 'Configs'\r\n",
+                encoding="utf-8",
+                newline="",
+            )
+
+            path = simulation._validated_matrix_hpc_acf()
+
+            self.assertEqual(path, str(spaced / "pyaedt_config.acf"))
+
+    def test_identity_failure_after_dso_activation_restores_without_solve(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, project, design, _high_level = self._simulation(root)
+            wrong = self._Design(name="maxwell_matrix")
+            returns = iter([design, wrong])
+            project.SetActiveDesign = Mock(side_effect=lambda _name: next(returns))
+            self._no_wait_preflight(simulation)
+
+            with self.assertRaisesRegex(RuntimeError, "design identity mismatch"):
+                simulation.analyze_and_extract("loss", lambda: None)
+
+            design.Analyze.assert_not_called()
+            self.assertEqual(simulation.solve_attempts, {})
+            self.assertEqual(desktop.active_config, "Local")
+            self.assertEqual(len(desktop.registry_loads), 1)
+
+    def test_restore_readback_failure_never_retries_dispatched_solve(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, _high_level = self._simulation(root)
+            original_set = desktop.SetRegistryString
+
+            def refuse_restore(key, value):
+                if value == "Local":
+                    return None
+                return original_set(key, value)
+
+            desktop.SetRegistryString = Mock(side_effect=refuse_restore)
+            self._no_wait_preflight(simulation)
+            original_restore = simulation._restore_native_maxwell_dso
+            simulation._restore_native_maxwell_dso = lambda key, value: original_restore(
+                key, value, max_attempts=2, retry_delay=0,
+                sleeper=lambda _seconds: None,
+            )
+            extracted = []
+
+            with self.assertRaisesRegex(RuntimeError, "DSO restore failed"):
+                simulation.analyze_and_extract(
+                    "loss", lambda: extracted.append(True)
+                )
+
+            design.Analyze.assert_called_once_with("Setup1", True)
+            self.assertEqual(simulation.solve_attempts, {"loss": 1})
+            self.assertEqual(extracted, [])
+
+    def test_preexisting_pyaedt_config_needs_no_restore(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, _high_level = self._simulation(root)
+            desktop.active_config = "pyaedt_config"
+            self._no_wait_preflight(simulation)
+
+            simulation.analyze_and_extract("loss", lambda: None)
+
+            design.Analyze.assert_called_once_with("Setup1", True)
+            self.assertEqual(desktop.active_config, "pyaedt_config")
+            self.assertTrue(any(
+                value == "pyaedt_config" for _key, value in desktop.registry_sets
+            ))
+            self.assertFalse(any(
+                value == "Local" for _key, value in desktop.registry_sets
+            ))
+
+
 class NativeProjectHandleTests(unittest.TestCase):
     @staticmethod
     def _native_project(active_design=None):

@@ -2538,21 +2538,337 @@ class Simulation():
         except Exception as message_error:
             logging.warning(f"[{label}] AEDT messages unavailable: {message_error}")
 
+    def _native_desktop_handle(self):
+        """Return the original Desktop handle, never a copied-design proxy."""
+        candidates = [getattr(self, "desktop", None)]
+        project_wrapper = getattr(self, "project", None)
+        try:
+            project_state = vars(project_wrapper)
+        except TypeError:
+            project_state = {}
+        candidates.append(project_state.get("desktop"))
+        for candidate in candidates:
+            odesktop = getattr(candidate, "odesktop", None)
+            if odesktop is not None and odesktop is not False and callable(
+                    getattr(odesktop, "SetActiveProject", None)):
+                return odesktop
+        raise RuntimeError("original native AEDT Desktop handle is unavailable")
+
+    def _verified_native_maxwell_setup(self, odesktop, setup_name="Setup1"):
+        """Resolve the exact active Maxwell setup through fresh native handles."""
+        expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        expected_design = _aedt_design_name(
+            getattr(self.design1, "design_name", "")
+        )
+        if not expected_project or not expected_design:
+            raise RuntimeError("native analysis project/design identity is unavailable")
+
+        oproject = odesktop.SetActiveProject(expected_project)
+        if oproject is None or oproject is False:
+            raise RuntimeError(f"SetActiveProject returned no project ({expected_project})")
+        actual_project = str(oproject.GetName() or "").strip()
+        if actual_project != expected_project:
+            raise _AedtIdentityMismatch(
+                "analysis project identity mismatch: "
+                f"expected={expected_project}, actual={actual_project or '<empty>'}"
+            )
+
+        odesign = oproject.SetActiveDesign(expected_design)
+        if odesign is None or odesign is False:
+            raise RuntimeError(f"SetActiveDesign returned no design ({expected_design})")
+        actual_design = _aedt_design_name(odesign)
+        if actual_design != expected_design:
+            raise _AedtIdentityMismatch(
+                "analysis design identity mismatch: "
+                f"expected={expected_design}, actual={actual_design or '<empty>'}"
+            )
+        design_type = str(odesign.GetDesignType() or "")
+        solution_type = str(odesign.GetSolutionType() or "")
+        if design_type != "Maxwell 3D" or not _is_ac_magnetic_solution(solution_type):
+            raise _AedtIdentityMismatch(
+                "analysis design physics mismatch: "
+                f"type={design_type!r}, solution={solution_type!r}"
+            )
+        analysis = odesign.GetModule("AnalysisSetup")
+        if analysis is None or analysis is False:
+            raise RuntimeError("active design returned no AnalysisSetup module")
+        setups = tuple(str(name) for name in (analysis.GetSetups() or []))
+        if setups != (setup_name,):
+            raise RuntimeError(
+                f"native analysis setup mismatch: expected={(setup_name,)}, actual={setups}"
+            )
+        return oproject, odesign
+
+    def _validated_matrix_hpc_acf(self):
+        """Return the matrix solve's exact 4-core/one-engine DSO configuration."""
+        matrix_design = getattr(self, "design_matrix", None)
+        solver = getattr(matrix_design, "solver_instance", None)
+        working_directory = str(getattr(solver, "working_directory", "") or "").strip()
+        if not working_directory:
+            raise RuntimeError("authoritative matrix HPC working directory is unavailable")
+        path = os.path.abspath(os.path.join(working_directory, "pyaedt_config.acf"))
+        if not os.path.isfile(path):
+            raise RuntimeError(f"authoritative matrix HPC ACF is missing: {path}")
+        if os.path.getsize(path) <= 0 or os.path.getsize(path) > 65536:
+            raise RuntimeError(f"authoritative matrix HPC ACF has invalid size: {path}")
+        with open(path, "r", encoding="utf-8", errors="strict") as stream:
+            text = stream.read()
+
+        expected = {
+            "ConfigName": "'pyaedt_config'",
+            "DesignType": "'Maxwell 3D'",
+            "MachineName": "'localhost'",
+            "NumEngines": str(int(self.NUM_TASK)),
+            "NumCores": str(int(self.NUM_CORE)),
+            "NumGPUs": "0",
+            "UseAutoSettings": "True",
+        }
+        mismatches = {}
+        for key, value in expected.items():
+            matches = re.findall(
+                rf"(?m)^\s*{re.escape(key)}\s*=\s*([^\r\n]+?)\s*$", text
+            )
+            if matches != [value]:
+                mismatches[key] = {"expected": value, "actual": matches}
+        dso_begin_count = text.count("$begin 'DSOConfig'")
+        dso_end_count = text.count("$end 'DSOConfig'")
+        if dso_begin_count != 1 or dso_end_count != 1:
+            mismatches["DSOConfig"] = {
+                "expected": {"begin": 1, "end": 1},
+                "actual": {"begin": dso_begin_count, "end": dso_end_count},
+            }
+        if mismatches:
+            raise RuntimeError(
+                f"authoritative matrix HPC ACF contract mismatch: {mismatches}"
+            )
+        return path
+
+    def _restore_native_maxwell_dso(
+            self, registry_key, original_config, max_attempts=5,
+            retry_delay=0.5, sleeper=time.sleep):
+        """Restore the pre-solve Maxwell DSO without ever touching Analyze."""
+        if not original_config:
+            return
+        errors = []
+        for attempt in range(1, int(max_attempts) + 1):
+            try:
+                odesktop = self._native_desktop_handle()
+                result = odesktop.SetRegistryString(registry_key, original_config)
+                if result is False:
+                    raise RuntimeError("SetRegistryString returned False")
+                actual = str(odesktop.GetRegistryString(registry_key) or "").strip()
+                if actual != original_config:
+                    raise RuntimeError(
+                        "DSO restore readback mismatch: "
+                        f"expected={original_config!r}, actual={actual!r}"
+                    )
+                return
+            except Exception as error:
+                errors.append(f"attempt {attempt}: {type(error).__name__}: {error}")
+                if attempt < int(max_attempts):
+                    sleeper(max(0.0, float(retry_delay)) * (2 ** (attempt - 1)))
+        raise RuntimeError("native Maxwell DSO restore failed: " + "; ".join(errors))
+
+    def _prepare_copied_loss_native_analysis(
+            self, setup_name="Setup1", max_attempts=5, timeout_s=30.0,
+            initial_retry_delay=0.5, clock=time.monotonic, sleeper=time.sleep):
+        """Retry only copied-loss solve preflight; never dispatch a solve here."""
+        acf_path = self._validated_matrix_hpc_acf()
+        registry_key = r"Desktop/ActiveDSOConfigurations/Maxwell 3D"
+        deadline = clock() + max(0.0, float(timeout_s))
+        original_config = None
+        config_may_be_active = False
+        attempts = []
+
+        for attempt in range(1, int(max_attempts) + 1):
+            if attempt > 1 and clock() >= deadline:
+                break
+            try:
+                odesktop = self._native_desktop_handle()
+                _oproject, odesign = self._verified_native_maxwell_setup(
+                    odesktop, setup_name=setup_name
+                )
+                running = odesktop.AreThereSimulationsRunning()
+                if running is not False:
+                    raise RuntimeError(
+                        f"AEDT reports an overlapping simulation: {running!r}"
+                    )
+                active = odesktop.GetRegistryString(registry_key)
+                if active is None or active is False:
+                    raise RuntimeError("GetRegistryString returned no active DSO")
+                active = str(active).strip()
+                if not active:
+                    raise RuntimeError("GetRegistryString returned an empty active DSO")
+                if original_config is None:
+                    original_config = active
+
+                loaded = odesktop.SetRegistryFromFile(acf_path)
+                if loaded is False:
+                    raise RuntimeError("SetRegistryFromFile returned False")
+                config_may_be_active = True
+                selected = odesktop.SetRegistryString(registry_key, "pyaedt_config")
+                if selected is False:
+                    raise RuntimeError("SetRegistryString returned False")
+                actual = str(odesktop.GetRegistryString(registry_key) or "").strip()
+                if actual != "pyaedt_config":
+                    raise RuntimeError(
+                        "native HPC DSO readback mismatch: "
+                        f"expected='pyaedt_config', actual={actual!r}"
+                    )
+                _oproject, odesign = self._verified_native_maxwell_setup(
+                    odesktop, setup_name=setup_name
+                )
+                return {
+                    "odesktop": odesktop,
+                    "odesign": odesign,
+                    "registry_key": registry_key,
+                    "original_config": original_config,
+                    "acf_path": acf_path,
+                }
+            except _AedtIdentityMismatch:
+                if config_may_be_active and original_config:
+                    self._restore_native_maxwell_dso(
+                        registry_key, original_config, sleeper=sleeper
+                    )
+                raise
+            except Exception as error:
+                attempts.append(
+                    f"attempt {attempt}: {type(error).__name__}: {error}"
+                )
+                now = clock()
+                if attempt >= int(max_attempts) or now >= deadline:
+                    break
+                logging.warning(
+                    "copied-loss native analysis preflight failed "
+                    f"(attempt {attempt}/{int(max_attempts)}): {error}"
+                )
+                sleeper(min(
+                    max(0.0, float(initial_retry_delay)) * (2 ** (attempt - 1)),
+                    max(0.0, deadline - now),
+                ))
+
+        restore_error = None
+        if config_may_be_active and original_config:
+            try:
+                self._restore_native_maxwell_dso(
+                    registry_key, original_config, sleeper=sleeper
+                )
+            except Exception as error:
+                restore_error = f"{type(error).__name__}: {error}"
+        raise RuntimeError(
+            "copied-loss native analysis preflight failed closed; "
+            f"attempts={attempts}, restore_error={restore_error}"
+        )
+
+    def _postcheck_copied_loss_native_analysis(
+            self, setup_name="Setup1", max_attempts=5,
+            retry_delay=0.5, sleeper=time.sleep):
+        """Reacquire exact identities after dispatch without any solve retry."""
+        errors = []
+        for attempt in range(1, int(max_attempts) + 1):
+            try:
+                odesktop = self._native_desktop_handle()
+                self._verified_native_maxwell_setup(
+                    odesktop, setup_name=setup_name
+                )
+                running = odesktop.AreThereSimulationsRunning()
+                if running is not False:
+                    raise RuntimeError(
+                        f"AEDT still reports a running simulation: {running!r}"
+                    )
+                return
+            except _AedtIdentityMismatch:
+                raise
+            except Exception as error:
+                errors.append(f"attempt {attempt}: {type(error).__name__}: {error}")
+                if attempt < int(max_attempts):
+                    sleeper(max(0.0, float(retry_delay)) * (2 ** (attempt - 1)))
+        raise RuntimeError(
+            "copied-loss post-dispatch identity check failed: " + "; ".join(errors)
+        )
+
     def analyze_and_extract(self, label, extractor):
         """Analyze exactly once; result-query failures never justify another solve."""
         def _analyze_once():
+            if label != "loss" or not bool(getattr(
+                    self, "loss_native_analyze_required", False)):
+                self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
+                t0 = time.time()
+                try:
+                    # The original, non-copied design retains PyAEDT's supported
+                    # high-level path. Setup.analyze() itself returns None.
+                    analyze_result = self.design1.setup.analyze(cores=self.NUM_CORE)
+                    if analyze_result is False:
+                        raise RuntimeError(f"[{label}] Setup1 analyze returned False")
+                except Exception:
+                    self._log_recent_aedt_messages(label)
+                    raise
+                elapsed = time.time() - t0
+                self.save_project()
+                return elapsed
+
+            context = self._prepare_copied_loss_native_analysis()
+            try:
+                # Preserve app.analyze() semantics: save before the only dispatch.
+                self.save_project(strict=True)
+                _oproject, dispatch_design = self._verified_native_maxwell_setup(
+                    context["odesktop"], setup_name="Setup1"
+                )
+                active = str(context["odesktop"].GetRegistryString(
+                    context["registry_key"]
+                ) or "").strip()
+                if active != "pyaedt_config":
+                    raise RuntimeError(
+                        f"[{label}] native HPC DSO changed before dispatch: {active!r}"
+                    )
+            except Exception:
+                self._restore_native_maxwell_dso(
+                    context["registry_key"], context["original_config"]
+                )
+                raise
+
             self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
             t0 = time.time()
+            dispatch_error = None
+            analyze_result = None
             try:
-                # PyAEDT 0.22 Setup.analyze() returns None on a successful invocation.
-                analyze_result = self.design1.setup.analyze(cores=self.NUM_CORE)
-                if analyze_result is False:
-                    raise RuntimeError(f"[{label}] Setup1 analyze returned False")
-            except Exception:
-                self._log_recent_aedt_messages(label)
-                raise
+                logging.info(
+                    f"[{label}] native Analyze dispatch Setup1 blocking=True"
+                )
+                analyze_result = dispatch_design.Analyze("Setup1", True)
+            except Exception as error:
+                dispatch_error = error
             elapsed = time.time() - t0
-            self.save_project()
+
+            restore_error = None
+            try:
+                self._restore_native_maxwell_dso(
+                    context["registry_key"], context["original_config"]
+                )
+            except Exception as error:
+                restore_error = error
+
+            if dispatch_error is not None:
+                self._log_recent_aedt_messages(label)
+                if restore_error is not None:
+                    raise RuntimeError(
+                        f"[{label}] native Analyze dispatch and DSO restore failed: "
+                        f"dispatch={dispatch_error}; restore={restore_error}"
+                    ) from dispatch_error
+                raise dispatch_error
+            if restore_error is not None:
+                raise RuntimeError(
+                    f"[{label}] native Analyze completed but DSO restore failed: "
+                    f"{restore_error}"
+                ) from restore_error
+            if analyze_result is not None and (
+                    type(analyze_result) is not int or analyze_result != 0):
+                raise RuntimeError(
+                    f"[{label}] native Analyze returned invalid status: "
+                    f"{analyze_result!r}"
+                )
+            self._postcheck_copied_loss_native_analysis()
+            self.save_project(strict=True)
             return elapsed
 
         elapsed = _analyze_once()
@@ -2661,14 +2977,27 @@ class Simulation():
         if part is not None and os.path.isfile(part):
             logging.info(f"Result part saved to {part}")
 
-    def save_project(self):
+    def save_project(self, strict=False):
+        errors = []
         try:
-            self.design1.save_project()
-        except Exception:
-            try:
-                self._native_project_handle().Save()
-            except Exception as e:
-                logging.warning(f"Failed to save project: {e}")
+            result = self.design1.save_project()
+            if result is False:
+                raise RuntimeError("wrapper save_project returned False")
+            return True
+        except Exception as error:
+            errors.append(f"wrapper={type(error).__name__}: {error}")
+        try:
+            result = self._native_project_handle().Save()
+            if result is False:
+                raise RuntimeError("native Project.Save returned False")
+            return True
+        except Exception as error:
+            errors.append(f"native={type(error).__name__}: {error}")
+        message = "Failed to save project: " + "; ".join(errors)
+        if strict:
+            raise RuntimeError(message)
+        logging.warning(message)
+        return False
 
     def close_project(self):
         # Capture solver/session descendants before AEDT release can orphan them.
@@ -2982,6 +3311,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 min_converged=sim.df_plus["min_converged"].iloc[0],
                 percent_error=sim.df_plus["percent_error"].iloc[0],
             )
+            # A copied pyDesign owns a separately constructed PyAEDT application
+            # wrapper.  Its cached Desktop proxy is not trusted for solve dispatch;
+            # analyze_and_extract uses the original Desktop and native design once.
+            sim.loss_native_analyze_required = True
 
         result_parts = [sim.df_plus]
         total_time = 0.0
