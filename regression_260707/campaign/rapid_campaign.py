@@ -21,6 +21,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 from filelock import FileLock
 
 
@@ -56,6 +57,8 @@ ACTIVE_STATUSES = frozenset(("queued", "attaching", "running"))
 TERMINAL_STATUSES = frozenset(("completed", "failed", "cancelled"))
 STATE_DIR_ENV = "MFT_RAPID_CAMPAIGN_STATE_DIR"
 TEMPERATURE_PATTERN = re.compile(r"^(?:T_(?:max|mean)_|Tprobe_)")
+FAILURE_STDERR_TAIL_LINES = 200
+FAILURE_STDERR_MAX_BYTES = 65_536
 
 STAGE_LOCAL3 = "local3"
 STAGE_PILOT10 = "pilot10"
@@ -237,15 +240,143 @@ def invalid_result_reason(result, solver_revision, library_revision, fetch_state
     return f"result_{fetch_state or 'strict_invalid'}"
 
 
-def _failure_message(task):
+_LEGACY_FAILURE_FIELDS = (
+    "failure_reason", "error_message", "error", "status_reason", "message",
+    "failure_message", "exit_code", "status",
+)
+_LEGACY_FAILURE_FIELD_PATTERN = "|".join(
+    re.escape(field) for field in _LEGACY_FAILURE_FIELDS
+)
+
+
+def _legacy_failure_payloads(text):
+    """Return payloads from the controller's historical ``key=value`` format."""
+    parts = re.split(
+        rf"\s+\|\s+(?=(?:{_LEGACY_FAILURE_FIELD_PATTERN})\s*=)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    payloads = []
+    for part in parts:
+        match = re.fullmatch(
+            rf"\s*({_LEGACY_FAILURE_FIELD_PATTERN})\s*=\s*(.*?)\s*",
+            part,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match is None:
+            payloads.append(part.strip())
+            continue
+        field, value = match.groups()
+        if field.lower() not in ("exit_code", "status"):
+            payloads.append(value.strip())
+    return [payload for payload in payloads if payload]
+
+
+def _is_informative_runtime_payload(payload):
+    text = str(payload or "").strip()
+    if not text:
+        return False
+    lowered = re.sub(r"\s+", " ", text.lower()).strip()
+    if lowered in {
+            "error", "failed", "failure", "task failed", "unknown",
+            "cancelled", "canceled"}:
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines and all(re.match(
+            r"^(?:PyAEDT\s+)?(?:INFO|DEBUG)(?::|\s)",
+            line,
+            flags=re.IGNORECASE,
+    ) for line in lines):
+        return False
+    return True
+
+
+def _is_informative_runtime_message(message):
+    """Reject status/preamble-only text while retaining genuine error payloads."""
+    text = str(message or "").strip()
+    if not text:
+        return False
+    return any(
+        _is_informative_runtime_payload(payload)
+        for payload in _legacy_failure_payloads(text)
+    )
+
+
+def _structured_failure_message(task):
     parts = []
     for key in (
             "failure_reason", "error_message", "error", "status_reason",
-            "message", "exit_code"):
+            "message", "failure_message"):
         value = task.get(key)
-        if value not in (None, "", []):
-            parts.append(f"{key}={value}")
-    return " | ".join(parts) or f"status={task.get('status', 'failed')}"
+        if value in (None, "", []):
+            continue
+        value_text = str(value).strip()
+        if _is_informative_runtime_message(value_text):
+            parts.append(f"{key}={value_text}")
+    return " | ".join(parts)
+
+
+def _stderr_failure_message(stderr):
+    """Extract one stable, high-signal cause from a bounded stderr tail."""
+    lines = [line.strip() for line in str(stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    patterns = (
+        ("run_one_loop", re.compile(
+            r"(?:ERROR:root:)?run_one_loop failed:\s*(.+)", re.IGNORECASE)),
+        ("exception", re.compile(
+            r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)):\s*(.+)$")),
+        ("pyaedt", re.compile(
+            r"^(?:PyAEDT\s+)?ERROR:(?:Global:|root:)?\s*(.+)$",
+            re.IGNORECASE)),
+        ("fatal", re.compile(r"^fatal:\s*(.+)$", re.IGNORECASE)),
+        ("srun", re.compile(
+            r"^srun:\s*error:\s*(.+(?:exited|killed|timeout|timed out).*)$",
+            re.IGNORECASE)),
+    )
+    for label, pattern in patterns:
+        for line in reversed(lines):
+            match = pattern.search(line)
+            if not match:
+                continue
+            detail = " ".join(match.groups()).strip()
+            message = f"stderr_{label}={detail}"
+            if _is_informative_runtime_message(message):
+                return message[:4000]
+    return ""
+
+
+def _fetch_task_stderr(task_id):
+    response = requests.get(
+        f"{scheduler_client.SCHEDULER}/api/tasks/{int(task_id)}/stderr",
+        params={
+            "tail_lines": FAILURE_STDERR_TAIL_LINES,
+            "max_bytes": FAILURE_STDERR_MAX_BYTES,
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _failure_message(task, stderr_fetcher=None, allow_stderr=True):
+    message = _structured_failure_message(task)
+    if message:
+        return message
+    task_id = task.get("id", task.get("task_id"))
+    if (allow_stderr and not isinstance(task_id, bool) and isinstance(task_id, int)
+            and task_id > 0):
+        fetcher = stderr_fetcher or _fetch_task_stderr
+        try:
+            message = _stderr_failure_message(fetcher(task_id))
+        except Exception:
+            message = ""
+        if message:
+            return message
+    exit_code = task.get("exit_code")
+    if exit_code not in (None, "", []):
+        return f"exit_code={exit_code}"
+    return f"status={task.get('status', 'failed')}"
 
 
 def error_fingerprint(message):
@@ -254,6 +385,28 @@ def error_fingerprint(message):
     normalized = re.sub(r"\b\d+\b", "<n>", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _runtime_error_fingerprint(message):
+    if not _is_informative_runtime_message(message):
+        return None
+    return error_fingerprint(message)
+
+
+def _refresh_failure_outcome(outcome, task):
+    """Classify a failed task, including legacy cached exit-code-only rows."""
+    status = str(task.get("status") or outcome.get("status") or "")
+    cached_message = outcome.get("error_message")
+    if _is_informative_runtime_message(cached_message):
+        message = str(cached_message)
+    else:
+        message = _failure_message(task, allow_stderr=status == "failed")
+    outcome["error_message"] = message
+    outcome["error_fingerprint"] = (
+        _runtime_error_fingerprint(message)
+        if status == "failed" else None
+    )
+    return outcome
 
 
 def _terminal_time(task, result=None):
@@ -293,7 +446,11 @@ def inspect_production_tasks(
                 and cached.get("task_id") == task_id
                 and cached.get("name") == task.get("name")
                 and cached.get("status") == status):
-            outcomes.append(dict(cached))
+            cached = dict(cached)
+            if status != "completed":
+                _refresh_failure_outcome(cached, task)
+                cached_outcomes[str(task_id)] = dict(cached)
+            outcomes.append(cached)
             continue
         outcome = {
             "task_id": task_id,
@@ -330,10 +487,8 @@ def inspect_production_tasks(
                 outcome["reason"] = invalid_result_reason(
                     result, solver_revision, library_revision, fetched.state)
         else:
-            message = _failure_message(task)
             outcome["reason"] = f"task_{status}"
-            outcome["error_message"] = message
-            outcome["error_fingerprint"] = error_fingerprint(message)
+            _refresh_failure_outcome(outcome, task)
         terminal_at = _terminal_time(task, result)
         outcome["terminal_at"] = _iso(terminal_at) if terminal_at else None
         outcomes.append(outcome)
@@ -430,7 +585,8 @@ def _production_gate_reasons(production):
 
     fingerprints = Counter(
         item["error_fingerprint"] for item in outcomes
-        if item["error_fingerprint"])
+        if (item["error_fingerprint"]
+            and _is_informative_runtime_message(item.get("error_message"))))
     repeated = sorted(
         (fingerprint, count) for fingerprint, count in fingerprints.items()
         if count >= REPEATED_ERROR_LIMIT)

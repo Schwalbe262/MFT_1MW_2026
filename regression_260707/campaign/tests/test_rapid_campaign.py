@@ -262,6 +262,234 @@ class PhysicalValidityTests(unittest.TestCase):
         self.assertEqual(inspected["outcomes"], [cached])
 
 
+class FailureClassificationTests(unittest.TestCase):
+    @staticmethod
+    def _failed_task(task_id, **overrides):
+        task = {
+            "id": task_id,
+            "name": rapid_campaign.production_prefix(
+                SOLVER_REVISION, LIBRARY_REVISION) + f"{task_id:05d}",
+            "status": "failed",
+            "exit_code": 1,
+        }
+        task.update(overrides)
+        return task
+
+    def test_structured_runtime_error_does_not_fetch_stderr(self):
+        fetch = mock.Mock(side_effect=AssertionError("stderr fetch is unnecessary"))
+
+        message = rapid_campaign._failure_message(
+            self._failed_task(
+                41, error_message="Failed to execute gRPC AEDT command: Analyze"),
+            stderr_fetcher=fetch,
+        )
+
+        self.assertEqual(
+            message,
+            "error_message=Failed to execute gRPC AEDT command: Analyze",
+        )
+        fetch.assert_not_called()
+        self.assertIsNotNone(
+            rapid_campaign._runtime_error_fingerprint(message))
+
+    def test_stale_info_failure_message_uses_stderr_root_cause(self):
+        stderr = """INFO:Global:Boundary Symmetry Symmetry3 has been created.
+ERROR:root:run_one_loop failed: [matrix] result extraction failed after 3 attempts
+RuntimeError: [matrix] result extraction failed after 3 attempts
+"""
+
+        message = rapid_campaign._failure_message(
+            self._failed_task(
+                42,
+                failure_message=(
+                    "INFO:Global:Boundary Symmetry Symmetry1 has been created.\n"
+                    "INFO:Global:Boundary Symmetry Symmetry2 has been created."
+                ),
+            ),
+            stderr_fetcher=mock.Mock(return_value=stderr),
+        )
+
+        self.assertEqual(
+            message,
+            "stderr_run_one_loop=[matrix] result extraction failed after 3 attempts",
+        )
+
+    def test_exit_code_only_failure_has_no_repeated_error_fingerprint(self):
+        task = self._failed_task(43)
+        with mock.patch.object(
+                rapid_campaign, "_fetch_task_stderr", return_value=""):
+            inspected = rapid_campaign.inspect_production_tasks(
+                [task], SOLVER_REVISION, LIBRARY_REVISION)
+
+        result = inspected["outcomes"][0]
+        self.assertEqual(result["error_message"], "exit_code=1")
+        self.assertIsNone(result["error_fingerprint"])
+
+    def test_cancelled_task_never_fetches_stderr_or_gets_runtime_fingerprint(self):
+        task = self._failed_task(48, status="cancelled", exit_code=None)
+        with mock.patch.object(
+                rapid_campaign, "_fetch_task_stderr") as fetch:
+            inspected = rapid_campaign.inspect_production_tasks(
+                [task], SOLVER_REVISION, LIBRARY_REVISION)
+
+        fetch.assert_not_called()
+        result = inspected["outcomes"][0]
+        self.assertEqual(result["error_message"], "status=cancelled")
+        self.assertIsNone(result["error_fingerprint"])
+
+    def test_legacy_cached_exit_only_fingerprint_is_reclassified(self):
+        task = self._failed_task(44)
+        name = task["name"]
+        cached = outcome(
+            44,
+            "failed",
+            name=name,
+            status="failed",
+            reason="task_failed",
+            error_message="exit_code=1",
+            error_fingerprint=rapid_campaign.error_fingerprint("exit_code=1"),
+        )
+        stderr = (
+            "ERROR:root:run_one_loop failed: Failed to execute gRPC AEDT "
+            "command: Analyze\n"
+        )
+        with mock.patch.object(
+                rapid_campaign, "_fetch_task_stderr", return_value=stderr) as fetch:
+            inspected = rapid_campaign.inspect_production_tasks(
+                [task], SOLVER_REVISION, LIBRARY_REVISION,
+                cached_outcomes={"44": cached},
+            )
+
+        refreshed = inspected["outcomes"][0]
+        fetch.assert_called_once_with(44)
+        self.assertEqual(
+            refreshed["error_message"],
+            "stderr_run_one_loop=Failed to execute gRPC AEDT command: Analyze",
+        )
+        self.assertIsNotNone(refreshed["error_fingerprint"])
+        self.assertNotEqual(
+            refreshed["error_fingerprint"], cached["error_fingerprint"])
+        self.assertEqual(inspected["cache"]["44"], refreshed)
+
+    def test_legacy_cached_exit_only_is_safe_when_stderr_unavailable(self):
+        rows = [
+            outcome(
+                task_id,
+                "failed",
+                status="failed",
+                reason="task_failed",
+                error_message="exit_code=1",
+                error_fingerprint=rapid_campaign.error_fingerprint("exit_code=1"),
+            )
+            for task_id in range(3)
+        ]
+
+        reasons = rapid_campaign._production_gate_reasons(production(rows))
+
+        self.assertFalse(any(
+            reason.startswith("repeated_runtime_error:") for reason in reasons
+        ))
+
+    def test_three_legacy_cached_prefixed_info_rows_do_not_pause(self):
+        message = (
+            "failure_message=PyAEDT INFO: Parsing design objects.\n"
+            "PyAEDT INFO: Boundary Symmetry Symmetry3 has been created."
+        )
+        rows = [
+            outcome(
+                task_id,
+                "failed",
+                status="failed",
+                reason="task_failed",
+                error_message=message,
+                error_fingerprint=rapid_campaign.error_fingerprint(message),
+            )
+            for task_id in range(3)
+        ]
+
+        reasons = rapid_campaign._production_gate_reasons(production(rows))
+
+        self.assertFalse(
+            rapid_campaign._is_informative_runtime_message(message)
+        )
+        self.assertFalse(any(
+            reason.startswith("repeated_runtime_error:") for reason in reasons
+        ))
+
+    def test_legacy_cached_prefixed_info_is_refetched_and_reclassified(self):
+        task = self._failed_task(49)
+        name = task["name"]
+        old_message = (
+            "failure_message=PyAEDT INFO: Parsing design objects.\n"
+            "PyAEDT INFO: Boundary Symmetry Symmetry3 has been created."
+        )
+        cached = outcome(
+            49,
+            "failed",
+            name=name,
+            status="failed",
+            reason="task_failed",
+            error_message=old_message,
+            error_fingerprint=rapid_campaign.error_fingerprint(old_message),
+        )
+        stderr = (
+            "ERROR:root:run_one_loop failed: copied loss preparation failed\n"
+        )
+        with mock.patch.object(
+                rapid_campaign, "_fetch_task_stderr", return_value=stderr) as fetch:
+            inspected = rapid_campaign.inspect_production_tasks(
+                [task], SOLVER_REVISION, LIBRARY_REVISION,
+                cached_outcomes={"49": cached},
+            )
+
+        refreshed = inspected["outcomes"][0]
+        fetch.assert_called_once_with(49)
+        self.assertEqual(
+            refreshed["error_message"],
+            "stderr_run_one_loop=copied loss preparation failed",
+        )
+        self.assertIsNotNone(refreshed["error_fingerprint"])
+        self.assertNotEqual(
+            refreshed["error_fingerprint"], cached["error_fingerprint"]
+        )
+        self.assertEqual(inspected["cache"]["49"], refreshed)
+
+    def test_legacy_prefixed_preamble_with_exception_remains_informative(self):
+        message = (
+            "failure_message=PyAEDT INFO: Parsing design objects.\n"
+            "RuntimeError: copied loss preparation failed"
+        )
+
+        self.assertTrue(
+            rapid_campaign._is_informative_runtime_message(message)
+        )
+        self.assertIsNotNone(
+            rapid_campaign._runtime_error_fingerprint(message)
+        )
+
+    def test_three_identical_stderr_runtime_errors_still_pause(self):
+        tasks = [self._failed_task(task_id) for task_id in range(45, 48)]
+        stderr = (
+            "ERROR:root:run_one_loop failed: Failed to execute gRPC AEDT "
+            "command: Analyze\n"
+        )
+        with mock.patch.object(
+                rapid_campaign, "_fetch_task_stderr", return_value=stderr):
+            inspected = rapid_campaign.inspect_production_tasks(
+                tasks, SOLVER_REVISION, LIBRARY_REVISION)
+
+        fingerprints = {
+            item["error_fingerprint"] for item in inspected["outcomes"]
+        }
+        self.assertEqual(len(fingerprints), 1)
+        fingerprint = fingerprints.pop()
+        self.assertIsNotNone(fingerprint)
+        self.assertIn(
+            f"repeated_runtime_error:{fingerprint}:3",
+            rapid_campaign._production_gate_reasons(inspected),
+        )
+
+
 class CandidateAuditTests(unittest.TestCase):
     def test_six_hour_profile_fails_before_candidate_or_submission_work(self):
         with mock.patch.object(

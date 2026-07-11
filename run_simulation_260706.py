@@ -649,13 +649,19 @@ def _configure_em_conductor_mesh(sim, mode):
     return True
 
 
-def _configure_loss_copy_skin_mesh(sim):
+def _configure_loss_copy_skin_mesh(sim, native_windings_solid=False):
     """Restore precise conductor physics when the matrix used stranded conductors."""
     if not _lightweight_matrix_enabled(sim):
         logging.info("loss copy: reusing inherited solid windings and mesh operations")
         return False
-    _set_winding_solid_state(sim.tx_winding, True, "Tx")
-    _set_winding_solid_state(sim.rx_winding, True, "Rx")
+    if native_windings_solid:
+        logging.info(
+            "loss copy: native winding edit already established solid Tx/Rx; "
+            "assigning conductor meshes only"
+        )
+    else:
+        _set_winding_solid_state(sim.tx_winding, True, "Tx")
+        _set_winding_solid_state(sim.rx_winding, True, "Rx")
     winding_mesh_count = sim.assign_skin_depth()
     plate_count = sim.assign_plate_settings(
         enable_eddy_effects=True, assign_skin_mesh=True
@@ -836,6 +842,671 @@ def _wait_for_ready_copied_loss_design(
         sleeper(min(max(0.0, float(poll_s)), max(0.0, deadline - now)))
 
 
+def _find_raw_design(project, design_name):
+    matches = [
+        raw for name, raw in _project_design_entries(project)
+        if name == design_name
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected one AEDT design named {design_name!r}, found {len(matches)}"
+        )
+    raw = matches[0]
+    if raw is None:
+        raw = project.SetActiveDesign(design_name)
+    if _aedt_design_name(raw) != design_name:
+        raise RuntimeError(
+            f"AEDT returned the wrong design for {design_name!r}: "
+            f"{_aedt_design_name(raw)!r}"
+        )
+    return raw
+
+
+def _validate_raw_copied_loss_design(raw_design, expected_name):
+    actual_name = _aedt_design_name(raw_design)
+    if actual_name != expected_name:
+        raise RuntimeError(
+            f"copied native design identity mismatch: "
+            f"expected={expected_name!r}, actual={actual_name!r}"
+        )
+    design_type = str(raw_design.GetDesignType() or "")
+    solution_type = str(raw_design.GetSolutionType() or "")
+    setups = tuple(str(item) for item in (
+        raw_design.GetModule("AnalysisSetup").GetSetups() or []
+    ))
+    if design_type != "Maxwell 3D":
+        raise RuntimeError(f"copied design type is not Maxwell 3D: {design_type!r}")
+    if not _is_ac_magnetic_solution(solution_type):
+        raise RuntimeError(
+            f"copied design solution is not AC magnetic: {solution_type!r}"
+        )
+    if "Setup1" not in setups:
+        raise RuntimeError(f"copied design has no Setup1: {setups!r}")
+    return {
+        "name": actual_name,
+        "design_type": design_type,
+        "solution_type": solution_type,
+        "setups": setups,
+    }
+
+
+def _matrix_source_signature(project, source_name, require_solved=True):
+    """Attest the source design and any native Matrix/solution evidence available."""
+    raw = _find_raw_design(project, source_name)
+    contract = _validate_raw_copied_loss_design(raw, source_name)
+    parameter_names = None
+    try:
+        parameter_names = tuple(sorted(str(item) for item in (
+            raw.GetChildObject("Parameters").GetChildNames() or []
+        )))
+    except Exception:
+        parameter_names = None
+    if parameter_names is not None and "Matrix" not in parameter_names:
+        raise RuntimeError(
+            f"solved source lost Matrix parameter: {parameter_names!r}"
+        )
+
+    solution_marker = None
+    try:
+        solution_module = raw.GetModule("Solutions")
+        variations = []
+        queried = False
+        for sweep_name in ("Setup1 : LastAdaptive", "Setup1 : Last Adaptive"):
+            try:
+                values = solution_module.GetAvailableVariations(sweep_name) or []
+                queried = True
+                variations.extend(str(item) for item in values)
+            except Exception:
+                continue
+        solution_marker = tuple(sorted(set(variations))) if queried else None
+    except Exception:
+        solution_marker = None
+    if require_solved and solution_marker == ():
+        raise RuntimeError("solved matrix source has no available solution variation")
+    source_windings = {}
+    for winding_name in ("Tx_winding", "Rx_winding"):
+        source_windings[winding_name] = tuple(
+            str(_native_child_property(
+                _native_winding_child(raw, winding_name), property_name
+            ))
+            for property_name in (
+                "Type", "Winding Type", "Current", "Phase", "IsSolid"
+            )
+        )
+    return {
+        **contract,
+        "parameter_names": parameter_names,
+        "solution_marker": solution_marker,
+        "windings": source_windings,
+    }
+
+
+def _assert_matrix_source_preserved(
+        project, source_name, expected_signature, require_solved=True):
+    actual = _matrix_source_signature(
+        project, source_name, require_solved=require_solved
+    )
+    if actual != expected_signature:
+        raise RuntimeError(
+            "solved matrix source changed during copied-loss preparation: "
+            f"expected={expected_signature!r}, actual={actual!r}"
+        )
+
+
+def _native_winding_child(raw_design, winding_name):
+    """Return the native winding using PyAEDT's Boundaries-first precedence."""
+    errors = []
+    for root_name in ("Boundaries", "Excitations"):
+        try:
+            root = raw_design.GetChildObject(root_name)
+            child_names = tuple(str(item) for item in (root.GetChildNames() or []))
+            if winding_name not in child_names:
+                errors.append(f"{root_name} names={child_names!r}")
+                continue
+            child = root.GetChildObject(winding_name)
+            if child is None or child is False:
+                errors.append(f"{root_name} child unavailable")
+                continue
+            return child
+        except Exception as error:
+            errors.append(f"{root_name}={type(error).__name__}: {error}")
+    raise RuntimeError(
+        f"native winding child {winding_name!r} is unavailable: {errors}"
+    )
+
+
+def _native_child_property(child, property_name):
+    names = tuple(str(item) for item in (child.GetPropNames() or []))
+    wanted = re.sub(r"[^a-z0-9]", "", property_name.lower())
+    matches = [
+        name for name in names
+        if re.sub(r"[^a-z0-9]", "", name.lower()) == wanted
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"native property {property_name!r} is not unique in {names!r}"
+        )
+    return child.GetPropValue(matches[0])
+
+
+def _aedt_quantity_parts(value):
+    token = str(value).strip().replace("°", "deg")
+    match = re.fullmatch(
+        r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)",
+        token,
+    )
+    if not match:
+        raise RuntimeError(f"invalid native AEDT quantity: {value!r}")
+    return float(match.group(1)), match.group(2).lower()
+
+
+def _assert_native_quantity(actual, expected, label):
+    actual_value, actual_unit = _aedt_quantity_parts(actual)
+    expected_value, expected_unit = _aedt_quantity_parts(expected)
+    if actual_unit != expected_unit:
+        raise RuntimeError(
+            f"{label} native unit mismatch: expected={expected!r}, actual={actual!r}"
+        )
+    if not math.isclose(actual_value, expected_value, rel_tol=1e-9, abs_tol=1e-9):
+        raise RuntimeError(
+            f"{label} native value mismatch: expected={expected!r}, actual={actual!r}"
+        )
+
+
+def _assert_native_copied_loss_windings(
+        raw_design, expected_design_name, tx_current, tx_phase,
+        rx_current, rx_phase, require_solid):
+    _validate_raw_copied_loss_design(raw_design, expected_design_name)
+    expected = {
+        "Tx_winding": (tx_current, tx_phase),
+        "Rx_winding": (rx_current, rx_phase),
+    }
+    for winding_name, (current, phase) in expected.items():
+        child = _native_winding_child(raw_design, winding_name)
+        object_kind = str(_native_child_property(
+            child, "Type"
+        )).strip().lower()
+        if object_kind != "winding group":
+            raise RuntimeError(
+                f"{winding_name} native object kind is not Winding Group: "
+                f"{object_kind!r}"
+            )
+        winding_type = str(_native_child_property(
+            child, "Winding Type"
+        )).strip().lower()
+        if winding_type != "current":
+            raise RuntimeError(
+                f"{winding_name} native Winding Type is not Current: "
+                f"{winding_type!r}"
+            )
+        _assert_native_quantity(
+            _native_child_property(
+                child, "Current"
+            ), current,
+            f"{winding_name} Current",
+        )
+        _assert_native_quantity(
+            _native_child_property(
+                child, "Phase"
+            ), phase,
+            f"{winding_name} Phase",
+        )
+        solid = _aedt_bool(_native_child_property(child, "IsSolid"))
+        if solid != bool(require_solid):
+            raise RuntimeError(
+                f"{winding_name} native IsSolid mismatch: "
+                f"expected={bool(require_solid)}, actual={solid}"
+            )
+
+
+def _assert_native_core_loss_assignment(raw_design, core_names):
+    boundary = raw_design.GetModule("BoundarySetup")
+    missing = []
+    for name in core_names:
+        try:
+            enabled = _aedt_bool(boundary.GetCoreLossEffect(name))
+        except Exception as error:
+            raise RuntimeError(
+                f"native core-loss readback failed for {name!r}"
+            ) from error
+        if not enabled:
+            missing.append(name)
+    if missing:
+        raise RuntimeError(
+            f"native copied design has core loss disabled for {missing!r}"
+        )
+
+
+def _edit_native_copied_loss_winding(
+        raw_design, expected_design_name, winding_name, current, phase):
+    """Edit one exact copied winding without trusting PyAEDT's cached props."""
+    _validate_raw_copied_loss_design(raw_design, expected_design_name)
+    child = _native_winding_child(raw_design, winding_name)
+    object_kind = str(_native_child_property(child, "Type")).strip().lower()
+    if object_kind != "winding group":
+        raise RuntimeError(
+            f"refusing to edit non-winding-group native object {winding_name!r}: "
+            f"{object_kind!r}"
+        )
+    winding_type = str(
+        _native_child_property(child, "Winding Type")
+    ).strip().lower()
+    if winding_type != "current":
+        raise RuntimeError(
+            f"refusing to edit non-current native winding {winding_name!r}: "
+            f"{winding_type!r}"
+        )
+    arguments = [
+        f"NAME:{winding_name}",
+        "Type:=", "Current",
+        "IsSolid:=", True,
+        "Current:=", str(current),
+        "Resistance:=", "0ohm",
+        "Inductance:=", "0H",
+        "Voltage:=", "0V",
+        "ParallelBranchesNum:=", "1",
+        "Phase:=", str(phase),
+    ]
+    boundary = raw_design.GetModule("BoundarySetup")
+    boundary.EditWindingGroup(winding_name, arguments)
+    _validate_raw_copied_loss_design(raw_design, expected_design_name)
+    return arguments
+
+
+def _assign_native_copied_core_loss(
+        raw_design, expected_design_name, core_names):
+    """Assign and prove core loss through the exact copied native design."""
+    _validate_raw_copied_loss_design(raw_design, expected_design_name)
+    core_names = [str(name) for name in core_names]
+    if not core_names or any(not name for name in core_names):
+        raise RuntimeError(f"invalid copied core-loss assignment: {core_names!r}")
+    boundary = raw_design.GetModule("BoundarySetup")
+    boundary.SetCoreLoss(core_names, False)
+    _validate_raw_copied_loss_design(raw_design, expected_design_name)
+    _assert_native_core_loss_assignment(raw_design, core_names)
+    return len(core_names)
+
+
+def _validate_saved_copied_loss_preparation(
+        aedt_path, source_name, copied_name,
+        tx_current, tx_phase, rx_current, rx_phase, core_count,
+        max_passes, min_converged, percent_error, frequency,
+        require_source_solved=True):
+    """Validate the authoritative saved AEDT snapshot before the loss solve."""
+    from ansys.aedt.core.internal.load_aedt_file import load_entire_aedt_file
+
+    if not os.path.isfile(aedt_path):
+        raise RuntimeError(f"copied-loss prepare snapshot is missing: {aedt_path}")
+    project = load_entire_aedt_file(aedt_path)
+    try:
+        models = project["AnsoftProject"]["Maxwell3DModel"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError("saved AEDT has no Maxwell3DModel list") from error
+    if not isinstance(models, list):
+        raise RuntimeError("saved AEDT Maxwell3DModel is not a list")
+
+    def _one_model(name):
+        matches = [model for model in models if model.get("Name") == name]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"saved AEDT expected one model {name!r}, found {len(matches)}"
+            )
+        return matches[0]
+
+    source_model = _one_model(source_name)
+    copied_model = _one_model(copied_name)
+    try:
+        source_parameters = source_model[
+            "MaxwellParameterSetup"
+        ]["MaxwellParameters"]
+        copied_parameters = copied_model[
+            "MaxwellParameterSetup"
+        ]["MaxwellParameters"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError("saved AEDT has malformed Maxwell parameter data") from error
+    if not isinstance(source_parameters.get("Matrix"), dict):
+        raise RuntimeError("saved matrix source lost its Matrix parameter")
+    if "Matrix" in copied_parameters:
+        raise RuntimeError("saved copied loss design still contains Matrix parameter")
+
+    boundaries = copied_model.get("BoundarySetup", {}).get("Boundaries", {})
+    expected_windings = {
+        "Tx_winding": (tx_current, tx_phase),
+        "Rx_winding": (rx_current, rx_phase),
+    }
+    for winding_name, (current, phase) in expected_windings.items():
+        winding = boundaries.get(winding_name)
+        if not isinstance(winding, dict):
+            raise RuntimeError(
+                f"saved copied design has no {winding_name!r} boundary"
+            )
+        if str(winding.get("Type", "")).strip().lower() != "current":
+            raise RuntimeError(
+                f"saved {winding_name} Type is not Current: {winding.get('Type')!r}"
+            )
+        if not _aedt_bool(winding.get("IsSolid")):
+            raise RuntimeError(f"saved {winding_name} is not solid")
+        _assert_native_quantity(
+            winding.get("Current"), current, f"saved {winding_name} Current"
+        )
+        _assert_native_quantity(
+            winding.get("Phase"), phase, f"saved {winding_name} Phase"
+        )
+
+    global_data = copied_model.get("BoundarySetup", {}).get("GlobalBoundData", {})
+    core_ids = global_data.get("CoreLossObjectIDs")
+    if core_ids is None:
+        core_ids = []
+    elif not isinstance(core_ids, (list, tuple)):
+        core_ids = [core_ids]
+    if len(core_ids) != int(core_count):
+        raise RuntimeError(
+            "saved copied design core-loss ID count mismatch: "
+            f"expected={int(core_count)}, actual={len(core_ids)}, ids={core_ids!r}"
+        )
+
+    try:
+        setup = copied_model["AnalysisSetup"]["SolveSetups"]["Setup1"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError("saved copied loss design has no Setup1") from error
+    expected_setup = {
+        "MaximumPasses": int(max_passes),
+        "MinimumConvergedPasses": int(min_converged),
+    }
+    if str(setup.get("SetupType", "")).strip() != "AC Magnetic":
+        raise RuntimeError(
+            f"saved copied Setup1 type mismatch: {setup.get('SetupType')!r}"
+        )
+    if not _aedt_bool(setup.get("Enabled")):
+        raise RuntimeError("saved copied Setup1 is disabled")
+    for key, expected in expected_setup.items():
+        if int(setup.get(key, -1)) != expected:
+            raise RuntimeError(
+                f"saved copied Setup1 {key} mismatch: "
+                f"expected={expected}, actual={setup.get(key)!r}"
+            )
+    if not math.isclose(
+            float(setup.get("PercentError", float("nan"))),
+            float(percent_error), rel_tol=0, abs_tol=1e-12):
+        raise RuntimeError(
+            "saved copied Setup1 PercentError mismatch: "
+            f"expected={percent_error!r}, actual={setup.get('PercentError')!r}"
+        )
+    _assert_native_quantity(
+        setup.get("Frequency"), f"{float(frequency):g}Hz",
+        "saved copied Setup1 Frequency",
+    )
+
+    preview = project.get("ProjectPreview", {}).get("DesignInfo")
+    if not isinstance(preview, list):
+        raise RuntimeError("saved AEDT has no ProjectPreview DesignInfo list")
+
+    def _one_preview(name):
+        matches = [item for item in preview if item.get("DesignName") == name]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"saved AEDT expected one preview {name!r}, found {len(matches)}"
+            )
+        return matches[0]
+
+    source_solved = _aedt_bool(_one_preview(source_name).get("IsSolved"))
+    if require_source_solved and not source_solved:
+        raise RuntimeError("saved matrix source is no longer solved")
+    if _aedt_bool(_one_preview(copied_name).get("IsSolved")):
+        raise RuntimeError("saved copied design still owns inherited solution data")
+    return {
+        "source": source_name,
+        "copied": copied_name,
+        "core_loss_ids": len(core_ids),
+        "source_solved": source_solved,
+        "copied_solved": False,
+    }
+
+
+def _set_copied_loss_winding_excitation(
+        winding, expected_name, current, phase, label):
+    """Edit one copied winding only after its boundary DataModel is usable."""
+    if winding is None or winding is False:
+        raise RuntimeError(f"copied {label} winding is unavailable")
+    resolved_name = str(winding.name or "").strip()
+    if resolved_name != expected_name:
+        raise RuntimeError(
+            f"copied {label} winding identity mismatch: "
+            f"expected={expected_name!r}, actual={resolved_name!r}"
+        )
+    props = winding.props
+    if not isinstance(props, dict) or not props:
+        raise RuntimeError(f"copied {label} winding properties are unavailable")
+    updates = {"Current": str(current), "Phase": str(phase)}
+    setter = getattr(props, "_setitem_without_update", None)
+    previous_auto_update = getattr(winding, "auto_update", None)
+    try:
+        if previous_auto_update is not None:
+            winding.auto_update = False
+        for key, value in updates.items():
+            if callable(setter):
+                setter(key, value)
+            else:
+                props[key] = value
+        if winding.update() is not True:
+            raise RuntimeError(
+                f"copied {label} winding Current/Phase update returned False"
+            )
+    finally:
+        if previous_auto_update is not None:
+            winding.auto_update = previous_auto_update
+    readback_name = str(winding.name or "").strip()
+    if readback_name != expected_name:
+        raise RuntimeError(
+            f"copied {label} winding identity changed after update: "
+            f"expected={expected_name!r}, actual={readback_name!r}"
+        )
+
+
+def _configure_copied_loss_excitations(
+        design, raw_design, expected_design_name,
+        tx_current, tx_phase, rx_current, rx_phase):
+    """Edit both windings natively and prove the complete copied state."""
+    wrapper_raw = getattr(getattr(design, "solver_instance", None), "odesign", None)
+    if wrapper_raw is None:
+        raise RuntimeError("copied wrapper has no native odesign before mutation")
+    _validate_raw_copied_loss_design(wrapper_raw, expected_design_name)
+    wrapper_name = _aedt_design_name(getattr(design, "design_name", ""))
+    if wrapper_name != expected_design_name:
+        raise RuntimeError(
+            f"copied wrapper identity mismatch: expected={expected_design_name!r}, "
+            f"actual={wrapper_name!r}"
+        )
+    _validate_raw_copied_loss_design(raw_design, expected_design_name)
+    tx = _native_winding_child(raw_design, "Tx_winding")
+    rx = _native_winding_child(raw_design, "Rx_winding")
+    _edit_native_copied_loss_winding(
+        raw_design, expected_design_name, "Tx_winding", tx_current, tx_phase
+    )
+    _edit_native_copied_loss_winding(
+        raw_design, expected_design_name, "Rx_winding", rx_current, rx_phase
+    )
+    _assert_native_copied_loss_windings(
+        raw_design, expected_design_name,
+        tx_current, tx_phase, rx_current, rx_phase,
+        require_solid=True,
+    )
+    return tx, rx
+
+
+def _validate_prepared_copied_loss_design(
+        project, prepared, before_names, source_name):
+    current_names = {
+        name for name, _raw in _project_design_entries(project)
+    }
+    new_names = sorted(current_names - set(before_names))
+    if len(new_names) != 1:
+        raise RuntimeError(
+            f"copied preparation introduced {len(new_names)} designs: {new_names!r}"
+        )
+    copied_name = new_names[0]
+    if copied_name == source_name:
+        raise RuntimeError("copied design resolved to the matrix source")
+    wrapper_name = _aedt_design_name(getattr(prepared, "design_name", ""))
+    wrapper_solution = str(getattr(prepared, "solution_type", "") or "")
+    setup = prepared.get_setup(name="Setup1")
+    if (
+            wrapper_name != copied_name
+            or not _is_ac_magnetic_solution(wrapper_solution)
+            or setup is None or setup is False
+            or _ready_loss_setup_properties(setup) is None):
+        raise RuntimeError(
+            "returned copied wrapper is not fully ready: "
+            f"name={wrapper_name!r}, solution={wrapper_solution!r}, "
+            f"copied_name={copied_name!r}"
+        )
+    raw = _find_raw_design(project, copied_name)
+    _validate_raw_copied_loss_design(raw, copied_name)
+    wrapper_raw = getattr(getattr(prepared, "solver_instance", None), "odesign", None)
+    if wrapper_raw is None:
+        raise RuntimeError("returned copied wrapper has no native odesign")
+    _validate_raw_copied_loss_design(wrapper_raw, copied_name)
+    return copied_name, raw
+
+
+def _cleanup_bad_copied_loss_design(
+        project, before_names, source_name, source_signature,
+        require_source_solved=True,
+        max_attempts=3, poll_s=0.25, sleeper=time.sleep):
+    """Delete the one exact new design and prove the solved source survived."""
+    before_names = set(before_names)
+    active_source = project.SetActiveDesign(source_name)
+    _validate_raw_copied_loss_design(active_source, source_name)
+    current_names = {
+        name for name, _raw in _project_design_entries(project)
+    }
+    new_names = sorted(current_names - before_names)
+    if not new_names:
+        for _poll in range(max(1, int(max_attempts))):
+            if poll_s:
+                sleeper(max(0.0, float(poll_s)))
+            current_names = {
+                name for name, _raw in _project_design_entries(project)
+            }
+            new_names = sorted(current_names - before_names)
+            if new_names:
+                break
+            if current_names != before_names:
+                raise RuntimeError(
+                    "copied-design cleanup baseline changed while waiting: "
+                    f"before={sorted(before_names)!r}, "
+                    f"current={sorted(current_names)!r}"
+                )
+        _assert_matrix_source_preserved(
+            project, source_name, source_signature,
+            require_solved=require_source_solved,
+        )
+        if not new_names:
+            return None
+    if len(new_names) != 1:
+        raise RuntimeError(
+            f"refusing ambiguous copied-design cleanup: new_names={new_names!r}"
+        )
+    bad_name = new_names[0]
+    if bad_name == source_name:
+        raise RuntimeError("refusing to delete solved matrix source")
+    errors = []
+    for _attempt in range(1, max(1, int(max_attempts)) + 1):
+        active_source = project.SetActiveDesign(source_name)
+        _validate_raw_copied_loss_design(active_source, source_name)
+        try:
+            project.DeleteDesign(bad_name)
+        except Exception as error:
+            errors.append(f"{type(error).__name__}: {error}")
+        if poll_s:
+            sleeper(max(0.0, float(poll_s)))
+        remaining = {
+            name for name, _raw in _project_design_entries(project)
+        }
+        if bad_name not in remaining:
+            if remaining != before_names:
+                raise RuntimeError(
+                    "copied-design cleanup did not restore the exact baseline: "
+                    f"before={sorted(before_names)!r}, after={sorted(remaining)!r}"
+                )
+            _assert_matrix_source_preserved(
+                project, source_name, source_signature,
+                require_solved=require_source_solved,
+            )
+            return bad_name
+    raise RuntimeError(
+        f"failed to delete exact copied design {bad_name!r}: {errors}"
+    )
+
+
+def _retry_copied_loss_preparation(
+        project, source_name, prepare_attempt, max_attempts=3,
+        retry_delay_s=5.0, sleeper=time.sleep, require_source_solved=True):
+    """Retry only pre-solve copy preparation while preserving the solved source."""
+    max_attempts = max(1, int(max_attempts))
+    source_signature = _matrix_source_signature(
+        project, source_name, require_solved=require_source_solved
+    )
+    baseline_names = {
+        name for name, _raw in _project_design_entries(project)
+    }
+    failures = []
+    for attempt in range(1, max_attempts + 1):
+        active_source = project.SetActiveDesign(source_name)
+        _validate_raw_copied_loss_design(active_source, source_name)
+        _assert_matrix_source_preserved(
+            project, source_name, source_signature,
+            require_solved=require_source_solved,
+        )
+        current_names = {
+            name for name, _raw in _project_design_entries(project)
+        }
+        if current_names != baseline_names:
+            raise RuntimeError(
+                "copied-loss retry baseline is not stable: "
+                f"expected={sorted(baseline_names)!r}, "
+                f"actual={sorted(current_names)!r}"
+            )
+        before_names = set(baseline_names)
+        try:
+            prepared = prepare_attempt(before_names, attempt)
+            if prepared is None or prepared is False:
+                raise RuntimeError("copied loss preparation returned no design")
+            _validate_prepared_copied_loss_design(
+                project, prepared, before_names, source_name
+            )
+            _assert_matrix_source_preserved(
+                project, source_name, source_signature,
+                require_solved=require_source_solved,
+            )
+            return prepared, attempt
+        except Exception as error:
+            failures.append(f"attempt {attempt}: {type(error).__name__}: {error}")
+            try:
+                _cleanup_bad_copied_loss_design(
+                    project, before_names, source_name, source_signature,
+                    require_source_solved=require_source_solved,
+                    sleeper=sleeper,
+                )
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    "copied loss preparation failed and exact bad-design cleanup "
+                    f"also failed: prepare={error}; cleanup={cleanup_error}"
+                ) from cleanup_error
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    "copied loss design preparation failed after "
+                    f"{max_attempts} fresh copies; " + "; ".join(failures)
+                ) from error
+            logging.warning(
+                "copied loss preparation attempt %s/%s failed before solve; "
+                "deleted the exact bad copy and will re-copy solved %s: %s",
+                attempt, max_attempts, source_name, error,
+            )
+            if retry_delay_s:
+                sleeper(max(0.0, float(retry_delay_s)))
+
+
 def _named_object_sequence(value):
     """Return object names without allowing an unnameable remap entry."""
     if value is None:
@@ -873,10 +1544,16 @@ def _remap_copied_design_objects(old_design, new_design, attributes):
         setattr(new_design, attribute, mapped)
 
 
-def _delete_copied_solution_or_raise(primary_design, fallback_design):
-    """Delete inherited fields before loss solve, using one of two COM paths."""
+def _delete_copied_solution_or_raise(
+        primary_design, fallback_design, expected_design_name):
+    """Delete inherited fields only through an exact copied-design identity."""
     errors = []
     for label, design in (("wrapper", primary_design), ("native", fallback_design)):
+        try:
+            _validate_raw_copied_loss_design(design, expected_design_name)
+        except Exception as error:
+            errors.append(f"{label}-identity={type(error).__name__}: {error}")
+            continue
         try:
             design.DeleteFullVariation("All", False)
             return label
@@ -3015,6 +3692,9 @@ class Simulation():
         row["matrix_conductor_policy"] = getattr(
             self, "matrix_conductor_policy", "not_recorded"
         )
+        row["loss_copy_prepare_attempts"] = int(getattr(
+            self, "loss_copy_prepare_attempts", 0
+        ))
         for key in (
             "matrix_winding_stranded_count",
             "matrix_conductor_mesh_operation_count",
@@ -3425,21 +4105,25 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             sim.assign_boundary()
             sim.create_setup(mode=mode)
 
-        def _build_loss_by_copy():
+        def _prepare_loss_copy_once(before_names, _attempt):
             """maxwell_matrix를 복제해 loss_sym 디자인으로 전환 (모델링 절반 절약).
             레퍼런스: pyaedt_library/example/MFT_TAB second_simulation()"""
             import math as _m
-            old_design = sim.design1  # 객체 핸들 리매핑용
             op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
-            before_names = {name for name, _raw in _project_design_entries(op)}
+            old_design = sim.design_matrix
+            source_name = _aedt_design_name(
+                getattr(old_design, "design_name", "")
+            )
+            if source_name != "maxwell_matrix":
+                raise RuntimeError(
+                    f"loss copy source is not maxwell_matrix: {source_name!r}"
+                )
             # The reference implementation gives AEDT five seconds to commit
             # the solved source design before CopyDesign. Shorter matrix runs
             # exposed a copied design with no solution type or Setup1.
-            old_design.save_project()
-            if not model_only:
-                sim._capture_matrix_hpc_acf()
+            sim.save_project(strict=True)
             time.sleep(5)
-            op.CopyDesign("maxwell_matrix")
+            op.CopyDesign(source_name)
             op.Paste()
             new_design, copied_setup = _wait_for_ready_copied_loss_design(
                 op, before_names,
@@ -3448,6 +4132,21 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 ),
             )
             sim.design1 = new_design
+            copied_name = _aedt_design_name(
+                getattr(new_design, "design_name", "")
+            )
+            if copied_name == source_name or copied_name in before_names:
+                raise RuntimeError(
+                    f"fresh copied design identity is invalid: {copied_name!r}"
+                )
+            wrapper_raw = getattr(
+                getattr(new_design, "solver_instance", None), "odesign", None
+            )
+            if wrapper_raw is None:
+                raise RuntimeError("fresh copied wrapper has no native odesign")
+            _validate_raw_copied_loss_design(wrapper_raw, copied_name)
+            active_raw = op.GetActiveDesign()
+            _validate_raw_copied_loss_design(active_raw, copied_name)
 
             # 모델링 때 래퍼에 저장된 객체 핸들들을 복제 디자인으로 리매핑
             # (save_calculation/save_loss_reports가 소비 - MFT_TAB 레퍼런스 패턴)
@@ -3464,6 +4163,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
             # matrix 파라미터 제거 (loss 디자인에는 불필요한 연산)
             od = op.GetActiveDesign()
+            _validate_raw_copied_loss_design(od, copied_name)
+            _validate_raw_copied_loss_design(wrapper_raw, copied_name)
             try:
                 od.GetModule("MaxwellParameterSetup").DeleteParameters(["Matrix"])
             except Exception as error:
@@ -3474,33 +4175,127 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             phase2 = getattr(sim, "I2_phase_auto", None)
             if phase2 is None:
                 phase2 = float(sim.df_plus["I2_phase_deg"].iloc[0])
-            tx, rx = sim.design1.get_excitation(excitation_name=["Tx_winding", "Rx_winding"])
-            tx["Current"] = f"{sim.loss_I1_peak}A"
-            tx["Phase"] = f"{sim.loss_I1_phase_deg}deg"
-            rx["Current"] = f"{I2 * _m.sqrt(2)}A"
-            rx["Phase"] = f"{phase2}deg"
+            tx_current = f"{sim.loss_I1_peak}A"
+            tx_phase = f"{sim.loss_I1_phase_deg}deg"
+            rx_current = f"{I2 * _m.sqrt(2)}A"
+            rx_phase = f"{phase2}deg"
+            tx, rx = _configure_copied_loss_excitations(
+                new_design, wrapper_raw, copied_name,
+                tx_current, tx_phase, rx_current, rx_phase,
+            )
             sim.tx_winding, sim.rx_winding = tx, rx
 
             # 복제 디자인이 물려받은 matrix 해를 삭제 - 안 지우면 여자를 바꿔도
             # 솔버가 재해석 없이 '해 없음 완료'로 끝남 (로컬 랜덤 검증에서 3/3 재현)
             _delete_copied_solution_or_raise(
-                sim.design1.design.odesign,
+                wrapper_raw,
                 op.GetActiveDesign(),
+                copied_name,
             )
 
             # 코어손실 + skin 메시(손실 정밀용) + 셋업 정밀값
-            sim.assign_core_loss()
-            _configure_loss_copy_skin_mesh(sim)
-            sim.design1.setup = _configure_copied_loss_setup(
+            _validate_raw_copied_loss_design(op.GetActiveDesign(), copied_name)
+            _validate_raw_copied_loss_design(wrapper_raw, copied_name)
+            core_names = [item.name for item in new_design.core_objs]
+            _assign_native_copied_core_loss(
+                wrapper_raw, copied_name, core_names
+            )
+            _configure_loss_copy_skin_mesh(
+                sim, native_windings_solid=True
+            )
+            _validate_raw_copied_loss_design(op.GetActiveDesign(), copied_name)
+            _validate_raw_copied_loss_design(wrapper_raw, copied_name)
+            _assert_native_copied_loss_windings(
+                wrapper_raw, copied_name,
+                tx_current, tx_phase, rx_current, rx_phase,
+                require_solid=True,
+            )
+            _assert_native_core_loss_assignment(wrapper_raw, core_names)
+            new_design.setup = _configure_copied_loss_setup(
                 copied_setup,
                 max_passes=sim.df_plus["max_passes"].iloc[0],
                 min_converged=sim.df_plus["min_converged"].iloc[0],
                 percent_error=sim.df_plus["percent_error"].iloc[0],
             )
+            _validate_raw_copied_loss_design(op.GetActiveDesign(), copied_name)
+            _validate_raw_copied_loss_design(wrapper_raw, copied_name)
+            sim.save_project(strict=True)
+            _validate_saved_copied_loss_preparation(
+                os.path.join(
+                    sim.project_path, f"{sim.PROJECT_NAME}.aedt"
+                ),
+                source_name, copied_name,
+                tx_current, tx_phase, rx_current, rx_phase,
+                len(core_names),
+                sim.df_plus["max_passes"].iloc[0],
+                sim.df_plus["min_converged"].iloc[0],
+                sim.df_plus["percent_error"].iloc[0],
+                sim.df_plus["freq"].iloc[0],
+                require_source_solved=not model_only,
+            )
             # A copied pyDesign owns a separately constructed PyAEDT application
             # wrapper.  Its cached Desktop proxy is not trusted for solve dispatch;
             # analyze_and_extract uses the original Desktop and native design once.
+            return new_design
+
+        def _build_loss_by_copy():
+            """Prepare a fresh copied loss design without ever re-solving Matrix."""
+            source_design = sim.design_matrix
+            source_tx_winding = sim.tx_winding
+            source_rx_winding = sim.rx_winding
+            temporary_names = (
+                "Tx_skin_depth_mesh", "Rx_skin_depth_mesh", "Rx_length_mesh",
+                "plate_skin_depth_mesh", "loss_winding_solid_update_count",
+                "loss_winding_mesh_operation_count",
+                "loss_conductor_mesh_operation_count",
+                "loss_plate_eddy_on_readback_count",
+                "loss_native_analyze_required", "loss_copy_prepare_attempts",
+                "design_loss",
+            )
+            baseline = {
+                name: (name in sim.__dict__, sim.__dict__.get(name))
+                for name in temporary_names
+            }
+
+            def _rollback_failed_prepare():
+                sim.design1 = source_design
+                sim.tx_winding = source_tx_winding
+                sim.rx_winding = source_rx_winding
+                for name, (existed, value) in baseline.items():
+                    if existed:
+                        sim.__dict__[name] = value
+                    else:
+                        sim.__dict__.pop(name, None)
+
+            if not model_only:
+                sim._capture_matrix_hpc_acf()
+
+            def _attempt(before_names, attempt):
+                _rollback_failed_prepare()
+                try:
+                    return _prepare_loss_copy_once(before_names, attempt)
+                except Exception:
+                    _rollback_failed_prepare()
+                    raise
+
+            op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
+            try:
+                new_design, attempts = _retry_copied_loss_preparation(
+                    op, "maxwell_matrix", _attempt,
+                    max_attempts=3, retry_delay_s=5.0,
+                    require_source_solved=not model_only,
+                )
+            except Exception:
+                _rollback_failed_prepare()
+                raise
+            sim.design1 = new_design
+            sim.loss_copy_prepare_attempts = attempts
             sim.loss_native_analyze_required = True
+            logging.info(
+                "copied loss design became fully ready on prepare attempt %s/3; "
+                "the exact solved Matrix source was reused",
+                attempts,
+            )
 
         result_parts = [sim.df_plus]
         total_time = 0.0

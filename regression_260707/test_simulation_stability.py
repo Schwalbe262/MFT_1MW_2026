@@ -12,7 +12,10 @@ import pandas as pd
 from run_simulation_260706 import (
     Simulation,
     SolutionDataUnavailableError,
+    _assign_native_copied_core_loss,
+    _assert_native_core_loss_assignment,
     _completion_exit_code,
+    _configure_copied_loss_excitations,
     _create_simulation_session,
     _configure_copied_loss_setup,
     _configure_em_conductor_mesh,
@@ -20,11 +23,16 @@ from run_simulation_260706 import (
     _delete_copied_solution_or_raise,
     _em_result_is_valid,
     _em_result_validation,
+    _edit_native_copied_loss_winding,
+    _native_winding_child,
     _parse_rl_matrix_export,
     _remap_copied_design_objects,
+    _retry_copied_loss_preparation,
+    _set_copied_loss_winding_excitation,
     _thermal_failure_frame,
     _thermal_result_is_valid,
     _wait_for_ready_copied_loss_design,
+    _validate_saved_copied_loss_preparation,
     log_failed_sample,
 )
 from module.input_parameter_260706 import (
@@ -584,6 +592,23 @@ class CopiedLossMeshPolicyTests(unittest.TestCase):
             ("plates", {"enable_eddy_effects": True, "assign_skin_mesh": True}),
         ])
 
+    def test_native_solid_copy_skips_stale_wrapper_edits_but_keeps_mesh(self):
+        simulation, calls = self._simulation(0)
+        simulation.tx_winding.update_result = False
+        simulation.rx_winding.update_result = False
+
+        assigned = _configure_loss_copy_skin_mesh(
+            simulation, native_windings_solid=True
+        )
+
+        self.assertTrue(assigned)
+        self.assertEqual(simulation.tx_winding.update_calls, 0)
+        self.assertEqual(simulation.rx_winding.update_calls, 0)
+        self.assertEqual(calls, [
+            ("skin", {}),
+            ("plates", {"enable_eddy_effects": True, "assign_skin_mesh": True}),
+        ])
+
     def test_winding_update_failure_stops_before_loss_mesh(self):
         simulation, calls = self._simulation(0)
         simulation.tx_winding.update_result = False
@@ -1057,21 +1082,601 @@ class CopiedLossObjectIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "remap mismatch for Rx_windings"):
             _remap_copied_design_objects(old, new, ("Rx_windings",))
 
-    def test_solution_delete_uses_fallback_after_primary_failure(self):
-        primary = SimpleNamespace(DeleteFullVariation=Mock(side_effect=RuntimeError("grpc")))
-        fallback = SimpleNamespace(DeleteFullVariation=Mock(return_value=None))
+    @staticmethod
+    def _native_design(name, delete_effect=None):
+        analysis = SimpleNamespace(GetSetups=lambda: ["Setup1"])
+        design = SimpleNamespace(
+            GetName=lambda: name,
+            GetDesignType=lambda: "Maxwell 3D",
+            GetSolutionType=lambda: "AC Magnetic",
+            GetModule=lambda module: analysis if module == "AnalysisSetup" else None,
+            DeleteFullVariation=Mock(
+                side_effect=delete_effect) if delete_effect else Mock(return_value=None),
+        )
+        return design
 
-        backend = _delete_copied_solution_or_raise(primary, fallback)
+    def test_solution_delete_uses_fallback_after_primary_failure(self):
+        primary = self._native_design("copy", RuntimeError("grpc"))
+        fallback = self._native_design("copy")
+
+        backend = _delete_copied_solution_or_raise(primary, fallback, "copy")
 
         self.assertEqual(backend, "native")
         fallback.DeleteFullVariation.assert_called_once_with("All", False)
 
     def test_solution_delete_fails_when_both_paths_fail(self):
-        primary = SimpleNamespace(DeleteFullVariation=Mock(side_effect=RuntimeError("grpc")))
-        fallback = SimpleNamespace(DeleteFullVariation=Mock(side_effect=RuntimeError("com")))
+        primary = self._native_design("copy", RuntimeError("grpc"))
+        fallback = self._native_design("copy", RuntimeError("com"))
 
         with self.assertRaisesRegex(RuntimeError, "copied solution deletion failed"):
-            _delete_copied_solution_or_raise(primary, fallback)
+            _delete_copied_solution_or_raise(primary, fallback, "copy")
+
+    def test_solution_delete_never_touches_stale_source_binding(self):
+        source = self._native_design("maxwell_matrix")
+        copied = self._native_design("maxwell_matrix1")
+
+        backend = _delete_copied_solution_or_raise(
+            source, copied, "maxwell_matrix1"
+        )
+
+        self.assertEqual(backend, "native")
+        source.DeleteFullVariation.assert_not_called()
+        copied.DeleteFullVariation.assert_called_once_with("All", False)
+
+
+class _NativeTree:
+    def __init__(self, children=None, properties=None):
+        self.children = children or {}
+        self.properties = properties or {}
+
+    def GetChildNames(self):
+        return list(self.children)
+
+    def GetChildObject(self, name):
+        return self.children[name]
+
+    def GetPropNames(self):
+        return list(self.properties)
+
+    def GetPropValue(self, name):
+        return self.properties[name]
+
+
+class _NativeLossDesign:
+    def __init__(self, name, matrix=False, solved=True):
+        self.name = name
+        self.matrix = matrix
+        self.solved = solved
+        self.deleted_solution = Mock()
+        self.windings = {
+            "Tx_winding": _NativeTree(properties={
+                "Type": "Winding Group", "Winding Type": "Current",
+                "Current": "1414A", "Phase": "0deg", "IsSolid": "Stranded",
+            }),
+            "Rx_winding": _NativeTree(properties={
+                "Type": "Winding Group", "Winding Type": "Current",
+                "Current": "141.4A", "Phase": "0deg", "IsSolid": "Stranded",
+            }),
+        }
+        self.core_loss = {}
+        self.native_winding_edit_noop = False
+        self.native_core_loss_noop = False
+        self.edit_winding_calls = []
+        self.set_core_loss_calls = []
+
+    def _edit_winding_group(self, name, arguments):
+        self.edit_winding_calls.append((name, list(arguments)))
+        if self.native_winding_edit_noop:
+            return
+        if arguments[0] != f"NAME:{name}" or len(arguments[1:]) % 2:
+            raise AssertionError(arguments)
+        updates = {
+            str(arguments[index]).removesuffix(":="): arguments[index + 1]
+            for index in range(1, len(arguments), 2)
+        }
+        if "Type" in updates:
+            updates["Winding Type"] = updates.pop("Type")
+        self.windings[name].properties.update(updates)
+
+    def _set_core_loss(self, names, on_field):
+        self.set_core_loss_calls.append((list(names), on_field))
+        if self.native_core_loss_noop:
+            return
+        for name in names:
+            self.core_loss[name] = True
+
+    def GetName(self):
+        return self.name
+
+    def GetDesignType(self):
+        return "Maxwell 3D"
+
+    def GetSolutionType(self):
+        return "AC Magnetic"
+
+    def GetChildObject(self, name):
+        if name == "Parameters":
+            return _NativeTree(children={"Matrix": _NativeTree()} if self.matrix else {})
+        if name == "Boundaries":
+            return _NativeTree(children=self.windings)
+        if name == "Excitations":
+            return _NativeTree(children={})
+        raise KeyError(name)
+
+    def GetModule(self, name):
+        if name == "AnalysisSetup":
+            return SimpleNamespace(GetSetups=lambda: ["Setup1"])
+        if name == "Solutions":
+            return SimpleNamespace(
+                GetAvailableVariations=lambda _setup: ["Freq='1000Hz'"] if self.solved else []
+            )
+        if name == "BoundarySetup":
+            return SimpleNamespace(
+                GetCoreLossEffect=lambda object_name: self.core_loss.get(object_name, False),
+                EditWindingGroup=self._edit_winding_group,
+                SetCoreLoss=self._set_core_loss,
+            )
+        raise KeyError(name)
+
+    def DeleteFullVariation(self, *_args):
+        self.deleted_solution(*_args)
+        self.solved = False
+
+
+class _NativeLossProject:
+    def __init__(self, source):
+        self.designs = [source]
+        self.deleted = []
+        self.active = source.name
+
+    def GetDesigns(self):
+        return list(self.designs)
+
+    def SetActiveDesign(self, name):
+        matches = [item for item in self.designs if item.name == name]
+        if len(matches) != 1:
+            raise RuntimeError(name)
+        self.active = name
+        return matches[0]
+
+    def DeleteDesign(self, name):
+        matches = [item for item in self.designs if item.name == name]
+        if len(matches) != 1:
+            raise RuntimeError(name)
+        self.designs.remove(matches[0])
+        self.deleted.append(name)
+
+
+class _WindingProps(dict):
+    def _setitem_without_update(self, key, value):
+        dict.__setitem__(self, key, value)
+
+
+class _CopiedWinding:
+    def __init__(self, name, native_child, update_result=True, write_native=True):
+        self.name = name
+        self.native_child = native_child
+        self.update_result = update_result
+        self.write_native = write_native
+        self.auto_update = True
+        self.props = _WindingProps(native_child.properties.copy())
+        self.update_calls = 0
+
+    def update(self):
+        self.update_calls += 1
+        if self.update_result and self.write_native:
+            self.native_child.properties.update(self.props)
+        return self.update_result
+
+
+def _prepared_wrapper(raw, windings=None):
+    setup = SimpleNamespace(
+        _child_object=object(),
+        properties={
+            "Max. Number of Passes": 10,
+            "Min. Converged Passes": 2,
+            "Percent Error": 1.5,
+        },
+    )
+    return SimpleNamespace(
+        design_name=raw.name,
+        solution_type="AC Magnetic",
+        solver_instance=SimpleNamespace(odesign=raw),
+        get_setup=lambda name: setup if name == "Setup1" else False,
+        get_excitation=lambda excitation_name: windings,
+    )
+
+
+class CopiedLossPreparationRetryTests(unittest.TestCase):
+    def test_native_winding_prefers_boundaries_when_alias_is_in_both_roots(self):
+        boundary_child = _NativeTree(properties={"Current": "1A"})
+        excitation_alias = _NativeTree(properties={"Current": "stale"})
+
+        class _AliasedDesign:
+            def GetChildObject(self, name):
+                if name == "Boundaries":
+                    return _NativeTree(children={"Tx_winding": boundary_child})
+                if name == "Excitations":
+                    return _NativeTree(children={"Tx_winding": excitation_alias})
+                raise KeyError(name)
+
+        selected = _native_winding_child(_AliasedDesign(), "Tx_winding")
+
+        self.assertIs(selected, boundary_child)
+
+    def test_none_winding_name_is_rejected_before_update(self):
+        winding = _CopiedWinding(None, _NativeTree(properties={
+            "Current": "1A", "Phase": "0deg",
+        }))
+
+        with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+            _set_copied_loss_winding_excitation(
+                winding, "Tx_winding", "2A", "1deg", "Tx"
+            )
+
+        self.assertEqual(winding.update_calls, 0)
+
+    def test_false_winding_update_fails_closed(self):
+        winding = _CopiedWinding(
+            "Tx_winding",
+            _NativeTree(properties={"Current": "1A", "Phase": "0deg"}),
+            update_result=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "returned False"):
+            _set_copied_loss_winding_excitation(
+                winding, "Tx_winding", "2A", "1deg", "Tx"
+            )
+
+    def test_native_readback_rejects_native_edit_without_effect(self):
+        raw = _NativeLossDesign("copy")
+        raw.native_winding_edit_noop = True
+        wrapper = _prepared_wrapper(raw, [])
+
+        with self.assertRaisesRegex(RuntimeError, "native value mismatch"):
+            _configure_copied_loss_excitations(
+                wrapper, raw, "copy", "1420A", "-8deg", "141.4A", "-4deg"
+            )
+
+    def test_native_readback_accepts_all_four_updated_values(self):
+        raw = _NativeLossDesign("copy")
+        wrapper = _prepared_wrapper(raw, [])
+
+        result = _configure_copied_loss_excitations(
+            wrapper, raw, "copy", "1420A", "-8deg", "141.4A", "-4deg"
+        )
+
+        self.assertEqual(
+            result,
+            (raw.windings["Tx_winding"], raw.windings["Rx_winding"]),
+        )
+        self.assertEqual(len(raw.edit_winding_calls), 2)
+        self.assertEqual(
+            raw.windings["Tx_winding"].properties["Type"], "Winding Group"
+        )
+        self.assertEqual(
+            raw.windings["Tx_winding"].properties["Winding Type"], "Current"
+        )
+        for name, arguments in raw.edit_winding_calls:
+            self.assertEqual(arguments[0], f"NAME:{name}")
+            values = dict(zip(arguments[1::2], arguments[2::2]))
+            self.assertEqual(values["Type:="], "Current")
+            self.assertIs(values["IsSolid:="], True)
+            self.assertEqual(values["Resistance:="], "0ohm")
+            self.assertEqual(values["Inductance:="], "0H")
+            self.assertEqual(values["Voltage:="], "0V")
+            self.assertEqual(values["ParallelBranchesNum:="], "1")
+
+    def test_exact_native_winding_identity_is_checked_before_edit(self):
+        raw = _NativeLossDesign("source")
+
+        with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+            _edit_native_copied_loss_winding(
+                raw, "copy", "Tx_winding", "1420A", "-8deg"
+            )
+
+        self.assertEqual(raw.edit_winding_calls, [])
+
+    def test_native_winding_type_is_distinct_from_object_kind(self):
+        raw = _NativeLossDesign("copy")
+        raw.windings["Tx_winding"].properties["Winding Type"] = "Voltage"
+
+        with self.assertRaisesRegex(RuntimeError, "non-current native winding"):
+            _edit_native_copied_loss_winding(
+                raw, "copy", "Tx_winding", "1420A", "-8deg"
+            )
+
+        self.assertEqual(raw.edit_winding_calls, [])
+
+    def test_native_core_assignment_uses_complete_exact_name_list(self):
+        raw = _NativeLossDesign("copy")
+
+        count = _assign_native_copied_core_loss(
+            raw, "copy", ["core_1", "core_2"]
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            raw.set_core_loss_calls,
+            [(["core_1", "core_2"], False)],
+        )
+        self.assertTrue(raw.core_loss["core_1"])
+        self.assertTrue(raw.core_loss["core_2"])
+
+    def test_native_core_assignment_rejects_false_readback(self):
+        raw = _NativeLossDesign("copy")
+        raw.native_core_loss_noop = True
+
+        with self.assertRaisesRegex(RuntimeError, "core loss disabled"):
+            _assign_native_copied_core_loss(raw, "copy", ["core_1"])
+
+    def test_fresh_copy_retry_deletes_only_failed_copy(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        project = _NativeLossProject(source)
+        calls = []
+
+        def prepare(_before, attempt):
+            raw = _NativeLossDesign(f"copy{attempt}")
+            project.designs.append(raw)
+            calls.append(attempt)
+            if attempt == 1:
+                raise RuntimeError("DataModel not ready")
+            return _prepared_wrapper(raw)
+
+        prepared, attempts = _retry_copied_loss_preparation(
+            project, "maxwell_matrix", prepare,
+            max_attempts=3, retry_delay_s=0, sleeper=lambda _seconds: None,
+        )
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(prepared.design_name, "copy2")
+        self.assertEqual(project.deleted, ["copy1"])
+        self.assertEqual([item.name for item in project.designs], ["maxwell_matrix", "copy2"])
+        self.assertEqual(calls, [1, 2])
+
+    def test_model_only_accepts_unsolved_source_without_dispatching_or_deleting(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=False)
+        project = _NativeLossProject(source)
+        calls = []
+
+        def prepare(_before, attempt):
+            raw = _NativeLossDesign(f"copy{attempt}", solved=False)
+            project.designs.append(raw)
+            calls.append(attempt)
+            return _prepared_wrapper(raw)
+
+        prepared, attempts = _retry_copied_loss_preparation(
+            project, "maxwell_matrix", prepare,
+            max_attempts=3, retry_delay_s=0, sleeper=lambda _seconds: None,
+            require_source_solved=False,
+        )
+
+        self.assertEqual(prepared.design_name, "copy1")
+        self.assertEqual(attempts, 1)
+        self.assertEqual(calls, [1])
+        self.assertFalse(source.solved)
+        self.assertEqual(project.deleted, [])
+
+    def test_source_winding_mutation_aborts_before_a_second_copy(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        project = _NativeLossProject(source)
+        calls = []
+
+        def prepare(_before, attempt):
+            project.designs.append(_NativeLossDesign(f"copy{attempt}"))
+            calls.append(attempt)
+            source.windings["Tx_winding"].properties["Current"] = "999A"
+            raise RuntimeError("stale wrapper mutated source")
+
+        with self.assertRaisesRegex(RuntimeError, "matrix source changed"):
+            _retry_copied_loss_preparation(
+                project, "maxwell_matrix", prepare,
+                max_attempts=3, retry_delay_s=0, sleeper=lambda _seconds: None,
+            )
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(project.deleted, ["copy1"])
+        self.assertEqual(
+            [item.name for item in project.designs], ["maxwell_matrix"]
+        )
+
+    def test_source_winding_type_mutation_aborts_before_a_second_copy(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        project = _NativeLossProject(source)
+        calls = []
+
+        def prepare(_before, attempt):
+            project.designs.append(_NativeLossDesign(f"copy{attempt}"))
+            calls.append(attempt)
+            source.windings["Tx_winding"].properties["Winding Type"] = "Voltage"
+            raise RuntimeError("source physical winding mode changed")
+
+        with self.assertRaisesRegex(RuntimeError, "matrix source changed"):
+            _retry_copied_loss_preparation(
+                project, "maxwell_matrix", prepare,
+                max_attempts=3, retry_delay_s=0, sleeper=lambda _seconds: None,
+            )
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(project.deleted, ["copy1"])
+        self.assertEqual(
+            [item.name for item in project.designs], ["maxwell_matrix"]
+        )
+
+    def test_deterministic_prepare_error_is_bounded_and_cleans_every_copy(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        project = _NativeLossProject(source)
+
+        def prepare(_before, attempt):
+            project.designs.append(_NativeLossDesign(f"copy{attempt}"))
+            raise RuntimeError("deterministic")
+
+        with self.assertRaisesRegex(RuntimeError, "failed after 3 fresh copies"):
+            _retry_copied_loss_preparation(
+                project, "maxwell_matrix", prepare,
+                max_attempts=3, retry_delay_s=0, sleeper=lambda _seconds: None,
+            )
+
+        self.assertEqual(project.deleted, ["copy1", "copy2", "copy3"])
+        self.assertEqual([item.name for item in project.designs], ["maxwell_matrix"])
+
+    def test_cleanup_rejects_delayed_second_copy_outside_baseline(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        project = _NativeLossProject(source)
+        original_delete = project.DeleteDesign
+
+        def delete_with_delayed_copy(name):
+            original_delete(name)
+            project.designs.append(_NativeLossDesign("late_copy"))
+
+        project.DeleteDesign = delete_with_delayed_copy
+
+        def prepare(_before, _attempt):
+            project.designs.append(_NativeLossDesign("copy1"))
+            raise RuntimeError("DataModel not ready")
+
+        with self.assertRaisesRegex(RuntimeError, "exact baseline"):
+            _retry_copied_loss_preparation(
+                project, "maxwell_matrix", prepare,
+                max_attempts=3, retry_delay_s=0, sleeper=lambda _seconds: None,
+            )
+
+        self.assertEqual(project.deleted, ["copy1"])
+        self.assertEqual(
+            [item.name for item in project.designs],
+            ["maxwell_matrix", "late_copy"],
+        )
+
+    def test_core_loss_false_readback_fails_closed(self):
+        raw = _NativeLossDesign("copy")
+        raw.core_loss["core_1"] = False
+
+        with self.assertRaisesRegex(RuntimeError, "core loss disabled"):
+            _assert_native_core_loss_assignment(raw, ["core_1"])
+
+    def test_core_loss_readback_exception_fails_closed(self):
+        def fail_readback(_object_name):
+            raise RuntimeError("grpc unavailable")
+
+        raw = SimpleNamespace(
+            GetModule=lambda _name: SimpleNamespace(
+                GetCoreLossEffect=fail_readback
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "readback failed"):
+            _assert_native_core_loss_assignment(raw, ["core_1"])
+
+
+class CopiedLossSavedSnapshotTests(unittest.TestCase):
+    @staticmethod
+    def _snapshot(copied_solved=False):
+        winding = lambda current, phase: {
+            "Type": "Current", "IsSolid": True,
+            "Current": current, "Phase": phase,
+        }
+        return {
+            "AnsoftProject": {
+                "Maxwell3DModel": [
+                    {
+                        "Name": "maxwell_matrix",
+                        "MaxwellParameterSetup": {
+                            "MaxwellParameters": {"Matrix": {"ID": 0}}
+                        },
+                    },
+                    {
+                        "Name": "copy",
+                        "MaxwellParameterSetup": {"MaxwellParameters": {}},
+                        "BoundarySetup": {
+                            "Boundaries": {
+                                "Tx_winding": winding("1420A", "-8deg"),
+                                "Rx_winding": winding("141.4A", "-4deg"),
+                            },
+                            "GlobalBoundData": {"CoreLossObjectIDs": [10, 11]},
+                        },
+                        "AnalysisSetup": {"SolveSetups": {"Setup1": {
+                            "SetupType": "AC Magnetic", "Enabled": True,
+                            "MaximumPasses": 10,
+                            "MinimumConvergedPasses": 2,
+                            "PercentError": 1.5,
+                            "Frequency": "1000Hz",
+                        }}},
+                    },
+                ],
+            },
+            "ProjectPreview": {"DesignInfo": [
+                {"DesignName": "maxwell_matrix", "IsSolved": True},
+                {"DesignName": "copy", "IsSolved": copied_solved},
+            ]},
+        }
+
+    def _validate(self, snapshot, require_source_solved=True):
+        with tempfile.NamedTemporaryFile(suffix=".aedt") as stream:
+            with patch(
+                    "ansys.aedt.core.internal.load_aedt_file.load_entire_aedt_file",
+                    return_value=snapshot):
+                return _validate_saved_copied_loss_preparation(
+                    stream.name, "maxwell_matrix", "copy",
+                    "1420A", "-8deg", "141.4A", "-4deg", 2,
+                    10, 2, 1.5, 1000,
+                    require_source_solved=require_source_solved,
+                )
+
+    def test_accepts_authoritative_unsolved_ready_copy(self):
+        evidence = self._validate(self._snapshot())
+
+        self.assertTrue(evidence["source_solved"])
+        self.assertFalse(evidence["copied_solved"])
+        self.assertEqual(evidence["core_loss_ids"], 2)
+
+    def test_rejects_copy_that_still_owns_inherited_solution(self):
+        with self.assertRaisesRegex(RuntimeError, "still owns inherited solution"):
+            self._validate(self._snapshot(copied_solved=True))
+
+    def test_model_only_accepts_unsolved_source_and_unsolved_copy(self):
+        snapshot = self._snapshot()
+        snapshot["ProjectPreview"]["DesignInfo"][0]["IsSolved"] = False
+
+        evidence = self._validate(snapshot, require_source_solved=False)
+
+        self.assertFalse(evidence["source_solved"])
+        self.assertFalse(evidence["copied_solved"])
+
+    def test_rejects_saved_stranded_winding(self):
+        snapshot = self._snapshot()
+        snapshot["AnsoftProject"]["Maxwell3DModel"][1][
+            "BoundarySetup"
+        ]["Boundaries"]["Tx_winding"]["IsSolid"] = False
+
+        with self.assertRaisesRegex(RuntimeError, "Tx_winding is not solid"):
+            self._validate(snapshot)
+
+    def test_rejects_saved_core_loss_count_mismatch(self):
+        snapshot = self._snapshot()
+        snapshot["AnsoftProject"]["Maxwell3DModel"][1][
+            "BoundarySetup"
+        ]["GlobalBoundData"]["CoreLossObjectIDs"] = [10]
+
+        with self.assertRaisesRegex(RuntimeError, "core-loss ID count mismatch"):
+            self._validate(snapshot)
+
+    def test_rejects_saved_source_without_matrix_parameter(self):
+        snapshot = self._snapshot()
+        del snapshot["AnsoftProject"]["Maxwell3DModel"][0][
+            "MaxwellParameterSetup"
+        ]["MaxwellParameters"]["Matrix"]
+
+        with self.assertRaisesRegex(RuntimeError, "source lost its Matrix"):
+            self._validate(snapshot)
+
+    def test_rejects_saved_setup_mismatch(self):
+        snapshot = self._snapshot()
+        snapshot["AnsoftProject"]["Maxwell3DModel"][1][
+            "AnalysisSetup"
+        ]["SolveSetups"]["Setup1"]["MaximumPasses"] = 11
+
+        with self.assertRaisesRegex(RuntimeError, "MaximumPasses mismatch"):
+            self._validate(snapshot)
 
 
 class _FakeClock:
