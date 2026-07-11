@@ -5,7 +5,8 @@ set -u
 
 usage() {
   echo "Usage: bash relaunch.sh [target] [buffer] [solver_40sha] [library_40sha]" >&2
-  echo "       target=0 defaults buffer=0; both revisions remain required for training." >&2
+  echo "       defaults: target=50, buffer=0; target+buffer must not exceed 50." >&2
+  echo "       Both revisions remain required for training." >&2
 }
 
 if [ "$#" -gt 4 ]; then
@@ -13,8 +14,8 @@ if [ "$#" -gt 4 ]; then
   exit 2
 fi
 
-TARGET_RAW="${1:-130}"
-BUFFER_RAW="${2:-}"
+TARGET_RAW="${1:-50}"
+BUFFER_RAW="${2:-0}"
 if ! [[ "$TARGET_RAW" =~ ^[0-9]+$ ]]; then
   echo "target must be a non-negative integer: $TARGET_RAW" >&2
   usage
@@ -22,15 +23,16 @@ if ! [[ "$TARGET_RAW" =~ ^[0-9]+$ ]]; then
 fi
 TARGET=$((10#$TARGET_RAW))
 if [ -z "$BUFFER_RAW" ]; then
-  if [ "$TARGET" -eq 0 ]; then
-    BUFFER=0
-  else
-    BUFFER=40
-  fi
+  BUFFER=0
 elif [[ "$BUFFER_RAW" =~ ^[0-9]+$ ]]; then
   BUFFER=$((10#$BUFFER_RAW))
 else
   echo "buffer must be a non-negative integer: $BUFFER_RAW" >&2
+  usage
+  exit 2
+fi
+if [ $((TARGET + BUFFER)) -gt 50 ]; then
+  echo "target+buffer must not exceed 50: $TARGET+$BUFFER" >&2
   usage
   exit 2
 fi
@@ -46,7 +48,7 @@ if [ ! -x "$PY" ]; then
   echo "Python runtime is unavailable: $PY" >&2
   exit 1
 fi
-for required_command in curl cygpath powershell.exe nohup sed tr; do
+for required_command in curl cygpath powershell.exe nohup sed sleep tail tr; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
     echo "Required command is unavailable: $required_command" >&2
     exit 1
@@ -125,11 +127,34 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass \
 echo "=== 3. Feeder (target $TARGET, buffer $BUFFER, count 1/task)"
 # feeder_state.json is intentionally retained. Resetting it forgets in-flight
 # submissions and can duplicate task names or overfill the scheduler.
+READY_FILE="$PWD/feeder_relaunch.ready"
+: > "$READY_FILE"
 nohup "$PY" feeder.py --loop 600 --max-samples 12000 \
   --target "$TARGET" --buffer "$BUFFER" \
   --solver-revision "$SOLVER_REVISION" --library-revision "$LIBRARY_REVISION" \
+  --ready-file "$READY_FILE" \
   > feeder_relaunch.log 2>&1 &
-echo "feeder pid $!"
+FEEDER_PID=$!
+echo "feeder pid $FEEDER_PID"
+FEEDER_READY=0
+for ((attempt = 0; attempt < 90; attempt++)); do
+  if [ -s "$READY_FILE" ] && kill -0 "$FEEDER_PID" 2>/dev/null; then
+    FEEDER_READY=1
+    break
+  fi
+  if ! kill -0 "$FEEDER_PID" 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+if [ "$FEEDER_READY" -ne 1 ]; then
+  echo "Feeder did not complete its first guarded cycle; relaunch aborted. Log tail:" >&2
+  tail -n 50 feeder_relaunch.log >&2
+  powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    -File "$(cygpath -w "$PWD/manage_campaign_loops.ps1")" >/dev/null 2>&1 || true
+  exit 1
+fi
+echo "feeder ready"
 
 echo "=== 4. Periodic collector loop"
 MFT_SOLVER_REVISION="$SOLVER_REVISION" \

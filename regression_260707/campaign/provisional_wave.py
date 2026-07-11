@@ -1,8 +1,8 @@
-"""Plan, submit, or cancel one isolated 300-task provisional generation.
+"""Plan or cancel one isolated 300-task provisional generation.
 
-This entry point intentionally does not touch feeder_state.json.  Submission is
-idempotent through the scheduler dedupe key and an atomic, generation-specific
-ledger.  Cancellation always uses explicit task IDs from that ledger.
+Direct submission from this legacy entry point is intentionally disabled.  Use
+rapid_campaign.py --execute so the p02/p08 gates and staged capacity controls
+remain in force.  Cancellation always uses explicit task IDs from the ledger.
 """
 import argparse
 import hashlib
@@ -36,6 +36,10 @@ ACTIVE_STATUSES = ("queued", "attaching", "running")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 PROFILE_PATH = REGRESSION_ROOT / "verify" / "profiles" / "standard.json"
 STATE_DIR_ENV = "MFT_PROVISIONAL_STATE_DIR"
+DIRECT_SUBMISSION_DISABLED = (
+    "direct provisional 300-task submission is disabled; "
+    "use rapid_campaign.py --execute"
+)
 
 
 def _now():
@@ -230,46 +234,7 @@ def _validate_local_revisions(solver_revision, library_revision, library_root=No
 def submit_generation(
         solver_revision, library_revision, profile, path, library_root=None,
         seed=SEED, count=TASK_COUNT):
-    _validate_local_revisions(solver_revision, library_revision, library_root)
-    health = _scheduler_json("/api/health")
-    if isinstance(health, dict) and health.get("status") not in (None, "ok", "healthy"):
-        raise RuntimeError(f"scheduler health check failed: {health}")
-
-    plan = build_plan(solver_revision, library_revision, profile, seed, count)
-    expected = new_manifest(solver_revision, library_revision, profile, plan, seed)
-    ledger = _load_or_initialize_ledger(expected, path)
-    existing = _validate_inventory(_task_inventory(expected["task_prefix"]), plan)
-
-    for planned, record in zip(plan, ledger["tasks"]):
-        known_id = existing.get(planned["name"])
-        if record.get("task_id") is not None and known_id not in (None, record["task_id"]):
-            raise RuntimeError(
-                f"ledger/scheduler task ID mismatch for {planned['name']}")
-        task_id = scheduler_client.submit_verification(
-            name=planned["name"],
-            workdir=f"mft_prov_{solver_revision[:7]}_{planned['index']:03d}",
-            params=planned["params"],
-            profile=profile,
-            mem_mb=MEMORY_MB,
-            cpus=CPUS,
-            solver_revision=solver_revision,
-            library_revision=library_revision,
-        )
-        if task_id is None:
-            raise RuntimeError(f"scheduler did not return a task ID for {planned['name']}")
-        task = _scheduler_json(f"/api/tasks/{int(task_id)}")
-        _validate_scheduler_task(task, planned)
-        record["task_id"] = int(task_id)
-        ledger["updated_at"] = _now()
-        pinned_pilot._atomic_manifest(ledger, path)
-
-    validate_manifest(ledger, expected, require_all_task_ids=True)
-    final_inventory = _validate_inventory(
-        _task_inventory(expected["task_prefix"]), plan)
-    if len(final_inventory) != count:
-        raise RuntimeError(
-            f"scheduler exposes {len(final_inventory)} provisional tasks, expected {count}")
-    return ledger
+    raise RuntimeError(DIRECT_SUBMISSION_DISABLED)
 
 
 def cancel_generation(manifest, expected, batch_size=100):
@@ -330,7 +295,7 @@ def main(argv=None):
     mode.add_argument("--cancel", action="store_true")
     parser.add_argument(
         "--acknowledge-provisional", action="store_true",
-        help="required for mutation; confirms this generation bypasses p02/p08")
+        help="required for cancellation; direct execution is disabled")
     args = parser.parse_args(argv)
 
     try:
@@ -338,8 +303,10 @@ def main(argv=None):
         library_revision = _validate_sha(args.library_revision, "library revision")
     except ValueError as exc:
         parser.error(str(exc))
-    if (args.execute or args.cancel) and not args.acknowledge_provisional:
-        parser.error("--acknowledge-provisional is required for execute or cancel")
+    if args.execute:
+        parser.error(DIRECT_SUBMISSION_DISABLED)
+    if args.cancel and not args.acknowledge_provisional:
+        parser.error("--acknowledge-provisional is required for cancel")
 
     profile = _load_profile()
     records = build_plan(
@@ -348,17 +315,6 @@ def main(argv=None):
         solver_revision, library_revision, profile, records, args.seed)
     path = manifest_path(
         solver_revision, library_revision, args.seed, args.manifest_dir)
-
-    if args.execute:
-        manifest = submit_generation(
-            solver_revision, library_revision, profile, path,
-            library_root=args.library_root, seed=args.seed, count=TASK_COUNT)
-        print(json.dumps({
-            "mode": "execute", "manifest": str(path),
-            "task_count": len(manifest["tasks"]),
-            "task_ids": [record["task_id"] for record in manifest["tasks"]],
-        }, ensure_ascii=False))
-        return
 
     if args.cancel:
         if not path.is_file():

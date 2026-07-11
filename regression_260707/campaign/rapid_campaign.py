@@ -582,6 +582,26 @@ def run_once(
         solver_revision, library_revision, seed=DEFAULT_SEED,
         max_samples=DEFAULT_MAX_SAMPLES, execute=False, clear_pause=False,
         library_root=None, state_path=None, manifest_dir=None, now=None):
+    if execute:
+        with pinned_pilot.campaign_mutation_lock():
+            return _run_once_locked(
+                solver_revision, library_revision, seed=seed,
+                max_samples=max_samples, execute=execute,
+                clear_pause=clear_pause, library_root=library_root,
+                state_path=state_path, manifest_dir=manifest_dir, now=now,
+            )
+    return _run_once_locked(
+        solver_revision, library_revision, seed=seed,
+        max_samples=max_samples, execute=execute,
+        clear_pause=clear_pause, library_root=library_root,
+        state_path=state_path, manifest_dir=manifest_dir, now=now,
+    )
+
+
+def _run_once_locked(
+        solver_revision, library_revision, seed=DEFAULT_SEED,
+        max_samples=DEFAULT_MAX_SAMPLES, execute=False, clear_pause=False,
+        library_root=None, state_path=None, manifest_dir=None, now=None):
     """Observe once and optionally perform exactly one safe promotion/refill step."""
     now = now or _now()
     solver_revision, library_revision = _validate_pinned_local_revisions(
@@ -660,8 +680,19 @@ def run_once(
                         record["task_id"] for record in result["manifest"]["tasks"]],
                 }
             elif decision["target_active"] >= 50:
-                feeder.step(
+                authorization = feeder._authorize_rapid_refill(
+                    decision,
+                    max_samples=max_samples,
+                    solver_revision=solver_revision,
+                    library_revision=library_revision,
+                    candidate_seed=seed,
+                    local_passed=local_passed,
+                    pilots_complete=bool(
+                        pilots["p02"]["exists"] and pilots["p08"]["exists"]),
+                )
+                feeder._step_from_rapid_controller(
                     max_samples,
+                    authorization=authorization,
                     target=decision["target_active"],
                     buffer=0,
                     solver_revision=solver_revision,

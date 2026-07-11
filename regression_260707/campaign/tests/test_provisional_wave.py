@@ -1,4 +1,4 @@
-import json
+import io
 import sys
 import tempfile
 import unittest
@@ -75,16 +75,27 @@ class ProvisionalWaveTests(unittest.TestCase):
         get.assert_not_called()
         post.assert_not_called()
 
-    def test_execute_requires_explicit_provisional_acknowledgement(self):
-        with mock.patch.object(
-                provisional_wave.scheduler_client, "submit_verification") as submit:
-            with self.assertRaises(SystemExit):
+    def test_execute_is_disabled_and_directs_operator_to_rapid_campaign(self):
+        with mock.patch.object(provisional_wave, "build_plan") as build_plan, \
+                mock.patch.object(
+                    provisional_wave.scheduler_client,
+                    "submit_verification") as submit, \
+                mock.patch.object(provisional_wave.requests, "get") as get, \
+                mock.patch.object(provisional_wave.requests, "post") as post, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as raised:
                 provisional_wave.main([
                     "--solver-revision", SOLVER,
                     "--library-revision", LIBRARY,
                     "--execute",
+                    "--acknowledge-provisional",
                 ])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("rapid_campaign.py --execute", stderr.getvalue())
+        build_plan.assert_not_called()
         submit.assert_not_called()
+        get.assert_not_called()
+        post.assert_not_called()
 
     @unittest.skipUnless(sys.platform == "win32", "Windows state path contract")
     def test_windows_default_manifest_uses_local_app_data(self):
@@ -107,48 +118,27 @@ class ProvisionalWaveTests(unittest.TestCase):
 
         self.assertEqual(path.parent, Path(td).resolve())
 
-    def test_resume_uses_dedupe_and_persists_each_exact_task_id(self):
-        records = self.build_plan()
-        expected = provisional_wave.new_manifest(
-            SOLVER, LIBRARY, PROFILE, records)
-        inventory = []
-        submitted_ids = [101, 102, 103]
-
-        def task_detail(path, params=None):
-            if path == "/api/health":
-                return {"status": "ok"}
-            if path == "/api/tasks":
-                return list(inventory)
-            task_id = int(path.rsplit("/", 1)[-1])
-            record = records[submitted_ids.index(task_id)]
-            task = {
-                "id": task_id,
-                "name": record["name"],
-                "dedupe_key": record["dedupe_key"],
-                "remote_cwd": provisional_wave.scheduler_client.GPFS_RUNS_REMOTE_CWD,
-                "status": "queued",
-            }
-            if not any(existing["id"] == task_id for existing in inventory):
-                inventory.append(task)
-            return task
-
+    def test_submit_generation_helper_is_disabled_before_any_scheduler_call(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
-                provisional_wave, "build_plan", return_value=records), mock.patch.object(
-                    provisional_wave, "_validate_local_revisions"), mock.patch.object(
-                    provisional_wave, "_scheduler_json", side_effect=task_detail), \
+                provisional_wave, "_validate_local_revisions") as validate, \
+                mock.patch.object(provisional_wave, "build_plan") as build_plan, \
+                mock.patch.object(provisional_wave.requests, "get") as get, \
+                mock.patch.object(provisional_wave.requests, "post") as post, \
                 mock.patch.object(
-                    provisional_wave.scheduler_client, "submit_verification",
-                    side_effect=submitted_ids) as submit:
+                    provisional_wave.scheduler_client,
+                    "submit_verification") as submit:
             path = Path(td) / "ledger.json"
-            ledger = provisional_wave.submit_generation(
-                SOLVER, LIBRARY, PROFILE, path, count=3)
-            persisted = json.loads(path.read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(
+                    RuntimeError, r"rapid_campaign\.py --execute"):
+                provisional_wave.submit_generation(
+                    SOLVER, LIBRARY, PROFILE, path, count=3)
 
-        self.assertEqual(submit.call_count, 3)
-        self.assertEqual([record["task_id"] for record in ledger["tasks"]], submitted_ids)
-        self.assertEqual([record["task_id"] for record in persisted["tasks"]], submitted_ids)
-        provisional_wave.validate_manifest(
-            persisted, expected, require_all_task_ids=True)
+            self.assertFalse(path.exists())
+        validate.assert_not_called()
+        build_plan.assert_not_called()
+        get.assert_not_called()
+        post.assert_not_called()
+        submit.assert_not_called()
 
     def test_inventory_rejects_same_prefix_with_wrong_dedupe(self):
         records = self.build_plan(1)

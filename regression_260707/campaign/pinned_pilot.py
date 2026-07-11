@@ -37,6 +37,8 @@ CPUS = 4
 MEMORY_MB = 32768
 CPU_HEADROOM = 0.85
 ACTIVE_STATUSES = ("queued", "attaching", "running")
+QUEUE_STATES = frozenset(("ready", "pending", "opening", "blocked"))
+LEGACY_MFT_NAME_PREFIX = "mft-"
 PILOT_STAGE_CONTRACT = {
     "p02": {"tasks": 2, "offset": 0},
     "p08": {"tasks": 8, "offset": 2},
@@ -44,6 +46,23 @@ PILOT_STAGE_CONTRACT = {
 LOCAL_GATE_COUNT = 3
 PILOT_RESERVED_VALID_CANDIDATES = sum(
     contract["tasks"] for contract in PILOT_STAGE_CONTRACT.values())
+MFT_PROJECT = scheduler_client.MFT_PROJECT
+MFT_PROJECT_MAX_ACTIVE_TASKS = scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS
+PILOT_PROJECT_HARD_CAP = PILOT_RESERVED_VALID_CANDIDATES
+_LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "").strip()
+if not _LOCALAPPDATA:
+    _LOCALAPPDATA = str(Path.home() / "AppData" / "Local")
+CAMPAIGN_MUTATION_LOCK_PATH = (
+    Path(_LOCALAPPDATA) / "MFT_1MW_2026" / "campaign-mutation.lock")
+CAMPAIGN_MUTATION_LOCK_TIMEOUT = 15 * 60
+
+
+def campaign_mutation_lock():
+    """Return the one host-wide lock shared by every campaign submit path."""
+    return scheduler_client.campaign_mutation_lock(
+        path=CAMPAIGN_MUTATION_LOCK_PATH,
+        timeout=CAMPAIGN_MUTATION_LOCK_TIMEOUT,
+    )
 
 
 def _get_json(path, params=None):
@@ -52,8 +71,134 @@ def _get_json(path, params=None):
     return response.json()
 
 
-def calculate_submission_headroom(statuses, allocations, ready_fit_slots):
-    """Return the conservative number of additional 4-core FEA tasks."""
+def queue_allows_demand_submission(queue_state):
+    """Allow demand to enter the scheduler unless its fit contract is blocked."""
+    normalized = str(queue_state or "").strip().lower()
+    if normalized not in QUEUE_STATES:
+        raise RuntimeError(f"scheduler returned invalid queue_state: {queue_state!r}")
+    return normalized != "blocked"
+
+
+def project_submission_snapshot(
+        projects, project_tasks, required_hard_cap, legacy_tasks=None):
+    """Return the absolute project+legacy MFT demand budget without double count."""
+    if isinstance(required_hard_cap, bool):
+        raise RuntimeError("MFT project hard cap must be a positive integer")
+    try:
+        required_hard_cap = int(required_hard_cap)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("MFT project hard cap must be a positive integer") from exc
+    if required_hard_cap < 1:
+        raise RuntimeError("MFT project hard cap must be a positive integer")
+    if required_hard_cap > MFT_PROJECT_MAX_ACTIVE_TASKS:
+        raise RuntimeError(
+            f"MFT project stage cap {required_hard_cap} exceeds absolute cap "
+            f"{MFT_PROJECT_MAX_ACTIVE_TASKS}")
+    if not isinstance(projects, list):
+        raise RuntimeError("scheduler returned an invalid project inventory")
+    matches = [
+        project for project in projects
+        if isinstance(project, dict)
+        and str(project.get("name") or "").strip() == MFT_PROJECT
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"scheduler project {MFT_PROJECT!r} is missing or ambiguous")
+    try:
+        project_contract = scheduler_client.validate_project_mutation_contract(
+            matches[0])
+    except scheduler_client.ProjectContractError as exc:
+        raise RuntimeError(str(exc)) from exc
+    server_cap = project_contract["max_active_tasks"]
+    if not isinstance(project_tasks, list):
+        raise RuntimeError("scheduler returned an invalid MFT project task inventory")
+    if legacy_tasks is None:
+        legacy_tasks = []
+    if not isinstance(legacy_tasks, list):
+        raise RuntimeError("scheduler returned an invalid legacy MFT task inventory")
+
+    def indexed(rows, source, allowed_projects, require_prefix=False):
+        inventory = {}
+        for task in rows:
+            if not isinstance(task, dict):
+                raise RuntimeError(
+                    f"scheduler returned an invalid {source} task")
+            task_id = task.get("id", task.get("task_id"))
+            if (isinstance(task_id, bool) or not isinstance(task_id, int)
+                    or task_id <= 0):
+                raise RuntimeError(
+                    f"scheduler returned an invalid {source} task ID")
+            if task_id in inventory:
+                raise RuntimeError(
+                    f"scheduler returned duplicate {source} task ID {task_id}")
+            project_name = str(task.get("project") or "").strip()
+            if project_name not in allowed_projects:
+                raise RuntimeError(
+                    f"scheduler returned {source} task {task_id} from "
+                    f"unexpected project {project_name!r}")
+            status = str(task.get("status") or "").strip().lower()
+            if status not in ACTIVE_STATUSES:
+                raise RuntimeError(
+                    f"scheduler returned unexpected {source} active task status: "
+                    f"{status!r}")
+            if (require_prefix
+                    and not str(task.get("name") or "").startswith(
+                        LEGACY_MFT_NAME_PREFIX)):
+                raise RuntimeError(
+                    f"scheduler legacy MFT filter returned task {task_id} "
+                    "outside the mft- namespace")
+            inventory[task_id] = dict(task)
+        return inventory
+
+    tagged = indexed(
+        project_tasks, "MFT project", {MFT_PROJECT})
+    legacy_scan = indexed(
+        legacy_tasks, "legacy MFT", {"", MFT_PROJECT}, require_prefix=True)
+    combined = dict(tagged)
+    for task_id, task in legacy_scan.items():
+        if task_id in combined:
+            if str(task.get("project") or "").strip() != MFT_PROJECT:
+                raise RuntimeError(
+                    f"scheduler task {task_id} is both project-tagged and legacy")
+            continue
+        combined[task_id] = task
+
+    counts = {status: 0 for status in ACTIVE_STATUSES}
+    tagged_counts = {status: 0 for status in ACTIVE_STATUSES}
+    legacy_counts = {status: 0 for status in ACTIVE_STATUSES}
+    for task in combined.values():
+        if not isinstance(task, dict):
+            raise RuntimeError("scheduler returned an invalid MFT project task")
+        status = str(task.get("status") or "").strip().lower()
+        counts[status] += 1
+        bucket = (
+            tagged_counts
+            if str(task.get("project") or "").strip() == MFT_PROJECT
+            else legacy_counts
+        )
+        bucket[status] += 1
+    active = sum(counts.values())
+    server_open_slots = max(0, server_cap - active)
+    stage_open_slots = max(0, required_hard_cap - active)
+    return {
+        "project": MFT_PROJECT,
+        "project_max_active_tasks": server_cap,
+        "project_required_hard_cap": required_hard_cap,
+        "project_counts": counts,
+        "project_tagged_counts": tagged_counts,
+        "legacy_counts": legacy_counts,
+        "project_active": active,
+        "project_tagged_active": sum(tagged_counts.values()),
+        "legacy_active": sum(legacy_counts.values()),
+        "project_server_open_slots": server_open_slots,
+        "project_stage_open_slots": stage_open_slots,
+        "project_submission_slots": min(server_open_slots, stage_open_slots),
+    }
+
+
+def calculate_submission_headroom(
+        statuses, allocations, ready_fit_slots, queue_state="ready", queue_reason=""):
+    """Return immediate-capacity telemetry plus the queued-demand admission gate."""
     global_active = sum(int(statuses.get(status, 0) or 0) for status in ACTIVE_STATUSES)
     usable = [
         allocation for allocation in allocations
@@ -69,6 +214,7 @@ def calculate_submission_headroom(statuses, allocations, ready_fit_slots):
         total_slots - global_active,
         max(0, int(ready_fit_slots or 0)),
     ))
+    queue_submission_allowed = queue_allows_demand_submission(queue_state)
     return {
         "global_active": global_active,
         "total_cpus": total_cpus,
@@ -77,12 +223,27 @@ def calculate_submission_headroom(statuses, allocations, ready_fit_slots):
         "free_slots": free_slots,
         "ready_fit_slots": int(ready_fit_slots or 0),
         "headroom": headroom,
+        "queue_state": str(queue_state or "").strip().lower(),
+        "queue_reason": str(queue_reason or "").strip(),
+        "queue_submission_allowed": queue_submission_allowed,
+        "submission_allowed": queue_submission_allowed,
     }
 
 
-def capacity_snapshot():
+def capacity_snapshot(required_hard_cap=PILOT_PROJECT_HARD_CAP):
     summary = _get_json("/api/tasks/summary")
     allocations = _get_json("/api/allocations")
+    projects = _get_json("/api/projects")
+    project_tasks = _get_json("/api/tasks", params={
+        "limit": 10000,
+        "project": MFT_PROJECT,
+        "status": ",".join(ACTIVE_STATUSES),
+    })
+    legacy_tasks = _get_json("/api/tasks", params={
+        "limit": 10000,
+        "name_prefix": LEGACY_MFT_NAME_PREFIX,
+        "status": ",".join(ACTIVE_STATUSES),
+    })
     capacity = _get_json("/api/task-capacity", params={
         "cpus": CPUS,
         "memory_mb": MEMORY_MB,
@@ -93,8 +254,18 @@ def capacity_snapshot():
     if not isinstance(summary, dict) or not isinstance(allocations, list) \
             or not isinstance(capacity, dict):
         raise RuntimeError("scheduler returned an invalid capacity snapshot")
-    return calculate_submission_headroom(
-        summary.get("statuses") or {}, allocations, capacity.get("ready_fit_slots"))
+    snapshot = calculate_submission_headroom(
+        summary.get("statuses") or {}, allocations, capacity.get("ready_fit_slots"),
+        queue_state=capacity.get("queue_state"),
+        queue_reason=capacity.get("queue_reason"),
+    )
+    snapshot.update(project_submission_snapshot(
+        projects, project_tasks, required_hard_cap, legacy_tasks=legacy_tasks))
+    snapshot["submission_allowed"] = bool(
+        snapshot["queue_submission_allowed"]
+        and snapshot["project_submission_slots"] > 0
+    )
+    return snapshot
 
 
 def deterministic_candidate_at(index, seed=260710):
@@ -492,12 +663,31 @@ def _atomic_manifest(payload, path):
 def submit_pilot_stage(
         solver_revision, library_revision, stage, seed=260710,
         execute=False, offset=None, manifest_dir=None, library_root=None):
+    if execute and not scheduler_client.campaign_mutation_lock_is_held():
+        with campaign_mutation_lock():
+            return _submit_pilot_stage_locked(
+                solver_revision, library_revision, stage, seed=seed,
+                execute=execute, offset=offset, manifest_dir=manifest_dir,
+                library_root=library_root,
+            )
+    return _submit_pilot_stage_locked(
+        solver_revision, library_revision, stage, seed=seed,
+        execute=execute, offset=offset, manifest_dir=manifest_dir,
+        library_root=library_root,
+    )
+
+
+def _submit_pilot_stage_locked(
+        solver_revision, library_revision, stage, seed=260710,
+        execute=False, offset=None, manifest_dir=None, library_root=None):
     """Plan or submit one contract-defined pilot stage.
 
     All mutation remains behind ``execute=True``.  The function is intentionally
     reusable by the rapid controller so it cannot drift from the standalone
     pilot CLI's revision, capacity, candidate, and predecessor gates.
     """
+    if execute and not scheduler_client.campaign_mutation_lock_is_held():
+        raise RuntimeError("pilot mutation requires the campaign mutation lock")
     contract = PILOT_STAGE_CONTRACT.get(stage)
     if contract is None:
         raise ValueError(f"unknown pilot stage: {stage}")
@@ -537,15 +727,41 @@ def submit_pilot_stage(
     profile_path = REGRESSION_ROOT / "verify" / "profiles" / "standard.json"
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     candidates = deterministic_candidates(tasks, offset=offset, seed=seed)
-    snapshot = capacity_snapshot()
-    if snapshot["headroom"] < tasks:
-        raise RuntimeError(
-            f"pilot needs {tasks} slots but conservative headroom is "
-            f"{snapshot['headroom']}: {snapshot}"
-        )
-
     tag = pilot_tag(
         solver_revision, library_revision, stage, seed, offset)
+    plans = []
+    for index, params in enumerate(candidates):
+        digest = candidate_digest(effective_candidate(params))
+        name = f"mft-pilot-{tag}-{index:02d}"
+        dedupe_key = scheduler_client.verification_dedupe_key(
+            name, params, profile, solver_revision, library_revision)
+        existing_id = (
+            scheduler_client.reconcile_task_id(name, dedupe_key)
+            if execute else None
+        )
+        record = {
+            "index": index,
+            "name": name,
+            "params_sha256": digest,
+            "task_id": existing_id,
+            "recovered": bool(existing_id is not None),
+        }
+        plans.append((record, params))
+    missing_count = sum(
+        record["task_id"] is None for record, _params in plans)
+    snapshot = capacity_snapshot(required_hard_cap=PILOT_PROJECT_HARD_CAP)
+    if missing_count and not snapshot["queue_submission_allowed"]:
+        raise RuntimeError(
+            "pilot submission is blocked by scheduler capacity: "
+            f"{snapshot.get('queue_reason') or snapshot.get('queue_state')}: {snapshot}"
+        )
+    if snapshot["project_submission_slots"] < missing_count:
+        raise RuntimeError(
+            f"pilot needs {missing_count} missing MFT project slots but only "
+            f"{snapshot['project_submission_slots']} remain under stage cap "
+            f"{PILOT_PROJECT_HARD_CAP}: {snapshot}"
+        )
+
     manifest = {
         "tag": tag,
         "stage": stage,
@@ -556,20 +772,23 @@ def submit_pilot_stage(
         "task_count": tasks,
         "profile": profile,
         "capacity": snapshot,
+        "missing_task_count": missing_count,
         "executed": bool(execute),
         "predecessor": predecessor,
-        "tasks": [],
+        "tasks": [record for record, _params in plans],
     }
-    for index, params in enumerate(candidates):
-        digest = candidate_digest(effective_candidate(params))
-        name = f"mft-pilot-{tag}-{index:02d}"
-        record = {
-            "index": index,
-            "name": name,
-            "params_sha256": digest,
-            "task_id": None,
-        }
-        if execute:
+    suffix = ".json" if execute else ".preview.json"
+    root = Path(manifest_dir) if manifest_dir is not None else campaign_manifest_dir()
+    manifest_path = root / f"{tag}{suffix}"
+    partial_path = root / f"{tag}.partial.json"
+    if execute:
+        # Keep crash recovery separate from the canonical completion gate.
+        # rapid_campaign must never interpret a ledger containing None IDs as
+        # a submitted pilot manifest.
+        _atomic_manifest(manifest, partial_path)
+    for record, params in plans:
+        if execute and record["task_id"] is None:
+            name = record["name"]
             record["task_id"] = scheduler_client.submit_verification(
                 name=name,
                 workdir=name.replace("-", "_"),
@@ -582,12 +801,12 @@ def submit_pilot_stage(
             )
             if record["task_id"] is None:
                 raise RuntimeError(f"scheduler did not return a task ID for {name}")
-        manifest["tasks"].append(record)
-
-    suffix = ".json" if execute else ".preview.json"
-    root = Path(manifest_dir) if manifest_dir is not None else campaign_manifest_dir()
-    manifest_path = root / f"{tag}{suffix}"
-    _atomic_manifest(manifest, manifest_path)
+            _atomic_manifest(manifest, partial_path)
+    if execute:
+        _atomic_manifest(manifest, manifest_path)
+        partial_path.unlink(missing_ok=True)
+    else:
+        _atomic_manifest(manifest, manifest_path)
     return {
         "manifest": manifest,
         "manifest_path": manifest_path,

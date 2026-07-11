@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,6 +74,18 @@ def production(items=(), active=0):
 
 
 class PromotionDecisionTests(unittest.TestCase):
+    def test_stage_hard_caps_remain_ten_fifty_and_three_hundred(self):
+        self.assertEqual(
+            rapid_campaign.STAGE_TARGETS,
+            {
+                rapid_campaign.STAGE_LOCAL3: 3,
+                rapid_campaign.STAGE_PILOT10: 10,
+                rapid_campaign.STAGE_FLEET50: 50,
+                rapid_campaign.STAGE_PRODUCTION300: 300,
+            },
+        )
+        self.assertEqual(max(rapid_campaign.STAGE_TARGETS.values()), 300)
+
     def test_five_strict_valid_pilots_promote_early_to_fifty(self):
         state = rapid_campaign.new_state(SOLVER_REVISION, LIBRARY_REVISION)
 
@@ -293,6 +307,56 @@ class CandidateAuditTests(unittest.TestCase):
 
 
 class ControllerMutationTests(unittest.TestCase):
+    def test_different_seed_controllers_share_one_project_mutation_lock(self):
+        active = 0
+        max_active = 0
+        entered = []
+        guard = threading.Lock()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+
+        def locked_body(*_args, seed, **_kwargs):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+                entered.append(seed)
+            first_entered.set()
+            if seed == 1:
+                release_first.wait(timeout=5)
+            with guard:
+                active -= 1
+            return {"seed": seed}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                rapid_campaign.pinned_pilot,
+                "CAMPAIGN_MUTATION_LOCK_PATH",
+                Path(directory) / "campaign.lock"), mock.patch.object(
+                    rapid_campaign, "_run_once_locked",
+                    side_effect=locked_body):
+            results = []
+            threads = [
+                threading.Thread(
+                    target=lambda seed=seed: results.append(
+                        rapid_campaign.run_once(
+                            SOLVER_REVISION, LIBRARY_REVISION,
+                            seed=seed, execute=True)))
+                for seed in (1, 2)
+            ]
+            threads[0].start()
+            self.assertTrue(first_entered.wait(timeout=2))
+            threads[1].start()
+            time.sleep(0.1)
+            self.assertEqual(entered, [1])
+            release_first.set()
+            for thread in threads:
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+
+        self.assertEqual(max_active, 1)
+        self.assertEqual(entered, [1, 2])
+        self.assertEqual({result["seed"] for result in results}, {1, 2})
+
     def test_legacy_serial_above_12000_still_refills_under_default_ceiling(self):
         state = {
             "serial": 16361,
@@ -310,7 +374,21 @@ class ControllerMutationTests(unittest.TestCase):
         with mock.patch.object(feeder, "load_state", return_value=state), \
                 mock.patch.object(
                     feeder, "scheduler_snapshot",
-                    return_value=(counts, counts, allocations, 20)), \
+                    return_value=(
+                        counts, counts, allocations,
+                        {"ready_fit_slots": 20, "queue_state": "ready",
+                         "queue_reason": "ready",
+                         "queue_submission_allowed": True,
+                         "submission_allowed": True,
+                         "project": rapid_campaign.pinned_pilot.MFT_PROJECT,
+                         "project_max_active_tasks": 300,
+                         "project_required_hard_cap": 1,
+                         "project_counts": counts,
+                         "project_active": 0,
+                         "project_server_open_slots": 300,
+                         "project_stage_open_slots": 1,
+                         "project_submission_slots": 1},
+                    )), \
                 mock.patch.object(
                     feeder, "dataset_collection_snapshot",
                     return_value=(12000, set())), \
@@ -359,7 +437,11 @@ class ControllerMutationTests(unittest.TestCase):
                                             rapid_campaign.feeder,
                                             "dataset_collection_snapshot",
                                             return_value=(274, set())), mock.patch.object(
-                                                rapid_campaign.feeder, "step") as refill:
+                                                rapid_campaign.feeder,
+                                                "_authorize_rapid_refill",
+                                                return_value="sealed") as authorize, mock.patch.object(
+                                                    rapid_campaign.feeder,
+                                                    "_step_from_rapid_controller") as refill:
                 result = rapid_campaign.run_once(
                     SOLVER_REVISION,
                     LIBRARY_REVISION,
@@ -370,8 +452,10 @@ class ControllerMutationTests(unittest.TestCase):
                     now=NOW,
                 )
 
+        authorize.assert_called_once()
         refill.assert_called_once_with(
             rapid_campaign.DEFAULT_MAX_SAMPLES,
+            authorization="sealed",
             target=50,
             buffer=0,
             solver_revision=SOLVER_REVISION,

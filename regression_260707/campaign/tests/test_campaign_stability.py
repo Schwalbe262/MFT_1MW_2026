@@ -28,7 +28,70 @@ class FakeResponse:
         return self._payload
 
 
+def project_capacity_gate(
+        counts, hard_cap, queue_state="ready", ready_fit_slots=100,
+        server_cap=300, queue_reason=None):
+    active = sum(int(counts.get(status, 0) or 0) for status in feeder.ACTIVE_TASK_STATUSES)
+    project_slots = max(0, min(server_cap - active, hard_cap - active))
+    queue_allowed = queue_state != "blocked"
+    return {
+        "ready_fit_slots": ready_fit_slots,
+        "queue_state": queue_state,
+        "queue_reason": queue_reason or queue_state,
+        "queue_submission_allowed": queue_allowed,
+        "submission_allowed": queue_allowed and project_slots > 0,
+        "project": pinned_pilot.MFT_PROJECT,
+        "project_max_active_tasks": server_cap,
+        "project_required_hard_cap": hard_cap,
+        "project_counts": dict(counts),
+        "project_active": active,
+        "project_server_open_slots": max(0, server_cap - active),
+        "project_stage_open_slots": max(0, hard_cap - active),
+        "project_submission_slots": project_slots,
+    }
+
+
 class FeederTests(unittest.TestCase):
+    def test_ready_marker_is_atomic_and_revision_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "feeder.ready"
+            feeder.publish_ready_marker(path, "a" * 40, "b" * 40)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["solver_revision"], "a" * 40)
+            self.assertEqual(payload["library_revision"], "b" * 40)
+            self.assertGreater(payload["pid"], 0)
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+    def test_direct_and_cli_feeder_cannot_enter_above_fifty(self):
+        self.assertLessEqual(
+            feeder.TARGET_ACTIVE + feeder.BUFFER,
+            feeder.MAX_STANDALONE_ACTIVE,
+        )
+        with mock.patch.object(feeder, "scheduler_snapshot") as snapshot:
+            with self.assertRaisesRegex(
+                    feeder.SchedulerError, "only rapid_campaign"):
+                feeder.step(
+                    1000, target=300, buffer=0,
+                    solver_revision="a" * 40, library_revision="b" * 40)
+        snapshot.assert_not_called()
+
+        argv = [
+            "feeder.py", "--once", "--target", "51", "--buffer", "0",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                feeder.al_driver, "_current_solver_revision") as current:
+            with self.assertRaisesRegex(
+                    feeder.SchedulerError, "standalone feeder hard cap"):
+                feeder.main()
+        current.assert_not_called()
+
+        with self.assertRaises(TypeError):
+            feeder.step(
+                1000, target=300, buffer=0,
+                solver_revision="a" * 40, library_revision="b" * 40,
+                _rapid_authorized=True,
+            )
+
     def test_unjudged_terminal_and_legacy_active_outputs_remain_reserved(self):
         state = {
             "outstanding": [3, 4],
@@ -57,8 +120,241 @@ class FeederTests(unittest.TestCase):
         self.assertEqual(snapshot["global_active"], 151)
         self.assertEqual(snapshot["total_slots"], 170)
         self.assertEqual(snapshot["headroom"], 19)
+        self.assertTrue(snapshot["submission_allowed"])
 
-    def test_refill_uses_scheduler_truth_and_cpu_cap_not_ledger(self):
+    def test_pinned_pilot_opening_queue_allows_demand_without_ready_slots(self):
+        snapshot = pinned_pilot.calculate_submission_headroom(
+            {"queued": 0, "attaching": 0, "running": 100},
+            [],
+            ready_fit_slots=0,
+            queue_state="opening",
+            queue_reason="opening demand pools",
+        )
+
+        self.assertEqual(snapshot["headroom"], 0)
+        self.assertEqual(snapshot["queue_state"], "opening")
+        self.assertTrue(snapshot["submission_allowed"])
+
+    def test_pinned_pilot_blocked_queue_refuses_demand(self):
+        snapshot = pinned_pilot.calculate_submission_headroom(
+            {}, [], ready_fit_slots=0, queue_state="blocked",
+            queue_reason="allocation backoff active for cpu",
+        )
+
+        self.assertFalse(snapshot["submission_allowed"])
+
+    def test_queue_contract_allows_ready_pending_and_opening_only(self):
+        for queue_state in ("ready", "pending", "opening"):
+            with self.subTest(queue_state=queue_state):
+                self.assertTrue(
+                    pinned_pilot.queue_allows_demand_submission(queue_state))
+        self.assertFalse(
+            pinned_pilot.queue_allows_demand_submission("blocked"))
+        with self.assertRaisesRegex(RuntimeError, "invalid queue_state"):
+            pinned_pilot.queue_allows_demand_submission("unknown")
+
+    def test_mft_project_inventory_enforces_server_and_stage_caps(self):
+        projects = [{
+            "name": pinned_pilot.MFT_PROJECT,
+            "max_active_tasks": 300,
+            "auto_pull": False,
+        }]
+        tasks = [
+            {"id": index + 1, "name": f"candidate-{index}",
+             "project": pinned_pilot.MFT_PROJECT, "status": "queued"}
+            for index in range(40)
+        ] + [
+            {"id": index + 41, "name": f"candidate-{index + 40}",
+             "project": pinned_pilot.MFT_PROJECT, "status": "running"}
+            for index in range(10)
+        ]
+
+        snapshot = pinned_pilot.project_submission_snapshot(
+            projects, tasks, required_hard_cap=50)
+
+        self.assertEqual(snapshot["project_active"], 50)
+        self.assertEqual(snapshot["project_stage_open_slots"], 0)
+        self.assertEqual(snapshot["project_submission_slots"], 0)
+        with self.assertRaisesRegex(RuntimeError, "must be exactly 300"):
+            pinned_pilot.project_submission_snapshot(
+                projects=[{
+                    "name": pinned_pilot.MFT_PROJECT,
+                    "max_active_tasks": 100,
+                    "auto_pull": False,
+                }],
+                project_tasks=[],
+                required_hard_cap=300,
+            )
+        with self.assertRaisesRegex(RuntimeError, "missing or ambiguous"):
+            pinned_pilot.project_submission_snapshot(
+                projects=[], project_tasks=[], required_hard_cap=10)
+
+    def test_project_capacity_unions_legacy_active_without_double_count(self):
+        projects = [{
+            "name": pinned_pilot.MFT_PROJECT,
+            "max_active_tasks": 300,
+            "auto_pull": False,
+        }]
+        tagged = [
+            {"id": 1, "name": "mft-camp-new-1", "project": pinned_pilot.MFT_PROJECT,
+             "status": "queued"},
+            {"id": 2, "name": "candidate-al", "project": pinned_pilot.MFT_PROJECT,
+             "status": "running"},
+        ]
+        legacy_scan = [
+            dict(tagged[0]),
+            {"id": 3, "name": "mft-camp-old-3", "project": "",
+             "status": "attaching"},
+        ]
+
+        snapshot = pinned_pilot.project_submission_snapshot(
+            projects, tagged, required_hard_cap=10,
+            legacy_tasks=legacy_scan)
+
+        self.assertEqual(snapshot["project_active"], 3)
+        self.assertEqual(snapshot["project_tagged_active"], 2)
+        self.assertEqual(snapshot["legacy_active"], 1)
+        self.assertEqual(snapshot["project_submission_slots"], 7)
+        self.assertEqual(snapshot["project_counts"], {
+            "queued": 1, "attaching": 1, "running": 1})
+
+    def test_project_capacity_rejects_duplicate_and_foreign_legacy_rows(self):
+        projects = [{
+            "name": pinned_pilot.MFT_PROJECT,
+            "max_active_tasks": 300,
+            "auto_pull": False,
+        }]
+        row = {"id": 1, "name": "mft-camp-old", "project": "",
+               "status": "queued"}
+        with self.assertRaisesRegex(RuntimeError, "duplicate legacy MFT task ID"):
+            pinned_pilot.project_submission_snapshot(
+                projects, [], required_hard_cap=10,
+                legacy_tasks=[row, dict(row)])
+        with self.assertRaisesRegex(RuntimeError, "unexpected project"):
+            pinned_pilot.project_submission_snapshot(
+                projects, [], required_hard_cap=10,
+                legacy_tasks=[{
+                    **row, "id": 2, "project": "IPMSM"}])
+        with self.assertRaisesRegex(RuntimeError, "exceeds absolute cap 300"):
+            pinned_pilot.project_submission_snapshot(
+                projects, [], required_hard_cap=301)
+
+    def test_campaign_inventory_preserves_project_and_projectless_legacy_union(self):
+        rows = [
+            {"id": 1, "name": "mft-camp-new", "project": pinned_pilot.MFT_PROJECT,
+             "status": "running"},
+            {"id": 2, "name": "mft-camp-legacy", "project": "",
+             "status": "completed"},
+        ]
+        with mock.patch.object(feeder, "_scheduler_json", return_value=rows) as get:
+            self.assertEqual(feeder.campaign_inventory(), rows)
+        self.assertEqual(get.call_args.kwargs["params"], {
+            "limit": 10000, "name_prefix": feeder.CAMPAIGN_PREFIX})
+
+        with mock.patch.object(feeder, "_scheduler_json", return_value=[{
+                "id": 3, "name": "mft-camp-foreign", "project": "IPMSM",
+                "status": "running"}]):
+            with self.assertRaisesRegex(feeder.SchedulerError, "unexpected project"):
+                feeder.campaign_inventory()
+
+    def test_scheduler_snapshot_isolates_mft_from_ipmsm_and_allows_opening(self):
+        calls = []
+
+        def scheduler_json(path, params=None):
+            calls.append((path, params))
+            if path == "/api/tasks/summary":
+                return {"statuses": {"running": 100}}
+            if path == "/api/allocations":
+                return []
+            if path == "/api/projects":
+                return [{
+                    "name": pinned_pilot.MFT_PROJECT,
+                    "max_active_tasks": 300,
+                    "auto_pull": False,
+                }]
+            if path == "/api/tasks":
+                return []
+            if path == "/api/task-capacity":
+                return {
+                    "ready_fit_slots": 0,
+                    "queue_state": "opening",
+                    "queue_reason": "opening demand pools",
+                }
+            raise AssertionError(path)
+
+        with mock.patch.object(
+                feeder, "_scheduler_json", side_effect=scheduler_json):
+            project_counts, global_counts, _allocations, capacity = (
+                feeder.scheduler_snapshot(required_hard_cap=300))
+
+        self.assertEqual(sum(project_counts.values()), 0)
+        self.assertEqual(global_counts["running"], 100)
+        self.assertEqual(capacity["project_submission_slots"], 300)
+        self.assertTrue(capacity["submission_allowed"])
+        self.assertIn(("/api/projects", None), calls)
+        self.assertIn((
+            "/api/tasks",
+            {
+                "limit": 10000,
+                "project": pinned_pilot.MFT_PROJECT,
+                "status": "queued,attaching,running",
+            },
+        ), calls)
+        self.assertIn((
+            "/api/tasks",
+            {
+                "limit": 10000,
+                "name_prefix": pinned_pilot.LEGACY_MFT_NAME_PREFIX,
+                "status": "queued,attaching,running",
+            },
+        ), calls)
+
+    def test_pinned_capacity_snapshot_requires_the_mft_project(self):
+        calls = []
+
+        def scheduler_json(path, params=None):
+            calls.append((path, params))
+            if path == "/api/tasks/summary":
+                return {"statuses": {"running": 100}}
+            if path == "/api/allocations":
+                return []
+            if path == "/api/projects":
+                return [{
+                    "name": pinned_pilot.MFT_PROJECT,
+                    "max_active_tasks": 300,
+                    "auto_pull": False,
+                }]
+            if path == "/api/tasks":
+                return []
+            if path == "/api/task-capacity":
+                return {
+                    "ready_fit_slots": 0,
+                    "queue_state": "opening",
+                    "queue_reason": "opening demand pools",
+                }
+            raise AssertionError(path)
+
+        with mock.patch.object(
+                pinned_pilot, "_get_json", side_effect=scheduler_json):
+            snapshot = pinned_pilot.capacity_snapshot()
+
+        self.assertEqual(
+            snapshot["project_required_hard_cap"],
+            pinned_pilot.PILOT_PROJECT_HARD_CAP,
+        )
+        self.assertEqual(snapshot["project_submission_slots"], 10)
+        self.assertTrue(snapshot["submission_allowed"])
+        self.assertIn(("/api/projects", None), calls)
+        self.assertIn((
+            "/api/tasks",
+            {
+                "limit": 10000,
+                "name_prefix": pinned_pilot.LEGACY_MFT_NAME_PREFIX,
+                "status": "queued,attaching,running",
+            },
+        ), calls)
+
+    def test_refill_uses_campaign_demand_not_global_ready_capacity(self):
         state = {
             "serial": 100,
             "submitted_samples": 0,
@@ -81,7 +377,10 @@ class FeederTests(unittest.TestCase):
         ]
 
         with mock.patch.object(feeder, "load_state", return_value=state), mock.patch.object(
-            feeder, "scheduler_snapshot", return_value=(counts, counts, allocations, 100)
+            feeder, "scheduler_snapshot", return_value=(
+                counts, counts, allocations,
+                project_capacity_gate(counts, hard_cap=10),
+            )
         ), mock.patch.object(
             feeder, "dataset_row_count", return_value=0
         ), mock.patch.object(
@@ -100,10 +399,10 @@ class FeederTests(unittest.TestCase):
             feeder.time, "sleep"
         ):
             self.assertTrue(feeder.step(
-                1000, target=130, buffer=40,
+                1000, target=10, buffer=0,
                 solver_revision="a" * 40, library_revision="b" * 40))
 
-        # free_cpus/4*0.85 is the only admitted new concurrency budget.
+        # The MFT campaign owns its target independently of unrelated tasks.
         self.assertEqual(submit_mock.call_count, 6)
         self.assertEqual(state["serial"], 106)
         self.assertEqual(state["submitted_samples"], 6)
@@ -124,8 +423,11 @@ class FeederTests(unittest.TestCase):
             "load_state",
             return_value={"serial": 0, "submitted_samples": 0},
         ), mock.patch.object(
-            feeder, "scheduler_snapshot", return_value=(counts, counts, allocations, 100)
-        ), mock.patch.object(
+            feeder, "scheduler_snapshot", return_value=(
+                counts, counts, allocations,
+                project_capacity_gate(counts, hard_cap=3),
+            )
+        ) as scheduler_snapshot, mock.patch.object(
             feeder, "dataset_row_count", return_value=0
         ), mock.patch.object(
             feeder, "dataset_collection_snapshot", return_value=(0, set())
@@ -146,6 +448,187 @@ class FeederTests(unittest.TestCase):
                 1000, target=2, buffer=1,
                 solver_revision="a" * 40, library_revision="b" * 40)
         self.assertEqual(submit_mock.call_count, 1)
+        scheduler_snapshot.assert_called_once_with(3)
+
+    def test_opening_queue_submits_mft_deficit_to_trigger_scale_out(self):
+        state = {"serial": 0, "submitted_samples": 0}
+        campaign_counts = {"queued": 0, "attaching": 0, "running": 0}
+        global_counts = {"queued": 0, "attaching": 0, "running": 100}
+        capacity_gate = project_capacity_gate(
+            campaign_counts,
+            hard_cap=3,
+            queue_state="opening",
+            ready_fit_slots=0,
+            queue_reason="no single ready pool has 4 free CPUs; opening demand pools",
+        )
+        with mock.patch.object(feeder, "load_state", return_value=state), mock.patch.object(
+            feeder, "scheduler_snapshot",
+            return_value=(campaign_counts, global_counts, [], capacity_gate),
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(0, set())
+        ), mock.patch.object(
+            feeder, "campaign_inventory", return_value=[]
+        ), mock.patch.object(
+            feeder, "cursor_after_valid_candidates", return_value=0
+        ), mock.patch.object(
+            feeder, "next_valid_candidate", return_value=(1, 0, {"candidate": 1})
+        ), mock.patch.object(
+            feeder, "submit", side_effect=[901, 902, 903]
+        ) as submit_mock, mock.patch.object(
+            feeder, "save_state"
+        ), mock.patch.object(feeder.time, "sleep"):
+            self.assertTrue(feeder.step(
+                1000, target=3, buffer=0,
+                solver_revision="a" * 40, library_revision="b" * 40))
+
+        self.assertEqual(submit_mock.call_count, 3)
+        self.assertEqual(state["submitted_samples"], 3)
+
+    def test_blocked_queue_is_the_only_capacity_state_that_stops_refill(self):
+        campaign_counts = {"queued": 0, "attaching": 0, "running": 0}
+        global_counts = {"queued": 0, "attaching": 0, "running": 100}
+        capacity_gate = project_capacity_gate(
+            campaign_counts,
+            hard_cap=3,
+            queue_state="blocked",
+            ready_fit_slots=0,
+            queue_reason="allocation backoff active for cpu",
+        )
+        with mock.patch.object(
+            feeder, "load_state", return_value={"serial": 0, "submitted_samples": 0}
+        ), mock.patch.object(
+            feeder, "scheduler_snapshot",
+            return_value=(campaign_counts, global_counts, [], capacity_gate),
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(0, set())
+        ), mock.patch.object(
+            feeder, "campaign_inventory", return_value=[]
+        ), mock.patch.object(feeder, "submit") as submit_mock:
+            self.assertTrue(feeder.step(
+                1000, target=3, buffer=0,
+                solver_revision="a" * 40, library_revision="b" * 40))
+
+        submit_mock.assert_not_called()
+
+    def test_none_submission_does_not_advance_and_retry_uses_same_candidate(self):
+        state = {
+            "serial": 7,
+            "submitted_samples": 0,
+            "candidate_generation": f"{'a' * 40}:{'b' * 40}:seed260710",
+            "candidate_cursor": 10,
+        }
+        counts = {"queued": 0, "attaching": 0, "running": 0}
+        with mock.patch.object(feeder, "load_state", return_value=state), mock.patch.object(
+            feeder, "scheduler_snapshot", return_value=(
+                counts, counts, [], project_capacity_gate(counts, hard_cap=1))
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(0, set())
+        ), mock.patch.object(
+            feeder, "campaign_inventory", return_value=[]
+        ), mock.patch.object(
+            feeder, "next_valid_candidate",
+            return_value=(11, 10, {"candidate": "same"})
+        ) as candidate, mock.patch.object(
+            feeder, "submit", side_effect=[None, 901]
+        ) as submit, mock.patch.object(
+            feeder, "save_state"
+        ) as save, mock.patch.object(feeder.time, "sleep"):
+            with self.assertRaisesRegex(
+                    feeder.SchedulerError, "candidate state was not advanced"):
+                feeder.step(
+                    1000, target=1, buffer=0,
+                    solver_revision="a" * 40, library_revision="b" * 40)
+            self.assertEqual(state, {
+                "serial": 7,
+                "submitted_samples": 0,
+                "candidate_generation": f"{'a' * 40}:{'b' * 40}:seed260710",
+                "candidate_cursor": 10,
+            })
+            save.assert_not_called()
+
+            self.assertTrue(feeder.step(
+                1000, target=1, buffer=0,
+                solver_revision="a" * 40, library_revision="b" * 40))
+
+        self.assertEqual(candidate.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in candidate.call_args_list], [10, 10])
+        self.assertEqual(
+            [call.args[0] for call in submit.call_args_list],
+            ["mft-camp-saaaaaaa-lbbbbbbb-00008"] * 2,
+        )
+        self.assertEqual(state["serial"], 8)
+        self.assertEqual(state["candidate_cursor"], 11)
+        self.assertEqual(state["outstanding"], [901])
+        save.assert_called_once()
+
+    def test_returning_to_an_earlier_seed_resumes_its_own_cursor(self):
+        solver = "a" * 40
+        library = "b" * 40
+        generation_one = f"{solver}:{library}:seed1"
+        generation_two = f"{solver}:{library}:seed2"
+        state = {
+            "serial": 20,
+            "submitted_samples": 20,
+            "candidate_generation": generation_two,
+            "candidate_cursor": 21,
+            "candidate_cursors": {
+                generation_one: 11,
+                generation_two: 21,
+            },
+        }
+        counts = {"queued": 0, "attaching": 0, "running": 0}
+        with mock.patch.object(feeder, "load_state", return_value=state), \
+                mock.patch.object(feeder, "scheduler_snapshot", return_value=(
+                    counts, counts, [], project_capacity_gate(counts, hard_cap=1))), \
+                mock.patch.object(
+                    feeder, "dataset_collection_snapshot", return_value=(0, set())), \
+                mock.patch.object(feeder, "campaign_inventory", return_value=[]), \
+                mock.patch.object(feeder, "cursor_after_valid_candidates") as initial, \
+                mock.patch.object(
+                    feeder, "next_valid_candidate",
+                    return_value=(12, 11, {"candidate": "seed-one-next"})) as candidate, \
+                mock.patch.object(feeder, "submit", return_value=902), \
+                mock.patch.object(feeder, "save_state"), \
+                mock.patch.object(feeder.time, "sleep"):
+            self.assertTrue(feeder.step(
+                1000, target=1, buffer=0,
+                solver_revision=solver, library_revision=library,
+                candidate_seed=1,
+            ))
+
+        initial.assert_not_called()
+        candidate.assert_called_once_with(11, seed=1)
+        self.assertEqual(state["candidate_cursors"], {
+            generation_one: 12,
+            generation_two: 21,
+        })
+
+    def test_submission_exception_rolls_back_unsaved_candidate_state(self):
+        state = {"serial": 2, "submitted_samples": 0}
+        original = dict(state)
+        counts = {"queued": 0, "attaching": 0, "running": 0}
+        with mock.patch.object(feeder, "load_state", return_value=state), mock.patch.object(
+            feeder, "scheduler_snapshot", return_value=(
+                counts, counts, [], project_capacity_gate(counts, hard_cap=1))
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(0, set())
+        ), mock.patch.object(
+            feeder, "campaign_inventory", return_value=[]
+        ), mock.patch.object(
+            feeder, "cursor_after_valid_candidates", return_value=10
+        ), mock.patch.object(
+            feeder, "next_valid_candidate", return_value=(11, 10, {"candidate": 1})
+        ), mock.patch.object(
+            feeder, "submit", side_effect=RuntimeError("uncertain POST")
+        ), mock.patch.object(feeder, "save_state") as save:
+            with self.assertRaisesRegex(RuntimeError, "uncertain POST"):
+                feeder.step(
+                    1000, target=1, buffer=0,
+                    solver_revision="a" * 40, library_revision="b" * 40)
+
+        self.assertEqual(state, original)
+        save.assert_not_called()
 
     def test_dataset_rows_not_submission_ledger_bound_total(self):
         state = {"serial": 10, "submitted_samples": 12000}
@@ -155,7 +638,11 @@ class FeederTests(unittest.TestCase):
             "total_cpus": 64, "free_cpus": 64,
         }]
         with mock.patch.object(feeder, "load_state", return_value=state), mock.patch.object(
-            feeder, "scheduler_snapshot", return_value=(counts, counts, allocations, 20)
+            feeder, "scheduler_snapshot", return_value=(
+                counts, counts, allocations,
+                project_capacity_gate(
+                    counts, hard_cap=10, ready_fit_slots=20),
+            )
         ), mock.patch.object(
             feeder, "dataset_row_count", return_value=998
         ), mock.patch.object(
@@ -186,7 +673,11 @@ class FeederTests(unittest.TestCase):
         with mock.patch.object(
             feeder, "load_state", return_value={"serial": 0, "submitted_samples": 0}
         ), mock.patch.object(
-            feeder, "scheduler_snapshot", return_value=(counts, counts, allocations, 20)
+            feeder, "scheduler_snapshot", return_value=(
+                counts, counts, allocations,
+                project_capacity_gate(
+                    counts, hard_cap=10, ready_fit_slots=20),
+            )
         ), mock.patch.object(
             feeder, "dataset_row_count", return_value=998
         ), mock.patch.object(

@@ -252,6 +252,130 @@ def task_state(task_id=17, stage="WAIT"):
 
 
 class SchedulerClientIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        project_contract = patch.object(
+            scheduler_client,
+            "require_live_project_mutation_contract",
+            return_value={
+                "name": scheduler_client.MFT_PROJECT,
+                "max_active_tasks":
+                    scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS,
+                "auto_pull": False,
+            },
+        )
+        self.require_project_contract = project_contract.start()
+        self.addCleanup(project_contract.stop)
+        capacity_snapshot = patch.object(
+            scheduler_client,
+            "live_project_submission_snapshot",
+            return_value={
+                "project_active": 0,
+                "project_submission_slots":
+                    scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS,
+            },
+        )
+        self.capacity_snapshot = capacity_snapshot.start()
+        self.addCleanup(capacity_snapshot.stop)
+
+    def test_project_mutation_contract_requires_exact_cap_and_auto_pull_false(self):
+        valid = {
+            "name": scheduler_client.MFT_PROJECT,
+            "max_active_tasks": scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS,
+            "auto_pull": False,
+        }
+        self.assertEqual(
+            scheduler_client.validate_project_mutation_contract(valid), valid)
+        for override in (
+            {"max_active_tasks": 0},
+            {"max_active_tasks": 299},
+            {"max_active_tasks": 301},
+            {"max_active_tasks": 300.0},
+            {"max_active_tasks": 300.1},
+            {"max_active_tasks": "300"},
+            {"max_active_tasks": True},
+            {"auto_pull": True},
+            {"auto_pull": None},
+        ):
+            with self.subTest(override=override), self.assertRaises(
+                    scheduler_client.ProjectContractError):
+                scheduler_client.validate_project_mutation_contract(
+                    {**valid, **override})
+
+    def test_submit_wrapper_owns_the_common_mutation_lock(self):
+        observed = []
+
+        def locked_submit(*_args, **_kwargs):
+            observed.append(scheduler_client.campaign_mutation_lock_is_held())
+            return 77
+
+        with patch.object(
+                scheduler_client, "_submit_verification_locked",
+                side_effect=locked_submit) as submit:
+            task_id = scheduler_client.submit_verification(
+                "candidate-lock", "wd", {}, {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+            )
+
+        self.assertEqual(task_id, 77)
+        self.assertEqual(observed, [True])
+        submit.assert_called_once()
+        self.assertFalse(scheduler_client.campaign_mutation_lock_is_held())
+
+    def test_absolute_project_capacity_blocks_post(self):
+        self.capacity_snapshot.return_value = {
+            "project_active": scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS,
+            "project_submission_slots": 0,
+        }
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), patch.object(
+                    scheduler_client.requests, "post") as post:
+            with self.assertRaises(scheduler_client.ProjectCapacityError):
+                scheduler_client.submit_verification(
+                    "candidate-full", "wd", {}, {},
+                    solver_revision=TEST_REVISION,
+                    library_revision=TEST_LIBRARY_REVISION,
+                )
+
+        post.assert_not_called()
+
+    def test_reconcile_accepts_new_and_legacy_active_and_terminal_rows(self):
+        for project in (scheduler_client.MFT_PROJECT, ""):
+            for status in ("running", "completed"):
+                with self.subTest(project=project, status=status):
+                    response = task_inventory_response([{
+                        "id": 71,
+                        "name": "candidate-existing",
+                        "dedupe_key": "exact-key",
+                        "project": project,
+                        "status": status,
+                    }])
+                    with patch.object(
+                            scheduler_client.requests, "get",
+                            return_value=response) as get:
+                        task_id = scheduler_client.reconcile_task_id(
+                            "candidate-existing", "exact-key", attempts=1)
+                    self.assertEqual(task_id, 71)
+                    self.assertEqual(get.call_args.kwargs["params"], {
+                        "limit": 10000,
+                        "name_prefix": "candidate-existing",
+                    })
+
+    def test_reconcile_rejects_exact_identity_from_another_project(self):
+        response = task_inventory_response([{
+            "id": 72,
+            "name": "candidate-foreign",
+            "dedupe_key": "exact-key",
+            "project": "IPMSM",
+            "status": "running",
+        }])
+        with patch.object(
+                scheduler_client.requests, "get", return_value=response):
+            with self.assertRaises(scheduler_client.TaskLookupError):
+                scheduler_client.reconcile_task_id(
+                    "candidate-foreign", "exact-key", attempts=1)
+
     def test_submit_exports_fork_bootstrap_before_solver_launch(self):
         submitted = Mock(status_code=201)
         submitted.json.return_value = {"id": 40}
@@ -291,8 +415,11 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             )
 
         self.assertEqual(task_id, 41)
+        self.capacity_snapshot.assert_called_once_with(
+            scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS)
         self.assertTrue(post.call_args.args[0].endswith("/api/tasks"))
         payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["project"], scheduler_client.MFT_PROJECT)
         self.assertRegex(
             payload["dedupe_key"],
             rf"^mft-al:candidate-41:{TEST_REVISION}:{TEST_LIBRARY_REVISION}:[0-9a-f]{{16}}$")
@@ -449,6 +576,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             "dedupe_key": dedupe_key,
             "status": "completed",
         }])
+        self.capacity_snapshot.reset_mock()
         with patch.object(scheduler_client.requests, "get", return_value=terminal), \
                 patch.object(scheduler_client.requests, "post") as second_post:
             task_id = scheduler_client.submit_verification(
@@ -456,6 +584,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
                 library_revision=TEST_LIBRARY_REVISION)
         self.assertEqual(task_id, 77)
         second_post.assert_not_called()
+        self.capacity_snapshot.assert_not_called()
 
     def test_lookup_uncertainty_prevents_post_and_response_loss_reconciles(self):
         with patch.object(
@@ -483,7 +612,8 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             "id": 88,
             "name": "candidate-lost",
             "dedupe_key": dedupe_key,
-            "status": "failed",
+            "project": "",
+            "status": "running",
         }])
         with patch.object(
                 scheduler_client.requests, "get",

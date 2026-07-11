@@ -19,6 +19,28 @@ P02_CANDIDATES = [{"candidate": 0}, {"candidate": 1}]
 P08_CANDIDATES = [{"candidate": index} for index in range(2, 10)]
 
 
+def pilot_capacity(queue_state="ready", project_active=0, queue_reason=None):
+    queue_allowed = queue_state != "blocked"
+    project_slots = max(
+        0, pinned_pilot.PILOT_PROJECT_HARD_CAP - project_active)
+    return {
+        "headroom": 0 if queue_state != "ready" else project_slots,
+        "queue_state": queue_state,
+        "queue_reason": queue_reason or queue_state,
+        "queue_submission_allowed": queue_allowed,
+        "submission_allowed": queue_allowed and project_slots > 0,
+        "project": pinned_pilot.MFT_PROJECT,
+        "project_max_active_tasks": 300,
+        "project_required_hard_cap": pinned_pilot.PILOT_PROJECT_HARD_CAP,
+        "project_counts": {
+            "queued": project_active, "attaching": 0, "running": 0},
+        "project_active": project_active,
+        "project_server_open_slots": 300 - project_active,
+        "project_stage_open_slots": project_slots,
+        "project_submission_slots": project_slots,
+    }
+
+
 def p02_manifest(task_ids=(101, 102), **overrides):
     tag = pinned_pilot.pilot_tag(
         SOLVER_REVISION, LIBRARY_REVISION, "p02", SEED, 0)
@@ -249,7 +271,7 @@ class PilotCompletionGateTests(unittest.TestCase):
 
 
 class PilotMainTests(unittest.TestCase):
-    def _run_main(self, stage, tasks, seed, execute=False):
+    def _run_main(self, stage, tasks, seed, execute=False, capacity=None):
         argv = [
             "pinned_pilot.py",
             "--tasks", str(tasks),
@@ -265,6 +287,7 @@ class PilotMainTests(unittest.TestCase):
         predecessor = {
             "manifest": "p02.json", "tag": "p02-tag", "task_ids": [101, 102]}
         submit_ids = list(range(1000, 1000 + tasks))
+        capacity = capacity or pilot_capacity()
         with mock.patch.object(sys, "argv", argv), mock.patch.object(
                 pinned_pilot.al_driver, "_current_solver_revision",
                 return_value=SOLVER_REVISION), mock.patch.object(
@@ -273,10 +296,12 @@ class PilotMainTests(unittest.TestCase):
                     pinned_pilot, "deterministic_candidates",
                     return_value=candidates) as select, mock.patch.object(
                     pinned_pilot, "capacity_snapshot",
-                    return_value={"headroom": tasks}), mock.patch.object(
+                    return_value=capacity), mock.patch.object(
                      pinned_pilot, "validate_p02_predecessor",
                      return_value=predecessor) as validate, mock.patch.object(
                     pinned_pilot.deployment_gate, "validate_deployment"), mock.patch.object(
+                    pinned_pilot.scheduler_client, "reconcile_task_id",
+                    return_value=None), mock.patch.object(
                      pinned_pilot.scheduler_client, "submit_verification",
                     side_effect=submit_ids) as submit, mock.patch.object(
                     pinned_pilot, "_atomic_manifest") as install, mock.patch(
@@ -321,6 +346,144 @@ class PilotMainTests(unittest.TestCase):
         for index, task in enumerate(manifest["tasks"]):
             self.assertEqual(task["name"], f"mft-pilot-{manifest['tag']}-{index:02d}")
             self.assertEqual(task["task_id"], 1000 + index)
+
+    def test_p08_submits_queued_demand_while_scheduler_is_opening_pools(self):
+        calls = self._run_main(
+            "p08", 8, SEED + 2, execute=True,
+            capacity=pilot_capacity(
+                queue_state="opening", queue_reason="opening demand pools"),
+        )
+
+        self.assertEqual(calls["submit"].call_count, 8)
+
+    def test_partial_p08_retry_reconciles_existing_ids_and_gates_only_missing(self):
+        candidates = [{"candidate": index} for index in range(8)]
+        existing = [701, 702, 703, 704, None, None, None, None]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                pinned_pilot.al_driver, "_current_solver_revision",
+                return_value=SOLVER_REVISION), mock.patch.object(
+                    pinned_pilot.al_driver, "_current_library_revision",
+                    return_value=LIBRARY_REVISION), mock.patch.object(
+                        pinned_pilot, "deterministic_candidates",
+                        return_value=candidates), mock.patch.object(
+                            pinned_pilot, "validate_p02_predecessor",
+                            return_value={"task_ids": [101, 102]}), mock.patch.object(
+                                pinned_pilot.deployment_gate,
+                                "validate_deployment"), mock.patch.object(
+                                    pinned_pilot, "capacity_snapshot",
+                                    return_value=pilot_capacity(project_active=4)) as capacity, mock.patch.object(
+                                        pinned_pilot.scheduler_client,
+                                        "reconcile_task_id",
+                                        side_effect=existing) as reconcile, mock.patch.object(
+                                            pinned_pilot.scheduler_client,
+                                            "submit_verification",
+                                            side_effect=[705, 706, 707, 708]) as submit:
+            result = pinned_pilot.submit_pilot_stage(
+                SOLVER_REVISION,
+                LIBRARY_REVISION,
+                "p08",
+                seed=SEED,
+                execute=True,
+                manifest_dir=directory,
+                library_root=CAMPAIGN_DIR,
+            )
+            canonical_exists = result["manifest_path"].is_file()
+            partial_exists = result["manifest_path"].with_suffix(
+                ".partial.json").is_file()
+
+        self.assertEqual(reconcile.call_count, 8)
+        self.assertEqual(submit.call_count, 4)
+        capacity.assert_called_once_with(
+            required_hard_cap=pinned_pilot.PILOT_PROJECT_HARD_CAP)
+        manifest = result["manifest"]
+        self.assertEqual(
+            [record["task_id"] for record in manifest["tasks"]],
+            [701, 702, 703, 704, 705, 706, 707, 708],
+        )
+        self.assertEqual(manifest["missing_task_count"], 4)
+        self.assertTrue(canonical_exists)
+        self.assertFalse(partial_exists)
+
+    def test_partial_p08_crash_keeps_only_partial_ledger(self):
+        candidates = [{"candidate": index} for index in range(8)]
+        existing = [701, 702, 703, 704, None, None, None, None]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                pinned_pilot.al_driver, "_current_solver_revision",
+                return_value=SOLVER_REVISION), mock.patch.object(
+                    pinned_pilot.al_driver, "_current_library_revision",
+                    return_value=LIBRARY_REVISION), mock.patch.object(
+                        pinned_pilot, "deterministic_candidates",
+                        return_value=candidates), mock.patch.object(
+                            pinned_pilot, "validate_p02_predecessor",
+                            return_value={"task_ids": [101, 102]}), mock.patch.object(
+                                pinned_pilot.deployment_gate,
+                                "validate_deployment"), mock.patch.object(
+                                    pinned_pilot, "capacity_snapshot",
+                                    return_value=pilot_capacity(project_active=4)), mock.patch.object(
+                                        pinned_pilot.scheduler_client,
+                                        "reconcile_task_id",
+                                        side_effect=existing), mock.patch.object(
+                                            pinned_pilot.scheduler_client,
+                                            "submit_verification",
+                                            side_effect=[705, RuntimeError("crash")]):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                pinned_pilot.submit_pilot_stage(
+                    SOLVER_REVISION,
+                    LIBRARY_REVISION,
+                    "p08",
+                    seed=SEED,
+                    execute=True,
+                    manifest_dir=directory,
+                    library_root=CAMPAIGN_DIR,
+                )
+            tag = pinned_pilot.pilot_tag(
+                SOLVER_REVISION, LIBRARY_REVISION, "p08", SEED, 2)
+            canonical = Path(directory) / f"{tag}.json"
+            partial = Path(directory) / f"{tag}.partial.json"
+            self.assertFalse(canonical.exists())
+            self.assertTrue(partial.is_file())
+            ledger = json.loads(partial.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [record["task_id"] for record in ledger["tasks"]],
+                [701, 702, 703, 704, 705, None, None, None],
+            )
+
+    def test_blocked_scheduler_capacity_prevents_pilot_submission(self):
+        candidates = [{"candidate": index} for index in range(2)]
+        blocked = pilot_capacity(
+            queue_state="blocked",
+            queue_reason="allocation backoff active for cpu")
+        with mock.patch.object(
+                pinned_pilot.al_driver, "_current_solver_revision",
+                return_value=SOLVER_REVISION), mock.patch.object(
+                    pinned_pilot.al_driver, "_current_library_revision",
+                    return_value=LIBRARY_REVISION), mock.patch.object(
+                        pinned_pilot, "deterministic_candidates",
+                        return_value=candidates), mock.patch.object(
+                        pinned_pilot, "capacity_snapshot",
+                            return_value=blocked), mock.patch.object(
+                                pinned_pilot.scheduler_client,
+                                "reconcile_task_id", return_value=None), mock.patch.object(
+                                pinned_pilot, "validate_local_gate",
+                                return_value={}), mock.patch.object(
+                                    pinned_pilot.deployment_gate,
+                                    "validate_deployment"), mock.patch.object(
+                                        pinned_pilot.scheduler_client,
+                                        "submit_verification") as submit, mock.patch.object(
+                                            pinned_pilot, "_atomic_manifest") as install:
+            with self.assertRaisesRegex(
+                    RuntimeError, "pilot submission is blocked"):
+                pinned_pilot.submit_pilot_stage(
+                    SOLVER_REVISION,
+                    LIBRARY_REVISION,
+                    "p02",
+                    seed=SEED,
+                    execute=True,
+                    library_root=CAMPAIGN_DIR,
+                )
+
+        submit.assert_not_called()
+        install.assert_not_called()
 
 
 if __name__ == "__main__":

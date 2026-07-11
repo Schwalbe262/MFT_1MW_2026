@@ -4,15 +4,30 @@ AL 검증용 스케줄러 클라이언트: 후보 params JSON -> 태스크 제�
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+from filelock import FileLock
 
 SCHEDULER = "http://127.0.0.1:8000"
+MFT_PROJECT = "MFT_1MW_2026v1"
+MFT_PROJECT_MAX_ACTIVE_TASKS = 300
+MFT_ACTIVE_STATUSES = ("queued", "attaching", "running")
+LEGACY_MFT_NAME_PREFIX = "mft-"
+_LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "").strip()
+if not _LOCALAPPDATA:
+    _LOCALAPPDATA = str(Path.home() / "AppData" / "Local")
+CAMPAIGN_MUTATION_LOCK_PATH = (
+    Path(_LOCALAPPDATA) / "MFT_1MW_2026" / "campaign-mutation.lock")
+CAMPAIGN_MUTATION_LOCK_TIMEOUT = 15 * 60
+_CAMPAIGN_LOCK_STATE = threading.local()
 BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
         "module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; "
         "export FLEXLM_TIMEOUT=3000000; "
@@ -64,20 +79,245 @@ class TaskSubmissionUncertain(RuntimeError):
     """A POST may have succeeded, but its durable task ID is not known yet."""
 
 
+class ProjectContractError(RuntimeError):
+    """The live logical-project mutation contract is absent or unsafe."""
+
+
+class ProjectCapacityError(RuntimeError):
+    """No logical MFT project slot remains for a new task."""
+
+
 @dataclass(frozen=True)
 class ResultFetch:
     state: str
     result: dict | None = None
 
 
+@contextmanager
+def campaign_mutation_lock(path=None, timeout=None):
+    """Serialize every MFT task mutation across processes on this host."""
+    lock_path = Path(path or CAMPAIGN_MUTATION_LOCK_PATH)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(
+        str(lock_path),
+        timeout=(CAMPAIGN_MUTATION_LOCK_TIMEOUT if timeout is None else timeout),
+    )
+    with lock:
+        previous_depth = int(getattr(_CAMPAIGN_LOCK_STATE, "depth", 0))
+        _CAMPAIGN_LOCK_STATE.depth = previous_depth + 1
+        try:
+            yield lock
+        finally:
+            _CAMPAIGN_LOCK_STATE.depth = previous_depth
+
+
+def campaign_mutation_lock_is_held():
+    """Return whether this thread owns the common mutation lock context."""
+    return int(getattr(_CAMPAIGN_LOCK_STATE, "depth", 0)) > 0
+
+
+def validate_project_mutation_contract(project):
+    """Require the exact live project contract used by every MFT submission."""
+    if not isinstance(project, dict):
+        raise ProjectContractError("scheduler returned an invalid MFT project")
+    if str(project.get("name") or "").strip() != MFT_PROJECT:
+        raise ProjectContractError(
+            f"scheduler project identity is not {MFT_PROJECT!r}")
+    raw_cap = project.get("max_active_tasks")
+    if type(raw_cap) is not int:
+        raise ProjectContractError(
+            "scheduler MFT project max_active_tasks is invalid")
+    cap = raw_cap
+    if cap != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        raise ProjectContractError(
+            f"scheduler MFT project max_active_tasks must be exactly "
+            f"{MFT_PROJECT_MAX_ACTIVE_TASKS}, got {cap}")
+    if project.get("auto_pull") is not False:
+        raise ProjectContractError(
+            "scheduler MFT project auto_pull must be exactly false")
+    return {
+        "name": MFT_PROJECT,
+        "max_active_tasks": cap,
+        "auto_pull": False,
+    }
+
+
+def require_live_project_mutation_contract():
+    """Read and validate the live project immediately before a task POST."""
+    try:
+        response = requests.get(
+            f"{SCHEDULER}/api/projects/{MFT_PROJECT}", timeout=30)
+        response.raise_for_status()
+        project = response.json()
+    except Exception as exc:
+        raise ProjectContractError(
+            f"failed to read scheduler project {MFT_PROJECT!r}: {exc}") from exc
+    return validate_project_mutation_contract(project)
+
+
+def project_submission_snapshot(
+        projects, project_tasks, required_hard_cap, legacy_tasks=None):
+    """Count tagged and projectless legacy MFT demand without double counting."""
+    if isinstance(required_hard_cap, bool) or not isinstance(required_hard_cap, int):
+        raise ProjectCapacityError("MFT project hard cap must be a positive integer")
+    if required_hard_cap < 1 or required_hard_cap > MFT_PROJECT_MAX_ACTIVE_TASKS:
+        raise ProjectCapacityError(
+            f"MFT project hard cap must be between 1 and "
+            f"{MFT_PROJECT_MAX_ACTIVE_TASKS}")
+    if not isinstance(projects, list):
+        raise ProjectCapacityError("scheduler returned an invalid project inventory")
+    matches = [
+        project for project in projects
+        if isinstance(project, dict)
+        and str(project.get("name") or "").strip() == MFT_PROJECT
+    ]
+    if len(matches) != 1:
+        raise ProjectCapacityError(
+            f"scheduler project {MFT_PROJECT!r} is missing or ambiguous")
+    project_contract = validate_project_mutation_contract(matches[0])
+    if not isinstance(project_tasks, list):
+        raise ProjectCapacityError(
+            "scheduler returned an invalid MFT project task inventory")
+    if legacy_tasks is None:
+        legacy_tasks = []
+    if not isinstance(legacy_tasks, list):
+        raise ProjectCapacityError(
+            "scheduler returned an invalid legacy MFT task inventory")
+
+    def indexed(rows, source, allowed_projects, require_prefix=False):
+        inventory = {}
+        for task in rows:
+            if not isinstance(task, dict):
+                raise ProjectCapacityError(
+                    f"scheduler returned an invalid {source} task")
+            task_id = task.get("id", task.get("task_id"))
+            if (isinstance(task_id, bool) or not isinstance(task_id, int)
+                    or task_id <= 0):
+                raise ProjectCapacityError(
+                    f"scheduler returned an invalid {source} task ID")
+            if task_id in inventory:
+                raise ProjectCapacityError(
+                    f"scheduler returned duplicate {source} task ID {task_id}")
+            project_name = str(task.get("project") or "").strip()
+            if project_name not in allowed_projects:
+                raise ProjectCapacityError(
+                    f"scheduler returned {source} task {task_id} from "
+                    f"unexpected project {project_name!r}")
+            status = str(task.get("status") or "").strip().lower()
+            if status not in MFT_ACTIVE_STATUSES:
+                raise ProjectCapacityError(
+                    f"scheduler returned unexpected {source} active task status: "
+                    f"{status!r}")
+            if (require_prefix
+                    and not str(task.get("name") or "").startswith(
+                        LEGACY_MFT_NAME_PREFIX)):
+                raise ProjectCapacityError(
+                    f"scheduler legacy MFT filter returned task {task_id} "
+                    "outside the mft- namespace")
+            inventory[task_id] = dict(task)
+        return inventory
+
+    tagged = indexed(project_tasks, "MFT project", {MFT_PROJECT})
+    legacy_scan = indexed(
+        legacy_tasks, "legacy MFT", {"", MFT_PROJECT}, require_prefix=True)
+    combined = dict(tagged)
+    for task_id, task in legacy_scan.items():
+        if task_id in combined:
+            if str(task.get("project") or "").strip() != MFT_PROJECT:
+                raise ProjectCapacityError(
+                    f"scheduler task {task_id} is both project-tagged and legacy")
+            continue
+        combined[task_id] = task
+
+    counts = {status: 0 for status in MFT_ACTIVE_STATUSES}
+    tagged_counts = {status: 0 for status in MFT_ACTIVE_STATUSES}
+    legacy_counts = {status: 0 for status in MFT_ACTIVE_STATUSES}
+    for task in combined.values():
+        status = str(task.get("status") or "").strip().lower()
+        counts[status] += 1
+        bucket = (
+            tagged_counts
+            if str(task.get("project") or "").strip() == MFT_PROJECT
+            else legacy_counts
+        )
+        bucket[status] += 1
+    active = sum(counts.values())
+    server_cap = project_contract["max_active_tasks"]
+    server_open_slots = max(0, server_cap - active)
+    stage_open_slots = max(0, required_hard_cap - active)
+    return {
+        "project": MFT_PROJECT,
+        "project_max_active_tasks": server_cap,
+        "project_required_hard_cap": required_hard_cap,
+        "project_counts": counts,
+        "project_tagged_counts": tagged_counts,
+        "legacy_counts": legacy_counts,
+        "project_active": active,
+        "project_tagged_active": sum(tagged_counts.values()),
+        "legacy_active": sum(legacy_counts.values()),
+        "project_server_open_slots": server_open_slots,
+        "project_stage_open_slots": stage_open_slots,
+        "project_submission_slots": min(server_open_slots, stage_open_slots),
+    }
+
+
+def _task_rows(response, source):
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload if isinstance(payload, list) else (
+        payload.get("tasks") if isinstance(payload, dict) else None)
+    if not isinstance(rows, list):
+        raise ProjectCapacityError(
+            f"scheduler returned an invalid {source} task inventory")
+    return rows
+
+
+def live_project_submission_snapshot(required_hard_cap=MFT_PROJECT_MAX_ACTIVE_TASKS):
+    """Read the absolute logical-project budget while the mutation lock is held."""
+    if not campaign_mutation_lock_is_held():
+        raise ProjectCapacityError(
+            "MFT project capacity must be checked under the campaign mutation lock")
+    project = require_live_project_mutation_contract()
+    statuses = ",".join(MFT_ACTIVE_STATUSES)
+    try:
+        project_tasks = _task_rows(requests.get(
+            f"{SCHEDULER}/api/tasks",
+            params={
+                "limit": 10000,
+                "project": MFT_PROJECT,
+                "status": statuses,
+            },
+            timeout=30,
+        ), "MFT project")
+        legacy_tasks = _task_rows(requests.get(
+            f"{SCHEDULER}/api/tasks",
+            params={
+                "limit": 10000,
+                "name_prefix": LEGACY_MFT_NAME_PREFIX,
+                "status": statuses,
+            },
+            timeout=30,
+        ), "legacy MFT")
+    except ProjectCapacityError:
+        raise
+    except Exception as exc:
+        raise ProjectCapacityError(
+            f"failed to read MFT project task capacity: {exc}") from exc
+    return project_submission_snapshot(
+        [project], project_tasks, required_hard_cap, legacy_tasks=legacy_tasks)
+
+
 def reconcile_task_id(name, dedupe_key, attempts=3, retry_delay=1):
-    """Find the newest exact task identity, including terminal tasks."""
+    """Find the newest exact task identity, including projectless legacy rows."""
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
             response = requests.get(
                 f"{SCHEDULER}/api/tasks",
-                params={"limit": 10000, "name_prefix": name},
+                params={
+                    "limit": 10000,
+                    "name_prefix": name,
+                },
                 timeout=30,
             )
             response.raise_for_status()
@@ -85,9 +325,29 @@ def reconcile_task_id(name, dedupe_key, attempts=3, retry_delay=1):
             tasks = payload if isinstance(payload, list) else payload.get("tasks", [])
             if not isinstance(tasks, list):
                 raise ValueError("task inventory is not a list")
-            matches = [
+            exact = [
                 task for task in tasks
-                if task.get("name") == name and task.get("dedupe_key") == dedupe_key
+                if isinstance(task, dict)
+                and task.get("name") == name
+                and task.get("dedupe_key") == dedupe_key
+            ]
+            foreign = [
+                task for task in exact
+                if str(task.get("project") or "").strip()
+                not in ("", MFT_PROJECT)
+            ]
+            if foreign:
+                projects = sorted({
+                    str(task.get("project") or "").strip()
+                    for task in foreign
+                })
+                raise ValueError(
+                    f"exact task identity exists outside {MFT_PROJECT!r}: "
+                    f"{projects}")
+            matches = [
+                task for task in exact
+                if str(task.get("project") or "").strip()
+                in ("", MFT_PROJECT)
             ]
             if not matches:
                 return None
@@ -115,25 +375,75 @@ def effective_verification_params(params, profile):
     return merged
 
 
-def submit_verification(
-        name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
-        solver_revision=None, library_revision=None):
-    """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
-    if not isinstance(solver_revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", solver_revision):
+def verification_submission_identity(
+        name, params, profile, solver_revision, library_revision):
+    """Return the one canonical payload/dedupe identity used for reconciliation."""
+    if (not isinstance(solver_revision, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", solver_revision)):
         raise ValueError("solver_revision must be a full 40-character git SHA")
+    if (not isinstance(library_revision, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", library_revision)):
+        raise ValueError(
+            "library_revision must be a full 40-character git SHA")
     solver_revision = solver_revision.lower()
-    if not isinstance(library_revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", library_revision):
-        raise ValueError("library_revision must be a full 40-character git SHA")
     library_revision = library_revision.lower()
     merged = effective_verification_params(params, profile)
-    timeout_seconds = int(profile.get(
-        "timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS))
-    if timeout_seconds <= 0:
-        raise ValueError("verification timeout_seconds must be positive")
     pjson = json.dumps(merged, separators=(",", ":"))
     parameter_digest = hashlib.sha256(pjson.encode("utf-8")).hexdigest()[:16]
     dedupe_key = (
         f"mft-al:{name}:{solver_revision}:{library_revision}:{parameter_digest}")
+    return {
+        "solver_revision": solver_revision,
+        "library_revision": library_revision,
+        "merged": merged,
+        "parameter_json": pjson,
+        "parameter_digest": parameter_digest,
+        "dedupe_key": dedupe_key,
+    }
+
+
+def verification_dedupe_key(
+        name, params, profile, solver_revision, library_revision):
+    return verification_submission_identity(
+        name, params, profile, solver_revision, library_revision)["dedupe_key"]
+
+
+def submit_verification(
+        name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
+        solver_revision=None, library_revision=None):
+    """Submit one MFT task under the shared cross-process mutation lock."""
+    if campaign_mutation_lock_is_held():
+        return _submit_verification_locked(
+            name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
+            solver_revision=solver_revision,
+            library_revision=library_revision,
+        )
+    with campaign_mutation_lock():
+        return _submit_verification_locked(
+            name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
+            solver_revision=solver_revision,
+            library_revision=library_revision,
+        )
+
+
+def _submit_verification_locked(
+        name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
+        solver_revision=None, library_revision=None):
+    """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
+    if not campaign_mutation_lock_is_held():
+        raise RuntimeError("MFT task mutation requires the campaign mutation lock")
+    identity = verification_submission_identity(
+        name, params, profile, solver_revision, library_revision)
+    solver_revision = identity["solver_revision"]
+    library_revision = identity["library_revision"]
+    merged = identity["merged"]
+    timeout_seconds = int(profile.get(
+        "timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS))
+    if timeout_seconds <= 0:
+        raise ValueError("verification timeout_seconds must be positive")
+    pjson = identity["parameter_json"]
+    parameter_digest = identity["parameter_digest"]
+    dedupe_key = identity["dedupe_key"]
     extra = profile.get("cli_flags", "")
     run_identity = (
         f"s{solver_revision[:12]}-l{library_revision[:12]}-p{parameter_digest}")
@@ -217,7 +527,8 @@ def submit_verification(
         + " )"
     )
     payload = {
-        "name": name, "remote_cwd": GPFS_RUNS_REMOTE_CWD,
+        "name": name, "project": MFT_PROJECT,
+        "remote_cwd": GPFS_RUNS_REMOTE_CWD,
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
         "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
         "timeout_seconds": timeout_seconds,
@@ -229,6 +540,11 @@ def submit_verification(
     existing = reconcile_task_id(name, dedupe_key)
     if existing is not None:
         return existing
+    capacity = live_project_submission_snapshot(MFT_PROJECT_MAX_ACTIVE_TASKS)
+    if capacity["project_submission_slots"] < 1:
+        raise ProjectCapacityError(
+            f"MFT project has no submission slots under cap "
+            f"{MFT_PROJECT_MAX_ACTIVE_TASKS}: {capacity}")
     try:
         r = requests.post(f"{SCHEDULER}/api/tasks", json=payload, timeout=20)
     except Exception as post_error:
