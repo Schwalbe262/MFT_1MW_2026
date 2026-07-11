@@ -1016,6 +1016,10 @@ def run_thermal_analysis(sim):
     mode = str(df["thermal_symmetry"].iloc[0])
     eighth = mode == "eighth"
 
+    # Copied Maxwell loss extraction can leave pyProject's cached gRPC proxy
+    # stale even though the original Desktop session remains healthy. Rebind
+    # the exact project before pyDesign asks project.name while creating Icepak.
+    sim._rebind_native_project_for_design_creation()
     ipk = sim.project.create_design(name="icepak_thermal", solver="icepak",
                                     solution="SteadyState TemperatureAndFlow")
     sim.design_thermal = ipk

@@ -237,8 +237,10 @@ class ThermalStabilityTest(unittest.TestCase):
         )
         wrapper = _DesignWrapper(ipk)
         project = SimpleNamespace(create_design=lambda **_kwargs: wrapper)
+        rebind_project = Mock()
         sim = SimpleNamespace(
             project=project,
+            _rebind_native_project_for_design_creation=rebind_project,
             df_plus=pd.DataFrame({
                 "thermal_symmetry": ["eighth"],
                 "thermal_max_iterations": [100],
@@ -293,6 +295,7 @@ class ThermalStabilityTest(unittest.TestCase):
             ))
             stack.enter_context(patch("time.sleep"))
             result = thermal.run_thermal_analysis(sim)
+        rebind_project.assert_called_once_with()
         return ipk, result.iloc[0]
 
     @staticmethod

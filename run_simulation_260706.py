@@ -1010,6 +1010,87 @@ class Simulation():
 
         raise RuntimeError("native AEDT project handle is unavailable")
 
+    def _rebind_native_project_for_design_creation(
+            self, max_attempts=3, retry_delay=0.5, sleeper=time.sleep):
+        """Rebind a stale pyProject handle before creating the next design."""
+        max_attempts = int(max_attempts)
+        if max_attempts < 1:
+            raise ValueError("project rebind max_attempts must be positive")
+        expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        project_wrapper = getattr(self, "project", None)
+        try:
+            project_state = vars(project_wrapper)
+        except TypeError:
+            project_state = {}
+        if not expected_project or not project_state:
+            raise RuntimeError("project wrapper identity is unavailable for native rebind")
+
+        odesktop = self._native_desktop_handle()
+        set_active_project = getattr(odesktop, "SetActiveProject", None)
+        if not callable(set_active_project):
+            raise RuntimeError("native Desktop cannot activate a project")
+
+        errors = []
+        missing = object()
+        for attempt in range(1, max_attempts + 1):
+            previous_project = project_state.get("project", missing)
+            previous_proj = project_state.get("proj", missing)
+            rebound = False
+
+            def restore_previous_binding():
+                for key, previous in (
+                        ("project", previous_project), ("proj", previous_proj)):
+                    if previous is missing:
+                        project_state.pop(key, None)
+                    else:
+                        project_state[key] = previous
+
+            try:
+                native_project = set_active_project(expected_project)
+                if native_project is None or native_project is False:
+                    raise RuntimeError(
+                        f"SetActiveProject returned no project ({expected_project})"
+                    )
+                actual_project = str(native_project.GetName() or "").strip()
+                if actual_project != expected_project:
+                    raise _AedtIdentityMismatch(
+                        "thermal project identity mismatch: "
+                        f"expected={expected_project}, "
+                        f"actual={actual_project or '<empty>'}"
+                    )
+
+                project_state["project"] = native_project
+                project_state["proj"] = native_project
+                rebound = True
+                rebound_name = str(project_wrapper.name or "").strip()
+                if rebound_name != expected_project:
+                    raise _AedtIdentityMismatch(
+                        "rebound project identity mismatch: "
+                        f"expected={expected_project}, "
+                        f"actual={rebound_name or '<empty>'}"
+                    )
+                return native_project
+            except _AedtIdentityMismatch:
+                if rebound:
+                    restore_previous_binding()
+                raise
+            except Exception as error:
+                if rebound:
+                    restore_previous_binding()
+                errors.append(
+                    f"attempt {attempt}: {type(error).__name__}: {error}"
+                )
+                if attempt < max_attempts:
+                    logging.warning(
+                        "native project rebind failed "
+                        f"(attempt {attempt}/{max_attempts}): {error}"
+                    )
+                    sleeper(max(0.0, float(retry_delay)) * (2 ** (attempt - 1)))
+        raise RuntimeError(
+            "native project rebind failed before design creation: "
+            + "; ".join(errors)
+        )
+
     def create_design(self, name="maxwell_design"):
         self.design1 = self.project.create_design(name=name, solver="maxwell3d", solution="AC Magnetic")
 

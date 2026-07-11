@@ -33,6 +33,7 @@ from module.thermal_260706 import (
     _partition_rx_turns,
     _rx_layout,
     _volume_weighted_powers,
+    run_thermal_analysis,
 )
 
 
@@ -1598,6 +1599,171 @@ class NativeProjectHandleTests(unittest.TestCase):
         simulation.save_project()
 
         self.assertEqual(calls, [("save", None)])
+
+    @staticmethod
+    def _project_wrapper(native_project, desktop):
+        class ProjectWrapper:
+            def __init__(self):
+                self.project = native_project
+                self.proj = native_project
+                self.desktop = SimpleNamespace(odesktop=desktop)
+
+            @property
+            def name(self):
+                return self.project.GetName()
+
+        return ProjectWrapper()
+
+    def test_rebinds_stale_project_before_design_creation(self):
+        stale = SimpleNamespace(
+            GetName=Mock(side_effect=RuntimeError("stale GetName"))
+        )
+        fresh = SimpleNamespace(GetName=Mock(return_value="simulation_test"))
+        set_active_project = Mock(return_value=fresh)
+        desktop = SimpleNamespace(SetActiveProject=set_active_project)
+        simulation = Simulation.__new__(Simulation)
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.desktop = SimpleNamespace(odesktop=desktop)
+        simulation.project = self._project_wrapper(stale, desktop)
+
+        result = simulation._rebind_native_project_for_design_creation()
+
+        self.assertIs(result, fresh)
+        self.assertIs(simulation.project.project, fresh)
+        self.assertIs(simulation.project.proj, fresh)
+        self.assertEqual(fresh.GetName.call_count, 2)
+        stale.GetName.assert_not_called()
+        set_active_project.assert_called_once_with("simulation_test")
+
+    def test_project_rebind_retries_only_before_design_creation(self):
+        fresh = SimpleNamespace(GetName=Mock(return_value="simulation_test"))
+        set_active_project = Mock(
+            side_effect=[RuntimeError("transient transport"), fresh]
+        )
+        desktop = SimpleNamespace(SetActiveProject=set_active_project)
+        stale = SimpleNamespace(GetName=Mock(side_effect=RuntimeError("stale")))
+        sleeper = Mock()
+        simulation = Simulation.__new__(Simulation)
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.desktop = SimpleNamespace(odesktop=desktop)
+        simulation.project = self._project_wrapper(stale, desktop)
+
+        result = simulation._rebind_native_project_for_design_creation(
+            max_attempts=3, retry_delay=0.5, sleeper=sleeper
+        )
+
+        self.assertIs(result, fresh)
+        self.assertEqual(set_active_project.call_count, 2)
+        sleeper.assert_called_once_with(0.5)
+
+    def test_project_rebind_rolls_back_partial_binding_before_retry(self):
+        stale = SimpleNamespace(GetName=Mock(side_effect=RuntimeError("stale")))
+        first = SimpleNamespace(GetName=Mock(side_effect=[
+            "simulation_test", RuntimeError("transient rebound readback")
+        ]))
+        second = SimpleNamespace(GetName=Mock(return_value="simulation_test"))
+        responses = iter([first, second])
+        observed_bindings = []
+        desktop = SimpleNamespace()
+        simulation = Simulation.__new__(Simulation)
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.desktop = SimpleNamespace(odesktop=desktop)
+        simulation.project = self._project_wrapper(stale, desktop)
+
+        def set_active_project(_name):
+            observed_bindings.append(simulation.project.project)
+            return next(responses)
+
+        desktop.SetActiveProject = Mock(side_effect=set_active_project)
+
+        result = simulation._rebind_native_project_for_design_creation(
+            max_attempts=2, retry_delay=0, sleeper=lambda _seconds: None
+        )
+
+        self.assertIs(result, second)
+        self.assertEqual(observed_bindings, [stale, stale])
+        self.assertIs(simulation.project.project, second)
+        self.assertIs(simulation.project.proj, second)
+
+    def test_project_rebind_exhaustion_preserves_original_handles(self):
+        stale = SimpleNamespace(GetName=Mock(side_effect=RuntimeError("stale")))
+        set_active_project = Mock(side_effect=RuntimeError("permanent transport"))
+        desktop = SimpleNamespace(SetActiveProject=set_active_project)
+        sleeper = Mock()
+        simulation = Simulation.__new__(Simulation)
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.desktop = SimpleNamespace(odesktop=desktop)
+        simulation.project = self._project_wrapper(stale, desktop)
+
+        with self.assertRaisesRegex(RuntimeError, "rebind failed before design creation"):
+            simulation._rebind_native_project_for_design_creation(
+                max_attempts=3, retry_delay=0.5, sleeper=sleeper
+            )
+
+        self.assertEqual(set_active_project.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleeper.call_args_list],
+            [0.5, 1.0],
+        )
+        self.assertIs(simulation.project.project, stale)
+        self.assertIs(simulation.project.proj, stale)
+
+    def test_project_rebind_requires_positive_attempt_count(self):
+        simulation = Simulation.__new__(Simulation)
+
+        with self.assertRaisesRegex(ValueError, "max_attempts must be positive"):
+            simulation._rebind_native_project_for_design_creation(max_attempts=0)
+
+    def test_project_rebind_identity_mismatch_fails_without_retry(self):
+        stale = SimpleNamespace(GetName=Mock(side_effect=RuntimeError("stale")))
+        wrong = SimpleNamespace(GetName=Mock(return_value="another_project"))
+        set_active_project = Mock(return_value=wrong)
+        desktop = SimpleNamespace(SetActiveProject=set_active_project)
+        simulation = Simulation.__new__(Simulation)
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.desktop = SimpleNamespace(odesktop=desktop)
+        simulation.project = self._project_wrapper(stale, desktop)
+
+        with self.assertRaisesRegex(RuntimeError, "thermal project identity mismatch"):
+            simulation._rebind_native_project_for_design_creation(
+                max_attempts=3, retry_delay=0, sleeper=lambda _seconds: None
+            )
+
+        set_active_project.assert_called_once_with("simulation_test")
+        self.assertIs(simulation.project.project, stale)
+        self.assertIs(simulation.project.proj, stale)
+
+    def test_thermal_entry_rebinds_before_icepak_creation(self):
+        class StopAfterCreate(Exception):
+            pass
+
+        events = []
+        analyze = Mock(side_effect=AssertionError("thermal recovery must not re-solve EM"))
+        solve_attempts = {"matrix": 1, "loss": 1}
+
+        def stop_after_create(**_kwargs):
+            events.append("create")
+            raise StopAfterCreate()
+
+        create_design = Mock(side_effect=stop_after_create)
+        simulation = SimpleNamespace(
+            df_plus=pd.DataFrame({"thermal_symmetry": ["eighth"]}),
+            design1=SimpleNamespace(setup=SimpleNamespace(analyze=analyze)),
+            solve_attempts=solve_attempts,
+            _rebind_native_project_for_design_creation=lambda: events.append("rebind"),
+            project=SimpleNamespace(create_design=create_design),
+        )
+
+        with self.assertRaises(StopAfterCreate):
+            run_thermal_analysis(simulation)
+
+        self.assertEqual(events, ["rebind", "create"])
+        create_design.assert_called_once_with(
+            name="icepak_thermal", solver="icepak",
+            solution="SteadyState TemperatureAndFlow",
+        )
+        self.assertEqual(simulation.solve_attempts, {"matrix": 1, "loss": 1})
+        analyze.assert_not_called()
 
 
 class FieldsReporterTests(unittest.TestCase):
