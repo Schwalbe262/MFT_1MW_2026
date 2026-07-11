@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "training"))
 
 from optimization.nsga2_problem import MFTProblem, T_TARGETS, DEFAULT_SPEC  # noqa: E402
+from module.input_parameter_260706 import _SOBOL_DIMS  # noqa: E402
 
 REQUIRED_MODEL_TARGETS = [
     "Llt_phys", "k",
@@ -40,6 +41,30 @@ def _sha256(path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _sobol_schema():
+    payload = [
+        {"name": name, "lower": float(lower), "upper": float(upper)}
+        for name, lower, upper in _SOBOL_DIMS
+    ]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return payload, hashlib.sha256(encoded).hexdigest()
+
+
+def _load_compatible_warm_start(path, n_var):
+    if not os.path.isfile(path):
+        return None
+    warm = np.load(path)
+    if warm.ndim != 2 or warm.shape[1] != int(n_var):
+        print(
+            f"warm start ignored: {path} has shape {warm.shape}, "
+            f"expected (*, {n_var})"
+        )
+        return None
+    return warm
 
 
 def _recomputed_strict_full_rows(
@@ -225,7 +250,8 @@ def main():
     warm = None
     prev = os.path.join(args.output_root, f"round_{args.round - 1:02d}", "pareto_X.npy")
     if os.path.isfile(prev):
-        warm = np.load(prev)
+        warm = _load_compatible_warm_start(prev, problem.n_var)
+    if warm is not None:
         print(f"warm start: {len(warm)} points from round {args.round - 1}")
 
     F_list, X_list, feasible_counts = [], [], []
@@ -273,6 +299,7 @@ def main():
         for target in REQUIRED_MODEL_TARGETS
     }
 
+    sobol_schema, sobol_schema_sha256 = _sobol_schema()
     with open(os.path.join(out_dir, "optimization_manifest.json"), "w", encoding="utf-8") as handle:
         json.dump({
             "training_run_id": quality.get("training_run_id"),
@@ -297,6 +324,8 @@ def main():
             "pareto_front_sha256": _sha256(front_path),
             "pareto_X_sha256": _sha256(pareto_x_path),
             "pareto_F_sha256": _sha256(pareto_f_path),
+            "sobol_schema": sobol_schema,
+            "sobol_schema_sha256": sobol_schema_sha256,
             "required_models": REQUIRED_MODEL_TARGETS,
             "restarts": args.restarts,
             "population": args.pop,

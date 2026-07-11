@@ -12,7 +12,8 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
     설계도면260706 반영 코어 생성.
 
     코어를 y방향(깊이)으로 n_group개 조로 분할하고, 각 조 사이/바깥에
-    좌우 외측 레그용 I자 콜드플레이트 조립체 두 개씩을 삽입한다.
+    외측 side leg와 center leg용 I자 콜드플레이트를 삽입한다. 전체 모델은
+    좌우 side 두 개와 center 한 개, x<=0 대칭 모델은 side+center 두 개다.
         w1 = n_group*d + (n_group+1)*(core_plate_t + 2*core_plate_pad_t)
     즉 디자인 변수 w1은 "코어 + 콜드플레이트 전체 깊이"를 의미한다.
 
@@ -21,7 +22,7 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
     3층으로 만들어 코어 면에 밀착시킨다. core_plate_pad_t = 0 이면 단일 판.
 
     코어 조만 창 2개를 subtract해 기존 자로를 유지한다. 플레이트/패드는
-    창 외측의 두 직선형 I자로 만들어 상·하부 yoke를 감싸지 않는다.
+    side/center leg의 직선형 I자로 만들어 상·하부 yoke를 감싸지 않는다.
 
     Returns:
         (core_objs, plate_objs, pad_objs)  - plate_objs는 알루미늄 판만
@@ -47,12 +48,15 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
         core_objs.append(core)
 
     if plate_on:
-        # Core-side cooling is a pair of straight I plates on the two outer
-        # legs. Unlike the core body, these plates are never window-subtracted
-        # into the former U-frame shape.
+        # Core-side cooling uses the two unique I plates visible in the x<=0
+        # symmetry half: one on the outer side leg and one on the center leg.
+        # Build the mirrored outer-side plate as well so full_model geometry is
+        # physically complete. Unlike the core body, none of these plates is
+        # window-subtracted into the former U-frame shape.
         i_plate_x = (
-            ("left", "-(2*l1+l2)"),
-            ("right", "(l1+l2)"),
+            ("side_left", "-(2*l1+l2)", "l1"),
+            ("center", "-l1", "2*l1"),
+            ("side_right", "(l1+l2)", "l1"),
         )
         for i in range(n_group + 1):
             y0 = f"(-w1/2 + {i}*({stack_expr} + {d_expr}))"
@@ -69,10 +73,10 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
                     (f"({y0})", "core_plate_t", plate_material, f"{name}_plate_{i + 1}"),
                 ]
             for y_start, t_expr, mat, obj_name in layers:
-                for side, x0 in i_plate_x:
+                for side, x0, width in i_plate_x:
                     obj = design.modeler.create_box(
                         origin=[x0, y_start, "-(h1+2*l1)/2"],
-                        sizes=["l1", t_expr, "h1+2*l1"],
+                        sizes=[width, t_expr, "h1+2*l1"],
                         name=f"{obj_name}_{side}",
                         material=mat
                     )

@@ -320,6 +320,140 @@ class ThermalStabilityTest(unittest.TestCase):
             "fan_config": ["dual"],
         }))
 
+    @staticmethod
+    def _probe_frame(n_group):
+        # A compact, fully derived geometry row exercises the real probe
+        # placement formulas without opening AEDT.
+        from module.input_parameter_260706 import (
+            create_input_parameter,
+            get_drawing_default_params,
+            validation_check,
+        )
+
+        params = get_drawing_default_params()
+        params["n_core_group"] = n_group
+        ok, frame = validation_check(
+            create_input_parameter(params), strict=True
+        )
+        if not ok:
+            raise AssertionError("probe test fixture did not validate")
+        return frame
+
+    def test_core_probe_depth_uses_core_not_central_plate(self):
+        odd = self._probe_frame(3)
+        self.assertEqual(thermal._core_probe_y_positions(odd, "eighth"), [0.0])
+
+        even = self._probe_frame(4)
+        stack_t = (
+            float(even["core_plate_t"].iloc[0])
+            + 2.0 * float(even["core_plate_pad_t"].iloc[0])
+        )
+        expected = 0.5 * (
+            float(even["core_depth_each"].iloc[0]) + stack_t
+        )
+        self.assertEqual(
+            thermal._core_probe_y_positions(even, "eighth"), [expected]
+        )
+        self.assertEqual(
+            thermal._core_probe_y_positions(even, "quarter"), [expected]
+        )
+        self.assertEqual(
+            thermal._core_probe_y_positions(even, "full"),
+            [-expected, expected],
+        )
+
+    def test_probe_sheets_cover_center_and_outer_side_legs(self):
+        frame = self._probe_frame(4)
+        calls = []
+
+        def create_rectangle(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(name=kwargs["name"], is3d=False, model=True)
+
+        ipk = SimpleNamespace(
+            modeler=SimpleNamespace(create_rectangle=create_rectangle)
+        )
+        sheets = thermal._create_probe_sheets(
+            ipk, frame, {}, eighth=True, mode="eighth"
+        )
+        names = {sheet.name for sheet in sheets}
+        self.assertIn("Tprobe_core_center_leg", names)
+        self.assertIn("Tprobe_core_side_leg", names)
+        self.assertIn("Tprobe_core_top_yoke", names)
+        by_name = {call["name"]: call for call in calls}
+        center = by_name["Tprobe_core_center_leg"]
+        side = by_name["Tprobe_core_side_leg"]
+        top_yoke = by_name["Tprobe_core_top_yoke"]
+        expected_y = thermal._core_probe_y_positions(frame, "eighth")[0]
+        self.assertAlmostEqual(float(center["origin"][1][:-2]), expected_y)
+        self.assertAlmostEqual(float(side["origin"][1][:-2]), expected_y)
+        self.assertAlmostEqual(float(top_yoke["origin"][1][:-2]), expected_y)
+        l1 = float(frame["l1"].iloc[0])
+        l2 = float(frame["l2"].iloc[0])
+        self.assertAlmostEqual(
+            float(side["origin"][0][:-2]),
+            -(2.0 * l1 + l2) + 0.05 * l1,
+        )
+        self.assertAlmostEqual(
+            float(top_yoke["origin"][2][:-2]),
+            float(frame["h1"].iloc[0]) / 2.0 + 0.05 * l1,
+        )
+
+    def test_core_probe_aggregates_center_and_side_legs(self):
+        complete = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+            "Tprobe_core_center_leg": (84.0, 78.0),
+            "Tprobe_core_side_leg": (89.0, 81.0),
+            "Tprobe_core_top_yoke": (92.0, 85.0),
+        }
+        _ipk, row = self._run(
+            None,
+            [complete],
+            probe_names=[
+                "Tprobe_core_center_leg",
+                "Tprobe_core_side_leg",
+                "Tprobe_core_top_yoke",
+            ],
+        )
+        self.assertEqual(row["Tprobe_core_center_leg_max"], 84.0)
+        self.assertEqual(row["Tprobe_core_side_leg_max"], 89.0)
+        self.assertEqual(row["Tprobe_core_top_yoke_max"], 92.0)
+        self.assertEqual(row["Tprobe_core_center_max"], 92.0)
+        self.assertEqual(row["Tprobe_core_center_mean"], 85.0)
+        self.assertEqual(row["thermal_extraction_complete"], 1)
+
+    def test_even_full_core_probe_selects_hottest_depth_and_leg(self):
+        complete = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+            "Tprobe_core_center_leg_neg": (83.0, 77.0),
+            "Tprobe_core_center_leg_pos": (86.0, 79.0),
+            "Tprobe_core_side_leg_neg": (90.0, 82.0),
+            "Tprobe_core_side_leg_pos": (88.0, 80.0),
+            "Tprobe_core_top_yoke_neg": (92.0, 84.0),
+            "Tprobe_core_top_yoke_pos": (91.0, 83.0),
+        }
+        _ipk, row = self._run(
+            None,
+            [complete],
+            probe_names=[
+                "Tprobe_core_center_leg_neg",
+                "Tprobe_core_center_leg_pos",
+                "Tprobe_core_side_leg_neg",
+                "Tprobe_core_side_leg_pos",
+                "Tprobe_core_top_yoke_neg",
+                "Tprobe_core_top_yoke_pos",
+            ],
+        )
+        self.assertEqual(row["Tprobe_core_center_leg_max"], 86.0)
+        self.assertEqual(row["Tprobe_core_side_leg_max"], 90.0)
+        self.assertEqual(row["Tprobe_core_top_yoke_max"], 92.0)
+        self.assertEqual(row["Tprobe_core_center_max"], 92.0)
+        self.assertEqual(row["Tprobe_core_center_mean"], 84.0)
+
     def test_none_and_false_analyze_returns_are_validated_from_data(self):
         complete = {
             "Tx_main_0": (81.0, 70.0),

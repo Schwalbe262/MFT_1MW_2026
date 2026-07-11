@@ -95,7 +95,9 @@ def filter_valid_training_rows(df, target, profile=None):
 
 def to_physical(df):
     """대칭 매트릭스 L 컬럼 -> 실물 (x2). 손실/B는 이미 _phys로 기록됨."""
-    out = df.copy()
+    from campaign.train_io import add_wcp_length_features
+
+    out = add_wcp_length_features(df)
     sym = out.get("full_model", 0).fillna(0).astype(float) == 0
     for c in ["Ltx", "Lrx", "M", "Lmt", "Lmr", "Llt", "Llr"]:
         if c in out.columns:

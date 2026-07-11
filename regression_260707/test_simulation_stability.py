@@ -29,7 +29,10 @@ from run_simulation_260706 import (
 from module.input_parameter_260706 import (
     COLD_PLATE_MAX_T_MM,
     COLD_PLATE_MIN_T_MM,
+    KEYS,
     N1_MAX_TURNS,
+    WCP_LENGTH_MAX_PCT,
+    WCP_LENGTH_MIN_PCT,
     _SOBOL_DIMS,
     create_input_parameter,
     decode_unit_sample,
@@ -130,6 +133,40 @@ class PrimaryTurnDomainTests(unittest.TestCase):
         self.assertEqual(decoded_high["wcp_t"], COLD_PLATE_MAX_T_MM)
         self.assertEqual(decoded_high["core_plate_t"], COLD_PLATE_MIN_T_MM)
 
+    def test_winding_plate_length_varies_as_percent_and_records_mm(self):
+        midpoint = {
+            key: lo + 0.5 * (hi - lo) for key, lo, hi in _SOBOL_DIMS
+        }
+        for requested_pct in (WCP_LENGTH_MIN_PCT, 50.0, WCP_LENGTH_MAX_PCT):
+            sample = dict(midpoint, wcp_len_pct=requested_pct)
+            decoded = decode_unit_sample(sample)
+            ok, frame = validation_check(
+                create_input_parameter({key: decoded[key] for key in KEYS}),
+                strict=True,
+            )
+            self.assertTrue(ok)
+            reference_mm = float(frame["wcp_len_ref_x"].iloc[0])
+            length_mm = float(frame["wcp_len_x"].iloc[0])
+            actual_pct = float(frame["wcp_len_pct"].iloc[0])
+            self.assertAlmostEqual(
+                length_mm, reference_mm * requested_pct / 100.0, delta=0.11
+            )
+            self.assertAlmostEqual(actual_pct, requested_pct, delta=0.05)
+
+    def test_fixed_winding_plate_mm_is_back_converted_and_range_checked(self):
+        params = get_drawing_default_params()
+        ok, valid = validation_check(create_input_parameter(params), strict=True)
+        self.assertTrue(ok)
+        reference_mm = float(valid["wcp_len_ref_x"].iloc[0])
+        self.assertAlmostEqual(
+            float(valid["wcp_len_pct"].iloc[0]),
+            100.0 * float(valid["wcp_len_x"].iloc[0]) / reference_mm,
+        )
+
+        params["wcp_len_x"] = 0.1 * reference_mm
+        with self.assertRaisesRegex(ValueError, "wcp_len_pct.*outside"):
+            validation_check(create_input_parameter(params), strict=True)
+
     def test_winding_plate_slot_adds_two_independent_pad_layers(self):
         params = get_drawing_default_params()
         params.update({"N1_main": 6, "N1_side": 0,
@@ -167,15 +204,31 @@ class ColdPlateGeometryTests(unittest.TestCase):
         cores, plates, pads = create_core_geometry(
             design, n_group=1, plate_on=True, pad_on=True)
         self.assertEqual(len(cores), 1)
-        self.assertEqual(len(plates), 4)  # two y stacks x left/right I plates
-        self.assertEqual(len(pads), 8)    # two 2T pads per aluminum I plate
-        self.assertTrue(all(
-            plate.name.endswith(("_left", "_right")) for plate in plates))
+        # Two y stacks x (left side, center, mirrored right side). The retained
+        # x<=0 solver domain contains the requested side+center pair.
+        self.assertEqual(len(plates), 6)
+        self.assertEqual(len(pads), 12)
+        self.assertEqual(
+            {plate.name.rsplit("_", 2)[-1] for plate in plates},
+            {"left", "center", "right"},
+        )
         plate_boxes = [box for box in design.modeler.boxes
                        if box["object"] in plates]
         pad_boxes = [box for box in design.modeler.boxes
                      if box["object"] in pads]
-        self.assertTrue(all(box["sizes"][0] == "l1" for box in plate_boxes))
+        center_boxes = [box for box in plate_boxes
+                        if box["name"].endswith("_center")]
+        side_boxes = [box for box in plate_boxes
+                      if "_side_" in box["name"]]
+        self.assertTrue(all(box["sizes"][0] == "2*l1"
+                            for box in center_boxes))
+        self.assertTrue(all(box["sizes"][0] == "l1" for box in side_boxes))
+        self.assertTrue(all(box["origin"][0] == "-l1"
+                            for box in center_boxes))
+        self.assertEqual(
+            {box["origin"][0] for box in side_boxes},
+            {"-(2*l1+l2)", "(l1+l2)"},
+        )
         self.assertTrue(all(box["sizes"][1] == "core_plate_t"
                             for box in plate_boxes))
         self.assertTrue(all(box["sizes"][1] == "core_plate_pad_t"
@@ -193,18 +246,22 @@ class ColdPlateGeometryTests(unittest.TestCase):
             "core_plate_t": 20.0,
             "core_plate_pad_t": 2.0,
         }])
-        self.assertEqual(simulation._sym_cut_count("core_plate_2_left"), 2)
-        self.assertEqual(simulation._mirror_mult("core_plate_2_left"), 2.0)
-        self.assertEqual(simulation._sym_cut_count("core_plate_1_left"), 1)
-        self.assertEqual(simulation._mirror_mult("core_plate_1_left"), 4.0)
+        self.assertEqual(simulation._sym_cut_count("core_plate_2_side_left"), 2)
+        self.assertEqual(simulation._mirror_mult("core_plate_2_side_left"), 2.0)
+        self.assertEqual(simulation._sym_cut_count("core_plate_1_side_left"), 1)
+        self.assertEqual(simulation._mirror_mult("core_plate_1_side_left"), 4.0)
+        self.assertEqual(simulation._sym_cut_count("core_plate_2_center"), 3)
+        self.assertEqual(simulation._mirror_mult("core_plate_2_center"), 1.0)
+        self.assertEqual(simulation._sym_cut_count("core_plate_1_center"), 2)
+        self.assertEqual(simulation._mirror_mult("core_plate_1_center"), 2.0)
         self.assertEqual(
-            simulation._phys_factor("P_core_plate_2_left", False)
-            * simulation._mirror_mult("core_plate_2_left"),
+            simulation._phys_factor("P_core_plate_2_side_left", False)
+            * simulation._mirror_mult("core_plate_2_side_left"),
             2.0,
         )
         self.assertEqual(
-            simulation._phys_factor("P_core_plate_1_left", False)
-            * simulation._mirror_mult("core_plate_1_left"),
+            simulation._phys_factor("P_core_plate_1_center", False)
+            * simulation._mirror_mult("core_plate_1_center"),
             2.0,
         )
 

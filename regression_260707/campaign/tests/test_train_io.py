@@ -24,6 +24,12 @@ def raw_rows():
             "N1_main": 7,
             "N2_main": 65,
             "N2_side": 5,
+            "wcp_len_x": 178.0,
+            "wcp_len_pct": 99.0,
+            "wcp_len_ref_x": 1.0,
+            "sl1_main_x": 356.0,
+            "round_corner": 0,
+            "corner_radius": 10.0,
             "Ltx": 20.0,
             "Lrx": 2000.0,
             "M": 190.0,
@@ -57,6 +63,10 @@ def raw_rows():
             "N1_main": 7,
             "N2_main": 65,
             "N2_side": 5,
+            "wcp_len_x": 200.0,
+            "sl1_main_x": 500.0,
+            "round_corner": 1,
+            "corner_radius": 10.0,
             "Ltx": 40.0,
             "Lrx": 4000.0,
             "M": 380.0,
@@ -85,7 +95,7 @@ class TrainIoBuilderTests(unittest.TestCase):
         view = train_io.build_train_io(raw)
 
         self.assertEqual(tuple(view.columns), train_io.TRAIN_IO_COLUMNS)
-        self.assertEqual(view["train_io_schema_version"].tolist(), [1, 1])
+        self.assertEqual(view["train_io_schema_version"].tolist(), [2, 2])
         self.assertEqual(
             view["inductance_source_basis"].tolist(),
             ["eighth_symmetry", "full_model"],
@@ -96,6 +106,9 @@ class TrainIoBuilderTests(unittest.TestCase):
         self.assertEqual(view["matrix_skin_mesh"].tolist(), [0, 1])
         self.assertEqual(view["P_winding_total"].tolist(), [4000.0, 4100.0])
         self.assertEqual(view["T_max_Rx_main"].tolist(), [91.0, 90.0])
+        self.assertEqual(view["wcp_len_ref_x"].tolist(), [356.0, 480.0])
+        self.assertAlmostEqual(view.loc[0, "wcp_len_pct"], 50.0)
+        self.assertAlmostEqual(view.loc[1, "wcp_len_pct"], 100.0 / 2.4)
         pd.testing.assert_frame_equal(raw, before)
 
     def test_builder_excludes_dynamic_raw_and_solver_telemetry_columns(self):

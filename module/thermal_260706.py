@@ -641,6 +641,32 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     return objs
 
 
+def _core_probe_y_positions(df, mode):
+    """Return core-group mid-depth planes that contain core, never a plate.
+
+    With an odd group count the middle core is centered at y=0. With an even
+    count the stack centered at y=0 is a cold-plate assembly, so the adjacent
+    core centers are at +/-(d + stack_t)/2. Symmetry models retain only y>=0.
+    """
+    n_group = int(df["n_core_group"].iloc[0])
+    if n_group <= 0:
+        raise ValueError(f"n_core_group must be positive, got {n_group}")
+    w1 = float(df["w1"].iloc[0])
+    plate_t = float(df["core_plate_t"].iloc[0])
+    pad_t = float(df["core_plate_pad_t"].iloc[0])
+    stack_t = plate_t + 2.0 * pad_t
+    core_depth = (w1 - (n_group + 1) * stack_t) / n_group
+    if not math.isfinite(core_depth) or core_depth <= 0:
+        raise ValueError(
+            f"invalid core depth for probes: n={n_group}, w1={w1}, "
+            f"stack_t={stack_t}, depth={core_depth}"
+        )
+    if n_group % 2:
+        return [0.0]
+    offset = 0.5 * (core_depth + stack_t)
+    return [offset] if mode in ("eighth", "quarter") else [-offset, offset]
+
+
 def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
     """
     회귀학습용 온도 프로브 시트 생성 (비모델 - 메시에 영향 없음).
@@ -719,10 +745,44 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
         off = l1 + l2 + l1 / 2
         _rx_probes("side", "Rx_side", -off)
 
-    # ---- 코어: 중심 레그 y=0 단면 ----
+    # ---- 코어: 올바른 깊이 중심에서 center/side leg + top yoke ----
     zc = 0.48 * (h1 + 2 * l1)
     zca, zcb = _z_range(zc)
-    _sheet("Tprobe_core_center", "XZ", [-0.9 * l1, 0, zca], [zcb - zca, 0.9 * l1 if eighth else 1.8 * l1])
+    # Probe both the central and outer side legs at a core mid-depth plane.
+    # y=0 is valid only for odd core-group counts; with an even count it lies
+    # inside the central cold-plate stack instead of inside core material.
+    core_y_positions = _core_probe_y_positions(df, mode)
+    center_x0 = -0.9 * l1
+    center_x_span = 0.9 * l1 if eighth else 1.8 * l1
+    side_x0 = -(2.0 * l1 + l2) + 0.05 * l1
+    side_x_span = 0.9 * l1
+    # The I plates contact the side and center legs, but the upper yoke across
+    # the window between those two strips has no direct plate contact. Probe
+    # that uncooled band explicitly instead of relying on a leg sheet to
+    # happen to catch it.
+    top_yoke_margin = 0.05 * l1
+    top_yoke_x0 = -(l1 + l2) + top_yoke_margin
+    top_yoke_x_span = l2 - 2.0 * top_yoke_margin
+    top_yoke_z0 = h1 / 2.0 + 0.05 * l1
+    top_yoke_z_span = 0.9 * l1
+    for y_core in core_y_positions:
+        if len(core_y_positions) == 1:
+            suffix = ""
+        else:
+            suffix = "_neg" if y_core < 0 else "_pos"
+        _sheet(
+            f"Tprobe_core_center_leg{suffix}", "XZ",
+            [center_x0, y_core, zca], [zcb - zca, center_x_span],
+        )
+        _sheet(
+            f"Tprobe_core_side_leg{suffix}", "XZ",
+            [side_x0, y_core, zca], [zcb - zca, side_x_span],
+        )
+        _sheet(
+            f"Tprobe_core_top_yoke{suffix}", "XZ",
+            [top_yoke_x0, y_core, top_yoke_z0],
+            [top_yoke_z_span, top_yoke_x_span],
+        )
 
     return sheets
 
@@ -1131,7 +1191,30 @@ def run_thermal_analysis(sim):
         probe.append((o, f"T_mean_{o.name}", "mean"))
         probe.append((o, f"T_max_{o.name}", "max"))
 
-    expected_cols = list(dict.fromkeys(col for _, col, _ in probe))
+    field_expected_cols = list(dict.fromkeys(col for _, col, _ in probe))
+    core_region_sheet_names = {
+        "center": [
+            sheet.name for sheet in probe_sheets
+            if sheet.name.startswith("Tprobe_core_center_leg")
+        ],
+        "side": [
+            sheet.name for sheet in probe_sheets
+            if sheet.name.startswith("Tprobe_core_side_leg")
+        ],
+        "top_yoke": [
+            sheet.name for sheet in probe_sheets
+            if sheet.name.startswith("Tprobe_core_top_yoke")
+        ],
+    }
+    aggregate_core_cols = []
+    if all(core_region_sheet_names.values()):
+        aggregate_core_cols = [
+            "Tprobe_core_center_leg_max", "Tprobe_core_center_leg_mean",
+            "Tprobe_core_side_leg_max", "Tprobe_core_side_leg_mean",
+            "Tprobe_core_top_yoke_max", "Tprobe_core_top_yoke_mean",
+            "Tprobe_core_center_max", "Tprobe_core_center_mean",
+        ]
+    expected_cols = list(dict.fromkeys(field_expected_cols + aggregate_core_cols))
     optional_cols = set()
     if int(df["N1_side"].iloc[0]) == 0:
         optional_cols.update({"Tprobe_Tx_side_max", "Tprobe_Tx_side_mean"})
@@ -1246,6 +1329,43 @@ def run_thermal_analysis(sim):
                 pass
         return got
 
+    def _refresh_core_probe_aggregates():
+        """Select the hottest depth plane per leg, then the hottest leg."""
+        selected = {}
+        output_prefixes = {
+            "center": "Tprobe_core_center_leg",
+            "side": "Tprobe_core_side_leg",
+            "top_yoke": "Tprobe_core_top_yoke",
+        }
+        for region, names in core_region_sheet_names.items():
+            if not names:
+                continue
+            candidates = []
+            for name in names:
+                max_col = f"{name}_max"
+                mean_col = f"{name}_mean"
+                if max_col not in temps or mean_col not in temps:
+                    continue
+                maximum = float(temps[max_col])
+                mean = float(temps[mean_col])
+                if math.isfinite(maximum) and math.isfinite(mean):
+                    candidates.append((maximum, mean, name))
+            if len(candidates) != len(names):
+                continue
+            maximum, mean, name = max(candidates, key=lambda item: item[0])
+            prefix = output_prefixes[region]
+            temps[f"{prefix}_max"] = maximum
+            temps[f"{prefix}_mean"] = mean
+            selected[region] = (maximum, mean, name)
+        if len(selected) == len(core_region_sheet_names) == 3:
+            maximum, mean, _name = max(
+                selected.values(), key=lambda item: item[0]
+            )
+            # Preserve the established model/quality-contract target while
+            # making it the hottest value across both physical leg locations.
+            temps["Tprobe_core_center_max"] = maximum
+            temps["Tprobe_core_center_mean"] = mean
+
     field_summary_attempts = 0
     for attempt in range(1, 4):
         missing_entries = [entry for entry in probe if entry[1] not in temps]
@@ -1255,13 +1375,15 @@ def run_thermal_analysis(sim):
         try:
             _activate_thermal_design(ipk)
             temps.update(_field_summary_bulk(missing_entries))
+            _refresh_core_probe_aggregates()
         except Exception as e:
             logging.warning(f"[thermal] field summary attempt {attempt}/3 failed: {e}")
         if all(col in temps for col in required_expected_cols):
             break
         if attempt < 3:
             _time.sleep(10)
-    n_fs = len(temps)
+    _refresh_core_probe_aggregates()
+    n_fs = sum(1 for col in field_expected_cols if col in temps)
 
     n_calc = 0
     calc_attempts = 0

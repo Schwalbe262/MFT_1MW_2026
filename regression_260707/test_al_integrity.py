@@ -1089,7 +1089,13 @@ class IngestIntegrityTests(unittest.TestCase):
             root = Path(directory)
             rdir = root / "al_rounds" / "round_01"
             rdir.mkdir(parents=True)
-            np.save(rdir / "pareto_X.npy", np.array([[0.1, 0.2]]))
+            from module.input_parameter_260706 import _SOBOL_DIMS
+
+            current_point = np.linspace(0.1, 0.9, len(_SOBOL_DIMS))[None, :]
+            np.save(rdir / "pareto_X.npy", current_point)
+            # A persisted pre-schema-extension archive must be ignored instead
+            # of being broadcast/vstacked into the current unit vectors.
+            np.save(root / "al_rounds" / "verified_X.npy", np.array([[0.1, 0.2]]))
             dataset = root / "data" / "dataset" / "train.parquet"
             state = self._state()
             lock_paths = []

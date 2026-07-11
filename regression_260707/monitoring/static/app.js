@@ -281,8 +281,11 @@
     });
     makeChecks($("#dialog-checks"), candidate.constraints);
     const params = $("#dialog-parameters"); params.replaceChildren();
+    const parameterUnits = { wcp_len_pct: "%", wcp_len_x: "mm" };
     Object.entries(candidate.parameters || {}).forEach(([key, value]) => {
-      const item = element("div"); item.append(element("dt", "", key), element("dd", "", number(value, Number.isInteger(value) ? 0 : 3))); params.append(item);
+      const rendered = number(value, Number.isInteger(value) ? 0 : 3);
+      const unit = parameterUnits[key] || "";
+      const item = element("div"); item.append(element("dt", "", key), element("dd", "", `${rendered}${unit ? ` ${unit}` : ""}`)); params.append(item);
     });
     $("#candidate-dialog").showModal();
   }

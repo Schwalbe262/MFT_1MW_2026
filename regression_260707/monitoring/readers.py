@@ -55,7 +55,8 @@ DESIGN_PARAMETER_KEYS = (
     "n_core_group", "core_plate_t", "cw1", "gap1", "cw2", "gap2",
     "nwh1", "nwh2", "cc_w2c_space_x", "cc_w2c_space_y",
     "w2c_w1c_space_x", "w2c_w1c_space_y", "w1c_w2s_gap_x_actual",
-    "w1s_cs_space_x", "cs_w1s_space_y", "h_gap2", "wcp_t", "wcp_len_x",
+    "w1s_cs_space_x", "cs_w1s_space_y", "h_gap2", "wcp_t",
+    "wcp_len_pct", "wcp_len_x",
 )
 INSULATION_KEYS = (
     "cc_w2c_space_x", "cc_w2c_space_y", "w2c_w1c_space_x",

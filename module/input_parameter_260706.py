@@ -9,6 +9,8 @@ N1_MIN_TURNS = 5
 N1_MAX_TURNS = 8
 COLD_PLATE_MIN_T_MM = 10.0
 COLD_PLATE_MAX_T_MM = 30.0
+WCP_LENGTH_MIN_PCT = 20.0
+WCP_LENGTH_MAX_PCT = 80.0
 
 
 # 설계도면260706.pdf 기반 파라미터 스키마.
@@ -68,7 +70,11 @@ def get_drawing_default_params():
         "w1s_cs_space_x": 30.1, "cs_w1s_space_y": 75.6,
         # 권선 냉각 플레이트: 알루미늄 20T + 양면 서멀패드 각 2T.
         # x방향 폭은 도면 미기재로 파라미터화 (기본 2*l1)
-        "wcp_t": 20.0, "wcp_pad_t": 2.0, "wcp_len_x": 178.0, "wcp_on": 1,
+        # Length percentage is referenced to the clear x-direction straight
+        # span inside the innermost Tx_main turn.  The physical geometry still
+        # consumes the resolved millimetre value ``wcp_len_x``.
+        "wcp_t": 20.0, "wcp_pad_t": 2.0,
+        "wcp_len_x": 178.0, "wcp_on": 1,
         # 코어 콜드플레이트: 알루미늄 20T + 양면 서멀패드 각 2T.
         "core_plate_pad_t": 2.0,
         # 코어 1조 깊이 허용 범위 [mm] (랜덤 모드에서 n_core_group 샘플링 제약.
@@ -218,6 +224,9 @@ _SOBOL_DIMS = [
     # wh2 상한 0.90: h_gap2(2차-요크 z 간격) = h1(1-wh2)/2 이 절연 타겟(40mm) 근방을 벗어나
     # 극소값이 되지 않게 (h1=500~1000에서 h_gap2 >= 25~50mm 보장)
     ("wh1", 0.8, 0.93), ("wh2", 0.5, 0.90),
+    # Append-only Sobol schema extension: preserve every pre-existing unit
+    # coordinate while adding the independent winding-plate length variable.
+    ("wcp_len_pct", WCP_LENGTH_MIN_PCT, WCP_LENGTH_MAX_PCT),
 ]
 
 
@@ -324,6 +333,25 @@ def decode_unit_sample(s, allow_space_shrink=True, space_min=None):
     nwh1 = round(h1 * s["wh1"], 1)
     nwh2 = round(h1 * s["wh2"], 1)
 
+    # Innermost Tx_main clear straight span in x.  Random campaign geometry is
+    # rectangular (round_corner defaults off), but retain the rounded-corner
+    # definition so the conversion remains physically meaningful for callers
+    # that opt into rounded turns.
+    resolved_cw2 = round(cw2, 3)
+    resolved_cc_x = round(cc_x, 1)
+    resolved_w21_x = round(w21_x, 1)
+    nwl2_main = (
+        N2_main * resolved_cw2 + max(N2_main - 1, 0) * gap2
+        if N2_main > 0 else 0.0
+    )
+    sl2_main_x = 2.0 * l1 + 2.0 * resolved_cc_x
+    sl1_main_x = sl2_main_x + 2.0 * nwl2_main + 2.0 * resolved_w21_x
+    round_corner = int(defaults["round_corner"]) != 0
+    corner_radius = float(defaults["corner_radius"]) if round_corner else 0.0
+    wcp_len_ref_x = sl1_main_x - 2.0 * corner_radius
+    wcp_len_pct = round(float(s["wcp_len_pct"]), 1)
+    wcp_len_x = round(wcp_len_ref_x * wcp_len_pct / 100.0, 1)
+
     values = dict(defaults)
     values.update({
         "N1_main": N1_main, "N1_side": N1_side, "N2_main": N2_main, "N2_side": N2_side,
@@ -331,6 +359,7 @@ def decode_unit_sample(s, allow_space_shrink=True, space_min=None):
         "n_core_group": n_core_group,
         "core_plate_t": plate_t,
         "wcp_t": wcp_t,
+        "wcp_len_x": wcp_len_x,
         "cw1": round(cw1, 2), "gap1": gap1, "cw2": round(cw2, 3), "gap2": gap2,
         "nwh1": nwh1, "nwh2": nwh2,
         "cc_w2c_space_x": round(cc_x, 1),
@@ -640,6 +669,20 @@ def validation_check(input_df, strict=False, return_errors=False):
     wcp_on = int(inp["wcp_on"].iloc[0]) != 0
     wcp_len_x = float(inp["wcp_len_x"].iloc[0])
 
+    # Resolve the human-readable percentage from the actual millimetre
+    # geometry.  ``wcp_len_x`` remains authoritative for legacy/fixed inputs;
+    # Sobol candidates set it from their sampled percentage before validation.
+    wcp_len_ref_x = sl1_main_x - (2.0 * corner_radius if round_corner else 0.0)
+    inp["wcp_len_ref_x"] = [wcp_len_ref_x]
+    if wcp_len_ref_x > 0:
+        wcp_len_pct = 100.0 * wcp_len_x / wcp_len_ref_x
+        inp["wcp_len_pct"] = [wcp_len_pct]
+    else:
+        wcp_len_pct = float("nan")
+        errors.append(
+            f"Tx innermost straight x span <= 0 ({wcp_len_ref_x})"
+        )
+
     if round_corner:
         if corner_radius < 1.0:
             errors.append(f"corner_radius ({corner_radius}) < 1mm")
@@ -660,10 +703,20 @@ def validation_check(input_df, strict=False, return_errors=False):
 
     if wcp_on and N1_main >= 2:
         # 냉각판이 y측 직선 구간 안에 놓여야 함 (직선 반길이 = x반폭 - 반경, 전 턴 동일)
-        straight_half = sl1_main_x / 2 - (corner_radius if round_corner else 0)
+        straight_half = wcp_len_ref_x / 2
         if wcp_len_x / 2 >= straight_half:
             errors.append(
                 f"wcp_len_x/2 ({wcp_len_x / 2}) >= Tx straight half length ({straight_half:.2f})"
+            )
+        # Allow only tiny sub-0.1-mm quantization drift at the endpoints.
+        pct_tolerance = 0.05
+        if (not math.isfinite(wcp_len_pct)
+                or wcp_len_pct < WCP_LENGTH_MIN_PCT - pct_tolerance
+                or wcp_len_pct > WCP_LENGTH_MAX_PCT + pct_tolerance):
+            errors.append(
+                f"wcp_len_pct {wcp_len_pct:.3f} outside "
+                f"[{WCP_LENGTH_MIN_PCT}, {WCP_LENGTH_MAX_PCT}]% "
+                f"(wcp_len_x={wcp_len_x:.3f}mm, reference={wcp_len_ref_x:.3f}mm)"
             )
 
     # 서멀패드 두께 검증 (알루미늄 판 두께 > 0 이어야 함)
@@ -732,6 +785,9 @@ def validation_check(input_df, strict=False, return_errors=False):
 # AEDT 디자인 변수로 설정하지 않는 키 (지오메트리 수식에 안 쓰이는 해석/열 파라미터, 문자열 등)
 NON_DESIGN_VAR_KEYS = {
     "rx_mesh_mode",
+    # Derived, human-readable plate-length metadata. Geometry and submission
+    # identity remain authoritative in the exact millimetre value wcp_len_x.
+    "wcp_len_pct", "wcp_len_ref_x",
     "freq", "V1_rms", "I1_rated", "I2_rated", "I2_phase_deg",
     "P_target", "V2_rms",
     "core_cm", "core_x", "core_y",

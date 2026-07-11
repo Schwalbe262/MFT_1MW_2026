@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-TRAIN_IO_SCHEMA_VERSION = 1
+TRAIN_IO_SCHEMA_VERSION = 2
 
 IDENTITY_COLUMNS = (
     "project_name",
@@ -51,6 +51,7 @@ DESIGN_INPUT_COLUMNS = (
     "cs_w1s_space_y",
     "wcp_t",
     "wcp_pad_t",
+    "wcp_len_pct",
     "wcp_len_x",
     "wcp_on",
     "core_plate_pad_t",
@@ -104,6 +105,7 @@ GEOMETRY_DERIVED_COLUMNS = (
     "sl2_side_x",
     "sl2_side_y",
     "w1c_w2s_gap_x_actual",
+    "wcp_len_ref_x",
     "Ae_m2",
     "core_vol_m3",
     "core_mass_kg",
@@ -182,6 +184,12 @@ AGGREGATE_TEMPERATURE_COLUMNS = (
     "Tprobe_Rx_side_leeward_mean",
     "Tprobe_Rx_side_side_max",
     "Tprobe_Rx_side_side_mean",
+    "Tprobe_core_center_leg_max",
+    "Tprobe_core_center_leg_mean",
+    "Tprobe_core_side_leg_max",
+    "Tprobe_core_side_leg_mean",
+    "Tprobe_core_top_yoke_max",
+    "Tprobe_core_top_yoke_mean",
     "Tprobe_core_center_max",
     "Tprobe_core_center_mean",
 )
@@ -222,10 +230,44 @@ def _column_or_missing(frame: pd.DataFrame, column: str) -> pd.Series:
     return pd.Series(np.nan, index=frame.index, name=column)
 
 
+def add_wcp_length_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Backfill winding cold-plate reference and percentage losslessly."""
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("frame must be a pandas DataFrame")
+    out = frame.copy()
+    length_mm = pd.to_numeric(
+        _column_or_missing(out, "wcp_len_x"), errors="coerce"
+    )
+    supplied_reference_mm = pd.to_numeric(
+        _column_or_missing(out, "wcp_len_ref_x"), errors="coerce"
+    )
+    straight_x = pd.to_numeric(
+        _column_or_missing(out, "sl1_main_x"), errors="coerce"
+    )
+    rounded = pd.to_numeric(
+        _column_or_missing(out, "round_corner"), errors="coerce"
+    ).eq(1)
+    radius = pd.to_numeric(
+        _column_or_missing(out, "corner_radius"), errors="coerce"
+    ).fillna(0.0)
+    derived_reference_mm = straight_x - radius.where(rounded, 0.0) * 2.0
+    # Geometry and exact mm are authoritative. Never preserve a supplied pct
+    # (or a conflicting supplied reference) when it can be recomputed.
+    reference_mm = derived_reference_mm.where(
+        derived_reference_mm.gt(0),
+        supplied_reference_mm.where(supplied_reference_mm.gt(0)),
+    )
+    derived_pct = length_mm * 100.0 / reference_mm.where(reference_mm.gt(0))
+    out["wcp_len_ref_x"] = reference_mm
+    out["wcp_len_pct"] = derived_pct
+    return out
+
+
 def build_train_io(master: pd.DataFrame) -> pd.DataFrame:
     """Build the fixed-schema physical I/O view without mutating ``master``."""
     if not isinstance(master, pd.DataFrame):
         raise TypeError("master must be a pandas DataFrame")
+    master = add_wcp_length_features(master)
 
     data = {
         "train_io_schema_version": pd.Series(

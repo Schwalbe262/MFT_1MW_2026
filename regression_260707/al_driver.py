@@ -476,6 +476,27 @@ def _unique_rows(array):
     return array[np.sort(indices)]
 
 
+def _unit_vector_matrix(array, n_var, label, allow_incompatible=False):
+    """Validate persisted Sobol vectors before distance or vstack operations."""
+    matrix = np.asarray(array)
+    valid = (
+        matrix.ndim == 2
+        and matrix.shape[1] == int(n_var)
+        and np.issubdtype(matrix.dtype, np.number)
+        and np.isfinite(matrix).all()
+    )
+    if valid:
+        return matrix.astype(float, copy=False)
+    message = (
+        f"{label} is incompatible with the current Sobol schema: "
+        f"shape={matrix.shape}, expected=(*, {n_var})"
+    )
+    if allow_incompatible:
+        print(f"[al] {message}; ignoring legacy vectors")
+        return None
+    raise RuntimeError(message)
+
+
 def _merge_source_ranks(existing, new_rows):
     keys = ["project_name", "saved_at"]
     columns = keys + [SOURCE_RANK_COLUMN]
@@ -833,6 +854,9 @@ def stage_select(st):
     rnd = st["round"]
     rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     X = np.load(os.path.join(rdir, "pareto_X.npy"))
+    from module.input_parameter_260706 import _SOBOL_DIMS
+
+    X = _unit_vector_matrix(X, len(_SOBOL_DIMS), "pareto_X")
     F = np.load(os.path.join(rdir, "pareto_F.npy"))
     front = pd.read_csv(os.path.join(rdir, "pareto_front.csv"))
 
@@ -847,7 +871,10 @@ def stage_select(st):
     verified_X = None
     vx_path = os.path.join(_active_al_root(), "verified_X.npy")
     if os.path.isfile(vx_path):
-        verified_X = np.load(vx_path)
+        verified_X = _unit_vector_matrix(
+            np.load(vx_path), len(_SOBOL_DIMS), "verified_X",
+            allow_incompatible=True,
+        )
 
     from select_candidates import select
     picked = select(X, F, G, sig_norm, verified_X=verified_X)
@@ -1237,9 +1264,18 @@ def stage_ingest(st):
             # Verified X is also replay-safe. A crash between files is repaired
             # by re-entering INGEST without duplicating either artifact.
             X = np.load(os.path.join(rdir, "pareto_X.npy"))
+            from module.input_parameter_260706 import _SOBOL_DIMS
+
+            X = _unit_vector_matrix(X, len(_SOBOL_DIMS), "pareto_X")
             v_new = X[[e["idx"] for e in errs]]
             vx_path = os.path.join(_active_al_root(), "verified_X.npy")
-            v_all = np.vstack([np.load(vx_path), v_new]) if os.path.isfile(vx_path) else v_new
+            previous = None
+            if os.path.isfile(vx_path):
+                previous = _unit_vector_matrix(
+                    np.load(vx_path), len(_SOBOL_DIMS), "verified_X",
+                    allow_incompatible=True,
+                )
+            v_all = np.vstack([previous, v_new]) if previous is not None else v_new
             _atomic_save_npy(_unique_rows(v_all), vx_path)
 
     err_df = pd.DataFrame(errs)
