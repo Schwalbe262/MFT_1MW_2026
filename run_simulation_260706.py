@@ -3297,6 +3297,68 @@ def log_failed_sample(input_df, reason, filename="failed_samples_260706.jsonl"):
         logging.warning(f"failed-sample logging failed: {e}")
 
 
+def _create_simulation_session(max_attempts=3, retry_delay_s=30):
+    """Create one healthy AEDT Desktop/Simulation pair with clean retries.
+
+    High-concurrency nodes can occasionally expose a half-created gRPC Desktop
+    (for example ``odesktop is None`` during ``EnableAutoSave``).  No candidate
+    has been generated at this point, so retrying the session is safe and does
+    not change the sampled design.  Every failed attempt releases its wrapper
+    and terminates only descendants created after this helper started.
+    """
+    max_attempts = int(max_attempts)
+    retry_delay_s = float(retry_delay_s)
+    if max_attempts < 1 or retry_delay_s < 0:
+        raise ValueError("invalid AEDT session retry policy")
+
+    baseline_descendants = _snapshot_descendants()
+    failures = []
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        desktop = None
+        try:
+            desktop = pyDesktop(
+                version=None,
+                non_graphical=GUI,
+                close_on_exit=True,
+                new_desktop=True,
+            )
+            simulation = Simulation(desktop=desktop)
+            if simulation is None:
+                raise RuntimeError("Simulation construction returned None")
+            return desktop, simulation
+        except Exception as error:
+            last_error = error
+            failures.append(f"{type(error).__name__}: {error}")
+            logging.warning(
+                "AEDT session startup attempt %d/%d failed: %s",
+                attempt,
+                max_attempts,
+                failures[-1],
+            )
+            captured_descendants = _snapshot_descendants()
+            if desktop is not None:
+                try:
+                    desktop.release_desktop(
+                        close_projects=True,
+                        close_on_exit=True,
+                    )
+                except Exception:
+                    pass
+            _terminate_spawned_descendants(
+                baseline_descendants,
+                captured_descendants,
+                wait_s=5,
+            )
+            if attempt < max_attempts:
+                time.sleep(retry_delay_s)
+
+    raise RuntimeError(
+        "AEDT desktop startup failed after "
+        f"{max_attempts} attempts: {'; '.join(failures)}"
+    ) from last_error
+
+
 def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrides=None):
     """
     param 이 None  -> 랜덤 파라미터 1회 (검증 실패 시 재추첨), 완료 후 프로젝트 삭제
@@ -3312,9 +3374,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     try:
         # pyDesktop을 context manager로 쓰면 release_desktop 이후 __exit__에서
         # close_on_exit 속성 오류가 발생하므로 직접 생성하고 finally에서 해제한다.
-        desktop = pyDesktop(version=None, non_graphical=GUI, close_on_exit=True, new_desktop=True)
-
-        sim = Simulation(desktop=desktop)
+        desktop, sim = _create_simulation_session()
 
         sim.create_simulation_name()
         sim.create_project()

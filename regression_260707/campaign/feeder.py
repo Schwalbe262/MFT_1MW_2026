@@ -77,6 +77,7 @@ class SchedulerError(RuntimeError):
 
 
 _RAPID_REFILL_SEAL = object()
+_ADOPTED_REFILL_SEAL = object()
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,32 @@ class _RapidRefillAuthorization:
     solver_revision: str
     library_revision: str
     candidate_seed: int
+    seal: object
+
+
+@dataclass(frozen=True)
+class _AdoptedRefillAuthorization:
+    """One-cycle authorization for an externally preloaded production fleet.
+
+    The adopted controller must authenticate its original cohort on every
+    cycle and prove the same local3 plus fleet20/90% evidence used by the
+    normal rapid controller.  Keeping this as a distinct sealed type avoids
+    weakening or pretending to satisfy the p02/p08 pilot contract.
+    """
+
+    target: int
+    max_samples: int
+    solver_revision: str
+    library_revision: str
+    candidate_seed: int
+    adoption_sha256: str
+    initial_count: int
+    cpus: int
+    memory_mb: int
+    timeout_seconds: int
+    evidence_mode: str
+    strict_rows: int
+    target_strict_rows: int
     seal: object
 
 
@@ -127,6 +154,82 @@ def _authorize_rapid_refill(
     )
 
 
+def _authorize_adopted_refill(
+        decision, *, max_samples, solver_revision, library_revision,
+        candidate_seed, local_passed, adoption_sha256, initial_count,
+        cpus, memory_mb, timeout_seconds, evidence_mode, strict_rows,
+        target_strict_rows):
+    """Seal one refill after an authenticated preloaded-250 fleet passes.
+
+    This is deliberately separate from :func:`_authorize_rapid_refill`:
+    adopted production evidence is not represented as fictitious p02/p08
+    pilot evidence.
+    """
+    if not scheduler_client.campaign_mutation_lock_is_held():
+        raise SchedulerError("adopted refill authorization requires the mutation lock")
+    if not isinstance(decision, dict) or decision.get("paused"):
+        raise SchedulerError("adopted refill decision is absent or paused")
+    if decision.get("target_active") != 300 or decision.get("action") != "refill_300":
+        raise SchedulerError("adopted refill decision must authorize refill_300")
+    if local_passed is not True:
+        raise SchedulerError("adopted refill lacks local3 evidence")
+    for revision, label in (
+            (solver_revision, "solver"), (library_revision, "library")):
+        revision = str(revision or "")
+        if (len(revision) != 40 or revision != revision.lower()
+                or any(char not in "0123456789abcdef" for char in revision)):
+            raise SchedulerError(f"adopted refill {label} revision is invalid")
+    if type(initial_count) is not int or initial_count != 250:
+        raise SchedulerError("adopted refill requires the exact preloaded-250 cohort")
+    if (evidence_mode != "preloaded250_v1" or type(max_samples) is not int
+            or max_samples != 12_000 or type(candidate_seed) is not int
+            or candidate_seed != 260710):
+        raise SchedulerError("adopted refill campaign contract is invalid")
+    if (type(strict_rows) is not int or type(target_strict_rows) is not int
+            or target_strict_rows != 3_000
+            or strict_rows < 0 or strict_rows >= target_strict_rows):
+        raise SchedulerError("adopted refill strict-row evidence is invalid")
+    adoption_sha256 = str(adoption_sha256 or "").lower()
+    if (len(adoption_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in adoption_sha256)):
+        raise SchedulerError("adopted refill cohort seal is invalid")
+    resources = (cpus, memory_mb, timeout_seconds)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in resources):
+        raise SchedulerError("adopted refill resources must be integers")
+    if resources != (4, 65_536, 14_400):
+        raise SchedulerError("adopted refill resources must be 4 CPU/64 GiB/4 hours")
+    production = decision.get("production") or {}
+    terminal = production.get("terminal")
+    valid = production.get("valid")
+    valid_rate = production.get("valid_rate")
+    if (isinstance(terminal, bool) or not isinstance(terminal, int)
+            or isinstance(valid, bool) or not isinstance(valid, int)
+            or valid < 0 or valid > terminal
+            or terminal < 20
+            or isinstance(valid_rate, bool)
+            or not isinstance(valid_rate, (int, float))
+            or not math.isfinite(float(valid_rate))
+            or abs(float(valid_rate) - valid / terminal) > 1e-12
+            or float(valid_rate) < 0.90):
+        raise SchedulerError("adopted refill lacks fleet20/90% promotion evidence")
+    return _AdoptedRefillAuthorization(
+        target=300,
+        max_samples=int(max_samples),
+        solver_revision=str(solver_revision),
+        library_revision=str(library_revision),
+        candidate_seed=int(candidate_seed),
+        adoption_sha256=adoption_sha256,
+        initial_count=int(initial_count),
+        cpus=int(cpus),
+        memory_mb=int(memory_mb),
+        timeout_seconds=int(timeout_seconds),
+        evidence_mode=evidence_mode,
+        strict_rows=strict_rows,
+        target_strict_rows=target_strict_rows,
+        seal=_ADOPTED_REFILL_SEAL,
+    )
+
+
 def _step_from_rapid_controller(
         max_samples, *, authorization, target, buffer=0,
         solver_revision=None, library_revision=None, candidate_seed=260710):
@@ -155,16 +258,68 @@ def _step_from_rapid_controller(
     )
 
 
-def submit(name, workdir, params, solver_revision, library_revision):
+def _step_from_adopted_controller(
+        max_samples, *, authorization, target, buffer=0,
+        solver_revision=None, library_revision=None, candidate_seed=260710,
+        adoption_sha256=None, initial_count=None, cpus=None, memory_mb=None,
+        timeout_seconds=None, evidence_mode=None, strict_rows=None,
+        target_strict_rows=None, journal=None):
+    """Execute one evidence-bound refill for an authenticated adopted fleet."""
+    if not scheduler_client.campaign_mutation_lock_is_held():
+        raise SchedulerError("adopted production refill requires the mutation lock")
+    expected = (
+        int(target), int(max_samples), str(solver_revision),
+        str(library_revision), int(candidate_seed),
+        str(adoption_sha256 or "").lower(), int(initial_count),
+        int(cpus), int(memory_mb), int(timeout_seconds),
+        evidence_mode, int(strict_rows), int(target_strict_rows),
+    )
+    actual = (
+        getattr(authorization, "target", None),
+        getattr(authorization, "max_samples", None),
+        getattr(authorization, "solver_revision", None),
+        getattr(authorization, "library_revision", None),
+        getattr(authorization, "candidate_seed", None),
+        getattr(authorization, "adoption_sha256", None),
+        getattr(authorization, "initial_count", None),
+        getattr(authorization, "cpus", None),
+        getattr(authorization, "memory_mb", None),
+        getattr(authorization, "timeout_seconds", None),
+        getattr(authorization, "evidence_mode", None),
+        getattr(authorization, "strict_rows", None),
+        getattr(authorization, "target_strict_rows", None),
+    )
+    if (not isinstance(authorization, _AdoptedRefillAuthorization)
+            or authorization.seal is not _ADOPTED_REFILL_SEAL
+            or actual != expected or int(buffer) != 0):
+        raise SchedulerError("adopted production refill authorization is invalid")
+    return _step_locked(
+        max_samples, target=target, buffer=buffer,
+        solver_revision=solver_revision, library_revision=library_revision,
+        candidate_seed=candidate_seed, _adopted_authorization=authorization,
+        _submit_resources={
+            "cpus": int(cpus),
+            "memory_mb": int(memory_mb),
+            "timeout_seconds": int(timeout_seconds),
+        },
+        _refill_journal=journal,
+    )
+
+
+def submit(
+        name, workdir, params, solver_revision, library_revision, *,
+        cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None):
     with open(PROFILE_PATH, encoding="utf-8") as stream:
         profile = json.load(stream)
+    if timeout_seconds is not None:
+        profile["timeout_seconds"] = int(timeout_seconds)
     return scheduler_client.submit_verification(
         name=name,
         workdir=workdir,
         params=params,
         profile=profile,
-        mem_mb=32768,
-        cpus=CPUS_PER_TASK,
+        mem_mb=int(memory_mb),
+        cpus=int(cpus),
         solver_revision=solver_revision,
         library_revision=library_revision,
     )
@@ -380,15 +535,48 @@ def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
 
 def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                  solver_revision=None, library_revision=None,
-                 candidate_seed=260710, _rapid_authorization=None):
+                 candidate_seed=260710, _rapid_authorization=None,
+                 _adopted_authorization=None, _submit_resources=None,
+                 _refill_journal=None):
     requested_active = int(target) + int(buffer)
     if requested_active > 0 and not scheduler_client.campaign_mutation_lock_is_held():
         raise SchedulerError("campaign refill requires the project mutation lock")
     if requested_active > MAX_STANDALONE_ACTIVE:
-        if (not isinstance(_rapid_authorization, _RapidRefillAuthorization)
-                or _rapid_authorization.seal is not _RAPID_REFILL_SEAL
-                or _rapid_authorization.target != requested_active):
+        rapid_authorized = (
+            isinstance(_rapid_authorization, _RapidRefillAuthorization)
+            and _rapid_authorization.seal is _RAPID_REFILL_SEAL
+            and _rapid_authorization.target == requested_active
+            and _rapid_authorization.max_samples == int(max_samples)
+            and _rapid_authorization.solver_revision == str(solver_revision)
+            and _rapid_authorization.library_revision == str(library_revision)
+            and _rapid_authorization.candidate_seed == int(candidate_seed)
+        )
+        adopted_authorized = (
+            isinstance(_adopted_authorization, _AdoptedRefillAuthorization)
+            and _adopted_authorization.seal is _ADOPTED_REFILL_SEAL
+            and _adopted_authorization.target == requested_active
+            and _adopted_authorization.max_samples == int(max_samples)
+            and _adopted_authorization.solver_revision == str(solver_revision)
+            and _adopted_authorization.library_revision == str(library_revision)
+            and _adopted_authorization.candidate_seed == int(candidate_seed)
+            and _submit_resources == {
+                "cpus": _adopted_authorization.cpus,
+                "memory_mb": _adopted_authorization.memory_mb,
+                "timeout_seconds": _adopted_authorization.timeout_seconds,
+            }
+        )
+        if not (rapid_authorized or adopted_authorized):
             raise SchedulerError("production refill requires rapid promotion authorization")
+    if _refill_journal is not None:
+        if (not isinstance(_refill_journal, dict)
+                or not isinstance(_refill_journal.get("events"), list)
+                or _refill_journal["events"]):
+            raise SchedulerError("refill journal must be a fresh events list")
+        _refill_journal.update({
+            "entered": True,
+            "submitted_count": 0,
+            "completed": False,
+        })
     st = load_state()
     committed_state = copy.deepcopy(st)
     # 로컬 장부나 다른 project가 아니라 scheduler의 MFT logical project가 source of truth다.
@@ -415,6 +603,16 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         min(campaign_deficit, capacity_gate["project_submission_slots"])
         if capacity_gate["submission_allowed"] else 0
     )
+    if _refill_journal is not None:
+        _refill_journal.update({
+            "dataset_rows": int(data_rows),
+            "reserved_rows": int(reserved_rows),
+            "projected_rows": int(projected_rows),
+            "campaign_deficit": int(campaign_deficit),
+            "submission_deficit": int(deficit),
+            "planned_count": 0,
+            "stop_reason": None,
+        })
     print(f"[feeder] campaign active {campaign_active} "
           f"(queued={campaign_counts['queued']}, attaching={campaign_counts['attaching']}, "
           f"running={campaign_counts['running']}), global active={global_active}, "
@@ -428,9 +626,15 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
           f"{data_rows}/{reserved_rows}/{projected_rows}")
     if data_rows >= max_samples:
         print(f"[feeder] dataset target reached ({data_rows}/{max_samples}) - no refill")
+        if _refill_journal is not None:
+            _refill_journal["stop_reason"] = "dataset_ceiling_reached"
+            _refill_journal["completed"] = True
         return False
     if projected_rows >= max_samples:
         print(f"[feeder] no refill: projected dataset rows {projected_rows}/{max_samples}")
+        if _refill_journal is not None:
+            _refill_journal["stop_reason"] = "projected_ceiling_reached"
+            _refill_journal["completed"] = True
         return True
     if deficit <= 0:
         print(
@@ -438,6 +642,9 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             f"queue_state={capacity_gate['queue_state']}, "
             f"queue_reason={capacity_gate['queue_reason'] or '-'}"
         )
+        if _refill_journal is not None:
+            _refill_journal["stop_reason"] = "no_submission_deficit"
+            _refill_journal["completed"] = True
         return True
     if not isinstance(solver_revision, str) or len(solver_revision) != 40:
         raise SchedulerError("a full pinned solver revision is required before refill")
@@ -465,7 +672,12 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         st.pop("candidate_raw_index", None)
     st["candidate_cursors"] = candidate_cursors
     n_new = min(deficit, (max_samples - projected_rows) // COUNT_PER_TASK)
+    if _refill_journal is not None:
+        _refill_journal["planned_count"] = int(n_new)
     if n_new <= 0:
+        if _refill_journal is not None:
+            _refill_journal["stop_reason"] = "no_planned_tasks"
+            _refill_journal["completed"] = True
         return False
     ok = 0
     for _ in range(n_new):
@@ -478,9 +690,36 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         st["candidate_cursor"] = next_cursor
         st["candidate_cursors"][candidate_generation] = next_cursor
         st["candidate_raw_index"] = raw_index
+        event = None
+        if _refill_journal is not None:
+            with open(PROFILE_PATH, encoding="utf-8") as stream:
+                event_profile = json.load(stream)
+            if _submit_resources and _submit_resources.get("timeout_seconds") is not None:
+                event_profile["timeout_seconds"] = int(
+                    _submit_resources["timeout_seconds"])
+            event_identity = scheduler_client.verification_submission_identity(
+                name, params, event_profile, solver_revision, library_revision)
+            event = {
+                "name": name,
+                "candidate_raw_index": int(raw_index),
+                "dedupe_key": event_identity["dedupe_key"],
+                "task_id": None,
+                "accepted_or_reconciled": False,
+                "ledger_committed": False,
+                "uncertain": False,
+            }
+            _refill_journal["events"].append(event)
         try:
-            tid = submit(name, wd, params, solver_revision, library_revision)
-        except Exception:
+            submit_kwargs = dict(_submit_resources or {})
+            tid = submit(
+                name, wd, params, solver_revision, library_revision,
+                **submit_kwargs,
+            )
+        except Exception as exc:
+            if event is not None:
+                event["uncertain"] = isinstance(
+                    exc, scheduler_client.TaskSubmissionUncertain)
+                event["exception_type"] = type(exc).__name__
             st.clear()
             st.update(copy.deepcopy(committed_state))
             raise
@@ -490,16 +729,25 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             raise SchedulerError(
                 f"scheduler did not return a task ID for {name}; "
                 "candidate state was not advanced")
+        if event is not None:
+            event["task_id"] = int(tid)
+            event["accepted_or_reconciled"] = True
         ok += 1
         st["submitted_samples"] += COUNT_PER_TASK
         st.setdefault("outstanding", []).append(tid)
         st.setdefault("task_expected_rows", {})[str(tid)] = COUNT_PER_TASK
         # Only a durable task ID commits the candidate/name cursor.
         save_state(st)
+        if event is not None:
+            event["ledger_committed"] = True
+            _refill_journal["submitted_count"] += 1
         committed_state = copy.deepcopy(st)
         time.sleep(0.3)
     print(f"[feeder] campaign active {campaign_active} -> +{ok}/{n_new} tasks "
           f"(누적 제출 샘플 {st['submitted_samples']})")
+    if _refill_journal is not None:
+        _refill_journal["stop_reason"] = "submitted"
+        _refill_journal["completed"] = True
     return True
 
 

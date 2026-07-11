@@ -141,26 +141,43 @@ def _assign_thermal_mesh(ipk, objs):
     pad_names = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
     _assign_levels({name: 2 for name in pad_names}, "pad_mesh_level")
 
-    # Tx turns are thicker than the pads, but coarse cut-cell meshing has still
-    # produced zero solution volume for complete turns. One shared level avoids
-    # the cell explosion caused by a separate cut-cell region per turn.
+    # Tx turns as thin as the sampled 1 mm lower bound can disappear from the
+    # shared cut-cell mesh. Level 4 preserves those solid zones while one shared
+    # operation avoids the isolated heat paths of separate-object meshing.
     tx_names = list(dict.fromkeys(obj.name for obj in objs.get("Tx", [])))
-    _assign_levels({name: 2 for name in tx_names}, "tx_mesh_level")
+    _assign_levels({name: 4 for name in tx_names}, "tx_mesh_level")
 
-    rx_blocks = []
-    for key in ("Rx_main_blocks", "Rx_side_blocks", "Rx_side2_blocks"):
-        rx_blocks.extend(objs.get(key, []))
-
-    # Side packs can be only one or two foil pitches thick. For a measured
-    # 1.621 mm pack, level 3 resolved the main and y-oriented side blocks but
-    # omitted both thin x-oriented side blocks. Level 4 restored their finite
-    # solution volumes while preserving the shared-region heat path.
-    rx_block_names = list(dict.fromkeys(obj.name for obj in rx_blocks))
-    _assign_levels({name: 4 for name in rx_block_names}, "rx_block_mesh_level")
+    # Keep each physical Rx pack in its own shared refinement region. Combining
+    # the distant main and side packs creates one very large cut-cell region;
+    # two production cases with a single 0.300--0.435 mm side turn then lost all
+    # three retained side-block solution zones even though the main pack survived.
+    # Level 5 is the finest predefined Icepak object level and is reserved for
+    # the side packs, while every block within one pack still shares a region so
+    # its conductive interfaces are not isolated.
+    rx_block_specs = (
+        ("Rx_main_blocks", "rx_main_block_mesh_level", 4),
+        ("Rx_side_blocks", "rx_side_block_mesh_level", 5),
+        ("Rx_side2_blocks", "rx_side2_block_mesh_level", 5),
+    )
+    for key, operation_name, level in rx_block_specs:
+        names = list(dict.fromkeys(obj.name for obj in objs.get(key, [])))
+        _assign_levels({name: level for name in names}, operation_name)
 
     explicit_rx = []
-    for key in ("Rx_main_explicit", "Rx_side_explicit", "Rx_side2_explicit"):
-        explicit_rx.extend(objs.get(key, []))
+    singleton_specs = (
+        ("Rx_main_explicit", "Rx_main_blocks", "rx_main_single_turn_mesh_level"),
+        ("Rx_side_explicit", "Rx_side_blocks", "rx_side_single_turn_mesh_level"),
+        ("Rx_side2_explicit", "Rx_side2_blocks", "rx_side2_single_turn_mesh_level"),
+    )
+    for explicit_key, block_key, operation_name in singleton_specs:
+        group = list(objs.get(explicit_key, []))
+        if len(group) == 1 and not objs.get(block_key, []):
+            # Level 5 is Icepak's finest predefined object level. Keep this as a
+            # pack-local shared region so a 0.3 mm exact copper turn remains a
+            # solved solid without refining the distant main pack.
+            _assign_levels({group[0].name: 5}, operation_name)
+        else:
+            explicit_rx.extend(group)
 
     # Per-object cut-cell subregions created million-cell meshes with skew above
     # 0.96 on thin foils. One object-level control keeps the foil represented
@@ -228,8 +245,10 @@ def _parse_thermal_residual_monitor(path, flow_limit=1e-3, energy_limit=1e-7):
     }
 
 
-def _thermal_convergence_telemetry(sim, ipk, setup, attempts=3, retry_seconds=2):
-    """Read the newest native Icepak residual monitor; missing evidence fails closed."""
+def _thermal_convergence_telemetry(
+    sim, ipk, setup, attempts=3, retry_seconds=2, not_before_ns=None,
+):
+    """Read a fresh native Icepak residual monitor; missing evidence fails closed."""
     defaults = {
         "thermal_convergence_available": 0,
         "thermal_converged": 0,
@@ -269,10 +288,16 @@ def _thermal_convergence_telemetry(sim, ipk, setup, attempts=3, retry_seconds=2)
             design_results = root / f"{ipk.design_name}.results"
             search_root = design_results if design_results.is_dir() else root
             if search_root.is_dir():
-                candidates.extend(
-                    path for path in search_root.glob("*_S*_MON*_V*.sd")
-                    if "_SOL" not in path.name
-                )
+                for path in search_root.glob("*_S*_MON*_V*.sd"):
+                    if "_SOL" in path.name:
+                        continue
+                    try:
+                        if not_before_ns is not None \
+                                and path.stat().st_mtime_ns < int(not_before_ns):
+                            continue
+                    except (OSError, TypeError, ValueError, OverflowError):
+                        continue
+                    candidates.append(path)
         if candidates:
             monitor = max(
                 set(candidates),
@@ -456,6 +481,11 @@ def _rx_layout(df, prefix):
 def _partition_rx_turns(windings, n_explicit):
     """Return retained explicit turns and the turns replaced by thermal blocks."""
     windings = list(windings)
+    # A one-turn group contains no inter-turn insulation to homogenize. Keeping
+    # the exact copper turn also avoids zero-cell omission of sub-millimetre
+    # blocks in the Icepak cut-cell mesh.
+    if len(windings) == 1:
+        return windings, []
     count = int(n_explicit)
     if count < 0 or 2 * count >= len(windings):
         return windings, []
@@ -845,13 +875,25 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
 
     # Rx 그룹 공통: explicit 턴 + 중간 균질 블록 (그룹 총손실 - explicit, 체적 비례)
     def _rx_group(explicit_objs, blocks, group_key, name_hint):
+        p_total = alloc.group_loss(group_key, name_hint)
+        if len(explicit_objs) == 1 and not blocks:
+            # The sole exact turn is the complete physical group. Production
+            # n_explicit_turns=0 reports omit per-turn Rx expressions, so its
+            # symmetry-adjusted group loss is also its exact turn loss.
+            _block(explicit_objs[0], p_total)
+            rx_power_balance.append({
+                "group": group_key,
+                "name_hint": name_hint,
+                "expected_w": p_total,
+                "assigned_w": p_total,
+            })
+            return
         p_exp_total = 0.0
         for w in explicit_objs:
             em_name = w.name.replace("Rx_side2", "Rx_side")
             p = alloc.turn_loss(f"P_turn_{em_name}", em_name)
             p_exp_total += p
             _block(w, p)
-        p_total = alloc.group_loss(group_key, name_hint)
         p_mid = p_total - p_exp_total
         if p_mid < -max(1e-9, abs(p_total) * 1e-12):
             raise RuntimeError(
@@ -1137,34 +1179,64 @@ def run_thermal_analysis(sim):
 
     # analyze() may return None after a successful blocking solve. Do not query
     # the setup completion property here: it uses the same unreliable report API that
-    # caused completed thermal solves to be launched repeatedly. Field Summary
-    # data below is the completion gate.
+    # caused completed thermal solves to be launched repeatedly. Native convergence
+    # evidence and Field Summary data below are the completion gates.
+    #
+    # A known AEDT startup race can return False/raise before it emits any usable
+    # monitor. Retry exactly once only for that narrow signature. A fresh monitor
+    # with either converged or residual-threshold evidence is authoritative and
+    # must never trigger another solve.
     import time as _time
-    solve_attempts = 1
+    solve_attempts = 0
     analyze_call_ok = False
     analyze_return_false = False
-    try:
-        analyze_result = ipk.analyze(cores=sim.NUM_CORE)
-        analyze_call_ok = True
-        analyze_return_false = analyze_result is False
-        if analyze_return_false:
-            logging.warning(
-                "[thermal] analyze returned False; validating the solve from Field Summary data."
-            )
-    except Exception as e:
-        logging.exception(f"[thermal] analyze invocation failed: {e}")
+    convergence = None
+    for solve_attempt in range(1, 3):
+        solve_attempts = solve_attempt
+        solve_started_ns = _time.time_ns()
+        invocation_failed = False
         try:
-            msgs = ipk.odesktop.GetMessages(sim.PROJECT_NAME, ipk.design_name, 0)
-            for m in list(msgs)[-20:]:
-                logging.warning(f"[AEDT] {m}")
+            analyze_result = ipk.analyze(cores=sim.NUM_CORE)
+            analyze_call_ok = True
+            returned_false = analyze_result is False
+            analyze_return_false = analyze_return_false or returned_false
+            invocation_failed = returned_false
+            if returned_false:
+                logging.warning(
+                    "[thermal] analyze returned False; validating fresh native "
+                    "convergence evidence."
+                )
+        except Exception as e:
+            invocation_failed = True
+            logging.exception(f"[thermal] analyze invocation failed: {e}")
+            try:
+                msgs = ipk.odesktop.GetMessages(sim.PROJECT_NAME, ipk.design_name, 0)
+                for m in list(msgs)[-20:]:
+                    logging.warning(f"[AEDT] {m}")
+            except Exception:
+                pass
+        try:
+            sim.save_project()
         except Exception:
             pass
-    try:
-        sim.save_project()
-    except Exception:
-        pass
 
-    convergence = _thermal_convergence_telemetry(sim, ipk, setup)
+        convergence = _thermal_convergence_telemetry(
+            sim, ipk, setup, not_before_ns=solve_started_ns
+        )
+        retryable_monitor_failure = convergence["thermal_convergence_reason"] in {
+            "monitor_missing", "monitor_malformed",
+        }
+        if solve_attempt == 1 and invocation_failed and retryable_monitor_failure:
+            logging.warning(
+                "[thermal] analyze startup produced no usable fresh monitor; "
+                "retrying exactly once after 30 seconds."
+            )
+            _time.sleep(30)
+            continue
+        break
+
+    if convergence is None:
+        raise RuntimeError("thermal convergence telemetry was not collected")
     logging.warning(
         "[thermal] convergence: available=%s converged=%s iteration=%s "
         "continuity=%s energy=%s reason=%s",

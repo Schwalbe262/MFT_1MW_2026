@@ -13,6 +13,7 @@ from run_simulation_260706 import (
     Simulation,
     SolutionDataUnavailableError,
     _completion_exit_code,
+    _create_simulation_session,
     _configure_copied_loss_setup,
     _configure_em_conductor_mesh,
     _configure_loss_copy_skin_mesh,
@@ -95,6 +96,73 @@ def _simulation_with_post(post):
     simulation.extraction_attempts = {}
     simulation.extraction_backends = {}
     return simulation
+
+
+class DesktopSessionRetryTests(unittest.TestCase):
+    @patch("run_simulation_260706.time.sleep")
+    @patch("run_simulation_260706._terminate_spawned_descendants")
+    @patch(
+        "run_simulation_260706._snapshot_descendants",
+        side_effect=[{10: (1, 1.0)}, {11: (1, 2.0)}],
+    )
+    @patch("run_simulation_260706.Simulation")
+    @patch("run_simulation_260706.pyDesktop")
+    def test_half_created_desktop_is_cleaned_and_retried(
+            self, desktop_factory, simulation_factory, snapshot,
+            terminate, sleep):
+        first_desktop = Mock()
+        second_desktop = Mock()
+        expected_simulation = Mock()
+        desktop_factory.side_effect = [first_desktop, second_desktop]
+        simulation_factory.side_effect = [
+            AttributeError("'NoneType' object has no attribute 'EnableAutoSave'"),
+            expected_simulation,
+        ]
+
+        desktop, simulation = _create_simulation_session(
+            max_attempts=2,
+            retry_delay_s=0.25,
+        )
+
+        self.assertIs(desktop, second_desktop)
+        self.assertIs(simulation, expected_simulation)
+        first_desktop.release_desktop.assert_called_once_with(
+            close_projects=True,
+            close_on_exit=True,
+        )
+        terminate.assert_called_once_with(
+            {10: (1, 1.0)},
+            {11: (1, 2.0)},
+            wait_s=5,
+        )
+        sleep.assert_called_once_with(0.25)
+        self.assertEqual(snapshot.call_count, 2)
+
+    @patch("run_simulation_260706.time.sleep")
+    @patch("run_simulation_260706._terminate_spawned_descendants")
+    @patch(
+        "run_simulation_260706._snapshot_descendants",
+        side_effect=[{}, {}, {}],
+    )
+    @patch("run_simulation_260706.Simulation")
+    @patch("run_simulation_260706.pyDesktop")
+    def test_retry_exhaustion_is_explicit(
+            self, desktop_factory, simulation_factory, _snapshot,
+            _terminate, sleep):
+        desktops = [Mock(), Mock()]
+        desktop_factory.side_effect = desktops
+        simulation_factory.side_effect = [RuntimeError("grpc-1"), RuntimeError("grpc-2")]
+
+        with self.assertRaisesRegex(
+                RuntimeError, "AEDT desktop startup failed after 2 attempts"):
+            _create_simulation_session(max_attempts=2, retry_delay_s=1)
+
+        for desktop in desktops:
+            desktop.release_desktop.assert_called_once_with(
+                close_projects=True,
+                close_on_exit=True,
+            )
+        sleep.assert_called_once_with(1.0)
 
 
 class PrimaryTurnDomainTests(unittest.TestCase):
@@ -2330,6 +2398,14 @@ class ThermalHomogenizationTests(unittest.TestCase):
         self.assertEqual([turn.name for turn in explicit], ["rx_0", "rx_1", "rx_3", "rx_4"])
         self.assertEqual([turn.name for turn in blocked], ["rx_2"])
 
+    def test_single_turn_stays_exact_copper_with_zero_explicit_setting(self):
+        turn = SimpleNamespace(name="Rx_side_0_0")
+
+        explicit, blocked = _partition_rx_turns([turn], 0)
+
+        self.assertEqual(explicit, [turn])
+        self.assertEqual(blocked, [])
+
     def test_zero_explicit_blocks_span_the_complete_rx_pack(self):
         frame = pd.DataFrame([{
             "n_explicit_turns": 0,
@@ -2595,11 +2671,12 @@ class ThermalMeshPolicyTests(unittest.TestCase):
 
         self.assertEqual(mesh.calls, [
             ({"wcp_pad": 2, "core_pad": 2}, "pad_mesh_level"),
-            ({"tx_0": 2, "tx_1": 2}, "tx_mesh_level"),
-            ({"rx_main_block": 4, "rx_side_block": 4}, "rx_block_mesh_level"),
+            ({"tx_0": 4, "tx_1": 4}, "tx_mesh_level"),
+            ({"rx_main_block": 4}, "rx_main_block_mesh_level"),
+            ({"rx_side_block": 5}, "rx_side_block_mesh_level"),
             ({"rx_main": 3, "rx_side": 3}, "rx_mesh_level"),
         ])
-        self.assertEqual(len(mesh.meshoperations), 4)
+        self.assertEqual(len(mesh.meshoperations), 5)
         for operation in mesh.meshoperations:
             self.assertFalse(operation.auto_update)
             self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
@@ -2610,6 +2687,25 @@ class ThermalMeshPolicyTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "tx_mesh_level mesh operation update failed"):
             _assign_thermal_mesh(SimpleNamespace(mesh=mesh), self._objects())
+
+    def test_single_rx_turn_gets_pack_local_finest_mesh_level(self):
+        mesh = self._Mesh()
+        obj = lambda name: SimpleNamespace(name=name)
+        objects = {
+            "Tx": [], "wcp_pads": [], "core_pads": [],
+            "Rx_main_explicit": [], "Rx_main_blocks": [obj("rx_main_block")],
+            "Rx_side_explicit": [obj("Rx_side_0_0")], "Rx_side_blocks": [],
+            "Rx_side2_explicit": [], "Rx_side2_blocks": [],
+        }
+
+        _assign_thermal_mesh(SimpleNamespace(mesh=mesh), objects)
+
+        self.assertEqual(mesh.calls, [
+            ({"rx_main_block": 4}, "rx_main_block_mesh_level"),
+            ({"Rx_side_0_0": 5}, "rx_side_single_turn_mesh_level"),
+        ])
+        for operation in mesh.meshoperations:
+            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
 
 
 class FailureLogTests(unittest.TestCase):
