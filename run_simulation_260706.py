@@ -2680,14 +2680,23 @@ class Simulation():
             )
         return oproject, odesign
 
-    def _validated_matrix_hpc_acf(self):
+    def _validated_matrix_hpc_acf(self, acf_path=None):
         """Return the matrix solve's exact 4-core/one-engine DSO configuration."""
-        matrix_design = getattr(self, "design_matrix", None)
-        solver = getattr(matrix_design, "solver_instance", None)
-        working_directory = str(getattr(solver, "working_directory", "") or "").strip()
-        if not working_directory:
-            raise RuntimeError("authoritative matrix HPC working directory is unavailable")
-        path = os.path.abspath(os.path.join(working_directory, "pyaedt_config.acf"))
+        if acf_path is None:
+            matrix_design = getattr(self, "design_matrix", None)
+            solver = getattr(matrix_design, "solver_instance", None)
+            working_directory = str(
+                getattr(solver, "working_directory", "") or ""
+            ).strip()
+            if not working_directory:
+                raise RuntimeError(
+                    "authoritative matrix HPC working directory is unavailable"
+                )
+            path = os.path.abspath(
+                os.path.join(working_directory, "pyaedt_config.acf")
+            )
+        else:
+            path = os.path.abspath(os.fspath(acf_path))
         if not os.path.isfile(path):
             raise RuntimeError(f"authoritative matrix HPC ACF is missing: {path}")
         if os.path.getsize(path) <= 0 or os.path.getsize(path) > 65536:
@@ -2724,6 +2733,35 @@ class Simulation():
             )
         return path
 
+    def _capture_matrix_hpc_acf(
+            self, max_attempts=5, retry_delay=0.5, sleeper=time.sleep):
+        """Capture the matrix ACF before CopyDesign can stale its PyAEDT wrapper."""
+        max_attempts = int(max_attempts)
+        if max_attempts < 1:
+            raise ValueError("matrix HPC ACF capture max_attempts must be positive")
+        errors = []
+        for attempt in range(1, max_attempts + 1):
+            try:
+                path = self._validated_matrix_hpc_acf()
+                self._matrix_hpc_acf_path = path
+                return path
+            except Exception as error:
+                errors.append(
+                    f"attempt {attempt}: {type(error).__name__}: {error}"
+                )
+                if attempt < max_attempts:
+                    logging.warning(
+                        "matrix HPC ACF capture failed "
+                        f"(attempt {attempt}/{max_attempts}): {error}"
+                    )
+                    sleeper(
+                        max(0.0, float(retry_delay)) * (2 ** (attempt - 1))
+                    )
+        raise RuntimeError(
+            "matrix HPC ACF capture failed before copied-loss design creation: "
+            + "; ".join(errors)
+        )
+
     def _restore_native_maxwell_dso(
             self, registry_key, original_config, max_attempts=5,
             retry_delay=0.5, sleeper=time.sleep):
@@ -2754,7 +2792,14 @@ class Simulation():
             self, setup_name="Setup1", max_attempts=5, timeout_s=30.0,
             initial_retry_delay=0.5, clock=time.monotonic, sleeper=time.sleep):
         """Retry only copied-loss solve preflight; never dispatch a solve here."""
-        acf_path = self._validated_matrix_hpc_acf()
+        captured_acf = getattr(self, "_matrix_hpc_acf_path", None)
+        if not captured_acf:
+            raise RuntimeError(
+                "captured matrix HPC ACF is unavailable before copied-loss solve"
+            )
+        # Revalidate the exact captured file and its full DSO contract without
+        # calling the source design's stale oproject.GetPath after CopyDesign.
+        acf_path = self._validated_matrix_hpc_acf(captured_acf)
         registry_key = r"Desktop/ActiveDSOConfigurations/Maxwell 3D"
         deadline = clock() + max(0.0, float(timeout_s))
         original_config = None
@@ -3326,6 +3371,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             # the solved source design before CopyDesign. Shorter matrix runs
             # exposed a copied design with no solution type or Setup1.
             old_design.save_project()
+            if not model_only:
+                sim._capture_matrix_hpc_acf()
             time.sleep(5)
             op.CopyDesign("maxwell_matrix")
             op.Paste()

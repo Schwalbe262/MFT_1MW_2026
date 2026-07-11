@@ -28,10 +28,15 @@ CAMPAIGN_MUTATION_LOCK_PATH = (
     Path(_LOCALAPPDATA) / "MFT_1MW_2026" / "campaign-mutation.lock")
 CAMPAIGN_MUTATION_LOCK_TIMEOUT = 15 * 60
 _CAMPAIGN_LOCK_STATE = threading.local()
+# MFT solver tasks are single-node. Fluent drops the generic Intel-MPI
+# bootstrap variable and otherwise sees SLURM_JOB_ID and launches nested srun;
+# its launcher consumes FLUENT_MPIRUN_FLAGS for the explicit local bootstrap.
 BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
         "module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; "
         "export FLEXLM_TIMEOUT=3000000; "
-        "export I_MPI_HYDRA_BOOTSTRAP=fork; sleep $((RANDOM % 60)); ")
+        "export I_MPI_HYDRA_BOOTSTRAP=fork; "
+        "export FLUENT_MPIRUN_FLAGS='-bootstrap fork'; "
+        "sleep $((RANDOM % 60)); ")
 
 RESULT_VALID = "valid"
 RESULT_INVALID = "invalid"

@@ -376,7 +376,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
                 scheduler_client.reconcile_task_id(
                     "candidate-foreign", "exact-key", attempts=1)
 
-    def test_submit_exports_fork_bootstrap_before_solver_launch(self):
+    def test_submit_exports_fluent_fork_bootstrap_before_solver_launch(self):
         submitted = Mock(status_code=201)
         submitted.json.return_value = {"id": 40}
 
@@ -393,10 +393,16 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             )
 
         command = post.call_args.kwargs["json"]["command"]
-        bootstrap_export = "export I_MPI_HYDRA_BOOTSTRAP=fork;"
-        self.assertEqual(command.count(bootstrap_export), 1)
+        hydra_export = "export I_MPI_HYDRA_BOOTSTRAP=fork;"
+        fluent_export = "export FLUENT_MPIRUN_FLAGS='-bootstrap fork';"
+        self.assertEqual(command.count(hydra_export), 1)
+        self.assertEqual(command.count(fluent_export), 1)
         self.assertLess(
-            command.index(bootstrap_export),
+            command.index(hydra_export),
+            command.index(fluent_export),
+        )
+        self.assertLess(
+            command.index(fluent_export),
             command.index("python run_simulation_260706.py"),
         )
 

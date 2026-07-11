@@ -1133,6 +1133,9 @@ $end 'DSOConfig'
                 working_directory=str(matrix_working)
             )
         )
+        simulation._matrix_hpc_acf_path = str(
+            matrix_working / "pyaedt_config.acf"
+        )
         simulation.NUM_CORE = 4
         simulation.NUM_TASK = 1
         simulation.loss_native_analyze_required = True
@@ -1173,6 +1176,85 @@ $end 'DSOConfig'
                 project.active_calls,
                 ["maxwell_matrix1"] * 5,
             )
+
+    def test_transient_getpath_capture_then_cached_loss_solve_exactly_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, _desktop, _project, design, high_level = self._simulation(
+                root
+            )
+            matrix_working = Path(root) / "matrix_working"
+
+            class FlakySolver:
+                def __init__(self):
+                    self.calls = 0
+
+                @property
+                def working_directory(self):
+                    self.calls += 1
+                    if self.calls < 3:
+                        raise RuntimeError("Failed to execute gRPC AEDT command: GetPath")
+                    return str(matrix_working)
+
+            solver = FlakySolver()
+            simulation.design_matrix = SimpleNamespace(solver_instance=solver)
+            del simulation._matrix_hpc_acf_path
+            simulation.solve_attempts = {"matrix": 1}
+            sleeper = Mock()
+
+            captured = simulation._capture_matrix_hpc_acf(
+                max_attempts=3, retry_delay=0.25, sleeper=sleeper
+            )
+            self._no_wait_preflight(simulation)
+            simulation.analyze_and_extract("loss", lambda: None)
+
+            self.assertEqual(captured, str(matrix_working / "pyaedt_config.acf"))
+            self.assertEqual(solver.calls, 3)
+            self.assertEqual(
+                [call.args[0] for call in sleeper.call_args_list],
+                [0.25, 0.5],
+            )
+            design.Analyze.assert_called_once_with("Setup1", True)
+            high_level.assert_not_called()
+            self.assertEqual(simulation.solve_attempts, {"matrix": 1, "loss": 1})
+
+    def test_getpath_capture_exhaustion_never_dispatches_loss_solve(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, high_level = self._simulation(
+                root
+            )
+
+            class FailedSolver:
+                def __init__(self):
+                    self.calls = 0
+
+                @property
+                def working_directory(self):
+                    self.calls += 1
+                    raise RuntimeError(
+                        "Failed to execute gRPC AEDT command: GetPath"
+                    )
+
+            solver = FailedSolver()
+            simulation.design_matrix = SimpleNamespace(solver_instance=solver)
+            del simulation._matrix_hpc_acf_path
+            simulation.solve_attempts = {"matrix": 1}
+            sleeper = Mock()
+
+            with self.assertRaisesRegex(
+                    RuntimeError, "capture failed before copied-loss design creation"):
+                simulation._capture_matrix_hpc_acf(
+                    max_attempts=3, retry_delay=0.25, sleeper=sleeper
+                )
+
+            self.assertEqual(solver.calls, 3)
+            self.assertEqual(
+                [call.args[0] for call in sleeper.call_args_list],
+                [0.25, 0.5],
+            )
+            design.Analyze.assert_not_called()
+            high_level.assert_not_called()
+            self.assertEqual(simulation.solve_attempts, {"matrix": 1})
+            self.assertEqual(desktop.registry_loads, [])
 
     def test_save_preflight_and_analyze_are_adjacent_and_ordered(self):
         with tempfile.TemporaryDirectory() as root:
