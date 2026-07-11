@@ -31,11 +31,14 @@ REVISION_ARGS=(
   --solver-revision "$MFT_SOLVER_REVISION"
   --library-revision "$MFT_LIBRARY_REVISION"
 )
+OUTPUT_ROOT="$PWD/training"
+RUN_ROOT="$OUTPUT_ROOT/checkpoint_runs/${MFT_SOLVER_REVISION}-${MFT_LIBRARY_REVISION}"
 
 while true; do
   printf '[checkpoint] start %s\n' "$(date -Iseconds)"
   if ! "$PY" training/checkpoint_orchestrator.py \
-      --runtime-root "$PWD" --execute \
+      --runtime-root "$PWD" \
+      --output-root "$OUTPUT_ROOT" --run-root "$RUN_ROOT" --execute \
       "${REVISION_ARGS[@]}" "${PROFILE_ARGS[@]}" 2>&1 | tail -30; then
     echo "[checkpoint] attempt failed or another worker owns the durable lock" >&2
   fi

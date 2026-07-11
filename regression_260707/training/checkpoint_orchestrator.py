@@ -515,6 +515,13 @@ def main():
     parser.add_argument("--runtime-root", default=str(REGRESSION_ROOT))
     parser.add_argument("--dataset", default=None)
     parser.add_argument("--output-root", default=None)
+    parser.add_argument(
+        "--run-root", default=None,
+        help=(
+            "identity-scoped checkpoint state and evidence root; shared model "
+            "and monitoring artifacts remain under --output-root"
+        ),
+    )
     parser.add_argument("--profile", default=None)
     parser.add_argument("--thresholds", default=str(DEFAULT_THRESHOLDS))
     parser.add_argument("--min-rows", type=int, default=200)
@@ -550,7 +557,8 @@ def main():
     output_root = os.path.abspath(
         args.output_root or os.path.join(runtime_root, "training")
     )
-    state_path = os.path.join(output_root, "checkpoint_state.json")
+    run_root = os.path.abspath(args.run_root or output_root)
+    state_path = os.path.join(run_root, "checkpoint_state.json")
     from quality_contract import DEFAULT_PROFILE_PATH, load_profile
 
     args.profile = os.path.abspath(args.profile or DEFAULT_PROFILE_PATH)
@@ -617,6 +625,7 @@ def main():
         "due_thresholds": due,
         "deferred_thresholds": deferred,
         "checkpoint_state_schema": state.get("schema_version"),
+        "checkpoint_run_root": run_root,
         "reconciliation_issues": reconciliation_issues,
         "state_identity": identity,
         "execute": bool(args.execute),
@@ -701,7 +710,7 @@ def main():
             }
             state.setdefault("attempts", []).append(attempt)
             _save_state(state, state_path)
-            snapshot = _snapshot_name(output_root, threshold, strict)
+            snapshot = _snapshot_name(run_root, threshold, strict)
             clean_snapshot = strict.drop(
                 columns=[
                     "_strict_valid_em", "_strict_valid_thermal",
@@ -721,12 +730,12 @@ def main():
             candidate_generation = None
             attempt_number = len(state["attempts"])
             metrics_result = os.path.join(
-                output_root,
+                run_root,
                 "checkpoint_metrics",
                 f"threshold_{threshold:06d}_attempt_{attempt_number:06d}.json",
             )
             candidate_result = os.path.join(
-                output_root,
+                run_root,
                 "candidate_results",
                 f"threshold_{threshold:06d}_attempt_{attempt_number:06d}.json",
             )

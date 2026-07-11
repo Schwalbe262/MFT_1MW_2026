@@ -482,6 +482,32 @@ class CheckpointRecoveryTests(unittest.TestCase):
             }), encoding="utf-8")
             dataset = root / "train.parquet"
             output = root / "training"
+            run_root = output / "checkpoint_runs" / (
+                f"{'a' * 40}-{'b' * 40}"
+            )
+            output.mkdir(parents=True)
+            legacy_state = output / "checkpoint_state.json"
+            legacy_state.write_text(json.dumps({
+                "schema_version": 2,
+                "completed": [],
+                "attempts": [],
+                "identity": {"solver_revision": "f" * 40},
+            }), encoding="utf-8")
+            legacy_state_bytes = legacy_state.read_bytes()
+            registry_pointer = output / "registry" / "current.json"
+            registry_pointer.parent.mkdir()
+            registry_pointer.write_text(
+                json.dumps({"legacy_sentinel": True}), encoding="utf-8"
+            )
+            registry_pointer_bytes = registry_pointer.read_bytes()
+            curve = output / "learning_curve.csv"
+            curve.write_text("legacy-curve\n", encoding="utf-8")
+            curve_bytes = curve.read_bytes()
+            quality_status = output / "model_quality_status.json"
+            quality_status.write_text(
+                json.dumps({"legacy_sentinel": True}), encoding="utf-8"
+            )
+            quality_status_bytes = quality_status.read_bytes()
             strict = pd.DataFrame({
                 "project_name": [f"simulation-{index}" for index in range(500)],
                 "_strict_valid_em": [True] * 500,
@@ -499,7 +525,15 @@ class CheckpointRecoveryTests(unittest.TestCase):
                 self.assertIn("checkpoint_train.py", command[1])
                 result_path = command[command.index("--result-json") + 1]
                 snapshot_path = command[command.index("--dataset") + 1]
+                curve_path = command[command.index("--curve-csv") + 1]
                 checkpoint = int(command[command.index("--checkpoint") + 1])
+                self.assertTrue(
+                    Path(result_path).resolve().is_relative_to(run_root.resolve())
+                )
+                self.assertTrue(
+                    Path(snapshot_path).resolve().is_relative_to(run_root.resolve())
+                )
+                self.assertEqual(Path(curve_path).resolve(), curve.resolve())
                 Path(result_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(result_path).write_text(json.dumps({
                     "checkpoint": checkpoint,
@@ -516,8 +550,11 @@ class CheckpointRecoveryTests(unittest.TestCase):
                 "--runtime-root", str(root),
                 "--dataset", str(dataset),
                 "--output-root", str(output),
+                "--run-root", str(run_root),
                 "--profile", str(profile),
                 "--thresholds", str(thresholds_path),
+                "--solver-revision", "a" * 40,
+                "--library-revision", "b" * 40,
                 "--execute",
             ]
             with patch.object(sys, "argv", argv), patch.object(
@@ -526,11 +563,81 @@ class CheckpointRecoveryTests(unittest.TestCase):
             ), patch.object(checkpoint_orchestrator, "_run", side_effect=fake_run):
                 checkpoint_orchestrator.main()
             state = json.loads(
-                (output / "checkpoint_state.json").read_text(encoding="utf-8")
+                (run_root / "checkpoint_state.json").read_text(encoding="utf-8")
+            )
+            status = json.loads(
+                (output / "strict_data_status.json").read_text(encoding="utf-8")
             )
             self.assertEqual(len(commands), 1)
             self.assertEqual(state["completed"][0]["kind"], "metrics_only")
-            self.assertFalse((output / "registry" / "current.json").exists())
+            self.assertEqual(legacy_state.read_bytes(), legacy_state_bytes)
+            self.assertEqual(registry_pointer.read_bytes(), registry_pointer_bytes)
+            self.assertEqual(curve.read_bytes(), curve_bytes)
+            self.assertEqual(quality_status.read_bytes(), quality_status_bytes)
+            self.assertEqual(
+                status["checkpoint_run_root"], os.path.abspath(run_root)
+            )
+            self.assertEqual(
+                status["state_identity"]["solver_revision"], "a" * 40
+            )
+            self.assertFalse((run_root / "strict_data_status.json").exists())
+
+    def test_same_run_root_keeps_identity_mismatch_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = root / "profile.json"
+            profile.write_text(json.dumps({
+                "param_overrides": {"full_model": 0}
+            }), encoding="utf-8")
+            thresholds = root / "thresholds.json"
+            thresholds.write_text(json.dumps({
+                "minimum_strict_full_rows": 3000,
+                "targets": {},
+            }), encoding="utf-8")
+            dataset = root / "train.parquet"
+            output = root / "training"
+            run_root = output / "checkpoint_runs" / "fixed"
+            empty = pd.DataFrame({
+                "_strict_valid_em": pd.Series(dtype=bool),
+                "_strict_valid_thermal": pd.Series(dtype=bool),
+                "_strict_valid_full": pd.Series(dtype=bool),
+                "_strict_invalid_reasons": pd.Series(dtype=str),
+            })
+
+            def invoke(solver_revision):
+                argv = [
+                    "checkpoint_orchestrator.py",
+                    "--runtime-root", str(root),
+                    "--dataset", str(dataset),
+                    "--output-root", str(output),
+                    "--run-root", str(run_root),
+                    "--profile", str(profile),
+                    "--thresholds", str(thresholds),
+                    "--solver-revision", solver_revision,
+                    "--library-revision", "b" * 40,
+                    "--execute",
+                ]
+                with patch.object(sys, "argv", argv), patch.object(
+                    checkpoint_orchestrator, "inspect_dataset",
+                    return_value=(empty, empty, empty, {}),
+                ):
+                    checkpoint_orchestrator.main()
+
+            invoke("a" * 40)
+            state_path = run_root / "checkpoint_state.json"
+            original_state = state_path.read_bytes()
+            original_status = (
+                output / "strict_data_status.json"
+            ).read_bytes()
+            with self.assertRaisesRegex(
+                RuntimeError, "runtime identity changed.*solver_revision"
+            ):
+                invoke("c" * 40)
+            self.assertEqual(state_path.read_bytes(), original_state)
+            self.assertEqual(
+                (output / "strict_data_status.json").read_bytes(),
+                original_status,
+            )
 
 
 class ActiveLearningPinTests(unittest.TestCase):
@@ -609,10 +716,22 @@ class LoopSeparationTests(unittest.TestCase):
         checkpoint_train = (HERE / "training" / "checkpoint_train.py").read_text(
             encoding="utf-8"
         )
+        powershell_launcher = (HERE.parent / "start_checkpoint_loop.ps1").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("checkpoint_orchestrator.py", collector)
         self.assertIn("checkpoint_orchestrator.py", trainer)
         self.assertIn("--solver-revision", trainer)
         self.assertIn("--library-revision", trainer)
+        self.assertIn('--output-root "$OUTPUT_ROOT"', trainer)
+        self.assertIn('--run-root "$RUN_ROOT"', trainer)
+        self.assertIn(
+            'checkpoint_runs/${MFT_SOLVER_REVISION}-${MFT_LIBRARY_REVISION}',
+            trainer,
+        )
+        self.assertIn('[string]$RunRoot', powershell_launcher)
+        self.assertIn('"--run-root", $RunRoot', powershell_launcher)
+        self.assertIn('Join-Path "checkpoint_runs" $RevisionKey', powershell_launcher)
         self.assertIn('MFT_SOLVER_REVISION="$SOLVER_REVISION"', relaunch)
         self.assertIn('MFT_LIBRARY_REVISION="$LIBRARY_REVISION"', relaunch)
         self.assertIn("auto_collect_loop.sh", relaunch)

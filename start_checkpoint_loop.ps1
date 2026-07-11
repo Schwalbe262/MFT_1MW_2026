@@ -2,6 +2,7 @@ param(
     [string]$RuntimeRoot = "Y:\git\MFT_1MW_2026\regression_260707",
     [string]$Dataset = "",
     [string]$OutputRoot = "",
+    [string]$RunRoot = "",
     [string]$Profile = "",
     [int]$IntervalSeconds = 600,
     [string]$Python = "$HOME\anaconda3\envs\pyaedt2026v1\python.exe",
@@ -22,7 +23,14 @@ $ScriptPath = Join-Path $PSScriptRoot "regression_260707\training\checkpoint_orc
 $Arguments = @($ScriptPath, "--runtime-root", $RuntimeRoot)
 $Arguments += @("--solver-revision", $SolverRevision, "--library-revision", $LibraryRevision)
 if ($Dataset) { $Arguments += @("--dataset", $Dataset) }
-if ($OutputRoot) { $Arguments += @("--output-root", $OutputRoot) }
+if (-not $OutputRoot) {
+    $OutputRoot = Join-Path $RuntimeRoot "training"
+}
+if (-not $RunRoot) {
+    $RevisionKey = "$($SolverRevision.ToLowerInvariant())-$($LibraryRevision.ToLowerInvariant())"
+    $RunRoot = Join-Path $OutputRoot (Join-Path "checkpoint_runs" $RevisionKey)
+}
+$Arguments += @("--output-root", $OutputRoot, "--run-root", $RunRoot)
 if ($Profile) {
     $Profile = (Resolve-Path -LiteralPath $Profile).ProviderPath
     $Arguments += @("--profile", $Profile)
