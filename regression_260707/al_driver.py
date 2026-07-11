@@ -15,6 +15,7 @@
   python al_driver.py --reset    # 처음부터
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -50,6 +51,10 @@ EXECUTE_SUBMISSIONS = False
 PINNED_SOLVER_REVISION = None
 PINNED_LIBRARY_REVISION = None
 PY = sys.executable
+MIN_STRICT_FULL_ROWS = 3000
+QUALITY_THRESHOLDS_PATH = os.path.join(
+    CODE_ROOT, "training", "model_quality_thresholds.json"
+)
 
 SPEC = {
     "Llt_target_uH": 27.5, "Llt_tol_uH": 0.55,
@@ -72,7 +77,9 @@ ACTUAL_TEMPERATURES = {
     "Tprobe_core_center_max": "T_max_core",
 }
 TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
-LOSS_COMPONENTS = ("P_winding_total", "P_core_total", "P_core_plate_total")
+LOSS_COMPONENTS = (
+    "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
+)
 SOURCE_RANK_COLUMN = "_collector_source_rank"
 AL_SOURCE_RANK = 50
 
@@ -112,6 +119,91 @@ def _finite(value):
         return math.isfinite(float(value))
     except (TypeError, ValueError, OverflowError):
         return False
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _runtime_identity():
+    if not PINNED_SOLVER_REVISION or not PINNED_LIBRARY_REVISION:
+        raise RuntimeError("AL runtime requires explicit solver/library revision pins")
+    return {
+        "schema_version": 2,
+        "solver_revision": str(PINNED_SOLVER_REVISION).lower(),
+        "library_revision": str(PINNED_LIBRARY_REVISION).lower(),
+        "dataset": os.path.abspath(DATASET),
+        "registry": os.path.abspath(REGISTRY),
+        "quality_thresholds_sha256": _sha256(QUALITY_THRESHOLDS_PATH),
+        "minimum_strict_full_rows": MIN_STRICT_FULL_ROWS,
+    }
+
+
+def _bind_runtime_identity(state):
+    expected = _runtime_identity()
+    existing = state.get("runtime_identity")
+    if existing is None:
+        is_fresh = (
+            state.get("stage") == "TRAIN"
+            and not state.get("training_run_id")
+            and not state.get("task_map")
+            and not state.get("final_verification")
+        )
+        if not is_fresh:
+            raise RuntimeError(
+                "legacy/unpinned AL state cannot be resumed; archive it and use --reset"
+            )
+        state["runtime_identity"] = expected
+    elif existing != expected:
+        raise RuntimeError(
+            f"AL runtime identity mismatch: stored={existing}, expected={expected}"
+        )
+    return expected
+
+
+def _assert_training_invariants(state):
+    identity = _bind_runtime_identity(state)
+    quality = state.get("model_quality_snapshot") or {}
+    snapshot = state.get("training_dataset")
+    generation = state.get("training_generation")
+    run_id = state.get("training_run_id")
+    reasons = []
+    if int(state.get("training_strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS:
+        reasons.append("insufficient_pinned_strict_full_rows")
+    if not quality.get("passed"):
+        reasons.append("model_quality_gate_not_passed")
+    if int(quality.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS:
+        reasons.append("quality_snapshot_below_3000")
+    if quality.get("training_run_id") != run_id:
+        reasons.append("training_run_identity_mismatch")
+    if (quality.get("solver_revision") != identity["solver_revision"]
+            or quality.get("library_revision") != identity["library_revision"]):
+        reasons.append("training_revision_identity_mismatch")
+    if quality.get("quality_thresholds_sha256") != identity["quality_thresholds_sha256"]:
+        reasons.append("quality_thresholds_identity_mismatch")
+    if not snapshot or not os.path.isfile(snapshot):
+        reasons.append("training_snapshot_missing")
+    elif quality.get("dataset_sha256") != _sha256(snapshot):
+        reasons.append("training_snapshot_fingerprint_mismatch")
+    if not generation or not os.path.isdir(generation):
+        reasons.append("training_generation_missing")
+    else:
+        report_path = os.path.join(generation, "train_report.json")
+        try:
+            with open(report_path, encoding="utf-8") as handle:
+                report = json.load(handle)
+            if (report.get("training_run_id") != run_id
+                    or report.get("dataset_sha256") != quality.get("dataset_sha256")
+                    or int(report.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS):
+                reasons.append("training_generation_identity_mismatch")
+        except Exception:
+            reasons.append("training_generation_report_unavailable")
+    if reasons:
+        raise RuntimeError("AL training invariant failed: " + ";".join(reasons))
 
 
 def _required_probe_targets(result):
@@ -519,6 +611,7 @@ def run(cmd, **kw):
 def stage_train(st):
     from quality_contract import annotate_validity
 
+    _bind_runtime_identity(st)
     rnd = st["round"]
     rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     os.makedirs(rdir, exist_ok=True)
@@ -534,6 +627,11 @@ def stage_train(st):
         ],
         errors="ignore",
     )
+    if len(strict) < MIN_STRICT_FULL_ROWS:
+        raise RuntimeError(
+            f"AL requires at least {MIN_STRICT_FULL_ROWS} pinned strict-full rows; "
+            f"found {len(strict)}"
+        )
     model_dataset = os.path.join(rdir, "strict_training_snapshot.parquet")
     _atomic_write_parquet(strict, model_dataset)
     from training.train_models import (
@@ -567,8 +665,17 @@ def stage_train(st):
             pointer = json.load(handle)
         with open(QUALITY_STATUS, encoding="utf-8") as handle:
             quality_snapshot = json.load(handle)
+        quality_snapshot.update({
+            "solver_revision": PINNED_SOLVER_REVISION,
+            "library_revision": PINNED_LIBRARY_REVISION,
+            "quality_thresholds_sha256": _sha256(QUALITY_THRESHOLDS_PATH),
+        })
         if (not quality_snapshot.get("passed")
-                or quality_snapshot.get("training_run_id") != pointer["training_run_id"]):
+                or quality_snapshot.get("training_run_id") != pointer["training_run_id"]
+                or int(quality_snapshot.get("strict_full_rows") or 0)
+                < MIN_STRICT_FULL_ROWS
+                or quality_snapshot.get("quality_thresholds_sha256")
+                != _sha256(QUALITY_THRESHOLDS_PATH)):
             raise RuntimeError("activated registry and quality snapshot do not match")
         generation_dir = os.path.abspath(os.path.join(REGISTRY, pointer["generation"]))
         quality_snapshot_path = os.path.join(rdir, "model_quality_snapshot.json")
@@ -607,6 +714,7 @@ def stage_train(st):
 
 
 def stage_optimize(st):
+    _assert_training_invariants(st)
     rnd = st["round"]
     spec_path = os.path.join(_active_al_root(), f"round_{rnd:02d}_spec.json")
     os.makedirs(os.path.dirname(spec_path), exist_ok=True)
@@ -623,6 +731,7 @@ def stage_optimize(st):
 
 
 def stage_select(st):
+    _assert_training_invariants(st)
     rnd = st["round"]
     rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     X = np.load(os.path.join(rdir, "pareto_X.npy"))
@@ -655,6 +764,7 @@ def stage_select(st):
 
 
 def stage_submit(st):
+    _assert_training_invariants(st)
     if not EXECUTE_SUBMISSIONS:
         raise RuntimeError(
             "standard FEA submission is disabled; rerun with --execute after reviewing artifacts"
@@ -782,21 +892,29 @@ def stage_wait(st):
             continue
 
         record["last_result_state"] = fetched.state
-        if fetched.state == sc.RESULT_VALID:
+        row = front.iloc[int(idx_str)]
+        params = {
+            key: (row[key].item() if hasattr(row[key], "item") else row[key])
+            for key in KEYS if key in front.columns and pd.notna(row[key])
+        }
+        result_matches = (
+            fetched.state == sc.RESULT_VALID
+            and sc.result_matches_params(fetched.result, params)
+        )
+        if result_matches:
             record["result"] = fetched.result
             record["outcome"] = "valid"
             record.pop("fetch_error", None)
             save_state(st)
             continue
+        if fetched.state == sc.RESULT_VALID:
+            record["last_result_state"] = "candidate_result_identity_mismatch"
 
         if int(record.get("attempt", 0)) >= 1:
             record["outcome"] = "exhausted"
             save_state(st)
             continue
 
-        row = front.iloc[int(idx_str)]
-        params = {k: (row[k].item() if hasattr(row[k], "item") else row[k])
-                  for k in KEYS if k in front.columns and pd.notna(row[k])}
         retry_name = f"mft-al-r{rnd:02d}-retry-{idx_str}"
         retry_workdir = f"mft_al_r{rnd:02d}_rt{idx_str}"
         new_tid = sc.submit_verification(
@@ -913,6 +1031,21 @@ def stage_ingest(st):
                 res, expected_revision=expected_revision,
                 expected_library_revision=expected_library):
             record["outcome"] = "pending"
+            record["result"] = None
+            st["stage"] = "WAIT"
+            save_state(st)
+            return
+        from module.input_parameter_260706 import KEYS
+        candidate_row = front.iloc[int(idx_str)]
+        candidate_params = {
+            key: (candidate_row[key].item()
+                  if hasattr(candidate_row[key], "item") else candidate_row[key])
+            for key in KEYS
+            if key in front.columns and pd.notna(candidate_row[key])
+        }
+        if not sc.result_matches_params(res, candidate_params):
+            record["outcome"] = "pending"
+            record["last_result_state"] = "candidate_result_identity_mismatch"
             record["result"] = None
             st["stage"] = "WAIT"
             save_state(st)
@@ -1115,6 +1248,7 @@ def stage_check(st):
 
 
 def stage_final_select(st):
+    _assert_training_invariants(st)
     from verify.finalize import collect_standard_pass_candidates
 
     queue = collect_standard_pass_candidates(
@@ -1165,6 +1299,7 @@ def stage_final_select(st):
 
 
 def stage_fine_submit(st):
+    _assert_training_invariants(st)
     if not EXECUTE_SUBMISSIONS:
         raise RuntimeError(
             "fine FEA submission is disabled; inspect fine_candidate_queue.csv "
@@ -1252,14 +1387,23 @@ def stage_fine_wait(st):
             save_state(st)
             raise RuntimeError(f"fine stdout unavailable for task {task_id}") from exc
         record["last_result_state"] = fetched.state
-        if fetched.state == sc.RESULT_VALID:
+        candidate = st["final_candidates"][int(key)]
+        result_matches = (
+            fetched.state == sc.RESULT_VALID
+            and sc.result_matches_params(fetched.result, candidate.get("params"))
+        )
+        if result_matches:
             record["outcome"] = "valid"
             record["result"] = fetched.result
-        elif int(record.get("attempt", 0)) >= 1:
+            save_state(st)
+            continue
+        if fetched.state == sc.RESULT_VALID:
+            record["last_result_state"] = "candidate_result_identity_mismatch"
+        if int(record.get("attempt", 0)) >= 1:
             # This is not a physical spec failure.  The smaller candidate
             # remains unverified and therefore blocks any minimum-volume PASS.
             record["outcome"] = "unverified"
-            record["unverified_reason"] = fetched.state
+            record["unverified_reason"] = record["last_result_state"]
         else:
             if not EXECUTE_SUBMISSIONS:
                 raise RuntimeError(
@@ -1304,11 +1448,34 @@ def stage_fine_wait(st):
         key for key, record in records.items()
         if record.get("outcome") == "unverified"
     ]
-    if unverified:
+    from verify.finalize import candidate_identity_reasons, physical_spec_reasons
+    passing_volumes = []
+    for key, record in records.items():
+        if record.get("outcome") != "valid":
+            continue
+        candidate = st["final_candidates"][int(key)]
+        result = record.get("result") or {}
+        if not (physical_spec_reasons(result)
+                + candidate_identity_reasons(result, candidate)):
+            try:
+                passing_volumes.append(float(candidate["volume_L"]))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+    smallest_pass_volume = min(passing_volumes) if passing_volumes else None
+    blocking_unverified = []
+    for key in unverified:
+        try:
+            volume = float(st["final_candidates"][int(key)]["volume_L"])
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+            blocking_unverified.append(key)
+            continue
+        if smallest_pass_volume is None or volume < smallest_pass_volume:
+            blocking_unverified.append(key)
+    if blocking_unverified:
         st["stage"] = "FINE_BLOCKED"
         st["fine_block_reason"] = (
             "smaller candidate fine FEA remained invalid/missing after one retry: "
-            + ",".join(unverified)
+            + ",".join(blocking_unverified)
         )
         print(f"[al] FINE BLOCKED: {st['fine_block_reason']}")
         return
@@ -1322,7 +1489,10 @@ def stage_fine_wait(st):
 
 
 def stage_final_report(st):
-    from verify.finalize import physical_spec_reasons, write_final_artifacts
+    from verify.finalize import (
+        candidate_identity_reasons, physical_spec_reasons,
+        write_final_artifacts,
+    )
 
     records = st.get("fine_task_records") or {}
     fine_results = [
@@ -1339,10 +1509,8 @@ def stage_final_report(st):
             or model_quality.get("training_run_id") != st.get("training_run_id")):
         raise RuntimeError("final report is blocked by a missing/failed model quality gate")
     current_pass = any(
-        not physical_spec_reasons(
-            result,
-            candidate.get("geometry_evidence", candidate.get("params", {})),
-        )
+        not (physical_spec_reasons(result)
+             + candidate_identity_reasons(result, candidate))
         for candidate, result in zip(st["final_candidates"], fine_results)
     )
     cursor = int(st.get("fine_queue_cursor", 0)) + len(st["final_candidates"])
@@ -1352,16 +1520,25 @@ def stage_final_report(st):
         # failure.  Continue with the next volume-ordered batch before asking
         # NSGA-II for more designs.
         history = st.setdefault("fine_attempt_history", [])
-        for candidate, result in zip(st["final_candidates"], fine_results):
+        for rank, (candidate, result) in enumerate(zip(
+                st["final_candidates"], fine_results)):
+            record = records.get(str(rank), {})
             history.append({
                 "candidate_digest": candidate["candidate_digest"],
                 "volume_L": candidate["volume_L"],
                 "passed": False,
-                "reasons": physical_spec_reasons(
-                    result,
-                    candidate.get("geometry_evidence", candidate.get("params", {})),
+                "reasons": (
+                    physical_spec_reasons(result)
+                    + candidate_identity_reasons(result, candidate)
                 ),
                 "fine_result": result,
+                "fine_task_id": record.get("active_id"),
+                "fine_task_status": record.get("last_status"),
+                "fine_attempt": record.get("attempt", 0),
+                "solver_revision": st.get("fine_solver_git_revision"),
+                "library_revision": st.get(
+                    "fine_pyaedt_library_git_revision"
+                ),
             })
         st["fine_queue_cursor"] = cursor
         st["fine_batch"] = int(st.get("fine_batch", 0)) + 1
@@ -1419,6 +1596,17 @@ def main():
     )
     args = ap.parse_args()
 
+    for label, revision in (
+        ("solver", args.solver_revision), ("library", args.library_revision),
+    ):
+        value = str(revision or "").strip().lower()
+        if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+            ap.error(f"{label} revision must be an explicit full 40-character SHA")
+        if label == "solver":
+            args.solver_revision = value
+        else:
+            args.library_revision = value
+
     configure_runtime(
         runtime_root=args.runtime_root,
         dataset=args.dataset,
@@ -1428,13 +1616,10 @@ def main():
         library_revision=args.library_revision,
     )
     EXECUTE_SUBMISSIONS = bool(args.execute)
-    if EXECUTE_SUBMISSIONS and (
-            not args.solver_revision or not args.library_revision):
-        ap.error("--execute requires full --solver-revision and --library-revision pins")
-
     if args.reset and os.path.isfile(STATE_PATH):
         os.remove(STATE_PATH)
     st = load_state()
+    _bind_runtime_identity(st)
     for _ in range(args.max_stages):
         if st["stage"] in ("DONE", "HARD_CAP", "FINE_BLOCKED"):
             print(f"[al] {st['stage'].lower()}. history:")

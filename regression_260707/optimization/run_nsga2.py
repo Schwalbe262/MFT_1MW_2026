@@ -25,9 +25,13 @@ from optimization.nsga2_problem import MFTProblem, T_TARGETS, DEFAULT_SPEC  # no
 
 REQUIRED_MODEL_TARGETS = [
     "Llt_phys", "k",
-    "P_winding_total", "P_core_total", "P_core_plate_total",
+    "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
     "B_max_core", "B_mean_core", *T_TARGETS,
 ]
+MIN_STRICT_FULL_ROWS = 3000
+VETTED_QUALITY_THRESHOLDS = os.path.abspath(os.path.join(
+    HERE, "..", "training", "model_quality_thresholds.json"
+))
 
 
 def _sha256(path):
@@ -106,7 +110,7 @@ def main():
     ap.add_argument("--output-root", default=os.path.join(HERE, "..", "al_rounds"))
     ap.add_argument(
         "--quality-thresholds",
-        default=os.path.join(HERE, "..", "training", "model_quality_thresholds.json"),
+        default=VETTED_QUALITY_THRESHOLDS,
     )
     ap.add_argument("--spec", default=None, help="스펙 오버라이드 JSON")
     ap.add_argument("--no-density-gate", action="store_true")
@@ -114,6 +118,10 @@ def main():
 
     out_dir = os.path.join(args.output_root, f"round_{args.round:02d}")
     os.makedirs(out_dir, exist_ok=True)
+
+    vetted_thresholds_sha256 = _sha256(VETTED_QUALITY_THRESHOLDS)
+    if _sha256(args.quality_thresholds) != vetted_thresholds_sha256:
+        raise SystemExit("quality thresholds differ from the vetted production contract")
 
     if bool(args.registry_generation) != bool(args.quality_status):
         raise SystemExit(
@@ -131,15 +139,26 @@ def main():
         dataset_sha = _sha256(args.dataset)
         if (not quality.get("passed")
                 or quality.get("dataset_sha256") != dataset_sha
+                or int(quality.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS
+                or quality.get("quality_thresholds_sha256")
+                != vetted_thresholds_sha256
                 or generation_report.get("dataset_sha256") != dataset_sha
+                or int(generation_report.get("strict_full_rows") or 0)
+                < MIN_STRICT_FULL_ROWS
                 or generation_report.get("training_run_id") != quality.get("training_run_id")):
             raise SystemExit("pinned surrogate generation/quality/dataset identity mismatch")
+        for key in ("solver_revision", "library_revision"):
+            value = str(quality.get(key) or "")
+            if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+                raise SystemExit(f"quality snapshot has no pinned {key}")
     else:
         from model_quality_gate import evaluate_registry
         with open(args.quality_thresholds, encoding="utf-8") as handle:
             quality_thresholds = json.load(handle)
         quality = evaluate_registry(args.registry, args.dataset, quality_thresholds)
-        if not quality["passed"]:
+        quality["quality_thresholds_sha256"] = vetted_thresholds_sha256
+        if (not quality["passed"]
+                or int(quality.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS):
             raise SystemExit(
                 "surrogate quality gate failed: " + "; ".join(quality["reasons"][:20])
             )
@@ -184,8 +203,10 @@ def main():
         raise SystemExit("모든 재시작에서 feasible 해 없음 - 제약 조임/데이터 커버리지 점검 필요")
 
     Xp, Fp, _ = nds_merge(F_list, X_list, [[None] * len(x) for x in X_list])
-    np.save(os.path.join(out_dir, "pareto_X.npy"), Xp)
-    np.save(os.path.join(out_dir, "pareto_F.npy"), Fp)
+    pareto_x_path = os.path.join(out_dir, "pareto_X.npy")
+    pareto_f_path = os.path.join(out_dir, "pareto_F.npy")
+    np.save(pareto_x_path, Xp)
+    np.save(pareto_f_path, Fp)
 
     # Pareto 후보의 파라미터/예측치 테이블
     frame, shrink, valid = problem.decode_batch(Xp)
@@ -197,18 +218,51 @@ def main():
             row[f"pred_{t}"] = float(mu[0])
             row[f"sigma_{t}"] = float(sg[0])
         rows.append(row)
+    front_path = os.path.join(out_dir, "pareto_front.csv")
     pd.concat([frame.reset_index(drop=True), pd.DataFrame(rows)], axis=1) \
-        .to_csv(os.path.join(out_dir, "pareto_front.csv"), index=False)
+        .to_csv(front_path, index=False)
+
+    model_artifacts = {
+        target: {
+            name: _sha256(os.path.join(registry_for_models, target, name))
+            for name in ("models.pkl", "meta.json")
+        }
+        for target in REQUIRED_MODEL_TARGETS
+    }
 
     with open(os.path.join(out_dir, "optimization_manifest.json"), "w", encoding="utf-8") as handle:
         json.dump({
             "training_run_id": quality.get("training_run_id"),
             "dataset_sha256": quality.get("dataset_sha256"),
             "quality_gate_passed": True,
+            "strict_full_rows": int(quality["strict_full_rows"]),
+            "quality_thresholds_sha256": vetted_thresholds_sha256,
+            "solver_revision": quality.get("solver_revision"),
+            "library_revision": quality.get("library_revision"),
+            "registry_generation": os.path.abspath(registry_for_models),
+            "generation_report_sha256": _sha256(os.path.join(
+                registry_for_models, "train_report.json"
+            )),
+            "model_artifacts_sha256": model_artifacts,
+            "quality_status_sha256": (
+                _sha256(args.quality_status) if args.quality_status else None
+            ),
+            "profile_sha256": (
+                generation_report.get("profile_sha256")
+                if args.registry_generation else None
+            ),
+            "pareto_front_sha256": _sha256(front_path),
+            "pareto_X_sha256": _sha256(pareto_x_path),
+            "pareto_F_sha256": _sha256(pareto_f_path),
             "required_models": REQUIRED_MODEL_TARGETS,
             "restarts": args.restarts,
             "population": args.pop,
             "round": args.round,
+            "seeds": [1000 + index for index in range(args.restarts)],
+            "termination": {
+                "ftol": 0.0025, "period": 30, "max_generations": 600,
+            },
+            "effective_spec": spec,
             "manufacturing_tolerance_policy": (
                 "excluded; exact-as-FEA geometry is assumed"
             ),

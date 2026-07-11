@@ -282,6 +282,27 @@ def required_temperature_columns(result):
     return tuple(columns)
 
 
+def result_matches_params(result, params):
+    """Require every submitted candidate input to be echoed by the result."""
+    if not isinstance(result, dict) or not isinstance(params, dict) or not params:
+        return False
+    for key, expected in params.items():
+        if key not in result:
+            return False
+        actual = result[key]
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+            try:
+                if not math.isclose(
+                        float(actual), float(expected),
+                        rel_tol=1e-9, abs_tol=1e-9):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return False
+        elif str(actual) != str(expected):
+            return False
+    return True
+
+
 def is_valid_result(
         result, expected_revision=None, expected_library_revision=None,
         expected_profile=None):
@@ -302,8 +323,10 @@ def is_valid_result(
         "Llt", "B_max_core", "full_model", "N2_side",
         "git_dirty", "pyaedt_library_git_dirty",
         "matrix_solve_attempts", "loss_solve_attempts",
-        "conv_passes_matrix", "conv_error_pct_matrix", "conv_delta_pct_matrix",
-        "conv_passes_loss", "conv_error_pct_loss", "conv_delta_pct_loss",
+        "conv_passes_matrix", "conv_consecutive_matrix",
+        "conv_error_pct_matrix", "conv_delta_pct_matrix",
+        "conv_passes_loss", "conv_consecutive_loss",
+        "conv_error_pct_loss", "conv_delta_pct_loss",
         "matrix_winding_stranded_count",
         "matrix_conductor_mesh_operation_count",
         "matrix_plate_eddy_off_readback_count",
@@ -311,7 +334,7 @@ def is_valid_result(
         "loss_winding_mesh_operation_count",
         "loss_conductor_mesh_operation_count",
         "loss_plate_eddy_on_readback_count",
-        "P_winding_total", "P_core_total", "P_core_plate_total",
+        "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
         "thermal_residual_flow_limit", "thermal_residual_energy_limit",
         "thermal_residual_continuity", "thermal_residual_x_velocity",
         "thermal_residual_y_velocity", "thermal_residual_z_velocity",
@@ -387,13 +410,18 @@ def is_valid_result(
             ("loss", "percent_error", "min_converged")):
         tolerance = float(result[tolerance_key])
         minimum_passes = float(profile_contract[minimum_key])
+        total_passes = float(result[f"conv_passes_{label}"])
+        consecutive = float(result[f"conv_consecutive_{label}"])
         if (not 0 < tolerance <= 1.5
-                or float(result[f"conv_passes_{label}"]) < minimum_passes
+                or total_passes < 1
+                or consecutive < minimum_passes
+                or consecutive > total_passes
+                or consecutive != math.floor(consecutive)
                 or not 0 <= float(result[f"conv_error_pct_{label}"]) <= tolerance
                 or not 0 <= float(result[f"conv_delta_pct_{label}"]) <= tolerance):
             return False
     if not all(float(result[key]) >= 0 for key in (
-            "P_winding_total", "P_core_total", "P_core_plate_total")):
+            "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total")):
         return False
     flow_limit = float(result["thermal_residual_flow_limit"])
     energy_limit = float(result["thermal_residual_energy_limit"])

@@ -12,7 +12,9 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
 
     dashboard = client.get("/api/dashboard")
     assert dashboard.status_code == 200
-    assert dashboard.json()["data"]["total_rows"] == 2
+    assert dashboard.json()["data"]["total_rows"] == 1
+    assert dashboard.json()["data"]["raw_total_rows"] == 2
+    assert dashboard.json()["data"]["count_basis"] == "pinned_strict_full"
 
     assert client.get("/api/status").status_code == 200
     assert client.get("/api/data").json()["complete_rows"] == 1

@@ -65,6 +65,7 @@ def valid_result(**updates):
         "loss_conductor_mesh_operation_count": 3,
         "loss_plate_eddy_on_readback_count": 5,
         "Llt": 13.75,
+        "l1": 50.0,
         "Ltx": 100.0,
         "Lrx": 100.0,
         "M": 86.25,
@@ -87,16 +88,39 @@ def valid_result(**updates):
         "max_passes": 10,
         "min_converged": 2,
         "freq": 1000.0,
+        "V1_rms": 1000.0,
+        "I1_rated": 1000.0,
+        "I2_rated": 100.0,
+        "I2_phase_deg": 0.0,
         "loss_from_copy": 1,
         "P_target": 1_000_000.0,
+        "V2_rms": 10_000.0,
+        "core_cm": 1.377,
+        "core_x": 1.51,
+        "core_y": 1.74,
+        "core_plate_on": 1,
+        "wcp_on": 1,
+        "round_corner": 0,
+        "plate_temp": 50.0,
+        "air_temp": 50.0,
+        "fan_velocity": 1.5,
+        "k_ins": 0.2,
+        "core_k_thermal": 2.0,
+        "rx_mesh_mode": "skin",
+        "fan_config": "dual",
+        "thermal_max_iterations": 250,
+        "conductor_temp_C": 80.0,
         "keep_project": 0,
         "B_max_core": 1.1,
         "B_mean_core": 0.8,
         "N2_side": 2,
+        "N1_side": 0,
         "conv_passes_matrix": 3,
+        "conv_consecutive_matrix": 1,
         "conv_error_pct_matrix": 0.5,
         "conv_delta_pct_matrix": 0.2,
         "conv_passes_loss": 3,
+        "conv_consecutive_loss": 2,
         "conv_error_pct_loss": 0.6,
         "conv_delta_pct_loss": 0.3,
         "P_winding_total": 4000.0,
@@ -667,6 +691,7 @@ class WaitStateIntegrityTests(unittest.TestCase):
             profile.write_text('{"cpus": 4}', encoding="utf-8")
             state = {"round": 1, "stage": "SUBMIT"}
             with patch.object(al_driver, "HERE", str(root)), \
+                    patch.object(al_driver, "_assert_training_invariants"), \
                     patch.object(al_driver, "_current_solver_revision", return_value=TEST_REVISION), \
                     patch.object(
                         al_driver, "_current_library_revision",
@@ -738,7 +763,7 @@ class WaitStateIntegrityTests(unittest.TestCase):
             self.assertEqual(submit.call_args.kwargs["mem_mb"], 65536)
 
             with self._context(root), \
-                    patch.object(al_driver.pd, "read_csv", return_value=pd.DataFrame({"unused": [1]})), \
+                    patch.object(al_driver.pd, "read_csv", return_value=pd.DataFrame({"l1": [50.0]})), \
                     patch.object(scheduler_client, "wait_all", return_value={18: "completed"}), \
                     patch.object(
                         scheduler_client, "fetch_result",
@@ -832,6 +857,7 @@ class WaitStateIntegrityTests(unittest.TestCase):
 class IngestIntegrityTests(unittest.TestCase):
     def _front(self):
         return pd.DataFrame({
+            "l1": [50.0],
             "pred_Llt_phys": [27.5],
             "pred_Tprobe_Tx_leeward_max": [89.5],
             "pred_Tprobe_Rx_main_leeward_max": [90.5],
@@ -840,6 +866,7 @@ class IngestIntegrityTests(unittest.TestCase):
             "pred_P_winding_total": [4000.0],
             "pred_P_core_total": [2000.0],
             "pred_P_core_plate_total": [500.0],
+            "pred_P_wcp_total": [0.0],
         })
 
     def _state(self, result=None):

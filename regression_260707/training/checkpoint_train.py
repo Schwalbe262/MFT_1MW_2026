@@ -31,6 +31,7 @@ TARGETS = {
     "P_winding_total": {"transform": "log1p", "metric_focus": "mape"},
     "P_core_total": {"transform": "log1p", "metric_focus": "mape"},
     "P_core_plate_total": {"transform": "log1p", "metric_focus": "mape"},
+    "P_wcp_total": {"transform": "log1p", "metric_focus": "mape"},
     "B_max_core": {"transform": None, "metric_focus": "rmse"},
     "B_mean_core": {"transform": None, "metric_focus": "rmse"},
     "Tprobe_Tx_leeward_max": {"transform": "t50", "metric_focus": "rmse"},

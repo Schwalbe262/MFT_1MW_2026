@@ -133,6 +133,8 @@ nohup "$PY" feeder.py --loop 600 --max-samples 12000 \
 echo "feeder pid $!"
 
 echo "=== 4. Periodic collector and checkpoint loop"
+MFT_SOLVER_REVISION="$SOLVER_REVISION" \
+MFT_LIBRARY_REVISION="$LIBRARY_REVISION" \
 nohup bash auto_collect_loop.sh > collect_relaunch.log 2>&1 &
 echo "collector pid $!"
 

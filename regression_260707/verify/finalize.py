@@ -42,6 +42,8 @@ INSULATION_COLUMNS = (
     "w1s_cs_space_x", "cs_w1s_space_y", "h_gap2",
 )
 SIDE_INSULATION_COLUMNS = ("w2s_w1s_space_x", "w1s_w2s_space_y")
+MIN_STRICT_FULL_ROWS = 3000
+QUALITY_THRESHOLDS_PATH = REGRESSION_ROOT / "training" / "model_quality_thresholds.json"
 
 
 def _finite(value):
@@ -51,7 +53,80 @@ def _finite(value):
         return False
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _optimization_manifest_reasons(
+    round_dir, expected_solver_revision, expected_library_revision,
+):
+    reasons = []
+    manifest_path = Path(round_dir) / "optimization_manifest.json"
+    front_path = Path(round_dir) / "pareto_front.csv"
+    quality_path = Path(round_dir) / "model_quality_snapshot.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ["optimization_manifest_unavailable"]
+    if not manifest.get("quality_gate_passed"):
+        reasons.append("optimization_quality_gate_not_passed")
+    if int(manifest.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS:
+        reasons.append("optimization_below_3000_strict_rows")
+    if manifest.get("solver_revision") != expected_solver_revision:
+        reasons.append("optimization_solver_revision_mismatch")
+    if manifest.get("library_revision") != expected_library_revision:
+        reasons.append("optimization_library_revision_mismatch")
+    try:
+        vetted_thresholds = _sha256(QUALITY_THRESHOLDS_PATH)
+    except Exception:
+        vetted_thresholds = None
+    if (vetted_thresholds is None
+            or manifest.get("quality_thresholds_sha256") != vetted_thresholds):
+        reasons.append("optimization_quality_thresholds_mismatch")
+    for path, key in (
+        (front_path, "pareto_front_sha256"),
+        (Path(round_dir) / "pareto_X.npy", "pareto_X_sha256"),
+        (Path(round_dir) / "pareto_F.npy", "pareto_F_sha256"),
+        (quality_path, "quality_status_sha256"),
+    ):
+        try:
+            if _sha256(path) != manifest.get(key):
+                reasons.append(f"optimization_artifact_mismatch:{key}")
+        except Exception:
+            reasons.append(f"optimization_artifact_unavailable:{key}")
+    required = set(manifest.get("required_models") or [])
+    if "P_wcp_total" not in required or len(required) < 12:
+        reasons.append("optimization_required_models_incomplete")
+    generation = manifest.get("registry_generation")
+    try:
+        generation_path = Path(generation).resolve()
+        registry_root = (REGRESSION_ROOT / "training" / "registry").resolve()
+        if os.path.commonpath([str(generation_path), str(registry_root)]) != str(registry_root):
+            raise RuntimeError("generation escapes registry")
+        if _sha256(generation_path / "train_report.json") != manifest.get(
+                "generation_report_sha256"):
+            reasons.append("optimization_generation_report_mismatch")
+        artifact_hashes = manifest.get("model_artifacts_sha256") or {}
+        for target in required:
+            for name in ("models.pkl", "meta.json"):
+                if _sha256(generation_path / target / name) != (
+                        artifact_hashes.get(target) or {}).get(name):
+                    reasons.append(f"optimization_model_artifact_mismatch:{target}:{name}")
+    except Exception:
+        reasons.append("optimization_generation_unavailable")
+    return list(dict.fromkeys(reasons))
+
+
 def physical_spec_reasons(result, candidate=None):
+    """Evaluate physical specifications from the authoritative FEA result.
+
+    ``candidate`` remains accepted for API compatibility, but candidate/front
+    columns are never evidence for an FEA pass.
+    """
     reasons = []
     try:
         llt = float(result["Llt"])
@@ -72,19 +147,24 @@ def physical_spec_reasons(result, candidate=None):
         value = result.get(column)
         if not _finite(value) or float(value) > SPEC["T_limit_C"]:
             reasons.append(f"temperature_out_of_spec:{column}")
-    for column in ("P_winding_total", "P_core_total", "P_core_plate_total"):
+    for column in (
+        "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
+    ):
         value = result.get(column)
         if not _finite(value) or float(value) < 0:
             reasons.append(f"invalid_loss:{column}")
-    if candidate is not None:
-        columns = list(INSULATION_COLUMNS)
-        if _finite(candidate.get("N1_side")) and float(candidate["N1_side"]) > 0:
-            columns.extend(SIDE_INSULATION_COLUMNS)
-        for column in columns:
-            if column not in candidate:
-                reasons.append(f"missing_insulation:{column}")
-            elif not _finite(candidate[column]) or float(candidate[column]) < SPEC["insulation_min_mm"]:
-                reasons.append(f"insulation_below_minimum:{column}")
+    columns = list(INSULATION_COLUMNS)
+    n1_side = result.get("N1_side")
+    if not _finite(n1_side):
+        reasons.append("missing_geometry:N1_side")
+    elif float(n1_side) > 0:
+        columns.extend(SIDE_INSULATION_COLUMNS)
+    for column in columns:
+        if column not in result:
+            reasons.append(f"missing_insulation:{column}")
+        elif (not _finite(result[column])
+              or float(result[column]) < SPEC["insulation_min_mm"]):
+            reasons.append(f"insulation_below_minimum:{column}")
     return reasons
 
 
@@ -96,6 +176,23 @@ def _candidate_digest(candidate):
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def candidate_identity_reasons(result, candidate):
+    """Authenticate the candidate record and its exact submitted FEA inputs."""
+    from verify import scheduler_client
+
+    if not isinstance(candidate, dict):
+        return ["candidate_record_missing"]
+    params = candidate.get("params")
+    if not isinstance(params, dict) or not params:
+        return ["candidate_params_missing"]
+    reasons = []
+    if candidate.get("candidate_digest") != _candidate_digest(params):
+        reasons.append("candidate_digest_mismatch")
+    if not scheduler_client.result_matches_params(result, params):
+        reasons.append("candidate_result_identity_mismatch")
+    return reasons
 
 
 def collect_standard_pass_candidates(
@@ -110,6 +207,13 @@ def collect_standard_pass_candidates(
         errors_path = round_dir / "verification_errors.csv"
         if not front_path.is_file() or not errors_path.is_file():
             continue
+        if _optimization_manifest_reasons(
+                round_dir, expected_solver_revision, expected_library_revision):
+            continue
+        manifest_path = round_dir / "optimization_manifest.json"
+        optimization_manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8")
+        )
         front = pd.read_csv(front_path)
         errors = pd.read_csv(errors_path)
         for error in errors.to_dict("records"):
@@ -125,26 +229,33 @@ def collect_standard_pass_candidates(
             if matches.empty:
                 continue
             result = matches.iloc[-1].to_dict()
-            validity = validate_record(
-                result,
-                expected_solver_revision=expected_solver_revision,
-                expected_library_revision=expected_library_revision,
-            )
             candidate = front.iloc[index].to_dict()
-            spec_reasons = physical_spec_reasons(result, candidate)
-            if not validity.full_valid or spec_reasons:
-                continue
-            try:
-                volume = float(bounding_box_lit(front.iloc[index])[0])
-            except Exception:
-                continue
-            if not _finite(volume) or volume <= 0:
-                continue
             params = {
                 key: (value.item() if hasattr(value, "item") else value)
                 for key, value in candidate.items()
                 if key in KEYS and _finite(value)
             }
+            authenticated = {
+                "params": params,
+                "candidate_digest": _candidate_digest(params),
+            }
+            validity = validate_record(
+                result,
+                expected_solver_revision=expected_solver_revision,
+                expected_library_revision=expected_library_revision,
+            )
+            spec_reasons = physical_spec_reasons(result)
+            identity_reasons = candidate_identity_reasons(result, authenticated)
+            if not validity.full_valid or spec_reasons or identity_reasons:
+                continue
+            try:
+                # The result, not a stale/spoofed Pareto row, is authoritative
+                # for the minimum-volume ranking.
+                volume = float(bounding_box_lit(result)[0])
+            except Exception:
+                continue
+            if not _finite(volume) or volume <= 0:
+                continue
             records.append({
                 "round": int(round_dir.name.split("_")[-1]),
                 "index": index,
@@ -153,11 +264,14 @@ def collect_standard_pass_candidates(
                 "total_loss_W": float(candidate.get("total_loss_W", math.nan)),
                 "params": params,
                 "geometry_evidence": {
-                    column: candidate.get(column)
+                    column: result.get(column)
                     for column in (*INSULATION_COLUMNS, *SIDE_INSULATION_COLUMNS, "N1_side")
                 },
                 "candidate_digest": _candidate_digest(params),
                 "standard_result": result,
+                "optimization_manifest": optimization_manifest,
+                "optimization_manifest_path": str(manifest_path),
+                "optimization_manifest_sha256": _sha256(manifest_path),
             })
     records.sort(key=lambda item: (item["volume_L"], item["total_loss_W"]))
     unique = []
@@ -202,9 +316,8 @@ def write_final_artifacts(
     attempts = list(prior_attempts or [])
     passed = []
     for candidate, result in zip(selected, fine_results):
-        reasons = physical_spec_reasons(
-            result, candidate.get("geometry_evidence", candidate["params"])
-        )
+        reasons = physical_spec_reasons(result)
+        reasons.extend(candidate_identity_reasons(result, candidate))
         if not scheduler_client.is_valid_result(
             result,
             expected_revision=solver_revision,
@@ -230,7 +343,6 @@ def write_final_artifacts(
     compatibility_result = None
     if winner:
         compatibility_result = dict(winner[1])
-        compatibility_result.update(winner[0].get("geometry_evidence", {}))
         compatibility_result["volume_L"] = winner[0]["volume_L"]
     artifact = {
         "schema_version": 1,
@@ -248,20 +360,22 @@ def write_final_artifacts(
         "fine_task_id": winner[0].get("fine_task_id") if winner else None,
         "fine_task_status": winner[0].get("fine_task_status") if winner else None,
         "candidate": winner[0] if winner else None,
+        "standard_result": winner[0].get("standard_result") if winner else None,
+        "optimization_manifest": (
+            winner[0].get("optimization_manifest") if winner else None
+        ),
         "fine_result": winner[1] if winner else None,
         # Compatibility key consumed by the standalone monitor.
         "result": compatibility_result,
     }
     results_dir = os.path.join(output_root, "verify", "results")
-    _atomic_text(
-        json.dumps(artifact, indent=1, ensure_ascii=False, default=str),
-        os.path.join(results_dir, "final_verification.json"),
-    )
     if winner:
         candidate, result = winner
+        standard = candidate.get("standard_result") or {}
+        optimization_manifest = candidate.get("optimization_manifest") or {}
         fine_loss = sum(
             float(result[key]) for key in
-            ("P_winding_total", "P_core_total", "P_core_plate_total")
+            ("P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total")
         )
         parameter_rows = "\n".join(
             f"| {key} | {value} |" for key, value in sorted(candidate["params"].items())
@@ -286,9 +400,17 @@ def write_final_artifacts(
 - Llt(물리): {(float(result['Llt']) if int(float(result['full_model'])) == 1 else 2 * float(result['Llt'])):.6g} uH
 - Bmax: {float(result['B_max_core']):.6g} T
 - 온도(Tx/Rx-main/Rx-side/core): {result.get('T_max_Tx')} / {result.get('T_max_Rx_main')} / {result.get('T_max_Rx_side')} / {result.get('T_max_core')} °C
-- EM 수렴(matrix/loss): pass {result.get('conv_passes_matrix')}/{result.get('conv_passes_loss')}, error {result.get('conv_error_pct_matrix')}/{result.get('conv_error_pct_loss')} %, delta {result.get('conv_delta_pct_matrix')}/{result.get('conv_delta_pct_loss')} %
+- EM 수렴(matrix/loss): total pass {result.get('conv_passes_matrix')}/{result.get('conv_passes_loss')}, consecutive pass {result.get('conv_consecutive_matrix')}/{result.get('conv_consecutive_loss')}, error {result.get('conv_error_pct_matrix')}/{result.get('conv_error_pct_loss')} %, delta {result.get('conv_delta_pct_matrix')}/{result.get('conv_delta_pct_loss')} %
 - thermal 수렴: iteration {result.get('thermal_iterations')}, continuity {result.get('thermal_residual_continuity')}, energy {result.get('thermal_residual_energy')}
 - surrogate generation: {model_quality.get('training_run_id')} (strict-full {model_quality.get('strict_full_rows')} rows)
+- training dataset SHA-256: {model_quality.get('dataset_sha256')}
+- quality contract SHA-256: {model_quality.get('quality_thresholds_sha256')}
+- NSGA manifest SHA-256: {candidate.get('optimization_manifest_sha256')}
+- NSGA restarts/population: {optimization_manifest.get('restarts')} / {optimization_manifest.get('population')}
+- standard FEA task/project: {candidate.get('task_id')} / {standard.get('project_name')}
+- standard EM total/consecutive pass (matrix/loss): {standard.get('conv_passes_matrix')}/{standard.get('conv_consecutive_matrix')} · {standard.get('conv_passes_loss')}/{standard.get('conv_consecutive_loss')}
+- standard extraction (matrix/loss): {standard.get('matrix_extraction_backend')} / {standard.get('loss_extraction_backend')}
+- standard thermal power (expected/assigned/max error): {standard.get('thermal_rx_expected_power_w')} / {standard.get('thermal_rx_assigned_power_w')} / {standard.get('thermal_rx_power_balance_max_abs_w')} W
 - solver revision: {solver_revision}
 - pyaedt_library revision: {library_revision}
 - 제작공차는 적용하지 않았으며, 형상은 FEA와 정확히 동일하게 제작된다고 가정했다.
@@ -313,4 +435,11 @@ def write_final_artifacts(
 - 제작공차는 적용하지 않았으며, 형상은 FEA와 정확히 동일하게 제작된다고 가정했다.
 """
     _atomic_text(report, os.path.join(output_root, "final_report.md"))
+    # The JSON is the monitor/automation commit marker.  Publish it only after
+    # the human-readable report so a crash cannot expose PASS with an old or
+    # missing report.
+    _atomic_text(
+        json.dumps(artifact, indent=1, ensure_ascii=False, default=str),
+        os.path.join(results_dir, "final_verification.json"),
+    )
     return artifact

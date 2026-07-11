@@ -6,12 +6,13 @@ from regression_260707.monitoring.readers import SafeArtifactCache, SchedulerRea
 
 def test_data_counts_quality_throughput_and_revision(artifact_service):
     data = artifact_service.data()
-    assert data["total_rows"] == 2
+    assert data["raw_total_rows"] == 2
+    assert data["total_rows"] == 1
     assert data["em_valid_rows"] == 2
     assert data["thermal_valid_rows"] == 1
     assert data["complete_rows"] == 1
     assert data["throughput_1h"] == 1
-    assert data["added_24h"] == 2
+    assert data["added_24h"] == 1
     assert data["collector"]["no_data_tasks"] == 1
     assert data["latest_revision"] == "a" * 40
     assert data["rows_not_latest_revision"] == 1

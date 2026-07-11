@@ -48,7 +48,7 @@ T_TARGETS = ["Tprobe_Tx_leeward_max", "Tprobe_Rx_main_leeward_max",
 class MFTProblem(Problem):
     """
     models: dict[target] -> predictor with .predict_mu_sigma(X_df) -> (mu, sigma)
-            필요 타겟: "Llt_phys", "P_winding_total", "P_core_total", "P_core_plate_total",
+            필요 타겟: "Llt_phys", "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
                        "B_max_core", T_TARGETS...
     density_gate: callable(X_features_df) -> ndarray (양수 = 위반량) 또는 None
     """
@@ -56,7 +56,7 @@ class MFTProblem(Problem):
     def __init__(self, models, spec=None, density_gate=None, fixed_overrides=None):
         required = {
             "Llt_phys", "P_winding_total", "P_core_total",
-            "P_core_plate_total", "B_max_core", *T_TARGETS,
+            "P_core_plate_total", "P_wcp_total", "B_max_core", *T_TARGETS,
         }
         missing = sorted(required.difference(models))
         if missing:
@@ -120,9 +120,10 @@ class MFTProblem(Problem):
             mu_pw, sg_pw = self._predict("P_winding_total", sub)
             mu_pc, sg_pc = self._predict("P_core_total", sub)
             mu_pp, sg_pp = self._predict("P_core_plate_total", sub)
+            mu_wcp, sg_wcp = self._predict("P_wcp_total", sub)
             mu_b, sg_b = self._predict("B_max_core", sub)
 
-            total_loss = mu_pw + mu_pc + mu_pp
+            total_loss = mu_pw + mu_pc + mu_pp + mu_wcp
             F[idx, 0] = vols
             F[idx, 1] = total_loss
 

@@ -375,6 +375,9 @@ def main():
                 quality = evaluate_registry(registry, snapshot, thresholds)
                 quality.update(
                     {
+                        "quality_thresholds_sha256": thresholds_sha256,
+                        "solver_revision": args.solver_revision,
+                        "library_revision": args.library_revision,
                         "evaluated_at": datetime.now().isoformat(timespec="seconds"),
                         "checkpoint": threshold,
                     }

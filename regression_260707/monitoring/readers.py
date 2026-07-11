@@ -33,6 +33,7 @@ TARGETS: tuple[dict[str, str], ...] = (
     {"name": "P_winding_total", "label": "권선 손실", "unit": "W"},
     {"name": "P_core_total", "label": "코어 손실", "unit": "W"},
     {"name": "P_core_plate_total", "label": "코어 플레이트 손실", "unit": "W"},
+    {"name": "P_wcp_total", "label": "권선 냉각판 손실", "unit": "W"},
     {"name": "B_max_core", "label": "코어 최대 자속밀도", "unit": "T"},
     {"name": "Tprobe_Tx_leeward_max", "label": "Tx 최대 온도", "unit": "°C"},
     {"name": "Tprobe_Rx_main_leeward_max", "label": "Rx main 최대 온도", "unit": "°C"},
@@ -341,6 +342,7 @@ class RuntimeRecorder:
                 "total_rows": data.get("total_rows"),
                 "complete_rows": data.get("complete_rows"),
                 "throughput_1h": data.get("throughput_1h"),
+                "count_basis": data.get("count_basis"),
             },
             "models": {
                 "trained": models.get("trained_count"),
@@ -479,24 +481,38 @@ class ArtifactService:
         manifest_result = self.cache.json(dataset_dir / "manifest.json", {})
         rows_result = self.cache.csv(dataset_dir / "train_io.csv")
         cache_result = self.cache.json(dataset_dir / "collect_cache.json", {})
+        strict_result = self.cache.json(
+            self.root / "training" / "strict_data_status.json", {}
+        )
         manifest = manifest_result.value if isinstance(manifest_result.value, dict) else {}
         rows = rows_result.value if isinstance(rows_result.value, list) else []
         collector_cache = cache_result.value if isinstance(cache_result.value, dict) else {}
-        warnings = self._warnings(manifest_result, rows_result, cache_result)
+        strict_status = (
+            strict_result.value if isinstance(strict_result.value, dict) else {}
+        )
+        warnings = self._warnings(
+            manifest_result, rows_result, cache_result, strict_result
+        )
 
         manifest_total = _integer(manifest.get("total_rows"), -1)
-        total = manifest_total if manifest_total >= 0 else len(rows)
+        raw_total = manifest_total if manifest_total >= 0 else len(rows)
         if rows and manifest_total >= 0 and len(rows) != manifest_total:
             warnings.append(f"manifest({manifest_total})와 train_io.csv({len(rows)}) 행 수가 다릅니다.")
 
-        em_valid = sum(1 for row in rows if _flag(row.get("result_valid_em")))
-        thermal_valid = sum(1 for row in rows if _flag(row.get("result_valid_thermal")))
-        complete = sum(
-            1 for row in rows
-            if _flag(row.get("result_valid_em")) and _flag(row.get("result_valid_thermal"))
+        identity = strict_status.get("state_identity")
+        identity = identity if isinstance(identity, dict) else {}
+        pins_valid = all(
+            re.fullmatch(r"[0-9a-fA-F]{40}", str(identity.get(key) or ""))
+            for key in ("solver_revision", "library_revision")
         )
-        if not rows:
-            em_valid = thermal_valid = complete = 0
+        strict_available = bool(strict_result.exists and pins_valid)
+        total = _integer(strict_status.get("strict_full_rows"), 0) if strict_available else 0
+        em_valid = _integer(strict_status.get("strict_em_rows"), 0) if strict_available else 0
+        thermal_valid = complete = total
+        if not strict_available:
+            warnings.append(
+                "pinned strict-data status is unavailable; goal progress is fail-closed at zero."
+            )
 
         timestamps = [
             parsed for row in rows
@@ -505,10 +521,35 @@ class ArtifactService:
         timestamps.sort()
         one_hour_ago = now - timedelta(hours=1)
         day_ago = now - timedelta(hours=24)
-        throughput_1h = sum(stamp >= one_hour_ago for stamp in timestamps)
-        added_24h = sum(stamp >= day_ago for stamp in timestamps)
-        latest_data = timestamps[-1] if timestamps else manifest_result.mtime
-        first_data = timestamps[0] if timestamps else None
+        strict_history = []
+        history_path = self.root / "monitoring" / "runtime" / "monitor_history.jsonl"
+        if history_path.is_file():
+            try:
+                with history_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            entry = json.loads(line)
+                        except (TypeError, ValueError):
+                            continue
+                        data_entry = entry.get("data") if isinstance(entry, dict) else None
+                        stamp = _parse_time(entry.get("time"), now.tzinfo) if isinstance(entry, dict) else None
+                        if (isinstance(data_entry, dict)
+                                and data_entry.get("count_basis") == "pinned_strict_full"
+                                and stamp is not None):
+                            strict_history.append((stamp, _integer(data_entry.get("total_rows"), 0)))
+            except OSError as exc:
+                warnings.append(f"strict runtime history read failed: {exc}")
+        def _growth_since(cutoff):
+            earlier = [value for stamp, value in strict_history if stamp <= cutoff]
+            if earlier:
+                return max(0, total - earlier[-1])
+            within = [value for stamp, value in strict_history if stamp >= cutoff]
+            return max(0, total - within[0]) if within else 0
+        throughput_1h = _growth_since(one_hour_ago)
+        added_24h = _growth_since(day_ago)
+        strict_updated = _parse_time(strict_status.get("time"), now.tzinfo)
+        latest_data = strict_updated if strict_available else None
+        first_data = strict_history[0][0] if strict_history else None
         stalled_minutes = max(0.0, (now - latest_data).total_seconds() / 60.0) if latest_data else None
         hourly_rate = float(throughput_1h)
         if hourly_rate <= 0 and added_24h:
@@ -517,21 +558,24 @@ class ArtifactService:
         eta_hours = remaining / hourly_rate if hourly_rate > 0 else None
         eta = now + timedelta(hours=eta_hours) if eta_hours is not None else None
 
-        buckets: dict[datetime, int] = defaultdict(int)
-        for stamp in timestamps:
-            hour = stamp.replace(minute=0, second=0, microsecond=0)
-            buckets[hour] += 1
         history: list[dict[str, Any]] = []
-        cumulative = 0
-        for hour, count in sorted(buckets.items()):
-            cumulative += count
-            history.append({"time": _iso(hour), "added": count, "total": cumulative})
+        previous = 0
+        for stamp, count in strict_history:
+            history.append({
+                "time": _iso(stamp), "added": max(0, count - previous),
+                "total": count,
+            })
+            previous = count
+        cumulative = total
         if len(history) > 240:
             stride = math.ceil(len(history) / 240)
             history = history[::stride]
             if history[-1]["total"] != cumulative:
-                last_hour = max(buckets)
-                history.append({"time": _iso(last_hour), "added": buckets[last_hour], "total": cumulative})
+                history.append({
+                    "time": _iso(now),
+                    "added": max(0, cumulative - history[-1]["total"]),
+                    "total": cumulative,
+                })
 
         revisions = Counter(
             str(row.get("git_hash", "")).strip().lower()
@@ -560,12 +604,15 @@ class ArtifactService:
         return {
             "schema_version": SCHEMA_VERSION,
             "available": manifest_result.exists or rows_result.exists,
+            "count_basis": "pinned_strict_full",
+            "strict_status_available": strict_available,
+            "raw_total_rows": raw_total,
             "total_rows": total,
             "em_valid_rows": em_valid,
             "thermal_valid_rows": thermal_valid,
             "complete_rows": complete,
             "em_only_rows": max(0, em_valid - complete),
-            "invalid_em_rows": max(0, len(rows) - em_valid) if rows else None,
+            "invalid_em_rows": max(0, raw_total - em_valid),
             "manifest_new_rows": _integer(manifest.get("new_rows"), 0),
             "manifest_new_unique_rows": _integer(manifest.get("new_unique_rows"), 0),
             "goal": DATA_GOAL,
@@ -594,7 +641,10 @@ class ArtifactService:
             "source": {
                 "manifest": str(manifest_result.path),
                 "rows": str(rows_result.path),
-                "updated_at": _iso(manifest_result.mtime or rows_result.mtime),
+                "strict_status": str(strict_result.path),
+                "updated_at": _iso(
+                    strict_result.mtime or manifest_result.mtime or rows_result.mtime
+                ),
             },
             "warnings": warnings,
         }
@@ -912,7 +962,7 @@ class ArtifactService:
         computed_status = "fail" if False in states else ("pass" if states and all(value is True for value in states) else "unknown")
         loss_components = [
             _finite_number(result.get(key)) for key in
-            ("P_winding_total", "P_core_total", "P_core_plate_total")
+            ("P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total")
         ]
         total_loss = sum(value for value in loss_components if value is not None) if all(value is not None for value in loss_components) else None
         return {

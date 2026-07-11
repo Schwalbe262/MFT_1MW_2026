@@ -67,8 +67,28 @@ PROFILE_IDENTITY_KEYS = (
     "n_explicit_turns",
     "matrix_skin_mesh",
     "freq",
+    "V1_rms",
+    "I1_rated",
+    "I2_rated",
+    "I2_phase_deg",
     "loss_from_copy",
     "P_target",
+    "V2_rms",
+    "core_cm",
+    "core_x",
+    "core_y",
+    "core_plate_on",
+    "wcp_on",
+    "round_corner",
+    "plate_temp",
+    "air_temp",
+    "fan_velocity",
+    "k_ins",
+    "core_k_thermal",
+    "rx_mesh_mode",
+    "fan_config",
+    "thermal_max_iterations",
+    "conductor_temp_C",
 )
 
 
@@ -182,9 +202,15 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
             reasons.append(f"{label}:tolerance_exceeds_profile")
 
         passes = _number(record, f"conv_passes_{label}")
+        consecutive = _number(record, f"conv_consecutive_{label}")
         minimum_passes = _number(expected, minimum_key) or 1.0
-        if passes is None or passes < minimum_passes:
+        if passes is None or passes < 1:
             reasons.append(f"{label}:missing_pass_count")
+        if (consecutive is None or consecutive < minimum_passes
+                or consecutive != math.floor(consecutive)):
+            reasons.append(f"{label}:insufficient_consecutive_convergence")
+        elif passes is not None and consecutive > passes:
+            reasons.append(f"{label}:invalid_consecutive_convergence")
         for metric in ("error", "delta"):
             key = f"conv_{metric}_pct_{label}"
             value = _number(record, key)

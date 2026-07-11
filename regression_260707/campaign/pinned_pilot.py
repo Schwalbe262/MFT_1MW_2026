@@ -158,22 +158,11 @@ def effective_candidate(params):
 
 def result_matches_candidate(result, params):
     """Require every intended input value to be echoed by the solver result."""
-    if not isinstance(result, dict):
-        return False
-    for key, expected in params.items():
-        if key not in result:
-            return False
-        actual = result[key]
-        if isinstance(expected, (int, float, np.number)) and not isinstance(expected, bool):
-            try:
-                if not math.isclose(
-                        float(actual), float(expected), rel_tol=1e-9, abs_tol=1e-9):
-                    return False
-            except (TypeError, ValueError, OverflowError):
-                return False
-        elif str(actual) != str(expected):
-            return False
-    return True
+    normalized = {
+        key: (value.item() if isinstance(value, np.generic) else value)
+        for key, value in params.items()
+    }
+    return scheduler_client.result_matches_params(result, normalized)
 
 
 def resolve_stage_contract(stage, tasks, offset=None):

@@ -4,8 +4,12 @@ param(
     [string]$OutputRoot = "",
     [int]$IntervalSeconds = 600,
     [string]$Python = "$HOME\anaconda3\envs\pyaedt2026v1\python.exe",
-    [string]$SolverRevision = "2ac926f678d58c4ec42aa8536fe7b509b42727c0",
-    [string]$LibraryRevision = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+    [Parameter(Mandatory=$true)]
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string]$SolverRevision,
+    [Parameter(Mandatory=$true)]
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string]$LibraryRevision,
     [switch]$Execute
 )
 

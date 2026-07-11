@@ -65,6 +65,28 @@ def campaign_root(tmp_path):
         },
     ])
     write_json(dataset / "collect_cache.json", {"harvested": [1, 2], "nodata": [3], "local_parts": ["a.parquet"]})
+    write_json(root / "training" / "strict_data_status.json", {
+        "time": "2026-07-11T02:30:00+09:00",
+        "raw_rows": 2,
+        "strict_em_rows": 2,
+        "strict_full_rows": 1,
+        "state_identity": {
+            "solver_revision": "a" * 40,
+            "library_revision": "c" * 40,
+        },
+    })
+    history_path = root / "monitoring" / "runtime" / "monitor_history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text("\n".join([
+        json.dumps({
+            "time": "2026-07-11T01:30:00+09:00",
+            "data": {"count_basis": "pinned_strict_full", "total_rows": 0},
+        }),
+        json.dumps({
+            "time": "2026-07-11T02:30:00+09:00",
+            "data": {"count_basis": "pinned_strict_full", "total_rows": 1},
+        }),
+    ]) + "\n", encoding="utf-8")
 
     registry = root / "training" / "registry"
     write_json(registry / "train_report.json", {
@@ -100,7 +122,8 @@ def campaign_root(tmp_path):
         "full_model": 0, "Llt": 13.75, "B_max_core": 1.0, "T_max_Tx": 90,
         "T_max_Rx_main": 91, "T_max_Rx_side": 92, "T_max_core": 88,
         "conv_error_pct_matrix": .5, "conv_error_pct_loss": .6,
-        "P_winding_total": 4000, "P_core_total": 2000, "P_core_plate_total": 500,
+        "P_winding_total": 4000, "P_core_total": 2000,
+        "P_core_plate_total": 500, "P_wcp_total": 250,
         "git_hash": "a" * 40, "pyaedt_library_git_hash": "c" * 40,
     }
     write_json(root / "al_rounds" / "state.json", {

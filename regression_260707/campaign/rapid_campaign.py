@@ -26,10 +26,12 @@ from filelock import FileLock
 
 HERE = Path(__file__).resolve().parent
 REGRESSION_ROOT = HERE.parent
+REPO_ROOT = REGRESSION_ROOT.parent
 sys.path.insert(0, str(REGRESSION_ROOT))
 sys.path.insert(0, str(REGRESSION_ROOT / "verify"))
 
 import feeder
+import deployment_gate
 import pinned_pilot
 import provisional_wave
 import scheduler_client
@@ -703,6 +705,13 @@ def main(argv=None):
         parser.error("--loop must be positive")
     if args.loop is not None and not args.execute:
         parser.error("--loop requires --execute")
+    if args.execute:
+        if not args.library_root:
+            parser.error("--execute requires --library-root for remote deployment validation")
+        deployment_gate.validate_deployment(
+            REPO_ROOT, args.solver_revision,
+            args.library_root, args.library_revision,
+        )
 
     while True:
         try:

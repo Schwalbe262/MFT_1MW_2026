@@ -176,6 +176,7 @@ def main():
     result = evaluate_registry(args.registry, args.dataset, thresholds)
     result["evaluated_at"] = datetime.now().isoformat(timespec="seconds")
     result["thresholds_path"] = os.path.abspath(args.thresholds)
+    result["quality_thresholds_sha256"] = _sha256(args.thresholds)
     status_path = args.status or os.path.join(args.registry, "quality_status.json")
     _atomic_json(result, status_path)
     print(json.dumps(result, ensure_ascii=False))
