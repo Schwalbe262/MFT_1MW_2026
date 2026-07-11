@@ -14,6 +14,7 @@ sys.path.insert(0, str(CAMPAIGN_DIR))
 
 import deployment_gate  # noqa: E402
 import feeder  # noqa: E402
+import pinned_pilot  # noqa: E402
 import rapid_campaign  # noqa: E402
 
 
@@ -91,6 +92,22 @@ class DeploymentGateTests(unittest.TestCase):
             )
         validate.assert_called_once_with(
             feeder.REPO_ROOT, SOLVER_REVISION, tmp, LIBRARY_REVISION
+        )
+
+    def test_active_learning_rechecks_remote_heads_before_submit(self):
+        driver = pinned_pilot.al_driver
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            driver, "PINNED_SOLVER_REVISION", SOLVER_REVISION
+        ), mock.patch.object(
+            driver, "PINNED_LIBRARY_REVISION", LIBRARY_REVISION
+        ), mock.patch.object(
+            driver, "PINNED_LIBRARY_ROOT", tmp
+        ), mock.patch(
+            "campaign.deployment_gate.validate_deployment", return_value={}
+        ) as validate:
+            driver._require_runtime_deployment()
+        validate.assert_called_once_with(
+            driver.REPO_ROOT, SOLVER_REVISION, tmp, LIBRARY_REVISION
         )
 
 

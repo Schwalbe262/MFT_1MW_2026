@@ -718,6 +718,7 @@ class WaitStateIntegrityTests(unittest.TestCase):
             al_driver,
             HERE=str(root),
             save_state=Mock(),
+            _require_runtime_deployment=Mock(),
         )
 
     def test_submit_pins_one_solver_revision_in_state_and_task_record(self):
@@ -747,6 +748,7 @@ class WaitStateIntegrityTests(unittest.TestCase):
                     patch.object(al_driver, "save_state") as save, \
                     patch.object(al_driver.time, "sleep"), \
                     patch.object(al_driver, "EXECUTE_SUBMISSIONS", True), \
+                    patch.object(al_driver, "_require_runtime_deployment"), \
                     patch.object(
                         scheduler_client, "submit_verification", return_value=17) as submit:
                 al_driver.stage_submit(state)

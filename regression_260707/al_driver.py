@@ -50,6 +50,7 @@ QUALITY_STATUS = os.path.join(RUNTIME_ROOT, "training", "model_quality_status.js
 EXECUTE_SUBMISSIONS = False
 PINNED_SOLVER_REVISION = None
 PINNED_LIBRARY_REVISION = None
+PINNED_LIBRARY_ROOT = None
 PY = sys.executable
 MIN_STRICT_FULL_ROWS = 3000
 QUALITY_THRESHOLDS_PATH = os.path.join(
@@ -86,10 +87,10 @@ AL_SOURCE_RANK = 50
 
 def configure_runtime(
         runtime_root=None, dataset=None, output_root=None, registry=None,
-        solver_revision=None, library_revision=None):
+        solver_revision=None, library_revision=None, library_root=None):
     """Point code in this worktree at a live runtime without changing its HEAD."""
     global RUNTIME_ROOT, OUTPUT_ROOT, AL_ROOT, STATE_PATH, DATASET, REGISTRY, QUALITY_STATUS
-    global PINNED_SOLVER_REVISION, PINNED_LIBRARY_REVISION
+    global PINNED_SOLVER_REVISION, PINNED_LIBRARY_REVISION, PINNED_LIBRARY_ROOT
     RUNTIME_ROOT = os.path.abspath(runtime_root or HERE)
     OUTPUT_ROOT = os.path.abspath(output_root or RUNTIME_ROOT)
     AL_ROOT = os.path.join(OUTPUT_ROOT, "al_rounds")
@@ -105,6 +106,26 @@ def configure_runtime(
     )
     PINNED_SOLVER_REVISION = solver_revision
     PINNED_LIBRARY_REVISION = library_revision
+    PINNED_LIBRARY_ROOT = os.path.abspath(library_root) if library_root else None
+
+
+def _require_runtime_deployment():
+    """Recheck both advertised remote heads immediately before any submit."""
+    library_root = PINNED_LIBRARY_ROOT or os.environ.get(
+        "MFT_PYAEDT_LIBRARY_ROOT", ""
+    ).strip()
+    if not library_root:
+        raise RuntimeError(
+            "AL submission requires --library-root or MFT_PYAEDT_LIBRARY_ROOT"
+        )
+    from campaign.deployment_gate import validate_deployment
+
+    return validate_deployment(
+        REPO_ROOT,
+        _current_solver_revision(),
+        library_root,
+        _current_library_revision(),
+    )
 
 
 def _active_al_root():
@@ -846,6 +867,7 @@ def stage_submit(st):
         raise RuntimeError(
             "standard FEA submission is disabled; rerun with --execute after reviewing artifacts"
         )
+    _require_runtime_deployment()
     rnd = st["round"]
     rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     picked = np.load(os.path.join(rdir, "selected_idx.npy")).tolist()
@@ -1008,6 +1030,7 @@ def stage_wait(st):
 
         retry_name = f"mft-al-r{rnd:02d}-retry-{idx_str}"
         retry_workdir = f"mft_al_r{rnd:02d}_rt{idx_str}"
+        _require_runtime_deployment()
         new_tid = sc.submit_verification(
             retry_name, retry_workdir, params, profile,
             mem_mb=65536, cpus=profile.get("cpus", 4),
@@ -1409,6 +1432,7 @@ def stage_fine_submit(st):
             "fine FEA submission is disabled; inspect fine_candidate_queue.csv "
             "and rerun with --execute"
         )
+    _require_runtime_deployment()
     import scheduler_client as sc
     from module.input_parameter_260706 import KEYS
 
@@ -1532,6 +1556,7 @@ def stage_fine_wait(st):
             retry_workdir = (
                 f"mft_final_fine_r{st['round']:02d}_b{batch:02d}_c{rank:02d}_retry"
             )
+            _require_runtime_deployment()
             new_task_id = sc.submit_verification(
                 retry_name,
                 retry_workdir,
@@ -1716,6 +1741,7 @@ def main():
     ap.add_argument("--registry", default=None)
     ap.add_argument("--solver-revision", default=None)
     ap.add_argument("--library-revision", default=None)
+    ap.add_argument("--library-root", default=None)
     ap.add_argument(
         "--execute", action="store_true",
         help="allow standard/fine FEA task submission; submission is disabled by default",
@@ -1740,8 +1766,13 @@ def main():
         registry=args.registry,
         solver_revision=args.solver_revision,
         library_revision=args.library_revision,
+        library_root=args.library_root,
     )
     EXECUTE_SUBMISSIONS = bool(args.execute)
+    if EXECUTE_SUBMISSIONS and not (
+            PINNED_LIBRARY_ROOT
+            or os.environ.get("MFT_PYAEDT_LIBRARY_ROOT", "").strip()):
+        ap.error("--execute requires --library-root or MFT_PYAEDT_LIBRARY_ROOT")
     if args.reset and os.path.isfile(STATE_PATH):
         os.remove(STATE_PATH)
     st = load_state()

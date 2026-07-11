@@ -706,6 +706,8 @@ class FineValidationTests(unittest.TestCase):
             return_value=runtime_scheduler_client.ResultFetch(
                 runtime_scheduler_client.RESULT_INVALID
             ),
+        ), patch.object(
+            al_driver, "_assert_training_invariants"
         ), patch.object(al_driver, "save_state"):
             al_driver.stage_fine_wait(state)
         self.assertEqual(state["stage"], "FINAL_REPORT")

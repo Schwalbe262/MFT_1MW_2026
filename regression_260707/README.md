@@ -33,7 +33,7 @@ al_driver.py  능동학습부터 최소부피 fine FEA/최종보고까지 재개
    `campaign/auto_checkpoint_loop.sh` 재학습을 독립 프로세스로 실행한다.
    orchestrator는 후보를 직접 검증한 뒤 통과 generation만 원자 승격한다.
 4. 튜닝(1회): `training/tune_optuna.py --all --trials 200` -> 본학습 `training/train_models.py --params best_params.json`
-5. AL/최종 루프: `python al_driver.py --runtime-root <live regression_260707> --max-stages 0`으로 live 경로/state를 먼저 확인하고, 승인된 revision을 고정한 뒤 `--execute` (state.json에서 재개)
+5. AL/최종 루프: `python al_driver.py --runtime-root <live regression_260707> --max-stages 0 --solver-revision <40sha> --library-revision <40sha>`로 live 경로/state를 먼저 확인하고, 제출 시에는 같은 pin과 `--library-root <clean checkout> --execute`를 사용한다. 모든 신규·재시도 제출 직전에 두 revision이 원격 branch head인지 다시 검증하며 `state.json`에서 재개한다.
 6. 최종: 사양을 통과한 standard FEA 후보를 부피순으로 fine FEA 검증하고 `verify/results/final_verification.json`과 `final_report.md`를 자동 생성
 
 현재 solver HEAD를 변경하지 않고 별도 worktree의 엄격 학습기를 live 산출물에 연결하려면

@@ -561,7 +561,9 @@ class ActiveLearningPinTests(unittest.TestCase):
             original_snapshot = Path(candidate["dataset"]).read_bytes()
             model_path = Path(candidate["generation"], "Llt_phys", "models.pkl")
             original_model = model_path.read_bytes()
-            with patch.object(al_driver, "REGISTRY", candidate["registry"]):
+            with patch.object(
+                al_driver, "REGISTRY", candidate["registry"]
+            ), patch.object(al_driver, "_assert_runtime_training_invariants"):
                 al_driver._assert_training_invariants(state)
                 Path(candidate["dataset"]).write_bytes(b"replaced")
                 with self.assertRaisesRegex(RuntimeError, "dataset_sha256"):
