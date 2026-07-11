@@ -333,40 +333,400 @@ class CopiedLossMeshPolicyTests(unittest.TestCase):
         self.assertTrue(all(call["is_solid"] is False for call in calls))
 
     def test_lightweight_matrix_disables_plate_eddy_without_mesh(self):
-        calls = []
         design = SimpleNamespace(
             core_plates=[SimpleNamespace(name="core_plate")],
             wcp_plates=[],
-            eddy_effects_on=lambda **kwargs: calls.append(kwargs) or True,
-            oboundary=SimpleNamespace(GetEddyEffect=lambda _name: "false"),
         )
         simulation = Simulation.__new__(Simulation)
         simulation.design1 = design
+        simulation._set_plate_eddy_effects_native = Mock(return_value=1)
 
         simulation.assign_plate_settings(
             enable_eddy_effects=False, assign_skin_mesh=False
         )
 
-        self.assertEqual(calls, [{
-            "assignment": ["core_plate"],
-            "enable_eddy_effects": False,
-            "enable_displacement_current": False,
-        }])
+        simulation._set_plate_eddy_effects_native.assert_called_once_with(False)
 
     def test_plate_eddy_readback_mismatch_fails_closed(self):
         design = SimpleNamespace(
             core_plates=[SimpleNamespace(name="core_plate")],
             wcp_plates=[],
-            eddy_effects_on=lambda **_kwargs: True,
-            oboundary=SimpleNamespace(GetEddyEffect=lambda _name: "false"),
         )
         simulation = Simulation.__new__(Simulation)
         simulation.design1 = design
+        simulation._set_plate_eddy_effects_native = Mock(
+            side_effect=RuntimeError("native eddy-effect readback mismatch")
+        )
 
         with self.assertRaisesRegex(RuntimeError, "readback mismatch"):
             simulation.assign_plate_settings(
                 enable_eddy_effects=True, assign_skin_mesh=False
             )
+
+    def test_plate_mesh_uses_fresh_name_selections_not_object_handles(self):
+        assign_skin_depth = Mock(return_value=SimpleNamespace(name="plate_skin_depth"))
+        design = SimpleNamespace(
+            core_plates=[SimpleNamespace(name="core_plate")],
+            wcp_plates=[SimpleNamespace(name="wcp_plate")],
+            mesh=SimpleNamespace(assign_skin_depth=assign_skin_depth),
+        )
+        simulation = Simulation.__new__(Simulation)
+        simulation.design1 = design
+        simulation.df_plus = pd.DataFrame({"freq": [1000.0]})
+        simulation._set_plate_eddy_effects_native = Mock(return_value=2)
+
+        count = simulation.assign_plate_settings(
+            enable_eddy_effects=True, assign_skin_mesh=True
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            assign_skin_depth.call_args.kwargs["assignment"],
+            ["core_plate", "wcp_plate"],
+        )
+        self.assertTrue(all(
+            isinstance(name, str)
+            for name in assign_skin_depth.call_args.kwargs["assignment"]
+        ))
+
+
+class NativeEddyTransactionTests(unittest.TestCase):
+    class _Editor:
+        def __init__(self, copper, aluminum, failure=None):
+            self.copper = list(copper)
+            self.aluminum = list(aluminum)
+            self.failure = failure
+            self.calls = []
+
+        def GetObjectsByMaterial(self, material):
+            self.calls.append(material)
+            if self.failure is not None:
+                failure, self.failure = self.failure, None
+                raise failure
+            if material == "copper_80C":
+                return list(self.copper)
+            if material == "aluminum":
+                return list(self.aluminum)
+            raise AssertionError(material)
+
+    class _Boundary:
+        def __init__(self, state, set_failure=None, read_failure=None, overrides=None):
+            self.state = state
+            self.set_failure = set_failure
+            self.read_failure = read_failure
+            self.overrides = overrides or {}
+            self.set_calls = []
+
+        def SetEddyEffect(self, payload):
+            self.set_calls.append(payload)
+            if self.set_failure is not None:
+                failure, self.set_failure = self.set_failure, None
+                raise failure
+            self.assert_vector_shape(payload)
+            for record in payload[1][1:]:
+                name = record[2]
+                self.state[name]["eddy"] = bool(record[4])
+                self.state[name]["displacement"] = bool(record[6])
+
+        @staticmethod
+        def assert_vector_shape(payload):
+            if payload[0] != "NAME:Eddy Effect Setting":
+                raise AssertionError(payload)
+            if payload[1][0] != "NAME:EddyEffectVector":
+                raise AssertionError(payload)
+
+        def _read(self, kind, name):
+            if self.read_failure is not None:
+                failure, self.read_failure = self.read_failure, None
+                raise failure
+            return self.overrides.get((kind, name), self.state[name][kind])
+
+        def GetEddyEffect(self, name):
+            return self._read("eddy", name)
+
+        def GetDisplacementCurrent(self, name):
+            return self._read("displacement", name)
+
+    class _RawDesign:
+        def __init__(self, name, editor, boundary, design_type="Maxwell 3D",
+                     solution="AC Magnetic"):
+            self.name = name
+            self.editor = editor
+            self.boundary = boundary
+            self.design_type = design_type
+            self.solution = solution
+            self.editor_calls = []
+
+        def GetName(self):
+            return self.name
+
+        def GetDesignType(self):
+            return self.design_type
+
+        def GetSolutionType(self):
+            return self.solution
+
+        def SetActiveEditor(self, name):
+            self.editor_calls.append(name)
+            if name != "3D Modeler":
+                raise AssertionError(name)
+            return self.editor
+
+        def GetModule(self, name):
+            if name != "BoundarySetup":
+                raise AssertionError(name)
+            return self.boundary
+
+    class _Project:
+        def __init__(self, design, name="simulation_native_eddy"):
+            self.design = design
+            self.name = name
+            self.active_calls = []
+
+        def GetName(self):
+            return self.name
+
+        def SetActiveDesign(self, name):
+            self.active_calls.append(name)
+            return self.design
+
+    @staticmethod
+    def _objects(prefix, count):
+        return [SimpleNamespace(name=f"{prefix}_{index}") for index in range(count)]
+
+    def _simulation(self, winding_count=4, plate_count=2):
+        tx_count = winding_count // 2
+        tx = self._objects("Tx", tx_count)
+        rx = self._objects("Rx", winding_count - tx_count)
+        core_count = plate_count // 2
+        core = self._objects("core_plate", core_count)
+        wcp = self._objects("wcp_plate", plate_count - core_count)
+        analyze = Mock(side_effect=AssertionError("eddy recovery must not solve"))
+        design = SimpleNamespace(
+            design_name="maxwell_matrix1",
+            Tx_windings=tx,
+            Rx_windings=rx,
+            core_plates=core,
+            wcp_plates=wcp,
+            setup=SimpleNamespace(analyze=analyze),
+            eddy_effects_on=Mock(
+                side_effect=AssertionError("high-level conductor discovery is forbidden")
+            ),
+            get_all_conductors_names=Mock(
+                side_effect=AssertionError("high-level conductor discovery is forbidden")
+            ),
+            modeler=SimpleNamespace(
+                refresh_all_ids=Mock(
+                    side_effect=AssertionError("modeler refresh is forbidden")
+                )
+            ),
+        )
+        simulation = Simulation.__new__(Simulation)
+        simulation.PROJECT_NAME = "simulation_native_eddy"
+        simulation.winding_conductor_material = "copper_80C"
+        simulation.design1 = design
+        simulation.solve_attempts = {"matrix": 1, "loss": 0}
+        names = [item.name for item in tx + rx + core + wcp]
+        state = {
+            name: {"eddy": False, "displacement": False} for name in names
+        }
+        return simulation, [item.name for item in tx + rx], [item.name for item in core + wcp], state
+
+    def _stack(self, copper, aluminum, state, **boundary_kwargs):
+        editor = self._Editor(copper, aluminum)
+        boundary = self._Boundary(state, **boundary_kwargs)
+        raw = self._RawDesign("maxwell_matrix1", editor, boundary)
+        project = self._Project(raw)
+        return project, raw, editor, boundary
+
+    def test_writes_and_reads_exact_full_vectors_without_hardcoded_count(self):
+        for enable_eddy_effects in (False, True):
+            for winding_count in (99, 87):
+                with self.subTest(
+                        enable_eddy_effects=enable_eddy_effects,
+                        winding_count=winding_count):
+                    simulation, windings, plates, state = self._simulation(
+                        winding_count=winding_count, plate_count=5
+                    )
+                    project, raw, editor, boundary = self._stack(
+                        windings, plates, state
+                    )
+                    simulation._refresh_native_project_handle = Mock(return_value=project)
+
+                    count = simulation._set_plate_eddy_effects_native(
+                        enable_eddy_effects,
+                        max_attempts=1,
+                        sleeper=lambda _seconds: None,
+                    )
+
+                    self.assertEqual(count, 5)
+                    self.assertEqual(editor.calls, ["copper_80C", "aluminum"])
+                    self.assertEqual(raw.editor_calls, ["3D Modeler"])
+                    self.assertEqual(project.active_calls, ["maxwell_matrix1"])
+                    vector = boundary.set_calls[0][1]
+                    self.assertEqual(len(vector) - 1, winding_count + 5)
+                    records = {record[2]: record for record in vector[1:]}
+                    self.assertEqual(set(records), set(windings + plates))
+                    self.assertTrue(all(records[name][4] is False for name in windings))
+                    self.assertTrue(all(
+                        records[name][4] is enable_eddy_effects for name in plates
+                    ))
+                    self.assertTrue(all(
+                        record[6] is False for record in records.values()
+                    ))
+                    self.assertTrue(all(
+                        state[name]["eddy"] is False for name in windings
+                    ))
+                    self.assertTrue(all(
+                        state[name]["eddy"] is enable_eddy_effects for name in plates
+                    ))
+                    self.assertEqual(
+                        simulation.solve_attempts, {"matrix": 1, "loss": 0}
+                    )
+                    simulation.design1.setup.analyze.assert_not_called()
+                    simulation.design1.eddy_effects_on.assert_not_called()
+                    simulation.design1.get_all_conductors_names.assert_not_called()
+                    simulation.design1.modeler.refresh_all_ids.assert_not_called()
+
+    def test_transient_query_write_and_read_failures_use_fresh_handles(self):
+        for stage in ("query", "write", "read"):
+            with self.subTest(stage=stage):
+                simulation, windings, plates, state = self._simulation()
+                first_project, _raw1, editor1, boundary1 = self._stack(
+                    windings, plates, state,
+                    set_failure=(RuntimeError("transient SetEddyEffect") if stage == "write" else None),
+                    read_failure=(RuntimeError("transient readback") if stage == "read" else None),
+                )
+                if stage == "query":
+                    editor1.failure = RuntimeError("transient GetObjectsByMaterial")
+                second_project, _raw2, _editor2, boundary2 = self._stack(
+                    windings, plates, state
+                )
+                simulation._refresh_native_project_handle = Mock(
+                    side_effect=[first_project, second_project]
+                )
+                sleeps = []
+
+                count = simulation._set_plate_eddy_effects_native(
+                    True, max_attempts=2, sleeper=sleeps.append
+                )
+
+                self.assertEqual(count, len(plates))
+                self.assertEqual(simulation._refresh_native_project_handle.call_count, 2)
+                self.assertEqual(sleeps, [0.5])
+                self.assertEqual(len(boundary2.set_calls), 1)
+                self.assertEqual(
+                    len(boundary1.set_calls), 0 if stage == "query" else 1
+                )
+                simulation.design1.setup.analyze.assert_not_called()
+
+    def test_material_universe_mismatch_never_writes(self):
+        cases = {
+            "missing": lambda windings, plates: (windings[:-1], plates),
+            "extra": lambda windings, plates: (windings + ["unexpected"], plates),
+            "duplicate": lambda windings, plates: (windings + [windings[0]], plates),
+            "mis-material": lambda windings, plates: (
+                windings[1:], plates + [windings[0]]
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                simulation, windings, plates, state = self._simulation()
+                copper, aluminum = mutate(list(windings), list(plates))
+                project, _raw, _editor, boundary = self._stack(
+                    copper, aluminum, state
+                )
+                simulation._refresh_native_project_handle = Mock(return_value=project)
+
+                with self.assertRaisesRegex(RuntimeError, "failed closed"):
+                    simulation._set_plate_eddy_effects_native(
+                        True, max_attempts=1, sleeper=lambda _seconds: None
+                    )
+
+                self.assertEqual(boundary.set_calls, [])
+                simulation.design1.setup.analyze.assert_not_called()
+
+    def test_wrong_design_identity_is_immediate_and_never_writes(self):
+        simulation, windings, plates, state = self._simulation()
+        project, _raw, _editor, boundary = self._stack(windings, plates, state)
+        project.design.name = "maxwell_matrix"
+        simulation._refresh_native_project_handle = Mock(return_value=project)
+
+        with self.assertRaisesRegex(RuntimeError, "design identity mismatch"):
+            simulation._set_plate_eddy_effects_native(
+                True, max_attempts=5, sleeper=lambda _seconds: None
+            )
+
+        simulation._refresh_native_project_handle.assert_called_once_with()
+        self.assertEqual(boundary.set_calls, [])
+        simulation.design1.setup.analyze.assert_not_called()
+
+    def test_permanent_transport_failure_is_bounded(self):
+        simulation, _windings, _plates, _state = self._simulation()
+        simulation._refresh_native_project_handle = Mock(
+            side_effect=RuntimeError("permanent transport failure")
+        )
+        sleeps = []
+
+        with self.assertRaisesRegex(RuntimeError, "failed closed"):
+            simulation._set_plate_eddy_effects_native(
+                True, max_attempts=5, sleeper=sleeps.append
+            )
+
+        self.assertEqual(simulation._refresh_native_project_handle.call_count, 5)
+        self.assertEqual(sleeps, [0.5, 1.0, 2.0, 4.0])
+        simulation.design1.setup.analyze.assert_not_called()
+
+    def test_deadline_prevents_another_native_transaction(self):
+        class Clock:
+            def __init__(self):
+                self.value = 0.0
+
+            def __call__(self):
+                return self.value
+
+            def sleep(self, seconds):
+                self.value += seconds
+
+        simulation, _windings, _plates, _state = self._simulation()
+        simulation._refresh_native_project_handle = Mock(
+            side_effect=RuntimeError("transport remains unavailable")
+        )
+        clock = Clock()
+
+        with self.assertRaisesRegex(RuntimeError, "failed closed"):
+            simulation._set_plate_eddy_effects_native(
+                True, max_attempts=5, timeout_s=1.0,
+                initial_retry_delay=1.0, clock=clock, sleeper=clock.sleep,
+            )
+
+        simulation._refresh_native_project_handle.assert_called_once_with()
+        self.assertEqual(clock.value, 1.0)
+        simulation.design1.setup.analyze.assert_not_called()
+
+    def test_any_full_vector_readback_mismatch_fails_closed(self):
+        for kind, target in (
+                ("eddy", "winding"),
+                ("eddy", "plate"),
+                ("displacement", "winding")):
+            with self.subTest(kind=kind, target=target):
+                simulation, windings, plates, state = self._simulation()
+                name = windings[0] if target == "winding" else plates[0]
+                expected = False if target == "winding" else True
+                override = not expected if kind == "eddy" else True
+                project, _raw, _editor, boundary = self._stack(
+                    windings, plates, state,
+                    overrides={(kind, name): override},
+                )
+                simulation._refresh_native_project_handle = Mock(return_value=project)
+
+                with self.assertRaisesRegex(RuntimeError, "readback mismatch"):
+                    simulation._set_plate_eddy_effects_native(
+                        True, max_attempts=1, sleeper=lambda _seconds: None
+                    )
+
+                self.assertEqual(len(boundary.set_calls), 1)
+                simulation.design1.setup.analyze.assert_not_called()
 
 
 class CopiedLossObjectIntegrityTests(unittest.TestCase):

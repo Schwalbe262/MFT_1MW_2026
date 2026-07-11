@@ -160,6 +160,10 @@ class SolutionDataUnavailableError(RuntimeError):
     """Legacy extraction error retained for compatibility with external callers."""
 
 
+class _AedtIdentityMismatch(RuntimeError):
+    """A fresh native AEDT handle resolved to a project or design we did not request."""
+
+
 _SOLUTION_UNIT_FACTORS = {
     "fa": 1e-15, "pa": 1e-12, "na": 1e-9, "ua": 1e-6,
     "ma": 1e-3, "a": 1.0, "ka": 1e3,
@@ -1115,6 +1119,10 @@ class Simulation():
         l2 = self.df_plus["l2"].iloc[0]
 
         conductor_mat = self._op_temp_conductor_material()
+        # Keep the authoritative material name without consulting Object3d
+        # properties later.  The latter forces a full PyAEDT modeler refresh,
+        # which is not reliable immediately after CopyDesign/Paste.
+        self.winding_conductor_material = conductor_mat
 
         round_corner = int(self.df_plus["round_corner"].iloc[0]) != 0
         corner_radius = float(self.df_plus["corner_radius"].iloc[0]) if round_corner else None
@@ -1588,6 +1596,222 @@ class Simulation():
                 raise RuntimeError("failed to assign Rx winding skin-depth mesh")
         return 2
 
+    @staticmethod
+    def _native_object_names(value, label):
+        """Normalize a native AEDT name sequence without accepting False/strings."""
+        if value is None or value is False or isinstance(value, (str, bytes, bool)):
+            raise RuntimeError(f"{label} returned no object-name sequence: {value!r}")
+        try:
+            names = [str(item).strip() for item in value]
+        except TypeError as error:
+            raise RuntimeError(
+                f"{label} returned a non-iterable object-name sequence: {value!r}"
+            ) from error
+        if any(not name for name in names):
+            raise RuntimeError(f"{label} returned an empty object name: {names!r}")
+        if len(set(names)) != len(names):
+            raise RuntimeError(f"{label} returned duplicate object names: {names!r}")
+        return names
+
+    def _set_plate_eddy_effects_native(
+            self, enable_eddy_effects, max_attempts=5, timeout_s=30.0,
+            initial_retry_delay=0.5, clock=time.monotonic, sleeper=time.sleep):
+        """Set the complete conductor eddy vector through fresh native handles.
+
+        PyAEDT ``eddy_effects_on`` first discovers every conductor by walking the
+        complete cached modeler/Object3d inventory.  A copied design can already
+        be valid in AEDT while that cache still contains a stale 3D editor.  This
+        path instead performs two native bulk material queries, validates the
+        exact campaign conductor universe, writes one full vector, and reads the
+        complete vector back.  Retrying this transaction is idempotent and never
+        repeats Copy/Paste, mesh creation, or a solve.
+        """
+        if int(max_attempts) < 1:
+            raise ValueError("max_attempts must be at least one")
+
+        expected_project_name = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        expected_design_name = _aedt_design_name(
+            getattr(self.design1, "design_name", "")
+        )
+        winding_material = str(
+            getattr(self, "winding_conductor_material", "") or ""
+        ).strip()
+        if not expected_project_name:
+            raise RuntimeError("native eddy project identity is unavailable")
+        if not expected_design_name:
+            raise RuntimeError("native eddy design identity is unavailable")
+        if not winding_material:
+            raise RuntimeError("authoritative winding conductor material is unavailable")
+
+        winding_names = (
+            _named_object_sequence(getattr(self.design1, "Tx_windings", None))
+            + _named_object_sequence(getattr(self.design1, "Rx_windings", None))
+        )
+        plate_names = (
+            _named_object_sequence(getattr(self.design1, "core_plates", None))
+            + _named_object_sequence(getattr(self.design1, "wcp_plates", None))
+        )
+        if not winding_names:
+            raise RuntimeError("native eddy contract has no winding conductors")
+        if not plate_names:
+            raise RuntimeError("native eddy contract has no plate conductors")
+        expected_names = winding_names + plate_names
+        if len(set(expected_names)) != len(expected_names):
+            raise RuntimeError(
+                "native eddy contract contains duplicate/overlapping conductor names"
+            )
+
+        desired_eddy = {
+            name: False for name in winding_names
+        }
+        desired_eddy.update({
+            name: bool(enable_eddy_effects) for name in plate_names
+        })
+        desired_displacement = {name: False for name in expected_names}
+
+        deadline = clock() + max(0.0, float(timeout_s))
+        attempts = []
+        for attempt in range(1, int(max_attempts) + 1):
+            if attempt > 1 and clock() >= deadline:
+                break
+            observed = {"copper": None, "aluminum": None}
+            try:
+                oproject = self._refresh_native_project_handle()
+                actual_project_name = str(oproject.GetName() or "").strip()
+                if actual_project_name != expected_project_name:
+                    raise _AedtIdentityMismatch(
+                        "project identity mismatch: "
+                        f"expected={expected_project_name}, actual={actual_project_name or '<empty>'}"
+                    )
+
+                odesign = oproject.SetActiveDesign(expected_design_name)
+                if odesign is None or odesign is False:
+                    raise RuntimeError(
+                        f"SetActiveDesign returned no design ({expected_design_name})"
+                    )
+                actual_design_name = _aedt_design_name(odesign)
+                if actual_design_name != expected_design_name:
+                    raise _AedtIdentityMismatch(
+                        "design identity mismatch: "
+                        f"expected={expected_design_name}, actual={actual_design_name or '<empty>'}"
+                    )
+                design_type = str(odesign.GetDesignType() or "")
+                solution_type = str(odesign.GetSolutionType() or "")
+                if design_type != "Maxwell 3D" or not _is_ac_magnetic_solution(
+                        solution_type):
+                    raise _AedtIdentityMismatch(
+                        "design physics mismatch: "
+                        f"type={design_type!r}, solution={solution_type!r}"
+                    )
+
+                oeditor = odesign.SetActiveEditor("3D Modeler")
+                if oeditor is None or oeditor is False:
+                    raise RuntimeError("SetActiveEditor returned no 3D Modeler")
+                oboundary = odesign.GetModule("BoundarySetup")
+                if oboundary is None or oboundary is False:
+                    raise RuntimeError("active design returned no BoundarySetup module")
+
+                observed_windings = self._native_object_names(
+                    oeditor.GetObjectsByMaterial(winding_material),
+                    f"GetObjectsByMaterial({winding_material})",
+                )
+                observed_plates = self._native_object_names(
+                    oeditor.GetObjectsByMaterial("aluminum"),
+                    "GetObjectsByMaterial(aluminum)",
+                )
+                observed = {
+                    "copper": observed_windings,
+                    "aluminum": observed_plates,
+                }
+                if (
+                        set(observed_windings) != set(winding_names)
+                        or len(observed_windings) != len(winding_names)):
+                    raise RuntimeError(
+                        "winding conductor universe mismatch: "
+                        f"expected={winding_names}, actual={observed_windings}"
+                    )
+                if (
+                        set(observed_plates) != set(plate_names)
+                        or len(observed_plates) != len(plate_names)):
+                    raise RuntimeError(
+                        "plate conductor universe mismatch: "
+                        f"expected={plate_names}, actual={observed_plates}"
+                    )
+                observed_all = observed_windings + observed_plates
+                if (
+                        len(set(observed_all)) != len(observed_all)
+                        or set(observed_all) != set(expected_names)
+                        or len(observed_all) != len(expected_names)):
+                    raise RuntimeError(
+                        "combined conductor universe mismatch: "
+                        f"expected={expected_names}, actual={observed_all}"
+                    )
+
+                eddy_vector = ["NAME:EddyEffectVector"]
+                for name in expected_names:
+                    eddy_vector.append([
+                        "NAME:Data",
+                        "Object Name:=", name,
+                        "Eddy Effect:=", desired_eddy[name],
+                        "Displacement Current:=", desired_displacement[name],
+                    ])
+                result = oboundary.SetEddyEffect([
+                    "NAME:Eddy Effect Setting", eddy_vector
+                ])
+                if result is False:
+                    raise RuntimeError("BoundarySetup.SetEddyEffect returned False")
+
+                mismatches = {}
+                for name in expected_names:
+                    actual_eddy = _aedt_bool(oboundary.GetEddyEffect(name))
+                    actual_displacement = _aedt_bool(
+                        oboundary.GetDisplacementCurrent(name)
+                    )
+                    if (
+                            actual_eddy != desired_eddy[name]
+                            or actual_displacement != desired_displacement[name]):
+                        mismatches[name] = {
+                            "eddy": {
+                                "expected": desired_eddy[name],
+                                "actual": actual_eddy,
+                            },
+                            "displacement": {
+                                "expected": desired_displacement[name],
+                                "actual": actual_displacement,
+                            },
+                        }
+                if mismatches:
+                    raise RuntimeError(
+                        f"native eddy-effect readback mismatch: {mismatches}"
+                    )
+                return len(plate_names)
+            except _AedtIdentityMismatch:
+                # Never mutate, or even retry against, an unexpected project/design.
+                raise
+            except Exception as error:
+                attempts.append({
+                    "attempt": attempt,
+                    "error": f"{type(error).__name__}: {error}",
+                    "observed": observed,
+                })
+                now = clock()
+                if attempt >= int(max_attempts) or now >= deadline:
+                    break
+                delay = min(
+                    max(0.0, float(initial_retry_delay)) * (2 ** (attempt - 1)),
+                    max(0.0, deadline - now),
+                )
+                logging.warning(
+                    "native conductor eddy transaction failed "
+                    f"(attempt {attempt}/{int(max_attempts)}): {error}"
+                )
+                sleeper(delay)
+        raise RuntimeError(
+            "native conductor eddy transaction failed closed; "
+            f"project={expected_project_name}, design={expected_design_name}, "
+            f"attempts={attempts}"
+        )
+
     def assign_plate_settings(self, enable_eddy_effects=True, assign_skin_mesh=True):
         """콜드플레이트/권선 냉각판 (알루미늄) 와전류 설정 + 메시"""
 
@@ -1597,19 +1821,12 @@ class Simulation():
 
         plate_names = [p.name for p in plates]
 
-        result = self.design1.eddy_effects_on(
-            assignment=plate_names,
-            enable_eddy_effects=enable_eddy_effects,
-            enable_displacement_current=False
-        )
-        if result is not True:
-            raise RuntimeError(f"failed to set plate eddy effects={enable_eddy_effects}")
-        for plate_name in plate_names:
-            actual = _aedt_bool(self.design1.oboundary.GetEddyEffect(plate_name))
-            if actual != bool(enable_eddy_effects):
-                raise RuntimeError(
-                    f"plate eddy-effect readback mismatch for {plate_name}: {actual}"
-                )
+        plate_count = self._set_plate_eddy_effects_native(enable_eddy_effects)
+        if int(plate_count) != len(plate_names):
+            raise RuntimeError(
+                "native plate eddy-effect count mismatch: "
+                f"expected={len(plate_names)}, actual={plate_count}"
+            )
 
         if not assign_skin_mesh:
             logging.info("plate skin-depth mesh skipped")
@@ -1622,7 +1839,7 @@ class Simulation():
         skin_depth = math.sqrt(2 / (omega * mu0 * sigma_al)) * 1e3  # in mm (~2.6mm @1kHz)
 
         self.plate_skin_depth_mesh = self.design1.mesh.assign_skin_depth(
-            assignment=plates,
+            assignment=plate_names,
             skin_depth=f'{skin_depth}mm',
             triangulation_max_length='50mm',
             layers_number="1",
@@ -1630,7 +1847,7 @@ class Simulation():
         )
         if self.plate_skin_depth_mesh is False or self.plate_skin_depth_mesh is None:
             raise RuntimeError("failed to assign plate skin-depth mesh")
-        return len(plates)
+        return int(plate_count)
 
     def assign_boundary(self):
 
