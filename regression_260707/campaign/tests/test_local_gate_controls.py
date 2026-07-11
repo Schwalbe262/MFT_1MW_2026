@@ -226,8 +226,9 @@ class FleetGateTests(unittest.TestCase):
                 feeder.al_driver, "_current_solver_revision", return_value=SOLVER), \
                 mock.patch.object(
                     feeder.al_driver, "_current_library_revision", return_value=LIBRARY), \
-                mock.patch.object(feeder, "validate_p08_completion") as validate, \
-                mock.patch.object(feeder, "step", return_value=False) as step:
+                 mock.patch.object(feeder, "validate_p08_completion") as validate, \
+                 mock.patch.object(feeder, "_require_deployed_revisions"), \
+                 mock.patch.object(feeder, "step", return_value=False) as step:
             feeder.main()
 
         validate.assert_called_once_with(SOLVER, LIBRARY, seed=260710)

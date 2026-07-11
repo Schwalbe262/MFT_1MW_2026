@@ -346,6 +346,7 @@ class ControllerMutationTests(unittest.TestCase):
             with mock.patch.object(
                     rapid_campaign, "_validate_pinned_local_revisions",
                     return_value=(SOLVER_REVISION, LIBRARY_REVISION)), mock.patch.object(
+                        rapid_campaign.deployment_gate, "validate_deployment"), mock.patch.object(
                         rapid_campaign, "candidate_supply_audit",
                         return_value={"count": 300, "plan_sha256": "x"}), mock.patch.object(
                             rapid_campaign.pinned_pilot, "validate_local_gate"), mock.patch.object(
@@ -363,6 +364,7 @@ class ControllerMutationTests(unittest.TestCase):
                     SOLVER_REVISION,
                     LIBRARY_REVISION,
                     execute=True,
+                    library_root=root,
                     state_path=state_path,
                     manifest_dir=root,
                     now=NOW,

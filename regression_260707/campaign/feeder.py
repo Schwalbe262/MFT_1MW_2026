@@ -33,6 +33,7 @@ VERIFY_DIR = os.path.abspath(os.path.join(HERE, "..", "verify"))
 if VERIFY_DIR not in sys.path:
     sys.path.insert(0, VERIFY_DIR)
 import scheduler_client
+import deployment_gate
 
 STATE = os.path.join(HERE, "feeder_state.json")
 SCHEDULER = "http://127.0.0.1:8000"
@@ -48,6 +49,18 @@ ACTIVE_TASK_STATUSES = ("queued", "attaching", "running")
 PROFILE_PATH = os.path.join(HERE, "..", "verify", "profiles", "standard.json")
 TRAIN_PARQUET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 COLLECT_CACHE = os.path.join(HERE, "..", "data", "dataset", "collect_cache.json")
+REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+
+
+def _require_deployed_revisions(solver_revision, library_revision):
+    library_root = os.environ.get("MFT_PYAEDT_LIBRARY_ROOT", "").strip()
+    if not library_root:
+        library_root = os.path.abspath(
+            os.path.join(REPO_ROOT, "..", "pyaedt_library")
+        )
+    return deployment_gate.validate_deployment(
+        REPO_ROOT, solver_revision, library_root, library_revision
+    )
 
 
 class SchedulerError(RuntimeError):
@@ -306,21 +319,24 @@ def main():
         validate_p08_completion(
             args.solver_revision, args.library_revision, seed=args.candidate_seed)
 
-    if args.once or not args.loop:
-        step(
+    def guarded_step():
+        if args.target + args.buffer > 0:
+            _require_deployed_revisions(
+                args.solver_revision, args.library_revision
+            )
+        return step(
             args.max_samples, target=args.target, buffer=args.buffer,
             solver_revision=args.solver_revision,
             library_revision=args.library_revision,
             candidate_seed=args.candidate_seed,
         )
+
+    if args.once or not args.loop:
+        guarded_step()
         return
     while True:
         try:
-            if not step(
-                    args.max_samples, target=args.target, buffer=args.buffer,
-                    solver_revision=args.solver_revision,
-                    library_revision=args.library_revision,
-                    candidate_seed=args.candidate_seed):
+            if not guarded_step():
                 break
         except Exception as e:
             print(f"[feeder] step error: {e}")

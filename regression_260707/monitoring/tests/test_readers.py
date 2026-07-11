@@ -44,6 +44,24 @@ def test_nsga_and_verification_are_joined(artifact_service):
     assert verification["final"]["evaluation"]["checks"]["full_model"]["pass"] is True
 
 
+def test_final_display_fails_closed_on_missing_or_negative_wcp_loss(
+        artifact_service, campaign_root):
+    artifact = json.loads(
+        Path(campaign_root, "verify", "results", "final_verification.json")
+        .read_text(encoding="utf-8")
+    )
+    result = dict(artifact["result"])
+    result["P_wcp_total"] = -1.0
+    negative = artifact_service._evaluate_fea(result, require_full_model=True)
+    assert negative["computed_status"] == "fail"
+    assert negative["checks"]["loss_components"]["pass"] is False
+
+    result.pop("P_wcp_total")
+    missing = artifact_service._evaluate_fea(result, require_full_model=True)
+    assert missing["computed_status"] == "unknown"
+    assert missing["checks"]["loss_components"]["pass"] is None
+
+
 def test_corrupt_json_retains_last_good_value(tmp_path):
     path = tmp_path / "state.json"
     path.write_text('{"stage": "WAIT"}', encoding="utf-8")

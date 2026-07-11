@@ -944,12 +944,27 @@ class ArtifactService:
         matrix_error = _finite_number(result.get("conv_error_pct_matrix"))
         loss_error = _finite_number(result.get("conv_error_pct_loss"))
         convergence_value = max(matrix_error, loss_error) if matrix_error is not None and loss_error is not None else None
+        loss_components = [
+            _finite_number(result.get(key)) for key in
+            ("P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total")
+        ]
+        losses_complete = all(value is not None for value in loss_components)
+        losses_nonnegative = (
+            all(value >= 0 for value in loss_components) if losses_complete else None
+        )
+        total_loss = sum(loss_components) if losses_complete else None
         checks = {
             "llt": self._constraint(llt, (26.95, 28.05), "band"),
             "temperature": self._constraint(max_temperature, 100.0, "max"),
             "bmax": self._constraint(bmax, 1.2, "max"),
             "insulation": self._constraint(min_insulation, 40.0, "min"),
             "convergence": self._constraint(convergence_value, 1.5, "max"),
+            "loss_components": {
+                "value": total_loss,
+                "limit": "all four finite and >= 0 W",
+                "margin": None,
+                "pass": losses_nonnegative,
+            },
         }
         if require_full_model:
             checks["full_model"] = {
@@ -960,11 +975,6 @@ class ArtifactService:
             }
         states = [item["pass"] for item in checks.values()]
         computed_status = "fail" if False in states else ("pass" if states and all(value is True for value in states) else "unknown")
-        loss_components = [
-            _finite_number(result.get(key)) for key in
-            ("P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total")
-        ]
-        total_loss = sum(value for value in loss_components if value is not None) if all(value is not None for value in loss_components) else None
         return {
             "computed_status": computed_status,
             "checks": checks,

@@ -42,6 +42,18 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _recomputed_strict_full_rows(
+        dataset_path, solver_revision=None, library_revision=None):
+    from quality_contract import annotate_validity
+
+    audited = annotate_validity(
+        pd.read_parquet(dataset_path),
+        expected_solver_revision=solver_revision,
+        expected_library_revision=library_revision,
+    )
+    return int(audited["_strict_valid_full"].sum())
+
+
 def load_models(registry=None):
     from predictor import EnsemblePredictor
     import predictor as predictor_mod
@@ -128,6 +140,7 @@ def main():
             "--registry-generation and --quality-status must be supplied together"
         )
     registry_for_models = args.registry
+    generation_report = {}
     if args.registry_generation:
         registry_for_models = os.path.abspath(args.registry_generation)
         with open(args.quality_status, encoding="utf-8") as handle:
@@ -151,6 +164,18 @@ def main():
             value = str(quality.get(key) or "")
             if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
                 raise SystemExit(f"quality snapshot has no pinned {key}")
+        verified_strict_rows = _recomputed_strict_full_rows(
+            args.dataset,
+            quality["solver_revision"],
+            quality["library_revision"],
+        )
+        if (verified_strict_rows < MIN_STRICT_FULL_ROWS
+                or verified_strict_rows != int(quality["strict_full_rows"])
+                or verified_strict_rows
+                != int(generation_report["strict_full_rows"])):
+            raise SystemExit(
+                "pinned dataset strict-full cohort does not match quality metadata"
+            )
     else:
         from model_quality_gate import evaluate_registry
         with open(args.quality_thresholds, encoding="utf-8") as handle:
@@ -161,6 +186,12 @@ def main():
                 or int(quality.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS):
             raise SystemExit(
                 "surrogate quality gate failed: " + "; ".join(quality["reasons"][:20])
+            )
+        verified_strict_rows = _recomputed_strict_full_rows(args.dataset)
+        if (verified_strict_rows < MIN_STRICT_FULL_ROWS
+                or verified_strict_rows != int(quality["strict_full_rows"])):
+            raise SystemExit(
+                "dataset strict-full cohort does not match quality metadata"
             )
 
     models = load_models(registry_for_models)
@@ -235,7 +266,7 @@ def main():
             "training_run_id": quality.get("training_run_id"),
             "dataset_sha256": quality.get("dataset_sha256"),
             "quality_gate_passed": True,
-            "strict_full_rows": int(quality["strict_full_rows"]),
+            "strict_full_rows": verified_strict_rows,
             "quality_thresholds_sha256": vetted_thresholds_sha256,
             "solver_revision": quality.get("solver_revision"),
             "library_revision": quality.get("library_revision"),

@@ -25,8 +25,11 @@ from training.train_models import capture_active_generation, restore_active_gene
 from verify import scheduler_client
 import scheduler_client as runtime_scheduler_client
 from verify.finalize import (
-    INSULATION_COLUMNS, _candidate_digest, write_final_artifacts,
+    INSULATION_COLUMNS, QUALITY_THRESHOLDS_PATH, REQUIRED_OPTIMIZATION_MODELS,
+    _candidate_digest, candidate_identity_reasons, write_final_artifacts,
 )
+from module.input_parameter_260706 import KEYS, create_input_parameter
+from optimization.geometry_metrics import bounding_box_lit
 from test_al_integrity import valid_result
 import al_driver
 from optimization.nsga2_problem import MFTProblem, T_TARGETS
@@ -197,11 +200,11 @@ class NSGAHardGateTests(unittest.TestCase):
             ):
                 run_nsga2.main()
 
-    def test_pinned_generation_below_3000_cannot_optimize(self):
+    def test_claimed_3000_rows_are_recomputed_from_pinned_parquet(self):
         with tempfile.TemporaryDirectory() as tmp:
             dataset = Path(tmp, "snapshot.parquet")
-            dataset.write_bytes(b"underfilled")
-            dataset_sha = hashlib.sha256(b"underfilled").hexdigest()
+            pd.DataFrame().to_parquet(dataset, index=False)
+            dataset_sha = hashlib.sha256(dataset.read_bytes()).hexdigest()
             generation = Path(tmp, "generation")
             generation.mkdir()
             quality = Path(tmp, "quality.json")
@@ -212,13 +215,13 @@ class NSGAHardGateTests(unittest.TestCase):
             Path(generation, "train_report.json").write_text(json.dumps({
                 "training_run_id": run_id,
                 "dataset_sha256": dataset_sha,
-                "strict_full_rows": 2999,
+                "strict_full_rows": 3000,
             }), encoding="utf-8")
             quality.write_text(json.dumps({
                 "passed": True,
                 "training_run_id": run_id,
                 "dataset_sha256": dataset_sha,
-                "strict_full_rows": 2999,
+                "strict_full_rows": 3000,
                 "quality_thresholds_sha256": threshold_sha,
                 "solver_revision": "a" * 40,
                 "library_revision": "b" * 40,
@@ -231,7 +234,7 @@ class NSGAHardGateTests(unittest.TestCase):
                 "--quality-thresholds", run_nsga2.VETTED_QUALITY_THRESHOLDS,
                 "--output-root", tmp,
             ]), self.assertRaisesRegex(
-                SystemExit, "generation/quality/dataset identity mismatch"
+                SystemExit, "strict-full cohort does not match quality metadata"
             ):
                 run_nsga2.main()
 
@@ -359,6 +362,61 @@ class OptimizationPhysicsTests(unittest.TestCase):
 
 
 class FineValidationTests(unittest.TestCase):
+    def candidate(self, l1, volume_L=100.0):
+        safe_inputs = {
+            "l1": l1,
+            "cc_w2c_space_x": 40.0,
+            "cc_w2c_space_y": 40.0,
+            "w2c_w1c_space_x": 40.0,
+            "w2c_w1c_space_y": 40.0,
+            "w1c_w2s_space_x": 40.0,
+            "w2s_w1s_space_x": 40.0,
+            "w1s_w2s_space_y": 40.0,
+            "w1s_cs_space_x": 40.0,
+            "cs_w1s_space_y": 40.0,
+        }
+        params = create_input_parameter(safe_inputs).iloc[0].to_dict()
+        standard_profile = json.loads(
+            (HERE / "verify" / "profiles" / "standard.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fine_profile = json.loads(
+            (HERE / "verify" / "profiles" / "fine.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        standard_params = runtime_scheduler_client.effective_verification_params(
+            params, standard_profile
+        )
+        fine_params = runtime_scheduler_client.effective_verification_params(
+            params, fine_profile
+        )
+        return {
+            "candidate_digest": _candidate_digest(params),
+            "volume_L": volume_L,
+            "params": params,
+            "standard_params": standard_params,
+            "fine_params": fine_params,
+            "geometry_evidence": {
+                column: 40.0 for column in INSULATION_COLUMNS
+            },
+        }
+
+    def quality_snapshot(self):
+        return {
+            "passed": True,
+            "strict_full_rows": 3000,
+            "solver_revision": "a" * 40,
+            "library_revision": "b" * 40,
+            "quality_thresholds_sha256": hashlib.sha256(
+                Path(QUALITY_THRESHOLDS_PATH).read_bytes()
+            ).hexdigest(),
+            "targets": {target: {} for target in REQUIRED_OPTIMIZATION_MODELS},
+            "training_run_id": "quality-run",
+            "dataset_sha256": "d" * 64,
+        }
+
     def fine_result(self, **updates):
         row = valid_result(
             full_model=1,
@@ -389,6 +447,13 @@ class FineValidationTests(unittest.TestCase):
             conv_delta_pct_matrix=0.2,
             conv_error_pct_loss=0.3,
             conv_delta_pct_loss=0.2,
+            sl1_main_x=100.0,
+            nwl1_main=10.0,
+            sl1_main_y=100.0,
+            nwb1_main_y=10.0,
+            sl2_side_x=100.0,
+            sl2_side_y=100.0,
+            nwl2_side=10.0,
         )
         row.update(updates)
         return row
@@ -414,59 +479,41 @@ class FineValidationTests(unittest.TestCase):
         ))
 
     def test_fine_failure_falls_back_to_next_smallest_candidate(self):
-        geometry = {column: 40.0 for column in INSULATION_COLUMNS}
-        small_params = {"l1": 50.0}
-        next_params = {"l1": 60.0}
-        selected = [
-            {
-                "candidate_digest": _candidate_digest(small_params),
-                "volume_L": 100.0,
-                "round": 1,
-                "task_id": 10,
-                "params": small_params,
-                "geometry_evidence": geometry,
-            },
-            {
-                "candidate_digest": _candidate_digest(next_params),
-                "volume_L": 110.0,
-                "round": 1,
-                "task_id": 11,
-                "params": next_params,
-                "geometry_evidence": geometry,
-            },
-        ]
-        failed = self.fine_result(T_max_Tx=101.0, **small_params)
-        passed = self.fine_result(**next_params)
-        with tempfile.TemporaryDirectory() as tmp:
+        selected = [self.candidate(50.0), self.candidate(60.0)]
+        selected[0].update(round=1, task_id=10)
+        selected[1].update(round=1, task_id=11)
+        failed = self.fine_result(
+            **dict(selected[0]["fine_params"], T_max_Tx=101.0)
+        )
+        passed = self.fine_result(**selected[1]["fine_params"])
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "verify.finalize._final_candidate_provenance_reasons", return_value=[]
+        ):
             artifact = write_final_artifacts(
-                tmp, selected, [failed, passed], {"passed": True},
+                tmp, selected, [failed, passed], self.quality_snapshot(),
                 "a" * 40, "b" * 40,
             )
             self.assertTrue(artifact["passed"])
             self.assertEqual(
                 artifact["candidate"]["candidate_digest"],
-                _candidate_digest(next_params),
+                selected[1]["candidate_digest"],
             )
             report = Path(tmp, "final_report.md").read_text(encoding="utf-8")
             self.assertNotIn("Monte Carlo", report)
             self.assertIn("정확히 동일", report)
 
     def test_fine_uses_actual_geometry_and_exact_candidate_identity(self):
-        params = {"l1": 50.0}
-        candidate = {
-            "candidate_digest": _candidate_digest(params),
-            "volume_L": 100.0,
-            "params": params,
-            # Stale/spoofed Pareto evidence must not override actual FEA.
-            "geometry_evidence": {
-                column: 40.0 for column in INSULATION_COLUMNS
-            },
-        }
-        bad_gap = self.fine_result(l1=50.0, cc_w2c_space_x=10.0)
-        wrong_candidate = self.fine_result(l1=51.0)
-        with tempfile.TemporaryDirectory() as tmp:
+        candidate = self.candidate(50.0)
+        # Stale/spoofed Pareto evidence must not override actual FEA.
+        bad_gap_params = dict(candidate["fine_params"], cc_w2c_space_x=10.0)
+        bad_gap = self.fine_result(**bad_gap_params)
+        wrong_params = dict(candidate["fine_params"], l1=51.0)
+        wrong_candidate = self.fine_result(**wrong_params)
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "verify.finalize._final_candidate_provenance_reasons", return_value=[]
+        ):
             gap_artifact = write_final_artifacts(
-                tmp, [candidate], [bad_gap], {"passed": True},
+                tmp, [candidate], [bad_gap], self.quality_snapshot(),
                 "a" * 40, "b" * 40,
             )
             self.assertFalse(gap_artifact["passed"])
@@ -475,7 +522,7 @@ class FineValidationTests(unittest.TestCase):
                 gap_artifact["fine_attempts"][-1]["reasons"],
             )
             identity_artifact = write_final_artifacts(
-                tmp, [candidate], [wrong_candidate], {"passed": True},
+                tmp, [candidate], [wrong_candidate], self.quality_snapshot(),
                 "a" * 40, "b" * 40,
             )
             self.assertFalse(identity_artifact["passed"])
@@ -483,6 +530,55 @@ class FineValidationTests(unittest.TestCase):
                 "candidate_result_identity_mismatch",
                 identity_artifact["fine_attempts"][-1]["reasons"],
             )
+
+    def test_final_pass_requires_standard_manifest_and_3000_row_quality(self):
+        candidate = self.candidate(50.0)
+        result = self.fine_result(**candidate["fine_params"])
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = write_final_artifacts(
+                tmp, [candidate], [result], {"passed": True},
+                "a" * 40, "b" * 40,
+            )
+        self.assertFalse(artifact["passed"])
+        reasons = artifact["fine_attempts"][-1]["reasons"]
+        self.assertIn("model_quality_below_3000_strict_rows", reasons)
+        self.assertIn("candidate_optimization_manifest_unavailable", reasons)
+        self.assertIn("strict_standard_contract_failed", reasons)
+
+    def test_candidate_identity_requires_all_71_submitted_inputs(self):
+        candidate = self.candidate(50.0)
+        result = self.fine_result(**candidate["fine_params"])
+        candidate["params"].pop("fan_config")
+        reasons = candidate_identity_reasons(
+            result, candidate, expected_params_key="fine_params"
+        )
+        self.assertIn("candidate_params_missing", reasons)
+
+    def test_final_ranking_uses_fine_result_volume_not_stored_candidate_volume(self):
+        first = self.candidate(50.0, volume_L=1.0)
+        second = self.candidate(60.0, volume_L=2.0)
+        first_result = self.fine_result(**first["fine_params"])
+        second_result = self.fine_result(**second["fine_params"])
+        actual = {
+            first["candidate_digest"]: float(bounding_box_lit(first_result)[0]),
+            second["candidate_digest"]: float(bounding_box_lit(second_result)[0]),
+        }
+        # Reverse/spoof the stored ordering. The fine geometry remains the only
+        # authoritative source for the winner and reported volume.
+        first["volume_L"], second["volume_L"] = 0.1, 0.01
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "verify.finalize._final_candidate_provenance_reasons", return_value=[]
+        ):
+            artifact = write_final_artifacts(
+                tmp, [first, second], [first_result, second_result],
+                self.quality_snapshot(), "a" * 40, "b" * 40,
+            )
+        expected_digest = min(actual, key=actual.get)
+        self.assertTrue(artifact["passed"])
+        self.assertEqual(artifact["candidate_id"], expected_digest)
+        self.assertAlmostEqual(
+            artifact["candidate"]["volume_L"], actual[expected_digest]
+        )
 
     def test_invalid_fine_result_after_retry_blocks_larger_candidate(self):
         state = {
@@ -514,19 +610,20 @@ class FineValidationTests(unittest.TestCase):
     def test_larger_unverified_candidate_does_not_block_smaller_fine_pass(self):
         candidates = []
         records = {}
-        for rank, (l1, volume) in enumerate(((50.0, 100.0), (60.0, 110.0), (70.0, 120.0))):
-            params = {"l1": l1}
-            candidates.append({
-                "params": params,
-                "candidate_digest": _candidate_digest(params),
-                "volume_L": volume,
-            })
+        for rank, l1 in enumerate((50.0, 60.0, 70.0)):
+            candidate = self.candidate(l1)
+            result = self.fine_result(**candidate["fine_params"])
+            candidate["volume_L"] = float(bounding_box_lit(result)[0])
+            candidates.append(candidate)
             records[str(rank)] = {
                 "active_id": 77 + rank,
                 "attempt": 0,
                 "outcome": "valid",
-                "result": self.fine_result(l1=l1),
+                "result": result,
             }
+        candidates[2]["volume_L"] = max(
+            candidates[0]["volume_L"], candidates[1]["volume_L"]
+        ) + 1.0
         records["2"].update(attempt=1, outcome="pending", result=None)
         state = {
             "round": 2,

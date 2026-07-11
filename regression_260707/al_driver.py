@@ -804,6 +804,12 @@ def stage_submit(st):
         row = front.iloc[i]
         params = {k: (row[k] if not isinstance(row[k], np.generic) else row[k].item())
                   for k in KEYS if k in front.columns and pd.notna(row[k])}
+        if set(params) != set(KEYS):
+            missing = sorted(set(KEYS) - set(params))
+            raise RuntimeError(f"standard candidate is missing required inputs: {missing}")
+        submitted_params = sc.effective_verification_params(params, profile)
+        if set(submitted_params) != set(KEYS):
+            raise RuntimeError("standard profile produced an incomplete parameter payload")
         name = f"mft-al-r{rnd:02d}-c{j:02d}"
         workdir = f"mft_al_r{rnd:02d}_c{j:02d}"
         tid = sc.submit_verification(
@@ -814,6 +820,7 @@ def stage_submit(st):
         records[idx_str] = _new_task_record(
             tid, name=name, workdir=workdir, solver_revision=solver_revision,
             library_revision=library_revision)
+        records[idx_str]["submitted_params"] = submitted_params
         if tid is None:
             unknown.append(idx_str)
         # Persist every returned identity. A driver crash cannot silently submit
@@ -897,9 +904,15 @@ def stage_wait(st):
             key: (row[key].item() if hasattr(row[key], "item") else row[key])
             for key in KEYS if key in front.columns and pd.notna(row[key])
         }
+        submitted_params = record.get("submitted_params")
+        if not isinstance(submitted_params, dict):
+            submitted_params = sc.effective_verification_params(params, profile)
+            record["submitted_params"] = submitted_params
         result_matches = (
             fetched.state == sc.RESULT_VALID
-            and sc.result_matches_params(fetched.result, params)
+            and sc.result_matches_params(
+                fetched.result, submitted_params, required_keys=KEYS
+            )
         )
         if result_matches:
             record["result"] = fetched.result
@@ -979,6 +992,11 @@ def stage_ingest(st):
     rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     front = pd.read_csv(os.path.join(rdir, "pareto_front.csv"))
     import scheduler_client as sc
+    with open(
+        os.path.join(CODE_ROOT, "verify", "profiles", "standard.json"),
+        encoding="utf-8",
+    ) as profile_file:
+        profile = json.load(profile_file)
 
     records = _ensure_task_records(st)
     solver_revision = st.get("solver_git_revision")
@@ -1043,7 +1061,13 @@ def stage_ingest(st):
             for key in KEYS
             if key in front.columns and pd.notna(candidate_row[key])
         }
-        if not sc.result_matches_params(res, candidate_params):
+        submitted_params = record.get("submitted_params")
+        if not isinstance(submitted_params, dict):
+            submitted_params = sc.effective_verification_params(
+                candidate_params, profile
+            )
+        if not sc.result_matches_params(
+                res, submitted_params, required_keys=KEYS):
             record["outcome"] = "pending"
             record["last_result_state"] = "candidate_result_identity_mismatch"
             record["result"] = None
@@ -1306,6 +1330,7 @@ def stage_fine_submit(st):
             "and rerun with --execute"
         )
     import scheduler_client as sc
+    from module.input_parameter_260706 import KEYS
 
     profile_path = os.path.join(HERE, "verify", "profiles", "fine.json")
     with open(profile_path, encoding="utf-8") as handle:
@@ -1323,6 +1348,11 @@ def stage_fine_submit(st):
                 unknown.append(key)
             continue
         batch = int(st.get("fine_batch", 0))
+        fine_params = sc.effective_verification_params(candidate["params"], profile)
+        if set(fine_params) != set(KEYS):
+            missing = sorted(set(KEYS) - set(fine_params))
+            raise RuntimeError(f"fine candidate is missing required inputs: {missing}")
+        candidate["fine_params"] = fine_params
         name = f"mft-final-fine-r{st['round']:02d}-b{batch:02d}-c{rank:02d}"
         workdir = f"mft_final_fine_r{st['round']:02d}_b{batch:02d}_c{rank:02d}"
         task_id = sc.submit_verification(
@@ -1352,6 +1382,7 @@ def stage_fine_submit(st):
 
 def stage_fine_wait(st):
     import scheduler_client as sc
+    from module.input_parameter_260706 import KEYS
 
     records = st.get("fine_task_records") or {}
     if len(records) != len(st.get("final_candidates") or []):
@@ -1390,7 +1421,9 @@ def stage_fine_wait(st):
         candidate = st["final_candidates"][int(key)]
         result_matches = (
             fetched.state == sc.RESULT_VALID
-            and sc.result_matches_params(fetched.result, candidate.get("params"))
+            and sc.result_matches_params(
+                fetched.result, candidate.get("fine_params"), required_keys=KEYS
+            )
         )
         if result_matches:
             record["outcome"] = "valid"
@@ -1448,6 +1481,7 @@ def stage_fine_wait(st):
         key for key, record in records.items()
         if record.get("outcome") == "unverified"
     ]
+    from optimization.geometry_metrics import bounding_box_lit
     from verify.finalize import candidate_identity_reasons, physical_spec_reasons
     passing_volumes = []
     for key, record in records.items():
@@ -1456,9 +1490,15 @@ def stage_fine_wait(st):
         candidate = st["final_candidates"][int(key)]
         result = record.get("result") or {}
         if not (physical_spec_reasons(result)
-                + candidate_identity_reasons(result, candidate)):
+                + candidate_identity_reasons(
+                    result, candidate, expected_params_key="fine_params"
+                )):
             try:
-                passing_volumes.append(float(candidate["volume_L"]))
+                volume = float(bounding_box_lit(result)[0])
+                if not math.isfinite(volume) or volume <= 0:
+                    raise ValueError("nonpositive fine volume")
+                passing_volumes.append(volume)
+                record["fine_volume_L"] = volume
             except (KeyError, TypeError, ValueError, OverflowError):
                 pass
     smallest_pass_volume = min(passing_volumes) if passing_volumes else None
@@ -1510,7 +1550,9 @@ def stage_final_report(st):
         raise RuntimeError("final report is blocked by a missing/failed model quality gate")
     current_pass = any(
         not (physical_spec_reasons(result)
-             + candidate_identity_reasons(result, candidate))
+             + candidate_identity_reasons(
+                 result, candidate, expected_params_key="fine_params"
+             ))
         for candidate, result in zip(st["final_candidates"], fine_results)
     )
     cursor = int(st.get("fine_queue_cursor", 0)) + len(st["final_candidates"])
@@ -1529,7 +1571,9 @@ def stage_final_report(st):
                 "passed": False,
                 "reasons": (
                     physical_spec_reasons(result)
-                    + candidate_identity_reasons(result, candidate)
+                    + candidate_identity_reasons(
+                        result, candidate, expected_params_key="fine_params"
+                    )
                 ),
                 "fine_result": result,
                 "fine_task_id": record.get("active_id"),

@@ -44,6 +44,13 @@ INSULATION_COLUMNS = (
 SIDE_INSULATION_COLUMNS = ("w2s_w1s_space_x", "w1s_w2s_space_y")
 MIN_STRICT_FULL_ROWS = 3000
 QUALITY_THRESHOLDS_PATH = REGRESSION_ROOT / "training" / "model_quality_thresholds.json"
+REQUIRED_OPTIMIZATION_MODELS = frozenset({
+    "Llt_phys", "k",
+    "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
+    "B_max_core", "B_mean_core",
+    "Tprobe_Tx_leeward_max", "Tprobe_Rx_main_leeward_max",
+    "Tprobe_Rx_side_leeward_max", "Tprobe_core_center_max",
+})
 
 
 def _finite(value):
@@ -99,7 +106,7 @@ def _optimization_manifest_reasons(
         except Exception:
             reasons.append(f"optimization_artifact_unavailable:{key}")
     required = set(manifest.get("required_models") or [])
-    if "P_wcp_total" not in required or len(required) < 12:
+    if required != REQUIRED_OPTIMIZATION_MODELS:
         reasons.append("optimization_required_models_incomplete")
     generation = manifest.get("registry_generation")
     try:
@@ -107,9 +114,10 @@ def _optimization_manifest_reasons(
         registry_root = (REGRESSION_ROOT / "training" / "registry").resolve()
         if os.path.commonpath([str(generation_path), str(registry_root)]) != str(registry_root):
             raise RuntimeError("generation escapes registry")
-        if _sha256(generation_path / "train_report.json") != manifest.get(
-                "generation_report_sha256"):
+        report_path = generation_path / "train_report.json"
+        if _sha256(report_path) != manifest.get("generation_report_sha256"):
             reasons.append("optimization_generation_report_mismatch")
+        generation_report = json.loads(report_path.read_text(encoding="utf-8"))
         artifact_hashes = manifest.get("model_artifacts_sha256") or {}
         for target in required:
             for name in ("models.pkl", "meta.json"):
@@ -118,6 +126,28 @@ def _optimization_manifest_reasons(
                     reasons.append(f"optimization_model_artifact_mismatch:{target}:{name}")
     except Exception:
         reasons.append("optimization_generation_unavailable")
+        generation_report = {}
+    try:
+        quality = json.loads(quality_path.read_text(encoding="utf-8"))
+        if not quality.get("passed"):
+            reasons.append("optimization_quality_snapshot_failed")
+        if int(quality.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS:
+            reasons.append("optimization_quality_snapshot_below_3000")
+        for key in (
+            "training_run_id", "dataset_sha256", "solver_revision",
+            "library_revision", "quality_thresholds_sha256",
+        ):
+            if quality.get(key) != manifest.get(key):
+                reasons.append(f"optimization_quality_identity_mismatch:{key}")
+        if set((quality.get("targets") or {}).keys()) != required:
+            reasons.append("optimization_quality_targets_incomplete")
+        for key in ("training_run_id", "dataset_sha256", "strict_full_rows"):
+            if generation_report.get(key) != manifest.get(key):
+                reasons.append(f"optimization_generation_identity_mismatch:{key}")
+        if generation_report.get("profile_sha256") != manifest.get("profile_sha256"):
+            reasons.append("optimization_profile_identity_mismatch")
+    except Exception:
+        reasons.append("optimization_quality_snapshot_unavailable")
     return list(dict.fromkeys(reasons))
 
 
@@ -169,28 +199,38 @@ def physical_spec_reasons(result, candidate=None):
 
 
 def _candidate_digest(candidate):
-    payload = {
-        key: candidate[key]
-        for key in KEYS if key in candidate and _finite(candidate[key])
-    }
+    payload = {}
+    for key in KEYS:
+        if key not in candidate:
+            continue
+        value = candidate[key]
+        if hasattr(value, "item"):
+            value = value.item()
+        payload[key] = value
     return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
     ).hexdigest()
 
 
-def candidate_identity_reasons(result, candidate):
+def candidate_identity_reasons(result, candidate, expected_params_key="params"):
     """Authenticate the candidate record and its exact submitted FEA inputs."""
     from verify import scheduler_client
 
     if not isinstance(candidate, dict):
         return ["candidate_record_missing"]
     params = candidate.get("params")
-    if not isinstance(params, dict) or not params:
+    if not isinstance(params, dict) or set(params) != set(KEYS):
         return ["candidate_params_missing"]
     reasons = []
     if candidate.get("candidate_digest") != _candidate_digest(params):
         reasons.append("candidate_digest_mismatch")
-    if not scheduler_client.result_matches_params(result, params):
+    expected_params = candidate.get(expected_params_key)
+    if not isinstance(expected_params, dict) or set(expected_params) != set(KEYS):
+        reasons.append(f"candidate_{expected_params_key}_missing")
+    elif not scheduler_client.result_matches_params(
+            result, expected_params, required_keys=KEYS):
         reasons.append("candidate_result_identity_mismatch")
     return reasons
 
@@ -200,6 +240,13 @@ def collect_standard_pass_candidates(
     expected_library_revision=None,
 ):
     """Return strict standard-FEA pass candidates ordered by recomputed volume."""
+    from verify import scheduler_client
+
+    standard_profile = json.loads(
+        (REGRESSION_ROOT / "verify" / "profiles" / "standard.json").read_text(
+            encoding="utf-8"
+        )
+    )
     master = pd.read_parquet(dataset)
     records = []
     for round_dir in sorted(Path(al_root).glob("round_[0-9][0-9]")):
@@ -235,8 +282,14 @@ def collect_standard_pass_candidates(
                 for key, value in candidate.items()
                 if key in KEYS and _finite(value)
             }
+            if set(params) != set(KEYS):
+                continue
+            standard_params = scheduler_client.effective_verification_params(
+                params, standard_profile
+            )
             authenticated = {
                 "params": params,
+                "standard_params": standard_params,
                 "candidate_digest": _candidate_digest(params),
             }
             validity = validate_record(
@@ -245,7 +298,9 @@ def collect_standard_pass_candidates(
                 expected_library_revision=expected_library_revision,
             )
             spec_reasons = physical_spec_reasons(result)
-            identity_reasons = candidate_identity_reasons(result, authenticated)
+            identity_reasons = candidate_identity_reasons(
+                result, authenticated, expected_params_key="standard_params"
+            )
             if not validity.full_valid or spec_reasons or identity_reasons:
                 continue
             try:
@@ -263,6 +318,7 @@ def collect_standard_pass_candidates(
                 "volume_L": volume,
                 "total_loss_W": float(candidate.get("total_loss_W", math.nan)),
                 "params": params,
+                "standard_params": standard_params,
                 "geometry_evidence": {
                     column: result.get(column)
                     for column in (*INSULATION_COLUMNS, *SIDE_INSULATION_COLUMNS, "N1_side")
@@ -302,6 +358,84 @@ def _atomic_text(text, path):
             os.remove(staged)
 
 
+def _model_quality_reasons(model_quality, solver_revision, library_revision):
+    reasons = []
+    if not isinstance(model_quality, dict) or not model_quality.get("passed"):
+        return ["model_quality_gate_not_passed"]
+    if int(model_quality.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS:
+        reasons.append("model_quality_below_3000_strict_rows")
+    if model_quality.get("solver_revision") != solver_revision:
+        reasons.append("model_quality_solver_revision_mismatch")
+    if model_quality.get("library_revision") != library_revision:
+        reasons.append("model_quality_library_revision_mismatch")
+    try:
+        if model_quality.get("quality_thresholds_sha256") != _sha256(
+                QUALITY_THRESHOLDS_PATH):
+            reasons.append("model_quality_thresholds_mismatch")
+    except Exception:
+        reasons.append("model_quality_thresholds_unavailable")
+    if set((model_quality.get("targets") or {}).keys()) != REQUIRED_OPTIMIZATION_MODELS:
+        reasons.append("model_quality_targets_incomplete")
+    for key in ("training_run_id", "dataset_sha256"):
+        value = str(model_quality.get(key) or "")
+        if not value or (key.endswith("sha256") and (
+                len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value.lower()))):
+            reasons.append(f"model_quality_{key}_missing")
+    return reasons
+
+
+def _final_candidate_provenance_reasons(
+        candidate, solver_revision, library_revision):
+    """Revalidate standard FEA and the complete optimization evidence chain."""
+    from verify import scheduler_client
+
+    reasons = []
+    if not isinstance(candidate, dict):
+        return ["candidate_record_missing"]
+    manifest_path_value = candidate.get("optimization_manifest_path")
+    try:
+        manifest_path = Path(manifest_path_value).resolve()
+        if _sha256(manifest_path) != candidate.get("optimization_manifest_sha256"):
+            reasons.append("candidate_optimization_manifest_hash_mismatch")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest != candidate.get("optimization_manifest"):
+            reasons.append("candidate_optimization_manifest_content_mismatch")
+        reasons.extend(_optimization_manifest_reasons(
+            manifest_path.parent, solver_revision, library_revision
+        ))
+    except Exception:
+        reasons.append("candidate_optimization_manifest_unavailable")
+
+    standard = candidate.get("standard_result")
+    standard_profile = json.loads(
+        (REGRESSION_ROOT / "verify" / "profiles" / "standard.json").read_text(
+            encoding="utf-8"
+        )
+    )["param_overrides"]
+    if not scheduler_client.is_valid_result(
+            standard,
+            expected_revision=solver_revision,
+            expected_library_revision=library_revision,
+            expected_profile=standard_profile):
+        reasons.append("strict_standard_contract_failed")
+    reasons.extend(physical_spec_reasons(standard or {}))
+    reasons.extend(candidate_identity_reasons(
+        standard or {}, candidate, expected_params_key="standard_params"
+    ))
+    try:
+        standard_volume = float(bounding_box_lit(standard)[0])
+        recorded_volume = float(candidate["volume_L"])
+        if (not _finite(standard_volume) or standard_volume <= 0
+                or not math.isclose(
+                    standard_volume, recorded_volume, rel_tol=1e-12, abs_tol=1e-9
+                )):
+            reasons.append("standard_volume_identity_mismatch")
+    except Exception:
+        reasons.append("standard_volume_unavailable")
+    return list(dict.fromkeys(reasons))
+
+
 def write_final_artifacts(
     output_root, selected, fine_results, model_quality, solver_revision,
     library_revision, prior_attempts=None,
@@ -314,10 +448,19 @@ def write_final_artifacts(
     ) as handle:
         fine_profile = json.load(handle)["param_overrides"]
     attempts = list(prior_attempts or [])
+    quality_reasons = _model_quality_reasons(
+        model_quality, solver_revision, library_revision
+    )
     passed = []
     for candidate, result in zip(selected, fine_results):
-        reasons = physical_spec_reasons(result)
-        reasons.extend(candidate_identity_reasons(result, candidate))
+        reasons = list(quality_reasons)
+        reasons.extend(_final_candidate_provenance_reasons(
+            candidate, solver_revision, library_revision
+        ))
+        reasons.extend(physical_spec_reasons(result))
+        reasons.extend(candidate_identity_reasons(
+            result, candidate, expected_params_key="fine_params"
+        ))
         if not scheduler_client.is_valid_result(
             result,
             expected_revision=solver_revision,
@@ -325,9 +468,17 @@ def write_final_artifacts(
             expected_profile=fine_profile,
         ):
             reasons.insert(0, "strict_fine_contract_failed")
+        try:
+            actual_volume = float(bounding_box_lit(result)[0])
+            if not _finite(actual_volume) or actual_volume <= 0:
+                raise ValueError("nonpositive fine volume")
+        except Exception:
+            actual_volume = None
+            reasons.append("fine_volume_unavailable")
+        reasons = list(dict.fromkeys(reasons))
         item = {
             "candidate_digest": candidate["candidate_digest"],
-            "volume_L": candidate["volume_L"],
+            "volume_L": actual_volume,
             "passed": not reasons,
             "reasons": reasons,
             "fine_result": result,
@@ -337,7 +488,10 @@ def write_final_artifacts(
         }
         attempts.append(item)
         if not reasons:
-            passed.append((candidate, result))
+            authoritative_candidate = dict(candidate)
+            authoritative_candidate["standard_volume_L"] = candidate.get("volume_L")
+            authoritative_candidate["volume_L"] = actual_volume
+            passed.append((authoritative_candidate, result))
     passed.sort(key=lambda pair: pair[0]["volume_L"])
     winner = passed[0] if passed else None
     compatibility_result = None

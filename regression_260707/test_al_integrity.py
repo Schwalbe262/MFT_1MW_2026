@@ -19,10 +19,38 @@ sys.path.insert(0, str(HERE / "verify"))
 import al_driver
 import scheduler_client
 import select_candidates
+from module.input_parameter_260706 import KEYS, create_input_parameter
 from training.checkpoint_train import filter_valid_training_rows
 
 TEST_REVISION = "a" * 40
 TEST_LIBRARY_REVISION = "b" * 40
+
+
+def complete_candidate_params(**updates):
+    safe = {
+        "cc_w2c_space_x": 40.0,
+        "cc_w2c_space_y": 40.0,
+        "w2c_w1c_space_x": 40.0,
+        "w2c_w1c_space_y": 40.0,
+        "w1c_w2s_space_x": 40.0,
+        "w2s_w1s_space_x": 40.0,
+        "w1s_w2s_space_y": 40.0,
+        "w1s_cs_space_x": 40.0,
+        "cs_w1s_space_y": 40.0,
+    }
+    safe.update(updates)
+    return create_input_parameter(safe).iloc[0].to_dict()
+
+
+def standard_submitted_params(**updates):
+    profile = json.loads(
+        (HERE / "verify" / "profiles" / "standard.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return scheduler_client.effective_verification_params(
+        complete_candidate_params(**updates), profile
+    )
 
 
 def valid_result(**updates):
@@ -673,7 +701,12 @@ class WaitStateIntegrityTests(unittest.TestCase):
     def _context(self, root):
         profile_path = root / "verify" / "profiles" / "standard.json"
         profile_path.parent.mkdir(parents=True, exist_ok=True)
-        profile_path.write_text('{"cpus": 4}', encoding="utf-8")
+        profile_path.write_text(
+            (HERE / "verify" / "profiles" / "standard.json").read_text(
+                encoding="utf-8"
+            ),
+            encoding="utf-8",
+        )
         return patch.multiple(
             al_driver,
             HERE=str(root),
@@ -688,7 +721,12 @@ class WaitStateIntegrityTests(unittest.TestCase):
             np.save(rdir / "selected_idx.npy", np.array([0]))
             profile = root / "verify" / "profiles" / "standard.json"
             profile.parent.mkdir(parents=True)
-            profile.write_text('{"cpus": 4}', encoding="utf-8")
+            profile.write_text(
+                (HERE / "verify" / "profiles" / "standard.json").read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
             state = {"round": 1, "stage": "SUBMIT"}
             with patch.object(al_driver, "HERE", str(root)), \
                     patch.object(al_driver, "_assert_training_invariants"), \
@@ -698,7 +736,7 @@ class WaitStateIntegrityTests(unittest.TestCase):
                         return_value=TEST_LIBRARY_REVISION), \
                     patch.object(
                         al_driver.pd, "read_csv",
-                        return_value=pd.DataFrame({"unused": [1]})), \
+                        return_value=pd.DataFrame([complete_candidate_params(l1=50.0)])), \
                     patch.object(al_driver, "save_state") as save, \
                     patch.object(al_driver.time, "sleep"), \
                     patch.object(al_driver, "EXECUTE_SUBMISSIONS", True), \
@@ -747,7 +785,9 @@ class WaitStateIntegrityTests(unittest.TestCase):
                 valid_result(result_valid_thermal=0),
             )
             with self._context(root), \
-                    patch.object(al_driver.pd, "read_csv", return_value=pd.DataFrame({"unused": [1]})), \
+                    patch.object(
+                        al_driver.pd, "read_csv",
+                        return_value=pd.DataFrame([complete_candidate_params(l1=50.0)])), \
                     patch.object(scheduler_client, "wait_all", return_value={17: "completed"}), \
                     patch.object(scheduler_client, "fetch_result", return_value=invalid), \
                     patch.object(scheduler_client, "submit_verification", return_value=18) as submit:
@@ -763,12 +803,15 @@ class WaitStateIntegrityTests(unittest.TestCase):
             self.assertEqual(submit.call_args.kwargs["mem_mb"], 65536)
 
             with self._context(root), \
-                    patch.object(al_driver.pd, "read_csv", return_value=pd.DataFrame({"l1": [50.0]})), \
+                    patch.object(
+                        al_driver.pd, "read_csv",
+                        return_value=pd.DataFrame([complete_candidate_params(l1=50.0)])), \
                     patch.object(scheduler_client, "wait_all", return_value={18: "completed"}), \
                     patch.object(
                         scheduler_client, "fetch_result",
                         return_value=scheduler_client.ResultFetch(
-                            scheduler_client.RESULT_VALID, valid_result())), \
+                            scheduler_client.RESULT_VALID,
+                            valid_result(**standard_submitted_params(l1=50.0)))), \
                     patch.object(scheduler_client, "submit_verification") as second_submit:
                 al_driver.stage_wait(state)
 
@@ -856,24 +899,30 @@ class WaitStateIntegrityTests(unittest.TestCase):
 
 class IngestIntegrityTests(unittest.TestCase):
     def _front(self):
-        return pd.DataFrame({
-            "l1": [50.0],
-            "pred_Llt_phys": [27.5],
-            "pred_Tprobe_Tx_leeward_max": [89.5],
-            "pred_Tprobe_Rx_main_leeward_max": [90.5],
-            "pred_Tprobe_Rx_side_leeward_max": [91.5],
-            "pred_Tprobe_core_center_max": [92.5],
-            "pred_P_winding_total": [4000.0],
-            "pred_P_core_total": [2000.0],
-            "pred_P_core_plate_total": [500.0],
-            "pred_P_wcp_total": [0.0],
+        row = complete_candidate_params(l1=50.0)
+        row.update({
+            "pred_Llt_phys": 27.5,
+            "pred_Tprobe_Tx_leeward_max": 89.5,
+            "pred_Tprobe_Rx_main_leeward_max": 90.5,
+            "pred_Tprobe_Rx_side_leeward_max": 91.5,
+            "pred_Tprobe_core_center_max": 92.5,
+            "pred_P_winding_total": 4000.0,
+            "pred_P_core_total": 2000.0,
+            "pred_P_core_plate_total": 500.0,
+            "pred_P_wcp_total": 0.0,
         })
+        return pd.DataFrame([row])
 
     def _state(self, result=None):
         record = al_driver._new_task_record(
             23, solver_revision=TEST_REVISION,
             library_revision=TEST_LIBRARY_REVISION)
-        record.update({"outcome": "valid", "result": result or valid_result()})
+        submitted = standard_submitted_params(l1=50.0)
+        record.update({
+            "outcome": "valid",
+            "result": result or valid_result(**submitted),
+            "submitted_params": submitted,
+        })
         return {
             "round": 1,
             "stage": "INGEST",

@@ -21,6 +21,7 @@ sys.path.insert(0, str(REGRESSION_ROOT / "verify"))
 sys.path.insert(0, str(REPO_ROOT))
 
 import al_driver
+import deployment_gate
 import scheduler_client
 from module.input_parameter_260706 import (
     KEYS,
@@ -490,7 +491,7 @@ def _atomic_manifest(payload, path):
 
 def submit_pilot_stage(
         solver_revision, library_revision, stage, seed=260710,
-        execute=False, offset=None, manifest_dir=None):
+        execute=False, offset=None, manifest_dir=None, library_root=None):
     """Plan or submit one contract-defined pilot stage.
 
     All mutation remains behind ``execute=True``.  The function is intentionally
@@ -508,6 +509,14 @@ def submit_pilot_stage(
         raise RuntimeError("solver revision is not the current vetted local solver")
     if library_revision != al_driver._current_library_revision():
         raise RuntimeError("library revision is not the current clean local library")
+    if execute:
+        if not library_root:
+            raise RuntimeError(
+                "pilot execution requires a library root for deployment validation"
+            )
+        deployment_gate.validate_deployment(
+            REPO_ROOT, solver_revision, library_root, library_revision
+        )
 
     predecessor = None
     if execute and stage == "p02":
@@ -594,6 +603,7 @@ def main():
     parser.add_argument("--seed", type=int, default=260710)
     parser.add_argument("--solver-revision", required=True)
     parser.add_argument("--library-revision", required=True)
+    parser.add_argument("--library-root")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
 
@@ -608,6 +618,7 @@ def main():
         seed=args.seed,
         execute=args.execute,
         offset=offset,
+        library_root=args.library_root,
     )
     manifest = result["manifest"]
     snapshot = result["capacity"]

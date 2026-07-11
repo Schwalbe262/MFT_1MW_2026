@@ -257,6 +257,7 @@ class PilotMainTests(unittest.TestCase):
             "--seed", str(seed),
             "--solver-revision", SOLVER_REVISION,
             "--library-revision", LIBRARY_REVISION,
+            "--library-root", str(CAMPAIGN_DIR),
         ]
         if execute:
             argv.append("--execute")
@@ -273,9 +274,10 @@ class PilotMainTests(unittest.TestCase):
                     return_value=candidates) as select, mock.patch.object(
                     pinned_pilot, "capacity_snapshot",
                     return_value={"headroom": tasks}), mock.patch.object(
-                    pinned_pilot, "validate_p02_predecessor",
-                    return_value=predecessor) as validate, mock.patch.object(
-                    pinned_pilot.scheduler_client, "submit_verification",
+                     pinned_pilot, "validate_p02_predecessor",
+                     return_value=predecessor) as validate, mock.patch.object(
+                    pinned_pilot.deployment_gate, "validate_deployment"), mock.patch.object(
+                     pinned_pilot.scheduler_client, "submit_verification",
                     side_effect=submit_ids) as submit, mock.patch.object(
                     pinned_pilot, "_atomic_manifest") as install, mock.patch(
                     "builtins.print"):

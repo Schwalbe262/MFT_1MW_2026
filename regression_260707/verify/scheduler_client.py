@@ -101,6 +101,20 @@ def reconcile_task_id(name, dedupe_key, attempts=3, retry_delay=1):
     ) from last_error
 
 
+def effective_verification_params(params, profile):
+    """Return the exact parameter payload written for a verification task."""
+    if not isinstance(params, dict):
+        raise TypeError("verification params must be a dict")
+    if not isinstance(profile, dict):
+        raise TypeError("verification profile must be a dict")
+    overrides = profile.get("param_overrides", {})
+    if not isinstance(overrides, dict):
+        raise TypeError("verification profile param_overrides must be a dict")
+    merged = dict(params)
+    merged.update(overrides)
+    return merged
+
+
 def submit_verification(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None):
@@ -111,8 +125,7 @@ def submit_verification(
     if not isinstance(library_revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", library_revision):
         raise ValueError("library_revision must be a full 40-character git SHA")
     library_revision = library_revision.lower()
-    merged = dict(params)
-    merged.update(profile.get("param_overrides", {}))
+    merged = effective_verification_params(params, profile)
     timeout_seconds = int(profile.get(
         "timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS))
     if timeout_seconds <= 0:
@@ -282,9 +295,11 @@ def required_temperature_columns(result):
     return tuple(columns)
 
 
-def result_matches_params(result, params):
+def result_matches_params(result, params, required_keys=None):
     """Require every submitted candidate input to be echoed by the result."""
     if not isinstance(result, dict) or not isinstance(params, dict) or not params:
+        return False
+    if required_keys is not None and set(params) != set(required_keys):
         return False
     for key, expected in params.items():
         if key not in result:

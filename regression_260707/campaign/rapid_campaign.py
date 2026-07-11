@@ -586,6 +586,14 @@ def run_once(
     now = now or _now()
     solver_revision, library_revision = _validate_pinned_local_revisions(
         solver_revision, library_revision, library_root=library_root)
+    if execute:
+        if not library_root:
+            raise RuntimeError("execute requires a library root for deployment validation")
+        # Recheck on every controller cycle. A long-running loop must stop
+        # before mutation if either pinned commit ceases to be advertised.
+        deployment_gate.validate_deployment(
+            REPO_ROOT, solver_revision, library_root, library_revision
+        )
     path = Path(state_path) if state_path else default_state_path(
         solver_revision, library_revision, seed)
     if execute:
@@ -634,7 +642,8 @@ def run_once(
             if decision["action"] == "submit_p02":
                 result = pinned_pilot.submit_pilot_stage(
                     solver_revision, library_revision, "p02", seed=seed,
-                    execute=True, manifest_dir=manifest_dir)
+                    execute=True, manifest_dir=manifest_dir,
+                    library_root=library_root)
                 mutation = {
                     "submitted": "p02",
                     "task_ids": [
@@ -643,7 +652,8 @@ def run_once(
             elif decision["action"] == "submit_p08":
                 result = pinned_pilot.submit_pilot_stage(
                     solver_revision, library_revision, "p08", seed=seed,
-                    execute=True, manifest_dir=manifest_dir)
+                    execute=True, manifest_dir=manifest_dir,
+                    library_root=library_root)
                 mutation = {
                     "submitted": "p08",
                     "task_ids": [
@@ -708,10 +718,6 @@ def main(argv=None):
     if args.execute:
         if not args.library_root:
             parser.error("--execute requires --library-root for remote deployment validation")
-        deployment_gate.validate_deployment(
-            REPO_ROOT, args.solver_revision,
-            args.library_root, args.library_revision,
-        )
 
     while True:
         try:
