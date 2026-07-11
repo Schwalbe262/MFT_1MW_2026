@@ -5,6 +5,12 @@ import numpy as np
 import pandas as pd
 
 
+N1_MIN_TURNS = 5
+N1_MAX_TURNS = 8
+COLD_PLATE_MIN_T_MM = 10.0
+COLD_PLATE_MAX_T_MM = 30.0
+
+
 # 설계도면260706.pdf 기반 파라미터 스키마.
 # 기존 input_parameter.py의 ratio 방식(wff/window_ratio) 대신
 # 물리 치수(도체 두께/간격/각종 space)를 직접 입력한다.
@@ -43,7 +49,8 @@ def get_drawing_default_params():
     return {
         # 턴수 (1차 6턴 전부 중심, 2차 60턴 = 중심 18 + 측면 42)
         "N1_main": 6, "N1_side": 0, "N2_main": 18, "N2_side": 42,
-        # 코어: 829 x 525 (x,z), 깊이 530 (코어 150x3 + 콜드플레이트 20x4)
+        # 코어: 829 x 525 (x,z), 전체 깊이 530. 알루미늄 plate와
+        # 양면 2T thermal pad는 별도 두께로 깊이 예산에 반영한다.
         "l1": 89.0, "l2": 236.5, "h1": 347.0, "w1": 530.0,
         "n_core_group": 3, "core_plate_t": 20.0, "core_plate_on": 1,
         # 도체: 1차 5mm/1.6mm, 2차 0.665mm/0.339mm
@@ -59,10 +66,10 @@ def get_drawing_default_params():
         "w2s_w1s_space_x": 0.0, "w1s_w2s_space_y": 0.0,
         # 측면 레그 - 2차 측면 권선 간격
         "w1s_cs_space_x": 30.1, "cs_w1s_space_y": 75.6,
-        # 권선 냉각 플레이트: 슬롯 20T = 서멀패드 2T + 알루미늄 16T + 서멀패드 2T (도체에 밀착)
+        # 권선 냉각 플레이트: 알루미늄 20T + 양면 서멀패드 각 2T.
         # x방향 폭은 도면 미기재로 파라미터화 (기본 2*l1)
         "wcp_t": 20.0, "wcp_pad_t": 2.0, "wcp_len_x": 178.0, "wcp_on": 1,
-        # 코어 콜드플레이트도 동일 구조: 20T = 2T 패드 + 16T 알루미늄 + 2T 패드
+        # 코어 콜드플레이트: 알루미늄 20T + 양면 서멀패드 각 2T.
         "core_plate_pad_t": 2.0,
         # 코어 1조 깊이 허용 범위 [mm] (랜덤 모드에서 n_core_group 샘플링 제약.
         # 도면 설계(150mm/조)는 범위 밖이지만 fixed 모드에서는 경고만 하고 통과)
@@ -195,6 +202,9 @@ _SOBOL_DIMS = [
     ("u_N1", 0, 1), ("u_N1_side", 0, 1), ("u_N2_side", 0, 1),
     ("l1", 40, 100), ("total_length", 500, 1200), ("total_height", 500, 1000),
     ("w1", 200, 800), ("u_ngroup", 0, 1),
+    # Independent winding/core cold-plate thickness design variables.
+    ("wcp_t", COLD_PLATE_MIN_T_MM, COLD_PLATE_MAX_T_MM),
+    ("core_plate_t", COLD_PLATE_MIN_T_MM, COLD_PLATE_MAX_T_MM),
     # HV 절연 간격 4쌍: 설계 타겟 40mm 주변 커버리지 (25~70) - 16mm급 극소 간격은
     # 실현 불가 영역이라 데이터 예산 낭비 (사용자 확인 2026-07-07)
     ("cc_w2c_space_x", 25, 70), ("cc_w2c_space_y", 25, 70),
@@ -253,7 +263,9 @@ def decode_unit_sample(s, allow_space_shrink=True, space_min=None):
             if k in s:
                 s[k] = max(float(s[k]), space_min)
 
-    N1 = 5 + int(s["u_N1"] * 5.9999)                     # 5..10
+    N1 = N1_MIN_TURNS + int(
+        s["u_N1"] * (N1_MAX_TURNS - N1_MIN_TURNS + 0.9999)
+    )                                                       # 5..8
     # N1_side(1차 측면 권선)는 캠페인 설계공간에서 제외:
     # 실제 절연 간격(w2s_w1s 등)을 반영하면 Tx-Rx_side x 간격 예산이 거의 성립하지 않고
     # (파일럿 84% 대량 실패의 원인), 도면 계열도 N1_side=0. u_N1_side 차원은 호환용으로 유지.
@@ -269,10 +281,12 @@ def decode_unit_sample(s, allow_space_shrink=True, space_min=None):
     w1 = round(s["w1"])
 
     # 코어 분할 수: 1조 깊이 [core_depth_min, core_depth_max] 제약을 역산해 유효 범위에서 선택
-    plate_t = defaults["core_plate_t"]
+    plate_t = round(float(s["core_plate_t"]), 1)
+    wcp_t = round(float(s["wcp_t"]), 1)
+    core_stack_t = plate_t + 2.0 * float(defaults["core_plate_pad_t"])
     d_min, d_max = defaults["core_depth_min"], defaults["core_depth_max"]
-    n_min = max(1, math.ceil((w1 - plate_t) / (d_max + plate_t)))
-    n_max = max(n_min, math.floor((w1 - plate_t) / (d_min + plate_t)))
+    n_min = max(1, math.ceil((w1 - core_stack_t) / (d_max + core_stack_t)))
+    n_max = max(n_min, math.floor((w1 - core_stack_t) / (d_min + core_stack_t)))
     n_core_group = n_min + int(s["u_ngroup"] * (n_max - n_min + 0.9999))
 
     # ---- 창 x방향 예산 분배 (제약 내장) ----
@@ -315,6 +329,8 @@ def decode_unit_sample(s, allow_space_shrink=True, space_min=None):
         "N1_main": N1_main, "N1_side": N1_side, "N2_main": N2_main, "N2_side": N2_side,
         "l1": l1, "l2": l2, "h1": h1, "w1": w1,
         "n_core_group": n_core_group,
+        "core_plate_t": plate_t,
+        "wcp_t": wcp_t,
         "cw1": round(cw1, 2), "gap1": gap1, "cw2": round(cw2, 3), "gap2": gap2,
         "nwh1": nwh1, "nwh2": nwh2,
         "cc_w2c_space_x": round(cc_x, 1),
@@ -352,21 +368,26 @@ def sym_cut_count(obj_name, df):
     w1 = float(df["w1"].iloc[0])
     n = int(df["n_core_group"].iloc[0])
     t = float(df["core_plate_t"].iloc[0])
-    d = (w1 - (n + 1) * t) / n
+    pad = float(df["core_plate_pad_t"].iloc[0])
+    stack_t = t + 2.0 * pad
+    d = (w1 - (n + 1) * stack_t) / n
 
     if name.startswith("core_plate"):
         try:
             i = int(name.split("_")[2])  # core_plate_<i> (1-based)
         except (IndexError, ValueError):
             return 2
-        y0 = -w1 / 2 + (i - 1) * (t + d)
+        y0 = -w1 / 2 + (i - 1) * (stack_t + d) + pad
+        # Each I plate is wholly on one x side, always spans z, and may span y.
+        if name.endswith(("_left", "_right")):
+            return 2 if (y0 < 0 < y0 + t) else 1
         return 3 if (y0 < 0 < y0 + t) else 2
     if name.startswith("core_"):
         try:
             i = int(name.split("_")[1])  # core_<i> (1-based)
         except (IndexError, ValueError):
             return 2
-        y0 = -w1 / 2 + i * t + (i - 1) * d
+        y0 = -w1 / 2 + i * stack_t + (i - 1) * d
         return 3 if (y0 < 0 < y0 + d) else 2
     return 3
 
@@ -376,7 +397,7 @@ def get_tx_y_gaps(df):
     1차(Tx) 중심 권선의 y방향 인접 턴 간격 리스트와 냉각판 슬롯 인덱스 계산.
 
     도면/사용자 확인: 냉각 플레이트는 턴1-턴2 사이와 턴(N-1)-턴N 사이에만 삽입.
-    슬롯 폭 = wcp_t (조립체가 슬롯을 꽉 채우고 서멀패드가 도체에 밀착).
+    슬롯 폭 = wcp_t + 2*wcp_pad_t (알루미늄과 양면 패드는 별도 두께).
 
     Returns:
         (y_gaps, slot_indices) - y_gaps 길이는 N1_main-1
@@ -384,7 +405,10 @@ def get_tx_y_gaps(df):
     N = int(df["N1_main"].iloc[0])
     gap1 = float(df["gap1"].iloc[0])
     wcp_on = int(df["wcp_on"].iloc[0]) != 0
-    slot = float(df["wcp_t"].iloc[0])
+    slot = (
+        float(df["wcp_t"].iloc[0])
+        + 2.0 * float(df["wcp_pad_t"].iloc[0])
+    )
 
     y_gaps = [gap1] * max(N - 1, 0)
     slot_indices = []
@@ -493,12 +517,18 @@ def validation_check(input_df, strict=False, return_errors=False):
 
     n_core_group = int(inp["n_core_group"].iloc[0])
     core_plate_t = float(inp["core_plate_t"].iloc[0])
+    core_plate_pad_t = float(inp["core_plate_pad_t"].iloc[0])
+    core_plate_stack_t = core_plate_t + 2.0 * core_plate_pad_t
 
     # 코어 1조 깊이
-    core_depth_each = (w1 - (n_core_group + 1) * core_plate_t) / n_core_group
+    core_depth_each = (
+        w1 - (n_core_group + 1) * core_plate_stack_t
+    ) / n_core_group
     inp["core_depth_each"] = [core_depth_each]
     if core_depth_each <= 0:
-        errors.append(f"core depth per group <= 0 (w1={w1}, plate_t={core_plate_t})")
+        errors.append(
+            f"core depth per group <= 0 (w1={w1}, "
+            f"plate_t={core_plate_t}, pad_t={core_plate_pad_t})")
     else:
         # 코어 1조 깊이 범위: 랜덤 모드에서는 재추첨 사유, fixed 모드에서는 경고만
         # (도면 설계 150mm/조가 기본 범위(60~120) 밖이므로 fixed는 막지 않는다)
@@ -641,10 +671,6 @@ def validation_check(input_df, strict=False, return_errors=False):
     core_plate_pad_t = float(inp["core_plate_pad_t"].iloc[0])
     if wcp_pad_t < 0 or core_plate_pad_t < 0:
         errors.append(f"pad thickness < 0 (wcp_pad_t={wcp_pad_t}, core_plate_pad_t={core_plate_pad_t})")
-    if wcp_on and float(inp["wcp_t"].iloc[0]) <= 2 * wcp_pad_t:
-        errors.append(f"wcp_t ({inp['wcp_t'].iloc[0]}) <= 2*wcp_pad_t ({2 * wcp_pad_t}) - no aluminum left")
-    if int(inp["core_plate_on"].iloc[0]) != 0 and core_plate_t <= 2 * core_plate_pad_t:
-        errors.append(f"core_plate_t ({core_plate_t}) <= 2*core_plate_pad_t ({2 * core_plate_pad_t}) - no aluminum left")
 
     # ---- 해석/열 파라미터 검증 ----
     if float(inp["freq"].iloc[0]) <= 0:
@@ -665,9 +691,18 @@ def validation_check(input_df, strict=False, return_errors=False):
         if float(inp["w1s_w2s_space_y"].iloc[0]) < 1.0:
             errors.append(f"w1s_w2s_space_y too small for N1_side>0 ({inp['w1s_w2s_space_y'].iloc[0]})")
 
-    # 1차 턴수 상한 (사용자 지시 2026-07-07: N1 <= 10, 구형 N1_side 샘플에서 13T 관측)
-    if not strict and int(inp["N1"].iloc[0]) > 10:
-        errors.append(f"N1 {int(inp['N1'].iloc[0])} > 10 (cap)")
+    # Active campaign design-domain contract: total primary turns are capped
+    # globally, including fixed/strict inputs and any legacy N1_side geometry.
+    n1_total = int(inp["N1"].iloc[0])
+    if n1_total > N1_MAX_TURNS:
+        errors.append(f"N1 {n1_total} > {N1_MAX_TURNS} (cap)")
+
+    for plate_key in ("wcp_t", "core_plate_t"):
+        plate_value = float(inp[plate_key].iloc[0])
+        if not COLD_PLATE_MIN_T_MM <= plate_value <= COLD_PLATE_MAX_T_MM:
+            errors.append(
+                f"{plate_key} {plate_value} outside "
+                f"[{COLD_PLATE_MIN_T_MM}, {COLD_PLATE_MAX_T_MM}] mm")
 
     # 랜덤 모드 커버리지 하한: HV 절연쌍 실간격 최소 20mm (설계 타겟 40mm 주변 데이터 확보,
     # 비례축소 후 극소 간격 샘플로 예산 낭비 방지). fixed 모드는 사용자 판단 존중.

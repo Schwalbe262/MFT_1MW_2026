@@ -26,7 +26,22 @@ from run_simulation_260706 import (
     _wait_for_ready_copied_loss_design,
     log_failed_sample,
 )
-from module.input_parameter_260706 import get_drawing_default_params
+from module.input_parameter_260706 import (
+    COLD_PLATE_MAX_T_MM,
+    COLD_PLATE_MIN_T_MM,
+    N1_MAX_TURNS,
+    _SOBOL_DIMS,
+    create_input_parameter,
+    decode_unit_sample,
+    get_drawing_default_params,
+    get_tx_y_gaps,
+    unit_to_dims,
+    validation_check,
+)
+from module.modeling_260706 import (
+    create_core as create_core_geometry,
+    create_winding_cooling_plates,
+)
 from module.thermal_260706 import (
     _assign_thermal_mesh,
     _build_homog_blocks,
@@ -76,6 +91,137 @@ def _simulation_with_post(post):
     simulation.extraction_attempts = {}
     simulation.extraction_backends = {}
     return simulation
+
+
+class PrimaryTurnDomainTests(unittest.TestCase):
+    def test_sobol_domain_caps_total_primary_turns_at_eight(self):
+        for u_n1 in (0.0, 0.2, 0.5, 0.8, 1.0):
+            unit = [0.5] * len(_SOBOL_DIMS)
+            unit[0] = u_n1
+            decoded = decode_unit_sample(unit_to_dims(unit))
+            self.assertLessEqual(
+                int(decoded["N1_main"]) + int(decoded["N1_side"]),
+                N1_MAX_TURNS,
+            )
+        self.assertEqual(
+            int(decode_unit_sample(unit_to_dims([1.0] + [0.5] * (
+                len(_SOBOL_DIMS) - 1)))["N1_main"]),
+            N1_MAX_TURNS,
+        )
+
+    def test_fixed_input_above_eight_turns_is_rejected(self):
+        params = get_drawing_default_params()
+        params["N1_main"] = N1_MAX_TURNS + 1
+        with self.assertRaisesRegex(
+                ValueError, f"N1 {N1_MAX_TURNS + 1} > {N1_MAX_TURNS}"):
+            validation_check(create_input_parameter(params), strict=True)
+
+    def test_winding_and_core_plate_thicknesses_vary_independently(self):
+        low = {key: 0.5 for key, _lo, _hi in _SOBOL_DIMS}
+        high = dict(low)
+        low.update({"wcp_t": COLD_PLATE_MIN_T_MM,
+                    "core_plate_t": COLD_PLATE_MAX_T_MM})
+        high.update({"wcp_t": COLD_PLATE_MAX_T_MM,
+                     "core_plate_t": COLD_PLATE_MIN_T_MM})
+        decoded_low = decode_unit_sample(low)
+        decoded_high = decode_unit_sample(high)
+        self.assertEqual(decoded_low["wcp_t"], COLD_PLATE_MIN_T_MM)
+        self.assertEqual(decoded_low["core_plate_t"], COLD_PLATE_MAX_T_MM)
+        self.assertEqual(decoded_high["wcp_t"], COLD_PLATE_MAX_T_MM)
+        self.assertEqual(decoded_high["core_plate_t"], COLD_PLATE_MIN_T_MM)
+
+    def test_winding_plate_slot_adds_two_independent_pad_layers(self):
+        params = get_drawing_default_params()
+        params.update({"N1_main": 6, "N1_side": 0,
+                       "wcp_t": 20.0, "wcp_pad_t": 2.0})
+        gaps, slots = get_tx_y_gaps(create_input_parameter(params))
+        self.assertEqual(gaps[0], 24.0)
+        self.assertEqual(gaps[-1], 24.0)
+        self.assertEqual(slots, [0, 4])
+
+
+class _GeometryObject:
+    def __init__(self, name):
+        self.name = name
+        self.color = None
+
+
+class _GeometryModeler:
+    def __init__(self):
+        self.boxes = []
+        self.subtract_calls = []
+
+    def create_box(self, origin, sizes, name, material):
+        obj = _GeometryObject(name)
+        self.boxes.append({"origin": origin, "sizes": sizes, "name": name,
+                           "material": material, "object": obj})
+        return obj
+
+    def subtract(self, assignments, tools, keep_originals=False):
+        self.subtract_calls.append((list(assignments), list(tools), keep_originals))
+
+
+class ColdPlateGeometryTests(unittest.TestCase):
+    def test_core_cooling_uses_two_i_plates_not_window_subtracted_u_frame(self):
+        design = SimpleNamespace(modeler=_GeometryModeler())
+        cores, plates, pads = create_core_geometry(
+            design, n_group=1, plate_on=True, pad_on=True)
+        self.assertEqual(len(cores), 1)
+        self.assertEqual(len(plates), 4)  # two y stacks x left/right I plates
+        self.assertEqual(len(pads), 8)    # two 2T pads per aluminum I plate
+        self.assertTrue(all(
+            plate.name.endswith(("_left", "_right")) for plate in plates))
+        plate_boxes = [box for box in design.modeler.boxes
+                       if box["object"] in plates]
+        pad_boxes = [box for box in design.modeler.boxes
+                     if box["object"] in pads]
+        self.assertTrue(all(box["sizes"][0] == "l1" for box in plate_boxes))
+        self.assertTrue(all(box["sizes"][1] == "core_plate_t"
+                            for box in plate_boxes))
+        self.assertTrue(all(box["sizes"][1] == "core_plate_pad_t"
+                            for box in pad_boxes))
+        assignments, _tools, keep = design.modeler.subtract_calls[-1]
+        self.assertEqual(assignments, cores)
+        self.assertFalse(keep)
+
+    def test_i_plate_symmetry_reconstructs_left_right_and_y_twins(self):
+        simulation = Simulation.__new__(Simulation)
+        simulation.loss_is_sym = True
+        simulation.df_plus = pd.DataFrame([{
+            "w1": 232.0,
+            "n_core_group": 2,
+            "core_plate_t": 20.0,
+            "core_plate_pad_t": 2.0,
+        }])
+        self.assertEqual(simulation._sym_cut_count("core_plate_2_left"), 2)
+        self.assertEqual(simulation._mirror_mult("core_plate_2_left"), 2.0)
+        self.assertEqual(simulation._sym_cut_count("core_plate_1_left"), 1)
+        self.assertEqual(simulation._mirror_mult("core_plate_1_left"), 4.0)
+        self.assertEqual(
+            simulation._phys_factor("P_core_plate_2_left", False)
+            * simulation._mirror_mult("core_plate_2_left"),
+            2.0,
+        )
+        self.assertEqual(
+            simulation._phys_factor("P_core_plate_1_left", False)
+            * simulation._mirror_mult("core_plate_1_left"),
+            2.0,
+        )
+
+    def test_winding_plate_aluminum_and_pads_keep_separate_thicknesses(self):
+        design = SimpleNamespace(modeler=_GeometryModeler())
+        plates, pads = create_winding_cooling_plates(
+            design, "Tx_main_wcp", space_width=100, coil_width=10,
+            y_gaps=[24], slot_indices=[0], wcp_len_x=50,
+            wcp_t=20, pad_t=2, height=40)
+        self.assertEqual(len(plates), 2)
+        self.assertEqual(len(pads), 4)
+        plate_boxes = [box for box in design.modeler.boxes
+                       if box["object"] in plates]
+        pad_boxes = [box for box in design.modeler.boxes
+                     if box["object"] in pads]
+        self.assertTrue(all(box["sizes"][1] == "20mm" for box in plate_boxes))
+        self.assertTrue(all(box["sizes"][1] == "2mm" for box in pad_boxes))
 
 
 class SolutionDataTests(unittest.TestCase):

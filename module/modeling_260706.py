@@ -12,29 +12,32 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
     설계도면260706 반영 코어 생성.
 
     코어를 y방향(깊이)으로 n_group개 조로 분할하고, 각 조 사이/바깥에
-    콜드플레이트 조립체 (n_group+1)개를 삽입한다.
-        w1 = n_group * d + (n_group+1) * core_plate_t   (d: 코어 1조 깊이)
+    좌우 외측 레그용 I자 콜드플레이트 조립체 두 개씩을 삽입한다.
+        w1 = n_group*d + (n_group+1)*(core_plate_t + 2*core_plate_pad_t)
     즉 디자인 변수 w1은 "코어 + 콜드플레이트 전체 깊이"를 의미한다.
 
-    콜드플레이트 조립체(총 core_plate_t)는 실제 구조대로
-    서멀패드(core_plate_pad_t) | 알루미늄(core_plate_t - 2*pad) | 서멀패드(pad)
+    core_plate_t는 알루미늄 자체 두께이며, 조립체는 실제 구조대로
+    서멀패드(core_plate_pad_t) | 알루미늄(core_plate_t) | 서멀패드(pad)
     3층으로 만들어 코어 면에 밀착시킨다. core_plate_pad_t = 0 이면 단일 판.
 
-    코어 조와 플레이트/패드 모두 동일한 E자 실루엣(창 2개 subtract)으로 만든다.
-    (권선이 창을 통과하므로 통짜 판이면 권선과 간섭)
+    코어 조만 창 2개를 subtract해 기존 자로를 유지한다. 플레이트/패드는
+    창 외측의 두 직선형 I자로 만들어 상·하부 yoke를 감싸지 않는다.
 
     Returns:
         (core_objs, plate_objs, pad_objs)  - plate_objs는 알루미늄 판만
     """
-    d_expr = f"((w1 - {n_group + 1}*core_plate_t)/{n_group})"
+    stack_expr = (
+        "(core_plate_t + 2*core_plate_pad_t)" if pad_on
+        else "core_plate_t"
+    )
+    d_expr = f"((w1 - {n_group + 1}*{stack_expr})/{n_group})"
 
     core_objs = []
     plate_objs = []
     pad_objs = []
-    bodies = []
 
     for i in range(n_group):
-        y0 = f"(-w1/2 + {i + 1}*core_plate_t + {i}*{d_expr})"
+        y0 = f"(-w1/2 + {i + 1}*{stack_expr} + {i}*{d_expr})"
         core = design.modeler.create_box(
             origin=["-(4*l1+2*l2)/2", y0, "-(h1+2*l1)/2"],
             sizes=["4*l1+2*l2", d_expr, "h1+2*l1"],
@@ -42,41 +45,47 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
             material=core_material
         )
         core_objs.append(core)
-        bodies.append(core)
 
     if plate_on:
+        # Core-side cooling is a pair of straight I plates on the two outer
+        # legs. Unlike the core body, these plates are never window-subtracted
+        # into the former U-frame shape.
+        i_plate_x = (
+            ("left", "-(2*l1+l2)"),
+            ("right", "(l1+l2)"),
+        )
         for i in range(n_group + 1):
-            y0 = f"(-w1/2 + {i}*(core_plate_t + {d_expr}))"
+            y0 = f"(-w1/2 + {i}*({stack_expr} + {d_expr}))"
 
-            # 서멀패드 | 알루미늄 | 서멀패드 (조립체 전체 두께 = core_plate_t)
+            # 서멀패드 | 알루미늄 | 서멀패드. 패드는 plate 두께와 별도이다.
             if pad_on:
                 layers = [
                     (f"({y0})", "core_plate_pad_t", pad_material, f"{name}_plate_pad_{i + 1}_a"),
-                    (f"({y0} + core_plate_pad_t)", "(core_plate_t - 2*core_plate_pad_t)", plate_material, f"{name}_plate_{i + 1}"),
-                    (f"({y0} + core_plate_t - core_plate_pad_t)", "core_plate_pad_t", pad_material, f"{name}_plate_pad_{i + 1}_b"),
+                    (f"({y0} + core_plate_pad_t)", "core_plate_t", plate_material, f"{name}_plate_{i + 1}"),
+                    (f"({y0} + core_plate_pad_t + core_plate_t)", "core_plate_pad_t", pad_material, f"{name}_plate_pad_{i + 1}_b"),
                 ]
             else:
                 layers = [
                     (f"({y0})", "core_plate_t", plate_material, f"{name}_plate_{i + 1}"),
                 ]
             for y_start, t_expr, mat, obj_name in layers:
-                obj = design.modeler.create_box(
-                    origin=["-(4*l1+2*l2)/2", y_start, "-(h1+2*l1)/2"],
-                    sizes=["4*l1+2*l2", t_expr, "h1+2*l1"],
-                    name=obj_name,
-                    material=mat
-                )
-                if mat == plate_material:
-                    if plate_color is not None:
-                        obj.color = plate_color
-                    plate_objs.append(obj)
-                else:
-                    if pad_color is not None:
-                        obj.color = pad_color
-                    pad_objs.append(obj)
-                bodies.append(obj)
+                for side, x0 in i_plate_x:
+                    obj = design.modeler.create_box(
+                        origin=[x0, y_start, "-(h1+2*l1)/2"],
+                        sizes=["l1", t_expr, "h1+2*l1"],
+                        name=f"{obj_name}_{side}",
+                        material=mat
+                    )
+                    if mat == plate_material:
+                        if plate_color is not None:
+                            obj.color = plate_color
+                        plate_objs.append(obj)
+                    else:
+                        if pad_color is not None:
+                            obj.color = pad_color
+                        pad_objs.append(obj)
 
-    # 창 2개를 코어 조 + 플레이트 전체에서 한 번에 subtract
+    # 창 2개는 코어 조에만 subtract한다. I plate는 그대로 유지한다.
     sub1 = design.modeler.create_box(
         origin=["-l1", "-w1/2", "-h1/2"],
         sizes=["-l2", "w1", "h1"],
@@ -89,7 +98,7 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
         name=f"{name}_sub2",
         material=core_material
     )
-    design.modeler.subtract(bodies, [sub1, sub2], keep_originals=False)
+    design.modeler.subtract(core_objs, [sub1, sub2], keep_originals=False)
 
     return core_objs, plate_objs, pad_objs
 
@@ -304,8 +313,8 @@ def create_winding_cooling_plates(design, name, space_width, coil_width, y_gaps,
     1차 권선 y방향 측면 슬롯에 들어가는 권선 냉각 플레이트 조립체 생성.
     슬롯은 y+ / y- 양측 대칭이므로 슬롯당 1조, 총 len(slot_indices)*2 조.
 
-    실제 구조 반영: 슬롯(y방향 간격 = wcp_t)을
-        서멀패드(pad_t) | 알루미늄(wcp_t - 2*pad_t) | 서멀패드(pad_t)
+    실제 구조 반영: 슬롯(y방향 간격 = wcp_t + 2*pad_t)을
+        서멀패드(pad_t) | 알루미늄(wcp_t) | 서멀패드(pad_t)
     로 꽉 채워 양쪽 도체 면에 밀착시킨다. pad_t = 0 이면 알루미늄 단일 판.
 
     Parameters:
@@ -314,7 +323,7 @@ def create_winding_cooling_plates(design, name, space_width, coil_width, y_gaps,
         y_gaps       : y방향 인접 턴 간격 리스트 (create_coil에 넘긴 것과 동일)
         slot_indices : 냉각판이 들어가는 gap 인덱스 리스트 (예: [0, N-2])
         wcp_len_x    : 플레이트 x방향 폭
-        wcp_t        : 조립체 전체 두께 (y방향, 슬롯 간격과 동일)
+        wcp_t        : 알루미늄 콜드플레이트 자체 두께
         pad_t        : 서멀패드 두께 (편측)
         height       : 플레이트 z방향 높이 (권선 높이와 동일, 중심 대칭)
 
@@ -332,8 +341,8 @@ def create_winding_cooling_plates(design, name, space_width, coil_width, y_gaps,
         if pad_t > 0:
             layers = [
                 (y_in, pad_t, pad_material, f"{name}_pad_{k + 1}_in"),
-                (y_in + pad_t, wcp_t - 2 * pad_t, plate_material, f"{name}_{k + 1}"),
-                (y_in + wcp_t - pad_t, pad_t, pad_material, f"{name}_pad_{k + 1}_out"),
+                (y_in + pad_t, wcp_t, plate_material, f"{name}_{k + 1}"),
+                (y_in + pad_t + wcp_t, pad_t, pad_material, f"{name}_pad_{k + 1}_out"),
             ]
         else:
             layers = [

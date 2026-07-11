@@ -2372,6 +2372,11 @@ class Simulation():
         name = obj_name
         if name.startswith("Tx_main_wcp"):
             return 2.0  # _p만 잔존 (_n 미러 삭제)
+        if (name.startswith("core_plate")
+                and name.endswith(("_left", "_right"))):
+            # The retained I plate has a discrete x-side twin. A plate stack
+            # that does not cross y=0 also has a discrete y-side twin.
+            return 2.0 if self._sym_cut_count(name) == 2 else 4.0
         if name.startswith("core_plate") or (name.startswith("core_") and not name.startswith("core_plate")):
             return 1.0 if self._sym_cut_count(name) == 3 else 2.0  # y=0 스팬이면 미러 없음
         return 1.0
