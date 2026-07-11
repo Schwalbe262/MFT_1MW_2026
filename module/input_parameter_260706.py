@@ -7,6 +7,7 @@ import pandas as pd
 
 N1_MIN_TURNS = 5
 N1_MAX_TURNS = 8
+PRIMARY_CONDUCTOR_MAX_THICKNESS_MM = 10.0
 COLD_PLATE_MIN_T_MM = 10.0
 COLD_PLATE_MAX_T_MM = 30.0
 WCP_LENGTH_MIN_PCT = 20.0
@@ -653,8 +654,17 @@ def validation_check(input_df, strict=False, return_errors=False):
         errors.append(f"nwh1 ({nwh1}) > h1 ({h1})")
     if nwh2 > h1:
         errors.append(f"nwh2 ({nwh2}) > h1 ({h1})")
-    if cw1 <= 0 or cw2 <= 0:
-        errors.append(f"conductor width <= 0 (cw1={cw1}, cw2={cw2})")
+    if not math.isfinite(cw1):
+        errors.append(f"cw1 must be finite ({cw1})")
+    elif cw1 <= 0:
+        errors.append(f"cw1 <= 0 ({cw1})")
+    elif cw1 > PRIMARY_CONDUCTOR_MAX_THICKNESS_MM:
+        errors.append(
+            f"cw1 {cw1} > {PRIMARY_CONDUCTOR_MAX_THICKNESS_MM}mm "
+            "(primary conductor thickness cap)"
+        )
+    if not math.isfinite(cw2) or cw2 <= 0:
+        errors.append(f"cw2 must be finite and > 0 ({cw2})")
     if gap1 <= 0 or gap2 <= 0:
         errors.append(f"conductor gap <= 0 (gap1={gap1}, gap2={gap2})")
 

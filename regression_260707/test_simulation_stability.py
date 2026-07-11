@@ -31,6 +31,7 @@ from module.input_parameter_260706 import (
     COLD_PLATE_MIN_T_MM,
     KEYS,
     N1_MAX_TURNS,
+    PRIMARY_CONDUCTOR_MAX_THICKNESS_MM,
     WCP_LENGTH_MAX_PCT,
     WCP_LENGTH_MIN_PCT,
     _SOBOL_DIMS,
@@ -117,6 +118,28 @@ class PrimaryTurnDomainTests(unittest.TestCase):
         params["N1_main"] = N1_MAX_TURNS + 1
         with self.assertRaisesRegex(
                 ValueError, f"N1 {N1_MAX_TURNS + 1} > {N1_MAX_TURNS}"):
+            validation_check(create_input_parameter(params), strict=True)
+
+    def test_primary_conductor_thickness_is_capped_at_ten_mm(self):
+        params = get_drawing_default_params()
+        # Keep the surrounding fixed geometry roomy enough that this test
+        # isolates the conductor-thickness boundary rather than x-clearance.
+        params["l2"] = 300.0
+        params["cw1"] = PRIMARY_CONDUCTOR_MAX_THICKNESS_MM
+        ok, frame = validation_check(create_input_parameter(params), strict=True)
+        self.assertTrue(ok)
+        self.assertEqual(
+            float(frame["cw1"].iloc[0]),
+            PRIMARY_CONDUCTOR_MAX_THICKNESS_MM,
+        )
+
+        params["cw1"] = PRIMARY_CONDUCTOR_MAX_THICKNESS_MM + 0.01
+        with self.assertRaisesRegex(
+                ValueError, r"cw1 10\.01 > 10\.0mm"):
+            validation_check(create_input_parameter(params), strict=True)
+
+        params["cw1"] = float("nan")
+        with self.assertRaisesRegex(ValueError, r"cw1 must be finite"):
             validation_check(create_input_parameter(params), strict=True)
 
     def test_winding_and_core_plate_thicknesses_vary_independently(self):
