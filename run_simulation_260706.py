@@ -292,6 +292,87 @@ def _finite_result_value(frame, column):
     return value if math.isfinite(value) else None
 
 
+def _parse_convergence_history(lines, tolerance):
+    """Parse a complete AEDT convergence export and count trailing good passes."""
+    try:
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError("invalid convergence tolerance") from error
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise RuntimeError("invalid convergence tolerance")
+
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+
+    completed = None
+    rows = []
+    for raw_line in lines:
+        line = str(raw_line).strip()
+        completed_match = re.match(r"^Completed\s*:\s*(\d+)\s*$", line, re.IGNORECASE)
+        if completed_match:
+            declared = int(completed_match.group(1))
+            if completed is not None and completed != declared:
+                raise RuntimeError("conflicting completed-pass counts")
+            completed = declared
+            continue
+
+        if not re.match(r"^\d+\s*\|", line):
+            continue
+        parts = [part.strip() for part in line.strip("|").split("|")]
+        if len(parts) < 5:
+            raise RuntimeError(f"malformed convergence row: {line}")
+        try:
+            pass_index = int(parts[0])
+            tetrahedra = float(parts[1].replace(",", ""))
+            total_energy = float(parts[2])
+            energy_error = float(parts[3])
+            delta_token = parts[4].upper()
+            delta_energy = (
+                None if delta_token in {"N/A", "NA"} else float(parts[4])
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError(f"malformed convergence row: {line}") from error
+        numeric_values = [tetrahedra, total_energy, energy_error]
+        if delta_energy is not None:
+            numeric_values.append(delta_energy)
+        if not all(math.isfinite(value) for value in numeric_values):
+            raise RuntimeError(f"non-finite convergence row: {line}")
+        if pass_index < 1 or tetrahedra <= 0:
+            raise RuntimeError(f"invalid convergence row: {line}")
+        rows.append((pass_index, tetrahedra, energy_error, delta_energy))
+
+    if completed is None or completed < 1:
+        raise RuntimeError("completed-pass count is missing")
+    expected_indices = list(range(1, completed + 1))
+    actual_indices = [row[0] for row in rows]
+    if actual_indices != expected_indices:
+        raise RuntimeError(
+            f"incomplete convergence history: completed={completed}, rows={actual_indices}"
+        )
+
+    consecutive = 0
+    for _, _, energy_error, delta_energy in reversed(rows):
+        if (
+            delta_energy is not None
+            and 0 <= energy_error <= tolerance
+            and 0 <= delta_energy <= tolerance
+        ):
+            consecutive += 1
+        else:
+            break
+
+    last = rows[-1]
+    return {
+        "passes": float(completed),
+        "mesh_tets": float(last[1]),
+        "error_pct": float(last[2]),
+        "delta_pct": (
+            float(last[3]) if last[3] is not None else float("nan")
+        ),
+        "consecutive": float(consecutive),
+    }
+
+
 def _em_result_validation(frame, matrix_on=True, loss_on=True):
     """Validate enabled EM stages against the configured adaptive criteria."""
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -315,18 +396,24 @@ def _em_result_validation(frame, matrix_on=True, loss_on=True):
         tolerance = _finite_result_value(frame, tolerance_column)
         minimum_passes = _finite_result_value(frame, minimum_column)
         passes = _finite_result_value(frame, f"conv_passes_{label}")
+        consecutive = _finite_result_value(frame, f"conv_consecutive_{label}")
         error = _finite_result_value(frame, f"conv_error_pct_{label}")
         delta = _finite_result_value(frame, f"conv_delta_pct_{label}")
         if tolerance is None or tolerance <= 0:
             failures.append(f"{label}: invalid {tolerance_column}")
         if minimum_passes is None or minimum_passes < 1:
             failures.append(f"{label}: invalid {minimum_column}")
-        if passes is None:
+        if passes is None or passes < 1 or not passes.is_integer():
             failures.append(f"{label}: convergence pass count is missing")
-        elif minimum_passes is not None and passes < minimum_passes:
+        if consecutive is None or consecutive < 0 or not consecutive.is_integer():
+            failures.append(f"{label}: consecutive converged pass count is missing")
+        elif minimum_passes is not None and consecutive < minimum_passes:
             failures.append(
-                f"{label}: convergence pass count {passes:g} is below {minimum_passes:g}"
+                f"{label}: consecutive converged pass count {consecutive:g} "
+                f"is below {minimum_passes:g}"
             )
+        elif passes is not None and consecutive > passes:
+            failures.append(f"{label}: inconsistent convergence pass counts")
         if error is None or error < 0:
             failures.append(f"{label}: energy error is missing")
         elif tolerance is not None and tolerance > 0 and error > tolerance:
@@ -1669,30 +1756,108 @@ class Simulation():
         message = f"[{extraction_key}] result extraction failed after {max_attempts} attempts: {last_error}"
         raise RuntimeError(message)
 
-    def _fresh_fields_reporter(self, max_attempts=3, retry_delay=2):
-        """Return FieldsReporter from the currently active native design."""
-        last_error = None
-        for attempt in range(1, max_attempts + 1):
+    def _refresh_native_project_handle(self):
+        """Rebind the current project through Desktop without touching any solve."""
+        project_wrapper = getattr(self, "project", None)
+        try:
+            project_state = vars(project_wrapper)
+        except TypeError:
+            project_state = {}
+
+        desktop_wrapper = project_state.get("desktop") or getattr(self, "desktop", None)
+        odesktop = getattr(desktop_wrapper, "odesktop", None)
+        set_active_project = getattr(odesktop, "SetActiveProject", None)
+        project_name = project_state.get("name") or getattr(self, "PROJECT_NAME", None)
+        if not callable(set_active_project) or not project_name:
+            raise RuntimeError("native Desktop/project identity is unavailable")
+        native_project = set_active_project(project_name)
+        if native_project is None or native_project is False:
+            raise RuntimeError(f"SetActiveProject returned no project ({project_name})")
+        return native_project
+
+    @staticmethod
+    def _fields_reporter_from_project(oproject, design_name):
+        """Get a reporter only from the verified requested native design."""
+        route_errors = []
+        routes = (
+            ("GetActiveDesign", getattr(oproject, "GetActiveDesign", None), ()),
+            ("SetActiveDesign", getattr(oproject, "SetActiveDesign", None), (design_name,)),
+        )
+        for route_name, route, args in routes:
+            if not callable(route):
+                route_errors.append(f"{route_name}=unavailable")
+                continue
             try:
-                design_name = self.design1.design_name
-                oproject = self._native_project_handle()
-                odesign = oproject.SetActiveDesign(design_name)
+                odesign = route(*args)
                 if odesign is None or odesign is False:
-                    odesign = self.design1.odesign
-                if odesign is None or odesign is False:
-                    raise RuntimeError(f"active design handle is unavailable ({design_name})")
+                    raise RuntimeError("returned no design")
+                actual_name = _aedt_design_name(odesign)
+                if actual_name != design_name:
+                    raise RuntimeError(
+                        f"design mismatch: expected={design_name}, actual={actual_name or '<empty>'}"
+                    )
                 reporter = odesign.GetModule("FieldsReporter")
                 if reporter is None or reporter is False:
-                    raise RuntimeError(f"FieldsReporter is unavailable ({design_name})")
+                    raise RuntimeError("returned no FieldsReporter")
                 return reporter
-            except Exception as e:
-                last_error = e
-                logging.warning(
-                    f"FieldsReporter reacquire failed (attempt {attempt}/{max_attempts}): {e}"
+            except Exception as error:
+                route_errors.append(f"{route_name}={type(error).__name__}: {error}")
+        raise RuntimeError("; ".join(route_errors))
+
+    def _fresh_fields_reporter(self, max_attempts=3, retry_delay=2):
+        """Reacquire FieldsReporter without re-running the completed EM solve."""
+        last_error = None
+        design_name = _aedt_design_name(getattr(self.design1, "design_name", ""))
+        if not design_name:
+            raise RuntimeError("FieldsReporter design identity is unavailable")
+
+        for attempt in range(1, max_attempts + 1):
+            candidates = []
+            preferred = getattr(self, "_fields_reporter_project", None)
+            if preferred is not None and preferred is not False:
+                candidates.append(("preferred", preferred))
+            try:
+                native_project = self._native_project_handle()
+                if all(native_project is not item[1] for item in candidates):
+                    candidates.append(("cached", native_project))
+            except Exception as error:
+                last_error = error
+
+            candidate_errors = []
+            for label, native_project in candidates:
+                try:
+                    reporter = self._fields_reporter_from_project(
+                        native_project, design_name
+                    )
+                    self._fields_reporter_project = native_project
+                    return reporter
+                except Exception as error:
+                    candidate_errors.append(
+                        f"{label}={type(error).__name__}: {error}"
+                    )
+
+            try:
+                refreshed_project = self._refresh_native_project_handle()
+                reporter = self._fields_reporter_from_project(
+                    refreshed_project, design_name
                 )
-                if attempt < max_attempts:
-                    time.sleep(retry_delay)
-        raise RuntimeError(f"FieldsReporter unavailable after {max_attempts} attempts: {last_error}")
+                self._fields_reporter_project = refreshed_project
+                return reporter
+            except Exception as error:
+                candidate_errors.append(
+                    f"refresh={type(error).__name__}: {error}"
+                )
+
+            last_error = RuntimeError("; ".join(candidate_errors))
+            logging.warning(
+                f"FieldsReporter reacquire failed (attempt {attempt}/{max_attempts}): "
+                f"{last_error}"
+            )
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+        raise RuntimeError(
+            f"FieldsReporter unavailable after {max_attempts} attempts: {last_error}"
+        )
 
     def _add_field_expression(self, expr_name, stack_builder, max_attempts=3, retry_delay=2):
         """Build one named expression with a freshly acquired calculator handle."""
@@ -2099,37 +2264,49 @@ class Simulation():
         return self.df_loss_summary
 
     def get_convergence_info(self, label):
-        """수렴 메타데이터 추출: pass 수, 최종 에너지오차/델타에너지 [%], 메시 사면체 수.
-        회귀 데이터 필터링용 (수렴 덜 된 샘플 식별)."""
-        cols = {f"conv_passes_{label}": float("nan"), f"conv_error_pct_{label}": float("nan"),
-                f"conv_delta_pct_{label}": float("nan"), f"mesh_tets_{label}": float("nan")}
+        """Export full pass history and derive fail-closed convergence telemetry."""
+        cols = {
+            f"conv_passes_{label}": float("nan"),
+            f"conv_consecutive_{label}": float("nan"),
+            f"conv_error_pct_{label}": float("nan"),
+            f"conv_delta_pct_{label}": float("nan"),
+            f"mesh_tets_{label}": float("nan"),
+        }
         try:
             if not self.project_path:
                 raise RuntimeError("deterministic project path is unavailable")
+            tolerance_columns = {
+                "matrix": "matrix_percent_error",
+                "loss": "percent_error",
+            }
+            tolerance_column = tolerance_columns.get(label)
+            if tolerance_column is None:
+                raise RuntimeError(f"unknown convergence stage: {label}")
+            tolerance = float(self.df_plus[tolerance_column].iloc[0])
+            if not math.isfinite(tolerance) or tolerance <= 0:
+                raise RuntimeError(f"invalid configured tolerance: {tolerance_column}")
+
             path = os.path.join(self.project_path, f"convergence_{label}.txt")
+            if os.path.exists(path):
+                os.remove(path)
             try:
                 variation = self.design1.available_variations.nominal_w_values
                 if isinstance(variation, (list, tuple)):
                     variation = " ".join(str(v) for v in variation)
             except Exception:
                 variation = ""
-            self.design1.odesign.ExportConvergence("Setup1", variation, path)
-            rows = []
+            exported = self.design1.odesign.ExportConvergence("Setup1", variation, path)
+            if exported is False:
+                raise RuntimeError("ExportConvergence returned False")
+            if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+                raise RuntimeError("ExportConvergence produced no history file")
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    parts = [p.strip() for p in line.replace("|", " ").split()]
-                    if parts and parts[0].isdigit():
-                        rows.append(parts)
-            if rows:
-                last = rows[-1]
-                cols[f"conv_passes_{label}"] = float(last[0])
-                # 형식: pass, tetrahedra, total energy, energy error %, delta energy %
-                if len(last) >= 2:
-                    cols[f"mesh_tets_{label}"] = float(last[1].replace(",", ""))
-                if len(last) >= 4:
-                    cols[f"conv_error_pct_{label}"] = float(last[3])
-                if len(last) >= 5:
-                    cols[f"conv_delta_pct_{label}"] = float(last[4])
+                metrics = _parse_convergence_history(f, tolerance)
+            cols[f"conv_passes_{label}"] = metrics["passes"]
+            cols[f"conv_consecutive_{label}"] = metrics["consecutive"]
+            cols[f"conv_error_pct_{label}"] = metrics["error_pct"]
+            cols[f"conv_delta_pct_{label}"] = metrics["delta_pct"]
+            cols[f"mesh_tets_{label}"] = metrics["mesh_tets"]
         except Exception as e:
             logging.warning(f"convergence info extraction failed ({label}): {e}")
         return pd.DataFrame({k: [v] for k, v in cols.items()})

@@ -758,7 +758,10 @@ class FieldsReporterTests(unittest.TestCase):
 
         reporters = [Reporter(stale=True), Reporter()]
         native_designs = [
-            SimpleNamespace(GetModule=lambda _name, reporter=reporter: reporter)
+            SimpleNamespace(
+                GetName=lambda: "maxwell_loss",
+                GetModule=lambda _name, reporter=reporter: reporter,
+            )
             for reporter in reporters
         ]
         active_calls = []
@@ -784,6 +787,118 @@ class FieldsReporterTests(unittest.TestCase):
         self.assertEqual(result, "P_test")
         self.assertEqual(active_calls, ["maxwell_loss", "maxwell_loss"])
         self.assertEqual(reporters[1].added, ["P_test"])
+
+    def test_recovers_reporter_from_fresh_project_without_another_solve(self):
+        class Reporter:
+            def __init__(self):
+                self.added = []
+
+            def DoesNamedExpressionExists(self, _name):
+                return False
+
+            def CalcStack(self, _operation):
+                pass
+
+            def EnterQty(self, _quantity):
+                pass
+
+            def AddNamedExpression(self, name, _category):
+                self.added.append(name)
+
+        class BrokenProject:
+            def __init__(self):
+                self.get_calls = 0
+                self.set_calls = 0
+
+            def GetActiveDesign(self):
+                self.get_calls += 1
+                raise RuntimeError("transient GetActiveDesign gRPC failure")
+
+            def SetActiveDesign(self, _name):
+                self.set_calls += 1
+                raise RuntimeError("transient SetActiveDesign gRPC failure")
+
+        reporter = Reporter()
+        native_design = SimpleNamespace(
+            GetName=lambda: "project;maxwell_loss",
+            GetModule=lambda _name: reporter,
+        )
+        fresh_project = SimpleNamespace(
+            GetActiveDesign=lambda: native_design,
+            SetActiveDesign=Mock(side_effect=AssertionError("switch is unnecessary")),
+        )
+        broken_project = BrokenProject()
+        desktop = SimpleNamespace(
+            odesktop=SimpleNamespace(SetActiveProject=Mock(return_value=fresh_project))
+        )
+        analyze = Mock(side_effect=AssertionError("recovery must not re-solve"))
+        simulation = Simulation.__new__(Simulation)
+        simulation.design1 = SimpleNamespace(
+            design_name="maxwell_loss",
+            setup=SimpleNamespace(analyze=analyze),
+        )
+        simulation.project = SimpleNamespace(
+            project=broken_project,
+            proj=broken_project,
+            desktop=desktop,
+            name="project",
+        )
+
+        result = simulation._add_field_expression(
+            "P_core_5", lambda value: value.EnterQty("CoreLoss"), retry_delay=0
+        )
+
+        self.assertEqual(result, "P_core_5")
+        self.assertEqual(reporter.added, ["P_core_5"])
+        self.assertEqual(broken_project.get_calls, 1)
+        self.assertEqual(broken_project.set_calls, 1)
+        desktop.odesktop.SetActiveProject.assert_called_once_with("project")
+        fresh_project.SetActiveDesign.assert_not_called()
+        analyze.assert_not_called()
+
+    def test_permanent_reporter_recovery_failure_remains_fail_closed(self):
+        class BrokenProject:
+            def __init__(self):
+                self.get_calls = 0
+                self.set_calls = 0
+
+            def GetActiveDesign(self):
+                self.get_calls += 1
+                raise RuntimeError("permanent GetActiveDesign failure")
+
+            def SetActiveDesign(self, _name):
+                self.set_calls += 1
+                raise RuntimeError("permanent SetActiveDesign failure")
+
+        broken_project = BrokenProject()
+        set_active_project = Mock(side_effect=RuntimeError("permanent project failure"))
+        analyze = Mock(side_effect=AssertionError("recovery must not re-solve"))
+        simulation = Simulation.__new__(Simulation)
+        simulation.design1 = SimpleNamespace(
+            design_name="maxwell_loss",
+            setup=SimpleNamespace(analyze=analyze),
+        )
+        simulation.project = SimpleNamespace(
+            project=broken_project,
+            proj=broken_project,
+            desktop=SimpleNamespace(
+                odesktop=SimpleNamespace(SetActiveProject=set_active_project)
+            ),
+            name="project",
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "failed to register field expression 'P_core_5'"
+        ):
+            simulation._add_field_expression(
+                "P_core_5", lambda _reporter: None,
+                max_attempts=3, retry_delay=0,
+            )
+
+        self.assertEqual(broken_project.get_calls, 3)
+        self.assertEqual(broken_project.set_calls, 3)
+        self.assertEqual(set_active_project.call_count, 3)
+        analyze.assert_not_called()
 
     def test_save_calculation_registers_expressions_on_simulation(self):
         class Reporter:
@@ -929,6 +1044,7 @@ class EmCompletionPolicyTests(unittest.TestCase):
             "matrix_percent_error": 1.5,
             "matrix_min_converged": 1,
             "conv_passes_matrix": 6,
+            "conv_consecutive_matrix": 1,
             "conv_error_pct_matrix": 1.1,
             "conv_delta_pct_matrix": 0.2,
             "Ltx": 900.0,
@@ -942,6 +1058,7 @@ class EmCompletionPolicyTests(unittest.TestCase):
             "percent_error": 1.5,
             "min_converged": 2,
             "conv_passes_loss": 4,
+            "conv_consecutive_loss": 2,
             "conv_error_pct_loss": 0.7,
             "conv_delta_pct_loss": 0.3,
             "P_core_total": 1000.0,
@@ -973,14 +1090,19 @@ class EmCompletionPolicyTests(unittest.TestCase):
         missing_delta = self._valid_result().drop(columns=["conv_delta_pct_loss"])
         self.assertFalse(_em_result_is_valid(missing_delta))
 
-        too_few_passes = self._valid_result()
-        too_few_passes.loc[0, "conv_passes_loss"] = 1
-        self.assertFalse(_em_result_is_valid(too_few_passes))
+        too_few_consecutive = self._valid_result()
+        too_few_consecutive.loc[0, "conv_consecutive_loss"] = 1
+        self.assertFalse(_em_result_is_valid(too_few_consecutive))
+
+        missing_history_count = self._valid_result().drop(
+            columns=["conv_consecutive_loss"]
+        )
+        self.assertFalse(_em_result_is_valid(missing_history_count))
 
     def test_validates_only_enabled_stages(self):
         matrix_only = self._valid_result().drop(columns=[
-            "percent_error", "conv_passes_loss", "conv_error_pct_loss",
-            "conv_delta_pct_loss", *list((
+            "percent_error", "conv_passes_loss", "conv_consecutive_loss",
+            "conv_error_pct_loss", "conv_delta_pct_loss", *list((
                 "P_core_total", "P_core_plate_total", "P_wcp_total",
                 "P_winding_total", "B_mean_core", "B_max_core",
             )),
@@ -991,6 +1113,97 @@ class EmCompletionPolicyTests(unittest.TestCase):
         self.assertFalse(
             _em_result_is_valid(matrix_only, matrix_on=False, loss_on=False)
         )
+
+
+class ConvergenceHistoryTests(unittest.TestCase):
+    @staticmethod
+    def _history(rows, completed=None):
+        completed = len(rows) if completed is None else completed
+        return "\n".join([
+            "Number of Passes",
+            f"Completed : {completed}",
+            "Maximum   : 10",
+            "Minimum   : 2",
+            "Criterion : Energy Error/Delta Energy (%)",
+            "Target    : (1.5, 1.5)",
+            "Pass|# Tetrahedra|Total Energy (J)|Energy Error (%)|Delta Energy (%)|",
+            *rows,
+            "",
+        ])
+
+    @staticmethod
+    def _extract(history):
+        with tempfile.TemporaryDirectory() as tmp:
+            def export_convergence(_setup, _variation, path):
+                if history is not None:
+                    Path(path).write_text(history, encoding="utf-8")
+
+            simulation = Simulation.__new__(Simulation)
+            simulation.project_path = tmp
+            simulation.df_plus = pd.DataFrame([{
+                "matrix_percent_error": 1.5,
+                "percent_error": 1.5,
+            }])
+            simulation.design1 = SimpleNamespace(
+                available_variations=SimpleNamespace(nominal_w_values=[]),
+                odesign=SimpleNamespace(ExportConvergence=export_convergence),
+            )
+            return simulation.get_convergence_info("loss")
+
+    @staticmethod
+    def _result_with_loss_metrics(metrics):
+        result = EmCompletionPolicyTests._valid_result()
+        for column, value in metrics.iloc[0].items():
+            result.loc[0, column] = value
+        return result
+
+    def test_last_row_only_passing_is_not_enough(self):
+        metrics = self._extract(self._history([
+            "1|100|1.0|5.0|N/A|",
+            "2|120|1.0|1.6|0.5|",
+            "3|140|1.0|1.0|0.4|",
+        ]))
+
+        self.assertEqual(metrics.loc[0, "conv_passes_loss"], 3)
+        self.assertEqual(metrics.loc[0, "conv_consecutive_loss"], 1)
+        valid, reason = _em_result_validation(
+            self._result_with_loss_metrics(metrics)
+        )
+        self.assertFalse(valid)
+        self.assertIn(
+            "loss: consecutive converged pass count 1 is below 2", reason
+        )
+
+    def test_last_configured_n_rows_passing_is_valid(self):
+        metrics = self._extract(self._history([
+            "1|100|1.0|5.0|N/A|",
+            "2|120|1.0|1.4|1.0|",
+            "3|140|1.0|0.8|0.4|",
+        ]))
+
+        self.assertEqual(metrics.loc[0, "conv_passes_loss"], 3)
+        self.assertEqual(metrics.loc[0, "conv_consecutive_loss"], 2)
+        self.assertTrue(_em_result_is_valid(
+            self._result_with_loss_metrics(metrics)
+        ))
+
+    def test_malformed_or_missing_history_is_invalid(self):
+        histories = [
+            self._history([
+                "1|100|1.0|5.0|N/A|",
+                "2|120|1.0|broken|0.5|",
+            ]),
+            None,
+        ]
+        for history in histories:
+            with self.subTest(history=history):
+                metrics = self._extract(history)
+                self.assertTrue(math.isnan(
+                    metrics.loc[0, "conv_consecutive_loss"]
+                ))
+                self.assertFalse(_em_result_is_valid(
+                    self._result_with_loss_metrics(metrics)
+                ))
 
 
 class ThermalMeshPolicyTests(unittest.TestCase):
