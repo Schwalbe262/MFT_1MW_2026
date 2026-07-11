@@ -2807,46 +2807,39 @@ class Simulation():
                 self.save_project()
                 return elapsed
 
+            # Preserve app.analyze() semantics, then make the bounded native
+            # preflight the final operation before the only solve dispatch.
+            # Repeating SetActiveDesign/GetRegistryString after a successful
+            # preflight can itself wedge an otherwise healthy copied design.
+            self.save_project(strict=True)
+            logging.info(
+                f"[{label}] preparing native Analyze Setup1 blocking=True"
+            )
             context = self._prepare_copied_loss_native_analysis()
-            try:
-                # Preserve app.analyze() semantics: save before the only dispatch.
-                self.save_project(strict=True)
-                _oproject, dispatch_design = self._verified_native_maxwell_setup(
-                    context["odesktop"], setup_name="Setup1"
-                )
-                active = str(context["odesktop"].GetRegistryString(
-                    context["registry_key"]
-                ) or "").strip()
-                if active != "pyaedt_config":
-                    raise RuntimeError(
-                        f"[{label}] native HPC DSO changed before dispatch: {active!r}"
-                    )
-            except Exception:
-                self._restore_native_maxwell_dso(
-                    context["registry_key"], context["original_config"]
-                )
-                raise
-
-            self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
-            t0 = time.time()
             dispatch_error = None
+            restore_error = None
             analyze_result = None
             try:
-                logging.info(
-                    f"[{label}] native Analyze dispatch Setup1 blocking=True"
-                )
-                analyze_result = dispatch_design.Analyze("Setup1", True)
-            except Exception as error:
-                dispatch_error = error
-            elapsed = time.time() - t0
-
-            restore_error = None
-            try:
-                self._restore_native_maxwell_dso(
-                    context["registry_key"], context["original_config"]
-                )
-            except Exception as error:
-                restore_error = error
+                dispatch_design = context["odesign"]
+                self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
+                t0 = time.time()
+                try:
+                    analyze_result = dispatch_design.Analyze("Setup1", True)
+                except Exception as error:
+                    dispatch_error = error
+                elapsed = time.time() - t0
+            finally:
+                pending_error = sys.exc_info()[1]
+                try:
+                    self._restore_native_maxwell_dso(
+                        context["registry_key"], context["original_config"]
+                    )
+                except Exception as error:
+                    restore_error = error
+                    if pending_error is not None and hasattr(pending_error, "add_note"):
+                        pending_error.add_note(
+                            f"native Maxwell DSO restore also failed: {error}"
+                        )
 
             if dispatch_error is not None:
                 self._log_recent_aedt_messages(label)

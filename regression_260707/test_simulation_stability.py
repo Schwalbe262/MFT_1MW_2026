@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import tempfile
 import unittest
@@ -1169,8 +1170,98 @@ $end 'DSOConfig'
             self.assertEqual(len(desktop.registry_loads), 1)
             self.assertEqual(
                 project.active_calls,
-                ["maxwell_matrix1"] * 6,
+                ["maxwell_matrix1"] * 5,
             )
+
+    def test_save_preflight_and_analyze_are_adjacent_and_ordered(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, project, design, _high_level = self._simulation(root)
+            events = []
+            phase = ["before"]
+            original_prepare = simulation._prepare_copied_loss_native_analysis
+            original_set_active_design = project.SetActiveDesign
+            original_get_registry = desktop.GetRegistryString
+            simulation.design1.save_project = Mock(
+                side_effect=lambda: events.append("save")
+            )
+
+            def prepare():
+                events.append("preflight_start")
+                context = original_prepare(
+                    initial_retry_delay=0,
+                    sleeper=lambda _seconds: None,
+                )
+                events.append("preflight_done")
+                phase[0] = "armed"
+                return context
+
+            def set_active_design(name):
+                if phase[0] == "armed":
+                    events.append("unexpected_set_active_design")
+                return original_set_active_design(name)
+
+            def get_registry(key):
+                if phase[0] == "armed":
+                    events.append("unexpected_get_registry")
+                return original_get_registry(key)
+
+            def analyze(*_args):
+                events.append("analyze")
+                phase[0] = "dispatched"
+                return 0
+
+            simulation._prepare_copied_loss_native_analysis = prepare
+            project.SetActiveDesign = set_active_design
+            desktop.GetRegistryString = get_registry
+            design.Analyze.side_effect = analyze
+
+            simulation.analyze_and_extract("loss", lambda: None)
+
+            self.assertLess(events.index("save"), events.index("preflight_start"))
+            self.assertLess(
+                events.index("preflight_start"), events.index("preflight_done")
+            )
+            self.assertEqual(
+                events[events.index("preflight_done") + 1],
+                "analyze",
+            )
+            self.assertNotIn("unexpected_set_active_design", events)
+            self.assertNotIn("unexpected_get_registry", events)
+            self.assertEqual(simulation.solve_attempts, {"loss": 1})
+            self.assertEqual(desktop.active_config, "Local")
+            self.assertEqual(simulation.design1.save_project.call_count, 2)
+
+    def test_logging_failure_before_preflight_never_mutates_dso(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, _high_level = self._simulation(root)
+
+            with patch.object(
+                    logging, "info", side_effect=RuntimeError("logging failed")):
+                with self.assertRaisesRegex(RuntimeError, "logging failed"):
+                    simulation.analyze_and_extract("loss", lambda: None)
+
+            design.Analyze.assert_not_called()
+            self.assertEqual(simulation.solve_attempts, {})
+            self.assertEqual(desktop.active_config, "Local")
+            self.assertEqual(desktop.registry_loads, [])
+            simulation.design1.save_project.assert_called_once_with()
+
+    def test_exception_after_preflight_restores_without_analyze(self):
+        class ExplodingTelemetry(dict):
+            def get(self, _key, _default=None):
+                raise RuntimeError("telemetry update failed")
+
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, _high_level = self._simulation(root)
+            simulation.solve_attempts = ExplodingTelemetry()
+            self._no_wait_preflight(simulation)
+
+            with self.assertRaisesRegex(RuntimeError, "telemetry update failed"):
+                simulation.analyze_and_extract("loss", lambda: None)
+
+            design.Analyze.assert_not_called()
+            self.assertEqual(desktop.active_config, "Local")
+            self.assertEqual(len(desktop.registry_loads), 1)
 
     def test_preflight_exhaustion_never_dispatches_or_extracts(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1189,7 +1280,7 @@ $end 'DSOConfig'
             high_level.assert_not_called()
             self.assertEqual(extracted, [])
             self.assertEqual(simulation.solve_attempts, {})
-            simulation.design1.save_project.assert_not_called()
+            simulation.design1.save_project.assert_called_once_with()
 
     def test_wrong_design_identity_fails_immediately_without_mutation(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1271,6 +1362,7 @@ $end 'DSOConfig'
             design.Analyze.assert_not_called()
             self.assertEqual(simulation.solve_attempts, {})
             self.assertEqual(desktop.active_config, "Local")
+            self.assertEqual(desktop.registry_loads, [])
 
     def test_predispatch_wrapper_save_failure_uses_verified_native_save(self):
         with tempfile.TemporaryDirectory() as root:
