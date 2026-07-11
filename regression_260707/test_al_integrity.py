@@ -698,6 +698,13 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
 
 
 class WaitStateIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self._training_patcher = patch.object(
+            al_driver, "_assert_training_invariants"
+        )
+        self.training_invariant = self._training_patcher.start()
+        self.addCleanup(self._training_patcher.stop)
+
     def _context(self, root):
         profile_path = root / "verify" / "profiles" / "standard.json"
         profile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -898,6 +905,13 @@ class WaitStateIntegrityTests(unittest.TestCase):
 
 
 class IngestIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self._training_patcher = patch.object(
+            al_driver, "_assert_training_invariants"
+        )
+        self.training_invariant = self._training_patcher.start()
+        self.addCleanup(self._training_patcher.stop)
+
     def _front(self):
         row = complete_candidate_params(l1=50.0)
         row.update({
@@ -1187,6 +1201,13 @@ class IngestIntegrityTests(unittest.TestCase):
 
 
 class ActiveLearningGateTests(unittest.TestCase):
+    def setUp(self):
+        self._training_patcher = patch.object(
+            al_driver, "_assert_training_invariants"
+        )
+        self.training_invariant = self._training_patcher.start()
+        self.addCleanup(self._training_patcher.stop)
+
     def test_check_cannot_agree_with_incomplete_temperature_coverage(self):
         errors = complete_errors()
         errors.pop("d_Tprobe_Rx_main_leeward_max")

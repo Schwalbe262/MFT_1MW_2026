@@ -20,8 +20,11 @@ sys.path.insert(0, str(HERE / "verify"))
 from quality_contract import annotate_validity, validate_record
 from training.checkpoint_orchestrator import checkpoint_sequence, due_with_backoff
 from training.checkpoint_train import feature_columns, filter_valid_training_rows
-from training.model_quality_gate import evaluate_registry
-from training.train_models import capture_active_generation, restore_active_generation
+from training.model_quality_gate import evaluate_generation, evaluate_registry
+from training.train_models import (
+    capture_active_generation, promote_generation, registry_pointer_token,
+    restore_active_generation,
+)
 from verify import scheduler_client
 import scheduler_client as runtime_scheduler_client
 from verify.finalize import (
@@ -132,6 +135,26 @@ class CheckpointScheduleTests(unittest.TestCase):
         )
         self.assertEqual(ready, [3000])
 
+    def test_reconciliation_recovery_bypasses_failure_backoff(self):
+        now = datetime.fromisoformat("2026-07-11T04:00:00")
+        state = {"attempts": [{
+            "threshold": 3000, "strict_full_rows": 3000,
+            "status": "failed", "finished_at": "2026-07-11T03:59:00",
+        }]}
+        ready, deferred = due_with_backoff(
+            [3000], state, 3000, minimum_new_rows=250,
+            backoff_seconds=3600, now=now, force_ready={3000},
+        )
+        self.assertEqual(ready, [3000])
+        self.assertEqual(deferred, [])
+
+    def test_malformed_reconciliation_threshold_does_not_crash_schedule(self):
+        ready, deferred = due_with_backoff(
+            [500], {"attempts": []}, 500, force_ready={"corrupt", None}
+        )
+        self.assertEqual(ready, [500])
+        self.assertEqual(deferred, [])
+
 
 class ActiveLearningInvariantTests(unittest.TestCase):
     def _pinned_runtime(self):
@@ -144,8 +167,8 @@ class ActiveLearningInvariantTests(unittest.TestCase):
         solver_patch, library_patch = self._pinned_runtime()
         with solver_patch, library_patch:
             fresh = {
-                "stage": "TRAIN", "training_run_id": None,
-                "task_map": {}, "final_verification": None,
+                "round": 1, "stage": "TRAIN", "q_mult": 1.0,
+                "task_map": {}, "history": [],
             }
             identity = al_driver._bind_runtime_identity(fresh)
             self.assertEqual(identity["minimum_strict_full_rows"], 3000)
@@ -153,6 +176,11 @@ class ActiveLearningInvariantTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "legacy/unpinned"):
                 al_driver._bind_runtime_identity({"stage": "SELECT"})
+            with self.assertRaisesRegex(RuntimeError, "legacy/unpinned"):
+                al_driver._bind_runtime_identity({
+                    "round": 7, "stage": "TRAIN", "q_mult": 1.0,
+                    "task_map": {}, "history": [{"round": 6}],
+                })
 
             mismatched = dict(fresh)
             mismatched["runtime_identity"] = dict(
@@ -165,9 +193,8 @@ class ActiveLearningInvariantTests(unittest.TestCase):
         solver_patch, library_patch = self._pinned_runtime()
         with solver_patch, library_patch:
             state = {
-                "stage": "TRAIN", "training_run_id": None,
-                "task_map": {},
-                "final_verification": None,
+                "round": 1, "stage": "TRAIN", "q_mult": 1.0,
+                "task_map": {}, "history": [],
             }
             al_driver._bind_runtime_identity(state)
             state.update({
@@ -268,23 +295,32 @@ class ModelQualityGateTests(unittest.TestCase):
                 "training_run_id": "run1",
                 "dataset_sha256": digest,
                 "strict_full_rows": 3000,
+                "profile_sha256": "profile-sha",
                 "features": ["N1_main"],
+                "artifacts": {
+                    "Llt_phys/models.pkl": hashlib.sha256(b"model").hexdigest(),
+                    "Llt_phys/meta.json": hashlib.sha256(
+                        json.dumps(meta).encode("utf-8")
+                    ).hexdigest(),
+                },
             }
-            Path(os.path.join(generation, "train_report.json")).write_text(
-                json.dumps(report), encoding="utf-8"
-            )
-            Path(os.path.join(registry, "current.json")).write_text(
-                json.dumps({
-                    "generation": "generations/run1",
-                    "dataset_sha256": digest,
-                }),
-                encoding="utf-8",
-            )
+            report_path = Path(os.path.join(generation, "train_report.json"))
+            report_path.write_text(json.dumps(report), encoding="utf-8")
             thresholds = {
                 "minimum_strict_full_rows": 3000,
                 "minimum_interval_coverage": 0.85,
                 "targets": {"Llt_phys": {"min_r2": 0.98, "max_mape_pct": 2.0}},
             }
+            quality = evaluate_generation(
+                registry, generation, dataset, thresholds
+            )
+            self.assertTrue(quality["passed"], quality["reasons"])
+            promote_generation(
+                registry, generation, quality,
+                dataset=dataset, profile_sha256="profile-sha",
+                thresholds_sha256=quality["thresholds_sha256"],
+                expected_pointer=registry_pointer_token(registry),
+            )
             self.assertTrue(
                 evaluate_registry(registry, dataset, thresholds)["passed"]
             )
@@ -300,13 +336,41 @@ class ModelQualityGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             registry = os.path.join(tmp, "registry")
             old = os.path.join(registry, "generations", "old")
-            os.makedirs(old)
-            report = {"training_run_id": "old", "targets": [], "report": {}}
-            Path(old, "train_report.json").write_text(
-                json.dumps(report), encoding="utf-8"
-            )
-            Path(registry, "current.json").write_text(
-                json.dumps({"generation": "generations/old"}), encoding="utf-8"
+            target_dir = Path(old, "Llt_phys")
+            target_dir.mkdir(parents=True)
+            Path(target_dir, "models.pkl").write_bytes(b"old-model")
+            Path(target_dir, "meta.json").write_text("{}", encoding="utf-8")
+            old_dataset = Path(tmp, "old-dataset.bin")
+            old_dataset.write_bytes(b"dataset")
+            old_dataset_sha256 = hashlib.sha256(b"dataset").hexdigest()
+            report = {
+                "training_run_id": "old", "targets": ["Llt_phys"],
+                "dataset_sha256": old_dataset_sha256,
+                "profile_sha256": "profile",
+                "strict_full_rows": 3000, "report": {},
+                "artifacts": {
+                    "Llt_phys/models.pkl": hashlib.sha256(b"old-model").hexdigest(),
+                    "Llt_phys/meta.json": hashlib.sha256(b"{}").hexdigest(),
+                },
+            }
+            report_path = Path(old, "train_report.json")
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            quality = {
+                "passed": True, "training_run_id": "old",
+                "dataset_sha256": old_dataset_sha256,
+                "profile_sha256": "profile",
+                "thresholds_sha256": "thresholds",
+                "generation": "generations/old",
+                "generation_report_sha256": hashlib.sha256(
+                    report_path.read_bytes()
+                ).hexdigest(),
+            }
+            promote_generation(
+                registry, old, quality,
+                dataset=old_dataset,
+                profile_sha256="profile",
+                thresholds_sha256="thresholds",
+                expected_pointer=registry_pointer_token(registry),
             )
             captured = capture_active_generation(registry)
             Path(registry, "current.json").write_text(
@@ -602,7 +666,9 @@ class FineValidationTests(unittest.TestCase):
             return_value=runtime_scheduler_client.ResultFetch(
                 runtime_scheduler_client.RESULT_INVALID
             ),
-        ), patch.object(al_driver, "save_state"):
+        ), patch.object(al_driver, "save_state"), patch.object(
+            al_driver, "_assert_training_invariants"
+        ):
             al_driver.stage_fine_wait(state)
         self.assertEqual(state["stage"], "FINE_BLOCKED")
         self.assertIn("smaller candidate", state["fine_block_reason"])

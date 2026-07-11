@@ -5,7 +5,7 @@ set -u
 
 usage() {
   echo "Usage: bash relaunch.sh [target] [buffer] [solver_40sha] [library_40sha]" >&2
-  echo "       target=0 defaults buffer=0 and permits both revisions to be omitted." >&2
+  echo "       target=0 defaults buffer=0; both revisions remain required for training." >&2
 }
 
 if [ "$#" -gt 4 ]; then
@@ -53,9 +53,8 @@ for required_command in curl cygpath powershell.exe nohup sed tr; do
   fi
 done
 
-if [ $((TARGET + BUFFER)) -gt 0 ] && \
-   { [ -z "$SOLVER_REVISION" ] || [ -z "$LIBRARY_REVISION" ]; }; then
-  echo "full solver and library revisions are required for a nonzero feeder target" >&2
+if [ -z "$SOLVER_REVISION" ] || [ -z "$LIBRARY_REVISION" ]; then
+  echo "full solver and library revisions are required for feeder and checkpoint training" >&2
   usage
   exit 2
 fi
@@ -132,11 +131,17 @@ nohup "$PY" feeder.py --loop 600 --max-samples 12000 \
   > feeder_relaunch.log 2>&1 &
 echo "feeder pid $!"
 
-echo "=== 4. Periodic collector and checkpoint loop"
+echo "=== 4. Periodic collector loop"
 MFT_SOLVER_REVISION="$SOLVER_REVISION" \
 MFT_LIBRARY_REVISION="$LIBRARY_REVISION" \
 nohup bash auto_collect_loop.sh > collect_relaunch.log 2>&1 &
 echo "collector pid $!"
+
+echo "=== 5. Independent durable checkpoint loop"
+MFT_SOLVER_REVISION="$SOLVER_REVISION" \
+MFT_LIBRARY_REVISION="$LIBRARY_REVISION" \
+nohup bash auto_checkpoint_loop.sh > checkpoint_relaunch.log 2>&1 &
+echo "checkpoint pid $!"
 
 sleep 3
 powershell.exe -NoProfile -ExecutionPolicy Bypass \

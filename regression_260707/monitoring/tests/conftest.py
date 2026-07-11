@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -89,14 +90,41 @@ def campaign_root(tmp_path):
     ]) + "\n", encoding="utf-8")
 
     registry = root / "training" / "registry"
-    write_json(registry / "train_report.json", {
+    generation = registry / "generations" / "run1"
+    write_json(generation / "train_report.json", {
         "time": "2026-07-11T02:00:00+09:00",
+        "training_run_id": "run1",
+        "dataset_sha256": "dataset-sha",
+        "profile_sha256": "profile-sha",
+        "strict_full_rows": 100,
         "report": {
             "Llt_phys": {"n_train": 80, "n_holdout": 20, "r2": .91, "rmse": .2, "mape_pct": 1.2, "p90_ape_pct": 2.1, "q90_conformal": 1.1},
             "P_winding_total": {"n_train": 80, "n_holdout": 20, "r2": .72, "rmse": 120, "mape_pct": 22, "p90_ape_pct": 30, "q90_conformal": 2.2},
         },
     })
-    write_json(registry / "Llt_phys" / "meta.json", {"trained_at": "2026-07-11T02:00:00+09:00"})
+    report_sha256 = hashlib.sha256(
+        (generation / "train_report.json").read_bytes()
+    ).hexdigest()
+    write_json(generation / "quality_gate.json", {
+        "passed": True, "training_run_id": "run1",
+        "dataset_sha256": "dataset-sha",
+        "profile_sha256": "profile-sha",
+        "generation": "generations/run1",
+        "generation_report_sha256": report_sha256,
+    })
+    gate_sha256 = hashlib.sha256(
+        (generation / "quality_gate.json").read_bytes()
+    ).hexdigest()
+    write_json(registry / "current.json", {
+        "schema_version": 2, "training_run_id": "run1",
+        "generation": "generations/run1",
+        "dataset_sha256": "dataset-sha",
+        "profile_sha256": "profile-sha",
+        "strict_full_rows": 100,
+        "generation_report_sha256": report_sha256,
+        "quality_gate_sha256": gate_sha256,
+    })
+    write_json(generation / "Llt_phys" / "meta.json", {"trained_at": "2026-07-11T02:00:00+09:00"})
     write_csv(root / "training" / "learning_curve.csv", [
         {"time": "2026-07-10 10:00:00", "target": "Llt_phys", "n": "60", "r2": ".85", "rmse": ".4", "mape_pct": "2", "p90_ape_pct": "3", "slice": "global"},
         {"time": "2026-07-11 02:00:00", "target": "Llt_phys", "n": "100", "r2": ".91", "rmse": ".2", "mape_pct": "1.2", "p90_ape_pct": "2.1", "slice": "global"},

@@ -147,11 +147,15 @@ def _bind_runtime_identity(state):
     expected = _runtime_identity()
     existing = state.get("runtime_identity")
     if existing is None:
+        fresh_keys = {"round", "stage", "q_mult", "task_map", "history"}
         is_fresh = (
-            state.get("stage") == "TRAIN"
+            set(state).issubset(fresh_keys)
+            and int(state.get("round", -1)) == 1
+            and state.get("stage") == "TRAIN"
+            and float(state.get("q_mult", -1)) == 1.0
             and not state.get("training_run_id")
             and not state.get("task_map")
-            and not state.get("final_verification")
+            and not state.get("history")
         )
         if not is_fresh:
             raise RuntimeError(
@@ -165,7 +169,7 @@ def _bind_runtime_identity(state):
     return expected
 
 
-def _assert_training_invariants(state):
+def _assert_runtime_training_invariants(state):
     identity = _bind_runtime_identity(state)
     quality = state.get("model_quality_snapshot") or {}
     snapshot = state.get("training_dataset")
@@ -635,75 +639,90 @@ def stage_train(st):
     model_dataset = os.path.join(rdir, "strict_training_snapshot.parquet")
     _atomic_write_parquet(strict, model_dataset)
     from training.train_models import (
-        capture_active_generation, discard_inactive_generation,
-        restore_active_generation,
+        discard_inactive_generation, promote_generation,
+        registry_pointer_token,
     )
-    registry_lock = FileLock(REGISTRY + ".training.lock", timeout=1)
-    registry_lock.acquire()
-    previous_generation = None
-    generation_captured = False
+    from quality_contract import DEFAULT_PROFILE_PATH
+
+    profile_path = os.path.abspath(DEFAULT_PROFILE_PATH)
+    from quality_contract import load_profile
+
+    profile_sha256 = hashlib.sha256(
+        json.dumps(
+            load_profile(profile_path), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    candidate_result_path = os.path.join(rdir, "candidate_generation.json")
+    expected_pointer = registry_pointer_token(REGISTRY)
+    candidate_generation = None
+    promoted = False
     try:
-        previous_generation = capture_active_generation(REGISTRY)
-        generation_captured = True
         run([
             PY, os.path.join("training", "checkpoint_train.py"),
             "--dataset", model_dataset,
             "--curve-csv", os.path.join(
                 RUNTIME_ROOT, "training", "learning_curve.csv"
             ),
+            "--profile", profile_path,
         ])
         run([
             PY, os.path.join("training", "train_models.py"),
             "--dataset", model_dataset, "--registry", REGISTRY,
+            "--profile", profile_path,
+            "--result-json", candidate_result_path,
         ])
-        run([
-            PY, os.path.join("training", "model_quality_gate.py"),
-            "--dataset", model_dataset, "--registry", REGISTRY,
-            "--status", QUALITY_STATUS,
-        ])
-        with open(os.path.join(REGISTRY, "current.json"), encoding="utf-8") as handle:
-            pointer = json.load(handle)
-        with open(QUALITY_STATUS, encoding="utf-8") as handle:
-            quality_snapshot = json.load(handle)
+        with open(candidate_result_path, encoding="utf-8") as handle:
+            candidate = json.load(handle)
+        candidate_generation = candidate["generation"]
+        from training.model_quality_gate import evaluate_generation
+
+        thresholds_path = QUALITY_THRESHOLDS_PATH
+        with open(thresholds_path, encoding="utf-8") as handle:
+            thresholds = json.load(handle)
+        quality_snapshot = evaluate_generation(
+            REGISTRY, candidate_generation, model_dataset, thresholds
+        )
         quality_snapshot.update({
             "solver_revision": PINNED_SOLVER_REVISION,
             "library_revision": PINNED_LIBRARY_REVISION,
             "quality_thresholds_sha256": _sha256(QUALITY_THRESHOLDS_PATH),
         })
-        if (not quality_snapshot.get("passed")
-                or quality_snapshot.get("training_run_id") != pointer["training_run_id"]
-                or int(quality_snapshot.get("strict_full_rows") or 0)
-                < MIN_STRICT_FULL_ROWS
-                or quality_snapshot.get("quality_thresholds_sha256")
-                != _sha256(QUALITY_THRESHOLDS_PATH)):
-            raise RuntimeError("activated registry and quality snapshot do not match")
+        quality_snapshot["evaluated_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        _atomic_write_json(quality_snapshot, QUALITY_STATUS)
+        if not quality_snapshot.get("passed"):
+            raise RuntimeError(
+                "surrogate quality gate failed: "
+                + "; ".join(quality_snapshot.get("reasons", [])[:10])
+            )
+        if (int(quality_snapshot.get("strict_full_rows") or 0)
+                < MIN_STRICT_FULL_ROWS):
+            raise RuntimeError("surrogate quality gate is below 3000 strict rows")
+        pointer = promote_generation(
+            REGISTRY,
+            candidate_generation,
+            quality_snapshot,
+            dataset=model_dataset,
+            profile_sha256=profile_sha256,
+            thresholds_sha256=hashlib.sha256(
+                json.dumps(
+                    thresholds, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+            expected_pointer=expected_pointer,
+        )
+        promoted = True
         generation_dir = os.path.abspath(os.path.join(REGISTRY, pointer["generation"]))
         quality_snapshot_path = os.path.join(rdir, "model_quality_snapshot.json")
         _atomic_write_json(quality_snapshot, quality_snapshot_path)
     except Exception:
-        rejected_generation = None
-        pointer_path = os.path.join(REGISTRY, "current.json")
-        if os.path.isfile(pointer_path):
+        if candidate_generation and not promoted:
             try:
-                with open(pointer_path, encoding="utf-8") as handle:
-                    current_pointer = json.load(handle)
-                candidate_generation = os.path.abspath(
-                    os.path.join(REGISTRY, current_pointer["generation"])
-                )
-                prior_path = (
-                    previous_generation.get("generation")
-                    if previous_generation else None
-                )
-                if candidate_generation != prior_path:
-                    rejected_generation = candidate_generation
-            except Exception:
-                rejected_generation = None
-        if generation_captured:
-            restore_active_generation(REGISTRY, previous_generation)
-        discard_inactive_generation(REGISTRY, rejected_generation)
+                discard_inactive_generation(REGISTRY, candidate_generation)
+            except Exception as cleanup_error:
+                print(f"[al] inactive candidate cleanup warning: {cleanup_error}")
         raise
-    finally:
-        registry_lock.release()
     st["training_dataset"] = model_dataset
     st["training_run_id"] = pointer["training_run_id"]
     st["training_generation"] = generation_dir
@@ -711,6 +730,64 @@ def stage_train(st):
     st["model_quality_snapshot_path"] = quality_snapshot_path
     st["training_strict_full_rows"] = int(len(strict))
     st["stage"] = "OPTIMIZE"
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _assert_training_invariants(st):
+    """Fail closed if the pinned accepted training evidence changes mid-round."""
+    _assert_runtime_training_invariants(st)
+    required = (
+        "training_dataset", "training_run_id", "training_generation",
+        "model_quality_snapshot_path", "training_strict_full_rows",
+    )
+    missing = [key for key in required if st.get(key) in (None, "")]
+    if missing:
+        raise RuntimeError("AL training evidence is missing: " + ", ".join(missing))
+    dataset = os.path.abspath(st["training_dataset"])
+    if not os.path.isfile(dataset):
+        raise RuntimeError("AL pinned training snapshot is missing")
+    from training.train_models import load_generation
+
+    record = load_generation(
+        REGISTRY, st["training_generation"], require_accepted=True
+    )
+    report = record["report"]
+    accepted = record["quality"]
+    quality_path = os.path.abspath(st["model_quality_snapshot_path"])
+    with open(quality_path, encoding="utf-8") as handle:
+        quality_snapshot = json.load(handle)
+    checks = {
+        "training_run_id": st["training_run_id"],
+        "dataset_sha256": _file_sha256(dataset),
+        "generation": record["generation_relative"],
+        "generation_report_sha256": record["generation_report_sha256"],
+        "profile_sha256": report.get("profile_sha256"),
+        "thresholds_sha256": accepted.get("thresholds_sha256"),
+    }
+    if os.path.normcase(os.path.abspath(st["training_generation"])) != os.path.normcase(
+        record["generation"]
+    ):
+        raise RuntimeError("AL pinned generation path changed")
+    if int(st["training_strict_full_rows"]) != int(report.get("strict_full_rows", -1)):
+        raise RuntimeError("AL pinned strict row count changed")
+    for key, expected in checks.items():
+        if report.get(key) not in (None, expected) and key in (
+            "training_run_id", "dataset_sha256", "profile_sha256"
+        ):
+            raise RuntimeError(f"AL generation {key} changed")
+        if quality_snapshot.get(key) != expected:
+            raise RuntimeError(f"AL quality snapshot {key} changed")
+        if accepted.get(key) not in (None, expected):
+            raise RuntimeError(f"AL accepted gate {key} changed")
+    if quality_snapshot.get("passed") is not True or accepted.get("passed") is not True:
+        raise RuntimeError("AL pinned generation is not quality accepted")
 
 
 def stage_optimize(st):
@@ -835,6 +912,7 @@ def stage_submit(st):
 
 
 def stage_wait(st):
+    _assert_training_invariants(st)
     import scheduler_client as sc
     records = _ensure_task_records(st)
     solver_revision = st.get("solver_git_revision")
@@ -988,6 +1066,7 @@ def stage_wait(st):
 
 
 def stage_ingest(st):
+    _assert_training_invariants(st)
     rnd = st["round"]
     rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     front = pd.read_csv(os.path.join(rdir, "pareto_front.csv"))
@@ -1151,6 +1230,7 @@ def stage_ingest(st):
 
 
 def stage_check(st):
+    _assert_training_invariants(st)
     rnd = st["round"]
     errs = st.get("last_errs") or {}
     hist = {"round": rnd, "time": datetime.now().isoformat(timespec="seconds")}
@@ -1381,6 +1461,7 @@ def stage_fine_submit(st):
 
 
 def stage_fine_wait(st):
+    _assert_training_invariants(st)
     import scheduler_client as sc
     from module.input_parameter_260706 import KEYS
 
@@ -1529,6 +1610,7 @@ def stage_fine_wait(st):
 
 
 def stage_final_report(st):
+    _assert_training_invariants(st)
     from verify.finalize import (
         candidate_identity_reasons, physical_spec_reasons,
         write_final_artifacts,

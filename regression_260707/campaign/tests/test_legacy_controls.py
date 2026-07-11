@@ -69,6 +69,7 @@ class RelaunchPreflightTests(unittest.TestCase):
             (("bad",), "target must be"),
             (("1", "bad"), "buffer must be"),
             (("1", "0"), "full solver and library revisions"),
+            (("0", "0"), "full solver and library revisions"),
             (("1", "0", "abc", "def"), "solver revision must be"),
             (("1", "0", "a" * 40), "full solver and library revisions"),
             (("1", "0", "a" * 40, "b" * 40, "extra"), "Usage:"),

@@ -27,7 +27,8 @@ regression_260707\monitoring\.venv\Scripts\python -m uvicorn regression_260707.m
 ## 읽는 산출물
 
 - 데이터: `data/dataset/manifest.json`, `train_io.csv`, `collect_cache.json`
-- 모델: `training/registry/train_report.json`, 각 모델의 `meta.json`, `training/learning_curve.csv`
+- 모델: `training/registry/current.json`이 가리키는 승인 generation의
+  `train_report.json`, 각 모델의 `meta.json`, `training/learning_curve.csv`
 - 최적화: 최신 `al_rounds/round_*/pareto_front.csv`, 선택적으로 `al_rounds/state.json`
 - standard FEA: `state.json`의 `task_records`와 최신 `verification_errors.csv`
 - fine FEA: 아래 경로 중 먼저 발견되는 JSON

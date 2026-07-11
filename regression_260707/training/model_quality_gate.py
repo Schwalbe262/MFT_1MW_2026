@@ -14,6 +14,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_REGISTRY = os.path.join(HERE, "registry")
 DEFAULT_THRESHOLDS = os.path.join(HERE, "model_quality_thresholds.json")
+REGISTRY_SCHEMA_VERSION = 2
+QUALITY_GATE_FILENAME = "quality_gate.json"
 
 
 def _sha256(path):
@@ -47,29 +49,42 @@ def _finite(value):
         return False
 
 
-def _load_generation(registry):
-    pointer_path = os.path.join(registry, "current.json")
-    with open(pointer_path, encoding="utf-8") as handle:
-        pointer = json.load(handle)
-    relative = pointer.get("generation")
+def _load_generation(registry, generation=None):
+    registry = os.path.abspath(registry)
+    pointer = None
+    if generation is None:
+        pointer_path = os.path.join(registry, "current.json")
+        with open(pointer_path, encoding="utf-8") as handle:
+            pointer = json.load(handle)
+        relative = pointer.get("generation")
+    else:
+        relative = os.fspath(generation)
     if not isinstance(relative, str) or not relative.strip():
-        raise RuntimeError("registry pointer has no generation")
-    generation = os.path.abspath(os.path.join(registry, relative))
-    registry_abs = os.path.abspath(registry)
-    if os.path.commonpath([generation, registry_abs]) != registry_abs:
-        raise RuntimeError("registry generation escapes registry root")
+        raise RuntimeError("registry generation is missing")
+    generation = os.path.abspath(
+        relative if os.path.isabs(relative) else os.path.join(registry, relative)
+    )
+    generations_root = os.path.abspath(os.path.join(registry, "generations"))
+    if (
+        generation == generations_root
+        or os.path.commonpath([generation, generations_root]) != generations_root
+    ):
+        raise RuntimeError("registry generation escapes generations root")
     with open(
         os.path.join(generation, "train_report.json"), encoding="utf-8"
     ) as handle:
         report = json.load(handle)
-    return pointer, generation, report
+    relative = os.path.relpath(generation, registry).replace("\\", "/")
+    return pointer, generation, relative, report
 
 
-def evaluate_registry(registry, dataset, thresholds):
+def evaluate_registry(registry, dataset, thresholds, generation=None):
     reasons = []
     target_status = {}
     try:
-        pointer, generation, report = _load_generation(registry)
+        pointer, generation, generation_relative, report = _load_generation(
+            registry, generation
+        )
     except Exception as exc:
         return {
             "passed": False,
@@ -78,13 +93,44 @@ def evaluate_registry(registry, dataset, thresholds):
         }
 
     run_id = report.get("training_run_id")
-    if pointer.get("training_run_id") not in (None, run_id):
-        reasons.append("pointer_training_run_mismatch")
+    report_path = os.path.join(generation, "train_report.json")
+    report_sha256 = _sha256(report_path)
+    thresholds_sha256 = hashlib.sha256(
+        json.dumps(thresholds, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if pointer is not None:
+        if pointer.get("schema_version") != REGISTRY_SCHEMA_VERSION:
+            reasons.append("ungated_pointer_schema")
+        if pointer.get("training_run_id") != run_id:
+            reasons.append("pointer_training_run_mismatch")
+        if pointer.get("generation_report_sha256") != report_sha256:
+            reasons.append("pointer_generation_report_mismatch")
+        if pointer.get("profile_sha256") != report.get("profile_sha256"):
+            reasons.append("pointer_profile_fingerprint_mismatch")
+        if pointer.get("thresholds_sha256") != thresholds_sha256:
+            reasons.append("pointer_threshold_fingerprint_mismatch")
+        if pointer.get("strict_full_rows") != report.get("strict_full_rows"):
+            reasons.append("pointer_strict_row_count_mismatch")
     dataset_sha = _sha256(dataset)
     if report.get("dataset_sha256") != dataset_sha:
         reasons.append("dataset_fingerprint_mismatch")
-    if pointer.get("dataset_sha256") != dataset_sha:
+    if pointer is not None and pointer.get("dataset_sha256") != dataset_sha:
         reasons.append("pointer_dataset_fingerprint_mismatch")
+
+    artifacts = report.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        reasons.append("artifact_manifest_missing")
+    else:
+        for relative_path, expected_sha256 in artifacts.items():
+            artifact = os.path.abspath(os.path.join(generation, relative_path))
+            if os.path.commonpath([artifact, generation]) != generation:
+                reasons.append(f"artifact_path_escape:{relative_path}")
+            elif not os.path.isfile(artifact):
+                reasons.append(f"artifact_missing:{relative_path}")
+            elif _sha256(artifact) != expected_sha256:
+                reasons.append(f"artifact_fingerprint_mismatch:{relative_path}")
     strict_rows = report.get("strict_full_rows")
     if not _finite(strict_rows) or int(strict_rows) < int(
         thresholds["minimum_strict_full_rows"]
@@ -150,11 +196,40 @@ def evaluate_registry(registry, dataset, thresholds):
         }
         reasons.extend(f"{target}:{reason}" for reason in target_reasons)
 
+    if pointer is not None:
+        gate_path = os.path.join(generation, QUALITY_GATE_FILENAME)
+        try:
+            with open(gate_path, encoding="utf-8") as handle:
+                accepted = json.load(handle)
+            gate_sha256 = _sha256(gate_path)
+            if pointer.get("quality_gate_sha256") != gate_sha256:
+                reasons.append("pointer_quality_gate_mismatch")
+            if accepted.get("passed") is not True:
+                reasons.append("active_generation_not_accepted")
+            if accepted.get("training_run_id") != run_id:
+                reasons.append("accepted_training_run_mismatch")
+            if accepted.get("dataset_sha256") != dataset_sha:
+                reasons.append("accepted_dataset_fingerprint_mismatch")
+            if accepted.get("profile_sha256") != report.get("profile_sha256"):
+                reasons.append("accepted_profile_fingerprint_mismatch")
+            if accepted.get("thresholds_sha256") != thresholds_sha256:
+                reasons.append("accepted_threshold_fingerprint_mismatch")
+            if accepted.get("generation") != generation_relative:
+                reasons.append("accepted_generation_path_mismatch")
+            if accepted.get("generation_report_sha256") != report_sha256:
+                reasons.append("accepted_generation_report_mismatch")
+        except Exception as exc:
+            reasons.append(f"acceptance_evidence_unavailable:{exc}")
+
     return {
         "passed": not reasons,
         "reasons": reasons,
         "training_run_id": run_id,
         "dataset_sha256": dataset_sha,
+        "profile_sha256": report.get("profile_sha256"),
+        "thresholds_sha256": thresholds_sha256,
+        "generation": generation_relative,
+        "generation_report_sha256": report_sha256,
         "strict_full_rows": strict_rows,
         "targets": target_status,
         "manufacturing_tolerance_policy": (
@@ -163,17 +238,27 @@ def evaluate_registry(registry, dataset, thresholds):
     }
 
 
+def evaluate_generation(registry, generation, dataset, thresholds):
+    """Evaluate an inactive candidate without consulting or changing current.json."""
+    return evaluate_registry(
+        registry, dataset, thresholds, generation=generation
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--registry", default=DEFAULT_REGISTRY)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--thresholds", default=DEFAULT_THRESHOLDS)
     parser.add_argument("--status", default=None)
+    parser.add_argument("--generation", default=None)
     args = parser.parse_args()
 
     with open(args.thresholds, encoding="utf-8") as handle:
         thresholds = json.load(handle)
-    result = evaluate_registry(args.registry, args.dataset, thresholds)
+    result = evaluate_registry(
+        args.registry, args.dataset, thresholds, generation=args.generation
+    )
     result["evaluated_at"] = datetime.now().isoformat(timespec="seconds")
     result["thresholds_path"] = os.path.abspath(args.thresholds)
     result["quality_thresholds_sha256"] = _sha256(args.thresholds)

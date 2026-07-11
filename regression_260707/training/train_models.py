@@ -1,9 +1,10 @@
-"""Train one coherent surrogate generation with independently tested UQ.
+"""Build coherent surrogate candidates without exposing ungated models.
 
 Every required target is trained from the same recomputed strict-full cohort.
-Models are first written to a generation directory and become visible through
-one atomic ``current.json`` pointer, so a failed/partial run cannot mix stale
-and new targets.
+This command only builds an immutable candidate generation.  The caller must
+evaluate that generation and use :func:`promote_generation` to publish it.
+Registry mutation APIs own the writer lock themselves; callers must never wrap
+them in the same lock.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import shutil
 import tempfile
 import uuid
 
+from filelock import FileLock
 import numpy as np
 import pandas as pd
 
@@ -38,6 +40,8 @@ N_FOLDS = 5
 CALIBRATION_FRAC = 0.10
 EVALUATION_FRAC = 0.10
 SEED = 42
+REGISTRY_SCHEMA_VERSION = 2
+QUALITY_GATE_FILENAME = "quality_gate.json"
 
 
 def default_family_params():
@@ -234,81 +238,287 @@ def _atomic_json(value, path):
             os.remove(staged)
 
 
-def _install_compatibility_view(registry, generation_dir, targets, report):
-    """Refresh old registry paths for the already-running monitoring UI."""
-    for target in targets:
-        target_dir = os.path.join(registry, target)
-        os.makedirs(target_dir, exist_ok=True)
-        for filename in ("models.pkl", "meta.json"):
-            source = os.path.join(generation_dir, target, filename)
-            destination = os.path.join(target_dir, filename)
-            fd, staged = tempfile.mkstemp(
-                prefix=f".{filename}.", suffix=".tmp", dir=target_dir
+def _registry_lock(registry, timeout=1):
+    """Return the single registry writer lock used by every mutation API."""
+    return FileLock(os.path.abspath(registry) + ".training.lock", timeout=timeout)
+
+
+def registry_pointer_token(registry):
+    """Capture the exact pointer state for compare-before-promote semantics."""
+    pointer_path = os.path.join(os.path.abspath(registry), "current.json")
+    if not os.path.isfile(pointer_path):
+        return {"exists": False, "sha256": None}
+    return {"exists": True, "sha256": _sha256(pointer_path)}
+
+
+def _resolve_generation(registry, generation):
+    registry = os.path.abspath(registry)
+    generations_root = os.path.abspath(os.path.join(registry, "generations"))
+    value = os.fspath(generation)
+    target = os.path.abspath(
+        value if os.path.isabs(value) else os.path.join(registry, value)
+    )
+    if (
+        target == generations_root
+        or os.path.commonpath([target, generations_root]) != generations_root
+    ):
+        raise RuntimeError("registry generation escapes generations root")
+    return target
+
+
+def load_generation(registry, generation, require_accepted=False):
+    """Load and cross-check one immutable generation and its gate evidence."""
+    registry = os.path.abspath(registry)
+    generation_dir = _resolve_generation(registry, generation)
+    report_path = os.path.join(generation_dir, "train_report.json")
+    with open(report_path, encoding="utf-8") as handle:
+        report = json.load(handle)
+    run_id = report.get("training_run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise RuntimeError("generation report has no training_run_id")
+    artifacts = report.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise RuntimeError("generation report has no artifact manifest")
+    for relative_path, expected_sha256 in artifacts.items():
+        artifact = os.path.abspath(os.path.join(generation_dir, relative_path))
+        if os.path.commonpath([artifact, generation_dir]) != generation_dir:
+            raise RuntimeError(f"generation artifact escapes root: {relative_path}")
+        if not os.path.isfile(artifact):
+            raise RuntimeError(f"generation artifact is missing: {relative_path}")
+        if _sha256(artifact) != expected_sha256:
+            raise RuntimeError(
+                f"generation artifact fingerprint mismatch: {relative_path}"
             )
-            os.close(fd)
+    report_sha256 = _sha256(report_path)
+    relative = os.path.relpath(generation_dir, registry).replace("\\", "/")
+    record = {
+        "generation": generation_dir,
+        "generation_relative": relative,
+        "report": report,
+        "generation_report_sha256": report_sha256,
+    }
+    if require_accepted:
+        gate_path = os.path.join(generation_dir, QUALITY_GATE_FILENAME)
+        with open(gate_path, encoding="utf-8") as handle:
+            quality = json.load(handle)
+        if quality.get("passed") is not True:
+            raise RuntimeError("generation has no passing quality gate")
+        if quality.get("training_run_id") != run_id:
+            raise RuntimeError("quality gate training run mismatch")
+        if quality.get("dataset_sha256") != report.get("dataset_sha256"):
+            raise RuntimeError("quality gate dataset mismatch")
+        if quality.get("profile_sha256") != report.get("profile_sha256"):
+            raise RuntimeError("quality gate profile mismatch")
+        if quality.get("generation_report_sha256") != report_sha256:
+            raise RuntimeError("quality gate generation report mismatch")
+        if quality.get("generation") != relative:
+            raise RuntimeError("quality gate generation path mismatch")
+        record.update(
+            quality=quality,
+            quality_gate_sha256=_sha256(gate_path),
+        )
+    return record
+
+
+def load_active_generation(registry):
+    """Load the accepted active generation; legacy/ungated pointers fail closed."""
+    registry = os.path.abspath(registry)
+    pointer_path = os.path.join(registry, "current.json")
+    with open(pointer_path, encoding="utf-8") as handle:
+        pointer = json.load(handle)
+    if pointer.get("schema_version") != REGISTRY_SCHEMA_VERSION:
+        raise RuntimeError("unsupported or ungated registry pointer schema")
+    relative = pointer.get("generation")
+    if not isinstance(relative, str) or not relative.strip():
+        raise RuntimeError("registry pointer has no generation")
+    record = load_generation(registry, relative, require_accepted=True)
+    report = record["report"]
+    checks = {
+        "training_run_id": report.get("training_run_id"),
+        "dataset_sha256": report.get("dataset_sha256"),
+        "profile_sha256": report.get("profile_sha256"),
+        "strict_full_rows": report.get("strict_full_rows"),
+        "generation_report_sha256": record["generation_report_sha256"],
+        "quality_gate_sha256": record["quality_gate_sha256"],
+        "thresholds_sha256": record["quality"].get("thresholds_sha256"),
+    }
+    for key, expected in checks.items():
+        if pointer.get(key) != expected:
+            raise RuntimeError(f"registry pointer {key} mismatch")
+    record["pointer"] = pointer
+    return record
+
+
+def _remove_compatibility_view(registry):
+    """Remove unsafe flat artifacts now that all readers follow current.json."""
+    registry = os.path.abspath(registry)
+    warnings = []
+    for target in TARGETS:
+        target_dir = os.path.join(registry, target)
+        if os.path.isdir(target_dir):
             try:
-                shutil.copy2(source, staged)
-                os.replace(staged, destination)
-            finally:
-                if os.path.exists(staged):
-                    os.remove(staged)
-    _atomic_json(report, os.path.join(registry, "train_report.json"))
+                shutil.rmtree(target_dir)
+            except OSError as exc:
+                warnings.append(f"{target_dir}: {exc}")
+    for filename in ("train_report.json", "compatibility.json"):
+        path = os.path.join(registry, filename)
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError as exc:
+                warnings.append(f"{path}: {exc}")
+    return warnings
 
 
 def capture_active_generation(registry):
-    """Capture enough metadata to roll back an activation after gate failure."""
+    """Capture a validated accepted generation for explicit administrative rollback."""
     pointer_path = os.path.join(registry, "current.json")
     if not os.path.isfile(pointer_path):
         return None
-    with open(pointer_path, encoding="utf-8") as handle:
-        pointer = json.load(handle)
-    generation = os.path.abspath(os.path.join(registry, pointer["generation"]))
-    with open(
-        os.path.join(generation, "train_report.json"), encoding="utf-8"
-    ) as handle:
-        report = json.load(handle)
-    return {"pointer": pointer, "generation": generation, "report": report}
+    return load_active_generation(registry)
 
 
-def restore_active_generation(registry, captured):
-    """Restore the prior atomic pointer and compatibility view."""
-    pointer_path = os.path.join(registry, "current.json")
-    if captured is None:
-        if os.path.isfile(pointer_path):
-            os.remove(pointer_path)
-        return
-    _atomic_json(captured["pointer"], pointer_path)
-    configured_targets = captured["report"].get("targets")
-    targets = configured_targets if isinstance(configured_targets, list) else list(TARGETS)
-    _install_compatibility_view(
-        registry, captured["generation"], targets, captured["report"]
-    )
+def restore_active_generation(registry, captured, lock_timeout=1):
+    """Restore a validated pointer, removing every unsafe legacy flat artifact."""
+    registry = os.path.abspath(registry)
+    with _registry_lock(registry, timeout=lock_timeout):
+        pointer_path = os.path.join(registry, "current.json")
+        if captured is None:
+            if os.path.isfile(pointer_path):
+                os.remove(pointer_path)
+            _remove_compatibility_view(registry)
+            return
+        record = load_generation(
+            registry, captured["generation"], require_accepted=True
+        )
+        if captured.get("pointer", {}).get("training_run_id") != record[
+            "report"
+        ].get("training_run_id"):
+            raise RuntimeError("captured pointer and generation do not match")
+        _atomic_json(captured["pointer"], pointer_path)
+        _remove_compatibility_view(registry)
 
 
-def discard_inactive_generation(registry, generation):
+def promote_generation(
+    registry, generation, quality, dataset, profile_sha256, thresholds_sha256,
+    expected_pointer=None, lock_timeout=1,
+):
+    """Atomically publish a candidate only after a passing, matching gate.
+
+    This function owns the writer lock.  ``expected_pointer`` should be a token
+    returned by :func:`registry_pointer_token`; a concurrent promotion then
+    fails instead of silently overwriting a newer accepted generation.
+    """
+    registry = os.path.abspath(registry)
+    with _registry_lock(registry, timeout=lock_timeout):
+        if expected_pointer is not None:
+            actual = registry_pointer_token(registry)
+            if actual != expected_pointer:
+                raise RuntimeError("registry pointer changed while candidate was evaluated")
+        record = load_generation(registry, generation, require_accepted=False)
+        report = record["report"]
+        if quality.get("passed") is not True:
+            raise RuntimeError("refusing to promote a failed quality gate")
+        dataset_sha256 = _sha256(dataset)
+        if (
+            quality.get("dataset_sha256") != dataset_sha256
+            or report.get("dataset_sha256") != dataset_sha256
+        ):
+            raise RuntimeError("quality gate dataset_sha256 mismatch")
+        if (
+            not isinstance(profile_sha256, str)
+            or not profile_sha256
+            or quality.get("profile_sha256") != profile_sha256
+            or report.get("profile_sha256") != profile_sha256
+        ):
+            raise RuntimeError("quality gate profile_sha256 mismatch")
+        if (
+            not isinstance(thresholds_sha256, str)
+            or not thresholds_sha256
+            or quality.get("thresholds_sha256") != thresholds_sha256
+        ):
+            raise RuntimeError("quality gate thresholds_sha256 mismatch")
+        checks = {
+            "training_run_id": report.get("training_run_id"),
+            "dataset_sha256": report.get("dataset_sha256"),
+            "profile_sha256": report.get("profile_sha256"),
+            "generation": record["generation_relative"],
+            "generation_report_sha256": record["generation_report_sha256"],
+        }
+        for key, expected in checks.items():
+            if quality.get(key) != expected:
+                raise RuntimeError(f"quality gate {key} mismatch")
+        accepted_quality = dict(quality)
+        accepted_quality.update(
+            schema_version=REGISTRY_SCHEMA_VERSION,
+            accepted_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        gate_path = os.path.join(record["generation"], QUALITY_GATE_FILENAME)
+        _atomic_json(accepted_quality, gate_path)
+        gate_sha256 = _sha256(gate_path)
+        pointer = {
+            "schema_version": REGISTRY_SCHEMA_VERSION,
+            "training_run_id": report["training_run_id"],
+            "generation": record["generation_relative"],
+            "dataset_sha256": report["dataset_sha256"],
+            "profile_sha256": report["profile_sha256"],
+            "strict_full_rows": report["strict_full_rows"],
+            "generation_report_sha256": record["generation_report_sha256"],
+            "quality_gate_sha256": gate_sha256,
+            "thresholds_sha256": accepted_quality["thresholds_sha256"],
+            "activated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        # Readers are pointer-only, so compatibility cleanup is best-effort and
+        # happens before the atomic pointer commit.  current.json is the final
+        # fallible step: if this function raises, the candidate is not active.
+        _remove_compatibility_view(registry)
+        _atomic_json(pointer, os.path.join(registry, "current.json"))
+        return pointer
+
+
+def _discard_inactive_generation_unlocked(registry, generation):
     """Delete only a rejected, inactive generation inside registry/generations."""
     if not generation:
         return
     registry = os.path.abspath(registry)
-    generations_root = os.path.abspath(os.path.join(registry, "generations"))
-    target = os.path.abspath(generation)
-    if os.path.commonpath([target, generations_root]) != generations_root:
-        raise RuntimeError("refusing to discard a generation outside registry")
+    target = _resolve_generation(registry, generation)
     pointer_path = os.path.join(registry, "current.json")
     if os.path.isfile(pointer_path):
-        with open(pointer_path, encoding="utf-8") as handle:
-            active = os.path.abspath(
-                os.path.join(registry, json.load(handle)["generation"])
-            )
+        try:
+            with open(pointer_path, encoding="utf-8") as handle:
+                active = _resolve_generation(
+                    registry, json.load(handle)["generation"]
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "refusing to discard while active pointer is unreadable"
+            ) from exc
         if active == target:
             raise RuntimeError("refusing to discard the active generation")
     if os.path.isdir(target):
         shutil.rmtree(target)
 
 
-def prune_inactive_generations(registry, keep=3, protected_run_ids=()):
+def discard_inactive_generation(registry, generation, lock_timeout=1):
+    """Delete an inactive generation while owning the registry writer lock."""
+    if not generation:
+        return
+    with _registry_lock(registry, timeout=lock_timeout):
+        _discard_inactive_generation_unlocked(registry, generation)
+
+
+def prune_inactive_generations(
+    registry, keep=3, protected_run_ids=(), lock_timeout=1
+):
     """Bound successful registry history without deleting active/AL-pinned runs."""
     registry = os.path.abspath(registry)
+    with _registry_lock(registry, timeout=lock_timeout):
+        return _prune_inactive_generations_unlocked(
+            registry, keep=keep, protected_run_ids=protected_run_ids
+        )
+
+
+def _prune_inactive_generations_unlocked(registry, keep, protected_run_ids):
     generations_root = os.path.join(registry, "generations")
     if not os.path.isdir(generations_root):
         return []
@@ -338,9 +548,125 @@ def prune_inactive_generations(registry, keep=3, protected_run_ids=()):
     for _, path, run_id in inventory:
         if path in keep_paths or run_id in protected:
             continue
-        discard_inactive_generation(registry, path)
+        _discard_inactive_generation_unlocked(registry, path)
         removed.append(path)
     return removed
+
+
+def _build_candidate(args, frame, features, strict_count, targets, family_params_for):
+    """Write one complete generation.  Caller must hold the registry lock."""
+    from quality_contract import load_profile
+
+    registry = args.registry
+    generations = os.path.join(registry, "generations")
+    os.makedirs(generations, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    staging = os.path.join(generations, f".{run_id}.tmp")
+    generation_dir = os.path.join(generations, run_id)
+    os.makedirs(staging, exist_ok=False)
+
+    dataset_sha256 = _sha256(args.dataset)
+    profile_data = load_profile(args.profile)
+    profile_sha256 = hashlib.sha256(
+        json.dumps(
+            profile_data, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    target_reports = {}
+    artifact_sha256 = {}
+    try:
+        for target in targets:
+            if target not in frame.columns:
+                raise RuntimeError(f"required target column is missing: {target}")
+            bundle, metrics = train_target(
+                frame,
+                features,
+                target,
+                TARGETS[target],
+                family_params_for(target),
+                args.weight_col,
+                min_rows=args.min_rows,
+            )
+            if bundle is None:
+                raise RuntimeError(
+                    f"required target {target} cannot be trained: {metrics}"
+                )
+            bundle.update(
+                {
+                    "training_run_id": run_id,
+                    "dataset_sha256": dataset_sha256,
+                    "strict_full_rows": strict_count,
+                    "profile_sha256": profile_sha256,
+                    "feature_schema": list(features),
+                }
+            )
+            target_dir = os.path.join(staging, target)
+            os.makedirs(target_dir, exist_ok=True)
+            model_path = os.path.join(target_dir, "models.pkl")
+            meta_path = os.path.join(target_dir, "meta.json")
+            with open(model_path, "wb") as handle:
+                pickle.dump(bundle, handle)
+            with open(meta_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {key: value for key, value in bundle.items() if key != "models"},
+                    handle,
+                    indent=1,
+                    default=str,
+                )
+            artifact_sha256[f"{target}/models.pkl"] = _sha256(model_path)
+            artifact_sha256[f"{target}/meta.json"] = _sha256(meta_path)
+            target_reports[target] = metrics
+            print(
+                f"{target:32s} R2={metrics['r2']:.4f} "
+                f"MAPE={metrics['mape_pct']:.2f}% "
+                f"P90={metrics['p90_ape_pct']:.2f}% "
+                f"coverage={metrics['interval_coverage']:.3f}"
+            )
+
+        report = {
+            "schema_version": REGISTRY_SCHEMA_VERSION,
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "training_run_id": run_id,
+            "dataset_path": args.dataset,
+            "dataset_sha256": dataset_sha256,
+            "raw_rows": int(len(frame)),
+            "strict_full_rows": strict_count,
+            "profile_path": args.profile,
+            "profile_sha256": profile_sha256,
+            "features": list(features),
+            "targets": list(targets),
+            "artifacts": artifact_sha256,
+            "report": target_reports,
+        }
+        report_path = os.path.join(staging, "train_report.json")
+        _atomic_json(report, report_path)
+        os.replace(staging, generation_dir)
+        relative = os.path.relpath(generation_dir, registry).replace("\\", "/")
+        return {
+            "schema_version": REGISTRY_SCHEMA_VERSION,
+            "training_run_id": run_id,
+            "generation": relative,
+            "generation_path": generation_dir,
+            "generation_report_sha256": _sha256(
+                os.path.join(generation_dir, "train_report.json")
+            ),
+            "dataset_sha256": dataset_sha256,
+            "strict_full_rows": strict_count,
+        }
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def build_candidate(
+    args, frame, features, strict_count, targets, family_params_for,
+    lock_timeout=1,
+):
+    """Build a candidate while owning the registry's sole writer lock."""
+    with _registry_lock(args.registry, timeout=lock_timeout):
+        return _build_candidate(
+            args, frame, features, strict_count, targets, family_params_for
+        )
 
 
 def main():
@@ -352,9 +678,21 @@ def main():
     parser.add_argument("--min-rows", type=int, default=200)
     parser.add_argument("--registry", default=REGISTRY)
     parser.add_argument("--profile", default=None)
+    parser.add_argument("--result-json", default=None)
+    parser.add_argument("--lock-timeout", type=float, default=1.0)
     args = parser.parse_args()
 
-    from quality_contract import annotate_validity, load_profile
+    from quality_contract import annotate_validity
+
+    args.dataset = os.path.abspath(args.dataset)
+    args.registry = os.path.abspath(args.registry)
+    args.profile = os.path.abspath(args.profile) if args.profile else None
+    args.params = os.path.abspath(args.params) if args.params else None
+    args.result_json = (
+        os.path.abspath(args.result_json) if args.result_json else None
+    )
+    if args.lock_timeout < 0:
+        parser.error("lock timeout must be non-negative")
 
     raw = pd.read_parquet(args.dataset)
     frame = to_physical(annotate_validity(raw, args.profile))
@@ -394,100 +732,13 @@ def main():
             f"partial registry generations are forbidden; omitted targets: {omitted}"
         )
 
-    registry = os.path.abspath(args.registry)
-    generations = os.path.join(registry, "generations")
-    os.makedirs(generations, exist_ok=True)
-    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
-    staging = os.path.join(generations, f".{run_id}.tmp")
-    generation_dir = os.path.join(generations, run_id)
-    os.makedirs(staging, exist_ok=False)
-
-    dataset_sha256 = _sha256(args.dataset)
-    profile_data = load_profile(args.profile)
-    profile_sha256 = hashlib.sha256(
-        json.dumps(
-            profile_data, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()
-    target_reports = {}
-    try:
-        for target in targets:
-            if target not in frame.columns:
-                raise RuntimeError(f"required target column is missing: {target}")
-            bundle, metrics = train_target(
-                frame,
-                features,
-                target,
-                TARGETS[target],
-                family_params_for(target),
-                args.weight_col,
-                min_rows=args.min_rows,
-            )
-            if bundle is None:
-                raise RuntimeError(
-                    f"required target {target} cannot be trained: {metrics}"
-                )
-            bundle.update(
-                {
-                    "training_run_id": run_id,
-                    "dataset_sha256": dataset_sha256,
-                    "strict_full_rows": strict_count,
-                    "profile_sha256": profile_sha256,
-                    "feature_schema": list(features),
-                }
-            )
-            target_dir = os.path.join(staging, target)
-            os.makedirs(target_dir, exist_ok=True)
-            with open(os.path.join(target_dir, "models.pkl"), "wb") as handle:
-                pickle.dump(bundle, handle)
-            with open(
-                os.path.join(target_dir, "meta.json"), "w", encoding="utf-8"
-            ) as handle:
-                json.dump(
-                    {key: value for key, value in bundle.items() if key != "models"},
-                    handle,
-                    indent=1,
-                    default=str,
-                )
-            target_reports[target] = metrics
-            print(
-                f"{target:32s} R2={metrics['r2']:.4f} "
-                f"MAPE={metrics['mape_pct']:.2f}% "
-                f"P90={metrics['p90_ape_pct']:.2f}% "
-                f"coverage={metrics['interval_coverage']:.3f}"
-            )
-
-        report = {
-            "time": datetime.now().isoformat(timespec="seconds"),
-            "training_run_id": run_id,
-            "dataset_path": os.path.abspath(args.dataset),
-            "dataset_sha256": dataset_sha256,
-            "raw_rows": int(len(frame)),
-            "strict_full_rows": strict_count,
-            "profile_sha256": profile_sha256,
-            "features": list(features),
-            "targets": list(targets),
-            "report": target_reports,
-        }
-        _atomic_json(report, os.path.join(staging, "train_report.json"))
-        os.replace(staging, generation_dir)
-        pointer = {
-            "schema_version": 1,
-            "training_run_id": run_id,
-            "generation": os.path.relpath(
-                generation_dir, registry
-            ).replace("\\", "/"),
-            "dataset_sha256": dataset_sha256,
-            "strict_full_rows": strict_count,
-            "activated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        _atomic_json(pointer, os.path.join(registry, "current.json"))
-        _install_compatibility_view(
-            registry, generation_dir, targets, report
-        )
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+    candidate = build_candidate(
+        args, frame, features, strict_count, targets, family_params_for,
+        lock_timeout=args.lock_timeout,
+    )
+    if args.result_json:
+        _atomic_json(candidate, args.result_json)
+    print(json.dumps({"candidate_generation": candidate}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

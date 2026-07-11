@@ -2,6 +2,7 @@ param(
     [string]$RuntimeRoot = "Y:\git\MFT_1MW_2026\regression_260707",
     [string]$Dataset = "",
     [string]$OutputRoot = "",
+    [string]$Profile = "",
     [int]$IntervalSeconds = 600,
     [string]$Python = "$HOME\anaconda3\envs\pyaedt2026v1\python.exe",
     [Parameter(Mandatory=$true)]
@@ -22,6 +23,10 @@ $Arguments = @($ScriptPath, "--runtime-root", $RuntimeRoot)
 $Arguments += @("--solver-revision", $SolverRevision, "--library-revision", $LibraryRevision)
 if ($Dataset) { $Arguments += @("--dataset", $Dataset) }
 if ($OutputRoot) { $Arguments += @("--output-root", $OutputRoot) }
+if ($Profile) {
+    $Profile = (Resolve-Path -LiteralPath $Profile).ProviderPath
+    $Arguments += @("--profile", $Profile)
+}
 if ($Execute) { $Arguments += "--execute" }
 
 while ($true) {

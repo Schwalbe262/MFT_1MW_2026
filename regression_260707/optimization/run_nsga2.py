@@ -54,14 +54,19 @@ def _recomputed_strict_full_rows(
     return int(audited["_strict_valid_full"].sum())
 
 
-def load_models(registry=None):
+def load_models(registry=None, generation=None):
     from predictor import EnsemblePredictor
     import predictor as predictor_mod
     reg = registry or predictor_mod.REGISTRY
     models = {}
     for t in REQUIRED_MODEL_TARGETS:
         try:
-            models[t] = EnsemblePredictor.load(t, registry=reg)
+            if generation:
+                models[t] = EnsemblePredictor.load_generation(
+                    t, registry=reg, generation=generation
+                )
+            else:
+                models[t] = EnsemblePredictor.load(t, registry=reg)
         except (FileNotFoundError, OSError):
             pass
     return models
@@ -141,12 +146,13 @@ def main():
         )
     registry_for_models = args.registry
     generation_report = {}
+    pinned_generation = None
     if args.registry_generation:
-        registry_for_models = os.path.abspath(args.registry_generation)
+        pinned_generation = os.path.abspath(args.registry_generation)
         with open(args.quality_status, encoding="utf-8") as handle:
             quality = json.load(handle)
         with open(
-            os.path.join(registry_for_models, "train_report.json"), encoding="utf-8"
+            os.path.join(pinned_generation, "train_report.json"), encoding="utf-8"
         ) as handle:
             generation_report = json.load(handle)
         dataset_sha = _sha256(args.dataset)
@@ -194,10 +200,16 @@ def main():
                 "dataset strict-full cohort does not match quality metadata"
             )
 
-    models = load_models(registry_for_models)
+    models = load_models(registry_for_models, generation=pinned_generation)
     missing = [target for target in REQUIRED_MODEL_TARGETS if target not in models]
     if missing:
         raise SystemExit(f"required model generation is incomplete: {missing}")
+    if pinned_generation:
+        generation_artifact_root = pinned_generation
+    else:
+        from train_models import load_active_generation
+
+        generation_artifact_root = load_active_generation(args.registry)["generation"]
 
     spec = dict(DEFAULT_SPEC)
     if args.spec:
@@ -255,7 +267,7 @@ def main():
 
     model_artifacts = {
         target: {
-            name: _sha256(os.path.join(registry_for_models, target, name))
+            name: _sha256(os.path.join(generation_artifact_root, target, name))
             for name in ("models.pkl", "meta.json")
         }
         for target in REQUIRED_MODEL_TARGETS
@@ -270,9 +282,9 @@ def main():
             "quality_thresholds_sha256": vetted_thresholds_sha256,
             "solver_revision": quality.get("solver_revision"),
             "library_revision": quality.get("library_revision"),
-            "registry_generation": os.path.abspath(registry_for_models),
+            "registry_generation": os.path.abspath(generation_artifact_root),
             "generation_report_sha256": _sha256(os.path.join(
-                registry_for_models, "train_report.json"
+                generation_artifact_root, "train_report.json"
             )),
             "model_artifacts_sha256": model_artifacts,
             "quality_status_sha256": (

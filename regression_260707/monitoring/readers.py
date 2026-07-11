@@ -9,6 +9,7 @@ dashboard.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -96,6 +97,17 @@ def _safe_text(value: Any, limit: int = 500) -> str | None:
         return None
     text = str(value).strip()
     return text[:limit] if text else None
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
 def _parse_time(value: Any, local_tz=None) -> datetime | None:
@@ -651,12 +663,68 @@ class ArtifactService:
 
     def models(self, current_data_count: int | None = None) -> dict[str, Any]:
         registry = self.root / "training" / "registry"
-        report_result = self.cache.json(registry / "train_report.json", {})
+        pointer_result = self.cache.json(registry / "current.json", {})
+        pointer = (
+            pointer_result.value
+            if isinstance(pointer_result.value, dict)
+            else {}
+        )
+        generation = registry / "generations" / "__unavailable__"
+        pointer_warning = pointer_result.warning
+        relative = pointer.get("generation")
+        try:
+            if pointer_warning:
+                raise ValueError("active model pointer is unreadable")
+            candidate = (registry / relative).resolve() if relative else None
+            generations_root = (registry / "generations").resolve()
+            if pointer.get("schema_version") != 2:
+                raise ValueError("accepted schema-v2 model pointer is unavailable")
+            if candidate is None or not candidate.is_relative_to(generations_root):
+                raise ValueError("model pointer escapes generations root")
+            generation = candidate
+        except (OSError, TypeError, ValueError) as exc:
+            pointer_warning = str(exc)
+        report_result = self.cache.json(generation / "train_report.json", {})
+        gate_result = self.cache.json(generation / "quality_gate.json", {})
         curve_result = self.cache.csv(self.root / "training" / "learning_curve.csv", max_rows=200_000)
         report_payload = report_result.value if isinstance(report_result.value, dict) else {}
+        gate_payload = gate_result.value if isinstance(gate_result.value, dict) else {}
         report = report_payload.get("report") if isinstance(report_payload.get("report"), dict) else {}
         curve_rows = curve_result.value if isinstance(curve_result.value, list) else []
-        warnings = self._warnings(report_result, curve_result)
+        warnings = self._warnings(pointer_result, report_result, gate_result, curve_result)
+        evidence_error = pointer_warning or report_result.warning or gate_result.warning
+        if not evidence_error and (
+            _sha256_file(Path(report_result.path))
+            != pointer.get("generation_report_sha256")
+        ):
+            evidence_error = "active generation report fingerprint mismatch"
+        if not evidence_error and (
+            _sha256_file(Path(gate_result.path))
+            != pointer.get("quality_gate_sha256")
+        ):
+            evidence_error = "active generation gate fingerprint mismatch"
+        if pointer_warning:
+            warnings.append(pointer_warning)
+            report = {}
+        elif evidence_error:
+            warnings.append(str(evidence_error))
+            report = {}
+        elif (
+            gate_payload.get("passed") is not True
+            or gate_payload.get("training_run_id") != pointer.get("training_run_id")
+            or report_payload.get("training_run_id") != pointer.get("training_run_id")
+            or gate_payload.get("generation") != pointer.get("generation")
+            or gate_payload.get("generation_report_sha256")
+            != pointer.get("generation_report_sha256")
+            or gate_payload.get("dataset_sha256") != pointer.get("dataset_sha256")
+            or gate_payload.get("profile_sha256") != pointer.get("profile_sha256")
+            or report_payload.get("dataset_sha256") != pointer.get("dataset_sha256")
+            or report_payload.get("profile_sha256") != pointer.get("profile_sha256")
+            or report_payload.get("strict_full_rows")
+            != pointer.get("strict_full_rows")
+        ):
+            warnings.append("active model generation has no matching passing gate")
+            report = {}
         if current_data_count is None:
             current_data_count = self.data()["total_rows"]
 
@@ -681,7 +749,7 @@ class ArtifactService:
         latest_times: list[datetime] = []
         for target in ordered_targets:
             metrics = report.get(target) if isinstance(report.get(target), dict) else None
-            meta_result = self.cache.json(registry / target / "meta.json", {})
+            meta_result = self.cache.json(generation / target / "meta.json", {})
             if meta_result.warning:
                 warnings.append(meta_result.warning)
             meta = meta_result.value if isinstance(meta_result.value, dict) else {}

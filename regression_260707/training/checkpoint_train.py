@@ -7,13 +7,16 @@
 - 사용: python checkpoint_train.py [--full]  (--full 이면 4패밀리 앙상블까지)
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from filelock import FileLock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REGRESSION_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -23,6 +26,30 @@ DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 CURVE_CSV = os.path.join(HERE, "learning_curve.csv")
 MAX_TRUSTED_TEMPERATURE_C = 4700.0
 MIN_TRUSTED_TEMPERATURE_C = -273.15
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _atomic_json(value, path):
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, staged = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp",
+        dir=os.path.dirname(path),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=1, default=str)
+        os.replace(staged, path)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
 
 # 회귀 타겟 (실물 기준 컬럼명, 변환 후)
 TARGETS = {
@@ -150,9 +177,26 @@ def main():
     ap.add_argument("--dataset", default=DATASET)
     ap.add_argument("--curve-csv", default=CURVE_CSV)
     ap.add_argument("--profile", default=None)
+    ap.add_argument("--result-json", default=None)
+    ap.add_argument("--checkpoint", type=int, default=None)
     args = ap.parse_args()
 
-    from quality_contract import annotate_validity
+    from quality_contract import DEFAULT_PROFILE_PATH, annotate_validity, load_profile
+
+    args.dataset = os.path.abspath(args.dataset)
+    args.curve_csv = os.path.abspath(args.curve_csv)
+    args.profile = os.path.abspath(args.profile or DEFAULT_PROFILE_PATH)
+    args.result_json = (
+        os.path.abspath(args.result_json) if args.result_json else None
+    )
+    if args.result_json and args.checkpoint is None:
+        ap.error("--checkpoint is required with --result-json")
+    profile_data = load_profile(args.profile)
+    profile_sha256 = hashlib.sha256(
+        json.dumps(
+            profile_data, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
 
     raw = pd.read_parquet(args.dataset)
     df = annotate_validity(raw, args.profile)
@@ -196,9 +240,23 @@ def main():
     if rows:
         curve = pd.DataFrame(rows)
         os.makedirs(os.path.dirname(os.path.abspath(args.curve_csv)), exist_ok=True)
-        header = not os.path.isfile(args.curve_csv)
-        curve.to_csv(args.curve_csv, mode="a", header=header, index=False)
+        with FileLock(args.curve_csv + ".lock", timeout=1):
+            header = not os.path.isfile(args.curve_csv)
+            curve.to_csv(args.curve_csv, mode="a", header=header, index=False)
         print(f"learning curve appended -> {args.curve_csv}")
+        if args.result_json:
+            _atomic_json({
+                "schema_version": 1,
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "checkpoint": args.checkpoint,
+                "dataset": args.dataset,
+                "dataset_sha256": _sha256(args.dataset),
+                "profile": args.profile,
+                "profile_sha256": profile_sha256,
+                "strict_full_rows": n_total,
+                "features": list(feats),
+                "metrics": rows,
+            }, args.result_json)
     else:
         raise SystemExit("no target has enough strict-full rows for checkpoint metrics")
 

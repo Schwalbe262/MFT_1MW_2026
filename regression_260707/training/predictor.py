@@ -3,7 +3,6 @@
 """
 import os
 import pickle
-import json
 
 import numpy as np
 
@@ -22,19 +21,32 @@ class EnsemblePredictor:
 
     @classmethod
     def load(cls, target, registry=REGISTRY):
-        generation = registry
-        pointer_path = os.path.join(registry, "current.json")
-        if os.path.isfile(pointer_path):
-            with open(pointer_path, encoding="utf-8") as handle:
-                pointer = json.load(handle)
-            relative = pointer.get("generation")
-            if not isinstance(relative, str) or not relative.strip():
-                raise RuntimeError("registry current.json has no generation")
-            generation = os.path.abspath(os.path.join(registry, relative))
-            if os.path.commonpath([generation, os.path.abspath(registry)]) != os.path.abspath(registry):
-                raise RuntimeError("registry generation escapes registry root")
-        with open(os.path.join(generation, target, "models.pkl"), "rb") as f:
-            return cls(pickle.load(f))
+        # There is intentionally no legacy flat-file fallback.  Only an atomic
+        # schema-v2 pointer with matching passing gate evidence is loadable.
+        from train_models import load_active_generation
+
+        active = load_active_generation(registry)
+        return cls._load_record(target, active)
+
+    @classmethod
+    def load_generation(cls, target, registry, generation):
+        """Load an explicitly pinned generation, requiring accepted gate evidence."""
+        from train_models import load_generation
+
+        return cls._load_record(
+            target, load_generation(registry, generation, require_accepted=True)
+        )
+
+    @classmethod
+    def _load_record(cls, target, active):
+        model_path = os.path.join(active["generation"], target, "models.pkl")
+        with open(model_path, "rb") as f:
+            bundle = pickle.load(f)
+        if bundle.get("training_run_id") != active["report"].get("training_run_id"):
+            raise RuntimeError("model bundle does not match active generation")
+        if bundle.get("dataset_sha256") != active["report"].get("dataset_sha256"):
+            raise RuntimeError("model bundle dataset does not match active generation")
+        return cls(bundle)
 
     def predict_mu_sigma(self, X_df, conformal=True):
         """X_df: 특징 프레임 (여분 컬럼 무시). 반환: (mu, sigma) 원공간, sigma는 q90 보정 반폭."""
