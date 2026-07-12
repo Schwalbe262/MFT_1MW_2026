@@ -11,6 +11,7 @@
 """
 import argparse
 import copy
+import glob
 import json
 import math
 import os
@@ -159,18 +160,33 @@ def _authorize_adopted_refill(
         candidate_seed, local_passed, adoption_sha256, initial_count,
         cpus, memory_mb, timeout_seconds, evidence_mode, strict_rows,
         target_strict_rows):
-    """Seal one refill after an authenticated preloaded-250 fleet passes.
+    """Seal one refill for an authenticated adopted or concurrent fleet.
 
     This is deliberately separate from :func:`_authorize_rapid_refill`:
     adopted production evidence is not represented as fictitious p02/p08
-    pilot evidence.
+    pilot evidence.  ``preloaded250_v1`` preserves the reviewed historical
+    250 -> 300 adoption path.  ``concurrent250_v1`` preserves the former
+    controller contract, while ``concurrent300_v1`` is the current continuous
+    mode: it may only maintain exactly 300 logical MFT active tasks and starts
+    from a sealed, empty controller ledger while other MFT revisions already
+    occupy part of that project-level pool.
     """
     if not scheduler_client.campaign_mutation_lock_is_held():
         raise SchedulerError("adopted refill authorization requires the mutation lock")
     if not isinstance(decision, dict) or decision.get("paused"):
         raise SchedulerError("adopted refill decision is absent or paused")
-    if decision.get("target_active") != 300 or decision.get("action") != "refill_300":
-        raise SchedulerError("adopted refill decision must authorize refill_300")
+    target = decision.get("target_active")
+    dynamic_contract = (
+        type(target) is int
+        and 1 <= target <= MFT_PROJECT_MAX_ACTIVE_TASKS
+        and initial_count == 0
+        and evidence_mode == "dynamic_project_cap_v1"
+    )
+    legacy_target = type(target) is int and target in (250, 300, 400)
+    if ((not dynamic_contract and not legacy_target)
+            or decision.get("action") != f"refill_{target}"):
+        raise SchedulerError(
+            "adopted refill decision must authorize its exact bounded target")
     if local_passed is not True:
         raise SchedulerError("adopted refill lacks local3 evidence")
     for revision, label in (
@@ -179,9 +195,23 @@ def _authorize_adopted_refill(
         if (len(revision) != 40 or revision != revision.lower()
                 or any(char not in "0123456789abcdef" for char in revision)):
             raise SchedulerError(f"adopted refill {label} revision is invalid")
-    if type(initial_count) is not int or initial_count != 250:
-        raise SchedulerError("adopted refill requires the exact preloaded-250 cohort")
-    if (evidence_mode != "preloaded250_v1" or type(max_samples) is not int
+    adopted_contract = (initial_count, evidence_mode)
+    if adopted_contract not in (
+            (250, "preloaded250_v1"),
+            (0, "concurrent250_v1"),
+            (0, "concurrent300_v1"),
+            (0, "concurrent400_v1"),
+            (0, "dynamic_project_cap_v1")):
+        raise SchedulerError(
+            "adopted refill requires exact preloaded-250 or concurrent-0 "
+            "cohort/evidence contract")
+    if (not dynamic_contract and (
+            (target == 300 and adopted_contract not in {
+                (250, "preloaded250_v1"), (0, "concurrent300_v1")})
+            or (target == 250 and adopted_contract != (0, "concurrent250_v1"))
+            or (target == 400 and adopted_contract != (0, "concurrent400_v1")))):
+        raise SchedulerError("adopted refill target/evidence contract is invalid")
+    if (type(max_samples) is not int
             or max_samples != 12_000 or type(candidate_seed) is not int
             or candidate_seed != 260710):
         raise SchedulerError("adopted refill campaign contract is invalid")
@@ -205,15 +235,18 @@ def _authorize_adopted_refill(
     if (isinstance(terminal, bool) or not isinstance(terminal, int)
             or isinstance(valid, bool) or not isinstance(valid, int)
             or valid < 0 or valid > terminal
-            or terminal < 20
-            or isinstance(valid_rate, bool)
-            or not isinstance(valid_rate, (int, float))
-            or not math.isfinite(float(valid_rate))
-            or abs(float(valid_rate) - valid / terminal) > 1e-12
-            or float(valid_rate) < 0.90):
+            or (terminal == 0 and valid_rate is not None)
+            or (terminal > 0 and (
+                isinstance(valid_rate, bool)
+                or not isinstance(valid_rate, (int, float))
+                or not math.isfinite(float(valid_rate))
+                or abs(float(valid_rate) - valid / terminal) > 1e-12))):
+        raise SchedulerError("adopted refill production evidence is inconsistent")
+    if ((target in (300, 400) or dynamic_contract)
+            and (terminal < 20 or float(valid_rate) < 0.90)):
         raise SchedulerError("adopted refill lacks fleet20/90% promotion evidence")
     return _AdoptedRefillAuthorization(
-        target=300,
+        target=int(target),
         max_samples=int(max_samples),
         solver_revision=str(solver_revision),
         library_revision=str(library_revision),
@@ -308,7 +341,8 @@ def _step_from_adopted_controller(
 
 def submit(
         name, workdir, params, solver_revision, library_revision, *,
-        cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None):
+        cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None,
+        required_project_cap=None):
     with open(PROFILE_PATH, encoding="utf-8") as stream:
         profile = json.load(stream)
     if timeout_seconds is not None:
@@ -322,6 +356,7 @@ def submit(
         cpus=int(cpus),
         solver_revision=solver_revision,
         library_revision=library_revision,
+        required_project_cap=required_project_cap,
     )
 
 
@@ -340,22 +375,63 @@ def save_state(st):
 def dataset_collection_snapshot():
     """Read master row count and collector judgements in one lock epoch."""
     with FileLock(TRAIN_PARQUET + ".lock", timeout=30):
-        rows = (
-            int(pq.ParquetFile(TRAIN_PARQUET).metadata.num_rows)
-            if os.path.isfile(TRAIN_PARQUET) else 0)
-        if not os.path.isfile(COLLECT_CACHE):
-            return rows, set()
         try:
-            with open(COLLECT_CACHE, encoding="utf-8") as stream:
-                cache = json.load(stream)
-            judged = {
-                int(task_id)
-                for key in ("harvested", "nodata")
-                for task_id in cache.get(key, [])
-            }
+            # Direct open is authoritative on mounted drives; directory
+            # metadata may transiently hide an otherwise readable parquet.
+            rows = int(pq.ParquetFile(TRAIN_PARQUET).metadata.num_rows)
+        except FileNotFoundError:
+            rows = 0
         except (OSError, ValueError, TypeError) as exc:
-            raise SchedulerError(f"collector cache is unreadable: {exc}") from exc
-        return rows, judged
+            raise SchedulerError(f"collector dataset is unreadable: {exc}") from exc
+        canonical_missing = False
+        directory = os.path.dirname(COLLECT_CACHE) or "."
+        basename = os.path.basename(COLLECT_CACHE)
+        # RaiDrive directory metadata can briefly report a false negative even
+        # when the canonical path is directly readable.
+        candidates = [COLLECT_CACHE]
+        recovery = set(glob.glob(COLLECT_CACHE + ".tmp*"))
+        recovery.update(glob.glob(os.path.join(
+            directory, f".{basename}.*.tmp")))
+        recovery.discard(COLLECT_CACHE)
+        def safe_mtime(path):
+            try:
+                return os.path.getmtime(path)
+            except OSError:
+                return -1.0
+
+        recovery = sorted(
+            recovery, key=lambda path: (safe_mtime(path), path), reverse=True)
+        candidates.extend(recovery)
+        errors = []
+        for path in candidates:
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    cache = json.load(stream)
+                if not isinstance(cache, dict):
+                    raise ValueError("cache root must be an object")
+                judged = set()
+                for key in ("harvested", "nodata"):
+                    task_ids = cache.get(key, [])
+                    if not isinstance(task_ids, list):
+                        raise ValueError(f"cache {key} must be a list")
+                    for task_id in task_ids:
+                        if (isinstance(task_id, bool) or not isinstance(task_id, int)
+                                or task_id <= 0):
+                            raise ValueError(f"cache {key} has an invalid task ID")
+                        judged.add(task_id)
+                return rows, judged
+            except FileNotFoundError as exc:
+                if path == COLLECT_CACHE:
+                    canonical_missing = True
+                else:
+                    errors.append(f"{os.path.basename(path)}: {exc}")
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                errors.append(f"{os.path.basename(path)}: {exc}")
+
+        if rows == 0 and canonical_missing and not recovery:
+            return rows, set()
+        detail = "; ".join(errors) if errors else "canonical cache is missing"
+        raise SchedulerError(f"collector cache is unavailable: {detail}")
 
 
 def dataset_row_count():
@@ -440,7 +516,9 @@ def _scheduler_json(path, params=None):
     raise SchedulerError(f"scheduler request failed for {path}: {last_error}")
 
 
-def scheduler_snapshot(required_hard_cap):
+def scheduler_snapshot(
+        required_hard_cap, *, require_exact_project_cap=False,
+        require_full_project=False):
     global_summary = _scheduler_json("/api/tasks/summary")
     allocations = _scheduler_json("/api/allocations")
     projects = _scheduler_json("/api/projects")
@@ -473,9 +551,11 @@ def scheduler_snapshot(required_hard_cap):
     try:
         queue_submission_allowed = queue_allows_demand_submission(
             capacity.get("queue_state"))
-        project_gate = project_submission_snapshot(
+        project_gate = scheduler_client.project_submission_snapshot(
             projects, project_tasks, required_hard_cap,
-            legacy_tasks=legacy_tasks)
+            legacy_tasks=legacy_tasks,
+            require_exact_project_cap=require_exact_project_cap,
+            require_full_project=require_full_project)
     except RuntimeError as exc:
         raise SchedulerError(str(exc)) from exc
     capacity_gate = {
@@ -541,6 +621,8 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     requested_active = int(target) + int(buffer)
     if requested_active > 0 and not scheduler_client.campaign_mutation_lock_is_held():
         raise SchedulerError("campaign refill requires the project mutation lock")
+    rapid_authorized = False
+    adopted_authorized = False
     if requested_active > MAX_STANDALONE_ACTIVE:
         rapid_authorized = (
             isinstance(_rapid_authorization, _RapidRefillAuthorization)
@@ -576,6 +658,13 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             "entered": True,
             "submitted_count": 0,
             "completed": False,
+            "batch_commit": bool(
+                adopted_authorized
+                and _adopted_authorization.evidence_mode
+                in {
+                    "concurrent300_v1", "concurrent400_v1",
+                    "dynamic_project_cap_v1",
+                }),
         })
     st = load_state()
     committed_state = copy.deepcopy(st)
@@ -585,8 +674,14 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         raise SchedulerError(
             f"campaign hard cap {hard_cap} exceeds project maximum "
             f"{MFT_PROJECT_MAX_ACTIVE_TASKS}")
+    dynamic_project_cap = bool(
+        adopted_authorized
+        and _adopted_authorization.evidence_mode == "dynamic_project_cap_v1")
     campaign_counts, global_counts, allocations, capacity_gate = scheduler_snapshot(
-        hard_cap)
+        hard_cap,
+        require_exact_project_cap=dynamic_project_cap,
+        require_full_project=dynamic_project_cap,
+    )
     ready_fit_slots = capacity_gate["ready_fit_slots"]
     campaign_active = sum(campaign_counts.values())
     data_rows, judged_ids = dataset_collection_snapshot()
@@ -679,41 +774,29 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             _refill_journal["stop_reason"] = "no_planned_tasks"
             _refill_journal["completed"] = True
         return False
+    batch_commit = bool(
+        _refill_journal is not None
+        and _refill_journal.get("batch_commit") is True)
+    event_profile = None
+    if _refill_journal is not None:
+        with open(PROFILE_PATH, encoding="utf-8") as stream:
+            event_profile = json.load(stream)
+        if _submit_resources and _submit_resources.get("timeout_seconds") is not None:
+            event_profile["timeout_seconds"] = int(
+                _submit_resources["timeout_seconds"])
+    planned = []
     ok = 0
-    for _ in range(n_new):
-        st["serial"] += 1
-        generation = f"s{solver_revision[:7]}-l{library_revision[:7]}"
-        name = f"mft-camp-{generation}-{st['serial']:05d}"
-        wd = f"mft_c_t{st['serial'] % 500:03d}"  # 500개 디렉토리 풀 재사용 (클론 재활용)
-        next_cursor, raw_index, params = next_valid_candidate(
-            int(st.get("candidate_cursor", 0)), seed=candidate_seed)
-        st["candidate_cursor"] = next_cursor
-        st["candidate_cursors"][candidate_generation] = next_cursor
-        st["candidate_raw_index"] = raw_index
-        event = None
-        if _refill_journal is not None:
-            with open(PROFILE_PATH, encoding="utf-8") as stream:
-                event_profile = json.load(stream)
-            if _submit_resources and _submit_resources.get("timeout_seconds") is not None:
-                event_profile["timeout_seconds"] = int(
-                    _submit_resources["timeout_seconds"])
-            event_identity = scheduler_client.verification_submission_identity(
-                name, params, event_profile, solver_revision, library_revision)
-            event = {
-                "name": name,
-                "candidate_raw_index": int(raw_index),
-                "dedupe_key": event_identity["dedupe_key"],
-                "task_id": None,
-                "accepted_or_reconciled": False,
-                "ledger_committed": False,
-                "uncertain": False,
-            }
-            _refill_journal["events"].append(event)
+
+    def submit_planned(item):
+        nonlocal ok, committed_state
+        event = item["event"]
         try:
             submit_kwargs = dict(_submit_resources or {})
+            if dynamic_project_cap:
+                submit_kwargs["required_project_cap"] = hard_cap
             tid = submit(
-                name, wd, params, solver_revision, library_revision,
-                **submit_kwargs,
+                item["name"], item["workdir"], item["params"],
+                solver_revision, library_revision, **submit_kwargs,
             )
         except Exception as exc:
             if event is not None:
@@ -727,7 +810,7 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             st.clear()
             st.update(copy.deepcopy(committed_state))
             raise SchedulerError(
-                f"scheduler did not return a task ID for {name}; "
+                f"scheduler did not return a task ID for {item['name']}; "
                 "candidate state was not advanced")
         if event is not None:
             event["task_id"] = int(tid)
@@ -736,13 +819,59 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         st["submitted_samples"] += COUNT_PER_TASK
         st.setdefault("outstanding", []).append(tid)
         st.setdefault("task_expected_rows", {})[str(tid)] = COUNT_PER_TASK
-        # Only a durable task ID commits the candidate/name cursor.
-        save_state(st)
-        if event is not None:
-            event["ledger_committed"] = True
-            _refill_journal["submitted_count"] += 1
-        committed_state = copy.deepcopy(st)
+        if not batch_commit:
+            # Legacy modes retain their per-task ledger commit.  The pool400
+            # mode pre-seals the whole batch and commits once below.
+            save_state(st)
+            if event is not None:
+                event["ledger_committed"] = True
+                _refill_journal["submitted_count"] += 1
+            committed_state = copy.deepcopy(st)
         time.sleep(0.3)
+
+    for _ in range(n_new):
+        st["serial"] += 1
+        generation = f"s{solver_revision[:7]}-l{library_revision[:7]}"
+        name = f"mft-camp-{generation}-{st['serial']:05d}"
+        wd = f"mft_c_t{st['serial'] % 500:03d}"  # 500개 디렉토리 풀 재사용 (클론 재활용)
+        next_cursor, raw_index, params = next_valid_candidate(
+            int(st.get("candidate_cursor", 0)), seed=candidate_seed)
+        st["candidate_cursor"] = next_cursor
+        st["candidate_cursors"][candidate_generation] = next_cursor
+        st["candidate_raw_index"] = raw_index
+        event = None
+        if _refill_journal is not None:
+            event_identity = scheduler_client.verification_submission_identity(
+                name, params, event_profile, solver_revision, library_revision)
+            event = {
+                "name": name,
+                "candidate_raw_index": int(raw_index),
+                "dedupe_key": event_identity["dedupe_key"],
+                "task_id": None,
+                "accepted_or_reconciled": False,
+                "ledger_committed": False,
+                "uncertain": False,
+            }
+            _refill_journal["events"].append(event)
+        item = {"name": name, "workdir": wd, "params": params, "event": event}
+        if batch_commit:
+            planned.append(item)
+        else:
+            submit_planned(item)
+    if batch_commit:
+        # All names/cursors/dedupe identities now exist in one in-memory plan.
+        # The controller wrapper persists that full plan before the first POST,
+        # then this loop performs only idempotent scheduler submissions.
+        for item in planned:
+            submit_planned(item)
+        # One immutable feeder generation and one ledger journal generation
+        # commit the complete accepted batch at its boundary.
+        save_state(st)
+        for item in planned:
+            if item["event"] is not None:
+                item["event"]["ledger_committed"] = True
+        _refill_journal["submitted_count"] = ok
+        committed_state = copy.deepcopy(st)
     print(f"[feeder] campaign active {campaign_active} -> +{ok}/{n_new} tasks "
           f"(누적 제출 샘플 {st['submitted_samples']})")
     if _refill_journal is not None:

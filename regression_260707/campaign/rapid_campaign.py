@@ -51,6 +51,10 @@ FLEET_GATE_VALID_RATE = 0.90
 RECENT_WINDOW = 30
 RECENT_MIN_VALID_RATE = 0.70
 REPEATED_ERROR_LIMIT = 3
+# Lifetime failures remain invalid/accounted, but only a current concentration
+# or current trailing streak is evidence of an ongoing runtime outage.
+REPEATED_ERROR_MIN_RECENT_RATIO = 0.20
+REPEATED_ERROR_TRAILING_LIMIT = 3
 DATA_STALL_SECONDS = 90 * 60
 MAX_STANDARD_TIMEOUT_SECONDS = 2 * 60 * 60
 ACTIVE_STATUSES = frozenset(("queued", "attaching", "running"))
@@ -247,6 +251,33 @@ _LEGACY_FAILURE_FIELDS = (
 _LEGACY_FAILURE_FIELD_PATTERN = "|".join(
     re.escape(field) for field in _LEGACY_FAILURE_FIELDS
 )
+_AEDT_SESSION_CLEANUP_MESSAGE = re.compile(
+    rf"^\s*(?:(?:{_LEGACY_FAILURE_FIELD_PATTERN}|stderr_[a-z0-9_]+)\s*=\s*)?"
+    r"(?:(?:PyAEDT\s+)?ERROR:(?:Global:|root:)?\s*)?"
+    r"(?:A\(n\)\s+<class\s+['\"]TypeError['\"]>\s+)?"
+    r"error occurred while retrieving information for the active AEDT sessions:\s*"
+    r"(?:argument of type\s+['\"]NoneType['\"]\s+is not iterable|"
+    r"['\"]NoneType['\"]\s+object is not iterable)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_aedt_session_cleanup_message(message):
+    """Identify the known post-close PyAEDT session-enumeration error."""
+    return _AEDT_SESSION_CLEANUP_MESSAGE.fullmatch(
+        str(message or "").strip()
+    ) is not None
+
+
+def _without_aedt_session_cleanup_lines(message):
+    """Drop post-close cleanup noise without hiding adjacent solve failures."""
+    text = str(message or "").strip()
+    if not text or _is_aedt_session_cleanup_message(text):
+        return ""
+    return "\n".join(
+        line for line in text.splitlines()
+        if not _is_aedt_session_cleanup_message(line)
+    ).strip()
 
 
 def _legacy_failure_payloads(text):
@@ -273,7 +304,7 @@ def _legacy_failure_payloads(text):
 
 
 def _is_informative_runtime_payload(payload):
-    text = str(payload or "").strip()
+    text = _without_aedt_session_cleanup_lines(payload)
     if not text:
         return False
     lowered = re.sub(r"\s+", " ", text.lower()).strip()
@@ -300,6 +331,24 @@ def _is_informative_runtime_message(message):
         _is_informative_runtime_payload(payload)
         for payload in _legacy_failure_payloads(text)
     )
+
+
+def _is_expected_sample_nonconvergence(message):
+    """True for a completed thermal solve that only missed residual limits.
+
+    This remains an invalid training sample and still lowers fleet/recent valid
+    rates.  It is not an infrastructure/runtime fingerprint that should stop
+    the entire campaign merely because several difficult geometries reach the
+    same numerical rejection.
+    """
+    return re.search(
+        r"\[thermal\]\s+solve rejected before extraction:.*"
+        r"\banalyze-call-ok\s*=\s*true\b.*"
+        r"\bconverged\s*=\s*0\b.*"
+        r"\breason\s*=\s*residual_threshold\b",
+        str(message or ""),
+        re.IGNORECASE,
+    ) is not None
 
 
 def _structured_failure_message(task):
@@ -363,16 +412,6 @@ def _stderr_failure_message(stderr):
     return ""
 
 
-def _is_aedt_session_cleanup_message(message):
-    """Identify the known post-close PyAEDT session-enumeration error."""
-    lowered = re.sub(r"\s+", " ", str(message or "").lower()).strip()
-    return (
-        "active aedt sessions" in lowered
-        and "nonetype" in lowered
-        and "not iterable" in lowered
-    )
-
-
 def _fetch_task_stderr(task_id):
     response = requests.get(
         f"{scheduler_client.SCHEDULER}/api/tasks/{int(task_id)}/stderr",
@@ -421,9 +460,246 @@ def error_fingerprint(message):
 
 
 def _runtime_error_fingerprint(message):
+    message = _without_aedt_session_cleanup_lines(message)
     if not _is_informative_runtime_message(message):
         return None
     return error_fingerprint(message)
+
+
+_CANDIDATE_JSON_COMMAND = re.compile(
+    r"printf\s+['\"]%s['\"]\s+['\"](?P<params>\{.*?\})['\"]"
+    r"\s*>\s*cand\.json",
+    re.DOTALL,
+)
+_SINGLETON_RX_VOLUME_MISSING = re.compile(
+    r"\[thermal\]\s+validation failed:\s*"
+    r"field-summary-data\s*=\s*true\s*,\s*"
+    r"required-missing\s*=\s*1\s*,\s*"
+    r"missing-total\s*=\s*2\s*,\s*"
+    r"analyze-call-ok\s*=\s*true\b",
+    re.IGNORECASE,
+)
+_SEALED_B171_SINGLETON_RX_FAILURE_IDS = frozenset((28_522, 28_743, 28_780))
+_SEALED_B171_PREFIX = "mft-camp-sb171c7c-le6b9b9d-"
+_SCHEDULER_CPU_POLICY_CUTOVER_UTC = "2026-07-12 11:00:54"
+_OPERATOR_CANCELLED_STALE_PREPOLICY_LAUNCHES = {
+    28_746: {
+        "name": "mft-camp-sb171c7c-le6b9b9d-18221",
+        "created_at": "2026-07-12 10:59:54",
+        "attached_at": "2026-07-12 11:00:46",
+        "launch_started_at": "2026-07-12 11:00:47",
+        "finished_at": "2026-07-12 14:24:22",
+    },
+    28_747: {
+        "name": "mft-camp-sb171c7c-le6b9b9d-18222",
+        "created_at": "2026-07-12 10:59:58",
+        "attached_at": "2026-07-12 11:00:47",
+        "launch_started_at": "2026-07-12 11:00:48",
+        "finished_at": "2026-07-12 14:24:21",
+    },
+    28_748: {
+        "name": "mft-camp-sb171c7c-le6b9b9d-18223",
+        "created_at": "2026-07-12 11:00:04",
+        "attached_at": "2026-07-12 11:00:48",
+        "launch_started_at": "2026-07-12 11:00:49",
+        "finished_at": "2026-07-12 14:24:21",
+    },
+}
+_SEALED_B171_SOLVER_REVISION = "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
+_SEALED_B171_LIBRARY_REVISION = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+# Exact MFT tasks whose four parent allocations were cancelled together at
+# 2026-07-12 14:39:33Z. A future exit-143 or a different immutable identity
+# must remain an ordinary fail-closed runtime failure.
+_RESOLVED_SCHEDULER_PARENT_CANCEL_ROWS = (
+    (29026, 18395, "53f702e3c9af07e3", 8347, "732197", "n003", "2026-07-12 13:00:59", "2026-07-12 14:43:45"),
+    (29037, 18403, "4f16ea5397bc114e", 8349, "732200", "n002", "2026-07-12 13:01:07", "2026-07-12 14:44:21"),
+    (29038, 18404, "529610606a46c297", 8345, "732195", "n014", "2026-07-12 13:01:06", "2026-07-12 14:44:21"),
+    (29047, 18413, "2ceff7844b9c1a5a", 8346, "732196", "n007", "2026-07-12 13:02:03", "2026-07-12 14:44:21"),
+    (29054, 18419, "99f24eeb3095fc02", 8349, "732200", "n002", "2026-07-12 13:02:08", "2026-07-12 14:44:22"),
+    (29055, 18420, "3a00ff710661030c", 8345, "732195", "n014", "2026-07-12 13:02:09", "2026-07-12 14:44:22"),
+    (29061, 18426, "17502fafe1a5cf20", 8346, "732196", "n007", "2026-07-12 13:03:27", "2026-07-12 14:44:22"),
+    (29069, 18433, "7be075e2aa04ffe4", 8345, "732195", "n014", "2026-07-12 13:03:31", "2026-07-12 14:44:22"),
+    (29075, 18439, "68e5d02c8a759786", 8346, "732196", "n007", "2026-07-12 13:04:24", "2026-07-12 14:44:22"),
+    (29095, 18458, "3f4f3615c476cc35", 8345, "732195", "n014", "2026-07-12 13:05:36", "2026-07-12 14:45:06"),
+    (29096, 18459, "99a65186e107158b", 8346, "732196", "n007", "2026-07-12 13:05:37", "2026-07-12 14:45:06"),
+    (29100, 18463, "471eef1a9e310db9", 8347, "732197", "n003", "2026-07-12 13:07:55", "2026-07-12 14:45:07"),
+    (29106, 18469, "1bb67807e77ed70a", 8349, "732200", "n002", "2026-07-12 13:08:03", "2026-07-12 14:45:07"),
+    (29117, 18480, "a257a621f785c38f", 8349, "732200", "n002", "2026-07-12 13:08:22", "2026-07-12 14:45:07"),
+    (29187, 18500, "fa36454d9cd507c4", 8345, "732195", "n014", "2026-07-12 13:18:16", "2026-07-12 14:46:27"),
+    (29188, 18501, "c2ceb39f453840c7", 8345, "732195", "n014", "2026-07-12 13:18:20", "2026-07-12 14:46:27"),
+    (29191, 18504, "22de86b53098e296", 8346, "732196", "n007", "2026-07-12 13:18:26", "2026-07-12 14:46:27"),
+    (29193, 18506, "afd3a36c48013faf", 8349, "732200", "n002", "2026-07-12 13:18:31", "2026-07-12 14:46:28"),
+    (29194, 18507, "1fdea70e98a4f930", 8349, "732200", "n002", "2026-07-12 13:18:35", "2026-07-12 14:46:28"),
+    (29197, 18510, "4bd495ddb787737c", 8345, "732195", "n014", "2026-07-12 13:20:45", "2026-07-12 14:46:28"),
+    (29264, 18538, "137ff85168b8e059", 8349, "732200", "n002", "2026-07-12 14:05:09", "2026-07-12 14:40:19"),
+    (29266, 18540, "4f1ea95bee191e48", 8349, "732200", "n002", "2026-07-12 14:05:10", "2026-07-12 14:40:19"),
+    (29270, 18544, "f1438518f870fd21", 8349, "732200", "n002", "2026-07-12 14:06:06", "2026-07-12 14:40:20"),
+    (29273, 18547, "129e4e4392e120b9", 8349, "732200", "n002", "2026-07-12 14:06:11", "2026-07-12 14:40:20"),
+    (29290, 18563, "5e6a1ca5623f708b", 8349, "732200", "n002", "2026-07-12 14:15:15", "2026-07-12 14:42:28"),
+    (29295, 18568, "0e664af6168a3e17", 8349, "732200", "n002", "2026-07-12 14:16:41", "2026-07-12 14:42:28"),
+)
+_RESOLVED_SCHEDULER_PARENT_CANCEL_TASKS = {}
+for (_task_id, _serial, _dedupe_suffix, _allocation_id, _slurm_job_id,
+     _node_name, _started_at, _finished_at) in (
+        _RESOLVED_SCHEDULER_PARENT_CANCEL_ROWS):
+    _name = f"{_SEALED_B171_PREFIX}{_serial}"
+    _RESOLVED_SCHEDULER_PARENT_CANCEL_TASKS[_task_id] = {
+        "name": _name,
+        "dedupe_key": (
+            f"mft-al:{_name}:{_SEALED_B171_SOLVER_REVISION}:"
+            f"{_SEALED_B171_LIBRARY_REVISION}:{_dedupe_suffix}"),
+        "allocation_id": _allocation_id,
+        "slurm_job_id": _slurm_job_id,
+        "allocation_node_name": _node_name,
+        "started_at": _started_at,
+        "finished_at": _finished_at,
+    }
+del (_task_id, _serial, _dedupe_suffix, _allocation_id, _slurm_job_id,
+     _node_name, _started_at, _finished_at, _name)
+_SEALED_OLD_TIMEOUT_CONTRACT_ROWS = (
+    (28749, 18224, "e16235f02fdc0064", 8034, "731400", "n046", "2026-07-12 11:04:04", "2026-07-12 15:05:23", "jji0930"),
+    (28773, 18248, "6df3ddc87b54d96f", 8293, "731975", "n116", "2026-07-12 11:05:49", "2026-07-12 15:09:22", "dhj02"),
+    (28789, 18263, "03f494eb3e1a6bae", 8004, "731339", "n041", "2026-07-12 11:05:59", "2026-07-12 15:09:27", "jji0930"),
+    (28819, 18292, "dec009e7dd4152db", 8212, "731735", "n090", "2026-07-12 11:25:25", "2026-07-12 15:28:32", "jji0930"),
+    (28830, 18303, "b18919fa3a1e70b7", 8311, "732022", "n111", "2026-07-12 11:26:20", "2026-07-12 15:29:20", "jji0930"),
+    (28842, 18315, "aa38ecbc17d90435", 8289, "731970", "n082", "2026-07-12 11:27:19", "2026-07-12 15:29:29", "jji0930"),
+)
+_SEALED_OLD_TIMEOUT_CONTRACT_TASKS = {}
+for (_task_id, _serial, _dedupe_suffix, _allocation_id, _slurm_job_id,
+     _node_name, _started_at, _finished_at, _account_name) in (
+        _SEALED_OLD_TIMEOUT_CONTRACT_ROWS):
+    _name = f"{_SEALED_B171_PREFIX}{_serial}"
+    _SEALED_OLD_TIMEOUT_CONTRACT_TASKS[_task_id] = {
+        "name": _name,
+        "dedupe_key": (
+            f"mft-al:{_name}:{_SEALED_B171_SOLVER_REVISION}:"
+            f"{_SEALED_B171_LIBRARY_REVISION}:{_dedupe_suffix}"),
+        "allocation_id": _allocation_id,
+        "slurm_job_id": _slurm_job_id,
+        "allocation_node_name": _node_name,
+        "started_at": _started_at,
+        "finished_at": _finished_at,
+        "account_name": _account_name,
+    }
+del (_task_id, _serial, _dedupe_suffix, _allocation_id, _slurm_job_id,
+     _node_name, _started_at, _finished_at, _account_name, _name)
+
+_FOUR_HOUR_TIMEOUT_MESSAGE = re.compile(
+    r"^(?:failure_message=)?task timed out after 14400s$", re.IGNORECASE,
+)
+
+
+def _scheduler_timestamp(value):
+    text = str(value or "").strip().replace("T", " ")
+    text = text.removesuffix("Z")
+    if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", text):
+        return None
+    return text[:19]
+
+
+def _is_operator_cancelled_stale_prepolicy_launch(task):
+    """Match only the three operator-reviewed stale pre-policy launches."""
+    task_id = task.get("id", task.get("task_id"))
+    expected = _OPERATOR_CANCELLED_STALE_PREPOLICY_LAUNCHES.get(task_id)
+    if expected is None:
+        return False
+    launch_started_at = _scheduler_timestamp(task.get("launch_started_at"))
+    return (
+        all(task.get(field) == value for field, value in expected.items())
+        and task.get("status") == "cancelled"
+        and task.get("started_at") in (None, "")
+        and task.get("exit_code") in (None, "")
+        and task.get("failure_message") in (None, "")
+        and task.get("project") == "MFT_1MW_2026v1"
+        and task.get("account_name") == "r1jae262"
+        and task.get("requested_account_name") == ""
+        and task.get("allocation_id") == 8_019
+        and str(task.get("slurm_job_id") or "") == "731354"
+        and task.get("allocation_node_name") == "n045"
+        and launch_started_at is not None
+        and launch_started_at < _SCHEDULER_CPU_POLICY_CUTOVER_UTC
+    )
+
+
+def _is_resolved_scheduler_parent_cancel_incident(task):
+    """Match only the exact diagnosed four-parent Slurm cancellation burst."""
+    task_id = task.get("id", task.get("task_id"))
+    expected = _RESOLVED_SCHEDULER_PARENT_CANCEL_TASKS.get(task_id)
+    return bool(
+        expected is not None
+        and all(task.get(field) == value for field, value in expected.items())
+        and task.get("status") == "failed"
+        and task.get("exit_code") in (143, "143")
+        and task.get("project") == "MFT_1MW_2026v1"
+        and task.get("account_name") == "dw16"
+        and task.get("requested_account_name") == ""
+        and task.get("scheduling_profile") == "fea_bursty"
+        and task.get("timeout_seconds") in (14_400, "14400")
+    )
+
+
+def _is_sealed_old_timeout_contract_incident(task, message):
+    """Match only six reviewed tasks on allocations born before cutover."""
+    task_id = task.get("id", task.get("task_id"))
+    expected = _SEALED_OLD_TIMEOUT_CONTRACT_TASKS.get(task_id)
+    return bool(
+        expected is not None
+        and all(task.get(field) == value for field, value in expected.items())
+        and task.get("status") == "failed"
+        and task.get("exit_code") in (124, "124")
+        and task.get("project") == "MFT_1MW_2026v1"
+        and task.get("requested_account_name") == ""
+        and task.get("scheduling_profile") == "fea_bursty"
+        and task.get("timeout_seconds") in (14_400, "14400")
+        and _FOUR_HOUR_TIMEOUT_MESSAGE.fullmatch(
+            str(message or "").strip()) is not None
+    )
+
+
+def _expected_failed_sample_reason(task, message):
+    """Classify only sealed, diagnosed b171 failures that remain invalid.
+
+    The invalid result remains fail-closed.  This merely prevents three or
+    more copies of the already diagnosed ``N2_side == 1`` mesh/extraction
+    limitation from being mistaken for a campaign-wide runtime outage.
+    """
+    if _is_operator_cancelled_stale_prepolicy_launch(task):
+        return "operator_cancelled_stale_prepolicy_launch"
+    if _is_resolved_scheduler_parent_cancel_incident(task):
+        return "resolved_scheduler_parent_cancel_incident"
+    if _is_sealed_old_timeout_contract_incident(task, message):
+        return "sealed_old_timeout_contract_incident"
+
+    # These jobs started before the scheduler's allocation-local affinity and
+    # adaptive admission policy was activated.  Their late four-hour timeout
+    # arrivals are invalid data, but cannot diagnose the post-cutover runtime
+    # cohort.  Future or timestamp-less timeouts remain stopping failures.
+    started_at = _scheduler_timestamp(task.get("started_at"))
+    if (str(task.get("name") or "").startswith(_SEALED_B171_PREFIX)
+            and task.get("exit_code") in (124, "124")
+            and _FOUR_HOUR_TIMEOUT_MESSAGE.fullmatch(str(message or "").strip())
+            and started_at is not None
+            and started_at < _SCHEDULER_CPU_POLICY_CUTOVER_UTC):
+        return "scheduler_prepolicy_timeout"
+
+    if _SINGLETON_RX_VOLUME_MISSING.search(str(message or "")) is None:
+        return None
+    # The scheduler list API deliberately omits command payloads.  These exact
+    # three identities were independently audited against their stored
+    # ``cand.json`` commands and all have N2_side == 1.  The allow-list is
+    # incident-specific; any later extraction omission still stops refill.
+    task_id = task.get("id", task.get("task_id"))
+    if task_id in _SEALED_B171_SINGLETON_RX_FAILURE_IDS:
+        return "singleton_rx_side_volume_missing"
+    match = _CANDIDATE_JSON_COMMAND.search(str(task.get("command") or ""))
+    if match is None:
+        return None
+    try:
+        params = json.loads(match.group("params"))
+        n2_side = int(params.get("N2_side"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return "singleton_rx_side_volume_missing" if n2_side == 1 else None
 
 
 def _refresh_failure_outcome(outcome, task):
@@ -435,8 +711,10 @@ def _refresh_failure_outcome(outcome, task):
     else:
         message = _failure_message(task, allow_stderr=status == "failed")
     outcome["error_message"] = message
+    outcome["expected_failure_reason"] = _expected_failed_sample_reason(
+        task, message) if status in ("failed", "cancelled") else None
     outcome["error_fingerprint"] = (
-        _runtime_error_fingerprint(message)
+        None if outcome["expected_failure_reason"] else _runtime_error_fingerprint(message)
         if status == "failed" else None
     )
     return outcome
@@ -616,18 +894,58 @@ def _production_gate_reasons(production):
             "revision_mismatch_detected:" + ",".join(
                 str(item["task_id"]) for item in revision_mismatches))
 
-    fingerprints = Counter(
-        item["error_fingerprint"] for item in outcomes
-        if (item["error_fingerprint"]
-            and _is_informative_runtime_message(item.get("error_message"))))
+    # A pre-policy task can finish hours after the scheduler cutover and land
+    # inside the newest terminal window even though it says nothing about the
+    # health of the current runtime policy.  It remains an invalid sample for
+    # dataset/accounting purposes, but must not displace a post-cutover outcome
+    # in this current-runtime health gate.  No other expected or failed sample
+    # is excluded here.
+    current_runtime_outcomes = [
+        item for item in outcomes
+        if item.get("expected_failure_reason") not in {
+            "scheduler_prepolicy_timeout",
+            "operator_cancelled_stale_prepolicy_launch",
+            "resolved_scheduler_parent_cancel_incident",
+            "sealed_old_timeout_contract_incident",
+        }
+    ]
+    recent = current_runtime_outcomes[-RECENT_WINDOW:]
+
+    def informative_fingerprint(item):
+        fingerprint = item["error_fingerprint"]
+        message = item.get("error_message")
+        if (fingerprint
+                and _is_informative_runtime_message(message)
+                and not _is_expected_sample_nonconvergence(message)):
+            return fingerprint
+        return None
+
+    fingerprints = Counter(filter(None, (
+        informative_fingerprint(item) for item in recent)))
+    trailing_fingerprint = None
+    trailing_count = 0
+    for item in reversed(recent):
+        fingerprint = informative_fingerprint(item)
+        if fingerprint is None:
+            break
+        if trailing_fingerprint is None:
+            trailing_fingerprint = fingerprint
+        elif fingerprint != trailing_fingerprint:
+            break
+        trailing_count += 1
     repeated = sorted(
-        (fingerprint, count) for fingerprint, count in fingerprints.items()
-        if count >= REPEATED_ERROR_LIMIT)
+        (fingerprint, count)
+        for fingerprint, count in fingerprints.items()
+        if (count >= REPEATED_ERROR_LIMIT
+            and (
+                count / len(recent) >= REPEATED_ERROR_MIN_RECENT_RATIO
+                or (fingerprint == trailing_fingerprint
+                    and trailing_count >= REPEATED_ERROR_TRAILING_LIMIT)
+            )))
     for fingerprint, count in repeated:
         reasons.append(f"repeated_runtime_error:{fingerprint}:{count}")
 
-    if len(outcomes) >= RECENT_WINDOW:
-        recent = outcomes[-RECENT_WINDOW:]
+    if len(current_runtime_outcomes) >= RECENT_WINDOW:
         valid_rate = sum(item["state"] == "valid" for item in recent) / RECENT_WINDOW
         if valid_rate < RECENT_MIN_VALID_RATE:
             reasons.append(

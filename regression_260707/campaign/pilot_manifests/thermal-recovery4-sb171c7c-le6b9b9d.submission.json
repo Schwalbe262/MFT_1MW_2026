@@ -1,0 +1,196 @@
+{
+  "capacity_after": {
+    "legacy_active": 0,
+    "legacy_counts": {
+      "attaching": 0,
+      "queued": 0,
+      "running": 0
+    },
+    "project": "MFT_1MW_2026v1",
+    "project_active": 223,
+    "project_counts": {
+      "attaching": 0,
+      "queued": 37,
+      "running": 186
+    },
+    "project_max_active_tasks": 300,
+    "project_required_hard_cap": 300,
+    "project_server_open_slots": 77,
+    "project_stage_open_slots": 77,
+    "project_submission_slots": 77,
+    "project_tagged_active": 223,
+    "project_tagged_counts": {
+      "attaching": 0,
+      "queued": 37,
+      "running": 186
+    }
+  },
+  "capacity_before": {
+    "legacy_active": 0,
+    "legacy_counts": {
+      "attaching": 0,
+      "queued": 0,
+      "running": 0
+    },
+    "project": "MFT_1MW_2026v1",
+    "project_active": 219,
+    "project_counts": {
+      "attaching": 0,
+      "queued": 33,
+      "running": 186
+    },
+    "project_max_active_tasks": 300,
+    "project_required_hard_cap": 300,
+    "project_server_open_slots": 81,
+    "project_stage_open_slots": 81,
+    "project_submission_slots": 81,
+    "project_tagged_active": 219,
+    "project_tagged_counts": {
+      "attaching": 0,
+      "queued": 33,
+      "running": 186
+    }
+  },
+  "completed_at": "2026-07-12T01:37:58+00:00",
+  "created_at": "2026-07-12T01:37:51+00:00",
+  "deployment": {
+    "library": {
+      "refs": [
+        "refs/heads/pyaedt_022"
+      ],
+      "repo_root": "\\\\RaiDrive-peets\\ANSYS\\git\\pyaedt_library_mft_clean",
+      "revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+    },
+    "solver": {
+      "refs": [
+        "refs/heads/fix/mft-rx-block-fastpath-260712",
+        "refs/heads/stabilize/mft-sim-260710"
+      ],
+      "repo_root": "\\\\RaiDrive-peets\\ANSYS\\git\\MFT_1MW_2026",
+      "revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
+    }
+  },
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+  "plan": "\\\\RaiDrive-peets\\ANSYS\\git\\MFT_1MW_2026\\regression_260707\\campaign\\pilot_manifests\\thermal-recovery4-sb171c7c-le6b9b9d.json",
+  "resources": {
+    "cpus": 4,
+    "env_profile": "pyaedt2026v1",
+    "gpus": 0,
+    "memory_mb": 65536,
+    "priority": 0,
+    "project": "MFT_1MW_2026v1",
+    "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs",
+    "required_capability": "conda:pyaedt2026v1",
+    "scheduling_profile": "fea_bursty",
+    "timeout_seconds": 14400
+  },
+  "root_reviewed_plan_sha256": "3e453deb61137c2d29c13bbbe8d5117b4c4111e5ea7e255d37dfd0d5e4444af5",
+  "scheduler_mutation_count": 4,
+  "schema": "thermal-recovery4-submission-v1",
+  "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+  "submission_policy": "all-four-in-one-mutation-lock-no-cancellation",
+  "submission_sha256": "fa951faa0cd29c3502e511f827ff0fc2573facc1413c76fb1ad3db0f689d5abc",
+  "task_count": 4,
+  "tasks": [
+    {
+      "dedupe_key": "mft-al:mft-recovery4-sb171c7c-le6b9b9d-01-src27794:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:65bde1bb0b4f91d5",
+      "name": "mft-recovery4-sb171c7c-le6b9b9d-01-src27794",
+      "ordinal": 1,
+      "recovered": false,
+      "scheduler_metadata": {
+        "cpus": 4,
+        "created_at": "2026-07-12 01:37:52",
+        "dedupe_key": "mft-al:mft-recovery4-sb171c7c-le6b9b9d-01-src27794:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:65bde1bb0b4f91d5",
+        "env_profile": "pyaedt2026v1",
+        "gpus": 0,
+        "id": 28077,
+        "memory_mb": 65536,
+        "name": "mft-recovery4-sb171c7c-le6b9b9d-01-src27794",
+        "project": "MFT_1MW_2026v1",
+        "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs",
+        "required_capability": "conda:pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "status": "queued",
+        "timeout_seconds": 14400
+      },
+      "source_task_id": 27794,
+      "submitted_at": "2026-07-12T01:37:52+00:00",
+      "task_id": 28077
+    },
+    {
+      "dedupe_key": "mft-al:mft-recovery4-sb171c7c-le6b9b9d-02-src27928:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:8295238ff8f2b594",
+      "name": "mft-recovery4-sb171c7c-le6b9b9d-02-src27928",
+      "ordinal": 2,
+      "recovered": false,
+      "scheduler_metadata": {
+        "cpus": 4,
+        "created_at": "2026-07-12 01:37:54",
+        "dedupe_key": "mft-al:mft-recovery4-sb171c7c-le6b9b9d-02-src27928:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:8295238ff8f2b594",
+        "env_profile": "pyaedt2026v1",
+        "gpus": 0,
+        "id": 28078,
+        "memory_mb": 65536,
+        "name": "mft-recovery4-sb171c7c-le6b9b9d-02-src27928",
+        "project": "MFT_1MW_2026v1",
+        "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs",
+        "required_capability": "conda:pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "status": "queued",
+        "timeout_seconds": 14400
+      },
+      "source_task_id": 27928,
+      "submitted_at": "2026-07-12T01:37:54+00:00",
+      "task_id": 28078
+    },
+    {
+      "dedupe_key": "mft-al:mft-recovery4-sb171c7c-le6b9b9d-03-src27880:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:5e9faf4159f56675",
+      "name": "mft-recovery4-sb171c7c-le6b9b9d-03-src27880",
+      "ordinal": 3,
+      "recovered": false,
+      "scheduler_metadata": {
+        "cpus": 4,
+        "created_at": "2026-07-12 01:37:56",
+        "dedupe_key": "mft-al:mft-recovery4-sb171c7c-le6b9b9d-03-src27880:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:5e9faf4159f56675",
+        "env_profile": "pyaedt2026v1",
+        "gpus": 0,
+        "id": 28079,
+        "memory_mb": 65536,
+        "name": "mft-recovery4-sb171c7c-le6b9b9d-03-src27880",
+        "project": "MFT_1MW_2026v1",
+        "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs",
+        "required_capability": "conda:pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "status": "queued",
+        "timeout_seconds": 14400
+      },
+      "source_task_id": 27880,
+      "submitted_at": "2026-07-12T01:37:56+00:00",
+      "task_id": 28079
+    },
+    {
+      "dedupe_key": "mft-al:mft-recovery4-sb171c7c-le6b9b9d-04-src27758:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:864554c785d42d74",
+      "name": "mft-recovery4-sb171c7c-le6b9b9d-04-src27758",
+      "ordinal": 4,
+      "recovered": false,
+      "scheduler_metadata": {
+        "cpus": 4,
+        "created_at": "2026-07-12 01:37:57",
+        "dedupe_key": "mft-al:mft-recovery4-sb171c7c-le6b9b9d-04-src27758:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:864554c785d42d74",
+        "env_profile": "pyaedt2026v1",
+        "gpus": 0,
+        "id": 28080,
+        "memory_mb": 65536,
+        "name": "mft-recovery4-sb171c7c-le6b9b9d-04-src27758",
+        "project": "MFT_1MW_2026v1",
+        "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs",
+        "required_capability": "conda:pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "status": "queued",
+        "timeout_seconds": 14400
+      },
+      "source_task_id": 27758,
+      "submitted_at": "2026-07-12T01:37:57+00:00",
+      "task_id": 28080
+    }
+  ]
+}

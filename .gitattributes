@@ -1,2 +1,10 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Reviewed controller artifacts are byte-sealed; never normalize line endings.
+regression_260707/campaign/pilot_manifests/production300-sb171c7c-le6b9b9d-seed260710-cursor2795.json binary
+regression_260707/campaign/pilot_manifests/replacement-s754923c-le6b9b9d-seed260710-cursor1843.json binary
+regression_260707/campaign/pilot_manifests/replacement-s754923c-le6b9b9d-seed260710-cursor1843.journal.json binary
+regression_260707/campaign/pilot_manifests/thermal-recovery4-sb171c7c-le6b9b9d.json binary
+regression_260707/campaign/pilot_manifests/thermal-recovery4-sb171c7c-le6b9b9d.submission.json binary
+regression_260707/campaign/pilot_manifests/target-rollback-pool400-to300-20260713.json binary

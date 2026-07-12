@@ -16,11 +16,51 @@ from pathlib import Path
 import requests
 from filelock import FileLock
 
+try:
+    from ..model_targets import CORE_REGION_TEMPERATURE_TARGETS
+except ImportError:
+    from model_targets import CORE_REGION_TEMPERATURE_TARGETS
+
 SCHEDULER = "http://127.0.0.1:8000"
 MFT_PROJECT = "MFT_1MW_2026v1"
 MFT_PROJECT_MAX_ACTIVE_TASKS = 300
 MFT_ACTIVE_STATUSES = ("queued", "attaching", "running")
 LEGACY_MFT_NAME_PREFIX = "mft-"
+MFT_PROJECT_REPOS = [
+    {
+        "url": "https://github.com/Schwalbe262/MFT_1MW_2026.git",
+        "ref": "main",
+        "subdir": "MFT_1MW_2026",
+    },
+    {
+        "url": "https://github.com/Schwalbe262/pyaedt_library.git",
+        "ref": "main",
+    },
+]
+MFT_PROJECT_SETUP = (
+    "source /etc/profile.d/lmod.sh 2>/dev/null || true\n"
+    "module load ansys-electronics/v252 2>/dev/null || "
+    "export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64\n"
+    "export FLEXLM_TIMEOUT=3000000"
+)
+MFT_PROJECT_ENTRYPOINTS = [
+    {
+        "path": "run_simulation_260706.py",
+        "conda_env": "pyaedt2026v1",
+        "workdir": "MFT_1MW_2026",
+    },
+    {
+        "path": "run_campaign.py",
+        "conda_env": "pyaedt2026v1",
+        "workdir": "MFT_1MW_2026",
+    },
+]
+MFT_PROJECT_CLEANUP_GLOBS = "*.aedtresults"
+MFT_PROJECT_OUTPUT_GLOBS = (
+    "simulation_results_*.csv,failed_samples_260706.jsonl,"
+    "results_parts_260706/*.parquet"
+)
+MFT_PROJECT_SIM_SUBDIR = "simulation"
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "").strip()
 if not _LOCALAPPDATA:
     _LOCALAPPDATA = str(Path.home() / "AppData" / "Local")
@@ -65,6 +105,7 @@ MANDATORY_TEMPERATURE_COLUMNS = (
     "Tprobe_Tx_leeward_max",
     "Tprobe_Rx_main_leeward_max",
     "Tprobe_core_center_max",
+    *CORE_REGION_TEMPERATURE_TARGETS,
 )
 SIDE_TEMPERATURE_COLUMNS = (
     "T_max_Rx_side",
@@ -121,8 +162,9 @@ def campaign_mutation_lock_is_held():
     return int(getattr(_CAMPAIGN_LOCK_STATE, "depth", 0)) > 0
 
 
-def validate_project_mutation_contract(project):
-    """Require the exact live project contract used by every MFT submission."""
+def validate_project_mutation_contract(
+        project, *, expected_cap=None, require_full=False):
+    """Validate the bounded target and optionally every mutation field."""
     if not isinstance(project, dict):
         raise ProjectContractError("scheduler returned an invalid MFT project")
     if str(project.get("name") or "").strip() != MFT_PROJECT:
@@ -133,21 +175,49 @@ def validate_project_mutation_contract(project):
         raise ProjectContractError(
             "scheduler MFT project max_active_tasks is invalid")
     cap = raw_cap
-    if cap != MFT_PROJECT_MAX_ACTIVE_TASKS:
+    if not 1 <= cap <= MFT_PROJECT_MAX_ACTIVE_TASKS:
         raise ProjectContractError(
-            f"scheduler MFT project max_active_tasks must be exactly "
-            f"{MFT_PROJECT_MAX_ACTIVE_TASKS}, got {cap}")
+            "scheduler MFT project max_active_tasks must be an integer "
+            f"between 1 and {MFT_PROJECT_MAX_ACTIVE_TASKS}, got {cap}")
+    if expected_cap is not None:
+        if (isinstance(expected_cap, bool)
+                or not isinstance(expected_cap, int)
+                or not 1 <= expected_cap <= MFT_PROJECT_MAX_ACTIVE_TASKS):
+            raise ProjectContractError("expected MFT project cap is invalid")
+        if cap != expected_cap:
+            raise ProjectContractError(
+                f"scheduler MFT project cap changed: expected "
+                f"{expected_cap}, got {cap}")
     if project.get("auto_pull") is not False:
         raise ProjectContractError(
             "scheduler MFT project auto_pull must be exactly false")
-    return {
+    if require_full:
+        full_checks = {
+            "repos": project.get("repos") == MFT_PROJECT_REPOS,
+            "setup": project.get("setup") == MFT_PROJECT_SETUP,
+            "entrypoints": project.get("entrypoints") == MFT_PROJECT_ENTRYPOINTS,
+            "cleanup_globs": project.get("cleanup_globs")
+                == MFT_PROJECT_CLEANUP_GLOBS,
+            "output_globs": project.get("output_globs")
+                == MFT_PROJECT_OUTPUT_GLOBS,
+            "sim_subdir": project.get("sim_subdir")
+                == MFT_PROJECT_SIM_SUBDIR,
+        }
+        if not all(full_checks.values()):
+            raise ProjectContractError(
+                f"scheduler MFT project mutation fields drifted: {full_checks}")
+    contract = {
         "name": MFT_PROJECT,
         "max_active_tasks": cap,
         "auto_pull": False,
     }
+    if project.get("updated_at") is not None:
+        contract["updated_at"] = project.get("updated_at")
+    return contract
 
 
-def require_live_project_mutation_contract():
+def require_live_project_mutation_contract(
+        *, expected_cap=None, require_full=False):
     """Read and validate the live project immediately before a task POST."""
     try:
         response = requests.get(
@@ -157,11 +227,13 @@ def require_live_project_mutation_contract():
     except Exception as exc:
         raise ProjectContractError(
             f"failed to read scheduler project {MFT_PROJECT!r}: {exc}") from exc
-    return validate_project_mutation_contract(project)
+    return validate_project_mutation_contract(
+        project, expected_cap=expected_cap, require_full=require_full)
 
 
 def project_submission_snapshot(
-        projects, project_tasks, required_hard_cap, legacy_tasks=None):
+        projects, project_tasks, required_hard_cap, legacy_tasks=None, *,
+        require_exact_project_cap=False, require_full_project=False):
     """Count tagged and projectless legacy MFT demand without double counting."""
     if isinstance(required_hard_cap, bool) or not isinstance(required_hard_cap, int):
         raise ProjectCapacityError("MFT project hard cap must be a positive integer")
@@ -179,7 +251,11 @@ def project_submission_snapshot(
     if len(matches) != 1:
         raise ProjectCapacityError(
             f"scheduler project {MFT_PROJECT!r} is missing or ambiguous")
-    project_contract = validate_project_mutation_contract(matches[0])
+    project_contract = validate_project_mutation_contract(
+        matches[0],
+        expected_cap=(required_hard_cap if require_exact_project_cap else None),
+        require_full=require_full_project,
+    )
     if not isinstance(project_tasks, list):
         raise ProjectCapacityError(
             "scheduler returned an invalid MFT project task inventory")
@@ -277,12 +353,17 @@ def _task_rows(response, source):
     return rows
 
 
-def live_project_submission_snapshot(required_hard_cap=MFT_PROJECT_MAX_ACTIVE_TASKS):
+def live_project_submission_snapshot(
+        required_hard_cap=MFT_PROJECT_MAX_ACTIVE_TASKS, *,
+        require_exact_project_cap=False, require_full_project=False):
     """Read the absolute logical-project budget while the mutation lock is held."""
     if not campaign_mutation_lock_is_held():
         raise ProjectCapacityError(
             "MFT project capacity must be checked under the campaign mutation lock")
-    project = require_live_project_mutation_contract()
+    project = require_live_project_mutation_contract(
+        expected_cap=(required_hard_cap if require_exact_project_cap else None),
+        require_full=require_full_project,
+    )
     statuses = ",".join(MFT_ACTIVE_STATUSES)
     try:
         project_tasks = _task_rows(requests.get(
@@ -309,7 +390,11 @@ def live_project_submission_snapshot(required_hard_cap=MFT_PROJECT_MAX_ACTIVE_TA
         raise ProjectCapacityError(
             f"failed to read MFT project task capacity: {exc}") from exc
     return project_submission_snapshot(
-        [project], project_tasks, required_hard_cap, legacy_tasks=legacy_tasks)
+        [project], project_tasks, required_hard_cap, legacy_tasks=legacy_tasks,
+        require_exact_project_cap=require_exact_project_cap,
+        # Full raw record was authenticated by the live contract read above.
+        require_full_project=False,
+    )
 
 
 def reconcile_task_id(name, dedupe_key, attempts=3, retry_delay=1):
@@ -415,25 +500,29 @@ def verification_dedupe_key(
 
 def submit_verification(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
-        solver_revision=None, library_revision=None):
+        solver_revision=None, library_revision=None,
+        required_project_cap=None):
     """Submit one MFT task under the shared cross-process mutation lock."""
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
             name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
             solver_revision=solver_revision,
             library_revision=library_revision,
+            required_project_cap=required_project_cap,
         )
     with campaign_mutation_lock():
         return _submit_verification_locked(
             name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
             solver_revision=solver_revision,
             library_revision=library_revision,
+            required_project_cap=required_project_cap,
         )
 
 
 def _submit_verification_locked(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
-        solver_revision=None, library_revision=None):
+        solver_revision=None, library_revision=None,
+        required_project_cap=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
@@ -545,11 +634,29 @@ def _submit_verification_locked(
     existing = reconcile_task_id(name, dedupe_key)
     if existing is not None:
         return existing
-    capacity = live_project_submission_snapshot(MFT_PROJECT_MAX_ACTIVE_TASKS)
+    if required_project_cap is None:
+        required_hard_cap = MFT_PROJECT_MAX_ACTIVE_TASKS
+        require_exact_project_cap = False
+    else:
+        if (isinstance(required_project_cap, bool)
+                or not isinstance(required_project_cap, int)
+                or not 1 <= required_project_cap
+                <= MFT_PROJECT_MAX_ACTIVE_TASKS):
+            raise ProjectContractError("required project cap is invalid")
+        required_hard_cap = required_project_cap
+        require_exact_project_cap = True
+    if require_exact_project_cap:
+        capacity = live_project_submission_snapshot(
+            required_hard_cap,
+            require_exact_project_cap=True,
+            require_full_project=True,
+        )
+    else:
+        capacity = live_project_submission_snapshot(required_hard_cap)
     if capacity["project_submission_slots"] < 1:
         raise ProjectCapacityError(
             f"MFT project has no submission slots under cap "
-            f"{MFT_PROJECT_MAX_ACTIVE_TASKS}: {capacity}")
+            f"{required_hard_cap}: {capacity}")
     try:
         r = requests.post(f"{SCHEDULER}/api/tasks", json=payload, timeout=20)
     except Exception as post_error:
@@ -596,6 +703,49 @@ def cancel(task_id):
         requests.post(f"{SCHEDULER}/tasks/{task_id}/cancel", timeout=10)
     except Exception:
         pass
+
+
+def cancel_queued_tasks_cas(task_ids):
+    """Cancel only exact task IDs that are still queued."""
+    if not campaign_mutation_lock_is_held():
+        raise RuntimeError("MFT queued cancellation requires the mutation lock")
+    if not isinstance(task_ids, (list, tuple)) or not task_ids:
+        raise ValueError("queued cancellation requires at least one task ID")
+    normalized = []
+    for task_id in task_ids:
+        if (isinstance(task_id, bool) or not isinstance(task_id, int)
+                or task_id <= 0 or task_id in normalized):
+            raise ValueError("queued cancellation task IDs are invalid/duplicate")
+        normalized.append(task_id)
+    try:
+        response = requests.post(
+            f"{SCHEDULER}/api/tasks/cancel",
+            params={
+                "task_ids": ",".join(map(str, normalized)),
+                "statuses": "queued",
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        raise TaskSubmissionUncertain(
+            f"queued-only cancellation response is uncertain: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ProjectContractError(
+            "scheduler queued cancellation acknowledgement is invalid")
+    cancelled = payload.get("cancelled")
+    count = payload.get("count")
+    if (not isinstance(cancelled, list)
+            or any(isinstance(item, bool) or not isinstance(item, int)
+                   for item in cancelled)
+            or len(cancelled) != len(set(cancelled))
+            or not set(cancelled).issubset(normalized)
+            or isinstance(count, bool) or not isinstance(count, int)
+            or count != len(cancelled)):
+        raise ProjectContractError(
+            "scheduler queued cancellation acknowledgement is inconsistent")
+    return {"cancelled": sorted(cancelled), "count": count}
 
 
 def _finite(result, key):
