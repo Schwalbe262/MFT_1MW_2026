@@ -176,14 +176,17 @@ _NATIVE_CORE_REGION_ORDER = (
 )
 
 
-def _native_core_report_plan(core_groups, sym_cut_counter):
-    """Validate native five-piece groups and batch B**y reports by cut count.
+def _native_core_report_plan(
+        core_groups, sym_cut_counter, *, require_complete_groups=False):
+    """Validate native core coverage and batch B**y reports by cut count.
 
     AEDT 2025.2 can leave its Fields calculator unable to register a second
     grouped ``ComplxPeak/Pow`` expression after the intervening per-piece B
     reports.  Native segmented cores have the same physical restoration
-    factor for every piece with the same symmetry-cut count, so one expression
-    per cut class is mathematically identical and avoids that failing sequence.
+    factor for every retained piece with the same symmetry-cut count, so one
+    expression per cut class is mathematically identical and avoids that
+    failing sequence.  Full models require all five canonical pieces; symmetry
+    models cover the exact surviving subset after the geometry split.
     """
     ordered_groups = []
     all_names = []
@@ -202,16 +205,21 @@ def _native_core_report_plan(core_groups, sym_cut_counter):
             f"core_{group_index}_{region}"
             for region in _NATIVE_CORE_REGION_ORDER
         )
-        missing = sorted(set(expected_names) - set(by_name))
         unexpected = sorted(set(by_name) - set(expected_names))
-        if missing or unexpected:
+        missing = sorted(set(expected_names) - set(by_name))
+        if unexpected or (require_complete_groups and missing):
             raise RuntimeError(
                 "native core report coverage mismatch for group "
                 f"{group_index}: missing={missing}, unexpected={unexpected}"
             )
 
-        ordered_pieces = tuple(by_name[name] for name in expected_names)
-        cut_counts = {int(sym_cut_counter(name)) for name in expected_names}
+        retained_names = tuple(name for name in expected_names if name in by_name)
+        if not retained_names:
+            raise RuntimeError(
+                f"native core report group {group_index} has no retained objects"
+            )
+        ordered_pieces = tuple(by_name[name] for name in retained_names)
+        cut_counts = {int(sym_cut_counter(name)) for name in retained_names}
         if len(cut_counts) != 1:
             raise RuntimeError(
                 "native core group spans multiple symmetry-cut counts: "
@@ -219,7 +227,7 @@ def _native_core_report_plan(core_groups, sym_cut_counter):
             )
         cut_count = cut_counts.pop()
         ordered_groups.append((int(group_index), ordered_pieces))
-        all_names.extend(expected_names)
+        all_names.extend(retained_names)
         batches.setdefault(cut_count, []).extend(ordered_pieces)
 
     if len(all_names) != len(set(all_names)):
@@ -3796,7 +3804,9 @@ class Simulation():
 
         if native_contract:
             native_report_plan = _native_core_report_plan(
-                core_groups, self._sym_cut_count
+                core_groups,
+                self._sym_cut_count,
+                require_complete_groups=bool(self.full_model),
             )
             for cut_count, pieces in native_report_plan["batches"]:
                 expr_name = f"Bpow_core_cut{cut_count}"
@@ -4089,8 +4099,11 @@ class Simulation():
             }
             native_group_count = len(native_report_plan["groups"])
             native_piece_count = len(native_report_plan["object_names"])
-            native_expected_piece_count = (
-                native_group_count * len(_NATIVE_CORE_REGION_ORDER)
+            native_expected_piece_count = sum(
+                len(pieces) for pieces in core_groups.values()
+            )
+            native_pre_split_piece_count = int(
+                self.df_plus["core_segmented_piece_count"].iloc[0]
             )
             native_coverage_attested = int(
                 native_piece_count == native_expected_piece_count
@@ -4109,6 +4122,7 @@ class Simulation():
             native_group_count = 0
             native_piece_count = 0
             native_expected_piece_count = 0
+            native_pre_split_piece_count = 0
             native_coverage_attested = 0
             native_membership_sha256 = ""
 
@@ -4127,6 +4141,13 @@ class Simulation():
             "native_core_report_piece_count": [native_piece_count],
             "native_core_report_expected_piece_count": [
                 native_expected_piece_count
+            ],
+            "native_core_pre_split_piece_count": [
+                native_pre_split_piece_count
+            ],
+            "native_core_report_coverage_basis": [
+                "all_retained_post_symmetry_core_objects"
+                if native_contract else "not_applicable"
             ],
             "native_core_report_coverage_attested": [
                 native_coverage_attested

@@ -393,14 +393,29 @@ class NativeCoreReportPlanTests(unittest.TestCase):
         missing = self._group(1)[:-1]
         unexpected = self._group(1) + [SimpleNamespace(name="core_1_extra")]
         duplicate = self._group(1) + [self._group(1)[0]]
-        for pieces, message in (
-            (missing, "coverage mismatch"),
-            (unexpected, "coverage mismatch"),
-            (duplicate, "duplicate native core report object"),
+        for pieces, message, kwargs in (
+            (missing, "coverage mismatch", {"require_complete_groups": True}),
+            (unexpected, "coverage mismatch", {}),
+            (duplicate, "duplicate native core report object", {}),
         ):
             with self.subTest(message=message), self.assertRaisesRegex(
                     RuntimeError, message):
-                _native_core_report_plan({1: pieces}, lambda _name: 2)
+                _native_core_report_plan(
+                    {1: pieces}, lambda _name: 2, **kwargs
+                )
+
+    def test_symmetry_reduced_group_covers_every_retained_piece(self):
+        retained = [
+            piece for piece in self._group(2)
+            if not piece.name.endswith(("leg_right", "yoke_bottom"))
+        ]
+        plan = _native_core_report_plan({2: retained}, lambda _name: 2)
+
+        self.assertEqual(len(plan["object_names"]), 3)
+        self.assertEqual(
+            set(plan["object_names"]), {piece.name for piece in retained}
+        )
+        self.assertEqual(len(plan["batches"][0][1]), 3)
 
     def test_group_with_mixed_cut_count_fails_closed(self):
         with self.assertRaisesRegex(RuntimeError, "multiple symmetry-cut"):
