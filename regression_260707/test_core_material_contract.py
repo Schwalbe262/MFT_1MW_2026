@@ -534,6 +534,35 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
 
 
 class CoreMaterialArtifactTests(unittest.TestCase):
+    def test_rerun_manifest_is_prepared_but_cannot_submit_during_incident(self):
+        path = (
+            Path(__file__).resolve().parent / "verify"
+            / "1k101_native_ab_rerun_441fb7f.json"
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["status"],
+            "prepared_not_submitted_due_raidrive_incident",
+        )
+        self.assertFalse(payload["execute"])
+        self.assertEqual(
+            payload["solver_revision"],
+            "441fb7fff4be7894474886217d30c7bc0178a580",
+        )
+        self.assertEqual(
+            [case["lamination_factor"] for case in payload["candidates"]],
+            [1.0, 0.85, 0.7],
+        )
+        self.assertEqual(
+            payload["submission_contract"]["priority"], 10
+        )
+        self.assertEqual(
+            payload["submission_contract"]["required_project_cap"], 300
+        )
+        self.assertEqual(
+            payload["prior_failure"]["task_ids"], [29964, 29965, 29966]
+        )
+
     def test_ab_artifact_is_explicitly_blocked_until_solved_evidence(self):
         path = Path(__file__).resolve().parent / "verify" / "1k101_native_ab_gate.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
