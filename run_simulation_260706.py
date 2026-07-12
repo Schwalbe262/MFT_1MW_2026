@@ -23,6 +23,7 @@ import portalocker
 import os
 import re
 import json
+import hashlib
 import argparse
 import uuid
 import tempfile
@@ -164,6 +165,92 @@ def _core_group_index(object_name):
     if not match:
         raise RuntimeError(f"unrecognized core object name: {object_name!r}")
     return int(match.group(1))
+
+
+_NATIVE_CORE_REGION_ORDER = (
+    "leg_left",
+    "leg_center",
+    "leg_right",
+    "yoke_bottom",
+    "yoke_top",
+)
+
+
+def _native_core_report_plan(core_groups, sym_cut_counter):
+    """Validate native five-piece groups and batch B**y reports by cut count.
+
+    AEDT 2025.2 can leave its Fields calculator unable to register a second
+    grouped ``ComplxPeak/Pow`` expression after the intervening per-piece B
+    reports.  Native segmented cores have the same physical restoration
+    factor for every piece with the same symmetry-cut count, so one expression
+    per cut class is mathematically identical and avoids that failing sequence.
+    """
+    ordered_groups = []
+    all_names = []
+    batches = {}
+    for group_index, pieces in sorted(core_groups.items()):
+        by_name = {}
+        for piece in pieces:
+            name = str(piece if isinstance(piece, str) else piece.name)
+            if name in by_name:
+                raise RuntimeError(
+                    f"duplicate native core report object: {name!r}"
+                )
+            by_name[name] = piece
+
+        expected_names = tuple(
+            f"core_{group_index}_{region}"
+            for region in _NATIVE_CORE_REGION_ORDER
+        )
+        missing = sorted(set(expected_names) - set(by_name))
+        unexpected = sorted(set(by_name) - set(expected_names))
+        if missing or unexpected:
+            raise RuntimeError(
+                "native core report coverage mismatch for group "
+                f"{group_index}: missing={missing}, unexpected={unexpected}"
+            )
+
+        ordered_pieces = tuple(by_name[name] for name in expected_names)
+        cut_counts = {int(sym_cut_counter(name)) for name in expected_names}
+        if len(cut_counts) != 1:
+            raise RuntimeError(
+                "native core group spans multiple symmetry-cut counts: "
+                f"group={group_index}, cuts={sorted(cut_counts)}"
+            )
+        cut_count = cut_counts.pop()
+        ordered_groups.append((int(group_index), ordered_pieces))
+        all_names.extend(expected_names)
+        batches.setdefault(cut_count, []).extend(ordered_pieces)
+
+    if len(all_names) != len(set(all_names)):
+        raise RuntimeError("native core report coverage contains duplicate objects")
+    if not all_names:
+        raise RuntimeError("native core report coverage is empty")
+
+    membership_text = "\n".join(all_names)
+    return {
+        "groups": tuple(ordered_groups),
+        "batches": tuple(
+            (cut_count, tuple(pieces))
+            for cut_count, pieces in sorted(batches.items())
+        ),
+        "object_names": tuple(all_names),
+        "membership_sha256": hashlib.sha256(
+            membership_text.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _native_b_power_restore_factor(cut_count, core_y, loss_is_sym):
+    """Return the exact full-model volume/amplitude factor for one cut class."""
+    if not loss_is_sym:
+        return 1.0
+    cut_count = int(cut_count)
+    core_y = float(core_y)
+    if cut_count not in (0, 1, 2, 3):
+        raise ValueError(f"invalid native symmetry-cut count: {cut_count!r}")
+    mirror_factor = 1.0 if cut_count == 3 else 2.0
+    return (2.0 ** cut_count) / (2.0 ** core_y) * mirror_factor
 
 
 def _raw_aedt_object_attribute(obj, property_name):
@@ -3673,6 +3760,11 @@ class Simulation():
           - 권선 그룹 총손실 + explicit 턴별 손실 (열해석 배분용) -> self.loss_map
         """
         n_exp = int(self.df_plus["n_explicit_turns"].iloc[0])
+        revision = (
+            str(self.df_plus["physics_data_revision"].iloc[0]).strip()
+            if "physics_data_revision" in self.df_plus.columns else ""
+        )
+        native_contract = revision == PHYSICS_DATA_REVISION
 
         # ---- 코어손실 + B ----
         # Native wound-core orientation splits one former core_i solid into
@@ -3693,14 +3785,37 @@ class Simulation():
         b_expr_group = {}
         b_expr_volume = {}
         core_y_exponent = float(self.df_plus["core_y"].iloc[0])
+        native_report_plan = None
+        b_power_cut_by_expr = {}
+
         for group_index, pieces in sorted(core_groups.items()):
             group_name = f"core_{group_index}"
             core_exprs.append(self._calc_group_loss(
                 pieces, f"P_{group_name}", quantity="CoreLoss"
             ))
-            b_power_exprs.append(self._calc_group_b_power_integral(
-                pieces, core_y_exponent, f"Bpow_{group_name}"
-            ))
+
+        if native_contract:
+            native_report_plan = _native_core_report_plan(
+                core_groups, self._sym_cut_count
+            )
+            for cut_count, pieces in native_report_plan["batches"]:
+                expr_name = f"Bpow_core_cut{cut_count}"
+                expression = self._calc_group_b_power_integral(
+                    pieces, core_y_exponent, expr_name
+                )
+                b_power_exprs.append(expression)
+                b_power_cut_by_expr[expression] = cut_count
+        else:
+            for group_index, pieces in sorted(core_groups.items()):
+                group_name = f"core_{group_index}"
+                b_power_exprs.append(self._calc_group_b_power_integral(
+                    pieces, core_y_exponent, f"Bpow_{group_name}"
+                ))
+
+        # Register per-piece B diagnostics only after all B**y expressions.
+        # This ordering also keeps the AEDT calculator's fragile Pow sequence
+        # away from the much larger series of Mean/Maximum registrations.
+        for group_index, pieces in sorted(core_groups.items()):
             for piece in pieces:
                 mean_expr = self._calc_field_expr(
                     piece.name, "B_peak", "Mean", f"B_mean_{piece.name}"
@@ -3778,11 +3893,6 @@ class Simulation():
         self.loss_map_native_raw_phys = {}
         self.loss_map_average_phys = {}
         self.loss_map_macro_phys = {}
-        revision = (
-            str(self.df_plus["physics_data_revision"].iloc[0]).strip()
-            if "physics_data_revision" in self.df_plus.columns else ""
-        )
-        native_contract = revision == PHYSICS_DATA_REVISION
         loss_margin = (
             float(self.df_plus["core_loss_margin"].iloc[0])
             if native_contract else 1.0
@@ -3813,16 +3923,26 @@ class Simulation():
         # Bavg**y moment uses the same symmetry amplitude and volume expansion
         # as the native Power Ferrite loss law, but is evaluated independently.
         b_power_phys = {}
+        b_power_restore_factor_by_expr = {}
         for e in b_power_exprs:
-            group_loss_key = "P_" + e.removeprefix("Bpow_")
             b_power_si = _b_power_volume_integral_si(
                 self.loss_map[e],
                 self.extraction_units.get("loss", {}).get(e, ""),
                 core_y_exponent,
             )
-            b_power_phys[e] = b_power_si * self._phys_factor(
-                group_loss_key, is_core_loss=True
-            )
+            if native_contract:
+                restore_factor = _native_b_power_restore_factor(
+                    b_power_cut_by_expr[e],
+                    core_y_exponent,
+                    getattr(self, "loss_is_sym", False),
+                )
+            else:
+                group_loss_key = "P_" + e.removeprefix("Bpow_")
+                restore_factor = self._phys_factor(
+                    group_loss_key, is_core_loss=True
+                )
+            b_power_restore_factor_by_expr[e] = restore_factor
+            b_power_phys[e] = b_power_si * restore_factor
         flux_integral_reported_wb = float(self.loss_map[flux_expr])
         b_section_average = (
             flux_integral_reported_wb
@@ -3851,11 +3971,16 @@ class Simulation():
             self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
             for e in core_exprs
         )
-        b_power_integral_phys = sum(
-            b_power_phys[e]
-            * self._mirror_mult(e.removeprefix("Bpow_"))
-            for e in b_power_exprs
-        )
+        if native_contract:
+            # Native batch factors already include both symmetry-volume and
+            # discrete mirror restoration for their cut class.
+            b_power_integral_phys = sum(b_power_phys.values())
+        else:
+            b_power_integral_phys = sum(
+                b_power_phys[e]
+                * self._mirror_mult(e.removeprefix("Bpow_"))
+                for e in b_power_exprs
+            )
         cplate_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
                            for e in plate_exprs if "core_plate" in e)
         wcp_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
@@ -3954,6 +4079,39 @@ class Simulation():
         )
         b_ac_sine_average = b_ac_sine_material * kf
 
+        if native_contract:
+            native_batch_members = {
+                str(cut_count): [
+                    str(piece if isinstance(piece, str) else piece.name)
+                    for piece in pieces
+                ]
+                for cut_count, pieces in native_report_plan["batches"]
+            }
+            native_group_count = len(native_report_plan["groups"])
+            native_piece_count = len(native_report_plan["object_names"])
+            native_expected_piece_count = (
+                native_group_count * len(_NATIVE_CORE_REGION_ORDER)
+            )
+            native_coverage_attested = int(
+                native_piece_count == native_expected_piece_count
+                and len(set(native_report_plan["object_names"]))
+                == native_piece_count
+            )
+            if not native_coverage_attested:
+                raise RuntimeError(
+                    "native core report coverage attestation failed after planning"
+                )
+            native_membership_sha256 = native_report_plan[
+                "membership_sha256"
+            ]
+        else:
+            native_batch_members = {}
+            native_group_count = 0
+            native_piece_count = 0
+            native_expected_piece_count = 0
+            native_coverage_attested = 0
+            native_membership_sha256 = ""
+
         # CSV에는 실물 기준 값을 기본으로 기록 (raw 대칭 적분값은 _raw 접미사)
         summary = {
             "P_core_total": [core_total],
@@ -3965,6 +4123,26 @@ class Simulation():
             "core_loss_native_attested": [core_loss_native_attested],
             "core_loss_margin_applied": [loss_margin],
             "Bavg_power_volume_integral": [b_power_integral_phys],
+            "native_core_report_group_count": [native_group_count],
+            "native_core_report_piece_count": [native_piece_count],
+            "native_core_report_expected_piece_count": [
+                native_expected_piece_count
+            ],
+            "native_core_report_coverage_attested": [
+                native_coverage_attested
+            ],
+            "native_core_report_membership_sha256": [
+                native_membership_sha256
+            ],
+            "native_core_b_power_batch_count": [len(native_batch_members)],
+            "native_core_b_power_batches_json": [json.dumps(
+                native_batch_members, sort_keys=True, separators=(",", ":")
+            )],
+            "native_core_b_power_restore_factors_json": [json.dumps(
+                b_power_restore_factor_by_expr,
+                sort_keys=True,
+                separators=(",", ":"),
+            )],
             "core_flux_section_retained_area_m2": [
                 flux_section_area_retained_m2
             ],

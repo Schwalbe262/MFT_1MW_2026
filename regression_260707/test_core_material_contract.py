@@ -41,6 +41,8 @@ from run_simulation_260706 import (
     Simulation,
     _b_power_volume_integral_si,
     _core_group_index,
+    _native_b_power_restore_factor,
+    _native_core_report_plan,
     _sheet_area_model_units,
 )
 
@@ -351,6 +353,74 @@ class CoreGeometrySegmentationTests(unittest.TestCase):
         legacy = (4*l1 + 2*l2) * (h1 + 2*l1) - 2*l2*h1
         segmented = 4*l1*h1 + 2*(4*l1 + 2*l2)*l1
         self.assertEqual(legacy, segmented)
+
+
+class NativeCoreReportPlanTests(unittest.TestCase):
+    @staticmethod
+    def _group(group_index):
+        return [
+            SimpleNamespace(name=f"core_{group_index}_{region}")
+            for region in (
+                "leg_left", "leg_center", "leg_right",
+                "yoke_bottom", "yoke_top",
+            )
+        ]
+
+    def test_same_cut_groups_become_one_complete_b_power_batch(self):
+        groups = {2: self._group(2), 1: list(reversed(self._group(1)))}
+        plan = _native_core_report_plan(groups, lambda _name: 2)
+
+        self.assertEqual(len(plan["groups"]), 2)
+        self.assertEqual([cut for cut, _pieces in plan["batches"]], [2])
+        self.assertEqual(len(plan["batches"][0][1]), 10)
+        self.assertEqual(len(plan["object_names"]), 10)
+        self.assertEqual(len(set(plan["object_names"])), 10)
+        self.assertEqual(len(plan["membership_sha256"]), 64)
+
+    def test_mixed_cut_groups_create_deterministic_batches(self):
+        groups = {1: self._group(1), 2: self._group(2)}
+        plan = _native_core_report_plan(
+            groups,
+            lambda name: 3 if _core_group_index(name) == 2 else 2,
+        )
+
+        self.assertEqual(
+            [(cut, len(pieces)) for cut, pieces in plan["batches"]],
+            [(2, 5), (3, 5)],
+        )
+
+    def test_missing_unexpected_or_duplicate_region_fails_closed(self):
+        missing = self._group(1)[:-1]
+        unexpected = self._group(1) + [SimpleNamespace(name="core_1_extra")]
+        duplicate = self._group(1) + [self._group(1)[0]]
+        for pieces, message in (
+            (missing, "coverage mismatch"),
+            (unexpected, "coverage mismatch"),
+            (duplicate, "duplicate native core report object"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(
+                    RuntimeError, message):
+                _native_core_report_plan({1: pieces}, lambda _name: 2)
+
+    def test_group_with_mixed_cut_count_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "multiple symmetry-cut"):
+            _native_core_report_plan(
+                {1: self._group(1)},
+                lambda name: 3 if name.endswith("yoke_top") else 2,
+            )
+
+    def test_native_batch_restoration_equals_legacy_group_math(self):
+        for cut_count in (2, 3):
+            with self.subTest(cut_count=cut_count):
+                legacy_physical_factor = (
+                    (2.0 ** cut_count) / (2.0 ** Y)
+                    * (1.0 if cut_count == 3 else 2.0)
+                )
+                self.assertAlmostEqual(
+                    _native_b_power_restore_factor(cut_count, Y, True),
+                    legacy_physical_factor,
+                )
+        self.assertEqual(_native_b_power_restore_factor(2, Y, False), 1.0)
 
 
 class _FakeMaterial:
