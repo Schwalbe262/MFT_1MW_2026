@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,7 +60,11 @@ from module.thermal_260706 import (
     _assign_thermal_mesh,
     _build_homog_blocks,
     _partition_rx_turns,
+    _prepare_thermal_dispatch,
     _rx_layout,
+    _snapshot_thermal_monitors,
+    _solve_exact_thermal_setup,
+    _thermal_convergence_telemetry,
     _volume_weighted_powers,
     run_thermal_analysis,
 )
@@ -2747,6 +2752,348 @@ class NativeProjectHandleTests(unittest.TestCase):
         analyze.assert_not_called()
 
 
+class ThermalDispatchPolicyTests(unittest.TestCase):
+    class _Clock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            return self.value
+
+        def sleep(self, seconds):
+            self.value += float(seconds)
+
+    @staticmethod
+    def _telemetry(reason, converged=0, monitor_file=""):
+        return {
+            "thermal_convergence_available": 1 if monitor_file else 0,
+            "thermal_converged": int(converged),
+            "thermal_iterations": 10 if monitor_file else 0,
+            "thermal_residual_continuity": 5e-4 if monitor_file else float("nan"),
+            "thermal_residual_x_velocity": 4e-4 if monitor_file else float("nan"),
+            "thermal_residual_y_velocity": 4e-4 if monitor_file else float("nan"),
+            "thermal_residual_z_velocity": 4e-4 if monitor_file else float("nan"),
+            "thermal_residual_energy": 1e-8 if monitor_file else float("nan"),
+            "thermal_residual_flow_limit": 1e-3 if monitor_file else float("nan"),
+            "thermal_residual_energy_limit": 1e-7 if monitor_file else float("nan"),
+            "thermal_convergence_reason": reason,
+            "thermal_monitor_file": monitor_file,
+        }
+
+    @staticmethod
+    def _harness(analyze_side_effect=None, setups=("ThermalSetup",), enabled=True):
+        class NativeSolver(SimpleNamespace):
+            @property
+            def setup_names(self):
+                module = getattr(self, "_oanalysis", None)
+                return list(module.GetSetups()) if module else []
+
+        analysis = SimpleNamespace(GetSetups=Mock(return_value=list(setups)))
+        native_design = SimpleNamespace(
+            GetName=Mock(return_value="icepak_thermal"),
+            GetDesignType=Mock(return_value="Icepak"),
+            GetModule=Mock(return_value=analysis),
+        )
+        native_project = SimpleNamespace(
+            GetName=Mock(return_value="simulation_test"),
+            SetActiveDesign=Mock(return_value=native_design),
+        )
+        if isinstance(analyze_side_effect, list):
+            analyze = Mock(side_effect=analyze_side_effect)
+        else:
+            analyze = Mock(return_value=analyze_side_effect)
+        native_solver = NativeSolver(
+            design_name="icepak_thermal",
+            oproject=native_project,
+            _oanalysis=SimpleNamespace(
+                GetSetups=Mock(return_value=["StaleSetup"])
+            ),
+            analyze=analyze,
+        )
+        mesh_operation = SimpleNamespace(
+            name="tx_mesh_level_L", props={"Level": "4", "Objects": ["tx_0", "tx_1"]}
+        )
+        ipk = SimpleNamespace(
+            design_name="icepak_thermal",
+            solver_instance=native_solver,
+            modeler=SimpleNamespace(object_names=["tx_0", "tx_1"], obounding_box=[0] * 6),
+            mesh=SimpleNamespace(meshoperations=[mesh_operation]),
+        )
+        desktop = SimpleNamespace(
+            AreThereSimulationsRunning=Mock(return_value=False),
+            GetMessages=Mock(return_value=["Icepak startup diagnostic"]),
+        )
+        rebind = Mock(return_value=native_project)
+        simulation = SimpleNamespace(
+            PROJECT_NAME="simulation_test",
+            NUM_CORE=4,
+            _rebind_native_project_for_design_creation=rebind,
+            _native_desktop_handle=Mock(return_value=desktop),
+            save_project=Mock(),
+        )
+        setup = SimpleNamespace(name="ThermalSetup", props={
+            "Enabled": enabled,
+            "Convergence Criteria - Flow": "0.001",
+            "Convergence Criteria - Energy": "1e-07",
+        })
+        return simulation, ipk, setup, analyze, rebind
+
+    def test_stale_pyaedt_analysis_cache_is_rebound_before_native_dispatch(self):
+        simulation, ipk, setup, _analyze, _rebind = self._harness(None)
+        native_solver = ipk.solver_instance
+        stale_analysis = native_solver._oanalysis
+        native_design = native_solver.oproject.SetActiveDesign.return_value
+        native_design.Analyze = Mock(return_value=None)
+
+        def emulated_pyaedt_analyze(*, setup, cores, blocking):
+            # PyAEDT analyze_setup silently returns its initial True value when
+            # the requested name is absent from its cached setup_names.
+            if setup in native_solver.setup_names:
+                return native_solver._odesign.Analyze(setup, blocking)
+            return True
+
+        native_solver.analyze = emulated_pyaedt_analyze
+        converged = self._telemetry(
+            "converged", converged=1, monitor_file="fresh.sd"
+        )
+
+        with patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            return_value=converged,
+        ):
+            result = _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        self.assertIsNot(native_solver._oanalysis, stale_analysis)
+        self.assertIs(
+            native_solver._oanalysis, native_design.GetModule.return_value
+        )
+        native_design.Analyze.assert_called_once_with("ThermalSetup", True)
+        self.assertEqual(result["solve_attempts"], 1)
+        self.assertEqual(result["convergence"]["thermal_converged"], 1)
+        forensic = json.loads(result["forensic_json"])
+        self.assertEqual(
+            forensic["attempts"][0]["identity"]["wrapper_setups"],
+            ["ThermalSetup"],
+        )
+
+    def test_false_with_delayed_converged_monitor_dispatches_exact_setup_once(self):
+        simulation, ipk, setup, analyze, rebind = self._harness(False)
+        clock = self._Clock()
+        missing = self._telemetry("monitor_missing")
+        converged = self._telemetry("converged", converged=1, monitor_file="fresh.sd")
+
+        with patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            side_effect=[missing, converged],
+        ):
+            result = _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=2, poll_s=1,
+                clock=clock, sleeper=clock.sleep,
+            )
+
+        analyze.assert_called_once_with(
+            setup="ThermalSetup", cores=4, blocking=True
+        )
+        rebind.assert_called_once_with()
+        self.assertEqual(result["solve_attempts"], 1)
+        self.assertFalse(result["analyze_call_ok"])
+        self.assertTrue(result["analyze_return_false"])
+        self.assertEqual(result["convergence"]["thermal_converged"], 1)
+
+    def test_false_and_missing_monitor_rebinds_and_retries_only_once(self):
+        simulation, ipk, setup, analyze, rebind = self._harness([False, False])
+        missing = self._telemetry("monitor_missing")
+
+        with patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            side_effect=[missing, missing, missing],
+        ):
+            result = _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        self.assertEqual(analyze.call_count, 2)
+        for call in analyze.call_args_list:
+            self.assertEqual(call.kwargs, {
+                "setup": "ThermalSetup", "cores": 4, "blocking": True,
+            })
+        self.assertEqual(rebind.call_count, 2)
+        self.assertEqual(result["solve_attempts"], 2)
+        self.assertEqual(result["dispatch_status"], "false")
+        self.assertEqual(
+            result["convergence"]["thermal_convergence_reason"], "monitor_missing"
+        )
+        forensic = json.loads(result["forensic_json"])
+        self.assertEqual(forensic["schema"], "thermal-dispatch-forensic-v1")
+        self.assertEqual(len(forensic["attempts"]), 2)
+        self.assertEqual(
+            forensic["attempts"][0]["aedt_messages"],
+            ["Icepak startup diagnostic"],
+        )
+        self.assertEqual(
+            forensic["attempts"][0]["identity"]["model_context"]
+            ["mesh_operations"][0],
+            {"level": "4", "name": "tx_mesh_level_L", "object_count": 2},
+        )
+
+    def test_fresh_residual_threshold_is_terminal_without_retry(self):
+        simulation, ipk, setup, analyze, rebind = self._harness(False)
+        residual = self._telemetry(
+            "residual_threshold", converged=0, monitor_file="fresh.sd"
+        )
+
+        with patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            return_value=residual,
+        ):
+            result = _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        analyze.assert_called_once_with(
+            setup="ThermalSetup", cores=4, blocking=True
+        )
+        rebind.assert_called_once_with()
+        self.assertEqual(result["solve_attempts"], 1)
+        self.assertEqual(
+            result["convergence"]["thermal_convergence_reason"],
+            "residual_threshold",
+        )
+
+    def test_exception_and_missing_monitor_dispatches_at_most_twice(self):
+        simulation, ipk, setup, analyze, rebind = self._harness([
+            RuntimeError("startup one"), RuntimeError("startup two"),
+        ])
+        missing = self._telemetry("monitor_missing")
+
+        with patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            side_effect=[missing, missing, missing],
+        ):
+            result = _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        self.assertEqual(analyze.call_count, 2)
+        self.assertEqual(rebind.call_count, 2)
+        self.assertEqual(result["solve_attempts"], 2)
+        self.assertEqual(result["dispatch_status"], "exception")
+        self.assertEqual(result["dispatch_exception_type"], "RuntimeError")
+
+    def test_numeric_running_state_zero_allows_and_one_blocks_dispatch(self):
+        simulation, ipk, setup, analyze, _rebind = self._harness(None)
+        desktop = simulation._native_desktop_handle.return_value
+        desktop.AreThereSimulationsRunning.return_value = 0
+        contract = _prepare_thermal_dispatch(simulation, ipk, setup)
+        self.assertEqual(contract["design"], "icepak_thermal")
+
+        desktop.AreThereSimulationsRunning.return_value = 1
+        with self.assertRaisesRegex(RuntimeError, "overlapping simulation"):
+            _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+        analyze.assert_not_called()
+
+    def test_none_with_missing_monitor_never_blindly_retries(self):
+        simulation, ipk, setup, analyze, rebind = self._harness(None)
+        missing = self._telemetry("monitor_missing")
+
+        with patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            return_value=missing,
+        ):
+            result = _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        analyze.assert_called_once_with(
+            setup="ThermalSetup", cores=4, blocking=True
+        )
+        rebind.assert_called_once_with()
+        self.assertEqual(result["solve_attempts"], 1)
+        self.assertEqual(result["dispatch_status"], "success")
+        self.assertEqual(
+            result["convergence"]["thermal_convergence_reason"], "monitor_missing"
+        )
+
+    def test_setup_identity_and_enabled_state_fail_before_dispatch(self):
+        for setups, enabled, expected in [
+            (("OtherSetup",), True, "native thermal setup mismatch"),
+            (("ThermalSetup",), False, "ThermalSetup is disabled"),
+        ]:
+            with self.subTest(setups=setups, enabled=enabled):
+                simulation, ipk, setup, analyze, _rebind = self._harness(
+                    None, setups=setups, enabled=enabled
+                )
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    _prepare_thermal_dispatch(simulation, ipk, setup)
+                analyze.assert_not_called()
+
+        simulation, ipk, setup, analyze, _rebind = self._harness(None)
+        native_design = ipk.solver_instance.oproject.SetActiveDesign.return_value
+        native_setup = SimpleNamespace(GetPropValue=Mock(return_value=False))
+        native_analysis = SimpleNamespace(
+            GetChildObject=Mock(return_value=native_setup)
+        )
+        native_design.GetChildObject = Mock(return_value=native_analysis)
+        with self.assertRaisesRegex(RuntimeError, "native ThermalSetup Enabled"):
+            _prepare_thermal_dispatch(simulation, ipk, setup)
+        analyze.assert_not_called()
+
+    def test_monitor_snapshot_rejects_stale_but_accepts_same_mtime_content_change(self):
+        stale = (
+            "1 Continuity(0.0020) XVelocity(0.0001) YVelocity(0.0001) "
+            "ZVelocity(0.0001) Energy(0.00000001)\n"
+        )
+        converged = stale.replace("0.0020", "0.0002")
+        self.assertEqual(len(stale), len(converged))
+        with tempfile.TemporaryDirectory() as directory:
+            results = Path(directory) / "icepak_thermal.results"
+            results.mkdir()
+            monitor = results / "case_S1_MON1_V1.sd"
+            monitor.write_text(stale, encoding="utf-8")
+            native = SimpleNamespace(results_directory=directory)
+            ipk = SimpleNamespace(
+                design_name="icepak_thermal", solver_instance=native
+            )
+            simulation = SimpleNamespace()
+            setup = SimpleNamespace(props={
+                "Convergence Criteria - Flow": "0.001",
+                "Convergence Criteria - Energy": "1e-07",
+            })
+            snapshot = _snapshot_thermal_monitors(simulation, ipk)
+            unchanged = _thermal_convergence_telemetry(
+                simulation, ipk, setup, attempts=1, monitor_snapshot=snapshot
+            )
+            original_stat = monitor.stat()
+            os.utime(
+                monitor,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000),
+            )
+            touched_only = _thermal_convergence_telemetry(
+                simulation, ipk, setup, attempts=1, monitor_snapshot=snapshot
+            )
+            monitor.write_text(converged, encoding="utf-8")
+            os.utime(
+                monitor,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            changed = _thermal_convergence_telemetry(
+                simulation, ipk, setup, attempts=1, monitor_snapshot=snapshot
+            )
+
+        self.assertEqual(
+            unchanged["thermal_convergence_reason"], "monitor_missing"
+        )
+        self.assertEqual(
+            touched_only["thermal_convergence_reason"], "monitor_missing"
+        )
+        self.assertEqual(changed["thermal_convergence_reason"], "converged")
+        self.assertEqual(changed["thermal_monitor_file"], "case_S1_MON1_V1.sd")
+
+
 class FieldsReporterTests(unittest.TestCase):
     def test_reacquires_reporter_after_stale_calcstack(self):
         class Reporter:
@@ -3360,6 +3707,11 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
             "Tprobe_core_center_max": [82.0],
         })
         self.assertTrue(_thermal_result_is_valid(valid))
+        false_return_with_native_convergence = valid.copy()
+        false_return_with_native_convergence["thermal_analyze_call_ok"] = 0
+        false_return_with_native_convergence["thermal_analyze_return_false"] = 1
+        false_return_with_native_convergence["thermal_dispatch_status"] = "false"
+        self.assertTrue(_thermal_result_is_valid(false_return_with_native_convergence))
         invalid = valid.copy()
         invalid.loc[0, "T_max_core"] = float("nan")
         self.assertFalse(_thermal_result_is_valid(invalid))

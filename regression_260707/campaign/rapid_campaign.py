@@ -321,6 +321,23 @@ def _stderr_failure_message(stderr):
     lines = [line.strip() for line in str(stderr or "").splitlines() if line.strip()]
     if not lines:
         return ""
+    # Thermal rejection is the primary solve failure.  PyAEDT can emit a later
+    # active-session TypeError while closing Desktop; choosing the last generic
+    # ERROR line would then split identical monitor_missing failures across two
+    # fingerprints.  Preserve the existing stderr_pyaedt message form so the
+    # already-cached fingerprint remains stable.
+    thermal_rejection = re.compile(
+        r"^(?:PyAEDT\s+)?ERROR:(?:Global:|root:)?\s*"
+        r"(\[thermal\]\s+solve rejected before extraction:\s*.+)$",
+        re.IGNORECASE,
+    )
+    for line in reversed(lines):
+        match = thermal_rejection.search(line)
+        if not match:
+            continue
+        message = f"stderr_pyaedt={match.group(1).strip()}"
+        if _is_informative_runtime_message(message):
+            return message[:4000]
     patterns = (
         ("run_one_loop", re.compile(
             r"(?:ERROR:root:)?run_one_loop failed:\s*(.+)", re.IGNORECASE)),
@@ -346,6 +363,16 @@ def _stderr_failure_message(stderr):
     return ""
 
 
+def _is_aedt_session_cleanup_message(message):
+    """Identify the known post-close PyAEDT session-enumeration error."""
+    lowered = re.sub(r"\s+", " ", str(message or "").lower()).strip()
+    return (
+        "active aedt sessions" in lowered
+        and "nonetype" in lowered
+        and "not iterable" in lowered
+    )
+
+
 def _fetch_task_stderr(task_id):
     response = requests.get(
         f"{scheduler_client.SCHEDULER}/api/tasks/{int(task_id)}/stderr",
@@ -361,18 +388,24 @@ def _fetch_task_stderr(task_id):
 
 def _failure_message(task, stderr_fetcher=None, allow_stderr=True):
     message = _structured_failure_message(task)
-    if message:
+    cleanup_message = bool(message) and _is_aedt_session_cleanup_message(message)
+    if message and not cleanup_message:
         return message
     task_id = task.get("id", task.get("task_id"))
     if (allow_stderr and not isinstance(task_id, bool) and isinstance(task_id, int)
             and task_id > 0):
         fetcher = stderr_fetcher or _fetch_task_stderr
         try:
-            message = _stderr_failure_message(fetcher(task_id))
+            stderr_message = _stderr_failure_message(fetcher(task_id))
         except Exception:
-            message = ""
-        if message:
-            return message
+            stderr_message = ""
+        if stderr_message and (
+                not message
+                or "[thermal] solve rejected before extraction:" in stderr_message.lower()
+        ):
+            return stderr_message
+    if message:
+        return message
     exit_code = task.get("exit_code")
     if exit_code not in (None, "", []):
         return f"exit_code={exit_code}"

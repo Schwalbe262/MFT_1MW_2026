@@ -11,9 +11,12 @@ Icepak 열해석 모듈 (설계도면260706 파이프라인 design3)
 - 경계조건: 콜드플레이트/권선냉각판(Al) 고정온도, region +y면 velocity inlet, -y면 pressure opening
 """
 
+import hashlib
+import json
 import math
 import logging
 import re
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -33,21 +36,45 @@ def _native_solver(app):
     return solver if solver is not None else app
 
 
-def _activate_thermal_design(app):
+_THERMAL_DESIGN_NAME = "icepak_thermal"
+_THERMAL_SETUP_NAME = "ThermalSetup"
+
+
+def _native_design_name(design):
+    """Return an AEDT design's leaf name without project qualification."""
+    value = design
+    get_name = getattr(design, "GetName", None)
+    if callable(get_name):
+        value = get_name()
+    return str(value or "").split(";")[-1].strip()
+
+
+def _activate_thermal_design(app, design_name=None, native_project=None):
     """Re-acquire the active native design and refresh the raw PyAEDT handle."""
     solver = _native_solver(app)
-    project = getattr(solver, "oproject", None)
+    project = native_project
+    if project is None:
+        project = getattr(solver, "oproject", None)
     set_active = getattr(project, "SetActiveDesign", None)
     if not callable(set_active):
         raise RuntimeError("native Icepak project handle has no SetActiveDesign")
 
-    design_name = getattr(solver, "design_name", None) or getattr(app, "design_name", None)
-    if not design_name:
+    expected_name = design_name or getattr(solver, "design_name", None) \
+        or getattr(app, "design_name", None)
+    if not expected_name:
         raise RuntimeError("thermal design name is unavailable")
-    design = set_active(design_name)
+    design = set_active(expected_name)
     if not design or not callable(getattr(design, "GetModule", None)):
-        raise RuntimeError(f"failed to activate thermal design: {design_name}")
+        raise RuntimeError(f"failed to activate thermal design: {expected_name}")
+    if design_name is not None:
+        actual_name = _native_design_name(design)
+        if actual_name != design_name:
+            raise RuntimeError(
+                "thermal design identity mismatch: "
+                f"expected={design_name!r}, actual={actual_name or '<empty>'!r}"
+            )
 
+    solver._oproject = project
     solver._odesign = design
     design_solutions = getattr(solver, "design_solutions", None)
     if design_solutions is not None:
@@ -245,8 +272,76 @@ def _parse_thermal_residual_monitor(path, flow_limit=1e-3, energy_limit=1e-7):
     }
 
 
+def _thermal_monitor_roots(sim, ipk):
+    """Return de-duplicated native results roots without recursive traversal."""
+    native_ipk = _native_solver(ipk)
+    roots = []
+    results_directory = getattr(native_ipk, "results_directory", None)
+    if results_directory:
+        roots.append(Path(str(results_directory)))
+    project_path = getattr(sim, "project_path", None)
+    project_name = str(getattr(sim, "PROJECT_NAME", "") or "").strip()
+    if project_path and project_name:
+        roots.append(Path(project_path) / f"{project_name}.aedtresults")
+
+    unique = []
+    seen = set()
+    for root in roots:
+        key = str(root.resolve(strict=False)).casefold()
+        if key not in seen:
+            unique.append(root)
+            seen.add(key)
+    return unique
+
+
+def _thermal_monitor_signature(path, sample_bytes=4096):
+    """Return a bounded signature that detects changes despite coarse mtimes."""
+    path = Path(path)
+    stat = path.stat()
+    size = int(stat.st_size)
+    sample_bytes = max(1, int(sample_bytes))
+    with path.open("rb") as stream:
+        head = stream.read(min(sample_bytes, size))
+        if size > sample_bytes:
+            stream.seek(max(0, size - sample_bytes))
+            tail = stream.read(sample_bytes)
+        else:
+            tail = b""
+    digest = hashlib.sha256(head + b"\0" + tail).hexdigest()
+    return size, int(stat.st_mtime_ns), digest
+
+
+def _thermal_monitor_candidates(sim, ipk):
+    design_name = str(getattr(ipk, "design_name", "") or _THERMAL_DESIGN_NAME)
+    candidates = {}
+    for root in _thermal_monitor_roots(sim, ipk):
+        design_results = root / f"{design_name}.results"
+        search_root = design_results if design_results.is_dir() else root
+        if not search_root.is_dir():
+            continue
+        for path in search_root.glob("*_S*_MON*_V*.sd"):
+            if "_SOL" in path.name:
+                continue
+            try:
+                signature = _thermal_monitor_signature(path)
+                key = str(path.resolve(strict=False)).casefold()
+            except OSError:
+                continue
+            candidates[key] = (path, signature)
+    return candidates
+
+
+def _snapshot_thermal_monitors(sim, ipk):
+    """Snapshot existing residual artifacts before a solve is dispatched."""
+    return {
+        key: signature
+        for key, (_path, signature) in _thermal_monitor_candidates(sim, ipk).items()
+    }
+
+
 def _thermal_convergence_telemetry(
     sim, ipk, setup, attempts=3, retry_seconds=2, not_before_ns=None,
+    monitor_snapshot=None,
 ):
     """Read a fresh native Icepak residual monitor; missing evidence fails closed."""
     defaults = {
@@ -272,37 +367,24 @@ def _thermal_convergence_telemetry(
             and math.isfinite(energy_limit) and 0 < energy_limit <= 1e-7):
         return {**defaults, "thermal_convergence_reason": "invalid_setup_criteria"}
 
-    native_ipk = _native_solver(ipk)
-    roots = []
-    results_directory = getattr(native_ipk, "results_directory", None)
-    if results_directory:
-        roots.append(Path(str(results_directory)))
-    project_path = getattr(sim, "project_path", None)
-    if project_path:
-        roots.append(Path(project_path) / f"{sim.PROJECT_NAME}.aedtresults")
-
     last_error = None
+    malformed_monitor = ""
     for attempt in range(1, attempts + 1):
         candidates = []
-        for root in roots:
-            design_results = root / f"{ipk.design_name}.results"
-            search_root = design_results if design_results.is_dir() else root
-            if search_root.is_dir():
-                for path in search_root.glob("*_S*_MON*_V*.sd"):
-                    if "_SOL" in path.name:
-                        continue
-                    try:
-                        if not_before_ns is not None \
-                                and path.stat().st_mtime_ns < int(not_before_ns):
-                            continue
-                    except (OSError, TypeError, ValueError, OverflowError):
-                        continue
-                    candidates.append(path)
-        if candidates:
-            monitor = max(
-                set(candidates),
-                key=lambda path: (path.stat().st_mtime_ns, path.name),
-            )
+        for key, (path, signature) in _thermal_monitor_candidates(sim, ipk).items():
+            if monitor_snapshot is not None:
+                previous = monitor_snapshot.get(key)
+                # A metadata-only touch is not solve evidence.  Require a new
+                # monitor path or a bounded content/size change; mtime remains
+                # in the signature only for deterministic candidate ordering.
+                if previous is not None \
+                        and (previous[0], previous[2]) == (signature[0], signature[2]):
+                    continue
+            elif not_before_ns is not None and signature[1] < int(not_before_ns):
+                continue
+            candidates.append((path, signature))
+        candidates.sort(key=lambda item: (item[1][1], item[0].name), reverse=True)
+        for monitor, _signature in candidates:
             try:
                 parsed = _parse_thermal_residual_monitor(
                     monitor, flow_limit=flow_limit, energy_limit=energy_limit
@@ -326,14 +408,395 @@ def _thermal_convergence_telemetry(
                 }
             except (OSError, ValueError) as exc:
                 last_error = exc
+                malformed_monitor = monitor.name
         if attempt < attempts:
-            import time
             time.sleep(retry_seconds)
 
     if last_error is not None:
         logging.error("[thermal] residual monitor validation failed: %s", last_error)
-        return {**defaults, "thermal_convergence_reason": "monitor_malformed"}
+        return {
+            **defaults,
+            "thermal_convergence_reason": "monitor_malformed",
+            "thermal_monitor_file": malformed_monitor,
+        }
     return defaults
+
+
+def _thermal_bool(value):
+    if value is True or value == 1:
+        return True
+    if value is False or value == 0:
+        return False
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "yes", "enabled", "on", "1"}:
+        return True
+    if normalized in {"false", "no", "disabled", "off", "0"}:
+        return False
+    raise RuntimeError(f"unrecognized ThermalSetup Enabled value: {value!r}")
+
+
+def _thermal_desktop_handle(sim, ipk):
+    getter = getattr(sim, "_native_desktop_handle", None)
+    if callable(getter):
+        desktop = getter()
+        if desktop is not None and desktop is not False:
+            return desktop
+    for owner in (_native_solver(ipk), ipk):
+        desktop = getattr(owner, "odesktop", None)
+        if desktop is not None and desktop is not False:
+            return desktop
+    raise RuntimeError("native AEDT Desktop handle is unavailable")
+
+
+def _thermal_running_state(sim, ipk):
+    desktop = _thermal_desktop_handle(sim, ipk)
+    is_running = getattr(desktop, "AreThereSimulationsRunning", None)
+    if not callable(is_running):
+        raise RuntimeError("native AEDT Desktop has no simulation-state query")
+    value = is_running()
+    if value is False or value == 0:
+        return False
+    if value is True or value == 1:
+        return True
+    normalized = str(value or "").strip().lower()
+    if normalized in {"false", "no", "off", "0"}:
+        return False
+    if normalized in {"true", "yes", "on", "1"}:
+        return True
+    raise RuntimeError(f"unrecognized AEDT simulation-running state: {value!r}")
+
+
+def _prepare_thermal_dispatch(
+    sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
+    setup_name=_THERMAL_SETUP_NAME,
+):
+    """Rebind and attest the one exact native Icepak setup before dispatch."""
+    expected_project = str(getattr(sim, "PROJECT_NAME", "") or "").strip()
+    if not expected_project:
+        raise RuntimeError("thermal project identity is unavailable")
+    rebind = getattr(sim, "_rebind_native_project_for_design_creation", None)
+    if not callable(rebind):
+        raise RuntimeError("thermal project rebind is unavailable")
+    native_project = rebind()
+    if native_project is None or native_project is False:
+        raise RuntimeError("thermal project rebind returned no native project")
+    get_project_name = getattr(native_project, "GetName", None)
+    if not callable(get_project_name):
+        raise RuntimeError("rebound thermal project has no identity readback")
+    actual_project = str(get_project_name() or "").strip()
+    if actual_project != expected_project:
+        raise RuntimeError(
+            "thermal project identity mismatch: "
+            f"expected={expected_project!r}, actual={actual_project or '<empty>'!r}"
+        )
+
+    native_ipk, native_design = _activate_thermal_design(
+        ipk, design_name=design_name, native_project=native_project
+    )
+    wrapper_name = str(getattr(native_ipk, "design_name", "") or "").strip()
+    if wrapper_name != design_name:
+        raise RuntimeError(
+            "thermal wrapper design identity mismatch: "
+            f"expected={design_name!r}, actual={wrapper_name or '<empty>'!r}"
+        )
+    get_design_type = getattr(native_design, "GetDesignType", None)
+    design_type = str(get_design_type() or "") if callable(get_design_type) else ""
+    if design_type and "icepak" not in design_type.lower():
+        raise RuntimeError(f"thermal design is not Icepak: {design_type!r}")
+
+    analysis = native_design.GetModule("AnalysisSetup")
+    if analysis is None or analysis is False:
+        raise RuntimeError("active thermal design returned no AnalysisSetup module")
+    get_setups = getattr(analysis, "GetSetups", None)
+    if not callable(get_setups):
+        raise RuntimeError("thermal AnalysisSetup has no setup readback")
+    setups = tuple(str(name) for name in (get_setups() or []))
+    if setups != (setup_name,):
+        raise RuntimeError(
+            f"native thermal setup mismatch: expected={(setup_name,)}, actual={setups}"
+        )
+    # PyAEDT caches the AnalysisSetup module independently from ``_odesign``.
+    # Merely rebinding the native design can therefore leave ``setup_names``
+    # pointed at the prior design; in that state ``analyze(setup=...)`` returns
+    # its default success value without calling oDesign.Analyze at all.  Keep the
+    # cache in the same attested transaction and require the wrapper readback to
+    # agree before dispatch.
+    try:
+        native_ipk._oanalysis = analysis
+        wrapper_setups = tuple(str(name) for name in (native_ipk.setup_names or []))
+    except Exception as exc:
+        raise RuntimeError(
+            f"thermal PyAEDT AnalysisSetup rebind failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if wrapper_setups != (setup_name,):
+        raise RuntimeError(
+            "thermal PyAEDT setup cache mismatch: "
+            f"expected={(setup_name,)}, actual={wrapper_setups}"
+        )
+    actual_setup_name = str(getattr(setup, "name", "") or "").strip()
+    if actual_setup_name != setup_name:
+        raise RuntimeError(
+            "thermal setup wrapper identity mismatch: "
+            f"expected={setup_name!r}, actual={actual_setup_name or '<empty>'!r}"
+        )
+    props = getattr(setup, "props", None)
+    if not hasattr(props, "get") or not _thermal_bool(props.get("Enabled")):
+        raise RuntimeError("ThermalSetup is disabled or has no Enabled readback")
+    enabled_source = "wrapper"
+    native_enabled = None
+    try:
+        analysis_child = native_design.GetChildObject("Analysis")
+        setup_child = analysis_child.GetChildObject(setup_name)
+        get_enabled = getattr(setup_child, "GetPropValue", None)
+        if callable(get_enabled):
+            native_enabled = get_enabled("Enabled")
+    except Exception:
+        # GetSetups above is the authoritative native identity check on AEDT
+        # versions that do not expose setup Enabled through the object tree.
+        pass
+    if native_enabled is not None:
+        if not _thermal_bool(native_enabled):
+            raise RuntimeError("native ThermalSetup Enabled readback is false")
+        enabled_source = "native+wrapper"
+
+    running = _thermal_running_state(sim, ipk)
+    if running is not False:
+        raise RuntimeError(f"AEDT reports an overlapping simulation: {running!r}")
+    return {
+        "project": actual_project,
+        "design": design_name,
+        "design_type": design_type,
+        "setups": list(setups),
+        "wrapper_setups": list(wrapper_setups),
+        "enabled": True,
+        "enabled_source": enabled_source,
+        "native_ipk": native_ipk,
+    }
+
+
+def _bounded_thermal_messages(sim, ipk, limit=12, char_limit=2048):
+    """Capture a bounded AEDT message tail without letting cleanup mask the solve."""
+    try:
+        desktop = _thermal_desktop_handle(sim, ipk)
+        get_messages = getattr(desktop, "GetMessages", None)
+        if not callable(get_messages):
+            return []
+        project_name = str(getattr(sim, "PROJECT_NAME", "") or "")
+        design_name = str(getattr(ipk, "design_name", "") or _THERMAL_DESIGN_NAME)
+        messages = list(get_messages(project_name, design_name, 0) or [])[-int(limit):]
+    except Exception as exc:
+        return [f"message-capture-error:{type(exc).__name__}:{str(exc)[:256]}"]
+    bounded = []
+    remaining = max(0, int(char_limit))
+    for message in messages:
+        value = str(message).replace("\r", " ").replace("\n", " ")[:512]
+        if remaining <= 0:
+            break
+        value = value[:remaining]
+        bounded.append(value)
+        remaining -= len(value)
+    return bounded
+
+
+def _bounded_thermal_model_context(ipk, operation_limit=24):
+    """Capture bounded mesh/object context for solve-start pilot diagnostics."""
+    context = {"object_count": None, "model_bounds": [], "mesh_operations": []}
+    try:
+        modeler = getattr(ipk, "modeler", None)
+        names = list(getattr(modeler, "object_names", []) or [])
+        context["object_count"] = len(names)
+        bounds = getattr(modeler, "obounding_box", None)
+        if bounds is not None:
+            context["model_bounds"] = [str(value)[:64] for value in list(bounds)[:6]]
+    except Exception as exc:
+        context["model_context_error"] = f"{type(exc).__name__}: {str(exc)[:256]}"
+    try:
+        mesh = getattr(ipk, "mesh", None)
+        operations = list(getattr(mesh, "meshoperations", []) or [])[:int(operation_limit)]
+        for operation in operations:
+            props = getattr(operation, "props", None)
+            get_prop = props.get if hasattr(props, "get") else lambda _key, default=None: default
+            objects = get_prop("Objects", get_prop("Mesh Object(s)", []))
+            if isinstance(objects, str):
+                object_count = 1
+            else:
+                try:
+                    object_count = len(list(objects or []))
+                except TypeError:
+                    object_count = None
+            context["mesh_operations"].append({
+                "name": str(getattr(operation, "name", ""))[:128],
+                "level": str(get_prop("Level", ""))[:64],
+                "object_count": object_count,
+            })
+    except Exception as exc:
+        context["mesh_context_error"] = f"{type(exc).__name__}: {str(exc)[:256]}"
+    return context
+
+
+def _poll_thermal_dispatch_evidence(
+    sim, ipk, setup, monitor_snapshot, timeout_s=30.0, poll_s=2.0,
+    clock=time.monotonic, sleeper=time.sleep,
+):
+    """Poll monitor evidence and native running state for a bounded grace period."""
+    deadline = clock() + max(0.0, float(timeout_s))
+    convergence = None
+    running = None
+    running_error = ""
+    while True:
+        convergence = _thermal_convergence_telemetry(
+            sim, ipk, setup, attempts=1, monitor_snapshot=monitor_snapshot
+        )
+        try:
+            running = _thermal_running_state(sim, ipk)
+            running_error = ""
+        except Exception as exc:
+            running = None
+            running_error = f"{type(exc).__name__}: {str(exc)[:512]}"
+        if convergence["thermal_convergence_reason"] in {
+            "converged", "residual_threshold",
+        }:
+            break
+        now = clock()
+        if now >= deadline:
+            break
+        sleeper(min(max(0.0, float(poll_s)), max(0.0, deadline - now)))
+    return convergence, running, running_error
+
+
+def _thermal_forensic_json(attempts, convergence):
+    """Serialize the bounded solve-start evidence used for retry decisions."""
+    payload = {
+        "schema": "thermal-dispatch-forensic-v1",
+        "attempts": attempts[:2],
+        "final_convergence": {
+            "available": convergence.get("thermal_convergence_available", 0),
+            "converged": convergence.get("thermal_converged", 0),
+            "reason": str(convergence.get("thermal_convergence_reason", ""))[:128],
+            "monitor_file": str(convergence.get("thermal_monitor_file", ""))[:256],
+        },
+    }
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _solve_exact_thermal_setup(
+    sim, ipk, setup, setup_name=_THERMAL_SETUP_NAME,
+    monitor_grace_s=30.0, poll_s=2.0,
+    clock=time.monotonic, sleeper=time.sleep,
+):
+    """Dispatch only ThermalSetup, with one evidence-gated startup retry."""
+    attempts = []
+    convergence = None
+    previous_snapshot = None
+    for requested_attempt in range(1, 3):
+        preflight = _prepare_thermal_dispatch(
+            sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
+            setup_name=setup_name,
+        )
+
+        # Close the small gap between the first grace poll and a permitted retry.
+        # A delayed first-attempt monitor is authoritative and prevents dispatch 2.
+        if requested_attempt == 2 and previous_snapshot is not None:
+            late = _thermal_convergence_telemetry(
+                sim, ipk, setup, attempts=1, monitor_snapshot=previous_snapshot
+            )
+            if late["thermal_convergence_reason"] != "monitor_missing":
+                convergence = late
+                if attempts:
+                    attempts[-1]["monitor_reason"] = late["thermal_convergence_reason"]
+                    attempts[-1]["monitor_file"] = str(
+                        late.get("thermal_monitor_file", "")
+                    )[:256]
+                    attempts[-1]["late_after_grace"] = True
+                break
+
+        monitor_snapshot = _snapshot_thermal_monitors(sim, ipk)
+        previous_snapshot = monitor_snapshot
+        native_ipk = preflight.pop("native_ipk")
+        started = clock()
+        status = "success"
+        returned = None
+        exception_type = ""
+        exception_message = ""
+        try:
+            returned = native_ipk.analyze(
+                setup=setup_name, cores=sim.NUM_CORE, blocking=True
+            )
+            if returned is False:
+                status = "false"
+                logging.warning(
+                    "[thermal] exact ThermalSetup dispatch returned False; "
+                    "polling native monitor evidence before any retry."
+                )
+        except Exception as exc:
+            status = "exception"
+            exception_type = type(exc).__name__
+            exception_message = str(exc)[:512]
+            logging.exception("[thermal] exact ThermalSetup dispatch failed: %s", exc)
+
+        messages = _bounded_thermal_messages(sim, ipk) if status != "success" else []
+        convergence, running, running_error = _poll_thermal_dispatch_evidence(
+            sim, ipk, setup, monitor_snapshot,
+            timeout_s=monitor_grace_s, poll_s=poll_s,
+            clock=clock, sleeper=sleeper,
+        )
+        if status != "success" or convergence["thermal_convergence_reason"] != "converged":
+            preflight["model_context"] = _bounded_thermal_model_context(ipk)
+            if not messages:
+                messages = _bounded_thermal_messages(sim, ipk)
+        try:
+            sim.save_project()
+        except Exception:
+            pass
+        attempts.append({
+            "attempt": len(attempts) + 1,
+            "dispatch_status": status,
+            "return_type": type(returned).__name__ if status != "exception" else "",
+            "exception_type": exception_type,
+            "exception_message": exception_message,
+            "elapsed_s": round(max(0.0, clock() - started), 3),
+            "native_running": running,
+            "running_state_error": running_error,
+            "monitor_reason": convergence["thermal_convergence_reason"],
+            "monitor_file": str(convergence.get("thermal_monitor_file", ""))[:256],
+            "aedt_messages": messages,
+            "identity": preflight,
+        })
+
+        reason = convergence["thermal_convergence_reason"]
+        if reason in {"converged", "residual_threshold", "monitor_malformed"}:
+            break
+        retryable = status in {"false", "exception"} \
+            and reason == "monitor_missing" and running is False
+        if requested_attempt == 1 and retryable:
+            logging.warning(
+                "[thermal] exact ThermalSetup startup produced no fresh monitor; "
+                "reacquiring the exact design/setup and retrying once."
+            )
+            continue
+        break
+
+    if convergence is None:
+        raise RuntimeError("thermal convergence telemetry was not collected")
+    final_attempt = attempts[-1] if attempts else {
+        "dispatch_status": "not-dispatched",
+        "exception_type": "",
+        "exception_message": "",
+    }
+    forensic_json = _thermal_forensic_json(attempts, convergence)
+    logging.warning("[thermal] dispatch forensic: %s", forensic_json)
+    return {
+        "convergence": convergence,
+        "solve_attempts": len(attempts),
+        "analyze_call_ok": final_attempt["dispatch_status"] == "success",
+        "analyze_return_false": any(
+            item["dispatch_status"] == "false" for item in attempts
+        ),
+        "dispatch_status": final_attempt["dispatch_status"],
+        "dispatch_exception_type": final_attempt["exception_type"],
+        "dispatch_exception_message": final_attempt["exception_message"],
+        "forensic_json": forensic_json,
+    }
 
 
 def _split_retained(ipk, objects, plane, sides):
@@ -1158,10 +1621,11 @@ def run_thermal_analysis(sim):
     # 수치적으로 직결되어 온도가 플레이트에 고정됨 (풀 도메인에서 실측된 함정)
     _assign_thermal_mesh(ipk, objs)
 
-    setup = ipk.create_setup(name="ThermalSetup")
+    setup = ipk.create_setup(name=_THERMAL_SETUP_NAME)
     if not setup:
         raise RuntimeError("create_setup returned no ThermalSetup")
     try:
+        setup.props["Enabled"] = True
         setup.props["Flow Regime"] = "Turbulent"
         setup.props["Convergence Criteria - Max Iterations"] = int(df["thermal_max_iterations"].iloc[0])
         setup.props["Convergence Criteria - Flow"] = "0.001"
@@ -1177,66 +1641,17 @@ def run_thermal_analysis(sim):
     except Exception as e:
         raise RuntimeError(f"ThermalSetup configuration failed: {e}") from e
 
-    # analyze() may return None after a successful blocking solve. Do not query
-    # the setup completion property here: it uses the same unreliable report API that
-    # caused completed thermal solves to be launched repeatedly. Native convergence
-    # evidence and Field Summary data below are the completion gates.
-    #
-    # A known AEDT startup race can return False/raise before it emits any usable
-    # monitor. Retry exactly once only for that narrow signature. A fresh monitor
-    # with either converged or residual-threshold evidence is authoritative and
-    # must never trigger another solve.
-    import time as _time
-    solve_attempts = 0
-    analyze_call_ok = False
-    analyze_return_false = False
-    convergence = None
-    for solve_attempt in range(1, 3):
-        solve_attempts = solve_attempt
-        solve_started_ns = _time.time_ns()
-        invocation_failed = False
-        try:
-            analyze_result = ipk.analyze(cores=sim.NUM_CORE)
-            analyze_call_ok = True
-            returned_false = analyze_result is False
-            analyze_return_false = analyze_return_false or returned_false
-            invocation_failed = returned_false
-            if returned_false:
-                logging.warning(
-                    "[thermal] analyze returned False; validating fresh native "
-                    "convergence evidence."
-                )
-        except Exception as e:
-            invocation_failed = True
-            logging.exception(f"[thermal] analyze invocation failed: {e}")
-            try:
-                msgs = ipk.odesktop.GetMessages(sim.PROJECT_NAME, ipk.design_name, 0)
-                for m in list(msgs)[-20:]:
-                    logging.warning(f"[AEDT] {m}")
-            except Exception:
-                pass
-        try:
-            sim.save_project()
-        except Exception:
-            pass
-
-        convergence = _thermal_convergence_telemetry(
-            sim, ipk, setup, not_before_ns=solve_started_ns
-        )
-        retryable_monitor_failure = convergence["thermal_convergence_reason"] in {
-            "monitor_missing", "monitor_malformed",
-        }
-        if solve_attempt == 1 and invocation_failed and retryable_monitor_failure:
-            logging.warning(
-                "[thermal] analyze startup produced no usable fresh monitor; "
-                "retrying exactly once after 30 seconds."
-            )
-            _time.sleep(30)
-            continue
-        break
-
-    if convergence is None:
-        raise RuntimeError("thermal convergence telemetry was not collected")
+    # Dispatch the one exact setup. Convergence evidence is independent of PyAEDT's
+    # return value because the wrapper can report False after native work completed.
+    solve_result = _solve_exact_thermal_setup(sim, ipk, setup)
+    solve_attempts = solve_result["solve_attempts"]
+    analyze_call_ok = solve_result["analyze_call_ok"]
+    analyze_return_false = solve_result["analyze_return_false"]
+    dispatch_status = solve_result["dispatch_status"]
+    dispatch_exception_type = solve_result["dispatch_exception_type"]
+    dispatch_exception_message = solve_result["dispatch_exception_message"]
+    dispatch_forensic_json = solve_result["forensic_json"]
+    convergence = solve_result["convergence"]
     logging.warning(
         "[thermal] convergence: available=%s converged=%s iteration=%s "
         "continuity=%s energy=%s reason=%s",
@@ -1312,7 +1727,7 @@ def run_thermal_analysis(sim):
     required_group_mask = sum(group_bits[key] for key in required_keys)
     required_group_count = len(required_keys)
 
-    if not analyze_call_ok or convergence["thermal_converged"] != 1:
+    if convergence["thermal_converged"] != 1:
         summary = {
             "thermal_solved": [0],
             "thermal_extraction_complete": [0],
@@ -1323,6 +1738,10 @@ def run_thermal_analysis(sim):
             "thermal_solve_attempts": [solve_attempts],
             "thermal_analyze_call_ok": [1 if analyze_call_ok else 0],
             "thermal_analyze_return_false": [1 if analyze_return_false else 0],
+            "thermal_dispatch_status": [dispatch_status],
+            "thermal_dispatch_exception_type": [dispatch_exception_type],
+            "thermal_dispatch_exception_message": [dispatch_exception_message],
+            "thermal_dispatch_forensic_json": [dispatch_forensic_json],
             "thermal_solution_data_available": [0],
             "thermal_field_summary_attempts": [0],
             "thermal_field_summary_value_count": [0],
@@ -1353,7 +1772,7 @@ def run_thermal_analysis(sim):
 
     native_ipk = _native_solver(ipk)
     try:
-        _activate_thermal_design(ipk)
+        _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
         solution = native_ipk.existing_analysis_sweeps[0]
     except Exception:
         solution = "ThermalSetup : SteadyState"
@@ -1445,7 +1864,7 @@ def run_thermal_analysis(sim):
             break
         field_summary_attempts = attempt
         try:
-            _activate_thermal_design(ipk)
+            _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
             temps.update(_field_summary_bulk(missing_entries))
             _refresh_core_probe_aggregates()
         except Exception as e:
@@ -1453,7 +1872,7 @@ def run_thermal_analysis(sim):
         if all(col in temps for col in required_expected_cols):
             break
         if attempt < 3:
-            _time.sleep(10)
+            time.sleep(10)
     _refresh_core_probe_aggregates()
     n_fs = sum(1 for col in field_expected_cols if col in temps)
 
@@ -1486,8 +1905,7 @@ def run_thermal_analysis(sim):
     required_complete = required_missing_count == 0 and required_group_count > 0
     solution_data_available = n_fs > 0
     solved = (
-        analyze_call_ok
-        and convergence["thermal_converged"] == 1
+        convergence["thermal_converged"] == 1
         and solution_data_available
         and required_complete
     )
@@ -1504,6 +1922,10 @@ def run_thermal_analysis(sim):
         "thermal_solve_attempts": [solve_attempts],
         "thermal_analyze_call_ok": [1 if analyze_call_ok else 0],
         "thermal_analyze_return_false": [1 if analyze_return_false else 0],
+        "thermal_dispatch_status": [dispatch_status],
+        "thermal_dispatch_exception_type": [dispatch_exception_type],
+        "thermal_dispatch_exception_message": [dispatch_exception_message],
+        "thermal_dispatch_forensic_json": [dispatch_forensic_json],
         "thermal_solution_data_available": [1 if solution_data_available else 0],
         "thermal_field_summary_attempts": [field_summary_attempts],
         "thermal_field_summary_value_count": [n_fs],

@@ -314,6 +314,66 @@ RuntimeError: [matrix] result extraction failed after 3 attempts
             "stderr_run_one_loop=[matrix] result extraction failed after 3 attempts",
         )
 
+    def test_thermal_rejection_outranks_later_aedt_session_cleanup_error(self):
+        stderr = """WARNING:Global:No mesh operation found.
+ERROR:root:[thermal] solve rejected before extraction: analyze-call-ok=True, converged=0, reason=monitor_missing
+INFO:Global:Project simulation closed correctly
+ERROR:Global:A(n) <class 'TypeError'> error occurred while retrieving information for the active AEDT sessions: argument of type 'NoneType' is not iterable
+INFO:Global:Desktop has been released and closed.
+"""
+
+        message = rapid_campaign._stderr_failure_message(stderr)
+
+        self.assertEqual(
+            message,
+            "stderr_pyaedt=[thermal] solve rejected before extraction: "
+            "analyze-call-ok=True, converged=0, reason=monitor_missing",
+        )
+        self.assertEqual(
+            rapid_campaign._runtime_error_fingerprint(message),
+            "d44e42386932a56a",
+        )
+
+    def test_structured_cleanup_error_selectively_checks_stderr_for_thermal_root(self):
+        cleanup = (
+            "A(n) <class 'TypeError'> error occurred while retrieving information "
+            "for the active AEDT sessions: argument of type 'NoneType' is not iterable"
+        )
+        stderr = (
+            "ERROR:root:[thermal] solve rejected before extraction: "
+            "analyze-call-ok=True, converged=0, reason=monitor_missing\n"
+            f"ERROR:Global:{cleanup}\n"
+        )
+        fetch = mock.Mock(return_value=stderr)
+
+        message = rapid_campaign._failure_message(
+            self._failed_task(49, error_message=cleanup), stderr_fetcher=fetch
+        )
+
+        fetch.assert_called_once_with(49)
+        self.assertEqual(
+            message,
+            "stderr_pyaedt=[thermal] solve rejected before extraction: "
+            "analyze-call-ok=True, converged=0, reason=monitor_missing",
+        )
+        self.assertEqual(
+            rapid_campaign._runtime_error_fingerprint(message),
+            "d44e42386932a56a",
+        )
+
+    def test_structured_cleanup_error_is_retained_when_stderr_has_no_better_root(self):
+        cleanup = (
+            "A(n) <class 'TypeError'> error occurred while retrieving information "
+            "for the active AEDT sessions: argument of type 'NoneType' is not iterable"
+        )
+
+        message = rapid_campaign._failure_message(
+            self._failed_task(50, error_message=cleanup),
+            stderr_fetcher=mock.Mock(return_value=f"ERROR:Global:{cleanup}\n"),
+        )
+
+        self.assertEqual(message, f"error_message={cleanup}")
+
     def test_exit_code_only_failure_has_no_repeated_error_fingerprint(self):
         task = self._failed_task(43)
         with mock.patch.object(
