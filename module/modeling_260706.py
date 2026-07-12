@@ -260,6 +260,7 @@ def create_coil(design, name="coil", window_height=50, window_length=50, window_
 
     for i, (x, y) in enumerate(zip(x_pos, y_pos)):
         for j, z in enumerate(z_pos):
+            object_name = f"{name}_{i}_{j}"
 
             if round_corner:
                 if corner_radius is None:
@@ -270,7 +271,7 @@ def create_coil(design, name="coil", window_height=50, window_length=50, window_
 
                 polyline_kwargs = dict(
                     points=points,
-                    name=f"{name}_{i}_{j}",
+                    name=object_name,
                     material=material,
                     xsection_orient="Auto",
                     xsection_type=shape,
@@ -292,7 +293,7 @@ def create_coil(design, name="coil", window_height=50, window_length=50, window_
 
                 winding = design.modeler.create_polyline(
                     points=points,
-                    name=f"{name}_{i}_{j}",
+                    name=object_name,
                     material=material,
                     xsection_orient="Auto",
                     xsection_type=shape,
@@ -302,6 +303,12 @@ def create_coil(design, name="coil", window_height=50, window_length=50, window_
                     xsection_topwidth=coil_width
                 )
 
+            if not winding:
+                raise RuntimeError(
+                    "create_polyline returned no object for "
+                    f"{object_name} (layer={i}, turn={j}, "
+                    f"xsection_width={coil_width}, xsection_height={coil_height})"
+                )
             if color is not None:
                 winding.color = color
             windings.append(winding)

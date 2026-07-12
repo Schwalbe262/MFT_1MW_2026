@@ -53,12 +53,14 @@ from module.input_parameter_260706 import (
     validation_check,
 )
 from module.modeling_260706 import (
+    create_coil as create_coil_geometry,
     create_core as create_core_geometry,
     create_winding_cooling_plates,
 )
 from module.thermal_260706 import (
     _assign_thermal_mesh,
     _build_homog_blocks,
+    _build_rx_group,
     _partition_rx_turns,
     _prepare_thermal_dispatch,
     _rx_layout,
@@ -3350,6 +3352,29 @@ class ThermalHomogenizationTests(unittest.TestCase):
         self.assertEqual([turn.name for turn in explicit], ["rx_0", "rx_1", "rx_3", "rx_4"])
         self.assertEqual([turn.name for turn in blocked], ["rx_2"])
 
+    def test_create_coil_false_return_preserves_the_polyline_root_cause(self):
+        modeler = SimpleNamespace(create_polyline=Mock(return_value=False))
+        design = SimpleNamespace(modeler=modeler)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"create_polyline returned no object for Rx_main_0_0.*"
+            r"xsection_width=1\.0.*xsection_height=80\.0",
+        ):
+            create_coil_geometry(
+                design=design,
+                name="Rx_main",
+                window_height=80.0,
+                window_length=2.0,
+                window_layer=2,
+                N_input=1,
+                width_fill_factor=1.0,
+                space_length=100.0,
+                space_width=120.0,
+                shape="rectangle",
+                color=[10, 10, 255],
+            )
+
     def test_single_turn_stays_exact_copper_with_zero_explicit_setting(self):
         turn = SimpleNamespace(name="Rx_side_0_0")
 
@@ -3384,6 +3409,62 @@ class ThermalHomogenizationTests(unittest.TestCase):
         self.assertEqual(by_name["Rx_main_block_xp"].sizes[0], f"{x_outer - x_inner}mm")
         self.assertEqual(by_name["Rx_main_block_yp"].origin[1], f"{y_inner}mm")
         self.assertEqual(by_name["Rx_main_block_yp"].sizes[1], f"{y_outer - y_inner}mm")
+
+    def test_zero_explicit_group_skips_disposable_rx_polylines(self):
+        # Regression for the observed Rx_main_13_0 CreatePolyline transport failure.
+        frame = pd.DataFrame([{
+            "N2_main": 22,
+            "nwh2": 654.6,
+        }])
+        blocks = [SimpleNamespace(name=f"Rx_main_block_{tag}") for tag in (
+            "xp", "xn", "yp", "yn",
+        )]
+        ipk = SimpleNamespace(modeler=SimpleNamespace())
+
+        with patch(
+            "module.thermal_260706.create_coil",
+            side_effect=AssertionError("disposable Rx polylines must not be created"),
+        ) as create, patch(
+            "module.thermal_260706._build_homog_blocks", return_value=blocks,
+        ) as build:
+            explicit, actual_blocks = _build_rx_group(
+                ipk, frame, "main", "Rx_main", 0.0, 0, 654.6,
+            )
+
+        create.assert_not_called()
+        build.assert_called_once_with(
+            ipk, frame, "main", "Rx_main", 0.0, 654.6,
+        )
+        self.assertEqual(explicit, [])
+        self.assertIs(actual_blocks, blocks)
+
+    def test_zero_explicit_single_turn_remains_exact_copper(self):
+        frame = pd.DataFrame([{
+            "N2_side": 1,
+            "nwh2": 80.0,
+            "nwl2_side": 0.5,
+            "wff2_side": 1.0,
+            "sl2_side_x": 100.0,
+            "sl2_side_y": 120.0,
+        }])
+        turn = SimpleNamespace(name="Rx_side_0_0")
+        ipk = SimpleNamespace(modeler=SimpleNamespace())
+
+        with patch(
+            "module.thermal_260706.create_coil",
+            return_value=([turn], 1, 0.5, 80.0, 0.0, 0.0),
+        ) as create, patch(
+            "module.thermal_260706._build_homog_blocks",
+            side_effect=AssertionError("one turn must not be homogenized"),
+        ) as build:
+            explicit, blocks = _build_rx_group(
+                ipk, frame, "side", "Rx_side", -10.0, 0, 80.0,
+            )
+
+        create.assert_called_once()
+        build.assert_not_called()
+        self.assertEqual(explicit, [turn])
+        self.assertEqual(blocks, [])
 
     def test_volume_weighted_distribution_preserves_group_power(self):
         blocks = [SimpleNamespace(volume=1.0), SimpleNamespace(volume=3.0)]

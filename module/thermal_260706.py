@@ -1001,6 +1001,54 @@ def _build_homog_blocks(ipk, df, prefix, name, offset_x, height):
     return blocks
 
 
+def _build_rx_group(ipk, df, prefix, name, offset_x, n_explicit, height):
+    """Build the final Rx thermal representation without disposable geometry."""
+    turn_count = int(df[f"N2_{prefix}"].iloc[0])
+    n_explicit = int(n_explicit)
+
+    # The standard campaign retains zero explicit turns. Creating every foil
+    # polyline only to delete it before installing these same complete-pack
+    # blocks adds no final geometry or physics. A one-turn pack remains exact
+    # copper because it has no inter-turn insulation to homogenize.
+    if n_explicit == 0 and turn_count > 1:
+        return [], _build_homog_blocks(
+            ipk, df, prefix, name, offset_x, height,
+        )
+
+    windings, _, _, _, _, _ = create_coil(
+        design=ipk, name=name,
+        window_height=df["nwh2"].iloc[0],
+        window_length=df[f"nwl2_{prefix}"].iloc[0],
+        window_layer=turn_count, N_input=1,
+        width_fill_factor=df[f"wff2_{prefix}"].iloc[0],
+        space_length=df[f"sl2_{prefix}_x"].iloc[0],
+        space_width=df[f"sl2_{prefix}_y"].iloc[0],
+        shape="rectangle", offset=[offset_x, 0, 0], color=[10, 10, 255],
+        round_corner=False,
+    )
+    explicit, middle = _partition_rx_turns(windings, n_explicit)
+    if not middle:
+        return explicit, []
+
+    names = [w.name for w in middle]
+    ipk.modeler.delete(names)
+    survivors = [n for n in names if n in set(ipk.modeler.object_names)]
+    for survivor in survivors:
+        try:
+            ipk.modeler.delete(survivor)
+        except Exception:
+            pass
+    survivors = [n for n in names if n in set(ipk.modeler.object_names)]
+    if survivors:
+        raise RuntimeError(
+            f"middle turn deletion failed for {len(survivors)} objects "
+            f"({survivors[:3]}...) - aborting thermal build"
+        )
+    return explicit, _build_homog_blocks(
+        ipk, df, prefix, name, offset_x, height,
+    )
+
+
 def _build_geometry(ipk, sim, eighth=False, mode=None):
     """열해석 지오메트리 생성. mode: full / quarter(x,y 분할) / eighth(x,y,z 분할)"""
     mode = mode or ("eighth" if eighth else "full")
@@ -1061,40 +1109,9 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     # ---- Rx 하이브리드 (main 1조 + side 2조) ----
     # n_explicit_turns = -1 이면 전 턴 explicit (블록 없음, 균질화 가정 제거).
     # 2*n_exp >= N 인 경우도 전 턴 explicit으로 처리 (중복/퇴화 블록 방지)
-    def _build_rx_group(prefix, name, offset_x):
-        windings, _, _, _, _, _ = create_coil(
-            design=ipk, name=name,
-            window_height=df["nwh2"].iloc[0],
-            window_length=df[f"nwl2_{prefix}"].iloc[0],
-            window_layer=df[f"N2_{prefix}"].iloc[0], N_input=1,
-            width_fill_factor=df[f"wff2_{prefix}"].iloc[0],
-            space_length=df[f"sl2_{prefix}_x"].iloc[0],
-            space_width=df[f"sl2_{prefix}_y"].iloc[0],
-            shape="rectangle", offset=[offset_x, 0, 0], color=[10, 10, 255],
-            round_corner=False
-        )
-        explicit, middle = _partition_rx_turns(windings, n_exp)
-        if not middle:
-            return explicit, []
-        if middle:
-            # 대형 샘플에서 일괄 삭제가 gRPC로 부분 실패하는 사례 실측
-            # ('Object does not have mesh' -> 솔버 중단) -> 삭제 후 검증 + 개별 재삭제
-            names = [w.name for w in middle]
-            ipk.modeler.delete(names)
-            survivors = [n for n in names if n in set(ipk.modeler.object_names)]
-            for n in survivors:
-                try:
-                    ipk.modeler.delete(n)
-                except Exception:
-                    pass
-            survivors = [n for n in names if n in set(ipk.modeler.object_names)]
-            if survivors:
-                raise RuntimeError(f"middle turn deletion failed for {len(survivors)} objects "
-                                   f"({survivors[:3]}...) - aborting thermal build")
-        blocks = _build_homog_blocks(ipk, df, prefix, name, offset_x, nwh2)
-        return explicit, blocks
-
-    objs["Rx_main_explicit"], objs["Rx_main_blocks"] = _build_rx_group("main", "Rx_main", 0.0)
+    objs["Rx_main_explicit"], objs["Rx_main_blocks"] = _build_rx_group(
+        ipk, df, "main", "Rx_main", 0.0, n_exp, nwh2,
+    )
 
     objs["Rx_side_explicit"] = []
     objs["Rx_side_blocks"] = []
@@ -1102,10 +1119,14 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     objs["Rx_side2_blocks"] = []
     if int(df["N2_side"].iloc[0]) > 0:
         off = l1 + l2 + l1 / 2
-        objs["Rx_side_explicit"], objs["Rx_side_blocks"] = _build_rx_group("side", "Rx_side", -off)
+        objs["Rx_side_explicit"], objs["Rx_side_blocks"] = _build_rx_group(
+            ipk, df, "side", "Rx_side", -off, n_exp, nwh2,
+        )
         if mode == "full":
             # 대칭 모드에서는 +x 측 링이 어차피 절단 제거되므로 생성 생략 (모델링 시간 절약)
-            objs["Rx_side2_explicit"], objs["Rx_side2_blocks"] = _build_rx_group("side", "Rx_side2", +off)
+            objs["Rx_side2_explicit"], objs["Rx_side2_blocks"] = _build_rx_group(
+                ipk, df, "side", "Rx_side2", +off, n_exp, nwh2,
+            )
 
     if mode in ("eighth", "quarter"):
         # EM 대칭 모델과 동일 옥탄트 (x<=0, y>=0[, z>=0])
