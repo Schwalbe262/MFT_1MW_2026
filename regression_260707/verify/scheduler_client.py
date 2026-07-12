@@ -34,6 +34,7 @@ except ImportError:
     )
 
 SCHEDULER = "http://127.0.0.1:8000"
+TEST_TASK_PRIORITY = 10
 MFT_PROJECT = "MFT_1MW_2026v1"
 # Absolute operator/controller ceiling.  The live project field may be any
 # integer in 1..300 and is the maintained-pool source of truth.
@@ -528,7 +529,7 @@ def verification_dedupe_key(
 def submit_verification(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
-        required_project_cap=None):
+        required_project_cap=None, priority=0):
     """Submit one MFT task under the shared cross-process mutation lock."""
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
@@ -536,6 +537,7 @@ def submit_verification(
             solver_revision=solver_revision,
             library_revision=library_revision,
             required_project_cap=required_project_cap,
+            priority=priority,
         )
     with campaign_mutation_lock():
         return _submit_verification_locked(
@@ -543,16 +545,19 @@ def submit_verification(
             solver_revision=solver_revision,
             library_revision=library_revision,
             required_project_cap=required_project_cap,
+            priority=priority,
         )
 
 
 def _submit_verification_locked(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
-        required_project_cap=None):
+        required_project_cap=None, priority=0):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise ValueError("verification priority must be an integer")
     identity = verification_submission_identity(
         name, params, profile, solver_revision, library_revision)
     solver_revision = identity["solver_revision"]
@@ -652,6 +657,7 @@ def _submit_verification_locked(
         "remote_cwd": GPFS_RUNS_REMOTE_CWD,
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
         "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
+        "priority": priority,
         "timeout_seconds": timeout_seconds,
         "dedupe_key": dedupe_key,
         # Exact per-task basename only. The scheduler applies this cleanup on

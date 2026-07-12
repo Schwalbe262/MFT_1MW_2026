@@ -28,10 +28,13 @@ DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 REGISTRY = os.path.join(HERE, "registry")
 
 from checkpoint_train import (  # noqa: E402
+    MAPE_ZERO_ABS_TOLERANCE,
     TARGETS,
     feature_columns,
     filter_valid_training_rows,
     inverse_y,
+    relative_error_summary,
+    relative_metric_mask,
     to_physical,
     transform_y,
 )
@@ -88,6 +91,25 @@ def _ensemble_prediction(models, Xpart, transform):
     return mu, np.maximum(derivative * sigma_t, 1e-9)
 
 
+def _evaluation_relative_metrics(y_true, error, half_width):
+    """Compute evaluation relative metrics on one auditable nonzero mask."""
+    actual = np.asarray(y_true, dtype=float).reshape(-1)
+    residual = np.asarray(error, dtype=float).reshape(-1)
+    widths = np.asarray(half_width, dtype=float).reshape(-1)
+    if len(actual) != len(residual) or len(actual) != len(widths):
+        raise ValueError("evaluation relative metric lengths differ")
+    mask = relative_metric_mask(actual)
+    summary = relative_error_summary(actual, residual)
+    relative_half_width = np.abs(widths[mask]) / np.abs(actual[mask])
+    summary["interval_p90_half_width_pct"] = (
+        float(np.quantile(relative_half_width, 0.9) * 100)
+        if len(relative_half_width) else float("nan")
+    )
+    if summary["mape_zero_abs_tolerance"] != MAPE_ZERO_ABS_TOLERANCE:
+        raise RuntimeError("relative metric tolerance contract drifted")
+    return summary
+
+
 def train_target(
     df,
     feats,
@@ -101,6 +123,7 @@ def train_target(
     from sklearn.model_selection import KFold, train_test_split
 
     sub = filter_valid_training_rows(df, target)
+    revision_cohort = sub.attrs.get("physics_data_revision_cohort", "")
     sub = sub.dropna(subset=[target])
     sub = sub[np.isfinite(pd.to_numeric(sub[target], errors="coerce"))]
     if len(sub) < min_rows:
@@ -168,9 +191,8 @@ def train_target(
     mu, sigma = _ensemble_prediction(models, X.iloc[idx_evaluation], transform)
     half_width = q90 * sigma
     error = mu - y_evaluation
-    relative_error = np.abs(error) / np.clip(np.abs(y_evaluation), 1e-9, None)
-    relative_half_width = half_width / np.clip(
-        np.abs(y_evaluation), 1e-9, None
+    relative_metrics = _evaluation_relative_metrics(
+        y_evaluation, error, half_width
     )
     target_scale = max(
         float(np.quantile(y_evaluation, 0.9) - np.quantile(y_evaluation, 0.1)),
@@ -192,15 +214,12 @@ def train_target(
         "normalized_rmse_pct": float(
             np.sqrt(np.mean(error ** 2)) / target_scale * 100
         ),
-        "mape_pct": float(np.mean(relative_error) * 100),
-        "p90_ape_pct": float(np.quantile(relative_error, 0.9) * 100),
+        **relative_metrics,
         "q90_conformal": q90,
         "interval_coverage": float(np.mean(np.abs(error) <= half_width)),
         "interval_mean_width": float(np.mean(2.0 * half_width)),
         "interval_p90_width": float(np.quantile(2.0 * half_width, 0.9)),
-        "interval_p90_half_width_pct": float(
-            np.quantile(relative_half_width, 0.9) * 100
-        ),
+        "physics_data_revision_cohort": revision_cohort,
     }
     bundle = {
         "models": models,
@@ -208,6 +227,7 @@ def train_target(
         "transform": transform,
         "q90": q90,
         "target": target,
+        "physics_data_revision_cohort": revision_cohort,
         "metrics": metrics,
         "trained_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -573,6 +593,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
         ).encode("utf-8")
     ).hexdigest()
     target_reports = {}
+    target_revision_cohorts = {}
     artifact_sha256 = {}
     try:
         for target in targets:
@@ -616,6 +637,9 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             artifact_sha256[f"{target}/models.pkl"] = _sha256(model_path)
             artifact_sha256[f"{target}/meta.json"] = _sha256(meta_path)
             target_reports[target] = metrics
+            target_revision_cohorts[target] = bundle[
+                "physics_data_revision_cohort"
+            ]
             print(
                 f"{target:32s} R2={metrics['r2']:.4f} "
                 f"MAPE={metrics['mape_pct']:.2f}% "
@@ -635,6 +659,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             "profile_sha256": profile_sha256,
             "features": list(features),
             "targets": list(targets),
+            "target_physics_data_revision_cohorts": target_revision_cohorts,
             "artifacts": artifact_sha256,
             "report": target_reports,
         }

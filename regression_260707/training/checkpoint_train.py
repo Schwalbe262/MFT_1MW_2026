@@ -26,6 +26,8 @@ DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 CURVE_CSV = os.path.join(HERE, "learning_curve.csv")
 MAX_TRUSTED_TEMPERATURE_C = 4700.0
 MIN_TRUSTED_TEMPERATURE_C = -273.15
+LEGACY_PHYSICS_DATA_REVISION = "legacy_unspecified"
+MAPE_ZERO_ABS_TOLERANCE = 1e-9
 
 
 def _sha256(path):
@@ -90,7 +92,29 @@ def filter_valid_training_rows(df, target, profile=None):
             keep &= values.gt(MIN_TRUSTED_TEMPERATURE_C) & values.lt(
                 MAX_TRUSTED_TEMPERATURE_C
             )
-    return df.loc[keep]
+    filtered = df.loc[keep].copy()
+    if filtered.empty:
+        filtered.attrs["physics_data_revision_cohort"] = ""
+        return filtered
+    if "physics_data_revision" in filtered.columns:
+        revisions = (
+            filtered["physics_data_revision"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace("", LEGACY_PHYSICS_DATA_REVISION)
+        )
+    else:
+        revisions = pd.Series(
+            LEGACY_PHYSICS_DATA_REVISION, index=filtered.index, dtype=object
+        )
+    cohorts = tuple(sorted(set(revisions.tolist())))
+    if len(cohorts) != 1:
+        raise RuntimeError(
+            f"target {target} mixes physics_data_revision cohorts: {cohorts}"
+        )
+    filtered.attrs["physics_data_revision_cohort"] = cohorts[0]
+    return filtered
 
 
 def to_physical(df):
@@ -147,6 +171,35 @@ def inverse_y(t, kind):
     return t
 
 
+def relative_metric_mask(y_true, tolerance=MAPE_ZERO_ABS_TOLERANCE):
+    """Select finite targets whose absolute value makes APE meaningful."""
+    values = np.asarray(y_true, dtype=float).reshape(-1)
+    return np.isfinite(values) & (np.abs(values) > float(tolerance))
+
+
+def relative_error_summary(
+        y_true, error, tolerance=MAPE_ZERO_ABS_TOLERANCE):
+    """Return MAPE evidence without letting zero targets dominate APE."""
+    actual = np.asarray(y_true, dtype=float).reshape(-1)
+    residual = np.asarray(error, dtype=float).reshape(-1)
+    if len(actual) != len(residual):
+        raise ValueError("relative metric target and error lengths differ")
+    mask = relative_metric_mask(actual, tolerance=tolerance)
+    relative = np.abs(residual[mask]) / np.abs(actual[mask])
+    return {
+        "mape_pct": (
+            float(np.mean(relative) * 100) if len(relative) else float("nan")
+        ),
+        "p90_ape_pct": (
+            float(np.quantile(relative, 0.9) * 100)
+            if len(relative) else float("nan")
+        ),
+        "mape_n": int(mask.sum()),
+        "mape_excluded_zero_count": int(len(actual) - mask.sum()),
+        "mape_zero_abs_tolerance": float(tolerance),
+    }
+
+
 def cv_metrics(X, y, kind, n_splits=5, seed=42):
     import lightgbm as lgb
     from sklearn.model_selection import KFold
@@ -163,14 +216,12 @@ def cv_metrics(X, y, kind, n_splits=5, seed=42):
         preds[te] = model.predict(X.iloc[te])
     yhat = inverse_y(preds, kind)
     err = yhat - y
-    rel = np.abs(err) / np.clip(np.abs(y), 1e-9, None)
     ss_res = float(np.sum(err ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2)) or 1e-12
     return {
         "r2": 1 - ss_res / ss_tot,
         "rmse": float(np.sqrt(np.mean(err ** 2))),
-        "mape_pct": float(np.mean(rel) * 100),
-        "p90_ape_pct": float(np.quantile(rel, 0.9) * 100),
+        **relative_error_summary(y, err),
     }
 
 
@@ -211,12 +262,16 @@ def main():
         raise SystemExit("no design-time training features remain after strict filtering")
 
     rows = []
+    target_revision_cohorts = {}
     for target, cfg in TARGETS.items():
         if target not in df.columns:
             print(f"  [skip] {target} (컬럼 없음)")
             continue
         # 온도 타겟: thermal 솔브가 성공한 행만 (thermal_solved 플래그, 2026-07-09)
         target_df = filter_valid_training_rows(df, target, args.profile)
+        revision_cohort = target_df.attrs.get(
+            "physics_data_revision_cohort", ""
+        )
         sub = target_df.dropna(subset=[target])
         sub = sub[np.isfinite(sub[target])]
         if len(sub) < 100:
@@ -226,7 +281,12 @@ def main():
         y = sub[target].to_numpy(dtype=float)
 
         m = cv_metrics(X, y, cfg["transform"])
-        row = {"time": stamp, "target": target, "n": len(sub), **m, "slice": "global"}
+        target_revision_cohorts[target] = revision_cohort
+        row = {
+            "time": stamp, "target": target, "n": len(sub), **m,
+            "slice": "global",
+            "physics_data_revision_cohort": revision_cohort,
+        }
         rows.append(row)
         print(f"  {target:32s} n={len(sub):6d}  R2={m['r2']:.4f}  MAPE={m['mape_pct']:.2f}%  "
               f"P90APE={m['p90_ape_pct']:.2f}%  RMSE={m['rmse']:.4g}")
@@ -236,7 +296,11 @@ def main():
             sl = sub[(sub["Llt_phys"] >= 20) & (sub["Llt_phys"] <= 40)]
             if len(sl) >= 100:
                 ms = cv_metrics(sl[feats].fillna(0.0), sl[target].to_numpy(dtype=float), cfg["transform"])
-                rows.append({"time": stamp, "target": target, "n": len(sl), **ms, "slice": "Llt20-40"})
+                rows.append({
+                    "time": stamp, "target": target, "n": len(sl), **ms,
+                    "slice": "Llt20-40",
+                    "physics_data_revision_cohort": revision_cohort,
+                })
                 print(f"    └ slice Llt 20-40uH: n={len(sl)}  MAPE={ms['mape_pct']:.2f}%  P90={ms['p90_ape_pct']:.2f}%")
 
     if rows:
@@ -257,6 +321,7 @@ def main():
                 "profile_sha256": profile_sha256,
                 "strict_full_rows": n_total,
                 "features": list(feats),
+                "target_physics_data_revision_cohorts": target_revision_cohorts,
                 "metrics": rows,
             }, args.result_json)
     else:

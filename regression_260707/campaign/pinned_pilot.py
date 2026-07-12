@@ -48,6 +48,7 @@ PILOT_RESERVED_VALID_CANDIDATES = sum(
     contract["tasks"] for contract in PILOT_STAGE_CONTRACT.values())
 MFT_PROJECT = scheduler_client.MFT_PROJECT
 MFT_PROJECT_MAX_ACTIVE_TASKS = scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS
+TEST_TASK_PRIORITY = scheduler_client.TEST_TASK_PRIORITY
 PILOT_PROJECT_HARD_CAP = PILOT_RESERVED_VALID_CANDIDATES
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "").strip()
 if not _LOCALAPPDATA:
@@ -798,6 +799,7 @@ def _submit_pilot_stage_locked(
                 cpus=CPUS,
                 solver_revision=solver_revision,
                 library_revision=library_revision,
+                priority=TEST_TASK_PRIORITY,
             )
             if record["task_id"] is None:
                 raise RuntimeError(f"scheduler did not return a task ID for {name}")

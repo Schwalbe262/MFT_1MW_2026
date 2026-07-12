@@ -343,6 +343,9 @@ class PilotMainTests(unittest.TestCase):
         self.assertEqual(manifest["seed"], SEED + 1)
         self.assertIn(f"p08-seed{SEED + 1}-o2", manifest["tag"])
         self.assertEqual(path.name, f"{manifest['tag']}.json")
+        for call in calls["submit"].call_args_list:
+            self.assertEqual(
+                call.kwargs["priority"], pinned_pilot.TEST_TASK_PRIORITY)
         for index, task in enumerate(manifest["tasks"]):
             self.assertEqual(task["name"], f"mft-pilot-{manifest['tag']}-{index:02d}")
             self.assertEqual(task["task_id"], 1000 + index)

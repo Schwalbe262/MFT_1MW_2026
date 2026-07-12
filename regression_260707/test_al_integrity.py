@@ -224,6 +224,38 @@ def complete_errors(spec_pass=(1, 1, 1)):
 
 
 class ThermalTrainingFilterTests(unittest.TestCase):
+    def test_training_filter_rejects_mixed_physics_revision_cohorts(self):
+        frame = pd.DataFrame({
+            "_strict_valid_full": [True, True],
+            "Llt": [27.4, 27.6],
+            "physics_data_revision": ["revision-a", "revision-b"],
+        })
+
+        with self.assertRaisesRegex(
+                RuntimeError, "mixes physics_data_revision cohorts"):
+            filter_valid_training_rows(frame, "Llt")
+
+    def test_training_filter_records_single_or_legacy_revision_cohort(self):
+        explicit = pd.DataFrame({
+            "_strict_valid_full": [True, True],
+            "Llt": [27.4, 27.6],
+            "physics_data_revision": ["revision-a", "revision-a"],
+        })
+        legacy = explicit.drop(columns=["physics_data_revision"])
+
+        self.assertEqual(
+            filter_valid_training_rows(
+                explicit, "Llt"
+            ).attrs["physics_data_revision_cohort"],
+            "revision-a",
+        )
+        self.assertEqual(
+            filter_valid_training_rows(
+                legacy, "Llt"
+            ).attrs["physics_data_revision_cohort"],
+            "legacy_unspecified",
+        )
+
     def test_only_complete_unsaturated_rows_feed_temperature_models(self):
         targets = (
             "Tprobe_core_center_max",
@@ -462,6 +494,41 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             command.index("python run_simulation_260706.py"),
         )
 
+    def test_submit_forwards_explicit_integer_priority(self):
+        submitted = Mock(status_code=201)
+        submitted.json.return_value = {"id": 401}
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), patch.object(
+                    scheduler_client.requests, "post",
+                    return_value=submitted) as post:
+            task_id = scheduler_client.submit_verification(
+                "candidate-priority", "candidate_workdir", {"x": 1}, {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+                priority=scheduler_client.TEST_TASK_PRIORITY,
+            )
+
+        self.assertEqual(task_id, 401)
+        self.assertEqual(
+            post.call_args.kwargs["json"]["priority"],
+            scheduler_client.TEST_TASK_PRIORITY,
+        )
+
+    def test_submit_rejects_non_integer_priority(self):
+        for priority in (True, 10.0, "10", None):
+            with self.subTest(priority=priority), patch.object(
+                    scheduler_client.requests, "post") as post:
+                with self.assertRaisesRegex(ValueError, "must be an integer"):
+                    scheduler_client.submit_verification(
+                        "candidate-invalid-priority", "candidate_workdir",
+                        {"x": 1}, {},
+                        solver_revision=TEST_REVISION,
+                        library_revision=TEST_LIBRARY_REVISION,
+                        priority=priority,
+                    )
+            post.assert_not_called()
+
     def test_dynamic_submit_binds_every_post_to_exact_observed_cap(self):
         submitted = Mock(status_code=201)
         submitted.json.return_value = {"id": 404}
@@ -526,6 +593,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertTrue(post.call_args.args[0].endswith("/api/tasks"))
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["project"], scheduler_client.MFT_PROJECT)
+        self.assertEqual(payload["priority"], 0)
         self.assertRegex(
             payload["dedupe_key"],
             rf"^mft-al:candidate-41:{TEST_REVISION}:{TEST_LIBRARY_REVISION}:[0-9a-f]{{16}}$")

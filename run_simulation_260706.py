@@ -189,6 +189,30 @@ def _raw_aedt_object_attribute(obj, property_name):
     return str(value).strip().strip('"')
 
 
+def _sheet_area_model_units(sheet):
+    """Read one sheet area through PyAEDT's FacePrimitive API."""
+    name = getattr(sheet, "name", sheet)
+    try:
+        faces = list(sheet.faces)
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot enumerate faces for sheet {name!r}"
+        ) from exc
+    if len(faces) != 1:
+        raise RuntimeError(
+            f"sheet {name!r} must expose exactly one face, got {len(faces)}"
+        )
+    try:
+        area = abs(float(faces[0].area))
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot read face area for sheet {name!r}"
+        ) from exc
+    if not math.isfinite(area) or area <= 0:
+        raise RuntimeError(f"invalid sheet area for {name!r}: {area!r}")
+    return area
+
+
 def _git_provenance():
     """Return the full solver revision and tracked-worktree dirty flag."""
     try:
@@ -2250,7 +2274,7 @@ class Simulation():
             sheet.model = False
             core_flux_sheets.append(sheet)
         full_flux_area_m2 = sum(
-            abs(float(sheet.area)) for sheet in core_flux_sheets
+            _sheet_area_model_units(sheet) for sheet in core_flux_sheets
         ) * 1e-6
         expected_full_flux_area_m2 = float(
             self.df_plus["Ae_gross_m2"].iloc[0]
@@ -2514,7 +2538,8 @@ class Simulation():
         if not self.design1.core_flux_sheets:
             raise RuntimeError("symmetry split removed every core flux section")
         retained_flux_area_m2 = sum(
-            abs(float(sheet.area)) for sheet in self.design1.core_flux_sheets
+            _sheet_area_model_units(sheet)
+            for sheet in self.design1.core_flux_sheets
         ) * 1e-6
         expected_flux_area_m2 = float(
             self.df_plus["Ae_gross_m2"].iloc[0]
@@ -3703,7 +3728,7 @@ class Simulation():
         )
         try:
             flux_section_area_retained_m2 = sum(
-                abs(float(sheet.area))
+                _sheet_area_model_units(sheet)
                 for sheet in self.design1.core_flux_sheets
             ) * 1e-6
         except Exception as exc:

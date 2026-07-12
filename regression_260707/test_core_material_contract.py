@@ -41,6 +41,7 @@ from run_simulation_260706 import (
     Simulation,
     _b_power_volume_integral_si,
     _core_group_index,
+    _sheet_area_model_units,
 )
 
 
@@ -48,6 +49,38 @@ K = 0.85
 Y = 1.74
 MARGIN = 1.15
 CM = 1.377
+
+
+class SheetAreaReadbackTests(unittest.TestCase):
+    def test_reads_object3d_sheet_area_from_its_single_face(self):
+        sheet = SimpleNamespace(
+            name="core_flux_section_1",
+            faces=[SimpleNamespace(area=1540.0)],
+        )
+
+        self.assertEqual(_sheet_area_model_units(sheet), 1540.0)
+
+    def test_rejects_missing_multiple_or_invalid_faces(self):
+        cases = (
+            (SimpleNamespace(name="none", faces=[]), "exactly one face"),
+            (
+                SimpleNamespace(
+                    name="multiple",
+                    faces=[SimpleNamespace(area=1.0), SimpleNamespace(area=2.0)],
+                ),
+                "exactly one face",
+            ),
+            (
+                SimpleNamespace(
+                    name="invalid", faces=[SimpleNamespace(area=float("nan"))]
+                ),
+                "invalid sheet area",
+            ),
+        )
+        for sheet, message in cases:
+            with self.subTest(sheet=sheet.name), self.assertRaisesRegex(
+                    RuntimeError, message):
+                _sheet_area_model_units(sheet)
 
 
 def native_props(direction, kf=K):
