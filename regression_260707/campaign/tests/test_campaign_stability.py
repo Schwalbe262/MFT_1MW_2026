@@ -301,6 +301,17 @@ class FeederTests(unittest.TestCase):
             },
         ), calls)
         self.assertIn((
+            "/api/task-capacity",
+            {
+                "cpus": feeder.CPUS_PER_TASK,
+                "memory_mb": 32768,
+                "scheduling_profile": "fea_bursty",
+                "required_capability": "conda:pyaedt2026v1",
+                "env_profile": "pyaedt2026v1",
+                "project": pinned_pilot.MFT_PROJECT,
+            },
+        ), calls)
+        self.assertIn((
             "/api/tasks",
             {
                 "limit": 10000,

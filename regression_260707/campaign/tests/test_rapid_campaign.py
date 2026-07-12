@@ -361,7 +361,7 @@ INFO:Global:Desktop has been released and closed.
             "d44e42386932a56a",
         )
 
-    def test_structured_cleanup_error_is_retained_when_stderr_has_no_better_root(self):
+    def test_structured_cleanup_error_falls_back_to_exit_code_without_root_cause(self):
         cleanup = (
             "A(n) <class 'TypeError'> error occurred while retrieving information "
             "for the active AEDT sessions: argument of type 'NoneType' is not iterable"
@@ -372,15 +372,16 @@ INFO:Global:Desktop has been released and closed.
             stderr_fetcher=mock.Mock(return_value=f"ERROR:Global:{cleanup}\n"),
         )
 
-        self.assertEqual(message, f"error_message={cleanup}")
+        self.assertEqual(message, "exit_code=1")
 
     def test_exit_code_only_failure_has_no_repeated_error_fingerprint(self):
         task = self._failed_task(43)
         with mock.patch.object(
-                rapid_campaign, "_fetch_task_stderr", return_value=""):
+                rapid_campaign, "_fetch_task_stderr", return_value="") as fetch:
             inspected = rapid_campaign.inspect_production_tasks(
                 [task], SOLVER_REVISION, LIBRARY_REVISION)
 
+        fetch.assert_not_called()
         result = inspected["outcomes"][0]
         self.assertEqual(result["error_message"], "exit_code=1")
         self.assertIsNone(result["error_fingerprint"])
@@ -397,7 +398,7 @@ INFO:Global:Desktop has been released and closed.
         self.assertEqual(result["error_message"], "status=cancelled")
         self.assertIsNone(result["error_fingerprint"])
 
-    def test_legacy_cached_exit_only_fingerprint_is_reclassified(self):
+    def test_legacy_cached_exit_only_is_reclassified_without_remote_stderr(self):
         task = self._failed_task(44)
         name = task["name"]
         cached = outcome(
@@ -421,12 +422,9 @@ INFO:Global:Desktop has been released and closed.
             )
 
         refreshed = inspected["outcomes"][0]
-        fetch.assert_called_once_with(44)
-        self.assertEqual(
-            refreshed["error_message"],
-            "stderr_run_one_loop=Failed to execute gRPC AEDT command: Analyze",
-        )
-        self.assertIsNotNone(refreshed["error_fingerprint"])
+        fetch.assert_not_called()
+        self.assertEqual(refreshed["error_message"], "exit_code=1")
+        self.assertIsNone(refreshed["error_fingerprint"])
         self.assertNotEqual(
             refreshed["error_fingerprint"], cached["error_fingerprint"])
         self.assertEqual(inspected["cache"]["44"], refreshed)
@@ -476,7 +474,7 @@ INFO:Global:Desktop has been released and closed.
             reason.startswith("repeated_runtime_error:") for reason in reasons
         ))
 
-    def test_legacy_cached_prefixed_info_is_refetched_and_reclassified(self):
+    def test_legacy_cached_prefixed_info_is_metadata_reclassified_without_fetch(self):
         task = self._failed_task(49)
         name = task["name"]
         old_message = (
@@ -503,12 +501,9 @@ INFO:Global:Desktop has been released and closed.
             )
 
         refreshed = inspected["outcomes"][0]
-        fetch.assert_called_once_with(49)
-        self.assertEqual(
-            refreshed["error_message"],
-            "stderr_run_one_loop=copied loss preparation failed",
-        )
-        self.assertIsNotNone(refreshed["error_fingerprint"])
+        fetch.assert_not_called()
+        self.assertEqual(refreshed["error_message"], "exit_code=1")
+        self.assertIsNone(refreshed["error_fingerprint"])
         self.assertNotEqual(
             refreshed["error_fingerprint"], cached["error_fingerprint"]
         )
@@ -527,7 +522,7 @@ INFO:Global:Desktop has been released and closed.
             rapid_campaign._runtime_error_fingerprint(message)
         )
 
-    def test_three_identical_stderr_runtime_errors_still_pause(self):
+    def test_explicit_diagnostic_enrichment_can_still_fingerprint_stderr(self):
         tasks = [self._failed_task(task_id) for task_id in range(45, 48)]
         stderr = (
             "ERROR:root:run_one_loop failed: Failed to execute gRPC AEDT "
@@ -535,18 +530,23 @@ INFO:Global:Desktop has been released and closed.
         )
         with mock.patch.object(
                 rapid_campaign, "_fetch_task_stderr", return_value=stderr):
-            inspected = rapid_campaign.inspect_production_tasks(
-                tasks, SOLVER_REVISION, LIBRARY_REVISION)
+            outcomes = []
+            for task in tasks:
+                item = outcome(
+                    task["id"], "failed", name=task["name"],
+                    status="failed", reason="task_failed")
+                rapid_campaign._refresh_failure_outcome(item, task)
+                outcomes.append(item)
 
         fingerprints = {
-            item["error_fingerprint"] for item in inspected["outcomes"]
+            item["error_fingerprint"] for item in outcomes
         }
         self.assertEqual(len(fingerprints), 1)
         fingerprint = fingerprints.pop()
         self.assertIsNotNone(fingerprint)
         self.assertIn(
             f"repeated_runtime_error:{fingerprint}:3",
-            rapid_campaign._production_gate_reasons(inspected),
+            rapid_campaign._production_gate_reasons(production(outcomes)),
         )
 
 

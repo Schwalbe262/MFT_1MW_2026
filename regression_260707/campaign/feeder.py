@@ -538,6 +538,10 @@ def scheduler_snapshot(
         "scheduling_profile": "fea_bursty",
         "required_capability": "conda:pyaedt2026v1",
         "env_profile": "pyaedt2026v1",
+        # License admission is project-scoped and fail-closed.  Omitting this
+        # field makes a known MFT request look like an unknown FEA project and
+        # falsely blocks refill before priority/admission ordering is reached.
+        "project": MFT_PROJECT,
     })
     global_statuses = (
         global_summary.get("statuses") if isinstance(global_summary, dict) else None)
