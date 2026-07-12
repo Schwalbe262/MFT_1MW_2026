@@ -299,6 +299,41 @@ def _completion_error(item, registry, expected_identity=None):
             return f"checkpoint_metrics_{key}_mismatch"
     if not isinstance(metrics.get("metrics"), list) or not metrics["metrics"]:
         return "checkpoint_metrics_empty"
+
+    parity_path_value = item.get("parity_result")
+    parity_hash_value = item.get("parity_result_sha256")
+    if bool(parity_path_value) != bool(parity_hash_value):
+        return "checkpoint_parity_evidence_incomplete"
+    if parity_path_value:
+        parity_path = os.path.abspath(parity_path_value)
+        expected_parity_path = os.path.splitext(metrics_path)[0] + ".parity.json"
+        if parity_path != expected_parity_path:
+            return "checkpoint_parity_path_mismatch"
+        if not os.path.isfile(parity_path):
+            return "checkpoint_parity_missing"
+        if _sha256(parity_path) != parity_hash_value:
+            return "checkpoint_parity_fingerprint_mismatch"
+        try:
+            with open(parity_path, encoding="utf-8") as handle:
+                parity = json.load(handle)
+        except Exception as exc:
+            return f"checkpoint_parity_invalid:{exc}"
+        parity_checks = {
+            "schema_version": 1,
+            "artifact_type": "checkpoint_cv_oof_parity",
+            "checkpoint": threshold,
+            "dataset": snapshot,
+            "dataset_sha256": item["snapshot_sha256"],
+            "profile": os.path.abspath(item["profile_path"]),
+            "profile_sha256": item["profile_sha256"],
+            "strict_full_rows": actual_rows,
+            "prediction_kind": "out_of_fold",
+        }
+        for key, expected in parity_checks.items():
+            if parity.get(key) != expected:
+                return f"checkpoint_parity_{key}_mismatch"
+        if not isinstance(parity.get("targets"), dict) or not parity["targets"]:
+            return "checkpoint_parity_targets_empty"
     kind = item.get("kind")
     if kind == "metrics_only":
         if threshold >= activation_minimum:
@@ -442,6 +477,7 @@ def training_commands(
     """Build child commands with one already-normalized absolute profile path."""
     if not profile or not os.path.isabs(profile):
         raise ValueError("checkpoint profile must be an absolute path")
+    parity_result = os.path.splitext(metrics_result)[0] + ".parity.json"
     commands = [[
             sys.executable,
             str(HERE / "checkpoint_train.py"),
@@ -450,6 +486,7 @@ def training_commands(
             "--profile", profile,
             "--checkpoint", str(threshold),
             "--result-json", metrics_result,
+            "--parity-json", parity_result,
         ]]
     if candidate_result:
         commands.append([
@@ -734,6 +771,7 @@ def main():
                 "checkpoint_metrics",
                 f"threshold_{threshold:06d}_attempt_{attempt_number:06d}.json",
             )
+            parity_result = os.path.splitext(metrics_result)[0] + ".parity.json"
             candidate_result = os.path.join(
                 run_root,
                 "candidate_results",
@@ -754,6 +792,8 @@ def main():
                     _run(command)
                 with open(metrics_result, encoding="utf-8") as handle:
                     metric_evidence = json.load(handle)
+                with open(parity_result, encoding="utf-8") as handle:
+                    parity_evidence = json.load(handle)
                 snapshot_sha256 = _sha256(snapshot)
                 metric_checks = {
                     "dataset": os.path.abspath(snapshot),
@@ -767,6 +807,20 @@ def main():
                         raise RuntimeError(
                             f"checkpoint metrics {key} mismatch"
                         )
+                parity_checks = {
+                    "schema_version": 1,
+                    "artifact_type": "checkpoint_cv_oof_parity",
+                    "checkpoint": threshold,
+                    **metric_checks,
+                    "prediction_kind": "out_of_fold",
+                }
+                for key, expected in parity_checks.items():
+                    if parity_evidence.get(key) != expected:
+                        raise RuntimeError(
+                            f"checkpoint parity {key} mismatch"
+                        )
+                if not isinstance(parity_evidence.get("targets"), dict) or not parity_evidence["targets"]:
+                    raise RuntimeError("checkpoint parity targets are empty")
                 common_completion = {
                     "threshold": threshold,
                     "actual_strict_full_rows": int(len(strict)),
@@ -774,6 +828,8 @@ def main():
                     "snapshot_sha256": snapshot_sha256,
                     "metrics_result": metrics_result,
                     "metrics_result_sha256": _sha256(metrics_result),
+                    "parity_result": parity_result,
+                    "parity_result_sha256": _sha256(parity_result),
                     "profile_path": args.profile,
                     "profile_sha256": locked_profile_sha256,
                     "thresholds_sha256": locked_thresholds_sha256,

@@ -23,6 +23,7 @@ from regression_260707.monitoring.readers import (
 
 def _install_checkpoint_fixture(
         campaign_root: Path, *, metrics_hash_valid: bool = True,
+        parity_hash_valid: bool = True,
         parity_profile_sha: str = "profile-sha") -> tuple[Path, Path]:
     pointer = campaign_root / "training" / "registry" / "current.json"
     pointer.unlink()
@@ -33,7 +34,9 @@ def _install_checkpoint_fixture(
         "schema_version": 1,
         "completed_at": "2026-07-11T02:40:00+09:00",
         "checkpoint": 500,
+        "dataset": "snapshot.parquet",
         "dataset_sha256": "snapshot-sha",
+        "profile": "profile.json",
         "profile_sha256": "profile-sha",
         "strict_full_rows": 100,
         "metrics": [
@@ -73,14 +76,14 @@ def _install_checkpoint_fixture(
             "activation_minimum_strict_full_rows": 3000,
         },
     }
-    state_path = run_root / "checkpoint_state.json"
-    state_path.write_text(json.dumps(state), encoding="utf-8")
     parity_path = metrics_path.with_suffix(".parity.json")
     parity_path.write_text(json.dumps({
         "schema_version": 1,
         "artifact_type": "checkpoint_cv_oof_parity",
         "checkpoint": 500,
+        "dataset": "snapshot.parquet",
         "dataset_sha256": "snapshot-sha",
+        "profile": "profile.json",
         "profile_sha256": parity_profile_sha,
         "strict_full_rows": 100,
         "prediction_kind": "out_of_fold",
@@ -98,6 +101,15 @@ def _install_checkpoint_fixture(
             },
         },
     }), encoding="utf-8")
+    parity_hash = hashlib.sha256(parity_path.read_bytes()).hexdigest()
+    if not parity_hash_valid:
+        parity_hash = "0" * 64
+    state["completed"][0].update({
+        "parity_result": str(parity_path),
+        "parity_result_sha256": parity_hash,
+    })
+    state_path = run_root / "checkpoint_state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
     return metrics_path, parity_path
 
 
@@ -269,6 +281,22 @@ def test_bad_parity_identity_keeps_metrics_but_returns_empty_parity(
     assert parity["pairs"] == []
     assert any("checkpoint parity identity mismatch" in warning
                for warning in parity["warnings"])
+
+
+def test_bad_parity_hash_keeps_metrics_but_returns_empty_parity(
+        campaign_root, artifact_service):
+    _install_checkpoint_fixture(campaign_root, parity_hash_valid=False)
+
+    payload = artifact_service.models(current_data_count=100)
+    model = next(item for item in payload["models"] if item["target"] == "Llt_phys")
+
+    assert model["status"] == "checkpoint"
+    assert model["evaluated"] is True
+    assert model["r2"] == .95
+    assert model["parity_available"] is False
+    assert model["parity_sample_count"] == 0
+    assert any("checkpoint parity hash mismatch" in warning
+               for warning in payload["warnings"])
 
 
 def test_checkpoint_state_must_match_current_strict_solver_library_identity(

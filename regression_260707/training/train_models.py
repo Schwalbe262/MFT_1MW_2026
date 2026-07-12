@@ -29,6 +29,7 @@ REGISTRY = os.path.join(HERE, "registry")
 
 from checkpoint_train import (  # noqa: E402
     TARGETS,
+    _zero_aware_percentage_metrics,
     feature_columns,
     filter_valid_training_rows,
     inverse_y,
@@ -168,7 +169,7 @@ def train_target(
     mu, sigma = _ensemble_prediction(models, X.iloc[idx_evaluation], transform)
     half_width = q90 * sigma
     error = mu - y_evaluation
-    relative_error = np.abs(error) / np.clip(np.abs(y_evaluation), 1e-9, None)
+    percentage_metrics = _zero_aware_percentage_metrics(y_evaluation, mu)
     relative_half_width = half_width / np.clip(
         np.abs(y_evaluation), 1e-9, None
     )
@@ -192,8 +193,7 @@ def train_target(
         "normalized_rmse_pct": float(
             np.sqrt(np.mean(error ** 2)) / target_scale * 100
         ),
-        "mape_pct": float(np.mean(relative_error) * 100),
-        "p90_ape_pct": float(np.quantile(relative_error, 0.9) * 100),
+        **percentage_metrics,
         "q90_conformal": q90,
         "interval_coverage": float(np.mean(np.abs(error) <= half_width)),
         "interval_mean_width": float(np.mean(2.0 * half_width)),
@@ -616,10 +616,18 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             artifact_sha256[f"{target}/models.pkl"] = _sha256(model_path)
             artifact_sha256[f"{target}/meta.json"] = _sha256(meta_path)
             target_reports[target] = metrics
+            mape_text = (
+                f"{metrics['mape_pct']:.2f}%"
+                if metrics["mape_pct"] is not None else "n/a"
+            )
+            p90_text = (
+                f"{metrics['p90_ape_pct']:.2f}%"
+                if metrics["p90_ape_pct"] is not None else "n/a"
+            )
             print(
                 f"{target:32s} R2={metrics['r2']:.4f} "
-                f"MAPE={metrics['mape_pct']:.2f}% "
-                f"P90={metrics['p90_ape_pct']:.2f}% "
+                f"MAPE={mape_text} "
+                f"P90={p90_text} "
                 f"coverage={metrics['interval_coverage']:.3f}"
             )
 

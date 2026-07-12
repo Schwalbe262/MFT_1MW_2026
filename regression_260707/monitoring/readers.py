@@ -1172,6 +1172,42 @@ class ArtifactService:
                     activation_minimum = self._exact_integer(
                         item.get("activation_minimum_strict_full_rows")
                     )
+                parity_path = None
+                parity_text = _safe_text(item.get("parity_result"), 4_096)
+                parity_hash = str(
+                    item.get("parity_result_sha256", "")
+                ).strip().lower()
+                if bool(parity_text) != bool(parity_hash):
+                    warnings.append(
+                        f"checkpoint parity evidence is incomplete: {state_path}"
+                    )
+                elif parity_text:
+                    try:
+                        authorized_parity = Path(parity_text)
+                        if not authorized_parity.is_absolute():
+                            authorized_parity = run_root / authorized_parity
+                        authorized_parity = authorized_parity.resolve()
+                        if not authorized_parity.is_relative_to(run_root):
+                            raise ValueError("parity result escapes checkpoint run root")
+                        if authorized_parity != metrics_path.with_suffix(
+                            ".parity.json"
+                        ):
+                            raise ValueError("parity result path is not deterministic")
+                    except (OSError, TypeError, ValueError) as exc:
+                        warnings.append(
+                            f"checkpoint parity path rejected ({exc}): {state_path}"
+                        )
+                    else:
+                        actual_parity_hash = _sha256_file(authorized_parity)
+                        if (
+                            not re.fullmatch(r"[0-9a-f]{64}", parity_hash)
+                            or actual_parity_hash != parity_hash
+                        ):
+                            warnings.append(
+                                f"checkpoint parity hash mismatch: {authorized_parity}"
+                            )
+                        else:
+                            parity_path = authorized_parity
                 candidate = {
                     "checkpoint": threshold,
                     "completed_at": completed_text,
@@ -1182,7 +1218,7 @@ class ArtifactService:
                     "metrics_payload": metrics_payload,
                     "metrics_path": metrics_path,
                     "state_path": state_path,
-                    "parity_path": metrics_path.with_suffix(".parity.json"),
+                    "parity_path": parity_path,
                     "parity_targets": {},
                     "parity_metadata": {},
                 }
@@ -1192,6 +1228,11 @@ class ArtifactService:
             return {"candidate": None, "warnings": list(dict.fromkeys(warnings))}
         _, _, selected = max(candidates, key=lambda entry: (entry[0], entry[1]))
         parity_path = selected["parity_path"]
+        if parity_path is None:
+            return {
+                "candidate": selected,
+                "warnings": list(dict.fromkeys(warnings)),
+            }
         parity_result = self.cache.json(parity_path, {}, max_bytes=64 * 1024 * 1024)
         if parity_result.warning:
             warnings.append(parity_result.warning)
@@ -1201,10 +1242,15 @@ class ArtifactService:
             parity_matches = (
                 parity.get("schema_version") == CHECKPOINT_PARITY_SCHEMA_VERSION
                 and parity.get("artifact_type") == CHECKPOINT_PARITY_ARTIFACT_TYPE
+                and parity.get("prediction_kind") == "out_of_fold"
                 and self._exact_integer(parity.get("checkpoint")) == selected["checkpoint"]
                 and self._exact_integer(parity.get("strict_full_rows")) == selected["strict_full_rows"]
+                and str(parity.get("dataset", ""))
+                == str(metrics_payload.get("dataset", ""))
                 and str(parity.get("dataset_sha256", "")).strip().lower()
                 == str(metrics_payload.get("dataset_sha256", "")).strip().lower()
+                and str(parity.get("profile", ""))
+                == str(metrics_payload.get("profile", ""))
                 and str(parity.get("profile_sha256", "")).strip().lower()
                 == str(metrics_payload.get("profile_sha256", "")).strip().lower()
             )

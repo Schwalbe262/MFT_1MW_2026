@@ -439,6 +439,38 @@ class CheckpointRecoveryTests(unittest.TestCase):
             self.assertEqual(valid, [item])
             self.assertEqual(issues, [])
             self.assertFalse(Path(tmp, "registry", "current.json").exists())
+            parity_result = metrics_result.with_suffix(".parity.json")
+            parity_result.write_text(json.dumps({
+                "schema_version": 1,
+                "artifact_type": "checkpoint_cv_oof_parity",
+                "checkpoint": 500,
+                "dataset": os.path.abspath(snapshot),
+                "dataset_sha256": _sha256(snapshot),
+                "profile": os.path.abspath(Path(tmp, "profile.json")),
+                "profile_sha256": "profile",
+                "strict_full_rows": 2000,
+                "prediction_kind": "out_of_fold",
+                "targets": {"Llt_phys": {"pairs": []}},
+            }), encoding="utf-8")
+            authorized = dict(
+                item,
+                parity_result=str(parity_result),
+                parity_result_sha256=_sha256(parity_result),
+            )
+            valid, issues = reconcile_completed(
+                {"completed": [authorized]}, str(Path(tmp, "registry"))
+            )
+            self.assertEqual(valid, [authorized])
+            self.assertEqual(issues, [])
+            parity_result.write_text("{}", encoding="utf-8")
+            valid, issues = reconcile_completed(
+                {"completed": [authorized]}, str(Path(tmp, "registry"))
+            )
+            self.assertEqual(valid, [])
+            self.assertEqual(
+                issues[0]["reason"],
+                "checkpoint_parity_fingerprint_mismatch",
+            )
             mutated = dict(item, threshold=1000)
             valid, issues = reconcile_completed(
                 {"completed": [mutated]}, str(Path(tmp, "registry"))
@@ -459,6 +491,13 @@ class CheckpointRecoveryTests(unittest.TestCase):
                 command[command.index("--profile") + 1] for command in commands
             ]
             self.assertEqual(supplied, [profile, profile])
+            metrics_command = commands[0]
+            parity_path = metrics_command[
+                metrics_command.index("--parity-json") + 1
+            ]
+            self.assertEqual(
+                parity_path, os.path.splitext("metrics")[0] + ".parity.json"
+            )
             self.assertEqual(len(training_commands(
                 "snapshot", "curve", "registry", 200, profile, 500, "metrics"
             )), 1)
@@ -524,6 +563,7 @@ class CheckpointRecoveryTests(unittest.TestCase):
                 commands.append(command)
                 self.assertIn("checkpoint_train.py", command[1])
                 result_path = command[command.index("--result-json") + 1]
+                parity_path = command[command.index("--parity-json") + 1]
                 snapshot_path = command[command.index("--dataset") + 1]
                 curve_path = command[command.index("--curve-csv") + 1]
                 checkpoint = int(command[command.index("--checkpoint") + 1])
@@ -543,6 +583,29 @@ class CheckpointRecoveryTests(unittest.TestCase):
                     "profile_sha256": profile_sha256,
                     "strict_full_rows": 500,
                     "metrics": [{"target": "Llt_phys", "r2": 0.5}],
+                }), encoding="utf-8")
+                Path(parity_path).write_text(json.dumps({
+                    "schema_version": 1,
+                    "artifact_type": "checkpoint_cv_oof_parity",
+                    "checkpoint": checkpoint,
+                    "dataset": os.path.abspath(snapshot_path),
+                    "dataset_sha256": _sha256(snapshot_path),
+                    "profile": os.path.abspath(profile),
+                    "profile_sha256": profile_sha256,
+                    "strict_full_rows": 500,
+                    "prediction_kind": "out_of_fold",
+                    "targets": {
+                        "Llt_phys": {
+                            "n": 500,
+                            "sample_count": 1,
+                            "pairs": [{
+                                "row_position": 0,
+                                "row_index": 0,
+                                "actual": 27.5,
+                                "predicted": 27.4,
+                            }],
+                        },
+                    },
                 }), encoding="utf-8")
 
             argv = [
@@ -570,6 +633,10 @@ class CheckpointRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(len(commands), 1)
             self.assertEqual(state["completed"][0]["kind"], "metrics_only")
+            self.assertEqual(
+                state["completed"][0]["parity_result_sha256"],
+                _sha256(state["completed"][0]["parity_result"]),
+            )
             self.assertEqual(legacy_state.read_bytes(), legacy_state_bytes)
             self.assertEqual(registry_pointer.read_bytes(), registry_pointer_bytes)
             self.assertEqual(curve.read_bytes(), curve_bytes)
