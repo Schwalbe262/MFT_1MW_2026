@@ -7,7 +7,9 @@ from module.modeling import create_coil_section
 
 def create_core(design, name="core", core_material="ferrite", n_group=3,
                 plate_material="aluminum", pad_material="thermal_pad",
-                plate_on=True, pad_on=True, plate_color=None, pad_color=None):
+                plate_on=True, pad_on=True, plate_color=None, pad_color=None,
+                segmented_lamination=False, core_material_leg=None,
+                core_material_yoke=None):
     """
     설계도면260706 반영 코어 생성.
 
@@ -39,13 +41,37 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
 
     for i in range(n_group):
         y0 = f"(-w1/2 + {i + 1}*{stack_expr} + {i}*{d_expr})"
-        core = design.modeler.create_box(
-            origin=["-(4*l1+2*l2)/2", y0, "-(h1+2*l1)/2"],
-            sizes=["4*l1+2*l2", d_expr, "h1+2*l1"],
-            name=f"{name}_{i + 1}",
-            material=core_material
-        )
-        core_objs.append(core)
+        if segmented_lamination:
+            # The ribbon plane follows the XZ magnetic path and contains Y.
+            # Hence the lamination normal is X in each leg and Z in each yoke.
+            # These five non-overlapping boxes exactly tile the legacy gross
+            # frame (three legs plus top and bottom yokes).
+            leg_material = core_material_leg or core_material
+            yoke_material = core_material_yoke or core_material
+            pieces = (
+                ("leg_left", "-(2*l1+l2)", "-h1/2", "l1", "h1", leg_material),
+                ("leg_center", "-l1", "-h1/2", "2*l1", "h1", leg_material),
+                ("leg_right", "(l1+l2)", "-h1/2", "l1", "h1", leg_material),
+                ("yoke_bottom", "-(2*l1+l2)", "-(h1/2+l1)",
+                 "4*l1+2*l2", "l1", yoke_material),
+                ("yoke_top", "-(2*l1+l2)", "h1/2",
+                 "4*l1+2*l2", "l1", yoke_material),
+            )
+            for region, x0, z0, width, height, material in pieces:
+                core_objs.append(design.modeler.create_box(
+                    origin=[x0, y0, z0],
+                    sizes=[width, d_expr, height],
+                    name=f"{name}_{i + 1}_{region}",
+                    material=material,
+                ))
+        else:
+            core = design.modeler.create_box(
+                origin=["-(4*l1+2*l2)/2", y0, "-(h1+2*l1)/2"],
+                sizes=["4*l1+2*l2", d_expr, "h1+2*l1"],
+                name=f"{name}_{i + 1}",
+                material=core_material
+            )
+            core_objs.append(core)
 
     if plate_on:
         # Core-side cooling uses the two unique I plates visible in the x<=0
@@ -90,19 +116,20 @@ def create_core(design, name="core", core_material="ferrite", n_group=3,
                         pad_objs.append(obj)
 
     # 창 2개는 코어 조에만 subtract한다. I plate는 그대로 유지한다.
-    sub1 = design.modeler.create_box(
-        origin=["-l1", "-w1/2", "-h1/2"],
-        sizes=["-l2", "w1", "h1"],
-        name=f"{name}_sub1",
-        material=core_material
-    )
-    sub2 = design.modeler.create_box(
-        origin=["l1", "-w1/2", "-h1/2"],
-        sizes=["l2", "w1", "h1"],
-        name=f"{name}_sub2",
-        material=core_material
-    )
-    design.modeler.subtract(core_objs, [sub1, sub2], keep_originals=False)
+    if not segmented_lamination:
+        sub1 = design.modeler.create_box(
+            origin=["-l1", "-w1/2", "-h1/2"],
+            sizes=["-l2", "w1", "h1"],
+            name=f"{name}_sub1",
+            material=core_material
+        )
+        sub2 = design.modeler.create_box(
+            origin=["l1", "-w1/2", "-h1/2"],
+            sizes=["l2", "w1", "h1"],
+            name=f"{name}_sub2",
+            material=core_material
+        )
+        design.modeler.subtract(core_objs, [sub1, sub2], keep_originals=False)
 
     return core_objs, plate_objs, pad_objs
 

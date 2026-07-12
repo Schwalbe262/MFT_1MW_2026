@@ -40,14 +40,23 @@ class _DesignHandle:
     def GetName(self):
         return self._name
 
-    def GetModule(self, _name):
+    def GetDesignType(self):
+        return "Icepak"
+
+    def GetModule(self, name):
+        if name == "AnalysisSetup":
+            return SimpleNamespace(GetSetups=lambda: ["ThermalSetup"])
         return SimpleNamespace()
 
 
 class _ProjectHandle:
-    def __init__(self):
+    def __init__(self, name="thermal_test"):
+        self._name = name
         self.active_calls = 0
         self.last_design = None
+
+    def GetName(self):
+        return self._name
 
     def SetActiveDesign(self, name):
         self.active_calls += 1
@@ -171,10 +180,15 @@ class _Icepak:
         self.setup_result = setup_result
         self.setup_update_result = setup_update_result
         self.design_name = "icepak_thermal"
+        self.setup_names = ["ThermalSetup"]
         self.existing_analysis_sweeps = ["ThermalSetup : SteadyState"]
         self.mesh = SimpleNamespace(assign_mesh_level=Mock())
         self.post = SimpleNamespace(create_field_summary=lambda: _FieldSummary(self))
         self.oproject = _ProjectHandle()
+        self.odesktop = SimpleNamespace(
+            AreThereSimulationsRunning=lambda: False,
+            GetMessages=lambda *_args: [],
+        )
         self._odesign = _DesignHandle("stale_design")
         self.design_solutions = SimpleNamespace(_odesign=self._odesign)
 
@@ -259,7 +273,7 @@ class ThermalStabilityTest(unittest.TestCase):
         )
         wrapper = _DesignWrapper(ipk)
         project = SimpleNamespace(create_design=lambda **_kwargs: wrapper)
-        rebind_project = Mock()
+        rebind_project = Mock(return_value=_ProjectHandle("thermal_test"))
         sim = SimpleNamespace(
             project=project,
             _rebind_native_project_for_design_creation=rebind_project,
@@ -298,6 +312,22 @@ class ThermalStabilityTest(unittest.TestCase):
                 "expected_w": 0.0,
                 "assigned_w": 0.0,
             }]
+            # The real loss allocator always emits the native-core transport
+            # contract. This helper replaces that allocator, so provide the
+            # same neutral legacy telemetry explicitly.
+            target_sim.thermal_core_loss_contract_version = "legacy_test"
+            target_sim.thermal_core_loss_source = "legacy_test"
+            target_sim.thermal_core_loss_correction_factor = 1.0
+            target_sim.thermal_core_expected_injected_w = 0.0
+            target_sim.thermal_core_requested_wrapper_echo_w = 0.0
+            target_sim.thermal_core_native_readback_w = 0.0
+            target_sim.thermal_core_restore_factor = 1.0
+            target_sim.thermal_core_native_restored_full_w = 0.0
+            target_sim.thermal_core_full_expected_margin_adjusted_w = 0.0
+            target_sim.thermal_core_native_restored_rel_error = 0.0
+            target_sim.thermal_core_native_readback_count = 0
+            target_sim.thermal_core_power_balance_abs_error_w = 0.0
+            target_sim.thermal_core_power_balance_rel_error = 0.0
             return {}
 
         with ExitStack() as stack:
@@ -311,10 +341,21 @@ class ThermalStabilityTest(unittest.TestCase):
             stack.enter_context(patch.object(thermal, "_assign_boundaries"))
             stack.enter_context(patch.object(thermal, "_assign_thermal_mesh"))
             if isinstance(convergence, (list, tuple)):
+                convergence_values = list(convergence)
+                convergence_index = {"value": 0}
+
+                def next_convergence(*_args, **_kwargs):
+                    index = min(
+                        convergence_index["value"],
+                        len(convergence_values) - 1,
+                    )
+                    convergence_index["value"] += 1
+                    return convergence_values[index]
+
                 telemetry = stack.enter_context(patch.object(
                     thermal,
                     "_thermal_convergence_telemetry",
-                    side_effect=list(convergence),
+                    side_effect=next_convergence,
                 ))
             else:
                 telemetry = stack.enter_context(patch.object(
@@ -322,11 +363,27 @@ class ThermalStabilityTest(unittest.TestCase):
                     "_thermal_convergence_telemetry",
                     return_value=convergence or self._convergence(),
                 ))
+
+            def poll_once(target_sim, target_ipk, target_setup, snapshot, **_kwargs):
+                value = thermal._thermal_convergence_telemetry(
+                    target_sim,
+                    target_ipk,
+                    target_setup,
+                    attempts=1,
+                    monitor_snapshot=snapshot,
+                )
+                return value, False, ""
+
+            stack.enter_context(patch.object(
+                thermal,
+                "_poll_thermal_dispatch_evidence",
+                side_effect=poll_once,
+            ))
             sleeper = stack.enter_context(patch("time.sleep"))
             result = thermal.run_thermal_analysis(sim)
         ipk.telemetry_mock = telemetry
         ipk.sleep_mock = sleeper
-        rebind_project.assert_called_once_with()
+        self.assertGreaterEqual(rebind_project.call_count, 2)
         return ipk, result.iloc[0]
 
     @staticmethod
@@ -411,6 +468,9 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertIn("Tprobe_core_center_leg", names)
         self.assertIn("Tprobe_core_side_leg", names)
         self.assertIn("Tprobe_core_top_yoke", names)
+        self.assertIn("Tprobe_Rx_side_side", names)
+        self.assertIn("Tprobe_Rx_side1_inner", names)
+        self.assertNotIn("Tprobe_Rx_side2_side", names)
         by_name = {call["name"]: call for call in calls}
         center = by_name["Tprobe_core_center_leg"]
         side = by_name["Tprobe_core_side_leg"]
@@ -429,6 +489,65 @@ class ThermalStabilityTest(unittest.TestCase):
             float(top_yoke["origin"][2][:-2]),
             float(frame["h1"].iloc[0]) / 2.0 + 0.05 * l1,
         )
+        # Negative-x side winding: outward is the more-negative radial pack;
+        # inward is its +x mirror toward the transformer centre.
+        outward = by_name["Tprobe_Rx_side_side"]
+        inward = by_name["Tprobe_Rx_side1_inner"]
+        self.assertLess(
+            float(outward["origin"][0][:-2]),
+            float(inward["origin"][0][:-2]),
+        )
+        self.assertEqual(outward["sizes"], inward["sizes"])
+
+    def test_full_probe_sheets_mirror_inner_and_outer_side_faces(self):
+        frame = self._probe_frame(4)
+        calls = []
+
+        def create_rectangle(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(name=kwargs["name"], is3d=False, model=True)
+
+        ipk = SimpleNamespace(
+            modeler=SimpleNamespace(create_rectangle=create_rectangle)
+        )
+        sheets = thermal._create_probe_sheets(
+            ipk, frame, {}, mode="full"
+        )
+        names = {sheet.name for sheet in sheets}
+        self.assertTrue({
+            "Tprobe_Rx_side_side", "Tprobe_Rx_side1_inner",
+            "Tprobe_Rx_side2_side", "Tprobe_Rx_side2_inner",
+        }.issubset(names))
+        by_name = {call["name"]: call for call in calls}
+        left_outer = float(
+            by_name["Tprobe_Rx_side_side"]["origin"][0][:-2]
+        )
+        left_inner = float(
+            by_name["Tprobe_Rx_side1_inner"]["origin"][0][:-2]
+        )
+        right_outer = float(
+            by_name["Tprobe_Rx_side2_side"]["origin"][0][:-2]
+        )
+        right_inner = float(
+            by_name["Tprobe_Rx_side2_inner"]["origin"][0][:-2]
+        )
+        self.assertLess(left_outer, left_inner)
+        self.assertGreater(right_outer, right_inner)
+        left_ranges = thermal._rx_side_face_x_ranges(
+            frame, -(float(frame["l1"].iloc[0]) * 1.5
+                     + float(frame["l2"].iloc[0]))
+        )
+        right_ranges = thermal._rx_side_face_x_ranges(
+            frame, float(frame["l1"].iloc[0]) * 1.5
+            + float(frame["l2"].iloc[0])
+        )
+        for relation in ("outward", "inward"):
+            self.assertAlmostEqual(
+                left_ranges[relation][0], -right_ranges[relation][1]
+            )
+            self.assertAlmostEqual(
+                left_ranges[relation][1], -right_ranges[relation][0]
+            )
 
     def test_core_probe_aggregates_center_and_side_legs(self):
         complete = {
@@ -524,6 +643,7 @@ class ThermalStabilityTest(unittest.TestCase):
             [complete],
             convergence=[
                 self._monitor_failure("monitor_missing"),
+                self._monitor_failure("monitor_missing"),
                 self._convergence(),
             ],
         )
@@ -532,16 +652,10 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(row["thermal_analyze_call_ok"], 1)
         self.assertEqual(row["thermal_analyze_return_false"], 1)
         self.assertEqual(row["thermal_solved"], 1)
-        ipk.sleep_mock.assert_called_once_with(30)
-        self.assertEqual(ipk.telemetry_mock.call_count, 2)
-        starts = [
-            item.kwargs["not_before_ns"]
-            for item in ipk.telemetry_mock.call_args_list
-        ]
-        self.assertTrue(all(isinstance(value, int) and value > 0 for value in starts))
-        self.assertLessEqual(starts[0], starts[1])
+        ipk.sleep_mock.assert_not_called()
+        self.assertEqual(ipk.telemetry_mock.call_count, 3)
 
-    def test_exception_with_malformed_monitor_retries_once(self):
+    def test_exception_with_malformed_monitor_does_not_double_dispatch(self):
         complete = {
             "Tx_main_0": (81.0, 70.0),
             "Rx_main_0": (88.0, 72.0),
@@ -552,14 +666,14 @@ class ThermalStabilityTest(unittest.TestCase):
             [complete],
             convergence=[
                 self._monitor_failure("monitor_malformed"),
-                self._convergence(),
             ],
         )
-        self.assertEqual(ipk.analyze_calls, 2)
-        self.assertEqual(row["thermal_solve_attempts"], 2)
-        self.assertEqual(row["thermal_analyze_call_ok"], 1)
-        self.assertEqual(row["thermal_solved"], 1)
-        ipk.sleep_mock.assert_called_once_with(30)
+        self.assertEqual(ipk.analyze_calls, 1)
+        self.assertEqual(row["thermal_solve_attempts"], 1)
+        self.assertEqual(row["thermal_analyze_call_ok"], 0)
+        self.assertEqual(row["thermal_solved"], 0)
+        self.assertEqual(row["thermal_convergence_reason"], "monitor_malformed")
+        ipk.sleep_mock.assert_not_called()
 
     def test_retry_is_capped_at_two_attempts(self):
         ipk, row = self._run(
@@ -567,14 +681,15 @@ class ThermalStabilityTest(unittest.TestCase):
             [{}],
             convergence=[
                 self._monitor_failure("monitor_missing"),
+                self._monitor_failure("monitor_missing"),
                 self._monitor_failure("monitor_malformed"),
             ],
         )
         self.assertEqual(ipk.analyze_calls, 2)
-        self.assertEqual(ipk.telemetry_mock.call_count, 2)
+        self.assertEqual(ipk.telemetry_mock.call_count, 3)
         self.assertEqual(row["thermal_solve_attempts"], 2)
         self.assertEqual(row["thermal_solved"], 0)
-        ipk.sleep_mock.assert_called_once_with(30)
+        ipk.sleep_mock.assert_not_called()
 
     def test_successful_invocation_with_missing_monitor_does_not_retry(self):
         ipk, row = self._run(
