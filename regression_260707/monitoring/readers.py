@@ -670,6 +670,7 @@ class RuntimeRecorder:
             "time": dashboard.get("generated_at"),
             "overall": dashboard.get("status", {}).get("overall"),
             "data": {
+                "raw_total_rows": data.get("raw_total_rows"),
                 "total_rows": data.get("total_rows"),
                 "complete_rows": data.get("complete_rows"),
                 "throughput_1h": data.get("throughput_1h"),
@@ -737,6 +738,7 @@ class RuntimeRecorder:
         summary = self._summary(dashboard)
         signature = (
             summary["overall"],
+            summary["data"]["raw_total_rows"],
             summary["data"]["total_rows"],
             summary["data"]["complete_rows"],
             summary["data"]["pinned_solver_revision"],
@@ -872,12 +874,24 @@ class ArtifactService:
         timestamps = [
             parsed for row in rows
             if (parsed := _parse_time(row.get("saved_at"), now.tzinfo)) is not None
+            and parsed <= now
         ]
         timestamps.sort()
         simulation_timing = _simulation_timing_summary(rows, now.tzinfo)
         one_hour_ago = now - timedelta(hours=1)
         day_ago = now - timedelta(hours=24)
+        new_solver_results_1h = sum(stamp >= one_hour_ago for stamp in timestamps)
+        new_solver_results_24h = sum(stamp >= day_ago for stamp in timestamps)
+        new_solver_hourly_rate = float(new_solver_results_1h)
+        if new_solver_hourly_rate <= 0 and new_solver_results_24h:
+            new_solver_hourly_rate = new_solver_results_24h / 24.0
+        latest_solver_result = timestamps[-1] if timestamps else None
+        solver_stalled_minutes = (
+            max(0.0, (now - latest_solver_result).total_seconds() / 60.0)
+            if latest_solver_result else None
+        )
         strict_history = []
+        raw_ingest_history = []
         history_path = self.root / "monitoring" / "runtime" / "monitor_history.jsonl"
         if history_path.is_file():
             try:
@@ -890,6 +904,11 @@ class ArtifactService:
                         data_entry = entry.get("data") if isinstance(entry, dict) else None
                         stamp = _parse_time(entry.get("time"), now.tzinfo) if isinstance(entry, dict) else None
                         if (isinstance(data_entry, dict)
+                                and stamp is not None
+                                and isinstance(data_entry.get("raw_total_rows"), int)
+                                and data_entry["raw_total_rows"] >= 0):
+                            raw_ingest_history.append((stamp, data_entry["raw_total_rows"]))
+                        if (isinstance(data_entry, dict)
                                 and data_entry.get("count_basis") == "pinned_strict_full"
                                 and pinned_revision is not None
                                 and pinned_library_revision is not None
@@ -899,21 +918,34 @@ class ArtifactService:
                             strict_history.append((stamp, _integer(data_entry.get("total_rows"), 0)))
             except OSError as exc:
                 warnings.append(f"strict runtime history read failed: {exc}")
-        def _growth_since(cutoff):
+        strict_history.sort(key=lambda item: item[0])
+        raw_ingest_history.sort(key=lambda item: item[0])
+
+        def _strict_growth_since(cutoff):
             earlier = [value for stamp, value in strict_history if stamp <= cutoff]
             if earlier:
                 return max(0, total - earlier[-1])
             within = [value for stamp, value in strict_history if stamp >= cutoff]
             return max(0, total - within[0]) if within else 0
-        throughput_1h = _growth_since(one_hour_ago)
-        added_24h = _growth_since(day_ago)
+
+        def _raw_ingest_growth_since(cutoff):
+            # A baseline at or before the cutoff is required.  Legacy history
+            # has no raw_total_rows, so guessing from strict totals would turn
+            # policy reclassification into fake solver throughput.
+            earlier = [value for stamp, value in raw_ingest_history if stamp <= cutoff]
+            return max(0, raw_total - earlier[-1]) if earlier else None
+
+        strict_valid_growth_1h = _strict_growth_since(one_hour_ago)
+        strict_valid_growth_24h = _strict_growth_since(day_ago)
+        raw_ingest_growth_1h = _raw_ingest_growth_since(one_hour_ago)
+        raw_ingest_growth_24h = _raw_ingest_growth_since(day_ago)
         strict_updated = _parse_time(strict_status.get("time"), now.tzinfo)
         latest_data = strict_updated if strict_available else None
         first_data = strict_history[0][0] if strict_history else None
         stalled_minutes = max(0.0, (now - latest_data).total_seconds() / 60.0) if latest_data else None
-        hourly_rate = float(throughput_1h)
-        if hourly_rate <= 0 and added_24h:
-            hourly_rate = added_24h / 24.0
+        hourly_rate = float(strict_valid_growth_1h)
+        if hourly_rate <= 0 and strict_valid_growth_24h:
+            hourly_rate = strict_valid_growth_24h / 24.0
         remaining = max(0, DATA_GOAL - total)
         eta_hours = remaining / hourly_rate if hourly_rate > 0 else None
         eta = now + timedelta(hours=eta_hours) if eta_hours is not None else None
@@ -980,9 +1012,29 @@ class ArtifactService:
             "goal_progress_pct": min(100.0, total / DATA_GOAL * 100.0),
             "stretch_progress_pct": min(100.0, total / STRETCH_GOAL * 100.0),
             "remaining_to_goal": remaining,
-            "throughput_1h": throughput_1h,
-            "added_24h": added_24h,
+            # Legacy aliases retain their original strict-history meaning.
+            "throughput_1h": strict_valid_growth_1h,
+            "added_24h": strict_valid_growth_24h,
             "effective_hourly_rate": hourly_rate,
+            "strict_valid_growth_1h": strict_valid_growth_1h,
+            "strict_valid_growth_24h": strict_valid_growth_24h,
+            "strict_effective_hourly_rate": hourly_rate,
+            "strict_growth_basis": "pinned_strict_full_including_reclassification",
+            "new_solver_results_1h": new_solver_results_1h,
+            "new_solver_results_24h": new_solver_results_24h,
+            "new_solver_hourly_rate": new_solver_hourly_rate,
+            "new_solver_results_basis": "deduplicated_train_io_saved_at",
+            "latest_solver_result_at": _iso(latest_solver_result),
+            "solver_stalled_minutes": solver_stalled_minutes,
+            "solver_stalled": bool(
+                solver_stalled_minutes is not None
+                and solver_stalled_minutes >= 90
+                and total < DATA_GOAL
+            ),
+            "raw_ingest_growth_1h": raw_ingest_growth_1h,
+            "raw_ingest_growth_24h": raw_ingest_growth_24h,
+            "raw_ingest_history_available": raw_ingest_growth_1h is not None,
+            "raw_ingest_growth_basis": "runtime_raw_total_rows_delta",
             "eta_3000": _iso(eta),
             "eta_hours": eta_hours,
             "first_data_at": _iso(first_data),
@@ -1001,6 +1053,7 @@ class ArtifactService:
             },
             "simulation_timing": simulation_timing,
             "history": history,
+            "history_basis": "pinned_strict_full_including_reclassification",
             "source": {
                 "manifest": str(manifest_result.path),
                 "rows": str(rows_result.path),
@@ -2146,12 +2199,20 @@ class ArtifactService:
 
         if data["total_rows"] >= DATA_GOAL:
             data_state, data_detail = "complete", f"목표 달성 · {data['total_rows']:,}개"
-        elif data["throughput_1h"] > 0:
-            data_state, data_detail = "active", f"최근 1시간 +{data['throughput_1h']}개"
-        elif data["stalled"]:
-            data_state, data_detail = "warning", "90분 이상 데이터 증가 없음"
+        elif data["new_solver_results_1h"] > 0:
+            data_state = "active"
+            data_detail = f"신규 solver 결과 · 1시간 +{data['new_solver_results_1h']}개"
+        elif data["solver_stalled"]:
+            data_state = "warning"
+            data_detail = (
+                "신규 solver 결과 90분 이상 없음 · "
+                f"strict 증가 +{data['strict_valid_growth_1h']}"
+            )
         else:
-            data_state, data_detail = "waiting", f"{data['total_rows']:,}개 확보"
+            data_state = "waiting"
+            data_detail = (
+                f"신규 solver 0 · strict 증가 +{data['strict_valid_growth_1h']}"
+            )
         stages.append({"key": "data", "label": "데이터 적재", "state": data_state, "detail": data_detail})
 
         if models.get("activation_state") == "preactivation_checkpoint":

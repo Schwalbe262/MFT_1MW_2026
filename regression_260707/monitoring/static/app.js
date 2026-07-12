@@ -140,18 +140,21 @@
     const strictRows = Number(data.total_rows);
     const isolatedRows = Number.isFinite(rawRows) && Number.isFinite(strictRows) ? Math.max(0, rawRows - strictRows) : null;
     setText("#data-quality-detail", `최신 strict EM ${number(data.em_valid_rows)}개 · Thermal ${number(data.thermal_valid_rows)}개 · 격리 ${number(isolatedRows)}개`);
-    setText("#data-throughput", `+${number(data.throughput_1h)}개`);
-    setText("#data-throughput-detail", `24시간 +${number(data.added_24h)} · 유효속도 ${number(data.effective_hourly_rate, 1)}/h`);
+    setText("#data-throughput", `+${number(data.new_solver_results_1h)}개`);
+    setText(
+      "#data-throughput-detail",
+      `saved_at 기준 · 24시간 +${number(data.new_solver_results_24h)} · strict 재판정 포함 +${number(data.strict_valid_growth_1h)}`,
+    );
     setText("#data-eta", data.eta_3000 ? dateTime(data.eta_3000) : "산정 불가");
-    setText("#data-stall", data.eta_hours != null ? `약 ${number(data.eta_hours, 1)}시간 후` : "최근 처리량이 없습니다");
-    setText("#data-freshness", elapsed(data.stalled_minutes));
-    $("#data-freshness").classList.toggle("stale", Boolean(data.stalled));
+    setText("#data-stall", data.eta_hours != null ? `strict 증가율 기준 · 약 ${number(data.eta_hours, 1)}시간 후` : "strict 증가율이 없습니다");
+    setText("#data-freshness", elapsed(data.solver_stalled_minutes));
+    $("#data-freshness").classList.toggle("stale", Boolean(data.solver_stalled));
     setText("#latest-revision", data.latest_revision ? `revision ${data.latest_revision.slice(0, 10)}` : "revision —");
     setText("#goal-label", `${number(data.total_rows)} / ${number(data.goal)}`);
     setText("#stretch-label", `${number(data.total_rows)} / ${number(data.stretch_goal)}+`);
     $("#goal-progress").style.width = `${Math.max(0, Math.min(100, data.goal_progress_pct || 0))}%`;
     $("#stretch-progress").style.width = `${Math.max(0, Math.min(100, data.stretch_progress_pct || 0))}%`;
-    setText("#data-24h", `+${number(data.added_24h)}개`);
+    setText("#data-24h", `1h +${number(data.strict_valid_growth_1h)} · 24h +${number(data.strict_valid_growth_24h)}`);
     setText("#data-remaining", `${number(data.remaining_to_goal)}개`);
     setText("#revision-mismatch", data.rows_not_latest_revision == null ? "—" : `${number(data.rows_not_latest_revision)}개`);
     setText("#collector-nodata", data.collector?.no_data_tasks == null ? "—" : `${number(data.collector.no_data_tasks)}건`);

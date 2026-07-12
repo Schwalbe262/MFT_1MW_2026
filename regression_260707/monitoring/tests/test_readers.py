@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 from pathlib import Path
@@ -122,6 +123,15 @@ def test_data_counts_quality_throughput_and_revision(artifact_service):
     assert data["complete_rows"] == 1
     assert data["throughput_1h"] == 1
     assert data["added_24h"] == 1
+    assert data["strict_valid_growth_1h"] == 1
+    assert data["strict_valid_growth_24h"] == 1
+    assert data["new_solver_results_1h"] == 1
+    assert data["new_solver_results_24h"] == 2
+    assert data["new_solver_hourly_rate"] == 1.0
+    assert data["new_solver_results_basis"] == "deduplicated_train_io_saved_at"
+    assert data["history_basis"] == "pinned_strict_full_including_reclassification"
+    assert data["raw_ingest_growth_1h"] is None
+    assert data["raw_ingest_history_available"] is False
     assert data["collector"]["no_data_tasks"] == 1
     assert data["latest_revision"] == "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a"
     assert data["pinned_revision"] == "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
@@ -141,6 +151,69 @@ def test_data_counts_quality_throughput_and_revision(artifact_service):
     assert timing["stages"]["loss"]["mean_seconds"] == 1750.0
     assert timing["stages"]["icepak"]["median_seconds"] == 1100.0
     assert timing["stages"]["total"]["mean_seconds"] == 3300.0
+
+
+def test_data_separates_strict_reclassification_from_new_solver_results(
+        campaign_root, artifact_service):
+    dataset_path = Path(campaign_root, "data", "dataset", "train_io.csv")
+    rows = list(csv.DictReader(dataset_path.open(encoding="utf-8", newline="")))
+    rows[0]["saved_at"] = "2026-07-11 00:30:00"
+    rows[1]["saved_at"] = "2026-07-11 01:30:00"
+    with dataset_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    strict_path = Path(campaign_root, "training", "strict_data_status.json")
+    strict = json.loads(strict_path.read_text(encoding="utf-8"))
+    strict["strict_full_rows"] = 1014
+    strict_path.write_text(json.dumps(strict), encoding="utf-8")
+
+    history_path = Path(campaign_root, "monitoring", "runtime", "monitor_history.jsonl")
+    history = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()]
+    history[-2]["data"]["total_rows"] = 982
+    history[-1]["data"]["total_rows"] = 1014
+    history_path.write_text(
+        "\n".join(json.dumps(entry) for entry in history) + "\n",
+        encoding="utf-8",
+    )
+
+    service = ArtifactService(
+        campaign_root,
+        scheduler=artifact_service.scheduler,
+        clock=artifact_service.clock,
+        record_runtime=False,
+    )
+    data = service.data()
+
+    assert data["throughput_1h"] == 32  # legacy strict-growth alias
+    assert data["strict_valid_growth_1h"] == 32
+    assert data["new_solver_results_1h"] == 0
+    assert data["new_solver_results_24h"] == 2
+    assert data["raw_ingest_growth_1h"] is None
+    assert data["raw_ingest_history_available"] is False
+
+
+def test_data_uses_new_raw_history_without_reinterpreting_legacy_rows(
+        campaign_root, artifact_service):
+    history_path = Path(campaign_root, "monitoring", "runtime", "monitor_history.jsonl")
+    with history_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "time": "2026-07-11T01:50:00+09:00",
+            "data": {"raw_total_rows": 1},
+        }) + "\n")
+
+    service = ArtifactService(
+        campaign_root,
+        scheduler=artifact_service.scheduler,
+        clock=artifact_service.clock,
+        record_runtime=False,
+    )
+    data = service.data()
+
+    assert data["raw_ingest_growth_1h"] == 1
+    assert data["raw_ingest_growth_24h"] is None
+    assert data["raw_ingest_history_available"] is True
 
 
 def test_data_separates_raw_rows_from_zero_b171_pinned_rows(
@@ -469,7 +542,9 @@ def test_runtime_recorder_recovers_from_winerror5_without_temp_collision(
     assert replace.call_count == 5
     snapshot = json.loads(recorder.snapshot_path.read_text(encoding="utf-8"))
     assert snapshot["data"]["pinned_solver_revision"] == dashboard["data"]["pinned_revision"]
+    assert snapshot["data"]["raw_total_rows"] == dashboard["data"]["raw_total_rows"]
     history = recorder.history()["entries"]
+    assert history[-1]["data"]["raw_total_rows"] == dashboard["data"]["raw_total_rows"]
     assert history[-1]["data"]["pinned_solver_revision"] == dashboard["data"]["pinned_revision"]
     assert history[-1]["data"]["pinned_library_revision"] == dashboard["data"]["pinned_library_revision"]
     assert list(recorder.directory.glob(".monitor_snapshot.json.*.tmp")) == []

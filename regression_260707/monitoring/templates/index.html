@@ -74,13 +74,13 @@
       <div class="metric-grid data-metrics">
         <article class="metric-card primary"><span>최신 revision 학습 가능</span><strong id="data-total">—</strong><small id="data-strict-detail">pin — · strict full</small></article>
         <article class="metric-card"><span>전체 수집 데이터</span><strong id="data-raw-total">—</strong><small id="data-quality-detail">—</small></article>
-        <article class="metric-card"><span>최근 1시간</span><strong id="data-throughput">—</strong><small id="data-throughput-detail">—</small></article>
+        <article class="metric-card"><span>신규 solver 결과 · 1시간</span><strong id="data-throughput">—</strong><small id="data-throughput-detail">saved_at 기준</small></article>
         <article class="metric-card"><span>3,000개 예상 도달</span><strong id="data-eta">—</strong><small id="data-stall">—</small></article>
       </div>
       <div class="split-grid data-layout">
         <article class="panel chart-panel">
-          <div class="panel-title"><div><h3>데이터 증가</h3><p>시뮬레이션 저장 시각 기준 누적 추세</p></div><span id="latest-revision" class="mono-chip">revision —</span></div>
-          <svg id="data-chart" class="chart" viewBox="0 0 760 260" role="img" aria-label="시간에 따른 누적 데이터 수"></svg>
+          <div class="panel-title"><div><h3>strict-valid 누적</h3><p>고정 pin 기준 · 정책 재판정에 따른 증감 포함</p></div><span id="latest-revision" class="mono-chip">revision —</span></div>
+          <svg id="data-chart" class="chart" viewBox="0 0 760 260" role="img" aria-label="시간에 따른 strict-valid 누적 데이터 수"></svg>
           <p id="data-chart-empty" class="empty-state hidden">표시할 데이터 이력이 없습니다.</p>
         </article>
         <article class="panel goal-panel">
@@ -88,7 +88,7 @@
           <div class="goal-row"><div><span>1차 목표</span><b id="goal-label">0 / 3,000</b></div><div class="progress"><i id="goal-progress"></i></div></div>
           <div class="goal-row"><div><span>연속 수집</span><b id="stretch-label">0 / 10,000+</b></div><div class="progress secondary"><i id="stretch-progress"></i></div></div>
           <dl class="detail-list">
-            <div><dt>최근 24시간 증가</dt><dd id="data-24h">—</dd></div>
+            <div><dt>strict-valid 증가 (재판정 포함)</dt><dd id="data-24h">—</dd></div>
             <div><dt>목표까지 남은 수</dt><dd id="data-remaining">—</dd></div>
             <div><dt>최신 revision 외 데이터</dt><dd id="revision-mismatch">—</dd></div>
             <div><dt>결과 없는 조회 작업</dt><dd id="collector-nodata">—</dd></div>

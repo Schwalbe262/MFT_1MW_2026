@@ -12,6 +12,9 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "data-chart" in page.text
     assert "최신 revision 학습 가능" in page.text
     assert "전체 수집 데이터" in page.text
+    assert "신규 solver 결과 · 1시간" in page.text
+    assert "strict-valid 누적" in page.text
+    assert "정책 재판정에 따른 증감 포함" in page.text
     assert "data-raw-total" in page.text
     assert "최근 시뮬레이션 단계별 소요시간" in page.text
     assert "stage-time-matrix-mean" in page.text
@@ -30,6 +33,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "function duration(value)" in script.text
     assert "data.pinned_revision" in script.text
     assert "data.raw_total_rows" in script.text
+    assert "data.new_solver_results_1h" in script.text
+    assert "data.strict_valid_growth_1h" in script.text
     assert "격리" in script.text
     assert "data.simulation_timing" in script.text
     assert "timingCell(evaluation.timing_seconds)" in script.text
@@ -52,6 +57,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert dashboard.status_code == 200
     assert dashboard.json()["data"]["total_rows"] == 1
     assert dashboard.json()["data"]["raw_total_rows"] == 2
+    assert dashboard.json()["data"]["new_solver_results_1h"] == 1
+    assert dashboard.json()["data"]["strict_valid_growth_1h"] == 1
     assert dashboard.json()["data"]["count_basis"] == "pinned_strict_full"
     assert dashboard.json()["data"]["latest_revision"] == "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a"
     assert dashboard.json()["data"]["pinned_revision"] == "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
