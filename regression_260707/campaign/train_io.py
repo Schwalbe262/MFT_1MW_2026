@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-TRAIN_IO_SCHEMA_VERSION = 2
+TRAIN_IO_SCHEMA_VERSION = 3
 
 IDENTITY_COLUMNS = (
     "project_name",
@@ -201,6 +201,13 @@ QUALITY_COLUMNS = (
     "conv_error_pct_loss",
 )
 
+TIMING_PROVENANCE_COLUMNS = (
+    "time_matrix",
+    "time_loss",
+    "time_thermal",
+    "time",
+)
+
 PROVENANCE_COLUMNS = (
     "git_hash",
     "git_dirty",
@@ -220,6 +227,7 @@ TRAIN_IO_COLUMNS = (
     *AGGREGATE_EM_OUTPUT_COLUMNS,
     *AGGREGATE_TEMPERATURE_COLUMNS,
     *QUALITY_COLUMNS,
+    *TIMING_PROVENANCE_COLUMNS,
     *PROVENANCE_COLUMNS,
 )
 
@@ -304,6 +312,7 @@ def build_train_io(master: pd.DataFrame) -> pd.DataFrame:
         *AGGREGATE_EM_OUTPUT_COLUMNS,
         *AGGREGATE_TEMPERATURE_COLUMNS,
         *QUALITY_COLUMNS,
+        *TIMING_PROVENANCE_COLUMNS,
         *PROVENANCE_COLUMNS,
     ):
         data[column] = _column_or_missing(master, column)

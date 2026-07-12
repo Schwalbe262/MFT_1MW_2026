@@ -14,6 +14,8 @@ import json
 import math
 import os
 import re
+import statistics
+import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
@@ -22,41 +24,93 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+
+try:
+    from ..model_targets import (
+        SURROGATE_TEMPERATURE_TARGETS,
+        SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    )
+except ImportError:  # Direct execution with regression_260707 on sys.path.
+    from model_targets import (
+        SURROGATE_TEMPERATURE_TARGETS,
+        SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    )
 
 
 SCHEMA_VERSION = 1
 DATA_GOAL = 3_000
 STRETCH_GOAL = 10_000
+PARALLEL_TARGET_MIN = 1
+PARALLEL_TARGET_MAX = 300
+SIMULATION_TIMING_WINDOW_ROWS = 100
+MAPE_ZERO_ABS_TOLERANCE = 1e-9
+SIMULATION_TIMING_FIELDS = (
+    ("matrix", "time_matrix"),
+    ("loss", "time_loss"),
+    ("icepak", "time_thermal"),
+    ("total", "time"),
+)
+CHECKPOINT_STATE_SCHEMA_VERSION = 2
+CHECKPOINT_METRICS_SCHEMA_VERSION = 1
+CHECKPOINT_PARITY_SCHEMA_VERSION = 1
+CHECKPOINT_PARITY_ARTIFACT_TYPE = "checkpoint_cv_oof_parity"
+CHECKPOINT_PARITY_PAIR_LIMIT = 2_000
 TARGETS: tuple[dict[str, str], ...] = (
     {"name": "Llt_phys", "label": "누설 인덕턴스 (Llt)", "unit": "µH"},
     {"name": "P_winding_total", "label": "권선 손실", "unit": "W"},
     {"name": "P_core_total", "label": "코어 손실", "unit": "W"},
     {"name": "P_core_plate_total", "label": "코어 플레이트 손실", "unit": "W"},
     {"name": "P_wcp_total", "label": "권선 냉각판 손실", "unit": "W"},
-    {"name": "B_max_core", "label": "코어 최대 자속밀도", "unit": "T"},
+    {"name": "P_Tx_main_group", "label": "1차 권선 손실", "unit": "W"},
+    {"name": "P_Rx_main_group", "label": "2차 중앙 권선 손실", "unit": "W"},
+    {"name": "P_Rx_side_total", "label": "2차 측면 권선 손실", "unit": "W"},
     {"name": "Tprobe_Tx_leeward_max", "label": "Tx 최대 온도", "unit": "°C"},
     {"name": "Tprobe_Rx_main_leeward_max", "label": "Rx main 최대 온도", "unit": "°C"},
     {"name": "Tprobe_Rx_side_leeward_max", "label": "Rx side 최대 온도", "unit": "°C"},
-    {"name": "Tprobe_core_center_max", "label": "코어 최대 온도", "unit": "°C"},
+    {"name": "Tprobe_core_center_max", "label": "코어 최대 온도(3영역 최대)", "unit": "°C"},
+    {"name": "Tprobe_core_center_leg_max", "label": "코어 중앙 레그 최대 온도", "unit": "°C"},
+    {"name": "Tprobe_core_side_leg_max", "label": "코어 사이드 레그 최대 온도", "unit": "°C"},
+    {"name": "Tprobe_core_top_yoke_max", "label": "코어 상부 요크 최대 온도", "unit": "°C"},
     {"name": "k", "label": "결합계수 (k)", "unit": ""},
     {"name": "B_mean_core", "label": "코어 평균 자속밀도", "unit": "T"},
 )
 TARGET_META = {item["name"]: item for item in TARGETS}
-TEMPERATURE_TARGETS = (
-    "Tprobe_Tx_leeward_max",
-    "Tprobe_Rx_main_leeward_max",
-    "Tprobe_Rx_side_leeward_max",
-    "Tprobe_core_center_max",
-)
+TEMPERATURE_TARGETS = tuple(SURROGATE_TEMPERATURE_TARGETS)
 DESIGN_PARAMETER_KEYS = (
-    "N1_main", "N2_main", "N2_side", "l1", "l2", "h1", "w1",
-    "n_core_group", "core_plate_t", "cw1", "gap1", "cw2", "gap2",
+    "N1_main", "N1_side", "N2_main", "N2_side", "l1", "l2", "h1", "w1",
+    "n_core_group", "core_plate_t", "core_plate_pad_t",
+    "cw1", "gap1", "cw2", "gap2",
     "nwh1", "nwh2", "cc_w2c_space_x", "cc_w2c_space_y",
     "w2c_w1c_space_x", "w2c_w1c_space_y", "w1c_w2s_gap_x_actual",
-    "w1s_cs_space_x", "cs_w1s_space_y", "h_gap2", "wcp_t",
+    "w1s_cs_space_x", "cs_w1s_space_y", "h_gap2", "wcp_t", "wcp_pad_t",
     "wcp_len_pct", "wcp_len_x",
+)
+CANDIDATE_REPORT_FIELDS = (
+    "size_W_mm", "size_L_mm", "size_H_mm", "size_WxLxH_mm",
+    "volume_L", "footprint_cm2",
+    "turns_primary", "turns_secondary_center", "turns_secondary_side",
+    "cw1_conductor_thickness_mm", "cw2_conductor_thickness_mm",
+    "gap1_mm", "gap2_mm",
+    "nwl1_main_pack_width_mm", "nwl1_side_pack_width_mm",
+    "nwl2_main_pack_width_mm", "nwl2_side_pack_width_mm",
+    "nwh1_winding_height_mm", "nwh2_winding_height_mm",
+    "core_depth_each_mm", "n_core_group",
+    "core_cold_plate_thickness_mm", "core_thermal_pad_thickness_mm",
+    "winding_cold_plate_thickness_mm", "winding_thermal_pad_thickness_mm",
+    "wcp_len_pct", "wcp_len_x_mm",
+    "leakage_target_uH", "pred_leakage_inductance_uH",
+    "B_design_analytic_T", "B_legacy_0p7_T", "B_design_waveform",
+    "B_denominator_coefficient", "Ae_m2", "Ae_gross_m2",
+    "Ae_effective_m2", "core_lamination_factor", "B_area_basis",
+    "pred_core_loss_W", "pred_core_cold_plate_loss_W",
+    "pred_winding_cold_plate_loss_W", "pred_primary_winding_loss_W",
+    "pred_secondary_center_winding_loss_W",
+    "pred_secondary_side_winding_loss_W", "pred_secondary_winding_loss_W",
+    "pred_component_winding_loss_sum_W", "pred_total_winding_loss_W",
+    "pred_total_loss_W", "rated_power_W", "pred_efficiency_pct",
+    "surrogate_output_basis",
 )
 INSULATION_KEYS = (
     "cc_w2c_space_x", "cc_w2c_space_y", "w2c_w1c_space_x",
@@ -79,6 +133,90 @@ def _finite_number(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _duration_seconds(value: Any) -> float | None:
+    """Return a non-negative finite duration without inventing missing timing."""
+    if isinstance(value, bool):
+        return None
+    number = _finite_number(value)
+    return number if number is not None and number >= 0 else None
+
+
+def _simulation_timing_summary(
+    rows: list[dict[str, Any]],
+    local_tz=None,
+    limit: int = SIMULATION_TIMING_WINDOW_ROWS,
+) -> dict[str, Any]:
+    """Summarize exact timing fields from the most recently saved rows."""
+    ranked: list[tuple[float, int, dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        stamp = _parse_time(row.get("saved_at"), local_tz)
+        ranked.append((stamp.timestamp() if stamp else float("-inf"), index, row))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    recent = [item[2] for item in ranked[:max(0, int(limit))]]
+    stages = {}
+    for name, source_field in SIMULATION_TIMING_FIELDS:
+        values = [
+            duration for row in recent
+            if (duration := _duration_seconds(row.get(source_field))) is not None
+        ]
+        stages[name] = {
+            "source_field": source_field,
+            "sample_count": len(values),
+            "mean_seconds": sum(values) / len(values) if values else None,
+            "median_seconds": statistics.median(values) if values else None,
+        }
+    return {
+        "available": any(stage["sample_count"] for stage in stages.values()),
+        "unit": "seconds",
+        "window_limit_rows": max(0, int(limit)),
+        "window_rows": len(recent),
+        "stages": stages,
+    }
+
+
+def _zero_aware_percentage_metrics(
+    actual_values: list[Any],
+    predicted_values: list[Any],
+    zero_abs_tolerance: float = MAPE_ZERO_ABS_TOLERANCE,
+) -> dict[str, Any]:
+    """Calculate APE metrics without dividing by structural zero targets."""
+    tolerance = _finite_number(zero_abs_tolerance)
+    if tolerance is None or tolerance < 0:
+        raise ValueError("MAPE zero tolerance must be finite and non-negative")
+    if len(actual_values) != len(predicted_values):
+        raise ValueError("MAPE actual/predicted lengths differ")
+    relative_errors: list[float] = []
+    valid_pair_count = 0
+    excluded_zero_count = 0
+    for raw_actual, raw_predicted in zip(actual_values, predicted_values):
+        actual = _finite_number(raw_actual)
+        predicted = _finite_number(raw_predicted)
+        if actual is None or predicted is None:
+            continue
+        valid_pair_count += 1
+        if abs(actual) <= tolerance:
+            excluded_zero_count += 1
+            continue
+        relative_errors.append(abs(predicted - actual) / abs(actual))
+    return {
+        "mape_pct": (
+            statistics.mean(relative_errors) * 100
+            if relative_errors else None
+        ),
+        "p90_ape_pct": (
+            statistics.quantiles(relative_errors, n=10, method="inclusive")[8] * 100
+            if len(relative_errors) >= 2
+            else relative_errors[0] * 100 if relative_errors else None
+        ),
+        "mape_n": len(relative_errors),
+        "mape_excluded_zero_count": excluded_zero_count,
+        "mape_valid_pair_count": valid_pair_count,
+        "mape_zero_abs_tolerance": tolerance,
+    }
 
 
 def _integer(value: Any, default: int = 0) -> int:
@@ -245,24 +383,107 @@ class SafeArtifactCache:
 
 
 class SchedulerReader:
-    """GET-only adapter for the existing scheduler API."""
+    """Bounded adapter for MFT scheduler status and project-cap control."""
 
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:8000",
         task_prefix: str = "mft",
+        project_name: str = "MFT_1MW_2026v1",
         timeout: float = 2.0,
         ttl: float = 10.0,
         opener: Callable[..., Any] = urlopen,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.task_prefix = task_prefix
+        self.project_name = project_name.strip()
         self.timeout = timeout
         self.ttl = ttl
         self._opener = opener
         self._lock = threading.Lock()
         self._cached_at = 0.0
         self._cached: dict[str, Any] | None = None
+
+    def _request_json(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+    ) -> Any:
+        body = None
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "mft-monitor/1",
+        }
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        with self._opener(request, timeout=self.timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _project_control(self, project: Any) -> dict[str, Any]:
+        if not isinstance(project, dict):
+            raise ValueError("scheduler project response is invalid")
+        if str(project.get("name") or "").strip() != self.project_name:
+            raise ValueError("scheduler returned a different project")
+        target = project.get("max_active_tasks")
+        if type(target) is not int or not PARALLEL_TARGET_MIN <= target <= PARALLEL_TARGET_MAX:
+            raise ValueError("scheduler project parallel target is invalid")
+        count_fields = {
+            "queued": project.get("queued_count"),
+            "attaching": project.get("attaching_count"),
+            "running": project.get("executing_count"),
+            "logical_active": project.get("logical_active_count"),
+        }
+        if any(type(value) is not int or value < 0 for value in count_fields.values()):
+            raise ValueError("scheduler project live counts are unavailable or invalid")
+        queued = count_fields["queued"]
+        attaching = count_fields["attaching"]
+        running = count_fields["running"]
+        logical_active = count_fields["logical_active"]
+        if logical_active != queued + attaching + running:
+            raise ValueError("scheduler project logical active count is inconsistent")
+        return {
+            "project": self.project_name,
+            "parallel_target": target,
+            "parallel_target_min": PARALLEL_TARGET_MIN,
+            "parallel_target_max": PARALLEL_TARGET_MAX,
+            "live_queued": max(0, queued),
+            "live_attaching": max(0, attaching),
+            "live_running": max(0, running),
+            "logical_active": max(0, logical_active),
+            "project_updated_at": project.get("updated_at"),
+        }
+
+    def set_parallel_target(self, target: int) -> dict[str, Any]:
+        """Set only the MFT project cap; task cancellation belongs to its controller."""
+        if type(target) is not int or not PARALLEL_TARGET_MIN <= target <= PARALLEL_TARGET_MAX:
+            raise ValueError(
+                f"parallel target must be an integer between "
+                f"{PARALLEL_TARGET_MIN} and {PARALLEL_TARGET_MAX}"
+            )
+        if not self.project_name:
+            raise ValueError("scheduler project control is not configured")
+        project_path = quote(self.project_name, safe="")
+        project = self._request_json(
+            f"/api/projects/{project_path}/max-active-tasks",
+            method="PATCH",
+            payload={"max_active_tasks": target},
+        )
+        control = self._project_control(project)
+        if control["parallel_target"] != target:
+            raise ValueError("scheduler project parallel target readback mismatch")
+        with self._lock:
+            self._cached = None
+            self._cached_at = 0.0
+        return control
 
     def snapshot(self) -> dict[str, Any]:
         now_monotonic = time.monotonic()
@@ -271,13 +492,10 @@ class SchedulerReader:
                 return self._cached
         # The campaign has more than ten thousand historical tasks.  Reading
         # /api/tasks would make a dashboard refresh take many seconds, so use
-        # the scheduler's aggregate, read-only endpoint exclusively.
+        # the aggregate summary plus the single MFT project record.
         query = urlencode({"name_prefix": self.task_prefix})
-        url = f"{self.base_url}/api/tasks/summary?{query}"
-        request = Request(url, headers={"Accept": "application/json", "User-Agent": "mft-monitor/1"}, method="GET")
         try:
-            with self._opener(request, timeout=self.timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            payload = self._request_json(f"/api/tasks/summary?{query}")
             if not isinstance(payload, dict) or not isinstance(payload.get("statuses"), dict):
                 raise ValueError("scheduler summary response is invalid")
             statuses = Counter({
@@ -293,6 +511,7 @@ class SchedulerReader:
                 "connected": True,
                 "url": self.base_url,
                 "read_only": True,
+                "control_enabled": False,
                 "task_prefix": self.task_prefix,
                 "total": _integer(payload.get("total"), sum(statuses.values())),
                 "running": running,
@@ -305,12 +524,53 @@ class SchedulerReader:
                 "error": None,
                 "updated_at": _iso(_now()),
             }
+            if self.project_name:
+                try:
+                    project_path = quote(self.project_name, safe="")
+                    project = self._request_json(f"/api/projects/{project_path}")
+                    result.update(self._project_control(project))
+                    result["control_enabled"] = True
+                    result["read_only"] = False
+                    result["project_error"] = None
+                except (
+                    HTTPError,
+                    URLError,
+                    OSError,
+                    ValueError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    result["project"] = self.project_name
+                    result["parallel_target"] = None
+                    result["parallel_target_min"] = PARALLEL_TARGET_MIN
+                    result["parallel_target_max"] = PARALLEL_TARGET_MAX
+                    result["live_queued"] = max(0, statuses.get("queued", 0))
+                    result["live_attaching"] = max(0, statuses.get("attaching", 0))
+                    result["live_running"] = max(0, statuses.get("running", 0))
+                    result["logical_active"] = (
+                        result["live_queued"]
+                        + result["live_attaching"]
+                        + result["live_running"]
+                    )
+                    result["project_error"] = (
+                        f"scheduler project 조회 실패: {type(exc).__name__}: {exc}"
+                    )
         except (HTTPError, URLError, OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
             result = {
                 "connected": False,
                 "url": self.base_url,
                 "read_only": True,
+                "control_enabled": False,
                 "task_prefix": self.task_prefix,
+                "project": self.project_name,
+                "parallel_target": None,
+                "parallel_target_min": PARALLEL_TARGET_MIN,
+                "parallel_target_max": PARALLEL_TARGET_MAX,
+                "live_queued": 0,
+                "live_attaching": 0,
+                "live_running": 0,
+                "logical_active": 0,
+                "project_error": None,
                 "total": 0,
                 "running": 0,
                 "pending": 0,
@@ -339,6 +599,64 @@ class RuntimeRecorder:
         self._lock = threading.Lock()
         self._last_signature: tuple[Any, ...] | None = None
         self._last_write = 0.0
+        self._snapshot_error: str | None = None
+
+    def _write_snapshot(self, payload: dict[str, Any]) -> None:
+        """Write one durable snapshot with a RaiDrive-safe bounded fallback."""
+        serialized = (
+            json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.snapshot_path.name}.",
+            suffix=".tmp",
+            dir=self.directory,
+        )
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            replace_error: OSError | None = None
+            for attempt in range(5):
+                try:
+                    os.replace(temp, self.snapshot_path)
+                    return
+                except OSError as exc:
+                    replace_error = exc
+                    if attempt < 4:
+                        time.sleep(0.05 * (2 ** attempt))
+
+            # Some Windows network filesystems deny rename/replace even when
+            # creating or overwriting the target directly is allowed.  The
+            # recorder lock serializes writers while this fallback writes,
+            # fsyncs, and verifies the complete serialized payload.
+            try:
+                with self.snapshot_path.open("wb") as handle:
+                    handle.write(serialized)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if self.snapshot_path.read_bytes() != serialized:
+                    raise OSError("snapshot direct-write readback mismatch")
+                return
+            except OSError as fallback_error:
+                raise OSError(
+                    f"snapshot replace failed ({replace_error}); "
+                    f"direct-write fallback failed ({fallback_error})"
+                ) from fallback_error
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _append_history(self, summary: dict[str, Any]) -> None:
+        with self.history_path.open("a", encoding="utf-8", newline="\n") as handle:
+            json.dump(summary, handle, ensure_ascii=False, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     @staticmethod
     def _summary(dashboard: dict[str, Any]) -> dict[str, Any]:
@@ -356,6 +674,8 @@ class RuntimeRecorder:
                 "complete_rows": data.get("complete_rows"),
                 "throughput_1h": data.get("throughput_1h"),
                 "count_basis": data.get("count_basis"),
+                "pinned_solver_revision": data.get("pinned_revision"),
+                "pinned_library_revision": data.get("pinned_library_revision"),
             },
             "models": {
                 "trained": models.get("trained_count"),
@@ -419,6 +739,8 @@ class RuntimeRecorder:
             summary["overall"],
             summary["data"]["total_rows"],
             summary["data"]["complete_rows"],
+            summary["data"]["pinned_solver_revision"],
+            summary["data"]["pinned_library_revision"],
             summary["models"]["trained"],
             summary["nsga2"]["round"],
             summary["nsga2"]["candidate_count"],
@@ -430,18 +752,30 @@ class RuntimeRecorder:
         now_monotonic = time.monotonic()
         with self._lock:
             if signature == self._last_signature and now_monotonic - self._last_write < self.min_interval_seconds:
+                if self._snapshot_error:
+                    raise OSError(self._snapshot_error)
                 return
             self.directory.mkdir(parents=True, exist_ok=True)
-            temp = self.snapshot_path.with_suffix(".json.tmp")
-            with temp.open("w", encoding="utf-8", newline="\n") as handle:
-                json.dump(self._snapshot(dashboard, summary), handle, ensure_ascii=False, indent=2, allow_nan=False)
-                handle.write("\n")
-            os.replace(temp, self.snapshot_path)
-            with self.history_path.open("a", encoding="utf-8", newline="\n") as handle:
-                json.dump(summary, handle, ensure_ascii=False, allow_nan=False)
-                handle.write("\n")
-            self._last_signature = signature
-            self._last_write = now_monotonic
+            errors = []
+            try:
+                self._write_snapshot(self._snapshot(dashboard, summary))
+                self._snapshot_error = None
+            except (OSError, TypeError, ValueError) as exc:
+                self._snapshot_error = f"snapshot write failed: {type(exc).__name__}: {exc}"
+                errors.append(self._snapshot_error)
+
+            history_written = False
+            try:
+                self._append_history(summary)
+                history_written = True
+            except (OSError, TypeError, ValueError) as exc:
+                errors.append(f"history append failed: {type(exc).__name__}: {exc}")
+
+            if history_written:
+                self._last_signature = signature
+                self._last_write = now_monotonic
+            if errors:
+                raise OSError("; ".join(errors))
 
     def history(self, limit: int = 2_000) -> dict[str, Any]:
         if not self.history_path.exists():
@@ -519,6 +853,14 @@ class ArtifactService:
             for key in ("solver_revision", "library_revision")
         )
         strict_available = bool(strict_result.exists and pins_valid)
+        pinned_revision = (
+            str(identity.get("solver_revision")).strip().lower()
+            if strict_available else None
+        )
+        pinned_library_revision = (
+            str(identity.get("library_revision")).strip().lower()
+            if strict_available else None
+        )
         total = _integer(strict_status.get("strict_full_rows"), 0) if strict_available else 0
         em_valid = _integer(strict_status.get("strict_em_rows"), 0) if strict_available else 0
         thermal_valid = complete = total
@@ -532,6 +874,7 @@ class ArtifactService:
             if (parsed := _parse_time(row.get("saved_at"), now.tzinfo)) is not None
         ]
         timestamps.sort()
+        simulation_timing = _simulation_timing_summary(rows, now.tzinfo)
         one_hour_ago = now - timedelta(hours=1)
         day_ago = now - timedelta(hours=24)
         strict_history = []
@@ -548,6 +891,10 @@ class ArtifactService:
                         stamp = _parse_time(entry.get("time"), now.tzinfo) if isinstance(entry, dict) else None
                         if (isinstance(data_entry, dict)
                                 and data_entry.get("count_basis") == "pinned_strict_full"
+                                and pinned_revision is not None
+                                and pinned_library_revision is not None
+                                and data_entry.get("pinned_solver_revision") == pinned_revision
+                                and data_entry.get("pinned_library_revision") == pinned_library_revision
                                 and stamp is not None):
                             strict_history.append((stamp, _integer(data_entry.get("total_rows"), 0)))
             except OSError as exc:
@@ -643,6 +990,8 @@ class ArtifactService:
             "stalled_minutes": stalled_minutes,
             "stalled": bool(stalled_minutes is not None and stalled_minutes >= 90 and total < DATA_GOAL),
             "latest_revision": latest_revision,
+            "pinned_revision": pinned_revision,
+            "pinned_library_revision": pinned_library_revision,
             "revision_count": len(revisions) or len(hashes),
             "rows_not_latest_revision": revision_mismatch,
             "collector": {
@@ -650,6 +999,7 @@ class ArtifactService:
                 "no_data_tasks": len(nodata) if isinstance(nodata, list) else None,
                 "local_parts": len(local_parts) if isinstance(local_parts, list) else None,
             },
+            "simulation_timing": simulation_timing,
             "history": history,
             "source": {
                 "manifest": str(manifest_result.path),
@@ -661,6 +1011,271 @@ class ArtifactService:
             },
             "warnings": warnings,
         }
+
+    @staticmethod
+    def _exact_integer(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        number = _finite_number(value)
+        if number is None or not number.is_integer():
+            return None
+        return int(number)
+
+    def _latest_checkpoint_evidence(self) -> dict[str, Any]:
+        """Return the newest SHA-authorized metrics-only checkpoint.
+
+        Checkpoint CV is evaluation evidence, not a deployed model.  The state
+        item authorizes the immutable metrics result by SHA-256; learning-curve
+        rows are deliberately not considered here.
+        """
+        training_root = self.root / "training"
+        strict_result = self.cache.json(training_root / "strict_data_status.json", {})
+        warnings = self._warnings(strict_result)
+        if strict_result.exists and strict_result.warning:
+            return {"candidate": None, "warnings": warnings}
+        strict_payload = strict_result.value if isinstance(strict_result.value, dict) else {}
+        strict_identity = (
+            strict_payload.get("state_identity")
+            if isinstance(strict_payload.get("state_identity"), dict)
+            else {}
+        )
+        required_identity = {
+            key: str(strict_identity[key]).strip().lower()
+            for key in ("solver_revision", "library_revision")
+            if _safe_text(strict_identity.get(key), 160)
+        }
+
+        candidates: list[tuple[int, float, dict[str, Any]]] = []
+        runs_root = training_root / "checkpoint_runs"
+        try:
+            state_paths = sorted(runs_root.glob("*/checkpoint_state.json"))
+        except OSError as exc:
+            return {
+                "candidate": None,
+                "warnings": warnings + [f"checkpoint state scan failed: {exc}"],
+            }
+
+        for state_path in state_paths:
+            state_result = self.cache.json(state_path, {})
+            if state_result.warning:
+                warnings.append(state_result.warning)
+                continue
+            state = state_result.value if isinstance(state_result.value, dict) else {}
+            if state.get("schema_version") != CHECKPOINT_STATE_SCHEMA_VERSION:
+                continue
+            identity = state.get("identity") if isinstance(state.get("identity"), dict) else {}
+            if any(
+                str(identity.get(key, "")).strip().lower() != expected
+                for key, expected in required_identity.items()
+            ):
+                # Other solver/library runs are retained as archives and are
+                # expected to coexist with the currently pinned campaign.
+                continue
+            completed = state.get("completed")
+            if not isinstance(completed, list):
+                continue
+            try:
+                run_root = state_path.parent.resolve()
+            except OSError as exc:
+                warnings.append(f"checkpoint run path resolution failed: {exc}")
+                continue
+
+            for item in completed:
+                if not isinstance(item, dict) or item.get("kind") != "metrics_only":
+                    continue
+                threshold = self._exact_integer(item.get("threshold"))
+                strict_rows = self._exact_integer(item.get("actual_strict_full_rows"))
+                completed_text = _safe_text(item.get("completed_at"), 80)
+                completed_at = _parse_time(completed_text, self.clock().tzinfo)
+                if threshold is None or threshold < 0 or strict_rows is None or completed_at is None:
+                    warnings.append(f"checkpoint completion is malformed: {state_path}")
+                    continue
+
+                metrics_text = _safe_text(item.get("metrics_result"), 4_096)
+                if not metrics_text:
+                    warnings.append(f"checkpoint metrics path is missing: {state_path}")
+                    continue
+                metrics_path = Path(metrics_text)
+                if not metrics_path.is_absolute():
+                    metrics_path = run_root / metrics_path
+                try:
+                    metrics_path = metrics_path.resolve()
+                    if not metrics_path.is_relative_to(run_root):
+                        raise ValueError("metrics result escapes checkpoint run root")
+                except (OSError, ValueError) as exc:
+                    warnings.append(f"checkpoint metrics path rejected: {exc}")
+                    continue
+
+                expected_hash = str(item.get("metrics_result_sha256", "")).strip().lower()
+                actual_hash = _sha256_file(metrics_path)
+                if not expected_hash or actual_hash != expected_hash:
+                    warnings.append(f"checkpoint metrics hash mismatch: {metrics_path}")
+                    continue
+                metrics_result = self.cache.json(metrics_path, {})
+                if metrics_result.warning or not metrics_result.exists:
+                    warnings.extend(self._warnings(metrics_result))
+                    continue
+                metrics_payload = (
+                    metrics_result.value if isinstance(metrics_result.value, dict) else {}
+                )
+                snapshot_sha = str(item.get("snapshot_sha256", "")).strip().lower()
+                profile_sha = str(item.get("profile_sha256", "")).strip().lower()
+                payload_checkpoint = self._exact_integer(metrics_payload.get("checkpoint"))
+                payload_rows = self._exact_integer(metrics_payload.get("strict_full_rows"))
+                evidence_matches = (
+                    metrics_payload.get("schema_version") == CHECKPOINT_METRICS_SCHEMA_VERSION
+                    and payload_checkpoint == threshold
+                    and payload_rows == strict_rows
+                    and str(metrics_payload.get("dataset_sha256", "")).strip().lower() == snapshot_sha
+                    and str(metrics_payload.get("profile_sha256", "")).strip().lower() == profile_sha
+                    and bool(snapshot_sha)
+                    and bool(profile_sha)
+                )
+                if not evidence_matches:
+                    warnings.append(f"checkpoint metrics identity mismatch: {metrics_path}")
+                    continue
+                state_profile_sha = str(identity.get("profile_sha256", "")).strip().lower()
+                if state_profile_sha and state_profile_sha != profile_sha:
+                    warnings.append(f"checkpoint state/profile identity mismatch: {state_path}")
+                    continue
+
+                metrics_rows = metrics_payload.get("metrics")
+                if not isinstance(metrics_rows, list):
+                    warnings.append(f"checkpoint metrics rows are malformed: {metrics_path}")
+                    continue
+                global_metrics: dict[str, dict[str, Any]] = {}
+                duplicate_target = False
+                for row in metrics_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    if str(row.get("slice", "global")).strip().lower() != "global":
+                        continue
+                    target = _safe_text(row.get("target"), 120)
+                    if not target:
+                        continue
+                    if target in global_metrics:
+                        duplicate_target = True
+                        break
+                    global_metrics[target] = row
+                if duplicate_target or not global_metrics:
+                    warnings.append(f"checkpoint global metrics are ambiguous or empty: {metrics_path}")
+                    continue
+
+                evaluated_at = (
+                    _safe_text(metrics_payload.get("completed_at"), 80)
+                    or completed_text
+                )
+                activation_minimum = self._exact_integer(
+                    identity.get("activation_minimum_strict_full_rows")
+                )
+                if activation_minimum is None:
+                    activation_minimum = self._exact_integer(
+                        item.get("activation_minimum_strict_full_rows")
+                    )
+                candidate = {
+                    "checkpoint": threshold,
+                    "completed_at": completed_text,
+                    "evaluated_at": evaluated_at,
+                    "strict_full_rows": strict_rows,
+                    "activation_minimum_strict_full_rows": activation_minimum,
+                    "metrics": global_metrics,
+                    "metrics_payload": metrics_payload,
+                    "metrics_path": metrics_path,
+                    "state_path": state_path,
+                    "parity_path": metrics_path.with_suffix(".parity.json"),
+                    "parity_targets": {},
+                    "parity_metadata": {},
+                }
+                candidates.append((threshold, completed_at.timestamp(), candidate))
+
+        if not candidates:
+            return {"candidate": None, "warnings": list(dict.fromkeys(warnings))}
+        _, _, selected = max(candidates, key=lambda entry: (entry[0], entry[1]))
+        parity_path = selected["parity_path"]
+        parity_result = self.cache.json(parity_path, {}, max_bytes=64 * 1024 * 1024)
+        if parity_result.warning:
+            warnings.append(parity_result.warning)
+        elif parity_result.exists:
+            parity = parity_result.value if isinstance(parity_result.value, dict) else {}
+            metrics_payload = selected["metrics_payload"]
+            parity_matches = (
+                parity.get("schema_version") == CHECKPOINT_PARITY_SCHEMA_VERSION
+                and parity.get("artifact_type") == CHECKPOINT_PARITY_ARTIFACT_TYPE
+                and self._exact_integer(parity.get("checkpoint")) == selected["checkpoint"]
+                and self._exact_integer(parity.get("strict_full_rows")) == selected["strict_full_rows"]
+                and str(parity.get("dataset_sha256", "")).strip().lower()
+                == str(metrics_payload.get("dataset_sha256", "")).strip().lower()
+                and str(parity.get("profile_sha256", "")).strip().lower()
+                == str(metrics_payload.get("profile_sha256", "")).strip().lower()
+            )
+            raw_targets = parity.get("targets")
+            if not parity_matches or not isinstance(raw_targets, dict):
+                warnings.append(f"checkpoint parity identity mismatch: {parity_path}")
+            else:
+                parity_targets: dict[str, dict[str, Any]] = {}
+                parity_error: str | None = None
+                for target, target_payload in raw_targets.items():
+                    if not isinstance(target, str) or not isinstance(target_payload, dict):
+                        parity_error = "target payload is malformed"
+                        break
+                    pairs = target_payload.get("pairs")
+                    sample_count = self._exact_integer(target_payload.get("sample_count"))
+                    n_rows = self._exact_integer(target_payload.get("n"))
+                    metric = selected["metrics"].get(target)
+                    metric_n = self._exact_integer(metric.get("n")) if metric else None
+                    if (
+                        not isinstance(pairs, list)
+                        or sample_count != len(pairs)
+                        or sample_count is None
+                        or sample_count > CHECKPOINT_PARITY_PAIR_LIMIT
+                        or n_rows is None
+                        or sample_count > n_rows
+                        or (metric_n is not None and metric_n != n_rows)
+                    ):
+                        parity_error = f"{target} sample metadata is malformed"
+                        break
+                    clean_pairs = []
+                    for pair in pairs:
+                        if not isinstance(pair, dict):
+                            parity_error = f"{target} pair is malformed"
+                            break
+                        actual = _finite_number(pair.get("actual"))
+                        predicted = _finite_number(pair.get("predicted"))
+                        if actual is None or predicted is None:
+                            parity_error = f"{target} pair is non-finite"
+                            break
+                        clean_pairs.append({
+                            "row_position": self._exact_integer(pair.get("row_position")),
+                            "row_index": _coerce(pair.get("row_index")),
+                            "actual": actual,
+                            "predicted": predicted,
+                        })
+                    if parity_error:
+                        break
+                    parity_targets[target] = {
+                        "n": n_rows,
+                        "sample_count": sample_count,
+                        "sampling": (
+                            target_payload.get("sampling")
+                            if isinstance(target_payload.get("sampling"), dict)
+                            else {}
+                        ),
+                        "pairs": clean_pairs,
+                    }
+                if parity_error:
+                    warnings.append(f"checkpoint parity malformed ({parity_error}): {parity_path}")
+                else:
+                    selected["parity_targets"] = parity_targets
+                    selected["parity_metadata"] = {
+                        "artifact_type": parity.get("artifact_type"),
+                        "prediction_kind": _safe_text(parity.get("prediction_kind"), 80),
+                        "cv": parity.get("cv") if isinstance(parity.get("cv"), dict) else {},
+                        "max_pairs_per_target": self._exact_integer(
+                            parity.get("max_pairs_per_target")
+                        ),
+                    }
+
+        return {"candidate": selected, "warnings": list(dict.fromkeys(warnings))}
 
     def models(self, current_data_count: int | None = None) -> dict[str, Any]:
         registry = self.root / "training" / "registry"
@@ -729,6 +1344,26 @@ class ArtifactService:
         if current_data_count is None:
             current_data_count = self.data()["total_rows"]
 
+        checkpoint_result = self._latest_checkpoint_evidence()
+        warnings.extend(checkpoint_result["warnings"])
+        checkpoint = checkpoint_result["candidate"]
+        checkpoint_metrics = checkpoint["metrics"] if checkpoint else {}
+        activation_minimum = (
+            checkpoint["activation_minimum_strict_full_rows"] if checkpoint else None
+        )
+        preactivation_checkpoint = bool(
+            checkpoint
+            and not pointer_result.exists
+            and activation_minimum is not None
+            and current_data_count < activation_minimum
+        )
+        if preactivation_checkpoint and pointer_warning:
+            # Before the activation floor, an absent pointer is the expected
+            # state: checkpoint CV has run, but no deployable generation may be
+            # promoted yet.  Existing/corrupt pointers and post-floor absence
+            # remain warnings.
+            warnings = [warning for warning in warnings if warning != pointer_warning]
+
         histories: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in curve_rows:
             target = _safe_text(row.get("target"), 120)
@@ -745,33 +1380,110 @@ class ArtifactService:
             histories[target].append(item)
 
         ordered_targets = [item["name"] for item in TARGETS]
-        ordered_targets.extend(sorted(set(report) - set(ordered_targets)))
+        ordered_targets.extend(
+            sorted((set(report) | set(checkpoint_metrics)) - set(ordered_targets))
+        )
         models: list[dict[str, Any]] = []
         latest_times: list[datetime] = []
         for target in ordered_targets:
-            metrics = report.get(target) if isinstance(report.get(target), dict) else None
+            active_metrics = report.get(target) if isinstance(report.get(target), dict) else None
             meta_result = self.cache.json(generation / target / "meta.json", {})
             if meta_result.warning:
                 warnings.append(meta_result.warning)
             meta = meta_result.value if isinstance(meta_result.value, dict) else {}
-            if metrics is None and isinstance(meta.get("metrics"), dict):
-                metrics = meta["metrics"]
-            metrics = metrics or {}
-            trained = bool(metrics)
-            trained_at = _safe_text(meta.get("trained_at") or report_payload.get("time"), 80)
+            if active_metrics is None and isinstance(meta.get("metrics"), dict):
+                active_metrics = meta["metrics"]
+            active_metrics = active_metrics or {}
+            trained = bool(active_metrics)
+            checkpoint_metric = (
+                checkpoint_metrics.get(target)
+                if not trained and isinstance(checkpoint_metrics.get(target), dict)
+                else None
+            )
+            evaluated = trained or checkpoint_metric is not None
+            metrics = active_metrics if trained else (checkpoint_metric or {})
+            trained_at = (
+                _safe_text(meta.get("trained_at") or report_payload.get("time"), 80)
+                if trained else None
+            )
             parsed_trained_at = _parse_time(trained_at, self.clock().tzinfo)
             if parsed_trained_at:
                 latest_times.append(parsed_trained_at)
-            n_train = _integer(metrics.get("n_train"), 0)
-            n_holdout = _integer(metrics.get("n_holdout"), 0)
-            n_used = n_train + n_holdout
+            n_train = _integer(metrics.get("n_train"), 0) if trained else 0
+            n_holdout = _integer(metrics.get("n_holdout"), 0) if trained else 0
+            n_used = (
+                n_train + n_holdout
+                if trained else max(0, self._exact_integer(metrics.get("n")) or 0)
+            )
             stale = bool(trained and current_data_count and n_used and current_data_count >= n_used + max(100, int(n_used * 0.25)))
-            history = histories.get(target, [])[-100:]
-            previous = history[-1] if history else None
+            history = [dict(item) for item in histories.get(target, [])[-100:]]
             r2 = _finite_number(metrics.get("r2"))
             mape = _finite_number(metrics.get("mape_pct"))
+            p90_ape = _finite_number(metrics.get("p90_ape_pct"))
+            mape_n = self._exact_integer(metrics.get("mape_n"))
+            mape_excluded_zero_count = self._exact_integer(
+                metrics.get("mape_excluded_zero_count")
+            )
+            mape_zero_abs_tolerance = _finite_number(
+                metrics.get("mape_zero_abs_tolerance")
+            )
+            percentage_metric_source = (
+                "artifact_zero_aware" if mape_n is not None
+                else "legacy_all_rows"
+            )
+            # Legacy checkpoints used max(|actual|, 1e-9) as the denominator,
+            # so a structural zero could turn one ordinary prediction error
+            # into a multi-million-percent MAPE.  The parity artifact contains
+            # every OOF pair while n <= the artifact limit, allowing an exact,
+            # non-mutating display correction until the next zero-aware
+            # checkpoint is produced.
+            parity_metric = (
+                checkpoint["parity_targets"].get(target, {})
+                if checkpoint_metric is not None else {}
+            )
+            parity_pairs = parity_metric.get("pairs", [])
+            if (
+                mape_n is None
+                and isinstance(parity_pairs, list)
+                and parity_metric.get("sample_count") == parity_metric.get("n")
+                and parity_metric.get("n") == n_used
+            ):
+                corrected = _zero_aware_percentage_metrics(
+                    [pair.get("actual") for pair in parity_pairs],
+                    [pair.get("predicted") for pair in parity_pairs],
+                )
+                if corrected["mape_n"] > 0:
+                    mape = corrected["mape_pct"]
+                    p90_ape = corrected["p90_ape_pct"]
+                    mape_n = corrected["mape_n"]
+                    mape_excluded_zero_count = corrected[
+                        "mape_excluded_zero_count"
+                    ]
+                    mape_zero_abs_tolerance = corrected[
+                        "mape_zero_abs_tolerance"
+                    ]
+                    percentage_metric_source = "parity_recomputed_zero_aware"
+                    for item in reversed(history):
+                        if item.get("n") == n_used:
+                            item.update({
+                                "mape_pct": mape,
+                                "p90_ape_pct": p90_ape,
+                                "mape_n": mape_n,
+                                "mape_excluded_zero_count": (
+                                    mape_excluded_zero_count
+                                ),
+                                "mape_zero_abs_tolerance": (
+                                    mape_zero_abs_tolerance
+                                ),
+                            })
+                            break
+            # learning_curve.csv remains historical display data only.  It is
+            # never used as the numeric source for checkpoint fallback rows.
+            previous = history[-1] if trained and history else None
             attention = bool(trained and ((r2 is not None and r2 < 0.8) or (mape is not None and mape > 20.0)))
-            if not trained:
+            if checkpoint_metric is not None:
+                status = "checkpoint"
+            elif not trained:
                 status = "not_trained"
             elif stale:
                 status = "stale"
@@ -785,6 +1497,13 @@ class ArtifactService:
                 "unit": TARGET_META.get(target, {}).get("unit", ""),
                 "status": status,
                 "trained": trained,
+                "evaluated": evaluated,
+                "deployable": trained,
+                "evaluation_kind": (
+                    "active_registry" if trained
+                    else ("checkpoint_cv" if checkpoint_metric is not None else None)
+                ),
+                "checkpoint": checkpoint["checkpoint"] if checkpoint_metric is not None else None,
                 "stale": stale,
                 "n_train": n_train,
                 "n_holdout": n_holdout,
@@ -792,27 +1511,84 @@ class ArtifactService:
                 "r2": r2,
                 "rmse": _finite_number(metrics.get("rmse")),
                 "mape_pct": mape,
-                "p90_ape_pct": _finite_number(metrics.get("p90_ape_pct")),
+                "p90_ape_pct": p90_ape,
+                "mape_n": mape_n,
+                "mape_excluded_zero_count": mape_excluded_zero_count,
+                "mape_zero_abs_tolerance": mape_zero_abs_tolerance,
+                "percentage_metric_source": percentage_metric_source,
                 "q90_conformal": _finite_number(metrics.get("q90_conformal") or meta.get("q90")),
                 "trained_at": trained_at,
+                "evaluated_at": (
+                    trained_at
+                    if trained else (checkpoint["evaluated_at"] if checkpoint_metric is not None else None)
+                ),
                 "delta_r2": (r2 - previous["r2"] if r2 is not None and previous and previous["r2"] is not None else None),
                 "delta_mape_pct": (mape - previous["mape_pct"] if mape is not None and previous and previous["mape_pct"] is not None else None),
+                "parity_available": bool(
+                    checkpoint_metric is not None
+                    and checkpoint["parity_targets"].get(target, {}).get("pairs")
+                ),
+                "parity_sample_count": (
+                    checkpoint["parity_targets"].get(target, {}).get("sample_count", 0)
+                    if checkpoint_metric is not None else 0
+                ),
+                "parity_source": (
+                    str(checkpoint["parity_path"])
+                    if checkpoint_metric is not None
+                    and target in checkpoint["parity_targets"] else None
+                ),
+                "source_kind": (
+                    "active_registry" if trained
+                    else ("checkpoint_cv" if checkpoint_metric is not None else None)
+                ),
+                "source": (
+                    str(report_result.path) if trained
+                    else (str(checkpoint["metrics_path"]) if checkpoint_metric is not None else None)
+                ),
                 "history": history,
             })
 
         trained_count = sum(model["trained"] for model in models)
+        evaluated_count = sum(model["evaluated"] for model in models)
+        primary_source = (
+            str(report_result.path) if trained_count
+            else (str(checkpoint["metrics_path"]) if checkpoint else str(report_result.path))
+        )
+        quality_note = (
+            f"현재 strict 데이터 {current_data_count}개는 활성화 기준 {activation_minimum}개 미만이므로 "
+            "검증된 checkpoint CV 평가만 표시하며 배포 모델로 취급하지 않습니다."
+            if preactivation_checkpoint else
+            "주의 표시는 탐색용 기준(R² < 0.8 또는 MAPE > 20%)이며, 최종 합격은 독립 FEA 검증으로 판정합니다."
+        )
         return {
             "schema_version": SCHEMA_VERSION,
-            "available": report_result.exists or curve_result.exists,
+            "available": report_result.exists or curve_result.exists or checkpoint is not None,
             "target_count": len(models),
             "trained_count": trained_count,
+            "evaluated_count": evaluated_count,
             "missing_count": len(models) - trained_count,
             "current_data_count": current_data_count,
             "latest_trained_at": _iso(max(latest_times)) if latest_times else _safe_text(report_payload.get("time"), 80),
-            "quality_note": "주의 표시는 탐색용 기준(R² < 0.8 또는 MAPE > 20%)이며, 최종 합격은 독립 FEA 검증으로 판정합니다.",
+            "latest_checkpoint": checkpoint["checkpoint"] if checkpoint else None,
+            "checkpoint_evaluated_at": checkpoint["evaluated_at"] if checkpoint else None,
+            "activation_minimum_strict_full_rows": activation_minimum,
+            "activation_state": (
+                "active_registry" if trained_count
+                else ("preactivation_checkpoint" if preactivation_checkpoint
+                      else ("activation_due" if checkpoint and activation_minimum is not None
+                            and current_data_count >= activation_minimum else "unavailable"))
+            ),
+            "quality_note": quality_note,
             "models": models,
             "warnings": list(dict.fromkeys(warnings)),
-            "source": str(report_result.path),
+            "source": primary_source,
+            "source_kind": (
+                "active_registry" if trained_count
+                else ("checkpoint_cv" if checkpoint else "unavailable")
+            ),
+            "active_source": str(report_result.path),
+            "checkpoint_source": str(checkpoint["metrics_path"]) if checkpoint else None,
+            "checkpoint_state_source": str(checkpoint["state_path"]) if checkpoint else None,
         }
 
     def model_history(self, target: str) -> dict[str, Any] | None:
@@ -821,6 +1597,59 @@ class ArtifactService:
         models = self.models()
         model = next((item for item in models["models"] if item["target"] == target), None)
         return {"target": target, "label": TARGET_META[target]["label"], "history": model["history"] if model else []}
+
+    def model_parity(self, target: str) -> dict[str, Any] | None:
+        if target not in TARGET_META:
+            return None
+        models = self.models()
+        model = next((item for item in models["models"] if item["target"] == target), None)
+        base = {
+            "schema_version": SCHEMA_VERSION,
+            "target": target,
+            "label": TARGET_META[target]["label"],
+            "unit": TARGET_META[target]["unit"],
+            "available": False,
+            "evaluation_kind": model.get("evaluation_kind") if model else None,
+            "checkpoint": model.get("checkpoint") if model else None,
+            "evaluated_at": model.get("evaluated_at") if model else None,
+            "n": model.get("n_used", 0) if model else 0,
+            "sample_count": 0,
+            "sampling": {},
+            "pairs": [],
+            "metadata": {},
+            "source": None,
+            "warnings": models.get("warnings", []),
+        }
+        # A passing active registry has priority.  A checkpoint sidecar is not
+        # presented as parity evidence for a different, deployed generation.
+        if not model or model.get("evaluation_kind") != "checkpoint_cv":
+            return base
+
+        checkpoint_result = self._latest_checkpoint_evidence()
+        candidate = checkpoint_result["candidate"]
+        warnings = list(dict.fromkeys(
+            [*base["warnings"], *checkpoint_result["warnings"]]
+        ))
+        if not candidate or candidate["checkpoint"] != model.get("checkpoint"):
+            base["warnings"] = warnings
+            return base
+        parity = candidate["parity_targets"].get(target)
+        if not isinstance(parity, dict) or not parity.get("pairs"):
+            base["warnings"] = warnings
+            return base
+        return {
+            **base,
+            "available": True,
+            "checkpoint": candidate["checkpoint"],
+            "evaluated_at": candidate["evaluated_at"],
+            "n": parity["n"],
+            "sample_count": parity["sample_count"],
+            "sampling": parity["sampling"],
+            "pairs": parity["pairs"],
+            "metadata": candidate["parity_metadata"],
+            "source": str(candidate["parity_path"]),
+            "warnings": warnings,
+        }
 
     @staticmethod
     def _constraint(value: float | None, limit: float | tuple[float, float], mode: str) -> dict[str, Any]:
@@ -844,7 +1673,9 @@ class ArtifactService:
         volume = _finite_number(row.get("volume_L"))
         loss = _finite_number(row.get("total_loss_W"))
         llt = _finite_number(row.get("pred_Llt_phys"))
-        bmax = _finite_number(row.get("pred_B_max_core"))
+        b_design = _finite_number(row.get("B_design_analytic_T"))
+        b_mean = _finite_number(row.get("pred_B_mean_core"))
+        bmax_diagnostic = _finite_number(row.get("pred_B_max_core"))
         temperatures = {
             target: _finite_number(row.get(f"pred_{target}")) for target in TEMPERATURE_TARGETS
         }
@@ -857,7 +1688,7 @@ class ArtifactService:
         constraints = {
             "llt": self._constraint(llt, (26.95, 28.05), "band"),
             "temperature": self._constraint(max_temperature, 100.0, "max"),
-            "bmax": self._constraint(bmax, 1.2, "max"),
+            "bfield": self._constraint(b_design, 1.2, "max"),
             "insulation": self._constraint(min_insulation, 40.0, "min"),
         }
         passes = [item["pass"] for item in constraints.values()]
@@ -870,6 +1701,11 @@ class ArtifactService:
         parameters = {
             key: _coerce(row.get(key)) for key in DESIGN_PARAMETER_KEYS if row.get(key) not in (None, "")
         }
+        report = {
+            key: _coerce(row.get(key))
+            for key in CANDIDATE_REPORT_FIELDS
+            if row.get(key) not in (None, "")
+        }
         return {
             "id": f"r{round_number:02d}-{index:04d}",
             "index": index,
@@ -877,13 +1713,16 @@ class ArtifactService:
             "volume_L": volume,
             "total_loss_W": loss,
             "pred_Llt_phys": llt,
-            "pred_B_max_core": bmax,
+            "B_design_analytic_T": b_design,
+            "pred_B_mean_core": b_mean,
+            "diagnostic_pred_B_max_core": bmax_diagnostic,
             "pred_max_temperature_C": max_temperature,
             "pred_temperatures_C": temperatures,
             "min_insulation_mm": min_insulation,
             "constraints": constraints,
             "spec_status": spec_status,
             "uncertainty": sigmas,
+            "report": report,
             "parameters": parameters,
         }
 
@@ -1058,6 +1897,12 @@ class ArtifactService:
             "conv_error_pct_loss": loss_error,
             "solver_revision": _safe_text(result.get("git_hash"), 40),
             "library_revision": _safe_text(result.get("pyaedt_library_git_hash"), 40),
+            "timing_seconds": {
+                "matrix": _duration_seconds(result.get("time_matrix")),
+                "loss": _duration_seconds(result.get("time_loss")),
+                "icepak": _duration_seconds(result.get("time_thermal")),
+                "total": _duration_seconds(result.get("time")),
+            },
             "parameters": {
                 key: _coerce(result.get(key)) for key in DESIGN_PARAMETER_KEYS if result.get(key) not in (None, "")
             },
@@ -1263,7 +2108,15 @@ class ArtifactService:
             data_state, data_detail = "waiting", f"{data['total_rows']:,}개 확보"
         stages.append({"key": "data", "label": "데이터 적재", "state": data_state, "detail": data_detail})
 
-        if models["trained_count"] == 0:
+        if models.get("activation_state") == "preactivation_checkpoint":
+            model_state = "waiting"
+            model_detail = (
+                f"checkpoint {models.get('latest_checkpoint')} CV "
+                f"{models.get('evaluated_count', 0)}/{models.get('target_count', 0)} · "
+                f"활성화 {models.get('current_data_count', 0):,}/"
+                f"{models.get('activation_minimum_strict_full_rows', 0):,}"
+            )
+        elif models["trained_count"] == 0:
             model_state, model_detail = "waiting", "학습 모델 없음"
         elif models["missing_count"]:
             model_state, model_detail = "warning", f"{models['trained_count']}/{models['target_count']} 모델 학습"
@@ -1297,7 +2150,10 @@ class ArtifactService:
             warnings.append(scheduler["error"])
         if data["stalled"]:
             warnings.append(f"유효 데이터가 약 {data['stalled_minutes']:.0f}분 동안 증가하지 않았습니다.")
-        if models["missing_count"]:
+        if (
+            models["missing_count"]
+            and models.get("activation_state") != "preactivation_checkpoint"
+        ):
             missing = [model["label"] for model in models["models"] if not model["trained"]]
             warnings.append("미학습 모델: " + ", ".join(missing))
         if final_status == "fail":

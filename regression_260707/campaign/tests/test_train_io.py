@@ -44,6 +44,10 @@ def raw_rows():
             "T_max_Rx_main": 91.0,
             "result_valid_em": 1,
             "result_valid_thermal": 1,
+            "time_matrix": 300.0,
+            "time_loss": 1700.0,
+            "time_thermal": 1000.0,
+            "time": 3000.0,
             "git_hash": "a" * 40,
             "pyaedt_library_git_hash": "b" * 40,
             "P_turn_Rx_main_0_0": 12.0,
@@ -81,6 +85,10 @@ def raw_rows():
             "T_max_Rx_main": 90.0,
             "result_valid_em": 1,
             "result_valid_thermal": 1,
+            "time_matrix": 600.0,
+            "time_loss": 1800.0,
+            "time_thermal": 1200.0,
+            "time": 3600.0,
             "git_hash": "c" * 40,
             "pyaedt_library_git_hash": "d" * 40,
         },
@@ -95,7 +103,7 @@ class TrainIoBuilderTests(unittest.TestCase):
         view = train_io.build_train_io(raw)
 
         self.assertEqual(tuple(view.columns), train_io.TRAIN_IO_COLUMNS)
-        self.assertEqual(view["train_io_schema_version"].tolist(), [2, 2])
+        self.assertEqual(view["train_io_schema_version"].tolist(), [3, 3])
         self.assertEqual(
             view["inductance_source_basis"].tolist(),
             ["eighth_symmetry", "full_model"],
@@ -106,6 +114,10 @@ class TrainIoBuilderTests(unittest.TestCase):
         self.assertEqual(view["matrix_skin_mesh"].tolist(), [0, 1])
         self.assertEqual(view["P_winding_total"].tolist(), [4000.0, 4100.0])
         self.assertEqual(view["T_max_Rx_main"].tolist(), [91.0, 90.0])
+        self.assertEqual(view["time_matrix"].tolist(), [300.0, 600.0])
+        self.assertEqual(view["time_loss"].tolist(), [1700.0, 1800.0])
+        self.assertEqual(view["time_thermal"].tolist(), [1000.0, 1200.0])
+        self.assertEqual(view["time"].tolist(), [3000.0, 3600.0])
         self.assertEqual(view["wcp_len_ref_x"].tolist(), [356.0, 480.0])
         self.assertAlmostEqual(view.loc[0, "wcp_len_pct"], 50.0)
         self.assertAlmostEqual(view.loc[1, "wcp_len_pct"], 100.0 / 2.4)
@@ -173,6 +185,8 @@ class TrainIoCollectorTests(unittest.TestCase):
         self.assertEqual(tuple(csv_view.columns), train_io.TRAIN_IO_COLUMNS)
         self.assertEqual(parquet_view["Llt_phys"].tolist(), [27.5, 27.5])
         self.assertEqual(csv_view["Llt_phys"].tolist(), [27.5, 27.5])
+        self.assertEqual(csv_view["time_matrix"].tolist(), [300.0, 600.0])
+        self.assertEqual(csv_view["time"].tolist(), [3000.0, 3600.0])
 
     def test_duplicate_merge_recreates_missing_io_without_rewriting_raw(self):
         ranked = self.ranked_rows()
