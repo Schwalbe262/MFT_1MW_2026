@@ -94,6 +94,13 @@ from module.modeling_260706 import (
     create_winding_cooling_plates,
     create_coil_section,
 )
+from module.aedt_pool_adapter import (
+    aedt_backend,
+    acquire_pooled_desktop,
+    bind_project_name as bind_pooled_project_name,
+    release_project as release_pooled_project,
+    report_failure as report_pooled_failure,
+)
 
 from ansys.aedt.core import settings
 
@@ -1582,6 +1589,10 @@ class Simulation():
         self.extraction_attempts = {}
         self.extraction_backends = {}
         self.spawned_descendants = {}
+        self.aedt_backend = aedt_backend()
+        self.aedt_lease = None
+        self.pooled_release_done = False
+        self.solver_may_be_running = False
 
     def create_simulation_name(self):
 
@@ -3605,6 +3616,7 @@ class Simulation():
                 try:
                     # The original, non-copied design retains PyAEDT's supported
                     # high-level path. Setup.analyze() itself returns None.
+                    self.solver_may_be_running = True
                     analyze_result = self.design1.setup.analyze(cores=self.NUM_CORE)
                     if analyze_result is False:
                         raise RuntimeError(f"[{label}] Setup1 analyze returned False")
@@ -3612,6 +3624,7 @@ class Simulation():
                     self._log_recent_aedt_messages(label)
                     raise
                 elapsed = time.time() - t0
+                self.solver_may_be_running = False
                 self.save_project()
                 return elapsed
 
@@ -3632,6 +3645,7 @@ class Simulation():
                 self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
                 t0 = time.time()
                 try:
+                    self.solver_may_be_running = True
                     analyze_result = dispatch_design.Analyze("Setup1", True)
                 except Exception as error:
                     dispatch_error = error
@@ -3669,6 +3683,7 @@ class Simulation():
                     f"{analyze_result!r}"
                 )
             self._postcheck_copied_loss_native_analysis()
+            self.solver_may_be_running = False
             self.save_project(strict=True)
             return elapsed
 
@@ -3678,7 +3693,15 @@ class Simulation():
 
     def get_execution_telemetry(self):
         """Return solve/extraction provenance alongside each training row."""
-        row = {}
+        row = {
+            "aedt_backend": self.aedt_backend,
+            "aedt_lease_id": int(
+                getattr(self.aedt_lease, "lease_id", 0) or 0
+            ),
+            "aedt_exclusive_session": int(
+                bool(getattr(self.aedt_lease, "exclusive_session", False))
+            ),
+        }
         for label in ("matrix", "loss"):
             row[f"{label}_solve_attempts"] = int(self.solve_attempts.get(label, 0))
             row[f"{label}_solution_queries"] = int(self.extraction_attempts.get(label, 0))
@@ -3822,6 +3845,13 @@ class Simulation():
                 self.save_project()
             except Exception:
                 pass
+        if self.aedt_backend == "pooled":
+            if self.aedt_lease is None:
+                raise RuntimeError("pooled Simulation has no AEDT lease")
+            if not self.pooled_release_done:
+                release_pooled_project(self.aedt_lease)
+                self.pooled_release_done = True
+            return
         self.design1.close_project()
         self.desktop.release_desktop(close_projects=True, close_on_exit=True)
 
@@ -3991,21 +4021,30 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
     if max_attempts < 1 or retry_delay_s < 0:
         raise ValueError("invalid AEDT session retry policy")
 
+    backend = aedt_backend()
     baseline_descendants = _snapshot_descendants()
     failures = []
     last_error = None
     for attempt in range(1, max_attempts + 1):
         desktop = None
+        lease = None
         try:
-            desktop = pyDesktop(
-                version=None,
-                non_graphical=GUI,
-                close_on_exit=True,
-                new_desktop=True,
-            )
+            if backend == "pooled":
+                desktop, lease = acquire_pooled_desktop(
+                    desktop_factory=pyDesktop,
+                    non_graphical=GUI,
+                )
+            else:
+                desktop = pyDesktop(
+                    version=None,
+                    non_graphical=GUI,
+                    close_on_exit=True,
+                    new_desktop=True,
+                )
             simulation = Simulation(desktop=desktop)
             if simulation is None:
                 raise RuntimeError("Simulation construction returned None")
+            simulation.aedt_lease = lease
             return desktop, simulation
         except Exception as error:
             last_error = error
@@ -4016,20 +4055,30 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
                 max_attempts,
                 failures[-1],
             )
-            captured_descendants = _snapshot_descendants()
-            if desktop is not None:
-                try:
-                    desktop.release_desktop(
-                        close_projects=True,
-                        close_on_exit=True,
-                    )
-                except Exception:
-                    pass
-            _terminate_spawned_descendants(
-                baseline_descendants,
-                captured_descendants,
-                wait_s=5,
-            )
+            if backend == "pooled":
+                if lease is not None:
+                    try:
+                        report_pooled_failure(
+                            lease, error, solver_may_run=False
+                        )
+                        release_pooled_project(lease, wait_seconds=120)
+                    except Exception:
+                        pass
+            else:
+                captured_descendants = _snapshot_descendants()
+                if desktop is not None:
+                    try:
+                        desktop.release_desktop(
+                            close_projects=True,
+                            close_on_exit=True,
+                        )
+                    except Exception:
+                        pass
+                _terminate_spawned_descendants(
+                    baseline_descendants,
+                    captured_descendants,
+                    wait_s=5,
+                )
             if attempt < max_attempts:
                 time.sleep(retry_delay_s)
 
@@ -4045,10 +4094,14 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     param 이 dict 등 -> 해당 값으로 1회 (fixed 모드), 프로젝트 폴더 보존
     model_only=True -> 모델링/셋업까지만 하고 해석은 생략 (지오메트리 확인용)
     """
+    backend = aedt_backend()
+    if backend == "pooled" and hold:
+        raise RuntimeError("--hold is not supported by pooled AEDT")
     fixed_mode = param is not None
     sim = None
     desktop = None
     held = [False]  # hold 성공 시 finally에서 desktop을 닫지 않기 위한 플래그
+    pooled_fault_reported = [False]
     delete_project_on_exit = not (fixed_mode or hold or model_only)
     baseline_descendants = _snapshot_descendants()
     try:
@@ -4057,6 +4110,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         desktop, sim = _create_simulation_session()
 
         sim.create_simulation_name()
+        if backend == "pooled":
+            bind_pooled_project_name(sim.aedt_lease, sim.PROJECT_NAME)
         sim.create_project()
 
         if fixed_mode:
@@ -4397,7 +4452,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             from module.thermal_260706 import run_thermal_analysis
             t0 = time.time()
             try:
+                sim.solver_may_be_running = True
                 df_thermal = run_thermal_analysis(sim)
+                sim.solver_may_be_running = False
             except Exception as thermal_error:
                 logging.exception(f"thermal stage failed: {thermal_error}")
                 log_failed_sample(
@@ -4492,19 +4549,62 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             log_failed_sample(sim.input_df, f"runtime: {e}")
         if fixed_mode:
             # fixed 모드에서는 실패를 조용히 넘기지 않는다
+            if backend == "pooled" and sim is not None and sim.aedt_lease is not None:
+                try:
+                    report_pooled_failure(
+                        sim.aedt_lease,
+                        e,
+                        solver_may_run=bool(sim.solver_may_be_running),
+                    )
+                    pooled_fault_reported[0] = True
+                except Exception:
+                    logging.exception("failed to report pooled AEDT failure")
             raise
         if sim is not None:
-            try:
-                sim.close_project()
-                time.sleep(1)
-            except Exception:
-                pass
+            if backend == "pooled" and sim.aedt_lease is not None:
+                try:
+                    report_pooled_failure(
+                        sim.aedt_lease,
+                        e,
+                        solver_may_run=bool(sim.solver_may_be_running),
+                    )
+                    pooled_fault_reported[0] = True
+                    if not sim.solver_may_be_running:
+                        release_pooled_project(sim.aedt_lease)
+                        sim.pooled_release_done = True
+                except Exception:
+                    logging.exception("failed to report/release pooled AEDT failure")
+            else:
+                try:
+                    sim.close_project()
+                    time.sleep(1)
+                except Exception:
+                    pass
         return False
     finally:
         spawned_descendants = _snapshot_descendants()
         if sim is not None:
             spawned_descendants.update(getattr(sim, "spawned_descendants", {}))
-        if desktop is not None:
+        if backend == "pooled":
+            if (
+                sim is not None
+                and sim.aedt_lease is not None
+                and not sim.pooled_release_done
+                and not pooled_fault_reported[0]
+            ):
+                try:
+                    release_pooled_project(sim.aedt_lease)
+                    sim.pooled_release_done = True
+                except Exception:
+                    logging.exception("pooled AEDT release failed in finalizer")
+            if delete_project_on_exit and sim is not None and sim.pooled_release_done:
+                try:
+                    sim.delete_project_folder(max_attempts=3, wait_s=1)
+                except Exception as error:
+                    logging.exception(
+                        f"Error deleting pooled project after host ACK: {error}"
+                    )
+        elif desktop is not None:
             try:
                 if held[0]:
                     # HOLD: 프로젝트/AEDT는 열어둔 채 python의 gRPC 세션만 해제
@@ -4517,13 +4617,14 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 pass
         # release가 조용히 실패하거나 solver가 re-parent되기 전에 PID를 확보해 둔다.
         # 이 프로세스가 이번 run에서 만든 자식만 회수하므로 다른 태스크에는 손대지 않는다.
-        _finalize_run_cleanup(
-            baseline_descendants,
-            spawned_descendants,
-            sim=sim,
-            held=held[0],
-            delete_project=delete_project_on_exit,
-        )
+        if backend != "pooled":
+            _finalize_run_cleanup(
+                baseline_descendants,
+                spawned_descendants,
+                sim=sim,
+                held=held[0],
+                delete_project=delete_project_on_exit,
+            )
 
 
 def parse_args():
