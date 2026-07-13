@@ -3161,6 +3161,38 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
 
 
 class FieldsReporterTests(unittest.TestCase):
+    def test_calcop_failure_clears_shared_stack_without_masking_error(self):
+        class Reporter:
+            def __init__(self):
+                self.stack_operations = []
+
+            def DoesNamedExpressionExists(self, _name):
+                return False
+
+            def CalcStack(self, operation):
+                self.stack_operations.append(operation)
+                if len(self.stack_operations) > 1:
+                    raise RuntimeError("cleanup transport failed")
+
+            def CalcOp(self, _operation):
+                raise RuntimeError("Failed to execute gRPC AEDT command: CalcOp")
+
+        reporter = Reporter()
+        simulation = Simulation.__new__(Simulation)
+        simulation._fresh_fields_reporter = Mock(return_value=reporter)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "failed to register field expression 'Phi_test'"
+        ):
+            simulation._add_field_expression(
+                "Phi_test",
+                lambda fields: fields.CalcOp("Integrate"),
+                max_attempts=1,
+                retry_delay=0,
+            )
+
+        self.assertEqual(reporter.stack_operations, ["clear", "clear"])
+
     def test_reacquires_reporter_after_stale_calcstack(self):
         class Reporter:
             def __init__(self, stale=False):

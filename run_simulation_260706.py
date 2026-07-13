@@ -3425,6 +3425,7 @@ class Simulation():
         """Build one named expression with a freshly acquired calculator handle."""
         last_error = None
         for attempt in range(1, max_attempts + 1):
+            reporter = None
             try:
                 reporter = self._fresh_fields_reporter(max_attempts=1, retry_delay=0)
                 try:
@@ -3448,8 +3449,21 @@ class Simulation():
                 logging.warning(
                     f"field expression '{expr_name}' failed (attempt {attempt}/{max_attempts}): {e}"
                 )
-                if attempt < max_attempts:
-                    time.sleep(retry_delay)
+            finally:
+                # The calculator stack is shared by the design.  A failed CalcOp
+                # can otherwise leave a partial expression behind and poison the
+                # next, unrelated loss expression.  Cleanup is best-effort and
+                # must never mask the original gRPC failure.
+                if reporter is not None:
+                    try:
+                        reporter.CalcStack("clear")
+                    except Exception as cleanup_error:
+                        logging.warning(
+                            f"field calculator stack cleanup failed ({expr_name}): "
+                            f"{cleanup_error}"
+                        )
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
         raise RuntimeError(f"failed to register field expression '{expr_name}': {last_error}")
 
     def get_magnetic_parameter(self):
@@ -3518,7 +3532,8 @@ class Simulation():
         self.df1["M"] = self.df1["M"].abs()
         return self.df1
 
-    def _export_field_report(self, report_name, Y_components):
+    def _export_field_report(
+            self, report_name, Y_components, extraction_key="loss"):
         # Kept as a compatibility-shaped helper for callers; no AEDT report/file is created.
         target_units = {}
         for expression in Y_components:
@@ -3534,7 +3549,7 @@ class Simulation():
             Y_components,
             target_units=target_units,
             report_category="Fields",
-            extraction_key="loss",
+            extraction_key=extraction_key,
         )
 
     def save_calculation(self):
@@ -3848,23 +3863,37 @@ class Simulation():
                 b_expr_group[mean_expr] = group_index
                 b_expr_group[max_expr] = group_index
                 b_expr_volume[mean_expr] = volume
-        flux_expr = self._calc_core_flux_integral(
-            self.design1.core_flux_sheets, "Phi_center_leg_B_normal"
-        )
+        flux_expr = None
+        flux_unavailable_reason = ""
         try:
-            flux_section_area_retained_m2 = sum(
-                _sheet_area_model_units(sheet)
-                for sheet in self.design1.core_flux_sheets
-            ) * 1e-6
-        except Exception as exc:
-            raise RuntimeError("cannot read retained core flux-section area") from exc
-        if not math.isfinite(flux_section_area_retained_m2) or (
-            flux_section_area_retained_m2 <= 0
-        ):
-            raise RuntimeError(
-                "invalid retained core flux-section area: "
-                f"{flux_section_area_retained_m2!r}"
+            flux_expr = self._calc_core_flux_integral(
+                self.design1.core_flux_sheets, "Phi_center_leg_B_normal"
             )
+        except Exception as exc:
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            flux_unavailable_reason = f"grpc_calcop_unavailable:{detail}"
+            logging.warning(
+                "Center-leg surface-flux expression is unavailable; "
+                f"continuing loss extraction: {flux_unavailable_reason}"
+            )
+        flux_section_area_retained_m2 = float("nan")
+        if flux_expr is not None:
+            try:
+                flux_section_area_retained_m2 = sum(
+                    _sheet_area_model_units(sheet)
+                    for sheet in self.design1.core_flux_sheets
+                ) * 1e-6
+            except Exception as exc:
+                raise RuntimeError(
+                    "cannot read retained core flux-section area"
+                ) from exc
+            if not math.isfinite(flux_section_area_retained_m2) or (
+                flux_section_area_retained_m2 <= 0
+            ):
+                raise RuntimeError(
+                    "invalid retained core flux-section area: "
+                    f"{flux_section_area_retained_m2!r}"
+                )
 
         # ---- 권선 그룹 총손실 + explicit 턴 손실 (열해석용) ----
         group_exprs = []
@@ -3888,14 +3917,44 @@ class Simulation():
             for w in explicit:
                 turn_exprs.append(self._calc_field_expr(w.name, "EMLoss", "Integrate", f"P_turn_{w.name}"))
 
+        # Keep the optional CalcOp-based surface integral out of the mandatory
+        # batch.  Its evaluation can fail independently without discarding the
+        # already solved core/winding loss and standard B evidence.
         all_exprs = (
             core_exprs + b_mean_exprs + b_max_exprs
-            + [flux_expr] + group_exprs + turn_exprs + plate_exprs
+            + group_exprs + turn_exprs + plate_exprs
         )
         df_loss = self._export_field_report("calculator_report_loss", all_exprs)
         vals = df_loss.iloc[0, -len(all_exprs):]
         vals.index = all_exprs
         self.loss_map = {k: float(v) for k, v in vals.items()}
+
+        flux_integral_reported_wb = float("nan")
+        if flux_expr is not None:
+            try:
+                df_flux_integral = self._export_field_report(
+                    "calculator_report_center_leg_flux",
+                    [flux_expr],
+                    extraction_key="center_leg_surface_flux_integral",
+                )
+                flux_integral_reported_wb = float(
+                    df_flux_integral[flux_expr].iloc[0]
+                )
+                if not math.isfinite(flux_integral_reported_wb):
+                    raise RuntimeError(
+                        f"non-finite field result for {flux_expr}: "
+                        f"{flux_integral_reported_wb!r}"
+                    )
+                self.loss_map[flux_expr] = flux_integral_reported_wb
+            except Exception as exc:
+                detail = " ".join(str(exc).split()) or type(exc).__name__
+                flux_unavailable_reason = f"grpc_calcop_unavailable:{detail}"
+                flux_expr = None
+                flux_integral_reported_wb = float("nan")
+                logging.warning(
+                    "Center-leg surface-flux evaluation is unavailable; "
+                    f"continuing loss extraction: {flux_unavailable_reason}"
+                )
 
         # 실물 기준(_phys) 환산: 대칭 loss 디자인이면 오브젝트별 절단면 수로 보정, 풀모델이면 x1
         b_factor = 0.5 if getattr(self, "loss_is_sym", False) else 1.0
@@ -3930,17 +3989,21 @@ class Simulation():
                 b_average, kf, area_basis=core_area_basis
             )
 
-        flux_integral_reported_wb = float(self.loss_map[flux_expr])
-        b_section_average = (
-            flux_integral_reported_wb
-            / flux_section_area_retained_m2
-            * b_factor
-        )
-        b_section_material = material_flux_density_t(
-            b_section_average, kf, area_basis=core_area_basis
-        )
         ae_gross_m2 = float(self.df_plus["Ae_gross_m2"].iloc[0])
-        flux_integral_physical_wb = b_section_average * ae_gross_m2
+        if flux_expr is not None:
+            b_section_average = (
+                flux_integral_reported_wb
+                / flux_section_area_retained_m2
+                * b_factor
+            )
+            b_section_material = material_flux_density_t(
+                b_section_average, kf, area_basis=core_area_basis
+            )
+            flux_integral_physical_wb = b_section_average * ae_gross_m2
+        else:
+            b_section_average = float("nan")
+            b_section_material = float("nan")
+            flux_integral_physical_wb = float("nan")
 
         def _obj_of(expr):
             n = expr
@@ -4174,6 +4237,7 @@ class Simulation():
             "B_core_section_vs_volume_mean_rel_error": [
                 abs(b_section_average - b_mean_average)
                 / max(abs(b_mean_average), 1e-12)
+                if math.isfinite(b_section_average) else float("nan")
             ],
             "B_design_square_material_analytic": [b_design_square_material],
             "B_ac_sine_material_analytic": [b_ac_sine_material],
@@ -4298,14 +4362,15 @@ class Simulation():
             b_flux_linkage_material = flux_linkage_peak / (
                 primary_turns * ae_effective_m2
             )
-            surface_linkage = primary_turns * flux_integral_physical_wb
-            surface_flux_linkage_rel_error = abs(
-                surface_linkage - flux_linkage_peak
-            ) / max(abs(flux_linkage_peak), 1e-12)
-            surface_induced_voltage = omega * surface_linkage
-            surface_flux_induced_voltage_rel_error = abs(
-                surface_induced_voltage - induced_voltage_peak
-            ) / max(abs(induced_voltage_peak), 1e-12)
+            if flux_expr is not None:
+                surface_linkage = primary_turns * flux_integral_physical_wb
+                surface_flux_linkage_rel_error = abs(
+                    surface_linkage - flux_linkage_peak
+                ) / max(abs(flux_linkage_peak), 1e-12)
+                surface_induced_voltage = omega * surface_linkage
+                surface_flux_induced_voltage_rel_error = abs(
+                    surface_induced_voltage - induced_voltage_peak
+                ) / max(abs(induced_voltage_peak), 1e-12)
             if native_contract and (
                 faraday_rel_error > 0.01 or source_voltage_rel_error > 0.05
             ):
@@ -4355,6 +4420,62 @@ class Simulation():
                 if math.isfinite(b_flux_linkage_material) else float("nan")
             ],
             "flux_linkage_attested": [flux_linkage_attested],
+        })
+
+        flux_available = flux_expr is not None
+        surface_metric_passed = bool(
+            not flux_available
+            or (
+                math.isfinite(surface_flux_linkage_rel_error)
+                and surface_flux_linkage_rel_error <= 0.05
+                and math.isfinite(surface_flux_induced_voltage_rel_error)
+                and surface_flux_induced_voltage_rel_error <= 0.05
+            )
+        )
+        center_leg_flux_evidence = {
+            "status": "available" if flux_available else "unavailable",
+            "applicable": flux_available,
+            "available": flux_available,
+            "passed": surface_metric_passed,
+            "reason": "" if flux_available else flux_unavailable_reason,
+            "reported_value_Wb": (
+                flux_integral_reported_wb if flux_available else None
+            ),
+            "physical_value_Wb": (
+                flux_integral_physical_wb if flux_available else None
+            ),
+            "equivalent_flux_evidence": [
+                "Tx_flux_linkage_faraday_rel_error",
+                "Tx_induced_vs_source_peak_rel_error",
+            ],
+        }
+        self.loss_gate_evidence = {
+            "center_leg_surface_flux_integral": center_leg_flux_evidence
+        }
+        summary.update({
+            "center_leg_surface_flux_integral_status": [
+                center_leg_flux_evidence["status"]
+            ],
+            "center_leg_surface_flux_integral_applicable": [
+                int(center_leg_flux_evidence["applicable"])
+            ],
+            "center_leg_surface_flux_integral_available": [
+                int(center_leg_flux_evidence["available"])
+            ],
+            "center_leg_surface_flux_integral_passed": [
+                int(center_leg_flux_evidence["passed"])
+            ],
+            "center_leg_surface_flux_integral_reason": [
+                center_leg_flux_evidence["reason"]
+            ],
+            "center_leg_surface_flux_integral_evidence_json": [
+                json.dumps(
+                    self.loss_gate_evidence,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            ],
         })
 
         self.df_loss_summary = pd.DataFrame(summary)

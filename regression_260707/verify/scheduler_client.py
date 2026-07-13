@@ -1010,18 +1010,46 @@ def is_valid_result(
             "B_mean_faraday_attested",
         )):
             return False
-        if not all(_finite(result, key) for key in (
+        surface_applicable = result.get(
+            "center_leg_surface_flux_integral_applicable"
+        )
+        surface_reason = str(result.get(
+            "center_leg_surface_flux_integral_reason"
+        ) or "")
+        surface_fail_soft = (
+            surface_applicable in (0, 0.0, False)
+            and result.get("center_leg_surface_flux_integral_available")
+            in (0, 0.0, False)
+            and result.get("center_leg_surface_flux_integral_passed")
+            in (1, 1.0, True)
+            and str(result.get(
+                "center_leg_surface_flux_integral_status"
+            ) or "").strip() == "unavailable"
+            and surface_reason.startswith("grpc_calcop_unavailable:")
+            and len(surface_reason) > len("grpc_calcop_unavailable:")
+        )
+        if surface_applicable in (0, 0.0, False) and not surface_fail_soft:
+            return False
+        required_native_fields = [
             "core_loss_native_rel_error",
             "core_loss_native_tolerance_rel",
             "B_mean_material_vs_sine_analytic_rel_error",
             "B_mean_faraday_tolerance_rel",
-            "core_surface_flux_vs_linkage_rel_error",
-            "core_surface_flux_vs_induced_voltage_rel_error",
             "thermal_core_native_readback_count",
             "thermal_core_native_restored_rel_error",
             "thermal_core_loss_correction_factor",
             "thermal_core_full_expected_margin_adjusted_w",
-        )):
+        ]
+        required_native_fields.extend(
+            (
+                "Tx_flux_linkage_faraday_rel_error",
+                "Tx_induced_vs_source_peak_rel_error",
+            ) if surface_fail_soft else (
+                "core_surface_flux_vs_linkage_rel_error",
+                "core_surface_flux_vs_induced_voltage_rel_error",
+            )
+        )
+        if not all(_finite(result, key) for key in required_native_fields):
             return False
         loss_error = float(result["core_loss_native_rel_error"])
         loss_tolerance = float(result["core_loss_native_tolerance_rel"])
@@ -1036,9 +1064,19 @@ def is_valid_result(
             "POWERLITE_Wkg_times_effective_mass"
         ):
             return False
-        if any(not 0.0 <= float(result[key]) <= 0.05 for key in (
-            "core_surface_flux_vs_linkage_rel_error",
-            "core_surface_flux_vs_induced_voltage_rel_error",
+        if surface_fail_soft:
+            if (
+                not 0.0 <= float(
+                    result["Tx_flux_linkage_faraday_rel_error"]
+                ) <= 0.01
+                or not 0.0 <= float(
+                    result["Tx_induced_vs_source_peak_rel_error"]
+                ) <= 0.05
+            ):
+                return False
+        elif any(not 0.0 <= float(result[key]) <= 0.05 for key in (
+                "core_surface_flux_vs_linkage_rel_error",
+                "core_surface_flux_vs_induced_voltage_rel_error",
         )):
             return False
         if result.get(

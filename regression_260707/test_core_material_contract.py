@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pandas as pd
+
 from module.core_material_contract import (
     AREA_BASIS_EXPLICIT_NET,
     AREA_BASIS_GROSS_HOMOGENEOUS,
@@ -47,6 +49,7 @@ from run_simulation_260706 import (
     _native_core_report_plan,
     _sheet_area_model_units,
 )
+from regression_260707.quality_contract import _em_reasons
 
 
 K = 0.85
@@ -609,6 +612,241 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
             ("op", "SurfaceValue"), ("op", "Integrate"),
             ("op", "CmplxMag"),
         ])
+
+    def _loss_report_shell(self, flux_registration, flux_evaluation_error=None):
+        simulation = Simulation.__new__(Simulation)
+        simulation.df_plus = self.frame.copy()
+        simulation.df_plus["physics_data_revision"] = "legacy_test_revision"
+        simulation.loss_is_sym = False
+        simulation.full_model = True
+
+        area_m2 = float(simulation.df_plus["Ae_gross_m2"].iloc[0])
+        core = SimpleNamespace(name="core_1", volume=1.0e6)
+        sheet = SimpleNamespace(
+            name="center_leg_section",
+            faces=[SimpleNamespace(area=area_m2 * 1.0e6)],
+        )
+        simulation.design1 = SimpleNamespace(
+            core_objs=[core],
+            core_flux_sheets=[sheet],
+            Tx_windings_main=[],
+            Rx_windings_main=[],
+            Rx_windings_side=[],
+            core_plates=[],
+            wcp_plates=[],
+        )
+        simulation._sym_cut_count = lambda _name: 0
+        simulation._calc_group_loss = (
+            lambda _objects, name, quantity="EMLoss": name
+        )
+        simulation._calc_field_expr = (
+            lambda _object, _quantity, _operation, name: name
+        )
+        simulation._calc_core_flux_integral = flux_registration
+
+        voltage_peak = math.sqrt(2.0) * float(
+            simulation.df_plus["V1_rms"].iloc[0]
+        )
+        frequency = float(simulation.df_plus["freq"].iloc[0])
+        turns = int(simulation.df_plus["N1_main"].iloc[0]) + int(
+            simulation.df_plus["N1_side"].iloc[0]
+        )
+        linkage = voltage_peak / (2.0 * math.pi * frequency)
+        physical_flux = linkage / turns
+        reference = faraday_lumped_core_reference(
+            voltage_rms_v=float(simulation.df_plus["V1_rms"].iloc[0]),
+            frequency_hz=frequency,
+            turns=turns,
+            gross_area_m2=area_m2,
+            lamination_factor=float(
+                simulation.df_plus["core_lamination_factor"].iloc[0]
+            ),
+            effective_mass_kg=float(
+                simulation.df_plus["core_mass_effective_kg"].iloc[0]
+            ),
+            loss_margin=1.0,
+            coefficient=6.5,
+            x=float(simulation.df_plus["core_x"].iloc[0]),
+            y=float(simulation.df_plus["core_y"].iloc[0]),
+        )
+        export_calls = []
+
+        def export_report(report_name, expressions, **_kwargs):
+            expressions = list(expressions)
+            export_calls.append((report_name, expressions))
+            if (
+                flux_evaluation_error is not None
+                and expressions == ["Phi_center_leg_B_normal"]
+            ):
+                raise flux_evaluation_error
+            row = {}
+            for expression in expressions:
+                if expression == "Phi_center_leg_B_normal":
+                    row[expression] = physical_flux
+                elif expression.startswith("B_mean_"):
+                    row[expression] = reference["B_pack_T"]
+                elif expression.startswith("B_max_"):
+                    row[expression] = reference["B_pack_T"] * 1.01
+                elif expression == "P_core_1":
+                    row[expression] = 100.0
+                else:
+                    row[expression] = 10.0
+            return pd.DataFrame([row], columns=expressions)
+
+        simulation._export_field_report = export_report
+
+        def solution_data(_expressions, aliases=None, **_kwargs):
+            if aliases == ["I1_mag_peak", "I1_phase_deg"]:
+                return pd.DataFrame({
+                    "I1_mag_peak": [10.0], "I1_phase_deg": [0.0]
+                })
+            return pd.DataFrame({
+                "induced_voltage_peak": [voltage_peak],
+                "flux_linkage_peak": [linkage],
+            })
+
+        simulation._solution_data_frame = solution_data
+        return simulation, export_calls, physical_flux
+
+    def test_flux_calculator_failure_is_fail_soft_and_faraday_continues(self):
+        calcop_error = RuntimeError(
+            "failed to register field expression 'Phi_center_leg_B_normal': "
+            "Failed to execute gRPC AEDT command: CalcOp"
+        )
+
+        def fail_flux_registration(_sheets, _name):
+            raise calcop_error
+
+        simulation, export_calls, _physical_flux = self._loss_report_shell(
+            fail_flux_registration
+        )
+
+        result = simulation.save_loss_reports()
+
+        self.assertGreater(result["P_core_total"].iloc[0], 0.0)
+        self.assertGreater(result["P_winding_total"].iloc[0], 0.0)
+        self.assertEqual(len(export_calls), 1)
+        self.assertNotIn("Phi_center_leg_B_normal", export_calls[0][1])
+        self.assertTrue(math.isnan(result["core_flux_integral_reported_Wb"].iloc[0]))
+        self.assertTrue(math.isnan(result["B_core_section_average"].iloc[0]))
+        self.assertTrue(math.isnan(
+            result["core_surface_flux_vs_linkage_rel_error"].iloc[0]
+        ))
+        expected_reason = f"grpc_calcop_unavailable:{calcop_error}"
+        evidence = simulation.loss_gate_evidence[
+            "center_leg_surface_flux_integral"
+        ]
+        self.assertEqual(evidence, {
+            "status": "unavailable",
+            "applicable": False,
+            "available": False,
+            "passed": True,
+            "reason": expected_reason,
+            "reported_value_Wb": None,
+            "physical_value_Wb": None,
+            "equivalent_flux_evidence": [
+                "Tx_flux_linkage_faraday_rel_error",
+                "Tx_induced_vs_source_peak_rel_error",
+            ],
+        })
+        self.assertEqual(
+            result["center_leg_surface_flux_integral_reason"].iloc[0],
+            expected_reason,
+        )
+        self.assertEqual(result["center_leg_surface_flux_integral_applicable"].iloc[0], 0)
+        self.assertAlmostEqual(result["Tx_flux_linkage_faraday_rel_error"].iloc[0], 0.0)
+        self.assertAlmostEqual(result["Tx_induced_vs_source_peak_rel_error"].iloc[0], 0.0)
+
+    def test_flux_calculator_evaluation_failure_is_also_fail_soft(self):
+        evaluation_error = RuntimeError(
+            "[center_leg_surface_flux_integral] result extraction failed after "
+            "3 attempts: Failed to execute gRPC AEDT command: CalcOp"
+        )
+        simulation, export_calls, _physical_flux = self._loss_report_shell(
+            lambda _sheets, name: name,
+            flux_evaluation_error=evaluation_error,
+        )
+
+        result = simulation.save_loss_reports()
+
+        self.assertEqual(len(export_calls), 2)
+        self.assertGreater(result["P_core_total"].iloc[0], 0.0)
+        self.assertTrue(math.isnan(result["core_flux_integral_reported_Wb"].iloc[0]))
+        self.assertEqual(
+            result["center_leg_surface_flux_integral_reason"].iloc[0],
+            f"grpc_calcop_unavailable:{evaluation_error}",
+        )
+        self.assertEqual(
+            simulation.loss_gate_evidence[
+                "center_leg_surface_flux_integral"
+            ]["applicable"],
+            False,
+        )
+        self.assertAlmostEqual(result["Tx_flux_linkage_faraday_rel_error"].iloc[0], 0.0)
+
+    def test_flux_calculator_success_preserves_surface_evidence(self):
+        simulation, export_calls, physical_flux = self._loss_report_shell(
+            lambda _sheets, name: name
+        )
+
+        result = simulation.save_loss_reports()
+
+        self.assertEqual(len(export_calls), 2)
+        self.assertEqual(export_calls[1], (
+            "calculator_report_center_leg_flux", ["Phi_center_leg_B_normal"]
+        ))
+        self.assertAlmostEqual(
+            result["core_flux_integral_physical_Wb"].iloc[0], physical_flux
+        )
+        self.assertAlmostEqual(
+            result["core_surface_flux_vs_linkage_rel_error"].iloc[0], 0.0
+        )
+        evidence = simulation.loss_gate_evidence[
+            "center_leg_surface_flux_integral"
+        ]
+        self.assertEqual(evidence["status"], "available")
+        self.assertTrue(evidence["applicable"])
+        self.assertTrue(evidence["available"])
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(evidence["reason"], "")
+
+    def test_quality_gate_accepts_only_structured_calcop_unavailability(self):
+        record = {
+            "physics_data_revision": PHYSICS_DATA_REVISION,
+            "center_leg_surface_flux_integral_applicable": 0,
+            "center_leg_surface_flux_integral_available": 0,
+            "center_leg_surface_flux_integral_passed": 1,
+            "center_leg_surface_flux_integral_status": "unavailable",
+            "center_leg_surface_flux_integral_reason": (
+                "grpc_calcop_unavailable:Failed to execute gRPC AEDT command: CalcOp"
+            ),
+            "Tx_flux_linkage_faraday_rel_error": 0.01,
+            "Tx_induced_vs_source_peak_rel_error": 0.05,
+        }
+
+        reasons = _em_reasons(record, {"param_overrides": {}})
+
+        self.assertNotIn(
+            "native_lamination:core_surface_flux_vs_linkage_rel_error", reasons
+        )
+        self.assertNotIn(
+            "native_lamination:core_surface_flux_vs_induced_voltage_rel_error",
+            reasons,
+        )
+        self.assertNotIn(
+            "native_lamination:center_leg_surface_flux_unavailability_invalid",
+            reasons,
+        )
+
+        record["center_leg_surface_flux_integral_reason"] = "missing without cause"
+        malformed = _em_reasons(record, {"param_overrides": {}})
+        self.assertIn(
+            "native_lamination:center_leg_surface_flux_unavailability_invalid",
+            malformed,
+        )
+        self.assertIn(
+            "native_lamination:core_surface_flux_vs_linkage_rel_error", malformed
+        )
 
     def test_b_peak_uses_supported_complex_vector_norm_diagnostic(self):
         operations = []

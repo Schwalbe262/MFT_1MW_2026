@@ -309,13 +309,44 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
             "POWERLITE_Wkg_times_effective_mass"
         ):
             reasons.append("native_lamination:core_loss_reference_basis")
-        for key in (
-            "core_surface_flux_vs_linkage_rel_error",
-            "core_surface_flux_vs_induced_voltage_rel_error",
-        ):
-            value = _number(record, key)
-            if value is None or not 0 <= value <= 0.05:
-                reasons.append(f"native_lamination:{key}")
+        surface_applicable = _number(
+            record, "center_leg_surface_flux_integral_applicable"
+        )
+        surface_reason = str(_value(
+            record, "center_leg_surface_flux_integral_reason"
+        ) or "")
+        surface_fail_soft = surface_applicable == 0.0 and (
+            _number(record, "center_leg_surface_flux_integral_available") == 0.0
+            and _number(record, "center_leg_surface_flux_integral_passed") == 1.0
+            and str(_value(
+                record, "center_leg_surface_flux_integral_status"
+            ) or "").strip() == "unavailable"
+            and surface_reason.startswith("grpc_calcop_unavailable:")
+            and len(surface_reason) > len("grpc_calcop_unavailable:")
+        )
+        if surface_applicable == 0.0 and not surface_fail_soft:
+            reasons.append(
+                "native_lamination:center_leg_surface_flux_unavailability_invalid"
+            )
+        if surface_fail_soft:
+            # Surface CalcOp evidence is informational when the cluster gRPC
+            # calculator cannot execute it.  The independent Faraday checks
+            # remain mandatory at their existing tolerances.
+            for key, limit in (
+                ("Tx_flux_linkage_faraday_rel_error", 0.01),
+                ("Tx_induced_vs_source_peak_rel_error", 0.05),
+            ):
+                value = _number(record, key)
+                if value is None or not 0 <= value <= limit:
+                    reasons.append(f"native_lamination:{key}")
+        else:
+            for key in (
+                "core_surface_flux_vs_linkage_rel_error",
+                "core_surface_flux_vs_induced_voltage_rel_error",
+            ):
+                value = _number(record, key)
+                if value is None or not 0 <= value <= 0.05:
+                    reasons.append(f"native_lamination:{key}")
         if str(_value(
             record, "core_native_model_approval_status"
         ) or "") != "approved_by_isolated_solved_kf_ab":
