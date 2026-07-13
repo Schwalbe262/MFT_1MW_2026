@@ -26,6 +26,7 @@ MFT_PROJECT = "MFT_1MW_2026v1"
 MFT_PROJECT_MAX_ACTIVE_TASKS = 500
 MFT_ACTIVE_STATUSES = ("queued", "attaching", "running")
 LEGACY_MFT_NAME_PREFIX = "mft-"
+AEDT_POOL_HOST_PROJECT = "_aedt_pool_hosts"
 MFT_PROJECT_REPOS = [
     {
         "url": "https://github.com/Schwalbe262/MFT_1MW_2026.git",
@@ -264,6 +265,16 @@ def project_submission_snapshot(
     if not isinstance(legacy_tasks, list):
         raise ProjectCapacityError(
             "scheduler returned an invalid legacy MFT task inventory")
+    # Pooled AEDT host tasks share the "mft-" name prefix but live in the
+    # dedicated host project; they are capacity-tracked by the pooled bundle
+    # state machine, not the MFT project cap.
+    legacy_tasks = [
+        task
+        for task in legacy_tasks
+        if not (isinstance(task, dict)
+                and str(task.get("project") or "").strip()
+                == AEDT_POOL_HOST_PROJECT)
+    ]
 
     def indexed(rows, source, allowed_projects, require_prefix=False):
         inventory = {}
