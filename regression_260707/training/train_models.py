@@ -201,6 +201,9 @@ def train_target(
     mu, sigma = _ensemble_prediction(models, X.iloc[idx_evaluation], transform)
     half_width = q90 * sigma
     error = mu - y_evaluation
+    relative_half_width = half_width / np.clip(
+        np.abs(y_evaluation), 1e-9, None
+    )
     relative_metrics = _evaluation_relative_metrics(
         y_evaluation, error, half_width
     )
