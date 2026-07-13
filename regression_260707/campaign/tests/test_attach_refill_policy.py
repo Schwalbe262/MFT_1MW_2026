@@ -197,7 +197,7 @@ def test_production_policy_pins_restart_v3_with_zero_pooled_fraction():
         policy.project_concurrency_target, policy.projects_per_aedt
     ) == policy.max_aedt_sessions
     assert policy.provenance.solver_revision == (
-        "dba903eb671e37642168afc5578b8e6a93e9c046"
+        "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7"
     )
     assert policy.provenance.library_revision == (
         "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
