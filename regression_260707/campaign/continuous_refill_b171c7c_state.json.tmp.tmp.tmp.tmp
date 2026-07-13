@@ -1,0 +1,524 @@
+{
+  "cycle_serial": 150,
+  "last_evidence": {
+    "action": "refill_250",
+    "excluded_rejected_submission": {
+      "cancellation_sha256": "ef28db0da228478b79a6919cec6deadc456f425012559ebe89e2169776fa0ecd",
+      "dedupe_key": "mft-al:mft-camp-sb171c7c-le6b9b9d-17612:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:ae6d03b35d7cfefc",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17612",
+      "never_started": true,
+      "status": "cancelled",
+      "task_id": 28101
+    },
+    "pause_reasons": [],
+    "paused": false,
+    "production_active_b171": 250,
+    "production_health_cohort": {
+      "cutoff_started_at": "2026-07-12T04:48:00Z",
+      "terminal": 2,
+      "valid": 0,
+      "valid_rate": 0.0
+    },
+    "production_health_cohort_cutoff": "2026-07-12T04:48:00Z",
+    "production_health_terminal_b171": 2,
+    "production_health_valid_b171": 0,
+    "production_health_valid_rate_b171": 0.0,
+    "production_lifetime": {
+      "terminal": 39,
+      "valid": 29,
+      "valid_rate": 0.7435897435897436
+    },
+    "production_lifetime_terminal_b171": 39,
+    "production_lifetime_valid_b171": 29,
+    "production_lifetime_valid_rate_b171": 0.7435897435897436,
+    "production_terminal_b171": 39,
+    "production_valid_b171": 29,
+    "production_valid_rate_b171": 0.7435897435897436,
+    "recovery4_active": 0,
+    "recovery4_completed_valid": 0,
+    "recovery4_nonblocking_alerts": [
+      "recovery4_terminal_timeout:28077:exit124",
+      "recovery4_terminal_timeout:28079:exit124"
+    ],
+    "recovery4_tasks": [
+      {
+        "exit_code": 124,
+        "failure_class": "timeout",
+        "name": "mft-recovery4-sb171c7c-le6b9b9d-01-src27794",
+        "state": "invalid",
+        "status": "failed",
+        "task_id": 28077
+      },
+      {
+        "name": "mft-recovery4-sb171c7c-le6b9b9d-02-src27928",
+        "state": "terminal_unreviewed",
+        "status": "completed",
+        "task_id": 28078
+      },
+      {
+        "exit_code": 124,
+        "failure_class": "timeout",
+        "name": "mft-recovery4-sb171c7c-le6b9b9d-03-src27880",
+        "state": "invalid",
+        "status": "failed",
+        "task_id": 28079
+      },
+      {
+        "name": "mft-recovery4-sb171c7c-le6b9b9d-04-src27758",
+        "state": "terminal_unreviewed",
+        "status": "completed",
+        "task_id": 28080
+      }
+    ],
+    "recovery4_terminal_gate_sha256": null,
+    "recovery4_wait_reasons": [],
+    "strict": {
+      "age_seconds": 63.696586,
+      "pinned": true,
+      "rows": 28
+    },
+    "time": "2026-07-12T06:51:40+00:00",
+    "wait_reasons": []
+  },
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+  "pause_reasons": [],
+  "paused": false,
+  "plan_sha256": "b24e2a9b00caa22bbec8793f4dbd99de51362fac87f9e9509358610abe9982d0",
+  "schema_version": 1,
+  "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+  "state_revision": 164,
+  "target_active": 250,
+  "target_strict_rows": 3000,
+  "task_outcomes": {
+    "28107": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17612",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28107,
+      "terminal_at": "2026-07-12T06:12:11+00:00"
+    },
+    "28109": {
+      "error_fingerprint": "3758841069d9a21b",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=True, converged=0, reason=residual_threshold",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17614",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28109,
+      "terminal_at": "2026-07-12T05:46:47+00:00"
+    },
+    "28113": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17618",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28113,
+      "terminal_at": "2026-07-12T05:05:31+00:00"
+    },
+    "28123": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17628",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28123,
+      "terminal_at": "2026-07-12T06:47:24+00:00"
+    },
+    "28125": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17630",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28125,
+      "terminal_at": "2026-07-12T06:47:24+00:00"
+    },
+    "28128": {
+      "error_fingerprint": "954ccf625f7f8899",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=False, converged=0, reason=monitor_missing",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17633",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28128,
+      "terminal_at": "2026-07-12T06:01:47+00:00"
+    },
+    "28136": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17641",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28136,
+      "terminal_at": "2026-07-12T05:30:14+00:00"
+    },
+    "28142": {
+      "error_fingerprint": "954ccf625f7f8899",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=False, converged=0, reason=monitor_missing",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17647",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28142,
+      "terminal_at": "2026-07-12T06:47:26+00:00"
+    },
+    "28143": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17648",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28143,
+      "terminal_at": "2026-07-12T06:13:35+00:00"
+    },
+    "28151": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17656",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28151,
+      "terminal_at": "2026-07-12T06:47:26+00:00"
+    },
+    "28152": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17657",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28152,
+      "terminal_at": "2026-07-12T06:34:57+00:00"
+    },
+    "28154": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17659",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28154,
+      "terminal_at": "2026-07-12T04:40:56+00:00"
+    },
+    "28156": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17661",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28156,
+      "terminal_at": "2026-07-12T05:36:52+00:00"
+    },
+    "28158": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17663",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28158,
+      "terminal_at": "2026-07-12T05:06:40+00:00"
+    },
+    "28159": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17664",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28159,
+      "terminal_at": "2026-07-12T06:47:26+00:00"
+    },
+    "28169": {
+      "error_fingerprint": "954ccf625f7f8899",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=False, converged=0, reason=monitor_missing",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17674",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28169,
+      "terminal_at": "2026-07-12T05:50:03+00:00"
+    },
+    "28172": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17677",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28172,
+      "terminal_at": "2026-07-12T06:03:17+00:00"
+    },
+    "28173": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17678",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28173,
+      "terminal_at": "2026-07-12T06:03:17+00:00"
+    },
+    "28178": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17683",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28178,
+      "terminal_at": "2026-07-12T06:36:32+00:00"
+    },
+    "28181": {
+      "error_fingerprint": "954ccf625f7f8899",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=False, converged=0, reason=monitor_missing",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17686",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28181,
+      "terminal_at": "2026-07-12T04:08:57+00:00"
+    },
+    "28182": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17687",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28182,
+      "terminal_at": "2026-07-12T06:36:32+00:00"
+    },
+    "28186": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17691",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28186,
+      "terminal_at": "2026-07-12T06:26:00+00:00"
+    },
+    "28192": {
+      "error_fingerprint": "954ccf625f7f8899",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=False, converged=0, reason=monitor_missing",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17697",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28192,
+      "terminal_at": "2026-07-12T05:07:52+00:00"
+    },
+    "28195": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17700",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28195,
+      "terminal_at": "2026-07-12T05:20:19+00:00"
+    },
+    "28203": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17708",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28203,
+      "terminal_at": "2026-07-12T05:20:19+00:00"
+    },
+    "28204": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17709",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28204,
+      "terminal_at": "2026-07-12T06:26:00+00:00"
+    },
+    "28208": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17713",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28208,
+      "terminal_at": "2026-07-12T05:38:07+00:00"
+    },
+    "28217": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17722",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28217,
+      "terminal_at": "2026-07-12T05:51:59+00:00"
+    },
+    "28240": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17745",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28240,
+      "terminal_at": "2026-07-12T06:50:46+00:00"
+    },
+    "28241": {
+      "error_fingerprint": "5a08385e60c1f2fc",
+      "error_message": "failure_message=WARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1783837070.027649 3645639 fork_posix.cc:71] Other threads are currently calling into gRPC, skipping fork() handlers\nINFO:Global:Boundary Symmetry Symmetry1 has been created.",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17746",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28241,
+      "terminal_at": "2026-07-12T06:37:53+00:00"
+    },
+    "28243": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17748",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28243,
+      "terminal_at": "2026-07-12T06:28:39+00:00"
+    },
+    "28247": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17752",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28247,
+      "terminal_at": "2026-07-12T06:37:53+00:00"
+    },
+    "28251": {
+      "error_fingerprint": "3758841069d9a21b",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=True, converged=0, reason=residual_threshold",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17756",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28251,
+      "terminal_at": "2026-07-12T06:17:28+00:00"
+    },
+    "28258": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17763",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28258,
+      "terminal_at": "2026-07-12T05:21:42+00:00"
+    },
+    "28265": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17770",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28265,
+      "terminal_at": "2026-07-12T06:28:39+00:00"
+    },
+    "28269": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17774",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28269,
+      "terminal_at": "2026-07-12T05:53:37+00:00"
+    },
+    "28273": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17778",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 28273,
+      "terminal_at": "2026-07-12T06:37:53+00:00"
+    },
+    "28279": {
+      "error_fingerprint": "3758841069d9a21b",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=True, converged=0, reason=residual_threshold",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17784",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28279,
+      "terminal_at": "2026-07-12T06:40:04+00:00"
+    },
+    "28367": {
+      "error_fingerprint": "124f8ab943596a8d",
+      "error_message": "stderr_run_one_loop=Failed to execute gRPC AEDT command: Analyze",
+      "name": "mft-camp-sb171c7c-le6b9b9d-17848",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 28367,
+      "terminal_at": "2026-07-12T06:41:46+00:00"
+    }
+  },
+  "updated_at": "2026-07-12T06:51:40+00:00"
+}

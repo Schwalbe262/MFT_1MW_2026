@@ -142,6 +142,76 @@ class PromotionDecisionTests(unittest.TestCase):
             "repeated_runtime_error:same-fingerprint:3",
             decision["pause_reasons"])
 
+    def test_sparse_lifetime_fingerprint_does_not_permanently_stop_refill(self):
+        rows = [outcome(index, "valid") for index in range(795)]
+        for index in (100, 300, 500, 780):
+            rows[index] = outcome(
+                index, "failed", error_fingerprint="sparse-fingerprint",
+                error_message="AEDT process exited", reason="task_failed")
+
+        reasons = rapid_campaign._production_gate_reasons(production(rows))
+
+        self.assertFalse(any(
+            reason.startswith("repeated_runtime_error:sparse-fingerprint:")
+            for reason in reasons
+        ))
+
+    def test_recent_fingerprint_ratio_stops_refill_without_a_trailing_streak(self):
+        rows = []
+        for group in range(6):
+            base = group * 5
+            rows.extend(outcome(base + offset, "valid") for offset in range(4))
+            rows.append(outcome(
+                base + 4, "failed", error_fingerprint="ratio-fingerprint",
+                error_message="AEDT process exited", reason="task_failed"))
+        # The latest 30 retain all six failures but end in a success, so this
+        # exercises the ratio signal independently of the trailing-streak one.
+        rows.append(outcome(999, "valid"))
+
+        reasons = rapid_campaign._production_gate_reasons(production(rows))
+
+        self.assertIn(
+            "repeated_runtime_error:ratio-fingerprint:6", reasons)
+
+    def test_three_trailing_matching_errors_stop_below_recent_ratio(self):
+        rows = [outcome(index, "valid") for index in range(27)]
+        rows.extend(
+            outcome(
+                100 + index, "failed", error_fingerprint="trailing-fingerprint",
+                error_message="AEDT process exited", reason="task_failed")
+            for index in range(3)
+        )
+
+        reasons = rapid_campaign._production_gate_reasons(production(rows))
+
+        self.assertIn(
+            "repeated_runtime_error:trailing-fingerprint:3", reasons)
+
+    def test_repeated_residual_nonconvergence_does_not_stop_healthy_fleet(self):
+        message = (
+            "stderr_pyaedt=[thermal] solve rejected before extraction: "
+            "analyze-call-ok=True, converged=0, reason=residual_threshold"
+        )
+        failed = [
+            outcome(
+                index,
+                "failed",
+                error_fingerprint="same-residual-fingerprint",
+                error_message=message,
+                reason="task_failed",
+            )
+            for index in range(4)
+        ]
+
+        reasons = rapid_campaign._production_gate_reasons(production(failed))
+
+        self.assertTrue(
+            rapid_campaign._is_expected_sample_nonconvergence(message)
+        )
+        self.assertFalse(any(
+            reason.startswith("repeated_runtime_error:") for reason in reasons
+        ))
+
     def test_recent_thirty_below_seventy_percent_stops_refill(self):
         state = rapid_campaign.new_state(SOLVER_REVISION, LIBRARY_REVISION)
         state["target_active"] = 300
@@ -152,6 +222,84 @@ class PromotionDecisionTests(unittest.TestCase):
             state, True, pilots(valid=10), production(rows), 300, now=NOW)
 
         self.assertTrue(any(
+            reason.startswith("recent_valid_rate_below_70pct")
+            for reason in decision["pause_reasons"]))
+
+    def test_prepolicy_timeouts_do_not_displace_current_runtime_health_window(self):
+        state = rapid_campaign.new_state(SOLVER_REVISION, LIBRARY_REVISION)
+        state["target_active"] = 300
+        current = [outcome(index, "valid") for index in range(24)]
+        current += [outcome(100 + index, "invalid") for index in range(6)]
+        late_prepolicy_timeouts = [
+            outcome(
+                200 + index,
+                "failed",
+                status="failed",
+                reason="task_failed",
+                expected_failure_reason="scheduler_prepolicy_timeout",
+            )
+            for index in range(7)
+        ]
+
+        decision = rapid_campaign.decide_campaign(
+            state,
+            True,
+            pilots(valid=10),
+            production(current + late_prepolicy_timeouts),
+            300,
+            now=NOW,
+        )
+
+        self.assertFalse(any(
+            reason.startswith("recent_valid_rate_below_70pct")
+            for reason in decision["pause_reasons"]))
+
+    def test_postpolicy_timeouts_still_reduce_current_runtime_health_rate(self):
+        state = rapid_campaign.new_state(SOLVER_REVISION, LIBRARY_REVISION)
+        state["target_active"] = 300
+        rows = [outcome(index, "valid") for index in range(20)]
+        rows += [
+            outcome(
+                100 + index,
+                "failed",
+                status="failed",
+                reason="task_failed",
+                expected_failure_reason=None,
+                error_fingerprint="postpolicy-timeout",
+                error_message="task timed out after 14400s",
+            )
+            for index in range(10)
+        ]
+
+        decision = rapid_campaign.decide_campaign(
+            state, True, pilots(valid=10), production(rows), 300, now=NOW)
+
+        self.assertTrue(any(
+            reason.startswith("recent_valid_rate_below_70pct")
+            for reason in decision["pause_reasons"]))
+
+    def test_sealed_operator_cancellations_do_not_displace_runtime_window(self):
+        state = rapid_campaign.new_state(SOLVER_REVISION, LIBRARY_REVISION)
+        state["target_active"] = 300
+        current = [outcome(index, "valid") for index in range(24)]
+        current += [outcome(100 + index, "invalid") for index in range(6)]
+        operator_cancelled = [
+            outcome(
+                28_746 + index,
+                "cancelled",
+                status="cancelled",
+                reason="task_cancelled",
+                expected_failure_reason=(
+                    "operator_cancelled_stale_prepolicy_launch"),
+            )
+            for index in range(3)
+        ]
+
+        decision = rapid_campaign.decide_campaign(
+            state, True, pilots(valid=10),
+            production(current + operator_cancelled), 300, now=NOW)
+
+        self.assertFalse(any(
             reason.startswith("recent_valid_rate_below_70pct")
             for reason in decision["pause_reasons"]))
 
@@ -361,7 +509,7 @@ INFO:Global:Desktop has been released and closed.
             "d44e42386932a56a",
         )
 
-    def test_structured_cleanup_error_is_retained_when_stderr_has_no_better_root(self):
+    def test_structured_cleanup_error_is_not_a_runtime_fingerprint(self):
         cleanup = (
             "A(n) <class 'TypeError'> error occurred while retrieving information "
             "for the active AEDT sessions: argument of type 'NoneType' is not iterable"
@@ -372,7 +520,57 @@ INFO:Global:Desktop has been released and closed.
             stderr_fetcher=mock.Mock(return_value=f"ERROR:Global:{cleanup}\n"),
         )
 
-        self.assertEqual(message, f"error_message={cleanup}")
+        self.assertEqual(message, "exit_code=1")
+        self.assertFalse(rapid_campaign._is_informative_runtime_message(cleanup))
+        self.assertIsNone(rapid_campaign._runtime_error_fingerprint(cleanup))
+
+    def test_cached_cleanup_only_failures_remain_invalid_without_false_pause(self):
+        cleanup = (
+            "A(n) <class 'TypeError'> error occurred while retrieving information "
+            "for the active AEDT sessions: argument of type 'NoneType' is not iterable"
+        )
+        tasks = [self._failed_task(task_id) for task_id in range(50, 53)]
+        cached = {
+            str(task["id"]): outcome(
+                task["id"],
+                "failed",
+                name=task["name"],
+                status="failed",
+                reason="task_failed",
+                error_message=f"stderr_pyaedt={cleanup}",
+                error_fingerprint=rapid_campaign.error_fingerprint(cleanup),
+            )
+            for task in tasks
+        }
+        stderr = (
+            "INFO:Global:Project simulation closed correctly\n"
+            f"ERROR:Global:{cleanup}\n"
+            "INFO:Global:Desktop has been released and closed.\n"
+        )
+
+        with mock.patch.object(
+                rapid_campaign, "_fetch_task_stderr", return_value=stderr) as fetch:
+            inspected = rapid_campaign.inspect_production_tasks(
+                tasks,
+                SOLVER_REVISION,
+                LIBRARY_REVISION,
+                cached_outcomes=cached,
+            )
+
+        self.assertEqual(fetch.call_count, 3)
+        self.assertTrue(all(
+            item["state"] == "invalid" and item["reason"] == "task_failed"
+            for item in inspected["outcomes"]
+        ))
+        self.assertTrue(all(
+            item["error_message"] == "exit_code=1"
+            and item["error_fingerprint"] is None
+            for item in inspected["outcomes"]
+        ))
+        self.assertFalse(any(
+            reason.startswith("repeated_runtime_error:")
+            for reason in rapid_campaign._production_gate_reasons(inspected)
+        ))
 
     def test_exit_code_only_failure_has_no_repeated_error_fingerprint(self):
         task = self._failed_task(43)
@@ -384,6 +582,96 @@ INFO:Global:Desktop has been released and closed.
         result = inspected["outcomes"][0]
         self.assertEqual(result["error_message"], "exit_code=1")
         self.assertIsNone(result["error_fingerprint"])
+
+    def test_prepolicy_four_hour_timeout_is_invalid_but_not_current_runtime_outage(self):
+        task = self._failed_task(
+            28_460,
+            name="mft-camp-sb171c7c-le6b9b9d-17941",
+            exit_code=124,
+            failure_message="task timed out after 14400s",
+            started_at="2026-07-12 09:05:25",
+        )
+
+        result = rapid_campaign._refresh_failure_outcome(
+            {"status": "failed"}, task,
+        )
+
+        self.assertEqual(
+            result["expected_failure_reason"], "scheduler_prepolicy_timeout",
+        )
+        self.assertIsNone(result["error_fingerprint"])
+
+    def test_exact_operator_cancelled_stale_launch_is_classified(self):
+        task = self._failed_task(
+            28_747,
+            name="mft-camp-sb171c7c-le6b9b9d-18222",
+            status="cancelled",
+            exit_code=None,
+            failure_message="",
+            project="MFT_1MW_2026v1",
+            account_name="r1jae262",
+            requested_account_name="",
+            allocation_id=8_019,
+            slurm_job_id="731354",
+            allocation_node_name="n045",
+            created_at="2026-07-12 10:59:58",
+            attached_at="2026-07-12 11:00:47",
+            launch_started_at="2026-07-12 11:00:48",
+            started_at=None,
+            finished_at="2026-07-12 14:24:21",
+        )
+
+        result = rapid_campaign._refresh_failure_outcome(
+            {"status": "cancelled"}, task,
+        )
+
+        self.assertEqual(
+            result["expected_failure_reason"],
+            "operator_cancelled_stale_prepolicy_launch",
+        )
+        self.assertIsNone(result["error_fingerprint"])
+
+    def test_unsealed_cancelled_launch_remains_generic_invalid(self):
+        task = self._failed_task(
+            29_999,
+            status="cancelled",
+            exit_code=None,
+            failure_message="",
+            project="MFT_1MW_2026v1",
+            account_name="r1jae262",
+            requested_account_name="",
+            allocation_id=8_019,
+            slurm_job_id="731354",
+            allocation_node_name="n045",
+            created_at="2026-07-12 10:59:58",
+            attached_at="2026-07-12 11:00:47",
+            launch_started_at="2026-07-12 11:00:48",
+            started_at=None,
+            finished_at="2026-07-12 14:24:21",
+        )
+
+        result = rapid_campaign._refresh_failure_outcome(
+            {"status": "cancelled"}, task,
+        )
+
+        self.assertIsNone(result["expected_failure_reason"])
+        self.assertIsNone(result["error_fingerprint"])
+
+    def test_postpolicy_four_hour_timeout_remains_stopping_runtime_error(self):
+        task = self._failed_task(
+            29_999,
+            exit_code=124,
+            failure_message="task timed out after 14400s",
+            started_at="2026-07-12 11:00:55",
+        )
+
+        inspected = rapid_campaign.inspect_production_tasks(
+            [task], SOLVER_REVISION, LIBRARY_REVISION,
+        )
+
+        result = inspected["outcomes"][0]
+        self.assertIsNone(result["expected_failure_reason"])
+        self.assertEqual(result["error_fingerprint"], "bca1d81ac1b45aca")
 
     def test_cancelled_task_never_fetches_stderr_or_gets_runtime_fingerprint(self):
         task = self._failed_task(48, status="cancelled", exit_code=None)
@@ -669,7 +957,7 @@ class ControllerMutationTests(unittest.TestCase):
                          "queue_submission_allowed": True,
                          "submission_allowed": True,
                          "project": rapid_campaign.pinned_pilot.MFT_PROJECT,
-                         "project_max_active_tasks": 300,
+                         "project_max_active_tasks": 400,
                          "project_required_hard_cap": 1,
                          "project_counts": counts,
                          "project_active": 0,

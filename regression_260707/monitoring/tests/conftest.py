@@ -14,12 +14,24 @@ FIXED_NOW = datetime(2026, 7, 11, 3, 0, tzinfo=KST)
 
 
 class DummyScheduler:
+    def __init__(self):
+        self.parallel_target = 300
+
     def snapshot(self):
         return {
             "connected": True,
             "url": "http://scheduler.invalid",
-            "read_only": True,
+            "read_only": False,
+            "control_enabled": True,
             "task_prefix": "mft",
+            "project": "MFT_1MW_2026v1",
+            "parallel_target": self.parallel_target,
+            "parallel_target_min": 1,
+            "parallel_target_max": 300,
+            "live_queued": 3,
+            "live_attaching": 2,
+            "live_running": 4,
+            "logical_active": 9,
             "total": 12,
             "running": 4,
             "pending": 3,
@@ -30,6 +42,20 @@ class DummyScheduler:
             "statuses": {"running": 4, "pending": 3, "completed": 3, "failed": 1, "cancelled": 1},
             "error": None,
             "updated_at": FIXED_NOW.isoformat(),
+        }
+
+    def set_parallel_target(self, target):
+        self.parallel_target = target
+        return {
+            "project": "MFT_1MW_2026v1",
+            "parallel_target": target,
+            "parallel_target_min": 1,
+            "parallel_target_max": 300,
+            "live_queued": 3,
+            "live_attaching": 2,
+            "live_running": 4,
+            "logical_active": 9,
+            "project_updated_at": FIXED_NOW.isoformat(),
         }
 
 
@@ -53,15 +79,21 @@ def campaign_root(tmp_path):
     dataset = root / "data" / "dataset"
     write_json(dataset / "manifest.json", {
         "updated": "260711_023000_000000", "total_rows": 2, "new_rows": 1,
-        "new_unique_rows": 1, "git_hashes": ["a" * 40, "b" * 40],
+        "new_unique_rows": 1, "git_hashes": [
+            "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a", "b" * 40,
+        ],
     })
     write_csv(dataset / "train_io.csv", [
         {
+            "train_io_schema_version": "3",
             "saved_at": "2026-07-11 02:30:00", "result_valid_em": "1", "result_valid_thermal": "1",
-            "git_hash": "a" * 40, "project_name": "one",
+            "time_matrix": "300", "time_loss": "1700", "time_thermal": "1000", "time": "3000",
+            "git_hash": "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a", "project_name": "one",
         },
         {
+            "train_io_schema_version": "3",
             "saved_at": "2026-07-11 01:30:00", "result_valid_em": "1", "result_valid_thermal": "0",
+            "time_matrix": "600", "time_loss": "1800", "time_thermal": "1200", "time": "3600",
             "git_hash": "b" * 40, "project_name": "two",
         },
     ])
@@ -72,7 +104,7 @@ def campaign_root(tmp_path):
         "strict_em_rows": 2,
         "strict_full_rows": 1,
         "state_identity": {
-            "solver_revision": "a" * 40,
+            "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
             "library_revision": "c" * 40,
         },
     })
@@ -80,12 +112,32 @@ def campaign_root(tmp_path):
     history_path.parent.mkdir(parents=True, exist_ok=True)
     history_path.write_text("\n".join([
         json.dumps({
+            "time": "2026-07-11T00:30:00+09:00",
+            "data": {
+                "count_basis": "pinned_strict_full", "total_rows": 51,
+                "pinned_solver_revision": "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a",
+                "pinned_library_revision": "c" * 40,
+            },
+        }),
+        json.dumps({
+            "time": "2026-07-11T01:00:00+09:00",
+            "data": {"count_basis": "pinned_strict_full", "total_rows": 51},
+        }),
+        json.dumps({
             "time": "2026-07-11T01:30:00+09:00",
-            "data": {"count_basis": "pinned_strict_full", "total_rows": 0},
+            "data": {
+                "count_basis": "pinned_strict_full", "total_rows": 0,
+                "pinned_solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+                "pinned_library_revision": "c" * 40,
+            },
         }),
         json.dumps({
             "time": "2026-07-11T02:30:00+09:00",
-            "data": {"count_basis": "pinned_strict_full", "total_rows": 1},
+            "data": {
+                "count_basis": "pinned_strict_full", "total_rows": 1,
+                "pinned_solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+                "pinned_library_revision": "c" * 40,
+            },
         }),
     ]) + "\n", encoding="utf-8")
 
@@ -136,7 +188,28 @@ def campaign_root(tmp_path):
         "nwh1": 350, "nwh2": 300, "cc_w2c_space_x": 42, "cc_w2c_space_y": 42,
         "w2c_w1c_space_x": 41, "w2c_w1c_space_y": 41, "w1c_w2s_gap_x_actual": 43,
         "w1s_cs_space_x": 44, "cs_w1s_space_y": 45, "h_gap2": 46,
-        "pred_Llt_phys": 27.5, "sigma_Llt_phys": .1, "pred_B_max_core": 1.0,
+        "pred_Llt_phys": 27.5, "sigma_Llt_phys": .1,
+        "B_design_analytic_T": 1.0, "pred_B_mean_core": .8,
+        "pred_B_max_core": 2.7,
+        "size_W_mm": 900, "size_L_mm": 700, "size_H_mm": 500,
+        "size_WxLxH_mm": "900.0 × 700.0 × 500.0",
+        "footprint_cm2": 6300, "turns_primary": 7,
+        "turns_secondary_center": 35, "turns_secondary_side": 25,
+        "cw1_conductor_thickness_mm": 5, "cw2_conductor_thickness_mm": 1,
+        "core_depth_each_mm": 70, "wcp_len_pct": 50, "wcp_len_x_mm": 140,
+        "core_cold_plate_thickness_mm": 20,
+        "core_thermal_pad_thickness_mm": 2,
+        "winding_cold_plate_thickness_mm": 20,
+        "winding_thermal_pad_thickness_mm": 2,
+        "pred_primary_winding_loss_W": 2000,
+        "pred_secondary_center_winding_loss_W": 1200,
+        "pred_secondary_side_winding_loss_W": 800,
+        "pred_secondary_winding_loss_W": 2000,
+        "pred_total_winding_loss_W": 4000,
+        "pred_core_loss_W": 2000, "pred_core_cold_plate_loss_W": 500,
+        "pred_winding_cold_plate_loss_W": 250,
+        "rated_power_W": 1_000_000, "pred_efficiency_pct": 99.2,
+        "Ae_effective_m2": .05, "core_lamination_factor": .85,
     }
     write_csv(root / "al_rounds" / "round_00" / "pareto_front.csv", [
         {**front_fields, "volume_L": 600, "total_loss_W": 7000},
@@ -152,6 +225,8 @@ def campaign_root(tmp_path):
         "conv_error_pct_matrix": .5, "conv_error_pct_loss": .6,
         "P_winding_total": 4000, "P_core_total": 2000,
         "P_core_plate_total": 500, "P_wcp_total": 250,
+        "time_matrix": 353.31, "time_loss": 1720.78,
+        "time_thermal": 1039.83, "time": 3113.92,
         "git_hash": "a" * 40, "pyaedt_library_git_hash": "c" * 40,
     }
     write_json(root / "al_rounds" / "state.json", {

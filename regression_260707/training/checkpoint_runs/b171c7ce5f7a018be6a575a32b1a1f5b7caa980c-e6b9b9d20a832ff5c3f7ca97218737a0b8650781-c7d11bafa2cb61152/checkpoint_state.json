@@ -1,0 +1,56 @@
+{
+ "schema_version": 2,
+ "completed": [
+  {
+   "threshold": 500,
+   "actual_strict_full_rows": 748,
+   "snapshot": "Y:\\git\\MFT_1MW_2026\\regression_260707\\training\\checkpoint_runs\\b171c7ce5f7a018be6a575a32b1a1f5b7caa980c-e6b9b9d20a832ff5c3f7ca97218737a0b8650781-c7d11bafa2cb61152\\snapshots\\strict_000500_7be9ab524fc5.parquet",
+   "snapshot_sha256": "9428abe5a21528185b44333aae24827e19391ec8cfb153db74668aebf5731757",
+   "metrics_result": "Y:\\git\\MFT_1MW_2026\\regression_260707\\training\\checkpoint_runs\\b171c7ce5f7a018be6a575a32b1a1f5b7caa980c-e6b9b9d20a832ff5c3f7ca97218737a0b8650781-c7d11bafa2cb61152\\checkpoint_metrics\\threshold_000500_attempt_000001.json",
+   "metrics_result_sha256": "e9352757fb4bc1a728042f64361e0c3f0fbde3547acba844bf41dae089f825c4",
+   "profile_path": "\\\\RaiDrive-peets\\ANSYS\\git\\MFT_1MW_2026\\regression_260707\\verify\\profiles\\standard.json",
+   "profile_sha256": "24a0c8feca4af7da95c4ac6f1f9c15d761320916962cb6813af44a9bb6d16a9f",
+   "thresholds_sha256": "9a5fdc0100da01f7b60f24ee1012e30db0d7a2677c56d1a1dc132e1efc8ce0a3",
+   "activation_minimum_strict_full_rows": 3000,
+   "completed_at": "2026-07-13T01:51:07",
+   "kind": "metrics_only",
+   "quality_passed": null
+  }
+ ],
+ "attempts": [
+  {
+   "threshold": 500,
+   "strict_full_rows": 748,
+   "started_at": "2026-07-13T01:50:24",
+   "status": "completed",
+   "actual_strict_full_rows": 748,
+   "snapshot": "Y:\\git\\MFT_1MW_2026\\regression_260707\\training\\checkpoint_runs\\b171c7ce5f7a018be6a575a32b1a1f5b7caa980c-e6b9b9d20a832ff5c3f7ca97218737a0b8650781-c7d11bafa2cb61152\\snapshots\\strict_000500_7be9ab524fc5.parquet",
+   "snapshot_sha256": "9428abe5a21528185b44333aae24827e19391ec8cfb153db74668aebf5731757",
+   "metrics_result": "Y:\\git\\MFT_1MW_2026\\regression_260707\\training\\checkpoint_runs\\b171c7ce5f7a018be6a575a32b1a1f5b7caa980c-e6b9b9d20a832ff5c3f7ca97218737a0b8650781-c7d11bafa2cb61152\\checkpoint_metrics\\threshold_000500_attempt_000001.json",
+   "metrics_result_sha256": "e9352757fb4bc1a728042f64361e0c3f0fbde3547acba844bf41dae089f825c4",
+   "profile_path": "\\\\RaiDrive-peets\\ANSYS\\git\\MFT_1MW_2026\\regression_260707\\verify\\profiles\\standard.json",
+   "profile_sha256": "24a0c8feca4af7da95c4ac6f1f9c15d761320916962cb6813af44a9bb6d16a9f",
+   "thresholds_sha256": "9a5fdc0100da01f7b60f24ee1012e30db0d7a2677c56d1a1dc132e1efc8ce0a3",
+   "activation_minimum_strict_full_rows": 3000,
+   "completed_at": "2026-07-13T01:51:07",
+   "kind": "metrics_only",
+   "quality_passed": null
+  }
+ ],
+ "identity": {
+  "dataset": "Y:\\git\\MFT_1MW_2026\\regression_260707\\data\\dataset\\train.parquet",
+  "profile_path": "\\\\RaiDrive-peets\\ANSYS\\git\\MFT_1MW_2026\\regression_260707\\verify\\profiles\\standard.json",
+  "profile_sha256": "24a0c8feca4af7da95c4ac6f1f9c15d761320916962cb6813af44a9bb6d16a9f",
+  "thresholds_path": "Y:\\git\\MFT_1MW_2026\\regression_260707\\training\\model_quality_thresholds.json",
+  "thresholds_sha256": "9a5fdc0100da01f7b60f24ee1012e30db0d7a2677c56d1a1dc132e1efc8ce0a3",
+  "activation_minimum_strict_full_rows": 3000,
+  "quality_contract_sha256": "20a116af199c7712269daf60fa60eba8d82a963ad4615a1bbf4edc0808a54c25",
+  "model_targets_sha256": "5ccdcd8646e2b6a03db75b96120f1947d0174574f2e23960b986d381dbfffee5",
+  "checkpoint_contract_schema_version": 1,
+  "checkpoint_contract_sha256": "7d11bafa2cb61152d9094aa9df0fc2a5d93b4d391a78250416614ba3028d8249",
+  "checkpoint_contract_key": "7d11bafa2cb61152",
+  "registry_protocol_version": 2,
+  "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+ }
+}

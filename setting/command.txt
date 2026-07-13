@@ -1,0 +1,34 @@
+chmod +x auto_setup.sh
+./auto_setup.sh
+
+
+chmod +x kill_remote.sh
+./kill_remote.sh
+
+
+
+conda env create -n pyaedt2026v1 -f environment.yml
+
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda env create -f environment.yml
+conda activate pyaedt2026v1
+
+
+
+module purge
+unset PYTHONPATH
+unset PYTHONHOME
+hash -r
+source ~/miniconda3/etc/profile.d/conda.sh
+conda --version
+conda activate pyaedt2026v1
+
+
+
+scancel -u $USER
+pkill -u $USER -f peets
+pkill -u $USER -f aedt_runs
+pkill -u $USER -f remote_worker_payload
+pkill -u $USER -f remote_job.sh
+pkill -u $USER -f sbatch

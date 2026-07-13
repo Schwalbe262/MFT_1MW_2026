@@ -1,0 +1,21 @@
+{
+ "schema_version": 2,
+ "completed": [],
+ "attempts": [],
+ "identity": {
+  "dataset": "Y:\\git\\MFT_1MW_2026\\regression_260707\\data\\dataset\\train.parquet",
+  "profile_path": "\\\\RaiDrive-peets\\ANSYS\\git\\MFT_1MW_2026\\regression_260707\\verify\\profiles\\standard.json",
+  "profile_sha256": "24a0c8feca4af7da95c4ac6f1f9c15d761320916962cb6813af44a9bb6d16a9f",
+  "thresholds_path": "Y:\\git\\MFT_1MW_2026\\regression_260707\\training\\model_quality_thresholds.json",
+  "thresholds_sha256": "78cae8cce399516930cebc48d1507a507539559bc309e5a4c301886333d9ddd9",
+  "activation_minimum_strict_full_rows": 3000,
+  "quality_contract_sha256": "f1feacd3cc86667ba4e7b6202f86e547f5aa9825fabf61750177a7e37912388a",
+  "model_targets_sha256": "24b6a9c2581bcbd6ec93011338989210469be8b100e83c8b26a03318f70b068d",
+  "checkpoint_contract_schema_version": 1,
+  "checkpoint_contract_sha256": "4cca347e6b927be2cdd696272243bdc5fefd99e1fba00e8c90a099b47ee42507",
+  "checkpoint_contract_key": "4cca347e6b927be2",
+  "registry_protocol_version": 2,
+  "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+ }
+}

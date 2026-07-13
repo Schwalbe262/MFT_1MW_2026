@@ -1,0 +1,45 @@
+{
+  "adoption_sealed": true,
+  "adoption_sha256": "4e46a3e253f991c39c3ceb01e4210fbf3b30fde57c0e445a166f3e780f046be9",
+  "initial_count": 250,
+  "last_strict_growth_at": "2026-07-11T18:50:57+00:00",
+  "last_strict_rows": 1,
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+  "pause_reasons": [
+    "fleet20_valid_rate_unreachable",
+    "local3_strict_failure:thermal_tx_mesh_zone_missing"
+  ],
+  "paused": true,
+  "promoted": false,
+  "promoted_at": null,
+  "schema_version": 1,
+  "seed": 260710,
+  "solver_revision": "3216e43a5a1a362ee2ed1aba89b642498c60d1b9",
+  "target_active": 300,
+  "target_strict_rows": 3000,
+  "task_outcomes": {
+    "27202": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-s3216e43-le6b9b9d-16915",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 27202,
+      "terminal_at": "2026-07-11T18:44:33+00:00"
+    },
+    "27337": {
+      "error_fingerprint": "56a333f312b1e141",
+      "error_message": "exit_code=1",
+      "name": "mft-camp-s3216e43-le6b9b9d-17050",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 27337,
+      "terminal_at": "2026-07-11T18:50:25+00:00"
+    }
+  },
+  "updated_at": "2026-07-11T19:30:00+00:00"
+}

@@ -1,0 +1,17 @@
+{
+ "schema_version": 2,
+ "completed": [],
+ "attempts": [],
+ "identity": {
+  "dataset": "Y:\\git\\MFT_1MW_2026\\regression_260707\\data\\dataset\\train.parquet",
+  "profile_path": "\\\\RaiDrive-peets\\ANSYS\\git\\MFT_1MW_2026\\regression_260707\\verify\\profiles\\standard.json",
+  "profile_sha256": "24a0c8feca4af7da95c4ac6f1f9c15d761320916962cb6813af44a9bb6d16a9f",
+  "thresholds_path": "\\\\RaiDrive-peets\\ANSYS\\git\\MFT_1MW_2026\\regression_260707\\training\\model_quality_thresholds.json",
+  "thresholds_sha256": "53b08ef98e1fd191d949004f3b242ba5f0850b926c818cd0d83626162ea532af",
+  "activation_minimum_strict_full_rows": 3000,
+  "quality_contract_sha256": "0388239ea55b66d61eccf2f5fc0d463a4a14c5c929fa5ce363e150d9c8ad2ddb",
+  "registry_protocol_version": 2,
+  "solver_revision": "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a",
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+ }
+}

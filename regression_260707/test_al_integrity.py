@@ -1,3 +1,4 @@
+import copy
 import json
 import hashlib
 import os
@@ -39,7 +40,11 @@ def complete_candidate_params(**updates):
         "cs_w1s_space_y": 40.0,
     }
     safe.update(updates)
-    return create_input_parameter(safe).iloc[0].to_dict()
+    row = create_input_parameter(safe).iloc[0]
+    # Material-contract constants are explicit solver inputs/results but are
+    # intentionally outside the sealed Sobol/campaign identity KEYS.  AL task
+    # identity must remain the exact KEYS payload.
+    return {key: row[key] for key in KEYS}
 
 
 def standard_submitted_params(**updates):
@@ -152,6 +157,9 @@ def valid_result(**updates):
         "conv_error_pct_loss": 0.6,
         "conv_delta_pct_loss": 0.3,
         "P_winding_total": 4000.0,
+        "P_Tx_main_group": 2400.0,
+        "P_Rx_main_group": 1200.0,
+        "P_Rx_side_total": 400.0,
         "P_core_total": 2000.0,
         "P_core_plate_total": 500.0,
         "P_wcp_total": 0.0,
@@ -171,6 +179,9 @@ def valid_result(**updates):
         "Tprobe_Rx_main_leeward_max": 90.0,
         "Tprobe_Rx_side_leeward_max": 91.0,
         "Tprobe_core_center_max": 92.0,
+        "Tprobe_core_center_leg_max": 88.0,
+        "Tprobe_core_side_leg_max": 90.0,
+        "Tprobe_core_top_yoke_max": 92.0,
         "project_name": "simulation-test",
         "saved_at": "2026-07-10 07:00:00",
     }
@@ -194,39 +205,50 @@ def task_inventory_response(tasks):
 
 
 def complete_errors(spec_pass=(1, 1, 1)):
-    return {
+    temperature_targets = tuple(
+        al_driver.MANDATORY_SURROGATE_TEMPERATURE_TARGETS
+    )
+    errors = {
         "dllt_pct": [0.1, 0.2, 0.3],
         "llt_fea": [27.5, 27.5, 27.5],
         "spec_pass": list(spec_pass),
-        "temperature_error_expected_count": [3, 3, 3],
+        "temperature_error_expected_count": [len(temperature_targets)] * 3,
         "temperature_error_complete": [1, 1, 1],
         "dloss_pct": [1.0, 2.0, 1.5],
-        "d_Tprobe_Tx_leeward_max": [1.0, 2.0, 1.5],
-        "d_Tprobe_Rx_main_leeward_max": [1.0, 2.0, 1.5],
-        "d_Tprobe_core_center_max": [1.0, 2.0, 1.5],
     }
+    errors.update({
+        f"d_{target}": [1.0, 2.0, 1.5]
+        for target in temperature_targets
+    })
+    return errors
 
 
 class ThermalTrainingFilterTests(unittest.TestCase):
     def test_only_complete_unsaturated_rows_feed_temperature_models(self):
-        target = "Tprobe_core_center_max"
-        frame = pd.DataFrame([
-            valid_result(sample="valid", **{target: 92.0}),
-            valid_result(sample="thermal-invalid", result_valid_thermal=0,
-                         **{target: 93.0}),
-            valid_result(sample="not-solved", thermal_solved=0,
-                         **{target: 94.0}),
-            valid_result(sample="below-cap", **{target: 4699.9}),
-            valid_result(sample="at-cap", **{target: 4700.0}),
-        ])
-
-        filtered = filter_valid_training_rows(frame, target)
-
-        self.assertEqual(filtered["sample"].tolist(), ["valid", "below-cap"])
-        self.assertEqual(
-            filter_valid_training_rows(frame, "Llt")["sample"].tolist(),
-            ["valid", "below-cap"],
+        targets = (
+            "Tprobe_core_center_max",
+            *al_driver.CORE_REGION_TEMPERATURE_TARGETS,
         )
+        for target in targets:
+            with self.subTest(target=target):
+                frame = pd.DataFrame([
+                    valid_result(sample="valid", **{target: 92.0}),
+                    valid_result(sample="thermal-invalid", result_valid_thermal=0,
+                                 **{target: 93.0}),
+                    valid_result(sample="not-solved", thermal_solved=0,
+                                 **{target: 94.0}),
+                    valid_result(sample="below-cap", **{target: 4699.9}),
+                    valid_result(sample="at-cap", **{target: 4700.0}),
+                ])
+
+                filtered = filter_valid_training_rows(frame, target)
+
+                self.assertEqual(
+                    filtered["sample"].tolist(), ["valid", "below-cap"])
+                self.assertEqual(
+                    filter_valid_training_rows(frame, "Llt")["sample"].tolist(),
+                    ["valid", "below-cap"],
+                )
 
 
 def verification_counts(total=3, valid=3, exhausted=0, pending=0):
@@ -277,7 +299,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.capacity_snapshot = capacity_snapshot.start()
         self.addCleanup(capacity_snapshot.stop)
 
-    def test_project_mutation_contract_requires_exact_cap_and_auto_pull_false(self):
+    def test_project_mutation_contract_requires_bounded_cap_and_auto_pull_false(self):
         valid = {
             "name": scheduler_client.MFT_PROJECT,
             "max_active_tasks": scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS,
@@ -285,12 +307,20 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         }
         self.assertEqual(
             scheduler_client.validate_project_mutation_contract(valid), valid)
+        for cap in (1, 137, 299, 300):
+            self.assertEqual(
+                scheduler_client.validate_project_mutation_contract(
+                    {**valid, "max_active_tasks": cap})["max_active_tasks"],
+                cap,
+            )
+        with self.assertRaises(scheduler_client.ProjectContractError):
+            scheduler_client.validate_project_mutation_contract(
+                {**valid, "max_active_tasks": 299}, expected_cap=300)
         for override in (
             {"max_active_tasks": 0},
-            {"max_active_tasks": 299},
             {"max_active_tasks": 301},
-            {"max_active_tasks": 300.0},
-            {"max_active_tasks": 300.1},
+            {"max_active_tasks": 400.0},
+            {"max_active_tasks": 400.1},
             {"max_active_tasks": "300"},
             {"max_active_tasks": True},
             {"auto_pull": True},
@@ -300,6 +330,32 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
                     scheduler_client.ProjectContractError):
                 scheduler_client.validate_project_mutation_contract(
                     {**valid, **override})
+
+    def test_full_project_contract_fails_closed_on_missing_or_partial_fields(self):
+        project = {
+            "name": scheduler_client.MFT_PROJECT,
+            "max_active_tasks": 275,
+            "auto_pull": False,
+            "repos": copy.deepcopy(scheduler_client.MFT_PROJECT_REPOS),
+            "setup": scheduler_client.MFT_PROJECT_SETUP,
+            "entrypoints": copy.deepcopy(
+                scheduler_client.MFT_PROJECT_ENTRYPOINTS),
+            "cleanup_globs": scheduler_client.MFT_PROJECT_CLEANUP_GLOBS,
+            "output_globs": scheduler_client.MFT_PROJECT_OUTPUT_GLOBS,
+            "sim_subdir": scheduler_client.MFT_PROJECT_SIM_SUBDIR,
+        }
+        contract = scheduler_client.validate_project_mutation_contract(
+            project, expected_cap=275, require_full=True)
+        self.assertEqual(contract["max_active_tasks"], 275)
+        for field in (
+                "repos", "setup", "entrypoints", "cleanup_globs",
+                "output_globs", "sim_subdir"):
+            drifted = copy.deepcopy(project)
+            drifted.pop(field)
+            with self.subTest(field=field), self.assertRaises(
+                    scheduler_client.ProjectContractError):
+                scheduler_client.validate_project_mutation_contract(
+                    drifted, expected_cap=275, require_full=True)
 
     def test_submit_wrapper_owns_the_common_mutation_lock(self):
         observed = []
@@ -390,9 +446,12 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
                 "candidate-mpi", "candidate_workdir", {"x": 1}, {},
                 solver_revision=TEST_REVISION,
                 library_revision=TEST_LIBRARY_REVISION,
+                priority=10,
             )
 
-        command = post.call_args.kwargs["json"]["command"]
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["priority"], 10)
+        command = payload["command"]
         hydra_export = "export I_MPI_HYDRA_BOOTSTRAP=fork;"
         fluent_export = "export FLUENT_MPIRUN_FLAGS='-bootstrap fork';"
         self.assertEqual(command.count(hydra_export), 1)
@@ -405,6 +464,50 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             command.index(fluent_export),
             command.index("python run_simulation_260706.py"),
         )
+
+    def test_dynamic_submit_binds_every_post_to_exact_observed_cap(self):
+        submitted = Mock(status_code=201)
+        submitted.json.return_value = {"id": 404}
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), patch.object(
+                scheduler_client.requests, "post", return_value=submitted):
+            task_id = scheduler_client.submit_verification(
+                "candidate-dynamic-cap", "candidate_workdir", {"x": 1}, {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+                required_project_cap=275,
+            )
+
+        self.assertEqual(task_id, 404)
+        self.capacity_snapshot.assert_called_once_with(
+            275,
+            require_exact_project_cap=True,
+            require_full_project=True,
+        )
+
+    def test_queued_cancel_uses_status_cas_and_validates_acknowledgement(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"cancelled": [12, 13], "count": 2}
+        with patch.object(
+                scheduler_client, "campaign_mutation_lock_is_held",
+                return_value=True), patch.object(
+                scheduler_client.requests, "post", return_value=response) as post:
+            result = scheduler_client.cancel_queued_tasks_cas([12, 13])
+
+        self.assertEqual(result, {"cancelled": [12, 13], "count": 2})
+        self.assertEqual(post.call_args.kwargs["params"], {
+            "task_ids": "12,13",
+            "statuses": "queued",
+        })
+        response.json.return_value = {"cancelled": [99], "count": 1}
+        with patch.object(
+                scheduler_client, "campaign_mutation_lock_is_held",
+                return_value=True), patch.object(
+                scheduler_client.requests, "post", return_value=response):
+            with self.assertRaises(scheduler_client.ProjectContractError):
+                scheduler_client.cancel_queued_tasks_cas([12, 13])
 
     def test_submit_groups_preflight_and_simulation_before_preserving_exit_code(self):
         submitted = Mock(status_code=201)
@@ -777,6 +880,14 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertFalse(scheduler_client.is_valid_result(valid_result(T_max_Rx_main=4726.85)))
         self.assertFalse(scheduler_client.is_valid_result(
             valid_result(Tprobe_core_center_max=4726.85)))
+        for target in al_driver.CORE_REGION_TEMPERATURE_TARGETS:
+            with self.subTest(core_region_target=target):
+                self.assertFalse(scheduler_client.is_valid_result(
+                    valid_result(**{target: 4726.85})))
+                missing_region = valid_result()
+                missing_region.pop(target)
+                self.assertFalse(
+                    scheduler_client.is_valid_result(missing_region))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_solved=0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_converged=0)))
         self.assertFalse(scheduler_client.is_valid_result(
@@ -803,6 +914,11 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertFalse(scheduler_client.is_valid_result(valid_result(loss_on=0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(thermal_on=0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(matrix_skin_mesh=1)))
+        missing_component = valid_result()
+        missing_component.pop("P_Rx_main_group")
+        self.assertFalse(scheduler_client.is_valid_result(missing_component))
+        self.assertFalse(scheduler_client.is_valid_result(
+            valid_result(P_Tx_main_group=2401.0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(P_target=0)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(matrix_max_passes=1)))
         self.assertFalse(scheduler_client.is_valid_result(valid_result(git_dirty=1)))
@@ -1058,6 +1174,9 @@ class IngestIntegrityTests(unittest.TestCase):
             "pred_Tprobe_Rx_main_leeward_max": 90.5,
             "pred_Tprobe_Rx_side_leeward_max": 91.5,
             "pred_Tprobe_core_center_max": 92.5,
+            "pred_Tprobe_core_center_leg_max": 88.5,
+            "pred_Tprobe_core_side_leg_max": 90.5,
+            "pred_Tprobe_core_top_yoke_max": 92.5,
             "pred_P_winding_total": 4000.0,
             "pred_P_core_total": 2000.0,
             "pred_P_core_plate_total": 500.0,
@@ -1127,7 +1246,21 @@ class IngestIntegrityTests(unittest.TestCase):
                 (str(dataset) + ".lock", {"timeout": 120}),
             ])
             self.assertEqual(state["last_errs"]["spec_pass"], [1])
-            self.assertEqual(state["last_errs"]["temperature_error_expected_count"], [4])
+            expected_temperature_count = len(al_driver._required_probe_targets(
+                state["task_records"]["0"]["result"]
+            ))
+            self.assertEqual(
+                state["last_errs"]["temperature_error_expected_count"],
+                [expected_temperature_count],
+            )
+            self.assertEqual(
+                sum(
+                    key.startswith("d_Tprobe")
+                    and len(values) == 1
+                    for key, values in state["last_errs"].items()
+                ),
+                expected_temperature_count,
+            )
             self.assertEqual(state["last_errs"]["dloss_pct"], [0.0])
             self.assertEqual(state["verification_counts"], {
                 "round": 1,
@@ -1402,9 +1535,17 @@ class ActiveLearningGateTests(unittest.TestCase):
         al_driver.stage_check(state)
 
         history = state["history"][-1]
-        self.assertEqual(history["temperature_error_count"], 3 * al_driver.SPEC["K"])
+        temperature_target_count = len(
+            al_driver.MANDATORY_SURROGATE_TEMPERATURE_TARGETS
+        )
         self.assertEqual(
-            history["temperature_error_expected_count"], 3 * al_driver.SPEC["K"])
+            history["temperature_error_count"],
+            temperature_target_count * al_driver.SPEC["K"],
+        )
+        self.assertEqual(
+            history["temperature_error_expected_count"],
+            temperature_target_count * al_driver.SPEC["K"],
+        )
         self.assertTrue(history["temperature_error_coverage_complete"])
         self.assertTrue(history["loss_error_coverage_complete"])
         self.assertTrue(history["verification_coverage_ok"])

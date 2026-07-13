@@ -1,0 +1,60 @@
+{
+  "adoption_sha256": "10b9524fd2b21368fb29b63eac3c9ab2bb5efe5b99dd5e89bbd05cf8eb9c2c57",
+  "cycle_serial": 0,
+  "initial_count": 250,
+  "initial_cursor_end": 1843,
+  "initial_first_id": 27471,
+  "initial_last_id": 27720,
+  "initial_serial_end": 17361,
+  "last_action": "wait_local3",
+  "last_evidence": {
+    "action": "wait_local3",
+    "initial_statuses": {
+      "failed": 1,
+      "queued": 5,
+      "running": 244
+    },
+    "local3_passed": false,
+    "pause_reasons": [],
+    "paused": false,
+    "production_active": 249,
+    "production_invalid": 1,
+    "production_terminal": 1,
+    "production_valid": 0,
+    "production_valid_rate": 0.0,
+    "strict_full_rows": 0,
+    "strict_progress": {
+      "growth_at": null,
+      "observed_rows": 0,
+      "previous_rows": 0,
+      "reasons": []
+    },
+    "target_strict_rows": 3000,
+    "time": "2026-07-11T21:01:53+00:00"
+  },
+  "last_strict_growth_at": null,
+  "last_strict_rows": 0,
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+  "pause_reasons": [],
+  "paused": false,
+  "promoted_at": null,
+  "schema_version": 1,
+  "seed": 260710,
+  "solver_revision": "688c6f9ae8b1368d2b4424e42fc8973b3c580d24",
+  "target_active": 300,
+  "target_strict_rows": 3000,
+  "task_outcomes": {
+    "27496": {
+      "error_fingerprint": "56a333f312b1e141",
+      "error_message": "exit_code=1",
+      "name": "mft-camp-s688c6f9-le6b9b9d-17137",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 27496,
+      "terminal_at": "2026-07-11T20:29:58+00:00"
+    }
+  },
+  "updated_at": "2026-07-11T21:01:53+00:00"
+}

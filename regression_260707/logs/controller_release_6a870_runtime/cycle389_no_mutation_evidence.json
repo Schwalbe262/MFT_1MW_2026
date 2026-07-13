@@ -1,0 +1,36 @@
+{
+  "action": "reconciled_no_mutation",
+  "controller_stopped": true,
+  "cycle_observation": {
+    "error": "UnicodeEncodeError: 'cp949' codec can't encode character '\\u2014' in position 158: illegal multibyte sequence",
+    "events": 0,
+    "planned_count": 0,
+    "status": "failed_closed",
+    "submitted_count": 0
+  },
+  "cycle_serial": 389,
+  "evidence_sha256": "1ceae4562a127097a186983baa458bcea42f71787d71a3ae074816db1cb120ca",
+  "feeder_after": {
+    "candidate_cursor": 8898,
+    "serial": 19229,
+    "state_revision": 1011,
+    "submitted_samples": 1618
+  },
+  "feeder_before": {
+    "candidate_cursor": 8898,
+    "serial": 19229,
+    "state_revision": 1011,
+    "submitted_samples": 1618
+  },
+  "interrupted_artifacts": [],
+  "observed_at": "2026-07-12T22:37:52+00:00",
+  "scheduler": {
+    "exact_generation_rows": 1619,
+    "inventory_rows_examined": 1619,
+    "matching_task_ids": [],
+    "max_production_serial": 19229,
+    "production_names_above_feeder_serial": [],
+    "project": "MFT_1MW_2026v1"
+  },
+  "schema": "continuous-refill-cycle-reconciliation-evidence-v1"
+}

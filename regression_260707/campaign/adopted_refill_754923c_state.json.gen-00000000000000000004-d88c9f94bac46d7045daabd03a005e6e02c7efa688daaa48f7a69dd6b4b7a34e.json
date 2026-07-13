@@ -1,0 +1,178 @@
+{
+  "adoption_sha256": "f1490f2cda497c9475fe079fb0a04e5adb7686c6f4c99ae28a0f946a918319a8",
+  "cycle_serial": 0,
+  "initial_count": 250,
+  "initial_cursor_end": 2795,
+  "initial_first_id": 27755,
+  "initial_last_id": 28004,
+  "initial_serial_end": 17611,
+  "last_action": "manual_intervention",
+  "last_evidence": {
+    "action": "manual_intervention",
+    "initial_statuses": {
+      "completed": 5,
+      "failed": 6,
+      "queued": 44,
+      "running": 195
+    },
+    "local3_passed": false,
+    "pause_reasons": [
+      "repeated_runtime_error:d44e42386932a56a:3",
+      "repeated_runtime_error:d44e42386932a56a:4"
+    ],
+    "paused": true,
+    "production_active": 239,
+    "production_invalid": 6,
+    "production_terminal": 11,
+    "production_valid": 5,
+    "production_valid_rate": 0.45454545454545453,
+    "strict_full_rows": 2,
+    "strict_progress": {
+      "growth_at": "2026-07-12T00:27:16.528990+00:00",
+      "observed_rows": 2,
+      "previous_rows": 2,
+      "reasons": []
+    },
+    "target_strict_rows": 3000,
+    "time": "2026-07-12T00:37:50+00:00"
+  },
+  "last_strict_growth_at": "2026-07-12T00:27:16.528990+00:00",
+  "last_strict_rows": 2,
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+  "pause_reasons": [
+    "repeated_runtime_error:d44e42386932a56a:3",
+    "repeated_runtime_error:d44e42386932a56a:4"
+  ],
+  "paused": true,
+  "promoted_at": null,
+  "schema_version": 1,
+  "seed": 260710,
+  "solver_revision": "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a",
+  "state_revision": 4,
+  "target_active": 300,
+  "target_strict_rows": 3000,
+  "task_outcomes": {
+    "27758": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-s754923c-le6b9b9d-17365",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 27758,
+      "terminal_at": "2026-07-12T00:10:37+00:00"
+    },
+    "27763": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-s754923c-le6b9b9d-17370",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 27763,
+      "terminal_at": "2026-07-12T00:24:42+00:00"
+    },
+    "27772": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-s754923c-le6b9b9d-17379",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 27772,
+      "terminal_at": "2026-07-12T00:36:03+00:00"
+    },
+    "27775": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-s754923c-le6b9b9d-17382",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 27775,
+      "terminal_at": "2026-07-12T00:36:03+00:00"
+    },
+    "27794": {
+      "error_fingerprint": "d44e42386932a56a",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=True, converged=0, reason=monitor_missing",
+      "name": "mft-camp-s754923c-le6b9b9d-17401",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 27794,
+      "terminal_at": "2026-07-12T00:26:19+00:00"
+    },
+    "27799": {
+      "error_fingerprint": "1fb366cff3339b71",
+      "error_message": "stderr_pyaedt=A(n) <class 'TypeError'> error occurred while retrieving information for the active AEDT sessions: argument of type 'NoneType' is not iterable",
+      "name": "mft-camp-s754923c-le6b9b9d-17406",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 27799,
+      "terminal_at": "2026-07-12T00:26:20+00:00"
+    },
+    "27804": {
+      "error_fingerprint": "d44e42386932a56a",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=True, converged=0, reason=monitor_missing",
+      "name": "mft-camp-s754923c-le6b9b9d-17411",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 27804,
+      "terminal_at": "2026-07-12T00:13:32+00:00"
+    },
+    "27813": {
+      "error_fingerprint": null,
+      "error_message": null,
+      "name": "mft-camp-s754923c-le6b9b9d-17420",
+      "reason": null,
+      "saturation_columns": [],
+      "state": "valid",
+      "status": "completed",
+      "task_id": 27813,
+      "terminal_at": "2026-07-12T00:28:00+00:00"
+    },
+    "27865": {
+      "error_fingerprint": "1fb366cff3339b71",
+      "error_message": "stderr_pyaedt=A(n) <class 'TypeError'> error occurred while retrieving information for the active AEDT sessions: argument of type 'NoneType' is not iterable",
+      "name": "mft-camp-s754923c-le6b9b9d-17472",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 27865,
+      "terminal_at": "2026-07-12T00:29:20+00:00"
+    },
+    "27880": {
+      "error_fingerprint": "d44e42386932a56a",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=True, converged=0, reason=monitor_missing",
+      "name": "mft-camp-s754923c-le6b9b9d-17487",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 27880,
+      "terminal_at": "2026-07-12T00:31:31+00:00"
+    },
+    "27928": {
+      "error_fingerprint": "d44e42386932a56a",
+      "error_message": "stderr_pyaedt=[thermal] solve rejected before extraction: analyze-call-ok=True, converged=0, reason=monitor_missing",
+      "name": "mft-camp-s754923c-le6b9b9d-17535",
+      "reason": "task_failed",
+      "saturation_columns": [],
+      "state": "invalid",
+      "status": "failed",
+      "task_id": 27928,
+      "terminal_at": "2026-07-11T23:50:42+00:00"
+    }
+  },
+  "updated_at": "2026-07-12T00:37:50+00:00"
+}

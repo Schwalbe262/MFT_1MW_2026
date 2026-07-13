@@ -1,0 +1,104 @@
+{
+  "schema": 1,
+  "environment": {
+    "account": "harry261",
+    "node": "n040",
+    "pyaedt": "0.22.0",
+    "aedt": "2025.2"
+  },
+  "job_transitions": [
+    {
+      "job_id": 732539,
+      "account": "dw16",
+      "terminal_state": "CANCELLED",
+      "elapsed": "00:00:00",
+      "reason": "AssocMaxJobsLimit; cancelled only after replacement was RUNNING"
+    },
+    {
+      "job_id": 732540,
+      "account": "harry261",
+      "terminal_state": "FAILED",
+      "elapsed": "00:00:00",
+      "reason": "SBATCH spool-path artifact mkdir failure; AEDT was not launched"
+    },
+    {
+      "job_id": 732543,
+      "account": "harry261",
+      "terminal_state": "FAILED",
+      "elapsed": "00:00:44",
+      "reason": "synthetic boundary preflight rejected multi-face Current assignment"
+    },
+    {
+      "job_id": 732547,
+      "account": "harry261",
+      "terminal_state": "CANCELLED",
+      "elapsed": "00:02:39",
+      "reason": "partial evidence preserved; solver identity corrected from comm-name to FlexLM PID mapping"
+    },
+    {
+      "job_id": 732549,
+      "account": "harry261",
+      "node": "n040",
+      "terminal_state": "FAILED",
+      "exit_code": "3:0",
+      "elapsed": "00:04:02",
+      "role": "primary two-project overlap and fault injection"
+    },
+    {
+      "job_id": 732554,
+      "account": "harry261",
+      "node": "n040",
+      "terminal_state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:00:34",
+      "slurm_priority": 4294210729,
+      "role": "fresh-Desktop healthy sibling reopen"
+    }
+  ],
+  "primary_evidence": {
+    "desktop_pid": 1278977,
+    "grpc_port": 34197,
+    "projects": ["pilot_A", "pilot_B"],
+    "solver_A_pid": 1279633,
+    "solver_B_pid": 1279899,
+    "overlap_observed_elapsed_s": 52.29784631729126,
+    "solver_A_sigterm_elapsed_s": 57.549617290496826,
+    "minimum_proven_overlap_s": 5.251770973205566,
+    "lmstat_local_electronics_desktop": 1,
+    "lmstat_local_elec_solve_maxwell": 2,
+    "project_local_invalid_setup_failure_observed": true,
+    "grpc_healthy_after_local_failure": true,
+    "solver_A_gone_after_sigterm": true,
+    "solver_B_alive_after_sigterm": true,
+    "grpc_healthy_after_sigterm": true,
+    "faulted_desktop_reuse_safe": false,
+    "faulted_desktop_reuse_reason": "GetSetups and ExportConvergence failed in the poisoned Desktop after solver A was terminated"
+  },
+  "fresh_reopen_evidence": {
+    "job_id": 732554,
+    "desktop_pid": 1293384,
+    "project": "pilot_B",
+    "design": "DesignB",
+    "object_count": 12,
+    "setups": ["Setup1"],
+    "existing_analysis_sweeps": ["Setup1 : LastAdaptive"],
+    "convergence_bytes": 337,
+    "convergence_completed": "N/A",
+    "convergence_data_rows": 0,
+    "available_quantity_count": 12,
+    "identity_intact": true,
+    "solution_index_intact": true,
+    "field_solution_payload_present": false,
+    "fresh_reopen_pass": false,
+    "post_job_local_n040_checkouts": 0
+  },
+  "verdict": {
+    "fault_isolation_contract": "REJECT",
+    "required_policy": "fault -> immediate admit block/quarantine -> Desktop/allocation drain/recycle -> failed task and every non-attested sibling requeue",
+    "same_desktop_reuse_after_fault": "FORBIDDEN",
+    "desktop_global_stop_before_healthy_terminal": "FORBIDDEN",
+    "production_pool_changed": false,
+    "b171_changed": false,
+    "live_pool_activation_authorized_by_this_experiment": false
+  }
+}

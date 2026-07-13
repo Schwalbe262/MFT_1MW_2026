@@ -28,6 +28,13 @@ from module.modeling_260706 import (
     compute_layer_positions,
 )
 from module.input_parameter_260706 import get_tx_y_gaps, set_design_variables
+from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.thermal_probe_contract import (
+    RX_SIDE_FACE_MAX_RULE,
+    RX_SIDE_FACE_MEAN_RULE,
+    RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
+    aggregate_rx_side_faces,
+)
 
 
 def _native_solver(app):
@@ -38,6 +45,76 @@ def _native_solver(app):
 
 _THERMAL_DESIGN_NAME = "icepak_thermal"
 _THERMAL_SETUP_NAME = "ThermalSetup"
+
+
+def _power_value_w(value):
+    match = re.fullmatch(
+        r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([a-zA-Z]*)\s*",
+        str(value),
+    )
+    if not match:
+        raise RuntimeError(f"cannot parse native block power: {value!r}")
+    factors = {"w": 1.0, "mw": 1e-3, "kw": 1e3}
+    unit = match.group(2).lower() or "w"
+    if unit not in factors:
+        raise RuntimeError(f"unsupported native block power unit: {unit!r}")
+    power = float(match.group(1)) * factors[unit]
+    if not math.isfinite(power) or power < 0:
+        raise RuntimeError(f"invalid native block power: {value!r}")
+    return power
+
+
+def _native_block_readback(boundary, obj):
+    """Read a freshly assigned Icepak block through the native OO child tree."""
+    child = getattr(boundary, "_child_object", None)
+    if child is None:
+        raise RuntimeError(
+            f"native boundary child unavailable for {getattr(boundary, 'name', boundary)!r}"
+        )
+    prop_names = set(str(name) for name in (child.GetPropNames() or []))
+    required = {"Block Type", "Use Total Power", "Total Power"}
+    missing = sorted(required - prop_names)
+    if missing:
+        raise RuntimeError(
+            f"native block readback missing properties {missing}: {sorted(prop_names)}"
+        )
+    block_type = str(child.GetPropValue("Block Type"))
+    use_total = child.GetPropValue("Use Total Power")
+    if block_type != "Solid" or str(use_total).strip().lower() not in {
+        "true", "1"
+    }:
+        raise RuntimeError(
+            f"native block contract mismatch: type={block_type!r}, "
+            f"use_total={use_total!r}"
+        )
+    power_w = _power_value_w(child.GetPropValue("Total Power"))
+
+    assignment_prop = next(
+        (name for name in ("Objects", "Assignment", "Parts") if name in prop_names),
+        None,
+    )
+    if assignment_prop is None:
+        raise RuntimeError("native block readback has no assignment property")
+    assignment = child.GetPropValue(assignment_prop)
+    values = list(assignment) if isinstance(assignment, (list, tuple)) else [assignment]
+    expected_name = str(obj.name)
+    names = {str(value).strip().strip('"') for value in values}
+    if expected_name not in names:
+        editor = getattr(obj, "_oeditor", None)
+        get_name = getattr(editor, "GetObjectNameByID", None)
+        if callable(get_name):
+            converted = set()
+            for value in values:
+                try:
+                    converted.add(str(get_name(int(value))))
+                except (TypeError, ValueError, OverflowError):
+                    converted.add(str(value).strip().strip('"'))
+            names = converted
+    if names != {expected_name}:
+        raise RuntimeError(
+            f"native block assignment mismatch: {names!r} != {{{expected_name!r}}}"
+        )
+    return {"object": expected_name, "power_w": power_w}
 
 
 def _native_design_name(design):
@@ -839,7 +916,29 @@ class LossAllocator:
     def __init__(self, sim, eighth=False, mode=None):
         self.sim = sim
         self.df = sim.df_plus
-        self.loss_map = getattr(sim, "loss_map_phys", None) or getattr(sim, "loss_map", {})
+        physical_loss_map = getattr(sim, "loss_map_phys", None)
+        contract_version = ""
+        if "core_material_contract_version" in self.df.columns:
+            contract_version = str(
+                self.df["core_material_contract_version"].iloc[0] or ""
+            ).strip()
+        physics_revision = (
+            str(self.df["physics_data_revision"].iloc[0] or "").strip()
+            if "physics_data_revision" in self.df.columns else ""
+        )
+        native_contract = physics_revision == PHYSICS_DATA_REVISION
+        if native_contract and not physical_loss_map:
+            raise RuntimeError(
+                "native-lamination physics revision requires loss_map_phys; "
+                "raw EM losses cannot be injected into Icepak"
+            )
+        self.loss_map = physical_loss_map or getattr(sim, "loss_map", {})
+        self.core_loss_contract_version = contract_version or "legacy_unspecified"
+        self.core_loss_source = (
+            "aedt_native_lamination_loss_attested_then_margin_adjusted"
+            if native_contract else "legacy_loss_map_fallback_allowed"
+        )
+        self.native_core_contract = native_contract
         self.mode = mode or ("eighth" if eighth else "full")
         self.eighth = self.mode == "eighth"
 
@@ -939,6 +1038,36 @@ def _rx_layout(df, prefix):
     x_pos = compute_layer_positions(slx / 2, cw2, gaps)
     y_pos = compute_layer_positions(sly / 2, cw2, gaps)
     return N, cw2, x_pos, y_pos
+
+
+def _rx_side_face_x_ranges(df, offset_x):
+    """Return transformer-outward/inward x ranges for one side winding.
+
+    ``_rx_layout`` describes a winding about its local leg centre with two
+    x-directed packs at ``+/-x``.  For the negative-x side leg the positive
+    local pack faces the transformer centre; for the positive-x mirror the
+    negative local pack does.  Deriving the direction from ``offset_x`` keeps
+    the same rule valid for symmetry and full models.
+    """
+    centre = float(offset_x)
+    if not math.isfinite(centre) or math.isclose(centre, 0.0, abs_tol=1e-12):
+        raise ValueError("Rx-side probe requires a non-zero side-leg offset")
+    _n, cw, x_pos, _y_pos = _rx_layout(df, "side")
+    x_in = x_pos[0] - cw / 2.0
+    x_out = x_pos[-1] + cw / 2.0
+    if not (math.isfinite(x_in) and math.isfinite(x_out) and 0 <= x_in < x_out):
+        raise ValueError(
+            f"invalid Rx-side probe radial bounds: inner={x_in}, outer={x_out}"
+        )
+    inward_sign = -1.0 if centre > 0 else 1.0
+
+    def _ordered(sign):
+        return tuple(sorted((centre + sign * x_in, centre + sign * x_out)))
+
+    return {
+        "outward": _ordered(-inward_sign),
+        "inward": _ordered(inward_sign),
+    }
 
 
 def _partition_rx_turns(windings, n_explicit):
@@ -1199,7 +1328,7 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
 
     sheets = []
 
-    def _sheet(name, orientation, origin, sizes):
+    def _sheet(name, orientation, origin, sizes, *, required=False):
         try:
             obj = ipk.modeler.create_rectangle(
                 orientation=orientation, origin=[f"{v}mm" for v in origin],
@@ -1209,6 +1338,10 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
             sheets.append(obj)
             return obj
         except Exception as e:
+            if required:
+                raise RuntimeError(
+                    f"required thermal probe sheet {name} failed"
+                ) from e
             logging.warning(f"probe sheet {name} failed: {e}")
             return None
 
@@ -1257,7 +1390,45 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
     _rx_probes("main", "Rx_main", 0.0)
     if int(df["N2_side"].iloc[0]) > 0:
         off = l1 + l2 + l1 / 2
-        _rx_probes("side", "Rx_side", -off)
+
+        def _rx_side_probes(name, offset_x):
+            """Probe both radial packs, classified relative to x=0."""
+            _n, cw, _x_pos, y_pos = _rx_layout(df, "side")
+            zh2 = 0.48 * nwh2
+            za, zb = _z_range(zh2)
+            y_in = y_pos[0] - cw / 2.0
+            y_out = y_pos[-1] + cw / 2.0
+            ys = y_in if eighth else -y_out
+            xs = offset_x if offset_x < 0 else (
+                -1.0 if eighth else offset_x
+            )
+            # Keep the airflow-leeward plane as an explicit diagnostic.  The
+            # established Rx-side surrogate target is aggregated below from
+            # the two transformer-relative radial faces instead.
+            _sheet(
+                f"Tprobe_{name}_flow_leeward", "YZ", [xs, ys, za],
+                [y_out - y_in, zb - za],
+            )
+            ranges = _rx_side_face_x_ranges(df, offset_x)
+            for relation, (x0, x1) in ranges.items():
+                # ``side`` is the historical outward field name and remains
+                # available byte-for-byte for the negative-x physical group.
+                if relation == "outward":
+                    probe_name = f"Tprobe_{name}_side"
+                else:
+                    # Use an explicit side-1 name so the raw left-face field
+                    # cannot collide with the all-side inner aggregate.
+                    physical_name = "Rx_side1" if name == "Rx_side" else name
+                    probe_name = f"Tprobe_{physical_name}_inner"
+                _sheet(
+                    probe_name, "XZ", [x0, 0, za],
+                    [zb - za, x1 - x0],
+                    required=True,
+                )
+
+        _rx_side_probes("Rx_side", -off)
+        if mode == "full":
+            _rx_side_probes("Rx_side2", +off)
 
     # ---- 코어: 올바른 깊이 중심에서 center/side leg + top yoke ----
     zc = 0.48 * (h1 + 2 * l1)
@@ -1335,8 +1506,9 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
     alloc = LossAllocator(sim, eighth=eighth, mode=mode)
     injected = {}
     rx_power_balance = []
+    native_core_readbacks = []
 
-    def _block(obj, watts):
+    def _block(obj, watts, *, native_core_readback=False):
         w = max(float(watts), 0.0)
         if not math.isfinite(w):
             raise ValueError(f"non-finite thermal loss for {obj.name}: {w}")
@@ -1352,6 +1524,16 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
             },
         )
         injected[obj.name] = w
+        if native_core_readback:
+            readback = _native_block_readback(boundary, obj)
+            if not math.isclose(
+                readback["power_w"], w, rel_tol=1e-12, abs_tol=1e-9
+            ):
+                raise RuntimeError(
+                    f"native Icepak block power mismatch for {obj.name}: "
+                    f"{readback['power_w']} != {w}"
+                )
+            native_core_readbacks.append(readback)
 
     # Tx 턴별
     for w in objs["Tx"]:
@@ -1407,6 +1589,7 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
 
     # 코어 그룹: loss_map_phys에 있는 키 우선, 없으면(풀 열해석 + 대칭 EM 조합의 미러) 대응 그룹
     n_group = int(df["n_core_group"].iloc[0])
+    core_expected_injected_w = 0.0
     for c in objs["core"]:
         try:
             i = int(c.name.split("_")[1])
@@ -1415,10 +1598,21 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
         key = f"P_{c.name}"
         if key not in alloc.loss_map:
             key = f"P_core_{n_group + 1 - i}"  # y-미러 그룹
-        _block(c, alloc.turn_loss(key, c.name))
+        core_power = alloc.turn_loss(key, c.name)
+        core_expected_injected_w += core_power
+        _block(
+            c, core_power, native_core_readback=alloc.native_core_contract
+        )
 
     # 콜드플레이트/냉각판은 고정온도 경계라 열원 주입 생략
     sim.thermal_injected = injected
+    sim.thermal_core_loss_contract_version = (
+        alloc.core_loss_contract_version
+    )
+    sim.thermal_core_loss_source = alloc.core_loss_source
+    sim.thermal_core_loss_correction_factor = float(
+        df["core_loss_correction_factor"].iloc[0]
+    ) if "core_loss_correction_factor" in df.columns else float("nan")
     if "n_explicit_turns" in df.columns:
         n_explicit = int(df["n_explicit_turns"].iloc[0])
     else:
@@ -1434,6 +1628,71 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
     tx_sum = sum(v for k, v in injected.items() if k.startswith("Tx_"))
     rx_sum = sum(v for k, v in injected.items() if k.startswith("Rx_"))
     core_sum = sum(v for k, v in injected.items() if k.startswith("core"))
+    core_balance_abs_error_w = abs(core_sum - core_expected_injected_w)
+    core_balance_rel_error = core_balance_abs_error_w / max(
+        abs(core_expected_injected_w), 1e-12
+    )
+    if not math.isclose(
+        core_sum, core_expected_injected_w, rel_tol=1e-12, abs_tol=1e-9
+    ):
+        raise RuntimeError(
+            "Icepak core-source power balance failed: "
+            f"assigned={core_sum:.12g}W, "
+            f"expected_margin_adjusted={core_expected_injected_w:.12g}W"
+        )
+    native_core_sum = (
+        sum(item["power_w"] for item in native_core_readbacks)
+        if alloc.native_core_contract else float("nan")
+    )
+    if alloc.native_core_contract and not math.isclose(
+        native_core_sum, core_expected_injected_w,
+        rel_tol=1e-12, abs_tol=1e-9,
+    ):
+        raise RuntimeError(
+            "native Icepak core-source sum mismatch: "
+            f"native={native_core_sum:.12g}W, "
+            f"expected={core_expected_injected_w:.12g}W"
+        )
+    full_core_expected_w = float("nan")
+    df_loss_summary = getattr(sim, "df_loss_summary", None)
+    if df_loss_summary is not None and "P_core_total" in df_loss_summary.columns:
+        full_core_expected_w = float(df_loss_summary["P_core_total"].iloc[0])
+    elif mode == "full":
+        full_core_expected_w = core_expected_injected_w
+    restore_factor = (
+        full_core_expected_w / core_expected_injected_w
+        if math.isfinite(full_core_expected_w)
+        and core_expected_injected_w > 0 else float("nan")
+    )
+    native_restored_full_w = (
+        native_core_sum * restore_factor
+        if math.isfinite(native_core_sum) and math.isfinite(restore_factor)
+        else float("nan")
+    )
+    restored_rel_error = (
+        abs(native_restored_full_w - full_core_expected_w)
+        / max(abs(full_core_expected_w), 1e-12)
+        if math.isfinite(native_restored_full_w)
+        and math.isfinite(full_core_expected_w) else float("nan")
+    )
+    if alloc.native_core_contract and (
+        not math.isfinite(restored_rel_error) or restored_rel_error > 1e-12
+    ):
+        raise RuntimeError(
+            "native Icepak restored full core power mismatch: "
+            f"restored={native_restored_full_w!r}, "
+            f"EM_margin_adjusted={full_core_expected_w!r}"
+        )
+    sim.thermal_core_expected_injected_w = core_expected_injected_w
+    sim.thermal_core_requested_wrapper_echo_w = core_sum
+    sim.thermal_core_native_readback_w = native_core_sum
+    sim.thermal_core_restore_factor = restore_factor
+    sim.thermal_core_native_restored_full_w = native_restored_full_w
+    sim.thermal_core_full_expected_margin_adjusted_w = full_core_expected_w
+    sim.thermal_core_native_restored_rel_error = restored_rel_error
+    sim.thermal_core_native_readback_count = len(native_core_readbacks)
+    sim.thermal_core_power_balance_abs_error_w = core_balance_abs_error_w
+    sim.thermal_core_power_balance_rel_error = core_balance_rel_error
     logging.warning(f"thermal injection totals [W]: Tx={tx_sum:.2f} Rx={rx_sum:.2f} core={core_sum:.2f} "
                  f"(eighth={eighth}, n_obj={len(injected)})")
     for k, v in injected.items():
@@ -1714,6 +1973,14 @@ def run_thermal_analysis(sim):
             if sheet.name.startswith("Tprobe_core_top_yoke")
         ],
     }
+    rx_side_outer_sheet_names = [
+        sheet.name for sheet in probe_sheets
+        if sheet.name in {"Tprobe_Rx_side_side", "Tprobe_Rx_side2_side"}
+    ]
+    rx_side_inner_sheet_names = [
+        sheet.name for sheet in probe_sheets
+        if sheet.name in {"Tprobe_Rx_side1_inner", "Tprobe_Rx_side2_inner"}
+    ]
     aggregate_core_cols = []
     if all(core_region_sheet_names.values()):
         aggregate_core_cols = [
@@ -1722,7 +1989,18 @@ def run_thermal_analysis(sim):
             "Tprobe_core_top_yoke_max", "Tprobe_core_top_yoke_mean",
             "Tprobe_core_center_max", "Tprobe_core_center_mean",
         ]
-    expected_cols = list(dict.fromkeys(field_expected_cols + aggregate_core_cols))
+    aggregate_rx_side_cols = []
+    if rx_side_outer_sheet_names and (
+        len(rx_side_outer_sheet_names) == len(rx_side_inner_sheet_names)
+    ):
+        aggregate_rx_side_cols = [
+            "Tprobe_Rx_side_outer_max", "Tprobe_Rx_side_outer_mean",
+            "Tprobe_Rx_side_inner_max", "Tprobe_Rx_side_inner_mean",
+            "Tprobe_Rx_side_leeward_max", "Tprobe_Rx_side_leeward_mean",
+        ]
+    expected_cols = list(dict.fromkeys(
+        field_expected_cols + aggregate_core_cols + aggregate_rx_side_cols
+    ))
     optional_cols = set()
     if int(df["N1_side"].iloc[0]) == 0:
         optional_cols.update({"Tprobe_Tx_side_max", "Tprobe_Tx_side_mean"})
@@ -1773,6 +2051,15 @@ def run_thermal_analysis(sim):
             "thermal_rx_power_balance_max_abs_w": [rx_balance_max_abs],
             "thermal_rx_expected_power_w": [rx_expected_power],
             "thermal_rx_assigned_power_w": [rx_assigned_power],
+            "thermal_rx_side_probe_contract_version": [
+                RX_SIDE_FACE_PROBE_CONTRACT_VERSION
+            ],
+            "thermal_rx_side_probe_max_rule": [RX_SIDE_FACE_MAX_RULE],
+            "thermal_rx_side_probe_mean_rule": [RX_SIDE_FACE_MEAN_RULE],
+            "thermal_rx_side_probe_selected_face": [""],
+            "thermal_rx_side_probe_face_count": [
+                len(rx_side_outer_sheet_names) + len(rx_side_inner_sheet_names)
+            ],
             "T_max_Tx": [float("nan")],
             "T_max_Rx_main": [float("nan")],
             "T_max_Rx_side": [float("nan")],
@@ -1878,6 +2165,23 @@ def run_thermal_analysis(sim):
             temps["Tprobe_core_center_max"] = maximum
             temps["Tprobe_core_center_mean"] = mean
 
+    rx_side_selected_face = ""
+
+    def _refresh_rx_side_face_aggregates():
+        """Aggregate complete inner/outer face sets without averaging faces."""
+        nonlocal rx_side_selected_face
+        if not aggregate_rx_side_cols:
+            return
+        aggregate, selected = aggregate_rx_side_faces(
+            temps, rx_side_outer_sheet_names, rx_side_inner_sheet_names
+        )
+        if aggregate:
+            # Compatibility target: its revised, versioned meaning is the
+            # hottest transformer-inward/outward radial face.  Pair the mean
+            # from that same face; never average unlike or unequal surfaces.
+            temps.update(aggregate)
+            rx_side_selected_face = selected
+
     field_summary_attempts = 0
     for attempt in range(1, 4):
         missing_entries = [entry for entry in probe if entry[1] not in temps]
@@ -1888,6 +2192,7 @@ def run_thermal_analysis(sim):
             _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
             temps.update(_field_summary_bulk(missing_entries))
             _refresh_core_probe_aggregates()
+            _refresh_rx_side_face_aggregates()
         except Exception as e:
             logging.warning(f"[thermal] field summary attempt {attempt}/3 failed: {e}")
         if all(col in temps for col in required_expected_cols):
@@ -1895,6 +2200,7 @@ def run_thermal_analysis(sim):
         if attempt < 3:
             time.sleep(10)
     _refresh_core_probe_aggregates()
+    _refresh_rx_side_face_aggregates()
     n_fs = sum(1 for col in field_expected_cols if col in temps)
 
     n_calc = 0
@@ -1957,6 +2263,52 @@ def run_thermal_analysis(sim):
         "thermal_rx_power_balance_max_abs_w": [rx_balance_max_abs],
         "thermal_rx_expected_power_w": [rx_expected_power],
         "thermal_rx_assigned_power_w": [rx_assigned_power],
+        "thermal_rx_side_probe_contract_version": [
+            RX_SIDE_FACE_PROBE_CONTRACT_VERSION
+        ],
+        "thermal_rx_side_probe_max_rule": [RX_SIDE_FACE_MAX_RULE],
+        "thermal_rx_side_probe_mean_rule": [RX_SIDE_FACE_MEAN_RULE],
+        "thermal_rx_side_probe_selected_face": [rx_side_selected_face],
+        "thermal_rx_side_probe_face_count": [
+            len(rx_side_outer_sheet_names) + len(rx_side_inner_sheet_names)
+        ],
+        "thermal_core_loss_contract_version": [
+            sim.thermal_core_loss_contract_version
+        ],
+        "thermal_core_loss_source": [sim.thermal_core_loss_source],
+        "thermal_core_loss_correction_factor": [
+            sim.thermal_core_loss_correction_factor
+        ],
+        "thermal_core_expected_injected_w": [
+            sim.thermal_core_expected_injected_w
+        ],
+        "thermal_core_requested_wrapper_echo_w": [
+            sim.thermal_core_requested_wrapper_echo_w
+        ],
+        "thermal_core_native_readback_w": [
+            sim.thermal_core_native_readback_w
+        ],
+        "thermal_core_restore_factor": [
+            sim.thermal_core_restore_factor
+        ],
+        "thermal_core_native_restored_full_w": [
+            sim.thermal_core_native_restored_full_w
+        ],
+        "thermal_core_full_expected_margin_adjusted_w": [
+            sim.thermal_core_full_expected_margin_adjusted_w
+        ],
+        "thermal_core_native_restored_rel_error": [
+            sim.thermal_core_native_restored_rel_error
+        ],
+        "thermal_core_native_readback_count": [
+            sim.thermal_core_native_readback_count
+        ],
+        "thermal_core_power_balance_abs_error_w": [
+            sim.thermal_core_power_balance_abs_error_w
+        ],
+        "thermal_core_power_balance_rel_error": [
+            sim.thermal_core_power_balance_rel_error
+        ],
         "T_max_Tx": [group_values["T_max_Tx"]],
         "T_max_Rx_main": [group_values["T_max_Rx_main"]],
         "T_max_Rx_side": [group_values["T_max_Rx_side"]],

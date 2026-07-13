@@ -1,0 +1,78 @@
+{
+  "schema": "mft-gui-timing-provenance-v1",
+  "project_name": "simulation481",
+  "launch": {
+    "command": "python run_simulation_260706.py --hold --thermal",
+    "python_process_id": 150864,
+    "python_started_at": "2026-07-12T23:36:12+09:00",
+    "desktop_process_id": 169936,
+    "desktop_started_at": "2026-07-12T23:47:50+09:00",
+    "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+    "solver_dirty": true,
+    "input_defaults_sha256": "68DDC13194E7539F56D8FA1180657453D0B10C50C2BC94061175A02AC545FD7F",
+    "runner_sha256": "328285E7785CB0F8345DBCC7DB5B827A6A3978FE59F143CFB4B9B50EA1C1AB30",
+    "thermal_module_sha256": "6DD75EDF1F97A11C379E649E146100CFA25856383BA71AD0850D8F8393386DB5"
+  },
+  "input_recovery": {
+    "random_geometry_values": "exact AEDT VariableProp readback",
+    "fixed_values": "b171 get_drawing_default_params plus --thermal/--hold overrides",
+    "complete": true
+  },
+  "input_parameters": {
+    "N1_main": 7, "N1_side": 0, "N2_main": 14, "N2_side": 56,
+    "l1": 55.0, "l2": 459.0, "h1": 644.0, "w1": 232.0,
+    "n_core_group": 2, "core_plate_t": 29.7, "core_plate_on": 1,
+    "cw1": 8.92, "gap1": 2.7, "cw2": 0.954, "gap2": 1.627,
+    "nwh1": 568.3, "nwh2": 522.0,
+    "cc_w2c_space_x": 30.4, "cc_w2c_space_y": 34.9,
+    "w2c_w1c_space_x": 69.7, "w2c_w1c_space_y": 39.9,
+    "w1c_w2s_space_x": 49.6, "w2s_w1s_space_x": 0.0,
+    "w1s_w2s_space_y": 0.0, "w1s_cs_space_x": 40.8,
+    "cs_w1s_space_y": 51.5,
+    "wcp_t": 28.9, "wcp_pad_t": 2.0, "wcp_len_x": 209.7,
+    "wcp_on": 1, "core_plate_pad_t": 2.0,
+    "core_depth_min": 60.0, "core_depth_max": 120.0,
+    "round_corner": 0, "corner_radius": 10.0, "corner_segments": 4,
+    "full_model": 0, "max_passes": 10, "percent_error": 1.5,
+    "min_converged": 2, "matrix_percent_error": 1.5,
+    "matrix_max_passes": 20, "matrix_min_converged": 1,
+    "freq": 1000.0, "V1_rms": 1000.0, "I1_rated": 1000.0,
+    "I2_rated": 100.0, "I2_phase_deg": 0.0, "P_target": 0.0,
+    "V2_rms": 10000.0, "core_cm": 1.377, "core_x": 1.51,
+    "core_y": 1.74, "matrix_on": 1, "loss_on": 1,
+    "thermal_on": 1, "plate_temp": 50.0, "air_temp": 50.0,
+    "fan_velocity": 1.5, "k_ins": 0.2, "core_k_thermal": 2.0,
+    "n_explicit_turns": 0, "rx_mesh_mode": "skin", "keep_project": 1,
+    "loss_sym_on": 1, "thermal_symmetry": "eighth",
+    "matrix_skin_mesh": 0, "fan_config": "dual", "loss_from_copy": 1,
+    "thermal_max_iterations": 250, "conductor_temp_C": 80.0
+  },
+  "timing": {
+    "matrix": {
+      "start": "2026-07-12T23:50:45+09:00", "stop": "2026-07-12T23:55:54+09:00",
+      "elapsed_seconds": 309, "final_tetrahedra": 135826, "status": "Normal Completion",
+      "profile": "DV338_S299_V0.profile",
+      "profile_sha256": "47C1E2D7CDE0A46C5D0227D7002B19BE87AB7C8E3D1CA14A0B9DE5AE5D6170D7"
+    },
+    "loss": {
+      "start": "2026-07-12T23:57:26+09:00", "stop": "2026-07-13T00:24:24+09:00",
+      "elapsed_seconds": 1617, "final_tetrahedra": 805201, "status": "Normal Completion",
+      "profile": "DV363_S299_V0.profile",
+      "profile_sha256": "631F759594873A2FB90A512ED5266E08EF68633976F369B8D81C10042F809C35"
+    },
+    "icepak": {
+      "start": "2026-07-13T00:26:49+09:00", "stop": "2026-07-13T00:34:31+09:00",
+      "elapsed_seconds": 461, "mesh_elapsed_seconds": 56,
+      "nodes": 1393156, "faces": 243611, "cells": 1285040,
+      "mesh_cpu_seconds": 35, "mesh_real_seconds": 34,
+      "initialization_cpu_seconds": 27, "initialization_real_seconds": 27,
+      "solve_cpu_seconds": 307, "solve_real_seconds": 305,
+      "status": "Normal Completion", "profile": "DV145_S131_V0.profile",
+      "profile_sha256": "F6836AAA04A8E383A778FCB93F339539F616D91EDAD5B4144DF005B26AC29E8C"
+    },
+    "solver_stage_sum_seconds": 2387,
+    "python_start_to_icepak_stop_seconds": 3499,
+    "non_profile_overhead_seconds": 1112
+  },
+  "project_aedt_sha256": "8000725CDA8207687BE7F34DE8D959A4B237861B1D2D99F6A93A7049B7F0B753"
+}

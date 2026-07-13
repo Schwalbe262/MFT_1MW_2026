@@ -1,0 +1,35 @@
+{
+  "accepted_count": 2,
+  "accepted_task_ids": [
+    30469,
+    30470
+  ],
+  "action": "reconciled_committed",
+  "controller_stopped": true,
+  "cycle_error": "ProjectCapacityError: failed to read MFT project task capacity: 500 Server Error: Internal Server Error for url: http://127.0.0.1:8000/api/tasks?limit=10000&name_prefix=mft-&status=queued%2Cattaching%2Crunning",
+  "cycle_failed_generation_revision": 2,
+  "cycle_serial": 467,
+  "evidence_sha256": "f32bb28fbec01506663a1a2b0000c8c578806963d811c23b90bc152f2b6cc852",
+  "feeder_before": {
+    "candidate_cursor": 10258,
+    "candidate_raw_index": 10257,
+    "serial": 19587,
+    "state_revision": 1033,
+    "submitted_samples": 1976
+  },
+  "feeder_before_sha256": "2dc3d80612c4edec9185796795ca080483e124e86c4b692900ad779785dc4a0b",
+  "feeder_target": {
+    "candidate_cursor": 10270,
+    "candidate_raw_index": 10269,
+    "serial": 19589,
+    "submitted_samples": 1978
+  },
+  "feeder_target_sha256": "ebe60ca66b82efbfa1c9dcd1821911d22f7990af8ac2fbf82c330d0c4fdbdcde",
+  "observed_at": "2026-07-13T01:02:30+00:00",
+  "scheduler_identity_sha256": "605e3135fc6a056a64d15e2745619fcfddadca510e73cf2a944180b84be3715b",
+  "scheduler_status_counts": {
+    "running": 2
+  },
+  "schema": "continuous-refill-cycle-reconciliation-evidence-v1",
+  "unaccepted_count": 1
+}

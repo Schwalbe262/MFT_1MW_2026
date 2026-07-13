@@ -1,0 +1,82 @@
+{
+  "schema": "mft-1k101-native-full-vdrive-ab-prepared-v1",
+  "status": "prepared_waiting_for_eighth_40c7552_pass",
+  "execute": false,
+  "submit_only_after_task_ids_pass": [30421, 30422, 30423],
+  "solver_revision": "40c75523dc593110b179d31c5a4d7fe376ca7fcb",
+  "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+  "base_params_file": "regression_260707/verify/1k101_native_ab_rerun_441fb7f.json",
+  "base_params_sha256": "6d69ac82a42676f3f3e63ac7162b7970a962e233d31246efb6301b6529e549d0",
+  "geometry_contract": "exact same simulation481 gross geometry and excitation inputs as the eighth A/B",
+  "execution_mode": "isolated non-graphical full voltage-driven AC Magnetic",
+  "parameter_overrides": {
+    "full_model": 1,
+    "loss_sym_on": 0,
+    "loss_from_copy": 0,
+    "thermal_symmetry": "full",
+    "thermal_on": 0
+  },
+  "submission_contract": {
+    "project": "MFT_1MW_2026v1",
+    "required_project_cap": 300,
+    "priority": 10,
+    "cpus": 4,
+    "memory_mb": 32768,
+    "timeout_seconds": 14400,
+    "cli_flags": "--headless",
+    "scheduling_profile": "fea_bursty",
+    "shared_lock": "regression_260707/logs/controller_release_6a870_runtime/locks/campaign_mutation.lock",
+    "controller_safe_pause_and_three_slot_reservation_required": true
+  },
+  "placement": {
+    "intent": "three distinct physical nodes without exclusive-node requests",
+    "selection": "read live allocations immediately before each POST; choose a different hard account and a distinct low-load preferred node",
+    "hard_accounts": ["dhj02", "jji0930", "r1jae262"],
+    "submit_sequentially": true,
+    "require_actual_allocation_node_readback_before_next_post": true,
+    "duplicate_actual_node_action": "stop before submitting the next candidate; do not cancel existing tasks",
+    "record_fields": [
+      "task_id",
+      "requested_account_name",
+      "requested_node_name",
+      "assigned_allocation",
+      "actual_allocation_account",
+      "actual_allocation_node",
+      "actual_slurm_job_id",
+      "node_cpu_busy_percent_at_attach",
+      "node_memory_used_percent_at_attach"
+    ],
+    "exclusive_node": false
+  },
+  "candidates": [
+    {
+      "lamination_factor": 1.0,
+      "name": "mft-ab1k101-kf100-full-vdrive-s40c7552",
+      "workdir": "ab1k101_kf100_full_vdrive_s40c7552",
+      "parameter_digest": "7450015cf486bb1e"
+    },
+    {
+      "lamination_factor": 0.85,
+      "name": "mft-ab1k101-kf085-full-vdrive-s40c7552",
+      "workdir": "ab1k101_kf085_full_vdrive_s40c7552",
+      "parameter_digest": "9cd4655987947372"
+    },
+    {
+      "lamination_factor": 0.7,
+      "name": "mft-ab1k101-kf070-full-vdrive-s40c7552",
+      "workdir": "ab1k101_kf070_full_vdrive_s40c7552",
+      "parameter_digest": "fe2dae7925a848e2"
+    }
+  ],
+  "acceptance": {
+    "all_three_terminal_completed": true,
+    "loss_report_flux_basis": "full_voltage_driven_physical_amplitude",
+    "loss_report_to_physical_flux_factor": 1.0,
+    "material_readback_exact": true,
+    "geometry_relative_error_max": 1e-9,
+    "faraday_relative_error_max": 0.01,
+    "induced_vs_source_peak_relative_error_max": 0.05,
+    "native_loss_vs_Bavg_integral_relative_error_max": 0.02,
+    "kf_material_B_ratio_relative_tolerance": 0.05
+  }
+}

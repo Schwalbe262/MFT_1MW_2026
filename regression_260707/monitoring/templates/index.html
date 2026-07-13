@@ -32,6 +32,32 @@
       <div><strong>확인이 필요합니다</strong><ul id="alert-list"></ul></div>
     </section>
 
+    <section class="parallel-control-panel" aria-labelledby="parallel-control-title">
+      <div class="parallel-control-heading">
+        <div>
+          <p class="eyebrow">LOCAL OPERATOR CONTROL · MFT ONLY</p>
+          <h2 id="parallel-control-title">MFT 병렬 실행 목표</h2>
+          <p>queued + attaching + running 합계를 지정한 수로 유지합니다. IPMSM 프로젝트에는 적용되지 않습니다.</p>
+        </div>
+        <form id="parallel-target-form" class="parallel-target-form" autocomplete="off">
+          <label for="parallel-target-input">유지할 작업 수</label>
+          <div>
+            <input id="parallel-target-input" name="target" type="number" min="1" max="300" step="1" inputmode="numeric" disabled required>
+            <button id="parallel-target-button" type="submit" disabled>목표 적용</button>
+          </div>
+        </form>
+      </div>
+      <div class="parallel-live-grid" aria-label="MFT 실시간 작업 상태">
+        <div><span>현재 목표</span><strong id="parallel-current-target">—</strong></div>
+        <div><span>논리 active</span><strong id="parallel-logical-active">—</strong></div>
+        <div><span>Queued</span><strong id="parallel-queued">—</strong></div>
+        <div><span>Attaching</span><strong id="parallel-attaching">—</strong></div>
+        <div><span>Running</span><strong id="parallel-running">—</strong></div>
+      </div>
+      <p id="parallel-target-status" class="parallel-target-status" aria-live="polite">Scheduler 연결을 확인하는 중입니다.</p>
+      <p class="parallel-control-note">목표를 낮춰도 running/attaching 작업은 중단하지 않습니다. 감소가 필요하면 controller가 시작 전으로 확인된 MFT queued 작업만 정리합니다.</p>
+    </section>
+
     <section class="pipeline-panel" aria-labelledby="pipeline-title">
       <div class="section-heading compact">
         <div><p class="eyebrow">LIVE PIPELINE</p><h2 id="pipeline-title">전체 진행 단계</h2></div>
@@ -46,8 +72,8 @@
         <div id="data-freshness" class="freshness">—</div>
       </div>
       <div class="metric-grid data-metrics">
-        <article class="metric-card primary"><span>누적 데이터</span><strong id="data-total">—</strong><small>train dataset</small></article>
-        <article class="metric-card"><span>EM + Thermal 완전 데이터</span><strong id="data-complete">—</strong><small id="data-quality-detail">—</small></article>
+        <article class="metric-card primary"><span>최신 revision 학습 가능</span><strong id="data-total">—</strong><small id="data-strict-detail">pin — · strict full</small></article>
+        <article class="metric-card"><span>전체 수집 데이터</span><strong id="data-raw-total">—</strong><small id="data-quality-detail">—</small></article>
         <article class="metric-card"><span>최근 1시간</span><strong id="data-throughput">—</strong><small id="data-throughput-detail">—</small></article>
         <article class="metric-card"><span>3,000개 예상 도달</span><strong id="data-eta">—</strong><small id="data-stall">—</small></article>
       </div>
@@ -69,6 +95,18 @@
           </dl>
         </article>
       </div>
+      <article class="panel stage-timing-panel" aria-labelledby="stage-timing-title">
+        <div class="panel-title">
+          <div><h3 id="stage-timing-title">최근 시뮬레이션 단계별 소요시간</h3><p>solver 결과의 실제 timing 필드 기준</p></div>
+          <span id="stage-timing-window" class="mono-chip">timing 데이터 없음</span>
+        </div>
+        <div class="stage-timing-grid">
+          <div class="stage-timing-card"><span>Matrix 평균</span><strong id="stage-time-matrix-mean">—</strong><small id="stage-time-matrix-detail">중앙값 — · n=0</small></div>
+          <div class="stage-timing-card"><span>Loss 평균</span><strong id="stage-time-loss-mean">—</strong><small id="stage-time-loss-detail">중앙값 — · n=0</small></div>
+          <div class="stage-timing-card"><span>Icepak 평균</span><strong id="stage-time-icepak-mean">—</strong><small id="stage-time-icepak-detail">중앙값 — · n=0</small></div>
+          <div class="stage-timing-card total"><span>합계 평균</span><strong id="stage-time-total-mean">—</strong><small id="stage-time-total-detail">중앙값 — · n=0</small></div>
+        </div>
+      </article>
     </section>
 
     <section aria-labelledby="models-title">
@@ -80,15 +118,34 @@
         <article class="panel table-panel">
           <div class="table-scroll">
             <table>
-              <thead><tr><th>출력 모델</th><th>학습/검증</th><th>R²</th><th>RMSE</th><th>MAPE</th><th>P90</th><th>상태</th></tr></thead>
+              <thead><tr><th>출력 모델</th><th>데이터 근거</th><th>R²</th><th>RMSE</th><th>MAPE</th><th>P90</th><th>상태</th></tr></thead>
               <tbody id="model-table"></tbody>
             </table>
           </div>
         </article>
         <article class="panel chart-panel model-chart-panel">
-          <div class="panel-title"><div><h3 id="model-chart-title">모델을 선택하세요</h3><p>체크포인트별 holdout 성능</p></div><span id="model-trained-at" class="muted">—</span></div>
-          <svg id="model-chart" class="chart" viewBox="0 0 620 260" role="img" aria-label="모델 체크포인트별 성능"></svg>
-          <p id="model-chart-empty" class="empty-state">왼쪽 표에서 모델 행을 선택하면 추세를 표시합니다.</p>
+          <div class="panel-title"><div><h3 id="model-chart-title">모델을 선택하세요</h3><p id="model-evaluation-kind">활성 모델과 체크포인트 CV를 구분해 표시합니다.</p></div><span id="model-trained-at" class="muted">—</span></div>
+          <section class="model-plot-block" aria-labelledby="model-parity-title">
+            <div class="model-plot-heading"><h4 id="model-parity-title">Parity plot</h4><span id="model-parity-meta" class="muted">—</span></div>
+            <svg id="model-parity-chart" class="chart parity-chart" viewBox="0 0 620 300" role="img" aria-label="실제값과 교차검증 예측값 parity plot"></svg>
+            <p id="model-parity-empty" class="empty-state">검증된 parity 데이터가 없습니다.</p>
+          </section>
+          <section class="model-plot-block history-plot" aria-labelledby="model-history-title">
+            <div class="model-plot-heading history-plot-heading">
+              <div><h4 id="model-history-title">체크포인트 CV R² 추세</h4><span class="history-axis-note">학습 데이터 수 기준</span></div>
+              <label class="history-metric-control" for="model-history-metric">
+                <span>지표</span>
+                <select id="model-history-metric" aria-label="체크포인트 성능 추세 지표">
+                  <option value="r2">CV R²</option>
+                  <option value="mape_pct">CV MAPE</option>
+                  <option value="rmse">CV RMSE</option>
+                  <option value="p90_ape_pct">CV P90 APE</option>
+                </select>
+              </label>
+            </div>
+            <svg id="model-chart" class="chart" viewBox="0 0 620 260" role="img" aria-label="학습 데이터 수에 따른 모델 체크포인트 교차검증 성능"></svg>
+            <p id="model-chart-empty" class="empty-state">왼쪽 표에서 모델 행을 선택하면 추세를 표시합니다.</p>
+          </section>
           <p id="model-quality-note" class="footnote"></p>
         </article>
       </div>
@@ -115,7 +172,7 @@
           <div class="panel-title"><div><h3>최소 체적 후보</h3><p>체적 오름차순 상위 20개</p></div></div>
           <div class="table-scroll candidate-scroll">
             <table>
-              <thead><tr><th>후보</th><th>체적</th><th>손실</th><th>Llt</th><th>Bmax</th><th>사양</th></tr></thead>
+              <thead><tr><th>후보</th><th>체적</th><th>손실</th><th>Llt</th><th>설계 B</th><th>사양</th></tr></thead>
               <tbody id="candidate-table"></tbody>
             </table>
           </div>
@@ -134,7 +191,7 @@
           <div class="panel-title"><div><h3>Standard FEA 후보</h3><p id="verify-coverage">아직 제출된 검증이 없습니다.</p></div></div>
           <div class="table-scroll">
             <table>
-              <thead><tr><th>후보</th><th>Task</th><th>Llt</th><th>최고온도</th><th>Bmax</th><th>손실</th><th>판정</th></tr></thead>
+              <thead><tr><th>후보</th><th>Task</th><th>Llt</th><th>최고온도</th><th>Bmax</th><th>손실</th><th>단계 소요시간</th><th>판정</th></tr></thead>
               <tbody id="verification-table"></tbody>
             </table>
           </div>
@@ -149,6 +206,8 @@
             <div><dt>Task ID</dt><dd id="final-task">—</dd></div>
             <div><dt>Solver SHA</dt><dd id="final-solver" class="mono">—</dd></div>
             <div><dt>Library SHA</dt><dd id="final-library" class="mono">—</dd></div>
+            <div><dt>Matrix / Loss</dt><dd><span id="final-time-matrix">—</span> / <span id="final-time-loss">—</span></dd></div>
+            <div><dt>Icepak / 합계</dt><dd><span id="final-time-icepak">—</span> / <span id="final-time-total">—</span></dd></div>
           </dl>
           <p id="final-error" class="inline-error hidden"></p>
         </article>
@@ -158,7 +217,7 @@
     <details class="diagnostics">
       <summary>진단 정보 · scheduler 연결 및 원본 파일</summary>
       <div class="diagnostic-grid">
-        <div><h3>Scheduler (GET only)</h3><dl id="scheduler-details" class="detail-list"></dl></div>
+        <div><h3>Scheduler / MFT control</h3><dl id="scheduler-details" class="detail-list"></dl></div>
         <div><h3>Artifact warnings</h3><ul id="artifact-warnings" class="plain-list"><li>없음</li></ul></div>
       </div>
       <p class="root-path">Project root: <code>{{ project_root }}</code></p>
@@ -169,8 +228,13 @@
     <form method="dialog"><button class="dialog-close" aria-label="닫기">×</button></form>
     <p class="eyebrow">PARETO CANDIDATE</p><h2 id="dialog-title">후보 상세</h2>
     <div id="dialog-summary" class="dialog-summary"></div>
+    <h3>손실 및 성능</h3><dl id="dialog-performance" class="detail-value-grid"></dl>
     <h3>제약 판정</h3><div id="dialog-checks" class="check-grid"></div>
-    <h3>설계 파라미터</h3><dl id="dialog-parameters" class="parameter-grid"></dl>
+    <h3>환산 설계값</h3><dl id="dialog-derived" class="detail-value-grid"></dl>
+    <details class="raw-parameter-details">
+      <summary>전체 원시 설계 파라미터</summary>
+      <dl id="dialog-parameters" class="parameter-grid"></dl>
+    </details>
   </dialog>
 
   <div id="loading-indicator" class="loading-indicator" aria-hidden="true"></div>

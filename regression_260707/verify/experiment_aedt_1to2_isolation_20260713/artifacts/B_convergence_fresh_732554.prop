@@ -1,0 +1,14 @@
+Setup : Setup1
+
+==================
+Number of Passes
+Completed : N/A
+Maximum   : 12
+Minimum   : 12
+==================
+Criterion : Energy Error/Delta Energy (%)
+Target    : (1e-12, 1e-12)
+Current   : N/A
+==================
+Pass|# Tetrahedra|Total Energy (J)|Energy Error (%)|Delta Energy (%)|Total Loss (W)|Loss Error (%)|Delta Loss (%)|
+

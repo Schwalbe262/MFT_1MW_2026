@@ -1,0 +1,22 @@
+﻿{
+    "started_at":  "2026-07-13T07:52:59.6944082+09:00",
+    "release_sha":  "5f3987e00212ffebe88d4d705b07c8f52603c5ed",
+    "project":  "MFT_1MW_2026v1",
+    "target":  300,
+    "mutation_lock":  "Y:\\git\\MFT_1MW_2026\\regression_260707\\logs\\controller_release_6a870_runtime\\locks\\campaign-mutation.lock",
+    "collector":  {
+                      "pid":  107220,
+                      "stdout":  "Y:\\git\\MFT_1MW_2026\\regression_260707\\logs\\controller_release_6a870_runtime\\collector_20260713-072314.stdout.log",
+                      "stderr":  "Y:\\git\\MFT_1MW_2026\\regression_260707\\logs\\controller_release_6a870_runtime\\collector_20260713-072314.stderr.log",
+                      "command":  "run_collector_6a870.py"
+                  },
+    "controller":  {
+                       "pid":  117072,
+                       "stdout":  "Y:\\git\\MFT_1MW_2026\\regression_260707\\logs\\controller_release_6a870_runtime\\controller_20260713-075256.stdout.log",
+                       "stderr":  "Y:\\git\\MFT_1MW_2026\\regression_260707\\logs\\controller_release_6a870_runtime\\controller_20260713-075256.stderr.log",
+                       "command":  "run_controller_6a870.py --execute --reviewed-plan-sha b24e2... --authorize-dynamic-project-cap --loop 60"
+                   },
+    "checkpoint_touched":  false,
+    "running_tasks_cancelled":  0,
+    "pool400_authorized":  false
+}

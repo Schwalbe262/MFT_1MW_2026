@@ -26,6 +26,7 @@ from training.checkpoint_orchestrator import (  # noqa: E402
     training_commands,
 )
 import training.checkpoint_orchestrator as checkpoint_orchestrator  # noqa: E402
+from training.checkpoint_contract import checkpoint_contract_identity  # noqa: E402
 from training.model_quality_gate import evaluate_generation  # noqa: E402
 import training.train_models as train_models  # noqa: E402
 from training.predictor import EnsemblePredictor  # noqa: E402
@@ -580,7 +581,45 @@ class CheckpointRecoveryTests(unittest.TestCase):
             self.assertEqual(
                 status["state_identity"]["solver_revision"], "a" * 40
             )
+            self.assertRegex(
+                status["state_identity"]["checkpoint_contract_key"],
+                r"^[0-9a-f]{16}$",
+            )
+            self.assertEqual(
+                status["state_identity"]["model_targets_sha256"],
+                _sha256(HERE / "model_targets.py"),
+            )
             self.assertFalse((run_root / "strict_data_status.json").exists())
+
+    def test_launcher_contract_key_race_fails_before_dataset_inspection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = root / "profile.json"
+            profile.write_text(json.dumps({
+                "param_overrides": {"full_model": 0}
+            }), encoding="utf-8")
+            thresholds = root / "thresholds.json"
+            thresholds.write_text(json.dumps({
+                "minimum_strict_full_rows": 3000,
+                "targets": {},
+            }), encoding="utf-8")
+            argv = [
+                "checkpoint_orchestrator.py",
+                "--runtime-root", str(root),
+                "--profile", str(profile),
+                "--thresholds", str(thresholds),
+                "--solver-revision", "a" * 40,
+                "--library-revision", "b" * 40,
+                "--expected-contract-key", "0" * 16,
+            ]
+            with patch.object(sys, "argv", argv), patch.object(
+                checkpoint_orchestrator, "inspect_dataset"
+            ) as inspect:
+                with self.assertRaisesRegex(
+                    RuntimeError, "changed after run-root selection"
+                ):
+                    checkpoint_orchestrator.main()
+            inspect.assert_not_called()
 
     def test_same_run_root_keeps_identity_mismatch_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -700,6 +739,50 @@ class MonitoringRegistryTests(unittest.TestCase):
 
 
 class LoopSeparationTests(unittest.TestCase):
+    def test_checkpoint_contract_key_tracks_every_training_contract_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = root / "profile.json"
+            thresholds = root / "thresholds.json"
+            quality_contract = root / "quality_contract.py"
+            model_targets = root / "model_targets.py"
+            profile.write_text(json.dumps({"value": 1}), encoding="utf-8")
+            thresholds.write_text(json.dumps({"target": 2}), encoding="utf-8")
+            quality_contract.write_text("VALIDATOR = 3\n", encoding="utf-8")
+            model_targets.write_text("TARGETS = (4,)\n", encoding="utf-8")
+
+            def identity():
+                return checkpoint_contract_identity(
+                    profile, thresholds, quality_contract, model_targets
+                )
+
+            baseline = identity()
+            self.assertRegex(
+                baseline["checkpoint_contract_key"], r"^[0-9a-f]{16}$"
+            )
+            # JSON formatting is not a semantic contract change.
+            profile.write_text('{\n  "value": 1\n}\n', encoding="utf-8")
+            self.assertEqual(
+                identity()["checkpoint_contract_sha256"],
+                baseline["checkpoint_contract_sha256"],
+            )
+            mutations = (
+                (profile, json.dumps({"value": 9})),
+                (thresholds, json.dumps({"target": 9})),
+                (quality_contract, "VALIDATOR = 9\n"),
+                (model_targets, "TARGETS = (9,)\n"),
+            )
+            prior = baseline
+            for path, content in mutations:
+                path.write_text(content, encoding="utf-8")
+                current = identity()
+                self.assertNotEqual(
+                    current["checkpoint_contract_sha256"],
+                    prior["checkpoint_contract_sha256"],
+                    path.name,
+                )
+                prior = current
+
     def test_collector_and_trainer_are_independent_managed_roots(self):
         collector = (HERE / "campaign" / "auto_collect_loop.sh").read_text(
             encoding="utf-8"
@@ -725,13 +808,17 @@ class LoopSeparationTests(unittest.TestCase):
         self.assertIn("--library-revision", trainer)
         self.assertIn('--output-root "$OUTPUT_ROOT"', trainer)
         self.assertIn('--run-root "$RUN_ROOT"', trainer)
-        self.assertIn(
-            'checkpoint_runs/${MFT_SOLVER_REVISION}-${MFT_LIBRARY_REVISION}',
-            trainer,
-        )
+        self.assertIn("training/checkpoint_contract.py", trainer)
+        self.assertIn("MFT_QUALITY_THRESHOLDS", trainer)
+        self.assertIn("--expected-contract-key", trainer)
+        self.assertIn("-c${CONTRACT_KEY}", trainer)
+        self.assertLess(trainer.index("while true"), trainer.index("CONTRACT_KEY="))
         self.assertIn('[string]$RunRoot', powershell_launcher)
-        self.assertIn('"--run-root", $RunRoot', powershell_launcher)
-        self.assertIn('Join-Path "checkpoint_runs" $RevisionKey', powershell_launcher)
+        self.assertIn('[string]$Thresholds', powershell_launcher)
+        self.assertIn('"--run-root", $CycleRunRoot', powershell_launcher)
+        self.assertIn("checkpoint_contract.py", powershell_launcher)
+        self.assertIn("--expected-contract-key", powershell_launcher)
+        self.assertIn('$RevisionContractKey = "$RevisionKey-c$ContractKey"', powershell_launcher)
         self.assertIn('MFT_SOLVER_REVISION="$SOLVER_REVISION"', relaunch)
         self.assertIn('MFT_LIBRARY_REVISION="$LIBRARY_REVISION"', relaunch)
         self.assertIn("auto_collect_loop.sh", relaunch)

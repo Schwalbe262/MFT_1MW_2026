@@ -23,10 +23,29 @@ import pandas as pd
 import requests
 from filelock import FileLock
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from module.thermal_probe_contract import (
+    RX_SIDE_FACE_MAX_RULE,
+    RX_SIDE_FACE_MEAN_RULE,
+    RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
+)
+from module.core_material_contract import PHYSICS_DATA_REVISION
+
 if __package__:
     from .train_io import build_train_io
+    try:
+        from ..model_targets import CORE_REGION_TEMPERATURE_TARGETS
+    except ImportError:  # ``campaign`` imported with regression root on sys.path.
+        from model_targets import CORE_REGION_TEMPERATURE_TARGETS
 else:  # Direct execution: python campaign/collect_wave.py
     from train_io import build_train_io
+    regression_root = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), ".."))
+    if regression_root not in sys.path:
+        sys.path.insert(0, regression_root)
+    from model_targets import CORE_REGION_TEMPERATURE_TARGETS
 
 SCHEDULER = "http://127.0.0.1:8000"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,10 +73,18 @@ MANDATORY_THERMAL_TEMPERATURE_COLUMNS = (
     "Tprobe_Tx_leeward_max",
     "Tprobe_Rx_main_leeward_max",
     "Tprobe_core_center_max",
+    *CORE_REGION_TEMPERATURE_TARGETS,
 )
 SIDE_THERMAL_TEMPERATURE_COLUMNS = (
     "T_max_Rx_side",
     "Tprobe_Rx_side_leeward_max",
+)
+STACKING_REVISION_SIDE_THERMAL_TEMPERATURE_COLUMNS = (
+    "Tprobe_Rx_side_leeward_mean",
+    "Tprobe_Rx_side_outer_max",
+    "Tprobe_Rx_side_outer_mean",
+    "Tprobe_Rx_side_inner_max",
+    "Tprobe_Rx_side_inner_mean",
 )
 
 
@@ -195,22 +222,166 @@ def list_tasks(prefix):
 
 # 터미널 태스크의 회수 결과 캐시: 재수집 시 재조회 생략 (회수 시간 수분 -> 초)
 CACHE_PATH = os.path.join(DATASET_DIR, "collect_cache.json")
+CACHE_WRITE_ATTEMPTS = 5
+CACHE_RETRY_SECONDS = 0.05
+
+
+def _empty_cache():
+    return {"nodata": [], "harvested": [], "local_parts": []}
+
+
+def _validated_cache(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("collector cache root must be an object")
+    cache = dict(payload)
+    for key in ("nodata", "harvested"):
+        values = cache.setdefault(key, [])
+        if not isinstance(values, list):
+            raise ValueError(f"collector cache {key} must be a list")
+        for task_id in values:
+            if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+                raise ValueError(f"collector cache {key} contains an invalid task ID")
+    local_parts = cache.setdefault("local_parts", [])
+    if (not isinstance(local_parts, list)
+            or any(not isinstance(part, str) or not part for part in local_parts)):
+        raise ValueError("collector cache local_parts must be a list of names")
+    return cache
+
+
+def _read_cache(path):
+    with open(path, encoding="utf-8") as stream:
+        return _validated_cache(json.load(stream))
+
+
+def _cache_recovery_paths():
+    directory = os.path.dirname(CACHE_PATH) or "."
+    basename = os.path.basename(CACHE_PATH)
+    candidates = set(glob.glob(CACHE_PATH + ".tmp*"))
+    candidates.update(glob.glob(os.path.join(
+        directory, f".{basename}.*.tmp")))
+    candidates.discard(CACHE_PATH)
+
+    def modified(path):
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return -1.0
+
+    return sorted(candidates, key=lambda path: (modified(path), path), reverse=True)
 
 
 def _load_cache():
+    canonical_missing = False
+    canonical_error = None
     try:
-        with open(CACHE_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"nodata": [], "harvested": [], "local_parts": []}
+        # Mounted-drive directory metadata can lag behind direct path access.
+        # Always attempt the canonical open before consulting recovery files.
+        return _read_cache(CACHE_PATH)
+    except FileNotFoundError:
+        canonical_missing = True
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        canonical_error = exc
+
+    recovery_paths = _cache_recovery_paths()
+    recovery_errors = []
+    for path in recovery_paths:
+        try:
+            return _read_cache(path)
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            recovery_errors.append(f"{os.path.basename(path)}: {exc}")
+
+    master_path = os.path.join(DATASET_DIR, "train.parquet")
+    try:
+        with open(master_path, "rb"):
+            master_exists = True
+    except FileNotFoundError:
+        master_exists = False
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot determine whether collector dataset exists: {exc}") from exc
+    if canonical_missing and not recovery_paths and not master_exists:
+        return _empty_cache()
+
+    details = []
+    if canonical_error is not None:
+        details.append(f"canonical unreadable: {canonical_error}")
+    elif canonical_missing:
+        details.append("canonical missing")
+    if recovery_errors:
+        details.append("recovery invalid: " + "; ".join(recovery_errors))
+    elif recovery_paths:
+        details.append("no valid recovery cache")
+    raise RuntimeError("collector cache unavailable; " + "; ".join(details))
+
+
+def _write_cache_bytes_verified(path, encoded, attempts=CACHE_WRITE_ATTEMPTS):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            with open(path, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            last_error = exc
+        try:
+            with open(path, "rb") as stream:
+                if stream.read() == encoded:
+                    return
+        except OSError as exc:
+            last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(CACHE_RETRY_SECONDS)
+    raise RuntimeError(f"verified collector cache write failed for {path}: {last_error}")
 
 
 def _save_cache(c):
+    cache = _validated_cache(c)
+    encoded = (json.dumps(
+        cache, ensure_ascii=False, allow_nan=False, sort_keys=True) + "\n").encode("utf-8")
     os.makedirs(DATASET_DIR, exist_ok=True)
-    tmp = CACHE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(c, f)
-    os.replace(tmp, CACHE_PATH)
+    fd, staged = tempfile.mkstemp(
+        prefix=f".{os.path.basename(CACHE_PATH)}.", suffix=".tmp",
+        dir=os.path.dirname(CACHE_PATH) or ".")
+    os.close(fd)
+    staged_valid = False
+    committed = False
+    try:
+        _write_cache_bytes_verified(staged, encoded)
+        staged_valid = True
+        last_replace_error = None
+        for attempt in range(CACHE_WRITE_ATTEMPTS):
+            try:
+                os.replace(staged, CACHE_PATH)
+            except OSError as exc:
+                last_replace_error = exc
+            try:
+                with open(CACHE_PATH, "rb") as stream:
+                    if stream.read() == encoded:
+                        committed = True
+                        return
+            except OSError as exc:
+                last_replace_error = exc
+            if attempt + 1 < CACHE_WRITE_ATTEMPTS:
+                time.sleep(CACHE_RETRY_SECONDS)
+
+        # RaiDrive can deny replace even though direct overwrite is available.
+        # The train lock serializes collector writers; keep the validated stage
+        # until the canonical direct write has also passed an exact readback.
+        try:
+            _write_cache_bytes_verified(CACHE_PATH, encoded)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "collector cache replace failed "
+                f"({last_replace_error}); valid recovery remains at {staged}: {exc}"
+            ) from exc
+        committed = True
+    finally:
+        if (committed or not staged_valid) and os.path.exists(staged):
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
 
 
 def _commit_pending_cache(pending_harvested, pending_nodata, pending_local_parts=()):
@@ -446,6 +617,12 @@ def normalize_thermal_validity(df):
         n2_side = pd.to_numeric(df["N2_side"], errors="coerce")
         complete &= n2_side.notna()
         side_required = n2_side.gt(0)
+    physics_revision = df.get(
+        "physics_data_revision", pd.Series("", index=df.index)
+    ).fillna("").astype(str).str.strip()
+    new_probe_required = side_required & physics_revision.eq(
+        PHYSICS_DATA_REVISION
+    )
     for column in SIDE_THERMAL_TEMPERATURE_COLUMNS:
         if column not in df.columns:
             complete &= ~side_required
@@ -457,6 +634,52 @@ def normalize_thermal_validity(df):
                 & side_temperature.lt(MAX_TRUSTED_TEMPERATURE_C)
             )
             complete &= ~side_required | side_trusted
+    for column in STACKING_REVISION_SIDE_THERMAL_TEMPERATURE_COLUMNS:
+        if column not in df.columns:
+            complete &= ~new_probe_required
+        else:
+            side_temperature = pd.to_numeric(df[column], errors="coerce")
+            side_trusted = (
+                side_temperature.map(math.isfinite)
+                & side_temperature.gt(MIN_TRUSTED_TEMPERATURE_C)
+                & side_temperature.lt(MAX_TRUSTED_TEMPERATURE_C)
+            )
+            complete &= ~new_probe_required | side_trusted
+
+    for column, expected in (
+        ("thermal_rx_side_probe_contract_version",
+         RX_SIDE_FACE_PROBE_CONTRACT_VERSION),
+        ("thermal_rx_side_probe_max_rule", RX_SIDE_FACE_MAX_RULE),
+        ("thermal_rx_side_probe_mean_rule", RX_SIDE_FACE_MEAN_RULE),
+    ):
+        if column not in df.columns:
+            complete &= ~new_probe_required
+        else:
+            complete &= ~new_probe_required | df[column].fillna("").astype(str).eq(
+                expected
+            )
+    if "thermal_rx_side_probe_selected_face" not in df.columns:
+        complete &= ~new_probe_required
+    else:
+        complete &= ~new_probe_required | df[
+            "thermal_rx_side_probe_selected_face"
+        ].fillna("").astype(str).isin({
+            "Tprobe_Rx_side_side", "Tprobe_Rx_side1_inner",
+            "Tprobe_Rx_side2_side", "Tprobe_Rx_side2_inner",
+        })
+    if "thermal_rx_side_probe_face_count" not in df.columns:
+        complete &= ~new_probe_required
+    else:
+        mode = df.get(
+            "thermal_symmetry", pd.Series("", index=df.index)
+        ).fillna("").astype(str).str.strip().str.lower()
+        expected_faces = pd.Series(2.0, index=df.index).where(
+            ~mode.eq("full"), 4.0
+        )
+        face_count = pd.to_numeric(
+            df["thermal_rx_side_probe_face_count"], errors="coerce"
+        )
+        complete &= ~new_probe_required | face_count.eq(expected_faces)
 
     expected_mask = pd.Series(11, index=df.index).where(~side_required, 15)
     for column, predicate in (
@@ -937,6 +1160,13 @@ def main(argv=None):
     ap.add_argument("--prefix", default="mft-camp")
     ap.add_argument("--max-conv-err", type=float, default=1.5)
     ap.add_argument("--cancelled-fetch-limit", type=int, default=500)
+    ap.add_argument(
+        "--running-fetch-limit", type=int, default=32,
+        help=(
+            "maximum running/attaching stdout files to inspect for early "
+            "RESULT_JSON rows; terminal collection is unaffected"
+        ),
+    )
     args = ap.parse_args(argv)
 
     os.makedirs(DATASET_DIR, exist_ok=True)
@@ -964,7 +1194,11 @@ def main(argv=None):
     # the scheduler API; fresh completed/failed tasks are always handled first.
     # + 실행 중 태스크의 RESULT_JSON 라인도 스트리밍 회수 (샘플 단위 실시간성)
     import json as _json
-    running = [t for t in tasks if t.get("status") in ("running", "attaching")]
+    running = sorted(
+        (t for t in tasks if t.get("status") in ("running", "attaching")),
+        key=lambda task: int(task["id"]),
+        reverse=True,
+    )[:max(0, args.running_fetch_limit)]
     cache = _load_cache()
     skip = set(cache.get("nodata", [])) | set(cache.get("harvested", []))
     frames = []
