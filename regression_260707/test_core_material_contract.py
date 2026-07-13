@@ -20,6 +20,7 @@ from module.core_material_contract import (
     effective_steinmetz_cm,
     expected_core_loss_from_bavg_moment_w,
     expected_specific_core_loss_w_kg,
+    faraday_lumped_core_reference,
     geometry_volume_and_masses,
     lamination_factor_policy_source,
     material_flux_density_t,
@@ -38,9 +39,13 @@ from module.input_parameter_260706 import (
 from module.modeling_260706 import create_core as create_core_geometry
 from module.thermal_260706 import LossAllocator, _assign_losses
 from run_simulation_260706 import (
+    B_POWER_REFERENCE_VARIABLE,
     Simulation,
     _b_power_volume_integral_si,
     _core_group_index,
+    _native_b_power_restore_factor,
+    _native_core_report_plan,
+    _sheet_area_model_units,
 )
 
 
@@ -48,6 +53,38 @@ K = 0.85
 Y = 1.74
 MARGIN = 1.15
 CM = 1.377
+
+
+class SheetAreaReadbackTests(unittest.TestCase):
+    def test_reads_object3d_sheet_area_from_its_single_face(self):
+        sheet = SimpleNamespace(
+            name="core_flux_section_1",
+            faces=[SimpleNamespace(area=1540.0)],
+        )
+
+        self.assertEqual(_sheet_area_model_units(sheet), 1540.0)
+
+    def test_rejects_missing_multiple_or_invalid_faces(self):
+        cases = (
+            (SimpleNamespace(name="none", faces=[]), "exactly one face"),
+            (
+                SimpleNamespace(
+                    name="multiple",
+                    faces=[SimpleNamespace(area=1.0), SimpleNamespace(area=2.0)],
+                ),
+                "exactly one face",
+            ),
+            (
+                SimpleNamespace(
+                    name="invalid", faces=[SimpleNamespace(area=float("nan"))]
+                ),
+                "invalid sheet area",
+            ),
+        )
+        for sheet, message in cases:
+            with self.subTest(sheet=sheet.name), self.assertRaisesRegex(
+                    RuntimeError, message):
+                _sheet_area_model_units(sheet)
 
 
 def native_props(direction, kf=K):
@@ -175,12 +212,78 @@ class CoreMaterialArithmeticTests(unittest.TestCase):
         self.assertAlmostEqual(expected, direct, places=12)
         self.assertGreater(expected_specific_core_loss_w_kg(1000, 1.0), 0)
 
+    def test_faraday_lumped_reference_is_independent_and_kf_sensitive(self):
+        common = dict(
+            voltage_rms_v=1000,
+            frequency_hz=1000,
+            turns=10,
+            gross_area_m2=0.01,
+            effective_mass_kg=50,
+            loss_margin=MARGIN,
+        )
+        kf1 = faraday_lumped_core_reference(
+            **common, lamination_factor=1.0
+        )
+        kf085 = faraday_lumped_core_reference(
+            **common, lamination_factor=0.85
+        )
+        self.assertAlmostEqual(
+            kf085["B_material_T"] / kf1["B_material_T"], 1 / 0.85
+        )
+        self.assertAlmostEqual(
+            kf085["specific_loss_W_kg"] / kf1["specific_loss_W_kg"],
+            (1 / 0.85) ** 1.74,
+        )
+        self.assertAlmostEqual(
+            kf085["margin_adjusted_loss_W"],
+            kf085["native_raw_loss_W"] * MARGIN,
+        )
+        self.assertEqual(
+            kf085["basis"],
+            "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
+            "POWERLITE_Wkg_times_effective_mass",
+        )
+
+    def test_faraday_lumped_reference_rejects_invalid_inputs(self):
+        common = dict(
+            voltage_rms_v=1000,
+            frequency_hz=1000,
+            turns=10,
+            gross_area_m2=0.01,
+            lamination_factor=0.85,
+            effective_mass_kg=50,
+            loss_margin=MARGIN,
+        )
+        for key, value in (
+            ("turns", 0),
+            ("gross_area_m2", 0),
+            ("lamination_factor", 1.1),
+            ("effective_mass_kg", -1),
+            ("loss_margin", 0.9),
+        ):
+            kwargs = dict(common)
+            kwargs[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                faraday_lumped_core_reference(**kwargs)
+
     def test_b_power_integral_units_are_fail_closed(self):
         self.assertAlmostEqual(
             _b_power_volume_integral_si(2.0, "T^1.74*mm^3", 1.74), 2e-9
         )
         self.assertEqual(
             _b_power_volume_integral_si(2.0, "tesla^1.74*m^3", 1.74), 2.0
+        )
+        self.assertAlmostEqual(
+            _b_power_volume_integral_si(
+                2.0, "mm^3", 1.74, normalized_by_one_tesla=True
+            ),
+            2e-9,
+        )
+        self.assertEqual(
+            _b_power_volume_integral_si(
+                2.0, "m^3", 1.74, normalized_by_one_tesla=True
+            ),
+            2.0,
         )
         with self.assertRaises(RuntimeError):
             _b_power_volume_integral_si(2.0, "T", 1.74)
@@ -320,6 +423,89 @@ class CoreGeometrySegmentationTests(unittest.TestCase):
         self.assertEqual(legacy, segmented)
 
 
+class NativeCoreReportPlanTests(unittest.TestCase):
+    @staticmethod
+    def _group(group_index):
+        return [
+            SimpleNamespace(name=f"core_{group_index}_{region}")
+            for region in (
+                "leg_left", "leg_center", "leg_right",
+                "yoke_bottom", "yoke_top",
+            )
+        ]
+
+    def test_same_cut_groups_become_one_complete_b_power_batch(self):
+        groups = {2: self._group(2), 1: list(reversed(self._group(1)))}
+        plan = _native_core_report_plan(groups, lambda _name: 2)
+
+        self.assertEqual(len(plan["groups"]), 2)
+        self.assertEqual([cut for cut, _pieces in plan["batches"]], [2])
+        self.assertEqual(len(plan["batches"][0][1]), 10)
+        self.assertEqual(len(plan["object_names"]), 10)
+        self.assertEqual(len(set(plan["object_names"])), 10)
+        self.assertEqual(len(plan["membership_sha256"]), 64)
+
+    def test_mixed_cut_groups_create_deterministic_batches(self):
+        groups = {1: self._group(1), 2: self._group(2)}
+        plan = _native_core_report_plan(
+            groups,
+            lambda name: 3 if _core_group_index(name) == 2 else 2,
+        )
+
+        self.assertEqual(
+            [(cut, len(pieces)) for cut, pieces in plan["batches"]],
+            [(2, 5), (3, 5)],
+        )
+
+    def test_missing_unexpected_or_duplicate_region_fails_closed(self):
+        missing = self._group(1)[:-1]
+        unexpected = self._group(1) + [SimpleNamespace(name="core_1_extra")]
+        duplicate = self._group(1) + [self._group(1)[0]]
+        for pieces, message, kwargs in (
+            (missing, "coverage mismatch", {"require_complete_groups": True}),
+            (unexpected, "coverage mismatch", {}),
+            (duplicate, "duplicate native core report object", {}),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(
+                    RuntimeError, message):
+                _native_core_report_plan(
+                    {1: pieces}, lambda _name: 2, **kwargs
+                )
+
+    def test_symmetry_reduced_group_covers_every_retained_piece(self):
+        retained = [
+            piece for piece in self._group(2)
+            if not piece.name.endswith(("leg_right", "yoke_bottom"))
+        ]
+        plan = _native_core_report_plan({2: retained}, lambda _name: 2)
+
+        self.assertEqual(len(plan["object_names"]), 3)
+        self.assertEqual(
+            set(plan["object_names"]), {piece.name for piece in retained}
+        )
+        self.assertEqual(len(plan["batches"][0][1]), 3)
+
+    def test_group_with_mixed_cut_count_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "multiple symmetry-cut"):
+            _native_core_report_plan(
+                {1: self._group(1)},
+                lambda name: 3 if name.endswith("yoke_top") else 2,
+            )
+
+    def test_native_batch_restoration_equals_legacy_group_math(self):
+        for cut_count in (2, 3):
+            with self.subTest(cut_count=cut_count):
+                legacy_physical_factor = (
+                    (2.0 ** cut_count) / (2.0 ** Y)
+                    * (1.0 if cut_count == 3 else 2.0)
+                )
+                self.assertAlmostEqual(
+                    _native_b_power_restore_factor(cut_count, Y, True),
+                    legacy_physical_factor,
+                )
+        self.assertEqual(_native_b_power_restore_factor(2, Y, False), 1.0)
+
+
 class _FakeMaterial:
     def __init__(self, name):
         self.name = name
@@ -424,7 +610,7 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
             ("op", "CmplxMag"),
         ])
 
-    def test_b_peak_uses_complxpeak_not_complex_vector_norm(self):
+    def test_b_peak_uses_supported_complex_vector_norm_diagnostic(self):
         operations = []
 
         class Reporter:
@@ -437,8 +623,38 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
             builder(Reporter()) or name
         )
         simulation._calc_field_expr("core_1", "B_peak", "Mean", "B_test")
-        self.assertIn(("op", "ComplxPeak"), operations)
-        self.assertNotIn(("op", "CmplxMag"), operations)
+        self.assertEqual(operations[:3], [
+            ("qty", "B"), ("op", "CmplxMag"), ("op", "Mag")
+        ])
+        self.assertNotIn(("op", "ComplxPeak"), operations)
+
+    def test_single_piece_b_power_expression_has_no_group_addition(self):
+        operations = []
+
+        class Reporter:
+            def EnterQty(self, value): operations.append(("qty", value))
+            def CalcOp(self, value): operations.append(("op", value))
+            def EnterScalar(self, value): operations.append(("scalar", value))
+            def EnterScalarFunc(self, value): operations.append(("scalar_func", value))
+            def EnterVol(self, value): operations.append(("vol", value))
+
+        simulation = Simulation.__new__(Simulation)
+        simulation._add_field_expression = lambda name, builder, **kwargs: (
+            builder(Reporter()) or name
+        )
+        result = simulation._calc_group_b_power_integral(
+            [SimpleNamespace(name="core_2_leg_left")], Y, "Bpow_piece"
+        )
+
+        self.assertEqual(result, "Bpow_piece")
+        self.assertEqual(operations, [
+            ("qty", "B"), ("op", "ComplxPeak"),
+            ("scalar_func", B_POWER_REFERENCE_VARIABLE), ("op", "/"),
+            ("scalar", Y),
+            ("op", "Pow"), ("vol", "core_2_leg_left"),
+            ("op", "Integrate"),
+        ])
+        self.assertNotIn(("op", "+"), operations)
 
     def test_thermal_injects_margin_adjusted_loss_and_native_readback_balances(self):
         corrected_core_w = 115.0
@@ -501,6 +717,35 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
 
 
 class CoreMaterialArtifactTests(unittest.TestCase):
+    def test_rerun_manifest_is_prepared_but_cannot_submit_during_incident(self):
+        path = (
+            Path(__file__).resolve().parent / "verify"
+            / "1k101_native_ab_rerun_441fb7f.json"
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["status"],
+            "prepared_not_submitted_due_raidrive_incident",
+        )
+        self.assertFalse(payload["execute"])
+        self.assertEqual(
+            payload["solver_revision"],
+            "441fb7fff4be7894474886217d30c7bc0178a580",
+        )
+        self.assertEqual(
+            [case["lamination_factor"] for case in payload["candidates"]],
+            [1.0, 0.85, 0.7],
+        )
+        self.assertEqual(
+            payload["submission_contract"]["priority"], 10
+        )
+        self.assertEqual(
+            payload["submission_contract"]["required_project_cap"], 300
+        )
+        self.assertEqual(
+            payload["prior_failure"]["task_ids"], [29964, 29965, 29966]
+        )
+
     def test_ab_artifact_is_explicitly_blocked_until_solved_evidence(self):
         path = Path(__file__).resolve().parent / "verify" / "1k101_native_ab_gate.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -512,7 +757,10 @@ class CoreMaterialArtifactTests(unittest.TestCase):
             [1.0, 0.85, 0.70],
         )
         self.assertIn("corner_interface_flux", payload["required_solved_metrics"])
-        self.assertIn("native_core_loss_vs_Bavg_power_integral", payload["required_solved_metrics"])
+        self.assertIn(
+            "native_core_loss_vs_independent_Faraday_POWERLITE_effective_mass",
+            payload["required_solved_metrics"],
+        )
 
     def test_new_revision_is_fail_closed_in_quality_and_scheduler_ingest(self):
         root = Path(__file__).resolve().parent

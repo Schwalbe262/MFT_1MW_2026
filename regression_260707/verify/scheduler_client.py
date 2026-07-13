@@ -15,14 +15,29 @@ from pathlib import Path
 
 import requests
 from filelock import FileLock
+from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.thermal_probe_contract import (
+    RX_SIDE_FACE_MAX_RULE,
+    RX_SIDE_FACE_MEAN_RULE,
+    RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
+)
 
 try:
-    from ..model_targets import CORE_REGION_TEMPERATURE_TARGETS
+    from ..model_targets import (
+        CORE_REGION_TEMPERATURE_TARGETS,
+        SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    )
 except ImportError:
-    from model_targets import CORE_REGION_TEMPERATURE_TARGETS
+    from model_targets import (
+        CORE_REGION_TEMPERATURE_TARGETS,
+        SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    )
 
 SCHEDULER = "http://127.0.0.1:8000"
+TEST_TASK_PRIORITY = 10
 MFT_PROJECT = "MFT_1MW_2026v1"
+# Absolute operator/controller ceiling.  The live project field may be any
+# integer in 1..300 and is the maintained-pool source of truth.
 MFT_PROJECT_MAX_ACTIVE_TASKS = 300
 MFT_ACTIVE_STATUSES = ("queued", "attaching", "running")
 LEGACY_MFT_NAME_PREFIX = "mft-"
@@ -111,6 +126,13 @@ SIDE_TEMPERATURE_COLUMNS = (
     "T_max_Rx_side",
     "Tprobe_Rx_side_leeward_max",
 )
+STACKING_REVISION_SIDE_TEMPERATURE_COLUMNS = (
+    "Tprobe_Rx_side_leeward_mean",
+    "Tprobe_Rx_side_outer_max",
+    "Tprobe_Rx_side_outer_mean",
+    "Tprobe_Rx_side_inner_max",
+    "Tprobe_Rx_side_inner_mean",
+)
 
 
 class ResultFetchError(RuntimeError):
@@ -164,7 +186,12 @@ def campaign_mutation_lock_is_held():
 
 def validate_project_mutation_contract(
         project, *, expected_cap=None, require_full=False):
-    """Validate the bounded target and optionally every mutation field."""
+    """Validate the operator target and, when requested, all mutation fields.
+
+    ``max_active_tasks`` is deliberately dynamic, but never unbounded.  A
+    controller batch may pass ``expected_cap`` to bind every scheduler POST to
+    the cap observed when that batch was authorized.
+    """
     if not isinstance(project, dict):
         raise ProjectContractError("scheduler returned an invalid MFT project")
     if str(project.get("name") or "").strip() != MFT_PROJECT:
@@ -392,7 +419,8 @@ def live_project_submission_snapshot(
     return project_submission_snapshot(
         [project], project_tasks, required_hard_cap, legacy_tasks=legacy_tasks,
         require_exact_project_cap=require_exact_project_cap,
-        # Full raw record was authenticated by the live contract read above.
+        # ``require_live_project_mutation_contract`` already authenticated
+        # the full raw record; ``project`` here is its normalized projection.
         require_full_project=False,
     )
 
@@ -501,7 +529,8 @@ def verification_dedupe_key(
 def submit_verification(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
-        required_project_cap=None):
+        required_project_cap=None, priority=0, account_name="",
+        node_name="", max_workers_per_node=0):
     """Submit one MFT task under the shared cross-process mutation lock."""
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
@@ -509,6 +538,10 @@ def submit_verification(
             solver_revision=solver_revision,
             library_revision=library_revision,
             required_project_cap=required_project_cap,
+            priority=priority,
+            account_name=account_name,
+            node_name=node_name,
+            max_workers_per_node=max_workers_per_node,
         )
     with campaign_mutation_lock():
         return _submit_verification_locked(
@@ -516,16 +549,31 @@ def submit_verification(
             solver_revision=solver_revision,
             library_revision=library_revision,
             required_project_cap=required_project_cap,
+            priority=priority,
+            account_name=account_name,
+            node_name=node_name,
+            max_workers_per_node=max_workers_per_node,
         )
 
 
 def _submit_verification_locked(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
-        required_project_cap=None):
+        required_project_cap=None, priority=0, account_name="",
+        node_name="", max_workers_per_node=0):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise ValueError("verification priority must be an integer")
+    account_name = str(account_name or "").strip()
+    node_name = str(node_name or "").strip()
+    if (isinstance(max_workers_per_node, bool)
+            or not isinstance(max_workers_per_node, int)
+            or max_workers_per_node < 0):
+        raise ValueError(
+            "verification max_workers_per_node must be a non-negative integer"
+        )
     identity = verification_submission_identity(
         name, params, profile, solver_revision, library_revision)
     solver_revision = identity["solver_revision"]
@@ -625,6 +673,10 @@ def _submit_verification_locked(
         "remote_cwd": GPFS_RUNS_REMOTE_CWD,
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
         "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
+        "account_name": account_name,
+        "node_name": node_name,
+        "max_workers_per_node": max_workers_per_node,
+        "priority": priority,
         "timeout_seconds": timeout_seconds,
         "dedupe_key": dedupe_key,
         # Exact per-task basename only. The scheduler applies this cleanup on
@@ -706,7 +758,13 @@ def cancel(task_id):
 
 
 def cancel_queued_tasks_cas(task_ids):
-    """Cancel only exact task IDs that are still queued."""
+    """Cancel only rows still queued and return the scheduler acknowledgement.
+
+    The caller must durably seal exact task identities before invoking this
+    function and must perform authoritative readback afterwards.  A timeout is
+    intentionally surfaced as an uncertain mutation for restart
+    reconciliation; it is never converted into an empty acknowledgement.
+    """
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT queued cancellation requires the mutation lock")
     if not isinstance(task_ids, (list, tuple)) or not task_ids:
@@ -761,6 +819,10 @@ def required_temperature_columns(result):
     try:
         if float(result["N2_side"]) > 0:
             columns.extend(SIDE_TEMPERATURE_COLUMNS)
+            if str(result.get("physics_data_revision") or "").strip() == (
+                PHYSICS_DATA_REVISION
+            ):
+                columns.extend(STACKING_REVISION_SIDE_TEMPERATURE_COLUMNS)
     except (KeyError, TypeError, ValueError, OverflowError):
         return ()
     return tuple(columns)
@@ -821,6 +883,7 @@ def is_valid_result(
         "loss_conductor_mesh_operation_count",
         "loss_plate_eddy_on_readback_count",
         "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
+        *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
         "thermal_residual_flow_limit", "thermal_residual_energy_limit",
         "thermal_residual_continuity", "thermal_residual_x_velocity",
         "thermal_residual_y_velocity", "thermal_residual_z_velocity",
@@ -907,7 +970,15 @@ def is_valid_result(
                 or not 0 <= float(result[f"conv_delta_pct_{label}"]) <= tolerance):
             return False
     if not all(float(result[key]) >= 0 for key in (
-            "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total")):
+            "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
+            *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS)):
+        return False
+    if not math.isclose(
+        float(result["P_winding_total"]),
+        sum(float(result[key]) for key in SURROGATE_WINDING_COMPONENT_LOSS_TARGETS),
+        rel_tol=1e-9,
+        abs_tol=1e-6,
+    ):
         return False
     flow_limit = float(result["thermal_residual_flow_limit"])
     energy_limit = float(result["thermal_residual_energy_limit"])
@@ -927,6 +998,78 @@ def is_valid_result(
             )
             or not 0.0 <= float(result["thermal_rx_power_balance_max_abs_w"]) <= 1e-9):
         return False
+    if str(result.get("physics_data_revision") or "").strip() == (
+        PHYSICS_DATA_REVISION
+    ):
+        # Keep this exact-revision gate aligned with quality_contract.py.  It
+        # deliberately does not change the legacy/b171 acceptance contract.
+        if any(result.get(key) != 1 for key in (
+            "core_native_material_readback_attested",
+            "core_loss_native_attested",
+            "flux_linkage_attested",
+            "B_mean_faraday_attested",
+        )):
+            return False
+        if not all(_finite(result, key) for key in (
+            "core_loss_native_rel_error",
+            "core_loss_native_tolerance_rel",
+            "B_mean_material_vs_sine_analytic_rel_error",
+            "B_mean_faraday_tolerance_rel",
+            "core_surface_flux_vs_linkage_rel_error",
+            "core_surface_flux_vs_induced_voltage_rel_error",
+            "thermal_core_native_readback_count",
+            "thermal_core_native_restored_rel_error",
+            "thermal_core_loss_correction_factor",
+            "thermal_core_full_expected_margin_adjusted_w",
+        )):
+            return False
+        loss_error = float(result["core_loss_native_rel_error"])
+        loss_tolerance = float(result["core_loss_native_tolerance_rel"])
+        if not 0.0 <= loss_error <= loss_tolerance <= 0.30:
+            return False
+        b_error = float(result["B_mean_material_vs_sine_analytic_rel_error"])
+        b_tolerance = float(result["B_mean_faraday_tolerance_rel"])
+        if not 0.0 <= b_error <= b_tolerance <= 0.15:
+            return False
+        if result.get("core_loss_reference_basis") != (
+            "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
+            "POWERLITE_Wkg_times_effective_mass"
+        ):
+            return False
+        if any(not 0.0 <= float(result[key]) <= 0.05 for key in (
+            "core_surface_flux_vs_linkage_rel_error",
+            "core_surface_flux_vs_induced_voltage_rel_error",
+        )):
+            return False
+        if result.get(
+            "core_native_model_approval_status"
+        ) != "approved_by_isolated_solved_kf_ab":
+            return False
+        if result.get("thermal_core_loss_source") != (
+            "aedt_native_lamination_loss_attested_then_margin_adjusted"
+        ):
+            return False
+        native_count = float(result["thermal_core_native_readback_count"])
+        if native_count < 1.0 or native_count != math.floor(native_count):
+            return False
+        if not 0.0 <= float(
+            result["thermal_core_native_restored_rel_error"]
+        ) <= 1e-12:
+            return False
+        if not math.isclose(
+            float(result["thermal_core_loss_correction_factor"]),
+            1.15,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return False
+        if not math.isclose(
+            float(result["thermal_core_full_expected_margin_adjusted_w"]),
+            float(result["P_core_total"]),
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
+            return False
     explicit_turns = float(result.get("n_explicit_turns", -1))
     expected_rx_model = "homogenized_blocks" if explicit_turns == 0.0 else "hybrid_explicit"
     if result.get("thermal_rx_model") != expected_rx_model:
@@ -958,6 +1101,34 @@ def is_valid_result(
         expected_mask = 15 if float(result["N2_side"]) > 0 else 11
         if int(float(result["thermal_required_group_mask"])) != expected_mask:
             return False
+        if (
+            expected_mask == 15
+            and str(result.get("physics_data_revision") or "").strip()
+            == PHYSICS_DATA_REVISION
+        ):
+            if result.get(
+                "thermal_rx_side_probe_contract_version"
+            ) != RX_SIDE_FACE_PROBE_CONTRACT_VERSION:
+                return False
+            if result.get(
+                "thermal_rx_side_probe_max_rule"
+            ) != RX_SIDE_FACE_MAX_RULE:
+                return False
+            if result.get(
+                "thermal_rx_side_probe_mean_rule"
+            ) != RX_SIDE_FACE_MEAN_RULE:
+                return False
+            if result.get("thermal_rx_side_probe_selected_face") not in {
+                "Tprobe_Rx_side_side", "Tprobe_Rx_side1_inner",
+                "Tprobe_Rx_side2_side", "Tprobe_Rx_side2_inner",
+            }:
+                return False
+            mode = str(result.get("thermal_symmetry") or "").strip().lower()
+            expected_faces = 4 if mode == "full" else 2
+            if int(float(result[
+                "thermal_rx_side_probe_face_count"
+            ])) != expected_faces:
+                return False
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
     temperatures = required_temperature_columns(result)
