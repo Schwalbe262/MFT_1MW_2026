@@ -243,11 +243,13 @@ class RegistryWriterTests(unittest.TestCase):
             metrics = {
                 "r2": 0.99, "mape_pct": 1.0, "p90_ape_pct": 1.5,
                 "interval_coverage": 0.9,
+                "physics_data_revision_cohort": "legacy_unspecified",
             }
             bundle = {
                 "models": [("constant", ConstantModel())],
                 "features": ["N1_main"], "transform": None, "q90": 1.0,
                 "target": "Llt_phys", "metrics": metrics,
+                "physics_data_revision_cohort": "legacy_unspecified",
             }
             with patch.object(
                 train_models, "train_target", return_value=(bundle, metrics)

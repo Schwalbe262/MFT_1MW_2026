@@ -123,11 +123,21 @@ def train_target(
     from sklearn.model_selection import KFold, train_test_split
 
     sub = filter_valid_training_rows(df, target)
-    revision_cohort = sub.attrs.get("physics_data_revision_cohort", "")
+    if "physics_data_revision_cohort" not in sub.attrs:
+        raise RuntimeError(
+            f"target {target} training rows are missing "
+            "physics_data_revision_cohort metadata"
+        )
+    revision_cohort = sub.attrs["physics_data_revision_cohort"]
     sub = sub.dropna(subset=[target])
     sub = sub[np.isfinite(pd.to_numeric(sub[target], errors="coerce"))]
     if len(sub) < min_rows:
         return None, f"insufficient strict-full rows ({len(sub)})"
+    if not isinstance(revision_cohort, str) or not revision_cohort.strip():
+        raise RuntimeError(
+            f"target {target} training rows are missing "
+            "physics_data_revision_cohort metadata"
+        )
 
     X = sub[feats].fillna(0.0).reset_index(drop=True)
     y_raw = sub[target].to_numpy(dtype=float)
@@ -615,6 +625,12 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
                 raise RuntimeError(
                     f"required target {target} cannot be trained: {metrics}"
                 )
+            revision_cohort = bundle.get("physics_data_revision_cohort")
+            if not isinstance(revision_cohort, str) or not revision_cohort.strip():
+                raise RuntimeError(
+                    f"required target {target} did not report "
+                    "physics_data_revision_cohort metadata"
+                )
             bundle.update(
                 {
                     "training_run_id": run_id,
@@ -640,9 +656,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             artifact_sha256[f"{target}/models.pkl"] = _sha256(model_path)
             artifact_sha256[f"{target}/meta.json"] = _sha256(meta_path)
             target_reports[target] = metrics
-            target_revision_cohorts[target] = bundle[
-                "physics_data_revision_cohort"
-            ]
+            target_revision_cohorts[target] = revision_cohort
             print(
                 f"{target:32s} R2={metrics['r2']:.4f} "
                 f"MAPE={metrics['mape_pct']:.2f}% "
