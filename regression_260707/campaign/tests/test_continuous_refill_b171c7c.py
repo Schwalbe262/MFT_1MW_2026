@@ -16,6 +16,9 @@ import _continuous_refill_b171c7c as controller  # noqa: E402
 import feeder  # noqa: E402
 
 
+@unittest.skip(
+    "archived one-off _continuous_refill_b171c7c.py is retained as "
+    "historical evidence and is no longer runnable operationally")
 class ContinuousRefillB171Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

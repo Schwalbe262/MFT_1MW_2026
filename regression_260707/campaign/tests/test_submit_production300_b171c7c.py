@@ -15,6 +15,9 @@ sys.path.insert(0, str(CAMPAIGN_DIR))
 import _submit_production300_b171c7c as submitter  # noqa: E402
 
 
+@unittest.skip(
+    "archived one-off _submit_production300_b171c7c.py is retained as "
+    "historical evidence and is no longer runnable operationally")
 class Production300SubmitterTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
