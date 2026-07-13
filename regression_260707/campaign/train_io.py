@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-TRAIN_IO_SCHEMA_VERSION = 6
+TRAIN_IO_SCHEMA_VERSION = 7
 
 IDENTITY_COLUMNS = (
     "project_name",
@@ -86,6 +86,9 @@ PHYSICAL_CONTEXT_COLUMNS = (
     "fan_config",
     "k_ins",
     "core_k_thermal",
+    "core_k_anisotropic",
+    "core_k_alloy",
+    "core_k_interlayer",
     "conductor_temp_C",
 )
 
@@ -145,6 +148,7 @@ ANALYSIS_BASIS_COLUMNS = (
     "thermal_symmetry",
     "n_explicit_turns",
     "thermal_rx_model",
+    "thermal_core_conductivity_model",
     "matrix_on",
     "loss_on",
     "thermal_on",
@@ -324,6 +328,8 @@ PROVENANCE_COLUMNS = (
     "core_loss_equiv_cut_depth_model",
     "Ae_m2_basis",
     "core_mass_kg_basis",
+    "thermal_core_k_inplane",
+    "thermal_core_k_throughstack",
     "thermal_core_loss_contract_version",
     "thermal_core_loss_source",
     "thermal_core_loss_correction_factor",

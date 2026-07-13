@@ -63,6 +63,14 @@ CORE_MATERIAL_INPUT_KEYS = (
     "core_lamination_factor",
     "core_loss_margin",
 )
+# Wound-core thermal material controls are accepted and echoed by fixed runs,
+# but deliberately stay outside KEYS.  The thermal material policy must not
+# rewrite the sealed Sobol/campaign identity for an unchanged geometry.
+THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS = (
+    "core_k_anisotropic",
+    "core_k_alloy",
+    "core_k_interlayer",
+)
 # Fixed-run-only controls stay outside KEYS so experiments do not rewrite the
 # sealed Sobol/campaign candidate identity. They are still echoed in results.
 EFFICIENCY_EXPERIMENT_INPUT_KEYS = (
@@ -73,9 +81,19 @@ EFFICIENCY_EXPERIMENT_INPUT_KEYS = (
 PHYSICS_METADATA_INPUT_KEYS = (
     "physics_data_revision",
 )
+# Preserve authentication of the exact full-input contract emitted before the
+# wound-core thermal-conductivity extension.  Candidate digests continue to
+# project onto KEYS for every supported schema.
+PRE_ANISOTROPIC_CORE_K_INPUT_KEYS = [
+    *KEYS,
+    *CORE_MATERIAL_INPUT_KEYS,
+    *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+    *PHYSICS_METADATA_INPUT_KEYS,
+]
 ALL_INPUT_KEYS = [
     *KEYS,
     *CORE_MATERIAL_INPUT_KEYS,
+    *THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
     *PHYSICS_METADATA_INPUT_KEYS,
 ]
@@ -85,6 +103,7 @@ ALL_INPUT_KEYS = [
 # still project onto KEYS.
 SUPPORTED_CANDIDATE_INPUT_SCHEMAS = frozenset({
     frozenset(KEYS),
+    frozenset(PRE_ANISOTROPIC_CORE_K_INPUT_KEYS),
     frozenset(ALL_INPUT_KEYS),
 })
 
@@ -165,6 +184,12 @@ def get_drawing_default_params():
         "fan_velocity": 1.5,     # 팬 유속 [m/s], +y -> -y
         "k_ins": 0.2,            # 권선 절연 열전도율 [W/mK]
         "core_k_thermal": 2.0,   # 코어 등가 열전도율 [W/mK] (아몰퍼스, 보수적 등방값)
+        # Wound 2605SA1 ribbon: width is y everywhere and the stack normal is
+        # radial in the xz magnetic loop.  Icepak derives the directional
+        # conductivities at runtime from these anchors and the lamination factor.
+        "core_k_anisotropic": 1,
+        "core_k_alloy": 9.0,       # Metglas 2605SA1 [W/mK]
+        "core_k_interlayer": 0.2,  # epoxy/varnish convention [W/mK]
         # Production thermal model: represent the complete Rx pack with
         # anisotropic blocks. Thin explicit foils can disappear from Icepak's
         # cut-cell mesh even when an object mesh level is assigned.
@@ -245,6 +270,7 @@ def create_input_parameter(param=None):
             defaults = get_drawing_default_params()
             for key in (
                     *CORE_MATERIAL_INPUT_KEYS,
+                    *THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
                     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
                     *PHYSICS_METADATA_INPUT_KEYS):
                 if key not in param.columns:
@@ -267,6 +293,7 @@ def create_input_parameter(param=None):
     defaults = get_drawing_default_params()
     for key in (
             *CORE_MATERIAL_INPUT_KEYS,
+            *THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
             *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
             *PHYSICS_METADATA_INPUT_KEYS):
         if key not in param_df.columns:
@@ -864,6 +891,32 @@ def validation_check(input_df, strict=False, return_errors=False):
         errors.append(f"freq <= 0 ({inp['freq'].iloc[0]})")
     if int(inp["loss_on"].iloc[0]) != 0 and float(inp["V1_rms"].iloc[0]) <= 0:
         errors.append(f"V1_rms <= 0 ({inp['V1_rms'].iloc[0]}) with loss_on=1")
+    try:
+        core_k_anisotropic = float(inp["core_k_anisotropic"].iloc[0])
+        if (
+                not math.isfinite(core_k_anisotropic)
+                or not core_k_anisotropic.is_integer()
+                or int(core_k_anisotropic) not in (0, 1)):
+            errors.append(
+                "core_k_anisotropic must be 0 or 1 "
+                f"({inp['core_k_anisotropic'].iloc[0]})"
+            )
+    except (TypeError, ValueError, OverflowError):
+        errors.append(
+            "core_k_anisotropic must be 0 or 1 "
+            f"({inp['core_k_anisotropic'].iloc[0]})"
+        )
+    for key in ("core_k_alloy", "core_k_interlayer"):
+        try:
+            conductivity = float(inp[key].iloc[0])
+            if not math.isfinite(conductivity) or conductivity <= 0:
+                errors.append(
+                    f"{key} must be finite and > 0 ({inp[key].iloc[0]})"
+                )
+        except (TypeError, ValueError, OverflowError):
+            errors.append(
+                f"{key} must be finite and > 0 ({inp[key].iloc[0]})"
+            )
     n_exp = int(inp["n_explicit_turns"].iloc[0])
     if int(inp["thermal_on"].iloc[0]) != 0 and n_exp < -1:
         errors.append(f"n_explicit_turns ({n_exp}) < -1")
@@ -936,7 +989,8 @@ NON_DESIGN_VAR_KEYS = {
     "core_cm", "core_x", "core_y",
     "matrix_on", "loss_on", "thermal_on",
     "plate_temp", "air_temp", "fan_velocity",
-    "k_ins", "core_k_thermal", "n_explicit_turns",
+    "k_ins", "core_k_thermal", "core_k_anisotropic", "core_k_alloy",
+    "core_k_interlayer", "n_explicit_turns",
     "max_passes", "percent_error", "min_converged",
     "matrix_percent_error", "matrix_max_passes", "matrix_min_converged", "keep_project",
     "core_depth_min", "core_depth_max",
