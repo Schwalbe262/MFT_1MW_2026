@@ -50,3 +50,25 @@ regression/
 regression_260515/NSGA2_result/
 regression_260515/best_model/
 best_model/
+
+# campaign runtime state / atomic-writer journals (2026-07-13)
+regression_260707/campaign/*.log
+regression_260707/campaign/*.err.log
+regression_260707/campaign/*_state.json
+regression_260707/campaign/*_state.json.*
+regression_260707/campaign/*.gen-*.json
+regression_260707/campaign/*.ready
+regression_260707/campaign/loop_counter.txt
+regression_260707/training/strict_data_status.json
+regression_260707/training/strict_data_status.json.*
+regression_260707/training/*.gen-*.json
+regression_260707/training/checkpoint_runs/
+regression_260707/training/archive/
+regression_260707/logs/
+*.json.tmp
+*.tmp.tmp
+simulation_num.txt
+loop_counter.txt
+failed_samples_*.jsonl
+results_fallback_*.jsonl
+_nul
