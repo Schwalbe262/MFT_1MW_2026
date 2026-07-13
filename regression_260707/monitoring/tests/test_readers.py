@@ -1,6 +1,7 @@
 import hashlib
 import json
-from datetime import timedelta
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 from urllib.error import URLError
@@ -17,6 +18,7 @@ from regression_260707.monitoring.readers import (
     ArtifactService,
     CURRENT_PHYSICS_DATA_REVISION,
     ReadResult,
+    RefillControllerReader,
     RuntimeRecorder,
     SafeArtifactCache,
     SchedulerReader,
@@ -1251,6 +1253,7 @@ def test_runtime_snapshot_failure_warns_but_history_still_appends(
     service = ArtifactService(
         campaign_root,
         scheduler=artifact_service.scheduler,
+        refill_controller=artifact_service.refill_controller,
         clock=artifact_service.clock,
         record_runtime=True,
     )
@@ -1803,11 +1806,139 @@ def test_scheduler_disables_control_when_runtime_lacks_exact_live_count_fields()
     assert "live counts" in result["project_error"]
 
 
+@pytest.mark.parametrize(
+    "state_payload",
+    (
+        {"policy": {"target": 275}},
+        {"generation": {"identity": {"project_concurrency_target": 275}}},
+    ),
+    ids=("policy-target", "production-generation-identity"),
+)
+def test_refill_controller_reader_returns_latest_tick_and_state_target(
+    tmp_path, monkeypatch, state_payload
+):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text(json.dumps(state_payload), encoding="utf-8")
+    log_path.write_text(
+        "\n".join(
+            (
+                json.dumps({"action": "older_tick"}),
+                json.dumps({
+                    "action": "rolling_refill_complete",
+                    "active_project_tasks_before": 271,
+                    "accepted_or_reconciled_count": 4,
+                    "generation": {"id": "restart-v3-1234567890abcdef"},
+                }),
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    tick_timestamp = 1_784_000_000
+    os.utime(log_path, (tick_timestamp, tick_timestamp))
+    monkeypatch.setenv("MFT_CONTROLLER_STATE_PATH", str(state_path))
+    monkeypatch.setenv("MFT_CONTROLLER_LOG_PATH", str(log_path))
+
+    result = RefillControllerReader().snapshot()
+
+    assert result == {
+        "available": True,
+        "last_tick_at": result["last_tick_at"],
+        "action": "rolling_refill_complete",
+        "active_project_tasks_before": 271,
+        "accepted_or_reconciled_count": 4,
+        "generation_id": "restart-v3-1234567890abcdef",
+        "concurrency_target": 275,
+    }
+    assert datetime.fromisoformat(result["last_tick_at"]).timestamp() == tick_timestamp
+
+
+def test_refill_controller_reader_missing_files_is_unavailable(tmp_path):
+    result = RefillControllerReader(
+        tmp_path / "missing-state.json", tmp_path / "missing.log"
+    ).snapshot()
+
+    assert result == {"available": False}
+
+
+def test_refill_controller_reader_rejects_malformed_last_log_line(tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text(json.dumps({"policy": {"target": 300}}), encoding="utf-8")
+    log_path.write_text(
+        json.dumps({"action": "no_refill_needed"}) + "\n{malformed\n\n",
+        encoding="utf-8",
+    )
+
+    assert RefillControllerReader(state_path, log_path).snapshot() == {
+        "available": False
+    }
+
+
+def test_refill_controller_reader_rejects_malformed_state(tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text("{malformed", encoding="utf-8")
+    log_path.write_text(
+        json.dumps({"action": "no_refill_needed"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert RefillControllerReader(state_path, log_path).snapshot() == {
+        "available": False
+    }
+
+
+def test_refill_controller_reader_requires_tick_action(tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text(json.dumps({"policy": {"target": 300}}), encoding="utf-8")
+    log_path.write_text(
+        json.dumps({"active_project_tasks_before": 300}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert RefillControllerReader(state_path, log_path).snapshot() == {
+        "available": False
+    }
+
+
+def test_refill_controller_reader_accepts_tick_larger_than_64_kib(tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text(json.dumps({"policy": {"target": 300}}), encoding="utf-8")
+    tick_line = json.dumps({
+        "action": "pooled_bundle_pending",
+        "active_project_tasks_before": 298,
+        "accepted_or_reconciled_count": 0,
+        "padding": "x" * 70_000,
+    })
+    assert 64 * 1024 < len(tick_line.encode("utf-8")) < 128 * 1024
+    log_path.write_text(
+        json.dumps({"action": "older_tick"}) + "\n" + tick_line + "\n",
+        encoding="utf-8",
+    )
+
+    result = RefillControllerReader(state_path, log_path).snapshot()
+
+    assert result["available"] is True
+    assert result["action"] == "pooled_bundle_pending"
+    assert result["active_project_tasks_before"] == 298
+    assert result["accepted_or_reconciled_count"] == 0
+
+
 def test_dashboard_survives_missing_optional_artifacts(tmp_path):
     from regression_260707.monitoring.readers import ArtifactService
-    from .conftest import DummyScheduler, FIXED_NOW
+    from .conftest import DummyRefillController, DummyScheduler, FIXED_NOW
 
-    service = ArtifactService(tmp_path / "empty", scheduler=DummyScheduler(), clock=lambda: FIXED_NOW, record_runtime=False)
+    service = ArtifactService(
+        tmp_path / "empty",
+        scheduler=DummyScheduler(),
+        refill_controller=DummyRefillController(),
+        clock=lambda: FIXED_NOW,
+        record_runtime=False,
+    )
     payload = service.dashboard()
     assert payload["data"]["total_rows"] == 0
     assert payload["models"]["trained_count"] == 0

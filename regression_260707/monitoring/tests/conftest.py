@@ -60,6 +60,11 @@ class DummyScheduler:
         }
 
 
+class DummyRefillController:
+    def snapshot(self):
+        return {"available": False}
+
+
 def write_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -251,6 +256,7 @@ def artifact_service(campaign_root):
     return ArtifactService(
         campaign_root,
         scheduler=DummyScheduler(),
+        refill_controller=DummyRefillController(),
         clock=lambda: FIXED_NOW,
         record_runtime=False,
     )

@@ -35,17 +35,27 @@
     <section class="parallel-control-panel" aria-labelledby="parallel-control-title">
       <div class="parallel-control-heading">
         <div>
-          <p class="eyebrow">LOCAL OPERATOR CONTROL · MFT ONLY</p>
-          <h2 id="parallel-control-title">MFT 병렬 실행 목표</h2>
-          <p>queued + attaching + running 합계를 지정한 수로 유지합니다. IPMSM 프로젝트에는 적용되지 않습니다.</p>
+          <p id="parallel-control-eyebrow" class="eyebrow">AUTOMATIC REFILL CONTROL · MFT ONLY</p>
+          <h2 id="parallel-control-title">MFT 자동 실행 유지</h2>
+          <p id="parallel-control-description">외부 refill-controller가 queued + attaching + running 합계를 자동으로 유지합니다.</p>
         </div>
-        <form id="parallel-target-form" class="parallel-target-form" autocomplete="off">
+        <form id="parallel-target-form" class="parallel-target-form hidden" autocomplete="off">
           <label for="parallel-target-input">유지할 작업 수</label>
           <div>
             <input id="parallel-target-input" name="target" type="number" min="1" max="300" step="1" inputmode="numeric" disabled required>
             <button id="parallel-target-button" type="submit" disabled>목표 적용</button>
           </div>
         </form>
+        <div id="refill-controller-status" class="parallel-target-form" aria-live="polite">
+          <span id="refill-controller-mode" class="state-chip unknown">자동 유지 모드</span>
+          <p id="refill-controller-summary">외부 컨트롤러 상태를 확인하는 중입니다.</p>
+          <dl id="refill-controller-details" class="detail-list">
+            <div><dt>최근 동작</dt><dd id="refill-controller-action" class="state-chip unknown">확인 중</dd></div>
+            <div><dt>직전 확인 시점의 실행 수</dt><dd id="refill-controller-active">—</dd></div>
+            <div><dt>최근 보충 수</dt><dd id="refill-controller-refilled">—</dd></div>
+            <div><dt>세대 ID 축약</dt><dd id="refill-controller-generation">—</dd></div>
+          </dl>
+        </div>
       </div>
       <div class="parallel-live-grid" aria-label="MFT 실시간 작업 상태">
         <div><span>현재 목표</span><strong id="parallel-current-target">—</strong></div>
@@ -73,8 +83,8 @@
         </dl>
         <p id="aedt-node-local-progress" class="aedt-node-local-progress hidden">노드 로컬 AEDT 진행 정보 없음</p>
       </article>
-      <p id="parallel-target-status" class="parallel-target-status" aria-live="polite">Scheduler 연결을 확인하는 중입니다.</p>
-      <p class="parallel-control-note">목표를 낮춰도 running/attaching 작업은 중단하지 않습니다. 감소가 필요하면 controller가 시작 전으로 확인된 MFT queued 작업만 정리합니다.</p>
+      <p id="parallel-target-status" class="parallel-target-status hidden" aria-live="polite">Scheduler 연결을 확인하는 중입니다.</p>
+      <p id="parallel-control-note" class="parallel-control-note hidden">목표를 낮춰도 running/attaching 작업은 중단하지 않습니다. 감소가 필요하면 controller가 시작 전으로 확인된 MFT queued 작업만 정리합니다.</p>
     </section>
 
     <section class="pipeline-panel" aria-labelledby="pipeline-title">

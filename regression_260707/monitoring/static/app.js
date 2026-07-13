@@ -75,6 +75,14 @@
     return `${number(minutes / 60, 1)}시간 전 갱신`;
   }
 
+  function relativeTickTime(value) {
+    if (!value) return "시각 확인 불가";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return "시각 확인 불가";
+    const minutes = Math.max(0, Math.floor((Date.now() - parsed.getTime()) / 60000));
+    return minutes < 1 ? "방금" : `${number(minutes)}분 전`;
+  }
+
   function element(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -1038,13 +1046,63 @@
     }
   }
 
-  function renderParallelControl(scheduler = {}) {
-    setText("#parallel-current-target", number(scheduler.parallel_target));
+  function refillActionStatus(action) {
+    const key = String(action || "").trim().toLowerCase();
+    if (key === "no_refill_needed") return { label: "정상 (보충 불필요)", kind: "pass" };
+    if (key === "pooled_bundle_pending") return { label: "AEDT 공유 번들 진행 중", kind: "attention" };
+    if (key === "failed_closed") return { label: "오류로 안전정지 (관리자 확인 필요)", kind: "fail" };
+    if (/(replac|submit|refill|reconcil|accept)/.test(key)) return { label: "보충 실행", kind: "checkpoint" };
+    return { label: action || "확인 불가", kind: "unknown" };
+  }
+
+  function renderRefillController(refillController = {}) {
+    const available = refillController.available === true;
+    const actionStatus = refillActionStatus(refillController.action);
+    const failedClosed = available && actionStatus.kind === "fail";
+    const block = $("#refill-controller-status");
+    block.classList.toggle("inline-error", failedClosed);
+    const mode = $("#refill-controller-mode");
+    mode.className = `state-chip ${failedClosed ? "fail" : available ? "pass" : "unknown"}`;
+    setText(
+      "#refill-controller-summary",
+      available
+        ? "자동 유지 모드 — 외부 컨트롤러가 MFT 동시 실행 수를 관리합니다."
+        : "컨트롤러 상태 파일을 찾을 수 없음 — 스케줄러 수치는 상단 카드 참고",
+    );
+    $("#refill-controller-details").classList.toggle("hidden", !available);
+    const action = $("#refill-controller-action");
+    action.className = `state-chip ${actionStatus.kind}`;
+    action.textContent = `${actionStatus.label} · ${relativeTickTime(refillController.last_tick_at ?? refillController.last_tick_time)}`;
+    setText("#refill-controller-active", number(refillController.active_project_tasks_before));
+    setText("#refill-controller-refilled", number(refillController.accepted_or_reconciled_count));
+    const generationId = refillController.generation_id ?? refillController.generation?.id;
+    setText("#refill-controller-generation", generationId == null ? null : String(generationId).slice(0, 12));
+  }
+
+  function renderParallelControl(scheduler = {}, refillController = state.dashboard?.refill_controller || {}) {
+    const controlEnabled = scheduler.control_enabled === true;
+    const displayedTarget = controlEnabled
+      ? scheduler.parallel_target
+      : (refillController.concurrency_target ?? scheduler.parallel_target);
+    setText("#parallel-current-target", number(displayedTarget));
     setText("#parallel-logical-active", number(scheduler.logical_active));
     setText("#parallel-queued", number(scheduler.live_queued));
     setText("#parallel-attaching", number(scheduler.live_attaching));
     setText("#parallel-running", number(scheduler.live_running));
     renderAedtAttach(scheduler);
+    $("#parallel-target-form").classList.toggle("hidden", !controlEnabled);
+    $("#refill-controller-status").classList.toggle("hidden", controlEnabled);
+    $("#parallel-target-status").classList.toggle("hidden", !controlEnabled);
+    $("#parallel-control-note").classList.toggle("hidden", !controlEnabled);
+    setText("#parallel-control-eyebrow", controlEnabled ? "LOCAL OPERATOR CONTROL · MFT ONLY" : "AUTOMATIC REFILL CONTROL · MFT ONLY");
+    setText("#parallel-control-title", controlEnabled ? "MFT 병렬 실행 목표" : "MFT 자동 실행 유지");
+    setText(
+      "#parallel-control-description",
+      controlEnabled
+        ? "queued + attaching + running 합계를 지정한 수로 유지합니다. IPMSM 프로젝트에는 적용되지 않습니다."
+        : "외부 refill-controller가 queued + attaching + running 합계를 자동으로 유지합니다.",
+    );
+    if (!controlEnabled) renderRefillController(refillController);
     const input = $("#parallel-target-input");
     const button = $("#parallel-target-button");
     const enabled = scheduler.connected === true && scheduler.control_enabled === true
@@ -1086,7 +1144,7 @@
   function render(payload) {
     state.dashboard = payload;
     renderOverall(payload);
-    renderParallelControl(payload.scheduler || {});
+    renderParallelControl(payload.scheduler || {}, payload.refill_controller || {});
     renderData(payload.data || {});
     renderModels(payload.models || { models: [] });
     renderNsga(payload.nsga2 || { candidates: [] });
@@ -1155,7 +1213,7 @@
       if (!confirmed) return;
     }
     state.updatingParallelTarget = true;
-    renderParallelControl(scheduler);
+    renderParallelControl(scheduler, state.dashboard?.refill_controller || {});
     let applied = false;
     try {
       const response = await fetch("/api/operator/parallel-target", {
@@ -1173,14 +1231,14 @@
       if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
       state.parallelTargetDirty = false;
       if (state.dashboard) state.dashboard.scheduler = { ...scheduler, ...payload, control_enabled: true, connected: true };
-      renderParallelControl(state.dashboard?.scheduler || payload);
+      renderParallelControl(state.dashboard?.scheduler || payload, state.dashboard?.refill_controller || {});
       applied = true;
       await refresh();
     } catch (error) {
       parallelStatus(`목표 적용 실패: ${error.message}`, "error");
     } finally {
       state.updatingParallelTarget = false;
-      renderParallelControl(state.dashboard?.scheduler || scheduler);
+      renderParallelControl(state.dashboard?.scheduler || scheduler, state.dashboard?.refill_controller || {});
       if (applied) parallelStatus(`MFT 병렬 목표 ${target}을 저장했습니다. controller가 다음 주기에 맞춥니다.`, "success");
     }
   });

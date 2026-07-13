@@ -75,6 +75,16 @@ NODE_LOCAL_AEDT_PROJECT = "_aedt_pool_hosts"
 NODE_LOCAL_AEDT_ENTRYPOINT = "aedt_node_canary_host"
 NODE_LOCAL_AEDT_ACTIVE_STATES = ("queued", "attaching", "running")
 NODE_LOCAL_AEDT_TASK_LIMIT = 1_000
+DEFAULT_CONTROLLER_STATE_PATH = (
+    "C:/Users/peets/slurm_scheduler_runtime/mft_controller/"
+    "restart_v3_7_controller_state.json"
+)
+DEFAULT_CONTROLLER_LOG_PATH = (
+    "C:/Users/peets/slurm_scheduler_runtime/mft_controller/"
+    "controller_restart_v3_7.log"
+)
+CONTROLLER_LOG_TAIL_BYTES = 128 * 1024
+CONTROLLER_STATE_MAX_BYTES = 8 * 1024 * 1024
 SIMULATION_TIMING_WINDOW_ROWS = 100
 MAPE_ZERO_ABS_TOLERANCE = 1e-9
 SIMULATION_TIMING_FIELDS = (
@@ -1083,6 +1093,119 @@ class SafeArtifactCache:
         )
 
 
+class RefillControllerReader:
+    """Read the external refill controller's last durable status tick."""
+
+    def __init__(
+        self,
+        state_path: str | Path | None = None,
+        log_path: str | Path | None = None,
+    ) -> None:
+        configured_state_path = state_path or os.environ.get(
+            "MFT_CONTROLLER_STATE_PATH", DEFAULT_CONTROLLER_STATE_PATH
+        )
+        configured_log_path = log_path or os.environ.get(
+            "MFT_CONTROLLER_LOG_PATH", DEFAULT_CONTROLLER_LOG_PATH
+        )
+        self.state_path = Path(configured_state_path)
+        self.log_path = Path(configured_log_path)
+
+    @staticmethod
+    def _count(value: Any) -> int | None:
+        if type(value) is int and value >= 0:
+            return value
+        if isinstance(value, float) and math.isfinite(value) and value >= 0:
+            integer = int(value)
+            return integer if integer == value else None
+        return None
+
+    @classmethod
+    def _concurrency_target(cls, state: dict[str, Any]) -> int | None:
+        paths = (
+            ("policy", "target"),
+            ("policy", "concurrency_target"),
+            ("policy", "project_concurrency_target"),
+            ("target",),
+            ("concurrency_target",),
+            ("project_concurrency_target",),
+            ("generation", "policy", "target"),
+            ("generation", "identity", "project_concurrency_target"),
+            ("generation", "identity", "concurrency_target"),
+        )
+        for path in paths:
+            value: Any = state
+            for key in path:
+                if not isinstance(value, dict) or key not in value:
+                    value = None
+                    break
+                value = value[key]
+            target = cls._count(value)
+            if target is not None:
+                return target
+        return cls._count(state.get("policy/target"))
+
+    def _read_state(self) -> dict[str, Any] | None:
+        stat = self.state_path.stat()
+        if stat.st_size <= 0 or stat.st_size > CONTROLLER_STATE_MAX_BYTES:
+            return None
+        with self.state_path.open("rb") as handle:
+            raw = handle.read(CONTROLLER_STATE_MAX_BYTES + 1)
+        if len(raw) > CONTROLLER_STATE_MAX_BYTES:
+            return None
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else None
+
+    def _read_last_tick(self) -> tuple[dict[str, Any] | None, datetime | None]:
+        stat = self.log_path.stat()
+        if stat.st_size <= 0:
+            return None, None
+        with self.log_path.open("rb") as handle:
+            handle.seek(max(0, stat.st_size - CONTROLLER_LOG_TAIL_BYTES))
+            tail = handle.read(CONTROLLER_LOG_TAIL_BYTES)
+        last_line = next((line for line in reversed(tail.splitlines()) if line.strip()), None)
+        if last_line is None:
+            return None, None
+        value = json.loads(last_line)
+        if not isinstance(value, dict):
+            return None, None
+        tick_at = datetime.fromtimestamp(stat.st_mtime, tz=_now().tzinfo)
+        return value, tick_at
+
+    def snapshot(self) -> dict[str, Any]:
+        try:
+            state = self._read_state()
+            tick, tick_at = self._read_last_tick()
+            if state is None or tick is None or tick_at is None:
+                return {"available": False}
+
+            action = tick.get("action")
+            if not isinstance(action, str) or not action.strip():
+                return {"available": False}
+
+            result: dict[str, Any] = {
+                "available": True,
+                "last_tick_at": _iso(tick_at),
+                "action": action.strip(),
+            }
+            for key in (
+                "active_project_tasks_before",
+                "accepted_or_reconciled_count",
+            ):
+                count = self._count(tick.get(key))
+                if count is not None:
+                    result[key] = count
+            generation = tick.get("generation")
+            generation_id = generation.get("id") if isinstance(generation, dict) else None
+            if isinstance(generation_id, str) and generation_id.strip():
+                result["generation_id"] = generation_id.strip()
+            concurrency_target = self._concurrency_target(state)
+            if concurrency_target is not None:
+                result["concurrency_target"] = concurrency_target
+            return result
+        except Exception:
+            return {"available": False}
+
+
 class SchedulerReader:
     """Bounded adapter for MFT scheduler status and project-cap control."""
 
@@ -1941,10 +2064,12 @@ class ArtifactService:
         scheduler: SchedulerReader | None = None,
         clock: Callable[[], datetime] = _now,
         record_runtime: bool = True,
+        refill_controller: RefillControllerReader | None = None,
     ) -> None:
         self.root = Path(regression_root).resolve()
         self.cache = SafeArtifactCache()
         self.scheduler = scheduler or SchedulerReader()
+        self.refill_controller = refill_controller or RefillControllerReader()
         self.clock = clock
         self.recorder = RuntimeRecorder(self.root / "monitoring" / "runtime") if record_runtime else None
         self._campaign_audit_lock = threading.RLock()
@@ -3457,6 +3582,7 @@ class ArtifactService:
         nsga = self.nsga2()
         verification = self.verification(nsga)
         scheduler = self.scheduler.snapshot()
+        refill_controller = self.refill_controller.snapshot()
         dashboard = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": generated_at,
@@ -3467,6 +3593,7 @@ class ArtifactService:
             "nsga2": nsga,
             "verification": verification,
             "scheduler": scheduler,
+            "refill_controller": refill_controller,
         }
         if record and self.recorder:
             try:
@@ -3485,6 +3612,7 @@ class ArtifactService:
             "project": dashboard["project"],
             **dashboard["status"],
             "scheduler": dashboard["scheduler"],
+            "refill_controller": dashboard["refill_controller"],
         }
 
     def history(self) -> dict[str, Any]:
