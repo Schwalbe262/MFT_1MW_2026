@@ -27,6 +27,10 @@ import hashlib
 import argparse
 import uuid
 import tempfile
+import time
+
+_PROCESS_STARTED_MONOTONIC = time.monotonic()
+_PROCESS_STARTED_EPOCH_S = time.time()
 
 try:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,8 +71,11 @@ os.environ.setdefault("FLEXLM_TIMEOUT", "3000000")
 import pyaedt_module
 from pyaedt_module.core import pyDesktop
 import os
-import time
-from datetime import datetime
+from datetime import datetime, timezone
+
+_PROCESS_STARTED_AT_UTC = datetime.fromtimestamp(
+    _PROCESS_STARTED_EPOCH_S, tz=timezone.utc
+).isoformat()
 
 import math
 import copy
@@ -1870,6 +1877,7 @@ class Simulation():
         self.extraction_backends = {}
         self.extraction_units = {}
         self.spawned_descendants = {}
+        self.stage_timings = {}
 
     def create_simulation_name(self):
 
@@ -4835,6 +4843,9 @@ class Simulation():
 
     def analyze_and_extract(self, label, extractor):
         """Analyze exactly once; result-query failures never justify another solve."""
+        if not hasattr(self, "stage_timings"):
+            self.stage_timings = {}
+
         def _analyze_once():
             if label != "loss" or not bool(getattr(
                     self, "loss_native_analyze_required", False)):
@@ -4910,8 +4921,24 @@ class Simulation():
             self.save_project(strict=True)
             return elapsed
 
+        analyze_started = time.monotonic()
         elapsed = _analyze_once()
-        extractor()
+        solve_finished = time.monotonic()
+        self.stage_timings[f"stage_time_{label}_solve_s"] = elapsed
+        self.stage_timings[f"stage_time_{label}_analyze_overhead_s"] = max(
+            0.0, solve_finished - analyze_started - elapsed
+        )
+        extraction_started = time.monotonic()
+        try:
+            extractor()
+        finally:
+            extraction_finished = time.monotonic()
+            self.stage_timings[f"stage_time_{label}_extract_s"] = (
+                extraction_finished - extraction_started
+            )
+            self.stage_timings[f"stage_time_{label}_analyze_total_s"] = (
+                extraction_finished - analyze_started
+            )
         return elapsed
 
     def get_execution_telemetry(self):
@@ -5020,11 +5047,24 @@ class Simulation():
             logging.info(f"Result part saved to {part}")
 
     def save_project(self, strict=False):
+        save_started = time.monotonic()
+
+        def _record_save_timing():
+            if not hasattr(self, "stage_timings"):
+                self.stage_timings = {}
+            self.stage_timings["stage_count_project_save"] = int(
+                self.stage_timings.get("stage_count_project_save", 0)
+            ) + 1
+            self.stage_timings["stage_time_project_save_s"] = float(
+                self.stage_timings.get("stage_time_project_save_s", 0.0)
+            ) + (time.monotonic() - save_started)
+
         errors = []
         try:
             result = self.design1.save_project()
             if result is False:
                 raise RuntimeError("wrapper save_project returned False")
+            _record_save_timing()
             return True
         except Exception as error:
             errors.append(f"wrapper={type(error).__name__}: {error}")
@@ -5032,10 +5072,12 @@ class Simulation():
             result = self._native_project_handle().Save()
             if result is False:
                 raise RuntimeError("native Project.Save returned False")
+            _record_save_timing()
             return True
         except Exception as error:
             errors.append(f"native={type(error).__name__}: {error}")
         message = "Failed to save project: " + "; ".join(errors)
+        _record_save_timing()
         if strict:
             raise RuntimeError(message)
         logging.warning(message)
@@ -5283,6 +5325,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     param 이 dict 등 -> 해당 값으로 1회 (fixed 모드), 프로젝트 폴더 보존
     model_only=True -> 모델링/셋업까지만 하고 해석은 생략 (지오메트리 확인용)
     """
+    run_started = time.monotonic()
+    run_started_at_utc = datetime.now(timezone.utc).isoformat()
     fixed_mode = param is not None
     sim = None
     desktop = None
@@ -5292,8 +5336,18 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     try:
         # pyDesktop을 context manager로 쓰면 release_desktop 이후 __exit__에서
         # close_on_exit 속성 오류가 발생하므로 직접 생성하고 finally에서 해제한다.
+        aedt_startup_started = time.monotonic()
         desktop, sim = _create_simulation_session()
+        sim.stage_timings.update({
+            "stage_time_process_pre_run_s": max(
+                0.0, run_started - _PROCESS_STARTED_MONOTONIC
+            ),
+            "stage_time_aedt_startup_s": (
+                time.monotonic() - aedt_startup_started
+            ),
+        })
 
+        project_input_started = time.monotonic()
         sim.create_simulation_name()
         sim.create_project()
 
@@ -5319,6 +5373,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     break
                 # 기각 샘플 기록 (설계공간 경계 데이터)
                 log_failed_sample(sim.input_df, "validation: " + " / ".join(errors))
+
+        sim.stage_timings["stage_time_project_input_s"] = (
+            time.monotonic() - project_input_started
+        )
 
         sim.full_model = int(sim.df_plus["full_model"].iloc[0]) != 0
         matrix_on = int(sim.df_plus["matrix_on"].iloc[0]) != 0
@@ -5541,7 +5599,11 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
         # ---- design1: L/k 매트릭스 (전류원, 기존 방식) ----
         if matrix_on:
+            matrix_model_started = time.monotonic()
             _build_em_design("maxwell_matrix", "matrix")
+            sim.stage_timings["stage_time_matrix_model_s"] = (
+                time.monotonic() - matrix_model_started
+            )
             sim.design_matrix = sim.design1
             if not model_only:
                 t_matrix = sim.analyze_and_extract("matrix", sim.get_magnetic_parameter)
@@ -5555,6 +5617,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         #   -> 추출 시 오브젝트별 상수 보정으로 실물(_phys) 기록. 시간 ~4x 단축.
         # loss_sym_on=0 (최종 검증): 풀모델 + Tx 전압원 (검증된 물리 기준 경로)
         if loss_on:
+            loss_prepare_started = time.monotonic()
             loss_sym = int(sim.df_plus["loss_sym_on"].iloc[0]) != 0 and not sim.full_model
 
             # P_target > 0 이면 design1의 누설(Lk = Llt_true)로 DAB 운전 위상을 역산해
@@ -5617,6 +5680,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 sim.loss_em_full = True
                 sim.loss_is_sym = False
                 _build_em_design("maxwell_loss", "loss")
+            sim.stage_timings["stage_time_loss_prepare_s"] = (
+                time.monotonic() - loss_prepare_started
+            )
             sim.design_loss = sim.design1
             if not model_only:
                 def _extract_loss_results():
@@ -5634,7 +5700,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         thermal_result_valid = not thermal_on
         if thermal_on and loss_on and not model_only:
             from module.thermal_260706 import run_thermal_analysis
-            t0 = time.time()
+            t0 = time.monotonic()
             try:
                 df_thermal = run_thermal_analysis(sim)
             except Exception as thermal_error:
@@ -5650,7 +5716,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     "physics_data_revision", pd.Series([""])
                 ).iloc[0],
             )
-            t_thermal = time.time() - t0
+            t_thermal = time.monotonic() - t0
+            sim.stage_timings["stage_time_thermal_total_s"] = t_thermal
             total_time += t_thermal
             result_parts += [df_thermal, pd.DataFrame({"time_thermal": [t_thermal]})]
 
@@ -5674,9 +5741,40 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 logging.exception(f"Error closing project: {e}")
             return
 
+        pre_result_finished = time.monotonic()
+        sim.stage_timings["stage_time_pre_result_s"] = (
+            pre_result_finished - run_started
+        )
+        sim.stage_timings["stage_time_process_to_result_s"] = (
+            pre_result_finished - _PROCESS_STARTED_MONOTONIC
+        )
+        nonoverlapping_keys = (
+            "stage_time_aedt_startup_s",
+            "stage_time_project_input_s",
+            "stage_time_matrix_model_s",
+            "stage_time_matrix_analyze_total_s",
+            "stage_time_loss_prepare_s",
+            "stage_time_loss_analyze_total_s",
+            "stage_time_thermal_total_s",
+        )
+        accounted = sum(
+            float(sim.stage_timings.get(key, 0.0))
+            for key in nonoverlapping_keys
+        )
+        sim.stage_timings["stage_time_unattributed_s"] = max(
+            0.0, sim.stage_timings["stage_time_pre_result_s"] - accounted
+        )
+        timing_frame = pd.DataFrame([{
+            "timing_schema": "mft-stage-timing-v1",
+            "timing_process_started_at_utc": _PROCESS_STARTED_AT_UTC,
+            "timing_run_started_at_utc": run_started_at_utc,
+            "timing_pre_result_at_utc": datetime.now(timezone.utc).isoformat(),
+            **sim.stage_timings,
+        }])
         simulation_time = pd.DataFrame({"time": [total_time]})
         result = pd.concat(
-            result_parts + [sim.get_execution_telemetry(), simulation_time], axis=1
+            result_parts + [sim.get_execution_telemetry(), timing_frame,
+                            simulation_time], axis=1
         )
         em_result_valid, em_validity_reason = _em_result_validation(
             result, matrix_on=matrix_on, loss_on=loss_on

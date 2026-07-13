@@ -219,7 +219,7 @@ def _require_thermal_geometry(
         raise RuntimeError(f"thermal geometry is missing required groups: {missing_groups}")
 
 
-def _assign_thermal_mesh(ipk, objs):
+def _assign_thermal_mesh(ipk, objs, side_block_level=5):
     """Keep thin solids represented without isolating their thermal interfaces."""
     def _assign_levels(levels, name):
         if not levels:
@@ -258,14 +258,17 @@ def _assign_thermal_mesh(ipk, objs):
     # Keep each physical Rx pack in its own shared refinement region. Combining
     # the distant main and side packs creates one very large cut-cell region;
     # two production cases with a single 0.300--0.435 mm side turn then lost all
-    # three retained side-block solution zones even though the main pack survived.
-    # Level 5 is the finest predefined Icepak object level and is reserved for
-    # the side packs, while every block within one pack still shares a region so
-    # its conductive interfaces are not isolated.
+    # three retained side solution zones even though the main pack survived.
+    # Exact singleton turns remain protected at level 5 below. Multi-turn side
+    # blocks use the fixed-run A/B level while all blocks in one pack continue
+    # to share a region so their conductive interfaces are not isolated.
+    side_block_level = int(side_block_level)
+    if side_block_level not in (4, 5):
+        raise ValueError("side_block_level must be 4 or 5")
     rx_block_specs = (
         ("Rx_main_blocks", "rx_main_block_mesh_level", 4),
-        ("Rx_side_blocks", "rx_side_block_mesh_level", 5),
-        ("Rx_side2_blocks", "rx_side2_block_mesh_level", 5),
+        ("Rx_side_blocks", "rx_side_block_mesh_level", side_block_level),
+        ("Rx_side2_blocks", "rx_side2_block_mesh_level", side_block_level),
     )
     for key, operation_name, level in rx_block_specs:
         names = list(dict.fromkeys(obj.name for obj in objs.get(key, [])))
@@ -1878,6 +1881,7 @@ def run_thermal_analysis(sim):
     EM loss 디자인 결과(sim.loss_map)를 이용해 Icepak 열해석 수행.
     반환: 온도 요약 1행 DataFrame (T_max_*, T_mean_*)
     """
+    thermal_started = time.monotonic()
     df = sim.df_plus
 
     mode = str(df["thermal_symmetry"].iloc[0])
@@ -1921,8 +1925,18 @@ def run_thermal_analysis(sim):
 
     # 서멀패드 메시 해상 강제: 패드(2mm)가 메시에 안 잡히면 도체가 고정온도 Al에
     # 수치적으로 직결되어 온도가 플레이트에 고정됨 (풀 도메인에서 실측된 함정)
-    _assign_thermal_mesh(ipk, objs)
+    _assign_thermal_mesh(
+        ipk,
+        objs,
+        side_block_level=int(
+            df.get(
+                "thermal_rx_side_block_mesh_level", pd.Series([5])
+            ).iloc[0]
+        ),
+    )
+    thermal_build_s = time.monotonic() - thermal_started
 
+    setup_started = time.monotonic()
     setup = ipk.create_setup(name=_THERMAL_SETUP_NAME)
     if not setup:
         raise RuntimeError("create_setup returned no ThermalSetup")
@@ -1942,10 +1956,13 @@ def run_thermal_analysis(sim):
             raise RuntimeError("ThermalSetup update returned False")
     except Exception as e:
         raise RuntimeError(f"ThermalSetup configuration failed: {e}") from e
+    thermal_setup_s = time.monotonic() - setup_started
 
     # Dispatch the one exact setup. Convergence evidence is independent of PyAEDT's
     # return value because the wrapper can report False after native work completed.
+    solve_started = time.monotonic()
     solve_result = _solve_exact_thermal_setup(sim, ipk, setup)
+    thermal_solve_s = time.monotonic() - solve_started
     solve_attempts = solve_result["solve_attempts"]
     analyze_call_ok = solve_result["analyze_call_ok"]
     analyze_return_false = solve_result["analyze_return_false"]
@@ -1964,6 +1981,7 @@ def run_thermal_analysis(sim):
         convergence["thermal_residual_energy"],
         convergence["thermal_convergence_reason"],
     )
+    extraction_started = time.monotonic()
 
     # ---- 온도 추출 (필드 계산기 직접 평가 - 리포트 기계 미사용) ----
     # 프로브 시트 (회귀학습용 주력 데이터: 위치 고정, 보간값이라 메시 스파이크에 강함)
@@ -2068,6 +2086,7 @@ def run_thermal_analysis(sim):
     required_group_count = len(required_keys)
 
     if convergence["thermal_converged"] != 1:
+        thermal_extraction_s = time.monotonic() - extraction_started
         summary = {
             "thermal_solved": [0],
             "thermal_extraction_complete": [0],
@@ -2094,6 +2113,10 @@ def run_thermal_analysis(sim):
             "thermal_probe_failures_json": [
                 serialize_probe_failures(probe_failures)
             ],
+            "thermal_build_s": [thermal_build_s],
+            "thermal_setup_s": [thermal_setup_s],
+            "thermal_solve_s": [thermal_solve_s],
+            "thermal_extraction_s": [thermal_extraction_s],
             "thermal_rx_model": [sim.thermal_rx_model],
             "thermal_rx_power_balance_ok": [1 if rx_balance_ok else 0],
             "thermal_rx_power_balance_group_count": [len(rx_balance)],
@@ -2339,6 +2362,7 @@ def run_thermal_analysis(sim):
     group_values = {
         key: _group_max(objects) for key, objects in group_objects.items()
     }
+    thermal_extraction_s = time.monotonic() - extraction_started
     required_missing_count = sum(
         1 for key in required_keys
         if not group_objects[key] or not math.isfinite(float(group_values[key]))
@@ -2387,6 +2411,10 @@ def run_thermal_analysis(sim):
         "thermal_probe_failures_json": [
             serialize_probe_failures(probe_failures)
         ],
+        "thermal_build_s": [thermal_build_s],
+        "thermal_setup_s": [thermal_setup_s],
+        "thermal_solve_s": [thermal_solve_s],
+        "thermal_extraction_s": [thermal_extraction_s],
         "thermal_rx_model": [sim.thermal_rx_model],
         "thermal_rx_power_balance_ok": [1 if rx_balance_ok else 0],
         "thermal_rx_power_balance_group_count": [len(rx_balance)],
