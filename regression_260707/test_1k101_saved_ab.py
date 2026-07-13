@@ -5,6 +5,9 @@ from pathlib import Path
 import unittest
 
 from regression_260707.verify.run_1k101_saved_ab import (
+    _expected_core_group_indices,
+    _symmetry_factors,
+    _validate_core_topology,
     evaluate_numerical_gates,
     parse_args,
     relative_error,
@@ -14,6 +17,10 @@ from regression_260707.verify.run_1k101_saved_ab import (
 GATE_PATH = (
     Path(__file__).resolve().parent / "verify" / "1k101_native_ab_gate.json"
 )
+FULL_CORE_REGIONS = (
+    "leg_left", "leg_center", "leg_right", "yoke_bottom", "yoke_top",
+)
+SYMMETRY_CORE_REGIONS = ("leg_left", "leg_center", "yoke_top")
 
 
 def gate_spec():
@@ -53,6 +60,95 @@ class RelativeErrorTests(unittest.TestCase):
         self.assertIsNone(relative_error(None, 1.0))
         self.assertIsNone(relative_error(float("nan"), 1.0))
         self.assertIsNone(relative_error(1.0, float("inf")))
+
+
+class CoreTopologyValidationTests(unittest.TestCase):
+    @staticmethod
+    def _group(group_index, regions):
+        return [f"core_{group_index}_{region}" for region in regions]
+
+    def test_task_30542_two_group_eighth_model_retains_only_group_two(self):
+        core_groups = {2: self._group(2, SYMMETRY_CORE_REGIONS)}
+
+        _validate_core_topology(
+            core_groups, {"n_core_group": 2, "full_model": 0}
+        )
+
+    def test_eighth_model_group_expectation_covers_even_and_odd_counts(self):
+        self.assertEqual(_expected_core_group_indices(1, 0), [1])
+        self.assertEqual(_expected_core_group_indices(2, 0), [2])
+        self.assertEqual(_expected_core_group_indices(3, 0), [2, 3])
+        self.assertEqual(_expected_core_group_indices(4, 0), [3, 4])
+
+    def test_eighth_model_rejects_deleted_or_extra_group_ids(self):
+        for actual in (
+            {1: self._group(1, SYMMETRY_CORE_REGIONS)},
+            {
+                1: self._group(1, SYMMETRY_CORE_REGIONS),
+                2: self._group(2, SYMMETRY_CORE_REGIONS),
+            },
+        ):
+            with self.subTest(actual=sorted(actual)), self.assertRaisesRegex(
+                RuntimeError, r"core group coverage mismatch: .*expected=\[2\]"
+            ):
+                _validate_core_topology(
+                    actual, {"n_core_group": 2, "full_model": 0}
+                )
+
+    def test_full_model_requires_every_group_and_all_five_regions(self):
+        complete = {
+            group: self._group(group, FULL_CORE_REGIONS) for group in (1, 2)
+        }
+        _validate_core_topology(
+            complete, {"n_core_group": 2, "full_model": 1}
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"core group coverage mismatch: .*expected=\[1, 2\]"
+        ):
+            _validate_core_topology(
+                {2: complete[2]}, {"n_core_group": 2, "full_model": 1}
+            )
+
+    def test_eighth_model_requires_exactly_the_three_surviving_regions(self):
+        wrong = {2: self._group(2, FULL_CORE_REGIONS)}
+
+        with self.assertRaisesRegex(
+            RuntimeError, "eighth-symmetry retained core topology mismatch"
+        ):
+            _validate_core_topology(
+                wrong, {"n_core_group": 2, "full_model": 0}
+            )
+
+    def test_geometry_factor_restores_both_whole_and_halved_retained_groups(self):
+        params = {
+            "loss_sym_on": 1,
+            "full_model": 0,
+            "w1": 300.0,
+            "core_plate_t": 10.0,
+            "core_plate_pad_t": 0.0,
+            "core_y": 1.74,
+        }
+        for group_count, object_name, expected_cuts in (
+            (2, "core_2_leg_left", 2),
+            (3, "core_2_leg_left", 3),
+            (3, "core_3_leg_left", 2),
+        ):
+            params["n_core_group"] = group_count
+            with self.subTest(group_count=group_count, object_name=object_name):
+                cut_count, _loss_factor, geometry_factor = _symmetry_factors(
+                    object_name, params
+                )
+                self.assertEqual(cut_count, expected_cuts)
+                self.assertEqual(geometry_factor, 8.0)
+
+        params.update({"n_core_group": 2, "loss_sym_on": 0})
+        cut_count, loss_factor, geometry_factor = _symmetry_factors(
+            "core_2_leg_left", params
+        )
+        self.assertEqual(cut_count, 2)
+        self.assertEqual(loss_factor, 8.0)
+        self.assertEqual(geometry_factor, 8.0)
 
 
 class SavedAbGateEvaluationTests(unittest.TestCase):

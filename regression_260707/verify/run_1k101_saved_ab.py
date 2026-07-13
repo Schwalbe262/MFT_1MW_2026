@@ -49,6 +49,7 @@ CORE_OBJECT_RE = re.compile(
 CORE_REGIONS = (
     "leg_left", "leg_center", "leg_right", "yoke_bottom", "yoke_top",
 )
+SYMMETRY_CORE_REGIONS = ("leg_left", "leg_center", "yoke_top")
 REQUIRED_PARAM_KEYS = {
     "V1_rms", "freq", "N1_main", "N1_side", "l1", "l2", "h1", "w1",
     "n_core_group", "core_plate_t", "core_plate_pad_t", "core_cm",
@@ -618,6 +619,50 @@ def _core_objects(editor) -> dict[int, list[str]]:
     return dict(sorted(groups.items()))
 
 
+def _expected_core_group_indices(
+    n_core_group: int, full_model: Any,
+) -> list[int]:
+    group_count = int(n_core_group)
+    if group_count < 1:
+        raise ValueError(f"n_core_group must be positive, got {group_count}")
+    if bool(int(full_model)):
+        return list(range(1, group_count + 1))
+
+    # create_core places group i about
+    # (i - (n + 1) / 2) * (core_depth + plate_stack).  The XZ
+    # PositiveOnly split therefore deletes the negative-y groups; for odd n it
+    # halves the central group.  The retained IDs start at floor(n / 2) + 1.
+    return list(range(group_count // 2 + 1, group_count + 1))
+
+
+def _validate_core_topology(
+    core_groups: Mapping[int, list[str]], params: Mapping[str, Any],
+) -> None:
+    full_model = bool(int(params["full_model"]))
+    expected_groups = _expected_core_group_indices(
+        int(params["n_core_group"]), full_model
+    )
+    actual_groups = sorted(core_groups)
+    if actual_groups != expected_groups:
+        raise RuntimeError(
+            f"core group coverage mismatch: actual={actual_groups}, "
+            f"expected={expected_groups}"
+        )
+
+    expected_regions = CORE_REGIONS if full_model else SYMMETRY_CORE_REGIONS
+    topology = "full" if full_model else "eighth-symmetry retained"
+    for group_index in expected_groups:
+        expected_names = [
+            f"core_{group_index}_{region}" for region in expected_regions
+        ]
+        actual_names = core_groups[group_index]
+        if actual_names != expected_names:
+            raise RuntimeError(
+                f"{topology} core topology mismatch for group {group_index}: "
+                f"actual={actual_names}, expected={expected_names}"
+            )
+
+
 def _solution_marker(raw_design) -> tuple[str, ...]:
     solutions = raw_design.GetModule("Solutions")
     values = solutions.GetAvailableVariations("Setup1 : LastAdaptive") or []
@@ -900,17 +945,22 @@ def _symmetry_factors(object_name: str, params: Mapping[str, Any]) -> tuple[int,
     from module.input_parameter_260706 import sym_cut_count
     import pandas as pd
 
-    loss_sym = bool(int(params["loss_sym_on"])) and not bool(int(params["full_model"]))
-    if not loss_sym:
+    if bool(int(params["full_model"])):
         return 0, 1.0, 1.0
     # sym_cut_count only needs raw input columns; preserve the established helper.
     frame = pd.DataFrame([dict(params)])
     cut_count = int(sym_cut_count(object_name, frame))
     mirror_factor = 1.0 if cut_count == 3 else 2.0
-    core_loss_factor = (
-        (2.0 ** cut_count) / (2.0 ** float(params["core_y"])) * mirror_factor
-    )
+    # Core volume is summed only over retained y>=0 groups.  A group wholly on
+    # that side has c=2 (x/z) and mirror_factor=2 to restore its deleted y twin;
+    # an odd central group has c=3 (x/y/z) and no distinct twin.  Both paths
+    # restore the retained-volume basis by 8 to the complete physical core.
     geometry_factor = (2.0 ** cut_count) * mirror_factor
+    loss_amplitude_factor = (
+        2.0 ** float(params["core_y"])
+        if bool(int(params["loss_sym_on"])) else 1.0
+    )
+    core_loss_factor = geometry_factor / loss_amplitude_factor
     return cut_count, core_loss_factor, geometry_factor
 
 
@@ -1129,24 +1179,10 @@ def _extract_saved_solution(
             raw_design.SetActiveEditor,
             "3D Modeler",
         )
-        expected_group_count = int(params["n_core_group"])
-        if sorted(core_groups) != list(range(1, expected_group_count + 1)):
-            raise RuntimeError(
-                f"core group coverage mismatch: actual={sorted(core_groups)}, "
-                f"expected=1..{expected_group_count}"
-            )
+        _validate_core_topology(core_groups, params)
         loss_sym = bool(int(params["loss_sym_on"])) and not bool(
             int(params["full_model"])
         )
-        if not loss_sym:
-            for group_index, names in core_groups.items():
-                expected_names = [
-                    f"core_{group_index}_{region}" for region in CORE_REGIONS
-                ]
-                if names != expected_names:
-                    raise RuntimeError(
-                        f"full core topology mismatch for group {group_index}: {names}"
-                    )
 
         variable_checks = {}
         for key in PROJECT_VARIABLE_KEYS:
