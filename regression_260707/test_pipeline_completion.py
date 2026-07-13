@@ -83,6 +83,17 @@ class StrictRowContractTests(unittest.TestCase):
             valid_result(P_wcp_total=-1.0)
         ).full_valid)
 
+    def test_explicit_turn_profile_identity_matches_thermal_model(self):
+        current = validate_record(valid_result())
+        historical = validate_record(valid_result(
+            n_explicit_turns=2,
+            thermal_rx_model="hybrid_explicit",
+        ))
+
+        self.assertNotIn("profile_mismatch:n_explicit_turns", current.reasons)
+        self.assertIn("profile_mismatch:n_explicit_turns", historical.reasons)
+        self.assertFalse(historical.full_valid)
+
     def test_training_filter_uses_strict_full_for_every_target(self):
         good = valid_result(N1_main=3, l1=100.0)
         bad = valid_result(

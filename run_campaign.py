@@ -12,7 +12,8 @@ import subprocess
 import sys
 
 DEFAULT_ARGS = ("--count 20 --thermal --headless "
-                "--set percent_error=1.0 --set max_passes=14 --set P_target=1e6")
+                "--set percent_error=1.0 --set max_passes=14 --set P_target=1e6 "
+                "--set n_explicit_turns=0")
 
 
 def main():

@@ -961,6 +961,20 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
                 call.kwargs["json"]["timeout_seconds"],
                 scheduler_client.DEFAULT_TASK_TIMEOUT_SECONDS)
 
+    def test_profiles_override_candidate_explicit_turn_count(self):
+        standard = standard_submitted_params(n_explicit_turns=4)
+        fine_profile = json.loads(
+            (HERE / "verify" / "profiles" / "fine.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fine = scheduler_client.effective_verification_params(
+            complete_candidate_params(n_explicit_turns=4), fine_profile
+        )
+
+        self.assertEqual(standard["n_explicit_turns"], 0)
+        self.assertEqual(fine["n_explicit_turns"], 2)
+
     def test_validity_requires_finite_candidate_specific_fields(self):
         self.assertTrue(scheduler_client.is_valid_result(
             valid_result(), expected_revision=TEST_REVISION,

@@ -30,10 +30,14 @@ from module.modeling_260706 import (
 from module.input_parameter_260706 import get_tx_y_gaps, set_design_variables
 from module.core_material_contract import PHYSICS_DATA_REVISION
 from module.thermal_probe_contract import (
+    ProbeSheetCollection,
     RX_SIDE_FACE_MAX_RULE,
     RX_SIDE_FACE_MEAN_RULE,
     RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
     aggregate_rx_side_faces,
+    parse_temperature_celsius,
+    serialize_probe_failures,
+    validate_probe_rectangle,
 )
 
 
@@ -1326,23 +1330,37 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
     l2 = float(df["l2"].iloc[0])
     cw1 = float(df["cw1"].iloc[0])
 
-    sheets = []
+    sheets = ProbeSheetCollection()
 
-    def _sheet(name, orientation, origin, sizes, *, required=False):
+    def _sheet(name, orientation, origin, sizes, *, required=True):
+        sheets.expect(name)
         try:
+            orientation, origin, sizes = validate_probe_rectangle(
+                name, orientation, origin, sizes
+            )
             obj = ipk.modeler.create_rectangle(
                 orientation=orientation, origin=[f"{v}mm" for v in origin],
                 sizes=[f"{v}mm" for v in sizes], name=name
             )
+            if isinstance(obj, bool) or obj is None:
+                raise RuntimeError(f"create_rectangle returned {obj!r}")
+            if str(getattr(obj, "name", "")) != name:
+                raise RuntimeError(
+                    f"created object name is {getattr(obj, 'name', None)!r}"
+                )
+            if getattr(obj, "is3d", None) is not False:
+                raise RuntimeError(
+                    f"created object is not a sheet (is3d={getattr(obj, 'is3d', None)!r})"
+                )
             obj.model = False
             sheets.append(obj)
             return obj
         except Exception as e:
-            if required:
-                raise RuntimeError(
-                    f"required thermal probe sheet {name} failed"
-                ) from e
-            logging.warning(f"probe sheet {name} failed: {e}")
+            stage = "geometry" if isinstance(e, ValueError) else "creation"
+            reason = "invalid_rectangle" if stage == "geometry" else "sheet_creation_failed"
+            sheets.record_failure(name, stage, reason, e)
+            level = logging.error if required else logging.warning
+            level("probe sheet %s failed before solve: %s", name, e)
             return None
 
     mode = mode or ("eighth" if eighth else "full")
@@ -1371,7 +1389,11 @@ def _create_probe_sheets(ipk, df, objs, eighth=False, mode=None):
     _sheet("Tprobe_Tx_leeward", "YZ", [x_probe, y_start, z0], [(tx_y[-1] - tx_y[0]) + cw1, z1 - z0])
     # XZ 평면 시트 (y=0): x- 런의 단면 (보유 옥탄트가 x<=0)
     # 주의: Y-법선("XZ"/"ZX") 사각형의 AEDT 치수 순서는 [z스팬, x스팬] (전치 버그 수정)
-    _sheet("Tprobe_Tx_side", "XZ", [-(tx_x[-1] + cw1 / 2), 0, z0], [z1 - z0, (tx_x[-1] - tx_x[0]) + cw1])
+    _sheet(
+        "Tprobe_Tx_side", "XZ", [-(tx_x[-1] + cw1 / 2), 0, z0],
+        [z1 - z0, (tx_x[-1] - tx_x[0]) + cw1],
+        required=int(df["N1_side"].iloc[0]) > 0,
+    )
 
     # ---- Rx 그룹 공통 생성기 ----
     def _rx_probes(prefix, name, offset_x):
@@ -1951,6 +1973,11 @@ def run_thermal_analysis(sim):
     for s in probe_sheets:
         probe.append((s, f"{s.name}_max", "max"))
         probe.append((s, f"{s.name}_mean", "mean"))
+    actual_probe_sheet_names = [sheet.name for sheet in probe_sheets]
+    expected_probe_sheet_names = list(getattr(
+        probe_sheets, "expected_names", actual_probe_sheet_names
+    ))
+    probe_failures = list(getattr(probe_sheets, "failures", []))
     vol_objs = (objs["Tx"] + objs["Rx_main_explicit"] + objs["Rx_main_blocks"]
                 + objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
                 + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"] + objs["core"])
@@ -1958,29 +1985,43 @@ def run_thermal_analysis(sim):
         probe.append((o, f"T_mean_{o.name}", "mean"))
         probe.append((o, f"T_max_{o.name}", "max"))
 
-    field_expected_cols = list(dict.fromkeys(col for _, col, _ in probe))
+    expected_probe_cols = [
+        f"{name}_{stat}"
+        for name in expected_probe_sheet_names
+        for stat in ("max", "mean")
+    ]
+    field_expected_cols = list(dict.fromkeys(
+        [col for _, col, _ in probe] + expected_probe_cols
+    ))
     core_region_sheet_names = {
         "center": [
-            sheet.name for sheet in probe_sheets
-            if sheet.name.startswith("Tprobe_core_center_leg")
+            name for name in expected_probe_sheet_names
+            if name.startswith("Tprobe_core_center_leg")
         ],
         "side": [
-            sheet.name for sheet in probe_sheets
-            if sheet.name.startswith("Tprobe_core_side_leg")
+            name for name in expected_probe_sheet_names
+            if name.startswith("Tprobe_core_side_leg")
         ],
         "top_yoke": [
-            sheet.name for sheet in probe_sheets
-            if sheet.name.startswith("Tprobe_core_top_yoke")
+            name for name in expected_probe_sheet_names
+            if name.startswith("Tprobe_core_top_yoke")
         ],
     }
     rx_side_outer_sheet_names = [
-        sheet.name for sheet in probe_sheets
-        if sheet.name in {"Tprobe_Rx_side_side", "Tprobe_Rx_side2_side"}
+        name for name in expected_probe_sheet_names
+        if name in {"Tprobe_Rx_side_side", "Tprobe_Rx_side2_side"}
     ]
     rx_side_inner_sheet_names = [
-        sheet.name for sheet in probe_sheets
-        if sheet.name in {"Tprobe_Rx_side1_inner", "Tprobe_Rx_side2_inner"}
+        name for name in expected_probe_sheet_names
+        if name in {"Tprobe_Rx_side1_inner", "Tprobe_Rx_side2_inner"}
     ]
+    rx_side_face_names = {
+        "Tprobe_Rx_side_side", "Tprobe_Rx_side1_inner",
+        "Tprobe_Rx_side2_side", "Tprobe_Rx_side2_inner",
+    }
+    actual_rx_side_face_count = sum(
+        name in rx_side_face_names for name in actual_probe_sheet_names
+    )
     aggregate_core_cols = []
     if all(core_region_sheet_names.values()):
         aggregate_core_cols = [
@@ -2045,6 +2086,14 @@ def run_thermal_analysis(sim):
             "thermal_field_summary_attempts": [0],
             "thermal_field_summary_value_count": [0],
             "thermal_calculator_attempts": [0],
+            "thermal_extraction_method": ["not_attempted"],
+            "thermal_extraction_failure_reason": [
+                f"solve_not_converged:{convergence['thermal_convergence_reason']}"
+            ],
+            "thermal_probe_failure_count": [len(probe_failures)],
+            "thermal_probe_failures_json": [
+                serialize_probe_failures(probe_failures)
+            ],
             "thermal_rx_model": [sim.thermal_rx_model],
             "thermal_rx_power_balance_ok": [1 if rx_balance_ok else 0],
             "thermal_rx_power_balance_group_count": [len(rx_balance)],
@@ -2058,7 +2107,7 @@ def run_thermal_analysis(sim):
             "thermal_rx_side_probe_mean_rule": [RX_SIDE_FACE_MEAN_RULE],
             "thermal_rx_side_probe_selected_face": [""],
             "thermal_rx_side_probe_face_count": [
-                len(rx_side_outer_sheet_names) + len(rx_side_inner_sheet_names)
+                actual_rx_side_face_count
             ],
             "T_max_Tx": [float("nan")],
             "T_max_Rx_main": [float("nan")],
@@ -2093,8 +2142,8 @@ def run_thermal_analysis(sim):
         return po
 
     # ---- 1차: Field Summary 일괄 (호출 1회, GUI/리눅스 공통 신뢰 경로) ----
-    # Calculator/ClcEval calls are intentionally excluded: they do not recover
-    # objects with zero mesh volume and repeatedly fail through gRPC.
+    field_summary_issues = {}
+
     def _field_summary_bulk(entries):
         fs = _post_of(native_ipk).create_field_summary()
         seen = set()
@@ -2112,21 +2161,41 @@ def run_thermal_analysis(sim):
         # 컬럼: Entity/Geometry/Quantity/Min/Max/Mean ... (버전에 따라 대소문자 상이)
         cols = {str(c).strip().lower(): c for c in df_fs.columns}
         name_c = cols.get("geometry name", cols.get("entity name", list(df_fs.columns)[2]))
+        unit_c = cols.get("unit", cols.get("units"))
         got = {}
         for obj, col, op in entries:
             row = df_fs[df_fs[name_c].astype(str) == str(obj.name)]
             if not len(row):
+                field_summary_issues[col] = "entity_not_returned"
                 continue
             want = cols.get("max" if op == "max" else "mean")
             if want is None:
+                field_summary_issues[col] = f"missing_{op}_column"
                 continue
             try:
-                value = float(row.iloc[0][want])
-                if math.isfinite(value):
-                    got[col] = value
-            except Exception:
-                pass
+                unit = row.iloc[0][unit_c] if unit_c is not None else None
+                got[col] = parse_temperature_celsius(row.iloc[0][want], unit)
+                field_summary_issues.pop(col, None)
+            except Exception as exc:
+                field_summary_issues[col] = (
+                    f"invalid_temperature:{type(exc).__name__}:{exc}"
+                )[:512]
         return got
+
+    def _scalar_probe_temperature(obj, op):
+        """Independent saved-field fallback, deliberately limited to sheets."""
+        post = _post_of(native_ipk)
+        getter = getattr(post, "get_scalar_field_value", None)
+        if not callable(getter):
+            raise RuntimeError("post processor has no scalar field API")
+        value = getter(
+            "Temp",
+            scalar_function="Maximum" if op == "max" else "Mean",
+            solution=solution,
+            object_name=obj.name,
+            object_type="surface",
+        )
+        return parse_temperature_celsius(value)
 
     def _refresh_core_probe_aggregates():
         """Select the hottest depth plane per leg, then the hottest leg."""
@@ -2205,9 +2274,54 @@ def run_thermal_analysis(sim):
 
     n_calc = 0
     calc_attempts = 0
+    scalar_probe_issues = {}
+    # AEDT can fail ExportFieldsSummary while the saved surface field remains
+    # readable.  Use the replay-proven scalar API only for missing probe-sheet
+    # statistics.  Never replace a missing modeled-volume maximum with a probe:
+    # that case indicates a genuine zero-mesh-volume thermal failure.
+    for obj, col, op in probe:
+        if col in temps or col in optional_cols or getattr(obj, "is3d", True):
+            continue
+        calc_attempts += 1
+        try:
+            _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
+            temps[col] = _scalar_probe_temperature(obj, op)
+            n_calc += 1
+        except Exception as exc:
+            scalar_probe_issues[col] = (
+                f"{type(exc).__name__}:{exc}"
+            )[:512]
+    _refresh_core_probe_aggregates()
+    _refresh_rx_side_face_aggregates()
 
     missing_cols = [col for col in expected_cols if col not in temps]
     required_missing_cols = [col for col in missing_cols if col not in optional_cols]
+    geometry_failure_names = {
+        str(failure.get("probe", "")) for failure in probe_failures
+    }
+    for name in expected_probe_sheet_names:
+        missing_stats = [
+            stat for stat in ("max", "mean")
+            if f"{name}_{stat}" in required_missing_cols
+        ]
+        if not missing_stats or name in geometry_failure_names:
+            continue
+        columns = [f"{name}_{stat}" for stat in missing_stats]
+        details = []
+        for column in columns:
+            if column in field_summary_issues:
+                details.append(f"field_summary={field_summary_issues[column]}")
+            if column in scalar_probe_issues:
+                details.append(f"scalar={scalar_probe_issues[column]}")
+        failure = {
+            "probe": name,
+            "stage": "extraction",
+            "reason": "saved_field_fallback_exhausted",
+            "columns": columns,
+        }
+        if details:
+            failure["detail"] = "; ".join(details)[:512]
+        probe_failures.append(failure)
     n_fail = len(missing_cols)
     logging.warning(
         f"[thermal] extraction: field-summary {n_fs}, calculator {n_calc}, "
@@ -2236,6 +2350,16 @@ def run_thermal_analysis(sim):
         and solution_data_available
         and required_complete
     )
+    if required_missing_count:
+        extraction_failure_reason = "required_volume_temperature_missing"
+    elif required_missing_cols:
+        extraction_failure_reason = "required_probe_temperature_missing"
+    else:
+        extraction_failure_reason = ""
+    extraction_method = (
+        "field_summary+scalar_field_calculator"
+        if calc_attempts else "field_summary"
+    )
 
     summary = {
         "thermal_solved": [1 if solved else 0],
@@ -2257,6 +2381,12 @@ def run_thermal_analysis(sim):
         "thermal_field_summary_attempts": [field_summary_attempts],
         "thermal_field_summary_value_count": [n_fs],
         "thermal_calculator_attempts": [calc_attempts],
+        "thermal_extraction_method": [extraction_method],
+        "thermal_extraction_failure_reason": [extraction_failure_reason],
+        "thermal_probe_failure_count": [len(probe_failures)],
+        "thermal_probe_failures_json": [
+            serialize_probe_failures(probe_failures)
+        ],
         "thermal_rx_model": [sim.thermal_rx_model],
         "thermal_rx_power_balance_ok": [1 if rx_balance_ok else 0],
         "thermal_rx_power_balance_group_count": [len(rx_balance)],
@@ -2270,7 +2400,7 @@ def run_thermal_analysis(sim):
         "thermal_rx_side_probe_mean_rule": [RX_SIDE_FACE_MEAN_RULE],
         "thermal_rx_side_probe_selected_face": [rx_side_selected_face],
         "thermal_rx_side_probe_face_count": [
-            len(rx_side_outer_sheet_names) + len(rx_side_inner_sheet_names)
+            actual_rx_side_face_count
         ],
         "thermal_core_loss_contract_version": [
             sim.thermal_core_loss_contract_version

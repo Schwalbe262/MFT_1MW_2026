@@ -1,6 +1,14 @@
+import json
+import math
 import unittest
 
-from module.thermal_probe_contract import aggregate_rx_side_faces
+from module.thermal_probe_contract import (
+    ProbeSheetCollection,
+    aggregate_rx_side_faces,
+    parse_temperature_celsius,
+    serialize_probe_failures,
+    validate_probe_rectangle,
+)
 
 
 class RxSideThermalProbeContractTest(unittest.TestCase):
@@ -39,6 +47,48 @@ class RxSideThermalProbeContractTest(unittest.TestCase):
 
         self.assertEqual(aggregate, {})
         self.assertEqual(selected, "")
+
+
+class ProbeExtractionContractTest(unittest.TestCase):
+    def test_rectangle_validation_rejects_nonfinite_and_zero_spans(self):
+        with self.assertRaisesRegex(ValueError, "finite"):
+            validate_probe_rectangle(
+                "Tprobe_bad", "XZ", [0.0, math.nan, 0.0], [2.0, 3.0]
+            )
+        with self.assertRaisesRegex(ValueError, "positive"):
+            validate_probe_rectangle(
+                "Tprobe_bad", "XZ", [0.0, 0.0, 0.0], [2.0, 0.0]
+            )
+
+    def test_rectangle_validation_normalizes_numeric_geometry(self):
+        orientation, origin, sizes = validate_probe_rectangle(
+            "Tprobe_ok", "xz", ["1", 2, 3.5], [4, "5.25"]
+        )
+        self.assertEqual(orientation, "XZ")
+        self.assertEqual(origin, (1.0, 2.0, 3.5))
+        self.assertEqual(sizes, (4.0, 5.25))
+
+    def test_temperature_parser_handles_units_and_rejects_nonfinite(self):
+        self.assertAlmostEqual(parse_temperature_celsius("84.25cel"), 84.25)
+        self.assertAlmostEqual(parse_temperature_celsius(357.15, "K"), 84.0)
+        with self.assertRaisesRegex(ValueError, "finite"):
+            parse_temperature_celsius(float("nan"))
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            parse_temperature_celsius("84.0 F")
+
+    def test_failure_serialization_is_structured_and_deterministic(self):
+        sheets = ProbeSheetCollection()
+        sheets.expect("Tprobe_core")
+        sheets.record_failure(
+            "Tprobe_core", "geometry", "invalid_rectangle", "zero span"
+        )
+        payload = serialize_probe_failures(sheets.failures)
+        self.assertEqual(json.loads(payload), [{
+            "probe": "Tprobe_core",
+            "stage": "geometry",
+            "reason": "invalid_rectangle",
+            "detail": "zero span",
+        }])
 
 
 if __name__ == "__main__":
