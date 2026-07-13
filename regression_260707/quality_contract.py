@@ -22,6 +22,24 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.thermal_probe_contract import (
+    RX_SIDE_FACE_MAX_RULE,
+    RX_SIDE_FACE_MEAN_RULE,
+    RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
+)
+
+try:
+    from .model_targets import (
+        CORE_REGION_TEMPERATURE_TARGETS,
+        SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    )
+except ImportError:  # Script execution with regression_260707 on sys.path.
+    from model_targets import (
+        CORE_REGION_TEMPERATURE_TARGETS,
+        SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    )
+
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PROFILE_PATH = HERE / "verify" / "profiles" / "standard.json"
@@ -34,6 +52,7 @@ MATRIX_REQUIRED_OUTPUTS = (
 LOSS_REQUIRED_OUTPUTS = (
     "P_core_total", "P_core_plate_total", "P_wcp_total",
     "P_winding_total", "B_mean_core", "B_max_core",
+    *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
 )
 MANDATORY_TEMPERATURE_COLUMNS = (
     "T_max_Tx",
@@ -42,10 +61,18 @@ MANDATORY_TEMPERATURE_COLUMNS = (
     "Tprobe_Tx_leeward_max",
     "Tprobe_Rx_main_leeward_max",
     "Tprobe_core_center_max",
+    *CORE_REGION_TEMPERATURE_TARGETS,
 )
 SIDE_TEMPERATURE_COLUMNS = (
     "T_max_Rx_side",
     "Tprobe_Rx_side_leeward_max",
+)
+STACKING_REVISION_SIDE_TEMPERATURE_COLUMNS = (
+    "Tprobe_Rx_side_leeward_mean",
+    "Tprobe_Rx_side_outer_max",
+    "Tprobe_Rx_side_outer_mean",
+    "Tprobe_Rx_side_inner_max",
+    "Tprobe_Rx_side_inner_mean",
 )
 FLOW_RESIDUAL_COLUMNS = (
     "thermal_residual_continuity",
@@ -225,14 +252,74 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
             if _number(record, key) is None:
                 reasons.append(f"{label}:nonfinite_output:{key}")
 
-    for key in ("P_core_total", "P_core_plate_total", "P_wcp_total", "P_winding_total"):
+    for key in (
+        "P_core_total", "P_core_plate_total", "P_wcp_total",
+        "P_winding_total", *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    ):
         value = _number(record, key)
         if value is not None and value < 0:
             reasons.append(f"loss:negative_output:{key}")
+    winding_total = _number(record, "P_winding_total")
+    winding_components = [
+        _number(record, key)
+        for key in SURROGATE_WINDING_COMPONENT_LOSS_TARGETS
+    ]
+    if winding_total is not None and all(
+        value is not None for value in winding_components
+    ) and not math.isclose(
+        winding_total,
+        sum(winding_components),
+        rel_tol=1e-9,
+        abs_tol=1e-6,
+    ):
+        reasons.append("loss:winding_component_sum_mismatch")
     for key in ("B_mean_core", "B_max_core"):
         value = _number(record, key)
         if value is not None and value < 0:
             reasons.append(f"loss:negative_output:{key}")
+    if str(_value(record, "physics_data_revision") or "").strip() == (
+        PHYSICS_DATA_REVISION
+    ):
+        for key in (
+            "core_native_material_readback_attested",
+            "core_loss_native_attested",
+            "flux_linkage_attested",
+            "B_mean_faraday_attested",
+        ):
+            if not _one(record, key):
+                reasons.append(f"native_lamination:{key}")
+        loss_error = _number(record, "core_loss_native_rel_error")
+        loss_tolerance = _number(record, "core_loss_native_tolerance_rel")
+        if (
+            loss_error is None or loss_tolerance is None
+            or not 0 <= loss_error <= loss_tolerance <= 0.30
+        ):
+            reasons.append("native_lamination:core_loss_faraday_mass_attestation")
+        b_error = _number(
+            record, "B_mean_material_vs_sine_analytic_rel_error"
+        )
+        b_tolerance = _number(record, "B_mean_faraday_tolerance_rel")
+        if (
+            b_error is None or b_tolerance is None
+            or not 0 <= b_error <= b_tolerance <= 0.15
+        ):
+            reasons.append("native_lamination:B_mean_faraday_attestation")
+        if str(_value(record, "core_loss_reference_basis") or "") != (
+            "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
+            "POWERLITE_Wkg_times_effective_mass"
+        ):
+            reasons.append("native_lamination:core_loss_reference_basis")
+        for key in (
+            "core_surface_flux_vs_linkage_rel_error",
+            "core_surface_flux_vs_induced_voltage_rel_error",
+        ):
+            value = _number(record, key)
+            if value is None or not 0 <= value <= 0.05:
+                reasons.append(f"native_lamination:{key}")
+        if str(_value(
+            record, "core_native_model_approval_status"
+        ) or "") != "approved_by_isolated_solved_kf_ab":
+            reasons.append("native_lamination:solved_ab_not_approved")
     llt = _number(record, "Llt")
     if llt is not None and llt <= 0:
         reasons.append("matrix:nonpositive_output:Llt")
@@ -282,6 +369,33 @@ def _thermal_reasons(record: Mapping[str, Any]) -> list[str]:
     ):
         if not _one(record, key):
             reasons.append(f"thermal_flag:{key}")
+    if str(_value(record, "physics_data_revision") or "").strip() == (
+        PHYSICS_DATA_REVISION
+    ):
+        if str(_value(record, "thermal_core_loss_source") or "") != (
+            "aedt_native_lamination_loss_attested_then_margin_adjusted"
+        ):
+            reasons.append("native_thermal:core_loss_source")
+        count = _number(record, "thermal_core_native_readback_count")
+        if count is None or count < 1 or count != math.floor(count):
+            reasons.append("native_thermal:readback_count")
+        balance = _number(record, "thermal_core_native_restored_rel_error")
+        if balance is None or not 0 <= balance <= 1e-12:
+            reasons.append("native_thermal:restored_power_balance")
+        margin = _number(record, "thermal_core_loss_correction_factor")
+        if margin is None or not math.isclose(
+            margin, 1.15, rel_tol=0.0, abs_tol=1e-12
+        ):
+            reasons.append("native_thermal:loss_margin")
+        expected = _number(
+            record, "thermal_core_full_expected_margin_adjusted_w"
+        )
+        p_core = _number(record, "P_core_total")
+        if (
+            expected is None or p_core is None
+            or not math.isclose(expected, p_core, rel_tol=1e-12, abs_tol=1e-9)
+        ):
+            reasons.append("native_thermal:em_to_icepak_core_power")
     if _number(record, "thermal_required_missing_count") != 0.0:
         reasons.append("thermal_extraction:required_missing")
     iterations = _number(record, "thermal_iterations")
@@ -314,12 +428,47 @@ def _thermal_reasons(record: Mapping[str, Any]) -> list[str]:
     required = list(MANDATORY_TEMPERATURE_COLUMNS)
     if side_required:
         required.extend(SIDE_TEMPERATURE_COLUMNS)
+    new_probe_contract_required = (
+        side_required
+        and str(_value(record, "physics_data_revision") or "").strip()
+        == PHYSICS_DATA_REVISION
+    )
+    if new_probe_contract_required:
+        required.extend(STACKING_REVISION_SIDE_TEMPERATURE_COLUMNS)
     for key in required:
         value = _number(record, key)
         if value is None:
             reasons.append(f"thermal_temperature:nonfinite:{key}")
         elif not MIN_TRUSTED_TEMPERATURE_C < value < MAX_TRUSTED_TEMPERATURE_C:
             reasons.append(f"thermal_temperature:untrusted:{key}")
+
+    if new_probe_contract_required:
+        if str(_value(
+            record, "thermal_rx_side_probe_contract_version"
+        ) or "") != RX_SIDE_FACE_PROBE_CONTRACT_VERSION:
+            reasons.append("thermal_probe:rx_side_contract_version")
+        if str(_value(
+            record, "thermal_rx_side_probe_max_rule"
+        ) or "") != RX_SIDE_FACE_MAX_RULE:
+            reasons.append("thermal_probe:rx_side_max_rule")
+        if str(_value(
+            record, "thermal_rx_side_probe_mean_rule"
+        ) or "") != RX_SIDE_FACE_MEAN_RULE:
+            reasons.append("thermal_probe:rx_side_mean_rule")
+        selected_face = str(_value(
+            record, "thermal_rx_side_probe_selected_face"
+        ) or "")
+        if selected_face not in {
+            "Tprobe_Rx_side_side", "Tprobe_Rx_side1_inner",
+            "Tprobe_Rx_side2_side", "Tprobe_Rx_side2_inner",
+        }:
+            reasons.append("thermal_probe:rx_side_selected_face")
+        mode = str(_value(record, "thermal_symmetry") or "").strip().lower()
+        expected_face_count = 4.0 if mode == "full" else 2.0
+        if _number(
+            record, "thermal_rx_side_probe_face_count"
+        ) != expected_face_count:
+            reasons.append("thermal_probe:rx_side_face_count")
 
     explicit_turns = _number(record, "n_explicit_turns")
     if explicit_turns is None or explicit_turns < 0:

@@ -4,6 +4,13 @@ import os
 import numpy as np
 import pandas as pd
 
+from module.core_material_contract import (
+    AREA_BASIS_GROSS_HOMOGENEOUS,
+    build_core_material_contract_fields,
+    effective_area_m2,
+    geometry_volume_and_masses,
+)
+
 
 N1_MIN_TURNS = 5
 N1_MAX_TURNS = 8
@@ -45,6 +52,17 @@ KEYS = [
     "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config", "loss_from_copy",
     "thermal_max_iterations", "conductor_temp_C",
 ]
+
+# Material constants are explicit input/result columns but deliberately stay
+# outside KEYS.  KEYS is the sealed Sobol/campaign identity schema; adding a
+# fixed constant there would rewrite existing candidate hashes without changing
+# their geometry.  The pinned solver revision plus these echoed columns binds
+# the material policy unambiguously.
+CORE_MATERIAL_INPUT_KEYS = (
+    "core_lamination_factor",
+    "core_loss_margin",
+)
+ALL_INPUT_KEYS = [*KEYS, *CORE_MATERIAL_INPUT_KEYS]
 
 
 def get_drawing_default_params():
@@ -105,6 +123,11 @@ def get_drawing_default_params():
         # 코어손실 계수 (2605SA1: P[W/kg]=6.5 f(kHz)^1.51 B^1.74, 밀도 7180kg/m3
         #  -> ANSYS Power Ferrite (W/m3, Hz): cm = 6.5*7180/1000^1.51 = 1.377)
         "core_cm": 1.377, "core_x": 1.51, "core_y": 1.74,
+        # UU137 approval-sheet guaranteed minimum.  ``core_cm`` remains the
+        # traceable POWERLITE base coefficient; validation derives the gross-
+        # geometry coefficient assigned to Maxwell.
+        "core_lamination_factor": 0.85,
+        "core_loss_margin": 1.15,
         # 디자인 활성화
         "matrix_on": 1,          # design1: L/k 매트릭스 (전류원)
         "loss_on": 1,            # design2: 손실 원샷 (Tx 전압원 + Rx 전류원 + 코어손실)
@@ -175,18 +198,28 @@ def create_input_parameter(param=None):
     if param is not None:
 
         if isinstance(param, dict):
-            unknown = set(param.keys()) - set(KEYS)
+            unknown = set(param.keys()) - set(ALL_INPUT_KEYS)
             if unknown:
-                raise ValueError(f"Unknown parameter keys: {sorted(unknown)}. Valid keys: {KEYS}")
+                raise ValueError(
+                    f"Unknown parameter keys: {sorted(unknown)}. "
+                    f"Valid keys: {ALL_INPUT_KEYS}"
+                )
             values = get_drawing_default_params()
             values.update(param)
-            param_df = pd.DataFrame([[values[k] for k in KEYS]], columns=KEYS)
+            param_df = pd.DataFrame(
+                [[values[k] for k in ALL_INPUT_KEYS]], columns=ALL_INPUT_KEYS
+            )
 
         elif isinstance(param, pd.DataFrame):
+            param = param.copy()
+            defaults = get_drawing_default_params()
+            for key in ("core_lamination_factor", "core_loss_margin"):
+                if key not in param.columns:
+                    param[key] = defaults[key]
             missing = set(KEYS) - set(param.columns)
             if missing:
                 raise ValueError(f"Missing parameter columns: {sorted(missing)}")
-            param_df = param[KEYS].copy()
+            param_df = param[ALL_INPUT_KEYS].copy()
 
         else:
             if isinstance(param, (list, tuple)) and len(param) > 0:
@@ -198,7 +231,12 @@ def create_input_parameter(param=None):
     else:
         param_df = _create_random_parameter_sobol()
 
-    return param_df
+    defaults = get_drawing_default_params()
+    for key in CORE_MATERIAL_INPUT_KEYS:
+        if key not in param_df.columns:
+            param_df[key] = defaults[key]
+
+    return param_df[ALL_INPUT_KEYS]
 
 
 # Sobol 시퀀스 상태 (프로세스 내 공유; 프로세스마다 다른 seed로 scramble)
@@ -471,12 +509,41 @@ def _add_derived_features(inp):
     d = float(inp["core_depth_each"].iloc[0]); n = int(inp["n_core_group"].iloc[0])
 
     iron_depth = n * d  # 콜드플레이트 제외 순수 철심 깊이 [mm]
-    Ae_m2 = (2 * l1 * 1e-3) * (iron_depth * 1e-3)          # 중심 레그 단면적
+    Ae_gross_m2 = (2 * l1 * 1e-3) * (iron_depth * 1e-3)    # gross center-leg pack area
     face_mm2 = (4 * l1 + 2 * l2) * (h1 + 2 * l1) - 2 * l2 * h1
-    core_vol_m3 = face_mm2 * iron_depth * 1e-9
-    inp["Ae_m2"] = [Ae_m2]
-    inp["core_vol_m3"] = [core_vol_m3]
-    inp["core_mass_kg"] = [core_vol_m3 * 7180.0]           # 2605SA1 밀도
+    core_vol_gross_m3 = face_mm2 * iron_depth * 1e-9
+    kf = float(inp["core_lamination_factor"].iloc[0])
+    basis = str(inp["core_geometry_material_basis"].iloc[0])
+    Ae_effective_m2 = effective_area_m2(
+        Ae_gross_m2, kf, area_basis=basis
+    )
+    (
+        core_vol_geometry_m3,
+        core_vol_effective_m3,
+        core_mass_gross_kg,
+        core_mass_effective_kg,
+    ) = geometry_volume_and_masses(
+        core_vol_gross_m3,
+        kf,
+        density_kg_m3=float(inp["core_mass_density_kg_m3"].iloc[0]),
+        area_basis=basis,
+    )
+
+    # Backward-compatible aliases retain their historical gross-geometry
+    # meaning. New consumers must use the explicit gross/effective columns.
+    inp["Ae_m2"] = [Ae_gross_m2]
+    inp["core_vol_m3"] = [core_vol_geometry_m3]
+    inp["core_mass_kg"] = [core_mass_gross_kg]
+    inp["Ae_gross_m2"] = [Ae_gross_m2]
+    inp["Ae_effective_m2"] = [Ae_effective_m2]
+    inp["core_vol_gross_m3"] = [core_vol_geometry_m3]
+    inp["core_vol_effective_m3"] = [core_vol_effective_m3]
+    inp["core_mass_gross_kg"] = [core_mass_gross_kg]
+    inp["core_mass_effective_kg"] = [core_mass_effective_kg]
+    inp["Ae_m2_basis"] = ["legacy_alias_gross_geometry"]
+    inp["core_mass_kg_basis"] = [
+        "legacy_alias_gross_geometry_bare_alloy_density"
+    ]
 
     def _cu(group_N, cw, gaps, slx, sly, height):
         if group_N <= 0:
@@ -525,6 +592,23 @@ def validation_check(input_df, strict=False, return_errors=False):
     """
     inp = input_df.copy()
     errors = []
+
+    material_contract_ok = False
+    try:
+        material_fields = build_core_material_contract_fields(
+            cm_base=inp["core_cm"].iloc[0],
+            core_x=inp["core_x"].iloc[0],
+            core_y=inp["core_y"].iloc[0],
+            lamination_factor=inp["core_lamination_factor"].iloc[0],
+            loss_margin=inp["core_loss_margin"].iloc[0],
+            area_basis=AREA_BASIS_GROSS_HOMOGENEOUS,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        errors.append(f"core material contract invalid: {exc}")
+    else:
+        for key, value in material_fields.items():
+            inp[key] = [value]
+        material_contract_ok = True
 
     N1_main = int(inp["N1_main"].iloc[0])
     N1_side = int(inp["N1_side"].iloc[0])
@@ -776,13 +860,14 @@ def validation_check(input_df, strict=False, return_errors=False):
         if min_gap < 20.0:
             errors.append(f"HV insulation coverage floor: min gap {min_gap:.1f} < 20mm")
 
-    result = len(errors) == 0
-
     # 파생 물리 특징량 (회귀학습 입력용) - 검증 통과 여부와 무관하게 계산
-    try:
-        _add_derived_features(inp)
-    except Exception:
-        pass
+    if material_contract_ok:
+        try:
+            _add_derived_features(inp)
+        except Exception as exc:
+            errors.append(f"derived feature calculation failed: {exc}")
+
+    result = len(errors) == 0
 
     if strict and not result:
         raise ValueError("Parameter validation failed: " + " / ".join(errors))
@@ -809,6 +894,7 @@ NON_DESIGN_VAR_KEYS = {
     "core_depth_min", "core_depth_max",
     "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config", "loss_from_copy",
     "thermal_max_iterations", "conductor_temp_C",
+    "core_lamination_factor", "core_loss_margin",
 }
 
 
