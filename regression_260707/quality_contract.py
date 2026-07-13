@@ -22,6 +22,15 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+# The strict contract is imported from repo-root scripts, the campaign
+# package, and standalone training loops; make module.* resolvable from
+# any of those working directories.
+import sys as _sys
+from pathlib import Path as _Path
+_REPO_ROOT = str(_Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+
 from module.core_material_contract import PHYSICS_DATA_REVISION
 from module.thermal_probe_contract import (
     RX_SIDE_FACE_MAX_RULE,
