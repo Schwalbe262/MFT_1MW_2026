@@ -178,15 +178,26 @@
     setText("#collector-nodata", data.collector?.no_data_tasks == null ? "—" : `${number(data.collector.no_data_tasks)}건`);
     const timing = data.simulation_timing || {};
     const timingStages = timing.stages || {};
-    const timingCohortLabel = timing.cohort_label || "현재 v3.2 코호트";
+    const timingActive = timing.active_cohort || data.active_cohort || {};
+    const timingCohortLabel = timing.cohort_label || timingActive.label || "활성 코호트 확인 중";
     const timingWindowRows = Number.isFinite(Number(timing.window_rows)) ? timing.window_rows : 0;
     const timingWindowLimit = Number.isFinite(Number(timing.window_limit_rows)) ? timing.window_limit_rows : 100;
-    setText("#stage-timing-basis", `${timingCohortLabel} 기준 · solver 결과의 실제 timing 필드`);
+    setText(
+      "#stage-timing-basis",
+      timingActive.available === false
+        ? timingCohortLabel
+        : `${timingCohortLabel} 기준 · solver 결과의 실제 timing 필드`,
+    );
     setText(
       "#stage-timing-window",
-      `${timingCohortLabel} · n=${number(timingWindowRows)} (최근 최대 ${number(timingWindowLimit)}행)`,
+      timingActive.available === false
+        ? timingCohortLabel
+        : `${timingCohortLabel} · n=${number(timingWindowRows)} (최근 최대 ${number(timingWindowLimit)}행)`,
     );
     const timingEmpty = $("#stage-timing-empty");
+    timingEmpty.textContent = timingActive.available === false
+      ? timingCohortLabel
+      : "활성 코호트 타이밍 데이터 없음";
     timingEmpty.classList.toggle("hidden", Boolean(timing.available));
     ["matrix", "loss", "icepak", "total"].forEach((key) => {
       const stage = timingStages[key] || {};
@@ -202,29 +213,36 @@
       color: "#26d7c7", area: true,
     });
     $("#data-chart-empty").classList.toggle("hidden", (data.history || []).length > 0);
-    renderCohorts(data.cohorts, data.current_cohort_metadata);
+    renderCohorts(data.cohorts, data.current_cohort_metadata, data.active_cohort);
     renderQuarantine(data.quarantine);
     renderElectrostatic(data.electrostatic);
     renderThermalModels(data.thermal_models);
   }
 
-  function renderCohorts(cohortsPayload, metadataPayload) {
+  function renderCohorts(cohortsPayload, metadataPayload, activePayload) {
     const cohorts = Array.isArray(cohortsPayload) ? cohortsPayload : [];
+    const active = activePayload && typeof activePayload === "object" ? activePayload : {};
     const list = $("#cohort-list");
     list.replaceChildren();
-    setText("#cohort-summary", cohorts.length ? `${number(cohorts.length)}개 코호트` : "코호트 —");
+    setText(
+      "#cohort-summary",
+      active.available === true
+        ? `ACTIVE ${active.git_hash_short || "—"}`
+        : active.label || (cohorts.length ? `${number(cohorts.length)}개 코호트` : "코호트 —"),
+    );
     if (!cohorts.length) {
       list.append(element("p", "empty-state compact-empty", "사용 가능한 코호트 데이터가 없습니다."));
     } else {
-      [...cohorts].sort((left, right) => Number(Boolean(right?.current)) - Number(Boolean(left?.current))).forEach((cohort) => {
-        const card = element("article", `cohort-row${cohort?.current ? " current" : ""}`);
+      [...cohorts].sort((left, right) => Number(Boolean(right?.active ?? right?.current)) - Number(Boolean(left?.active ?? left?.current))).forEach((cohort) => {
+        const isActive = Boolean(cohort?.active ?? cohort?.current);
+        const card = element("article", `cohort-row${isActive ? " active" : ""}`);
         const heading = element("div", "cohort-row-heading");
         const identity = element("div");
         const hash = cohort?.git_hash_short || (cohort?.git_hash ? String(cohort.git_hash).slice(0, 10) : "—");
         identity.append(element("strong", "mono", hash));
         identity.append(element("span", "", cohort?.physics_data_revision || "physics revision —"));
         heading.append(identity);
-        if (cohort?.current) heading.append(element("span", "state-chip pass", "CURRENT v3.2"));
+        if (isActive) heading.append(element("span", "state-chip pass", "ACTIVE"));
         card.append(heading);
         const metrics = element("dl", "cohort-metric-grid");
         [
@@ -292,7 +310,7 @@
     const quarantine = payload && typeof payload === "object" ? payload : {};
     const current = quarantine.current && typeof quarantine.current === "object" ? quarantine.current : {};
     const legacy = quarantine.legacy && typeof quarantine.legacy === "object" ? quarantine.legacy : {};
-    setText("#quarantine-current-title", current.label || "현재 v3.2 코호트");
+    setText("#quarantine-current-title", current.label || "활성 코호트");
     setText("#quarantine-current-count", count(current.rows));
     renderReasonList($("#quarantine-current-reasons"), current.reasons, hasNumber(current.rows) && Number(current.rows) === 0
       ? "현재 코호트의 격리 행이 없습니다."
@@ -332,15 +350,15 @@
   function renderElectrostatic(payload) {
     const electrostatic = payload && typeof payload === "object" ? payload : {};
     const available = electrostatic.available === true;
+    const active = electrostatic.active_cohort && typeof electrostatic.active_cohort === "object"
+      ? electrostatic.active_cohort : {};
     const stateChip = $("#electrostatic-state");
     stateChip.className = `state-chip ${available ? "pass" : "unknown"}`;
-    stateChip.textContent = available ? "v3.2 STRICT" : "사용 불가";
-    const basisLabels = {
-      "current_v3.2_strict_full": "현재 v3.2 strict-full 코호트 기준",
-    };
+    stateChip.textContent = available ? "STRICT" : active.available === false ? "데이터 없음" : "사용 불가";
+    const cohortLabel = electrostatic.cohort_label || active.label || "활성 코호트 확인 중";
     setText(
       "#electrostatic-basis",
-      basisLabels[electrostatic.cohort_basis] || electrostatic.cohort_basis || "v3.2 strict 코호트 기준",
+      active.available === false ? cohortLabel : `${cohortLabel} strict-full 기준`,
     );
     setText("#cap-stage-present", count(electrostatic.cap_stage_present_rows));
     setText("#cap-stage-absent", count(electrostatic.cap_stage_absent_rows));
@@ -382,7 +400,13 @@
   function renderThermalModels(payload) {
     const thermal = payload && typeof payload === "object" ? payload : {};
     const models = Array.isArray(thermal.models) ? thermal.models : [];
-    setText("#thermal-model-summary", thermal.available === true ? `${count(thermal.tagged_rows)} 태그` : "사용 불가");
+    const active = thermal.active_cohort && typeof thermal.active_cohort === "object"
+      ? thermal.active_cohort : {};
+    const cohortLabel = thermal.cohort_label || active.label || "활성 코호트 확인 중";
+    setText("#thermal-model-basis", active.available === false ? cohortLabel : `${cohortLabel} 기준`);
+    setText("#thermal-model-summary", thermal.available === true
+      ? `${count(thermal.tagged_rows)} 태그`
+      : active.available === false ? "데이터 없음" : "사용 불가");
     setText(
       "#thermal-model-missing",
       hasNumber(thermal.total_rows) || hasNumber(thermal.missing_rows)
@@ -392,7 +416,11 @@
     const list = $("#thermal-model-list");
     list.replaceChildren();
     if (!models.length) {
-      list.append(element("p", "empty-state compact-empty", "사용 가능한 열모델 태그 데이터가 없습니다."));
+      list.append(element(
+        "p",
+        "empty-state compact-empty",
+        active.available === false ? cohortLabel : "사용 가능한 열모델 태그 데이터가 없습니다.",
+      ));
       return;
     }
     models.forEach((item) => {

@@ -32,8 +32,10 @@ regression_260707\monitoring\.venv\Scripts\python -m uvicorn regression_260707.m
 ## 읽는 산출물
 
 - 데이터: `data/dataset/manifest.json`, `train.parquet`, `train_io.csv`, `collect_cache.json`
-  - v3.2 코호트·정전용량·열전도 모델·격리 집계는 손실 없는 `train.parquet`를 사용하며,
+  - 활성 코호트·정전용량·열전도 모델·격리 집계는 손실 없는 `train.parquet`를 사용하며,
     Parquet가 없거나 읽는 중이면 기존 CSV 화면으로 안전하게 폴백한다.
+  - 활성 코호트는 `module.core_material_contract.PHYSICS_DATA_REVISION`과 일치하는 행 중
+    `saved_at`이 가장 최신인 행의 `(git_hash, physics_data_revision)` 조합이다.
 - 모델: `training/registry/current.json`이 가리키는 승인 generation의
   `train_report.json`, 각 모델의 `meta.json`, `training/learning_curve.csv`
 - 최적화: 최신 `al_rounds/round_*/pareto_front.csv`, 선택적으로 `al_rounds/state.json`

@@ -8,6 +8,7 @@ from urllib.error import URLError
 import pandas as pd
 import pytest
 
+from module.core_material_contract import PHYSICS_DATA_REVISION
 from regression_260707.model_targets import (
     CORE_REGION_TEMPERATURE_TARGETS,
     SURROGATE_TEMPERATURE_TARGETS,
@@ -15,7 +16,6 @@ from regression_260707.model_targets import (
 from regression_260707.monitoring.readers import (
     ArtifactService,
     CURRENT_PHYSICS_DATA_REVISION,
-    CURRENT_SOLVER_REVISION,
     RuntimeRecorder,
     SafeArtifactCache,
     SchedulerReader,
@@ -25,6 +25,14 @@ from regression_260707.monitoring.readers import (
     _simulation_timing_summary,
     _zero_aware_percentage_metrics,
 )
+
+
+OLDER_SOLVER_REVISION = "a" * 40
+NEWER_SOLVER_REVISION = "b" * 40
+
+
+def test_current_physics_revision_comes_from_repo_contract():
+    assert CURRENT_PHYSICS_DATA_REVISION == PHYSICS_DATA_REVISION
 
 
 def _install_checkpoint_fixture(
@@ -124,11 +132,14 @@ def test_data_counts_quality_throughput_and_revision(artifact_service):
     assert data["eta_3000"] is not None
     timing = data["simulation_timing"]
     assert timing["available"] is False
-    assert timing["cohort_basis"] == "current_v3.2_identity"
+    assert timing["cohort_basis"] == "active_identity"
     assert timing["cohort_filter"] == {
-        "git_hash": CURRENT_SOLVER_REVISION,
+        "git_hash": None,
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
     }
+    assert timing["active_cohort"]["status"] == "no_current_revision_rows"
+    assert "현재 revision 데이터 없음" in timing["cohort_label"]
+    assert CURRENT_PHYSICS_DATA_REVISION in timing["cohort_label"]
     assert timing["cohort_rows"] == 0
     assert timing["window_rows"] == 0
     assert timing["window_limit_rows"] == 100
@@ -399,50 +410,55 @@ def test_fea_timings_fail_closed_without_nonnegative_finite_result_fields(artifa
     }
 
 
-def test_simulation_timing_summary_filters_active_cohort_before_recent_window():
-    current = {
-        "git_hash": CURRENT_SOLVER_REVISION,
+def test_simulation_timing_summary_uses_newest_sha_for_current_physics():
+    older = {
+        "git_hash": OLDER_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+    }
+    newer = {
+        "git_hash": NEWER_SOLVER_REVISION,
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
     }
     summary = _simulation_timing_summary([
         {
-            **current, "saved_at": "2026-07-11 00:00:00",
+            **older, "saved_at": "2026-07-11 00:00:00",
             "time_matrix": "100", "time_thermal": "100",
         },
         {
             "git_hash": "legacy", "physics_data_revision": "legacy",
-            "saved_at": "2026-07-11 04:00:00", "thermal_on": 0,
+            "saved_at": "2026-07-11 05:00:00", "thermal_on": 0,
             "time_matrix": "999", "time_thermal": "3",
         },
         {
-            **current, "git_hash": CURRENT_SOLVER_REVISION.upper(),
-            "saved_at": "2026-07-11 02:00:00",
-            "time_matrix": "300", "time_thermal": "300",
+            **newer, "git_hash": NEWER_SOLVER_REVISION.upper(),
+            "saved_at": "2026-07-11 04:00:00",
+            "time_matrix": "400", "time_thermal": "400",
         },
         {
-            **current, "saved_at": "2026-07-11 01:00:00",
+            **newer, "saved_at": "2026-07-11 01:00:00",
             "time_matrix": "200", "time_thermal": "200",
         },
         {
-            "git_hash": CURRENT_SOLVER_REVISION,
-            "physics_data_revision": "legacy_unspecified",
+            **older,
             "saved_at": "2026-07-11 03:00:00",
-            "time_matrix": "888", "time_thermal": "3",
+            "time_matrix": "300", "time_thermal": "300",
         },
     ], limit=2)
 
-    assert summary["cohort_basis"] == "current_v3.2_identity"
-    assert summary["cohort_label"] == "현재 v3.2 코호트"
+    assert summary["cohort_basis"] == "active_identity"
+    assert summary["cohort_label"] == "활성 코호트 bbbbbbbbbb"
     assert summary["cohort_filter"] == {
-        "git_hash": CURRENT_SOLVER_REVISION,
+        "git_hash": NEWER_SOLVER_REVISION,
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
     }
-    assert summary["cohort_rows"] == 3
+    assert summary["active_cohort"]["available"] is True
+    assert summary["active_cohort"]["git_hash"] == NEWER_SOLVER_REVISION
+    assert summary["cohort_rows"] == 2
     assert summary["window_rows"] == 2
     assert summary["stages"]["matrix"]["sample_count"] == 2
-    assert summary["stages"]["matrix"]["mean_seconds"] == 250.0
-    assert summary["stages"]["matrix"]["median_seconds"] == 250.0
-    assert summary["stages"]["icepak"]["mean_seconds"] == 250.0
+    assert summary["stages"]["matrix"]["mean_seconds"] == 300.0
+    assert summary["stages"]["matrix"]["median_seconds"] == 300.0
+    assert summary["stages"]["icepak"]["mean_seconds"] == 300.0
     assert summary["stages"]["loss"]["sample_count"] == 0
     assert summary["stages"]["loss"]["mean_seconds"] is None
 
@@ -457,18 +473,24 @@ def test_simulation_timing_summary_does_not_fall_back_to_legacy_rows():
             "time_thermal": 3, "time": 6,
         },
         {
-            "git_hash": CURRENT_SOLVER_REVISION,
+            "git_hash": OLDER_SOLVER_REVISION,
             "physics_data_revision": "legacy_unspecified",
             "time_thermal": 3,
         },
         {
-            "git_hash": "legacy",
-            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "git_hash": NEWER_SOLVER_REVISION,
+            "physics_data_revision": "previous-physics-revision",
             "time_thermal": 3,
         },
     ])
 
     assert summary["available"] is False
+    assert summary["cohort_filter"] == {
+        "git_hash": None,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+    }
+    assert "현재 revision 데이터 없음" in summary["cohort_label"]
+    assert CURRENT_PHYSICS_DATA_REVISION in summary["cohort_label"]
     assert summary["cohort_rows"] == 0
     assert summary["window_rows"] == 0
     assert all(
@@ -482,13 +504,13 @@ def test_simulation_timing_summary_does_not_fall_back_to_legacy_rows():
 def test_simulation_timing_summary_tolerates_missing_columns():
     frame = pd.DataFrame([
         {"saved_at": "2026-07-11 03:00:00", "time_thermal": 3},
-        {"git_hash": CURRENT_SOLVER_REVISION, "time_matrix": 100},
+        {"git_hash": OLDER_SOLVER_REVISION, "time_matrix": 100},
         {
             "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
             "time_loss": 200,
         },
         {
-            "git_hash": CURRENT_SOLVER_REVISION,
+            "git_hash": NEWER_SOLVER_REVISION,
             "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
             "saved_at": "2026-07-11 04:00:00",
         },
@@ -501,6 +523,53 @@ def test_simulation_timing_summary_tolerates_missing_columns():
     assert summary["window_rows"] == 1
     assert all(stage["sample_count"] == 0
                for stage in summary["stages"].values())
+
+
+def test_active_cohort_degrades_when_recency_or_newest_hash_is_missing():
+    undated = _simulation_timing_summary([{
+        "git_hash": NEWER_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        "time_matrix": 100,
+    }])
+    assert undated["active_cohort"]["available"] is False
+    assert undated["cohort_rows"] == 0
+
+    newest_hash_missing = _simulation_timing_summary([
+        {
+            "git_hash": OLDER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": "2026-07-11 03:00:00",
+            "time_matrix": 100,
+        },
+        {
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": "2026-07-11 04:00:00",
+            "time_matrix": 200,
+        },
+    ])
+    assert newest_hash_missing["active_cohort"]["available"] is False
+    assert newest_hash_missing["cohort_rows"] == 0
+
+
+def test_simulation_timing_summary_degrades_if_physics_import_is_unavailable():
+    summary = _simulation_timing_summary(
+        [{
+            "git_hash": NEWER_SOLVER_REVISION,
+            "physics_data_revision": PHYSICS_DATA_REVISION,
+            "saved_at": "2026-07-11 04:00:00",
+            "time_matrix": 100,
+        }],
+        current_physics_revision=None,
+    )
+
+    assert summary["available"] is False
+    assert summary["active_cohort"]["status"] == "physics_revision_unavailable"
+    assert summary["cohort_filter"] == {
+        "git_hash": None,
+        "physics_data_revision": None,
+    }
+    assert "import 실패" in summary["cohort_label"]
+    assert summary["cohort_rows"] == 0
 
 
 def test_zero_aware_percentage_metrics_exclude_structural_zero_targets():
@@ -523,11 +592,11 @@ def test_zero_aware_percentage_metrics_exclude_structural_zero_targets():
     assert all_zero["mape_excluded_zero_count"] == 1
 
 
-def test_campaign_frame_summary_separates_v32_cohort_and_physics_panels():
+def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
     from .conftest import FIXED_NOW
 
     current = {
-        "git_hash": CURRENT_SOLVER_REVISION,
+        "git_hash": NEWER_SOLVER_REVISION,
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
         "saved_at": (FIXED_NOW - timedelta(minutes=20)).isoformat(),
         "thermal_core_conductivity_model": (
@@ -595,6 +664,23 @@ def test_campaign_frame_summary_separates_v32_cohort_and_physics_panels():
             "winding_flux_linkage_readback_available": 0,
         },
         {
+            "git_hash": OLDER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (FIXED_NOW - timedelta(minutes=30)).isoformat(),
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+            "cap_on": 1,
+            "C_tx_tx_F": 99e-9,
+            "C_rx_rx_F": 99e-9,
+            "C_tx_rx_F": 99e-9,
+            "f_res_tx_self_Hz": 9_900_000.0,
+            "f_res_rx_self_Hz": 9_900_000.0,
+            "f_res_interwinding_Hz": 9_900_000.0,
+            "thermal_core_conductivity_model": "isotropic_legacy",
+            "thermal_core_k_inplane": 99.0,
+            "thermal_core_k_throughstack": 99.0,
+        },
+        {
             "git_hash": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
             "physics_data_revision": "legacy_unspecified",
             "saved_at": (FIXED_NOW - timedelta(minutes=10)).isoformat(),
@@ -619,33 +705,56 @@ def test_campaign_frame_summary_separates_v32_cohort_and_physics_panels():
         },
     ])
     history = {
-        (CURRENT_SOLVER_REVISION, CURRENT_PHYSICS_DATA_REVISION): [
+        (NEWER_SOLVER_REVISION, CURRENT_PHYSICS_DATA_REVISION): [
             (FIXED_NOW - timedelta(hours=1, minutes=5), 1),
         ],
     }
 
     summary = _campaign_frame_summary(frame, FIXED_NOW, history)
 
-    assert len(summary["cohorts"]) == 2
-    cohort = summary["cohorts"][0]
+    assert summary["active_cohort"]["git_hash"] == NEWER_SOLVER_REVISION
+    assert summary["active_cohort"]["physics_data_revision"] == (
+        CURRENT_PHYSICS_DATA_REVISION
+    )
+    assert len(summary["cohorts"]) == 3
+    cohorts = {
+        (item["git_hash"], item["physics_data_revision"]): item
+        for item in summary["cohorts"]
+    }
+    cohort = cohorts[(NEWER_SOLVER_REVISION, CURRENT_PHYSICS_DATA_REVISION)]
     assert cohort == {
-        "git_hash": CURRENT_SOLVER_REVISION,
-        "git_hash_short": CURRENT_SOLVER_REVISION[:10],
+        "git_hash": NEWER_SOLVER_REVISION,
+        "git_hash_short": NEWER_SOLVER_REVISION[:10],
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        "active": True,
         "current": True,
         "raw_rows": 5,
         "strict_em_rows": 4,
         "strict_full_rows": 3,
         "growth_rate_per_hour": 2.0,
     }
-    legacy = summary["cohorts"][1]
+    older = cohorts[(OLDER_SOLVER_REVISION, CURRENT_PHYSICS_DATA_REVISION)]
+    assert older["active"] is False
+    assert older["current"] is False
+    assert older["raw_rows"] == 1
+    assert older["strict_em_rows"] == 0
+    assert older["strict_full_rows"] == 0
+    legacy = cohorts[(
+        "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+        "legacy_unspecified",
+    )]
+    assert legacy["active"] is False
     assert legacy["current"] is False
     assert legacy["raw_rows"] == 2
     assert legacy["strict_em_rows"] == 0
     assert legacy["strict_full_rows"] == 0
 
     electrostatic = summary["electrostatic"]
-    assert electrostatic["cohort_basis"] == "current_v3.2_strict_full"
+    assert electrostatic["cohort_basis"] == "active_strict_full"
+    assert electrostatic["cohort_filter"] == {
+        "git_hash": NEWER_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+    }
     assert electrostatic["cohort_rows"] == 3
     assert electrostatic["cap_stage_present_rows"] == 2
     assert electrostatic["cap_stage_absent_rows"] == 1
@@ -680,16 +789,23 @@ def test_campaign_frame_summary_separates_v32_cohort_and_physics_panels():
     thermal = {
         item["model"]: item for item in summary["thermal_models"]["models"]
     }
-    assert summary["thermal_models"]["tagged_rows"] == 7
+    assert summary["thermal_models"]["cohort_basis"] == "active_identity"
+    assert summary["thermal_models"]["cohort_filter"] == {
+        "git_hash": NEWER_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+    }
+    assert summary["thermal_models"]["total_rows"] == 5
+    assert summary["thermal_models"]["tagged_rows"] == 5
+    assert summary["thermal_models"]["missing_rows"] == 0
     assert thermal["anisotropic_wound_rule_of_mixtures_v1"]["count"] == 5
-    assert thermal["isotropic_legacy"]["count"] == 2
+    assert "isotropic_legacy" not in thermal
     assert thermal["anisotropic_wound_rule_of_mixtures_v1"][
         "thermal_core_k_inplane"
     ]["median"] == pytest.approx(18.0)
 
     quarantine = summary["quarantine"]
     assert quarantine["current"]["rows"] == 2
-    assert quarantine["legacy"]["rows"] == 2
+    assert quarantine["legacy"]["rows"] == 3
     current_reasons = {
         item["reason"]: item["count"]
         for item in quarantine["current"]["reasons"]
@@ -706,7 +822,7 @@ def test_campaign_frame_summary_separates_v32_cohort_and_physics_panels():
                    for reason in current_reasons)
     assert legacy_reasons[
         "untrusted_provenance:solver_revision_mismatch"
-    ] == 2
+    ] == 3
 
     metadata = summary["current_cohort_metadata"]
     assert metadata["core_lamination_factor"] == {
@@ -728,29 +844,32 @@ def test_campaign_frame_summary_separates_v32_cohort_and_physics_panels():
     }
 
 
-def test_campaign_frame_summary_tolerates_missing_v32_columns_and_uses_flags():
+def test_campaign_frame_summary_tolerates_missing_columns_and_uses_flags():
     from .conftest import FIXED_NOW
 
     frame = pd.DataFrame([
         {
-            "git_hash": CURRENT_SOLVER_REVISION,
+            "git_hash": NEWER_SOLVER_REVISION,
             "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (FIXED_NOW - timedelta(minutes=2)).isoformat(),
             "result_valid_em": 1,
             "result_valid_thermal": 1,
         },
         {
-            "git_hash": CURRENT_SOLVER_REVISION,
+            "git_hash": NEWER_SOLVER_REVISION,
             "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (FIXED_NOW - timedelta(minutes=1)).isoformat(),
         },
     ])
 
     summary = _campaign_frame_summary(frame, FIXED_NOW)
 
     cohort = summary["cohorts"][0]
+    assert cohort["active"] is True
     assert cohort["raw_rows"] == 2
     assert cohort["strict_em_rows"] == 1
     assert cohort["strict_full_rows"] == 1
-    assert cohort["growth_rate_per_hour"] == 0.0
+    assert cohort["growth_rate_per_hour"] == 1.0
     electrostatic = summary["electrostatic"]
     assert electrostatic["available"] is False
     assert electrostatic["cohort_rows"] == 1
@@ -764,13 +883,16 @@ def test_campaign_frame_summary_tolerates_missing_v32_columns_and_uses_flags():
         assert metric["sample_count"] == 0
         assert all(value is None for key, value in metric.items()
                    if key.startswith(("min_", "median_", "max_")))
-    assert summary["thermal_models"] == {
-        "available": False,
-        "total_rows": 2,
-        "tagged_rows": 0,
-        "missing_rows": 2,
-        "models": [],
+    thermal = summary["thermal_models"]
+    assert thermal["available"] is False
+    assert thermal["cohort_filter"] == {
+        "git_hash": NEWER_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
     }
+    assert thermal["total_rows"] == 2
+    assert thermal["tagged_rows"] == 0
+    assert thermal["missing_rows"] == 2
+    assert thermal["models"] == []
     assert summary["current_cohort_metadata"]["core_lamination_factor"][
         "sample_count"
     ] == 0
@@ -784,7 +906,7 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
 
     frame = pd.DataFrame([
         {
-            "git_hash": CURRENT_SOLVER_REVISION,
+            "git_hash": NEWER_SOLVER_REVISION,
             "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
             "saved_at": FIXED_NOW.isoformat(),
             "_strict_valid_em": True,
@@ -829,9 +951,12 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
         record_runtime=False,
     )
 
-    def passthrough_audit(result, expected_library_revision):
+    def passthrough_audit(
+            result, expected_solver_revision, expected_library_revision):
         assert result.path == str(parquet_path)
         assert result.value is not None
+        assert expected_solver_revision == NEWER_SOLVER_REVISION
+        assert expected_library_revision is None
         return result.value, None
 
     with mock.patch.object(
@@ -842,6 +967,8 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
         data = service.data()
 
     assert data["source"]["campaign_rows"] == str(parquet_path)
+    assert data["active_cohort"]["git_hash"] == NEWER_SOLVER_REVISION
+    assert data["cohorts"][0]["active"] is True
     assert data["cohorts"][0]["current"] is True
     assert data["cohorts"][0]["raw_rows"] == 1
     assert data["cohorts"][0]["strict_full_rows"] == 1
@@ -849,7 +976,8 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
     assert data["electrostatic"]["capacitance"]["tx_tx"][
         "median_nF"
     ] == pytest.approx(2.0)
-    assert data["thermal_models"]["tagged_rows"] == 2
+    assert data["thermal_models"]["total_rows"] == 1
+    assert data["thermal_models"]["tagged_rows"] == 1
     assert data["quarantine"]["legacy"]["rows"] == 1
     timing = data["simulation_timing"]
     assert timing["available"] is True
@@ -935,7 +1063,7 @@ def test_corrupt_json_retains_last_good_value(tmp_path):
 def test_parquet_reader_retains_last_good_synthetic_frame(tmp_path):
     path = tmp_path / "train.parquet"
     expected = pd.DataFrame([{
-        "git_hash": CURRENT_SOLVER_REVISION,
+        "git_hash": NEWER_SOLVER_REVISION,
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
         "C_tx_tx_F": 1e-9,
     }])

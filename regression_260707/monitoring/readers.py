@@ -1,7 +1,7 @@
 """Safe readers and view-model builders for MFT campaign artifacts.
 
 Most readers intentionally depend only on the Python standard library.  The
-campaign-v3.2 reader loads the lossless Parquet audit dataset lazily so the
+campaign reader loads the lossless Parquet audit dataset lazily so the
 electrostatic fields that are not present in ``train_io.csv`` remain visible.
 A missing Parquet dependency, partially written file, or corrupt artifact is
 still isolated from the rest of the dashboard.
@@ -40,14 +40,20 @@ except ImportError:  # Direct execution with regression_260707 on sys.path.
         SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
     )
 
+try:
+    from module.core_material_contract import (
+        PHYSICS_DATA_REVISION as CURRENT_PHYSICS_DATA_REVISION,
+    )
+except Exception as exc:  # The dashboard must remain available if repo imports fail.
+    CURRENT_PHYSICS_DATA_REVISION: str | None = None
+    PHYSICS_DATA_REVISION_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+else:
+    PHYSICS_DATA_REVISION_IMPORT_ERROR = None
+
 
 SCHEMA_VERSION = 1
 DATA_GOAL = 3_000
 STRETCH_GOAL = 10_000
-CURRENT_SOLVER_REVISION = "513a6f321b997d1866f8c0da57cc27c285b29a5c"
-CURRENT_PHYSICS_DATA_REVISION = (
-    "mft1mw-1k101-native-lamination-kf0p85-v3"
-)
 LEGACY_PHYSICS_DATA_REVISION = "legacy_unspecified"
 THERMAL_MODEL_TAGS = (
     "isotropic_legacy",
@@ -168,16 +174,25 @@ def _simulation_timing_summary(
     frame: Any,
     local_tz=None,
     limit: int = SIMULATION_TIMING_WINDOW_ROWS,
+    active_cohort: tuple[str, str] | None = None,
+    current_physics_revision: str | None = CURRENT_PHYSICS_DATA_REVISION,
 ) -> dict[str, Any]:
-    """Summarize recent timing fields for the exact current v3.2 cohort."""
+    """Summarize recent timing fields for the dynamically active cohort."""
     columns = (
         "git_hash", "physics_data_revision", "saved_at",
         *(source_field for _, source_field in SIMULATION_TIMING_FIELDS),
     )
     rows = _frame_records(frame, columns)
+    if active_cohort is None:
+        active_cohort = _active_cohort_identity(
+            rows, local_tz, current_physics_revision
+        )
+    active = _active_cohort_view(
+        active_cohort, current_physics_revision
+    )
     cohort_rows = [
         row for row in rows
-        if _is_current_cohort(*_cohort_identity(row))
+        if _is_active_cohort(_cohort_identity(row), active_cohort)
     ]
     ranked: list[tuple[float, int, dict[str, Any]]] = []
     for index, row in enumerate(cohort_rows):
@@ -199,12 +214,16 @@ def _simulation_timing_summary(
         }
     return {
         "available": any(stage["sample_count"] for stage in stages.values()),
-        "cohort_basis": "current_v3.2_identity",
-        "cohort_label": "현재 v3.2 코호트",
+        "cohort_basis": "active_identity",
+        "cohort_label": active["label"],
         "cohort_filter": {
-            "git_hash": CURRENT_SOLVER_REVISION,
-            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "git_hash": active["git_hash"],
+            "physics_data_revision": (
+                active["physics_data_revision"]
+                or active["expected_physics_data_revision"]
+            ),
         },
+        "active_cohort": active,
         "cohort_rows": len(cohort_rows),
         "unit": "seconds",
         "window_limit_rows": max(0, int(limit)),
@@ -334,11 +353,79 @@ def _cohort_identity(row: dict[str, Any]) -> tuple[str, str]:
     return revision, physics_revision
 
 
-def _is_current_cohort(revision: str, physics_revision: str) -> bool:
-    return (
-        revision == CURRENT_SOLVER_REVISION
-        and physics_revision == CURRENT_PHYSICS_DATA_REVISION
-    )
+def _active_cohort_identity(
+    frame: Any,
+    local_tz=None,
+    current_physics_revision: str | None = CURRENT_PHYSICS_DATA_REVISION,
+) -> tuple[str, str] | None:
+    """Select the newest solver identity for the deployed physics revision.
+
+    Rows without a comparable ``saved_at`` cannot establish recency and are
+    ignored.  If the newest comparable row lacks a solver hash, no active pair
+    is claimed instead of silently selecting an older solver cohort.
+    """
+    expected = _optional_text(current_physics_revision, 160)
+    if expected is None:
+        return None
+    ranked: list[tuple[float, int, tuple[str, str]]] = []
+    for index, row in enumerate(_frame_records(
+        frame, ("git_hash", "physics_data_revision", "saved_at")
+    )):
+        identity = _cohort_identity(row)
+        if identity[1] != expected:
+            continue
+        stamp = _parse_time(row.get("saved_at"), local_tz)
+        if stamp is None:
+            continue
+        ranked.append((
+            stamp.timestamp(),
+            index,
+            identity,
+        ))
+    if not ranked:
+        return None
+    identity = max(ranked, key=lambda item: (item[0], item[1]))[2]
+    return identity if identity[0] else None
+
+
+def _is_active_cohort(
+    identity: tuple[str, str],
+    active_cohort: tuple[str, str] | None,
+) -> bool:
+    return active_cohort is not None and identity == active_cohort
+
+
+def _active_cohort_view(
+    active_cohort: tuple[str, str] | None,
+    current_physics_revision: str | None = CURRENT_PHYSICS_DATA_REVISION,
+) -> dict[str, Any]:
+    expected = _optional_text(current_physics_revision, 160)
+    if active_cohort is not None:
+        git_hash, physics_revision = active_cohort
+        return {
+            "available": True,
+            "status": "active",
+            "git_hash": git_hash,
+            "git_hash_short": git_hash[:10],
+            "physics_data_revision": physics_revision,
+            "expected_physics_data_revision": expected,
+            "label": f"활성 코호트 {git_hash[:10]}",
+        }
+    if expected is not None:
+        label = f"현재 revision 데이터 없음 · 기대 revision: {expected}"
+        status = "no_current_revision_rows"
+    else:
+        label = "현재 revision 확인 불가 · PHYSICS_DATA_REVISION import 실패"
+        status = "physics_revision_unavailable"
+    return {
+        "available": False,
+        "status": status,
+        "git_hash": None,
+        "git_hash_short": None,
+        "physics_data_revision": None,
+        "expected_physics_data_revision": expected,
+        "label": label,
+    }
 
 
 def _optional_flag(value: Any) -> bool | None:
@@ -431,13 +518,15 @@ def _campaign_frame_summary(
     frame: Any,
     now: datetime,
     cohort_history: dict[tuple[str, str], list[tuple[datetime, int]]] | None = None,
+    active_cohort: tuple[str, str] | None = None,
+    current_physics_revision: str | None = CURRENT_PHYSICS_DATA_REVISION,
 ) -> dict[str, Any]:
-    """Summarize the v3.2 audit frame while tolerating every missing column.
+    """Summarize the campaign audit frame while tolerating missing columns.
 
     Canonically audited frames carry ``_strict_*`` columns.  Synthetic and
-    CSV fallback frames may only carry stored result flags; the exact current
-    solver/physics identity is still required before such a row is counted as
-    strict for this campaign.
+    CSV fallback frames may only carry stored result flags; the dynamically
+    active solver/physics identity is still required before such a row is
+    counted as strict for this campaign.
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -456,10 +545,19 @@ def _campaign_frame_summary(
         "winding_flux_linkage_readback_reason",
     )
     records = _frame_records(frame, columns)
+    if active_cohort is None:
+        active_cohort = _active_cohort_identity(
+            records, now.tzinfo, current_physics_revision
+        )
+    active = _active_cohort_view(
+        active_cohort, current_physics_revision
+    )
     prepared: list[dict[str, Any]] = []
     for row in records:
         revision, physics_revision = _cohort_identity(row)
-        current = _is_current_cohort(revision, physics_revision)
+        current = _is_active_cohort(
+            (revision, physics_revision), active_cohort
+        )
         strict_em_flag = _optional_flag(row.get("_strict_valid_em"))
         if strict_em_flag is None:
             strict_em_flag = _optional_flag(row.get("result_valid_em")) is True
@@ -474,8 +572,8 @@ def _campaign_frame_summary(
             "_monitor_git_hash": revision,
             "_monitor_physics_revision": physics_revision,
             "_monitor_current": current,
-            # Pinned campaign strictness is intentionally fail-closed for
-            # every legacy solver or physics cohort.
+            # Campaign-panel strictness is intentionally fail-closed for every
+            # solver or physics cohort outside the active pair.
             "_monitor_strict_em": bool(current and strict_em_flag),
             "_monitor_strict_full": bool(
                 current and strict_em_flag and strict_full_flag
@@ -518,11 +616,14 @@ def _campaign_frame_summary(
             baseline = before[-1] if before else (within[0] if within else None)
             if baseline is not None:
                 recent_growth = max(0, strict_full_rows - baseline)
-        current = _is_current_cohort(revision, physics_revision)
+        current = _is_active_cohort(
+            (revision, physics_revision), active_cohort
+        )
         cohorts.append({
             "git_hash": revision or None,
             "git_hash_short": revision[:10] if revision else "unknown",
             "physics_data_revision": physics_revision,
+            "active": current,
             "current": current,
             "raw_rows": len(cohort_rows),
             "strict_em_rows": strict_em_rows,
@@ -530,7 +631,7 @@ def _campaign_frame_summary(
             "growth_rate_per_hour": float(recent_growth),
         })
     cohorts.sort(key=lambda item: (
-        not item["current"], -item["raw_rows"],
+        not item["active"], -item["raw_rows"],
         item["git_hash_short"], item["physics_data_revision"],
     ))
 
@@ -551,7 +652,16 @@ def _campaign_frame_summary(
             unknown_cap_rows += 1
     electrostatic = {
         "available": bool(current_strict and present_rows),
-        "cohort_basis": "current_v3.2_strict_full",
+        "cohort_basis": "active_strict_full",
+        "cohort_label": active["label"],
+        "cohort_filter": {
+            "git_hash": active["git_hash"],
+            "physics_data_revision": (
+                active["physics_data_revision"]
+                or active["expected_physics_data_revision"]
+            ),
+        },
+        "active_cohort": active,
         "cohort_rows": len(current_strict),
         "cap_stage_present_rows": len(present_rows),
         "cap_stage_absent_rows": absent_rows,
@@ -567,7 +677,7 @@ def _campaign_frame_summary(
     }
 
     model_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in prepared:
+    for row in current_rows:
         model = _optional_text(row.get("thermal_core_conductivity_model"), 160)
         if model:
             model_rows[model].append(row)
@@ -576,9 +686,19 @@ def _campaign_frame_summary(
     ] + sorted(model for model in model_rows if model not in THERMAL_MODEL_TAGS)
     thermal_models = {
         "available": bool(model_rows),
-        "total_rows": len(prepared),
+        "cohort_basis": "active_identity",
+        "cohort_label": active["label"],
+        "cohort_filter": {
+            "git_hash": active["git_hash"],
+            "physics_data_revision": (
+                active["physics_data_revision"]
+                or active["expected_physics_data_revision"]
+            ),
+        },
+        "active_cohort": active,
+        "total_rows": len(current_rows),
         "tagged_rows": sum(len(rows) for rows in model_rows.values()),
-        "missing_rows": len(prepared) - sum(
+        "missing_rows": len(current_rows) - sum(
             len(rows) for rows in model_rows.values()
         ),
         "models": [
@@ -586,8 +706,8 @@ def _campaign_frame_summary(
                 "model": model,
                 "count": len(model_rows[model]),
                 "percent": (
-                    len(model_rows[model]) / len(prepared) * 100.0
-                    if prepared else 0.0
+                    len(model_rows[model]) / len(current_rows) * 100.0
+                    if current_rows else 0.0
                 ),
                 "thermal_core_k_inplane": _plain_stats(
                     model_rows[model], "thermal_core_k_inplane"
@@ -618,13 +738,18 @@ def _campaign_frame_summary(
             current_reason_counts.update(reasons)
         else:
             legacy_quarantined += 1
-            if row["_monitor_git_hash"] != CURRENT_SOLVER_REVISION:
+            if (
+                active_cohort is None
+                or row["_monitor_git_hash"] != active_cohort[0]
+            ):
                 reasons.append(
                     "untrusted_provenance:solver_revision_mismatch"
                 )
             if (
+                current_physics_revision is not None
+                and
                 row["_monitor_physics_revision"]
-                != CURRENT_PHYSICS_DATA_REVISION
+                != current_physics_revision
             ):
                 reasons.append("cohort:physics_data_revision_mismatch")
             legacy_reason_counts.update(dict.fromkeys(reasons, 1))
@@ -661,12 +786,16 @@ def _campaign_frame_summary(
             readback_missing += 1
 
     return {
+        "active_cohort": active,
         "cohorts": cohorts,
         "electrostatic": electrostatic,
         "thermal_models": thermal_models,
         "quarantine": {
             "current": {
-                "label": "v3.2 신규 cohort",
+                "label": (
+                    f"활성 코호트 {active['git_hash_short']}"
+                    if active["available"] else active["label"]
+                ),
                 "rows": current_quarantined,
                 "reasons": _reason_items(current_reason_counts),
             },
@@ -1595,6 +1724,7 @@ class ArtifactService:
     def _audited_campaign_frame(
         self,
         result: ReadResult,
+        expected_solver_revision: str | None,
         expected_library_revision: str | None,
     ) -> tuple[Any, str | None]:
         """Cache canonical strict annotations for one immutable Parquet read."""
@@ -1604,6 +1734,7 @@ class ArtifactService:
             result.path,
             result.mtime,
             id(result.value),
+            expected_solver_revision,
             expected_library_revision,
         )
         with self._campaign_audit_lock:
@@ -1615,17 +1746,18 @@ class ArtifactService:
 
                 audited = annotate_validity(
                     result.value,
-                    expected_solver_revision=CURRENT_SOLVER_REVISION,
+                    expected_solver_revision=expected_solver_revision,
                     expected_library_revision=expected_library_revision,
                 )
             except Exception as exc:
                 # Stored validity flags remain a fail-soft operational view;
-                # _campaign_frame_summary still pins them to the exact v3.2
-                # solver/physics identity instead of trusting legacy rows.
+                # _campaign_frame_summary still pins them to the dynamically
+                # selected solver/physics identity instead of trusting others.
                 audited = result.value
                 warning = (
                     "train.parquet strict audit failed; stored validity flags "
-                    f"are shown for the v3.2 cohort: {type(exc).__name__}: {exc}"
+                    "are shown for the active cohort: "
+                    f"{type(exc).__name__}: {exc}"
                 )
             self._campaign_audit_key = key
             self._campaign_audit_frame = audited
@@ -1654,6 +1786,11 @@ class ArtifactService:
             manifest_result, rows_result, parquet_result, cache_result,
             strict_result,
         )
+        if PHYSICS_DATA_REVISION_IMPORT_ERROR:
+            warnings.append(
+                "PHYSICS_DATA_REVISION import failed; active cohort panels "
+                f"are unavailable: {PHYSICS_DATA_REVISION_IMPORT_ERROR}"
+            )
 
         manifest_total = _integer(manifest.get("total_rows"), -1)
         parquet_rows = (
@@ -1685,12 +1822,24 @@ class ArtifactService:
             str(identity.get("library_revision")).strip().lower()
             if strict_available else None
         )
+        raw_campaign_frame = (
+            parquet_result.value
+            if parquet_result.value is not None else rows
+        )
+        active_cohort = _active_cohort_identity(
+            raw_campaign_frame, now.tzinfo, CURRENT_PHYSICS_DATA_REVISION
+        )
+        active_solver_revision = (
+            active_cohort[0] if active_cohort is not None else None
+        )
         audit_library_revision = (
             pinned_library_revision
-            if pinned_revision == CURRENT_SOLVER_REVISION else None
+            if pinned_revision == active_solver_revision else None
         )
         campaign_frame, audit_warning = self._audited_campaign_frame(
-            parquet_result, audit_library_revision
+            parquet_result,
+            active_solver_revision,
+            audit_library_revision,
         )
         if campaign_frame is None:
             campaign_frame = rows
@@ -1710,7 +1859,10 @@ class ArtifactService:
         ]
         timestamps.sort()
         simulation_timing = _simulation_timing_summary(
-            campaign_frame, now.tzinfo
+            campaign_frame,
+            now.tzinfo,
+            active_cohort=active_cohort,
+            current_physics_revision=CURRENT_PHYSICS_DATA_REVISION,
         )
         one_hour_ago = now - timedelta(hours=1)
         day_ago = now - timedelta(hours=24)
@@ -1770,6 +1922,8 @@ class ArtifactService:
             campaign_frame,
             now,
             cohort_history=dict(cohort_history),
+            active_cohort=active_cohort,
+            current_physics_revision=CURRENT_PHYSICS_DATA_REVISION,
         )
         def _growth_since(cutoff):
             earlier = [value for stamp, value in strict_history if stamp <= cutoff]
@@ -1872,7 +2026,7 @@ class ArtifactService:
             "latest_revision": latest_revision,
             "pinned_revision": pinned_revision,
             "pinned_library_revision": pinned_library_revision,
-            "current_solver_revision": CURRENT_SOLVER_REVISION,
+            "current_solver_revision": active_solver_revision,
             "current_physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
             "revision_count": len(revisions) or len(hashes),
             "rows_not_latest_revision": revision_mismatch,

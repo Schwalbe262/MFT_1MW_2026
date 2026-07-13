@@ -263,17 +263,17 @@ section { margin: 0 0 52px; scroll-margin-top: 100px; }
 .compact-empty { margin: 20px 0; }
 .cohort-list { display: grid; gap: 8px; }
 .cohort-row { padding: 11px 12px; border: 1px solid var(--line-soft); border-radius: 9px; background: rgba(0,0,0,.1); }
-.cohort-row.current { border-color: rgba(38,215,199,.34); background: linear-gradient(90deg, rgba(38,215,199,.08), rgba(38,215,199,.018)); box-shadow: inset 3px 0 0 rgba(38,215,199,.7); }
+.cohort-row.active { border-color: rgba(38,215,199,.34); background: linear-gradient(90deg, rgba(38,215,199,.08), rgba(38,215,199,.018)); box-shadow: inset 3px 0 0 rgba(38,215,199,.7); }
 .cohort-row-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
 .cohort-row-heading > div { display: grid; gap: 4px; min-width: 0; }
 .cohort-row-heading strong { color: var(--text); font: 700 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
-.cohort-row.current .cohort-row-heading strong { color: var(--cyan); }
+.cohort-row.active .cohort-row-heading strong { color: var(--cyan); }
 .cohort-row-heading > div > span { overflow: hidden; color: var(--muted); font: 500 9px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .cohort-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 10px 0 0; border-top: 1px solid var(--line-soft); }
 .cohort-metric-grid > div { padding: 9px 9px 0 0; }
 .cohort-metric-grid dt { color: #708b99; font-size: 8px; font-weight: 700; text-transform: uppercase; }
 .cohort-metric-grid dd { margin: 4px 0 0; font: 700 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
-.cohort-row.current .cohort-metric-grid > div:last-child dd { color: var(--green); }
+.cohort-row.active .cohort-metric-grid > div:last-child dd { color: var(--green); }
 .cohort-metadata-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
 .cohort-metadata-grid section { min-width: 0; margin: 0; padding: 11px 12px; border: 1px solid var(--line-soft); border-radius: 9px; background: rgba(0,0,0,.08); }
 .cohort-metadata-grid h4, .quarantine-panel h4, .electrostatic-panel h4 { margin: 0; color: #718d9b; font-size: 9px; letter-spacing: .045em; text-transform: uppercase; }

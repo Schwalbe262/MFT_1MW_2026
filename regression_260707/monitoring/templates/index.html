@@ -135,7 +135,7 @@
         </article>
         <article class="panel quarantine-panel" aria-labelledby="quarantine-title">
           <div class="panel-title">
-            <div><h3 id="quarantine-title">격리 사유</h3><p>현재 v3.2 코호트 신호와 레거시 노이즈를 분리</p></div>
+            <div><h3 id="quarantine-title">격리 사유</h3><p>활성 코호트 신호와 이전 코호트 노이즈를 분리</p></div>
             <span id="quarantine-current-count" class="section-badge">—</span>
           </div>
           <section class="quarantine-current" aria-labelledby="quarantine-current-title">
@@ -151,7 +151,7 @@
       <div class="split-grid physics-insight-layout">
         <article class="panel electrostatic-panel" aria-labelledby="electrostatic-title">
           <div class="panel-title">
-            <div><h3 id="electrostatic-title">정전용량 · 공진 추정</h3><p id="electrostatic-basis">v3.2 strict 코호트 기준</p></div>
+            <div><h3 id="electrostatic-title">정전용량 · 공진 추정</h3><p id="electrostatic-basis">활성 strict-full 코호트 확인 중</p></div>
             <span id="electrostatic-state" class="state-chip unknown">확인 중</span>
           </div>
           <div class="electrostatic-presence-grid">
@@ -173,7 +173,7 @@
         </article>
         <article class="panel thermal-model-panel" aria-labelledby="thermal-model-title">
           <div class="panel-title">
-            <div><h3 id="thermal-model-title">코어 열전도 모델 태그</h3><p>thermal_core_conductivity_model 분포와 유효 열전도도</p></div>
+            <div><h3 id="thermal-model-title">코어 열전도 모델 태그</h3><p id="thermal-model-basis">활성 코호트 확인 중</p></div>
             <span id="thermal-model-summary" class="section-badge">—</span>
           </div>
           <div id="thermal-model-list" class="thermal-model-list"><p class="empty-state compact-empty">열모델 태그를 확인하는 중입니다.</p></div>
@@ -182,8 +182,8 @@
       </div>
       <article class="panel stage-timing-panel" aria-labelledby="stage-timing-title">
         <div class="panel-title">
-          <div><h3 id="stage-timing-title">최근 시뮬레이션 단계별 소요시간</h3><p id="stage-timing-basis">현재 v3.2 코호트 기준 · solver 결과의 실제 timing 필드</p></div>
-          <span id="stage-timing-window" class="mono-chip">현재 v3.2 코호트 · n=0</span>
+          <div><h3 id="stage-timing-title">최근 시뮬레이션 단계별 소요시간</h3><p id="stage-timing-basis">활성 코호트 기준 · solver 결과의 실제 timing 필드</p></div>
+          <span id="stage-timing-window" class="mono-chip">활성 코호트 확인 중</span>
         </div>
         <div class="stage-timing-grid">
           <div class="stage-timing-card"><span>Matrix 평균</span><strong id="stage-time-matrix-mean">—</strong><small id="stage-time-matrix-detail">중앙값 — · n=0</small></div>
@@ -191,7 +191,7 @@
           <div class="stage-timing-card"><span>Icepak 평균</span><strong id="stage-time-icepak-mean">—</strong><small id="stage-time-icepak-detail">중앙값 — · n=0</small></div>
           <div class="stage-timing-card total"><span>합계 평균</span><strong id="stage-time-total-mean">—</strong><small id="stage-time-total-detail">중앙값 — · n=0</small></div>
         </div>
-        <p id="stage-timing-empty" class="stage-timing-empty">v3.2 코호트 타이밍 데이터 없음</p>
+        <p id="stage-timing-empty" class="stage-timing-empty">활성 코호트 타이밍 데이터 없음</p>
       </article>
     </section>
 
