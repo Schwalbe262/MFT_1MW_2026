@@ -1476,7 +1476,7 @@ def stage_fine_submit(st):
         )
     _require_runtime_deployment()
     import scheduler_client as sc
-    from module.input_parameter_260706 import KEYS
+    from module.input_parameter_260706 import ALL_INPUT_KEYS, KEYS
 
     profile_path = os.path.join(HERE, "verify", "profiles", "fine.json")
     with open(profile_path, encoding="utf-8") as handle:
@@ -1486,6 +1486,12 @@ def stage_fine_submit(st):
     st["fine_solver_git_revision"] = solver_revision
     st["fine_pyaedt_library_git_revision"] = library_revision
     records = st.setdefault("fine_task_records", {})
+    # Preserve restart compatibility with sealed 71-key fronts while allowing
+    # current candidates to authenticate their explicit kf/loss-margin inputs.
+    allowed_input_schemas = {
+        frozenset(KEYS),
+        frozenset(ALL_INPUT_KEYS),
+    }
     unknown = []
     for rank, candidate in enumerate(st["final_candidates"]):
         key = str(rank)
@@ -1495,9 +1501,16 @@ def stage_fine_submit(st):
             continue
         batch = int(st.get("fine_batch", 0))
         fine_params = sc.effective_verification_params(candidate["params"], profile)
-        if set(fine_params) != set(KEYS):
-            missing = sorted(set(KEYS) - set(fine_params))
-            raise RuntimeError(f"fine candidate is missing required inputs: {missing}")
+        candidate_schema = frozenset(candidate["params"])
+        fine_schema = frozenset(fine_params)
+        if (candidate_schema not in allowed_input_schemas
+                or fine_schema != candidate_schema):
+            missing = sorted(candidate_schema - fine_schema)
+            extra = sorted(fine_schema - candidate_schema)
+            raise RuntimeError(
+                "fine candidate has an invalid submitted input schema: "
+                f"missing={missing}, extra={extra}"
+            )
         candidate["fine_params"] = fine_params
         name = f"mft-final-fine-r{st['round']:02d}-b{batch:02d}-c{rank:02d}"
         workdir = f"mft_final_fine_r{st['round']:02d}_b{batch:02d}_c{rank:02d}"
@@ -1529,9 +1542,15 @@ def stage_fine_submit(st):
 def stage_fine_wait(st):
     _assert_training_invariants(st)
     import scheduler_client as sc
-    from module.input_parameter_260706 import KEYS
+    from module.input_parameter_260706 import ALL_INPUT_KEYS, KEYS
 
     records = st.get("fine_task_records") or {}
+    # Match the exact schema accepted at submission, including material inputs
+    # when the candidate explicitly supplied them.
+    allowed_input_schemas = {
+        frozenset(KEYS),
+        frozenset(ALL_INPUT_KEYS),
+    }
     if len(records) != len(st.get("final_candidates") or []):
         raise RuntimeError("fine task inventory is incomplete")
     pending_records = {
@@ -1566,10 +1585,16 @@ def stage_fine_wait(st):
             raise RuntimeError(f"fine stdout unavailable for task {task_id}") from exc
         record["last_result_state"] = fetched.state
         candidate = st["final_candidates"][int(key)]
+        fine_params = candidate.get("fine_params")
+        fine_schema = (
+            frozenset(fine_params)
+            if isinstance(fine_params, dict) else frozenset()
+        )
         result_matches = (
             fetched.state == sc.RESULT_VALID
+            and fine_schema in allowed_input_schemas
             and sc.result_matches_params(
-                fetched.result, candidate.get("fine_params"), required_keys=KEYS
+                fetched.result, fine_params, required_keys=fine_schema
             )
         )
         if result_matches:

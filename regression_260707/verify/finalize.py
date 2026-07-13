@@ -20,7 +20,7 @@ for path in (str(REGRESSION_ROOT), str(REPO_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from module.input_parameter_260706 import KEYS  # noqa: E402
+from module.input_parameter_260706 import ALL_INPUT_KEYS, KEYS  # noqa: E402
 from optimization.geometry_metrics import bounding_box_lit  # noqa: E402
 from quality_contract import validate_record  # noqa: E402
 
@@ -50,6 +50,12 @@ REQUIRED_OPTIMIZATION_MODELS = frozenset({
     "B_max_core", "B_mean_core",
     "Tprobe_Tx_leeward_max", "Tprobe_Rx_main_leeward_max",
     "Tprobe_Rx_side_leeward_max", "Tprobe_core_center_max",
+})
+ALLOWED_CANDIDATE_INPUT_SCHEMAS = frozenset({
+    # Legacy AL fronts carry the sealed design identity only.  Current fixed
+    # inputs may also carry the two explicit, revision-bound material inputs.
+    frozenset(KEYS),
+    frozenset(ALL_INPUT_KEYS),
 })
 
 
@@ -221,16 +227,23 @@ def candidate_identity_reasons(result, candidate, expected_params_key="params"):
     if not isinstance(candidate, dict):
         return ["candidate_record_missing"]
     params = candidate.get("params")
-    if not isinstance(params, dict) or set(params) != set(KEYS):
+    params_schema = (
+        frozenset(params) if isinstance(params, dict) else frozenset()
+    )
+    if params_schema not in ALLOWED_CANDIDATE_INPUT_SCHEMAS:
         return ["candidate_params_missing"]
     reasons = []
     if candidate.get("candidate_digest") != _candidate_digest(params):
         reasons.append("candidate_digest_mismatch")
     expected_params = candidate.get(expected_params_key)
-    if not isinstance(expected_params, dict) or set(expected_params) != set(KEYS):
+    expected_schema = (
+        frozenset(expected_params)
+        if isinstance(expected_params, dict) else frozenset()
+    )
+    if expected_schema != params_schema:
         reasons.append(f"candidate_{expected_params_key}_missing")
     elif not scheduler_client.result_matches_params(
-            result, expected_params, required_keys=KEYS):
+            result, expected_params, required_keys=params_schema):
         reasons.append("candidate_result_identity_mismatch")
     return reasons
 
