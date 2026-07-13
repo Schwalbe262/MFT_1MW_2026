@@ -3809,12 +3809,23 @@ class Simulation():
                 require_complete_groups=bool(self.full_model),
             )
             for cut_count, pieces in native_report_plan["batches"]:
-                expr_name = f"Bpow_core_cut{cut_count}"
-                expression = self._calc_group_b_power_integral(
-                    pieces, core_y_exponent, expr_name
-                )
-                b_power_exprs.append(expression)
-                b_power_cut_by_expr[expression] = cut_count
+                # Keep each retained solid in its own calculator expression.
+                # AEDT 2025.2 reproducibly rejects the grouped stack for the
+                # symmetry-retained leg/center/yoke trio at CalcOp, even when
+                # the same operation succeeds for a single solid.  Python
+                # sums the independently exported volume integrals below,
+                # which is exactly linear and also identifies the failing
+                # object if AEDT ever rejects one individual expression.
+                for piece in pieces:
+                    piece_name = str(
+                        piece if isinstance(piece, str) else piece.name
+                    )
+                    expr_name = f"Bpow_{piece_name}"
+                    expression = self._calc_group_b_power_integral(
+                        [piece], core_y_exponent, expr_name
+                    )
+                    b_power_exprs.append(expression)
+                    b_power_cut_by_expr[expression] = cut_count
         else:
             for group_index, pieces in sorted(core_groups.items()):
                 group_name = f"core_{group_index}"
@@ -4156,6 +4167,7 @@ class Simulation():
                 native_membership_sha256
             ],
             "native_core_b_power_batch_count": [len(native_batch_members)],
+            "native_core_b_power_expression_count": [len(b_power_exprs)],
             "native_core_b_power_batches_json": [json.dumps(
                 native_batch_members, sort_keys=True, separators=(",", ":")
             )],

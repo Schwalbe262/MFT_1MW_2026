@@ -515,6 +515,31 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             scheduler_client.TEST_TASK_PRIORITY,
         )
 
+    def test_submit_forwards_distinct_node_placement_constraints(self):
+        submitted = Mock(status_code=201)
+        submitted.json.return_value = {"id": 402}
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), patch.object(
+                    scheduler_client.requests, "post",
+                    return_value=submitted) as post:
+            task_id = scheduler_client.submit_verification(
+                "candidate-placement", "candidate_workdir", {"x": 1}, {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+                priority=scheduler_client.TEST_TASK_PRIORITY,
+                account_name="account-a",
+                node_name="node-101",
+                max_workers_per_node=1,
+            )
+
+        self.assertEqual(task_id, 402)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["account_name"], "account-a")
+        self.assertEqual(payload["node_name"], "node-101")
+        self.assertEqual(payload["max_workers_per_node"], 1)
+        self.assertFalse(payload.get("exclusive_node", False))
+
     def test_submit_rejects_non_integer_priority(self):
         for priority in (True, 10.0, "10", None):
             with self.subTest(priority=priority), patch.object(

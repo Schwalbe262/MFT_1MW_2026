@@ -558,6 +558,31 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
         self.assertIn(("op", "ComplxPeak"), operations)
         self.assertNotIn(("op", "CmplxMag"), operations)
 
+    def test_single_piece_b_power_expression_has_no_group_addition(self):
+        operations = []
+
+        class Reporter:
+            def EnterQty(self, value): operations.append(("qty", value))
+            def CalcOp(self, value): operations.append(("op", value))
+            def EnterScalar(self, value): operations.append(("scalar", value))
+            def EnterVol(self, value): operations.append(("vol", value))
+
+        simulation = Simulation.__new__(Simulation)
+        simulation._add_field_expression = lambda name, builder, **kwargs: (
+            builder(Reporter()) or name
+        )
+        result = simulation._calc_group_b_power_integral(
+            [SimpleNamespace(name="core_2_leg_left")], Y, "Bpow_piece"
+        )
+
+        self.assertEqual(result, "Bpow_piece")
+        self.assertEqual(operations, [
+            ("qty", "B"), ("op", "ComplxPeak"), ("scalar", Y),
+            ("op", "Pow"), ("vol", "core_2_leg_left"),
+            ("op", "Integrate"),
+        ])
+        self.assertNotIn(("op", "+"), operations)
+
     def test_thermal_injects_margin_adjusted_loss_and_native_readback_balances(self):
         corrected_core_w = 115.0
         sim = SimpleNamespace(
