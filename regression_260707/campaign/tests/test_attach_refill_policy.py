@@ -166,7 +166,7 @@ def test_production_policy_pins_restart_v3_with_zero_pooled_fraction():
     assert policy.projects_per_aedt == 2
     assert policy.validated_projects_per_aedt == 2
     assert policy.provenance.solver_revision == (
-        "4f585b0540dbe3b2828f991024fdb9f1f2d23b8b"
+        "513a6f321b997d1866f8c0da57cc27c285b29a5c"
     )
     assert policy.provenance.library_revision == (
         "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
