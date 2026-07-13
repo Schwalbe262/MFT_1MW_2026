@@ -284,7 +284,6 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
             "core_native_material_readback_attested",
             "core_loss_native_attested",
             "flux_linkage_attested",
-            "B_mean_faraday_attested",
         ):
             if not _one(record, key):
                 reasons.append(f"native_lamination:{key}")
@@ -292,23 +291,9 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
         loss_tolerance = _number(record, "core_loss_native_tolerance_rel")
         if (
             loss_error is None or loss_tolerance is None
-            or not 0 <= loss_error <= loss_tolerance <= 0.30
+            or not 0 <= loss_error <= loss_tolerance <= 0.02
         ):
-            reasons.append("native_lamination:core_loss_faraday_mass_attestation")
-        b_error = _number(
-            record, "B_mean_material_vs_sine_analytic_rel_error"
-        )
-        b_tolerance = _number(record, "B_mean_faraday_tolerance_rel")
-        if (
-            b_error is None or b_tolerance is None
-            or not 0 <= b_error <= b_tolerance <= 0.15
-        ):
-            reasons.append("native_lamination:B_mean_faraday_attestation")
-        if str(_value(record, "core_loss_reference_basis") or "") != (
-            "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
-            "POWERLITE_Wkg_times_effective_mass"
-        ):
-            reasons.append("native_lamination:core_loss_reference_basis")
+            reasons.append("native_lamination:core_loss_integral_attestation")
         for key in (
             "core_surface_flux_vs_linkage_rel_error",
             "core_surface_flux_vs_induced_voltage_rel_error",
