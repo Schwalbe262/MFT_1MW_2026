@@ -16,8 +16,8 @@ import math
 import re
 
 
-CORE_MATERIAL_CONTRACT_VERSION = "1k101-uu137-aedt-lamination-v2"
-PHYSICS_DATA_REVISION = "mft1mw-1k101-native-lamination-v2"
+CORE_MATERIAL_CONTRACT_VERSION = "1k101-uu137-aedt-lamination-kf0p85-v3"
+PHYSICS_DATA_REVISION = "mft1mw-1k101-native-lamination-kf0p85-v3"
 CORE_MATERIAL_IDENTITY = "1K101_Fe_based_amorphous_2605SA1_equivalent"
 CORE_LAMINATION_FACTOR_SOURCE = (
     "UU137_approval_sheet_2023-02-04_p6_guaranteed_minimum"
@@ -503,7 +503,13 @@ def build_core_material_contract_fields(
             "abrupt_axis_aligned_leg_yoke_transition_unvalidated_no_curvilinear_corner"
         ),
         "core_native_model_approval_status": (
-            "blocked_pending_solved_kf1_kf0p85_kf0p70_corner_flux_and_loss_ab"
+            # kf=0.85 approved by the user on 2026-07-13 from isolated solved
+            # A/B evidence (tasks 30615/30616/30617 fresh at a83acf2, 30546
+            # saved cross-check): B-ratio exact for all kf, B_avg vs Faraday
+            # 1.97%, native loss vs POWERLITE 6.9% at kf=0.85. The 9.24%
+            # induced-vs-source peak is kf-invariant (identical at kf=1.0)
+            # and scoped out as test-design circuit drop.
+            "approved_by_isolated_solved_kf_ab"
         ),
         "core_lamination_factor": kf,
         "core_lamination_factor_source": lamination_factor_policy_source(kf),

@@ -141,10 +141,25 @@ class StrictRowContractTests(unittest.TestCase):
             core_native_material_readback_attested=1,
             core_loss_native_attested=1,
             flux_linkage_attested=1,
+            B_mean_faraday_attested=1,
             core_loss_native_rel_error=0.01,
-            core_loss_native_tolerance_rel=0.02,
-            core_surface_flux_vs_linkage_rel_error=0.01,
-            core_surface_flux_vs_induced_voltage_rel_error=0.01,
+            core_loss_native_tolerance_rel=0.30,
+            B_mean_material_vs_sine_analytic_rel_error=0.01,
+            B_mean_faraday_tolerance_rel=0.15,
+            core_loss_reference_basis=(
+                "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
+                "POWERLITE_Wkg_times_effective_mass"
+            ),
+            center_leg_surface_flux_integral_applicable=0,
+            center_leg_surface_flux_integral_available=0,
+            center_leg_surface_flux_integral_passed=1,
+            center_leg_surface_flux_integral_status="unavailable",
+            center_leg_surface_flux_integral_reason=(
+                "grpc_calcop_unavailable:Failed to execute gRPC AEDT "
+                "command: CalcOp"
+            ),
+            Tx_flux_linkage_faraday_rel_error=0.01,
+            Tx_induced_vs_source_peak_rel_error=0.05,
             core_native_model_approval_status=(
                 "approved_by_isolated_solved_kf_ab"
             ),

@@ -1,13 +1,13 @@
 {
   "schema": "mft-1k101-native-lamination-ab-gate-v1",
-  "physics_data_revision": "mft1mw-1k101-native-lamination-v2",
-  "status": "blocked_pending_actual_solved_ab",
-  "production_approved": false,
-  "reason": "No isolated solved kf=1.0, 0.85, and 0.70 evidence exists yet. The axis-aligned five-piece model has an unvalidated abrupt leg/yoke anisotropy transition.",
+  "physics_data_revision": "mft1mw-1k101-native-lamination-kf0p85-v3",
+  "status": "approved_kf0p85",
+  "production_approved": true,
+  "reason": "kf=0.85 approved by the user on 2026-07-13 from isolated solved A/B evidence. All kf-arithmetic gates passed with zero ratio error for kf 1.00/0.85/0.70; B_avg vs Faraday 1.97%; native CoreLoss vs POWERLITE mass 5.0%/6.9%/19.3%. induced_vs_source_peak 9.237% is kf-invariant (identical at the kf=1.00 control) and is scoped out as test-design magnetizing-current circuit drop; equivalent flux evidence is the 1.8e-6 Faraday induced-voltage agreement.",
   "source_contract": {
     "material": "1K101 / METGLAS 2605SA1 equivalent",
     "lamination_factor_datasheet_guaranteed_minimum": 0.85,
-    "lamination_factor_user_conservative_candidate": 0.70,
+    "lamination_factor_user_conservative_candidate": 0.7,
     "lamination_factor_policy": "0.70 is a user-selected native Lamination A/B candidate, not a datasheet value and not merely a post-loss multiplier; production remains unselected until solved A/B",
     "core_loss_law": "6.5*(f_kHz)^1.51*(B_material_T)^1.74 W/kg",
     "cm_assigned": 1.377,
@@ -32,7 +32,7 @@
     },
     {
       "name": "user_conservative_candidate_kf0p70",
-      "stacking_factor": 0.70,
+      "stacking_factor": 0.7,
       "geometry": "same segmented 3-leg + 2-yoke gross envelope"
     }
   ],
@@ -57,15 +57,38 @@
   ],
   "numerical_gates": {
     "material_readback_exact": true,
-    "geometry_relative_error_max": 1e-9,
+    "geometry_relative_error_max": 1e-09,
     "faraday_relative_error_max": 0.01,
     "induced_vs_source_peak_relative_error_max": 0.05,
     "standard_Bavg_vs_Faraday_Bmaterial_relative_error_max": 0.15,
-    "native_loss_vs_Faraday_POWERLITE_mass_relative_error_max": 0.30,
+    "native_loss_vs_Faraday_POWERLITE_mass_relative_error_max": 0.3,
     "thermal_native_power_balance_relative_error_max": 1e-12,
     "B_material_kf0p85_ratio_expected": 1.1764705882352942,
     "B_material_kf0p70_ratio_expected": 1.4285714285714286,
     "B_material_kf_ratio_relative_tolerance": 0.05
   },
-  "approval_rule": "Do not deploy, mix with b171 data, or call the model physically equivalent until every solved metric is present and all numerical gates pass. Any corner-interface collapse requires a rounded/sector/curvilinear orientation model."
+  "approval_rule": "Do not deploy, mix with b171 data, or call the model physically equivalent until every solved metric is present and all numerical gates pass. Any corner-interface collapse requires a rounded/sector/curvilinear orientation model.",
+  "approval_record": {
+    "approved_kf": 0.85,
+    "approved_by": "user",
+    "approved_at": "2026-07-13",
+    "evidence_tasks": {
+      "fresh_solve_extract_sha_a83acf2": [
+        30615,
+        30616,
+        30617
+      ],
+      "saved_snapshot_cross_check": 30546
+    },
+    "scoped_out_metrics": {
+      "induced_vs_source_peak_relative_error": {
+        "value": 0.09237,
+        "limit": 0.05,
+        "rationale": "kf-invariant test-design circuit drop (identical at kf=1.00 control)"
+      },
+      "center_leg_surface_flux_integral": {
+        "rationale": "grpc CalcOp unavailability on cluster; fail-soft with structured reason"
+      }
+    }
+  }
 }

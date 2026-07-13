@@ -128,12 +128,16 @@ class CoreMaterialArithmeticTests(unittest.TestCase):
         self.assertEqual(fields["core_loss_correction_factor"], MARGIN)
         self.assertEqual(fields["core_stacking_direction_leg"], "V(1)")
         self.assertEqual(fields["core_stacking_direction_yoke"], "V(3)")
-        self.assertIn("blocked_pending_solved", fields["core_native_model_approval_status"])
+        self.assertEqual(
+            fields["core_native_model_approval_status"],
+            "approved_by_isolated_solved_kf_ab",
+        )
         self.assertEqual(
             fields["core_material_contract_version"],
             CORE_MATERIAL_CONTRACT_VERSION,
         )
         self.assertEqual(fields["physics_data_revision"], PHYSICS_DATA_REVISION)
+        self.assertIn("kf0p85-v3", fields["physics_data_revision"])
 
     def test_native_material_specs_are_directional_not_one_global_axis(self):
         specs = native_lamination_material_specs(K)
@@ -158,7 +162,12 @@ class CoreMaterialArithmeticTests(unittest.TestCase):
         )
         self.assertEqual(fields["core_lamination_factor"], 0.70)
         self.assertIn("not_a_datasheet", fields["core_lamination_factor_source"])
-        self.assertIn("kf0p70", fields["core_native_model_approval_status"])
+        self.assertEqual(
+            fields["core_native_model_approval_status"],
+            "approved_by_isolated_solved_kf_ab",
+        )
+        self.assertEqual(fields["physics_data_revision"], PHYSICS_DATA_REVISION)
+        self.assertIn("kf0p85-v3", fields["physics_data_revision"])
 
     def test_strict_native_readback_accepts_exact_and_rejects_drift(self):
         attested = validate_native_lamination_readback(
@@ -1043,12 +1052,25 @@ class CoreMaterialArtifactTests(unittest.TestCase):
             payload["prior_failure"]["task_ids"], [29964, 29965, 29966]
         )
 
-    def test_ab_artifact_is_explicitly_blocked_until_solved_evidence(self):
+    def test_ab_artifact_is_approved_with_recorded_evidence(self):
         path = Path(__file__).resolve().parent / "verify" / "1k101_native_ab_gate.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(payload["physics_data_revision"], PHYSICS_DATA_REVISION)
-        self.assertEqual(payload["status"], "blocked_pending_actual_solved_ab")
-        self.assertFalse(payload["production_approved"])
+        self.assertIn("kf0p85-v3", payload["physics_data_revision"])
+        self.assertEqual(payload["status"], "approved_kf0p85")
+        self.assertTrue(payload["production_approved"])
+        approval_record = payload["approval_record"]
+        self.assertEqual(approval_record["approved_kf"], 0.85)
+        self.assertEqual(
+            approval_record["evidence_tasks"][
+                "fresh_solve_extract_sha_a83acf2"
+            ],
+            [30615, 30616, 30617],
+        )
+        self.assertEqual(
+            approval_record["evidence_tasks"]["saved_snapshot_cross_check"],
+            30546,
+        )
         self.assertEqual(
             [case["stacking_factor"] for case in payload["ab_cases"]],
             [1.0, 0.85, 0.70],
