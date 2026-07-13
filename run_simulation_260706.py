@@ -98,6 +98,7 @@ from module.aedt_pool_adapter import (
     aedt_backend,
     acquire_pooled_desktop,
     bind_project_name as bind_pooled_project_name,
+    pilot_pre_solve_barrier,
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
 )
@@ -4113,6 +4114,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         if backend == "pooled":
             bind_pooled_project_name(sim.aedt_lease, sim.PROJECT_NAME)
         sim.create_project()
+        pilot_pre_solve_barrier(sim.PROJECT_NAME)
 
         if fixed_mode:
             sim.input_df = create_input_parameter(param)
