@@ -991,9 +991,80 @@ class LossAllocator:
 # 재질
 # ---------------------------------------------------------------------------
 
+_CORE_THERMAL_MODEL_LEGACY = "isotropic_legacy"
+_CORE_THERMAL_MODEL_WOUND = "anisotropic_wound_rule_of_mixtures_v1"
+_CORE_THERMAL_MATERIAL_LEGACY = "core_amorphous_thermal"
+_CORE_THERMAL_MATERIAL_LEG = "core_amorphous_thermal_leg"
+_CORE_THERMAL_MATERIAL_YOKE = "core_amorphous_thermal_yoke"
+
+
+def _derive_wound_core_conductivity(
+        lamination_factor, k_alloy, k_interlayer):
+    """Return in-plane and through-stack conductivity in W/mK."""
+    kf = float(lamination_factor)
+    alloy = float(k_alloy)
+    interlayer = float(k_interlayer)
+    if not math.isfinite(kf) or not 0.0 <= kf <= 1.0:
+        raise ValueError(
+            f"core_lamination_factor must be finite and in [0, 1], got {kf}"
+        )
+    for name, value in (
+            ("core_k_alloy", alloy),
+            ("core_k_interlayer", interlayer)):
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and > 0, got {value}")
+    k_inplane = kf * alloy + (1.0 - kf) * interlayer
+    k_throughstack = 1.0 / (
+        kf / alloy + (1.0 - kf) / interlayer
+    )
+    return k_inplane, k_throughstack
+
+
+def _core_thermal_conductivity_contract(df):
+    """Resolve the selected core model and both directional conductivities."""
+    enabled_value = float(df["core_k_anisotropic"].iloc[0])
+    if (
+            not math.isfinite(enabled_value)
+            or not enabled_value.is_integer()
+            or int(enabled_value) not in (0, 1)):
+        raise ValueError(
+            f"core_k_anisotropic must be 0 or 1, got {enabled_value}"
+        )
+    enabled = int(enabled_value)
+    if enabled == 0:
+        legacy = float(df["core_k_thermal"].iloc[0])
+        return {
+            "anisotropic": False,
+            "thermal_core_conductivity_model": _CORE_THERMAL_MODEL_LEGACY,
+            "thermal_core_k_inplane": legacy,
+            "thermal_core_k_throughstack": legacy,
+        }
+    k_inplane, k_throughstack = _derive_wound_core_conductivity(
+        df["core_lamination_factor"].iloc[0],
+        df["core_k_alloy"].iloc[0],
+        df["core_k_interlayer"].iloc[0],
+    )
+    return {
+        "anisotropic": True,
+        "thermal_core_conductivity_model": _CORE_THERMAL_MODEL_WOUND,
+        "thermal_core_k_inplane": k_inplane,
+        "thermal_core_k_throughstack": k_throughstack,
+    }
+
+
+def _core_thermal_material_for_piece(piece_name):
+    """Map one segmented core name to its wound-ribbon material orientation."""
+    name = str(piece_name)
+    if re.fullmatch(r"core_\d+_leg_(?:left|center|right)", name):
+        return _CORE_THERMAL_MATERIAL_LEG
+    if re.fullmatch(r"core_\d+_yoke_(?:top|bottom)", name):
+        return _CORE_THERMAL_MATERIAL_YOKE
+    raise ValueError(f"unrecognized segmented core piece name: {name!r}")
+
+
 def _create_thermal_materials(ipk, df):
     """코어 등가재질 + 권선 균질화 이방성 재질 2종 생성"""
-    k_core = float(df["core_k_thermal"].iloc[0])
+    core_contract = _core_thermal_conductivity_contract(df)
     k_ins = float(df["k_ins"].iloc[0])
     cw2 = float(df["cw2"].iloc[0])
     gap2 = float(df["gap2"].iloc[0])
@@ -1004,9 +1075,37 @@ def _create_thermal_materials(ipk, df):
 
     mats = ipk.materials
 
-    if "core_amorphous_thermal" not in mats.material_keys:
-        m = mats.add_material("core_amorphous_thermal")
-        m.thermal_conductivity = k_core
+    if core_contract["anisotropic"]:
+        core_materials = (
+            (
+                _CORE_THERMAL_MATERIAL_LEG,
+                [
+                    core_contract["thermal_core_k_throughstack"],
+                    core_contract["thermal_core_k_inplane"],
+                    core_contract["thermal_core_k_inplane"],
+                ],
+            ),
+            (
+                _CORE_THERMAL_MATERIAL_YOKE,
+                [
+                    core_contract["thermal_core_k_inplane"],
+                    core_contract["thermal_core_k_inplane"],
+                    core_contract["thermal_core_k_throughstack"],
+                ],
+            ),
+        )
+        for material_name, conductivity in core_materials:
+            if material_name not in mats.material_keys:
+                m = mats.add_material(material_name)
+                # A three-element Python list is PyAEDT's supported
+                # AnisoProperty form; component order is global X/Y/Z.
+                m.thermal_conductivity = conductivity
+                m.mass_density = 7180
+                m.specific_heat = 540
+    elif _CORE_THERMAL_MATERIAL_LEGACY not in mats.material_keys:
+        # Preserve the pre-extension scalar material path exactly when opted out.
+        m = mats.add_material(_CORE_THERMAL_MATERIAL_LEGACY)
+        m.thermal_conductivity = core_contract["thermal_core_k_inplane"]
         m.mass_density = 7180
         m.specific_heat = 540
 
@@ -1208,12 +1307,30 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     n_group = int(df["n_core_group"].iloc[0])
     plate_on = int(df["core_plate_on"].iloc[0]) != 0
     pad_on = float(df["core_plate_pad_t"].iloc[0]) > 0
-    core_objs, plate_objs, pad_objs = create_core(
-        design=ipk, name="core", core_material="core_amorphous_thermal",
-        n_group=n_group, plate_material="aluminum", pad_material="thermal_pad",
-        plate_on=plate_on, pad_on=pad_on,
-        plate_color=[144, 190, 144], pad_color=[200, 160, 200]
-    )
+    core_contract = _core_thermal_conductivity_contract(df)
+    if core_contract["anisotropic"]:
+        core_objs, plate_objs, pad_objs = create_core(
+            design=ipk, name="core",
+            core_material=_CORE_THERMAL_MATERIAL_LEGACY,
+            n_group=n_group, plate_material="aluminum",
+            pad_material="thermal_pad", plate_on=plate_on, pad_on=pad_on,
+            plate_color=[144, 190, 144], pad_color=[200, 160, 200],
+            segmented_lamination=True,
+            core_material_leg=_core_thermal_material_for_piece(
+                "core_1_leg_center"
+            ),
+            core_material_yoke=_core_thermal_material_for_piece(
+                "core_1_yoke_top"
+            ),
+        )
+    else:
+        core_objs, plate_objs, pad_objs = create_core(
+            design=ipk, name="core",
+            core_material=_CORE_THERMAL_MATERIAL_LEGACY,
+            n_group=n_group, plate_material="aluminum",
+            pad_material="thermal_pad", plate_on=plate_on, pad_on=pad_on,
+            plate_color=[144, 190, 144], pad_color=[200, 160, 200]
+        )
     objs["core"] = core_objs
     objs["core_plates"] = plate_objs
     objs["core_pads"] = pad_objs
@@ -1622,19 +1739,52 @@ def _assign_losses(ipk, sim, objs, eighth=False, mode=None):
     # 코어 그룹: loss_map_phys에 있는 키 우선, 없으면(풀 열해석 + 대칭 EM 조합의 미러) 대응 그룹
     n_group = int(df["n_core_group"].iloc[0])
     core_expected_injected_w = 0.0
-    for c in objs["core"]:
-        try:
-            i = int(c.name.split("_")[1])
-        except (IndexError, ValueError):
-            i = 1
-        key = f"P_{c.name}"
-        if key not in alloc.loss_map:
-            key = f"P_core_{n_group + 1 - i}"  # y-미러 그룹
-        core_power = alloc.turn_loss(key, c.name)
-        core_expected_injected_w += core_power
-        _block(
-            c, core_power, native_core_readback=alloc.native_core_contract
+    segmented_core = any(
+        re.fullmatch(
+            r"core_\d+_(?:leg_(?:left|center|right)|yoke_(?:top|bottom))",
+            str(c.name),
         )
+        for c in objs["core"]
+    )
+    if segmented_core:
+        # Maxwell reports one P_core_i total for the five leg/yoke pieces.  In
+        # a symmetry model, first recover the retained gross-frame group total
+        # with the canonical unsuffixed name, then distribute it by each live
+        # post-split volume.  This preserves both total power and uniform source
+        # density instead of injecting the group total into every piece.
+        core_groups = {}
+        for c in objs["core"]:
+            _core_thermal_material_for_piece(c.name)
+            i = int(c.name.split("_")[1])
+            core_groups.setdefault(i, []).append(c)
+        for i, pieces in sorted(core_groups.items()):
+            key = f"P_core_{i}"
+            if key not in alloc.loss_map:
+                key = f"P_core_{n_group + 1 - i}"  # y-미러 그룹
+            group_power = alloc.turn_loss(key, f"core_{i}")
+            piece_powers = _volume_weighted_powers(pieces, group_power)
+            core_expected_injected_w += group_power
+            for piece, piece_power in zip(pieces, piece_powers):
+                _block(
+                    piece,
+                    piece_power,
+                    native_core_readback=alloc.native_core_contract,
+                )
+    else:
+        # Legacy path intentionally remains byte-for-behavior equivalent.
+        for c in objs["core"]:
+            try:
+                i = int(c.name.split("_")[1])
+            except (IndexError, ValueError):
+                i = 1
+            key = f"P_{c.name}"
+            if key not in alloc.loss_map:
+                key = f"P_core_{n_group + 1 - i}"  # y-미러 그룹
+            core_power = alloc.turn_loss(key, c.name)
+            core_expected_injected_w += core_power
+            _block(
+                c, core_power, native_core_readback=alloc.native_core_contract
+            )
 
     # 콜드플레이트/냉각판은 고정온도 경계라 열원 주입 생략
     sim.thermal_injected = injected
@@ -1903,6 +2053,7 @@ def run_thermal_analysis(sim):
     sim.design_thermal = ipk
 
     set_design_variables(ipk, sim.input_df)
+    core_conductivity = _core_thermal_conductivity_contract(df)
     _create_thermal_materials(ipk, df)
     objs = _build_geometry(ipk, sim, eighth=eighth, mode=mode)
     probe_sheets = _create_probe_sheets(ipk, df, objs, eighth=eighth, mode=mode)
@@ -2125,6 +2276,15 @@ def run_thermal_analysis(sim):
             "thermal_solve_s": [thermal_solve_s],
             "thermal_extraction_s": [thermal_extraction_s],
             "thermal_rx_model": [sim.thermal_rx_model],
+            "thermal_core_conductivity_model": [
+                core_conductivity["thermal_core_conductivity_model"]
+            ],
+            "thermal_core_k_inplane": [
+                core_conductivity["thermal_core_k_inplane"]
+            ],
+            "thermal_core_k_throughstack": [
+                core_conductivity["thermal_core_k_throughstack"]
+            ],
             "thermal_rx_power_balance_ok": [1 if rx_balance_ok else 0],
             "thermal_rx_power_balance_group_count": [len(rx_balance)],
             "thermal_rx_power_balance_max_abs_w": [rx_balance_max_abs],
@@ -2423,6 +2583,15 @@ def run_thermal_analysis(sim):
         "thermal_solve_s": [thermal_solve_s],
         "thermal_extraction_s": [thermal_extraction_s],
         "thermal_rx_model": [sim.thermal_rx_model],
+        "thermal_core_conductivity_model": [
+            core_conductivity["thermal_core_conductivity_model"]
+        ],
+        "thermal_core_k_inplane": [
+            core_conductivity["thermal_core_k_inplane"]
+        ],
+        "thermal_core_k_throughstack": [
+            core_conductivity["thermal_core_k_throughstack"]
+        ],
         "thermal_rx_power_balance_ok": [1 if rx_balance_ok else 0],
         "thermal_rx_power_balance_group_count": [len(rx_balance)],
         "thermal_rx_power_balance_max_abs_w": [rx_balance_max_abs],

@@ -44,6 +44,7 @@ from verify.finalize import (
 from module.input_parameter_260706 import (
     ALL_INPUT_KEYS,
     KEYS,
+    PRE_ANISOTROPIC_CORE_K_INPUT_KEYS,
     create_input_parameter,
 )
 from module.core_material_contract import PHYSICS_DATA_REVISION
@@ -900,14 +901,25 @@ class FineValidationTests(unittest.TestCase):
     def test_candidate_schemas_preserve_sealed_digest_across_revision_metadata(self):
         complete = create_input_parameter({}).iloc[0].to_dict()
         sealed = {key: complete[key] for key in KEYS}
+        pre_anisotropic = {
+            key: complete[key]
+            for key in PRE_ANISOTROPIC_CORE_K_INPUT_KEYS
+        }
+        legacy_thermal = dict(
+            complete,
+            core_k_anisotropic=0,
+            core_k_alloy=8.5,
+            core_k_interlayer=0.25,
+        )
 
         self.assertEqual(len(KEYS), 71)
-        self.assertEqual(len(ALL_INPUT_KEYS), 75)
+        self.assertEqual(len(PRE_ANISOTROPIC_CORE_K_INPUT_KEYS), 75)
+        self.assertEqual(len(ALL_INPUT_KEYS), 78)
         self.assertEqual(
             {len(schema) for schema in ALLOWED_CANDIDATE_INPUT_SCHEMAS},
-            {71, 75},
+            {71, 75, 78},
         )
-        for params in (sealed, complete):
+        for params in (sealed, pre_anisotropic, complete, legacy_thermal):
             with self.subTest(schema_size=len(params)):
                 self.assertIn(
                     frozenset(params), ALLOWED_CANDIDATE_INPUT_SCHEMAS

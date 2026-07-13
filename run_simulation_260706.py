@@ -841,9 +841,10 @@ def _thermal_result_is_valid(frame, physics_data_revision=None):
         return False
 
 
-def _thermal_failure_frame(error):
+def _thermal_failure_frame(error, core_conductivity=None):
     """Build a harvestable EM row marker for a hard thermal-stage failure."""
     message = str(error).strip() or repr(error)
+    core_conductivity = core_conductivity or {}
     return pd.DataFrame({
         "thermal_solved": [0],
         "thermal_convergence_available": [0],
@@ -853,6 +854,17 @@ def _thermal_failure_frame(error):
         "thermal_required_group_mask": [15],
         "thermal_required_group_count": [4],
         "thermal_rx_model": ["unknown"],
+        "thermal_core_conductivity_model": [
+            core_conductivity.get(
+                "thermal_core_conductivity_model", "unknown"
+            )
+        ],
+        "thermal_core_k_inplane": [core_conductivity.get(
+            "thermal_core_k_inplane", float("nan")
+        )],
+        "thermal_core_k_throughstack": [core_conductivity.get(
+            "thermal_core_k_throughstack", float("nan")
+        )],
         "thermal_rx_power_balance_ok": [0],
         "thermal_rx_power_balance_group_count": [0],
         "thermal_rx_power_balance_max_abs_w": [float("nan")],
@@ -5825,7 +5837,13 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         # ---- design3: Icepak 열해석 (풀 지오메트리, EM 손실 주입) ----
         thermal_result_valid = not thermal_on
         if thermal_on and loss_on and not model_only:
-            from module.thermal_260706 import run_thermal_analysis
+            from module.thermal_260706 import (
+                _core_thermal_conductivity_contract,
+                run_thermal_analysis,
+            )
+            core_conductivity = _core_thermal_conductivity_contract(
+                sim.df_plus
+            )
             t0 = time.monotonic()
             try:
                 df_thermal = run_thermal_analysis(sim)
@@ -5835,7 +5853,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     sim.input_df,
                     f"thermal: {type(thermal_error).__name__}: {thermal_error}",
                 )
-                df_thermal = _thermal_failure_frame(thermal_error)
+                df_thermal = _thermal_failure_frame(
+                    thermal_error, core_conductivity=core_conductivity
+                )
             thermal_result_valid = _thermal_result_is_valid(
                 df_thermal,
                 physics_data_revision=sim.df_plus.get(

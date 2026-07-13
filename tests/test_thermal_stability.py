@@ -20,6 +20,20 @@ class _Object:
         self.volume = volume
 
 
+class _Material:
+    pass
+
+
+class _Materials:
+    def __init__(self):
+        self.material_keys = {}
+
+    def add_material(self, name):
+        material = _Material()
+        self.material_keys[name] = material
+        return material
+
+
 class _Boundary:
     def __init__(self, props=None, update_result=True, post_update_props=None):
         self.props = props or {}
@@ -282,6 +296,7 @@ class ThermalStabilityTest(unittest.TestCase):
         convergence=None,
         tx_count=1,
         scalar_responses=None,
+        core_k_anisotropic=1,
     ):
         ipk = _Icepak(
             analyze_result,
@@ -302,6 +317,11 @@ class ThermalStabilityTest(unittest.TestCase):
                 "N1_side": [n1_side],
                 "N2_side": [1 if include_side else 0],
                 "n_explicit_turns": [1],
+                "core_k_anisotropic": [core_k_anisotropic],
+                "core_k_thermal": [2.0],
+                "core_lamination_factor": [0.85],
+                "core_k_alloy": [9.0],
+                "core_k_interlayer": [0.2],
             }),
             input_df=pd.DataFrame([{}]),
             NUM_CORE=4,
@@ -426,6 +446,178 @@ class ThermalStabilityTest(unittest.TestCase):
             "fan_velocity": [1.5],
             "fan_config": ["dual"],
         }))
+
+    @staticmethod
+    def _core_k_frame(anisotropic=1, legacy=2.0):
+        return pd.DataFrame({
+            "core_k_anisotropic": [anisotropic],
+            "core_k_thermal": [legacy],
+            "core_lamination_factor": [0.85],
+            "core_k_alloy": [9.0],
+            "core_k_interlayer": [0.2],
+            "k_ins": [0.2],
+            "cw2": [0.665],
+            "gap2": [0.339],
+        })
+
+    def test_wound_core_rule_of_mixtures_and_piece_orientation(self):
+        k_inplane, k_throughstack = (
+            thermal._derive_wound_core_conductivity(0.85, 9.0, 0.2)
+        )
+        self.assertAlmostEqual(k_inplane, 7.68)
+        self.assertAlmostEqual(k_throughstack, 1.1842105263157894)
+
+        for name in (
+                "core_1_leg_left", "core_2_leg_center",
+                "core_3_leg_right"):
+            self.assertEqual(
+                thermal._core_thermal_material_for_piece(name),
+                "core_amorphous_thermal_leg",
+            )
+        for name in ("core_1_yoke_top", "core_3_yoke_bottom"):
+            self.assertEqual(
+                thermal._core_thermal_material_for_piece(name),
+                "core_amorphous_thermal_yoke",
+            )
+        with self.assertRaisesRegex(ValueError, "unrecognized segmented"):
+            thermal._core_thermal_material_for_piece("core_1")
+
+        materials = _Materials()
+        thermal._create_thermal_materials(
+            SimpleNamespace(materials=materials), self._core_k_frame()
+        )
+        self.assertEqual(
+            materials.material_keys[
+                "core_amorphous_thermal_leg"
+            ].thermal_conductivity,
+            [k_throughstack, k_inplane, k_inplane],
+        )
+        self.assertEqual(
+            materials.material_keys[
+                "core_amorphous_thermal_yoke"
+            ].thermal_conductivity,
+            [k_inplane, k_inplane, k_throughstack],
+        )
+        self.assertNotIn("core_amorphous_thermal", materials.material_keys)
+
+    def test_legacy_core_material_path_remains_scalar(self):
+        frame = self._core_k_frame(anisotropic=0, legacy=2.75)
+        # These anchors are irrelevant when the explicit legacy opt-out is set.
+        frame["core_k_alloy"] = -1.0
+        frame["core_k_interlayer"] = -1.0
+        contract = thermal._core_thermal_conductivity_contract(frame)
+        self.assertEqual(contract["thermal_core_conductivity_model"], "isotropic_legacy")
+        self.assertEqual(contract["thermal_core_k_inplane"], 2.75)
+        self.assertEqual(contract["thermal_core_k_throughstack"], 2.75)
+
+        materials = _Materials()
+        thermal._create_thermal_materials(
+            SimpleNamespace(materials=materials), frame
+        )
+        self.assertEqual(
+            materials.material_keys[
+                "core_amorphous_thermal"
+            ].thermal_conductivity,
+            2.75,
+        )
+        self.assertNotIn(
+            "core_amorphous_thermal_leg", materials.material_keys
+        )
+        self.assertNotIn(
+            "core_amorphous_thermal_yoke", materials.material_keys
+        )
+
+    def test_thermal_geometry_segments_only_the_anisotropic_core(self):
+        def core_call(anisotropic):
+            frame = pd.DataFrame({
+                "core_k_anisotropic": [anisotropic],
+                "core_k_thermal": [2.0],
+                "core_lamination_factor": [0.85],
+                "core_k_alloy": [9.0],
+                "core_k_interlayer": [0.2],
+                "n_explicit_turns": [1],
+                "l1": [89.0],
+                "l2": [236.5],
+                "nwh1": [284.5],
+                "nwh2": [284.5],
+                "n_core_group": [1],
+                "core_plate_on": [0],
+                "core_plate_pad_t": [0.0],
+                "wcp_on": [0],
+                "wcp_pad_t": [0.0],
+                "N1_main": [1],
+                "N2_side": [0],
+                "nwl1_main": [100.0],
+                "wff1_main": [0.5],
+                "sl1_main_x": [100.0],
+                "sl1_main_y": [100.0],
+            })
+            core = _Object("core_1")
+            tx = _Object("Tx_main_0")
+            rx = _Object("Rx_main_0")
+            ipk = SimpleNamespace(modeler=SimpleNamespace(
+                object_names=[core.name, tx.name, rx.name]
+            ))
+            sim = SimpleNamespace(df_plus=frame)
+            with patch.object(
+                    thermal, "create_core",
+                    return_value=([core], [], [])) as create_core_mock, \
+                    patch.object(
+                        thermal, "get_tx_y_gaps", return_value=([], [])
+                    ), \
+                    patch.object(
+                        thermal, "create_coil",
+                        return_value=([tx], None, 1.0, None, None, None),
+                    ), \
+                    patch.object(
+                        thermal, "_build_rx_group",
+                        return_value=([rx], []),
+                    ):
+                thermal._build_geometry(ipk, sim, mode="full")
+            return create_core_mock.call_args.kwargs
+
+        anisotropic = core_call(1)
+        self.assertIs(anisotropic["segmented_lamination"], True)
+        self.assertEqual(
+            anisotropic["core_material_leg"],
+            "core_amorphous_thermal_leg",
+        )
+        self.assertEqual(
+            anisotropic["core_material_yoke"],
+            "core_amorphous_thermal_yoke",
+        )
+
+        legacy = core_call(0)
+        self.assertEqual(legacy["core_material"], "core_amorphous_thermal")
+        self.assertNotIn("segmented_lamination", legacy)
+        self.assertNotIn("core_material_leg", legacy)
+        self.assertNotIn("core_material_yoke", legacy)
+
+    def test_thermal_payload_tags_anisotropic_and_legacy_core_models(self):
+        response = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+        }
+        _ipk, anisotropic = self._run(None, [response])
+        self.assertEqual(
+            anisotropic["thermal_core_conductivity_model"],
+            "anisotropic_wound_rule_of_mixtures_v1",
+        )
+        self.assertAlmostEqual(anisotropic["thermal_core_k_inplane"], 7.68)
+        self.assertAlmostEqual(
+            anisotropic["thermal_core_k_throughstack"],
+            1.1842105263157894,
+        )
+
+        _ipk, legacy = self._run(
+            None, [response], core_k_anisotropic=0
+        )
+        self.assertEqual(
+            legacy["thermal_core_conductivity_model"], "isotropic_legacy"
+        )
+        self.assertEqual(legacy["thermal_core_k_inplane"], 2.0)
+        self.assertEqual(legacy["thermal_core_k_throughstack"], 2.0)
 
     @staticmethod
     def _probe_frame(n_group):
@@ -1022,6 +1214,67 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(injected, {"Rx_side_0_0": 25.0})
         self.assertEqual(sim.thermal_rx_power_balance[-1]["assigned_w"], 25.0)
         self.assertEqual(sim.thermal_rx_model, "homogenized_blocks")
+
+    def test_segmented_core_loss_is_volume_weighted_once_per_group(self):
+        def assign_solid_block(name, power):
+            return _Boundary({
+                "Block Type": "Solid",
+                "Objects": [name],
+                "Total Power": power,
+            })
+
+        frame = pd.DataFrame({
+            "n_core_group": [1],
+            "w1": [8.0],
+            "core_plate_t": [0.0],
+            "core_plate_pad_t": [0.0],
+            "n_explicit_turns": [0],
+        })
+        pieces = [
+            _Object("core_1_leg_left", volume=1.0),
+            _Object("core_1_leg_center", volume=1.0),
+            _Object("core_1_yoke_top", volume=2.0),
+        ]
+        objects = self._loss_objects()
+        objects["Tx"] = []
+        objects["core"] = pieces
+        sim = SimpleNamespace(
+            df_plus=frame,
+            loss_map_phys={"P_Rx_main_group": 0.0, "P_core_1": 80.0},
+        )
+        injected = thermal._assign_losses(
+            SimpleNamespace(assign_solid_block=assign_solid_block),
+            sim,
+            objects,
+            mode="eighth",
+        )
+        self.assertEqual(
+            injected,
+            {
+                "core_1_leg_left": 2.5,
+                "core_1_leg_center": 2.5,
+                "core_1_yoke_top": 5.0,
+            },
+        )
+        self.assertEqual(sum(injected.values()), 10.0)
+        self.assertEqual(sim.thermal_core_expected_injected_w, 10.0)
+
+        # The unsegmented branch must not require a volume and must retain the
+        # exact pre-extension source assignment.
+        legacy_objects = self._loss_objects()
+        legacy_objects["Tx"] = []
+        legacy_objects["core"] = [SimpleNamespace(name="core_1")]
+        legacy_sim = SimpleNamespace(
+            df_plus=frame,
+            loss_map_phys={"P_Rx_main_group": 0.0, "P_core_1": 80.0},
+        )
+        legacy_injected = thermal._assign_losses(
+            SimpleNamespace(assign_solid_block=assign_solid_block),
+            legacy_sim,
+            legacy_objects,
+            mode="eighth",
+        )
+        self.assertEqual(legacy_injected, {"core_1": 10.0})
 
     def test_fixed_temperature_uses_supported_condition_and_props(self):
         ipk = _BoundaryIcepak()

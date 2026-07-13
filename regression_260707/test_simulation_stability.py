@@ -38,17 +38,21 @@ from run_simulation_260706 import (
     log_failed_sample,
 )
 from module.input_parameter_260706 import (
+    ALL_INPUT_KEYS,
     COLD_PLATE_MAX_T_MM,
     COLD_PLATE_MIN_T_MM,
     KEYS,
     N1_MAX_TURNS,
+    PRE_ANISOTROPIC_CORE_K_INPUT_KEYS,
     PRIMARY_CONDUCTOR_MAX_THICKNESS_MM,
+    THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
     WCP_LENGTH_MAX_PCT,
     WCP_LENGTH_MIN_PCT,
     _SOBOL_DIMS,
     create_input_parameter,
     decode_unit_sample,
     get_drawing_default_params,
+    get_design_var_columns,
     get_tx_y_gaps,
     unit_to_dims,
     validation_check,
@@ -185,6 +189,58 @@ class DesktopSessionRetryTests(unittest.TestCase):
                 close_on_exit=True,
             )
         sleep.assert_called_once_with(1.0)
+
+
+class ThermalCoreConductivityInputContractTests(unittest.TestCase):
+    def test_controls_are_accepted_but_not_sealed_or_design_variables(self):
+        defaults = get_drawing_default_params()
+        self.assertEqual(defaults["core_k_anisotropic"], 1)
+        self.assertEqual(defaults["core_k_alloy"], 9.0)
+        self.assertEqual(defaults["core_k_interlayer"], 0.2)
+        self.assertTrue(
+            set(THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS).issubset(ALL_INPUT_KEYS)
+        )
+        self.assertTrue(
+            set(THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS).isdisjoint(KEYS)
+        )
+
+        frame = create_input_parameter({
+            "core_k_anisotropic": 0,
+            "core_k_alloy": 8.5,
+            "core_k_interlayer": 0.25,
+        })
+        self.assertEqual(int(frame["core_k_anisotropic"].iloc[0]), 0)
+        self.assertEqual(float(frame["core_k_alloy"].iloc[0]), 8.5)
+        self.assertEqual(float(frame["core_k_interlayer"].iloc[0]), 0.25)
+        self.assertTrue(
+            set(THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS).isdisjoint(
+                get_design_var_columns(frame)
+            )
+        )
+
+        pre_extension = create_input_parameter(
+            frame[PRE_ANISOTROPIC_CORE_K_INPUT_KEYS]
+        )
+        self.assertEqual(int(pre_extension["core_k_anisotropic"].iloc[0]), 1)
+        self.assertEqual(float(pre_extension["core_k_alloy"].iloc[0]), 9.0)
+        self.assertEqual(
+            float(pre_extension["core_k_interlayer"].iloc[0]), 0.2
+        )
+
+    def test_controls_require_binary_flag_and_positive_finite_anchors(self):
+        cases = (
+            ("core_k_anisotropic", 2, "must be 0 or 1"),
+            ("core_k_anisotropic", 0.5, "must be 0 or 1"),
+            ("core_k_alloy", 0.0, "finite and > 0"),
+            ("core_k_alloy", float("nan"), "finite and > 0"),
+            ("core_k_interlayer", -0.1, "finite and > 0"),
+        )
+        for key, value, message in cases:
+            with self.subTest(key=key, value=value):
+                params = get_drawing_default_params()
+                params[key] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    validation_check(create_input_parameter(params), strict=True)
 
 
 class PrimaryTurnDomainTests(unittest.TestCase):
@@ -4011,7 +4067,16 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
         self.assertTrue(_thermal_result_is_valid(legacy))
 
     def test_thermal_exception_row_preserves_failure_provenance(self):
-        frame = _thermal_failure_frame(RuntimeError("source assignment failed"))
+        frame = _thermal_failure_frame(
+            RuntimeError("source assignment failed"),
+            core_conductivity={
+                "thermal_core_conductivity_model": (
+                    "anisotropic_wound_rule_of_mixtures_v1"
+                ),
+                "thermal_core_k_inplane": 7.68,
+                "thermal_core_k_throughstack": 1.1842105263157894,
+            },
+        )
 
         self.assertEqual(frame["thermal_solved"].iloc[0], 0)
         self.assertEqual(frame["thermal_extraction_complete"].iloc[0], 0)
@@ -4019,6 +4084,11 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
         self.assertEqual(frame["thermal_required_missing_count"].iloc[0], 4)
         self.assertEqual(frame["thermal_error_type"].iloc[0], "RuntimeError")
         self.assertIn("source assignment failed", frame["thermal_error_message"].iloc[0])
+        self.assertEqual(
+            frame["thermal_core_conductivity_model"].iloc[0],
+            "anisotropic_wound_rule_of_mixtures_v1",
+        )
+        self.assertEqual(frame["thermal_core_k_inplane"].iloc[0], 7.68)
 
     def test_short_batch_is_not_reported_as_complete(self):
         self.assertEqual(_completion_exit_code(8, 8), 0)

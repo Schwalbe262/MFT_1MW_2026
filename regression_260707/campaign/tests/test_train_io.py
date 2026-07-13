@@ -23,6 +23,14 @@ def raw_rows():
             "matrix_skin_mesh": 0,
             "n_explicit_turns": 0,
             "thermal_rx_model": "homogenized_blocks",
+            "core_k_anisotropic": 1,
+            "core_k_alloy": 9.0,
+            "core_k_interlayer": 0.2,
+            "thermal_core_conductivity_model": (
+                "anisotropic_wound_rule_of_mixtures_v1"
+            ),
+            "thermal_core_k_inplane": 7.68,
+            "thermal_core_k_throughstack": 1.1842105263157894,
             "N1_main": 7,
             "N2_main": 65,
             "N2_side": 5,
@@ -76,6 +84,12 @@ def raw_rows():
             "matrix_skin_mesh": 1,
             "n_explicit_turns": 2,
             "thermal_rx_model": "hybrid_explicit",
+            "core_k_anisotropic": 0,
+            "core_k_alloy": 9.0,
+            "core_k_interlayer": 0.2,
+            "thermal_core_conductivity_model": "isotropic_legacy",
+            "thermal_core_k_inplane": 2.0,
+            "thermal_core_k_throughstack": 2.0,
             "N1_main": 7,
             "N2_main": 65,
             "N2_side": 5,
@@ -129,6 +143,14 @@ class TrainIoBuilderTests(unittest.TestCase):
             view["thermal_rx_model"].tolist(),
             ["homogenized_blocks", "hybrid_explicit"],
         )
+        self.assertEqual(
+            view["thermal_core_conductivity_model"].tolist(),
+            [
+                "anisotropic_wound_rule_of_mixtures_v1",
+                "isotropic_legacy",
+            ],
+        )
+        self.assertEqual(view["thermal_core_k_inplane"].tolist(), [7.68, 2.0])
         self.assertEqual(view["P_winding_total"].tolist(), [4000.0, 4100.0])
         self.assertEqual(
             view.loc[0, "winding_flux_linkage_readback_status"],
