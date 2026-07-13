@@ -118,6 +118,11 @@ from module.thermal_probe_contract import (
     RX_SIDE_FACE_MEAN_RULE,
     RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
 )
+from module.electrostatic_cap import (
+    build_capacitance_payload,
+    build_capacitance_timing_payload,
+    parse_maxwell_capacitance_export,
+)
 
 from ansys.aedt.core import settings
 
@@ -1908,7 +1913,7 @@ class Simulation():
         self.desktop = desktop
         self.full_model = False
         self.project_path = None
-        self.solve_attempts = {"matrix": 0, "loss": 0}
+        self.solve_attempts = {"matrix": 0, "cap": 0, "loss": 0}
         self.extraction_attempts = {}
         self.extraction_backends = {}
         self.extraction_units = {}
@@ -2100,8 +2105,10 @@ class Simulation():
             + "; ".join(errors)
         )
 
-    def create_design(self, name="maxwell_design"):
-        self.design1 = self.project.create_design(name=name, solver="maxwell3d", solution="AC Magnetic")
+    def create_design(self, name="maxwell_design", solution="AC Magnetic"):
+        self.design1 = self.project.create_design(
+            name=name, solver="maxwell3d", solution=solution
+        )
 
         # skip mesh setting
         # pyaedt 0.22: GetActiveDesign이 None을 주면 디자인 삽입 경로가 bool 오류로 무너져
@@ -3247,6 +3254,189 @@ class Simulation():
         self.design1.assign_symmetry(assignment=self.air_region.bottom_face_y, symmetry_name="Symmetry3", is_odd=True)
         self.design1.assign_radiation(assignment=[self.air_region.top_face_z, self.air_region.bottom_face_x, self.air_region.top_face_y], radiation="Radiation")
 
+    def create_capacitance_design(self, name="maxwell_cap"):
+        """Copy the solved matrix geometry into a Maxwell Electrostatic design.
+
+        Only physical 3D bodies are copied; magnetic coil-terminal/flux sheets,
+        winding excitations, matrix parameters, and magnetic boundaries stay
+        in ``maxwell_matrix``.  The electrostatic model treats every Tx turn as
+        one equipotential net and every Rx turn as a second equipotential net;
+        core and cooling plates are tied to the finite enclosure ground.  This
+        is intentionally a first-order two-net screening model, not a
+        turn-by-turn winding network.
+        """
+        source = getattr(self, "design_matrix", None)
+        if source is None:
+            raise RuntimeError("capacitance stage requires maxwell_matrix geometry")
+
+        tx_names = _named_object_sequence(source.Tx_windings)
+        rx_names = _named_object_sequence(source.Rx_windings)
+        core_names = _named_object_sequence(source.core_objs)
+        plate_names = _named_object_sequence(
+            list(source.core_plates) + list(source.wcp_plates)
+        )
+        dielectric_names = _named_object_sequence(
+            list(source.core_pads) + list(source.wcp_pads)
+        )
+        if not tx_names or not rx_names or not core_names:
+            raise RuntimeError(
+                "capacitance geometry groups are incomplete: "
+                f"Tx={len(tx_names)}, Rx={len(rx_names)}, "
+                f"core={len(core_names)}"
+            )
+
+        geometry_names = (
+            tx_names + rx_names + core_names + plate_names
+            + dielectric_names
+        )
+        if len(geometry_names) != len(set(geometry_names)):
+            raise RuntimeError("capacitance geometry copy contains duplicate names")
+
+        self.create_design(name=name, solution="Electrostatic")
+        cap_design = self.design1
+        set_design_variables(cap_design, self.input_df)
+        cap_design.modeler.model_units = "mm"
+        copied = cap_design.copy_solid_bodies_from(
+            source.solver_instance,
+            assignment=geometry_names,
+            no_vacuum=False,
+            no_pec=False,
+            include_sheets=False,
+        )
+        if copied is None or copied is False:
+            raise RuntimeError("copying matrix solids into capacitance design failed")
+        actual_names = set(cap_design.modeler.object_names)
+        missing_names = sorted(set(geometry_names) - actual_names)
+        if missing_names:
+            raise RuntimeError(
+                f"capacitance geometry paste is incomplete: {missing_names!r}"
+            )
+
+        # Percentage padding is measured from the active model's bounding span.
+        # An eighth model has half the full span on every cut axis, so 200% on
+        # each retained remote side reproduces the full model's 100%-of-full-span
+        # grounded enclosure after mirroring.  Using the magnetic eighth Region
+        # directly (100% of a half span) would bias C and break the x8 contract.
+        if self.full_model:
+            remote_region_padding_percent = 100.0
+            region = cap_design.modeler.create_air_region(
+                x_pos=100.0,
+                y_pos=100.0,
+                z_pos=100.0,
+                x_neg=100.0,
+                y_neg=100.0,
+                z_neg=100.0,
+                is_percentage=True,
+            )
+        else:
+            remote_region_padding_percent = 200.0
+            region = cap_design.modeler.create_air_region(
+                x_pos=0.0,
+                y_pos=200.0,
+                z_pos=200.0,
+                x_neg=200.0,
+                y_neg=0.0,
+                z_neg=0.0,
+                is_percentage=True,
+            )
+        if region is None or region is False:
+            raise RuntimeError("creating the matched capacitance region failed")
+        if self.full_model:
+            grounded_region_faces = [
+                region.top_face_x, region.bottom_face_x,
+                region.top_face_y, region.bottom_face_y,
+                region.top_face_z, region.bottom_face_z,
+            ]
+            cut_region_faces = []
+        else:
+            # The retained domain is x<=0, y>=0, z>=0.  Ground only the three
+            # remote region faces.  The x=0/y=0/z=0 faces receive explicit even
+            # symmetry (n.D=0); grounding those cut faces would corrupt 1/8 C.
+            grounded_region_faces = [
+                region.bottom_face_x, region.top_face_y, region.top_face_z,
+            ]
+            cut_region_faces = [
+                region.top_face_x, region.bottom_face_y, region.bottom_face_z,
+            ]
+
+        cap_even_symmetry = None
+        if cut_region_faces:
+            cap_even_symmetry = cap_design.assign_symmetry(
+                assignment=cut_region_faces,
+                symmetry_name="CapEvenSymmetry",
+                is_odd=False,
+            )
+            if cap_even_symmetry is None or cap_even_symmetry is False:
+                raise RuntimeError("assigning electrostatic even symmetry failed")
+
+        tx_voltage = cap_design.assign_voltage(
+            assignment=tx_names, amplitude="1V", name="CapTx"
+        )
+        rx_voltage = cap_design.assign_voltage(
+            assignment=rx_names, amplitude="0V", name="CapRx"
+        )
+        # One shared 0-V source spans every grounded body.  In particular, the
+        # touching segmented core boxes are not declared as independent nets.
+        ground_solids_voltage = cap_design.assign_voltage(
+            assignment=core_names + plate_names,
+            amplitude="0V", name="CapGroundSolids",
+        )
+        ground_region_voltage = cap_design.assign_voltage(
+            assignment=grounded_region_faces,
+            amplitude="0V", name="CapGroundRegion",
+        )
+        for label, boundary in (
+                ("Tx", tx_voltage), ("Rx", rx_voltage),
+                ("ground solids", ground_solids_voltage),
+                ("ground region", ground_region_voltage)):
+            if boundary is None or boundary is False:
+                raise RuntimeError(
+                    f"capacitance {label} voltage assignment failed"
+                )
+
+        matrix = cap_design.assign_matrix(
+            # Ground is an explicit 0-V boundary, not a matrix source.  Maxwell
+            # solves the two independent unit-voltage source patterns and emits
+            # the requested native 2x2 Maxwell capacitance matrix.
+            assignment=[tx_voltage.name, rx_voltage.name],
+            matrix_name="CapMatrix",
+        )
+        if matrix is None or matrix is False:
+            raise RuntimeError("native capacitance matrix assignment failed")
+
+        setup = cap_design.create_setup(
+            name="Setup1",
+            setup_type="Electrostatic",
+            MaximumPasses=int(self.df_plus["cap_max_passes"].iloc[0]),
+            MinimumPasses=1,
+            MinimumConvergedPasses=1,
+            PercentError=float(self.df_plus["cap_percent_error"].iloc[0]),
+            SolveFieldOnly=False,
+            SolveMatrixAtLast=True,
+        )
+        if setup is None or setup is False:
+            raise RuntimeError("creating the electrostatic Setup1 failed")
+        cap_design.setup = setup
+        cap_design.cap_tx_names = tx_names
+        cap_design.cap_rx_names = rx_names
+        cap_design.cap_ground_names = core_names + plate_names
+        cap_design.cap_dielectric_names = dielectric_names
+        cap_design.cap_region = region
+        cap_design.cap_region_remote_padding_percent = (
+            remote_region_padding_percent
+        )
+        cap_design.cap_even_symmetry = cap_even_symmetry
+        cap_design.cap_matrix = matrix
+        self.cap_geometry_copy_count = len(geometry_names)
+        self.cap_region_created_count = 1
+        self.cap_region_remote_padding_percent = (
+            remote_region_padding_percent
+        )
+        self.cap_grounded_solid_count = len(core_names) + len(plate_names)
+        self.cap_grounded_region_face_count = len(grounded_region_faces)
+        self.cap_symmetry_face_count = len(cut_region_faces)
+        return cap_design
+
     def create_setup(self, mode="loss"):
         """mode="matrix": 인덕턴스 전용 경량 수렴 (skin 없음 + 완화된 pe)
         mode="loss": 정밀 수렴 (손실/근접효과 - 기존 설정 유지)"""
@@ -3575,6 +3765,91 @@ class Simulation():
         # parameters. Preserve the established dataset convention for mutual M.
         self.df1["M"] = self.df1["M"].abs()
         return self.df1
+
+    def get_capacitance_parameter(self, max_attempts=3, retry_delay=2.0):
+        """Export the native 2x2 C matrix and build full-basis LC estimates.
+
+        Export retries are extraction-only: the electrostatic setup is never
+        re-solved because a result file was temporarily unavailable.
+        """
+        if not isinstance(getattr(self, "df1", None), pd.DataFrame):
+            raise RuntimeError("capacitance resonance requires matrix-stage L results")
+        missing_l = [
+            name for name in ("Ltx", "Lrx", "Llt")
+            if name not in self.df1.columns
+        ]
+        if missing_l:
+            raise RuntimeError(
+                f"capacitance resonance is missing inductance fields: {missing_l}"
+            )
+
+        last_error = None
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            export_path = None
+            self.extraction_attempts["cap"] = (
+                self.extraction_attempts.get("cap", 0) + 1
+            )
+            try:
+                fd, export_path = tempfile.mkstemp(
+                    prefix="mft_cap_", suffix=".txt"
+                )
+                os.close(fd)
+                os.remove(export_path)
+                started = time.time()
+                exported = self.design1.export_c_matrix(
+                    matrix_name="CapMatrix",
+                    output_file=export_path,
+                    setup="Setup1",
+                    default_adaptive="LastAdaptive",
+                    is_post_processed=False,
+                )
+                if exported is False:
+                    raise RuntimeError("export_c_matrix returned False")
+                if (
+                        not os.path.isfile(export_path)
+                        or os.path.getsize(export_path) <= 0):
+                    raise RuntimeError(
+                        "export_c_matrix did not create a non-empty file"
+                    )
+                if os.path.getmtime(export_path) < started - 2:
+                    raise RuntimeError("export_c_matrix returned a stale file")
+                with open(
+                        export_path, encoding="utf-8", errors="strict"
+                ) as exported_file:
+                    parsed = parse_maxwell_capacitance_export(
+                        exported_file.read()
+                    )
+                payload = build_capacitance_payload(
+                    parsed,
+                    float(self.df1["Ltx"].iloc[0]),
+                    float(self.df1["Lrx"].iloc[0]),
+                    float(self.df1["Llt"].iloc[0]),
+                    full_model=self.full_model,
+                    tx_name="CapTx",
+                    rx_name="CapRx",
+                )
+                self.df_cap = pd.DataFrame([payload])
+                self.extraction_backends["cap"] = "export_c_matrix"
+                self.extraction_units["cap"] = "F"
+                return self.df_cap
+            except Exception as error:
+                last_error = error
+                if attempt < max(1, int(max_attempts)):
+                    logging.warning(
+                        "[cap] export_c_matrix extraction attempt %s/%s failed: %s",
+                        attempt, max(1, int(max_attempts)), error,
+                    )
+                    time.sleep(max(0.0, float(retry_delay)))
+            finally:
+                if export_path and os.path.isfile(export_path):
+                    try:
+                        os.remove(export_path)
+                    except OSError:
+                        pass
+        raise RuntimeError(
+            "[cap] capacitance extraction failed after "
+            f"{max(1, int(max_attempts))} attempts: {last_error}"
+        ) from last_error
 
     def _export_field_report(
             self, report_name, Y_components, extraction_key="loss"):
@@ -4626,6 +4901,7 @@ class Simulation():
                 raise RuntimeError("deterministic project path is unavailable")
             tolerance_columns = {
                 "matrix": "matrix_percent_error",
+                "cap": "cap_percent_error",
                 "loss": "percent_error",
             }
             tolerance_column = tolerance_columns.get(label)
@@ -5067,7 +5343,7 @@ class Simulation():
     def get_execution_telemetry(self):
         """Return solve/extraction provenance alongside each training row."""
         row = {}
-        for label in ("matrix", "loss"):
+        for label in ("matrix", "cap", "loss"):
             row[f"{label}_solve_attempts"] = int(self.solve_attempts.get(label, 0))
             row[f"{label}_solution_queries"] = int(self.extraction_attempts.get(label, 0))
             row[f"{label}_extraction_backend"] = self.extraction_backends.get(label, "not_run")
@@ -5087,6 +5363,11 @@ class Simulation():
             "matrix_winding_stranded_count",
             "matrix_conductor_mesh_operation_count",
             "matrix_plate_eddy_off_readback_count",
+            "cap_geometry_copy_count",
+            "cap_region_created_count",
+            "cap_grounded_solid_count",
+            "cap_grounded_region_face_count",
+            "cap_symmetry_face_count",
             "loss_winding_solid_update_count",
             "loss_winding_mesh_operation_count",
             "loss_conductor_mesh_operation_count",
@@ -5518,6 +5799,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
         sim.full_model = int(sim.df_plus["full_model"].iloc[0]) != 0
         matrix_on = int(sim.df_plus["matrix_on"].iloc[0]) != 0
+        cap_on = int(sim.df_plus["cap_on"].iloc[0]) != 0
         loss_on = int(sim.df_plus["loss_on"].iloc[0]) != 0
         thermal_on = int(sim.df_plus["thermal_on"].iloc[0]) != 0
 
@@ -5750,6 +6032,53 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 result_parts.append(sim.get_convergence_info("matrix"))
                 result_parts.append(pd.DataFrame({"time_matrix": [t_matrix]}))
 
+        # ---- optional design: two-net electrostatic capacitance matrix ----
+        if cap_on:
+            if not matrix_on:
+                raise RuntimeError(
+                    "cap_on=1 requires matrix_on=1 (Ltx/Lrx/Llt are required)"
+                )
+            matrix_design = sim.design_matrix
+            cap_stage_started = time.monotonic()
+            cap_model_started = time.monotonic()
+            try:
+                sim.create_capacitance_design(name="maxwell_cap")
+            finally:
+                sim.stage_timings["stage_time_cap_model_s"] = (
+                    time.monotonic() - cap_model_started
+                )
+            sim.design_cap = sim.design1
+            try:
+                if not model_only:
+                    t_cap = sim.analyze_and_extract(
+                        "cap", sim.get_capacitance_parameter
+                    )
+                    total_time += t_cap
+                    result_parts.append(sim.df_cap)
+                    cap_convergence = sim.get_convergence_info("cap")
+                    result_parts.append(cap_convergence)
+                    cap_extract_s = float(
+                        sim.stage_timings.get("stage_time_cap_extract_s", 0.0)
+                    )
+                    sim.stage_timings["stage_time_cap_total_s"] = (
+                        time.monotonic() - cap_stage_started
+                    )
+                    result_parts.append(pd.DataFrame([
+                        build_capacitance_timing_payload(
+                            t_cap,
+                            cap_extract_s,
+                            float(sim.stage_timings["stage_time_cap_total_s"]),
+                        )
+                    ]))
+                else:
+                    sim.stage_timings["stage_time_cap_total_s"] = (
+                        time.monotonic() - cap_stage_started
+                    )
+            finally:
+                # Loss-copy preparation is intentionally anchored to the exact
+                # solved maxwell_matrix source, never the electrostatic design.
+                sim.design1 = matrix_design
+
         # ---- design2: 손실 원샷 ----
         # loss_sym_on=1 (캠페인 기본): 대칭 1/8 + 전류 여자 (Tx = 부하+자화 페이저 합)
         #   -> 추출 시 오브젝트별 상수 보정으로 실물(_phys) 기록. 시간 ~4x 단축.
@@ -5899,6 +6228,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             "stage_time_project_input_s",
             "stage_time_matrix_model_s",
             "stage_time_matrix_analyze_total_s",
+            "stage_time_cap_total_s",
             "stage_time_loss_prepare_s",
             "stage_time_loss_analyze_total_s",
             "stage_time_thermal_total_s",

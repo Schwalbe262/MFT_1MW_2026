@@ -41,7 +41,9 @@ from module.input_parameter_260706 import (
     ALL_INPUT_KEYS,
     COLD_PLATE_MAX_T_MM,
     COLD_PLATE_MIN_T_MM,
+    ELECTROSTATIC_STAGE_INPUT_KEYS,
     KEYS,
+    PRE_ELECTROSTATIC_INPUT_KEYS,
     N1_MAX_TURNS,
     PRE_ANISOTROPIC_CORE_K_INPUT_KEYS,
     PRIMARY_CONDUCTOR_MAX_THICKNESS_MM,
@@ -344,6 +346,57 @@ class PrimaryTurnDomainTests(unittest.TestCase):
         self.assertEqual(gaps[0], 24.0)
         self.assertEqual(gaps[-1], 24.0)
         self.assertEqual(slots, [0, 4])
+
+
+class ElectrostaticInputContractTests(unittest.TestCase):
+    def test_optional_cap_controls_are_accepted_but_not_sealed_or_design_vars(self):
+        defaults = get_drawing_default_params()
+        self.assertEqual(defaults["cap_on"], 0)
+        self.assertEqual(defaults["cap_max_passes"], 10)
+        self.assertEqual(defaults["cap_percent_error"], 1.0)
+        self.assertTrue(set(ELECTROSTATIC_STAGE_INPUT_KEYS).issubset(ALL_INPUT_KEYS))
+        self.assertTrue(set(ELECTROSTATIC_STAGE_INPUT_KEYS).isdisjoint(KEYS))
+
+        frame = create_input_parameter({
+            "cap_on": 1,
+            "cap_max_passes": 12,
+            "cap_percent_error": 0.75,
+        })
+        self.assertEqual(int(frame["cap_on"].iloc[0]), 1)
+        self.assertEqual(int(frame["cap_max_passes"].iloc[0]), 12)
+        self.assertEqual(float(frame["cap_percent_error"].iloc[0]), 0.75)
+        self.assertTrue(
+            set(ELECTROSTATIC_STAGE_INPUT_KEYS).isdisjoint(
+                get_design_var_columns(frame)
+            )
+        )
+
+        legacy_frame = create_input_parameter(
+            frame[PRE_ELECTROSTATIC_INPUT_KEYS]
+        )
+        self.assertEqual(int(legacy_frame["cap_on"].iloc[0]), 0)
+        self.assertEqual(int(legacy_frame["cap_max_passes"].iloc[0]), 10)
+        self.assertEqual(float(legacy_frame["cap_percent_error"].iloc[0]), 1.0)
+
+    def test_cap_stage_requires_matrix_inductance(self):
+        params = get_drawing_default_params()
+        params.update({"cap_on": 1, "matrix_on": 0})
+        with self.assertRaisesRegex(ValueError, "cap_on=1 requires matrix_on=1"):
+            validation_check(create_input_parameter(params), strict=True)
+
+    def test_cap_adaptive_controls_are_positive_and_finite(self):
+        cases = (
+            ("cap_max_passes", 0, "positive integer"),
+            ("cap_max_passes", 1.5, "positive integer"),
+            ("cap_percent_error", 0.0, "finite and > 0"),
+            ("cap_percent_error", float("nan"), "finite and > 0"),
+        )
+        for key, value, message in cases:
+            with self.subTest(key=key, value=value):
+                params = get_drawing_default_params()
+                params[key] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    validation_check(create_input_parameter(params), strict=True)
 
 
 class _GeometryObject:
@@ -2025,6 +2078,23 @@ class AnalyzePolicyTests(unittest.TestCase):
         self.assertGreaterEqual(
             simulation.stage_timings["stage_time_matrix_analyze_total_s"],
             simulation.stage_timings["stage_time_matrix_solve_s"],
+        )
+
+    def test_cap_stage_records_solve_extraction_and_total_time(self):
+        simulation = self._simulation([None])
+
+        simulation.analyze_and_extract("cap", lambda: None)
+
+        self.assertEqual(simulation.solve_attempts["cap"], 1)
+        self.assertGreaterEqual(
+            simulation.stage_timings["stage_time_cap_solve_s"], 0
+        )
+        self.assertGreaterEqual(
+            simulation.stage_timings["stage_time_cap_extract_s"], 0
+        )
+        self.assertGreaterEqual(
+            simulation.stage_timings["stage_time_cap_analyze_total_s"],
+            simulation.stage_timings["stage_time_cap_solve_s"],
         )
 
     def test_empty_data_error_never_resolves(self):

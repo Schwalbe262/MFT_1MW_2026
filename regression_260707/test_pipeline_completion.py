@@ -45,6 +45,7 @@ from module.input_parameter_260706 import (
     ALL_INPUT_KEYS,
     KEYS,
     PRE_ANISOTROPIC_CORE_K_INPUT_KEYS,
+    PRE_ELECTROSTATIC_INPUT_KEYS,
     create_input_parameter,
 )
 from module.core_material_contract import PHYSICS_DATA_REVISION
@@ -911,15 +912,25 @@ class FineValidationTests(unittest.TestCase):
             core_k_alloy=8.5,
             core_k_interlayer=0.25,
         )
+        pre_cap = {key: complete[key] for key in PRE_ELECTROSTATIC_INPUT_KEYS}
+        cap_diagnostic = dict(
+            complete,
+            cap_on=1,
+            cap_max_passes=12,
+            cap_percent_error=0.75,
+        )
 
         self.assertEqual(len(KEYS), 71)
         self.assertEqual(len(PRE_ANISOTROPIC_CORE_K_INPUT_KEYS), 75)
-        self.assertEqual(len(ALL_INPUT_KEYS), 78)
+        self.assertEqual(len(ALL_INPUT_KEYS), 81)
         self.assertEqual(
             {len(schema) for schema in ALLOWED_CANDIDATE_INPUT_SCHEMAS},
-            {71, 75, 78},
+            {71, 75, 81},
         )
-        for params in (sealed, pre_anisotropic, complete, legacy_thermal):
+        for params in (
+            sealed, pre_anisotropic, pre_cap, complete,
+            legacy_thermal, cap_diagnostic,
+        ):
             with self.subTest(schema_size=len(params)):
                 self.assertIn(
                     frozenset(params), ALLOWED_CANDIDATE_INPUT_SCHEMAS
