@@ -91,7 +91,7 @@ def _native_block_readback(boundary, obj):
         )
     block_type = str(child.GetPropValue(block_type_prop))
     use_total = child.GetPropValue("Use Total Power")
-    if block_type != "Solid" or str(use_total).strip().lower() not in {
+    if block_type not in ("Solid", "Solid Block") or str(use_total).strip().lower() not in {
         "true", "1"
     }:
         raise RuntimeError(
