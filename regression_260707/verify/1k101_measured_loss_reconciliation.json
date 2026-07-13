@@ -1,0 +1,39 @@
+{
+  "schema": "mft-1k101-measured-loss-reconciliation-v1",
+  "source": "material/1K101/아몰퍼스실험.xlsx",
+  "status": "measurement_mismatch_requires_engineering_review",
+  "test_core": {
+    "turns": 4,
+    "effective_area_cm2": 24.96,
+    "geometric_area_cm2": 28.05,
+    "stacking_factor_from_area": 0.8898395721925134,
+    "mass_kg": 6.994,
+    "density_g_cm3": 7.18,
+    "B_formula": "V_rms/(4.44*f*N*Ae_effective)",
+    "waveform": "sinusoidal"
+  },
+  "production_contract": {
+    "lamination_factor": 0.85,
+    "loss_margin": 1.15,
+    "loss_margin_interpretation": "engineering_margin_not_measurement_fit",
+    "warning": "The workbook test core kf≈0.88984 and area basis must not be substituted for the UU137 guaranteed-minimum kf=0.85 production contract."
+  },
+  "points": [
+    {"row": 2, "frequency_hz": 1000.0, "B_material_T": 0.1127930815430815, "measured_W": 1.25, "powerlite_weight_base_W": 1.0200241830974663, "powerlite_margin_1p15_W": 1.1730278105620862, "pred_minus_measured_pct": -6.157775155033107},
+    {"row": 3, "frequency_hz": 1000.0, "B_material_T": 0.225586163086163, "measured_W": 5.53, "powerlite_weight_base_W": 3.407239491317941, "powerlite_margin_1p15_W": 3.918325415015632, "pred_minus_measured_pct": -29.144205876751684},
+    {"row": 4, "frequency_hz": 1000.0, "B_material_T": 0.33837924462924457, "measured_W": 10.125, "powerlite_weight_base_W": 6.899243157144305, "powerlite_margin_1p15_W": 7.93412963071595, "pred_minus_measured_pct": -21.638225869472095},
+    {"row": 5, "frequency_hz": 1000.0, "B_material_T": 0.451172326172326, "measured_W": 14.89, "powerlite_weight_base_W": 11.3813781511955, "powerlite_margin_1p15_W": 13.088584873874824, "pred_minus_measured_pct": -12.098153969947456},
+    {"row": 6, "frequency_hz": 1000.0, "B_material_T": 0.5639654077154076, "measured_W": 19.26, "powerlite_weight_base_W": 16.781016941275873, "powerlite_margin_1p15_W": 19.29816948246725, "pred_minus_measured_pct": 0.19818007511551716},
+    {"row": 7, "frequency_hz": 1000.0, "B_material_T": 0.6767584892584891, "measured_W": 23.7, "powerlite_weight_base_W": 23.04589845492021, "powerlite_margin_1p15_W": 26.50278322315824, "pred_minus_measured_pct": 11.826089549190888},
+    {"row": 8, "frequency_hz": 1000.0, "B_material_T": 0.7895515708015706, "measured_W": 28.3, "powerlite_weight_base_W": 30.1356843240614, "powerlite_margin_1p15_W": 34.656036972670606, "pred_minus_measured_pct": 22.459494603076347},
+    {"row": 9, "frequency_hz": 1000.0, "B_material_T": 0.902344652344652, "measured_W": 37.72, "powerlite_weight_base_W": 38.0178056020374, "powerlite_margin_1p15_W": 43.720476442343006, "pred_minus_measured_pct": 15.907943908650601},
+    {"row": 10, "frequency_hz": 200.0, "B_material_T": 0.5639654077154075, "measured_W": 4.37, "powerlite_weight_base_W": 1.4769764453534109, "powerlite_margin_1p15_W": 1.6985229121564225, "pred_minus_measured_pct": -61.13219880648919},
+    {"row": 11, "frequency_hz": 200.0, "B_material_T": 1.127930815430815, "measured_W": 14.63, "powerlite_weight_base_W": 4.933620747179554, "powerlite_margin_1p15_W": 5.673663859256487, "pred_minus_measured_pct": -61.21897567152095}
+  ],
+  "summary": {
+    "one_kHz_pred_minus_measured_pct_min": -29.144205876751684,
+    "one_kHz_pred_minus_measured_pct_max": 22.459494603076347,
+    "two_hundred_Hz_pred_minus_measured_pct": [-61.13219880648919, -61.21897567152095]
+  },
+  "conclusion": "The 1.15 factor is not a measurement fit. It remains a separately declared engineering margin; model approval requires reconciliation over the intended frequency, waveform, B, temperature, anneal, and production area basis."
+}

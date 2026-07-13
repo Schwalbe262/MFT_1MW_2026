@@ -1,0 +1,91 @@
+{
+  "schema": "mft-thermal-hybrid-ab-v1",
+  "generated_at": "2026-07-13T01:29:00+09:00",
+  "policy": {
+    "N": 8,
+    "edge_fine_turns": 3,
+    "left": [0, 1, 2],
+    "interior": [3, 4],
+    "right": [5, 6, 7],
+    "levels": [4, 3, 4]
+  },
+  "baseline_manifest": "simulation/thermal_replays_screening_260713/simulation470_tx_l4_260713_005102_b2d3833e/replay_manifest.json",
+  "hybrid_manifest": "simulation/thermal_replays_screening_260713/simulation470_tx_hybrid_k3_260713_011823_451334b5/replay_manifest.json",
+  "mesh": {
+    "baseline_cells": 591884,
+    "hybrid_cells": 591878,
+    "cell_delta": -6,
+    "cell_reduction_percent": 0.001014,
+    "baseline_nodes": 703347,
+    "hybrid_nodes": 703347,
+    "baseline_faces": 319165,
+    "hybrid_faces": 319069
+  },
+  "timing_seconds": {
+    "baseline_mesh_elapsed": 61,
+    "hybrid_mesh_elapsed": 50,
+    "baseline_total_solution_process": 336,
+    "hybrid_total_solution_process": 325,
+    "total_reduction_percent": 3.27381,
+    "baseline_solve_real": 172,
+    "hybrid_solve_real": 181,
+    "solve_real_change_percent": 5.232558
+  },
+  "accuracy": {
+    "reference_temperature_c": 50.0,
+    "criterion": "absolute per-turn (T-50C) mean and max error <= 2%",
+    "baseline_hotspot": "Tx_main_1_0",
+    "hybrid_hotspot": "Tx_main_1_0",
+    "hotspot_rank_preserved": true,
+    "turns": {
+      "Tx_main_0_0": {
+        "max": {"baseline_c": 302.366, "hybrid_c": 298.086, "delta_c": -4.28, "rise_error_percent": -1.69595, "passes_2_percent": true},
+        "mean": {"baseline_c": 240.891, "hybrid_c": 238.436, "delta_c": -2.455, "rise_error_percent": -1.286074, "passes_2_percent": true}
+      },
+      "Tx_main_1_0": {
+        "max": {"baseline_c": 308.581, "hybrid_c": 303.833, "delta_c": -4.748, "rise_error_percent": -1.836175, "passes_2_percent": true},
+        "mean": {"baseline_c": 261.194, "hybrid_c": 256.721, "delta_c": -4.473, "rise_error_percent": -2.117958, "passes_2_percent": false}
+      },
+      "Tx_main_2_0": {
+        "max": {"baseline_c": 308.058, "hybrid_c": 302.425, "delta_c": -5.633, "rise_error_percent": -2.182843, "passes_2_percent": false},
+        "mean": {"baseline_c": 294.25, "hybrid_c": 286.005, "delta_c": -8.245, "rise_error_percent": -3.37564, "passes_2_percent": false}
+      },
+      "Tx_main_3_0": {
+        "max": {"baseline_c": 292.612, "hybrid_c": 288.588, "delta_c": -4.024, "rise_error_percent": -1.658615, "passes_2_percent": true},
+        "mean": {"baseline_c": 281.459, "hybrid_c": 273.782, "delta_c": -7.677, "rise_error_percent": -3.316786, "passes_2_percent": false}
+      },
+      "Tx_main_4_0": {
+        "max": {"baseline_c": 262.03, "hybrid_c": 265.82, "delta_c": 3.79, "rise_error_percent": 1.787483, "passes_2_percent": true},
+        "mean": {"baseline_c": 246.619, "hybrid_c": 257.693, "delta_c": 11.074, "rise_error_percent": 5.632213, "passes_2_percent": false}
+      },
+      "Tx_main_5_0": {
+        "max": {"baseline_c": 227.177, "hybrid_c": 237.355, "delta_c": 10.178, "rise_error_percent": 5.744538, "passes_2_percent": false},
+        "mean": {"baseline_c": 202.581, "hybrid_c": 209.735, "delta_c": 7.154, "rise_error_percent": 4.688657, "passes_2_percent": false}
+      },
+      "Tx_main_6_0": {
+        "max": {"baseline_c": 195.627, "hybrid_c": 200.784, "delta_c": 5.157, "rise_error_percent": 3.541239, "passes_2_percent": false},
+        "mean": {"baseline_c": 163.056, "hybrid_c": 167.267, "delta_c": 4.211, "rise_error_percent": 3.724703, "passes_2_percent": false}
+      },
+      "Tx_main_7_0": {
+        "max": {"baseline_c": 171.057, "hybrid_c": 174.548, "delta_c": 3.491, "rise_error_percent": 2.883765, "passes_2_percent": false},
+        "mean": {"baseline_c": 132.204, "hybrid_c": 134.221, "delta_c": 2.017, "rise_error_percent": 2.453652, "passes_2_percent": false}
+      }
+    }
+  },
+  "contracts": {
+    "baseline_converged": true,
+    "hybrid_converged": true,
+    "baseline_iteration": 134,
+    "hybrid_iteration": 134,
+    "tx_zones_equal": true,
+    "boundary_temperatures_equal": true,
+    "heat_source_contract_sha256_equal": true
+  },
+  "verdict": {
+    "accuracy_pass": false,
+    "speed_benefit_material": false,
+    "production_apply": false,
+    "run_k2": false,
+    "reason": "k3 already fails the 2% temperature-rise criterion and changes only 6 of 591884 cells; k2 would be less conservative."
+  }
+}

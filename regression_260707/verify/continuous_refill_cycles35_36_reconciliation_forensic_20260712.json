@@ -1,0 +1,272 @@
+{
+  "schema": "continuous-refill-cycles35-36-forensic-report-v1",
+  "created_at": "2026-07-12T04:12:00+00:00",
+  "scope": "Historical proof that interrupted controller cycles 35 and 36 created no scheduler task and did not advance the feeder ledger; this report is not an authoritative cycle journal and authorizes no mutation.",
+  "campaign_identity": {
+    "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+    "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+    "plan_sha256": "b24e2a9b00caa22bbec8793f4dbd99de51362fac87f9e9509358610abe9982d0"
+  },
+  "forensic_observations": {
+    "controller_process_checks": [
+      {
+        "observed_at": "2026-07-12T03:52:13+00:00",
+        "matching_process_count": 0
+      },
+      {
+        "observed_at": "2026-07-12T03:54:48.699597+00:00",
+        "matching_process_count": 0
+      }
+    ],
+    "feeder_durable_seal_before_and_after_observation": {
+      "state_revision": 187,
+      "serial": 17797,
+      "candidate_cursor": 3446,
+      "candidate_raw_index": 3445,
+      "submitted_samples": 186,
+      "max_outstanding_task_id": 28292,
+      "canonical_sha256": "ce8a1de8e491695cb6dfc066cffed69908cd5fc1c07d0e2016ffb7e2bfbf9088",
+      "file_sha256": "dac12c306d5326176ff8924cd0c9c1c0cbdb3107c769fb57171fd213bdb4aad1",
+      "candidate_17798_name_present": false,
+      "candidate_17798_dedupe_present": false,
+      "candidate_17798_params_sha256_present": false
+    },
+    "candidate_17798": {
+      "name": "mft-camp-sb171c7c-le6b9b9d-17798",
+      "dedupe_key": "mft-al:mft-camp-sb171c7c-le6b9b9d-17798:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:01e6ccb2a388608e",
+      "params_sha256": "c0441bc2d1756d789f1343624b8693f798534d204fae306914b95a7418e87b74",
+      "candidate_raw_index": 3452
+    },
+    "scheduler_api": {
+      "observed_at": "2026-07-12T03:54:33.405752+00:00",
+      "request_scope": "limit=10000,name_prefix=mft-camp-sb171c7c-le6b9b9d- (all projects)",
+      "http_status": 200,
+      "raw_response_sha256": "498b18373713b8f95cdf709b253bf0100be7a743e87b385d2c4b665c8b6068c7",
+      "production_task_count": 187,
+      "projects": [
+        "MFT_1MW_2026v1"
+      ],
+      "max_production_serial": 17797,
+      "max_task_id": 28292,
+      "candidate_name_matches": 0,
+      "candidate_dedupe_matches": 0,
+      "production_names_above_feeder_serial": []
+    },
+    "scheduler_sqlite_query_only": {
+      "observed_at": "2026-07-12T03:54:19.854961+00:00",
+      "database_path": "C:\\Users\\peets\\NEC\\slurm_scheduler\\data\\slurm_scheduler.db",
+      "pragma_query_only": 1,
+      "query_evidence_sha256": "cabb1edfc574d8be87a6b484121293e1bb4589b05600640df59218d10dc5fb62",
+      "production_task_count": 187,
+      "max_production_serial": 17797,
+      "max_task_id": 28292,
+      "candidate_name_matches_global": 0,
+      "candidate_dedupe_matches_global": 0,
+      "production_names_above_feeder_serial": []
+    },
+    "last_committed_submission": {
+      "cycle_serial": 27,
+      "task_id": 28292,
+      "name": "mft-camp-sb171c7c-le6b9b9d-17797",
+      "cycle_file_sha256": "dd8b580da7637b2049dc793b1ee91470e205a35441ab357f840f00def125d601",
+      "cycle_canonical_sha256": "4c3fc06125d54aaeca2ea57cd2a80944602e1c10bddc8677be21cff1386fd58d"
+    },
+    "zero_submission_cycles_after_anchor": [
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34
+    ]
+  },
+  "factored_exact_rich_evidence_payloads": {
+    "canonicalization": "SHA-256 of UTF-8 json.dumps(unsigned_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':')); evidence_sha256 is excluded from unsigned_payload",
+    "merge_rule": "For each cycle, unsigned_payload is the top-level union of common_unsigned_payload and per_cycle_unsigned_delta[cycle]; interrupted_artifacts comes only from the per-cycle delta. The signed payload is unsigned_payload plus that cycle's evidence_sha256.",
+    "common_unsigned_payload": {
+      "schema": "continuous-refill-cycle-reconciliation-evidence-v1",
+      "action": "reconciled_no_mutation",
+      "observed_at": "2026-07-12T03:54:48.699597+00:00",
+      "controller_stopped": true,
+      "controller_process_observations": [
+        {
+          "matching_process_count": 0,
+          "observed_at": "2026-07-12T03:52:13+00:00"
+        },
+        {
+          "matching_process_count": 0,
+          "observed_at": "2026-07-12T03:54:48.699597+00:00"
+        }
+      ],
+      "campaign_identity": {
+        "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+        "plan_sha256": "b24e2a9b00caa22bbec8793f4dbd99de51362fac87f9e9509358610abe9982d0",
+        "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
+      },
+      "feeder_before": {
+        "candidate_cursor": 3446,
+        "candidate_raw_index": 3445,
+        "canonical_sha256": "ce8a1de8e491695cb6dfc066cffed69908cd5fc1c07d0e2016ffb7e2bfbf9088",
+        "file_sha256": "dac12c306d5326176ff8924cd0c9c1c0cbdb3107c769fb57171fd213bdb4aad1",
+        "max_outstanding_task_id": 28292,
+        "serial": 17797,
+        "state_revision": 187,
+        "submitted_samples": 186
+      },
+      "feeder_after": {
+        "candidate_cursor": 3446,
+        "candidate_raw_index": 3445,
+        "canonical_sha256": "ce8a1de8e491695cb6dfc066cffed69908cd5fc1c07d0e2016ffb7e2bfbf9088",
+        "file_sha256": "dac12c306d5326176ff8924cd0c9c1c0cbdb3107c769fb57171fd213bdb4aad1",
+        "max_outstanding_task_id": 28292,
+        "serial": 17797,
+        "state_revision": 187,
+        "submitted_samples": 186
+      },
+      "scheduler": {
+        "matching_task_ids": [],
+        "production_names_above_feeder_serial": [],
+        "max_production_serial": 17797,
+        "max_production_task_id": 28292,
+        "candidate": {
+          "dedupe_key": "mft-al:mft-camp-sb171c7c-le6b9b9d-17798:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:01e6ccb2a388608e",
+          "name": "mft-camp-sb171c7c-le6b9b9d-17798",
+          "params_sha256": "c0441bc2d1756d789f1343624b8693f798534d204fae306914b95a7418e87b74"
+        },
+        "api": {
+          "candidate_dedupe_matches": 0,
+          "candidate_name_matches": 0,
+          "http_status": 200,
+          "max_task_id": 28292,
+          "observed_at": "2026-07-12T03:54:33.405752+00:00",
+          "projects": [
+            "MFT_1MW_2026v1"
+          ],
+          "raw_response_sha256": "498b18373713b8f95cdf709b253bf0100be7a743e87b385d2c4b665c8b6068c7",
+          "task_count": 187
+        },
+        "sqlite": {
+          "candidate_dedupe_matches": 0,
+          "candidate_name_matches": 0,
+          "max_task_id": 28292,
+          "observed_at": "2026-07-12T03:54:19.854961+00:00",
+          "query_evidence_sha256": "cabb1edfc574d8be87a6b484121293e1bb4589b05600640df59218d10dc5fb62",
+          "query_only": true,
+          "task_count": 187
+        }
+      },
+      "last_committed_anchor": {
+        "cycle_canonical_sha256": "4c3fc06125d54aaeca2ea57cd2a80944602e1c10bddc8677be21cff1386fd58d",
+        "cycle_file_sha256": "dd8b580da7637b2049dc793b1ee91470e205a35441ab357f840f00def125d601",
+        "cycle_serial": 27,
+        "name": "mft-camp-sb171c7c-le6b9b9d-17797",
+        "task_id": 28292
+      },
+      "zero_submission_cycles_after_anchor": [
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34
+      ]
+    },
+    "per_cycle_unsigned_delta": {
+      "35": {
+        "cycle_serial": 35,
+        "interrupted_artifacts": [
+          {
+            "canonical_sha256": "826b4707b07feb8be63bb9ab484979ae8f615f6b7758fe7c8c85ad0b11c5edd3",
+            "event_count": 0,
+            "file_sha256": "a8f64605b65b84bceb0504c151549b080e0f5f8b2fc389e92edf1545013798cd",
+            "path": "regression_260707/campaign/pilot_manifests/continuous-refill-sb171c7c-le6b9b9d/cycle-000035.json",
+            "status": "authorized_pending",
+            "submitted_count": null
+          }
+        ]
+      },
+      "36": {
+        "cycle_serial": 36,
+        "interrupted_artifacts": [
+          {
+            "canonical_sha256": "af5d433d269d4dcfff013539a35845948f62ff4203f9dd4f3816569914875627",
+            "event": {
+              "accepted_or_reconciled": false,
+              "candidate_raw_index": 3452,
+              "dedupe_key": "mft-al:mft-camp-sb171c7c-le6b9b9d-17798:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:01e6ccb2a388608e",
+              "ledger_committed": false,
+              "name": "mft-camp-sb171c7c-le6b9b9d-17798",
+              "params_sha256": "c0441bc2d1756d789f1343624b8693f798534d204fae306914b95a7418e87b74",
+              "task_id": null
+            },
+            "event_count": 1,
+            "file_sha256": "596041c27a5b14f988d3b4e8ea855d71941069da9854b947a054db3c8173c70f",
+            "path": "regression_260707/campaign/pilot_manifests/continuous-refill-sb171c7c-le6b9b9d/cycle-000036.json",
+            "status": "mutation_about_to_submit",
+            "submitted_count": 0
+          }
+        ]
+      }
+    },
+    "computed_rich_evidence_sha256": {
+      "35": "a9fb8d9f4765d7dd77c54f9f2d36eb8a43eadd2441c0b6f9a991a3df8d63a8bd",
+      "36": "8441c05e70681449a88b7a25e757a8d7ab5a5a4da4d22ece58788bf7da5c2fc8"
+    }
+  },
+  "authoritative_reconciliation_linkage": {
+    "note": "The authoritative controller used separately reviewed minimal payloads. The richer payloads above are supporting forensic evidence only and were never published as cycle mutations.",
+    "35": {
+      "authoritative_evidence_sha256": "9b724eaf321843933b31a5aeaad90d49279781e3947d91a81d8fc054af50ebdd",
+      "published_at": "2026-07-12T04:07:24+00:00",
+      "status": "reconciled_no_mutation",
+      "state_revision": 1,
+      "source_generation": "cycle-000035.json.gen-00000000000000000000-20174639caa0905795ffd41ad1ce756501b007bda8c75c8c4754c91751abcdd5.json",
+      "source_generation_file_sha256": "6bd881662ac4e353d17dca47eafbead6c955782e5e63fdf8b30db91b16ca8a45",
+      "source_generation_canonical_sha256": "20174639caa0905795ffd41ad1ce756501b007bda8c75c8c4754c91751abcdd5",
+      "reconciled_generation": "cycle-000035.json.gen-00000000000000000001-df84be431fee759ac7fe1735c2d6e4a515f9984d25d334e7b02202eb802a323e.json",
+      "reconciled_generation_file_sha256": "1a0480c8fc4e3ed3bc07cd56696911806ba67cce322aab83d7bca524b08d1a40",
+      "reconciled_generation_canonical_sha256": "df84be431fee759ac7fe1735c2d6e4a515f9984d25d334e7b02202eb802a323e"
+    },
+    "36": {
+      "authoritative_evidence_sha256": "623387e17a0b9d58d20430b1160cdd3b689f3e72f35f4fd4308b87097f3b1a03",
+      "published_at": "2026-07-12T04:07:24+00:00",
+      "status": "reconciled_no_mutation",
+      "state_revision": 1,
+      "source_generation": "cycle-000036.json.gen-00000000000000000000-7b2dd03e20cacaa6f0bb77c06d89d5947b0dacd546721b09aa7b511a0ab9d0bd.json",
+      "source_generation_file_sha256": "c3bcfbe15f14b5c541ba122337dcd981125ad4bd24e5d15e8906296b599c9ba2",
+      "source_generation_canonical_sha256": "7b2dd03e20cacaa6f0bb77c06d89d5947b0dacd546721b09aa7b511a0ab9d0bd",
+      "reconciled_generation": "cycle-000036.json.gen-00000000000000000001-565b3bd2ab84326178d3df0ee82e20bcb17dd4b986c9290606ee3bcc0531ca46.json",
+      "reconciled_generation_file_sha256": "ddf54688a42d145aa760387cd71ae21d799f9d76783661b643ab33985d1425ee",
+      "reconciled_generation_canonical_sha256": "565b3bd2ab84326178d3df0ee82e20bcb17dd4b986c9290606ee3bcc0531ca46"
+    }
+  },
+  "verification": {
+    "authoritative_readback": {
+      "35": {
+        "status": "reconciled_no_mutation",
+        "state_revision": 1,
+        "submitted_count": 0,
+        "evidence_sha256": "9b724eaf321843933b31a5aeaad90d49279781e3947d91a81d8fc054af50ebdd"
+      },
+      "36": {
+        "status": "reconciled_no_mutation",
+        "state_revision": 1,
+        "submitted_count": 0,
+        "candidate_event_task_id": null,
+        "candidate_event_accepted_or_reconciled": false,
+        "candidate_event_ledger_committed": false,
+        "evidence_sha256": "623387e17a0b9d58d20430b1160cdd3b689f3e72f35f4fd4308b87097f3b1a03"
+      }
+    },
+    "controller_test": {
+      "command": "C:\\Users\\peets\\anaconda3\\python.exe -m pytest regression_260707/campaign/tests/test_continuous_refill_b171c7c.py -q -p no:cacheprovider",
+      "result": "12 passed in 27.50s",
+      "exit_code": 0
+    },
+    "startup_gate": "PASS before the production controller resumed; later authorized production cycles are outside this historical reconciliation scope."
+  },
+  "report_sha256_semantics": "SHA-256 of UTF-8 canonical JSON with report_sha256 omitted, using ensure_ascii=False, sort_keys=True, separators=(',', ':')",
+  "report_sha256": "00422bd538e3b586cb7e2e20c4ba34d58289dec3259b56fd7011cb9e1fe361fa"
+}

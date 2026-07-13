@@ -1,0 +1,82 @@
+[
+  {
+    "cmdline": "/bin/bash /var/spool/slurmd/job732549/slurm_script",
+    "comm": "slurm_script",
+    "desktop_descendant": false,
+    "pid": 1278617,
+    "ppid": 1278613,
+    "state": "S (sleeping)"
+  },
+  {
+    "cmdline": "timeout --signal=TERM --kill-after=60s 25m python -u /gpfs/home1/harry261/slurm_scheduler/experiments/aedt12iso-20260713T033349/pilot.py --artifact-dir /gpfs/home1/harry261/slurm_scheduler/experiments/aedt12iso-20260713T033349/artifact-732549 --lmutil /opt/ohpc/pub/Electronics/v242/Linux64/licensingclient/linx64/lmutil --license-server 1055@172.16.10.81 --cylinders 12 --mesh-mm 0.55 --passes 12 --phase-timeout 180 --completion-timeout 900",
+    "comm": "timeout",
+    "desktop_descendant": false,
+    "pid": 1278674,
+    "ppid": 1278617,
+    "state": "S (sleeping)"
+  },
+  {
+    "cmdline": "python -u /gpfs/home1/harry261/slurm_scheduler/experiments/aedt12iso-20260713T033349/pilot.py --artifact-dir /gpfs/home1/harry261/slurm_scheduler/experiments/aedt12iso-20260713T033349/artifact-732549 --lmutil /opt/ohpc/pub/Electronics/v242/Linux64/licensingclient/linx64/lmutil --license-server 1055@172.16.10.81 --cylinders 12 --mesh-mm 0.55 --passes 12 --phase-timeout 180 --completion-timeout 900",
+    "comm": "python",
+    "desktop_descendant": false,
+    "pid": 1278675,
+    "ppid": 1278674,
+    "state": "R (running)"
+  },
+  {
+    "cmdline": "/bin/bash /opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt -grpcsrv 34197 -ng",
+    "comm": "ansysedt",
+    "desktop_descendant": false,
+    "pid": 1278711,
+    "ppid": 1278675,
+    "state": "S (sleeping)"
+  },
+  {
+    "cmdline": "/opt/ohpc/pub/Electronics/v252/AnsysEM/ansysedt.exe -grpcsrv 34197 -ng",
+    "comm": "ansysedt.exe",
+    "desktop_descendant": true,
+    "pid": 1278977,
+    "ppid": 1278711,
+    "state": "S (sleeping)"
+  },
+  {
+    "cmdline": "mwrpcss -1 1",
+    "comm": "mwrpcss",
+    "desktop_descendant": true,
+    "pid": 1279086,
+    "ppid": 1278977,
+    "state": "S (sleeping)"
+  },
+  {
+    "cmdline": "/opt/ohpc/pub/Electronics/v252/AnsysEM/common/mono/Linux64/bin/mono /opt/ohpc/pub/Electronics/v252/AnsysEM/common/IronPython/ipy64.exe /opt/ohpc/pub/Electronics/v252/AnsysEM/schedulers/scripts/persistence.py 50559",
+    "comm": "mono",
+    "desktop_descendant": true,
+    "pid": 1279153,
+    "ppid": 1278977,
+    "state": "S (sleeping)"
+  },
+  {
+    "cmdline": "/opt/ohpc/pub/Electronics/v252/licensingclient/linx64/ansyscl -acl 1278977.45536 -nodaemon -log /home1/harry261/.ansys/ansyscl.n040.1278977.45536.log",
+    "comm": "ansyscl",
+    "desktop_descendant": true,
+    "pid": 1279392,
+    "ppid": 1278977,
+    "state": "S (sleeping)"
+  },
+  {
+    "cmdline": "/bin/bash /opt/ohpc/pub/Electronics/v252/AnsysEM/MAXWELLCOMENGINE $begin 'AnsoftCOM'  $begin 'CommDetails'   TransportType=1   IPAddress='192.168.100.50'   ListenPort='34131'   IPAddressVector[1: '192.168.140.50']  $end 'CommDetails'  $begin 'Marshall'   InstanceID=507   InterfaceID=1   FactoryIntID='MaxwellComEngineProxyStubFactory'  $end 'Marshall'  $begin 'EnvBlock'   ANSYSEM_FEATURE_F538630_MECH_TRANSIENT_THERMAL_ENABLE='1'   ANS_IS64BITMACHINE='0'   ANSYSEM_FEATURE_F395486_RIGID_FLEX_BENDING_ENABLE='1'   ANSYSEM_FEATURE_SF6694_NON_GRAPHICAL_COMMAND_EXECUTION_ENABLE='1'   ANSYSEM_FEATURE_F545177_ECAD_INTEGRATION_WITH_APHI_ENABLE='1'   ANSYSEM_FEATURE_F826442_MULTI_FINITE_ARRAYS_ENABLE='1'   ANSYSEM_FEATURE_FEA_ENV='1'   ANS_MESHER_PROC_DUMP_PREPOST_BEND_SM3='1'   ANSYSEM_FEATURE_F650636_MECH_LAYOUT_COMPONENT_ENABLE='1'   ANS_NODEPCHECK='1'   ANSYSEM_FEATURE_SF159726_SCRIPTOBJECT_ENABLE='1'   ANSYSEM_FEATURE_SF222134_CABLE_MODELING_ENHANCEMENTS_ENABLE='1'   ANS_IGNOREOS='1'   ANSYSEM_FEATURE_S432616_LAYOUT_COMPONENT_IN_3D_ENABLE='1'   ANSYSEM_FEATURE_F335896_MECHANICAL_STRUCTURAL_SOLN_TYPE_ENABLE='1'   ANSYSEM_TRACE_ID='09379d39ce29743b3a40dc7bd36144f2'   ANSOFT_PASS_DEBUG_ENV_TO_REMOTE_ENGINES='1'   ANSYSEM_FEATURE_CONTROL='<redacted>'   ANSOFT_NON_GRAPHICAL_MODE='TRUE'   ANSYSEM_MPI_ENVIRONMENT='DESKTOP'   ANSYS_LICENSING_WORKFLOW_SESSION='<redacted>'   ANSYS_LICENSING_CONTEXT_DATA='<redacted>'  $end 'EnvBlock' $end 'AnsoftCOM'  $begin '' $end ''",
+    "comm": "MAXWELLCOMENGIN",
+    "desktop_descendant": true,
+    "pid": 1279468,
+    "ppid": 1279153,
+    "state": "S (sleeping)"
+  },
+  {
+    "cmdline": "/opt/ohpc/pub/Electronics/v252/AnsysEM/MAXWELLCOMENGINE.exe $begin 'AnsoftCOM'  $begin 'CommDetails'   TransportType=1   IPAddress='192.168.100.50'   ListenPort='34131'   IPAddressVector[1: '192.168.140.50']  $end 'CommDetails'  $begin 'Marshall'   InstanceID=507   InterfaceID=1   FactoryIntID='MaxwellComEngineProxyStubFactory'  $end 'Marshall'  $begin 'EnvBlock'   ANSYSEM_FEATURE_F538630_MECH_TRANSIENT_THERMAL_ENABLE='1'   ANS_IS64BITMACHINE='0'   ANSYSEM_FEATURE_F395486_RIGID_FLEX_BENDING_ENABLE='1'   ANSYSEM_FEATURE_SF6694_NON_GRAPHICAL_COMMAND_EXECUTION_ENABLE='1'   ANSYSEM_FEATURE_F545177_ECAD_INTEGRATION_WITH_APHI_ENABLE='1'   ANSYSEM_FEATURE_F826442_MULTI_FINITE_ARRAYS_ENABLE='1'   ANSYSEM_FEATURE_FEA_ENV='1'   ANS_MESHER_PROC_DUMP_PREPOST_BEND_SM3='1'   ANSYSEM_FEATURE_F650636_MECH_LAYOUT_COMPONENT_ENABLE='1'   ANS_NODEPCHECK='1'   ANSYSEM_FEATURE_SF159726_SCRIPTOBJECT_ENABLE='1'   ANSYSEM_FEATURE_SF222134_CABLE_MODELING_ENHANCEMENTS_ENABLE='1'   ANS_IGNOREOS='1'   ANSYSEM_FEATURE_S432616_LAYOUT_COMPONENT_IN_3D_ENABLE='1'   ANSYSEM_FEATURE_F335896_MECHANICAL_STRUCTURAL_SOLN_TYPE_ENABLE='1'   ANSYSEM_TRACE_ID='09379d39ce29743b3a40dc7bd36144f2'   ANSOFT_PASS_DEBUG_ENV_TO_REMOTE_ENGINES='1'   ANSYSEM_FEATURE_CONTROL='<redacted>'   ANSOFT_NON_GRAPHICAL_MODE='TRUE'   ANSYSEM_MPI_ENVIRONMENT='DESKTOP'   ANSYS_LICENSING_WORKFLOW_SESSION='<redacted>'   ANSYS_LICENSING_CONTEXT_DATA='<redacted>'  $end 'EnvBlock' $end 'AnsoftCOM'  $begin '' $end ''",
+    "comm": "MAXWELLCOMENGIN",
+    "desktop_descendant": true,
+    "pid": 1279633,
+    "ppid": 1279468,
+    "state": "S (sleeping)"
+  }
+]

@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "source_reopen_verdict": "reopen_verdict_732554.json",
+  "source_convergence": "B_convergence_fresh_732554.prop",
+  "automated_reopen_verdict_claimed_pass": true,
+  "corrected_pass": false,
+  "solver_pid_survival_classification": "necessary_process_isolation_condition_not_sufficient_solution_validity_condition",
+  "correction_reason": [
+    "convergence export contains Completed: N/A",
+    "convergence export contains zero pass data rows",
+    "saved pilot_B results contain only setup/solution index and geometry cache, not field solution payload",
+    "available quantities are only Volume(B_conductor_*) geometry quantities",
+    "LastAdaptive name alone is not evidence that a solve reached a valid terminal state"
+  ],
+  "final_architecture_verdict": "REJECT",
+  "pool_activation": "FORBIDDEN",
+  "required_failure_policy": "quarantine and drain the Desktop; requeue the failed task and every sibling lacking independently attested terminal output"
+}
