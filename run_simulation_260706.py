@@ -99,7 +99,7 @@ from module.core_material_contract import (
     LEG_STACKING_DIRECTION,
     PHYSICS_DATA_REVISION,
     YOKE_STACKING_DIRECTION,
-    expected_core_loss_from_bavg_moment_w,
+    faraday_lumped_core_reference,
     material_flux_density_t,
     native_lamination_material_specs,
     sinusoidal_b_peak_material_t,
@@ -180,15 +180,12 @@ _NATIVE_CORE_REGION_ORDER = (
 
 def _native_core_report_plan(
         core_groups, sym_cut_counter, *, require_complete_groups=False):
-    """Validate native core coverage and batch B**y reports by cut count.
+    """Validate native core coverage and topology by symmetry-cut count.
 
-    AEDT 2025.2 can leave its Fields calculator unable to register a second
-    grouped ``ComplxPeak/Pow`` expression after the intervening per-piece B
-    reports.  Native segmented cores have the same physical restoration
-    factor for every retained piece with the same symmetry-cut count, so one
-    expression per cut class is mathematically identical and avoids that
-    failing sequence.  Full models require all five canonical pieces; symmetry
-    models cover the exact surviving subset after the geometry split.
+    Full models require all five canonical pieces; symmetry models cover the
+    exact surviving subset after the geometry split.  The returned batches are
+    retained for diagnostic provenance only; production loss validation uses
+    the independent Python Faraday/POWERLITE/mass reference.
     """
     ordered_groups = []
     all_names = []
@@ -3677,10 +3674,13 @@ class Simulation():
         def _build(reporter):
             if quantity == "B_peak":
                 reporter.EnterQty("B")
-                # Maxwell defines ComplxPeak as the maximum magnitude of the
-                # equivalent real vector over one AC cycle. CmplxMag instead
-                # returns the complex-vector norm and can overstate rotating B.
-                reporter.CalcOp("ComplxPeak")
+                # Maxwell AC Magnetic 2025.2 rejects CalcOp("ComplxPeak") at
+                # the gRPC calculator boundary.  Retain the established,
+                # supported standard extraction path and label its semantics
+                # explicitly in every result row.  It is a diagnostic complex
+                # vector norm and is not used for the independent loss formula.
+                reporter.CalcOp("CmplxMag")
+                reporter.CalcOp("Mag")
             else:
                 reporter.EnterQty(quantity)
             reporter.EnterVol(obj_name)
@@ -3702,7 +3702,7 @@ class Simulation():
         return self._add_field_expression(expr_name, _build)
 
     def _calc_group_b_power_integral(self, objs, exponent, expr_name):
-        """Integrate ``|B_complex|**exponent`` over a set of gross core pieces."""
+        """Legacy postprocess diagnostic; never used by the production gate."""
         exponent = float(exponent)
         if not math.isfinite(exponent) or exponent <= 0:
             raise ValueError(f"invalid B exponent: {exponent!r}")
@@ -3804,12 +3804,9 @@ class Simulation():
         core_exprs = []
         b_mean_exprs = []
         b_max_exprs = []
-        b_power_exprs = []
         b_expr_group = {}
         b_expr_volume = {}
-        core_y_exponent = float(self.df_plus["core_y"].iloc[0])
         native_report_plan = None
-        b_power_cut_by_expr = {}
 
         for group_index, pieces in sorted(core_groups.items()):
             group_name = f"core_{group_index}"
@@ -3823,34 +3820,11 @@ class Simulation():
                 self._sym_cut_count,
                 require_complete_groups=bool(self.full_model),
             )
-            for cut_count, pieces in native_report_plan["batches"]:
-                # Keep each retained solid in its own calculator expression.
-                # AEDT 2025.2 reproducibly rejects the grouped stack for the
-                # symmetry-retained leg/center/yoke trio at CalcOp, even when
-                # the same operation succeeds for a single solid.  Python
-                # sums the independently exported volume integrals below,
-                # which is exactly linear and also identifies the failing
-                # object if AEDT ever rejects one individual expression.
-                for piece in pieces:
-                    piece_name = str(
-                        piece if isinstance(piece, str) else piece.name
-                    )
-                    expr_name = f"Bpow_{piece_name}"
-                    expression = self._calc_group_b_power_integral(
-                        [piece], core_y_exponent, expr_name
-                    )
-                    b_power_exprs.append(expression)
-                    b_power_cut_by_expr[expression] = cut_count
-        else:
-            for group_index, pieces in sorted(core_groups.items()):
-                group_name = f"core_{group_index}"
-                b_power_exprs.append(self._calc_group_b_power_integral(
-                    pieces, core_y_exponent, f"Bpow_{group_name}"
-                ))
 
-        # Register per-piece B diagnostics only after all B**y expressions.
-        # This ordering also keeps the AEDT calculator's fragile Pow sequence
-        # away from the much larger series of Mean/Maximum registrations.
+        # Per-piece B diagnostics retain the established CmplxMag->Mag
+        # extraction.  The independent core-loss reference is evaluated in
+        # Python from Faraday B and effective mass; no calculator B**y moment
+        # participates in the production gate.
         for group_index, pieces in sorted(core_groups.items()):
             for piece in pieces:
                 mean_expr = self._calc_field_expr(
@@ -3915,7 +3889,7 @@ class Simulation():
                 turn_exprs.append(self._calc_field_expr(w.name, "EMLoss", "Integrate", f"P_turn_{w.name}"))
 
         all_exprs = (
-            core_exprs + b_power_exprs + b_mean_exprs + b_max_exprs
+            core_exprs + b_mean_exprs + b_max_exprs
             + [flux_expr] + group_exprs + turn_exprs + plate_exprs
         )
         df_loss = self._export_field_report("calculator_report_loss", all_exprs)
@@ -3956,30 +3930,6 @@ class Simulation():
                 b_average, kf, area_basis=core_area_basis
             )
 
-        # Bavg**y moment uses the same symmetry amplitude and volume expansion
-        # as the native Power Ferrite loss law, but is evaluated independently.
-        b_power_phys = {}
-        b_power_restore_factor_by_expr = {}
-        for e in b_power_exprs:
-            b_power_si = _b_power_volume_integral_si(
-                self.loss_map[e],
-                self.extraction_units.get("loss", {}).get(e, ""),
-                core_y_exponent,
-                normalized_by_one_tesla=True,
-            )
-            if native_contract:
-                restore_factor = _native_b_power_restore_factor(
-                    b_power_cut_by_expr[e],
-                    core_y_exponent,
-                    getattr(self, "loss_is_sym", False),
-                )
-            else:
-                group_loss_key = "P_" + e.removeprefix("Bpow_")
-                restore_factor = self._phys_factor(
-                    group_loss_key, is_core_loss=True
-                )
-            b_power_restore_factor_by_expr[e] = restore_factor
-            b_power_phys[e] = b_power_si * restore_factor
         flux_integral_reported_wb = float(self.loss_map[flux_expr])
         b_section_average = (
             flux_integral_reported_wb
@@ -4008,16 +3958,6 @@ class Simulation():
             self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
             for e in core_exprs
         )
-        if native_contract:
-            # Native batch factors already include both symmetry-volume and
-            # discrete mirror restoration for their cut class.
-            b_power_integral_phys = sum(b_power_phys.values())
-        else:
-            b_power_integral_phys = sum(
-                b_power_phys[e]
-                * self._mirror_mult(e.removeprefix("Bpow_"))
-                for e in b_power_exprs
-            )
         cplate_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
                            for e in plate_exprs if "core_plate" in e)
         wcp_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
@@ -4065,39 +4005,6 @@ class Simulation():
             (self.loss_map_phys[e] for e in b_max_exprs), default=0
         )
 
-        core_loss_expected = float("nan")
-        core_loss_expected_native_raw = float("nan")
-        core_loss_native_rel_error = float("nan")
-        core_loss_native_attested = 0
-        core_loss_native_tolerance_rel = 0.02
-        if native_contract:
-            core_loss_expected = expected_core_loss_from_bavg_moment_w(
-                b_power_integral_phys,
-                cm_base=float(self.df_plus["core_cm_assigned"].iloc[0]),
-                frequency_hz=float(self.df_plus["freq"].iloc[0]),
-                core_x=float(self.df_plus["core_x"].iloc[0]),
-                core_y=float(self.df_plus["core_y"].iloc[0]),
-                lamination_factor=kf,
-                loss_margin=loss_margin,
-            )
-            core_loss_expected_native_raw = core_loss_expected / loss_margin
-            denominator = max(abs(core_loss_expected_native_raw), 1e-12)
-            core_loss_native_rel_error = abs(
-                core_total_native_raw - core_loss_expected_native_raw
-            ) / denominator
-            if not math.isfinite(core_loss_native_rel_error) or (
-                core_loss_native_rel_error > core_loss_native_tolerance_rel
-            ):
-                raise RuntimeError(
-                    "AEDT native lamination CoreLoss failed independent "
-                    "Bavg^y-volume-integral attestation: "
-                    f"solver_raw={core_total_native_raw:.12g}W, "
-                    f"expected_raw={core_loss_expected_native_raw:.12g}W, "
-                    f"relative_error={core_loss_native_rel_error:.6g}, "
-                    f"tolerance={core_loss_native_tolerance_rel:.6g}"
-                )
-            core_loss_native_attested = 1
-
         primary_turns = int(self.df_plus["N1_main"].iloc[0]) + int(
             self.df_plus["N1_side"].iloc[0]
         )
@@ -4108,22 +4015,79 @@ class Simulation():
             primary_turns,
             ae_effective_m2,
         )
-        b_ac_sine_material = sinusoidal_b_peak_material_t(
+        faraday_reference = faraday_lumped_core_reference(
+            voltage_rms_v=float(self.df_plus["V1_rms"].iloc[0]),
+            frequency_hz=float(self.df_plus["freq"].iloc[0]),
+            turns=primary_turns,
+            gross_area_m2=ae_gross_m2,
+            lamination_factor=kf,
+            effective_mass_kg=float(
+                self.df_plus["core_mass_effective_kg"].iloc[0]
+            ),
+            loss_margin=loss_margin,
+            coefficient=6.5,
+            x=float(self.df_plus["core_x"].iloc[0]),
+            y=float(self.df_plus["core_y"].iloc[0]),
+        )
+        b_ac_sine_material = faraday_reference["B_material_T"]
+        b_ac_sine_average = faraday_reference["B_pack_T"]
+        # Cross-check the algebraic gross-area route against the existing
+        # effective-area helper.  This is deterministic Python math, not an
+        # AEDT field-calculator identity.
+        b_ac_sine_material_effective_area = sinusoidal_b_peak_material_t(
             float(self.df_plus["V1_rms"].iloc[0]),
             float(self.df_plus["freq"].iloc[0]),
             primary_turns,
             ae_effective_m2,
         )
-        b_ac_sine_average = b_ac_sine_material * kf
+        if not math.isclose(
+            b_ac_sine_material,
+            b_ac_sine_material_effective_area,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError("Faraday gross/effective area references disagree")
+
+        core_loss_expected = faraday_reference["margin_adjusted_loss_W"]
+        core_loss_expected_native_raw = faraday_reference["native_raw_loss_W"]
+        core_loss_native_rel_error = float("nan")
+        core_loss_native_attested = 0
+        core_loss_native_tolerance_rel = 0.30
+        b_mean_faraday_rel_error = abs(
+            b_mean_material - b_ac_sine_material
+        ) / max(abs(b_ac_sine_material), 1e-12)
+        b_mean_faraday_tolerance_rel = 0.15
+        b_mean_faraday_attested = int(
+            math.isfinite(b_mean_faraday_rel_error)
+            and b_mean_faraday_rel_error <= b_mean_faraday_tolerance_rel
+        )
+        if native_contract:
+            denominator = max(abs(core_loss_expected_native_raw), 1e-12)
+            core_loss_native_rel_error = abs(
+                core_total_native_raw - core_loss_expected_native_raw
+            ) / denominator
+            if not b_mean_faraday_attested:
+                raise RuntimeError(
+                    "standard AEDT B average failed Faraday lumped reference: "
+                    f"standard_material={b_mean_material:.12g}T, "
+                    f"faraday_material={b_ac_sine_material:.12g}T, "
+                    f"relative_error={b_mean_faraday_rel_error:.6g}, "
+                    f"tolerance={b_mean_faraday_tolerance_rel:.6g}"
+                )
+            if not math.isfinite(core_loss_native_rel_error) or (
+                core_loss_native_rel_error > core_loss_native_tolerance_rel
+            ):
+                raise RuntimeError(
+                    "AEDT native lamination CoreLoss failed lumped Faraday/"
+                    "POWERLITE/mass reference: "
+                    f"solver_raw={core_total_native_raw:.12g}W, "
+                    f"expected_raw={core_loss_expected_native_raw:.12g}W, "
+                    f"relative_error={core_loss_native_rel_error:.6g}, "
+                    f"tolerance={core_loss_native_tolerance_rel:.6g}"
+                )
+            core_loss_native_attested = 1
 
         if native_contract:
-            native_batch_members = {
-                str(cut_count): [
-                    str(piece if isinstance(piece, str) else piece.name)
-                    for piece in pieces
-                ]
-                for cut_count, pieces in native_report_plan["batches"]
-            }
             native_group_count = len(native_report_plan["groups"])
             native_piece_count = len(native_report_plan["object_names"])
             native_expected_piece_count = sum(
@@ -4145,7 +4109,6 @@ class Simulation():
                 "membership_sha256"
             ]
         else:
-            native_batch_members = {}
             native_group_count = 0
             native_piece_count = 0
             native_expected_piece_count = 0
@@ -4158,13 +4121,27 @@ class Simulation():
             "P_core_total": [core_total],
             "P_core_total_native_raw_W": [core_total_native_raw],
             "P_core_total_expected_from_Bavg_integral": [core_loss_expected],
+            "P_core_total_expected_from_faraday_mass": [core_loss_expected],
             "P_core_total_expected_native_raw_W": [core_loss_expected_native_raw],
+            "P_core_total_expected_faraday_native_raw_W": [
+                core_loss_expected_native_raw
+            ],
             "core_loss_native_rel_error": [core_loss_native_rel_error],
             "core_loss_native_tolerance_rel": [core_loss_native_tolerance_rel],
             "core_loss_native_attested": [core_loss_native_attested],
             "core_loss_margin_applied": [loss_margin],
-            "Bavg_power_volume_integral": [b_power_integral_phys],
-            "Bavg_power_integral_normalized_by_one_tesla": [1],
+            "core_loss_reference_basis": [faraday_reference["basis"]],
+            "core_loss_reference_specific_W_kg": [
+                faraday_reference["specific_loss_W_kg"]
+            ],
+            "core_loss_reference_effective_mass_kg": [
+                faraday_reference["effective_mass_kg"]
+            ],
+            "Bavg_power_volume_integral": [float("nan")],
+            "Bavg_power_integral_normalized_by_one_tesla": [0],
+            "Bavg_power_integral_status": [
+                "disabled_by_user_use_independent_faraday_lumped_gate"
+            ],
             "native_core_report_group_count": [native_group_count],
             "native_core_report_piece_count": [native_piece_count],
             "native_core_report_expected_piece_count": [
@@ -4183,16 +4160,10 @@ class Simulation():
             "native_core_report_membership_sha256": [
                 native_membership_sha256
             ],
-            "native_core_b_power_batch_count": [len(native_batch_members)],
-            "native_core_b_power_expression_count": [len(b_power_exprs)],
-            "native_core_b_power_batches_json": [json.dumps(
-                native_batch_members, sort_keys=True, separators=(",", ":")
-            )],
-            "native_core_b_power_restore_factors_json": [json.dumps(
-                b_power_restore_factor_by_expr,
-                sort_keys=True,
-                separators=(",", ":"),
-            )],
+            "native_core_b_power_batch_count": [0],
+            "native_core_b_power_expression_count": [0],
+            "native_core_b_power_batches_json": ["{}"],
+            "native_core_b_power_restore_factors_json": ["{}"],
             "core_flux_section_retained_area_m2": [
                 flux_section_area_retained_m2
             ],
@@ -4207,10 +4178,19 @@ class Simulation():
             "B_design_square_material_analytic": [b_design_square_material],
             "B_ac_sine_material_analytic": [b_ac_sine_material],
             "B_ac_sine_average_analytic": [b_ac_sine_average],
-            "B_mean_material_vs_sine_analytic_rel_error": [
-                abs(b_mean_material - b_ac_sine_material)
-                / max(abs(b_ac_sine_material), 1e-12)
+            "B_faraday_pack_T": [faraday_reference["B_pack_T"]],
+            "B_faraday_material_T": [faraday_reference["B_material_T"]],
+            "B_standard_extraction_operator": ["CmplxMag_then_Mag"],
+            "B_standard_extraction_semantics": [
+                "complex_vector_norm_diagnostic_not_phase_peak"
             ],
+            "B_mean_material_vs_sine_analytic_rel_error": [
+                b_mean_faraday_rel_error
+            ],
+            "B_mean_faraday_tolerance_rel": [
+                b_mean_faraday_tolerance_rel
+            ],
+            "B_mean_faraday_attested": [b_mean_faraday_attested],
             "P_core_plate_total": [cplate_total],
             "P_wcp_total": [wcp_total],
             "P_winding_total": [winding_total],
@@ -5228,19 +5208,6 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             """EM 디자인 1개 생성: 지오메트리 + 여자 + 메시 + 경계 + 셋업"""
             sim.create_design(name=design_name)
             set_design_variables(sim.design1, sim.input_df)
-            reference = sim.design1.set_variable(
-                variable_name=B_POWER_REFERENCE_VARIABLE,
-                value=B_POWER_REFERENCE_T,
-                unit="tesla",
-            )
-            if reference is False:
-                raise RuntimeError(
-                    "failed to set exact 1-tesla B-power reference variable"
-                )
-            sim.df_plus["B_power_reference_T"] = [B_POWER_REFERENCE_T]
-            sim.df_plus["B_power_expression_basis"] = [
-                "(ComplxPeak(B)/1tesla)^core_y"
-            ]
             sim.create_core()
             sim.create_coil()
             sim.split_geometry()

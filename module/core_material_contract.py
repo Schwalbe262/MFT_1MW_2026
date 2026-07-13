@@ -26,6 +26,7 @@ CORE_LAMINATION_FACTOR_DATASHEET_MIN = 0.85
 CORE_LAMINATION_FACTOR_USER_CONSERVATIVE_CANDIDATE = 0.70
 CORE_LAMINATION_FACTOR_AB_CANDIDATES = (1.0, 0.85, 0.70)
 CORE_LOSS_MODEL_SOURCE = "POWERLITE_C_opt_p2_6p5_f_kHz_1p51_B_1p74"
+CORE_SPECIFIC_LOSS_COEFFICIENT_W_KG = 6.5
 CORE_LOSS_MARGIN_SOURCE = "production_conservative_margin_1p15"
 CORE_MASS_DENSITY_KG_M3 = 7180.0
 CORE_MASS_DENSITY_SOURCE = "POWERLITE_C_opt_p1_density_7p18_g_cm3"
@@ -370,6 +371,74 @@ def expected_specific_core_loss_w_kg(
     return coefficient * (frequency / 1000.0) ** x * b_material**y
 
 
+def faraday_lumped_core_reference(
+    *,
+    voltage_rms_v,
+    frequency_hz,
+    turns,
+    gross_area_m2,
+    lamination_factor,
+    effective_mass_kg,
+    loss_margin,
+    coefficient=CORE_SPECIFIC_LOSS_COEFFICIENT_W_KG,
+    x=1.51,
+    y=1.74,
+) -> dict:
+    """Independent non-calculator reference for sinusoidal Maxwell results.
+
+    The reference deliberately avoids a field-calculator ``B**y`` moment.
+    Faraday's law first gives the homogenized gross-pack flux density.  The
+    ribbon-material density is ``B_pack / kf`` and POWERLITE's published
+    W/kg law is applied to the effective alloy mass.  Because this is a
+    lumped estimate, production records compare it to both the standard AEDT
+    B-average extraction and native CoreLoss with explicit engineering
+    tolerances rather than claiming pointwise identity.
+    """
+    voltage = _finite(voltage_rms_v, "voltage_rms")
+    frequency = _finite(frequency_hz, "frequency")
+    turns = _finite(turns, "turns")
+    gross_area = _finite(gross_area_m2, "gross_area")
+    kf = _finite(lamination_factor, "core_lamination_factor")
+    mass = _finite(effective_mass_kg, "effective_mass")
+    margin = _finite(loss_margin, "core_loss_margin")
+    if min(voltage, frequency, turns, gross_area, mass) <= 0:
+        raise ValueError(
+            "voltage, frequency, turns, gross area, and effective mass must be > 0"
+        )
+    if not 0 < kf <= 1:
+        raise ValueError("core_lamination_factor must satisfy 0 < kf <= 1")
+    if margin < 1:
+        raise ValueError("core_loss_margin must be >= 1")
+    b_pack = math.sqrt(2.0) * voltage / (
+        2.0 * math.pi * frequency * turns * gross_area
+    )
+    b_material = b_pack / kf
+    specific_loss = expected_specific_core_loss_w_kg(
+        frequency,
+        b_material,
+        coefficient=coefficient,
+        x=x,
+        y=y,
+    )
+    native_raw = specific_loss * mass
+    return {
+        "B_pack_T": b_pack,
+        "B_material_T": b_material,
+        "specific_loss_W_kg": specific_loss,
+        "effective_mass_kg": mass,
+        "native_raw_loss_W": native_raw,
+        "margin_adjusted_loss_W": native_raw * margin,
+        "loss_margin": margin,
+        "coefficient_W_kg": float(coefficient),
+        "frequency_exponent": float(x),
+        "flux_exponent": float(y),
+        "basis": (
+            "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
+            "POWERLITE_Wkg_times_effective_mass"
+        ),
+    }
+
+
 def expected_core_loss_from_bavg_moment_w(
     bavg_power_volume_integral,
     *,
@@ -463,7 +532,11 @@ def build_core_material_contract_fields(
             else "explicit_net_geometry_base_cm_then_margin"
         ),
         "core_loss_expected_integral_basis": (
-            "Cm*f_Hz^x*margin*kf^(1-y)*integral(Bavg^y_dVgross)"
+            "lumped_faraday_Bpack_then_Bmaterial_div_kf_then_"
+            "POWERLITE_Wkg_times_effective_mass"
+        ),
+        "core_specific_loss_coefficient_W_kg": (
+            CORE_SPECIFIC_LOSS_COEFFICIENT_W_KG
         ),
         "core_B_average_to_material_factor": 1.0 / kf if gross_basis else 1.0,
         # Compatibility name retained as an optional result column.
@@ -489,7 +562,7 @@ def build_core_material_contract_fields(
         ),
         "maxwell_B_output_basis": MAXWELL_B_OUTPUT_BASIS,
         "maxwell_B_peak_operator": (
-            "ComplxPeak_maximum_equivalent_real_vector_magnitude_over_AC_cycle"
+            "CmplxMag_then_Mag_complex_vector_norm_diagnostic_not_phase_peak"
         ),
         "maxwell_voltage_source_basis": MAXWELL_VOLTAGE_SOURCE_BASIS,
     }

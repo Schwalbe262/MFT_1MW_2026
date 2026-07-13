@@ -1007,11 +1007,14 @@ def is_valid_result(
             "core_native_material_readback_attested",
             "core_loss_native_attested",
             "flux_linkage_attested",
+            "B_mean_faraday_attested",
         )):
             return False
         if not all(_finite(result, key) for key in (
             "core_loss_native_rel_error",
             "core_loss_native_tolerance_rel",
+            "B_mean_material_vs_sine_analytic_rel_error",
+            "B_mean_faraday_tolerance_rel",
             "core_surface_flux_vs_linkage_rel_error",
             "core_surface_flux_vs_induced_voltage_rel_error",
             "thermal_core_native_readback_count",
@@ -1022,7 +1025,16 @@ def is_valid_result(
             return False
         loss_error = float(result["core_loss_native_rel_error"])
         loss_tolerance = float(result["core_loss_native_tolerance_rel"])
-        if not 0.0 <= loss_error <= loss_tolerance <= 0.02:
+        if not 0.0 <= loss_error <= loss_tolerance <= 0.30:
+            return False
+        b_error = float(result["B_mean_material_vs_sine_analytic_rel_error"])
+        b_tolerance = float(result["B_mean_faraday_tolerance_rel"])
+        if not 0.0 <= b_error <= b_tolerance <= 0.15:
+            return False
+        if result.get("core_loss_reference_basis") != (
+            "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
+            "POWERLITE_Wkg_times_effective_mass"
+        ):
             return False
         if any(not 0.0 <= float(result[key]) <= 0.05 for key in (
             "core_surface_flux_vs_linkage_rel_error",

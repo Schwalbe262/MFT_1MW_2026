@@ -20,6 +20,7 @@ from module.core_material_contract import (
     effective_steinmetz_cm,
     expected_core_loss_from_bavg_moment_w,
     expected_specific_core_loss_w_kg,
+    faraday_lumped_core_reference,
     geometry_volume_and_masses,
     lamination_factor_policy_source,
     material_flux_density_t,
@@ -210,6 +211,60 @@ class CoreMaterialArithmeticTests(unittest.TestCase):
         )
         self.assertAlmostEqual(expected, direct, places=12)
         self.assertGreater(expected_specific_core_loss_w_kg(1000, 1.0), 0)
+
+    def test_faraday_lumped_reference_is_independent_and_kf_sensitive(self):
+        common = dict(
+            voltage_rms_v=1000,
+            frequency_hz=1000,
+            turns=10,
+            gross_area_m2=0.01,
+            effective_mass_kg=50,
+            loss_margin=MARGIN,
+        )
+        kf1 = faraday_lumped_core_reference(
+            **common, lamination_factor=1.0
+        )
+        kf085 = faraday_lumped_core_reference(
+            **common, lamination_factor=0.85
+        )
+        self.assertAlmostEqual(
+            kf085["B_material_T"] / kf1["B_material_T"], 1 / 0.85
+        )
+        self.assertAlmostEqual(
+            kf085["specific_loss_W_kg"] / kf1["specific_loss_W_kg"],
+            (1 / 0.85) ** 1.74,
+        )
+        self.assertAlmostEqual(
+            kf085["margin_adjusted_loss_W"],
+            kf085["native_raw_loss_W"] * MARGIN,
+        )
+        self.assertEqual(
+            kf085["basis"],
+            "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
+            "POWERLITE_Wkg_times_effective_mass",
+        )
+
+    def test_faraday_lumped_reference_rejects_invalid_inputs(self):
+        common = dict(
+            voltage_rms_v=1000,
+            frequency_hz=1000,
+            turns=10,
+            gross_area_m2=0.01,
+            lamination_factor=0.85,
+            effective_mass_kg=50,
+            loss_margin=MARGIN,
+        )
+        for key, value in (
+            ("turns", 0),
+            ("gross_area_m2", 0),
+            ("lamination_factor", 1.1),
+            ("effective_mass_kg", -1),
+            ("loss_margin", 0.9),
+        ):
+            kwargs = dict(common)
+            kwargs[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                faraday_lumped_core_reference(**kwargs)
 
     def test_b_power_integral_units_are_fail_closed(self):
         self.assertAlmostEqual(
@@ -555,7 +610,7 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
             ("op", "CmplxMag"),
         ])
 
-    def test_b_peak_uses_complxpeak_not_complex_vector_norm(self):
+    def test_b_peak_uses_supported_complex_vector_norm_diagnostic(self):
         operations = []
 
         class Reporter:
@@ -568,8 +623,10 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
             builder(Reporter()) or name
         )
         simulation._calc_field_expr("core_1", "B_peak", "Mean", "B_test")
-        self.assertIn(("op", "ComplxPeak"), operations)
-        self.assertNotIn(("op", "CmplxMag"), operations)
+        self.assertEqual(operations[:3], [
+            ("qty", "B"), ("op", "CmplxMag"), ("op", "Mag")
+        ])
+        self.assertNotIn(("op", "ComplxPeak"), operations)
 
     def test_single_piece_b_power_expression_has_no_group_addition(self):
         operations = []
@@ -700,7 +757,10 @@ class CoreMaterialArtifactTests(unittest.TestCase):
             [1.0, 0.85, 0.70],
         )
         self.assertIn("corner_interface_flux", payload["required_solved_metrics"])
-        self.assertIn("native_core_loss_vs_Bavg_power_integral", payload["required_solved_metrics"])
+        self.assertIn(
+            "native_core_loss_vs_independent_Faraday_POWERLITE_effective_mass",
+            payload["required_solved_metrics"],
+        )
 
     def test_new_revision_is_fail_closed_in_quality_and_scheduler_ingest(self):
         root = Path(__file__).resolve().parent
