@@ -340,6 +340,7 @@ section { margin: 0 0 52px; scroll-margin-top: 100px; }
 .stage-timing-card small { color: var(--muted); font: 500 9px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .stage-timing-card.total { background: rgba(38,215,199,.035); }
 .stage-timing-card.total > span, .stage-timing-card.total strong { color: var(--cyan); }
+.stage-timing-empty { margin: 0; padding: 10px 18px; border-top: 1px solid var(--line-soft); color: #8aa2ad; font-size: 9px; }
 
 .table-panel { padding: 0; overflow: hidden; }
 .table-panel > .panel-title { padding: 17px 18px 7px; }

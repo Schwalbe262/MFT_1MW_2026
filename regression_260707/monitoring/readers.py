@@ -165,15 +165,22 @@ def _duration_seconds(value: Any) -> float | None:
 
 
 def _simulation_timing_summary(
-    rows: list[dict[str, Any]],
+    frame: Any,
     local_tz=None,
     limit: int = SIMULATION_TIMING_WINDOW_ROWS,
 ) -> dict[str, Any]:
-    """Summarize exact timing fields from the most recently saved rows."""
+    """Summarize recent timing fields for the exact current v3.2 cohort."""
+    columns = (
+        "git_hash", "physics_data_revision", "saved_at",
+        *(source_field for _, source_field in SIMULATION_TIMING_FIELDS),
+    )
+    rows = _frame_records(frame, columns)
+    cohort_rows = [
+        row for row in rows
+        if _is_current_cohort(*_cohort_identity(row))
+    ]
     ranked: list[tuple[float, int, dict[str, Any]]] = []
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            continue
+    for index, row in enumerate(cohort_rows):
         stamp = _parse_time(row.get("saved_at"), local_tz)
         ranked.append((stamp.timestamp() if stamp else float("-inf"), index, row))
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -192,6 +199,13 @@ def _simulation_timing_summary(
         }
     return {
         "available": any(stage["sample_count"] for stage in stages.values()),
+        "cohort_basis": "current_v3.2_identity",
+        "cohort_label": "현재 v3.2 코호트",
+        "cohort_filter": {
+            "git_hash": CURRENT_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        },
+        "cohort_rows": len(cohort_rows),
         "unit": "seconds",
         "window_limit_rows": max(0, int(limit)),
         "window_rows": len(recent),
@@ -308,6 +322,23 @@ def _optional_text(value: Any, limit: int = 500) -> str | None:
     if not text or text.casefold() in {"nan", "<na>", "none", "null"}:
         return None
     return text[:limit]
+
+
+def _cohort_identity(row: dict[str, Any]) -> tuple[str, str]:
+    """Return the normalized identity used by every campaign cohort reader."""
+    revision = (_optional_text(row.get("git_hash"), 40) or "").lower()
+    physics_revision = (
+        _optional_text(row.get("physics_data_revision"), 160)
+        or LEGACY_PHYSICS_DATA_REVISION
+    )
+    return revision, physics_revision
+
+
+def _is_current_cohort(revision: str, physics_revision: str) -> bool:
+    return (
+        revision == CURRENT_SOLVER_REVISION
+        and physics_revision == CURRENT_PHYSICS_DATA_REVISION
+    )
 
 
 def _optional_flag(value: Any) -> bool | None:
@@ -427,15 +458,8 @@ def _campaign_frame_summary(
     records = _frame_records(frame, columns)
     prepared: list[dict[str, Any]] = []
     for row in records:
-        revision = (_optional_text(row.get("git_hash"), 40) or "").lower()
-        physics_revision = (
-            _optional_text(row.get("physics_data_revision"), 160)
-            or LEGACY_PHYSICS_DATA_REVISION
-        )
-        current = (
-            revision == CURRENT_SOLVER_REVISION
-            and physics_revision == CURRENT_PHYSICS_DATA_REVISION
-        )
+        revision, physics_revision = _cohort_identity(row)
+        current = _is_current_cohort(revision, physics_revision)
         strict_em_flag = _optional_flag(row.get("_strict_valid_em"))
         if strict_em_flag is None:
             strict_em_flag = _optional_flag(row.get("result_valid_em")) is True
@@ -494,10 +518,7 @@ def _campaign_frame_summary(
             baseline = before[-1] if before else (within[0] if within else None)
             if baseline is not None:
                 recent_growth = max(0, strict_full_rows - baseline)
-        current = (
-            revision == CURRENT_SOLVER_REVISION
-            and physics_revision == CURRENT_PHYSICS_DATA_REVISION
-        )
+        current = _is_current_cohort(revision, physics_revision)
         cohorts.append({
             "git_hash": revision or None,
             "git_hash_short": revision[:10] if revision else "unknown",
@@ -1688,7 +1709,9 @@ class ArtifactService:
             if (parsed := _parse_time(row.get("saved_at"), now.tzinfo)) is not None
         ]
         timestamps.sort()
-        simulation_timing = _simulation_timing_summary(rows, now.tzinfo)
+        simulation_timing = _simulation_timing_summary(
+            campaign_frame, now.tzinfo
+        )
         one_hour_ago = now - timedelta(hours=1)
         day_ago = now - timedelta(hours=24)
         strict_history = []

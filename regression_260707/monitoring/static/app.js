@@ -178,10 +178,16 @@
     setText("#collector-nodata", data.collector?.no_data_tasks == null ? "—" : `${number(data.collector.no_data_tasks)}건`);
     const timing = data.simulation_timing || {};
     const timingStages = timing.stages || {};
+    const timingCohortLabel = timing.cohort_label || "현재 v3.2 코호트";
+    const timingWindowRows = Number.isFinite(Number(timing.window_rows)) ? timing.window_rows : 0;
+    const timingWindowLimit = Number.isFinite(Number(timing.window_limit_rows)) ? timing.window_limit_rows : 100;
+    setText("#stage-timing-basis", `${timingCohortLabel} 기준 · solver 결과의 실제 timing 필드`);
     setText(
       "#stage-timing-window",
-      timing.available ? `최근 ${number(timing.window_rows)}개 행 (최대 ${number(timing.window_limit_rows)})` : "timing 데이터 없음",
+      `${timingCohortLabel} · n=${number(timingWindowRows)} (최근 최대 ${number(timingWindowLimit)}행)`,
     );
+    const timingEmpty = $("#stage-timing-empty");
+    timingEmpty.classList.toggle("hidden", Boolean(timing.available));
     ["matrix", "loss", "icepak", "total"].forEach((key) => {
       const stage = timingStages[key] || {};
       setText(`#stage-time-${key}-mean`, duration(stage.mean_seconds));

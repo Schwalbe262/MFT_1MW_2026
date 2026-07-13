@@ -182,8 +182,8 @@
       </div>
       <article class="panel stage-timing-panel" aria-labelledby="stage-timing-title">
         <div class="panel-title">
-          <div><h3 id="stage-timing-title">최근 시뮬레이션 단계별 소요시간</h3><p>solver 결과의 실제 timing 필드 기준</p></div>
-          <span id="stage-timing-window" class="mono-chip">timing 데이터 없음</span>
+          <div><h3 id="stage-timing-title">최근 시뮬레이션 단계별 소요시간</h3><p id="stage-timing-basis">현재 v3.2 코호트 기준 · solver 결과의 실제 timing 필드</p></div>
+          <span id="stage-timing-window" class="mono-chip">현재 v3.2 코호트 · n=0</span>
         </div>
         <div class="stage-timing-grid">
           <div class="stage-timing-card"><span>Matrix 평균</span><strong id="stage-time-matrix-mean">—</strong><small id="stage-time-matrix-detail">중앙값 — · n=0</small></div>
@@ -191,6 +191,7 @@
           <div class="stage-timing-card"><span>Icepak 평균</span><strong id="stage-time-icepak-mean">—</strong><small id="stage-time-icepak-detail">중앙값 — · n=0</small></div>
           <div class="stage-timing-card total"><span>합계 평균</span><strong id="stage-time-total-mean">—</strong><small id="stage-time-total-detail">중앙값 — · n=0</small></div>
         </div>
+        <p id="stage-timing-empty" class="stage-timing-empty">v3.2 코호트 타이밍 데이터 없음</p>
       </article>
     </section>
 

@@ -123,18 +123,21 @@ def test_data_counts_quality_throughput_and_revision(artifact_service):
     assert data["rows_not_latest_revision"] == 1
     assert data["eta_3000"] is not None
     timing = data["simulation_timing"]
-    assert timing["available"] is True
-    assert timing["window_rows"] == 2
-    assert timing["window_limit_rows"] == 100
-    assert timing["stages"]["matrix"] == {
-        "source_field": "time_matrix",
-        "sample_count": 2,
-        "mean_seconds": 450.0,
-        "median_seconds": 450.0,
+    assert timing["available"] is False
+    assert timing["cohort_basis"] == "current_v3.2_identity"
+    assert timing["cohort_filter"] == {
+        "git_hash": CURRENT_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
     }
-    assert timing["stages"]["loss"]["mean_seconds"] == 1750.0
-    assert timing["stages"]["icepak"]["median_seconds"] == 1100.0
-    assert timing["stages"]["total"]["mean_seconds"] == 3300.0
+    assert timing["cohort_rows"] == 0
+    assert timing["window_rows"] == 0
+    assert timing["window_limit_rows"] == 100
+    assert all(
+        stage["sample_count"] == 0
+        and stage["mean_seconds"] is None
+        and stage["median_seconds"] is None
+        for stage in timing["stages"].values()
+    )
 
 
 def test_data_separates_raw_rows_from_zero_b171_pinned_rows(
@@ -396,19 +399,108 @@ def test_fea_timings_fail_closed_without_nonnegative_finite_result_fields(artifa
     }
 
 
-def test_simulation_timing_summary_uses_only_most_recent_rows():
+def test_simulation_timing_summary_filters_active_cohort_before_recent_window():
+    current = {
+        "git_hash": CURRENT_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+    }
     summary = _simulation_timing_summary([
-        {"saved_at": "2026-07-11 00:00:00", "time_matrix": "100"},
-        {"saved_at": "2026-07-11 02:00:00", "time_matrix": "300"},
-        {"saved_at": "2026-07-11 01:00:00", "time_matrix": "200"},
+        {
+            **current, "saved_at": "2026-07-11 00:00:00",
+            "time_matrix": "100", "time_thermal": "100",
+        },
+        {
+            "git_hash": "legacy", "physics_data_revision": "legacy",
+            "saved_at": "2026-07-11 04:00:00", "thermal_on": 0,
+            "time_matrix": "999", "time_thermal": "3",
+        },
+        {
+            **current, "git_hash": CURRENT_SOLVER_REVISION.upper(),
+            "saved_at": "2026-07-11 02:00:00",
+            "time_matrix": "300", "time_thermal": "300",
+        },
+        {
+            **current, "saved_at": "2026-07-11 01:00:00",
+            "time_matrix": "200", "time_thermal": "200",
+        },
+        {
+            "git_hash": CURRENT_SOLVER_REVISION,
+            "physics_data_revision": "legacy_unspecified",
+            "saved_at": "2026-07-11 03:00:00",
+            "time_matrix": "888", "time_thermal": "3",
+        },
     ], limit=2)
 
+    assert summary["cohort_basis"] == "current_v3.2_identity"
+    assert summary["cohort_label"] == "현재 v3.2 코호트"
+    assert summary["cohort_filter"] == {
+        "git_hash": CURRENT_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+    }
+    assert summary["cohort_rows"] == 3
     assert summary["window_rows"] == 2
     assert summary["stages"]["matrix"]["sample_count"] == 2
     assert summary["stages"]["matrix"]["mean_seconds"] == 250.0
     assert summary["stages"]["matrix"]["median_seconds"] == 250.0
+    assert summary["stages"]["icepak"]["mean_seconds"] == 250.0
     assert summary["stages"]["loss"]["sample_count"] == 0
     assert summary["stages"]["loss"]["mean_seconds"] is None
+
+
+def test_simulation_timing_summary_does_not_fall_back_to_legacy_rows():
+    summary = _simulation_timing_summary([
+        {
+            "git_hash": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+            "physics_data_revision": "legacy_unspecified",
+            "saved_at": "2026-07-11 03:00:00", "thermal_on": 0,
+            "time_matrix": 1, "time_loss": 2,
+            "time_thermal": 3, "time": 6,
+        },
+        {
+            "git_hash": CURRENT_SOLVER_REVISION,
+            "physics_data_revision": "legacy_unspecified",
+            "time_thermal": 3,
+        },
+        {
+            "git_hash": "legacy",
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "time_thermal": 3,
+        },
+    ])
+
+    assert summary["available"] is False
+    assert summary["cohort_rows"] == 0
+    assert summary["window_rows"] == 0
+    assert all(
+        stage["sample_count"] == 0
+        and stage["mean_seconds"] is None
+        and stage["median_seconds"] is None
+        for stage in summary["stages"].values()
+    )
+
+
+def test_simulation_timing_summary_tolerates_missing_columns():
+    frame = pd.DataFrame([
+        {"saved_at": "2026-07-11 03:00:00", "time_thermal": 3},
+        {"git_hash": CURRENT_SOLVER_REVISION, "time_matrix": 100},
+        {
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "time_loss": 200,
+        },
+        {
+            "git_hash": CURRENT_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": "2026-07-11 04:00:00",
+        },
+    ])
+
+    summary = _simulation_timing_summary(frame)
+
+    assert summary["available"] is False
+    assert summary["cohort_rows"] == 1
+    assert summary["window_rows"] == 1
+    assert all(stage["sample_count"] == 0
+               for stage in summary["stages"].values())
 
 
 def test_zero_aware_percentage_metrics_exclude_structural_zero_targets():
@@ -709,6 +801,10 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
             ),
             "thermal_core_k_inplane": 18.0,
             "thermal_core_k_throughstack": 2.0,
+            "time_matrix": 480.0,
+            "time_loss": 1_800.0,
+            "time_thermal": 900.0,
+            "time": 3_180.0,
         },
         {
             "git_hash": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
@@ -717,6 +813,11 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
             "_strict_valid_em": False,
             "_strict_valid_full": False,
             "thermal_core_conductivity_model": "isotropic_legacy",
+            "thermal_on": 0,
+            "time_matrix": 1.0,
+            "time_loss": 2.0,
+            "time_thermal": 3.0,
+            "time": 6.0,
         },
     ])
     parquet_path = campaign_root / "data" / "dataset" / "train.parquet"
@@ -750,6 +851,13 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
     ] == pytest.approx(2.0)
     assert data["thermal_models"]["tagged_rows"] == 2
     assert data["quarantine"]["legacy"]["rows"] == 1
+    timing = data["simulation_timing"]
+    assert timing["available"] is True
+    assert timing["cohort_rows"] == 1
+    assert timing["window_rows"] == 1
+    assert timing["stages"]["matrix"]["mean_seconds"] == 480.0
+    assert timing["stages"]["icepak"]["mean_seconds"] == 900.0
+    assert timing["stages"]["total"]["mean_seconds"] == 3_180.0
 
 
 def test_runtime_recorder_recovers_from_winerror5_without_temp_collision(

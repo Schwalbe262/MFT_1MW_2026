@@ -15,6 +15,10 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "data-raw-total" in page.text
     assert "최근 시뮬레이션 단계별 소요시간" in page.text
     assert "stage-time-matrix-mean" in page.text
+    assert 'id="stage-timing-basis"' in page.text
+    assert "현재 v3.2 코호트 기준" in page.text
+    assert "현재 v3.2 코호트 · n=0" in page.text
+    assert "v3.2 코호트 타이밍 데이터 없음" in page.text
     assert "단계 소요시간" in page.text
     assert "final-time-matrix" in page.text
     assert "MFT 병렬 실행 목표" in page.text
@@ -43,6 +47,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "data.raw_total_rows" in script.text
     assert "격리" in script.text
     assert "data.simulation_timing" in script.text
+    assert "timing.cohort_label" in script.text
+    assert "n=${number(timingWindowRows)}" in script.text
     assert "timingCell(evaluation.timing_seconds)" in script.text
     assert 'return "—"' in script.text
     assert 'fetch("/api/operator/parallel-target"' in script.text
@@ -68,6 +74,7 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert stylesheet.status_code == 200
     assert ".timing-grid" in stylesheet.text
     assert ".stage-timing-grid" in stylesheet.text
+    assert ".stage-timing-empty" in stylesheet.text
     assert ".history-metric-control" in stylesheet.text
     assert ".chart-tooltip" in stylesheet.text
     assert ".cohort-row.current" in stylesheet.text
@@ -83,7 +90,11 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert dashboard.json()["data"]["count_basis"] == "pinned_strict_full"
     assert dashboard.json()["data"]["latest_revision"] == "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a"
     assert dashboard.json()["data"]["pinned_revision"] == "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
-    assert dashboard.json()["data"]["simulation_timing"]["stages"]["total"]["mean_seconds"] == 3300.0
+    timing = dashboard.json()["data"]["simulation_timing"]
+    assert timing["available"] is False
+    assert timing["cohort_rows"] == 0
+    assert timing["window_rows"] == 0
+    assert timing["stages"]["total"]["mean_seconds"] is None
 
     assert client.get("/api/status").status_code == 200
     assert client.get("/api/data").json()["complete_rows"] == 1
