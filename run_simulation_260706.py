@@ -3692,8 +3692,9 @@ class Simulation():
                 return odesktop
         raise RuntimeError("original native AEDT Desktop handle is unavailable")
 
-    def _verified_native_maxwell_setup(self, owner, setup_name="Setup1"):
-        """Resolve the exact Maxwell setup from this Simulation's named handles."""
+    def _verified_native_maxwell_setup(
+            self, setup_name="Setup1", *, odesktop=None):
+        """Resolve the exact Maxwell setup through a backend-specific owner."""
         expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
         expected_design = _aedt_design_name(
             getattr(self.design1, "design_name", "")
@@ -3701,19 +3702,25 @@ class Simulation():
         if not expected_project or not expected_design:
             raise RuntimeError("native analysis project/design identity is unavailable")
 
-        set_active_project = getattr(owner, "SetActiveProject", None)
-        if callable(set_active_project):
-            if self._backend_mode() != "standalone":
+        # AEDT gRPC proxies synthesize callable attributes for unknown method
+        # names, so method probing cannot distinguish a project from Desktop.
+        if self._backend_mode() == "pooled":
+            if odesktop is not None:
                 raise RuntimeError(
                     "pooled AEDT cannot resolve a project through Desktop active state"
                 )
+            oproject = self._verified_native_project_handle()
+        else:
+            if odesktop is None:
+                odesktop = self._native_desktop_handle()
+            set_active_project = getattr(odesktop, "SetActiveProject", None)
+            if not callable(set_active_project):
+                raise RuntimeError("native Desktop cannot activate a project")
             oproject = set_active_project(expected_project)
             if oproject is None or oproject is False:
                 raise RuntimeError(
                     f"SetActiveProject returned no project ({expected_project})"
                 )
-        else:
-            oproject = owner
         actual_project = str(oproject.GetName() or "").strip()
         if actual_project != expected_project:
             raise _AedtIdentityMismatch(
@@ -3869,9 +3876,8 @@ class Simulation():
                 if attempt > 1 and clock() >= deadline:
                     break
                 try:
-                    oproject = self._verified_native_project_handle()
                     _oproject, odesign = self._verified_native_maxwell_setup(
-                        oproject, setup_name=setup_name
+                        setup_name=setup_name
                     )
                     return {
                         "odesktop": None,
@@ -3918,7 +3924,7 @@ class Simulation():
             try:
                 odesktop = self._native_desktop_handle()
                 _oproject, odesign = self._verified_native_maxwell_setup(
-                    odesktop, setup_name=setup_name
+                    setup_name=setup_name, odesktop=odesktop
                 )
                 running = odesktop.AreThereSimulationsRunning()
                 if running is not False:
@@ -3948,7 +3954,7 @@ class Simulation():
                         f"expected='pyaedt_config', actual={actual!r}"
                     )
                 _oproject, odesign = self._verified_native_maxwell_setup(
-                    odesktop, setup_name=setup_name
+                    setup_name=setup_name, odesktop=odesktop
                 )
                 return {
                     "odesktop": odesktop,
@@ -4000,14 +4006,13 @@ class Simulation():
         for attempt in range(1, int(max_attempts) + 1):
             try:
                 if self._backend_mode() == "pooled":
-                    oproject = self._verified_native_project_handle()
                     self._verified_native_maxwell_setup(
-                        oproject, setup_name=setup_name
+                        setup_name=setup_name
                     )
                 else:
                     odesktop = self._native_desktop_handle()
                     self._verified_native_maxwell_setup(
-                        odesktop, setup_name=setup_name
+                        setup_name=setup_name, odesktop=odesktop
                     )
                     running = odesktop.AreThereSimulationsRunning()
                     if running is not False:

@@ -2201,6 +2201,69 @@ $end 'DSOConfig'
             self.assertIs(context["odesign"], design)
             self.assertEqual(verify.call_count, 2)
 
+    def test_pooled_preflight_does_not_duck_type_named_project_as_desktop(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, _high_level = self._simulation(root)
+            simulation.aedt_backend = "pooled"
+            named_project = Mock()
+            named_project.GetName.return_value = simulation.PROJECT_NAME
+            named_project.GetDesigns.return_value = [design]
+            named_project.SetActiveProject.side_effect = AssertionError(
+                "named project must not be classified as Desktop"
+            )
+            named_project.SetActiveDesign.side_effect = AssertionError(
+                "explicit design lookup expected"
+            )
+            verify = Mock(return_value=named_project)
+            simulation._verified_native_project_handle = verify
+            desktop.SetActiveProject = Mock(
+                side_effect=AssertionError("Desktop active project is shared")
+            )
+
+            context = simulation._prepare_copied_loss_native_analysis(
+                max_attempts=1,
+                initial_retry_delay=0,
+                sleeper=lambda _seconds: None,
+            )
+
+            self.assertIs(context["odesign"], design)
+            self.assertIsNone(context["odesktop"])
+            self.assertIsNone(context["registry_key"])
+            verify.assert_called_once_with()
+            named_project.SetActiveProject.assert_not_called()
+            named_project.SetActiveDesign.assert_not_called()
+            desktop.SetActiveProject.assert_not_called()
+
+    def test_pooled_postcheck_does_not_duck_type_named_project_as_desktop(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, _project, design, _high_level = self._simulation(root)
+            simulation.aedt_backend = "pooled"
+            named_project = Mock()
+            named_project.GetName.return_value = simulation.PROJECT_NAME
+            named_project.GetDesigns.return_value = [design]
+            named_project.SetActiveProject.side_effect = AssertionError(
+                "named project must not be classified as Desktop"
+            )
+            named_project.SetActiveDesign.side_effect = AssertionError(
+                "explicit design lookup expected"
+            )
+            verify = Mock(return_value=named_project)
+            simulation._verified_native_project_handle = verify
+            desktop.SetActiveProject = Mock(
+                side_effect=AssertionError("Desktop active project is shared")
+            )
+
+            simulation._postcheck_copied_loss_native_analysis(
+                max_attempts=1,
+                retry_delay=0,
+                sleeper=lambda _seconds: None,
+            )
+
+            verify.assert_called_once_with()
+            named_project.SetActiveProject.assert_not_called()
+            named_project.SetActiveDesign.assert_not_called()
+            desktop.SetActiveProject.assert_not_called()
+
     def test_transient_registry_preflight_then_exactly_one_native_solve(self):
         with tempfile.TemporaryDirectory() as root:
             simulation, desktop, project, design, high_level = self._simulation(
