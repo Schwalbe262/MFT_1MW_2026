@@ -1,8 +1,10 @@
 # MFT 1MW 전용 모니터
 
-`slurm_scheduler`와 완전히 분리된 읽기 전용 WEB UI다. MFT 저장소의 데이터셋,
-학습 리포트, AL/NSGA-II 산출물, 검증 결과를 직접 읽고 스케줄러에는 작업 수 확인을
-위한 경량 `GET /api/tasks/summary` 요청만 보낸다. 수만 건의 작업 목록은 읽지 않는다.
+`slurm_scheduler`와 분리된 MFT 전용 WEB UI다. MFT 저장소의 데이터셋, 학습 리포트,
+AL/NSGA-II 산출물, 검증 결과를 직접 읽는다. 스케줄러 상태는 경량
+`GET /api/tasks/summary`와 MFT 프로젝트 조회만 사용하며 수만 건의 작업 목록은 읽지
+않는다. 유일한 쓰기 기능은 MFT 프로젝트의 병렬 유지 목표를 바꾸는 cap-only PATCH다.
+repo/setup/entrypoint는 수정하지 않으며 IPMSM 프로젝트도 건드리지 않는다.
 
 ## 실행
 
@@ -15,6 +17,9 @@
 최초 실행에서 전용 `.venv`와 최소 패키지를 설치한다. 서버는 외부에 노출되지 않는
 `http://127.0.0.1:8010`에 바인딩된다. 다른 포트를 쓰려면
 `.\start_monitor.ps1 -Port 8011`처럼 실행한다.
+
+병렬 목표 변경 API는 추가로 loopback client, same-origin, JSON 전용 custom header를
+검사한다. reverse proxy로 외부에 노출해 쓰는 운영 방식은 지원하지 않는다.
 
 직접 실행할 수도 있다.
 
@@ -48,6 +53,7 @@ fine FEA JSON에는 `result` 객체와 선택적으로 `candidate_id`, `task_id`
 - `MFT_MONITOR_ROOT`: 기본값은 `regression_260707` 디렉터리
 - `MFT_SCHEDULER_URL`: 기본값 `http://127.0.0.1:8000`
 - `MFT_MONITOR_TASK_PREFIX`: 조회할 작업 이름 접두사, 기본값 `mft`
+- `MFT_SCHEDULER_PROJECT`: 병렬 목표를 제어할 프로젝트, 기본값 `MFT_1MW_2026v1`
 - `MFT_SCHEDULER_TIMEOUT`: 스케줄러 GET 제한시간(초), 기본값 `2`
 - `MFT_MONITOR_DISABLE_HISTORY=1`: runtime snapshot/history 기록 중지
 

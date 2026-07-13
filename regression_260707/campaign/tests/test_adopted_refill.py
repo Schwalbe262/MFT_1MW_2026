@@ -57,6 +57,58 @@ def authorize(**overrides):
         return feeder._authorize_adopted_refill(decision(), **kwargs)
 
 
+def decision400(terminal=20, valid=18, paused=False):
+    payload = decision(terminal=terminal, valid=valid, paused=paused)
+    payload.update({"target_active": 400, "action": "refill_400"})
+    return payload
+
+
+def authorize400(**overrides):
+    kwargs = {
+        "max_samples": 12_000,
+        "solver_revision": SOLVER,
+        "library_revision": LIBRARY,
+        "candidate_seed": 260710,
+        "local_passed": True,
+        "adoption_sha256": ADOPTION,
+        "initial_count": 0,
+        "evidence_mode": "concurrent400_v1",
+        "strict_rows": 25,
+        "target_strict_rows": 3_000,
+        **RESOURCES,
+    }
+    kwargs.update(overrides)
+    with mock.patch.object(
+            feeder.scheduler_client,
+            "campaign_mutation_lock_is_held",
+            return_value=True,
+    ):
+        return feeder._authorize_adopted_refill(decision400(), **kwargs)
+
+
+def authorize300(**overrides):
+    kwargs = {
+        "max_samples": 12_000,
+        "solver_revision": SOLVER,
+        "library_revision": LIBRARY,
+        "candidate_seed": 260710,
+        "local_passed": True,
+        "adoption_sha256": ADOPTION,
+        "initial_count": 0,
+        "evidence_mode": "concurrent300_v1",
+        "strict_rows": 25,
+        "target_strict_rows": 3_000,
+        **RESOURCES,
+    }
+    kwargs.update(overrides)
+    with mock.patch.object(
+            feeder.scheduler_client,
+            "campaign_mutation_lock_is_held",
+            return_value=True,
+    ):
+        return feeder._authorize_adopted_refill(decision(), **kwargs)
+
+
 class AdoptedAuthorizationTests(unittest.TestCase):
     def test_exact_preloaded_contract_issues_distinct_sealed_authorization(self):
         auth = authorize()
@@ -110,6 +162,41 @@ class AdoptedAuthorizationTests(unittest.TestCase):
                     **RESOURCES,
                 )
 
+    def test_concurrent400_contract_is_exact_and_health_gated(self):
+        refill400 = decision400()
+        kwargs = {
+            "max_samples": 12_000,
+            "solver_revision": SOLVER,
+            "library_revision": LIBRARY,
+            "candidate_seed": 260710,
+            "local_passed": True,
+            "adoption_sha256": ADOPTION,
+            "initial_count": 0,
+            "evidence_mode": "concurrent400_v1",
+            "strict_rows": 25,
+            "target_strict_rows": 3_000,
+            **RESOURCES,
+        }
+        with mock.patch.object(
+                feeder.scheduler_client,
+                "campaign_mutation_lock_is_held",
+                return_value=True,
+        ):
+            auth = feeder._authorize_adopted_refill(refill400, **kwargs)
+            self.assertEqual(auth.target, 400)
+            self.assertEqual(auth.initial_count, 0)
+            self.assertEqual(auth.evidence_mode, "concurrent400_v1")
+
+            bad_mode = {**kwargs, "evidence_mode": "concurrent250_v1"}
+            with self.assertRaisesRegex(
+                    feeder.SchedulerError, "target/evidence contract"):
+                feeder._authorize_adopted_refill(refill400, **bad_mode)
+
+            weak = decision(terminal=20, valid=17)
+            weak.update({"target_active": 400, "action": "refill_400"})
+            with self.assertRaisesRegex(feeder.SchedulerError, "fleet20/90"):
+                feeder._authorize_adopted_refill(weak, **kwargs)
+
     def test_truthy_local_string_and_coerced_initial_count_are_rejected(self):
         with self.assertRaisesRegex(feeder.SchedulerError, "local3"):
             authorize(local_passed="yes")
@@ -162,6 +249,73 @@ class AdoptedAuthorizationTests(unittest.TestCase):
 
 
 class AdoptedRefillJournalTests(unittest.TestCase):
+    def test_concurrent300_commits_one_feeder_generation_per_batch(self):
+        auth = authorize300()
+        generation = f"{SOLVER}:{LIBRARY}:seed260710"
+        state = {
+            "serial": 18_000,
+            "submitted_samples": 300,
+            "candidate_generation": generation,
+            "candidate_cursor": 939,
+            "candidate_cursors": {generation: 939},
+            "outstanding": [],
+            "task_expected_rows": {},
+        }
+        campaign_counts = {"queued": 297, "attaching": 0, "running": 0}
+        capacity = {
+            "ready_fit_slots": 0,
+            "queue_state": "open",
+            "queue_reason": "",
+            "project_active": 297,
+            "project_submission_slots": 3,
+            "submission_allowed": True,
+        }
+        journal = {"events": []}
+
+        with mock.patch.object(
+                feeder.scheduler_client,
+                "campaign_mutation_lock_is_held",
+                return_value=True,
+        ), mock.patch.object(feeder, "load_state", return_value=state), mock.patch.object(
+            feeder,
+            "scheduler_snapshot",
+            return_value=(campaign_counts, campaign_counts, [], capacity),
+        ), mock.patch.object(
+            feeder, "dataset_collection_snapshot", return_value=(10, set())
+        ), mock.patch.object(feeder, "campaign_inventory", return_value=[]), mock.patch.object(
+            feeder, "reserved_unjudged_rows", return_value=0
+        ), mock.patch.object(
+            feeder, "cpu_submission_headroom", return_value=(0, 0, 0, 297)
+        ), mock.patch.object(
+            feeder, "submit", side_effect=[601, 602, 603]
+        ), mock.patch.object(feeder, "save_state") as save_state, mock.patch.object(
+            feeder.time, "sleep"
+        ):
+            result = feeder._step_from_adopted_controller(
+                12_000,
+                authorization=auth,
+                target=300,
+                buffer=0,
+                solver_revision=SOLVER,
+                library_revision=LIBRARY,
+                candidate_seed=260710,
+                adoption_sha256=ADOPTION,
+                initial_count=0,
+                evidence_mode="concurrent300_v1",
+                strict_rows=25,
+                target_strict_rows=3_000,
+                journal=journal,
+                **RESOURCES,
+            )
+
+        self.assertTrue(result)
+        save_state.assert_called_once()
+        self.assertTrue(journal["batch_commit"])
+        self.assertEqual(journal["planned_count"], 3)
+        self.assertEqual(journal["submitted_count"], 3)
+        self.assertEqual([row["task_id"] for row in journal["events"]], [601, 602, 603])
+        self.assertTrue(all(row["ledger_committed"] for row in journal["events"]))
+
     def test_partial_submission_records_committed_and_failed_events(self):
         auth = authorize()
         generation = f"{SOLVER}:{LIBRARY}:seed260710"

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,6 +16,21 @@ sys.path.insert(0, str(CAMPAIGN_DIR))
 import collect_wave  # noqa: E402
 import feeder  # noqa: E402
 import pinned_pilot  # noqa: E402
+
+
+class DirectEntrypointTests(unittest.TestCase):
+    def test_collect_wave_help_runs_from_regression_root(self):
+        regression_root = CAMPAIGN_DIR.parent
+        result = subprocess.run(
+            [sys.executable, str(CAMPAIGN_DIR / "collect_wave.py"), "--help"],
+            cwd=regression_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--prefix", result.stdout)
 
 
 class FakeResponse:
@@ -107,6 +123,34 @@ class FeederTests(unittest.TestCase):
 
         self.assertEqual(reserved, 10)  # legacy 8 + completed 1 + ledger-only 1
 
+    def test_dataset_snapshot_recovers_valid_collector_staging_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            train = Path(directory) / "train.parquet"
+            cache = Path(directory) / "collect_cache.json"
+            pd.DataFrame([{"value": 1}]).to_parquet(train, index=False)
+            Path(str(cache) + ".tmp.tmp").write_text(json.dumps({
+                "harvested": [7], "nodata": [8], "local_parts": [],
+            }), encoding="utf-8")
+
+            with mock.patch.object(feeder, "TRAIN_PARQUET", str(train)), \
+                    mock.patch.object(feeder, "COLLECT_CACHE", str(cache)):
+                rows, judged = feeder.dataset_collection_snapshot()
+
+        self.assertEqual(rows, 1)
+        self.assertEqual(judged, {7, 8})
+
+    def test_dataset_snapshot_fails_closed_when_existing_cache_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            train = Path(directory) / "train.parquet"
+            cache = Path(directory) / "collect_cache.json"
+            pd.DataFrame([{"value": 1}]).to_parquet(train, index=False)
+
+            with mock.patch.object(feeder, "TRAIN_PARQUET", str(train)), \
+                    mock.patch.object(feeder, "COLLECT_CACHE", str(cache)):
+                with self.assertRaisesRegex(
+                        feeder.SchedulerError, "canonical cache is missing"):
+                    feeder.dataset_collection_snapshot()
+
     def test_pinned_pilot_capacity_counts_global_tasks_and_warm_cpus(self):
         statuses = {"queued": 8, "attaching": 1, "running": 142}
         allocations = [
@@ -175,8 +219,7 @@ class FeederTests(unittest.TestCase):
         self.assertEqual(snapshot["project_active"], 50)
         self.assertEqual(snapshot["project_stage_open_slots"], 0)
         self.assertEqual(snapshot["project_submission_slots"], 0)
-        with self.assertRaisesRegex(RuntimeError, "must be exactly 300"):
-            pinned_pilot.project_submission_snapshot(
+        reduced = pinned_pilot.project_submission_snapshot(
                 projects=[{
                     "name": pinned_pilot.MFT_PROJECT,
                     "max_active_tasks": 100,
@@ -185,6 +228,8 @@ class FeederTests(unittest.TestCase):
                 project_tasks=[],
                 required_hard_cap=300,
             )
+        self.assertEqual(reduced["project_max_active_tasks"], 100)
+        self.assertEqual(reduced["project_submission_slots"], 100)
         with self.assertRaisesRegex(RuntimeError, "missing or ambiguous"):
             pinned_pilot.project_submission_snapshot(
                 projects=[], project_tasks=[], required_hard_cap=10)
@@ -448,7 +493,11 @@ class FeederTests(unittest.TestCase):
                 1000, target=2, buffer=1,
                 solver_revision="a" * 40, library_revision="b" * 40)
         self.assertEqual(submit_mock.call_count, 1)
-        scheduler_snapshot.assert_called_once_with(3)
+        scheduler_snapshot.assert_called_once_with(
+            3,
+            require_exact_project_cap=False,
+            require_full_project=False,
+        )
 
     def test_opening_queue_submits_mft_deficit_to_trigger_scale_out(self):
         state = {"serial": 0, "submitted_samples": 0}
@@ -772,6 +821,11 @@ class CollectorDatasetTests(unittest.TestCase):
         ]
         for patcher in self.patches:
             patcher.start()
+        # An existing dataset and its collector cache are one durable unit in
+        # production.  Tests that intentionally exercise first-run/missing-
+        # cache recovery remove this fixture explicitly below.
+        Path(collect_wave.CACHE_PATH).write_text(
+            json.dumps(collect_wave._empty_cache()), encoding="utf-8")
 
     def tearDown(self):
         for patcher in reversed(self.patches):
@@ -783,6 +837,35 @@ class CollectorDatasetTests(unittest.TestCase):
 
     def read_source_ranks(self):
         return pd.read_parquet(self.source_rank_path)
+
+    def test_cache_save_uses_verified_direct_fallback_when_replace_is_denied(self):
+        cache = {"harvested": [7], "nodata": [8], "local_parts": ["part.parquet"]}
+        denied = PermissionError(5, "RaiDrive rename denied")
+        with mock.patch.object(
+                collect_wave.os, "replace", side_effect=denied) as replace, \
+                mock.patch.object(collect_wave.time, "sleep"):
+            collect_wave._save_cache(cache)
+
+        self.assertEqual(replace.call_count, collect_wave.CACHE_WRITE_ATTEMPTS)
+        self.assertEqual(collect_wave._load_cache(), cache)
+        self.assertEqual(
+            list(Path(self.dataset_dir).glob(".collect_cache.json.*.tmp")), [])
+
+    def test_load_cache_recovers_valid_legacy_staging_file(self):
+        Path(collect_wave.CACHE_PATH).unlink()
+        recovery = Path(collect_wave.CACHE_PATH + ".tmp.tmp")
+        expected = {"harvested": [7], "nodata": [8], "local_parts": []}
+        recovery.write_text(json.dumps(expected), encoding="utf-8")
+        (Path(self.dataset_dir) / "train.parquet").write_bytes(b"existing")
+
+        self.assertEqual(collect_wave._load_cache(), expected)
+
+    def test_load_cache_fails_closed_when_existing_dataset_has_no_cache(self):
+        Path(collect_wave.CACHE_PATH).unlink()
+        (Path(self.dataset_dir) / "train.parquet").write_bytes(b"existing")
+
+        with self.assertRaisesRegex(RuntimeError, "canonical missing"):
+            collect_wave._load_cache()
 
     def test_cancelled_task_partial_result_is_harvested(self):
         tasks = [{
@@ -816,6 +899,20 @@ class CollectorDatasetTests(unittest.TestCase):
         fetch_stdout.assert_not_called()
         cache = json.loads(Path(collect_wave.CACHE_PATH).read_text(encoding="utf-8"))
         self.assertEqual(cache["nodata"], [78])
+
+    def test_running_fetch_limit_zero_leaves_remote_stdout_for_terminal_pass(self):
+        tasks = [{
+            "id": 79, "name": "mft-camp-srev-lrev-79", "status": "running",
+            "started_at": "2026-07-12T01:00:00Z",
+        }]
+        with mock.patch.object(
+                collect_wave, "list_tasks", return_value=tasks), mock.patch.object(
+                    collect_wave, "fetch_stdout") as fetch_stdout:
+            result = collect_wave.main([
+                "--prefix", "mft-camp", "--running-fetch-limit", "0"])
+
+        self.assertEqual(result["new_unique_rows"], 0)
+        fetch_stdout.assert_not_called()
 
     def test_source_rank_sidecar_is_strict_and_replay_recoverable(self):
         master = pd.DataFrame([
@@ -1108,6 +1205,9 @@ class CollectorDatasetTests(unittest.TestCase):
         pd.DataFrame(
             [{"project_name": "p1", "saved_at": "t1", "value": 2.0}]
         ).to_parquet(part, index=False)
+        Path(collect_wave.CACHE_PATH).write_text(json.dumps({
+            "harvested": [], "nodata": [], "local_parts": [],
+        }), encoding="utf-8")
         original_replace = collect_wave.os.replace
 
         def fail_rank_replace(source, target):
@@ -1126,7 +1226,9 @@ class CollectorDatasetTests(unittest.TestCase):
             self.read_source_ranks().loc[0, collect_wave.SOURCE_RANK_COLUMN],
             collect_wave.SOURCE_RANK_LOCAL_CSV,
         )
-        self.assertFalse(Path(collect_wave.CACHE_PATH).exists())
+        interrupted_cache = json.loads(
+            Path(collect_wave.CACHE_PATH).read_text(encoding="utf-8"))
+        self.assertEqual(interrupted_cache["local_parts"], [])
 
         with mock.patch.object(collect_wave, "list_tasks", return_value=[]):
             result = collect_wave.main(["--prefix", "mft-camp"])

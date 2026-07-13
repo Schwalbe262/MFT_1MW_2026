@@ -478,9 +478,12 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
                 "candidate-mpi", "candidate_workdir", {"x": 1}, {},
                 solver_revision=TEST_REVISION,
                 library_revision=TEST_LIBRARY_REVISION,
+                priority=10,
             )
 
-        command = post.call_args.kwargs["json"]["command"]
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["priority"], 10)
+        command = payload["command"]
         hydra_export = "export I_MPI_HYDRA_BOOTSTRAP=fork;"
         fluent_export = "export FLUENT_MPIRUN_FLAGS='-bootstrap fork';"
         self.assertEqual(command.count(hydra_export), 1)

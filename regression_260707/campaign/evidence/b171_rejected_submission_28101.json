@@ -1,0 +1,29 @@
+{
+  "schema": "b171-rejected-submission-evidence-v1",
+  "source": {
+    "kind": "sealed_controller_cancellation_artifact",
+    "original_relative_path": "pilot_manifests/continuous-refill-sb171c7c-le6b9b9d/cycle-000001-cancellation.json",
+    "cancellation_sha256": "ef28db0da228478b79a6919cec6deadc456f425012559ebe89e2169776fa0ecd"
+  },
+  "reviewed_contract": {
+    "cycle_serial": 1,
+    "task_id": 28101,
+    "name": "mft-camp-sb171c7c-le6b9b9d-17612",
+    "project": "MFT_1MW_2026v1",
+    "actual_dedupe_key": "mft-al:mft-camp-sb171c7c-le6b9b9d-17612:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:ae6d03b35d7cfefc",
+    "expected_plan_dedupe_key": "mft-al:mft-camp-sb171c7c-le6b9b9d-17612:b171c7ce5f7a018be6a575a32b1a1f5b7caa980c:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:6f2e0101a9a8878c",
+    "status_before": "queued",
+    "status_after": "cancelled",
+    "attached_at_before": null,
+    "started_at_before": null,
+    "acknowledgement": {
+      "cancelled": [28101],
+      "count": 1
+    }
+  },
+  "provenance": {
+    "source_bytes_republished": false,
+    "review_scope": "exact rejected identity, dedupe mismatch, queued-to-cancelled transition and never-started scheduler acknowledgement"
+  },
+  "evidence_sha256": "739a7fa81ccd4d5a145cf06d0c095c4d51f4eee3846860a1faa6f176a75c2bd4"
+}

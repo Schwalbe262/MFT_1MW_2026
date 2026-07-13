@@ -1,0 +1,65 @@
+{
+  "asol_exists": true,
+  "asol_has_last_adaptive": true,
+  "asol_sha256": "cce569d9360f334635912c020852c405dd8bf6e5692a9e5090974ab2f9d78994",
+  "available_quantities_sample": [
+    "Volume(B_conductor_00)",
+    "Volume(B_conductor_01)",
+    "Volume(B_conductor_02)",
+    "Volume(B_conductor_03)",
+    "Volume(B_conductor_04)",
+    "Volume(B_conductor_05)",
+    "Volume(B_conductor_06)",
+    "Volume(B_conductor_07)",
+    "Volume(B_conductor_08)",
+    "Volume(B_conductor_09)",
+    "Volume(B_conductor_10)",
+    "Volume(B_conductor_11)"
+  ],
+  "available_quantity_count": 12,
+  "clone_project": "/gpfs/home1/harry261/slurm_scheduler/experiments/aedt12reopen-20260713T034304/reopen-artifact-732554/clone/pilot_B.aedt",
+  "convergence_call_result": "/gpfs/home1/harry261/slurm_scheduler/experiments/aedt12reopen-20260713T034304/reopen-artifact-732554/B_convergence_fresh.prop",
+  "convergence_exists": true,
+  "convergence_size": 337,
+  "design": "DesignB",
+  "desktop_pid": 1293384,
+  "existing_analysis_sweeps": [
+    "Setup1 : LastAdaptive"
+  ],
+  "fresh_reopen_pass": true,
+  "grpc_port": 51435,
+  "host": "n040.hpc",
+  "identity_intact": true,
+  "native_solutions": [],
+  "nominal_adaptive": "Setup1 : LastAdaptive",
+  "objects": [
+    "B_conductor_00",
+    "B_conductor_01",
+    "B_conductor_02",
+    "B_conductor_03",
+    "B_conductor_04",
+    "B_conductor_05",
+    "B_conductor_06",
+    "B_conductor_07",
+    "B_conductor_08",
+    "B_conductor_09",
+    "B_conductor_10",
+    "B_conductor_11"
+  ],
+  "priority_intent": "high_over_production",
+  "project": "pilot_B",
+  "project_list": [
+    "pilot_B"
+  ],
+  "pyaedt": "0.22.0",
+  "quantity_solution": "Setup1 : LastAdaptive",
+  "schema": 1,
+  "setups": [
+    "Setup1"
+  ],
+  "slurm_job_id": "732554",
+  "solution_index_intact": true,
+  "source_project": "/gpfs/home1/harry261/slurm_scheduler/experiments/aedt12iso-20260713T033349/artifact-732549/projects/pilot_B.aedt",
+  "source_project_sha256": "44d0d61605e01d49f88fbe9fb73a6165c4d6e0be6eb3c26a12d554b13b8d8e4d",
+  "source_results_exists": true
+}

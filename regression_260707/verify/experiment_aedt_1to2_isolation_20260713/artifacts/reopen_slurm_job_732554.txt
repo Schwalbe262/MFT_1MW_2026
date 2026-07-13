@@ -1,0 +1,33 @@
+JobId=732554 JobName=aedt12reopen
+   UserId=harry261(1468) GroupId=users(100) MCS_label=N/A
+   Priority=4294210729 Nice=0 Account=uos QOS=node10_cpu640
+   JobState=RUNNING Reason=None Dependency=(null)
+   Requeue=0 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=0:0
+   DerivedExitCode=0:0
+   RunTime=00:00:01 TimeLimit=00:10:00 TimeMin=N/A
+   SubmitTime=2026-07-13T03:43:36 EligibleTime=2026-07-13T03:43:36
+   AccrueTime=2026-07-13T03:43:36
+   StartTime=2026-07-13T03:43:55 EndTime=2026-07-13T03:53:55 Deadline=N/A
+   SuspendTime=None SecsPreSuspend=0 LastSchedEval=2026-07-13T03:43:55 Scheduler=Backfill
+   Partition=cpu1 AllocNode:Sid=gate2:3383646
+   ReqNodeList=(null) ExcNodeList=(null)
+   NodeList=n040
+   BatchHost=n040
+   NumNodes=1 NumCPUs=2 NumTasks=1 CPUs/Task=2 ReqB:S:C:T=0:0:*:*
+   ReqTRES=cpu=2,mem=8G,node=1,billing=2
+   AllocTRES=cpu=2,node=1,billing=2
+   Socks/Node=* NtasksPerN:B:S:C=0:0:*:* CoreSpec=*
+   JOB_GRES=(null)
+     Nodes=n040 CPU_IDs=16-17 Mem=0 GRES=
+   MinCPUsNode=2 MinMemoryNode=8G MinTmpDiskNode=0
+   Features=(null) DelayBoot=00:00:00
+   OverSubscribe=OK Contiguous=0 Licenses=(null) Network=(null)
+   Command=/gpfs/home1/harry261/slurm_scheduler/experiments/aedt12reopen-20260713T034304/run_reopen.sbatch
+   WorkDir=/gpfs/home1/harry261/slurm_scheduler/experiments/aedt12reopen-20260713T034304
+   StdErr=/gpfs/home1/harry261/slurm_scheduler/experiments/aedt12reopen-20260713T034304/slurm-732554.err
+   StdIn=/dev/null
+   StdOut=/gpfs/home1/harry261/slurm_scheduler/experiments/aedt12reopen-20260713T034304/slurm-732554.out
+   Power=
+   TresPerTask=cpu:2
+   
+

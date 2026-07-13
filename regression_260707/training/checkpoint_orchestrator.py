@@ -23,6 +23,11 @@ import tempfile
 from filelock import FileLock
 import pandas as pd
 
+try:
+    from .checkpoint_contract import checkpoint_contract_identity
+except ImportError:  # Direct script execution from the training directory.
+    from checkpoint_contract import checkpoint_contract_identity
+
 
 HERE = Path(__file__).resolve().parent
 REGRESSION_ROOT = HERE.parent
@@ -88,14 +93,43 @@ def due_with_backoff(
 def _atomic_json(value, path):
     path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    serialized = json.dumps(value, indent=1, default=str)
+    generation = None
+    if os.path.basename(path) == "strict_data_status.json":
+        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        generation_fd, generation = tempfile.mkstemp(
+            prefix=f"{os.path.basename(path)}.gen-",
+            suffix=f"-{digest}.json",
+            dir=os.path.dirname(path),
+        )
+        with os.fdopen(generation_fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
     fd, staged = tempfile.mkstemp(
         prefix=f".{os.path.basename(path)}.", suffix=".tmp",
         dir=os.path.dirname(path),
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=1, default=str)
-        os.replace(staged, path)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.replace(staged, path)
+        except PermissionError:
+            if generation is None:
+                raise
+            # RaiDrive can reject same-directory replacement while allowing a
+            # direct canonical repair. The immutable generation remains the
+            # authoritative complete JSON if this convenience copy is denied.
+            try:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(serialized)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError:
+                pass
     finally:
         if os.path.exists(staged):
             os.remove(staged)
@@ -442,6 +476,7 @@ def training_commands(
     """Build child commands with one already-normalized absolute profile path."""
     if not profile or not os.path.isabs(profile):
         raise ValueError("checkpoint profile must be an absolute path")
+    parity_result = os.path.splitext(metrics_result)[0] + ".parity.json"
     commands = [[
             sys.executable,
             str(HERE / "checkpoint_train.py"),
@@ -450,6 +485,7 @@ def training_commands(
             "--profile", profile,
             "--checkpoint", str(threshold),
             "--result-json", metrics_result,
+            "--parity-json", parity_result,
         ]]
     if candidate_result:
         commands.append([
@@ -527,6 +563,13 @@ def main():
     parser.add_argument("--min-rows", type=int, default=200)
     parser.add_argument("--solver-revision", default=None)
     parser.add_argument("--library-revision", default=None)
+    parser.add_argument(
+        "--expected-contract-key", default=None,
+        help=(
+            "content key selected by an automatic launcher; rejects a file "
+            "change between run-root selection and orchestration"
+        ),
+    )
     parser.add_argument("--retry-min-new-rows", type=int, default=250)
     parser.add_argument("--retry-backoff-seconds", type=int, default=3600)
     parser.add_argument("--max-checkpoints-per-run", type=int, default=1)
@@ -548,6 +591,12 @@ def main():
         args.library_revision = args.library_revision.lower()
     if args.retry_min_new_rows < 0 or args.retry_backoff_seconds < 0:
         parser.error("checkpoint retry limits must be non-negative")
+    if args.expected_contract_key and not re.fullmatch(
+        r"[0-9a-fA-F]{16}", args.expected_contract_key
+    ):
+        parser.error("expected contract key must be 16 hexadecimal characters")
+    if args.expected_contract_key:
+        args.expected_contract_key = args.expected_contract_key.lower()
 
     runtime_root = os.path.abspath(args.runtime_root)
     dataset = os.path.abspath(
@@ -564,16 +613,26 @@ def main():
     args.profile = os.path.abspath(args.profile or DEFAULT_PROFILE_PATH)
     args.thresholds = os.path.abspath(args.thresholds)
     profile_data = load_profile(args.profile)
-    profile_sha256 = hashlib.sha256(
-        json.dumps(profile_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    contract_identity = checkpoint_contract_identity(
+        args.profile,
+        args.thresholds,
+        os.path.join(REGRESSION_ROOT, "quality_contract.py"),
+        os.path.join(REGRESSION_ROOT, "model_targets.py"),
+    )
+    profile_sha256 = contract_identity["profile_sha256"]
     with open(args.thresholds, encoding="utf-8") as handle:
         thresholds = json.load(handle)
-    thresholds_sha256 = hashlib.sha256(
-        json.dumps(thresholds, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
+    thresholds_sha256 = contract_identity["thresholds_sha256"]
+    if (
+        args.expected_contract_key
+        and contract_identity["checkpoint_contract_key"]
+        != args.expected_contract_key
+    ):
+        raise RuntimeError(
+            "checkpoint contract changed after run-root selection: "
+            f"expected={args.expected_contract_key}, "
+            f"actual={contract_identity['checkpoint_contract_key']}"
         )
-    ).hexdigest()
     identity = {
         "dataset": dataset,
         "profile_path": args.profile,
@@ -583,9 +642,19 @@ def main():
         "activation_minimum_strict_full_rows": int(
             thresholds["minimum_strict_full_rows"]
         ),
-        "quality_contract_sha256": _sha256(
-            os.path.join(REGRESSION_ROOT, "quality_contract.py")
-        ),
+        "quality_contract_sha256": contract_identity[
+            "quality_contract_sha256"
+        ],
+        "model_targets_sha256": contract_identity["model_targets_sha256"],
+        "checkpoint_contract_schema_version": contract_identity[
+            "schema_version"
+        ],
+        "checkpoint_contract_sha256": contract_identity[
+            "checkpoint_contract_sha256"
+        ],
+        "checkpoint_contract_key": contract_identity[
+            "checkpoint_contract_key"
+        ],
         "registry_protocol_version": REGISTRY_PROTOCOL_VERSION,
         "solver_revision": args.solver_revision,
         "library_revision": args.library_revision,
@@ -659,6 +728,19 @@ def main():
             raise RuntimeError("quality profile changed during checkpoint inspection")
         if locked_thresholds_sha256 != thresholds_sha256:
             raise RuntimeError("quality thresholds changed during checkpoint inspection")
+        locked_contract_identity = checkpoint_contract_identity(
+            args.profile,
+            args.thresholds,
+            os.path.join(REGRESSION_ROOT, "quality_contract.py"),
+            os.path.join(REGRESSION_ROOT, "model_targets.py"),
+        )
+        if (
+            locked_contract_identity["checkpoint_contract_sha256"]
+            != contract_identity["checkpoint_contract_sha256"]
+        ):
+            raise RuntimeError(
+                "checkpoint contract changed during checkpoint inspection"
+            )
         raw, audited, strict, quarantine = inspect_dataset(
             dataset, args.profile, args.solver_revision, args.library_revision
         )

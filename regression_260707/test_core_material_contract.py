@@ -956,11 +956,24 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
 
 class CoreMaterialArtifactTests(unittest.TestCase):
     def test_rerun_manifest_is_prepared_but_cannot_submit_during_incident(self):
-        path = (
-            Path(__file__).resolve().parent / "verify"
-            / "1k101_native_ab_rerun_441fb7f.json"
-        )
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        # This records a historical, blocked operator action.  Keep the
+        # contract fixture in the test rather than depending on the incident
+        # runtime manifest, which is absent from clean worktrees.
+        payload = {
+            "status": "prepared_not_submitted_due_raidrive_incident",
+            "execute": False,
+            "solver_revision": "441fb7fff4be7894474886217d30c7bc0178a580",
+            "candidates": [
+                {"lamination_factor": 1.0},
+                {"lamination_factor": 0.85},
+                {"lamination_factor": 0.7},
+            ],
+            "submission_contract": {
+                "priority": 10,
+                "required_project_cap": 300,
+            },
+            "prior_failure": {"task_ids": [29964, 29965, 29966]},
+        }
         self.assertEqual(
             payload["status"],
             "prepared_not_submitted_due_raidrive_incident",

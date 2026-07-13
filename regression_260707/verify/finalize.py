@@ -21,6 +21,10 @@ for path in (str(REGRESSION_ROOT), str(REPO_ROOT)):
         sys.path.insert(0, path)
 
 from module.input_parameter_260706 import ALL_INPUT_KEYS, KEYS  # noqa: E402
+from model_targets import (  # noqa: E402
+    SURROGATE_TEMPERATURE_TARGETS,
+    SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+)
 from optimization.geometry_metrics import bounding_box_lit  # noqa: E402
 from quality_contract import validate_record  # noqa: E402
 
@@ -47,9 +51,9 @@ QUALITY_THRESHOLDS_PATH = REGRESSION_ROOT / "training" / "model_quality_threshol
 REQUIRED_OPTIMIZATION_MODELS = frozenset({
     "Llt_phys", "k",
     "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
-    "B_max_core", "B_mean_core",
-    "Tprobe_Tx_leeward_max", "Tprobe_Rx_main_leeward_max",
-    "Tprobe_Rx_side_leeward_max", "Tprobe_core_center_max",
+    *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    "B_mean_core",
+    *SURROGATE_TEMPERATURE_TARGETS,
 })
 ALLOWED_CANDIDATE_INPUT_SCHEMAS = frozenset({
     # Legacy AL fronts carry the sealed design identity only.  Current fixed
@@ -185,10 +189,23 @@ def physical_spec_reasons(result, candidate=None):
             reasons.append(f"temperature_out_of_spec:{column}")
     for column in (
         "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
+        *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
     ):
         value = result.get(column)
         if not _finite(value) or float(value) < 0:
             reasons.append(f"invalid_loss:{column}")
+    if all(_finite(result.get(column)) for column in (
+        "P_winding_total", *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+    )) and not math.isclose(
+        float(result["P_winding_total"]),
+        sum(
+            float(result[column])
+            for column in SURROGATE_WINDING_COMPONENT_LOSS_TARGETS
+        ),
+        rel_tol=1e-9,
+        abs_tol=1e-6,
+    ):
+        reasons.append("winding_loss_component_sum_mismatch")
     columns = list(INSULATION_COLUMNS)
     n1_side = result.get("N1_side")
     if not _finite(n1_side):

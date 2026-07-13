@@ -1,0 +1,179 @@
+{
+  "B_project_sha256": "44d0d61605e01d49f88fbe9fb73a6165c4d6e0be6eb3c26a12d554b13b8d8e4d",
+  "activation_allowed": false,
+  "baseline_license": {
+    "elec_solve_maxwell": {
+      "global_in_use": 152,
+      "issued": 550,
+      "local_checkout_count": 0,
+      "local_lines": [],
+      "local_pids": []
+    },
+    "electronics3d_gui": {
+      "global_in_use": 503,
+      "issued": 550,
+      "local_checkout_count": 0,
+      "local_lines": [],
+      "local_pids": []
+    },
+    "electronics_desktop": {
+      "global_in_use": 502,
+      "issued": 550,
+      "local_checkout_count": 0,
+      "local_lines": [],
+      "local_pids": []
+    }
+  },
+  "checks": {
+    "A_solver_left_after_sigterm": true,
+    "B_convergence_exported": false,
+    "B_identity_intact": false,
+    "B_project_valid": true,
+    "B_solver_survived_after_sigterm": true,
+    "desktop_checkout_exactly_one_during_overlap": true,
+    "exact_sigterm_mapping": true,
+    "grpc_after_completion": true,
+    "grpc_after_local_failure": true,
+    "grpc_after_sigterm": true,
+    "grpc_during_overlap": true,
+    "project_local_failure_observed": true,
+    "same_desktop": true,
+    "sigterm_sent": true,
+    "solver_checkouts_at_least_two_during_overlap": true,
+    "two_projects": true,
+    "two_solver_processes_during_overlap": true
+  },
+  "convergence_A": {
+    "call_result": "False",
+    "exists": false,
+    "size": 0
+  },
+  "convergence_B": {
+    "call_result": "False",
+    "exists": false,
+    "size": 0
+  },
+  "desktop_pid": 1278977,
+  "fault_target_pid": 1279633,
+  "final_license_before_close": {
+    "elec_solve_maxwell": {
+      "global_in_use": 142,
+      "issued": 550,
+      "local_checkout_count": 0,
+      "local_lines": [],
+      "local_pids": []
+    },
+    "electronics3d_gui": {
+      "global_in_use": 497,
+      "issued": 550,
+      "local_checkout_count": 1,
+      "local_lines": [
+        "    harry261 nib040.hpc n040.hpc 1278977 (v2025.0506) (172.16.10.81/1055 178140), start Mon 7/13 3:35"
+      ],
+      "local_pids": [
+        1278977
+      ]
+    },
+    "electronics_desktop": {
+      "global_in_use": 496,
+      "issued": 550,
+      "local_checkout_count": 1,
+      "local_lines": [
+        "    harry261 nib040.hpc n040.hpc 1278977 (v2025.0506) (172.16.10.81/1055 132928), start Mon 7/13 3:35"
+      ],
+      "local_pids": [
+        1278977
+      ]
+    }
+  },
+  "grpc_port": 34197,
+  "identity_A_after": {
+    "error": "GrpcApiError: Failed to execute gRPC AEDT command: GetSetups",
+    "ok": false
+  },
+  "identity_A_before": {
+    "design": "DesignA",
+    "objects": [
+      "A_conductor_00",
+      "A_conductor_01",
+      "A_conductor_02",
+      "A_conductor_03",
+      "A_conductor_04",
+      "A_conductor_05",
+      "A_conductor_06",
+      "A_conductor_07",
+      "A_conductor_08",
+      "A_conductor_09",
+      "A_conductor_10",
+      "A_conductor_11"
+    ],
+    "project": "pilot_A",
+    "setups": [
+      "Setup1"
+    ]
+  },
+  "identity_B_after": {
+    "error": "GrpcApiError: Failed to execute gRPC AEDT command: GetSetups",
+    "ok": false
+  },
+  "identity_B_before": {
+    "design": "DesignB",
+    "objects": [
+      "B_conductor_00",
+      "B_conductor_01",
+      "B_conductor_02",
+      "B_conductor_03",
+      "B_conductor_04",
+      "B_conductor_05",
+      "B_conductor_06",
+      "B_conductor_07",
+      "B_conductor_08",
+      "B_conductor_09",
+      "B_conductor_10",
+      "B_conductor_11"
+    ],
+    "project": "pilot_B",
+    "setups": [
+      "Setup1"
+    ]
+  },
+  "overlap_license": {
+    "elec_solve_maxwell": {
+      "global_in_use": 151,
+      "issued": 550,
+      "local_checkout_count": 2,
+      "local_lines": [
+        "    harry261 nib040.hpc n040.hpc 1279633 (v2025.0506) (172.16.10.81/1055 67212), start Mon 7/13 3:35",
+        "    harry261 nib040.hpc n040.hpc 1279899 (v2025.0506) (172.16.10.81/1055 133790), start Mon 7/13 3:35"
+      ],
+      "local_pids": [
+        1279633,
+        1279899
+      ]
+    },
+    "electronics3d_gui": {
+      "global_in_use": 503,
+      "issued": 550,
+      "local_checkout_count": 1,
+      "local_lines": [
+        "    harry261 nib040.hpc n040.hpc 1278977 (v2025.0506) (172.16.10.81/1055 178140), start Mon 7/13 3:35"
+      ],
+      "local_pids": [
+        1278977
+      ]
+    },
+    "electronics_desktop": {
+      "global_in_use": 502,
+      "issued": 550,
+      "local_checkout_count": 1,
+      "local_lines": [
+        "    harry261 nib040.hpc n040.hpc 1278977 (v2025.0506) (172.16.10.81/1055 132928), start Mon 7/13 3:35"
+      ],
+      "local_pids": [
+        1278977
+      ]
+    }
+  },
+  "quarantine_policy": "On any ambiguous mapping or shared-failure evidence: stop attaching new work, mark the Desktop quarantined, let or stop only after the healthy sibling is terminal, drain the allocation, and requeue unfinished work onto a fresh one-project Desktop.",
+  "schema": 1
+}

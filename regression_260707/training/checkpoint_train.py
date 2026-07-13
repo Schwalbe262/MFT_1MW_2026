@@ -22,10 +22,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REGRESSION_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 if REGRESSION_ROOT not in sys.path:
     sys.path.insert(0, REGRESSION_ROOT)
+from model_targets import (
+    SURROGATE_TEMPERATURE_TARGETS,
+    SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+)
+
 DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 CURVE_CSV = os.path.join(HERE, "learning_curve.csv")
 MAX_TRUSTED_TEMPERATURE_C = 4700.0
 MIN_TRUSTED_TEMPERATURE_C = -273.15
+PARITY_SCHEMA_VERSION = 1
+PARITY_MAX_PAIRS_PER_TARGET = 2_000
 LEGACY_PHYSICS_DATA_REVISION = "legacy_unspecified"
 MAPE_ZERO_ABS_TOLERANCE = 1e-9
 
@@ -58,15 +65,19 @@ TARGETS = {
     "Llt_phys": {"transform": "log", "metric_focus": "mape"},
     "k": {"transform": None, "metric_focus": "rmse"},
     "P_winding_total": {"transform": "log1p", "metric_focus": "mape"},
+    **{
+        target: {"transform": "log1p", "metric_focus": "mape"}
+        for target in SURROGATE_WINDING_COMPONENT_LOSS_TARGETS
+    },
     "P_core_total": {"transform": "log1p", "metric_focus": "mape"},
     "P_core_plate_total": {"transform": "log1p", "metric_focus": "mape"},
     "P_wcp_total": {"transform": "log1p", "metric_focus": "mape"},
     "B_max_core": {"transform": None, "metric_focus": "rmse"},
     "B_mean_core": {"transform": None, "metric_focus": "rmse"},
-    "Tprobe_Tx_leeward_max": {"transform": "t50", "metric_focus": "rmse"},
-    "Tprobe_Rx_main_leeward_max": {"transform": "t50", "metric_focus": "rmse"},
-    "Tprobe_Rx_side_leeward_max": {"transform": "t50", "metric_focus": "rmse"},
-    "Tprobe_core_center_max": {"transform": "t50", "metric_focus": "rmse"},
+    **{
+        target: {"transform": "t50", "metric_focus": "rmse"}
+        for target in SURROGATE_TEMPERATURE_TARGETS
+    },
 }
 
 # 특징량: 입력 파라미터 + 파생 물리량 (결과/메타 컬럼 제외)
@@ -200,7 +211,7 @@ def relative_error_summary(
     }
 
 
-def cv_metrics(X, y, kind, n_splits=5, seed=42):
+def cv_metrics(X, y, kind, n_splits=5, seed=42, return_yhat=False):
     import lightgbm as lgb
     from sklearn.model_selection import KFold
 
@@ -218,10 +229,66 @@ def cv_metrics(X, y, kind, n_splits=5, seed=42):
     err = yhat - y
     ss_res = float(np.sum(err ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2)) or 1e-12
-    return {
+    metrics = {
         "r2": 1 - ss_res / ss_tot,
         "rmse": float(np.sqrt(np.mean(err ** 2))),
         **relative_error_summary(y, err),
+    }
+    if return_yhat:
+        return metrics, yhat
+    return metrics
+
+
+def _evenly_spaced_positions(length, limit=PARITY_MAX_PAIRS_PER_TARGET):
+    """Return deterministic positions, retaining both endpoints when sampled."""
+    length = int(length)
+    limit = int(limit)
+    if length <= 0 or limit <= 0:
+        return []
+    if length <= limit:
+        return list(range(length))
+    if limit == 1:
+        return [0]
+    return [
+        index * (length - 1) // (limit - 1)
+        for index in range(limit)
+    ]
+
+
+def _json_index(value):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _parity_target(y, yhat, row_index, limit=PARITY_MAX_PAIRS_PER_TARGET):
+    actual = np.asarray(y, dtype=float).reshape(-1)
+    predicted = np.asarray(yhat, dtype=float).reshape(-1)
+    indexes = list(row_index)
+    if len(actual) != len(predicted) or len(actual) != len(indexes):
+        raise ValueError("parity actual, predicted, and row-index lengths differ")
+    if not np.isfinite(actual).all() or not np.isfinite(predicted).all():
+        raise ValueError("parity values must all be finite")
+    positions = _evenly_spaced_positions(len(actual), limit=limit)
+    method = "all" if len(actual) <= int(limit) else "evenly_spaced_position"
+    return {
+        "n": len(actual),
+        "sample_count": len(positions),
+        "sampling": {
+            "method": method,
+            "limit": int(limit),
+        },
+        "pairs": [
+            {
+                "row_position": int(position),
+                "row_index": _json_index(indexes[position]),
+                "actual": float(actual[position]),
+                "predicted": float(predicted[position]),
+            }
+            for position in positions
+        ],
     }
 
 
@@ -231,6 +298,8 @@ def main():
     ap.add_argument("--curve-csv", default=CURVE_CSV)
     ap.add_argument("--profile", default=None)
     ap.add_argument("--result-json", default=None)
+    ap.add_argument("--parity-json", default=None)
+    ap.add_argument("--skip-curve-append", action="store_true")
     ap.add_argument("--checkpoint", type=int, default=None)
     args = ap.parse_args()
 
@@ -242,8 +311,11 @@ def main():
     args.result_json = (
         os.path.abspath(args.result_json) if args.result_json else None
     )
-    if args.result_json and args.checkpoint is None:
-        ap.error("--checkpoint is required with --result-json")
+    args.parity_json = (
+        os.path.abspath(args.parity_json) if args.parity_json else None
+    )
+    if (args.result_json or args.parity_json) and args.checkpoint is None:
+        ap.error("--checkpoint is required with --result-json or --parity-json")
     profile_data = load_profile(args.profile)
     profile_sha256 = hashlib.sha256(
         json.dumps(
@@ -262,6 +334,7 @@ def main():
         raise SystemExit("no design-time training features remain after strict filtering")
 
     rows = []
+    parity_targets = {}
     target_revision_cohorts = {}
     for target, cfg in TARGETS.items():
         if target not in df.columns:
@@ -280,7 +353,16 @@ def main():
         X = sub[feats].fillna(0.0)
         y = sub[target].to_numpy(dtype=float)
 
-        m = cv_metrics(X, y, cfg["transform"])
+        if args.parity_json:
+            m, yhat = cv_metrics(
+                X, y, cfg["transform"], return_yhat=True
+            )
+            parity_targets[target] = _parity_target(y, yhat, sub.index)
+            parity_targets[target][
+                "physics_data_revision_cohort"
+            ] = revision_cohort
+        else:
+            m = cv_metrics(X, y, cfg["transform"])
         target_revision_cohorts[target] = revision_cohort
         row = {
             "time": stamp, "target": target, "n": len(sub), **m,
@@ -304,19 +386,27 @@ def main():
                 print(f"    └ slice Llt 20-40uH: n={len(sl)}  MAPE={ms['mape_pct']:.2f}%  P90={ms['p90_ape_pct']:.2f}%")
 
     if rows:
-        curve = pd.DataFrame(rows)
-        os.makedirs(os.path.dirname(os.path.abspath(args.curve_csv)), exist_ok=True)
-        with FileLock(args.curve_csv + ".lock", timeout=1):
-            header = not os.path.isfile(args.curve_csv)
-            curve.to_csv(args.curve_csv, mode="a", header=header, index=False)
-        print(f"learning curve appended -> {args.curve_csv}")
+        if not args.skip_curve_append:
+            curve = pd.DataFrame(rows)
+            os.makedirs(os.path.dirname(os.path.abspath(args.curve_csv)), exist_ok=True)
+            with FileLock(args.curve_csv + ".lock", timeout=1):
+                header = not os.path.isfile(args.curve_csv)
+                curve.to_csv(args.curve_csv, mode="a", header=header, index=False)
+            print(f"learning curve appended -> {args.curve_csv}")
+        else:
+            print("learning curve append skipped")
+        completed_at = datetime.now().isoformat(timespec="seconds")
+        dataset_sha256 = (
+            _sha256(args.dataset)
+            if args.result_json or args.parity_json else None
+        )
         if args.result_json:
             _atomic_json({
                 "schema_version": 1,
-                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "completed_at": completed_at,
                 "checkpoint": args.checkpoint,
                 "dataset": args.dataset,
-                "dataset_sha256": _sha256(args.dataset),
+                "dataset_sha256": dataset_sha256,
                 "profile": args.profile,
                 "profile_sha256": profile_sha256,
                 "strict_full_rows": n_total,
@@ -324,6 +414,24 @@ def main():
                 "target_physics_data_revision_cohorts": target_revision_cohorts,
                 "metrics": rows,
             }, args.result_json)
+        if args.parity_json:
+            _atomic_json({
+                "schema_version": PARITY_SCHEMA_VERSION,
+                "artifact_type": "checkpoint_cv_oof_parity",
+                "completed_at": completed_at,
+                "checkpoint": args.checkpoint,
+                "dataset": args.dataset,
+                "dataset_sha256": dataset_sha256,
+                "profile": args.profile,
+                "profile_sha256": profile_sha256,
+                "strict_full_rows": n_total,
+                "features": list(feats),
+                "prediction_kind": "out_of_fold",
+                "cv": {"n_splits": 5, "shuffle": True, "seed": 42},
+                "max_pairs_per_target": PARITY_MAX_PAIRS_PER_TARGET,
+                "target_physics_data_revision_cohorts": target_revision_cohorts,
+                "targets": parity_targets,
+            }, args.parity_json)
     else:
         raise SystemExit("no target has enough strict-full rows for checkpoint metrics")
 

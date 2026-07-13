@@ -219,6 +219,9 @@ def train_target(
         "interval_coverage": float(np.mean(np.abs(error) <= half_width)),
         "interval_mean_width": float(np.mean(2.0 * half_width)),
         "interval_p90_width": float(np.quantile(2.0 * half_width, 0.9)),
+        "interval_p90_half_width_pct": float(
+            np.quantile(relative_half_width, 0.9) * 100
+        ),
         "physics_data_revision_cohort": revision_cohort,
     }
     bundle = {

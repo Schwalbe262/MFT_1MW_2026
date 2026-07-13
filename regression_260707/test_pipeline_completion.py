@@ -18,8 +18,17 @@ sys.path.insert(0, str(HERE / "training"))
 sys.path.insert(0, str(HERE / "verify"))
 
 from quality_contract import annotate_validity, validate_record
+from model_targets import (
+    CORE_REGION_TEMPERATURE_TARGETS,
+    SURROGATE_TEMPERATURE_TARGETS,
+    SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+)
 from training.checkpoint_orchestrator import checkpoint_sequence, due_with_backoff
-from training.checkpoint_train import feature_columns, filter_valid_training_rows
+from training.checkpoint_train import (
+    TARGETS as CHECKPOINT_TARGETS,
+    feature_columns,
+    filter_valid_training_rows,
+)
 from training.model_quality_gate import evaluate_generation, evaluate_registry
 from training.train_models import (
     capture_active_generation, promote_generation, registry_pointer_token,
@@ -32,11 +41,41 @@ from verify.finalize import (
     _candidate_digest, candidate_identity_reasons, write_final_artifacts,
 )
 from module.input_parameter_260706 import KEYS, create_input_parameter
+from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.thermal_probe_contract import (
+    RX_SIDE_FACE_MAX_RULE,
+    RX_SIDE_FACE_MEAN_RULE,
+    RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
+)
 from optimization.geometry_metrics import bounding_box_lit
 from test_al_integrity import valid_result
 import al_driver
 from optimization.nsga2_problem import MFTProblem, T_TARGETS
 from optimization import run_nsga2
+from monitoring.readers import TEMPERATURE_TARGETS as MONITORING_TEMPERATURE_TARGETS
+from campaign import collect_wave
+
+
+class CoreTemperatureTargetContractTests(unittest.TestCase):
+    def test_three_core_regions_are_independent_end_to_end_targets(self):
+        expected = tuple(SURROGATE_TEMPERATURE_TARGETS)
+        self.assertEqual(tuple(T_TARGETS), expected)
+        self.assertEqual(tuple(al_driver.T_TARGETS), expected)
+        self.assertEqual(tuple(MONITORING_TEMPERATURE_TARGETS), expected)
+        self.assertTrue(
+            set(CORE_REGION_TEMPERATURE_TARGETS).issubset(CHECKPOINT_TARGETS)
+        )
+        self.assertTrue(set(expected).issubset(REQUIRED_OPTIMIZATION_MODELS))
+        self.assertTrue(
+            set(SURROGATE_WINDING_COMPONENT_LOSS_TARGETS).issubset(
+                CHECKPOINT_TARGETS
+            )
+        )
+        self.assertTrue(
+            set(SURROGATE_WINDING_COMPONENT_LOSS_TARGETS).issubset(
+                REQUIRED_OPTIMIZATION_MODELS
+            )
+        )
 
 
 class StrictRowContractTests(unittest.TestCase):
@@ -76,6 +115,86 @@ class StrictRowContractTests(unittest.TestCase):
         self.assertFalse(validate_record(
             valid_result(matrix_solve_attempts=2)
         ).full_valid)
+
+    def test_new_revision_rx_side_inner_face_is_fail_closed_but_legacy_is_valid(self):
+        legacy = valid_result()
+        self.assertTrue(validate_record(legacy).full_valid)
+        revised = valid_result(
+            physics_data_revision=PHYSICS_DATA_REVISION,
+            Tprobe_Rx_side_leeward_mean=84.0,
+            Tprobe_Rx_side_outer_max=88.0,
+            Tprobe_Rx_side_outer_mean=82.0,
+            Tprobe_Rx_side_inner_max=91.0,
+            Tprobe_Rx_side_inner_mean=84.0,
+            thermal_rx_side_probe_contract_version=(
+                RX_SIDE_FACE_PROBE_CONTRACT_VERSION
+            ),
+            thermal_rx_side_probe_max_rule=RX_SIDE_FACE_MAX_RULE,
+            thermal_rx_side_probe_mean_rule=RX_SIDE_FACE_MEAN_RULE,
+            thermal_rx_side_probe_selected_face="Tprobe_Rx_side1_inner",
+            thermal_rx_side_probe_face_count=2,
+            core_native_material_readback_attested=1,
+            core_loss_native_attested=1,
+            flux_linkage_attested=1,
+            core_loss_native_rel_error=0.01,
+            core_loss_native_tolerance_rel=0.02,
+            core_surface_flux_vs_linkage_rel_error=0.01,
+            core_surface_flux_vs_induced_voltage_rel_error=0.01,
+            core_native_model_approval_status=(
+                "approved_by_isolated_solved_kf_ab"
+            ),
+            thermal_core_loss_source=(
+                "aedt_native_lamination_loss_attested_then_margin_adjusted"
+            ),
+            thermal_core_native_readback_count=3,
+            thermal_core_native_restored_rel_error=0.0,
+            thermal_core_loss_correction_factor=1.15,
+        )
+        revised["thermal_core_full_expected_margin_adjusted_w"] = revised[
+            "P_core_total"
+        ]
+        self.assertTrue(validate_record(revised).full_valid)
+        normalized, demoted = collect_wave.normalize_thermal_validity(
+            pd.DataFrame([revised])
+        )
+        self.assertEqual(demoted, 0)
+        self.assertTrue(scheduler_client.is_valid_result(
+            normalized.iloc[0].to_dict()
+        ))
+        revised.pop("Tprobe_Rx_side_inner_max")
+        result = validate_record(revised)
+        self.assertFalse(result.thermal_valid)
+        self.assertIn(
+            "thermal_temperature:nonfinite:Tprobe_Rx_side_inner_max",
+            result.reasons,
+        )
+        normalized, demoted = collect_wave.normalize_thermal_validity(
+            pd.DataFrame([revised])
+        )
+        self.assertEqual(demoted, 1)
+        self.assertFalse(scheduler_client.is_valid_result(revised))
+
+    def test_b171_legacy_row_survives_collector_quality_and_scheduler_paths(self):
+        # b171 predates physics_data_revision and the new inner-face columns.
+        # It must remain valid under its pinned controller while the new
+        # revision uses the stricter face-probe contract.
+        legacy = valid_result()
+        self.assertNotIn("physics_data_revision", legacy)
+        self.assertNotIn("Tprobe_Rx_side_inner_max", legacy)
+
+        normalized, demoted = collect_wave.normalize_thermal_validity(
+            pd.DataFrame([legacy])
+        )
+        record = normalized.iloc[0].to_dict()
+
+        self.assertEqual(demoted, 0)
+        self.assertEqual(record["thermal_solved"], 1)
+        self.assertTrue(validate_record(record).full_valid)
+        self.assertTrue(scheduler_client.is_valid_result(
+            record,
+            expected_revision=legacy["git_hash"],
+            expected_library_revision=legacy["pyaedt_library_git_hash"],
+        ))
         self.assertFalse(validate_record(
             valid_result(thermal_rx_model="hybrid_explicit")
         ).full_valid)
@@ -103,6 +222,15 @@ class StrictRowContractTests(unittest.TestCase):
         audited = annotate_validity(frame)
         self.assertEqual(int(audited["_strict_valid_full"].sum()), 1)
         self.assertEqual(len(filter_valid_training_rows(frame, "Llt")), 1)
+
+    def test_winding_component_outputs_are_complete_and_sum_to_total(self):
+        missing = valid_result()
+        missing.pop("P_Rx_main_group")
+        self.assertFalse(validate_record(missing).full_valid)
+        self.assertFalse(validate_record(valid_result(
+            P_Tx_main_group=2401.0,
+        )).full_valid)
+        self.assertTrue(validate_record(valid_result()).full_valid)
 
     def test_feature_whitelist_excludes_postsolve_leakage(self):
         frame = pd.DataFrame([
@@ -412,6 +540,9 @@ class OptimizationPhysicsTests(unittest.TestCase):
         values = {
             "Llt_phys": 27.5,
             "P_winding_total": 100.0,
+            "P_Tx_main_group": 60.0,
+            "P_Rx_main_group": 30.0,
+            "P_Rx_side_total": 10.0,
             "P_core_total": 200.0,
             "P_core_plate_total": 300.0,
             "P_wcp_total": 400.0,
@@ -423,7 +554,14 @@ class OptimizationPhysicsTests(unittest.TestCase):
             density_gate=lambda frame: np.zeros(len(frame)),
         )
         problem.decode_batch = lambda X: (
-            pd.DataFrame([{"h_gap2": 50.0}] * len(X)),
+            pd.DataFrame([{
+                "h_gap2": 50.0,
+                "N1_main": 6,
+                "N1_side": 0,
+                "V1_rms": 1000.0,
+                "freq": 1000.0,
+                "Ae_m2": 0.08,
+            }] * len(X)),
             np.zeros(len(X)),
             np.ones(len(X), dtype=bool),
         )
@@ -434,6 +572,12 @@ class OptimizationPhysicsTests(unittest.TestCase):
         ):
             problem._evaluate(np.zeros((1, problem.n_var)), out)
         self.assertEqual(out["F"][0, 1], 1000.0)
+        self.assertEqual(
+            out["G"].shape,
+            (1, 1 + len(T_TARGETS) + 5),
+        )
+        self.assertTrue(np.isfinite(out["G"]).all())
+        self.assertTrue((np.abs(out["G"]) < 1.0e5).all())
 
 
 class FineValidationTests(unittest.TestCase):
@@ -450,7 +594,11 @@ class FineValidationTests(unittest.TestCase):
             "w1s_cs_space_x": 40.0,
             "cs_w1s_space_y": 40.0,
         }
-        params = create_input_parameter(safe_inputs).iloc[0].to_dict()
+        complete = create_input_parameter(safe_inputs).iloc[0].to_dict()
+        # The Sobol/candidate identity remains the sealed KEYS schema. Fixed
+        # material policy columns are echoed by the solver but are not design
+        # coordinates and must not alter candidate hashes.
+        params = {key: complete[key] for key in KEYS}
         standard_profile = json.loads(
             (HERE / "verify" / "profiles" / "standard.json").read_text(
                 encoding="utf-8"
