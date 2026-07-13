@@ -62,7 +62,16 @@ CORE_MATERIAL_INPUT_KEYS = (
     "core_lamination_factor",
     "core_loss_margin",
 )
-ALL_INPUT_KEYS = [*KEYS, *CORE_MATERIAL_INPUT_KEYS]
+# Fixed-run-only controls stay outside KEYS so experiments do not rewrite the
+# sealed Sobol/campaign candidate identity. They are still echoed in results.
+EFFICIENCY_EXPERIMENT_INPUT_KEYS = (
+    "thermal_rx_side_block_mesh_level",
+)
+ALL_INPUT_KEYS = [
+    *KEYS,
+    *CORE_MATERIAL_INPUT_KEYS,
+    *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+]
 
 
 def get_drawing_default_params():
@@ -160,6 +169,9 @@ def get_drawing_default_params():
         "fan_config": "dual",
         # Icepak 최대 iteration (수렴 판정 기준 미달 시 상한) - iteration 배터리 테스트로 캠페인 값 결정
         "thermal_max_iterations": 250,
+        # A/B-only Icepak control. Level 5 is the unchanged production default;
+        # level 4 is the guarded multi-turn side-pack candidate.
+        "thermal_rx_side_block_mesh_level": 5,
         # 권선 도체의 운전 온도 기준 [C]: EM 도전율을 이 온도의 구리로 설정
         # (20C 기준이면 실물(~80-100C) 권선손실 ~25% 과소평가 - 손실/온도 라벨 현실화)
         "conductor_temp_C": 80.0,
@@ -213,7 +225,9 @@ def create_input_parameter(param=None):
         elif isinstance(param, pd.DataFrame):
             param = param.copy()
             defaults = get_drawing_default_params()
-            for key in ("core_lamination_factor", "core_loss_margin"):
+            for key in (
+                    *CORE_MATERIAL_INPUT_KEYS,
+                    *EFFICIENCY_EXPERIMENT_INPUT_KEYS):
                 if key not in param.columns:
                     param[key] = defaults[key]
             missing = set(KEYS) - set(param.columns)
@@ -232,7 +246,7 @@ def create_input_parameter(param=None):
         param_df = _create_random_parameter_sobol()
 
     defaults = get_drawing_default_params()
-    for key in CORE_MATERIAL_INPUT_KEYS:
+    for key in (*CORE_MATERIAL_INPUT_KEYS, *EFFICIENCY_EXPERIMENT_INPUT_KEYS):
         if key not in param_df.columns:
             param_df[key] = defaults[key]
 
@@ -831,6 +845,14 @@ def validation_check(input_df, strict=False, return_errors=False):
         errors.append(f"invalid rx_mesh_mode ({inp['rx_mesh_mode'].iloc[0]})")
     if str(inp["thermal_symmetry"].iloc[0]) not in ("eighth", "quarter", "full"):
         errors.append(f"invalid thermal_symmetry ({inp['thermal_symmetry'].iloc[0]})")
+    side_block_mesh_level = int(
+        inp["thermal_rx_side_block_mesh_level"].iloc[0]
+    )
+    if side_block_mesh_level not in (4, 5):
+        errors.append(
+            "thermal_rx_side_block_mesh_level must be 4 or 5 "
+            f"({side_block_mesh_level})"
+        )
     # Tx측면 권선이 있으면 Rx측면과의 절연 간격 필수 (0이면 도체 접촉 -> 솔버 에러)
     if N1_side > 0:
         if float(inp["w2s_w1s_space_x"].iloc[0]) < 1.0:
@@ -894,6 +916,7 @@ NON_DESIGN_VAR_KEYS = {
     "core_depth_min", "core_depth_max",
     "loss_sym_on", "thermal_symmetry", "matrix_skin_mesh", "fan_config", "loss_from_copy",
     "thermal_max_iterations", "conductor_temp_C",
+    "thermal_rx_side_block_mesh_level",
     "core_lamination_factor", "core_loss_margin",
 }
 

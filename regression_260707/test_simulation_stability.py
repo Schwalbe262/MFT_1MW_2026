@@ -1960,6 +1960,16 @@ class AnalyzePolicyTests(unittest.TestCase):
 
         self.assertEqual(simulation.solve_attempts["matrix"], 1)
         self.assertEqual(extracted, [True])
+        self.assertGreaterEqual(
+            simulation.stage_timings["stage_time_matrix_solve_s"], 0
+        )
+        self.assertGreaterEqual(
+            simulation.stage_timings["stage_time_matrix_extract_s"], 0
+        )
+        self.assertGreaterEqual(
+            simulation.stage_timings["stage_time_matrix_analyze_total_s"],
+            simulation.stage_timings["stage_time_matrix_solve_s"],
+        )
 
     def test_empty_data_error_never_resolves(self):
         simulation = self._simulation([None])
@@ -3546,6 +3556,13 @@ class ThermalHomogenizationTests(unittest.TestCase):
         self.assertEqual(defaults["matrix_percent_error"], 1.5)
         self.assertEqual(defaults["matrix_max_passes"], 20)
         self.assertEqual(defaults["percent_error"], 1.5)
+        self.assertEqual(defaults["thermal_rx_side_block_mesh_level"], 5)
+        candidate = create_input_parameter({
+            "thermal_rx_side_block_mesh_level": 4
+        })
+        self.assertEqual(
+            candidate["thermal_rx_side_block_mesh_level"].iloc[0], 4
+        )
 
 
 class EmCompletionPolicyTests(unittest.TestCase):
@@ -3778,6 +3795,18 @@ class ThermalMeshPolicyTests(unittest.TestCase):
             self.assertFalse(operation.auto_update)
             self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
             self.assertEqual(operation.update_calls, 1)
+
+    def test_efficiency_ab_can_relax_only_multi_turn_side_blocks(self):
+        mesh = self._Mesh()
+
+        _assign_thermal_mesh(
+            SimpleNamespace(mesh=mesh), self._objects(), side_block_level=4
+        )
+
+        self.assertIn(
+            ({"rx_side_block": 4}, "rx_side_block_mesh_level"),
+            mesh.calls,
+        )
 
     def test_separate_object_mesh_update_failure_is_fatal(self):
         mesh = self._Mesh(failing_name="tx_mesh_level")
