@@ -1,15 +1,18 @@
 """Opt-in bridge from the MFT runner to the scheduler AEDT session host.
 
 The production default remains one runner-owned Desktop per process.  Pooled
-mode is accepted only with an explicit 1:1 acknowledgement and always requests
-an exclusive scheduler session; this module has no 1:2 code path.
+mode requires either the already-proven exclusive 1:1 acknowledgement or the
+separate disposable 1:2 pilot acknowledgement.  The latter is deliberately
+named as a pilot and is not a production enable switch.
 """
 
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,8 @@ from typing import Any
 
 STANDALONE_BACKEND = "standalone"
 POOLED_BACKEND = "pooled"
+EXCLUSIVE_1TO1_ACK = "MFT_AEDT_EXCLUSIVE_1TO1"
+SHARED_1TO2_PILOT_ACK = "MFT_AEDT_SHARED_1TO2_PILOT"
 TERMINAL_LEASE_STATES = {
     "released",
     "failed",
@@ -31,18 +36,27 @@ def aedt_backend() -> str:
         raise RuntimeError(
             "MFT_AEDT_BACKEND must be 'standalone' or 'pooled'"
         )
-    if value == POOLED_BACKEND and os.environ.get(
-        "MFT_AEDT_EXCLUSIVE_1TO1", ""
-    ).strip() != "1":
-        raise RuntimeError(
-            "pooled AEDT is experimental and requires "
-            "MFT_AEDT_EXCLUSIVE_1TO1=1"
-        )
+    if value == POOLED_BACKEND:
+        exclusive = os.environ.get(EXCLUSIVE_1TO1_ACK, "").strip() == "1"
+        shared_pilot = os.environ.get(SHARED_1TO2_PILOT_ACK, "").strip() == "1"
+        if exclusive == shared_pilot:
+            raise RuntimeError(
+                "pooled AEDT requires exactly one explicit acknowledgement: "
+                "MFT_AEDT_EXCLUSIVE_1TO1=1 or "
+                "MFT_AEDT_SHARED_1TO2_PILOT=1"
+            )
     return value
 
 
 def pooled_backend_enabled() -> bool:
     return aedt_backend() == POOLED_BACKEND
+
+
+def shared_1to2_pilot_enabled() -> bool:
+    return (
+        aedt_backend() == POOLED_BACKEND
+        and os.environ.get(SHARED_1TO2_PILOT_ACK, "").strip() == "1"
+    )
 
 
 def _scheduler_attach_module() -> Any:
@@ -86,7 +100,7 @@ def acquire_pooled_desktop(
     desktop_factory: Any,
     non_graphical: bool,
 ) -> tuple[Any, Any]:
-    """Acquire one exclusive lease and attach without Desktop ownership."""
+    """Acquire a pilot lease and attach without Desktop ownership."""
     if not pooled_backend_enabled():
         raise RuntimeError("pooled Desktop acquisition requested while disabled")
     scheduler_url = os.environ.get("MFT_AEDT_SCHEDULER_URL", "").strip()
@@ -100,14 +114,16 @@ def acquire_pooled_desktop(
     pending_project = (
         f"mft-pending-{task_id or os.getpid()}-{uuid.uuid4().hex[:12]}"
     )
+    shared_pilot = shared_1to2_pilot_enabled()
     lease = client.acquire_project_lease(
         scheduler_url,
         pending_project,
         request_key=(
-            f"mft-1to1:{task_id or os.getpid()}:{uuid.uuid4().hex}"
+            f"mft-{'1to2' if shared_pilot else '1to1'}:"
+            f"{task_id or os.getpid()}:{uuid.uuid4().hex}"
         ),
         task_id=task_id,
-        exclusive_session=True,
+        exclusive_session=not shared_pilot,
     )
     try:
         lease.wait_until_leased(
@@ -133,6 +149,37 @@ def acquire_pooled_desktop(
             pass
         raise
     return desktop, lease
+
+
+def pilot_pre_solve_barrier(project_name: str) -> None:
+    """Optional disposable 1:2 hook for a client-abort isolation test.
+
+    It runs only under the explicit shared-pilot acknowledgement.  Production
+    and exclusive 1:1 runs ignore the marker/hang variables entirely.
+    """
+    if not shared_1to2_pilot_enabled():
+        return
+    marker_text = os.environ.get("MFT_AEDT_PILOT_PRE_SOLVE_READY_FILE", "").strip()
+    hang_text = os.environ.get("MFT_AEDT_PILOT_PRE_SOLVE_HANG_SECONDS", "0").strip()
+    try:
+        hang_seconds = int(hang_text)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "MFT_AEDT_PILOT_PRE_SOLVE_HANG_SECONDS must be an integer"
+        ) from exc
+    if not 0 <= hang_seconds <= 3600:
+        raise RuntimeError(
+            "MFT_AEDT_PILOT_PRE_SOLVE_HANG_SECONDS must be between 0 and 3600"
+        )
+    if marker_text:
+        marker = Path(marker_text).expanduser().resolve()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps({"project_name": project_name, "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+    if hang_seconds:
+        time.sleep(hang_seconds)
 
 
 def bind_project_name(lease: Any, project_name: str) -> None:
