@@ -115,10 +115,21 @@
       <div class="split-grid campaign-insight-layout">
         <article class="panel cohort-panel" aria-labelledby="cohort-title">
           <div class="panel-title">
-            <div><h3 id="cohort-title">Solver · 물리 데이터 코호트</h3><p>git_hash와 physics_data_revision 조합별 행 수와 최근 증가 속도</p></div>
+            <div><h3 id="cohort-title">Solver · 물리 데이터 코호트</h3><p>ACTIVE 핵심 지표와 이전 코호트의 최신순 요약</p></div>
             <span id="cohort-summary" class="mono-chip">코호트 —</span>
           </div>
-          <div id="cohort-list" class="cohort-list"><p class="empty-state compact-empty">코호트 데이터를 확인하는 중입니다.</p></div>
+          <div id="cohort-list" class="cohort-list">
+            <div id="cohort-active"><p class="empty-state compact-empty">코호트 데이터를 확인하는 중입니다.</p></div>
+            <div id="cohort-history" class="cohort-history hidden">
+              <button id="cohort-history-toggle" class="cohort-history-toggle" type="button" aria-expanded="false" aria-controls="cohort-history-table-wrap">이전 코호트 0개 보기</button>
+              <div id="cohort-history-table-wrap" class="cohort-history-table-wrap" role="region" aria-label="이전 코호트 표" tabindex="0">
+                <table class="cohort-history-table" aria-label="이전 코호트 요약">
+                  <thead><tr><th>SHA</th><th>revision</th><th>Raw</th><th>Strict EM</th><th>Strict full</th><th>+/h</th></tr></thead>
+                  <tbody id="cohort-history-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
           <div class="cohort-metadata-grid">
             <section aria-labelledby="lamination-factor-title">
               <h4 id="lamination-factor-title">코어 적층 계수</h4>

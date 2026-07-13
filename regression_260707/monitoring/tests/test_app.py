@@ -1,3 +1,9 @@
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
 from fastapi.testclient import TestClient
 
 from module.core_material_contract import PHYSICS_DATA_REVISION
@@ -29,6 +35,15 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert 'id="model-history-metric"' in page.text
     assert 'value="mape_pct"' in page.text
     assert 'id="cohort-list"' in page.text
+    assert 'id="cohort-active"' in page.text
+    assert 'id="cohort-history"' in page.text
+    assert 'id="cohort-history-toggle"' in page.text
+    assert 'aria-expanded="false"' in page.text
+    assert "이전 코호트 0개 보기" in page.text
+    assert '<th>SHA</th><th>revision</th><th>Raw</th>' in page.text
+    assert '<th>Strict EM</th><th>Strict full</th><th>+/h</th>' in page.text
+    assert 'id="cohort-history-body"' in page.text
+    assert 'aria-label="이전 코호트 표" tabindex="0"' in page.text
     assert 'id="cohort-lamination-factor"' in page.text
     assert 'id="cohort-flux-availability"' in page.text
     assert 'id="quarantine-current-reasons"' in page.text
@@ -64,6 +79,15 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "data.current_cohort_metadata" in script.text
     assert "cohort?.active" in script.text
     assert "cohort?.growth_rate_per_hour" in script.text
+    assert "COHORT_HISTORY_PREVIEW_ROWS = 2" in script.text
+    assert "cohort?.latest_saved_at" in script.text
+    assert "function compactPriorCohorts(cohorts)" in script.text
+    assert "legacy_aggregate: true" in script.text
+    assert "레거시 (${number(cohort.cohort_count)}개 코호트)" in script.text
+    assert "index >= COHORT_HISTORY_PREVIEW_ROWS" in script.text
+    assert 'toggle.setAttribute("aria-expanded", String(applied))' in script.text
+    assert "이전 코호트 ${number(cohortCount)}개 보기" in script.text
+    assert "state.cohortHistoryExpanded" in script.text
     assert "data.quarantine" in script.text
     assert "electrostatic.cap_stage_present_rows" in script.text
     assert '"C_tx_tx"' in script.text
@@ -83,6 +107,10 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert ".history-metric-control" in stylesheet.text
     assert ".chart-tooltip" in stylesheet.text
     assert ".cohort-row.active" in stylesheet.text
+    assert ".cohort-history-toggle" in stylesheet.text
+    assert ".cohort-history-table" in stylesheet.text
+    assert ".cohort-history-table tr.legacy-aggregate" in stylesheet.text
+    assert ".cohort-history-table-wrap:focus-visible" in stylesheet.text
     assert ".quarantine-legacy" in stylesheet.text
     assert ".electrostatic-presence-grid" in stylesheet.text
     assert ".thermal-model-row" in stylesheet.text
@@ -143,6 +171,62 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     }
     assert client.get("/api/history").status_code == 200
     assert client.get("/healthz").json()["status"] == "ok"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_cohort_history_view_collapses_aggregates_and_expands_in_newest_order():
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    script = r"""
+const path = require("node:path");
+const { cohortHistoryView } = require(path.resolve(process.argv[1]));
+const revision = "mft1mw-1k101-native-lamination-kf0p85-v3";
+const cohort = (sha, savedAt, raw = 1, physicsRevision = revision) => ({
+  git_hash: sha.repeat(40), git_hash_short: sha.repeat(10),
+  physics_data_revision: physicsRevision, latest_saved_at: savedAt,
+  active: false, raw_rows: raw, strict_em_rows: 0,
+  strict_full_rows: 0, growth_rate_per_hour: 0,
+});
+const cohorts = [
+  { ...cohort("a", "2026-07-13T10:00:00+09:00", 8), active: true,
+    strict_em_rows: 7, strict_full_rows: 6, growth_rate_per_hour: 2 },
+  cohort("b", "2026-07-13T09:59:00.000900+09:00"),
+  cohort("c", "2026-07-13T09:59:00.000700+09:00"),
+  cohort("d", "2026-07-13T09:59:00.000600+09:00"),
+  cohort("e", "2026-07-13T09:59:00.000800+09:00", 2, "legacy_unspecified"),
+  cohort("f", "2026-07-13T09:59:00.000500+09:00", 3, "legacy_unspecified"),
+];
+const collapsed = cohortHistoryView(cohorts, false);
+const expanded = cohortHistoryView(cohorts, true);
+process.stdout.write(JSON.stringify({ collapsed, expanded }));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script, str(app_js)],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=10,
+    )
+    result = json.loads(completed.stdout)
+    collapsed = result["collapsed"]
+    expanded = result["expanded"]
+
+    assert collapsed["cohortCount"] == 5
+    assert [row["cohort"]["git_hash_short"] for row in collapsed["rows"]] == [
+        "b" * 10,
+        "legacy",
+        "c" * 10,
+        "d" * 10,
+    ]
+    assert [row["hidden"] for row in collapsed["rows"]] == [
+        False, False, True, True,
+    ]
+    aggregate = collapsed["rows"][1]["cohort"]
+    assert aggregate["legacy_aggregate"] is True
+    assert aggregate["cohort_count"] == 2
+    assert aggregate["raw_rows"] == 5
+    assert aggregate["latest_saved_at"] == "2026-07-13T09:59:00.000800+09:00"
+    assert all(row["hidden"] is False for row in expanded["rows"])
 
 
 def test_api_failure_is_section_local(campaign_root):
