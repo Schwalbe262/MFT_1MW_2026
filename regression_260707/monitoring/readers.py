@@ -1,9 +1,10 @@
 """Safe readers and view-model builders for MFT campaign artifacts.
 
-This module intentionally depends only on the Python standard library.  The
-simulation/training environments therefore do not need to be imported by the
-web process, and a partially written or corrupt artifact cannot take down the
-dashboard.
+Most readers intentionally depend only on the Python standard library.  The
+campaign-v3.2 reader loads the lossless Parquet audit dataset lazily so the
+electrostatic fields that are not present in ``train_io.csv`` remain visible.
+A missing Parquet dependency, partially written file, or corrupt artifact is
+still isolated from the rest of the dashboard.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,6 +44,25 @@ except ImportError:  # Direct execution with regression_260707 on sys.path.
 SCHEMA_VERSION = 1
 DATA_GOAL = 3_000
 STRETCH_GOAL = 10_000
+CURRENT_SOLVER_REVISION = "513a6f321b997d1866f8c0da57cc27c285b29a5c"
+CURRENT_PHYSICS_DATA_REVISION = (
+    "mft1mw-1k101-native-lamination-kf0p85-v3"
+)
+LEGACY_PHYSICS_DATA_REVISION = "legacy_unspecified"
+THERMAL_MODEL_TAGS = (
+    "isotropic_legacy",
+    "anisotropic_wound_rule_of_mixtures_v1",
+)
+CAPACITANCE_FIELDS = {
+    "tx_tx": "C_tx_tx_F",
+    "rx_rx": "C_rx_rx_F",
+    "tx_rx": "C_tx_rx_F",
+}
+RESONANCE_FIELDS = {
+    "tx_self": "f_res_tx_self_Hz",
+    "rx_self": "f_res_rx_self_Hz",
+    "interwinding": "f_res_interwinding_Hz",
+}
 PARALLEL_TARGET_MIN = 1
 PARALLEL_TARGET_MAX = 300
 SIMULATION_TIMING_WINDOW_ROWS = 100
@@ -276,6 +297,382 @@ def _coerce(value: Any) -> Any:
     return _safe_text(value)
 
 
+def _optional_text(value: Any, limit: int = 500) -> str | None:
+    """Normalize schema-union nulls without turning NaN into a cohort tag."""
+    if value is None:
+        return None
+    number = _finite_number(value)
+    if number is None and isinstance(value, (float, int)):
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in {"nan", "<na>", "none", "null"}:
+        return None
+    return text[:limit]
+
+
+def _optional_flag(value: Any) -> bool | None:
+    if value is None:
+        return None
+    number = _finite_number(value)
+    if number is not None:
+        if number == 1.0:
+            return True
+        if number == 0.0:
+            return False
+        return None
+    text = str(value).strip().casefold()
+    if text in {"true", "yes", "pass", "passed"}:
+        return True
+    if text in {"false", "no", "fail", "failed"}:
+        return False
+    return None
+
+
+def _frame_records(frame: Any, columns: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Project a pandas-like frame or record iterable onto bounded columns."""
+    if frame is None:
+        return []
+    if isinstance(frame, dict):
+        return [{key: frame.get(key) for key in columns if key in frame}]
+    if isinstance(frame, (list, tuple)):
+        return [
+            {key: row.get(key) for key in columns if key in row}
+            for row in frame if isinstance(row, dict)
+        ]
+    available = getattr(frame, "columns", ())
+    try:
+        selected = [key for key in columns if key in available]
+        if not selected:
+            return [{} for _ in range(len(frame))]
+        projected = frame.loc[:, selected]
+        records = projected.to_dict(orient="records")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return []
+    return [dict(row) for row in records if isinstance(row, dict)]
+
+
+def _scaled_stats(
+    rows: list[dict[str, Any]],
+    column: str,
+    scale: float,
+    suffix: str,
+) -> dict[str, Any]:
+    values = [
+        value * scale
+        for row in rows
+        if (value := _finite_number(row.get(column))) is not None
+    ]
+    return {
+        "source_column": column,
+        "sample_count": len(values),
+        f"min_{suffix}": min(values) if values else None,
+        f"median_{suffix}": statistics.median(values) if values else None,
+        f"max_{suffix}": max(values) if values else None,
+    }
+
+
+def _plain_stats(rows: list[dict[str, Any]], column: str) -> dict[str, Any]:
+    values = [
+        value for row in rows
+        if (value := _finite_number(row.get(column))) is not None
+    ]
+    return {
+        "source_column": column,
+        "sample_count": len(values),
+        "min": min(values) if values else None,
+        "median": statistics.median(values) if values else None,
+        "max": max(values) if values else None,
+    }
+
+
+def _invalid_reasons(row: dict[str, Any]) -> list[str]:
+    raw = _optional_text(row.get("_strict_invalid_reasons"), 20_000)
+    if not raw:
+        raw = _optional_text(row.get("em_validity_reason"), 20_000)
+    if not raw:
+        return []
+    return list(dict.fromkeys(
+        reason.strip() for reason in raw.split(";") if reason.strip()
+    ))
+
+
+def _campaign_frame_summary(
+    frame: Any,
+    now: datetime,
+    cohort_history: dict[tuple[str, str], list[tuple[datetime, int]]] | None = None,
+) -> dict[str, Any]:
+    """Summarize the v3.2 audit frame while tolerating every missing column.
+
+    Canonically audited frames carry ``_strict_*`` columns.  Synthetic and
+    CSV fallback frames may only carry stored result flags; the exact current
+    solver/physics identity is still required before such a row is counted as
+    strict for this campaign.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    columns = (
+        "git_hash", "physics_data_revision", "saved_at",
+        "result_valid_em", "result_valid_thermal",
+        "_strict_valid_em", "_strict_valid_full",
+        "_strict_invalid_reasons", "em_validity_reason",
+        "cap_on", *CAPACITANCE_FIELDS.values(), *RESONANCE_FIELDS.values(),
+        "thermal_core_conductivity_model", "thermal_core_k_inplane",
+        "thermal_core_k_throughstack", "core_lamination_factor",
+        "winding_flux_linkage_readback_status",
+        "winding_flux_linkage_readback_applicable",
+        "winding_flux_linkage_readback_available",
+        "winding_flux_linkage_readback_passed",
+        "winding_flux_linkage_readback_reason",
+    )
+    records = _frame_records(frame, columns)
+    prepared: list[dict[str, Any]] = []
+    for row in records:
+        revision = (_optional_text(row.get("git_hash"), 40) or "").lower()
+        physics_revision = (
+            _optional_text(row.get("physics_data_revision"), 160)
+            or LEGACY_PHYSICS_DATA_REVISION
+        )
+        current = (
+            revision == CURRENT_SOLVER_REVISION
+            and physics_revision == CURRENT_PHYSICS_DATA_REVISION
+        )
+        strict_em_flag = _optional_flag(row.get("_strict_valid_em"))
+        if strict_em_flag is None:
+            strict_em_flag = _optional_flag(row.get("result_valid_em")) is True
+        strict_full_flag = _optional_flag(row.get("_strict_valid_full"))
+        if strict_full_flag is None:
+            strict_full_flag = (
+                bool(strict_em_flag)
+                and _optional_flag(row.get("result_valid_thermal")) is True
+            )
+        prepared.append({
+            **row,
+            "_monitor_git_hash": revision,
+            "_monitor_physics_revision": physics_revision,
+            "_monitor_current": current,
+            # Pinned campaign strictness is intentionally fail-closed for
+            # every legacy solver or physics cohort.
+            "_monitor_strict_em": bool(current and strict_em_flag),
+            "_monitor_strict_full": bool(
+                current and strict_em_flag and strict_full_flag
+            ),
+        })
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in prepared:
+        grouped[(
+            row["_monitor_git_hash"], row["_monitor_physics_revision"]
+        )].append(row)
+
+    cutoff = now - timedelta(hours=1)
+    cohort_history = cohort_history or {}
+    cohorts: list[dict[str, Any]] = []
+    for (revision, physics_revision), cohort_rows in grouped.items():
+        strict_em_rows = sum(row["_monitor_strict_em"] for row in cohort_rows)
+        strict_full_rows = sum(row["_monitor_strict_full"] for row in cohort_rows)
+        recent_growth = sum(
+            1 for row in cohort_rows
+            if row["_monitor_strict_full"]
+            and (
+                stamp := _parse_time(row.get("saved_at"), now.tzinfo)
+            ) is not None
+            and cutoff <= stamp <= now
+        )
+        history = sorted(
+            (
+                (stamp, max(0, _integer(count, 0)))
+                for stamp, count in cohort_history.get(
+                    (revision, physics_revision), []
+                )
+                if isinstance(stamp, datetime)
+            ),
+            key=lambda item: item[0],
+        )
+        if history:
+            before = [count for stamp, count in history if stamp <= cutoff]
+            within = [count for stamp, count in history if stamp >= cutoff]
+            baseline = before[-1] if before else (within[0] if within else None)
+            if baseline is not None:
+                recent_growth = max(0, strict_full_rows - baseline)
+        current = (
+            revision == CURRENT_SOLVER_REVISION
+            and physics_revision == CURRENT_PHYSICS_DATA_REVISION
+        )
+        cohorts.append({
+            "git_hash": revision or None,
+            "git_hash_short": revision[:10] if revision else "unknown",
+            "physics_data_revision": physics_revision,
+            "current": current,
+            "raw_rows": len(cohort_rows),
+            "strict_em_rows": strict_em_rows,
+            "strict_full_rows": strict_full_rows,
+            "growth_rate_per_hour": float(recent_growth),
+        })
+    cohorts.sort(key=lambda item: (
+        not item["current"], -item["raw_rows"],
+        item["git_hash_short"], item["physics_data_revision"],
+    ))
+
+    current_rows = [row for row in prepared if row["_monitor_current"]]
+    current_strict = [
+        row for row in current_rows if row["_monitor_strict_full"]
+    ]
+    present_rows: list[dict[str, Any]] = []
+    absent_rows = 0
+    unknown_cap_rows = 0
+    for row in current_strict:
+        cap_flag = _optional_flag(row.get("cap_on"))
+        if cap_flag is True:
+            present_rows.append(row)
+        elif cap_flag is False:
+            absent_rows += 1
+        else:
+            unknown_cap_rows += 1
+    electrostatic = {
+        "available": bool(current_strict and present_rows),
+        "cohort_basis": "current_v3.2_strict_full",
+        "cohort_rows": len(current_strict),
+        "cap_stage_present_rows": len(present_rows),
+        "cap_stage_absent_rows": absent_rows,
+        "cap_stage_unknown_rows": unknown_cap_rows,
+        "capacitance": {
+            key: _scaled_stats(present_rows, column, 1e9, "nF")
+            for key, column in CAPACITANCE_FIELDS.items()
+        },
+        "resonance": {
+            key: _scaled_stats(present_rows, column, 1e-3, "kHz")
+            for key, column in RESONANCE_FIELDS.items()
+        },
+    }
+
+    model_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in prepared:
+        model = _optional_text(row.get("thermal_core_conductivity_model"), 160)
+        if model:
+            model_rows[model].append(row)
+    ordered_models = [
+        model for model in THERMAL_MODEL_TAGS if model in model_rows
+    ] + sorted(model for model in model_rows if model not in THERMAL_MODEL_TAGS)
+    thermal_models = {
+        "available": bool(model_rows),
+        "total_rows": len(prepared),
+        "tagged_rows": sum(len(rows) for rows in model_rows.values()),
+        "missing_rows": len(prepared) - sum(
+            len(rows) for rows in model_rows.values()
+        ),
+        "models": [
+            {
+                "model": model,
+                "count": len(model_rows[model]),
+                "percent": (
+                    len(model_rows[model]) / len(prepared) * 100.0
+                    if prepared else 0.0
+                ),
+                "thermal_core_k_inplane": _plain_stats(
+                    model_rows[model], "thermal_core_k_inplane"
+                ),
+                "thermal_core_k_throughstack": _plain_stats(
+                    model_rows[model], "thermal_core_k_throughstack"
+                ),
+            }
+            for model in ordered_models
+        ],
+    }
+
+    current_reason_counts: Counter[str] = Counter()
+    legacy_reason_counts: Counter[str] = Counter()
+    current_quarantined = 0
+    legacy_quarantined = 0
+    for row in prepared:
+        reasons = _invalid_reasons(row)
+        if row["_monitor_current"]:
+            if row["_monitor_strict_full"]:
+                continue
+            current_quarantined += 1
+            if not reasons:
+                if not row["_monitor_strict_em"]:
+                    reasons.append("stored_flag:result_valid_em")
+                else:
+                    reasons.append("stored_flag:result_valid_thermal")
+            current_reason_counts.update(reasons)
+        else:
+            legacy_quarantined += 1
+            if row["_monitor_git_hash"] != CURRENT_SOLVER_REVISION:
+                reasons.append(
+                    "untrusted_provenance:solver_revision_mismatch"
+                )
+            if (
+                row["_monitor_physics_revision"]
+                != CURRENT_PHYSICS_DATA_REVISION
+            ):
+                reasons.append("cohort:physics_data_revision_mismatch")
+            legacy_reason_counts.update(dict.fromkeys(reasons, 1))
+
+    def _reason_items(counts: Counter[str]) -> list[dict[str, Any]]:
+        return [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(
+                counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
+
+    statuses = Counter(
+        _optional_text(
+            row.get("winding_flux_linkage_readback_status"), 80
+        ) or "missing"
+        for row in current_rows
+    )
+    readback_available = 0
+    readback_unavailable = 0
+    readback_missing = 0
+    for row in current_rows:
+        available = _optional_flag(
+            row.get("winding_flux_linkage_readback_available")
+        )
+        status = _optional_text(
+            row.get("winding_flux_linkage_readback_status"), 80
+        )
+        if available is True or status == "available":
+            readback_available += 1
+        elif available is False or status == "unavailable":
+            readback_unavailable += 1
+        else:
+            readback_missing += 1
+
+    return {
+        "cohorts": cohorts,
+        "electrostatic": electrostatic,
+        "thermal_models": thermal_models,
+        "quarantine": {
+            "current": {
+                "label": "v3.2 신규 cohort",
+                "rows": current_quarantined,
+                "reasons": _reason_items(current_reason_counts),
+            },
+            "legacy": {
+                "label": "레거시 cohort 잡음",
+                "rows": legacy_quarantined,
+                "reasons": _reason_items(legacy_reason_counts),
+            },
+        },
+        "current_cohort_metadata": {
+            "core_lamination_factor": _plain_stats(
+                current_rows, "core_lamination_factor"
+            ),
+            "winding_flux_linkage_readback": {
+                "cohort_rows": len(current_rows),
+                "available_rows": readback_available,
+                "unavailable_rows": readback_unavailable,
+                "missing_rows": readback_missing,
+                "statuses": [
+                    {"status": status, "count": count}
+                    for status, count in sorted(statuses.items())
+                ],
+            },
+        },
+    }
+
+
 @dataclass(frozen=True)
 class ReadResult:
     value: Any
@@ -338,7 +735,10 @@ class SafeArtifactCache:
         try:
             value = parser(path)
             mtime = datetime.fromtimestamp(signature[0] / 1_000_000_000, tz=_now().tzinfo)
-        except (OSError, UnicodeError, ValueError, TypeError, csv.Error, json.JSONDecodeError) as exc:
+        except (
+            OSError, UnicodeError, ValueError, TypeError, ImportError,
+            csv.Error, json.JSONDecodeError,
+        ) as exc:
             with self._lock:
                 self._failed[key] = signature
                 cached = self._good.get(key)
@@ -381,6 +781,44 @@ class SafeArtifactCache:
 
         return self._read(path, f"csv:{max_rows}", parser, [],)
 
+    def parquet(
+        self,
+        path: Path,
+        max_rows: int = 100_000,
+        max_columns: int = 2_000,
+    ) -> ReadResult:
+        """Read a bounded Parquet frame lazily and retain the last good frame."""
+        def parser(source: Path) -> Any:
+            try:
+                import pandas as pd
+                import pyarrow.parquet as parquet
+
+                metadata = parquet.ParquetFile(source).metadata
+                if metadata.num_rows > max_rows:
+                    raise ValueError(
+                        f"Parquet exceeds {max_rows} row safety limit"
+                    )
+                if metadata.num_columns > max_columns:
+                    raise ValueError(
+                        f"Parquet exceeds {max_columns} column safety limit"
+                    )
+                return pd.read_parquet(source)
+            except (ImportError, OSError, TypeError, ValueError):
+                raise
+            except Exception as exc:
+                # Arrow exception classes are intentionally not imported at
+                # module load time; normalize parser failures for _read().
+                raise ValueError(
+                    f"Parquet parse failed: {type(exc).__name__}: {exc}"
+                ) from exc
+
+        return self._read(
+            path,
+            f"parquet:{max_rows}:{max_columns}",
+            parser,
+            None,
+        )
+
 
 class SchedulerReader:
     """Bounded adapter for MFT scheduler status and project-cap control."""
@@ -391,6 +829,7 @@ class SchedulerReader:
         task_prefix: str = "mft",
         project_name: str = "MFT_1MW_2026v1",
         timeout: float = 2.0,
+        optional_timeout: float | None = None,
         ttl: float = 10.0,
         opener: Callable[..., Any] = urlopen,
     ) -> None:
@@ -398,6 +837,9 @@ class SchedulerReader:
         self.task_prefix = task_prefix
         self.project_name = project_name.strip()
         self.timeout = timeout
+        self.optional_timeout = (
+            timeout if optional_timeout is None else max(0.1, optional_timeout)
+        )
         self.ttl = ttl
         self._opener = opener
         self._lock = threading.Lock()
@@ -410,6 +852,7 @@ class SchedulerReader:
         *,
         method: str = "GET",
         payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         body = None
         headers = {
@@ -425,8 +868,285 @@ class SchedulerReader:
             headers=headers,
             method=method,
         )
-        with self._opener(request, timeout=self.timeout) as response:
+        with self._opener(
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+        ) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    @staticmethod
+    def _nonnegative_integer(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        number = _finite_number(value)
+        if number is None or number < 0 or not number.is_integer():
+            return None
+        return int(number)
+
+    @staticmethod
+    def _boolean(value: Any) -> bool | None:
+        return value if type(value) is bool else None
+
+    @classmethod
+    def _pool_snapshot(cls, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("AEDT pool response is invalid")
+        config = payload.get("config")
+        plan = payload.get("plan")
+        sessions = payload.get("sessions")
+        leases = payload.get("leases")
+        if (
+            not isinstance(config, dict)
+            or not isinstance(plan, dict)
+            or not isinstance(sessions, list)
+            or not isinstance(leases, list)
+        ):
+            raise ValueError("AEDT pool response is missing config/plan/sessions/leases")
+        session_states = {
+            str(state): max(0, _integer(count, 0))
+            for state, count in (
+                plan.get("state_counts")
+                if isinstance(plan.get("state_counts"), dict) else {}
+            ).items()
+        }
+        observed_session_states = Counter(
+            state
+            for item in sessions if isinstance(item, dict)
+            if (state := _optional_text(item.get("state"), 80))
+        )
+        if not session_states:
+            session_states = dict(observed_session_states)
+        lease_states = {
+            str(state): max(0, _integer(count, 0))
+            for state, count in (
+                plan.get("lease_counts")
+                if isinstance(plan.get("lease_counts"), dict) else {}
+            ).items()
+        }
+        observed_lease_states = Counter(
+            state
+            for item in leases if isinstance(item, dict)
+            if (state := _optional_text(item.get("state"), 80))
+        )
+        if not lease_states:
+            lease_states = dict(observed_lease_states)
+        live_leases = cls._nonnegative_integer(plan.get("live_projects"))
+        if live_leases is None:
+            # Match the scheduler's LEASE_LIVE_STATES contract.  Queued is
+            # also reported separately below so the UI can expose pressure.
+            live_leases = sum(
+                lease_states.get(state, 0)
+                for state in ("queued", "leased", "active", "releasing")
+            )
+        return {
+            "available": True,
+            "enabled": cls._boolean(config.get("enabled")),
+            "adapter_ready": cls._boolean(config.get("adapter_ready")),
+            "validation_passed": cls._boolean(
+                config.get("validation_passed")
+            ),
+            "operational": cls._boolean(config.get("operational")),
+            "max_sessions": cls._nonnegative_integer(
+                config.get("max_aedt_sessions")
+            ),
+            "min_idle_sessions": cls._nonnegative_integer(
+                config.get("min_idle_aedt_sessions")
+            ),
+            "idle_sessions": cls._nonnegative_integer(
+                plan.get("idle_session_count")
+            ),
+            "hard_sessions": cls._nonnegative_integer(
+                plan.get("hard_session_count")
+            ),
+            "warm_spare_deficit": cls._nonnegative_integer(
+                plan.get("warm_spare_deficit")
+            ),
+            "warm_spare_start_needed": cls._nonnegative_integer(
+                plan.get("warm_spare_start_needed")
+            ),
+            # These arrays are capped history/diagnostic records, not live
+            # capacity.  Keep their sizes explicitly named and never use
+            # them as the denominator for pool utilization.
+            "session_record_count": len(sessions),
+            "lease_record_count": len(leases),
+            "live_leases": live_leases,
+            "queued_leases": lease_states.get("queued", 0),
+            "ready_sessions": session_states.get("ready", 0),
+            "busy_sessions": session_states.get("busy", 0),
+            "session_states": dict(sorted(session_states.items())),
+            "lease_states": dict(sorted(lease_states.items())),
+            "warm_spare_reason": _safe_text(
+                plan.get("warm_spare_status_reason"), 500
+            ),
+            "error": None,
+        }
+
+    @classmethod
+    def _license_snapshot(cls, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("license response is invalid")
+        candidates: list[dict[str, Any]] = []
+        for key in ("display", "features", "in_use"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                candidates.extend(
+                    item for item in values if isinstance(item, dict)
+                )
+        selected = next((
+            item for item in candidates
+            if str(item.get("feature") or "").strip().casefold()
+            == "electronics_desktop"
+        ), None)
+        admission = payload.get("admission")
+        admission = admission if isinstance(admission, dict) else {}
+        admission_features = (
+            admission.get("features")
+            if isinstance(admission.get("features"), dict) else {}
+        )
+        if selected is None:
+            fallback = admission_features.get("electronics_desktop")
+            selected = fallback if isinstance(fallback, dict) else None
+        if selected is None:
+            raise ValueError("electronics_desktop license feature is unavailable")
+        used = cls._nonnegative_integer(selected.get("used"))
+        total = cls._nonnegative_integer(selected.get("total"))
+        if used is None or total is None or used > total:
+            raise ValueError("electronics_desktop license counts are invalid")
+        error = _safe_text(payload.get("error"), 500)
+        snapshot_valid = admission.get("snapshot_valid")
+        if type(snapshot_valid) is not bool:
+            snapshot_valid = payload.get("server_up") is True and not error
+        return {
+            "available": True,
+            "feature": "electronics_desktop",
+            "label": _safe_text(selected.get("label"), 100)
+            or "AnsysElectronicsDesktop",
+            "used": used,
+            "total": total,
+            "snapshot_valid": snapshot_valid,
+            "checked_at": _safe_text(payload.get("checked_at"), 80),
+            "error": error,
+        }
+
+    @staticmethod
+    def _unavailable_pool(error: str | None = None) -> dict[str, Any]:
+        return {
+            "available": False,
+            "enabled": None,
+            "adapter_ready": None,
+            "validation_passed": None,
+            "operational": None,
+            "max_sessions": None,
+            "min_idle_sessions": None,
+            "idle_sessions": None,
+            "hard_sessions": None,
+            "warm_spare_deficit": None,
+            "warm_spare_start_needed": None,
+            "session_record_count": None,
+            "lease_record_count": None,
+            "live_leases": None,
+            "queued_leases": None,
+            "ready_sessions": None,
+            "busy_sessions": None,
+            "session_states": {},
+            "lease_states": {},
+            "warm_spare_reason": None,
+            "error": error,
+        }
+
+    @staticmethod
+    def _unavailable_license(error: str | None = None) -> dict[str, Any]:
+        return {
+            "available": False,
+            "feature": "electronics_desktop",
+            "label": "AnsysElectronicsDesktop",
+            "used": None,
+            "total": None,
+            "snapshot_valid": None,
+            "checked_at": None,
+            "error": error,
+        }
+
+    def _aedt_attach_snapshot(self) -> dict[str, Any]:
+        """Fetch optional attach diagnostics concurrently within one deadline."""
+        pool = self._unavailable_pool()
+        license_status = self._unavailable_license()
+        requests = {
+            "pool": "/api/aedt-pool",
+            "license": "/api/licenses",
+        }
+        executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="mft-monitor-aedt"
+        )
+        futures = {
+            name: executor.submit(
+                self._request_json,
+                path,
+                timeout=self.optional_timeout,
+            )
+            for name, path in requests.items()
+        }
+        deadline = time.monotonic() + self.optional_timeout + 0.25
+        try:
+            for name, future in futures.items():
+                try:
+                    remaining = max(0.01, deadline - time.monotonic())
+                    payload = future.result(timeout=remaining)
+                    if name == "pool":
+                        pool = self._pool_snapshot(payload)
+                    else:
+                        license_status = self._license_snapshot(payload)
+                except Exception as exc:
+                    message = (
+                        f"{requests[name]} 조회 실패: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    if name == "pool":
+                        pool = self._unavailable_pool(message)
+                    else:
+                        license_status = self._unavailable_license(message)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        errors = [
+            error for error in (pool.get("error"), license_status.get("error"))
+            if error
+        ]
+        if pool["available"]:
+            if pool["enabled"] is False:
+                state = "disabled"
+            elif pool["operational"] is not True:
+                state = "gated"
+            else:
+                idle = pool.get("idle_sessions")
+                minimum_idle = pool.get("min_idle_sessions")
+                if idle is None or minimum_idle is None:
+                    state = "partial"
+                elif idle < minimum_idle:
+                    state = (
+                        "warming"
+                        if (pool.get("warm_spare_start_needed") or 0) > 0
+                        else "shortfall"
+                    )
+                elif not license_status["available"]:
+                    state = "partial"
+                elif (
+                    license_status.get("snapshot_valid") is not True
+                    or bool(license_status.get("error"))
+                ):
+                    state = "degraded"
+                else:
+                    state = "operational"
+        elif license_status["available"]:
+            state = "pool_unavailable"
+        else:
+            state = "unavailable"
+        return {
+            "available": bool(pool["available"] or license_status["available"]),
+            "state": state,
+            "license": license_status,
+            "pool": pool,
+            "errors": errors,
+        }
 
     def _project_control(self, project: Any) -> dict[str, Any]:
         if not isinstance(project, dict):
@@ -555,6 +1275,7 @@ class SchedulerReader:
                     result["project_error"] = (
                         f"scheduler project 조회 실패: {type(exc).__name__}: {exc}"
                     )
+            result["aedt_attach"] = self._aedt_attach_snapshot()
         except (HTTPError, URLError, OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
             result = {
                 "connected": False,
@@ -581,6 +1302,13 @@ class SchedulerReader:
                 "statuses": {},
                 "error": f"scheduler 조회 실패: {type(exc).__name__}: {exc}",
                 "updated_at": _iso(_now()),
+                "aedt_attach": {
+                    "available": False,
+                    "state": "unavailable",
+                    "license": self._unavailable_license(),
+                    "pool": self._unavailable_pool(),
+                    "errors": [],
+                },
             }
         with self._lock:
             self._cached = result
@@ -676,6 +1404,17 @@ class RuntimeRecorder:
                 "count_basis": data.get("count_basis"),
                 "pinned_solver_revision": data.get("pinned_revision"),
                 "pinned_library_revision": data.get("pinned_library_revision"),
+                "cohorts": [
+                    {
+                        key: cohort.get(key)
+                        for key in (
+                            "git_hash", "physics_data_revision", "raw_rows",
+                            "strict_em_rows", "strict_full_rows",
+                        )
+                    }
+                    for cohort in data.get("cohorts", [])
+                    if isinstance(cohort, dict)
+                ],
             },
             "models": {
                 "trained": models.get("trained_count"),
@@ -741,6 +1480,14 @@ class RuntimeRecorder:
             summary["data"]["complete_rows"],
             summary["data"]["pinned_solver_revision"],
             summary["data"]["pinned_library_revision"],
+            tuple(
+                (
+                    cohort.get("git_hash"),
+                    cohort.get("physics_data_revision"),
+                    cohort.get("strict_full_rows"),
+                )
+                for cohort in summary["data"]["cohorts"]
+            ),
             summary["models"]["trained"],
             summary["nsga2"]["round"],
             summary["nsga2"]["candidate_count"],
@@ -815,10 +1562,54 @@ class ArtifactService:
         self.scheduler = scheduler or SchedulerReader()
         self.clock = clock
         self.recorder = RuntimeRecorder(self.root / "monitoring" / "runtime") if record_runtime else None
+        self._campaign_audit_lock = threading.RLock()
+        self._campaign_audit_key: tuple[Any, ...] | None = None
+        self._campaign_audit_frame: Any = None
+        self._campaign_audit_warning: str | None = None
 
     @staticmethod
     def _warnings(*results: ReadResult) -> list[str]:
         return [result.warning for result in results if result.warning]
+
+    def _audited_campaign_frame(
+        self,
+        result: ReadResult,
+        expected_library_revision: str | None,
+    ) -> tuple[Any, str | None]:
+        """Cache canonical strict annotations for one immutable Parquet read."""
+        if not result.exists or result.value is None:
+            return None, result.warning
+        key = (
+            result.path,
+            result.mtime,
+            id(result.value),
+            expected_library_revision,
+        )
+        with self._campaign_audit_lock:
+            if key == self._campaign_audit_key:
+                return self._campaign_audit_frame, self._campaign_audit_warning
+            warning = None
+            try:
+                from ..quality_contract import annotate_validity
+
+                audited = annotate_validity(
+                    result.value,
+                    expected_solver_revision=CURRENT_SOLVER_REVISION,
+                    expected_library_revision=expected_library_revision,
+                )
+            except Exception as exc:
+                # Stored validity flags remain a fail-soft operational view;
+                # _campaign_frame_summary still pins them to the exact v3.2
+                # solver/physics identity instead of trusting legacy rows.
+                audited = result.value
+                warning = (
+                    "train.parquet strict audit failed; stored validity flags "
+                    f"are shown for the v3.2 cohort: {type(exc).__name__}: {exc}"
+                )
+            self._campaign_audit_key = key
+            self._campaign_audit_frame = audited
+            self._campaign_audit_warning = warning
+            return audited, warning
 
     def data(self) -> dict[str, Any]:
         now = self.clock()
@@ -827,6 +1618,7 @@ class ArtifactService:
         dataset_dir = self.root / "data" / "dataset"
         manifest_result = self.cache.json(dataset_dir / "manifest.json", {})
         rows_result = self.cache.csv(dataset_dir / "train_io.csv")
+        parquet_result = self.cache.parquet(dataset_dir / "train.parquet")
         cache_result = self.cache.json(dataset_dir / "collect_cache.json", {})
         strict_result = self.cache.json(
             self.root / "training" / "strict_data_status.json", {}
@@ -838,13 +1630,24 @@ class ArtifactService:
             strict_result.value if isinstance(strict_result.value, dict) else {}
         )
         warnings = self._warnings(
-            manifest_result, rows_result, cache_result, strict_result
+            manifest_result, rows_result, parquet_result, cache_result,
+            strict_result,
         )
 
         manifest_total = _integer(manifest.get("total_rows"), -1)
-        raw_total = manifest_total if manifest_total >= 0 else len(rows)
+        parquet_rows = (
+            len(parquet_result.value)
+            if parquet_result.value is not None
+            and hasattr(parquet_result.value, "__len__") else -1
+        )
+        observed_rows = parquet_rows if parquet_rows >= 0 else len(rows)
+        raw_total = manifest_total if manifest_total >= 0 else observed_rows
         if rows and manifest_total >= 0 and len(rows) != manifest_total:
             warnings.append(f"manifest({manifest_total})와 train_io.csv({len(rows)}) 행 수가 다릅니다.")
+        if parquet_rows >= 0 and manifest_total >= 0 and parquet_rows != manifest_total:
+            warnings.append(
+                f"manifest({manifest_total})와 train.parquet({parquet_rows}) 행 수가 다릅니다."
+            )
 
         identity = strict_status.get("state_identity")
         identity = identity if isinstance(identity, dict) else {}
@@ -861,6 +1664,17 @@ class ArtifactService:
             str(identity.get("library_revision")).strip().lower()
             if strict_available else None
         )
+        audit_library_revision = (
+            pinned_library_revision
+            if pinned_revision == CURRENT_SOLVER_REVISION else None
+        )
+        campaign_frame, audit_warning = self._audited_campaign_frame(
+            parquet_result, audit_library_revision
+        )
+        if campaign_frame is None:
+            campaign_frame = rows
+        if audit_warning and audit_warning not in warnings:
+            warnings.append(audit_warning)
         total = _integer(strict_status.get("strict_full_rows"), 0) if strict_available else 0
         em_valid = _integer(strict_status.get("strict_em_rows"), 0) if strict_available else 0
         thermal_valid = complete = total
@@ -878,6 +1692,9 @@ class ArtifactService:
         one_hour_ago = now - timedelta(hours=1)
         day_ago = now - timedelta(hours=24)
         strict_history = []
+        cohort_history: dict[
+            tuple[str, str], list[tuple[datetime, int]]
+        ] = defaultdict(list)
         history_path = self.root / "monitoring" / "runtime" / "monitor_history.jsonl"
         if history_path.is_file():
             try:
@@ -889,6 +1706,33 @@ class ArtifactService:
                             continue
                         data_entry = entry.get("data") if isinstance(entry, dict) else None
                         stamp = _parse_time(entry.get("time"), now.tzinfo) if isinstance(entry, dict) else None
+                        if isinstance(data_entry, dict) and stamp is not None:
+                            history_cohorts = data_entry.get("cohorts")
+                            if isinstance(history_cohorts, list):
+                                for cohort in history_cohorts:
+                                    if not isinstance(cohort, dict):
+                                        continue
+                                    revision = (
+                                        _optional_text(
+                                            cohort.get("git_hash"), 40
+                                        ) or ""
+                                    ).lower()
+                                    physics_revision = (
+                                        _optional_text(
+                                            cohort.get(
+                                                "physics_data_revision"
+                                            ), 160,
+                                        )
+                                        or LEGACY_PHYSICS_DATA_REVISION
+                                    )
+                                    cohort_history[(
+                                        revision, physics_revision
+                                    )].append((
+                                        stamp,
+                                        _integer(
+                                            cohort.get("strict_full_rows"), 0
+                                        ),
+                                    ))
                         if (isinstance(data_entry, dict)
                                 and data_entry.get("count_basis") == "pinned_strict_full"
                                 and pinned_revision is not None
@@ -899,6 +1743,11 @@ class ArtifactService:
                             strict_history.append((stamp, _integer(data_entry.get("total_rows"), 0)))
             except OSError as exc:
                 warnings.append(f"strict runtime history read failed: {exc}")
+        campaign_summary = _campaign_frame_summary(
+            campaign_frame,
+            now,
+            cohort_history=dict(cohort_history),
+        )
         def _growth_since(cutoff):
             earlier = [value for stamp, value in strict_history if stamp <= cutoff]
             if earlier:
@@ -937,16 +1786,21 @@ class ArtifactService:
                     "total": cumulative,
                 })
 
+        campaign_identity_rows = _frame_records(
+            campaign_frame, ("git_hash", "saved_at")
+        )
+        revision_rows = campaign_identity_rows or rows
         revisions = Counter(
-            str(row.get("git_hash", "")).strip().lower()
-            for row in rows if str(row.get("git_hash", "")).strip()
+            revision.lower()
+            for row in revision_rows
+            if (revision := _optional_text(row.get("git_hash"), 40))
         )
         latest_revision = None
         timed_revisions = [
             (stamp, revision)
-            for row in rows
+            for row in revision_rows
             if (stamp := _parse_time(row.get("saved_at"), now.tzinfo)) is not None
-            if (revision := _safe_text(row.get("git_hash"), 40))
+            if (revision := _optional_text(row.get("git_hash"), 40))
         ]
         if timed_revisions:
             latest_revision = max(timed_revisions, key=lambda item: item[0])[1].lower()
@@ -963,7 +1817,10 @@ class ArtifactService:
 
         return {
             "schema_version": SCHEMA_VERSION,
-            "available": manifest_result.exists or rows_result.exists,
+            "available": (
+                manifest_result.exists or rows_result.exists
+                or parquet_result.exists
+            ),
             "count_basis": "pinned_strict_full",
             "strict_status_available": strict_available,
             "raw_total_rows": raw_total,
@@ -992,8 +1849,11 @@ class ArtifactService:
             "latest_revision": latest_revision,
             "pinned_revision": pinned_revision,
             "pinned_library_revision": pinned_library_revision,
+            "current_solver_revision": CURRENT_SOLVER_REVISION,
+            "current_physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
             "revision_count": len(revisions) or len(hashes),
             "rows_not_latest_revision": revision_mismatch,
+            **campaign_summary,
             "collector": {
                 "harvested_tasks": len(harvested) if isinstance(harvested, list) else None,
                 "no_data_tasks": len(nodata) if isinstance(nodata, list) else None,
@@ -1004,9 +1864,17 @@ class ArtifactService:
             "source": {
                 "manifest": str(manifest_result.path),
                 "rows": str(rows_result.path),
+                "parquet": str(parquet_result.path),
+                "campaign_rows": (
+                    str(parquet_result.path)
+                    if parquet_result.exists
+                    and parquet_result.value is not None
+                    else str(rows_result.path)
+                ),
                 "strict_status": str(strict_result.path),
                 "updated_at": _iso(
-                    strict_result.mtime or manifest_result.mtime or rows_result.mtime
+                    strict_result.mtime or parquet_result.mtime
+                    or manifest_result.mtime or rows_result.mtime
                 ),
             },
             "warnings": warnings,

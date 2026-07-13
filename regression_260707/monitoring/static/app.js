@@ -81,6 +81,27 @@
     return node;
   }
 
+  function hasNumber(value) {
+    return value != null && value !== "" && Number.isFinite(Number(value));
+  }
+
+  function count(value, suffix = "개") {
+    return hasNumber(value) ? `${number(value)}${suffix}` : "—";
+  }
+
+  function ratio(numerator, denominator, suffix = "") {
+    if (!hasNumber(numerator) || !hasNumber(denominator)) return "—";
+    return `${number(numerator)} / ${number(denominator)}${suffix}`;
+  }
+
+  function rangeSummary(stats = {}, unit = "", digits = 3) {
+    const unitSuffix = unit ? ` ${unit}` : "";
+    const median = hasNumber(stats.median) ? `${number(stats.median, digits)}${unitSuffix}` : "—";
+    const minimum = hasNumber(stats.min) ? `${number(stats.min, digits)}${unitSuffix}` : "—";
+    const maximum = hasNumber(stats.max) ? `${number(stats.max, digits)}${unitSuffix}` : "—";
+    return { median, detail: `최소 ${minimum} · 최대 ${maximum} · n=${number(stats.sample_count)}` };
+  }
+
   function timingCell(timing = {}) {
     const cell = element("td", "simulation-timing");
     const grid = element("div", "timing-grid");
@@ -175,6 +196,216 @@
       color: "#26d7c7", area: true,
     });
     $("#data-chart-empty").classList.toggle("hidden", (data.history || []).length > 0);
+    renderCohorts(data.cohorts, data.current_cohort_metadata);
+    renderQuarantine(data.quarantine);
+    renderElectrostatic(data.electrostatic);
+    renderThermalModels(data.thermal_models);
+  }
+
+  function renderCohorts(cohortsPayload, metadataPayload) {
+    const cohorts = Array.isArray(cohortsPayload) ? cohortsPayload : [];
+    const list = $("#cohort-list");
+    list.replaceChildren();
+    setText("#cohort-summary", cohorts.length ? `${number(cohorts.length)}개 코호트` : "코호트 —");
+    if (!cohorts.length) {
+      list.append(element("p", "empty-state compact-empty", "사용 가능한 코호트 데이터가 없습니다."));
+    } else {
+      [...cohorts].sort((left, right) => Number(Boolean(right?.current)) - Number(Boolean(left?.current))).forEach((cohort) => {
+        const card = element("article", `cohort-row${cohort?.current ? " current" : ""}`);
+        const heading = element("div", "cohort-row-heading");
+        const identity = element("div");
+        const hash = cohort?.git_hash_short || (cohort?.git_hash ? String(cohort.git_hash).slice(0, 10) : "—");
+        identity.append(element("strong", "mono", hash));
+        identity.append(element("span", "", cohort?.physics_data_revision || "physics revision —"));
+        heading.append(identity);
+        if (cohort?.current) heading.append(element("span", "state-chip pass", "CURRENT v3.2"));
+        card.append(heading);
+        const metrics = element("dl", "cohort-metric-grid");
+        [
+          ["Raw", count(cohort?.raw_rows)],
+          ["Strict EM", count(cohort?.strict_em_rows)],
+          ["Strict full", count(cohort?.strict_full_rows)],
+          ["증가 속도", hasNumber(cohort?.growth_rate_per_hour)
+            ? `${Number(cohort.growth_rate_per_hour) > 0 ? "+" : ""}${number(cohort.growth_rate_per_hour, 1)}/h`
+            : "—"],
+        ].forEach(([label, value]) => {
+          const item = element("div");
+          item.append(element("dt", "", label), element("dd", "", value));
+          metrics.append(item);
+        });
+        card.append(metrics);
+        list.append(card);
+      });
+    }
+
+    const metadata = metadataPayload && typeof metadataPayload === "object" ? metadataPayload : {};
+    const lamination = metadata.core_lamination_factor || {};
+    const laminationRange = rangeSummary(lamination, "", 3);
+    setText(
+      "#cohort-lamination-factor",
+      laminationRange.median === "—" ? "—" : `중앙값 ${laminationRange.median}`,
+    );
+    setText(
+      "#cohort-lamination-detail",
+      hasNumber(lamination.min) || hasNumber(lamination.max) || hasNumber(lamination.sample_count)
+        ? laminationRange.detail
+        : "표본 —",
+    );
+
+    const flux = metadata.winding_flux_linkage_readback || {};
+    setText("#cohort-flux-availability", ratio(flux.available_rows, flux.cohort_rows, "개"));
+    setText(
+      "#cohort-flux-detail",
+      hasNumber(flux.unavailable_rows) || hasNumber(flux.missing_rows)
+        ? `미지원 ${count(flux.unavailable_rows)} · 누락 ${count(flux.missing_rows)}`
+        : "상태 —",
+    );
+    const statuses = $("#cohort-flux-statuses");
+    statuses.replaceChildren();
+    const statusRows = Array.isArray(flux.statuses) ? flux.statuses : [];
+    statusRows.forEach((item) => {
+      statuses.append(element("span", "mini-chip", `${item?.status || "미지정"} ${count(item?.count)}`));
+    });
+  }
+
+  function renderReasonList(container, reasonsPayload, emptyMessage) {
+    const reasons = Array.isArray(reasonsPayload) ? reasonsPayload : [];
+    container.replaceChildren();
+    if (!reasons.length) {
+      container.append(element("p", "empty-state compact-empty", emptyMessage));
+      return;
+    }
+    reasons.forEach((item) => {
+      const row = element("div", "reason-row");
+      row.append(element("code", "", item?.reason || "미지정 사유"), element("strong", "", count(item?.count)));
+      container.append(row);
+    });
+  }
+
+  function renderQuarantine(payload) {
+    const quarantine = payload && typeof payload === "object" ? payload : {};
+    const current = quarantine.current && typeof quarantine.current === "object" ? quarantine.current : {};
+    const legacy = quarantine.legacy && typeof quarantine.legacy === "object" ? quarantine.legacy : {};
+    setText("#quarantine-current-title", current.label || "현재 v3.2 코호트");
+    setText("#quarantine-current-count", count(current.rows));
+    renderReasonList($("#quarantine-current-reasons"), current.reasons, hasNumber(current.rows) && Number(current.rows) === 0
+      ? "현재 코호트의 격리 행이 없습니다."
+      : "현재 코호트 격리 정보를 사용할 수 없습니다.");
+    setText("#quarantine-legacy-label", legacy.label || "레거시 코호트 노이즈");
+    setText("#quarantine-legacy-count", count(legacy.rows));
+    renderReasonList($("#quarantine-legacy-reasons"), legacy.reasons, hasNumber(legacy.rows) && Number(legacy.rows) === 0
+      ? "레거시 격리 행이 없습니다."
+      : "레거시 격리 정보를 사용할 수 없습니다.");
+  }
+
+  function renderRangeList(container, entries, unit) {
+    container.replaceChildren();
+    entries.forEach(([key, label, stats]) => {
+      const source = stats && typeof stats === "object" ? stats : {};
+      const unitKey = unit === "nF" ? "nF" : unit === "kHz" ? "kHz" : null;
+      const values = {
+        ...source,
+        min: unitKey ? (source[`min_${unitKey}`] ?? source.min) : source.min,
+        median: unitKey ? (source[`median_${unitKey}`] ?? source.median) : source.median,
+        max: unitKey ? (source[`max_${unitKey}`] ?? source.max) : source.max,
+      };
+      const summary = rangeSummary(values, unit, 3);
+      const row = element("div", "range-row");
+      const identity = element("div", "range-identity");
+      identity.append(element("b", "", label));
+      identity.append(element("code", "", values.source_column || "source —"));
+      const result = element("div", "range-values");
+      result.append(element("strong", "", `중앙값 ${summary.median}`));
+      result.append(element("small", "", summary.detail));
+      row.dataset.metric = key;
+      row.append(identity, result);
+      container.append(row);
+    });
+  }
+
+  function renderElectrostatic(payload) {
+    const electrostatic = payload && typeof payload === "object" ? payload : {};
+    const available = electrostatic.available === true;
+    const stateChip = $("#electrostatic-state");
+    stateChip.className = `state-chip ${available ? "pass" : "unknown"}`;
+    stateChip.textContent = available ? "v3.2 STRICT" : "사용 불가";
+    const basisLabels = {
+      "current_v3.2_strict_full": "현재 v3.2 strict-full 코호트 기준",
+    };
+    setText(
+      "#electrostatic-basis",
+      basisLabels[electrostatic.cohort_basis] || electrostatic.cohort_basis || "v3.2 strict 코호트 기준",
+    );
+    setText("#cap-stage-present", count(electrostatic.cap_stage_present_rows));
+    setText("#cap-stage-absent", count(electrostatic.cap_stage_absent_rows));
+    setText("#cap-stage-unknown", count(electrostatic.cap_stage_unknown_rows));
+    setText("#electrostatic-cohort-rows", count(electrostatic.cohort_rows));
+    const capacitance = electrostatic.capacitance || {};
+    renderRangeList($("#capacitance-summary"), [
+      ["tx_tx", "C_tx_tx", capacitance.tx_tx],
+      ["rx_rx", "C_rx_rx", capacitance.rx_rx],
+      ["tx_rx", "C_tx_rx", capacitance.tx_rx],
+    ], "nF");
+    const resonance = electrostatic.resonance || {};
+    renderRangeList($("#resonance-summary"), [
+      ["tx_self", "Tx self", resonance.tx_self],
+      ["rx_self", "Rx self", resonance.rx_self],
+      ["interwinding", "상호권선", resonance.interwinding],
+    ], "kHz");
+  }
+
+  function thermalModelLabel(model) {
+    const names = {
+      isotropic_legacy: "등방성 레거시",
+      anisotropic_wound_rule_of_mixtures_v1: "이방성 권선 혼합칙 v1",
+    };
+    return names[model] || model || "미지정 모델";
+  }
+
+  function thermalStat(label, statsPayload) {
+    const stats = statsPayload && typeof statsPayload === "object" ? statsPayload : {};
+    const summary = rangeSummary(stats, "W/m·K", 3);
+    const row = element("div", "thermal-stat");
+    row.append(element("span", "", label));
+    const values = element("div");
+    values.append(element("strong", "", summary.median), element("small", "", summary.detail));
+    row.append(values);
+    return row;
+  }
+
+  function renderThermalModels(payload) {
+    const thermal = payload && typeof payload === "object" ? payload : {};
+    const models = Array.isArray(thermal.models) ? thermal.models : [];
+    setText("#thermal-model-summary", thermal.available === true ? `${count(thermal.tagged_rows)} 태그` : "사용 불가");
+    setText(
+      "#thermal-model-missing",
+      hasNumber(thermal.total_rows) || hasNumber(thermal.missing_rows)
+        ? `전체 ${count(thermal.total_rows)} · 태그 ${count(thermal.tagged_rows)} · 누락 ${count(thermal.missing_rows)}`
+        : "이 필드를 포함한 행이 없습니다.",
+    );
+    const list = $("#thermal-model-list");
+    list.replaceChildren();
+    if (!models.length) {
+      list.append(element("p", "empty-state compact-empty", "사용 가능한 열모델 태그 데이터가 없습니다."));
+      return;
+    }
+    models.forEach((item) => {
+      const card = element("article", "thermal-model-row");
+      const heading = element("div", "thermal-model-heading");
+      const identity = element("div");
+      identity.append(element("strong", "", thermalModelLabel(item?.model)));
+      identity.append(element("code", "", item?.model || "—"));
+      const share = hasNumber(item?.percent) ? `${number(item.percent, 1)}%` : "—";
+      heading.append(identity, element("b", "", `${count(item?.count)} · ${share}`));
+      card.append(heading);
+      const stats = element("div", "thermal-stat-list");
+      stats.append(
+        thermalStat("면내 k", item?.thermal_core_k_inplane),
+        thermalStat("적층방향 k", item?.thermal_core_k_throughstack),
+      );
+      card.append(stats);
+      list.append(card);
+    });
   }
 
   function chartBounds(svg) {
@@ -707,12 +938,93 @@
     node.className = `parallel-target-status${kind ? ` ${kind}` : ""}`;
   }
 
+  function snapshotMessage(value) {
+    if (value == null || value === "") return null;
+    if (typeof value === "string") return value;
+    if (typeof value === "object") return value.message || value.error || value.detail || null;
+    return String(value);
+  }
+
+  function renderAedtAttach(scheduler = {}) {
+    const attach = scheduler.aedt_attach && typeof scheduler.aedt_attach === "object"
+      ? scheduler.aedt_attach
+      : {};
+    const license = attach.license && typeof attach.license === "object" ? attach.license : {};
+    const pool = attach.pool && typeof attach.pool === "object" ? attach.pool : {};
+    const rawState = String(attach.state || "").toLowerCase();
+    let stateKey = rawState;
+    if (!stateKey) {
+      if (pool.available === true && pool.enabled === true && pool.operational === true) stateKey = "healthy";
+      else if (pool.available === true && pool.enabled === true) stateKey = "degraded";
+      else if (pool.available === true && pool.enabled === false) stateKey = "disabled";
+      else stateKey = attach.available === true ? "partial" : "unavailable";
+    }
+    const healthyStates = new Set(["healthy", "ready", "ok", "operational", "available"]);
+    const warningStates = new Set(["degraded", "partial", "shortfall", "warming", "warning", "gated", "pool_unavailable"]);
+    const errorStates = new Set(["error", "failed", "failure"]);
+    const chipClass = healthyStates.has(stateKey) ? "pass"
+      : warningStates.has(stateKey) ? "attention"
+        : errorStates.has(stateKey) ? "fail" : "unknown";
+    const stateLabels = {
+      healthy: "정상", ready: "준비됨", ok: "정상", operational: "운영 중", available: "사용 가능",
+      degraded: "주의", partial: "일부 확인", shortfall: "유휴 부족", warming: "예열 중", warning: "주의",
+      gated: "Attach 제한", pool_unavailable: "Pool 확인 불가",
+      disabled: "비활성", unavailable: "사용 불가", unknown: "확인 불가",
+      error: "오류", failed: "오류", failure: "오류",
+    };
+    const stateChip = $("#aedt-attach-state");
+    stateChip.className = `state-chip ${chipClass}`;
+    stateChip.textContent = stateLabels[stateKey] || attach.state || "확인 불가";
+    const card = $("#aedt-attach-card");
+    card.className = `aedt-attach-card ${chipClass === "pass" ? "healthy" : chipClass === "attention" ? "degraded" : chipClass === "fail" ? "error" : "unavailable"}`;
+
+    setText(
+      "#aedt-license-usage",
+      hasNumber(license.used) && hasNumber(license.total) ? `${number(license.used)} / ${number(license.total)}` : "—",
+    );
+    let poolState = "—";
+    if (pool.available === true) {
+      if (pool.enabled === false) poolState = "비활성";
+      else if (stateKey === "warming") poolState = "예열 중";
+      else if (stateKey === "shortfall") poolState = "유휴 부족";
+      else if (pool.operational === true) poolState = "운영 중";
+      else if (pool.enabled === true) poolState = "주의 필요";
+      else poolState = "확인 불가";
+    }
+    setText("#aedt-pool-state", poolState);
+    setText("#aedt-pool-idle", pool.available === true ? ratio(pool.idle_sessions, pool.min_idle_sessions) : "—");
+    setText("#aedt-pool-sessions", pool.available === true ? ratio(pool.hard_sessions, pool.max_sessions) : "—");
+    setText(
+      "#aedt-pool-leases",
+      pool.available === true && hasNumber(pool.live_leases) && hasNumber(pool.queued_leases)
+        ? `${number(pool.live_leases)} / ${number(pool.queued_leases)}`
+        : "—",
+    );
+    setText("#aedt-pool-capacity", pool.available === true ? ratio(pool.ready_sessions, pool.busy_sessions) : "—");
+
+    const errors = [
+      ...(Array.isArray(attach.errors) ? attach.errors : []),
+      license.error,
+      pool.error,
+    ].map(snapshotMessage).filter(Boolean);
+    if (errors.length) {
+      setText("#aedt-attach-detail", [...new Set(errors)].join(" · "));
+    } else if (pool.warm_spare_reason) {
+      setText("#aedt-attach-detail", pool.warm_spare_reason);
+    } else if (attach.available === true) {
+      setText("#aedt-attach-detail", license.checked_at ? `라이선스 ${dateTime(license.checked_at)} 확인` : "Scheduler AEDT snapshot 정상");
+    } else {
+      setText("#aedt-attach-detail", "Scheduler의 AEDT pool / license 정보를 사용할 수 없습니다.");
+    }
+  }
+
   function renderParallelControl(scheduler = {}) {
     setText("#parallel-current-target", number(scheduler.parallel_target));
     setText("#parallel-logical-active", number(scheduler.logical_active));
     setText("#parallel-queued", number(scheduler.live_queued));
     setText("#parallel-attaching", number(scheduler.live_attaching));
     setText("#parallel-running", number(scheduler.live_running));
+    renderAedtAttach(scheduler);
     const input = $("#parallel-target-input");
     const button = $("#parallel-target-button");
     const enabled = scheduler.connected === true && scheduler.control_enabled === true

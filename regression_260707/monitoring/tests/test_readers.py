@@ -1,8 +1,11 @@
 import hashlib
 import json
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
+from urllib.error import URLError
 
+import pandas as pd
 import pytest
 
 from regression_260707.model_targets import (
@@ -11,11 +14,14 @@ from regression_260707.model_targets import (
 )
 from regression_260707.monitoring.readers import (
     ArtifactService,
+    CURRENT_PHYSICS_DATA_REVISION,
+    CURRENT_SOLVER_REVISION,
     RuntimeRecorder,
     SafeArtifactCache,
     SchedulerReader,
     TARGET_META,
     TEMPERATURE_TARGETS,
+    _campaign_frame_summary,
     _simulation_timing_summary,
     _zero_aware_percentage_metrics,
 )
@@ -425,6 +431,327 @@ def test_zero_aware_percentage_metrics_exclude_structural_zero_targets():
     assert all_zero["mape_excluded_zero_count"] == 1
 
 
+def test_campaign_frame_summary_separates_v32_cohort_and_physics_panels():
+    from .conftest import FIXED_NOW
+
+    current = {
+        "git_hash": CURRENT_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        "saved_at": (FIXED_NOW - timedelta(minutes=20)).isoformat(),
+        "thermal_core_conductivity_model": (
+            "anisotropic_wound_rule_of_mixtures_v1"
+        ),
+        "thermal_core_k_inplane": 18.0,
+        "thermal_core_k_throughstack": 2.0,
+        "core_lamination_factor": 0.85,
+    }
+    frame = pd.DataFrame([
+        {
+            **current,
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+            "cap_on": 1,
+            "C_tx_tx_F": 1e-9,
+            "C_rx_rx_F": 4e-9,
+            "C_tx_rx_F": 0.2e-9,
+            "f_res_tx_self_Hz": 100_000.0,
+            "f_res_rx_self_Hz": 200_000.0,
+            "f_res_interwinding_Hz": 50_000.0,
+            "winding_flux_linkage_readback_status": "available",
+            "winding_flux_linkage_readback_applicable": 1,
+            "winding_flux_linkage_readback_available": 1,
+            "winding_flux_linkage_readback_passed": 1,
+        },
+        {
+            **current,
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+            "cap_on": 1,
+            "C_tx_tx_F": 3e-9,
+            "C_rx_rx_F": 8e-9,
+            "C_tx_rx_F": 0.6e-9,
+            "f_res_tx_self_Hz": 300_000.0,
+            "f_res_rx_self_Hz": 400_000.0,
+            "f_res_interwinding_Hz": 150_000.0,
+            "winding_flux_linkage_readback_status": "unavailable",
+            "winding_flux_linkage_readback_applicable": 1,
+            "winding_flux_linkage_readback_available": 0,
+            "winding_flux_linkage_readback_passed": 0,
+        },
+        {
+            **current,
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+            "cap_on": 0,
+        },
+        {
+            **current,
+            "_strict_valid_em": True,
+            "_strict_valid_full": False,
+            "_strict_invalid_reasons": "thermal:required_group_missing",
+            "cap_on": 1,
+            "winding_flux_linkage_readback_status": "available",
+            "winding_flux_linkage_readback_available": 1,
+        },
+        {
+            **current,
+            "_strict_valid_em": False,
+            "_strict_valid_full": False,
+            "_strict_invalid_reasons": "em:matrix_invalid",
+            "cap_on": 1,
+            "winding_flux_linkage_readback_status": "unavailable",
+            "winding_flux_linkage_readback_available": 0,
+        },
+        {
+            "git_hash": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+            "physics_data_revision": "legacy_unspecified",
+            "saved_at": (FIXED_NOW - timedelta(minutes=10)).isoformat(),
+            "_strict_valid_em": False,
+            "_strict_valid_full": False,
+            "_strict_invalid_reasons": (
+                "untrusted_provenance:solver_revision_mismatch"
+            ),
+            "thermal_core_conductivity_model": "isotropic_legacy",
+            "thermal_core_k_inplane": 10.0,
+            "thermal_core_k_throughstack": 10.0,
+        },
+        {
+            "git_hash": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+            "physics_data_revision": "legacy_unspecified",
+            "saved_at": (FIXED_NOW - timedelta(hours=2)).isoformat(),
+            "_strict_valid_em": False,
+            "_strict_valid_full": False,
+            "thermal_core_conductivity_model": "isotropic_legacy",
+            "thermal_core_k_inplane": 10.0,
+            "thermal_core_k_throughstack": 10.0,
+        },
+    ])
+    history = {
+        (CURRENT_SOLVER_REVISION, CURRENT_PHYSICS_DATA_REVISION): [
+            (FIXED_NOW - timedelta(hours=1, minutes=5), 1),
+        ],
+    }
+
+    summary = _campaign_frame_summary(frame, FIXED_NOW, history)
+
+    assert len(summary["cohorts"]) == 2
+    cohort = summary["cohorts"][0]
+    assert cohort == {
+        "git_hash": CURRENT_SOLVER_REVISION,
+        "git_hash_short": CURRENT_SOLVER_REVISION[:10],
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        "current": True,
+        "raw_rows": 5,
+        "strict_em_rows": 4,
+        "strict_full_rows": 3,
+        "growth_rate_per_hour": 2.0,
+    }
+    legacy = summary["cohorts"][1]
+    assert legacy["current"] is False
+    assert legacy["raw_rows"] == 2
+    assert legacy["strict_em_rows"] == 0
+    assert legacy["strict_full_rows"] == 0
+
+    electrostatic = summary["electrostatic"]
+    assert electrostatic["cohort_basis"] == "current_v3.2_strict_full"
+    assert electrostatic["cohort_rows"] == 3
+    assert electrostatic["cap_stage_present_rows"] == 2
+    assert electrostatic["cap_stage_absent_rows"] == 1
+    assert electrostatic["cap_stage_unknown_rows"] == 0
+    expected_capacitance = {
+        "tx_tx": ("C_tx_tx_F", 1.0, 2.0, 3.0),
+        "rx_rx": ("C_rx_rx_F", 4.0, 6.0, 8.0),
+        "tx_rx": ("C_tx_rx_F", 0.2, 0.4, 0.6),
+    }
+    for key, (source, minimum, median, maximum) in expected_capacitance.items():
+        metric = electrostatic["capacitance"][key]
+        assert metric["source_column"] == source
+        assert metric["sample_count"] == 2
+        assert metric["min_nF"] == pytest.approx(minimum)
+        assert metric["median_nF"] == pytest.approx(median)
+        assert metric["max_nF"] == pytest.approx(maximum)
+    expected_resonance = {
+        "tx_self": ("f_res_tx_self_Hz", 100.0, 200.0, 300.0),
+        "rx_self": ("f_res_rx_self_Hz", 200.0, 300.0, 400.0),
+        "interwinding": (
+            "f_res_interwinding_Hz", 50.0, 100.0, 150.0
+        ),
+    }
+    for key, (source, minimum, median, maximum) in expected_resonance.items():
+        metric = electrostatic["resonance"][key]
+        assert metric["source_column"] == source
+        assert metric["sample_count"] == 2
+        assert metric["min_kHz"] == pytest.approx(minimum)
+        assert metric["median_kHz"] == pytest.approx(median)
+        assert metric["max_kHz"] == pytest.approx(maximum)
+
+    thermal = {
+        item["model"]: item for item in summary["thermal_models"]["models"]
+    }
+    assert summary["thermal_models"]["tagged_rows"] == 7
+    assert thermal["anisotropic_wound_rule_of_mixtures_v1"]["count"] == 5
+    assert thermal["isotropic_legacy"]["count"] == 2
+    assert thermal["anisotropic_wound_rule_of_mixtures_v1"][
+        "thermal_core_k_inplane"
+    ]["median"] == pytest.approx(18.0)
+
+    quarantine = summary["quarantine"]
+    assert quarantine["current"]["rows"] == 2
+    assert quarantine["legacy"]["rows"] == 2
+    current_reasons = {
+        item["reason"]: item["count"]
+        for item in quarantine["current"]["reasons"]
+    }
+    legacy_reasons = {
+        item["reason"]: item["count"]
+        for item in quarantine["legacy"]["reasons"]
+    }
+    assert current_reasons == {
+        "em:matrix_invalid": 1,
+        "thermal:required_group_missing": 1,
+    }
+    assert not any("solver_revision_mismatch" in reason
+                   for reason in current_reasons)
+    assert legacy_reasons[
+        "untrusted_provenance:solver_revision_mismatch"
+    ] == 2
+
+    metadata = summary["current_cohort_metadata"]
+    assert metadata["core_lamination_factor"] == {
+        "source_column": "core_lamination_factor",
+        "sample_count": 5,
+        "min": 0.85,
+        "median": 0.85,
+        "max": 0.85,
+    }
+    readback = metadata["winding_flux_linkage_readback"]
+    assert readback["cohort_rows"] == 5
+    assert readback["available_rows"] == 2
+    assert readback["unavailable_rows"] == 2
+    assert readback["missing_rows"] == 1
+    assert {item["status"]: item["count"] for item in readback["statuses"]} == {
+        "available": 2,
+        "missing": 1,
+        "unavailable": 2,
+    }
+
+
+def test_campaign_frame_summary_tolerates_missing_v32_columns_and_uses_flags():
+    from .conftest import FIXED_NOW
+
+    frame = pd.DataFrame([
+        {
+            "git_hash": CURRENT_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "result_valid_em": 1,
+            "result_valid_thermal": 1,
+        },
+        {
+            "git_hash": CURRENT_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        },
+    ])
+
+    summary = _campaign_frame_summary(frame, FIXED_NOW)
+
+    cohort = summary["cohorts"][0]
+    assert cohort["raw_rows"] == 2
+    assert cohort["strict_em_rows"] == 1
+    assert cohort["strict_full_rows"] == 1
+    assert cohort["growth_rate_per_hour"] == 0.0
+    electrostatic = summary["electrostatic"]
+    assert electrostatic["available"] is False
+    assert electrostatic["cohort_rows"] == 1
+    assert electrostatic["cap_stage_present_rows"] == 0
+    assert electrostatic["cap_stage_absent_rows"] == 0
+    assert electrostatic["cap_stage_unknown_rows"] == 1
+    for metric in (
+        *electrostatic["capacitance"].values(),
+        *electrostatic["resonance"].values(),
+    ):
+        assert metric["sample_count"] == 0
+        assert all(value is None for key, value in metric.items()
+                   if key.startswith(("min_", "median_", "max_")))
+    assert summary["thermal_models"] == {
+        "available": False,
+        "total_rows": 2,
+        "tagged_rows": 0,
+        "missing_rows": 2,
+        "models": [],
+    }
+    assert summary["current_cohort_metadata"]["core_lamination_factor"][
+        "sample_count"
+    ] == 0
+    assert summary["current_cohort_metadata"][
+        "winding_flux_linkage_readback"
+    ]["missing_rows"] == 2
+
+
+def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
+    from .conftest import DummyScheduler, FIXED_NOW
+
+    frame = pd.DataFrame([
+        {
+            "git_hash": CURRENT_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": FIXED_NOW.isoformat(),
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+            "cap_on": 1,
+            "C_tx_tx_F": 2e-9,
+            "C_rx_rx_F": 4e-9,
+            "C_tx_rx_F": 0.5e-9,
+            "f_res_tx_self_Hz": 100_000.0,
+            "f_res_rx_self_Hz": 200_000.0,
+            "f_res_interwinding_Hz": 50_000.0,
+            "thermal_core_conductivity_model": (
+                "anisotropic_wound_rule_of_mixtures_v1"
+            ),
+            "thermal_core_k_inplane": 18.0,
+            "thermal_core_k_throughstack": 2.0,
+        },
+        {
+            "git_hash": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+            "physics_data_revision": "legacy_unspecified",
+            "saved_at": (FIXED_NOW - timedelta(hours=2)).isoformat(),
+            "_strict_valid_em": False,
+            "_strict_valid_full": False,
+            "thermal_core_conductivity_model": "isotropic_legacy",
+        },
+    ])
+    parquet_path = campaign_root / "data" / "dataset" / "train.parquet"
+    frame.to_parquet(parquet_path, index=False)
+    service = ArtifactService(
+        campaign_root,
+        scheduler=DummyScheduler(),
+        clock=lambda: FIXED_NOW,
+        record_runtime=False,
+    )
+
+    def passthrough_audit(result, expected_library_revision):
+        assert result.path == str(parquet_path)
+        assert result.value is not None
+        return result.value, None
+
+    with mock.patch.object(
+        service,
+        "_audited_campaign_frame",
+        side_effect=passthrough_audit,
+    ):
+        data = service.data()
+
+    assert data["source"]["campaign_rows"] == str(parquet_path)
+    assert data["cohorts"][0]["current"] is True
+    assert data["cohorts"][0]["raw_rows"] == 1
+    assert data["cohorts"][0]["strict_full_rows"] == 1
+    assert data["electrostatic"]["cap_stage_present_rows"] == 1
+    assert data["electrostatic"]["capacitance"]["tx_tx"][
+        "median_nF"
+    ] == pytest.approx(2.0)
+    assert data["thermal_models"]["tagged_rows"] == 2
+    assert data["quarantine"]["legacy"]["rows"] == 1
+
+
 def test_runtime_recorder_recovers_from_winerror5_without_temp_collision(
         tmp_path, artifact_service):
     recorder = RuntimeRecorder(tmp_path / "runtime", min_interval_seconds=0)
@@ -497,6 +824,28 @@ def test_corrupt_json_retains_last_good_value(tmp_path):
     assert "마지막 정상" in second.warning or "읽기 실패" in second.warning
 
 
+def test_parquet_reader_retains_last_good_synthetic_frame(tmp_path):
+    path = tmp_path / "train.parquet"
+    expected = pd.DataFrame([{
+        "git_hash": CURRENT_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        "C_tx_tx_F": 1e-9,
+    }])
+    expected.to_parquet(path, index=False)
+    cache = SafeArtifactCache()
+
+    first = cache.parquet(path)
+    assert first.exists is True
+    assert first.warning is None
+    assert first.value.to_dict("records") == expected.to_dict("records")
+
+    path.write_bytes(b"partial parquet")
+    second = cache.parquet(path)
+    assert second.exists is True
+    assert second.value.to_dict("records") == expected.to_dict("records")
+    assert second.warning is not None
+
+
 class FakeResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -543,6 +892,317 @@ def test_scheduler_uses_aggregate_summary_and_exact_project_status():
     assert "/api/tasks?" not in calls[0][0]
     assert calls[1][1] == "GET"
     assert calls[1][0].endswith("/api/projects/MFT_1MW_2026v1")
+
+
+def test_scheduler_normalizes_aedt_pool_and_license_attach_status():
+    calls = []
+
+    def opener(request, timeout):
+        calls.append((request.full_url, timeout))
+        if "/api/tasks/summary?" in request.full_url:
+            return FakeResponse({
+                "name_prefix": "mft",
+                "total": 9,
+                "statuses": {"running": 4, "completed": 5},
+            })
+        if request.full_url.endswith("/api/projects/MFT_1MW_2026v1"):
+            return FakeResponse({
+                "name": "MFT_1MW_2026v1",
+                "max_active_tasks": 300,
+                "queued_count": 7,
+                "attaching_count": 2,
+                "executing_count": 4,
+                "logical_active_count": 13,
+            })
+        if request.full_url.endswith("/api/aedt-pool"):
+            return FakeResponse({
+                "config": {
+                    "enabled": True,
+                    "adapter_ready": True,
+                    "validation_passed": True,
+                    "operational": True,
+                    "max_aedt_sessions": 8,
+                    "min_idle_aedt_sessions": 2,
+                    "target_project_concurrency": 16,
+                    "projects_per_aedt": 2,
+                },
+                "plan": {
+                    "idle_session_count": 2,
+                    "hard_session_count": 3,
+                    "warm_spare_status_reason": "target satisfied",
+                },
+                "sessions": [
+                    {"id": 1, "state": "ready"},
+                    {"id": 2, "state": "ready"},
+                    {"id": 3, "state": "starting"},
+                ],
+                "leases": [
+                    {"id": 11, "state": "active"},
+                    {"id": 12, "state": "queued"},
+                    {"id": 13, "state": "releasing"},
+                ],
+            })
+        if request.full_url.endswith("/api/licenses"):
+            return FakeResponse({
+                "checked_at": "2026-07-13T02:00:00+09:00",
+                "server_up": True,
+                "features": [{
+                    "feature": "electronics_desktop",
+                    "label": "Electronics Desktop",
+                    "total": 550,
+                    "used": 344,
+                }],
+                # A conflicting fallback proves the complete feature list wins.
+                "in_use": [{
+                    "feature": "electronics_desktop",
+                    "total": 550,
+                    "used": 12,
+                }],
+                "error": "",
+                "admission": {"snapshot_valid": True},
+            })
+        raise AssertionError(request.full_url)
+
+    result = SchedulerReader(
+        base_url="http://example.test",
+        opener=opener,
+        timeout=2.0,
+        optional_timeout=0.25,
+        ttl=0,
+    ).snapshot()
+
+    assert result["connected"] is True
+    attach = result["aedt_attach"]
+    assert attach["available"] is True
+    assert attach["state"] == "operational"
+    assert attach["errors"] == []
+    assert attach["pool"] == {
+        "available": True,
+        "enabled": True,
+        "adapter_ready": True,
+        "validation_passed": True,
+        "operational": True,
+        "max_sessions": 8,
+        "min_idle_sessions": 2,
+        "idle_sessions": 2,
+        "hard_sessions": 3,
+        "warm_spare_deficit": None,
+        "warm_spare_start_needed": None,
+        "session_record_count": 3,
+        "lease_record_count": 3,
+        "live_leases": 3,
+        "queued_leases": 1,
+        "ready_sessions": 2,
+        "busy_sessions": 0,
+        "session_states": {"ready": 2, "starting": 1},
+        "lease_states": {"active": 1, "queued": 1, "releasing": 1},
+        "warm_spare_reason": "target satisfied",
+        "error": None,
+    }
+    assert attach["license"] == {
+        "available": True,
+        "feature": "electronics_desktop",
+        "label": "Electronics Desktop",
+        "used": 344,
+        "total": 550,
+        "snapshot_valid": True,
+        "checked_at": "2026-07-13T02:00:00+09:00",
+        "error": None,
+    }
+    optional_calls = {
+        url: timeout for url, timeout in calls
+        if url.endswith(("/api/aedt-pool", "/api/licenses"))
+    }
+    assert optional_calls == {
+        "http://example.test/api/aedt-pool": 0.25,
+        "http://example.test/api/licenses": 0.25,
+    }
+
+
+@pytest.mark.parametrize("failed_endpoint", ["pool", "license"])
+def test_scheduler_optional_attach_endpoint_failure_is_section_local(
+        failed_endpoint):
+    def opener(request, timeout):
+        if "/api/tasks/summary?" in request.full_url:
+            return FakeResponse({
+                "name_prefix": "mft",
+                "total": 4,
+                "statuses": {"running": 4},
+            })
+        if request.full_url.endswith("/api/projects/MFT_1MW_2026v1"):
+            return FakeResponse({
+                "name": "MFT_1MW_2026v1",
+                "max_active_tasks": 300,
+                "queued_count": 0,
+                "attaching_count": 0,
+                "executing_count": 4,
+                "logical_active_count": 4,
+            })
+        if request.full_url.endswith("/api/aedt-pool"):
+            if failed_endpoint == "pool":
+                raise URLError("optional endpoint timed out")
+            return FakeResponse({
+                "config": {
+                    "enabled": True,
+                    "adapter_ready": True,
+                    "validation_passed": True,
+                    "operational": True,
+                    "max_aedt_sessions": 8,
+                    "min_idle_aedt_sessions": 0,
+                },
+                "plan": {
+                    "idle_session_count": 0,
+                    "hard_session_count": 0,
+                },
+                "sessions": [],
+                "leases": [],
+            })
+        if request.full_url.endswith("/api/licenses"):
+            if failed_endpoint == "license":
+                return FakeResponse({"features": "malformed"})
+            return FakeResponse({
+                "checked_at": "2026-07-13T02:00:00+09:00",
+                "server_up": True,
+                "features": [{
+                    "feature": "electronics_desktop",
+                    "total": 550,
+                    "used": 0,
+                }],
+                "admission": {"snapshot_valid": True},
+            })
+        raise AssertionError(request.full_url)
+
+    result = SchedulerReader(
+        base_url="http://optional.test",
+        opener=opener,
+        optional_timeout=0.1,
+        ttl=0,
+    ).snapshot()
+
+    # Optional diagnostics never erase the authoritative summary/project state.
+    assert result["connected"] is True
+    assert result["control_enabled"] is True
+    assert result["running"] == 4
+    assert result["parallel_target"] == 300
+    attach = result["aedt_attach"]
+    assert len(attach["errors"]) == 1
+    if failed_endpoint == "pool":
+        assert attach["state"] == "pool_unavailable"
+        assert attach["pool"]["available"] is False
+        assert "/api/aedt-pool" in attach["pool"]["error"]
+        assert attach["license"]["available"] is True
+        assert attach["license"]["used"] == 0
+    else:
+        assert attach["state"] == "partial"
+        assert attach["pool"]["available"] is True
+        assert attach["license"]["available"] is False
+        assert "/api/licenses" in attach["license"]["error"]
+
+
+def test_scheduler_aedt_attach_reports_warm_spare_shortfall():
+    def opener(request, timeout):
+        if request.full_url.endswith("/api/aedt-pool"):
+            return FakeResponse({
+                "config": {
+                    "enabled": True,
+                    "adapter_ready": True,
+                    "validation_passed": True,
+                    "operational": True,
+                    "max_aedt_sessions": 8,
+                    "min_idle_aedt_sessions": 2,
+                },
+                "plan": {
+                    "idle_session_count": 0,
+                    "hard_session_count": 1,
+                    "warm_spare_deficit": 2,
+                    "warm_spare_start_needed": 2,
+                    "warm_spare_status_reason": (
+                        "warm-spare session startup is in progress"
+                    ),
+                    "state_counts": {"starting": 1},
+                    "lease_counts": {},
+                },
+                # Historical terminal rows must not become pool capacity.
+                "sessions": [
+                    *[{"id": index, "state": "closed"} for index in range(20)],
+                    {"id": 21, "state": "starting"},
+                ],
+                "leases": [],
+            })
+        if request.full_url.endswith("/api/licenses"):
+            return FakeResponse({
+                "checked_at": "2026-07-13T02:00:00+09:00",
+                "server_up": True,
+                "features": [{
+                    "feature": "electronics_desktop",
+                    "total": 550,
+                    "used": 344,
+                }],
+                "admission": {"snapshot_valid": True},
+            })
+        raise AssertionError(request.full_url)
+
+    attach = SchedulerReader(
+        base_url="http://warm-spare.test",
+        opener=opener,
+        optional_timeout=0.1,
+        ttl=0,
+    )._aedt_attach_snapshot()
+
+    assert attach["state"] == "warming"
+    assert attach["pool"]["hard_sessions"] == 1
+    assert attach["pool"]["max_sessions"] == 8
+    assert attach["pool"]["session_record_count"] == 21
+    assert attach["pool"]["warm_spare_deficit"] == 2
+
+
+def test_scheduler_aedt_attach_marks_stale_license_snapshot_degraded():
+    def opener(request, timeout):
+        if request.full_url.endswith("/api/aedt-pool"):
+            return FakeResponse({
+                "config": {
+                    "enabled": True,
+                    "adapter_ready": True,
+                    "validation_passed": True,
+                    "operational": True,
+                    "max_aedt_sessions": 8,
+                    "min_idle_aedt_sessions": 1,
+                },
+                "plan": {
+                    "idle_session_count": 1,
+                    "hard_session_count": 1,
+                    "state_counts": {"ready": 1},
+                    "lease_counts": {},
+                },
+                "sessions": [{"id": 1, "state": "ready"}],
+                "leases": [],
+            })
+        if request.full_url.endswith("/api/licenses"):
+            return FakeResponse({
+                "checked_at": "2026-07-13T02:00:00+09:00",
+                "server_up": True,
+                "features": [{
+                    "feature": "electronics_desktop",
+                    "total": 550,
+                    "used": 344,
+                }],
+                "error": "showing the last good snapshot",
+                "admission": {"snapshot_valid": False},
+            })
+        raise AssertionError(request.full_url)
+
+    attach = SchedulerReader(
+        base_url="http://stale-license.test",
+        opener=opener,
+        optional_timeout=0.1,
+        ttl=0,
+    )._aedt_attach_snapshot()
+
+    assert attach["state"] == "degraded"
+    assert attach["license"]["available"] is True
+    assert attach["license"]["used"] == 344
+    assert attach["license"]["snapshot_valid"] is False
+    assert attach["errors"] == ["showing the last good snapshot"]
 
 
 def test_scheduler_parallel_target_uses_cap_only_patch_and_exact_readback():

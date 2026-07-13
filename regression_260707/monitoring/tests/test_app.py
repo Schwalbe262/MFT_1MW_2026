@@ -23,6 +23,17 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "parallel-attaching" in page.text
     assert 'id="model-history-metric"' in page.text
     assert 'value="mape_pct"' in page.text
+    assert 'id="cohort-list"' in page.text
+    assert 'id="cohort-lamination-factor"' in page.text
+    assert 'id="cohort-flux-availability"' in page.text
+    assert 'id="quarantine-current-reasons"' in page.text
+    assert 'id="quarantine-legacy-reasons"' in page.text
+    assert 'id="capacitance-summary"' in page.text
+    assert 'id="resonance-summary"' in page.text
+    assert 'id="thermal-model-list"' in page.text
+    assert 'id="aedt-attach-card"' in page.text
+    assert 'id="aedt-license-usage"' in page.text
+    assert 'id="aedt-pool-idle"' in page.text
     assert "학습 데이터 수 기준" in page.text
 
     script = client.get("/static/app.js")
@@ -40,6 +51,18 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "x: (item) => Number(item.n)" in script.text
     assert "historyPointTooltip" in script.text
     assert "CV P90 APE" in script.text
+    assert "data.current_cohort_metadata" in script.text
+    assert "cohort?.growth_rate_per_hour" in script.text
+    assert "data.quarantine" in script.text
+    assert "electrostatic.cap_stage_present_rows" in script.text
+    assert '"C_tx_tx"' in script.text
+    assert "resonance.interwinding" in script.text
+    assert "data.thermal_models" in script.text
+    assert "scheduler.aedt_attach" in script.text
+    assert "license.used" in script.text
+    assert "pool.min_idle_sessions" in script.text
+    assert "ratio(pool.hard_sessions, pool.max_sessions)" in script.text
+    assert "ratio(pool.ready_sessions, pool.busy_sessions)" in script.text
 
     stylesheet = client.get("/static/app.css")
     assert stylesheet.status_code == 200
@@ -47,6 +70,11 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert ".stage-timing-grid" in stylesheet.text
     assert ".history-metric-control" in stylesheet.text
     assert ".chart-tooltip" in stylesheet.text
+    assert ".cohort-row.current" in stylesheet.text
+    assert ".quarantine-legacy" in stylesheet.text
+    assert ".electrostatic-presence-grid" in stylesheet.text
+    assert ".thermal-model-row" in stylesheet.text
+    assert ".aedt-attach-card" in stylesheet.text
 
     dashboard = client.get("/api/dashboard")
     assert dashboard.status_code == 200
