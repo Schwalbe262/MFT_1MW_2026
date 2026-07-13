@@ -704,14 +704,7 @@ def _expected_failed_sample_reason(task, message):
 
 def _refresh_failure_outcome(
         outcome, task, *, allow_remote_stderr=True):
-    """Classify a terminal-invalid task from metadata by default at call sites.
-
-    A scheduler ``failed`` or ``cancelled`` status can never become a valid
-    training result.  Fleet reconciliation must therefore not serialize an
-    unbounded historical stderr scan merely to enrich its diagnostic
-    fingerprint.  Explicit incident-diagnostic callers may retain the legacy
-    bounded stderr lookup by leaving ``allow_remote_stderr`` enabled.
-    """
+    """Classify a terminal-invalid task and refresh weak cached diagnostics."""
     status = str(task.get("status") or outcome.get("status") or "")
     cached_message = outcome.get("error_message")
     if _is_informative_runtime_message(cached_message):
@@ -770,8 +763,7 @@ def inspect_production_tasks(
                 and cached.get("status") == status):
             cached = dict(cached)
             if status != "completed":
-                _refresh_failure_outcome(
-                    cached, task, allow_remote_stderr=False)
+                _refresh_failure_outcome(cached, task)
                 cached_outcomes[str(task_id)] = dict(cached)
             outcomes.append(cached)
             continue
@@ -811,8 +803,7 @@ def inspect_production_tasks(
                     result, solver_revision, library_revision, fetched.state)
         else:
             outcome["reason"] = f"task_{status}"
-            _refresh_failure_outcome(
-                outcome, task, allow_remote_stderr=False)
+            _refresh_failure_outcome(outcome, task)
         terminal_at = _terminal_time(task, result)
         outcome["terminal_at"] = _iso(terminal_at) if terminal_at else None
         outcomes.append(outcome)
