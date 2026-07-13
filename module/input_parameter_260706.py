@@ -189,8 +189,9 @@ def get_drawing_default_params():
         "loss_on": 1,            # design2: 손실 원샷 (Tx 전압원 + Rx 전류원 + 코어손실)
         "thermal_on": 0,         # design3: Icepak 열해석
         # Optional Maxwell Electrostatic capacitance/resonance screening stage.
-        # Kept off for production candidates until its cluster wall-time A/B is measured.
-        "cap_on": 0,
+        # Default ON for the durable v3.2 dataset: the cluster wall-time A/B
+        # (task 31070) measured +53 s per design (~+0.9% of a full pipeline).
+        "cap_on": 1,
         "cap_max_passes": 10,
         "cap_percent_error": 1.0,
         # 열해석 조건

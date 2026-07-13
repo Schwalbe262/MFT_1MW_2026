@@ -351,7 +351,7 @@ class PrimaryTurnDomainTests(unittest.TestCase):
 class ElectrostaticInputContractTests(unittest.TestCase):
     def test_optional_cap_controls_are_accepted_but_not_sealed_or_design_vars(self):
         defaults = get_drawing_default_params()
-        self.assertEqual(defaults["cap_on"], 0)
+        self.assertEqual(defaults["cap_on"], 1)
         self.assertEqual(defaults["cap_max_passes"], 10)
         self.assertEqual(defaults["cap_percent_error"], 1.0)
         self.assertTrue(set(ELECTROSTATIC_STAGE_INPUT_KEYS).issubset(ALL_INPUT_KEYS))
@@ -374,7 +374,7 @@ class ElectrostaticInputContractTests(unittest.TestCase):
         legacy_frame = create_input_parameter(
             frame[PRE_ELECTROSTATIC_INPUT_KEYS]
         )
-        self.assertEqual(int(legacy_frame["cap_on"].iloc[0]), 0)
+        self.assertEqual(int(legacy_frame["cap_on"].iloc[0]), 1)
         self.assertEqual(int(legacy_frame["cap_max_passes"].iloc[0]), 10)
         self.assertEqual(float(legacy_frame["cap_percent_error"].iloc[0]), 1.0)
 
