@@ -54,6 +54,23 @@
         <div><span>Attaching</span><strong id="parallel-attaching">—</strong></div>
         <div><span>Running</span><strong id="parallel-running">—</strong></div>
       </div>
+      <article id="aedt-attach-card" class="aedt-attach-card unavailable" aria-labelledby="aedt-attach-title">
+        <div class="aedt-attach-heading">
+          <div>
+            <span class="aedt-mark" aria-hidden="true">A</span>
+            <div><h3 id="aedt-attach-title">AEDT attach / 라이선스</h3><p id="aedt-attach-detail">Scheduler pool 정보를 확인하는 중입니다.</p></div>
+          </div>
+          <span id="aedt-attach-state" class="state-chip unknown">확인 중</span>
+        </div>
+        <dl class="aedt-attach-grid">
+          <div><dt>AEDT 사용 / 전체</dt><dd id="aedt-license-usage">—</dd></div>
+          <div><dt>Pool 상태</dt><dd id="aedt-pool-state">—</dd></div>
+          <div><dt>유휴 / 최소 유휴</dt><dd id="aedt-pool-idle">—</dd></div>
+          <div><dt>Hard / 세션 상한</dt><dd id="aedt-pool-sessions">—</dd></div>
+          <div><dt>Live(대기 포함) / 대기 lease</dt><dd id="aedt-pool-leases">—</dd></div>
+          <div><dt>Ready / Busy 세션</dt><dd id="aedt-pool-capacity">—</dd></div>
+        </dl>
+      </article>
       <p id="parallel-target-status" class="parallel-target-status" aria-live="polite">Scheduler 연결을 확인하는 중입니다.</p>
       <p class="parallel-control-note">목표를 낮춰도 running/attaching 작업은 중단하지 않습니다. 감소가 필요하면 controller가 시작 전으로 확인된 MFT queued 작업만 정리합니다.</p>
     </section>
@@ -95,10 +112,78 @@
           </dl>
         </article>
       </div>
+      <div class="split-grid campaign-insight-layout">
+        <article class="panel cohort-panel" aria-labelledby="cohort-title">
+          <div class="panel-title">
+            <div><h3 id="cohort-title">Solver · 물리 데이터 코호트</h3><p>git_hash와 physics_data_revision 조합별 행 수와 최근 증가 속도</p></div>
+            <span id="cohort-summary" class="mono-chip">코호트 —</span>
+          </div>
+          <div id="cohort-list" class="cohort-list"><p class="empty-state compact-empty">코호트 데이터를 확인하는 중입니다.</p></div>
+          <div class="cohort-metadata-grid">
+            <section aria-labelledby="lamination-factor-title">
+              <h4 id="lamination-factor-title">코어 적층 계수</h4>
+              <strong id="cohort-lamination-factor">—</strong>
+              <small id="cohort-lamination-detail">표본 —</small>
+            </section>
+            <section aria-labelledby="flux-readback-title">
+              <h4 id="flux-readback-title">권선 flux linkage readback</h4>
+              <strong id="cohort-flux-availability">—</strong>
+              <small id="cohort-flux-detail">상태 —</small>
+              <div id="cohort-flux-statuses" class="mini-chip-list"></div>
+            </section>
+          </div>
+        </article>
+        <article class="panel quarantine-panel" aria-labelledby="quarantine-title">
+          <div class="panel-title">
+            <div><h3 id="quarantine-title">격리 사유</h3><p>활성 코호트 신호와 이전 코호트 노이즈를 분리</p></div>
+            <span id="quarantine-current-count" class="section-badge">—</span>
+          </div>
+          <section class="quarantine-current" aria-labelledby="quarantine-current-title">
+            <h4 id="quarantine-current-title">현재 코호트</h4>
+            <div id="quarantine-current-reasons" class="reason-list"><p class="empty-state compact-empty">격리 정보를 확인하는 중입니다.</p></div>
+          </section>
+          <details id="quarantine-legacy" class="quarantine-legacy">
+            <summary><span id="quarantine-legacy-label">레거시 코호트 노이즈</span><b id="quarantine-legacy-count">—</b></summary>
+            <div id="quarantine-legacy-reasons" class="reason-list"><p class="empty-state compact-empty">레거시 격리 정보가 없습니다.</p></div>
+          </details>
+        </article>
+      </div>
+      <div class="split-grid physics-insight-layout">
+        <article class="panel electrostatic-panel" aria-labelledby="electrostatic-title">
+          <div class="panel-title">
+            <div><h3 id="electrostatic-title">정전용량 · 공진 추정</h3><p id="electrostatic-basis">활성 strict-full 코호트 확인 중</p></div>
+            <span id="electrostatic-state" class="state-chip unknown">확인 중</span>
+          </div>
+          <div class="electrostatic-presence-grid">
+            <div><span>Cap stage 있음</span><strong id="cap-stage-present">—</strong></div>
+            <div><span>없음</span><strong id="cap-stage-absent">—</strong></div>
+            <div><span>판정 불가</span><strong id="cap-stage-unknown">—</strong></div>
+            <div><span>코호트 행</span><strong id="electrostatic-cohort-rows">—</strong></div>
+          </div>
+          <div class="electrostatic-table-grid">
+            <section aria-labelledby="capacitance-summary-title">
+              <h4 id="capacitance-summary-title">정전용량 <small>nF</small></h4>
+              <div id="capacitance-summary" class="range-list"></div>
+            </section>
+            <section aria-labelledby="resonance-summary-title">
+              <h4 id="resonance-summary-title">공진 추정 <small>kHz</small></h4>
+              <div id="resonance-summary" class="range-list"></div>
+            </section>
+          </div>
+        </article>
+        <article class="panel thermal-model-panel" aria-labelledby="thermal-model-title">
+          <div class="panel-title">
+            <div><h3 id="thermal-model-title">코어 열전도 모델 태그</h3><p id="thermal-model-basis">활성 코호트 확인 중</p></div>
+            <span id="thermal-model-summary" class="section-badge">—</span>
+          </div>
+          <div id="thermal-model-list" class="thermal-model-list"><p class="empty-state compact-empty">열모델 태그를 확인하는 중입니다.</p></div>
+          <p id="thermal-model-missing" class="panel-note">태그 누락 —</p>
+        </article>
+      </div>
       <article class="panel stage-timing-panel" aria-labelledby="stage-timing-title">
         <div class="panel-title">
-          <div><h3 id="stage-timing-title">최근 시뮬레이션 단계별 소요시간</h3><p>solver 결과의 실제 timing 필드 기준</p></div>
-          <span id="stage-timing-window" class="mono-chip">timing 데이터 없음</span>
+          <div><h3 id="stage-timing-title">최근 시뮬레이션 단계별 소요시간</h3><p id="stage-timing-basis">활성 코호트 기준 · solver 결과의 실제 timing 필드</p></div>
+          <span id="stage-timing-window" class="mono-chip">활성 코호트 확인 중</span>
         </div>
         <div class="stage-timing-grid">
           <div class="stage-timing-card"><span>Matrix 평균</span><strong id="stage-time-matrix-mean">—</strong><small id="stage-time-matrix-detail">중앙값 — · n=0</small></div>
@@ -106,6 +191,7 @@
           <div class="stage-timing-card"><span>Icepak 평균</span><strong id="stage-time-icepak-mean">—</strong><small id="stage-time-icepak-detail">중앙값 — · n=0</small></div>
           <div class="stage-timing-card total"><span>합계 평균</span><strong id="stage-time-total-mean">—</strong><small id="stage-time-total-detail">중앙값 — · n=0</small></div>
         </div>
+        <p id="stage-timing-empty" class="stage-timing-empty">활성 코호트 타이밍 데이터 없음</p>
       </article>
     </section>
 

@@ -31,7 +31,11 @@ regression_260707\monitoring\.venv\Scripts\python -m uvicorn regression_260707.m
 
 ## 읽는 산출물
 
-- 데이터: `data/dataset/manifest.json`, `train_io.csv`, `collect_cache.json`
+- 데이터: `data/dataset/manifest.json`, `train.parquet`, `train_io.csv`, `collect_cache.json`
+  - 활성 코호트·정전용량·열전도 모델·격리 집계는 손실 없는 `train.parquet`를 사용하며,
+    Parquet가 없거나 읽는 중이면 기존 CSV 화면으로 안전하게 폴백한다.
+  - 활성 코호트는 `module.core_material_contract.PHYSICS_DATA_REVISION`과 일치하는 행 중
+    `saved_at`이 가장 최신인 행의 `(git_hash, physics_data_revision)` 조합이다.
 - 모델: `training/registry/current.json`이 가리키는 승인 generation의
   `train_report.json`, 각 모델의 `meta.json`, `training/learning_curve.csv`
 - 최적화: 최신 `al_rounds/round_*/pareto_front.csv`, 선택적으로 `al_rounds/state.json`
@@ -55,6 +59,7 @@ fine FEA JSON에는 `result` 객체와 선택적으로 `candidate_id`, `task_id`
 - `MFT_MONITOR_TASK_PREFIX`: 조회할 작업 이름 접두사, 기본값 `mft`
 - `MFT_SCHEDULER_PROJECT`: 병렬 목표를 제어할 프로젝트, 기본값 `MFT_1MW_2026v1`
 - `MFT_SCHEDULER_TIMEOUT`: 스케줄러 GET 제한시간(초), 기본값 `2`
+- `MFT_SCHEDULER_OPTIONAL_TIMEOUT`: AEDT pool/license 선택 조회 제한시간(초), 기본값 `1`
 - `MFT_MONITOR_DISABLE_HISTORY=1`: runtime snapshot/history 기록 중지
 
 ## 테스트

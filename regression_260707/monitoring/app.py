@@ -41,6 +41,9 @@ def create_app(
             task_prefix=os.environ.get("MFT_MONITOR_TASK_PREFIX", "mft"),
             project_name=os.environ.get("MFT_SCHEDULER_PROJECT", "MFT_1MW_2026v1"),
             timeout=float(os.environ.get("MFT_SCHEDULER_TIMEOUT", "2")),
+            optional_timeout=float(
+                os.environ.get("MFT_SCHEDULER_OPTIONAL_TIMEOUT", "1")
+            ),
         )
         service = ArtifactService(
             root,
@@ -51,7 +54,7 @@ def create_app(
     app = FastAPI(
         title="MFT 1MW Campaign Monitor",
         description="Project dashboard for MFT campaign status and bounded local operator control.",
-        version="1.0.0",
+        version="1.1.0",
         docs_url="/api/docs",
         redoc_url=None,
     )
