@@ -813,6 +813,19 @@ def _finite(result, key):
         return False
 
 
+def _optional_text(value):
+    """Normalize absent scalar values, including schema-union NaNs."""
+    if value is None:
+        return ""
+    try:
+        if math.isnan(float(value)):
+            return ""
+    except (TypeError, ValueError, OverflowError):
+        pass
+    text = str(value).strip()
+    return "" if text.casefold() in {"nan", "<na>", "none"} else text
+
+
 def required_temperature_columns(result):
     """Return all physical/probe temperatures required by this candidate."""
     columns = list(MANDATORY_TEMPERATURE_COLUMNS)
@@ -1003,12 +1016,73 @@ def is_valid_result(
     ):
         # Keep this exact-revision gate aligned with quality_contract.py.  It
         # deliberately does not change the legacy/b171 acceptance contract.
+        winding_readback_applicable = result.get(
+            "winding_flux_linkage_readback_applicable"
+        )
+        winding_readback_available = result.get(
+            "winding_flux_linkage_readback_available"
+        )
+        winding_readback_passed = result.get(
+            "winding_flux_linkage_readback_passed"
+        )
+        winding_readback_reason = _optional_text(result.get(
+            "winding_flux_linkage_readback_reason"
+        ))
+        winding_readback_status = _optional_text(result.get(
+            "winding_flux_linkage_readback_status"
+        ))
+        winding_readback_fail_soft = (
+            winding_readback_applicable in (0, 0.0, False)
+            and winding_readback_available in (0, 0.0, False)
+            and winding_readback_passed in (1, 1.0, True)
+            and winding_readback_status == "unavailable"
+            and winding_readback_reason.startswith(
+                "grpc_calcop_unavailable:"
+            )
+            and len(winding_readback_reason) > len(
+                "grpc_calcop_unavailable:"
+            )
+        )
+        winding_readback_available_valid = (
+            winding_readback_applicable in (1, 1.0, True)
+            and winding_readback_available in (1, 1.0, True)
+            and winding_readback_passed in (1, 1.0, True)
+            and winding_readback_status == "available"
+            and not winding_readback_reason
+        )
+        winding_readback_evidence_declared = (
+            _finite(result, "winding_flux_linkage_readback_applicable")
+            or _finite(result, "winding_flux_linkage_readback_available")
+            or _finite(result, "winding_flux_linkage_readback_passed")
+            or bool(winding_readback_status)
+            or bool(winding_readback_reason)
+        )
+        winding_readback_unavailable_declared = (
+            winding_readback_applicable in (0, 0.0, False)
+            or winding_readback_available in (0, 0.0, False)
+            or winding_readback_status == "unavailable"
+        )
+        if (
+            winding_readback_unavailable_declared
+            and not winding_readback_fail_soft
+        ):
+            return False
+        if (
+            winding_readback_evidence_declared
+            and not winding_readback_fail_soft
+            and not winding_readback_available_valid
+        ):
+            return False
         if any(result.get(key) != 1 for key in (
             "core_native_material_readback_attested",
             "core_loss_native_attested",
-            "flux_linkage_attested",
             "B_mean_faraday_attested",
         )):
+            return False
+        if (
+            not winding_readback_fail_soft
+            and result.get("flux_linkage_attested") != 1
+        ):
             return False
         surface_applicable = result.get(
             "center_leg_surface_flux_integral_applicable"
@@ -1040,15 +1114,16 @@ def is_valid_result(
             "thermal_core_loss_correction_factor",
             "thermal_core_full_expected_margin_adjusted_w",
         ]
-        required_native_fields.extend(
-            (
-                "Tx_flux_linkage_faraday_rel_error",
-                "Tx_induced_vs_source_peak_rel_error",
-            ) if surface_fail_soft else (
-                "core_surface_flux_vs_linkage_rel_error",
-                "core_surface_flux_vs_induced_voltage_rel_error",
+        if not winding_readback_fail_soft:
+            required_native_fields.extend(
+                (
+                    "Tx_flux_linkage_faraday_rel_error",
+                    "Tx_induced_vs_source_peak_rel_error",
+                ) if surface_fail_soft else (
+                    "core_surface_flux_vs_linkage_rel_error",
+                    "core_surface_flux_vs_induced_voltage_rel_error",
+                )
             )
-        )
         if not all(_finite(result, key) for key in required_native_fields):
             return False
         loss_error = float(result["core_loss_native_rel_error"])
@@ -1064,7 +1139,9 @@ def is_valid_result(
             "POWERLITE_Wkg_times_effective_mass"
         ):
             return False
-        if surface_fail_soft:
+        if winding_readback_fail_soft:
+            pass
+        elif surface_fail_soft:
             if (
                 not 0.0 <= float(
                     result["Tx_flux_linkage_faraday_rel_error"]

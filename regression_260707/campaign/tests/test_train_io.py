@@ -43,6 +43,14 @@ def raw_rows():
             "P_winding_total": 4000.0,
             "P_core_total": 2000.0,
             "B_max_core": 1.1,
+            "winding_flux_linkage_readback_status": "unavailable",
+            "winding_flux_linkage_readback_applicable": 0,
+            "winding_flux_linkage_readback_available": 0,
+            "winding_flux_linkage_readback_passed": 1,
+            "winding_flux_linkage_readback_reason": (
+                "grpc_calcop_unavailable:Failed to execute gRPC AEDT "
+                "command: CalcOp"
+            ),
             "T_max_Rx_main": 91.0,
             "result_valid_em": 1,
             "result_valid_thermal": 1,
@@ -107,7 +115,7 @@ class TrainIoBuilderTests(unittest.TestCase):
         view = train_io.build_train_io(raw)
 
         self.assertEqual(tuple(view.columns), train_io.TRAIN_IO_COLUMNS)
-        self.assertEqual(view["train_io_schema_version"].tolist(), [6, 6])
+        self.assertEqual(view["train_io_schema_version"].tolist(), [7, 7])
         self.assertEqual(
             view["inductance_source_basis"].tolist(),
             ["eighth_symmetry", "full_model"],
@@ -122,6 +130,15 @@ class TrainIoBuilderTests(unittest.TestCase):
             ["homogenized_blocks", "hybrid_explicit"],
         )
         self.assertEqual(view["P_winding_total"].tolist(), [4000.0, 4100.0])
+        self.assertEqual(
+            view.loc[0, "winding_flux_linkage_readback_status"],
+            "unavailable",
+        )
+        self.assertTrue(
+            view.loc[0, "winding_flux_linkage_readback_reason"].startswith(
+                "grpc_calcop_unavailable:"
+            )
+        )
         self.assertEqual(view["T_max_Rx_main"].tolist(), [91.0, 90.0])
         self.assertEqual(view["time_matrix"].tolist(), [300.0, 600.0])
         self.assertEqual(view["time_loss"].tolist(), [1700.0, 1800.0])

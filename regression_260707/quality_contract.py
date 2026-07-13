@@ -155,6 +155,19 @@ def _number(record: Mapping[str, Any], key: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _optional_text(value: Any) -> str:
+    """Normalize absent scalar values, including schema-union NaNs."""
+    if value is None:
+        return ""
+    try:
+        if math.isnan(float(value)):
+            return ""
+    except (TypeError, ValueError, OverflowError):
+        pass
+    text = str(value).strip()
+    return "" if text.casefold() in {"nan", "<na>", "none"} else text
+
+
 def _one(record: Mapping[str, Any], key: str) -> bool:
     value = _number(record, key)
     return value is not None and value == 1.0
@@ -280,14 +293,82 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
     if str(_value(record, "physics_data_revision") or "").strip() == (
         PHYSICS_DATA_REVISION
     ):
+        winding_readback_applicable = _number(
+            record, "winding_flux_linkage_readback_applicable"
+        )
+        winding_readback_available = _number(
+            record, "winding_flux_linkage_readback_available"
+        )
+        winding_readback_passed = _number(
+            record, "winding_flux_linkage_readback_passed"
+        )
+        winding_readback_reason = _optional_text(_value(
+            record, "winding_flux_linkage_readback_reason"
+        ))
+        winding_readback_status = _optional_text(_value(
+            record, "winding_flux_linkage_readback_status"
+        ))
+        winding_readback_fail_soft = (
+            winding_readback_applicable == 0.0
+            and winding_readback_available == 0.0
+            and winding_readback_passed == 1.0
+            and winding_readback_status == "unavailable"
+            and winding_readback_reason.startswith(
+                "grpc_calcop_unavailable:"
+            )
+            and len(winding_readback_reason) > len(
+                "grpc_calcop_unavailable:"
+            )
+        )
+        winding_readback_available_valid = (
+            winding_readback_applicable == 1.0
+            and winding_readback_available == 1.0
+            and winding_readback_passed == 1.0
+            and winding_readback_status == "available"
+            and not winding_readback_reason
+        )
+        winding_readback_evidence_declared = (
+            winding_readback_applicable is not None
+            or winding_readback_available is not None
+            or winding_readback_passed is not None
+            or bool(winding_readback_status)
+            or bool(winding_readback_reason)
+        )
+        winding_readback_unavailable_declared = (
+            winding_readback_applicable == 0.0
+            or winding_readback_available == 0.0
+            or winding_readback_status == "unavailable"
+        )
+        if (
+            winding_readback_unavailable_declared
+            and not winding_readback_fail_soft
+        ):
+            reasons.append(
+                "native_lamination:"
+                "winding_flux_linkage_readback_unavailability_invalid"
+            )
+        elif (
+            winding_readback_evidence_declared
+            and not winding_readback_fail_soft
+            and not winding_readback_available_valid
+        ):
+            reasons.append(
+                "native_lamination:"
+                "winding_flux_linkage_readback_evidence_invalid"
+            )
         for key in (
             "core_native_material_readback_attested",
             "core_loss_native_attested",
-            "flux_linkage_attested",
-            "B_mean_faraday_attested",
         ):
             if not _one(record, key):
                 reasons.append(f"native_lamination:{key}")
+        if (
+            not winding_readback_fail_soft
+            and not _one(record, "flux_linkage_attested")
+        ):
+            reasons.append("native_lamination:flux_linkage_attested")
+        if not _one(record, "B_mean_faraday_attested"):
+            reasons.append("native_lamination:B_mean_faraday_attested")
         loss_error = _number(record, "core_loss_native_rel_error")
         loss_tolerance = _number(record, "core_loss_native_tolerance_rel")
         if (
@@ -328,7 +409,12 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
             reasons.append(
                 "native_lamination:center_leg_surface_flux_unavailability_invalid"
             )
-        if surface_fail_soft:
+        if winding_readback_fail_soft:
+            # The standard B-mean Faraday attestation above remains mandatory.
+            # Only CalcOp-backed winding readback and comparisons derived from
+            # it are informational when that readback is unavailable.
+            pass
+        elif surface_fail_soft:
             # Surface CalcOp evidence is informational when the cluster gRPC
             # calculator cannot execute it.  The independent Faraday checks
             # remain mandatory at their existing tolerances.

@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-TRAIN_IO_SCHEMA_VERSION = 6
+TRAIN_IO_SCHEMA_VERSION = 7
 
 IDENTITY_COLUMNS = (
     "project_name",
@@ -214,6 +214,11 @@ AGGREGATE_EM_OUTPUT_COLUMNS = (
     "core_surface_flux_vs_induced_voltage_rel_error",
     "B_flux_linkage_vs_sine_analytic_rel_error",
     "flux_linkage_attested",
+    "winding_flux_linkage_readback_status",
+    "winding_flux_linkage_readback_applicable",
+    "winding_flux_linkage_readback_available",
+    "winding_flux_linkage_readback_passed",
+    "winding_flux_linkage_readback_reason",
     "loss_report_to_physical_flux_factor",
     "I1_mag_peak",
     "I1_phase_deg",

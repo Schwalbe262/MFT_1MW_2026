@@ -668,21 +668,46 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
             ("op", "CmplxMag"),
         ])
 
-    def _loss_report_shell(self, flux_registration, flux_evaluation_error=None):
+    def _loss_report_shell(
+        self,
+        flux_registration,
+        flux_evaluation_error=None,
+        winding_readback_error=None,
+        native_contract=False,
+    ):
         simulation = Simulation.__new__(Simulation)
         simulation.df_plus = self.frame.copy()
-        simulation.df_plus["physics_data_revision"] = "legacy_test_revision"
+        simulation.df_plus["physics_data_revision"] = (
+            PHYSICS_DATA_REVISION
+            if native_contract else "legacy_test_revision"
+        )
         simulation.loss_is_sym = False
         simulation.full_model = True
 
         area_m2 = float(simulation.df_plus["Ae_gross_m2"].iloc[0])
-        core = SimpleNamespace(name="core_1", volume=1.0e6)
+        if native_contract:
+            cores = [
+                SimpleNamespace(
+                    name=f"core_1_{region}",
+                    volume=2.0e5,
+                )
+                for region in (
+                    "leg_left",
+                    "leg_center",
+                    "leg_right",
+                    "yoke_bottom",
+                    "yoke_top",
+                )
+            ]
+            simulation.df_plus["core_segmented_piece_count"] = [len(cores)]
+        else:
+            cores = [SimpleNamespace(name="core_1", volume=1.0e6)]
         sheet = SimpleNamespace(
             name="center_leg_section",
             faces=[SimpleNamespace(area=area_m2 * 1.0e6)],
         )
         simulation.design1 = SimpleNamespace(
-            core_objs=[core],
+            core_objs=cores,
             core_flux_sheets=[sheet],
             Tx_windings_main=[],
             Rx_windings_main=[],
@@ -743,7 +768,10 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
                 elif expression.startswith("B_max_"):
                     row[expression] = reference["B_pack_T"] * 1.01
                 elif expression == "P_core_1":
-                    row[expression] = 100.0
+                    row[expression] = (
+                        reference["native_raw_loss_W"]
+                        if native_contract else 100.0
+                    )
                 else:
                     row[expression] = 10.0
             return pd.DataFrame([row], columns=expressions)
@@ -755,6 +783,8 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
                 return pd.DataFrame({
                     "I1_mag_peak": [10.0], "I1_phase_deg": [0.0]
                 })
+            if winding_readback_error is not None:
+                raise winding_readback_error
             return pd.DataFrame({
                 "induced_voltage_peak": [voltage_peak],
                 "flux_linkage_peak": [linkage],
@@ -838,6 +868,62 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
             False,
         )
         self.assertAlmostEqual(result["Tx_flux_linkage_faraday_rel_error"].iloc[0], 0.0)
+
+    def test_native_winding_calcop_readback_failure_is_fail_soft(self):
+        readback_error = RuntimeError(
+            "[flux_linkage] result extraction failed after 3 attempts: "
+            "Failed to execute gRPC AEDT command: CalcOp"
+        )
+        simulation, _export_calls, _physical_flux = self._loss_report_shell(
+            lambda _sheets, name: name,
+            winding_readback_error=readback_error,
+            native_contract=True,
+        )
+
+        result = simulation.save_loss_reports()
+
+        expected_reason = f"grpc_calcop_unavailable:{readback_error}"
+        self.assertEqual(result["B_mean_faraday_attested"].iloc[0], 1)
+        self.assertEqual(result["flux_linkage_attested"].iloc[0], 0)
+        self.assertTrue(math.isnan(
+            result["Tx_flux_linkage_faraday_rel_error"].iloc[0]
+        ))
+        self.assertEqual(
+            result["winding_flux_linkage_readback_reason"].iloc[0],
+            expected_reason,
+        )
+        self.assertEqual(
+            simulation.loss_gate_evidence["winding_flux_linkage_readback"],
+            {
+                "status": "unavailable",
+                "applicable": False,
+                "available": False,
+                "passed": True,
+                "reason": expected_reason,
+                "reported_induced_voltage_peak_V": None,
+                "reported_flux_linkage_peak_Wb_turn": None,
+                "physical_induced_voltage_peak_V": None,
+                "physical_flux_linkage_peak_Wb_turn": None,
+                "required_physics_evidence": [
+                    "B_mean_faraday_attested"
+                ],
+            },
+        )
+
+    def test_native_non_grpc_calcop_readback_failure_stays_fail_closed(self):
+        simulation, _export_calls, _physical_flux = self._loss_report_shell(
+            lambda _sheets, name: name,
+            winding_readback_error=RuntimeError(
+                "local CalcOp expression validation failed before transport"
+            ),
+            native_contract=True,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "new physics revision requires induced-voltage/flux-linkage",
+        ):
+            simulation.save_loss_reports()
 
     def test_flux_calculator_success_preserves_surface_evidence(self):
         simulation, export_calls, physical_flux = self._loss_report_shell(

@@ -61,6 +61,87 @@ from monitoring.readers import TEMPERATURE_TARGETS as MONITORING_TEMPERATURE_TAR
 from campaign import collect_wave
 
 
+CALCOP_UNAVAILABLE_REASON = (
+    "grpc_calcop_unavailable:Failed to execute gRPC AEDT command: CalcOp"
+)
+
+
+def _valid_native_result(**updates):
+    row = valid_result(
+        physics_data_revision=PHYSICS_DATA_REVISION,
+        Tprobe_Rx_side_leeward_mean=84.0,
+        Tprobe_Rx_side_outer_max=88.0,
+        Tprobe_Rx_side_outer_mean=82.0,
+        Tprobe_Rx_side_inner_max=91.0,
+        Tprobe_Rx_side_inner_mean=84.0,
+        thermal_rx_side_probe_contract_version=(
+            RX_SIDE_FACE_PROBE_CONTRACT_VERSION
+        ),
+        thermal_rx_side_probe_max_rule=RX_SIDE_FACE_MAX_RULE,
+        thermal_rx_side_probe_mean_rule=RX_SIDE_FACE_MEAN_RULE,
+        thermal_rx_side_probe_selected_face="Tprobe_Rx_side1_inner",
+        thermal_rx_side_probe_face_count=2,
+        core_native_material_readback_attested=1,
+        core_loss_native_attested=1,
+        flux_linkage_attested=1,
+        B_mean_faraday_attested=1,
+        core_loss_native_rel_error=0.01,
+        core_loss_native_tolerance_rel=0.30,
+        B_mean_material_vs_sine_analytic_rel_error=0.01,
+        B_mean_faraday_tolerance_rel=0.15,
+        core_loss_reference_basis=(
+            "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
+            "POWERLITE_Wkg_times_effective_mass"
+        ),
+        center_leg_surface_flux_integral_applicable=1,
+        center_leg_surface_flux_integral_available=1,
+        center_leg_surface_flux_integral_passed=1,
+        center_leg_surface_flux_integral_status="available",
+        center_leg_surface_flux_integral_reason="",
+        winding_flux_linkage_readback_applicable=1,
+        winding_flux_linkage_readback_available=1,
+        winding_flux_linkage_readback_passed=1,
+        winding_flux_linkage_readback_status="available",
+        winding_flux_linkage_readback_reason="",
+        Tx_flux_linkage_faraday_rel_error=0.01,
+        Tx_induced_vs_source_peak_rel_error=0.05,
+        core_surface_flux_vs_linkage_rel_error=0.01,
+        core_surface_flux_vs_induced_voltage_rel_error=0.01,
+        core_native_model_approval_status=(
+            "approved_by_isolated_solved_kf_ab"
+        ),
+        thermal_core_loss_source=(
+            "aedt_native_lamination_loss_attested_then_margin_adjusted"
+        ),
+        thermal_core_native_readback_count=3,
+        thermal_core_native_restored_rel_error=0.0,
+        thermal_core_loss_correction_factor=1.15,
+    )
+    row["thermal_core_full_expected_margin_adjusted_w"] = row[
+        "P_core_total"
+    ]
+    row.update(updates)
+    return row
+
+
+def _native_result_with_unavailable_winding_readback(**updates):
+    row = _valid_native_result(
+        flux_linkage_attested=0,
+        winding_flux_linkage_readback_applicable=0,
+        winding_flux_linkage_readback_available=0,
+        winding_flux_linkage_readback_passed=1,
+        winding_flux_linkage_readback_status="unavailable",
+        winding_flux_linkage_readback_reason=CALCOP_UNAVAILABLE_REASON,
+        Tx_flux_linkage_faraday_rel_error=float("nan"),
+        Tx_induced_vs_source_peak_rel_error=float("nan"),
+        core_surface_flux_vs_linkage_rel_error=float("nan"),
+        core_surface_flux_vs_induced_voltage_rel_error=float("nan"),
+        center_leg_surface_flux_integral_passed=0,
+    )
+    row.update(updates)
+    return row
+
+
 class CoreTemperatureTargetContractTests(unittest.TestCase):
     def test_three_core_regions_are_independent_end_to_end_targets(self):
         expected = tuple(SURROGATE_TEMPERATURE_TARGETS)
@@ -121,58 +202,77 @@ class StrictRowContractTests(unittest.TestCase):
             valid_result(matrix_solve_attempts=2)
         ).full_valid)
 
+    def test_native_winding_readback_present_and_passing_is_full_valid(self):
+        row = _valid_native_result()
+
+        self.assertTrue(validate_record(row).full_valid)
+        self.assertTrue(scheduler_client.is_valid_result(row))
+
+    def test_native_winding_calcop_unavailability_remains_full_valid(self):
+        row = _native_result_with_unavailable_winding_readback()
+
+        result = validate_record(row)
+        self.assertTrue(result.full_valid, result.reasons)
+        self.assertNotIn(
+            "native_lamination:flux_linkage_attested", result.reasons
+        )
+        self.assertTrue(scheduler_client.is_valid_result(row))
+
+    def test_native_available_winding_readback_failure_is_quarantined(self):
+        cases = (
+            (
+                {
+                    "flux_linkage_attested": 0,
+                    "winding_flux_linkage_readback_passed": 0,
+                    "Tx_flux_linkage_faraday_rel_error": 0.010001,
+                },
+                "native_lamination:flux_linkage_attested",
+            ),
+            (
+                {"winding_flux_linkage_readback_passed": 0},
+                (
+                    "native_lamination:"
+                    "winding_flux_linkage_readback_evidence_invalid"
+                ),
+            ),
+            (
+                {"core_surface_flux_vs_linkage_rel_error": 0.050001},
+                "native_lamination:core_surface_flux_vs_linkage_rel_error",
+            ),
+            (
+                {
+                    "core_surface_flux_vs_induced_voltage_rel_error": 0.050001
+                },
+                (
+                    "native_lamination:"
+                    "core_surface_flux_vs_induced_voltage_rel_error"
+                ),
+            ),
+        )
+        for updates, expected_reason in cases:
+            with self.subTest(reason=expected_reason):
+                row = _valid_native_result(**updates)
+
+                result = validate_record(row)
+                self.assertFalse(result.full_valid)
+                self.assertIn(expected_reason, result.reasons)
+                self.assertFalse(scheduler_client.is_valid_result(row))
+
+    def test_native_winding_unavailability_does_not_waive_b_mean(self):
+        row = _native_result_with_unavailable_winding_readback()
+        row.pop("B_mean_faraday_attested")
+
+        result = validate_record(row)
+        self.assertFalse(result.full_valid)
+        self.assertIn(
+            "native_lamination:B_mean_faraday_attested", result.reasons
+        )
+        self.assertFalse(scheduler_client.is_valid_result(row))
+
     def test_new_revision_rx_side_inner_face_is_fail_closed_but_legacy_is_valid(self):
         legacy = valid_result()
         self.assertTrue(validate_record(legacy).full_valid)
-        revised = valid_result(
-            physics_data_revision=PHYSICS_DATA_REVISION,
-            Tprobe_Rx_side_leeward_mean=84.0,
-            Tprobe_Rx_side_outer_max=88.0,
-            Tprobe_Rx_side_outer_mean=82.0,
-            Tprobe_Rx_side_inner_max=91.0,
-            Tprobe_Rx_side_inner_mean=84.0,
-            thermal_rx_side_probe_contract_version=(
-                RX_SIDE_FACE_PROBE_CONTRACT_VERSION
-            ),
-            thermal_rx_side_probe_max_rule=RX_SIDE_FACE_MAX_RULE,
-            thermal_rx_side_probe_mean_rule=RX_SIDE_FACE_MEAN_RULE,
-            thermal_rx_side_probe_selected_face="Tprobe_Rx_side1_inner",
-            thermal_rx_side_probe_face_count=2,
-            core_native_material_readback_attested=1,
-            core_loss_native_attested=1,
-            flux_linkage_attested=1,
-            B_mean_faraday_attested=1,
-            core_loss_native_rel_error=0.01,
-            core_loss_native_tolerance_rel=0.30,
-            B_mean_material_vs_sine_analytic_rel_error=0.01,
-            B_mean_faraday_tolerance_rel=0.15,
-            core_loss_reference_basis=(
-                "sinusoidal_faraday_Bpack_then_Bmaterial_div_kf_then_"
-                "POWERLITE_Wkg_times_effective_mass"
-            ),
-            center_leg_surface_flux_integral_applicable=0,
-            center_leg_surface_flux_integral_available=0,
-            center_leg_surface_flux_integral_passed=1,
-            center_leg_surface_flux_integral_status="unavailable",
-            center_leg_surface_flux_integral_reason=(
-                "grpc_calcop_unavailable:Failed to execute gRPC AEDT "
-                "command: CalcOp"
-            ),
-            Tx_flux_linkage_faraday_rel_error=0.01,
-            Tx_induced_vs_source_peak_rel_error=0.05,
-            core_native_model_approval_status=(
-                "approved_by_isolated_solved_kf_ab"
-            ),
-            thermal_core_loss_source=(
-                "aedt_native_lamination_loss_attested_then_margin_adjusted"
-            ),
-            thermal_core_native_readback_count=3,
-            thermal_core_native_restored_rel_error=0.0,
-            thermal_core_loss_correction_factor=1.15,
-        )
-        revised["thermal_core_full_expected_margin_adjusted_w"] = revised[
-            "P_core_total"
-        ]
+        revised = _valid_native_result()
         self.assertTrue(validate_record(revised).full_valid)
         normalized, demoted = collect_wave.normalize_thermal_validity(
             pd.DataFrame([revised])

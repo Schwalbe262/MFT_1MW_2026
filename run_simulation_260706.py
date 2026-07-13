@@ -140,6 +140,15 @@ B_POWER_REFERENCE_VARIABLE = "B_power_reference"
 B_POWER_REFERENCE_T = 1.0
 
 
+def _grpc_calcop_unavailability_reason(error):
+    """Return the structured fail-soft reason for a CalcOp-class failure."""
+    detail = " ".join(str(error).split()) or type(error).__name__
+    normalized = detail.casefold()
+    if "grpc" not in normalized or "calcop" not in normalized:
+        return ""
+    return f"grpc_calcop_unavailable:{detail}"
+
+
 def _raw_aedt_material_props(materials, material_name):
     """Return fresh native material data, bypassing PyAEDT's assigned cache."""
     manager = getattr(materials, "omaterial_manager", None)
@@ -4347,6 +4356,9 @@ class Simulation():
         surface_flux_linkage_rel_error = float("nan")
         surface_flux_induced_voltage_rel_error = float("nan")
         flux_linkage_attested = 0
+        winding_readback_available = False
+        winding_readback_passed = False
+        winding_readback_unavailable_reason = ""
         try:
             induced_expr = "mag(InducedVoltage(Tx_winding))"
             linkage_expr = "mag(FluxLinkage(Tx_winding))"
@@ -4394,22 +4406,74 @@ class Simulation():
                 surface_flux_induced_voltage_rel_error = abs(
                     surface_induced_voltage - induced_voltage_peak
                 ) / max(abs(induced_voltage_peak), 1e-12)
-            if native_contract and (
-                faraday_rel_error > 0.01 or source_voltage_rel_error > 0.05
-            ):
+            winding_readback_passed = bool(
+                math.isfinite(faraday_rel_error)
+                and faraday_rel_error <= 0.01
+                and math.isfinite(source_voltage_rel_error)
+                and source_voltage_rel_error <= 0.05
+            )
+            if native_contract and not winding_readback_passed:
                 raise RuntimeError(
                     "native stacking flux-linkage attestation failed: "
                     f"Faraday relative error={faraday_rel_error:.6g}, "
                     f"source relative error={source_voltage_rel_error:.6g}"
                 )
+            winding_readback_available = True
             flux_linkage_attested = int(native_contract)
         except Exception as exc:
-            if native_contract:
+            calcop_reason = _grpc_calcop_unavailability_reason(exc)
+            if calcop_reason:
+                winding_readback_unavailable_reason = calcop_reason
+                logging.warning(
+                    "Winding flux-linkage/induced-voltage readback is "
+                    "unavailable; continuing loss extraction: "
+                    f"{calcop_reason}"
+                )
+            elif native_contract:
                 raise RuntimeError(
                     "new physics revision requires induced-voltage/flux-linkage "
                     "Faraday readback"
                 ) from exc
-            logging.warning(f"Failed to extract flux-linkage audit: {exc}")
+            else:
+                detail = " ".join(str(exc).split()) or type(exc).__name__
+                winding_readback_unavailable_reason = (
+                    f"readback_unavailable:{detail}"
+                )
+                logging.warning(f"Failed to extract flux-linkage audit: {exc}")
+
+        winding_readback_evidence = {
+            "status": (
+                "available" if winding_readback_available else "unavailable"
+            ),
+            "applicable": winding_readback_available,
+            "available": winding_readback_available,
+            "passed": (
+                winding_readback_passed
+                if winding_readback_available
+                else winding_readback_unavailable_reason.startswith(
+                    "grpc_calcop_unavailable:"
+                )
+            ),
+            "reason": (
+                "" if winding_readback_available
+                else winding_readback_unavailable_reason
+            ),
+            "reported_induced_voltage_peak_V": (
+                induced_voltage_reported_peak
+                if winding_readback_available else None
+            ),
+            "reported_flux_linkage_peak_Wb_turn": (
+                flux_linkage_reported_peak
+                if winding_readback_available else None
+            ),
+            "physical_induced_voltage_peak_V": (
+                induced_voltage_peak if winding_readback_available else None
+            ),
+            "physical_flux_linkage_peak_Wb_turn": (
+                flux_linkage_peak if winding_readback_available else None
+            ),
+            "required_physics_evidence": ["B_mean_faraday_attested"],
+        }
 
         summary.update({
             "loss_report_to_physical_flux_factor": [
@@ -4473,7 +4537,8 @@ class Simulation():
             ],
         }
         self.loss_gate_evidence = {
-            "center_leg_surface_flux_integral": center_leg_flux_evidence
+            "center_leg_surface_flux_integral": center_leg_flux_evidence,
+            "winding_flux_linkage_readback": winding_readback_evidence,
         }
         summary.update({
             "center_leg_surface_flux_integral_status": [
@@ -4493,7 +4558,38 @@ class Simulation():
             ],
             "center_leg_surface_flux_integral_evidence_json": [
                 json.dumps(
-                    self.loss_gate_evidence,
+                    {
+                        "center_leg_surface_flux_integral": (
+                            center_leg_flux_evidence
+                        )
+                    },
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            ],
+            "winding_flux_linkage_readback_status": [
+                winding_readback_evidence["status"]
+            ],
+            "winding_flux_linkage_readback_applicable": [
+                int(winding_readback_evidence["applicable"])
+            ],
+            "winding_flux_linkage_readback_available": [
+                int(winding_readback_evidence["available"])
+            ],
+            "winding_flux_linkage_readback_passed": [
+                int(winding_readback_evidence["passed"])
+            ],
+            "winding_flux_linkage_readback_reason": [
+                winding_readback_evidence["reason"]
+            ],
+            "winding_flux_linkage_readback_evidence_json": [
+                json.dumps(
+                    {
+                        "winding_flux_linkage_readback": (
+                            winding_readback_evidence
+                        )
+                    },
                     allow_nan=False,
                     separators=(",", ":"),
                     sort_keys=True,
