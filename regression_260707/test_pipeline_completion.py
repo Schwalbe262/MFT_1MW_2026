@@ -48,15 +48,19 @@ from module.input_parameter_260706 import (
     PRE_ELECTROSTATIC_INPUT_KEYS,
     create_input_parameter,
 )
-from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.core_material_contract import (
+    PHYSICS_DATA_REVISION,
+    PHYSICS_EQUIVALENT_SOLVER_REVISIONS,
+)
 from module.thermal_probe_contract import (
     RX_SIDE_FACE_MAX_RULE,
     RX_SIDE_FACE_MEAN_RULE,
     RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
 )
 from optimization.geometry_metrics import bounding_box_lit
-from test_al_integrity import valid_result
+from test_al_integrity import TEST_LIBRARY_REVISION, valid_result
 import al_driver
+from training import checkpoint_orchestrator
 from optimization.nsga2_problem import MFTProblem, T_TARGETS
 from optimization import run_nsga2
 from monitoring.readers import TEMPERATURE_TARGETS as MONITORING_TEMPERATURE_TARGETS
@@ -167,6 +171,87 @@ class CoreTemperatureTargetContractTests(unittest.TestCase):
 
 
 class StrictRowContractTests(unittest.TestCase):
+    def test_same_physics_solver_whitelist_is_one_fail_closed_cohort(self):
+        expected_solver = PHYSICS_EQUIVALENT_SOLVER_REVISIONS[-1]
+        unknown_solver = "f" * 40
+        rows = [
+            *(
+                _valid_native_result(git_hash=revision)
+                for revision in PHYSICS_EQUIVALENT_SOLVER_REVISIONS
+            ),
+            _valid_native_result(git_hash=unknown_solver),
+            _valid_native_result(
+                git_hash=PHYSICS_EQUIVALENT_SOLVER_REVISIONS[0],
+                physics_data_revision="foreign-physics-revision",
+            ),
+            _valid_native_result(
+                git_hash=expected_solver,
+                physics_data_revision="foreign-physics-revision",
+            ),
+        ]
+
+        results = [
+            validate_record(
+                row,
+                expected_solver_revision=expected_solver,
+                expected_library_revision=TEST_LIBRARY_REVISION,
+            )
+            for row in rows
+        ]
+        self.assertEqual(
+            [result.full_valid for result in results],
+            [True, True, False, False, False],
+        )
+        for result in results[2:]:
+            self.assertIn(
+                "untrusted_provenance:solver_revision_mismatch",
+                result.reasons,
+            )
+
+        frame = pd.DataFrame(rows)
+        audited = annotate_validity(
+            frame,
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertEqual(
+            audited["_strict_valid_full"].tolist(),
+            [True, True, False, False, False],
+        )
+        training_rows = filter_valid_training_rows(audited, "Llt")
+        self.assertEqual(len(training_rows), 2)
+        self.assertEqual(
+            training_rows.attrs["physics_data_revision_cohort"],
+            PHYSICS_DATA_REVISION,
+        )
+        for row, expected in zip(rows, (True, True, False, False, False)):
+            with self.subTest(scheduler_revision=row["git_hash"]):
+                self.assertEqual(
+                    scheduler_client.is_valid_result(
+                        row,
+                        expected_revision=expected_solver,
+                        expected_library_revision=TEST_LIBRARY_REVISION,
+                    ),
+                    expected,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp, "strict-cohort.parquet")
+            frame.to_parquet(dataset, index=False)
+            _, _, strict, quarantine = checkpoint_orchestrator.inspect_dataset(
+                dataset,
+                expected_solver_revision=expected_solver,
+                expected_library_revision=TEST_LIBRARY_REVISION,
+            )
+        self.assertEqual(len(strict), 2)
+        self.assertEqual(
+            set(strict["git_hash"]),
+            set(PHYSICS_EQUIVALENT_SOLVER_REVISIONS),
+        )
+        self.assertEqual(
+            quarantine["untrusted_provenance:solver_revision_mismatch"], 3
+        )
+
     def test_legacy_false_positive_is_quarantined(self):
         row = valid_result(conv_error_pct_matrix=13.254)
         result = validate_record(row)

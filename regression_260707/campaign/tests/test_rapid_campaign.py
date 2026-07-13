@@ -14,6 +14,10 @@ CAMPAIGN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CAMPAIGN_DIR))
 
 import rapid_campaign  # noqa: E402
+from module.core_material_contract import (  # noqa: E402
+    PHYSICS_DATA_REVISION,
+    PHYSICS_EQUIVALENT_SOLVER_REVISIONS,
+)
 
 
 SOLVER_REVISION = "a" * 40
@@ -346,6 +350,48 @@ class PromotionDecisionTests(unittest.TestCase):
 
 
 class PhysicalValidityTests(unittest.TestCase):
+    def test_collection_classifies_only_reviewed_current_physics_as_equivalent(self):
+        expected_solver = PHYSICS_EQUIVALENT_SOLVER_REVISIONS[-1]
+        cases = (
+            (
+                {
+                    "git_hash": PHYSICS_EQUIVALENT_SOLVER_REVISIONS[0],
+                    "physics_data_revision": PHYSICS_DATA_REVISION,
+                },
+                False,
+            ),
+            (
+                {
+                    "git_hash": "f" * 40,
+                    "physics_data_revision": PHYSICS_DATA_REVISION,
+                },
+                True,
+            ),
+            (
+                {
+                    "git_hash": PHYSICS_EQUIVALENT_SOLVER_REVISIONS[0],
+                    "physics_data_revision": "foreign-physics-revision",
+                },
+                True,
+            ),
+            (
+                {
+                    "git_hash": expected_solver,
+                    "physics_data_revision": "foreign-physics-revision",
+                },
+                True,
+            ),
+        )
+        for result, mismatch in cases:
+            with self.subTest(result=result):
+                reason = rapid_campaign.invalid_result_reason(
+                    result,
+                    expected_solver,
+                    LIBRARY_REVISION,
+                    "strict_invalid",
+                )
+                self.assertEqual(reason == "solver_revision_mismatch", mismatch)
+
     def test_icepak_saturation_is_detected_even_when_success_flags_exist(self):
         result = {
             "thermal_solved": 1,

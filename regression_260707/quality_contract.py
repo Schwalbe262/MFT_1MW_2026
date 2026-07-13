@@ -31,7 +31,10 @@ _REPO_ROOT = str(_Path(__file__).resolve().parents[1])
 if _REPO_ROOT not in _sys.path:
     _sys.path.insert(0, _REPO_ROOT)
 
-from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.core_material_contract import (
+    PHYSICS_DATA_REVISION,
+    solver_revision_matches_physics_cohort,
+)
 from module.thermal_probe_contract import (
     RX_SIDE_FACE_MAX_RULE,
     RX_SIDE_FACE_MEAN_RULE,
@@ -213,9 +216,13 @@ def _provenance_reasons(
     for key in ("git_hash", "pyaedt_library_git_hash"):
         if not re.fullmatch(r"[0-9a-fA-F]{40}", str(_value(record, key) or "").strip()):
             reasons.append(f"untrusted_provenance:{key}")
-    if expected_solver_revision is not None and str(
-        _value(record, "git_hash") or ""
-    ).strip().lower() != str(expected_solver_revision).strip().lower():
+    if expected_solver_revision is not None and not (
+        solver_revision_matches_physics_cohort(
+            _value(record, "git_hash"),
+            expected_solver_revision,
+            _value(record, "physics_data_revision"),
+        )
+    ):
         reasons.append("untrusted_provenance:solver_revision_mismatch")
     if expected_library_revision is not None and str(
         _value(record, "pyaedt_library_git_hash") or ""

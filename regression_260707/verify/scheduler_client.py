@@ -15,7 +15,10 @@ from pathlib import Path
 
 import requests
 from filelock import FileLock
-from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.core_material_contract import (
+    PHYSICS_DATA_REVISION,
+    solver_revision_matches_physics_cohort,
+)
 from module.thermal_probe_contract import (
     RX_SIDE_FACE_MAX_RULE,
     RX_SIDE_FACE_MEAN_RULE,
@@ -1200,7 +1203,14 @@ def is_valid_result(
         return False
     if expected_revision is not None:
         expected = str(expected_revision).strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{40}", expected) or expected != git_hash:
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", expected)
+            or not solver_revision_matches_physics_cohort(
+                git_hash,
+                expected,
+                result.get("physics_data_revision"),
+            )
+        ):
             return False
     library_hash = str(result.get("pyaedt_library_git_hash") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", library_hash):

@@ -43,12 +43,26 @@ except ImportError:  # Direct execution with regression_260707 on sys.path.
 try:
     from module.core_material_contract import (
         PHYSICS_DATA_REVISION as CURRENT_PHYSICS_DATA_REVISION,
+        solver_revision_matches_physics_cohort,
     )
 except Exception as exc:  # The dashboard must remain available if repo imports fail.
     CURRENT_PHYSICS_DATA_REVISION: str | None = None
+    solver_revision_matches_physics_cohort = None
     PHYSICS_DATA_REVISION_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 else:
     PHYSICS_DATA_REVISION_IMPORT_ERROR = None
+
+try:
+    try:
+        from ..training.checkpoint_contract import (
+            checkpoint_status_revision_identity_matches,
+        )
+    except ImportError:
+        from training.checkpoint_contract import (
+            checkpoint_status_revision_identity_matches,
+        )
+except Exception:  # Keep the dashboard fail-soft when repo imports are unavailable.
+    checkpoint_status_revision_identity_matches = None
 
 
 SCHEMA_VERSION = 1
@@ -392,7 +406,13 @@ def _is_active_cohort(
     identity: tuple[str, str],
     active_cohort: tuple[str, str] | None,
 ) -> bool:
-    return active_cohort is not None and identity == active_cohort
+    if active_cohort is None or identity[1] != active_cohort[1]:
+        return False
+    if solver_revision_matches_physics_cohort is None:
+        return identity == active_cohort
+    return solver_revision_matches_physics_cohort(
+        identity[0], active_cohort[0], identity[1]
+    )
 
 
 def _active_cohort_view(
@@ -1809,19 +1829,32 @@ class ArtifactService:
 
         identity = strict_status.get("state_identity")
         identity = identity if isinstance(identity, dict) else {}
-        pins_valid = all(
-            re.fullmatch(r"[0-9a-fA-F]{40}", str(identity.get(key) or ""))
-            for key in ("solver_revision", "library_revision")
+        status_solver_revision = (
+            strict_status.get("expected_solver_revision")
+            or identity.get("solver_revision")
+        )
+        status_library_revision = (
+            strict_status.get("expected_library_revision")
+            or identity.get("library_revision")
+        )
+        pinned_revision = str(status_solver_revision or "").strip().lower()
+        pinned_library_revision = str(
+            status_library_revision or ""
+        ).strip().lower()
+        full_pins = all(re.fullmatch(r"[0-9a-f]{40}", revision) for revision in (
+            pinned_revision, pinned_library_revision
+        ))
+        pins_valid = bool(
+            full_pins
+            and checkpoint_status_revision_identity_matches is not None
+            and checkpoint_status_revision_identity_matches(
+                strict_status, pinned_revision, pinned_library_revision
+            )
         )
         strict_available = bool(strict_result.exists and pins_valid)
-        pinned_revision = (
-            str(identity.get("solver_revision")).strip().lower()
-            if strict_available else None
-        )
-        pinned_library_revision = (
-            str(identity.get("library_revision")).strip().lower()
-            if strict_available else None
-        )
+        if not strict_available:
+            pinned_revision = None
+            pinned_library_revision = None
         raw_campaign_frame = (
             parquet_result.value
             if parquet_result.value is not None else rows
@@ -1834,7 +1867,16 @@ class ArtifactService:
         )
         audit_library_revision = (
             pinned_library_revision
-            if pinned_revision == active_solver_revision else None
+            if (
+                pinned_revision is not None
+                and active_cohort is not None
+                and solver_revision_matches_physics_cohort is not None
+                and solver_revision_matches_physics_cohort(
+                    active_solver_revision,
+                    pinned_revision,
+                    active_cohort[1],
+                )
+            ) else None
         )
         campaign_frame, audit_warning = self._audited_campaign_frame(
             parquet_result,
@@ -2084,9 +2126,18 @@ class ArtifactService:
             if isinstance(strict_payload.get("state_identity"), dict)
             else {}
         )
+        identity_keys = (
+            (
+                "solver_revision_cohort",
+                "physics_data_revision",
+                "library_revision",
+            )
+            if strict_identity.get("solver_revision_cohort")
+            else ("solver_revision", "library_revision")
+        )
         required_identity = {
             key: str(strict_identity[key]).strip().lower()
-            for key in ("solver_revision", "library_revision")
+            for key in identity_keys
             if _safe_text(strict_identity.get(key), 160)
         }
 

@@ -33,6 +33,9 @@ import feeder
 import pinned_pilot
 import rapid_campaign
 import scheduler_client
+from training.checkpoint_contract import (
+    checkpoint_status_revision_identity_matches,
+)
 
 
 SOLVER = "3216e43a5a1a362ee2ed1aba89b642498c60d1b9"
@@ -226,10 +229,8 @@ def _local3_passed() -> bool:
 
 def _strict_rows() -> int:
     payload = json.loads(STRICT_STATUS_PATH.read_text(encoding="utf-8"))
-    identity = payload.get("state_identity") or {}
-    if (
-        identity.get("solver_revision") != SOLVER
-        or identity.get("library_revision") != LIBRARY
+    if not checkpoint_status_revision_identity_matches(
+        payload, SOLVER, LIBRARY
     ):
         raise RuntimeError("strict status revision identity mismatch")
     timestamp = datetime.fromisoformat(str(payload["time"]).replace("Z", "+00:00"))
