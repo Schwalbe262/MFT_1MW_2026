@@ -60,6 +60,8 @@ class RevisionProvenance:
     solver_revision: str
     library_revision: str
     data_contract_revision: str
+    physics_data_revision: str
+    core_lamination_factor: float
     scheduler_selector_revision: str
     scheduler_runtime_revision: str
     controller_base_revision: str
@@ -85,12 +87,41 @@ class RevisionProvenance:
         if not contract or len(contract) > 160:
             raise ValueError("data_contract_revision must be 1..160 characters")
         object.__setattr__(self, "data_contract_revision", contract)
+        if not isinstance(self.physics_data_revision, str):
+            raise ValueError("physics_data_revision must be a string")
+        physics_revision = self.physics_data_revision.strip()
+        if (
+            not physics_revision
+            or len(physics_revision) > 160
+            or any(character.isspace() for character in physics_revision)
+        ):
+            raise ValueError(
+                "physics_data_revision must be a 1..160 character token"
+            )
+        object.__setattr__(self, "physics_data_revision", physics_revision)
+        if isinstance(self.core_lamination_factor, bool):
+            raise ValueError(
+                "core_lamination_factor must be finite and satisfy 0 < kf <= 1"
+            )
+        try:
+            lamination_factor = float(self.core_lamination_factor)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "core_lamination_factor must be finite and satisfy 0 < kf <= 1"
+            ) from exc
+        if not math.isfinite(lamination_factor) or not 0 < lamination_factor <= 1:
+            raise ValueError(
+                "core_lamination_factor must be finite and satisfy 0 < kf <= 1"
+            )
+        object.__setattr__(self, "core_lamination_factor", lamination_factor)
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "solver_revision": self.solver_revision,
             "library_revision": self.library_revision,
             "data_contract_revision": self.data_contract_revision,
+            "physics_data_revision": self.physics_data_revision,
+            "core_lamination_factor": self.core_lamination_factor,
             "scheduler_selector_revision": self.scheduler_selector_revision,
             "scheduler_runtime_revision": self.scheduler_runtime_revision,
             "controller_base_revision": self.controller_base_revision,
@@ -109,6 +140,21 @@ class RevisionProvenance:
         return _canonical_sha256(self.as_dict())
 
 
+def pin_candidate_params(
+    params: Mapping[str, object], provenance: RevisionProvenance
+) -> dict[str, object]:
+    """Copy a candidate payload and apply the reviewed physics identity."""
+
+    if not isinstance(params, Mapping):
+        raise TypeError("candidate params must be a mapping")
+    if not isinstance(provenance, RevisionProvenance):
+        raise TypeError("candidate provenance must be RevisionProvenance")
+    pinned = dict(params)
+    pinned["core_lamination_factor"] = provenance.core_lamination_factor
+    pinned["physics_data_revision"] = provenance.physics_data_revision
+    return pinned
+
+
 @dataclass(frozen=True)
 class AttachRefillPolicy:
     """Operator-reviewed backend and logical-capacity policy.
@@ -124,6 +170,7 @@ class AttachRefillPolicy:
     projects_per_aedt: int
     validated_projects_per_aedt: int
     provenance: RevisionProvenance
+    pooled_fraction: float = 0.0
     standalone_profile: str = FEA_BURSTY
     pooled_profile: str = FEA_BURSTY
     failed_bundle_fallback: str = STANDALONE
@@ -133,6 +180,17 @@ class AttachRefillPolicy:
             raise ValueError("primary_backend must be standalone or pooled")
         if self.failed_bundle_fallback != STANDALONE:
             raise ValueError("failed pooled bundles may fall back only to standalone")
+        if isinstance(self.pooled_fraction, bool):
+            raise ValueError("pooled_fraction must be finite and between 0 and 1")
+        try:
+            pooled_fraction = float(self.pooled_fraction)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "pooled_fraction must be finite and between 0 and 1"
+            ) from exc
+        if not math.isfinite(pooled_fraction) or not 0 <= pooled_fraction <= 1:
+            raise ValueError("pooled_fraction must be finite and between 0 and 1")
+        object.__setattr__(self, "pooled_fraction", pooled_fraction)
         for field in (
             "project_concurrency_target",
             "max_aedt_sessions",
@@ -176,6 +234,7 @@ class AttachRefillPolicy:
             "max_aedt_sessions": self.max_aedt_sessions,
             "projects_per_aedt": self.projects_per_aedt,
             "validated_projects_per_aedt": self.validated_projects_per_aedt,
+            "pooled_fraction": self.pooled_fraction,
             "standalone_profile": self.standalone_profile,
             "pooled_profile": self.pooled_profile,
             "failed_bundle_fallback": self.failed_bundle_fallback,
@@ -331,6 +390,10 @@ def task_submission_options(
     env = {
         "MFT_CONTROLLER_POLICY_SHA256": policy.digest,
         "MFT_DATA_CONTRACT_REVISION": policy.provenance.data_contract_revision,
+        "MFT_PHYSICS_DATA_REVISION": policy.provenance.physics_data_revision,
+        "MFT_CORE_LAMINATION_FACTOR": str(
+            policy.provenance.core_lamination_factor
+        ),
         "MFT_AEDT_BUNDLE_ID": bundle.bundle_id,
         "MFT_AEDT_BUNDLE_EXPECTED_ROWS": str(bundle.expected_rows),
         "MFT_AEDT_BUNDLE_PROJECT_INDEX": str(candidate_index),

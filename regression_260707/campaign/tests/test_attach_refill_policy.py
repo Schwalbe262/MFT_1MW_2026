@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from pathlib import Path
 from unittest import mock
@@ -33,21 +34,25 @@ SHA = {
 }
 
 
-def provenance() -> policy_module.RevisionProvenance:
-    return policy_module.RevisionProvenance(
-        solver_revision=SHA["solver"],
-        library_revision=SHA["library"],
-        data_contract_revision="strict-1k101-kf070-v1",
-        scheduler_selector_revision=SHA["selector"],
-        scheduler_runtime_revision=SHA["runtime"],
-        controller_base_revision=SHA["controller"],
-        attach_canary_revision=SHA["canary"],
-        attach_validation_revision=SHA["validation"],
-        attach_validation_scheduler_revision=SHA["validation_scheduler"],
-        attach_timeout_validation_scheduler_revision=(
+def provenance(**changes) -> policy_module.RevisionProvenance:
+    values = {
+        "solver_revision": SHA["solver"],
+        "library_revision": SHA["library"],
+        "data_contract_revision": "mft1mw-1k101-native-lamination-kf0p85-v3",
+        "physics_data_revision": "mft1mw-1k101-native-lamination-kf0p85-v3",
+        "core_lamination_factor": 0.85,
+        "scheduler_selector_revision": SHA["selector"],
+        "scheduler_runtime_revision": SHA["runtime"],
+        "controller_base_revision": SHA["controller"],
+        "attach_canary_revision": SHA["canary"],
+        "attach_validation_revision": SHA["validation"],
+        "attach_validation_scheduler_revision": SHA["validation_scheduler"],
+        "attach_timeout_validation_scheduler_revision": (
             SHA["timeout_validation_scheduler"]
         ),
-    )
+    }
+    values.update(changes)
+    return policy_module.RevisionProvenance(**values)
 
 
 def attach_policy(**changes) -> policy_module.AttachRefillPolicy:
@@ -58,6 +63,7 @@ def attach_policy(**changes) -> policy_module.AttachRefillPolicy:
         "projects_per_aedt": 2,
         "validated_projects_per_aedt": 2,
         "provenance": provenance(),
+        "pooled_fraction": 1.0,
     }
     values.update(changes)
     return policy_module.AttachRefillPolicy(**values)
@@ -93,6 +99,85 @@ def test_projects_per_aedt_is_generic_but_evidence_bounded():
             projects_per_aedt=3,
             validated_projects_per_aedt=2,
         )
+
+
+def test_provenance_physics_identity_is_validated_and_changes_digest():
+    base = provenance()
+    assert base.as_dict()["physics_data_revision"] == (
+        "mft1mw-1k101-native-lamination-kf0p85-v3"
+    )
+    assert base.as_dict()["core_lamination_factor"] == 0.85
+    assert provenance(
+        physics_data_revision="mft1mw-1k101-native-lamination-kf0p85-v4"
+    ).digest != base.digest
+    assert provenance(core_lamination_factor=0.70).digest != base.digest
+
+    for invalid in (True, 0.0, -0.1, 1.01, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="core_lamination_factor"):
+            provenance(core_lamination_factor=invalid)
+    with pytest.raises(ValueError, match="physics_data_revision"):
+        provenance(physics_data_revision=260713)
+    with pytest.raises(ValueError, match="physics_data_revision"):
+        provenance(physics_data_revision="revision with spaces")
+
+
+def test_pin_candidate_params_copies_and_overrides_both_physics_fields():
+    source = {
+        "N1_main": 12,
+        "core_lamination_factor": 0.70,
+        "physics_data_revision": "stale-revision",
+    }
+    pinned = policy_module.pin_candidate_params(source, provenance())
+
+    assert pinned is not source
+    assert source["core_lamination_factor"] == 0.70
+    assert source["physics_data_revision"] == "stale-revision"
+    assert pinned["core_lamination_factor"] == 0.85
+    assert pinned["physics_data_revision"] == (
+        "mft1mw-1k101-native-lamination-kf0p85-v3"
+    )
+
+
+def test_pooled_fraction_is_bounded_normalized_and_part_of_policy_digest():
+    standalone_only = attach_policy(pooled_fraction=0)
+    pooled = attach_policy(pooled_fraction=1)
+
+    assert standalone_only.pooled_fraction == 0.0
+    assert pooled.pooled_fraction == 1.0
+    assert standalone_only.digest != pooled.digest
+    for invalid in (True, -0.01, 1.01, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="pooled_fraction"):
+            attach_policy(pooled_fraction=invalid)
+
+
+def test_production_policy_pins_restart_v3_with_zero_pooled_fraction():
+    path = CAMPAIGN_ROOT / "attach_refill_policy_canary_n2.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    provenance_payload = payload.pop("provenance")
+    payload.pop("schema")
+    policy = policy_module.AttachRefillPolicy(
+        provenance=policy_module.RevisionProvenance(**provenance_payload),
+        **payload,
+    )
+
+    assert policy.primary_backend == "pooled"
+    assert policy.pooled_fraction == 0.0
+    assert policy.project_concurrency_target == 300
+    assert policy.projects_per_aedt == 2
+    assert policy.validated_projects_per_aedt == 2
+    assert policy.provenance.solver_revision == (
+        "06c650cfa0c1be2bcd8af9a8f074fe8fae701d0d"
+    )
+    assert policy.provenance.library_revision == (
+        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+    )
+    assert policy.provenance.physics_data_revision == (
+        "mft1mw-1k101-native-lamination-kf0p85-v3"
+    )
+    assert policy.provenance.data_contract_revision == (
+        policy.provenance.physics_data_revision
+    )
+    assert policy.provenance.core_lamination_factor == 0.85
 
 
 def test_bundle_expected_rows_equals_logical_projects_not_desktop_count():
@@ -169,8 +254,12 @@ def test_task_options_include_target_aware_provenance_and_generic_n():
     assert options["submission_env"]["MFT_PROJECTS_PER_AEDT"] == "3"
     assert (
         options["submission_env"]["MFT_DATA_CONTRACT_REVISION"]
-        == "strict-1k101-kf070-v1"
+        == "mft1mw-1k101-native-lamination-kf0p85-v3"
     )
+    assert options["submission_env"]["MFT_PHYSICS_DATA_REVISION"] == (
+        "mft1mw-1k101-native-lamination-kf0p85-v3"
+    )
+    assert options["submission_env"]["MFT_CORE_LAMINATION_FACTOR"] == "0.85"
 
 
 class _Response:
@@ -237,6 +326,27 @@ def test_scoped_dedupe_changes_only_when_provenance_changes():
     assert scoped.startswith(plain)
 
 
+def test_scheduler_parameter_dedupe_changes_with_each_physics_pin():
+    profile = {"param_overrides": {}}
+    base_provenance = provenance()
+    revision_provenance = provenance(
+        physics_data_revision="mft1mw-1k101-native-lamination-kf0p85-v4"
+    )
+    kf_provenance = provenance(core_lamination_factor=0.70)
+
+    def dedupe(item):
+        params = policy_module.pin_candidate_params({"N1_main": 12}, item)
+        return scheduler_client.verification_dedupe_key(
+            "mft-next-physics", params, profile, SHA["solver"], SHA["library"]
+        )
+
+    assert len({
+        dedupe(base_provenance),
+        dedupe(revision_provenance),
+        dedupe(kf_provenance),
+    }) == 3
+
+
 def ready_pool_status(policy):
     return {
         "enabled": True,
@@ -264,6 +374,21 @@ def test_coordinator_refills_project_deficit_not_desktop_deficit():
     assert plan["selected_backend"] == "pooled"
     assert plan["cancel_task_ids"] == []
     assert plan["mass_cancel_authorized"] is False
+
+
+def test_fractional_pool_admission_does_not_starve_one_slot_cycles():
+    policy = attach_policy(pooled_fraction=0.25)
+    selected = [
+        controller_module.AttachAwareRefillCoordinator(policy).plan_cycle(
+            active_project_tasks=299,
+            candidates=[candidate],
+            pool_status=ready_pool_status(policy),
+        )["selected_backend"]
+        for candidate in candidates(64)
+    ]
+
+    assert "pooled" in selected
+    assert "standalone" in selected
 
 
 def test_pool_gate_failure_uses_existing_standalone_path_without_waiting():
