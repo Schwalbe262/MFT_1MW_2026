@@ -38,6 +38,8 @@ LIBRARY_ROOT = Path(os.environ.get(
 LIBRARY_SRC = LIBRARY_ROOT if LIBRARY_ROOT.name == "src" else LIBRARY_ROOT / "src"
 if str(LIBRARY_SRC) not in sys.path:
     sys.path.insert(0, str(LIBRARY_SRC))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 EVIDENCE_SCHEMA = "mft-1k101-saved-native-ab-evidence-v1"
