@@ -342,7 +342,9 @@ def _step_from_adopted_controller(
 def submit(
         name, workdir, params, solver_revision, library_revision, *,
         cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None,
-        required_project_cap=None):
+        required_project_cap=None, aedt_backend="standalone",
+        scheduling_profile="fea_bursty", submission_env=None,
+        dedupe_scope=None):
     with open(PROFILE_PATH, encoding="utf-8") as stream:
         profile = json.load(stream)
     if timeout_seconds is not None:
@@ -357,6 +359,10 @@ def submit(
         solver_revision=solver_revision,
         library_revision=library_revision,
         required_project_cap=required_project_cap,
+        aedt_backend=aedt_backend,
+        scheduling_profile=scheduling_profile,
+        submission_env=submission_env,
+        dedupe_scope=dedupe_scope,
     )
 
 

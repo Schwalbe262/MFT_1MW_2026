@@ -466,7 +466,8 @@ def effective_verification_params(params, profile):
 
 
 def verification_submission_identity(
-        name, params, profile, solver_revision, library_revision):
+        name, params, profile, solver_revision, library_revision,
+        dedupe_scope=None):
     """Return the one canonical payload/dedupe identity used for reconciliation."""
     if (not isinstance(solver_revision, str)
             or not re.fullmatch(r"[0-9a-fA-F]{40}", solver_revision)):
@@ -480,8 +481,15 @@ def verification_submission_identity(
     merged = effective_verification_params(params, profile)
     pjson = json.dumps(merged, separators=(",", ":"))
     parameter_digest = hashlib.sha256(pjson.encode("utf-8")).hexdigest()[:16]
+    normalized_scope = ""
+    if dedupe_scope is not None:
+        normalized_scope = str(dedupe_scope).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_scope):
+            raise ValueError("dedupe_scope must be a 64-character SHA256")
     dedupe_key = (
-        f"mft-al:{name}:{solver_revision}:{library_revision}:{parameter_digest}")
+        f"mft-al:{name}:{solver_revision}:{library_revision}:{parameter_digest}"
+        + (f":scope-{normalized_scope}" if normalized_scope else "")
+    )
     return {
         "solver_revision": solver_revision,
         "library_revision": library_revision,
@@ -489,19 +497,41 @@ def verification_submission_identity(
         "parameter_json": pjson,
         "parameter_digest": parameter_digest,
         "dedupe_key": dedupe_key,
+        "dedupe_scope": normalized_scope or None,
     }
 
 
 def verification_dedupe_key(
-        name, params, profile, solver_revision, library_revision):
+        name, params, profile, solver_revision, library_revision,
+        dedupe_scope=None):
     return verification_submission_identity(
-        name, params, profile, solver_revision, library_revision)["dedupe_key"]
+        name, params, profile, solver_revision, library_revision,
+        dedupe_scope=dedupe_scope)["dedupe_key"]
+
+
+def _normalized_submission_env(submission_env):
+    if submission_env is None:
+        return {}
+    if not isinstance(submission_env, dict):
+        raise TypeError("submission_env must be a dict")
+    normalized = {}
+    for key, value in submission_env.items():
+        key = str(key)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", key):
+            raise ValueError(f"invalid submission environment key: {key!r}")
+        value = str(value)
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError(f"invalid submission environment value for {key}")
+        normalized[key] = value
+    return normalized
 
 
 def submit_verification(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
-        required_project_cap=None):
+        required_project_cap=None, *, aedt_backend="standalone",
+        scheduling_profile="fea_bursty", submission_env=None,
+        dedupe_scope=None):
     """Submit one MFT task under the shared cross-process mutation lock."""
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
@@ -509,6 +539,10 @@ def submit_verification(
             solver_revision=solver_revision,
             library_revision=library_revision,
             required_project_cap=required_project_cap,
+            aedt_backend=aedt_backend,
+            scheduling_profile=scheduling_profile,
+            submission_env=submission_env,
+            dedupe_scope=dedupe_scope,
         )
     with campaign_mutation_lock():
         return _submit_verification_locked(
@@ -516,18 +550,25 @@ def submit_verification(
             solver_revision=solver_revision,
             library_revision=library_revision,
             required_project_cap=required_project_cap,
+            aedt_backend=aedt_backend,
+            scheduling_profile=scheduling_profile,
+            submission_env=submission_env,
+            dedupe_scope=dedupe_scope,
         )
 
 
 def _submit_verification_locked(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
-        required_project_cap=None):
+        required_project_cap=None, *, aedt_backend="standalone",
+        scheduling_profile="fea_bursty", submission_env=None,
+        dedupe_scope=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
     identity = verification_submission_identity(
-        name, params, profile, solver_revision, library_revision)
+        name, params, profile, solver_revision, library_revision,
+        dedupe_scope=dedupe_scope)
     solver_revision = identity["solver_revision"]
     library_revision = identity["library_revision"]
     merged = identity["merged"]
@@ -538,6 +579,23 @@ def _submit_verification_locked(
     pjson = identity["parameter_json"]
     parameter_digest = identity["parameter_digest"]
     dedupe_key = identity["dedupe_key"]
+    if aedt_backend not in {"standalone", "pooled"}:
+        raise ValueError("aedt_backend must be standalone or pooled")
+    if scheduling_profile != "fea_bursty":
+        raise ValueError("MFT FEA task scheduling_profile must be fea_bursty")
+    normalized_env = _normalized_submission_env(submission_env)
+    submission_provenance = {
+        "aedt_backend": aedt_backend,
+        "scheduling_profile": scheduling_profile,
+        "dedupe_scope": identity["dedupe_scope"],
+        "submission_env": normalized_env,
+    }
+    env_exports = "".join(
+        f"export {key}={shlex.quote(value)}; "
+        for key, value in sorted(normalized_env.items())
+    )
+    provenance_line = json.dumps(
+        submission_provenance, sort_keys=True, separators=(",", ":"))
     extra = profile.get("cli_flags", "")
     run_identity = (
         f"s{solver_revision[:12]}-l{library_revision[:12]}-p{parameter_digest}")
@@ -596,7 +654,10 @@ def _submit_verification_locked(
                   f"[ -d {quoted_library}/src ] && "
                   f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n' && ")
     run_group = (
-        f"mkdir -p {quoted_workdir} && "
+        env_exports
+        + f"printf 'MFT_SUBMISSION_PROVENANCE %s\\n' "
+          f"{shlex.quote(provenance_line)}; "
+        + f"mkdir -p {quoted_workdir} && "
         + lib_clone
         + f"([ -d {quoted_repo}/.git ] || git clone -q --depth 1 "
           f"https://github.com/Schwalbe262/MFT_1MW_2026.git {quoted_repo}) && "
@@ -624,7 +685,9 @@ def _submit_verification_locked(
         "name": name, "project": MFT_PROJECT,
         "remote_cwd": GPFS_RUNS_REMOTE_CWD,
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
-        "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
+        "scheduling_profile": scheduling_profile,
+        "aedt_backend": aedt_backend,
+        "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
         "timeout_seconds": timeout_seconds,
         "dedupe_key": dedupe_key,
         # Exact per-task basename only. The scheduler applies this cleanup on

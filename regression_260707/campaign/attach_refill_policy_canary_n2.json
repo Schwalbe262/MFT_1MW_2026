@@ -1,0 +1,23 @@
+{
+  "schema": "mft-attach-aware-refill-policy-v1",
+  "primary_backend": "pooled",
+  "project_concurrency_target": 300,
+  "max_aedt_sessions": 250,
+  "projects_per_aedt": 2,
+  "validated_projects_per_aedt": 2,
+  "standalone_profile": "fea_bursty",
+  "pooled_profile": "fea_bursty",
+  "failed_bundle_fallback": "standalone",
+  "provenance": {
+    "solver_revision": "78d95110505315b8852c286994697844e22c214a",
+    "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+    "data_contract_revision": "strict-b171-attach-canary-pre-1k101-v1",
+    "scheduler_selector_revision": "9f7b005927bb4d039c743623e8f39e9a214feca0",
+    "scheduler_runtime_revision": "d66cf542b0deffa465d43367dd89ed8a4639235d",
+    "controller_base_revision": "5f3987e00212ffebe88d4d705b07c8f52603c5ed",
+    "attach_canary_revision": "78d95110505315b8852c286994697844e22c214a",
+    "attach_validation_revision": "fd3b02c2a4c3bd2ef566cc6e79ce1291f5576a18",
+    "attach_validation_scheduler_revision": "620a3019da3577bbe2ea2e10aafebd8c26717df7",
+    "attach_timeout_validation_scheduler_revision": "f3a65eeabb0e1d4d0f7694035147b9c27e673ee1"
+  }
+}
