@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-TRAIN_IO_SCHEMA_VERSION = 5
+TRAIN_IO_SCHEMA_VERSION = 6
 
 IDENTITY_COLUMNS = (
     "project_name",
@@ -143,6 +143,8 @@ ANALYSIS_BASIS_COLUMNS = (
     "matrix_skin_mesh",
     "loss_sym_on",
     "thermal_symmetry",
+    "n_explicit_turns",
+    "thermal_rx_model",
     "matrix_on",
     "loss_on",
     "thermal_on",

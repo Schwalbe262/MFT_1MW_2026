@@ -21,6 +21,8 @@ def raw_rows():
             "saved_at": "2026-07-10 01:00:00",
             "full_model": 0,
             "matrix_skin_mesh": 0,
+            "n_explicit_turns": 0,
+            "thermal_rx_model": "homogenized_blocks",
             "N1_main": 7,
             "N2_main": 65,
             "N2_side": 5,
@@ -64,6 +66,8 @@ def raw_rows():
             "saved_at": "2026-07-10 02:00:00",
             "full_model": 1,
             "matrix_skin_mesh": 1,
+            "n_explicit_turns": 2,
+            "thermal_rx_model": "hybrid_explicit",
             "N1_main": 7,
             "N2_main": 65,
             "N2_side": 5,
@@ -103,7 +107,7 @@ class TrainIoBuilderTests(unittest.TestCase):
         view = train_io.build_train_io(raw)
 
         self.assertEqual(tuple(view.columns), train_io.TRAIN_IO_COLUMNS)
-        self.assertEqual(view["train_io_schema_version"].tolist(), [5, 5])
+        self.assertEqual(view["train_io_schema_version"].tolist(), [6, 6])
         self.assertEqual(
             view["inductance_source_basis"].tolist(),
             ["eighth_symmetry", "full_model"],
@@ -112,6 +116,11 @@ class TrainIoBuilderTests(unittest.TestCase):
         self.assertEqual(view["Llt_phys"].tolist(), [27.5, 27.5])
         self.assertEqual(view["M_phys"].tolist(), [380.0, 380.0])
         self.assertEqual(view["matrix_skin_mesh"].tolist(), [0, 1])
+        self.assertEqual(view["n_explicit_turns"].tolist(), [0, 2])
+        self.assertEqual(
+            view["thermal_rx_model"].tolist(),
+            ["homogenized_blocks", "hybrid_explicit"],
+        )
         self.assertEqual(view["P_winding_total"].tolist(), [4000.0, 4100.0])
         self.assertEqual(view["T_max_Rx_main"].tolist(), [91.0, 90.0])
         self.assertEqual(view["time_matrix"].tolist(), [300.0, 600.0])
