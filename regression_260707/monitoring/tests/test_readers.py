@@ -726,6 +726,7 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
         "git_hash": NEWER_SOLVER_REVISION,
         "git_hash_short": NEWER_SOLVER_REVISION[:10],
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        "latest_saved_at": (FIXED_NOW - timedelta(minutes=20)).isoformat(),
         "active": True,
         "current": True,
         "raw_rows": 5,
@@ -748,6 +749,11 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
     assert legacy["raw_rows"] == 2
     assert legacy["strict_em_rows"] == 0
     assert legacy["strict_full_rows"] == 0
+    assert [item["git_hash"] for item in summary["cohorts"]] == [
+        NEWER_SOLVER_REVISION,
+        "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+        OLDER_SOLVER_REVISION,
+    ]
 
     electrostatic = summary["electrostatic"]
     assert electrostatic["cohort_basis"] == "active_strict_full"
@@ -842,6 +848,65 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
         "missing": 1,
         "unavailable": 2,
     }
+
+
+def test_campaign_cohorts_sort_inactive_rows_by_latest_saved_row():
+    from .conftest import FIXED_NOW
+
+    recent_revision = "c" * 40
+    undated_revision = "d" * 40
+    inactive_second = FIXED_NOW - timedelta(minutes=10)
+    frame = pd.DataFrame([
+        {
+            "git_hash": NEWER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (FIXED_NOW - timedelta(minutes=1)).isoformat(),
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+        },
+        {
+            "git_hash": OLDER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (
+                inactive_second + timedelta(microseconds=100)
+            ).isoformat(),
+        },
+        {
+            "git_hash": OLDER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (
+                inactive_second + timedelta(microseconds=200)
+            ).isoformat(),
+        },
+        {
+            "git_hash": recent_revision,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (
+                inactive_second + timedelta(microseconds=800)
+            ).isoformat(),
+        },
+        {
+            "git_hash": undated_revision,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        },
+    ])
+
+    cohorts = _campaign_frame_summary(frame, FIXED_NOW)["cohorts"]
+
+    assert [item["git_hash"] for item in cohorts] == [
+        NEWER_SOLVER_REVISION,
+        recent_revision,
+        OLDER_SOLVER_REVISION,
+        undated_revision,
+    ]
+    assert cohorts[1]["latest_saved_at"] == (
+        inactive_second + timedelta(microseconds=800)
+    ).isoformat()
+    assert cohorts[2]["raw_rows"] == 2
+    assert cohorts[2]["latest_saved_at"] == (
+        inactive_second + timedelta(microseconds=200)
+    ).isoformat()
+    assert cohorts[3]["latest_saved_at"] is None
 
 
 def test_campaign_frame_summary_tolerates_missing_columns_and_uses_flags():

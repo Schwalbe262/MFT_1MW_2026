@@ -610,6 +610,16 @@ def _campaign_frame_summary(
     cohort_history = cohort_history or {}
     cohorts: list[dict[str, Any]] = []
     for (revision, physics_revision), cohort_rows in grouped.items():
+        saved_stamps = [
+            stamp
+            for row in cohort_rows
+            if (
+                stamp := _parse_time(row.get("saved_at"), now.tzinfo)
+            ) is not None
+        ]
+        latest_saved_at = max(
+            saved_stamps, key=lambda stamp: stamp.timestamp(), default=None
+        )
         strict_em_rows = sum(row["_monitor_strict_em"] for row in cohort_rows)
         strict_full_rows = sum(row["_monitor_strict_full"] for row in cohort_rows)
         recent_growth = sum(
@@ -643,6 +653,9 @@ def _campaign_frame_summary(
             "git_hash": revision or None,
             "git_hash_short": revision[:10] if revision else "unknown",
             "physics_data_revision": physics_revision,
+            "latest_saved_at": (
+                latest_saved_at.isoformat() if latest_saved_at else None
+            ),
             "active": current,
             "current": current,
             "raw_rows": len(cohort_rows),
@@ -650,10 +663,16 @@ def _campaign_frame_summary(
             "strict_full_rows": strict_full_rows,
             "growth_rate_per_hour": float(recent_growth),
         })
-    cohorts.sort(key=lambda item: (
-        not item["active"], -item["raw_rows"],
-        item["git_hash_short"], item["physics_data_revision"],
-    ))
+
+    def _cohort_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        latest = _parse_time(item.get("latest_saved_at"), now.tzinfo)
+        latest_rank = latest.timestamp() if latest is not None else float("-inf")
+        return (
+            not item["active"], -latest_rank, -item["raw_rows"],
+            item["git_hash_short"], item["physics_data_revision"],
+        )
+
+    cohorts.sort(key=_cohort_sort_key)
 
     current_rows = [row for row in prepared if row["_monitor_current"]]
     current_strict = [

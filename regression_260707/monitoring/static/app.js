@@ -1,15 +1,20 @@
 (() => {
   "use strict";
 
+  const hasDOM = typeof document !== "undefined";
   const $ = (selector) => document.querySelector(selector);
   const svgNS = "http://www.w3.org/2000/svg";
-  const refreshSeconds = Number(document.body.dataset.refreshSeconds || 20);
+  const refreshSeconds = hasDOM ? Number(document.body.dataset.refreshSeconds || 20) : 20;
   const state = {
     dashboard: null, selectedModel: null, selectedModelData: null, refreshing: false,
     historyMetric: "r2",
     parityCache: new Map(), parityRequest: 0,
     parallelTargetDirty: false, updatingParallelTarget: false,
+    cohortHistoryExpanded: false,
   };
+
+  const COHORT_HISTORY_PREVIEW_ROWS = 2;
+  const LEGACY_COHORT_REVISION = "legacy_unspecified";
 
   const labels = {
     loading: "불러오는 중", active: "진행 중", warning: "주의", error: "오류", idle: "대기",
@@ -219,47 +224,184 @@
     renderThermalModels(data.thermal_models);
   }
 
+  function isActiveCohort(cohort) {
+    return Boolean(cohort?.active ?? cohort?.current);
+  }
+
+  function cohortTimestamp(cohort) {
+    const timestamp = String(cohort?.latest_saved_at || "");
+    const fractional = timestamp.match(
+      /\.(\d+)(?:Z|[+-]\d{2}:?\d{2})?$/,
+    )?.[1] || "";
+    const normalizedTimestamp = fractional
+      ? timestamp.replace(`.${fractional}`, `.${fractional.padEnd(3, "0").slice(0, 3)}`)
+      : timestamp;
+    const milliseconds = Date.parse(normalizedTimestamp);
+    if (!Number.isFinite(milliseconds)) return Number.NEGATIVE_INFINITY;
+    const subMillisecond = Number(fractional.padEnd(6, "0").slice(3, 6) || 0) / 1000;
+    return milliseconds + subMillisecond;
+  }
+
+  function cohortGrowth(cohort) {
+    return hasNumber(cohort?.growth_rate_per_hour)
+      ? `${Number(cohort.growth_rate_per_hour) > 0 ? "+" : ""}${number(cohort.growth_rate_per_hour, 1)}/h`
+      : "—";
+  }
+
+  function shortPhysicsRevision(value) {
+    const revision = String(value || "").trim();
+    if (!revision || revision.toLowerCase() === LEGACY_COHORT_REVISION) return "legacy";
+    return revision.length > 18 ? `${revision.slice(0, 18)}…` : revision;
+  }
+
+  function compactPriorCohorts(cohorts) {
+    const prior = cohorts.filter((cohort) => !isActiveCohort(cohort));
+    const isLegacyNoise = (cohort) => (
+      String(cohort?.physics_data_revision || "").trim().toLowerCase() === LEGACY_COHORT_REVISION
+      && Number(cohort?.strict_em_rows) === 0
+      && Number(cohort?.strict_full_rows) === 0
+      && (!hasNumber(cohort?.growth_rate_per_hour) || Number(cohort.growth_rate_per_hour) === 0)
+    );
+    const legacyNoise = prior.filter(isLegacyNoise);
+    const rows = prior.filter((cohort) => !isLegacyNoise(cohort));
+    if (legacyNoise.length) {
+      const sum = (key) => legacyNoise.reduce(
+        (total, cohort) => total + (hasNumber(cohort?.[key]) ? Number(cohort[key]) : 0),
+        0,
+      );
+      const newestLegacy = [...legacyNoise].sort(
+        (left, right) => cohortTimestamp(right) - cohortTimestamp(left),
+      )[0];
+      rows.push({
+        git_hash: null,
+        git_hash_short: "legacy",
+        physics_data_revision: LEGACY_COHORT_REVISION,
+        latest_saved_at: newestLegacy?.latest_saved_at || null,
+        legacy_aggregate: true,
+        cohort_count: legacyNoise.length,
+        raw_rows: sum("raw_rows"),
+        strict_em_rows: sum("strict_em_rows"),
+        strict_full_rows: sum("strict_full_rows"),
+        growth_rate_per_hour: sum("growth_rate_per_hour"),
+      });
+    }
+    return rows.sort((left, right) => {
+      const newestFirst = cohortTimestamp(right) - cohortTimestamp(left);
+      if (newestFirst) return newestFirst;
+      const leftIdentity = `${left?.git_hash_short || left?.git_hash || ""}:${left?.physics_data_revision || ""}`;
+      const rightIdentity = `${right?.git_hash_short || right?.git_hash || ""}:${right?.physics_data_revision || ""}`;
+      return leftIdentity.localeCompare(rightIdentity);
+    });
+  }
+
+  function cohortHistoryView(cohorts, expanded = false) {
+    const source = Array.isArray(cohorts) ? cohorts : [];
+    return {
+      cohortCount: source.filter((cohort) => !isActiveCohort(cohort)).length,
+      rows: compactPriorCohorts(source).map((cohort, index) => {
+        const extra = index >= COHORT_HISTORY_PREVIEW_ROWS;
+        return { cohort, extra, hidden: extra && !expanded };
+      }),
+    };
+  }
+
+  function activeCohortCard(cohort) {
+    const card = element("article", "cohort-row active");
+    const heading = element("div", "cohort-row-heading");
+    const identity = element("div");
+    const hash = cohort?.git_hash_short || (cohort?.git_hash ? String(cohort.git_hash).slice(0, 10) : "—");
+    identity.append(element("strong", "mono", hash));
+    identity.append(element("span", "", cohort?.physics_data_revision || "physics revision —"));
+    heading.append(identity, element("span", "state-chip pass", "ACTIVE"));
+    card.append(heading);
+    const metrics = element("dl", "cohort-metric-grid");
+    [
+      ["Raw", count(cohort?.raw_rows)],
+      ["Strict EM", count(cohort?.strict_em_rows)],
+      ["Strict full", count(cohort?.strict_full_rows)],
+      ["증가 속도", cohortGrowth(cohort)],
+    ].forEach(([label, value]) => {
+      const item = element("div");
+      item.append(element("dt", "", label), element("dd", "", value));
+      metrics.append(item);
+    });
+    card.append(metrics);
+    return card;
+  }
+
+  function setCohortHistoryExpanded(expanded) {
+    state.cohortHistoryExpanded = Boolean(expanded);
+    const toggle = $("#cohort-history-toggle");
+    const extraRows = document.querySelectorAll("#cohort-history-body tr[data-cohort-extra='true']");
+    const canExpand = extraRows.length > 0;
+    const applied = canExpand && state.cohortHistoryExpanded;
+    const cohortCount = Number(toggle.dataset.cohortCount || 0);
+    toggle.setAttribute("aria-expanded", String(applied));
+    toggle.textContent = applied
+      ? `이전 코호트 ${number(cohortCount)}개 접기`
+      : `이전 코호트 ${number(cohortCount)}개 보기`;
+    extraRows.forEach((row) => row.classList.toggle("hidden", !applied));
+  }
+
   function renderCohorts(cohortsPayload, metadataPayload, activePayload) {
     const cohorts = Array.isArray(cohortsPayload) ? cohortsPayload : [];
     const active = activePayload && typeof activePayload === "object" ? activePayload : {};
-    const list = $("#cohort-list");
-    list.replaceChildren();
+    const activeContainer = $("#cohort-active");
+    const history = $("#cohort-history");
+    const historyBody = $("#cohort-history-body");
+    const historyToggle = $("#cohort-history-toggle");
+    activeContainer.replaceChildren();
+    activeContainer.classList.remove("hidden");
+    historyBody.replaceChildren();
     setText(
       "#cohort-summary",
       active.available === true
         ? `ACTIVE ${active.git_hash_short || "—"}`
         : active.label || (cohorts.length ? `${number(cohorts.length)}개 코호트` : "코호트 —"),
     );
+
     if (!cohorts.length) {
-      list.append(element("p", "empty-state compact-empty", "사용 가능한 코호트 데이터가 없습니다."));
+      activeContainer.append(element("p", "empty-state compact-empty", "사용 가능한 코호트 데이터가 없습니다."));
+      history.classList.add("hidden");
+      historyToggle.dataset.cohortCount = "0";
+      historyToggle.classList.add("hidden");
+      setCohortHistoryExpanded(false);
     } else {
-      [...cohorts].sort((left, right) => Number(Boolean(right?.active ?? right?.current)) - Number(Boolean(left?.active ?? left?.current))).forEach((cohort) => {
-        const isActive = Boolean(cohort?.active ?? cohort?.current);
-        const card = element("article", `cohort-row${isActive ? " active" : ""}`);
-        const heading = element("div", "cohort-row-heading");
-        const identity = element("div");
-        const hash = cohort?.git_hash_short || (cohort?.git_hash ? String(cohort.git_hash).slice(0, 10) : "—");
-        identity.append(element("strong", "mono", hash));
-        identity.append(element("span", "", cohort?.physics_data_revision || "physics revision —"));
-        heading.append(identity);
-        if (isActive) heading.append(element("span", "state-chip pass", "ACTIVE"));
-        card.append(heading);
-        const metrics = element("dl", "cohort-metric-grid");
-        [
-          ["Raw", count(cohort?.raw_rows)],
-          ["Strict EM", count(cohort?.strict_em_rows)],
-          ["Strict full", count(cohort?.strict_full_rows)],
-          ["증가 속도", hasNumber(cohort?.growth_rate_per_hour)
-            ? `${Number(cohort.growth_rate_per_hour) > 0 ? "+" : ""}${number(cohort.growth_rate_per_hour, 1)}/h`
-            : "—"],
-        ].forEach(([label, value]) => {
-          const item = element("div");
-          item.append(element("dt", "", label), element("dd", "", value));
-          metrics.append(item);
-        });
-        card.append(metrics);
-        list.append(card);
+      const activeCohort = cohorts.find(isActiveCohort);
+      if (activeCohort) {
+        activeContainer.append(activeCohortCard(activeCohort));
+      } else {
+        activeContainer.classList.add("hidden");
+      }
+
+      const historyView = cohortHistoryView(cohorts, state.cohortHistoryExpanded);
+      historyView.rows.forEach(({ cohort, extra, hidden }) => {
+        const row = element("tr", cohort?.legacy_aggregate ? "legacy-aggregate" : "");
+        row.dataset.cohortExtra = String(extra);
+        row.classList.toggle("hidden", hidden);
+        const hash = cohort?.legacy_aggregate
+          ? `레거시 (${number(cohort.cohort_count)}개 코호트)`
+          : cohort?.git_hash_short || (cohort?.git_hash ? String(cohort.git_hash).slice(0, 10) : "—");
+        const hashCell = element("td", "cohort-history-sha mono", hash);
+        if (!cohort?.legacy_aggregate && cohort?.git_hash) hashCell.title = String(cohort.git_hash);
+        const revisionCell = element("td", "cohort-history-revision mono", shortPhysicsRevision(cohort?.physics_data_revision));
+        if (cohort?.physics_data_revision) revisionCell.title = String(cohort.physics_data_revision);
+        const growth = element("td", "cohort-history-growth", cohortGrowth(cohort));
+        if (Number(cohort?.growth_rate_per_hour) > 0) growth.classList.add("positive");
+        row.append(
+          hashCell,
+          revisionCell,
+          element("td", "", number(cohort?.raw_rows)),
+          element("td", "", number(cohort?.strict_em_rows)),
+          element("td", "", number(cohort?.strict_full_rows)),
+          growth,
+        );
+        historyBody.append(row);
       });
+      history.classList.toggle("hidden", historyView.rows.length === 0);
+      historyToggle.dataset.cohortCount = String(historyView.cohortCount);
+      historyToggle.classList.toggle("hidden", historyView.rows.length <= COHORT_HISTORY_PREVIEW_ROWS);
+      setCohortHistoryExpanded(state.cohortHistoryExpanded);
     }
 
     const metadata = metadataPayload && typeof metadataPayload === "object" ? metadataPayload : {};
@@ -1132,7 +1274,17 @@
     }
   }
 
+  if (!hasDOM) {
+    if (typeof module !== "undefined" && module.exports) {
+      module.exports = { cohortHistoryView };
+    }
+    return;
+  }
+
   $("#refresh-button").addEventListener("click", refresh);
+  $("#cohort-history-toggle").addEventListener("click", () => {
+    setCohortHistoryExpanded(!state.cohortHistoryExpanded);
+  });
   $("#model-history-metric").addEventListener("change", (event) => {
     const metric = event.target.value;
     if (!historyMetrics[metric]) return;
