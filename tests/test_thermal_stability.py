@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import tempfile
@@ -172,18 +173,26 @@ class _FieldSummary:
 
 
 class _Icepak:
-    def __init__(self, analyze_result, field_summary_responses, setup_result=True, setup_update_result=True):
+    def __init__(
+        self, analyze_result, field_summary_responses, setup_result=True,
+        setup_update_result=True, scalar_responses=None,
+    ):
         self.analyze_result = analyze_result
         self.analyze_calls = 0
         self.field_summary_calls = 0
         self.field_summary_responses = field_summary_responses
+        self.scalar_responses = scalar_responses or {}
+        self.scalar_calls = []
         self.setup_result = setup_result
         self.setup_update_result = setup_update_result
         self.design_name = "icepak_thermal"
         self.setup_names = ["ThermalSetup"]
         self.existing_analysis_sweeps = ["ThermalSetup : SteadyState"]
         self.mesh = SimpleNamespace(assign_mesh_level=Mock())
-        self.post = SimpleNamespace(create_field_summary=lambda: _FieldSummary(self))
+        self.post = SimpleNamespace(
+            create_field_summary=lambda: _FieldSummary(self),
+            get_scalar_field_value=self._get_scalar_field_value,
+        )
         self.oproject = _ProjectHandle()
         self.odesktop = SimpleNamespace(
             AreThereSimulationsRunning=lambda: False,
@@ -191,6 +200,14 @@ class _Icepak:
         )
         self._odesign = _DesignHandle("stale_design")
         self.design_solutions = SimpleNamespace(_odesign=self._odesign)
+
+    def _get_scalar_field_value(self, _quantity, **kwargs):
+        key = (kwargs["object_name"], kwargs["scalar_function"])
+        self.scalar_calls.append((key, kwargs["object_type"], kwargs["solution"]))
+        value = self.scalar_responses.get(key)
+        if isinstance(value, Exception):
+            raise value
+        return value
 
     def create_setup(self, name):
         if not self.setup_result:
@@ -264,12 +281,14 @@ class ThermalStabilityTest(unittest.TestCase):
         setup_update_result=True,
         convergence=None,
         tx_count=1,
+        scalar_responses=None,
     ):
         ipk = _Icepak(
             analyze_result,
             responses,
             setup_result=setup_result,
             setup_update_result=setup_update_result,
+            scalar_responses=scalar_responses,
         )
         wrapper = _DesignWrapper(ipk)
         project = SimpleNamespace(create_design=lambda **_kwargs: wrapper)
@@ -549,6 +568,31 @@ class ThermalStabilityTest(unittest.TestCase):
                 left_ranges[relation][1], -right_ranges[relation][0]
             )
 
+    def test_invalid_probe_span_is_recorded_before_aedt_creation(self):
+        frame = self._probe_frame(4)
+        frame.loc[:, "l2"] = 5.0
+        calls = []
+
+        def create_rectangle(**kwargs):
+            calls.append(kwargs["name"])
+            return SimpleNamespace(name=kwargs["name"], is3d=False, model=True)
+
+        ipk = SimpleNamespace(
+            modeler=SimpleNamespace(create_rectangle=create_rectangle)
+        )
+        sheets = thermal._create_probe_sheets(
+            ipk, frame, {}, eighth=True, mode="eighth"
+        )
+
+        self.assertNotIn("Tprobe_core_top_yoke", calls)
+        self.assertIn("Tprobe_core_top_yoke", sheets.expected_names)
+        failure = next(
+            item for item in sheets.failures
+            if item["probe"] == "Tprobe_core_top_yoke"
+        )
+        self.assertEqual(failure["stage"], "geometry")
+        self.assertEqual(failure["reason"], "invalid_rectangle")
+
     def test_core_probe_aggregates_center_and_side_legs(self):
         complete = {
             "Tx_main_0": (81.0, 70.0),
@@ -784,6 +828,60 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(row["thermal_solved"], 1)
         self.assertEqual(row["thermal_extraction_complete"], 0)
         self.assertEqual(row["thermal_missing_count"], 2)
+
+    def test_missing_probe_uses_bounded_saved_field_scalar_fallback(self):
+        complete_groups = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+        }
+        ipk, row = self._run(
+            None,
+            [complete_groups] * 3,
+            n1_side=1,
+            probe_names=["Tprobe_Tx_side"],
+            scalar_responses={
+                ("Tprobe_Tx_side", "Maximum"): 86.0,
+                ("Tprobe_Tx_side", "Mean"): 74.0,
+            },
+        )
+
+        self.assertEqual(ipk.field_summary_calls, 3)
+        self.assertEqual(row["thermal_calculator_attempts"], 2)
+        self.assertEqual(len(ipk.scalar_calls), 2)
+        self.assertTrue(all(call[1] == "surface" for call in ipk.scalar_calls))
+        self.assertEqual(row["Tprobe_Tx_side_max"], 86.0)
+        self.assertEqual(row["Tprobe_Tx_side_mean"], 74.0)
+        self.assertEqual(row["thermal_extraction_complete"], 1)
+        self.assertEqual(row["thermal_probe_failure_count"], 0)
+        self.assertEqual(json.loads(row["thermal_probe_failures_json"]), [])
+
+    def test_failed_probe_fallback_is_structured_and_stays_quarantinable(self):
+        complete_groups = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+        }
+        ipk, row = self._run(
+            None,
+            [complete_groups] * 3,
+            n1_side=1,
+            probe_names=["Tprobe_Tx_side"],
+        )
+
+        self.assertEqual(row["thermal_extraction_complete"], 0)
+        self.assertEqual(row["thermal_extraction_failure_reason"],
+                         "required_probe_temperature_missing")
+        self.assertEqual(row["thermal_probe_failure_count"], 1)
+        [failure] = json.loads(row["thermal_probe_failures_json"])
+        self.assertEqual(failure["probe"], "Tprobe_Tx_side")
+        self.assertEqual(failure["stage"], "extraction")
+        self.assertEqual(failure["reason"], "saved_field_fallback_exhausted")
+        self.assertEqual(
+            failure["columns"],
+            ["Tprobe_Tx_side_max", "Tprobe_Tx_side_mean"],
+        )
+        self.assertEqual(len(ipk.scalar_calls), 2)
 
     def test_report_failure_does_not_launch_another_solve(self):
         ipk, row = self._run(None, [False, False, False])
