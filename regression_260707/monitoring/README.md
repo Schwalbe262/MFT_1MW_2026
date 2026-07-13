@@ -2,8 +2,9 @@
 
 `slurm_scheduler`와 분리된 MFT 전용 WEB UI다. MFT 저장소의 데이터셋, 학습 리포트,
 AL/NSGA-II 산출물, 검증 결과를 직접 읽는다. 스케줄러 상태는 경량
-`GET /api/tasks/summary`와 MFT 프로젝트 조회만 사용하며 수만 건의 작업 목록은 읽지
-않는다. 유일한 쓰기 기능은 MFT 프로젝트의 병렬 유지 목표를 바꾸는 cap-only PATCH다.
+`GET /api/tasks/summary`, MFT 프로젝트 조회, `_aedt_pool_hosts`의 active 작업만 거르는
+bounded 조회를 사용하며 수만 건의 작업 목록은 읽지 않는다. 유일한 쓰기 기능은 MFT
+프로젝트의 병렬 유지 목표를 바꾸는 cap-only PATCH다.
 repo/setup/entrypoint는 수정하지 않으며 IPMSM 프로젝트도 건드리지 않는다.
 
 ## 실행
@@ -36,6 +37,8 @@ regression_260707\monitoring\.venv\Scripts\python -m uvicorn regression_260707.m
     Parquet가 없거나 읽는 중이면 기존 CSV 화면으로 안전하게 폴백한다.
   - 활성 코호트는 `module.core_material_contract.PHYSICS_DATA_REVISION`과 일치하는 행 중
     `saved_at`이 가장 최신인 행의 `(git_hash, physics_data_revision)` 조합이다.
+  - 메인 데이터 목표·증가율·도달 예상은 현재 `PHYSICS_DATA_REVISION`의 모든 SHA에서
+    재계산된 strict 플래그를 합산한다. SHA별 상세는 `/cohorts`에서 확인한다.
 - 모델: `training/registry/current.json`이 가리키는 승인 generation의
   `train_report.json`, 각 모델의 `meta.json`, `training/learning_curve.csv`
 - 최적화: 최신 `al_rounds/round_*/pareto_front.csv`, 선택적으로 `al_rounds/state.json`
@@ -59,7 +62,7 @@ fine FEA JSON에는 `result` 객체와 선택적으로 `candidate_id`, `task_id`
 - `MFT_MONITOR_TASK_PREFIX`: 조회할 작업 이름 접두사, 기본값 `mft`
 - `MFT_SCHEDULER_PROJECT`: 병렬 목표를 제어할 프로젝트, 기본값 `MFT_1MW_2026v1`
 - `MFT_SCHEDULER_TIMEOUT`: 스케줄러 GET 제한시간(초), 기본값 `2`
-- `MFT_SCHEDULER_OPTIONAL_TIMEOUT`: AEDT pool/license 선택 조회 제한시간(초), 기본값 `1`
+- `MFT_SCHEDULER_OPTIONAL_TIMEOUT`: AEDT pool/license 및 node-local host 선택 조회 제한시간(초), 기본값 `1`
 - `MFT_MONITOR_DISABLE_HISTORY=1`: runtime snapshot/history 기록 중지
 
 ## 테스트

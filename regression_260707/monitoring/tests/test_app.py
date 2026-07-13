@@ -17,11 +17,16 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert page.status_code == 200
     assert "최적설계 파이프라인" in page.text
     assert "data-chart" in page.text
-    assert "최신 revision 학습 가능" in page.text
+    assert "현재 물리 revision 학습 가능" in page.text
+    assert "코호트 상세 →" in page.text
+    assert 'href="/cohorts"' in page.text
+    assert 'id="data-member-shas"' in page.text
     assert "전체 수집 데이터" in page.text
     assert "data-raw-total" in page.text
     assert "최근 시뮬레이션 단계별 소요시간" in page.text
     assert "stage-time-matrix-mean" in page.text
+    assert "stage-time-electrostatic-mean" in page.text
+    assert "Electrostatic 평균" in page.text
     assert 'id="stage-timing-basis"' in page.text
     assert "활성 코호트 기준" in page.text
     assert "활성 코호트 확인 중" in page.text
@@ -34,16 +39,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "parallel-attaching" in page.text
     assert 'id="model-history-metric"' in page.text
     assert 'value="mape_pct"' in page.text
-    assert 'id="cohort-list"' in page.text
-    assert 'id="cohort-active"' in page.text
-    assert 'id="cohort-history"' in page.text
-    assert 'id="cohort-history-toggle"' in page.text
-    assert 'aria-expanded="false"' in page.text
-    assert "이전 코호트 0개 보기" in page.text
-    assert '<th>SHA</th><th>revision</th><th>Raw</th>' in page.text
-    assert '<th>Strict EM</th><th>Strict full</th><th>+/h</th>' in page.text
-    assert 'id="cohort-history-body"' in page.text
-    assert 'aria-label="이전 코호트 표" tabindex="0"' in page.text
+    assert 'id="cohort-list"' not in page.text
+    assert 'id="cohort-history"' not in page.text
     assert 'id="cohort-lamination-factor"' in page.text
     assert 'id="cohort-flux-availability"' in page.text
     assert 'id="quarantine-current-reasons"' in page.text
@@ -55,12 +52,26 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert 'id="aedt-attach-card"' in page.text
     assert 'id="aedt-license-usage"' in page.text
     assert 'id="aedt-pool-idle"' in page.text
+    assert "중앙 풀(비활성·구조적 차단)" in page.text
+    assert 'id="aedt-node-local-progress"' in page.text
     assert "학습 데이터 수 기준" in page.text
+
+    cohorts_page = client.get("/cohorts")
+    assert cohorts_page.status_code == 200
+    assert "수집 데이터 코호트" in cohorts_page.text
+    assert "코호트 상세" in cohorts_page.text
+    assert 'href="/"' in cohorts_page.text
+    assert '<th>SHA</th><th>revision</th><th>Raw</th>' in cohorts_page.text
+    assert '<th>Strict EM</th><th>Strict full</th><th>+/h</th>' in cohorts_page.text
+    assert 'id="cohorts-body"' in cohorts_page.text
+    assert "/static/cohorts.js" in cohorts_page.text
 
     script = client.get("/static/app.js")
     assert script.status_code == 200
     assert "function duration(value)" in script.text
-    assert "data.pinned_revision" in script.text
+    assert "data.current_physics_data_revision" in script.text
+    assert "data.member_git_hash_shorts" in script.text
+    assert "data.revision_raw_rows" in script.text
     assert "data.raw_total_rows" in script.text
     assert "격리" in script.text
     assert "data.simulation_timing" in script.text
@@ -77,17 +88,6 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "historyPointTooltip" in script.text
     assert "CV P90 APE" in script.text
     assert "data.current_cohort_metadata" in script.text
-    assert "cohort?.active" in script.text
-    assert "cohort?.growth_rate_per_hour" in script.text
-    assert "COHORT_HISTORY_PREVIEW_ROWS = 2" in script.text
-    assert "cohort?.latest_saved_at" in script.text
-    assert "function compactPriorCohorts(cohorts)" in script.text
-    assert "legacy_aggregate: true" in script.text
-    assert "레거시 (${number(cohort.cohort_count)}개 코호트)" in script.text
-    assert "index >= COHORT_HISTORY_PREVIEW_ROWS" in script.text
-    assert 'toggle.setAttribute("aria-expanded", String(applied))' in script.text
-    assert "이전 코호트 ${number(cohortCount)}개 보기" in script.text
-    assert "state.cohortHistoryExpanded" in script.text
     assert "data.quarantine" in script.text
     assert "electrostatic.cap_stage_present_rows" in script.text
     assert '"C_tx_tx"' in script.text
@@ -98,6 +98,17 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "pool.min_idle_sessions" in script.text
     assert "ratio(pool.hard_sessions, pool.max_sessions)" in script.text
     assert "ratio(pool.ready_sessions, pool.busy_sessions)" in script.text
+    assert "attach.node_local" in script.text
+    assert "nodeLocal.active_host_tasks" in script.text
+    assert "노드 로컬: 활성 호스트" in script.text
+    assert '["matrix", "loss", "electrostatic", "icepak", "total"]' in script.text
+
+    cohorts_script = client.get("/static/cohorts.js")
+    assert cohorts_script.status_code == 200
+    assert "function compactCohorts(payload)" in cohorts_script.text
+    assert "legacy_aggregate: true" in cohorts_script.text
+    assert "레거시 (${number(cohort.cohort_count)}개 코호트)" in cohorts_script.text
+    assert 'fetch("/api/data"' in cohorts_script.text
 
     stylesheet = client.get("/static/app.css")
     assert stylesheet.status_code == 200
@@ -106,36 +117,36 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert ".stage-timing-empty" in stylesheet.text
     assert ".history-metric-control" in stylesheet.text
     assert ".chart-tooltip" in stylesheet.text
-    assert ".cohort-row.active" in stylesheet.text
-    assert ".cohort-history-toggle" in stylesheet.text
-    assert ".cohort-history-table" in stylesheet.text
-    assert ".cohort-history-table tr.legacy-aggregate" in stylesheet.text
-    assert ".cohort-history-table-wrap:focus-visible" in stylesheet.text
+    assert ".cohort-detail-table tr.active" in stylesheet.text
+    assert ".cohort-detail-table tr.legacy-aggregate" in stylesheet.text
     assert ".quarantine-legacy" in stylesheet.text
     assert ".electrostatic-presence-grid" in stylesheet.text
     assert ".thermal-model-row" in stylesheet.text
     assert ".aedt-attach-card" in stylesheet.text
+    assert ".aedt-node-local-progress" in stylesheet.text
 
     dashboard = client.get("/api/dashboard")
     assert dashboard.status_code == 200
     assert dashboard.json()["data"]["total_rows"] == 1
     assert dashboard.json()["data"]["raw_total_rows"] == 2
-    assert dashboard.json()["data"]["count_basis"] == "pinned_strict_full"
+    assert dashboard.json()["data"]["count_basis"] == "physics_revision_strict_full"
     assert dashboard.json()["data"]["latest_revision"] == "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a"
     assert dashboard.json()["data"]["pinned_revision"] == "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
     data = dashboard.json()["data"]
     active = data["active_cohort"]
-    assert active["available"] is False
-    assert active["status"] == "no_current_revision_rows"
+    assert active["available"] is True
+    assert active["status"] == "active"
+    assert active["git_hash"] == "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a"
     assert active["expected_physics_data_revision"] == PHYSICS_DATA_REVISION
-    assert "현재 revision 데이터 없음" in active["label"]
-    assert PHYSICS_DATA_REVISION in active["label"]
+    assert data["revision_raw_rows"] == 2
+    assert data["member_git_hash_shorts"] == ["754923c", "bbbbbbb"]
     timing = data["simulation_timing"]
-    assert timing["available"] is False
+    assert timing["available"] is True
     assert timing["active_cohort"] == active
-    assert timing["cohort_rows"] == 0
-    assert timing["window_rows"] == 0
-    assert timing["stages"]["total"]["mean_seconds"] is None
+    assert timing["cohort_rows"] == 1
+    assert timing["window_rows"] == 1
+    assert timing["stages"]["total"]["mean_seconds"] == 3000.0
+    assert timing["stages"]["electrostatic"]["sample_count"] == 0
 
     assert client.get("/api/status").status_code == 200
     assert client.get("/api/data").json()["complete_rows"] == 1
@@ -174,11 +185,11 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
-def test_cohort_history_view_collapses_aggregates_and_expands_in_newest_order():
-    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+def test_cohorts_page_compacts_legacy_noise_and_keeps_active_first():
+    cohorts_js = Path(__file__).resolve().parents[1] / "static" / "cohorts.js"
     script = r"""
 const path = require("node:path");
-const { cohortHistoryView } = require(path.resolve(process.argv[1]));
+const { compactCohorts } = require(path.resolve(process.argv[1]));
 const revision = "mft1mw-1k101-native-lamination-kf0p85-v3";
 const cohort = (sha, savedAt, raw = 1, physicsRevision = revision) => ({
   git_hash: sha.repeat(40), git_hash_short: sha.repeat(10),
@@ -195,38 +206,31 @@ const cohorts = [
   cohort("e", "2026-07-13T09:59:00.000800+09:00", 2, "legacy_unspecified"),
   cohort("f", "2026-07-13T09:59:00.000500+09:00", 3, "legacy_unspecified"),
 ];
-const collapsed = cohortHistoryView(cohorts, false);
-const expanded = cohortHistoryView(cohorts, true);
-process.stdout.write(JSON.stringify({ collapsed, expanded }));
+process.stdout.write(JSON.stringify(compactCohorts(cohorts)));
 """
     completed = subprocess.run(
-        ["node", "-e", script, str(app_js)],
+        ["node", "-e", script, str(cohorts_js)],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
         timeout=10,
     )
-    result = json.loads(completed.stdout)
-    collapsed = result["collapsed"]
-    expanded = result["expanded"]
+    rows = json.loads(completed.stdout)
 
-    assert collapsed["cohortCount"] == 5
-    assert [row["cohort"]["git_hash_short"] for row in collapsed["rows"]] == [
+    assert [row["git_hash_short"] for row in rows] == [
+        "a" * 10,
         "b" * 10,
         "legacy",
         "c" * 10,
         "d" * 10,
     ]
-    assert [row["hidden"] for row in collapsed["rows"]] == [
-        False, False, True, True,
-    ]
-    aggregate = collapsed["rows"][1]["cohort"]
+    assert rows[0]["active"] is True
+    aggregate = rows[2]
     assert aggregate["legacy_aggregate"] is True
     assert aggregate["cohort_count"] == 2
     assert aggregate["raw_rows"] == 5
     assert aggregate["latest_saved_at"] == "2026-07-13T09:59:00.000800+09:00"
-    assert all(row["hidden"] is False for row in expanded["rows"])
 
 
 def test_api_failure_is_section_local(campaign_root):
@@ -241,7 +245,12 @@ def test_api_failure_is_section_local(campaign_root):
     assert "broken artifact" in response.json()["error"]
 
 
-def test_local_operator_can_set_exact_bounded_parallel_target(artifact_service):
+def test_local_operator_can_set_exact_bounded_parallel_target(
+        artifact_service, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
+        tmp_path / "campaign-mutation.lock",
+    )
     client = TestClient(
         create_app(service=artifact_service),
         base_url="http://127.0.0.1:8010",
@@ -264,7 +273,12 @@ def test_local_operator_can_set_exact_bounded_parallel_target(artifact_service):
     assert artifact_service.scheduler.parallel_target == 275
 
 
-def test_parallel_target_control_rejects_csrf_remote_and_invalid_requests(artifact_service):
+def test_parallel_target_control_rejects_csrf_remote_and_invalid_requests(
+        artifact_service, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
+        tmp_path / "campaign-mutation.lock",
+    )
     app = create_app(service=artifact_service)
     local = TestClient(
         app,
