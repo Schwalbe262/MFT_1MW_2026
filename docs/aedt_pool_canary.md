@@ -4,14 +4,16 @@ Standalone remains the default. A canary task must opt in explicitly:
 
 ```bash
 export MFT_AEDT_BACKEND=pooled
-export MFT_AEDT_SHARED_1TO2_CANARY=1
+export MFT_AEDT_SHARED_CANARY=1
 ```
 
 Exactly one pooled acknowledgement may be set. The canary acknowledgement
-requests a non-exclusive two-slot lease but does not enable the disposable
+requests a non-exclusive shared lease but does not enable the disposable
 pre-solve marker/hang hooks. It is intended only for scheduler-controlled
 tasks while the AEDT pool is in explicit canary mode with small session and
-project limits.
+project limits. The current validated bound is two projects per AEDT. The
+acknowledgement is intentionally not named after that bound so a later,
+separately validated N does not require a new runner protocol.
 
 The task must also receive `MFT_AEDT_SCHEDULER_URL` and
 `MFT_SLURM_SCHEDULER_ROOT`. The runner attaches with `new_desktop=False` and

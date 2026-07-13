@@ -21,7 +21,7 @@ STANDALONE_BACKEND = "standalone"
 POOLED_BACKEND = "pooled"
 EXCLUSIVE_1TO1_ACK = "MFT_AEDT_EXCLUSIVE_1TO1"
 SHARED_1TO2_PILOT_ACK = "MFT_AEDT_SHARED_1TO2_PILOT"
-SHARED_1TO2_CANARY_ACK = "MFT_AEDT_SHARED_1TO2_CANARY"
+SHARED_CANARY_ACK = "MFT_AEDT_SHARED_CANARY"
 TERMINAL_LEASE_STATES = {
     "released",
     "failed",
@@ -40,14 +40,14 @@ def aedt_backend() -> str:
         acknowledgements = {
             EXCLUSIVE_1TO1_ACK: os.environ.get(EXCLUSIVE_1TO1_ACK, "").strip() == "1",
             SHARED_1TO2_PILOT_ACK: os.environ.get(SHARED_1TO2_PILOT_ACK, "").strip() == "1",
-            SHARED_1TO2_CANARY_ACK: os.environ.get(SHARED_1TO2_CANARY_ACK, "").strip() == "1",
+            SHARED_CANARY_ACK: os.environ.get(SHARED_CANARY_ACK, "").strip() == "1",
         }
         if sum(acknowledgements.values()) != 1:
             raise RuntimeError(
                 "pooled AEDT requires exactly one explicit acknowledgement: "
                 "MFT_AEDT_EXCLUSIVE_1TO1=1 or "
                 "MFT_AEDT_SHARED_1TO2_PILOT=1 or "
-                "MFT_AEDT_SHARED_1TO2_CANARY=1"
+                "MFT_AEDT_SHARED_CANARY=1"
             )
     return value
 
@@ -63,15 +63,15 @@ def shared_1to2_pilot_enabled() -> bool:
     )
 
 
-def shared_1to2_canary_enabled() -> bool:
+def shared_canary_enabled() -> bool:
     return (
         aedt_backend() == POOLED_BACKEND
-        and os.environ.get(SHARED_1TO2_CANARY_ACK, "").strip() == "1"
+        and os.environ.get(SHARED_CANARY_ACK, "").strip() == "1"
     )
 
 
 def shared_1to2_enabled() -> bool:
-    return shared_1to2_pilot_enabled() or shared_1to2_canary_enabled()
+    return shared_1to2_pilot_enabled() or shared_canary_enabled()
 
 
 def _scheduler_attach_module() -> Any:
@@ -130,7 +130,7 @@ def acquire_pooled_desktop(
         f"mft-pending-{task_id or os.getpid()}-{uuid.uuid4().hex[:12]}"
     )
     shared = shared_1to2_enabled()
-    shared_mode = "canary" if shared_1to2_canary_enabled() else "pilot"
+    shared_mode = "canary" if shared_canary_enabled() else "pilot"
     lease = client.acquire_project_lease(
         scheduler_url,
         pending_project,
