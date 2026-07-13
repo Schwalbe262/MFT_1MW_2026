@@ -68,15 +68,33 @@ CORE_MATERIAL_INPUT_KEYS = (
 EFFICIENCY_EXPERIMENT_INPUT_KEYS = (
     "thermal_rx_side_block_mesh_level",
 )
+# Optional electrostatic-stage controls are accepted and echoed by fixed runs,
+# but deliberately stay outside KEYS.  KEYS is the sealed campaign identity;
+# enabling an A/B diagnostic stage must not change the underlying candidate.
+ELECTROSTATIC_STAGE_INPUT_KEYS = (
+    "cap_on",
+    "cap_max_passes",
+    "cap_percent_error",
+)
 # Solver-contract metadata is accepted and echoed by fixed runs, but is not a
 # Sobol coordinate or an AEDT numeric design variable.
 PHYSICS_METADATA_INPUT_KEYS = (
     "physics_data_revision",
 )
+# The exact full-input contract emitted by e30c070 remains authenticated.
+# Unlike the required physics revision, omitted default-off diagnostic-stage
+# controls do not change candidate physics or identity.
+PRE_ELECTROSTATIC_INPUT_KEYS = [
+    *KEYS,
+    *CORE_MATERIAL_INPUT_KEYS,
+    *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+    *PHYSICS_METADATA_INPUT_KEYS,
+]
 ALL_INPUT_KEYS = [
     *KEYS,
     *CORE_MATERIAL_INPUT_KEYS,
     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+    *ELECTROSTATIC_STAGE_INPUT_KEYS,
     *PHYSICS_METADATA_INPUT_KEYS,
 ]
 
@@ -85,6 +103,7 @@ ALL_INPUT_KEYS = [
 # still project onto KEYS.
 SUPPORTED_CANDIDATE_INPUT_SCHEMAS = frozenset({
     frozenset(KEYS),
+    frozenset(PRE_ELECTROSTATIC_INPUT_KEYS),
     frozenset(ALL_INPUT_KEYS),
 })
 
@@ -159,6 +178,11 @@ def get_drawing_default_params():
         "matrix_on": 1,          # design1: L/k 매트릭스 (전류원)
         "loss_on": 1,            # design2: 손실 원샷 (Tx 전압원 + Rx 전류원 + 코어손실)
         "thermal_on": 0,         # design3: Icepak 열해석
+        # Optional Maxwell Electrostatic capacitance/resonance screening stage.
+        # Kept off for production candidates until its cluster wall-time A/B is measured.
+        "cap_on": 0,
+        "cap_max_passes": 10,
+        "cap_percent_error": 1.0,
         # 열해석 조건
         "plate_temp": 50.0,      # 콜드플레이트 고정온도 [cel]
         "air_temp": 50.0,        # 팬 흡입공기/주변 온도 [cel]
@@ -246,6 +270,7 @@ def create_input_parameter(param=None):
             for key in (
                     *CORE_MATERIAL_INPUT_KEYS,
                     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+                    *ELECTROSTATIC_STAGE_INPUT_KEYS,
                     *PHYSICS_METADATA_INPUT_KEYS):
                 if key not in param.columns:
                     param[key] = defaults[key]
@@ -268,6 +293,7 @@ def create_input_parameter(param=None):
     for key in (
             *CORE_MATERIAL_INPUT_KEYS,
             *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+            *ELECTROSTATIC_STAGE_INPUT_KEYS,
             *PHYSICS_METADATA_INPUT_KEYS):
         if key not in param_df.columns:
             param_df[key] = defaults[key]
@@ -864,6 +890,36 @@ def validation_check(input_df, strict=False, return_errors=False):
         errors.append(f"freq <= 0 ({inp['freq'].iloc[0]})")
     if int(inp["loss_on"].iloc[0]) != 0 and float(inp["V1_rms"].iloc[0]) <= 0:
         errors.append(f"V1_rms <= 0 ({inp['V1_rms'].iloc[0]}) with loss_on=1")
+    cap_on = int(inp["cap_on"].iloc[0]) != 0
+    if cap_on and int(inp["matrix_on"].iloc[0]) == 0:
+        errors.append("cap_on=1 requires matrix_on=1 (inductance results are required)")
+    try:
+        cap_max_passes = float(inp["cap_max_passes"].iloc[0])
+        if (
+                not math.isfinite(cap_max_passes)
+                or not cap_max_passes.is_integer()
+                or cap_max_passes < 1):
+            errors.append(
+                "cap_max_passes must be a positive integer "
+                f"({inp['cap_max_passes'].iloc[0]})"
+            )
+    except (TypeError, ValueError, OverflowError):
+        errors.append(
+            "cap_max_passes must be a positive integer "
+            f"({inp['cap_max_passes'].iloc[0]})"
+        )
+    try:
+        cap_percent_error = float(inp["cap_percent_error"].iloc[0])
+        if not math.isfinite(cap_percent_error) or cap_percent_error <= 0:
+            errors.append(
+                "cap_percent_error must be finite and > 0 "
+                f"({inp['cap_percent_error'].iloc[0]})"
+            )
+    except (TypeError, ValueError, OverflowError):
+        errors.append(
+            "cap_percent_error must be finite and > 0 "
+            f"({inp['cap_percent_error'].iloc[0]})"
+        )
     n_exp = int(inp["n_explicit_turns"].iloc[0])
     if int(inp["thermal_on"].iloc[0]) != 0 and n_exp < -1:
         errors.append(f"n_explicit_turns ({n_exp}) < -1")
@@ -935,6 +991,7 @@ NON_DESIGN_VAR_KEYS = {
     "P_target", "V2_rms",
     "core_cm", "core_x", "core_y",
     "matrix_on", "loss_on", "thermal_on",
+    "cap_on", "cap_max_passes", "cap_percent_error",
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "n_explicit_turns",
     "max_passes", "percent_error", "min_converged",
