@@ -1197,6 +1197,15 @@ def _read_live_scheduler(
         ),
         "legacy MFT",
     )
+    # Pooled AEDT host tasks share the "mft-" name prefix but live in the
+    # dedicated host project; they are capacity-tracked by the bundle state
+    # machine, not the MFT project cap.
+    legacy_tasks = [
+        task
+        for task in legacy_tasks
+        if str((task or {}).get("project") or "").strip()
+        != NODE_CANARY_HOST_PROJECT
+    ]
     snapshot = scheduler_client.project_submission_snapshot(
         [project],
         project_tasks,
