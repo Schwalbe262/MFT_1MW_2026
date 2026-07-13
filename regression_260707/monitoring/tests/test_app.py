@@ -48,7 +48,16 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert 'id="cohort-history"' not in page.text
     assert 'id="cohort-lamination-factor"' in page.text
     assert 'id="cohort-flux-availability"' in page.text
+    current_details_tag = '<details id="quarantine-current-details" class="quarantine-reason-details">'
+    assert current_details_tag in page.text
+    assert 'id="quarantine-current-reason-count"' in page.text
+    assert '<span class="fold-open">펼치기 ▾</span>' in page.text
+    assert '<span class="fold-close">접기 ▴</span>' in page.text
     assert 'id="quarantine-current-reasons"' in page.text
+    current_details_start = page.text.index(current_details_tag)
+    current_details_end = page.text.index("</details>", current_details_start)
+    current_reasons_start = page.text.index('id="quarantine-current-reasons"')
+    assert current_details_start < current_reasons_start < current_details_end
     assert 'id="quarantine-legacy-reasons"' in page.text
     assert 'id="capacitance-summary"' in page.text
     assert 'id="resonance-summary"' in page.text
@@ -103,6 +112,9 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "CV P90 APE" in script.text
     assert "data.current_cohort_metadata" in script.text
     assert "data.quarantine" in script.text
+    assert '`${current.label || "활성 코호트"} — ${count(current.rows)}`' in script.text
+    assert 'hasCurrentReasons ? count(currentReasons.length, "건") : "—"' in script.text
+    assert "#quarantine-current-details" not in script.text
     assert "electrostatic.cap_stage_present_rows" in script.text
     assert '"C_tx_tx"' in script.text
     assert "resonance.interwinding" in script.text
@@ -133,6 +145,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert ".chart-tooltip" in stylesheet.text
     assert ".cohort-detail-table tr.active" in stylesheet.text
     assert ".cohort-detail-table tr.legacy-aggregate" in stylesheet.text
+    assert ".quarantine-reason-details[open] .fold-open" in stylesheet.text
+    assert ".quarantine-reason-details[open] .fold-close" in stylesheet.text
     assert ".quarantine-legacy" in stylesheet.text
     assert ".electrostatic-presence-grid" in stylesheet.text
     assert ".thermal-model-row" in stylesheet.text

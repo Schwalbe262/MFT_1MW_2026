@@ -278,9 +278,12 @@
     const quarantine = payload && typeof payload === "object" ? payload : {};
     const current = quarantine.current && typeof quarantine.current === "object" ? quarantine.current : {};
     const legacy = quarantine.legacy && typeof quarantine.legacy === "object" ? quarantine.legacy : {};
-    setText("#quarantine-current-title", current.label || "활성 코호트");
+    const hasCurrentReasons = Array.isArray(current.reasons);
+    const currentReasons = hasCurrentReasons ? current.reasons : [];
+    setText("#quarantine-current-title", `${current.label || "활성 코호트"} — ${count(current.rows)}`);
     setText("#quarantine-current-count", count(current.rows));
-    renderReasonList($("#quarantine-current-reasons"), current.reasons, hasNumber(current.rows) && Number(current.rows) === 0
+    setText("#quarantine-current-reason-count", hasCurrentReasons ? count(currentReasons.length, "건") : "—");
+    renderReasonList($("#quarantine-current-reasons"), currentReasons, hasNumber(current.rows) && Number(current.rows) === 0
       ? "현재 코호트의 격리 행이 없습니다."
       : "현재 코호트 격리 정보를 사용할 수 없습니다.");
     setText("#quarantine-legacy-label", legacy.label || "레거시 코호트 노이즈");

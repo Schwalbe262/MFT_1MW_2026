@@ -280,6 +280,15 @@ section { margin: 0 0 52px; scroll-margin-top: 100px; }
 
 .quarantine-current { margin: 0; padding: 11px 12px 12px; border: 1px solid rgba(255,187,85,.19); border-radius: 9px; background: rgba(255,187,85,.035); }
 .quarantine-current h4 { margin-bottom: 8px; color: var(--amber); }
+.quarantine-reason-details { border: 1px solid var(--line-soft); border-radius: 8px; background: rgba(0,0,0,.06); }
+.quarantine-reason-details summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px; color: #7892a0; cursor: pointer; font-size: 9px; font-weight: 700; list-style: none; }
+.quarantine-reason-details summary::-webkit-details-marker { display: none; }
+.quarantine-reason-details summary b { color: var(--text); font: 700 9px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.quarantine-reason-details .fold-close { display: none; }
+.quarantine-reason-details[open] summary { border-bottom: 1px solid var(--line-soft); }
+.quarantine-reason-details[open] .fold-open { display: none; }
+.quarantine-reason-details[open] .fold-close { display: inline; }
+.quarantine-reason-details .reason-list { padding: 8px; }
 .reason-list { display: grid; gap: 5px; }
 .reason-row { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; min-width: 0; padding: 7px 8px; border-radius: 6px; background: rgba(0,0,0,.12); }
 .reason-row code { overflow: hidden; color: #8ca5b2; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }

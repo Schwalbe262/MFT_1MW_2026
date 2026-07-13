@@ -152,8 +152,15 @@
             <span id="quarantine-current-count" class="section-badge">—</span>
           </div>
           <section class="quarantine-current" aria-labelledby="quarantine-current-title">
-            <h4 id="quarantine-current-title">현재 코호트</h4>
-            <div id="quarantine-current-reasons" class="reason-list"><p class="empty-state compact-empty">격리 정보를 확인하는 중입니다.</p></div>
+            <h4 id="quarantine-current-title">현재 코호트 — —</h4>
+            <details id="quarantine-current-details" class="quarantine-reason-details">
+              <summary>
+                <span>사유별 상세 <b id="quarantine-current-reason-count">—건</b></span>
+                <span class="fold-open">펼치기 ▾</span>
+                <span class="fold-close">접기 ▴</span>
+              </summary>
+              <div id="quarantine-current-reasons" class="reason-list"><p class="empty-state compact-empty">격리 정보를 확인하는 중입니다.</p></div>
+            </details>
           </section>
           <details id="quarantine-legacy" class="quarantine-legacy">
             <summary><span id="quarantine-legacy-label">레거시 코호트 노이즈</span><b id="quarantine-legacy-count">—</b></summary>
