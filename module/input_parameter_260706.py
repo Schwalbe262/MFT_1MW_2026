@@ -6,6 +6,7 @@ import pandas as pd
 
 from module.core_material_contract import (
     AREA_BASIS_GROSS_HOMOGENEOUS,
+    PHYSICS_DATA_REVISION,
     build_core_material_contract_fields,
     effective_area_m2,
     geometry_volume_and_masses,
@@ -67,11 +68,25 @@ CORE_MATERIAL_INPUT_KEYS = (
 EFFICIENCY_EXPERIMENT_INPUT_KEYS = (
     "thermal_rx_side_block_mesh_level",
 )
+# Solver-contract metadata is accepted and echoed by fixed runs, but is not a
+# Sobol coordinate or an AEDT numeric design variable.
+PHYSICS_METADATA_INPUT_KEYS = (
+    "physics_data_revision",
+)
 ALL_INPUT_KEYS = [
     *KEYS,
     *CORE_MATERIAL_INPUT_KEYS,
     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+    *PHYSICS_METADATA_INPUT_KEYS,
 ]
+
+# Candidate authentication remains fail-closed: sealed fronts use KEYS, while
+# current full-input candidates use the complete contract. Candidate digests
+# still project onto KEYS.
+SUPPORTED_CANDIDATE_INPUT_SCHEMAS = frozenset({
+    frozenset(KEYS),
+    frozenset(ALL_INPUT_KEYS),
+})
 
 
 def get_drawing_default_params():
@@ -137,6 +152,9 @@ def get_drawing_default_params():
         # geometry coefficient assigned to Maxwell.
         "core_lamination_factor": 0.85,
         "core_loss_margin": 1.15,
+        # Bind fixed-input payloads to the exact physics policy implemented by
+        # this checkout. The pin is owned by core_material_contract.py.
+        "physics_data_revision": PHYSICS_DATA_REVISION,
         # 디자인 활성화
         "matrix_on": 1,          # design1: L/k 매트릭스 (전류원)
         "loss_on": 1,            # design2: 손실 원샷 (Tx 전압원 + Rx 전류원 + 코어손실)
@@ -227,7 +245,8 @@ def create_input_parameter(param=None):
             defaults = get_drawing_default_params()
             for key in (
                     *CORE_MATERIAL_INPUT_KEYS,
-                    *EFFICIENCY_EXPERIMENT_INPUT_KEYS):
+                    *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+                    *PHYSICS_METADATA_INPUT_KEYS):
                 if key not in param.columns:
                     param[key] = defaults[key]
             missing = set(KEYS) - set(param.columns)
@@ -246,9 +265,16 @@ def create_input_parameter(param=None):
         param_df = _create_random_parameter_sobol()
 
     defaults = get_drawing_default_params()
-    for key in (*CORE_MATERIAL_INPUT_KEYS, *EFFICIENCY_EXPERIMENT_INPUT_KEYS):
+    for key in (
+            *CORE_MATERIAL_INPUT_KEYS,
+            *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
+            *PHYSICS_METADATA_INPUT_KEYS):
         if key not in param_df.columns:
             param_df[key] = defaults[key]
+
+    revision = param_df["physics_data_revision"]
+    if not revision.map(lambda value: isinstance(value, str)).all():
+        raise ValueError("physics_data_revision must be a string")
 
     return param_df[ALL_INPUT_KEYS]
 
@@ -918,6 +944,7 @@ NON_DESIGN_VAR_KEYS = {
     "thermal_max_iterations", "conductor_temp_C",
     "thermal_rx_side_block_mesh_level",
     "core_lamination_factor", "core_loss_margin",
+    "physics_data_revision",
 }
 
 

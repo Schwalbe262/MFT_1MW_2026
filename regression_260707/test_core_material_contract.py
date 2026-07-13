@@ -32,10 +32,13 @@ from module.core_material_contract import (
     validate_native_lamination_readback,
 )
 from module.input_parameter_260706 import (
+    ALL_INPUT_KEYS,
     CORE_MATERIAL_INPUT_KEYS,
     KEYS,
+    PHYSICS_METADATA_INPUT_KEYS,
     create_input_parameter,
     get_drawing_default_params,
+    get_design_var_columns,
     validation_check,
 )
 from module.modeling_260706 import create_core as create_core_geometry
@@ -45,6 +48,7 @@ from run_simulation_260706 import (
     Simulation,
     _b_power_volume_integral_si,
     _core_group_index,
+    _load_fixed_input_parameter,
     _native_b_power_restore_factor,
     _native_core_report_plan,
     _sheet_area_model_units,
@@ -343,6 +347,48 @@ class CoreMaterialInputContractTests(unittest.TestCase):
             CORE_MATERIAL_INPUT_KEYS,
             ("core_lamination_factor", "core_loss_margin"),
         )
+
+    def test_physics_revision_is_optional_string_metadata_with_pinned_default(self):
+        defaults = get_drawing_default_params()
+        loaded = create_input_parameter({})
+
+        self.assertEqual(
+            defaults["physics_data_revision"], PHYSICS_DATA_REVISION
+        )
+        self.assertEqual(
+            loaded["physics_data_revision"].iloc[0], PHYSICS_DATA_REVISION
+        )
+        self.assertEqual(
+            PHYSICS_METADATA_INPUT_KEYS, ("physics_data_revision",)
+        )
+        self.assertIn("physics_data_revision", ALL_INPUT_KEYS)
+        self.assertNotIn("physics_data_revision", KEYS)
+        self.assertNotIn(
+            "physics_data_revision", get_design_var_columns(loaded)
+        )
+
+    def test_matching_physics_revision_is_accepted_and_echoed(self):
+        loaded, validated_revision = _load_fixed_input_parameter({
+            "physics_data_revision": PHYSICS_DATA_REVISION,
+        })
+        ok, echoed = validation_check(loaded, strict=True)
+
+        self.assertTrue(ok)
+        self.assertEqual(validated_revision, PHYSICS_DATA_REVISION)
+        self.assertEqual(
+            echoed["physics_data_revision"].iloc[0], validated_revision
+        )
+
+    def test_mismatched_physics_revision_fails_closed(self):
+        with self.assertRaisesRegex(
+                ValueError, "physics_data_revision mismatch.*refusing to run"):
+            _load_fixed_input_parameter({
+                "physics_data_revision": "foreign-physics-revision",
+            })
+
+        with self.assertRaisesRegex(
+                ValueError, "physics_data_revision must be a string"):
+            create_input_parameter({"physics_data_revision": 260713})
 
     def test_validation_emits_gross_and_effective_geometry_provenance(self):
         ok, frame = validation_check(

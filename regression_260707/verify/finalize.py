@@ -20,7 +20,10 @@ for path in (str(REGRESSION_ROOT), str(REPO_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from module.input_parameter_260706 import ALL_INPUT_KEYS, KEYS  # noqa: E402
+from module.input_parameter_260706 import (  # noqa: E402
+    KEYS,
+    SUPPORTED_CANDIDATE_INPUT_SCHEMAS,
+)
 from model_targets import (  # noqa: E402
     SURROGATE_TEMPERATURE_TARGETS,
     SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
@@ -55,12 +58,7 @@ REQUIRED_OPTIMIZATION_MODELS = frozenset({
     "B_mean_core",
     *SURROGATE_TEMPERATURE_TARGETS,
 })
-ALLOWED_CANDIDATE_INPUT_SCHEMAS = frozenset({
-    # Legacy AL fronts carry the sealed design identity only.  Current fixed
-    # inputs may also carry the two explicit, revision-bound material inputs.
-    frozenset(KEYS),
-    frozenset(ALL_INPUT_KEYS),
-})
+ALLOWED_CANDIDATE_INPUT_SCHEMAS = SUPPORTED_CANDIDATE_INPUT_SCHEMAS
 
 
 def _finite(value):

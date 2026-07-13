@@ -37,10 +37,15 @@ from training.train_models import (
 from verify import scheduler_client
 import scheduler_client as runtime_scheduler_client
 from verify.finalize import (
-    INSULATION_COLUMNS, QUALITY_THRESHOLDS_PATH, REQUIRED_OPTIMIZATION_MODELS,
-    _candidate_digest, candidate_identity_reasons, write_final_artifacts,
+    ALLOWED_CANDIDATE_INPUT_SCHEMAS, INSULATION_COLUMNS,
+    QUALITY_THRESHOLDS_PATH, REQUIRED_OPTIMIZATION_MODELS, _candidate_digest,
+    candidate_identity_reasons, write_final_artifacts,
 )
-from module.input_parameter_260706 import KEYS, create_input_parameter
+from module.input_parameter_260706 import (
+    ALL_INPUT_KEYS,
+    KEYS,
+    create_input_parameter,
+)
 from module.core_material_contract import PHYSICS_DATA_REVISION
 from module.thermal_probe_contract import (
     RX_SIDE_FACE_MAX_RULE,
@@ -776,6 +781,30 @@ class FineValidationTests(unittest.TestCase):
             result, candidate, expected_params_key="fine_params"
         )
         self.assertIn("candidate_params_missing", reasons)
+
+    def test_candidate_schemas_preserve_sealed_digest_across_revision_metadata(self):
+        complete = create_input_parameter({}).iloc[0].to_dict()
+        sealed = {key: complete[key] for key in KEYS}
+
+        self.assertEqual(len(KEYS), 71)
+        self.assertEqual(len(ALL_INPUT_KEYS), 75)
+        self.assertEqual(
+            {len(schema) for schema in ALLOWED_CANDIDATE_INPUT_SCHEMAS},
+            {71, 75},
+        )
+        for params in (sealed, complete):
+            with self.subTest(schema_size=len(params)):
+                self.assertIn(
+                    frozenset(params), ALLOWED_CANDIDATE_INPUT_SCHEMAS
+                )
+                self.assertEqual(
+                    _candidate_digest(params), _candidate_digest(sealed)
+                )
+
+        unknown = dict(complete, unknown_candidate_input=1)
+        self.assertNotIn(
+            frozenset(unknown), ALLOWED_CANDIDATE_INPUT_SCHEMAS
+        )
 
     def test_final_ranking_uses_fine_result_volume_not_stored_candidate_volume(self):
         first = self.candidate(50.0, volume_L=1.0)

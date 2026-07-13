@@ -1476,7 +1476,9 @@ def stage_fine_submit(st):
         )
     _require_runtime_deployment()
     import scheduler_client as sc
-    from module.input_parameter_260706 import ALL_INPUT_KEYS, KEYS
+    from module.input_parameter_260706 import (
+        SUPPORTED_CANDIDATE_INPUT_SCHEMAS,
+    )
 
     profile_path = os.path.join(HERE, "verify", "profiles", "fine.json")
     with open(profile_path, encoding="utf-8") as handle:
@@ -1486,12 +1488,7 @@ def stage_fine_submit(st):
     st["fine_solver_git_revision"] = solver_revision
     st["fine_pyaedt_library_git_revision"] = library_revision
     records = st.setdefault("fine_task_records", {})
-    # Preserve restart compatibility with sealed 71-key fronts while allowing
-    # current candidates to authenticate their explicit kf/loss-margin inputs.
-    allowed_input_schemas = {
-        frozenset(KEYS),
-        frozenset(ALL_INPUT_KEYS),
-    }
+    allowed_input_schemas = SUPPORTED_CANDIDATE_INPUT_SCHEMAS
     unknown = []
     for rank, candidate in enumerate(st["final_candidates"]):
         key = str(rank)
@@ -1542,15 +1539,13 @@ def stage_fine_submit(st):
 def stage_fine_wait(st):
     _assert_training_invariants(st)
     import scheduler_client as sc
-    from module.input_parameter_260706 import ALL_INPUT_KEYS, KEYS
+    from module.input_parameter_260706 import (
+        SUPPORTED_CANDIDATE_INPUT_SCHEMAS,
+    )
 
     records = st.get("fine_task_records") or {}
-    # Match the exact schema accepted at submission, including material inputs
-    # when the candidate explicitly supplied them.
-    allowed_input_schemas = {
-        frozenset(KEYS),
-        frozenset(ALL_INPUT_KEYS),
-    }
+    # Match the exact versioned schema accepted at submission.
+    allowed_input_schemas = SUPPORTED_CANDIDATE_INPUT_SCHEMAS
     if len(records) != len(st.get("final_candidates") or []):
         raise RuntimeError("fine task inventory is incomplete")
     pending_records = {

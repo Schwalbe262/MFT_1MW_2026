@@ -869,6 +869,21 @@ def _project_delete_policy(input_frame, fixed_mode=False, hold=False, model_only
     return not (keep_project or hold or model_only)
 
 
+def _load_fixed_input_parameter(param):
+    """Load one fixed payload and bind it to this solver's physics revision."""
+    input_frame = create_input_parameter(param)
+    revision = input_frame["physics_data_revision"].iloc[0]
+    if not isinstance(revision, str):
+        raise ValueError("physics_data_revision must be a string")
+    if revision != PHYSICS_DATA_REVISION:
+        raise ValueError(
+            "physics_data_revision mismatch: payload has "
+            f"{revision!r}, but this solver requires "
+            f"{PHYSICS_DATA_REVISION!r}; refusing to run"
+        )
+    return input_frame, revision
+
+
 def _lightweight_matrix_enabled(sim):
     return int(sim.df_plus["matrix_skin_mesh"].iloc[0]) == 0
 
@@ -5334,6 +5349,16 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     delete_project_on_exit = not (fixed_mode or hold or model_only)
     baseline_descendants = _snapshot_descendants()
     try:
+        fixed_input_df = None
+        validated_physics_data_revision = None
+        if fixed_mode:
+            # Reject foreign physics payloads before starting AEDT. The
+            # material-contract expansion below intentionally emits the code
+            # pin, so validating after it would silently hide a mismatch.
+            fixed_input_df, validated_physics_data_revision = (
+                _load_fixed_input_parameter(param)
+            )
+
         # pyDesktop을 context manager로 쓰면 release_desktop 이후 __exit__에서
         # close_on_exit 속성 오류가 발생하므로 직접 생성하고 finally에서 해제한다.
         aedt_startup_started = time.monotonic()
@@ -5352,12 +5377,17 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         sim.create_project()
 
         if fixed_mode:
-            sim.input_df = create_input_parameter(param)
+            sim.input_df = fixed_input_df
             delete_project_on_exit = _project_delete_policy(
                 sim.input_df, fixed_mode=True, hold=hold, model_only=model_only
             )
             # 위반 시 이유를 담아 ValueError raise
             _, sim.df_plus = validation_check(sim.input_df, strict=True)
+            # Echo the value that passed the exact payload check, rather than
+            # relying on a downstream contract builder to replace it.
+            sim.df_plus["physics_data_revision"] = (
+                validated_physics_data_revision
+            )
         else:
             while True:
                 sim.input_df = create_input_parameter(None)
