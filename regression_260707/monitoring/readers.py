@@ -85,6 +85,10 @@ RESONANCE_FIELDS = {
 }
 PARALLEL_TARGET_MIN = 1
 PARALLEL_TARGET_MAX = 300
+NODE_LOCAL_AEDT_PROJECT = "_aedt_pool_hosts"
+NODE_LOCAL_AEDT_ENTRYPOINT = "aedt_node_canary_host"
+NODE_LOCAL_AEDT_ACTIVE_STATES = ("queued", "attaching", "running")
+NODE_LOCAL_AEDT_TASK_LIMIT = 1_000
 SIMULATION_TIMING_WINDOW_ROWS = 100
 MAPE_ZERO_ABS_TOLERANCE = 1e-9
 SIMULATION_TIMING_FIELDS = (
@@ -93,6 +97,7 @@ SIMULATION_TIMING_FIELDS = (
     ("icepak", "time_thermal"),
     ("total", "time"),
 )
+CAP_TIMING_FIELDS = ("cap_solve_time_s", "cap_extraction_time_s")
 CHECKPOINT_STATE_SCHEMA_VERSION = 2
 CHECKPOINT_METRICS_SCHEMA_VERSION = 1
 CHECKPOINT_PARITY_SCHEMA_VERSION = 1
@@ -195,6 +200,7 @@ def _simulation_timing_summary(
     columns = (
         "git_hash", "physics_data_revision", "saved_at",
         *(source_field for _, source_field in SIMULATION_TIMING_FIELDS),
+        "cap_on", *CAP_TIMING_FIELDS,
     )
     rows = _frame_records(frame, columns)
     if active_cohort is None:
@@ -226,6 +232,28 @@ def _simulation_timing_summary(
             "mean_seconds": sum(values) / len(values) if values else None,
             "median_seconds": statistics.median(values) if values else None,
         }
+    electrostatic_values = []
+    for row in recent:
+        if _optional_flag(row.get("cap_on")) is not True:
+            continue
+        cap_parts = [
+            _duration_seconds(row.get(source_field))
+            for source_field in CAP_TIMING_FIELDS
+        ]
+        if all(value is not None for value in cap_parts):
+            electrostatic_values.append(sum(cap_parts))
+    stages["electrostatic"] = {
+        "source_fields": list(CAP_TIMING_FIELDS),
+        "sample_count": len(electrostatic_values),
+        "mean_seconds": (
+            sum(electrostatic_values) / len(electrostatic_values)
+            if electrostatic_values else None
+        ),
+        "median_seconds": (
+            statistics.median(electrostatic_values)
+            if electrostatic_values else None
+        ),
+    }
     return {
         "available": any(stage["sample_count"] for stage in stages.values()),
         "cohort_basis": "active_identity",
@@ -537,16 +565,16 @@ def _invalid_reasons(row: dict[str, Any]) -> list[str]:
 def _campaign_frame_summary(
     frame: Any,
     now: datetime,
-    cohort_history: dict[tuple[str, str], list[tuple[datetime, int]]] | None = None,
     active_cohort: tuple[str, str] | None = None,
     current_physics_revision: str | None = CURRENT_PHYSICS_DATA_REVISION,
 ) -> dict[str, Any]:
     """Summarize the campaign audit frame while tolerating missing columns.
 
-    Canonically audited frames carry ``_strict_*`` columns.  Synthetic and
-    CSV fallback frames may only carry stored result flags; the dynamically
-    active solver/physics identity is still required before such a row is
-    counted as strict for this campaign.
+    Canonically audited frames carry ``_strict_*`` columns.  Their per-row
+    classifications are aggregated by physics revision without imposing an
+    additional active-SHA gate.  Synthetic and CSV fallback rows may only
+    carry stored result flags; those remain fail-closed outside the active
+    pair because they were not recomputed by the quality contract.
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -579,9 +607,15 @@ def _campaign_frame_summary(
             (revision, physics_revision), active_cohort
         )
         strict_em_flag = _optional_flag(row.get("_strict_valid_em"))
-        if strict_em_flag is None:
-            strict_em_flag = _optional_flag(row.get("result_valid_em")) is True
         strict_full_flag = _optional_flag(row.get("_strict_valid_full"))
+        strict_flags_recomputed = (
+            strict_em_flag is not None and strict_full_flag is not None
+        )
+        if not strict_flags_recomputed:
+            if strict_em_flag is None:
+                strict_em_flag = (
+                    _optional_flag(row.get("result_valid_em")) is True
+                )
         if strict_full_flag is None:
             strict_full_flag = (
                 bool(strict_em_flag)
@@ -592,11 +626,13 @@ def _campaign_frame_summary(
             "_monitor_git_hash": revision,
             "_monitor_physics_revision": physics_revision,
             "_monitor_current": current,
-            # Campaign-panel strictness is intentionally fail-closed for every
-            # solver or physics cohort outside the active pair.
-            "_monitor_strict_em": bool(current and strict_em_flag),
+            "_monitor_strict_recomputed": strict_flags_recomputed,
+            "_monitor_strict_em": bool(
+                strict_em_flag and (strict_flags_recomputed or current)
+            ),
             "_monitor_strict_full": bool(
-                current and strict_em_flag and strict_full_flag
+                strict_em_flag and strict_full_flag
+                and (strict_flags_recomputed or current)
             ),
         })
 
@@ -607,7 +643,6 @@ def _campaign_frame_summary(
         )].append(row)
 
     cutoff = now - timedelta(hours=1)
-    cohort_history = cohort_history or {}
     cohorts: list[dict[str, Any]] = []
     for (revision, physics_revision), cohort_rows in grouped.items():
         saved_stamps = [
@@ -630,22 +665,6 @@ def _campaign_frame_summary(
             ) is not None
             and cutoff <= stamp <= now
         )
-        history = sorted(
-            (
-                (stamp, max(0, _integer(count, 0)))
-                for stamp, count in cohort_history.get(
-                    (revision, physics_revision), []
-                )
-                if isinstance(stamp, datetime)
-            ),
-            key=lambda item: item[0],
-        )
-        if history:
-            before = [count for stamp, count in history if stamp <= cutoff]
-            within = [count for stamp, count in history if stamp >= cutoff]
-            baseline = before[-1] if before else (within[0] if within else None)
-            if baseline is not None:
-                recent_growth = max(0, strict_full_rows - baseline)
         current = _is_active_cohort(
             (revision, physics_revision), active_cohort
         )
@@ -673,6 +692,78 @@ def _campaign_frame_summary(
         )
 
     cohorts.sort(key=_cohort_sort_key)
+
+    expected_physics_revision = _optional_text(
+        current_physics_revision, 160
+    )
+    revision_rows = [
+        row for row in prepared
+        if expected_physics_revision is not None
+        and row["_monitor_physics_revision"] == expected_physics_revision
+    ]
+    revision_strict_em = [
+        row for row in revision_rows if row["_monitor_strict_em"]
+    ]
+    revision_strict_full = [
+        row for row in revision_rows if row["_monitor_strict_full"]
+    ]
+    revision_strict_stamps = sorted(
+        stamp
+        for row in revision_strict_full
+        if (
+            stamp := _parse_time(row.get("saved_at"), now.tzinfo)
+        ) is not None
+    )
+    revision_history: list[dict[str, Any]] = []
+    cumulative = 0
+    for stamp, count in Counter(revision_strict_stamps).items():
+        cumulative += count
+        revision_history.append({
+            "time": stamp.isoformat(),
+            "added": count,
+            "total": cumulative,
+        })
+    if len(revision_history) > 240:
+        stride = math.ceil(len(revision_history) / 240)
+        sampled_history = revision_history[::stride]
+        if sampled_history[-1] != revision_history[-1]:
+            sampled_history.append(revision_history[-1])
+        revision_history = sampled_history
+    member_cohorts = [
+        cohort for cohort in cohorts
+        if cohort["physics_data_revision"] == expected_physics_revision
+        and cohort.get("git_hash")
+    ]
+    physics_revision_aggregate = {
+        "available": expected_physics_revision is not None,
+        "physics_data_revision": expected_physics_revision,
+        "has_rows": bool(revision_rows),
+        "raw_rows": len(revision_rows),
+        "strict_em_rows": len(revision_strict_em),
+        "strict_full_rows": len(revision_strict_full),
+        "growth_rate_per_hour": float(sum(
+            cutoff <= stamp <= now for stamp in revision_strict_stamps
+        )),
+        "added_24h": sum(
+            now - timedelta(hours=24) <= stamp <= now
+            for stamp in revision_strict_stamps
+        ),
+        "member_git_hashes": [
+            cohort["git_hash"] for cohort in member_cohorts
+        ],
+        "member_git_hash_shorts": [
+            str(cohort["git_hash"])[:7] for cohort in member_cohorts
+        ],
+        "first_strict_saved_at": (
+            revision_strict_stamps[0].isoformat()
+            if revision_strict_stamps else None
+        ),
+        "latest_strict_saved_at": (
+            revision_strict_stamps[-1].isoformat()
+            if revision_strict_stamps else None
+        ),
+        "history": revision_history,
+    }
 
     current_rows = [row for row in prepared if row["_monitor_current"]]
     current_strict = [
@@ -776,6 +867,8 @@ def _campaign_frame_summary(
                     reasons.append("stored_flag:result_valid_thermal")
             current_reason_counts.update(reasons)
         else:
+            if row["_monitor_strict_full"]:
+                continue
             legacy_quarantined += 1
             if (
                 active_cohort is None
@@ -827,6 +920,7 @@ def _campaign_frame_summary(
     return {
         "active_cohort": active,
         "cohorts": cohorts,
+        "physics_revision_aggregate": physics_revision_aggregate,
         "electrostatic": electrostatic,
         "thermal_models": thermal_models,
         "quarantine": {
@@ -1217,6 +1311,93 @@ class SchedulerReader:
             "error": error,
         }
 
+    @classmethod
+    def _node_local_snapshot(cls, payload: Any) -> dict[str, Any]:
+        """Normalize active node-local AEDT host tasks and bundle identities."""
+        if not isinstance(payload, list):
+            raise ValueError("node-local AEDT host response is invalid")
+        hosts: list[dict[str, Any]] = []
+        seen_task_ids: set[int] = set()
+        statuses: Counter[str] = Counter()
+        expected_projects_by_bundle: dict[str, int] = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            project = _optional_text(item.get("project"), 160)
+            if project not in (None, NODE_LOCAL_AEDT_PROJECT):
+                continue
+            name = _optional_text(item.get("name"), 500) or ""
+            entrypoint = _optional_text(item.get("entrypoint"), 500)
+            if entrypoint is not None:
+                entrypoint_leaf = entrypoint.replace("\\", "/").rsplit(
+                    "/", 1
+                )[-1]
+                entrypoint_leaf = entrypoint_leaf.removesuffix(".py").rsplit(
+                    ".", 1
+                )[-1]
+                if entrypoint_leaf != NODE_LOCAL_AEDT_ENTRYPOINT:
+                    continue
+            elif not name.endswith("-host"):
+                # Compatibility for older task-list responses that omitted
+                # entrypoint.  Canary host names are ``{bundle_id}-host``.
+                continue
+            status = (
+                _optional_text(item.get("status"), 40) or ""
+            ).lower()
+            if status not in NODE_LOCAL_AEDT_ACTIVE_STATES:
+                continue
+            task_id = cls._nonnegative_integer(
+                item.get("task_id", item.get("id"))
+            )
+            if task_id is None or task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(task_id)
+            raw_payload = item.get("payload_json")
+            if isinstance(raw_payload, str):
+                try:
+                    raw_payload = json.loads(raw_payload)
+                except (TypeError, ValueError):
+                    raw_payload = None
+            task_payload = raw_payload if isinstance(raw_payload, dict) else {}
+            bundle_id = _optional_text(
+                task_payload.get("aedt_canary_bundle_id"), 500
+            )
+            if bundle_id is None and name.endswith("-host"):
+                bundle_id = name[:-5] or None
+            expected_projects = cls._nonnegative_integer(
+                task_payload.get("aedt_canary_expected_projects")
+            )
+            if bundle_id and expected_projects is not None:
+                expected_projects_by_bundle[bundle_id] = expected_projects
+            statuses[status] += 1
+            hosts.append({
+                "task_id": task_id,
+                "name": name or None,
+                "status": status,
+                "bundle_id": bundle_id,
+            })
+        bundle_ids = list(dict.fromkeys(
+            host["bundle_id"] for host in hosts if host["bundle_id"]
+        ))
+        return {
+            "available": True,
+            "project": NODE_LOCAL_AEDT_PROJECT,
+            "active_host_tasks": len(hosts),
+            "statuses": dict(sorted(statuses.items())),
+            "bundle_count": len(bundle_ids),
+            "bundle_ids": bundle_ids,
+            "expected_projects": (
+                sum(expected_projects_by_bundle[bundle_id]
+                    for bundle_id in bundle_ids)
+                if bundle_ids and all(
+                    bundle_id in expected_projects_by_bundle
+                    for bundle_id in bundle_ids
+                ) else None
+            ),
+            "hosts": hosts,
+            "error": None,
+        }
+
     @staticmethod
     def _unavailable_pool(error: str | None = None) -> dict[str, Any]:
         return {
@@ -1256,16 +1437,37 @@ class SchedulerReader:
             "error": error,
         }
 
+    @staticmethod
+    def _unavailable_node_local(error: str | None = None) -> dict[str, Any]:
+        return {
+            "available": False,
+            "project": NODE_LOCAL_AEDT_PROJECT,
+            "active_host_tasks": None,
+            "statuses": {},
+            "bundle_count": None,
+            "bundle_ids": [],
+            "expected_projects": None,
+            "hosts": [],
+            "error": error,
+        }
+
     def _aedt_attach_snapshot(self) -> dict[str, Any]:
         """Fetch optional attach diagnostics concurrently within one deadline."""
         pool = self._unavailable_pool()
         license_status = self._unavailable_license()
+        node_local = self._unavailable_node_local()
+        node_local_query = urlencode({
+            "project": NODE_LOCAL_AEDT_PROJECT,
+            "status": ",".join(NODE_LOCAL_AEDT_ACTIVE_STATES),
+            "limit": NODE_LOCAL_AEDT_TASK_LIMIT,
+        })
         requests = {
             "pool": "/api/aedt-pool",
             "license": "/api/licenses",
+            "node_local": f"/api/tasks?{node_local_query}",
         }
         executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="mft-monitor-aedt"
+            max_workers=3, thread_name_prefix="mft-monitor-aedt"
         )
         futures = {
             name: executor.submit(
@@ -1283,8 +1485,10 @@ class SchedulerReader:
                     payload = future.result(timeout=remaining)
                     if name == "pool":
                         pool = self._pool_snapshot(payload)
-                    else:
+                    elif name == "license":
                         license_status = self._license_snapshot(payload)
+                    else:
+                        node_local = self._node_local_snapshot(payload)
                 except Exception as exc:
                     message = (
                         f"{requests[name]} 조회 실패: "
@@ -1292,8 +1496,13 @@ class SchedulerReader:
                     )
                     if name == "pool":
                         pool = self._unavailable_pool(message)
-                    else:
+                    elif name == "license":
                         license_status = self._unavailable_license(message)
+                    else:
+                        # Older scheduler deployments do not expose the
+                        # filtered host-task view.  Keep that optional absence
+                        # isolated from central pool/license health.
+                        node_local = self._unavailable_node_local(message)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
         errors = [
@@ -1334,6 +1543,7 @@ class SchedulerReader:
             "state": state,
             "license": license_status,
             "pool": pool,
+            "node_local": node_local,
             "errors": errors,
         }
 
@@ -1496,6 +1706,7 @@ class SchedulerReader:
                     "state": "unavailable",
                     "license": self._unavailable_license(),
                     "pool": self._unavailable_pool(),
+                    "node_local": self._unavailable_node_local(),
                     "errors": [],
                 },
             }
@@ -1591,6 +1802,11 @@ class RuntimeRecorder:
                 "complete_rows": data.get("complete_rows"),
                 "throughput_1h": data.get("throughput_1h"),
                 "count_basis": data.get("count_basis"),
+                "physics_data_revision": data.get(
+                    "current_physics_data_revision"
+                ),
+                "revision_raw_rows": data.get("revision_raw_rows"),
+                "member_git_hashes": data.get("member_git_hashes"),
                 "pinned_solver_revision": data.get("pinned_revision"),
                 "pinned_library_revision": data.get("pinned_library_revision"),
                 "cohorts": [
@@ -1667,8 +1883,8 @@ class RuntimeRecorder:
             summary["overall"],
             summary["data"]["total_rows"],
             summary["data"]["complete_rows"],
-            summary["data"]["pinned_solver_revision"],
-            summary["data"]["pinned_library_revision"],
+            summary["data"]["physics_data_revision"],
+            tuple(summary["data"].get("member_git_hashes") or []),
             tuple(
                 (
                     cohort.get("git_hash"),
@@ -1766,7 +1982,14 @@ class ArtifactService:
         expected_solver_revision: str | None,
         expected_library_revision: str | None,
     ) -> tuple[Any, str | None]:
-        """Cache canonical strict annotations for one immutable Parquet read."""
+        """Cache canonical per-SHA strict annotations for one Parquet read.
+
+        Every well-formed solver SHA is passed back into the quality contract
+        as the exact expected revision for that subgroup.  This keeps strict
+        evidence recomputed per row while allowing one physics revision to
+        span multiple clean solver rolls.  Missing or malformed identities
+        are still audited, without an expected SHA, and fail provenance.
+        """
         if not result.exists or result.value is None:
             return None, result.warning
         key = (
@@ -1780,19 +2003,68 @@ class ArtifactService:
             if key == self._campaign_audit_key:
                 return self._campaign_audit_frame, self._campaign_audit_warning
             warning = None
+            audit_fields = (
+                "_strict_valid_em",
+                "_strict_valid_thermal",
+                "_strict_valid_full",
+                "_strict_invalid_reasons",
+            )
             try:
                 from ..quality_contract import annotate_validity
 
-                audited = annotate_validity(
-                    result.value,
-                    expected_solver_revision=expected_solver_revision,
-                    expected_library_revision=expected_library_revision,
-                )
+                source = result.value
+                if "git_hash" not in source.columns:
+                    audited = annotate_validity(
+                        source,
+                        expected_solver_revision=None,
+                        expected_library_revision=None,
+                    )
+                else:
+                    audited = source.copy()
+                    audited["_strict_valid_em"] = False
+                    audited["_strict_valid_thermal"] = False
+                    audited["_strict_valid_full"] = False
+                    audited["_strict_invalid_reasons"] = ""
+                    positions_by_revision: dict[str, list[int]] = defaultdict(list)
+                    for position, value in enumerate(source["git_hash"].tolist()):
+                        revision = (_optional_text(value, 160) or "").lower()
+                        positions_by_revision[revision].append(position)
+                    active_revision = (
+                        _optional_text(expected_solver_revision, 160) or ""
+                    ).lower()
+                    for revision, positions in positions_by_revision.items():
+                        exact_revision = (
+                            revision
+                            if re.fullmatch(r"[0-9a-f]{40}", revision)
+                            else None
+                        )
+                        cohort = source.iloc[positions].copy()
+                        cohort_audited = annotate_validity(
+                            cohort,
+                            expected_solver_revision=exact_revision,
+                            expected_library_revision=(
+                                expected_library_revision
+                                if exact_revision == active_revision
+                                else None
+                            ),
+                        )
+                        for field in audit_fields:
+                            column_position = audited.columns.get_loc(field)
+                            audited.iloc[positions, column_position] = (
+                                cohort_audited[field].to_numpy()
+                            )
             except Exception as exc:
                 # Stored validity flags remain a fail-soft operational view;
                 # _campaign_frame_summary still pins them to the dynamically
-                # selected solver/physics identity instead of trusting others.
+                # selected active identity instead of trusting other cohorts.
                 audited = result.value
+                if hasattr(audited, "drop"):
+                    # Never mistake persisted/stale underscore columns for a
+                    # successful recomputation after the canonical audit
+                    # itself failed.
+                    audited = audited.drop(
+                        columns=list(audit_fields), errors="ignore"
+                    )
                 warning = (
                     "train.parquet strict audit failed; stored validity flags "
                     "are shown for the active cohort: "
@@ -1906,123 +2178,50 @@ class ArtifactService:
             campaign_frame = rows
         if audit_warning and audit_warning not in warnings:
             warnings.append(audit_warning)
-        total = _integer(strict_status.get("strict_full_rows"), 0) if strict_available else 0
-        em_valid = _integer(strict_status.get("strict_em_rows"), 0) if strict_available else 0
-        thermal_valid = complete = total
         if not strict_available:
             warnings.append(
-                "pinned strict-data status is unavailable; goal progress is fail-closed at zero."
+                "pinned strict-data status is unavailable; the physics-revision "
+                "aggregate uses row-level validity evidence instead."
             )
 
-        timestamps = [
-            parsed for row in rows
-            if (parsed := _parse_time(row.get("saved_at"), now.tzinfo)) is not None
-        ]
-        timestamps.sort()
         simulation_timing = _simulation_timing_summary(
             campaign_frame,
             now.tzinfo,
             active_cohort=active_cohort,
             current_physics_revision=CURRENT_PHYSICS_DATA_REVISION,
         )
-        one_hour_ago = now - timedelta(hours=1)
-        day_ago = now - timedelta(hours=24)
-        strict_history = []
-        cohort_history: dict[
-            tuple[str, str], list[tuple[datetime, int]]
-        ] = defaultdict(list)
-        history_path = self.root / "monitoring" / "runtime" / "monitor_history.jsonl"
-        if history_path.is_file():
-            try:
-                with history_path.open("r", encoding="utf-8") as handle:
-                    for line in handle:
-                        try:
-                            entry = json.loads(line)
-                        except (TypeError, ValueError):
-                            continue
-                        data_entry = entry.get("data") if isinstance(entry, dict) else None
-                        stamp = _parse_time(entry.get("time"), now.tzinfo) if isinstance(entry, dict) else None
-                        if isinstance(data_entry, dict) and stamp is not None:
-                            history_cohorts = data_entry.get("cohorts")
-                            if isinstance(history_cohorts, list):
-                                for cohort in history_cohorts:
-                                    if not isinstance(cohort, dict):
-                                        continue
-                                    revision = (
-                                        _optional_text(
-                                            cohort.get("git_hash"), 40
-                                        ) or ""
-                                    ).lower()
-                                    physics_revision = (
-                                        _optional_text(
-                                            cohort.get(
-                                                "physics_data_revision"
-                                            ), 160,
-                                        )
-                                        or LEGACY_PHYSICS_DATA_REVISION
-                                    )
-                                    cohort_history[(
-                                        revision, physics_revision
-                                    )].append((
-                                        stamp,
-                                        _integer(
-                                            cohort.get("strict_full_rows"), 0
-                                        ),
-                                    ))
-                        if (isinstance(data_entry, dict)
-                                and data_entry.get("count_basis") == "pinned_strict_full"
-                                and pinned_revision is not None
-                                and pinned_library_revision is not None
-                                and data_entry.get("pinned_solver_revision") == pinned_revision
-                                and data_entry.get("pinned_library_revision") == pinned_library_revision
-                                and stamp is not None):
-                            strict_history.append((stamp, _integer(data_entry.get("total_rows"), 0)))
-            except OSError as exc:
-                warnings.append(f"strict runtime history read failed: {exc}")
         campaign_summary = _campaign_frame_summary(
             campaign_frame,
             now,
-            cohort_history=dict(cohort_history),
             active_cohort=active_cohort,
             current_physics_revision=CURRENT_PHYSICS_DATA_REVISION,
         )
-        def _growth_since(cutoff):
-            earlier = [value for stamp, value in strict_history if stamp <= cutoff]
-            if earlier:
-                return max(0, total - earlier[-1])
-            within = [value for stamp, value in strict_history if stamp >= cutoff]
-            return max(0, total - within[0]) if within else 0
-        throughput_1h = _growth_since(one_hour_ago)
-        added_24h = _growth_since(day_ago)
-        strict_updated = _parse_time(strict_status.get("time"), now.tzinfo)
-        latest_data = strict_updated if strict_available else None
-        first_data = strict_history[0][0] if strict_history else None
-        stalled_minutes = max(0.0, (now - latest_data).total_seconds() / 60.0) if latest_data else None
+        physics_aggregate = campaign_summary["physics_revision_aggregate"]
+        revision_raw_rows = _integer(physics_aggregate.get("raw_rows"), 0)
+        total = _integer(physics_aggregate.get("strict_full_rows"), 0)
+        em_valid = _integer(physics_aggregate.get("strict_em_rows"), 0)
+        thermal_valid = complete = total
+        throughput_1h = _integer(
+            physics_aggregate.get("growth_rate_per_hour"), 0
+        )
+        added_24h = _integer(physics_aggregate.get("added_24h"), 0)
+        latest_data = _parse_time(
+            physics_aggregate.get("latest_strict_saved_at"), now.tzinfo
+        )
+        first_data = _parse_time(
+            physics_aggregate.get("first_strict_saved_at"), now.tzinfo
+        )
+        stalled_minutes = (
+            max(0.0, (now - latest_data).total_seconds() / 60.0)
+            if latest_data else None
+        )
         hourly_rate = float(throughput_1h)
         if hourly_rate <= 0 and added_24h:
             hourly_rate = added_24h / 24.0
         remaining = max(0, DATA_GOAL - total)
         eta_hours = remaining / hourly_rate if hourly_rate > 0 else None
         eta = now + timedelta(hours=eta_hours) if eta_hours is not None else None
-
-        history: list[dict[str, Any]] = []
-        previous = 0
-        for stamp, count in strict_history:
-            history.append({
-                "time": _iso(stamp), "added": max(0, count - previous),
-                "total": count,
-            })
-            previous = count
-        cumulative = total
-        if len(history) > 240:
-            stride = math.ceil(len(history) / 240)
-            history = history[::stride]
-            if history[-1]["total"] != cumulative:
-                history.append({
-                    "time": _iso(now),
-                    "added": max(0, cumulative - history[-1]["total"]),
-                    "total": cumulative,
-                })
+        history = list(physics_aggregate.get("history") or [])
 
         campaign_identity_rows = _frame_records(
             campaign_frame, ("git_hash", "saved_at")
@@ -2059,15 +2258,16 @@ class ArtifactService:
                 manifest_result.exists or rows_result.exists
                 or parquet_result.exists
             ),
-            "count_basis": "pinned_strict_full",
+            "count_basis": "physics_revision_strict_full",
             "strict_status_available": strict_available,
             "raw_total_rows": raw_total,
+            "revision_raw_rows": revision_raw_rows,
             "total_rows": total,
             "em_valid_rows": em_valid,
             "thermal_valid_rows": thermal_valid,
             "complete_rows": complete,
             "em_only_rows": max(0, em_valid - complete),
-            "invalid_em_rows": max(0, raw_total - em_valid),
+            "invalid_em_rows": max(0, revision_raw_rows - em_valid),
             "manifest_new_rows": _integer(manifest.get("new_rows"), 0),
             "manifest_new_unique_rows": _integer(manifest.get("new_unique_rows"), 0),
             "goal": DATA_GOAL,
@@ -2089,8 +2289,15 @@ class ArtifactService:
             "pinned_library_revision": pinned_library_revision,
             "current_solver_revision": active_solver_revision,
             "current_physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "member_git_hashes": physics_aggregate["member_git_hashes"],
+            "member_git_hash_shorts": (
+                physics_aggregate["member_git_hash_shorts"]
+            ),
             "revision_count": len(revisions) or len(hashes),
             "rows_not_latest_revision": revision_mismatch,
+            "rows_not_current_physics_revision": max(
+                0, raw_total - revision_raw_rows
+            ),
             **campaign_summary,
             "collector": {
                 "harvested_tasks": len(harvested) if isinstance(harvested, list) else None,
@@ -2111,8 +2318,8 @@ class ArtifactService:
                 ),
                 "strict_status": str(strict_result.path),
                 "updated_at": _iso(
-                    strict_result.mtime or parquet_result.mtime
-                    or manifest_result.mtime or rows_result.mtime
+                    parquet_result.mtime or manifest_result.mtime
+                    or rows_result.mtime or strict_result.mtime
                 ),
             },
             "warnings": warnings,

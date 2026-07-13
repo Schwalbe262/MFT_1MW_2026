@@ -10,11 +10,7 @@
     historyMetric: "r2",
     parityCache: new Map(), parityRequest: 0,
     parallelTargetDirty: false, updatingParallelTarget: false,
-    cohortHistoryExpanded: false,
   };
-
-  const COHORT_HISTORY_PREVIEW_ROWS = 2;
-  const LEGACY_COHORT_REVISION = "legacy_unspecified";
 
   const labels = {
     loading: "불러오는 중", active: "진행 중", warning: "주의", error: "오류", idle: "대기",
@@ -160,26 +156,27 @@
 
   function renderData(data) {
     setText("#data-total", `${number(data.total_rows)}개`);
-    setText("#data-strict-detail", data.pinned_revision ? `pin ${data.pinned_revision.slice(0, 10)} · strict full` : "pin — · strict full");
+    const physicsRevision = String(data.current_physics_data_revision || "");
+    const physicsLabel = physicsRevision.length > 24 ? `${physicsRevision.slice(0, 24)}…` : (physicsRevision || "—");
+    setText("#data-strict-detail", `physics ${physicsLabel} · strict full`);
+    const memberShas = Array.isArray(data.member_git_hash_shorts) ? data.member_git_hash_shorts : [];
+    setText("#data-member-shas", `SHA: ${memberShas.length ? memberShas.join(", ") : "—"}`);
     setText("#data-raw-total", `${number(data.raw_total_rows)}개`);
-    const rawRows = Number(data.raw_total_rows);
-    const strictRows = Number(data.total_rows);
-    const isolatedRows = Number.isFinite(rawRows) && Number.isFinite(strictRows) ? Math.max(0, rawRows - strictRows) : null;
-    setText("#data-quality-detail", `최신 strict EM ${number(data.em_valid_rows)}개 · Thermal ${number(data.thermal_valid_rows)}개 · 격리 ${number(isolatedRows)}개`);
+    setText("#data-quality-detail", `현재 revision raw ${number(data.revision_raw_rows)}개 · strict EM ${number(data.em_valid_rows)}개 · strict full ${number(data.total_rows)}개`);
     setText("#data-throughput", `+${number(data.throughput_1h)}개`);
     setText("#data-throughput-detail", `24시간 +${number(data.added_24h)} · 유효속도 ${number(data.effective_hourly_rate, 1)}/h`);
     setText("#data-eta", data.eta_3000 ? dateTime(data.eta_3000) : "산정 불가");
     setText("#data-stall", data.eta_hours != null ? `약 ${number(data.eta_hours, 1)}시간 후` : "최근 처리량이 없습니다");
     setText("#data-freshness", elapsed(data.stalled_minutes));
     $("#data-freshness").classList.toggle("stale", Boolean(data.stalled));
-    setText("#latest-revision", data.latest_revision ? `revision ${data.latest_revision.slice(0, 10)}` : "revision —");
+    setText("#latest-revision", physicsRevision ? `physics ${physicsLabel}` : "physics —");
     setText("#goal-label", `${number(data.total_rows)} / ${number(data.goal)}`);
     setText("#stretch-label", `${number(data.total_rows)} / ${number(data.stretch_goal)}+`);
     $("#goal-progress").style.width = `${Math.max(0, Math.min(100, data.goal_progress_pct || 0))}%`;
     $("#stretch-progress").style.width = `${Math.max(0, Math.min(100, data.stretch_progress_pct || 0))}%`;
     setText("#data-24h", `+${number(data.added_24h)}개`);
     setText("#data-remaining", `${number(data.remaining_to_goal)}개`);
-    setText("#revision-mismatch", data.rows_not_latest_revision == null ? "—" : `${number(data.rows_not_latest_revision)}개`);
+    setText("#revision-mismatch", data.rows_not_current_physics_revision == null ? "—" : `${number(data.rows_not_current_physics_revision)}개`);
     setText("#collector-nodata", data.collector?.no_data_tasks == null ? "—" : `${number(data.collector.no_data_tasks)}건`);
     const timing = data.simulation_timing || {};
     const timingStages = timing.stages || {};
@@ -204,7 +201,7 @@
       ? timingCohortLabel
       : "활성 코호트 타이밍 데이터 없음";
     timingEmpty.classList.toggle("hidden", Boolean(timing.available));
-    ["matrix", "loss", "icepak", "total"].forEach((key) => {
+    ["matrix", "loss", "electrostatic", "icepak", "total"].forEach((key) => {
       const stage = timingStages[key] || {};
       setText(`#stage-time-${key}-mean`, duration(stage.mean_seconds));
       setText(
@@ -218,192 +215,13 @@
       color: "#26d7c7", area: true,
     });
     $("#data-chart-empty").classList.toggle("hidden", (data.history || []).length > 0);
-    renderCohorts(data.cohorts, data.current_cohort_metadata, data.active_cohort);
+    renderCohortMetadata(data.current_cohort_metadata);
     renderQuarantine(data.quarantine);
     renderElectrostatic(data.electrostatic);
     renderThermalModels(data.thermal_models);
   }
 
-  function isActiveCohort(cohort) {
-    return Boolean(cohort?.active ?? cohort?.current);
-  }
-
-  function cohortTimestamp(cohort) {
-    const timestamp = String(cohort?.latest_saved_at || "");
-    const fractional = timestamp.match(
-      /\.(\d+)(?:Z|[+-]\d{2}:?\d{2})?$/,
-    )?.[1] || "";
-    const normalizedTimestamp = fractional
-      ? timestamp.replace(`.${fractional}`, `.${fractional.padEnd(3, "0").slice(0, 3)}`)
-      : timestamp;
-    const milliseconds = Date.parse(normalizedTimestamp);
-    if (!Number.isFinite(milliseconds)) return Number.NEGATIVE_INFINITY;
-    const subMillisecond = Number(fractional.padEnd(6, "0").slice(3, 6) || 0) / 1000;
-    return milliseconds + subMillisecond;
-  }
-
-  function cohortGrowth(cohort) {
-    return hasNumber(cohort?.growth_rate_per_hour)
-      ? `${Number(cohort.growth_rate_per_hour) > 0 ? "+" : ""}${number(cohort.growth_rate_per_hour, 1)}/h`
-      : "—";
-  }
-
-  function shortPhysicsRevision(value) {
-    const revision = String(value || "").trim();
-    if (!revision || revision.toLowerCase() === LEGACY_COHORT_REVISION) return "legacy";
-    return revision.length > 18 ? `${revision.slice(0, 18)}…` : revision;
-  }
-
-  function compactPriorCohorts(cohorts) {
-    const prior = cohorts.filter((cohort) => !isActiveCohort(cohort));
-    const isLegacyNoise = (cohort) => (
-      String(cohort?.physics_data_revision || "").trim().toLowerCase() === LEGACY_COHORT_REVISION
-      && Number(cohort?.strict_em_rows) === 0
-      && Number(cohort?.strict_full_rows) === 0
-      && (!hasNumber(cohort?.growth_rate_per_hour) || Number(cohort.growth_rate_per_hour) === 0)
-    );
-    const legacyNoise = prior.filter(isLegacyNoise);
-    const rows = prior.filter((cohort) => !isLegacyNoise(cohort));
-    if (legacyNoise.length) {
-      const sum = (key) => legacyNoise.reduce(
-        (total, cohort) => total + (hasNumber(cohort?.[key]) ? Number(cohort[key]) : 0),
-        0,
-      );
-      const newestLegacy = [...legacyNoise].sort(
-        (left, right) => cohortTimestamp(right) - cohortTimestamp(left),
-      )[0];
-      rows.push({
-        git_hash: null,
-        git_hash_short: "legacy",
-        physics_data_revision: LEGACY_COHORT_REVISION,
-        latest_saved_at: newestLegacy?.latest_saved_at || null,
-        legacy_aggregate: true,
-        cohort_count: legacyNoise.length,
-        raw_rows: sum("raw_rows"),
-        strict_em_rows: sum("strict_em_rows"),
-        strict_full_rows: sum("strict_full_rows"),
-        growth_rate_per_hour: sum("growth_rate_per_hour"),
-      });
-    }
-    return rows.sort((left, right) => {
-      const newestFirst = cohortTimestamp(right) - cohortTimestamp(left);
-      if (newestFirst) return newestFirst;
-      const leftIdentity = `${left?.git_hash_short || left?.git_hash || ""}:${left?.physics_data_revision || ""}`;
-      const rightIdentity = `${right?.git_hash_short || right?.git_hash || ""}:${right?.physics_data_revision || ""}`;
-      return leftIdentity.localeCompare(rightIdentity);
-    });
-  }
-
-  function cohortHistoryView(cohorts, expanded = false) {
-    const source = Array.isArray(cohorts) ? cohorts : [];
-    return {
-      cohortCount: source.filter((cohort) => !isActiveCohort(cohort)).length,
-      rows: compactPriorCohorts(source).map((cohort, index) => {
-        const extra = index >= COHORT_HISTORY_PREVIEW_ROWS;
-        return { cohort, extra, hidden: extra && !expanded };
-      }),
-    };
-  }
-
-  function activeCohortCard(cohort) {
-    const card = element("article", "cohort-row active");
-    const heading = element("div", "cohort-row-heading");
-    const identity = element("div");
-    const hash = cohort?.git_hash_short || (cohort?.git_hash ? String(cohort.git_hash).slice(0, 10) : "—");
-    identity.append(element("strong", "mono", hash));
-    identity.append(element("span", "", cohort?.physics_data_revision || "physics revision —"));
-    heading.append(identity, element("span", "state-chip pass", "ACTIVE"));
-    card.append(heading);
-    const metrics = element("dl", "cohort-metric-grid");
-    [
-      ["Raw", count(cohort?.raw_rows)],
-      ["Strict EM", count(cohort?.strict_em_rows)],
-      ["Strict full", count(cohort?.strict_full_rows)],
-      ["증가 속도", cohortGrowth(cohort)],
-    ].forEach(([label, value]) => {
-      const item = element("div");
-      item.append(element("dt", "", label), element("dd", "", value));
-      metrics.append(item);
-    });
-    card.append(metrics);
-    return card;
-  }
-
-  function setCohortHistoryExpanded(expanded) {
-    state.cohortHistoryExpanded = Boolean(expanded);
-    const toggle = $("#cohort-history-toggle");
-    const extraRows = document.querySelectorAll("#cohort-history-body tr[data-cohort-extra='true']");
-    const canExpand = extraRows.length > 0;
-    const applied = canExpand && state.cohortHistoryExpanded;
-    const cohortCount = Number(toggle.dataset.cohortCount || 0);
-    toggle.setAttribute("aria-expanded", String(applied));
-    toggle.textContent = applied
-      ? `이전 코호트 ${number(cohortCount)}개 접기`
-      : `이전 코호트 ${number(cohortCount)}개 보기`;
-    extraRows.forEach((row) => row.classList.toggle("hidden", !applied));
-  }
-
-  function renderCohorts(cohortsPayload, metadataPayload, activePayload) {
-    const cohorts = Array.isArray(cohortsPayload) ? cohortsPayload : [];
-    const active = activePayload && typeof activePayload === "object" ? activePayload : {};
-    const activeContainer = $("#cohort-active");
-    const history = $("#cohort-history");
-    const historyBody = $("#cohort-history-body");
-    const historyToggle = $("#cohort-history-toggle");
-    activeContainer.replaceChildren();
-    activeContainer.classList.remove("hidden");
-    historyBody.replaceChildren();
-    setText(
-      "#cohort-summary",
-      active.available === true
-        ? `ACTIVE ${active.git_hash_short || "—"}`
-        : active.label || (cohorts.length ? `${number(cohorts.length)}개 코호트` : "코호트 —"),
-    );
-
-    if (!cohorts.length) {
-      activeContainer.append(element("p", "empty-state compact-empty", "사용 가능한 코호트 데이터가 없습니다."));
-      history.classList.add("hidden");
-      historyToggle.dataset.cohortCount = "0";
-      historyToggle.classList.add("hidden");
-      setCohortHistoryExpanded(false);
-    } else {
-      const activeCohort = cohorts.find(isActiveCohort);
-      if (activeCohort) {
-        activeContainer.append(activeCohortCard(activeCohort));
-      } else {
-        activeContainer.classList.add("hidden");
-      }
-
-      const historyView = cohortHistoryView(cohorts, state.cohortHistoryExpanded);
-      historyView.rows.forEach(({ cohort, extra, hidden }) => {
-        const row = element("tr", cohort?.legacy_aggregate ? "legacy-aggregate" : "");
-        row.dataset.cohortExtra = String(extra);
-        row.classList.toggle("hidden", hidden);
-        const hash = cohort?.legacy_aggregate
-          ? `레거시 (${number(cohort.cohort_count)}개 코호트)`
-          : cohort?.git_hash_short || (cohort?.git_hash ? String(cohort.git_hash).slice(0, 10) : "—");
-        const hashCell = element("td", "cohort-history-sha mono", hash);
-        if (!cohort?.legacy_aggregate && cohort?.git_hash) hashCell.title = String(cohort.git_hash);
-        const revisionCell = element("td", "cohort-history-revision mono", shortPhysicsRevision(cohort?.physics_data_revision));
-        if (cohort?.physics_data_revision) revisionCell.title = String(cohort.physics_data_revision);
-        const growth = element("td", "cohort-history-growth", cohortGrowth(cohort));
-        if (Number(cohort?.growth_rate_per_hour) > 0) growth.classList.add("positive");
-        row.append(
-          hashCell,
-          revisionCell,
-          element("td", "", number(cohort?.raw_rows)),
-          element("td", "", number(cohort?.strict_em_rows)),
-          element("td", "", number(cohort?.strict_full_rows)),
-          growth,
-        );
-        historyBody.append(row);
-      });
-      history.classList.toggle("hidden", historyView.rows.length === 0);
-      historyToggle.dataset.cohortCount = String(historyView.cohortCount);
-      historyToggle.classList.toggle("hidden", historyView.rows.length <= COHORT_HISTORY_PREVIEW_ROWS);
-      setCohortHistoryExpanded(state.cohortHistoryExpanded);
-    }
-
+  function renderCohortMetadata(metadataPayload) {
     const metadata = metadataPayload && typeof metadataPayload === "object" ? metadataPayload : {};
     const lamination = metadata.core_lamination_factor || {};
     const laminationRange = rangeSummary(lamination, "", 3);
@@ -1127,6 +945,7 @@
       : {};
     const license = attach.license && typeof attach.license === "object" ? attach.license : {};
     const pool = attach.pool && typeof attach.pool === "object" ? attach.pool : {};
+    const nodeLocal = attach.node_local && typeof attach.node_local === "object" ? attach.node_local : {};
     const rawState = String(attach.state || "").toLowerCase();
     let stateKey = rawState;
     if (!stateKey) {
@@ -1177,6 +996,31 @@
         : "—",
     );
     setText("#aedt-pool-capacity", pool.available === true ? ratio(pool.ready_sessions, pool.busy_sessions) : "—");
+
+    const nodeLocalProgress = $("#aedt-node-local-progress");
+    const activeHosts = Number(nodeLocal.active_host_tasks);
+    const showNodeLocal = nodeLocal.available === true && Number.isFinite(activeHosts) && activeHosts > 0;
+    nodeLocalProgress.classList.toggle("hidden", !showNodeLocal);
+    if (showNodeLocal) {
+      const bundleText = hasNumber(nodeLocal.bundle_count)
+        ? `번들 ${number(nodeLocal.bundle_count)}개`
+        : "번들 정보 없음";
+      const projectText = hasNumber(nodeLocal.expected_projects)
+        ? ` · 프로젝트 ${number(nodeLocal.expected_projects)}개`
+        : "";
+      const statuses = nodeLocal.statuses && typeof nodeLocal.statuses === "object" ? nodeLocal.statuses : {};
+      const stateText = [
+        ["Q", statuses.queued],
+        ["A", statuses.attaching],
+        ["R", statuses.running],
+      ].filter(([, value]) => hasNumber(value)).map(([label, value]) => `${label} ${number(value)}`).join(" · ");
+      nodeLocalProgress.textContent = `노드 로컬: 활성 호스트 ${number(activeHosts)}개 · ${bundleText}${projectText}${stateText ? ` · ${stateText}` : ""}`;
+      const bundleIds = Array.isArray(nodeLocal.bundle_ids) ? nodeLocal.bundle_ids : [];
+      nodeLocalProgress.title = bundleIds.length ? `번들: ${bundleIds.join(", ")}` : "";
+    } else {
+      nodeLocalProgress.textContent = "노드 로컬 AEDT 진행 정보 없음";
+      nodeLocalProgress.title = "";
+    }
 
     const errors = [
       ...(Array.isArray(attach.errors) ? attach.errors : []),
@@ -1275,16 +1119,10 @@
   }
 
   if (!hasDOM) {
-    if (typeof module !== "undefined" && module.exports) {
-      module.exports = { cohortHistoryView };
-    }
     return;
   }
 
   $("#refresh-button").addEventListener("click", refresh);
-  $("#cohort-history-toggle").addEventListener("click", () => {
-    setCohortHistoryExpanded(!state.cohortHistoryExpanded);
-  });
   $("#model-history-metric").addEventListener("change", (event) => {
     const metric = event.target.value;
     if (!historyMetrics[metric]) return;

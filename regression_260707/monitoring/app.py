@@ -69,7 +69,9 @@ def create_app(
         # The operator dashboard is a live local tool.  Do not let a browser
         # keep an older HTML/JS/CSS bundle while the service has already moved
         # to a newer response schema.
-        if request.url.path == "/" or request.url.path.startswith(("/api/", "/static/")):
+        if request.url.path in {"/", "/cohorts"} or request.url.path.startswith(
+            ("/api/", "/static/")
+        ):
             response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -133,6 +135,18 @@ def create_app(
             name="index.html",
             context={
                 "title": "MFT 1MW 최적설계 모니터",
+                "refresh_seconds": 20,
+                "project_root": str(root),
+            },
+        )
+
+    @app.get("/cohorts", response_class=HTMLResponse, include_in_schema=False)
+    async def cohorts_page(request: Request):
+        return templates.TemplateResponse(
+            request=request,
+            name="cohorts.html",
+            context={
+                "title": "MFT 데이터 코호트 상세",
                 "refresh_seconds": 20,
                 "project_root": str(root),
             },
