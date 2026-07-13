@@ -618,6 +618,7 @@ def main():
         args.thresholds,
         os.path.join(REGRESSION_ROOT, "quality_contract.py"),
         os.path.join(REGRESSION_ROOT, "model_targets.py"),
+        solver_revision=args.solver_revision,
     )
     profile_sha256 = contract_identity["profile_sha256"]
     with open(args.thresholds, encoding="utf-8") as handle:
@@ -656,7 +657,12 @@ def main():
             "checkpoint_contract_key"
         ],
         "registry_protocol_version": REGISTRY_PROTOCOL_VERSION,
-        "solver_revision": args.solver_revision,
+        "physics_data_revision": contract_identity[
+            "physics_data_revision"
+        ],
+        "solver_revision_cohort": contract_identity[
+            "solver_revision_cohort"
+        ],
         "library_revision": args.library_revision,
     }
     raw, audited, strict, quarantine = inspect_dataset(
@@ -697,6 +703,8 @@ def main():
         "checkpoint_run_root": run_root,
         "reconciliation_issues": reconciliation_issues,
         "state_identity": identity,
+        "expected_solver_revision": args.solver_revision,
+        "expected_library_revision": args.library_revision,
         "execute": bool(args.execute),
         "manufacturing_tolerance_policy": (
             "excluded; exact-as-FEA geometry is assumed"
@@ -733,6 +741,7 @@ def main():
             args.thresholds,
             os.path.join(REGRESSION_ROOT, "quality_contract.py"),
             os.path.join(REGRESSION_ROOT, "model_targets.py"),
+            solver_revision=args.solver_revision,
         )
         if (
             locked_contract_identity["checkpoint_contract_sha256"]

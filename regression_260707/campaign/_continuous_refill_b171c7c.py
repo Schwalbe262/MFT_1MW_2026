@@ -44,6 +44,9 @@ import feeder
 import pinned_pilot
 import rapid_campaign
 import scheduler_client
+from training.checkpoint_contract import (
+    checkpoint_status_revision_identity_matches,
+)
 
 
 SOLVER = "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
@@ -1216,11 +1219,11 @@ def _strict_snapshot() -> dict:
         if not snapshots:
             raise RuntimeError("no valid strict status snapshot: " + ",".join(errors))
         stamp, source, payload = max(snapshots, key=lambda item: item[0])
-        identity = payload.get("state_identity") or {}
         age = (datetime.now(timezone.utc) - stamp).total_seconds()
         pinned = (
-            identity.get("solver_revision") == SOLVER
-            and identity.get("library_revision") == LIBRARY
+            checkpoint_status_revision_identity_matches(
+                payload, SOLVER, LIBRARY
+            )
             and age <= 20 * 60
         )
         rows = int(payload.get("strict_full_rows") or 0) if pinned else 0

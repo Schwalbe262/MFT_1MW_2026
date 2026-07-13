@@ -26,12 +26,20 @@ from training.checkpoint_orchestrator import (  # noqa: E402
     training_commands,
 )
 import training.checkpoint_orchestrator as checkpoint_orchestrator  # noqa: E402
-from training.checkpoint_contract import checkpoint_contract_identity  # noqa: E402
+from training.checkpoint_contract import (  # noqa: E402
+    checkpoint_contract_identity,
+    checkpoint_status_revision_identity_matches,
+)
 from training.model_quality_gate import evaluate_generation  # noqa: E402
 import training.train_models as train_models  # noqa: E402
 from training.predictor import EnsemblePredictor  # noqa: E402
 from monitoring.readers import ArtifactService  # noqa: E402
 import al_driver  # noqa: E402
+from module.core_material_contract import (  # noqa: E402
+    PHYSICS_DATA_REVISION,
+    PHYSICS_EQUIVALENT_SOLVER_REVISIONS,
+    solver_revision_cohort_identity,
+)
 
 
 class ConstantModel:
@@ -273,6 +281,47 @@ class RegistryWriterTests(unittest.TestCase):
 
 
 class CheckpointRecoveryTests(unittest.TestCase):
+    def test_strict_status_pins_are_bound_to_canonical_state_identity(self):
+        solver = PHYSICS_EQUIVALENT_SOLVER_REVISIONS[-1]
+        library = "b" * 40
+        status = {
+            "expected_solver_revision": solver,
+            "expected_library_revision": library,
+            "state_identity": {
+                "solver_revision_cohort": solver_revision_cohort_identity(
+                    solver
+                ),
+                "physics_data_revision": PHYSICS_DATA_REVISION,
+                "library_revision": library,
+            },
+        }
+        self.assertTrue(checkpoint_status_revision_identity_matches(
+            status, solver, library
+        ))
+        for key, value in (
+            ("solver_revision_cohort", "solver_revision:" + "f" * 40),
+            ("physics_data_revision", "foreign-physics-revision"),
+            ("library_revision", "c" * 40),
+        ):
+            with self.subTest(tampered=key):
+                tampered = {
+                    **status,
+                    "state_identity": {
+                        **status["state_identity"],
+                        key: value,
+                    },
+                }
+                self.assertFalse(checkpoint_status_revision_identity_matches(
+                    tampered, solver, library
+                ))
+        legacy = {"state_identity": {
+            "solver_revision": "a" * 40,
+            "library_revision": library,
+        }}
+        self.assertTrue(checkpoint_status_revision_identity_matches(
+            legacy, "a" * 40, library
+        ))
+
     def _completion(self, candidate, pointer):
         metrics_result = Path(candidate["dataset"] + ".metrics.json")
         profile_path = os.path.abspath(candidate["dataset"] + ".profile.json")
@@ -581,8 +630,10 @@ class CheckpointRecoveryTests(unittest.TestCase):
                 status["checkpoint_run_root"], os.path.abspath(run_root)
             )
             self.assertEqual(
-                status["state_identity"]["solver_revision"], "a" * 40
+                status["state_identity"]["solver_revision_cohort"],
+                solver_revision_cohort_identity("a" * 40),
             )
+            self.assertEqual(status["expected_solver_revision"], "a" * 40)
             self.assertRegex(
                 status["state_identity"]["checkpoint_contract_key"],
                 r"^[0-9a-f]{16}$",
@@ -623,7 +674,7 @@ class CheckpointRecoveryTests(unittest.TestCase):
                     checkpoint_orchestrator.main()
             inspect.assert_not_called()
 
-    def test_same_run_root_keeps_identity_mismatch_fail_closed(self):
+    def test_same_run_root_shares_equivalent_solver_identity_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             profile = root / "profile.json"
@@ -664,16 +715,34 @@ class CheckpointRecoveryTests(unittest.TestCase):
                 ):
                     checkpoint_orchestrator.main()
 
-            invoke("a" * 40)
+            invoke(PHYSICS_EQUIVALENT_SOLVER_REVISIONS[0])
             state_path = run_root / "checkpoint_state.json"
+            first_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                first_state["identity"]["solver_revision_cohort"],
+                solver_revision_cohort_identity(
+                    PHYSICS_EQUIVALENT_SOLVER_REVISIONS[0]
+                ),
+            )
+
+            invoke(PHYSICS_EQUIVALENT_SOLVER_REVISIONS[1])
+            shared_state = json.loads(state_path.read_text(encoding="utf-8"))
+            shared_status = json.loads(
+                (output / "strict_data_status.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(shared_state["identity"], first_state["identity"])
+            self.assertEqual(
+                shared_status["expected_solver_revision"],
+                PHYSICS_EQUIVALENT_SOLVER_REVISIONS[1],
+            )
             original_state = state_path.read_bytes()
-            original_status = (
-                output / "strict_data_status.json"
-            ).read_bytes()
+            original_status = (output / "strict_data_status.json").read_bytes()
             with self.assertRaisesRegex(
-                RuntimeError, "runtime identity changed.*solver_revision"
+                RuntimeError, "runtime identity changed"
             ):
-                invoke("c" * 40)
+                invoke("f" * 40)
             self.assertEqual(state_path.read_bytes(), original_state)
             self.assertEqual(
                 (output / "strict_data_status.json").read_bytes(),
@@ -785,6 +854,39 @@ class LoopSeparationTests(unittest.TestCase):
                 )
                 prior = current
 
+            equivalent_a = checkpoint_contract_identity(
+                profile,
+                thresholds,
+                quality_contract,
+                model_targets,
+                solver_revision=PHYSICS_EQUIVALENT_SOLVER_REVISIONS[0],
+            )
+            equivalent_b = checkpoint_contract_identity(
+                profile,
+                thresholds,
+                quality_contract,
+                model_targets,
+                solver_revision=PHYSICS_EQUIVALENT_SOLVER_REVISIONS[1],
+            )
+            unknown = checkpoint_contract_identity(
+                profile,
+                thresholds,
+                quality_contract,
+                model_targets,
+                solver_revision="f" * 40,
+            )
+            self.assertEqual(
+                equivalent_a["checkpoint_contract_sha256"],
+                equivalent_b["checkpoint_contract_sha256"],
+            )
+            self.assertNotEqual(
+                equivalent_b["checkpoint_contract_sha256"],
+                unknown["checkpoint_contract_sha256"],
+            )
+            self.assertEqual(
+                equivalent_a["physics_data_revision"], PHYSICS_DATA_REVISION
+            )
+
     def test_collector_and_trainer_are_independent_managed_roots(self):
         collector = (HERE / "campaign" / "auto_collect_loop.sh").read_text(
             encoding="utf-8"
@@ -811,16 +913,24 @@ class LoopSeparationTests(unittest.TestCase):
         self.assertIn('--output-root "$OUTPUT_ROOT"', trainer)
         self.assertIn('--run-root "$RUN_ROOT"', trainer)
         self.assertIn("training/checkpoint_contract.py", trainer)
+        self.assertIn('--solver-revision "$MFT_SOLVER_REVISION"', trainer)
         self.assertIn("MFT_QUALITY_THRESHOLDS", trainer)
         self.assertIn("--expected-contract-key", trainer)
         self.assertIn("-c${CONTRACT_KEY}", trainer)
+        self.assertNotIn(
+            "${MFT_SOLVER_REVISION}-${MFT_LIBRARY_REVISION}", trainer
+        )
         self.assertLess(trainer.index("while true"), trainer.index("CONTRACT_KEY="))
         self.assertIn('[string]$RunRoot', powershell_launcher)
         self.assertIn('[string]$Thresholds', powershell_launcher)
         self.assertIn('"--run-root", $CycleRunRoot', powershell_launcher)
         self.assertIn("checkpoint_contract.py", powershell_launcher)
         self.assertIn("--expected-contract-key", powershell_launcher)
-        self.assertIn('$RevisionContractKey = "$RevisionKey-c$ContractKey"', powershell_launcher)
+        self.assertIn('"--solver-revision", $SolverRevision', powershell_launcher)
+        self.assertIn(
+            '$RevisionContractKey = "$LibraryKey-c$ContractKey"',
+            powershell_launcher,
+        )
         self.assertIn('MFT_SOLVER_REVISION="$SOLVER_REVISION"', relaunch)
         self.assertIn('MFT_LIBRARY_REVISION="$LIBRARY_REVISION"', relaunch)
         self.assertIn("auto_collect_loop.sh", relaunch)
