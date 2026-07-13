@@ -33,8 +33,13 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "활성 코호트 타이밍 데이터 없음" in page.text
     assert "단계 소요시간" in page.text
     assert "final-time-matrix" in page.text
-    assert "MFT 병렬 실행 목표" in page.text
+    assert "MFT 자동 실행 유지" in page.text
+    assert 'id="parallel-target-form" class="parallel-target-form hidden"' in page.text
     assert "parallel-target-input" in page.text
+    assert 'id="refill-controller-status" class="parallel-target-form"' in page.text
+    assert 'id="parallel-target-status" class="parallel-target-status hidden"' in page.text
+    assert 'id="parallel-control-note" class="parallel-control-note hidden"' in page.text
+    assert "세대 ID 축약" in page.text
     assert "parallel-logical-active" in page.text
     assert "parallel-attaching" in page.text
     assert 'id="model-history-metric"' in page.text
@@ -43,7 +48,16 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert 'id="cohort-history"' not in page.text
     assert 'id="cohort-lamination-factor"' in page.text
     assert 'id="cohort-flux-availability"' in page.text
+    current_details_tag = '<details id="quarantine-current-details" class="quarantine-reason-details">'
+    assert current_details_tag in page.text
+    assert 'id="quarantine-current-reason-count"' in page.text
+    assert '<span class="fold-open">펼치기 ▾</span>' in page.text
+    assert '<span class="fold-close">접기 ▴</span>' in page.text
     assert 'id="quarantine-current-reasons"' in page.text
+    current_details_start = page.text.index(current_details_tag)
+    current_details_end = page.text.index("</details>", current_details_start)
+    current_reasons_start = page.text.index('id="quarantine-current-reasons"')
+    assert current_details_start < current_reasons_start < current_details_end
     assert 'id="quarantine-legacy-reasons"' in page.text
     assert 'id="capacitance-summary"' in page.text
     assert 'id="resonance-summary"' in page.text
@@ -83,12 +97,24 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert 'return "—"' in script.text
     assert 'fetch("/api/operator/parallel-target"' in script.text
     assert '"X-MFT-Operator-Control": "parallel-target-v1"' in script.text
+    assert 'key === "no_refill_needed"' in script.text
+    assert 'key === "pooled_bundle_pending"' in script.text
+    assert 'key === "failed_closed"' in script.text
+    assert "정상 (보충 불필요)" in script.text
+    assert "보충 실행" in script.text
+    assert "AEDT 공유 번들 진행 중" in script.text
+    assert "오류로 안전정지 (관리자 확인 필요)" in script.text
+    assert "컨트롤러 상태 파일을 찾을 수 없음" in script.text
+    assert "refillController.concurrency_target ?? scheduler.parallel_target" in script.text
     assert "scheduler.live_queued" in script.text
     assert "x: (item) => Number(item.n)" in script.text
     assert "historyPointTooltip" in script.text
     assert "CV P90 APE" in script.text
     assert "data.current_cohort_metadata" in script.text
     assert "data.quarantine" in script.text
+    assert '`${current.label || "활성 코호트"} — ${count(current.rows)}`' in script.text
+    assert 'hasCurrentReasons ? count(currentReasons.length, "건") : "—"' in script.text
+    assert "#quarantine-current-details" not in script.text
     assert "electrostatic.cap_stage_present_rows" in script.text
     assert '"C_tx_tx"' in script.text
     assert "resonance.interwinding" in script.text
@@ -119,6 +145,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert ".chart-tooltip" in stylesheet.text
     assert ".cohort-detail-table tr.active" in stylesheet.text
     assert ".cohort-detail-table tr.legacy-aggregate" in stylesheet.text
+    assert ".quarantine-reason-details[open] .fold-open" in stylesheet.text
+    assert ".quarantine-reason-details[open] .fold-close" in stylesheet.text
     assert ".quarantine-legacy" in stylesheet.text
     assert ".electrostatic-presence-grid" in stylesheet.text
     assert ".thermal-model-row" in stylesheet.text
@@ -243,6 +271,28 @@ def test_api_failure_is_section_local(campaign_root):
     assert response.status_code == 200
     assert response.json()["available"] is False
     assert "broken artifact" in response.json()["error"]
+
+
+def test_dashboard_and_status_expose_refill_controller(artifact_service):
+    expected = {
+        "available": True,
+        "last_tick_at": "2026-07-13T12:30:00+09:00",
+        "action": "no_refill_needed",
+        "active_project_tasks_before": 300,
+        "accepted_or_reconciled_count": 0,
+        "generation_id": "restart-v3-generation",
+        "concurrency_target": 300,
+    }
+
+    class StubRefillController:
+        def snapshot(self):
+            return dict(expected)
+
+    artifact_service.refill_controller = StubRefillController()
+    client = TestClient(create_app(service=artifact_service))
+
+    assert client.get("/api/dashboard").json()["refill_controller"] == expected
+    assert client.get("/api/status").json()["refill_controller"] == expected
 
 
 def test_local_operator_can_set_exact_bounded_parallel_target(
