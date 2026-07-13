@@ -76,13 +76,20 @@ def _native_block_readback(boundary, obj):
             f"native boundary child unavailable for {getattr(boundary, 'name', boundary)!r}"
         )
     prop_names = set(str(name) for name in (child.GetPropNames() or []))
-    required = {"Block Type", "Use Total Power", "Total Power"}
-    missing = sorted(required - prop_names)
+    # AEDT 2025.2 exposes the block-type property as plain "Type" (observed
+    # live on the cluster: Assignment/Name/Total Power/Type/Use External
+    # Conditions/Use Total Power); older builds named it "Block Type".
+    block_type_prop = next(
+        (name for name in ("Block Type", "Type") if name in prop_names), None
+    )
+    missing = sorted({"Use Total Power", "Total Power"} - prop_names)
+    if block_type_prop is None:
+        missing = sorted(missing + ["Block Type|Type"])
     if missing:
         raise RuntimeError(
             f"native block readback missing properties {missing}: {sorted(prop_names)}"
         )
-    block_type = str(child.GetPropValue("Block Type"))
+    block_type = str(child.GetPropValue(block_type_prop))
     use_total = child.GetPropValue("Use Total Power")
     if block_type != "Solid" or str(use_total).strip().lower() not in {
         "true", "1"
