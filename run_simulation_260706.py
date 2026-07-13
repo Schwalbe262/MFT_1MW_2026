@@ -129,6 +129,8 @@ from module.source_contract import SOLVER_REVISION_PATHS
 
 PLATE_COLOR = [144, 190, 144]
 PAD_COLOR = [200, 160, 200]
+B_POWER_REFERENCE_VARIABLE = "B_power_reference"
+B_POWER_REFERENCE_T = 1.0
 
 
 def _raw_aedt_material_props(materials, material_name):
@@ -387,19 +389,26 @@ def _convert_solution_unit(value, source_unit, target_unit):
     return float(value) * source_factor / target_factor
 
 
-def _b_power_volume_integral_si(value, unit, exponent):
-    """Normalize a SolutionData ``integral(|B|**y dV)`` to T**y*m**3."""
+def _b_power_volume_integral_si(
+        value, unit, exponent, *, normalized_by_one_tesla=False):
+    """Normalize a B-power integral to the numeric T**y*m**3 moment.
+
+    When the calculator expression uses ``(B / 1 tesla)**y``, its reported
+    unit is volume only while its numerical value is exactly the desired
+    moment with B expressed in tesla.
+    """
     number = float(value)
     exponent = float(exponent)
     if not math.isfinite(number) or number < 0:
         raise RuntimeError(f"invalid B-power volume integral: {value!r}")
     raw = str(unit or "").strip().lower().replace(" ", "")
     raw = raw.replace("³", "^3").replace("tesla", "t")
-    if not raw or "t" not in raw:
+    if (not normalized_by_one_tesla) and (not raw or "t" not in raw):
         raise RuntimeError(
             f"B-power integral unit lacks tesla basis: {unit!r}"
         )
-    if not any(token in raw for token in (str(exponent), f"^{exponent:g}")):
+    if (not normalized_by_one_tesla) and not any(
+            token in raw for token in (str(exponent), f"^{exponent:g}")):
         # Some AEDT builds omit a fractional exponent from the display unit.
         # Accept a generic powered-T marker, but never silently accept plain T.
         if "t^" not in raw and "pow" not in raw:
@@ -3703,6 +3712,12 @@ class Simulation():
                 name = obj if isinstance(obj, str) else obj.name
                 reporter.EnterQty("B")
                 reporter.CalcOp("ComplxPeak")
+                # Fractional powers of a dimensional field are rejected by
+                # AEDT 2025.2's scalar Pow operation.  Normalize by the exact
+                # 1-tesla design variable first; the resulting dimensionless
+                # field has the same numerical value as B expressed in tesla.
+                reporter.EnterScalarFunc(B_POWER_REFERENCE_VARIABLE)
+                reporter.CalcOp("/")
                 reporter.EnterScalar(exponent)
                 reporter.CalcOp("Pow")
                 reporter.EnterVol(name)
@@ -3950,6 +3965,7 @@ class Simulation():
                 self.loss_map[e],
                 self.extraction_units.get("loss", {}).get(e, ""),
                 core_y_exponent,
+                normalized_by_one_tesla=True,
             )
             if native_contract:
                 restore_factor = _native_b_power_restore_factor(
@@ -4148,6 +4164,7 @@ class Simulation():
             "core_loss_native_attested": [core_loss_native_attested],
             "core_loss_margin_applied": [loss_margin],
             "Bavg_power_volume_integral": [b_power_integral_phys],
+            "Bavg_power_integral_normalized_by_one_tesla": [1],
             "native_core_report_group_count": [native_group_count],
             "native_core_report_piece_count": [native_piece_count],
             "native_core_report_expected_piece_count": [
@@ -5211,6 +5228,19 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             """EM 디자인 1개 생성: 지오메트리 + 여자 + 메시 + 경계 + 셋업"""
             sim.create_design(name=design_name)
             set_design_variables(sim.design1, sim.input_df)
+            reference = sim.design1.set_variable(
+                variable_name=B_POWER_REFERENCE_VARIABLE,
+                value=B_POWER_REFERENCE_T,
+                unit="tesla",
+            )
+            if reference is False:
+                raise RuntimeError(
+                    "failed to set exact 1-tesla B-power reference variable"
+                )
+            sim.df_plus["B_power_reference_T"] = [B_POWER_REFERENCE_T]
+            sim.df_plus["B_power_expression_basis"] = [
+                "(ComplxPeak(B)/1tesla)^core_y"
+            ]
             sim.create_core()
             sim.create_coil()
             sim.split_geometry()

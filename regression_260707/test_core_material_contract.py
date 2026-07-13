@@ -38,6 +38,7 @@ from module.input_parameter_260706 import (
 from module.modeling_260706 import create_core as create_core_geometry
 from module.thermal_260706 import LossAllocator, _assign_losses
 from run_simulation_260706 import (
+    B_POWER_REFERENCE_VARIABLE,
     Simulation,
     _b_power_volume_integral_si,
     _core_group_index,
@@ -216,6 +217,18 @@ class CoreMaterialArithmeticTests(unittest.TestCase):
         )
         self.assertEqual(
             _b_power_volume_integral_si(2.0, "tesla^1.74*m^3", 1.74), 2.0
+        )
+        self.assertAlmostEqual(
+            _b_power_volume_integral_si(
+                2.0, "mm^3", 1.74, normalized_by_one_tesla=True
+            ),
+            2e-9,
+        )
+        self.assertEqual(
+            _b_power_volume_integral_si(
+                2.0, "m^3", 1.74, normalized_by_one_tesla=True
+            ),
+            2.0,
         )
         with self.assertRaises(RuntimeError):
             _b_power_volume_integral_si(2.0, "T", 1.74)
@@ -565,6 +578,7 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
             def EnterQty(self, value): operations.append(("qty", value))
             def CalcOp(self, value): operations.append(("op", value))
             def EnterScalar(self, value): operations.append(("scalar", value))
+            def EnterScalarFunc(self, value): operations.append(("scalar_func", value))
             def EnterVol(self, value): operations.append(("vol", value))
 
         simulation = Simulation.__new__(Simulation)
@@ -577,7 +591,9 @@ class CoreMaterialSolverIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result, "Bpow_piece")
         self.assertEqual(operations, [
-            ("qty", "B"), ("op", "ComplxPeak"), ("scalar", Y),
+            ("qty", "B"), ("op", "ComplxPeak"),
+            ("scalar_func", B_POWER_REFERENCE_VARIABLE), ("op", "/"),
+            ("scalar", Y),
             ("op", "Pow"), ("vol", "core_2_leg_left"),
             ("op", "Integrate"),
         ])
