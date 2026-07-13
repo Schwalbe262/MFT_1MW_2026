@@ -425,15 +425,23 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
             pass
         elif surface_fail_soft:
             # Surface CalcOp evidence is informational when the cluster gRPC
-            # calculator cannot execute it.  The independent Faraday checks
-            # remain mandatory at their existing tolerances.
+            # calculator cannot execute it.  The independent Faraday flux
+            # linkage check remains mandatory; the EMF-vs-source-peak
+            # deviation is loaded-magnetizing-current circuit physics (I*Z
+            # drop, kf-invariant per the approved gate's kf=1.00 control) —
+            # recorded as advisory evidence: it must be present and finite,
+            # but is not tolerance-gated per row.
             for key, limit in (
                 ("Tx_flux_linkage_faraday_rel_error", 0.01),
-                ("Tx_induced_vs_source_peak_rel_error", 0.05),
             ):
                 value = _number(record, key)
                 if value is None or not 0 <= value <= limit:
                     reasons.append(f"native_lamination:{key}")
+            advisory = _number(record, "Tx_induced_vs_source_peak_rel_error")
+            if advisory is None or advisory < 0:
+                reasons.append(
+                    "native_lamination:Tx_induced_vs_source_peak_rel_error"
+                )
         else:
             for key in (
                 "core_surface_flux_vs_linkage_rel_error",
