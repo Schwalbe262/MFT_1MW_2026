@@ -40,6 +40,12 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "training"))
 sys.path.insert(0, os.path.join(HERE, "verify"))
 
+from model_targets import (
+    CORE_REGION_TEMPERATURE_TARGETS,
+    MANDATORY_SURROGATE_TEMPERATURE_TARGETS,
+    SURROGATE_TEMPERATURE_TARGETS,
+)
+
 RUNTIME_ROOT = HERE
 OUTPUT_ROOT = HERE
 AL_ROOT = os.path.join(OUTPUT_ROOT, "al_rounds")
@@ -68,14 +74,14 @@ SPEC = {
     "max_rounds": 10, "K": 33,
 }
 
-T_TARGETS = ["Tprobe_Tx_leeward_max", "Tprobe_Rx_main_leeward_max",
-             "Tprobe_Rx_side_leeward_max", "Tprobe_core_center_max"]
+T_TARGETS = list(SURROGATE_TEMPERATURE_TARGETS)
 
 ACTUAL_TEMPERATURES = {
     "Tprobe_Tx_leeward_max": "T_max_Tx",
     "Tprobe_Rx_main_leeward_max": "T_max_Rx_main",
     "Tprobe_Rx_side_leeward_max": "T_max_Rx_side",
     "Tprobe_core_center_max": "T_max_core",
+    **{target: target for target in CORE_REGION_TEMPERATURE_TARGETS},
 }
 TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 LOSS_COMPONENTS = (
@@ -232,9 +238,9 @@ def _assert_runtime_training_invariants(state):
 
 
 def _required_probe_targets(result):
-    targets = [T_TARGETS[0], T_TARGETS[1], T_TARGETS[3]]
+    targets = list(MANDATORY_SURROGATE_TEMPERATURE_TARGETS)
     if _finite(result.get("N2_side")) and float(result["N2_side"]) > 0:
-        targets.insert(2, T_TARGETS[2])
+        targets.insert(2, "Tprobe_Rx_side_leeward_max")
     return targets
 
 

@@ -21,6 +21,7 @@ EM_KEYS = ["P_core_total", "B_mean_core", "B_max_core", "P_Tx_main_group",
 T_KEYS = ["Tprobe_Tx_leeward_max", "Tprobe_Tx_side_max",
           "Tprobe_Rx_main_leeward_max", "Tprobe_Rx_main_side_max",
           "Tprobe_Rx_side_leeward_max", "Tprobe_Rx_side_side_max",
+          "Tprobe_Rx_side_outer_max", "Tprobe_Rx_side_inner_max",
           "Tprobe_core_center_max", "T_max_Tx", "T_max_Rx_main",
           "T_max_Rx_side", "T_max_core"]
 TIME_KEYS = ["time_matrix", "time_loss", "time_thermal", "time"]

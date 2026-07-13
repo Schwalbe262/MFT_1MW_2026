@@ -21,13 +21,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "training"))
 
-from optimization.nsga2_problem import MFTProblem, T_TARGETS, DEFAULT_SPEC  # noqa: E402
+from optimization.nsga2_problem import (  # noqa: E402
+    DEFAULT_SPEC,
+    MFTProblem,
+    NSGA_FIXED_THERMAL_STACK_MM,
+    T_TARGETS,
+)
+from optimization.design_summary import (  # noqa: E402
+    COMPONENT_LOSS_TARGETS,
+    pareto_design_summary,
+)
 from module.input_parameter_260706 import _SOBOL_DIMS  # noqa: E402
 
 REQUIRED_MODEL_TARGETS = [
     "Llt_phys", "k",
     "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
-    "B_max_core", "B_mean_core", *T_TARGETS,
+    *COMPONENT_LOSS_TARGETS,
+    # B_max remains a raw FEA diagnostic.  The optimizer uses the analytical
+    # bulk volt-second constraint and keeps B_mean only as a comparison model.
+    "B_mean_core", *T_TARGETS,
 ]
 MIN_STRICT_FULL_ROWS = 3000
 VETTED_QUALITY_THRESHOLDS = os.path.abspath(os.path.join(
@@ -133,6 +145,13 @@ def run_one(problem, seed, pop, warm_X=None, max_gen=600):
                           rng.random((pop - n_warm, problem.n_var))])
     else:
         init = FloatRandomSampling().do(problem, pop).get("X")
+
+    # Array-based warm/random sampling bypasses pymoo's sampler repair path.
+    # Project it explicitly so fixed normalized plate coordinates are honored
+    # in the chromosome as well as by the fail-closed physical decoder.
+    init = np.minimum(
+        np.maximum(np.asarray(init, dtype=float), problem.xl), problem.xu
+    )
 
     algo = NSGA2(pop_size=pop, sampling=init)
     term = DefaultMultiObjectiveTermination(ftol=0.0025, period=30, n_max_gen=max_gen)
@@ -282,10 +301,45 @@ def main():
     rows = []
     for i in range(len(Xp)):
         row = {"volume_L": Fp[i, 0], "total_loss_W": Fp[i, 1]}
-        for t, mdl in models.items():
+        predictions = {}
+        for t in REQUIRED_MODEL_TARGETS:
+            mdl = models[t]
             mu, sg = mdl.predict_mu_sigma(frame.iloc[[i]])
-            row[f"pred_{t}"] = float(mu[0])
+            predictions[t] = float(mu[0])
+            row[f"pred_{t}"] = predictions[t]
             row[f"sigma_{t}"] = float(sg[0])
+        summary = pareto_design_summary(
+            frame.iloc[i],
+            predictions,
+            Fp[i, 1],
+            leakage_target_uH=spec["Llt_target_uH"],
+            core_lamination_factor=spec["core_lamination_factor"],
+            B_area_basis=spec["B_area_basis"],
+        )
+        if not np.isclose(
+            summary["volume_L"], Fp[i, 0], rtol=1e-9, atol=1e-9
+        ):
+            raise RuntimeError(
+                "Pareto volume objective does not match decoded geometry"
+            )
+        # Some requested audit names (Ae_m2, n_core_group, wcp_len_pct)
+        # already exist in the authoritative decoded frame. Cross-check them
+        # and retain that original column once instead of emitting ambiguous
+        # duplicate CSV headers.
+        overlap = set(summary).intersection(frame.columns)
+        for column in overlap:
+            decoded_value = float(frame.iloc[i][column])
+            summary_value = float(summary[column])
+            if not np.isclose(
+                decoded_value, summary_value, rtol=1e-12, atol=1e-12
+            ):
+                raise RuntimeError(
+                    f"Pareto summary {column} does not match decoded geometry"
+                )
+        row.update({
+            key: value for key, value in summary.items()
+            if key not in overlap
+        })
         rows.append(row)
     front_path = os.path.join(out_dir, "pareto_front.csv")
     pd.concat([frame.reset_index(drop=True), pd.DataFrame(rows)], axis=1) \
@@ -335,6 +389,17 @@ def main():
                 "ftol": 0.0025, "period": 30, "max_generations": 600,
             },
             "effective_spec": spec,
+            "fixed_thermal_stack_mm": NSGA_FIXED_THERMAL_STACK_MM,
+            "reported_flux_density_basis": (
+                "B_design_analytic_T=V1_rms/"
+                "(4*freq*N1*Ae_effective_m2)"
+            ),
+            "reported_flux_density_waveform": "bipolar_square",
+            "reported_flux_density_denominator_coefficient": 4.0,
+            "flux_density_constraint": (
+                "B_design_analytic_T <= effective_spec.B_limit_T"
+            ),
+            "B_max_core_role": "diagnostic_only_not_an_optimization_constraint",
             "manufacturing_tolerance_policy": (
                 "excluded; exact-as-FEA geometry is assumed"
             ),

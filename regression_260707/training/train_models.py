@@ -101,6 +101,7 @@ def train_target(
     from sklearn.model_selection import KFold, train_test_split
 
     sub = filter_valid_training_rows(df, target)
+    revision_cohort = sub.attrs.get("physics_data_revision_cohort", "")
     sub = sub.dropna(subset=[target])
     sub = sub[np.isfinite(pd.to_numeric(sub[target], errors="coerce"))]
     if len(sub) < min_rows:
@@ -201,6 +202,7 @@ def train_target(
         "interval_p90_half_width_pct": float(
             np.quantile(relative_half_width, 0.9) * 100
         ),
+        "physics_data_revision_cohort": revision_cohort,
     }
     bundle = {
         "models": models,
@@ -208,6 +210,7 @@ def train_target(
         "transform": transform,
         "q90": q90,
         "target": target,
+        "physics_data_revision_cohort": revision_cohort,
         "metrics": metrics,
         "trained_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -573,6 +576,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
         ).encode("utf-8")
     ).hexdigest()
     target_reports = {}
+    target_revision_cohorts = {}
     artifact_sha256 = {}
     try:
         for target in targets:
@@ -616,6 +620,9 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             artifact_sha256[f"{target}/models.pkl"] = _sha256(model_path)
             artifact_sha256[f"{target}/meta.json"] = _sha256(meta_path)
             target_reports[target] = metrics
+            target_revision_cohorts[target] = bundle[
+                "physics_data_revision_cohort"
+            ]
             print(
                 f"{target:32s} R2={metrics['r2']:.4f} "
                 f"MAPE={metrics['mape_pct']:.2f}% "
@@ -635,6 +642,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             "profile_sha256": profile_sha256,
             "features": list(features),
             "targets": list(targets),
+            "target_physics_data_revision_cohorts": target_revision_cohorts,
             "artifacts": artifact_sha256,
             "report": target_reports,
         }

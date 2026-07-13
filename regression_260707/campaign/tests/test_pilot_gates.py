@@ -30,7 +30,7 @@ def pilot_capacity(queue_state="ready", project_active=0, queue_reason=None):
         "queue_submission_allowed": queue_allowed,
         "submission_allowed": queue_allowed and project_slots > 0,
         "project": pinned_pilot.MFT_PROJECT,
-        "project_max_active_tasks": 300,
+        "project_max_active_tasks": 400,
         "project_required_hard_cap": pinned_pilot.PILOT_PROJECT_HARD_CAP,
         "project_counts": {
             "queued": project_active, "attaching": 0, "running": 0},

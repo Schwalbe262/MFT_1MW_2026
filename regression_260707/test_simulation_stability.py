@@ -25,6 +25,7 @@ from run_simulation_260706 import (
     _em_result_is_valid,
     _em_result_validation,
     _edit_native_copied_loss_winding,
+    _matrix_source_signature,
     _native_winding_child,
     _parse_rl_matrix_export,
     _remap_copied_design_objects,
@@ -69,6 +70,12 @@ from module.thermal_260706 import (
     _thermal_convergence_telemetry,
     _volume_weighted_powers,
     run_thermal_analysis,
+)
+from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.thermal_probe_contract import (
+    RX_SIDE_FACE_MAX_RULE,
+    RX_SIDE_FACE_MEAN_RULE,
+    RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
 )
 
 
@@ -1295,6 +1302,63 @@ def _prepared_wrapper(raw, windings=None):
 
 
 class CopiedLossPreparationRetryTests(unittest.TestCase):
+    def test_matrix_solution_probe_stops_after_canonical_name_succeeds(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        project = _NativeLossProject(source)
+        original_get_module = source.GetModule
+        calls = []
+
+        def get_module(name):
+            if name != "Solutions":
+                return original_get_module(name)
+
+            def get_available_variations(sweep_name):
+                calls.append(sweep_name)
+                if sweep_name != "Setup1 : LastAdaptive":
+                    raise AssertionError("legacy fallback must not be probed")
+                return ["Freq='1000Hz'"]
+
+            return SimpleNamespace(
+                GetAvailableVariations=get_available_variations
+            )
+
+        source.GetModule = get_module
+
+        signature = _matrix_source_signature(project, "maxwell_matrix")
+
+        self.assertEqual(calls, ["Setup1 : LastAdaptive"])
+        self.assertEqual(signature["solution_marker"], ("Freq='1000Hz'",))
+
+    def test_matrix_solution_probe_uses_legacy_name_only_after_exception(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        project = _NativeLossProject(source)
+        original_get_module = source.GetModule
+        calls = []
+
+        def get_module(name):
+            if name != "Solutions":
+                return original_get_module(name)
+
+            def get_available_variations(sweep_name):
+                calls.append(sweep_name)
+                if sweep_name == "Setup1 : LastAdaptive":
+                    raise RuntimeError("canonical spelling unavailable")
+                return ["Freq='1000Hz'"]
+
+            return SimpleNamespace(
+                GetAvailableVariations=get_available_variations
+            )
+
+        source.GetModule = get_module
+
+        signature = _matrix_source_signature(project, "maxwell_matrix")
+
+        self.assertEqual(
+            calls,
+            ["Setup1 : LastAdaptive", "Setup1 : Last Adaptive"],
+        )
+        self.assertEqual(signature["solution_marker"], ("Freq='1000Hz'",))
+
     def test_native_winding_prefers_boundaries_when_alias_is_in_both_roots(self):
         boundary_child = _NativeTree(properties={"Current": "1A"})
         excitation_alias = _NativeTree(properties={"Current": "stale"})
@@ -3825,6 +3889,65 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"thermal_solved": [0]})))
         self.assertFalse(_thermal_result_is_valid(pd.DataFrame({"other": [1]})))
         self.assertFalse(_thermal_result_is_valid(None))
+
+    def test_new_physics_revision_requires_complete_rx_side_face_contract(self):
+        base = pd.DataFrame({
+            "physics_data_revision": [PHYSICS_DATA_REVISION],
+            "thermal_solved": [1],
+            "thermal_convergence_available": [1],
+            "thermal_converged": [1],
+            "thermal_iterations": [151],
+            "thermal_extraction_complete": [1],
+            "thermal_residual_flow_limit": [1e-3],
+            "thermal_residual_energy_limit": [1e-7],
+            "thermal_residual_continuity": [8e-4],
+            "thermal_residual_x_velocity": [4e-4],
+            "thermal_residual_y_velocity": [9e-4],
+            "thermal_residual_z_velocity": [4e-4],
+            "thermal_residual_energy": [4e-9],
+            "thermal_rx_model": ["homogenized_blocks"],
+            "thermal_rx_power_balance_ok": [1],
+            "thermal_rx_power_balance_group_count": [2],
+            "thermal_rx_power_balance_max_abs_w": [0.0],
+            "thermal_rx_expected_power_w": [120.0],
+            "thermal_rx_assigned_power_w": [120.0],
+            "thermal_required_group_mask": [15],
+            "thermal_symmetry": ["eighth"],
+            "T_max_Tx": [80.0], "T_max_Rx_main": [81.0],
+            "T_max_Rx_side": [82.0], "T_max_core": [83.0],
+            "Tprobe_Tx_leeward_max": [79.0],
+            "Tprobe_Rx_main_leeward_max": [80.0],
+            "Tprobe_Rx_side_leeward_max": [91.0],
+            "Tprobe_Rx_side_leeward_mean": [84.0],
+            "Tprobe_Rx_side_outer_max": [88.0],
+            "Tprobe_Rx_side_outer_mean": [82.0],
+            "Tprobe_Rx_side_inner_max": [91.0],
+            "Tprobe_Rx_side_inner_mean": [84.0],
+            "Tprobe_core_center_max": [82.0],
+            "thermal_rx_side_probe_contract_version": [
+                RX_SIDE_FACE_PROBE_CONTRACT_VERSION
+            ],
+            "thermal_rx_side_probe_max_rule": [RX_SIDE_FACE_MAX_RULE],
+            "thermal_rx_side_probe_mean_rule": [RX_SIDE_FACE_MEAN_RULE],
+            "thermal_rx_side_probe_selected_face": [
+                "Tprobe_Rx_side1_inner"
+            ],
+            "thermal_rx_side_probe_face_count": [2],
+        })
+        self.assertTrue(_thermal_result_is_valid(base))
+        missing_inner = base.drop(columns=["Tprobe_Rx_side_inner_max"])
+        self.assertFalse(_thermal_result_is_valid(missing_inner))
+        legacy = base.drop(columns=[
+            "physics_data_revision", "Tprobe_Rx_side_inner_max",
+            "Tprobe_Rx_side_inner_mean", "Tprobe_Rx_side_outer_max",
+            "Tprobe_Rx_side_outer_mean", "Tprobe_Rx_side_leeward_mean",
+            "thermal_rx_side_probe_contract_version",
+            "thermal_rx_side_probe_max_rule",
+            "thermal_rx_side_probe_mean_rule",
+            "thermal_rx_side_probe_selected_face",
+            "thermal_rx_side_probe_face_count",
+        ])
+        self.assertTrue(_thermal_result_is_valid(legacy))
 
     def test_thermal_exception_row_preserves_failure_provenance(self):
         frame = _thermal_failure_frame(RuntimeError("source assignment failed"))

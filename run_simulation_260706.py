@@ -23,6 +23,7 @@ import portalocker
 import os
 import re
 import json
+import hashlib
 import argparse
 import uuid
 import tempfile
@@ -94,6 +95,22 @@ from module.modeling_260706 import (
     create_winding_cooling_plates,
     create_coil_section,
 )
+from module.core_material_contract import (
+    LEG_STACKING_DIRECTION,
+    PHYSICS_DATA_REVISION,
+    YOKE_STACKING_DIRECTION,
+    faraday_lumped_core_reference,
+    material_flux_density_t,
+    native_lamination_material_specs,
+    sinusoidal_b_peak_material_t,
+    square_wave_b_material_t,
+    validate_native_lamination_readback,
+)
+from module.thermal_probe_contract import (
+    RX_SIDE_FACE_MAX_RULE,
+    RX_SIDE_FACE_MEAN_RULE,
+    RX_SIDE_FACE_PROBE_CONTRACT_VERSION,
+)
 
 from ansys.aedt.core import settings
 
@@ -112,6 +129,182 @@ from module.source_contract import SOLVER_REVISION_PATHS
 
 PLATE_COLOR = [144, 190, 144]
 PAD_COLOR = [200, 160, 200]
+B_POWER_REFERENCE_VARIABLE = "B_power_reference"
+B_POWER_REFERENCE_T = 1.0
+
+
+def _raw_aedt_material_props(materials, material_name):
+    """Return fresh native material data, bypassing PyAEDT's assigned cache."""
+    manager = getattr(materials, "omaterial_manager", None)
+    if manager is None or not callable(getattr(manager, "GetData", None)):
+        raise RuntimeError("AEDT material manager cannot provide native readback")
+    try:
+        raw = list(manager.GetData(str(material_name)))
+        from ansys.aedt.core.generic.data_handlers import _arg2dict
+
+        parsed = {}
+        _arg2dict(raw, parsed)
+    except Exception as exc:
+        raise RuntimeError(
+            f"native AEDT material readback failed for {material_name!r}"
+        ) from exc
+    if len(parsed) != 1:
+        raise RuntimeError(
+            f"unexpected native material payload for {material_name!r}: "
+            f"top-level keys={list(parsed)}"
+        )
+    props = next(iter(parsed.values()))
+    if not isinstance(props, dict) or not props:
+        raise RuntimeError(
+            f"native AEDT material payload is empty for {material_name!r}"
+        )
+    return props
+
+
+def _core_group_index(object_name):
+    """Extract the depth-group index from legacy or segmented core names."""
+    match = re.fullmatch(r"core_(\d+)(?:_(?:leg_(?:left|center|right)|yoke_(?:top|bottom)))?", str(object_name))
+    if not match:
+        raise RuntimeError(f"unrecognized core object name: {object_name!r}")
+    return int(match.group(1))
+
+
+_NATIVE_CORE_REGION_ORDER = (
+    "leg_left",
+    "leg_center",
+    "leg_right",
+    "yoke_bottom",
+    "yoke_top",
+)
+
+
+def _native_core_report_plan(
+        core_groups, sym_cut_counter, *, require_complete_groups=False):
+    """Validate native core coverage and topology by symmetry-cut count.
+
+    Full models require all five canonical pieces; symmetry models cover the
+    exact surviving subset after the geometry split.  The returned batches are
+    retained for diagnostic provenance only; production loss validation uses
+    the independent Python Faraday/POWERLITE/mass reference.
+    """
+    ordered_groups = []
+    all_names = []
+    batches = {}
+    for group_index, pieces in sorted(core_groups.items()):
+        by_name = {}
+        for piece in pieces:
+            name = str(piece if isinstance(piece, str) else piece.name)
+            if name in by_name:
+                raise RuntimeError(
+                    f"duplicate native core report object: {name!r}"
+                )
+            by_name[name] = piece
+
+        expected_names = tuple(
+            f"core_{group_index}_{region}"
+            for region in _NATIVE_CORE_REGION_ORDER
+        )
+        unexpected = sorted(set(by_name) - set(expected_names))
+        missing = sorted(set(expected_names) - set(by_name))
+        if unexpected or (require_complete_groups and missing):
+            raise RuntimeError(
+                "native core report coverage mismatch for group "
+                f"{group_index}: missing={missing}, unexpected={unexpected}"
+            )
+
+        retained_names = tuple(name for name in expected_names if name in by_name)
+        if not retained_names:
+            raise RuntimeError(
+                f"native core report group {group_index} has no retained objects"
+            )
+        ordered_pieces = tuple(by_name[name] for name in retained_names)
+        cut_counts = {int(sym_cut_counter(name)) for name in retained_names}
+        if len(cut_counts) != 1:
+            raise RuntimeError(
+                "native core group spans multiple symmetry-cut counts: "
+                f"group={group_index}, cuts={sorted(cut_counts)}"
+            )
+        cut_count = cut_counts.pop()
+        ordered_groups.append((int(group_index), ordered_pieces))
+        all_names.extend(retained_names)
+        batches.setdefault(cut_count, []).extend(ordered_pieces)
+
+    if len(all_names) != len(set(all_names)):
+        raise RuntimeError("native core report coverage contains duplicate objects")
+    if not all_names:
+        raise RuntimeError("native core report coverage is empty")
+
+    membership_text = "\n".join(all_names)
+    return {
+        "groups": tuple(ordered_groups),
+        "batches": tuple(
+            (cut_count, tuple(pieces))
+            for cut_count, pieces in sorted(batches.items())
+        ),
+        "object_names": tuple(all_names),
+        "membership_sha256": hashlib.sha256(
+            membership_text.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _native_b_power_restore_factor(cut_count, core_y, loss_is_sym):
+    """Return the exact full-model volume/amplitude factor for one cut class."""
+    if not loss_is_sym:
+        return 1.0
+    cut_count = int(cut_count)
+    core_y = float(core_y)
+    if cut_count not in (0, 1, 2, 3):
+        raise ValueError(f"invalid native symmetry-cut count: {cut_count!r}")
+    mirror_factor = 1.0 if cut_count == 3 else 2.0
+    return (2.0 ** cut_count) / (2.0 ** core_y) * mirror_factor
+
+
+def _raw_aedt_object_attribute(obj, property_name):
+    """Read one geometry attribute directly from AEDT's native editor."""
+    editor = getattr(obj, "_oeditor", None)
+    getter = getattr(editor, "GetPropertyValue", None)
+    if not callable(getter):
+        raise RuntimeError(
+            f"native editor readback unavailable for {getattr(obj, 'name', obj)!r}"
+        )
+    try:
+        value = getter(
+            "Geometry3DAttributeTab", str(obj.name), str(property_name)
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"native object {property_name} readback failed for {obj.name!r}"
+        ) from exc
+    if value is None or str(value).strip() == "":
+        raise RuntimeError(
+            f"native object {property_name} readback empty for {obj.name!r}"
+        )
+    return str(value).strip().strip('"')
+
+
+def _sheet_area_model_units(sheet):
+    """Read one sheet area through PyAEDT's FacePrimitive API."""
+    name = getattr(sheet, "name", sheet)
+    try:
+        faces = list(sheet.faces)
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot enumerate faces for sheet {name!r}"
+        ) from exc
+    if len(faces) != 1:
+        raise RuntimeError(
+            f"sheet {name!r} must expose exactly one face, got {len(faces)}"
+        )
+    try:
+        area = abs(float(faces[0].area))
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot read face area for sheet {name!r}"
+        ) from exc
+    if not math.isfinite(area) or area <= 0:
+        raise RuntimeError(f"invalid sheet area for {name!r}: {area!r}")
+    return area
 
 
 def _git_provenance():
@@ -169,6 +362,8 @@ _SOLUTION_UNIT_FACTORS = {
     "ma": 1e-3, "a": 1.0, "ka": 1e3,
     "ph": 1e-12, "nh": 1e-9, "uh": 1e-6, "mh": 1e-3, "h": 1.0,
     "nw": 1e-9, "uw": 1e-6, "mw": 1e-3, "w": 1.0, "kw": 1e3, "megaw": 1e6,
+    "uv": 1e-6, "mv": 1e-3, "v": 1.0, "kv": 1e3,
+    "uwb": 1e-6, "mwb": 1e-3, "wb": 1.0,
     "ut": 1e-6, "mt": 1e-3, "t": 1.0, "tesla": 1.0,
     "rad": 180.0 / math.pi, "deg": 1.0,
 }
@@ -189,6 +384,45 @@ def _convert_solution_unit(value, source_unit, target_unit):
         logging.warning(f"unknown SolutionData unit conversion '{source_unit}' -> '{target_unit}'")
         return float(value)
     return float(value) * source_factor / target_factor
+
+
+def _b_power_volume_integral_si(
+        value, unit, exponent, *, normalized_by_one_tesla=False):
+    """Normalize a B-power integral to the numeric T**y*m**3 moment.
+
+    When the calculator expression uses ``(B / 1 tesla)**y``, its reported
+    unit is volume only while its numerical value is exactly the desired
+    moment with B expressed in tesla.
+    """
+    number = float(value)
+    exponent = float(exponent)
+    if not math.isfinite(number) or number < 0:
+        raise RuntimeError(f"invalid B-power volume integral: {value!r}")
+    raw = str(unit or "").strip().lower().replace(" ", "")
+    raw = raw.replace("³", "^3").replace("tesla", "t")
+    if (not normalized_by_one_tesla) and (not raw or "t" not in raw):
+        raise RuntimeError(
+            f"B-power integral unit lacks tesla basis: {unit!r}"
+        )
+    if (not normalized_by_one_tesla) and not any(
+            token in raw for token in (str(exponent), f"^{exponent:g}")):
+        # Some AEDT builds omit a fractional exponent from the display unit.
+        # Accept a generic powered-T marker, but never silently accept plain T.
+        if "t^" not in raw and "pow" not in raw:
+            raise RuntimeError(
+                f"B-power integral unit lacks exponent {exponent:g}: {unit!r}"
+            )
+    if "mm^3" in raw or "mm3" in raw:
+        volume_factor = 1e-9
+    elif "cm^3" in raw or "cm3" in raw:
+        volume_factor = 1e-6
+    elif "meter^3" in raw or "m^3" in raw or re.search(r"(?<![a-z])m3(?![a-z])", raw):
+        volume_factor = 1.0
+    else:
+        raise RuntimeError(
+            f"unsupported or ambiguous B-power volume unit: {unit!r}"
+        )
+    return number * volume_factor
 
 
 _RL_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?"
@@ -462,9 +696,16 @@ SIDE_THERMAL_TEMPERATURE_COLUMNS = (
     "T_max_Rx_side",
     "Tprobe_Rx_side_leeward_max",
 )
+STACKING_REVISION_SIDE_THERMAL_TEMPERATURE_COLUMNS = (
+    "Tprobe_Rx_side_leeward_mean",
+    "Tprobe_Rx_side_outer_max",
+    "Tprobe_Rx_side_outer_mean",
+    "Tprobe_Rx_side_inner_max",
+    "Tprobe_Rx_side_inner_mean",
+)
 
 
-def _thermal_result_is_valid(frame):
+def _thermal_result_is_valid(frame, physics_data_revision=None):
     """Return True only when every required thermal group passed extraction."""
     if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
         return False
@@ -532,6 +773,48 @@ def _thermal_result_is_valid(frame):
         required = list(MANDATORY_THERMAL_TEMPERATURE_COLUMNS)
         if required_mask & group_bits["T_max_Rx_side"]:
             required.extend(SIDE_THERMAL_TEMPERATURE_COLUMNS)
+        physics_revision = str(
+            physics_data_revision
+            if physics_data_revision is not None
+            else frame.get(
+                "physics_data_revision", pd.Series([""])
+            ).iloc[0]
+        ).strip()
+        if (
+            required_mask & group_bits["T_max_Rx_side"]
+            and physics_revision == PHYSICS_DATA_REVISION
+        ):
+            required.extend(
+                STACKING_REVISION_SIDE_THERMAL_TEMPERATURE_COLUMNS
+            )
+            if str(frame["thermal_rx_side_probe_contract_version"].iloc[0]) != (
+                RX_SIDE_FACE_PROBE_CONTRACT_VERSION
+            ):
+                return False
+            if str(frame["thermal_rx_side_probe_max_rule"].iloc[0]) != (
+                RX_SIDE_FACE_MAX_RULE
+            ):
+                return False
+            if str(frame["thermal_rx_side_probe_mean_rule"].iloc[0]) != (
+                RX_SIDE_FACE_MEAN_RULE
+            ):
+                return False
+            selected_face = str(
+                frame["thermal_rx_side_probe_selected_face"].iloc[0]
+            )
+            if selected_face not in {
+                "Tprobe_Rx_side_side", "Tprobe_Rx_side1_inner",
+                "Tprobe_Rx_side2_side", "Tprobe_Rx_side2_inner",
+            }:
+                return False
+            mode = str(frame.get(
+                "thermal_symmetry", pd.Series(["eighth"])
+            ).iloc[0]).strip().lower()
+            expected_face_count = 4 if mode == "full" else 2
+            if int(frame["thermal_rx_side_probe_face_count"].iloc[0]) != (
+                expected_face_count
+            ):
+                return False
         temperatures = [float(frame[column].iloc[0]) for column in required]
         return all(
             math.isfinite(value)
@@ -916,6 +1199,10 @@ def _matrix_source_signature(project, source_name, require_solved=True):
                 values = solution_module.GetAvailableVariations(sweep_name) or []
                 queried = True
                 variations.extend(str(item) for item in values)
+                # AEDT logs an invalid sweep spelling as a GUI macro error even
+                # when Python catches the exception.  Do not probe the legacy
+                # fallback after one spelling has already been accepted.
+                break
             except Exception:
                 continue
         solution_marker = tuple(sorted(set(variations))) if queried else None
@@ -1581,6 +1868,7 @@ class Simulation():
         self.solve_attempts = {"matrix": 0, "loss": 0}
         self.extraction_attempts = {}
         self.extraction_backends = {}
+        self.extraction_units = {}
         self.spawned_descendants = {}
 
     def create_simulation_name(self):
@@ -1824,17 +2112,137 @@ class Simulation():
             mat.permeability = 1
             mat.thermal_conductivity = 0.2  # W/(m*K)
 
-    def create_core(self):
-        # 2605SA1/1K101 코어손실 계수 [W/m^3, Hz 기준] (데이터시트 kHz 계수에서 변환됨)
-        # 재질은 프로젝트 스코프이므로 두 번째 디자인에서는 재사용
-        if "power_ferrite" not in self.design1.materials.material_keys:
-            self.design1.set_power_ferrite(
-                cm=float(self.df_plus["core_cm"].iloc[0]),
-                x=float(self.df_plus["core_x"].iloc[0]),
-                y=float(self.df_plus["core_y"].iloc[0])
+    def _configure_1k101_native_material(self, material_name, direction):
+        """Create/update one wound-core orientation and attest native AEDT data."""
+        cm = float(self.df_plus["core_cm_assigned"].iloc[0])
+        core_x = float(self.df_plus["core_x"].iloc[0])
+        core_y = float(self.df_plus["core_y"].iloc[0])
+        kf = float(self.df_plus["core_lamination_factor"].iloc[0])
+        specs = native_lamination_material_specs(kf)
+        region = "leg" if direction == LEG_STACKING_DIRECTION else "yoke"
+        if specs[region]["stacking_direction"] != direction:
+            raise RuntimeError(f"internal stacking-direction mismatch for {region}")
+
+        materials = self.design1.materials
+        base_name = "power_ferrite"
+        if base_name not in materials.material_keys:
+            created = self.design1.set_power_ferrite(
+                cm=cm, x=core_x, y=core_y
             )
-        self.power_ferrite_mat = self.design1.materials["power_ferrite"]
-        self.power_ferrite_mat.permeability = "3000"
+            if created is False:
+                raise RuntimeError("failed to create base POWERLITE material")
+        base = materials[base_name]
+        if base is None:
+            raise RuntimeError("base POWERLITE material is unavailable")
+        base.permeability = "3000"
+        base.conductivity = 0
+        set_loss = getattr(base, "set_power_ferrite_coreloss", None)
+        if not callable(set_loss) or set_loss(
+            cm=cm, x=core_x, y=core_y, kdc=0, cut_depth=0.0
+        ) is False:
+            raise RuntimeError("failed to apply base POWERLITE core-loss law")
+
+        if material_name not in materials.material_keys:
+            material = materials.duplicate_material(base_name, material_name)
+        else:
+            material = materials[material_name]
+        if material is None or material is False:
+            raise RuntimeError(f"failed to create native material {material_name!r}")
+
+        # Reapply every solver-relevant property because project materials are
+        # shared by copied designs and may otherwise retain stale values.
+        material.permeability = "3000"
+        material.conductivity = 0
+        set_loss = getattr(material, "set_power_ferrite_coreloss", None)
+        if not callable(set_loss) or set_loss(
+            cm=cm, x=core_x, y=core_y, kdc=0, cut_depth=0.0
+        ) is False:
+            raise RuntimeError(
+                f"failed to apply POWERLITE law to {material_name!r}"
+            )
+        material.stacking_type = specs[region]["stacking_type"]
+        material.stacking_factor = specs[region]["stacking_factor"]
+        material.stacking_direction = specs[region]["stacking_direction"]
+
+        raw_props = _raw_aedt_material_props(materials, material_name)
+        attestation = validate_native_lamination_readback(
+            raw_props,
+            lamination_factor=kf,
+            stacking_direction=direction,
+            cm_base=cm,
+            core_x=core_x,
+            core_y=core_y,
+            permeability=3000.0,
+        )
+        return material, attestation
+
+    def create_core(self):
+        # Keep the traceable POWERLITE base law in Maxwell.  The new physics
+        # revision uses AEDT's native Lamination model and splits the XZ frame
+        # into V(1) legs and V(3) yokes.  Legacy revisions keep the old single
+        # solid so sealed b171 candidates remain interpretable.
+        cm_assigned = float(self.df_plus["core_cm_assigned"].iloc[0])
+        core_x = float(self.df_plus["core_x"].iloc[0])
+        core_y = float(self.df_plus["core_y"].iloc[0])
+        revision = (
+            str(self.df_plus["physics_data_revision"].iloc[0]).strip()
+            if "physics_data_revision" in self.df_plus.columns else ""
+        )
+        native_stacking = revision == PHYSICS_DATA_REVISION
+
+        if native_stacking:
+            leg_name = "power_ferrite_1k101_leg_v1"
+            yoke_name = "power_ferrite_1k101_yoke_v3"
+            leg_mat, leg_attestation = self._configure_1k101_native_material(
+                leg_name, LEG_STACKING_DIRECTION
+            )
+            yoke_mat, yoke_attestation = self._configure_1k101_native_material(
+                yoke_name, YOKE_STACKING_DIRECTION
+            )
+            self.power_ferrite_mat = leg_mat
+            self.core_material_native_attestation = {
+                "physics_data_revision": revision,
+                "leg": leg_attestation,
+                "yoke": yoke_attestation,
+            }
+            self.df_plus["core_native_material_readback_attested"] = [1]
+            self.df_plus["core_native_leg_material_name"] = [leg_name]
+            self.df_plus["core_native_yoke_material_name"] = [yoke_name]
+            self.df_plus["core_native_leg_stacking_direction_readback"] = [
+                leg_attestation["stacking_direction"]
+            ]
+            self.df_plus["core_native_yoke_stacking_direction_readback"] = [
+                yoke_attestation["stacking_direction"]
+            ]
+            self.df_plus["core_native_leg_stacking_factor_readback"] = [
+                leg_attestation["stacking_factor"]
+            ]
+            self.df_plus["core_native_yoke_stacking_factor_readback"] = [
+                yoke_attestation["stacking_factor"]
+            ]
+            self.df_plus["core_native_cm_readback"] = [
+                leg_attestation["core_loss_cm"]
+            ]
+        else:
+            leg_name = yoke_name = "power_ferrite"
+            if "power_ferrite" not in self.design1.materials.material_keys:
+                self.design1.set_power_ferrite(
+                    cm=cm_assigned, x=core_x, y=core_y
+                )
+            self.power_ferrite_mat = self.design1.materials["power_ferrite"]
+            update_core_loss = getattr(
+                self.power_ferrite_mat, "set_power_ferrite_coreloss", None
+            )
+            if not callable(update_core_loss) or update_core_loss(
+                cm=cm_assigned, x=core_x, y=core_y
+            ) is False:
+                raise RuntimeError("failed to apply legacy core-loss contract")
+            self.power_ferrite_mat.permeability = "3000"
+            self.core_material_native_attestation = {
+                "physics_data_revision": revision or "legacy_unspecified",
+                "native_lamination": False,
+            }
+            self.df_plus["core_native_material_readback_attested"] = [0]
 
         self.create_thermal_pad_material()
 
@@ -1845,16 +2253,147 @@ class Simulation():
         core_objs, plate_objs, pad_objs = create_core(
             design=self.design1,
             name="core",
-            core_material="power_ferrite",
+            core_material=leg_name,
             n_group=n_group,
             plate_material="aluminum",
             pad_material="thermal_pad",
             plate_on=plate_on,
             pad_on=pad_on,
             plate_color=PLATE_COLOR,
-            pad_color=PAD_COLOR
+            pad_color=PAD_COLOR,
+            segmented_lamination=native_stacking,
+            core_material_leg=leg_name,
+            core_material_yoke=yoke_name,
         )
+        if native_stacking:
+            expected_regions = {
+                "leg_left", "leg_center", "leg_right",
+                "yoke_bottom", "yoke_top",
+            }
+            by_group = {index: set() for index in range(1, n_group + 1)}
+            for obj in core_objs:
+                index = _core_group_index(obj.name)
+                prefix = f"core_{index}_"
+                by_group.setdefault(index, set()).add(obj.name[len(prefix):])
+                expected_material = (
+                    leg_name if "_leg_" in obj.name else yoke_name
+                ).casefold()
+                actual_material = _raw_aedt_object_attribute(
+                    obj, "Material"
+                ).casefold()
+                if actual_material != expected_material:
+                    raise RuntimeError(
+                        f"core material assignment mismatch for {obj.name}: "
+                        f"{actual_material!r} != {expected_material!r}"
+                    )
+                orientation = _raw_aedt_object_attribute(obj, "Orientation")
+                if orientation != "Global":
+                    raise RuntimeError(
+                        f"core object orientation mismatch for {obj.name}: "
+                        f"{orientation!r} != 'Global'"
+                    )
+            drift = {
+                index: sorted(regions)
+                for index, regions in by_group.items()
+                if regions != expected_regions
+            }
+            if drift or len(core_objs) != 5 * n_group:
+                raise RuntimeError(
+                    "segmented core topology mismatch: "
+                    f"count={len(core_objs)}, groups={drift or by_group}"
+                )
+            expected_total_mm3 = float(
+                self.df_plus["core_vol_gross_m3"].iloc[0]
+            ) * 1e9
+            actual_total_mm3 = sum(abs(float(obj.volume)) for obj in core_objs)
+            volume_rel_error = abs(
+                actual_total_mm3 - expected_total_mm3
+            ) / max(abs(expected_total_mm3), 1e-12)
+            if not math.isfinite(volume_rel_error) or volume_rel_error > 1e-9:
+                raise RuntimeError(
+                    "segmented core gross-volume preservation failed: "
+                    f"actual={actual_total_mm3:.12g}mm3, "
+                    f"expected={expected_total_mm3:.12g}mm3, "
+                    f"relative_error={volume_rel_error:.6g}"
+                )
+            center_area_mm2 = sum(
+                abs(float(obj.volume))
+                for obj in core_objs if obj.name.endswith("_leg_center")
+            ) / float(self.df_plus["h1"].iloc[0])
+            expected_center_area_mm2 = float(
+                self.df_plus["Ae_gross_m2"].iloc[0]
+            ) * 1e6
+            area_rel_error = abs(
+                center_area_mm2 - expected_center_area_mm2
+            ) / max(abs(expected_center_area_mm2), 1e-12)
+            if area_rel_error > 1e-9:
+                raise RuntimeError(
+                    "segmented center-leg gross-area preservation failed: "
+                    f"actual={center_area_mm2:.12g}mm2, "
+                    f"expected={expected_center_area_mm2:.12g}mm2"
+                )
+            density = float(self.df_plus["core_mass_density_kg_m3"].iloc[0])
+            actual_mass_kg = actual_total_mm3 * 1e-9 * density
+            expected_mass_kg = float(
+                self.df_plus["core_mass_gross_kg"].iloc[0]
+            )
+            mass_rel_error = abs(actual_mass_kg - expected_mass_kg) / max(
+                abs(expected_mass_kg), 1e-12
+            )
+            if mass_rel_error > 1e-9:
+                raise RuntimeError(
+                    "segmented core gross-mass preservation failed: "
+                    f"actual={actual_mass_kg:.12g}kg, "
+                    f"expected={expected_mass_kg:.12g}kg"
+                )
+            self.df_plus["core_segmented_piece_count"] = [len(core_objs)]
+            self.df_plus["core_segmented_area_rel_error"] = [area_rel_error]
+            self.df_plus["core_segmented_volume_rel_error"] = [volume_rel_error]
+            self.df_plus["core_segmented_mass_rel_error"] = [mass_rel_error]
+
+        stack_expr = (
+            "(core_plate_t + 2*core_plate_pad_t)" if pad_on
+            else "core_plate_t"
+        )
+        depth_expr = f"((w1 - {n_group + 1}*{stack_expr})/{n_group})"
+        core_flux_sheets = []
+        for index in range(n_group):
+            y0 = (
+                f"(-w1/2 + {index + 1}*{stack_expr} "
+                f"+ {index}*{depth_expr})"
+            )
+            sheet = self.design1.modeler.create_rectangle(
+                orientation="XY",
+                origin=["-l1", y0, "0mm"],
+                sizes=["2*l1", depth_expr],
+                name=f"core_flux_section_{index + 1}",
+            )
+            if sheet is None or sheet is False:
+                raise RuntimeError(
+                    f"failed to create core flux section {index + 1}"
+                )
+            sheet.model = False
+            core_flux_sheets.append(sheet)
+        full_flux_area_m2 = sum(
+            _sheet_area_model_units(sheet) for sheet in core_flux_sheets
+        ) * 1e-6
+        expected_full_flux_area_m2 = float(
+            self.df_plus["Ae_gross_m2"].iloc[0]
+        )
+        full_flux_area_rel_error = abs(
+            full_flux_area_m2 - expected_full_flux_area_m2
+        ) / max(abs(expected_full_flux_area_m2), 1e-12)
+        if full_flux_area_rel_error > 1e-9:
+            raise RuntimeError(
+                "full core flux-section area mismatch: "
+                f"actual={full_flux_area_m2:.12g}m2, "
+                f"expected={expected_full_flux_area_m2:.12g}m2"
+            )
+        self.df_plus["core_flux_section_full_area_rel_error"] = [
+            full_flux_area_rel_error
+        ]
         self.design1.core_objs = core_objs
+        self.design1.core_flux_sheets = core_flux_sheets
         self.design1.core_plates = plate_objs
         self.design1.core_pads = pad_objs
 
@@ -2062,10 +2601,12 @@ class Simulation():
         if self.full_model:
             return
 
-        geometrys = (self.design1.core_objs + self.design1.core_plates + self.design1.core_pads
+        geometrys = (self.design1.core_objs
+                     + self.design1.core_plates + self.design1.core_pads
                      + self.design1.wcp_plates + self.design1.wcp_pads
                      + self.design1.Tx_windings_main + self.design1.Rx_windings_main
                      + self.design1.Tx_windings_side + self.design1.Rx_windings_side)
+        flux_sheets = list(self.design1.core_flux_sheets)
 
         # 분할 순서대로 진행하되, 앞 분할에서 통째로 삭제된 오브젝트를 다음 호출에 넘기지 않음
         # (넘기면 AEDT가 'Part not found' 경고를 배치로 뿜음 - 무해하지만 소음)
@@ -2076,13 +2617,47 @@ class Simulation():
         self.design1.modeler.split(assignment=geometrys, plane="XY", sides="PositiveOnly")
         geometrys = _alive(geometrys)
         self.design1.modeler.split(assignment=geometrys, plane="XZ", sides="PositiveOnly")
+        # Flux sheets are exactly coplanar with XY (z=0), so do not submit them
+        # to the ambiguous z split. They only need the y>=0 and x<=0 cuts.
+        self.design1.modeler.split(
+            assignment=flux_sheets, plane="XZ", sides="PositiveOnly"
+        )
         geometrys = _alive(geometrys)
+        flux_sheets = _alive(flux_sheets)
         self.design1.modeler.split(assignment=geometrys, plane="YZ", sides="NegativeOnly")
+        self.design1.modeler.split(
+            assignment=flux_sheets, plane="YZ", sides="NegativeOnly"
+        )
 
         # 대칭 분할로 완전히 잘려나간 오브젝트(y<0 쪽 콜드플레이트/냉각판 등)를 리스트에서 제거
         # (이후 eddy 설정/손실 계산이 존재하지 않는 오브젝트를 참조하지 않도록)
         existing = set(self.design1.modeler.object_names)
         self.design1.core_objs = [o for o in self.design1.core_objs if o.name in existing]
+        self.design1.core_flux_sheets = [
+            o for o in self.design1.core_flux_sheets if o.name in existing
+        ]
+        if not self.design1.core_flux_sheets:
+            raise RuntimeError("symmetry split removed every core flux section")
+        retained_flux_area_m2 = sum(
+            _sheet_area_model_units(sheet)
+            for sheet in self.design1.core_flux_sheets
+        ) * 1e-6
+        expected_flux_area_m2 = float(
+            self.df_plus["Ae_gross_m2"].iloc[0]
+        ) / 4.0
+        flux_area_rel_error = abs(
+            retained_flux_area_m2 - expected_flux_area_m2
+        ) / max(abs(expected_flux_area_m2), 1e-12)
+        if flux_area_rel_error > 1e-9:
+            raise RuntimeError(
+                "symmetry core flux-section area mismatch: "
+                f"retained={retained_flux_area_m2:.12g}m2, "
+                f"expected={expected_flux_area_m2:.12g}m2, "
+                f"relative_error={flux_area_rel_error:.6g}"
+            )
+        self.df_plus["core_flux_section_symmetry_area_rel_error"] = [
+            flux_area_rel_error
+        ]
         self.design1.core_plates = [o for o in self.design1.core_plates if o.name in existing]
         self.design1.core_pads = [o for o in self.design1.core_pads if o.name in existing]
         self.design1.wcp_plates = [o for o in self.design1.wcp_plates if o.name in existing]
@@ -2661,6 +3236,14 @@ class Simulation():
         if len(expressions) != len(aliases):
             raise ValueError("expressions and aliases must have the same length")
         target_units = target_units or {}
+        # Some verification/replay callers construct a lightweight Simulation
+        # shell without invoking __init__.  Lazily create telemetry maps so
+        # extraction correctness does not depend on constructor side effects.
+        for attribute in (
+            "extraction_attempts", "extraction_backends", "extraction_units"
+        ):
+            if not isinstance(getattr(self, attribute, None), dict):
+                setattr(self, attribute, {})
         last_error = None
         backend = (
             "get_solution_data_per_variation"
@@ -2693,6 +3276,10 @@ class Simulation():
                     last_error = RuntimeError(f"{backend} returned no usable response")
                 else:
                     units = getattr(solution, "units_data", {}) or {}
+                    self.extraction_units[extraction_key] = {
+                        expression: str(units.get(expression, "") or "")
+                        for expression in expressions
+                    }
                     row = {}
                     missing = []
                     for expression, alias in zip(expressions, aliases):
@@ -2933,10 +3520,16 @@ class Simulation():
 
     def _export_field_report(self, report_name, Y_components):
         # Kept as a compatibility-shaped helper for callers; no AEDT report/file is created.
-        target_units = {
-            expression: ("T" if expression.startswith("B_") else "W")
-            for expression in Y_components
-        }
+        target_units = {}
+        for expression in Y_components:
+            if expression.startswith(("B_mean_", "B_max_")):
+                target_units[expression] = "T"
+            elif expression.startswith("Phi_"):
+                target_units[expression] = "Wb"
+            elif expression.startswith("P_"):
+                target_units[expression] = "W"
+            # Bpow_* deliberately retains its compound T**y*volume unit.  It
+            # is validated and normalized explicitly before use.
         return self._solution_data_frame(
             Y_components,
             target_units=target_units,
@@ -3081,6 +3674,11 @@ class Simulation():
         def _build(reporter):
             if quantity == "B_peak":
                 reporter.EnterQty("B")
+                # Maxwell AC Magnetic 2025.2 rejects CalcOp("ComplxPeak") at
+                # the gRPC calculator boundary.  Retain the established,
+                # supported standard extraction path and label its semantics
+                # explicitly in every result row.  It is a diagnostic complex
+                # vector norm and is not used for the independent loss formula.
                 reporter.CalcOp("CmplxMag")
                 reporter.CalcOp("Mag")
             else:
@@ -3100,6 +3698,59 @@ class Simulation():
                 reporter.CalcOp("Integrate")
                 if i > 0:
                     reporter.CalcOp("+")
+
+        return self._add_field_expression(expr_name, _build)
+
+    def _calc_group_b_power_integral(self, objs, exponent, expr_name):
+        """Legacy postprocess diagnostic; never used by the production gate."""
+        exponent = float(exponent)
+        if not math.isfinite(exponent) or exponent <= 0:
+            raise ValueError(f"invalid B exponent: {exponent!r}")
+
+        def _build(reporter):
+            for i, obj in enumerate(objs):
+                name = obj if isinstance(obj, str) else obj.name
+                reporter.EnterQty("B")
+                reporter.CalcOp("ComplxPeak")
+                # Fractional powers of a dimensional field are rejected by
+                # AEDT 2025.2's scalar Pow operation.  Normalize by the exact
+                # 1-tesla design variable first; the resulting dimensionless
+                # field has the same numerical value as B expressed in tesla.
+                reporter.EnterScalarFunc(B_POWER_REFERENCE_VARIABLE)
+                reporter.CalcOp("/")
+                reporter.EnterScalar(exponent)
+                reporter.CalcOp("Pow")
+                reporter.EnterVol(name)
+                reporter.CalcOp("Integrate")
+                if i > 0:
+                    reporter.CalcOp("+")
+
+        return self._add_field_expression(expr_name, _build)
+
+    def _calc_core_flux_integral(self, sheets, expr_name):
+        """Integrate complex +Z B through center-leg XY section sheets.
+
+        The +Z component is explicit because Maxwell warns that a standalone
+        sheet's implicit normal can be ill-defined.  All section sheets use the
+        same XY orientation and the complex phasors are summed before taking a
+        magnitude, so no per-sheet sign cancellation is hidden.
+        """
+        sheets = list(sheets)
+        if not sheets:
+            raise RuntimeError("no center-leg section sheets for flux integral")
+
+        def _build(reporter):
+            for index, sheet in enumerate(sheets):
+                name = sheet if isinstance(sheet, str) else sheet.name
+                reporter.EnterQty("B")
+                reporter.CalcOp("ScalarZ")
+                reporter.EnterSurf(name)
+                reporter.CalcOp("SurfaceValue")
+                reporter.CalcOp("Integrate")
+                if index > 0:
+                    reporter.CalcOp("+")
+            # Take magnitude only after summing complex flux phasors.
+            reporter.CalcOp("CmplxMag")
 
         return self._add_field_expression(expr_name, _build)
 
@@ -3132,15 +3783,88 @@ class Simulation():
           - 권선 그룹 총손실 + explicit 턴별 손실 (열해석 배분용) -> self.loss_map
         """
         n_exp = int(self.df_plus["n_explicit_turns"].iloc[0])
+        revision = (
+            str(self.df_plus["physics_data_revision"].iloc[0]).strip()
+            if "physics_data_revision" in self.df_plus.columns else ""
+        )
+        native_contract = revision == PHYSICS_DATA_REVISION
 
         # ---- 코어손실 + B ----
+        # Native wound-core orientation splits one former core_i solid into
+        # three legs and two yokes. Preserve the public P_core_i contract by
+        # integrating all retained pieces of each physical depth group.
+        core_groups = {}
+        for core_obj in self.design1.core_objs:
+            core_groups.setdefault(
+                _core_group_index(core_obj.name), []
+            ).append(core_obj)
+        if not core_groups:
+            raise RuntimeError("no core objects available for loss reporting")
+
         core_exprs = []
         b_mean_exprs = []
         b_max_exprs = []
-        for c in self.design1.core_objs:
-            core_exprs.append(self._calc_field_expr(c.name, "CoreLoss", "Integrate", f"P_{c.name}"))
-            b_mean_exprs.append(self._calc_field_expr(c.name, "B_peak", "Mean", f"B_mean_{c.name}"))
-            b_max_exprs.append(self._calc_field_expr(c.name, "B_peak", "Maximum", f"B_max_{c.name}"))
+        b_expr_group = {}
+        b_expr_volume = {}
+        native_report_plan = None
+
+        for group_index, pieces in sorted(core_groups.items()):
+            group_name = f"core_{group_index}"
+            core_exprs.append(self._calc_group_loss(
+                pieces, f"P_{group_name}", quantity="CoreLoss"
+            ))
+
+        if native_contract:
+            native_report_plan = _native_core_report_plan(
+                core_groups,
+                self._sym_cut_count,
+                require_complete_groups=bool(self.full_model),
+            )
+
+        # Per-piece B diagnostics retain the established CmplxMag->Mag
+        # extraction.  The independent core-loss reference is evaluated in
+        # Python from Faraday B and effective mass; no calculator B**y moment
+        # participates in the production gate.
+        for group_index, pieces in sorted(core_groups.items()):
+            for piece in pieces:
+                mean_expr = self._calc_field_expr(
+                    piece.name, "B_peak", "Mean", f"B_mean_{piece.name}"
+                )
+                max_expr = self._calc_field_expr(
+                    piece.name, "B_peak", "Maximum", f"B_max_{piece.name}"
+                )
+                try:
+                    volume = abs(float(piece.volume))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"cannot read core component volume for {piece.name!r}"
+                    ) from exc
+                if not math.isfinite(volume) or volume <= 0:
+                    raise RuntimeError(
+                        f"invalid core component volume for {piece.name!r}: {volume!r}"
+                    )
+                b_mean_exprs.append(mean_expr)
+                b_max_exprs.append(max_expr)
+                b_expr_group[mean_expr] = group_index
+                b_expr_group[max_expr] = group_index
+                b_expr_volume[mean_expr] = volume
+        flux_expr = self._calc_core_flux_integral(
+            self.design1.core_flux_sheets, "Phi_center_leg_B_normal"
+        )
+        try:
+            flux_section_area_retained_m2 = sum(
+                _sheet_area_model_units(sheet)
+                for sheet in self.design1.core_flux_sheets
+            ) * 1e-6
+        except Exception as exc:
+            raise RuntimeError("cannot read retained core flux-section area") from exc
+        if not math.isfinite(flux_section_area_retained_m2) or (
+            flux_section_area_retained_m2 <= 0
+        ):
+            raise RuntimeError(
+                "invalid retained core flux-section area: "
+                f"{flux_section_area_retained_m2!r}"
+            )
 
         # ---- 권선 그룹 총손실 + explicit 턴 손실 (열해석용) ----
         group_exprs = []
@@ -3164,7 +3888,10 @@ class Simulation():
             for w in explicit:
                 turn_exprs.append(self._calc_field_expr(w.name, "EMLoss", "Integrate", f"P_turn_{w.name}"))
 
-        all_exprs = core_exprs + b_mean_exprs + b_max_exprs + group_exprs + turn_exprs + plate_exprs
+        all_exprs = (
+            core_exprs + b_mean_exprs + b_max_exprs
+            + [flux_expr] + group_exprs + turn_exprs + plate_exprs
+        )
         df_loss = self._export_field_report("calculator_report_loss", all_exprs)
         vals = df_loss.iloc[0, -len(all_exprs):]
         vals.index = all_exprs
@@ -3173,12 +3900,47 @@ class Simulation():
         # 실물 기준(_phys) 환산: 대칭 loss 디자인이면 오브젝트별 절단면 수로 보정, 풀모델이면 x1
         b_factor = 0.5 if getattr(self, "loss_is_sym", False) else 1.0
         self.loss_map_phys = {}
+        self.loss_map_native_raw_phys = {}
+        self.loss_map_average_phys = {}
+        self.loss_map_macro_phys = {}
+        loss_margin = (
+            float(self.df_plus["core_loss_margin"].iloc[0])
+            if native_contract else 1.0
+        )
         for e in core_exprs:
-            self.loss_map_phys[e] = self.loss_map[e] * self._phys_factor(e, is_core_loss=True)
+            native_raw = self.loss_map[e] * self._phys_factor(
+                e, is_core_loss=True
+            )
+            self.loss_map_native_raw_phys[e] = native_raw
+            self.loss_map_phys[e] = native_raw * loss_margin
         for e in group_exprs + turn_exprs + plate_exprs:
             self.loss_map_phys[e] = self.loss_map[e] * self._phys_factor(e, is_core_loss=False)
+        kf = float(self.df_plus["core_lamination_factor"].iloc[0])
+        core_area_basis = str(
+            self.df_plus["core_geometry_material_basis"].iloc[0]
+        )
         for e in b_mean_exprs + b_max_exprs:
-            self.loss_map_phys[e] = self.loss_map[e] * b_factor
+            # Symmetry conversion first recovers the macroscopic flux density
+            # of the gross homogeneous model.  Only then convert to ribbon-
+            # material flux density using the UU137 lamination factor.
+            b_average = self.loss_map[e] * b_factor
+            self.loss_map_average_phys[e] = b_average
+            self.loss_map_macro_phys[e] = b_average
+            self.loss_map_phys[e] = material_flux_density_t(
+                b_average, kf, area_basis=core_area_basis
+            )
+
+        flux_integral_reported_wb = float(self.loss_map[flux_expr])
+        b_section_average = (
+            flux_integral_reported_wb
+            / flux_section_area_retained_m2
+            * b_factor
+        )
+        b_section_material = material_flux_density_t(
+            b_section_average, kf, area_basis=core_area_basis
+        )
+        ae_gross_m2 = float(self.df_plus["Ae_gross_m2"].iloc[0])
+        flux_integral_physical_wb = b_section_average * ae_gross_m2
 
         def _obj_of(expr):
             n = expr
@@ -3188,7 +3950,14 @@ class Simulation():
             return n
 
         # 총계 (대칭 모델의 삭제된 미러 몫 포함 - 실물 전체 기준)
-        core_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e)) for e in core_exprs)
+        core_total_native_raw = sum(
+            self.loss_map_native_raw_phys[e] * self._mirror_mult(_obj_of(e))
+            for e in core_exprs
+        )
+        core_total = sum(
+            self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
+            for e in core_exprs
+        )
         cplate_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
                            for e in plate_exprs if "core_plate" in e)
         wcp_total = sum(self.loss_map_phys[e] * self._mirror_mult(_obj_of(e))
@@ -3198,22 +3967,260 @@ class Simulation():
         p_rxs_one = self.loss_map_phys.get("P_Rx_side_group", 0.0)
         winding_total = p_tx + p_rxm + 2 * p_rxs_one  # 측면 링 2개 (좌우 대칭)
 
-        b_mean = sum(self.loss_map_phys[e] for e in b_mean_exprs) / max(len(b_mean_exprs), 1)
-        b_max = max((self.loss_map_phys[e] for e in b_max_exprs), default=0)
+        group_b_average = {}
+        group_volume = {}
+        for group_index in core_groups:
+            means = [
+                e for e in b_mean_exprs if b_expr_group[e] == group_index
+            ]
+            volume = sum(b_expr_volume[e] for e in means)
+            if volume <= 0:
+                raise RuntimeError(f"zero retained core volume for group {group_index}")
+            group_b_average[group_index] = sum(
+                self.loss_map_average_phys[e] * b_expr_volume[e]
+                for e in means
+            ) / volume
+            group_volume[group_index] = volume
+
+        physical_volume_weights = {
+            group_index: group_volume[group_index]
+            * (2 ** self._sym_cut_count(f"core_{group_index}"))
+            * self._mirror_mult(f"core_{group_index}")
+            for group_index in group_b_average
+        }
+        total_volume_weight = sum(physical_volume_weights.values())
+        if total_volume_weight <= 0:
+            raise RuntimeError("zero physical core volume weight")
+        b_mean_average = sum(
+            group_b_average[index] * physical_volume_weights[index]
+            for index in group_b_average
+        ) / total_volume_weight
+        b_max_average = max(
+            (self.loss_map_average_phys[e] for e in b_max_exprs), default=0
+        )
+        b_mean_material = material_flux_density_t(
+            b_mean_average, kf, area_basis=core_area_basis
+        )
+        b_max_material = max(
+            (self.loss_map_phys[e] for e in b_max_exprs), default=0
+        )
+
+        primary_turns = int(self.df_plus["N1_main"].iloc[0]) + int(
+            self.df_plus["N1_side"].iloc[0]
+        )
+        ae_effective_m2 = float(self.df_plus["Ae_effective_m2"].iloc[0])
+        b_design_square_material = square_wave_b_material_t(
+            float(self.df_plus["V1_rms"].iloc[0]),
+            float(self.df_plus["freq"].iloc[0]),
+            primary_turns,
+            ae_effective_m2,
+        )
+        faraday_reference = faraday_lumped_core_reference(
+            voltage_rms_v=float(self.df_plus["V1_rms"].iloc[0]),
+            frequency_hz=float(self.df_plus["freq"].iloc[0]),
+            turns=primary_turns,
+            gross_area_m2=ae_gross_m2,
+            lamination_factor=kf,
+            effective_mass_kg=float(
+                self.df_plus["core_mass_effective_kg"].iloc[0]
+            ),
+            loss_margin=loss_margin,
+            coefficient=6.5,
+            x=float(self.df_plus["core_x"].iloc[0]),
+            y=float(self.df_plus["core_y"].iloc[0]),
+        )
+        b_ac_sine_material = faraday_reference["B_material_T"]
+        b_ac_sine_average = faraday_reference["B_pack_T"]
+        # Cross-check the algebraic gross-area route against the existing
+        # effective-area helper.  This is deterministic Python math, not an
+        # AEDT field-calculator identity.
+        b_ac_sine_material_effective_area = sinusoidal_b_peak_material_t(
+            float(self.df_plus["V1_rms"].iloc[0]),
+            float(self.df_plus["freq"].iloc[0]),
+            primary_turns,
+            ae_effective_m2,
+        )
+        if not math.isclose(
+            b_ac_sine_material,
+            b_ac_sine_material_effective_area,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError("Faraday gross/effective area references disagree")
+
+        core_loss_expected = faraday_reference["margin_adjusted_loss_W"]
+        core_loss_expected_native_raw = faraday_reference["native_raw_loss_W"]
+        core_loss_native_rel_error = float("nan")
+        core_loss_native_attested = 0
+        core_loss_native_tolerance_rel = 0.30
+        b_mean_faraday_rel_error = abs(
+            b_mean_material - b_ac_sine_material
+        ) / max(abs(b_ac_sine_material), 1e-12)
+        b_mean_faraday_tolerance_rel = 0.15
+        b_mean_faraday_attested = int(
+            math.isfinite(b_mean_faraday_rel_error)
+            and b_mean_faraday_rel_error <= b_mean_faraday_tolerance_rel
+        )
+        if native_contract:
+            denominator = max(abs(core_loss_expected_native_raw), 1e-12)
+            core_loss_native_rel_error = abs(
+                core_total_native_raw - core_loss_expected_native_raw
+            ) / denominator
+            if not b_mean_faraday_attested:
+                raise RuntimeError(
+                    "standard AEDT B average failed Faraday lumped reference: "
+                    f"standard_material={b_mean_material:.12g}T, "
+                    f"faraday_material={b_ac_sine_material:.12g}T, "
+                    f"relative_error={b_mean_faraday_rel_error:.6g}, "
+                    f"tolerance={b_mean_faraday_tolerance_rel:.6g}"
+                )
+            if not math.isfinite(core_loss_native_rel_error) or (
+                core_loss_native_rel_error > core_loss_native_tolerance_rel
+            ):
+                raise RuntimeError(
+                    "AEDT native lamination CoreLoss failed lumped Faraday/"
+                    "POWERLITE/mass reference: "
+                    f"solver_raw={core_total_native_raw:.12g}W, "
+                    f"expected_raw={core_loss_expected_native_raw:.12g}W, "
+                    f"relative_error={core_loss_native_rel_error:.6g}, "
+                    f"tolerance={core_loss_native_tolerance_rel:.6g}"
+                )
+            core_loss_native_attested = 1
+
+        if native_contract:
+            native_group_count = len(native_report_plan["groups"])
+            native_piece_count = len(native_report_plan["object_names"])
+            native_expected_piece_count = sum(
+                len(pieces) for pieces in core_groups.values()
+            )
+            native_pre_split_piece_count = int(
+                self.df_plus["core_segmented_piece_count"].iloc[0]
+            )
+            native_coverage_attested = int(
+                native_piece_count == native_expected_piece_count
+                and len(set(native_report_plan["object_names"]))
+                == native_piece_count
+            )
+            if not native_coverage_attested:
+                raise RuntimeError(
+                    "native core report coverage attestation failed after planning"
+                )
+            native_membership_sha256 = native_report_plan[
+                "membership_sha256"
+            ]
+        else:
+            native_group_count = 0
+            native_piece_count = 0
+            native_expected_piece_count = 0
+            native_pre_split_piece_count = 0
+            native_coverage_attested = 0
+            native_membership_sha256 = ""
 
         # CSV에는 실물 기준 값을 기본으로 기록 (raw 대칭 적분값은 _raw 접미사)
         summary = {
             "P_core_total": [core_total],
+            "P_core_total_native_raw_W": [core_total_native_raw],
+            "P_core_total_expected_from_Bavg_integral": [core_loss_expected],
+            "P_core_total_expected_from_faraday_mass": [core_loss_expected],
+            "P_core_total_expected_native_raw_W": [core_loss_expected_native_raw],
+            "P_core_total_expected_faraday_native_raw_W": [
+                core_loss_expected_native_raw
+            ],
+            "core_loss_native_rel_error": [core_loss_native_rel_error],
+            "core_loss_native_tolerance_rel": [core_loss_native_tolerance_rel],
+            "core_loss_native_attested": [core_loss_native_attested],
+            "core_loss_margin_applied": [loss_margin],
+            "core_loss_reference_basis": [faraday_reference["basis"]],
+            "core_loss_reference_specific_W_kg": [
+                faraday_reference["specific_loss_W_kg"]
+            ],
+            "core_loss_reference_effective_mass_kg": [
+                faraday_reference["effective_mass_kg"]
+            ],
+            "Bavg_power_volume_integral": [float("nan")],
+            "Bavg_power_integral_normalized_by_one_tesla": [0],
+            "Bavg_power_integral_status": [
+                "disabled_by_user_use_independent_faraday_lumped_gate"
+            ],
+            "native_core_report_group_count": [native_group_count],
+            "native_core_report_piece_count": [native_piece_count],
+            "native_core_report_expected_piece_count": [
+                native_expected_piece_count
+            ],
+            "native_core_pre_split_piece_count": [
+                native_pre_split_piece_count
+            ],
+            "native_core_report_coverage_basis": [
+                "all_retained_post_symmetry_core_objects"
+                if native_contract else "not_applicable"
+            ],
+            "native_core_report_coverage_attested": [
+                native_coverage_attested
+            ],
+            "native_core_report_membership_sha256": [
+                native_membership_sha256
+            ],
+            "native_core_b_power_batch_count": [0],
+            "native_core_b_power_expression_count": [0],
+            "native_core_b_power_batches_json": ["{}"],
+            "native_core_b_power_restore_factors_json": ["{}"],
+            "core_flux_section_retained_area_m2": [
+                flux_section_area_retained_m2
+            ],
+            "core_flux_integral_reported_Wb": [flux_integral_reported_wb],
+            "core_flux_integral_physical_Wb": [flux_integral_physical_wb],
+            "B_core_section_average": [b_section_average],
+            "B_core_section_material": [b_section_material],
+            "B_core_section_vs_volume_mean_rel_error": [
+                abs(b_section_average - b_mean_average)
+                / max(abs(b_mean_average), 1e-12)
+            ],
+            "B_design_square_material_analytic": [b_design_square_material],
+            "B_ac_sine_material_analytic": [b_ac_sine_material],
+            "B_ac_sine_average_analytic": [b_ac_sine_average],
+            "B_faraday_pack_T": [faraday_reference["B_pack_T"]],
+            "B_faraday_material_T": [faraday_reference["B_material_T"]],
+            "B_standard_extraction_operator": ["CmplxMag_then_Mag"],
+            "B_standard_extraction_semantics": [
+                "complex_vector_norm_diagnostic_not_phase_peak"
+            ],
+            "B_mean_material_vs_sine_analytic_rel_error": [
+                b_mean_faraday_rel_error
+            ],
+            "B_mean_faraday_tolerance_rel": [
+                b_mean_faraday_tolerance_rel
+            ],
+            "B_mean_faraday_attested": [b_mean_faraday_attested],
             "P_core_plate_total": [cplate_total],
             "P_wcp_total": [wcp_total],
             "P_winding_total": [winding_total],
             "P_Rx_side_total": [2 * p_rxs_one],
-            "B_mean_core": [b_mean], "B_max_core": [b_max],
+            # Compatibility aliases now deliberately mean ribbon-material B.
+            # The explicit macro/material columns prevent cross-revision
+            # consumers from guessing which area basis was used.
+            "B_mean_core": [b_mean_material],
+            "B_max_core": [b_max_material],
+            "B_mean_core_average": [b_mean_average],
+            "B_max_core_average_diagnostic": [b_max_average],
+            "B_mean_core_macro": [b_mean_average],
+            "B_max_core_macro": [b_max_average],
+            "B_mean_core_material": [b_mean_material],
+            "B_max_core_material": [b_max_material],
+            "B_max_core_usage": [
+                "diagnostic_only_edge_and_segment_interface_spikes"
+            ],
         }
         for e in core_exprs + group_exprs + turn_exprs + plate_exprs:
             summary[e] = [self.loss_map_phys[e]]
+            if e in core_exprs:
+                summary[f"{e}_native_raw"] = [
+                    self.loss_map_native_raw_phys[e]
+                ]
             if getattr(self, "loss_is_sym", False):
                 summary[f"{e}_raw"] = [self.loss_map[e]]
+        for e in b_mean_exprs + b_max_exprs:
+            summary[f"{e}_average"] = [self.loss_map_average_phys[e]]
+            summary[f"{e}_material"] = [self.loss_map_phys[e]]
 
         # ---- Tx 해석 전류 (전압원 여자 검증용) ----
         I1_mag = float("nan")
@@ -3239,6 +4246,116 @@ class Simulation():
         phase_used = getattr(self, "I2_phase_auto", None)
         summary["I2_phase_used_deg"] = [phase_used if phase_used is not None
                                         else float(self.df_plus["I2_phase_deg"].iloc[0])]
+
+        report_to_physical_flux_factor = (
+            2.0 if getattr(self, "loss_is_sym", False) else 1.0
+        )
+        induced_voltage_reported_peak = float("nan")
+        flux_linkage_reported_peak = float("nan")
+        induced_voltage_peak = float("nan")
+        flux_linkage_peak = float("nan")
+        faraday_rel_error = float("nan")
+        source_voltage_rel_error = float("nan")
+        b_flux_linkage_material = float("nan")
+        surface_flux_linkage_rel_error = float("nan")
+        surface_flux_induced_voltage_rel_error = float("nan")
+        flux_linkage_attested = 0
+        try:
+            induced_expr = "mag(InducedVoltage(Tx_winding))"
+            linkage_expr = "mag(FluxLinkage(Tx_winding))"
+            df_flux = self._solution_data_frame(
+                [induced_expr, linkage_expr],
+                aliases=["induced_voltage_peak", "flux_linkage_peak"],
+                target_units={induced_expr: "V", linkage_expr: "Wb"},
+                report_category="AC Magnetic",
+                extraction_key="flux_linkage",
+            )
+            induced_voltage_reported_peak = float(
+                df_flux["induced_voltage_peak"].iloc[0]
+            )
+            flux_linkage_reported_peak = float(
+                df_flux["flux_linkage_peak"].iloc[0]
+            )
+            induced_voltage_peak = (
+                induced_voltage_reported_peak
+                * report_to_physical_flux_factor
+            )
+            flux_linkage_peak = (
+                flux_linkage_reported_peak
+                * report_to_physical_flux_factor
+            )
+            omega = 2.0 * math.pi * float(self.df_plus["freq"].iloc[0])
+            faraday_voltage = omega * flux_linkage_peak
+            source_voltage_peak = (
+                math.sqrt(2.0) * float(self.df_plus["V1_rms"].iloc[0])
+            )
+            faraday_rel_error = abs(
+                induced_voltage_peak - faraday_voltage
+            ) / max(abs(induced_voltage_peak), 1e-12)
+            source_voltage_rel_error = abs(
+                induced_voltage_peak - source_voltage_peak
+            ) / max(abs(source_voltage_peak), 1e-12)
+            b_flux_linkage_material = flux_linkage_peak / (
+                primary_turns * ae_effective_m2
+            )
+            surface_linkage = primary_turns * flux_integral_physical_wb
+            surface_flux_linkage_rel_error = abs(
+                surface_linkage - flux_linkage_peak
+            ) / max(abs(flux_linkage_peak), 1e-12)
+            surface_induced_voltage = omega * surface_linkage
+            surface_flux_induced_voltage_rel_error = abs(
+                surface_induced_voltage - induced_voltage_peak
+            ) / max(abs(induced_voltage_peak), 1e-12)
+            if native_contract and (
+                faraday_rel_error > 0.01 or source_voltage_rel_error > 0.05
+            ):
+                raise RuntimeError(
+                    "native stacking flux-linkage attestation failed: "
+                    f"Faraday relative error={faraday_rel_error:.6g}, "
+                    f"source relative error={source_voltage_rel_error:.6g}"
+                )
+            flux_linkage_attested = int(native_contract)
+        except Exception as exc:
+            if native_contract:
+                raise RuntimeError(
+                    "new physics revision requires induced-voltage/flux-linkage "
+                    "Faraday readback"
+                ) from exc
+            logging.warning(f"Failed to extract flux-linkage audit: {exc}")
+
+        summary.update({
+            "loss_report_to_physical_flux_factor": [
+                report_to_physical_flux_factor
+            ],
+            "loss_report_flux_basis": [
+                "eighth_current_driven_half_amplitude"
+                if getattr(self, "loss_is_sym", False)
+                else "full_voltage_driven_physical_amplitude"
+            ],
+            "Tx_induced_voltage_reported_peak_V": [
+                induced_voltage_reported_peak
+            ],
+            "Tx_induced_voltage_peak_V": [induced_voltage_peak],
+            "Tx_flux_linkage_reported_peak_Wb_turn": [
+                flux_linkage_reported_peak
+            ],
+            "Tx_flux_linkage_peak_Wb_turn": [flux_linkage_peak],
+            "Tx_flux_linkage_faraday_rel_error": [faraday_rel_error],
+            "Tx_induced_vs_source_peak_rel_error": [source_voltage_rel_error],
+            "B_flux_linkage_material": [b_flux_linkage_material],
+            "core_surface_flux_vs_linkage_rel_error": [
+                surface_flux_linkage_rel_error
+            ],
+            "core_surface_flux_vs_induced_voltage_rel_error": [
+                surface_flux_induced_voltage_rel_error
+            ],
+            "B_flux_linkage_vs_sine_analytic_rel_error": [
+                abs(b_flux_linkage_material - b_ac_sine_material)
+                / max(abs(b_ac_sine_material), 1e-12)
+                if math.isfinite(b_flux_linkage_material) else float("nan")
+            ],
+            "flux_linkage_attested": [flux_linkage_attested],
+        })
 
         self.df_loss_summary = pd.DataFrame(summary)
         return self.df_loss_summary
@@ -4156,8 +5273,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 (
                     "Tx_windings_main", "Tx_windings_side", "Tx_windings_side2",
                     "Tx_windings", "Rx_windings_main", "Rx_windings_side",
-                    "Rx_windings_side2", "Rx_windings", "core_objs", "core_plates",
-                    "core_pads", "wcp_plates", "wcp_pads",
+                    "Rx_windings_side2", "Rx_windings", "core_objs",
+                    "core_flux_sheets", "core_plates", "core_pads",
+                    "wcp_plates", "wcp_pads",
                 ),
             )
 
@@ -4405,7 +5523,12 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     f"thermal: {type(thermal_error).__name__}: {thermal_error}",
                 )
                 df_thermal = _thermal_failure_frame(thermal_error)
-            thermal_result_valid = _thermal_result_is_valid(df_thermal)
+            thermal_result_valid = _thermal_result_is_valid(
+                df_thermal,
+                physics_data_revision=sim.df_plus.get(
+                    "physics_data_revision", pd.Series([""])
+                ).iloc[0],
+            )
             t_thermal = time.time() - t0
             total_time += t_thermal
             result_parts += [df_thermal, pd.DataFrame({"time_thermal": [t_thermal]})]

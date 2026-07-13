@@ -26,7 +26,10 @@ esac
 
 while true; do
   printf '[collector] start %s\n' "$(date -Iseconds)"
-  "$PY" campaign/collect_wave.py --prefix mft-camp 2>&1 | tail -4
+  # Terminal rows are authoritative.  Polling every running worker's remote
+  # stdout serialized hundreds of SSH reads, stretched a pass past 3 minutes,
+  # and competed with the controller for the scheduler's bounded read slots.
+  "$PY" campaign/collect_wave.py --prefix mft-camp --running-fetch-limit 0 2>&1 | tail -4
   printf '[collector] sleep %ss %s\n' "$COLLECT_INTERVAL_SECONDS" "$(date -Iseconds)"
   sleep "$COLLECT_INTERVAL_SECONDS"
 done
