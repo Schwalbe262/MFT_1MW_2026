@@ -2,7 +2,7 @@
   "schema": "mft-attach-aware-refill-policy-v1",
   "primary_backend": "pooled",
   "pooled_fraction": 0.0,
-  "project_concurrency_target": 300,
+  "project_concurrency_target": 500,
   "max_aedt_sessions": 250,
   "projects_per_aedt": 2,
   "validated_projects_per_aedt": 2,

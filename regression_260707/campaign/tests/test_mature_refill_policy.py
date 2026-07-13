@@ -45,13 +45,13 @@ class MatureRefillPolicyTests(unittest.TestCase):
         self.assertIn("strict_collector_not_pinned_to_b171", alerts)
         self.assertEqual(
             controller._maintained_pool_action(
-                target_active=300,
-                logical_active=299,
+                target_active=500,
+                logical_active=499,
                 target_reached=False,
                 reasons=reasons,
                 wait_reasons=waits,
             ),
-            "refill_300",
+            "refill_500",
         )
 
     def test_malformed_health_evidence_still_fails_closed(self):

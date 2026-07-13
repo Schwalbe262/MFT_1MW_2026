@@ -27,6 +27,7 @@ from typing import Iterable, Mapping, Sequence
 STANDALONE = "standalone"
 POOLED = "pooled"
 FEA_BURSTY = "fea_bursty"
+REVIEWED_PROJECT_CONCURRENCY_CAP = 500
 ACTIVE_TASK_STATES = frozenset({"queued", "attaching", "running"})
 TERMINAL_TASK_STATES = frozenset({"completed", "failed", "cancelled", "timeout"})
 FAILURE_TASK_STATES = frozenset({"failed", "cancelled", "timeout"})
@@ -198,19 +199,29 @@ class AttachRefillPolicy:
             "validated_projects_per_aedt",
         ):
             _positive_int(field, getattr(self, field))
-        if self.project_concurrency_target > 300:
-            raise ValueError("project_concurrency_target exceeds the reviewed cap 300")
+        if self.project_concurrency_target > REVIEWED_PROJECT_CONCURRENCY_CAP:
+            raise ValueError(
+                "project_concurrency_target exceeds the reviewed cap "
+                f"{REVIEWED_PROJECT_CONCURRENCY_CAP}"
+            )
         if self.projects_per_aedt > self.validated_projects_per_aedt:
             raise ValueError(
                 "projects_per_aedt exceeds the attach validation evidence"
             )
-        if self.primary_backend == POOLED and (
-            self.max_aedt_sessions * self.projects_per_aedt
-            < self.project_concurrency_target
-        ):
-            raise ValueError(
-                "AEDT session ceiling cannot cover the logical project target"
+        if self.primary_backend == POOLED:
+            # Authenticate the complete pooled envelope even while a staged
+            # policy has pooled_fraction=0.0 and selects standalone at runtime.
+            required_aedt_sessions = math.ceil(
+                self.project_concurrency_target / self.projects_per_aedt
             )
+            capacity_checks = (
+                required_aedt_sessions <= self.max_aedt_sessions,
+                self.project_concurrency_target <= self.max_pooled_projects,
+            )
+            if not all(capacity_checks):
+                raise ValueError(
+                    "AEDT session ceiling cannot cover the logical project target"
+                )
         if self.standalone_profile != FEA_BURSTY:
             raise ValueError("standalone FEA scheduling profile must be fea_bursty")
         if self.pooled_profile != FEA_BURSTY:

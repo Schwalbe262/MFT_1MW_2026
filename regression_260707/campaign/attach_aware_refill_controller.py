@@ -382,7 +382,7 @@ def _load_policy(path: str | Path) -> AttachRefillPolicy:
             policy.provenance.core_lamination_factor
             == PRODUCTION_CORE_LAMINATION_FACTOR
         ),
-        "project_concurrency_target": policy.project_concurrency_target == 300,
+        "project_concurrency_target": policy.project_concurrency_target == 500,
         "primary_backend": policy.primary_backend == POOLED,
         "pooled_fraction": (
             policy.pooled_fraction == PRODUCTION_POOLED_FRACTION

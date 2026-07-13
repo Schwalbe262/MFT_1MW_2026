@@ -1,15 +1,15 @@
-# Attach-aware MFT 300-maintenance controller (restart v3, not started)
+# Attach-aware MFT 500-maintenance controller (restart v3, not started)
 
 ## Outcome
 
-This branch provides the reviewed restart-v3 300-maintenance controller for a
+This branch provides the reviewed restart-v3 500-maintenance controller for a
 rolling standalone-to-pooled AEDT transition. PLAN mode performs scheduler
 GETs only. The controller has not been started by this change, and no task was
 submitted or cancelled while preparing it.
 
 The logical unit remains one simulation project and one expected training row.
 The scheduler continues to count each simulation as one MFT project task, so
-the project concurrency target remains exactly 300. A pooled bundle groups up
+the project concurrency target remains exactly 500. A pooled bundle groups up
 to `projects_per_aedt=N` project tasks and records
 `bundle.expected_rows == project count`; it does not reinterpret the scheduler
 task cap as a Desktop cap.
@@ -26,7 +26,7 @@ task cap as a Desktop cap.
   and capacity plumbing remains present but inactive.
 - `desired_aedt_sessions = ceil(pooled logical projects / N)` and may never
   exceed the UI/operator `max_aedt_sessions` ceiling.
-- A pooled policy is invalid if `max_aedt_sessions * N < 300`.
+- A pooled policy is invalid if `max_aedt_sessions * N < 500`.
 - N is not hard-coded to two. The requested N must be no larger than the
   separately pinned `validated_projects_per_aedt`. Moving to N=3 therefore
   requires N=3 evidence and a new immutable policy, not a code rewrite.
@@ -38,8 +38,8 @@ task cap as a Desktop cap.
 1. Deploy the exact attach-capable MFT and scheduler revisions recorded in the
    policy provenance.
 2. In scheduler Web UI set the AEDT session ceiling, logical project target,
-   and `projects_per_aedt`. For the current N=2 policy, target 300 needs 150
-   sessions; the prepared ceiling is 250.
+   and `projects_per_aedt`. For the current N=2 policy, target 500 needs 250
+   sessions, exactly matching the prepared ceiling.
 3. Keep the production pooled fraction at zero. Enable pooled admission only
    after the N=2 scheduler validation row is accepted and the pool reports
    `enabled`, `validation_passed`, and `operational`.

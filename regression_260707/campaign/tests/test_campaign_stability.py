@@ -235,9 +235,9 @@ class FeederTests(unittest.TestCase):
                 projects, [], required_hard_cap=10,
                 legacy_tasks=[{
                     **row, "id": 2, "project": "IPMSM"}])
-        with self.assertRaisesRegex(RuntimeError, "exceeds absolute cap 300"):
+        with self.assertRaisesRegex(RuntimeError, "exceeds absolute cap 500"):
             pinned_pilot.project_submission_snapshot(
-                projects, [], required_hard_cap=301)
+                projects, [], required_hard_cap=501)
 
     def test_campaign_inventory_preserves_project_and_projectless_legacy_union(self):
         rows = [

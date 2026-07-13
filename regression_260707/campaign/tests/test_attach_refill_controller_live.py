@@ -58,7 +58,7 @@ def _scheduler_get(active: int):
     ]
     project = {
         "name": controller.scheduler_client.MFT_PROJECT,
-        "max_active_tasks": 300,
+        "max_active_tasks": 500,
         "auto_pull": False,
     }
 
@@ -138,7 +138,7 @@ def test_live_plan_is_get_only_standalone_and_repeatable(
     tmp_path, monkeypatch, capsys
 ):
     state_path = tmp_path / "restart_v3_controller_state.json"
-    get = mock.Mock(side_effect=_scheduler_get(active=298))
+    get = mock.Mock(side_effect=_scheduler_get(active=498))
     monkeypatch.setattr(controller.scheduler_client.requests, "get", get)
     monkeypatch.setattr(controller.pinned_pilot, "next_valid_candidate", _candidate)
     submission_identity = (
@@ -166,11 +166,11 @@ def test_live_plan_is_get_only_standalone_and_repeatable(
     assert first["scheduler_query_count"] == 3
     assert first["scheduler_mutation_count"] == 0
     assert first["active_counts"] == {
-        "queued": 296,
+        "queued": 496,
         "attaching": 1,
         "running": 1,
     }
-    assert first["active_project_tasks"] == 298
+    assert first["active_project_tasks"] == 498
     assert first["logical_project_deficit"] == 2
     assert first["would_submit"] == first["would_replace"] == 2
     assert first["state_initialized"] is True
@@ -219,6 +219,7 @@ def test_live_plan_is_get_only_standalone_and_repeatable(
     assert state["generation"] == first["generation"]
     start_cursor = first["generation"]["identity"]["candidate_start_cursor"]
     assert first["generation"]["identity"]["candidate_valid_offset"] == 35
+    assert first["generation"]["identity"]["project_concurrency_target"] == 500
     assert state["candidate_cursor"] == start_cursor
     assert state["next_serial"] == 1
     assert state["state_revision"] == 0
@@ -238,7 +239,7 @@ def test_live_plan_is_get_only_standalone_and_repeatable(
         sentinel.assert_not_called()
 
 
-def test_generation_identity_changes_with_each_physics_pin():
+def test_generation_identity_changes_with_concurrency_and_physics_pins():
     policy = controller._load_policy(controller.DEFAULT_POLICY_PATH)
     profile = controller._load_profile(controller.DEFAULT_TIMEOUT_SECONDS)
 
@@ -271,11 +272,26 @@ def test_generation_identity_changes_with_each_physics_pin():
             ),
         )
     )
+    changed_target = generation(
+        replace(policy, project_concurrency_target=499)
+    )
 
-    assert len({base["id"], changed_revision["id"], changed_factor["id"]}) == 3
     assert len(
-        {base["digest"], changed_revision["digest"], changed_factor["digest"]}
-    ) == 3
+        {
+            base["id"],
+            changed_revision["id"],
+            changed_factor["id"],
+            changed_target["id"],
+        }
+    ) == 4
+    assert len(
+        {
+            base["digest"],
+            changed_revision["digest"],
+            changed_factor["digest"],
+            changed_target["digest"],
+        }
+    ) == 4
 
 
 def test_live_policy_rejects_nonzero_pooled_fraction(tmp_path):
@@ -327,7 +343,7 @@ def test_authorized_mocked_run_advances_fresh_state_once(
     tmp_path, monkeypatch, capsys
 ):
     state_path = tmp_path / "restart_v3_controller_state.json"
-    get = mock.Mock(side_effect=_scheduler_get(active=299))
+    get = mock.Mock(side_effect=_scheduler_get(active=499))
     monkeypatch.setattr(controller.scheduler_client.requests, "get", get)
     monkeypatch.setattr(controller.pinned_pilot, "next_valid_candidate", _candidate)
     sentinels = _forbid_mutations(monkeypatch)

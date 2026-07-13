@@ -58,8 +58,8 @@ def provenance(**changes) -> policy_module.RevisionProvenance:
 def attach_policy(**changes) -> policy_module.AttachRefillPolicy:
     values = {
         "primary_backend": "pooled",
-        "project_concurrency_target": 300,
-        "max_aedt_sessions": 150,
+        "project_concurrency_target": 500,
+        "max_aedt_sessions": 250,
         "projects_per_aedt": 2,
         "validated_projects_per_aedt": 2,
         "provenance": provenance(),
@@ -79,23 +79,39 @@ def candidates(count: int) -> list[policy_module.ProjectCandidate]:
     ]
 
 
-def test_pooled_target_300_requires_enough_aedt_sessions():
+@pytest.mark.parametrize("pooled_fraction", [0.0, 1.0])
+def test_pooled_target_500_requires_250_aedt_sessions(pooled_fraction):
+    policy = attach_policy(pooled_fraction=pooled_fraction)
+
+    assert policy_module.desired_aedt_sessions(500, 2) == 250
+    assert policy.max_aedt_sessions == 250
+    assert policy.max_pooled_projects == 500
+    assert policy.project_concurrency_target <= policy.max_pooled_projects
     with pytest.raises(ValueError, match="cannot cover"):
-        attach_policy(max_aedt_sessions=149)
+        attach_policy(
+            max_aedt_sessions=249,
+            pooled_fraction=pooled_fraction,
+        )
+    with pytest.raises(ValueError, match="reviewed cap 500"):
+        attach_policy(
+            project_concurrency_target=501,
+            max_aedt_sessions=251,
+            pooled_fraction=pooled_fraction,
+        )
 
 
 def test_projects_per_aedt_is_generic_but_evidence_bounded():
     future = attach_policy(
-        max_aedt_sessions=100,
+        max_aedt_sessions=167,
         projects_per_aedt=3,
         validated_projects_per_aedt=3,
     )
-    assert future.max_pooled_projects == 300
-    assert policy_module.desired_aedt_sessions(300, 3) == 100
+    assert future.max_pooled_projects == 501
+    assert policy_module.desired_aedt_sessions(500, 3) == 167
 
     with pytest.raises(ValueError, match="validation evidence"):
         attach_policy(
-            max_aedt_sessions=100,
+            max_aedt_sessions=167,
             projects_per_aedt=3,
             validated_projects_per_aedt=2,
         )
@@ -144,6 +160,16 @@ def test_pooled_fraction_is_bounded_normalized_and_part_of_policy_digest():
 
     assert standalone_only.pooled_fraction == 0.0
     assert pooled.pooled_fraction == 1.0
+    assert standalone_only.max_pooled_projects == 500
+    assert pooled.max_pooled_projects == 500
+    assert policy_module.desired_aedt_sessions(
+        standalone_only.project_concurrency_target,
+        standalone_only.projects_per_aedt,
+    ) == 250
+    assert policy_module.desired_aedt_sessions(
+        pooled.project_concurrency_target,
+        pooled.projects_per_aedt,
+    ) == 250
     assert standalone_only.digest != pooled.digest
     for invalid in (True, -0.01, 1.01, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="pooled_fraction"):
@@ -162,9 +188,14 @@ def test_production_policy_pins_restart_v3_with_zero_pooled_fraction():
 
     assert policy.primary_backend == "pooled"
     assert policy.pooled_fraction == 0.0
-    assert policy.project_concurrency_target == 300
+    assert policy.project_concurrency_target == 500
+    assert policy.max_aedt_sessions == 250
     assert policy.projects_per_aedt == 2
     assert policy.validated_projects_per_aedt == 2
+    assert policy.max_pooled_projects == 500
+    assert policy_module.desired_aedt_sessions(
+        policy.project_concurrency_target, policy.projects_per_aedt
+    ) == policy.max_aedt_sessions
     assert policy.provenance.solver_revision == (
         "dba903eb671e37642168afc5578b8e6a93e9c046"
     )
@@ -236,7 +267,7 @@ def test_running_sibling_prevents_early_fallback():
 
 def test_task_options_include_target_aware_provenance_and_generic_n():
     policy = attach_policy(
-        max_aedt_sessions=100,
+        max_aedt_sessions=167,
         projects_per_aedt=3,
         validated_projects_per_aedt=3,
     )
@@ -361,7 +392,7 @@ def ready_pool_status(policy):
 def test_coordinator_refills_project_deficit_not_desktop_deficit():
     policy = attach_policy()
     plan = controller_module.AttachAwareRefillCoordinator(policy).plan_cycle(
-        active_project_tasks=294,
+        active_project_tasks=494,
         candidates=candidates(6),
         pool_status=ready_pool_status(policy),
     )
@@ -380,7 +411,7 @@ def test_fractional_pool_admission_does_not_starve_one_slot_cycles():
     policy = attach_policy(pooled_fraction=0.25)
     selected = [
         controller_module.AttachAwareRefillCoordinator(policy).plan_cycle(
-            active_project_tasks=299,
+            active_project_tasks=499,
             candidates=[candidate],
             pool_status=ready_pool_status(policy),
         )["selected_backend"]
@@ -396,7 +427,7 @@ def test_pool_gate_failure_uses_existing_standalone_path_without_waiting():
     status = ready_pool_status(policy)
     status["operational"] = False
     plan = controller_module.AttachAwareRefillCoordinator(policy).plan_cycle(
-        active_project_tasks=298,
+        active_project_tasks=498,
         candidates=candidates(2),
         pool_status=status,
     )

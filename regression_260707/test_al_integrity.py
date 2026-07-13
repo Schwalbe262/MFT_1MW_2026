@@ -288,7 +288,7 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         for override in (
             {"max_active_tasks": 0},
             {"max_active_tasks": 299},
-            {"max_active_tasks": 301},
+            {"max_active_tasks": 501},
             {"max_active_tasks": 300.0},
             {"max_active_tasks": 300.1},
             {"max_active_tasks": "300"},
@@ -297,9 +297,11 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
             {"auto_pull": None},
         ):
             with self.subTest(override=override), self.assertRaises(
-                    scheduler_client.ProjectContractError):
+                scheduler_client.ProjectContractError):
                 scheduler_client.validate_project_mutation_contract(
-                    {**valid, **override})
+                    {**valid, **override},
+                    expected_cap=scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS,
+                )
 
     def test_submit_wrapper_owns_the_common_mutation_lock(self):
         observed = []
