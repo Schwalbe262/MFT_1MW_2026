@@ -48,6 +48,7 @@ def test_pooled_backend_requires_explicit_exclusive_ack(monkeypatch):
     monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
     monkeypatch.delenv("MFT_AEDT_EXCLUSIVE_1TO1", raising=False)
     monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_PILOT", raising=False)
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_CANARY", raising=False)
     with pytest.raises(RuntimeError, match="exactly one explicit acknowledgement"):
         adapter.aedt_backend()
 
@@ -56,6 +57,7 @@ def test_pooled_backend_rejects_ambiguous_dual_ack(monkeypatch):
     monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
     monkeypatch.setenv("MFT_AEDT_EXCLUSIVE_1TO1", "1")
     monkeypatch.setenv("MFT_AEDT_SHARED_1TO2_PILOT", "1")
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_CANARY", raising=False)
     with pytest.raises(RuntimeError, match="exactly one explicit acknowledgement"):
         adapter.aedt_backend()
 
@@ -104,6 +106,7 @@ def test_shared_pilot_requests_nonexclusive_session(monkeypatch):
     monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
     monkeypatch.delenv("MFT_AEDT_EXCLUSIVE_1TO1", raising=False)
     monkeypatch.setenv("MFT_AEDT_SHARED_1TO2_PILOT", "1")
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_CANARY", raising=False)
     monkeypatch.setenv("MFT_AEDT_SCHEDULER_URL", "http://scheduler:8000")
     monkeypatch.setattr(
         adapter,
@@ -117,7 +120,40 @@ def test_shared_pilot_requests_nonexclusive_session(monkeypatch):
     )
 
     assert requests[0][2]["exclusive_session"] is False
-    assert requests[0][2]["request_key"].startswith("mft-1to2:")
+    assert requests[0][2]["request_key"].startswith("mft-1to2-pilot:")
+
+
+def test_shared_canary_requests_nonexclusive_session_without_pilot_barrier(
+    tmp_path, monkeypatch
+):
+    lease = FakeLease()
+    lease.exclusive_session = False
+    requests = []
+
+    def acquire(url, project, **kwargs):
+        requests.append((url, project, kwargs))
+        return lease
+
+    marker = tmp_path / "must-not-exist.json"
+    monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
+    monkeypatch.delenv("MFT_AEDT_EXCLUSIVE_1TO1", raising=False)
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_PILOT", raising=False)
+    monkeypatch.setenv("MFT_AEDT_SHARED_1TO2_CANARY", "1")
+    monkeypatch.setenv("MFT_AEDT_SCHEDULER_URL", "http://scheduler:8000")
+    monkeypatch.setenv("MFT_AEDT_PILOT_PRE_SOLVE_READY_FILE", str(marker))
+    monkeypatch.setenv("MFT_AEDT_PILOT_PRE_SOLVE_HANG_SECONDS", "3600")
+    monkeypatch.setattr(
+        adapter,
+        "_scheduler_attach_module",
+        lambda: SimpleNamespace(acquire_project_lease=acquire),
+    )
+
+    adapter.acquire_pooled_desktop(desktop_factory="factory", non_graphical=True)
+    adapter.pilot_pre_solve_barrier("simulation_canary")
+
+    assert requests[0][2]["exclusive_session"] is False
+    assert requests[0][2]["request_key"].startswith("mft-1to2-canary:")
+    assert not marker.exists()
 
 
 def test_shared_pilot_barrier_writes_marker_without_hanging(tmp_path, monkeypatch):
@@ -125,6 +161,7 @@ def test_shared_pilot_barrier_writes_marker_without_hanging(tmp_path, monkeypatc
     monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
     monkeypatch.delenv("MFT_AEDT_EXCLUSIVE_1TO1", raising=False)
     monkeypatch.setenv("MFT_AEDT_SHARED_1TO2_PILOT", "1")
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_CANARY", raising=False)
     monkeypatch.setenv("MFT_AEDT_PILOT_PRE_SOLVE_READY_FILE", str(marker))
     monkeypatch.setenv("MFT_AEDT_PILOT_PRE_SOLVE_HANG_SECONDS", "0")
 

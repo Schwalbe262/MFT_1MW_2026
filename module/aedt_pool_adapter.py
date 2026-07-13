@@ -1,9 +1,8 @@
 """Opt-in bridge from the MFT runner to the scheduler AEDT session host.
 
 The production default remains one runner-owned Desktop per process.  Pooled
-mode requires either the already-proven exclusive 1:1 acknowledgement or the
-separate disposable 1:2 pilot acknowledgement.  The latter is deliberately
-named as a pilot and is not a production enable switch.
+mode requires an explicit exclusive 1:1, disposable shared 1:2 pilot, or
+bounded shared 1:2 canary acknowledgement.  Standalone remains the default.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ STANDALONE_BACKEND = "standalone"
 POOLED_BACKEND = "pooled"
 EXCLUSIVE_1TO1_ACK = "MFT_AEDT_EXCLUSIVE_1TO1"
 SHARED_1TO2_PILOT_ACK = "MFT_AEDT_SHARED_1TO2_PILOT"
+SHARED_1TO2_CANARY_ACK = "MFT_AEDT_SHARED_1TO2_CANARY"
 TERMINAL_LEASE_STATES = {
     "released",
     "failed",
@@ -37,13 +37,17 @@ def aedt_backend() -> str:
             "MFT_AEDT_BACKEND must be 'standalone' or 'pooled'"
         )
     if value == POOLED_BACKEND:
-        exclusive = os.environ.get(EXCLUSIVE_1TO1_ACK, "").strip() == "1"
-        shared_pilot = os.environ.get(SHARED_1TO2_PILOT_ACK, "").strip() == "1"
-        if exclusive == shared_pilot:
+        acknowledgements = {
+            EXCLUSIVE_1TO1_ACK: os.environ.get(EXCLUSIVE_1TO1_ACK, "").strip() == "1",
+            SHARED_1TO2_PILOT_ACK: os.environ.get(SHARED_1TO2_PILOT_ACK, "").strip() == "1",
+            SHARED_1TO2_CANARY_ACK: os.environ.get(SHARED_1TO2_CANARY_ACK, "").strip() == "1",
+        }
+        if sum(acknowledgements.values()) != 1:
             raise RuntimeError(
                 "pooled AEDT requires exactly one explicit acknowledgement: "
                 "MFT_AEDT_EXCLUSIVE_1TO1=1 or "
-                "MFT_AEDT_SHARED_1TO2_PILOT=1"
+                "MFT_AEDT_SHARED_1TO2_PILOT=1 or "
+                "MFT_AEDT_SHARED_1TO2_CANARY=1"
             )
     return value
 
@@ -57,6 +61,17 @@ def shared_1to2_pilot_enabled() -> bool:
         aedt_backend() == POOLED_BACKEND
         and os.environ.get(SHARED_1TO2_PILOT_ACK, "").strip() == "1"
     )
+
+
+def shared_1to2_canary_enabled() -> bool:
+    return (
+        aedt_backend() == POOLED_BACKEND
+        and os.environ.get(SHARED_1TO2_CANARY_ACK, "").strip() == "1"
+    )
+
+
+def shared_1to2_enabled() -> bool:
+    return shared_1to2_pilot_enabled() or shared_1to2_canary_enabled()
 
 
 def _scheduler_attach_module() -> Any:
@@ -114,16 +129,17 @@ def acquire_pooled_desktop(
     pending_project = (
         f"mft-pending-{task_id or os.getpid()}-{uuid.uuid4().hex[:12]}"
     )
-    shared_pilot = shared_1to2_pilot_enabled()
+    shared = shared_1to2_enabled()
+    shared_mode = "canary" if shared_1to2_canary_enabled() else "pilot"
     lease = client.acquire_project_lease(
         scheduler_url,
         pending_project,
         request_key=(
-            f"mft-{'1to2' if shared_pilot else '1to1'}:"
+            f"mft-{'1to2-' + shared_mode if shared else '1to1'}:"
             f"{task_id or os.getpid()}:{uuid.uuid4().hex}"
         ),
         task_id=task_id,
-        exclusive_session=not shared_pilot,
+        exclusive_session=not shared,
     )
     try:
         lease.wait_until_leased(
