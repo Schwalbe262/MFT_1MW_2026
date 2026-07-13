@@ -64,6 +64,10 @@ def attach_policy(**changes) -> policy_module.AttachRefillPolicy:
         "validated_projects_per_aedt": 2,
         "provenance": provenance(),
         "pooled_fraction": 1.0,
+        "node_local_pooled_enabled": True,
+        "node_local_pooled_validation_attestation": (
+            policy_module.NODE_LOCAL_POOLED_VALIDATION_ATTESTATION
+        ),
     }
     values.update(changes)
     return policy_module.AttachRefillPolicy(**values)
@@ -188,6 +192,10 @@ def test_production_policy_pins_restart_v3_with_zero_pooled_fraction():
 
     assert policy.primary_backend == "pooled"
     assert policy.pooled_fraction == 0.0
+    assert policy.node_local_pooled_enabled is True
+    assert policy.node_local_pooled_validation_attestation == (
+        policy_module.NODE_LOCAL_POOLED_VALIDATION_ATTESTATION
+    )
     assert policy.project_concurrency_target == 500
     assert policy.max_aedt_sessions == 250
     assert policy.projects_per_aedt == 2
@@ -300,9 +308,13 @@ class _Response:
         return {"task_id": 901}
 
 
-def test_scheduler_submission_emits_backend_and_scoped_provenance():
+def test_scheduler_pooled_submission_emits_colocation_contract_and_env():
     profile = {"param_overrides": {}, "cli_flags": "--thermal", "timeout_seconds": 99}
     captured = {}
+    bundle_payload = {
+        "aedt_canary_bundle_id": "bundle-canary-hostlifetime-260713f-0001",
+        "aedt_canary_expected_projects": 2,
+    }
 
     def post(_url, *, json, timeout):
         captured.update(json)
@@ -329,18 +341,81 @@ def test_scheduler_submission_emits_backend_and_scoped_provenance():
             aedt_backend="pooled",
             scheduling_profile="fea_bursty",
             submission_env={
+                "MFT_AEDT_BACKEND": "pooled",
                 "MFT_AEDT_SHARED_CANARY": "1",
-                "MFT_DATA_CONTRACT_REVISION": "strict-v2",
+                "MFT_AEDT_SCHEDULER_URL": "http://127.0.0.1:8123",
+                "MFT_SLURM_SCHEDULER_ROOT": (
+                    "~/slurm_scheduler/runs/canary-hostlifetime-260713f-host"
+                ),
             },
             dedupe_scope="a" * 64,
+            entrypoint="aedt_node_canary_client",
+            same_node_as_task_id=777,
+            payload_json=bundle_payload,
         )
 
     assert task_id == 901
     assert captured["aedt_backend"] == "pooled"
     assert captured["scheduling_profile"] == "fea_bursty"
     assert captured["dedupe_key"].endswith(":scope-" + "a" * 64)
-    assert "export MFT_AEDT_SHARED_CANARY=1" in captured["command"]
+    assert captured["entrypoint"] == "aedt_node_canary_client"
+    assert captured["same_node_as_task_id"] == 777
+    assert captured["payload_json"] == bundle_payload
+    exports = (
+        "export MFT_AEDT_BACKEND=pooled",
+        "export MFT_AEDT_SHARED_CANARY=1",
+        "export MFT_AEDT_SCHEDULER_URL=http://127.0.0.1:8123",
+        "export MFT_SLURM_SCHEDULER_ROOT='~/slurm_scheduler/runs/"
+        "canary-hostlifetime-260713f-host'",
+    )
+    for export in exports:
+        assert export in captured["command"]
+        assert captured["command"].index(export) < captured["command"].index(
+            "MFT_SUBMISSION_PROVENANCE"
+        )
     assert "MFT_SUBMISSION_PROVENANCE" in captured["command"]
+    assert (
+        "python run_simulation_260706.py --fixed --thermal --params cand.json"
+        in captured["command"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "error", "message"),
+    [
+        ({"entrypoint": None}, TypeError, "entrypoint must be a string"),
+        (
+            {"entrypoint": " aedt_node_canary_client"},
+            ValueError,
+            "entrypoint must not contain surrounding whitespace",
+        ),
+        (
+            {"same_node_as_task_id": False},
+            TypeError,
+            "same_node_as_task_id must be an integer",
+        ),
+        (
+            {"same_node_as_task_id": -1},
+            ValueError,
+            "same_node_as_task_id must be positive when supplied",
+        ),
+        ({"payload_json": []}, TypeError, "payload_json must be a dict"),
+    ],
+)
+def test_scheduler_colocation_fields_reject_invalid_values(options, error, message):
+    with mock.patch.object(
+        scheduler_client, "campaign_mutation_lock_is_held", return_value=True
+    ):
+        with pytest.raises(error, match=message):
+            scheduler_client._submit_verification_locked(
+                "mft-next-invalid-colocation",
+                "mft-work",
+                {"x": 1},
+                {"param_overrides": {}},
+                solver_revision=SHA["solver"],
+                library_revision=SHA["library"],
+                **options,
+            )
 
 
 def test_scoped_dedupe_changes_only_when_provenance_changes():
@@ -378,23 +453,12 @@ def test_scheduler_parameter_dedupe_changes_with_each_physics_pin():
     }) == 3
 
 
-def ready_pool_status(policy):
-    return {
-        "enabled": True,
-        "operational": True,
-        "validation_passed": True,
-        "max_aedt_sessions": policy.max_aedt_sessions,
-        "target_project_concurrency": policy.project_concurrency_target,
-        "projects_per_aedt": policy.projects_per_aedt,
-    }
-
-
 def test_coordinator_refills_project_deficit_not_desktop_deficit():
     policy = attach_policy()
     plan = controller_module.AttachAwareRefillCoordinator(policy).plan_cycle(
         active_project_tasks=494,
         candidates=candidates(6),
-        pool_status=ready_pool_status(policy),
+        pool_status=None,
     )
 
     assert plan["logical_project_deficit"] == 6
@@ -413,7 +477,7 @@ def test_fractional_pool_admission_does_not_starve_one_slot_cycles():
         controller_module.AttachAwareRefillCoordinator(policy).plan_cycle(
             active_project_tasks=499,
             candidates=[candidate],
-            pool_status=ready_pool_status(policy),
+                pool_status=None,
         )["selected_backend"]
         for candidate in candidates(64)
     ]
@@ -422,14 +486,12 @@ def test_fractional_pool_admission_does_not_starve_one_slot_cycles():
     assert "standalone" in selected
 
 
-def test_pool_gate_failure_uses_existing_standalone_path_without_waiting():
-    policy = attach_policy()
-    status = ready_pool_status(policy)
-    status["operational"] = False
+def test_node_local_pool_gate_failure_uses_standalone_without_waiting():
+    policy = attach_policy(node_local_pooled_enabled=False)
     plan = controller_module.AttachAwareRefillCoordinator(policy).plan_cycle(
         active_project_tasks=498,
         candidates=candidates(2),
-        pool_status=status,
+        pool_status=None,
     )
 
     assert plan["selected_backend"] == "standalone"

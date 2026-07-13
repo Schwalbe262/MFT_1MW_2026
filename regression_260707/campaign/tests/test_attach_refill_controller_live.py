@@ -24,10 +24,14 @@ SCHEDULER_URL = "http://scheduler.test:8000"
 
 
 class _Response:
-    def __init__(self, payload):
+    def __init__(self, payload, *, status_code=200, text=""):
         self._payload = payload
+        self.status_code = status_code
+        self.text = text
 
     def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
         return None
 
     def json(self):
@@ -284,6 +288,16 @@ def test_generation_identity_changes_with_concurrency_and_physics_pins():
             changed_target["id"],
         }
     ) == 4
+
+    rollout_flip = generation(
+        replace(
+            policy,
+            pooled_fraction=0.75,
+            node_local_pooled_enabled=not policy.node_local_pooled_enabled,
+        )
+    )
+    assert rollout_flip["id"] == base["id"]
+    assert rollout_flip["digest"] == base["digest"]
     assert len(
         {
             base["digest"],
@@ -294,7 +308,7 @@ def test_generation_identity_changes_with_concurrency_and_physics_pins():
     ) == 4
 
 
-def test_live_policy_rejects_nonzero_pooled_fraction(tmp_path):
+def test_live_policy_accepts_reviewed_nonzero_pooled_fraction(tmp_path):
     payload = json.loads(
         controller.DEFAULT_POLICY_PATH.read_text(encoding="utf-8")
     )
@@ -302,8 +316,24 @@ def test_live_policy_rejects_nonzero_pooled_fraction(tmp_path):
     path = tmp_path / "unreviewed-pooled-policy.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="pooled_fraction.*False"):
-        controller._load_policy(path)
+    policy = controller._load_policy(path)
+    assert policy.pooled_fraction == 0.01
+    assert controller.pool_gate(policy)["eligible"] is True
+
+
+def test_live_policy_allows_node_local_readiness_kill_switch(tmp_path):
+    payload = json.loads(
+        controller.DEFAULT_POLICY_PATH.read_text(encoding="utf-8")
+    )
+    payload["pooled_fraction"] = 1.0
+    payload["node_local_pooled_enabled"] = False
+    path = tmp_path / "pooled-disabled-policy.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    policy = controller._load_policy(path)
+
+    assert policy.node_local_pooled_enabled is False
+    assert controller.pool_gate(policy)["eligible"] is False
 
 
 @pytest.mark.parametrize(
@@ -390,3 +420,603 @@ def test_authorized_mocked_run_advances_fresh_state_once(
     sentinels["post"].assert_not_called()
     sentinels["cancel"].assert_not_called()
     sentinels["cancel_cas"].assert_not_called()
+
+
+class _TextResponse(_Response):
+    def __init__(self, text):
+        super().__init__(None)
+        self.text = text
+
+
+def _active_allocation(
+    allocation_id=41,
+    account="account-a",
+    *,
+    free_cpus=64,
+    free_memory_mb=262_144,
+    state="active",
+):
+    return {
+        "id": allocation_id,
+        "account_name": account,
+        "state": state,
+        "resource_pool": "cpu",
+        "node_name": f"n{allocation_id}",
+        "slurm_job_id": f"job-{allocation_id}",
+        "free_cpus": free_cpus,
+        "free_memory_mb": free_memory_mb,
+    }
+
+
+def _pooled_runtime(tmp_path, monkeypatch, *, discovery_text=""):
+    policy = replace(
+        controller._load_policy(controller.DEFAULT_POLICY_PATH),
+        pooled_fraction=1.0,
+    )
+    profile = controller._load_profile(controller.DEFAULT_TIMEOUT_SECONDS)
+    generation = controller._generation_contract(
+        policy,
+        candidate_seed=controller.DEFAULT_CANDIDATE_SEED,
+        profile=profile,
+        cpus=controller.DEFAULT_CPUS,
+        memory_mb=controller.DEFAULT_MEMORY_MB,
+    )
+    state_path = tmp_path / "restart_v3_controller_state.json"
+    state = controller._new_state(generation, SCHEDULER_URL)
+    controller._atomic_save_state(state_path, state)
+    monkeypatch.setattr(controller.pinned_pilot, "next_valid_candidate", _candidate)
+    monkeypatch.setattr(
+        controller.scheduler_client,
+        "campaign_mutation_lock",
+        lambda: nullcontext(),
+    )
+    scheduler = {
+        "discovery_text": discovery_text,
+        "host_posts": [],
+        "host_task_id": 701,
+        "host_status": "running",
+        "host_post_status": 201,
+        "client_statuses": {},
+    }
+    base_get = _scheduler_get(active=498)
+
+    def get(url, params=None, timeout=None):
+        if url == f"{SCHEDULER_URL}/api/allocations":
+            assert params is None
+            assert timeout == 30
+            return _Response([_active_allocation()])
+        if url == f"{SCHEDULER_URL}/api/tasks/{scheduler['host_task_id']}":
+            assert params is None
+            assert timeout == 30
+            return _Response(
+                {
+                    "id": scheduler["host_task_id"],
+                    "status": scheduler["host_status"],
+                }
+            )
+        if url == (
+            f"{SCHEDULER_URL}/api/tasks/{scheduler['host_task_id']}/stdout"
+        ):
+            assert params == {"max_bytes": controller.NODE_CANARY_STDOUT_MAX_BYTES}
+            assert timeout == 30
+            return _TextResponse(scheduler["discovery_text"])
+        for task_id, status in scheduler["client_statuses"].items():
+            if url == f"{SCHEDULER_URL}/api/tasks/{task_id}":
+                assert params is None
+                assert timeout == 30
+                return _Response({"id": task_id, "status": status})
+        if (
+            url == f"{SCHEDULER_URL}/api/tasks"
+            and params
+            and str(params.get("name_prefix") or "").endswith("-host")
+        ):
+            assert timeout == 30
+            return _Response([])
+        return base_get(url, params=params, timeout=timeout)
+
+    def post(url, json=None, timeout=None):
+        assert url == f"{SCHEDULER_URL}/api/tasks"
+        assert timeout == 20
+        scheduler["host_posts"].append(dict(json))
+        return _Response(
+            {"id": scheduler["host_task_id"]},
+            status_code=scheduler["host_post_status"],
+            text="allocation is no longer attachable",
+        )
+
+    monkeypatch.setattr(controller.scheduler_client.requests, "get", get)
+    monkeypatch.setattr(controller.scheduler_client.requests, "post", post)
+    return policy, profile, generation, state_path, scheduler
+
+
+def test_node_canary_discovery_line_parsing_is_loopback_and_n2():
+    line = "NODE_CANARY_DISCOVERY " + json.dumps(
+        {
+            "schema_version": 1,
+            "mode": "scheduler_managed_node_local_canary",
+            "scheduler_url": "http://127.0.0.1:8123",
+            "expected_projects": 2,
+            "node": "n116",
+            "rollback_file": "/tmp/bundle.rollback",
+        }
+    )
+
+    discovery = controller.parse_node_canary_discovery(
+        f"booting\n{line}\n", expected_projects=2
+    )
+
+    assert discovery["scheduler_url"] == "http://127.0.0.1:8123"
+    assert discovery["node"] == "n116"
+    with pytest.raises(ValueError, match="loopback"):
+        controller.parse_node_canary_discovery(
+            line.replace("127.0.0.1", "scheduler.example"),
+            expected_projects=2,
+        )
+    with pytest.raises(ValueError, match="contract failed"):
+        controller.parse_node_canary_discovery(line, expected_projects=1)
+
+
+def test_allocation_selection_round_robins_accounts_and_respects_capacity():
+    two_bundle_capacity = {
+        "free_cpus": 18,
+        "free_memory_mb": 270_336,
+    }
+    allocations = [
+        _active_allocation(11, "account-a", **two_bundle_capacity),
+        _active_allocation(21, "account-b", **two_bundle_capacity),
+    ]
+
+    selected, last = controller.select_host_allocations(
+        allocations,
+        [2, 2, 2, 2],
+        client_cpus=4,
+        client_memory_mb=65_536,
+    )
+
+    assert [item["account_name"] for item in selected] == [
+        "account-a",
+        "account-b",
+        "account-a",
+        "account-b",
+    ]
+    assert last == "account-b"
+    resumed, resumed_last = controller.select_host_allocations(
+        allocations,
+        [2],
+        client_cpus=4,
+        client_memory_mb=65_536,
+        last_account="account-a",
+    )
+    assert resumed[0]["account_name"] == "account-b"
+    assert resumed_last == "account-b"
+
+
+def test_allocation_selection_never_overbooks_host_bundle_footprint():
+    one_slot = _active_allocation(
+        31,
+        "account-a",
+        free_cpus=9,
+        free_memory_mb=135_168,
+    )
+    selected, _ = controller.select_host_allocations(
+        [one_slot],
+        [2, 2],
+        client_cpus=4,
+        client_memory_mb=65_536,
+    )
+    assert [item["id"] if item else None for item in selected] == [31, None]
+
+    selected, _ = controller.select_host_allocations(
+        [
+            one_slot,
+            _active_allocation(32, "account-b", state="warm"),
+            _active_allocation(33, "account-b", free_cpus=8),
+        ],
+        [2],
+        client_cpus=4,
+        client_memory_mb=65_536,
+        reserved_by_allocation={
+            31: {"cpus": 9, "memory_mb": 135_168, "hosts": 1}
+        },
+    )
+    assert selected == [None]
+
+
+def test_pooled_bundle_resume_uses_persisted_host_and_builds_exact_clients(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    submit = mock.Mock(side_effect=[801, 802])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    first = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    bundle = persisted["pooled_bundles"][0]
+
+    assert first["action"] == "pooled_bundle_pending"
+    assert bundle["phase"] == "discovery_wait"
+    assert bundle["host_task_id"] == 701
+    assert len(scheduler["host_posts"]) == 1
+    host = scheduler["host_posts"][0]
+    assert host["entrypoint"] == "aedt_node_canary_host"
+    assert host["requested_allocation_id"] == 41
+    assert host["project"] == "_aedt_pool_hosts"
+    assert host["payload_json"] == {
+        "aedt_canary_bundle_id": bundle["bundle_id"],
+        "aedt_canary_expected_projects": 2,
+        "aedt_canary_discovery_file": bundle["coordination_files"]["discovery"],
+        "aedt_canary_evidence_file": bundle["coordination_files"]["evidence"],
+        "aedt_canary_rollback_file": bundle["coordination_files"]["rollback"],
+        "aedt_canary_scheduler_revision": controller.NODE_CANARY_SCHEDULER_REVISION,
+    }
+    assert controller.NODE_CANARY_SCHEDULER_REVISION in host["command"]
+    submit.assert_not_called()
+
+    scheduler["discovery_text"] = "NODE_CANARY_DISCOVERY " + json.dumps(
+        {
+            "schema_version": 1,
+            "mode": "scheduler_managed_node_local_canary",
+            "scheduler_url": "http://127.0.0.1:8123",
+            "expected_projects": 2,
+            "node": "n41",
+            "rollback_file": bundle["coordination_files"]["rollback"],
+        }
+    )
+    second = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert second["accepted_or_reconciled_count"] == 2
+    assert len(scheduler["host_posts"]) == 1
+    assert submit.call_count == 2
+    for call in submit.call_args_list:
+        kwargs = call.kwargs
+        assert kwargs["aedt_backend"] == "pooled"
+        assert kwargs["entrypoint"] == "aedt_node_canary_client"
+        assert kwargs["same_node_as_task_id"] == 701
+        assert kwargs["payload_json"] == {
+            "aedt_canary_bundle_id": bundle["bundle_id"],
+            "aedt_canary_expected_projects": 2,
+        }
+        assert kwargs["submission_env"]["MFT_AEDT_BACKEND"] == "pooled"
+        assert kwargs["submission_env"]["MFT_AEDT_SHARED_CANARY"] == "1"
+        assert kwargs["submission_env"]["MFT_AEDT_SCHEDULER_URL"] == (
+            "http://127.0.0.1:8123"
+        )
+        assert kwargs["submission_env"]["MFT_SLURM_SCHEDULER_ROOT"] == (
+            f"~/slurm_scheduler/runs/{bundle['bundle_id']}-host"
+        )
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert resumed["reservations"] == []
+    assert resumed["state_revision"] == 2
+    assert resumed["pooled_bundles"][0]["phase"] == "clients_tracked"
+    assert resumed["pooled_bundles"][0]["client_task_ids"] == [801, 802]
+
+
+def test_readiness_kill_switch_falls_back_before_client_admission(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    submit = mock.Mock(side_effect=[851, 852])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    disabled = replace(policy, node_local_pooled_enabled=False)
+
+    result = controller._run_cycle(
+        disabled, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert result["accepted_or_reconciled_count"] == 2
+    assert len(scheduler["host_posts"]) == 1
+    assert all(
+        call.kwargs["aedt_backend"] == "standalone"
+        for call in submit.call_args_list
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    bundle = state["pooled_bundles"][0]
+    assert bundle["phase"] == "complete"
+    assert "pool gate closed" in bundle["failure_reason"]
+    assert bundle["client_task_ids"] == [None, None]
+
+
+def test_discovery_timeout_falls_back_to_new_standalone_identities(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    submit = mock.Mock(side_effect=[901, 902])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted["pooled_bundles"][0]["discovery_deadline_at"] = (
+        "2000-01-01T00:00:00Z"
+    )
+    controller._atomic_save_state(state_path, persisted)
+    scheduler["discovery_text"] = "NODE_CANARY_DISCOVERY " + json.dumps(
+        {
+            "schema_version": 1,
+            "mode": "scheduler_managed_node_local_canary",
+            "scheduler_url": "http://127.0.0.1:8123",
+            "expected_projects": 2,
+            "node": "late-node",
+            "rollback_file": "/tmp/late.rollback",
+        }
+    )
+
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert result["accepted_or_reconciled_count"] == 2
+    assert len(scheduler["host_posts"]) == 1
+    assert submit.call_count == 2
+    for call in submit.call_args_list:
+        assert call.kwargs["aedt_backend"] == "standalone"
+        assert "-sa-retry-" in call.kwargs["name"]
+        assert "entrypoint" not in call.kwargs
+        assert "same_node_as_task_id" not in call.kwargs
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["pooled_bundles"][0]["phase"] == "complete"
+    assert state["pooled_bundles"][0]["fallback_task_ids"] == [901, 902]
+    assert all(item["backend"] == "standalone" for item in state["submissions"])
+    assert all(
+        "-sa-retry-" in item["name"] for item in state["submissions"]
+    )
+    assert controller._reserved_allocation_footprints(
+        state, generation
+    ) == {
+        41: {"cpus": 1, "memory_mb": 4_096, "hosts": 1}
+    }
+
+    scheduler["host_status"] = "completed"
+    events = []
+    controller._refresh_bundle_host_terminals(
+        state, generation, SCHEDULER_URL, state_path, events
+    )
+
+    assert state["pooled_bundles"][0]["host_terminal_status"] == "completed"
+    assert events[0]["transition"] == "host_terminal_observed"
+    assert controller._reserved_allocation_footprints(state, generation) == {}
+
+
+def test_terminal_host_before_discovery_falls_back_without_cancellation(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    submit = mock.Mock(side_effect=[911, 912])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    scheduler["host_status"] = "failed"
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert result["accepted_or_reconciled_count"] == 2
+    assert result["cancel_task_ids"] == []
+    assert len(scheduler["host_posts"]) == 1
+    assert all(
+        call.kwargs["aedt_backend"] == "standalone"
+        for call in submit.call_args_list
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    bundle = state["pooled_bundles"][0]
+    assert bundle["phase"] == "complete"
+    assert "became terminal before discovery: failed" in bundle["failure_reason"]
+
+
+@pytest.mark.parametrize("interruption", ["host_failure", "client_rejection"])
+def test_partial_client_admission_retries_missing_rows_standalone(
+    tmp_path, monkeypatch, interruption
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    bundle = persisted["pooled_bundles"][0]
+    scheduler["discovery_text"] = "NODE_CANARY_DISCOVERY " + json.dumps(
+        {
+            "schema_version": 1,
+            "mode": "scheduler_managed_node_local_canary",
+            "scheduler_url": "http://127.0.0.1:8123",
+            "expected_projects": 2,
+            "node": "n41",
+            "rollback_file": bundle["coordination_files"]["rollback"],
+        }
+    )
+
+    admitted = []
+
+    def submit_first_client(**kwargs):
+        admitted.append(kwargs)
+        if len(admitted) == 1:
+            if interruption == "host_failure":
+                scheduler["host_status"] = "failed"
+            return 801
+        return None
+
+    monkeypatch.setattr(
+        controller.scheduler_client,
+        "submit_verification",
+        mock.Mock(side_effect=submit_first_client),
+    )
+    first = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert first["accepted_or_reconciled_count"] == 1
+    assert len(admitted) == (1 if interruption == "host_failure" else 2)
+    partial = json.loads(state_path.read_text(encoding="utf-8"))
+    partial_bundle = partial["pooled_bundles"][0]
+    assert partial_bundle["phase"] == "clients_partial_tracked"
+    assert partial_bundle["client_task_ids"] == [801, None]
+    assert partial_bundle["host_terminal_status"] == (
+        "failed" if interruption == "host_failure" else None
+    )
+    assert (
+        "terminal during client admission"
+        if interruption == "host_failure"
+        else "definitively rejected"
+    ) in partial_bundle["failure_reason"]
+
+    scheduler["client_statuses"][801] = "failed"
+    fallback_submit = mock.Mock(side_effect=[901, 902])
+    monkeypatch.setattr(
+        controller.scheduler_client,
+        "submit_verification",
+        fallback_submit,
+    )
+    second = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert second["accepted_or_reconciled_count"] == 2
+    assert fallback_submit.call_count == 2
+    assert all(
+        call.kwargs["aedt_backend"] == "standalone"
+        and "-sa-retry-" in call.kwargs["name"]
+        for call in fallback_submit.call_args_list
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    completed = state["pooled_bundles"][0]
+    assert completed["phase"] == "complete"
+    assert completed["client_fallback_task_ids"] == [901, 902]
+    assert state["reservations"] == []
+    assert [(item["serial"], item["backend"]) for item in state["submissions"]] == [
+        (1, "pooled"),
+        (2, "standalone"),
+    ]
+
+
+def test_rejected_exact_host_placement_falls_back_instead_of_wedging(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    scheduler["host_post_status"] = 409
+    submit = mock.Mock(side_effect=[921, 922])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert result["accepted_or_reconciled_count"] == 2
+    assert len(scheduler["host_posts"]) == 1
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    bundle = state["pooled_bundles"][0]
+    assert bundle["phase"] == "complete"
+    assert "HTTP 409" in bundle["failure_reason"]
+    assert all(
+        call.kwargs["aedt_backend"] == "standalone"
+        for call in submit.call_args_list
+    )
+
+
+def test_expired_host_submit_intent_falls_back_without_creating_late_host(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+
+    def uncertain_post(url, json=None, timeout=None):
+        scheduler["host_posts"].append(dict(json))
+        raise TimeoutError("controller lost the host POST response")
+
+    monkeypatch.setattr(
+        controller.scheduler_client.requests, "post", uncertain_post
+    )
+    with pytest.raises(TimeoutError, match="lost the host POST"):
+        controller._run_cycle(
+            policy, generation, profile, SCHEDULER_URL, state_path
+        )
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    bundle = persisted["pooled_bundles"][0]
+    assert bundle["phase"] == "host_submit"
+    assert bundle["host_task_id"] is None
+    assert bundle["discovery_deadline_at"] is not None
+    bundle["discovery_deadline_at"] = "2000-01-01T00:00:00Z"
+    controller._atomic_save_state(state_path, persisted)
+
+    late_post = mock.Mock(side_effect=AssertionError("late host POST"))
+    submit = mock.Mock(side_effect=[931, 932])
+    monkeypatch.setattr(controller.scheduler_client.requests, "post", late_post)
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    late_post.assert_not_called()
+    assert result["accepted_or_reconciled_count"] == 2
+    assert all(
+        call.kwargs["aedt_backend"] == "standalone"
+        for call in submit.call_args_list
+    )
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    resumed_bundle = resumed["pooled_bundles"][0]
+    assert resumed_bundle["phase"] == "complete"
+    assert resumed_bundle["host_task_id"] is None
+    assert "deadline elapsed" in resumed_bundle["failure_reason"]
+
+
+def test_terminal_missing_client_row_retries_as_new_standalone_identity(
+    tmp_path, monkeypatch
+):
+    discovery = "NODE_CANARY_DISCOVERY " + json.dumps(
+        {
+            "schema_version": 1,
+            "mode": "scheduler_managed_node_local_canary",
+            "scheduler_url": "http://127.0.0.1:8123",
+            "expected_projects": 2,
+            "node": "n41",
+            "rollback_file": "/tmp/bundle.rollback",
+        }
+    )
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch, discovery_text=discovery
+    )
+    submit = mock.Mock(side_effect=[801, 802, 903])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    scheduler["client_statuses"] = {801: "completed", 802: "failed"}
+    fetch = mock.Mock(
+        return_value=controller.scheduler_client.ResultFetch(
+            controller.scheduler_client.RESULT_VALID, {"accepted": True}
+        )
+    )
+    monkeypatch.setattr(controller.scheduler_client, "fetch_result", fetch)
+
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert result["accepted_or_reconciled_count"] == 1
+    assert submit.call_count == 3
+    retry = submit.call_args_list[-1].kwargs
+    assert retry["aedt_backend"] == "standalone"
+    assert retry["name"].endswith("-1")
+    assert "-sa-retry-" in retry["name"]
+    assert retry["name"] != submit.call_args_list[1].kwargs["name"]
+    fetch.assert_called_once()
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    bundle = state["pooled_bundles"][0]
+    assert bundle["phase"] == "complete"
+    assert bundle["client_fallback_task_ids"] == [None, 903]
+    assert bundle["missing_candidate_indices"] == [1]

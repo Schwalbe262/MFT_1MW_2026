@@ -531,7 +531,8 @@ def submit_verification(
         solver_revision=None, library_revision=None,
         required_project_cap=None, *, aedt_backend="standalone",
         scheduling_profile="fea_bursty", submission_env=None,
-        dedupe_scope=None):
+        dedupe_scope=None, entrypoint="", same_node_as_task_id=0,
+        payload_json=None):
     """Submit one MFT task under the shared cross-process mutation lock."""
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
@@ -543,6 +544,9 @@ def submit_verification(
             scheduling_profile=scheduling_profile,
             submission_env=submission_env,
             dedupe_scope=dedupe_scope,
+            entrypoint=entrypoint,
+            same_node_as_task_id=same_node_as_task_id,
+            payload_json=payload_json,
         )
     with campaign_mutation_lock():
         return _submit_verification_locked(
@@ -554,6 +558,9 @@ def submit_verification(
             scheduling_profile=scheduling_profile,
             submission_env=submission_env,
             dedupe_scope=dedupe_scope,
+            entrypoint=entrypoint,
+            same_node_as_task_id=same_node_as_task_id,
+            payload_json=payload_json,
         )
 
 
@@ -562,7 +569,8 @@ def _submit_verification_locked(
         solver_revision=None, library_revision=None,
         required_project_cap=None, *, aedt_backend="standalone",
         scheduling_profile="fea_bursty", submission_env=None,
-        dedupe_scope=None):
+        dedupe_scope=None, entrypoint="", same_node_as_task_id=0,
+        payload_json=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
@@ -583,6 +591,17 @@ def _submit_verification_locked(
         raise ValueError("aedt_backend must be standalone or pooled")
     if scheduling_profile != "fea_bursty":
         raise ValueError("MFT FEA task scheduling_profile must be fea_bursty")
+    if not isinstance(entrypoint, str):
+        raise TypeError("entrypoint must be a string")
+    if entrypoint != entrypoint.strip():
+        raise ValueError("entrypoint must not contain surrounding whitespace")
+    if (isinstance(same_node_as_task_id, bool)
+            or not isinstance(same_node_as_task_id, int)):
+        raise TypeError("same_node_as_task_id must be an integer")
+    if same_node_as_task_id < 0:
+        raise ValueError("same_node_as_task_id must be positive when supplied")
+    if payload_json is not None and not isinstance(payload_json, dict):
+        raise TypeError("payload_json must be a dict")
     normalized_env = _normalized_submission_env(submission_env)
     submission_provenance = {
         "aedt_backend": aedt_backend,
@@ -694,6 +713,12 @@ def _submit_verification_locked(
         # every terminal path, including cancellation and allocation loss.
         "cleanup_globs": scratch_leaf,
     }
+    if entrypoint:
+        payload["entrypoint"] = entrypoint
+    if same_node_as_task_id:
+        payload["same_node_as_task_id"] = same_node_as_task_id
+    if payload_json is not None:
+        payload["payload_json"] = payload_json
     existing = reconcile_task_id(name, dedupe_key)
     if existing is not None:
         return existing

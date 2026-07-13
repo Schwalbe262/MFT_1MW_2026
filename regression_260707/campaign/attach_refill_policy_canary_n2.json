@@ -2,6 +2,8 @@
   "schema": "mft-attach-aware-refill-policy-v1",
   "primary_backend": "pooled",
   "pooled_fraction": 0.0,
+  "node_local_pooled_enabled": true,
+  "node_local_pooled_validation_attestation": "canary-hostlifetime-260713f:passed=true",
   "project_concurrency_target": 500,
   "max_aedt_sessions": 250,
   "projects_per_aedt": 2,

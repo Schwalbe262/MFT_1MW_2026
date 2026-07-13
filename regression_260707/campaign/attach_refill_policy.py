@@ -26,6 +26,9 @@ from typing import Iterable, Mapping, Sequence
 
 STANDALONE = "standalone"
 POOLED = "pooled"
+NODE_LOCAL_POOLED_VALIDATION_ATTESTATION = (
+    "canary-hostlifetime-260713f:passed=true"
+)
 FEA_BURSTY = "fea_bursty"
 REVIEWED_PROJECT_CONCURRENCY_CAP = 500
 ACTIVE_TASK_STATES = frozenset({"queued", "attaching", "running"})
@@ -172,6 +175,8 @@ class AttachRefillPolicy:
     validated_projects_per_aedt: int
     provenance: RevisionProvenance
     pooled_fraction: float = 0.0
+    node_local_pooled_enabled: bool = False
+    node_local_pooled_validation_attestation: str = ""
     standalone_profile: str = FEA_BURSTY
     pooled_profile: str = FEA_BURSTY
     failed_bundle_fallback: str = STANDALONE
@@ -192,6 +197,20 @@ class AttachRefillPolicy:
         if not math.isfinite(pooled_fraction) or not 0 <= pooled_fraction <= 1:
             raise ValueError("pooled_fraction must be finite and between 0 and 1")
         object.__setattr__(self, "pooled_fraction", pooled_fraction)
+        if not isinstance(self.node_local_pooled_enabled, bool):
+            raise ValueError("node_local_pooled_enabled must be a boolean")
+        attestation = str(
+            self.node_local_pooled_validation_attestation or ""
+        ).strip()
+        if len(attestation) > 256:
+            raise ValueError(
+                "node_local_pooled_validation_attestation is too long"
+            )
+        object.__setattr__(
+            self,
+            "node_local_pooled_validation_attestation",
+            attestation,
+        )
         for field in (
             "project_concurrency_target",
             "max_aedt_sessions",
@@ -246,6 +265,10 @@ class AttachRefillPolicy:
             "projects_per_aedt": self.projects_per_aedt,
             "validated_projects_per_aedt": self.validated_projects_per_aedt,
             "pooled_fraction": self.pooled_fraction,
+            "node_local_pooled_enabled": self.node_local_pooled_enabled,
+            "node_local_pooled_validation_attestation": (
+                self.node_local_pooled_validation_attestation
+            ),
             "standalone_profile": self.standalone_profile,
             "pooled_profile": self.pooled_profile,
             "failed_bundle_fallback": self.failed_bundle_fallback,
@@ -412,6 +435,7 @@ def task_submission_options(
         "MFT_EXPECTED_ROWS": "1",
     }
     if bundle.backend == POOLED:
+        env["MFT_AEDT_BACKEND"] = POOLED
         env["MFT_AEDT_SHARED_CANARY"] = "1"
     return {
         "aedt_backend": bundle.backend,
