@@ -13,6 +13,7 @@ import pandas as pd
 from run_simulation_260706 import (
     Simulation,
     SolutionDataUnavailableError,
+    _PooledDesktop,
     _assign_native_copied_core_loss,
     _assert_native_core_loss_assignment,
     _completion_exit_code,
@@ -21,10 +22,13 @@ from run_simulation_260706 import (
     _configure_copied_loss_setup,
     _configure_em_conductor_mesh,
     _configure_loss_copy_skin_mesh,
+    _create_handle_bound_project,
+    _create_handle_bound_project_design,
     _delete_copied_solution_or_raise,
     _em_result_is_valid,
     _em_result_validation,
     _edit_native_copied_loss_winding,
+    _find_raw_design,
     _native_winding_child,
     _parse_rl_matrix_export,
     _remap_copied_design_objects,
@@ -114,6 +118,29 @@ def _simulation_with_post(post):
 
 
 class DesktopSessionRetryTests(unittest.TestCase):
+    @patch("run_simulation_260706.GUI", False)
+    @patch("run_simulation_260706.Simulation")
+    @patch("run_simulation_260706.acquire_pooled_desktop")
+    @patch("run_simulation_260706.aedt_backend", return_value="pooled")
+    def test_pooled_session_uses_desktop_wrapper_without_global_autosave_mutation(
+            self, _backend, acquire, simulation_factory):
+        desktop = Mock()
+        lease = Mock()
+        simulation = Mock()
+        acquire.return_value = (desktop, lease)
+        simulation_factory.return_value = simulation
+
+        actual_desktop, actual_simulation = _create_simulation_session()
+
+        self.assertIs(actual_desktop, desktop)
+        self.assertIs(actual_simulation, simulation)
+        acquire.assert_called_once_with(
+            desktop_factory=_PooledDesktop,
+            non_graphical=False,
+        )
+        self.assertTrue(_PooledDesktop.disable_autosave(object()))
+        self.assertIs(simulation.aedt_lease, lease)
+
     @patch("run_simulation_260706.time.sleep")
     @patch("run_simulation_260706._terminate_spawned_descendants")
     @patch(
@@ -1295,6 +1322,66 @@ def _prepared_wrapper(raw, windings=None):
 
 
 class CopiedLossPreparationRetryTests(unittest.TestCase):
+    def test_exact_design_lookup_never_reads_or_mutates_active_state(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        copied = _NativeLossDesign("copy")
+        get_active = Mock(side_effect=AssertionError("GetActiveDesign is global"))
+        set_active = Mock(side_effect=AssertionError("SetActiveDesign is mutable"))
+        project = SimpleNamespace(
+            GetDesigns=lambda: [source, copied],
+            GetActiveDesign=get_active,
+            SetActiveDesign=set_active,
+        )
+
+        selected = _find_raw_design(
+            project, "copy", allow_active_fallback=False
+        )
+
+        self.assertIs(selected, copied)
+        get_active.assert_not_called()
+        set_active.assert_not_called()
+
+    def test_string_design_list_uses_named_selection_on_bound_project(self):
+        copied = _NativeLossDesign("copy")
+        get_active = Mock(side_effect=AssertionError("GetActiveDesign is global"))
+        set_active = Mock(return_value=copied)
+        project = SimpleNamespace(
+            GetDesigns=lambda: ["simulation_test;copy"],
+            GetActiveDesign=get_active,
+            SetActiveDesign=set_active,
+        )
+
+        selected = _find_raw_design(project, "copy")
+
+        self.assertIs(selected, copied)
+        get_active.assert_not_called()
+        set_active.assert_called_once_with("copy")
+
+    def test_copy_retry_uses_only_named_design_handles(self):
+        source = _NativeLossDesign("maxwell_matrix", matrix=True, solved=True)
+        project = _NativeLossProject(source)
+        project.GetActiveDesign = Mock(
+            side_effect=AssertionError("GetActiveDesign is global")
+        )
+        project.SetActiveDesign = Mock(
+            side_effect=AssertionError("SetActiveDesign is mutable")
+        )
+
+        def prepare(_before, _attempt):
+            copied = _NativeLossDesign("copy")
+            project.designs.append(copied)
+            return _prepared_wrapper(copied)
+
+        prepared, attempts = _retry_copied_loss_preparation(
+            project, "maxwell_matrix", prepare,
+            max_attempts=1, retry_delay_s=0,
+        )
+
+        self.assertEqual(prepared.design_name, "copy")
+        self.assertEqual(attempts, 1)
+        project.GetActiveDesign.assert_not_called()
+        project.SetActiveDesign.assert_not_called()
+
     def test_native_winding_prefers_boundaries_when_alias_is_in_both_roots(self):
         boundary_child = _NativeTree(properties={"Current": "1A"})
         excitation_alias = _NativeTree(properties={"Current": "stale"})
@@ -1775,7 +1862,7 @@ class CopiedLossReadinessTests(unittest.TestCase):
         self.assertEqual(wrapper.design_name, "copy")
         self.assertIs(setup, wrapper.get_setup("Setup1"))
         self.assertEqual(factory_calls, [("copy", "AC Magnetic")])
-        self.assertEqual(project.active_calls, ["copy"])
+        self.assertEqual(project.active_calls, [])
 
     def test_retries_transient_wrapper_state(self):
         source = _FakeRawDesign("source")
@@ -1796,7 +1883,7 @@ class CopiedLossReadinessTests(unittest.TestCase):
 
         self.assertEqual(wrapper.solution_type, "AC Magnetic")
         self.assertTrue(hasattr(setup, "properties"))
-        self.assertEqual(project.active_calls, ["copy", "copy", "copy", "copy"])
+        self.assertEqual(project.active_calls, [])
 
     def test_accepts_eddy_current_solution_alias(self):
         source = _FakeRawDesign("source")
@@ -2057,6 +2144,62 @@ $end 'DSOConfig'
             initial_retry_delay=0,
             sleeper=lambda _seconds: None,
         )
+
+    def test_pooled_preflight_uses_named_handles_and_no_desktop_globals(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, desktop, project, design, _high_level = self._simulation(root)
+            simulation.aedt_backend = "pooled"
+            simulation._bound_native_project = project
+            project.GetDesigns = Mock(return_value=[design])
+            project.SetActiveDesign = Mock(
+                side_effect=AssertionError("named handle lookup must remain stable")
+            )
+            desktop.SetActiveProject = Mock(
+                side_effect=AssertionError("Desktop active project is shared")
+            )
+            desktop.AreThereSimulationsRunning = Mock(
+                side_effect=AssertionError("Desktop running state includes siblings")
+            )
+            desktop.GetRegistryString = Mock(
+                side_effect=AssertionError("Desktop DSO registry is shared")
+            )
+            desktop.SetRegistryString = Mock(
+                side_effect=AssertionError("Desktop DSO registry is shared")
+            )
+            desktop.SetRegistryFromFile = Mock(
+                side_effect=AssertionError("Desktop DSO registry is shared")
+            )
+
+            context = simulation._prepare_copied_loss_native_analysis()
+            simulation._postcheck_copied_loss_native_analysis()
+
+            self.assertIs(context["odesign"], design)
+            self.assertIsNone(context["odesktop"])
+            self.assertIsNone(context["registry_key"])
+            project.SetActiveDesign.assert_not_called()
+            desktop.SetActiveProject.assert_not_called()
+            desktop.AreThereSimulationsRunning.assert_not_called()
+            desktop.GetRegistryString.assert_not_called()
+            desktop.SetRegistryString.assert_not_called()
+            desktop.SetRegistryFromFile.assert_not_called()
+
+    def test_pooled_preflight_retries_transient_explicit_handle_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            simulation, _desktop, project, design, _high_level = self._simulation(root)
+            simulation.aedt_backend = "pooled"
+            simulation._bound_native_project = project
+            project.GetDesigns = Mock(return_value=[design])
+            verify = Mock(side_effect=[RuntimeError("transient gRPC"), project])
+            simulation._verified_native_project_handle = verify
+
+            context = simulation._prepare_copied_loss_native_analysis(
+                max_attempts=2,
+                initial_retry_delay=0,
+                sleeper=lambda _seconds: None,
+            )
+
+            self.assertIs(context["odesign"], design)
+            self.assertEqual(verify.call_count, 2)
 
     def test_transient_registry_preflight_then_exactly_one_native_solve(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2507,6 +2650,12 @@ class NativeProjectHandleTests(unittest.TestCase):
         calls = []
 
         class NativeProject:
+            def GetName(self):
+                return "simulation_test"
+
+            def GetDesigns(self):
+                return [active_design] if active_design is not None else []
+
             def SetActiveDesign(self, name):
                 calls.append(("active", name))
                 return active_design
@@ -2527,6 +2676,174 @@ class NativeProjectHandleTests(unittest.TestCase):
 
         self.assertIs(simulation._native_project_handle(), native)
 
+    def test_pooled_project_creation_wraps_returned_handle_without_reselection(self):
+        with tempfile.TemporaryDirectory() as root:
+            native = SimpleNamespace(
+                GetName=Mock(return_value="simulation_test"),
+                GetPath=Mock(return_value=root),
+                SaveAs=Mock(return_value=True),
+            )
+            get_projects = Mock(side_effect=[[], ["simulation_test"]])
+            set_active = Mock(
+                side_effect=AssertionError("Desktop active project is shared")
+            )
+            odesktop = SimpleNamespace(
+                GetProjectList=get_projects,
+                NewProject=Mock(return_value=native),
+                SetActiveProject=set_active,
+            )
+            desktop = SimpleNamespace(odesktop=odesktop)
+
+            wrapped, selected = _create_handle_bound_project(
+                desktop, root, "simulation_test"
+            )
+
+            self.assertIs(selected, native)
+            self.assertIs(wrapped.project, native)
+            self.assertIs(wrapped.proj, native)
+            self.assertEqual(get_projects.call_count, 1)
+            set_active.assert_not_called()
+            odesktop.NewProject.assert_called_once()
+            native.SaveAs.assert_called_once()
+
+    def test_pooled_refresh_uses_bound_project_without_desktop_activation(self):
+        native, _calls = self._native_project()
+        set_active_project = Mock(
+            side_effect=AssertionError("Desktop active project is shared")
+        )
+        simulation = Simulation.__new__(Simulation)
+        simulation.aedt_backend = "pooled"
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.desktop = SimpleNamespace(
+            odesktop=SimpleNamespace(SetActiveProject=set_active_project)
+        )
+        simulation.project = SimpleNamespace(project=native, proj=native)
+
+        selected = simulation._refresh_native_project_handle()
+
+        self.assertIs(selected, native)
+        set_active_project.assert_not_called()
+
+    def test_pooled_bound_project_identity_mismatch_fails_closed(self):
+        wrong = SimpleNamespace(
+            GetName=lambda: "sibling_project",
+            SetActiveDesign=Mock(),
+        )
+        simulation = Simulation.__new__(Simulation)
+        simulation.aedt_backend = "pooled"
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.project = SimpleNamespace(project=wrong, proj=wrong)
+
+        with self.assertRaisesRegex(RuntimeError, "project identity mismatch"):
+            simulation._refresh_native_project_handle()
+
+    def test_pooled_wrapper_construction_routes_active_hooks_to_bound_handles(self):
+        from ansys.aedt.core.application.design import Design as AedtDesign
+        from ansys.aedt.core.desktop import Desktop as AedtDesktop
+        from pyaedt_module.core.pydesign import pyDesign
+
+        raw_design = SimpleNamespace(
+            GetName=lambda: "copy",
+            GetDesignType=lambda: "Maxwell 3D",
+            GetSolutionType=lambda: "AC Magnetic",
+        )
+
+        class NativeProject:
+            def GetName(self):
+                return "simulation_test"
+
+            def GetDesigns(self):
+                return [raw_design]
+
+        native_project = NativeProject()
+        original_active_project = AedtDesktop.active_project
+        original_active_design = AedtDesktop.active_design
+        original_project_list = AedtDesktop.__dict__["project_list"]
+        initializer_name = "_Design__init_desktop_from_design"
+        original_initializer = AedtDesign.__dict__[initializer_name]
+        original_setup = pyDesign._setup_maxwell3d
+        testcase = self
+        desktop_wrapper = SimpleNamespace(odesktop=object())
+        design_solutions = SimpleNamespace(_odesign=None)
+        solver_instance = SimpleNamespace(
+            _oproject=None, _odesign=None, design_solutions=design_solutions
+        )
+
+        class ProjectWrapper:
+            def __init__(self):
+                self.project = native_project
+                self.proj = native_project
+                self.desktop = desktop_wrapper
+
+            def create_design(self, **_kwargs):
+                testcase.assertIsNot(pyDesign._setup_maxwell3d, original_setup)
+                bound_desktop = getattr(AedtDesign, initializer_name)()
+                testcase.assertIs(bound_desktop.odesktop, desktop_wrapper.odesktop)
+                testcase.assertEqual(
+                    bound_desktop.project_list,
+                    ["simulation_test"],
+                )
+                testcase.assertIs(
+                    bound_desktop.active_project(name="simulation_test"),
+                    native_project,
+                )
+                testcase.assertIs(
+                    bound_desktop.active_design(
+                        project_object=native_project, name="copy"
+                    ),
+                    raw_design,
+                )
+                return SimpleNamespace(solver_instance=solver_instance)
+
+        wrapped = _create_handle_bound_project_design(
+            ProjectWrapper(), "simulation_test", "copy", "maxwell3d", "AC Magnetic"
+        )
+
+        self.assertIs(wrapped.solver_instance._oproject, native_project)
+        self.assertIs(wrapped.solver_instance._odesign, raw_design)
+        self.assertIs(design_solutions._odesign, raw_design)
+        self.assertIs(AedtDesktop.active_project, original_active_project)
+        self.assertIs(AedtDesktop.active_design, original_active_design)
+        self.assertIs(AedtDesktop.__dict__["project_list"], original_project_list)
+        self.assertIs(AedtDesign.__dict__[initializer_name], original_initializer)
+        self.assertIs(pyDesign._setup_maxwell3d, original_setup)
+
+    def test_pooled_wrapper_construction_restores_hooks_after_exception(self):
+        from ansys.aedt.core.application.design import Design as AedtDesign
+        from ansys.aedt.core.desktop import Desktop as AedtDesktop
+        from pyaedt_module.core.pydesign import pyDesign
+
+        native_project = SimpleNamespace(GetName=lambda: "simulation_test")
+        wrapper = SimpleNamespace(
+            project=native_project,
+            proj=native_project,
+            desktop=SimpleNamespace(odesktop=object()),
+            create_design=Mock(side_effect=RuntimeError("constructor failed")),
+        )
+        initializer_name = "_Design__init_desktop_from_design"
+        originals = (
+            AedtDesktop.__dict__["project_list"],
+            AedtDesktop.active_project,
+            AedtDesktop.active_design,
+            AedtDesign.__dict__[initializer_name],
+            pyDesign._setup_maxwell3d,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "constructor failed"):
+            _create_handle_bound_project_design(
+                wrapper, "simulation_test", "copy", "maxwell3d", "AC Magnetic"
+            )
+
+        restored = (
+            AedtDesktop.__dict__["project_list"],
+            AedtDesktop.active_project,
+            AedtDesktop.active_design,
+            AedtDesign.__dict__[initializer_name],
+            pyDesign._setup_maxwell3d,
+        )
+        for actual, expected in zip(restored, originals):
+            self.assertIs(actual, expected)
+
     def test_falls_back_to_raw_solver_project_handle(self):
         native, _ = self._native_project()
         simulation = Simulation.__new__(Simulation)
@@ -2541,6 +2858,9 @@ class NativeProjectHandleTests(unittest.TestCase):
         class NativeDesign:
             def __init__(self):
                 self.settings_calls = []
+
+            def GetName(self):
+                return "maxwell_loss"
 
             def SetDesignSettings(self, *args):
                 self.settings_calls.append(args)
@@ -2563,6 +2883,8 @@ class NativeProjectHandleTests(unittest.TestCase):
             create_design=lambda **_: wrapped_design,
         )
         simulation = Simulation.__new__(Simulation)
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.aedt_backend = "standalone"
         simulation.project = project_wrapper
 
         with patch("run_simulation_260706.time.sleep"):
@@ -2571,7 +2893,7 @@ class NativeProjectHandleTests(unittest.TestCase):
         self.assertIs(solver_instance._odesign, native_design)
         self.assertIs(design_solutions._odesign, native_design)
         self.assertFalse(hasattr(wrapped_design, "_odesign"))
-        self.assertEqual(calls, [("active", "maxwell_loss")])
+        self.assertEqual(calls, [])
         self.assertEqual(len(native_design.settings_calls), 1)
 
     def test_save_project_uses_native_fallback(self):
@@ -2840,6 +3162,43 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
         })
         return simulation, ipk, setup, analyze, rebind
 
+    def test_pooled_thermal_preflight_ignores_desktop_running_state(self):
+        simulation, ipk, setup, _analyze, _rebind = self._harness(None)
+        simulation.aedt_backend = "pooled"
+        native_project = ipk.solver_instance.oproject
+        native_design = native_project.SetActiveDesign.return_value
+        native_project.GetDesigns = Mock(return_value=[native_design])
+        native_project.SetActiveDesign = Mock(
+            side_effect=AssertionError("pooled thermal lookup must be explicit")
+        )
+        desktop = simulation._native_desktop_handle.return_value
+        desktop.AreThereSimulationsRunning = Mock(
+            side_effect=AssertionError("sibling running state is not authoritative")
+        )
+
+        contract = _prepare_thermal_dispatch(simulation, ipk, setup)
+
+        self.assertEqual(contract["project"], "simulation_test")
+        self.assertEqual(contract["design"], "icepak_thermal")
+        native_project.SetActiveDesign.assert_not_called()
+        desktop.AreThereSimulationsRunning.assert_not_called()
+
+    def test_pooled_thermal_lookup_falls_back_after_transient_enumeration(self):
+        simulation, ipk, setup, _analyze, _rebind = self._harness(None)
+        simulation.aedt_backend = "pooled"
+        native_project = ipk.solver_instance.oproject
+        native_design = native_project.SetActiveDesign.return_value
+        native_project.GetDesigns = Mock(
+            side_effect=RuntimeError("transient GetDesigns gRPC")
+        )
+
+        contract = _prepare_thermal_dispatch(simulation, ipk, setup)
+
+        self.assertEqual(contract["design"], "icepak_thermal")
+        native_project.SetActiveDesign.assert_called_once_with("icepak_thermal")
+        simulation._native_desktop_handle.return_value \
+            .AreThereSimulationsRunning.assert_not_called()
+
     def test_stale_pyaedt_analysis_cache_is_rebound_before_native_dispatch(self):
         simulation, ipk, setup, _analyze, _rebind = self._harness(None)
         native_solver = ipk.solver_instance
@@ -2939,6 +3298,35 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             ["mesh_operations"][0],
             {"level": "4", "name": "tx_mesh_level_L", "object_count": 2},
         )
+
+    def test_pooled_false_and_missing_monitor_never_double_dispatches(self):
+        simulation, ipk, setup, analyze, rebind = self._harness([False, False])
+        simulation.aedt_backend = "pooled"
+        native_project = ipk.solver_instance.oproject
+        native_design = native_project.SetActiveDesign.return_value
+        native_project.GetDesigns = Mock(return_value=[native_design])
+        desktop = simulation._native_desktop_handle.return_value
+        desktop.AreThereSimulationsRunning = Mock(
+            side_effect=AssertionError("Desktop running state includes siblings")
+        )
+        missing = self._telemetry("monitor_missing")
+
+        with patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            return_value=missing,
+        ):
+            result = _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        analyze.assert_called_once_with(
+            setup="ThermalSetup", cores=4, blocking=True
+        )
+        rebind.assert_called_once_with()
+        desktop.AreThereSimulationsRunning.assert_not_called()
+        self.assertEqual(result["solve_attempts"], 1)
+        forensic = json.loads(result["forensic_json"])
+        self.assertIsNone(forensic["attempts"][0]["native_running"])
 
     def test_fresh_residual_threshold_is_terminal_without_retry(self):
         simulation, ipk, setup, analyze, rebind = self._harness(False)
@@ -3184,7 +3572,7 @@ class FieldsReporterTests(unittest.TestCase):
             GetModule=lambda _name: reporter,
         )
         fresh_project = SimpleNamespace(
-            GetActiveDesign=lambda: native_design,
+            GetDesigns=lambda: [native_design],
             SetActiveDesign=Mock(side_effect=AssertionError("switch is unnecessary")),
         )
         broken_project = BrokenProject()
@@ -3210,7 +3598,7 @@ class FieldsReporterTests(unittest.TestCase):
 
         self.assertEqual(result, "P_core_5")
         self.assertEqual(reporter.added, ["P_core_5"])
-        self.assertEqual(broken_project.get_calls, 1)
+        self.assertEqual(broken_project.get_calls, 0)
         self.assertEqual(broken_project.set_calls, 1)
         desktop.odesktop.SetActiveProject.assert_called_once_with("project")
         fresh_project.SetActiveDesign.assert_not_called()
@@ -3255,7 +3643,7 @@ class FieldsReporterTests(unittest.TestCase):
                 max_attempts=3, retry_delay=0,
             )
 
-        self.assertEqual(broken_project.get_calls, 3)
+        self.assertEqual(broken_project.get_calls, 0)
         self.assertEqual(broken_project.set_calls, 3)
         self.assertEqual(set_active_project.call_count, 3)
         analyze.assert_not_called()

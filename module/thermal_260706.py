@@ -49,21 +49,73 @@ def _native_design_name(design):
     return str(value or "").split(";")[-1].strip()
 
 
-def _activate_thermal_design(app, design_name=None, native_project=None):
-    """Re-acquire the active native design and refresh the raw PyAEDT handle."""
+def _explicit_native_design(project, design_name, allow_active_fallback=True):
+    """Resolve one named design without reading Desktop-global active state."""
+    expected_name = _native_design_name(design_name)
+    matches = []
+    errors = []
+    get_designs = getattr(project, "GetDesigns", None)
+    if callable(get_designs):
+        try:
+            for raw in get_designs() or []:
+                if (
+                        hasattr(raw, "GetName")
+                        and _native_design_name(raw) == expected_name):
+                    matches.append(raw)
+        except Exception as exc:
+            errors.append(f"GetDesigns={type(exc).__name__}: {exc}")
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"expected one thermal design named {expected_name!r}, found {len(matches)}"
+        )
+    if matches:
+        return matches[0]
+
+    for route_name in ("GetDesign", "GetChildObject"):
+        route = getattr(project, route_name, None)
+        if not callable(route):
+            continue
+        try:
+            raw = route(expected_name)
+            if raw is None or raw is False:
+                raise RuntimeError("returned no design")
+            actual_name = _native_design_name(raw)
+            if actual_name != expected_name:
+                raise RuntimeError(
+                    f"design mismatch: expected={expected_name!r}, actual={actual_name!r}"
+                )
+            return raw
+        except Exception as exc:
+            errors.append(f"{route_name}={type(exc).__name__}: {exc}")
+
+    if not allow_active_fallback:
+        detail = "; ".join(errors) if errors else "no explicit named-design API"
+        raise RuntimeError(
+            f"explicit thermal design handle is unavailable for {expected_name!r}: "
+            f"{detail}"
+        )
+    set_active = getattr(project, "SetActiveDesign", None)
+    if not callable(set_active):
+        raise RuntimeError("native Icepak project handle has no named-design lookup")
+    return set_active(expected_name)
+
+
+def _activate_thermal_design(
+        app, design_name=None, native_project=None, allow_active_fallback=True):
+    """Re-acquire an exact native design and refresh the raw PyAEDT handle."""
     solver = _native_solver(app)
     project = native_project
     if project is None:
         project = getattr(solver, "oproject", None)
-    set_active = getattr(project, "SetActiveDesign", None)
-    if not callable(set_active):
-        raise RuntimeError("native Icepak project handle has no SetActiveDesign")
 
     expected_name = design_name or getattr(solver, "design_name", None) \
         or getattr(app, "design_name", None)
     if not expected_name:
         raise RuntimeError("thermal design name is unavailable")
-    design = set_active(expected_name)
+    design = _explicit_native_design(
+        project, expected_name,
+        allow_active_fallback=allow_active_fallback,
+    )
     if not design or not callable(getattr(design, "GetModule", None)):
         raise RuntimeError(f"failed to activate thermal design: {expected_name}")
     if design_name is not None:
@@ -448,7 +500,17 @@ def _thermal_desktop_handle(sim, ipk):
     raise RuntimeError("native AEDT Desktop handle is unavailable")
 
 
+def _thermal_backend(sim):
+    return str(getattr(sim, "aedt_backend", "standalone") or "standalone")
+
+
 def _thermal_running_state(sim, ipk):
+    if _thermal_backend(sim) == "pooled":
+        # Desktop-wide running state includes a legitimate sibling project.
+        # There is no project-scoped idle proof, so report unknown.  In
+        # particular, this must never authorize the startup retry below: a
+        # False/exception return can still leave this project's solve running.
+        return None
     desktop = _thermal_desktop_handle(sim, ipk)
     is_running = getattr(desktop, "AreThereSimulationsRunning", None)
     if not callable(is_running):
@@ -491,7 +553,8 @@ def _prepare_thermal_dispatch(
         )
 
     native_ipk, native_design = _activate_thermal_design(
-        ipk, design_name=design_name, native_project=native_project
+        ipk, design_name=design_name, native_project=native_project,
+        allow_active_fallback=True,
     )
     wrapper_name = str(getattr(native_ipk, "design_name", "") or "").strip()
     if wrapper_name != design_name:
@@ -560,7 +623,7 @@ def _prepare_thermal_dispatch(
         enabled_source = "native+wrapper"
 
     running = _thermal_running_state(sim, ipk)
-    if running is not False:
+    if _thermal_backend(sim) == "standalone" and running is not False:
         raise RuntimeError(f"AEDT reports an overlapping simulation: {running!r}")
     return {
         "project": actual_project,
@@ -1606,8 +1669,17 @@ def run_thermal_analysis(sim):
     # stale even though the original Desktop session remains healthy. Rebind
     # the exact project before pyDesign asks project.name while creating Icepak.
     sim._rebind_native_project_for_design_creation()
-    ipk = sim.project.create_design(name="icepak_thermal", solver="icepak",
-                                    solution="SteadyState TemperatureAndFlow")
+    create_project_design = getattr(sim, "create_project_design", None)
+    if callable(create_project_design):
+        ipk = create_project_design(
+            name="icepak_thermal", solver="icepak",
+            solution="SteadyState TemperatureAndFlow",
+        )
+    else:
+        ipk = sim.project.create_design(
+            name="icepak_thermal", solver="icepak",
+            solution="SteadyState TemperatureAndFlow",
+        )
     sim.design_thermal = ipk
 
     set_design_variables(ipk, sim.input_df)
@@ -1793,7 +1865,10 @@ def run_thermal_analysis(sim):
 
     native_ipk = _native_solver(ipk)
     try:
-        _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
+        _activate_thermal_design(
+            ipk, design_name=_THERMAL_DESIGN_NAME,
+            allow_active_fallback=True,
+        )
         solution = native_ipk.existing_analysis_sweeps[0]
     except Exception:
         solution = "ThermalSetup : SteadyState"
@@ -1885,7 +1960,10 @@ def run_thermal_analysis(sim):
             break
         field_summary_attempts = attempt
         try:
-            _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
+            _activate_thermal_design(
+                ipk, design_name=_THERMAL_DESIGN_NAME,
+                allow_active_fallback=True,
+            )
             temps.update(_field_summary_bulk(missing_entries))
             _refresh_core_probe_aggregates()
         except Exception as e:

@@ -26,6 +26,7 @@ import json
 import argparse
 import uuid
 import tempfile
+import threading
 
 try:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -120,6 +121,16 @@ from module.source_contract import SOLVER_REVISION_PATHS
 
 PLATE_COLOR = [144, 190, 144]
 PAD_COLOR = [200, 160, 200]
+
+
+class _PooledDesktop(pyDesktop):
+    """Attach wrapper that leaves shared Desktop-wide autosave policy untouched."""
+
+    def disable_autosave(self):
+        return True
+
+
+_HANDLE_BOUND_DESIGN_LOCK = threading.RLock()
 
 
 def _git_provenance():
@@ -750,6 +761,51 @@ def _aedt_design_name(value):
     return str(value or "").split(";")[-1].strip()
 
 
+def _explicit_project_design(project, design_name):
+    """Return one named design without consulting AEDT's active pointers."""
+    expected_name = _aedt_design_name(design_name)
+    if not expected_name:
+        raise RuntimeError("explicit AEDT design name is empty")
+
+    matches = []
+    errors = []
+    try:
+        for name, raw in _project_design_entries(project):
+            if name == expected_name and raw is not None and raw is not False:
+                matches.append(raw)
+    except Exception as error:
+        errors.append(f"GetDesigns={type(error).__name__}: {error}")
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"expected one AEDT design named {expected_name!r}, found {len(matches)}"
+        )
+    if matches:
+        return matches[0]
+
+    for route_name in ("GetDesign", "GetChildObject"):
+        route = getattr(project, route_name, None)
+        if not callable(route):
+            continue
+        try:
+            raw = route(expected_name)
+            if raw is None or raw is False:
+                raise RuntimeError("returned no design")
+            actual_name = _aedt_design_name(raw)
+            if actual_name != expected_name:
+                raise RuntimeError(
+                    f"design mismatch: expected={expected_name!r}, "
+                    f"actual={actual_name!r}"
+                )
+            return raw
+        except Exception as error:
+            errors.append(f"{route_name}={type(error).__name__}: {error}")
+
+    detail = "; ".join(errors) if errors else "no explicit named-design API"
+    raise RuntimeError(
+        f"explicit AEDT design handle is unavailable for {expected_name!r}: {detail}"
+    )
+
+
 def _project_design_entries(project):
     entries = []
     for item in project.GetDesigns() or []:
@@ -781,7 +837,7 @@ def _wait_for_ready_copied_loss_design(
             candidates = [item for item in new_entries if item[0] == target_name]
             for name, raw in candidates:
                 if raw is None:
-                    raw = project.SetActiveDesign(name)
+                    raw = _find_raw_design(project, name)
                 design_type = str(raw.GetDesignType() or "")
                 solution_type = str(raw.GetSolutionType() or "")
                 setups = tuple(str(item) for item in (
@@ -813,7 +869,6 @@ def _wait_for_ready_copied_loss_design(
                 if stable_count < 2:
                     continue
 
-                project.SetActiveDesign(name)
                 wrapper = wrapper_factory(name, solution_type)
                 wrapper_name = _aedt_design_name(getattr(wrapper, "design_name", ""))
                 wrapper_solution = str(getattr(wrapper, "solution_type", "") or "")
@@ -850,22 +905,35 @@ def _wait_for_ready_copied_loss_design(
         sleeper(min(max(0.0, float(poll_s)), max(0.0, deadline - now)))
 
 
-def _find_raw_design(project, design_name):
-    matches = [
-        raw for name, raw in _project_design_entries(project)
-        if name == design_name
-    ]
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"expected one AEDT design named {design_name!r}, found {len(matches)}"
-        )
-    raw = matches[0]
-    if raw is None:
-        raw = project.SetActiveDesign(design_name)
+def _find_raw_design(project, design_name, allow_active_fallback=None):
+    """Resolve an exact design from one already-bound project handle.
+
+    ``SetActiveDesign(name)`` is retained only as a named selection operation on
+    that explicit project object.  Unlike Desktop active-project/design reads,
+    the returned handle is immediately identity-checked and remains valid if a
+    sibling subsequently changes Desktop-global active state.
+    """
+    try:
+        raw = _explicit_project_design(project, design_name)
+    except Exception as explicit_error:
+        if allow_active_fallback is None:
+            allow_active_fallback = True
+        if not allow_active_fallback:
+            raise RuntimeError(
+                f"explicit AEDT handle is required for design {design_name!r}"
+            ) from explicit_error
+        set_active = getattr(project, "SetActiveDesign", None)
+        if not callable(set_active):
+            raise explicit_error
+        raw = set_active(design_name)
+        if raw is None or raw is False:
+            raise RuntimeError(
+                f"SetActiveDesign returned no design ({design_name})"
+            ) from explicit_error
     if _aedt_design_name(raw) != design_name:
-        raise RuntimeError(
-            f"AEDT returned the wrong design for {design_name!r}: "
-            f"{_aedt_design_name(raw)!r}"
+        raise _AedtIdentityMismatch(
+            "design identity mismatch: "
+            f"expected={design_name!r}, actual={_aedt_design_name(raw)!r}"
         )
     return raw
 
@@ -1383,8 +1451,8 @@ def _cleanup_bad_copied_loss_design(
         max_attempts=3, poll_s=0.25, sleeper=time.sleep):
     """Delete the one exact new design and prove the solved source survived."""
     before_names = set(before_names)
-    active_source = project.SetActiveDesign(source_name)
-    _validate_raw_copied_loss_design(active_source, source_name)
+    source_design = _find_raw_design(project, source_name)
+    _validate_raw_copied_loss_design(source_design, source_name)
     current_names = {
         name for name, _raw in _project_design_entries(project)
     }
@@ -1420,8 +1488,8 @@ def _cleanup_bad_copied_loss_design(
         raise RuntimeError("refusing to delete solved matrix source")
     errors = []
     for _attempt in range(1, max(1, int(max_attempts)) + 1):
-        active_source = project.SetActiveDesign(source_name)
-        _validate_raw_copied_loss_design(active_source, source_name)
+        source_design = _find_raw_design(project, source_name)
+        _validate_raw_copied_loss_design(source_design, source_name)
         try:
             project.DeleteDesign(bad_name)
         except Exception as error:
@@ -1460,8 +1528,8 @@ def _retry_copied_loss_preparation(
     }
     failures = []
     for attempt in range(1, max_attempts + 1):
-        active_source = project.SetActiveDesign(source_name)
-        _validate_raw_copied_loss_design(active_source, source_name)
+        source_design = _find_raw_design(project, source_name)
+        _validate_raw_copied_loss_design(source_design, source_name)
         _assert_matrix_source_preserved(
             project, source_name, source_signature,
             require_solved=require_source_solved,
@@ -1570,6 +1638,254 @@ def _delete_copied_solution_or_raise(
     raise RuntimeError("copied solution deletion failed: " + "; ".join(errors))
 
 
+def _create_handle_bound_project(desktop_wrapper, path, name):
+    """Create/open one pooled project and wrap its returned native handle."""
+    expected_name = str(name or "").strip()
+    if not expected_name:
+        raise RuntimeError("pooled project name is empty")
+    odesktop = getattr(desktop_wrapper, "odesktop", None)
+    if odesktop is None or odesktop is False:
+        raise RuntimeError("pooled Desktop has no native handle")
+
+    open_names = [str(item) for item in (odesktop.GetProjectList() or [])]
+    if expected_name in open_names:
+        raise RuntimeError(
+            "pooled project name is already open; refusing Desktop "
+            f"active-project fallback ({expected_name})"
+        )
+
+    project_path = os.path.abspath(os.path.normpath(str(path)))
+    if project_path.lower().endswith(".aedt"):
+        project_file = project_path
+    else:
+        project_file = os.path.join(project_path, expected_name + ".aedt")
+    project_dir = os.path.dirname(project_file)
+    if project_dir:
+        os.makedirs(project_dir, exist_ok=True)
+
+    if os.path.isfile(project_file):
+        native_project = odesktop.OpenProject(project_file)
+    else:
+        native_project = odesktop.NewProject(project_file)
+        if native_project is not None and native_project is not False:
+            native_project.SaveAs(project_file, True)
+    if native_project is None or native_project is False:
+        raise RuntimeError(f"pooled project creation returned no handle ({expected_name})")
+    actual_name = str(native_project.GetName() or "").strip()
+    if actual_name != expected_name:
+        raise _AedtIdentityMismatch(
+            "pooled project creation identity mismatch: "
+            f"expected={expected_name}, actual={actual_name or '<empty>'}"
+        )
+
+    from pyaedt_module.core.pyproject import pyProject
+
+    class HandleBoundProject(pyProject):
+        def _get_project(self, path=None, name=None, forced_load=True):
+            del path, name, forced_load
+            return native_project
+
+    wrapped = HandleBoundProject(
+        desktop_wrapper, path=project_file, name=expected_name, forced_load=True
+    )
+    wrapped.project = native_project
+    wrapped.proj = native_project
+    return wrapped, native_project
+
+
+def _create_handle_bound_project_design(
+        project_wrapper, project_name, name, solver, solution):
+    """Construct a PyAEDT wrapper while binding only supplied native handles.
+
+    The custom ``pyaedt_module`` wrapper and PyAEDT both normally select the
+    project through ``oDesktop.SetActiveProject`` during construction.  In a
+    pooled Desktop that pointer belongs to every client.  This narrowly scoped
+    constructor route supplies the already-bound native project/design objects
+    to those lookup hooks and omits the custom wrapper's redundant Desktop
+    activation.
+    """
+    project_state = vars(project_wrapper)
+    native_project = project_state.get("project")
+    if native_project is None or native_project is False:
+        native_project = project_state.get("proj")
+    if native_project is None or native_project is False:
+        raise RuntimeError("pooled design creation has no native project handle")
+    desktop_wrapper = project_state.get("desktop")
+    if desktop_wrapper is None or desktop_wrapper is False:
+        raise RuntimeError("pooled design creation has no leased Desktop wrapper")
+    expected_project = str(project_name or "").strip()
+    expected_design = _aedt_design_name(name)
+    if not expected_design:
+        raise RuntimeError("pooled design creation requires an explicit design name")
+    actual_project = str(native_project.GetName() or "").strip()
+    if not expected_project or actual_project != expected_project:
+        raise _AedtIdentityMismatch(
+            "pooled design-creation project mismatch: "
+            f"expected={expected_project or '<empty>'}, "
+            f"actual={actual_project or '<empty>'}"
+        )
+
+    solver_token = _normalized_aedt_token(solver)
+    if solver_token == "maxwell3d":
+        setup_attribute = "_setup_maxwell3d"
+        from pyaedt_module.solver.maxwell3d import Maxwell3d as solver_class
+    elif solver_token == "icepak":
+        setup_attribute = "_setup_icepak"
+        from pyaedt_module.solver.icepak import Icepak as solver_class
+    else:
+        raise RuntimeError(f"unsupported pooled design wrapper solver: {solver!r}")
+
+    from ansys.aedt.core.application.design import Design as AedtDesign
+    from pyaedt_module.core.pydesign import pyDesign
+
+    desktop_initializer_name = "_Design__init_desktop_from_design"
+
+    def handle_bound_desktop_initializer(_design_class, *_args, **_kwargs):
+        # Constructing a second PyAEDT Desktop wrapper on the same gRPC session
+        # recreates the application and invalidates the supplied raw handles.
+        # Reuse a project-scoped view of the wrapper that owns this lease.
+        return desktop_view
+
+    def handle_bound_project_list(_desktop):
+        # PyAEDT checks this property before calling active_project.  Supplying
+        # the already-attested project prevents a transient Desktop list read
+        # from falling through to oDesktop.NewProject().
+        return [expected_project]
+
+    def handle_bound_active_project(_desktop, name=None):
+        requested_name = str(name or "").strip()
+        if not requested_name:
+            raise RuntimeError("pooled wrapper requested an unnamed active project")
+        if requested_name != expected_project:
+            raise _AedtIdentityMismatch(
+                "pooled wrapper requested the wrong project: "
+                f"expected={expected_project}, actual={requested_name or '<empty>'}"
+            )
+        return native_project
+
+    def handle_bound_active_design(
+            _desktop, project_object=None, name=None, design_type=None):
+        del design_type
+        if project_object is None or project_object is False:
+            raise RuntimeError("pooled wrapper requested an unbound active design")
+        owner = project_object
+        owner_name = str(owner.GetName() or "").strip()
+        if owner_name != expected_project:
+            raise _AedtIdentityMismatch(
+                "pooled wrapper design owner mismatch: "
+                f"expected={expected_project}, actual={owner_name or '<empty>'}"
+            )
+        requested_name = _aedt_design_name(name)
+        if not requested_name:
+            raise RuntimeError("pooled wrapper requested an unnamed active design")
+        if requested_name != expected_design:
+            raise _AedtIdentityMismatch(
+                "pooled wrapper requested the wrong design: "
+                f"expected={expected_design}, actual={requested_name or '<empty>'}"
+            )
+        return _find_raw_design(
+            native_project, requested_name, allow_active_fallback=True
+        )
+
+    class HandleBoundDesktopView:
+        """Delegate non-identity operations while keeping identity project-scoped."""
+
+        def __init__(self, delegate):
+            self._delegate = delegate
+
+        @property
+        def project_list(self):
+            return handle_bound_project_list(self)
+
+        def active_project(self, name=None):
+            return handle_bound_active_project(self, name=name)
+
+        def active_design(
+                self, project_object=None, name=None, design_type=None):
+            return handle_bound_active_design(
+                self, project_object=project_object, name=name,
+                design_type=design_type,
+            )
+
+        def design_list(self, project=None):
+            requested_project = str(project or expected_project).strip()
+            if requested_project != expected_project:
+                raise _AedtIdentityMismatch(
+                    "pooled wrapper requested another project's design list: "
+                    f"expected={expected_project}, actual={requested_project}"
+                )
+            get_top = getattr(native_project, "GetTopDesignList", None)
+            if callable(get_top):
+                return [
+                    _aedt_design_name(item) for item in (get_top() or [])
+                    if _aedt_design_name(item)
+                ]
+            return [entry[0] for entry in _project_design_entries(native_project)]
+
+        def __getattr__(self, attribute):
+            return getattr(self._delegate, attribute)
+
+    desktop_view = HandleBoundDesktopView(desktop_wrapper)
+
+    def handle_bound_setup(wrapper, design_name, solution_type):
+        solver_instance = wrapper._instantiate_solver(
+            solver_class, design_name=design_name, solution_type=solution_type
+        )
+        solver_instance.design = wrapper
+        return solver_instance
+
+    with _HANDLE_BOUND_DESIGN_LOCK:
+        original_desktop_initializer = AedtDesign.__dict__[desktop_initializer_name]
+        original_setup = getattr(pyDesign, setup_attribute)
+        try:
+            setattr(
+                AedtDesign, desktop_initializer_name,
+                classmethod(handle_bound_desktop_initializer),
+            )
+            setattr(pyDesign, setup_attribute, handle_bound_setup)
+            wrapped = project_wrapper.create_design(
+                name=name, solver=solver, solution=solution
+            )
+        finally:
+            setattr(pyDesign, setup_attribute, original_setup)
+            setattr(AedtDesign, desktop_initializer_name, original_desktop_initializer)
+
+    raw_design = _find_raw_design(
+        native_project, expected_design, allow_active_fallback=True
+    )
+    solver_instance = getattr(wrapped, "solver_instance", None)
+    if solver_instance is None:
+        raise RuntimeError("pooled design wrapper has no PyAEDT solver instance")
+    expected_type = "Maxwell 3D" if solver_token == "maxwell3d" else "Icepak"
+    actual_type = str(raw_design.GetDesignType() or "")
+    actual_solution = str(raw_design.GetSolutionType() or "")
+    if actual_type != expected_type:
+        raise _AedtIdentityMismatch(
+            "pooled design-creation type mismatch: "
+            f"expected={expected_type!r}, actual={actual_type!r}"
+        )
+    solution_matches = (
+        _is_ac_magnetic_solution(actual_solution)
+        if solver_token == "maxwell3d"
+        else (
+            not solution
+            or _normalized_aedt_token(solution)
+            == _normalized_aedt_token(actual_solution)
+        )
+    )
+    if not solution_matches:
+        raise _AedtIdentityMismatch(
+            "pooled design-creation solution mismatch: "
+            f"expected={solution!r}, actual={actual_solution!r}"
+        )
+    solver_instance._oproject = native_project
+    solver_instance._odesign = raw_design
+    design_solutions = getattr(solver_instance, "design_solutions", None)
+    if design_solutions is not None:
+        design_solutions._odesign = raw_design
+    return wrapped
+
+
 class Simulation():
 
     def __init__(self, desktop=None):
@@ -1666,7 +1982,16 @@ class Simulation():
             raise RuntimeError("Desktop instance is None. Cannot create project.")
 
         try:
-            self.project = self.desktop.create_project(path=self.project_path, name=self.PROJECT_NAME)
+            if self._backend_mode() == "pooled":
+                self.project, self._bound_native_project = \
+                    _create_handle_bound_project(
+                        self.desktop, self.project_path, self.PROJECT_NAME
+                    )
+            else:
+                self.project = self.desktop.create_project(
+                    path=self.project_path, name=self.PROJECT_NAME
+                )
+                self._bound_native_project = self._native_project_handle()
         except Exception as e:
             error_msg = f"Failed to create project '{self.PROJECT_NAME}' at path '{self.project_path}': {e}\n"
             print(error_msg, file=sys.stderr)
@@ -1675,6 +2000,11 @@ class Simulation():
 
     def _native_project_handle(self):
         """Return the native AEDT project without probing pyProject dynamic attributes."""
+        bound = getattr(self, "_bound_native_project", None)
+        if (
+                bound is not None and bound is not False
+                and str(getattr(self, "aedt_backend", "") or "") == "pooled"):
+            return bound
         project_wrapper = getattr(self, "project", None)
         try:
             project_state = vars(project_wrapper)
@@ -1699,6 +2029,24 @@ class Simulation():
 
         raise RuntimeError("native AEDT project handle is unavailable")
 
+    def _backend_mode(self):
+        return str(getattr(self, "aedt_backend", "") or aedt_backend())
+
+    def _verified_native_project_handle(self):
+        """Return this Simulation's cached project and attest its exact identity."""
+        native_project = self._native_project_handle()
+        expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        get_name = getattr(native_project, "GetName", None)
+        if not expected_project or not callable(get_name):
+            raise RuntimeError("native project identity is unavailable")
+        actual_project = str(get_name() or "").strip()
+        if actual_project != expected_project:
+            raise _AedtIdentityMismatch(
+                "project identity mismatch: "
+                f"expected={expected_project}, actual={actual_project or '<empty>'}"
+            )
+        return native_project
+
     def _rebind_native_project_for_design_creation(
             self, max_attempts=3, retry_delay=0.5, sleeper=time.sleep):
         """Rebind a stale pyProject handle before creating the next design."""
@@ -1713,6 +2061,12 @@ class Simulation():
             project_state = {}
         if not expected_project or not project_state:
             raise RuntimeError("project wrapper identity is unavailable for native rebind")
+
+        if self._backend_mode() == "pooled":
+            native_project = self._verified_native_project_handle()
+            project_state["project"] = native_project
+            project_state["proj"] = native_project
+            return native_project
 
         odesktop = self._native_desktop_handle()
         set_active_project = getattr(odesktop, "SetActiveProject", None)
@@ -1750,6 +2104,7 @@ class Simulation():
 
                 project_state["project"] = native_project
                 project_state["proj"] = native_project
+                self._bound_native_project = native_project
                 rebound = True
                 rebound_name = str(project_wrapper.name or "").strip()
                 if rebound_name != expected_project:
@@ -1780,13 +2135,26 @@ class Simulation():
             + "; ".join(errors)
         )
 
+    def create_project_design(self, name, solver, solution=None):
+        """Create/wrap a design without Desktop active state in pooled mode."""
+        if self._backend_mode() == "pooled":
+            self._verified_native_project_handle()
+            return _create_handle_bound_project_design(
+                self.project, self.PROJECT_NAME, name, solver, solution
+            )
+        return self.project.create_design(
+            name=name, solver=solver, solution=solution
+        )
+
     def create_design(self, name="maxwell_design"):
-        self.design1 = self.project.create_design(name=name, solver="maxwell3d", solution="AC Magnetic")
+        self.design1 = self.create_project_design(
+            name=name, solver="maxwell3d", solution="AC Magnetic"
+        )
 
         # skip mesh setting
-        # pyaedt 0.22: GetActiveDesign이 None을 주면 디자인 삽입 경로가 bool 오류로 무너져
-        # odesign 핸들을 못 받는 케이스 실측 (AEDT에는 디자인이 실제로 생성됨).
-        # -> 짧은 재시도 후, 네이티브 SetActiveDesign으로 생성된 디자인의 핸들을 직접 회수
+        # PyAEDT 0.22 can leave odesign empty even though AEDT created the
+        # design. After a short wait, recover it by exact name from the bound
+        # project; pooled mode never consults AEDT's active-design pointer.
         oDesign = self.design1.odesign
         for _ in range(3):
             if oDesign is not None and oDesign is not False:
@@ -1795,7 +2163,10 @@ class Simulation():
             oDesign = self.design1.odesign
         if oDesign is None or oDesign is False:
             try:
-                native = self._native_project_handle().SetActiveDesign(name)
+                native = _find_raw_design(
+                    self._verified_native_project_handle(), name,
+                    allow_active_fallback=True,
+                )
                 if native is not None and native is not False:
                     solver_instance = self.design1.solver_instance
                     solver_instance._odesign = native
@@ -1803,9 +2174,9 @@ class Simulation():
                     if design_solutions is not None:
                         design_solutions._odesign = native
                     oDesign = native
-                    logging.warning(f"odesign recovered via native SetActiveDesign ({name})")
+                    logging.warning(f"odesign recovered via explicit project handle ({name})")
             except Exception as e:
-                logging.warning(f"native SetActiveDesign fallback failed: {e}")
+                logging.warning(f"native design-handle recovery failed: {e}")
         if oDesign is None or oDesign is False:
             raise RuntimeError(f"odesign handle is None after design creation ({name}) - desktop unstable")
         oDesign.SetDesignSettings(
@@ -2454,11 +2825,10 @@ class Simulation():
                         f"expected={expected_project_name}, actual={actual_project_name or '<empty>'}"
                     )
 
-                odesign = oproject.SetActiveDesign(expected_design_name)
-                if odesign is None or odesign is False:
-                    raise RuntimeError(
-                        f"SetActiveDesign returned no design ({expected_design_name})"
-                    )
+                odesign = _find_raw_design(
+                    oproject, expected_design_name,
+                    allow_active_fallback=True,
+                )
                 actual_design_name = _aedt_design_name(odesign)
                 if actual_design_name != expected_design_name:
                     raise _AedtIdentityMismatch(
@@ -2744,7 +3114,10 @@ class Simulation():
         raise RuntimeError(message)
 
     def _refresh_native_project_handle(self):
-        """Rebind the current project through Desktop without touching any solve."""
+        """Rebind standalone through Desktop; reuse the bound handle pooled."""
+        if self._backend_mode() == "pooled":
+            return self._verified_native_project_handle()
+
         project_wrapper = getattr(self, "project", None)
         try:
             project_state = vars(project_wrapper)
@@ -2760,36 +3133,21 @@ class Simulation():
         native_project = set_active_project(project_name)
         if native_project is None or native_project is False:
             raise RuntimeError(f"SetActiveProject returned no project ({project_name})")
+        self._bound_native_project = native_project
         return native_project
 
     @staticmethod
-    def _fields_reporter_from_project(oproject, design_name):
+    def _fields_reporter_from_project(
+            oproject, design_name, allow_active_fallback=True):
         """Get a reporter only from the verified requested native design."""
-        route_errors = []
-        routes = (
-            ("GetActiveDesign", getattr(oproject, "GetActiveDesign", None), ()),
-            ("SetActiveDesign", getattr(oproject, "SetActiveDesign", None), (design_name,)),
+        odesign = _find_raw_design(
+            oproject, design_name,
+            allow_active_fallback=allow_active_fallback,
         )
-        for route_name, route, args in routes:
-            if not callable(route):
-                route_errors.append(f"{route_name}=unavailable")
-                continue
-            try:
-                odesign = route(*args)
-                if odesign is None or odesign is False:
-                    raise RuntimeError("returned no design")
-                actual_name = _aedt_design_name(odesign)
-                if actual_name != design_name:
-                    raise RuntimeError(
-                        f"design mismatch: expected={design_name}, actual={actual_name or '<empty>'}"
-                    )
-                reporter = odesign.GetModule("FieldsReporter")
-                if reporter is None or reporter is False:
-                    raise RuntimeError("returned no FieldsReporter")
-                return reporter
-            except Exception as error:
-                route_errors.append(f"{route_name}={type(error).__name__}: {error}")
-        raise RuntimeError("; ".join(route_errors))
+        reporter = odesign.GetModule("FieldsReporter")
+        if reporter is None or reporter is False:
+            raise RuntimeError("explicit design returned no FieldsReporter")
+        return reporter
 
     def _fresh_fields_reporter(self, max_attempts=3, retry_delay=2):
         """Reacquire FieldsReporter without re-running the completed EM solve."""
@@ -2797,6 +3155,9 @@ class Simulation():
         design_name = _aedt_design_name(getattr(self.design1, "design_name", ""))
         if not design_name:
             raise RuntimeError("FieldsReporter design identity is unavailable")
+        # Named selection on this verified project handle is pooled-safe; only
+        # Desktop active-project/design state is forbidden.
+        allow_active_fallback = True
 
         for attempt in range(1, max_attempts + 1):
             candidates = []
@@ -2814,7 +3175,8 @@ class Simulation():
             for label, native_project in candidates:
                 try:
                     reporter = self._fields_reporter_from_project(
-                        native_project, design_name
+                        native_project, design_name,
+                        allow_active_fallback=allow_active_fallback,
                     )
                     self._fields_reporter_project = native_project
                     return reporter
@@ -2826,7 +3188,8 @@ class Simulation():
             try:
                 refreshed_project = self._refresh_native_project_handle()
                 reporter = self._fields_reporter_from_project(
-                    refreshed_project, design_name
+                    refreshed_project, design_name,
+                    allow_active_fallback=allow_active_fallback,
                 )
                 self._fields_reporter_project = refreshed_project
                 return reporter
@@ -3329,8 +3692,8 @@ class Simulation():
                 return odesktop
         raise RuntimeError("original native AEDT Desktop handle is unavailable")
 
-    def _verified_native_maxwell_setup(self, odesktop, setup_name="Setup1"):
-        """Resolve the exact active Maxwell setup through fresh native handles."""
+    def _verified_native_maxwell_setup(self, owner, setup_name="Setup1"):
+        """Resolve the exact Maxwell setup from this Simulation's named handles."""
         expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
         expected_design = _aedt_design_name(
             getattr(self.design1, "design_name", "")
@@ -3338,9 +3701,19 @@ class Simulation():
         if not expected_project or not expected_design:
             raise RuntimeError("native analysis project/design identity is unavailable")
 
-        oproject = odesktop.SetActiveProject(expected_project)
-        if oproject is None or oproject is False:
-            raise RuntimeError(f"SetActiveProject returned no project ({expected_project})")
+        set_active_project = getattr(owner, "SetActiveProject", None)
+        if callable(set_active_project):
+            if self._backend_mode() != "standalone":
+                raise RuntimeError(
+                    "pooled AEDT cannot resolve a project through Desktop active state"
+                )
+            oproject = set_active_project(expected_project)
+            if oproject is None or oproject is False:
+                raise RuntimeError(
+                    f"SetActiveProject returned no project ({expected_project})"
+                )
+        else:
+            oproject = owner
         actual_project = str(oproject.GetName() or "").strip()
         if actual_project != expected_project:
             raise _AedtIdentityMismatch(
@@ -3348,9 +3721,10 @@ class Simulation():
                 f"expected={expected_project}, actual={actual_project or '<empty>'}"
             )
 
-        odesign = oproject.SetActiveDesign(expected_design)
-        if odesign is None or odesign is False:
-            raise RuntimeError(f"SetActiveDesign returned no design ({expected_design})")
+        odesign = _find_raw_design(
+            oproject, expected_design,
+            allow_active_fallback=True,
+        )
         actual_design = _aedt_design_name(odesign)
         if actual_design != expected_design:
             raise _AedtIdentityMismatch(
@@ -3462,6 +3836,8 @@ class Simulation():
         """Restore the pre-solve Maxwell DSO without ever touching Analyze."""
         if not original_config:
             return
+        if self._backend_mode() != "standalone":
+            return
         errors = []
         for attempt in range(1, int(max_attempts) + 1):
             try:
@@ -3486,6 +3862,42 @@ class Simulation():
             self, setup_name="Setup1", max_attempts=5, timeout_s=30.0,
             initial_retry_delay=0.5, clock=time.monotonic, sleeper=time.sleep):
         """Retry only copied-loss solve preflight; never dispatch a solve here."""
+        if self._backend_mode() == "pooled":
+            deadline = clock() + max(0.0, float(timeout_s))
+            errors = []
+            for attempt in range(1, int(max_attempts) + 1):
+                if attempt > 1 and clock() >= deadline:
+                    break
+                try:
+                    oproject = self._verified_native_project_handle()
+                    _oproject, odesign = self._verified_native_maxwell_setup(
+                        oproject, setup_name=setup_name
+                    )
+                    return {
+                        "odesktop": None,
+                        "odesign": odesign,
+                        "registry_key": None,
+                        "original_config": None,
+                        "acf_path": None,
+                    }
+                except _AedtIdentityMismatch:
+                    raise
+                except Exception as error:
+                    errors.append(
+                        f"attempt {attempt}: {type(error).__name__}: {error}"
+                    )
+                    now = clock()
+                    if attempt >= int(max_attempts) or now >= deadline:
+                        break
+                    sleeper(min(
+                        max(0.0, float(initial_retry_delay)) * (2 ** (attempt - 1)),
+                        max(0.0, deadline - now),
+                    ))
+            raise RuntimeError(
+                "pooled copied-loss native analysis preflight failed: "
+                + "; ".join(errors)
+            )
+
         captured_acf = getattr(self, "_matrix_hpc_acf_path", None)
         if not captured_acf:
             raise RuntimeError(
@@ -3587,15 +3999,21 @@ class Simulation():
         errors = []
         for attempt in range(1, int(max_attempts) + 1):
             try:
-                odesktop = self._native_desktop_handle()
-                self._verified_native_maxwell_setup(
-                    odesktop, setup_name=setup_name
-                )
-                running = odesktop.AreThereSimulationsRunning()
-                if running is not False:
-                    raise RuntimeError(
-                        f"AEDT still reports a running simulation: {running!r}"
+                if self._backend_mode() == "pooled":
+                    oproject = self._verified_native_project_handle()
+                    self._verified_native_maxwell_setup(
+                        oproject, setup_name=setup_name
                     )
+                else:
+                    odesktop = self._native_desktop_handle()
+                    self._verified_native_maxwell_setup(
+                        odesktop, setup_name=setup_name
+                    )
+                    running = odesktop.AreThereSimulationsRunning()
+                    if running is not False:
+                        raise RuntimeError(
+                            f"AEDT still reports a running simulation: {running!r}"
+                        )
                 return
             except _AedtIdentityMismatch:
                 raise
@@ -3631,8 +4049,8 @@ class Simulation():
 
             # Preserve app.analyze() semantics, then make the bounded native
             # preflight the final operation before the only solve dispatch.
-            # Repeating SetActiveDesign/GetRegistryString after a successful
-            # preflight can itself wedge an otherwise healthy copied design.
+            # Repeating named-design/registry preflight after a successful
+            # check can itself wedge an otherwise healthy copied design.
             self.save_project(strict=True)
             logging.info(
                 f"[{label}] preparing native Analyze Setup1 blocking=True"
@@ -4032,7 +4450,7 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
         try:
             if backend == "pooled":
                 desktop, lease = acquire_pooled_desktop(
-                    desktop_factory=pyDesktop,
+                    desktop_factory=_PooledDesktop,
                     non_graphical=GUI,
                 )
             else:
@@ -4166,7 +4584,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             """maxwell_matrix를 복제해 loss_sym 디자인으로 전환 (모델링 절반 절약).
             레퍼런스: pyaedt_library/example/MFT_TAB second_simulation()"""
             import math as _m
-            op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
+            op = sim._verified_native_project_handle()
             old_design = sim.design_matrix
             source_name = _aedt_design_name(
                 getattr(old_design, "design_name", "")
@@ -4184,7 +4602,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             op.Paste()
             new_design, copied_setup = _wait_for_ready_copied_loss_design(
                 op, before_names,
-                lambda name, solution: sim.project.create_design(
+                lambda name, solution: sim.create_project_design(
                     name=name, solver="maxwell3d", solution=solution,
                 ),
             )
@@ -4202,8 +4620,11 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             if wrapper_raw is None:
                 raise RuntimeError("fresh copied wrapper has no native odesign")
             _validate_raw_copied_loss_design(wrapper_raw, copied_name)
-            active_raw = op.GetActiveDesign()
-            _validate_raw_copied_loss_design(active_raw, copied_name)
+            copied_raw = _find_raw_design(
+                op, copied_name,
+                allow_active_fallback=True,
+            )
+            _validate_raw_copied_loss_design(copied_raw, copied_name)
 
             # 모델링 때 래퍼에 저장된 객체 핸들들을 복제 디자인으로 리매핑
             # (save_calculation/save_loss_reports가 소비 - MFT_TAB 레퍼런스 패턴)
@@ -4219,11 +4640,14 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             )
 
             # matrix 파라미터 제거 (loss 디자인에는 불필요한 연산)
-            od = op.GetActiveDesign()
-            _validate_raw_copied_loss_design(od, copied_name)
+            copied_raw = _find_raw_design(
+                op, copied_name,
+                allow_active_fallback=True,
+            )
+            _validate_raw_copied_loss_design(copied_raw, copied_name)
             _validate_raw_copied_loss_design(wrapper_raw, copied_name)
             try:
-                od.GetModule("MaxwellParameterSetup").DeleteParameters(["Matrix"])
+                copied_raw.GetModule("MaxwellParameterSetup").DeleteParameters(["Matrix"])
             except Exception as error:
                 raise RuntimeError("matrix parameter deletion failed on loss copy") from error
 
@@ -4246,12 +4670,21 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             # 솔버가 재해석 없이 '해 없음 완료'로 끝남 (로컬 랜덤 검증에서 3/3 재현)
             _delete_copied_solution_or_raise(
                 wrapper_raw,
-                op.GetActiveDesign(),
+                _find_raw_design(
+                    op, copied_name,
+                    allow_active_fallback=True,
+                ),
                 copied_name,
             )
 
             # 코어손실 + skin 메시(손실 정밀용) + 셋업 정밀값
-            _validate_raw_copied_loss_design(op.GetActiveDesign(), copied_name)
+            _validate_raw_copied_loss_design(
+                _find_raw_design(
+                    op, copied_name,
+                    allow_active_fallback=True,
+                ),
+                copied_name,
+            )
             _validate_raw_copied_loss_design(wrapper_raw, copied_name)
             core_names = [item.name for item in new_design.core_objs]
             _assign_native_copied_core_loss(
@@ -4260,7 +4693,13 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             _configure_loss_copy_skin_mesh(
                 sim, native_windings_solid=True
             )
-            _validate_raw_copied_loss_design(op.GetActiveDesign(), copied_name)
+            _validate_raw_copied_loss_design(
+                _find_raw_design(
+                    op, copied_name,
+                    allow_active_fallback=True,
+                ),
+                copied_name,
+            )
             _validate_raw_copied_loss_design(wrapper_raw, copied_name)
             _assert_native_copied_loss_windings(
                 wrapper_raw, copied_name,
@@ -4274,7 +4713,13 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 min_converged=sim.df_plus["min_converged"].iloc[0],
                 percent_error=sim.df_plus["percent_error"].iloc[0],
             )
-            _validate_raw_copied_loss_design(op.GetActiveDesign(), copied_name)
+            _validate_raw_copied_loss_design(
+                _find_raw_design(
+                    op, copied_name,
+                    allow_active_fallback=True,
+                ),
+                copied_name,
+            )
             _validate_raw_copied_loss_design(wrapper_raw, copied_name)
             sim.save_project(strict=True)
             _validate_saved_copied_loss_preparation(
@@ -4324,7 +4769,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     else:
                         sim.__dict__.pop(name, None)
 
-            if not model_only:
+            if not model_only and sim._backend_mode() == "standalone":
                 sim._capture_matrix_hpc_acf()
 
             def _attempt(before_names, attempt):
@@ -4335,7 +4780,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     _rollback_failed_prepare()
                     raise
 
-            op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
+            op = sim._verified_native_project_handle()
             try:
                 new_design, attempts = _retry_copied_loss_preparation(
                     op, "maxwell_matrix", _attempt,
