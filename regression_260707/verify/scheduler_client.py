@@ -711,9 +711,15 @@ def _submit_verification_locked(
         # the workdir must be world-writable or SaveAs/solve outputs fail
         # with cross-account permission errors.
         cleanup_workdirs = '"${MFT_GPFS_WORKDIR}"'
+        # Account homes are not uniformly traversable (some are 0700), so
+        # per-home workdirs are unreachable for a Desktop running under a
+        # different account even at mode 777. Use the world-writable shared
+        # scratch instead of the account workspace for pooled runs.
         select_workdir = (
             "umask 000; "
-            + gpfs_workdir_setup
+            + "MFT_GPFS_ROOT=/gpfs/tmp_cpu2/mft_pool; "
+            + 'mkdir -p "$MFT_GPFS_ROOT"; '
+            + f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{scratch_leaf}"; '
             + gpfs_stale_cleanup
             + 'MFT_WORKDIR="$MFT_GPFS_WORKDIR"; '
             + "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
