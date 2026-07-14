@@ -1,11 +1,14 @@
 import copy
 import hashlib
+import importlib
 import json
+import logging
+import os
 import sys
 import unittest
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 
 CAMPAIGN_DIR = Path(__file__).resolve().parent
@@ -248,6 +251,66 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 "MFT_SLURM_SCHEDULER_ROOT",
                 "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE"):
             self.assertNotIn(key, payload["command"])
+
+
+def test_state_round_trip_with_configured_directory(tmp_path):
+    state_dir = tmp_path / "mft_feeder"
+    state = {"serial": 17, "submitted_samples": 85}
+    state_path = state_dir / "feeder_state.json"
+
+    assert not state_dir.exists()
+    try:
+        with patch.dict(
+                os.environ,
+                {"MFT_FEEDER_STATE_DIR": str(state_dir)},
+        ):
+            importlib.reload(feeder)
+            feeder.save_state(state)
+
+            assert Path(feeder.STATE) == state_path
+            assert state_path.is_file()
+            assert feeder.load_state() == state
+            assert not Path(f"{state_path}.tmp").exists()
+    finally:
+        importlib.reload(feeder)
+
+
+def test_load_state_tolerates_empty_and_corrupt_files(tmp_path, caplog):
+    expected = {"serial": 0, "submitted_samples": 0}
+    for name, contents in (("empty", ""), ("corrupt", "{not-json")):
+        state_path = tmp_path / name / "feeder_state.json"
+        state_path.parent.mkdir()
+        state_path.write_text(contents, encoding="utf-8")
+        caplog.clear()
+
+        with patch.object(feeder, "STATE", str(state_path)), caplog.at_level(
+                logging.WARNING, logger=feeder.__name__):
+            assert feeder.load_state() == expected
+
+        assert "is empty or corrupt" in caplog.text
+        assert "starting fresh" in caplog.text
+
+
+def test_save_state_falls_back_to_direct_write(tmp_path):
+    state_path = tmp_path / "feeder_state.json"
+    tmp_state_path = Path(f"{state_path}.tmp")
+    state = {"serial": 23, "submitted_samples": 115}
+
+    with patch.object(feeder, "STATE", str(state_path)), patch.object(
+            feeder.os,
+            "replace",
+            side_effect=PermissionError(5, "atomic rename unsupported"),
+    ) as replace, patch.object(feeder.time, "sleep") as sleep:
+        feeder.save_state(state)
+
+    assert replace.call_args_list == [
+        call(str(tmp_state_path), str(state_path)),
+        call(str(tmp_state_path), str(state_path)),
+        call(str(tmp_state_path), str(state_path)),
+    ]
+    assert sleep.call_args_list == [call(0.5), call(0.5)]
+    assert json.loads(state_path.read_text(encoding="utf-8")) == state
+    assert not tmp_state_path.exists()
 
 
 if __name__ == "__main__":

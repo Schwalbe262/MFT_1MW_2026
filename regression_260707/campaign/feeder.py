@@ -13,6 +13,7 @@ import argparse
 import copy
 import glob
 import json
+import logging
 import math
 import os
 import sys
@@ -44,7 +45,14 @@ if VERIFY_DIR not in sys.path:
 import scheduler_client
 import deployment_gate
 
-STATE = os.path.join(HERE, "feeder_state.json")
+LOGGER = logging.getLogger(__name__)
+
+_STATE_DIR = os.environ.get("MFT_FEEDER_STATE_DIR")
+if _STATE_DIR:
+    os.makedirs(_STATE_DIR, exist_ok=True)
+else:
+    _STATE_DIR = HERE
+STATE = os.path.join(_STATE_DIR, "feeder_state.json")
 SCHEDULER = "http://127.0.0.1:8000"
 CAMPAIGN_PREFIX = "mft-camp-"
 
@@ -401,14 +409,49 @@ def submit(
 
 def load_state():
     if os.path.isfile(STATE):
-        return json.load(open(STATE))
+        try:
+            with open(STATE, encoding="utf-8") as stream:
+                return json.load(stream)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "state file %s is empty or corrupt (%s); starting fresh",
+                STATE,
+                exc,
+            )
     return {"serial": 0, "submitted_samples": 0}
 
 
 def save_state(st):
     tmp = STATE + ".tmp"
-    json.dump(st, open(tmp, "w"))
-    os.replace(tmp, STATE)
+    with open(tmp, "w", encoding="utf-8") as stream:
+        json.dump(st, stream)
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            os.replace(tmp, STATE)
+            return
+        except OSError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.5)
+
+    LOGGER.warning(
+        "atomic state update failed after 3 attempts (%s); "
+        "writing %s directly",
+        last_error,
+        STATE,
+    )
+    with open(STATE, "w", encoding="utf-8") as stream:
+        json.dump(st, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.remove(tmp)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        LOGGER.warning("could not remove temporary state file %s: %s", tmp, exc)
 
 
 def dataset_collection_snapshot():
