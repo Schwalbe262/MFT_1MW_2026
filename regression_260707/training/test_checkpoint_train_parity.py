@@ -13,6 +13,56 @@ from regression_260707.training import checkpoint_train as checkpoint
 
 
 class CheckpointParityTests(unittest.TestCase):
+    def test_capacitance_target_contract_excludes_resonance_outputs(self):
+        capacitance_targets = {
+            "C_tx_tx_F", "C_rx_rx_F", "C_tx_rx_F"
+        }
+        for target in capacitance_targets:
+            with self.subTest(target=target):
+                self.assertEqual(checkpoint.TARGETS[target]["transform"], "log")
+                self.assertEqual(
+                    checkpoint.TARGETS[target]["metric_focus"], "mape"
+                )
+                self.assertEqual(
+                    checkpoint.TARGETS[target]["relative_metric_tolerance"],
+                    0.0,
+                )
+        self.assertFalse(
+            any(target.startswith("f_res_") for target in checkpoint.TARGETS)
+        )
+
+    def test_capacitance_rows_require_positive_finite_value_and_cap_stage(self):
+        frame = pd.DataFrame({
+            "sample": [
+                "valid", "zero", "negative", "nan", "inf",
+                "cap-off", "cap-missing",
+            ],
+            "C_tx_rx_F": [
+                1e-10, 0.0, -1e-10, np.nan, np.inf, 2e-10, 3e-10,
+            ],
+            "cap_on": [1, 1, 1, 1, 1, 0, np.nan],
+            "_strict_valid_full": [True] * 7,
+        })
+
+        filtered = checkpoint.filter_valid_training_rows(
+            frame, "C_tx_rx_F"
+        )
+
+        self.assertEqual(filtered["sample"].tolist(), ["valid"])
+
+    def test_capacitance_rows_allow_legacy_dataset_without_cap_flag(self):
+        frame = pd.DataFrame({
+            "sample": ["valid", "invalid"],
+            "C_rx_rx_F": [3e-10, 0.0],
+            "_strict_valid_full": [True, True],
+        })
+
+        filtered = checkpoint.filter_valid_training_rows(
+            frame, "C_rx_rx_F"
+        )
+
+        self.assertEqual(filtered["sample"].tolist(), ["valid"])
+
     def test_target_cohort_rejects_physics_revision_mixing(self):
         frame = pd.DataFrame({
             "target": [1.0, 2.0],

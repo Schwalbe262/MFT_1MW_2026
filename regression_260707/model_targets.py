@@ -54,3 +54,13 @@ SURROGATE_WINDING_COMPONENT_LOSS_TARGETS = (
     "P_Rx_main_group",
     "P_Rx_side_total",
 )
+
+
+# Full-physical Maxwell electrostatic coefficients.  Resonance frequencies are
+# deliberately not independent surrogate targets; downstream code derives
+# them from these capacitances and the inductance/coupling predictions.
+SURROGATE_CAPACITANCE_TARGETS = (
+    "C_tx_tx_F",
+    "C_rx_rx_F",
+    "C_tx_rx_F",
+)

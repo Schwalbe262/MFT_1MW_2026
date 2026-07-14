@@ -834,6 +834,12 @@ class FineValidationTests(unittest.TestCase):
         }
 
     def quality_snapshot(self):
+        # The quality gate reports every threshold target, including models
+        # that are diagnostic/advisory rather than optimizer inputs.
+        target_status = {
+            target: {} for target in REQUIRED_OPTIMIZATION_MODELS
+        }
+        target_status["B_max_core"] = {"blocking": True}
         return {
             "passed": True,
             "strict_full_rows": 3000,
@@ -842,7 +848,7 @@ class FineValidationTests(unittest.TestCase):
             "quality_thresholds_sha256": hashlib.sha256(
                 Path(QUALITY_THRESHOLDS_PATH).read_bytes()
             ).hexdigest(),
-            "targets": {target: {} for target in REQUIRED_OPTIMIZATION_MODELS},
+            "targets": target_status,
             "training_run_id": "quality-run",
             "dataset_sha256": "d" * 64,
         }

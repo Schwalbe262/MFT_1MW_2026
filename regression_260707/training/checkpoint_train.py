@@ -23,6 +23,7 @@ REGRESSION_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 if REGRESSION_ROOT not in sys.path:
     sys.path.insert(0, REGRESSION_ROOT)
 from model_targets import (
+    SURROGATE_CAPACITANCE_TARGETS,
     SURROGATE_TEMPERATURE_TARGETS,
     SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
 )
@@ -35,6 +36,7 @@ PARITY_SCHEMA_VERSION = 1
 PARITY_MAX_PAIRS_PER_TARGET = 2_000
 LEGACY_PHYSICS_DATA_REVISION = "legacy_unspecified"
 MAPE_ZERO_ABS_TOLERANCE = 1e-9
+CAPACITANCE_RELATIVE_METRIC_TOLERANCE = 0.0
 
 
 def _sha256(path):
@@ -64,6 +66,16 @@ def _atomic_json(value, path):
 TARGETS = {
     "Llt_phys": {"transform": "log", "metric_focus": "mape"},
     "k": {"transform": None, "metric_focus": "rmse"},
+    **{
+        target: {
+            "transform": "log",
+            "metric_focus": "mape",
+            # Valid capacitances are strictly positive, including values below
+            # the legacy near-zero tolerance used by loss-like targets.
+            "relative_metric_tolerance": CAPACITANCE_RELATIVE_METRIC_TOLERANCE,
+        }
+        for target in SURROGATE_CAPACITANCE_TARGETS
+    },
     "P_winding_total": {"transform": "log1p", "metric_focus": "mape"},
     **{
         target: {"transform": "log1p", "metric_focus": "mape"}
@@ -82,12 +94,12 @@ TARGETS = {
 
 # 특징량: 입력 파라미터 + 파생 물리량 (결과/메타 컬럼 제외)
 def filter_valid_training_rows(df, target, profile=None):
-    """Return the shared strict-full cohort used by every surrogate target.
+    """Return strict-full rows satisfying the target-specific contract.
 
-    Using one cohort prevents a model from silently learning from legacy EM
-    false positives while the temperature models see a different population.
-    Validity is recomputed from error, delta, residual, extraction, power
-    balance, temperature saturation, profile, and provenance evidence.
+    Strict-full validity is the common first tier.  The second tier removes
+    rows whose requested target is unavailable or invalid.  This lets newer
+    outputs, such as electrostatic capacitance, train only on eligible cohorts
+    without admitting legacy EM false positives into any target.
     """
     if "_strict_valid_full" not in df.columns:
         from quality_contract import annotate_validity
@@ -99,6 +111,13 @@ def filter_valid_training_rows(df, target, profile=None):
     else:
         values = pd.to_numeric(df[target], errors="coerce")
         keep &= values.map(np.isfinite)
+        if target in SURROGATE_CAPACITANCE_TARGETS:
+            keep &= values.gt(0)
+            if "cap_on" in df.columns:
+                cap_enabled = pd.to_numeric(
+                    df["cap_on"], errors="coerce"
+                ).eq(1)
+                keep &= cap_enabled
         if target.startswith("Tprobe"):
             keep &= values.gt(MIN_TRUSTED_TEMPERATURE_C) & values.lt(
                 MAX_TRUSTED_TEMPERATURE_C
@@ -164,7 +183,7 @@ def feature_columns(df):
 
 def transform_y(y, kind):
     if kind == "log":
-        return np.log(np.clip(y, 1e-9, None))
+        return np.log(np.clip(y, np.finfo(float).tiny, None))
     if kind == "log1p":
         return np.log1p(np.clip(y, 0, None))
     if kind == "t50":
@@ -211,7 +230,15 @@ def relative_error_summary(
     }
 
 
-def cv_metrics(X, y, kind, n_splits=5, seed=42, return_yhat=False):
+def cv_metrics(
+    X,
+    y,
+    kind,
+    n_splits=5,
+    seed=42,
+    return_yhat=False,
+    relative_tolerance=MAPE_ZERO_ABS_TOLERANCE,
+):
     import lightgbm as lgb
     from sklearn.model_selection import KFold
 
@@ -232,7 +259,7 @@ def cv_metrics(X, y, kind, n_splits=5, seed=42, return_yhat=False):
     metrics = {
         "r2": 1 - ss_res / ss_tot,
         "rmse": float(np.sqrt(np.mean(err ** 2))),
-        **relative_error_summary(y, err),
+        **relative_error_summary(y, err, tolerance=relative_tolerance),
     }
     if return_yhat:
         return metrics, yhat
@@ -352,17 +379,29 @@ def main():
             continue
         X = sub[feats].fillna(0.0)
         y = sub[target].to_numpy(dtype=float)
+        relative_tolerance = cfg.get(
+            "relative_metric_tolerance", MAPE_ZERO_ABS_TOLERANCE
+        )
 
         if args.parity_json:
             m, yhat = cv_metrics(
-                X, y, cfg["transform"], return_yhat=True
+                X,
+                y,
+                cfg["transform"],
+                return_yhat=True,
+                relative_tolerance=relative_tolerance,
             )
             parity_targets[target] = _parity_target(y, yhat, sub.index)
             parity_targets[target][
                 "physics_data_revision_cohort"
             ] = revision_cohort
         else:
-            m = cv_metrics(X, y, cfg["transform"])
+            m = cv_metrics(
+                X,
+                y,
+                cfg["transform"],
+                relative_tolerance=relative_tolerance,
+            )
         target_revision_cohorts[target] = revision_cohort
         row = {
             "time": stamp, "target": target, "n": len(sub), **m,
@@ -377,7 +416,12 @@ def main():
         if "Llt_phys" in sub.columns:
             sl = sub[(sub["Llt_phys"] >= 20) & (sub["Llt_phys"] <= 40)]
             if len(sl) >= 100:
-                ms = cv_metrics(sl[feats].fillna(0.0), sl[target].to_numpy(dtype=float), cfg["transform"])
+                ms = cv_metrics(
+                    sl[feats].fillna(0.0),
+                    sl[target].to_numpy(dtype=float),
+                    cfg["transform"],
+                    relative_tolerance=relative_tolerance,
+                )
                 rows.append({
                     "time": stamp, "target": target, "n": len(sl), **ms,
                     "slice": "Llt20-40",

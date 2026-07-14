@@ -1,10 +1,10 @@
 """Build coherent surrogate candidates without exposing ungated models.
 
-Every required target is trained from the same recomputed strict-full cohort.
-This command only builds an immutable candidate generation.  The caller must
-evaluate that generation and use :func:`promote_generation` to publish it.
-Registry mutation APIs own the writer lock themselves; callers must never wrap
-them in the same lock.
+Every required target starts from the same recomputed strict-full cohort, then
+applies its target-specific availability contract.  This command only builds
+an immutable candidate generation.  The caller must evaluate that generation
+and use :func:`promote_generation` to publish it.  Registry mutation APIs own
+the writer lock themselves; callers must never wrap them in the same lock.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ EVALUATION_FRAC = 0.10
 SEED = 42
 REGISTRY_SCHEMA_VERSION = 2
 QUALITY_GATE_FILENAME = "quality_gate.json"
+SIGMA_FLOOR_POLICY = "relative_machine_epsilon_v1"
 
 
 def default_family_params():
@@ -88,24 +89,34 @@ def _ensemble_prediction(models, Xpart, transform):
     derivative = np.abs(
         inverse_y(mu_t + 1e-4, transform) - inverse_y(mu_t - 1e-4, transform)
     ) / 2e-4
-    return mu, np.maximum(derivative * sigma_t, 1e-9)
+    sigma_floor = np.maximum(
+        np.abs(mu) * np.finfo(float).eps, np.finfo(float).tiny
+    )
+    return mu, np.maximum(derivative * sigma_t, sigma_floor)
 
 
-def _evaluation_relative_metrics(y_true, error, half_width):
+def _evaluation_relative_metrics(
+    y_true,
+    error,
+    half_width,
+    tolerance=MAPE_ZERO_ABS_TOLERANCE,
+):
     """Compute evaluation relative metrics on one auditable nonzero mask."""
     actual = np.asarray(y_true, dtype=float).reshape(-1)
     residual = np.asarray(error, dtype=float).reshape(-1)
     widths = np.asarray(half_width, dtype=float).reshape(-1)
     if len(actual) != len(residual) or len(actual) != len(widths):
         raise ValueError("evaluation relative metric lengths differ")
-    mask = relative_metric_mask(actual)
-    summary = relative_error_summary(actual, residual)
+    mask = relative_metric_mask(actual, tolerance=tolerance)
+    summary = relative_error_summary(
+        actual, residual, tolerance=tolerance
+    )
     relative_half_width = np.abs(widths[mask]) / np.abs(actual[mask])
     summary["interval_p90_half_width_pct"] = (
         float(np.quantile(relative_half_width, 0.9) * 100)
         if len(relative_half_width) else float("nan")
     )
-    if summary["mape_zero_abs_tolerance"] != MAPE_ZERO_ABS_TOLERANCE:
+    if summary["mape_zero_abs_tolerance"] != float(tolerance):
         raise RuntimeError("relative metric tolerance contract drifted")
     return summary
 
@@ -132,7 +143,7 @@ def train_target(
     sub = sub.dropna(subset=[target])
     sub = sub[np.isfinite(pd.to_numeric(sub[target], errors="coerce"))]
     if len(sub) < min_rows:
-        return None, f"insufficient strict-full rows ({len(sub)})"
+        return None, f"insufficient eligible strict-full rows ({len(sub)})"
     if not isinstance(revision_cohort, str) or not revision_cohort.strip():
         raise RuntimeError(
             f"target {target} training rows are missing "
@@ -147,6 +158,9 @@ def train_target(
         else np.ones(len(sub))
     )
     transform = cfg["transform"]
+    relative_tolerance = cfg.get(
+        "relative_metric_tolerance", MAPE_ZERO_ABS_TOLERANCE
+    )
     y = transform_y(y_raw, transform)
 
     indices = np.arange(len(X))
@@ -201,16 +215,16 @@ def train_target(
     mu, sigma = _ensemble_prediction(models, X.iloc[idx_evaluation], transform)
     half_width = q90 * sigma
     error = mu - y_evaluation
-    relative_half_width = half_width / np.clip(
-        np.abs(y_evaluation), 1e-9, None
-    )
     relative_metrics = _evaluation_relative_metrics(
-        y_evaluation, error, half_width
+        y_evaluation,
+        error,
+        half_width,
+        tolerance=relative_tolerance,
     )
     target_scale = max(
         float(np.quantile(y_evaluation, 0.9) - np.quantile(y_evaluation, 0.1)),
         float(np.median(np.abs(y_evaluation))),
-        1e-9,
+        np.finfo(float).tiny,
     )
     metrics = {
         "n_train": int(len(idx_train)),
@@ -232,9 +246,6 @@ def train_target(
         "interval_coverage": float(np.mean(np.abs(error) <= half_width)),
         "interval_mean_width": float(np.mean(2.0 * half_width)),
         "interval_p90_width": float(np.quantile(2.0 * half_width, 0.9)),
-        "interval_p90_half_width_pct": float(
-            np.quantile(relative_half_width, 0.9) * 100
-        ),
         "physics_data_revision_cohort": revision_cohort,
     }
     bundle = {
@@ -242,6 +253,7 @@ def train_target(
         "features": list(feats),
         "transform": transform,
         "q90": q90,
+        "sigma_floor_policy": SIGMA_FLOOR_POLICY,
         "target": target,
         "physics_data_revision_cohort": revision_cohort,
         "metrics": metrics,

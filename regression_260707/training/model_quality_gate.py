@@ -80,6 +80,7 @@ def _load_generation(registry, generation=None):
 
 def evaluate_registry(registry, dataset, thresholds, generation=None):
     reasons = []
+    advisories = []
     target_status = {}
     try:
         pointer, generation, generation_relative, report = _load_generation(
@@ -89,6 +90,7 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
         return {
             "passed": False,
             "reasons": [f"registry_unavailable:{exc}"],
+            "advisories": [],
             "targets": {},
         }
 
@@ -158,6 +160,11 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
     minimum_coverage = float(thresholds["minimum_interval_coverage"])
     for target, limits in thresholds["targets"].items():
         target_reasons = []
+        blocking_value = limits.get("blocking", True)
+        blocking = isinstance(blocking_value, bool) and blocking_value
+        if not isinstance(blocking_value, bool):
+            target_reasons.append("invalid_threshold_config:blocking")
+            blocking = True
         meta_path = os.path.join(generation, target, "meta.json")
         model_path = os.path.join(generation, target, "models.pkl")
         if not os.path.isfile(meta_path) or not os.path.isfile(model_path):
@@ -181,6 +188,8 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
         if not _finite(coverage) or float(coverage) < minimum_coverage:
             target_reasons.append("interval_coverage_below_minimum")
         for key, limit in limits.items():
+            if key == "blocking":
+                continue
             metric = key.removeprefix("min_").removeprefix("max_")
             value = metrics.get(metric)
             if not _finite(value):
@@ -191,10 +200,17 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
                 target_reasons.append(f"metric_above_maximum:{metric}")
         target_status[target] = {
             "passed": not target_reasons,
+            "blocking": blocking,
             "reasons": target_reasons,
             "metrics": metrics,
         }
-        reasons.extend(f"{target}:{reason}" for reason in target_reasons)
+        qualified_reasons = [
+            f"{target}:{reason}" for reason in target_reasons
+        ]
+        if blocking:
+            reasons.extend(qualified_reasons)
+        else:
+            advisories.extend(qualified_reasons)
 
     if pointer is not None:
         gate_path = os.path.join(generation, QUALITY_GATE_FILENAME)
@@ -224,6 +240,7 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
     return {
         "passed": not reasons,
         "reasons": reasons,
+        "advisories": advisories,
         "training_run_id": run_id,
         "dataset_sha256": dataset_sha,
         "profile_sha256": report.get("profile_sha256"),

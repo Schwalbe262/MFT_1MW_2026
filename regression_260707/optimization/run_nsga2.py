@@ -31,10 +31,13 @@ from optimization.design_summary import (  # noqa: E402
     COMPONENT_LOSS_TARGETS,
     pareto_design_summary,
 )
+from optimization.resonance import derive_resonances  # noqa: E402
 from module.input_parameter_260706 import _SOBOL_DIMS  # noqa: E402
+from model_targets import SURROGATE_CAPACITANCE_TARGETS  # noqa: E402
 
 REQUIRED_MODEL_TARGETS = [
     "Llt_phys", "k",
+    *SURROGATE_CAPACITANCE_TARGETS,
     "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
     *COMPONENT_LOSS_TARGETS,
     # B_max remains a raw FEA diagnostic.  The optimizer uses the analytical
@@ -308,6 +311,10 @@ def main():
             predictions[t] = float(mu[0])
             row[f"pred_{t}"] = predictions[t]
             row[f"sigma_{t}"] = float(sg[0])
+        for target, value in derive_resonances(
+            predictions, frame.iloc[i].to_dict()
+        ).items():
+            row[f"pred_{target}"] = value
         summary = pareto_design_summary(
             frame.iloc[i],
             predictions,

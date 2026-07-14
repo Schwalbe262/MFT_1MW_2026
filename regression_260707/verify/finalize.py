@@ -25,6 +25,7 @@ from module.input_parameter_260706 import (  # noqa: E402
     SUPPORTED_CANDIDATE_INPUT_SCHEMAS,
 )
 from model_targets import (  # noqa: E402
+    SURROGATE_CAPACITANCE_TARGETS,
     SURROGATE_TEMPERATURE_TARGETS,
     SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
 )
@@ -53,6 +54,7 @@ MIN_STRICT_FULL_ROWS = 3000
 QUALITY_THRESHOLDS_PATH = REGRESSION_ROOT / "training" / "model_quality_thresholds.json"
 REQUIRED_OPTIMIZATION_MODELS = frozenset({
     "Llt_phys", "k",
+    *SURROGATE_CAPACITANCE_TARGETS,
     "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
     *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
     "B_mean_core",
@@ -147,7 +149,9 @@ def _optimization_manifest_reasons(
         ):
             if quality.get(key) != manifest.get(key):
                 reasons.append(f"optimization_quality_identity_mismatch:{key}")
-        if set((quality.get("targets") or {}).keys()) != required:
+        if not required.issubset(
+            set((quality.get("targets") or {}).keys())
+        ):
             reasons.append("optimization_quality_targets_incomplete")
         for key in ("training_run_id", "dataset_sha256", "strict_full_rows"):
             if generation_report.get(key) != manifest.get(key):
@@ -402,7 +406,9 @@ def _model_quality_reasons(model_quality, solver_revision, library_revision):
             reasons.append("model_quality_thresholds_mismatch")
     except Exception:
         reasons.append("model_quality_thresholds_unavailable")
-    if set((model_quality.get("targets") or {}).keys()) != REQUIRED_OPTIMIZATION_MODELS:
+    if not REQUIRED_OPTIMIZATION_MODELS.issubset(
+        set((model_quality.get("targets") or {}).keys())
+    ):
         reasons.append("model_quality_targets_incomplete")
     for key in ("training_run_id", "dataset_sha256"):
         value = str(model_quality.get(key) or "")
