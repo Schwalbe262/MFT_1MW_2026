@@ -102,7 +102,10 @@ NODE_CANARY_SCHEDULER_REPOSITORY = (
 )
 NODE_CANARY_SCHEDULER_REVISION = "e4718e4b6f229175f8c3d85dbf2cf8c34c7ee93e"
 NODE_CANARY_DISCOVERY_PREFIX = "NODE_CANARY_DISCOVERY "
-NODE_CANARY_DISCOVERY_TIMEOUT_SECONDS = 10 * 60
+# 30 min: the host is pinned to a live (usually full) allocation, so it must
+# first wait for a task slot to free and then cold-start AEDT on a busy node.
+# 10 min covered only ~20% of hosts in production on 2026-07-14.
+NODE_CANARY_DISCOVERY_TIMEOUT_SECONDS = 30 * 60
 NODE_CANARY_HOST_TIMEOUT_SECONDS = 14_400
 NODE_CANARY_HOST_CPUS = 1
 NODE_CANARY_HOST_MEMORY_MB = 4_096
