@@ -39,9 +39,10 @@ except ImportError:
 SCHEDULER = "http://127.0.0.1:8000"
 TEST_TASK_PRIORITY = 10
 MFT_PROJECT = "MFT_1MW_2026v1"
-# Absolute operator/controller ceiling.  The live project field may be any
-# integer in 1..300 and is the maintained-pool source of truth.
+# Default operator/controller ceiling.  The pooled feeder may explicitly use
+# the scheduler's higher project ceiling without changing legacy callers.
 MFT_PROJECT_MAX_ACTIVE_TASKS = 300
+MFT_PROJECT_MAX_ACTIVE_TASKS_CEILING = 600
 MFT_ACTIVE_STATUSES = ("queued", "attaching", "running")
 LEGACY_MFT_NAME_PREFIX = "mft-"
 MFT_PROJECT_REPOS = [
@@ -187,14 +188,26 @@ def campaign_mutation_lock_is_held():
     return int(getattr(_CAMPAIGN_LOCK_STATE, "depth", 0)) > 0
 
 
+def _validated_project_cap_ceiling(max_project_active_tasks):
+    if (type(max_project_active_tasks) is not int
+            or not 1 <= max_project_active_tasks
+            <= MFT_PROJECT_MAX_ACTIVE_TASKS_CEILING):
+        raise ProjectContractError(
+            "MFT project max_active_tasks ceiling is invalid")
+    return max_project_active_tasks
+
+
 def validate_project_mutation_contract(
-        project, *, expected_cap=None, require_full=False):
+        project, *, expected_cap=None, require_full=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Validate the operator target and, when requested, all mutation fields.
 
     ``max_active_tasks`` is deliberately dynamic, but never unbounded.  A
     controller batch may pass ``expected_cap`` to bind every scheduler POST to
     the cap observed when that batch was authorized.
     """
+    max_project_active_tasks = _validated_project_cap_ceiling(
+        max_project_active_tasks)
     if not isinstance(project, dict):
         raise ProjectContractError("scheduler returned an invalid MFT project")
     if str(project.get("name") or "").strip() != MFT_PROJECT:
@@ -205,14 +218,14 @@ def validate_project_mutation_contract(
         raise ProjectContractError(
             "scheduler MFT project max_active_tasks is invalid")
     cap = raw_cap
-    if not 1 <= cap <= MFT_PROJECT_MAX_ACTIVE_TASKS:
+    if not 1 <= cap <= max_project_active_tasks:
         raise ProjectContractError(
             "scheduler MFT project max_active_tasks must be an integer "
-            f"between 1 and {MFT_PROJECT_MAX_ACTIVE_TASKS}, got {cap}")
+            f"between 1 and {max_project_active_tasks}, got {cap}")
     if expected_cap is not None:
         if (isinstance(expected_cap, bool)
                 or not isinstance(expected_cap, int)
-                or not 1 <= expected_cap <= MFT_PROJECT_MAX_ACTIVE_TASKS):
+                or not 1 <= expected_cap <= max_project_active_tasks):
             raise ProjectContractError("expected MFT project cap is invalid")
         if cap != expected_cap:
             raise ProjectContractError(
@@ -247,7 +260,8 @@ def validate_project_mutation_contract(
 
 
 def require_live_project_mutation_contract(
-        *, expected_cap=None, require_full=False):
+        *, expected_cap=None, require_full=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Read and validate the live project immediately before a task POST."""
     try:
         response = requests.get(
@@ -257,20 +271,28 @@ def require_live_project_mutation_contract(
     except Exception as exc:
         raise ProjectContractError(
             f"failed to read scheduler project {MFT_PROJECT!r}: {exc}") from exc
+    validation_options = {}
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        validation_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     return validate_project_mutation_contract(
-        project, expected_cap=expected_cap, require_full=require_full)
+        project, expected_cap=expected_cap, require_full=require_full,
+        **validation_options)
 
 
 def project_submission_snapshot(
         projects, project_tasks, required_hard_cap, legacy_tasks=None, *,
-        require_exact_project_cap=False, require_full_project=False):
+        require_exact_project_cap=False, require_full_project=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Count tagged and projectless legacy MFT demand without double counting."""
+    max_project_active_tasks = _validated_project_cap_ceiling(
+        max_project_active_tasks)
     if isinstance(required_hard_cap, bool) or not isinstance(required_hard_cap, int):
         raise ProjectCapacityError("MFT project hard cap must be a positive integer")
-    if required_hard_cap < 1 or required_hard_cap > MFT_PROJECT_MAX_ACTIVE_TASKS:
+    if required_hard_cap < 1 or required_hard_cap > max_project_active_tasks:
         raise ProjectCapacityError(
             f"MFT project hard cap must be between 1 and "
-            f"{MFT_PROJECT_MAX_ACTIVE_TASKS}")
+            f"{max_project_active_tasks}")
     if not isinstance(projects, list):
         raise ProjectCapacityError("scheduler returned an invalid project inventory")
     matches = [
@@ -281,10 +303,15 @@ def project_submission_snapshot(
     if len(matches) != 1:
         raise ProjectCapacityError(
             f"scheduler project {MFT_PROJECT!r} is missing or ambiguous")
+    validation_options = {}
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        validation_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     project_contract = validate_project_mutation_contract(
         matches[0],
         expected_cap=(required_hard_cap if require_exact_project_cap else None),
         require_full=require_full_project,
+        **validation_options,
     )
     if not isinstance(project_tasks, list):
         raise ProjectCapacityError(
@@ -385,14 +412,20 @@ def _task_rows(response, source):
 
 def live_project_submission_snapshot(
         required_hard_cap=MFT_PROJECT_MAX_ACTIVE_TASKS, *,
-        require_exact_project_cap=False, require_full_project=False):
+        require_exact_project_cap=False, require_full_project=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Read the absolute logical-project budget while the mutation lock is held."""
     if not campaign_mutation_lock_is_held():
         raise ProjectCapacityError(
             "MFT project capacity must be checked under the campaign mutation lock")
+    validation_options = {}
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        validation_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     project = require_live_project_mutation_contract(
         expected_cap=(required_hard_cap if require_exact_project_cap else None),
         require_full=require_full_project,
+        **validation_options,
     )
     statuses = ",".join(MFT_ACTIVE_STATUSES)
     try:
@@ -425,6 +458,7 @@ def live_project_submission_snapshot(
         # ``require_live_project_mutation_contract`` already authenticated
         # the full raw record; ``project`` here is its normalized projection.
         require_full_project=False,
+        **validation_options,
     )
 
 
@@ -559,13 +593,19 @@ def submit_verification(
         solver_revision=None, library_revision=None,
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
-        submission_env=None):
+        submission_env=None, required_hard_cap=None,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Submit one MFT task under the shared cross-process mutation lock."""
     submission_options = {}
     if aedt_backend is not None:
         submission_options["aedt_backend"] = aedt_backend
     if submission_env is not None:
         submission_options["submission_env"] = submission_env
+    if required_hard_cap is not None:
+        submission_options["required_hard_cap"] = required_hard_cap
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        submission_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
             name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
@@ -597,7 +637,8 @@ def _submit_verification_locked(
         solver_revision=None, library_revision=None,
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
-        submission_env=None):
+        submission_env=None, required_hard_cap=None,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
@@ -750,25 +791,42 @@ def _submit_verification_locked(
     existing = reconcile_task_id(name, dedupe_key)
     if existing is not None:
         return existing
+    max_project_active_tasks = _validated_project_cap_ceiling(
+        max_project_active_tasks)
     if required_project_cap is None:
-        required_hard_cap = MFT_PROJECT_MAX_ACTIVE_TASKS
+        if required_hard_cap is None:
+            required_hard_cap = MFT_PROJECT_MAX_ACTIVE_TASKS
+        elif (isinstance(required_hard_cap, bool)
+                or not isinstance(required_hard_cap, int)
+                or not 1 <= required_hard_cap
+                <= max_project_active_tasks):
+            raise ProjectContractError("required project hard cap is invalid")
         require_exact_project_cap = False
     else:
+        if required_hard_cap is not None:
+            raise ProjectContractError(
+                "required project cap and hard cap are mutually exclusive")
         if (isinstance(required_project_cap, bool)
                 or not isinstance(required_project_cap, int)
                 or not 1 <= required_project_cap
-                <= MFT_PROJECT_MAX_ACTIVE_TASKS):
+                <= max_project_active_tasks):
             raise ProjectContractError("required project cap is invalid")
         required_hard_cap = required_project_cap
         require_exact_project_cap = True
+    validation_options = {}
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        validation_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     if require_exact_project_cap:
         capacity = live_project_submission_snapshot(
             required_hard_cap,
             require_exact_project_cap=True,
             require_full_project=True,
+            **validation_options,
         )
     else:
-        capacity = live_project_submission_snapshot(required_hard_cap)
+        capacity = live_project_submission_snapshot(
+            required_hard_cap, **validation_options)
     if capacity["project_submission_slots"] < 1:
         raise ProjectCapacityError(
             f"MFT project has no submission slots under cap "

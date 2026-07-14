@@ -28,27 +28,40 @@ LEGACY_PAYLOAD_SHA256 = (
 
 class FeederPooledSubmissionTests(unittest.TestCase):
     def _capture_cli_payload(
-            self, cli_args, *, fail_local_revision_checks=False):
+            self, cli_args, *, fail_local_revision_checks=False, target=1,
+            project_max_active_tasks=300):
         accepted = Mock(status_code=201)
         accepted.json.return_value = {"id": 123}
         argv = [
             "feeder.py",
             "--once",
-            "--target", "1",
+            "--target", str(target),
             "--max-samples", "1",
             "--solver-revision", SOLVER_REVISION,
             "--library-revision", LIBRARY_REVISION,
             *cli_args,
         ]
-        campaign_counts = {"queued": 0, "attaching": 0, "running": 0}
-        capacity = {
-            "ready_fit_slots": 1,
-            "project_submission_slots": 1,
-            "submission_allowed": True,
-            "queue_state": "ready",
-            "queue_reason": "",
-            "project_active": 0,
-        }
+        def scheduler_json(path, params=None):
+            if path == "/api/tasks/summary":
+                return {"statuses": {}}
+            if path == "/api/allocations":
+                return []
+            if path == "/api/projects":
+                return [{
+                    "name": feeder.MFT_PROJECT,
+                    "max_active_tasks": project_max_active_tasks,
+                    "auto_pull": False,
+                }]
+            if path == "/api/tasks":
+                return []
+            if path == "/api/task-capacity":
+                return {
+                    "ready_fit_slots": 1,
+                    "queue_state": "ready",
+                    "queue_reason": "",
+                }
+            raise AssertionError((path, params))
+
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
             solver_revision_check = stack.enter_context(patch.object(
@@ -87,8 +100,8 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             ))
             stack.enter_context(patch.object(
                 feeder,
-                "scheduler_snapshot",
-                return_value=(campaign_counts, campaign_counts, [], capacity),
+                "_scheduler_json",
+                side_effect=scheduler_json,
             ))
             stack.enter_context(patch.object(
                 feeder, "dataset_collection_snapshot", return_value=(0, set())))
@@ -110,10 +123,12 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 "reconcile_task_id",
                 return_value=None,
             ))
-            stack.enter_context(patch.object(
+            live_snapshot = stack.enter_context(patch.object(
                 feeder.scheduler_client,
                 "live_project_submission_snapshot",
-                return_value={"project_submission_slots": 300},
+                return_value={
+                    "project_submission_slots": project_max_active_tasks,
+                },
             ))
             post = stack.enter_context(patch.object(
                 feeder.scheduler_client.requests,
@@ -122,12 +137,57 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             ))
             feeder.main()
 
+        if target > feeder.MFT_PROJECT_MAX_ACTIVE_TASKS:
+            live_snapshot.assert_called_once_with(
+                target,
+                max_project_active_tasks=(
+                    feeder.MAX_POOLED_PROJECT_ACTIVE_TASKS),
+            )
         if fail_local_revision_checks:
             solver_revision_check.assert_not_called()
             library_revision_check.assert_not_called()
             p08_completion_check.assert_not_called()
         post.assert_called_once()
         return copy.deepcopy(post.call_args.kwargs["json"])
+
+    def test_aedt_pooled_accepts_target_500_with_project_cap_510(self):
+        payload = self._capture_cli_payload(
+            [
+                "--aedt-pooled",
+                "--aedt-pool-url", "https://pool.example.test:8443",
+            ],
+            target=500,
+            project_max_active_tasks=510,
+        )
+
+        self.assertEqual(payload["aedt_backend"], "pooled")
+
+    def test_non_pooled_retains_target_and_project_cap_errors(self):
+        with self.assertRaises(feeder.SchedulerError) as target_error:
+            self._capture_cli_payload([], target=51)
+        self.assertEqual(
+            str(target_error.exception),
+            "standalone feeder hard cap is 50; use rapid_campaign.py for "
+            "300-task production promotion",
+        )
+
+        with self.assertRaises(feeder.SchedulerError) as project_cap_error:
+            self._capture_cli_payload([], project_max_active_tasks=301)
+        self.assertEqual(
+            str(project_cap_error.exception),
+            "scheduler MFT project max_active_tasks must be an integer "
+            "between 1 and 300, got 301",
+        )
+
+    def test_high_target_requires_the_pooled_backend_marker(self):
+        with self.assertRaises(feeder.SchedulerError) as error:
+            feeder.step(1, target=500, pooled_submission={})
+
+        self.assertEqual(
+            str(error.exception),
+            "direct feeder hard cap is 50; only rapid_campaign may authorize "
+            "production promotion",
+        )
 
     def test_trust_pinned_revisions_bypasses_local_revision_vetting(self):
         with patch("builtins.print") as output:

@@ -59,6 +59,9 @@ CAMPAIGN_PREFIX = "mft-camp-"
 TARGET_ACTIVE = 50    # standalone 실행+대기 목표 (--target으로 오버라이드)
 BUFFER = 0            # production 300 promotion is owned by rapid_campaign
 MAX_STANDALONE_ACTIVE = 50
+MAX_POOLED_ACTIVE = 500
+MAX_POOLED_PROJECT_ACTIVE_TASKS = (
+    scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS_CEILING)
 COUNT_PER_TASK = 1
 CPUS_PER_TASK = 4
 DEFAULT_AEDT_POOL_PKG_ROOT = "$HOME/slurm_scheduler/aedt_pool_pkg"
@@ -116,6 +119,13 @@ def _pooled_submission_kwargs(args):
             "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": args.aedt_pool_token_file,
         },
     }
+
+
+def _is_pooled_submission(submission):
+    return (
+        isinstance(submission, dict)
+        and submission.get("aedt_backend") == "pooled"
+    )
 
 
 _RAPID_REFILL_SEAL = object()
@@ -383,7 +393,8 @@ def _step_from_adopted_controller(
 def submit(
         name, workdir, params, solver_revision, library_revision, *,
         cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None,
-        required_project_cap=None, aedt_backend=None, submission_env=None):
+        required_project_cap=None, aedt_backend=None, submission_env=None,
+        required_hard_cap=None, max_project_active_tasks=None):
     with open(PROFILE_PATH, encoding="utf-8") as stream:
         profile = json.load(stream)
     if timeout_seconds is not None:
@@ -393,6 +404,11 @@ def submit(
         submission_options["aedt_backend"] = aedt_backend
     if submission_env is not None:
         submission_options["submission_env"] = submission_env
+    if required_hard_cap is not None:
+        submission_options["required_hard_cap"] = required_hard_cap
+    if max_project_active_tasks is not None:
+        submission_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     return scheduler_client.submit_verification(
         name=name,
         workdir=workdir,
@@ -600,7 +616,8 @@ def _scheduler_json(path, params=None):
 
 def scheduler_snapshot(
         required_hard_cap, *, require_exact_project_cap=False,
-        require_full_project=False):
+        require_full_project=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     global_summary = _scheduler_json("/api/tasks/summary")
     allocations = _scheduler_json("/api/allocations")
     projects = _scheduler_json("/api/projects")
@@ -637,11 +654,16 @@ def scheduler_snapshot(
     try:
         queue_submission_allowed = queue_allows_demand_submission(
             capacity.get("queue_state"))
+        project_options = {}
+        if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+            project_options["max_project_active_tasks"] = (
+                max_project_active_tasks)
         project_gate = scheduler_client.project_submission_snapshot(
             projects, project_tasks, required_hard_cap,
             legacy_tasks=legacy_tasks,
             require_exact_project_cap=require_exact_project_cap,
-            require_full_project=require_full_project)
+            require_full_project=require_full_project,
+            **project_options)
     except RuntimeError as exc:
         raise SchedulerError(str(exc)) from exc
     capacity_gate = {
@@ -679,7 +701,11 @@ def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
          solver_revision=None, library_revision=None, candidate_seed=260710,
          pooled_submission=None):
     requested_active = int(target) + int(buffer)
-    if requested_active > MAX_STANDALONE_ACTIVE:
+    pooled_mode = _is_pooled_submission(pooled_submission)
+    if pooled_mode and requested_active > MAX_POOLED_ACTIVE:
+        raise SchedulerError(
+            f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
+    if not pooled_mode and requested_active > MAX_STANDALONE_ACTIVE:
         raise SchedulerError(
             f"direct feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
             "only rapid_campaign may authorize production promotion")
@@ -715,6 +741,12 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         raise SchedulerError("campaign refill requires the project mutation lock")
     rapid_authorized = False
     adopted_authorized = False
+    pooled_mode = _is_pooled_submission(_pooled_submission)
+    pooled_authorized = bool(
+        pooled_mode and requested_active <= MAX_POOLED_ACTIVE)
+    if pooled_mode and not pooled_authorized:
+        raise SchedulerError(
+            f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
     if requested_active > MAX_STANDALONE_ACTIVE:
         rapid_authorized = (
             isinstance(_rapid_authorization, _RapidRefillAuthorization)
@@ -739,7 +771,7 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                 "timeout_seconds": _adopted_authorization.timeout_seconds,
             }
         )
-        if not (rapid_authorized or adopted_authorized):
+        if not (rapid_authorized or adopted_authorized or pooled_authorized):
             raise SchedulerError("production refill requires rapid promotion authorization")
     if _refill_journal is not None:
         if (not isinstance(_refill_journal, dict)
@@ -762,18 +794,23 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     committed_state = copy.deepcopy(st)
     # 로컬 장부나 다른 project가 아니라 scheduler의 MFT logical project가 source of truth다.
     hard_cap = max(1, int(target) + int(buffer))
-    if hard_cap > MFT_PROJECT_MAX_ACTIVE_TASKS:
+    if (not pooled_authorized
+            and hard_cap > MFT_PROJECT_MAX_ACTIVE_TASKS):
         raise SchedulerError(
             f"campaign hard cap {hard_cap} exceeds project maximum "
             f"{MFT_PROJECT_MAX_ACTIVE_TASKS}")
     dynamic_project_cap = bool(
         adopted_authorized
         and _adopted_authorization.evidence_mode == "dynamic_project_cap_v1")
-    campaign_counts, global_counts, allocations, capacity_gate = scheduler_snapshot(
-        hard_cap,
-        require_exact_project_cap=dynamic_project_cap,
-        require_full_project=dynamic_project_cap,
-    )
+    snapshot_options = {
+        "require_exact_project_cap": dynamic_project_cap,
+        "require_full_project": dynamic_project_cap,
+    }
+    if pooled_authorized:
+        snapshot_options["max_project_active_tasks"] = (
+            MAX_POOLED_PROJECT_ACTIVE_TASKS)
+    campaign_counts, global_counts, allocations, capacity_gate = (
+        scheduler_snapshot(hard_cap, **snapshot_options))
     ready_fit_slots = capacity_gate["ready_fit_slots"]
     campaign_active = sum(campaign_counts.values())
     data_rows, judged_ids = dataset_collection_snapshot()
@@ -886,6 +923,12 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             submit_kwargs = dict(_submit_resources or {})
             if _pooled_submission is not None:
                 submit_kwargs.update(_pooled_submission)
+            if pooled_authorized:
+                submit_kwargs.update({
+                    "required_hard_cap": hard_cap,
+                    "max_project_active_tasks": (
+                        MAX_POOLED_PROJECT_ACTIVE_TASKS),
+                })
             if dynamic_project_cap:
                 submit_kwargs["required_project_cap"] = hard_cap
             tid = submit(
@@ -1046,7 +1089,10 @@ def main():
     pooled_submission = _pooled_submission_kwargs(args)
 
     requested_active = int(args.target) + int(args.buffer)
-    if requested_active > MAX_STANDALONE_ACTIVE:
+    if args.aedt_pooled and requested_active > MAX_POOLED_ACTIVE:
+        raise SchedulerError(
+            f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
+    if not args.aedt_pooled and requested_active > MAX_STANDALONE_ACTIVE:
         raise SchedulerError(
             f"standalone feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
             "use rapid_campaign.py for 300-task production promotion")
