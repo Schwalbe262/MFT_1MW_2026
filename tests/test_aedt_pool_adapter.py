@@ -199,3 +199,111 @@ def test_nonreleased_host_ack_fails_closed():
     lease.release = lambda **_kwargs: {"state": "releasing"}
     with pytest.raises(RuntimeError, match="not acknowledged"):
         adapter.release_project(lease, wait_seconds=1)
+
+
+class FakeSharedDesktop:
+    def __init__(self, sibling_running=True):
+        self.sibling_running = sibling_running
+        self.running_calls = 0
+        self.active_project_calls = []
+
+    def AreThereSimulationsRunning(self):
+        self.running_calls += 1
+        return self.sibling_running
+
+    def SetActiveProject(self, name):
+        self.active_project_calls.append(name)
+        raise AssertionError("pooled preflight must not use Desktop active state")
+
+
+class FakeOwnedDesign:
+    def GetName(self):
+        return "simulation_own;maxwell_loss"
+
+    def GetDesignType(self):
+        return "Maxwell 3D"
+
+    def GetSolutionType(self):
+        return "AC Magnetic"
+
+    def GetModule(self, name):
+        assert name == "AnalysisSetup"
+        return SimpleNamespace(GetSetups=lambda: ["Setup1"])
+
+
+class FakeOwnedProject:
+    def __init__(self):
+        self.design = FakeOwnedDesign()
+        self.active_design_calls = []
+
+    def GetName(self):
+        return "simulation_own"
+
+    def GetDesigns(self):
+        return [self.design]
+
+    def SetActiveDesign(self, name):
+        self.active_design_calls.append(name)
+        raise AssertionError("pooled preflight must enumerate its owned design")
+
+
+def _pooled_preflight_harness(monkeypatch, *, own_running):
+    from run_simulation_260706 import Simulation
+
+    monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
+    monkeypatch.delenv("MFT_AEDT_EXCLUSIVE_1TO1", raising=False)
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_PILOT", raising=False)
+    monkeypatch.setenv("MFT_AEDT_SHARED_CANARY", "1")
+    assert adapter.pooled_backend_enabled() is True
+
+    desktop = FakeSharedDesktop(sibling_running=True)
+    project = FakeOwnedProject()
+    desktop_wrapper = SimpleNamespace(odesktop=desktop)
+    simulation = Simulation.__new__(Simulation)
+    simulation.aedt_backend = "pooled"
+    simulation.PROJECT_NAME = "simulation_own"
+    simulation.solver_may_be_running = own_running
+    simulation.desktop = desktop_wrapper
+    simulation.project = SimpleNamespace(
+        project=project,
+        proj=project,
+        desktop=desktop_wrapper,
+    )
+    simulation.design1 = SimpleNamespace(design_name="maxwell_loss")
+    return simulation, desktop, project
+
+
+def test_pooled_preflight_ignores_solving_sibling_when_owned_project_is_idle(
+    monkeypatch,
+):
+    simulation, desktop, project = _pooled_preflight_harness(
+        monkeypatch, own_running=False
+    )
+
+    context = simulation._prepare_copied_loss_native_analysis(
+        max_attempts=1,
+        timeout_s=0,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert context["odesign"] is project.design
+    assert context["odesktop"] is None
+    assert desktop.running_calls == 0
+    assert desktop.active_project_calls == []
+    assert project.active_design_calls == []
+
+
+def test_pooled_preflight_fails_when_owned_project_is_solving(monkeypatch):
+    simulation, desktop, _project = _pooled_preflight_harness(
+        monkeypatch, own_running=True
+    )
+
+    with pytest.raises(RuntimeError, match="this client's project: True"):
+        simulation._prepare_copied_loss_native_analysis(
+            max_attempts=1,
+            timeout_s=0,
+            sleeper=lambda _seconds: None,
+        )
+
+    assert desktop.running_calls == 0
+    assert desktop.active_project_calls == []

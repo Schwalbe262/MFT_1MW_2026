@@ -127,7 +127,6 @@ from module.aedt_pool_adapter import (
     aedt_backend,
     acquire_pooled_desktop,
     bind_project_name as bind_pooled_project_name,
-    pooled_backend_enabled,
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
 )
@@ -2043,6 +2042,25 @@ class Simulation():
 
         raise RuntimeError("native AEDT project handle is unavailable")
 
+    def _backend_mode(self):
+        """Return the backend captured for this runner instance."""
+        return str(getattr(self, "aedt_backend", "") or aedt_backend())
+
+    def _verified_native_project_handle(self):
+        """Return this runner's cached project after exact-name attestation."""
+        native_project = self._native_project_handle()
+        expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        get_name = getattr(native_project, "GetName", None)
+        if not expected_project or not callable(get_name):
+            raise RuntimeError("native project identity is unavailable")
+        actual_project = str(get_name() or "").strip()
+        if actual_project != expected_project:
+            raise _AedtIdentityMismatch(
+                "project identity mismatch: "
+                f"expected={expected_project}, actual={actual_project or '<empty>'}"
+            )
+        return native_project
+
     def _rebind_native_project_for_design_creation(
             self, max_attempts=3, retry_delay=0.5, sleeper=time.sleep):
         """Rebind a stale pyProject handle before creating the next design."""
@@ -2057,6 +2075,12 @@ class Simulation():
             project_state = {}
         if not expected_project or not project_state:
             raise RuntimeError("project wrapper identity is unavailable for native rebind")
+
+        if self._backend_mode() == "pooled":
+            native_project = self._verified_native_project_handle()
+            project_state["project"] = native_project
+            project_state["proj"] = native_project
+            return native_project
 
         odesktop = self._native_desktop_handle()
         set_active_project = getattr(odesktop, "SetActiveProject", None)
@@ -3572,7 +3596,10 @@ class Simulation():
         raise RuntimeError(message)
 
     def _refresh_native_project_handle(self):
-        """Rebind the current project through Desktop without touching any solve."""
+        """Rebind standalone through Desktop; reuse the bound handle pooled."""
+        if self._backend_mode() == "pooled":
+            return self._verified_native_project_handle()
+
         project_wrapper = getattr(self, "project", None)
         try:
             project_state = vars(project_wrapper)
@@ -4986,6 +5013,49 @@ class Simulation():
                 return odesktop
         raise RuntimeError("original native AEDT Desktop handle is unavailable")
 
+    def _verified_pooled_native_maxwell_setup(self, setup_name="Setup1"):
+        """Resolve this client's exact Maxwell setup without Desktop active state."""
+        expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        expected_design = _aedt_design_name(
+            getattr(self.design1, "design_name", "")
+        )
+        if not expected_project or not expected_design:
+            raise RuntimeError("native analysis project/design identity is unavailable")
+
+        oproject = self._verified_native_project_handle()
+        actual_project = str(oproject.GetName() or "").strip()
+        if actual_project != expected_project:
+            raise _AedtIdentityMismatch(
+                "analysis project identity mismatch: "
+                f"expected={expected_project}, actual={actual_project or '<empty>'}"
+            )
+
+        odesign = _find_raw_design(oproject, expected_design)
+        if odesign is None or odesign is False:
+            raise RuntimeError(f"SetActiveDesign returned no design ({expected_design})")
+        actual_design = _aedt_design_name(odesign)
+        if actual_design != expected_design:
+            raise _AedtIdentityMismatch(
+                "analysis design identity mismatch: "
+                f"expected={expected_design}, actual={actual_design or '<empty>'}"
+            )
+        design_type = str(odesign.GetDesignType() or "")
+        solution_type = str(odesign.GetSolutionType() or "")
+        if design_type != "Maxwell 3D" or not _is_ac_magnetic_solution(solution_type):
+            raise _AedtIdentityMismatch(
+                "analysis design physics mismatch: "
+                f"type={design_type!r}, solution={solution_type!r}"
+            )
+        analysis = odesign.GetModule("AnalysisSetup")
+        if analysis is None or analysis is False:
+            raise RuntimeError("active design returned no AnalysisSetup module")
+        setups = tuple(str(name) for name in (analysis.GetSetups() or []))
+        if setups != (setup_name,):
+            raise RuntimeError(
+                f"native analysis setup mismatch: expected={(setup_name,)}, actual={setups}"
+            )
+        return oproject, odesign
+
     def _verified_native_maxwell_setup(self, odesktop, setup_name="Setup1"):
         """Resolve the exact active Maxwell setup through fresh native handles."""
         expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
@@ -5139,10 +5209,65 @@ class Simulation():
                     sleeper(max(0.0, float(retry_delay)) * (2 ** (attempt - 1)))
         raise RuntimeError("native Maxwell DSO restore failed: " + "; ".join(errors))
 
+    def _pooled_owned_project_simulation_running(self):
+        """Return only this client's solve state, never the Desktop-wide state."""
+        if self._backend_mode() != "pooled":
+            raise RuntimeError("pooled project solve state requested while disabled")
+        self._verified_native_project_handle()
+        running = getattr(self, "solver_may_be_running", None)
+        if type(running) is not bool:
+            raise RuntimeError("pooled project solve state is unavailable")
+        return running
+
     def _prepare_copied_loss_native_analysis(
             self, setup_name="Setup1", max_attempts=5, timeout_s=30.0,
             initial_retry_delay=0.5, clock=time.monotonic, sleeper=time.sleep):
         """Retry only copied-loss solve preflight; never dispatch a solve here."""
+        if self._backend_mode() == "pooled":
+            deadline = clock() + max(0.0, float(timeout_s))
+            attempts = []
+            for attempt in range(1, int(max_attempts) + 1):
+                if attempt > 1 and clock() >= deadline:
+                    break
+                try:
+                    running = self._pooled_owned_project_simulation_running()
+                    if running is not False:
+                        raise RuntimeError(
+                            "AEDT reports an overlapping simulation in this "
+                            f"client's project: {running!r}"
+                        )
+                    _oproject, odesign = self._verified_pooled_native_maxwell_setup(
+                        setup_name=setup_name
+                    )
+                    return {
+                        "odesktop": None,
+                        "odesign": odesign,
+                        "registry_key": None,
+                        "original_config": None,
+                        "acf_path": None,
+                    }
+                except _AedtIdentityMismatch:
+                    raise
+                except Exception as error:
+                    attempts.append(
+                        f"attempt {attempt}: {type(error).__name__}: {error}"
+                    )
+                    now = clock()
+                    if attempt >= int(max_attempts) or now >= deadline:
+                        break
+                    logging.warning(
+                        "pooled copied-loss native analysis preflight failed "
+                        f"(attempt {attempt}/{int(max_attempts)}): {error}"
+                    )
+                    sleeper(min(
+                        max(0.0, float(initial_retry_delay)) * (2 ** (attempt - 1)),
+                        max(0.0, deadline - now),
+                    ))
+            raise RuntimeError(
+                "pooled copied-loss native analysis preflight failed closed; "
+                f"attempts={attempts}"
+            )
+
         captured_acf = getattr(self, "_matrix_hpc_acf_path", None)
         if not captured_acf:
             raise RuntimeError(
@@ -5165,18 +5290,11 @@ class Simulation():
                 _oproject, odesign = self._verified_native_maxwell_setup(
                     odesktop, setup_name=setup_name
                 )
-                # Shared (pooled) Desktops legitimately run sibling solves.
-                # Already-running solves consumed their DSO at launch, so only
-                # concurrent swap+launch windows race; a quiet Desktop may
-                # never occur at 1:3, so keep the window minimal instead of
-                # waiting. The strict matrix/loss policy validation
-                # quarantines the rare stomped launch downstream.
-                if not pooled_backend_enabled():
-                    running = odesktop.AreThereSimulationsRunning()
-                    if running is not False:
-                        raise RuntimeError(
-                            f"AEDT reports an overlapping simulation: {running!r}"
-                        )
+                running = odesktop.AreThereSimulationsRunning()
+                if running is not False:
+                    raise RuntimeError(
+                        f"AEDT reports an overlapping simulation: {running!r}"
+                    )
                 active = odesktop.GetRegistryString(registry_key)
                 if active is None or active is False:
                     raise RuntimeError("GetRegistryString returned no active DSO")
@@ -5248,6 +5366,35 @@ class Simulation():
             self, setup_name="Setup1", max_attempts=5,
             retry_delay=0.5, sleeper=time.sleep):
         """Reacquire exact identities after dispatch without any solve retry."""
+        if self._backend_mode() == "pooled":
+            errors = []
+            for attempt in range(1, int(max_attempts) + 1):
+                try:
+                    self._verified_pooled_native_maxwell_setup(
+                        setup_name=setup_name
+                    )
+                    running = self._pooled_owned_project_simulation_running()
+                    if running is not False:
+                        raise RuntimeError(
+                            "AEDT still reports a running simulation in this "
+                            f"client's project: {running!r}"
+                        )
+                    return
+                except _AedtIdentityMismatch:
+                    raise
+                except Exception as error:
+                    errors.append(
+                        f"attempt {attempt}: {type(error).__name__}: {error}"
+                    )
+                    if attempt < int(max_attempts):
+                        sleeper(
+                            max(0.0, float(retry_delay)) * (2 ** (attempt - 1))
+                        )
+            raise RuntimeError(
+                "pooled copied-loss post-dispatch identity check failed: "
+                + "; ".join(errors)
+            )
+
         errors = []
         for attempt in range(1, int(max_attempts) + 1):
             try:
@@ -5255,15 +5402,11 @@ class Simulation():
                 self._verified_native_maxwell_setup(
                     odesktop, setup_name=setup_name
                 )
-                # Desktop-wide "still running" is meaningless on a shared
-                # Desktop (sibling solves); own-solve completion is already
-                # enforced by the synchronous analyze return above this check.
-                if not pooled_backend_enabled():
-                    running = odesktop.AreThereSimulationsRunning()
-                    if running is not False:
-                        raise RuntimeError(
-                            f"AEDT still reports a running simulation: {running!r}"
-                        )
+                running = odesktop.AreThereSimulationsRunning()
+                if running is not False:
+                    raise RuntimeError(
+                        f"AEDT still reports a running simulation: {running!r}"
+                    )
                 return
             except _AedtIdentityMismatch:
                 raise
@@ -5357,9 +5500,9 @@ class Simulation():
                     f"[{label}] native Analyze returned invalid status: "
                     f"{analyze_result!r}"
                 )
-            self._postcheck_copied_loss_native_analysis()
             if getattr(self, "aedt_backend", "standalone") == "pooled":
                 self.solver_may_be_running = False
+            self._postcheck_copied_loss_native_analysis()
             self.save_project(strict=True)
             return elapsed
 
@@ -5901,7 +6044,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             """maxwell_matrix를 복제해 loss_sym 디자인으로 전환 (모델링 절반 절약).
             레퍼런스: pyaedt_library/example/MFT_TAB second_simulation()"""
             import math as _m
-            op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
+            if sim._backend_mode() == "pooled":
+                op = sim._verified_native_project_handle()
+            else:
+                op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
             old_design = sim.design_matrix
             source_name = _aedt_design_name(
                 getattr(old_design, "design_name", "")
@@ -6071,7 +6217,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     _rollback_failed_prepare()
                     raise
 
-            op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
+            if sim._backend_mode() == "pooled":
+                op = sim._verified_native_project_handle()
+            else:
+                op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
             try:
                 new_design, attempts = _retry_copied_loss_preparation(
                     op, "maxwell_matrix", _attempt,

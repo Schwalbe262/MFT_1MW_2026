@@ -540,15 +540,6 @@ def _thermal_desktop_handle(sim, ipk):
 
 
 def _thermal_running_state(sim, ipk):
-    # Desktop-wide running state is meaningless on a shared pooled AEDT
-    # session (sibling clients solve concurrently); callers treat this
-    # exception as "no evidence" rather than a false positive.
-    from module.aedt_pool_adapter import pooled_backend_enabled
-    if pooled_backend_enabled():
-        raise RuntimeError(
-            "Desktop-wide simulation state is not meaningful on a shared "
-            "pooled AEDT session"
-        )
     desktop = _thermal_desktop_handle(sim, ipk)
     is_running = getattr(desktop, "AreThereSimulationsRunning", None)
     if not callable(is_running):
@@ -659,13 +650,9 @@ def _prepare_thermal_dispatch(
             raise RuntimeError("native ThermalSetup Enabled readback is false")
         enabled_source = "native+wrapper"
 
-    from module.aedt_pool_adapter import pooled_backend_enabled
-    if not pooled_backend_enabled():
-        running = _thermal_running_state(sim, ipk)
-        if running is not False:
-            raise RuntimeError(
-                f"AEDT reports an overlapping simulation: {running!r}"
-            )
+    running = _thermal_running_state(sim, ipk)
+    if running is not False:
+        raise RuntimeError(f"AEDT reports an overlapping simulation: {running!r}")
     return {
         "project": actual_project,
         "design": design_name,

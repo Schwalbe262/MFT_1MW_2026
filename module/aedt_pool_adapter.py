@@ -154,6 +154,14 @@ def acquire_pooled_desktop(
             non_graphical=non_graphical,
             desktop_factory=desktop_factory,
         )
+        # The lease must heartbeat for the entire run (solves take 40-70
+        # minutes); wait_until_leased only heartbeats while queued, and an
+        # expired lease lets the pool recycle the shared Desktop mid-solve.
+        lease.start_heartbeat(
+            heartbeat_seconds=_positive_int_env(
+                "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
+            )
+        )
     except Exception:
         try:
             lease.report_fault(
@@ -207,6 +215,10 @@ def bind_project_name(lease: Any, project_name: str) -> None:
 
 
 def release_project(lease: Any, *, wait_seconds: int | None = None) -> dict:
+    try:
+        lease.stop_heartbeat()
+    except Exception:
+        pass
     status = lease.release(
         wait_seconds=(
             _positive_int_env("MFT_AEDT_RELEASE_WAIT_SECONDS", 300)
