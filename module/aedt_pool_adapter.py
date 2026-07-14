@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -110,6 +111,74 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+# The solver's long native calls can hold the GIL for 10+ minutes, which
+# starves any in-process heartbeat thread and expires the lease mid-solve.
+# A child process is immune to the parent's GIL.  It exits by itself when
+# the parent dies (orphaned to init) or when the lease goes terminal on the
+# server (persistent HTTP errors), so a crashed client cannot pin its slot.
+_HEARTBEAT_PROC_SRC = """
+import os, time, urllib.request
+url = os.environ["MFT_HB_URL"]
+headers = {"Content-Type": "application/json"}
+if os.environ.get("MFT_HB_BOOTSTRAP", ""):
+    headers["X-AEDT-Bootstrap-Token"] = os.environ["MFT_HB_BOOTSTRAP"]
+if os.environ.get("MFT_HB_TOKEN", ""):
+    headers["X-AEDT-Lease-Token"] = os.environ["MFT_HB_TOKEN"]
+interval = max(5, int(os.environ.get("MFT_HB_INTERVAL", "30")))
+failures = 0
+while failures < 20:
+    if hasattr(os, "getppid") and os.getppid() == 1:
+        break
+    try:
+        request = urllib.request.Request(
+            url, data=b"{}", headers=headers, method="POST"
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener.open(request, timeout=25).read()
+        failures = 0
+    except Exception:
+        failures += 1
+    time.sleep(interval)
+"""
+
+
+def _spawn_heartbeat_process(lease: Any) -> Any:
+    env = dict(os.environ)
+    env["MFT_HB_URL"] = (
+        f"{lease.http.scheduler_url}/api/aedt-pool/leases/{lease.lease_id}/heartbeat"
+    )
+    env["MFT_HB_BOOTSTRAP"] = str(getattr(lease.http, "bootstrap_token", "") or "")
+    env["MFT_HB_TOKEN"] = str(lease.client_token or "")
+    env["MFT_HB_INTERVAL"] = os.environ.get(
+        "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", "30"
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", _HEARTBEAT_PROC_SRC],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def start_lease_keepalive(lease: Any) -> None:
+    if getattr(lease, "_mft_hb_proc", None) is not None:
+        return
+    lease._mft_hb_proc = _spawn_heartbeat_process(lease)
+
+
+def stop_lease_keepalive(lease: Any) -> None:
+    proc = getattr(lease, "_mft_hb_proc", None)
+    lease._mft_hb_proc = None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+    except Exception:
+        pass
+
+
 def acquire_pooled_desktop(
     *,
     desktop_factory: Any,
@@ -152,13 +221,15 @@ def acquire_pooled_desktop(
         )
         # wait_until_leased only heartbeats while queued.  The lease TTL is
         # far shorter than a Desktop attach or a solve, so ownership must be
-        # kept alive by a background heartbeat from the moment the lease is
-        # granted until release()/report_fault() stops it.
+        # kept alive from the moment the lease is granted until release/fault.
+        # The in-process thread alone is not enough: the solver's native calls
+        # hold the GIL for many minutes, so a child process keeps beating too.
         lease.start_heartbeat(
             heartbeat_seconds=_positive_int_env(
                 "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
             )
         )
+        start_lease_keepalive(lease)
         desktop = lease.connect_desktop(
             non_graphical=non_graphical,
             desktop_factory=desktop_factory,
@@ -172,6 +243,8 @@ def acquire_pooled_desktop(
             lease.release(wait_seconds=120)
         except Exception:
             pass
+        finally:
+            stop_lease_keepalive(lease)
         raise
     return desktop, lease
 
@@ -216,6 +289,7 @@ def bind_project_name(lease: Any, project_name: str) -> None:
 
 
 def release_project(lease: Any, *, wait_seconds: int | None = None) -> dict:
+    stop_lease_keepalive(lease)
     status = lease.release(
         wait_seconds=(
             _positive_int_env("MFT_AEDT_RELEASE_WAIT_SECONDS", 300)
@@ -231,6 +305,7 @@ def release_project(lease: Any, *, wait_seconds: int | None = None) -> dict:
 
 
 def report_failure(lease: Any, error: BaseException, *, solver_may_run: bool) -> dict:
+    stop_lease_keepalive(lease)
     text = f"{type(error).__name__}: {error}"[:4000]
     lower = text.lower()
     if solver_may_run or "timeout" in lower or "timed out" in lower:

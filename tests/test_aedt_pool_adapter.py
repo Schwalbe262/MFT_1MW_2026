@@ -13,6 +13,10 @@ class FakeLease:
 
     def __init__(self):
         self.calls = []
+        self.http = SimpleNamespace(
+            scheduler_url="http://scheduler:8000", bootstrap_token="boot"
+        )
+        self.client_token = "lease-token"
 
     def wait_until_leased(self, **kwargs):
         self.calls.append(("wait", kwargs))
@@ -65,13 +69,34 @@ def test_pooled_backend_rejects_ambiguous_dual_ack(monkeypatch):
         adapter.aedt_backend()
 
 
+class FakeHeartbeatProc:
+    def __init__(self):
+        self.killed = False
+
+    def poll(self):
+        return 1 if self.killed else None
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
 def test_pooled_acquire_always_requests_exclusive_session(monkeypatch):
     lease = FakeLease()
     requests = []
+    spawned = []
 
     def acquire(url, project, **kwargs):
         requests.append((url, project, kwargs))
         return lease
+
+    def fake_spawn(target):
+        assert target is lease
+        proc = FakeHeartbeatProc()
+        spawned.append(proc)
+        return proc
 
     monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
     monkeypatch.setenv("MFT_AEDT_EXCLUSIVE_1TO1", "1")
@@ -82,6 +107,7 @@ def test_pooled_acquire_always_requests_exclusive_session(monkeypatch):
         "_scheduler_attach_module",
         lambda: SimpleNamespace(acquire_project_lease=acquire),
     )
+    monkeypatch.setattr(adapter, "_spawn_heartbeat_process", fake_spawn)
 
     desktop, acquired = adapter.acquire_pooled_desktop(
         desktop_factory="factory",
@@ -97,10 +123,27 @@ def test_pooled_acquire_always_requests_exclusive_session(monkeypatch):
     assert lease.calls[1][1]["heartbeat_seconds"] == 30
     assert lease.calls[2][0] == "connect"
     assert lease.calls[2][1]["desktop_factory"] == "factory"
+    assert len(spawned) == 1 and not spawned[0].killed
+
+    adapter.release_project(lease, wait_seconds=1)
+    assert spawned[0].killed
+
+
+def test_keepalive_process_stops_on_failure_report(monkeypatch):
+    lease = FakeLease()
+    proc = FakeHeartbeatProc()
+    monkeypatch.setattr(adapter, "_spawn_heartbeat_process", lambda _l: proc)
+
+    adapter.start_lease_keepalive(lease)
+    assert lease._mft_hb_proc is proc
+    adapter.report_failure(lease, RuntimeError("x"), solver_may_run=False)
+    assert proc.killed
+    assert lease._mft_hb_proc is None
 
 
 def test_shared_pilot_requests_nonexclusive_session(monkeypatch):
     lease = FakeLease()
+    monkeypatch.setattr(adapter, "_spawn_heartbeat_process", lambda _l: FakeHeartbeatProc())
     lease.exclusive_session = False
     requests = []
 
@@ -132,6 +175,7 @@ def test_shared_canary_requests_nonexclusive_session_without_pilot_barrier(
     tmp_path, monkeypatch
 ):
     lease = FakeLease()
+    monkeypatch.setattr(adapter, "_spawn_heartbeat_process", lambda _l: FakeHeartbeatProc())
     lease.exclusive_session = False
     requests = []
 
