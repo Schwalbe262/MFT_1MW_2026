@@ -3498,6 +3498,53 @@ class Simulation():
         self.design1.setup.properties["Percent Error"] = float(_p("percent_error", 2.0))
         self.design1.setup.properties["Frequency Setup"] = f"{float(self.df_plus['freq'].iloc[0])}Hz"
 
+    def _prepare_pooled_solution_data_app(self):
+        """Hydrate the pooled PyAEDT app state needed by lazy post creation."""
+        if self._backend_mode() != "pooled":
+            return None
+
+        design = getattr(self, "design1", None)
+        app = getattr(design, "solver_instance", None)
+        if app is None:
+            raise RuntimeError("pooled SolutionData PyAEDT app is unavailable")
+
+        expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        raw_project_path = getattr(self, "project_path", None)
+        try:
+            project_path = os.fsdecode(os.fspath(raw_project_path)).strip()
+        except TypeError as error:
+            raise RuntimeError(
+                "pooled SolutionData project path is unavailable"
+            ) from error
+        if not expected_project or not project_path:
+            raise RuntimeError(
+                "pooled SolutionData project identity/path is unavailable"
+            )
+
+        native_project = self._verified_native_project_handle()
+        expected_design = _aedt_design_name(
+            getattr(design, "design_name", "")
+        )
+        if not expected_design:
+            raise RuntimeError("pooled SolutionData design identity is unavailable")
+        native_design = _find_raw_design(native_project, expected_design)
+
+        # PyAEDT owns project caches separate from pyProject.  Its save_project
+        # clears both, and pooled gRPC oProject.GetPath() cannot repopulate the
+        # path.  Seed the attested name first because the project_name getter
+        # clears _project_path while filling an empty name cache.
+        app._oproject = native_project
+        app._odesign = native_design
+        app._design_name = expected_design
+        design_solutions = getattr(app, "design_solutions", None)
+        if design_solutions is not None:
+            design_solutions._odesign = native_design
+        # ReportSetup is design-scoped and may have been cached before a save.
+        app._oreportsetup = None
+        app._project_name = expected_project
+        app._project_path = os.path.abspath(project_path)
+        return app
+
     def _solution_data_frame(self, expressions, aliases=None, target_units=None,
                              report_category=None, report_context=None,
                              extraction_key="result",
@@ -3531,6 +3578,7 @@ class Simulation():
         for attempt in range(1, max_attempts + 1):
             self.extraction_attempts[extraction_key] = self.extraction_attempts.get(extraction_key, 0) + 1
             try:
+                self._prepare_pooled_solution_data_app()
                 post = self.design1.post
                 if callable(post) and not hasattr(post, "get_solution_data"):
                     post = post()
