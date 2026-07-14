@@ -59,12 +59,14 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 "_current_library_revision",
                 return_value=LIBRARY_REVISION,
             ))
+            p08_completion_check = stack.enter_context(patch.object(
+                feeder, "validate_p08_completion"))
             if fail_local_revision_checks:
                 error = AssertionError(
-                    "local revision vetting must be bypassed")
+                    "local revision vetting and p08 completion must be bypassed")
                 solver_revision_check.side_effect = error
                 library_revision_check.side_effect = error
-            stack.enter_context(patch.object(feeder, "validate_p08_completion"))
+                p08_completion_check.side_effect = error
             stack.enter_context(patch.object(feeder, "_require_deployed_revisions"))
             stack.enter_context(patch.object(
                 feeder,
@@ -121,6 +123,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         if fail_local_revision_checks:
             solver_revision_check.assert_not_called()
             library_revision_check.assert_not_called()
+            p08_completion_check.assert_not_called()
         post.assert_called_once()
         return copy.deepcopy(post.call_args.kwargs["json"])
 
@@ -138,7 +141,8 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             and "WARNING" in call.args[0]
         ]
         self.assertEqual(warning_lines, [
-            "[feeder] WARNING: local revision vetting was bypassed; "
+            "[feeder] WARNING: local revision vetting and the p08 completion "
+            "gate were bypassed; "
             f"using pinned solver SHA {SOLVER_REVISION} and "
             f"library SHA {LIBRARY_REVISION}"
         ])

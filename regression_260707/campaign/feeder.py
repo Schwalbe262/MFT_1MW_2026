@@ -1024,7 +1024,8 @@ def main():
                     "--trust-pinned-revisions is set"
                 )
         print(
-            "[feeder] WARNING: local revision vetting was bypassed; "
+            "[feeder] WARNING: local revision vetting and the p08 completion "
+            "gate were bypassed; "
             f"using pinned solver SHA {args.solver_revision} and "
             f"library SHA {args.library_revision}"
         )
@@ -1035,8 +1036,9 @@ def main():
                 raise SchedulerError("feeder solver revision is not the current vetted local solver")
             if args.library_revision != al_driver._current_library_revision():
                 raise SchedulerError("feeder library revision is not the current clean local library")
-        validate_p08_completion(
-            args.solver_revision, args.library_revision, seed=args.candidate_seed)
+            validate_p08_completion(
+                args.solver_revision, args.library_revision,
+                seed=args.candidate_seed)
 
     def guarded_step():
         def run_locked_step():
