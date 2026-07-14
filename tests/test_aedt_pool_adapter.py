@@ -18,6 +18,9 @@ class FakeLease:
         self.calls.append(("wait", kwargs))
         return {"state": "leased", "endpoint": "node:50001"}
 
+    def start_heartbeat(self, **kwargs):
+        self.calls.append(("start_heartbeat", kwargs))
+
     def connect_desktop(self, **kwargs):
         self.calls.append(("connect", kwargs))
         return "desktop"
@@ -90,8 +93,10 @@ def test_pooled_acquire_always_requests_exclusive_session(monkeypatch):
     assert requests[0][2]["exclusive_session"] is True
     assert requests[0][2]["task_id"] == 123
     assert lease.calls[0][0] == "wait"
-    assert lease.calls[1][0] == "connect"
-    assert lease.calls[1][1]["desktop_factory"] == "factory"
+    assert lease.calls[1][0] == "start_heartbeat"
+    assert lease.calls[1][1]["heartbeat_seconds"] == 30
+    assert lease.calls[2][0] == "connect"
+    assert lease.calls[2][1]["desktop_factory"] == "factory"
 
 
 def test_shared_pilot_requests_nonexclusive_session(monkeypatch):

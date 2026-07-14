@@ -150,6 +150,15 @@ def acquire_pooled_desktop(
                 "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
             ),
         )
+        # wait_until_leased only heartbeats while queued.  The lease TTL is
+        # far shorter than a Desktop attach or a solve, so ownership must be
+        # kept alive by a background heartbeat from the moment the lease is
+        # granted until release()/report_fault() stops it.
+        lease.start_heartbeat(
+            heartbeat_seconds=_positive_int_env(
+                "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
+            )
+        )
         desktop = lease.connect_desktop(
             non_graphical=non_graphical,
             desktop_factory=desktop_factory,
