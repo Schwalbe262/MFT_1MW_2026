@@ -1010,6 +1010,13 @@ def build_node_canary_host_command(
     root = f'"$PWD/{clone_leaf}"'
     return (
         "set -euo pipefail; "
+        # Raw-command task: unlike MFT project entrypoints it gets no project
+        # setup, so the AEDT environment must be loaded here or Desktop()
+        # dies with "AEDT is not installed" (observed fleet-wide 2026-07-13).
+        "source /etc/profile.d/lmod.sh 2>/dev/null || true; "
+        "module load ansys-electronics/v252 2>/dev/null || "
+        "export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; "
+        "export FLEXLM_TIMEOUT=3000000; "
         f"root={root}; "
         'test ! -e "$root"; '
         f"git clone --no-checkout {shlex.quote(NODE_CANARY_SCHEDULER_REPOSITORY)} "
