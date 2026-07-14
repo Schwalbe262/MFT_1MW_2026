@@ -22,12 +22,6 @@ class FakeLease:
         self.calls.append(("connect", kwargs))
         return "desktop"
 
-    def start_heartbeat(self, **kwargs):
-        self.calls.append(("start_heartbeat", kwargs))
-
-    def stop_heartbeat(self):
-        self.calls.append(("stop_heartbeat", {}))
-
     def bind_project_name(self, name):
         self.calls.append(("bind", name))
         return {"project_name": name}
