@@ -127,6 +127,7 @@ from module.aedt_pool_adapter import (
     aedt_backend,
     acquire_pooled_desktop,
     bind_project_name as bind_pooled_project_name,
+    pooled_backend_enabled,
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
 )
@@ -5164,11 +5165,18 @@ class Simulation():
                 _oproject, odesign = self._verified_native_maxwell_setup(
                     odesktop, setup_name=setup_name
                 )
-                running = odesktop.AreThereSimulationsRunning()
-                if running is not False:
-                    raise RuntimeError(
-                        f"AEDT reports an overlapping simulation: {running!r}"
-                    )
+                # Shared (pooled) Desktops legitimately run sibling solves.
+                # Already-running solves consumed their DSO at launch, so only
+                # concurrent swap+launch windows race; a quiet Desktop may
+                # never occur at 1:3, so keep the window minimal instead of
+                # waiting. The strict matrix/loss policy validation
+                # quarantines the rare stomped launch downstream.
+                if not pooled_backend_enabled():
+                    running = odesktop.AreThereSimulationsRunning()
+                    if running is not False:
+                        raise RuntimeError(
+                            f"AEDT reports an overlapping simulation: {running!r}"
+                        )
                 active = odesktop.GetRegistryString(registry_key)
                 if active is None or active is False:
                     raise RuntimeError("GetRegistryString returned no active DSO")
@@ -5247,11 +5255,15 @@ class Simulation():
                 self._verified_native_maxwell_setup(
                     odesktop, setup_name=setup_name
                 )
-                running = odesktop.AreThereSimulationsRunning()
-                if running is not False:
-                    raise RuntimeError(
-                        f"AEDT still reports a running simulation: {running!r}"
-                    )
+                # Desktop-wide "still running" is meaningless on a shared
+                # Desktop (sibling solves); own-solve completion is already
+                # enforced by the synchronous analyze return above this check.
+                if not pooled_backend_enabled():
+                    running = odesktop.AreThereSimulationsRunning()
+                    if running is not False:
+                        raise RuntimeError(
+                            f"AEDT still reports a running simulation: {running!r}"
+                        )
                 return
             except _AedtIdentityMismatch:
                 raise
