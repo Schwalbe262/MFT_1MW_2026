@@ -5223,51 +5223,6 @@ class Simulation():
             self, setup_name="Setup1", max_attempts=5, timeout_s=30.0,
             initial_retry_delay=0.5, clock=time.monotonic, sleeper=time.sleep):
         """Retry only copied-loss solve preflight; never dispatch a solve here."""
-        if self._backend_mode() == "pooled":
-            deadline = clock() + max(0.0, float(timeout_s))
-            attempts = []
-            for attempt in range(1, int(max_attempts) + 1):
-                if attempt > 1 and clock() >= deadline:
-                    break
-                try:
-                    running = self._pooled_owned_project_simulation_running()
-                    if running is not False:
-                        raise RuntimeError(
-                            "AEDT reports an overlapping simulation in this "
-                            f"client's project: {running!r}"
-                        )
-                    _oproject, odesign = self._verified_pooled_native_maxwell_setup(
-                        setup_name=setup_name
-                    )
-                    return {
-                        "odesktop": None,
-                        "odesign": odesign,
-                        "registry_key": None,
-                        "original_config": None,
-                        "acf_path": None,
-                    }
-                except _AedtIdentityMismatch:
-                    raise
-                except Exception as error:
-                    attempts.append(
-                        f"attempt {attempt}: {type(error).__name__}: {error}"
-                    )
-                    now = clock()
-                    if attempt >= int(max_attempts) or now >= deadline:
-                        break
-                    logging.warning(
-                        "pooled copied-loss native analysis preflight failed "
-                        f"(attempt {attempt}/{int(max_attempts)}): {error}"
-                    )
-                    sleeper(min(
-                        max(0.0, float(initial_retry_delay)) * (2 ** (attempt - 1)),
-                        max(0.0, deadline - now),
-                    ))
-            raise RuntimeError(
-                "pooled copied-loss native analysis preflight failed closed; "
-                f"attempts={attempts}"
-            )
-
         captured_acf = getattr(self, "_matrix_hpc_acf_path", None)
         if not captured_acf:
             raise RuntimeError(
@@ -5287,14 +5242,27 @@ class Simulation():
                 break
             try:
                 odesktop = self._native_desktop_handle()
-                _oproject, odesign = self._verified_native_maxwell_setup(
-                    odesktop, setup_name=setup_name
-                )
-                running = odesktop.AreThereSimulationsRunning()
-                if running is not False:
-                    raise RuntimeError(
-                        f"AEDT reports an overlapping simulation: {running!r}"
+                if self._backend_mode() == "pooled":
+                    _oproject, odesign = (
+                        self._verified_pooled_native_maxwell_setup(
+                            setup_name=setup_name
+                        )
                     )
+                    running = self._pooled_owned_project_simulation_running()
+                    if running is not False:
+                        raise RuntimeError(
+                            "AEDT reports an overlapping simulation in this "
+                            f"client's project: {running!r}"
+                        )
+                else:
+                    _oproject, odesign = self._verified_native_maxwell_setup(
+                        odesktop, setup_name=setup_name
+                    )
+                    running = odesktop.AreThereSimulationsRunning()
+                    if running is not False:
+                        raise RuntimeError(
+                            f"AEDT reports an overlapping simulation: {running!r}"
+                        )
                 active = odesktop.GetRegistryString(registry_key)
                 if active is None or active is False:
                     raise RuntimeError("GetRegistryString returned no active DSO")
@@ -5317,9 +5285,16 @@ class Simulation():
                         "native HPC DSO readback mismatch: "
                         f"expected='pyaedt_config', actual={actual!r}"
                     )
-                _oproject, odesign = self._verified_native_maxwell_setup(
-                    odesktop, setup_name=setup_name
-                )
+                if self._backend_mode() == "pooled":
+                    _oproject, odesign = (
+                        self._verified_pooled_native_maxwell_setup(
+                            setup_name=setup_name
+                        )
+                    )
+                else:
+                    _oproject, odesign = self._verified_native_maxwell_setup(
+                        odesktop, setup_name=setup_name
+                    )
                 return {
                     "odesktop": odesktop,
                     "odesign": odesign,
