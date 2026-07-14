@@ -25,7 +25,8 @@ LEGACY_PAYLOAD_SHA256 = (
 
 
 class FeederPooledSubmissionTests(unittest.TestCase):
-    def _capture_cli_payload(self, cli_args):
+    def _capture_cli_payload(
+            self, cli_args, *, fail_local_revision_checks=False):
         accepted = Mock(status_code=201)
         accepted.json.return_value = {"id": 123}
         argv = [
@@ -48,16 +49,21 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         }
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
-            stack.enter_context(patch.object(
+            solver_revision_check = stack.enter_context(patch.object(
                 feeder.al_driver,
                 "_current_solver_revision",
                 return_value=SOLVER_REVISION,
             ))
-            stack.enter_context(patch.object(
+            library_revision_check = stack.enter_context(patch.object(
                 feeder.al_driver,
                 "_current_library_revision",
                 return_value=LIBRARY_REVISION,
             ))
+            if fail_local_revision_checks:
+                error = AssertionError(
+                    "local revision vetting must be bypassed")
+                solver_revision_check.side_effect = error
+                library_revision_check.side_effect = error
             stack.enter_context(patch.object(feeder, "validate_p08_completion"))
             stack.enter_context(patch.object(feeder, "_require_deployed_revisions"))
             stack.enter_context(patch.object(
@@ -112,8 +118,30 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             ))
             feeder.main()
 
+        if fail_local_revision_checks:
+            solver_revision_check.assert_not_called()
+            library_revision_check.assert_not_called()
         post.assert_called_once()
         return copy.deepcopy(post.call_args.kwargs["json"])
+
+    def test_trust_pinned_revisions_bypasses_local_revision_vetting(self):
+        with patch("builtins.print") as output:
+            self._capture_cli_payload(
+                ["--trust-pinned-revisions"],
+                fail_local_revision_checks=True,
+            )
+
+        warning_lines = [
+            call.args[0]
+            for call in output.call_args_list
+            if call.args and isinstance(call.args[0], str)
+            and "WARNING" in call.args[0]
+        ]
+        self.assertEqual(warning_lines, [
+            "[feeder] WARNING: local revision vetting was bypassed; "
+            f"using pinned solver SHA {SOLVER_REVISION} and "
+            f"library SHA {LIBRARY_REVISION}"
+        ])
 
     def test_aedt_pooled_injects_backend_environment_and_resources(self):
         expected_env = {

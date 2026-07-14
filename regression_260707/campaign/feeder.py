@@ -968,6 +968,7 @@ def _argument_parser():
                     help="목표 초과 대기 버퍼")
     ap.add_argument("--solver-revision")
     ap.add_argument("--library-revision")
+    ap.add_argument("--trust-pinned-revisions", action="store_true")
     ap.add_argument("--candidate-seed", type=int, default=260710)
     ap.add_argument(
         "--aedt-pooled",
@@ -1011,11 +1012,29 @@ def main():
             f"standalone feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
             "use rapid_campaign.py for 300-task production promotion")
 
+    if args.trust_pinned_revisions:
+        for revision, flag in (
+                (args.solver_revision, "--solver-revision"),
+                (args.library_revision, "--library-revision")):
+            if (not isinstance(revision, str) or len(revision) != 40
+                    or any(char not in "0123456789abcdefABCDEF"
+                           for char in revision)):
+                raise SchedulerError(
+                    f"{flag} must be a full 40-character hex string when "
+                    "--trust-pinned-revisions is set"
+                )
+        print(
+            "[feeder] WARNING: local revision vetting was bypassed; "
+            f"using pinned solver SHA {args.solver_revision} and "
+            f"library SHA {args.library_revision}"
+        )
+
     if args.target + args.buffer > 0:
-        if args.solver_revision != al_driver._current_solver_revision():
-            raise SchedulerError("feeder solver revision is not the current vetted local solver")
-        if args.library_revision != al_driver._current_library_revision():
-            raise SchedulerError("feeder library revision is not the current clean local library")
+        if not args.trust_pinned_revisions:
+            if args.solver_revision != al_driver._current_solver_revision():
+                raise SchedulerError("feeder solver revision is not the current vetted local solver")
+            if args.library_revision != al_driver._current_library_revision():
+                raise SchedulerError("feeder library revision is not the current clean local library")
         validate_p08_completion(
             args.solver_revision, args.library_revision, seed=args.candidate_seed)
 
