@@ -53,6 +53,14 @@ BUFFER = 0            # production 300 promotion is owned by rapid_campaign
 MAX_STANDALONE_ACTIVE = 50
 COUNT_PER_TASK = 1
 CPUS_PER_TASK = 4
+DEFAULT_AEDT_POOL_PKG_ROOT = (
+    "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/aedt_pool_pkg"
+)
+DEFAULT_AEDT_POOL_TOKEN_FILE = (
+    "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/aedt_pool_bootstrap"
+)
+DEFAULT_POOLED_CPUS = 1
+DEFAULT_POOLED_MEMORY_MB = 6144
 CPU_HEADROOM = 0.85
 SCHEDULER_ATTEMPTS = 3
 ACTIVE_TASK_STATUSES = ("queued", "attaching", "running")
@@ -75,6 +83,35 @@ def _require_deployed_revisions(solver_revision, library_revision):
 
 class SchedulerError(RuntimeError):
     pass
+
+
+def _pooled_submission_kwargs(args):
+    if not args.aedt_pooled:
+        return None
+    if not isinstance(args.aedt_pool_url, str) or not args.aedt_pool_url.strip():
+        raise SchedulerError("--aedt-pool-url is required with --aedt-pooled")
+    for value, flag in (
+            (args.pooled_cpus, "--pooled-cpus"),
+            (args.pooled_memory_mb, "--pooled-memory-mb")):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise SchedulerError(f"{flag} must be a positive integer")
+    for value, flag in (
+            (args.aedt_pool_pkg_root, "--aedt-pool-pkg-root"),
+            (args.aedt_pool_token_file, "--aedt-pool-token-file")):
+        if not isinstance(value, str) or not value.strip():
+            raise SchedulerError(f"{flag} must be non-empty")
+    return {
+        "cpus": args.pooled_cpus,
+        "memory_mb": args.pooled_memory_mb,
+        "aedt_backend": "pooled",
+        "submission_env": {
+            "MFT_AEDT_BACKEND": "pooled",
+            "MFT_AEDT_SHARED_CANARY": "1",
+            "MFT_AEDT_SCHEDULER_URL": args.aedt_pool_url,
+            "MFT_SLURM_SCHEDULER_ROOT": args.aedt_pool_pkg_root,
+            "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": args.aedt_pool_token_file,
+        },
+    }
 
 
 _RAPID_REFILL_SEAL = object()
@@ -342,11 +379,16 @@ def _step_from_adopted_controller(
 def submit(
         name, workdir, params, solver_revision, library_revision, *,
         cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None,
-        required_project_cap=None):
+        required_project_cap=None, aedt_backend=None, submission_env=None):
     with open(PROFILE_PATH, encoding="utf-8") as stream:
         profile = json.load(stream)
     if timeout_seconds is not None:
         profile["timeout_seconds"] = int(timeout_seconds)
+    submission_options = {}
+    if aedt_backend is not None:
+        submission_options["aedt_backend"] = aedt_backend
+    if submission_env is not None:
+        submission_options["submission_env"] = submission_env
     return scheduler_client.submit_verification(
         name=name,
         workdir=workdir,
@@ -357,6 +399,7 @@ def submit(
         solver_revision=solver_revision,
         library_revision=library_revision,
         required_project_cap=required_project_cap,
+        **submission_options,
     )
 
 
@@ -594,12 +637,16 @@ def cpu_submission_headroom(status_counts, allocations, ready_fit_slots):
 
 
 def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
-         solver_revision=None, library_revision=None, candidate_seed=260710):
+         solver_revision=None, library_revision=None, candidate_seed=260710,
+         pooled_submission=None):
     requested_active = int(target) + int(buffer)
     if requested_active > MAX_STANDALONE_ACTIVE:
         raise SchedulerError(
             f"direct feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
             "only rapid_campaign may authorize production promotion")
+    pooled_options = {}
+    if pooled_submission is not None:
+        pooled_options["_pooled_submission"] = pooled_submission
     if (requested_active > 0
             and not scheduler_client.campaign_mutation_lock_is_held()):
         with campaign_mutation_lock():
@@ -608,12 +655,14 @@ def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                 solver_revision=solver_revision,
                 library_revision=library_revision,
                 candidate_seed=candidate_seed,
+                **pooled_options,
             )
     return _step_locked(
         max_samples, target=target, buffer=buffer,
         solver_revision=solver_revision,
         library_revision=library_revision,
         candidate_seed=candidate_seed,
+        **pooled_options,
     )
 
 
@@ -621,7 +670,7 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                  solver_revision=None, library_revision=None,
                  candidate_seed=260710, _rapid_authorization=None,
                  _adopted_authorization=None, _submit_resources=None,
-                 _refill_journal=None):
+                 _refill_journal=None, _pooled_submission=None):
     requested_active = int(target) + int(buffer)
     if requested_active > 0 and not scheduler_client.campaign_mutation_lock_is_held():
         raise SchedulerError("campaign refill requires the project mutation lock")
@@ -796,6 +845,8 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         event = item["event"]
         try:
             submit_kwargs = dict(_submit_resources or {})
+            if _pooled_submission is not None:
+                submit_kwargs.update(_pooled_submission)
             if dynamic_project_cap:
                 submit_kwargs["required_project_cap"] = hard_cap
             tid = submit(
@@ -906,7 +957,7 @@ def publish_ready_marker(path, solver_revision, library_revision):
             os.remove(staged)
 
 
-def main():
+def _argument_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", type=int, default=None, help="반복 주기 [s]")
@@ -919,10 +970,40 @@ def main():
     ap.add_argument("--library-revision")
     ap.add_argument("--candidate-seed", type=int, default=260710)
     ap.add_argument(
+        "--aedt-pooled",
+        action="store_true",
+        help="attach MFT tasks to shared AEDT pool Desktops",
+    )
+    ap.add_argument("--aedt-pool-url", metavar="URL")
+    ap.add_argument(
+        "--aedt-pool-pkg-root",
+        default=DEFAULT_AEDT_POOL_PKG_ROOT,
+        metavar="PATH",
+    )
+    ap.add_argument(
+        "--aedt-pool-token-file",
+        default=DEFAULT_AEDT_POOL_TOKEN_FILE,
+        metavar="PATH",
+    )
+    ap.add_argument(
+        "--pooled-cpus", type=int, default=DEFAULT_POOLED_CPUS, metavar="N")
+    ap.add_argument(
+        "--pooled-memory-mb",
+        type=int,
+        default=DEFAULT_POOLED_MEMORY_MB,
+        metavar="N",
+    )
+    ap.add_argument(
         "--ready-file",
         help="atomically written after the first successful guarded cycle",
     )
+    return ap
+
+
+def main():
+    ap = _argument_parser()
     args = ap.parse_args()
+    pooled_submission = _pooled_submission_kwargs(args)
 
     requested_active = int(args.target) + int(args.buffer)
     if requested_active > MAX_STANDALONE_ACTIVE:
@@ -944,11 +1025,15 @@ def main():
                 _require_deployed_revisions(
                     args.solver_revision, args.library_revision
                 )
+            step_options = {}
+            if pooled_submission is not None:
+                step_options["pooled_submission"] = pooled_submission
             return step(
                 args.max_samples, target=args.target, buffer=args.buffer,
                 solver_revision=args.solver_revision,
                 library_revision=args.library_revision,
                 candidate_seed=args.candidate_seed,
+                **step_options,
             )
 
         if args.target + args.buffer > 0:

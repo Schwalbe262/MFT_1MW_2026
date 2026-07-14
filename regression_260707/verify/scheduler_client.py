@@ -529,12 +529,35 @@ def verification_dedupe_key(
         name, params, profile, solver_revision, library_revision)["dedupe_key"]
 
 
+def _normalized_submission_env(submission_env):
+    if submission_env is None:
+        return {}
+    if not isinstance(submission_env, dict):
+        raise TypeError("submission_env must be a dict")
+    normalized = {}
+    for key, value in submission_env.items():
+        key = str(key)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", key):
+            raise ValueError(f"invalid submission environment key: {key!r}")
+        value = str(value)
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError(f"invalid submission environment value for {key}")
+        normalized[key] = value
+    return normalized
+
+
 def submit_verification(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
         required_project_cap=None, priority=0, account_name="",
-        node_name="", max_workers_per_node=0):
+        node_name="", max_workers_per_node=0, *, aedt_backend=None,
+        submission_env=None):
     """Submit one MFT task under the shared cross-process mutation lock."""
+    submission_options = {}
+    if aedt_backend is not None:
+        submission_options["aedt_backend"] = aedt_backend
+    if submission_env is not None:
+        submission_options["submission_env"] = submission_env
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
             name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
@@ -545,6 +568,7 @@ def submit_verification(
             account_name=account_name,
             node_name=node_name,
             max_workers_per_node=max_workers_per_node,
+            **submission_options,
         )
     with campaign_mutation_lock():
         return _submit_verification_locked(
@@ -556,6 +580,7 @@ def submit_verification(
             account_name=account_name,
             node_name=node_name,
             max_workers_per_node=max_workers_per_node,
+            **submission_options,
         )
 
 
@@ -563,7 +588,8 @@ def _submit_verification_locked(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
         required_project_cap=None, priority=0, account_name="",
-        node_name="", max_workers_per_node=0):
+        node_name="", max_workers_per_node=0, *, aedt_backend=None,
+        submission_env=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
@@ -589,6 +615,13 @@ def _submit_verification_locked(
     pjson = identity["parameter_json"]
     parameter_digest = identity["parameter_digest"]
     dedupe_key = identity["dedupe_key"]
+    if aedt_backend is not None and aedt_backend not in {"standalone", "pooled"}:
+        raise ValueError("aedt_backend must be standalone or pooled")
+    normalized_env = _normalized_submission_env(submission_env)
+    env_exports = "".join(
+        f"export {key}={shlex.quote(value)}; "
+        for key, value in sorted(normalized_env.items())
+    )
     extra = profile.get("cli_flags", "")
     run_identity = (
         f"s{solver_revision[:12]}-l{library_revision[:12]}-p{parameter_digest}")
@@ -647,7 +680,8 @@ def _submit_verification_locked(
                   f"[ -d {quoted_library}/src ] && "
                   f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n' && ")
     run_group = (
-        f"mkdir -p {quoted_workdir} && "
+        env_exports
+        + f"mkdir -p {quoted_workdir} && "
         + lib_clone
         + f"([ -d {quoted_repo}/.git ] || git clone -q --depth 1 "
           f"https://github.com/Schwalbe262/MFT_1MW_2026.git {quoted_repo}) && "
@@ -686,6 +720,8 @@ def _submit_verification_locked(
         # every terminal path, including cancellation and allocation loss.
         "cleanup_globs": scratch_leaf,
     }
+    if aedt_backend is not None:
+        payload["aedt_backend"] = aedt_backend
     existing = reconcile_task_id(name, dedupe_key)
     if existing is not None:
         return existing
