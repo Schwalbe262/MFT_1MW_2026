@@ -651,28 +651,45 @@ def _submit_verification_locked(
     quoted_workdir = '"${MFT_WORKDIR}"'
     quoted_repo = '"${MFT_WORKDIR}/repo"'
     quoted_library = '"${MFT_WORKDIR}/pyaedt_library"'
-    cleanup_workdirs = '"${MFT_NVME_WORKDIR}" "${MFT_GPFS_WORKDIR}"'
-    select_workdir = (
+    gpfs_workdir_setup = (
         "MFT_GPFS_ROOT=$PWD; "
         f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{scratch_leaf}"; '
-        f"MFT_NVME_WORKDIR={shlex.quote(scratch_workdir)}; "
+    )
+    gpfs_stale_cleanup = (
         'find "$MFT_GPFS_ROOT" -mindepth 1 -maxdepth 1 -type d '
         '-user "$USER" '
         f"-name {shlex.quote(SCRATCH_LEAF_PATTERN)} "
         f"-mmin +{GPFS_SCRATCH_STALE_MINUTES} -exec rm -rf -- {{}} + "
         "2>/dev/null || true; "
-        f"MFT_ENROOT_FREE_KB=$(df -Pk {LOCAL_SCRATCH_ROOT} 2>/dev/null "
-        "| awk 'NR==2 {print $4}'); "
-        f"if [ \"$(findmnt -n -o FSTYPE -T {LOCAL_SCRATCH_ROOT} 2>/dev/null)\" = xfs ] "
-        f"&& [ \"${{MFT_ENROOT_FREE_KB:-0}}\" -ge {LOCAL_SCRATCH_MIN_FREE_KB} ]; then "
-        "MFT_WORKDIR=$MFT_NVME_WORKDIR; "
-        f"find {LOCAL_SCRATCH_ROOT} -mindepth 1 -maxdepth 1 -type d "
-        "-user \"$USER\" -name 'mft_*' "
-        f"-mmin +{LOCAL_SCRATCH_STALE_MINUTES} -exec rm -rf -- {{}} + "
-        "2>/dev/null || true; "
-        "else MFT_WORKDIR=$MFT_GPFS_WORKDIR; fi; "
-        "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
     )
+    if aedt_backend == "pooled":
+        # AEDT file operations run on the Desktop's node, so pooled tasks must
+        # use storage shared with that node rather than client-local NVMe.
+        cleanup_workdirs = '"${MFT_GPFS_WORKDIR}"'
+        select_workdir = (
+            gpfs_workdir_setup
+            + gpfs_stale_cleanup
+            + 'MFT_WORKDIR="$MFT_GPFS_WORKDIR"; '
+            + "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
+        )
+    else:
+        cleanup_workdirs = '"${MFT_NVME_WORKDIR}" "${MFT_GPFS_WORKDIR}"'
+        select_workdir = (
+            gpfs_workdir_setup
+            + f"MFT_NVME_WORKDIR={shlex.quote(scratch_workdir)}; "
+            + gpfs_stale_cleanup
+            + f"MFT_ENROOT_FREE_KB=$(df -Pk {LOCAL_SCRATCH_ROOT} 2>/dev/null "
+            "| awk 'NR==2 {print $4}'); "
+            f"if [ \"$(findmnt -n -o FSTYPE -T {LOCAL_SCRATCH_ROOT} 2>/dev/null)\" = xfs ] "
+            f"&& [ \"${{MFT_ENROOT_FREE_KB:-0}}\" -ge {LOCAL_SCRATCH_MIN_FREE_KB} ]; then "
+            "MFT_WORKDIR=$MFT_NVME_WORKDIR; "
+            f"find {LOCAL_SCRATCH_ROOT} -mindepth 1 -maxdepth 1 -type d "
+            "-user \"$USER\" -name 'mft_*' "
+            f"-mmin +{LOCAL_SCRATCH_STALE_MINUTES} -exec rm -rf -- {{}} + "
+            "2>/dev/null || true; "
+            "else MFT_WORKDIR=$MFT_GPFS_WORKDIR; fi; "
+            "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
+        )
     lib_clone = (f"([ -d {quoted_library}/.git ] || {{ [ ! -e {quoted_library} ] && "
                  "git clone -q --depth 1 "
                  f"https://github.com/Schwalbe262/pyaedt_library.git {quoted_library}.tmp.$$ "

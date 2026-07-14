@@ -200,25 +200,50 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         self.assertEqual(pooled_payload["cpus"], 2)
         self.assertEqual(pooled_payload["memory_mb"], 8192)
         self.assertNotIn("submission_env", pooled_payload)
+        pooled_command = pooled_payload["command"]
+        self.assertIn(
+            'MFT_WORKDIR="$MFT_GPFS_WORKDIR";',
+            pooled_command,
+        )
+        self.assertNotIn("MFT_NVME_WORKDIR", pooled_command)
+        self.assertNotIn("MFT_ENROOT_FREE_KB", pooled_command)
+        self.assertNotIn(
+            "findmnt -n -o FSTYPE -T /enroot",
+            pooled_command,
+        )
+        self.assertIn(
+            'cleanup() { rm -rf -- "${MFT_GPFS_WORKDIR}" 2>/dev/null; };',
+            pooled_command,
+        )
 
         env_exports = "".join(
             f'export {key}="{value}"; '
             for key, value in sorted(expected_env.items())
         )
-        self.assertEqual(pooled_payload["command"].count(env_exports), 1)
+        self.assertEqual(pooled_command.count(env_exports), 1)
         for key, value in expected_env.items():
             self.assertIn(
                 f'export {key}="{value}";',
-                pooled_payload["command"],
+                pooled_command,
             )
 
         legacy_payload = self._capture_cli_payload([])
+        legacy_command = legacy_payload["command"]
+        self.assertIn("MFT_NVME_WORKDIR=/enroot/", legacy_command)
+        self.assertIn("MFT_ENROOT_FREE_KB=", legacy_command)
+        self.assertIn(
+            "findmnt -n -o FSTYPE -T /enroot",
+            legacy_command,
+        )
+        self.assertIn("MFT_WORKDIR=$MFT_NVME_WORKDIR;", legacy_command)
         normalized = copy.deepcopy(pooled_payload)
         normalized.pop("aedt_backend")
         normalized["cpus"] = legacy_payload["cpus"]
         normalized["memory_mb"] = legacy_payload["memory_mb"]
-        normalized["command"] = normalized["command"].replace(env_exports, "", 1)
-        self.assertEqual(normalized, legacy_payload)
+        normalized.pop("command")
+        legacy_without_command = copy.deepcopy(legacy_payload)
+        legacy_without_command.pop("command")
+        self.assertEqual(normalized, legacy_without_command)
 
     def test_without_aedt_pooled_keeps_exact_legacy_payload_shape(self):
         payload = self._capture_cli_payload([
