@@ -1,0 +1,83 @@
+{
+  "generation": {
+    "digest": "9167cb544a3e8cd8b5408dc6c4d824bd694dc7cf353e6ab15f2d95ca18a1ec74",
+    "identity": {
+      "candidate_seed": 260710,
+      "core_lamination_factor": 0.85,
+      "cpus": 4,
+      "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+      "memory_mb": 65536,
+      "physics_data_revision": "mft1mw-1k101-native-lamination-kf0p85-v3",
+      "policy_digest": "2ccae7eb65b8dc91ebb8b486d763f0965a6d6dfaf360fec4e33435b626de225b",
+      "profile_sha256": "559e8289150e72a9daa70327aee0afc7050923838b323df4374bcc713d135101",
+      "project_concurrency_target": 500,
+      "solver_revision": "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7"
+    }
+  },
+  "pooled_bundles": [
+    {
+      "actions": [
+        {
+          "backend": "pooled",
+          "name": "mft-camp-env-source",
+          "params": {},
+          "scheduling_profile": "fea_bursty",
+          "serial": 340,
+          "submission_env": {
+            "MFT_AEDT_BACKEND": "pooled",
+            "MFT_AEDT_BUNDLE_EXPECTED_ROWS": "2",
+            "MFT_AEDT_BUNDLE_ID": "mft-aedt-pooled-env-source",
+            "MFT_AEDT_BUNDLE_PROJECT_INDEX": "0",
+            "MFT_AEDT_SHARED_CANARY": "1",
+            "MFT_CONTROLLER_POLICY_SHA256": "005b924cd921b40f1b6d4990cac147bf03e12689d4e196d2d78535526aac5a79",
+            "MFT_CORE_LAMINATION_FACTOR": "0.85",
+            "MFT_DATA_CONTRACT_REVISION": "mft1mw-1k101-native-lamination-kf0p85-v3",
+            "MFT_EXPECTED_ROWS": "1",
+            "MFT_PHYSICS_DATA_REVISION": "mft1mw-1k101-native-lamination-kf0p85-v3",
+            "MFT_PROJECTS_PER_AEDT": "2"
+          },
+          "workdir": "mft_camp_env_source"
+        }
+      ]
+    }
+  ],
+  "reservations": [],
+  "submissions": [
+    {
+      "backend": "standalone",
+      "bundle_id": "mft-aedt-standalone-a018e618fb0ead1c945a",
+      "candidate_cursor_after": 1367,
+      "candidate_cursor_before": 1364,
+      "candidate_raw_index": 1366,
+      "name": "mft-camp-rv3-sbffbb15-g9167cb544a3e-000341",
+      "params_sha256": "28cdbc52f41eb53777bcef25389b1d6e0b960837f23d60759b750b8d781e1931",
+      "serial": 341,
+      "submitted_or_reconciled_at": "2026-07-14T02:20:28.609827Z",
+      "task_id": 34649
+    },
+    {
+      "backend": "standalone",
+      "bundle_id": "mft-aedt-standalone-f4206d81983ffa233897",
+      "candidate_cursor_after": 1376,
+      "candidate_cursor_before": 1375,
+      "candidate_raw_index": 1375,
+      "name": "mft-camp-rv3-sbffbb15-g9167cb544a3e-000344",
+      "params_sha256": "23bc302afb09415f57efa7140d53f9063db1649df78655bd5039525d8a7b869a",
+      "serial": 344,
+      "submitted_or_reconciled_at": "2026-07-14T02:20:31.500331Z",
+      "task_id": 34650
+    },
+    {
+      "backend": "standalone",
+      "bundle_id": "mft-aedt-standalone-2b2c9feb317dd8b7d557",
+      "candidate_cursor_after": 1379,
+      "candidate_cursor_before": 1376,
+      "candidate_raw_index": 1378,
+      "name": "mft-camp-rv3-sbffbb15-g9167cb544a3e-000345",
+      "params_sha256": "ba8027b6c4ef9cd738832cb91e45a918ee9be15ad0e0e38db5abd887143825d2",
+      "serial": 345,
+      "submitted_or_reconciled_at": "2026-07-14T02:20:35.102504Z",
+      "task_id": 34651
+    }
+  ]
+}
