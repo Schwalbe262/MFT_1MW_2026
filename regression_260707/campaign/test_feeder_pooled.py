@@ -1,7 +1,6 @@
 import copy
 import hashlib
 import json
-import shlex
 import sys
 import unittest
 from contextlib import ExitStack, nullcontext
@@ -161,11 +160,30 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "--aedt-pool-url", "https://pool.example.test:8443",
         ])
         self.assertEqual(
-            defaults.aedt_pool_pkg_root, feeder.DEFAULT_AEDT_POOL_PKG_ROOT)
+            defaults.aedt_pool_pkg_root,
+            "$HOME/slurm_scheduler/aedt_pool_pkg",
+        )
         self.assertEqual(
-            defaults.aedt_pool_token_file, feeder.DEFAULT_AEDT_POOL_TOKEN_FILE)
+            defaults.aedt_pool_token_file,
+            "$HOME/slurm_scheduler/aedt_pool_bootstrap",
+        )
         self.assertEqual(defaults.pooled_cpus, 1)
         self.assertEqual(defaults.pooled_memory_mb, 6144)
+
+        default_payload = self._capture_cli_payload([
+            "--aedt-pooled",
+            "--aedt-pool-url", "https://pool.example.test:8443",
+        ])
+        self.assertIn(
+            'export MFT_SLURM_SCHEDULER_ROOT='
+            '"$HOME/slurm_scheduler/aedt_pool_pkg";',
+            default_payload["command"],
+        )
+        self.assertIn(
+            'export SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE='
+            '"$HOME/slurm_scheduler/aedt_pool_bootstrap";',
+            default_payload["command"],
+        )
 
         pooled_payload = self._capture_cli_payload([
             "--aedt-pooled",
@@ -181,13 +199,13 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         self.assertNotIn("submission_env", pooled_payload)
 
         env_exports = "".join(
-            f"export {key}={shlex.quote(value)}; "
+            f'export {key}="{value}"; '
             for key, value in sorted(expected_env.items())
         )
         self.assertEqual(pooled_payload["command"].count(env_exports), 1)
         for key, value in expected_env.items():
             self.assertIn(
-                f"export {key}={shlex.quote(value)};",
+                f'export {key}="{value}";',
                 pooled_payload["command"],
             )
 

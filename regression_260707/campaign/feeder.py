@@ -53,12 +53,8 @@ BUFFER = 0            # production 300 promotion is owned by rapid_campaign
 MAX_STANDALONE_ACTIVE = 50
 COUNT_PER_TASK = 1
 CPUS_PER_TASK = 4
-DEFAULT_AEDT_POOL_PKG_ROOT = (
-    "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/aedt_pool_pkg"
-)
-DEFAULT_AEDT_POOL_TOKEN_FILE = (
-    "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/aedt_pool_bootstrap"
-)
+DEFAULT_AEDT_POOL_PKG_ROOT = "$HOME/slurm_scheduler/aedt_pool_pkg"
+DEFAULT_AEDT_POOL_TOKEN_FILE = "$HOME/slurm_scheduler/aedt_pool_bootstrap"
 DEFAULT_POOLED_CPUS = 1
 DEFAULT_POOLED_MEMORY_MB = 6144
 CPU_HEADROOM = 0.85

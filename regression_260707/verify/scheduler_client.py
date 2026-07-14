@@ -546,6 +546,14 @@ def _normalized_submission_env(submission_env):
     return normalized
 
 
+def _shell_double_quote_expandable(value):
+    """Quote a shell value while leaving runtime dollar expansion enabled."""
+    escaped = (
+        value.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`")
+    )
+    return f'"{escaped}"'
+
+
 def submit_verification(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
@@ -619,7 +627,7 @@ def _submit_verification_locked(
         raise ValueError("aedt_backend must be standalone or pooled")
     normalized_env = _normalized_submission_env(submission_env)
     env_exports = "".join(
-        f"export {key}={shlex.quote(value)}; "
+        f"export {key}={_shell_double_quote_expandable(value)}; "
         for key, value in sorted(normalized_env.items())
     )
     extra = profile.get("cli_flags", "")
