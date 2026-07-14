@@ -706,9 +706,14 @@ def _submit_verification_locked(
     if aedt_backend == "pooled":
         # AEDT file operations run on the Desktop's node, so pooled tasks must
         # use storage shared with that node rather than client-local NVMe.
+        # The shared Desktop may run under a DIFFERENT account (session hosts
+        # are placed per-allocation), so everything the client creates under
+        # the workdir must be world-writable or SaveAs/solve outputs fail
+        # with cross-account permission errors.
         cleanup_workdirs = '"${MFT_GPFS_WORKDIR}"'
         select_workdir = (
-            gpfs_workdir_setup
+            "umask 000; "
+            + gpfs_workdir_setup
             + gpfs_stale_cleanup
             + 'MFT_WORKDIR="$MFT_GPFS_WORKDIR"; '
             + "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
