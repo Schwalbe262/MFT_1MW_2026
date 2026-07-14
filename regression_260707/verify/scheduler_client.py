@@ -95,7 +95,10 @@ BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
         "export FLEXLM_TIMEOUT=3000000; "
         "export I_MPI_HYDRA_BOOTSTRAP=fork; "
         "export FLUENT_MPIRUN_FLAGS='-bootstrap fork'; "
-        "sleep $((RANDOM % 60)); ")
+        # A 100-task wave acquiring at once overwhelms the control-plane relay
+        # path (~40+ concurrent connections stall it >30s and session hosts
+        # die); spread client starts across five minutes.
+        "sleep $((RANDOM % 300)); ")
 
 RESULT_VALID = "valid"
 RESULT_INVALID = "invalid"
