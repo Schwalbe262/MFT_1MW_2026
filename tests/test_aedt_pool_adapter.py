@@ -212,6 +212,9 @@ class FakeSharedDesktop:
         self.sibling_running = sibling_running
         self.running_calls = 0
         self.active_project_calls = []
+        self.active_config = "Local"
+        self.registry_loads = []
+        self.registry_sets = []
 
     def AreThereSimulationsRunning(self):
         self.running_calls += 1
@@ -220,6 +223,16 @@ class FakeSharedDesktop:
     def SetActiveProject(self, name):
         self.active_project_calls.append(name)
         raise AssertionError("pooled preflight must not use Desktop active state")
+
+    def GetRegistryString(self, _key):
+        return self.active_config
+
+    def SetRegistryFromFile(self, path):
+        self.registry_loads.append(path)
+
+    def SetRegistryString(self, key, value):
+        self.registry_sets.append((key, value))
+        self.active_config = value
 
 
 class FakeOwnedDesign:
@@ -276,6 +289,8 @@ def _pooled_preflight_harness(monkeypatch, *, own_running):
         desktop=desktop_wrapper,
     )
     simulation.design1 = SimpleNamespace(design_name="maxwell_loss")
+    simulation._matrix_hpc_acf_path = "owned-matrix.acf"
+    simulation._validated_matrix_hpc_acf = lambda path: path
     return simulation, desktop, project
 
 
@@ -293,7 +308,9 @@ def test_pooled_preflight_ignores_solving_sibling_when_owned_project_is_idle(
     )
 
     assert context["odesign"] is project.design
-    assert context["odesktop"] is None
+    assert context["odesktop"] is desktop
+    assert context["original_config"] == "Local"
+    assert desktop.registry_loads == ["owned-matrix.acf"]
     assert desktop.running_calls == 0
     assert desktop.active_project_calls == []
     assert project.active_design_calls == []
@@ -313,3 +330,4 @@ def test_pooled_preflight_fails_when_owned_project_is_solving(monkeypatch):
 
     assert desktop.running_calls == 0
     assert desktop.active_project_calls == []
+    assert desktop.registry_loads == []
