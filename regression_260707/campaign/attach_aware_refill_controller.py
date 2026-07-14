@@ -3,7 +3,8 @@
 ``plan`` performs only scheduler GET requests (plus local generation-state
 initialisation).  ``run`` is the sole scheduler mutation path and requires an
 exact generation acknowledgement before it can submit an idempotent rolling
-refill.  Neither mode has scheduler cancellation authority.
+refill.  Run mode may also cancel only exact, state-owned pooled host tasks
+after verifying their scheduler identity.
 
 The pure policy/coordinator APIs remain usable without the live controller
 shell; ``offline`` retains the original file-to-file planner interface.
@@ -107,6 +108,7 @@ NODE_CANARY_DISCOVERY_PREFIX = "NODE_CANARY_DISCOVERY "
 # 10 min covered only ~20% of hosts in production on 2026-07-14.
 NODE_CANARY_DISCOVERY_TIMEOUT_SECONDS = 30 * 60
 NODE_CANARY_HOST_TIMEOUT_SECONDS = 14_400
+NODE_CANARY_HOST_TASK_TIMEOUT_SECONDS = 6 * 3600
 NODE_CANARY_HOST_CPUS = 1
 NODE_CANARY_HOST_MEMORY_MB = 4_096
 NODE_CANARY_HOST_PRIORITY = 100_000
@@ -118,6 +120,13 @@ TASK_TERMINAL_STATES = {
     "timeout",
 }
 TASK_STATUS_ALIASES = {"canceled": "cancelled", "timed_out": "timeout"}
+POOLED_BUNDLE_HOST_PREFIX = "mft-aedt-pooled-"
+HOST_CANCEL_STATUSES = {
+    "requested",
+    "already_terminal",
+    "failed",
+    "identity_mismatch",
+}
 
 
 class ExactTaskSubmissionRejected(RuntimeError):
@@ -722,6 +731,32 @@ def _validate_state(
                     or not str(bundle.get("host_terminal_at")).strip()
                 )
             )
+            or (
+                bundle.get("host_cancel_status") is not None
+                and bundle.get("host_cancel_status") not in HOST_CANCEL_STATUSES
+            )
+            or (
+                bundle.get("host_cancel_error") is not None
+                and (
+                    not isinstance(bundle.get("host_cancel_error"), str)
+                    or not str(bundle.get("host_cancel_error")).strip()
+                )
+            )
+            or (
+                bundle.get("host_cancel_at") is not None
+                and (
+                    not isinstance(bundle.get("host_cancel_at"), str)
+                    or not str(bundle.get("host_cancel_at")).strip()
+                )
+            )
+            or (
+                bundle.get("host_cancel_task_id") is not None
+                and (
+                    isinstance(bundle.get("host_cancel_task_id"), bool)
+                    or not isinstance(bundle.get("host_cancel_task_id"), int)
+                    or int(bundle["host_cancel_task_id"]) <= 0
+                )
+            )
         ):
             raise RuntimeError("controller state contains an invalid pooled bundle")
         bundle_id = str(bundle["bundle_id"])
@@ -1065,7 +1100,7 @@ def _node_canary_host_payload(
         "memory_mb": NODE_CANARY_HOST_MEMORY_MB,
         "gpus": 0,
         "priority": NODE_CANARY_HOST_PRIORITY,
-        "timeout_seconds": 0,
+        "timeout_seconds": NODE_CANARY_HOST_TASK_TIMEOUT_SECONDS,
         "dedupe_key": str(bundle["host_dedupe_key"]),
         "entrypoint": NODE_CANARY_HOST_ENTRYPOINT,
         "requested_allocation_id": int(allocation["id"]),
@@ -1553,6 +1588,10 @@ def _reserve_plan(
                 "discovery_deadline_at": None,
                 "host_terminal_status": None,
                 "host_terminal_at": None,
+                "host_cancel_status": None,
+                "host_cancel_error": None,
+                "host_cancel_at": None,
+                "host_cancel_task_id": None,
                 "coordination_files": paths,
                 "host_clone_root": (
                     f"~/slurm_scheduler/runs/{bundle_id}-host"
@@ -1695,7 +1734,10 @@ def _prepare_bundle_fallback(
     policy: AttachRefillPolicy,
     generation: Mapping[str, object],
     profile: Mapping[str, object],
+    scheduler_url: str,
+    lifecycle_events: list[dict[str, object]],
 ) -> None:
+    entering_fallback = bundle.get("phase") != "fallback_submit"
     for index, serial in enumerate(bundle["action_serials"]):  # type: ignore[index]
         action = _reservation_by_serial(state, int(serial))
         if action is None:
@@ -1716,6 +1758,12 @@ def _prepare_bundle_fallback(
     bundle["phase"] = "fallback_submit"
     bundle["failure_reason"] = reason
     bundle["updated_at"] = _now()
+    if entering_fallback:
+        event = _guarded_cancel_bundle_host(
+            scheduler_url, bundle, trigger="bundle_fallback"
+        )
+        if event is not None:
+            lifecycle_events.append(event)
 
 
 def _interrupt_client_submission(
@@ -1725,6 +1773,8 @@ def _interrupt_client_submission(
     policy: AttachRefillPolicy,
     generation: Mapping[str, object],
     profile: Mapping[str, object],
+    scheduler_url: str,
+    lifecycle_events: list[dict[str, object]],
 ) -> str:
     """Move an interrupted N=2 admission to a resumable fallback phase."""
 
@@ -1732,7 +1782,14 @@ def _interrupt_client_submission(
     admitted = [task_id for task_id in task_ids if task_id is not None]
     if not admitted:
         _prepare_bundle_fallback(
-            state, bundle, reason, policy, generation, profile
+            state,
+            bundle,
+            reason,
+            policy,
+            generation,
+            profile,
+            scheduler_url,
+            lifecycle_events,
         )
         return "fallback_submit"
     bundle["failure_reason"] = reason
@@ -1865,6 +1922,191 @@ def _record_host_terminal(bundle: dict[str, object], status: str) -> None:
     bundle["updated_at"] = now
 
 
+def _record_host_cancel(
+    bundle: dict[str, object],
+    task_id: int,
+    status: str,
+    error: str | None = None,
+) -> None:
+    if status not in HOST_CANCEL_STATUSES:
+        raise ValueError(f"invalid host cancellation status: {status}")
+    now = _now()
+    bundle["host_cancel_status"] = status
+    bundle["host_cancel_error"] = error
+    bundle["host_cancel_at"] = now
+    bundle["host_cancel_task_id"] = task_id
+    bundle["updated_at"] = now
+
+
+def _guarded_cancel_bundle_host(
+    scheduler_url: str,
+    bundle: dict[str, object],
+    *,
+    trigger: str,
+    task_id: int | None = None,
+) -> dict[str, object] | None:
+    """Fail-soft cancel of one exact, scheduler-verified bundle host."""
+
+    target = bundle.get("host_task_id") if task_id is None else task_id
+    if isinstance(target, bool) or not isinstance(target, int) or target <= 0:
+        return None
+    event: dict[str, object] = {
+        "bundle_id": bundle.get("bundle_id"),
+        "transition": "host_cancel",
+        "trigger": trigger,
+        "host_task_id": target,
+    }
+    try:
+        task = _scheduler_task_record(scheduler_url, target)
+    except Exception as exc:
+        error = f"task verification failed: {type(exc).__name__}: {exc}"
+        _record_host_cancel(bundle, target, "failed", error)
+        event.update(host_cancel_status="failed", host_cancel_error=error)
+        return event
+
+    expected_name = str(bundle.get("host_name") or "")
+    actual_name = str(task.get("name") or "")
+    actual_project = str(task.get("project") or "")
+    if actual_name != expected_name or actual_project != NODE_CANARY_HOST_PROJECT:
+        error = (
+            f"refused to cancel task {target}: expected name {expected_name!r} "
+            f"in project {NODE_CANARY_HOST_PROJECT!r}, got name "
+            f"{actual_name!r} in project {actual_project!r}"
+        )
+        _record_host_cancel(bundle, target, "identity_mismatch", error)
+        event.update(
+            host_cancel_status="identity_mismatch", host_cancel_error=error
+        )
+        return event
+
+    task_status = _normalized_task_status(task.get("status") or task.get("state"))
+    event["host_status"] = task_status
+    if task_status in TASK_TERMINAL_STATES:
+        _record_host_terminal(bundle, task_status)
+        _record_host_cancel(bundle, target, "already_terminal")
+        event["host_cancel_status"] = "already_terminal"
+        return event
+
+    try:
+        response = scheduler_client.requests.post(
+            f"{scheduler_url}/api/tasks/{target}/cancel", timeout=60
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        error = f"cancel request failed: {type(exc).__name__}: {exc}"
+        _record_host_cancel(bundle, target, "failed", error)
+        event.update(host_cancel_status="failed", host_cancel_error=error)
+        return event
+
+    _record_host_cancel(bundle, target, "requested")
+    event["host_cancel_status"] = "requested"
+    return event
+
+
+def _reconcile_state_owned_stale_hosts(
+    state: dict[str, object],
+    generation: Mapping[str, object],
+    scheduler_url: str,
+    state_path: Path,
+    lifecycle_events: list[dict[str, object]],
+) -> None:
+    """Cancel active pooled hosts owned by fallback/completed state bundles."""
+
+    stale_by_name = {
+        str(bundle.get("host_name")): bundle
+        for bundle in state["pooled_bundles"]  # type: ignore[index]
+        if bundle.get("phase")
+        in {"fallback_submit", "client_fallback_submit", "complete"}
+        and str(bundle.get("host_name") or "").startswith(
+            POOLED_BUNDLE_HOST_PREFIX
+        )
+    }
+    if not stale_by_name:
+        return
+    try:
+        rows = _task_rows(
+            _response_json(
+                scheduler_client.requests.get(
+                    f"{scheduler_url}/api/tasks",
+                    params={
+                        "limit": 10_000,
+                        "project": NODE_CANARY_HOST_PROJECT,
+                        "name_prefix": POOLED_BUNDLE_HOST_PREFIX,
+                        "status": ",".join(scheduler_client.MFT_ACTIVE_STATUSES),
+                    },
+                    timeout=30,
+                ),
+                "active pooled host reconciliation",
+            ),
+            "active pooled host reconciliation",
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        lifecycle_events.append(
+            {
+                "transition": "stale_host_reconciliation_failed",
+                "host_cancel_status": "failed",
+                "host_cancel_error": error,
+            }
+        )
+        changed = False
+        for bundle in stale_by_name.values():
+            task_id = bundle.get("host_task_id")
+            if (
+                isinstance(task_id, bool)
+                or not isinstance(task_id, int)
+                or task_id <= 0
+            ):
+                continue
+            bundle_error = f"active host inventory failed: {error}"
+            _record_host_cancel(bundle, task_id, "failed", bundle_error)
+            lifecycle_events.append(
+                {
+                    "bundle_id": bundle.get("bundle_id"),
+                    "transition": "host_cancel",
+                    "trigger": "startup_reconciliation",
+                    "host_task_id": task_id,
+                    "host_cancel_status": "failed",
+                    "host_cancel_error": bundle_error,
+                }
+            )
+            changed = True
+        if changed:
+            _save_controller_state(state_path, state, generation, scheduler_url)
+        return
+
+    changed = False
+    for task in rows:
+        task_id = task.get("id")
+        name = str(task.get("name") or "")
+        status = _normalized_task_status(task.get("status") or task.get("state"))
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id <= 0
+            or not name.startswith(POOLED_BUNDLE_HOST_PREFIX)
+            or str(task.get("project") or "") != NODE_CANARY_HOST_PROJECT
+            or status not in scheduler_client.MFT_ACTIVE_STATUSES
+        ):
+            continue
+        bundle = stale_by_name.get(name)
+        if bundle is None:
+            continue
+        if bundle.get("host_task_id") is None:
+            bundle["host_task_id"] = task_id
+        event = _guarded_cancel_bundle_host(
+            scheduler_url,
+            bundle,
+            trigger="startup_reconciliation",
+            task_id=task_id,
+        )
+        if event is not None:
+            lifecycle_events.append(event)
+            changed = True
+    if changed:
+        _save_controller_state(state_path, state, generation, scheduler_url)
+
+
 def _refresh_bundle_host_terminals(
     state: dict[str, object],
     generation: Mapping[str, object],
@@ -1956,10 +2198,19 @@ def _advance_pooled_bundle(
                     policy,
                     generation,
                     profile,
+                    scheduler_url,
+                    lifecycle_events,
                 )
             else:
                 _prepare_bundle_fallback(
-                    state, bundle, reason, policy, generation, profile
+                    state,
+                    bundle,
+                    reason,
+                    policy,
+                    generation,
+                    profile,
+                    scheduler_url,
+                    lifecycle_events,
                 )
                 next_phase = "fallback_submit"
             lifecycle_events.append(
@@ -1989,6 +2240,8 @@ def _advance_pooled_bundle(
                     policy,
                     generation,
                     profile,
+                    scheduler_url,
+                    lifecycle_events,
                 )
                 _save_controller_state(
                     state_path, state, generation, scheduler_url
@@ -2029,6 +2282,8 @@ def _advance_pooled_bundle(
                     policy,
                     generation,
                     profile,
+                    scheduler_url,
+                    lifecycle_events,
                 )
                 lifecycle_events.append(
                     {
@@ -2052,6 +2307,8 @@ def _advance_pooled_bundle(
                         policy,
                         generation,
                         profile,
+                        scheduler_url,
+                        lifecycle_events,
                     )
                     lifecycle_events.append(
                         {
@@ -2097,6 +2354,8 @@ def _advance_pooled_bundle(
                     policy,
                     generation,
                     profile,
+                    scheduler_url,
+                    lifecycle_events,
                 )
                 lifecycle_events.append(
                     {
@@ -2119,6 +2378,8 @@ def _advance_pooled_bundle(
                     policy,
                     generation,
                     profile,
+                    scheduler_url,
+                    lifecycle_events,
                 )
                 lifecycle_events.append(
                     {
@@ -2137,6 +2398,8 @@ def _advance_pooled_bundle(
                     policy,
                     generation,
                     profile,
+                    scheduler_url,
+                    lifecycle_events,
                 )
                 lifecycle_events.append(
                     {
@@ -2161,6 +2424,8 @@ def _advance_pooled_bundle(
                     policy,
                     generation,
                     profile,
+                    scheduler_url,
+                    lifecycle_events,
                 )
                 lifecycle_events.append(
                     {
@@ -2221,6 +2486,8 @@ def _advance_pooled_bundle(
                         policy,
                         generation,
                         profile,
+                        scheduler_url,
+                        lifecycle_events,
                     )
                     lifecycle_events.append(
                         {
@@ -2252,6 +2519,8 @@ def _advance_pooled_bundle(
                         policy,
                         generation,
                         profile,
+                        scheduler_url,
+                        lifecycle_events,
                     )
                     lifecycle_events.append(
                         {
@@ -2302,6 +2571,8 @@ def _advance_pooled_bundle(
                 policy,
                 generation,
                 profile,
+                scheduler_url,
+                lifecycle_events,
             )
             _save_controller_state(state_path, state, generation, scheduler_url)
             fallback_ids = list(bundle["fallback_task_ids"])  # type: ignore[arg-type]
@@ -2462,6 +2733,14 @@ def _reconcile_tracked_bundles(
                 status in TASK_TERMINAL_STATES for status in statuses.values()
             ):
                 continue
+            host_event = _guarded_cancel_bundle_host(
+                scheduler_url, bundle, trigger="all_clients_terminal"
+            )
+            if host_event is not None:
+                lifecycle_events.append(host_event)
+                _save_controller_state(
+                    state_path, state, generation, scheduler_url
+                )
             accepted_rows: list[int] = []
             transport_unavailable = False
             for task_id, status in statuses.items():
@@ -2622,6 +2901,13 @@ def _run_cycle(
         with scheduler_client.campaign_mutation_lock():
             accepted: list[dict[str, object]] = []
             lifecycle_events: list[dict[str, object]] = []
+            _reconcile_state_owned_stale_hosts(
+                state,
+                generation,
+                scheduler_url,
+                state_path,
+                lifecycle_events,
+            )
             _refresh_bundle_host_terminals(
                 state,
                 generation,
@@ -2698,6 +2984,10 @@ def _run_cycle(
                 "phase": bundle["phase"],
                 "host_task_id": bundle.get("host_task_id"),
                 "host_terminal_status": bundle.get("host_terminal_status"),
+                "host_cancel_status": bundle.get("host_cancel_status"),
+                "host_cancel_error": bundle.get("host_cancel_error"),
+                "host_cancel_at": bundle.get("host_cancel_at"),
+                "host_cancel_task_id": bundle.get("host_cancel_task_id"),
                 "client_task_ids": bundle.get("client_task_ids"),
                 "fallback_task_ids": bundle.get("fallback_task_ids"),
                 "client_fallback_task_ids": bundle.get(

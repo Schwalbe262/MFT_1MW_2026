@@ -475,10 +475,17 @@ def _pooled_runtime(tmp_path, monkeypatch, *, discovery_text=""):
         "host_posts": [],
         "host_task_id": 701,
         "host_status": "running",
+        "host_name": None,
+        "host_project": controller.NODE_CANARY_HOST_PROJECT,
         "host_post_status": 201,
+        "host_cancel_posts": [],
+        "host_cancel_status": 200,
+        "host_cancel_exception": None,
+        "active_host_tasks": [],
+        "host_inventory_gets": [],
+        "active_project_tasks": 498,
         "client_statuses": {},
     }
-    base_get = _scheduler_get(active=498)
 
     def get(url, params=None, timeout=None):
         if url == f"{SCHEDULER_URL}/api/allocations":
@@ -488,10 +495,17 @@ def _pooled_runtime(tmp_path, monkeypatch, *, discovery_text=""):
         if url == f"{SCHEDULER_URL}/api/tasks/{scheduler['host_task_id']}":
             assert params is None
             assert timeout == 30
+            submitted_name = (
+                scheduler["host_posts"][-1]["name"]
+                if scheduler["host_posts"]
+                else None
+            )
             return _Response(
                 {
                     "id": scheduler["host_task_id"],
                     "status": scheduler["host_status"],
+                    "name": scheduler["host_name"] or submitted_name,
+                    "project": scheduler["host_project"],
                 }
             )
         if url == (
@@ -505,6 +519,15 @@ def _pooled_runtime(tmp_path, monkeypatch, *, discovery_text=""):
                 assert params is None
                 assert timeout == 30
                 return _Response({"id": task_id, "status": status})
+        if url == f"{SCHEDULER_URL}/api/tasks" and params == {
+            "limit": 10_000,
+            "project": controller.NODE_CANARY_HOST_PROJECT,
+            "name_prefix": "mft-aedt-pooled-",
+            "status": "queued,attaching,running",
+        }:
+            assert timeout == 30
+            scheduler["host_inventory_gets"].append(dict(params))
+            return _Response(list(scheduler["active_host_tasks"]))
         if (
             url == f"{SCHEDULER_URL}/api/tasks"
             and params
@@ -512,9 +535,21 @@ def _pooled_runtime(tmp_path, monkeypatch, *, discovery_text=""):
         ):
             assert timeout == 30
             return _Response([])
-        return base_get(url, params=params, timeout=timeout)
+        return _scheduler_get(active=scheduler["active_project_tasks"])(
+            url, params=params, timeout=timeout
+        )
 
     def post(url, json=None, timeout=None):
+        if url == (
+            f"{SCHEDULER_URL}/api/tasks/"
+            f"{scheduler['host_task_id']}/cancel"
+        ):
+            assert json is None
+            assert timeout == 60
+            scheduler["host_cancel_posts"].append(scheduler["host_task_id"])
+            if scheduler["host_cancel_exception"] is not None:
+                raise scheduler["host_cancel_exception"]
+            return _Response({}, status_code=scheduler["host_cancel_status"])
         assert url == f"{SCHEDULER_URL}/api/tasks"
         assert timeout == 20
         scheduler["host_posts"].append(dict(json))
@@ -645,6 +680,18 @@ def test_pooled_bundle_resume_uses_persisted_host_and_builds_exact_clients(
     assert host["entrypoint"] == "aedt_node_canary_host"
     assert host["requested_allocation_id"] == 41
     assert host["project"] == "_aedt_pool_hosts"
+    assert (
+        host["timeout_seconds"]
+        == controller.NODE_CANARY_HOST_TASK_TIMEOUT_SECONDS
+        == 6 * 3600
+    )
+    assert controller.NODE_CANARY_HOST_TASK_TIMEOUT_SECONDS != (
+        controller.NODE_CANARY_HOST_TIMEOUT_SECONDS
+    )
+    assert (
+        f"--timeout-seconds {controller.NODE_CANARY_HOST_TIMEOUT_SECONDS}"
+        in host["command"]
+    )
     assert host["payload_json"] == {
         "aedt_canary_bundle_id": bundle["bundle_id"],
         "aedt_canary_expected_projects": 2,
@@ -726,6 +773,55 @@ def test_readiness_kill_switch_falls_back_before_client_admission(
     assert bundle["client_task_ids"] == [None, None]
 
 
+def test_all_terminal_pooled_clients_cancel_host_on_completion(
+    tmp_path, monkeypatch
+):
+    discovery = "NODE_CANARY_DISCOVERY " + json.dumps(
+        {
+            "schema_version": 1,
+            "mode": "scheduler_managed_node_local_canary",
+            "scheduler_url": "http://127.0.0.1:8123",
+            "expected_projects": 2,
+            "node": "n41",
+            "rollback_file": "/tmp/bundle.rollback",
+        }
+    )
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch, discovery_text=discovery
+    )
+    submit = mock.Mock(side_effect=[801, 802])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    scheduler["client_statuses"] = {801: "completed", 802: "completed"}
+    scheduler["active_project_tasks"] = 500
+    fetch = mock.Mock(
+        return_value=controller.scheduler_client.ResultFetch(
+            controller.scheduler_client.RESULT_VALID, {"accepted": True}
+        )
+    )
+    monkeypatch.setattr(controller.scheduler_client, "fetch_result", fetch)
+
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert scheduler["host_cancel_posts"] == [701]
+    assert fetch.call_count == 2
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    completed_bundle = state["pooled_bundles"][0]
+    assert completed_bundle["phase"] == "complete"
+    assert completed_bundle["host_cancel_status"] == "requested"
+    assert completed_bundle["host_cancel_error"] is None
+    assert completed_bundle["host_cancel_task_id"] == 701
+    assert completed_bundle["host_cancel_at"]
+    visible_bundle = result["pooled_bundles"][0]
+    assert visible_bundle["host_cancel_status"] == "requested"
+    assert visible_bundle["host_cancel_error"] is None
+    assert visible_bundle["host_cancel_task_id"] == 701
+    assert visible_bundle["host_cancel_at"]
+
+
 def test_discovery_timeout_falls_back_to_new_standalone_identities(
     tmp_path, monkeypatch
 ):
@@ -758,6 +854,7 @@ def test_discovery_timeout_falls_back_to_new_standalone_identities(
 
     assert result["accepted_or_reconciled_count"] == 2
     assert len(scheduler["host_posts"]) == 1
+    assert scheduler["host_cancel_posts"] == [701]
     assert submit.call_count == 2
     for call in submit.call_args_list:
         assert call.kwargs["aedt_backend"] == "standalone"
@@ -765,8 +862,18 @@ def test_discovery_timeout_falls_back_to_new_standalone_identities(
         assert "entrypoint" not in call.kwargs
         assert "same_node_as_task_id" not in call.kwargs
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["pooled_bundles"][0]["phase"] == "complete"
-    assert state["pooled_bundles"][0]["fallback_task_ids"] == [901, 902]
+    completed_bundle = state["pooled_bundles"][0]
+    assert completed_bundle["phase"] == "complete"
+    assert completed_bundle["fallback_task_ids"] == [901, 902]
+    assert completed_bundle["host_cancel_status"] == "requested"
+    assert completed_bundle["host_cancel_error"] is None
+    assert completed_bundle["host_cancel_task_id"] == 701
+    assert completed_bundle["host_cancel_at"]
+    visible_bundle = result["pooled_bundles"][0]
+    assert visible_bundle["host_cancel_status"] == "requested"
+    assert visible_bundle["host_cancel_error"] is None
+    assert visible_bundle["host_cancel_task_id"] == 701
+    assert visible_bundle["host_cancel_at"]
     assert all(item["backend"] == "standalone" for item in state["submissions"])
     assert all(
         "-sa-retry-" in item["name"] for item in state["submissions"]
@@ -788,6 +895,141 @@ def test_discovery_timeout_falls_back_to_new_standalone_identities(
     assert controller._reserved_allocation_footprints(state, generation) == {}
 
 
+def test_discovery_fallback_records_cancel_failure_without_raising(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    submit = mock.Mock(side_effect=[905, 906])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted["pooled_bundles"][0]["discovery_deadline_at"] = (
+        "2000-01-01T00:00:00Z"
+    )
+    controller._atomic_save_state(state_path, persisted)
+    scheduler["host_cancel_status"] = 503
+
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert result["accepted_or_reconciled_count"] == 2
+    assert scheduler["host_cancel_posts"] == [701]
+    assert submit.call_count == 2
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    completed_bundle = state["pooled_bundles"][0]
+    assert completed_bundle["phase"] == "complete"
+    assert completed_bundle["fallback_task_ids"] == [905, 906]
+    assert completed_bundle["host_cancel_status"] == "failed"
+    assert "HTTP 503" in completed_bundle["host_cancel_error"]
+    assert completed_bundle["host_cancel_task_id"] == 701
+    assert completed_bundle["host_cancel_at"]
+    visible_bundle = result["pooled_bundles"][0]
+    assert visible_bundle["host_cancel_status"] == "failed"
+    assert "HTTP 503" in visible_bundle["host_cancel_error"]
+    assert visible_bundle["host_cancel_task_id"] == 701
+    assert visible_bundle["host_cancel_at"]
+
+
+def test_discovery_fallback_refuses_mismatched_host_identity(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    submit = mock.Mock(side_effect=[907, 908])
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted["pooled_bundles"][0]["discovery_deadline_at"] = (
+        "2000-01-01T00:00:00Z"
+    )
+    controller._atomic_save_state(state_path, persisted)
+    mismatched_name = "mft-aedt-pooled-not-this-controller-host"
+    scheduler["host_name"] = mismatched_name
+
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert result["accepted_or_reconciled_count"] == 2
+    assert scheduler["host_cancel_posts"] == []
+    assert submit.call_count == 2
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    completed_bundle = state["pooled_bundles"][0]
+    assert completed_bundle["phase"] == "complete"
+    assert completed_bundle["fallback_task_ids"] == [907, 908]
+    assert completed_bundle["host_cancel_status"] == "identity_mismatch"
+    assert mismatched_name in completed_bundle["host_cancel_error"]
+    assert completed_bundle["host_cancel_task_id"] == 701
+    assert completed_bundle["host_cancel_at"]
+    visible_bundle = result["pooled_bundles"][0]
+    assert visible_bundle["host_cancel_status"] == "identity_mismatch"
+    assert mismatched_name in visible_bundle["host_cancel_error"]
+    assert visible_bundle["host_cancel_task_id"] == 701
+    assert visible_bundle["host_cancel_at"]
+
+
+def test_startup_reconciliation_cancels_only_state_owned_stale_host(
+    tmp_path, monkeypatch
+):
+    policy, profile, generation, state_path, scheduler = _pooled_runtime(
+        tmp_path, monkeypatch
+    )
+    submit = mock.Mock(side_effect=AssertionError("client submission forbidden"))
+    monkeypatch.setattr(controller.scheduler_client, "submit_verification", submit)
+
+    controller._run_cycle(policy, generation, profile, SCHEDULER_URL, state_path)
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    owned_bundle = persisted["pooled_bundles"][0]
+    owned_bundle["phase"] = "complete"
+    owned_bundle["failure_reason"] = "simulated stale pre-fix bundle"
+    controller._atomic_save_state(state_path, persisted)
+    scheduler["active_host_tasks"] = [
+        {
+            "id": 701,
+            "name": owned_bundle["host_name"],
+            "project": controller.NODE_CANARY_HOST_PROJECT,
+            "status": "running",
+        },
+        {
+            "id": 702,
+            "name": "mft-aedt-pooled-state-absent-host",
+            "project": controller.NODE_CANARY_HOST_PROJECT,
+            "status": "running",
+        },
+        {
+            "id": 703,
+            "name": "mft-aedt-n3canary-manual-host",
+            "project": controller.NODE_CANARY_HOST_PROJECT,
+            "status": "running",
+        },
+    ]
+
+    result = controller._run_cycle(
+        policy, generation, profile, SCHEDULER_URL, state_path
+    )
+
+    assert len(scheduler["host_inventory_gets"]) == 1
+    assert scheduler["host_cancel_posts"] == [701]
+    submit.assert_not_called()
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    reconciled_bundle = state["pooled_bundles"][0]
+    assert reconciled_bundle["host_cancel_status"] == "requested"
+    assert reconciled_bundle["host_cancel_error"] is None
+    assert reconciled_bundle["host_cancel_task_id"] == 701
+    assert reconciled_bundle["host_cancel_at"]
+    visible_bundle = result["pooled_bundles"][0]
+    assert visible_bundle["host_cancel_status"] == "requested"
+    assert visible_bundle["host_cancel_error"] is None
+    assert visible_bundle["host_cancel_task_id"] == 701
+    assert visible_bundle["host_cancel_at"]
+
+
 def test_terminal_host_before_discovery_falls_back_without_cancellation(
     tmp_path, monkeypatch
 ):
@@ -806,6 +1048,7 @@ def test_terminal_host_before_discovery_falls_back_without_cancellation(
     assert result["accepted_or_reconciled_count"] == 2
     assert result["cancel_task_ids"] == []
     assert len(scheduler["host_posts"]) == 1
+    assert scheduler["host_cancel_posts"] == []
     assert all(
         call.kwargs["aedt_backend"] == "standalone"
         for call in submit.call_args_list
@@ -814,6 +1057,11 @@ def test_terminal_host_before_discovery_falls_back_without_cancellation(
     bundle = state["pooled_bundles"][0]
     assert bundle["phase"] == "complete"
     assert "became terminal before discovery: failed" in bundle["failure_reason"]
+    assert bundle["host_terminal_status"] == "failed"
+    assert bundle["host_cancel_status"] == "already_terminal"
+    assert bundle["host_cancel_error"] is None
+    assert bundle["host_cancel_task_id"] == 701
+    assert bundle["host_cancel_at"]
 
 
 @pytest.mark.parametrize("interruption", ["host_failure", "client_rejection"])
