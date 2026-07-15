@@ -6439,18 +6439,33 @@ class Simulation():
             keep = int(self.df_plus["keep_project"].iloc[0]) != 0
         except Exception:
             keep = False
-        with self.aedt_automation_transaction():
-            if not keep:
-                try:
-                    self.design1.cleanup_solution()
-                except Exception:
-                    pass
-            else:
+        backend = self._backend_mode()
+        if keep:
+            with self.aedt_automation_transaction():
                 try:
                     self.save_project()
                 except Exception:
                     pass
-        if getattr(self, "aedt_backend", "standalone") == "pooled":
+        elif backend != "pooled":
+            with self.aedt_automation_transaction():
+                try:
+                    self.design1.cleanup_solution()
+                except Exception:
+                    pass
+        else:
+            # A pooled project is disposable as one exact lease-owned tree.
+            # The session host closes that exact project during release, then
+            # prepares every host-owned results directory for the client's
+            # post-ACK recursive delete.  Calling PyAEDT cleanup_solution here
+            # adds no retained-data benefit.  Its cached ``oproject`` can also
+            # follow a sibling's Desktop-global active project and emit an AEDT
+            # error (or, worse, mutate the sibling) before the exact host close.
+            # Do not make any high-level AEDT mutation from this stale wrapper.
+            logging.info(
+                "Skipping cleanup_solution for disposable pooled project; "
+                "exact lease release and post-ACK tree deletion own cleanup"
+            )
+        if backend == "pooled":
             if self.aedt_lease is None:
                 raise RuntimeError("pooled Simulation has no AEDT lease")
             if not self.pooled_release_done:

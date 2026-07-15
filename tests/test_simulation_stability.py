@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pandas as pd
@@ -249,6 +250,84 @@ def _simulation(tmp_path, backend):
     )
     simulation.design1 = design
     return simulation, app, design, project_path
+
+
+def test_pooled_close_skips_stale_cleanup_and_releases_exact_lease(
+        monkeypatch, caplog):
+    """Reproduce q8: a sibling changed the Desktop active project at close."""
+
+    sibling = {"solution_deleted": False}
+    lease = object()
+    release_calls = []
+
+    def stale_cleanup_solution():
+        # PyAEDT 0.22 resolves ``odesign`` through its cached ``oproject``.
+        # In q8 that SetActiveDesign lookup saw a sibling project and logged an
+        # AEDT API Error.  A mutation-capable fake makes sibling safety explicit.
+        sibling["solution_deleted"] = True
+        raise RuntimeError("stale wrapper resolved the sibling active project")
+
+    simulation = Simulation.__new__(Simulation)
+    simulation.aedt_backend = "pooled"
+    simulation.aedt_lease = lease
+    simulation.pooled_release_done = False
+    simulation.spawned_descendants = set()
+    simulation.df_plus = pd.DataFrame([{"keep_project": 0}])
+    simulation.design1 = SimpleNamespace(
+        cleanup_solution=stale_cleanup_solution
+    )
+
+    def forbidden_client_transaction():
+        raise AssertionError(
+            "disposable pooled close must not enter a client AEDT transaction"
+        )
+
+    simulation.aedt_automation_transaction = forbidden_client_transaction
+    monkeypatch.setattr(
+        "run_simulation_260706._snapshot_descendants", lambda: {}
+    )
+    monkeypatch.setattr(
+        "run_simulation_260706.release_pooled_project",
+        lambda candidate: release_calls.append(candidate),
+    )
+
+    with caplog.at_level("INFO"):
+        simulation.close_project()
+
+    assert sibling["solution_deleted"] is False
+    assert release_calls == [lease]
+    assert simulation.pooled_release_done is True
+    assert "Skipping cleanup_solution for disposable pooled project" in caplog.text
+
+
+def test_standalone_close_keeps_existing_solution_cleanup(monkeypatch):
+    cleanup_calls = []
+    close_calls = []
+    release_calls = []
+    simulation = Simulation.__new__(Simulation)
+    simulation.aedt_backend = "standalone"
+    simulation.spawned_descendants = set()
+    simulation.df_plus = pd.DataFrame([{"keep_project": 0}])
+    simulation.design1 = SimpleNamespace(
+        cleanup_solution=lambda: cleanup_calls.append(True),
+        close_project=lambda: close_calls.append(True),
+    )
+    simulation.desktop = SimpleNamespace(
+        release_desktop=lambda **kwargs: release_calls.append(kwargs)
+    )
+    simulation.aedt_automation_transaction = nullcontext
+    monkeypatch.setattr(
+        "run_simulation_260706._snapshot_descendants", lambda: {}
+    )
+
+    simulation.close_project()
+
+    assert cleanup_calls == [True]
+    assert close_calls == [True]
+    assert release_calls == [{
+        "close_projects": True,
+        "close_on_exit": True,
+    }]
 
 
 def test_pooled_solution_data_hydrates_none_project_path_before_post(tmp_path):
