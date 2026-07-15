@@ -46,6 +46,7 @@ REQUIRED_MODEL_TARGETS = [
     "B_mean_core", *T_TARGETS,
 ]
 MIN_STRICT_FULL_ROWS = 3000
+EXPERIMENTAL_MIN_STRICT_FULL_ROWS = 2000
 VETTED_QUALITY_THRESHOLDS = os.path.abspath(os.path.join(
     HERE, "..", "training", "model_quality_thresholds.json"
 ))
@@ -93,6 +94,78 @@ def _recomputed_strict_full_rows(
         expected_library_revision=library_revision,
     )
     return int(audited["_strict_valid_full"].sum())
+
+
+def _experimental_quality_contract(
+        quality, quality_path, generation_report, generation_path,
+        dataset_path):
+    """Authenticate an explicitly non-production 2k active-learning input."""
+
+    if not isinstance(quality, dict):
+        raise SystemExit("experimental quality evidence is not an object")
+    expected = {
+        "schema_version": 1,
+        "lane": "provisional_2000_surrogate",
+        "passed": False,
+        "activation_performed": False,
+        "nsga2_enqueued": False,
+        "verification_enqueued": False,
+        "production_minimum_strict_full_rows": MIN_STRICT_FULL_ROWS,
+        "provisional_minimum_strict_full_rows": EXPERIMENTAL_MIN_STRICT_FULL_ROWS,
+        "terminal_reason": "provisional_quality_gate_failed",
+    }
+    mismatches = [
+        key for key, value in expected.items() if quality.get(key) != value
+    ]
+    if mismatches:
+        raise SystemExit(
+            "experimental quality evidence contract mismatch: "
+            + ",".join(mismatches)
+        )
+    blockers = quality.get("failed_targets")
+    if not isinstance(blockers, dict) or not blockers:
+        raise SystemExit("experimental lane has no sealed quality blockers")
+    for target, reasons in blockers.items():
+        if not isinstance(target, str) or not target or not isinstance(reasons, list) \
+                or not reasons or not all(isinstance(item, str) and item for item in reasons):
+            raise SystemExit("experimental quality blocker inventory is invalid")
+
+    dataset_sha = _sha256(dataset_path)
+    report_path = os.path.join(generation_path, "train_report.json")
+    report_sha = _sha256(report_path)
+    if (
+            quality.get("dataset_sha256") != dataset_sha
+            or generation_report.get("dataset_sha256") != dataset_sha
+            or quality.get("generation_report_sha256") != report_sha):
+        raise SystemExit(
+            "experimental surrogate generation/quality/dataset identity mismatch"
+        )
+    try:
+        quality_rows = int(quality["strict_full_rows"])
+        report_rows = int(generation_report["strict_full_rows"])
+    except (KeyError, TypeError, ValueError):
+        raise SystemExit("experimental strict-full row evidence is invalid")
+    if (
+            quality_rows < EXPERIMENTAL_MIN_STRICT_FULL_ROWS
+            or quality_rows != report_rows):
+        raise SystemExit("experimental strict-full row identity mismatch")
+
+    revisions = {}
+    for key in ("solver_revision_pin", "library_revision_pin"):
+        value = str(quality.get(key) or "").lower()
+        if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+            raise SystemExit(f"experimental quality evidence has no pinned {key}")
+        revisions[key] = value
+    normalized = dict(quality)
+    normalized.update({
+        "training_run_id": generation_report.get("training_run_id"),
+        "dataset_sha256": dataset_sha,
+        "solver_revision": revisions["solver_revision_pin"],
+        "library_revision": revisions["library_revision_pin"],
+        "quality_status_sha256": _sha256(quality_path),
+        "generation_report_sha256": report_sha,
+    })
+    return normalized
 
 
 def load_models(registry=None, generation=None):
@@ -250,6 +323,13 @@ def main():
     ap.add_argument("--registry", default=os.path.join(HERE, "..", "training", "registry"))
     ap.add_argument("--registry-generation", default=None)
     ap.add_argument("--quality-status", default=None)
+    ap.add_argument(
+        "--experimental-quality-status", default=None,
+        help=(
+            "explicit failed provisional-2000 quality evidence; runs only a "
+            "non-production active-learning search"
+        ),
+    )
     ap.add_argument("--output-root", default=os.path.join(HERE, "..", "al_rounds"))
     ap.add_argument(
         "--quality-thresholds",
@@ -276,23 +356,37 @@ def main():
     if _sha256(args.quality_thresholds) != vetted_thresholds_sha256:
         raise SystemExit("quality thresholds differ from the vetted production contract")
 
-    if bool(args.registry_generation) != bool(args.quality_status):
+    experimental = bool(args.experimental_quality_status)
+    if experimental and args.quality_status:
         raise SystemExit(
-            "--registry-generation and --quality-status must be supplied together"
+            "production and experimental quality evidence are mutually exclusive"
+        )
+    supplied_quality = args.experimental_quality_status or args.quality_status
+    if bool(args.registry_generation) != bool(supplied_quality):
+        raise SystemExit(
+            "--registry-generation and one quality-status mode must be supplied together"
         )
     registry_for_models = args.registry
     generation_report = {}
     pinned_generation = None
     if args.registry_generation:
         pinned_generation = os.path.abspath(args.registry_generation)
-        with open(args.quality_status, encoding="utf-8") as handle:
+        with open(supplied_quality, encoding="utf-8") as handle:
             quality = json.load(handle)
         with open(
             os.path.join(pinned_generation, "train_report.json"), encoding="utf-8"
         ) as handle:
             generation_report = json.load(handle)
         dataset_sha = _sha256(args.dataset)
-        if (not quality.get("passed")
+        if experimental:
+            quality = _experimental_quality_contract(
+                quality,
+                os.path.abspath(args.experimental_quality_status),
+                generation_report,
+                pinned_generation,
+                os.path.abspath(args.dataset),
+            )
+        elif (not quality.get("passed")
                 or quality.get("dataset_sha256") != dataset_sha
                 or int(quality.get("strict_full_rows") or 0) < MIN_STRICT_FULL_ROWS
                 or quality.get("quality_thresholds_sha256")
@@ -311,7 +405,11 @@ def main():
             quality["solver_revision"],
             quality["library_revision"],
         )
-        if (verified_strict_rows < MIN_STRICT_FULL_ROWS
+        minimum_rows = (
+            EXPERIMENTAL_MIN_STRICT_FULL_ROWS if experimental
+            else MIN_STRICT_FULL_ROWS
+        )
+        if (verified_strict_rows < minimum_rows
                 or verified_strict_rows != int(quality["strict_full_rows"])
                 or verified_strict_rows
                 != int(generation_report["strict_full_rows"])):
@@ -461,7 +559,15 @@ def main():
         json.dump({
             "training_run_id": quality.get("training_run_id"),
             "dataset_sha256": quality.get("dataset_sha256"),
-            "quality_gate_passed": True,
+            "quality_gate_passed": not experimental,
+            "experimental_active_learning": experimental,
+            "production_eligible": not experimental,
+            "quality_blockers": (
+                quality.get("failed_targets") if experimental else {}
+            ),
+            "experimental_minimum_strict_full_rows": (
+                EXPERIMENTAL_MIN_STRICT_FULL_ROWS if experimental else None
+            ),
             "strict_full_rows": verified_strict_rows,
             "quality_thresholds_sha256": vetted_thresholds_sha256,
             "solver_revision": quality.get("solver_revision"),
@@ -472,7 +578,7 @@ def main():
             )),
             "model_artifacts_sha256": model_artifacts,
             "quality_status_sha256": (
-                _sha256(args.quality_status) if args.quality_status else None
+                _sha256(supplied_quality) if supplied_quality else None
             ),
             "profile_sha256": (
                 generation_report.get("profile_sha256")
