@@ -1,13 +1,15 @@
 """
-상시 포화 피더: 캠페인 태스크(실행+대기)를 목표 수준(기본 400+버퍼 40)으로 유지.
+상시 포화 피더: scheduler의 durable simulation-policy desired 수를 유지한다.
 
-웨이브 장벽 없이, 완료되는 만큼 새 태스크를 채워 넣어 400 병렬을 상시 유지한다.
-- 태스크: --count 5 (샘플 5개 연속, 실패 재추첨 내장)
-- 이름: mft-camp-c-<일련번호> (serial은 feeder_state.json에 영속)
+Pooled 장기 루프는 매 주기 versioned policy를 읽고, 완료되는 만큼만 새 태스크를
+채운다. ``--target``은 일회성 실행 또는 policy가 없는 구형 scheduler의 명시적
+호환 fallback일 뿐 장기 운전의 source of truth가 아니다.
+- 태스크: 작업당 샘플 1개
+- 이름: mft-camp-s<solver>-l<library>-<일련번호> (serial은 feeder_state.json에 영속)
 - 총량 상한: --max-samples 도달 시 중단 (기본 12000)
 
-사용: python feeder.py --once        # 1회 보충 (크론/수동)
-      python feeder.py --loop 600   # 데몬 (600초 주기)
+사용: python feeder.py --once --target 1  # 1회 보충 (수동)
+      python feeder.py --loop 600 --aedt-pooled ...  # durable policy 운전
 """
 import argparse
 import copy
@@ -22,7 +24,7 @@ from dataclasses import dataclass
 
 import requests
 import pyarrow.parquet as pq
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from pinned_pilot import (
     LEGACY_MFT_NAME_PREFIX,
@@ -53,6 +55,7 @@ if _STATE_DIR:
 else:
     _STATE_DIR = HERE
 STATE = os.path.join(_STATE_DIR, "feeder_state.json")
+CONTROLLER_LOCK = os.path.join(_STATE_DIR, "feeder-controller.lock")
 SCHEDULER = "http://127.0.0.1:8000"
 CAMPAIGN_PREFIX = "mft-camp-"
 
@@ -66,6 +69,9 @@ COUNT_PER_TASK = 1
 CPUS_PER_TASK = 4
 DEFAULT_AEDT_POOL_PKG_ROOT = "$HOME/slurm_scheduler/aedt_pool_pkg"
 DEFAULT_AEDT_POOL_TOKEN_FILE = "$HOME/slurm_scheduler/aedt_pool_bootstrap"
+DEFAULT_AEDT_SESSION_VERSION = "2025.2"
+DEFAULT_AEDT_ISOLATION_POLICY = "family"
+AEDT_ISOLATION_POLICIES = ("family", "shared_if_compatible")
 DEFAULT_POOLED_CPUS = 1
 DEFAULT_POOLED_MEMORY_MB = 6144
 CPU_HEADROOM = 0.85
@@ -92,6 +98,10 @@ class SchedulerError(RuntimeError):
     pass
 
 
+class SimulationPolicyUnavailable(SchedulerError):
+    """An older scheduler does not advertise durable simulation policy."""
+
+
 def _pooled_submission_kwargs(args):
     if not args.aedt_pooled:
         return None
@@ -104,9 +114,13 @@ def _pooled_submission_kwargs(args):
             raise SchedulerError(f"{flag} must be a positive integer")
     for value, flag in (
             (args.aedt_pool_pkg_root, "--aedt-pool-pkg-root"),
-            (args.aedt_pool_token_file, "--aedt-pool-token-file")):
+            (args.aedt_pool_token_file, "--aedt-pool-token-file"),
+            (args.aedt_session_version, "--aedt-session-version")):
         if not isinstance(value, str) or not value.strip():
             raise SchedulerError(f"{flag} must be non-empty")
+    if args.aedt_isolation_policy not in AEDT_ISOLATION_POLICIES:
+        raise SchedulerError(
+            "--aedt-isolation-policy must be family or shared_if_compatible")
     return {
         "cpus": args.pooled_cpus,
         "memory_mb": args.pooled_memory_mb,
@@ -117,6 +131,8 @@ def _pooled_submission_kwargs(args):
             "MFT_AEDT_SCHEDULER_URL": args.aedt_pool_url,
             "MFT_SLURM_SCHEDULER_ROOT": args.aedt_pool_pkg_root,
             "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": args.aedt_pool_token_file,
+            "MFT_AEDT_SESSION_VERSION": args.aedt_session_version,
+            "MFT_AEDT_ISOLATION_POLICY": args.aedt_isolation_policy,
         },
     }
 
@@ -614,6 +630,102 @@ def _scheduler_json(path, params=None):
     raise SchedulerError(f"scheduler request failed for {path}: {last_error}")
 
 
+def simulation_policy_snapshot():
+    """Read and validate the scheduler-owned MFT desired concurrency.
+
+    The project safety cap is intentionally not accepted as demand.  A pooled
+    controller may refill only from a versioned policy whose desired value is
+    within both the scheduler rollout gate and this solver release's hard cap.
+    """
+    project = _scheduler_json(f"/api/projects/{MFT_PROJECT}")
+    if not isinstance(project, dict):
+        raise SchedulerError("scheduler returned an invalid MFT project policy")
+    if str(project.get("name") or project.get("project") or "").strip() != MFT_PROJECT:
+        raise SchedulerError("scheduler returned a different project policy")
+    embedded = project.get("simulation_policy")
+    if isinstance(embedded, dict):
+        policy = {**project, **embedded}
+    elif (
+            "desired_simulations" in project
+            or "policy_revision" in project
+            or "validated_concurrency_limit" in project):
+        policy = project
+    else:
+        raise SimulationPolicyUnavailable(
+            "scheduler project has no durable simulation-policy capability")
+
+    desired = policy.get("desired_simulations")
+    validated = policy.get("validated_concurrency_limit")
+    revision = policy.get("policy_revision")
+    scale_down_mode = str(policy.get("scale_down_mode") or "").strip().lower()
+    if (type(desired) is not int
+            or not 0 <= desired <= MAX_POOLED_ACTIVE):
+        raise SchedulerError(
+            f"scheduler desired_simulations must be between 0 and "
+            f"{MAX_POOLED_ACTIVE}")
+    if (type(validated) is not int
+            or not 0 <= validated <= MAX_POOLED_PROJECT_ACTIVE_TASKS):
+        raise SchedulerError(
+            "scheduler validated_concurrency_limit is invalid")
+    if desired > validated:
+        raise SchedulerError(
+            "scheduler desired_simulations exceeds the validated concurrency limit")
+    if (isinstance(revision, bool)
+            or not isinstance(revision, (int, str))
+            or not str(revision).strip()
+            or (isinstance(revision, int) and revision < 0)):
+        raise SchedulerError("scheduler simulation-policy revision is invalid")
+    if scale_down_mode != "drain":
+        raise SchedulerError("scheduler simulation-policy must use drain scale-down")
+    return {
+        "desired_simulations": desired,
+        "effective_simulations": policy.get("effective_simulations"),
+        "validated_concurrency_limit": validated,
+        "policy_revision": revision,
+        "scale_down_mode": scale_down_mode,
+        "resource_constraint": policy.get("resource_constraint"),
+    }
+
+
+def _cycle_target(args):
+    """Resolve one cycle's target, preferring durable policy for pooled loops."""
+    policy_driven = bool(args.aedt_pooled and (args.loop or args.target is None))
+    if policy_driven:
+        try:
+            policy = simulation_policy_snapshot()
+            if args.buffer:
+                raise SchedulerError(
+                    "--buffer must be zero when simulation-policy drives the feeder")
+            return policy["desired_simulations"], policy
+        except SimulationPolicyUnavailable:
+            # A supplied target is an explicit compatibility fallback for an
+            # older scheduler.  New deployments omit it and therefore fail
+            # closed until durable policy is available.
+            if args.target is None:
+                raise
+            LOGGER.warning(
+                "durable simulation-policy unavailable; using explicit "
+                "compatibility target %s for this cycle",
+                args.target,
+            )
+    return (TARGET_ACTIVE if args.target is None else args.target), None
+
+
+def _validate_cycle_target(args, target):
+    if type(target) is not int or type(args.buffer) is not int:
+        raise SchedulerError("target and buffer must be integers")
+    requested_active = target + args.buffer
+    if requested_active < 0:
+        raise SchedulerError("target plus buffer must be non-negative")
+    if args.aedt_pooled and requested_active > MAX_POOLED_ACTIVE:
+        raise SchedulerError(f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
+    if not args.aedt_pooled and requested_active > MAX_STANDALONE_ACTIVE:
+        raise SchedulerError(
+            f"standalone feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
+            "use rapid_campaign.py for 300-task production promotion")
+    return requested_active
+
+
 def scheduler_snapshot(
         required_hard_cap, *, require_exact_project_cap=False,
         require_full_project=False,
@@ -1044,8 +1156,15 @@ def _argument_parser():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", type=int, default=None, help="반복 주기 [s]")
     ap.add_argument("--max-samples", type=int, default=12000)
-    ap.add_argument("--target", type=int, default=TARGET_ACTIVE,
-                    help="실행+대기 목표 (라이선스 서버 과부하 시 감속용)")
+    ap.add_argument(
+        "--target",
+        type=int,
+        default=None,
+        help=(
+            "compatibility/one-shot target; pooled loops read the durable "
+            "scheduler simulation-policy every cycle"
+        ),
+    )
     ap.add_argument("--buffer", type=int, default=BUFFER,
                     help="목표 초과 대기 버퍼")
     ap.add_argument("--solver-revision")
@@ -1069,6 +1188,20 @@ def _argument_parser():
         metavar="PATH",
     )
     ap.add_argument(
+        "--aedt-session-version",
+        default=DEFAULT_AEDT_SESSION_VERSION,
+        metavar="VERSION",
+    )
+    ap.add_argument(
+        "--aedt-isolation-policy",
+        choices=AEDT_ISOLATION_POLICIES,
+        default=DEFAULT_AEDT_ISOLATION_POLICY,
+        help=(
+            "start family-isolated; switch to shared_if_compatible only "
+            "after the mixed MFT/motor canary passes"
+        ),
+    )
+    ap.add_argument(
         "--pooled-cpus", type=int, default=DEFAULT_POOLED_CPUS, metavar="N")
     ap.add_argument(
         "--pooled-memory-mb",
@@ -1087,15 +1220,8 @@ def main():
     ap = _argument_parser()
     args = ap.parse_args()
     pooled_submission = _pooled_submission_kwargs(args)
-
-    requested_active = int(args.target) + int(args.buffer)
-    if args.aedt_pooled and requested_active > MAX_POOLED_ACTIVE:
-        raise SchedulerError(
-            f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
-    if not args.aedt_pooled and requested_active > MAX_STANDALONE_ACTIVE:
-        raise SchedulerError(
-            f"standalone feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
-            "use rapid_campaign.py for 300-task production promotion")
+    if args.target is not None:
+        _validate_cycle_target(args, args.target)
 
     if args.trust_pinned_revisions:
         for revision, flag in (
@@ -1115,56 +1241,89 @@ def main():
             f"library SHA {args.library_revision}"
         )
 
-    if args.target + args.buffer > 0:
-        if not args.trust_pinned_revisions:
-            if args.solver_revision != al_driver._current_solver_revision():
-                raise SchedulerError("feeder solver revision is not the current vetted local solver")
-            if args.library_revision != al_driver._current_library_revision():
-                raise SchedulerError("feeder library revision is not the current clean local library")
-            validate_p08_completion(
-                args.solver_revision, args.library_revision,
-                seed=args.candidate_seed)
+    may_submit = bool(
+        args.target is None
+        or args.target + args.buffer > 0
+        or (args.aedt_pooled and args.loop)
+    )
+    if may_submit and not args.trust_pinned_revisions:
+        if args.solver_revision != al_driver._current_solver_revision():
+            raise SchedulerError("feeder solver revision is not the current vetted local solver")
+        if args.library_revision != al_driver._current_library_revision():
+            raise SchedulerError("feeder library revision is not the current clean local library")
+        validate_p08_completion(
+            args.solver_revision, args.library_revision,
+            seed=args.candidate_seed)
 
     def guarded_step():
-        def run_locked_step():
-            if args.target + args.buffer > 0:
+        def run_cycle(target, policy, requested_active):
+            if requested_active > 0:
                 _require_deployed_revisions(
                     args.solver_revision, args.library_revision
+                )
+            if policy is not None:
+                print(
+                    "[feeder] scheduler policy "
+                    f"revision={policy['policy_revision']} "
+                    f"desired={policy['desired_simulations']} "
+                    f"effective={policy.get('effective_simulations')} "
+                    f"validated={policy['validated_concurrency_limit']}"
                 )
             step_options = {}
             if pooled_submission is not None:
                 step_options["pooled_submission"] = pooled_submission
             return step(
-                args.max_samples, target=args.target, buffer=args.buffer,
+                args.max_samples, target=target, buffer=args.buffer,
                 solver_revision=args.solver_revision,
                 library_revision=args.library_revision,
                 candidate_seed=args.candidate_seed,
                 **step_options,
             )
 
-        if args.target + args.buffer > 0:
+        # Serialize policy observation with every submission in that cycle.
+        # The WEB UI uses the same host-wide lock, so a concurrent target
+        # reduction cannot race an already-authorized refill batch.
+        if args.aedt_pooled and (args.loop or args.target is None):
             with campaign_mutation_lock():
-                return run_locked_step()
-        return run_locked_step()
+                target, policy = _cycle_target(args)
+                requested_active = _validate_cycle_target(args, target)
+                return run_cycle(target, policy, requested_active)
+
+        target, policy = _cycle_target(args)
+        requested_active = _validate_cycle_target(args, target)
+        if requested_active > 0:
+            with campaign_mutation_lock():
+                return run_cycle(target, policy, requested_active)
+        return run_cycle(target, policy, requested_active)
 
     if args.once or not args.loop:
         guarded_step()
         publish_ready_marker(
             args.ready_file, args.solver_revision, args.library_revision)
         return
-    ready_published = False
-    while True:
-        try:
-            keep_running = guarded_step()
-            if not ready_published:
-                publish_ready_marker(
-                    args.ready_file, args.solver_revision, args.library_revision)
-                ready_published = True
-            if not keep_running:
-                break
-        except Exception as e:
-            print(f"[feeder] step error: {e}")
-        time.sleep(args.loop)
+    controller_lock = FileLock(CONTROLLER_LOCK)
+    try:
+        with controller_lock.acquire(timeout=0):
+            ready_published = False
+            while True:
+                try:
+                    keep_running = guarded_step()
+                    if not ready_published:
+                        publish_ready_marker(
+                            args.ready_file,
+                            args.solver_revision,
+                            args.library_revision,
+                        )
+                        ready_published = True
+                    if not keep_running:
+                        break
+                except Exception as e:
+                    print(f"[feeder] step error: {e}")
+                time.sleep(args.loop)
+    except FileLockTimeout as exc:
+        raise SchedulerError(
+            f"another feeder controller owns {CONTROLLER_LOCK}"
+        ) from exc
 
 
 if __name__ == "__main__":

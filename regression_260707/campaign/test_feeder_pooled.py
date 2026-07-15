@@ -10,6 +10,8 @@ from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
+from filelock import FileLock
+
 
 CAMPAIGN_DIR = Path(__file__).resolve().parent
 if str(CAMPAIGN_DIR) not in sys.path:
@@ -22,7 +24,7 @@ SOLVER_REVISION = "a" * 40
 LIBRARY_REVISION = "b" * 40
 # Compact-JSON digest from the pre-pooled payload builder for this fixed fixture.
 LEGACY_PAYLOAD_SHA256 = (
-    "611abcc5adac9e6f4870b9e2dae7453cbb01f69018b4fa70fefc56ffeefab973"
+    "c9729f8f224a26bbf0161381c06ffe54709d678f48163bb032cbc19ec9d4dd1e"
 )
 
 
@@ -214,6 +216,8 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "MFT_AEDT_BACKEND": "pooled",
             "MFT_AEDT_SHARED_CANARY": "1",
             "MFT_AEDT_SCHEDULER_URL": "https://pool.example.test:8443",
+            "MFT_AEDT_SESSION_VERSION": "2025.2",
+            "MFT_AEDT_ISOLATION_POLICY": "family",
             "MFT_SLURM_SCHEDULER_ROOT": "/opt/pool package",
             "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": "/run/pool token",
         }
@@ -230,6 +234,8 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             defaults.aedt_pool_token_file,
             "$HOME/slurm_scheduler/aedt_pool_bootstrap",
         )
+        self.assertEqual(defaults.aedt_session_version, "2025.2")
+        self.assertEqual(defaults.aedt_isolation_policy, "family")
         self.assertEqual(defaults.pooled_cpus, 1)
         self.assertEqual(defaults.pooled_memory_mb, 6144)
 
@@ -286,6 +292,23 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 f'export {key}="{value}";',
                 pooled_command,
             )
+        self.assertNotIn("MFT_AEDT_POOL_WORKSPACE", pooled_command)
+        self.assertNotIn("MFT_AEDT_POOL_WORKSPACE_ROOT", pooled_command)
+
+        shared_payload = self._capture_cli_payload([
+            "--aedt-pooled",
+            "--aedt-pool-url", "https://pool.example.test:8443",
+            "--aedt-isolation-policy", "shared_if_compatible",
+        ])
+        self.assertIn(
+            'export MFT_AEDT_SESSION_VERSION="2025.2";',
+            shared_payload["command"],
+        )
+        self.assertIn(
+            'export MFT_AEDT_ISOLATION_POLICY="shared_if_compatible";',
+            shared_payload["command"],
+        )
+        self.assertNotIn("MFT_AEDT_POOL_WORKSPACE", shared_payload["command"])
 
         legacy_payload = self._capture_cli_payload([])
         legacy_command = legacy_payload["command"]
@@ -336,6 +359,127 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 "MFT_SLURM_SCHEDULER_ROOT",
                 "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE"):
             self.assertNotIn(key, payload["command"])
+
+
+class FeederSimulationPolicyTests(unittest.TestCase):
+    def test_policy_snapshot_uses_desired_not_project_safety_cap(self):
+        project = {
+            "name": feeder.MFT_PROJECT,
+            "max_active_tasks": 510,
+            "simulation_policy": {
+                "desired_simulations": 500,
+                "effective_simulations": 472,
+                "validated_concurrency_limit": 500,
+                "policy_revision": 19,
+                "scale_down_mode": "drain",
+                "resource_constraint": {"code": "license_headroom"},
+            },
+        }
+        with patch.object(feeder, "_scheduler_json", return_value=project) as get:
+            policy = feeder.simulation_policy_snapshot()
+
+        get.assert_called_once_with(
+            f"/api/projects/{feeder.MFT_PROJECT}")
+        self.assertEqual(policy["desired_simulations"], 500)
+        self.assertEqual(policy["effective_simulations"], 472)
+        self.assertEqual(policy["policy_revision"], 19)
+
+    def test_policy_snapshot_fails_closed_above_validated_limit(self):
+        project = {
+            "name": feeder.MFT_PROJECT,
+            "desired_simulations": 500,
+            "validated_concurrency_limit": 250,
+            "policy_revision": 3,
+            "scale_down_mode": "drain",
+        }
+        with patch.object(feeder, "_scheduler_json", return_value=project):
+            with self.assertRaisesRegex(
+                    feeder.SchedulerError, "exceeds the validated"):
+                feeder.simulation_policy_snapshot()
+
+    def test_pooled_loop_prefers_durable_policy_over_explicit_fallback(self):
+        args = feeder._argument_parser().parse_args([
+            "--loop", "600",
+            "--target", "40",
+            "--aedt-pooled",
+            "--aedt-pool-url", "https://pool.example.test",
+        ])
+        expected = {
+            "desired_simulations": 500,
+            "effective_simulations": 480,
+            "validated_concurrency_limit": 500,
+            "policy_revision": 20,
+            "scale_down_mode": "drain",
+            "resource_constraint": None,
+        }
+        with patch.object(
+                feeder, "simulation_policy_snapshot", return_value=expected):
+            target, policy = feeder._cycle_target(args)
+
+        self.assertEqual(target, 500)
+        self.assertEqual(policy, expected)
+
+    def test_new_pooled_controller_has_no_fixed_cli_target(self):
+        args = feeder._argument_parser().parse_args([
+            "--loop", "600",
+            "--aedt-pooled",
+            "--aedt-pool-url", "https://pool.example.test",
+        ])
+        self.assertIsNone(args.target)
+        with patch.object(
+                feeder,
+                "simulation_policy_snapshot",
+                side_effect=feeder.SchedulerError("policy unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                    feeder.SchedulerError, "policy unavailable"):
+                feeder._cycle_target(args)
+
+    def test_explicit_target_is_only_an_old_scheduler_fallback(self):
+        args = feeder._argument_parser().parse_args([
+            "--loop", "600",
+            "--target", "40",
+            "--aedt-pooled",
+            "--aedt-pool-url", "https://pool.example.test",
+        ])
+        with patch.object(
+                feeder,
+                "simulation_policy_snapshot",
+                side_effect=feeder.SimulationPolicyUnavailable(
+                    "old scheduler"),
+        ):
+            target, policy = feeder._cycle_target(args)
+        self.assertEqual(target, 40)
+        self.assertIsNone(policy)
+
+        with patch.object(
+                feeder,
+                "simulation_policy_snapshot",
+                side_effect=feeder.SchedulerError("invalid live policy"),
+        ):
+            with self.assertRaisesRegex(
+                    feeder.SchedulerError, "invalid live policy"):
+                feeder._cycle_target(args)
+
+    def test_loop_controller_lock_rejects_duplicate_process(self):
+        with self.subTest("lifetime lock"):
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory() as directory:
+                lock_path = str(Path(directory) / "feeder-controller.lock")
+                argv = [
+                    "feeder.py", "--loop", "600", "--target", "0",
+                    "--solver-revision", SOLVER_REVISION,
+                    "--library-revision", LIBRARY_REVISION,
+                    "--trust-pinned-revisions",
+                ]
+                with FileLock(lock_path).acquire(timeout=0):
+                    with patch.object(sys, "argv", argv), patch.object(
+                            feeder, "CONTROLLER_LOCK", lock_path):
+                        with self.assertRaisesRegex(
+                                feeder.SchedulerError,
+                                "another feeder controller owns"):
+                            feeder.main()
 
 
 def test_state_round_trip_with_configured_directory(tmp_path):
