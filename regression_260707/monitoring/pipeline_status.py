@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import threading
 import time
 from typing import Any, Callable
 from urllib.parse import quote
@@ -32,6 +33,7 @@ RECENT_JOBS_PER_LANE = 4
 QUERY_DEADLINE_SECONDS = 1.0
 ARTIFACT_SCAN_LIMIT = 2_048
 ARTIFACT_CANDIDATE_LIMIT = 64
+DATASET_AUDIT_MAX_BYTES = 128 * 1024 * 1024
 ROLE_ACTIVITY_STALE_SECONDS = 20 * 60
 RUNNING_HEARTBEAT_STALE_SECONDS = 180
 FIRST_TRAINING_ROWS = 500
@@ -97,6 +99,12 @@ def _timestamp(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if result >= 0 else None
+
+
+def _nonnegative_integer(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _iso_timestamp(value: Any) -> str | None:
@@ -275,6 +283,10 @@ class ContinuousPipelineReader:
         busy_timeout_seconds: float = 0.15,
         database_max_bytes: int = DATABASE_MAX_BYTES,
         inspect_external_processes: bool = True,
+        dataset_audit_max_bytes: int = DATASET_AUDIT_MAX_BYTES,
+        dataset_auditor: Callable[
+            [Path, str | None, str | None], dict[str, int]
+        ] | None = None,
     ) -> None:
         configured = pipeline_root or os.environ.get(
             PIPELINE_ROOT_ENV, str(DEFAULT_PIPELINE_ROOT)
@@ -284,6 +296,138 @@ class ContinuousPipelineReader:
         self.busy_timeout_seconds = max(0.01, min(float(busy_timeout_seconds), 2.0))
         self.database_max_bytes = max(1024, int(database_max_bytes))
         self.inspect_external_processes = bool(inspect_external_processes)
+        self.dataset_audit_max_bytes = max(
+            1, int(dataset_audit_max_bytes)
+        )
+        self.dataset_auditor = dataset_auditor or self._audit_dataset_artifact
+        self._dataset_audit_lock = threading.Lock()
+        self._dataset_audit_key: tuple[Any, ...] | None = None
+        self._dataset_audit_result: dict[str, Any] | None = None
+
+    @staticmethod
+    def _audit_dataset_artifact(
+        path: Path,
+        solver_revision: str | None,
+        library_revision: str | None,
+    ) -> dict[str, int]:
+        """Recompute row tiers from an immutable dataset generation.
+
+        This is intentionally imported lazily: a missing Parquet engine must
+        degrade only the optional row classification, not the monitoring API.
+        The caller caches the small result by artifact fingerprint so the
+        quality contract is not rerun on every browser refresh.
+        """
+        import pandas as pd
+
+        from ..quality_contract import annotate_validity
+
+        raw = pd.read_parquet(path)
+        audited = annotate_validity(
+            raw,
+            expected_solver_revision=solver_revision,
+            expected_library_revision=library_revision,
+        )
+        raw_rows = int(len(audited))
+        strict_em_rows = int(
+            audited["_strict_valid_em"].fillna(False).astype(bool).sum()
+        )
+        strict_full_rows = int(
+            audited["_strict_valid_full"].fillna(False).astype(bool).sum()
+        )
+        if not 0 <= strict_full_rows <= strict_em_rows <= raw_rows:
+            raise ValueError(
+                "dataset row tiers violate full <= EM <= raw invariant"
+            )
+        return {
+            "raw_rows": raw_rows,
+            "strict_em_rows": strict_em_rows,
+            "strict_full_rows": strict_full_rows,
+            "em_only_rows": strict_em_rows - strict_full_rows,
+        }
+
+    def _cached_dataset_audit(
+        self,
+        path: Path,
+        solver_revision: str | None,
+        library_revision: str | None,
+    ) -> dict[str, Any]:
+        """Return a bounded, read-only and fingerprint-cached row audit."""
+        try:
+            if path.is_symlink():
+                raise OSError("dataset artifact symlinks are not audited")
+            before = path.stat()
+            if not path.is_file():
+                raise OSError("dataset artifact is not a regular file")
+            if before.st_size <= 0:
+                raise OSError("dataset artifact is empty")
+            if before.st_size > self.dataset_audit_max_bytes:
+                raise OSError(
+                    "dataset artifact exceeds read-only audit limit "
+                    f"({before.st_size} > {self.dataset_audit_max_bytes} bytes)"
+                )
+        except OSError as exc:
+            return {
+                "available": False,
+                "source": "manifest",
+                "error": f"{type(exc).__name__}: {_bounded_text(exc, 400)}",
+            }
+
+        key = (
+            str(path),
+            int(before.st_size),
+            int(before.st_mtime_ns),
+            solver_revision,
+            library_revision,
+        )
+        with self._dataset_audit_lock:
+            if key == self._dataset_audit_key and self._dataset_audit_result:
+                return dict(self._dataset_audit_result)
+            try:
+                counts = self.dataset_auditor(
+                    path, solver_revision, library_revision
+                )
+                after = path.stat()
+                if (
+                    after.st_size != before.st_size
+                    or after.st_mtime_ns != before.st_mtime_ns
+                ):
+                    raise OSError("dataset artifact changed during row audit")
+                normalized = {
+                    name: int(counts[name])
+                    for name in (
+                        "raw_rows",
+                        "strict_em_rows",
+                        "strict_full_rows",
+                        "em_only_rows",
+                    )
+                }
+                if not (
+                    0
+                    <= normalized["strict_full_rows"]
+                    <= normalized["strict_em_rows"]
+                    <= normalized["raw_rows"]
+                    and normalized["em_only_rows"]
+                    == normalized["strict_em_rows"]
+                    - normalized["strict_full_rows"]
+                ):
+                    raise ValueError("dataset auditor returned incoherent row tiers")
+                result: dict[str, Any] = {
+                    "available": True,
+                    "source": "train.parquet_quality_contract",
+                    "artifact_size_bytes": int(after.st_size),
+                    "error": None,
+                    **normalized,
+                }
+            except Exception as exc:
+                result = {
+                    "available": False,
+                    "source": "manifest",
+                    "artifact_size_bytes": int(before.st_size),
+                    "error": f"{type(exc).__name__}: {_bounded_text(exc, 500)}",
+                }
+            self._dataset_audit_key = key
+            self._dataset_audit_result = result
+            return dict(result)
 
     @staticmethod
     def _controller_cycle(role: dict[str, Any]) -> dict[str, Any]:
@@ -319,6 +463,29 @@ class ContinuousPipelineReader:
             }
         return {"available": False, "dataset_generation": None, "jobs": {}, "blocked": {}}
 
+    @staticmethod
+    def _unavailable_dataset_cohort(
+        error: str,
+        *,
+        scan_truncated: bool,
+    ) -> dict[str, Any]:
+        return {
+            "available": False,
+            "counts_available": False,
+            "raw_rows": None,
+            "strict_em_rows": None,
+            "strict_full_rows": 0,
+            "em_only_rows": None,
+            "current_raw_rows": None,
+            "current_strict_em_rows": None,
+            "current_strict_full_rows": 0,
+            "current_em_only_rows": None,
+            "counts_source": None,
+            "counts_error": error,
+            "error": error,
+            "scan_truncated": scan_truncated,
+        }
+
     def _dataset_cohort(
         self,
         revisions: dict[str, Any],
@@ -347,19 +514,15 @@ class ContinuousPipelineReader:
                     except OSError:
                         continue
         except (FileNotFoundError, NotADirectoryError):
-            return {
-                "available": False,
-                "current_strict_full_rows": 0,
-                "error": "exact-SHA dataset generation is unavailable",
-                "scan_truncated": False,
-            }
+            return self._unavailable_dataset_cohort(
+                "exact-SHA dataset generation is unavailable",
+                scan_truncated=False,
+            )
         except OSError as exc:
-            return {
-                "available": False,
-                "current_strict_full_rows": 0,
-                "error": f"{type(exc).__name__}: {_bounded_text(exc, 400)}",
-                "scan_truncated": False,
-            }
+            return self._unavailable_dataset_cohort(
+                f"{type(exc).__name__}: {_bounded_text(exc, 400)}",
+                scan_truncated=False,
+            )
         seen: set[Path] = set()
         for _, path in sorted(candidates, key=lambda item: item[0], reverse=True):
             if path in seen:
@@ -377,12 +540,66 @@ class ContinuousPipelineReader:
                 continue
             if library and metadata.get("library_revision") != library:
                 continue
-            rows = metadata.get("strict_full_rows")
-            if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+            manifest_full_rows = _nonnegative_integer(
+                metadata.get("strict_full_rows")
+            )
+            if manifest_full_rows is None:
                 continue
+            audit = self._cached_dataset_audit(
+                path / "train.parquet", solver, library
+            )
+            if audit.get("available"):
+                raw_rows = audit["raw_rows"]
+                strict_em_rows = audit["strict_em_rows"]
+                strict_full_rows = audit["strict_full_rows"]
+                em_only_rows = audit["em_only_rows"]
+                counts_available = True
+            else:
+                raw_rows = _nonnegative_integer(metadata.get("raw_rows"))
+                strict_em_rows = _nonnegative_integer(
+                    metadata.get("strict_em_rows")
+                )
+                strict_full_rows = manifest_full_rows
+                em_only_rows = (
+                    strict_em_rows - strict_full_rows
+                    if strict_em_rows is not None
+                    and strict_em_rows >= strict_full_rows
+                    else None
+                )
+                counts_available = (
+                    raw_rows is not None
+                    and strict_em_rows is not None
+                    and em_only_rows is not None
+                    and strict_em_rows <= raw_rows
+                )
+            manifest_consistent = (
+                strict_full_rows == manifest_full_rows
+                if audit.get("available")
+                else None
+            )
+            counts_warning = None
+            if manifest_consistent is False:
+                counts_warning = (
+                    "manifest strict_full_rows differs from the read-only "
+                    "quality-contract audit"
+                )
             return {
                 "available": True,
-                "current_strict_full_rows": rows,
+                "counts_available": counts_available,
+                "raw_rows": raw_rows,
+                "strict_em_rows": strict_em_rows,
+                "strict_full_rows": strict_full_rows,
+                "em_only_rows": em_only_rows,
+                # Keep the original current_* keys for older UI clients.
+                "current_raw_rows": raw_rows,
+                "current_strict_em_rows": strict_em_rows,
+                "current_strict_full_rows": strict_full_rows,
+                "current_em_only_rows": em_only_rows,
+                "manifest_strict_full_rows": manifest_full_rows,
+                "manifest_matches_audit": manifest_consistent,
+                "counts_source": audit.get("source"),
+                "counts_error": audit.get("error"),
+                "counts_warning": counts_warning,
                 "generation_id": _bounded_text(manifest.get("generation_id"), 100),
                 "generation": f"dataset:{manifest.get('generation_id')}",
                 "created_at": _bounded_text(manifest.get("created_at"), 100),
@@ -391,12 +608,10 @@ class ContinuousPipelineReader:
                 "scan_truncated": truncated,
                 "error": None,
             }
-        return {
-            "available": False,
-            "current_strict_full_rows": 0,
-            "error": "no dataset generation matches the exact controller revisions",
-            "scan_truncated": truncated,
-        }
+        return self._unavailable_dataset_cohort(
+            "no dataset generation matches the exact controller revisions",
+            scan_truncated=truncated,
+        )
 
     def _external_tuners(self, now: float) -> dict[str, Any]:
         if not self.inspect_external_processes:
@@ -1042,6 +1257,18 @@ class ContinuousPipelineReader:
                 "first_training_rows": FIRST_TRAINING_ROWS,
                 "model_activation_rows": MODEL_ACTIVATION_ROWS,
                 "first_tuning_rows": FIRST_TUNING_ROWS,
+                "em_only_is_invalid": False,
+                "row_semantics": {
+                    "strict_em_rows": (
+                        "EM quality and provenance passed"
+                    ),
+                    "strict_full_rows": (
+                        "EM and thermal quality passed; used by full-pipeline gates"
+                    ),
+                    "em_only_rows": (
+                        "EM-usable with incomplete thermal results; not invalid"
+                    ),
+                },
             },
             "external_tuners": external_tuners,
             "queue": queue,

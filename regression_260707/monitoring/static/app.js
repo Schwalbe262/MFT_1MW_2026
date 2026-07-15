@@ -236,10 +236,38 @@
       true,
     );
     const cohort = pipeline.cohort || {};
+    const rawRows = cohort.raw_rows ?? cohort.current_raw_rows;
+    const strictEmRows = cohort.strict_em_rows ?? cohort.current_strict_em_rows;
+    const strictFullRows = cohort.strict_full_rows ?? cohort.current_strict_full_rows ?? 0;
+    const emOnlyRows = cohort.em_only_rows ?? cohort.current_em_only_rows;
+    const completeClassification = [rawRows, strictEmRows, strictFullRows, emOnlyRows]
+      .every((value) => value != null && Number.isFinite(Number(value)));
+    setText(
+      "#pipeline-em-rows",
+      completeClassification
+        ? `${number(rawRows)} / ${number(strictEmRows)}`
+        : "Parquet 분류 확인 중",
+    );
+    setText(
+      "#pipeline-em-only-rows",
+      completeClassification
+        ? `${number(emOnlyRows)} (thermal incomplete)`
+        : "—",
+    );
     setText(
       "#pipeline-exact-rows",
-      `${number(cohort.current_strict_full_rows || 0)} · train ${number(cohort.first_training_rows || 500)} / model ${number(cohort.model_activation_rows || 3000)} / tune ${number(cohort.first_tuning_rows || 4000)}`,
+      `${number(strictFullRows)} · train ${number(cohort.first_training_rows || 500)} / model ${number(cohort.model_activation_rows || 3000)} / tune ${number(cohort.first_tuning_rows || 4000)}`,
     );
+    const cohortExplanation = $("#pipeline-cohort-explanation");
+    if (completeClassification) {
+      cohortExplanation.textContent = Number(emOnlyRows) > 0
+        ? `${number(emOnlyRows)}개는 무효 데이터가 아닙니다. EM 기준을 통과했지만 열 결과가 불완전해 Full(EM+열) gate에서만 제외됩니다.`
+        : "모든 EM 사용 가능 행이 열 품질 기준까지 통과했습니다.";
+    } else {
+      cohortExplanation.textContent = "Full 행은 manifest에서 확인됐으며, EM/열 분리 집계를 읽는 중입니다.";
+    }
+    cohortExplanation.classList.toggle("pipeline-cohort-audit-warning", Boolean(cohort.counts_warning));
+    cohortExplanation.title = cohort.counts_warning || cohort.counts_error || cohort.counts_source || "";
     renderPipelineRevision(
       "#pipeline-dataset-generation",
       cohort.generation,

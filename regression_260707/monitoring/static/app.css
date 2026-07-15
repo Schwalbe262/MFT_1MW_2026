@@ -227,6 +227,9 @@ section { margin: 0 0 52px; scroll-margin-top: 100px; }
 .continuous-role-card dd, .continuous-revision-card dd { min-width: 0; margin: 0; overflow: hidden; color: var(--text); font: 600 9px ui-monospace, SFMono-Regular, Consolas, monospace; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
 .continuous-revision-card > span { display: block; margin-bottom: 12px; }
 .continuous-revision-card dd.revision-invalid { color: var(--red); }
+.continuous-revision-card #pipeline-em-only-rows { color: var(--cyan); }
+.pipeline-cohort-explanation { margin: 11px 0 0; padding: 8px 9px; border-left: 2px solid rgba(38,215,199,.55); border-radius: 0 6px 6px 0; color: #8fb2bc; background: rgba(38,215,199,.045); font-size: 8px; line-height: 1.55; }
+.pipeline-cohort-explanation.pipeline-cohort-audit-warning { border-left-color: var(--yellow); color: #d6b977; background: rgba(255,187,85,.045); }
 .external-tuner-card > p { margin: 0 0 8px; color: var(--muted); font-size: 8px; line-height: 1.45; }
 .external-tuner-card .plain-list { max-height: 62px; overflow: auto; font-size: 8px; }
 .continuous-pipeline-summary { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin-top: 12px; border: 1px solid var(--line-soft); border-radius: 9px; overflow: hidden; }

@@ -190,6 +190,86 @@ def test_pipeline_reader_reports_real_parallel_lanes_revisions_and_errors(tmp_pa
     assert database.stat().st_mtime_ns == before_mtime
 
 
+def test_pipeline_reader_audits_row_tiers_once_per_dataset_fingerprint(tmp_path):
+    now = time.time()
+    root = tmp_path / "pipeline"
+    _create_queue(root, now)
+    _write_role(root, "controller", now)
+    _write_role(root, "supervisor", now)
+    artifact = (
+        root / "artifacts" / "dataset" / ("d" * 64) / "train.parquet"
+    )
+    artifact.write_bytes(b"immutable parquet fixture")
+    calls = []
+
+    def audit(path, solver_revision, library_revision):
+        calls.append((path, solver_revision, library_revision))
+        return {
+            "raw_rows": 321,
+            "strict_em_rows": 150,
+            "strict_full_rows": 123,
+            "em_only_rows": 27,
+        }
+
+    reader = ContinuousPipelineReader(
+        root,
+        clock=lambda: now,
+        inspect_external_processes=False,
+        dataset_auditor=audit,
+    )
+    first = reader.snapshot()
+    second = reader.snapshot()
+
+    assert len(calls) == 1
+    assert calls[0] == (artifact, SOLVER_REVISION, LIBRARY_REVISION)
+    assert first["cohort"]["counts_available"] is True
+    assert first["cohort"]["raw_rows"] == 321
+    assert first["cohort"]["strict_em_rows"] == 150
+    assert first["cohort"]["strict_full_rows"] == 123
+    assert first["cohort"]["em_only_rows"] == 27
+    assert first["cohort"]["current_strict_full_rows"] == 123
+    assert first["cohort"]["counts_source"] == (
+        "train.parquet_quality_contract"
+    )
+    assert first["cohort"]["manifest_matches_audit"] is True
+    assert first["cohort"]["em_only_is_invalid"] is False
+    assert "not invalid" in first["cohort"]["row_semantics"]["em_only_rows"]
+    assert second["cohort"] == first["cohort"]
+
+
+def test_pipeline_reader_bounds_dataset_audit_and_keeps_manifest_full_count(tmp_path):
+    now = time.time()
+    root = tmp_path / "pipeline"
+    _create_queue(root, now)
+    _write_role(root, "controller", now)
+    artifact = (
+        root / "artifacts" / "dataset" / ("d" * 64) / "train.parquet"
+    )
+    artifact.write_bytes(b"too large for configured test bound")
+    called = False
+
+    def audit(path, solver_revision, library_revision):
+        nonlocal called
+        called = True
+        raise AssertionError("bounded artifact must not be opened")
+
+    payload = ContinuousPipelineReader(
+        root,
+        clock=lambda: now,
+        inspect_external_processes=False,
+        dataset_audit_max_bytes=8,
+        dataset_auditor=audit,
+    ).snapshot()
+
+    assert called is False
+    assert payload["cohort"]["available"] is True
+    assert payload["cohort"]["counts_available"] is False
+    assert payload["cohort"]["strict_em_rows"] is None
+    assert payload["cohort"]["strict_full_rows"] == 123
+    assert payload["cohort"]["em_only_rows"] is None
+    assert "audit limit" in payload["cohort"]["counts_error"]
+
+
 def test_pipeline_reader_is_bounded_and_fail_soft_for_missing_or_corrupt_state(tmp_path):
     now = time.time()
     missing = ContinuousPipelineReader(
@@ -265,15 +345,22 @@ def test_pipeline_api_and_static_panel_are_exposed(tmp_path):
     assert 'id="continuous-pipeline-title"' in page.text
     assert 'id="continuous-pipeline-lanes"' in page.text
     assert 'id="pipeline-running-lanes"' in page.text
+    assert 'id="pipeline-em-rows"' in page.text
+    assert 'id="pipeline-em-only-rows"' in page.text
+    assert 'id="pipeline-cohort-explanation"' in page.text
     script = client.get("/static/app.js").text
     assert "function renderContinuousPipeline" in script
     assert "parallel.parallel_work_confirmed" in script
     assert "job?.heartbeat_stale" in script
     assert "lane.prerequisite" in script
+    assert "cohort.strict_em_rows" in script
+    assert "cohort.em_only_rows" in script
+    assert "무효 데이터가 아닙니다" in script
     stylesheet = client.get("/static/app.css").text
     assert ".continuous-pipeline-panel" in stylesheet
     assert ".continuous-lane-table" in stylesheet
     assert ".pipeline-heartbeat.stale" in stylesheet
+    assert ".pipeline-cohort-explanation" in stylesheet
 
 
 def test_job_state_fixture_covers_monitor_schema():
