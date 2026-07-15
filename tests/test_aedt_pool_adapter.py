@@ -686,7 +686,7 @@ def test_pooled_results_preclaim_exact_design_alias_and_reject_traversal(
     ("label", "solution_type"),
     (("matrix", "AC Magnetic"), ("cap", "Electrostatic"), ("loss", "AC Magnetic")),
 )
-def test_pooled_native_analyze_is_exact_nonblocking_and_attested_under_lock(
+def test_pooled_native_analyze_blocks_outside_lock_and_allows_sibling_transition(
     monkeypatch, tmp_path, label, solution_type,
 ):
     from run_simulation_260706 import Simulation
@@ -708,6 +708,19 @@ def test_pooled_native_analyze_is_exact_nonblocking_and_attested_under_lock(
             events.append("lock-exit")
             lock_depth[0] -= 1
 
+    class NativeWindow:
+        def __enter__(self):
+            assert lock_depth[0] > 0
+            self.depth = lock_depth[0]
+            lock_depth[0] = 0
+            events.append("native-window-yield")
+            return self
+
+        def __exit__(self, *_args):
+            assert lock_depth[0] == 0
+            lock_depth[0] = self.depth
+            events.append("native-window-restore")
+
     workspace = tmp_path / "lease-workspace"
     workspace.mkdir()
 
@@ -717,6 +730,9 @@ def test_pooled_native_analyze_is_exact_nonblocking_and_attested_under_lock(
 
         def automation_guard(self):
             return Guard()
+
+        def native_solve_window(self):
+            return NativeWindow()
 
     class Project:
         def Save(self):
@@ -729,8 +745,12 @@ def test_pooled_native_analyze_is_exact_nonblocking_and_attested_under_lock(
             return f"maxwell_{label}"
 
         def Analyze(self, setup_name, blocking):
-            assert lock_depth[0] > 0
+            # A sibling stage can own the Desktop automation transaction while
+            # this exact project-scoped blocking call waits for its solver.
+            assert lock_depth[0] == 0
             events.append(("analyze", setup_name, blocking))
+            with Guard():
+                events.append("sibling-stage-transition")
             desktop.completed = True
             return 0
 
@@ -807,10 +827,13 @@ def test_pooled_native_analyze_is_exact_nonblocking_and_attested_under_lock(
 
     assert elapsed >= 0
     assert events[0] == "activate"
-    analyze_event = ("analyze", "Setup1", False)
+    analyze_event = ("analyze", "Setup1", True)
     assert analyze_event in events
-    assert events.index("lock-enter") < events.index(analyze_event)
+    assert events.index("native-window-yield") < events.index(analyze_event)
+    assert events.index(analyze_event) < events.index("native-window-restore")
+    assert "sibling-stage-transition" in events
     assert events.count(analyze_event) == 1
+    # One outer transaction plus the deliberately interleaved sibling.
     assert events.count("lock-enter") == 2
     assert contracts == [
         {
@@ -868,7 +891,7 @@ def _minimal_pooled_terminal_harness(*, normal=False, fatal=False, mismatch=Fals
             return self.name
 
         def Analyze(self, setup_name, blocking):
-            assert (setup_name, blocking) == ("Setup1", False)
+            assert (setup_name, blocking) == ("Setup1", True)
             self.analyzed = True
             return 0
 
@@ -910,6 +933,7 @@ def _minimal_pooled_terminal_harness(*, normal=False, fatal=False, mismatch=Fals
     simulation.pooled_activation_done = True
     simulation.activate_pooled_for_solve = lambda: None
     simulation.aedt_automation_transaction = lambda: nullcontext()
+    simulation.aedt_native_solve_window = lambda: nullcontext()
     simulation._verified_pooled_native_setup = verify
     simulation._native_desktop_handle = lambda: Desktop()
     simulation._ensure_pooled_shared_results_directory = lambda *_args, **_kwargs: None

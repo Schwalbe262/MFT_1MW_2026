@@ -58,6 +58,37 @@ def test_new_exact_design_error_is_fatal_even_after_normal():
     assert update.fatal_messages == ("Fatal solver process terminated",)
 
 
+def test_error_severity_normal_is_not_downgraded_to_success():
+    """An error-channel Normal can be fallout from a contaminated Desktop.
+
+    AEDT emitted this exact severity oddity in q16 only after a sibling's
+    asynchronous script macro lost its active project and was aborted.  The
+    text still records Normal syntax, but its error-channel provenance must
+    keep the whole exact scope fail-closed rather than manufacture a valid
+    terminal result.
+    """
+
+    line = "[error] Normal completion of simulation on server: shared-node"
+
+    class ErrorNormalDesktop:
+        phase = 0
+
+        def GetMessages(self, _project, _design, severity):
+            if self.phase == 0:
+                return []
+            return [line] if severity in (0, 2) else []
+
+    desktop = ErrorNormalDesktop()
+    cursor = capture_scoped_message_cursor(desktop, "own-project", "own-design")
+    desktop.phase = 1
+
+    update = advance_scoped_message_cursor(desktop, cursor)
+
+    assert update.normal_completion is True
+    assert update.new_errors == (line,)
+    assert update.fatal_messages == (line,)
+
+
 def test_message_history_reset_without_cursor_overlap_fails_closed():
     class ResetDesktop:
         value = ["before"]

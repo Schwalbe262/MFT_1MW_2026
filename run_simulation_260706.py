@@ -6160,7 +6160,20 @@ class Simulation():
     def _analyze_exact_pooled_design(
             self, label, setup_name="Setup1", *, timeout_s=None, poll_s=None,
             clock=time.monotonic, sleeper=time.sleep):
-        """Dispatch one exact pooled solve and attest its own terminal result."""
+        """Run one exact pooled solve without leaving an AEDT macro in flight.
+
+        AEDT's native ``Analyze(..., False)`` is not merely a detached solver
+        dispatch.  The gRPC script macro can continue after that call returns,
+        and it still depends on Desktop-global active project/design state.  A
+        sibling lease is then able to acquire the automation lock, activate a
+        different project, and corrupt the first macro (``project is not
+        activated`` / incompatible calculator stack).  Keep the exact native
+        handle captured under the lock, suspend the lock only for the blocking
+        project-scoped Analyze call, then reacquire it before reading terminal
+        evidence.  Sibling native solves can still overlap while each caller
+        waits in its own blocking gRPC call; only unsafe asynchronous macros
+        are excluded.
+        """
 
         contracts = {
             "matrix": ("Maxwell 3D", "AC Magnetic"),
@@ -6217,19 +6230,26 @@ class Simulation():
             # suppresses project release, and lets the host quarantine safely.
             self.solver_may_be_running = True
             started = clock()
-            analyze_result = odesign.Analyze(setup_name, False)
+            # ``native_solve_window`` releases every nesting level of this
+            # lease's automation transaction, allowing sibling projects to
+            # model and start their own blocking native solves concurrently.
+            # It restores the lock before this context continues.
+            with self.aedt_native_solve_window():
+                analyze_result = odesign.Analyze(setup_name, True)
             if analyze_result is not None and (
                     type(analyze_result) is not int or analyze_result != 0):
                 raise RuntimeError(
-                    f"[{label}] native nonblocking Analyze returned invalid "
+                    f"[{label}] native blocking Analyze returned invalid "
                     f"status: {analyze_result!r}"
                 )
 
-        deadline = started + timeout_s
-        normal_completion = False
-        last_convergence_error = "normal completion has not been observed"
-        while True:
-            with self.aedt_automation_transaction():
+            deadline = started + timeout_s
+            normal_completion = False
+            last_convergence_error = "normal completion has not been observed"
+            while True:
+                # Analyze(blocking=True) has returned, so no AEDT script macro
+                # remains dependent on the active project while these exact
+                # postflight reads briefly reactivate this lease's design.
                 completed_project, completed_design = (
                     self._verified_pooled_native_setup(
                         setup_name=setup_name,
@@ -6281,21 +6301,25 @@ class Simulation():
                         self.solver_may_be_running = False
                         elapsed = max(0.0, clock() - started)
                         logging.info(
-                            "[%s] exact nonblocking terminal attestation: "
+                            "[%s] exact blocking terminal attestation: "
                             "passes=%s elapsed=%.3fs",
                             label, metrics.get("passes"), elapsed,
                         )
                         return elapsed
 
-            now = clock()
-            if now >= deadline:
-                raise TimeoutError(
-                    f"[{label}] timed out after {timeout_s:.1f}s waiting for "
-                    "exact project/design terminal evidence; "
-                    f"normal_completion={normal_completion}, "
-                    f"last_convergence_error={last_convergence_error}"
-                )
-            sleeper(min(poll_s, max(0.0, deadline - now)))
+                now = clock()
+                if now >= deadline:
+                    raise TimeoutError(
+                        f"[{label}] timed out after {timeout_s:.1f}s waiting for "
+                        "exact project/design terminal evidence; "
+                        f"normal_completion={normal_completion}, "
+                        f"last_convergence_error={last_convergence_error}"
+                    )
+                # Result/message files can flush shortly after a blocking call
+                # returns.  Do not hold the Desktop automation lock while
+                # waiting for that project-local evidence.
+                with self.aedt_native_solve_window():
+                    sleeper(min(poll_s, max(0.0, deadline - now)))
 
     def analyze_and_extract(self, label, extractor):
         """Analyze exactly once; result-query failures never justify another solve."""

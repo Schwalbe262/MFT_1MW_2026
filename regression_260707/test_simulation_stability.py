@@ -3203,7 +3203,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
                 simulation, ipk, setup, monitor_grace_s=0,
             )
 
-        analyze.assert_called_once_with("ThermalSetup", False)
+        analyze.assert_called_once_with("ThermalSetup", True)
         self.assertEqual(result["solve_attempts"], 1)
         self.assertEqual(result["convergence"]["thermal_converged"], 1)
         self.assertFalse(simulation.solver_may_be_running)
@@ -3248,7 +3248,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             "module.thermal_260706._thermal_convergence_telemetry",
             return_value=missing,
         ), self.assertRaisesRegex(
-            RuntimeError, "nonblocking Analyze returned invalid status"
+            RuntimeError, "blocking Analyze returned invalid status"
         ):
             _solve_exact_thermal_setup(
                 simulation, ipk, setup, monitor_grace_s=0,

@@ -1262,7 +1262,7 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(solve_project.active_calls, 1)
         self.assertEqual(
             solve_project.last_design.analyze_calls,
-            [("ThermalSetup", False)],
+            [("ThermalSetup", True)],
         )
         self.assertIs(ipk.oproject, extraction_project)
         self.assertEqual(postflight_project.active_calls, 1)

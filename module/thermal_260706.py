@@ -1017,12 +1017,14 @@ def _solve_exact_pooled_thermal_setup(
     timeout_s=None, monitor_grace_s=30.0, poll_s=None,
     clock=time.monotonic, sleeper=time.sleep,
 ):
-    """Nonblocking exact-design dispatch with fresh residual attestation.
+    """Blocking exact-design dispatch with fresh residual attestation.
 
     ``run_thermal_analysis`` already owns the session automation transaction.
-    Dispatch therefore happens while the exact project/design activation is
-    protected.  ``native_solve_window`` yields that outer lock while this loop
-    takes only short reactivation/message/monitor transactions.
+    Capture the exact design while that transaction is held, then suspend it
+    around ``Analyze(..., True)``.  This keeps sibling native solves parallel
+    without leaving an asynchronous AEDT script macro exposed to a sibling's
+    Desktop-global project activation.  The lock is restored before terminal
+    messages and residual artifacts are read.
     """
 
     timeout_s, poll_s = _pooled_thermal_poll_settings(timeout_s, poll_s)
@@ -1045,10 +1047,11 @@ def _solve_exact_pooled_thermal_setup(
 
     sim.solver_may_be_running = True
     started = clock()
-    returned = native_design.Analyze(setup_name, False)
+    with sim.aedt_native_solve_window():
+        returned = native_design.Analyze(setup_name, True)
     if returned is not None and (type(returned) is not int or returned != 0):
         raise RuntimeError(
-            "[thermal] native nonblocking Analyze returned invalid status: "
+            "[thermal] native blocking Analyze returned invalid status: "
             f"{returned!r}"
         )
 
@@ -1063,55 +1066,57 @@ def _solve_exact_pooled_thermal_setup(
         "converged", "residual_threshold", "monitor_malformed",
     }
 
-    # Yield every level of the caller's held transaction.  Each poll below
-    # reacquires it briefly and therefore cannot race a sibling's activation.
-    with sim.aedt_native_solve_window():
-        while True:
-            with sim.aedt_automation_transaction():
-                postflight = _prepare_thermal_dispatch(
-                    sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
-                    setup_name=setup_name,
-                )
-                terminal_postflight = postflight
-                update = advance_scoped_message_cursor(
-                    _thermal_desktop_handle(sim, ipk), message_cursor
-                )
-                message_cursor = update.cursor
-                if update.fatal_messages:
-                    evidence = " | ".join(update.fatal_messages[-6:])[:2000]
-                    raise RuntimeError(
-                        "[thermal] exact AEDT design reported a terminal error: "
-                        f"{evidence}"
-                    )
-                if update.normal_completion and not normal_completion:
-                    normal_seen_at = clock()
-                normal_completion = normal_completion or update.normal_completion
-                convergence = _thermal_convergence_telemetry(
-                    sim, postflight["native_ipk"], setup, attempts=1,
-                    monitor_snapshot=monitor_snapshot,
-                )
-                reason = convergence["thermal_convergence_reason"]
-                if normal_completion and reason in terminal_monitor_reasons:
-                    sim.solver_may_be_running = False
-                    sim.save_project()
-                    break
+    while True:
+        # The blocking Analyze macro is complete.  Exact project reactivation
+        # is now safe and remains protected by the caller's restored lock.
+        postflight = _prepare_thermal_dispatch(
+            sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
+            setup_name=setup_name,
+        )
+        terminal_postflight = postflight
+        update = advance_scoped_message_cursor(
+            _thermal_desktop_handle(sim, ipk), message_cursor
+        )
+        message_cursor = update.cursor
+        if update.fatal_messages:
+            evidence = " | ".join(update.fatal_messages[-6:])[:2000]
+            raise RuntimeError(
+                "[thermal] exact AEDT design reported a terminal error: "
+                f"{evidence}"
+            )
+        if update.normal_completion and not normal_completion:
+            normal_seen_at = clock()
+        normal_completion = normal_completion or update.normal_completion
+        convergence = _thermal_convergence_telemetry(
+            sim, postflight["native_ipk"], setup, attempts=1,
+            monitor_snapshot=monitor_snapshot,
+        )
+        reason = convergence["thermal_convergence_reason"]
+        if normal_completion and reason in terminal_monitor_reasons:
+            sim.solver_may_be_running = False
+            sim.save_project()
+            break
 
-            now = clock()
-            if normal_completion and normal_seen_at is not None \
-                    and now >= normal_seen_at + max(0.0, float(monitor_grace_s)):
-                # The exact Normal message proves this solver stopped, but a
-                # missing fresh residual artifact makes the thermal row invalid.
-                # Do not quarantine healthy siblings for an artifact failure.
-                sim.solver_may_be_running = False
-                break
-            if now >= deadline:
-                raise TimeoutError(
-                    "[thermal] timed out waiting for exact project/design "
-                    "Normal completion and a fresh residual monitor; "
-                    f"normal_completion={normal_completion}, "
-                    "reason="
-                    f"{convergence['thermal_convergence_reason']}"
-                )
+        now = clock()
+        if normal_completion and normal_seen_at is not None \
+                and now >= normal_seen_at + max(0.0, float(monitor_grace_s)):
+            # The exact Normal message proves this solver stopped, but a
+            # missing fresh residual artifact makes the thermal row invalid.
+            # Do not quarantine healthy siblings for an artifact failure.
+            sim.solver_may_be_running = False
+            break
+        if now >= deadline:
+            raise TimeoutError(
+                "[thermal] timed out waiting for exact project/design "
+                "Normal completion and a fresh residual monitor; "
+                f"normal_completion={normal_completion}, "
+                "reason="
+                f"{convergence['thermal_convergence_reason']}"
+            )
+        # The blocking macro has ended, so only release the transaction while
+        # waiting for message/result-file flush.  Each following postflight
+        # reacquires and re-attests the exact thermal design.
+        with sim.aedt_native_solve_window():
             sleeper(min(poll_s, max(0.0, deadline - now)))
 
     identity = {
@@ -1131,7 +1136,7 @@ def _solve_exact_pooled_thermal_setup(
         "monitor_file": str(convergence.get("thermal_monitor_file", ""))[:256],
         "aedt_messages": [],
         "identity": identity,
-        "blocking": False,
+        "blocking": True,
         "normal_completion": normal_completion,
     }]
     forensic_json = _thermal_forensic_json(attempts, convergence)
