@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 import re
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import pandas as pd
 
 from module import aedt_pool_adapter as adapter
 
@@ -683,7 +686,7 @@ def test_pooled_results_preclaim_exact_design_alias_and_reject_traversal(
     ("label", "solution_type"),
     (("matrix", "AC Magnetic"), ("cap", "Electrostatic"), ("loss", "AC Magnetic")),
 )
-def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
+def test_pooled_native_analyze_is_exact_nonblocking_and_attested_under_lock(
     monkeypatch, tmp_path, label, solution_type,
 ):
     from run_simulation_260706 import Simulation
@@ -726,9 +729,47 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
             return f"maxwell_{label}"
 
         def Analyze(self, setup_name, blocking):
-            assert lock_depth[0] == 0
+            assert lock_depth[0] > 0
             events.append(("analyze", setup_name, blocking))
+            desktop.completed = True
             return 0
+
+        def GetNominalVariation(self):
+            return ""
+
+        def ExportConvergence(self, setup_name, variation, path):
+            assert lock_depth[0] > 0
+            assert setup_name == "Setup1"
+            assert variation == ""
+            Path(path).write_text(
+                "Completed: 2\n"
+                "1 | 100 | 1.0 | 1.0 | N/A\n"
+                "2 | 200 | 1.0 | 0.5 | 0.5\n",
+                encoding="utf-8",
+            )
+            events.append("export-convergence")
+            return None
+
+    class Desktop:
+        completed = False
+
+        @staticmethod
+        def GetRegistryString(_key):
+            return "pyaedt_config"
+
+        def GetMessages(self, project_name, design_name, severity):
+            assert lock_depth[0] > 0
+            assert (project_name, design_name) == (
+                "mft-own", f"maxwell_{label}"
+            )
+            if severity == 2:
+                return []
+            values = ["pre-dispatch diagnostic"]
+            if self.completed:
+                values.append(
+                    "Normal completion of simulation on server: exact-node"
+                )
+            return values
 
     simulation = Simulation.__new__(Simulation)
     simulation.aedt_backend = "pooled"
@@ -736,6 +777,11 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
     simulation.PROJECT_NAME = "mft-own"
     simulation.project_path = str(workspace / simulation.PROJECT_NAME)
     simulation.design1 = SimpleNamespace(design_name=f"maxwell_{label}")
+    simulation.df_plus = pd.DataFrame({
+        "matrix_percent_error": [1.5],
+        "cap_percent_error": [1.0],
+        "percent_error": [1.5],
+    })
     simulation.solve_attempts = {"matrix": 0, "cap": 0, "loss": 0}
     simulation.solver_may_be_running = False
     simulation.pooled_activation_done = False
@@ -750,9 +796,8 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
         return project, design
 
     simulation._verified_pooled_native_setup = verify
-    simulation._native_desktop_handle = lambda: SimpleNamespace(
-        GetRegistryString=lambda _key: "pyaedt_config"
-    )
+    desktop = Desktop()
+    simulation._native_desktop_handle = lambda: desktop
     simulation.save_project = lambda strict=False: events.append(
         ("save-wrapper", strict)
     )
@@ -762,9 +807,9 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
 
     assert elapsed >= 0
     assert events[0] == "activate"
-    analyze_event = ("analyze", "Setup1", True)
+    analyze_event = ("analyze", "Setup1", False)
     assert analyze_event in events
-    assert events.index("lock-exit") < events.index(analyze_event)
+    assert events.index("lock-enter") < events.index(analyze_event)
     assert events.count(analyze_event) == 1
     assert events.count("lock-enter") == 2
     assert contracts == [
@@ -772,6 +817,7 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
             "setup_name": "Setup1",
             "expected_design_type": "Maxwell 3D",
             "expected_solution_type": solution_type,
+            "activate": True,
         },
         {
             "setup_name": "Setup1",
@@ -779,6 +825,7 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
             "expected_solution_type": solution_type,
             "project_refresh_max_attempts": 3,
             "project_refresh_retry_delay": 0.5,
+            "activate": True,
         },
     ]
     assert simulation.solve_attempts[label] == 1
@@ -791,3 +838,127 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
     )
     assert design_results.is_dir()
     assert design_results.stat().st_mode & 0o777 == 0o777
+
+
+class _FakeClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        return self.value
+
+    def sleep(self, seconds):
+        self.value += float(seconds)
+
+
+def _minimal_pooled_terminal_harness(*, normal=False, fatal=False, mismatch=False):
+    from run_simulation_260706 import Simulation
+
+    class Project:
+        def Save(self):
+            return None
+
+    class Design:
+        analyzed = False
+
+        def __init__(self, name="maxwell_matrix"):
+            self.name = name
+
+        def GetName(self):
+            return self.name
+
+        def Analyze(self, setup_name, blocking):
+            assert (setup_name, blocking) == ("Setup1", False)
+            self.analyzed = True
+            return 0
+
+    design = Design()
+    project = Project()
+
+    class Desktop:
+        @staticmethod
+        def GetRegistryString(_key):
+            return "pyaedt_config"
+
+        def GetMessages(self, project_name, design_name, severity):
+            assert (project_name, design_name) == ("own-project", "maxwell_matrix")
+            if severity == 2:
+                if design.analyzed and fatal:
+                    return ["Fatal solver process terminated"]
+                return []
+            values = ["pre-dispatch own-design message"]
+            if design.analyzed and normal:
+                values.append(
+                    "Normal completion of simulation on server: own-node"
+                )
+            return values
+
+    verify_calls = []
+
+    def verify(**kwargs):
+        verify_calls.append(kwargs)
+        if mismatch and len(verify_calls) > 1:
+            return project, Design("sibling-design")
+        return project, design
+
+    simulation = Simulation.__new__(Simulation)
+    simulation.aedt_backend = "pooled"
+    simulation.PROJECT_NAME = "own-project"
+    simulation.design1 = SimpleNamespace(design_name="maxwell_matrix")
+    simulation.solve_attempts = {"matrix": 0}
+    simulation.solver_may_be_running = False
+    simulation.pooled_activation_done = True
+    simulation.activate_pooled_for_solve = lambda: None
+    simulation.aedt_automation_transaction = lambda: nullcontext()
+    simulation._verified_pooled_native_setup = verify
+    simulation._native_desktop_handle = lambda: Desktop()
+    simulation._ensure_pooled_shared_results_directory = lambda *_args, **_kwargs: None
+    simulation._pooled_terminal_convergence_locked = Mock(return_value={
+        "passes": 2.0,
+    })
+    return simulation, design
+
+
+def test_pooled_valid_stale_convergence_is_not_terminal_without_new_normal():
+    simulation, design = _minimal_pooled_terminal_harness(normal=False)
+    clock = _FakeClock()
+
+    with pytest.raises(TimeoutError, match="terminal evidence"):
+        simulation._analyze_exact_pooled_design(
+            "matrix", timeout_s=1, poll_s=0.5,
+            clock=clock, sleeper=clock.sleep,
+        )
+
+    assert design.analyzed is True
+    # A valid pre-existing/stale result is irrelevant until a new exact-design
+    # Normal-completion message advances the pre-dispatch cursor.
+    simulation._pooled_terminal_convergence_locked.assert_not_called()
+    assert simulation.solver_may_be_running is True
+
+
+def test_pooled_terminal_design_mismatch_fails_closed_and_keeps_uncertainty():
+    simulation, _design = _minimal_pooled_terminal_harness(
+        normal=True, mismatch=True
+    )
+
+    with pytest.raises(RuntimeError, match="terminal-poll design identity mismatch"):
+        simulation._analyze_exact_pooled_design(
+            "matrix", timeout_s=1, poll_s=0,
+        )
+
+    simulation._pooled_terminal_convergence_locked.assert_not_called()
+    assert simulation.solver_may_be_running is True
+
+
+def test_pooled_new_exact_design_error_is_fatal_and_keeps_uncertainty():
+    simulation, _design = _minimal_pooled_terminal_harness(
+        normal=True, fatal=True
+    )
+
+    with pytest.raises(RuntimeError, match="exact AEDT design reported"):
+        simulation._analyze_exact_pooled_design(
+            "matrix", timeout_s=1, poll_s=0,
+        )
+
+    simulation._pooled_terminal_convergence_locked.assert_not_called()
+    assert simulation.solver_may_be_running is True

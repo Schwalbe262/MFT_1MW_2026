@@ -3078,9 +3078,24 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             modeler=SimpleNamespace(object_names=["tx_0", "tx_1"], obounding_box=[0] * 6),
             mesh=SimpleNamespace(meshoperations=[mesh_operation]),
         )
+        def scoped_messages(project_name, design_name, severity):
+            if (project_name, design_name) != (
+                    "simulation_test", "icepak_thermal"):
+                return ["Normal completion of simulation on server: sibling"]
+            if severity == 2:
+                return []
+            messages = ["Icepak startup diagnostic"]
+            from module.aedt_pool_adapter import pooled_backend_enabled
+            if pooled_backend_enabled() and analyze.called:
+                messages.append(
+                    "Normal completion of simulation on server: thermal-node"
+                )
+            return messages
+
         desktop = SimpleNamespace(
             AreThereSimulationsRunning=Mock(return_value=False),
-            GetMessages=Mock(return_value=["Icepak startup diagnostic"]),
+            GetMessages=Mock(side_effect=scoped_messages),
+            SetActiveProject=Mock(return_value=native_project),
         )
         rebind = Mock(return_value=native_project)
         simulation = SimpleNamespace(
@@ -3091,6 +3106,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             _ensure_pooled_shared_results_directory=Mock(),
             save_project=Mock(),
             aedt_native_solve_window=lambda: nullcontext(),
+            aedt_automation_transaction=lambda: nullcontext(),
         )
         setup = SimpleNamespace(name="ThermalSetup", props={
             "Enabled": enabled,
@@ -3187,10 +3203,16 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
                 simulation, ipk, setup, monitor_grace_s=0,
             )
 
-        analyze.assert_called_once_with("ThermalSetup", True)
+        analyze.assert_called_once_with("ThermalSetup", False)
         self.assertEqual(result["solve_attempts"], 1)
         self.assertEqual(result["convergence"]["thermal_converged"], 1)
         self.assertFalse(simulation.solver_may_be_running)
+        desktop = simulation._native_desktop_handle.return_value
+        self.assertGreaterEqual(desktop.SetActiveProject.call_count, 2)
+        for message_call in desktop.GetMessages.call_args_list:
+            self.assertEqual(
+                message_call.args[:2], ("simulation_test", "icepak_thermal")
+            )
 
     def test_pooled_thermal_preflight_failure_is_project_local(self):
         simulation, ipk, setup, analyze, _rebind = self._harness(
@@ -3226,7 +3248,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             "module.thermal_260706._thermal_convergence_telemetry",
             return_value=missing,
         ), self.assertRaisesRegex(
-            RuntimeError, "pooled thermal native solve state is uncertain"
+            RuntimeError, "nonblocking Analyze returned invalid status"
         ):
             _solve_exact_thermal_setup(
                 simulation, ipk, setup, monitor_grace_s=0,
@@ -3252,7 +3274,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             "module.thermal_260706._thermal_convergence_telemetry",
             return_value=malformed,
         ), self.assertRaisesRegex(
-            RuntimeError, "pooled thermal native solve state is uncertain"
+            RuntimeError, "native analyze transport failed"
         ):
             _solve_exact_thermal_setup(
                 simulation, ipk, setup, monitor_grace_s=0,
