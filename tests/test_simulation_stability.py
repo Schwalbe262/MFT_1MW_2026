@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+from ansys.aedt.core.internal.errors import GrpcApiError
 
 from run_simulation_260706 import Simulation
 
@@ -250,6 +251,91 @@ def _simulation(tmp_path, backend):
     )
     simulation.design1 = design
     return simulation, app, design, project_path
+
+
+def test_pooled_project_refresh_retries_only_transient_getprojects_grpc(
+        tmp_path, caplog):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    native_desktop = simulation.desktop.odesktop
+    expected_project = native_desktop.projects[0]
+    effects = [
+        GrpcApiError("transient enumeration one"),
+        GrpcApiError("transient enumeration two"),
+        [expected_project],
+    ]
+    calls = []
+    sleeps = []
+
+    def get_projects():
+        calls.append(True)
+        effect = effects.pop(0)
+        if isinstance(effect, BaseException):
+            raise effect
+        return effect
+
+    native_desktop.GetProjects = get_projects
+
+    with caplog.at_level("WARNING"):
+        refreshed = simulation._refresh_native_project_handle(
+            get_projects_max_attempts=3,
+            get_projects_retry_delay=0.5,
+            sleeper=sleeps.append,
+        )
+
+    assert refreshed is expected_project
+    assert len(calls) == 3
+    assert sleeps == [0.5, 1.0]
+    assert simulation.project.project is expected_project
+    assert simulation.project.proj is expected_project
+    assert caplog.text.count("GetProjects transient gRPC failure") == 2
+
+
+def test_pooled_project_refresh_does_not_retry_non_grpc_getprojects_error(
+        tmp_path):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    calls = []
+    sleeps = []
+
+    def get_projects():
+        calls.append(True)
+        raise RuntimeError("non-gRPC enumeration failure")
+
+    simulation.desktop.odesktop.GetProjects = get_projects
+
+    with pytest.raises(RuntimeError, match="non-gRPC enumeration failure"):
+        simulation._refresh_native_project_handle(
+            get_projects_max_attempts=3,
+            sleeper=sleeps.append,
+        )
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_pooled_project_refresh_does_not_retry_identity_absence(tmp_path):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    sibling_design = _FakeNativeDesign("simulation_sibling", "maxwell_matrix")
+    sibling_project = _FakeNativeProject("simulation_sibling", sibling_design)
+    calls = []
+    sleeps = []
+
+    def get_projects():
+        calls.append(True)
+        return [sibling_project]
+
+    simulation.desktop.odesktop.GetProjects = get_projects
+
+    with pytest.raises(
+            RuntimeError,
+            match="expected one live pooled AEDT project named 'simulation_own', found 0",
+    ):
+        simulation._refresh_native_project_handle(
+            get_projects_max_attempts=3,
+            sleeper=sleeps.append,
+        )
+
+    assert len(calls) == 1
+    assert sleeps == []
 
 
 def test_pooled_close_skips_stale_cleanup_and_releases_exact_lease(

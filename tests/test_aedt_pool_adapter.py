@@ -765,6 +765,7 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
     analyze_event = ("analyze", "Setup1", True)
     assert analyze_event in events
     assert events.index("lock-exit") < events.index(analyze_event)
+    assert events.count(analyze_event) == 1
     assert events.count("lock-enter") == 2
     assert contracts == [
         {
@@ -776,6 +777,8 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
             "setup_name": "Setup1",
             "expected_design_type": "Maxwell 3D",
             "expected_solution_type": solution_type,
+            "project_refresh_max_attempts": 3,
+            "project_refresh_retry_delay": 0.5,
         },
     ]
     assert simulation.solve_attempts[label] == 1

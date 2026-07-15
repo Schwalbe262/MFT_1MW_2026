@@ -137,6 +137,7 @@ from module.aedt_pool_adapter import (
 )
 
 from ansys.aedt.core import settings
+from ansys.aedt.core.internal.errors import GrpcApiError
 
 settings.skip_license_check = True
 settings.wait_for_license = False
@@ -4138,9 +4139,14 @@ class Simulation():
         message = f"[{extraction_key}] result extraction failed after {max_attempts} attempts: {last_error}"
         raise RuntimeError(message)
 
-    def _refresh_native_project_handle(self):
+    def _refresh_native_project_handle(
+            self, *, get_projects_max_attempts=1,
+            get_projects_retry_delay=0.5, sleeper=time.sleep):
         """Return a fresh exact-project handle without cross-project activation."""
         if self._backend_mode() == "pooled":
+            get_projects_max_attempts = int(get_projects_max_attempts)
+            if get_projects_max_attempts < 1:
+                raise ValueError("GetProjects max_attempts must be positive")
             expected_project = str(
                 getattr(self, "PROJECT_NAME", "") or ""
             ).strip()
@@ -4157,9 +4163,26 @@ class Simulation():
             get_projects = getattr(odesktop, "GetProjects", None)
             if not callable(get_projects):
                 raise RuntimeError("native pooled Desktop cannot enumerate projects")
+            projects = None
+            for attempt in range(1, get_projects_max_attempts + 1):
+                try:
+                    projects = get_projects() or []
+                    break
+                except GrpcApiError as error:
+                    if attempt >= get_projects_max_attempts:
+                        raise
+                    logging.warning(
+                        "native pooled Desktop GetProjects transient gRPC "
+                        f"failure (attempt {attempt}/{get_projects_max_attempts}): "
+                        f"{error}"
+                    )
+                    sleeper(
+                        max(0.0, float(get_projects_retry_delay))
+                        * (2 ** (attempt - 1))
+                    )
             matches = []
             project_errors = []
-            for index, candidate in enumerate(get_projects() or []):
+            for index, candidate in enumerate(projects):
                 try:
                     candidate_name = str(candidate.GetName() or "").strip()
                 except Exception as error:
@@ -5611,7 +5634,9 @@ class Simulation():
 
     def _verified_pooled_native_setup(
             self, setup_name="Setup1", *, design_name="",
-            expected_design_type="Maxwell 3D", expected_solution_type="AC Magnetic"):
+            expected_design_type="Maxwell 3D", expected_solution_type="AC Magnetic",
+            project_refresh_max_attempts=1,
+            project_refresh_retry_delay=0.5):
         """Resolve one exact pooled setup without Desktop active state."""
         expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
         expected_design = _aedt_design_name(design_name) or _aedt_design_name(
@@ -5619,7 +5644,10 @@ class Simulation():
         if not expected_project or not expected_design:
             raise RuntimeError("native analysis project/design identity is unavailable")
 
-        oproject = self._refresh_native_project_handle()
+        oproject = self._refresh_native_project_handle(
+            get_projects_max_attempts=project_refresh_max_attempts,
+            get_projects_retry_delay=project_refresh_retry_delay,
+        )
         actual_project = str(oproject.GetName() or "").strip()
         if actual_project != expected_project:
             raise _AedtIdentityMismatch(
@@ -6096,6 +6124,8 @@ class Simulation():
                 setup_name=setup_name,
                 expected_design_type=expected_design_type,
                 expected_solution_type=expected_solution_type,
+                project_refresh_max_attempts=3,
+                project_refresh_retry_delay=0.5,
             )
             self.save_project(strict=True)
             self._ensure_pooled_shared_results_directory(
