@@ -3088,6 +3088,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             NUM_CORE=4,
             _rebind_native_project_for_design_creation=rebind,
             _native_desktop_handle=Mock(return_value=desktop),
+            _ensure_pooled_shared_results_directory=Mock(),
             save_project=Mock(),
             aedt_native_solve_window=lambda: nullcontext(),
         )

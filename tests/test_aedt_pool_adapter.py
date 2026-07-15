@@ -410,12 +410,132 @@ def test_pooled_project_name_uses_task_and_pool_wide_lease_identity(
     assert Path(simulation.project_path).parent == workspace.resolve()
 
 
+def _pooled_results_harness(tmp_path):
+    from run_simulation_260706 import Simulation
+
+    workspace = tmp_path / "lease-workspace"
+    workspace.mkdir()
+    simulation = Simulation.__new__(Simulation)
+    simulation.aedt_backend = "pooled"
+    simulation.PROJECT_NAME = "mft-own"
+    simulation.aedt_lease = SimpleNamespace(workspace_path=str(workspace))
+    simulation.project_path = str(workspace / simulation.PROJECT_NAME)
+    return simulation, workspace
+
+
+def test_pooled_project_preclaims_world_writable_results_before_aedt_create(
+    tmp_path,
+):
+    simulation, workspace = _pooled_results_harness(tmp_path)
+    observed = []
+
+    class Desktop:
+        def create_project(self, *, path, name):
+            results = Path(path) / f"{name}.aedtresults"
+            observed.append((results.is_dir(), results.stat().st_mode & 0o777))
+            return SimpleNamespace(name=name)
+
+    simulation.desktop = Desktop()
+
+    simulation._create_project_locked()
+
+    results = workspace / "mft-own" / "mft-own.aedtresults"
+    assert observed == [(True, 0o777)]
+    assert results.is_dir()
+    assert results.stat().st_mode & 0o777 == 0o777
+
+
+def test_pooled_project_postcheck_rejects_aedt_replacing_results_with_file(
+    tmp_path,
+):
+    simulation, _workspace = _pooled_results_harness(tmp_path)
+
+    class Desktop:
+        def create_project(self, *, path, name):
+            results = Path(path) / f"{name}.aedtresults"
+            assert results.is_dir()
+            results.rmdir()
+            results.write_text("replaced", encoding="utf-8")
+            return SimpleNamespace(name=name)
+
+    simulation.desktop = Desktop()
+
+    with pytest.raises(RuntimeError, match="not a plain directory"):
+        simulation._create_project_locked()
+
+
+def test_pooled_results_reject_project_outside_lease_workspace(tmp_path):
+    simulation, _workspace = _pooled_results_harness(tmp_path)
+    outside = tmp_path / "outside" / simulation.PROJECT_NAME
+    simulation.project_path = str(outside)
+
+    with pytest.raises(RuntimeError, match="outside its lease workspace"):
+        simulation._ensure_pooled_shared_results_directory()
+
+    assert not outside.exists()
+
+
+def test_standalone_results_helper_has_no_filesystem_side_effect(tmp_path):
+    from run_simulation_260706 import Simulation
+
+    simulation = Simulation.__new__(Simulation)
+    simulation.aedt_backend = "standalone"
+    simulation.PROJECT_NAME = "standalone-own"
+    simulation.project_path = str(tmp_path / "must-not-exist")
+    simulation.aedt_lease = None
+
+    assert simulation._ensure_pooled_shared_results_directory(
+        "maxwell_matrix"
+    ) is None
+    assert not Path(simulation.project_path).exists()
+
+
+def test_pooled_results_permission_failure_is_fail_closed(tmp_path, monkeypatch):
+    simulation, _workspace = _pooled_results_harness(tmp_path)
+    original_chmod = os.chmod
+
+    def deny_results_chmod(path, mode):
+        if str(path).endswith(".aedtresults"):
+            raise PermissionError("cross-account owner mismatch")
+        return original_chmod(path, mode)
+
+    monkeypatch.setattr(os, "chmod", deny_results_chmod)
+
+    with pytest.raises(
+        RuntimeError, match="failed to prepare cross-account pooled AEDT results"
+    ):
+        simulation._ensure_pooled_shared_results_directory()
+
+
+def test_pooled_results_preclaim_exact_design_alias_and_reject_traversal(
+    tmp_path,
+):
+    simulation, workspace = _pooled_results_harness(tmp_path)
+
+    alias = simulation._ensure_pooled_shared_results_directory(
+        "maxwell_matrix"
+    )
+
+    expected = (
+        workspace
+        / "mft-own"
+        / "mft-own.aedtresults"
+        / "maxwell_matrix"
+    )
+    assert Path(alias) == expected
+    assert expected.is_dir()
+    assert expected.stat().st_mode & 0o777 == 0o777
+    with pytest.raises(RuntimeError, match="unsafe pooled shared-results"):
+        simulation._ensure_pooled_shared_results_directory("../sibling")
+    assert not (workspace / "mft-own" / "sibling").exists()
+
+
 @pytest.mark.parametrize(
     ("label", "solution_type"),
     (("matrix", "AC Magnetic"), ("cap", "Electrostatic"), ("loss", "AC Magnetic")),
 )
 def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
-    monkeypatch, label, solution_type,
+    monkeypatch, tmp_path, label, solution_type,
 ):
     from run_simulation_260706 import Simulation
 
@@ -436,8 +556,12 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
             events.append("lock-exit")
             lock_depth[0] -= 1
 
+    workspace = tmp_path / "lease-workspace"
+    workspace.mkdir()
+
     class Lease:
         protocol_version = 2
+        workspace_path = str(workspace)
 
         def automation_guard(self):
             return Guard()
@@ -449,6 +573,9 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
             return None
 
     class Design:
+        def GetName(self):
+            return f"maxwell_{label}"
+
         def Analyze(self, setup_name, blocking):
             assert lock_depth[0] == 0
             events.append(("analyze", setup_name, blocking))
@@ -458,6 +585,7 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
     simulation.aedt_backend = "pooled"
     simulation.aedt_lease = Lease()
     simulation.PROJECT_NAME = "mft-own"
+    simulation.project_path = str(workspace / simulation.PROJECT_NAME)
     simulation.design1 = SimpleNamespace(design_name=f"maxwell_{label}")
     simulation.solve_attempts = {"matrix": 0, "cap": 0, "loss": 0}
     simulation.solver_may_be_running = False
@@ -503,3 +631,11 @@ def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
     ]
     assert simulation.solve_attempts[label] == 1
     assert simulation.solver_may_be_running is False
+    design_results = (
+        workspace
+        / "mft-own"
+        / "mft-own.aedtresults"
+        / f"maxwell_{label}"
+    )
+    assert design_results.is_dir()
+    assert design_results.stat().st_mode & 0o777 == 0o777

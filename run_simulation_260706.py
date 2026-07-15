@@ -28,6 +28,7 @@ import argparse
 import uuid
 import tempfile
 import time
+import stat
 
 _PROCESS_STARTED_MONOTONIC = time.monotonic()
 _PROCESS_STARTED_EPOCH_S = time.time()
@@ -2039,6 +2040,145 @@ class Simulation():
         with self.aedt_automation_transaction():
             return self._create_project_locked()
 
+    @staticmethod
+    def _shared_aedt_path_component(value, label):
+        """Return one safe AEDT filesystem component or fail closed."""
+
+        try:
+            component = os.fsdecode(os.fspath(value)).strip()
+        except TypeError as error:
+            raise RuntimeError(
+                f"pooled shared-results {label} is unavailable"
+            ) from error
+        if (
+                not component
+                or component in {".", ".."}
+                or "\x00" in component
+                or "/" in component
+                or "\\" in component):
+            raise RuntimeError(
+                f"unsafe pooled shared-results {label}: {component!r}"
+            )
+        return component
+
+    @staticmethod
+    def _shared_aedt_plain_directory(path, label):
+        """Attest a real directory without following a final symlink."""
+
+        try:
+            metadata = os.lstat(path)
+        except OSError as error:
+            raise RuntimeError(
+                f"pooled shared-results {label} is unavailable: {path}"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(
+                f"pooled shared-results {label} is not a plain directory: {path}"
+            )
+        return metadata
+
+    def _ensure_pooled_shared_results_directory(self, design_name=""):
+        """Preclaim one cross-account AEDT results directory with mode 0777.
+
+        Pooled clients and the long-lived AEDT process can have different UIDs.
+        AEDT 2025.2 creates ``.aedtresults`` directories as 0755 even when its
+        process umask is 000, while PyAEDT SolutionData creates a temporary
+        directory directly below that root.  The client therefore owns and
+        attests the root before AEDT first saves the project, and preclaims the
+        exact native design alias before every solve.
+        """
+
+        if self._backend_mode() != "pooled":
+            return None
+
+        project_name = self._shared_aedt_path_component(
+            getattr(self, "PROJECT_NAME", ""), "project name"
+        )
+        lease = getattr(self, "aedt_lease", None)
+        raw_workspace = getattr(lease, "workspace_path", "")
+        raw_project_path = getattr(self, "project_path", None)
+        try:
+            workspace_path = os.path.abspath(
+                os.fsdecode(os.fspath(raw_workspace)).strip()
+            )
+            project_path = os.path.abspath(
+                os.fsdecode(os.fspath(raw_project_path)).strip()
+            )
+        except TypeError as error:
+            raise RuntimeError(
+                "pooled shared-results workspace/project path is unavailable"
+            ) from error
+        if not str(raw_workspace or "").strip() or not str(
+                raw_project_path or "").strip():
+            raise RuntimeError(
+                "pooled shared-results workspace/project path is unavailable"
+            )
+
+        self._shared_aedt_plain_directory(workspace_path, "workspace")
+        workspace_real = os.path.realpath(workspace_path)
+        project_real = os.path.realpath(project_path)
+        try:
+            contained = (
+                os.path.commonpath((workspace_real, project_real))
+                == workspace_real
+            )
+        except ValueError:
+            contained = False
+        if not contained or project_real == workspace_real:
+            raise RuntimeError(
+                "pooled shared-results project path is outside its lease "
+                f"workspace: project={project_path!r}, workspace={workspace_path!r}"
+            )
+
+        results_root = os.path.join(
+            project_path, f"{project_name}.aedtresults"
+        )
+        target = results_root
+        if design_name:
+            design_component = self._shared_aedt_path_component(
+                design_name, "design name"
+            )
+            target = os.path.join(results_root, design_component)
+
+        try:
+            os.makedirs(project_path, mode=0o777, exist_ok=True)
+            self._shared_aedt_plain_directory(project_path, "project directory")
+            if os.path.lexists(results_root):
+                self._shared_aedt_plain_directory(results_root, "results root")
+            else:
+                os.makedirs(results_root, mode=0o777, exist_ok=False)
+            self._shared_aedt_plain_directory(results_root, "results root")
+            os.chmod(results_root, 0o777)
+            if target != results_root:
+                if os.path.lexists(target):
+                    self._shared_aedt_plain_directory(
+                        target, "design results alias"
+                    )
+                else:
+                    os.makedirs(target, mode=0o777, exist_ok=False)
+                self._shared_aedt_plain_directory(target, "design results alias")
+                os.chmod(target, 0o777)
+        except RuntimeError:
+            raise
+        except OSError as error:
+            raise RuntimeError(
+                "failed to prepare cross-account pooled AEDT results "
+                f"directory: {target}"
+            ) from error
+
+        attested_directories = [(results_root, "results root")]
+        if target != results_root:
+            attested_directories.append((target, "design results alias"))
+        for path, label in attested_directories:
+            metadata = self._shared_aedt_plain_directory(path, label)
+            actual_mode = stat.S_IMODE(metadata.st_mode)
+            if actual_mode != 0o777:
+                raise RuntimeError(
+                    f"pooled shared-results {label} mode is not 0777: "
+                    f"path={path}, mode={actual_mode:04o}"
+                )
+        return target
+
     def _create_project_locked(self):
 
         simulation_dir = "./simulation"
@@ -2052,7 +2192,12 @@ class Simulation():
             raise RuntimeError("Desktop instance is None. Cannot create project.")
 
         try:
+            # Preclaim before AEDT's first SaveAs, then re-attest immediately
+            # afterwards.  If AEDT deletes/replaces the client-owned root, the
+            # postcheck fails before modeling or solving consumes more quota.
+            self._ensure_pooled_shared_results_directory()
             self.project = self.desktop.create_project(path=self.project_path, name=self.PROJECT_NAME)
+            self._ensure_pooled_shared_results_directory()
         except Exception as e:
             error_msg = f"Failed to create project '{self.PROJECT_NAME}' at path '{self.project_path}': {e}\n"
             print(error_msg, file=sys.stderr)
@@ -5740,9 +5885,14 @@ class Simulation():
                     "pooled session DSO profile mismatch: "
                     f"expected='pyaedt_config', actual={active_dso!r}"
                 )
+            design_alias = _aedt_design_name(odesign)
+            self._ensure_pooled_shared_results_directory(design_alias)
             saved = oproject.Save()
             if saved is False:
                 raise RuntimeError("native project Save returned False before solve")
+            # Save can create or replace AEDT result metadata.  Re-attest at
+            # the last point before yielding the automation lock and Analyze.
+            self._ensure_pooled_shared_results_directory(design_alias)
 
         self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
         self.solver_may_be_running = True
@@ -5768,12 +5918,15 @@ class Simulation():
             # Fresh read-only enumeration proves that the completed call still
             # belongs to this project even if siblings changed the GUI's active
             # project while the native solver was running.
-            self._verified_pooled_native_setup(
+            _oproject, completed_design = self._verified_pooled_native_setup(
                 setup_name=setup_name,
                 expected_design_type=expected_design_type,
                 expected_solution_type=expected_solution_type,
             )
             self.save_project(strict=True)
+            self._ensure_pooled_shared_results_directory(
+                _aedt_design_name(completed_design)
+            )
         return elapsed
 
     def analyze_and_extract(self, label, extractor):

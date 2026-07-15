@@ -794,10 +794,24 @@ def _solve_exact_thermal_setup(
     convergence = None
     previous_snapshot = None
     for requested_attempt in range(1, 3):
+        from module.aedt_pool_adapter import pooled_backend_enabled
+
+        pooled_backend = pooled_backend_enabled()
         preflight = _prepare_thermal_dispatch(
             sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
             setup_name=setup_name,
         )
+        if pooled_backend:
+            prepare_results = getattr(
+                sim, "_ensure_pooled_shared_results_directory", None
+            )
+            if not callable(prepare_results):
+                raise RuntimeError(
+                    "pooled thermal shared-results preparation is unavailable"
+                )
+            # This runs while the caller still owns the project automation
+            # transaction and before native Analyze yields it to siblings.
+            prepare_results(str(preflight["design"]))
 
         # Close the small gap between the first grace poll and a permitted retry.
         # A delayed first-attempt monitor is authoritative and prevents dispatch 2.
@@ -824,9 +838,6 @@ def _solve_exact_thermal_setup(
         returned = None
         exception_type = ""
         exception_message = ""
-        from module.aedt_pool_adapter import pooled_backend_enabled
-
-        pooled_backend = pooled_backend_enabled()
         try:
             analyze_kwargs = {"setup": setup_name, "blocking": True}
             if not pooled_backend:
