@@ -3,7 +3,7 @@ import math
 import os
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -18,6 +18,18 @@ class _Object:
         self.name = name
         self.is3d = True
         self.volume = volume
+
+
+class _NoLiveDimensionObject:
+    """Object identity whose editor-backed dimension must never be queried."""
+
+    def __init__(self, name, volume=1.0):
+        self.name = name
+        self.volume = volume
+
+    @property
+    def is3d(self):
+        raise AssertionError("post-solve Object3d.is3d query is forbidden")
 
 
 class _Material:
@@ -51,6 +63,7 @@ class _Boundary:
 class _DesignHandle:
     def __init__(self, name):
         self._name = name
+        self.analyze_calls = []
 
     def GetName(self):
         return self._name
@@ -62,6 +75,10 @@ class _DesignHandle:
         if name == "AnalysisSetup":
             return SimpleNamespace(GetSetups=lambda: ["ThermalSetup"])
         return SimpleNamespace()
+
+    def Analyze(self, setup_name, blocking):
+        self.analyze_calls.append((setup_name, blocking))
+        return 0
 
 
 class _ProjectHandle:
@@ -77,6 +94,15 @@ class _ProjectHandle:
         self.active_calls += 1
         self.last_design = _DesignHandle(name)
         return self.last_design
+
+
+class _SingleActivationProjectHandle(_ProjectHandle):
+    """Models a native project proxy that becomes stale while Analyze runs."""
+
+    def SetActiveDesign(self, name):
+        if self.active_calls:
+            raise RuntimeError("stale q7 project proxy reused after native solve")
+        return super().SetActiveDesign(name)
 
 
 class _Setup:
@@ -207,13 +233,19 @@ class _Icepak:
             create_field_summary=lambda: _FieldSummary(self),
             get_scalar_field_value=self._get_scalar_field_value,
         )
-        self.oproject = _ProjectHandle()
+        self._oproject = _ProjectHandle()
         self.odesktop = SimpleNamespace(
             AreThereSimulationsRunning=lambda: False,
             GetMessages=lambda *_args: [],
         )
         self._odesign = _DesignHandle("stale_design")
         self.design_solutions = SimpleNamespace(_odesign=self._odesign)
+
+    @property
+    def oproject(self):
+        # PyAEDT exposes the native project through its refreshed private
+        # handle; model that indirection so a postflight rebind is observable.
+        return self._oproject
 
     def _get_scalar_field_value(self, _quantity, **kwargs):
         key = (kwargs["object_name"], kwargs["scalar_function"])
@@ -297,6 +329,10 @@ class ThermalStabilityTest(unittest.TestCase):
         tx_count=1,
         scalar_responses=None,
         core_k_anisotropic=1,
+        pooled=False,
+        rebind_sequence=None,
+        object_factory=None,
+        probe_factory=None,
     ):
         ipk = _Icepak(
             analyze_result,
@@ -307,7 +343,10 @@ class ThermalStabilityTest(unittest.TestCase):
         )
         wrapper = _DesignWrapper(ipk)
         project = SimpleNamespace(create_design=lambda **_kwargs: wrapper)
-        rebind_project = Mock(return_value=_ProjectHandle("thermal_test"))
+        if rebind_sequence is None:
+            rebind_project = Mock(return_value=_ProjectHandle("thermal_test"))
+        else:
+            rebind_project = Mock(side_effect=list(rebind_sequence))
         sim = SimpleNamespace(
             project=project,
             _rebind_native_project_for_design_creation=rebind_project,
@@ -327,21 +366,28 @@ class ThermalStabilityTest(unittest.TestCase):
             NUM_CORE=4,
             PROJECT_NAME="thermal_test",
             save_project=Mock(),
+            _ensure_pooled_shared_results_directory=Mock(),
+            aedt_native_solve_window=Mock(return_value=nullcontext()),
+            solver_may_be_running=False,
         )
-        side = [_Object("Rx_side_0")] if include_side else []
+        object_factory = object_factory or _Object
+        probe_factory = probe_factory or (
+            lambda name: SimpleNamespace(name=name, is3d=False)
+        )
+        side = [object_factory("Rx_side_0")] if include_side else []
         objects = {
-            "Tx": [_Object(f"Tx_main_{index}") for index in range(tx_count)],
-            "Rx_main_explicit": [_Object("Rx_main_0")],
+            "Tx": [object_factory(f"Tx_main_{index}") for index in range(tx_count)],
+            "Rx_main_explicit": [object_factory("Rx_main_0")],
             "Rx_main_blocks": [],
             "Rx_side_explicit": side,
             "Rx_side_blocks": [],
             "Rx_side2_explicit": [],
             "Rx_side2_blocks": [],
-            "core": [_Object("core_1")],
+            "core": [object_factory("core_1")],
             "wcp_pads": [],
             "core_pads": [],
         }
-        probe_sheets = [SimpleNamespace(name=name, is3d=False) for name in probe_names]
+        probe_sheets = [probe_factory(name) for name in probe_names]
 
         def record_mock_power_balance(_ipk, target_sim, _objects, **_kwargs):
             target_sim.thermal_rx_model = "hybrid_explicit"
@@ -370,6 +416,11 @@ class ThermalStabilityTest(unittest.TestCase):
             return {}
 
         with ExitStack() as stack:
+            from module import aedt_pool_adapter
+
+            stack.enter_context(patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=pooled
+            ))
             stack.enter_context(patch.object(thermal, "set_design_variables"))
             stack.enter_context(patch.object(thermal, "_create_thermal_materials"))
             stack.enter_context(patch.object(thermal, "_build_geometry", return_value=objects))
@@ -422,6 +473,7 @@ class ThermalStabilityTest(unittest.TestCase):
             result = thermal.run_thermal_analysis(sim)
         ipk.telemetry_mock = telemetry
         ipk.sleep_mock = sleeper
+        ipk.rebind_project_mock = rebind_project
         self.assertGreaterEqual(rebind_project.call_count, 2)
         return ipk, result.iloc[0]
 
@@ -855,7 +907,7 @@ class ThermalStabilityTest(unittest.TestCase):
                 self.assertEqual(row["thermal_required_group_mask"], 11)
                 self.assertEqual(row["thermal_required_group_count"], 3)
                 self.assertTrue(math.isnan(row["T_max_Rx_side"]))
-                self.assertEqual(ipk.oproject.active_calls, 2)
+                self.assertEqual(ipk.oproject.active_calls, 3)
                 self.assertIs(ipk._odesign, ipk.oproject.last_design)
                 self.assertIs(ipk.design_solutions._odesign, ipk.oproject.last_design)
                 self.assertFalse(
@@ -867,6 +919,81 @@ class ThermalStabilityTest(unittest.TestCase):
                 )
                 self.assertEqual(ipk.setup.props["Convergence Criteria - Flow"], "0.001")
                 self.assertEqual(ipk.setup.props["Convergence Criteria - Energy"], "1e-07")
+
+    def test_pooled_q7_stale_solve_project_is_rebound_before_extraction(self):
+        complete = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+        }
+        initial_project = _ProjectHandle("thermal_test")
+        solve_project = _SingleActivationProjectHandle("thermal_test")
+        postflight_project = _ProjectHandle("thermal_test")
+
+        ipk, row = self._run(
+            None,
+            [complete],
+            pooled=True,
+            rebind_sequence=[
+                initial_project,
+                solve_project,
+                postflight_project,
+            ],
+        )
+
+        self.assertEqual(row["thermal_solved"], 1)
+        self.assertEqual(row["thermal_extraction_complete"], 1)
+        self.assertEqual(ipk.rebind_project_mock.call_count, 3)
+        self.assertEqual(solve_project.active_calls, 1)
+        self.assertEqual(
+            solve_project.last_design.analyze_calls,
+            [("ThermalSetup", True)],
+        )
+        self.assertIs(ipk.oproject, postflight_project)
+        self.assertEqual(postflight_project.active_calls, 2)
+
+    def test_post_solve_extraction_never_queries_object_dimension_proxy(self):
+        complete = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+            "Tprobe_Tx_side": (86.0, 74.0),
+        }
+
+        _ipk, row = self._run(
+            None,
+            [complete],
+            n1_side=1,
+            probe_names=["Tprobe_Tx_side"],
+            object_factory=_NoLiveDimensionObject,
+            probe_factory=_NoLiveDimensionObject,
+        )
+
+        self.assertEqual(row["thermal_solved"], 1)
+        self.assertEqual(row["thermal_extraction_complete"], 1)
+        self.assertEqual(row["Tprobe_Tx_side_max"], 86.0)
+        self.assertEqual(row["T_max_core"], 91.0)
+
+    def test_post_solve_rebind_failure_is_explicit_and_fail_closed(self):
+        complete = {
+            "Tx_main_0": (81.0, 70.0),
+            "Rx_main_0": (88.0, 72.0),
+            "core_1": (91.0, 75.0),
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "thermal post-solve exact project/design rebind failed",
+        ):
+            self._run(
+                None,
+                [complete],
+                rebind_sequence=[
+                    _ProjectHandle("thermal_test"),
+                    _ProjectHandle("thermal_test"),
+                    RuntimeError("q7 exact project is no longer available"),
+                ],
+            )
 
     def test_false_with_missing_monitor_retries_once_and_accepts_fresh_convergence(self):
         complete = {
@@ -970,7 +1097,7 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(row["T_max_core"], 91.0)
         self.assertTrue(math.isnan(row["T_max_Rx_main"]))
         self.assertEqual(row["thermal_calculator_attempts"], 0)
-        self.assertEqual(ipk.oproject.active_calls, 4)
+        self.assertEqual(ipk.oproject.active_calls, 5)
 
     def test_one_missing_modeled_tx_turn_invalidates_tx_group(self):
         missing_second_tx = {

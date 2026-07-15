@@ -2218,10 +2218,17 @@ def run_thermal_analysis(sim):
     # 프로브 시트 (회귀학습용 주력 데이터: 위치 고정, 보간값이라 메시 스파이크에 강함)
     # + 그룹별 체적 평균/최대
     temps = {}
+    # Object3d instances retain the editor proxy that was active when geometry
+    # was built.  A pooled native solve deliberately yields the Desktop lock,
+    # so siblings can switch or close projects before thermal extraction
+    # resumes.  Preserve only immutable extraction identity and the geometry
+    # dimension known at creation time; never ask a pre-solve Object3d for
+    # ``is3d`` after that boundary.
     probe = []
     for s in probe_sheets:
-        probe.append((s, f"{s.name}_max", "max"))
-        probe.append((s, f"{s.name}_mean", "mean"))
+        name = str(s.name)
+        probe.append((name, False, f"{name}_max", "max"))
+        probe.append((name, False, f"{name}_mean", "mean"))
     actual_probe_sheet_names = [sheet.name for sheet in probe_sheets]
     expected_probe_sheet_names = list(getattr(
         probe_sheets, "expected_names", actual_probe_sheet_names
@@ -2231,8 +2238,9 @@ def run_thermal_analysis(sim):
                 + objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
                 + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"] + objs["core"])
     for o in vol_objs:
-        probe.append((o, f"T_mean_{o.name}", "mean"))
-        probe.append((o, f"T_max_{o.name}", "max"))
+        name = str(o.name)
+        probe.append((name, True, f"T_mean_{name}", "mean"))
+        probe.append((name, True, f"T_max_{name}", "max"))
 
     expected_probe_cols = [
         f"{name}_{stat}"
@@ -2240,7 +2248,7 @@ def run_thermal_analysis(sim):
         for stat in ("max", "mean")
     ]
     field_expected_cols = list(dict.fromkeys(
-        [col for _, col, _ in probe] + expected_probe_cols
+        [col for _, _, col, _ in probe] + expected_probe_cols
     ))
     core_region_sheet_names = {
         "center": [
@@ -2296,13 +2304,19 @@ def run_thermal_analysis(sim):
         optional_cols.update({"Tprobe_Tx_side_max", "Tprobe_Tx_side_mean"})
     required_expected_cols = [col for col in expected_cols if col not in optional_cols]
     group_objects = {
-        "T_max_Tx": list(objs["Tx"]),
-        "T_max_Rx_main": list(objs["Rx_main_explicit"] + objs["Rx_main_blocks"]),
-        "T_max_Rx_side": list(
-            objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
-            + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"]
-        ),
-        "T_max_core": list(objs["core"]),
+        "T_max_Tx": [str(obj.name) for obj in objs["Tx"]],
+        "T_max_Rx_main": [
+            str(obj.name)
+            for obj in objs["Rx_main_explicit"] + objs["Rx_main_blocks"]
+        ],
+        "T_max_Rx_side": [
+            str(obj.name)
+            for obj in (
+                objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
+                + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"]
+            )
+        ],
+        "T_max_core": [str(obj.name) for obj in objs["core"]],
     }
     group_bits = {
         "T_max_Tx": 1,
@@ -2390,9 +2404,26 @@ def run_thermal_analysis(sim):
         sim.df_thermal = pd.DataFrame(summary)
         return sim.df_thermal
 
-    native_ipk = _native_solver(ipk)
+    # Analyze yielded the pooled Desktop automation lock for the full native
+    # solve.  Cached project/design child proxies are therefore no longer
+    # authoritative even when the Desktop itself is healthy.  Re-enumerate
+    # this lease's exact project and re-attest the Icepak design/setup before
+    # any post-processing call can touch those proxies.
     try:
-        _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
+        postflight = _prepare_thermal_dispatch(
+            sim,
+            ipk,
+            setup,
+            design_name=_THERMAL_DESIGN_NAME,
+            setup_name=_THERMAL_SETUP_NAME,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "thermal post-solve exact project/design rebind failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    native_ipk = postflight["native_ipk"]
+    try:
         solution = native_ipk.existing_analysis_sweeps[0]
     except Exception:
         solution = "ThermalSetup : SteadyState"
@@ -2410,14 +2441,15 @@ def run_thermal_analysis(sim):
     def _field_summary_bulk(entries):
         fs = _post_of(native_ipk).create_field_summary()
         seen = set()
-        for obj, col, op in entries:
-            is3d = getattr(obj, "is3d", True)
-            key = (obj.name, is3d)
+        for name, is_volume, _col, _op in entries:
+            key = (name, is_volume)
             if key in seen:
                 continue
             seen.add(key)
-            fs.add_calculation("Object", "Volume" if is3d else "Surface",
-                               obj.name, "Temperature")
+            fs.add_calculation(
+                "Object", "Volume" if is_volume else "Surface",
+                name, "Temperature"
+            )
         df_fs = fs.get_field_summary_data(setup=solution, pandas_output=True)
         if df_fs is None or isinstance(df_fs, bool) or not hasattr(df_fs, "columns") or not len(df_fs):
             raise RuntimeError(f"field summary returned {type(df_fs).__name__} (no data)")
@@ -2426,8 +2458,8 @@ def run_thermal_analysis(sim):
         name_c = cols.get("geometry name", cols.get("entity name", list(df_fs.columns)[2]))
         unit_c = cols.get("unit", cols.get("units"))
         got = {}
-        for obj, col, op in entries:
-            row = df_fs[df_fs[name_c].astype(str) == str(obj.name)]
+        for name, _is_volume, col, op in entries:
+            row = df_fs[df_fs[name_c].astype(str) == name]
             if not len(row):
                 field_summary_issues[col] = "entity_not_returned"
                 continue
@@ -2445,7 +2477,7 @@ def run_thermal_analysis(sim):
                 )[:512]
         return got
 
-    def _scalar_probe_temperature(obj, op):
+    def _scalar_probe_temperature(name, op):
         """Independent saved-field fallback, deliberately limited to sheets."""
         post = _post_of(native_ipk)
         getter = getattr(post, "get_scalar_field_value", None)
@@ -2455,7 +2487,7 @@ def run_thermal_analysis(sim):
             "Temp",
             scalar_function="Maximum" if op == "max" else "Mean",
             solution=solution,
-            object_name=obj.name,
+            object_name=name,
             object_type="surface",
         )
         return parse_temperature_celsius(value)
@@ -2516,7 +2548,7 @@ def run_thermal_analysis(sim):
 
     field_summary_attempts = 0
     for attempt in range(1, 4):
-        missing_entries = [entry for entry in probe if entry[1] not in temps]
+        missing_entries = [entry for entry in probe if entry[2] not in temps]
         if not missing_entries:
             break
         field_summary_attempts = attempt
@@ -2542,13 +2574,13 @@ def run_thermal_analysis(sim):
     # readable.  Use the replay-proven scalar API only for missing probe-sheet
     # statistics.  Never replace a missing modeled-volume maximum with a probe:
     # that case indicates a genuine zero-mesh-volume thermal failure.
-    for obj, col, op in probe:
-        if col in temps or col in optional_cols or getattr(obj, "is3d", True):
+    for name, is_volume, col, op in probe:
+        if col in temps or col in optional_cols or is_volume:
             continue
         calc_attempts += 1
         try:
             _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
-            temps[col] = _scalar_probe_temperature(obj, op)
+            temps[col] = _scalar_probe_temperature(name, op)
             n_calc += 1
         except Exception as exc:
             scalar_probe_issues[col] = (
@@ -2592,10 +2624,10 @@ def run_thermal_analysis(sim):
         f"(required-column failures={len(required_missing_cols)})"
     )
 
-    def _group_max(group_objects):
+    def _group_max(group_names):
         # A partial maximum can silently understate component temperature. Require
         # every modeled maximum for the physical group before emitting its summary.
-        cols = list(dict.fromkeys(f"T_max_{obj.name}" for obj in group_objects))
+        cols = list(dict.fromkeys(f"T_max_{name}" for name in group_names))
         vals = [temps[col] for col in cols if col in temps and math.isfinite(float(temps[col]))]
         return max(vals) if cols and len(vals) == len(cols) else float("nan")
 
