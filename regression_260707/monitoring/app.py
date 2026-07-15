@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -16,7 +17,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from filelock import FileLock
 
-from .readers import TARGETS, ArtifactService, SchedulerReader
+from .readers import (
+    TARGETS,
+    ArtifactService,
+    SchedulerReader,
+    SimulationPolicyConflict,
+)
 
 
 HERE = Path(__file__).resolve().parent
@@ -26,6 +32,19 @@ if not _LOCALAPPDATA:
     _LOCALAPPDATA = str(Path.home() / "AppData" / "Local")
 CAMPAIGN_MUTATION_LOCK_PATH = (
     Path(_LOCALAPPDATA) / "MFT_1MW_2026" / "campaign-mutation.lock")
+TRUSTED_OPERATOR_LAN = ip_network("192.168.0.0/24")
+DEFAULT_OPERATOR_HOSTS = ("localhost", "127.0.0.1", "::1")
+LOGGER = logging.getLogger(__name__)
+
+
+def _operator_host_allowlist() -> frozenset[str]:
+    configured = os.environ.get("MFT_MONITOR_OPERATOR_HOSTS", "")
+    values = configured.split(",") if configured.strip() else DEFAULT_OPERATOR_HOSTS
+    return frozenset(
+        value.strip().lower().removeprefix("[").removesuffix("]")
+        for value in values
+        if value.strip()
+    )
 
 
 def create_app(
@@ -53,13 +72,14 @@ def create_app(
 
     app = FastAPI(
         title="MFT 1MW Campaign Monitor",
-        description="Project dashboard for MFT campaign status and bounded local operator control.",
-        version="1.1.0",
+        description="Project dashboard for MFT campaign status and bounded trusted-LAN operator control.",
+        version="1.2.0",
         docs_url="/api/docs",
         redoc_url=None,
     )
     app.state.service = service
     app.state.regression_root = root
+    app.state.operator_host_allowlist = _operator_host_allowlist()
     templates = Jinja2Templates(directory=str(HERE / "templates"))
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 
@@ -94,28 +114,34 @@ def create_app(
             )
 
     def require_local_operator_request(request: Request) -> None:
-        """Keep the one mutation endpoint loopback-only and CSRF-resistant."""
+        """Permit bounded trusted-LAN operation while resisting Host/CSRF abuse."""
         client_host = request.client.host if request.client else ""
         try:
-            if not ip_address(client_host).is_loopback:
-                raise ValueError("not loopback")
+            client_address = ip_address(client_host)
+            mapped = getattr(client_address, "ipv4_mapped", None)
+            if mapped is not None:
+                client_address = mapped
+            if not (
+                client_address.is_loopback
+                or client_address in TRUSTED_OPERATOR_LAN
+            ):
+                raise ValueError("outside trusted operator network")
         except ValueError as exc:
             raise HTTPException(
                 status_code=403,
-                detail="operator control is available only from localhost",
+                detail=(
+                    "operator control is available only from loopback or "
+                    "192.168.0.0/24"
+                ),
             ) from exc
         host_header = request.headers.get("host", "").strip()
         host_name = urlsplit(f"//{host_header}").hostname or ""
-        if host_name.lower() != "localhost":
-            try:
-                if not ip_address(host_name).is_loopback:
-                    raise ValueError("host is not loopback")
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=403,
-                    detail="operator control Host must be localhost",
-                ) from exc
-        if request.headers.get("x-mft-operator-control") != "parallel-target-v1":
+        if host_name.lower() not in app.state.operator_host_allowlist:
+            raise HTTPException(
+                status_code=403,
+                detail="operator control Host is not allowlisted",
+            )
+        if request.headers.get("x-mft-operator-control") != "simulation-policy-v1":
             raise HTTPException(status_code=403, detail="operator control header is required")
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -200,8 +226,8 @@ def create_app(
     async def api_history():
         return await invoke(service.history, "history")
 
-    @app.patch("/api/operator/parallel-target")
-    async def api_set_parallel_target(request: Request):
+    @app.patch("/api/operator/simulation-policy")
+    async def api_set_simulation_policy(request: Request):
         require_local_operator_request(request)
         try:
             payload = await request.json()
@@ -209,14 +235,20 @@ def create_app(
             raise HTTPException(status_code=400, detail="request body must be JSON") from exc
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="request body must be a JSON object")
-        target = payload.get("target")
-        if type(target) is not int or not 1 <= target <= 300:
-            raise HTTPException(
-                status_code=422,
-                detail="target must be an integer between 1 and 300",
-            )
+        target = payload.get("desired_simulations")
+        expected_revision = payload.get("expected_revision")
+        if type(target) is not int:
+            raise HTTPException(status_code=422, detail="desired_simulations must be an integer")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, (int, str))
+            or not str(expected_revision).strip()
+        ):
+            raise HTTPException(status_code=422, detail="expected_revision is required")
+        if payload.get("scale_down_mode") != "drain":
+            raise HTTPException(status_code=422, detail="scale_down_mode must be drain")
         scheduler = getattr(service, "scheduler", None)
-        setter = getattr(scheduler, "set_parallel_target", None)
+        setter = getattr(scheduler, "set_simulation_policy", None)
         if not callable(setter):
             raise HTTPException(status_code=503, detail="scheduler operator control is unavailable")
         try:
@@ -225,9 +257,42 @@ def create_app(
                     parents=True, exist_ok=True)
                 with FileLock(
                         str(CAMPAIGN_MUTATION_LOCK_PATH), timeout=15 * 60):
-                    return setter(target)
+                    current = scheduler.snapshot()
+                    if current.get("policy_supported") is not True:
+                        raise RuntimeError(
+                            current.get("control_gate_reason")
+                            or "scheduler simulation-policy is unavailable"
+                        )
+                    if current.get("control_enabled") is not True:
+                        raise PermissionError(
+                            current.get("control_gate_reason")
+                            or "scheduler simulation-policy is gated"
+                        )
+                    if current.get("policy_revision") != expected_revision:
+                        raise SimulationPolicyConflict(
+                            "simulation policy changed; refresh and retry"
+                        )
+                    minimum = current.get("parallel_target_min")
+                    maximum = current.get("parallel_target_max")
+                    if (
+                        type(minimum) is not int
+                        or type(maximum) is not int
+                        or not minimum <= target <= maximum
+                    ):
+                        raise ValueError(
+                            f"desired_simulations must be between {minimum} and {maximum}"
+                        )
+                    return setter(
+                        target, expected_revision=expected_revision
+                    )
 
             result = await run_in_threadpool(set_under_campaign_lock)
+        except SimulationPolicyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=423, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
@@ -235,8 +300,17 @@ def create_app(
                 status_code=502,
                 detail=f"scheduler target update failed: {type(exc).__name__}: {exc}",
             ) from exc
+        LOGGER.info(
+            "simulation_policy_update source=%s project=%s expected_revision=%s "
+            "new_revision=%s desired_simulations=%s",
+            request.client.host if request.client else "",
+            result.get("project"),
+            expected_revision,
+            result.get("policy_revision"),
+            target,
+        )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "updated": True,
             **result,
         }

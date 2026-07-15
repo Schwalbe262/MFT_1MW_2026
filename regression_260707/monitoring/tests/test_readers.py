@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pandas as pd
 import pytest
@@ -22,6 +22,7 @@ from regression_260707.monitoring.readers import (
     RuntimeRecorder,
     SafeArtifactCache,
     SchedulerReader,
+    SimulationPolicyConflict,
     TARGET_META,
     TEMPERATURE_TARGETS,
     _campaign_frame_summary,
@@ -1344,10 +1345,18 @@ def test_scheduler_uses_aggregate_summary_and_exact_project_status():
             return FakeResponse({"name_prefix": "mft", "total": 9, "statuses": {"running": 4, "completed": 3, "failed": 2}})
         return FakeResponse({
             "name": "MFT_1MW_2026v1",
-            "max_active_tasks": 300,
+            "max_active_tasks": 510,
+            "desired_simulations": 500,
+            "effective_simulations": 480,
+            "validated_concurrency_limit": 500,
+            "min_desired_simulations": 0,
+            "max_desired_simulations": 500,
+            "policy_revision": 12,
+            "scale_down_mode": "drain",
             "queued_count": 7,
             "attaching_count": 2,
             "executing_count": 4,
+            "solving_count": 3,
             "logical_active_count": 13,
             "updated_at": "2026-07-13T01:00:00+09:00",
         })
@@ -1356,17 +1365,74 @@ def test_scheduler_uses_aggregate_summary_and_exact_project_status():
     assert result["connected"] is True
     assert result["running"] == 4
     assert result["total"] == 9
-    assert result["parallel_target"] == 300
+    assert result["parallel_target"] == 500
+    assert result["effective_simulations"] == 480
+    assert result["validated_concurrency_limit"] == 500
+    assert result["policy_revision"] == 12
     assert result["live_queued"] == 7
     assert result["live_attaching"] == 2
-    assert result["live_running"] == 4
-    assert result["logical_active"] == 13
+    assert result["live_active"] == 4
+    assert result["live_solving"] == 3
+    assert result["logical_active"] == 6
     assert result["control_enabled"] is True
     assert calls[0][1] == "GET"
     assert "/api/tasks/summary?" in calls[0][0]
     assert "/api/tasks?" not in calls[0][0]
     assert calls[1][1] == "GET"
     assert calls[1][0].endswith("/api/projects/MFT_1MW_2026v1")
+    assert calls[2][1] == "GET"
+    assert calls[2][0].endswith(
+        "/api/projects/MFT_1MW_2026v1/simulation-policy"
+    )
+
+
+def test_scheduler_legacy_cap_above_300_remains_visible_but_not_mutable():
+    def opener(request, timeout):
+        if "/api/tasks/summary?" in request.full_url:
+            return FakeResponse({"total": 9, "statuses": {"running": 4}})
+        return FakeResponse({
+            "name": "MFT_1MW_2026v1",
+            "max_active_tasks": 510,
+            "queued_count": 3,
+            "attaching_count": 2,
+            "executing_count": 4,
+        })
+
+    result = SchedulerReader(
+        base_url="http://legacy.test", opener=opener, ttl=0
+    ).snapshot()
+
+    assert result["connected"] is True
+    assert result["legacy_project_cap"] == 510
+    assert result["logical_active"] == 6
+    assert result["policy_supported"] is False
+    assert result["control_enabled"] is False
+    assert result["parallel_target"] is None
+    assert "durable simulation-policy" in result["control_gate_reason"]
+
+
+def test_scheduler_policy_allows_bounded_repair_of_legacy_desired_510():
+    control = SchedulerReader(base_url="http://repair.test")._simulation_policy_control({
+        "project": "MFT_1MW_2026v1",
+        "desired_simulations": 510,
+        "effective_simulations": 500,
+        "validated_concurrency_limit": 510,
+        "min_desired_simulations": 0,
+        "max_desired_simulations": 500,
+        "policy_revision": 4,
+        "scale_down_mode": "drain",
+        "queued_count": 10,
+        "attaching_count": 2,
+        "active_count": 6,
+        "solving_count": 4,
+        "logical_active_count": 6,
+    })
+
+    assert control["desired_simulations"] == 510
+    assert control["parallel_target_max"] == 500
+    assert control["live_active"] == 4
+    assert control["logical_active"] == 6
+    assert control["control_enabled"] is True
 
 
 def test_scheduler_normalizes_aedt_pool_and_license_attach_status():
@@ -1561,13 +1627,38 @@ def test_scheduler_optional_attach_endpoint_failure_is_section_local(
                 "total": 4,
                 "statuses": {"running": 4},
             })
+        if request.full_url.endswith(
+                "/api/projects/MFT_1MW_2026v1/simulation-policy"):
+            return FakeResponse({
+                "project": "MFT_1MW_2026v1",
+                "desired_simulations": 300,
+                "effective_simulations": 300,
+                "validated_concurrency_limit": 500,
+                "min_desired_simulations": 0,
+                "max_desired_simulations": 500,
+                "policy_revision": 3,
+                "scale_down_mode": "drain",
+                "queued_count": 0,
+                "attaching_count": 0,
+                "active_count": 4,
+                "solving_count": 4,
+                "logical_active_count": 4,
+                "control_enabled": True,
+            })
         if request.full_url.endswith("/api/projects/MFT_1MW_2026v1"):
             return FakeResponse({
                 "name": "MFT_1MW_2026v1",
                 "max_active_tasks": 300,
+                "desired_simulations": 300,
+                "effective_simulations": 300,
+                "validated_concurrency_limit": 500,
+                "min_desired_simulations": 0,
+                "max_desired_simulations": 500,
+                "policy_revision": 3,
                 "queued_count": 0,
                 "attaching_count": 0,
                 "executing_count": 4,
+                "solving_count": 4,
                 "logical_active_count": 4,
             })
         if request.full_url.endswith("/api/aedt-pool"):
@@ -1739,18 +1830,24 @@ def test_scheduler_aedt_attach_marks_stale_license_snapshot_degraded():
     assert attach["errors"] == ["showing the last good snapshot"]
 
 
-def test_scheduler_parallel_target_uses_cap_only_patch_and_exact_readback():
+def test_scheduler_simulation_policy_uses_versioned_drain_patch_and_exact_readback():
     calls = []
 
     def opener(request, timeout):
         calls.append((request.full_url, request.get_method(), request.data, timeout))
         return FakeResponse({
             "name": "MFT_1MW_2026v1",
-            "max_active_tasks": 275,
+            "desired_simulations": 500,
+            "effective_simulations": 275,
+            "validated_concurrency_limit": 500,
+            "min_desired_simulations": 0,
+            "max_desired_simulations": 500,
+            "policy_revision": 18,
+            "scale_down_mode": "drain",
             "queued_count": 200,
             "attaching_count": 5,
-            "executing_count": 70,
-            "logical_active_count": 275,
+            "active_count": 70,
+            "solving_count": 65,
             "updated_at": "2026-07-13T01:05:00+09:00",
             "repos": [{"url": "must-not-be-sent"}],
             "setup": "must-not-be-sent",
@@ -1758,17 +1855,22 @@ def test_scheduler_parallel_target_uses_cap_only_patch_and_exact_readback():
         })
 
     reader = SchedulerReader(base_url="http://example.test", opener=opener, ttl=60)
-    result = reader.set_parallel_target(275)
+    result = reader.set_simulation_policy(500, expected_revision=17)
 
-    assert result["parallel_target"] == 275
-    assert result["logical_active"] == 275
+    assert result["parallel_target"] == 500
+    assert result["effective_simulations"] == 275
+    assert result["logical_active"] == 75
     assert len(calls) == 1
-    assert calls[0][0].endswith("/api/projects/MFT_1MW_2026v1/max-active-tasks")
+    assert calls[0][0].endswith("/api/projects/MFT_1MW_2026v1/simulation-policy")
     assert calls[0][1] == "PATCH"
-    assert json.loads(calls[0][2].decode("utf-8")) == {"max_active_tasks": 275}
+    assert json.loads(calls[0][2].decode("utf-8")) == {
+        "desired_simulations": 500,
+        "expected_revision": 17,
+        "scale_down_mode": "drain",
+    }
 
 
-def test_scheduler_parallel_target_rejects_invalid_value_before_request():
+def test_scheduler_simulation_policy_rejects_invalid_value_before_request():
     calls = []
 
     def opener(request, timeout):
@@ -1776,10 +1878,21 @@ def test_scheduler_parallel_target_rejects_invalid_value_before_request():
         raise AssertionError("invalid target must not reach scheduler")
 
     reader = SchedulerReader(base_url="http://example.test", opener=opener)
-    for invalid in (0, 301, -1, 1.5, True, "300"):
+    for invalid in (601, -1, 1.5, True, "300"):
         with pytest.raises(ValueError):
-            reader.set_parallel_target(invalid)
+            reader.set_simulation_policy(invalid, expected_revision=1)
+    with pytest.raises(ValueError):
+        reader.set_simulation_policy(300, expected_revision=None)
     assert calls == []
+
+
+def test_scheduler_simulation_policy_maps_revision_conflict():
+    def opener(request, timeout):
+        raise HTTPError(request.full_url, 409, "conflict", {}, None)
+
+    reader = SchedulerReader(base_url="http://example.test", opener=opener)
+    with pytest.raises(SimulationPolicyConflict):
+        reader.set_simulation_policy(500, expected_revision=17)
 
 
 def test_scheduler_disables_control_when_runtime_lacks_exact_live_count_fields():
@@ -1802,7 +1915,7 @@ def test_scheduler_disables_control_when_runtime_lacks_exact_live_count_fields()
     assert result["connected"] is True
     assert result["control_enabled"] is False
     assert result["parallel_target"] is None
-    assert result["logical_active"] == 9
+    assert result["logical_active"] == 6
     assert "live counts" in result["project_error"]
 
 

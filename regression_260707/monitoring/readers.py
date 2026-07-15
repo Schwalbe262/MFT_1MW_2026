@@ -83,8 +83,12 @@ RESONANCE_FIELDS = {
     "rx_self": "f_res_rx_self_Hz",
     "interwinding": "f_res_interwinding_Hz",
 }
-PARALLEL_TARGET_MIN = 1
-PARALLEL_TARGET_MAX = 300
+# The scheduler owns the authoritative bounds.  These values are used only
+# while an older scheduler has no simulation-policy capability to advertise.
+# Keep the fallback in one place so the UI never grows its own competing cap.
+DEFAULT_PARALLEL_TARGET_MIN = 0
+DEFAULT_PARALLEL_TARGET_MAX = 500
+PARALLEL_TARGET_SAFETY_CEILING = 600
 NODE_LOCAL_AEDT_PROJECT = "_aedt_pool_hosts"
 NODE_LOCAL_AEDT_ENTRYPOINT = "aedt_node_canary_host"
 NODE_LOCAL_AEDT_ACTIVE_STATES = ("queued", "attaching", "running")
@@ -1226,8 +1230,12 @@ class RefillControllerReader:
             return {"available": False}
 
 
+class SimulationPolicyConflict(RuntimeError):
+    """The scheduler rejected a stale simulation-policy revision."""
+
+
 class SchedulerReader:
-    """Bounded adapter for MFT scheduler status and project-cap control."""
+    """Adapter for MFT scheduler status and durable simulation policy."""
 
     def __init__(
         self,
@@ -1670,62 +1678,258 @@ class SchedulerReader:
             "errors": errors,
         }
 
-    def _project_control(self, project: Any) -> dict[str, Any]:
+    @classmethod
+    def _first_count(cls, *values: Any) -> int | None:
+        for value in values:
+            parsed = cls._nonnegative_integer(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _validate_project_identity(self, project: Any) -> dict[str, Any]:
         if not isinstance(project, dict):
             raise ValueError("scheduler project response is invalid")
-        if str(project.get("name") or "").strip() != self.project_name:
+        name = str(project.get("project") or project.get("name") or "").strip()
+        if name != self.project_name:
             raise ValueError("scheduler returned a different project")
-        target = project.get("max_active_tasks")
-        if type(target) is not int or not PARALLEL_TARGET_MIN <= target <= PARALLEL_TARGET_MAX:
-            raise ValueError("scheduler project parallel target is invalid")
-        count_fields = {
-            "queued": project.get("queued_count"),
-            "attaching": project.get("attaching_count"),
-            "running": project.get("executing_count"),
-            "logical_active": project.get("logical_active_count"),
-        }
-        if any(type(value) is not int or value < 0 for value in count_fields.values()):
+        return project
+
+    def _project_status(self, project: Any) -> dict[str, Any]:
+        """Normalize project counters without treating its safety cap as demand."""
+        project = self._validate_project_identity(project)
+        queued = self._first_count(project.get("queued_count"))
+        attaching = self._first_count(project.get("attaching_count"))
+        active = self._first_count(
+            project.get("active_count"), project.get("executing_count")
+        )
+        solving = self._first_count(project.get("solving_count"), active)
+        if any(value is None for value in (queued, attaching, active, solving)):
             raise ValueError("scheduler project live counts are unavailable or invalid")
-        queued = count_fields["queued"]
-        attaching = count_fields["attaching"]
-        running = count_fields["running"]
-        logical_active = count_fields["logical_active"]
-        if logical_active != queued + attaching + running:
-            raise ValueError("scheduler project logical active count is inconsistent")
         return {
             "project": self.project_name,
-            "parallel_target": target,
-            "parallel_target_min": PARALLEL_TARGET_MIN,
-            "parallel_target_max": PARALLEL_TARGET_MAX,
-            "live_queued": max(0, queued),
-            "live_attaching": max(0, attaching),
-            "live_running": max(0, running),
-            "logical_active": max(0, logical_active),
+            "live_queued": queued,
+            "live_attaching": attaching,
+            "live_active": active,
+            "live_solving": solving,
+            # Compatibility for older dashboard consumers.
+            "live_running": active,
+            # Desired concurrency excludes work that is merely queued.
+            "logical_active": attaching + active,
+            "legacy_project_cap": self._first_count(project.get("max_active_tasks")),
             "project_updated_at": project.get("updated_at"),
         }
 
-    def set_parallel_target(self, target: int) -> dict[str, Any]:
-        """Set only the MFT project cap; task cancellation belongs to its controller."""
-        if type(target) is not int or not PARALLEL_TARGET_MIN <= target <= PARALLEL_TARGET_MAX:
-            raise ValueError(
-                f"parallel target must be an integer between "
-                f"{PARALLEL_TARGET_MIN} and {PARALLEL_TARGET_MAX}"
+    def _simulation_policy_control(
+        self,
+        policy: Any,
+        *,
+        project: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Normalize the scheduler's versioned, durable desired-concurrency policy."""
+        if not isinstance(policy, dict):
+            raise ValueError("scheduler simulation policy response is invalid")
+        combined = {**(project or {}), **policy}
+        self._validate_project_identity(combined)
+        limits = combined.get("limits")
+        limits = limits if isinstance(limits, dict) else {}
+        desired_min = self._first_count(
+            combined.get("min_desired_simulations"),
+            combined.get("desired_simulations_min"),
+            limits.get("min_desired_simulations"),
+            limits.get("minimum"),
+            DEFAULT_PARALLEL_TARGET_MIN,
+        )
+        desired_max = self._first_count(
+            combined.get("max_desired_simulations"),
+            combined.get("desired_simulations_max"),
+            limits.get("max_desired_simulations"),
+            limits.get("maximum"),
+            DEFAULT_PARALLEL_TARGET_MAX,
+        )
+        validated = self._first_count(
+            combined.get("validated_concurrency_limit"),
+            limits.get("validated_concurrency_limit"),
+        )
+        desired = self._first_count(combined.get("desired_simulations"))
+        effective = self._first_count(combined.get("effective_simulations"))
+        if desired_min is None or desired_max is None or desired_min > desired_max:
+            raise ValueError("scheduler simulation policy bounds are invalid")
+        if desired_max > PARALLEL_TARGET_SAFETY_CEILING:
+            raise ValueError("scheduler simulation policy exceeds the MFT safety ceiling")
+        if (
+            validated is None
+            or not desired_min <= validated <= PARALLEL_TARGET_SAFETY_CEILING
+        ):
+            raise ValueError("scheduler validated concurrency limit is invalid")
+        # Accept a legacy desired value above a newly lowered capability so an
+        # operator can repair it through the bounded UI.  The next value is
+        # still limited to parallel_target_max below.
+        if (
+            desired is None
+            or not desired_min <= desired <= PARALLEL_TARGET_SAFETY_CEILING
+        ):
+            raise ValueError("scheduler desired simulation count is invalid")
+        if effective is not None and effective > desired_max:
+            raise ValueError("scheduler effective simulation count is invalid")
+        revision = combined.get("policy_revision")
+        if isinstance(revision, bool) or not isinstance(revision, (int, str)):
+            raise ValueError("scheduler simulation policy revision is invalid")
+        if (isinstance(revision, int) and revision < 0) or not str(revision).strip():
+            raise ValueError("scheduler simulation policy revision is invalid")
+
+        counts = combined.get("counts")
+        counts = counts if isinstance(counts, dict) else {}
+        queued = self._first_count(
+            combined.get("queued_simulations"), combined.get("queued_count"),
+            counts.get("queued"),
+        )
+        attaching = self._first_count(
+            combined.get("attaching_simulations"), combined.get("attaching_count"),
+            counts.get("attaching"),
+        )
+        active = self._first_count(
+            combined.get("active_simulations"), combined.get("active_count"),
+            combined.get("executing_count"), counts.get("active"),
+        )
+        solving = self._first_count(
+            combined.get("solving_simulations"), combined.get("solving_count"),
+            counts.get("solving"), active,
+        )
+        reported_logical = self._first_count(
+            combined.get("logical_active_simulations"),
+            combined.get("logical_active_count"),
+            counts.get("logical_active"),
+        )
+        if project is not None:
+            status = self._project_status(project)
+            queued = status["live_queued"] if queued is None else queued
+            attaching = status["live_attaching"] if attaching is None else attaching
+            active = status["live_active"] if active is None else active
+            solving = status["live_solving"] if solving is None else solving
+        if any(value is None for value in (queued, attaching, active, solving)):
+            raise ValueError("scheduler simulation policy live counts are unavailable")
+        # Compatibility with the first policy API revision, where active_count
+        # was accidentally emitted as attaching+solving.  The explicit logical
+        # total makes that wire shape unambiguous and keeps UI semantics stable.
+        if reported_logical == active and attaching > 0 and solving <= active:
+            active = max(solving, active - attaching)
+        if solving > active:
+            raise ValueError("scheduler solving count exceeds active count")
+
+        raw_constraint = combined.get("resource_constraint")
+        if isinstance(raw_constraint, dict):
+            constraint = {
+                str(key): value for key, value in raw_constraint.items()
+                if isinstance(key, str) and value is not None
+            }
+        elif raw_constraint is None:
+            constraint = None
+        else:
+            constraint = {"reason": _safe_text(raw_constraint, 500)}
+        gate_reason = (
+            _optional_text(combined.get("control_gate_reason"), 500)
+            or _optional_text(combined.get("gate_reason"), 500)
+            or (
+                _optional_text(constraint.get("reason"), 500)
+                if isinstance(constraint, dict) else None
             )
+        )
+        scheduler_control_enabled = combined.get("control_enabled")
+        control_enabled = (
+            scheduler_control_enabled
+            if type(scheduler_control_enabled) is bool else True
+        )
+        if not control_enabled and not gate_reason:
+            gate_reason = "scheduler가 simulation-policy 변경을 잠갔습니다"
+        return {
+            "project": self.project_name,
+            "policy_supported": True,
+            "control_enabled": control_enabled,
+            "read_only": not control_enabled,
+            "parallel_target": desired,
+            "desired_simulations": desired,
+            "effective_simulations": effective,
+            "validated_concurrency_limit": validated,
+            "parallel_target_min": desired_min,
+            # An operator may only select a concurrency level that has passed
+            # the scheduler rollout gate, even if the configured safety cap is higher.
+            "parallel_target_max": min(desired_max, validated),
+            "configured_target_max": desired_max,
+            "policy_revision": revision,
+            "scale_down_mode": str(
+                combined.get("scale_down_mode") or "drain"
+            ).strip().lower(),
+            "live_queued": queued,
+            "live_attaching": attaching,
+            "live_active": active,
+            "live_solving": solving,
+            "live_running": active,
+            "logical_active": attaching + active,
+            "resource_constraint": constraint,
+            "control_gate_reason": gate_reason,
+            "project_updated_at": combined.get("updated_at"),
+        }
+
+    def set_simulation_policy(
+        self,
+        desired_simulations: int,
+        *,
+        expected_revision: int | str,
+    ) -> dict[str, Any]:
+        """CAS-update durable MFT demand; lowering always uses graceful drain."""
+        if (
+            type(desired_simulations) is not int
+            or not DEFAULT_PARALLEL_TARGET_MIN
+            <= desired_simulations
+            <= PARALLEL_TARGET_SAFETY_CEILING
+        ):
+            raise ValueError(
+                "desired simulations must be an integer between "
+                f"{DEFAULT_PARALLEL_TARGET_MIN} and "
+                f"{PARALLEL_TARGET_SAFETY_CEILING}"
+            )
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, (int, str))
+            or not str(expected_revision).strip()
+        ):
+            raise ValueError("expected policy revision is required")
         if not self.project_name:
             raise ValueError("scheduler project control is not configured")
         project_path = quote(self.project_name, safe="")
-        project = self._request_json(
-            f"/api/projects/{project_path}/max-active-tasks",
-            method="PATCH",
-            payload={"max_active_tasks": target},
-        )
-        control = self._project_control(project)
-        if control["parallel_target"] != target:
-            raise ValueError("scheduler project parallel target readback mismatch")
+        try:
+            policy = self._request_json(
+                f"/api/projects/{project_path}/simulation-policy",
+                method="PATCH",
+                payload={
+                    "desired_simulations": desired_simulations,
+                    "expected_revision": expected_revision,
+                    "scale_down_mode": "drain",
+                },
+            )
+        except HTTPError as exc:
+            if exc.code == 409:
+                raise SimulationPolicyConflict(
+                    "simulation policy changed; refresh and retry"
+                ) from exc
+            raise
+        control = self._simulation_policy_control(policy)
+        if control["desired_simulations"] != desired_simulations:
+            raise ValueError("scheduler simulation policy readback mismatch")
         with self._lock:
             self._cached = None
             self._cached_at = 0.0
         return control
+
+    def set_parallel_target(
+        self, target: int, *, expected_revision: int | str | None = None
+    ) -> dict[str, Any]:
+        """Compatibility name for callers migrated to the versioned policy API."""
+        if expected_revision is None:
+            raise ValueError("expected policy revision is required")
+        return self.set_simulation_policy(
+            target, expected_revision=expected_revision
+        )
 
     def snapshot(self) -> dict[str, Any]:
         now_monotonic = time.monotonic()
@@ -1754,6 +1958,7 @@ class SchedulerReader:
                 "url": self.base_url,
                 "read_only": True,
                 "control_enabled": False,
+                "policy_supported": False,
                 "task_prefix": self.task_prefix,
                 "total": _integer(payload.get("total"), sum(statuses.values())),
                 "running": running,
@@ -1770,9 +1975,42 @@ class SchedulerReader:
                 try:
                     project_path = quote(self.project_name, safe="")
                     project = self._request_json(f"/api/projects/{project_path}")
-                    result.update(self._project_control(project))
-                    result["control_enabled"] = True
-                    result["read_only"] = False
+                    result.update(self._project_status(project))
+                    embedded = project.get("simulation_policy")
+                    if isinstance(embedded, dict):
+                        policy = {**project, **embedded}
+                    elif (
+                        "desired_simulations" in project
+                        or "policy_revision" in project
+                        or "validated_concurrency_limit" in project
+                    ):
+                        # Transitional schedulers advertise the core policy on
+                        # the project record and expose effective/gate/count
+                        # fields at the dedicated GET endpoint.
+                        policy = self._request_json(
+                            f"/api/projects/{project_path}/simulation-policy"
+                        )
+                    else:
+                        policy = None
+                    if policy is not None:
+                        result.update(
+                            self._simulation_policy_control(policy, project=project)
+                        )
+                    else:
+                        result.update({
+                            "parallel_target": None,
+                            "desired_simulations": None,
+                            "effective_simulations": None,
+                            "validated_concurrency_limit": None,
+                            "parallel_target_min": DEFAULT_PARALLEL_TARGET_MIN,
+                            "parallel_target_max": DEFAULT_PARALLEL_TARGET_MAX,
+                            "policy_revision": None,
+                            "resource_constraint": None,
+                            "control_gate_reason": (
+                                "scheduler가 durable simulation-policy "
+                                "capability를 아직 제공하지 않습니다"
+                            ),
+                        })
                     result["project_error"] = None
                 except (
                     HTTPError,
@@ -1784,15 +2022,24 @@ class SchedulerReader:
                 ) as exc:
                     result["project"] = self.project_name
                     result["parallel_target"] = None
-                    result["parallel_target_min"] = PARALLEL_TARGET_MIN
-                    result["parallel_target_max"] = PARALLEL_TARGET_MAX
+                    result["desired_simulations"] = None
+                    result["effective_simulations"] = None
+                    result["validated_concurrency_limit"] = None
+                    result["parallel_target_min"] = DEFAULT_PARALLEL_TARGET_MIN
+                    result["parallel_target_max"] = DEFAULT_PARALLEL_TARGET_MAX
+                    result["policy_revision"] = None
                     result["live_queued"] = max(0, statuses.get("queued", 0))
                     result["live_attaching"] = max(0, statuses.get("attaching", 0))
-                    result["live_running"] = max(0, statuses.get("running", 0))
+                    result["live_active"] = max(0, statuses.get("running", 0))
+                    result["live_solving"] = result["live_active"]
+                    result["live_running"] = result["live_active"]
                     result["logical_active"] = (
-                        result["live_queued"]
-                        + result["live_attaching"]
+                        result["live_attaching"]
                         + result["live_running"]
+                    )
+                    result["resource_constraint"] = None
+                    result["control_gate_reason"] = (
+                        "scheduler project 상태를 검증할 수 없습니다"
                     )
                     result["project_error"] = (
                         f"scheduler project 조회 실패: {type(exc).__name__}: {exc}"
@@ -1804,16 +2051,25 @@ class SchedulerReader:
                 "url": self.base_url,
                 "read_only": True,
                 "control_enabled": False,
+                "policy_supported": False,
                 "task_prefix": self.task_prefix,
                 "project": self.project_name,
                 "parallel_target": None,
-                "parallel_target_min": PARALLEL_TARGET_MIN,
-                "parallel_target_max": PARALLEL_TARGET_MAX,
+                "desired_simulations": None,
+                "effective_simulations": None,
+                "validated_concurrency_limit": None,
+                "parallel_target_min": DEFAULT_PARALLEL_TARGET_MIN,
+                "parallel_target_max": DEFAULT_PARALLEL_TARGET_MAX,
+                "policy_revision": None,
                 "live_queued": 0,
                 "live_attaching": 0,
+                "live_active": 0,
+                "live_solving": 0,
                 "live_running": 0,
                 "logical_active": 0,
                 "project_error": None,
+                "resource_constraint": None,
+                "control_gate_reason": "scheduler에 연결할 수 없습니다",
                 "total": 0,
                 "running": 0,
                 "pending": 0,

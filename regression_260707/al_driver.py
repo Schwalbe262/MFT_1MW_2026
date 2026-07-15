@@ -661,122 +661,72 @@ def run(cmd, **kw):
 
 
 def stage_train(st):
-    from quality_contract import annotate_validity
+    """Adopt the checkpoint promoter's accepted generation.
 
+    The continuous checkpoint orchestrator is the sole registry promoter.
+    AL/NSGA pins that immutable evidence instead of independently training and
+    racing ``current.json``.  If collection has advanced beyond the accepted
+    generation, this stage is safely retried after the trainer lane promotes
+    its next quality-passing checkpoint.
+    """
     _bind_runtime_identity(st)
     rnd = st["round"]
     rdir = os.path.join(_active_al_root(), f"round_{rnd:02d}")
     os.makedirs(rdir, exist_ok=True)
-    audited = annotate_validity(
-        pd.read_parquet(DATASET),
-        expected_solver_revision=PINNED_SOLVER_REVISION,
-        expected_library_revision=PINNED_LIBRARY_REVISION,
-    )
-    strict = audited.loc[audited["_strict_valid_full"]].drop(
-        columns=[
-            "_strict_valid_em", "_strict_valid_thermal",
-            "_strict_valid_full", "_strict_invalid_reasons",
-        ],
-        errors="ignore",
-    )
-    if len(strict) < MIN_STRICT_FULL_ROWS:
+    from training.train_models import load_active_generation
+
+    active = load_active_generation(REGISTRY)
+    report = active["report"]
+    quality_snapshot = dict(active["quality"])
+    previous_training_run_id = st.get("training_run_id")
+    if (
+        previous_training_run_id
+        and report.get("training_run_id") == previous_training_run_id
+    ):
         raise RuntimeError(
-            f"AL requires at least {MIN_STRICT_FULL_ROWS} pinned strict-full rows; "
-            f"found {len(strict)}"
+            "checkpoint_not_ready: active checkpoint has not advanced beyond "
+            f"{previous_training_run_id}"
         )
-    model_dataset = os.path.join(rdir, "strict_training_snapshot.parquet")
-    _atomic_write_parquet(strict, model_dataset)
-    from training.train_models import (
-        discard_inactive_generation, promote_generation,
-        registry_pointer_token,
+    strict_rows = int(report.get("strict_full_rows") or 0)
+    if strict_rows < MIN_STRICT_FULL_ROWS:
+        raise RuntimeError(
+            f"AL requires an accepted model with at least "
+            f"{MIN_STRICT_FULL_ROWS} strict-full rows; found {strict_rows}"
+        )
+    if (
+        quality_snapshot.get("passed") is not True
+        or quality_snapshot.get("solver_revision") != PINNED_SOLVER_REVISION
+        or quality_snapshot.get("library_revision") != PINNED_LIBRARY_REVISION
+        or quality_snapshot.get("quality_thresholds_sha256")
+        != _sha256(QUALITY_THRESHOLDS_PATH)
+    ):
+        raise RuntimeError(
+            "active checkpoint model does not match the pinned AL quality contract"
+        )
+    model_dataset = os.path.abspath(report.get("dataset_path") or "")
+    if (
+        not os.path.isfile(model_dataset)
+        or _sha256(model_dataset) != report.get("dataset_sha256")
+        or quality_snapshot.get("dataset_sha256") != report.get("dataset_sha256")
+    ):
+        raise RuntimeError("active checkpoint model dataset snapshot is unavailable")
+    source_dataset_path, source_dataset_generation = (
+        _authenticate_training_source_dataset(report, quality_snapshot)
     )
-    from quality_contract import DEFAULT_PROFILE_PATH
-
-    profile_path = os.path.abspath(DEFAULT_PROFILE_PATH)
-    from quality_contract import load_profile
-
-    profile_sha256 = hashlib.sha256(
-        json.dumps(
-            load_profile(profile_path), sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()
-    candidate_result_path = os.path.join(rdir, "candidate_generation.json")
-    expected_pointer = registry_pointer_token(REGISTRY)
-    candidate_generation = None
-    promoted = False
-    try:
-        run([
-            PY, os.path.join("training", "checkpoint_train.py"),
-            "--dataset", model_dataset,
-            "--curve-csv", os.path.join(
-                RUNTIME_ROOT, "training", "learning_curve.csv"
-            ),
-            "--profile", profile_path,
-        ])
-        run([
-            PY, os.path.join("training", "train_models.py"),
-            "--dataset", model_dataset, "--registry", REGISTRY,
-            "--profile", profile_path,
-            "--result-json", candidate_result_path,
-        ])
-        with open(candidate_result_path, encoding="utf-8") as handle:
-            candidate = json.load(handle)
-        candidate_generation = candidate["generation"]
-        from training.model_quality_gate import evaluate_generation
-
-        thresholds_path = QUALITY_THRESHOLDS_PATH
-        with open(thresholds_path, encoding="utf-8") as handle:
-            thresholds = json.load(handle)
-        quality_snapshot = evaluate_generation(
-            REGISTRY, candidate_generation, model_dataset, thresholds
-        )
-        quality_snapshot.update({
-            "solver_revision": PINNED_SOLVER_REVISION,
-            "library_revision": PINNED_LIBRARY_REVISION,
-            "quality_thresholds_sha256": _sha256(QUALITY_THRESHOLDS_PATH),
-        })
-        quality_snapshot["evaluated_at"] = datetime.now().isoformat(
-            timespec="seconds"
-        )
-        _atomic_write_json(quality_snapshot, QUALITY_STATUS)
-        if not quality_snapshot.get("passed"):
-            raise RuntimeError(
-                "surrogate quality gate failed: "
-                + "; ".join(quality_snapshot.get("reasons", [])[:10])
-            )
-        if (int(quality_snapshot.get("strict_full_rows") or 0)
-                < MIN_STRICT_FULL_ROWS):
-            raise RuntimeError("surrogate quality gate is below 3000 strict rows")
-        pointer = promote_generation(
-            REGISTRY,
-            candidate_generation,
-            quality_snapshot,
-            dataset=model_dataset,
-            profile_sha256=profile_sha256,
-            thresholds_sha256=hashlib.sha256(
-                json.dumps(
-                    thresholds, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            ).hexdigest(),
-            expected_pointer=expected_pointer,
-        )
-        promoted = True
-        generation_dir = os.path.abspath(os.path.join(REGISTRY, pointer["generation"]))
-        quality_snapshot_path = os.path.join(rdir, "model_quality_snapshot.json")
-        _atomic_write_json(quality_snapshot, quality_snapshot_path)
-    except Exception:
-        if candidate_generation and not promoted:
-            try:
-                discard_inactive_generation(REGISTRY, candidate_generation)
-            except Exception as cleanup_error:
-                print(f"[al] inactive candidate cleanup warning: {cleanup_error}")
-        raise
+    generation_dir = active["generation"]
+    quality_snapshot_path = os.path.join(rdir, "model_quality_snapshot.json")
+    _atomic_write_json(quality_snapshot, quality_snapshot_path)
     st["training_dataset"] = model_dataset
-    st["training_run_id"] = pointer["training_run_id"]
+    st["training_run_id"] = report["training_run_id"]
     st["training_generation"] = generation_dir
     st["model_quality_snapshot"] = quality_snapshot
     st["model_quality_snapshot_path"] = quality_snapshot_path
-    st["training_strict_full_rows"] = int(len(strict))
+    st["training_strict_full_rows"] = strict_rows
+    st["training_source_dataset"] = source_dataset_path
+    st["training_source_dataset_generation"] = source_dataset_generation
+    st["training_source_dataset_sha256"] = report["source_dataset_sha256"]
+    if st.pop("post_convergence_retrain_pending", False):
+        st["post_convergence_retrain_done"] = True
     st["stage"] = "OPTIMIZE"
 
 
@@ -788,12 +738,50 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
+def _authenticate_training_source_dataset(report, quality):
+    """Authenticate the immutable collection generation behind a checkpoint."""
+    source_path = os.path.abspath(report.get("source_dataset_path") or "")
+    source_identity = report.get("source_dataset_generation")
+    source_sha256 = report.get("source_dataset_sha256")
+    if (
+        not isinstance(source_identity, str)
+        or not source_identity.startswith("dataset:")
+        or len(source_identity) != len("dataset:") + 64
+        or not source_path
+        or not os.path.isfile(source_path)
+        or not isinstance(source_sha256, str)
+        or _file_sha256(source_path) != source_sha256
+    ):
+        raise RuntimeError(
+            "active checkpoint has no authenticated immutable source dataset"
+        )
+    generation_id = source_identity.split(":", 1)[1]
+    from pathlib import Path
+    from pipeline.artifacts import GenerationStore
+
+    generation_dir = Path(source_path).resolve().parent
+    if len(generation_dir.parents) < 2:
+        raise RuntimeError("checkpoint source dataset path is not content addressed")
+    generation = GenerationStore(generation_dir.parents[1]).load(generation_dir)
+    if (
+        generation.kind != "dataset"
+        or generation.generation_id != generation_id
+        or Path(source_path).resolve() != generation.path / "train.parquet"
+        or quality.get("source_dataset_generation") != source_identity
+        or quality.get("source_dataset_sha256") != source_sha256
+    ):
+        raise RuntimeError("checkpoint source dataset generation identity mismatch")
+    return str(generation.path / "train.parquet"), source_identity
+
+
 def _assert_training_invariants(st):
     """Fail closed if the pinned accepted training evidence changes mid-round."""
     _assert_runtime_training_invariants(st)
     required = (
         "training_dataset", "training_run_id", "training_generation",
         "model_quality_snapshot_path", "training_strict_full_rows",
+        "training_source_dataset", "training_source_dataset_generation",
+        "training_source_dataset_sha256",
     )
     missing = [key for key in required if st.get(key) in (None, "")]
     if missing:
@@ -808,6 +796,9 @@ def _assert_training_invariants(st):
     )
     report = record["report"]
     accepted = record["quality"]
+    source_path, source_identity = _authenticate_training_source_dataset(
+        report, accepted
+    )
     quality_path = os.path.abspath(st["model_quality_snapshot_path"])
     with open(quality_path, encoding="utf-8") as handle:
         quality_snapshot = json.load(handle)
@@ -825,6 +816,14 @@ def _assert_training_invariants(st):
         raise RuntimeError("AL pinned generation path changed")
     if int(st["training_strict_full_rows"]) != int(report.get("strict_full_rows", -1)):
         raise RuntimeError("AL pinned strict row count changed")
+    if (
+        os.path.normcase(source_path)
+        != os.path.normcase(os.path.abspath(st["training_source_dataset"]))
+        or source_identity != st["training_source_dataset_generation"]
+        or report.get("source_dataset_sha256")
+        != st["training_source_dataset_sha256"]
+    ):
+        raise RuntimeError("AL pinned source dataset changed")
     for key, expected in checks.items():
         if report.get(key) not in (None, expected) and key in (
             "training_run_id", "dataset_sha256", "profile_sha256"
@@ -1400,7 +1399,7 @@ def stage_check(st):
             # The rows just ingested were not in the model that proposed this
             # front.  One mandatory retrain -> NSGA-II -> standard-FEA round
             # removes that one-generation lag before fine verification.
-            st["post_convergence_retrain_done"] = True
+            st["post_convergence_retrain_pending"] = True
             st["round"] = rnd + 1
             st["stage"] = "TRAIN"
             print("[al] standard agreement reached; mandatory final retrain scheduled")

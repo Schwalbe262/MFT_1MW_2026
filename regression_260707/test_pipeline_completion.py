@@ -17,7 +17,11 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "training"))
 sys.path.insert(0, str(HERE / "verify"))
 
-from quality_contract import annotate_validity, validate_record
+from quality_contract import (
+    PHYSICS_EQUIVALENT_SOLVER_REVISIONS as QUALITY_SOLVER_EQUIVALENCE,
+    annotate_validity,
+    validate_record,
+)
 from model_targets import (
     CORE_REGION_TEMPERATURE_TARGETS,
     SURROGATE_TEMPERATURE_TARGETS,
@@ -251,6 +255,106 @@ class StrictRowContractTests(unittest.TestCase):
         self.assertEqual(
             quarantine["untrusted_provenance:solver_revision_mismatch"], 3
         )
+
+    def test_operator_approved_solver_revision_equivalence_is_directional(self):
+        expected_solver = "262574a886cef9e0f8f550d12571cf6d54c826e2"
+        approved_solver = "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7"
+        excluded_solver = "dba903eb671e37642168afc5578b8e6a93e9c046"
+        unrelated_expected = "a" * 40
+        exact_row = _valid_native_result(git_hash=expected_solver)
+        approved_row = _valid_native_result(git_hash=approved_solver)
+        excluded_row = _valid_native_result(git_hash=excluded_solver)
+        dirty_approved_row = _valid_native_result(
+            git_hash=approved_solver, git_dirty=True
+        )
+        foreign_physics_row = _valid_native_result(
+            git_hash=approved_solver,
+            physics_data_revision="foreign-physics-revision",
+        )
+
+        self.assertEqual(
+            QUALITY_SOLVER_EQUIVALENCE[expected_solver],
+            frozenset({
+                approved_solver,
+                "66ee6685859c207eafdca796120e2e1643f72f5c",
+                "f0271da72ff4b9f085b3927769c583c163792adb",
+                "f411bf5492669f87896eb657b9e5db2998d219a7",
+                "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
+            }),
+        )
+
+        approved = validate_record(
+            approved_row,
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertTrue(approved.full_valid)
+        self.assertNotIn(
+            "untrusted_provenance:solver_revision_mismatch",
+            approved.reasons,
+        )
+
+        excluded = validate_record(
+            excluded_row,
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertFalse(excluded.full_valid)
+        self.assertIn(
+            "untrusted_provenance:solver_revision_mismatch",
+            excluded.reasons,
+        )
+
+        dirty = validate_record(
+            dirty_approved_row,
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertFalse(dirty.full_valid)
+        self.assertIn("untrusted_provenance:git_dirty", dirty.reasons)
+        self.assertNotIn(
+            "untrusted_provenance:solver_revision_mismatch",
+            dirty.reasons,
+        )
+
+        foreign_physics = validate_record(
+            foreign_physics_row,
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertFalse(foreign_physics.full_valid)
+        self.assertIn(
+            "untrusted_provenance:solver_revision_mismatch",
+            foreign_physics.reasons,
+        )
+
+        unrelated = validate_record(
+            approved_row,
+            expected_solver_revision=unrelated_expected,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertFalse(unrelated.full_valid)
+        self.assertIn(
+            "untrusted_provenance:solver_revision_mismatch",
+            unrelated.reasons,
+        )
+
+        audited = annotate_validity(
+            pd.DataFrame([
+                exact_row,
+                approved_row,
+                excluded_row,
+                dirty_approved_row,
+                foreign_physics_row,
+            ]),
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertEqual(
+            audited["_strict_valid_full"].tolist(),
+            [True, True, False, False, False],
+        )
+        self.assertEqual(audited.attrs["provenance_equivalent_rows"], 1)
 
     def test_legacy_false_positive_is_quarantined(self):
         row = valid_result(conv_error_pct_matrix=13.254)

@@ -17,6 +17,7 @@ FIXED_NOW = datetime(2026, 7, 11, 3, 0, tzinfo=KST)
 class DummyScheduler:
     def __init__(self):
         self.parallel_target = 300
+        self.policy_revision = 7
 
     def snapshot(self):
         return {
@@ -24,15 +25,25 @@ class DummyScheduler:
             "url": "http://scheduler.invalid",
             "read_only": False,
             "control_enabled": True,
+            "policy_supported": True,
             "task_prefix": "mft",
             "project": "MFT_1MW_2026v1",
             "parallel_target": self.parallel_target,
-            "parallel_target_min": 1,
-            "parallel_target_max": 300,
+            "desired_simulations": self.parallel_target,
+            "effective_simulations": min(self.parallel_target, 275),
+            "validated_concurrency_limit": 500,
+            "parallel_target_min": 0,
+            "parallel_target_max": 500,
+            "policy_revision": self.policy_revision,
+            "scale_down_mode": "drain",
             "live_queued": 3,
             "live_attaching": 2,
+            "live_active": 4,
+            "live_solving": 3,
             "live_running": 4,
-            "logical_active": 9,
+            "logical_active": 6,
+            "resource_constraint": None,
+            "control_gate_reason": None,
             "total": 12,
             "running": 4,
             "pending": 3,
@@ -45,17 +56,32 @@ class DummyScheduler:
             "updated_at": FIXED_NOW.isoformat(),
         }
 
-    def set_parallel_target(self, target):
+    def set_simulation_policy(self, target, *, expected_revision):
+        if expected_revision != self.policy_revision:
+            raise RuntimeError("stale policy revision")
         self.parallel_target = target
+        self.policy_revision += 1
         return {
             "project": "MFT_1MW_2026v1",
+            "policy_supported": True,
+            "control_enabled": True,
+            "read_only": False,
             "parallel_target": target,
-            "parallel_target_min": 1,
-            "parallel_target_max": 300,
+            "desired_simulations": target,
+            "effective_simulations": min(target, 275),
+            "validated_concurrency_limit": 500,
+            "parallel_target_min": 0,
+            "parallel_target_max": 500,
+            "policy_revision": self.policy_revision,
+            "scale_down_mode": "drain",
             "live_queued": 3,
             "live_attaching": 2,
+            "live_active": 4,
+            "live_solving": 3,
             "live_running": 4,
-            "logical_active": 9,
+            "logical_active": 6,
+            "resource_constraint": None,
+            "control_gate_reason": None,
             "project_updated_at": FIXED_NOW.isoformat(),
         }
 

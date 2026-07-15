@@ -58,6 +58,25 @@ DEFAULT_PROFILE_PATH = HERE / "verify" / "profiles" / "standard.json"
 MAX_TRUSTED_TEMPERATURE_C = 4700.0
 MIN_TRUSTED_TEMPERATURE_C = -273.15
 
+# Evidence / approval record (operator decision 2026-07-15): the reviewed
+# production-physics diff bffbb15..262574a is limited to the pooled AEDT
+# adapter, pooled-only overlap-guard scoping, and pooled result-extraction
+# plumbing.  It makes no geometry, setup, expression, or material changes.
+PHYSICS_EQUIVALENT_SOLVER_REVISIONS: dict[str, frozenset[str]] = {
+    "262574a886cef9e0f8f550d12571cf6d54c826e2": frozenset({
+        "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7",
+        "66ee6685859c207eafdca796120e2e1643f72f5c",
+        "f0271da72ff4b9f085b3927769c583c163792adb",
+        "f411bf5492669f87896eb657b9e5db2998d219a7",
+        "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
+    }),
+}
+# Explicitly not enrolled: these physics-adjacent diffs remain unreviewed.
+# dba903eb671e37642168afc5578b8e6a93e9c046
+# 22d715011a827a111ed32e40da1272b9d47251fe
+# 4f585b0540dbe3b2828f991024fdb9f1f2d23b8b
+# 513a6f321b997d1866f8c0da57cc27c285b29a5c
+
 MATRIX_REQUIRED_OUTPUTS = (
     "Ltx", "Lrx", "M", "k", "Lmt", "Lmr", "Llt", "Llr",
 )
@@ -205,6 +224,21 @@ def _profile_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
     return reasons
 
 
+def _uses_explicit_solver_revision_equivalence(
+    record: Mapping[str, Any], expected_solver_revision: object,
+) -> bool:
+    actual = _optional_text(_value(record, "git_hash")).lower()
+    expected = _optional_text(expected_solver_revision).lower()
+    return (
+        actual != expected
+        and actual in PHYSICS_EQUIVALENT_SOLVER_REVISIONS.get(
+            expected, frozenset()
+        )
+        and _optional_text(_value(record, "physics_data_revision"))
+        == PHYSICS_DATA_REVISION
+    )
+
+
 def _provenance_reasons(
     record: Mapping[str, Any], expected_solver_revision=None,
     expected_library_revision=None,
@@ -221,6 +255,9 @@ def _provenance_reasons(
             _value(record, "git_hash"),
             expected_solver_revision,
             _value(record, "physics_data_revision"),
+        )
+        or _uses_explicit_solver_revision_equivalence(
+            record, expected_solver_revision
         )
     ):
         reasons.append("untrusted_provenance:solver_revision_mismatch")
@@ -678,6 +715,7 @@ def annotate_validity(
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("frame must be a pandas DataFrame")
     profile_data = load_profile(profile)
+    records = frame.to_dict("records")
     results = [
         validate_record(
             row,
@@ -687,13 +725,21 @@ def annotate_validity(
             expected_solver_revision=expected_solver_revision,
             expected_library_revision=expected_library_revision,
         )
-        for row in frame.to_dict("records")
+        for row in records
     ]
     out = frame.copy()
     out["_strict_valid_em"] = [result.em_valid for result in results]
     out["_strict_valid_thermal"] = [result.thermal_valid for result in results]
     out["_strict_valid_full"] = [result.full_valid for result in results]
     out["_strict_invalid_reasons"] = [";".join(result.reasons) for result in results]
+    out.attrs["provenance_equivalent_rows"] = sum(
+        result.full_valid
+        and require_clean_provenance
+        and _uses_explicit_solver_revision_equivalence(
+            row, expected_solver_revision
+        )
+        for row, result in zip(records, results)
+    )
     return out
 
 

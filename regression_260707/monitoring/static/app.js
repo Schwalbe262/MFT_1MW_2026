@@ -1084,54 +1084,78 @@
 
   function renderParallelControl(scheduler = {}, refillController = state.dashboard?.refill_controller || {}) {
     const controlEnabled = scheduler.control_enabled === true;
-    const displayedTarget = controlEnabled
-      ? scheduler.parallel_target
-      : (refillController.concurrency_target ?? scheduler.parallel_target);
+    const policySupported = scheduler.policy_supported === true;
+    const displayedTarget = scheduler.desired_simulations
+      ?? scheduler.parallel_target
+      ?? refillController.concurrency_target;
     setText("#parallel-current-target", number(displayedTarget));
+    setText("#parallel-effective-target", number(scheduler.effective_simulations));
+    setText("#parallel-validated-limit", number(scheduler.validated_concurrency_limit));
     setText("#parallel-logical-active", number(scheduler.logical_active));
     setText("#parallel-queued", number(scheduler.live_queued));
     setText("#parallel-attaching", number(scheduler.live_attaching));
-    setText("#parallel-running", number(scheduler.live_running));
+    setText("#parallel-active", number(scheduler.live_active ?? scheduler.live_running));
+    setText("#parallel-solving", number(scheduler.live_solving));
     renderAedtAttach(scheduler);
-    $("#parallel-target-form").classList.toggle("hidden", !controlEnabled);
-    $("#refill-controller-status").classList.toggle("hidden", controlEnabled);
-    $("#parallel-target-status").classList.toggle("hidden", !controlEnabled);
-    $("#parallel-control-note").classList.toggle("hidden", !controlEnabled);
-    setText("#parallel-control-eyebrow", controlEnabled ? "LOCAL OPERATOR CONTROL · MFT ONLY" : "AUTOMATIC REFILL CONTROL · MFT ONLY");
-    setText("#parallel-control-title", controlEnabled ? "MFT 병렬 실행 목표" : "MFT 자동 실행 유지");
+    $("#parallel-target-form").classList.remove("hidden");
+    $("#refill-controller-status").classList.toggle("hidden", policySupported);
+    $("#parallel-target-status").classList.remove("hidden");
+    $("#parallel-control-note").classList.remove("hidden");
+    setText("#parallel-control-eyebrow", policySupported ? "DURABLE SIMULATION POLICY · MFT ONLY" : "AUTOMATIC REFILL CONTROL · MFT ONLY");
+    setText("#parallel-control-title", policySupported ? "MFT 병렬 실행 목표" : "MFT 자동 실행 유지");
     setText(
       "#parallel-control-description",
-      controlEnabled
-        ? "queued + attaching + running 합계를 지정한 수로 유지합니다. IPMSM 프로젝트에는 적용되지 않습니다."
+      policySupported
+        ? "attaching + active 수를 desired 목표로 유지합니다. queued admission은 별도로 표시하며 IPMSM에는 적용하지 않습니다."
         : "외부 refill-controller가 queued + attaching + running 합계를 자동으로 유지합니다.",
     );
-    if (!controlEnabled) renderRefillController(refillController);
+    if (!policySupported) renderRefillController(refillController);
     const input = $("#parallel-target-input");
     const button = $("#parallel-target-button");
-    const enabled = scheduler.connected === true && scheduler.control_enabled === true
-      && Number.isInteger(Number(scheduler.parallel_target));
-    input.min = String(scheduler.parallel_target_min ?? 1);
-    input.max = String(scheduler.parallel_target_max ?? 300);
-    if (!state.parallelTargetDirty && document.activeElement !== input && scheduler.parallel_target != null) {
-      input.value = String(scheduler.parallel_target);
+    const minimum = Number(scheduler.parallel_target_min);
+    const maximum = Number(scheduler.parallel_target_max);
+    const revision = scheduler.policy_revision;
+    const enabled = scheduler.connected === true && controlEnabled
+      && Number.isInteger(minimum) && Number.isInteger(maximum) && minimum <= maximum
+      && (Number.isInteger(revision) || (typeof revision === "string" && revision.length > 0));
+    input.min = Number.isInteger(minimum) ? String(minimum) : "0";
+    if (Number.isInteger(maximum)) input.max = String(maximum);
+    else input.removeAttribute("max");
+    if (!state.parallelTargetDirty && document.activeElement !== input && displayedTarget != null) {
+      input.value = String(displayedTarget);
     }
     input.disabled = !enabled || state.updatingParallelTarget;
     button.disabled = !enabled || state.updatingParallelTarget;
+    const constraint = scheduler.resource_constraint;
+    const constraintReason = constraint && typeof constraint === "object"
+      ? (constraint.reason ?? constraint.detail ?? constraint.code)
+      : constraint;
     if (state.updatingParallelTarget) {
       parallelStatus("새 목표를 Scheduler에 적용하는 중입니다.");
     } else if (scheduler.project_error) {
       parallelStatus(scheduler.project_error, "error");
     } else if (!enabled) {
-      parallelStatus(scheduler.error || "로컬 Scheduler 목표 제어를 사용할 수 없습니다.", "error");
+      parallelStatus(
+        scheduler.control_gate_reason
+          || scheduler.error
+          || "Scheduler simulation-policy 변경 gate가 열리지 않았습니다.",
+        "error",
+      );
+    } else if (constraintReason) {
+      parallelStatus(
+        `Desired ${number(displayedTarget)} · effective ${number(scheduler.effective_simulations)} · 자원 제한: ${constraintReason}`,
+      );
     } else {
-      parallelStatus(`현재 ${scheduler.project || "MFT"} 목표 ${number(scheduler.parallel_target)} · localhost 전용 제어`);
+      parallelStatus(
+        `Desired ${number(displayedTarget)} · effective ${number(scheduler.effective_simulations)} · 검증 상한 ${number(scheduler.validated_concurrency_limit)} · loopback/신뢰 LAN 제어`,
+      );
     }
   }
 
   function renderDiagnostics(payload) {
     const scheduler = payload.scheduler || {};
     const details = $("#scheduler-details"); details.replaceChildren();
-    [["연결", scheduler.connected ? "정상" : "실패"], ["실행 / 대기", `${number(scheduler.running)} / ${number(scheduler.pending)}`], ["완료 / 실패", `${number(scheduler.completed)} / ${number(scheduler.failed)}`], ["조회 범위", scheduler.project || scheduler.task_prefix || "—"], ["모드", scheduler.control_enabled ? "localhost bounded control" : "GET only"]].forEach(([key, value]) => {
+    [["연결", scheduler.connected ? "정상" : "실패"], ["실행 / 대기", `${number(scheduler.running)} / ${number(scheduler.pending)}`], ["완료 / 실패", `${number(scheduler.completed)} / ${number(scheduler.failed)}`], ["조회 범위", scheduler.project || scheduler.task_prefix || "—"], ["모드", scheduler.control_enabled ? "versioned LAN policy control" : "GET only"]].forEach(([key, value]) => {
       const item = element("div"); item.append(element("dt", "", key), element("dd", "", value)); details.append(item);
     });
     const warnings = [
@@ -1198,15 +1222,15 @@
     if (state.updatingParallelTarget) return;
     const input = $("#parallel-target-input");
     const target = Number(input.value);
-    const min = Number(input.min || 1);
-    const max = Number(input.max || 300);
+    const min = Number(input.min);
+    const max = Number(input.max);
     if (!Number.isInteger(target) || target < min || target > max) {
       parallelStatus(`목표는 ${min}~${max} 사이 정수여야 합니다.`, "error");
       input.focus();
       return;
     }
     const scheduler = state.dashboard?.scheduler || {};
-    const current = Number(scheduler.parallel_target);
+    const current = Number(scheduler.desired_simulations ?? scheduler.parallel_target);
     const logicalActive = Number(scheduler.logical_active);
     if (Number.isFinite(current) && target < current && Number.isFinite(logicalActive) && logicalActive > target) {
       const confirmed = window.confirm(
@@ -1219,21 +1243,25 @@
     renderParallelControl(scheduler, state.dashboard?.refill_controller || {});
     let applied = false;
     try {
-      const response = await fetch("/api/operator/parallel-target", {
+      const response = await fetch("/api/operator/simulation-policy", {
         method: "PATCH",
         cache: "no-store",
         headers: {
           Accept: "application/json",
           "Content-Type": "application/json",
-          "X-MFT-Operator-Control": "parallel-target-v1",
+          "X-MFT-Operator-Control": "simulation-policy-v1",
         },
-        body: JSON.stringify({ target }),
+        body: JSON.stringify({
+          desired_simulations: target,
+          expected_revision: scheduler.policy_revision,
+          scale_down_mode: "drain",
+        }),
       });
       let payload = {};
       try { payload = await response.json(); } catch (error) { payload = {}; }
       if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
       state.parallelTargetDirty = false;
-      if (state.dashboard) state.dashboard.scheduler = { ...scheduler, ...payload, control_enabled: true, connected: true };
+      if (state.dashboard) state.dashboard.scheduler = { ...scheduler, ...payload, policy_supported: true, connected: true };
       renderParallelControl(state.dashboard?.scheduler || payload, state.dashboard?.refill_controller || {});
       applied = true;
       await refresh();

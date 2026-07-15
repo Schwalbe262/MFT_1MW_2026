@@ -1,6 +1,9 @@
 param(
     [ValidateRange(1024, 65535)]
     [int]$Port = 8010,
+    [ValidateSet("127.0.0.1", "0.0.0.0")]
+    [string]$ListenAddress = "127.0.0.1",
+    [string[]]$OperatorHosts = @(),
     [switch]$NoBrowser,
     [switch]$ForceInstall
 )
@@ -38,14 +41,25 @@ New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null
 $StdoutLog = Join-Path $RuntimeDir "server.stdout.log"
 $StderrLog = Join-Path $RuntimeDir "server.stderr.log"
 $Url = "http://127.0.0.1:$Port"
+if ($ListenAddress -eq "0.0.0.0" -and $OperatorHosts.Count -eq 0) {
+    throw "-OperatorHosts is required when listening on the trusted LAN."
+}
 $Arguments = @(
     "-m", "uvicorn", "regression_260707.monitoring.app:app",
-    "--host", "127.0.0.1", "--port", $Port.ToString()
+    "--host", $ListenAddress, "--port", $Port.ToString()
 )
 
 Write-Host "[MFT monitor] Starting $Url" -ForegroundColor Green
-$Server = Start-Process -FilePath $Python -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
-    -RedirectStandardOutput $StdoutLog -RedirectStandardError $StderrLog -WindowStyle Hidden -PassThru
+$PreviousOperatorHosts = $env:MFT_MONITOR_OPERATOR_HOSTS
+try {
+    if ($OperatorHosts.Count -gt 0) {
+        $env:MFT_MONITOR_OPERATOR_HOSTS = $OperatorHosts -join ","
+    }
+    $Server = Start-Process -FilePath $Python -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
+        -RedirectStandardOutput $StdoutLog -RedirectStandardError $StderrLog -WindowStyle Hidden -PassThru
+} finally {
+    $env:MFT_MONITOR_OPERATOR_HOSTS = $PreviousOperatorHosts
+}
 
 try {
     $Ready = $false

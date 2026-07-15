@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import closing
 from datetime import datetime
 import hashlib
 import json
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -157,6 +159,29 @@ def _sha256(path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _authenticate_source_dataset_generation(dataset, source_identity):
+    """Prove that checkpoint input is the named immutable dataset generation."""
+    source_path = Path(dataset).resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            "authenticated source dataset is unavailable: " + str(source_path)
+        )
+    generation_id = str(source_identity).split(":", 1)[1]
+    generation_dir = source_path.parent
+    if len(generation_dir.parents) < 2:
+        raise RuntimeError("source dataset path is not content addressed")
+    from pipeline.artifacts import GenerationStore
+
+    generation = GenerationStore(generation_dir.parents[1]).load(generation_dir)
+    if (
+        generation.kind != "dataset"
+        or generation.generation_id != generation_id
+        or source_path != generation.path / "train.parquet"
+    ):
+        raise RuntimeError("source dataset generation identity mismatch")
+    return _sha256(source_path)
 
 
 def _load_state(path):
@@ -471,7 +496,8 @@ def _run(command):
 
 def training_commands(
     snapshot, curve, registry, min_rows, profile, threshold, metrics_result,
-    candidate_result=None,
+    candidate_result=None, params=None, source_dataset_path=None,
+    source_dataset_generation=None,
 ):
     """Build child commands with one already-normalized absolute profile path."""
     if not profile or not os.path.isabs(profile):
@@ -488,7 +514,7 @@ def training_commands(
             "--parity-json", parity_result,
         ]]
     if candidate_result:
-        commands.append([
+        candidate_command = [
             sys.executable,
             str(HERE / "train_models.py"),
             "--dataset", snapshot,
@@ -496,7 +522,18 @@ def training_commands(
             "--min-rows", str(min_rows),
             "--profile", profile,
             "--result-json", candidate_result,
-        ])
+        ]
+        if params:
+            candidate_command.extend(["--params", params])
+        if source_dataset_path:
+            candidate_command.extend(
+                ["--source-dataset-path", source_dataset_path]
+            )
+        if source_dataset_generation:
+            candidate_command.extend(
+                ["--source-dataset-generation", source_dataset_generation]
+            )
+        commands.append(candidate_command)
     return commands
 
 
@@ -522,6 +559,46 @@ def _pinned_training_runs(runtime_root):
                 run_ids.add(value["training_run_id"])
         except Exception:
             continue
+    pipeline_roots = {
+        os.path.abspath(os.path.join(runtime_root, "pipeline_runtime")),
+    }
+    configured_pipeline_root = os.environ.get("MFT_PIPELINE_ROOT", "").strip()
+    if configured_pipeline_root:
+        pipeline_roots.add(os.path.abspath(configured_pipeline_root))
+    for pipeline_root in pipeline_roots:
+        queue_path = os.path.join(pipeline_root, "jobs.sqlite3")
+        if os.path.isfile(queue_path):
+            try:
+                with closing(sqlite3.connect(queue_path)) as connection:
+                    rows = connection.execute(
+                        "SELECT input_generation FROM jobs "
+                        "WHERE input_generation LIKE 'model:%' "
+                        "AND state NOT IN ('failed','cancelled')"
+                    ).fetchall()
+                run_ids.update(
+                    value.split(":", 1)[1]
+                    for (value,) in rows
+                    if isinstance(value, str) and value.startswith("model:")
+                )
+            except (OSError, sqlite3.Error):
+                # Registry pruning is best effort and already preserves the
+                # active generation. A busy/unavailable queue is retried on
+                # the next checkpoint rather than breaking model promotion.
+                pass
+        artifact_root = Path(pipeline_root, "artifacts")
+        if artifact_root.is_dir():
+            for manifest_path in artifact_root.glob("*/*/manifest.json"):
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    metadata = manifest.get("metadata") or {}
+                    run_id = metadata.get("training_run_id")
+                    if isinstance(run_id, str) and run_id:
+                        run_ids.add(run_id)
+                    for parent in manifest.get("parents") or []:
+                        if isinstance(parent, str) and parent.startswith("model:"):
+                            run_ids.add(parent.split(":", 1)[1])
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
     return run_ids
 
 
@@ -550,6 +627,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime-root", default=str(REGRESSION_ROOT))
     parser.add_argument("--dataset", default=None)
+    parser.add_argument(
+        "--dataset-series", default=None,
+        help=(
+            "stable canonical dataset identity when --dataset is an immutable "
+            "content snapshot"
+        ),
+    )
+    parser.add_argument(
+        "--source-dataset-generation",
+        default=None,
+        help="content-addressed dataset:<sha256> identity for pipeline inputs",
+    )
     parser.add_argument("--output-root", default=None)
     parser.add_argument(
         "--run-root", default=None,
@@ -560,6 +649,10 @@ def main():
     )
     parser.add_argument("--profile", default=None)
     parser.add_argument("--thresholds", default=str(DEFAULT_THRESHOLDS))
+    parser.add_argument(
+        "--params", default=None,
+        help="immutable Optuna params.json generation pinned into this contract",
+    )
     parser.add_argument("--min-rows", type=int, default=200)
     parser.add_argument("--solver-revision", default=None)
     parser.add_argument("--library-revision", default=None)
@@ -607,11 +700,25 @@ def main():
         args.output_root or os.path.join(runtime_root, "training")
     )
     run_root = os.path.abspath(args.run_root or output_root)
-    state_path = os.path.join(run_root, "checkpoint_state.json")
     from quality_contract import DEFAULT_PROFILE_PATH, load_profile
 
     args.profile = os.path.abspath(args.profile or DEFAULT_PROFILE_PATH)
     args.thresholds = os.path.abspath(args.thresholds)
+    args.params = os.path.abspath(args.params) if args.params else None
+    params_sha256 = _sha256(args.params) if args.params else None
+    if args.source_dataset_generation and not re.fullmatch(
+        r"dataset:[0-9a-fA-F]{64}", args.source_dataset_generation
+    ):
+        parser.error("source dataset generation must be dataset:<sha256>")
+    if args.source_dataset_generation:
+        args.source_dataset_generation = args.source_dataset_generation.lower()
+    source_dataset_sha256 = (
+        _authenticate_source_dataset_generation(
+            dataset, args.source_dataset_generation
+        )
+        if args.source_dataset_generation
+        else (_sha256(dataset) if os.path.isfile(dataset) else None)
+    )
     profile_data = load_profile(args.profile)
     contract_identity = checkpoint_contract_identity(
         args.profile,
@@ -620,6 +727,7 @@ def main():
         os.path.join(REGRESSION_ROOT, "model_targets.py"),
         solver_revision=args.solver_revision,
     )
+    state_path = os.path.join(run_root, "checkpoint_state.json")
     profile_sha256 = contract_identity["profile_sha256"]
     with open(args.thresholds, encoding="utf-8") as handle:
         thresholds = json.load(handle)
@@ -635,7 +743,7 @@ def main():
             f"actual={contract_identity['checkpoint_contract_key']}"
         )
     identity = {
-        "dataset": dataset,
+        "dataset": os.path.abspath(args.dataset_series or dataset),
         "profile_path": args.profile,
         "profile_sha256": profile_sha256,
         "thresholds_path": args.thresholds,
@@ -705,6 +813,11 @@ def main():
         "state_identity": identity,
         "expected_solver_revision": args.solver_revision,
         "expected_library_revision": args.library_revision,
+        "params_path": args.params,
+        "params_sha256": params_sha256,
+        "source_dataset_path": dataset,
+        "source_dataset_sha256": source_dataset_sha256,
+        "source_dataset_generation": args.source_dataset_generation,
         "execute": bool(args.execute),
         "manufacturing_tolerance_policy": (
             "excluded; exact-as-FEA geometry is assumed"
@@ -750,6 +863,8 @@ def main():
             raise RuntimeError(
                 "checkpoint contract changed during checkpoint inspection"
             )
+        if args.params and _sha256(args.params) != params_sha256:
+            raise RuntimeError("tuned parameter generation changed during inspection")
         raw, audited, strict, quarantine = inspect_dataset(
             dataset, args.profile, args.solver_revision, args.library_revision
         )
@@ -841,6 +956,9 @@ def main():
                     snapshot, curve, registry, args.min_rows,
                     args.profile, threshold, metrics_result,
                     candidate_result if activation_required else None,
+                    args.params,
+                    dataset,
+                    args.source_dataset_generation,
                 ):
                     _run(command)
                 with open(metrics_result, encoding="utf-8") as handle:
@@ -868,6 +986,11 @@ def main():
                     "profile_path": args.profile,
                     "profile_sha256": locked_profile_sha256,
                     "thresholds_sha256": locked_thresholds_sha256,
+                    "params_path": args.params,
+                    "params_sha256": params_sha256,
+                    "source_dataset_path": dataset,
+                    "source_dataset_sha256": source_dataset_sha256,
+                    "source_dataset_generation": args.source_dataset_generation,
                     "activation_minimum_strict_full_rows": activation_minimum,
                     "completed_at": datetime.now().isoformat(timespec="seconds"),
                 }
@@ -896,6 +1019,9 @@ def main():
                         "library_revision": args.library_revision,
                         "evaluated_at": datetime.now().isoformat(timespec="seconds"),
                         "checkpoint": threshold,
+                        "source_dataset_path": dataset,
+                        "source_dataset_sha256": source_dataset_sha256,
+                        "source_dataset_generation": args.source_dataset_generation,
                     }
                 )
                 _atomic_json(quality, quality_status)
