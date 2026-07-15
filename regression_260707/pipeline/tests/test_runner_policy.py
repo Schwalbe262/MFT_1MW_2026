@@ -319,6 +319,28 @@ class NsgaParallelTests(unittest.TestCase):
                     quality, quality_path, report, generation, dataset
                 )
 
+    def test_experimental_models_authenticate_without_production_acceptance(self):
+        from regression_260707.optimization import run_nsga2
+        import predictor
+        import train_models
+
+        record = {"generation": "sealed", "report": {"artifacts": {"x": "y"}}}
+        with mock.patch.object(
+            train_models, "load_generation", return_value=record
+        ) as load_generation, mock.patch.object(
+            predictor.EnsemblePredictor,
+            "_load_record",
+            side_effect=lambda target, active: (target, active),
+        ):
+            models = run_nsga2.load_models(
+                "registry", "generation", allow_unaccepted=True
+            )
+        load_generation.assert_called_once_with(
+            "registry", "generation", require_accepted=False
+        )
+        self.assertEqual(set(models), set(run_nsga2.REQUIRED_MODEL_TARGETS))
+        self.assertTrue(all(value[1] is record for value in models.values()))
+
     def test_restarts_are_parallel_bounded_and_returned_in_seed_order(self):
         from regression_260707.optimization import run_nsga2
 

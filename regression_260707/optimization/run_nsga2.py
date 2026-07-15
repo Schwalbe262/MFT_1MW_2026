@@ -168,14 +168,31 @@ def _experimental_quality_contract(
     return normalized
 
 
-def load_models(registry=None, generation=None):
+def load_models(registry=None, generation=None, *, allow_unaccepted=False):
     from predictor import EnsemblePredictor
     import predictor as predictor_mod
     reg = registry or predictor_mod.REGISTRY
+    generation_record = None
+    if generation and allow_unaccepted:
+        # The experimental lane is explicitly tied to failed quality evidence,
+        # so it cannot use EnsemblePredictor.load_generation(), whose contract
+        # correctly requires a passing production gate.  Still authenticate
+        # every model/report byte through the immutable registry inventory;
+        # the experimental quality contract above separately binds that report
+        # to the exact dataset, revision pins, row count, and blockers.
+        from train_models import load_generation
+
+        generation_record = load_generation(
+            reg, generation, require_accepted=False
+        )
     models = {}
     for t in REQUIRED_MODEL_TARGETS:
         try:
-            if generation:
+            if generation_record is not None:
+                models[t] = EnsemblePredictor._load_record(
+                    t, generation_record
+                )
+            elif generation:
                 models[t] = EnsemblePredictor.load_generation(
                     t, registry=reg, generation=generation
                 )
@@ -434,7 +451,11 @@ def main():
                 "dataset strict-full cohort does not match quality metadata"
             )
 
-    models = load_models(registry_for_models, generation=pinned_generation)
+    models = load_models(
+        registry_for_models,
+        generation=pinned_generation,
+        allow_unaccepted=experimental,
+    )
     missing = [target for target in REQUIRED_MODEL_TARGETS if target not in models]
     if missing:
         raise SystemExit(f"required model generation is incomplete: {missing}")
