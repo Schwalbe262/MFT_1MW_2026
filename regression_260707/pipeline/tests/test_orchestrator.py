@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import tempfile
 import unittest
 
@@ -168,6 +169,64 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(queue.get(first.jobs["train"]).state, "cancelled")
             self.assertEqual(queue.get(second.jobs["tune"]).state, "queued")
             self.assertEqual(queue.get(second.jobs["train"]).state, "queued")
+
+    def test_durable_checkpoint_state_advances_without_dataset_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "training").mkdir(parents=True)
+            (runtime / "campaign").mkdir()
+            dataset = root / "train.parquet"
+            dataset.write_bytes(b"stable dataset generation")
+            queue = DurableJobQueue(root / "pipeline" / "jobs.sqlite3")
+            orchestrator = PipelineOrchestrator(
+                queue,
+                GenerationStore(root / "pipeline" / "artifacts"),
+                runtime,
+                python=str(root / "python"),
+            )
+
+            training_dir = str(Path(__file__).resolve().parents[2] / "training")
+            import sys
+
+            if training_dir not in sys.path:
+                sys.path.insert(0, training_dir)
+            from checkpoint_contract import checkpoint_contract_identity
+
+            contract = checkpoint_contract_identity(solver_revision="a" * 40)
+            run_root = (
+                runtime
+                / "training"
+                / "checkpoint_runs"
+                / ("b" * 40 + "-c" + contract["checkpoint_contract_key"])
+            )
+            run_root.mkdir(parents=True)
+            (run_root / "checkpoint_state.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "identity": {
+                            **contract,
+                            "library_revision": "b" * 40,
+                        },
+                        "completed": [
+                            {"threshold": 500, "kind": "metrics_only"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = orchestrator.plan_cycle(
+                dataset_path=dataset,
+                strict_full_rows=2188,
+                solver_revision="a" * 40,
+                library_revision="b" * 40,
+                now=1200,
+            )
+
+            train = queue.get(result.jobs["train"])
+            self.assertIn("checkpoint-1000-", train.idempotency_key)
 
     def test_tuning_lookup_is_scoped_to_the_full_data_cohort(self):
         with tempfile.TemporaryDirectory() as directory:

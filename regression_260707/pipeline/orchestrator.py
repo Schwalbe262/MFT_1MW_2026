@@ -238,6 +238,47 @@ class PipelineOrchestrator:
                     )
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 pass
+
+        # ``strict_data_status.json`` is written before a checkpoint starts, so
+        # it can legitimately lag after a successful long-running worker.  The
+        # identity-scoped checkpoint state is the durable completion ledger;
+        # read it on every controller cycle so 500 -> 1000 -> 2000 progresses
+        # without waiting for the dataset bytes to change.
+        checkpoint_state_path = checkpoint_run_root / "checkpoint_state.json"
+        if checkpoint_state_path.is_file():
+            try:
+                checkpoint_state = json.loads(
+                    checkpoint_state_path.read_text(encoding="utf-8")
+                )
+                identity = checkpoint_state.get("identity") or {}
+                identity_matches = (
+                    checkpoint_state.get("schema_version") == 2
+                    and identity.get("checkpoint_contract_sha256")
+                    == contract["checkpoint_contract_sha256"]
+                    and identity.get("checkpoint_contract_key")
+                    == contract["checkpoint_contract_key"]
+                    and identity.get("solver_revision_cohort")
+                    == contract["solver_revision_cohort"]
+                    and identity.get("physics_data_revision")
+                    == contract["physics_data_revision"]
+                    and str(identity.get("library_revision") or "").lower()
+                    == library_revision.lower()
+                )
+                if identity_matches:
+                    completed_thresholds = [
+                        int(item["threshold"])
+                        for item in checkpoint_state.get("completed", [])
+                        if isinstance(item, dict)
+                        and isinstance(item.get("threshold"), int)
+                        and not isinstance(item.get("threshold"), bool)
+                        and 0 < int(item["threshold"]) <= rows
+                    ]
+                    active_rows = max(
+                        active_rows,
+                        max(completed_thresholds, default=0),
+                    )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
         checkpoint = next_training_checkpoint(rows, active_rows)
         if checkpoint is not None:
             dependencies = [tune_job.id] if tune_job else []
