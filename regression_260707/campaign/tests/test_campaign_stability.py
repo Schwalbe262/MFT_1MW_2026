@@ -294,12 +294,66 @@ class FeederTests(unittest.TestCase):
         with mock.patch.object(feeder, "_scheduler_json", return_value=rows) as get:
             self.assertEqual(feeder.campaign_inventory(), rows)
         self.assertEqual(get.call_args.kwargs["params"], {
-            "limit": 10000, "name_prefix": feeder.CAMPAIGN_PREFIX})
+            "compact": True,
+            "limit": feeder.CAMPAIGN_INVENTORY_PAGE_SIZE,
+            "name_prefix": feeder.CAMPAIGN_PREFIX,
+        })
 
         with mock.patch.object(feeder, "_scheduler_json", return_value=[{
                 "id": 3, "name": "mft-camp-foreign", "project": "IPMSM",
                 "status": "running"}]):
             with self.assertRaisesRegex(feeder.SchedulerError, "unexpected project"):
+                feeder.campaign_inventory()
+
+    def test_campaign_inventory_pages_all_rows_for_exact_reservations(self):
+        pages = [
+            [
+                {"id": 5, "name": "mft-camp-sx-ly-5", "project": "MFT_1MW_2026v1",
+                 "status": "completed"},
+                {"id": 4, "name": "mft-camp-sx-ly-4", "project": "",
+                 "status": "running"},
+            ],
+            [
+                {"id": 3, "name": "mft-camp-sx-ly-3", "project": "MFT_1MW_2026v1",
+                 "status": "failed"},
+                {"id": 2, "name": "mft-camp-sx-ly-2", "project": "MFT_1MW_2026v1",
+                 "status": "completed"},
+            ],
+            [
+                {"id": 1, "name": "mft-camp-c-legacy", "project": "",
+                 "status": "completed"},
+            ],
+        ]
+        with mock.patch.object(feeder, "CAMPAIGN_INVENTORY_PAGE_SIZE", 2), \
+                mock.patch.object(feeder, "_scheduler_json", side_effect=pages) as get:
+            tasks = feeder.campaign_inventory()
+
+        self.assertEqual([task["id"] for task in tasks], [5, 4, 3, 2, 1])
+        self.assertEqual(get.call_args_list[0].kwargs["params"], {
+            "compact": True, "limit": 2, "name_prefix": feeder.CAMPAIGN_PREFIX,
+        })
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["before_id"], 4)
+        self.assertEqual(get.call_args_list[2].kwargs["params"]["before_id"], 2)
+        self.assertEqual(
+            feeder.reserved_unjudged_rows(
+                {"outstanding": [], "task_expected_rows": {}},
+                tasks,
+                judged_ids={2, 3},
+            ),
+            10,
+        )  # IDs 4 and 5 reserve one row each; legacy ID 1 reserves eight.
+
+    def test_campaign_inventory_fails_closed_if_scheduler_ignores_cursor(self):
+        repeated = [
+            {"id": 2, "name": "mft-camp-sx-ly-2", "project": "MFT_1MW_2026v1",
+             "status": "running"},
+            {"id": 1, "name": "mft-camp-sx-ly-1", "project": "MFT_1MW_2026v1",
+             "status": "running"},
+        ]
+        with mock.patch.object(feeder, "CAMPAIGN_INVENTORY_PAGE_SIZE", 2), \
+                mock.patch.object(feeder, "_scheduler_json", side_effect=[repeated, repeated]):
+            with self.assertRaisesRegex(
+                    feeder.SchedulerError, "invalid/duplicate campaign task ID"):
                 feeder.campaign_inventory()
 
     def test_scheduler_snapshot_isolates_mft_from_ipmsm_and_allows_opening(self):

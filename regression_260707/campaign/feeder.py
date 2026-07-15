@@ -111,6 +111,7 @@ DEFAULT_POOLED_MEMORY_MB = 6144
 CPU_HEADROOM = 0.85
 SCHEDULER_ATTEMPTS = 3
 ACTIVE_TASK_STATUSES = ("queued", "attaching", "running")
+CAMPAIGN_INVENTORY_PAGE_SIZE = 2000
 PROFILE_PATH = os.path.join(HERE, "..", "verify", "profiles", "standard.json")
 TRAIN_PARQUET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 COLLECT_CACHE = os.path.join(HERE, "..", "data", "dataset", "collect_cache.json")
@@ -599,35 +600,50 @@ def dataset_row_count():
 
 
 def campaign_inventory():
-    payload = _scheduler_json(
-        "/api/tasks", params={
-            "limit": 10000,
-            "name_prefix": CAMPAIGN_PREFIX,
-        })
-    tasks = payload if isinstance(payload, list) else (
-        payload.get("tasks") if isinstance(payload, dict) else None)
-    if not isinstance(tasks, list):
-        raise SchedulerError("scheduler returned an invalid campaign task inventory")
     inventory = []
     seen_ids = set()
-    for task in tasks:
-        if not isinstance(task, dict):
-            raise SchedulerError("scheduler returned an invalid campaign task")
-        if not str(task.get("name") or "").startswith(CAMPAIGN_PREFIX):
-            raise SchedulerError(
-                "scheduler campaign prefix filter returned an unrelated task")
-        project = str(task.get("project") or "").strip()
-        if project not in ("", MFT_PROJECT):
-            raise SchedulerError(
-                f"campaign task belongs to unexpected project {project!r}")
-        task_id = task.get("id", task.get("task_id"))
-        if (isinstance(task_id, bool) or not isinstance(task_id, int)
-                or task_id <= 0 or task_id in seen_ids):
-            raise SchedulerError(
-                "scheduler returned an invalid/duplicate campaign task ID")
-        seen_ids.add(task_id)
-        inventory.append(task)
-    return inventory
+    before_id = 0
+    while True:
+        params = {
+            "compact": True,
+            "limit": CAMPAIGN_INVENTORY_PAGE_SIZE,
+            "name_prefix": CAMPAIGN_PREFIX,
+        }
+        if before_id:
+            params["before_id"] = before_id
+        payload = _scheduler_json("/api/tasks", params=params)
+        tasks = payload if isinstance(payload, list) else (
+            payload.get("tasks") if isinstance(payload, dict) else None)
+        if not isinstance(tasks, list) or len(tasks) > CAMPAIGN_INVENTORY_PAGE_SIZE:
+            raise SchedulerError("scheduler returned an invalid campaign task inventory")
+        page_ids = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                raise SchedulerError("scheduler returned an invalid campaign task")
+            if not str(task.get("name") or "").startswith(CAMPAIGN_PREFIX):
+                raise SchedulerError(
+                    "scheduler campaign prefix filter returned an unrelated task")
+            project = str(task.get("project") or "").strip()
+            if project not in ("", MFT_PROJECT):
+                raise SchedulerError(
+                    f"campaign task belongs to unexpected project {project!r}")
+            task_id = task.get("id", task.get("task_id"))
+            if (isinstance(task_id, bool) or not isinstance(task_id, int)
+                    or task_id <= 0 or task_id in seen_ids
+                    or (before_id and task_id >= before_id)):
+                raise SchedulerError(
+                    "scheduler returned an invalid/duplicate campaign task ID")
+            seen_ids.add(task_id)
+            page_ids.append(task_id)
+            inventory.append(task)
+        if len(tasks) < CAMPAIGN_INVENTORY_PAGE_SIZE:
+            return inventory
+        if not page_ids:
+            raise SchedulerError("scheduler campaign inventory cursor did not advance")
+        next_before_id = min(page_ids)
+        if before_id and next_before_id >= before_id:
+            raise SchedulerError("scheduler campaign inventory cursor did not advance")
+        before_id = next_before_id
 
 
 def expected_task_rows(task):
