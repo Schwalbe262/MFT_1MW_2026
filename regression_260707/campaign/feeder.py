@@ -131,6 +131,9 @@ def _pooled_submission_kwargs(args):
             "MFT_AEDT_SCHEDULER_URL": args.aedt_pool_url,
             "MFT_SLURM_SCHEDULER_ROOT": args.aedt_pool_pkg_root,
             "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": args.aedt_pool_token_file,
+            "MFT_AEDT_POOL_WORKSPACE": (
+                "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
+            ),
             "MFT_AEDT_SESSION_VERSION": args.aedt_session_version,
             "MFT_AEDT_ISOLATION_POLICY": args.aedt_isolation_policy,
         },

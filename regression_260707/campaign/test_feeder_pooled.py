@@ -218,6 +218,9 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "MFT_AEDT_SCHEDULER_URL": "https://pool.example.test:8443",
             "MFT_AEDT_SESSION_VERSION": "2025.2",
             "MFT_AEDT_ISOLATION_POLICY": "family",
+            "MFT_AEDT_POOL_WORKSPACE": (
+                "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
+            ),
             "MFT_SLURM_SCHEDULER_ROOT": "/opt/pool package",
             "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": "/run/pool token",
         }
@@ -292,7 +295,11 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 f'export {key}="{value}";',
                 pooled_command,
             )
-        self.assertNotIn("MFT_AEDT_POOL_WORKSPACE", pooled_command)
+        self.assertIn(
+            'export MFT_AEDT_POOL_WORKSPACE='
+            '"/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}";',
+            pooled_command,
+        )
         self.assertNotIn("MFT_AEDT_POOL_WORKSPACE_ROOT", pooled_command)
 
         shared_payload = self._capture_cli_payload([
@@ -308,7 +315,11 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             'export MFT_AEDT_ISOLATION_POLICY="shared_if_compatible";',
             shared_payload["command"],
         )
-        self.assertNotIn("MFT_AEDT_POOL_WORKSPACE", shared_payload["command"])
+        self.assertIn(
+            'export MFT_AEDT_POOL_WORKSPACE='
+            '"/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}";',
+            shared_payload["command"],
+        )
 
         legacy_payload = self._capture_cli_payload([])
         legacy_command = legacy_payload["command"]
