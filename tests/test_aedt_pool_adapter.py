@@ -119,6 +119,7 @@ def test_pooled_acquire_always_requests_exclusive_session(monkeypatch, tmp_path)
     assert requests[0][2]["project_namespace"] == "mft"
     assert requests[0][2]["isolation_policy"] == "exclusive"
     assert requests[0][2]["protocol_version"] == 2
+    assert requests[0][2]["admission_timeout_seconds"] == 1800
     assert requests[0][2]["session_profile"] == adapter.pooled_session_profile()
     assert lease.calls[0][0] == "wait"
     assert lease.calls[1][0] == "connect"

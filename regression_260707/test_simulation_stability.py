@@ -3145,9 +3145,16 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
 
     def test_pooled_thermal_dispatch_reuses_host_dso_without_cores_override(self):
         simulation, ipk, setup, analyze, _rebind = self._harness(None)
+        simulation.solver_may_be_running = False
         converged = self._telemetry(
             "converged", converged=1, monitor_file="fresh.sd"
         )
+
+        def assert_dispatch_window(**_kwargs):
+            self.assertTrue(simulation.solver_may_be_running)
+            return None
+
+        analyze.side_effect = assert_dispatch_window
 
         with patch(
             "module.aedt_pool_adapter.pooled_backend_enabled",
@@ -3163,6 +3170,75 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
         analyze.assert_called_once_with(setup="ThermalSetup", blocking=True)
         self.assertEqual(result["solve_attempts"], 1)
         self.assertEqual(result["convergence"]["thermal_converged"], 1)
+        self.assertFalse(simulation.solver_may_be_running)
+
+    def test_pooled_thermal_preflight_failure_is_project_local(self):
+        simulation, ipk, setup, analyze, _rebind = self._harness(
+            None, setups=("OtherSetup",)
+        )
+        simulation.solver_may_be_running = False
+
+        with patch(
+            "module.aedt_pool_adapter.pooled_backend_enabled",
+            return_value=True,
+        ), self.assertRaisesRegex(RuntimeError, "native thermal setup mismatch"):
+            _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        analyze.assert_not_called()
+        self.assertFalse(simulation.solver_may_be_running)
+
+    def test_pooled_thermal_false_without_native_evidence_stays_uncertain(self):
+        simulation, ipk, setup, _analyze, _rebind = self._harness(False)
+        simulation.solver_may_be_running = False
+        missing = self._telemetry("monitor_missing")
+        desktop = simulation._native_desktop_handle.return_value
+        desktop.AreThereSimulationsRunning.side_effect = [
+            False,
+            RuntimeError("transport state unavailable"),
+        ]
+
+        with patch(
+            "module.aedt_pool_adapter.pooled_backend_enabled",
+            return_value=True,
+        ), patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            return_value=missing,
+        ), self.assertRaisesRegex(
+            RuntimeError, "pooled thermal native solve state is uncertain"
+        ):
+            _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        self.assertTrue(simulation.solver_may_be_running)
+
+    def test_pooled_thermal_exception_with_monitor_stays_uncertain_until_idle(self):
+        simulation, ipk, setup, analyze, _rebind = self._harness(None)
+        analyze.side_effect = RuntimeError("native analyze transport failed")
+        simulation.solver_may_be_running = False
+        malformed = self._telemetry("monitor_malformed", monitor_file="fresh.sd")
+        desktop = simulation._native_desktop_handle.return_value
+        desktop.AreThereSimulationsRunning.side_effect = [
+            False,
+            RuntimeError("transport state unavailable"),
+        ]
+
+        with patch(
+            "module.aedt_pool_adapter.pooled_backend_enabled",
+            return_value=True,
+        ), patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            return_value=malformed,
+        ), self.assertRaisesRegex(
+            RuntimeError, "pooled thermal native solve state is uncertain"
+        ):
+            _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        self.assertTrue(simulation.solver_may_be_running)
 
     def test_false_and_missing_monitor_rebinds_and_retries_only_once(self):
         simulation, ipk, setup, analyze, rebind = self._harness([False, False])

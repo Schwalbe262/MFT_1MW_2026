@@ -6688,11 +6688,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             )
             t0 = time.monotonic()
             try:
-                if backend == "pooled":
-                    sim.solver_may_be_running = True
                 df_thermal = run_thermal_analysis(sim)
-                if backend == "pooled":
-                    sim.solver_may_be_running = False
             except Exception as thermal_error:
                 logging.exception(f"thermal stage failed: {thermal_error}")
                 log_failed_sample(

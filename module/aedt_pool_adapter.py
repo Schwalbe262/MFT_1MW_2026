@@ -123,6 +123,7 @@ def pooled_session_profile() -> dict[str, Any]:
         "profile_version": 2,
         "aedt_version": version,
         "python_environment": "pyaedt2026v1",
+        "pyaedt_version": "0.22.0",
         "filesystem": "gpfs-shared-v1",
         "desktop_dso": {
             "config_name": "pyaedt_config",
@@ -204,6 +205,13 @@ def acquire_pooled_desktop(
     shared_mode = "canary" if shared_canary_enabled() else "pilot"
     workspace = pooled_workspace_path()
     request_mode = "1to2-" + shared_mode if shared else "1to1"
+    lease_wait_seconds = _positive_int_env(
+        "MFT_AEDT_LEASE_WAIT_SECONDS", 1800
+    )
+    if not 30 <= lease_wait_seconds <= 3600:
+        raise RuntimeError(
+            "MFT_AEDT_LEASE_WAIT_SECONDS must be between 30 and 3600"
+        )
     lease = client.acquire_project_lease(
         scheduler_url,
         pending_project,
@@ -218,15 +226,14 @@ def acquire_pooled_desktop(
         isolation_policy=pooled_isolation_policy(exclusive=not shared),
         workspace_path=str(workspace),
         protocol_version=2,
+        admission_timeout_seconds=lease_wait_seconds,
         heartbeat_seconds=_positive_int_env(
             "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
         ),
     )
     try:
         lease.wait_until_leased(
-            timeout_seconds=_positive_int_env(
-                "MFT_AEDT_LEASE_WAIT_SECONDS", 1800
-            ),
+            timeout_seconds=lease_wait_seconds,
             heartbeat_seconds=_positive_int_env(
                 "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
             ),

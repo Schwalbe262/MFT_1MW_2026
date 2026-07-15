@@ -822,17 +822,30 @@ def _solve_exact_thermal_setup(
         returned = None
         exception_type = ""
         exception_message = ""
+        from module.aedt_pool_adapter import pooled_backend_enabled
+
+        pooled_backend = pooled_backend_enabled()
         try:
             analyze_kwargs = {"setup": setup_name, "blocking": True}
-            from module.aedt_pool_adapter import pooled_backend_enabled
-
-            if not pooled_backend_enabled():
+            if not pooled_backend:
                 analyze_kwargs["cores"] = sim.NUM_CORE
             # Passing ``cores=`` asks PyAEDT to rewrite and later restore the
             # Desktop-global Icepak DSO registry.  A pooled Desktop can have a
             # sibling MFT/IPMSM project, so it must reuse the host-owned,
             # read-back-verified profile instead.
+            if pooled_backend:
+                # Set uncertainty at the last possible moment. Geometry,
+                # materials, mesh, and setup failures above are project-local
+                # script errors and must not quarantine a healthy shared host.
+                sim.solver_may_be_running = True
             returned = native_ipk.analyze(**analyze_kwargs)
+            if pooled_backend:
+                # blocking=True returned normally, so this project's solver is
+                # no longer an unknown in-flight native operation. PyAEDT also
+                # returns False when native Analyze raised internally, so that
+                # value remains uncertain until the evidence poll proves idle.
+                if returned is not False:
+                    sim.solver_may_be_running = False
             if returned is False:
                 status = "false"
                 logging.warning(
@@ -851,6 +864,13 @@ def _solve_exact_thermal_setup(
             timeout_s=monitor_grace_s, poll_s=poll_s,
             clock=clock, sleeper=sleeper,
         )
+        reason = convergence["thermal_convergence_reason"]
+        if pooled_backend and running is False:
+            # Only an exact project-scoped idle result proves that a False or
+            # exceptional native dispatch did not leave work in flight. A
+            # monitor can prove startup/progress, but not that the solver
+            # process has stopped.
+            sim.solver_may_be_running = False
         if status != "success" or convergence["thermal_convergence_reason"] != "converged":
             preflight["model_context"] = _bounded_thermal_model_context(ipk)
             if not messages:
@@ -874,7 +894,6 @@ def _solve_exact_thermal_setup(
             "identity": preflight,
         })
 
-        reason = convergence["thermal_convergence_reason"]
         if reason in {"converged", "residual_threshold", "monitor_malformed"}:
             break
         retryable = status in {"false", "exception"} \
@@ -896,6 +915,14 @@ def _solve_exact_thermal_setup(
     }
     forensic_json = _thermal_forensic_json(attempts, convergence)
     logging.warning("[thermal] dispatch forensic: %s", forensic_json)
+    if pooled_backend and bool(getattr(sim, "solver_may_be_running", False)):
+        # Never flow into normal project close/release with an uncertain native
+        # Icepak operation. The outer pooled failure path reports this as a
+        # solver fault and lets the session host quarantine/recycle safely.
+        raise RuntimeError(
+            "pooled thermal native solve state is uncertain: "
+            + forensic_json[:4000]
+        )
     return {
         "convergence": convergence,
         "solve_attempts": len(attempts),
