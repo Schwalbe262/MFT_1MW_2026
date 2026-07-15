@@ -324,6 +324,79 @@ class RunnerTests(unittest.TestCase):
 
 
 class NsgaParallelTests(unittest.TestCase):
+    def _experimental_quality_fixture(self, root):
+        from regression_260707.optimization import run_nsga2
+        import hashlib
+
+        generation = root / "registry" / "generations" / "run-1"
+        generation.mkdir(parents=True)
+        dataset = root / "strict.parquet"
+        dataset.write_bytes(b"strict-2188")
+        dataset_sha = hashlib.sha256(dataset.read_bytes()).hexdigest()
+        report = {
+            "training_run_id": "run-1",
+            "dataset_sha256": dataset_sha,
+            "strict_full_rows": 2188,
+        }
+        report_path = generation / "train_report.json"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        quality = {
+            "schema_version": 1,
+            "lane": "provisional_2000_surrogate",
+            "passed": False,
+            "activation_performed": False,
+            "nsga2_enqueued": False,
+            "verification_enqueued": False,
+            "strict_full_rows": 2188,
+            "production_minimum_strict_full_rows": 3000,
+            "provisional_minimum_strict_full_rows": 2000,
+            "solver_revision_pin": "a" * 40,
+            "library_revision_pin": "b" * 40,
+            "dataset_sha256": dataset_sha,
+            "generation_report_sha256": hashlib.sha256(
+                report_path.read_bytes()
+            ).hexdigest(),
+            "failed_targets": {"Llt_phys": ["mape_pct"]},
+            "terminal_reason": "provisional_quality_gate_failed",
+        }
+        quality_path = root / "quality.json"
+        quality_path.write_text(json.dumps(quality), encoding="utf-8")
+        return run_nsga2, generation, dataset, report, quality, quality_path
+
+    def test_experimental_quality_is_fail_closed_and_revision_pinned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = self._experimental_quality_fixture(root)
+            run_nsga2, generation, dataset, report, quality, quality_path = values
+            normalized = run_nsga2._experimental_quality_contract(
+                quality, quality_path, report, generation, dataset
+            )
+            self.assertFalse(normalized["passed"])
+            self.assertEqual(normalized["training_run_id"], "run-1")
+            self.assertEqual(normalized["solver_revision"], "a" * 40)
+            self.assertEqual(normalized["library_revision"], "b" * 40)
+            self.assertEqual(len(normalized["quality_status_sha256"]), 64)
+
+            quality["passed"] = True
+            with self.assertRaisesRegex(SystemExit, "contract mismatch"):
+                run_nsga2._experimental_quality_contract(
+                    quality, quality_path, report, generation, dataset
+                )
+
+    def test_experimental_quality_rejects_tampered_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = self._experimental_quality_fixture(root)
+            run_nsga2, generation, dataset, report, quality, quality_path = values
+            (generation / "train_report.json").write_text(
+                json.dumps({**report, "strict_full_rows": 2189}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "identity mismatch"):
+                run_nsga2._experimental_quality_contract(
+                    quality, quality_path, report, generation, dataset
+                )
+
     def test_restarts_are_parallel_bounded_and_returned_in_seed_order(self):
         from regression_260707.optimization import run_nsga2
 
