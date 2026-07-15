@@ -217,8 +217,12 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "MFT_AEDT_SHARED_CANARY": "1",
             "MFT_AEDT_SCHEDULER_URL": "https://pool.example.test:8443",
             "MFT_AEDT_SESSION_VERSION": "2025.2",
+            "MFT_AEDT_SESSION_PROFILE": feeder.AEDT_SESSION_PROFILE,
             "MFT_AEDT_ISOLATION_POLICY": "family",
             "MFT_AEDT_POOL_WORKSPACE": (
+                "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
+            ),
+            "MFT_AEDT_WORKSPACE_PATH": (
                 "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
             ),
             "MFT_SLURM_SCHEDULER_ROOT": "/opt/pool package",
@@ -269,6 +273,12 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         self.assertEqual(pooled_payload["cpus"], 2)
         self.assertEqual(pooled_payload["memory_mb"], 8192)
         self.assertNotIn("submission_env", pooled_payload)
+        expected_env_setup = "\n".join(
+            f"export {key}="
+            f"{feeder.scheduler_client._shell_double_quote_expandable(value)}"
+            for key, value in sorted(expected_env.items())
+        )
+        self.assertEqual(pooled_payload["env_setup"], expected_env_setup)
         pooled_command = pooled_payload["command"]
         self.assertIn(
             'MFT_WORKDIR="$MFT_GPFS_WORKDIR";',
@@ -286,13 +296,15 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         )
 
         env_exports = "".join(
-            f'export {key}="{value}"; '
+            f"export {key}="
+            f"{feeder.scheduler_client._shell_double_quote_expandable(value)}; "
             for key, value in sorted(expected_env.items())
         )
         self.assertEqual(pooled_command.count(env_exports), 1)
         for key, value in expected_env.items():
             self.assertIn(
-                f'export {key}="{value}";',
+                f"export {key}="
+                f"{feeder.scheduler_client._shell_double_quote_expandable(value)};",
                 pooled_command,
             )
         self.assertNotIn(
@@ -338,6 +350,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         normalized["cpus"] = legacy_payload["cpus"]
         normalized["memory_mb"] = legacy_payload["memory_mb"]
         normalized.pop("command")
+        normalized.pop("env_setup")
         legacy_without_command = copy.deepcopy(legacy_payload)
         legacy_without_command.pop("command")
         self.assertEqual(normalized, legacy_without_command)

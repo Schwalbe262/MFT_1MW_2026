@@ -72,6 +72,40 @@ DEFAULT_AEDT_POOL_CLIENT_TOKEN_FILE = "$HOME/slurm_scheduler/aedt_pool_client"
 DEFAULT_AEDT_SESSION_VERSION = "2025.2"
 DEFAULT_AEDT_ISOLATION_POLICY = "family"
 AEDT_ISOLATION_POLICIES = ("family", "shared_if_compatible")
+AEDT_SESSION_PROFILE = json.dumps(
+    {
+        "profile_version": 2,
+        "aedt_version": "2025.2",
+        "python_environment": "pyaedt2026v1",
+        "pyaedt_version": "0.22.0",
+        "filesystem": "gpfs-shared-v1",
+        "desktop_dso": {
+            "config_name": "pyaedt_config",
+            "designs": {
+                "Icepak": {
+                    "cores": 4,
+                    "tasks": 1,
+                    "gpus": 0,
+                    "use_auto_settings": False,
+                },
+                "Maxwell 2D": {
+                    "cores": 4,
+                    "tasks": 1,
+                    "gpus": 0,
+                    "use_auto_settings": True,
+                },
+                "Maxwell 3D": {
+                    "cores": 4,
+                    "tasks": 1,
+                    "gpus": 0,
+                    "use_auto_settings": True,
+                },
+            },
+        },
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+)
 DEFAULT_POOLED_CPUS = 1
 DEFAULT_POOLED_MEMORY_MB = 6144
 CPU_HEADROOM = 0.85
@@ -139,7 +173,11 @@ def _pooled_submission_kwargs(args):
             "MFT_AEDT_POOL_WORKSPACE": (
                 "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
             ),
+            "MFT_AEDT_WORKSPACE_PATH": (
+                "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
+            ),
             "MFT_AEDT_SESSION_VERSION": args.aedt_session_version,
+            "MFT_AEDT_SESSION_PROFILE": AEDT_SESSION_PROFILE,
             "MFT_AEDT_ISOLATION_POLICY": args.aedt_isolation_policy,
         },
     }

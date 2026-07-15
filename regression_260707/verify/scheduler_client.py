@@ -674,6 +674,10 @@ def _submit_verification_locked(
         f"export {key}={_shell_double_quote_expandable(value)}; "
         for key, value in sorted(normalized_env.items())
     )
+    pooled_env_setup = "\n".join(
+        f"export {key}={_shell_double_quote_expandable(value)}"
+        for key, value in sorted(normalized_env.items())
+    )
     extra = profile.get("cli_flags", "")
     run_identity = (
         f"s{solver_revision[:12]}-l{library_revision[:12]}-p{parameter_digest}")
@@ -800,6 +804,10 @@ def _submit_verification_locked(
         # every terminal path, including cancellation and allocation loss.
         "cleanup_globs": scratch_leaf,
     }
+    if aedt_backend == "pooled":
+        # Persist the exact literal contract separately from the command so
+        # scheduler admission can validate it without interpreting shell.
+        payload["env_setup"] = pooled_env_setup
     if aedt_backend is not None:
         payload["aedt_backend"] = aedt_backend
     existing = reconcile_task_id(name, dedupe_key)
