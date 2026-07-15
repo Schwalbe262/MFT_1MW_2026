@@ -356,6 +356,40 @@ class StrictRowContractTests(unittest.TestCase):
         )
         self.assertEqual(audited.attrs["provenance_equivalent_rows"], 1)
 
+    def test_pooled_release_reuses_reviewed_same_physics_rows(self):
+        expected_solver = "26afff8de2936f605783395fbff19d5f1d26b354"
+        approved_solver = "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7"
+        baseline_solver = "262574a886cef9e0f8f550d12571cf6d54c826e2"
+        excluded_solver = "dba903eb671e37642168afc5578b8e6a93e9c046"
+
+        self.assertEqual(
+            QUALITY_SOLVER_EQUIVALENCE[expected_solver],
+            frozenset({
+                baseline_solver,
+                approved_solver,
+                "66ee6685859c207eafdca796120e2e1643f72f5c",
+                "f0271da72ff4b9f085b3927769c583c163792adb",
+                "f411bf5492669f87896eb657b9e5db2998d219a7",
+                "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
+            }),
+        )
+        rows = [
+            _valid_native_result(git_hash=expected_solver),
+            _valid_native_result(git_hash=baseline_solver),
+            _valid_native_result(git_hash=approved_solver),
+            _valid_native_result(git_hash=excluded_solver),
+        ]
+        audited = annotate_validity(
+            pd.DataFrame(rows),
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertEqual(
+            audited["_strict_valid_full"].tolist(),
+            [True, True, True, False],
+        )
+        self.assertEqual(audited.attrs["provenance_equivalent_rows"], 2)
+
     def test_legacy_false_positive_is_quarantined(self):
         row = valid_result(conv_error_pct_matrix=13.254)
         result = validate_record(row)

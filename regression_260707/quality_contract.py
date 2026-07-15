@@ -70,6 +70,19 @@ PHYSICS_EQUIVALENT_SOLVER_REVISIONS: dict[str, frozenset[str]] = {
         "f411bf5492669f87896eb657b9e5db2998d219a7",
         "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
     }),
+    # Reviewed 2026-07-15: 262574a..26afff8 changes only the pooled
+    # Desktop transport/lifecycle, exact-project cache rebind, host-owned DSO
+    # handling, and failure quarantine.  Geometry, materials, setups,
+    # expressions, and PHYSICS_DATA_REVISION are unchanged.  Keep the runtime
+    # solver pin at 26afff8 while reusing the already approved physical rows.
+    "26afff8de2936f605783395fbff19d5f1d26b354": frozenset({
+        "262574a886cef9e0f8f550d12571cf6d54c826e2",
+        "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7",
+        "66ee6685859c207eafdca796120e2e1643f72f5c",
+        "f0271da72ff4b9f085b3927769c583c163792adb",
+        "f411bf5492669f87896eb657b9e5db2998d219a7",
+        "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
+    }),
 }
 # Explicitly not enrolled: these physics-adjacent diffs remain unreviewed.
 # dba903eb671e37642168afc5578b8e6a93e9c046
