@@ -360,11 +360,13 @@ class StrictRowContractTests(unittest.TestCase):
         expected_solver = "26afff8de2936f605783395fbff19d5f1d26b354"
         approved_solver = "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7"
         baseline_solver = "262574a886cef9e0f8f550d12571cf6d54c826e2"
+        shared_result_solver = "267860a86dc8c8017c4b713f6674c0614cc365ce"
         excluded_solver = "dba903eb671e37642168afc5578b8e6a93e9c046"
 
         self.assertEqual(
             QUALITY_SOLVER_EQUIVALENCE[expected_solver],
             frozenset({
+                shared_result_solver,
                 baseline_solver,
                 approved_solver,
                 "66ee6685859c207eafdca796120e2e1643f72f5c",
@@ -375,6 +377,7 @@ class StrictRowContractTests(unittest.TestCase):
         )
         rows = [
             _valid_native_result(git_hash=expected_solver),
+            _valid_native_result(git_hash=shared_result_solver),
             _valid_native_result(git_hash=baseline_solver),
             _valid_native_result(git_hash=approved_solver),
             _valid_native_result(git_hash=excluded_solver),
@@ -386,9 +389,9 @@ class StrictRowContractTests(unittest.TestCase):
         )
         self.assertEqual(
             audited["_strict_valid_full"].tolist(),
-            [True, True, True, False],
+            [True, True, True, True, False],
         )
-        self.assertEqual(audited.attrs["provenance_equivalent_rows"], 2)
+        self.assertEqual(audited.attrs["provenance_equivalent_rows"], 3)
 
     def test_legacy_false_positive_is_quarantined(self):
         row = valid_result(conv_error_pct_matrix=13.254)
