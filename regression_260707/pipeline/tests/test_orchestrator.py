@@ -32,6 +32,16 @@ class OrchestratorTests(unittest.TestCase):
             )
 
             self.assertEqual(set(result.jobs), {"collect", "tune", "train"})
+            collect = queue.get(result.jobs["collect"])
+            command = collect.payload["command"]
+            self.assertEqual(
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--extra-prefix"
+                ],
+                ["mft-1to3", "mft-mixed", "mft-9way"],
+            )
             train_dependencies = queue.dependencies(result.jobs["train"])
             self.assertEqual([job.id for job in train_dependencies], [result.jobs["tune"]])
             self.assertIsNotNone(queue.claim("collector", job_types=["collect"], now=1201))

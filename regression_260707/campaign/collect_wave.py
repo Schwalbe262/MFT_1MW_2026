@@ -226,6 +226,23 @@ def list_tasks(prefix):
     return list(seen.values())
 
 
+def list_tasks_for_prefixes(prefixes):
+    """Return the union of scheduler tasks for an explicit prefix allowlist."""
+    normalized = []
+    for value in prefixes:
+        prefix = str(value or "").strip()
+        if not prefix:
+            raise ValueError("task prefixes must be non-empty")
+        if prefix not in normalized:
+            normalized.append(prefix)
+
+    tasks_by_id = {}
+    for prefix in normalized:
+        for task in list_tasks(prefix):
+            tasks_by_id[int(task["id"])] = task
+    return sorted(tasks_by_id.values(), key=lambda task: int(task["id"]))
+
+
 # 터미널 태스크의 회수 결과 캐시: 재수집 시 재조회 생략 (회수 시간 수분 -> 초)
 CACHE_PATH = os.path.join(DATASET_DIR, "collect_cache.json")
 CACHE_WRITE_ATTEMPTS = 5
@@ -1164,6 +1181,13 @@ def merge_dataset(merged, dedup_keys, prefix, pending_harvested=(), pending_noda
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefix", default="mft-camp")
+    ap.add_argument(
+        "--extra-prefix", action="append", default=[],
+        help=(
+            "additional scheduler task-name prefix to collect; repeat this "
+            "option to use an explicit allowlist"
+        ),
+    )
     ap.add_argument("--max-conv-err", type=float, default=1.5)
     ap.add_argument("--cancelled-fetch-limit", type=int, default=500)
     ap.add_argument(
@@ -1180,7 +1204,11 @@ def main(argv=None):
     if repaired_master_rows:
         print(f"thermal_master_rows_demoted: {repaired_master_rows}")
 
-    tasks = list_tasks(args.prefix)
+    prefixes = tuple(dict.fromkeys([args.prefix, *args.extra_prefix]))
+    tasks = list_tasks_for_prefixes(prefixes)
+    collection_label = "+".join(prefixes)
+    if len(prefixes) > 1:
+        print(f"task prefixes: {', '.join(prefixes)}")
     done = [t for t in tasks if t.get("status") == "completed"]
     failed = [t for t in tasks if t.get("status") == "failed"]
     cancelled = [t for t in tasks if t.get("status") == "cancelled"]
@@ -1339,7 +1367,7 @@ def main(argv=None):
     print(f"convergence filter (<= {args.max_conv_err}%): -{n_filtered} rows")
 
     new_unique_rows, total_rows, master_path = merge_dataset(
-        merged, dedup_keys, args.prefix,
+        merged, dedup_keys, collection_label,
         pending_harvested=pending_harvested, pending_nodata=pending_nodata,
         pending_local_parts=pending_local_parts)
     print(f"new_unique_rows: {new_unique_rows}")

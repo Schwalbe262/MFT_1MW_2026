@@ -235,6 +235,33 @@ class TrainIoCollectorTests(unittest.TestCase):
         frame[collect_wave.SOURCE_RANK_COLUMN] = collect_wave.SOURCE_RANK_JSON
         return frame
 
+    def test_multiple_prefix_inventory_is_allowlisted_deduplicated_and_sorted(self):
+        inventories = {
+            "mft-camp": [
+                {"id": 12, "name": "mft-camp-12"},
+                {"id": 10, "name": "mft-camp-10"},
+            ],
+            "mft-9way": [
+                {"id": 13, "name": "mft-9way-q18-13"},
+                {"id": 12, "name": "mft-camp-12"},
+            ],
+        }
+
+        with mock.patch.object(
+            collect_wave,
+            "list_tasks",
+            side_effect=lambda prefix: inventories[prefix],
+        ) as list_tasks:
+            tasks = collect_wave.list_tasks_for_prefixes(
+                ["mft-camp", "mft-9way", "mft-camp"]
+            )
+
+        self.assertEqual([task["id"] for task in tasks], [10, 12, 13])
+        self.assertEqual(
+            [call.args[0] for call in list_tasks.call_args_list],
+            ["mft-camp", "mft-9way"],
+        )
+
     def test_merge_preserves_raw_and_writes_matching_atomic_views(self):
         new_rows, total, _ = collect_wave.merge_dataset(
             self.ranked_rows(), ["project_name", "saved_at"], "mft-camp"
