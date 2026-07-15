@@ -68,7 +68,7 @@ MAX_POOLED_PROJECT_ACTIVE_TASKS = (
 COUNT_PER_TASK = 1
 CPUS_PER_TASK = 4
 DEFAULT_AEDT_POOL_PKG_ROOT = "$HOME/slurm_scheduler/aedt_pool_pkg"
-DEFAULT_AEDT_POOL_TOKEN_FILE = "$HOME/slurm_scheduler/aedt_pool_bootstrap"
+DEFAULT_AEDT_POOL_CLIENT_TOKEN_FILE = "$HOME/slurm_scheduler/aedt_pool_client"
 DEFAULT_AEDT_SESSION_VERSION = "2025.2"
 DEFAULT_AEDT_ISOLATION_POLICY = "family"
 AEDT_ISOLATION_POLICIES = ("family", "shared_if_compatible")
@@ -114,7 +114,10 @@ def _pooled_submission_kwargs(args):
             raise SchedulerError(f"{flag} must be a positive integer")
     for value, flag in (
             (args.aedt_pool_pkg_root, "--aedt-pool-pkg-root"),
-            (args.aedt_pool_token_file, "--aedt-pool-token-file"),
+            (
+                args.aedt_pool_client_token_file,
+                "--aedt-pool-client-token-file",
+            ),
             (args.aedt_session_version, "--aedt-session-version")):
         if not isinstance(value, str) or not value.strip():
             raise SchedulerError(f"{flag} must be non-empty")
@@ -130,7 +133,9 @@ def _pooled_submission_kwargs(args):
             "MFT_AEDT_SHARED_CANARY": "1",
             "MFT_AEDT_SCHEDULER_URL": args.aedt_pool_url,
             "MFT_SLURM_SCHEDULER_ROOT": args.aedt_pool_pkg_root,
-            "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": args.aedt_pool_token_file,
+            "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE": (
+                args.aedt_pool_client_token_file
+            ),
             "MFT_AEDT_POOL_WORKSPACE": (
                 "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
             ),
@@ -1186,9 +1191,15 @@ def _argument_parser():
         metavar="PATH",
     )
     ap.add_argument(
+        "--aedt-pool-client-token-file",
         "--aedt-pool-token-file",
-        default=DEFAULT_AEDT_POOL_TOKEN_FILE,
+        dest="aedt_pool_client_token_file",
+        default=DEFAULT_AEDT_POOL_CLIENT_TOKEN_FILE,
         metavar="PATH",
+        help=(
+            "path to the lease-create-only client credential; "
+            "--aedt-pool-token-file is a deprecated alias"
+        ),
     )
     ap.add_argument(
         "--aedt-session-version",

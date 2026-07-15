@@ -222,7 +222,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
             ),
             "MFT_SLURM_SCHEDULER_ROOT": "/opt/pool package",
-            "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": "/run/pool token",
+            "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE": "/run/pool token",
         }
 
         defaults = feeder._argument_parser().parse_args([
@@ -234,8 +234,8 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "$HOME/slurm_scheduler/aedt_pool_pkg",
         )
         self.assertEqual(
-            defaults.aedt_pool_token_file,
-            "$HOME/slurm_scheduler/aedt_pool_bootstrap",
+            defaults.aedt_pool_client_token_file,
+            "$HOME/slurm_scheduler/aedt_pool_client",
         )
         self.assertEqual(defaults.aedt_session_version, "2025.2")
         self.assertEqual(defaults.aedt_isolation_policy, "family")
@@ -252,8 +252,8 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             default_payload["command"],
         )
         self.assertIn(
-            'export SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE='
-            '"$HOME/slurm_scheduler/aedt_pool_bootstrap";',
+            'export SLURM_AEDT_POOL_CLIENT_TOKEN_FILE='
+            '"$HOME/slurm_scheduler/aedt_pool_client";',
             default_payload["command"],
         )
 
@@ -261,7 +261,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "--aedt-pooled",
             "--aedt-pool-url", "https://pool.example.test:8443",
             "--aedt-pool-pkg-root", "/opt/pool package",
-            "--aedt-pool-token-file", "/run/pool token",
+            "--aedt-pool-client-token-file", "/run/pool token",
             "--pooled-cpus", "2",
             "--pooled-memory-mb", "8192",
         ])
@@ -295,6 +295,9 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 f'export {key}="{value}";',
                 pooled_command,
             )
+        self.assertNotIn(
+            "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE", pooled_command
+        )
         self.assertIn(
             'export MFT_AEDT_POOL_WORKSPACE='
             '"/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}";',
@@ -368,6 +371,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 "MFT_AEDT_SHARED_CANARY",
                 "MFT_AEDT_SCHEDULER_URL",
                 "MFT_SLURM_SCHEDULER_ROOT",
+                "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE",
                 "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE"):
             self.assertNotIn(key, payload["command"])
 
