@@ -33,6 +33,7 @@ class OrchestratorTests(unittest.TestCase):
 
             self.assertEqual(set(result.jobs), {"collect", "tune", "train"})
             collect = queue.get(result.jobs["collect"])
+            self.assertTrue(collect.idempotency_key.startswith("collector-v2-window-"))
             command = collect.payload["command"]
             self.assertEqual(
                 [

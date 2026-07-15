@@ -135,7 +135,7 @@ class PipelineOrchestrator:
         jobs: dict[str, int] = {}
         collect = self.queue.enqueue(
             "collect",
-            f"collector-window-{bucket}",
+            f"collector-v2-window-{bucket}",
             {
                 "command": [
                     self.python,
