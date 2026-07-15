@@ -675,6 +675,7 @@ def _prepare_thermal_dispatch(
         "enabled": True,
         "enabled_source": enabled_source,
         "native_ipk": native_ipk,
+        "native_design": native_design,
     }
 
 
@@ -817,6 +818,7 @@ def _solve_exact_thermal_setup(
         monitor_snapshot = _snapshot_thermal_monitors(sim, ipk)
         previous_snapshot = monitor_snapshot
         native_ipk = preflight.pop("native_ipk")
+        native_design = preflight.pop("native_design")
         started = clock()
         status = "success"
         returned = None
@@ -838,7 +840,20 @@ def _solve_exact_thermal_setup(
                 # materials, mesh, and setup failures above are project-local
                 # script errors and must not quarantine a healthy shared host.
                 sim.solver_may_be_running = True
-            returned = native_ipk.analyze(**analyze_kwargs)
+            if pooled_backend:
+                # The surrounding thermal transaction protects build and
+                # extraction. Yield it only around the exact project-scoped
+                # native solve so sibling projects can model/solve in parallel.
+                with sim.aedt_native_solve_window():
+                    returned = native_design.Analyze(setup_name, True)
+                if returned is not None and (
+                        type(returned) is not int or returned != 0):
+                    raise RuntimeError(
+                        "[thermal] native Analyze returned invalid status: "
+                        f"{returned!r}"
+                    )
+            else:
+                returned = native_ipk.analyze(**analyze_kwargs)
             if pooled_backend:
                 # blocking=True returned normally, so this project's solver is
                 # no longer an unknown in-flight native operation. PyAEDT also

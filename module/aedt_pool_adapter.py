@@ -1,8 +1,9 @@
 """Opt-in bridge from the MFT runner to the scheduler AEDT session host.
 
 The production default remains one runner-owned Desktop per process.  Pooled
-mode requires an explicit exclusive 1:1, disposable shared 1:2 pilot, or
-bounded shared 1:2 canary acknowledgement.  Standalone remains the default.
+mode requires an explicit exclusive 1:1, disposable shared pilot, or bounded
+shared canary acknowledgement (up to the scheduler's 1:3 limit). Standalone
+remains the default.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import os
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -305,7 +307,7 @@ def bind_project_name(lease: Any, project_name: str) -> None:
 
 
 def activate_project(lease: Any, project_name: str) -> dict:
-    """Declare a pooled lease active only after AEDT created the project."""
+    """Declare a pooled lease solve-ready after its first model is complete."""
     if not project_name or not str(project_name).strip():
         raise RuntimeError("MFT project name is empty before pooled activation")
     status = lease.activate(project_name=str(project_name).strip())
@@ -319,6 +321,38 @@ def activate_project(lease: Any, project_name: str) -> dict:
     ).strip():
         raise RuntimeError("scheduler lease activation project-name mismatch")
     return status
+
+
+def automation_guard(lease: Any):
+    """Serialize Desktop-global automation for one shared AEDT session."""
+
+    if lease is None:
+        raise RuntimeError("pooled AEDT automation requires an active lease")
+    factory = getattr(lease, "automation_guard", None)
+    if callable(factory):
+        return factory()
+    # The production protocol is v2 and must fail closed if an old scheduler
+    # client is deployed.  Protocol-v1 is retained only for legacy unit tests.
+    if int(getattr(lease, "protocol_version", 1) or 1) < 2:
+        return nullcontext()
+    raise RuntimeError(
+        "scheduler attach client has no AEDT automation-lock support"
+    )
+
+
+def native_solve_window(lease: Any):
+    """Temporarily yield a held automation lock to a project-scoped solve."""
+
+    if lease is None:
+        raise RuntimeError("pooled native solve requires an active AEDT lease")
+    factory = getattr(lease, "native_solve_window", None)
+    if callable(factory):
+        return factory()
+    if int(getattr(lease, "protocol_version", 1) or 1) < 2:
+        return nullcontext()
+    raise RuntimeError(
+        "scheduler attach client has no native-solve window support"
+    )
 
 
 def release_project(lease: Any, *, wait_seconds: int | None = None) -> dict:

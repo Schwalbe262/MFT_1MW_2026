@@ -4,6 +4,7 @@ import math
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
@@ -2098,17 +2099,18 @@ class AnalyzePolicyTests(unittest.TestCase):
             simulation.stage_timings["stage_time_matrix_solve_s"],
         )
 
-    def test_pooled_analyze_reuses_host_dso_without_global_registry_rewrite(self):
+    def test_pooled_analyze_uses_exact_native_project_scoped_dispatch(self):
         simulation = self._simulation([None])
         simulation.aedt_backend = "pooled"
         simulation.solver_may_be_running = False
         simulation.design1.setup.analyze = Mock(return_value=None)
+        simulation._analyze_exact_pooled_design = Mock(return_value=0.0)
+        simulation.aedt_automation_transaction = lambda: nullcontext()
 
         simulation.analyze_and_extract("matrix", lambda: None)
 
-        simulation.design1.setup.analyze.assert_called_once_with(
-            cores=None, tasks=None, gpus=None
-        )
+        simulation._analyze_exact_pooled_design.assert_called_once_with("matrix")
+        simulation.design1.setup.analyze.assert_not_called()
         self.assertFalse(simulation.solver_may_be_running)
 
     def test_standalone_analyze_keeps_explicit_core_contract(self):
@@ -2841,6 +2843,21 @@ class NativeProjectHandleTests(unittest.TestCase):
 
         return ProjectWrapper()
 
+    def test_pooled_rebind_enumerates_fresh_exact_project(self):
+        stale = SimpleNamespace(GetName=Mock(return_value="simulation_test"))
+        fresh = SimpleNamespace(GetName=Mock(return_value="simulation_test"))
+        simulation = Simulation.__new__(Simulation)
+        simulation.aedt_backend = "pooled"
+        simulation.PROJECT_NAME = "simulation_test"
+        simulation.project = self._project_wrapper(stale, SimpleNamespace())
+        simulation._refresh_native_project_handle = Mock(return_value=fresh)
+
+        result = simulation._rebind_native_project_for_design_creation()
+
+        self.assertIs(result, fresh)
+        simulation._refresh_native_project_handle.assert_called_once_with()
+        stale.GetName.assert_not_called()
+
     def test_rebinds_stale_project_before_design_creation(self):
         stale = SimpleNamespace(
             GetName=Mock(side_effect=RuntimeError("stale GetName"))
@@ -3043,6 +3060,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             analyze = Mock(side_effect=analyze_side_effect)
         else:
             analyze = Mock(return_value=analyze_side_effect)
+        native_design.Analyze = analyze
         native_solver = NativeSolver(
             design_name="icepak_thermal",
             oproject=native_project,
@@ -3071,6 +3089,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             _rebind_native_project_for_design_creation=rebind,
             _native_desktop_handle=Mock(return_value=desktop),
             save_project=Mock(),
+            aedt_native_solve_window=lambda: nullcontext(),
         )
         setup = SimpleNamespace(name="ThermalSetup", props={
             "Enabled": enabled,
@@ -3150,7 +3169,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             "converged", converged=1, monitor_file="fresh.sd"
         )
 
-        def assert_dispatch_window(**_kwargs):
+        def assert_dispatch_window(*_args, **_kwargs):
             self.assertTrue(simulation.solver_may_be_running)
             return None
 
@@ -3167,7 +3186,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
                 simulation, ipk, setup, monitor_grace_s=0,
             )
 
-        analyze.assert_called_once_with(setup="ThermalSetup", blocking=True)
+        analyze.assert_called_once_with("ThermalSetup", True)
         self.assertEqual(result["solve_attempts"], 1)
         self.assertEqual(result["convergence"]["thermal_converged"], 1)
         self.assertFalse(simulation.solver_may_be_running)

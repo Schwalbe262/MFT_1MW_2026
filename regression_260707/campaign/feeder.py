@@ -180,6 +180,10 @@ def _pooled_submission_kwargs(args):
             "MFT_AEDT_SESSION_VERSION": args.aedt_session_version,
             "MFT_AEDT_SESSION_PROFILE": AEDT_SESSION_PROFILE,
             "MFT_AEDT_ISOLATION_POLICY": args.aedt_isolation_policy,
+            # Three serialized first-model builds can legitimately exceed the
+            # old 120-second underfilled seal. Keep the model-ready barrier open
+            # for the scheduler client's supported maximum.
+            "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "900",
         },
     }
 

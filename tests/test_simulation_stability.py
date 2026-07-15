@@ -238,6 +238,7 @@ def _simulation(tmp_path, backend):
     project_path.mkdir()
     simulation = Simulation.__new__(Simulation)
     simulation.aedt_backend = backend
+    simulation.aedt_lease = SimpleNamespace(protocol_version=1)
     simulation.PROJECT_NAME = project_name
     simulation.project_path = str(project_path)
     simulation.desktop = desktop

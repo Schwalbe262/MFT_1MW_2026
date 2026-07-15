@@ -247,6 +247,7 @@ class FakeSharedDesktop:
         self.active_config = "pyaedt_config"
         self.registry_loads = []
         self.registry_sets = []
+        self.projects = []
 
     def AreThereSimulationsRunning(self):
         self.running_calls += 1
@@ -255,6 +256,9 @@ class FakeSharedDesktop:
     def SetActiveProject(self, name):
         self.active_project_calls.append(name)
         raise AssertionError("pooled preflight must not use Desktop active state")
+
+    def GetProjects(self):
+        return list(self.projects)
 
     def GetRegistryString(self, _key):
         return self.active_config
@@ -309,6 +313,7 @@ def _pooled_preflight_harness(monkeypatch, *, own_running):
 
     desktop = FakeSharedDesktop(sibling_running=True)
     project = FakeOwnedProject()
+    desktop.projects = [project]
     desktop_wrapper = SimpleNamespace(odesktop=desktop)
     simulation = Simulation.__new__(Simulation)
     simulation.aedt_backend = "pooled"
@@ -403,3 +408,98 @@ def test_pooled_project_name_uses_task_and_pool_wide_lease_identity(
 
     assert re.fullmatch(r"mft-9876-4321-[0-9a-f]{12}", simulation.PROJECT_NAME)
     assert Path(simulation.project_path).parent == workspace.resolve()
+
+
+@pytest.mark.parametrize(
+    ("label", "solution_type"),
+    (("matrix", "AC Magnetic"), ("cap", "Electrostatic"), ("loss", "AC Magnetic")),
+)
+def test_pooled_native_analyze_is_exact_and_runs_outside_automation_lock(
+    monkeypatch, label, solution_type,
+):
+    from run_simulation_260706 import Simulation
+
+    monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
+    monkeypatch.delenv("MFT_AEDT_EXCLUSIVE_1TO1", raising=False)
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_PILOT", raising=False)
+    monkeypatch.setenv("MFT_AEDT_SHARED_CANARY", "1")
+    events = []
+    lock_depth = [0]
+
+    class Guard:
+        def __enter__(self):
+            lock_depth[0] += 1
+            events.append("lock-enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock-exit")
+            lock_depth[0] -= 1
+
+    class Lease:
+        protocol_version = 2
+
+        def automation_guard(self):
+            return Guard()
+
+    class Project:
+        def Save(self):
+            assert lock_depth[0] > 0
+            events.append("save")
+            return None
+
+    class Design:
+        def Analyze(self, setup_name, blocking):
+            assert lock_depth[0] == 0
+            events.append(("analyze", setup_name, blocking))
+            return 0
+
+    simulation = Simulation.__new__(Simulation)
+    simulation.aedt_backend = "pooled"
+    simulation.aedt_lease = Lease()
+    simulation.PROJECT_NAME = "mft-own"
+    simulation.design1 = SimpleNamespace(design_name=f"maxwell_{label}")
+    simulation.solve_attempts = {"matrix": 0, "cap": 0, "loss": 0}
+    simulation.solver_may_be_running = False
+    simulation.pooled_activation_done = False
+    simulation.activate_pooled_for_solve = lambda: events.append("activate")
+    project = Project()
+    design = Design()
+    contracts = []
+
+    def verify(**kwargs):
+        assert lock_depth[0] > 0
+        contracts.append(kwargs)
+        return project, design
+
+    simulation._verified_pooled_native_setup = verify
+    simulation._native_desktop_handle = lambda: SimpleNamespace(
+        GetRegistryString=lambda _key: "pyaedt_config"
+    )
+    simulation.save_project = lambda strict=False: events.append(
+        ("save-wrapper", strict)
+    )
+    simulation._log_recent_aedt_messages = lambda _label: None
+
+    elapsed = simulation._analyze_exact_pooled_design(label)
+
+    assert elapsed >= 0
+    assert events[0] == "activate"
+    analyze_event = ("analyze", "Setup1", True)
+    assert analyze_event in events
+    assert events.index("lock-exit") < events.index(analyze_event)
+    assert events.count("lock-enter") == 2
+    assert contracts == [
+        {
+            "setup_name": "Setup1",
+            "expected_design_type": "Maxwell 3D",
+            "expected_solution_type": solution_type,
+        },
+        {
+            "setup_name": "Setup1",
+            "expected_design_type": "Maxwell 3D",
+            "expected_solution_type": solution_type,
+        },
+    ]
+    assert simulation.solve_attempts[label] == 1
+    assert simulation.solver_may_be_running is False

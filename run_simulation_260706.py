@@ -127,7 +127,9 @@ from module.aedt_pool_adapter import (
     aedt_backend,
     acquire_pooled_desktop,
     activate_project as activate_pooled_project,
+    automation_guard as pooled_automation_guard,
     bind_project_name as bind_pooled_project_name,
+    native_solve_window as pooled_native_solve_window,
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
 )
@@ -1188,7 +1190,7 @@ def _wait_for_ready_copied_loss_design(
         sleeper(min(max(0.0, float(poll_s)), max(0.0, deadline - now)))
 
 
-def _find_raw_design(project, design_name):
+def _find_raw_design(project, design_name, *, allow_activation=True):
     matches = [
         raw for name, raw in _project_design_entries(project)
         if name == design_name
@@ -1199,6 +1201,10 @@ def _find_raw_design(project, design_name):
         )
     raw = matches[0]
     if raw is None:
+        if not allow_activation:
+            raise RuntimeError(
+                f"AEDT design {design_name!r} has no direct native handle"
+            )
         raw = project.SetActiveDesign(design_name)
     if _aedt_design_name(raw) != design_name:
         raise RuntimeError(
@@ -1937,6 +1943,7 @@ class Simulation():
         self.aedt_backend = aedt_backend()
         self.aedt_lease = None
         self.pooled_release_done = False
+        self.pooled_activation_done = False
         self.solver_may_be_running = False
 
     def create_simulation_name(self):
@@ -2029,6 +2036,11 @@ class Simulation():
 
     def create_project(self):
 
+        with self.aedt_automation_transaction():
+            return self._create_project_locked()
+
+    def _create_project_locked(self):
+
         simulation_dir = "./simulation"
         if not os.path.exists(simulation_dir):
             os.makedirs(simulation_dir, exist_ok=True)
@@ -2077,6 +2089,34 @@ class Simulation():
         """Return the backend captured for this runner instance."""
         return str(getattr(self, "aedt_backend", "") or aedt_backend())
 
+    def aedt_automation_transaction(self):
+        """Protect one Desktop-global attach/model/extract/save transaction."""
+
+        if self._backend_mode() != "pooled":
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return pooled_automation_guard(self.aedt_lease)
+
+    def activate_pooled_for_solve(self):
+        """Join the solve batch only after this task's first model is complete."""
+
+        if self._backend_mode() != "pooled" or bool(
+                getattr(self, "pooled_activation_done", False)):
+            return None
+        status = activate_pooled_project(self.aedt_lease, self.PROJECT_NAME)
+        self.pooled_activation_done = True
+        return status
+
+    def aedt_native_solve_window(self):
+        """Yield a held automation transaction for one exact native solve."""
+
+        if self._backend_mode() != "pooled":
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return pooled_native_solve_window(self.aedt_lease)
+
     def _verified_native_project_handle(self):
         """Return this runner's cached project after exact-name attestation."""
         native_project = self._native_project_handle()
@@ -2108,10 +2148,12 @@ class Simulation():
             raise RuntimeError("project wrapper identity is unavailable for native rebind")
 
         if self._backend_mode() == "pooled":
-            native_project = self._verified_native_project_handle()
-            project_state["project"] = native_project
-            project_state["proj"] = native_project
-            return native_project
+            # Another worker can legitimately leave Desktop's global active
+            # project/design on its own lease between our stages.  Never carry
+            # a cached child proxy across that boundary: enumerate the current
+            # Desktop application and rebind this wrapper to the one exact
+            # project owned by this lease.
+            return self._refresh_native_project_handle()
 
         odesktop = self._native_desktop_handle()
         set_active_project = getattr(odesktop, "SetActiveProject", None)
@@ -2180,6 +2222,10 @@ class Simulation():
         )
 
     def create_design(self, name="maxwell_design", solution="AC Magnetic"):
+        with self.aedt_automation_transaction():
+            return self._create_design_locked(name=name, solution=solution)
+
+    def _create_design_locked(self, name="maxwell_design", solution="AC Magnetic"):
         self.design1 = self.project.create_design(
             name=name, solver="maxwell3d", solution=solution
         )
@@ -4058,6 +4104,11 @@ class Simulation():
                 self.extraction_attempts.get("cap", 0) + 1
             )
             try:
+                # A sibling can change Desktop's global active design while
+                # this project's native electrostatic solve is in flight.
+                # Rehydrate the PyAEDT app from this lease's exact project and
+                # design before asking the high-level C-matrix exporter.
+                self._prepare_pooled_solution_data_app()
                 fd, export_path = tempfile.mkstemp(
                     prefix="mft_cap_", suffix=".txt"
                 )
@@ -5161,6 +5212,10 @@ class Simulation():
         return self.df_loss_summary
 
     def get_convergence_info(self, label):
+        with self.aedt_automation_transaction():
+            return self._get_convergence_info_locked(label)
+
+    def _get_convergence_info_locked(self, label):
         """Export full pass history and derive fail-closed convergence telemetry."""
         cols = {
             f"conv_passes_{label}": float("nan"),
@@ -5235,16 +5290,17 @@ class Simulation():
                 return odesktop
         raise RuntimeError("original native AEDT Desktop handle is unavailable")
 
-    def _verified_pooled_native_maxwell_setup(self, setup_name="Setup1"):
-        """Resolve this client's exact Maxwell setup without Desktop active state."""
+    def _verified_pooled_native_setup(
+            self, setup_name="Setup1", *, design_name="",
+            expected_design_type="Maxwell 3D", expected_solution_type="AC Magnetic"):
+        """Resolve one exact pooled setup without Desktop active state."""
         expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
-        expected_design = _aedt_design_name(
-            getattr(self.design1, "design_name", "")
-        )
+        expected_design = _aedt_design_name(design_name) or _aedt_design_name(
+            getattr(self.design1, "design_name", ""))
         if not expected_project or not expected_design:
             raise RuntimeError("native analysis project/design identity is unavailable")
 
-        oproject = self._verified_native_project_handle()
+        oproject = self._refresh_native_project_handle()
         actual_project = str(oproject.GetName() or "").strip()
         if actual_project != expected_project:
             raise _AedtIdentityMismatch(
@@ -5252,9 +5308,11 @@ class Simulation():
                 f"expected={expected_project}, actual={actual_project or '<empty>'}"
             )
 
-        odesign = _find_raw_design(oproject, expected_design)
+        odesign = _find_raw_design(
+            oproject, expected_design, allow_activation=False
+        )
         if odesign is None or odesign is False:
-            raise RuntimeError(f"SetActiveDesign returned no design ({expected_design})")
+            raise RuntimeError(f"native project returned no design ({expected_design})")
         actual_design = _aedt_design_name(odesign)
         if actual_design != expected_design:
             raise _AedtIdentityMismatch(
@@ -5263,7 +5321,13 @@ class Simulation():
             )
         design_type = str(odesign.GetDesignType() or "")
         solution_type = str(odesign.GetSolutionType() or "")
-        if design_type != "Maxwell 3D" or not _is_ac_magnetic_solution(solution_type):
+        type_matches = design_type == str(expected_design_type)
+        expected_solution = str(expected_solution_type or "").strip().casefold()
+        if expected_solution == "ac magnetic":
+            solution_matches = _is_ac_magnetic_solution(solution_type)
+        else:
+            solution_matches = str(solution_type).strip().casefold() == expected_solution
+        if not type_matches or not solution_matches:
             raise _AedtIdentityMismatch(
                 "analysis design physics mismatch: "
                 f"type={design_type!r}, solution={solution_type!r}"
@@ -5277,6 +5341,11 @@ class Simulation():
                 f"native analysis setup mismatch: expected={(setup_name,)}, actual={setups}"
             )
         return oproject, odesign
+
+    def _verified_pooled_native_maxwell_setup(self, setup_name="Setup1"):
+        """Resolve this client's exact AC Magnetic setup without activation."""
+
+        return self._verified_pooled_native_setup(setup_name=setup_name)
 
     def _verified_native_maxwell_setup(self, odesktop, setup_name="Setup1"):
         """Resolve the exact active Maxwell setup through fresh native handles."""
@@ -5636,12 +5705,85 @@ class Simulation():
             "copied-loss post-dispatch identity check failed: " + "; ".join(errors)
         )
 
+    def _analyze_exact_pooled_design(self, label, setup_name="Setup1"):
+        """Run one project-scoped native solve outside the automation lock."""
+
+        contracts = {
+            "matrix": ("Maxwell 3D", "AC Magnetic"),
+            "loss": ("Maxwell 3D", "AC Magnetic"),
+            "cap": ("Maxwell 3D", "Electrostatic"),
+        }
+        try:
+            expected_design_type, expected_solution_type = contracts[label]
+        except KeyError as error:
+            raise RuntimeError(f"unsupported pooled solve label: {label!r}") from error
+
+        # Activation is deliberately delayed until modeling is complete.  The
+        # scheduler's solve permit therefore becomes a three-project
+        # model-ready barrier without holding this session's automation lock.
+        self.activate_pooled_for_solve()
+        with self.aedt_automation_transaction():
+            oproject, odesign = self._verified_pooled_native_setup(
+                setup_name=setup_name,
+                expected_design_type=expected_design_type,
+                expected_solution_type=expected_solution_type,
+            )
+            odesktop = self._native_desktop_handle()
+            registry_key = (
+                r"Desktop/ActiveDSOConfigurations/" + expected_design_type
+            )
+            active_dso = str(
+                odesktop.GetRegistryString(registry_key) or ""
+            ).strip()
+            if active_dso != "pyaedt_config":
+                raise RuntimeError(
+                    "pooled session DSO profile mismatch: "
+                    f"expected='pyaedt_config', actual={active_dso!r}"
+                )
+            saved = oproject.Save()
+            if saved is False:
+                raise RuntimeError("native project Save returned False before solve")
+
+        self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
+        self.solver_may_be_running = True
+        started = time.time()
+        try:
+            analyze_result = odesign.Analyze(setup_name, True)
+        except Exception:
+            # Keep solver_may_be_running=True: a transport exception cannot
+            # prove whether the blocking native operation remained in flight.
+            with self.aedt_automation_transaction():
+                self._log_recent_aedt_messages(label)
+            raise
+        elapsed = time.time() - started
+        if analyze_result is not None and (
+                type(analyze_result) is not int or analyze_result != 0):
+            raise RuntimeError(
+                f"[{label}] native Analyze returned invalid status: "
+                f"{analyze_result!r}"
+            )
+        self.solver_may_be_running = False
+
+        with self.aedt_automation_transaction():
+            # Fresh read-only enumeration proves that the completed call still
+            # belongs to this project even if siblings changed the GUI's active
+            # project while the native solver was running.
+            self._verified_pooled_native_setup(
+                setup_name=setup_name,
+                expected_design_type=expected_design_type,
+                expected_solution_type=expected_solution_type,
+            )
+            self.save_project(strict=True)
+        return elapsed
+
     def analyze_and_extract(self, label, extractor):
         """Analyze exactly once; result-query failures never justify another solve."""
         if not hasattr(self, "stage_timings"):
             self.stage_timings = {}
 
         def _analyze_once():
+            if self._backend_mode() == "pooled":
+                return self._analyze_exact_pooled_design(label)
             if label != "loss" or not bool(getattr(
                     self, "loss_native_analyze_required", False)):
                 self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
@@ -5746,7 +5888,11 @@ class Simulation():
         )
         extraction_started = time.monotonic()
         try:
-            extractor()
+            if self._backend_mode() == "pooled":
+                with self.aedt_automation_transaction():
+                    extractor()
+            else:
+                extractor()
         finally:
             extraction_finished = time.monotonic()
             self.stage_timings[f"stage_time_{label}_extract_s"] = (
@@ -5868,6 +6014,10 @@ class Simulation():
             logging.info(f"Result part saved to {part}")
 
     def save_project(self, strict=False):
+        with self.aedt_automation_transaction():
+            return self._save_project_locked(strict=strict)
+
+    def _save_project_locked(self, strict=False):
         save_started = time.monotonic()
 
         def _record_save_timing():
@@ -5963,16 +6113,17 @@ class Simulation():
             keep = int(self.df_plus["keep_project"].iloc[0]) != 0
         except Exception:
             keep = False
-        if not keep:
-            try:
-                self.design1.cleanup_solution()
-            except Exception:
-                pass
-        else:
-            try:
-                self.save_project()
-            except Exception:
-                pass
+        with self.aedt_automation_transaction():
+            if not keep:
+                try:
+                    self.design1.cleanup_solution()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.save_project()
+                except Exception:
+                    pass
         if getattr(self, "aedt_backend", "standalone") == "pooled":
             if self.aedt_lease is None:
                 raise RuntimeError("pooled Simulation has no AEDT lease")
@@ -6269,8 +6420,6 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         if backend == "pooled":
             bind_pooled_project_name(sim.aedt_lease, sim.PROJECT_NAME)
         sim.create_project()
-        if backend == "pooled":
-            activate_pooled_project(sim.aedt_lease, sim.PROJECT_NAME)
 
         if fixed_mode:
             sim.input_df = fixed_input_df
@@ -6312,28 +6461,29 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
         def _build_em_design(design_name, mode):
             """EM 디자인 1개 생성: 지오메트리 + 여자 + 메시 + 경계 + 셋업"""
-            sim.create_design(name=design_name)
-            set_design_variables(sim.design1, sim.input_df)
-            sim.create_core()
-            sim.create_coil()
-            sim.split_geometry()
-            sim.create_coil_section()
-            sim.assign_winding(mode=mode)
-            sim.assign_coil()
-            if mode == "matrix":
-                sim.assign_matrix()
-            else:
-                sim.assign_core_loss()
-            _configure_em_conductor_mesh(sim, mode)
-            sim.assign_boundary()
-            sim.create_setup(mode=mode)
+            with sim.aedt_automation_transaction():
+                sim.create_design(name=design_name)
+                set_design_variables(sim.design1, sim.input_df)
+                sim.create_core()
+                sim.create_coil()
+                sim.split_geometry()
+                sim.create_coil_section()
+                sim.assign_winding(mode=mode)
+                sim.assign_coil()
+                if mode == "matrix":
+                    sim.assign_matrix()
+                else:
+                    sim.assign_core_loss()
+                _configure_em_conductor_mesh(sim, mode)
+                sim.assign_boundary()
+                sim.create_setup(mode=mode)
 
         def _prepare_loss_copy_once(before_names, _attempt):
             """maxwell_matrix를 복제해 loss_sym 디자인으로 전환 (모델링 절반 절약).
             레퍼런스: pyaedt_library/example/MFT_TAB second_simulation()"""
             import math as _m
             if sim._backend_mode() == "pooled":
-                op = sim._verified_native_project_handle()
+                op = sim._refresh_native_project_handle()
             else:
                 op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
             old_design = sim.design_matrix
@@ -6506,7 +6656,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     raise
 
             if sim._backend_mode() == "pooled":
-                op = sim._verified_native_project_handle()
+                op = sim._refresh_native_project_handle()
             else:
                 op = sim.project.desktop.odesktop.SetActiveProject(sim.project.name)
             try:
@@ -6555,7 +6705,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             cap_stage_started = time.monotonic()
             cap_model_started = time.monotonic()
             try:
-                sim.create_capacitance_design(name="maxwell_cap")
+                with sim.aedt_automation_transaction():
+                    sim.create_capacitance_design(name="maxwell_cap")
             finally:
                 sim.stage_timings["stage_time_cap_model_s"] = (
                     time.monotonic() - cap_model_started
@@ -6652,7 +6803,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 sim.loss_em_full = False
                 sim.loss_is_sym = True
                 if int(sim.df_plus.get("loss_from_copy", pd.Series([1])).iloc[0]):
-                    _build_loss_by_copy()
+                    with sim.aedt_automation_transaction():
+                        _build_loss_by_copy()
                 else:
                     _build_em_design("maxwell_loss", "loss_sym")
             else:
@@ -6688,7 +6840,11 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             )
             t0 = time.monotonic()
             try:
-                df_thermal = run_thermal_analysis(sim)
+                # Thermal build/monitor/extract share one transaction; its exact
+                # native Analyze temporarily yields the lock inside the helper.
+                sim.activate_pooled_for_solve()
+                with sim.aedt_automation_transaction():
+                    df_thermal = run_thermal_analysis(sim)
             except Exception as thermal_error:
                 logging.exception(f"thermal stage failed: {thermal_error}")
                 log_failed_sample(

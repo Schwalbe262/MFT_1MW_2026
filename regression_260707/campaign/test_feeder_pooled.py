@@ -219,6 +219,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "MFT_AEDT_SESSION_VERSION": "2025.2",
             "MFT_AEDT_SESSION_PROFILE": feeder.AEDT_SESSION_PROFILE,
             "MFT_AEDT_ISOLATION_POLICY": "family",
+            "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "900",
             "MFT_AEDT_POOL_WORKSPACE": (
                 "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
             ),
