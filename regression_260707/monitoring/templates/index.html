@@ -35,17 +35,27 @@
     <section class="parallel-control-panel" aria-labelledby="parallel-control-title">
       <div class="parallel-control-heading">
         <div>
-          <p class="eyebrow">LOCAL OPERATOR CONTROL · MFT ONLY</p>
-          <h2 id="parallel-control-title">MFT 병렬 실행 목표</h2>
-          <p>queued + attaching + running 합계를 지정한 수로 유지합니다. IPMSM 프로젝트에는 적용되지 않습니다.</p>
+          <p id="parallel-control-eyebrow" class="eyebrow">AUTOMATIC REFILL CONTROL · MFT ONLY</p>
+          <h2 id="parallel-control-title">MFT 자동 실행 유지</h2>
+          <p id="parallel-control-description">외부 refill-controller가 queued + attaching + running 합계를 자동으로 유지합니다.</p>
         </div>
-        <form id="parallel-target-form" class="parallel-target-form" autocomplete="off">
+        <form id="parallel-target-form" class="parallel-target-form hidden" autocomplete="off">
           <label for="parallel-target-input">유지할 작업 수</label>
           <div>
             <input id="parallel-target-input" name="target" type="number" min="1" max="300" step="1" inputmode="numeric" disabled required>
             <button id="parallel-target-button" type="submit" disabled>목표 적용</button>
           </div>
         </form>
+        <div id="refill-controller-status" class="parallel-target-form" aria-live="polite">
+          <span id="refill-controller-mode" class="state-chip unknown">자동 유지 모드</span>
+          <p id="refill-controller-summary">외부 컨트롤러 상태를 확인하는 중입니다.</p>
+          <dl id="refill-controller-details" class="detail-list">
+            <div><dt>최근 동작</dt><dd id="refill-controller-action" class="state-chip unknown">확인 중</dd></div>
+            <div><dt>직전 확인 시점의 실행 수</dt><dd id="refill-controller-active">—</dd></div>
+            <div><dt>최근 보충 수</dt><dd id="refill-controller-refilled">—</dd></div>
+            <div><dt>세대 ID 축약</dt><dd id="refill-controller-generation">—</dd></div>
+          </dl>
+        </div>
       </div>
       <div class="parallel-live-grid" aria-label="MFT 실시간 작업 상태">
         <div><span>현재 목표</span><strong id="parallel-current-target">—</strong></div>
@@ -62,6 +72,7 @@
           </div>
           <span id="aedt-attach-state" class="state-chip unknown">확인 중</span>
         </div>
+        <p class="aedt-pool-scope">중앙 풀(비활성·구조적 차단)</p>
         <dl class="aedt-attach-grid">
           <div><dt>AEDT 사용 / 전체</dt><dd id="aedt-license-usage">—</dd></div>
           <div><dt>Pool 상태</dt><dd id="aedt-pool-state">—</dd></div>
@@ -70,9 +81,10 @@
           <div><dt>Live(대기 포함) / 대기 lease</dt><dd id="aedt-pool-leases">—</dd></div>
           <div><dt>Ready / Busy 세션</dt><dd id="aedt-pool-capacity">—</dd></div>
         </dl>
+        <p id="aedt-node-local-progress" class="aedt-node-local-progress hidden">노드 로컬 AEDT 진행 정보 없음</p>
       </article>
-      <p id="parallel-target-status" class="parallel-target-status" aria-live="polite">Scheduler 연결을 확인하는 중입니다.</p>
-      <p class="parallel-control-note">목표를 낮춰도 running/attaching 작업은 중단하지 않습니다. 감소가 필요하면 controller가 시작 전으로 확인된 MFT queued 작업만 정리합니다.</p>
+      <p id="parallel-target-status" class="parallel-target-status hidden" aria-live="polite">Scheduler 연결을 확인하는 중입니다.</p>
+      <p id="parallel-control-note" class="parallel-control-note hidden">목표를 낮춰도 running/attaching 작업은 중단하지 않습니다. 감소가 필요하면 controller가 시작 전으로 확인된 MFT queued 작업만 정리합니다.</p>
     </section>
 
     <section class="pipeline-panel" aria-labelledby="pipeline-title">
@@ -86,17 +98,20 @@
     <section aria-labelledby="data-title">
       <div class="section-heading">
         <div><p class="eyebrow">01 · DATA CAMPAIGN</p><h2 id="data-title">데이터 확보 현황</h2></div>
-        <div id="data-freshness" class="freshness">—</div>
+        <div class="section-heading-actions">
+          <a class="detail-link" href="/cohorts">코호트 상세 →</a>
+          <div id="data-freshness" class="freshness">—</div>
+        </div>
       </div>
       <div class="metric-grid data-metrics">
-        <article class="metric-card primary"><span>최신 revision 학습 가능</span><strong id="data-total">—</strong><small id="data-strict-detail">pin — · strict full</small></article>
+        <article class="metric-card primary"><span>현재 물리 revision 학습 가능</span><strong id="data-total">—</strong><small id="data-strict-detail">physics revision — · strict full</small><small id="data-member-shas" class="member-shas">SHA: —</small></article>
         <article class="metric-card"><span>전체 수집 데이터</span><strong id="data-raw-total">—</strong><small id="data-quality-detail">—</small></article>
         <article class="metric-card"><span>최근 1시간</span><strong id="data-throughput">—</strong><small id="data-throughput-detail">—</small></article>
         <article class="metric-card"><span>3,000개 예상 도달</span><strong id="data-eta">—</strong><small id="data-stall">—</small></article>
       </div>
       <div class="split-grid data-layout">
         <article class="panel chart-panel">
-          <div class="panel-title"><div><h3>데이터 증가</h3><p>시뮬레이션 저장 시각 기준 누적 추세</p></div><span id="latest-revision" class="mono-chip">revision —</span></div>
+          <div class="panel-title"><div><h3>데이터 증가</h3><p>현재 물리 revision · 시뮬레이션 저장 시각 기준 누적 추세</p></div><span id="latest-revision" class="mono-chip">physics —</span></div>
           <svg id="data-chart" class="chart" viewBox="0 0 760 260" role="img" aria-label="시간에 따른 누적 데이터 수"></svg>
           <p id="data-chart-empty" class="empty-state hidden">표시할 데이터 이력이 없습니다.</p>
         </article>
@@ -107,7 +122,7 @@
           <dl class="detail-list">
             <div><dt>최근 24시간 증가</dt><dd id="data-24h">—</dd></div>
             <div><dt>목표까지 남은 수</dt><dd id="data-remaining">—</dd></div>
-            <div><dt>최신 revision 외 데이터</dt><dd id="revision-mismatch">—</dd></div>
+            <div><dt>현재 물리 revision 외 데이터</dt><dd id="revision-mismatch">—</dd></div>
             <div><dt>결과 없는 조회 작업</dt><dd id="collector-nodata">—</dd></div>
           </dl>
         </article>
@@ -115,10 +130,8 @@
       <div class="split-grid campaign-insight-layout">
         <article class="panel cohort-panel" aria-labelledby="cohort-title">
           <div class="panel-title">
-            <div><h3 id="cohort-title">Solver · 물리 데이터 코호트</h3><p>git_hash와 physics_data_revision 조합별 행 수와 최근 증가 속도</p></div>
-            <span id="cohort-summary" class="mono-chip">코호트 —</span>
+            <div><h3 id="cohort-title">활성 코호트 메타데이터</h3><p>현재 solver pair의 물리 readback · 코호트별 수치는 상세 페이지에서 확인</p></div>
           </div>
-          <div id="cohort-list" class="cohort-list"><p class="empty-state compact-empty">코호트 데이터를 확인하는 중입니다.</p></div>
           <div class="cohort-metadata-grid">
             <section aria-labelledby="lamination-factor-title">
               <h4 id="lamination-factor-title">코어 적층 계수</h4>
@@ -139,8 +152,15 @@
             <span id="quarantine-current-count" class="section-badge">—</span>
           </div>
           <section class="quarantine-current" aria-labelledby="quarantine-current-title">
-            <h4 id="quarantine-current-title">현재 코호트</h4>
-            <div id="quarantine-current-reasons" class="reason-list"><p class="empty-state compact-empty">격리 정보를 확인하는 중입니다.</p></div>
+            <h4 id="quarantine-current-title">현재 코호트 — —</h4>
+            <details id="quarantine-current-details" class="quarantine-reason-details">
+              <summary>
+                <span>사유별 상세 <b id="quarantine-current-reason-count">—건</b></span>
+                <span class="fold-open">펼치기 ▾</span>
+                <span class="fold-close">접기 ▴</span>
+              </summary>
+              <div id="quarantine-current-reasons" class="reason-list"><p class="empty-state compact-empty">격리 정보를 확인하는 중입니다.</p></div>
+            </details>
           </section>
           <details id="quarantine-legacy" class="quarantine-legacy">
             <summary><span id="quarantine-legacy-label">레거시 코호트 노이즈</span><b id="quarantine-legacy-count">—</b></summary>
@@ -188,6 +208,7 @@
         <div class="stage-timing-grid">
           <div class="stage-timing-card"><span>Matrix 평균</span><strong id="stage-time-matrix-mean">—</strong><small id="stage-time-matrix-detail">중앙값 — · n=0</small></div>
           <div class="stage-timing-card"><span>Loss 평균</span><strong id="stage-time-loss-mean">—</strong><small id="stage-time-loss-detail">중앙값 — · n=0</small></div>
+          <div class="stage-timing-card"><span>Electrostatic 평균</span><strong id="stage-time-electrostatic-mean">—</strong><small id="stage-time-electrostatic-detail">중앙값 — · n=0</small></div>
           <div class="stage-timing-card"><span>Icepak 평균</span><strong id="stage-time-icepak-mean">—</strong><small id="stage-time-icepak-detail">중앙값 — · n=0</small></div>
           <div class="stage-timing-card total"><span>합계 평균</span><strong id="stage-time-total-mean">—</strong><small id="stage-time-total-detail">중앙값 — · n=0</small></div>
         </div>

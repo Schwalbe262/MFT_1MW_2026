@@ -18,6 +18,14 @@ import re
 
 CORE_MATERIAL_CONTRACT_VERSION = "1k101-uu137-aedt-lamination-kf0p85-v3"
 PHYSICS_DATA_REVISION = "mft1mw-1k101-native-lamination-kf0p85-v3"
+# Governance: extend this tuple only for code-reviewed solver revisions proven
+# to produce physically identical rows for PHYSICS_DATA_REVISION. Any solver
+# change that touches physics MUST bump PHYSICS_DATA_REVISION instead of
+# extending this tuple.
+PHYSICS_EQUIVALENT_SOLVER_REVISIONS = (
+    "dba903eb671e37642168afc5578b8e6a93e9c046",
+    "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7",
+)
 CORE_MATERIAL_IDENTITY = "1K101_Fe_based_amorphous_2605SA1_equivalent"
 CORE_LAMINATION_FACTOR_SOURCE = (
     "UU137_approval_sheet_2023-02-04_p6_guaranteed_minimum"
@@ -47,6 +55,40 @@ SUPPORTED_AREA_BASES = {
     AREA_BASIS_GROSS_HOMOGENEOUS,
     AREA_BASIS_EXPLICIT_NET,
 }
+
+
+def solver_revision_matches_physics_cohort(
+    actual_revision: object,
+    expected_revision: object,
+    physics_data_revision: object,
+) -> bool:
+    """Match legacy exact pins or the reviewed current-physics solver cohort."""
+    actual = str(
+        "" if actual_revision is None else actual_revision
+    ).strip().lower()
+    expected = str(
+        "" if expected_revision is None else expected_revision
+    ).strip().lower()
+    equivalent = PHYSICS_EQUIVALENT_SOLVER_REVISIONS
+    if actual in equivalent or expected in equivalent:
+        return (
+            str(
+                "" if physics_data_revision is None else physics_data_revision
+            ).strip() == PHYSICS_DATA_REVISION
+            and actual in equivalent
+            and expected in equivalent
+        )
+    return actual == expected
+
+
+def solver_revision_cohort_identity(solver_revision: object) -> str | None:
+    """Return one checkpoint identity for all reviewed current-physics SHAs."""
+    if solver_revision is None:
+        return None
+    revision = str(solver_revision).strip().lower()
+    if revision in PHYSICS_EQUIVALENT_SOLVER_REVISIONS:
+        return f"physics_data_revision:{PHYSICS_DATA_REVISION}"
+    return f"solver_revision:{revision}"
 
 
 def lamination_factor_policy_source(lamination_factor) -> str:

@@ -8,6 +8,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REGISTRY = os.path.join(HERE, "registry")
+LEGACY_SIGMA_FLOOR_POLICY = "legacy_absolute_1e-9"
+RELATIVE_SIGMA_FLOOR_POLICY = "relative_machine_epsilon_v1"
 
 from checkpoint_train import inverse_y  # noqa: E402
 
@@ -18,6 +20,16 @@ class EnsemblePredictor:
         self.features = bundle["features"]
         self.kind = bundle["transform"]
         self.q90 = bundle["q90"]
+        self.sigma_floor_policy = bundle.get(
+            "sigma_floor_policy", LEGACY_SIGMA_FLOOR_POLICY
+        )
+        if self.sigma_floor_policy not in {
+            LEGACY_SIGMA_FLOOR_POLICY,
+            RELATIVE_SIGMA_FLOOR_POLICY,
+        }:
+            raise RuntimeError(
+                f"unsupported sigma floor policy: {self.sigma_floor_policy}"
+            )
 
     @classmethod
     def load(cls, target, registry=REGISTRY):
@@ -56,7 +68,13 @@ class EnsemblePredictor:
         sg_t = preds_t.std(axis=0)
         mu = inverse_y(mu_t, self.kind)
         deriv = np.abs(inverse_y(mu_t + 1e-4, self.kind) - inverse_y(mu_t - 1e-4, self.kind)) / 2e-4
-        sg = np.maximum(deriv * sg_t, 1e-9)
+        if self.sigma_floor_policy == LEGACY_SIGMA_FLOOR_POLICY:
+            sigma_floor = np.full_like(mu, 1e-9, dtype=float)
+        else:
+            sigma_floor = np.maximum(
+                np.abs(mu) * np.finfo(float).eps, np.finfo(float).tiny
+            )
+        sg = np.maximum(deriv * sg_t, sigma_floor)
         if conformal:
             sg = sg * self.q90
         return mu, sg

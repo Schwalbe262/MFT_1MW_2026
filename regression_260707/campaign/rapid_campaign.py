@@ -37,6 +37,8 @@ import pinned_pilot
 import provisional_wave
 import scheduler_client
 
+from module.core_material_contract import solver_revision_matches_physics_cohort
+
 
 SCHEMA_VERSION = 1
 DEFAULT_SEED = 260710
@@ -236,7 +238,11 @@ def invalid_result_reason(result, solver_revision, library_revision, fetch_state
     if not isinstance(result, dict):
         return f"result_{fetch_state or 'missing'}"
     solver_hash = str(result.get("git_hash") or "").strip().lower()
-    if solver_hash and solver_hash != solver_revision:
+    if solver_hash and not solver_revision_matches_physics_cohort(
+        solver_hash,
+        solver_revision,
+        result.get("physics_data_revision"),
+    ):
         return "solver_revision_mismatch"
     library_hash = str(result.get("pyaedt_library_git_hash") or "").strip().lower()
     if library_hash and library_hash != library_revision:

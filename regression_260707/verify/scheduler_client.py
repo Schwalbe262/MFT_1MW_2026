@@ -15,7 +15,10 @@ from pathlib import Path
 
 import requests
 from filelock import FileLock
-from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.core_material_contract import (
+    PHYSICS_DATA_REVISION,
+    solver_revision_matches_physics_cohort,
+)
 from module.thermal_probe_contract import (
     RX_SIDE_FACE_MAX_RULE,
     RX_SIDE_FACE_MEAN_RULE,
@@ -36,9 +39,10 @@ except ImportError:
 SCHEDULER = "http://127.0.0.1:8000"
 TEST_TASK_PRIORITY = 10
 MFT_PROJECT = "MFT_1MW_2026v1"
-# Absolute operator/controller ceiling.  The live project field may be any
-# integer in 1..300 and is the maintained-pool source of truth.
+# Default operator/controller ceiling.  The pooled feeder may explicitly use
+# the scheduler's higher project ceiling without changing legacy callers.
 MFT_PROJECT_MAX_ACTIVE_TASKS = 300
+MFT_PROJECT_MAX_ACTIVE_TASKS_CEILING = 600
 MFT_ACTIVE_STATUSES = ("queued", "attaching", "running")
 LEGACY_MFT_NAME_PREFIX = "mft-"
 MFT_PROJECT_REPOS = [
@@ -91,7 +95,10 @@ BASE = ("source /etc/profile.d/lmod.sh 2>/dev/null || true; "
         "export FLEXLM_TIMEOUT=3000000; "
         "export I_MPI_HYDRA_BOOTSTRAP=fork; "
         "export FLUENT_MPIRUN_FLAGS='-bootstrap fork'; "
-        "sleep $((RANDOM % 60)); ")
+        # A 100-task wave acquiring at once overwhelms the control-plane relay
+        # path (~40+ concurrent connections stall it >30s and session hosts
+        # die); spread client starts across five minutes.
+        "sleep $((RANDOM % 300)); ")
 
 RESULT_VALID = "valid"
 RESULT_INVALID = "invalid"
@@ -184,14 +191,26 @@ def campaign_mutation_lock_is_held():
     return int(getattr(_CAMPAIGN_LOCK_STATE, "depth", 0)) > 0
 
 
+def _validated_project_cap_ceiling(max_project_active_tasks):
+    if (type(max_project_active_tasks) is not int
+            or not 1 <= max_project_active_tasks
+            <= MFT_PROJECT_MAX_ACTIVE_TASKS_CEILING):
+        raise ProjectContractError(
+            "MFT project max_active_tasks ceiling is invalid")
+    return max_project_active_tasks
+
+
 def validate_project_mutation_contract(
-        project, *, expected_cap=None, require_full=False):
+        project, *, expected_cap=None, require_full=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Validate the operator target and, when requested, all mutation fields.
 
     ``max_active_tasks`` is deliberately dynamic, but never unbounded.  A
     controller batch may pass ``expected_cap`` to bind every scheduler POST to
     the cap observed when that batch was authorized.
     """
+    max_project_active_tasks = _validated_project_cap_ceiling(
+        max_project_active_tasks)
     if not isinstance(project, dict):
         raise ProjectContractError("scheduler returned an invalid MFT project")
     if str(project.get("name") or "").strip() != MFT_PROJECT:
@@ -202,14 +221,14 @@ def validate_project_mutation_contract(
         raise ProjectContractError(
             "scheduler MFT project max_active_tasks is invalid")
     cap = raw_cap
-    if not 1 <= cap <= MFT_PROJECT_MAX_ACTIVE_TASKS:
+    if not 1 <= cap <= max_project_active_tasks:
         raise ProjectContractError(
             "scheduler MFT project max_active_tasks must be an integer "
-            f"between 1 and {MFT_PROJECT_MAX_ACTIVE_TASKS}, got {cap}")
+            f"between 1 and {max_project_active_tasks}, got {cap}")
     if expected_cap is not None:
         if (isinstance(expected_cap, bool)
                 or not isinstance(expected_cap, int)
-                or not 1 <= expected_cap <= MFT_PROJECT_MAX_ACTIVE_TASKS):
+                or not 1 <= expected_cap <= max_project_active_tasks):
             raise ProjectContractError("expected MFT project cap is invalid")
         if cap != expected_cap:
             raise ProjectContractError(
@@ -244,7 +263,8 @@ def validate_project_mutation_contract(
 
 
 def require_live_project_mutation_contract(
-        *, expected_cap=None, require_full=False):
+        *, expected_cap=None, require_full=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Read and validate the live project immediately before a task POST."""
     try:
         response = requests.get(
@@ -254,20 +274,28 @@ def require_live_project_mutation_contract(
     except Exception as exc:
         raise ProjectContractError(
             f"failed to read scheduler project {MFT_PROJECT!r}: {exc}") from exc
+    validation_options = {}
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        validation_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     return validate_project_mutation_contract(
-        project, expected_cap=expected_cap, require_full=require_full)
+        project, expected_cap=expected_cap, require_full=require_full,
+        **validation_options)
 
 
 def project_submission_snapshot(
         projects, project_tasks, required_hard_cap, legacy_tasks=None, *,
-        require_exact_project_cap=False, require_full_project=False):
+        require_exact_project_cap=False, require_full_project=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Count tagged and projectless legacy MFT demand without double counting."""
+    max_project_active_tasks = _validated_project_cap_ceiling(
+        max_project_active_tasks)
     if isinstance(required_hard_cap, bool) or not isinstance(required_hard_cap, int):
         raise ProjectCapacityError("MFT project hard cap must be a positive integer")
-    if required_hard_cap < 1 or required_hard_cap > MFT_PROJECT_MAX_ACTIVE_TASKS:
+    if required_hard_cap < 1 or required_hard_cap > max_project_active_tasks:
         raise ProjectCapacityError(
             f"MFT project hard cap must be between 1 and "
-            f"{MFT_PROJECT_MAX_ACTIVE_TASKS}")
+            f"{max_project_active_tasks}")
     if not isinstance(projects, list):
         raise ProjectCapacityError("scheduler returned an invalid project inventory")
     matches = [
@@ -278,10 +306,15 @@ def project_submission_snapshot(
     if len(matches) != 1:
         raise ProjectCapacityError(
             f"scheduler project {MFT_PROJECT!r} is missing or ambiguous")
+    validation_options = {}
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        validation_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     project_contract = validate_project_mutation_contract(
         matches[0],
         expected_cap=(required_hard_cap if require_exact_project_cap else None),
         require_full=require_full_project,
+        **validation_options,
     )
     if not isinstance(project_tasks, list):
         raise ProjectCapacityError(
@@ -382,14 +415,20 @@ def _task_rows(response, source):
 
 def live_project_submission_snapshot(
         required_hard_cap=MFT_PROJECT_MAX_ACTIVE_TASKS, *,
-        require_exact_project_cap=False, require_full_project=False):
+        require_exact_project_cap=False, require_full_project=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Read the absolute logical-project budget while the mutation lock is held."""
     if not campaign_mutation_lock_is_held():
         raise ProjectCapacityError(
             "MFT project capacity must be checked under the campaign mutation lock")
+    validation_options = {}
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        validation_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     project = require_live_project_mutation_contract(
         expected_cap=(required_hard_cap if require_exact_project_cap else None),
         require_full=require_full_project,
+        **validation_options,
     )
     statuses = ",".join(MFT_ACTIVE_STATUSES)
     try:
@@ -422,6 +461,7 @@ def live_project_submission_snapshot(
         # ``require_live_project_mutation_contract`` already authenticated
         # the full raw record; ``project`` here is its normalized projection.
         require_full_project=False,
+        **validation_options,
     )
 
 
@@ -526,12 +566,49 @@ def verification_dedupe_key(
         name, params, profile, solver_revision, library_revision)["dedupe_key"]
 
 
+def _normalized_submission_env(submission_env):
+    if submission_env is None:
+        return {}
+    if not isinstance(submission_env, dict):
+        raise TypeError("submission_env must be a dict")
+    normalized = {}
+    for key, value in submission_env.items():
+        key = str(key)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", key):
+            raise ValueError(f"invalid submission environment key: {key!r}")
+        value = str(value)
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError(f"invalid submission environment value for {key}")
+        normalized[key] = value
+    return normalized
+
+
+def _shell_double_quote_expandable(value):
+    """Quote a shell value while leaving runtime dollar expansion enabled."""
+    escaped = (
+        value.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`")
+    )
+    return f'"{escaped}"'
+
+
 def submit_verification(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
         required_project_cap=None, priority=0, account_name="",
-        node_name="", max_workers_per_node=0):
+        node_name="", max_workers_per_node=0, *, aedt_backend=None,
+        submission_env=None, required_hard_cap=None,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """Submit one MFT task under the shared cross-process mutation lock."""
+    submission_options = {}
+    if aedt_backend is not None:
+        submission_options["aedt_backend"] = aedt_backend
+    if submission_env is not None:
+        submission_options["submission_env"] = submission_env
+    if required_hard_cap is not None:
+        submission_options["required_hard_cap"] = required_hard_cap
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        submission_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
             name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
@@ -542,6 +619,7 @@ def submit_verification(
             account_name=account_name,
             node_name=node_name,
             max_workers_per_node=max_workers_per_node,
+            **submission_options,
         )
     with campaign_mutation_lock():
         return _submit_verification_locked(
@@ -553,6 +631,7 @@ def submit_verification(
             account_name=account_name,
             node_name=node_name,
             max_workers_per_node=max_workers_per_node,
+            **submission_options,
         )
 
 
@@ -560,7 +639,9 @@ def _submit_verification_locked(
         name, workdir, params: dict, profile: dict, mem_mb=32768, cpus=4,
         solver_revision=None, library_revision=None,
         required_project_cap=None, priority=0, account_name="",
-        node_name="", max_workers_per_node=0):
+        node_name="", max_workers_per_node=0, *, aedt_backend=None,
+        submission_env=None, required_hard_cap=None,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
@@ -586,6 +667,13 @@ def _submit_verification_locked(
     pjson = identity["parameter_json"]
     parameter_digest = identity["parameter_digest"]
     dedupe_key = identity["dedupe_key"]
+    if aedt_backend is not None and aedt_backend not in {"standalone", "pooled"}:
+        raise ValueError("aedt_backend must be standalone or pooled")
+    normalized_env = _normalized_submission_env(submission_env)
+    env_exports = "".join(
+        f"export {key}={_shell_double_quote_expandable(value)}; "
+        for key, value in sorted(normalized_env.items())
+    )
     extra = profile.get("cli_flags", "")
     run_identity = (
         f"s{solver_revision[:12]}-l{library_revision[:12]}-p{parameter_digest}")
@@ -607,28 +695,56 @@ def _submit_verification_locked(
     quoted_workdir = '"${MFT_WORKDIR}"'
     quoted_repo = '"${MFT_WORKDIR}/repo"'
     quoted_library = '"${MFT_WORKDIR}/pyaedt_library"'
-    cleanup_workdirs = '"${MFT_NVME_WORKDIR}" "${MFT_GPFS_WORKDIR}"'
-    select_workdir = (
+    gpfs_workdir_setup = (
         "MFT_GPFS_ROOT=$PWD; "
         f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{scratch_leaf}"; '
-        f"MFT_NVME_WORKDIR={shlex.quote(scratch_workdir)}; "
+    )
+    gpfs_stale_cleanup = (
         'find "$MFT_GPFS_ROOT" -mindepth 1 -maxdepth 1 -type d '
         '-user "$USER" '
         f"-name {shlex.quote(SCRATCH_LEAF_PATTERN)} "
         f"-mmin +{GPFS_SCRATCH_STALE_MINUTES} -exec rm -rf -- {{}} + "
         "2>/dev/null || true; "
-        f"MFT_ENROOT_FREE_KB=$(df -Pk {LOCAL_SCRATCH_ROOT} 2>/dev/null "
-        "| awk 'NR==2 {print $4}'); "
-        f"if [ \"$(findmnt -n -o FSTYPE -T {LOCAL_SCRATCH_ROOT} 2>/dev/null)\" = xfs ] "
-        f"&& [ \"${{MFT_ENROOT_FREE_KB:-0}}\" -ge {LOCAL_SCRATCH_MIN_FREE_KB} ]; then "
-        "MFT_WORKDIR=$MFT_NVME_WORKDIR; "
-        f"find {LOCAL_SCRATCH_ROOT} -mindepth 1 -maxdepth 1 -type d "
-        "-user \"$USER\" -name 'mft_*' "
-        f"-mmin +{LOCAL_SCRATCH_STALE_MINUTES} -exec rm -rf -- {{}} + "
-        "2>/dev/null || true; "
-        "else MFT_WORKDIR=$MFT_GPFS_WORKDIR; fi; "
-        "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
     )
+    if aedt_backend == "pooled":
+        # AEDT file operations run on the Desktop's node, so pooled tasks must
+        # use storage shared with that node rather than client-local NVMe.
+        # The shared Desktop may run under a DIFFERENT account (session hosts
+        # are placed per-allocation), so everything the client creates under
+        # the workdir must be world-writable or SaveAs/solve outputs fail
+        # with cross-account permission errors.
+        cleanup_workdirs = '"${MFT_GPFS_WORKDIR}"'
+        # Account homes are not uniformly traversable (some are 0700), so
+        # per-home workdirs are unreachable for a Desktop running under a
+        # different account even at mode 777. Use the world-writable shared
+        # scratch instead of the account workspace for pooled runs.
+        select_workdir = (
+            "umask 000; "
+            + "MFT_GPFS_ROOT=/gpfs/tmp_cpu2/mft_pool; "
+            + 'mkdir -p "$MFT_GPFS_ROOT"; '
+            + f'MFT_GPFS_WORKDIR="$MFT_GPFS_ROOT/{scratch_leaf}"; '
+            + gpfs_stale_cleanup
+            + 'MFT_WORKDIR="$MFT_GPFS_WORKDIR"; '
+            + "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
+        )
+    else:
+        cleanup_workdirs = '"${MFT_NVME_WORKDIR}" "${MFT_GPFS_WORKDIR}"'
+        select_workdir = (
+            gpfs_workdir_setup
+            + f"MFT_NVME_WORKDIR={shlex.quote(scratch_workdir)}; "
+            + gpfs_stale_cleanup
+            + f"MFT_ENROOT_FREE_KB=$(df -Pk {LOCAL_SCRATCH_ROOT} 2>/dev/null "
+            "| awk 'NR==2 {print $4}'); "
+            f"if [ \"$(findmnt -n -o FSTYPE -T {LOCAL_SCRATCH_ROOT} 2>/dev/null)\" = xfs ] "
+            f"&& [ \"${{MFT_ENROOT_FREE_KB:-0}}\" -ge {LOCAL_SCRATCH_MIN_FREE_KB} ]; then "
+            "MFT_WORKDIR=$MFT_NVME_WORKDIR; "
+            f"find {LOCAL_SCRATCH_ROOT} -mindepth 1 -maxdepth 1 -type d "
+            "-user \"$USER\" -name 'mft_*' "
+            f"-mmin +{LOCAL_SCRATCH_STALE_MINUTES} -exec rm -rf -- {{}} + "
+            "2>/dev/null || true; "
+            "else MFT_WORKDIR=$MFT_GPFS_WORKDIR; fi; "
+            "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
+        )
     lib_clone = (f"([ -d {quoted_library}/.git ] || {{ [ ! -e {quoted_library} ] && "
                  "git clone -q --depth 1 "
                  f"https://github.com/Schwalbe262/pyaedt_library.git {quoted_library}.tmp.$$ "
@@ -644,7 +760,8 @@ def _submit_verification_locked(
                   f"[ -d {quoted_library}/src ] && "
                   f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n' && ")
     run_group = (
-        f"mkdir -p {quoted_workdir} && "
+        env_exports
+        + f"mkdir -p {quoted_workdir} && "
         + lib_clone
         + f"([ -d {quoted_repo}/.git ] || git clone -q --depth 1 "
           f"https://github.com/Schwalbe262/MFT_1MW_2026.git {quoted_repo}) && "
@@ -683,28 +800,47 @@ def _submit_verification_locked(
         # every terminal path, including cancellation and allocation loss.
         "cleanup_globs": scratch_leaf,
     }
+    if aedt_backend is not None:
+        payload["aedt_backend"] = aedt_backend
     existing = reconcile_task_id(name, dedupe_key)
     if existing is not None:
         return existing
+    max_project_active_tasks = _validated_project_cap_ceiling(
+        max_project_active_tasks)
     if required_project_cap is None:
-        required_hard_cap = MFT_PROJECT_MAX_ACTIVE_TASKS
+        if required_hard_cap is None:
+            required_hard_cap = MFT_PROJECT_MAX_ACTIVE_TASKS
+        elif (isinstance(required_hard_cap, bool)
+                or not isinstance(required_hard_cap, int)
+                or not 1 <= required_hard_cap
+                <= max_project_active_tasks):
+            raise ProjectContractError("required project hard cap is invalid")
         require_exact_project_cap = False
     else:
+        if required_hard_cap is not None:
+            raise ProjectContractError(
+                "required project cap and hard cap are mutually exclusive")
         if (isinstance(required_project_cap, bool)
                 or not isinstance(required_project_cap, int)
                 or not 1 <= required_project_cap
-                <= MFT_PROJECT_MAX_ACTIVE_TASKS):
+                <= max_project_active_tasks):
             raise ProjectContractError("required project cap is invalid")
         required_hard_cap = required_project_cap
         require_exact_project_cap = True
+    validation_options = {}
+    if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+        validation_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     if require_exact_project_cap:
         capacity = live_project_submission_snapshot(
             required_hard_cap,
             require_exact_project_cap=True,
             require_full_project=True,
+            **validation_options,
         )
     else:
-        capacity = live_project_submission_snapshot(required_hard_cap)
+        capacity = live_project_submission_snapshot(
+            required_hard_cap, **validation_options)
     if capacity["project_submission_slots"] < 1:
         raise ProjectCapacityError(
             f"MFT project has no submission slots under cap "
@@ -1200,7 +1336,14 @@ def is_valid_result(
         return False
     if expected_revision is not None:
         expected = str(expected_revision).strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{40}", expected) or expected != git_hash:
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", expected)
+            or not solver_revision_matches_physics_cohort(
+                git_hash,
+                expected,
+                result.get("physics_data_revision"),
+            )
+        ):
             return False
     library_hash = str(result.get("pyaedt_library_git_hash") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", library_hash):

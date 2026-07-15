@@ -21,6 +21,7 @@ def raw_rows():
             "saved_at": "2026-07-10 01:00:00",
             "full_model": 0,
             "matrix_skin_mesh": 0,
+            "cap_on": 1,
             "n_explicit_turns": 0,
             "thermal_rx_model": "homogenized_blocks",
             "core_k_anisotropic": 1,
@@ -51,6 +52,12 @@ def raw_rows():
             "P_winding_total": 4000.0,
             "P_core_total": 2000.0,
             "B_max_core": 1.1,
+            "C_tx_tx_F": 1.5e-8,
+            "C_rx_rx_F": 1.0e-9,
+            "C_tx_rx_F": 4.0e-10,
+            "f_res_tx_self_Hz": 20_000.0,
+            "f_res_rx_self_Hz": 8_000.0,
+            "f_res_interwinding_Hz": 1_300_000.0,
             "winding_flux_linkage_readback_status": "unavailable",
             "winding_flux_linkage_readback_applicable": 0,
             "winding_flux_linkage_readback_available": 0,
@@ -129,7 +136,7 @@ class TrainIoBuilderTests(unittest.TestCase):
         view = train_io.build_train_io(raw)
 
         self.assertEqual(tuple(view.columns), train_io.TRAIN_IO_COLUMNS)
-        self.assertEqual(view["train_io_schema_version"].tolist(), [7, 7])
+        self.assertEqual(view["train_io_schema_version"].tolist(), [8, 8])
         self.assertEqual(
             view["inductance_source_basis"].tolist(),
             ["eighth_symmetry", "full_model"],
@@ -138,6 +145,8 @@ class TrainIoBuilderTests(unittest.TestCase):
         self.assertEqual(view["Llt_phys"].tolist(), [27.5, 27.5])
         self.assertEqual(view["M_phys"].tolist(), [380.0, 380.0])
         self.assertEqual(view["matrix_skin_mesh"].tolist(), [0, 1])
+        self.assertEqual(view.loc[0, "cap_on"], 1)
+        self.assertTrue(pd.isna(view.loc[1, "cap_on"]))
         self.assertEqual(view["n_explicit_turns"].tolist(), [0, 2])
         self.assertEqual(
             view["thermal_rx_model"].tolist(),
@@ -152,6 +161,14 @@ class TrainIoBuilderTests(unittest.TestCase):
         )
         self.assertEqual(view["thermal_core_k_inplane"].tolist(), [7.68, 2.0])
         self.assertEqual(view["P_winding_total"].tolist(), [4000.0, 4100.0])
+        self.assertEqual(view.loc[0, "C_tx_tx_F"], 1.5e-8)
+        self.assertEqual(view.loc[0, "C_rx_rx_F"], 1.0e-9)
+        self.assertEqual(view.loc[0, "C_tx_rx_F"], 4.0e-10)
+        self.assertEqual(view.loc[0, "f_res_tx_self_Hz"], 20_000.0)
+        self.assertEqual(view.loc[0, "f_res_rx_self_Hz"], 8_000.0)
+        self.assertEqual(view.loc[0, "f_res_interwinding_Hz"], 1_300_000.0)
+        for column in train_io.ELECTROSTATIC_OUTPUT_COLUMNS:
+            self.assertTrue(pd.isna(view.loc[1, column]))
         self.assertEqual(
             view.loc[0, "winding_flux_linkage_readback_status"],
             "unavailable",

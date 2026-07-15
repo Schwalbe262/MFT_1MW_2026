@@ -13,7 +13,10 @@ for path in (str(REGRESSION_ROOT), str(REPO_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from model_targets import SURROGATE_WINDING_COMPONENT_LOSS_TARGETS
+from model_targets import (
+    SURROGATE_CAPACITANCE_TARGETS,
+    SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
+)
 from optimization.design_summary import (
     B_AREA_BASIS_DATASHEET_NET,
     B_AREA_BASIS_GROSS_WITH_LAMINATION,
@@ -250,6 +253,18 @@ class OptimizationContractTests(unittest.TestCase):
             .read_text(encoding="utf-8")
         )["targets"]
         for target in SURROGATE_WINDING_COMPONENT_LOSS_TARGETS:
+            with self.subTest(target=target):
+                self.assertIn(target, TARGETS)
+                self.assertIn(target, thresholds)
+                self.assertIn(target, REQUIRED_MODEL_TARGETS)
+                self.assertIn(target, REQUIRED_OPTIMIZATION_MODELS)
+
+    def test_capacitance_targets_are_required_end_to_end(self):
+        thresholds = json.loads(
+            (REGRESSION_ROOT / "training" / "model_quality_thresholds.json")
+            .read_text(encoding="utf-8")
+        )["targets"]
+        for target in SURROGATE_CAPACITANCE_TARGETS:
             with self.subTest(target=target):
                 self.assertIn(target, TARGETS)
                 self.assertIn(target, thresholds)

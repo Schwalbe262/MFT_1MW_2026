@@ -16,6 +16,7 @@ from module.core_material_contract import (
     CORE_MATERIAL_CONTRACT_VERSION,
     LEG_STACKING_DIRECTION,
     PHYSICS_DATA_REVISION,
+    PHYSICS_EQUIVALENT_SOLVER_REVISIONS,
     YOKE_STACKING_DIRECTION,
     build_core_material_contract_fields,
     effective_area_m2,
@@ -115,6 +116,24 @@ def native_props(direction, kf=K):
 
 
 class CoreMaterialArithmeticTests(unittest.TestCase):
+    def test_physics_equivalent_solver_revision_whitelist_is_explicit(self):
+        self.assertEqual(
+            PHYSICS_EQUIVALENT_SOLVER_REVISIONS,
+            (
+                "dba903eb671e37642168afc5578b8e6a93e9c046",
+                "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7",
+            ),
+        )
+        self.assertEqual(
+            len(set(PHYSICS_EQUIVALENT_SOLVER_REVISIONS)),
+            len(PHYSICS_EQUIVALENT_SOLVER_REVISIONS),
+        )
+        for revision in PHYSICS_EQUIVALENT_SOLVER_REVISIONS:
+            with self.subTest(revision=revision):
+                self.assertEqual(len(revision), 40)
+                self.assertEqual(revision, revision.lower())
+                self.assertLessEqual(set(revision), set("0123456789abcdef"))
+
     def test_native_contract_keeps_base_cm_and_separate_margin(self):
         fields = build_core_material_contract_fields(
             cm_base=CM, core_x=1.51, core_y=Y,

@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-TRAIN_IO_SCHEMA_VERSION = 7
+TRAIN_IO_SCHEMA_VERSION = 8
 
 IDENTITY_COLUMNS = (
     "project_name",
@@ -152,6 +152,7 @@ ANALYSIS_BASIS_COLUMNS = (
     "matrix_on",
     "loss_on",
     "thermal_on",
+    "cap_on",
 )
 
 INDUCTANCE_SOURCE_COLUMNS = (
@@ -228,6 +229,15 @@ AGGREGATE_EM_OUTPUT_COLUMNS = (
     "I1_phase_deg",
     "phi_deg",
     "I2_phase_used_deg",
+)
+
+ELECTROSTATIC_OUTPUT_COLUMNS = (
+    "C_tx_tx_F",
+    "C_rx_rx_F",
+    "C_tx_rx_F",
+    "f_res_tx_self_Hz",
+    "f_res_rx_self_Hz",
+    "f_res_interwinding_Hz",
 )
 
 AGGREGATE_TEMPERATURE_COLUMNS = (
@@ -369,6 +379,7 @@ TRAIN_IO_COLUMNS = (
     *INDUCTANCE_BASIS_COLUMNS,
     *INDUCTANCE_PHYSICAL_COLUMNS,
     *AGGREGATE_EM_OUTPUT_COLUMNS,
+    *ELECTROSTATIC_OUTPUT_COLUMNS,
     *AGGREGATE_TEMPERATURE_COLUMNS,
     *QUALITY_COLUMNS,
     *TIMING_PROVENANCE_COLUMNS,
@@ -454,6 +465,7 @@ def build_train_io(master: pd.DataFrame) -> pd.DataFrame:
 
     for column in (
         *AGGREGATE_EM_OUTPUT_COLUMNS,
+        *ELECTROSTATIC_OUTPUT_COLUMNS,
         *AGGREGATE_TEMPERATURE_COLUMNS,
         *QUALITY_COLUMNS,
         *TIMING_PROVENANCE_COLUMNS,

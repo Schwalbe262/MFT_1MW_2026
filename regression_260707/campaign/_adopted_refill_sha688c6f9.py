@@ -36,6 +36,9 @@ import feeder
 import pinned_pilot
 import rapid_campaign
 import scheduler_client
+from training.checkpoint_contract import (
+    checkpoint_status_revision_identity_matches,
+)
 
 
 SOLVER = "688c6f9ae8b1368d2b4424e42fc8973b3c580d24"
@@ -668,8 +671,9 @@ def _local3_passed() -> bool:
 
 def _strict_rows() -> int:
     payload = json.loads(STRICT_STATUS_PATH.read_text(encoding="utf-8"))
-    identity = payload.get("state_identity") or {}
-    if identity.get("solver_revision") != SOLVER or identity.get("library_revision") != LIBRARY:
+    if not checkpoint_status_revision_identity_matches(
+        payload, SOLVER, LIBRARY
+    ):
         raise RuntimeError("strict status is not pinned to SHA688/library e6")
     stamp = datetime.fromisoformat(str(payload["time"]).replace("Z", "+00:00"))
     if stamp.tzinfo is None:

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+</head>
+<body class="cohorts-page" data-refresh-seconds="{{ refresh_seconds }}">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">M</span>
+      <div>
+        <p class="eyebrow">MFT · DATA CAMPAIGN</p>
+        <h1>코호트 상세</h1>
+      </div>
+    </div>
+    <div class="topbar-status">
+      <span id="cohorts-status" class="status-pill status-loading"><i></i> 불러오는 중</span>
+      <span id="cohorts-refreshed" class="muted">—</span>
+      <button id="cohorts-refresh" class="icon-button" type="button" title="지금 새로고침" aria-label="지금 새로고침">↻</button>
+      <a class="detail-link back-link" href="/">← 메인 대시보드</a>
+    </div>
+  </header>
+
+  <main class="cohorts-main">
+    <section aria-labelledby="cohorts-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SOLVER · PHYSICS REVISION</p>
+          <h2 id="cohorts-title">수집 데이터 코호트</h2>
+          <p>git SHA와 물리 데이터 revision 조합별 재계산 strict 판정입니다.</p>
+        </div>
+        <span id="cohorts-summary" class="section-badge">—</span>
+      </div>
+      <article class="panel cohorts-table-panel">
+        <div class="cohorts-revision-bar">
+          <span id="cohorts-current-revision" class="mono-chip">현재 physics —</span>
+          <small id="cohorts-members">SHA: —</small>
+        </div>
+        <div class="table-scroll" role="region" aria-label="코호트 상세 표" tabindex="0">
+          <table class="cohort-detail-table" aria-label="Solver 및 물리 데이터 revision 코호트 상세">
+            <thead>
+              <tr><th>SHA</th><th>revision</th><th>Raw</th><th>Strict EM</th><th>Strict full</th><th>+/h</th></tr>
+            </thead>
+            <tbody id="cohorts-body"></tbody>
+          </table>
+        </div>
+        <p id="cohorts-empty" class="empty-state">코호트 데이터를 확인하는 중입니다.</p>
+      </article>
+      <p id="cohorts-error" class="inline-error hidden" role="alert"></p>
+    </section>
+    <p class="root-path">Project root: <code>{{ project_root }}</code></p>
+  </main>
+  <script src="{{ url_for('static', path='/cohorts.js') }}" defer></script>
+</body>
+</html>

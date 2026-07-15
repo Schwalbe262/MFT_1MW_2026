@@ -26,6 +26,9 @@ for item in (HERE, REGRESSION_ROOT, VERIFY_ROOT, REPO_ROOT):
 import feeder
 import pinned_pilot
 import scheduler_client
+from training.checkpoint_contract import (
+    checkpoint_status_revision_identity_matches,
+)
 
 
 OLD_SOLVER = "3216e43a5a1a362ee2ed1aba89b642498c60d1b9"
@@ -255,8 +258,9 @@ def _validate_old_inventory(rows: list[dict]) -> dict:
 
 def _strict_harvest_evidence() -> dict:
     payload = json.loads(STRICT_STATUS_PATH.read_text(encoding="utf-8"))
-    identity = payload.get("state_identity") or {}
-    if identity.get("solver_revision") != OLD_SOLVER or identity.get("library_revision") != LIBRARY:
+    if not checkpoint_status_revision_identity_matches(
+        payload, OLD_SOLVER, LIBRARY
+    ):
         raise RuntimeError("harvest checkpoint is not pinned to the old solver/library")
     stamp = datetime.fromisoformat(str(payload["time"]).replace("Z", "+00:00"))
     if stamp.tzinfo is None:

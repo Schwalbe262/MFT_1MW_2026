@@ -1,6 +1,7 @@
 import hashlib
 import json
-from datetime import timedelta
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 from urllib.error import URLError
@@ -16,6 +17,8 @@ from regression_260707.model_targets import (
 from regression_260707.monitoring.readers import (
     ArtifactService,
     CURRENT_PHYSICS_DATA_REVISION,
+    ReadResult,
+    RefillControllerReader,
     RuntimeRecorder,
     SafeArtifactCache,
     SchedulerReader,
@@ -118,8 +121,9 @@ def _install_checkpoint_fixture(
 def test_data_counts_quality_throughput_and_revision(artifact_service):
     data = artifact_service.data()
     assert data["raw_total_rows"] == 2
+    assert data["revision_raw_rows"] == 2
     assert data["total_rows"] == 1
-    assert data["em_valid_rows"] == 2
+    assert data["em_valid_rows"] == 1
     assert data["thermal_valid_rows"] == 1
     assert data["complete_rows"] == 1
     assert data["throughput_1h"] == 1
@@ -129,29 +133,29 @@ def test_data_counts_quality_throughput_and_revision(artifact_service):
     assert data["pinned_revision"] == "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
     assert data["pinned_library_revision"] == "c" * 40
     assert data["rows_not_latest_revision"] == 1
+    assert data["rows_not_current_physics_revision"] == 0
+    assert data["count_basis"] == "physics_revision_strict_full"
+    assert data["member_git_hash_shorts"] == [
+        "754923c", "bbbbbbb",
+    ]
     assert data["eta_3000"] is not None
     timing = data["simulation_timing"]
-    assert timing["available"] is False
+    assert timing["available"] is True
     assert timing["cohort_basis"] == "active_identity"
     assert timing["cohort_filter"] == {
-        "git_hash": None,
+        "git_hash": "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a",
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
     }
-    assert timing["active_cohort"]["status"] == "no_current_revision_rows"
-    assert "현재 revision 데이터 없음" in timing["cohort_label"]
-    assert CURRENT_PHYSICS_DATA_REVISION in timing["cohort_label"]
-    assert timing["cohort_rows"] == 0
-    assert timing["window_rows"] == 0
+    assert timing["active_cohort"]["status"] == "active"
+    assert timing["cohort_rows"] == 1
+    assert timing["window_rows"] == 1
     assert timing["window_limit_rows"] == 100
-    assert all(
-        stage["sample_count"] == 0
-        and stage["mean_seconds"] is None
-        and stage["median_seconds"] is None
-        for stage in timing["stages"].values()
-    )
+    assert timing["stages"]["matrix"]["mean_seconds"] == 300.0
+    assert timing["stages"]["total"]["mean_seconds"] == 3_000.0
+    assert timing["stages"]["electrostatic"]["sample_count"] == 0
 
 
-def test_data_separates_raw_rows_from_zero_b171_pinned_rows(
+def test_data_revision_aggregate_does_not_reset_with_zero_pinned_status(
         campaign_root, artifact_service):
     manifest_path = Path(campaign_root, "data", "dataset", "manifest.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -172,9 +176,10 @@ def test_data_separates_raw_rows_from_zero_b171_pinned_rows(
     data = service.data()
 
     assert data["raw_total_rows"] == 436
-    assert data["total_rows"] == 0
-    assert data["em_valid_rows"] == 0
-    assert data["thermal_valid_rows"] == 0
+    assert data["revision_raw_rows"] == 2
+    assert data["total_rows"] == 1
+    assert data["em_valid_rows"] == 1
+    assert data["thermal_valid_rows"] == 1
     assert data["pinned_revision"] == "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
     assert data["latest_revision"] == "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a"
 
@@ -501,6 +506,44 @@ def test_simulation_timing_summary_does_not_fall_back_to_legacy_rows():
     )
 
 
+def test_simulation_timing_summary_uses_cap_solve_plus_extraction_only_when_on():
+    base = {
+        "git_hash": NEWER_SOLVER_REVISION,
+        "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+    }
+    summary = _simulation_timing_summary([
+        {
+            **base, "saved_at": "2026-07-11 04:00:00", "cap_on": 1,
+            "cap_solve_time_s": 10, "cap_extraction_time_s": 2,
+            "time": 100,
+        },
+        {
+            **base, "saved_at": "2026-07-11 03:00:00", "cap_on": "true",
+            "cap_solve_time_s": 20, "cap_extraction_time_s": 4,
+            "time": 110,
+        },
+        {
+            **base, "saved_at": "2026-07-11 02:00:00", "cap_on": 0,
+            "cap_solve_time_s": 999, "cap_extraction_time_s": 999,
+            "time": 120,
+        },
+        {
+            **base, "saved_at": "2026-07-11 01:00:00", "cap_on": 1,
+            "cap_solve_time_s": 30,
+            "time": 130,
+        },
+    ])
+
+    stage = summary["stages"]["electrostatic"]
+    assert stage["source_fields"] == [
+        "cap_solve_time_s", "cap_extraction_time_s",
+    ]
+    assert stage["sample_count"] == 2
+    assert stage["mean_seconds"] == pytest.approx(18.0)
+    assert stage["median_seconds"] == pytest.approx(18.0)
+    assert summary["stages"]["total"]["sample_count"] == 4
+
+
 def test_simulation_timing_summary_tolerates_missing_columns():
     frame = pd.DataFrame([
         {"saved_at": "2026-07-11 03:00:00", "time_thermal": 3},
@@ -704,13 +747,7 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
             "thermal_core_k_throughstack": 10.0,
         },
     ])
-    history = {
-        (NEWER_SOLVER_REVISION, CURRENT_PHYSICS_DATA_REVISION): [
-            (FIXED_NOW - timedelta(hours=1, minutes=5), 1),
-        ],
-    }
-
-    summary = _campaign_frame_summary(frame, FIXED_NOW, history)
+    summary = _campaign_frame_summary(frame, FIXED_NOW)
 
     assert summary["active_cohort"]["git_hash"] == NEWER_SOLVER_REVISION
     assert summary["active_cohort"]["physics_data_revision"] == (
@@ -726,19 +763,20 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
         "git_hash": NEWER_SOLVER_REVISION,
         "git_hash_short": NEWER_SOLVER_REVISION[:10],
         "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        "latest_saved_at": (FIXED_NOW - timedelta(minutes=20)).isoformat(),
         "active": True,
         "current": True,
         "raw_rows": 5,
         "strict_em_rows": 4,
         "strict_full_rows": 3,
-        "growth_rate_per_hour": 2.0,
+        "growth_rate_per_hour": 3.0,
     }
     older = cohorts[(OLDER_SOLVER_REVISION, CURRENT_PHYSICS_DATA_REVISION)]
     assert older["active"] is False
     assert older["current"] is False
     assert older["raw_rows"] == 1
-    assert older["strict_em_rows"] == 0
-    assert older["strict_full_rows"] == 0
+    assert older["strict_em_rows"] == 1
+    assert older["strict_full_rows"] == 1
     legacy = cohorts[(
         "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
         "legacy_unspecified",
@@ -748,6 +786,21 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
     assert legacy["raw_rows"] == 2
     assert legacy["strict_em_rows"] == 0
     assert legacy["strict_full_rows"] == 0
+    assert [item["git_hash"] for item in summary["cohorts"]] == [
+        NEWER_SOLVER_REVISION,
+        "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+        OLDER_SOLVER_REVISION,
+    ]
+    aggregate = summary["physics_revision_aggregate"]
+    assert aggregate["physics_data_revision"] == CURRENT_PHYSICS_DATA_REVISION
+    assert aggregate["raw_rows"] == 6
+    assert aggregate["strict_em_rows"] == 5
+    assert aggregate["strict_full_rows"] == 4
+    assert aggregate["growth_rate_per_hour"] == 4.0
+    assert aggregate["member_git_hashes"] == [
+        NEWER_SOLVER_REVISION, OLDER_SOLVER_REVISION,
+    ]
+    assert aggregate["member_git_hash_shorts"] == ["bbbbbbb", "aaaaaaa"]
 
     electrostatic = summary["electrostatic"]
     assert electrostatic["cohort_basis"] == "active_strict_full"
@@ -805,7 +858,7 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
 
     quarantine = summary["quarantine"]
     assert quarantine["current"]["rows"] == 2
-    assert quarantine["legacy"]["rows"] == 3
+    assert quarantine["legacy"]["rows"] == 2
     current_reasons = {
         item["reason"]: item["count"]
         for item in quarantine["current"]["reasons"]
@@ -822,7 +875,7 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
                    for reason in current_reasons)
     assert legacy_reasons[
         "untrusted_provenance:solver_revision_mismatch"
-    ] == 3
+    ] == 2
 
     metadata = summary["current_cohort_metadata"]
     assert metadata["core_lamination_factor"] == {
@@ -842,6 +895,65 @@ def test_campaign_frame_summary_scopes_all_panels_to_newest_rolling_sha():
         "missing": 1,
         "unavailable": 2,
     }
+
+
+def test_campaign_cohorts_sort_inactive_rows_by_latest_saved_row():
+    from .conftest import FIXED_NOW
+
+    recent_revision = "c" * 40
+    undated_revision = "d" * 40
+    inactive_second = FIXED_NOW - timedelta(minutes=10)
+    frame = pd.DataFrame([
+        {
+            "git_hash": NEWER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (FIXED_NOW - timedelta(minutes=1)).isoformat(),
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+        },
+        {
+            "git_hash": OLDER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (
+                inactive_second + timedelta(microseconds=100)
+            ).isoformat(),
+        },
+        {
+            "git_hash": OLDER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (
+                inactive_second + timedelta(microseconds=200)
+            ).isoformat(),
+        },
+        {
+            "git_hash": recent_revision,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (
+                inactive_second + timedelta(microseconds=800)
+            ).isoformat(),
+        },
+        {
+            "git_hash": undated_revision,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+        },
+    ])
+
+    cohorts = _campaign_frame_summary(frame, FIXED_NOW)["cohorts"]
+
+    assert [item["git_hash"] for item in cohorts] == [
+        NEWER_SOLVER_REVISION,
+        recent_revision,
+        OLDER_SOLVER_REVISION,
+        undated_revision,
+    ]
+    assert cohorts[1]["latest_saved_at"] == (
+        inactive_second + timedelta(microseconds=800)
+    ).isoformat()
+    assert cohorts[2]["raw_rows"] == 2
+    assert cohorts[2]["latest_saved_at"] == (
+        inactive_second + timedelta(microseconds=200)
+    ).isoformat()
+    assert cohorts[3]["latest_saved_at"] is None
 
 
 def test_campaign_frame_summary_tolerates_missing_columns_and_uses_flags():
@@ -901,6 +1013,55 @@ def test_campaign_frame_summary_tolerates_missing_columns_and_uses_flags():
     ]["missing_rows"] == 2
 
 
+def test_campaign_audit_is_per_sha_and_preserves_malformed_rows(tmp_path):
+    frame = pd.DataFrame({
+        "git_hash": [
+            NEWER_SOLVER_REVISION, None, OLDER_SOLVER_REVISION, "bad-sha",
+        ],
+        "physics_data_revision": [CURRENT_PHYSICS_DATA_REVISION] * 4,
+    }, index=[7, 7, 3, 9])
+    calls = []
+
+    def fake_annotate(
+            cohort, *, expected_solver_revision,
+            expected_library_revision):
+        calls.append((
+            tuple(cohort["git_hash"]), expected_solver_revision,
+            expected_library_revision,
+        ))
+        audited = cohort.copy()
+        valid = expected_solver_revision is not None
+        audited["_strict_valid_em"] = valid
+        audited["_strict_valid_thermal"] = valid
+        audited["_strict_valid_full"] = valid
+        audited["_strict_invalid_reasons"] = "" if valid else "bad-provenance"
+        return audited
+
+    service = ArtifactService(tmp_path, record_runtime=False)
+    with mock.patch(
+        "regression_260707.quality_contract.annotate_validity",
+        side_effect=fake_annotate,
+    ):
+        audited, warning = service._audited_campaign_frame(
+            ReadResult(frame, "memory.parquet", True),
+            NEWER_SOLVER_REVISION,
+            "d" * 40,
+        )
+
+    assert warning is None
+    assert audited.index.tolist() == [7, 7, 3, 9]
+    assert audited["git_hash"].tolist()[:1] == [NEWER_SOLVER_REVISION]
+    assert pd.isna(audited["git_hash"].iloc[1])
+    assert audited["git_hash"].tolist()[2:] == [OLDER_SOLVER_REVISION, "bad-sha"]
+    assert audited["_strict_valid_full"].tolist() == [True, False, True, False]
+    assert calls == [
+        ((NEWER_SOLVER_REVISION,), NEWER_SOLVER_REVISION, "d" * 40),
+        ((None,), None, None),
+        ((OLDER_SOLVER_REVISION,), OLDER_SOLVER_REVISION, None),
+        (("bad-sha",), None, None),
+    ]
+
+
 def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
     from .conftest import DummyScheduler, FIXED_NOW
 
@@ -925,8 +1086,22 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
             "thermal_core_k_throughstack": 2.0,
             "time_matrix": 480.0,
             "time_loss": 1_800.0,
+            "cap_solve_time_s": 40.0,
+            "cap_extraction_time_s": 5.0,
             "time_thermal": 900.0,
             "time": 3_180.0,
+        },
+        {
+            "git_hash": OLDER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "saved_at": (FIXED_NOW - timedelta(hours=2)).isoformat(),
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+            "cap_on": 0,
+            "time_matrix": 300.0,
+            "time_loss": 1_000.0,
+            "time_thermal": 800.0,
+            "time": 2_100.0,
         },
         {
             "git_hash": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
@@ -941,9 +1116,32 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
             "time_thermal": 3.0,
             "time": 6.0,
         },
+        {
+            "git_hash": "c" * 40,
+            "physics_data_revision": "previous-physics-revision",
+            "saved_at": (FIXED_NOW - timedelta(hours=3)).isoformat(),
+            "_strict_valid_em": True,
+            "_strict_valid_full": True,
+        },
     ])
+    manifest_path = campaign_root / "data" / "dataset" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["total_rows"] = 4
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     parquet_path = campaign_root / "data" / "dataset" / "train.parquet"
     frame.to_parquet(parquet_path, index=False)
+    history_path = (
+        campaign_root / "monitoring" / "runtime" / "monitor_history.jsonl"
+    )
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps({
+        "time": (FIXED_NOW - timedelta(minutes=10)).isoformat(),
+        "data": {"cohorts": [{
+            "git_hash": OLDER_SOLVER_REVISION,
+            "physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
+            "strict_full_rows": 0,
+        }]},
+    }) + "\n", encoding="utf-8")
     service = ArtifactService(
         campaign_root,
         scheduler=DummyScheduler(),
@@ -951,20 +1149,39 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
         record_runtime=False,
     )
 
-    def passthrough_audit(
-            result, expected_solver_revision, expected_library_revision):
-        assert result.path == str(parquet_path)
-        assert result.value is not None
-        assert expected_solver_revision == NEWER_SOLVER_REVISION
-        assert expected_library_revision is None
-        return result.value, None
+    audit_calls = []
 
-    with mock.patch.object(
-        service,
-        "_audited_campaign_frame",
-        side_effect=passthrough_audit,
+    def audit_by_declared_sha(
+            cohort, *, expected_solver_revision,
+            expected_library_revision):
+        declared = {
+            str(value).strip().lower() for value in cohort["git_hash"]
+        }
+        assert declared == {expected_solver_revision}
+        assert expected_library_revision is None
+        audit_calls.append((expected_solver_revision, tuple(cohort.index)))
+        audited = cohort.copy()
+        valid = audited["physics_data_revision"].ne("legacy_unspecified")
+        audited["_strict_valid_em"] = valid
+        audited["_strict_valid_thermal"] = valid
+        audited["_strict_valid_full"] = valid
+        audited["_strict_invalid_reasons"] = [
+            "" if item else "test:legacy" for item in valid
+        ]
+        return audited
+
+    with mock.patch(
+        "regression_260707.quality_contract.annotate_validity",
+        side_effect=audit_by_declared_sha,
     ):
         data = service.data()
+
+    assert audit_calls == [
+        (NEWER_SOLVER_REVISION, (0,)),
+        (OLDER_SOLVER_REVISION, (1,)),
+        ("b171c7ce5f7a018be6a575a32b1a1f5b7caa980c", (2,)),
+        ("c" * 40, (3,)),
+    ]
 
     assert data["source"]["campaign_rows"] == str(parquet_path)
     assert data["active_cohort"]["git_hash"] == NEWER_SOLVER_REVISION
@@ -972,6 +1189,25 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
     assert data["cohorts"][0]["current"] is True
     assert data["cohorts"][0]["raw_rows"] == 1
     assert data["cohorts"][0]["strict_full_rows"] == 1
+    assert data["count_basis"] == "physics_revision_strict_full"
+    assert data["raw_total_rows"] == 4
+    assert data["revision_raw_rows"] == 2
+    assert data["total_rows"] == 2
+    assert data["em_valid_rows"] == 2
+    assert data["throughput_1h"] == 1
+    assert data["member_git_hashes"] == [
+        NEWER_SOLVER_REVISION, OLDER_SOLVER_REVISION,
+    ]
+    assert data["member_git_hash_shorts"] == ["bbbbbbb", "aaaaaaa"]
+    older_cohort = next(
+        item for item in data["cohorts"]
+        if item["git_hash"] == OLDER_SOLVER_REVISION
+    )
+    # Old zero-based runtime snapshots must not turn a rolled SHA's existing
+    # rows into false +/h growth.  saved_at is the authoritative basis.
+    assert older_cohort["growth_rate_per_hour"] == 0
+    assert data["rows_not_current_physics_revision"] == 2
+    assert data["eta_3000"] is not None
     assert data["electrostatic"]["cap_stage_present_rows"] == 1
     assert data["electrostatic"]["capacitance"]["tx_tx"][
         "median_nF"
@@ -984,6 +1220,8 @@ def test_artifact_service_data_reads_lossless_campaign_parquet(campaign_root):
     assert timing["cohort_rows"] == 1
     assert timing["window_rows"] == 1
     assert timing["stages"]["matrix"]["mean_seconds"] == 480.0
+    assert timing["stages"]["electrostatic"]["mean_seconds"] == 45.0
+    assert timing["stages"]["electrostatic"]["sample_count"] == 1
     assert timing["stages"]["icepak"]["mean_seconds"] == 900.0
     assert timing["stages"]["total"]["mean_seconds"] == 3_180.0
 
@@ -1015,6 +1253,7 @@ def test_runtime_snapshot_failure_warns_but_history_still_appends(
     service = ArtifactService(
         campaign_root,
         scheduler=artifact_service.scheduler,
+        refill_controller=artifact_service.refill_controller,
         clock=artifact_service.clock,
         record_runtime=True,
     )
@@ -1197,6 +1436,39 @@ def test_scheduler_normalizes_aedt_pool_and_license_attach_status():
                 "error": "",
                 "admission": {"snapshot_valid": True},
             })
+        if "/api/tasks?" in request.full_url and "_aedt_pool_hosts" in request.full_url:
+            return FakeResponse([
+                {
+                    "task_id": 701, "name": "bundle-a-host",
+                    "project": "_aedt_pool_hosts", "status": "running",
+                    "entrypoint": "aedt_node_canary_host",
+                },
+                {
+                    "task_id": 702, "name": "bundle-b-host",
+                    "project": "_aedt_pool_hosts", "status": "attaching",
+                    "entrypoint": "aedt_node_canary_host",
+                },
+                {
+                    "task_id": 703, "name": "bundle-c-host",
+                    "project": "_aedt_pool_hosts", "status": "queued",
+                    "entrypoint": "aedt_node_canary_host",
+                },
+                {
+                    "task_id": 704, "name": "finished-host",
+                    "project": "_aedt_pool_hosts", "status": "completed",
+                    "entrypoint": "aedt_node_canary_host",
+                },
+                {
+                    "task_id": 705, "name": "unrelated-host",
+                    "project": "other", "status": "running",
+                    "entrypoint": "aedt_node_canary_host",
+                },
+                {
+                    "task_id": 706, "name": "central-session-host",
+                    "project": "_aedt_pool_hosts", "status": "running",
+                    "entrypoint": "slurm_scheduler.aedt_session_host",
+                },
+            ])
         raise AssertionError(request.full_url)
 
     result = SchedulerReader(
@@ -1243,6 +1515,30 @@ def test_scheduler_normalizes_aedt_pool_and_license_attach_status():
         "total": 550,
         "snapshot_valid": True,
         "checked_at": "2026-07-13T02:00:00+09:00",
+        "error": None,
+    }
+    assert attach["node_local"] == {
+        "available": True,
+        "project": "_aedt_pool_hosts",
+        "active_host_tasks": 3,
+        "statuses": {"attaching": 1, "queued": 1, "running": 1},
+        "bundle_count": 3,
+        "bundle_ids": ["bundle-a", "bundle-b", "bundle-c"],
+        "expected_projects": None,
+        "hosts": [
+            {
+                "task_id": 701, "name": "bundle-a-host",
+                "status": "running", "bundle_id": "bundle-a",
+            },
+            {
+                "task_id": 702, "name": "bundle-b-host",
+                "status": "attaching", "bundle_id": "bundle-b",
+            },
+            {
+                "task_id": 703, "name": "bundle-c-host",
+                "status": "queued", "bundle_id": "bundle-c",
+            },
+        ],
         "error": None,
     }
     optional_calls = {
@@ -1322,6 +1618,8 @@ def test_scheduler_optional_attach_endpoint_failure_is_section_local(
     assert result["parallel_target"] == 300
     attach = result["aedt_attach"]
     assert len(attach["errors"]) == 1
+    assert attach["node_local"]["available"] is False
+    assert "/api/tasks?" in attach["node_local"]["error"]
     if failed_endpoint == "pool":
         assert attach["state"] == "pool_unavailable"
         assert attach["pool"]["available"] is False
@@ -1508,11 +1806,139 @@ def test_scheduler_disables_control_when_runtime_lacks_exact_live_count_fields()
     assert "live counts" in result["project_error"]
 
 
+@pytest.mark.parametrize(
+    "state_payload",
+    (
+        {"policy": {"target": 275}},
+        {"generation": {"identity": {"project_concurrency_target": 275}}},
+    ),
+    ids=("policy-target", "production-generation-identity"),
+)
+def test_refill_controller_reader_returns_latest_tick_and_state_target(
+    tmp_path, monkeypatch, state_payload
+):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text(json.dumps(state_payload), encoding="utf-8")
+    log_path.write_text(
+        "\n".join(
+            (
+                json.dumps({"action": "older_tick"}),
+                json.dumps({
+                    "action": "rolling_refill_complete",
+                    "active_project_tasks_before": 271,
+                    "accepted_or_reconciled_count": 4,
+                    "generation": {"id": "restart-v3-1234567890abcdef"},
+                }),
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    tick_timestamp = 1_784_000_000
+    os.utime(log_path, (tick_timestamp, tick_timestamp))
+    monkeypatch.setenv("MFT_CONTROLLER_STATE_PATH", str(state_path))
+    monkeypatch.setenv("MFT_CONTROLLER_LOG_PATH", str(log_path))
+
+    result = RefillControllerReader().snapshot()
+
+    assert result == {
+        "available": True,
+        "last_tick_at": result["last_tick_at"],
+        "action": "rolling_refill_complete",
+        "active_project_tasks_before": 271,
+        "accepted_or_reconciled_count": 4,
+        "generation_id": "restart-v3-1234567890abcdef",
+        "concurrency_target": 275,
+    }
+    assert datetime.fromisoformat(result["last_tick_at"]).timestamp() == tick_timestamp
+
+
+def test_refill_controller_reader_missing_files_is_unavailable(tmp_path):
+    result = RefillControllerReader(
+        tmp_path / "missing-state.json", tmp_path / "missing.log"
+    ).snapshot()
+
+    assert result == {"available": False}
+
+
+def test_refill_controller_reader_rejects_malformed_last_log_line(tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text(json.dumps({"policy": {"target": 300}}), encoding="utf-8")
+    log_path.write_text(
+        json.dumps({"action": "no_refill_needed"}) + "\n{malformed\n\n",
+        encoding="utf-8",
+    )
+
+    assert RefillControllerReader(state_path, log_path).snapshot() == {
+        "available": False
+    }
+
+
+def test_refill_controller_reader_rejects_malformed_state(tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text("{malformed", encoding="utf-8")
+    log_path.write_text(
+        json.dumps({"action": "no_refill_needed"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert RefillControllerReader(state_path, log_path).snapshot() == {
+        "available": False
+    }
+
+
+def test_refill_controller_reader_requires_tick_action(tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text(json.dumps({"policy": {"target": 300}}), encoding="utf-8")
+    log_path.write_text(
+        json.dumps({"active_project_tasks_before": 300}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert RefillControllerReader(state_path, log_path).snapshot() == {
+        "available": False
+    }
+
+
+def test_refill_controller_reader_accepts_tick_larger_than_64_kib(tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    log_path = tmp_path / "controller.log"
+    state_path.write_text(json.dumps({"policy": {"target": 300}}), encoding="utf-8")
+    tick_line = json.dumps({
+        "action": "pooled_bundle_pending",
+        "active_project_tasks_before": 298,
+        "accepted_or_reconciled_count": 0,
+        "padding": "x" * 70_000,
+    })
+    assert 64 * 1024 < len(tick_line.encode("utf-8")) < 128 * 1024
+    log_path.write_text(
+        json.dumps({"action": "older_tick"}) + "\n" + tick_line + "\n",
+        encoding="utf-8",
+    )
+
+    result = RefillControllerReader(state_path, log_path).snapshot()
+
+    assert result["available"] is True
+    assert result["action"] == "pooled_bundle_pending"
+    assert result["active_project_tasks_before"] == 298
+    assert result["accepted_or_reconciled_count"] == 0
+
+
 def test_dashboard_survives_missing_optional_artifacts(tmp_path):
     from regression_260707.monitoring.readers import ArtifactService
-    from .conftest import DummyScheduler, FIXED_NOW
+    from .conftest import DummyRefillController, DummyScheduler, FIXED_NOW
 
-    service = ArtifactService(tmp_path / "empty", scheduler=DummyScheduler(), clock=lambda: FIXED_NOW, record_runtime=False)
+    service = ArtifactService(
+        tmp_path / "empty",
+        scheduler=DummyScheduler(),
+        refill_controller=DummyRefillController(),
+        clock=lambda: FIXED_NOW,
+        record_runtime=False,
+    )
     payload = service.dashboard()
     assert payload["data"]["total_rows"] == 0
     assert payload["models"]["trained_count"] == 0

@@ -40,6 +40,7 @@ while true; do
   # validator, or model-target change gets a fresh evidence root without
   # overwriting the immutable state for the prior contract.
   if ! CONTRACT_KEY="$("$PY" training/checkpoint_contract.py \
+      --solver-revision "$MFT_SOLVER_REVISION" \
       "${PROFILE_ARGS[@]}" "${THRESHOLD_ARGS[@]}")"; then
     echo "[checkpoint] unable to fingerprint the training contract" >&2
     sleep "$CHECKPOINT_INTERVAL_SECONDS"
@@ -50,7 +51,7 @@ while true; do
     sleep "$CHECKPOINT_INTERVAL_SECONDS"
     continue
   fi
-  RUN_ROOT="$OUTPUT_ROOT/checkpoint_runs/${MFT_SOLVER_REVISION}-${MFT_LIBRARY_REVISION}-c${CONTRACT_KEY}"
+  RUN_ROOT="$OUTPUT_ROOT/checkpoint_runs/${MFT_LIBRARY_REVISION}-c${CONTRACT_KEY}"
   printf '[checkpoint] start %s\n' "$(date -Iseconds)"
   if ! "$PY" training/checkpoint_orchestrator.py \
       --runtime-root "$PWD" \

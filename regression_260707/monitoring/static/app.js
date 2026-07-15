@@ -1,9 +1,10 @@
 (() => {
   "use strict";
 
+  const hasDOM = typeof document !== "undefined";
   const $ = (selector) => document.querySelector(selector);
   const svgNS = "http://www.w3.org/2000/svg";
-  const refreshSeconds = Number(document.body.dataset.refreshSeconds || 20);
+  const refreshSeconds = hasDOM ? Number(document.body.dataset.refreshSeconds || 20) : 20;
   const state = {
     dashboard: null, selectedModel: null, selectedModelData: null, refreshing: false,
     historyMetric: "r2",
@@ -72,6 +73,14 @@
     if (minutes < 1) return "방금 갱신";
     if (minutes < 60) return `${Math.floor(minutes)}분 전 갱신`;
     return `${number(minutes / 60, 1)}시간 전 갱신`;
+  }
+
+  function relativeTickTime(value) {
+    if (!value) return "시각 확인 불가";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return "시각 확인 불가";
+    const minutes = Math.max(0, Math.floor((Date.now() - parsed.getTime()) / 60000));
+    return minutes < 1 ? "방금" : `${number(minutes)}분 전`;
   }
 
   function element(tag, className, text) {
@@ -155,26 +164,27 @@
 
   function renderData(data) {
     setText("#data-total", `${number(data.total_rows)}개`);
-    setText("#data-strict-detail", data.pinned_revision ? `pin ${data.pinned_revision.slice(0, 10)} · strict full` : "pin — · strict full");
+    const physicsRevision = String(data.current_physics_data_revision || "");
+    const physicsLabel = physicsRevision.length > 24 ? `${physicsRevision.slice(0, 24)}…` : (physicsRevision || "—");
+    setText("#data-strict-detail", `physics ${physicsLabel} · strict full`);
+    const memberShas = Array.isArray(data.member_git_hash_shorts) ? data.member_git_hash_shorts : [];
+    setText("#data-member-shas", `SHA: ${memberShas.length ? memberShas.join(", ") : "—"}`);
     setText("#data-raw-total", `${number(data.raw_total_rows)}개`);
-    const rawRows = Number(data.raw_total_rows);
-    const strictRows = Number(data.total_rows);
-    const isolatedRows = Number.isFinite(rawRows) && Number.isFinite(strictRows) ? Math.max(0, rawRows - strictRows) : null;
-    setText("#data-quality-detail", `최신 strict EM ${number(data.em_valid_rows)}개 · Thermal ${number(data.thermal_valid_rows)}개 · 격리 ${number(isolatedRows)}개`);
+    setText("#data-quality-detail", `현재 revision raw ${number(data.revision_raw_rows)}개 · strict EM ${number(data.em_valid_rows)}개 · strict full ${number(data.total_rows)}개`);
     setText("#data-throughput", `+${number(data.throughput_1h)}개`);
     setText("#data-throughput-detail", `24시간 +${number(data.added_24h)} · 유효속도 ${number(data.effective_hourly_rate, 1)}/h`);
     setText("#data-eta", data.eta_3000 ? dateTime(data.eta_3000) : "산정 불가");
     setText("#data-stall", data.eta_hours != null ? `약 ${number(data.eta_hours, 1)}시간 후` : "최근 처리량이 없습니다");
     setText("#data-freshness", elapsed(data.stalled_minutes));
     $("#data-freshness").classList.toggle("stale", Boolean(data.stalled));
-    setText("#latest-revision", data.latest_revision ? `revision ${data.latest_revision.slice(0, 10)}` : "revision —");
+    setText("#latest-revision", physicsRevision ? `physics ${physicsLabel}` : "physics —");
     setText("#goal-label", `${number(data.total_rows)} / ${number(data.goal)}`);
     setText("#stretch-label", `${number(data.total_rows)} / ${number(data.stretch_goal)}+`);
     $("#goal-progress").style.width = `${Math.max(0, Math.min(100, data.goal_progress_pct || 0))}%`;
     $("#stretch-progress").style.width = `${Math.max(0, Math.min(100, data.stretch_progress_pct || 0))}%`;
     setText("#data-24h", `+${number(data.added_24h)}개`);
     setText("#data-remaining", `${number(data.remaining_to_goal)}개`);
-    setText("#revision-mismatch", data.rows_not_latest_revision == null ? "—" : `${number(data.rows_not_latest_revision)}개`);
+    setText("#revision-mismatch", data.rows_not_current_physics_revision == null ? "—" : `${number(data.rows_not_current_physics_revision)}개`);
     setText("#collector-nodata", data.collector?.no_data_tasks == null ? "—" : `${number(data.collector.no_data_tasks)}건`);
     const timing = data.simulation_timing || {};
     const timingStages = timing.stages || {};
@@ -199,7 +209,7 @@
       ? timingCohortLabel
       : "활성 코호트 타이밍 데이터 없음";
     timingEmpty.classList.toggle("hidden", Boolean(timing.available));
-    ["matrix", "loss", "icepak", "total"].forEach((key) => {
+    ["matrix", "loss", "electrostatic", "icepak", "total"].forEach((key) => {
       const stage = timingStages[key] || {};
       setText(`#stage-time-${key}-mean`, duration(stage.mean_seconds));
       setText(
@@ -213,55 +223,13 @@
       color: "#26d7c7", area: true,
     });
     $("#data-chart-empty").classList.toggle("hidden", (data.history || []).length > 0);
-    renderCohorts(data.cohorts, data.current_cohort_metadata, data.active_cohort);
+    renderCohortMetadata(data.current_cohort_metadata);
     renderQuarantine(data.quarantine);
     renderElectrostatic(data.electrostatic);
     renderThermalModels(data.thermal_models);
   }
 
-  function renderCohorts(cohortsPayload, metadataPayload, activePayload) {
-    const cohorts = Array.isArray(cohortsPayload) ? cohortsPayload : [];
-    const active = activePayload && typeof activePayload === "object" ? activePayload : {};
-    const list = $("#cohort-list");
-    list.replaceChildren();
-    setText(
-      "#cohort-summary",
-      active.available === true
-        ? `ACTIVE ${active.git_hash_short || "—"}`
-        : active.label || (cohorts.length ? `${number(cohorts.length)}개 코호트` : "코호트 —"),
-    );
-    if (!cohorts.length) {
-      list.append(element("p", "empty-state compact-empty", "사용 가능한 코호트 데이터가 없습니다."));
-    } else {
-      [...cohorts].sort((left, right) => Number(Boolean(right?.active ?? right?.current)) - Number(Boolean(left?.active ?? left?.current))).forEach((cohort) => {
-        const isActive = Boolean(cohort?.active ?? cohort?.current);
-        const card = element("article", `cohort-row${isActive ? " active" : ""}`);
-        const heading = element("div", "cohort-row-heading");
-        const identity = element("div");
-        const hash = cohort?.git_hash_short || (cohort?.git_hash ? String(cohort.git_hash).slice(0, 10) : "—");
-        identity.append(element("strong", "mono", hash));
-        identity.append(element("span", "", cohort?.physics_data_revision || "physics revision —"));
-        heading.append(identity);
-        if (isActive) heading.append(element("span", "state-chip pass", "ACTIVE"));
-        card.append(heading);
-        const metrics = element("dl", "cohort-metric-grid");
-        [
-          ["Raw", count(cohort?.raw_rows)],
-          ["Strict EM", count(cohort?.strict_em_rows)],
-          ["Strict full", count(cohort?.strict_full_rows)],
-          ["증가 속도", hasNumber(cohort?.growth_rate_per_hour)
-            ? `${Number(cohort.growth_rate_per_hour) > 0 ? "+" : ""}${number(cohort.growth_rate_per_hour, 1)}/h`
-            : "—"],
-        ].forEach(([label, value]) => {
-          const item = element("div");
-          item.append(element("dt", "", label), element("dd", "", value));
-          metrics.append(item);
-        });
-        card.append(metrics);
-        list.append(card);
-      });
-    }
-
+  function renderCohortMetadata(metadataPayload) {
     const metadata = metadataPayload && typeof metadataPayload === "object" ? metadataPayload : {};
     const lamination = metadata.core_lamination_factor || {};
     const laminationRange = rangeSummary(lamination, "", 3);
@@ -310,9 +278,12 @@
     const quarantine = payload && typeof payload === "object" ? payload : {};
     const current = quarantine.current && typeof quarantine.current === "object" ? quarantine.current : {};
     const legacy = quarantine.legacy && typeof quarantine.legacy === "object" ? quarantine.legacy : {};
-    setText("#quarantine-current-title", current.label || "활성 코호트");
+    const hasCurrentReasons = Array.isArray(current.reasons);
+    const currentReasons = hasCurrentReasons ? current.reasons : [];
+    setText("#quarantine-current-title", `${current.label || "활성 코호트"} — ${count(current.rows)}`);
     setText("#quarantine-current-count", count(current.rows));
-    renderReasonList($("#quarantine-current-reasons"), current.reasons, hasNumber(current.rows) && Number(current.rows) === 0
+    setText("#quarantine-current-reason-count", hasCurrentReasons ? count(currentReasons.length, "건") : "—");
+    renderReasonList($("#quarantine-current-reasons"), currentReasons, hasNumber(current.rows) && Number(current.rows) === 0
       ? "현재 코호트의 격리 행이 없습니다."
       : "현재 코호트 격리 정보를 사용할 수 없습니다.");
     setText("#quarantine-legacy-label", legacy.label || "레거시 코호트 노이즈");
@@ -985,6 +956,7 @@
       : {};
     const license = attach.license && typeof attach.license === "object" ? attach.license : {};
     const pool = attach.pool && typeof attach.pool === "object" ? attach.pool : {};
+    const nodeLocal = attach.node_local && typeof attach.node_local === "object" ? attach.node_local : {};
     const rawState = String(attach.state || "").toLowerCase();
     let stateKey = rawState;
     if (!stateKey) {
@@ -1036,6 +1008,31 @@
     );
     setText("#aedt-pool-capacity", pool.available === true ? ratio(pool.ready_sessions, pool.busy_sessions) : "—");
 
+    const nodeLocalProgress = $("#aedt-node-local-progress");
+    const activeHosts = Number(nodeLocal.active_host_tasks);
+    const showNodeLocal = nodeLocal.available === true && Number.isFinite(activeHosts) && activeHosts > 0;
+    nodeLocalProgress.classList.toggle("hidden", !showNodeLocal);
+    if (showNodeLocal) {
+      const bundleText = hasNumber(nodeLocal.bundle_count)
+        ? `번들 ${number(nodeLocal.bundle_count)}개`
+        : "번들 정보 없음";
+      const projectText = hasNumber(nodeLocal.expected_projects)
+        ? ` · 프로젝트 ${number(nodeLocal.expected_projects)}개`
+        : "";
+      const statuses = nodeLocal.statuses && typeof nodeLocal.statuses === "object" ? nodeLocal.statuses : {};
+      const stateText = [
+        ["Q", statuses.queued],
+        ["A", statuses.attaching],
+        ["R", statuses.running],
+      ].filter(([, value]) => hasNumber(value)).map(([label, value]) => `${label} ${number(value)}`).join(" · ");
+      nodeLocalProgress.textContent = `노드 로컬: 활성 호스트 ${number(activeHosts)}개 · ${bundleText}${projectText}${stateText ? ` · ${stateText}` : ""}`;
+      const bundleIds = Array.isArray(nodeLocal.bundle_ids) ? nodeLocal.bundle_ids : [];
+      nodeLocalProgress.title = bundleIds.length ? `번들: ${bundleIds.join(", ")}` : "";
+    } else {
+      nodeLocalProgress.textContent = "노드 로컬 AEDT 진행 정보 없음";
+      nodeLocalProgress.title = "";
+    }
+
     const errors = [
       ...(Array.isArray(attach.errors) ? attach.errors : []),
       license.error,
@@ -1052,13 +1049,63 @@
     }
   }
 
-  function renderParallelControl(scheduler = {}) {
-    setText("#parallel-current-target", number(scheduler.parallel_target));
+  function refillActionStatus(action) {
+    const key = String(action || "").trim().toLowerCase();
+    if (key === "no_refill_needed") return { label: "정상 (보충 불필요)", kind: "pass" };
+    if (key === "pooled_bundle_pending") return { label: "AEDT 공유 번들 진행 중", kind: "attention" };
+    if (key === "failed_closed") return { label: "오류로 안전정지 (관리자 확인 필요)", kind: "fail" };
+    if (/(replac|submit|refill|reconcil|accept)/.test(key)) return { label: "보충 실행", kind: "checkpoint" };
+    return { label: action || "확인 불가", kind: "unknown" };
+  }
+
+  function renderRefillController(refillController = {}) {
+    const available = refillController.available === true;
+    const actionStatus = refillActionStatus(refillController.action);
+    const failedClosed = available && actionStatus.kind === "fail";
+    const block = $("#refill-controller-status");
+    block.classList.toggle("inline-error", failedClosed);
+    const mode = $("#refill-controller-mode");
+    mode.className = `state-chip ${failedClosed ? "fail" : available ? "pass" : "unknown"}`;
+    setText(
+      "#refill-controller-summary",
+      available
+        ? "자동 유지 모드 — 외부 컨트롤러가 MFT 동시 실행 수를 관리합니다."
+        : "컨트롤러 상태 파일을 찾을 수 없음 — 스케줄러 수치는 상단 카드 참고",
+    );
+    $("#refill-controller-details").classList.toggle("hidden", !available);
+    const action = $("#refill-controller-action");
+    action.className = `state-chip ${actionStatus.kind}`;
+    action.textContent = `${actionStatus.label} · ${relativeTickTime(refillController.last_tick_at ?? refillController.last_tick_time)}`;
+    setText("#refill-controller-active", number(refillController.active_project_tasks_before));
+    setText("#refill-controller-refilled", number(refillController.accepted_or_reconciled_count));
+    const generationId = refillController.generation_id ?? refillController.generation?.id;
+    setText("#refill-controller-generation", generationId == null ? null : String(generationId).slice(0, 12));
+  }
+
+  function renderParallelControl(scheduler = {}, refillController = state.dashboard?.refill_controller || {}) {
+    const controlEnabled = scheduler.control_enabled === true;
+    const displayedTarget = controlEnabled
+      ? scheduler.parallel_target
+      : (refillController.concurrency_target ?? scheduler.parallel_target);
+    setText("#parallel-current-target", number(displayedTarget));
     setText("#parallel-logical-active", number(scheduler.logical_active));
     setText("#parallel-queued", number(scheduler.live_queued));
     setText("#parallel-attaching", number(scheduler.live_attaching));
     setText("#parallel-running", number(scheduler.live_running));
     renderAedtAttach(scheduler);
+    $("#parallel-target-form").classList.toggle("hidden", !controlEnabled);
+    $("#refill-controller-status").classList.toggle("hidden", controlEnabled);
+    $("#parallel-target-status").classList.toggle("hidden", !controlEnabled);
+    $("#parallel-control-note").classList.toggle("hidden", !controlEnabled);
+    setText("#parallel-control-eyebrow", controlEnabled ? "LOCAL OPERATOR CONTROL · MFT ONLY" : "AUTOMATIC REFILL CONTROL · MFT ONLY");
+    setText("#parallel-control-title", controlEnabled ? "MFT 병렬 실행 목표" : "MFT 자동 실행 유지");
+    setText(
+      "#parallel-control-description",
+      controlEnabled
+        ? "queued + attaching + running 합계를 지정한 수로 유지합니다. IPMSM 프로젝트에는 적용되지 않습니다."
+        : "외부 refill-controller가 queued + attaching + running 합계를 자동으로 유지합니다.",
+    );
+    if (!controlEnabled) renderRefillController(refillController);
     const input = $("#parallel-target-input");
     const button = $("#parallel-target-button");
     const enabled = scheduler.connected === true && scheduler.control_enabled === true
@@ -1100,7 +1147,7 @@
   function render(payload) {
     state.dashboard = payload;
     renderOverall(payload);
-    renderParallelControl(payload.scheduler || {});
+    renderParallelControl(payload.scheduler || {}, payload.refill_controller || {});
     renderData(payload.data || {});
     renderModels(payload.models || { models: [] });
     renderNsga(payload.nsga2 || { candidates: [] });
@@ -1130,6 +1177,10 @@
       $("#refresh-button").disabled = false;
       $("#loading-indicator").classList.remove("loading");
     }
+  }
+
+  if (!hasDOM) {
+    return;
   }
 
   $("#refresh-button").addEventListener("click", refresh);
@@ -1165,7 +1216,7 @@
       if (!confirmed) return;
     }
     state.updatingParallelTarget = true;
-    renderParallelControl(scheduler);
+    renderParallelControl(scheduler, state.dashboard?.refill_controller || {});
     let applied = false;
     try {
       const response = await fetch("/api/operator/parallel-target", {
@@ -1183,14 +1234,14 @@
       if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
       state.parallelTargetDirty = false;
       if (state.dashboard) state.dashboard.scheduler = { ...scheduler, ...payload, control_enabled: true, connected: true };
-      renderParallelControl(state.dashboard?.scheduler || payload);
+      renderParallelControl(state.dashboard?.scheduler || payload, state.dashboard?.refill_controller || {});
       applied = true;
       await refresh();
     } catch (error) {
       parallelStatus(`목표 적용 실패: ${error.message}`, "error");
     } finally {
       state.updatingParallelTarget = false;
-      renderParallelControl(state.dashboard?.scheduler || scheduler);
+      renderParallelControl(state.dashboard?.scheduler || scheduler, state.dashboard?.refill_controller || {});
       if (applied) parallelStatus(`MFT 병렬 목표 ${target}을 저장했습니다. controller가 다음 주기에 맞춥니다.`, "success");
     }
   });

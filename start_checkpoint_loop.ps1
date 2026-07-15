@@ -40,10 +40,14 @@ if ($Profile) {
 }
 if ($Execute) { $BaseArguments += "--execute" }
 $ExplicitRunRoot = $RunRoot
-$RevisionKey = "$($SolverRevision.ToLowerInvariant())-$($LibraryRevision.ToLowerInvariant())"
+$LibraryKey = $LibraryRevision.ToLowerInvariant()
 
 while ($true) {
-    $ContractArguments = @($ContractScriptPath, "--thresholds", $Thresholds)
+    $ContractArguments = @(
+        $ContractScriptPath,
+        "--thresholds", $Thresholds,
+        "--solver-revision", $SolverRevision
+    )
     if ($Profile) { $ContractArguments += @("--profile", $Profile) }
     $ContractKey = (& $Python @ContractArguments | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $ContractKey -notmatch '^[0-9a-f]{16}$') {
@@ -54,7 +58,7 @@ while ($true) {
     if ($ExplicitRunRoot) {
         $CycleRunRoot = $ExplicitRunRoot
     } else {
-        $RevisionContractKey = "$RevisionKey-c$ContractKey"
+        $RevisionContractKey = "$LibraryKey-c$ContractKey"
         $CycleRunRoot = Join-Path $OutputRoot (Join-Path "checkpoint_runs" $RevisionContractKey)
     }
     $Arguments = $BaseArguments + @(

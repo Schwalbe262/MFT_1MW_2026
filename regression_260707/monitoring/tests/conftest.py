@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from module.core_material_contract import PHYSICS_DATA_REVISION
 from regression_260707.monitoring.readers import ArtifactService
 
 
@@ -59,6 +60,11 @@ class DummyScheduler:
         }
 
 
+class DummyRefillController:
+    def snapshot(self):
+        return {"available": False}
+
+
 def write_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -88,13 +94,15 @@ def campaign_root(tmp_path):
             "train_io_schema_version": "3",
             "saved_at": "2026-07-11 02:30:00", "result_valid_em": "1", "result_valid_thermal": "1",
             "time_matrix": "300", "time_loss": "1700", "time_thermal": "1000", "time": "3000",
-            "git_hash": "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a", "project_name": "one",
+            "git_hash": "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a",
+            "physics_data_revision": PHYSICS_DATA_REVISION, "project_name": "one",
         },
         {
             "train_io_schema_version": "3",
             "saved_at": "2026-07-11 01:30:00", "result_valid_em": "1", "result_valid_thermal": "0",
             "time_matrix": "600", "time_loss": "1800", "time_thermal": "1200", "time": "3600",
-            "git_hash": "b" * 40, "project_name": "two",
+            "git_hash": "b" * 40,
+            "physics_data_revision": PHYSICS_DATA_REVISION, "project_name": "two",
         },
     ])
     write_json(dataset / "collect_cache.json", {"harvested": [1, 2], "nodata": [3], "local_parts": ["a.parquet"]})
@@ -248,6 +256,7 @@ def artifact_service(campaign_root):
     return ArtifactService(
         campaign_root,
         scheduler=DummyScheduler(),
+        refill_controller=DummyRefillController(),
         clock=lambda: FIXED_NOW,
         record_runtime=False,
     )

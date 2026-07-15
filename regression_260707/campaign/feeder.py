@@ -1,18 +1,21 @@
 """
-상시 포화 피더: 캠페인 태스크(실행+대기)를 목표 수준(기본 400+버퍼 40)으로 유지.
+상시 포화 피더: scheduler의 durable simulation-policy desired 수를 유지한다.
 
-웨이브 장벽 없이, 완료되는 만큼 새 태스크를 채워 넣어 400 병렬을 상시 유지한다.
-- 태스크: --count 5 (샘플 5개 연속, 실패 재추첨 내장)
-- 이름: mft-camp-c-<일련번호> (serial은 feeder_state.json에 영속)
+Pooled 장기 루프는 매 주기 versioned policy를 읽고, 완료되는 만큼만 새 태스크를
+채운다. ``--target``은 일회성 실행 또는 policy가 없는 구형 scheduler의 명시적
+호환 fallback일 뿐 장기 운전의 source of truth가 아니다.
+- 태스크: 작업당 샘플 1개
+- 이름: mft-camp-s<solver>-l<library>-<일련번호> (serial은 feeder_state.json에 영속)
 - 총량 상한: --max-samples 도달 시 중단 (기본 12000)
 
-사용: python feeder.py --once        # 1회 보충 (크론/수동)
-      python feeder.py --loop 600   # 데몬 (600초 주기)
+사용: python feeder.py --once --target 1  # 1회 보충 (수동)
+      python feeder.py --loop 600 --aedt-pooled ...  # durable policy 운전
 """
 import argparse
 import copy
 import glob
 import json
+import logging
 import math
 import os
 import sys
@@ -21,7 +24,7 @@ from dataclasses import dataclass
 
 import requests
 import pyarrow.parquet as pq
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from pinned_pilot import (
     LEGACY_MFT_NAME_PREFIX,
@@ -44,15 +47,33 @@ if VERIFY_DIR not in sys.path:
 import scheduler_client
 import deployment_gate
 
-STATE = os.path.join(HERE, "feeder_state.json")
+LOGGER = logging.getLogger(__name__)
+
+_STATE_DIR = os.environ.get("MFT_FEEDER_STATE_DIR")
+if _STATE_DIR:
+    os.makedirs(_STATE_DIR, exist_ok=True)
+else:
+    _STATE_DIR = HERE
+STATE = os.path.join(_STATE_DIR, "feeder_state.json")
+CONTROLLER_LOCK = os.path.join(_STATE_DIR, "feeder-controller.lock")
 SCHEDULER = "http://127.0.0.1:8000"
 CAMPAIGN_PREFIX = "mft-camp-"
 
 TARGET_ACTIVE = 50    # standalone 실행+대기 목표 (--target으로 오버라이드)
 BUFFER = 0            # production 300 promotion is owned by rapid_campaign
 MAX_STANDALONE_ACTIVE = 50
+MAX_POOLED_ACTIVE = 500
+MAX_POOLED_PROJECT_ACTIVE_TASKS = (
+    scheduler_client.MFT_PROJECT_MAX_ACTIVE_TASKS_CEILING)
 COUNT_PER_TASK = 1
 CPUS_PER_TASK = 4
+DEFAULT_AEDT_POOL_PKG_ROOT = "$HOME/slurm_scheduler/aedt_pool_pkg"
+DEFAULT_AEDT_POOL_TOKEN_FILE = "$HOME/slurm_scheduler/aedt_pool_bootstrap"
+DEFAULT_AEDT_SESSION_VERSION = "2025.2"
+DEFAULT_AEDT_ISOLATION_POLICY = "family"
+AEDT_ISOLATION_POLICIES = ("family", "shared_if_compatible")
+DEFAULT_POOLED_CPUS = 1
+DEFAULT_POOLED_MEMORY_MB = 6144
 CPU_HEADROOM = 0.85
 SCHEDULER_ATTEMPTS = 3
 ACTIVE_TASK_STATUSES = ("queued", "attaching", "running")
@@ -75,6 +96,55 @@ def _require_deployed_revisions(solver_revision, library_revision):
 
 class SchedulerError(RuntimeError):
     pass
+
+
+class SimulationPolicyUnavailable(SchedulerError):
+    """An older scheduler does not advertise durable simulation policy."""
+
+
+def _pooled_submission_kwargs(args):
+    if not args.aedt_pooled:
+        return None
+    if not isinstance(args.aedt_pool_url, str) or not args.aedt_pool_url.strip():
+        raise SchedulerError("--aedt-pool-url is required with --aedt-pooled")
+    for value, flag in (
+            (args.pooled_cpus, "--pooled-cpus"),
+            (args.pooled_memory_mb, "--pooled-memory-mb")):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise SchedulerError(f"{flag} must be a positive integer")
+    for value, flag in (
+            (args.aedt_pool_pkg_root, "--aedt-pool-pkg-root"),
+            (args.aedt_pool_token_file, "--aedt-pool-token-file"),
+            (args.aedt_session_version, "--aedt-session-version")):
+        if not isinstance(value, str) or not value.strip():
+            raise SchedulerError(f"{flag} must be non-empty")
+    if args.aedt_isolation_policy not in AEDT_ISOLATION_POLICIES:
+        raise SchedulerError(
+            "--aedt-isolation-policy must be family or shared_if_compatible")
+    return {
+        "cpus": args.pooled_cpus,
+        "memory_mb": args.pooled_memory_mb,
+        "aedt_backend": "pooled",
+        "submission_env": {
+            "MFT_AEDT_BACKEND": "pooled",
+            "MFT_AEDT_SHARED_CANARY": "1",
+            "MFT_AEDT_SCHEDULER_URL": args.aedt_pool_url,
+            "MFT_SLURM_SCHEDULER_ROOT": args.aedt_pool_pkg_root,
+            "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": args.aedt_pool_token_file,
+            "MFT_AEDT_POOL_WORKSPACE": (
+                "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
+            ),
+            "MFT_AEDT_SESSION_VERSION": args.aedt_session_version,
+            "MFT_AEDT_ISOLATION_POLICY": args.aedt_isolation_policy,
+        },
+    }
+
+
+def _is_pooled_submission(submission):
+    return (
+        isinstance(submission, dict)
+        and submission.get("aedt_backend") == "pooled"
+    )
 
 
 _RAPID_REFILL_SEAL = object()
@@ -342,11 +412,22 @@ def _step_from_adopted_controller(
 def submit(
         name, workdir, params, solver_revision, library_revision, *,
         cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None,
-        required_project_cap=None):
+        required_project_cap=None, aedt_backend=None, submission_env=None,
+        required_hard_cap=None, max_project_active_tasks=None):
     with open(PROFILE_PATH, encoding="utf-8") as stream:
         profile = json.load(stream)
     if timeout_seconds is not None:
         profile["timeout_seconds"] = int(timeout_seconds)
+    submission_options = {}
+    if aedt_backend is not None:
+        submission_options["aedt_backend"] = aedt_backend
+    if submission_env is not None:
+        submission_options["submission_env"] = submission_env
+    if required_hard_cap is not None:
+        submission_options["required_hard_cap"] = required_hard_cap
+    if max_project_active_tasks is not None:
+        submission_options["max_project_active_tasks"] = (
+            max_project_active_tasks)
     return scheduler_client.submit_verification(
         name=name,
         workdir=workdir,
@@ -357,19 +438,55 @@ def submit(
         solver_revision=solver_revision,
         library_revision=library_revision,
         required_project_cap=required_project_cap,
+        **submission_options,
     )
 
 
 def load_state():
     if os.path.isfile(STATE):
-        return json.load(open(STATE))
+        try:
+            with open(STATE, encoding="utf-8") as stream:
+                return json.load(stream)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "state file %s is empty or corrupt (%s); starting fresh",
+                STATE,
+                exc,
+            )
     return {"serial": 0, "submitted_samples": 0}
 
 
 def save_state(st):
     tmp = STATE + ".tmp"
-    json.dump(st, open(tmp, "w"))
-    os.replace(tmp, STATE)
+    with open(tmp, "w", encoding="utf-8") as stream:
+        json.dump(st, stream)
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            os.replace(tmp, STATE)
+            return
+        except OSError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.5)
+
+    LOGGER.warning(
+        "atomic state update failed after 3 attempts (%s); "
+        "writing %s directly",
+        last_error,
+        STATE,
+    )
+    with open(STATE, "w", encoding="utf-8") as stream:
+        json.dump(st, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.remove(tmp)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        LOGGER.warning("could not remove temporary state file %s: %s", tmp, exc)
 
 
 def dataset_collection_snapshot():
@@ -516,9 +633,106 @@ def _scheduler_json(path, params=None):
     raise SchedulerError(f"scheduler request failed for {path}: {last_error}")
 
 
+def simulation_policy_snapshot():
+    """Read and validate the scheduler-owned MFT desired concurrency.
+
+    The project safety cap is intentionally not accepted as demand.  A pooled
+    controller may refill only from a versioned policy whose desired value is
+    within both the scheduler rollout gate and this solver release's hard cap.
+    """
+    project = _scheduler_json(f"/api/projects/{MFT_PROJECT}")
+    if not isinstance(project, dict):
+        raise SchedulerError("scheduler returned an invalid MFT project policy")
+    if str(project.get("name") or project.get("project") or "").strip() != MFT_PROJECT:
+        raise SchedulerError("scheduler returned a different project policy")
+    embedded = project.get("simulation_policy")
+    if isinstance(embedded, dict):
+        policy = {**project, **embedded}
+    elif (
+            "desired_simulations" in project
+            or "policy_revision" in project
+            or "validated_concurrency_limit" in project):
+        policy = project
+    else:
+        raise SimulationPolicyUnavailable(
+            "scheduler project has no durable simulation-policy capability")
+
+    desired = policy.get("desired_simulations")
+    validated = policy.get("validated_concurrency_limit")
+    revision = policy.get("policy_revision")
+    scale_down_mode = str(policy.get("scale_down_mode") or "").strip().lower()
+    if (type(desired) is not int
+            or not 0 <= desired <= MAX_POOLED_ACTIVE):
+        raise SchedulerError(
+            f"scheduler desired_simulations must be between 0 and "
+            f"{MAX_POOLED_ACTIVE}")
+    if (type(validated) is not int
+            or not 0 <= validated <= MAX_POOLED_PROJECT_ACTIVE_TASKS):
+        raise SchedulerError(
+            "scheduler validated_concurrency_limit is invalid")
+    if desired > validated:
+        raise SchedulerError(
+            "scheduler desired_simulations exceeds the validated concurrency limit")
+    if (isinstance(revision, bool)
+            or not isinstance(revision, (int, str))
+            or not str(revision).strip()
+            or (isinstance(revision, int) and revision < 0)):
+        raise SchedulerError("scheduler simulation-policy revision is invalid")
+    if scale_down_mode != "drain":
+        raise SchedulerError("scheduler simulation-policy must use drain scale-down")
+    return {
+        "desired_simulations": desired,
+        "effective_simulations": policy.get("effective_simulations"),
+        "validated_concurrency_limit": validated,
+        "policy_revision": revision,
+        "scale_down_mode": scale_down_mode,
+        "resource_constraint": policy.get("resource_constraint"),
+    }
+
+
+def _cycle_target(args):
+    """Resolve one cycle's target, preferring durable policy for pooled loops."""
+    policy_driven = bool(args.aedt_pooled and (args.loop or args.target is None))
+    if policy_driven:
+        try:
+            policy = simulation_policy_snapshot()
+            if args.buffer:
+                raise SchedulerError(
+                    "--buffer must be zero when simulation-policy drives the feeder")
+            return policy["desired_simulations"], policy
+        except SimulationPolicyUnavailable:
+            # A supplied target is an explicit compatibility fallback for an
+            # older scheduler.  New deployments omit it and therefore fail
+            # closed until durable policy is available.
+            if args.target is None:
+                raise
+            LOGGER.warning(
+                "durable simulation-policy unavailable; using explicit "
+                "compatibility target %s for this cycle",
+                args.target,
+            )
+    return (TARGET_ACTIVE if args.target is None else args.target), None
+
+
+def _validate_cycle_target(args, target):
+    if type(target) is not int or type(args.buffer) is not int:
+        raise SchedulerError("target and buffer must be integers")
+    requested_active = target + args.buffer
+    if requested_active < 0:
+        raise SchedulerError("target plus buffer must be non-negative")
+    if args.aedt_pooled and requested_active > MAX_POOLED_ACTIVE:
+        raise SchedulerError(f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
+    if not args.aedt_pooled and requested_active > MAX_STANDALONE_ACTIVE:
+        raise SchedulerError(
+            f"standalone feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
+            "use rapid_campaign.py for 300-task production promotion")
+    return requested_active
+
+
 def scheduler_snapshot(
         required_hard_cap, *, require_exact_project_cap=False,
-        require_full_project=False):
+        require_full_project=False,
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
     global_summary = _scheduler_json("/api/tasks/summary")
     allocations = _scheduler_json("/api/allocations")
     projects = _scheduler_json("/api/projects")
@@ -555,11 +769,16 @@ def scheduler_snapshot(
     try:
         queue_submission_allowed = queue_allows_demand_submission(
             capacity.get("queue_state"))
+        project_options = {}
+        if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
+            project_options["max_project_active_tasks"] = (
+                max_project_active_tasks)
         project_gate = scheduler_client.project_submission_snapshot(
             projects, project_tasks, required_hard_cap,
             legacy_tasks=legacy_tasks,
             require_exact_project_cap=require_exact_project_cap,
-            require_full_project=require_full_project)
+            require_full_project=require_full_project,
+            **project_options)
     except RuntimeError as exc:
         raise SchedulerError(str(exc)) from exc
     capacity_gate = {
@@ -594,12 +813,20 @@ def cpu_submission_headroom(status_counts, allocations, ready_fit_slots):
 
 
 def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
-         solver_revision=None, library_revision=None, candidate_seed=260710):
+         solver_revision=None, library_revision=None, candidate_seed=260710,
+         pooled_submission=None):
     requested_active = int(target) + int(buffer)
-    if requested_active > MAX_STANDALONE_ACTIVE:
+    pooled_mode = _is_pooled_submission(pooled_submission)
+    if pooled_mode and requested_active > MAX_POOLED_ACTIVE:
+        raise SchedulerError(
+            f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
+    if not pooled_mode and requested_active > MAX_STANDALONE_ACTIVE:
         raise SchedulerError(
             f"direct feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
             "only rapid_campaign may authorize production promotion")
+    pooled_options = {}
+    if pooled_submission is not None:
+        pooled_options["_pooled_submission"] = pooled_submission
     if (requested_active > 0
             and not scheduler_client.campaign_mutation_lock_is_held()):
         with campaign_mutation_lock():
@@ -608,12 +835,14 @@ def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                 solver_revision=solver_revision,
                 library_revision=library_revision,
                 candidate_seed=candidate_seed,
+                **pooled_options,
             )
     return _step_locked(
         max_samples, target=target, buffer=buffer,
         solver_revision=solver_revision,
         library_revision=library_revision,
         candidate_seed=candidate_seed,
+        **pooled_options,
     )
 
 
@@ -621,12 +850,18 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                  solver_revision=None, library_revision=None,
                  candidate_seed=260710, _rapid_authorization=None,
                  _adopted_authorization=None, _submit_resources=None,
-                 _refill_journal=None):
+                 _refill_journal=None, _pooled_submission=None):
     requested_active = int(target) + int(buffer)
     if requested_active > 0 and not scheduler_client.campaign_mutation_lock_is_held():
         raise SchedulerError("campaign refill requires the project mutation lock")
     rapid_authorized = False
     adopted_authorized = False
+    pooled_mode = _is_pooled_submission(_pooled_submission)
+    pooled_authorized = bool(
+        pooled_mode and requested_active <= MAX_POOLED_ACTIVE)
+    if pooled_mode and not pooled_authorized:
+        raise SchedulerError(
+            f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
     if requested_active > MAX_STANDALONE_ACTIVE:
         rapid_authorized = (
             isinstance(_rapid_authorization, _RapidRefillAuthorization)
@@ -651,7 +886,7 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                 "timeout_seconds": _adopted_authorization.timeout_seconds,
             }
         )
-        if not (rapid_authorized or adopted_authorized):
+        if not (rapid_authorized or adopted_authorized or pooled_authorized):
             raise SchedulerError("production refill requires rapid promotion authorization")
     if _refill_journal is not None:
         if (not isinstance(_refill_journal, dict)
@@ -674,18 +909,23 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     committed_state = copy.deepcopy(st)
     # 로컬 장부나 다른 project가 아니라 scheduler의 MFT logical project가 source of truth다.
     hard_cap = max(1, int(target) + int(buffer))
-    if hard_cap > MFT_PROJECT_MAX_ACTIVE_TASKS:
+    if (not pooled_authorized
+            and hard_cap > MFT_PROJECT_MAX_ACTIVE_TASKS):
         raise SchedulerError(
             f"campaign hard cap {hard_cap} exceeds project maximum "
             f"{MFT_PROJECT_MAX_ACTIVE_TASKS}")
     dynamic_project_cap = bool(
         adopted_authorized
         and _adopted_authorization.evidence_mode == "dynamic_project_cap_v1")
-    campaign_counts, global_counts, allocations, capacity_gate = scheduler_snapshot(
-        hard_cap,
-        require_exact_project_cap=dynamic_project_cap,
-        require_full_project=dynamic_project_cap,
-    )
+    snapshot_options = {
+        "require_exact_project_cap": dynamic_project_cap,
+        "require_full_project": dynamic_project_cap,
+    }
+    if pooled_authorized:
+        snapshot_options["max_project_active_tasks"] = (
+            MAX_POOLED_PROJECT_ACTIVE_TASKS)
+    campaign_counts, global_counts, allocations, capacity_gate = (
+        scheduler_snapshot(hard_cap, **snapshot_options))
     ready_fit_slots = capacity_gate["ready_fit_slots"]
     campaign_active = sum(campaign_counts.values())
     data_rows, judged_ids = dataset_collection_snapshot()
@@ -796,6 +1036,14 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         event = item["event"]
         try:
             submit_kwargs = dict(_submit_resources or {})
+            if _pooled_submission is not None:
+                submit_kwargs.update(_pooled_submission)
+            if pooled_authorized:
+                submit_kwargs.update({
+                    "required_hard_cap": hard_cap,
+                    "max_project_active_tasks": (
+                        MAX_POOLED_PROJECT_ACTIVE_TASKS),
+                })
             if dynamic_project_cap:
                 submit_kwargs["required_project_cap"] = hard_cap
             tid = submit(
@@ -906,74 +1154,179 @@ def publish_ready_marker(path, solver_revision, library_revision):
             os.remove(staged)
 
 
-def main():
+def _argument_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", type=int, default=None, help="반복 주기 [s]")
     ap.add_argument("--max-samples", type=int, default=12000)
-    ap.add_argument("--target", type=int, default=TARGET_ACTIVE,
-                    help="실행+대기 목표 (라이선스 서버 과부하 시 감속용)")
+    ap.add_argument(
+        "--target",
+        type=int,
+        default=None,
+        help=(
+            "compatibility/one-shot target; pooled loops read the durable "
+            "scheduler simulation-policy every cycle"
+        ),
+    )
     ap.add_argument("--buffer", type=int, default=BUFFER,
                     help="목표 초과 대기 버퍼")
     ap.add_argument("--solver-revision")
     ap.add_argument("--library-revision")
+    ap.add_argument("--trust-pinned-revisions", action="store_true")
     ap.add_argument("--candidate-seed", type=int, default=260710)
+    ap.add_argument(
+        "--aedt-pooled",
+        action="store_true",
+        help="attach MFT tasks to shared AEDT pool Desktops",
+    )
+    ap.add_argument("--aedt-pool-url", metavar="URL")
+    ap.add_argument(
+        "--aedt-pool-pkg-root",
+        default=DEFAULT_AEDT_POOL_PKG_ROOT,
+        metavar="PATH",
+    )
+    ap.add_argument(
+        "--aedt-pool-token-file",
+        default=DEFAULT_AEDT_POOL_TOKEN_FILE,
+        metavar="PATH",
+    )
+    ap.add_argument(
+        "--aedt-session-version",
+        default=DEFAULT_AEDT_SESSION_VERSION,
+        metavar="VERSION",
+    )
+    ap.add_argument(
+        "--aedt-isolation-policy",
+        choices=AEDT_ISOLATION_POLICIES,
+        default=DEFAULT_AEDT_ISOLATION_POLICY,
+        help=(
+            "start family-isolated; switch to shared_if_compatible only "
+            "after the mixed MFT/motor canary passes"
+        ),
+    )
+    ap.add_argument(
+        "--pooled-cpus", type=int, default=DEFAULT_POOLED_CPUS, metavar="N")
+    ap.add_argument(
+        "--pooled-memory-mb",
+        type=int,
+        default=DEFAULT_POOLED_MEMORY_MB,
+        metavar="N",
+    )
     ap.add_argument(
         "--ready-file",
         help="atomically written after the first successful guarded cycle",
     )
+    return ap
+
+
+def main():
+    ap = _argument_parser()
     args = ap.parse_args()
+    pooled_submission = _pooled_submission_kwargs(args)
+    if args.target is not None:
+        _validate_cycle_target(args, args.target)
 
-    requested_active = int(args.target) + int(args.buffer)
-    if requested_active > MAX_STANDALONE_ACTIVE:
-        raise SchedulerError(
-            f"standalone feeder hard cap is {MAX_STANDALONE_ACTIVE}; "
-            "use rapid_campaign.py for 300-task production promotion")
+    if args.trust_pinned_revisions:
+        for revision, flag in (
+                (args.solver_revision, "--solver-revision"),
+                (args.library_revision, "--library-revision")):
+            if (not isinstance(revision, str) or len(revision) != 40
+                    or any(char not in "0123456789abcdefABCDEF"
+                           for char in revision)):
+                raise SchedulerError(
+                    f"{flag} must be a full 40-character hex string when "
+                    "--trust-pinned-revisions is set"
+                )
+        print(
+            "[feeder] WARNING: local revision vetting and the p08 completion "
+            "gate were bypassed; "
+            f"using pinned solver SHA {args.solver_revision} and "
+            f"library SHA {args.library_revision}"
+        )
 
-    if args.target + args.buffer > 0:
+    may_submit = bool(
+        args.target is None
+        or args.target + args.buffer > 0
+        or (args.aedt_pooled and args.loop)
+    )
+    if may_submit and not args.trust_pinned_revisions:
         if args.solver_revision != al_driver._current_solver_revision():
             raise SchedulerError("feeder solver revision is not the current vetted local solver")
         if args.library_revision != al_driver._current_library_revision():
             raise SchedulerError("feeder library revision is not the current clean local library")
         validate_p08_completion(
-            args.solver_revision, args.library_revision, seed=args.candidate_seed)
+            args.solver_revision, args.library_revision,
+            seed=args.candidate_seed)
 
     def guarded_step():
-        def run_locked_step():
-            if args.target + args.buffer > 0:
+        def run_cycle(target, policy, requested_active):
+            if requested_active > 0:
                 _require_deployed_revisions(
                     args.solver_revision, args.library_revision
                 )
+            if policy is not None:
+                print(
+                    "[feeder] scheduler policy "
+                    f"revision={policy['policy_revision']} "
+                    f"desired={policy['desired_simulations']} "
+                    f"effective={policy.get('effective_simulations')} "
+                    f"validated={policy['validated_concurrency_limit']}"
+                )
+            step_options = {}
+            if pooled_submission is not None:
+                step_options["pooled_submission"] = pooled_submission
             return step(
-                args.max_samples, target=args.target, buffer=args.buffer,
+                args.max_samples, target=target, buffer=args.buffer,
                 solver_revision=args.solver_revision,
                 library_revision=args.library_revision,
                 candidate_seed=args.candidate_seed,
+                **step_options,
             )
 
-        if args.target + args.buffer > 0:
+        # Serialize policy observation with every submission in that cycle.
+        # The WEB UI uses the same host-wide lock, so a concurrent target
+        # reduction cannot race an already-authorized refill batch.
+        if args.aedt_pooled and (args.loop or args.target is None):
             with campaign_mutation_lock():
-                return run_locked_step()
-        return run_locked_step()
+                target, policy = _cycle_target(args)
+                requested_active = _validate_cycle_target(args, target)
+                return run_cycle(target, policy, requested_active)
+
+        target, policy = _cycle_target(args)
+        requested_active = _validate_cycle_target(args, target)
+        if requested_active > 0:
+            with campaign_mutation_lock():
+                return run_cycle(target, policy, requested_active)
+        return run_cycle(target, policy, requested_active)
 
     if args.once or not args.loop:
         guarded_step()
         publish_ready_marker(
             args.ready_file, args.solver_revision, args.library_revision)
         return
-    ready_published = False
-    while True:
-        try:
-            keep_running = guarded_step()
-            if not ready_published:
-                publish_ready_marker(
-                    args.ready_file, args.solver_revision, args.library_revision)
-                ready_published = True
-            if not keep_running:
-                break
-        except Exception as e:
-            print(f"[feeder] step error: {e}")
-        time.sleep(args.loop)
+    controller_lock = FileLock(CONTROLLER_LOCK)
+    try:
+        with controller_lock.acquire(timeout=0):
+            ready_published = False
+            while True:
+                try:
+                    keep_running = guarded_step()
+                    if not ready_published:
+                        publish_ready_marker(
+                            args.ready_file,
+                            args.solver_revision,
+                            args.library_revision,
+                        )
+                        ready_published = True
+                    if not keep_running:
+                        break
+                except Exception as e:
+                    print(f"[feeder] step error: {e}")
+                time.sleep(args.loop)
+    except FileLockTimeout as exc:
+        raise SchedulerError(
+            f"another feeder controller owns {CONTROLLER_LOCK}"
+        ) from exc
 
 
 if __name__ == "__main__":
