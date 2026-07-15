@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,11 @@ from .controller import ContinuousController
 from .orchestrator import PipelineOrchestrator, descriptor_from_active_registry
 from .queue import DurableJobQueue
 from .runner import JobRunner
+from .runtime_lock import AlreadyRunningError, RoleInstanceLock
 from .supervisor import PipelineSupervisor
+
+
+SINGLETON_EXIT_CODE = 73
 
 
 def _paths(args):
@@ -25,6 +30,31 @@ def _paths(args):
         DurableJobQueue(pipeline_root / "jobs.sqlite3"),
         GenerationStore(pipeline_root / "artifacts"),
     )
+
+
+def _verification_config_identity(path: str | None) -> str | None:
+    if not path:
+        return None
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _run_role_locked(pipeline_root, role, metadata, callback):
+    try:
+        with RoleInstanceLock(pipeline_root, role, metadata):
+            return callback()
+    except AlreadyRunningError as exc:
+        print(
+            json.dumps({
+                "pipeline_singleton_error": str(exc),
+                "role": role,
+                "lock_path": str(exc.path),
+                "owner": exc.owner,
+                "exit_code": SINGLETON_EXIT_CODE,
+            }, ensure_ascii=False),
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(SINGLETON_EXIT_CODE) from None
 
 
 def main() -> None:
@@ -82,9 +112,14 @@ def main() -> None:
             runner.run_forever(types)
         return
     if args.command == "supervise":
-        PipelineSupervisor(
-            queue.path, store.root, pipeline_root / "work"
-        ).run()
+        _run_role_locked(
+            pipeline_root,
+            "supervisor",
+            {"command": "supervise"},
+            lambda: PipelineSupervisor(
+                queue.path, store.root, pipeline_root / "work"
+            ).run(),
+        )
         return
     if args.command == "control":
         verification_commands = None
@@ -103,10 +138,25 @@ def main() -> None:
             optuna_trials=args.optuna_trials,
             verification_commands=verification_commands,
         )
-        if args.once:
-            print(json.dumps(controller.plan_once().__dict__, indent=1))
-        else:
-            controller.run_forever(args.interval_seconds)
+        def run_controller():
+            if args.once:
+                print(json.dumps(controller.plan_once().__dict__, indent=1))
+            else:
+                controller.run_forever(args.interval_seconds)
+
+        _run_role_locked(
+            pipeline_root,
+            "controller",
+            {
+                "command": "control",
+                "solver_revision": args.solver_revision.lower(),
+                "library_revision": args.library_revision.lower(),
+                "verification_config_sha256": _verification_config_identity(
+                    args.verification_commands
+                ),
+            },
+            run_controller,
+        )
         return
 
     dataset = os.path.abspath(

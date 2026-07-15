@@ -46,6 +46,74 @@ Run `control` without `--once` for recurring generation discovery. Run
 controller and supervisor are separate processes so long model tuning cannot
 delay collection.
 
+### Persistent Windows launcher
+
+For unattended operation, keep code/data in the reviewed checkout and put all
+mutable pipeline state on the local runtime disk.  The launcher defaults to
+`C:\Users\peets\slurm_scheduler_runtime\mft_pipeline` and refuses to place
+the queue, artifacts, locks, or logs inside the source tree.  Controller and
+supervisor use independent OS-held locks; a second copy of the same role exits
+with code 73, while the two different roles run together.  A crash releases
+the lock without deleting its diagnostic metadata file.
+
+The launcher also requires the SHA-256 of the operator-reviewed verification
+JSON.  It verifies that both standard and fine stages explicitly enable the
+scheduler adapter, checks their absolute library checkout, and installs the
+exact reviewed bytes as `config/verification-<sha256>.json` under the runtime
+root before starting Python.  Use full, pinned 40-character revisions:
+
+```powershell
+$launcher = 'Y:\git\MFT_1MW_2026\regression_260707\pipeline\start_pipeline_role.ps1'
+$config = 'C:\Users\peets\slurm_scheduler_runtime\mft_pipeline_config\verification_commands.json'
+$configSha = (Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash
+$common = @{
+    SolverRevision = '<40-character MFT_solver SHA>'
+    LibraryRevision = '<40-character pyaedt_library SHA>'
+    VerificationConfig = $config
+    ReviewedVerificationConfigSha256 = $configSha
+    PipelineRuntimeRoot = 'C:\Users\peets\slurm_scheduler_runtime\mft_pipeline'
+    MftRuntimeRoot = 'Y:\git\MFT_1MW_2026\regression_260707'
+    Python = 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe'
+}
+
+# Safe preflight: validates and seals configuration but starts no Python job.
+& $launcher -Role Controller @common -ValidateOnly
+& $launcher -Role Supervisor @common -ValidateOnly
+
+# These are the two independent long-running Scheduled Task actions.
+& $launcher -Role Controller @common -RestartOnFailure
+& $launcher -Role Supervisor @common -RestartOnFailure
+```
+
+Configure two Scheduled Tasks (one per role) to run at boot under the same
+service account, with "do not start a new instance" and task-level restart on
+failure enabled.  The repository does not register those tasks automatically.
+Use the launcher command above as each action; `-RestartOnFailure` provides an
+additional 30-second process restart loop, except for singleton exit 73.
+During the one-time migration, first let the legacy pre-lock controller and
+supervisor exit under the existing operational procedure.  They cannot own the
+new lock retroactively, so starting this launcher on top of either legacy
+process would temporarily create a duplicate.
+
+Runtime files are intentionally stable across reboot:
+
+- `jobs.sqlite3`, `artifacts/`, and `work/` hold durable queue state and
+  immutable hand-offs.
+- `locks/controller.lock` and `locks/supervisor.lock` identify the current or
+  most recent owner.  Do not delete them; an unlocked stale file is reusable.
+- `logs/<role>.stdout.log` and `logs/<role>.stderr.log` append Python output.
+- `logs/<role>.launcher.jsonl` records process starts, exits, and restart waits
+  with the pinned revision and verification-config identities.
+
+To inspect the external queue without starting another long-running role:
+
+```powershell
+$py = $common.Python
+& $py -m regression_260707.pipeline `
+  --runtime-root $common.MftRuntimeRoot `
+  --pipeline-root $common.PipelineRuntimeRoot status
+```
+
 Verification is fail-closed by default: no standard/fine job is enqueued until
 `--verification-commands` explicitly enables the reviewed scheduler adapter.
 When absent, the controller result reports `verification_standard` and
