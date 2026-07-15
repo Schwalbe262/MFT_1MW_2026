@@ -98,6 +98,68 @@
       <ol id="pipeline" class="pipeline"></ol>
     </section>
 
+    <section class="continuous-pipeline-panel" aria-labelledby="continuous-pipeline-title">
+      <div class="section-heading compact">
+        <div>
+          <p class="eyebrow">DURABLE CONTINUOUS PIPELINE</p>
+          <h2 id="continuous-pipeline-title">지속 병렬 파이프라인</h2>
+          <p id="continuous-pipeline-detail" class="continuous-pipeline-detail">controller, supervisor와 lane heartbeat를 확인하는 중입니다.</p>
+        </div>
+        <span id="continuous-pipeline-state" class="status-pill status-loading"><i></i> 확인 중</span>
+      </div>
+      <div class="continuous-role-grid">
+        <article class="continuous-role-card">
+          <div><span>Controller</span><b id="pipeline-controller-state" class="state-chip unknown">확인 중</b></div>
+          <dl>
+            <div><dt>PID / 시작</dt><dd id="pipeline-controller-process">—</dd></div>
+            <div><dt>마지막 활동</dt><dd id="pipeline-controller-heartbeat">—</dd></div>
+            <div><dt>마지막 오류</dt><dd id="pipeline-controller-error">없음</dd></div>
+          </dl>
+        </article>
+        <article class="continuous-role-card">
+          <div><span>Supervisor</span><b id="pipeline-supervisor-state" class="state-chip unknown">확인 중</b></div>
+          <dl>
+            <div><dt>PID / 시작</dt><dd id="pipeline-supervisor-process">—</dd></div>
+            <div><dt>마지막 활동</dt><dd id="pipeline-supervisor-heartbeat">—</dd></div>
+            <div><dt>마지막 오류</dt><dd id="pipeline-supervisor-error">없음</dd></div>
+          </dl>
+        </article>
+        <article class="continuous-revision-card">
+          <span>고정 실행 revision</span>
+          <dl>
+            <div><dt>Solver</dt><dd id="pipeline-solver-revision" class="mono">—</dd></div>
+            <div><dt>Library</dt><dd id="pipeline-library-revision" class="mono">—</dd></div>
+            <div><dt>검증 config</dt><dd id="pipeline-verification-revision" class="mono">—</dd></div>
+            <div><dt>Exact strict rows</dt><dd id="pipeline-exact-rows" class="mono">—</dd></div>
+            <div><dt>Dataset generation</dt><dd id="pipeline-dataset-generation" class="mono">—</dd></div>
+          </dl>
+        </article>
+        <article class="continuous-role-card external-tuner-card">
+          <div><span>External Optuna</span><b id="pipeline-external-tuner-state" class="state-chip unknown">확인 중</b></div>
+          <p id="pipeline-external-tuner-detail">durable queue 밖의 tuner를 확인하는 중입니다.</p>
+          <ul id="pipeline-external-tuners" class="plain-list"></ul>
+        </article>
+      </div>
+      <div class="continuous-pipeline-summary" aria-label="pipeline 병렬 실행 요약">
+        <div><span>동시 running lane</span><strong id="pipeline-running-lanes">—</strong></div>
+        <div><span>작업 보유 lane</span><strong id="pipeline-active-lanes">—</strong></div>
+        <div><span>Queued / retry</span><strong id="pipeline-queued-jobs">—</strong></div>
+        <div><span>Running</span><strong id="pipeline-running-jobs">—</strong></div>
+        <div><span>Succeeded</span><strong id="pipeline-succeeded-jobs">—</strong></div>
+        <div><span>Failed</span><strong id="pipeline-failed-jobs">—</strong></div>
+      </div>
+      <div class="table-scroll continuous-lane-scroll">
+        <table class="continuous-lane-table">
+          <thead>
+            <tr><th>Lane</th><th>상태</th><th>Q / R / S / F</th><th>Job / attempt</th><th>시작</th><th>Heartbeat</th><th>경과</th><th>Prerequisite / generation / 마지막 오류</th></tr>
+          </thead>
+          <tbody id="continuous-pipeline-lanes"></tbody>
+        </table>
+      </div>
+      <p id="continuous-pipeline-empty" class="empty-state hidden">pipeline queue를 읽을 수 없습니다.</p>
+      <p class="continuous-pipeline-root">Read-only source: <code id="continuous-pipeline-root">—</code></p>
+    </section>
+
     <section aria-labelledby="data-title">
       <div class="section-heading">
         <div><p class="eyebrow">01 · DATA CAMPAIGN</p><h2 id="data-title">데이터 확보 현황</h2></div>

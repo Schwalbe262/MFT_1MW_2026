@@ -91,6 +91,44 @@ class DummyRefillController:
         return {"available": False}
 
 
+class DummyContinuousPipeline:
+    def snapshot(self):
+        return {
+            "schema_version": 1,
+            "generated_at": FIXED_NOW.isoformat(),
+            "available": True,
+            "root": "C:/test/mft_pipeline",
+            "health": "healthy",
+            "roles": {
+                "controller": {"status": "alive", "alive": True},
+                "supervisor": {"status": "alive", "alive": True},
+            },
+            "revisions": {
+                "solver_revision": "b" * 40,
+                "library_revision": "c" * 40,
+                "solver_revision_exact": True,
+                "library_revision_exact": True,
+                "exact": True,
+            },
+            "queue": {
+                "available": True,
+                "counts": {state: 0 for state in (
+                    "queued", "retry_wait", "running", "succeeded",
+                    "failed", "cancelled",
+                )},
+            },
+            "lanes": [],
+            "parallel": {
+                "running_lane_count": 0,
+                "running_lanes": [],
+                "active_lane_count": 0,
+                "active_lanes": [],
+                "parallel_work_confirmed": False,
+            },
+            "warnings": [],
+        }
+
+
 def write_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -283,6 +321,7 @@ def artifact_service(campaign_root):
         campaign_root,
         scheduler=DummyScheduler(),
         refill_controller=DummyRefillController(),
+        continuous_pipeline=DummyContinuousPipeline(),
         clock=lambda: FIXED_NOW,
         record_runtime=False,
     )

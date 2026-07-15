@@ -64,6 +64,8 @@ try:
 except Exception:  # Keep the dashboard fail-soft when repo imports are unavailable.
     checkpoint_status_revision_identity_matches = None
 
+from .pipeline_status import ContinuousPipelineReader
+
 
 SCHEMA_VERSION = 1
 DATA_GOAL = 3_000
@@ -2341,11 +2343,15 @@ class ArtifactService:
         clock: Callable[[], datetime] = _now,
         record_runtime: bool = True,
         refill_controller: RefillControllerReader | None = None,
+        continuous_pipeline: ContinuousPipelineReader | None = None,
     ) -> None:
         self.root = Path(regression_root).resolve()
         self.cache = SafeArtifactCache()
         self.scheduler = scheduler or SchedulerReader()
         self.refill_controller = refill_controller or RefillControllerReader()
+        self.continuous_pipeline = (
+            continuous_pipeline or ContinuousPipelineReader()
+        )
         self.clock = clock
         self.recorder = RuntimeRecorder(self.root / "monitoring" / "runtime") if record_runtime else None
         self._campaign_audit_lock = threading.RLock()
@@ -3890,17 +3896,27 @@ class ArtifactService:
         verification = self.verification(nsga)
         scheduler = self.scheduler.snapshot()
         refill_controller = self.refill_controller.snapshot()
+        continuous_pipeline = self.continuous_pipeline.snapshot()
+        status = self._status(data, models, nsga, verification, scheduler)
+        pipeline_warnings = continuous_pipeline.get("warnings", [])
+        if pipeline_warnings:
+            status["warnings"] = list(dict.fromkeys([
+                *status["warnings"], *pipeline_warnings,
+            ]))
+            if status["overall"] not in {"error"}:
+                status["overall"] = "warning"
         dashboard = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": generated_at,
             "project": "MFT_1MW_2026",
-            "status": self._status(data, models, nsga, verification, scheduler),
+            "status": status,
             "data": data,
             "models": models,
             "nsga2": nsga,
             "verification": verification,
             "scheduler": scheduler,
             "refill_controller": refill_controller,
+            "continuous_pipeline": continuous_pipeline,
         }
         if record and self.recorder:
             try:
@@ -3920,6 +3936,7 @@ class ArtifactService:
             **dashboard["status"],
             "scheduler": dashboard["scheduler"],
             "refill_controller": dashboard["refill_controller"],
+            "continuous_pipeline": dashboard["continuous_pipeline"],
         }
 
     def history(self) -> dict[str, Any]:

@@ -162,6 +162,201 @@
     });
   }
 
+  function compactGeneration(value) {
+    if (!value) return "—";
+    const normalized = String(value).replaceAll("\\", "/").replace(/\/$/, "");
+    const parts = normalized.split("/").filter(Boolean);
+    if (parts.length <= 2) return normalized;
+    return `…/${parts.slice(-2).join("/")}`;
+  }
+
+  function pipelineStateLabel(value) {
+    return ({
+      healthy: "정상", degraded: "주의", offline: "중지",
+      alive: "실행 중", stale: "stale", missing: "없음", invalid: "오류",
+      unknown: "확인 불가", running: "실행 중", waiting: "대기",
+      retrying: "재시도", succeeded: "완료", failed: "실패", idle: "idle", unavailable: "읽기 실패",
+    })[value] || value || "확인 불가";
+  }
+
+  function pipelineStateClass(value) {
+    if (["healthy", "alive", "running", "succeeded"].includes(value)) return "pass";
+    if (["offline", "stale", "invalid", "failed"].includes(value)) return "fail";
+    return "unknown";
+  }
+
+  function renderPipelineRole(name, role = {}) {
+    const chip = $(`#pipeline-${name}-state`);
+    const roleState = role.status || "missing";
+    chip.className = `state-chip ${pipelineStateClass(roleState)}`;
+    chip.textContent = pipelineStateLabel(roleState);
+    const process = role.pid
+      ? `PID ${role.pid} · ${dateTime(role.started_at)} · ${duration(role.elapsed_seconds)}`
+      : "PID 없음";
+    setText(`#pipeline-${name}-process`, process);
+    const activity = role.last_activity_at
+      ? `${dateTime(role.last_activity_at)} · ${duration(role.activity_age_seconds)} 전`
+      : "활동 기록 없음";
+    setText(`#pipeline-${name}-heartbeat`, activity);
+    const errorNode = $(`#pipeline-${name}-error`);
+    errorNode.textContent = role.last_error || role.error || "없음";
+    errorNode.classList.toggle("pipeline-error", Boolean(role.last_error || role.error));
+  }
+
+  function renderPipelineRevision(selector, value, exact = true) {
+    const node = $(selector);
+    node.textContent = value ? String(value).slice(0, 12) : "—";
+    node.title = value || "";
+    node.classList.toggle("revision-invalid", Boolean(value) && !exact);
+  }
+
+  function renderContinuousPipeline(pipeline = {}) {
+    const health = pipeline.health || "offline";
+    const status = $("#continuous-pipeline-state");
+    status.className = `status-pill status-${health === "healthy" ? "active" : health === "offline" ? "error" : "warning"}`;
+    status.replaceChildren(element("i"), document.createTextNode(` ${pipelineStateLabel(health)}`));
+    setText("#continuous-pipeline-root", pipeline.root || "—");
+    renderPipelineRole("controller", pipeline.roles?.controller || {});
+    renderPipelineRole("supervisor", pipeline.roles?.supervisor || {});
+
+    const revisions = pipeline.revisions || {};
+    renderPipelineRevision(
+      "#pipeline-solver-revision",
+      revisions.solver_revision,
+      revisions.solver_revision_exact,
+    );
+    renderPipelineRevision(
+      "#pipeline-library-revision",
+      revisions.library_revision,
+      revisions.library_revision_exact,
+    );
+    renderPipelineRevision(
+      "#pipeline-verification-revision",
+      revisions.verification_config_sha256,
+      true,
+    );
+    const cohort = pipeline.cohort || {};
+    setText(
+      "#pipeline-exact-rows",
+      `${number(cohort.current_strict_full_rows || 0)} · train ${number(cohort.first_training_rows || 500)} / model ${number(cohort.model_activation_rows || 3000)} / tune ${number(cohort.first_tuning_rows || 4000)}`,
+    );
+    renderPipelineRevision(
+      "#pipeline-dataset-generation",
+      cohort.generation,
+      cohort.available === true,
+    );
+    const external = pipeline.external_tuners || {};
+    const externalProcesses = Array.isArray(external.processes) ? external.processes : [];
+    const externalState = $("#pipeline-external-tuner-state");
+    externalState.className = `state-chip ${externalProcesses.length ? "unknown" : external.available ? "pass" : "fail"}`;
+    externalState.textContent = externalProcesses.length ? `${externalProcesses.length}개 별도 실행` : external.available ? "없음" : "확인 불가";
+    setText(
+      "#pipeline-external-tuner-detail",
+      externalProcesses.length
+        ? "아래 작업은 durable lane 수에 포함되지 않습니다."
+        : external.error || "durable queue 밖의 Optuna 작업이 없습니다.",
+    );
+    const externalList = $("#pipeline-external-tuners");
+    externalList.replaceChildren();
+    externalProcesses.forEach((process) => {
+      const dataset = compactGeneration(process.dataset);
+      externalList.append(element(
+        "li", "",
+        `PID ${process.pid} · ${duration(process.elapsed_seconds)} · trials ${process.trials || "—"} · ${dataset}`,
+      ));
+    });
+
+    const parallel = pipeline.parallel || {};
+    const queue = pipeline.queue || {};
+    const counts = queue.counts || {};
+    setText("#pipeline-running-lanes", `${number(parallel.running_lane_count || 0)} / 6`);
+    setText("#pipeline-active-lanes", `${number(parallel.active_lane_count || 0)} / 6`);
+    setText("#pipeline-queued-jobs", number((counts.queued || 0) + (counts.retry_wait || 0)));
+    setText("#pipeline-running-jobs", number(counts.running || 0));
+    setText("#pipeline-succeeded-jobs", number(counts.succeeded || 0));
+    setText("#pipeline-failed-jobs", number(counts.failed || 0));
+    const runningNames = Array.isArray(parallel.running_lanes) ? parallel.running_lanes : [];
+    const roleSummary = pipeline.roles?.controller?.alive && pipeline.roles?.supervisor?.alive
+      ? "controller와 supervisor가 모두 실행 중"
+      : "controller/supervisor 실행 상태 확인 필요";
+    const parallelSummary = parallel.parallel_work_confirmed
+      ? `${runningNames.length}개 lane 실제 동시 실행 확인 (${runningNames.join(", ")})`
+      : runningNames.length
+        ? `현재 ${runningNames[0]} lane 실행 중; 다른 lane은 조건/의존성 대기`
+        : "현재 running job 없음; queue 조건 또는 데이터 checkpoint 대기";
+    setText("#continuous-pipeline-detail", `${roleSummary} · ${parallelSummary}`);
+
+    const body = $("#continuous-pipeline-lanes");
+    body.replaceChildren();
+    const lanes = Array.isArray(pipeline.lanes) ? pipeline.lanes : [];
+    lanes.forEach((lane) => {
+      const row = element("tr", `pipeline-lane-${lane.health || "unavailable"}`);
+      const identity = element("td", "pipeline-lane-identity");
+      identity.append(element("b", "", lane.label || lane.job_type));
+      identity.append(element("code", "", lane.job_type || "—"));
+      row.append(identity);
+      const healthCell = element("td");
+      healthCell.append(element(
+        "span",
+        `state-chip ${pipelineStateClass(lane.health)}`,
+        pipelineStateLabel(lane.health),
+      ));
+      row.append(healthCell);
+      const laneCounts = lane.counts || {};
+      row.append(element(
+        "td",
+        "pipeline-counts mono",
+        `${number((laneCounts.queued || 0) + (laneCounts.retry_wait || 0))} / ${number(laneCounts.running || 0)} / ${number(laneCounts.succeeded || 0)} / ${number(laneCounts.failed || 0)}`,
+      ));
+      const job = lane.current_job;
+      row.append(element(
+        "td", "mono",
+        job ? `#${job.id} · ${job.attempt}/${job.max_attempts}` : "—",
+      ));
+      row.append(element("td", "pipeline-time", job ? dateTime(job.started_at) : "—"));
+      const heartbeat = job?.heartbeat_at
+        ? `${dateTime(job.heartbeat_at)} · ${duration(job.heartbeat_age_seconds)} 전`
+        : "—";
+      const heartbeatCell = element(
+        "td",
+        job?.heartbeat_stale ? "pipeline-heartbeat stale" : "pipeline-heartbeat",
+        heartbeat,
+      );
+      row.append(heartbeatCell);
+      row.append(element("td", "mono", job ? duration(job.elapsed_seconds) : "—"));
+      const evidence = element("td", "pipeline-evidence");
+      const generations = element("div", "pipeline-generations");
+      const input = element("code", "", compactGeneration(job?.input_generation));
+      input.title = job?.input_generation || "";
+      const output = element("code", "", compactGeneration(job?.output_generation));
+      output.title = job?.output_generation || "";
+      generations.append(input, element("span", "", "→"), output);
+      const prerequisite = lane.prerequisite || {};
+      if (prerequisite.reason) {
+        evidence.append(element(
+          "small",
+          prerequisite.ready ? "pipeline-prerequisite ready" : "pipeline-prerequisite blocked",
+          prerequisite.reason,
+        ));
+      }
+      evidence.append(generations);
+      const lastError = job?.terminal_reason || lane.last_error?.reason;
+      if (lastError) {
+        const error = element("small", "pipeline-error", lastError);
+        error.title = lastError;
+        evidence.append(error);
+      } else {
+        evidence.append(element("small", "pipeline-no-error", "오류 없음"));
+      }
+      row.append(evidence);
+      body.append(row);
+    });
+    $("#continuous-pipeline-empty").classList.toggle(
+      "hidden", queue.available === true && lanes.length > 0,
+    );
+    $(".continuous-lane-scroll").classList.toggle("hidden", lanes.length === 0);
+  }
+
   function renderData(data) {
     setText("#data-total", `${number(data.total_rows)}개`);
     const physicsRevision = String(data.current_physics_data_revision || "");
@@ -1161,6 +1356,7 @@
     const warnings = [
       ...(payload.data?.warnings || []), ...(payload.models?.warnings || []),
       ...(payload.nsga2?.warnings || []), ...(payload.verification?.warnings || []),
+      ...(payload.continuous_pipeline?.warnings || []),
       ...(scheduler.error ? [scheduler.error] : []), ...(scheduler.project_error ? [scheduler.project_error] : []),
     ];
     const list = $("#artifact-warnings"); list.replaceChildren();
@@ -1171,6 +1367,7 @@
   function render(payload) {
     state.dashboard = payload;
     renderOverall(payload);
+    renderContinuousPipeline(payload.continuous_pipeline || {});
     renderParallelControl(payload.scheduler || {}, payload.refill_controller || {});
     renderData(payload.data || {});
     renderModels(payload.models || { models: [] });

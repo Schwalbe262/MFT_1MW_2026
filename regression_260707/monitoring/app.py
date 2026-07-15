@@ -226,6 +226,10 @@ def create_app(
     async def api_history():
         return await invoke(service.history, "history")
 
+    @app.get("/api/pipeline")
+    async def api_pipeline():
+        return await invoke(service.continuous_pipeline.snapshot, "pipeline")
+
     @app.patch("/api/operator/simulation-policy")
     async def api_set_simulation_policy(request: Request):
         require_local_operator_request(request)
