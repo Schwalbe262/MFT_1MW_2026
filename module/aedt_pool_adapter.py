@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import sys
 import time
@@ -26,6 +27,7 @@ SHARED_1TO2_PILOT_ACK = "MFT_AEDT_SHARED_1TO2_PILOT"
 SHARED_CANARY_ACK = "MFT_AEDT_SHARED_CANARY"
 ISOLATION_POLICY_ENV = "MFT_AEDT_ISOLATION_POLICY"
 SESSION_VERSION_ENV = "MFT_AEDT_SESSION_VERSION"
+POOL_FILL_TIMEOUT_ENV = "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"
 DEFAULT_SESSION_VERSION = "2025.2"
 POOL_HPC_CORES = 4
 TERMINAL_LEASE_STATES = {
@@ -60,6 +62,23 @@ def aedt_backend() -> str:
 
 def pooled_backend_enabled() -> bool:
     return aedt_backend() == POOLED_BACKEND
+
+
+def validate_pooled_fill_timeout() -> float:
+    """Fail before admission on the scheduler's solve-barrier contract."""
+
+    raw_timeout = os.environ.get(POOL_FILL_TIMEOUT_ENV, "900").strip()
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"{POOL_FILL_TIMEOUT_ENV} must be numeric"
+        ) from exc
+    if not math.isfinite(timeout) or not 0 <= timeout <= 900:
+        raise RuntimeError(
+            "pooled AEDT fill timeout must be between 0 and 900 seconds"
+        )
+    return timeout
 
 
 def shared_1to2_pilot_enabled() -> bool:
@@ -197,6 +216,10 @@ def acquire_pooled_desktop(
         raise RuntimeError(
             "MFT_AEDT_SCHEDULER_URL must be an http(s) URL"
         )
+    # The scheduler client validates this again at activate/solve-permit time.
+    # Validate independently here so malformed task configuration cannot
+    # consume a lease or build an AEDT model before reaching that barrier.
+    validate_pooled_fill_timeout()
     client = _scheduler_attach_module()
     task_text = os.environ.get("SLURM_SCHED_TASK_ID", "").strip()
     task_id = int(task_text) if task_text.isdigit() else 0

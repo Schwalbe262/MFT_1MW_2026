@@ -68,6 +68,85 @@ def test_activation_is_explicit_and_requires_project_creation_identity():
     assert lease.calls == [("activate", "simulation17")]
 
 
+@pytest.mark.parametrize(
+    ("raw_timeout", "expected"),
+    (("0", 0.0), ("0.25", 0.25), ("900", 900.0)),
+)
+def test_pooled_fill_timeout_accepts_closed_interval_boundaries(
+    monkeypatch, raw_timeout, expected,
+):
+    monkeypatch.setenv(adapter.POOL_FILL_TIMEOUT_ENV, raw_timeout)
+
+    assert adapter.validate_pooled_fill_timeout() == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_timeout", "message"),
+    (
+        ("", "must be numeric"),
+        ("not-a-number", "must be numeric"),
+        ("nan", "between 0 and 900"),
+        ("inf", "between 0 and 900"),
+        ("-0.001", "between 0 and 900"),
+        ("900.001", "between 0 and 900"),
+    ),
+)
+def test_invalid_fill_timeout_fails_before_workspace_or_lease_request(
+    monkeypatch, raw_timeout, message,
+):
+    events = []
+    monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
+    monkeypatch.setenv("MFT_AEDT_EXCLUSIVE_1TO1", "1")
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_PILOT", raising=False)
+    monkeypatch.delenv("MFT_AEDT_SHARED_CANARY", raising=False)
+    monkeypatch.setenv("MFT_AEDT_SCHEDULER_URL", "http://scheduler:8000")
+    monkeypatch.setenv(adapter.POOL_FILL_TIMEOUT_ENV, raw_timeout)
+    monkeypatch.setattr(
+        adapter,
+        "_scheduler_attach_module",
+        lambda: events.append("scheduler-client-import"),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "pooled_workspace_path",
+        lambda: events.append("workspace-create"),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        adapter.acquire_pooled_desktop(
+            desktop_factory="must-not-attach",
+            non_graphical=True,
+        )
+
+    assert events == []
+
+
+def test_run_loop_rejects_fill_timeout_before_session_or_modeling(monkeypatch):
+    import run_simulation_260706 as runner
+
+    events = []
+    monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
+    monkeypatch.setenv("MFT_AEDT_EXCLUSIVE_1TO1", "1")
+    monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_PILOT", raising=False)
+    monkeypatch.delenv("MFT_AEDT_SHARED_CANARY", raising=False)
+    monkeypatch.setenv(adapter.POOL_FILL_TIMEOUT_ENV, "901")
+    monkeypatch.setattr(
+        runner,
+        "_snapshot_descendants",
+        lambda: events.append("snapshot"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_create_simulation_session",
+        lambda: events.append("session-and-modeling"),
+    )
+
+    with pytest.raises(RuntimeError, match="between 0 and 900"):
+        runner.run_one_loop()
+
+    assert events == []
+
+
 def test_pooled_backend_requires_explicit_exclusive_ack(monkeypatch):
     monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
     monkeypatch.delenv("MFT_AEDT_EXCLUSIVE_1TO1", raising=False)

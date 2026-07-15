@@ -133,6 +133,7 @@ from module.aedt_pool_adapter import (
     native_solve_window as pooled_native_solve_window,
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
+    validate_pooled_fill_timeout,
 )
 
 from ansys.aedt.core import settings
@@ -6724,6 +6725,11 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     backend = aedt_backend()
     if backend == "pooled" and hold:
         raise RuntimeError("--hold is not supported by pooled AEDT")
+    if backend == "pooled":
+        # Reject a malformed solve-barrier timeout before session admission.
+        # acquire_pooled_desktop repeats this check for non-run-loop callers;
+        # the scheduler client retains its activate-time defense in depth.
+        validate_pooled_fill_timeout()
     fixed_mode = param is not None
     sim = None
     desktop = None
