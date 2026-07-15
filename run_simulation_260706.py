@@ -126,6 +126,7 @@ from module.electrostatic_cap import (
 from module.aedt_pool_adapter import (
     aedt_backend,
     acquire_pooled_desktop,
+    activate_project as activate_pooled_project,
     bind_project_name as bind_pooled_project_name,
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
@@ -1939,6 +1940,36 @@ class Simulation():
         self.solver_may_be_running = False
 
     def create_simulation_name(self):
+
+        # A pooled Desktop can serve tasks from different nodes and accounts.
+        # A Slurm job id plus a node-local PID is not globally unique, and the
+        # legacy simulation prefix collides with old motor project names.  The
+        # scheduler lease id provides a pool-wide namespace.
+        if self._backend_mode() == "pooled":
+            lease_id = int(getattr(self.aedt_lease, "lease_id", 0) or 0)
+            if lease_id <= 0:
+                raise RuntimeError(
+                    "pooled project naming requires a positive AEDT lease id"
+                )
+            task_text = str(
+                os.environ.get("SLURM_SCHED_TASK_ID")
+                or os.environ.get("SLURM_JOB_ID")
+                or os.getpid()
+            ).strip()
+            task_component = re.sub(r"[^A-Za-z0-9_-]+", "-", task_text)
+            self.num = lease_id
+            self.PROJECT_NAME = (
+                f"mft-{task_component}-{lease_id}-{uuid.uuid4().hex[:12]}"
+            )
+            workspace = str(
+                getattr(self.aedt_lease, "workspace_path", "") or ""
+            ).strip()
+            simulation_dir = workspace or "./simulation"
+            os.makedirs(simulation_dir, exist_ok=True)
+            self.project_path = os.path.abspath(
+                os.path.join(simulation_dir, self.PROJECT_NAME)
+            )
+            return
 
         # slurm_scheduler dynamic_packed_srun 모드: SIMULATION_ID 환경변수 기반 이름
         # (공유 파일시스템에서 카운터 파일 락 경합 없이 고유 이름 보장)
@@ -5348,6 +5379,11 @@ class Simulation():
     def _capture_matrix_hpc_acf(
             self, max_attempts=5, retry_delay=0.5, sleeper=time.sleep):
         """Capture the matrix ACF before CopyDesign can stale its PyAEDT wrapper."""
+        if self._backend_mode() == "pooled":
+            # The session host owns the Desktop-global DSO contract.  A pooled
+            # client must neither generate nor load a project-local ACF.
+            self._matrix_hpc_acf_path = None
+            return None
         max_attempts = int(max_attempts)
         if max_attempts < 1:
             raise ValueError("matrix HPC ACF capture max_attempts must be positive")
@@ -5414,14 +5450,17 @@ class Simulation():
             self, setup_name="Setup1", max_attempts=5, timeout_s=30.0,
             initial_retry_delay=0.5, clock=time.monotonic, sleeper=time.sleep):
         """Retry only copied-loss solve preflight; never dispatch a solve here."""
-        captured_acf = getattr(self, "_matrix_hpc_acf_path", None)
-        if not captured_acf:
-            raise RuntimeError(
-                "captured matrix HPC ACF is unavailable before copied-loss solve"
-            )
-        # Revalidate the exact captured file and its full DSO contract without
-        # calling the source design's stale oproject.GetPath after CopyDesign.
-        acf_path = self._validated_matrix_hpc_acf(captured_acf)
+        pooled_backend = self._backend_mode() == "pooled"
+        acf_path = None
+        if not pooled_backend:
+            captured_acf = getattr(self, "_matrix_hpc_acf_path", None)
+            if not captured_acf:
+                raise RuntimeError(
+                    "captured matrix HPC ACF is unavailable before copied-loss solve"
+                )
+            # Revalidate the exact captured file and its full DSO contract without
+            # calling the source design's stale oproject.GetPath after CopyDesign.
+            acf_path = self._validated_matrix_hpc_acf(captured_acf)
         registry_key = r"Desktop/ActiveDSOConfigurations/Maxwell 3D"
         deadline = clock() + max(0.0, float(timeout_s))
         original_config = None
@@ -5433,7 +5472,7 @@ class Simulation():
                 break
             try:
                 odesktop = self._native_desktop_handle()
-                if self._backend_mode() == "pooled":
+                if pooled_backend:
                     _oproject, odesign = (
                         self._verified_pooled_native_maxwell_setup(
                             setup_name=setup_name
@@ -5460,23 +5499,36 @@ class Simulation():
                 active = str(active).strip()
                 if not active:
                     raise RuntimeError("GetRegistryString returned an empty active DSO")
-                if original_config is None:
-                    original_config = active
-
-                loaded = odesktop.SetRegistryFromFile(acf_path)
-                if loaded is False:
-                    raise RuntimeError("SetRegistryFromFile returned False")
-                config_may_be_active = True
-                selected = odesktop.SetRegistryString(registry_key, "pyaedt_config")
-                if selected is False:
-                    raise RuntimeError("SetRegistryString returned False")
+                if pooled_backend:
+                    # A pooled Desktop is shared by sibling projects.  Loading
+                    # or restoring a DSO registry entry here is Desktop-global
+                    # and can change another project's in-flight solve.  The
+                    # session host/admission profile owns that configuration;
+                    # clients may only verify the agreed immutable profile.
+                    if active != "pyaedt_config":
+                        raise RuntimeError(
+                            "pooled session DSO profile mismatch: "
+                            f"expected='pyaedt_config', actual={active!r}"
+                        )
+                else:
+                    if original_config is None:
+                        original_config = active
+                    loaded = odesktop.SetRegistryFromFile(acf_path)
+                    if loaded is False:
+                        raise RuntimeError("SetRegistryFromFile returned False")
+                    config_may_be_active = True
+                    selected = odesktop.SetRegistryString(
+                        registry_key, "pyaedt_config"
+                    )
+                    if selected is False:
+                        raise RuntimeError("SetRegistryString returned False")
                 actual = str(odesktop.GetRegistryString(registry_key) or "").strip()
                 if actual != "pyaedt_config":
                     raise RuntimeError(
                         "native HPC DSO readback mismatch: "
                         f"expected='pyaedt_config', actual={actual!r}"
                     )
-                if self._backend_mode() == "pooled":
+                if pooled_backend:
                     _oproject, odesign = (
                         self._verified_pooled_native_maxwell_setup(
                             setup_name=setup_name
@@ -5597,9 +5649,22 @@ class Simulation():
                 try:
                     # The original, non-copied design retains PyAEDT's supported
                     # high-level path. Setup.analyze() itself returns None.
-                    if getattr(self, "aedt_backend", "standalone") == "pooled":
+                    pooled_backend = (
+                        getattr(self, "aedt_backend", "standalone") == "pooled"
+                    )
+                    if pooled_backend:
                         self.solver_may_be_running = True
-                    analyze_result = self.design1.setup.analyze(cores=self.NUM_CORE)
+                    # PyAEDT's ``cores=`` path rewrites and later restores the
+                    # Desktop-global ActiveDSOConfigurations registry entry.
+                    # A pooled Desktop can have sibling MFT/IPMSM projects, so
+                    # the session host owns one immutable 4-core/1-engine DSO
+                    # profile and clients must solve with that active default.
+                    analyze_kwargs = (
+                        {"cores": None, "tasks": None, "gpus": None}
+                        if pooled_backend
+                        else {"cores": self.NUM_CORE}
+                    )
+                    analyze_result = self.design1.setup.analyze(**analyze_kwargs)
                     if analyze_result is False:
                         raise RuntimeError(f"[{label}] Setup1 analyze returned False")
                 except Exception:
@@ -6085,10 +6150,15 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
         raise ValueError("invalid AEDT session retry policy")
 
     backend = aedt_backend()
+    # A pooled acquisition is one durable scheduler intent keyed by this task.
+    # Retrying it locally after a terminal attach failure would either return
+    # the same terminal lease or create an unowned duplicate. The campaign
+    # feeder owns task-level retry/requeue with a new task identity.
+    attempt_limit = 1 if backend == "pooled" else max_attempts
     baseline_descendants = _snapshot_descendants()
     failures = []
     last_error = None
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, attempt_limit + 1):
         desktop = None
         lease = None
         try:
@@ -6115,7 +6185,7 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
             logging.warning(
                 "AEDT session startup attempt %d/%d failed: %s",
                 attempt,
-                max_attempts,
+                attempt_limit,
                 failures[-1],
             )
             if backend == "pooled":
@@ -6142,12 +6212,12 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
                     captured_descendants,
                     wait_s=5,
                 )
-            if attempt < max_attempts:
+            if attempt < attempt_limit:
                 time.sleep(retry_delay_s)
 
     raise RuntimeError(
         "AEDT desktop startup failed after "
-        f"{max_attempts} attempts: {'; '.join(failures)}"
+        f"{attempt_limit} attempts: {'; '.join(failures)}"
     ) from last_error
 
 
@@ -6199,6 +6269,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         if backend == "pooled":
             bind_pooled_project_name(sim.aedt_lease, sim.PROJECT_NAME)
         sim.create_project()
+        if backend == "pooled":
+            activate_pooled_project(sim.aedt_lease, sim.PROJECT_NAME)
 
         if fixed_mode:
             sim.input_df = fixed_input_df
@@ -6422,7 +6494,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     else:
                         sim.__dict__.pop(name, None)
 
-            if not model_only:
+            if not model_only and sim._backend_mode() != "pooled":
                 sim._capture_matrix_hpc_acf()
 
             def _attempt(before_names, attempt):

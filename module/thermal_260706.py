@@ -823,9 +823,16 @@ def _solve_exact_thermal_setup(
         exception_type = ""
         exception_message = ""
         try:
-            returned = native_ipk.analyze(
-                setup=setup_name, cores=sim.NUM_CORE, blocking=True
-            )
+            analyze_kwargs = {"setup": setup_name, "blocking": True}
+            from module.aedt_pool_adapter import pooled_backend_enabled
+
+            if not pooled_backend_enabled():
+                analyze_kwargs["cores"] = sim.NUM_CORE
+            # Passing ``cores=`` asks PyAEDT to rewrite and later restore the
+            # Desktop-global Icepak DSO registry.  A pooled Desktop can have a
+            # sibling MFT/IPMSM project, so it must reuse the host-owned,
+            # read-back-verified profile instead.
+            returned = native_ipk.analyze(**analyze_kwargs)
             if returned is False:
                 status = "false"
                 logging.warning(

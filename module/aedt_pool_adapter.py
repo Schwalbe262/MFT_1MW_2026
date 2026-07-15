@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import subprocess
 import sys
 import time
 import uuid
@@ -23,6 +22,10 @@ POOLED_BACKEND = "pooled"
 EXCLUSIVE_1TO1_ACK = "MFT_AEDT_EXCLUSIVE_1TO1"
 SHARED_1TO2_PILOT_ACK = "MFT_AEDT_SHARED_1TO2_PILOT"
 SHARED_CANARY_ACK = "MFT_AEDT_SHARED_CANARY"
+ISOLATION_POLICY_ENV = "MFT_AEDT_ISOLATION_POLICY"
+SESSION_VERSION_ENV = "MFT_AEDT_SESSION_VERSION"
+DEFAULT_SESSION_VERSION = "2025.2"
+POOL_HPC_CORES = 4
 TERMINAL_LEASE_STATES = {
     "released",
     "failed",
@@ -111,72 +114,71 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
-# The solver's long native calls can hold the GIL for 10+ minutes, which
-# starves any in-process heartbeat thread and expires the lease mid-solve.
-# A child process is immune to the parent's GIL.  It exits by itself when
-# the parent dies (orphaned to init) or when the lease goes terminal on the
-# server (persistent HTTP errors), so a crashed client cannot pin its slot.
-_HEARTBEAT_PROC_SRC = """
-import os, time, urllib.request
-url = os.environ["MFT_HB_URL"]
-headers = {"Content-Type": "application/json"}
-if os.environ.get("MFT_HB_BOOTSTRAP", ""):
-    headers["X-AEDT-Bootstrap-Token"] = os.environ["MFT_HB_BOOTSTRAP"]
-if os.environ.get("MFT_HB_TOKEN", ""):
-    headers["X-AEDT-Lease-Token"] = os.environ["MFT_HB_TOKEN"]
-interval = max(5, int(os.environ.get("MFT_HB_INTERVAL", "30")))
-failures = 0
-while failures < 20:
-    if hasattr(os, "getppid") and os.getppid() == 1:
-        break
-    try:
-        request = urllib.request.Request(
-            url, data=b"{}", headers=headers, method="POST"
+def pooled_session_profile() -> dict[str, Any]:
+    """Desktop-global settings that MFT and IPMSM may safely share."""
+    version = os.environ.get(SESSION_VERSION_ENV, DEFAULT_SESSION_VERSION).strip()
+    if not version:
+        raise RuntimeError(f"{SESSION_VERSION_ENV} must not be blank")
+    return {
+        "profile_version": 2,
+        "aedt_version": version,
+        "python_environment": "pyaedt2026v1",
+        "filesystem": "gpfs-shared-v1",
+        "desktop_dso": {
+            "config_name": "pyaedt_config",
+            # Every solver used by the full MFT workflow is Desktop-global.
+            # Icepak explicitly disables auto settings in PyAEDT while both
+            # Maxwell design types use it, so encode each read-back contract.
+            "designs": {
+                "Icepak": {
+                    "cores": POOL_HPC_CORES,
+                    "tasks": 1,
+                    "gpus": 0,
+                    "use_auto_settings": False,
+                },
+                "Maxwell 2D": {
+                    "cores": POOL_HPC_CORES,
+                    "tasks": 1,
+                    "gpus": 0,
+                    "use_auto_settings": True,
+                },
+                "Maxwell 3D": {
+                    "cores": POOL_HPC_CORES,
+                    "tasks": 1,
+                    "gpus": 0,
+                    "use_auto_settings": True,
+                },
+            },
+        },
+    }
+
+
+def pooled_isolation_policy(*, exclusive: bool) -> str:
+    if exclusive:
+        return "exclusive"
+    policy = os.environ.get(ISOLATION_POLICY_ENV, "family").strip().lower()
+    if policy not in {"family", "shared_if_compatible"}:
+        raise RuntimeError(
+            f"{ISOLATION_POLICY_ENV} must be family or shared_if_compatible"
         )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        opener.open(request, timeout=25).read()
-        failures = 0
-    except Exception:
-        failures += 1
-    time.sleep(interval)
-"""
+    return policy
 
 
-def _spawn_heartbeat_process(lease: Any) -> Any:
-    env = dict(os.environ)
-    env["MFT_HB_URL"] = (
-        f"{lease.http.scheduler_url}/api/aedt-pool/leases/{lease.lease_id}/heartbeat"
+def pooled_workspace_path() -> Path:
+    configured = os.environ.get("MFT_AEDT_POOL_WORKSPACE", "").strip()
+    workspace = (
+        Path(configured).expanduser().resolve()
+        if configured
+        else (Path.cwd() / "simulation").resolve()
     )
-    env["MFT_HB_BOOTSTRAP"] = str(getattr(lease.http, "bootstrap_token", "") or "")
-    env["MFT_HB_TOKEN"] = str(lease.client_token or "")
-    env["MFT_HB_INTERVAL"] = os.environ.get(
-        "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", "30"
-    )
-    return subprocess.Popen(
-        [sys.executable, "-c", _HEARTBEAT_PROC_SRC],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def start_lease_keepalive(lease: Any) -> None:
-    if getattr(lease, "_mft_hb_proc", None) is not None:
-        return
-    lease._mft_hb_proc = _spawn_heartbeat_process(lease)
-
-
-def stop_lease_keepalive(lease: Any) -> None:
-    proc = getattr(lease, "_mft_hb_proc", None)
-    lease._mft_hb_proc = None
-    if proc is None:
-        return
+    workspace.mkdir(parents=True, exist_ok=True, mode=0o777)
     try:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=10)
-    except Exception:
-        pass
+        workspace.chmod(0o777)
+    except OSError as exc:
+        raise RuntimeError(
+            f"pooled AEDT workspace is not cross-account writable: {workspace}"
+        ) from exc
+    return workspace
 
 
 def acquire_pooled_desktop(
@@ -200,15 +202,25 @@ def acquire_pooled_desktop(
     )
     shared = shared_1to2_enabled()
     shared_mode = "canary" if shared_canary_enabled() else "pilot"
+    workspace = pooled_workspace_path()
+    request_mode = "1to2-" + shared_mode if shared else "1to1"
     lease = client.acquire_project_lease(
         scheduler_url,
         pending_project,
-        request_key=(
-            f"mft-{'1to2-' + shared_mode if shared else '1to1'}:"
-            f"{task_id or os.getpid()}:{uuid.uuid4().hex}"
-        ),
+        # One process owns one durable intent. A lost HTTP response must not
+        # turn a retry into a second queued/ghost lease.
+        request_key=f"mft-{request_mode}:{task_id or os.getpid()}",
         task_id=task_id,
         exclusive_session=not shared,
+        workload_family="mft",
+        session_profile=pooled_session_profile(),
+        project_namespace="mft",
+        isolation_policy=pooled_isolation_policy(exclusive=not shared),
+        workspace_path=str(workspace),
+        protocol_version=2,
+        heartbeat_seconds=_positive_int_env(
+            "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
+        ),
     )
     try:
         lease.wait_until_leased(
@@ -219,32 +231,29 @@ def acquire_pooled_desktop(
                 "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
             ),
         )
-        # wait_until_leased only heartbeats while queued.  The lease TTL is
-        # far shorter than a Desktop attach or a solve, so ownership must be
-        # kept alive from the moment the lease is granted until release/fault.
-        # The in-process thread alone is not enough: the solver's native calls
-        # hold the GIL for many minutes, so a child process keeps beating too.
-        lease.start_heartbeat(
-            heartbeat_seconds=_positive_int_env(
-                "MFT_AEDT_LEASE_HEARTBEAT_SECONDS", 30
+        lease_workspace = Path(str(getattr(lease, "workspace_path", "") or "")).resolve()
+        if lease_workspace != workspace:
+            raise RuntimeError(
+                "pooled AEDT lease workspace readback mismatch: "
+                f"requested={workspace}, actual={lease_workspace}"
             )
-        )
-        start_lease_keepalive(lease)
+        # acquire_project_lease(protocol_version=2) owns one spawn-based child
+        # keepalive from queue admission through release. Do not add a second
+        # in-process heartbeat: native AEDT calls can hold the parent GIL.
         desktop = lease.connect_desktop(
             non_graphical=non_graphical,
             desktop_factory=desktop_factory,
         )
-    except Exception:
+    except Exception as error:
         try:
-            lease.report_fault(
-                "script_error",
-                failure_message="MFT failed before project creation",
+            report_failure(
+                lease,
+                error,
+                solver_may_run=False,
             )
             lease.release(wait_seconds=120)
         except Exception:
             pass
-        finally:
-            stop_lease_keepalive(lease)
         raise
     return desktop, lease
 
@@ -288,8 +297,24 @@ def bind_project_name(lease: Any, project_name: str) -> None:
         raise RuntimeError("scheduler lease project-name readback mismatch")
 
 
+def activate_project(lease: Any, project_name: str) -> dict:
+    """Declare a pooled lease active only after AEDT created the project."""
+    if not project_name or not str(project_name).strip():
+        raise RuntimeError("MFT project name is empty before pooled activation")
+    status = lease.activate(project_name=str(project_name).strip())
+    if str(status.get("state") or "") != "active":
+        raise RuntimeError(
+            "scheduler lease activation was not acknowledged: "
+            f"state={status.get('state')!r}"
+        )
+    if str(status.get("project_name") or str(project_name).strip()) != str(
+        project_name
+    ).strip():
+        raise RuntimeError("scheduler lease activation project-name mismatch")
+    return status
+
+
 def release_project(lease: Any, *, wait_seconds: int | None = None) -> dict:
-    stop_lease_keepalive(lease)
     status = lease.release(
         wait_seconds=(
             _positive_int_env("MFT_AEDT_RELEASE_WAIT_SECONDS", 300)
@@ -305,17 +330,27 @@ def release_project(lease: Any, *, wait_seconds: int | None = None) -> dict:
 
 
 def report_failure(lease: Any, error: BaseException, *, solver_may_run: bool) -> dict:
-    stop_lease_keepalive(lease)
     text = f"{type(error).__name__}: {error}"[:4000]
     lower = text.lower()
-    if solver_may_run or "timeout" in lower or "timed out" in lower:
+    if solver_may_run:
         kind = "solver_timeout"
+        phase = "solve"
+    elif "timeout" in lower or "timed out" in lower:
+        kind = "admission_timeout"
+        phase = "admission"
     elif any(token in lower for token in ("grpc", "desktop died", "connection reset")):
-        kind = "aedt_death"
+        kind = "aedt_transport_death"
+        phase = "attach_or_transport"
     else:
         kind = "script_error"
+        phase = "pre_solve"
     return lease.report_fault(
         kind,
+        phase=phase,
+        evidence={
+            "exception_type": type(error).__name__,
+            "solver_may_run": bool(solver_may_run),
+        },
         failure_message=text,
         sibling_grace_seconds=60,
     )

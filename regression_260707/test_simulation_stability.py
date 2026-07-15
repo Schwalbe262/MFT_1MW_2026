@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import pandas as pd
 
@@ -191,6 +191,24 @@ class DesktopSessionRetryTests(unittest.TestCase):
                 close_on_exit=True,
             )
         sleep.assert_called_once_with(1.0)
+
+    @patch("run_simulation_260706.time.sleep")
+    @patch("run_simulation_260706._snapshot_descendants", return_value={})
+    @patch("run_simulation_260706.acquire_pooled_desktop")
+    @patch("run_simulation_260706.aedt_backend", return_value="pooled")
+    def test_pooled_attach_failure_is_one_durable_intent_not_local_retries(
+            self, _backend, acquire, _snapshot, sleep):
+        acquire.side_effect = RuntimeError("attach failed")
+
+        with self.assertRaisesRegex(
+                RuntimeError, "AEDT desktop startup failed after 1 attempts"):
+            _create_simulation_session(max_attempts=3, retry_delay_s=30)
+
+        acquire.assert_called_once_with(
+            desktop_factory=ANY,
+            non_graphical=ANY,
+        )
+        sleep.assert_not_called()
 
 
 class ThermalCoreConductivityInputContractTests(unittest.TestCase):
@@ -2080,6 +2098,27 @@ class AnalyzePolicyTests(unittest.TestCase):
             simulation.stage_timings["stage_time_matrix_solve_s"],
         )
 
+    def test_pooled_analyze_reuses_host_dso_without_global_registry_rewrite(self):
+        simulation = self._simulation([None])
+        simulation.aedt_backend = "pooled"
+        simulation.solver_may_be_running = False
+        simulation.design1.setup.analyze = Mock(return_value=None)
+
+        simulation.analyze_and_extract("matrix", lambda: None)
+
+        simulation.design1.setup.analyze.assert_called_once_with(
+            cores=None, tasks=None, gpus=None
+        )
+        self.assertFalse(simulation.solver_may_be_running)
+
+    def test_standalone_analyze_keeps_explicit_core_contract(self):
+        simulation = self._simulation([None])
+        simulation.design1.setup.analyze = Mock(return_value=None)
+
+        simulation.analyze_and_extract("matrix", lambda: None)
+
+        simulation.design1.setup.analyze.assert_called_once_with(cores=4)
+
     def test_cap_stage_records_solve_extraction_and_total_time(self):
         simulation = self._simulation([None])
 
@@ -3102,6 +3141,27 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
         self.assertEqual(result["solve_attempts"], 1)
         self.assertFalse(result["analyze_call_ok"])
         self.assertTrue(result["analyze_return_false"])
+        self.assertEqual(result["convergence"]["thermal_converged"], 1)
+
+    def test_pooled_thermal_dispatch_reuses_host_dso_without_cores_override(self):
+        simulation, ipk, setup, analyze, _rebind = self._harness(None)
+        converged = self._telemetry(
+            "converged", converged=1, monitor_file="fresh.sd"
+        )
+
+        with patch(
+            "module.aedt_pool_adapter.pooled_backend_enabled",
+            return_value=True,
+        ), patch(
+            "module.thermal_260706._thermal_convergence_telemetry",
+            return_value=converged,
+        ):
+            result = _solve_exact_thermal_setup(
+                simulation, ipk, setup, monitor_grace_s=0,
+            )
+
+        analyze.assert_called_once_with(setup="ThermalSetup", blocking=True)
+        self.assertEqual(result["solve_attempts"], 1)
         self.assertEqual(result["convergence"]["thermal_converged"], 1)
 
     def test_false_and_missing_monitor_rebinds_and_retries_only_once(self):
