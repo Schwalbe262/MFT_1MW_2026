@@ -4,7 +4,9 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
+import sys
 import time
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -166,6 +168,14 @@ def test_pipeline_reader_reports_real_parallel_lanes_revisions_and_errors(tmp_pa
         "running_lanes": ["collect", "optimize"],
         "active_lane_count": 4,
         "active_lanes": ["collect", "tune", "optimize", "verify_fine"],
+        "durable_running_lane_count": 2,
+        "durable_running_lanes": ["collect", "optimize"],
+        "durable_active_lane_count": 4,
+        "durable_active_lanes": [
+            "collect", "tune", "optimize", "verify_fine"
+        ],
+        "external_running_lane_count": 0,
+        "external_running_lanes": [],
         "parallel_work_confirmed": True,
     }
     lanes = {lane["job_type"]: lane for lane in payload["lanes"]}
@@ -188,6 +198,85 @@ def test_pipeline_reader_reports_real_parallel_lanes_revisions_and_errors(tmp_pa
     # query_only plus mode=ro must leave the durable queue byte-for-byte alone.
     assert hashlib.sha256(database.read_bytes()).hexdigest() == before_hash
     assert database.stat().st_mtime_ns == before_mtime
+
+
+def test_external_tuner_counts_only_after_recent_cpu_or_io_activity(
+    tmp_path, monkeypatch
+):
+    now = [time.time()]
+    root = tmp_path / "pipeline"
+    _create_queue(root, now[0])
+    _write_role(root, "controller", now[0])
+    _write_role(root, "supervisor", now[0])
+    dataset = tmp_path / "strict.parquet"
+    dataset.write_bytes(b"immutable dataset identity")
+    counters = {"cpu": 10.0, "read": 1_000.0, "write": 50.0}
+
+    class AccessDenied(Exception):
+        pass
+
+    class NoSuchProcess(Exception):
+        pass
+
+    class FakeProcess:
+        info = {
+            "pid": 42,
+            "name": "python.exe",
+            "create_time": now[0] - 100,
+        }
+
+        @staticmethod
+        def cmdline():
+            return [
+                "python.exe",
+                "training/tune_optuna.py",
+                "--all",
+                "--trials",
+                "200",
+                "--dataset",
+                str(dataset),
+            ]
+
+        @staticmethod
+        def cpu_times():
+            return SimpleNamespace(user=counters["cpu"], system=0.0)
+
+        @staticmethod
+        def io_counters():
+            return SimpleNamespace(
+                read_bytes=counters["read"],
+                write_bytes=counters["write"],
+            )
+
+    fake_psutil = SimpleNamespace(
+        AccessDenied=AccessDenied,
+        NoSuchProcess=NoSuchProcess,
+        process_iter=lambda attrs: [FakeProcess()],
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    reader = ContinuousPipelineReader(root, clock=lambda: now[0])
+
+    first = reader.snapshot()
+    assert first["external_tuners"]["validated_running_count"] == 0
+    assert first["external_tuners"]["processes"][0]["command_validated"] is True
+    assert first["parallel"]["running_lane_count"] == 2
+    assert first["parallel"]["external_running_lanes"] == []
+
+    now[0] += 20
+    counters["cpu"] += 4.0
+    counters["read"] += 2_048
+    second = reader.snapshot()
+    process = second["external_tuners"]["processes"][0]
+    assert process["activity_confirmed"] is True
+    assert process["cpu_seconds_delta"] == 4.0
+    assert process["read_bytes_delta"] == 2_048
+    assert process["validated_running"] is True
+    assert second["parallel"]["running_lane_count"] == 3
+    assert second["parallel"]["running_lanes"] == [
+        "collect", "optimize", "external_tune"
+    ]
+    assert second["parallel"]["durable_running_lane_count"] == 2
+    assert second["parallel"]["external_running_lane_count"] == 1
 
 
 def test_pipeline_reader_audits_row_tiers_once_per_dataset_fingerprint(tmp_path):

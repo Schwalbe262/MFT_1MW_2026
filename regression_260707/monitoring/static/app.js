@@ -275,13 +275,20 @@
     );
     const external = pipeline.external_tuners || {};
     const externalProcesses = Array.isArray(external.processes) ? external.processes : [];
+    const externalVerified = Number(external.validated_running_count || 0);
     const externalState = $("#pipeline-external-tuner-state");
-    externalState.className = `state-chip ${externalProcesses.length ? "unknown" : external.available ? "pass" : "fail"}`;
-    externalState.textContent = externalProcesses.length ? `${externalProcesses.length}개 별도 실행` : external.available ? "없음" : "확인 불가";
+    externalState.className = `state-chip ${externalVerified ? "pass" : externalProcesses.length ? "unknown" : external.available ? "pass" : "fail"}`;
+    externalState.textContent = externalVerified
+      ? `${externalVerified}개 활동 검증`
+      : externalProcesses.length
+        ? `${externalProcesses.length}개 확인 대기`
+        : external.available ? "없음" : "확인 불가";
     setText(
       "#pipeline-external-tuner-detail",
-      externalProcesses.length
-        ? "아래 작업은 durable lane 수에 포함되지 않습니다."
+      externalVerified
+        ? "최근 CPU/I/O 증가가 확인되어 observed 병렬 lane에 포함됩니다. durable queue 수에는 포함되지 않습니다."
+        : externalProcesses.length
+          ? "PID는 있으나 최근 CPU/I/O 증가가 확인되기 전에는 병렬 lane으로 세지 않습니다."
         : external.error || "durable queue 밖의 Optuna 작업이 없습니다.",
     );
     const externalList = $("#pipeline-external-tuners");
@@ -290,15 +297,21 @@
       const dataset = compactGeneration(process.dataset);
       externalList.append(element(
         "li", "",
-        `PID ${process.pid} · ${duration(process.elapsed_seconds)} · trials ${process.trials || "—"} · ${dataset}`,
+        `PID ${process.pid} · ${process.validated_running ? "활동 검증" : "검증 대기"} · CPU +${number(process.cpu_seconds_delta, 2)}s · read +${number(process.read_bytes_delta)}B · ${duration(process.elapsed_seconds)} · trials ${process.trials || "—"} · ${dataset}`,
       ));
     });
 
     const parallel = pipeline.parallel || {};
     const queue = pipeline.queue || {};
     const counts = queue.counts || {};
-    setText("#pipeline-running-lanes", `${number(parallel.running_lane_count || 0)} / 6`);
-    setText("#pipeline-active-lanes", `${number(parallel.active_lane_count || 0)} / 6`);
+    setText(
+      "#pipeline-running-lanes",
+      `${number(parallel.running_lane_count || 0)} observed (${number(parallel.durable_running_lane_count || 0)} durable + ${number(parallel.external_running_lane_count || 0)} external)`,
+    );
+    setText(
+      "#pipeline-active-lanes",
+      `${number(parallel.active_lane_count || 0)} observed (${number(parallel.durable_active_lane_count || 0)} durable)`,
+    );
     setText("#pipeline-queued-jobs", number((counts.queued || 0) + (counts.retry_wait || 0)));
     setText("#pipeline-running-jobs", number(counts.running || 0));
     setText("#pipeline-succeeded-jobs", number(counts.succeeded || 0));

@@ -36,6 +36,7 @@ ARTIFACT_CANDIDATE_LIMIT = 64
 DATASET_AUDIT_MAX_BYTES = 128 * 1024 * 1024
 ROLE_ACTIVITY_STALE_SECONDS = 20 * 60
 RUNNING_HEARTBEAT_STALE_SECONDS = 180
+EXTERNAL_ACTIVITY_CONFIRMATION_SECONDS = 120
 FIRST_TRAINING_ROWS = 500
 MODEL_ACTIVATION_ROWS = 3_000
 FIRST_TUNING_ROWS = 4_000
@@ -303,6 +304,10 @@ class ContinuousPipelineReader:
         self._dataset_audit_lock = threading.Lock()
         self._dataset_audit_key: tuple[Any, ...] | None = None
         self._dataset_audit_result: dict[str, Any] | None = None
+        self._external_process_lock = threading.Lock()
+        self._external_process_samples: dict[
+            tuple[int, float], dict[str, float | None]
+        ] = {}
 
     @staticmethod
     def _audit_dataset_artifact(
@@ -615,16 +620,25 @@ class ContinuousPipelineReader:
 
     def _external_tuners(self, now: float) -> dict[str, Any]:
         if not self.inspect_external_processes:
-            return {"available": False, "processes": [], "error": None}
+            return {
+                "available": False,
+                "processes": [],
+                "validated_running_count": 0,
+                "validated_lane_active": False,
+                "error": None,
+            }
         try:
             import psutil
         except ImportError:
             return {
                 "available": False,
                 "processes": [],
+                "validated_running_count": 0,
+                "validated_lane_active": False,
                 "error": "psutil unavailable; external Optuna processes are not observable",
             }
         processes = []
+        samples: dict[tuple[int, float], dict[str, float | None]] = {}
         deadline = time.monotonic() + 1.0
         try:
             iterator = psutil.process_iter(
@@ -660,6 +674,52 @@ class ContinuousPipelineReader:
                     )
 
                 created_at = _timestamp(info.get("create_time"))
+                if created_at is None:
+                    continue
+                trials_text = argument_after("--trials")
+                dataset = argument_after("--dataset")
+                try:
+                    trials = int(trials_text) if trials_text is not None else None
+                except (TypeError, ValueError):
+                    trials = None
+                selection_valid = (
+                    "--all" in arguments
+                    or (
+                        argument_after("--target") is not None
+                        and argument_after("--family") is not None
+                    )
+                )
+                command_validated = bool(
+                    dataset and trials is not None and trials > 0 and selection_valid
+                )
+                cpu_seconds = None
+                read_bytes = None
+                write_bytes = None
+                try:
+                    cpu_times = process.cpu_times()
+                    cpu_seconds = float(cpu_times.user + cpu_times.system)
+                except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                    pass
+                try:
+                    io_counters = process.io_counters()
+                    read_bytes = float(io_counters.read_bytes)
+                    write_bytes = float(io_counters.write_bytes)
+                except (
+                    AttributeError,
+                    psutil.AccessDenied,
+                    psutil.NoSuchProcess,
+                    OSError,
+                ):
+                    pass
+                identity = (int(info["pid"]), float(int(created_at)))
+                sample = {
+                    "sampled_at": now,
+                    "cpu_seconds": cpu_seconds,
+                    "read_bytes": read_bytes,
+                    "write_bytes": write_bytes,
+                    "activity_confirmed_at": None,
+                }
+                samples[identity] = sample
                 processes.append({
                     "pid": int(info["pid"]),
                     "name": _bounded_text(info.get("name"), 100),
@@ -669,19 +729,92 @@ class ContinuousPipelineReader:
                         if created_at is not None
                         else None
                     ),
-                    "trials": argument_after("--trials"),
-                    "dataset": argument_after("--dataset"),
+                    "trials": trials_text,
+                    "dataset": dataset,
                     "managed_by_durable_pipeline": False,
+                    "command_validated": command_validated,
+                    "activity_confirmed": False,
+                    "activity_age_seconds": None,
+                    "activity_window_seconds": None,
+                    "cpu_seconds_delta": None,
+                    "read_bytes_delta": None,
+                    "write_bytes_delta": None,
+                    "validated_running": False,
                 })
         except Exception as exc:
             return {
                 "available": False,
                 "processes": [],
+                "validated_running_count": 0,
+                "validated_lane_active": False,
                 "error": f"{type(exc).__name__}: {_bounded_text(exc, 400)}",
             }
+        with self._external_process_lock:
+            previous_samples = self._external_process_samples
+            for process in processes:
+                started_at = _parse_iso(process["started_at"])
+                identity = (
+                    int(process["pid"]),
+                    float(int(started_at)) if started_at is not None else -1.0,
+                )
+                current = samples.get(identity)
+                previous = previous_samples.get(identity)
+                if current is None:
+                    continue
+                confirmed_at = (
+                    previous.get("activity_confirmed_at")
+                    if previous is not None else None
+                )
+                if previous is not None:
+                    window = max(
+                        0.0,
+                        now - float(previous.get("sampled_at") or now),
+                    )
+                    process["activity_window_seconds"] = window
+                    deltas: dict[str, float | None] = {}
+                    for source, destination in (
+                        ("cpu_seconds", "cpu_seconds_delta"),
+                        ("read_bytes", "read_bytes_delta"),
+                        ("write_bytes", "write_bytes_delta"),
+                    ):
+                        before = previous.get(source)
+                        after = current.get(source)
+                        delta = (
+                            max(0.0, float(after) - float(before))
+                            if before is not None and after is not None
+                            else None
+                        )
+                        process[destination] = delta
+                        deltas[source] = delta
+                    if (
+                        (deltas["cpu_seconds"] or 0.0) >= 0.01
+                        or (deltas["read_bytes"] or 0.0) > 0
+                        or (deltas["write_bytes"] or 0.0) > 0
+                    ):
+                        confirmed_at = now
+                current["activity_confirmed_at"] = confirmed_at
+                activity_age = (
+                    max(0.0, now - float(confirmed_at))
+                    if confirmed_at is not None else None
+                )
+                activity_confirmed = bool(
+                    activity_age is not None
+                    and activity_age <= EXTERNAL_ACTIVITY_CONFIRMATION_SECONDS
+                )
+                process["activity_confirmed"] = activity_confirmed
+                process["activity_age_seconds"] = activity_age
+                process["validated_running"] = bool(
+                    process["command_validated"] and activity_confirmed
+                )
+            self._external_process_samples = samples
+        validated = [
+            process for process in processes if process["validated_running"]
+        ]
         return {
             "available": True,
             "processes": sorted(processes, key=lambda item: item["pid"]),
+            "validated_running_count": len(validated),
+            "validated_lane_active": bool(validated),
             "error": None,
         }
 
@@ -1174,12 +1307,12 @@ class ContinuousPipelineReader:
         cohort = self._dataset_cohort(revisions, controller_cycle)
         self._lane_prerequisites(lanes, cohort, controller_cycle)
         external_tuners = self._external_tuners(now)
-        running_lanes = [
+        durable_running_lanes = [
             lane["job_type"]
             for lane in lanes
             if lane["counts"].get("running", 0) > 0
         ]
-        active_lanes = [
+        durable_active_lanes = [
             lane["job_type"]
             for lane in lanes
             if sum(
@@ -1187,6 +1320,12 @@ class ContinuousPipelineReader:
                 for state in ("queued", "retry_wait", "running")
             ) > 0
         ]
+        external_running_lanes = (
+            ["external_tune"]
+            if external_tuners.get("validated_lane_active") else []
+        )
+        running_lanes = durable_running_lanes + external_running_lanes
+        active_lanes = durable_active_lanes + external_running_lanes
         stale_jobs = [
             lane["job_type"]
             for lane in lanes
@@ -1225,10 +1364,18 @@ class ContinuousPipelineReader:
             pids = ", ".join(
                 str(item["pid"]) for item in external_tuners["processes"]
             )
-            warnings.append(
-                "external Optuna tuner is running outside the durable pipeline "
-                f"(PID {pids}); it is not included in lane counts"
-            )
+            if external_tuners.get("validated_lane_active"):
+                warnings.append(
+                    "external Optuna tuner has recent CPU/I/O activity "
+                    f"(PID {pids}); included as external_tune in observed lane "
+                    "counts but excluded from durable queue counts"
+                )
+            else:
+                warnings.append(
+                    "external Optuna tuner process is present but recent CPU/I/O "
+                    f"activity is not yet confirmed (PID {pids}); excluded from "
+                    "observed lane counts"
+                )
         both_roles_alive = all(role["alive"] for role in roles.values())
         if (
             both_roles_alive
@@ -1278,6 +1425,12 @@ class ContinuousPipelineReader:
                 "running_lanes": running_lanes,
                 "active_lane_count": len(active_lanes),
                 "active_lanes": active_lanes,
+                "durable_running_lane_count": len(durable_running_lanes),
+                "durable_running_lanes": durable_running_lanes,
+                "durable_active_lane_count": len(durable_active_lanes),
+                "durable_active_lanes": durable_active_lanes,
+                "external_running_lane_count": len(external_running_lanes),
+                "external_running_lanes": external_running_lanes,
                 "parallel_work_confirmed": len(running_lanes) >= 2,
             },
             "warnings": warnings,
