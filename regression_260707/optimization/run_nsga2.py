@@ -203,6 +203,38 @@ def load_models(registry=None, generation=None, *, allow_unaccepted=False):
     return models
 
 
+def _bound_surrogate_inference(models, threads=1):
+    """Disable nested all-core prediction below restart-level parallelism."""
+
+    evidence = []
+    for target in sorted(models):
+        configure = getattr(models[target], "configure_inference_threads", None)
+        if not callable(configure):
+            raise RuntimeError(
+                f"surrogate predictor cannot bind inference threads: {target}"
+            )
+        result = configure(threads)
+        if not isinstance(result, dict) or result.get("threads") != int(threads):
+            raise RuntimeError(
+                f"surrogate inference thread attestation failed: {target}"
+            )
+        evidence.append(result)
+    families = sorted({
+        family
+        for result in evidence
+        for family in result.get("families", [])
+    })
+    return {
+        "threads_per_model": int(threads),
+        "target_count": len(evidence),
+        "model_count": sum(
+            int(result.get("model_count") or 0) for result in evidence
+        ),
+        "families": families,
+        "policy": "outer_restart_parallelism_inner_model_serial_v1",
+    }
+
+
 def build_density_gate(dataset_path, features):
     from predictor import DensityGate
     from checkpoint_train import to_physical
@@ -459,6 +491,11 @@ def main():
     missing = [target for target in REQUIRED_MODEL_TARGETS if target not in models]
     if missing:
         raise SystemExit(f"required model generation is incomplete: {missing}")
+    inference_parallelism = _bound_surrogate_inference(models, threads=1)
+    print(json.dumps({
+        "event": "surrogate_inference_parallelism",
+        **inference_parallelism,
+    }, sort_keys=True), flush=True)
     if pinned_generation:
         generation_artifact_root = pinned_generation
     else:
@@ -614,6 +651,7 @@ def main():
             "restarts": args.restarts,
             "population": args.pop,
             "workers": min(args.workers, args.restarts),
+            "surrogate_inference_parallelism": inference_parallelism,
             "round": args.round,
             "seeds": [1000 + index for index in range(args.restarts)],
             "termination": {

@@ -8,8 +8,10 @@ import threading
 import time
 import unittest
 from unittest import mock
+import warnings
 
 import numpy as np
+import pandas as pd
 
 from regression_260707.pipeline.artifacts import GenerationStore
 from regression_260707.pipeline.policy import (
@@ -418,6 +420,73 @@ class NsgaParallelTests(unittest.TestCase):
         )
         self.assertEqual(set(models), set(run_nsga2.REQUIRED_MODEL_TARGETS))
         self.assertTrue(all(value[1] is record for value in models.values()))
+
+    def test_nsga_bounds_nested_ensemble_inference_and_suppresses_joblib_warning(self):
+        from regression_260707.optimization import run_nsga2
+        import predictor
+
+        class JoblibModel:
+            def __init__(self):
+                self.n_jobs = -1
+
+            def predict(self, frame):
+                if self.n_jobs != 1:
+                    warnings.warn(
+                        "sklearn.utils.parallel.delayed should be used",
+                        UserWarning,
+                    )
+                return np.ones(len(frame), dtype=float)
+
+        class CatBoostModel:
+            def __init__(self):
+                self.thread_counts = []
+
+            def predict(self, frame, thread_count=None):
+                self.thread_counts.append(thread_count)
+                return np.full(len(frame), 2.0, dtype=float)
+
+        joblib_model = JoblibModel()
+        catboost_model = CatBoostModel()
+        ensemble = predictor.EnsemblePredictor({
+            "models": [
+                ("extratrees", joblib_model),
+                ("catboost", catboost_model),
+            ],
+            "features": ["x"],
+            "transform": "identity",
+            "q90": 1.0,
+        })
+
+        evidence = run_nsga2._bound_surrogate_inference(
+            {"Llt_phys": ensemble}, threads=1
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ensemble.predict_mu_sigma(pd.DataFrame({"x": [0.0, 1.0]}))
+            ensemble.disagreement(pd.DataFrame({"x": [0.0, 1.0]}))
+
+        self.assertEqual(caught, [])
+        self.assertEqual(joblib_model.n_jobs, 1)
+        self.assertEqual(catboost_model.thread_counts, [1, 1])
+        self.assertEqual(evidence, {
+            "threads_per_model": 1,
+            "target_count": 1,
+            "model_count": 2,
+            "families": ["catboost", "extratrees"],
+            "policy": "outer_restart_parallelism_inner_model_serial_v1",
+        })
+
+    def test_nsga_inference_bound_rejects_unknown_nested_parallelism(self):
+        import predictor
+
+        ensemble = predictor.EnsemblePredictor({
+            "models": [("unknown", object())],
+            "features": ["x"],
+            "transform": "identity",
+            "q90": 1.0,
+        })
+        with self.assertRaisesRegex(RuntimeError, "unsupported ensemble family"):
+            ensemble.configure_inference_threads(1)
 
     def test_restarts_are_parallel_bounded_and_returned_in_seed_order(self):
         from regression_260707.optimization import run_nsga2
