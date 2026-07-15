@@ -11,7 +11,9 @@ Icepak 열해석 모듈 (설계도면260706 파이프라인 design3)
 - 경계조건: 콜드플레이트/권선냉각판(Al) 고정온도, region +y면 velocity inlet, -y면 pressure opening
 """
 
+import csv
 import hashlib
+import io
 import json
 import math
 import logging
@@ -49,6 +51,135 @@ def _native_solver(app):
 
 _THERMAL_DESIGN_NAME = "icepak_thermal"
 _THERMAL_SETUP_NAME = "ThermalSetup"
+
+
+def _field_summary_data_frame(sim, field_summary, setup):
+    """Return field-summary data through a host-visible export path.
+
+    PyAEDT's ``get_field_summary_data`` creates its CSV in the caller's local
+    ``/tmp``.  With a pooled Desktop the caller and AEDT can run on different
+    nodes, so AEDT writes a different node-local file and the caller reads its
+    still-empty placeholder.  Export pooled summaries through the lease's
+    task-unique GPFS workspace instead.  The file must be writable by the
+    session-host account, which can differ from the client account.
+    """
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    if not pooled_backend_enabled():
+        return field_summary.get_field_summary_data(
+            setup=setup, pandas_output=True
+        )
+
+    create_target = getattr(sim, "_new_aedt_export_target", None)
+    read_target = getattr(sim, "_read_attested_aedt_export", None)
+    remove_target = getattr(sim, "_remove_attested_aedt_export", None)
+    if not all(callable(item) for item in (
+            create_target, read_target, remove_target)):
+        raise RuntimeError(
+            "pooled field summary requires attested AEDT export helpers"
+        )
+
+    output_path = None
+    provenance = None
+    try:
+        output_path, provenance = create_target("thermal_field_summary")
+        started = time.time()
+        exported = field_summary.export_csv(output_path, setup=setup)
+        if exported is False:
+            raise RuntimeError("pooled field-summary export returned False")
+        exported_text = read_target(
+            output_path,
+            provenance,
+            started,
+            "thermal_field_summary",
+        )
+        with io.StringIO(exported_text, newline="") as stream:
+            for _ in range(4):
+                if stream.readline() == "":
+                    raise RuntimeError("pooled field-summary export is empty")
+            frame = pd.DataFrame(list(csv.DictReader(stream)))
+        for column in ("Min", "Max", "Mean", "Stdev", "Total"):
+            if column in frame.columns:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        return frame
+    finally:
+        if output_path and provenance:
+            remove_target(
+                output_path,
+                provenance,
+                "thermal_field_summary",
+            )
+
+
+def _wait_for_pooled_field_summary_idle(
+    sim,
+    ipk,
+    timeout_s=7200.0,
+    poll_s=2.0,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+):
+    """Drain in-flight sibling solves before Desktop-global field export.
+
+    The caller owns the pooled automation transaction while this function
+    runs.  Existing project-scoped native solves can therefore finish, but no
+    sibling can dispatch another solve before ``ExportFieldsSummary``.  The
+    Desktop-wide state is used only as a drain barrier, never as evidence that
+    this lease's own solve succeeded.
+    """
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    if not pooled_backend_enabled():
+        return 0.0
+    desktop = _thermal_desktop_handle(sim, ipk)
+    is_running = getattr(desktop, "AreThereSimulationsRunning", None)
+    if not callable(is_running):
+        raise RuntimeError(
+            "pooled thermal field-summary drain has no simulation-state query"
+        )
+
+    started = clock()
+    deadline = started + max(0.0, float(timeout_s))
+    waiting_logged = False
+    while True:
+        value = is_running()
+        if value is False or value == 0:
+            elapsed = max(0.0, clock() - started)
+            if waiting_logged:
+                logging.warning(
+                    "[thermal] pooled field-summary drain completed in %.1fs",
+                    elapsed,
+                )
+            return elapsed
+        if value is True or value == 1:
+            running = True
+        else:
+            normalized = str(value or "").strip().casefold()
+            if normalized in {"false", "no", "off", "0"}:
+                return max(0.0, clock() - started)
+            if normalized in {"true", "yes", "on", "1"}:
+                running = True
+            else:
+                raise RuntimeError(
+                    "pooled thermal field-summary drain returned an "
+                    f"unrecognized state: {value!r}"
+                )
+        if running and not waiting_logged:
+            logging.warning(
+                "[thermal] waiting for in-flight sibling solves before "
+                "Desktop-global field-summary export"
+            )
+            waiting_logged = True
+        now = clock()
+        if now >= deadline:
+            raise RuntimeError(
+                "timed out waiting for pooled AEDT to become idle before "
+                f"thermal field-summary export ({float(timeout_s):.1f}s)"
+            )
+        sleeper(min(
+            max(0.05, float(poll_s)),
+            max(0.0, deadline - now),
+        ))
 
 
 def _power_value_w(value):
@@ -2450,7 +2581,7 @@ def run_thermal_analysis(sim):
                 "Object", "Volume" if is_volume else "Surface",
                 name, "Temperature"
             )
-        df_fs = fs.get_field_summary_data(setup=solution, pandas_output=True)
+        df_fs = _field_summary_data_frame(sim, fs, solution)
         if df_fs is None or isinstance(df_fs, bool) or not hasattr(df_fs, "columns") or not len(df_fs):
             raise RuntimeError(f"field summary returned {type(df_fs).__name__} (no data)")
         # 컬럼: Entity/Geometry/Quantity/Min/Max/Mean ... (버전에 따라 대소문자 상이)
@@ -2547,6 +2678,7 @@ def run_thermal_analysis(sim):
             rx_side_selected_face = selected
 
     field_summary_attempts = 0
+    _wait_for_pooled_field_summary_idle(sim, native_ipk)
     for attempt in range(1, 4):
         missing_entries = [entry for entry in probe if entry[2] not in temps]
         if not missing_entries:

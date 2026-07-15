@@ -191,7 +191,7 @@ class _FieldSummary:
     def add_calculation(self, _entity, _geometry, name, _quantity):
         self._names.append(name)
 
-    def get_field_summary_data(self, **_kwargs):
+    def _next_rows(self):
         index = self._icepak.field_summary_calls
         self._icepak.field_summary_calls += 1
         response = self._icepak.field_summary_responses[min(index, len(self._icepak.field_summary_responses) - 1)]
@@ -209,7 +209,31 @@ class _FieldSummary:
                 "Max": maximum,
                 "Mean": mean,
             })
+        return rows
+
+    def get_field_summary_data(self, **_kwargs):
+        rows = self._next_rows()
+        if rows is False:
+            return False
         return pd.DataFrame(rows)
+
+    def export_csv(self, output_file, setup=None):
+        rows = self._next_rows()
+        self._icepak.field_summary_export_call = (output_file, setup)
+        if rows is False:
+            return False
+        columns = ["Entity", "Quantity", "Geometry Name", "Max", "Mean"]
+        body = [",".join(columns)]
+        body.extend(
+            ",".join(str(row.get(column, "")) for column in columns)
+            for row in rows
+        )
+        self._icepak.field_summary_export_text = (
+            "Field Summary\nProject\nDesign\nSolution\n"
+            + "\n".join(body)
+            + "\n"
+        )
+        return True
 
 
 class _Icepak:
@@ -221,6 +245,8 @@ class _Icepak:
         self.analyze_calls = 0
         self.field_summary_calls = 0
         self.field_summary_responses = field_summary_responses
+        self.field_summary_export_call = None
+        self.field_summary_export_text = ""
         self.scalar_responses = scalar_responses or {}
         self.scalar_calls = []
         self.setup_result = setup_result
@@ -282,6 +308,157 @@ class _DesignWrapper:
 
 
 class ThermalStabilityTest(unittest.TestCase):
+    def test_pooled_field_summary_uses_attested_shared_export(self):
+        from module import aedt_pool_adapter
+
+        field_summary = SimpleNamespace(
+            export_csv=Mock(return_value=True),
+            get_field_summary_data=Mock(
+                side_effect=AssertionError("node-local tempfile is forbidden")
+            ),
+        )
+        provenance = {
+            "transport": "pooled_shared_results",
+            "parent": "/gpfs/task/.aedtresults",
+        }
+        sim = SimpleNamespace(
+            _new_aedt_export_target=Mock(return_value=(
+                "/gpfs/task/.aedtresults/thermal-summary.txt",
+                provenance,
+            )),
+            _read_attested_aedt_export=Mock(return_value=(
+                "Field Summary\nProject\nDesign\nSolution\n"
+                "Entity,Quantity,Geometry Name,Min,Max,Mean,Stdev,Total\n"
+                "Object,Temperature,core_1,40.0,91.5,75.25,2.0,300.0\n"
+            )),
+            _remove_attested_aedt_export=Mock(),
+        )
+
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
+            frame = thermal._field_summary_data_frame(
+                sim, field_summary, "ThermalSetup : SteadyState"
+            )
+
+        self.assertEqual(frame.loc[0, "Geometry Name"], "core_1")
+        self.assertEqual(frame.loc[0, "Max"], 91.5)
+        self.assertEqual(frame.loc[0, "Mean"], 75.25)
+        field_summary.get_field_summary_data.assert_not_called()
+        field_summary.export_csv.assert_called_once_with(
+            "/gpfs/task/.aedtresults/thermal-summary.txt",
+            setup="ThermalSetup : SteadyState",
+        )
+        sim._read_attested_aedt_export.assert_called_once_with(
+            "/gpfs/task/.aedtresults/thermal-summary.txt",
+            provenance,
+            unittest.mock.ANY,
+            "thermal_field_summary",
+        )
+        sim._remove_attested_aedt_export.assert_called_once_with(
+            "/gpfs/task/.aedtresults/thermal-summary.txt",
+            provenance,
+            "thermal_field_summary",
+        )
+
+    def test_pooled_field_summary_cleans_export_after_failure(self):
+        from module import aedt_pool_adapter
+
+        provenance = {"transport": "pooled_shared_results"}
+        sim = SimpleNamespace(
+            _new_aedt_export_target=Mock(return_value=(
+                "/gpfs/task/.aedtresults/thermal-summary.txt",
+                provenance,
+            )),
+            _read_attested_aedt_export=Mock(),
+            _remove_attested_aedt_export=Mock(),
+        )
+        field_summary = SimpleNamespace(export_csv=Mock(return_value=False))
+
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
+            with self.assertRaisesRegex(
+                    RuntimeError, "field-summary export returned False"):
+                thermal._field_summary_data_frame(
+                    sim, field_summary, "ThermalSetup : SteadyState"
+                )
+
+        sim._read_attested_aedt_export.assert_not_called()
+        sim._remove_attested_aedt_export.assert_called_once_with(
+            "/gpfs/task/.aedtresults/thermal-summary.txt",
+            provenance,
+            "thermal_field_summary",
+        )
+
+    def test_standalone_field_summary_keeps_pyaedt_data_path(self):
+        from module import aedt_pool_adapter
+
+        expected = pd.DataFrame([{"Geometry Name": "core_1", "Max": 91.5}])
+        field_summary = SimpleNamespace(
+            get_field_summary_data=Mock(return_value=expected)
+        )
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=False):
+            actual = thermal._field_summary_data_frame(
+                SimpleNamespace(),
+                field_summary,
+                "ThermalSetup : SteadyState",
+            )
+
+        self.assertIs(actual, expected)
+        field_summary.get_field_summary_data.assert_called_once_with(
+            setup="ThermalSetup : SteadyState", pandas_output=True
+        )
+
+    def test_pooled_field_summary_waits_for_sibling_solve_drain(self):
+        from module import aedt_pool_adapter
+
+        states = iter([True, "true", False])
+        desktop = SimpleNamespace(
+            AreThereSimulationsRunning=Mock(side_effect=lambda: next(states))
+        )
+        now = [100.0]
+
+        def sleep_and_advance(seconds):
+            now[0] += seconds
+
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
+            elapsed = thermal._wait_for_pooled_field_summary_idle(
+                SimpleNamespace(),
+                SimpleNamespace(odesktop=desktop),
+                timeout_s=20.0,
+                poll_s=2.0,
+                clock=lambda: now[0],
+                sleeper=sleep_and_advance,
+            )
+
+        self.assertEqual(elapsed, 4.0)
+        self.assertEqual(desktop.AreThereSimulationsRunning.call_count, 3)
+
+    def test_pooled_field_summary_drain_timeout_is_explicit(self):
+        from module import aedt_pool_adapter
+
+        desktop = SimpleNamespace(AreThereSimulationsRunning=Mock(return_value=True))
+        now = [100.0]
+
+        def sleep_and_advance(seconds):
+            now[0] += seconds
+
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
+            with self.assertRaisesRegex(
+                    RuntimeError, "timed out waiting for pooled AEDT"):
+                thermal._wait_for_pooled_field_summary_idle(
+                    SimpleNamespace(),
+                    SimpleNamespace(odesktop=desktop),
+                    timeout_s=3.0,
+                    poll_s=2.0,
+                    clock=lambda: now[0],
+                    sleeper=sleep_and_advance,
+                )
+
+        self.assertEqual(now[0], 103.0)
+
     @staticmethod
     def _convergence(converged=True):
         return {
@@ -367,6 +544,14 @@ class ThermalStabilityTest(unittest.TestCase):
             PROJECT_NAME="thermal_test",
             save_project=Mock(),
             _ensure_pooled_shared_results_directory=Mock(),
+            _new_aedt_export_target=Mock(return_value=(
+                "/shared/results/mft_thermal_field_summary_export.txt",
+                {"transport": "pooled_shared_results"},
+            )),
+            _read_attested_aedt_export=Mock(
+                side_effect=lambda *_args: ipk.field_summary_export_text
+            ),
+            _remove_attested_aedt_export=Mock(),
             aedt_native_solve_window=Mock(return_value=nullcontext()),
             solver_may_be_running=False,
         )
