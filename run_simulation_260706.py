@@ -2077,7 +2077,8 @@ class Simulation():
             )
         return metadata
 
-    def _ensure_pooled_shared_results_directory(self, design_name=""):
+    def _ensure_pooled_shared_results_directory(
+            self, design_name="", replace_empty_foreign_root=False):
         """Preclaim one cross-account AEDT results directory with mode 0777.
 
         Pooled clients and the long-lived AEDT process can have different UIDs.
@@ -2148,7 +2149,27 @@ class Simulation():
             else:
                 os.makedirs(results_root, mode=0o777, exist_ok=False)
             self._shared_aedt_plain_directory(results_root, "results root")
-            os.chmod(results_root, 0o777)
+            try:
+                os.chmod(results_root, 0o777)
+            except PermissionError:
+                if not replace_empty_foreign_root:
+                    raise
+                # AEDT 2025.2 replaces the client-preclaimed empty root during
+                # NewProject/SaveAs with a host-owned 0755 directory.  The
+                # project directory remains owned by the lease client, so it
+                # can atomically remove that root only while it is still empty
+                # and recreate it under the client UID.  Never delete a root
+                # containing solver data; rmdir also closes the check/remove
+                # race by failing if AEDT populated it concurrently.
+                if os.listdir(results_root):
+                    raise RuntimeError(
+                        "AEDT replaced pooled results root with a non-empty "
+                        f"foreign directory: {results_root}"
+                    )
+                os.rmdir(results_root)
+                os.mkdir(results_root, mode=0o777)
+                self._shared_aedt_plain_directory(results_root, "results root")
+                os.chmod(results_root, 0o777)
             if target != results_root:
                 if os.path.lexists(target):
                     self._shared_aedt_plain_directory(
@@ -2197,7 +2218,9 @@ class Simulation():
             # postcheck fails before modeling or solving consumes more quota.
             self._ensure_pooled_shared_results_directory()
             self.project = self.desktop.create_project(path=self.project_path, name=self.PROJECT_NAME)
-            self._ensure_pooled_shared_results_directory()
+            self._ensure_pooled_shared_results_directory(
+                replace_empty_foreign_root=True
+            )
         except Exception as e:
             error_msg = f"Failed to create project '{self.PROJECT_NAME}' at path '{self.project_path}': {e}\n"
             print(error_msg, file=sys.stderr)

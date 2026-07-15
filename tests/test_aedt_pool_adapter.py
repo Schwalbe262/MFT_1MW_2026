@@ -464,6 +464,76 @@ def test_pooled_project_postcheck_rejects_aedt_replacing_results_with_file(
         simulation._create_project_locked()
 
 
+def test_pooled_project_reclaims_empty_aedt_replaced_results_root(
+    tmp_path, monkeypatch,
+):
+    simulation, workspace = _pooled_results_harness(tmp_path)
+    foreign_inode = [None]
+
+    class Desktop:
+        def create_project(self, *, path, name):
+            results = Path(path) / f"{name}.aedtresults"
+            results.rmdir()
+            results.mkdir(mode=0o755)
+            foreign_inode[0] = results.stat().st_ino
+            return SimpleNamespace(name=name)
+
+    original_chmod = os.chmod
+
+    def reject_foreign_inode(path, mode):
+        if (
+                foreign_inode[0] is not None
+                and Path(path).exists()
+                and Path(path).stat().st_ino == foreign_inode[0]):
+            raise PermissionError("AEDT host owns this inode")
+        return original_chmod(path, mode)
+
+    simulation.desktop = Desktop()
+    monkeypatch.setattr(os, "chmod", reject_foreign_inode)
+
+    simulation._create_project_locked()
+
+    results = workspace / "mft-own" / "mft-own.aedtresults"
+    assert results.stat().st_ino != foreign_inode[0]
+    assert results.stat().st_mode & 0o777 == 0o777
+
+
+def test_pooled_project_never_removes_nonempty_foreign_results_root(
+    tmp_path, monkeypatch,
+):
+    simulation, workspace = _pooled_results_harness(tmp_path)
+    foreign_inode = [None]
+
+    class Desktop:
+        def create_project(self, *, path, name):
+            results = Path(path) / f"{name}.aedtresults"
+            results.rmdir()
+            results.mkdir(mode=0o755)
+            (results / "solver-data").write_text("preserve", encoding="utf-8")
+            foreign_inode[0] = results.stat().st_ino
+            return SimpleNamespace(name=name)
+
+    original_chmod = os.chmod
+
+    def reject_foreign_inode(path, mode):
+        if (
+                foreign_inode[0] is not None
+                and Path(path).exists()
+                and Path(path).stat().st_ino == foreign_inode[0]):
+            raise PermissionError("AEDT host owns this inode")
+        return original_chmod(path, mode)
+
+    simulation.desktop = Desktop()
+    monkeypatch.setattr(os, "chmod", reject_foreign_inode)
+
+    with pytest.raises(RuntimeError, match="non-empty foreign directory"):
+        simulation._create_project_locked()
+
+    results = workspace / "mft-own" / "mft-own.aedtresults"
+    assert results.stat().st_ino == foreign_inode[0]
+    assert (results / "solver-data").read_text(encoding="utf-8") == "preserve"
+
+
 def test_pooled_results_reject_project_outside_lease_workspace(tmp_path):
     simulation, _workspace = _pooled_results_harness(tmp_path)
     outside = tmp_path / "outside" / simulation.PROJECT_NAME
