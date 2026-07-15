@@ -3499,7 +3499,7 @@ class Simulation():
         self.design1.setup.properties["Frequency Setup"] = f"{float(self.df_plus['freq'].iloc[0])}Hz"
 
     def _prepare_pooled_solution_data_app(self):
-        """Hydrate the pooled PyAEDT app state needed by lazy post creation."""
+        """Fully rebind a pooled PyAEDT app to this project and design."""
         if self._backend_mode() != "pooled":
             return None
 
@@ -3521,28 +3521,122 @@ class Simulation():
                 "pooled SolutionData project identity/path is unavailable"
             )
 
-        native_project = self._verified_native_project_handle()
-        expected_design = _aedt_design_name(
-            getattr(design, "design_name", "")
-        )
+        app_state = vars(app)
+        expected_design = _aedt_design_name(app_state.get("_design_name", ""))
+        if not expected_design:
+            expected_design = _aedt_design_name(
+                getattr(design, "design_name", "")
+            )
         if not expected_design:
             raise RuntimeError("pooled SolutionData design identity is unavailable")
+
+        native_project = self._refresh_native_project_handle()
         native_design = _find_raw_design(native_project, expected_design)
+        native_design_type = str(native_design.GetDesignType() or "").strip()
+        native_solution_type = str(native_design.GetSolutionType() or "").strip()
+        if native_design_type != "Maxwell 3D" or not native_solution_type:
+            raise _AedtIdentityMismatch(
+                "pooled PyAEDT design physics mismatch: "
+                f"type={native_design_type!r}, solution={native_solution_type!r}"
+            )
+
+        project_wrapper = getattr(self, "project", None)
+        try:
+            project_state = vars(project_wrapper)
+        except TypeError:
+            project_state = {}
+        desktop_wrapper = (
+            project_state.get("desktop")
+            or getattr(self, "desktop", None)
+            or getattr(app, "_desktop_class", None)
+        )
+        if desktop_wrapper is None or getattr(
+                desktop_wrapper, "odesktop", None) is None:
+            raise RuntimeError("pooled PyAEDT Desktop binding is unavailable")
+
+        # PyAEDT's supported set_active_design path reconstructs the complete
+        # application.  In a pooled process that reconstruction re-enters
+        # Desktop and can recreate the gRPC application, invalidating every
+        # existing child proxy.  Reinitialize only AedtObjects instead: this is
+        # the same cache reset PyAEDT uses after duplicating a design, but it is
+        # bound here from exact, read-only native identity/physics readbacks.
+        from ansys.aedt.core.application.aedt_objects import AedtObjects
+        from ansys.aedt.core.application.design_solutions import DesignSolution
+        from ansys.aedt.core.application.variables import VariableManager
+
+        app._desktop_class = desktop_wrapper
+        app._desktop = desktop_wrapper.odesktop
+        AedtObjects.__init__(
+            app,
+            desktop_wrapper,
+            native_project,
+            native_design,
+            is_inherithed=True,
+        )
+
+        # These lazy objects sit above AedtObjects and retain native modules,
+        # editor/modeler proxies, object inventories, or variation/setup state.
+        # Recreate them lazily against the attested handles.  VariableManager is
+        # the exception: its property is not lazy, so install a fresh manager.
+        app._design_dictionary = None
+        app._project_dictionary = {}
+        app._mttime = None
+        app._boundaries = {}
+        app._project_datasets = []
+        app._design_datasets = []
+        app._excitation_objects = {}
+        app._setup = None
+        app._materials = None
+        app._available_variations = None
+        app._setups = []
+        app._parametrics = []
+        app._optimizations = []
+        app._native_components = []
+        app._modeler = None
+        app._post = None
+        app._mesh = None
+        app._variable_manager = VariableManager(app)
+
+        # Never use either solution-type setter here: both can issue native
+        # SetSolutionType and would violate the physics-neutral rebind contract.
+        app._design_name = expected_design
+        app._design_type = native_design_type
+        app._temp_solution_type = native_solution_type
+        design_solutions = DesignSolution(
+            native_design,
+            native_design_type,
+            str(getattr(app, "_aedt_version", "") or ""),
+        )
+        design_solutions._solution_type = native_solution_type
+        app.design_solutions = design_solutions
+
+        for logger in {
+                id(item): item for item in (
+                    getattr(app, "_logger", None),
+                    getattr(app, "_global_logger", None),
+                ) if item is not None
+        }.values():
+            logger.oproject = native_project
+            logger.odesign = native_design
 
         # PyAEDT owns project caches separate from pyProject.  Its save_project
         # clears both, and pooled gRPC oProject.GetPath() cannot repopulate the
         # path.  Seed the attested name first because the project_name getter
         # clears _project_path while filling an empty name cache.
-        app._oproject = native_project
-        app._odesign = native_design
-        app._design_name = expected_design
-        design_solutions = getattr(app, "design_solutions", None)
-        if design_solutions is not None:
-            design_solutions._odesign = native_design
-        # ReportSetup is design-scoped and may have been cached before a save.
-        app._oreportsetup = None
         app._project_name = expected_project
         app._project_path = os.path.abspath(project_path)
+        self._fields_reporter_project = native_project
+
+        rebound_design_type = str(getattr(app, "design_type", "") or "")
+        rebound_solution_type = str(getattr(app, "solution_type", "") or "")
+        if (
+                rebound_design_type != native_design_type
+                or rebound_solution_type != native_solution_type):
+            raise _AedtIdentityMismatch(
+                "pooled PyAEDT cache readback mismatch: "
+                f"native=({native_design_type!r}, {native_solution_type!r}), "
+                f"app=({rebound_design_type!r}, {rebound_solution_type!r})"
+            )
         return app
 
     def _solution_data_frame(self, expressions, aliases=None, target_units=None,
@@ -3644,9 +3738,54 @@ class Simulation():
         raise RuntimeError(message)
 
     def _refresh_native_project_handle(self):
-        """Rebind standalone through Desktop; reuse the bound handle pooled."""
+        """Return a fresh exact-project handle without cross-project activation."""
         if self._backend_mode() == "pooled":
-            return self._verified_native_project_handle()
+            expected_project = str(
+                getattr(self, "PROJECT_NAME", "") or ""
+            ).strip()
+            if not expected_project:
+                raise RuntimeError("native pooled project identity is unavailable")
+
+            # A PyAEDT Desktop reconnect replaces its gRPC application object.
+            # Child oProject proxies keep the old immutable object ID, so a
+            # successful GetName on a cached proxy is not sufficient proof that
+            # Save/design-module calls are still usable.  GetProjects is
+            # read-only and returns children of the current Desktop application;
+            # unlike SetActiveProject it does not alter shared Desktop state.
+            odesktop = self._native_desktop_handle()
+            get_projects = getattr(odesktop, "GetProjects", None)
+            if not callable(get_projects):
+                raise RuntimeError("native pooled Desktop cannot enumerate projects")
+            matches = []
+            project_errors = []
+            for index, candidate in enumerate(get_projects() or []):
+                try:
+                    candidate_name = str(candidate.GetName() or "").strip()
+                except Exception as error:
+                    project_errors.append(
+                        f"project[{index}]={type(error).__name__}: {error}"
+                    )
+                    continue
+                if candidate_name == expected_project:
+                    matches.append(candidate)
+            if len(matches) != 1:
+                detail = f"; errors={project_errors}" if project_errors else ""
+                raise RuntimeError(
+                    "expected one live pooled AEDT project named "
+                    f"{expected_project!r}, found {len(matches)}{detail}"
+                )
+            native_project = matches[0]
+
+            project_wrapper = getattr(self, "project", None)
+            try:
+                project_state = vars(project_wrapper)
+            except TypeError:
+                project_state = {}
+            if not project_state:
+                raise RuntimeError("pooled project wrapper cache is unavailable")
+            project_state["project"] = native_project
+            project_state["proj"] = native_project
+            return native_project
 
         project_wrapper = getattr(self, "project", None)
         try:
@@ -3812,6 +3951,10 @@ class Simulation():
         export_path = None
         self.extraction_attempts["matrix"] = self.extraction_attempts.get("matrix", 0) + 1
         try:
+            # export_rl_matrix validates cached app design/solution state before
+            # it asks AEDT for any matrix data, so pooled hydration must precede
+            # the export rather than live only in the SolutionData fallback.
+            self._prepare_pooled_solution_data_app()
             fd, export_path = tempfile.mkstemp(prefix="mft_rl_", suffix=".txt")
             os.close(fd)
             os.remove(export_path)
@@ -5673,6 +5816,56 @@ class Simulation():
             ) + (time.monotonic() - save_started)
 
         errors = []
+        if self._backend_mode() == "pooled":
+            try:
+                self._prepare_pooled_solution_data_app()
+            except Exception as error:
+                errors.append(
+                    f"initial-rehydrate={type(error).__name__}: {error}"
+                )
+            if not errors:
+                try:
+                    result = self.design1.save_project()
+                    if result is False:
+                        raise RuntimeError("wrapper save_project returned False")
+                except Exception as error:
+                    errors.append(f"wrapper[1]={type(error).__name__}: {error}")
+                    logging.warning(
+                        "pooled wrapper save failed; rehydrating the exact "
+                        f"project/design and retrying once: {error}"
+                    )
+                else:
+                    try:
+                        # PyAEDT clears its project name/path after Save. Restore
+                        # those caches and refresh children before returning.
+                        self._prepare_pooled_solution_data_app()
+                    except Exception as error:
+                        errors.append(
+                            f"post-save-rehydrate={type(error).__name__}: {error}"
+                        )
+                    else:
+                        _record_save_timing()
+                        return True
+
+            if errors and errors[-1].startswith("wrapper[1]="):
+                try:
+                    self._prepare_pooled_solution_data_app()
+                    result = self.design1.save_project()
+                    if result is False:
+                        raise RuntimeError("wrapper save_project returned False")
+                    self._prepare_pooled_solution_data_app()
+                except Exception as error:
+                    errors.append(f"wrapper[2]={type(error).__name__}: {error}")
+                else:
+                    _record_save_timing()
+                    return True
+
+            message = "Failed to save pooled project: " + "; ".join(errors)
+            _record_save_timing()
+            # A pooled client cannot safely continue with an unsaved project or
+            # an app that could not be rehydrated, even at non-strict call sites.
+            raise RuntimeError(message)
+
         try:
             result = self.design1.save_project()
             if result is False:
