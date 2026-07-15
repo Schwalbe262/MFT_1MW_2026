@@ -32,6 +32,7 @@ DEFAULT_THRESHOLDS = HERE / "model_quality_thresholds.json"
 DEFAULT_QUALITY_CONTRACT = REGRESSION_ROOT / "quality_contract.py"
 DEFAULT_MODEL_TARGETS = REGRESSION_ROOT / "model_targets.py"
 CONTRACT_SCHEMA_VERSION = 2
+TUNED_CONTRACT_SCHEMA_VERSION = 3
 DEFAULT_KEY_LENGTH = 16
 
 
@@ -101,6 +102,7 @@ def checkpoint_contract_identity(
     model_targets: str | Path = DEFAULT_MODEL_TARGETS,
     *,
     solver_revision: str | None = None,
+    params: str | Path | None = None,
     key_length: int = DEFAULT_KEY_LENGTH,
 ) -> dict:
     """Return stable content hashes plus a compact directory-safe key."""
@@ -116,10 +118,10 @@ def checkpoint_contract_identity(
             solver_revision
         ),
     }
-    payload = {
-        "schema_version": CONTRACT_SCHEMA_VERSION,
-        **components,
-    }
+    payload = {"schema_version": CONTRACT_SCHEMA_VERSION, **components}
+    if params is not None:
+        payload["schema_version"] = TUNED_CONTRACT_SCHEMA_VERSION
+        payload["params_sha256"] = _canonical_json_sha256(params)
     digest = hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")).hexdigest()
@@ -137,6 +139,7 @@ def main() -> None:
     parser.add_argument("--quality-contract", default=str(DEFAULT_QUALITY_CONTRACT))
     parser.add_argument("--model-targets", default=str(DEFAULT_MODEL_TARGETS))
     parser.add_argument("--solver-revision", default=None)
+    parser.add_argument("--params", default=None)
     parser.add_argument("--key-length", type=int, default=DEFAULT_KEY_LENGTH)
     parser.add_argument(
         "--json", action="store_true",
@@ -149,6 +152,7 @@ def main() -> None:
         args.quality_contract,
         args.model_targets,
         solver_revision=args.solver_revision,
+        params=args.params,
         key_length=args.key_length,
     )
     if args.json:

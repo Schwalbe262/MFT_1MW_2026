@@ -9,6 +9,7 @@ NSGA-2 멀티 재시작 드라이버.
   python run_nsga2.py --restarts 16 --round 1
 """
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -162,10 +163,88 @@ def run_one(problem, seed, pop, warm_X=None, max_gen=600):
     return res
 
 
+def _run_one_arrays(problem, seed, pop, warm_X, max_gen):
+    """Process-pool boundary that returns only compact, pickle-safe evidence."""
+    result = run_one(
+        problem, seed=seed, pop=pop, warm_X=warm_X, max_gen=max_gen
+    )
+    return (
+        result.X,
+        result.F,
+        int(result.algorithm.n_gen),
+    )
+
+
+def run_restarts(
+    problem, restarts, pop, warm_X=None, workers=4, max_gen=600,
+    executor_factory=ProcessPoolExecutor,
+):
+    """Run deterministic restart seeds concurrently and return seed order.
+
+    Four processes is the production ceiling.  Returning results in restart
+    order keeps the merged Pareto and manifest deterministic even though
+    futures finish out of order.
+    """
+    restarts = int(restarts)
+    workers = int(workers)
+    if restarts < 1:
+        raise ValueError("NSGA restarts must be positive")
+    if not 1 <= workers <= 4:
+        raise ValueError("NSGA workers must be between 1 and 4")
+    workers = min(workers, restarts)
+    if workers == 1:
+        return [
+            _run_one_arrays(problem, 1000 + index, pop, warm_X, max_gen)
+            for index in range(restarts)
+        ]
+    ordered = {}
+    with executor_factory(max_workers=workers) as executor:
+        pending = {
+            executor.submit(
+                _run_one_arrays,
+                problem,
+                1000 + index,
+                pop,
+                warm_X,
+                max_gen,
+            ): index
+            for index in range(restarts)
+        }
+        for future in as_completed(pending):
+            index = pending[future]
+            ordered[index] = future.result()
+    return [ordered[index] for index in range(restarts)]
+
+
+def _completed_output_is_valid(out_dir):
+    marker_path = os.path.join(out_dir, "COMPLETED")
+    manifest_path = os.path.join(out_dir, "optimization_manifest.json")
+    if not os.path.isfile(marker_path):
+        return False
+    try:
+        marker = json.load(open(marker_path, encoding="utf-8"))
+        manifest = json.load(open(manifest_path, encoding="utf-8"))
+        return (
+            marker.get("optimization_manifest_sha256") == _sha256(manifest_path)
+            and manifest.get("pareto_front_sha256")
+            == _sha256(os.path.join(out_dir, "pareto_front.csv"))
+            and manifest.get("pareto_X_sha256")
+            == _sha256(os.path.join(out_dir, "pareto_X.npy"))
+            and manifest.get("pareto_F_sha256")
+            == _sha256(os.path.join(out_dir, "pareto_F.npy"))
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--restarts", type=int, default=16)
     ap.add_argument("--pop", type=int, default=200)
+    ap.add_argument(
+        "--workers", type=int, default=4,
+        help="parallel restart processes (production maximum: 4)",
+    )
     ap.add_argument("--round", type=int, default=0, help="AL 라운드 번호 (출력 디렉토리)")
     ap.add_argument("--dataset", default=os.path.join(HERE, "..", "data", "dataset", "train.parquet"))
     ap.add_argument("--registry", default=os.path.join(HERE, "..", "training", "registry"))
@@ -180,8 +259,18 @@ def main():
     ap.add_argument("--no-density-gate", action="store_true")
     args = ap.parse_args()
 
+    if args.restarts < 1 or args.pop < 2:
+        ap.error("restarts must be positive and population must be at least 2")
+    if not 1 <= args.workers <= 4:
+        ap.error("workers must be between 1 and 4")
+
     out_dir = os.path.join(args.output_root, f"round_{args.round:02d}")
     os.makedirs(out_dir, exist_ok=True)
+    if os.path.isfile(os.path.join(out_dir, "COMPLETED")):
+        if _completed_output_is_valid(out_dir):
+            print(f"optimization generation already complete: {out_dir}")
+            return
+        raise SystemExit("completed optimization output failed authentication")
 
     vetted_thresholds_sha256 = _sha256(VETTED_QUALITY_THRESHOLDS)
     if _sha256(args.quality_thresholds) != vetted_thresholds_sha256:
@@ -277,18 +366,24 @@ def main():
         print(f"warm start: {len(warm)} points from round {args.round - 1}")
 
     F_list, X_list, feasible_counts = [], [], []
-    for r in range(args.restarts):
-        res = run_one(problem, seed=1000 + r, pop=args.pop, warm_X=warm)
-        if res.X is None:
+    restart_results = run_restarts(
+        problem,
+        args.restarts,
+        args.pop,
+        warm_X=warm,
+        workers=args.workers,
+    )
+    for r, (result_x, result_f, generations) in enumerate(restart_results):
+        if result_x is None:
             feasible_counts.append(0)
             continue
-        X = np.atleast_2d(res.X)
-        F = np.atleast_2d(res.F)
+        X = np.atleast_2d(result_x)
+        F = np.atleast_2d(result_f)
         X_list.append(X)
         F_list.append(F)
         feasible_counts.append(len(X))
         print(f"restart {r}: {len(X)} pareto pts, vol {F[:,0].min():.0f}-{F[:,0].max():.0f}L, "
-              f"loss {F[:,1].min():.0f}-{F[:,1].max():.0f}W, gen {res.algorithm.n_gen}")
+              f"loss {F[:,1].min():.0f}-{F[:,1].max():.0f}W, gen {generations}")
 
     if not X_list:
         raise SystemExit("모든 재시작에서 feasible 해 없음 - 제약 조임/데이터 커버리지 점검 필요")
@@ -361,7 +456,8 @@ def main():
     }
 
     sobol_schema, sobol_schema_sha256 = _sobol_schema()
-    with open(os.path.join(out_dir, "optimization_manifest.json"), "w", encoding="utf-8") as handle:
+    manifest_path = os.path.join(out_dir, "optimization_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump({
             "training_run_id": quality.get("training_run_id"),
             "dataset_sha256": quality.get("dataset_sha256"),
@@ -390,6 +486,7 @@ def main():
             "required_models": REQUIRED_MODEL_TARGETS,
             "restarts": args.restarts,
             "population": args.pop,
+            "workers": min(args.workers, args.restarts),
             "round": args.round,
             "seeds": [1000 + index for index in range(args.restarts)],
             "termination": {
@@ -411,6 +508,18 @@ def main():
                 "excluded; exact-as-FEA geometry is assumed"
             ),
         }, handle, indent=1)
+
+    # This is the commit marker consumed by generation workers.  It is always
+    # written after arrays, CSV, and the complete provenance manifest.
+    completed_path = os.path.join(out_dir, "COMPLETED")
+    staged_completed = completed_path + f".{os.getpid()}.tmp"
+    with open(staged_completed, "w", encoding="utf-8") as handle:
+        json.dump({
+            "optimization_manifest_sha256": _sha256(manifest_path),
+        }, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(staged_completed, completed_path)
 
     print(f"\nmerged Pareto: {len(Xp)} pts -> {out_dir}")
     print(f"volume {Fp[:,0].min():.0f}~{Fp[:,0].max():.0f} L | loss {Fp[:,1].min():.0f}~{Fp[:,1].max():.0f} W")

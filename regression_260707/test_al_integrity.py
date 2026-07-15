@@ -1659,7 +1659,8 @@ class ActiveLearningGateTests(unittest.TestCase):
         self.assertTrue(history["verification_rows_complete"])
         self.assertEqual(history["fea_full_spec_pass"], 3)
         self.assertEqual(state["stage"], "TRAIN")
-        self.assertTrue(state["post_convergence_retrain_done"])
+        self.assertTrue(state["post_convergence_retrain_pending"])
+        self.assertFalse(state.get("post_convergence_retrain_done", False))
         self.assertEqual(state["round"], 2)
 
     def test_hard_cap_is_not_reported_as_verified_done(self):

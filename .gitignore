@@ -65,6 +65,7 @@ regression_260707/training/*.gen-*.json
 regression_260707/training/checkpoint_runs/
 regression_260707/training/archive/
 regression_260707/logs/
+regression_260707/pipeline_runtime/
 *.json.tmp
 *.tmp.tmp
 simulation_num.txt

@@ -685,10 +685,23 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             "training_run_id": run_id,
             "dataset_path": args.dataset,
             "dataset_sha256": dataset_sha256,
+            "source_dataset_path": getattr(
+                args, "source_dataset_path", None
+            ) or args.dataset,
+            "source_dataset_sha256": _sha256(
+                getattr(args, "source_dataset_path", None) or args.dataset
+            ),
+            "source_dataset_generation": getattr(
+                args, "source_dataset_generation", None
+            ),
             "raw_rows": int(len(frame)),
             "strict_full_rows": strict_count,
             "profile_path": args.profile,
             "profile_sha256": profile_sha256,
+            "params_path": getattr(args, "params", None),
+            "params_sha256": (
+                _sha256(args.params) if getattr(args, "params", None) else None
+            ),
             "features": list(features),
             "targets": list(targets),
             "target_physics_data_revision_cohorts": target_revision_cohorts,
@@ -731,6 +744,8 @@ def main():
     parser.add_argument("--dataset", default=DATASET)
     parser.add_argument("--targets", nargs="*", default=None)
     parser.add_argument("--params", default=None)
+    parser.add_argument("--source-dataset-path", default=None)
+    parser.add_argument("--source-dataset-generation", default=None)
     parser.add_argument("--weight-col", default="sample_weight")
     parser.add_argument("--min-rows", type=int, default=200)
     parser.add_argument("--registry", default=REGISTRY)
@@ -745,6 +760,10 @@ def main():
     args.registry = os.path.abspath(args.registry)
     args.profile = os.path.abspath(args.profile) if args.profile else None
     args.params = os.path.abspath(args.params) if args.params else None
+    args.source_dataset_path = (
+        os.path.abspath(args.source_dataset_path)
+        if args.source_dataset_path else args.dataset
+    )
     args.result_json = (
         os.path.abspath(args.result_json) if args.result_json else None
     )

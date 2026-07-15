@@ -34,6 +34,7 @@ from training.model_quality_gate import evaluate_generation  # noqa: E402
 import training.train_models as train_models  # noqa: E402
 from training.predictor import EnsemblePredictor  # noqa: E402
 from monitoring.readers import ArtifactService  # noqa: E402
+from pipeline.artifacts import GenerationStore  # noqa: E402
 import al_driver  # noqa: E402
 from module.core_material_contract import (  # noqa: E402
     PHYSICS_DATA_REVISION,
@@ -57,6 +58,11 @@ def _candidate(root, run_id="candidate", registry=None):
     dataset = root / f"snapshot-{run_id}.parquet"
     dataset.write_bytes(f"stable-{run_id}".encode("utf-8"))
     dataset_sha256 = _sha256(dataset)
+    source = GenerationStore(root / "pipeline_generations").publish_files(
+        "dataset", {"train.parquet": dataset}
+    )
+    source_dataset = source.path / "train.parquet"
+    source_identity = f"dataset:{source.generation_id}"
     generation = registry / "generations" / run_id
     target_dir = generation / "Llt_phys"
     target_dir.mkdir(parents=True)
@@ -74,6 +80,9 @@ def _candidate(root, run_id="candidate", registry=None):
         "metrics": metrics,
         "training_run_id": run_id,
         "dataset_sha256": dataset_sha256,
+        "source_dataset_path": str(source_dataset),
+        "source_dataset_sha256": _sha256(source_dataset),
+        "source_dataset_generation": source_identity,
     }
     with open(target_dir / "models.pkl", "wb") as handle:
         pickle.dump(bundle, handle)
@@ -83,6 +92,9 @@ def _candidate(root, run_id="candidate", registry=None):
         "schema_version": 2,
         "training_run_id": run_id,
         "dataset_sha256": dataset_sha256,
+        "source_dataset_path": str(source_dataset),
+        "source_dataset_sha256": _sha256(source_dataset),
+        "source_dataset_generation": source_identity,
         "profile_sha256": "profile-sha",
         "strict_full_rows": 3000,
         "features": ["N1_main"],
@@ -105,6 +117,11 @@ def _candidate(root, run_id="candidate", registry=None):
     quality = evaluate_generation(
         str(registry), str(generation), str(dataset), thresholds
     )
+    quality.update({
+        "source_dataset_path": str(source_dataset),
+        "source_dataset_sha256": _sha256(source_dataset),
+        "source_dataset_generation": source_identity,
+    })
     if not quality["passed"]:
         raise AssertionError(quality["reasons"])
     return {
@@ -114,6 +131,9 @@ def _candidate(root, run_id="candidate", registry=None):
         "relative": f"generations/{run_id}",
         "quality": quality,
         "thresholds": thresholds,
+        "source_dataset": str(source_dataset),
+        "source_dataset_sha256": _sha256(source_dataset),
+        "source_dataset_generation": source_identity,
     }
 
 
@@ -774,6 +794,13 @@ class ActiveLearningPinTests(unittest.TestCase):
                 "training_generation": candidate["generation"],
                 "model_quality_snapshot_path": str(quality_path),
                 "training_strict_full_rows": 3000,
+                "training_source_dataset": candidate["source_dataset"],
+                "training_source_dataset_sha256": candidate[
+                    "source_dataset_sha256"
+                ],
+                "training_source_dataset_generation": candidate[
+                    "source_dataset_generation"
+                ],
             }
             original_snapshot = Path(candidate["dataset"]).read_bytes()
             model_path = Path(candidate["generation"], "Llt_phys", "models.pkl")
