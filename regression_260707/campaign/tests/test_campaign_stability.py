@@ -777,7 +777,10 @@ class CollectorFetchTests(unittest.TestCase):
             state_path.write_text(
                 json.dumps({"outstanding": [99]}), encoding="utf-8")
 
-            def get_json(path, **_kwargs):
+            calls = []
+
+            def get_json(path, **kwargs):
+                calls.append((path, kwargs))
                 if path == "/api/tasks":
                     return {"tasks": []}
                 if path == "/api/tasks/99":
@@ -794,6 +797,19 @@ class CollectorFetchTests(unittest.TestCase):
                 tasks = collect_wave.list_tasks("mft-camp")
 
         self.assertEqual(tasks, [task])
+        self.assertEqual(
+            calls[0],
+            (
+                "/api/tasks",
+                {
+                    "params": {
+                        "limit": collect_wave.TASK_LIST_LIMIT,
+                        "name_prefix": "mft-camp",
+                    },
+                    "timeout": 30,
+                },
+            ),
+        )
 
 
 class CollectorDatasetTests(unittest.TestCase):

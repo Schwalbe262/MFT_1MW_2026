@@ -48,6 +48,7 @@ else:  # Direct execution: python campaign/collect_wave.py
     from model_targets import CORE_REGION_TEMPERATURE_TARGETS
 
 SCHEDULER = "http://127.0.0.1:8000"
+TASK_LIST_LIMIT = 200
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(HERE, "..", "data", "dataset")
 LOCAL_RESULTS_CSV = os.path.join(HERE, "..", "..", "simulation_results_260706.csv")
@@ -149,8 +150,13 @@ def fetch_stdout(task_id, timeout=30):
 
 def list_tasks(prefix):
     # 신 스케줄러(limit/name_prefix 지원) 우선
+    # A 10k response takes longer than the 30 s client timeout on the live
+    # scheduler.  The durable feeder ledger below recovers every task outside
+    # this bounded recent window, so a smaller page reduces latency without
+    # dropping outstanding campaign work.
     t = _get_json("/api/tasks",
-                  params={"limit": 10000, "name_prefix": prefix}, timeout=30)
+                  params={"limit": TASK_LIST_LIMIT,
+                          "name_prefix": prefix}, timeout=30)
     tasks = t if isinstance(t, list) else t.get("tasks", [])
     matched = [x for x in tasks if str(x.get("name", "")).startswith(prefix)]
     page_seen = {x["id"]: x for x in matched}
