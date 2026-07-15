@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -234,6 +235,115 @@ class ElectrostaticStageMockTests(unittest.TestCase):
             axis=1,
         )
         self.assertTrue(combined.columns.is_unique)
+
+    def test_pooled_export_retries_in_exact_shared_results_root(self):
+        exported_paths = []
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "lease-workspace"
+            project_name = "mft-pooled-cap"
+            project_path = workspace / project_name
+            project_path.mkdir(parents=True)
+
+            def export_c_matrix(**kwargs):
+                output_path = Path(kwargs["output_file"])
+                exported_paths.append(output_path)
+                if len(exported_paths) == 1:
+                    return False
+                output_path.write_text(CAP_MATRIX_EXPORT, encoding="utf-8")
+                return True
+
+            simulation = Simulation.__new__(Simulation)
+            simulation.aedt_backend = "pooled"
+            simulation.aedt_lease = SimpleNamespace(
+                workspace_path=str(workspace)
+            )
+            simulation.PROJECT_NAME = project_name
+            simulation.project_path = str(project_path)
+            simulation.design1 = SimpleNamespace(
+                export_c_matrix=Mock(side_effect=export_c_matrix)
+            )
+            simulation.df1 = pd.DataFrame([{
+                "Ltx": 100.0,
+                "Lrx": 400.0,
+                "Llt": 10.0,
+            }])
+            simulation.full_model = False
+            simulation.extraction_attempts = {}
+            simulation.extraction_backends = {}
+            simulation.extraction_units = {}
+            simulation._prepare_pooled_solution_data_app = Mock()
+
+            with patch("run_simulation_260706.time.sleep") as sleep:
+                result = simulation.get_capacitance_parameter(
+                    max_attempts=2, retry_delay=0.0
+                )
+
+            results_root = (
+                project_path / f"{project_name}.aedtresults"
+            ).resolve()
+            self.assertEqual(len(exported_paths), 2)
+            self.assertEqual(
+                {path.resolve().parent for path in exported_paths},
+                {results_root},
+            )
+            self.assertTrue(all(
+                path.name.startswith("mft_cap_export_")
+                and path.suffix == ".txt"
+                for path in exported_paths
+            ))
+            self.assertEqual(len(set(exported_paths)), 2)
+            self.assertTrue(all(not path.exists() for path in exported_paths))
+            self.assertAlmostEqual(result["C_tx_tx_F"].iloc[0], 80e-12)
+            self.assertEqual(
+                simulation.extraction_backends["cap"], "export_c_matrix"
+            )
+            sleep.assert_called_once_with(0.0)
+
+    def test_pooled_export_rejects_non_regular_output_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "lease-workspace"
+            project_name = "mft-pooled-cap"
+            project_path = workspace / project_name
+            project_path.mkdir(parents=True)
+            exported_paths = []
+
+            def export_c_matrix(**kwargs):
+                output_path = Path(kwargs["output_file"])
+                exported_paths.append(output_path)
+                output_path.mkdir()
+                return True
+
+            simulation = Simulation.__new__(Simulation)
+            simulation.aedt_backend = "pooled"
+            simulation.aedt_lease = SimpleNamespace(
+                workspace_path=str(workspace)
+            )
+            simulation.PROJECT_NAME = project_name
+            simulation.project_path = str(project_path)
+            simulation.design1 = SimpleNamespace(
+                export_c_matrix=Mock(side_effect=export_c_matrix)
+            )
+            simulation.df1 = pd.DataFrame([{
+                "Ltx": 100.0,
+                "Lrx": 400.0,
+                "Llt": 10.0,
+            }])
+            simulation.full_model = False
+            simulation.extraction_attempts = {}
+            simulation.extraction_backends = {}
+            simulation.extraction_units = {}
+            simulation._prepare_pooled_solution_data_app = Mock()
+
+            with self.assertRaisesRegex(
+                    RuntimeError, "not a plain file"):
+                simulation.get_capacitance_parameter(
+                    max_attempts=1, retry_delay=0.0
+                )
+
+            self.assertEqual(len(exported_paths), 1)
+            self.assertTrue(exported_paths[0].is_dir())
+            self.assertNotIn("cap", simulation.extraction_backends)
 
 
 if __name__ == "__main__":

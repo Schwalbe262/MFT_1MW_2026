@@ -2200,6 +2200,161 @@ class Simulation():
                 )
         return target
 
+    def _new_aedt_export_target(self, stage):
+        """Return an AEDT-visible export target plus its attested provenance.
+
+        ``ExportSolnData`` runs inside the AEDT process, not inside this Python
+        client.  In a pooled session the two processes can be on different
+        nodes, so a client-local ``/tmp`` path is not a shared namespace.  Put
+        pooled exports below this lease's world-writable ``.aedtresults`` root
+        and remember the root inode so a replaced directory is never trusted.
+        """
+
+        stage_component = self._shared_aedt_path_component(
+            stage, "export stage"
+        )
+        if self._backend_mode() == "pooled":
+            parent = self._ensure_pooled_shared_results_directory()
+            parent = os.path.abspath(parent)
+            metadata = self._shared_aedt_plain_directory(
+                parent, "export directory"
+            )
+            filename = (
+                f"mft_{stage_component}_export_{uuid.uuid4().hex}.txt"
+            )
+            target = os.path.join(parent, filename)
+            if os.path.lexists(target):
+                raise RuntimeError(
+                    f"pooled AEDT export target already exists: {target}"
+                )
+            return target, {
+                "transport": "pooled_shared_results",
+                "parent": parent,
+                "parent_identity": (metadata.st_dev, metadata.st_ino),
+            }
+
+        fd, target = tempfile.mkstemp(
+            prefix=f"mft_{stage_component}_", suffix=".txt"
+        )
+        os.close(fd)
+        os.remove(target)
+        return target, {
+            "transport": "client_local_tmp",
+            "parent": os.path.dirname(os.path.abspath(target)),
+            "parent_identity": None,
+        }
+
+    def _read_attested_aedt_export(
+            self, target, provenance, started, stage):
+        """Read one fresh regular export without accepting path substitution."""
+
+        transport = str(provenance.get("transport", "") or "")
+        parent = os.path.abspath(str(provenance.get("parent", "") or ""))
+        target = os.path.abspath(target)
+        if os.path.dirname(target) != parent:
+            raise RuntimeError(
+                f"{stage} export target escaped its attested directory"
+            )
+
+        expected_parent = provenance.get("parent_identity")
+        if expected_parent is not None:
+            parent_metadata = self._shared_aedt_plain_directory(
+                parent, "export directory"
+            )
+            if (
+                    parent_metadata.st_dev,
+                    parent_metadata.st_ino) != tuple(expected_parent):
+                raise RuntimeError(
+                    f"{stage} export directory changed during AEDT call"
+                )
+
+        try:
+            metadata = os.lstat(target)
+        except OSError as error:
+            raise RuntimeError(
+                f"{stage} export target is missing after AEDT call "
+                f"(transport={transport})"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(
+                f"{stage} export target is not a plain file "
+                f"(transport={transport})"
+            )
+        if metadata.st_nlink != 1:
+            raise RuntimeError(
+                f"{stage} export target has an unsafe link count "
+                f"(transport={transport}, links={metadata.st_nlink})"
+            )
+        if metadata.st_size <= 0:
+            raise RuntimeError(
+                f"{stage} export target is empty "
+                f"(transport={transport})"
+            )
+        if metadata.st_mtime < float(started) - 2:
+            raise RuntimeError(
+                f"{stage} export target is stale "
+                f"(transport={transport})"
+            )
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags)
+        try:
+            opened_metadata = os.fstat(descriptor)
+            if (
+                    opened_metadata.st_dev != metadata.st_dev
+                    or opened_metadata.st_ino != metadata.st_ino
+                    or not stat.S_ISREG(opened_metadata.st_mode)):
+                raise RuntimeError(
+                    f"{stage} export target changed before read "
+                    f"(transport={transport})"
+                )
+            with os.fdopen(descriptor, "r", encoding="utf-8", errors="strict") as stream:
+                descriptor = None
+                text = stream.read()
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if not text:
+            raise RuntimeError(
+                f"{stage} export target decoded as empty "
+                f"(transport={transport})"
+            )
+        return text
+
+    def _remove_attested_aedt_export(self, target, provenance, stage):
+        """Remove only the regular export file created in the attested scope."""
+
+        if not target or not os.path.lexists(target):
+            return
+        parent = os.path.abspath(str(provenance.get("parent", "") or ""))
+        target = os.path.abspath(target)
+        try:
+            if os.path.dirname(target) != parent:
+                raise RuntimeError("target escaped its attested directory")
+            expected_parent = provenance.get("parent_identity")
+            if expected_parent is not None:
+                parent_metadata = self._shared_aedt_plain_directory(
+                    parent, "export directory"
+                )
+                if (
+                        parent_metadata.st_dev,
+                        parent_metadata.st_ino) != tuple(expected_parent):
+                    raise RuntimeError("export directory identity changed")
+            metadata = os.lstat(target)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("target is not a plain file")
+            os.unlink(target)
+        except OSError as error:
+            logging.warning(
+                "[%s] failed to remove attested AEDT export: %s", stage, error
+            )
+        except RuntimeError as error:
+            logging.error(
+                "[%s] refusing unsafe AEDT export cleanup: %s", stage, error
+            )
+
     def _create_project_locked(self):
 
         simulation_dir = "./simulation"
@@ -4268,6 +4423,7 @@ class Simulation():
         last_error = None
         for attempt in range(1, max(1, int(max_attempts)) + 1):
             export_path = None
+            export_provenance = None
             self.extraction_attempts["cap"] = (
                 self.extraction_attempts.get("cap", 0) + 1
             )
@@ -4277,11 +4433,9 @@ class Simulation():
                 # Rehydrate the PyAEDT app from this lease's exact project and
                 # design before asking the high-level C-matrix exporter.
                 self._prepare_pooled_solution_data_app()
-                fd, export_path = tempfile.mkstemp(
-                    prefix="mft_cap_", suffix=".txt"
+                export_path, export_provenance = (
+                    self._new_aedt_export_target("cap")
                 )
-                os.close(fd)
-                os.remove(export_path)
                 started = time.time()
                 exported = self.design1.export_c_matrix(
                     matrix_name="CapMatrix",
@@ -4292,20 +4446,13 @@ class Simulation():
                 )
                 if exported is False:
                     raise RuntimeError("export_c_matrix returned False")
-                if (
-                        not os.path.isfile(export_path)
-                        or os.path.getsize(export_path) <= 0):
-                    raise RuntimeError(
-                        "export_c_matrix did not create a non-empty file"
-                    )
-                if os.path.getmtime(export_path) < started - 2:
-                    raise RuntimeError("export_c_matrix returned a stale file")
-                with open(
-                        export_path, encoding="utf-8", errors="strict"
-                ) as exported_file:
-                    parsed = parse_maxwell_capacitance_export(
-                        exported_file.read()
-                    )
+                exported_text = self._read_attested_aedt_export(
+                    export_path,
+                    export_provenance,
+                    started,
+                    "cap",
+                )
+                parsed = parse_maxwell_capacitance_export(exported_text)
                 payload = build_capacitance_payload(
                     parsed,
                     float(self.df1["Ltx"].iloc[0]),
@@ -4318,6 +4465,10 @@ class Simulation():
                 self.df_cap = pd.DataFrame([payload])
                 self.extraction_backends["cap"] = "export_c_matrix"
                 self.extraction_units["cap"] = "F"
+                logging.info(
+                    "[cap] export_c_matrix extraction transport=%s",
+                    export_provenance["transport"],
+                )
                 return self.df_cap
             except Exception as error:
                 last_error = error
@@ -4328,11 +4479,10 @@ class Simulation():
                     )
                     time.sleep(max(0.0, float(retry_delay)))
             finally:
-                if export_path and os.path.isfile(export_path):
-                    try:
-                        os.remove(export_path)
-                    except OSError:
-                        pass
+                if export_path and export_provenance:
+                    self._remove_attested_aedt_export(
+                        export_path, export_provenance, "cap"
+                    )
         raise RuntimeError(
             "[cap] capacitance extraction failed after "
             f"{max(1, int(max_attempts))} attempts: {last_error}"
