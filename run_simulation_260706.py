@@ -4261,6 +4261,25 @@ class Simulation():
                 route_errors.append(f"{route_name}={type(error).__name__}: {error}")
         raise RuntimeError("; ".join(route_errors))
 
+    def _verified_fields_reporter_project(self, native_project):
+        """Reject a pooled reporter route that is not owned by this lease."""
+        if self._backend_mode() != "pooled":
+            return native_project
+        expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        get_name = getattr(native_project, "GetName", None)
+        if not expected_project or not callable(get_name):
+            raise _AedtIdentityMismatch(
+                "FieldsReporter project identity is unavailable"
+            )
+        actual_project = str(get_name() or "").strip()
+        if actual_project != expected_project:
+            raise _AedtIdentityMismatch(
+                "FieldsReporter project identity mismatch: "
+                f"expected={expected_project!r}, "
+                f"actual={actual_project or '<empty>'!r}"
+            )
+        return native_project
+
     def _fresh_fields_reporter(self, max_attempts=3, retry_delay=2):
         """Reacquire FieldsReporter without re-running the completed EM solve."""
         last_error = None
@@ -4283,6 +4302,9 @@ class Simulation():
             candidate_errors = []
             for label, native_project in candidates:
                 try:
+                    native_project = self._verified_fields_reporter_project(
+                        native_project
+                    )
                     reporter = self._fields_reporter_from_project(
                         native_project, design_name
                     )
@@ -4295,6 +4317,9 @@ class Simulation():
 
             try:
                 refreshed_project = self._refresh_native_project_handle()
+                refreshed_project = self._verified_fields_reporter_project(
+                    refreshed_project
+                )
                 reporter = self._fields_reporter_from_project(
                     refreshed_project, design_name
                 )
@@ -4753,6 +4778,36 @@ class Simulation():
 
         return self._add_field_expression(expr_name, _build)
 
+    def _optional_core_surface_flux_expression(self):
+        """Register optional surface-flux evidence without polluting pooled AEDT.
+
+        AEDT 2025.2's gRPC FieldsReporter rejects this surface CalcOp chain in
+        the shared pooled runtime and records each rejected attempt as a Script
+        macro error.  The metric is explicitly optional: the production physics
+        gate uses independently attested Faraday and winding-linkage evidence.
+        Mark it unavailable before transport in pooled mode instead of emitting
+        three known AEDT errors or pretending the evidence exists.
+        """
+        if self._backend_mode() == "pooled":
+            return (
+                None,
+                "pooled_optional_calcop_unavailable:"
+                "center_leg_surface_flux_uses_equivalent_faraday_evidence",
+            )
+        try:
+            expression = self._calc_core_flux_integral(
+                self.design1.core_flux_sheets, "Phi_center_leg_B_normal"
+            )
+        except Exception as exc:
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            reason = f"grpc_calcop_unavailable:{detail}"
+            logging.warning(
+                "Center-leg surface-flux expression is unavailable; "
+                f"continuing loss extraction: {reason}"
+            )
+            return None, reason
+        return expression, ""
+
     @staticmethod
     def _select_explicit_turns(turns, count):
         """Select inner/outer turns once, preserving their original order."""
@@ -4847,19 +4902,9 @@ class Simulation():
                 b_expr_group[mean_expr] = group_index
                 b_expr_group[max_expr] = group_index
                 b_expr_volume[mean_expr] = volume
-        flux_expr = None
-        flux_unavailable_reason = ""
-        try:
-            flux_expr = self._calc_core_flux_integral(
-                self.design1.core_flux_sheets, "Phi_center_leg_B_normal"
-            )
-        except Exception as exc:
-            detail = " ".join(str(exc).split()) or type(exc).__name__
-            flux_unavailable_reason = f"grpc_calcop_unavailable:{detail}"
-            logging.warning(
-                "Center-leg surface-flux expression is unavailable; "
-                f"continuing loss extraction: {flux_unavailable_reason}"
-            )
+        flux_expr, flux_unavailable_reason = (
+            self._optional_core_surface_flux_expression()
+        )
         flux_section_area_retained_m2 = float("nan")
         if flux_expr is not None:
             try:
@@ -6157,6 +6202,21 @@ class Simulation():
             if target and provenance:
                 self._remove_attested_aedt_export(target, provenance, stage)
 
+    @staticmethod
+    def _pooled_stage_contract(label):
+        """Return the exact native design identity for one pooled stage."""
+        contracts = {
+            "matrix": ("Maxwell 3D", "AC Magnetic"),
+            "loss": ("Maxwell 3D", "AC Magnetic"),
+            "cap": ("Maxwell 3D", "Electrostatic"),
+        }
+        try:
+            return contracts[label]
+        except KeyError as error:
+            raise RuntimeError(
+                f"unsupported pooled solve label: {label!r}"
+            ) from error
+
     def _analyze_exact_pooled_design(
             self, label, setup_name="Setup1", *, timeout_s=None, poll_s=None,
             clock=time.monotonic, sleeper=time.sleep):
@@ -6175,15 +6235,9 @@ class Simulation():
         are excluded.
         """
 
-        contracts = {
-            "matrix": ("Maxwell 3D", "AC Magnetic"),
-            "loss": ("Maxwell 3D", "AC Magnetic"),
-            "cap": ("Maxwell 3D", "Electrostatic"),
-        }
-        try:
-            expected_design_type, expected_solution_type = contracts[label]
-        except KeyError as error:
-            raise RuntimeError(f"unsupported pooled solve label: {label!r}") from error
+        expected_design_type, expected_solution_type = (
+            self._pooled_stage_contract(label)
+        )
 
         timeout_s, poll_s = self._pooled_terminal_poll_settings(
             timeout_s=timeout_s, poll_s=poll_s
@@ -6434,7 +6488,23 @@ class Simulation():
         extraction_started = time.monotonic()
         try:
             if self._backend_mode() == "pooled":
+                expected_design_type, expected_solution_type = (
+                    self._pooled_stage_contract(label)
+                )
                 with self.aedt_automation_transaction():
+                    # A sibling can legitimately leave Desktop's active project
+                    # on its own lease while this task waits in blocking Analyze.
+                    # Re-attest and reactivate this exact project/design/setup at
+                    # the transaction boundary before any cached postprocessor,
+                    # FieldsReporter, or modeler proxy is allowed to run.
+                    self._verified_pooled_native_setup(
+                        setup_name="Setup1",
+                        expected_design_type=expected_design_type,
+                        expected_solution_type=expected_solution_type,
+                        project_refresh_max_attempts=3,
+                        project_refresh_retry_delay=0.5,
+                        activate=True,
+                    )
                     extractor()
             else:
                 extractor()

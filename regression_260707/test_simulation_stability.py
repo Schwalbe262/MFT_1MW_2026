@@ -2105,13 +2105,48 @@ class AnalyzePolicyTests(unittest.TestCase):
         simulation.solver_may_be_running = False
         simulation.design1.setup.analyze = Mock(return_value=None)
         simulation._analyze_exact_pooled_design = Mock(return_value=0.0)
+        simulation._verified_pooled_native_setup = Mock(
+            return_value=(object(), object())
+        )
         simulation.aedt_automation_transaction = lambda: nullcontext()
 
         simulation.analyze_and_extract("matrix", lambda: None)
 
         simulation._analyze_exact_pooled_design.assert_called_once_with("matrix")
+        simulation._verified_pooled_native_setup.assert_called_once_with(
+            setup_name="Setup1",
+            expected_design_type="Maxwell 3D",
+            expected_solution_type="AC Magnetic",
+            project_refresh_max_attempts=3,
+            project_refresh_retry_delay=0.5,
+            activate=True,
+        )
         simulation.design1.setup.analyze.assert_not_called()
         self.assertFalse(simulation.solver_may_be_running)
+
+    def test_pooled_extractor_preflight_failure_never_extracts_or_resolves(self):
+        simulation = self._simulation([None])
+        simulation.aedt_backend = "pooled"
+        simulation._analyze_exact_pooled_design = Mock(return_value=0.0)
+        simulation._verified_pooled_native_setup = Mock(
+            side_effect=RuntimeError("extractor project identity mismatch")
+        )
+        simulation.aedt_automation_transaction = lambda: nullcontext()
+        extractor = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "project identity mismatch"):
+            simulation.analyze_and_extract("cap", extractor)
+
+        simulation._analyze_exact_pooled_design.assert_called_once_with("cap")
+        simulation._verified_pooled_native_setup.assert_called_once_with(
+            setup_name="Setup1",
+            expected_design_type="Maxwell 3D",
+            expected_solution_type="Electrostatic",
+            project_refresh_max_attempts=3,
+            project_refresh_retry_delay=0.5,
+            activate=True,
+        )
+        extractor.assert_not_called()
 
     def test_standalone_analyze_keeps_explicit_core_contract(self):
         simulation = self._simulation([None])
@@ -3475,6 +3510,62 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
 
 
 class FieldsReporterTests(unittest.TestCase):
+    def test_pooled_reporter_rejects_sibling_project_before_design_route(self):
+        reporter = object()
+        native_design = SimpleNamespace(
+            GetName=lambda: "own-project;maxwell_loss",
+            GetModule=lambda _name: reporter,
+        )
+        sibling_set_active = Mock(
+            side_effect=AssertionError("sibling project must not be queried")
+        )
+        sibling_project = SimpleNamespace(
+            GetName=lambda: "sibling-project",
+            SetActiveDesign=sibling_set_active,
+        )
+        own_project = SimpleNamespace(
+            GetName=lambda: "own-project",
+            GetActiveDesign=lambda: native_design,
+            SetActiveDesign=Mock(
+                side_effect=AssertionError("active exact design is sufficient")
+            ),
+        )
+        simulation = Simulation.__new__(Simulation)
+        simulation.aedt_backend = "pooled"
+        simulation.PROJECT_NAME = "own-project"
+        simulation.design1 = SimpleNamespace(design_name="maxwell_loss")
+        simulation.project = SimpleNamespace(
+            project=sibling_project,
+            proj=sibling_project,
+        )
+        simulation._refresh_native_project_handle = Mock(return_value=own_project)
+
+        result = simulation._fresh_fields_reporter(
+            max_attempts=1, retry_delay=0
+        )
+
+        self.assertIs(result, reporter)
+        sibling_set_active.assert_not_called()
+        simulation._refresh_native_project_handle.assert_called_once_with()
+
+    def test_pooled_optional_surface_flux_is_explicitly_unavailable_pretransport(self):
+        simulation = Simulation.__new__(Simulation)
+        simulation.aedt_backend = "pooled"
+        simulation.design1 = SimpleNamespace(core_flux_sheets=[object()])
+        simulation._calc_core_flux_integral = Mock(
+            side_effect=AssertionError("pooled optional CalcOp must not run")
+        )
+
+        expression, reason = simulation._optional_core_surface_flux_expression()
+
+        self.assertIsNone(expression)
+        self.assertEqual(
+            reason,
+            "pooled_optional_calcop_unavailable:"
+            "center_leg_surface_flux_uses_equivalent_faraday_evidence",
+        )
+        simulation._calc_core_flux_integral.assert_not_called()
+
     def test_calcop_failure_clears_shared_stack_without_masking_error(self):
         class Reporter:
             def __init__(self):
@@ -4074,7 +4165,7 @@ class ThermalMeshPolicyTests(unittest.TestCase):
     class _Operation:
         def __init__(self, name, update_ok=True):
             self.name = name
-            self.props = {}
+            self.props = {"Command": "AssignMeshLevel"}
             self.auto_update = True
             self.update_ok = update_ok
             self.update_calls = 0
@@ -4129,6 +4220,7 @@ class ThermalMeshPolicyTests(unittest.TestCase):
         self.assertEqual(len(mesh.meshoperations), 5)
         for operation in mesh.meshoperations:
             self.assertFalse(operation.auto_update)
+            self.assertNotIn("Command", operation.props)
             self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
             self.assertEqual(operation.update_calls, 1)
 

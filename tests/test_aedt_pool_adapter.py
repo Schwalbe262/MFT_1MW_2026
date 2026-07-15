@@ -863,6 +863,53 @@ def test_pooled_native_analyze_blocks_outside_lock_and_allows_sibling_transition
     assert design_results.stat().st_mode & 0o777 == 0o777
 
 
+def test_pooled_extractor_rebinds_exact_stage_inside_automation_guard():
+    from run_simulation_260706 import Simulation
+
+    events = []
+
+    class Guard:
+        def __enter__(self):
+            events.append("lock-enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock-exit")
+
+    simulation = Simulation.__new__(Simulation)
+    simulation.aedt_backend = "pooled"
+    simulation._analyze_exact_pooled_design = Mock(return_value=0.0)
+    simulation.aedt_automation_transaction = lambda: Guard()
+
+    def verify(**kwargs):
+        events.append(("verify", kwargs))
+        return object(), object()
+
+    simulation._verified_pooled_native_setup = verify
+
+    simulation.analyze_and_extract(
+        "loss", lambda: events.append("extract")
+    )
+
+    simulation._analyze_exact_pooled_design.assert_called_once_with("loss")
+    assert events == [
+        "lock-enter",
+        (
+            "verify",
+            {
+                "setup_name": "Setup1",
+                "expected_design_type": "Maxwell 3D",
+                "expected_solution_type": "AC Magnetic",
+                "project_refresh_max_attempts": 3,
+                "project_refresh_retry_delay": 0.5,
+                "activate": True,
+            },
+        ),
+        "extract",
+        "lock-exit",
+    ]
+
+
 class _FakeClock:
     def __init__(self):
         self.value = 0.0

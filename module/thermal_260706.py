@@ -416,6 +416,14 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
             # conductive/convective path to the surrounding fluid. Keep the object
             # level control, but mesh all controlled solids in the shared region.
             operation.auto_update = False
+            # PyAEDT 0.22 exposes AEDT's read-only command metadata in the mesh
+            # operation property bag.  Sending it back through ``update`` emits
+            # ``Script macro error: Command is read only`` even though the mesh
+            # operation itself is accepted.  Remove only that metadata field;
+            # every writable mesh property remains subject to the readback below.
+            for key in tuple(operation.props):
+                if str(key).strip().casefold() == "command":
+                    del operation.props[key]
             operation.props["Mesh Object(s) Separately Enabled"] = False
             if not update():
                 raise RuntimeError(f"{name} mesh operation update failed: {item}")

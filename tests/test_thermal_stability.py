@@ -1814,13 +1814,17 @@ class ThermalStabilityTest(unittest.TestCase):
 
     def test_explicit_rx_gets_one_object_mesh_operation(self):
         pad_mesh_operation = SimpleNamespace(
-            name="pad_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+            name="pad_mesh", props={"Command": "AssignMeshLevel"},
+            auto_update=True, update=Mock(return_value=True))
         rx_main_block_mesh_operation = SimpleNamespace(
-            name="rx_main_block_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+            name="rx_main_block_mesh", props={"Command": "AssignMeshLevel"},
+            auto_update=True, update=Mock(return_value=True))
         rx_mesh_operation = SimpleNamespace(
-            name="rx_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+            name="rx_mesh", props={"Command": "AssignMeshLevel"},
+            auto_update=True, update=Mock(return_value=True))
         tx_mesh_operation = SimpleNamespace(
-            name="tx_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+            name="tx_mesh", props={"Command": "AssignMeshLevel"},
+            auto_update=True, update=Mock(return_value=True))
         mesh = SimpleNamespace(
             assign_mesh_level=Mock(
                 side_effect=[["pad_mesh"], ["tx_mesh"], ["rx_main_block_mesh"], ["rx_mesh"]]),
@@ -1858,6 +1862,7 @@ class ThermalStabilityTest(unittest.TestCase):
             pad_mesh_operation, tx_mesh_operation,
             rx_main_block_mesh_operation, rx_mesh_operation,
         ):
+            self.assertNotIn("Command", operation.props)
             self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
 
     def test_thermal_mesh_failures_are_not_silenced(self):
