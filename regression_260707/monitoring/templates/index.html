@@ -35,14 +35,14 @@
     <section class="parallel-control-panel" aria-labelledby="parallel-control-title">
       <div class="parallel-control-heading">
         <div>
-          <p id="parallel-control-eyebrow" class="eyebrow">AUTOMATIC REFILL CONTROL · MFT ONLY</p>
-          <h2 id="parallel-control-title">MFT 자동 실행 유지</h2>
-          <p id="parallel-control-description">외부 refill-controller가 queued + attaching + running 합계를 자동으로 유지합니다.</p>
+          <p id="parallel-control-eyebrow" class="eyebrow">DURABLE SIMULATION POLICY · MFT ONLY</p>
+          <h2 id="parallel-control-title">MFT 병렬 실행 목표</h2>
+          <p id="parallel-control-description">Scheduler의 versioned desired/effective 정책을 확인하는 중입니다.</p>
         </div>
-        <form id="parallel-target-form" class="parallel-target-form hidden" autocomplete="off">
-          <label for="parallel-target-input">유지할 작업 수</label>
+        <form id="parallel-target-form" class="parallel-target-form" autocomplete="off">
+          <label for="parallel-target-input">Desired simulations</label>
           <div>
-            <input id="parallel-target-input" name="target" type="number" min="1" max="300" step="1" inputmode="numeric" disabled required>
+            <input id="parallel-target-input" name="target" type="number" min="0" step="1" inputmode="numeric" disabled required>
             <button id="parallel-target-button" type="submit" disabled>목표 적용</button>
           </div>
         </form>
@@ -58,11 +58,14 @@
         </div>
       </div>
       <div class="parallel-live-grid" aria-label="MFT 실시간 작업 상태">
-        <div><span>현재 목표</span><strong id="parallel-current-target">—</strong></div>
+        <div><span>Desired</span><strong id="parallel-current-target">—</strong></div>
+        <div><span>Effective</span><strong id="parallel-effective-target">—</strong></div>
+        <div><span>Validated limit</span><strong id="parallel-validated-limit">—</strong></div>
         <div><span>논리 active</span><strong id="parallel-logical-active">—</strong></div>
         <div><span>Queued</span><strong id="parallel-queued">—</strong></div>
         <div><span>Attaching</span><strong id="parallel-attaching">—</strong></div>
-        <div><span>Running</span><strong id="parallel-running">—</strong></div>
+        <div><span>Active</span><strong id="parallel-active">—</strong></div>
+        <div><span>Solving</span><strong id="parallel-solving">—</strong></div>
       </div>
       <article id="aedt-attach-card" class="aedt-attach-card unavailable" aria-labelledby="aedt-attach-title">
         <div class="aedt-attach-heading">
@@ -83,8 +86,8 @@
         </dl>
         <p id="aedt-node-local-progress" class="aedt-node-local-progress hidden">노드 로컬 AEDT 진행 정보 없음</p>
       </article>
-      <p id="parallel-target-status" class="parallel-target-status hidden" aria-live="polite">Scheduler 연결을 확인하는 중입니다.</p>
-      <p id="parallel-control-note" class="parallel-control-note hidden">목표를 낮춰도 running/attaching 작업은 중단하지 않습니다. 감소가 필요하면 controller가 시작 전으로 확인된 MFT queued 작업만 정리합니다.</p>
+      <p id="parallel-target-status" class="parallel-target-status" aria-live="polite">Scheduler 연결을 확인하는 중입니다.</p>
+      <p id="parallel-control-note" class="parallel-control-note">목표를 낮춰도 active/attaching 작업은 중단하지 않습니다. 시작 전 MFT 대기 작업만 drain 정책으로 정리합니다.</p>
     </section>
 
     <section class="pipeline-panel" aria-labelledby="pipeline-title">

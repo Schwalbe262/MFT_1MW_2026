@@ -33,12 +33,16 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "활성 코호트 타이밍 데이터 없음" in page.text
     assert "단계 소요시간" in page.text
     assert "final-time-matrix" in page.text
-    assert "MFT 자동 실행 유지" in page.text
-    assert 'id="parallel-target-form" class="parallel-target-form hidden"' in page.text
+    assert "MFT 병렬 실행 목표" in page.text
+    assert 'id="parallel-target-form" class="parallel-target-form"' in page.text
     assert "parallel-target-input" in page.text
+    assert "parallel-effective-target" in page.text
+    assert "parallel-validated-limit" in page.text
+    assert "parallel-active" in page.text
+    assert "parallel-solving" in page.text
     assert 'id="refill-controller-status" class="parallel-target-form"' in page.text
-    assert 'id="parallel-target-status" class="parallel-target-status hidden"' in page.text
-    assert 'id="parallel-control-note" class="parallel-control-note hidden"' in page.text
+    assert 'id="parallel-target-status" class="parallel-target-status"' in page.text
+    assert 'id="parallel-control-note" class="parallel-control-note"' in page.text
     assert "세대 ID 축약" in page.text
     assert "parallel-logical-active" in page.text
     assert "parallel-attaching" in page.text
@@ -95,8 +99,10 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "n=${number(timingWindowRows)}" in script.text
     assert "timingCell(evaluation.timing_seconds)" in script.text
     assert 'return "—"' in script.text
-    assert 'fetch("/api/operator/parallel-target"' in script.text
-    assert '"X-MFT-Operator-Control": "parallel-target-v1"' in script.text
+    assert 'fetch("/api/operator/simulation-policy"' in script.text
+    assert '"X-MFT-Operator-Control": "simulation-policy-v1"' in script.text
+    assert 'expected_revision: scheduler.policy_revision' in script.text
+    assert 'scale_down_mode: "drain"' in script.text
     assert 'key === "no_refill_needed"' in script.text
     assert 'key === "pooled_bundle_pending"' in script.text
     assert 'key === "failed_closed"' in script.text
@@ -105,7 +111,7 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "AEDT 공유 번들 진행 중" in script.text
     assert "오류로 안전정지 (관리자 확인 필요)" in script.text
     assert "컨트롤러 상태 파일을 찾을 수 없음" in script.text
-    assert "refillController.concurrency_target ?? scheduler.parallel_target" in script.text
+    assert "?? refillController.concurrency_target" in script.text
     assert "scheduler.live_queued" in script.text
     assert "x: (item) => Number(item.n)" in script.text
     assert "historyPointTooltip" in script.text
@@ -295,7 +301,7 @@ def test_dashboard_and_status_expose_refill_controller(artifact_service):
     assert client.get("/api/status").json()["refill_controller"] == expected
 
 
-def test_local_operator_can_set_exact_bounded_parallel_target(
+def test_local_operator_can_set_versioned_drain_simulation_policy(
         artifact_service, tmp_path, monkeypatch):
     monkeypatch.setattr(
         "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
@@ -307,23 +313,28 @@ def test_local_operator_can_set_exact_bounded_parallel_target(
         client=("127.0.0.1", 51000),
     )
     response = client.patch(
-        "/api/operator/parallel-target",
+        "/api/operator/simulation-policy",
         headers={
             "Content-Type": "application/json",
-            "X-MFT-Operator-Control": "parallel-target-v1",
+            "X-MFT-Operator-Control": "simulation-policy-v1",
             "Origin": "http://127.0.0.1:8010",
         },
-        json={"target": 275},
+        json={
+            "desired_simulations": 500,
+            "expected_revision": 7,
+            "scale_down_mode": "drain",
+        },
     )
 
     assert response.status_code == 200
     assert response.json()["updated"] is True
     assert response.json()["project"] == "MFT_1MW_2026v1"
-    assert response.json()["parallel_target"] == 275
-    assert artifact_service.scheduler.parallel_target == 275
+    assert response.json()["desired_simulations"] == 500
+    assert response.json()["policy_revision"] == 8
+    assert artifact_service.scheduler.parallel_target == 500
 
 
-def test_parallel_target_control_rejects_csrf_remote_and_invalid_requests(
+def test_simulation_policy_control_rejects_csrf_remote_and_invalid_requests(
         artifact_service, tmp_path, monkeypatch):
     monkeypatch.setattr(
         "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
@@ -337,29 +348,34 @@ def test_parallel_target_control_rejects_csrf_remote_and_invalid_requests(
     )
     valid_headers = {
         "Content-Type": "application/json",
-        "X-MFT-Operator-Control": "parallel-target-v1",
+        "X-MFT-Operator-Control": "simulation-policy-v1",
+    }
+    valid_payload = {
+        "desired_simulations": 300,
+        "expected_revision": 7,
+        "scale_down_mode": "drain",
     }
 
     assert local.patch(
-        "/api/operator/parallel-target",
+        "/api/operator/simulation-policy",
         headers={"Content-Type": "application/json"},
-        json={"target": 300},
+        json=valid_payload,
     ).status_code == 403
     assert local.patch(
-        "/api/operator/parallel-target",
+        "/api/operator/simulation-policy",
         headers={**valid_headers, "Origin": "https://attacker.invalid"},
-        json={"target": 300},
+        json=valid_payload,
     ).status_code == 403
     assert local.patch(
-        "/api/operator/parallel-target",
+        "/api/operator/simulation-policy",
         headers={**valid_headers, "Host": "monitor.public.invalid"},
-        json={"target": 300},
+        json=valid_payload,
     ).status_code == 403
-    for invalid in (0, 301, -1, 1.5, True, "300"):
+    for invalid in (501, -1, 1.5, True, "300"):
         response = local.patch(
-            "/api/operator/parallel-target",
+            "/api/operator/simulation-policy",
             headers=valid_headers,
-            json={"target": invalid},
+            json={**valid_payload, "desired_simulations": invalid},
         )
         assert response.status_code == 422
 
@@ -369,7 +385,66 @@ def test_parallel_target_control_rejects_csrf_remote_and_invalid_requests(
         client=("192.0.2.10", 51002),
     )
     assert remote.patch(
-        "/api/operator/parallel-target",
+        "/api/operator/simulation-policy",
         headers=valid_headers,
-        json={"target": 300},
+        json=valid_payload,
     ).status_code == 403
+
+
+def test_simulation_policy_allows_allowlisted_trusted_lan(
+        artifact_service, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
+        tmp_path / "campaign-mutation.lock",
+    )
+    monkeypatch.setenv("MFT_MONITOR_OPERATOR_HOSTS", "monitor.local,192.168.0.37")
+    client = TestClient(
+        create_app(service=artifact_service),
+        base_url="http://192.168.0.37:8010",
+        client=("192.168.0.18", 51003),
+    )
+    response = client.patch(
+        "/api/operator/simulation-policy",
+        headers={
+            "Content-Type": "application/json",
+            "X-MFT-Operator-Control": "simulation-policy-v1",
+            "Origin": "http://192.168.0.37:8010",
+        },
+        json={
+            "desired_simulations": 0,
+            "expected_revision": 7,
+            "scale_down_mode": "drain",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["desired_simulations"] == 0
+
+
+def test_simulation_policy_rejects_stale_browser_revision(
+        artifact_service, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
+        tmp_path / "campaign-mutation.lock",
+    )
+    client = TestClient(
+        create_app(service=artifact_service),
+        base_url="http://127.0.0.1:8010",
+        client=("127.0.0.1", 51004),
+    )
+    response = client.patch(
+        "/api/operator/simulation-policy",
+        headers={
+            "Content-Type": "application/json",
+            "X-MFT-Operator-Control": "simulation-policy-v1",
+        },
+        json={
+            "desired_simulations": 500,
+            "expected_revision": 6,
+            "scale_down_mode": "drain",
+        },
+    )
+
+    assert response.status_code == 409
+    assert artifact_service.scheduler.parallel_target == 300
+    assert artifact_service.scheduler.policy_revision == 7

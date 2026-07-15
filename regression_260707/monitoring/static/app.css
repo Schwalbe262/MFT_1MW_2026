@@ -158,7 +158,7 @@ section { margin: 0 0 52px; scroll-margin-top: 100px; }
   font-weight: 800;
 }
 .parallel-target-form button:disabled, .parallel-target-form input:disabled { cursor: not-allowed; opacity: .45; }
-.parallel-live-grid { display: grid; grid-template-columns: repeat(5, minmax(100px, 1fr)); margin-top: 16px; border: 1px solid var(--line-soft); border-radius: 9px; overflow: hidden; }
+.parallel-live-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); margin-top: 16px; border: 1px solid var(--line-soft); border-radius: 9px; overflow: hidden; }
 .parallel-live-grid > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 11px 13px; border-right: 1px solid var(--line-soft); background: rgba(0,0,0,.1); }
 .parallel-live-grid > div:last-child { border-right: 0; }
 .parallel-live-grid span { color: var(--muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
