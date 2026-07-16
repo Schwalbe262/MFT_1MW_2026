@@ -59,6 +59,12 @@ def test_manifest_dry_run_is_write_free_and_identity_is_fail_closed(tmp_path):
         "open_ended": True,
         "completion_and_failure_semantics": "immediate-refill",
         "scale_down_semantics": "drain-no-cancel",
+        "cpu_accounting": {
+            "thin_client_cpus": 1,
+            "host_cpus_per_attached_lease": 4,
+            "full_session_host_cpus": 12,
+            "owner": "scheduler-live-aedt-project-leases",
+        },
     }
     assert not target.exists()
 
@@ -151,7 +157,7 @@ def test_submission_contract_pins_accounts_resources_and_all_timeouts():
     submission = q22.pooled_submission(args)
     environment = submission["submission_env"]
     assert submission["account_names"] == q22.DEFAULT_ELIGIBLE_ACCOUNTS
-    assert submission["cpus"] == 4
+    assert submission["cpus"] == 1
     assert submission["memory_mb"] == 6144
     assert submission["timeout_seconds"] == 86400
     assert environment["MFT_AEDT_RELEASE_WAIT_SECONDS"] == "7200"
@@ -171,6 +177,8 @@ def test_pool_gate_accepts_167x3_and_adjustable_policy_through_500():
             "max_aedt_sessions": 167,
             "projects_per_aedt": 3,
             "target_project_concurrency": 500,
+            "project_cpus": 4,
+            "session_reserved_cpus": 12,
             "enabled": True,
             "adapter_ready": True,
             "validation_passed": True,
@@ -206,6 +214,12 @@ def test_pool_gate_accepts_167x3_and_adjustable_policy_through_500():
     with patch.object(q22, "_http_json", side_effect=response):
         _, target = q22.verify_pool_and_policy("http://scheduler")
     assert target == 497
+
+    pool["config"]["project_cpus"] = 1
+    with patch.object(q22, "_http_json", side_effect=response):
+        with pytest.raises(q22.GateError, match="charge 4 host CPUs"):
+            q22.verify_pool_and_policy("http://scheduler")
+    pool["config"]["project_cpus"] = 4
 
     pool["config"]["max_aedt_sessions"] = 166
     with patch.object(q22, "_http_json", side_effect=response):

@@ -65,6 +65,11 @@ EXPECTED_POOL_SESSIONS = 167
 EXPECTED_PROJECTS_PER_AEDT = 3
 EXPECTED_POOL_TARGET = 500
 EXPECTED_POOL_CAPACITY = EXPECTED_POOL_SESSIONS * EXPECTED_PROJECTS_PER_AEDT
+THIN_CLIENT_CPUS = 1
+HOST_CPUS_PER_ATTACHED_LEASE = 4
+EXPECTED_SESSION_RESERVED_CPUS = (
+    HOST_CPUS_PER_ATTACHED_LEASE * EXPECTED_PROJECTS_PER_AEDT
+)
 LEGACY_MAX_LOGICAL_ACTIVE = 30
 LEGACY_POOL_SESSIONS = 10
 LEGACY_POOL_PROJECTS = 30
@@ -174,7 +179,7 @@ def verify_profile(path: Path = PROFILE_PATH) -> dict[str, Any]:
         raise GateError(f"q22 full extraction profile drifted: {drift}")
     if profile.get("timeout_seconds") != TASK_TIMEOUT_SECONDS:
         raise GateError("q22 task timeout must be exactly 86400 seconds")
-    if profile.get("cpus") != 1 or profile.get("mem_mb") != 6144:
+    if profile.get("cpus") != THIN_CLIENT_CPUS or profile.get("mem_mb") != 6144:
         raise GateError("q22 pooled profile must request 1 CPU and 6144 MiB")
     return profile
 
@@ -262,6 +267,8 @@ def verify_pool_and_policy(base_url: str) -> tuple[dict[str, Any], int]:
         "max_aedt_sessions": EXPECTED_POOL_SESSIONS,
         "projects_per_aedt": EXPECTED_PROJECTS_PER_AEDT,
         "target_project_concurrency": EXPECTED_POOL_TARGET,
+        "project_cpus": HOST_CPUS_PER_ATTACHED_LEASE,
+        "session_reserved_cpus": EXPECTED_SESSION_RESERVED_CPUS,
         "enabled": True,
         "adapter_ready": True,
         "validation_passed": True,
@@ -271,7 +278,8 @@ def verify_pool_and_policy(base_url: str) -> tuple[dict[str, Any], int]:
              if config.get(key) != value}
     if drift:
         raise GateError(
-            "AEDT pool must remain 167x3 with target 500 and operational: "
+            "AEDT pool must remain 167x3 with target 500, charge 4 host CPUs "
+            "per attached lease, and remain operational: "
             f"{drift}"
         )
     if EXPECTED_POOL_CAPACITY < MAX_LOGICAL_ACTIVE:
@@ -568,6 +576,12 @@ def build_manifest(identity: Mapping[str, Any]) -> dict[str, Any]:
             "open_ended": True,
             "completion_and_failure_semantics": "immediate-refill",
             "scale_down_semantics": "drain-no-cancel",
+            "cpu_accounting": {
+                "thin_client_cpus": THIN_CLIENT_CPUS,
+                "host_cpus_per_attached_lease": HOST_CPUS_PER_ATTACHED_LEASE,
+                "full_session_host_cpus": EXPECTED_SESSION_RESERVED_CPUS,
+                "owner": "scheduler-live-aedt-project-leases",
+            },
         },
     }
 
@@ -912,10 +926,9 @@ def pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
         "MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION": SCHEDULER_PACKAGE_REVISION,
     }
     return {
-        # This is the solver-pressure accounting value.  The thin attach
-        # client itself is cheap, but each attached Maxwell/Icepak project
-        # consumes the four-core budget inside the AEDT host.
-        "cpus": 4,
+        # This scheduler task is only an attach/control client. Solver pressure
+        # is charged once on the Desktop host from its accepted/live lease.
+        "cpus": THIN_CLIENT_CPUS,
         "memory_mb": 6144,
         "timeout_seconds": TASK_TIMEOUT_SECONDS,
         "profile_path": str(PROFILE_PATH),
@@ -966,6 +979,7 @@ def static_plan(args: argparse.Namespace, manifest: Mapping[str, Any]) -> dict[s
         "execution_requires": [
             "q21b tasks 41796-41798 and releases remain valid",
             "pool remains 167x3 with capacity >=500 and target 500",
+            "thin clients request 1 CPU; scheduler charges 4 host CPUs per live lease",
             "active policy remains 0..500 with validated limit 500",
             "every eligible account has clean exact scheduler package",
             "solver/library revisions remain advertised remote branch heads",

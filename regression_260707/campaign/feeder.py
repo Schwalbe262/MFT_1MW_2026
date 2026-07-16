@@ -122,7 +122,9 @@ AEDT_SESSION_PROFILE = json.dumps(
     sort_keys=True,
     separators=(",", ":"),
 )
-DEFAULT_POOLED_CPUS = 4
+# Pooled tasks are thin attach/control clients. The scheduler charges the
+# four-core solver budget to the AEDT host from each accepted/live lease.
+DEFAULT_POOLED_CPUS = 1
 DEFAULT_POOLED_MEMORY_MB = 6144
 CPU_HEADROOM = 0.85
 SCHEDULER_ATTEMPTS = 3

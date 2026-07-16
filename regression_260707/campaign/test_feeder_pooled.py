@@ -312,14 +312,14 @@ class FeederPooledSubmissionTests(unittest.TestCase):
         )
         self.assertEqual(defaults.aedt_session_version, "2025.2")
         self.assertEqual(defaults.aedt_isolation_policy, "family")
-        self.assertEqual(defaults.pooled_cpus, 4)
+        self.assertEqual(defaults.pooled_cpus, 1)
         self.assertEqual(defaults.pooled_memory_mb, 6144)
 
         default_payload = self._capture_cli_payload([
             "--aedt-pooled",
             "--aedt-pool-url", "https://pool.example.test:8443",
         ])
-        self.assertEqual(default_payload["cpus"], 4)
+        self.assertEqual(default_payload["cpus"], 1)
         self.assertIn(
             'export MFT_SLURM_SCHEDULER_ROOT='
             '"$HOME/slurm_scheduler/aedt_pool_pkg";',
