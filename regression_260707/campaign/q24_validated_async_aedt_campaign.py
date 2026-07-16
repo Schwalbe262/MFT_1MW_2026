@@ -492,8 +492,47 @@ def _q24_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
     return {**submission, "submission_env": environment}
 
 
+def _run_q24_current_live_gates(args: argparse.Namespace) -> dict[str, Any]:
+    """Validate current production state without replaying retired canaries."""
+
+    engine.verify_compatibility(engine.REPO_ROOT, engine.COMPATIBILITY_PATH)
+    engine.verify_profile(engine.PROFILE_PATH)
+    engine.verify_local_library(args.library_root)
+    try:
+        deployment = engine.deployment_gate.validate_deployment(
+            args.deployment_solver_root,
+            engine.CAMPAIGN_SOLVER,
+            args.library_root,
+            engine.LIBRARY_REVISION,
+        )
+    except Exception as exc:
+        raise engine.GateError(
+            f"remote deployment revision gate failed: {exc}"
+        ) from exc
+    pool, logical_target = engine.verify_pool_and_policy(args.scheduler_url)
+    packages = engine.audit_remote_packages(
+        args.accounts_config,
+        args.eligible_accounts,
+        args.ssh_audit_python,
+    )
+    config = pool.get("config") or {}
+    return {
+        "deployment": deployment,
+        "logical_target": logical_target,
+        "pool_validation_passed": bool(config.get("validation_passed")),
+        "scheduler_policy": {
+            "source": "current-live-config",
+            "native_solve_mode": config.get("native_solve_mode"),
+            "parallel_safe_native_solve_families": config.get(
+                "parallel_safe_native_solve_families"
+            ),
+        },
+        "packages": packages,
+    }
+
+
 def _run_q24_live_gates(args: argparse.Namespace) -> dict[str, Any]:
-    gates = _ORIGINAL_RUN_LIVE_GATES(args)
+    gates = _run_q24_current_live_gates(args)
     state_path = args.state_dir / "feeder_state.json"
     predecessor = _validate_predecessor_manifest(
         _predecessor_manifest_path(state_path),

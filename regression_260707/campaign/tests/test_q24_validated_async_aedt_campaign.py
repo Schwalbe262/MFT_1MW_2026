@@ -181,6 +181,67 @@ def test_q24_pool_gate_requires_server_side_validated_parallel(monkeypatch):
         q24._verify_q24_pool_and_policy("http://pool")
 
 
+def test_q24_live_gates_use_current_policy_not_retired_q21b_evidence(
+    configured_engine, tmp_path
+):
+    args = configured_engine._parser().parse_args([])
+    args.state_dir = tmp_path
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    predecessor = _write_predecessor_manifest(tmp_path / "feeder_state.json")
+    pool = {
+        "config": {
+            "validation_passed": True,
+            "native_solve_mode": "validated_parallel",
+            "parallel_safe_native_solve_families": ["mft_validated_async"],
+        }
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(engine, "verify_compatibility"))
+        stack.enter_context(patch.object(engine, "verify_profile"))
+        stack.enter_context(patch.object(engine, "verify_local_library"))
+        stack.enter_context(
+            patch.object(
+                engine.deployment_gate,
+                "validate_deployment",
+                return_value={"solver": q24.REFILL_SOLVER},
+            )
+        )
+        stack.enter_context(
+            patch.object(engine, "verify_pool_and_policy", return_value=(pool, 500))
+        )
+        stack.enter_context(
+            patch.object(engine, "audit_remote_packages", return_value=["audited"])
+        )
+        retired = stack.enter_context(
+            patch.object(
+                engine,
+                "verify_scheduler_evidence",
+                side_effect=engine.GateError("stale q21b task 41796"),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                q24,
+                "verify_rolling_inventory",
+                return_value={"logical_active": 500},
+            )
+        )
+        gates = q24._run_q24_live_gates(args)
+
+    retired.assert_not_called()
+    assert gates["logical_target"] == 500
+    assert gates["pool_validation_passed"] is True
+    assert gates["scheduler_policy"] == {
+        "source": "current-live-config",
+        "native_solve_mode": "validated_parallel",
+        "parallel_safe_native_solve_families": ["mft_validated_async"],
+    }
+    assert gates["packages"] == ["audited"]
+    assert gates["predecessor_manifest"]["identity_sha256"] == (
+        predecessor["identity_sha256"]
+    )
+
+
 def test_rolling_inventory_counts_both_exact_cohorts_and_rejects_others(tmp_path):
     db_path = tmp_path / "scheduler.db"
     with sqlite3.connect(db_path) as connection:
