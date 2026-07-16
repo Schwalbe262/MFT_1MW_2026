@@ -135,6 +135,7 @@ PROFILE_PATH = os.path.join(HERE, "..", "verify", "profiles", "standard.json")
 TRAIN_PARQUET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 COLLECT_CACHE = os.path.join(HERE, "..", "data", "dataset", "collect_cache.json")
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+_LAST_DATASET_COLLECTION_SNAPSHOT = None
 
 
 def _require_deployed_revisions(solver_revision, library_revision):
@@ -1096,6 +1097,8 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                     "dynamic_project_cap_v1",
                 }),
         })
+    global _LAST_DATASET_COLLECTION_SNAPSHOT
+
     st = load_state()
     committed_state = copy.deepcopy(st)
     # 로컬 장부나 다른 project가 아니라 scheduler의 MFT logical project가 source of truth다.
@@ -1119,7 +1122,30 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         scheduler_snapshot(hard_cap, **snapshot_options))
     ready_fit_slots = capacity_gate["ready_fit_slots"]
     campaign_active = sum(campaign_counts.values())
-    data_rows, judged_ids = dataset_collection_snapshot()
+    collection_key = (os.path.abspath(TRAIN_PARQUET), os.path.abspath(COLLECT_CACHE))
+    try:
+        data_rows, judged_ids = dataset_collection_snapshot()
+    except FileLockTimeout:
+        cached = _LAST_DATASET_COLLECTION_SNAPSHOT
+        if not (scheduler_admission_owns_queueing and unbounded_dataset):
+            raise
+        if cached is None or cached[0] != collection_key:
+            print(
+                "[feeder] q24 collector snapshot is busy and no validated "
+                "snapshot is cached; retrying next cycle without submission"
+            )
+            return True
+        data_rows, judged_ids = cached[1], set(cached[2])
+        print(
+            "[feeder] q24 collector snapshot is busy; using last validated "
+            f"snapshot rows={data_rows}"
+        )
+    else:
+        _LAST_DATASET_COLLECTION_SNAPSHOT = (
+            collection_key,
+            int(data_rows),
+            frozenset(judged_ids),
+        )
     if target + buffer > 0:
         tasks = campaign_inventory()
         reserved_rows = reserved_unjudged_rows(st, tasks, judged_ids)

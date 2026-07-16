@@ -1,5 +1,6 @@
 from contextlib import ExitStack, nullcontext
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -52,6 +53,7 @@ CONFIGURED_NAMES = (
     "load_or_create_manifest",
     "pooled_submission",
     "audit_remote_packages",
+    "_write_status",
 )
 
 
@@ -256,6 +258,143 @@ def test_queueing_override_rejects_non_q24_campaign(configured_engine):
             library_revision=q24.LIBRARY_REVISION,
             pooled_submission=submission,
         )
+
+
+def test_q24_uses_last_validated_dataset_snapshot_while_collector_is_locked(
+    configured_engine
+):
+    args = configured_engine._parser().parse_args([])
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    submission = configured_engine.pooled_submission(args)
+    state = {"serial": BASELINE_SERIAL, "submitted_samples": 0}
+    counts = {"queued": 0, "attaching": 0, "running": 0}
+    capacity = {
+        "ready_fit_slots": 0,
+        "queue_state": "blocked",
+        "queue_reason": "allocation backoff active for cpu",
+        "queue_submission_allowed": False,
+        "project_active": 0,
+        "project_submission_slots": 1,
+        "submission_allowed": False,
+    }
+    key = (
+        os.path.abspath(engine.feeder.TRAIN_PARQUET),
+        os.path.abspath(engine.feeder.COLLECT_CACHE),
+    )
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                engine.feeder.scheduler_client,
+                "campaign_mutation_lock_is_held",
+                return_value=True,
+            )
+        )
+        stack.enter_context(patch.object(engine.feeder, "load_state", return_value=state))
+        stack.enter_context(
+            patch.object(
+                engine.feeder,
+                "scheduler_snapshot",
+                return_value=(counts, counts, [], capacity),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                engine.feeder,
+                "dataset_collection_snapshot",
+                side_effect=engine.feeder.FileLockTimeout("train.parquet.lock"),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                engine.feeder,
+                "_LAST_DATASET_COLLECTION_SNAPSHOT",
+                (key, 5_237, frozenset()),
+            )
+        )
+        stack.enter_context(patch.object(engine.feeder, "campaign_inventory", return_value=[]))
+        stack.enter_context(
+            patch.object(engine.feeder, "cursor_after_valid_candidates", return_value=0)
+        )
+        stack.enter_context(
+            patch.object(
+                engine.feeder,
+                "next_valid_candidate",
+                return_value=(1, 0, {"candidate": 1}),
+            )
+        )
+        submit = stack.enter_context(patch.object(engine.feeder, "submit", return_value=901))
+        stack.enter_context(patch.object(engine.feeder, "save_state"))
+        stack.enter_context(patch.object(engine.feeder.time, "sleep"))
+        assert engine.feeder.step(
+            None,
+            target=1,
+            solver_revision=q24.REFILL_SOLVER,
+            library_revision=q24.LIBRARY_REVISION,
+            pooled_submission=submission,
+        )
+
+    submit.assert_called_once()
+
+
+def test_q24_defers_cycle_when_first_dataset_snapshot_is_locked(configured_engine):
+    args = configured_engine._parser().parse_args([])
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    submission = configured_engine.pooled_submission(args)
+    counts = {"queued": 0, "attaching": 0, "running": 0}
+    capacity = {
+        "ready_fit_slots": 0,
+        "queue_state": "blocked",
+        "queue_reason": "allocation backoff active for cpu",
+        "queue_submission_allowed": False,
+        "project_active": 0,
+        "project_submission_slots": 1,
+        "submission_allowed": False,
+    }
+    with patch.object(
+        engine.feeder.scheduler_client,
+        "campaign_mutation_lock_is_held",
+        return_value=True,
+    ), patch.object(
+        engine.feeder,
+        "load_state",
+        return_value={"serial": BASELINE_SERIAL, "submitted_samples": 0},
+    ), patch.object(
+        engine.feeder,
+        "scheduler_snapshot",
+        return_value=(counts, counts, [], capacity),
+    ), patch.object(
+        engine.feeder,
+        "dataset_collection_snapshot",
+        side_effect=engine.feeder.FileLockTimeout("train.parquet.lock"),
+    ), patch.object(
+        engine.feeder,
+        "_LAST_DATASET_COLLECTION_SNAPSHOT",
+        None,
+    ), patch.object(engine.feeder, "submit") as submit:
+        assert engine.feeder.step(
+            None,
+            target=1,
+            solver_revision=q24.REFILL_SOLVER,
+            library_revision=q24.LIBRARY_REVISION,
+            pooled_submission=submission,
+        )
+
+    submit.assert_not_called()
+
+
+def test_q24_status_falls_back_when_atomic_replace_is_denied(
+    configured_engine, tmp_path
+):
+    path = tmp_path / "q24.status.json"
+    with patch.object(q24.os, "replace", side_effect=PermissionError("denied")), patch.object(
+        q24.time, "sleep"
+    ):
+        configured_engine._write_status(path, {"phase": "open-ended-refill"})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "phase": "open-ended-refill"
+    }
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_q24_pool_gate_requires_server_side_validated_parallel(monkeypatch):

@@ -13,9 +13,11 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import time
 from typing import Any, Mapping, Sequence
 
 import q22_bounded_soak as engine
@@ -52,7 +54,9 @@ _ORIGINAL_RUN_LIVE_GATES = q23._ORIGINAL_RUN_LIVE_GATES
 _ORIGINAL_MANIFEST_IDENTITY = q23._ORIGINAL_MANIFEST_IDENTITY
 _ORIGINAL_LOAD_OR_CREATE_MANIFEST = q23._ORIGINAL_LOAD_OR_CREATE_MANIFEST
 _ORIGINAL_STATIC_PLAN = q23._ORIGINAL_STATIC_PLAN
+_ORIGINAL_WRITE_STATUS = engine._write_status
 _RUNTIME_PREFLIGHT_ARGS: argparse.Namespace | None = None
+STATUS_WRITE_ATTEMPTS = 3
 
 
 def _sha256_file(path: Path) -> str:
@@ -499,6 +503,45 @@ def _q24_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _write_q24_status(path: Path, payload: Mapping[str, Any]) -> None:
+    """Keep control alive when RaiDrive temporarily denies atomic replace."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(dict(payload), indent=2, sort_keys=True)
+    last_error: OSError | None = None
+    for attempt in range(STATUS_WRITE_ATTEMPTS):
+        staged = path.with_name(
+            f".{path.name}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp"
+        )
+        try:
+            with staged.open("w", encoding="utf-8") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(staged, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt + 1 < STATUS_WRITE_ATTEMPTS:
+                time.sleep(0.1 * (attempt + 1))
+
+    try:
+        with path.open("w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        print(
+            "[q24] status write deferred; retaining the previous status: "
+            f"atomic={last_error!r}, direct={exc!r}",
+            flush=True,
+        )
+
+
 def _run_q24_current_live_gates(args: argparse.Namespace) -> dict[str, Any]:
     """Validate current production state without replaying retired canaries."""
 
@@ -601,6 +644,7 @@ def configure_engine(
     engine.manifest_identity = _q24_manifest_identity
     engine.load_or_create_manifest = _load_or_create_q24_manifest
     engine.pooled_submission = _q24_pooled_submission
+    engine._write_status = _write_q24_status
 
 
 def _bootstrap_parser() -> argparse.ArgumentParser:
