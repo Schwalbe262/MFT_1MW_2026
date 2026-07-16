@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import re
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -62,6 +63,29 @@ def test_default_backend_is_standalone_and_does_not_require_scheduler(
     assert adapter.pooled_backend_enabled() is False
 
 
+def test_validated_async_workload_family_enables_default_launch_settle(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        adapter.WORKLOAD_FAMILY_ENV,
+        adapter.VALIDATED_ASYNC_WORKLOAD_FAMILY,
+    )
+    monkeypatch.delenv(adapter.ASYNC_DISPATCH_SETTLE_ENV, raising=False)
+
+    assert (
+        adapter.pooled_workload_family()
+        == adapter.VALIDATED_ASYNC_WORKLOAD_FAMILY
+    )
+    assert adapter.pooled_async_dispatch_settle_seconds() == 2.0
+
+
+def test_unknown_workload_family_fails_before_lease_request(monkeypatch):
+    monkeypatch.setenv(adapter.WORKLOAD_FAMILY_ENV, "unreviewed_parallel")
+
+    with pytest.raises(RuntimeError, match="MFT_AEDT_WORKLOAD_FAMILY"):
+        adapter.pooled_workload_family()
+
+
 def test_activation_is_explicit_and_requires_project_creation_identity():
     lease = FakeLease()
 
@@ -96,19 +120,16 @@ def test_native_pipeline_barrier_fails_closed_with_old_v2_client():
         )
 
 
-def test_native_solve_window_never_delegates_or_yields_mft_session_lock():
+def test_native_solve_window_delegates_async_wait_suspension():
     lease = SimpleNamespace(
         protocol_version=2,
-        native_solve_window=Mock(
-            side_effect=AssertionError("MFT must not suspend the session lock")
-        ),
+        native_solve_window=Mock(return_value=nullcontext()),
     )
-    lock_depth = 2
 
     with adapter.native_solve_window(lease):
-        assert lock_depth == 2
+        pass
 
-    lease.native_solve_window.assert_not_called()
+    lease.native_solve_window.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -298,6 +319,10 @@ def test_shared_canary_requests_nonexclusive_session_without_pilot_barrier(
     monkeypatch.delenv("MFT_AEDT_EXCLUSIVE_1TO1", raising=False)
     monkeypatch.delenv("MFT_AEDT_SHARED_1TO2_PILOT", raising=False)
     monkeypatch.setenv("MFT_AEDT_SHARED_CANARY", "1")
+    monkeypatch.setenv(
+        adapter.WORKLOAD_FAMILY_ENV,
+        adapter.VALIDATED_ASYNC_WORKLOAD_FAMILY,
+    )
     monkeypatch.setenv("MFT_AEDT_SCHEDULER_URL", "http://scheduler:8000")
     monkeypatch.setenv("MFT_AEDT_PILOT_PRE_SOLVE_READY_FILE", str(marker))
     monkeypatch.setenv("MFT_AEDT_PILOT_PRE_SOLVE_HANG_SECONDS", "3600")
@@ -312,6 +337,7 @@ def test_shared_canary_requests_nonexclusive_session_without_pilot_barrier(
     adapter.pilot_pre_solve_barrier("simulation_canary")
 
     assert requests[0][2]["exclusive_session"] is False
+    assert requests[0][2]["workload_family"] == "mft_validated_async"
     assert requests[0][2]["request_key"] == f"mft-1to2-canary:{os.getpid()}"
     assert not marker.exists()
 
@@ -784,7 +810,7 @@ def test_pooled_results_preclaim_exact_design_alias_and_reject_traversal(
     ("label", "solution_type"),
     (("matrix", "AC Magnetic"), ("cap", "Electrostatic"), ("loss", "AC Magnetic")),
 )
-def test_pooled_native_analyze_and_terminal_postflight_hold_session_lock(
+def test_pooled_native_analyze_dispatch_and_terminal_polls_use_short_locks(
     monkeypatch, tmp_path, label, solution_type,
 ):
     from run_simulation_260706 import Simulation
@@ -815,9 +841,6 @@ def test_pooled_native_analyze_and_terminal_postflight_hold_session_lock(
 
         def automation_guard(self):
             return Guard()
-
-        def native_solve_window(self):
-            raise AssertionError("MFT adapter must not delegate lock suspension")
 
     class Project:
         def Save(self):
@@ -904,18 +927,29 @@ def test_pooled_native_analyze_and_terminal_postflight_hold_session_lock(
     )
     simulation._log_recent_aedt_messages = lambda _label: None
 
-    elapsed = simulation._analyze_exact_pooled_design(label)
+    def settle(seconds):
+        assert lock_depth[0] == 1
+        assert seconds == 2
+        events.append("launch-settle")
+
+    elapsed = simulation._analyze_exact_pooled_design(
+        label, dispatch_settle_s=2, sleeper=settle
+    )
 
     assert elapsed >= 0
     assert events[0] == "activate"
-    analyze_event = ("analyze", "Setup1", True)
+    analyze_event = ("analyze", "Setup1", False)
     assert analyze_event in events
-    assert "native-window-yield" not in events
-    assert "sibling-stage-transition" not in events
     assert events.count(analyze_event) == 1
-    assert events.count("lock-enter") == 1
+    assert events.index(analyze_event) < events.index("launch-settle")
+    assert events.count("lock-enter") == 2
     assert events.index("lock-enter") < events.index(analyze_event)
-    assert events.index("export-convergence") < events.index("lock-exit")
+    dispatch_exit = events.index("lock-exit")
+    terminal_enter = events.index("lock-enter", dispatch_exit + 1)
+    assert events.index(analyze_event) < dispatch_exit < terminal_enter
+    assert events.index("export-convergence") < events.index(
+        "lock-exit", terminal_enter + 1
+    )
     assert contracts == [
         {
             "setup_name": "Setup1",
@@ -944,7 +978,147 @@ def test_pooled_native_analyze_and_terminal_postflight_hold_session_lock(
     assert design_results.stat().st_mode & 0o777 == 0o777
 
 
-def test_pooled_analyze_terminal_and_extractor_share_one_outer_guard():
+def test_two_async_projects_overlap_while_every_aedt_call_stays_locked():
+    """A long native solve is parallel; Desktop automation is never parallel."""
+
+    from run_simulation_260706 import Simulation
+
+    session_lock = threading.RLock()
+    state_lock = threading.Lock()
+    owner = [None]
+    automation_owners = [0]
+    max_automation_owners = [0]
+    dispatched: set[str] = set()
+    native_running: set[str] = set()
+    overlap_seen = [False]
+    start = threading.Barrier(2)
+    failures = []
+
+    class Guard:
+        def __enter__(self):
+            session_lock.acquire()
+            with state_lock:
+                owner[0] = threading.get_ident()
+                automation_owners[0] += 1
+                max_automation_owners[0] = max(
+                    max_automation_owners[0], automation_owners[0]
+                )
+            return self
+
+        def __exit__(self, *_args):
+            with state_lock:
+                automation_owners[0] -= 1
+                owner[0] = None
+            session_lock.release()
+
+    def assert_locked():
+        assert owner[0] == threading.get_ident()
+        assert automation_owners[0] == 1
+
+    class Project:
+        def Save(self):
+            assert_locked()
+            return None
+
+    class Design:
+        def __init__(self, project_name):
+            self.project_name = project_name
+
+        def GetName(self):
+            assert_locked()
+            return "maxwell_matrix"
+
+        def Analyze(self, setup_name, blocking):
+            assert_locked()
+            assert (setup_name, blocking) == ("Setup1", False)
+            with state_lock:
+                overlap_seen[0] = overlap_seen[0] or bool(native_running)
+                dispatched.add(self.project_name)
+                native_running.add(self.project_name)
+            return 0
+
+    class Desktop:
+        @staticmethod
+        def GetRegistryString(_key):
+            assert_locked()
+            return "pyaedt_config"
+
+        @staticmethod
+        def GetMessages(project_name, design_name, severity):
+            assert_locked()
+            assert design_name == "maxwell_matrix"
+            if severity == 2:
+                return []
+            values = [f"pre-dispatch:{project_name}"]
+            with state_lock:
+                if len(dispatched) == 2:
+                    values.append(
+                        "Normal completion of simulation on server: async-test"
+                    )
+            return values
+
+    def simulation_for(project_name):
+        simulation = Simulation.__new__(Simulation)
+        simulation.aedt_backend = "pooled"
+        simulation.PROJECT_NAME = project_name
+        simulation.design1 = SimpleNamespace(design_name="maxwell_matrix")
+        simulation.solve_attempts = {"matrix": 0}
+        simulation.solver_may_be_running = False
+        simulation.pooled_activation_done = True
+        simulation.activate_pooled_for_solve = lambda: None
+        simulation.aedt_automation_transaction = lambda: Guard()
+        project = Project()
+        design = Design(project_name)
+        desktop = Desktop()
+
+        def verify(**_kwargs):
+            assert_locked()
+            return project, design
+
+        def convergence(*_args, **_kwargs):
+            assert_locked()
+            with state_lock:
+                assert len(dispatched) == 2
+                native_running.discard(project_name)
+            return {"passes": 2.0}
+
+        simulation._verified_pooled_native_setup = verify
+        simulation._native_desktop_handle = lambda: desktop
+        simulation._ensure_pooled_shared_results_directory = (
+            lambda *_args, **_kwargs: assert_locked()
+        )
+        simulation._pooled_terminal_convergence_locked = convergence
+        return simulation
+
+    simulations = [simulation_for("async-a"), simulation_for("async-b")]
+
+    def run(simulation):
+        try:
+            start.wait(timeout=2)
+            simulation._analyze_exact_pooled_design(
+                "matrix",
+                timeout_s=2,
+                poll_s=0.005,
+                dispatch_settle_s=0,
+            )
+        except BaseException as error:  # surfaced in the parent test thread
+            failures.append(error)
+
+    threads = [threading.Thread(target=run, args=(item,)) for item in simulations]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert failures == []
+    assert overlap_seen[0] is True
+    assert max_automation_owners[0] == 1
+    assert native_running == set()
+    assert [item.solve_attempts["matrix"] for item in simulations] == [1, 1]
+
+
+def test_pooled_analyze_runs_unlocked_then_extractor_uses_one_guard():
     from run_simulation_260706 import Simulation
 
     events = []
@@ -967,7 +1141,7 @@ def test_pooled_analyze_terminal_and_extractor_share_one_outer_guard():
 
     def analyze(label):
         assert label == "loss"
-        assert lock_depth[0] == 1
+        assert lock_depth[0] == 0
         events.append("analyze-terminal")
         return 0.0
 
@@ -990,8 +1164,8 @@ def test_pooled_analyze_terminal_and_extractor_share_one_outer_guard():
     simulation._analyze_exact_pooled_design.assert_called_once_with("loss")
     assert events == [
         "activate",
-        "lock-enter",
         "analyze-terminal",
+        "lock-enter",
         (
             "verify",
             {
@@ -1036,7 +1210,7 @@ def _minimal_pooled_terminal_harness(*, normal=False, fatal=False, mismatch=Fals
             return self.name
 
         def Analyze(self, setup_name, blocking):
-            assert (setup_name, blocking) == ("Setup1", True)
+            assert (setup_name, blocking) == ("Setup1", False)
             self.analyzed = True
             return 0
 

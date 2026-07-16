@@ -127,14 +127,16 @@ def _pooled_field_summary_window(
     clock=time.monotonic,
     sleeper=time.sleep,
 ):
-    """Yield an idle exact thermal design without releasing the outer lock.
+    """Yield an idle, exact thermal design while keeping one short lock.
 
     ``run_thermal_analysis`` owns an outer automation transaction.  A pooled
-    Desktop must not admit sibling automation between its native Analyze,
-    terminal postflight, and field extraction.  Re-entrant poll transactions
-    retain the caller's outer ownership during every busy wait.  Once idle is
-    observed, yield inside the same transaction so no idle-check/export race
-    is possible.  Desktop-wide running state is only this export barrier; it
+    Desktop can remain busy while sibling projects solve, so holding that
+    transaction during the drain would starve them. Suspend the outer depth,
+    take short poll transactions, and release every busy observation.
+
+    Once idle is observed, yield inside that same inner transaction. The
+    field-summary and scalar fallback therefore run without an idle-check to
+    export race. Desktop-wide running state is only this export barrier; it
     never attests the current lease's solve success.
     """
     from module.aedt_pool_adapter import pooled_backend_enabled
@@ -143,8 +145,9 @@ def _pooled_field_summary_window(
         yield ipk
         return
 
+    native_window = getattr(sim, "aedt_native_solve_window", None)
     automation_transaction = getattr(sim, "aedt_automation_transaction", None)
-    if not callable(automation_transaction):
+    if not callable(native_window) or not callable(automation_transaction):
         raise RuntimeError(
             "pooled thermal field-summary window has no lock discipline"
         )
@@ -152,68 +155,67 @@ def _pooled_field_summary_window(
     started = clock()
     deadline = started + max(0.0, float(timeout_s))
     waiting_logged = False
-    while True:
-        with automation_transaction():
-            postflight = _prepare_thermal_dispatch(
-                sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
-                setup_name=_THERMAL_SETUP_NAME,
-            )
-            native_ipk = postflight["native_ipk"]
-            desktop = _thermal_desktop_handle(sim, native_ipk)
-            is_running = getattr(
-                desktop, "AreThereSimulationsRunning", None
-            )
-            if not callable(is_running):
-                raise RuntimeError(
-                    "pooled thermal field-summary drain has no "
-                    "simulation-state query"
+    with native_window():
+        while True:
+            with automation_transaction():
+                postflight = _prepare_thermal_dispatch(
+                    sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
+                    setup_name=_THERMAL_SETUP_NAME,
                 )
-            value = is_running()
-            if value is False or value == 0:
-                running = False
-            elif value is True or value == 1:
-                running = True
-            else:
-                normalized = str(value or "").strip().casefold()
-                if normalized in {"false", "no", "off", "0"}:
+                native_ipk = postflight["native_ipk"]
+                desktop = _thermal_desktop_handle(sim, native_ipk)
+                is_running = getattr(
+                    desktop, "AreThereSimulationsRunning", None
+                )
+                if not callable(is_running):
+                    raise RuntimeError(
+                        "pooled thermal field-summary drain has no "
+                        "simulation-state query"
+                    )
+                value = is_running()
+                if value is False or value == 0:
                     running = False
-                elif normalized in {"true", "yes", "on", "1"}:
+                elif value is True or value == 1:
                     running = True
                 else:
-                    raise RuntimeError(
-                        "pooled thermal field-summary drain returned an "
-                        f"unrecognized state: {value!r}"
-                    )
-            if not running:
-                elapsed = max(0.0, clock() - started)
-                if waiting_logged:
-                    logging.warning(
-                        "[thermal] pooled field-summary drain completed "
-                        "in %.1fs",
-                        elapsed,
-                    )
-                # Deliberately yield before leaving this transaction.
-                yield native_ipk
-                return
+                    normalized = str(value or "").strip().casefold()
+                    if normalized in {"false", "no", "off", "0"}:
+                        running = False
+                    elif normalized in {"true", "yes", "on", "1"}:
+                        running = True
+                    else:
+                        raise RuntimeError(
+                            "pooled thermal field-summary drain returned an "
+                            f"unrecognized state: {value!r}"
+                        )
+                if not running:
+                    elapsed = max(0.0, clock() - started)
+                    if waiting_logged:
+                        logging.warning(
+                            "[thermal] pooled field-summary drain completed "
+                            "in %.1fs",
+                            elapsed,
+                        )
+                    # Deliberately yield before leaving this transaction.
+                    yield native_ipk
+                    return
 
-        if not waiting_logged:
-            logging.warning(
-                "[thermal] waiting for AEDT to become idle before "
-                "Desktop-global field-summary export"
-            )
-            waiting_logged = True
-        now = clock()
-        if now >= deadline:
-            raise RuntimeError(
-                "timed out waiting for pooled AEDT to become idle before "
-                f"thermal field-summary export ({float(timeout_s):.1f}s)"
-            )
-        # The caller's outer transaction remains held while this file/message
-        # flush wait runs; only the nested poll depth was released above.
-        sleeper(min(
-            max(0.05, float(poll_s)),
-            max(0.0, deadline - now),
-        ))
+            if not waiting_logged:
+                logging.warning(
+                    "[thermal] waiting for in-flight sibling solves before "
+                    "Desktop-global field-summary export"
+                )
+                waiting_logged = True
+            now = clock()
+            if now >= deadline:
+                raise RuntimeError(
+                    "timed out waiting for pooled AEDT to become idle before "
+                    f"thermal field-summary export ({float(timeout_s):.1f}s)"
+                )
+            sleeper(min(
+                max(0.05, float(poll_s)),
+                max(0.0, deadline - now),
+            ))
 
 
 def _power_value_w(value):
@@ -1019,15 +1021,15 @@ def _pooled_thermal_poll_settings(timeout_s=None, poll_s=None):
 def _solve_exact_pooled_thermal_setup(
     sim, ipk, setup, setup_name=_THERMAL_SETUP_NAME,
     timeout_s=None, monitor_grace_s=30.0, poll_s=None,
-    clock=time.monotonic, sleeper=time.sleep,
+    dispatch_settle_s=None, clock=time.monotonic, sleeper=time.sleep,
 ):
-    """Blocking exact-design dispatch with fresh residual attestation.
+    """Nonblocking exact-design dispatch with fresh residual attestation.
 
     ``run_thermal_analysis`` already owns the session automation transaction.
-    Capture the exact design and retain that transaction across blocking
-    ``Analyze(..., True)``, terminal messages, residual attestation, and the
-    caller's extraction.  The compatibility native-solve context is a no-op
-    for MFT so attached siblings cannot overlap Desktop-native pipelines.
+    Dispatch and a bounded macro-settle guard happen while the exact project
+    activation is protected. ``native_solve_window`` then suspends that outer
+    depth while this loop takes only short reactivation/message/monitor
+    transactions, allowing sibling native solves to overlap safely.
     """
 
     timeout_s, poll_s = _pooled_thermal_poll_settings(timeout_s, poll_s)
@@ -1050,12 +1052,26 @@ def _solve_exact_pooled_thermal_setup(
 
     sim.solver_may_be_running = True
     started = clock()
-    with sim.aedt_native_solve_window():
-        returned = native_design.Analyze(setup_name, True)
+    returned = native_design.Analyze(setup_name, False)
     if returned is not None and (type(returned) is not int or returned != 0):
         raise RuntimeError(
-            "[thermal] native blocking Analyze returned invalid status: "
+            "[thermal] native nonblocking Analyze returned invalid status: "
             f"{returned!r}"
+        )
+    from module.aedt_pool_adapter import pooled_async_dispatch_settle_seconds
+    settle_s = (
+        pooled_async_dispatch_settle_seconds()
+        if dispatch_settle_s is None else float(dispatch_settle_s)
+    )
+    if not math.isfinite(settle_s) or not 0 <= settle_s <= 30:
+        raise RuntimeError(
+            "pooled async dispatch settle must be between 0 and 30 seconds"
+        )
+    if settle_s:
+        sleeper(settle_s)
+    if str(native_design.GetName() or "").strip() != str(preflight["design"]):
+        raise RuntimeError(
+            "[thermal] async dispatch design identity changed during launch settle"
         )
 
     normal_completion = False
@@ -1069,56 +1085,55 @@ def _solve_exact_pooled_thermal_setup(
         "converged", "residual_threshold", "monitor_malformed",
     }
 
-    while True:
-        # The blocking Analyze macro is complete.  Exact project reactivation
-        # is now safe and remains protected by the caller's restored lock.
-        postflight = _prepare_thermal_dispatch(
-            sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
-            setup_name=setup_name,
-        )
-        terminal_postflight = postflight
-        update = advance_scoped_message_cursor(
-            _thermal_desktop_handle(sim, ipk), message_cursor
-        )
-        message_cursor = update.cursor
-        if update.fatal_messages:
-            evidence = " | ".join(update.fatal_messages[-6:])[:2000]
-            raise RuntimeError(
-                "[thermal] exact AEDT design reported a terminal error: "
-                f"{evidence}"
-            )
-        if update.normal_completion and not normal_completion:
-            normal_seen_at = clock()
-        normal_completion = normal_completion or update.normal_completion
-        convergence = _thermal_convergence_telemetry(
-            sim, postflight["native_ipk"], setup, attempts=1,
-            monitor_snapshot=monitor_snapshot,
-        )
-        reason = convergence["thermal_convergence_reason"]
-        if normal_completion and reason in terminal_monitor_reasons:
-            sim.solver_may_be_running = False
-            sim.save_project()
-            break
+    # Yield every level of the caller's held transaction. Each poll below
+    # reacquires it briefly and cannot race a sibling's activation.
+    with sim.aedt_native_solve_window():
+        while True:
+            with sim.aedt_automation_transaction():
+                postflight = _prepare_thermal_dispatch(
+                    sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
+                    setup_name=setup_name,
+                )
+                terminal_postflight = postflight
+                update = advance_scoped_message_cursor(
+                    _thermal_desktop_handle(sim, ipk), message_cursor
+                )
+                message_cursor = update.cursor
+                if update.fatal_messages:
+                    evidence = " | ".join(update.fatal_messages[-6:])[:2000]
+                    raise RuntimeError(
+                        "[thermal] exact AEDT design reported a terminal error: "
+                        f"{evidence}"
+                    )
+                if update.normal_completion and not normal_completion:
+                    normal_seen_at = clock()
+                normal_completion = normal_completion or update.normal_completion
+                convergence = _thermal_convergence_telemetry(
+                    sim, postflight["native_ipk"], setup, attempts=1,
+                    monitor_snapshot=monitor_snapshot,
+                )
+                reason = convergence["thermal_convergence_reason"]
+                if normal_completion and reason in terminal_monitor_reasons:
+                    sim.solver_may_be_running = False
+                    sim.save_project()
+                    break
 
-        now = clock()
-        if normal_completion and normal_seen_at is not None \
-                and now >= normal_seen_at + max(0.0, float(monitor_grace_s)):
-            # The exact Normal message proves this solver stopped, but a
-            # missing fresh residual artifact makes the thermal row invalid.
-            # Do not quarantine healthy siblings for an artifact failure.
-            sim.solver_may_be_running = False
-            break
-        if now >= deadline:
-            raise TimeoutError(
-                "[thermal] timed out waiting for exact project/design "
-                "Normal completion and a fresh residual monitor; "
-                f"normal_completion={normal_completion}, "
-                "reason="
-                f"{convergence['thermal_convergence_reason']}"
-            )
-        # The blocking macro has ended, but retain the transaction while
-        # waiting for message/result-file flush and re-attesting this design.
-        with sim.aedt_native_solve_window():
+            now = clock()
+            if normal_completion and normal_seen_at is not None \
+                    and now >= normal_seen_at + max(0.0, float(monitor_grace_s)):
+                # The exact Normal message proves this solver stopped, but a
+                # missing fresh residual artifact makes the thermal row invalid.
+                # Do not quarantine healthy siblings for an artifact failure.
+                sim.solver_may_be_running = False
+                break
+            if now >= deadline:
+                raise TimeoutError(
+                    "[thermal] timed out waiting for exact project/design "
+                    "Normal completion and a fresh residual monitor; "
+                    f"normal_completion={normal_completion}, "
+                    "reason="
+                    f"{convergence['thermal_convergence_reason']}"
+                )
             sleeper(min(poll_s, max(0.0, deadline - now)))
 
     identity = {
@@ -1138,7 +1153,7 @@ def _solve_exact_pooled_thermal_setup(
         "monitor_file": str(convergence.get("thermal_monitor_file", ""))[:256],
         "aedt_messages": [],
         "identity": identity,
-        "blocking": True,
+        "blocking": False,
         "normal_completion": normal_completion,
     }]
     forensic_json = _thermal_forensic_json(attempts, convergence)

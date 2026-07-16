@@ -29,9 +29,14 @@ ISOLATION_POLICY_ENV = "MFT_AEDT_ISOLATION_POLICY"
 SESSION_VERSION_ENV = "MFT_AEDT_SESSION_VERSION"
 POOL_FILL_TIMEOUT_ENV = "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"
 RELEASE_WAIT_ENV = "MFT_AEDT_RELEASE_WAIT_SECONDS"
+WORKLOAD_FAMILY_ENV = "MFT_AEDT_WORKLOAD_FAMILY"
+ASYNC_DISPATCH_SETTLE_ENV = "MFT_AEDT_ASYNC_DISPATCH_SETTLE_SECONDS"
 DEFAULT_SESSION_VERSION = "2025.2"
 POOL_HPC_CORES = 4
 DEFAULT_RELEASE_WAIT_SECONDS = 7200
+DEFAULT_WORKLOAD_FAMILY = "mft"
+VALIDATED_ASYNC_WORKLOAD_FAMILY = "mft_validated_async"
+DEFAULT_ASYNC_DISPATCH_SETTLE_SECONDS = 2.0
 TERMINAL_LEASE_STATES = {
     "released",
     "failed",
@@ -200,6 +205,52 @@ def pooled_isolation_policy(*, exclusive: bool) -> str:
     return policy
 
 
+def pooled_workload_family() -> str:
+    """Return the scheduler packing/solve-permit family for this client.
+
+    The async family is deliberately a separate exact value.  It lets a
+    rolling deployment keep predecessor clients in their serialized ``mft``
+    sessions while the scheduler grants three native-solve permits only to
+    the reviewed async successor.
+    """
+
+    family = os.environ.get(
+        WORKLOAD_FAMILY_ENV, DEFAULT_WORKLOAD_FAMILY
+    ).strip().lower()
+    if family not in {
+        DEFAULT_WORKLOAD_FAMILY,
+        VALIDATED_ASYNC_WORKLOAD_FAMILY,
+    }:
+        raise RuntimeError(
+            f"{WORKLOAD_FAMILY_ENV} must be "
+            f"{DEFAULT_WORKLOAD_FAMILY!r} or "
+            f"{VALIDATED_ASYNC_WORKLOAD_FAMILY!r}"
+        )
+    return family
+
+
+def pooled_async_dispatch_settle_seconds() -> float:
+    """Validate the short lock-held guard after ``Analyze(..., False)``."""
+
+    default = (
+        DEFAULT_ASYNC_DISPATCH_SETTLE_SECONDS
+        if pooled_workload_family() == VALIDATED_ASYNC_WORKLOAD_FAMILY
+        else 0.0
+    )
+    raw = os.environ.get(ASYNC_DISPATCH_SETTLE_ENV, str(default)).strip()
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"{ASYNC_DISPATCH_SETTLE_ENV} must be numeric"
+        ) from error
+    if not math.isfinite(seconds) or not 0 <= seconds <= 30:
+        raise RuntimeError(
+            f"{ASYNC_DISPATCH_SETTLE_ENV} must be between 0 and 30 seconds"
+        )
+    return seconds
+
+
 def pooled_workspace_path() -> Path:
     configured = os.environ.get("MFT_AEDT_POOL_WORKSPACE", "").strip()
     workspace = (
@@ -259,7 +310,7 @@ def acquire_pooled_desktop(
         request_key=f"mft-{request_mode}:{task_id or os.getpid()}",
         task_id=task_id,
         exclusive_session=not shared,
-        workload_family="mft",
+        workload_family=pooled_workload_family(),
         session_profile=pooled_session_profile(),
         project_namespace="mft",
         isolation_policy=pooled_isolation_policy(exclusive=not shared),
@@ -379,19 +430,18 @@ def automation_guard(lease: Any):
 
 
 def native_solve_window(lease: Any):
-    """Keep a held MFT automation transaction across native solve work.
-
-    AEDT 2025.2 did not remain process-stable when independent attached
-    clients released the session lock and entered blocking ``Analyze`` calls
-    concurrently.  The method remains as a compatibility context for the
-    existing solver/thermal call sites, but it deliberately never suspends the
-    session lock.  Three projects may stay attached to one Desktop; their
-    native solve, terminal-attestation, and extraction pipelines are serialized.
-    """
+    """Temporarily yield a held transaction during async native solve waits."""
 
     if lease is None:
         raise RuntimeError("pooled native solve requires an active AEDT lease")
-    return nullcontext()
+    factory = getattr(lease, "native_solve_window", None)
+    if callable(factory):
+        return factory()
+    if int(getattr(lease, "protocol_version", 1) or 1) < 2:
+        return nullcontext()
+    raise RuntimeError(
+        "scheduler attach client has no native-solve window support"
+    )
 
 
 def wait_for_native_pipeline_barrier(lease: Any) -> dict[str, Any]:

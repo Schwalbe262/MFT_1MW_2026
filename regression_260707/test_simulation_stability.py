@@ -3242,7 +3242,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
                 simulation, ipk, setup, monitor_grace_s=0,
             )
 
-        analyze.assert_called_once_with("ThermalSetup", True)
+        analyze.assert_called_once_with("ThermalSetup", False)
         self.assertEqual(result["solve_attempts"], 1)
         self.assertEqual(result["convergence"]["thermal_converged"], 1)
         self.assertFalse(simulation.solver_may_be_running)

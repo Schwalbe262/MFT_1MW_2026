@@ -132,6 +132,7 @@ from module.aedt_pool_adapter import (
     automation_guard as pooled_automation_guard,
     bind_project_name as bind_pooled_project_name,
     native_solve_window as pooled_native_solve_window,
+    pooled_async_dispatch_settle_seconds,
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
     validate_pooled_fill_timeout,
@@ -2454,7 +2455,7 @@ class Simulation():
         return status
 
     def aedt_native_solve_window(self):
-        """Compatibility context that never yields pooled MFT automation."""
+        """Suspend a held outer transaction while async native solves run."""
 
         if self._backend_mode() != "pooled":
             from contextlib import nullcontext
@@ -2463,7 +2464,7 @@ class Simulation():
         return pooled_native_solve_window(self.aedt_lease)
 
     def wait_for_pooled_native_pipeline(self):
-        """Join the cohort barrier after the serialized native extraction."""
+        """Join the cohort barrier after this project's native extraction."""
 
         if self._backend_mode() != "pooled" or bool(getattr(
                 self, "pooled_native_pipeline_done", False)):
@@ -6250,19 +6251,16 @@ class Simulation():
 
     def _analyze_exact_pooled_design(
             self, label, setup_name="Setup1", *, timeout_s=None, poll_s=None,
-            clock=time.monotonic, sleeper=time.sleep):
-        """Run one exact pooled solve without leaving an AEDT macro in flight.
+            dispatch_settle_s=None, clock=time.monotonic, sleeper=time.sleep):
+        """Dispatch one exact async solve and poll it in short transactions.
 
-        AEDT's native ``Analyze(..., False)`` is not merely a detached solver
-        dispatch.  The gRPC script macro can continue after that call returns,
-        and it still depends on Desktop-global active project/design state.  A
-        sibling lease is then able to acquire the automation lock, activate a
-        different project, and corrupt the first macro (``project is not
-        activated`` / incompatible calculator stack).  Keep the exact native
-        handle and the session automation lock from blocking Analyze through
-        terminal evidence.  The enclosing ``analyze_and_extract`` transaction
-        extends that same ownership through result extraction, so attached
-        sibling projects cannot overlap native pipelines in one Desktop.
+        AEDT 2025.2 supports overlapping project-scoped native solves, but its
+        nonblocking gRPC macro can remain dependent on the active project for a
+        short interval after ``Analyze`` returns.  Keep the session lock only
+        through a bounded launch-settle guard, then release it for the long
+        native solve.  Every terminal/convergence read reacquires the lock,
+        reactivates and verifies this exact project/design/setup, and releases
+        it again before sleeping.
         """
 
         expected_design_type, expected_solution_type = (
@@ -6302,8 +6300,8 @@ class Simulation():
             if saved is False:
                 raise RuntimeError("native project Save returned False before solve")
             # Save can create or replace AEDT result metadata.  Re-attest at
-            # the last point before entering blocking Analyze while retaining
-            # the session automation lock.
+            # the last point before nonblocking Analyze while retaining the
+            # session automation lock.
             self._ensure_pooled_shared_results_directory(design_alias)
             odesktop = self._native_desktop_handle()
             message_cursor = capture_scoped_message_cursor(
@@ -6315,25 +6313,37 @@ class Simulation():
             # suppresses project release, and lets the host quarantine safely.
             self.solver_may_be_running = True
             started = clock()
-            # The compatibility window is intentionally a no-op for MFT.  Keep
-            # every nesting level of this session transaction held so sibling
-            # projects cannot enter native Analyze concurrently.
-            with self.aedt_native_solve_window():
-                analyze_result = odesign.Analyze(setup_name, True)
+            analyze_result = odesign.Analyze(setup_name, False)
             if analyze_result is not None and (
                     type(analyze_result) is not int or analyze_result != 0):
                 raise RuntimeError(
-                    f"[{label}] native blocking Analyze returned invalid "
+                    f"[{label}] native nonblocking Analyze returned invalid "
                     f"status: {analyze_result!r}"
                 )
+            settle_s = (
+                pooled_async_dispatch_settle_seconds()
+                if dispatch_settle_s is None else float(dispatch_settle_s)
+            )
+            if not math.isfinite(settle_s) or not 0 <= settle_s <= 30:
+                raise RuntimeError(
+                    "pooled async dispatch settle must be between 0 and 30 seconds"
+                )
+            if settle_s:
+                # Live 1:2 evidence showed the solver child/license appeared
+                # less than one second after Analyze(False) returned.  Two
+                # seconds is a bounded guard against the active-project macro
+                # contamination seen when a sibling activated immediately.
+                sleeper(settle_s)
+            if _aedt_design_name(odesign) != design_alias:
+                raise _AedtIdentityMismatch(
+                    "async dispatch design identity changed during launch settle"
+                )
 
-            deadline = started + timeout_s
-            normal_completion = False
-            last_convergence_error = "normal completion has not been observed"
-            while True:
-                # Analyze(blocking=True) has returned, so no AEDT script macro
-                # remains dependent on the active project while these exact
-                # postflight reads briefly reactivate this lease's design.
+        deadline = started + timeout_s
+        normal_completion = False
+        last_convergence_error = "normal completion has not been observed"
+        while True:
+            with self.aedt_automation_transaction():
                 completed_project, completed_design = (
                     self._verified_pooled_native_setup(
                         setup_name=setup_name,
@@ -6385,26 +6395,21 @@ class Simulation():
                         self.solver_may_be_running = False
                         elapsed = max(0.0, clock() - started)
                         logging.info(
-                            "[%s] exact blocking terminal attestation: "
+                            "[%s] exact nonblocking terminal attestation: "
                             "passes=%s elapsed=%.3fs",
                             label, metrics.get("passes"), elapsed,
                         )
                         return elapsed
 
-                now = clock()
-                if now >= deadline:
-                    raise TimeoutError(
-                        f"[{label}] timed out after {timeout_s:.1f}s waiting for "
-                        "exact project/design terminal evidence; "
-                        f"normal_completion={normal_completion}, "
-                        f"last_convergence_error={last_convergence_error}"
-                    )
-                # Result/message files can flush shortly after a blocking call
-                # returns.  Keep the session transaction held during this
-                # bounded wait: a sibling Analyze must not start before exact
-                # terminal attestation and extraction complete.
-                with self.aedt_native_solve_window():
-                    sleeper(min(poll_s, max(0.0, deadline - now)))
+            now = clock()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"[{label}] timed out after {timeout_s:.1f}s waiting for "
+                    "exact project/design terminal evidence; "
+                    f"normal_completion={normal_completion}, "
+                    f"last_convergence_error={last_convergence_error}"
+                )
+            sleeper(min(poll_s, max(0.0, deadline - now)))
 
     def analyze_and_extract(self, label, extractor):
         """Analyze exactly once; result-query failures never justify another solve."""
@@ -6516,26 +6521,19 @@ class Simulation():
             self.activate_pooled_for_solve()
 
         analyze_started = time.monotonic()
-        # One outer transaction is continuous from native Analyze through its
-        # terminal postflight and result extraction.  Nested stage helpers are
-        # re-entrant, and MFT's native-solve compatibility window is a no-op.
-        with self.aedt_automation_transaction():
-            elapsed = _analyze_once()
-            solve_finished = time.monotonic()
-            self.stage_timings[f"stage_time_{label}_solve_s"] = elapsed
-            self.stage_timings[f"stage_time_{label}_analyze_overhead_s"] = max(
-                0.0, solve_finished - analyze_started - elapsed
-            )
-            extraction_started = time.monotonic()
-            try:
-                if pooled_backend:
+        elapsed = _analyze_once()
+        solve_finished = time.monotonic()
+        self.stage_timings[f"stage_time_{label}_solve_s"] = elapsed
+        self.stage_timings[f"stage_time_{label}_analyze_overhead_s"] = max(
+            0.0, solve_finished - analyze_started - elapsed
+        )
+        extraction_started = time.monotonic()
+        try:
+            if pooled_backend:
+                with self.aedt_automation_transaction():
                     expected_design_type, expected_solution_type = (
                         self._pooled_stage_contract(label)
                     )
-                    # Re-attest this exact project/design/setup before any
-                    # cached postprocessor, FieldsReporter, or modeler proxy is
-                    # allowed to run.  No sibling can transition Desktop state
-                    # between terminal postflight and this extraction.
                     self._verified_pooled_native_setup(
                         setup_name="Setup1",
                         expected_design_type=expected_design_type,
@@ -6544,15 +6542,17 @@ class Simulation():
                         project_refresh_retry_delay=0.5,
                         activate=True,
                     )
+                    extractor()
+            else:
                 extractor()
-            finally:
-                extraction_finished = time.monotonic()
-                self.stage_timings[f"stage_time_{label}_extract_s"] = (
-                    extraction_finished - extraction_started
-                )
-                self.stage_timings[f"stage_time_{label}_analyze_total_s"] = (
-                    extraction_finished - analyze_started
-                )
+        finally:
+            extraction_finished = time.monotonic()
+            self.stage_timings[f"stage_time_{label}_extract_s"] = (
+                extraction_finished - extraction_started
+            )
+            self.stage_timings[f"stage_time_{label}_analyze_total_s"] = (
+                extraction_finished - analyze_started
+            )
         return elapsed
 
     def get_execution_telemetry(self):
@@ -7518,8 +7518,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             )
             t0 = time.monotonic()
             try:
-                # Thermal build, blocking Analyze, terminal postflight, and
-                # extraction share one uninterrupted session transaction.
+                # Thermal build/dispatch/extract share one outer transaction;
+                # the async solve wait suspends it and uses short poll locks.
                 sim.activate_pooled_for_solve()
                 with sim.aedt_automation_transaction():
                     df_thermal = run_thermal_analysis(sim)
@@ -7545,9 +7545,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             total_time += t_thermal
             result_parts += [df_thermal, pd.DataFrame({"time_thermal": [t_thermal]})]
 
-        # Join only after this project's serialized native extraction has
-        # released the session lock.  The first member may then wait while its
-        # attached siblings acquire the lock and finish their own pipelines.
+        # Join only after this project's extraction has released the session
+        # lock. Native solves may overlap; Desktop-global extraction remains
+        # serialized by the short automation transactions.
         if backend == "pooled" and not model_only \
                 and sim.pooled_activation_done \
                 and not sim.pooled_native_pipeline_done:
