@@ -133,6 +133,17 @@ def test_data_counts_quality_throughput_and_revision(artifact_service):
     assert data["latest_revision"] == "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a"
     assert data["pinned_revision"] == "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
     assert data["pinned_library_revision"] == "c" * 40
+    assert data["training_cohort"] == {
+        "available": True,
+        "count_basis": "exact_solver_library_strict_full",
+        "raw_rows": 2,
+        "strict_em_rows": 2,
+        "strict_full_rows": 1,
+        "solver_revision": "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c",
+        "library_revision": "c" * 40,
+        "source_dataset_generation": None,
+        "updated_at": "2026-07-11T02:30:00+09:00",
+    }
     assert data["rows_not_latest_revision"] == 1
     assert data["rows_not_current_physics_revision"] == 0
     assert data["count_basis"] == "physics_revision_strict_full"
@@ -181,8 +192,13 @@ def test_data_revision_aggregate_does_not_reset_with_zero_pinned_status(
     assert data["total_rows"] == 1
     assert data["em_valid_rows"] == 1
     assert data["thermal_valid_rows"] == 1
+    assert data["training_cohort"]["strict_full_rows"] == 0
     assert data["pinned_revision"] == "b171c7ce5f7a018be6a575a32b1a1f5b7caa980c"
     assert data["latest_revision"] == "754923cf1c97bc45bcd9d8c6ba60d98773a5c30a"
+
+    dashboard = service.dashboard(record=False)
+    assert dashboard["data"]["total_rows"] == 1
+    assert dashboard["models"]["current_data_count"] == 0
 
 
 def test_models_include_planned_missing_targets_and_metrics(artifact_service):
