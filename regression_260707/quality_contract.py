@@ -86,6 +86,17 @@ PHYSICS_EQUIVALENT_SOLVER_REVISIONS: dict[str, frozenset[str]] = {
         "f0271da72ff4b9f085b3927769c583c163792adb",
         "f411bf5492669f87896eb657b9e5db2998d219a7",
         "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
+        # q22 approval 2026-07-16 is deliberately exact and directional.
+        # c7a0c792 is the q21b one-AEDT/three-project solved runtime
+        # (tasks 41796-41798).  092a35bb is its direct child; the reviewed
+        # c7a0c792..092a35bb diff changes collection/terminal validation only,
+        # while the solver, module tree, feeder, and standard profile Git
+        # objects are identical.  The auditable record is
+        # campaign/q22_physics_compatibility.json.  Never replace these exact
+        # SHAs with ancestry or prefix matching: an unreviewed descendant must
+        # remain rejected.
+        "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+        "092a35bb6e9552fa9c0ef7388c6059606844f2cd",
     }),
 }
 # Explicitly not enrolled: these physics-adjacent diffs remain unreviewed.

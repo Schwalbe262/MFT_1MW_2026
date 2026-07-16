@@ -18,6 +18,8 @@ class DummyScheduler:
     def __init__(self):
         self.parallel_target = 300
         self.policy_revision = 7
+        self.total_simulations = 500
+        self.demand_revision = 3
 
     def snapshot(self):
         return {
@@ -35,6 +37,14 @@ class DummyScheduler:
             "parallel_target_min": 0,
             "parallel_target_max": 500,
             "policy_revision": self.policy_revision,
+            "campaign_demand_supported": True,
+            "campaign_demand_control_enabled": True,
+            "total_simulations": self.total_simulations,
+            "campaign_demand_min": 0,
+            "campaign_demand_max": 100000,
+            "demand_revision": self.demand_revision,
+            "campaign_demand_scale_down_mode": "drain",
+            "campaign_demand_error": None,
             "scale_down_mode": "drain",
             "live_queued": 3,
             "live_attaching": 2,
@@ -83,6 +93,23 @@ class DummyScheduler:
             "resource_constraint": None,
             "control_gate_reason": None,
             "project_updated_at": FIXED_NOW.isoformat(),
+        }
+
+    def set_campaign_demand(self, target, *, expected_revision):
+        if expected_revision != self.demand_revision:
+            raise RuntimeError("stale demand revision")
+        self.total_simulations = target
+        self.demand_revision += 1
+        return {
+            "project": "MFT_1MW_2026v1",
+            "campaign_demand_supported": True,
+            "campaign_demand_control_enabled": True,
+            "total_simulations": target,
+            "campaign_demand_min": 0,
+            "campaign_demand_max": 100000,
+            "demand_revision": self.demand_revision,
+            "campaign_demand_scale_down_mode": "drain",
+            "campaign_demand_error": None,
         }
 
 

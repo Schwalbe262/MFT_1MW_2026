@@ -131,7 +131,7 @@ section { margin: 0 0 52px; scroll-margin-top: 100px; }
   background: linear-gradient(145deg, rgba(18,45,52,.96), rgba(9,23,31,.98));
   box-shadow: 0 20px 50px rgba(0,0,0,.14);
 }
-.parallel-control-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; }
+.parallel-control-heading { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 18px 28px; }
 .parallel-control-heading h2 { margin: 5px 0 6px; font-size: 20px; letter-spacing: -.025em; }
 .parallel-control-heading > div > p:last-child { margin: 0; color: var(--muted); font-size: 11px; }
 .parallel-target-form { flex: 0 0 min(360px, 42%); }

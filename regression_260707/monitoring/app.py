@@ -20,6 +20,7 @@ from filelock import FileLock
 from .readers import (
     TARGETS,
     ArtifactService,
+    CampaignDemandConflict,
     SchedulerReader,
     SimulationPolicyConflict,
 )
@@ -113,7 +114,10 @@ def create_app(
                 status_code=200,
             )
 
-    def require_local_operator_request(request: Request) -> None:
+    def require_local_operator_request(
+        request: Request,
+        control_header: str = "simulation-policy-v1",
+    ) -> None:
         """Permit bounded trusted-LAN operation while resisting Host/CSRF abuse."""
         client_host = request.client.host if request.client else ""
         try:
@@ -141,7 +145,7 @@ def create_app(
                 status_code=403,
                 detail="operator control Host is not allowlisted",
             )
-        if request.headers.get("x-mft-operator-control") != "simulation-policy-v1":
+        if request.headers.get("x-mft-operator-control") != control_header:
             raise HTTPException(status_code=403, detail="operator control header is required")
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -316,6 +320,94 @@ def create_app(
         return {
             "schema_version": 2,
             "updated": True,
+            **result,
+        }
+
+    @app.patch("/api/operator/campaign-demand")
+    async def api_set_campaign_demand(request: Request):
+        require_local_operator_request(request, "campaign-demand-v1")
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="request body must be JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="request body must be a JSON object")
+        if set(payload) != {"total_simulations", "expected_revision"}:
+            raise HTTPException(
+                status_code=422,
+                detail="only total_simulations and expected_revision are accepted",
+            )
+        target = payload.get("total_simulations")
+        expected_revision = payload.get("expected_revision")
+        if type(target) is not int:
+            raise HTTPException(status_code=422, detail="total_simulations must be an integer")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, (int, str))
+            or not str(expected_revision).strip()
+        ):
+            raise HTTPException(status_code=422, detail="expected_revision is required")
+        scheduler = getattr(service, "scheduler", None)
+        setter = getattr(scheduler, "set_campaign_demand", None)
+        if not callable(setter):
+            raise HTTPException(status_code=503, detail="campaign demand control is unavailable")
+        try:
+            def set_under_campaign_lock():
+                # This is the same lock held from demand GET through feeder
+                # submission, so a Web UI decrease cannot race a refill batch.
+                CAMPAIGN_MUTATION_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with FileLock(str(CAMPAIGN_MUTATION_LOCK_PATH), timeout=15 * 60):
+                    current = scheduler.snapshot()
+                    if current.get("campaign_demand_supported") is not True:
+                        raise RuntimeError(
+                            current.get("campaign_demand_error")
+                            or "scheduler campaign-demand is unavailable"
+                        )
+                    if current.get("campaign_demand_control_enabled") is not True:
+                        raise PermissionError("scheduler campaign-demand control is gated")
+                    if current.get("demand_revision") != expected_revision:
+                        raise CampaignDemandConflict(
+                            "campaign demand changed; refresh and retry"
+                        )
+                    minimum = current.get("campaign_demand_min")
+                    maximum = current.get("campaign_demand_max")
+                    if (
+                        type(minimum) is not int
+                        or type(maximum) is not int
+                        or not minimum <= target <= maximum
+                    ):
+                        raise ValueError(
+                            f"total_simulations must be between {minimum} and {maximum}"
+                        )
+                    return setter(target, expected_revision=expected_revision)
+
+            result = await run_in_threadpool(set_under_campaign_lock)
+        except CampaignDemandConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=423, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"campaign demand update failed: {type(exc).__name__}: {exc}",
+            ) from exc
+        LOGGER.info(
+            "campaign_demand_update source=%s project=%s expected_revision=%s "
+            "new_revision=%s total_simulations=%s semantics=drain-no-cancel",
+            request.client.host if request.client else "",
+            result.get("project"),
+            expected_revision,
+            result.get("demand_revision"),
+            target,
+        )
+        return {
+            "schema_version": 1,
+            "updated": True,
+            "no_cancellation_performed": True,
             **result,
         }
 

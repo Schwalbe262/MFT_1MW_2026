@@ -478,8 +478,9 @@ def submit(
         name, workdir, params, solver_revision, library_revision, *,
         cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None,
         required_project_cap=None, aedt_backend=None, submission_env=None,
-        required_hard_cap=None, max_project_active_tasks=None):
-    with open(PROFILE_PATH, encoding="utf-8") as stream:
+        required_hard_cap=None, max_project_active_tasks=None,
+        account_name="", profile_path=None):
+    with open(profile_path or PROFILE_PATH, encoding="utf-8") as stream:
         profile = json.load(stream)
     if timeout_seconds is not None:
         profile["timeout_seconds"] = int(timeout_seconds)
@@ -503,8 +504,22 @@ def submit(
         solver_revision=solver_revision,
         library_revision=library_revision,
         required_project_cap=required_project_cap,
+        account_name=account_name,
         **submission_options,
     )
+
+
+def _account_name_for_serial(account_names, serial):
+    """Return a stable account pin for one durable feeder serial."""
+    names = tuple(account_names or ())
+    if not names:
+        return ""
+    if any(not isinstance(value, str) or not value.strip() for value in names):
+        raise SchedulerError(
+            "pooled account_names must contain non-empty strings")
+    if isinstance(serial, bool) or not isinstance(serial, int) or serial <= 0:
+        raise SchedulerError("feeder serial must be a positive integer")
+    return names[(serial - 1) % len(names)]
 
 
 def load_state():
@@ -917,7 +932,12 @@ def cpu_submission_headroom(status_counts, allocations, ready_fit_slots):
 
 def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
          solver_revision=None, library_revision=None, candidate_seed=260710,
-         pooled_submission=None):
+         pooled_submission=None, max_new_tasks=None):
+    if (max_new_tasks is not None
+            and (isinstance(max_new_tasks, bool)
+                 or not isinstance(max_new_tasks, int)
+                 or max_new_tasks < 0)):
+        raise SchedulerError("max_new_tasks must be a non-negative integer")
     requested_active = int(target) + int(buffer)
     pooled_mode = _is_pooled_submission(pooled_submission)
     if pooled_mode and requested_active > MAX_POOLED_ACTIVE:
@@ -938,6 +958,7 @@ def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                 solver_revision=solver_revision,
                 library_revision=library_revision,
                 candidate_seed=candidate_seed,
+                _max_new_tasks=max_new_tasks,
                 **pooled_options,
             )
     return _step_locked(
@@ -945,6 +966,7 @@ def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         solver_revision=solver_revision,
         library_revision=library_revision,
         candidate_seed=candidate_seed,
+        _max_new_tasks=max_new_tasks,
         **pooled_options,
     )
 
@@ -953,7 +975,13 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                  solver_revision=None, library_revision=None,
                  candidate_seed=260710, _rapid_authorization=None,
                  _adopted_authorization=None, _submit_resources=None,
-                 _refill_journal=None, _pooled_submission=None):
+                 _refill_journal=None, _pooled_submission=None,
+                 _max_new_tasks=None):
+    if (_max_new_tasks is not None
+            and (isinstance(_max_new_tasks, bool)
+                 or not isinstance(_max_new_tasks, int)
+                 or _max_new_tasks < 0)):
+        raise SchedulerError("max_new_tasks must be a non-negative integer")
     requested_active = int(target) + int(buffer)
     if requested_active > 0 and not scheduler_client.campaign_mutation_lock_is_held():
         raise SchedulerError("campaign refill requires the project mutation lock")
@@ -1114,6 +1142,8 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         st.pop("candidate_raw_index", None)
     st["candidate_cursors"] = candidate_cursors
     n_new = min(deficit, (max_samples - projected_rows) // COUNT_PER_TASK)
+    if _max_new_tasks is not None:
+        n_new = min(n_new, _max_new_tasks)
     if _refill_journal is not None:
         _refill_journal["planned_count"] = int(n_new)
     if n_new <= 0:
@@ -1141,6 +1171,14 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             submit_kwargs = dict(_submit_resources or {})
             if _pooled_submission is not None:
                 submit_kwargs.update(_pooled_submission)
+            account_names = tuple(submit_kwargs.pop("account_names", ()) or ())
+            if account_names:
+                # The persisted serial is part of the durable task identity.
+                # Deriving placement from it keeps account pinning stable after
+                # a controller crash or an uncertain scheduler response.
+                submit_kwargs["account_name"] = _account_name_for_serial(
+                    account_names, int(item["serial"])
+                )
             if pooled_authorized:
                 submit_kwargs.update({
                     "required_hard_cap": hard_cap,
@@ -1208,7 +1246,13 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
                 "uncertain": False,
             }
             _refill_journal["events"].append(event)
-        item = {"name": name, "workdir": wd, "params": params, "event": event}
+        item = {
+            "name": name,
+            "workdir": wd,
+            "params": params,
+            "event": event,
+            "serial": int(st["serial"]),
+        }
         if batch_commit:
             planned.append(item)
         else:

@@ -89,8 +89,10 @@ RESONANCE_FIELDS = {
 # while an older scheduler has no simulation-policy capability to advertise.
 # Keep the fallback in one place so the UI never grows its own competing cap.
 DEFAULT_PARALLEL_TARGET_MIN = 0
-DEFAULT_PARALLEL_TARGET_MAX = 500
-PARALLEL_TARGET_SAFETY_CEILING = 600
+DEFAULT_PARALLEL_TARGET_MAX = 30
+PARALLEL_TARGET_SAFETY_CEILING = 30
+DEFAULT_CAMPAIGN_DEMAND_MIN = 0
+DEFAULT_CAMPAIGN_DEMAND_MAX = 100_000
 NODE_LOCAL_AEDT_PROJECT = "_aedt_pool_hosts"
 NODE_LOCAL_AEDT_ENTRYPOINT = "aedt_node_canary_host"
 NODE_LOCAL_AEDT_ACTIVE_STATES = ("queued", "attaching", "running")
@@ -1236,6 +1238,10 @@ class SimulationPolicyConflict(RuntimeError):
     """The scheduler rejected a stale simulation-policy revision."""
 
 
+class CampaignDemandConflict(RuntimeError):
+    """The scheduler rejected a stale total-demand revision."""
+
+
 class SchedulerReader:
     """Adapter for MFT scheduler status and durable simulation policy."""
 
@@ -1872,6 +1878,85 @@ class SchedulerReader:
             "project_updated_at": combined.get("updated_at"),
         }
 
+    def _campaign_demand_control(self, demand: Any) -> dict[str, Any]:
+        """Normalize the versioned total budget independently of concurrency."""
+        demand = self._validate_project_identity(demand)
+        total = self._first_count(demand.get("total_simulations"))
+        if total is None or total > DEFAULT_CAMPAIGN_DEMAND_MAX:
+            raise ValueError("scheduler total simulation demand is invalid")
+        revision = demand.get("demand_revision")
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, (int, str))
+            or not str(revision).strip()
+            or (isinstance(revision, int) and revision < 0)
+        ):
+            raise ValueError("scheduler campaign demand revision is invalid")
+        if str(demand.get("scale_down_mode") or "drain").lower() != "drain":
+            raise ValueError("scheduler campaign demand must use drain semantics")
+        return {
+            "campaign_demand_supported": True,
+            "campaign_demand_control_enabled": True,
+            "total_simulations": total,
+            "campaign_demand_min": DEFAULT_CAMPAIGN_DEMAND_MIN,
+            "campaign_demand_max": DEFAULT_CAMPAIGN_DEMAND_MAX,
+            "demand_revision": revision,
+            "campaign_demand_updated_at": demand.get("updated_at"),
+            "campaign_demand_updated_by": demand.get("updated_by"),
+            "campaign_demand_scale_down_mode": "drain",
+            "campaign_demand_error": None,
+        }
+
+    def set_campaign_demand(
+        self,
+        total_simulations: int,
+        *,
+        expected_revision: int | str,
+    ) -> dict[str, Any]:
+        """CAS-update total accepted-submission demand; never cancel live work."""
+        if (
+            type(total_simulations) is not int
+            or not DEFAULT_CAMPAIGN_DEMAND_MIN
+            <= total_simulations
+            <= DEFAULT_CAMPAIGN_DEMAND_MAX
+        ):
+            raise ValueError(
+                "total simulations must be an integer between "
+                f"{DEFAULT_CAMPAIGN_DEMAND_MIN} and "
+                f"{DEFAULT_CAMPAIGN_DEMAND_MAX}"
+            )
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, (int, str))
+            or not str(expected_revision).strip()
+        ):
+            raise ValueError("expected demand revision is required")
+        if not self.project_name:
+            raise ValueError("scheduler project control is not configured")
+        project_path = quote(self.project_name, safe="")
+        try:
+            demand = self._request_json(
+                f"/api/projects/{project_path}/campaign-demand",
+                method="PATCH",
+                payload={
+                    "total_simulations": total_simulations,
+                    "expected_revision": expected_revision,
+                },
+            )
+        except HTTPError as exc:
+            if exc.code == 409:
+                raise CampaignDemandConflict(
+                    "campaign demand changed; refresh and retry"
+                ) from exc
+            raise
+        control = self._campaign_demand_control(demand)
+        if control["total_simulations"] != total_simulations:
+            raise ValueError("scheduler campaign demand readback mismatch")
+        with self._lock:
+            self._cached = None
+            self._cached_at = 0.0
+        return control
+
     def set_simulation_policy(
         self,
         desired_simulations: int,
@@ -2013,6 +2098,27 @@ class SchedulerReader:
                                 "capability를 아직 제공하지 않습니다"
                             ),
                         })
+                    try:
+                        demand = self._request_json(
+                            f"/api/projects/{project_path}/campaign-demand"
+                        )
+                        result.update(self._campaign_demand_control(demand))
+                    except Exception as demand_error:
+                        # Total demand is a newer, independent capability. Its
+                        # absence disables only this field, never concurrency.
+                        result.update({
+                            "campaign_demand_supported": False,
+                            "campaign_demand_control_enabled": False,
+                            "total_simulations": None,
+                            "campaign_demand_min": DEFAULT_CAMPAIGN_DEMAND_MIN,
+                            "campaign_demand_max": DEFAULT_CAMPAIGN_DEMAND_MAX,
+                            "demand_revision": None,
+                            "campaign_demand_scale_down_mode": "drain",
+                            "campaign_demand_error": (
+                                "scheduler campaign-demand query failed: "
+                                f"{type(demand_error).__name__}: {demand_error}"
+                            ),
+                        })
                     result["project_error"] = None
                 except (
                     HTTPError,
@@ -2030,6 +2136,14 @@ class SchedulerReader:
                     result["parallel_target_min"] = DEFAULT_PARALLEL_TARGET_MIN
                     result["parallel_target_max"] = DEFAULT_PARALLEL_TARGET_MAX
                     result["policy_revision"] = None
+                    result["campaign_demand_supported"] = False
+                    result["campaign_demand_control_enabled"] = False
+                    result["total_simulations"] = None
+                    result["campaign_demand_min"] = DEFAULT_CAMPAIGN_DEMAND_MIN
+                    result["campaign_demand_max"] = DEFAULT_CAMPAIGN_DEMAND_MAX
+                    result["demand_revision"] = None
+                    result["campaign_demand_scale_down_mode"] = "drain"
+                    result["campaign_demand_error"] = "scheduler project unavailable"
                     result["live_queued"] = max(0, statuses.get("queued", 0))
                     result["live_attaching"] = max(0, statuses.get("attaching", 0))
                     result["live_active"] = max(0, statuses.get("running", 0))
@@ -2063,6 +2177,14 @@ class SchedulerReader:
                 "parallel_target_min": DEFAULT_PARALLEL_TARGET_MIN,
                 "parallel_target_max": DEFAULT_PARALLEL_TARGET_MAX,
                 "policy_revision": None,
+                "campaign_demand_supported": False,
+                "campaign_demand_control_enabled": False,
+                "total_simulations": None,
+                "campaign_demand_min": DEFAULT_CAMPAIGN_DEMAND_MIN,
+                "campaign_demand_max": DEFAULT_CAMPAIGN_DEMAND_MAX,
+                "demand_revision": None,
+                "campaign_demand_scale_down_mode": "drain",
+                "campaign_demand_error": "scheduler unavailable",
                 "live_queued": 0,
                 "live_attaching": 0,
                 "live_active": 0,

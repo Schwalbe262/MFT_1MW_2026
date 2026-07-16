@@ -379,6 +379,8 @@ class StrictRowContractTests(unittest.TestCase):
         expected_solver = "26afff8de2936f605783395fbff19d5f1d26b354"
         approved_solver = "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7"
         baseline_solver = "262574a886cef9e0f8f550d12571cf6d54c826e2"
+        proven_q21b_solver = "c7a0c792e2babc74ad1596a6b95b45379a6f903d"
+        q22_campaign_solver = "092a35bb6e9552fa9c0ef7388c6059606844f2cd"
         excluded_solver = "dba903eb671e37642168afc5578b8e6a93e9c046"
 
         self.assertEqual(
@@ -390,12 +392,16 @@ class StrictRowContractTests(unittest.TestCase):
                 "f0271da72ff4b9f085b3927769c583c163792adb",
                 "f411bf5492669f87896eb657b9e5db2998d219a7",
                 "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
+                proven_q21b_solver,
+                q22_campaign_solver,
             }),
         )
         rows = [
             _valid_native_result(git_hash=expected_solver),
             _valid_native_result(git_hash=baseline_solver),
             _valid_native_result(git_hash=approved_solver),
+            _valid_native_result(git_hash=proven_q21b_solver),
+            _valid_native_result(git_hash=q22_campaign_solver),
             _valid_native_result(git_hash=excluded_solver),
         ]
         audited = annotate_validity(
@@ -405,9 +411,64 @@ class StrictRowContractTests(unittest.TestCase):
         )
         self.assertEqual(
             audited["_strict_valid_full"].tolist(),
-            [True, True, True, False],
+            [True, True, True, True, True, False],
         )
-        self.assertEqual(audited.attrs["provenance_equivalent_rows"], 2)
+        self.assertEqual(audited.attrs["provenance_equivalent_rows"], 4)
+
+    def test_q22_compatibility_is_exact_directional_and_fail_closed(self):
+        expected_solver = "26afff8de2936f605783395fbff19d5f1d26b354"
+        proven_q21b_solver = "c7a0c792e2babc74ad1596a6b95b45379a6f903d"
+        q22_campaign_solver = "092a35bb6e9552fa9c0ef7388c6059606844f2cd"
+        unlisted_revision = "9" * 40
+
+        for approved_revision in (proven_q21b_solver, q22_campaign_solver):
+            with self.subTest(approved_revision=approved_revision):
+                result = validate_record(
+                    _valid_native_result(git_hash=approved_revision),
+                    expected_solver_revision=expected_solver,
+                    expected_library_revision=TEST_LIBRARY_REVISION,
+                )
+                self.assertTrue(result.full_valid)
+                self.assertNotIn(
+                    "untrusted_provenance:solver_revision_mismatch",
+                    result.reasons,
+                )
+
+        unlisted = validate_record(
+            _valid_native_result(git_hash=unlisted_revision),
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertFalse(unlisted.full_valid)
+        self.assertIn(
+            "untrusted_provenance:solver_revision_mismatch",
+            unlisted.reasons,
+        )
+
+        foreign_physics = validate_record(
+            _valid_native_result(
+                git_hash=q22_campaign_solver,
+                physics_data_revision="foreign-physics-revision",
+            ),
+            expected_solver_revision=expected_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertFalse(foreign_physics.full_valid)
+        self.assertIn(
+            "untrusted_provenance:solver_revision_mismatch",
+            foreign_physics.reasons,
+        )
+
+        reverse_direction = validate_record(
+            _valid_native_result(git_hash=expected_solver),
+            expected_solver_revision=q22_campaign_solver,
+            expected_library_revision=TEST_LIBRARY_REVISION,
+        )
+        self.assertFalse(reverse_direction.full_valid)
+        self.assertIn(
+            "untrusted_provenance:solver_revision_mismatch",
+            reverse_direction.reasons,
+        )
 
     def test_legacy_false_positive_is_quarantined(self):
         row = valid_result(conv_error_pct_matrix=13.254)

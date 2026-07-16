@@ -39,8 +39,16 @@
           <h2 id="parallel-control-title">MFT 병렬 실행 목표</h2>
           <p id="parallel-control-description">Scheduler의 versioned desired/effective 정책을 확인하는 중입니다.</p>
         </div>
+        <form id="campaign-demand-form" class="parallel-target-form" autocomplete="off">
+          <label for="campaign-demand-input">총 시뮬레이션 수 (기본 500)</label>
+          <div>
+            <input id="campaign-demand-input" name="total-demand" type="number" min="0" step="1" inputmode="numeric" disabled required>
+            <button id="campaign-demand-button" type="submit" disabled>총량 적용</button>
+          </div>
+          <p id="campaign-demand-status" class="parallel-target-status" aria-live="polite">총량 control을 확인하는 중입니다.</p>
+        </form>
         <form id="parallel-target-form" class="parallel-target-form" autocomplete="off">
-          <label for="parallel-target-input">Desired simulations</label>
+          <label for="parallel-target-input">동시 실행 수 (검증 상한 30)</label>
           <div>
             <input id="parallel-target-input" name="target" type="number" min="0" step="1" inputmode="numeric" disabled required>
             <button id="parallel-target-button" type="submit" disabled>목표 적용</button>
@@ -58,7 +66,8 @@
         </div>
       </div>
       <div class="parallel-live-grid" aria-label="MFT 실시간 작업 상태">
-        <div><span>Desired</span><strong id="parallel-current-target">—</strong></div>
+        <div><span>Total demand</span><strong id="campaign-total-demand">—</strong></div>
+        <div><span>Desired active</span><strong id="parallel-current-target">—</strong></div>
         <div><span>Effective</span><strong id="parallel-effective-target">—</strong></div>
         <div><span>Validated limit</span><strong id="parallel-validated-limit">—</strong></div>
         <div><span>논리 active</span><strong id="parallel-logical-active">—</strong></div>

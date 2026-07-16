@@ -10,6 +10,7 @@
     historyMetric: "r2",
     parityCache: new Map(), parityRequest: 0,
     parallelTargetDirty: false, updatingParallelTarget: false,
+    campaignDemandDirty: false, updatingCampaignDemand: false,
   };
 
   const labels = {
@@ -1179,6 +1180,12 @@
     node.className = `parallel-target-status${kind ? ` ${kind}` : ""}`;
   }
 
+  function campaignDemandStatus(message, kind = "") {
+    const node = $("#campaign-demand-status");
+    node.textContent = message;
+    node.className = `parallel-target-status${kind ? ` ${kind}` : ""}`;
+  }
+
   function snapshotMessage(value) {
     if (value == null || value === "") return null;
     if (typeof value === "string") return value;
@@ -1324,6 +1331,43 @@
     const displayedTarget = scheduler.desired_simulations
       ?? scheduler.parallel_target
       ?? refillController.concurrency_target;
+    const displayedDemand = scheduler.total_simulations;
+    const demandInput = $("#campaign-demand-input");
+    const demandButton = $("#campaign-demand-button");
+    const demandMinimum = Number(scheduler.campaign_demand_min);
+    const demandMaximum = Number(scheduler.campaign_demand_max);
+    const demandRevision = scheduler.demand_revision;
+    const demandEnabled = scheduler.connected === true
+      && scheduler.campaign_demand_supported === true
+      && scheduler.campaign_demand_control_enabled === true
+      && Number.isInteger(demandMinimum) && Number.isInteger(demandMaximum)
+      && demandMinimum <= demandMaximum
+      && (Number.isInteger(demandRevision)
+        || (typeof demandRevision === "string" && demandRevision.length > 0));
+    demandInput.min = Number.isInteger(demandMinimum) ? String(demandMinimum) : "0";
+    if (Number.isInteger(demandMaximum)) demandInput.max = String(demandMaximum);
+    else demandInput.removeAttribute("max");
+    if (!state.campaignDemandDirty
+        && document.activeElement !== demandInput
+        && displayedDemand != null) {
+      demandInput.value = String(displayedDemand);
+    }
+    demandInput.disabled = !demandEnabled || state.updatingCampaignDemand;
+    demandButton.disabled = !demandEnabled || state.updatingCampaignDemand;
+    setText("#campaign-total-demand", number(displayedDemand));
+    if (state.updatingCampaignDemand) {
+      campaignDemandStatus("총 시뮬레이션 수를 저장하는 중입니다.");
+    } else if (!demandEnabled) {
+      campaignDemandStatus(
+        scheduler.campaign_demand_error
+          || "Scheduler campaign-demand gate가 아직 열리지 않았습니다.",
+        "error",
+      );
+    } else {
+      campaignDemandStatus(
+        `총 ${number(displayedDemand)}개 · revision ${String(demandRevision)} · 감소 시 신규 제출만 중단`,
+      );
+    }
     setText("#parallel-current-target", number(displayedTarget));
     setText("#parallel-effective-target", number(scheduler.effective_simulations));
     setText("#parallel-validated-limit", number(scheduler.validated_concurrency_limit));
@@ -1451,6 +1495,75 @@
     if (!historyMetrics[metric]) return;
     state.historyMetric = metric;
     if (state.selectedModelData) renderModelHistory(state.selectedModelData);
+  });
+  $("#campaign-demand-input").addEventListener("input", () => {
+    state.campaignDemandDirty = true;
+  });
+  $("#campaign-demand-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.updatingCampaignDemand) return;
+    const input = $("#campaign-demand-input");
+    const target = Number(input.value);
+    const min = Number(input.min);
+    const max = Number(input.max);
+    if (!Number.isInteger(target) || target < min || target > max) {
+      campaignDemandStatus(`총량은 ${min}~${max} 사이 정수여야 합니다.`, "error");
+      input.focus();
+      return;
+    }
+    const scheduler = state.dashboard?.scheduler || {};
+    const current = Number(scheduler.total_simulations);
+    if (Number.isFinite(current) && target < current) {
+      const confirmed = window.confirm(
+        `총 시뮬레이션 수를 ${current}에서 ${target}(으)로 낮춥니다.\n`
+        + "이미 queued/attaching/running인 작업은 취소하지 않고, controller가 신규 제출만 멈춥니다."
+      );
+      if (!confirmed) return;
+    }
+    state.updatingCampaignDemand = true;
+    renderParallelControl(scheduler, state.dashboard?.refill_controller || {});
+    let applied = false;
+    try {
+      const response = await fetch("/api/operator/campaign-demand", {
+        method: "PATCH",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-MFT-Operator-Control": "campaign-demand-v1",
+        },
+        body: JSON.stringify({
+          total_simulations: target,
+          expected_revision: scheduler.demand_revision,
+        }),
+      });
+      let payload = {};
+      try { payload = await response.json(); } catch (error) { payload = {}; }
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      state.campaignDemandDirty = false;
+      if (state.dashboard) {
+        state.dashboard.scheduler = {
+          ...scheduler,
+          ...payload,
+          campaign_demand_supported: true,
+          campaign_demand_control_enabled: true,
+          connected: true,
+        };
+      }
+      applied = true;
+      await refresh();
+    } catch (error) {
+      campaignDemandStatus(`총량 적용 실패: ${error.message}`, "error");
+    } finally {
+      state.updatingCampaignDemand = false;
+      renderParallelControl(state.dashboard?.scheduler || scheduler, state.dashboard?.refill_controller || {});
+      if (applied) {
+        campaignDemandStatus(
+          `총 시뮬레이션 수 ${target}개를 저장했습니다. 실행 중인 작업은 취소하지 않습니다.`,
+          "success",
+        );
+      }
+    }
   });
   $("#parallel-target-input").addEventListener("input", () => {
     state.parallelTargetDirty = true;

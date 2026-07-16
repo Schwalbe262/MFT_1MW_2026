@@ -35,6 +35,9 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "final-time-matrix" in page.text
     assert "MFT 병렬 실행 목표" in page.text
     assert 'id="parallel-target-form" class="parallel-target-form"' in page.text
+    assert 'id="campaign-demand-form" class="parallel-target-form"' in page.text
+    assert "campaign-demand-input" in page.text
+    assert "campaign-total-demand" in page.text
     assert "parallel-target-input" in page.text
     assert "parallel-effective-target" in page.text
     assert "parallel-validated-limit" in page.text
@@ -100,6 +103,9 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "timingCell(evaluation.timing_seconds)" in script.text
     assert 'return "—"' in script.text
     assert 'fetch("/api/operator/simulation-policy"' in script.text
+    assert 'fetch("/api/operator/campaign-demand"' in script.text
+    assert '"X-MFT-Operator-Control": "campaign-demand-v1"' in script.text
+    assert "expected_revision: scheduler.demand_revision" in script.text
     assert '"X-MFT-Operator-Control": "simulation-policy-v1"' in script.text
     assert 'expected_revision: scheduler.policy_revision' in script.text
     assert 'scale_down_mode: "drain"' in script.text
@@ -332,6 +338,69 @@ def test_local_operator_can_set_versioned_drain_simulation_policy(
     assert response.json()["desired_simulations"] == 500
     assert response.json()["policy_revision"] == 8
     assert artifact_service.scheduler.parallel_target == 500
+
+
+def test_local_operator_can_cas_total_demand_without_cancelling_active_work(
+        artifact_service, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
+        tmp_path / "campaign-mutation.lock",
+    )
+    client = TestClient(
+        create_app(service=artifact_service),
+        base_url="http://127.0.0.1:8010",
+        client=("127.0.0.1", 51010),
+    )
+    response = client.patch(
+        "/api/operator/campaign-demand",
+        headers={
+            "Content-Type": "application/json",
+            "X-MFT-Operator-Control": "campaign-demand-v1",
+            "Origin": "http://127.0.0.1:8010",
+        },
+        json={"total_simulations": 250, "expected_revision": 3},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total_simulations"] == 250
+    assert response.json()["demand_revision"] == 4
+    assert response.json()["no_cancellation_performed"] is True
+    assert artifact_service.scheduler.total_simulations == 250
+    # Total demand is independent of the active-concurrency policy.
+    assert artifact_service.scheduler.parallel_target == 300
+
+
+def test_campaign_demand_rejects_stale_revision_and_wrong_control_header(
+        artifact_service, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "regression_260707.monitoring.app.CAMPAIGN_MUTATION_LOCK_PATH",
+        tmp_path / "campaign-mutation.lock",
+    )
+    client = TestClient(
+        create_app(service=artifact_service),
+        base_url="http://127.0.0.1:8010",
+        client=("127.0.0.1", 51011),
+    )
+    payload = {"total_simulations": 750, "expected_revision": 2}
+    wrong_header = client.patch(
+        "/api/operator/campaign-demand",
+        headers={
+            "Content-Type": "application/json",
+            "X-MFT-Operator-Control": "simulation-policy-v1",
+        },
+        json=payload,
+    )
+    assert wrong_header.status_code == 403
+    stale = client.patch(
+        "/api/operator/campaign-demand",
+        headers={
+            "Content-Type": "application/json",
+            "X-MFT-Operator-Control": "campaign-demand-v1",
+        },
+        json=payload,
+    )
+    assert stale.status_code == 409
+    assert artifact_service.scheduler.total_simulations == 500
 
 
 def test_simulation_policy_control_rejects_csrf_remote_and_invalid_requests(

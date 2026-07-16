@@ -1,0 +1,133 @@
+{
+  "schema": "q22-bounded-soak-physics-compatibility-v1",
+  "campaign_id": "q22-bounded-soak500-260716",
+  "reviewed_date": "2026-07-16",
+  "scope": "Directional row-provenance compatibility for the bounded q22 500-submission campaign; this is not permission to launch or to accept future descendants.",
+  "pins": {
+    "existing_training_cohort_solver_revision": "26afff8de2936f605783395fbff19d5f1d26b354",
+    "proven_runtime_solver_revision": "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+    "campaign_solver_revision": "092a35bb6e9552fa9c0ef7388c6059606844f2cd",
+    "pyaedt_library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+    "scheduler_package_commit": "9150e7fa7f72fdf00fb8113e157398b410833c40",
+    "physics_data_revision": "mft1mw-1k101-native-lamination-kf0p85-v3"
+  },
+  "ancestry_attestation": {
+    "checked_with": "git merge-base --is-ancestor",
+    "relations": [
+      {
+        "ancestor": "26afff8de2936f605783395fbff19d5f1d26b354",
+        "descendant": "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+        "result": true
+      },
+      {
+        "ancestor": "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+        "descendant": "092a35bb6e9552fa9c0ef7388c6059606844f2cd",
+        "result": true,
+        "direct_parent": true
+      }
+    ],
+    "note": "Ancestry is recorded evidence only. It is never an acceptance rule. Compatibility requires an exact SHA allowlist entry."
+  },
+  "q21b_runtime_evidence": {
+    "description": "One AEDT session with three attached MFT projects completed solve and release using the proven runtime and pinned library.",
+    "session_id": 536,
+    "solver_revision": "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+    "pyaedt_library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781",
+    "scheduler_package_commit": "9150e7fa7f72fdf00fb8113e157398b410833c40",
+    "tasks": [
+      {
+        "task_id": 41796,
+        "terminal_status": "completed",
+        "exit_code": 0
+      },
+      {
+        "task_id": 41797,
+        "terminal_status": "completed",
+        "exit_code": 0
+      },
+      {
+        "task_id": 41798,
+        "terminal_status": "completed",
+        "exit_code": 0
+      }
+    ],
+    "approval_boundary": "This evidence approves only the exact proven runtime SHA. It does not approve an arbitrary descendant."
+  },
+  "runtime_surface_attestation": {
+    "base_revision": "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+    "candidate_revision": "092a35bb6e9552fa9c0ef7388c6059606844f2cd",
+    "claim": "Every listed physics-generation/runtime-input path has the same Git object at the proven and campaign revisions.",
+    "required_identical_objects": [
+      {
+        "path": "run_simulation_260706.py",
+        "object_type": "blob",
+        "base_object_sha1": "df6f854f7b06e3e817d71649070d73d32b807006",
+        "candidate_object_sha1": "df6f854f7b06e3e817d71649070d73d32b807006"
+      },
+      {
+        "path": "module",
+        "object_type": "tree",
+        "base_object_sha1": "1f01dfe8b785648e2958d44714e21b739759098c",
+        "candidate_object_sha1": "1f01dfe8b785648e2958d44714e21b739759098c"
+      },
+      {
+        "path": "regression_260707/campaign/feeder.py",
+        "object_type": "blob",
+        "base_object_sha1": "efa1aed05281d42e2fe9a01125e76ab343f8fe6d",
+        "candidate_object_sha1": "efa1aed05281d42e2fe9a01125e76ab343f8fe6d"
+      },
+      {
+        "path": "regression_260707/verify/profiles/standard.json",
+        "object_type": "blob",
+        "base_object_sha1": "4f30763ff5a57f5cadce7f029f3d37624c7f8bd9",
+        "candidate_object_sha1": "4f30763ff5a57f5cadce7f029f3d37624c7f8bd9"
+      }
+    ],
+    "complete_name_status_diff": [
+      {
+        "status": "M",
+        "path": "regression_260707/campaign/collect_wave.py",
+        "base_object_sha1": "4c30657eebce298ad172e1bdc2bc6a38792030b3",
+        "candidate_object_sha1": "a0027b97436955f3fdc3d2aaca9fd1d3e1107261",
+        "review_scope": "result collection and terminal-result recovery"
+      },
+      {
+        "status": "M",
+        "path": "regression_260707/quality_contract.py",
+        "base_object_sha1": "ccb7a108e0bc67d145ea861255e9eaae09d7831a",
+        "candidate_object_sha1": "0e5e779eb39907ffda363c595a55361f8d3e16ee",
+        "review_scope": "strict result validity for an unavailable optional pooled CalcOp"
+      },
+      {
+        "status": "M",
+        "path": "regression_260707/test_pipeline_completion.py",
+        "base_object_sha1": "50d5ef2d73aadfe3461c5d696e7b5985a7a3c8aa",
+        "candidate_object_sha1": "52c0fad185151e216f7b2d1987186b8afc325d3e",
+        "review_scope": "tests only"
+      },
+      {
+        "status": "M",
+        "path": "regression_260707/verify/scheduler_client.py",
+        "base_object_sha1": "ad7e82f190ed7e5c2fbfec4fb5f8d77f3c2841b9",
+        "candidate_object_sha1": "2afc3beec2eebe151c668b2b21cceac899ec0d7a",
+        "review_scope": "strict terminal-result selection and validation"
+      }
+    ],
+    "verification_commands": [
+      "git diff --name-status c7a0c792e2babc74ad1596a6b95b45379a6f903d..092a35bb6e9552fa9c0ef7388c6059606844f2cd",
+      "git diff --quiet c7a0c792e2babc74ad1596a6b95b45379a6f903d..092a35bb6e9552fa9c0ef7388c6059606844f2cd -- run_simulation_260706.py module regression_260707/campaign/feeder.py regression_260707/verify/profiles/standard.json"
+    ]
+  },
+  "quality_contract": {
+    "expected_solver_revision": "26afff8de2936f605783395fbff19d5f1d26b354",
+    "approved_actual_solver_revisions_added_for_q22": [
+      "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+      "092a35bb6e9552fa9c0ef7388c6059606844f2cd"
+    ],
+    "directional": true,
+    "requires_clean_solver_checkout": true,
+    "requires_exact_physics_data_revision": true,
+    "accept_arbitrary_descendants": false,
+    "accept_abbreviated_sha": false
+  }
+}
