@@ -9,7 +9,7 @@ NSGA-2 멀티 재시작 드라이버.
   python run_nsga2.py --restarts 16 --round 1
 """
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -391,13 +391,16 @@ def _run_one_arrays(problem, seed, pop, warm_X, max_gen):
 
 def run_restarts(
     problem, restarts, pop, warm_X=None, workers=4, max_gen=600,
-    executor_factory=ProcessPoolExecutor,
+    executor_factory=None,
 ):
     """Run deterministic restart seeds concurrently and return seed order.
 
-    Four processes is the production ceiling.  Returning results in restart
-    order keeps the merged Pareto and manifest deterministic even though
-    futures finish out of order.
+    Four workers is the production ceiling.  Windows named-pipe transport cannot
+    reliably serialize the multi-gigabyte fitted-model graph into spawned
+    processes, so the local Windows lane shares that immutable graph between
+    threads.  Linux workers retain process isolation.  Returning results in
+    restart order keeps the merged Pareto and manifest deterministic even
+    though futures finish out of order.
     """
     restarts = int(restarts)
     workers = int(workers)
@@ -411,6 +414,10 @@ def run_restarts(
             _run_one_arrays(problem, 1000 + index, pop, warm_X, max_gen)
             for index in range(restarts)
         ]
+    if executor_factory is None:
+        executor_factory = (
+            ThreadPoolExecutor if os.name == "nt" else ProcessPoolExecutor
+        )
     ordered = {}
     with executor_factory(max_workers=workers) as executor:
         pending = {

@@ -507,6 +507,36 @@ class NsgaParallelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "between 1 and 4"):
             run_nsga2.run_restarts(object(), 16, 200, workers=5)
 
+    def test_windows_restarts_share_large_model_graph_between_threads(self):
+        from regression_260707.optimization import run_nsga2
+
+        class Result:
+            def __init__(self, seed):
+                self.X = np.array([[seed]])
+                self.F = np.array([[seed, seed]])
+                self.algorithm = type("Algorithm", (), {"n_gen": seed})()
+
+        factory = mock.Mock(
+            side_effect=lambda max_workers: ThreadPoolExecutor(
+                max_workers=max_workers
+            )
+        )
+        with mock.patch.object(run_nsga2.os, "name", "nt"), mock.patch.object(
+            run_nsga2, "ThreadPoolExecutor", factory
+        ), mock.patch.object(
+            run_nsga2,
+            "run_one",
+            side_effect=lambda problem, seed, **kw: Result(seed),
+        ):
+            results = run_nsga2.run_restarts(
+                object(), 2, 10, workers=2
+            )
+
+        factory.assert_called_once_with(max_workers=2)
+        self.assertEqual(
+            [int(item[0][0, 0]) for item in results], [1000, 1001]
+        )
+
     def test_infeasible_population_report_uses_stable_constraint_schema(self):
         from regression_260707.optimization import nsga2_problem, run_nsga2
 
