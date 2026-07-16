@@ -807,7 +807,7 @@ class CollectorFetchTests(unittest.TestCase):
                 "http://127.0.0.1:8001",
             )
 
-    def test_local_transport_failure_activates_8001_for_following_requests(self):
+    def test_local_transport_failure_retries_pinned_8002_endpoint(self):
         responses = [
             collect_wave.requests.ConnectionError("legacy listener unavailable"),
             FakeResponse(200, text="recovered"),
@@ -830,11 +830,11 @@ class CollectorFetchTests(unittest.TestCase):
             )
 
         self.assertEqual([call.args[0] for call in get_mock.call_args_list], [
-            "http://127.0.0.1:8000/api/health",
-            "http://127.0.0.1:8001/api/health",
-            "http://127.0.0.1:8001/api/tasks",
+            "http://127.0.0.1:8002/api/health",
+            "http://127.0.0.1:8002/api/health",
+            "http://127.0.0.1:8002/api/tasks",
         ])
-        sleep_mock.assert_not_called()
+        sleep_mock.assert_called_once_with(0.5)
 
     def test_explicit_remote_scheduler_never_falls_back_to_loopback(self):
         with mock.patch.object(

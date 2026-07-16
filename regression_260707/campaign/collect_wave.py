@@ -48,8 +48,10 @@ else:  # Direct execution: python campaign/collect_wave.py
         sys.path.insert(0, regression_root)
     from model_targets import CORE_REGION_TEMPERATURE_TARGETS
 
-DEFAULT_SCHEDULER = "http://127.0.0.1:8000"
-LOCAL_SCHEDULER_FALLBACK = "http://127.0.0.1:8001"
+# The live scheduler/UI is intentionally pinned to 8002.  Keeping the
+# collector's source default aligned with the launcher makes a restarted or
+# orphan-recovered worker safe even when its parent environment is absent.
+DEFAULT_SCHEDULER = "http://127.0.0.1:8002"
 
 
 def _configured_scheduler_url():
@@ -137,14 +139,6 @@ def _get_response(path, *, params=None, timeout=30, attempts=FETCH_ATTEMPTS):
             request_targets = [(None, path)]
         else:
             request_targets = [(SCHEDULER, f"{SCHEDULER}{path}")]
-            # The local scheduler may be moved to the recovery listener while
-            # a recurring collector is still configured for the legacy port.
-            # Never redirect an explicit remote endpoint to localhost.
-            if SCHEDULER == DEFAULT_SCHEDULER:
-                request_targets.append((
-                    LOCAL_SCHEDULER_FALLBACK,
-                    f"{LOCAL_SCHEDULER_FALLBACK}{path}",
-                ))
         for scheduler_base, url in request_targets:
             try:
                 response = requests.get(url, params=params, timeout=timeout)
