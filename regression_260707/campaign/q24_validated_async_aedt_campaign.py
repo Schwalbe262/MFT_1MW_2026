@@ -59,6 +59,24 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _verify_q24_pool_and_policy(base_url: str) -> tuple[dict[str, Any], int]:
+    """Require the server-side stop-loss to authorize only q24 async MFT."""
+
+    summary, logical_target = q23._verify_q23_pool_and_policy(base_url)
+    config = summary.get("config") or {}
+    expected_families = ["mft_validated_async"]
+    if (
+        config.get("native_solve_mode") != "validated_parallel"
+        or config.get("parallel_safe_native_solve_families")
+        != expected_families
+    ):
+        raise engine.GateError(
+            "q24 scheduler must run validated_parallel with only "
+            "mft_validated_async authorized for parallel native solves"
+        )
+    return summary, logical_target
+
+
 def _predecessor_manifest_path(state_path: Path) -> Path:
     return state_path.resolve().parent / f"{PREDECESSOR_CAMPAIGN_ID}.manifest.json"
 
@@ -531,6 +549,7 @@ def configure_engine(
     engine.PROVEN_RUNTIME_SOLVER = PREDECESSOR_SOLVER
     engine.LIBRARY_REVISION = LIBRARY_REVISION
     engine.verify_compatibility = _verify_q24_compatibility
+    engine.verify_pool_and_policy = _verify_q24_pool_and_policy
     engine.run_live_gates = _run_q24_live_gates
     engine.static_plan = _q24_static_plan
     engine.manifest_identity = _q24_manifest_identity

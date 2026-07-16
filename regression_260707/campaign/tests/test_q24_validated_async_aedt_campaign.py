@@ -161,6 +161,26 @@ def test_q24_submission_emits_only_validated_async_replacement(configured_engine
     assert environment["MFT_AEDT_ASYNC_DISPATCH_SETTLE_SECONDS"] == "2"
 
 
+def test_q24_pool_gate_requires_server_side_validated_parallel(monkeypatch):
+    summary = {
+        "config": {
+            "native_solve_mode": "validated_parallel",
+            "parallel_safe_native_solve_families": ["mft_validated_async"],
+        }
+    }
+    monkeypatch.setattr(
+        q23,
+        "_verify_q23_pool_and_policy",
+        lambda _url: (summary, 500),
+    )
+
+    assert q24._verify_q24_pool_and_policy("http://pool") == (summary, 500)
+
+    summary["config"]["native_solve_mode"] = "serial"
+    with pytest.raises(engine.GateError, match="validated_parallel"):
+        q24._verify_q24_pool_and_policy("http://pool")
+
+
 def test_rolling_inventory_counts_both_exact_cohorts_and_rejects_others(tmp_path):
     db_path = tmp_path / "scheduler.db"
     with sqlite3.connect(db_path) as connection:
