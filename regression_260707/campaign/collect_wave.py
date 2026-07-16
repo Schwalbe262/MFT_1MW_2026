@@ -14,6 +14,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -60,6 +61,10 @@ SOURCE_RANK_TERMINAL_CSV = 10
 SOURCE_RANK_JSON = 20
 SOURCE_RANK_LOCAL_CSV = 30
 SOURCE_RANK_LOCAL_PART = 40
+# A manually requested policy replay must be able to replace the same raw
+# scheduler payload after a collector bug is fixed. The one-point bump keeps
+# normal source precedence intact while making a second replay a no-op.
+SOURCE_RANK_RECOLLECT_OFFSET = 1
 
 FETCH_ATTEMPTS = 3
 RETRY_BASE_SECONDS = 0.5
@@ -441,8 +446,9 @@ def fetch_result_rows(task_id, out=None):
 
 # 프로브 전치 버그 수정 커밋 (2026-07-07). 이전 코드로 돌린 행은 _side/core_center
 # 프로브가 전치된 시트에서 평가된 값이라 무효 -> NaN 처리 (T_max_*, leeward는 유효)
-PROBE_FIX_HASHES_OK = None  # lazy: 수정 커밋 이후 해시 집합
+PROBE_FIX_HASHES_OK = None  # lazy: revision -> merge-base ancestry result
 PROBE_FIX_COMMIT = "6245ae84ba2734d2f1b6619fba3b2a8f15d20f42"
+GIT_REVISION_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 
@@ -523,34 +529,103 @@ def load_local_result_frames(cache):
     return frames, pending_parts
 
 
-def sanitize_bad_probes(df):
+def _probe_fix_git_run(command):
+    """Run a read-only git query against the solver repository."""
     import subprocess
+
+    return subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=os.path.join(HERE, "..", ".."),
+    )
+
+
+def _resolve_git_commit(revision):
+    result = _probe_fix_git_run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"]
+    )
+    resolved = str(result.stdout or "").strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", resolved):
+        return None
+    return resolved
+
+
+def _initialize_probe_fix_ancestry_cache():
+    """Validate the local repo before trusting any cached ancestry result."""
     global PROBE_FIX_HASHES_OK
+    if PROBE_FIX_HASHES_OK is not None:
+        return
+    try:
+        baseline = _resolve_git_commit(PROBE_FIX_COMMIT)
+    except Exception as exc:
+        raise RuntimeError("probe-fix git ancestry classification failed") from exc
+    if baseline is None:
+        raise RuntimeError(
+            "probe-fix git ancestry classification failed: baseline commit unavailable"
+        )
+    PROBE_FIX_HASHES_OK = {
+        PROBE_FIX_COMMIT: True,
+        baseline: True,
+    }
+
+
+def _is_post_probe_fix_revision(value):
+    """Classify a solver revision by its actual graph ancestry.
+
+    The old implementation enumerated only the ancestry path from the fix to
+    the collector's current HEAD. Valid commits on another branch were thus
+    incorrectly treated as pre-fix. Resolve each observed revision and ask git
+    whether the fix is its ancestor instead. Unknown or malformed hashes are
+    untrusted, while an unavailable repository aborts classification.
+    """
+    global PROBE_FIX_HASHES_OK
+    _initialize_probe_fix_ancestry_cache()
+
+    if not isinstance(value, str):
+        return False
+    revision = value.strip().lower()
+    if not GIT_REVISION_RE.fullmatch(revision):
+        return False
+    if revision in PROBE_FIX_HASHES_OK:
+        return bool(PROBE_FIX_HASHES_OK[revision])
+
+    try:
+        resolved = _resolve_git_commit(revision)
+        if resolved is None:
+            # A syntactically valid but absent/ambiguous object is not trusted.
+            PROBE_FIX_HASHES_OK[revision] = False
+            return False
+        if resolved in PROBE_FIX_HASHES_OK:
+            verdict = bool(PROBE_FIX_HASHES_OK[resolved])
+        else:
+            result = _probe_fix_git_run(
+                ["git", "merge-base", "--is-ancestor", PROBE_FIX_COMMIT, resolved]
+            )
+            if result.returncode == 0:
+                verdict = True
+            elif result.returncode == 1:
+                verdict = False
+            else:
+                raise RuntimeError(
+                    "git merge-base failed: " + str(result.stderr or "").strip()
+                )
+            PROBE_FIX_HASHES_OK[resolved] = verdict
+        PROBE_FIX_HASHES_OK[revision] = verdict
+        return verdict
+    except Exception as exc:
+        raise RuntimeError("probe-fix git ancestry classification failed") from exc
+
+
+def sanitize_bad_probes(df):
     if "git_hash" not in df.columns:
         return df, 0
-    if PROBE_FIX_HASHES_OK is None:
-        try:
-            git_run = {
-                "capture_output": True,
-                "text": True,
-                "encoding": "utf-8",
-                "errors": "replace",
-                "cwd": os.path.join(HERE, "..", ".."),
-            }
-            subprocess.run(
-                ["git", "merge-base", "--is-ancestor", PROBE_FIX_COMMIT, "HEAD"],
-                check=True,
-                **git_run,
-            )
-            descendants = subprocess.run(
-                ["git", "rev-list", "--ancestry-path", f"{PROBE_FIX_COMMIT}..HEAD"],
-                check=True,
-                **git_run,
-            ).stdout.split()
-            PROBE_FIX_HASHES_OK = {PROBE_FIX_COMMIT}
-            PROBE_FIX_HASHES_OK.update(descendants)
-        except Exception as exc:
-            raise RuntimeError("probe-fix git ancestry classification failed") from exc
+    # Initialize before changing the frame so a missing/wrong repository is a
+    # fail-closed collector error, not a destructive mass demotion.
+    _initialize_probe_fix_ancestry_cache()
     bad_cols = [
         column for column in df.columns
         if column.startswith("Tprobe_")
@@ -560,15 +635,7 @@ def sanitize_bad_probes(df):
             or column.startswith("Tprobe_core_center_")
         )
     ]
-    def _is_post_fix(value):
-        if not isinstance(value, str):
-            return False
-        revision = value.strip().lower()
-        if not revision:
-            return False
-        return any(commit.startswith(revision) for commit in PROBE_FIX_HASHES_OK)
-
-    mask = ~df["git_hash"].map(_is_post_fix)
+    mask = ~df["git_hash"].map(_is_post_probe_fix_revision)
     n = int(mask.sum())
     if n and bad_cols:
         df.loc[mask, bad_cols] = float("nan")
@@ -1197,7 +1264,18 @@ def main(argv=None):
             "RESULT_JSON rows; terminal collection is unaffected"
         ),
     )
+    ap.add_argument(
+        "--recollect-task", action="append", type=int, default=[],
+        help=(
+            "force a terminal scheduler task through the current collector "
+            "policy; repeatable and idempotent by sample identity"
+        ),
+    )
     args = ap.parse_args(argv)
+
+    recollect_task_ids = set(args.recollect_task)
+    if any(task_id <= 0 for task_id in recollect_task_ids):
+        ap.error("--recollect-task IDs must be positive")
 
     os.makedirs(DATASET_DIR, exist_ok=True)
     repaired_master_rows = repair_master_thermal_validity()
@@ -1206,6 +1284,28 @@ def main(argv=None):
 
     prefixes = tuple(dict.fromkeys([args.prefix, *args.extra_prefix]))
     tasks = list_tasks_for_prefixes(prefixes)
+    tasks_by_id = {int(task["id"]): task for task in tasks}
+    for task_id in sorted(recollect_task_ids - set(tasks_by_id)):
+        task = _get_json(f"/api/tasks/{task_id}", timeout=15)
+        if not isinstance(task, dict) or int(task.get("id", 0) or 0) != task_id:
+            raise RuntimeError(f"recollect task {task_id} lookup returned a mismatched task")
+        if not any(str(task.get("name", "")).startswith(prefix) for prefix in prefixes):
+            raise RuntimeError(
+                f"recollect task {task_id} is outside the configured prefix allowlist"
+            )
+        tasks_by_id[task_id] = task
+    tasks = sorted(tasks_by_id.values(), key=lambda task: int(task["id"]))
+    nonterminal_recollect = sorted(
+        task_id for task_id in recollect_task_ids
+        if str(tasks_by_id[task_id].get("status")) not in {
+            "completed", "failed", "cancelled"
+        }
+    )
+    if nonterminal_recollect:
+        raise RuntimeError(
+            "recollect tasks must be terminal: "
+            + ", ".join(str(task_id) for task_id in nonterminal_recollect)
+        )
     collection_label = "+".join(prefixes)
     if len(prefixes) > 1:
         print(f"task prefixes: {', '.join(prefixes)}")
@@ -1234,7 +1334,9 @@ def main(argv=None):
         reverse=True,
     )[:max(0, args.running_fetch_limit)]
     cache = _load_cache()
-    skip = set(cache.get("nodata", [])) | set(cache.get("harvested", []))
+    skip = (
+        set(cache.get("nodata", [])) | set(cache.get("harvested", []))
+    ) - recollect_task_ids
     frames = []
     n_salvaged = 0
     n_streamed = 0
@@ -1274,10 +1376,18 @@ def main(argv=None):
         task_frames = []
         json_frame = fetch_streamed_rows(t["id"], out=out)
         if json_frame is not None and len(json_frame):
-            task_frames.append((json_frame, SOURCE_RANK_JSON))
+            json_rank = SOURCE_RANK_JSON + (
+                SOURCE_RANK_RECOLLECT_OFFSET
+                if int(t["id"]) in recollect_task_ids else 0
+            )
+            task_frames.append((json_frame, json_rank))
         csv_frame = fetch_result_rows(t["id"], out=out)
         if csv_frame is not None and len(csv_frame):
-            task_frames.append((csv_frame, SOURCE_RANK_TERMINAL_CSV))
+            csv_rank = SOURCE_RANK_TERMINAL_CSV + (
+                SOURCE_RANK_RECOLLECT_OFFSET
+                if int(t["id"]) in recollect_task_ids else 0
+            )
+            task_frames.append((csv_frame, csv_rank))
         if task_frames:
             for frame, source_rank in task_frames:
                 frame["task_id"] = t["id"]

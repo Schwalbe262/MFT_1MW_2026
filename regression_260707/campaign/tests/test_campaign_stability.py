@@ -1429,6 +1429,72 @@ class CollectorDatasetTests(unittest.TestCase):
         persisted = json.loads(Path(collect_wave.CACHE_PATH).read_text(encoding="utf-8"))
         self.assertEqual(persisted["harvested"], [11])
 
+    def test_policy_recollect_replaces_demoted_row_once_without_raw_duplicate(self):
+        task_id = 41761
+        revision = "1519dd3"
+        project_name = "simulation35400"
+        saved_at = "2026-07-16T08:16:08+09:00"
+        master = Path(self.dataset_dir) / "train.parquet"
+        pd.DataFrame([{
+            "project_name": project_name,
+            "saved_at": saved_at,
+            "git_hash": revision,
+            "Tprobe_core_center_max": float("nan"),
+            "task_id": task_id,
+            "task_name": "mft-1to3-q18",
+        }]).to_parquet(master, index=False)
+        self.write_source_ranks([{
+            "project_name": project_name,
+            "saved_at": saved_at,
+            collect_wave.SOURCE_RANK_COLUMN: collect_wave.SOURCE_RANK_JSON,
+        }])
+        Path(collect_wave.CACHE_PATH).write_text(json.dumps({
+            "nodata": [], "harvested": [task_id], "local_parts": [],
+        }), encoding="utf-8")
+        task = {
+            "id": task_id,
+            "name": "mft-1to3-q18-s522-r35400",
+            "status": "completed",
+        }
+        stdout = "RESULT_JSON " + json.dumps({
+            "project_name": project_name,
+            "saved_at": saved_at,
+            "git_hash": revision,
+            "Tprobe_core_center_max": 87.0,
+        })
+
+        previous_ancestry = collect_wave.PROBE_FIX_HASHES_OK
+        collect_wave.PROBE_FIX_HASHES_OK = {revision: True}
+        try:
+            with mock.patch.object(
+                    collect_wave, "list_tasks", return_value=[]), mock.patch.object(
+                    collect_wave, "_get_json", return_value=task) as get_task, mock.patch.object(
+                    collect_wave, "fetch_stdout", return_value=stdout):
+                first = collect_wave.main([
+                    "--prefix", "mft-1to3", "--recollect-task", str(task_id)
+                ])
+                second = collect_wave.main([
+                    "--prefix", "mft-1to3", "--recollect-task", str(task_id)
+                ])
+        finally:
+            collect_wave.PROBE_FIX_HASHES_OK = previous_ancestry
+
+        self.assertEqual(get_task.call_count, 2)
+        self.assertEqual(first["new_unique_rows"], 1)
+        self.assertEqual(second["new_unique_rows"], 0)
+        repaired = pd.read_parquet(master)
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(repaired["Tprobe_core_center_max"].iloc[0], 87.0)
+        ranks = self.read_source_ranks()
+        self.assertEqual(len(ranks), 1)
+        self.assertEqual(
+            ranks[collect_wave.SOURCE_RANK_COLUMN].iloc[0],
+            collect_wave.SOURCE_RANK_JSON + collect_wave.SOURCE_RANK_RECOLLECT_OFFSET,
+        )
+        cache = json.loads(Path(collect_wave.CACHE_PATH).read_text(encoding="utf-8"))
+        self.assertEqual(cache["harvested"], [task_id])
+        self.assertEqual(len(list(Path(self.dataset_dir).glob("collected_*.parquet"))), 1)
+
     def test_parquet_failure_keeps_master_and_terminal_cache_uncommitted(self):
         master = Path(self.dataset_dir) / "train.parquet"
         pd.DataFrame(
@@ -1547,59 +1613,106 @@ class CollectorDatasetTests(unittest.TestCase):
 
 
 class ProbeSanitizerTests(unittest.TestCase):
-    def test_git_ancestry_uses_utf8_and_preserves_rx_side_leeward(self):
-        responses = [
-            mock.Mock(stdout=""),
-            mock.Mock(stdout="newhash000000000000000000000000000000000\n"),
-        ]
-        frame = pd.DataFrame([
-            {
-                "git_hash": "newhash",
-                "Tprobe_core_center_max": 87.0,
-                "Tprobe_Rx_main_side_max": 88.0,
-                "Tprobe_Rx_side_leeward_max": 89.0,
-            },
-            {
-                "git_hash": "oldhash",
-                "Tprobe_core_center_max": 77.0,
-                "Tprobe_Rx_main_side_max": 78.0,
-                "Tprobe_Rx_side_leeward_max": 79.0,
-            },
-        ])
-        previous = collect_wave.PROBE_FIX_HASHES_OK
-        collect_wave.PROBE_FIX_HASHES_OK = None
-        try:
-            with mock.patch("subprocess.run", side_effect=responses) as run:
-                sanitized, count = collect_wave.sanitize_bad_probes(frame.copy())
-        finally:
-            collect_wave.PROBE_FIX_HASHES_OK = previous
+    BASELINE = collect_wave.PROBE_FIX_COMMIT
+    SIDE_ABBREV = "a1b2c3d"
+    SIDE_FULL = SIDE_ABBREV + "0" * 33
+    OLD_ABBREV = "b1c2d3e"
+    OLD_FULL = OLD_ABBREV + "0" * 33
+    UNKNOWN_ABBREV = "c1d2e3f"
 
-        self.assertEqual(count, 1)
+    def setUp(self):
+        self.previous_cache = collect_wave.PROBE_FIX_HASHES_OK
+        collect_wave.PROBE_FIX_HASHES_OK = None
+
+    def tearDown(self):
+        collect_wave.PROBE_FIX_HASHES_OK = self.previous_cache
+
+    @staticmethod
+    def _completed(command, returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+    def _git_side_effect(self, *, side_result=0, old_result=1):
+        def run(command, **kwargs):
+            if command[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+                revision = command[-1].split("^", 1)[0]
+                resolved = {
+                    self.BASELINE: self.BASELINE,
+                    self.SIDE_ABBREV: self.SIDE_FULL,
+                    self.OLD_ABBREV: self.OLD_FULL,
+                }.get(revision)
+                if resolved is None:
+                    return self._completed(command, 128, stderr="unknown revision")
+                return self._completed(command, stdout=resolved + "\n")
+            if command[:3] == ["git", "merge-base", "--is-ancestor"]:
+                if command[-1] == self.SIDE_FULL:
+                    return self._completed(command, side_result)
+                if command[-1] == self.OLD_FULL:
+                    return self._completed(command, old_result)
+            raise AssertionError(f"unexpected git query: {command}")
+
+        return run
+
+    @staticmethod
+    def _probe_frame(revision, temperature=87.0):
+        return pd.DataFrame([{
+            "git_hash": revision,
+            "Tprobe_core_center_max": temperature,
+            "Tprobe_Rx_main_side_max": temperature + 1,
+            "Tprobe_Rx_side_leeward_max": temperature + 2,
+        }])
+
+    def test_side_branch_descendant_is_preserved_by_true_merge_base_query(self):
+        frame = self._probe_frame(self.SIDE_ABBREV)
+        with mock.patch(
+                "subprocess.run", side_effect=self._git_side_effect()) as run:
+            sanitized, count = collect_wave.sanitize_bad_probes(frame.copy())
+
+        self.assertEqual(count, 0)
         self.assertEqual(sanitized["Tprobe_core_center_max"].iloc[0], 87.0)
-        self.assertTrue(pd.isna(sanitized["Tprobe_core_center_max"].iloc[1]))
-        self.assertTrue(pd.isna(sanitized["Tprobe_Rx_main_side_max"].iloc[1]))
-        self.assertEqual(sanitized["Tprobe_Rx_side_leeward_max"].tolist(), [89.0, 79.0])
-        self.assertEqual(run.call_count, 2)
+        merge_calls = [
+            call.args[0] for call in run.call_args_list
+            if call.args[0][:3] == ["git", "merge-base", "--is-ancestor"]
+        ]
+        self.assertEqual(merge_calls, [[
+            "git", "merge-base", "--is-ancestor", self.BASELINE, self.SIDE_FULL
+        ]])
+        self.assertNotIn("HEAD", merge_calls[0])
         for call in run.call_args_list:
             self.assertEqual(call.kwargs["encoding"], "utf-8")
             self.assertEqual(call.kwargs["errors"], "replace")
-            self.assertTrue(call.kwargs["check"])
-        self.assertEqual(run.call_args_list[0].args[0][:3], ["git", "merge-base", "--is-ancestor"])
-        self.assertEqual(run.call_args_list[1].args[0][:3], ["git", "rev-list", "--ancestry-path"])
+            self.assertFalse(call.kwargs["check"])
+
+    def test_non_descendant_is_demoted_but_unrelated_leeward_probe_remains(self):
+        frame = self._probe_frame(self.OLD_ABBREV, temperature=77.0)
+        with mock.patch("subprocess.run", side_effect=self._git_side_effect()):
+            sanitized, count = collect_wave.sanitize_bad_probes(frame.copy())
+
+        self.assertEqual(count, 1)
+        self.assertTrue(pd.isna(sanitized["Tprobe_core_center_max"].iloc[0]))
+        self.assertTrue(pd.isna(sanitized["Tprobe_Rx_main_side_max"].iloc[0]))
+        self.assertEqual(sanitized["Tprobe_Rx_side_leeward_max"].iloc[0], 79.0)
+
+    def test_unknown_commit_is_untrusted_without_running_merge_base(self):
+        frame = self._probe_frame(self.UNKNOWN_ABBREV)
+        with mock.patch(
+                "subprocess.run", side_effect=self._git_side_effect()) as run:
+            sanitized, count = collect_wave.sanitize_bad_probes(frame.copy())
+
+        self.assertEqual(count, 1)
+        self.assertTrue(pd.isna(sanitized["Tprobe_core_center_max"].iloc[0]))
+        self.assertFalse(any(
+            call.args[0][:3] == ["git", "merge-base", "--is-ancestor"]
+            for call in run.call_args_list
+        ))
 
     def test_git_classification_failure_aborts_without_mutating_data(self):
         frame = pd.DataFrame({
             "git_hash": ["newhash"],
             "Tprobe_core_center_max": [87.0],
         })
-        previous = collect_wave.PROBE_FIX_HASHES_OK
-        collect_wave.PROBE_FIX_HASHES_OK = None
-        try:
-            with mock.patch("subprocess.run", side_effect=OSError("git unavailable")):
-                with self.assertRaisesRegex(RuntimeError, "ancestry classification failed"):
-                    collect_wave.sanitize_bad_probes(frame)
-        finally:
-            collect_wave.PROBE_FIX_HASHES_OK = previous
+        with mock.patch("subprocess.run", side_effect=OSError("git unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "ancestry classification failed"):
+                collect_wave.sanitize_bad_probes(frame)
         self.assertEqual(frame["Tprobe_core_center_max"].iloc[0], 87.0)
 
 
