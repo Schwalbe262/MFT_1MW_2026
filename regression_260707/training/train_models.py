@@ -835,6 +835,10 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
                 }
                 for future in as_completed(futures):
                     persist_trained(future.result())
+                    # A Future retains its fitted model bundle after result().
+                    # Drop it immediately so a 21-target run does not hold all
+                    # already-persisted ensembles in memory until the end.
+                    del futures[future]
 
         report = {
             "schema_version": REGISTRY_SCHEMA_VERSION,
