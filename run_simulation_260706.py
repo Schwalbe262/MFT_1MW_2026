@@ -125,6 +125,7 @@ from module.electrostatic_cap import (
     parse_maxwell_capacitance_export,
 )
 from module.aedt_pool_adapter import (
+    PooledReleaseSettlementError,
     aedt_backend,
     acquire_pooled_desktop,
     activate_project as activate_pooled_project,
@@ -7003,7 +7004,10 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
                 if lease is not None:
                     try:
                         report_pooled_failure(
-                            lease, error, solver_may_run=False
+                            lease,
+                            error,
+                            solver_may_run=False,
+                            lifecycle_phase="admission_or_attach",
                         )
                         release_pooled_project(lease, wait_seconds=120)
                     except Exception:
@@ -7054,6 +7058,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     held = [False]  # hold 성공 시 finally에서 desktop을 닫지 않기 위한 플래그
     pooled_release_suppressed = [False]
     pooled_settlement_error = [None]
+    pooled_lifecycle_phase = "admission_or_attach"
     delete_project_on_exit = not (fixed_mode or hold or model_only)
     baseline_descendants = _snapshot_descendants()
     try:
@@ -7071,6 +7076,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         # close_on_exit 속성 오류가 발생하므로 직접 생성하고 finally에서 해제한다.
         aedt_startup_started = time.monotonic()
         desktop, sim = _create_simulation_session()
+        pooled_lifecycle_phase = "modeling"
         sim.stage_timings.update({
             "stage_time_process_pre_run_s": max(
                 0.0, run_started - _PROCESS_STARTED_MONOTONIC
@@ -7344,6 +7350,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
         result_parts = [sim.df_plus]
         total_time = 0.0
+        pooled_lifecycle_phase = "native_pipeline"
 
         # ---- design1: L/k 매트릭스 (전류원, 기존 방식) ----
         if matrix_on:
@@ -7556,6 +7563,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 )
                 return True
             try:
+                pooled_lifecycle_phase = "release_settlement"
                 sim.close_project()
             except Exception as e:
                 logging.exception(f"Error closing project: {e}")
@@ -7563,6 +7571,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     raise
             return
 
+        pooled_lifecycle_phase = "postprocess"
         pre_result_finished = time.monotonic()
         sim.stage_timings["stage_time_pre_result_s"] = (
             pre_result_finished - run_started
@@ -7651,6 +7660,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             return bool(em_result_valid and thermal_result_valid)
 
         try:
+            pooled_lifecycle_phase = "release_settlement"
             sim.close_project()
         except Exception as e:
             logging.exception(f"Error closing project: {e}")
@@ -7669,24 +7679,37 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 and sim is not None
                 and sim.aedt_lease is not None):
             solver_uncertain = bool(sim.solver_may_be_running)
-            try:
-                report_pooled_failure(
-                    sim.aedt_lease,
-                    e,
-                    solver_may_run=solver_uncertain,
+            if isinstance(e, PooledReleaseSettlementError):
+                # release_project already requested host-owned settlement and
+                # performed its final status recheck.  Do not overwrite that
+                # truthful `releasing` state with a solver/script fault, and do
+                # not turn an actually incomplete close into task success.
+                pooled_release_suppressed[0] = True
+                pooled_settlement_error[0] = e
+                logging.error(
+                    "pooled AEDT release settlement remains incomplete: %s", e
                 )
-                pooled_release_suppressed[0] = solver_uncertain
-                if not solver_uncertain:
-                    release_pooled_project(sim.aedt_lease)
-                    sim.pooled_release_done = True
-            except Exception as settlement_error:
-                pooled_release_suppressed[0] = solver_uncertain
-                pooled_settlement_error[0] = settlement_error
-                logging.exception("failed to settle pooled AEDT failure")
+            else:
+                try:
+                    report_pooled_failure(
+                        sim.aedt_lease,
+                        e,
+                        solver_may_run=solver_uncertain,
+                        lifecycle_phase=pooled_lifecycle_phase,
+                    )
+                    pooled_release_suppressed[0] = solver_uncertain
+                    if not solver_uncertain:
+                        release_pooled_project(sim.aedt_lease)
+                        sim.pooled_release_done = True
+                except Exception as settlement_error:
+                    pooled_release_suppressed[0] = solver_uncertain
+                    pooled_settlement_error[0] = settlement_error
+                    logging.exception("failed to settle pooled AEDT failure")
         if fixed_mode:
             # fixed 모드에서는 실패를 조용히 넘기지 않는다
             if (
                     pooled_settlement_error[0] is not None
+                    and pooled_settlement_error[0] is not e
                     and hasattr(e, "add_note")):
                 e.add_note(
                     "pooled AEDT failure settlement also failed: "

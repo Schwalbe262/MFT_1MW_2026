@@ -326,24 +326,82 @@ def test_bind_release_and_failure_classification(monkeypatch):
         lease,
         TimeoutError("solver timed out"),
         solver_may_run=False,
+        lifecycle_phase="admission",
     )
     adapter.report_failure(
         lease,
         RuntimeError("bad input"),
         solver_may_run=False,
+        lifecycle_phase="postprocess",
     )
 
     assert ("bind", "simulation_pilot") in lease.calls
     assert ("release", {"wait_seconds": 9}) in lease.calls
     fault_kinds = [call[1] for call in lease.calls if call[0] == "fault"]
     assert fault_kinds == ["admission_timeout", "script_error"]
+    fault_phases = [
+        call[2]["phase"] for call in lease.calls if call[0] == "fault"
+    ]
+    assert fault_phases == ["admission", "postprocess"]
+
+
+def test_release_default_matches_long_shared_postprocess_cap(monkeypatch):
+    lease = FakeLease()
+    monkeypatch.delenv("MFT_AEDT_RELEASE_WAIT_SECONDS", raising=False)
+
+    assert adapter.release_project(lease)["state"] == "released"
+
+    assert ("release", {"wait_seconds": 7200}) in lease.calls
+
+
+def test_release_accepts_host_ack_from_final_status_recheck():
+    lease = FakeLease()
+    lease.release = Mock(return_value={"state": "releasing"})
+    lease.status = Mock(return_value={"state": "released"})
+
+    status = adapter.release_project(lease, wait_seconds=1)
+
+    assert status["state"] == "released"
+    lease.status.assert_called_once_with()
 
 
 def test_nonreleased_host_ack_fails_closed():
     lease = FakeLease()
     lease.release = lambda **_kwargs: {"state": "releasing"}
-    with pytest.raises(RuntimeError, match="not acknowledged"):
+    with pytest.raises(
+        adapter.PooledReleaseSettlementError, match="not acknowledged"
+    ):
         adapter.release_project(lease, wait_seconds=1)
+
+
+def test_release_settlement_is_not_reported_as_solver_or_script_fault():
+    lease = FakeLease()
+    error = adapter.PooledReleaseSettlementError({"state": "releasing"})
+
+    with pytest.raises(ValueError, match="must not be reported"):
+        adapter.report_failure(
+            lease,
+            error,
+            solver_may_run=False,
+            lifecycle_phase="release_settlement",
+        )
+
+    assert not any(call[0] == "fault" for call in lease.calls)
+
+
+def test_postprocess_timeout_is_not_classified_as_admission_timeout():
+    lease = FakeLease()
+
+    adapter.report_failure(
+        lease,
+        TimeoutError("postprocess timed out"),
+        solver_may_run=False,
+        lifecycle_phase="postprocess",
+    )
+
+    fault = next(call for call in lease.calls if call[0] == "fault")
+    assert fault[1] == "script_error"
+    assert fault[2]["phase"] == "postprocess"
 
 
 class FakeSharedDesktop:

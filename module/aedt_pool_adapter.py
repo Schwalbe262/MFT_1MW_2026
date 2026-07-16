@@ -28,14 +28,28 @@ SHARED_CANARY_ACK = "MFT_AEDT_SHARED_CANARY"
 ISOLATION_POLICY_ENV = "MFT_AEDT_ISOLATION_POLICY"
 SESSION_VERSION_ENV = "MFT_AEDT_SESSION_VERSION"
 POOL_FILL_TIMEOUT_ENV = "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"
+RELEASE_WAIT_ENV = "MFT_AEDT_RELEASE_WAIT_SECONDS"
 DEFAULT_SESSION_VERSION = "2025.2"
 POOL_HPC_CORES = 4
+DEFAULT_RELEASE_WAIT_SECONDS = 7200
 TERMINAL_LEASE_STATES = {
     "released",
     "failed",
     "cancelled",
     "expired",
 }
+
+
+class PooledReleaseSettlementError(RuntimeError):
+    """The host has not completed an explicitly requested project release."""
+
+    def __init__(self, status: Any):
+        self.status = status if isinstance(status, dict) else {}
+        self.state = str(self.status.get("state") or "")
+        super().__init__(
+            "pooled AEDT project close was not acknowledged: "
+            f"state={self.state!r}"
+        )
 
 
 def aedt_backend() -> str:
@@ -282,6 +296,7 @@ def acquire_pooled_desktop(
                 lease,
                 error,
                 solver_may_run=False,
+                lifecycle_phase="admission_or_attach",
             )
             lease.release(wait_seconds=120)
         except Exception:
@@ -402,35 +417,74 @@ def wait_for_native_pipeline_barrier(lease: Any) -> dict[str, Any]:
 
 
 def release_project(lease: Any, *, wait_seconds: int | None = None) -> dict:
+    if wait_seconds is None:
+        # One shared session can serialize three long native postprocessors
+        # behind the Desktop-global automation lock. Keep the release ACK
+        # budget aligned with that lock's 7200-second production cap. An
+        # explicit operator override remains authoritative for diagnostics.
+        wait_seconds = _positive_int_env(
+            RELEASE_WAIT_ENV, DEFAULT_RELEASE_WAIT_SECONDS
+        )
+    else:
+        wait_seconds = int(wait_seconds)
+        if wait_seconds <= 0:
+            raise RuntimeError("pooled AEDT release wait must be positive")
     status = lease.release(
-        wait_seconds=(
-            _positive_int_env("MFT_AEDT_RELEASE_WAIT_SECONDS", 300)
-            if wait_seconds is None else int(wait_seconds)
-        )
+        wait_seconds=wait_seconds
     )
-    state = str(status.get("state") or "")
+    state = str(status.get("state") or "") if isinstance(status, dict) else ""
+    if state == "releasing":
+        # The scheduler client polls to its deadline. Close the narrow race
+        # where the host commits release just after that final poll, without
+        # treating any genuinely incomplete settlement as success.
+        read_status = getattr(lease, "status", None)
+        if callable(read_status):
+            try:
+                late_status = read_status()
+            except Exception as error:
+                raise PooledReleaseSettlementError(status) from error
+            if isinstance(late_status, dict):
+                status = late_status
+                state = str(status.get("state") or "")
     if state != "released":
-        raise RuntimeError(
-            f"pooled AEDT project close was not acknowledged: state={state!r}"
-        )
+        raise PooledReleaseSettlementError(status)
     return status
 
 
-def report_failure(lease: Any, error: BaseException, *, solver_may_run: bool) -> dict:
+def report_failure(
+    lease: Any,
+    error: BaseException,
+    *,
+    solver_may_run: bool,
+    lifecycle_phase: str = "",
+) -> dict:
+    if isinstance(error, PooledReleaseSettlementError):
+        # A release was already requested and the host owns its settlement.
+        # Reporting this as a solver/script fault would overwrite the true
+        # lifecycle state and unnecessarily quarantine healthy siblings.
+        raise ValueError(
+            "pooled release settlement errors must not be reported as AEDT faults"
+        )
     text = f"{type(error).__name__}: {error}"[:4000]
     lower = text.lower()
+    phase_hint = str(lifecycle_phase or "").strip() or "runtime"
     if solver_may_run:
         kind = "solver_timeout"
         phase = "solve"
-    elif "timeout" in lower or "timed out" in lower:
+    elif (
+        ("timeout" in lower or "timed out" in lower)
+        and phase_hint in {"admission", "admission_or_attach", "attach"}
+    ):
         kind = "admission_timeout"
-        phase = "admission"
+        phase = phase_hint
     elif any(token in lower for token in ("grpc", "desktop died", "connection reset")):
         kind = "aedt_transport_death"
-        phase = "attach_or_transport"
+        phase = (
+            phase_hint if phase_hint != "runtime" else "attach_or_transport"
+        )
     else:
         kind = "script_error"
-        phase = "pre_solve"
+        phase = phase_hint
     return lease.report_fault(
         kind,
         phase=phase,
