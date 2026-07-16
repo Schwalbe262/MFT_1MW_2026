@@ -134,6 +134,11 @@ from module.aedt_pool_adapter import (
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
     validate_pooled_fill_timeout,
+    wait_for_native_pipeline_barrier as pooled_native_pipeline_barrier,
+)
+from module.aedt_terminal_attestation import (
+    advance_scoped_message_cursor,
+    capture_scoped_message_cursor,
 )
 
 from ansys.aedt.core import settings
@@ -913,6 +918,19 @@ def _project_delete_policy(input_frame, fixed_mode=False, hold=False, model_only
     keep_values = input_frame.get("keep_project", pd.Series([default_keep]))
     keep_project = int(keep_values.iloc[0]) != 0
     return not (keep_project or hold or model_only)
+
+
+def _final_fixed_project_save_required(backend, fixed_mode=False, hold=False):
+    """Avoid a redundant pooled save after terminal solve attestation.
+
+    Every pooled native stage already saves its exact project before terminal
+    attestation returns.  Thermal field-summary extraction does not change the
+    solved field data, while another final save can hold Desktop automation
+    behind a ~30 minute extraction and delay ``RESULT_JSON``.  Pooled hold is
+    rejected at admission, but retain it here as a fail-safe preservation rule.
+    """
+
+    return bool(hold or (fixed_mode and str(backend) != "pooled"))
 
 
 def _load_fixed_input_parameter(param):
@@ -1947,6 +1965,7 @@ class Simulation():
         self.aedt_lease = None
         self.pooled_release_done = False
         self.pooled_activation_done = False
+        self.pooled_native_pipeline_done = False
         self.solver_may_be_running = False
 
     def create_simulation_name(self):
@@ -2441,6 +2460,21 @@ class Simulation():
 
             return nullcontext()
         return pooled_native_solve_window(self.aedt_lease)
+
+    def wait_for_pooled_native_pipeline(self):
+        """Join the cohort barrier before long Desktop-global extraction."""
+
+        if self._backend_mode() != "pooled" or bool(getattr(
+                self, "pooled_native_pipeline_done", False)):
+            return None
+        status = pooled_native_pipeline_barrier(self.aedt_lease)
+        self.pooled_native_pipeline_done = True
+        logging.info(
+            "pooled native-pipeline cohort complete: %s/%s",
+            status.get("native_pipeline_completed_count"),
+            status.get("native_pipeline_expected_count"),
+        )
+        return status
 
     def _verified_native_project_handle(self):
         """Return this runner's cached project after exact-name attestation."""
@@ -4257,6 +4291,25 @@ class Simulation():
                 route_errors.append(f"{route_name}={type(error).__name__}: {error}")
         raise RuntimeError("; ".join(route_errors))
 
+    def _verified_fields_reporter_project(self, native_project):
+        """Reject a pooled reporter route that is not owned by this lease."""
+        if self._backend_mode() != "pooled":
+            return native_project
+        expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
+        get_name = getattr(native_project, "GetName", None)
+        if not expected_project or not callable(get_name):
+            raise _AedtIdentityMismatch(
+                "FieldsReporter project identity is unavailable"
+            )
+        actual_project = str(get_name() or "").strip()
+        if actual_project != expected_project:
+            raise _AedtIdentityMismatch(
+                "FieldsReporter project identity mismatch: "
+                f"expected={expected_project!r}, "
+                f"actual={actual_project or '<empty>'!r}"
+            )
+        return native_project
+
     def _fresh_fields_reporter(self, max_attempts=3, retry_delay=2):
         """Reacquire FieldsReporter without re-running the completed EM solve."""
         last_error = None
@@ -4279,6 +4332,9 @@ class Simulation():
             candidate_errors = []
             for label, native_project in candidates:
                 try:
+                    native_project = self._verified_fields_reporter_project(
+                        native_project
+                    )
                     reporter = self._fields_reporter_from_project(
                         native_project, design_name
                     )
@@ -4291,6 +4347,9 @@ class Simulation():
 
             try:
                 refreshed_project = self._refresh_native_project_handle()
+                refreshed_project = self._verified_fields_reporter_project(
+                    refreshed_project
+                )
                 reporter = self._fields_reporter_from_project(
                     refreshed_project, design_name
                 )
@@ -4749,6 +4808,36 @@ class Simulation():
 
         return self._add_field_expression(expr_name, _build)
 
+    def _optional_core_surface_flux_expression(self):
+        """Register optional surface-flux evidence without polluting pooled AEDT.
+
+        AEDT 2025.2's gRPC FieldsReporter rejects this surface CalcOp chain in
+        the shared pooled runtime and records each rejected attempt as a Script
+        macro error.  The metric is explicitly optional: the production physics
+        gate uses independently attested Faraday and winding-linkage evidence.
+        Mark it unavailable before transport in pooled mode instead of emitting
+        three known AEDT errors or pretending the evidence exists.
+        """
+        if self._backend_mode() == "pooled":
+            return (
+                None,
+                "pooled_optional_calcop_unavailable:"
+                "center_leg_surface_flux_uses_equivalent_faraday_evidence",
+            )
+        try:
+            expression = self._calc_core_flux_integral(
+                self.design1.core_flux_sheets, "Phi_center_leg_B_normal"
+            )
+        except Exception as exc:
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            reason = f"grpc_calcop_unavailable:{detail}"
+            logging.warning(
+                "Center-leg surface-flux expression is unavailable; "
+                f"continuing loss extraction: {reason}"
+            )
+            return None, reason
+        return expression, ""
+
     @staticmethod
     def _select_explicit_turns(turns, count):
         """Select inner/outer turns once, preserving their original order."""
@@ -4843,19 +4932,9 @@ class Simulation():
                 b_expr_group[mean_expr] = group_index
                 b_expr_group[max_expr] = group_index
                 b_expr_volume[mean_expr] = volume
-        flux_expr = None
-        flux_unavailable_reason = ""
-        try:
-            flux_expr = self._calc_core_flux_integral(
-                self.design1.core_flux_sheets, "Phi_center_leg_B_normal"
-            )
-        except Exception as exc:
-            detail = " ".join(str(exc).split()) or type(exc).__name__
-            flux_unavailable_reason = f"grpc_calcop_unavailable:{detail}"
-            logging.warning(
-                "Center-leg surface-flux expression is unavailable; "
-                f"continuing loss extraction: {flux_unavailable_reason}"
-            )
+        flux_expr, flux_unavailable_reason = (
+            self._optional_core_surface_flux_expression()
+        )
         flux_section_area_retained_m2 = float("nan")
         if flux_expr is not None:
             try:
@@ -5636,8 +5715,8 @@ class Simulation():
             self, setup_name="Setup1", *, design_name="",
             expected_design_type="Maxwell 3D", expected_solution_type="AC Magnetic",
             project_refresh_max_attempts=1,
-            project_refresh_retry_delay=0.5):
-        """Resolve one exact pooled setup without Desktop active state."""
+            project_refresh_retry_delay=0.5, activate=False):
+        """Resolve one exact pooled setup, optionally reactivating it under lock."""
         expected_project = str(getattr(self, "PROJECT_NAME", "") or "").strip()
         expected_design = _aedt_design_name(design_name) or _aedt_design_name(
             getattr(self.design1, "design_name", ""))
@@ -5648,6 +5727,18 @@ class Simulation():
             get_projects_max_attempts=project_refresh_max_attempts,
             get_projects_retry_delay=project_refresh_retry_delay,
         )
+        if activate:
+            # Native Analyze and result exports are design-scoped, but AEDT's
+            # scripting application still has Desktop-global active pointers.
+            # Change those pointers only while the session automation lock is
+            # held, then read the exact identities back before the call.
+            odesktop = self._native_desktop_handle()
+            active_project = odesktop.SetActiveProject(expected_project)
+            if active_project is None or active_project is False:
+                raise RuntimeError(
+                    f"SetActiveProject returned no project ({expected_project})"
+                )
+            oproject = active_project
         actual_project = str(oproject.GetName() or "").strip()
         if actual_project != expected_project:
             raise _AedtIdentityMismatch(
@@ -5655,9 +5746,12 @@ class Simulation():
                 f"expected={expected_project}, actual={actual_project or '<empty>'}"
             )
 
-        odesign = _find_raw_design(
-            oproject, expected_design, allow_activation=False
-        )
+        if activate:
+            odesign = oproject.SetActiveDesign(expected_design)
+        else:
+            odesign = _find_raw_design(
+                oproject, expected_design, allow_activation=False
+            )
         if odesign is None or odesign is False:
             raise RuntimeError(f"native project returned no design ({expected_design})")
         actual_design = _aedt_design_name(odesign)
@@ -6052,18 +6146,132 @@ class Simulation():
             "copied-loss post-dispatch identity check failed: " + "; ".join(errors)
         )
 
-    def _analyze_exact_pooled_design(self, label, setup_name="Setup1"):
-        """Run one project-scoped native solve outside the automation lock."""
+    @staticmethod
+    def _pooled_terminal_poll_settings(timeout_s=None, poll_s=None):
+        """Validate bounded settings for project-scoped terminal polling."""
 
+        if timeout_s is None:
+            raw_timeout = os.environ.get(
+                "MFT_AEDT_POOLED_SOLVE_TIMEOUT_SECONDS", "7200"
+            ).strip()
+            try:
+                timeout_s = float(raw_timeout)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise RuntimeError(
+                    "MFT_AEDT_POOLED_SOLVE_TIMEOUT_SECONDS must be numeric"
+                ) from error
+            if not 30 <= timeout_s <= 86400:
+                raise RuntimeError(
+                    "MFT_AEDT_POOLED_SOLVE_TIMEOUT_SECONDS must be between "
+                    "30 and 86400"
+                )
+        else:
+            timeout_s = float(timeout_s)
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                raise ValueError("pooled solve timeout must be positive")
+
+        if poll_s is None:
+            raw_poll = os.environ.get(
+                "MFT_AEDT_POOLED_SOLVE_POLL_SECONDS", "2"
+            ).strip()
+            try:
+                poll_s = float(raw_poll)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise RuntimeError(
+                    "MFT_AEDT_POOLED_SOLVE_POLL_SECONDS must be numeric"
+                ) from error
+            if not 0.1 <= poll_s <= 30:
+                raise RuntimeError(
+                    "MFT_AEDT_POOLED_SOLVE_POLL_SECONDS must be between 0.1 and 30"
+                )
+        else:
+            poll_s = float(poll_s)
+            if not math.isfinite(poll_s) or poll_s < 0:
+                raise ValueError("pooled solve poll interval must be non-negative")
+        return timeout_s, poll_s
+
+    def _pooled_terminal_convergence_locked(
+            self, label, setup_name, native_design):
+        """Export and parse one fresh exact-design convergence history."""
+
+        tolerance_columns = {
+            "matrix": "matrix_percent_error",
+            "cap": "cap_percent_error",
+            "loss": "percent_error",
+        }
+        try:
+            tolerance_column = tolerance_columns[label]
+            tolerance = float(self.df_plus[tolerance_column].iloc[0])
+        except (KeyError, TypeError, ValueError, OverflowError, IndexError) as error:
+            raise RuntimeError(
+                f"[{label}] configured convergence tolerance is unavailable"
+            ) from error
+        if not math.isfinite(tolerance) or tolerance <= 0:
+            raise RuntimeError(
+                f"[{label}] configured convergence tolerance is invalid"
+            )
+
+        target = None
+        provenance = None
+        stage = f"{label}_{setup_name}_terminal_convergence"
+        try:
+            target, provenance = self._new_aedt_export_target(stage)
+            get_variation = getattr(native_design, "GetNominalVariation", None)
+            variation = get_variation() if callable(get_variation) else ""
+            exported_at = time.time()
+            exported = native_design.ExportConvergence(
+                setup_name, str(variation or ""), target
+            )
+            if exported is False:
+                raise RuntimeError("ExportConvergence returned False")
+            text = self._read_attested_aedt_export(
+                target, provenance, exported_at, stage
+            )
+            return _parse_convergence_history(text, tolerance)
+        finally:
+            if target and provenance:
+                self._remove_attested_aedt_export(target, provenance, stage)
+
+    @staticmethod
+    def _pooled_stage_contract(label):
+        """Return the exact native design identity for one pooled stage."""
         contracts = {
             "matrix": ("Maxwell 3D", "AC Magnetic"),
             "loss": ("Maxwell 3D", "AC Magnetic"),
             "cap": ("Maxwell 3D", "Electrostatic"),
         }
         try:
-            expected_design_type, expected_solution_type = contracts[label]
+            return contracts[label]
         except KeyError as error:
-            raise RuntimeError(f"unsupported pooled solve label: {label!r}") from error
+            raise RuntimeError(
+                f"unsupported pooled solve label: {label!r}"
+            ) from error
+
+    def _analyze_exact_pooled_design(
+            self, label, setup_name="Setup1", *, timeout_s=None, poll_s=None,
+            clock=time.monotonic, sleeper=time.sleep):
+        """Run one exact pooled solve without leaving an AEDT macro in flight.
+
+        AEDT's native ``Analyze(..., False)`` is not merely a detached solver
+        dispatch.  The gRPC script macro can continue after that call returns,
+        and it still depends on Desktop-global active project/design state.  A
+        sibling lease is then able to acquire the automation lock, activate a
+        different project, and corrupt the first macro (``project is not
+        activated`` / incompatible calculator stack).  Keep the exact native
+        handle captured under the lock, suspend the lock only for the blocking
+        project-scoped Analyze call, then reacquire it before reading terminal
+        evidence.  Sibling native solves can still overlap while each caller
+        waits in its own blocking gRPC call; only unsafe asynchronous macros
+        are excluded.
+        """
+
+        expected_design_type, expected_solution_type = (
+            self._pooled_stage_contract(label)
+        )
+
+        timeout_s, poll_s = self._pooled_terminal_poll_settings(
+            timeout_s=timeout_s, poll_s=poll_s
+        )
 
         # Activation is deliberately delayed until modeling is complete.  The
         # scheduler's solve permit therefore becomes a three-project
@@ -6074,6 +6282,7 @@ class Simulation():
                 setup_name=setup_name,
                 expected_design_type=expected_design_type,
                 expected_solution_type=expected_solution_type,
+                activate=True,
             )
             odesktop = self._native_desktop_handle()
             registry_key = (
@@ -6095,43 +6304,106 @@ class Simulation():
             # Save can create or replace AEDT result metadata.  Re-attest at
             # the last point before yielding the automation lock and Analyze.
             self._ensure_pooled_shared_results_directory(design_alias)
+            odesktop = self._native_desktop_handle()
+            message_cursor = capture_scoped_message_cursor(
+                odesktop, self.PROJECT_NAME, design_alias
+            )
+            self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
+            # Keep this true through every uncertain/failure path.  The existing
+            # top-level pooled fault settlement then reports solver_timeout,
+            # suppresses project release, and lets the host quarantine safely.
+            self.solver_may_be_running = True
+            started = clock()
+            # ``native_solve_window`` releases every nesting level of this
+            # lease's automation transaction, allowing sibling projects to
+            # model and start their own blocking native solves concurrently.
+            # It restores the lock before this context continues.
+            with self.aedt_native_solve_window():
+                analyze_result = odesign.Analyze(setup_name, True)
+            if analyze_result is not None and (
+                    type(analyze_result) is not int or analyze_result != 0):
+                raise RuntimeError(
+                    f"[{label}] native blocking Analyze returned invalid "
+                    f"status: {analyze_result!r}"
+                )
 
-        self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
-        self.solver_may_be_running = True
-        started = time.time()
-        try:
-            analyze_result = odesign.Analyze(setup_name, True)
-        except Exception:
-            # Keep solver_may_be_running=True: a transport exception cannot
-            # prove whether the blocking native operation remained in flight.
-            with self.aedt_automation_transaction():
-                self._log_recent_aedt_messages(label)
-            raise
-        elapsed = time.time() - started
-        if analyze_result is not None and (
-                type(analyze_result) is not int or analyze_result != 0):
-            raise RuntimeError(
-                f"[{label}] native Analyze returned invalid status: "
-                f"{analyze_result!r}"
-            )
-        self.solver_may_be_running = False
+            deadline = started + timeout_s
+            normal_completion = False
+            last_convergence_error = "normal completion has not been observed"
+            while True:
+                # Analyze(blocking=True) has returned, so no AEDT script macro
+                # remains dependent on the active project while these exact
+                # postflight reads briefly reactivate this lease's design.
+                completed_project, completed_design = (
+                    self._verified_pooled_native_setup(
+                        setup_name=setup_name,
+                        expected_design_type=expected_design_type,
+                        expected_solution_type=expected_solution_type,
+                        project_refresh_max_attempts=3,
+                        project_refresh_retry_delay=0.5,
+                        activate=True,
+                    )
+                )
+                completed_alias = _aedt_design_name(completed_design)
+                if completed_alias != message_cursor.design:
+                    raise _AedtIdentityMismatch(
+                        "terminal-poll design identity mismatch: "
+                        f"expected={message_cursor.design!r}, "
+                        f"actual={completed_alias!r}"
+                    )
+                update = advance_scoped_message_cursor(
+                    self._native_desktop_handle(), message_cursor
+                )
+                message_cursor = update.cursor
+                if update.fatal_messages:
+                    evidence = " | ".join(update.fatal_messages[-6:])[:2000]
+                    raise RuntimeError(
+                        f"[{label}] exact AEDT design reported a terminal error: "
+                        f"{evidence}"
+                    )
+                normal_completion = (
+                    normal_completion or update.normal_completion
+                )
+                if normal_completion:
+                    try:
+                        metrics = self._pooled_terminal_convergence_locked(
+                            label, setup_name, completed_design
+                        )
+                    except Exception as error:
+                        last_convergence_error = (
+                            f"{type(error).__name__}: {error}"
+                        )[:1000]
+                    else:
+                        saved = completed_project.Save()
+                        if saved is False:
+                            raise RuntimeError(
+                                "native project Save returned False after solve"
+                            )
+                        self._ensure_pooled_shared_results_directory(
+                            completed_alias
+                        )
+                        self.solver_may_be_running = False
+                        elapsed = max(0.0, clock() - started)
+                        logging.info(
+                            "[%s] exact blocking terminal attestation: "
+                            "passes=%s elapsed=%.3fs",
+                            label, metrics.get("passes"), elapsed,
+                        )
+                        return elapsed
 
-        with self.aedt_automation_transaction():
-            # Fresh read-only enumeration proves that the completed call still
-            # belongs to this project even if siblings changed the GUI's active
-            # project while the native solver was running.
-            _oproject, completed_design = self._verified_pooled_native_setup(
-                setup_name=setup_name,
-                expected_design_type=expected_design_type,
-                expected_solution_type=expected_solution_type,
-                project_refresh_max_attempts=3,
-                project_refresh_retry_delay=0.5,
-            )
-            self.save_project(strict=True)
-            self._ensure_pooled_shared_results_directory(
-                _aedt_design_name(completed_design)
-            )
-        return elapsed
+                now = clock()
+                if now >= deadline:
+                    raise TimeoutError(
+                        f"[{label}] timed out after {timeout_s:.1f}s waiting for "
+                        "exact project/design terminal evidence; "
+                        f"normal_completion={normal_completion}, "
+                        f"last_convergence_error={last_convergence_error}"
+                    )
+                # Result/message files can flush shortly after a blocking call
+                # returns.  Do not hold the Desktop automation lock while
+                # waiting for that project-local evidence.
+                with self.aedt_native_solve_window():
+                    sleeper(min(poll_s, max(0.0, deadline - now)))
 
     def analyze_and_extract(self, label, extractor):
         """Analyze exactly once; result-query failures never justify another solve."""
@@ -6246,7 +6518,23 @@ class Simulation():
         extraction_started = time.monotonic()
         try:
             if self._backend_mode() == "pooled":
+                expected_design_type, expected_solution_type = (
+                    self._pooled_stage_contract(label)
+                )
                 with self.aedt_automation_transaction():
+                    # A sibling can legitimately leave Desktop's active project
+                    # on its own lease while this task waits in blocking Analyze.
+                    # Re-attest and reactivate this exact project/design/setup at
+                    # the transaction boundary before any cached postprocessor,
+                    # FieldsReporter, or modeler proxy is allowed to run.
+                    self._verified_pooled_native_setup(
+                        setup_name="Setup1",
+                        expected_design_type=expected_design_type,
+                        expected_solution_type=expected_solution_type,
+                        project_refresh_max_attempts=3,
+                        project_refresh_retry_delay=0.5,
+                        activate=True,
+                    )
                     extractor()
             else:
                 extractor()
@@ -7244,6 +7532,15 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             total_time += t_thermal
             result_parts += [df_thermal, pd.DataFrame({"time_thermal": [t_thermal]})]
 
+        # Thermal workflows join from inside ``run_thermal_analysis`` before
+        # their long Desktop-global field extraction.  A valid pooled workflow
+        # without thermal still has to mark its final native stage so a mixed
+        # sealed cohort cannot wait forever for a participant that never joins.
+        if backend == "pooled" and not model_only \
+                and sim.pooled_activation_done \
+                and not sim.pooled_native_pipeline_done:
+            sim.wait_for_pooled_native_pipeline()
+
         if model_only:
             print(sim.df_plus)
             sim.save_project()
@@ -7326,7 +7623,14 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
         if fixed_mode or hold:
             print(result)
-            sim.save_project()
+            if _final_fixed_project_save_required(
+                    backend, fixed_mode=fixed_mode, hold=hold):
+                sim.save_project()
+            else:
+                logging.info(
+                    "Skipping redundant final pooled project save; the exact "
+                    "terminal native stage was already saved"
+                )
         # 스케줄러 stdout 회수용: 결과 1행을 JSON 한 줄로 즉시 스트리밍
         # (랜덤 모드도 포함 - 태스크 완주를 기다리지 않고 샘플 단위로 데이터 회수 가능)
         try:

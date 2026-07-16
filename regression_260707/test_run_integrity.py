@@ -10,6 +10,7 @@ import pandas as pd
 from run_simulation_260706 import (
     Simulation,
     _finalize_run_cleanup,
+    _final_fixed_project_save_required,
     _git_provenance,
     _project_delete_policy,
     main,
@@ -127,6 +128,23 @@ class FinalCleanupTests(unittest.TestCase):
         self.assertTrue(_project_delete_policy(discard, fixed_mode=True))
         self.assertFalse(_project_delete_policy(discard, fixed_mode=True, hold=True))
         self.assertFalse(_project_delete_policy(discard, fixed_mode=True, model_only=True))
+
+    def test_pooled_fixed_run_skips_redundant_postprocess_save(self):
+        self.assertFalse(
+            _final_fixed_project_save_required(
+                "pooled", fixed_mode=True, hold=False
+            )
+        )
+        self.assertTrue(
+            _final_fixed_project_save_required(
+                "standalone", fixed_mode=True, hold=False
+            )
+        )
+        self.assertTrue(
+            _final_fixed_project_save_required(
+                "pooled", fixed_mode=True, hold=True
+            )
+        )
 
     def test_disposable_project_is_deleted_after_descendant_termination(self):
         events = []

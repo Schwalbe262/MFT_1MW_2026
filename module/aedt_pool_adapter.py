@@ -378,6 +378,29 @@ def native_solve_window(lease: Any):
     )
 
 
+def wait_for_native_pipeline_barrier(lease: Any) -> dict[str, Any]:
+    """Wait until the exact sealed cohort has finished every native solve."""
+
+    if lease is None:
+        raise RuntimeError(
+            "pooled native-pipeline barrier requires an active lease"
+        )
+    waiter = getattr(lease, "wait_for_native_pipeline_barrier", None)
+    if callable(waiter):
+        status = waiter()
+        if not bool(status.get("native_pipeline_barrier_granted", False)):
+            raise RuntimeError(
+                "scheduler returned without granting the native-pipeline "
+                "barrier"
+            )
+        return status
+    if int(getattr(lease, "protocol_version", 1) or 1) < 2:
+        return {}
+    raise RuntimeError(
+        "scheduler attach client has no native-pipeline barrier support"
+    )
+
+
 def release_project(lease: Any, *, wait_seconds: int | None = None) -> dict:
     status = lease.release(
         wait_seconds=(

@@ -17,8 +17,10 @@ import io
 import json
 import math
 import logging
+import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +42,10 @@ from module.thermal_probe_contract import (
     parse_temperature_celsius,
     serialize_probe_failures,
     validate_probe_rectangle,
+)
+from module.aedt_terminal_attestation import (
+    advance_scoped_message_cursor,
+    capture_scoped_message_cursor,
 )
 
 
@@ -111,75 +117,107 @@ def _field_summary_data_frame(sim, field_summary, setup):
             )
 
 
-def _wait_for_pooled_field_summary_idle(
+@contextmanager
+def _pooled_field_summary_window(
     sim,
     ipk,
+    setup,
     timeout_s=7200.0,
     poll_s=2.0,
     clock=time.monotonic,
     sleeper=time.sleep,
 ):
-    """Drain in-flight sibling solves before Desktop-global field export.
+    """Yield an idle, exact thermal design while keeping one short lock.
 
-    The caller owns the pooled automation transaction while this function
-    runs.  Existing project-scoped native solves can therefore finish, but no
-    sibling can dispatch another solve before ``ExportFieldsSummary``.  The
-    Desktop-wide state is used only as a drain barrier, never as evidence that
-    this lease's own solve succeeded.
+    ``run_thermal_analysis`` owns an outer automation transaction.  A pooled
+    Desktop can remain busy for many minutes while sibling projects solve, so
+    holding that transaction during the drain starves those siblings and can
+    itself trigger the automation-lock timeout.  Suspend the outer depth, take
+    short poll transactions, and release each busy observation immediately.
+
+    Once idle is observed, yield *inside that same inner transaction*.  The
+    field-summary and scalar fallback therefore run without an idle-check to
+    export race, while no lock is held during the potentially long drain.
+    Desktop-wide running state is only this export barrier; it never attests
+    the current lease's solve success.
     """
     from module.aedt_pool_adapter import pooled_backend_enabled
 
     if not pooled_backend_enabled():
-        return 0.0
-    desktop = _thermal_desktop_handle(sim, ipk)
-    is_running = getattr(desktop, "AreThereSimulationsRunning", None)
-    if not callable(is_running):
+        yield ipk
+        return
+
+    native_window = getattr(sim, "aedt_native_solve_window", None)
+    automation_transaction = getattr(sim, "aedt_automation_transaction", None)
+    if not callable(native_window) or not callable(automation_transaction):
         raise RuntimeError(
-            "pooled thermal field-summary drain has no simulation-state query"
+            "pooled thermal field-summary window has no lock discipline"
         )
 
     started = clock()
     deadline = started + max(0.0, float(timeout_s))
     waiting_logged = False
-    while True:
-        value = is_running()
-        if value is False or value == 0:
-            elapsed = max(0.0, clock() - started)
-            if waiting_logged:
+    with native_window():
+        while True:
+            with automation_transaction():
+                postflight = _prepare_thermal_dispatch(
+                    sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
+                    setup_name=_THERMAL_SETUP_NAME,
+                )
+                native_ipk = postflight["native_ipk"]
+                desktop = _thermal_desktop_handle(sim, native_ipk)
+                is_running = getattr(
+                    desktop, "AreThereSimulationsRunning", None
+                )
+                if not callable(is_running):
+                    raise RuntimeError(
+                        "pooled thermal field-summary drain has no "
+                        "simulation-state query"
+                    )
+                value = is_running()
+                if value is False or value == 0:
+                    running = False
+                elif value is True or value == 1:
+                    running = True
+                else:
+                    normalized = str(value or "").strip().casefold()
+                    if normalized in {"false", "no", "off", "0"}:
+                        running = False
+                    elif normalized in {"true", "yes", "on", "1"}:
+                        running = True
+                    else:
+                        raise RuntimeError(
+                            "pooled thermal field-summary drain returned an "
+                            f"unrecognized state: {value!r}"
+                        )
+                if not running:
+                    elapsed = max(0.0, clock() - started)
+                    if waiting_logged:
+                        logging.warning(
+                            "[thermal] pooled field-summary drain completed "
+                            "in %.1fs",
+                            elapsed,
+                        )
+                    # Deliberately yield before leaving this transaction.
+                    yield native_ipk
+                    return
+
+            if not waiting_logged:
                 logging.warning(
-                    "[thermal] pooled field-summary drain completed in %.1fs",
-                    elapsed,
+                    "[thermal] waiting for in-flight sibling solves before "
+                    "Desktop-global field-summary export"
                 )
-            return elapsed
-        if value is True or value == 1:
-            running = True
-        else:
-            normalized = str(value or "").strip().casefold()
-            if normalized in {"false", "no", "off", "0"}:
-                return max(0.0, clock() - started)
-            if normalized in {"true", "yes", "on", "1"}:
-                running = True
-            else:
+                waiting_logged = True
+            now = clock()
+            if now >= deadline:
                 raise RuntimeError(
-                    "pooled thermal field-summary drain returned an "
-                    f"unrecognized state: {value!r}"
+                    "timed out waiting for pooled AEDT to become idle before "
+                    f"thermal field-summary export ({float(timeout_s):.1f}s)"
                 )
-        if running and not waiting_logged:
-            logging.warning(
-                "[thermal] waiting for in-flight sibling solves before "
-                "Desktop-global field-summary export"
-            )
-            waiting_logged = True
-        now = clock()
-        if now >= deadline:
-            raise RuntimeError(
-                "timed out waiting for pooled AEDT to become idle before "
-                f"thermal field-summary export ({float(timeout_s):.1f}s)"
-            )
-        sleeper(min(
-            max(0.05, float(poll_s)),
-            max(0.0, deadline - now),
-        ))
+            sleeper(min(
+                max(0.05, float(poll_s)),
+                max(0.0, deadline - now),
+            ))
 
 
 def _power_value_w(value):
@@ -378,6 +416,14 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
             # conductive/convective path to the surrounding fluid. Keep the object
             # level control, but mesh all controlled solids in the shared region.
             operation.auto_update = False
+            # PyAEDT 0.22 exposes AEDT's read-only command metadata in the mesh
+            # operation property bag.  Sending it back through ``update`` emits
+            # ``Script macro error: Command is read only`` even though the mesh
+            # operation itself is accepted.  Remove only that metadata field;
+            # every writable mesh property remains subject to the readback below.
+            for key in tuple(operation.props):
+                if str(key).strip().casefold() == "command":
+                    del operation.props[key]
             operation.props["Mesh Object(s) Separately Enabled"] = False
             if not update():
                 raise RuntimeError(f"{name} mesh operation update failed: {item}")
@@ -705,12 +751,27 @@ def _prepare_thermal_dispatch(
     expected_project = str(getattr(sim, "PROJECT_NAME", "") or "").strip()
     if not expected_project:
         raise RuntimeError("thermal project identity is unavailable")
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    pooled_backend = pooled_backend_enabled()
     rebind = getattr(sim, "_rebind_native_project_for_design_creation", None)
     if not callable(rebind):
         raise RuntimeError("thermal project rebind is unavailable")
     native_project = rebind()
     if native_project is None or native_project is False:
         raise RuntimeError("thermal project rebind returned no native project")
+    if pooled_backend:
+        desktop = _thermal_desktop_handle(sim, ipk)
+        set_active_project = getattr(desktop, "SetActiveProject", None)
+        if not callable(set_active_project):
+            raise RuntimeError(
+                "pooled thermal Desktop cannot activate the exact project"
+            )
+        native_project = set_active_project(expected_project)
+        if native_project is None or native_project is False:
+            raise RuntimeError(
+                f"SetActiveProject returned no project ({expected_project})"
+            )
     get_project_name = getattr(native_project, "GetName", None)
     if not callable(get_project_name):
         raise RuntimeError("rebound thermal project has no identity readback")
@@ -790,8 +851,7 @@ def _prepare_thermal_dispatch(
             raise RuntimeError("native ThermalSetup Enabled readback is false")
         enabled_source = "native+wrapper"
 
-    from module.aedt_pool_adapter import pooled_backend_enabled
-    if not pooled_backend_enabled():
+    if not pooled_backend:
         running = _thermal_running_state(sim, ipk)
         if running is not False:
             raise RuntimeError(
@@ -915,12 +975,225 @@ def _thermal_forensic_json(attempts, convergence):
     return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
+def _pooled_thermal_poll_settings(timeout_s=None, poll_s=None):
+    """Return the same bounded polling contract used by pooled EM stages."""
+
+    if timeout_s is None:
+        raw_timeout = os.environ.get(
+            "MFT_AEDT_POOLED_SOLVE_TIMEOUT_SECONDS", "7200"
+        ).strip()
+        try:
+            timeout_s = float(raw_timeout)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError(
+                "MFT_AEDT_POOLED_SOLVE_TIMEOUT_SECONDS must be numeric"
+            ) from error
+        if not 30 <= timeout_s <= 86400:
+            raise RuntimeError(
+                "MFT_AEDT_POOLED_SOLVE_TIMEOUT_SECONDS must be between 30 and 86400"
+            )
+    else:
+        timeout_s = float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("pooled thermal solve timeout must be positive")
+
+    if poll_s is None:
+        raw_poll = os.environ.get(
+            "MFT_AEDT_POOLED_SOLVE_POLL_SECONDS", "2"
+        ).strip()
+        try:
+            poll_s = float(raw_poll)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError(
+                "MFT_AEDT_POOLED_SOLVE_POLL_SECONDS must be numeric"
+            ) from error
+        if not 0.1 <= poll_s <= 30:
+            raise RuntimeError(
+                "MFT_AEDT_POOLED_SOLVE_POLL_SECONDS must be between 0.1 and 30"
+            )
+    else:
+        poll_s = float(poll_s)
+        if not math.isfinite(poll_s) or poll_s < 0:
+            raise ValueError(
+                "pooled thermal solve poll interval must be non-negative"
+            )
+    return timeout_s, poll_s
+
+
+def _solve_exact_pooled_thermal_setup(
+    sim, ipk, setup, setup_name=_THERMAL_SETUP_NAME,
+    timeout_s=None, monitor_grace_s=30.0, poll_s=None,
+    clock=time.monotonic, sleeper=time.sleep,
+):
+    """Blocking exact-design dispatch with fresh residual attestation.
+
+    ``run_thermal_analysis`` already owns the session automation transaction.
+    Capture the exact design while that transaction is held, then suspend it
+    around ``Analyze(..., True)``.  This keeps sibling native solves parallel
+    without leaving an asynchronous AEDT script macro exposed to a sibling's
+    Desktop-global project activation.  The lock is restored before terminal
+    messages and residual artifacts are read.
+    """
+
+    timeout_s, poll_s = _pooled_thermal_poll_settings(timeout_s, poll_s)
+    preflight = _prepare_thermal_dispatch(
+        sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
+        setup_name=setup_name,
+    )
+    prepare_results = getattr(sim, "_ensure_pooled_shared_results_directory", None)
+    if not callable(prepare_results):
+        raise RuntimeError(
+            "pooled thermal shared-results preparation is unavailable"
+        )
+    prepare_results(str(preflight["design"]))
+    monitor_snapshot = _snapshot_thermal_monitors(sim, ipk)
+    native_design = preflight["native_design"]
+    desktop = _thermal_desktop_handle(sim, ipk)
+    message_cursor = capture_scoped_message_cursor(
+        desktop, preflight["project"], preflight["design"]
+    )
+
+    sim.solver_may_be_running = True
+    started = clock()
+    with sim.aedt_native_solve_window():
+        returned = native_design.Analyze(setup_name, True)
+    if returned is not None and (type(returned) is not int or returned != 0):
+        raise RuntimeError(
+            "[thermal] native blocking Analyze returned invalid status: "
+            f"{returned!r}"
+        )
+
+    normal_completion = False
+    normal_seen_at = None
+    terminal_postflight = None
+    convergence = _thermal_convergence_telemetry(
+        sim, ipk, setup, attempts=1, monitor_snapshot=monitor_snapshot
+    )
+    deadline = started + timeout_s
+    terminal_monitor_reasons = {
+        "converged", "residual_threshold", "monitor_malformed",
+    }
+
+    while True:
+        # The blocking Analyze macro is complete.  Exact project reactivation
+        # is now safe and remains protected by the caller's restored lock.
+        postflight = _prepare_thermal_dispatch(
+            sim, ipk, setup, design_name=_THERMAL_DESIGN_NAME,
+            setup_name=setup_name,
+        )
+        terminal_postflight = postflight
+        update = advance_scoped_message_cursor(
+            _thermal_desktop_handle(sim, ipk), message_cursor
+        )
+        message_cursor = update.cursor
+        if update.fatal_messages:
+            evidence = " | ".join(update.fatal_messages[-6:])[:2000]
+            raise RuntimeError(
+                "[thermal] exact AEDT design reported a terminal error: "
+                f"{evidence}"
+            )
+        if update.normal_completion and not normal_completion:
+            normal_seen_at = clock()
+        normal_completion = normal_completion or update.normal_completion
+        convergence = _thermal_convergence_telemetry(
+            sim, postflight["native_ipk"], setup, attempts=1,
+            monitor_snapshot=monitor_snapshot,
+        )
+        reason = convergence["thermal_convergence_reason"]
+        if normal_completion and reason in terminal_monitor_reasons:
+            sim.solver_may_be_running = False
+            sim.save_project()
+            break
+
+        now = clock()
+        if normal_completion and normal_seen_at is not None \
+                and now >= normal_seen_at + max(0.0, float(monitor_grace_s)):
+            # The exact Normal message proves this solver stopped, but a
+            # missing fresh residual artifact makes the thermal row invalid.
+            # Do not quarantine healthy siblings for an artifact failure.
+            sim.solver_may_be_running = False
+            break
+        if now >= deadline:
+            raise TimeoutError(
+                "[thermal] timed out waiting for exact project/design "
+                "Normal completion and a fresh residual monitor; "
+                f"normal_completion={normal_completion}, "
+                "reason="
+                f"{convergence['thermal_convergence_reason']}"
+            )
+        # The blocking macro has ended, so only release the transaction while
+        # waiting for message/result-file flush.  Each following postflight
+        # reacquires and re-attests the exact thermal design.
+        with sim.aedt_native_solve_window():
+            sleeper(min(poll_s, max(0.0, deadline - now)))
+
+    identity = {
+        key: value for key, value in preflight.items()
+        if key not in {"native_ipk", "native_design"}
+    }
+    attempts = [{
+        "attempt": 1,
+        "dispatch_status": "success",
+        "return_type": type(returned).__name__,
+        "exception_type": "",
+        "exception_message": "",
+        "elapsed_s": round(max(0.0, clock() - started), 3),
+        "native_running": False,
+        "running_state_error": "",
+        "monitor_reason": convergence["thermal_convergence_reason"],
+        "monitor_file": str(convergence.get("thermal_monitor_file", ""))[:256],
+        "aedt_messages": [],
+        "identity": identity,
+        "blocking": True,
+        "normal_completion": normal_completion,
+    }]
+    forensic_json = _thermal_forensic_json(attempts, convergence)
+    logging.warning("[thermal] dispatch forensic: %s", forensic_json)
+    return {
+        "solve_attempts": 1,
+        "analyze_call_ok": True,
+        "analyze_return_false": False,
+        "dispatch_status": "success",
+        "dispatch_exception_type": "",
+        "dispatch_exception_message": "",
+        "forensic_json": forensic_json,
+        "convergence": convergence,
+        "postflight": terminal_postflight,
+    }
+
+
+def _wait_for_pooled_native_pipeline(sim):
+    """Join the sealed cohort barrier without holding Desktop automation."""
+
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    if not pooled_backend_enabled():
+        return None
+    native_window = getattr(sim, "aedt_native_solve_window", None)
+    waiter = getattr(sim, "wait_for_pooled_native_pipeline", None)
+    if not callable(native_window) or not callable(waiter):
+        raise RuntimeError(
+            "pooled native-pipeline barrier has no lock discipline"
+        )
+    with native_window():
+        return waiter()
+
+
 def _solve_exact_thermal_setup(
     sim, ipk, setup, setup_name=_THERMAL_SETUP_NAME,
     monitor_grace_s=30.0, poll_s=2.0,
     clock=time.monotonic, sleeper=time.sleep,
 ):
     """Dispatch only ThermalSetup, with one evidence-gated startup retry."""
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    if pooled_backend_enabled():
+        return _solve_exact_pooled_thermal_setup(
+            sim, ipk, setup, setup_name=setup_name,
+            monitor_grace_s=monitor_grace_s, poll_s=poll_s,
+            clock=clock, sleeper=sleeper,
+        )
+
     attempts = []
     convergence = None
     previous_snapshot = None
@@ -2343,6 +2616,22 @@ def run_thermal_analysis(sim):
         convergence["thermal_residual_energy"],
         convergence["thermal_convergence_reason"],
     )
+    from module.aedt_pool_adapter import pooled_backend_enabled
+    pooled_backend = pooled_backend_enabled()
+    if pooled_backend:
+        # ``AreThereSimulationsRunning == False`` is only a momentary
+        # Desktop-idle observation.  A sibling may still be waiting for the
+        # automation lock to build or launch its final thermal design.  If the
+        # first completed project starts the long Desktop-global field-summary
+        # export in that gap, it starves the sibling's remaining native solve.
+        # Mark this exact sealed-batch member complete and wait, with every
+        # outer automation-lock depth suspended, until all cohort members have
+        # finished their full native pipeline.
+        barrier_started = time.monotonic()
+        _wait_for_pooled_native_pipeline(sim)
+        sim.stage_timings["stage_time_native_pipeline_barrier_s"] = (
+            time.monotonic() - barrier_started
+        )
     extraction_started = time.monotonic()
 
     # ---- 온도 추출 (필드 계산기 직접 평가 - 리포트 기계 미사용) ----
@@ -2540,19 +2829,27 @@ def run_thermal_analysis(sim):
     # authoritative even when the Desktop itself is healthy.  Re-enumerate
     # this lease's exact project and re-attest the Icepak design/setup before
     # any post-processing call can touch those proxies.
-    try:
-        postflight = _prepare_thermal_dispatch(
-            sim,
-            ipk,
-            setup,
-            design_name=_THERMAL_DESIGN_NAME,
-            setup_name=_THERMAL_SETUP_NAME,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "thermal post-solve exact project/design rebind failed: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
+    # The cohort barrier deliberately allowed siblings to reactivate their
+    # projects/designs.  Never reuse the pre-barrier child proxy in pooled
+    # mode; re-enumerate and attest this lease again under the restored lock.
+    postflight = (
+        None if pooled_backend
+        else solve_result.get("postflight")
+    )
+    if not postflight:
+        try:
+            postflight = _prepare_thermal_dispatch(
+                sim,
+                ipk,
+                setup,
+                design_name=_THERMAL_DESIGN_NAME,
+                setup_name=_THERMAL_SETUP_NAME,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "thermal post-solve exact project/design rebind failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
     native_ipk = postflight["native_ipk"]
     try:
         solution = native_ipk.existing_analysis_sweeps[0]
@@ -2678,48 +2975,56 @@ def run_thermal_analysis(sim):
             rx_side_selected_face = selected
 
     field_summary_attempts = 0
-    _wait_for_pooled_field_summary_idle(sim, native_ipk)
-    for attempt in range(1, 4):
-        missing_entries = [entry for entry in probe if entry[2] not in temps]
-        if not missing_entries:
-            break
-        field_summary_attempts = attempt
-        try:
-            _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
-            temps.update(_field_summary_bulk(missing_entries))
-            _refresh_core_probe_aggregates()
-            _refresh_rx_side_face_aggregates()
-        except Exception as e:
-            logging.warning(f"[thermal] field summary attempt {attempt}/3 failed: {e}")
-        if all(col in temps for col in required_expected_cols):
-            break
-        if attempt < 3:
-            time.sleep(10)
-    _refresh_core_probe_aggregates()
-    _refresh_rx_side_face_aggregates()
-    n_fs = sum(1 for col in field_expected_cols if col in temps)
+    with _pooled_field_summary_window(
+            sim, native_ipk, setup) as extraction_ipk:
+        native_ipk = extraction_ipk
+        for attempt in range(1, 4):
+            missing_entries = [entry for entry in probe if entry[2] not in temps]
+            if not missing_entries:
+                break
+            field_summary_attempts = attempt
+            try:
+                _activate_thermal_design(
+                    native_ipk, design_name=_THERMAL_DESIGN_NAME
+                )
+                temps.update(_field_summary_bulk(missing_entries))
+                _refresh_core_probe_aggregates()
+                _refresh_rx_side_face_aggregates()
+            except Exception as e:
+                logging.warning(
+                    f"[thermal] field summary attempt {attempt}/3 failed: {e}"
+                )
+            if all(col in temps for col in required_expected_cols):
+                break
+            if attempt < 3:
+                time.sleep(10)
+        _refresh_core_probe_aggregates()
+        _refresh_rx_side_face_aggregates()
+        n_fs = sum(1 for col in field_expected_cols if col in temps)
 
-    n_calc = 0
-    calc_attempts = 0
-    scalar_probe_issues = {}
-    # AEDT can fail ExportFieldsSummary while the saved surface field remains
-    # readable.  Use the replay-proven scalar API only for missing probe-sheet
-    # statistics.  Never replace a missing modeled-volume maximum with a probe:
-    # that case indicates a genuine zero-mesh-volume thermal failure.
-    for name, is_volume, col, op in probe:
-        if col in temps or col in optional_cols or is_volume:
-            continue
-        calc_attempts += 1
-        try:
-            _activate_thermal_design(ipk, design_name=_THERMAL_DESIGN_NAME)
-            temps[col] = _scalar_probe_temperature(name, op)
-            n_calc += 1
-        except Exception as exc:
-            scalar_probe_issues[col] = (
-                f"{type(exc).__name__}:{exc}"
-            )[:512]
-    _refresh_core_probe_aggregates()
-    _refresh_rx_side_face_aggregates()
+        n_calc = 0
+        calc_attempts = 0
+        scalar_probe_issues = {}
+        # AEDT can fail ExportFieldsSummary while the saved surface field
+        # remains readable. Use the replay-proven scalar API only for missing
+        # probe-sheet statistics. Never replace a missing modeled-volume
+        # maximum with a probe: that indicates a zero-mesh-volume failure.
+        for name, is_volume, col, op in probe:
+            if col in temps or col in optional_cols or is_volume:
+                continue
+            calc_attempts += 1
+            try:
+                _activate_thermal_design(
+                    native_ipk, design_name=_THERMAL_DESIGN_NAME
+                )
+                temps[col] = _scalar_probe_temperature(name, op)
+                n_calc += 1
+            except Exception as exc:
+                scalar_probe_issues[col] = (
+                    f"{type(exc).__name__}:{exc}"
+                )[:512]
+        _refresh_core_probe_aggregates()
+        _refresh_rx_side_face_aggregates()
 
     missing_cols = [col for col in expected_cols if col not in temps]
     required_missing_cols = [col for col in missing_cols if col not in optional_cols]

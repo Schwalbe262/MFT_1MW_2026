@@ -3,7 +3,7 @@ import math
 import os
 import tempfile
 import unittest
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -409,55 +409,171 @@ class ThermalStabilityTest(unittest.TestCase):
             setup="ThermalSetup : SteadyState", pandas_output=True
         )
 
-    def test_pooled_field_summary_waits_for_sibling_solve_drain(self):
+    def test_pooled_field_summary_busy_polls_release_lock_for_siblings(self):
         from module import aedt_pool_adapter
 
         states = iter([True, "true", False])
-        desktop = SimpleNamespace(
-            AreThereSimulationsRunning=Mock(side_effect=lambda: next(states))
+        lock_depth = [0]
+        events = []
+
+        @contextmanager
+        def guard():
+            lock_depth[0] += 1
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+                lock_depth[0] -= 1
+
+        @contextmanager
+        def native_window():
+            events.append("outer-suspended")
+            yield
+            events.append("outer-restored")
+
+        def running():
+            events.append(("running", lock_depth[0]))
+            return next(states)
+
+        desktop = SimpleNamespace(AreThereSimulationsRunning=Mock(side_effect=running))
+        native_ipk = SimpleNamespace(odesktop=desktop)
+        sim = SimpleNamespace(
+            aedt_native_solve_window=native_window,
+            aedt_automation_transaction=guard,
         )
         now = [100.0]
 
         def sleep_and_advance(seconds):
+            self.assertEqual(lock_depth[0], 0)
+            with guard():
+                events.append("sibling-automation")
             now[0] += seconds
 
         with patch.object(
-                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
-            elapsed = thermal._wait_for_pooled_field_summary_idle(
-                SimpleNamespace(),
-                SimpleNamespace(odesktop=desktop),
-                timeout_s=20.0,
-                poll_s=2.0,
-                clock=lambda: now[0],
-                sleeper=sleep_and_advance,
-            )
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True), \
+                patch.object(
+                    thermal, "_prepare_thermal_dispatch",
+                    return_value={"native_ipk": native_ipk},
+                ):
+            with thermal._pooled_field_summary_window(
+                    sim, native_ipk, SimpleNamespace(),
+                    timeout_s=20.0, poll_s=2.0,
+                    clock=lambda: now[0], sleeper=sleep_and_advance,
+            ) as yielded:
+                self.assertIs(yielded, native_ipk)
+                self.assertEqual(lock_depth[0], 1)
+                events.append("field-export")
 
-        self.assertEqual(elapsed, 4.0)
+        self.assertEqual(now[0], 104.0)
         self.assertEqual(desktop.AreThereSimulationsRunning.call_count, 3)
+        self.assertEqual(events.count("sibling-automation"), 2)
+        idle_index = events.index(("running", 1), events.index(("running", 1)) + 1)
+        idle_index = events.index(("running", 1), idle_index + 1)
+        export_index = events.index("field-export")
+        self.assertNotIn("lock-exit", events[idle_index:export_index])
+        self.assertEqual(lock_depth[0], 0)
 
-    def test_pooled_field_summary_drain_timeout_is_explicit(self):
+    def test_pooled_field_summary_window_timeout_releases_every_busy_poll(self):
         from module import aedt_pool_adapter
 
         desktop = SimpleNamespace(AreThereSimulationsRunning=Mock(return_value=True))
+        lock_depth = [0]
+
+        @contextmanager
+        def guard():
+            lock_depth[0] += 1
+            try:
+                yield
+            finally:
+                lock_depth[0] -= 1
+
+        native_ipk = SimpleNamespace(odesktop=desktop)
+        sim = SimpleNamespace(
+            aedt_native_solve_window=lambda: nullcontext(),
+            aedt_automation_transaction=guard,
+        )
         now = [100.0]
 
         def sleep_and_advance(seconds):
+            self.assertEqual(lock_depth[0], 0)
             now[0] += seconds
 
         with patch.object(
-                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True), \
+                patch.object(
+                    thermal, "_prepare_thermal_dispatch",
+                    return_value={"native_ipk": native_ipk},
+                ):
             with self.assertRaisesRegex(
                     RuntimeError, "timed out waiting for pooled AEDT"):
-                thermal._wait_for_pooled_field_summary_idle(
-                    SimpleNamespace(),
-                    SimpleNamespace(odesktop=desktop),
-                    timeout_s=3.0,
-                    poll_s=2.0,
-                    clock=lambda: now[0],
-                    sleeper=sleep_and_advance,
-                )
+                with thermal._pooled_field_summary_window(
+                        sim, native_ipk, SimpleNamespace(),
+                        timeout_s=3.0, poll_s=2.0,
+                        clock=lambda: now[0], sleeper=sleep_and_advance,
+                ):
+                    self.fail("busy pooled Desktop must not yield export window")
 
         self.assertEqual(now[0], 103.0)
+        self.assertEqual(lock_depth[0], 0)
+
+    def test_standalone_field_summary_window_is_a_lock_free_null_context(self):
+        from module import aedt_pool_adapter
+
+        native_ipk = SimpleNamespace()
+        sim = SimpleNamespace(
+            aedt_native_solve_window=Mock(
+                side_effect=AssertionError("standalone must not suspend a lock")
+            ),
+            aedt_automation_transaction=Mock(
+                side_effect=AssertionError("standalone must not acquire a lock")
+            ),
+        )
+
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=False):
+            with thermal._pooled_field_summary_window(
+                    sim, native_ipk, SimpleNamespace()) as yielded:
+                self.assertIs(yielded, native_ipk)
+
+        sim.aedt_native_solve_window.assert_not_called()
+        sim.aedt_automation_transaction.assert_not_called()
+
+    def test_native_pipeline_barrier_suspends_every_outer_lock_depth(self):
+        from module import aedt_pool_adapter
+
+        lock_depth = [2]
+        events = []
+
+        @contextmanager
+        def native_window():
+            saved = lock_depth[0]
+            self.assertGreater(saved, 0)
+            lock_depth[0] = 0
+            events.append("suspended")
+            try:
+                yield
+            finally:
+                lock_depth[0] = saved
+                events.append("restored")
+
+        def wait_for_cohort():
+            self.assertEqual(lock_depth[0], 0)
+            events.append("cohort-complete")
+            return {"native_pipeline_barrier_granted": True}
+
+        sim = SimpleNamespace(
+            aedt_native_solve_window=native_window,
+            wait_for_pooled_native_pipeline=wait_for_cohort,
+        )
+        with patch.object(
+            aedt_pool_adapter, "pooled_backend_enabled", return_value=True
+        ):
+            status = thermal._wait_for_pooled_native_pipeline(sim)
+
+        self.assertTrue(status["native_pipeline_barrier_granted"])
+        self.assertEqual(events, ["suspended", "cohort-complete", "restored"])
+        self.assertEqual(lock_depth[0], 2)
 
     @staticmethod
     def _convergence(converged=True):
@@ -520,10 +636,58 @@ class ThermalStabilityTest(unittest.TestCase):
         )
         wrapper = _DesignWrapper(ipk)
         project = SimpleNamespace(create_design=lambda **_kwargs: wrapper)
+        current_native_project = {"value": None}
         if rebind_sequence is None:
-            rebind_project = Mock(return_value=_ProjectHandle("thermal_test"))
+            default_native_project = _ProjectHandle("thermal_test")
+            known_native_projects = [default_native_project]
+
+            def next_native_project():
+                current_native_project["value"] = default_native_project
+                return default_native_project
         else:
-            rebind_project = Mock(side_effect=list(rebind_sequence))
+            known_native_projects = list(rebind_sequence)
+            native_projects = iter(known_native_projects)
+
+            def next_native_project():
+                value = next(native_projects)
+                current_native_project["value"] = value
+                return value
+
+        rebind_project = Mock(side_effect=next_native_project)
+
+        def set_active_project(project_name):
+            self.assertEqual(project_name, "thermal_test")
+            value = current_native_project["value"]
+            self.assertIsNotNone(value)
+            return value
+
+        def scoped_messages(project_name, design_name, severity):
+            self.assertEqual(
+                (project_name, design_name),
+                ("thermal_test", "icepak_thermal"),
+            )
+            if severity == 2:
+                return []
+            values = ["pre-dispatch thermal diagnostic"]
+            dispatched = any(
+                getattr(project_value, "last_design", None) is not None
+                and project_value.last_design.analyze_calls
+                for project_value in known_native_projects
+            )
+            if dispatched:
+                values.append(
+                    "Normal completion of simulation on server: thermal-node"
+                )
+            return values
+
+        pooled_desktop = SimpleNamespace(
+            AreThereSimulationsRunning=lambda: False,
+            GetMessages=scoped_messages,
+            SetActiveProject=Mock(side_effect=set_active_project),
+        )
+        ipk.odesktop = pooled_desktop
+        native_window = Mock(return_value=nullcontext())
+        native_pipeline_barrier = Mock()
         sim = SimpleNamespace(
             project=project,
             _rebind_native_project_for_design_creation=rebind_project,
@@ -552,7 +716,11 @@ class ThermalStabilityTest(unittest.TestCase):
                 side_effect=lambda *_args: ipk.field_summary_export_text
             ),
             _remove_attested_aedt_export=Mock(),
-            aedt_native_solve_window=Mock(return_value=nullcontext()),
+            aedt_native_solve_window=native_window,
+            aedt_automation_transaction=lambda: nullcontext(),
+            wait_for_pooled_native_pipeline=native_pipeline_barrier,
+            _native_desktop_handle=Mock(return_value=pooled_desktop),
+            stage_timings={},
             solver_may_be_running=False,
         )
         object_factory = object_factory or _Object
@@ -659,6 +827,8 @@ class ThermalStabilityTest(unittest.TestCase):
         ipk.telemetry_mock = telemetry
         ipk.sleep_mock = sleeper
         ipk.rebind_project_mock = rebind_project
+        ipk.native_window_mock = native_window
+        ipk.native_pipeline_barrier_mock = native_pipeline_barrier
         self.assertGreaterEqual(rebind_project.call_count, 2)
         return ipk, result.iloc[0]
 
@@ -1114,6 +1284,8 @@ class ThermalStabilityTest(unittest.TestCase):
         initial_project = _ProjectHandle("thermal_test")
         solve_project = _SingleActivationProjectHandle("thermal_test")
         postflight_project = _ProjectHandle("thermal_test")
+        extraction_project = _ProjectHandle("thermal_test")
+        field_summary_project = _ProjectHandle("thermal_test")
 
         ipk, row = self._run(
             None,
@@ -1123,19 +1295,25 @@ class ThermalStabilityTest(unittest.TestCase):
                 initial_project,
                 solve_project,
                 postflight_project,
+                extraction_project,
+                field_summary_project,
             ],
         )
 
         self.assertEqual(row["thermal_solved"], 1)
         self.assertEqual(row["thermal_extraction_complete"], 1)
-        self.assertEqual(ipk.rebind_project_mock.call_count, 3)
+        self.assertEqual(ipk.rebind_project_mock.call_count, 5)
+        ipk.native_pipeline_barrier_mock.assert_called_once_with()
+        self.assertGreaterEqual(ipk.native_window_mock.call_count, 3)
         self.assertEqual(solve_project.active_calls, 1)
         self.assertEqual(
             solve_project.last_design.analyze_calls,
             [("ThermalSetup", True)],
         )
-        self.assertIs(ipk.oproject, postflight_project)
-        self.assertEqual(postflight_project.active_calls, 2)
+        self.assertIs(ipk.oproject, field_summary_project)
+        self.assertEqual(postflight_project.active_calls, 1)
+        self.assertGreaterEqual(extraction_project.active_calls, 1)
+        self.assertGreaterEqual(field_summary_project.active_calls, 2)
 
     def test_post_solve_extraction_never_queries_object_dimension_proxy(self):
         complete = {
@@ -1683,13 +1861,17 @@ class ThermalStabilityTest(unittest.TestCase):
 
     def test_explicit_rx_gets_one_object_mesh_operation(self):
         pad_mesh_operation = SimpleNamespace(
-            name="pad_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+            name="pad_mesh", props={"Command": "AssignMeshLevel"},
+            auto_update=True, update=Mock(return_value=True))
         rx_main_block_mesh_operation = SimpleNamespace(
-            name="rx_main_block_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+            name="rx_main_block_mesh", props={"Command": "AssignMeshLevel"},
+            auto_update=True, update=Mock(return_value=True))
         rx_mesh_operation = SimpleNamespace(
-            name="rx_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+            name="rx_mesh", props={"Command": "AssignMeshLevel"},
+            auto_update=True, update=Mock(return_value=True))
         tx_mesh_operation = SimpleNamespace(
-            name="tx_mesh", props={}, auto_update=True, update=Mock(return_value=True))
+            name="tx_mesh", props={"Command": "AssignMeshLevel"},
+            auto_update=True, update=Mock(return_value=True))
         mesh = SimpleNamespace(
             assign_mesh_level=Mock(
                 side_effect=[["pad_mesh"], ["tx_mesh"], ["rx_main_block_mesh"], ["rx_mesh"]]),
@@ -1727,6 +1909,7 @@ class ThermalStabilityTest(unittest.TestCase):
             pad_mesh_operation, tx_mesh_operation,
             rx_main_block_mesh_operation, rx_mesh_operation,
         ):
+            self.assertNotIn("Command", operation.props)
             self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
 
     def test_thermal_mesh_failures_are_not_silenced(self):
