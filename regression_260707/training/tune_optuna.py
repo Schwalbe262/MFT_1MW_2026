@@ -34,6 +34,13 @@ LEGACY_OUT = HERE / "best_params.json"
 MIN_STRICT_FULL_ROWS = 4000
 FAMILIES = ("lightgbm", "xgboost", "catboost", "extratrees")
 TUNING_SCHEMA_VERSION = 1
+DEFAULT_MODEL_THREADS = 24
+MODEL_THREAD_PARAMETERS = {
+    "lightgbm": "n_jobs",
+    "xgboost": "n_jobs",
+    "catboost": "thread_count",
+    "extratrees": "n_jobs",
+}
 
 from checkpoint_train import (  # noqa: E402
     TARGETS,
@@ -107,14 +114,47 @@ def sample_params(trial, family):
             n_estimators=trial.suggest_int("n_estimators", 200, 1500),
             min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 10),
             max_features=trial.suggest_float("max_features", 0.4, 1.0),
-            n_jobs=-1,
         )
     raise ValueError(family)
 
 
-def tune(target, family, trials, df, feats):
+def model_params_with_thread_budget(family, params, model_threads):
+    """Apply one explicit CPU budget without publishing it as tuned data."""
+
+    if isinstance(model_threads, bool):
+        raise ValueError("model_threads must be a positive integer")
+    try:
+        threads = int(model_threads)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("model_threads must be a positive integer") from exc
+    if threads < 1:
+        raise ValueError("model_threads must be a positive integer")
+    try:
+        parameter = MODEL_THREAD_PARAMETERS[family]
+    except KeyError as exc:
+        raise ValueError(family) from exc
+    runtime_params = dict(params)
+    # Override unbounded/default library settings even if a caller supplied
+    # one.  The budget is an execution resource, not an Optuna search value.
+    runtime_params[parameter] = threads
+    return runtime_params
+
+
+def tune(
+    target,
+    family,
+    trials,
+    df,
+    feats,
+    *,
+    model_threads=DEFAULT_MODEL_THREADS,
+):
     import optuna
     from sklearn.model_selection import KFold
+
+    # Validate before creating a study so an invalid resource contract cannot
+    # leave a partial tuning run behind.
+    model_params_with_thread_budget(family, {}, model_threads)
 
     eligible = filter_valid_training_rows(df, target)
     sub = eligible.dropna(subset=[target])
@@ -128,10 +168,13 @@ def tune(target, family, trials, df, feats):
     folds = KFold(n_splits=4, shuffle=True, random_state=0)
 
     def objective(trial):
-        params = sample_params(trial, family)
+        search_params = sample_params(trial, family)
+        runtime_params = model_params_with_thread_budget(
+            family, search_params, model_threads
+        )
         errors = []
         for fold_index, (train_index, test_index) in enumerate(folds.split(X)):
-            model = make_model(family, params, seed=fold_index)
+            model = make_model(family, runtime_params, seed=fold_index)
             model.fit(X.iloc[train_index], y[train_index])
             prediction = model.predict(X.iloc[test_index])
             errors.append(float(np.mean((prediction - y[test_index]) ** 2)))
@@ -198,6 +241,15 @@ def main():
     parser.add_argument("--family", choices=FAMILIES, default=None)
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--trials", type=int, default=200)
+    parser.add_argument(
+        "--model-threads",
+        type=int,
+        default=DEFAULT_MODEL_THREADS,
+        help=(
+            "maximum model-library threads per tuning fit "
+            f"(default: {DEFAULT_MODEL_THREADS})"
+        ),
+    )
     parser.add_argument("--dataset", default=str(DATASET))
     parser.add_argument("--artifact-root", default=None)
     parser.add_argument("--result-json", default=None)
@@ -227,8 +279,15 @@ def main():
         r"[0-9a-fA-F]{64}", args.data_contract_sha256
     ):
         parser.error("data contract must be a full SHA-256")
-    if args.trials < 1 or args.min_strict_full_rows < MIN_STRICT_FULL_ROWS:
-        parser.error("trials must be positive and the production row gate is >=4000")
+    if (
+        args.trials < 1
+        or args.model_threads < 1
+        or args.min_strict_full_rows < MIN_STRICT_FULL_ROWS
+    ):
+        parser.error(
+            "trials and model threads must be positive and the production "
+            "row gate is >=4000"
+        )
     if not ((args.target and args.family) or args.all):
         parser.error("supply --target with --family, or --all")
     if args.all and (args.target or args.family):
@@ -267,7 +326,12 @@ def main():
     for target, family in jobs:
         print(f"\n=== tune {target} / {family} ({args.trials} trials) ===")
         best, value, eligible_rows = tune(
-            target, family, args.trials, frame, features
+            target,
+            family,
+            args.trials,
+            frame,
+            features,
+            model_threads=args.model_threads,
         )
         params.setdefault(family, {})[target] = {
             "params": best,
@@ -302,6 +366,7 @@ def main():
             json.dumps(features, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
         "trials_per_job": args.trials,
+        "model_threads": args.model_threads,
         "jobs": results,
         "sampler": "TPESampler(seed=7)",
         "pruner": "MedianPruner(n_warmup_steps=1)",

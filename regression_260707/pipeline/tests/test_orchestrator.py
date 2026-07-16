@@ -45,6 +45,9 @@ class OrchestratorTests(unittest.TestCase):
             )
             train_dependencies = queue.dependencies(result.jobs["train"])
             self.assertEqual([job.id for job in train_dependencies], [result.jobs["tune"]])
+            tune_command = queue.get(result.jobs["tune"]).payload["command"]
+            thread_option = tune_command.index("--model-threads")
+            self.assertEqual(tune_command[thread_option + 1], "24")
             self.assertIsNotNone(queue.claim("collector", job_types=["collect"], now=1201))
             self.assertIsNotNone(queue.claim("tuner", job_types=["tune"], now=1201))
             self.assertIsNone(queue.claim("trainer", job_types=["train"], now=1201))
@@ -287,6 +290,7 @@ class ControllerSnapshotTests(unittest.TestCase):
                 def plan_cycle(self, **kwargs):
                     self.planned_bytes = Path(kwargs["dataset_path"]).read_bytes()
                     self.series = kwargs["dataset_series_path"]
+                    self.model_threads = kwargs["model_threads"]
                     return "planned"
 
             orchestrator = FakeOrchestrator()
@@ -307,6 +311,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             self.assertEqual(controller.plan_once(), "planned")
             self.assertEqual(orchestrator.planned_bytes, b"first-generation")
             self.assertEqual(orchestrator.series, str(live.resolve()))
+            self.assertEqual(orchestrator.model_threads, 24)
 
 
 if __name__ == "__main__":

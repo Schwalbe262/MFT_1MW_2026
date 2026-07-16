@@ -60,7 +60,9 @@ The launcher also requires the SHA-256 of the operator-reviewed verification
 JSON.  It verifies that both standard and fine stages explicitly enable the
 scheduler adapter, checks their absolute library checkout, and installs the
 exact reviewed bytes as `config/verification-<sha256>.json` under the runtime
-root before starting Python.  Use full, pinned 40-character revisions:
+root before starting Python.  Tuning is explicitly limited to 24 model-library
+threads so the persistent controller and scheduler UI retain CPU headroom.
+Use full, pinned 40-character revisions:
 
 ```powershell
 $launcher = 'Y:\git\MFT_1MW_2026\regression_260707\pipeline\start_pipeline_role.ps1'
@@ -74,6 +76,7 @@ $common = @{
     PipelineRuntimeRoot = 'C:\Users\peets\slurm_scheduler_runtime\mft_pipeline'
     MftRuntimeRoot = 'Y:\git\MFT_1MW_2026\regression_260707'
     Python = 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe'
+    ModelThreads = 24
 }
 
 # Safe preflight: validates and seals configuration but starts no Python job.

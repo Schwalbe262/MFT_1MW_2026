@@ -79,6 +79,7 @@ class PipelineLauncherTests(unittest.TestCase):
             contract = json.loads(result.stdout.lstrip("\ufeff"))
             self.assertEqual(contract["solver_revision"], "a" * 40)
             self.assertEqual(contract["library_revision"], "b" * 40)
+            self.assertEqual(contract["model_threads"], 24)
             self.assertEqual(contract["pipeline_runtime_root"], str(state.resolve()))
             self.assertEqual(
                 contract["singleton_lock"],
@@ -89,6 +90,8 @@ class PipelineLauncherTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(sealed.read_bytes()).hexdigest(), digest)
             self.assertIn("--pipeline-root", contract["arguments"])
             self.assertIn(str(state.resolve()), contract["arguments"])
+            thread_option = contract["arguments"].index("--model-threads")
+            self.assertEqual(contract["arguments"][thread_option + 1], "24")
             self.assertFalse((state / "jobs.sqlite3").exists())
 
     def test_review_hash_mismatch_fails_before_any_python_process(self):
