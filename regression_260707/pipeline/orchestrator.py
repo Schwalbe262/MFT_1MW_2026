@@ -149,6 +149,7 @@ class PipelineOrchestrator:
                     str(self.runtime_root / "campaign" / "collect_wave.py"),
                     "--prefix", "mft-camp",
                     "--extra-prefix", "mft-1to3",
+                    "--extra-prefix", "mft-1x3",
                     "--extra-prefix", "mft-mixed",
                     "--extra-prefix", "mft-9way",
                     "--running-fetch-limit", "0",
