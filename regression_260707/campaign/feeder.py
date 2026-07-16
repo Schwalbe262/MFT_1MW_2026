@@ -56,7 +56,23 @@ else:
     _STATE_DIR = HERE
 STATE = os.path.join(_STATE_DIR, "feeder_state.json")
 CONTROLLER_LOCK = os.path.join(_STATE_DIR, "feeder-controller.lock")
-SCHEDULER = "http://127.0.0.1:8000"
+DEFAULT_SCHEDULER = "http://127.0.0.1:8000"
+LOCAL_SCHEDULER_FALLBACK = "http://127.0.0.1:8001"
+
+
+def _configured_scheduler_url():
+    """Resolve the scheduler endpoint once for this feeder process."""
+
+    return (
+        os.environ.get("MFT_SCHEDULER_URL", DEFAULT_SCHEDULER).strip().rstrip("/")
+        or DEFAULT_SCHEDULER
+    )
+
+
+SCHEDULER = _configured_scheduler_url()
+# Submission/reconciliation helpers live in scheduler_client.  Keep their
+# endpoint aligned with the policy/inventory reads performed in this module.
+scheduler_client.SCHEDULER = SCHEDULER
 CAMPAIGN_PREFIX = "mft-camp-"
 
 TARGET_ACTIVE = 50    # standalone 실행+대기 목표 (--target으로 오버라이드)
@@ -180,6 +196,7 @@ def _pooled_submission_kwargs(args):
             "MFT_AEDT_SESSION_VERSION": args.aedt_session_version,
             "MFT_AEDT_SESSION_PROFILE": AEDT_SESSION_PROFILE,
             "MFT_AEDT_ISOLATION_POLICY": args.aedt_isolation_policy,
+            "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS": "7200",
             # Three serialized first-model builds can legitimately exceed the
             # old 120-second underfilled seal. Keep the model-ready barrier open
             # for the scheduler client's supported maximum.
@@ -681,10 +698,33 @@ def reserved_unjudged_rows(state, tasks, judged_ids):
 
 
 def _scheduler_json(path, params=None):
+    global SCHEDULER
     last_error = None
     for attempt in range(SCHEDULER_ATTEMPTS):
+        response = None
+        request_bases = [SCHEDULER]
+        # Fail over only from the legacy loopback listener.  An explicitly
+        # configured remote scheduler must fail closed instead of silently
+        # sending project traffic to a different service.
+        if SCHEDULER == DEFAULT_SCHEDULER:
+            request_bases.append(LOCAL_SCHEDULER_FALLBACK)
+        for scheduler_base in request_bases:
+            try:
+                response = requests.get(
+                    f"{scheduler_base}{path}", params=params, timeout=30
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                continue
+            if scheduler_base != SCHEDULER:
+                SCHEDULER = scheduler_base
+                scheduler_client.SCHEDULER = scheduler_base
+            break
         try:
-            response = requests.get(f"{SCHEDULER}{path}", params=params, timeout=30)
+            if response is None:
+                raise last_error or SchedulerError(
+                    "scheduler connection failed without an error"
+                )
             status_code = int(response.status_code)
             if status_code >= 400:
                 raise SchedulerError(f"HTTP {status_code} from {path}")

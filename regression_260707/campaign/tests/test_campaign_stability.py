@@ -799,6 +799,62 @@ class FeederTests(unittest.TestCase):
 
 
 class CollectorFetchTests(unittest.TestCase):
+    def test_next_collector_process_uses_scheduler_environment(self):
+        with mock.patch.dict(
+                "os.environ", {"MFT_SCHEDULER_URL": "http://127.0.0.1:8001/"}):
+            self.assertEqual(
+                collect_wave._configured_scheduler_url(),
+                "http://127.0.0.1:8001",
+            )
+
+    def test_local_transport_failure_activates_8001_for_following_requests(self):
+        responses = [
+            collect_wave.requests.ConnectionError("legacy listener unavailable"),
+            FakeResponse(200, text="recovered"),
+            FakeResponse(200, text="next"),
+        ]
+        with mock.patch.object(
+                collect_wave, "SCHEDULER", collect_wave.DEFAULT_SCHEDULER), \
+                mock.patch.object(
+                    collect_wave.requests, "get", side_effect=responses
+                ) as get_mock, mock.patch.object(
+                    collect_wave.time, "sleep"
+                ) as sleep_mock:
+            self.assertEqual(
+                collect_wave._get_response("/api/health").text,
+                "recovered",
+            )
+            self.assertEqual(
+                collect_wave._get_response("/api/tasks").text,
+                "next",
+            )
+
+        self.assertEqual([call.args[0] for call in get_mock.call_args_list], [
+            "http://127.0.0.1:8000/api/health",
+            "http://127.0.0.1:8001/api/health",
+            "http://127.0.0.1:8001/api/tasks",
+        ])
+        sleep_mock.assert_not_called()
+
+    def test_explicit_remote_scheduler_never_falls_back_to_loopback(self):
+        with mock.patch.object(
+                collect_wave, "SCHEDULER", "https://scheduler.example.test"), \
+                mock.patch.object(
+                    collect_wave.requests,
+                    "get",
+                    side_effect=collect_wave.requests.ConnectionError("unavailable"),
+                ) as get_mock, mock.patch.object(
+                    collect_wave.time, "sleep"
+                ):
+            with self.assertRaises(collect_wave.FetchError):
+                collect_wave._get_response("/api/health", attempts=2)
+
+        self.assertEqual(get_mock.call_count, 2)
+        self.assertTrue(all(
+            call.args[0] == "https://scheduler.example.test/api/health"
+            for call in get_mock.call_args_list
+        ))
+
     def test_429_and_5xx_are_retried_with_bounded_backoff(self):
         responses = [
             FakeResponse(429, headers={"Retry-After": "0.1"}),

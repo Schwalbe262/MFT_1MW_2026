@@ -28,6 +28,73 @@ LEGACY_PAYLOAD_SHA256 = (
 )
 
 
+class FeederSchedulerEndpointTests(unittest.TestCase):
+    def test_next_feeder_process_uses_scheduler_environment(self):
+        with patch.dict(
+                os.environ, {"MFT_SCHEDULER_URL": "http://127.0.0.1:8001/"}):
+            self.assertEqual(
+                feeder._configured_scheduler_url(),
+                "http://127.0.0.1:8001",
+            )
+
+    def test_local_transport_failure_syncs_reads_and_submissions_to_8001(self):
+        recovered = Mock(status_code=200)
+        recovered.json.return_value = {"status": "ok"}
+        with patch.object(
+                feeder, "SCHEDULER", feeder.DEFAULT_SCHEDULER), patch.object(
+                feeder.scheduler_client,
+                "SCHEDULER",
+                feeder.DEFAULT_SCHEDULER,
+        ), patch.object(
+                feeder.requests,
+                "get",
+                side_effect=[
+                    feeder.requests.ConnectionError(
+                        "legacy listener unavailable"
+                    ),
+                    recovered,
+                ],
+        ) as get_mock, patch.object(feeder.time, "sleep") as sleep_mock:
+            self.assertEqual(
+                feeder._scheduler_json("/api/health"),
+                {"status": "ok"},
+            )
+            self.assertEqual(feeder.SCHEDULER, feeder.LOCAL_SCHEDULER_FALLBACK)
+            self.assertEqual(
+                feeder.scheduler_client.SCHEDULER,
+                feeder.LOCAL_SCHEDULER_FALLBACK,
+            )
+
+        self.assertEqual([call.args[0] for call in get_mock.call_args_list], [
+            "http://127.0.0.1:8000/api/health",
+            "http://127.0.0.1:8001/api/health",
+        ])
+        sleep_mock.assert_not_called()
+
+    def test_explicit_remote_scheduler_never_falls_back_to_loopback(self):
+        with patch.object(
+                feeder, "SCHEDULER", "https://scheduler.example.test"), \
+                patch.object(
+                    feeder.scheduler_client,
+                    "SCHEDULER",
+                    "https://scheduler.example.test",
+                ), patch.object(
+                    feeder, "SCHEDULER_ATTEMPTS", 2
+                ), patch.object(
+                    feeder.requests,
+                    "get",
+                    side_effect=feeder.requests.ConnectionError("unavailable"),
+                ) as get_mock, patch.object(feeder.time, "sleep"):
+            with self.assertRaises(feeder.SchedulerError):
+                feeder._scheduler_json("/api/health")
+
+        self.assertEqual(get_mock.call_count, 2)
+        self.assertTrue(all(
+            call.args[0] == "https://scheduler.example.test/api/health"
+            for call in get_mock.call_args_list
+        ))
+
+
 class FeederPooledSubmissionTests(unittest.TestCase):
     def _capture_cli_payload(
             self, cli_args, *, fail_local_revision_checks=False, target=1,
@@ -213,6 +280,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
 
     def test_aedt_pooled_injects_backend_environment_and_resources(self):
         expected_env = {
+            "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS": "7200",
             "MFT_AEDT_BACKEND": "pooled",
             "MFT_AEDT_SHARED_CANARY": "1",
             "MFT_AEDT_SCHEDULER_URL": "https://pool.example.test:8443",
@@ -384,6 +452,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
                 "MFT_AEDT_BACKEND",
                 "MFT_AEDT_SHARED_CANARY",
                 "MFT_AEDT_SCHEDULER_URL",
+                "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS",
                 "MFT_SLURM_SCHEDULER_ROOT",
                 "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE",
                 "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE"):

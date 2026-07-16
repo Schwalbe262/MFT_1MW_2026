@@ -48,7 +48,20 @@ else:  # Direct execution: python campaign/collect_wave.py
         sys.path.insert(0, regression_root)
     from model_targets import CORE_REGION_TEMPERATURE_TARGETS
 
-SCHEDULER = "http://127.0.0.1:8000"
+DEFAULT_SCHEDULER = "http://127.0.0.1:8000"
+LOCAL_SCHEDULER_FALLBACK = "http://127.0.0.1:8001"
+
+
+def _configured_scheduler_url():
+    """Resolve the scheduler endpoint once for this collector subprocess."""
+
+    return (
+        os.environ.get("MFT_SCHEDULER_URL", DEFAULT_SCHEDULER).strip().rstrip("/")
+        or DEFAULT_SCHEDULER
+    )
+
+
+SCHEDULER = _configured_scheduler_url()
 TASK_LIST_LIMIT = 200
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(HERE, "..", "data", "dataset")
@@ -115,15 +128,32 @@ def _retry_delay(response, attempt):
 
 def _get_response(path, *, params=None, timeout=30, attempts=FETCH_ATTEMPTS):
     """GET with bounded retry for 429, 5xx, and connection failures."""
-    url = path if path.startswith("http") else f"{SCHEDULER}{path}"
+    global SCHEDULER
     last_error = None
     for attempt in range(attempts):
         response = None
-        try:
-            response = requests.get(url, params=params, timeout=timeout)
-        except requests.RequestException as exc:
-            last_error = FetchError(f"GET {path} failed: {exc}")
+        if path.startswith("http"):
+            request_targets = [(None, path)]
         else:
+            request_targets = [(SCHEDULER, f"{SCHEDULER}{path}")]
+            # The local scheduler may be moved to the recovery listener while
+            # a recurring collector is still configured for the legacy port.
+            # Never redirect an explicit remote endpoint to localhost.
+            if SCHEDULER == DEFAULT_SCHEDULER:
+                request_targets.append((
+                    LOCAL_SCHEDULER_FALLBACK,
+                    f"{LOCAL_SCHEDULER_FALLBACK}{path}",
+                ))
+        for scheduler_base, url in request_targets:
+            try:
+                response = requests.get(url, params=params, timeout=timeout)
+            except requests.RequestException as exc:
+                last_error = FetchError(f"GET {path} failed: {exc}")
+                continue
+            if scheduler_base is not None and scheduler_base != SCHEDULER:
+                SCHEDULER = scheduler_base
+            break
+        if response is not None:
             status_code = int(response.status_code)
             if status_code != 429 and status_code < 500:
                 if status_code >= 400:
