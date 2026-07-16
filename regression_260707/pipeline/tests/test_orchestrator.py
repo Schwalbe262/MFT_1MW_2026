@@ -305,6 +305,7 @@ class ControllerSnapshotTests(unittest.TestCase):
             def inspect(snapshot):
                 self.assertEqual(Path(snapshot).read_bytes(), b"first-generation")
                 live.write_bytes(b"second-generation")
+                controller._last_raw_rows = 5432
                 return 4000
 
             controller.inspect_strict_rows = inspect
@@ -316,6 +317,7 @@ class ControllerSnapshotTests(unittest.TestCase):
                 (root / "surrogate_status.json").read_text(encoding="utf-8")
             )
             self.assertEqual(status["state"], "waiting_for_next_dataset_check")
+            self.assertEqual(status["raw_rows"], 5432)
             self.assertEqual(status["strict_full_rows"], 4000)
             self.assertEqual(status["last_error"], None)
             manifest = json.loads(

@@ -87,6 +87,7 @@ class ContinuousController:
             active_manifest_path or pipeline_root / "active_surrogate.json"
         ))
         self._cycle = 0
+        self._last_raw_rows = None
         self._last_strict_rows = None
         self._last_result = None
         self._last_error = None
@@ -191,6 +192,7 @@ class ContinuousController:
             "solver_revision": self.solver_revision,
             "library_revision": self.library_revision,
             "dataset": self._dataset_status(),
+            "raw_rows": self._last_raw_rows,
             "strict_full_rows": self._last_strict_rows,
             "activation_minimum_strict_full_rows": MIN_MODEL_ACTIVATION_ROWS,
             "first_tuning_strict_full_rows": FIRST_TUNING_ROWS,
@@ -224,11 +226,12 @@ class ContinuousController:
                 sys.path.insert(0, value)
         from checkpoint_orchestrator import inspect_dataset
 
-        _, _, strict, _ = inspect_dataset(
+        raw, _, strict, _ = inspect_dataset(
             os.path.abspath(os.fspath(dataset or self.dataset)),
             expected_solver_revision=self.solver_revision,
             expected_library_revision=self.library_revision,
         )
+        self._last_raw_rows = int(len(raw))
         return int(len(strict))
 
     def _snapshot_dataset(self) -> str:
