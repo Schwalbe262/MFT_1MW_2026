@@ -308,6 +308,119 @@ class _DesignWrapper:
 
 
 class ThermalStabilityTest(unittest.TestCase):
+    def test_pooled_first_mesh_init_skips_only_region_command_writeback(self):
+        from ansys.aedt.core.modeler.cad import elements_3d
+        from module import aedt_pool_adapter
+
+        native_history_child = SimpleNamespace(
+            SetPropValue=Mock(return_value=True)
+        )
+        history_node = SimpleNamespace(
+            _saved_root_name="Region",
+            _node="CreateRegion:1",
+            _app=None,
+            auto_update=True,
+            update_property=native_history_child.SetPropValue,
+        )
+        history_props = {}
+
+        class _LazyIcepak:
+            def __init__(self):
+                self._mesh = None
+
+            @property
+            def mesh(self):
+                props = elements_3d.HistoryProps(
+                    history_node,
+                    {"Existing Writable Property": "kept"},
+                )
+                history_props["value"] = props
+                props["Command"] = "CreateRegion"
+                props["Max Element Size"] = "2mm"
+                self._mesh = object()
+                return self._mesh
+
+        ipk = _LazyIcepak()
+        original_history_props = elements_3d.HistoryProps
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
+            initialized = thermal._initialize_pooled_icepak_mesh(ipk)
+
+        props = history_props["value"]
+        self.assertIs(initialized, ipk._mesh)
+        self.assertEqual(props["Command"], "CreateRegion")
+        self.assertEqual(props["Existing Writable Property"], "kept")
+        native_history_child.SetPropValue.assert_called_once_with(
+            "Max Element Size", "2mm"
+        )
+        self.assertIs(elements_3d.HistoryProps, original_history_props)
+
+        # The compatibility shim must not leak even through its former object.
+        props["Command"] = "CreateRegionAgain"
+        self.assertEqual(
+            native_history_child.SetPropValue.call_args_list[-1],
+            call("Command", "CreateRegionAgain"),
+        )
+
+    def test_pooled_mesh_shim_does_not_filter_other_history_commands(self):
+        from ansys.aedt.core.modeler.cad import elements_3d
+
+        updates = []
+        non_region_node = SimpleNamespace(
+            _saved_root_name="Box1",
+            _node="CreateBox:1",
+            _app=None,
+            auto_update=True,
+            update_property=lambda key, value: updates.append((key, value)),
+        )
+        with thermal._pooled_icepak_region_history_readback():
+            props = elements_3d.HistoryProps(non_region_node, {})
+            props["Command"] = "CreateBox"
+
+        self.assertEqual(updates, [("Command", "CreateBox")])
+
+    def test_standalone_and_initialized_mesh_skip_scoped_shim(self):
+        from ansys.aedt.core.modeler.cad import elements_3d
+        from module import aedt_pool_adapter
+
+        class _UnexpectedMeshAccess:
+            _mesh = None
+
+            @property
+            def mesh(self):
+                raise AssertionError("standalone mesh must remain lazy")
+
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=False):
+            self.assertIsNone(
+                thermal._initialize_pooled_icepak_mesh(_UnexpectedMeshAccess())
+            )
+
+        initialized = object()
+        ipk = SimpleNamespace(_mesh=initialized)
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
+            self.assertIs(
+                thermal._initialize_pooled_icepak_mesh(ipk),
+                initialized,
+            )
+
+        class _FailedMeshInitialization:
+            _mesh = None
+
+            @property
+            def mesh(self):
+                raise RuntimeError("mesh initialization failed")
+
+        original_history_props = elements_3d.HistoryProps
+        with patch.object(
+                aedt_pool_adapter, "pooled_backend_enabled", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "initialization failed"):
+                thermal._initialize_pooled_icepak_mesh(
+                    _FailedMeshInitialization()
+                )
+        self.assertIs(elements_3d.HistoryProps, original_history_props)
+
     def test_pooled_field_summary_uses_attested_shared_export(self):
         from module import aedt_pool_adapter
 

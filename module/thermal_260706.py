@@ -19,6 +19,7 @@ import math
 import logging
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,6 +58,76 @@ def _native_solver(app):
 
 _THERMAL_DESIGN_NAME = "icepak_thermal"
 _THERMAL_SETUP_NAME = "ThermalSetup"
+
+
+_HISTORY_PROPS_PATCH_LOCK = threading.RLock()
+
+
+@contextmanager
+def _pooled_icepak_region_history_readback():
+    """Skip PyAEDT 0.22's write-back of read-only Region command metadata.
+
+    ``IcepakMesh`` constructs ``GlobalMeshRegion``, whose ``Region`` helper
+    reads the modeler history.  During that read PyAEDT 0.22 copies the
+    ``Command`` metadata through ``HistoryProps.__setitem__``.  Auto-update
+    then sends the read-only value back to AEDT with ``SetPropValue`` and AEDT
+    records a non-fatal ``Command is read only`` script-macro error.
+
+    Keep the compatibility shim scoped to the first pooled Icepak mesh
+    initialization.  Only the internal ``CreateRegion`` command copy bypasses
+    auto-update; every writable property still follows PyAEDT's original
+    setter.  The class method is restored in ``finally`` so later histories in
+    the long-lived pooled client retain normal PyAEDT behavior.
+    """
+    from ansys.aedt.core.modeler.cad import elements_3d
+
+    with _HISTORY_PROPS_PATCH_LOCK:
+        original_history_props = elements_3d.HistoryProps
+        shim_active = [True]
+
+        class _ScopedRegionHistoryProps(original_history_props):
+            def __setitem__(props, key, value):
+                child = getattr(props, "_pyaedt_child", None)
+                root_name = str(
+                    getattr(child, "_saved_root_name", "")
+                ).strip().casefold()
+                node_name = str(
+                    getattr(child, "_node", "")
+                ).strip().casefold()
+                if (
+                    shim_active[0]
+                    and str(key).strip().casefold() == "command"
+                    and root_name == "region"
+                    and node_name.startswith("createregion")
+                ):
+                    props._setitem_without_update(key, value)
+                    return
+                return original_history_props.__setitem__(props, key, value)
+
+        # BinaryTreeNode.properties resolves this module symbol when it creates
+        # a new history bag. Existing HistoryProps objects are never modified.
+        elements_3d.HistoryProps = _ScopedRegionHistoryProps
+        try:
+            yield
+        finally:
+            shim_active[0] = False
+            elements_3d.HistoryProps = original_history_props
+
+
+def _initialize_pooled_icepak_mesh(ipk):
+    """Initialize one lazy pooled Icepak mesh under the PyAEDT 0.22 shim."""
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    if not pooled_backend_enabled():
+        return None
+    initialized = getattr(ipk, "_mesh", None)
+    if initialized is not None:
+        return initialized
+    with _pooled_icepak_region_history_readback():
+        initialized = ipk.mesh
+    if initialized is None:
+        raise RuntimeError("pooled Icepak mesh initialization returned no mesh")
+    return initialized
 
 
 def _field_summary_data_frame(sim, field_summary, setup):
@@ -2528,6 +2599,7 @@ def run_thermal_analysis(sim):
     ipk = sim.project.create_design(name="icepak_thermal", solver="icepak",
                                     solution="SteadyState TemperatureAndFlow")
     sim.design_thermal = ipk
+    _initialize_pooled_icepak_mesh(ipk)
 
     set_design_variables(ipk, sim.input_df)
     core_conductivity = _core_thermal_conductivity_contract(df)
