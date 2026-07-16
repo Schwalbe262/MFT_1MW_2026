@@ -143,6 +143,7 @@ def test_cycle_submits_only_own_deficit_and_respects_shared_project_slots(tmp_pa
         assert call.kwargs["aedt_backend"] == "pooled"
         assert call.kwargs["required_hard_cap"] == 500
         assert call.kwargs["prevalidated_cycle"] is True
+        assert call.kwargs["account_name"] == ""
 
 
 def test_cycle_waits_when_shared_project_has_no_slots(tmp_path):
@@ -168,8 +169,5 @@ def test_cycle_waits_when_shared_project_has_no_slots(tmp_path):
     submit.assert_not_called()
 
 
-def test_accounts_map_six_projects_each_over_thirty_serials():
-    values = [soak._account_for_serial(serial) for serial in range(1, 31)]
-    assert {account: values.count(account) for account in soak.ELIGIBLE_ACCOUNTS} == {
-        account: 6 for account in soak.ELIGIBLE_ACCOUNTS
-    }
+def test_controller_has_no_static_account_selector():
+    assert not hasattr(soak, "_account_for_serial")

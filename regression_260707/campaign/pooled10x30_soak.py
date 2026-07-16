@@ -306,10 +306,6 @@ def verify_deployment_and_packages(args: argparse.Namespace) -> dict[str, Any]:
     return {"deployment": deployment, "packages": packages}
 
 
-def _account_for_serial(serial: int) -> str:
-    return ELIGIBLE_ACCOUNTS[(serial - 1) % len(ELIGIBLE_ACCOUNTS)]
-
-
 def execute_cycle(args: argparse.Namespace, static_gates: Mapping[str, Any]) -> dict[str, Any]:
     state_path = args.runtime_dir / "state.json"
     status: dict[str, Any]
@@ -349,7 +345,12 @@ def execute_cycle(args: argparse.Namespace, static_gates: Mapping[str, Any]) -> 
                 submission_env=environment,
                 required_hard_cap=PROJECT_CAP,
                 max_project_active_tasks=PROJECT_CAP,
-                account_name=_account_for_serial(serial),
+                # Leave flexible soak work unpinned.  The scheduler owns the
+                # live account decision because it can see per-account GPFS
+                # headroom and must reserve a whole three-project AEDT cohort.
+                # A durable round-robin pin can strand queued work on an
+                # account that cannot safely start another AEDT session.
+                account_name="",
                 profile_path=str(PROFILE_PATH),
                 prevalidated_cycle=True,
             )
