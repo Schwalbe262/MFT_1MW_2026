@@ -2533,6 +2533,51 @@ class ArtifactService:
         if not strict_available:
             pinned_revision = None
             pinned_library_revision = None
+        training_raw_rows = self._exact_integer(strict_status.get("raw_rows"))
+        training_strict_em_rows = self._exact_integer(
+            strict_status.get("strict_em_rows")
+        )
+        training_strict_full_rows = self._exact_integer(
+            strict_status.get("strict_full_rows")
+        )
+        training_counts_valid = bool(
+            strict_available
+            and training_raw_rows is not None
+            and training_strict_em_rows is not None
+            and training_strict_full_rows is not None
+            and 0 <= training_strict_full_rows
+            <= training_strict_em_rows
+            <= training_raw_rows
+        )
+        if strict_available and not training_counts_valid:
+            warnings.append(
+                "pinned strict-data counts are missing or inconsistent; "
+                "the training cohort is unavailable."
+            )
+            strict_available = False
+            pinned_revision = None
+            pinned_library_revision = None
+        training_cohort = {
+            "available": training_counts_valid,
+            "count_basis": "exact_solver_library_strict_full",
+            "raw_rows": training_raw_rows if training_counts_valid else None,
+            "strict_em_rows": (
+                training_strict_em_rows if training_counts_valid else None
+            ),
+            "strict_full_rows": (
+                training_strict_full_rows if training_counts_valid else None
+            ),
+            "solver_revision": pinned_revision,
+            "library_revision": pinned_library_revision,
+            "source_dataset_generation": (
+                _safe_text(strict_status.get("source_dataset_generation"), 160)
+                if training_counts_valid else None
+            ),
+            "updated_at": (
+                _safe_text(strict_status.get("time"), 80)
+                if training_counts_valid else None
+            ),
+        }
         raw_campaign_frame = (
             parquet_result.value
             if parquet_result.value is not None else rows
@@ -2674,6 +2719,7 @@ class ArtifactService:
             "latest_revision": latest_revision,
             "pinned_revision": pinned_revision,
             "pinned_library_revision": pinned_library_revision,
+            "training_cohort": training_cohort,
             "current_solver_revision": active_solver_revision,
             "current_physics_data_revision": CURRENT_PHYSICS_DATA_REVISION,
             "member_git_hashes": physics_aggregate["member_git_hashes"],
@@ -3051,7 +3097,14 @@ class ArtifactService:
             warnings.append("active model generation has no matching passing gate")
             report = {}
         if current_data_count is None:
-            current_data_count = self.data()["total_rows"]
+            data = self.data()
+            training_cohort = data.get("training_cohort")
+            current_data_count = (
+                training_cohort.get("strict_full_rows")
+                if isinstance(training_cohort, dict)
+                and training_cohort.get("available") is True
+                else data["total_rows"]
+            )
 
         checkpoint_result = self._latest_checkpoint_evidence()
         warnings.extend(checkpoint_result["warnings"])
@@ -3891,7 +3944,14 @@ class ArtifactService:
     def dashboard(self, record: bool = True) -> dict[str, Any]:
         generated_at = _iso(self.clock())
         data = self.data()
-        models = self.models(data["total_rows"])
+        training_cohort = data.get("training_cohort")
+        model_data_count = (
+            training_cohort.get("strict_full_rows")
+            if isinstance(training_cohort, dict)
+            and training_cohort.get("available") is True
+            else data["total_rows"]
+        )
+        models = self.models(model_data_count)
         nsga = self.nsga2()
         verification = self.verification(nsga)
         scheduler = self.scheduler.snapshot()
