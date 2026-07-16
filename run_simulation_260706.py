@@ -134,6 +134,7 @@ from module.aedt_pool_adapter import (
     release_project as release_pooled_project,
     report_failure as report_pooled_failure,
     validate_pooled_fill_timeout,
+    wait_for_native_pipeline_barrier as pooled_native_pipeline_barrier,
 )
 from module.aedt_terminal_attestation import (
     advance_scoped_message_cursor,
@@ -917,6 +918,19 @@ def _project_delete_policy(input_frame, fixed_mode=False, hold=False, model_only
     keep_values = input_frame.get("keep_project", pd.Series([default_keep]))
     keep_project = int(keep_values.iloc[0]) != 0
     return not (keep_project or hold or model_only)
+
+
+def _final_fixed_project_save_required(backend, fixed_mode=False, hold=False):
+    """Avoid a redundant pooled save after terminal solve attestation.
+
+    Every pooled native stage already saves its exact project before terminal
+    attestation returns.  Thermal field-summary extraction does not change the
+    solved field data, while another final save can hold Desktop automation
+    behind a ~30 minute extraction and delay ``RESULT_JSON``.  Pooled hold is
+    rejected at admission, but retain it here as a fail-safe preservation rule.
+    """
+
+    return bool(hold or (fixed_mode and str(backend) != "pooled"))
 
 
 def _load_fixed_input_parameter(param):
@@ -1951,6 +1965,7 @@ class Simulation():
         self.aedt_lease = None
         self.pooled_release_done = False
         self.pooled_activation_done = False
+        self.pooled_native_pipeline_done = False
         self.solver_may_be_running = False
 
     def create_simulation_name(self):
@@ -2445,6 +2460,21 @@ class Simulation():
 
             return nullcontext()
         return pooled_native_solve_window(self.aedt_lease)
+
+    def wait_for_pooled_native_pipeline(self):
+        """Join the cohort barrier before long Desktop-global extraction."""
+
+        if self._backend_mode() != "pooled" or bool(getattr(
+                self, "pooled_native_pipeline_done", False)):
+            return None
+        status = pooled_native_pipeline_barrier(self.aedt_lease)
+        self.pooled_native_pipeline_done = True
+        logging.info(
+            "pooled native-pipeline cohort complete: %s/%s",
+            status.get("native_pipeline_completed_count"),
+            status.get("native_pipeline_expected_count"),
+        )
+        return status
 
     def _verified_native_project_handle(self):
         """Return this runner's cached project after exact-name attestation."""
@@ -7502,6 +7532,15 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             total_time += t_thermal
             result_parts += [df_thermal, pd.DataFrame({"time_thermal": [t_thermal]})]
 
+        # Thermal workflows join from inside ``run_thermal_analysis`` before
+        # their long Desktop-global field extraction.  A valid pooled workflow
+        # without thermal still has to mark its final native stage so a mixed
+        # sealed cohort cannot wait forever for a participant that never joins.
+        if backend == "pooled" and not model_only \
+                and sim.pooled_activation_done \
+                and not sim.pooled_native_pipeline_done:
+            sim.wait_for_pooled_native_pipeline()
+
         if model_only:
             print(sim.df_plus)
             sim.save_project()
@@ -7584,7 +7623,14 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
 
         if fixed_mode or hold:
             print(result)
-            sim.save_project()
+            if _final_fixed_project_save_required(
+                    backend, fixed_mode=fixed_mode, hold=hold):
+                sim.save_project()
+            else:
+                logging.info(
+                    "Skipping redundant final pooled project save; the exact "
+                    "terminal native stage was already saved"
+                )
         # 스케줄러 stdout 회수용: 결과 1행을 JSON 한 줄로 즉시 스트리밍
         # (랜덤 모드도 포함 - 태스크 완주를 기다리지 않고 샘플 단위로 데이터 회수 가능)
         try:

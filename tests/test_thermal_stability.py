@@ -539,6 +539,42 @@ class ThermalStabilityTest(unittest.TestCase):
         sim.aedt_native_solve_window.assert_not_called()
         sim.aedt_automation_transaction.assert_not_called()
 
+    def test_native_pipeline_barrier_suspends_every_outer_lock_depth(self):
+        from module import aedt_pool_adapter
+
+        lock_depth = [2]
+        events = []
+
+        @contextmanager
+        def native_window():
+            saved = lock_depth[0]
+            self.assertGreater(saved, 0)
+            lock_depth[0] = 0
+            events.append("suspended")
+            try:
+                yield
+            finally:
+                lock_depth[0] = saved
+                events.append("restored")
+
+        def wait_for_cohort():
+            self.assertEqual(lock_depth[0], 0)
+            events.append("cohort-complete")
+            return {"native_pipeline_barrier_granted": True}
+
+        sim = SimpleNamespace(
+            aedt_native_solve_window=native_window,
+            wait_for_pooled_native_pipeline=wait_for_cohort,
+        )
+        with patch.object(
+            aedt_pool_adapter, "pooled_backend_enabled", return_value=True
+        ):
+            status = thermal._wait_for_pooled_native_pipeline(sim)
+
+        self.assertTrue(status["native_pipeline_barrier_granted"])
+        self.assertEqual(events, ["suspended", "cohort-complete", "restored"])
+        self.assertEqual(lock_depth[0], 2)
+
     @staticmethod
     def _convergence(converged=True):
         return {
@@ -650,6 +686,8 @@ class ThermalStabilityTest(unittest.TestCase):
             SetActiveProject=Mock(side_effect=set_active_project),
         )
         ipk.odesktop = pooled_desktop
+        native_window = Mock(return_value=nullcontext())
+        native_pipeline_barrier = Mock()
         sim = SimpleNamespace(
             project=project,
             _rebind_native_project_for_design_creation=rebind_project,
@@ -678,9 +716,11 @@ class ThermalStabilityTest(unittest.TestCase):
                 side_effect=lambda *_args: ipk.field_summary_export_text
             ),
             _remove_attested_aedt_export=Mock(),
-            aedt_native_solve_window=Mock(return_value=nullcontext()),
+            aedt_native_solve_window=native_window,
             aedt_automation_transaction=lambda: nullcontext(),
+            wait_for_pooled_native_pipeline=native_pipeline_barrier,
             _native_desktop_handle=Mock(return_value=pooled_desktop),
+            stage_timings={},
             solver_may_be_running=False,
         )
         object_factory = object_factory or _Object
@@ -787,6 +827,8 @@ class ThermalStabilityTest(unittest.TestCase):
         ipk.telemetry_mock = telemetry
         ipk.sleep_mock = sleeper
         ipk.rebind_project_mock = rebind_project
+        ipk.native_window_mock = native_window
+        ipk.native_pipeline_barrier_mock = native_pipeline_barrier
         self.assertGreaterEqual(rebind_project.call_count, 2)
         return ipk, result.iloc[0]
 
@@ -1243,6 +1285,7 @@ class ThermalStabilityTest(unittest.TestCase):
         solve_project = _SingleActivationProjectHandle("thermal_test")
         postflight_project = _ProjectHandle("thermal_test")
         extraction_project = _ProjectHandle("thermal_test")
+        field_summary_project = _ProjectHandle("thermal_test")
 
         ipk, row = self._run(
             None,
@@ -1253,20 +1296,24 @@ class ThermalStabilityTest(unittest.TestCase):
                 solve_project,
                 postflight_project,
                 extraction_project,
+                field_summary_project,
             ],
         )
 
         self.assertEqual(row["thermal_solved"], 1)
         self.assertEqual(row["thermal_extraction_complete"], 1)
-        self.assertEqual(ipk.rebind_project_mock.call_count, 4)
+        self.assertEqual(ipk.rebind_project_mock.call_count, 5)
+        ipk.native_pipeline_barrier_mock.assert_called_once_with()
+        self.assertGreaterEqual(ipk.native_window_mock.call_count, 3)
         self.assertEqual(solve_project.active_calls, 1)
         self.assertEqual(
             solve_project.last_design.analyze_calls,
             [("ThermalSetup", True)],
         )
-        self.assertIs(ipk.oproject, extraction_project)
+        self.assertIs(ipk.oproject, field_summary_project)
         self.assertEqual(postflight_project.active_calls, 1)
-        self.assertGreaterEqual(extraction_project.active_calls, 2)
+        self.assertGreaterEqual(extraction_project.active_calls, 1)
+        self.assertGreaterEqual(field_summary_project.active_calls, 2)
 
     def test_post_solve_extraction_never_queries_object_dimension_proxy(self):
         complete = {

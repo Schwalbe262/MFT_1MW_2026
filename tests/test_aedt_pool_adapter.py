@@ -71,6 +71,31 @@ def test_activation_is_explicit_and_requires_project_creation_identity():
     assert lease.calls == [("activate", "simulation17")]
 
 
+def test_native_pipeline_barrier_requires_scheduler_grant():
+    lease = SimpleNamespace(
+        protocol_version=2,
+        wait_for_native_pipeline_barrier=Mock(
+            return_value={
+                "native_pipeline_barrier_granted": True,
+                "native_pipeline_completed_count": 3,
+                "native_pipeline_expected_count": 3,
+            }
+        ),
+    )
+
+    status = adapter.wait_for_native_pipeline_barrier(lease)
+
+    assert status["native_pipeline_completed_count"] == 3
+    lease.wait_for_native_pipeline_barrier.assert_called_once_with()
+
+
+def test_native_pipeline_barrier_fails_closed_with_old_v2_client():
+    with pytest.raises(RuntimeError, match="no native-pipeline barrier"):
+        adapter.wait_for_native_pipeline_barrier(
+            SimpleNamespace(protocol_version=2)
+        )
+
+
 @pytest.mark.parametrize(
     ("raw_timeout", "expected"),
     (("0", 0.0), ("0.25", 0.25), ("900", 900.0)),

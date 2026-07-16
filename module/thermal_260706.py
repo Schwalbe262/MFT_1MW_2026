@@ -1162,6 +1162,23 @@ def _solve_exact_pooled_thermal_setup(
     }
 
 
+def _wait_for_pooled_native_pipeline(sim):
+    """Join the sealed cohort barrier without holding Desktop automation."""
+
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    if not pooled_backend_enabled():
+        return None
+    native_window = getattr(sim, "aedt_native_solve_window", None)
+    waiter = getattr(sim, "wait_for_pooled_native_pipeline", None)
+    if not callable(native_window) or not callable(waiter):
+        raise RuntimeError(
+            "pooled native-pipeline barrier has no lock discipline"
+        )
+    with native_window():
+        return waiter()
+
+
 def _solve_exact_thermal_setup(
     sim, ipk, setup, setup_name=_THERMAL_SETUP_NAME,
     monitor_grace_s=30.0, poll_s=2.0,
@@ -2599,6 +2616,22 @@ def run_thermal_analysis(sim):
         convergence["thermal_residual_energy"],
         convergence["thermal_convergence_reason"],
     )
+    from module.aedt_pool_adapter import pooled_backend_enabled
+    pooled_backend = pooled_backend_enabled()
+    if pooled_backend:
+        # ``AreThereSimulationsRunning == False`` is only a momentary
+        # Desktop-idle observation.  A sibling may still be waiting for the
+        # automation lock to build or launch its final thermal design.  If the
+        # first completed project starts the long Desktop-global field-summary
+        # export in that gap, it starves the sibling's remaining native solve.
+        # Mark this exact sealed-batch member complete and wait, with every
+        # outer automation-lock depth suspended, until all cohort members have
+        # finished their full native pipeline.
+        barrier_started = time.monotonic()
+        _wait_for_pooled_native_pipeline(sim)
+        sim.stage_timings["stage_time_native_pipeline_barrier_s"] = (
+            time.monotonic() - barrier_started
+        )
     extraction_started = time.monotonic()
 
     # ---- 온도 추출 (필드 계산기 직접 평가 - 리포트 기계 미사용) ----
@@ -2796,7 +2829,13 @@ def run_thermal_analysis(sim):
     # authoritative even when the Desktop itself is healthy.  Re-enumerate
     # this lease's exact project and re-attest the Icepak design/setup before
     # any post-processing call can touch those proxies.
-    postflight = solve_result.get("postflight")
+    # The cohort barrier deliberately allowed siblings to reactivate their
+    # projects/designs.  Never reuse the pre-barrier child proxy in pooled
+    # mode; re-enumerate and attest this lease again under the restored lock.
+    postflight = (
+        None if pooled_backend
+        else solve_result.get("postflight")
+    )
     if not postflight:
         try:
             postflight = _prepare_thermal_dispatch(
