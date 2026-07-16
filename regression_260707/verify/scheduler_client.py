@@ -38,6 +38,10 @@ except ImportError:
 
 SCHEDULER = "http://127.0.0.1:8000"
 TEST_TASK_PRIORITY = 10
+POOLED_OPTIONAL_SURFACE_CALCOP_REASON = (
+    "pooled_optional_calcop_unavailable:"
+    "center_leg_surface_flux_uses_equivalent_faraday_evidence"
+)
 MFT_PROJECT = "MFT_1MW_2026v1"
 # Default operator/controller ceiling.  The pooled feeder may explicitly use
 # the scheduler's higher project ceiling without changing legacy callers.
@@ -1234,6 +1238,13 @@ def is_valid_result(
         surface_reason = str(result.get(
             "center_leg_surface_flux_integral_reason"
         ) or "")
+        surface_reason_approved = (
+            (
+                surface_reason.startswith("grpc_calcop_unavailable:")
+                and len(surface_reason) > len("grpc_calcop_unavailable:")
+            )
+            or surface_reason == POOLED_OPTIONAL_SURFACE_CALCOP_REASON
+        )
         surface_fail_soft = (
             surface_applicable in (0, 0.0, False)
             and result.get("center_leg_surface_flux_integral_available")
@@ -1243,8 +1254,7 @@ def is_valid_result(
             and str(result.get(
                 "center_leg_surface_flux_integral_status"
             ) or "").strip() == "unavailable"
-            and surface_reason.startswith("grpc_calcop_unavailable:")
-            and len(surface_reason) > len("grpc_calcop_unavailable:")
+            and surface_reason_approved
         )
         if surface_applicable in (0, 0.0, False) and not surface_fail_soft:
             return False

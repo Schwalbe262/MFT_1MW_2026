@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE / "verify"))
 
 from quality_contract import (
     PHYSICS_EQUIVALENT_SOLVER_REVISIONS as QUALITY_SOLVER_EQUIVALENCE,
+    POOLED_OPTIONAL_SURFACE_CALCOP_REASON,
     annotate_validity,
     validate_record,
 )
@@ -147,6 +148,24 @@ def _native_result_with_unavailable_winding_readback(**updates):
         core_surface_flux_vs_linkage_rel_error=float("nan"),
         core_surface_flux_vs_induced_voltage_rel_error=float("nan"),
         center_leg_surface_flux_integral_passed=0,
+    )
+    row.update(updates)
+    return row
+
+
+def _native_result_with_pooled_optional_surface_calcop(**updates):
+    row = _valid_native_result(
+        center_leg_surface_flux_integral_applicable=0,
+        center_leg_surface_flux_integral_available=0,
+        center_leg_surface_flux_integral_passed=1,
+        center_leg_surface_flux_integral_status="unavailable",
+        center_leg_surface_flux_integral_reason=(
+            POOLED_OPTIONAL_SURFACE_CALCOP_REASON
+        ),
+        core_surface_flux_vs_linkage_rel_error=float("nan"),
+        core_surface_flux_vs_induced_voltage_rel_error=float("nan"),
+        Tx_flux_linkage_faraday_rel_error=2.949e-7,
+        Tx_induced_vs_source_peak_rel_error=0.05,
     )
     row.update(updates)
     return row
@@ -442,6 +461,62 @@ class StrictRowContractTests(unittest.TestCase):
             "native_lamination:flux_linkage_attested", result.reasons
         )
         self.assertTrue(scheduler_client.is_valid_result(row))
+
+    def test_pooled_optional_surface_calcop_uses_exact_faraday_evidence(self):
+        row = _native_result_with_pooled_optional_surface_calcop()
+
+        result = validate_record(row)
+
+        self.assertTrue(result.full_valid, result.reasons)
+        self.assertTrue(scheduler_client.is_valid_result(row))
+
+        cases = (
+            {
+                "center_leg_surface_flux_integral_reason": (
+                    POOLED_OPTIONAL_SURFACE_CALCOP_REASON + ":extra"
+                )
+            },
+            {"Tx_flux_linkage_faraday_rel_error": 0.010001},
+            {"git_dirty": 1},
+            {"git_hash": "abc1234"},
+        )
+        for updates in cases:
+            with self.subTest(updates=updates):
+                invalid = _native_result_with_pooled_optional_surface_calcop(
+                    **updates
+                )
+                self.assertFalse(validate_record(invalid).full_valid)
+                self.assertFalse(scheduler_client.is_valid_result(invalid))
+
+    def test_failed_terminal_json_guard_recovers_only_strict_clean_rows(self):
+        strict = _native_result_with_pooled_optional_surface_calcop()
+        bad_hash = _native_result_with_pooled_optional_surface_calcop(
+            git_hash="abc1234"
+        )
+        stored_invalid = _native_result_with_pooled_optional_surface_calcop(
+            result_valid_em=0
+        )
+
+        for status in ("failed", "cancelled"):
+            with self.subTest(status=status):
+                guarded, recovered = collect_wave.guard_terminal_result_json(
+                    pd.DataFrame([strict, bad_hash, stored_invalid]), status
+                )
+                self.assertEqual(recovered, 1)
+                self.assertEqual(
+                    guarded["result_valid_em"].tolist(), [1, 0, 0]
+                )
+                self.assertEqual(
+                    guarded["result_valid_thermal"].tolist(), [1, 0, 0]
+                )
+                self.assertEqual(
+                    guarded["terminal_result_recovery_validated"].tolist(),
+                    [1, 0, 0],
+                )
+                self.assertEqual(
+                    guarded["collector_terminal_status"].tolist(),
+                    [status, status, status],
+                )
 
     def test_native_available_winding_readback_failure_is_quarantined(self):
         cases = (

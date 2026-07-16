@@ -552,6 +552,47 @@ def fetch_streamed_rows(task_id, out=None):
     return pd.DataFrame(rows) if rows else None
 
 
+def guard_terminal_result_json(frame, task_status):
+    """Validate failed/cancelled RESULT_JSON without ever promoting a flag."""
+    status = str(task_status or "").strip().lower()
+    if frame is None or frame.empty or status not in {"failed", "cancelled"}:
+        return frame, 0
+
+    regression_root = os.path.abspath(os.path.join(HERE, ".."))
+    if regression_root not in sys.path:
+        sys.path.insert(0, regression_root)
+    from quality_contract import annotate_validity
+
+    audited = annotate_validity(frame)
+    clean = frame.copy()
+    strict_em = audited["_strict_valid_em"].fillna(False).astype(bool)
+    strict_full = audited["_strict_valid_full"].fillna(False).astype(bool)
+    claimed_em = (
+        pd.to_numeric(clean["result_valid_em"], errors="coerce").eq(1)
+        if "result_valid_em" in clean.columns
+        else pd.Series(False, index=clean.index)
+    )
+    claimed_thermal = (
+        pd.to_numeric(clean["result_valid_thermal"], errors="coerce").eq(1)
+        if "result_valid_thermal" in clean.columns
+        else pd.Series(False, index=clean.index)
+    )
+    if "result_valid_em" in clean.columns:
+        clean.loc[claimed_em & ~strict_em, "result_valid_em"] = 0
+    if "result_valid_thermal" in clean.columns:
+        # Thermal recovery also requires clean/profile-valid EM provenance;
+        # _strict_valid_thermal alone intentionally does not include it.
+        clean.loc[claimed_thermal & ~strict_full, "result_valid_thermal"] = 0
+
+    recoverable = claimed_em & strict_em & (~claimed_thermal | strict_full)
+    clean["collector_terminal_status"] = status
+    clean["terminal_result_recovery_validated"] = recoverable.astype(int)
+    clean["terminal_result_recovery_reason"] = audited[
+        "_strict_invalid_reasons"
+    ].astype(str)
+    return clean, int(recoverable.sum())
+
+
 def _tag_source(frame, rank):
     tagged = frame.copy()
     tagged[SOURCE_RANK_COLUMN] = rank
@@ -1425,6 +1466,7 @@ def main(argv=None):
     ) - recollect_task_ids
     frames = []
     n_salvaged = 0
+    n_terminal_recovered = 0
     n_streamed = 0
     n_skipped = 0
     n_fetch_errors = 0
@@ -1462,6 +1504,10 @@ def main(argv=None):
         task_frames = []
         json_frame = fetch_streamed_rows(t["id"], out=out)
         if json_frame is not None and len(json_frame):
+            json_frame, recovered = guard_terminal_result_json(
+                json_frame, t.get("status")
+            )
+            n_terminal_recovered += recovered
             json_rank = SOURCE_RANK_JSON + (
                 SOURCE_RANK_RECOLLECT_OFFSET
                 if int(t["id"]) in recollect_task_ids else 0
@@ -1512,6 +1558,11 @@ def main(argv=None):
             n_streamed += len(rows)
     if n_salvaged:
         print(f"salvaged from failed tasks: {n_salvaged}")
+    if n_terminal_recovered:
+        print(
+            "strict terminal RESULT_JSON rows recovered: "
+            f"{n_terminal_recovered}"
+        )
     if n_streamed:
         print(f"streamed from running tasks: {n_streamed} rows")
     if n_fetch_errors:

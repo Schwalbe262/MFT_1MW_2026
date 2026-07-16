@@ -57,6 +57,10 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_PROFILE_PATH = HERE / "verify" / "profiles" / "standard.json"
 MAX_TRUSTED_TEMPERATURE_C = 4700.0
 MIN_TRUSTED_TEMPERATURE_C = -273.15
+POOLED_OPTIONAL_SURFACE_CALCOP_REASON = (
+    "pooled_optional_calcop_unavailable:"
+    "center_leg_surface_flux_uses_equivalent_faraday_evidence"
+)
 
 # Evidence / approval record (operator decision 2026-07-15): the reviewed
 # production-physics diff bffbb15..262574a is limited to the pooled AEDT
@@ -462,14 +466,20 @@ def _em_reasons(record: Mapping[str, Any], profile: dict) -> list[str]:
         surface_reason = str(_value(
             record, "center_leg_surface_flux_integral_reason"
         ) or "")
+        surface_reason_approved = (
+            (
+                surface_reason.startswith("grpc_calcop_unavailable:")
+                and len(surface_reason) > len("grpc_calcop_unavailable:")
+            )
+            or surface_reason == POOLED_OPTIONAL_SURFACE_CALCOP_REASON
+        )
         surface_fail_soft = surface_applicable == 0.0 and (
             _number(record, "center_leg_surface_flux_integral_available") == 0.0
             and _number(record, "center_leg_surface_flux_integral_passed") == 1.0
             and str(_value(
                 record, "center_leg_surface_flux_integral_status"
             ) or "").strip() == "unavailable"
-            and surface_reason.startswith("grpc_calcop_unavailable:")
-            and len(surface_reason) > len("grpc_calcop_unavailable:")
+            and surface_reason_approved
         )
         if surface_applicable == 0.0 and not surface_fail_soft:
             reasons.append(
