@@ -30,6 +30,9 @@ from .policy import (
 from .queue import DurableJobQueue, Job
 
 
+DEFAULT_MODEL_THREADS = 24
+
+
 @dataclass(frozen=True)
 class CycleResult:
     dataset_generation: str
@@ -90,12 +93,16 @@ class PipelineOrchestrator:
         quality_regression: bool = False,
         collect_interval_seconds: int = 600,
         optuna_trials: int = 200,
+        model_threads: int = DEFAULT_MODEL_THREADS,
         verification_commands: Mapping[str, Mapping[str, object]] | None = None,
         now: float | None = None,
     ) -> CycleResult:
         rows = int(strict_full_rows)
         if rows < 0:
             raise ValueError("strict_full_rows must be non-negative")
+        if isinstance(model_threads, bool) or int(model_threads) < 1:
+            raise ValueError("model_threads must be a positive integer")
+        model_threads = int(model_threads)
         for label, revision in (
             ("solver", solver_revision), ("library", library_revision)
         ):
@@ -180,6 +187,7 @@ class PipelineOrchestrator:
                         str(self.runtime_root / "training" / "tune_optuna.py"),
                         "--all",
                         "--trials", str(int(optuna_trials)),
+                        "--model-threads", str(model_threads),
                         "--dataset", str(dataset.path / "train.parquet"),
                         "--artifact-root", str(self.store.root),
                         "--result-json", result_json,

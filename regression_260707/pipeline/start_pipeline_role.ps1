@@ -25,6 +25,8 @@ param(
     [int]$ControllerIntervalSeconds = 600,
     [ValidateRange(1, 100000)]
     [int]$OptunaTrials = 200,
+    [ValidateRange(1, 1024)]
+    [int]$ModelThreads = 24,
     [switch]$RestartOnFailure,
     [ValidateRange(1, 3600)]
     [int]$RestartDelaySeconds = 30,
@@ -154,7 +156,8 @@ if ($Role -eq "Controller") {
         "--library-revision", $library,
         "--verification-commands", $sealedConfig,
         "--interval-seconds", [string]$ControllerIntervalSeconds,
-        "--optuna-trials", [string]$OptunaTrials
+        "--optuna-trials", [string]$OptunaTrials,
+        "--model-threads", [string]$ModelThreads
     )
     if ($Dataset) {
         $arguments += @("--dataset", [IO.Path]::GetFullPath($Dataset))
@@ -176,6 +179,7 @@ $contract = [ordered]@{
     pipeline_runtime_root = $stateRoot
     solver_revision = $solver
     library_revision = $library
+    model_threads = $ModelThreads
     verification_config = $sealedConfig
     verification_config_sha256 = $reviewedConfigSha
     stdout_log = $stdoutLog
@@ -194,6 +198,7 @@ while ($true) {
         attempt = $attempt
         solver_revision = $solver
         library_revision = $library
+        model_threads = $ModelThreads
         verification_config_sha256 = $reviewedConfigSha
     }
     $exitCode = 1

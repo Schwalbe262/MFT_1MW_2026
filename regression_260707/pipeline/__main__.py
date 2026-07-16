@@ -11,7 +11,11 @@ import sys
 
 from .artifacts import GenerationStore
 from .controller import ContinuousController
-from .orchestrator import PipelineOrchestrator, descriptor_from_active_registry
+from .orchestrator import (
+    DEFAULT_MODEL_THREADS,
+    PipelineOrchestrator,
+    descriptor_from_active_registry,
+)
 from .queue import DurableJobQueue
 from .runner import JobRunner
 from .runtime_lock import AlreadyRunningError, RoleInstanceLock
@@ -79,6 +83,9 @@ def main() -> None:
     control.add_argument("--library-revision", required=True)
     control.add_argument("--interval-seconds", type=int, default=600)
     control.add_argument("--optuna-trials", type=int, default=200)
+    control.add_argument(
+        "--model-threads", type=int, default=DEFAULT_MODEL_THREADS
+    )
     control.add_argument("--verification-commands", default=None)
     control.add_argument("--once", action="store_true")
 
@@ -92,6 +99,9 @@ def main() -> None:
     plan.add_argument("--drift-detected", action="store_true")
     plan.add_argument("--quality-regression", action="store_true")
     plan.add_argument("--optuna-trials", type=int, default=200)
+    plan.add_argument(
+        "--model-threads", type=int, default=DEFAULT_MODEL_THREADS
+    )
     plan.add_argument("--verification-commands", default=None)
     args = parser.parse_args()
 
@@ -136,6 +146,7 @@ def main() -> None:
             solver_revision=args.solver_revision.lower(),
             library_revision=args.library_revision.lower(),
             optuna_trials=args.optuna_trials,
+            model_threads=args.model_threads,
             verification_commands=verification_commands,
         )
         def run_controller():
@@ -151,6 +162,7 @@ def main() -> None:
                 "command": "control",
                 "solver_revision": args.solver_revision.lower(),
                 "library_revision": args.library_revision.lower(),
+                "model_threads": args.model_threads,
                 "verification_config_sha256": _verification_config_identity(
                     args.verification_commands
                 ),
@@ -186,6 +198,7 @@ def main() -> None:
         drift_detected=args.drift_detected,
         quality_regression=args.quality_regression,
         optuna_trials=args.optuna_trials,
+        model_threads=args.model_threads,
         verification_commands=commands,
     )
     print(json.dumps(result.__dict__, indent=1))

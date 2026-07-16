@@ -10,7 +10,11 @@ import sys
 import tempfile
 import time
 
-from .orchestrator import PipelineOrchestrator, descriptor_from_active_registry
+from .orchestrator import (
+    DEFAULT_MODEL_THREADS,
+    PipelineOrchestrator,
+    descriptor_from_active_registry,
+)
 
 
 class ContinuousController:
@@ -23,6 +27,7 @@ class ContinuousController:
         solver_revision: str,
         library_revision: str,
         optuna_trials: int = 200,
+        model_threads: int = DEFAULT_MODEL_THREADS,
         verification_commands=None,
     ):
         self.orchestrator = orchestrator
@@ -31,6 +36,9 @@ class ContinuousController:
         self.solver_revision = solver_revision
         self.library_revision = library_revision
         self.optuna_trials = int(optuna_trials)
+        if isinstance(model_threads, bool) or int(model_threads) < 1:
+            raise ValueError("model_threads must be a positive integer")
+        self.model_threads = int(model_threads)
         self.verification_commands = verification_commands
 
     def inspect_strict_rows(self, dataset=None) -> int:
@@ -93,6 +101,7 @@ class ContinuousController:
                 drift_detected=drift_detected,
                 quality_regression=quality_regression,
                 optuna_trials=self.optuna_trials,
+                model_threads=self.model_threads,
                 verification_commands=self.verification_commands,
             )
         finally:
