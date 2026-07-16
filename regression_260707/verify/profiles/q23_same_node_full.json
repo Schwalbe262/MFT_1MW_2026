@@ -1,5 +1,5 @@
 {
-  "comment": "Q23 same-node production profile: full matrix/capacitance/loss/thermal extraction with four accounted project CPUs",
+  "comment": "Q23 same-node production profile: full matrix/capacitance/loss/thermal extraction with four project CPUs; the pool reserves one AEDT host CPU separately",
   "cli_flags": "--thermal --headless",
   "param_overrides": {
     "full_model": 0,

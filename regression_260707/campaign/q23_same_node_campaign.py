@@ -21,11 +21,14 @@ CAMPAIGN_ID = "q23-same-node500-260716"
 SCHEMA = "q23-same-node-open-ended-controller-v1"
 PREDECESSOR_CAMPAIGN_ID = "q22-bounded-soak500-260716"
 Q22_RUNTIME_EVIDENCE_PACKAGE = "9150e7fa7f72fdf00fb8113e157398b410833c40"
-EXPECTED_POOL_SESSIONS = 170
+# Five pinned accounts receive 100 projects each.  Same-account packing needs
+# 5 * ceil(100 / 3) = 170 occupied sessions; three further sessions stay idle.
+EXPECTED_POOL_SESSIONS = 173
 EXPECTED_MIN_IDLE_AEDT_SESSIONS = 3
 EXPECTED_PROJECTS_PER_AEDT = 3
 EXPECTED_POOL_TARGET = 500
 PROJECT_CPUS = 4
+AEDT_SESSION_BASE_CPUS = 1
 POOL_FILL_TIMEOUT_SECONDS = 7_200
 DEFAULT_ELIGIBLE_ACCOUNTS = (
     "dhj02",
@@ -229,6 +232,11 @@ def _q23_manifest_identity(
     identity["pool_topology"]["min_idle_aedt_sessions"] = (
         EXPECTED_MIN_IDLE_AEDT_SESSIONS
     )
+    identity["pool_topology"]["session_base_cpus"] = AEDT_SESSION_BASE_CPUS
+    identity["pool_topology"]["session_reserved_cpus"] = (
+        AEDT_SESSION_BASE_CPUS
+        + PROJECT_CPUS * EXPECTED_PROJECTS_PER_AEDT
+    )
     identity["timeouts"]["pool_fill"] = POOL_FILL_TIMEOUT_SECONDS
     identity["adoption"]["semantics"] = (
         "clean-q23-boundary-no-q22-live-task-no-replay-open-ended-refill"
@@ -295,12 +303,13 @@ def _q23_static_plan(
 ) -> dict[str, Any]:
     plan = _ORIGINAL_STATIC_PLAN(args, manifest)
     plan["active_control"]["pool"] = (
-        "170 AEDT x 3 projects = 510 capacity; 3 idle sessions; target <= 500"
+        "173 AEDT x 3 projects = 519 capacity; 3 idle sessions above the "
+        "five-account packed demand; target <= 500"
     )
     plan["execution_requires"] = [
         "all q22 predecessor tasks are terminal and its controller remains stopped",
-        "pool remains 170x3 with min_idle_aedt_sessions=3 and target 500",
-        "each same-node project requests and accounts 4 CPUs",
+        "pool remains 173x3 with min_idle_aedt_sessions=3 and target 500",
+        "each project accounts 4 CPUs; each full session reserves 1+4x3=13 CPUs",
         "solve-permit cohort fill timeout remains 7200 seconds",
         "all five eligible accounts have the exact runtime scheduler package",
         "solver/library revisions remain exact and physics-compatible",
@@ -328,7 +337,8 @@ def configure_engine(
     engine.THIN_CLIENT_CPUS = PROJECT_CPUS
     engine.HOST_CPUS_PER_ATTACHED_LEASE = PROJECT_CPUS
     engine.EXPECTED_SESSION_RESERVED_CPUS = (
-        PROJECT_CPUS * EXPECTED_PROJECTS_PER_AEDT
+        AEDT_SESSION_BASE_CPUS
+        + PROJECT_CPUS * EXPECTED_PROJECTS_PER_AEDT
     )
     engine.EXPECTED_POOL_SESSIONS = EXPECTED_POOL_SESSIONS
     engine.EXPECTED_PROJECTS_PER_AEDT = EXPECTED_PROJECTS_PER_AEDT

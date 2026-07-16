@@ -65,8 +65,16 @@ def test_q23_submission_is_clean_four_cpu_same_node_contract(configured_engine):
 
     assert configured_engine.CAMPAIGN_ID == q23.CAMPAIGN_ID
     assert configured_engine.audit_remote_packages is q23._audit_q23_remote_packages
-    assert configured_engine.EXPECTED_POOL_SESSIONS == 170
-    assert configured_engine.EXPECTED_POOL_CAPACITY == 510
+    assert configured_engine.EXPECTED_POOL_SESSIONS == 173
+    assert configured_engine.EXPECTED_POOL_CAPACITY == 519
+    assert configured_engine.EXPECTED_SESSION_RESERVED_CPUS == 13
+    projects_per_account = (
+        q23.EXPECTED_POOL_TARGET + len(q23.DEFAULT_ELIGIBLE_ACCOUNTS) - 1
+    ) // len(q23.DEFAULT_ELIGIBLE_ACCOUNTS)
+    packed_demand = len(q23.DEFAULT_ELIGIBLE_ACCOUNTS) * (
+        projects_per_account + q23.EXPECTED_PROJECTS_PER_AEDT - 1
+    ) // q23.EXPECTED_PROJECTS_PER_AEDT
+    assert configured_engine.EXPECTED_POOL_SESSIONS - packed_demand == 3
     assert submission["cpus"] == 4
     assert submission["account_names"] == q23.DEFAULT_ELIGIBLE_ACCOUNTS
     assert environment["MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"] == "7200"
@@ -81,12 +89,21 @@ def test_q23_profile_and_manifest_identity_pin_four_cpus(configured_engine):
         Path("feeder_state.json"),
         q23.DEFAULT_ELIGIBLE_ACCOUNTS,
     )
+    manifest = configured_engine.build_manifest(identity)
     assert profile["cpus"] == 4
     assert profile["timeout_seconds"] == 86_400
     assert identity["campaign_id"] == q23.CAMPAIGN_ID
     assert identity["scheduler_package_revision"] == PACKAGE_SHA
     assert identity["eligible_accounts"] == list(q23.DEFAULT_ELIGIBLE_ACCOUNTS)
     assert identity["pool_topology"]["min_idle_aedt_sessions"] == 3
+    assert identity["pool_topology"]["session_base_cpus"] == 1
+    assert identity["pool_topology"]["session_reserved_cpus"] == 13
+    assert manifest["runtime_control"]["cpu_accounting"] == {
+        "thin_client_cpus": 4,
+        "host_cpus_per_attached_lease": 4,
+        "full_session_host_cpus": 13,
+        "owner": "scheduler-live-aedt-project-leases",
+    }
     assert identity["timeouts"]["pool_fill"] == 7_200
     assert identity["adoption"]["semantics"].startswith("clean-q23-boundary")
 
