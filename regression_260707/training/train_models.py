@@ -447,9 +447,103 @@ def restore_active_generation(registry, captured, lock_timeout=1):
         _remove_compatibility_view(registry)
 
 
+def _finite_metric(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if np.isfinite(parsed) and parsed >= 0.0 else None
+
+
+def compare_candidate_to_incumbent(candidate_report, incumbent_report):
+    """Return fail-closed evidence that a candidate is better overall.
+
+    Every target is compared using the first common scale-safe loss in
+    ``normalized_rmse_pct``, ``mape_pct``, then ``rmse``.  A replacement must
+    improve the mean target loss by at least 0.5%, may not regress any target
+    by more than 5%, and may not use fewer strict-full rows.  This comparison
+    complements the absolute quality gate; it never weakens that gate.
+    """
+    candidate_rows = int(candidate_report.get("strict_full_rows") or 0)
+    incumbent_rows = int(incumbent_report.get("strict_full_rows") or 0)
+    reasons = []
+    if candidate_rows < incumbent_rows:
+        reasons.append("candidate_has_fewer_strict_full_rows")
+
+    candidate_targets = candidate_report.get("report") or {}
+    incumbent_targets = incumbent_report.get("report") or {}
+    if not isinstance(candidate_targets, dict) or not isinstance(
+        incumbent_targets, dict
+    ):
+        reasons.append("target_metrics_unavailable")
+        candidate_targets = {}
+        incumbent_targets = {}
+
+    missing = sorted(set(incumbent_targets) - set(candidate_targets))
+    if missing:
+        reasons.append("candidate_missing_incumbent_targets")
+
+    comparisons = {}
+    ratios = []
+    for target in sorted(set(incumbent_targets) & set(candidate_targets)):
+        candidate_metrics = candidate_targets.get(target) or {}
+        incumbent_metrics = incumbent_targets.get(target) or {}
+        selected = None
+        for metric in ("normalized_rmse_pct", "mape_pct", "rmse"):
+            candidate_value = _finite_metric(candidate_metrics.get(metric))
+            incumbent_value = _finite_metric(incumbent_metrics.get(metric))
+            if candidate_value is not None and incumbent_value is not None:
+                selected = (metric, candidate_value, incumbent_value)
+                break
+        if selected is None:
+            comparisons[target] = {"comparable": False}
+            reasons.append(f"target_metric_unavailable:{target}")
+            continue
+        metric, candidate_value, incumbent_value = selected
+        if incumbent_value == 0.0:
+            ratio = 1.0 if candidate_value == 0.0 else float("inf")
+        else:
+            ratio = candidate_value / incumbent_value
+        ratios.append(ratio)
+        comparisons[target] = {
+            "comparable": True,
+            "metric": metric,
+            "candidate": candidate_value,
+            "incumbent": incumbent_value,
+            "ratio": ratio,
+        }
+
+    if not ratios:
+        reasons.append("no_comparable_targets")
+    aggregate_ratio = (
+        float(np.mean(ratios)) if ratios else float("inf")
+    )
+    worst_ratio = max(ratios, default=float("inf"))
+    if aggregate_ratio > 0.995:
+        reasons.append("aggregate_improvement_below_0p5_percent")
+    if worst_ratio > 1.05:
+        reasons.append("target_regression_exceeds_5_percent")
+    return {
+        "schema_version": 1,
+        "required": True,
+        "passed": not reasons,
+        "candidate_training_run_id": candidate_report.get("training_run_id"),
+        "incumbent_training_run_id": incumbent_report.get("training_run_id"),
+        "candidate_strict_full_rows": candidate_rows,
+        "incumbent_strict_full_rows": incumbent_rows,
+        "aggregate_loss_ratio": aggregate_ratio,
+        "worst_target_loss_ratio": worst_ratio,
+        "maximum_aggregate_loss_ratio": 0.995,
+        "maximum_target_loss_ratio": 1.05,
+        "comparisons": comparisons,
+        "reasons": reasons,
+    }
+
+
 def promote_generation(
     registry, generation, quality, dataset, profile_sha256, thresholds_sha256,
     expected_pointer=None, lock_timeout=1,
+    require_incumbent_improvement=False,
 ):
     """Atomically publish a candidate only after a passing, matching gate.
 
@@ -497,9 +591,34 @@ def promote_generation(
             if quality.get(key) != expected:
                 raise RuntimeError(f"quality gate {key} mismatch")
         accepted_quality = dict(quality)
+        pointer_path = os.path.join(registry, "current.json")
+        if require_incumbent_improvement and os.path.isfile(pointer_path):
+            incumbent = load_active_generation(registry)
+            comparison = compare_candidate_to_incumbent(
+                report, incumbent["report"]
+            )
+            if not comparison["passed"]:
+                raise RuntimeError(
+                    "candidate does not improve the active surrogate: "
+                    + "; ".join(comparison["reasons"])
+                )
+        else:
+            comparison = {
+                "schema_version": 1,
+                "required": bool(require_incumbent_improvement),
+                "passed": True,
+                "reason": (
+                    "no_incumbent"
+                    if require_incumbent_improvement
+                    else "comparison_not_requested"
+                ),
+                "candidate_training_run_id": report.get("training_run_id"),
+                "incumbent_training_run_id": None,
+            }
         accepted_quality.update(
             schema_version=REGISTRY_SCHEMA_VERSION,
             accepted_at=datetime.now().isoformat(timespec="seconds"),
+            incumbent_comparison=comparison,
         )
         gate_path = os.path.join(record["generation"], QUALITY_GATE_FILENAME)
         _atomic_json(accepted_quality, gate_path)
@@ -520,7 +639,7 @@ def promote_generation(
         # happens before the atomic pointer commit.  current.json is the final
         # fallible step: if this function raises, the candidate is not active.
         _remove_compatibility_view(registry)
-        _atomic_json(pointer, os.path.join(registry, "current.json"))
+        _atomic_json(pointer, pointer_path)
         return pointer
 
 

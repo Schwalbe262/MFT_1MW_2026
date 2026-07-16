@@ -107,7 +107,18 @@ def main() -> None:
 
     runtime, pipeline_root, queue, store = _paths(args)
     if args.command == "status":
+        def read_status(name):
+            path = pipeline_root / name
+            if not path.is_file():
+                return None
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                return {"read_error": f"{type(exc).__name__}:{exc}"}
+
         print(json.dumps({
+            "surrogate": read_status("surrogate_status.json"),
+            "active_surrogate": read_status("active_surrogate.json"),
             "stats": queue.stats(),
             "jobs": [job.__dict__ for job in queue.list(limit=args.limit)],
         }, indent=1, ensure_ascii=False))

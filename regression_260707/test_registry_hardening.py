@@ -52,7 +52,10 @@ def _sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _candidate(root, run_id="candidate", registry=None):
+def _candidate(
+    root, run_id="candidate", registry=None, *, mape_pct=1.0,
+    strict_full_rows=3000,
+):
     root = Path(root)
     registry = Path(registry or root / "registry")
     dataset = root / f"snapshot-{run_id}.parquet"
@@ -68,7 +71,7 @@ def _candidate(root, run_id="candidate", registry=None):
     target_dir.mkdir(parents=True)
     metrics = {
         "r2": 0.99,
-        "mape_pct": 1.0,
+        "mape_pct": float(mape_pct),
         "interval_coverage": 0.90,
     }
     bundle = {
@@ -96,7 +99,7 @@ def _candidate(root, run_id="candidate", registry=None):
         "source_dataset_sha256": _sha256(source_dataset),
         "source_dataset_generation": source_identity,
         "profile_sha256": "profile-sha",
-        "strict_full_rows": 3000,
+        "strict_full_rows": int(strict_full_rows),
         "features": ["N1_main"],
         "targets": ["Llt_phys"],
         "report": {"Llt_phys": metrics},
@@ -250,6 +253,54 @@ class RegistryPublicationTests(unittest.TestCase):
                 self.assertFalse(
                     Path(candidate["registry"], "current.json").exists()
                 )
+
+    def test_production_promotion_requires_better_than_active_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            incumbent = _candidate(tmp, "incumbent", mape_pct=1.0)
+            _promote(incumbent)
+            pointer_before = Path(
+                incumbent["registry"], "current.json"
+            ).read_bytes()
+
+            worse = _candidate(
+                tmp, "worse", registry=incumbent["registry"],
+                mape_pct=1.1, strict_full_rows=4000,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "does not improve the active surrogate"
+            ):
+                train_models.promote_generation(
+                    worse["registry"], worse["generation"], worse["quality"],
+                    dataset=worse["dataset"], profile_sha256="profile-sha",
+                    thresholds_sha256=worse["quality"]["thresholds_sha256"],
+                    expected_pointer=train_models.registry_pointer_token(
+                        worse["registry"]
+                    ),
+                    require_incumbent_improvement=True,
+                )
+            self.assertEqual(
+                Path(incumbent["registry"], "current.json").read_bytes(),
+                pointer_before,
+            )
+
+            better = _candidate(
+                tmp, "better", registry=incumbent["registry"],
+                mape_pct=0.9, strict_full_rows=4000,
+            )
+            train_models.promote_generation(
+                better["registry"], better["generation"], better["quality"],
+                dataset=better["dataset"], profile_sha256="profile-sha",
+                thresholds_sha256=better["quality"]["thresholds_sha256"],
+                expected_pointer=train_models.registry_pointer_token(
+                    better["registry"]
+                ),
+                require_incumbent_improvement=True,
+            )
+            active = train_models.load_active_generation(better["registry"])
+            self.assertEqual(active["report"]["training_run_id"], "better")
+            comparison = active["quality"]["incumbent_comparison"]
+            self.assertTrue(comparison["passed"])
+            self.assertLess(comparison["aggregate_loss_ratio"], 0.995)
 
 
 class RegistryWriterTests(unittest.TestCase):

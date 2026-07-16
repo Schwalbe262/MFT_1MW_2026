@@ -1038,6 +1038,7 @@ def main():
                     profile_sha256=locked_profile_sha256,
                     thresholds_sha256=locked_thresholds_sha256,
                     expected_pointer=expected_pointer,
+                    require_incumbent_improvement=True,
                 )
                 promoted = True
                 accepted = load_generation(

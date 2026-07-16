@@ -93,6 +93,34 @@ PHYSICS_EQUIVALENT_SOLVER_REVISIONS: dict[str, frozenset[str]] = {
         "f411bf5492669f87896eb657b9e5db2998d219a7",
         "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
     }),
+    # Reviewed 2026-07-17 for the current production pin.  The already
+    # reviewed 8fab610 runtime changes only pooled async dispatch, terminal
+    # polling, extraction locking, and scheduler-family isolation.  The
+    # 8fab610..7768510 diff is limited to feeder/controller policy plus one
+    # exact-session Desktop handle recovery path.  That recovery is gated by
+    # ``_backend_mode() == "pooled"`` and only reattaches the lease-authorized
+    # PID/port/project; it does not change geometry, materials, setup values,
+    # expressions, result definitions, or PHYSICS_DATA_REVISION.  The full
+    # review record is campaign/q25_physics_compatibility.json.
+    #
+    # Directionality and exact SHAs are deliberate.  A controller pinned to
+    # 7768510 may consume the reviewed predecessor cohort, but an older model
+    # pin must not silently accept this later runtime or an arbitrary
+    # descendant.
+    "7768510433858c9056f04320e66819d5fcc90f1a": frozenset({
+        "8fab610dfca7180732bd0b38923aa6c71e2129bb",
+        "8b1a65ca46509b0fe3fe64420709dea2d15de1a4",
+        "092a35bb6e9552fa9c0ef7388c6059606844f2cd",
+        "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+        "267860a86dc8c8017c4b713f6674c0614cc365ce",
+        "26afff8de2936f605783395fbff19d5f1d26b354",
+        "262574a886cef9e0f8f550d12571cf6d54c826e2",
+        "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7",
+        "66ee6685859c207eafdca796120e2e1643f72f5c",
+        "f0271da72ff4b9f085b3927769c583c163792adb",
+        "f411bf5492669f87896eb657b9e5db2998d219a7",
+        "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
+    }),
 }
 # Explicitly not enrolled: these physics-adjacent diffs remain unreviewed.
 # dba903eb671e37642168afc5578b8e6a93e9c046

@@ -312,6 +312,18 @@ class ControllerSnapshotTests(unittest.TestCase):
             self.assertEqual(orchestrator.planned_bytes, b"first-generation")
             self.assertEqual(orchestrator.series, str(live.resolve()))
             self.assertEqual(orchestrator.model_threads, 24)
+            status = json.loads(
+                (root / "surrogate_status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["state"], "waiting_for_next_dataset_check")
+            self.assertEqual(status["strict_full_rows"], 4000)
+            self.assertEqual(status["last_error"], None)
+            manifest = json.loads(
+                (root / "active_surrogate.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["state"], "awaiting_activation")
+            self.assertEqual(manifest["rows_until_activation"], 0)
+            self.assertIn("fail closed", manifest["consumer_contract"])
 
 
 if __name__ == "__main__":
