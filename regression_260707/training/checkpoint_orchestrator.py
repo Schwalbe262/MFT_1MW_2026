@@ -96,16 +96,19 @@ def _atomic_json(value, path):
     path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     serialized = json.dumps(value, indent=1, default=str)
+    serialized_bytes = serialized.encode("utf-8")
+    serialized_sha256 = hashlib.sha256(serialized_bytes).hexdigest()
     generation = None
-    if os.path.basename(path) == "strict_data_status.json":
-        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    if os.path.basename(path) in {
+        "strict_data_status.json", "checkpoint_state.json",
+    }:
         generation_fd, generation = tempfile.mkstemp(
             prefix=f"{os.path.basename(path)}.gen-",
-            suffix=f"-{digest}.json",
+            suffix=f"-{serialized_sha256}.json",
             dir=os.path.dirname(path),
         )
-        with os.fdopen(generation_fd, "w", encoding="utf-8") as handle:
-            handle.write(serialized)
+        with os.fdopen(generation_fd, "wb") as handle:
+            handle.write(serialized_bytes)
             handle.flush()
             os.fsync(handle.fileno())
     fd, staged = tempfile.mkstemp(
@@ -113,28 +116,45 @@ def _atomic_json(value, path):
         dir=os.path.dirname(path),
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(serialized)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(serialized_bytes)
             handle.flush()
             os.fsync(handle.fileno())
         try:
             os.replace(staged, path)
-        except PermissionError:
+        except PermissionError as replace_error:
             if generation is None:
                 raise
             # RaiDrive can reject same-directory replacement while allowing a
-            # direct canonical repair. The immutable generation remains the
-            # authoritative complete JSON if this convenience copy is denied.
+            # direct canonical repair.  The immutable, fsync'd generation is
+            # written first, so even an interrupted direct repair is
+            # recoverable on the next invocation.
             try:
-                with open(path, "w", encoding="utf-8") as handle:
-                    handle.write(serialized)
+                with open(path, "wb") as handle:
+                    handle.write(serialized_bytes)
                     handle.flush()
                     os.fsync(handle.fileno())
-            except OSError:
-                pass
+            except OSError as repair_error:
+                raise RuntimeError(
+                    "canonical JSON repair failed after atomic replace denial; "
+                    f"recovery_generation={generation}"
+                ) from repair_error
+            if _sha256(path) != serialized_sha256:
+                raise RuntimeError(
+                    "canonical JSON repair fingerprint mismatch; "
+                    f"recovery_generation={generation}"
+                ) from replace_error
+        if _sha256(path) != serialized_sha256:
+            raise RuntimeError(f"canonical JSON fingerprint mismatch: {path}")
     finally:
         if os.path.exists(staged):
-            os.remove(staged)
+            try:
+                os.remove(staged)
+            except OSError:
+                # A complete immutable generation already exists for every
+                # RaiDrive-sensitive state file.  A stale hidden staging file
+                # is harmless and is preferable to masking a committed state.
+                pass
 
 
 def _atomic_parquet(frame, path):

@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,48 @@ class AtomicStrictStatusTests(unittest.TestCase):
         self.assertEqual(len(generations), 1)
         self.assertEqual(canonical, payload)
         self.assertEqual(immutable, payload)
+
+    def test_checkpoint_state_has_verified_direct_repair_and_generation(self):
+        payload = {
+            "schema_version": 2,
+            "completed": [{"threshold": 500}],
+            "attempts": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint_state.json"
+            with mock.patch.object(
+                    checkpoint.os, "replace", side_effect=PermissionError("denied")):
+                checkpoint._atomic_json(payload, path)
+
+            generations = list(path.parent.glob(path.name + ".gen-*.json"))
+            canonical = json.loads(path.read_text(encoding="utf-8"))
+            immutable = json.loads(generations[0].read_text(encoding="utf-8"))
+
+        self.assertEqual(len(generations), 1)
+        self.assertEqual(canonical, payload)
+        self.assertEqual(immutable, payload)
+
+    def test_checkpoint_state_repair_failure_is_not_silently_accepted(self):
+        payload = {"schema_version": 2, "completed": [], "attempts": []}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint_state.json"
+            real_open = open
+
+            def deny_canonical(target, *args, **kwargs):
+                if os.path.abspath(target) == os.path.abspath(path):
+                    raise PermissionError("canonical denied")
+                return real_open(target, *args, **kwargs)
+
+            with mock.patch.object(
+                    checkpoint.os, "replace", side_effect=PermissionError("denied")
+            ), mock.patch("builtins.open", side_effect=deny_canonical):
+                with self.assertRaisesRegex(
+                        RuntimeError, "recovery_generation="):
+                    checkpoint._atomic_json(payload, path)
+
+            generations = list(path.parent.glob(path.name + ".gen-*.json"))
+
+        self.assertEqual(len(generations), 1)
 
 
 class TrainingCommandTests(unittest.TestCase):
