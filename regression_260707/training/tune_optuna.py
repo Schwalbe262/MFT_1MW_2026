@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 DATASET = REGRESSION_ROOT / "data" / "dataset" / "train.parquet"
 LEGACY_OUT = HERE / "best_params.json"
 MIN_STRICT_FULL_ROWS = 4000
+EXPERIMENTAL_MIN_STRICT_FULL_ROWS = 2000
 FAMILIES = ("lightgbm", "xgboost", "catboost", "extratrees")
 TUNING_SCHEMA_VERSION = 1
 DEFAULT_MODEL_THREADS = 24
@@ -255,7 +256,14 @@ def main():
     parser.add_argument("--result-json", default=None)
     parser.add_argument("--base-params", default=None)
     parser.add_argument("--legacy-output", default=None)
-    parser.add_argument("--min-strict-full-rows", type=int, default=MIN_STRICT_FULL_ROWS)
+    parser.add_argument("--min-strict-full-rows", type=int, default=None)
+    parser.add_argument(
+        "--experimental", action="store_true",
+        help=(
+            "allow a separately stored, FEA-disabled >=2k exploratory tuning "
+            "generation; it is never eligible for the production tuning store"
+        ),
+    )
     parser.add_argument("--solver-revision", default=None)
     parser.add_argument("--library-revision", default=None)
     parser.add_argument("--data-contract-sha256", default=None)
@@ -279,14 +287,20 @@ def main():
         r"[0-9a-fA-F]{64}", args.data_contract_sha256
     ):
         parser.error("data contract must be a full SHA-256")
+    minimum_floor = (
+        EXPERIMENTAL_MIN_STRICT_FULL_ROWS
+        if args.experimental else MIN_STRICT_FULL_ROWS
+    )
+    if args.min_strict_full_rows is None:
+        args.min_strict_full_rows = minimum_floor
     if (
         args.trials < 1
         or args.model_threads < 1
-        or args.min_strict_full_rows < MIN_STRICT_FULL_ROWS
+        or args.min_strict_full_rows < minimum_floor
     ):
         parser.error(
-            "trials and model threads must be positive and the production "
-            "row gate is >=4000"
+            "trials and model threads must be positive and the selected "
+            f"row gate is >={minimum_floor}"
         )
     if not ((args.target and args.family) or args.all):
         parser.error("supply --target with --family, or --all")
@@ -349,6 +363,9 @@ def main():
     )
     metadata = {
         "tuning_schema_version": TUNING_SCHEMA_VERSION,
+        "lane": "experimental" if args.experimental else "production",
+        "production_eligible": not args.experimental,
+        "fea_submission_approved": not args.experimental,
         "dataset_sha256": _sha256(dataset),
         "strict_full_rows": strict_count,
         "solver_revision": (
