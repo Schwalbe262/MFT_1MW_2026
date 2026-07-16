@@ -46,6 +46,12 @@ SEED = 42
 REGISTRY_SCHEMA_VERSION = 2
 QUALITY_GATE_FILENAME = "quality_gate.json"
 SIGMA_FLOOR_POLICY = "relative_machine_epsilon_v1"
+MODEL_THREAD_PARAMETERS = {
+    "lightgbm": "n_jobs",
+    "xgboost": "n_jobs",
+    "catboost": "thread_count",
+    "extratrees": "n_jobs",
+}
 
 
 def default_family_params():
@@ -540,6 +546,17 @@ def compare_candidate_to_incumbent(candidate_report, incumbent_report):
     }
 
 
+def with_model_thread_budget(family, params, threads):
+    """Apply an execution-only bound to every supported model family."""
+    if threads is None:
+        return dict(params)
+    if isinstance(threads, bool) or int(threads) < 1:
+        raise ValueError("model_threads must be a positive integer")
+    bounded = dict(params)
+    bounded[MODEL_THREAD_PARAMETERS[family]] = int(threads)
+    return bounded
+
+
 def promote_generation(
     registry, generation, quality, dataset, profile_sha256, thresholds_sha256,
     expected_pointer=None, lock_timeout=1,
@@ -871,6 +888,10 @@ def main():
     parser.add_argument("--profile", default=None)
     parser.add_argument("--result-json", default=None)
     parser.add_argument("--lock-timeout", type=float, default=1.0)
+    parser.add_argument(
+        "--model-threads", type=int, default=None,
+        help="maximum threads used by each model fit (execution-only)",
+    )
     args = parser.parse_args()
 
     from quality_contract import annotate_validity
@@ -888,6 +909,8 @@ def main():
     )
     if args.lock_timeout < 0:
         parser.error("lock timeout must be non-negative")
+    if args.model_threads is not None and args.model_threads < 1:
+        parser.error("model threads must be positive")
 
     raw = pd.read_parquet(args.dataset)
     frame = to_physical(annotate_validity(raw, args.profile))
@@ -917,7 +940,9 @@ def main():
                 not isinstance(value, dict) for value in specification.values()
             ):
                 params.update(specification)
-            output[family] = params
+            output[family] = with_model_thread_budget(
+                family, params, args.model_threads
+            )
         return output
 
     targets = args.targets or list(TARGETS)

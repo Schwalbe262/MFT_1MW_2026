@@ -99,12 +99,17 @@ def _atomic_json(value, path):
     serialized_bytes = serialized.encode("utf-8")
     serialized_sha256 = hashlib.sha256(serialized_bytes).hexdigest()
     generation = None
-    if os.path.basename(path) in {
-        "strict_data_status.json", "checkpoint_state.json",
-    }:
+    generation_prefix = {
+        "strict_data_status.json": ".strict-status-",
+        "checkpoint_state.json": ".checkpoint-state-",
+    }.get(os.path.basename(path))
+    if generation_prefix:
         generation_fd, generation = tempfile.mkstemp(
-            prefix=f"{os.path.basename(path)}.gen-",
-            suffix=f"-{serialized_sha256}.json",
+            # Keep the filename below Windows path limits in deep,
+            # identity-scoped checkpoint roots. The full digest is verified
+            # from bytes instead of trusted from this convenience name.
+            prefix=generation_prefix,
+            suffix=f"-{serialized_sha256[:16]}.json",
             dir=os.path.dirname(path),
         )
         with os.fdopen(generation_fd, "wb") as handle:

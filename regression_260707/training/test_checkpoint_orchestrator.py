@@ -20,7 +20,7 @@ class AtomicStrictStatusTests(unittest.TestCase):
                     checkpoint.os, "replace", side_effect=PermissionError("denied")):
                 checkpoint._atomic_json(payload, path)
 
-            generations = list(path.parent.glob(path.name + ".gen-*.json"))
+            generations = list(path.parent.glob(".strict-status-*.json"))
             canonical = json.loads(path.read_text(encoding="utf-8"))
             immutable = json.loads(generations[0].read_text(encoding="utf-8"))
 
@@ -40,7 +40,7 @@ class AtomicStrictStatusTests(unittest.TestCase):
                     checkpoint.os, "replace", side_effect=PermissionError("denied")):
                 checkpoint._atomic_json(payload, path)
 
-            generations = list(path.parent.glob(path.name + ".gen-*.json"))
+            generations = list(path.parent.glob(".checkpoint-state-*.json"))
             canonical = json.loads(path.read_text(encoding="utf-8"))
             immutable = json.loads(generations[0].read_text(encoding="utf-8"))
 
@@ -66,7 +66,7 @@ class AtomicStrictStatusTests(unittest.TestCase):
                         RuntimeError, "recovery_generation="):
                     checkpoint._atomic_json(payload, path)
 
-            generations = list(path.parent.glob(path.name + ".gen-*.json"))
+            generations = list(path.parent.glob(".checkpoint-state-*.json"))
 
         self.assertEqual(len(generations), 1)
 
