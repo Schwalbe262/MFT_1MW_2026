@@ -244,6 +244,84 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(output[0].state, "retry_wait")
             self.assertEqual(output[0].terminal_reason, "worker_shutdown")
 
+    def test_declared_deterministic_exit_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = DurableJobQueue(root / "jobs.sqlite3")
+            store = GenerationStore(root / "artifacts")
+            job = queue.enqueue(
+                "optimize",
+                "deterministic-infeasible",
+                {
+                    "command": [sys.executable, "-c", "raise SystemExit(42)"],
+                    "retry": True,
+                    "retry_backoff_seconds": 0,
+                    "non_retryable_exit_codes": [42],
+                },
+                max_attempts=3,
+            )
+
+            result = JobRunner(
+                queue, store, root / "work", owner="worker"
+            ).run_once(["optimize"])
+
+            self.assertEqual(result.id, job.id)
+            self.assertEqual(result.state, "failed")
+            self.assertEqual(result.attempt, 1)
+            self.assertIn("command_exit:42;non_retryable=true", result.terminal_reason)
+
+    def test_unlisted_exit_remains_retryable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = DurableJobQueue(root / "jobs.sqlite3")
+            store = GenerationStore(root / "artifacts")
+            job = queue.enqueue(
+                "optimize",
+                "transient-failure",
+                {
+                    "command": [sys.executable, "-c", "raise SystemExit(41)"],
+                    "retry": True,
+                    "retry_backoff_seconds": 0,
+                    "non_retryable_exit_codes": [42],
+                },
+                max_attempts=3,
+            )
+
+            result = JobRunner(
+                queue, store, root / "work", owner="worker"
+            ).run_once(["optimize"])
+
+            self.assertEqual(result.id, job.id)
+            self.assertEqual(result.state, "retry_wait")
+            self.assertEqual(result.attempt, 1)
+            self.assertIn("command_exit:41;non_retryable=false", result.terminal_reason)
+
+    def test_non_retryable_exit_codes_must_be_an_integer_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = DurableJobQueue(root / "jobs.sqlite3")
+            store = GenerationStore(root / "artifacts")
+            job = queue.enqueue(
+                "optimize",
+                "invalid-non-retryable-codes",
+                {
+                    "command": [sys.executable, "-c", "raise SystemExit(99)"],
+                    "non_retryable_exit_codes": "42",
+                },
+                max_attempts=3,
+            )
+
+            result = JobRunner(
+                queue, store, root / "work", owner="worker"
+            ).run_once(["optimize"])
+
+            self.assertEqual(result.id, job.id)
+            self.assertEqual(result.state, "failed")
+            self.assertEqual(result.attempt, 1)
+            self.assertEqual(
+                result.terminal_reason, "invalid non_retryable_exit_codes payload"
+            )
+
 
 class NsgaParallelTests(unittest.TestCase):
     def test_restarts_are_parallel_bounded_and_returned_in_seed_order(self):
