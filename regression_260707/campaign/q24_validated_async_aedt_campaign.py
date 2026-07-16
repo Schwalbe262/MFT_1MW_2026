@@ -818,6 +818,9 @@ def _q24_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
         # placement is backlogged. Scheduler/AEDT admission still decides
         # when each accepted task can attach and run.
         "scheduler_admission_owns_queueing": True,
+        # Plan deterministic names/cursors first, rely on scheduler dedupe for
+        # every POST, then persist the feeder ledger once per refill batch.
+        "batch_state_commit": True,
     }
 
 

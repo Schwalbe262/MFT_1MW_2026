@@ -1013,6 +1013,8 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         "immediate_state_permission_fallback", False)
     scheduler_admission_owns_queueing = cycle_submission_options.pop(
         "scheduler_admission_owns_queueing", False)
+    batch_state_commit = cycle_submission_options.pop(
+        "batch_state_commit", False)
     if (isinstance(submission_delay_seconds, bool)
             or not isinstance(submission_delay_seconds, (int, float))
             or not math.isfinite(float(submission_delay_seconds))
@@ -1026,6 +1028,8 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     if not isinstance(scheduler_admission_owns_queueing, bool):
         raise SchedulerError(
             "scheduler_admission_owns_queueing must be a bool")
+    if not isinstance(batch_state_commit, bool):
+        raise SchedulerError("batch_state_commit must be a bool")
     unbounded_dataset = max_samples is None
     if unbounded_dataset and not pooled_mode:
         raise SchedulerError(
@@ -1036,22 +1040,27 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     if pooled_mode and not pooled_authorized:
         raise SchedulerError(
             f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
-    if scheduler_admission_owns_queueing:
-        environment = cycle_submission_options.get("submission_env") or {}
-        if (
-            not pooled_authorized
-            or cycle_submission_options.get("prevalidated_cycle") is not True
-            or environment.get("MFT_CAMPAIGN_ID")
-            != "q24-validated-async-aedt500-260716"
-            or environment.get("MFT_AEDT_WORKLOAD_FAMILY")
-            != "mft_validated_async"
-            or environment.get("MFT_CAMPAIGN_MIGRATION_REPLACEMENT_SOLVER")
-            != str(solver_revision)
-        ):
-            raise SchedulerError(
-                "scheduler-owned queueing is reserved for the exact q24 "
-                "validated-async rolling contract"
-            )
+    environment = cycle_submission_options.get("submission_env") or {}
+    exact_q24_validated_async_contract = bool(
+        pooled_authorized
+        and cycle_submission_options.get("prevalidated_cycle") is True
+        and environment.get("MFT_CAMPAIGN_ID")
+        == "q24-validated-async-aedt500-260716"
+        and environment.get("MFT_AEDT_WORKLOAD_FAMILY")
+        == "mft_validated_async"
+        and environment.get("MFT_CAMPAIGN_MIGRATION_REPLACEMENT_SOLVER")
+        == str(solver_revision)
+    )
+    if scheduler_admission_owns_queueing and not exact_q24_validated_async_contract:
+        raise SchedulerError(
+            "scheduler-owned queueing is reserved for the exact q24 "
+            "validated-async rolling contract"
+        )
+    if batch_state_commit and not exact_q24_validated_async_contract:
+        raise SchedulerError(
+            "batch state commit is reserved for the exact q24 "
+            "validated-async rolling contract"
+        )
     if requested_active > MAX_STANDALONE_ACTIVE:
         rapid_authorized = (
             isinstance(_rapid_authorization, _RapidRefillAuthorization)
@@ -1256,8 +1265,12 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             _refill_journal["completed"] = True
         return False
     batch_commit = bool(
-        _refill_journal is not None
-        and _refill_journal.get("batch_commit") is True)
+        batch_state_commit
+        or (
+            _refill_journal is not None
+            and _refill_journal.get("batch_commit") is True
+        )
+    )
     event_profile = None
     if _refill_journal is not None:
         with open(PROFILE_PATH, encoding="utf-8") as stream:
@@ -1380,7 +1393,8 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         for item in planned:
             if item["event"] is not None:
                 item["event"]["ledger_committed"] = True
-        _refill_journal["submitted_count"] = ok
+        if _refill_journal is not None:
+            _refill_journal["submitted_count"] = ok
         committed_state = copy.deepcopy(st)
     print(f"[feeder] campaign active {campaign_active} -> +{ok}/{n_new} tasks "
           f"(누적 제출 샘플 {st['submitted_samples']})")

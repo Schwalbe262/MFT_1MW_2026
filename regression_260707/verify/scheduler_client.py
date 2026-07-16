@@ -830,9 +830,15 @@ def _submit_verification_locked(
         payload["env_setup"] = pooled_env_setup
     if aedt_backend is not None:
         payload["aedt_backend"] = aedt_backend
-    existing = reconcile_task_id(name, dedupe_key)
-    if existing is not None:
-        return existing
+    # A prevalidated pooled refill already holds the campaign mutation lock and
+    # has reconciled the authoritative inventory for this cycle.  Avoid a
+    # second full task-list GET for every item in a large refill; the scheduler
+    # POST enforces the same durable dedupe key.  Reconciliation after an
+    # uncertain POST and before every retry remains mandatory below.
+    if not prevalidated_cycle:
+        existing = reconcile_task_id(name, dedupe_key)
+        if existing is not None:
+            return existing
     max_project_active_tasks = _validated_project_cap_ceiling(
         max_project_active_tasks)
     if required_project_cap is None:

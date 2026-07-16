@@ -258,7 +258,7 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "production promotion",
         )
 
-    def test_prevalidated_pooled_cycle_skips_only_capacity_reread(self):
+    def test_prevalidated_pooled_cycle_skips_initial_reconcile_and_capacity(self):
         accepted = Mock(status_code=201)
         accepted.json.return_value = {"id": 124}
         events = []
@@ -298,7 +298,84 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             )
 
         self.assertEqual(task_id, 124)
+        self.assertEqual(events, ["post"])
+        dedupe.assert_not_called()
+        capacity.assert_not_called()
+        submit.assert_called_once()
+
+    def test_normal_cycle_still_reconciles_before_post(self):
+        accepted = Mock(status_code=201)
+        accepted.json.return_value = {"id": 125}
+        events = []
+
+        with patch.object(
+                feeder.scheduler_client,
+                "campaign_mutation_lock_is_held",
+                return_value=True,
+        ), patch.object(
+                feeder.scheduler_client,
+                "reconcile_task_id",
+                side_effect=lambda *_args, **_kwargs: events.append("reconcile"),
+        ) as dedupe, patch.object(
+                feeder.scheduler_client,
+                "live_project_submission_snapshot",
+                return_value={"project_submission_slots": 1},
+        ), patch.object(
+                feeder.scheduler_client.requests,
+                "post",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("post") or accepted
+                ),
+        ):
+            task_id = feeder.scheduler_client.submit_verification(
+                "normal-cycle", "wd", {"candidate": 1}, {},
+                solver_revision=SOLVER_REVISION,
+                library_revision=LIBRARY_REVISION,
+            )
+
+        self.assertEqual(task_id, 125)
         self.assertEqual(events, ["reconcile", "post"])
+        dedupe.assert_called_once()
+
+    def test_prevalidated_uncertain_post_still_reconciles(self):
+        events = []
+
+        def reconcile(*_args, **_kwargs):
+            events.append("reconcile")
+            return 126
+
+        def post(*_args, **_kwargs):
+            events.append("post")
+            raise feeder.scheduler_client.requests.Timeout("response lost")
+
+        with patch.object(
+                feeder.scheduler_client,
+                "campaign_mutation_lock_is_held",
+                return_value=True,
+        ), patch.object(
+                feeder.scheduler_client,
+                "reconcile_task_id",
+                side_effect=reconcile,
+        ) as dedupe, patch.object(
+                feeder.scheduler_client,
+                "live_project_submission_snapshot",
+        ) as capacity, patch.object(
+                feeder.scheduler_client.requests,
+                "post",
+                side_effect=post,
+        ) as submit:
+            task_id = feeder.scheduler_client.submit_verification(
+                "prevalidated-response-loss", "wd", {"candidate": 1}, {},
+                solver_revision=SOLVER_REVISION,
+                library_revision=LIBRARY_REVISION,
+                aedt_backend="pooled",
+                required_hard_cap=500,
+                max_project_active_tasks=600,
+                prevalidated_cycle=True,
+            )
+
+        self.assertEqual(task_id, 126)
+        self.assertEqual(events, ["post", "reconcile"])
         dedupe.assert_called_once()
         capacity.assert_not_called()
         submit.assert_called_once()

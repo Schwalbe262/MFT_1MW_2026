@@ -187,6 +187,7 @@ def test_q24_submission_emits_only_validated_async_replacement(configured_engine
     assert submission["account_names"] == q24.DEFAULT_ELIGIBLE_ACCOUNTS
     assert submission["prevalidated_cycle"] is True
     assert submission["scheduler_admission_owns_queueing"] is True
+    assert submission["batch_state_commit"] is True
     assert environment["MFT_CAMPAIGN_ID"] == q24.CAMPAIGN_ID
     assert environment["MFT_CAMPAIGN_MIGRATION_PREDECESSOR"] == q23.CAMPAIGN_ID
     assert environment["MFT_CAMPAIGN_MIGRATION_PREDECESSOR_SOLVER"] == (
@@ -271,6 +272,212 @@ def test_q24_refills_exact_deficit_while_resource_queue_is_backed_off(
         == "mft_validated_async"
         for call in submit.call_args_list
     )
+
+
+def test_q24_batch_commits_state_once_for_486_tasks(configured_engine):
+    args = configured_engine._parser().parse_args([])
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    submission = configured_engine.pooled_submission(args)
+    state = {"serial": BASELINE_SERIAL, "submitted_samples": 0}
+    counts = {"queued": 0, "attaching": 0, "running": 0}
+    capacity = {
+        "ready_fit_slots": 0,
+        "queue_state": "blocked",
+        "queue_reason": "scheduler admission owns queueing",
+        "project_counts": counts,
+        "project_active": 0,
+        "project_submission_slots": 486,
+        "submission_allowed": False,
+    }
+
+    def candidate(cursor, *, seed):
+        return cursor + 1, cursor, {"candidate": cursor}
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            engine.feeder.scheduler_client,
+            "campaign_mutation_lock_is_held",
+            return_value=True,
+        ))
+        stack.enter_context(patch.object(engine.feeder, "load_state", return_value=state))
+        stack.enter_context(patch.object(
+            engine.feeder,
+            "scheduler_snapshot",
+            return_value=(counts, counts, [], capacity),
+        ))
+        stack.enter_context(patch.object(
+            engine.feeder, "dataset_collection_snapshot", return_value=(0, set())
+        ))
+        stack.enter_context(patch.object(engine.feeder, "campaign_inventory", return_value=[]))
+        stack.enter_context(patch.object(
+            engine.feeder, "cursor_after_valid_candidates", return_value=0
+        ))
+        stack.enter_context(patch.object(
+            engine.feeder, "next_valid_candidate", side_effect=candidate
+        ))
+        submit = stack.enter_context(patch.object(
+            engine.feeder,
+            "submit",
+            side_effect=lambda *_args, **_kwargs: 100_000 + int(
+                _args[0].rsplit("-", 1)[1]
+            ),
+        ))
+        save = stack.enter_context(patch.object(engine.feeder, "save_state"))
+        stack.enter_context(patch.object(engine.feeder.time, "sleep"))
+
+        assert engine.feeder.step(
+            None,
+            target=486,
+            solver_revision=q24.REFILL_SOLVER,
+            library_revision=q24.LIBRARY_REVISION,
+            pooled_submission=submission,
+        )
+
+    assert submit.call_count == 486
+    assert save.call_count == 1
+    assert state["serial"] == BASELINE_SERIAL + 486
+
+
+def test_q24_batch_restart_replays_same_names_after_middle_post_failure(
+    configured_engine,
+):
+    args = configured_engine._parser().parse_args([])
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    submission = configured_engine.pooled_submission(args)
+    state = {"serial": BASELINE_SERIAL, "submitted_samples": 0}
+    counts = {"queued": 0, "attaching": 0, "running": 0}
+    capacity = {
+        "ready_fit_slots": 0,
+        "queue_state": "blocked",
+        "queue_reason": "scheduler admission owns queueing",
+        "project_counts": counts,
+        "project_active": 0,
+        "project_submission_slots": 3,
+        "submission_allowed": False,
+    }
+    phase = {"value": 1}
+    names = {1: [], 2: []}
+
+    def candidate(cursor, *, seed):
+        return cursor + 1, cursor, {"candidate": cursor}
+
+    def submit(name, *_args, **_kwargs):
+        names[phase["value"]].append(name)
+        if phase["value"] == 1 and len(names[1]) == 2:
+            raise RuntimeError("middle POST failed")
+        return 200_000 + int(name.rsplit("-", 1)[1])
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            engine.feeder.scheduler_client,
+            "campaign_mutation_lock_is_held",
+            return_value=True,
+        ))
+        stack.enter_context(patch.object(engine.feeder, "load_state", return_value=state))
+        stack.enter_context(patch.object(
+            engine.feeder,
+            "scheduler_snapshot",
+            return_value=(counts, counts, [], capacity),
+        ))
+        stack.enter_context(patch.object(
+            engine.feeder, "dataset_collection_snapshot", return_value=(0, set())
+        ))
+        stack.enter_context(patch.object(engine.feeder, "campaign_inventory", return_value=[]))
+        stack.enter_context(patch.object(
+            engine.feeder, "cursor_after_valid_candidates", return_value=0
+        ))
+        stack.enter_context(patch.object(
+            engine.feeder, "next_valid_candidate", side_effect=candidate
+        ))
+        stack.enter_context(patch.object(engine.feeder, "submit", side_effect=submit))
+        save = stack.enter_context(patch.object(engine.feeder, "save_state"))
+        stack.enter_context(patch.object(engine.feeder.time, "sleep"))
+
+        with pytest.raises(RuntimeError, match="middle POST failed"):
+            engine.feeder.step(
+                None,
+                target=3,
+                solver_revision=q24.REFILL_SOLVER,
+                library_revision=q24.LIBRARY_REVISION,
+                pooled_submission=submission,
+            )
+        assert save.call_count == 0
+        assert state["serial"] == BASELINE_SERIAL
+
+        phase["value"] = 2
+        assert engine.feeder.step(
+            None,
+            target=3,
+            solver_revision=q24.REFILL_SOLVER,
+            library_revision=q24.LIBRARY_REVISION,
+            pooled_submission=submission,
+        )
+
+    assert names[1] == names[2][:2]
+    assert len(names[2]) == 3
+    assert save.call_count == 1
+    assert state["serial"] == BASELINE_SERIAL + 3
+
+
+def test_non_q24_pooled_refill_retains_per_task_state_commits(configured_engine):
+    args = configured_engine._parser().parse_args([])
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    submission = q23._q23_pooled_submission(args)
+    state = {"serial": BASELINE_SERIAL, "submitted_samples": 0}
+    counts = {"queued": 0, "attaching": 0, "running": 0}
+    capacity = {
+        "ready_fit_slots": 3,
+        "queue_state": "ready",
+        "queue_reason": "",
+        "project_counts": counts,
+        "project_active": 0,
+        "project_submission_slots": 3,
+        "submission_allowed": True,
+    }
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            engine.feeder.scheduler_client,
+            "campaign_mutation_lock_is_held",
+            return_value=True,
+        ))
+        stack.enter_context(patch.object(engine.feeder, "load_state", return_value=state))
+        stack.enter_context(patch.object(
+            engine.feeder,
+            "scheduler_snapshot",
+            return_value=(counts, counts, [], capacity),
+        ))
+        stack.enter_context(patch.object(
+            engine.feeder, "dataset_collection_snapshot", return_value=(0, set())
+        ))
+        stack.enter_context(patch.object(engine.feeder, "campaign_inventory", return_value=[]))
+        stack.enter_context(patch.object(
+            engine.feeder, "cursor_after_valid_candidates", return_value=0
+        ))
+        stack.enter_context(patch.object(
+            engine.feeder,
+            "next_valid_candidate",
+            side_effect=lambda cursor, *, seed: (
+                cursor + 1, cursor, {"candidate": cursor}
+            ),
+        ))
+        stack.enter_context(patch.object(
+            engine.feeder,
+            "submit",
+            side_effect=[301, 302, 303],
+        ))
+        save = stack.enter_context(patch.object(engine.feeder, "save_state"))
+        stack.enter_context(patch.object(engine.feeder.time, "sleep"))
+
+        assert engine.feeder.step(
+            None,
+            target=3,
+            solver_revision=q24.PREDECESSOR_SOLVER,
+            library_revision=q24.LIBRARY_REVISION,
+            pooled_submission=submission,
+        )
+
+    assert save.call_count == 3
 
 
 def test_queueing_override_rejects_non_q24_campaign(configured_engine):
