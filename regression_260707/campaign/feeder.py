@@ -122,7 +122,7 @@ AEDT_SESSION_PROFILE = json.dumps(
     sort_keys=True,
     separators=(",", ":"),
 )
-DEFAULT_POOLED_CPUS = 1
+DEFAULT_POOLED_CPUS = 4
 DEFAULT_POOLED_MEMORY_MB = 6144
 CPU_HEADROOM = 0.85
 SCHEDULER_ATTEMPTS = 3
@@ -940,6 +940,10 @@ def step(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         raise SchedulerError("max_new_tasks must be a non-negative integer")
     requested_active = int(target) + int(buffer)
     pooled_mode = _is_pooled_submission(pooled_submission)
+    if max_samples is None and not pooled_mode:
+        raise SchedulerError(
+            "an unbounded dataset is allowed only for the pooled feeder"
+        )
     if pooled_mode and requested_active > MAX_POOLED_ACTIVE:
         raise SchedulerError(
             f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
@@ -988,6 +992,11 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     rapid_authorized = False
     adopted_authorized = False
     pooled_mode = _is_pooled_submission(_pooled_submission)
+    unbounded_dataset = max_samples is None
+    if unbounded_dataset and not pooled_mode:
+        raise SchedulerError(
+            "an unbounded dataset is allowed only for the pooled feeder"
+        )
     pooled_authorized = bool(
         pooled_mode and requested_active <= MAX_POOLED_ACTIVE)
     if pooled_mode and not pooled_authorized:
@@ -997,6 +1006,7 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         rapid_authorized = (
             isinstance(_rapid_authorization, _RapidRefillAuthorization)
             and _rapid_authorization.seal is _RAPID_REFILL_SEAL
+            and not unbounded_dataset
             and _rapid_authorization.target == requested_active
             and _rapid_authorization.max_samples == int(max_samples)
             and _rapid_authorization.solver_revision == str(solver_revision)
@@ -1006,6 +1016,7 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         adopted_authorized = (
             isinstance(_adopted_authorization, _AdoptedRefillAuthorization)
             and _adopted_authorization.seal is _ADOPTED_REFILL_SEAL
+            and not unbounded_dataset
             and _adopted_authorization.target == requested_active
             and _adopted_authorization.max_samples == int(max_samples)
             and _adopted_authorization.solver_revision == str(solver_revision)
@@ -1094,13 +1105,13 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
           f"{capacity_gate['project_submission_slots']}, "
           "dataset/reserved/projected="
           f"{data_rows}/{reserved_rows}/{projected_rows}")
-    if data_rows >= max_samples:
+    if not unbounded_dataset and data_rows >= max_samples:
         print(f"[feeder] dataset target reached ({data_rows}/{max_samples}) - no refill")
         if _refill_journal is not None:
             _refill_journal["stop_reason"] = "dataset_ceiling_reached"
             _refill_journal["completed"] = True
         return False
-    if projected_rows >= max_samples:
+    if not unbounded_dataset and projected_rows >= max_samples:
         print(f"[feeder] no refill: projected dataset rows {projected_rows}/{max_samples}")
         if _refill_journal is not None:
             _refill_journal["stop_reason"] = "projected_ceiling_reached"
@@ -1141,7 +1152,11 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         st["candidate_cursor"] = candidate_cursor
         st.pop("candidate_raw_index", None)
     st["candidate_cursors"] = candidate_cursors
-    n_new = min(deficit, (max_samples - projected_rows) // COUNT_PER_TASK)
+    n_new = (
+        deficit
+        if unbounded_dataset
+        else min(deficit, (max_samples - projected_rows) // COUNT_PER_TASK)
+    )
     if _max_new_tasks is not None:
         n_new = min(n_new, _max_new_tasks)
     if _refill_journal is not None:

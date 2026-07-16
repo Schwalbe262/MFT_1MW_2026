@@ -828,6 +828,74 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
                 library_revision=TEST_LIBRARY_REVISION)
         self.assertEqual(task_id, 88)
 
+    def test_submit_retries_503_and_transport_with_same_dedupe(self):
+        unavailable = Mock(status_code=503)
+        accepted = Mock(status_code=201)
+        accepted.json.return_value = {"id": 89}
+        with patch.object(
+                scheduler_client, "reconcile_task_id", return_value=None), patch.object(
+                scheduler_client.requests, "post",
+                side_effect=[
+                    unavailable,
+                    requests.Timeout("scheduler busy"),
+                    accepted,
+                ]) as post, patch.object(
+                scheduler_client.time, "sleep") as sleep:
+            task_id = scheduler_client.submit_verification(
+                "candidate-ramp-retry", "wd", {"x": 1}, {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+            )
+
+        self.assertEqual(task_id, 89)
+        self.assertEqual(post.call_count, 3)
+        dedupe_keys = [call.kwargs["json"]["dedupe_key"]
+                       for call in post.call_args_list]
+        self.assertEqual(len(set(dedupe_keys)), 1)
+        self.assertTrue(all(
+            call.kwargs["timeout"]
+            == scheduler_client.SUBMISSION_POST_TIMEOUT_SECONDS
+            for call in post.call_args_list
+        ))
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list], [1, 2]
+        )
+
+    def test_submit_terminal_4xx_is_not_replayed(self):
+        rejected = Mock(status_code=422)
+        with patch.object(
+                scheduler_client, "reconcile_task_id", return_value=None), patch.object(
+                scheduler_client.requests, "post", return_value=rejected) as post, \
+                patch.object(scheduler_client.time, "sleep") as sleep:
+            task_id = scheduler_client.submit_verification(
+                "candidate-terminal-4xx", "wd", {}, {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+            )
+
+        self.assertIsNone(task_id)
+        post.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_submit_transient_retry_budget_is_bounded(self):
+        unavailable = Mock(status_code=503)
+        with patch.object(
+                scheduler_client, "reconcile_task_id", return_value=None), patch.object(
+                scheduler_client.requests, "post", return_value=unavailable) as post, \
+                patch.object(scheduler_client.time, "sleep") as sleep:
+            with self.assertRaises(scheduler_client.TaskSubmissionUncertain):
+                scheduler_client.submit_verification(
+                    "candidate-bounded-retry", "wd", {}, {},
+                    solver_revision=TEST_REVISION,
+                    library_revision=TEST_LIBRARY_REVISION,
+                )
+
+        self.assertEqual(post.call_count, scheduler_client.SUBMISSION_POST_ATTEMPTS)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            list(scheduler_client.SUBMISSION_POST_BACKOFF_SECONDS),
+        )
+
     def test_latest_well_formed_result_is_authoritative(self):
         good = valid_result(sample="good")
         invalid = valid_result(sample="bad", result_valid_thermal=0)

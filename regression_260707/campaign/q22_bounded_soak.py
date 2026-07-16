@@ -1,17 +1,14 @@
-"""Policy-driven, crash-safe q22 pooled production controller.
+"""Policy-driven, crash-safe, open-ended q22 pooled production controller.
 
-This controller deliberately separates two operator controls:
-
-* campaign demand is the total number of accepted q22 submissions (500 by
-  default, but versioned and adjustable in the Web UI); and
-* simulation policy is the number of logical clients allowed to be active at
-  once (never more than 30 for the validated 10 AEDT x 3 project pool).
+There is deliberately no campaign submission total.  The scheduler's durable
+simulation policy is the sole operator control: while its effective value is
+non-zero, every cycle refills completed or failed q22 tasks back to that
+logical-active target (up to 500).  Setting the policy to zero stops refill and
+lets existing tasks drain; this controller never cancels existing work.
 
 The launch identity (solver, library, package, profile, candidate seed and
-baseline serial) is immutable.  Demand is not: lowering it stops refill
-without cancelling work, while raising it extends the same deterministic
-candidate stream.  ``feeder.max_new_tasks`` is the final per-cycle guard, so a
-restart or an uncertain scheduler POST cannot exceed the observed demand.
+baseline serial) is immutable.  A single controller lock and the scheduler's
+host-wide campaign mutation lock serialize reconciliation and submission.
 
 The default mode is a write-free plan. Execution requires the deliberately
 verbose ``--execute-mft-family-production`` switch. MFT remains family-isolated
@@ -50,18 +47,27 @@ from module.core_material_contract import PHYSICS_DATA_REVISION
 from regression_260707 import quality_contract
 
 
-SCHEMA = "q22-bounded-soak-controller-v1"
-ACCOUNT_EXPANSION_SCHEMA = "q22-bounded-soak-controller-account-expansion-v2"
+# The campaign id and manifest filenames remain stable so already-submitted q22
+# tasks are adopted rather than replayed during the bounded -> open-ended
+# controller transition.
+SCHEMA = "q22-open-ended-controller-v3"
+ACCOUNT_EXPANSION_SCHEMA = "q22-open-ended-controller-account-expansion-v3"
+LEGACY_SCHEMA = "q22-bounded-soak-controller-v1"
+LEGACY_ACCOUNT_EXPANSION_SCHEMA = (
+    "q22-bounded-soak-controller-account-expansion-v2"
+)
 CAMPAIGN_ID = "q22-bounded-soak500-260716"
 PROJECT = "MFT_1MW_2026v1"
-DEFAULT_TOTAL_DEMAND = 500
 ADOPTED_BASELINE_SERIAL = 17113
 ADOPTED_BASELINE_DATASET_ROWS = 5233
-MAX_TOTAL_DEMAND = 100_000
-MAX_LOGICAL_ACTIVE = 30
-EXPECTED_POOL_SESSIONS = 10
+MAX_LOGICAL_ACTIVE = 500
+EXPECTED_POOL_SESSIONS = 167
 EXPECTED_PROJECTS_PER_AEDT = 3
-EXPECTED_POOL_PROJECTS = 30
+EXPECTED_POOL_TARGET = 500
+EXPECTED_POOL_CAPACITY = EXPECTED_POOL_SESSIONS * EXPECTED_PROJECTS_PER_AEDT
+LEGACY_MAX_LOGICAL_ACTIVE = 30
+LEGACY_POOL_SESSIONS = 10
+LEGACY_POOL_PROJECTS = 30
 TASK_TIMEOUT_SECONDS = 86_400
 RELEASE_TIMEOUT_SECONDS = 7_200
 AUTOMATION_TIMEOUT_SECONDS = 7_200
@@ -247,19 +253,6 @@ def _http_json(base_url: str, path: str) -> dict[str, Any]:
     return value
 
 
-def read_campaign_demand(base_url: str) -> dict[str, Any]:
-    demand = _http_json(base_url, f"/api/projects/{PROJECT}/campaign-demand")
-    total = demand.get("total_simulations")
-    revision = demand.get("demand_revision")
-    if (isinstance(total, bool) or not isinstance(total, int)
-            or not 0 <= total <= MAX_TOTAL_DEMAND):
-        raise GateError("campaign total_simulations is invalid")
-    if (isinstance(revision, bool) or not isinstance(revision, (int, str))
-            or not str(revision).strip()):
-        raise GateError("campaign demand_revision is invalid")
-    return demand
-
-
 def verify_pool_and_policy(base_url: str) -> tuple[dict[str, Any], int]:
     summary = _http_json(base_url, "/api/aedt-pool")
     config = summary.get("config")
@@ -268,7 +261,7 @@ def verify_pool_and_policy(base_url: str) -> tuple[dict[str, Any], int]:
     required = {
         "max_aedt_sessions": EXPECTED_POOL_SESSIONS,
         "projects_per_aedt": EXPECTED_PROJECTS_PER_AEDT,
-        "target_project_concurrency": EXPECTED_POOL_PROJECTS,
+        "target_project_concurrency": EXPECTED_POOL_TARGET,
         "enabled": True,
         "adapter_ready": True,
         "validation_passed": True,
@@ -277,7 +270,15 @@ def verify_pool_and_policy(base_url: str) -> tuple[dict[str, Any], int]:
     drift = {key: config.get(key) for key, value in required.items()
              if config.get(key) != value}
     if drift:
-        raise GateError(f"AEDT pool must remain exact 10x3/30 and operational: {drift}")
+        raise GateError(
+            "AEDT pool must remain 167x3 with target 500 and operational: "
+            f"{drift}"
+        )
+    if EXPECTED_POOL_CAPACITY < MAX_LOGICAL_ACTIVE:
+        raise GateError("configured AEDT pool capacity cannot serve logical target 500")
+    validation = summary.get("latest_validation")
+    if not isinstance(validation, dict) or validation.get("status") != "passed":
+        raise GateError("latest AEDT pool validation must be passed")
     project = _http_json(base_url, f"/api/projects/{PROJECT}")
     embedded = project.get("simulation_policy")
     policy = {**project, **embedded} if isinstance(embedded, dict) else project
@@ -288,7 +289,13 @@ def verify_pool_and_policy(base_url: str) -> tuple[dict[str, Any], int]:
     effective = policy.get("effective_simulations")
     if (type(desired) is not int or not 0 <= desired <= MAX_LOGICAL_ACTIVE
             or validated != MAX_LOGICAL_ACTIVE):
-        raise GateError("active policy must be within the validated 0..30 range")
+        raise GateError("active policy must be within the validated 0..500 range")
+    if policy.get("min_desired_simulations") not in (None, 0):
+        raise GateError("simulation policy minimum must be zero")
+    if policy.get("max_desired_simulations") not in (None, MAX_LOGICAL_ACTIVE):
+        raise GateError("simulation policy maximum must be 500")
+    if policy.get("control_enabled") is False:
+        raise GateError("simulation policy control must be enabled")
     if effective is None:
         effective = desired
     if type(effective) is not int or not 0 <= effective <= desired:
@@ -468,14 +475,37 @@ def audit_remote_packages(
     return results
 
 
-def manifest_identity(
+def _manifest_identity(
     baseline_serial: int,
     state_path: Path,
     eligible_accounts: Sequence[str],
+    *,
+    legacy: bool,
 ) -> dict[str, Any]:
     profile = verify_profile()
+    if legacy:
+        schema = LEGACY_SCHEMA
+        max_logical_active = LEGACY_MAX_LOGICAL_ACTIVE
+        pool_topology = {
+            "sessions": LEGACY_POOL_SESSIONS,
+            "projects_per_aedt": EXPECTED_PROJECTS_PER_AEDT,
+            "projects": LEGACY_POOL_PROJECTS,
+        }
+        adoption_semantics = "adopt-existing-q22-submissions-no-second-plus500"
+    else:
+        schema = SCHEMA
+        max_logical_active = MAX_LOGICAL_ACTIVE
+        pool_topology = {
+            "sessions": EXPECTED_POOL_SESSIONS,
+            "projects_per_aedt": EXPECTED_PROJECTS_PER_AEDT,
+            "capacity": EXPECTED_POOL_CAPACITY,
+            "target": EXPECTED_POOL_TARGET,
+        }
+        adoption_semantics = (
+            "adopt-existing-q22-submissions-no-replay-open-ended-refill"
+        )
     return {
-        "schema": SCHEMA,
+        "schema": schema,
         "campaign_id": CAMPAIGN_ID,
         "baseline_serial": int(baseline_serial),
         "state_path": str(state_path.resolve()),
@@ -487,8 +517,8 @@ def manifest_identity(
         "physics_data_revision": PHYSICS_REVISION,
         "profile_sha256": _digest(profile),
         "eligible_accounts": list(eligible_accounts),
-        "max_logical_active": MAX_LOGICAL_ACTIVE,
-        "pool_topology": {"sessions": 10, "projects_per_aedt": 3, "projects": 30},
+        "max_logical_active": max_logical_active,
+        "pool_topology": pool_topology,
         "timeouts": {
             "task": TASK_TIMEOUT_SECONDS,
             "release": RELEASE_TIMEOUT_SECONDS,
@@ -499,9 +529,30 @@ def manifest_identity(
             "prelaunch_serial": ADOPTED_BASELINE_SERIAL,
             "prelaunch_dataset_rows": ADOPTED_BASELINE_DATASET_ROWS,
             "legacy_feeder_max_samples": 5733,
-            "semantics": "adopt-existing-q22-submissions-no-second-plus500",
+            "semantics": adoption_semantics,
         },
     }
+
+
+def manifest_identity(
+    baseline_serial: int,
+    state_path: Path,
+    eligible_accounts: Sequence[str],
+) -> dict[str, Any]:
+    return _manifest_identity(
+        baseline_serial, state_path, eligible_accounts, legacy=False
+    )
+
+
+def legacy_manifest_identity(
+    baseline_serial: int,
+    state_path: Path,
+    eligible_accounts: Sequence[str],
+) -> dict[str, Any]:
+    """Reproduce the persisted bounded-v1 identity for in-place adoption."""
+    return _manifest_identity(
+        baseline_serial, state_path, eligible_accounts, legacy=True
+    )
 
 
 def build_manifest(identity: Mapping[str, Any]) -> dict[str, Any]:
@@ -510,12 +561,13 @@ def build_manifest(identity: Mapping[str, Any]) -> dict[str, Any]:
         **immutable,
         "identity_sha256": _digest(immutable),
         "created_at_epoch": time.time(),
-        "demand_control": {
-            "endpoint": f"/api/projects/{PROJECT}/campaign-demand",
-            "default_total_simulations": DEFAULT_TOTAL_DEMAND,
-            "mutable_with_cas": True,
-            "decrease_semantics": "stop-refill-no-cancel",
-            "increase_semantics": "extend-deterministic-stream",
+        "runtime_control": {
+            "endpoint": f"/api/projects/{PROJECT}",
+            "field": "simulation_policy.desired_simulations",
+            "logical_active_range": [0, MAX_LOGICAL_ACTIVE],
+            "open_ended": True,
+            "completion_and_failure_semantics": "immediate-refill",
+            "scale_down_semantics": "drain-no-cancel",
         },
     }
 
@@ -539,11 +591,13 @@ def _ordered_strict_superset(
     )
 
 
-def account_expansion_identity(
+def _account_expansion_identity(
     previous_manifest: Mapping[str, Any],
     state_path: Path,
     eligible_accounts: Sequence[str],
     transition_serial: int,
+    *,
+    legacy: bool,
 ) -> dict[str, Any]:
     previous_accounts = previous_manifest.get("eligible_accounts")
     if not isinstance(previous_accounts, list) or not all(
@@ -557,9 +611,15 @@ def account_expansion_identity(
     baseline = int(previous_manifest["baseline_serial"])
     if transition_serial < baseline:
         raise GateError("account expansion transition serial precedes campaign baseline")
-    identity = manifest_identity(baseline, state_path, eligible_accounts)
+    identity = (
+        legacy_manifest_identity(baseline, state_path, eligible_accounts)
+        if legacy
+        else manifest_identity(baseline, state_path, eligible_accounts)
+    )
     identity.update({
-        "schema": ACCOUNT_EXPANSION_SCHEMA,
+        "schema": (
+            LEGACY_ACCOUNT_EXPANSION_SCHEMA if legacy else ACCOUNT_EXPANSION_SCHEMA
+        ),
         "manifest_version": 2,
         "transition": {
             "kind": "append-only-account-superset",
@@ -567,12 +627,33 @@ def account_expansion_identity(
             "predecessor_identity_sha256": previous_manifest["identity_sha256"],
             "predecessor_eligible_accounts": list(previous_accounts),
             "transition_serial": int(transition_serial),
-            "baseline_and_demand_semantics": (
-                "same-baseline-and-campaign-demand-no-resubmission"
+            "baseline_and_control_semantics": (
+                "same-baseline-open-ended-policy-no-resubmission"
             ),
         },
     })
+    if legacy:
+        transition = identity["transition"]
+        transition["baseline_and_demand_semantics"] = (
+            "same-baseline-and-campaign-demand-no-resubmission"
+        )
+        transition.pop("baseline_and_control_semantics")
     return identity
+
+
+def account_expansion_identity(
+    previous_manifest: Mapping[str, Any],
+    state_path: Path,
+    eligible_accounts: Sequence[str],
+    transition_serial: int,
+) -> dict[str, Any]:
+    return _account_expansion_identity(
+        previous_manifest,
+        state_path,
+        eligible_accounts,
+        transition_serial,
+        legacy=False,
+    )
 
 
 def validate_manifest(
@@ -583,7 +664,13 @@ def validate_manifest(
     baseline = manifest.get("baseline_serial")
     if isinstance(baseline, bool) or not isinstance(baseline, int) or baseline < 0:
         raise GateError("controller manifest baseline_serial is invalid")
-    expected = manifest_identity(baseline, state_path, eligible_accounts)
+    schema = manifest.get("schema")
+    if schema == SCHEMA:
+        expected = manifest_identity(baseline, state_path, eligible_accounts)
+    elif schema == LEGACY_SCHEMA:
+        expected = legacy_manifest_identity(baseline, state_path, eligible_accounts)
+    else:
+        raise GateError(f"unsupported controller manifest schema: {schema!r}")
     actual = {key: manifest.get(key) for key in expected}
     if actual != expected or manifest.get("identity_sha256") != _digest(expected):
         raise GateError("controller manifest immutable identity drifted")
@@ -603,12 +690,24 @@ def validate_account_expansion_manifest(
     if (isinstance(transition_serial, bool)
             or not isinstance(transition_serial, int)):
         raise GateError("v2 manifest transition_serial is invalid")
-    expected = account_expansion_identity(
-        previous_manifest,
-        state_path,
-        eligible_accounts,
-        transition_serial,
-    )
+    schema = manifest.get("schema")
+    if schema == ACCOUNT_EXPANSION_SCHEMA:
+        expected = account_expansion_identity(
+            previous_manifest,
+            state_path,
+            eligible_accounts,
+            transition_serial,
+        )
+    elif schema == LEGACY_ACCOUNT_EXPANSION_SCHEMA:
+        expected = _account_expansion_identity(
+            previous_manifest,
+            state_path,
+            eligible_accounts,
+            transition_serial,
+            legacy=True,
+        )
+    else:
+        raise GateError(f"unsupported v2 controller manifest schema: {schema!r}")
     actual = {key: manifest.get(key) for key in expected}
     if actual != expected or manifest.get("identity_sha256") != _digest(expected):
         raise GateError("v2 controller manifest immutable identity drifted")
@@ -731,20 +830,16 @@ def load_or_create_manifest(
 def campaign_progress(
     manifest: Mapping[str, Any],
     current_serial: int,
-    total_demand: int,
 ) -> dict[str, int]:
+    """Report accepted work without imposing any terminal submission count."""
     baseline = int(manifest["baseline_serial"])
     if current_serial < baseline:
         raise GateError("feeder serial regressed below the campaign baseline")
     accepted = current_serial - baseline
-    remaining = max(0, int(total_demand) - accepted)
     return {
         "baseline_serial": baseline,
         "current_serial": current_serial,
         "accepted_simulations": accepted,
-        "total_simulations": int(total_demand),
-        "remaining_simulations": remaining,
-        "oversupplied_by": max(0, accepted - int(total_demand)),
     }
 
 
@@ -817,7 +912,10 @@ def pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
         "MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION": SCHEDULER_PACKAGE_REVISION,
     }
     return {
-        "cpus": 1,
+        # This is the solver-pressure accounting value.  The thin attach
+        # client itself is cheap, but each attached Maxwell/Icepak project
+        # consumes the four-core budget inside the AEDT host.
+        "cpus": 4,
         "memory_mb": 6144,
         "timeout_seconds": TASK_TIMEOUT_SECONDS,
         "profile_path": str(PROFILE_PATH),
@@ -841,17 +939,19 @@ def static_plan(args: argparse.Namespace, manifest: Mapping[str, Any]) -> dict[s
     progress = campaign_progress(
         manifest,
         _state_serial(args.state_dir / "feeder_state.json"),
-        args.planned_total_demand,
     )
     submission = pooled_submission(args)
     return {
         "mode": "write-free-dry-run",
         "campaign": CAMPAIGN_ID,
-        "demand": progress,
+        "progress": progress,
         "active_control": {
             "source": "versioned scheduler simulation-policy/Web UI",
             "range": [0, MAX_LOGICAL_ACTIVE],
-            "pool": "10 AEDT x 3 projects = 30",
+            "pool": "167 AEDT x 3 projects = 501 capacity; target <= 500",
+            "open_ended": True,
+            "completion_or_failure": "refill to current effective target",
+            "stop": "set desired simulations to zero; existing tasks drain",
         },
         "pins": {
             "solver": CAMPAIGN_SOLVER,
@@ -864,10 +964,9 @@ def static_plan(args: argparse.Namespace, manifest: Mapping[str, Any]) -> dict[s
         )},
         "environment": submission["submission_env"],
         "execution_requires": [
-            "campaign-demand API deployed with CAS default 500",
             "q21b tasks 41796-41798 and releases remain valid",
-            "pool remains exact 10x3/30",
-            "active policy remains 0..30 with validated limit 30",
+            "pool remains 167x3 with capacity >=500 and target 500",
+            "active policy remains 0..500 with validated limit 500",
             "every eligible account has clean exact scheduler package",
             "solver/library revisions remain advertised remote branch heads",
         ],
@@ -912,34 +1011,27 @@ def execute_cycle(
     manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     # Remote/package evidence is checked immediately before entering the one
-    # host-wide mutation epoch.  Demand and active policy are then observed
-    # under the same lock used by both Web UI PATCH routes.
+    # host-wide mutation epoch.  Active policy is then observed under the same
+    # lock used by the Web UI PATCH route.
     gates = run_live_gates(args)
     with feeder.campaign_mutation_lock():
-        demand = read_campaign_demand(args.scheduler_url)
         _pool, logical_target = verify_pool_and_policy(args.scheduler_url)
         current_serial = _state_serial(args.state_dir / "feeder_state.json")
         verify_owned_serials(args.scheduler_db, manifest, current_serial)
-        progress = campaign_progress(
-            manifest, current_serial, int(demand["total_simulations"])
-        )
-        remaining = progress["remaining_simulations"]
-        if remaining and logical_target:
+        progress = campaign_progress(manifest, current_serial)
+        if logical_target:
             feeder.step(
-                2_000_000_000,
+                None,
                 target=logical_target,
                 buffer=0,
                 solver_revision=CAMPAIGN_SOLVER,
                 library_revision=LIBRARY_REVISION,
                 candidate_seed=CANDIDATE_SEED,
                 pooled_submission=pooled_submission(args),
-                max_new_tasks=remaining,
             )
             current_serial = _state_serial(args.state_dir / "feeder_state.json")
             verify_owned_serials(args.scheduler_db, manifest, current_serial)
-            progress = campaign_progress(
-                manifest, current_serial, int(demand["total_simulations"])
-            )
+            progress = campaign_progress(manifest, current_serial)
         return {
             "schema": SCHEMA,
             "campaign": CAMPAIGN_ID,
@@ -948,15 +1040,51 @@ def execute_cycle(
                 "identity_sha256": manifest["identity_sha256"],
                 "eligible_accounts": list(manifest["eligible_accounts"]),
             },
-            "phase": "demand-satisfied" if not progress["remaining_simulations"] else (
-                "paused-by-active-policy" if not logical_target else "rolling-refill"
+            "phase": (
+                "stop-requested-draining"
+                if not logical_target
+                else "open-ended-refill"
             ),
             "updated_at_epoch": time.time(),
-            "demand_revision": demand["demand_revision"],
             "progress": progress,
             "logical_target": logical_target,
+            "open_ended": True,
+            "submission_ceiling": None,
+            "completion_and_failure_refill": True,
             "gates": gates,
             "no_cancellation_performed": True,
+        }
+
+
+def controller_cycle_status(
+    args: argparse.Namespace,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Convert retryable uncertainty into a next-cycle reconciliation state."""
+    try:
+        return execute_cycle(args, manifest)
+    except feeder.scheduler_client.TaskSubmissionUncertain as exc:
+        current_serial = _state_serial(args.state_dir / "feeder_state.json")
+        return {
+            "schema": SCHEMA,
+            "campaign": CAMPAIGN_ID,
+            "phase": "submission-uncertain-reconcile-next-cycle",
+            "updated_at_epoch": time.time(),
+            "blocker": str(exc),
+            "progress": campaign_progress(manifest, current_serial),
+            "open_ended": True,
+            "submission_ceiling": None,
+            "same_dedupe_retry": True,
+            "no_cancellation_performed": True,
+        }
+    except GateError as exc:
+        return {
+            "schema": SCHEMA,
+            "campaign": CAMPAIGN_ID,
+            "phase": "blocked-fail-closed",
+            "updated_at_epoch": time.time(),
+            "blocker": str(exc),
+            "no_submission_attempted": True,
         }
 
 
@@ -974,7 +1102,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--live-readonly-gates", action="store_true")
-    parser.add_argument("--interval-seconds", type=int, default=60)
+    parser.add_argument("--interval-seconds", type=int, default=5)
     parser.add_argument(
         "--manifest-version",
         type=int,
@@ -985,14 +1113,13 @@ def _parser() -> argparse.ArgumentParser:
             "append-only account-superset manifest referencing v1"
         ),
     )
-    parser.add_argument("--planned-total-demand", type=int, default=DEFAULT_TOTAL_DEMAND)
     parser.add_argument(
         "--adopt-baseline-serial",
         type=int,
         default=ADOPTED_BASELINE_SERIAL,
         help=(
             "prelaunch canonical feeder serial; already accepted later "
-            "serials count toward total demand"
+            "serials are adopted into the open-ended stream"
         ),
     )
     parser.add_argument("--scheduler-url", default=DEFAULT_SCHEDULER_URL)
@@ -1025,9 +1152,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if (not args.eligible_accounts or len(set(args.eligible_accounts))
             != len(args.eligible_accounts)):
         raise GateError("eligible accounts must be a non-empty unique list")
-    if (isinstance(args.planned_total_demand, bool)
-            or not 0 <= args.planned_total_demand <= MAX_TOTAL_DEMAND):
-        raise GateError(f"planned total demand must be 0..{MAX_TOTAL_DEMAND}")
     if args.interval_seconds < 5:
         raise GateError("interval-seconds must be at least 5")
 
@@ -1054,7 +1178,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.live_readonly_gates:
             try:
                 plan["live_gates"] = run_live_gates(args)
-                plan["live_demand"] = read_campaign_demand(args.scheduler_url)
+                plan["live_policy_target"] = plan["live_gates"]["logical_target"]
             except GateError as exc:
                 plan["live_gate_blocker"] = str(exc)
         print(json.dumps(plan, indent=2, sort_keys=True))
@@ -1069,10 +1193,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # every possible submission.
                 run_live_gates(args)
             with feeder.campaign_mutation_lock():
-                # Refuse to create the immutable baseline until the mutable
-                # demand API exists.  The initial UI value is expected to be
-                # 500, but it may subsequently change by CAS.
-                read_campaign_demand(args.scheduler_url)
+                # Refuse to create the immutable baseline until the validated
+                # open-ended 0..500 simulation policy exists.
+                verify_pool_and_policy(args.scheduler_url)
                 manifest = load_manifest_version(
                     manifest_path,
                     predecessor_path,
@@ -1083,21 +1206,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     baseline_serial=args.adopt_baseline_serial,
                 )
             while True:
-                try:
-                    status = execute_cycle(args, manifest)
-                except GateError as exc:
-                    status = {
-                        "schema": SCHEMA,
-                        "campaign": CAMPAIGN_ID,
-                        "phase": "blocked-fail-closed",
-                        "updated_at_epoch": time.time(),
-                        "blocker": str(exc),
-                        "no_submission_attempted": True,
-                    }
+                status = controller_cycle_status(args, manifest)
                 _write_status(status_path, status)
                 print(json.dumps(status, sort_keys=True), flush=True)
                 if args.once:
-                    return 0 if status.get("phase") != "blocked-fail-closed" else 2
+                    return 0 if status.get("phase") in {
+                        "open-ended-refill", "stop-requested-draining"
+                    } else 2
                 time.sleep(args.interval_seconds)
     except FileLockTimeout as exc:
         raise GateError("another feeder/controller already owns the canonical lock") from exc

@@ -11,7 +11,7 @@ param(
     [ValidateSet(1, 2)]
     [int]$ManifestVersion = 1,
     [string[]]$EligibleAccounts = @('dhj02', 'harry261', 'jji0930'),
-    [int]$IntervalSeconds = 60,
+    [int]$IntervalSeconds = 5,
     [int]$RestartDelaySeconds = 15
 )
 
@@ -48,7 +48,7 @@ foreach ($Account in $EligibleAccounts) {
 
 while ($true) {
     $Started = Get-Date -Format o
-    "[$Started] starting q22 bounded controller" | Tee-Object -FilePath $LogPath -Append
+    "[$Started] starting q22 open-ended controller" | Tee-Object -FilePath $LogPath -Append
     & $Python @Arguments 2>&1 | Tee-Object -FilePath $LogPath -Append
     $ExitCode = $LASTEXITCODE
     $Stopped = Get-Date -Format o

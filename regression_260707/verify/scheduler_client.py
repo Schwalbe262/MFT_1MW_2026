@@ -48,6 +48,9 @@ MFT_PROJECT = "MFT_1MW_2026v1"
 MFT_PROJECT_MAX_ACTIVE_TASKS = 300
 MFT_PROJECT_MAX_ACTIVE_TASKS_CEILING = 600
 MFT_ACTIVE_STATUSES = ("queued", "attaching", "running")
+SUBMISSION_POST_TIMEOUT_SECONDS = 120
+SUBMISSION_POST_ATTEMPTS = 4
+SUBMISSION_POST_BACKOFF_SECONDS = (1, 2, 4)
 LEGACY_MFT_NAME_PREFIX = "mft-"
 MFT_PROJECT_REPOS = [
     {
@@ -857,38 +860,64 @@ def _submit_verification_locked(
         raise ProjectCapacityError(
             f"MFT project has no submission slots under cap "
             f"{required_hard_cap}: {capacity}")
-    try:
-        r = requests.post(f"{SCHEDULER}/api/tasks", json=payload, timeout=20)
-    except Exception as post_error:
+    last_transient_error = None
+    for attempt in range(SUBMISSION_POST_ATTEMPTS):
+        if attempt:
+            time.sleep(SUBMISSION_POST_BACKOFF_SECONDS[attempt - 1])
+            try:
+                recovered = reconcile_task_id(name, dedupe_key)
+            except TaskLookupError as lookup_error:
+                last_transient_error = lookup_error
+            else:
+                if recovered is not None:
+                    return recovered
+        try:
+            # Large pooled ramps make the single scheduler worker briefly busy
+            # reconciling sessions/allocations. Every retry carries the exact
+            # same dedupe identity, and reconciliation brackets uncertain POSTs.
+            response = requests.post(
+                f"{SCHEDULER}/api/tasks",
+                json=payload,
+                timeout=SUBMISSION_POST_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as post_error:
+            last_transient_error = post_error
+        else:
+            status_code = int(response.status_code)
+            if status_code in (200, 201):
+                try:
+                    response_payload = response.json()
+                    task_id = response_payload.get("task_id") or response_payload.get(
+                        "id"
+                    )
+                    if task_id is not None:
+                        return int(task_id)
+                except Exception as response_error:
+                    last_transient_error = response_error
+                else:
+                    last_transient_error = RuntimeError(
+                        f"scheduler accepted {name!r} without a task id"
+                    )
+            elif status_code == 429 or status_code >= 500:
+                last_transient_error = RuntimeError(
+                    f"transient scheduler submission HTTP {status_code} for {name!r}"
+                )
+            else:
+                # All other 4xx responses (and unexpected 3xx responses) are
+                # terminal contract failures. Do not replay them.
+                return None
         try:
             recovered = reconcile_task_id(name, dedupe_key)
         except TaskLookupError as lookup_error:
-            raise TaskSubmissionUncertain(
-                f"POST response and reconciliation were both unavailable for {name!r}"
-            ) from lookup_error
-        if recovered is not None:
-            return recovered
-        raise TaskSubmissionUncertain(
-            f"POST response was lost and no durable task is visible yet for {name!r}"
-        ) from post_error
-    if r.status_code not in (200, 201):
-        recovered = reconcile_task_id(name, dedupe_key)
-        if recovered is not None:
-            return recovered
-        return None
-    try:
-        response_payload = r.json()
-        task_id = response_payload.get("task_id") or response_payload.get("id")
-        if task_id is not None:
-            return int(task_id)
-    except Exception:
-        pass
-    recovered = reconcile_task_id(name, dedupe_key)
-    if recovered is not None:
-        return recovered
+            last_transient_error = lookup_error
+        else:
+            if recovered is not None:
+                return recovered
+
     raise TaskSubmissionUncertain(
-        f"scheduler accepted {name!r} without returning or exposing its task ID"
-    )
+        f"scheduler submission remained uncertain after "
+        f"{SUBMISSION_POST_ATTEMPTS} idempotent attempts for {name!r}"
+    ) from last_transient_error
 
 
 def get_status(task_id):

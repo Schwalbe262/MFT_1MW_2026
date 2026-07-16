@@ -1,4 +1,4 @@
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import json
 from pathlib import Path
 import sqlite3
@@ -32,20 +32,14 @@ def test_profile_is_explicit_full_extraction_with_required_timeout():
     assert profile["timeout_seconds"] == 86400
 
 
-def test_mutable_demand_progress_decrease_never_requests_cancellation():
+def test_progress_is_open_ended_without_remaining_or_total_ceiling():
     manifest = {"baseline_serial": 100}
-    extended = q22.campaign_progress(manifest, 107, 12)
-    reduced = q22.campaign_progress(manifest, 107, 3)
-    assert extended == {
+    progress = q22.campaign_progress(manifest, 10_107)
+    assert progress == {
         "baseline_serial": 100,
-        "current_serial": 107,
-        "accepted_simulations": 7,
-        "total_simulations": 12,
-        "remaining_simulations": 5,
-        "oversupplied_by": 0,
+        "current_serial": 10_107,
+        "accepted_simulations": 10_007,
     }
-    assert reduced["remaining_simulations"] == 0
-    assert reduced["oversupplied_by"] == 4
 
 
 def test_manifest_dry_run_is_write_free_and_identity_is_fail_closed(tmp_path):
@@ -58,8 +52,14 @@ def test_manifest_dry_run_is_write_free_and_identity_is_fail_closed(tmp_path):
         target, state, accounts, execute=False
     )
     assert manifest["baseline_serial"] == 123
-    assert manifest["demand_control"]["default_total_simulations"] == 500
-    assert manifest["demand_control"]["mutable_with_cas"] is True
+    assert manifest["runtime_control"] == {
+        "endpoint": f"/api/projects/{q22.PROJECT}",
+        "field": "simulation_policy.desired_simulations",
+        "logical_active_range": [0, 500],
+        "open_ended": True,
+        "completion_and_failure_semantics": "immediate-refill",
+        "scale_down_semantics": "drain-no-cancel",
+    }
     assert not target.exists()
 
     persisted = q22.load_or_create_manifest(
@@ -72,6 +72,26 @@ def test_manifest_dry_run_is_write_free_and_identity_is_fail_closed(tmp_path):
     target.write_text(json.dumps(tampered), encoding="utf-8")
     with pytest.raises(q22.GateError, match="immutable identity drifted"):
         q22.load_or_create_manifest(target, state, accounts, execute=False)
+
+
+def test_persisted_bounded_v1_manifest_is_adopted_without_replay(tmp_path):
+    state = tmp_path / "feeder_state.json"
+    state.write_text(json.dumps({"serial": 127}), encoding="utf-8")
+    target = tmp_path / "manifest.json"
+    accounts = ("account-a", "account-b")
+    identity = q22.legacy_manifest_identity(120, state, accounts)
+    target.write_text(json.dumps({
+        **identity,
+        "identity_sha256": q22._digest(identity),
+        "demand_control": {"default_total_simulations": 500},
+    }), encoding="utf-8")
+
+    adopted = q22.load_or_create_manifest(
+        target, state, accounts, execute=False, baseline_serial=120
+    )
+
+    assert adopted["schema"] == q22.LEGACY_SCHEMA
+    assert adopted["baseline_serial"] == 120
 
 
 def test_v2_manifest_is_atomic_append_only_account_superset(tmp_path):
@@ -107,8 +127,8 @@ def test_v2_manifest_is_atomic_append_only_account_superset(tmp_path):
         "predecessor_identity_sha256": v1["identity_sha256"],
         "predecessor_eligible_accounts": list(original),
         "transition_serial": 127,
-        "baseline_and_demand_semantics": (
-            "same-baseline-and-campaign-demand-no-resubmission"
+        "baseline_and_control_semantics": (
+            "same-baseline-open-ended-policy-no-resubmission"
         ),
     }
     assert v2["eligible_accounts"] == list(expanded)
@@ -131,7 +151,7 @@ def test_submission_contract_pins_accounts_resources_and_all_timeouts():
     submission = q22.pooled_submission(args)
     environment = submission["submission_env"]
     assert submission["account_names"] == q22.DEFAULT_ELIGIBLE_ACCOUNTS
-    assert submission["cpus"] == 1
+    assert submission["cpus"] == 4
     assert submission["memory_mb"] == 6144
     assert submission["timeout_seconds"] == 86400
     assert environment["MFT_AEDT_RELEASE_WAIT_SECONDS"] == "7200"
@@ -145,12 +165,12 @@ def test_submission_contract_pins_accounts_resources_and_all_timeouts():
     )
 
 
-def test_pool_gate_keeps_total_demand_separate_from_active_30():
+def test_pool_gate_accepts_167x3_and_adjustable_policy_through_500():
     pool = {
         "config": {
-            "max_aedt_sessions": 10,
+            "max_aedt_sessions": 167,
             "projects_per_aedt": 3,
-            "target_project_concurrency": 30,
+            "target_project_concurrency": 500,
             "enabled": True,
             "adapter_ready": True,
             "validation_passed": True,
@@ -166,9 +186,12 @@ def test_pool_gate_keeps_total_demand_separate_from_active_30():
         "name": q22.PROJECT,
         "max_active_tasks": 500,
         "simulation_policy": {
-            "desired_simulations": 30,
-            "effective_simulations": 27,
-            "validated_concurrency_limit": 30,
+            "desired_simulations": 500,
+            "effective_simulations": 497,
+            "validated_concurrency_limit": 500,
+            "min_desired_simulations": 0,
+            "max_desired_simulations": 500,
+            "control_enabled": True,
             "scale_down_mode": "drain",
         },
     }
@@ -182,11 +205,11 @@ def test_pool_gate_keeps_total_demand_separate_from_active_30():
 
     with patch.object(q22, "_http_json", side_effect=response):
         _, target = q22.verify_pool_and_policy("http://scheduler")
-    assert target == 27
+    assert target == 497
 
-    pool["config"]["target_project_concurrency"] = 500
+    pool["config"]["max_aedt_sessions"] = 166
     with patch.object(q22, "_http_json", side_effect=response):
-        with pytest.raises(q22.GateError, match="10x3/30"):
+        with pytest.raises(q22.GateError, match="167x3"):
             q22.verify_pool_and_policy("http://scheduler")
 
 
@@ -208,7 +231,7 @@ def test_owned_serials_reject_unrelated_feeder_mutation(tmp_path):
         q22.verify_owned_serials(db, manifest, 102)
 
 
-def test_feeder_exact_remaining_cap_and_deterministic_account_pins():
+def test_feeder_unbounded_pool_refills_498_back_to_500_with_account_pins():
     initial_state = {"serial": 100, "submitted_samples": 0}
     submitted = []
 
@@ -219,14 +242,14 @@ def test_feeder_exact_remaining_cap_and_deterministic_account_pins():
         submitted.append((name, kwargs["account_name"]))
         return 9000 + len(submitted)
 
-    campaign_counts = {"queued": 0, "attaching": 0, "running": 0}
+    campaign_counts = {"queued": 0, "attaching": 0, "running": 498}
     capacity = {
-        "ready_fit_slots": 30,
-        "project_submission_slots": 500,
+        "ready_fit_slots": 2,
+        "project_submission_slots": 2,
         "submission_allowed": True,
         "queue_state": "ready",
         "queue_reason": "",
-        "project_active": 0,
+        "project_active": 498,
     }
     with ExitStack() as stack:
         stack.enter_context(patch.object(
@@ -238,10 +261,10 @@ def test_feeder_exact_remaining_cap_and_deterministic_account_pins():
             return_value=(campaign_counts, {}, [], capacity),
         ))
         stack.enter_context(patch.object(
-            feeder, "cpu_submission_headroom", return_value=(30, 100, 100, 0)
+            feeder, "cpu_submission_headroom", return_value=(2, 2000, 8, 498)
         ))
         stack.enter_context(patch.object(
-            feeder, "dataset_collection_snapshot", return_value=(0, set())
+            feeder, "dataset_collection_snapshot", return_value=(2_000_000_000, set())
         ))
         stack.enter_context(patch.object(feeder, "campaign_inventory", return_value=[]))
         stack.enter_context(patch.object(feeder, "reserved_unjudged_rows", return_value=0))
@@ -255,15 +278,14 @@ def test_feeder_exact_remaining_cap_and_deterministic_account_pins():
         stack.enter_context(patch.object(feeder, "save_state"))
         stack.enter_context(patch.object(feeder.time, "sleep"))
         feeder._step_locked(
-            10_000,
-            target=30,
+            None,
+            target=500,
             solver_revision="a" * 40,
             library_revision="b" * 40,
             _pooled_submission={
                 "aedt_backend": "pooled",
                 "account_names": ("account-a", "account-b", "account-c"),
             },
-            _max_new_tasks=2,
         )
 
     assert submitted == [
@@ -271,6 +293,66 @@ def test_feeder_exact_remaining_cap_and_deterministic_account_pins():
         ("mft-camp-saaaaaaa-lbbbbbbb-00102", "account-c"),
     ]
     assert initial_state["serial"] == 102
+
+
+def test_execute_cycle_has_no_submission_ceiling_and_refills_target_500(tmp_path):
+    args = q22._parser().parse_args([])
+    args.state_dir = tmp_path
+    args.eligible_accounts = q22.DEFAULT_ELIGIBLE_ACCOUNTS
+    manifest = {
+        "baseline_serial": 100,
+        "identity_sha256": "identity",
+        "eligible_accounts": list(args.eligible_accounts),
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(q22, "run_live_gates", return_value={}))
+        stack.enter_context(patch.object(
+            feeder, "campaign_mutation_lock", return_value=nullcontext()
+        ))
+        stack.enter_context(patch.object(
+            q22, "verify_pool_and_policy", return_value=({}, 500)
+        ))
+        stack.enter_context(patch.object(q22, "_state_serial", side_effect=[100, 102]))
+        stack.enter_context(patch.object(q22, "verify_owned_serials"))
+        stack.enter_context(patch.object(
+            q22, "pooled_submission", return_value={"aedt_backend": "pooled"}
+        ))
+        step = stack.enter_context(patch.object(feeder, "step"))
+        status = q22.execute_cycle(args, manifest)
+
+    assert step.call_args.args[0] is None
+    assert step.call_args.kwargs["target"] == 500
+    assert "max_new_tasks" not in step.call_args.kwargs
+    assert status["phase"] == "open-ended-refill"
+    assert status["submission_ceiling"] is None
+    assert status["progress"]["accepted_simulations"] == 2
+
+
+def test_uncertain_submission_becomes_next_cycle_same_dedupe_reconciliation(tmp_path):
+    args = q22._parser().parse_args([])
+    args.state_dir = tmp_path
+    manifest = {
+        "baseline_serial": 100,
+        "identity_sha256": "identity",
+        "eligible_accounts": list(q22.DEFAULT_ELIGIBLE_ACCOUNTS),
+    }
+    recovered = {"phase": "open-ended-refill"}
+    with patch.object(
+        q22,
+        "execute_cycle",
+        side_effect=[
+            feeder.scheduler_client.TaskSubmissionUncertain("lost POST response"),
+            recovered,
+        ],
+    ) as execute, patch.object(q22, "_state_serial", return_value=101):
+        uncertain = q22.controller_cycle_status(args, manifest)
+        next_cycle = q22.controller_cycle_status(args, manifest)
+
+    assert uncertain["phase"] == "submission-uncertain-reconcile-next-cycle"
+    assert uncertain["same_dedupe_retry"] is True
+    assert uncertain["no_cancellation_performed"] is True
+    assert next_cycle is recovered
+    assert execute.call_count == 2
 
 
 @pytest.mark.parametrize("value", [-1, True, 1.5, "1"])
