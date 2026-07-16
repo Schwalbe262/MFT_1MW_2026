@@ -10,6 +10,7 @@ the writer lock themselves; callers must never wrap them in the same lock.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import hashlib
 import json
@@ -760,7 +761,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
     target_revision_cohorts = {}
     artifact_sha256 = {}
     try:
-        for target in targets:
+        def train_one(target):
             if target not in frame.columns:
                 raise RuntimeError(f"required target column is missing: {target}")
             bundle, metrics = train_target(
@@ -782,6 +783,10 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
                     f"required target {target} did not report "
                     "physics_data_revision_cohort metadata"
                 )
+            return target, bundle, metrics, revision_cohort
+
+        def persist_trained(result):
+            target, bundle, metrics, revision_cohort = result
             bundle.update(
                 {
                     "training_run_id": run_id,
@@ -814,6 +819,22 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
                 f"P90={metrics['p90_ape_pct']:.2f}% "
                 f"coverage={metrics['interval_coverage']:.3f}"
             )
+
+        target_workers = int(getattr(args, "target_workers", 1) or 1)
+        if target_workers == 1:
+            for target in targets:
+                persist_trained(train_one(target))
+        else:
+            # Targets are independent and the frame is read-only. Each model
+            # library is separately bounded by --model-threads, so the caller
+            # can use target_workers * model_threads as one explicit budget.
+            with ThreadPoolExecutor(max_workers=target_workers) as executor:
+                futures = {
+                    executor.submit(train_one, target): target
+                    for target in targets
+                }
+                for future in as_completed(futures):
+                    persist_trained(future.result())
 
         report = {
             "schema_version": REGISTRY_SCHEMA_VERSION,
@@ -892,6 +913,10 @@ def main():
         "--model-threads", type=int, default=None,
         help="maximum threads used by each model fit (execution-only)",
     )
+    parser.add_argument(
+        "--target-workers", type=int, default=1,
+        help="number of independent targets trained concurrently (default: 1)",
+    )
     args = parser.parse_args()
 
     from quality_contract import annotate_validity
@@ -911,6 +936,8 @@ def main():
         parser.error("lock timeout must be non-negative")
     if args.model_threads is not None and args.model_threads < 1:
         parser.error("model threads must be positive")
+    if args.target_workers < 1:
+        parser.error("target workers must be positive")
 
     raw = pd.read_parquet(args.dataset)
     frame = to_physical(annotate_validity(raw, args.profile))

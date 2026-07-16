@@ -204,12 +204,14 @@ def main():
     parser.add_argument("--solver-revision", required=True)
     parser.add_argument("--library-revision", required=True)
     parser.add_argument("--model-threads", type=int, default=12)
+    parser.add_argument("--target-workers", type=int, default=1)
     parser.add_argument("--trials-per-job", type=int, default=50)
     parser.add_argument("--hpo-threads-per-job", type=int, default=3)
     parser.add_argument("--poll-seconds", type=int, default=10)
     args = parser.parse_args()
     if (
-        args.model_threads < 1 or args.poll_seconds < 1
+        args.model_threads < 1 or args.target_workers < 1
+        or args.poll_seconds < 1
         or args.trials_per_job < 1 or args.hpo_threads_per_job < 1
     ):
         parser.error("thread and poll budgets must be positive")
@@ -272,6 +274,7 @@ def main():
         "--profile", os.path.abspath(args.profile),
         "--params", str(merged_params),
         "--model-threads", str(args.model_threads),
+        "--target-workers", str(args.target_workers),
         "--result-json", str(candidate_result),
         "--source-dataset-path", os.path.abspath(args.dataset),
     ]
@@ -292,6 +295,11 @@ def main():
             merged_params=str(merged_params),
             merged_params_sha256=sha256_file(merged_params),
             strict_snapshot=strict_snapshot_evidence,
+            candidate_target_workers=args.target_workers,
+            candidate_model_threads=args.model_threads,
+            candidate_total_thread_budget=(
+                args.target_workers * args.model_threads
+            ),
         )
     candidate = _read_json(candidate_result)
     quality = build_experimental_quality(
