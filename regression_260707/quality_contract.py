@@ -98,6 +98,28 @@ PHYSICS_EQUIVALENT_SOLVER_REVISIONS: dict[str, frozenset[str]] = {
         "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
         "092a35bb6e9552fa9c0ef7388c6059606844f2cd",
     }),
+    # Reviewed 2026-07-16 rolling q24 successor. 8fab610 uses AEDT 2025.2's
+    # supported nonblocking Analyze call, retains a bounded launch-settle lock,
+    # polls exact project/design terminal evidence with short transactions, and
+    # locks extraction. The separate mft_validated_async scheduler family is
+    # the only family authorized for three native-solve permits. The change is
+    # transport/lifecycle-only: geometry, materials, setup values, expressions,
+    # result definitions, and PHYSICS_DATA_REVISION are unchanged.
+    # Directionality is deliberate: a q24 model may consume the exact reviewed
+    # predecessor cohort, but older expected revisions do not silently accept
+    # this future runtime.
+    "8fab610dfca7180732bd0b38923aa6c71e2129bb": frozenset({
+        "26afff8de2936f605783395fbff19d5f1d26b354",
+        "262574a886cef9e0f8f550d12571cf6d54c826e2",
+        "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7",
+        "66ee6685859c207eafdca796120e2e1643f72f5c",
+        "f0271da72ff4b9f085b3927769c583c163792adb",
+        "f411bf5492669f87896eb657b9e5db2998d219a7",
+        "1a5f904214fb39bc83e52f3cc5da6d30977ada34",
+        "c7a0c792e2babc74ad1596a6b95b45379a6f903d",
+        "092a35bb6e9552fa9c0ef7388c6059606844f2cd",
+        "8b1a65ca46509b0fe3fe64420709dea2d15de1a4",
+    }),
 }
 # Explicitly not enrolled: these physics-adjacent diffs remain unreviewed.
 # dba903eb671e37642168afc5578b8e6a93e9c046
