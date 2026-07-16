@@ -41,7 +41,7 @@ class OrchestratorTests(unittest.TestCase):
                     for index, value in enumerate(command)
                     if value == "--extra-prefix"
                 ],
-                ["mft-1to3", "mft-mixed", "mft-9way"],
+                ["mft-1to3", "mft-1x3", "mft-mixed", "mft-9way"],
             )
             train_dependencies = queue.dependencies(result.jobs["train"])
             self.assertEqual([job.id for job in train_dependencies], [result.jobs["tune"]])
