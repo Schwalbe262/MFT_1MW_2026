@@ -20,6 +20,7 @@ class EnsemblePredictor:
         self.features = bundle["features"]
         self.kind = bundle["transform"]
         self.q90 = bundle["q90"]
+        self.inference_threads = None
         self.sigma_floor_policy = bundle.get(
             "sigma_floor_policy", LEGACY_SIGMA_FLOOR_POLICY
         )
@@ -30,6 +31,68 @@ class EnsemblePredictor:
             raise RuntimeError(
                 f"unsupported sigma floor policy: {self.sigma_floor_policy}"
             )
+
+    def configure_inference_threads(self, threads=1):
+        """Bound nested model prediction parallelism for outer-parallel jobs.
+
+        NSGA-II already parallelizes independent restarts.  Letting every
+        ensemble member also use all host cores creates nested joblib/OpenMP
+        pools, repeated sklearn warnings and severe oversubscription.  Keep
+        the default unchanged for other consumers; optimization explicitly
+        opts into this bound after loading its pinned model generation.
+        """
+
+        if isinstance(threads, bool):
+            raise ValueError("inference threads must be a positive integer")
+        try:
+            normalized = int(threads)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "inference threads must be a positive integer"
+            ) from exc
+        if normalized < 1 or normalized > 4:
+            raise ValueError("inference threads must be between 1 and 4")
+        supported = {"lightgbm", "xgboost", "catboost", "extratrees"}
+        configured = []
+        for family, model in self.bundle["models"]:
+            family_name = str(family).lower()
+            if family_name not in supported:
+                raise RuntimeError(
+                    f"cannot bound unsupported ensemble family: {family}"
+                )
+            if family_name != "catboost":
+                if not hasattr(model, "n_jobs"):
+                    raise RuntimeError(
+                        f"{family_name} model has no n_jobs inference control"
+                    )
+                model.n_jobs = normalized
+                if int(model.n_jobs) != normalized:
+                    raise RuntimeError(
+                        f"failed to bind {family_name} inference threads"
+                    )
+            configured.append(family_name)
+        self.inference_threads = normalized
+        return {
+            "threads": normalized,
+            "model_count": len(configured),
+            "families": configured,
+        }
+
+    def _predict_model(self, family, model, frame):
+        if (
+            self.inference_threads is not None
+            and str(family).lower() == "catboost"
+        ):
+            return model.predict(
+                frame, thread_count=int(self.inference_threads)
+            )
+        return model.predict(frame)
+
+    def _transformed_predictions(self, frame):
+        return np.stack([
+            self._predict_model(family, model, frame)
+            for family, model in self.bundle["models"]
+        ])
 
     @classmethod
     def load(cls, target, registry=REGISTRY):
@@ -63,7 +126,7 @@ class EnsemblePredictor:
     def predict_mu_sigma(self, X_df, conformal=True):
         """X_df: 특징 프레임 (여분 컬럼 무시). 반환: (mu, sigma) 원공간, sigma는 q90 보정 반폭."""
         X = X_df.reindex(columns=self.features).fillna(0.0)
-        preds_t = np.stack([m.predict(X) for _, m in self.bundle["models"]])
+        preds_t = self._transformed_predictions(X)
         mu_t = np.median(preds_t, axis=0)
         sg_t = preds_t.std(axis=0)
         mu = inverse_y(mu_t, self.kind)
@@ -82,7 +145,7 @@ class EnsemblePredictor:
     def disagreement(self, X_df):
         """앙상블 불일치 (원공간 max-min 폭) - 신뢰 게이트용"""
         X = X_df.reindex(columns=self.features).fillna(0.0)
-        preds_t = np.stack([m.predict(X) for _, m in self.bundle["models"]])
+        preds_t = self._transformed_predictions(X)
         lo = inverse_y(preds_t.min(axis=0), self.kind)
         hi = inverse_y(preds_t.max(axis=0), self.kind)
         return hi - lo

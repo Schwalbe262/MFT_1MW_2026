@@ -80,6 +80,12 @@ PHYSICS_EQUIVALENT_SOLVER_REVISIONS: dict[str, frozenset[str]] = {
     # expressions, and PHYSICS_DATA_REVISION are unchanged.  Keep the runtime
     # solver pin at 26afff8 while reusing the already approved physical rows.
     "26afff8de2936f605783395fbff19d5f1d26b354": frozenset({
+        # Reviewed 2026-07-16: 26afff8..267860a changes only pooled
+        # Desktop automation ownership, native solve-window scheduling, and
+        # cross-account AEDT result-directory permissions.  The guarded
+        # standalone physics path and all geometry/material/setup/expression
+        # definitions are unchanged.
+        "267860a86dc8c8017c4b713f6674c0614cc365ce",
         "262574a886cef9e0f8f550d12571cf6d54c826e2",
         "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7",
         "66ee6685859c207eafdca796120e2e1643f72f5c",

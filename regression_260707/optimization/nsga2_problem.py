@@ -55,6 +55,17 @@ DEFAULT_SPEC = {
 T_TARGETS = list(SURROGATE_TEMPERATURE_TARGETS)
 POST_TEMPERATURE_CONSTRAINT = 1 + len(T_TARGETS)
 N_IEQ_CONSTRAINTS = POST_TEMPERATURE_CONSTRAINT + 5
+CONSTRAINT_NAMES = (
+    "Llt_robust_band",
+    *(f"temperature_robust_limit:{target}" for target in T_TARGETS),
+    "analytical_flux_density_limit",
+    "decoded_space_shrink",
+    "secondary_vertical_insulation",
+    "strict_full_density_support",
+    "Llt_ensemble_disagreement",
+)
+if len(CONSTRAINT_NAMES) != N_IEQ_CONSTRAINTS:
+    raise RuntimeError("NSGA constraint name/schema length mismatch")
 
 # NSGA keeps the append-only Sobol chromosome for warm-start compatibility,
 # but these physical dimensions are fixed in both its bounds and decoder.
@@ -91,6 +102,7 @@ class MFTProblem(Problem):
         self.models = models
         self.spec = dict(DEFAULT_SPEC, **(spec or {}))
         self.density_gate = density_gate
+        self.constraint_names = CONSTRAINT_NAMES
         supplied_overrides = dict(fixed_overrides or {})
         for name, expected in NSGA_FIXED_THERMAL_STACK_MM.items():
             if name in supplied_overrides and not np.isclose(

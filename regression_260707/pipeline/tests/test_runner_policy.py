@@ -8,8 +8,10 @@ import threading
 import time
 import unittest
 from unittest import mock
+import warnings
 
 import numpy as np
+import pandas as pd
 
 from regression_260707.pipeline.artifacts import GenerationStore
 from regression_260707.pipeline.policy import (
@@ -324,6 +326,168 @@ class RunnerTests(unittest.TestCase):
 
 
 class NsgaParallelTests(unittest.TestCase):
+    def _experimental_quality_fixture(self, root):
+        from regression_260707.optimization import run_nsga2
+        import hashlib
+
+        generation = root / "registry" / "generations" / "run-1"
+        generation.mkdir(parents=True)
+        dataset = root / "strict.parquet"
+        dataset.write_bytes(b"strict-2188")
+        dataset_sha = hashlib.sha256(dataset.read_bytes()).hexdigest()
+        report = {
+            "training_run_id": "run-1",
+            "dataset_sha256": dataset_sha,
+            "strict_full_rows": 2188,
+        }
+        report_path = generation / "train_report.json"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        quality = {
+            "schema_version": 1,
+            "lane": "provisional_2000_surrogate",
+            "passed": False,
+            "activation_performed": False,
+            "nsga2_enqueued": False,
+            "verification_enqueued": False,
+            "strict_full_rows": 2188,
+            "production_minimum_strict_full_rows": 3000,
+            "provisional_minimum_strict_full_rows": 2000,
+            "solver_revision_pin": "a" * 40,
+            "library_revision_pin": "b" * 40,
+            "dataset_sha256": dataset_sha,
+            "generation_report_sha256": hashlib.sha256(
+                report_path.read_bytes()
+            ).hexdigest(),
+            "failed_targets": {"Llt_phys": ["mape_pct"]},
+            "terminal_reason": "provisional_quality_gate_failed",
+        }
+        quality_path = root / "quality.json"
+        quality_path.write_text(json.dumps(quality), encoding="utf-8")
+        return run_nsga2, generation, dataset, report, quality, quality_path
+
+    def test_experimental_quality_is_fail_closed_and_revision_pinned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = self._experimental_quality_fixture(root)
+            run_nsga2, generation, dataset, report, quality, quality_path = values
+            normalized = run_nsga2._experimental_quality_contract(
+                quality, quality_path, report, generation, dataset
+            )
+            self.assertFalse(normalized["passed"])
+            self.assertEqual(normalized["training_run_id"], "run-1")
+            self.assertEqual(normalized["solver_revision"], "a" * 40)
+            self.assertEqual(normalized["library_revision"], "b" * 40)
+            self.assertEqual(len(normalized["quality_status_sha256"]), 64)
+
+            quality["passed"] = True
+            with self.assertRaisesRegex(SystemExit, "contract mismatch"):
+                run_nsga2._experimental_quality_contract(
+                    quality, quality_path, report, generation, dataset
+                )
+
+    def test_experimental_quality_rejects_tampered_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = self._experimental_quality_fixture(root)
+            run_nsga2, generation, dataset, report, quality, quality_path = values
+            (generation / "train_report.json").write_text(
+                json.dumps({**report, "strict_full_rows": 2189}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "identity mismatch"):
+                run_nsga2._experimental_quality_contract(
+                    quality, quality_path, report, generation, dataset
+                )
+
+    def test_experimental_models_authenticate_without_production_acceptance(self):
+        from regression_260707.optimization import run_nsga2
+        import predictor
+        import train_models
+
+        record = {"generation": "sealed", "report": {"artifacts": {"x": "y"}}}
+        with mock.patch.object(
+            train_models, "load_generation", return_value=record
+        ) as load_generation, mock.patch.object(
+            predictor.EnsemblePredictor,
+            "_load_record",
+            side_effect=lambda target, active: (target, active),
+        ):
+            models = run_nsga2.load_models(
+                "registry", "generation", allow_unaccepted=True
+            )
+        load_generation.assert_called_once_with(
+            "registry", "generation", require_accepted=False
+        )
+        self.assertEqual(set(models), set(run_nsga2.REQUIRED_MODEL_TARGETS))
+        self.assertTrue(all(value[1] is record for value in models.values()))
+
+    def test_nsga_bounds_nested_ensemble_inference_and_suppresses_joblib_warning(self):
+        from regression_260707.optimization import run_nsga2
+        import predictor
+
+        class JoblibModel:
+            def __init__(self):
+                self.n_jobs = -1
+
+            def predict(self, frame):
+                if self.n_jobs != 1:
+                    warnings.warn(
+                        "sklearn.utils.parallel.delayed should be used",
+                        UserWarning,
+                    )
+                return np.ones(len(frame), dtype=float)
+
+        class CatBoostModel:
+            def __init__(self):
+                self.thread_counts = []
+
+            def predict(self, frame, thread_count=None):
+                self.thread_counts.append(thread_count)
+                return np.full(len(frame), 2.0, dtype=float)
+
+        joblib_model = JoblibModel()
+        catboost_model = CatBoostModel()
+        ensemble = predictor.EnsemblePredictor({
+            "models": [
+                ("extratrees", joblib_model),
+                ("catboost", catboost_model),
+            ],
+            "features": ["x"],
+            "transform": "identity",
+            "q90": 1.0,
+        })
+
+        evidence = run_nsga2._bound_surrogate_inference(
+            {"Llt_phys": ensemble}, threads=1
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ensemble.predict_mu_sigma(pd.DataFrame({"x": [0.0, 1.0]}))
+            ensemble.disagreement(pd.DataFrame({"x": [0.0, 1.0]}))
+
+        self.assertEqual(caught, [])
+        self.assertEqual(joblib_model.n_jobs, 1)
+        self.assertEqual(catboost_model.thread_counts, [1, 1])
+        self.assertEqual(evidence, {
+            "threads_per_model": 1,
+            "target_count": 1,
+            "model_count": 2,
+            "families": ["catboost", "extratrees"],
+            "policy": "outer_restart_parallelism_inner_model_serial_v1",
+        })
+
+    def test_nsga_inference_bound_rejects_unknown_nested_parallelism(self):
+        import predictor
+
+        ensemble = predictor.EnsemblePredictor({
+            "models": [("unknown", object())],
+            "features": ["x"],
+            "transform": "identity",
+            "q90": 1.0,
+        })
+        with self.assertRaisesRegex(RuntimeError, "unsupported ensemble family"):
+            ensemble.configure_inference_threads(1)
+
     def test_restarts_are_parallel_bounded_and_returned_in_seed_order(self):
         from regression_260707.optimization import run_nsga2
 
@@ -342,6 +506,38 @@ class NsgaParallelTests(unittest.TestCase):
         self.assertEqual([int(item[0][0, 0]) for item in results], [1000, 1001, 1002, 1003])
         with self.assertRaisesRegex(ValueError, "between 1 and 4"):
             run_nsga2.run_restarts(object(), 16, 200, workers=5)
+
+    def test_infeasible_population_report_uses_stable_constraint_schema(self):
+        from regression_260707.optimization import nsga2_problem, run_nsga2
+
+        names = nsga2_problem.CONSTRAINT_NAMES
+        self.assertEqual(len(names), nsga2_problem.N_IEQ_CONSTRAINTS)
+        self.assertEqual(names[0], "Llt_robust_band")
+        self.assertEqual(names[-1], "Llt_ensemble_disagreement")
+
+        constraints = np.full((2, len(names)), -1.0)
+        constraints[0, 0] = 2.0
+        constraints[1, 0] = 0.25
+        constraints[1, 1] = 0.5
+        chromosomes = np.vstack((
+            np.zeros(3, dtype=float),
+            np.ones(3, dtype=float),
+        ))
+
+        class Population:
+            def get(self, key):
+                return {"G": constraints, "X": chromosomes}[key]
+
+        report = run_nsga2._population_infeasibility(Population(), names)
+        self.assertTrue(report["available"])
+        self.assertEqual(report["population_size"], 2)
+        self.assertEqual(report["feasible_count"], 0)
+        self.assertEqual(report["closest_candidate"]["population_index"], 1)
+        by_name = {item["name"]: item for item in report["constraints"]}
+        self.assertEqual(by_name["Llt_robust_band"]["passing_count"], 0)
+        self.assertEqual(
+            by_name[names[2]]["passing_count"], 2
+        )
 
     def test_al_driver_no_longer_promotes_models(self):
         from regression_260707 import al_driver

@@ -16,7 +16,7 @@ from regression_260707.pipeline.scheduler_verification import (
 
 class VerificationAdapterTests(unittest.TestCase):
     @staticmethod
-    def _optimization(store, root, count=40):
+    def _optimization(store, root, count=40, include_fea_revisions=True):
         source = root / "optimization"
         source.mkdir()
         pd.DataFrame(
@@ -27,13 +27,19 @@ class VerificationAdapterTests(unittest.TestCase):
             }
         ).to_csv(source / "pareto_front.csv", index=False)
         np.save(source / "pareto_X.npy", np.arange(count * 2).reshape(count, 2))
+        manifest = {
+            "solver_revision": "a" * 40,
+            "library_revision": "b" * 40,
+            "training_solver_revision": "a" * 40,
+            "training_library_revision": "b" * 40,
+        }
+        if include_fea_revisions:
+            manifest.update({
+                "fea_solver_revision": "c" * 40,
+                "fea_library_revision": "d" * 40,
+            })
         (source / "optimization_manifest.json").write_text(
-            json.dumps(
-                {
-                    "solver_revision": "a" * 40,
-                    "library_revision": "b" * 40,
-                }
-            ),
+            json.dumps(manifest),
             encoding="utf-8",
         )
         return store.publish_tree("optimization", source)
@@ -89,6 +95,10 @@ class VerificationAdapterTests(unittest.TestCase):
                 (standard_output / "selection.json").read_text(encoding="utf-8")
             )
             self.assertEqual(len(standard_request["candidates"]), 33)
+            self.assertEqual(standard_request["solver_revision"], "c" * 40)
+            self.assertEqual(
+                standard_request["training_solver_revision"], "a" * 40
+            )
 
             standard = store.publish_tree(
                 "verification_standard", standard_output
@@ -111,6 +121,10 @@ class VerificationAdapterTests(unittest.TestCase):
                 (fine_output / "selection.json").read_text(encoding="utf-8")
             )
             self.assertEqual(len(fine_request["candidates"]), 3)
+            self.assertEqual(fine_request["solver_revision"], "c" * 40)
+            self.assertEqual(
+                fine_request["training_solver_revision"], "a" * 40
+            )
             expected = [
                 item["candidate_id"]
                 for item in standard_request["candidates"][-3:][::-1]
@@ -145,6 +159,22 @@ class VerificationAdapterTests(unittest.TestCase):
                     optimization.path,
                     root / "output",
                     3,
+                    {"adapter": "mft_scheduler_v1"},
+                )
+
+    def test_training_revision_cannot_be_reused_as_implicit_fea_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = GenerationStore(root / "artifacts")
+            optimization = self._optimization(
+                store, root, include_fea_revisions=False
+            )
+            with self.assertRaisesRegex(RuntimeError, "separate exact training/FEA"):
+                verification_adapter.run(
+                    "standard",
+                    optimization.path,
+                    root / "output",
+                    33,
                     {"adapter": "mft_scheduler_v1"},
                 )
 
