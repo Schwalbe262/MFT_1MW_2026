@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 import psutil
@@ -102,6 +103,76 @@ def _merge_params(jobs, output):
     return evidence
 
 
+def _strict_snapshot(
+    source, output_root, profile, solver_revision, library_revision,
+    inspector=None,
+):
+    """Build a local immutable candidate cohort with exact revision pins."""
+    if inspector is None:
+        from checkpoint_orchestrator import inspect_dataset
+        inspector = inspect_dataset
+
+    source = os.path.abspath(source)
+    source_sha256 = sha256_file(source)
+    snapshot_root = Path(output_root).resolve() / "snapshots"
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshot_root / (
+        f"strict_{source_sha256[:16]}_{solver_revision[:12]}.parquet"
+    )
+    evidence_path = snapshot.with_suffix(".json")
+    if snapshot.is_file() and evidence_path.is_file():
+        evidence = _read_json(evidence_path)
+        expected = {
+            "source_dataset_sha256": source_sha256,
+            "solver_revision": solver_revision,
+            "library_revision": library_revision,
+            "snapshot_sha256": sha256_file(snapshot),
+        }
+        if all(evidence.get(key) == value for key, value in expected.items()):
+            return str(snapshot), evidence
+
+    raw, audited, strict, quarantine = inspector(
+        source, profile, solver_revision, library_revision
+    )
+    clean = strict.drop(
+        columns=[
+            "_strict_valid_em", "_strict_valid_thermal",
+            "_strict_valid_full", "_strict_invalid_reasons",
+        ],
+        errors="ignore",
+    )
+    fd, staged = tempfile.mkstemp(
+        prefix=f".{snapshot.name}.", suffix=".tmp", dir=snapshot_root
+    )
+    os.close(fd)
+    try:
+        clean.to_parquet(staged, index=False)
+        os.replace(staged, snapshot)
+    finally:
+        try:
+            os.remove(staged)
+        except FileNotFoundError:
+            pass
+    evidence = {
+        "schema_version": 1,
+        "created_at": _now(),
+        "source_dataset": source,
+        "source_dataset_sha256": source_sha256,
+        "snapshot": str(snapshot),
+        "snapshot_sha256": sha256_file(snapshot),
+        "raw_rows": int(len(raw)),
+        "strict_em_rows": int(audited["_strict_valid_em"].sum()),
+        "strict_full_rows": int(len(strict)),
+        "quarantined_rows": int(len(raw) - len(strict)),
+        "quarantine_reasons": quarantine,
+        "solver_revision": solver_revision,
+        "library_revision": library_revision,
+        "profile": os.path.abspath(profile),
+    }
+    atomic_json(evidence_path, evidence)
+    return str(snapshot), evidence
+
+
 def _wait_process(process, status_path, jobs, phase, poll, **extra):
     while process.poll() is None:
         _status(
@@ -110,6 +181,11 @@ def _wait_process(process, status_path, jobs, phase, poll, **extra):
         )
         time.sleep(poll)
     if process.returncode:
+        _status(
+            status_path, f"{phase}_failed_retryable", jobs,
+            worker_pid=process.pid, worker_command=process.args,
+            error=f"{phase} process exited {process.returncode}", **extra,
+        )
         raise RuntimeError(f"{phase} process exited {process.returncode}")
 
 
@@ -182,17 +258,22 @@ def main():
 
     merged_params = work / "merged_params.json"
     tuning_evidence = _merge_params(jobs, merged_params)
+    training_dataset, strict_snapshot_evidence = _strict_snapshot(
+        args.dataset, work, args.profile,
+        args.solver_revision.lower(), args.library_revision.lower(),
+    )
     candidate_result = work / "candidate_result.json"
     training_log = work / "candidate_training.log"
     command = [
         sys.executable,
         str(Path(__file__).resolve().parent / "train_models.py"),
-        "--dataset", os.path.abspath(args.dataset),
+        "--dataset", training_dataset,
         "--registry", os.path.abspath(args.registry),
         "--profile", os.path.abspath(args.profile),
         "--params", str(merged_params),
         "--model-threads", str(args.model_threads),
         "--result-json", str(candidate_result),
+        "--source-dataset-path", os.path.abspath(args.dataset),
     ]
     if args.source_dataset_generation:
         command.extend([
@@ -210,17 +291,18 @@ def main():
             tuning_evidence=tuning_evidence,
             merged_params=str(merged_params),
             merged_params_sha256=sha256_file(merged_params),
+            strict_snapshot=strict_snapshot_evidence,
         )
     candidate = _read_json(candidate_result)
     quality = build_experimental_quality(
-        args.registry, candidate["generation"], args.dataset,
+        args.registry, candidate["generation"], training_dataset,
         args.thresholds, args.profile,
         args.solver_revision, args.library_revision,
     )
     result = publish_if_better(
         registry=args.registry,
         generation=candidate["generation"],
-        dataset=args.dataset,
+        dataset=training_dataset,
         quality=quality,
         evidence_root=root / "evidence",
         pointer_path=args.pointer,
@@ -234,6 +316,7 @@ def main():
         "candidate_promoted" if result["promoted"] else "candidate_rejected",
         jobs, supervisor_pid=os.getpid(), result=result,
         tuning_evidence=tuning_evidence,
+        strict_snapshot=strict_snapshot_evidence,
     )
     print(json.dumps(result, ensure_ascii=False), flush=True)
 

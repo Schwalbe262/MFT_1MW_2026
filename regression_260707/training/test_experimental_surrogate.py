@@ -2,7 +2,9 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import pandas as pd
 
+from regression_260707.training import experimental_refresh as refresh
 from regression_260707.training import experimental_surrogate as experimental
 
 
@@ -100,3 +102,33 @@ def test_better_candidate_updates_audit_pointer_and_nsga_source_identically():
         active = experimental.validate_source_descriptor(source)
         assert active["record"]["report"]["training_run_id"] == "candidate"
         assert active["source"]["eligibility"] == "FEA-NOT-APPROVED"
+
+
+def test_candidate_snapshot_contains_only_exact_pinned_strict_rows():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "train.parquet"
+        source.write_bytes(b"immutable source identity")
+        audited = pd.DataFrame({
+            "physics_data_revision": ["v3", "legacy_unspecified"],
+            "value": [1.0, 2.0],
+            "_strict_valid_em": [True, False],
+            "_strict_valid_thermal": [True, False],
+            "_strict_valid_full": [True, False],
+            "_strict_invalid_reasons": ["", "revision_mismatch"],
+        })
+        strict = audited.iloc[[0]].copy()
+        snapshot, evidence = refresh._strict_snapshot(
+            source, root / "work", root / "profile.json",
+            "1" * 40, "2" * 40,
+            inspector=lambda *_: (
+                audited, audited, strict, {"revision_mismatch": 1}
+            ),
+        )
+
+        candidate = pd.read_parquet(snapshot)
+        assert candidate["physics_data_revision"].tolist() == ["v3"]
+        assert not any(column.startswith("_strict_") for column in candidate)
+        assert evidence["strict_full_rows"] == 1
+        assert evidence["solver_revision"] == "1" * 40
+        assert evidence["snapshot_sha256"] == experimental.sha256_file(snapshot)
