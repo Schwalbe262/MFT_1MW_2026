@@ -128,9 +128,14 @@ def main():
     parser.add_argument("--solver-revision", required=True)
     parser.add_argument("--library-revision", required=True)
     parser.add_argument("--model-threads", type=int, default=12)
+    parser.add_argument("--trials-per-job", type=int, default=50)
+    parser.add_argument("--hpo-threads-per-job", type=int, default=3)
     parser.add_argument("--poll-seconds", type=int, default=10)
     args = parser.parse_args()
-    if args.model_threads < 1 or args.poll_seconds < 1:
+    if (
+        args.model_threads < 1 or args.poll_seconds < 1
+        or args.trials_per_job < 1 or args.hpo_threads_per_job < 1
+    ):
         parser.error("thread and poll budgets must be positive")
 
     root = Path(args.runtime_root).resolve()
@@ -138,12 +143,21 @@ def main():
     status_path = root / "status.json"
     work = root / "refresh_work"
     work.mkdir(parents=True, exist_ok=True)
-    jobs = args.job
+    jobs = [
+        {
+            **job,
+            "trials": args.trials_per_job,
+            "model_threads": args.hpo_threads_per_job,
+        }
+        for job in args.job
+    ]
     _status(
         status_path, "experimental_hpo", jobs,
         supervisor_pid=os.getpid(), dataset=os.path.abspath(args.dataset),
         dataset_sha256=sha256_file(args.dataset),
-        total_model_thread_budget=sum(3 for _ in jobs),
+        trials_per_job=args.trials_per_job,
+        total_trials=args.trials_per_job * len(jobs),
+        total_model_thread_budget=args.hpo_threads_per_job * len(jobs),
     )
     while True:
         states = [_process_state(job["pid"]) for job in jobs]
@@ -160,7 +174,9 @@ def main():
             status_path, "experimental_hpo", jobs,
             supervisor_pid=os.getpid(), dataset=os.path.abspath(args.dataset),
             dataset_sha256=sha256_file(args.dataset),
-            total_model_thread_budget=sum(3 for _ in jobs),
+            trials_per_job=args.trials_per_job,
+            total_trials=args.trials_per_job * len(jobs),
+            total_model_thread_budget=args.hpo_threads_per_job * len(jobs),
         )
         time.sleep(args.poll_seconds)
 
