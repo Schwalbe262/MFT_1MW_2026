@@ -40,6 +40,9 @@ LIBRARY_REVISION = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
 COMPATIBILITY_PATH = Path(__file__).with_name(
     "q24_validated_async_aedt_compatibility.json"
 )
+SUCCESSOR_COMPATIBILITY_PATH = Path(__file__).with_name(
+    "q24_validated_async_aedt_successors.json"
+)
 DEFAULT_ELIGIBLE_ACCOUNTS = q23.DEFAULT_ELIGIBLE_ACCOUNTS
 ACTIVE_STATES = ("queued", "attaching", "running")
 PREDECESSOR_GENERATION = (
@@ -48,6 +51,7 @@ PREDECESSOR_GENERATION = (
 REFILL_GENERATION = (
     f"{REFILL_SOLVER}:{LIBRARY_REVISION}:seed{engine.CANDIDATE_SEED}"
 )
+ACTIVE_REFILL_SOLVER = REFILL_SOLVER
 
 _ORIGINAL_VERIFY_COMPATIBILITY = q23._ORIGINAL_VERIFY_COMPATIBILITY
 _ORIGINAL_RUN_LIVE_GATES = q23._ORIGINAL_RUN_LIVE_GATES
@@ -55,8 +59,113 @@ _ORIGINAL_MANIFEST_IDENTITY = q23._ORIGINAL_MANIFEST_IDENTITY
 _ORIGINAL_LOAD_OR_CREATE_MANIFEST = q23._ORIGINAL_LOAD_OR_CREATE_MANIFEST
 _ORIGINAL_STATIC_PLAN = q23._ORIGINAL_STATIC_PLAN
 _ORIGINAL_WRITE_STATUS = engine._write_status
+_ORIGINAL_VERIFY_OWNED_SERIALS = engine.verify_owned_serials
+_ORIGINAL_EXECUTE_CYCLE = engine.execute_cycle
 _RUNTIME_PREFLIGHT_ARGS: argparse.Namespace | None = None
 STATUS_WRITE_ATTEMPTS = 3
+
+
+def _candidate_generation(solver_revision: str) -> str:
+    return (
+        f"{solver_revision}:{LIBRARY_REVISION}:seed{engine.CANDIDATE_SEED}"
+    )
+
+
+def _successor_compatibility() -> dict[str, Any]:
+    evidence = engine._read_json(SUCCESSOR_COMPATIBILITY_PATH)
+    expected = {
+        "schema": "q24-validated-async-aedt-successors-v1",
+        "campaign_id": CAMPAIGN_ID,
+        "initial_refill_solver_revision": REFILL_SOLVER,
+        "library_revision": LIBRARY_REVISION,
+        "physics_data_revision": PHYSICS_DATA_REVISION,
+    }
+    drift = {
+        key: (value, evidence.get(key))
+        for key, value in expected.items()
+        if evidence.get(key) != value
+    }
+    if drift:
+        raise engine.GateError(
+            f"q24 successor compatibility header drifted: {drift}"
+        )
+    successors = evidence.get("approved_successors")
+    if not isinstance(successors, list):
+        raise engine.GateError("q24 approved successor ledger is invalid")
+    seen = {REFILL_SOLVER}
+    available_cursor_sources = {REFILL_SOLVER}
+    normalized = []
+    for raw in successors:
+        if not isinstance(raw, dict):
+            raise engine.GateError("q24 approved successor record is invalid")
+        required_strings = (
+            "solver_revision",
+            "parent_revision",
+            "cursor_predecessor_solver_revision",
+            "physics_effect",
+        )
+        if any(not isinstance(raw.get(key), str) for key in required_strings):
+            raise engine.GateError("q24 successor pin fields are invalid")
+        solver = raw["solver_revision"]
+        parent = raw["parent_revision"]
+        cursor_source = raw["cursor_predecessor_solver_revision"]
+        if (
+            len(solver) != 40
+            or len(parent) != 40
+            or len(cursor_source) != 40
+            or solver in seen
+        ):
+            raise engine.GateError("q24 successor revision ledger is invalid")
+        if cursor_source not in available_cursor_sources:
+            raise engine.GateError(
+                "q24 successor cursor predecessor is not an earlier approved pin"
+            )
+        paths = raw.get("reviewed_fix_paths")
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or not all(isinstance(path, str) and path for path in paths)
+            or len(set(paths)) != len(paths)
+            or paths != sorted(paths)
+        ):
+            raise engine.GateError("q24 successor reviewed path set is invalid")
+        if raw["physics_effect"] != "none":
+            raise engine.GateError("q24 successor must be physics-neutral")
+        if raw.get("runtime_contract") != {
+            "workload_family": "mft_validated_async",
+            "parallel_native_solve_permits": 3,
+            "predecessor_family_remains_serialized": True,
+        }:
+            raise engine.GateError("q24 successor runtime contract drifted")
+        seen.add(solver)
+        available_cursor_sources.add(solver)
+        normalized.append(dict(raw))
+    return {**evidence, "approved_successors": normalized}
+
+
+def _successor_entries() -> dict[str, dict[str, Any]]:
+    return {
+        item["solver_revision"]: item
+        for item in _successor_compatibility()["approved_successors"]
+    }
+
+
+def _allowed_refill_solvers() -> tuple[str, ...]:
+    return (REFILL_SOLVER, *_successor_entries().keys())
+
+
+def _select_refill_solver(solver_revision: str) -> str:
+    if (
+        not isinstance(solver_revision, str)
+        or len(solver_revision) != 40
+        or any(character not in "0123456789abcdef" for character in solver_revision)
+    ):
+        raise engine.GateError("q24 --refill-solver requires a full lowercase SHA")
+    if solver_revision not in _allowed_refill_solvers():
+        raise engine.GateError(
+            "q24 --refill-solver is absent from the approved successor ledger"
+        )
+    return solver_revision
 
 
 def _sha256_file(path: Path) -> str:
@@ -239,8 +348,140 @@ def _candidate_cursor_transition(
     return transition
 
 
+def _candidate_successor_transition(
+    state_path: Path,
+    target_solver: str,
+    *,
+    execute: bool,
+) -> dict[str, Any]:
+    """Move a successor to the current high-water cursor exactly once."""
+
+    target_solver = _select_refill_solver(target_solver)
+    state = engine._read_json(state_path)
+    cursors = state.get("candidate_cursors")
+    migrations = state.get("candidate_cursor_migrations") or {}
+    if not isinstance(cursors, dict) or not isinstance(migrations, dict):
+        raise engine.GateError("q24 successor cursor ledger is invalid")
+
+    entries = _successor_entries()
+    successor_generations = {
+        _candidate_generation(solver) for solver in entries
+    }
+    if target_solver == REFILL_SOLVER:
+        if (
+            state.get("candidate_generation") in successor_generations
+            or any(generation in migrations for generation in successor_generations)
+        ):
+            raise engine.GateError(
+                "q24 refill solver rollback is forbidden after successor migration"
+            )
+        return {
+            "schema": "solver-successor-cursor-v1",
+            "campaign_id": CAMPAIGN_ID,
+            "replacement_generation": REFILL_GENERATION,
+            "selected_solver_revision": REFILL_SOLVER,
+            "semantics": "initial-q24-refill-no-successor-rollout",
+        }
+
+    entry = entries[target_solver]
+    source_solver = entry["cursor_predecessor_solver_revision"]
+    source_generation = _candidate_generation(source_solver)
+    target_generation = _candidate_generation(target_solver)
+    entry_digest = engine._digest(entry)
+    existing = migrations.get(target_generation)
+    if existing is not None:
+        if not isinstance(existing, dict):
+            raise engine.GateError(
+                "q24 successor cursor migration record is invalid"
+            )
+        expected_fixed = {
+            "schema": "solver-successor-cursor-v1",
+            "campaign_id": CAMPAIGN_ID,
+            "source_generation": source_generation,
+            "replacement_generation": target_generation,
+            "source_solver_revision": source_solver,
+            "replacement_solver_revision": target_solver,
+            "compatibility_entry_sha256": entry_digest,
+            "semantics": "continue-next-candidate-no-replay",
+        }
+        drift = {
+            key: (expected, existing.get(key))
+            for key, expected in expected_fixed.items()
+            if existing.get(key) != expected
+        }
+        source_cursor = existing.get("source_cursor")
+        replacement_initial_cursor = existing.get(
+            "replacement_initial_cursor"
+        )
+        current_generation = state.get("candidate_generation")
+        current_cursor = state.get("candidate_cursor")
+        if (
+            drift
+            or isinstance(source_cursor, bool)
+            or not isinstance(source_cursor, int)
+            or source_cursor < 0
+            or replacement_initial_cursor != source_cursor
+            or cursors.get(source_generation) != source_cursor
+            or not isinstance(cursors.get(target_generation), int)
+            or int(cursors[target_generation]) < source_cursor
+            or current_generation not in {source_generation, target_generation}
+            or current_cursor != cursors.get(current_generation)
+        ):
+            raise engine.GateError(
+                f"q24 successor cursor migration drifted: {drift}"
+            )
+        return dict(existing)
+
+    current_generation = state.get("candidate_generation")
+    source_cursor = cursors.get(source_generation)
+    serial = state.get("serial")
+    if current_generation != source_generation:
+        raise engine.GateError(
+            "q24 successor migration source is not the active refill solver"
+        )
+    if (
+        isinstance(serial, bool)
+        or not isinstance(serial, int)
+        or serial < 0
+        or isinstance(source_cursor, bool)
+        or not isinstance(source_cursor, int)
+        or source_cursor < 0
+        or state.get("candidate_cursor") != source_cursor
+    ):
+        raise engine.GateError("q24 successor source cursor is inconsistent")
+    if target_generation in cursors:
+        raise engine.GateError(
+            "q24 successor cursor exists without an audited migration record"
+        )
+    transition = {
+        "schema": "solver-successor-cursor-v1",
+        "campaign_id": CAMPAIGN_ID,
+        "source_generation": source_generation,
+        "replacement_generation": target_generation,
+        "source_solver_revision": source_solver,
+        "replacement_solver_revision": target_solver,
+        "transition_serial": serial,
+        "source_cursor": source_cursor,
+        "replacement_initial_cursor": source_cursor,
+        "compatibility_entry_sha256": entry_digest,
+        "semantics": "continue-next-candidate-no-replay",
+    }
+    if execute:
+        if Path(engine.feeder.STATE).resolve() != state_path.resolve():
+            raise engine.GateError("q24 configured feeder state path drifted")
+        updated = dict(state)
+        updated_cursors = dict(cursors)
+        updated_cursors[target_generation] = source_cursor
+        updated_migrations = dict(migrations)
+        updated_migrations[target_generation] = transition
+        updated["candidate_cursors"] = updated_cursors
+        updated["candidate_cursor_migrations"] = updated_migrations
+        engine.feeder.save_state(updated, immediate_permission_fallback=True)
+    return transition
+
+
 def verify_rolling_inventory(db_path: Path) -> dict[str, Any]:
-    """Accept only the exact predecessor/replacement pins in live MFT slots."""
+    """Accept only the predecessor and append-only approved refill pins."""
 
     placeholders = ",".join("?" for _ in ACTIVE_STATES)
     try:
@@ -259,34 +500,54 @@ def verify_rolling_inventory(db_path: Path) -> dict[str, Any]:
         raise engine.GateError(f"q24 rolling inventory query failed: {exc}") from exc
 
     counts: Counter[str] = Counter()
-    ids: dict[str, list[int]] = {"predecessor": [], "replacement": []}
+    cohorts = {
+        PREDECESSOR_SOLVER: "predecessor",
+        REFILL_SOLVER: "initial_replacement",
+        **{
+            solver: f"successor_{solver[:7]}"
+            for solver in _successor_entries()
+        },
+    }
+    ids: dict[str, list[int]] = {cohort: [] for cohort in cohorts.values()}
     for row in rows:
         dedupe = str(row["dedupe_key"] or "")
         name = str(row["name"] or "")
         status = str(row["status"] or "")
-        if f":{PREDECESSOR_SOLVER}:{LIBRARY_REVISION}:" in dedupe \
-                and name.startswith(f"mft-camp-s{PREDECESSOR_SOLVER[:7]}-"):
-            cohort = "predecessor"
-        elif f":{REFILL_SOLVER}:{LIBRARY_REVISION}:" in dedupe \
-                and name.startswith(f"mft-camp-s{REFILL_SOLVER[:7]}-"):
-            cohort = "replacement"
-        else:
+        matched = [
+            cohort
+            for solver, cohort in cohorts.items()
+            if f":{solver}:{LIBRARY_REVISION}:" in dedupe
+            and name.startswith(f"mft-camp-s{solver[:7]}-")
+        ]
+        if len(matched) != 1:
             raise engine.GateError(
                 "q24 found an unapproved live MFT campaign task: "
                 f"id={row['id']} name={name!r}"
             )
+        cohort = matched[0]
         counts[f"{cohort}_{status}"] += 1
         ids[cohort].append(int(row["id"]))
+    refill_cohorts = [
+        cohort for cohort in ids if cohort != "predecessor"
+    ]
     return {
         "logical_active": len(rows),
         "counts": dict(sorted(counts.items())),
         "predecessor_live": len(ids["predecessor"]),
-        "replacement_live": len(ids["replacement"]),
+        "replacement_live": sum(len(ids[cohort]) for cohort in refill_cohorts),
+        "selected_refill_solver": ACTIVE_REFILL_SOLVER,
+        "selected_refill_live": len(
+            ids[cohorts[ACTIVE_REFILL_SOLVER]]
+        ),
         "predecessor_sample": ids["predecessor"][:20],
-        "replacement_sample": ids["replacement"][:20],
+        "replacement_sample": [
+            task_id
+            for cohort in refill_cohorts
+            for task_id in ids[cohort]
+        ][:20],
         "counting_semantics": (
-            "both exact cohorts count toward one MFT project target; "
-            "new submissions use replacement only"
+            "all exact rolling cohorts count toward one MFT project target; "
+            "new submissions use the explicitly selected refill solver only"
         ),
         "cancellations": 0,
     }
@@ -338,19 +599,20 @@ def _verify_q24_compatibility(
     }
     if evidence.get("runtime_contract") != expected_runtime:
         raise engine.GateError("q24 async runtime contract drifted")
-    if target_solver != REFILL_SOLVER:
-        raise engine.GateError("q24 refill solver pin drifted")
+    selected_solver = _select_refill_solver(target_solver)
     if PREDECESSOR_SOLVER not in quality_contract.PHYSICS_EQUIVALENT_SOLVER_REVISIONS.get(
         REFILL_SOLVER, frozenset()
     ):
         raise engine.GateError("q24 directional physics approval is absent")
 
     try:
-        parent = engine._git(repo_root, "rev-parse", f"{REFILL_SOLVER}^")
-        changed = engine._git(
+        initial_parent = engine._git(
+            repo_root, "rev-parse", f"{REFILL_SOLVER}^"
+        )
+        initial_changed = engine._git(
             repo_root, "diff", "--name-only", REFILL_PARENT, REFILL_SOLVER
         ).splitlines()
-        ancestry = subprocess.run(
+        initial_ancestry = subprocess.run(
             [
                 "git", "-c", f"safe.directory={repo_root.as_posix()}",
                 "-C", str(repo_root), "merge-base", "--is-ancestor",
@@ -364,16 +626,63 @@ def _verify_q24_compatibility(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise engine.GateError(f"q24 Git compatibility check failed: {exc}") from exc
-    if parent != REFILL_PARENT or ancestry.returncode:
+    if initial_parent != REFILL_PARENT or initial_ancestry.returncode:
         raise engine.GateError("q24 reviewed replacement ancestry drifted")
-    if changed != evidence.get("reviewed_fix_paths"):
+    if initial_changed != evidence.get("reviewed_fix_paths"):
         raise engine.GateError("q24 reviewed replacement path set drifted")
+
+    successor_rollout: dict[str, Any] | None = None
+    if selected_solver != REFILL_SOLVER:
+        entry = _successor_entries()[selected_solver]
+        try:
+            selected_parent = engine._git(
+                repo_root, "rev-parse", f"{selected_solver}^"
+            )
+            selected_changed = engine._git(
+                repo_root,
+                "diff",
+                "--name-only",
+                entry["parent_revision"],
+                selected_solver,
+            ).splitlines()
+            selected_ancestry = subprocess.run(
+                [
+                    "git", "-c", f"safe.directory={repo_root.as_posix()}",
+                    "-C", str(repo_root), "merge-base", "--is-ancestor",
+                    REFILL_SOLVER, selected_solver,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise engine.GateError(
+                f"q24 successor Git compatibility check failed: {exc}"
+            ) from exc
+        if (
+            selected_parent != entry["parent_revision"]
+            or selected_ancestry.returncode
+        ):
+            raise engine.GateError("q24 reviewed successor ancestry drifted")
+        if selected_changed != entry["reviewed_fix_paths"]:
+            raise engine.GateError("q24 reviewed successor path set drifted")
+        successor_rollout = {
+            **entry,
+            "compatibility_entry_sha256": engine._digest(entry),
+        }
     return {
         **predecessor,
         "q24_validated_async_aedt_migration": {
             **evidence,
             "evidence_sha256": _sha256_file(COMPATIBILITY_PATH),
             "scheduler_package_revision": target_package,
+        },
+        "q24_refill_selection": {
+            "initial_refill_solver_revision": REFILL_SOLVER,
+            "selected_refill_solver_revision": selected_solver,
+            "successor_rollout": successor_rollout,
         },
     }
 
@@ -383,9 +692,17 @@ def _q24_manifest_identity(
     state_path: Path,
     eligible_accounts: Sequence[str],
 ) -> dict[str, Any]:
-    identity = _ORIGINAL_MANIFEST_IDENTITY(
-        baseline_serial, state_path, eligible_accounts
-    )
+    # The already-persisted q24 v1 manifest remains pinned to the initial
+    # 8fab refill forever. Runtime successor selection is recorded in the
+    # cursor migration ledger, not by rewriting this immutable identity.
+    active_solver = engine.CAMPAIGN_SOLVER
+    engine.CAMPAIGN_SOLVER = REFILL_SOLVER
+    try:
+        identity = _ORIGINAL_MANIFEST_IDENTITY(
+            baseline_serial, state_path, eligible_accounts
+        )
+    finally:
+        engine.CAMPAIGN_SOLVER = active_solver
     predecessor_path = _predecessor_manifest_path(state_path)
     predecessor = _validate_predecessor_manifest(
         predecessor_path, state_path, eligible_accounts
@@ -489,7 +806,8 @@ def _q24_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
     environment.update({
         "MFT_CAMPAIGN_MIGRATION_PREDECESSOR": PREDECESSOR_CAMPAIGN_ID,
         "MFT_CAMPAIGN_MIGRATION_PREDECESSOR_SOLVER": PREDECESSOR_SOLVER,
-        "MFT_CAMPAIGN_MIGRATION_REPLACEMENT_SOLVER": REFILL_SOLVER,
+        "MFT_CAMPAIGN_MIGRATION_INITIAL_REPLACEMENT_SOLVER": REFILL_SOLVER,
+        "MFT_CAMPAIGN_MIGRATION_REPLACEMENT_SOLVER": ACTIVE_REFILL_SOLVER,
         "MFT_AEDT_WORKLOAD_FAMILY": "mft_validated_async",
         "MFT_AEDT_ASYNC_DISPATCH_SETTLE_SECONDS": "2",
     })
@@ -501,6 +819,122 @@ def _q24_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
         # when each accepted task can attach and run.
         "scheduler_admission_owns_queueing": True,
     }
+
+
+def _verify_q24_owned_serials(
+    db_path: Path,
+    manifest: Mapping[str, Any],
+    current_serial: int,
+) -> None:
+    """Require one exact approved refill task for every accepted q24 serial."""
+
+    baseline = int(manifest["baseline_serial"])
+    if current_serial == baseline:
+        return
+    by_serial: dict[int, tuple[str, str]] = {}
+    try:
+        with engine._connect_readonly(db_path) as connection:
+            for solver in _allowed_refill_solvers():
+                prefix = (
+                    f"mft-camp-s{solver[:7]}-l{LIBRARY_REVISION[:7]}-"
+                )
+                rows = connection.execute(
+                    "SELECT name, dedupe_key FROM tasks WHERE name LIKE ?",
+                    (prefix + "%",),
+                ).fetchall()
+                for row in rows:
+                    name = str(row["name"] or "")
+                    suffix = name[len(prefix):]
+                    if not suffix.isdecimal():
+                        continue
+                    serial = int(suffix)
+                    if serial <= baseline or serial > current_serial:
+                        continue
+                    dedupe = str(row["dedupe_key"] or "")
+                    if (
+                        f":{solver}:{LIBRARY_REVISION}:" not in dedupe
+                        or not dedupe.startswith(f"mft-al:{name}:")
+                    ):
+                        raise engine.GateError(
+                            f"q24 serial {serial} task identity drifted"
+                        )
+                    if serial in by_serial:
+                        raise engine.GateError(
+                            f"q24 serial {serial} exists in multiple refill cohorts"
+                        )
+                    by_serial[serial] = (solver, name)
+    except sqlite3.Error as exc:
+        raise engine.GateError(f"q24 ownership query failed: {exc}") from exc
+
+    for serial in range(baseline + 1, current_serial + 1):
+        if serial not in by_serial:
+            raise engine.GateError(
+                f"q24 accepted serial {serial} has no exact approved task"
+            )
+
+
+def _execute_q24_cycle(
+    args: argparse.Namespace,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Refill 500 with one selected pin and an atomic no-replay handoff."""
+
+    gates = engine.run_live_gates(args)
+    state_path = args.state_dir / "feeder_state.json"
+    successor_transition: dict[str, Any] | None = None
+    with engine.feeder.campaign_mutation_lock():
+        _pool, logical_target = engine.verify_pool_and_policy(args.scheduler_url)
+        if logical_target:
+            successor_transition = _candidate_successor_transition(
+                state_path,
+                ACTIVE_REFILL_SOLVER,
+                execute=True,
+            )
+        current_serial = engine._state_serial(state_path)
+        engine.verify_owned_serials(
+            args.scheduler_db, manifest, current_serial
+        )
+        progress = engine.campaign_progress(manifest, current_serial)
+        if logical_target:
+            engine.feeder.step(
+                None,
+                target=logical_target,
+                buffer=0,
+                solver_revision=ACTIVE_REFILL_SOLVER,
+                library_revision=LIBRARY_REVISION,
+                candidate_seed=engine.CANDIDATE_SEED,
+                pooled_submission=engine.pooled_submission(args),
+            )
+            current_serial = engine._state_serial(state_path)
+            engine.verify_owned_serials(
+                args.scheduler_db, manifest, current_serial
+            )
+            progress = engine.campaign_progress(manifest, current_serial)
+        return {
+            "schema": SCHEMA,
+            "campaign": CAMPAIGN_ID,
+            "manifest": {
+                "version": int(manifest.get("manifest_version") or 1),
+                "identity_sha256": manifest["identity_sha256"],
+                "eligible_accounts": list(manifest["eligible_accounts"]),
+                "initial_refill_solver_revision": REFILL_SOLVER,
+            },
+            "phase": (
+                "stop-requested-draining"
+                if not logical_target
+                else "open-ended-refill"
+            ),
+            "updated_at_epoch": time.time(),
+            "progress": progress,
+            "logical_target": logical_target,
+            "open_ended": True,
+            "submission_ceiling": None,
+            "completion_and_failure_refill": True,
+            "selected_refill_solver_revision": ACTIVE_REFILL_SOLVER,
+            "candidate_cursor_successor_transition": successor_transition,
+            "gates": gates,
+            "no_cancellation_performed": True,
+        }
 
 
 def _write_q24_status(path: Path, payload: Mapping[str, Any]) -> None:
@@ -607,6 +1041,13 @@ def _q24_static_plan(
 ) -> dict[str, Any]:
     plan = _ORIGINAL_STATIC_PLAN(args, manifest)
     plan["migration"] = dict(manifest["migration"])
+    plan["refill_rollout"] = {
+        "immutable_manifest_solver": REFILL_SOLVER,
+        "selected_refill_solver": ACTIVE_REFILL_SOLVER,
+        "cursor_transition": "atomic-high-water-no-replay",
+        "live_task_mutation": "none",
+        "cancellation": "none",
+    }
     plan["active_control"]["pool"] = (
         "173 AEDT x 3 projects = 519 capacity; one 500-project target counts "
         "both rolling cohorts"
@@ -625,7 +1066,10 @@ def configure_engine(
     scheduler_package_revision: str,
     baseline_serial: int,
     baseline_dataset_rows: int,
+    refill_solver: str = REFILL_SOLVER,
 ) -> None:
+    global ACTIVE_REFILL_SOLVER
+    ACTIVE_REFILL_SOLVER = _select_refill_solver(refill_solver)
     q23.configure_engine(
         scheduler_package_revision, baseline_serial, baseline_dataset_rows
     )
@@ -634,7 +1078,7 @@ def configure_engine(
     engine.ACCOUNT_EXPANSION_SCHEMA = f"{SCHEMA}-unsupported-v2"
     engine.LEGACY_SCHEMA = f"{SCHEMA}-unsupported-legacy"
     engine.LEGACY_ACCOUNT_EXPANSION_SCHEMA = f"{SCHEMA}-unsupported-legacy-v2"
-    engine.CAMPAIGN_SOLVER = REFILL_SOLVER
+    engine.CAMPAIGN_SOLVER = ACTIVE_REFILL_SOLVER
     engine.PROVEN_RUNTIME_SOLVER = PREDECESSOR_SOLVER
     engine.LIBRARY_REVISION = LIBRARY_REVISION
     engine.verify_compatibility = _verify_q24_compatibility
@@ -644,6 +1088,8 @@ def configure_engine(
     engine.manifest_identity = _q24_manifest_identity
     engine.load_or_create_manifest = _load_or_create_q24_manifest
     engine.pooled_submission = _q24_pooled_submission
+    engine.verify_owned_serials = _verify_q24_owned_serials
+    engine.execute_cycle = _execute_q24_cycle
     engine._write_status = _write_q24_status
 
 
@@ -652,6 +1098,7 @@ def _bootstrap_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler-package-revision", required=True)
     parser.add_argument("--adopt-baseline-serial", required=True, type=int)
     parser.add_argument("--adopt-baseline-dataset-rows", required=True, type=int)
+    parser.add_argument("--refill-solver", default=REFILL_SOLVER)
     return parser
 
 
@@ -667,6 +1114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         bootstrap.scheduler_package_revision,
         bootstrap.adopt_baseline_serial,
         bootstrap.adopt_baseline_dataset_rows,
+        bootstrap.refill_solver,
     )
     engine_argv = [
         *forwarded,

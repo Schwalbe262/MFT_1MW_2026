@@ -52,6 +52,8 @@ CONFIGURED_NAMES = (
     "manifest_identity",
     "load_or_create_manifest",
     "pooled_submission",
+    "verify_owned_serials",
+    "execute_cycle",
     "audit_remote_packages",
     "_write_status",
 )
@@ -61,13 +63,46 @@ CONFIGURED_NAMES = (
 def configured_engine():
     previous = {name: getattr(engine, name) for name in CONFIGURED_NAMES}
     previous_state = engine.feeder.STATE
+    previous_active_refill = q24.ACTIVE_REFILL_SOLVER
     q24.configure_engine(PACKAGE_SHA, BASELINE_SERIAL, BASELINE_ROWS)
     try:
         yield engine
     finally:
+        q24.ACTIVE_REFILL_SOLVER = previous_active_refill
         engine.feeder.STATE = previous_state
         for name, value in previous.items():
             setattr(engine, name, value)
+
+
+def _approve_successor(monkeypatch, tmp_path, solver="a" * 40):
+    evidence = {
+        "schema": "q24-validated-async-aedt-successors-v1",
+        "campaign_id": q24.CAMPAIGN_ID,
+        "initial_refill_solver_revision": q24.REFILL_SOLVER,
+        "library_revision": q24.LIBRARY_REVISION,
+        "physics_data_revision": engine.PHYSICS_REVISION,
+        "approved_successors": [
+            {
+                "solver_revision": solver,
+                "parent_revision": "b" * 40,
+                "cursor_predecessor_solver_revision": q24.REFILL_SOLVER,
+                "reviewed_fix_paths": [
+                    "regression_260707/test_simulation_stability.py",
+                    "run_simulation_260706.py",
+                ],
+                "physics_effect": "none",
+                "runtime_contract": {
+                    "workload_family": "mft_validated_async",
+                    "parallel_native_solve_permits": 3,
+                    "predecessor_family_remains_serialized": True,
+                },
+            }
+        ],
+    }
+    path = tmp_path / "successors.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+    monkeypatch.setattr(q24, "SUCCESSOR_COMPATIBILITY_PATH", path)
+    return solver, evidence["approved_successors"][0]
 
 
 def _state_payload(serial=BASELINE_SERIAL, cursor=5_594):
@@ -504,6 +539,13 @@ def test_rolling_inventory_counts_both_exact_cohorts_and_rejects_others(tmp_path
                 ),
                 (
                     3,
+                    _task_name("7768510433858c9056f04320e66819d5fcc90f1a", 18_002),
+                    "attaching",
+                    _dedupe("7768510433858c9056f04320e66819d5fcc90f1a", 18_002),
+                    engine.PROJECT,
+                ),
+                (
+                    4,
                     _task_name(q24.PREDECESSOR_SOLVER, 17_998),
                     "completed",
                     _dedupe(q24.PREDECESSOR_SOLVER, 17_998),
@@ -513,14 +555,14 @@ def test_rolling_inventory_counts_both_exact_cohorts_and_rejects_others(tmp_path
         )
 
     inventory = q24.verify_rolling_inventory(db_path)
-    assert inventory["logical_active"] == 2
+    assert inventory["logical_active"] == 3
     assert inventory["predecessor_live"] == 1
-    assert inventory["replacement_live"] == 1
+    assert inventory["replacement_live"] == 2
     assert inventory["cancellations"] == 0
 
     with sqlite3.connect(db_path) as connection:
         connection.execute(
-            "INSERT INTO tasks VALUES (4, 'manual-mft', 'attaching', "
+            "INSERT INTO tasks VALUES (5, 'manual-mft', 'attaching', "
             "'unapproved', ?)",
             (engine.PROJECT,),
         )
@@ -569,6 +611,88 @@ def test_cursor_transition_rejects_unproven_replacement_cursor(
         q24._candidate_cursor_transition(
             state_path, BASELINE_SERIAL, execute=True
         )
+
+
+def test_successor_cursor_transition_preserves_high_water_and_forbids_rollback(
+    configured_engine, monkeypatch, tmp_path
+):
+    successor, entry = _approve_successor(monkeypatch, tmp_path)
+    q24.configure_engine(
+        PACKAGE_SHA, BASELINE_SERIAL, BASELINE_ROWS, successor
+    )
+    state_path = tmp_path / "feeder_state.json"
+    state = {
+        "serial": BASELINE_SERIAL + 17,
+        "submitted_samples": 5_075,
+        "candidate_generation": q24.REFILL_GENERATION,
+        "candidate_cursor": 6_123,
+        "candidate_cursors": {
+            q24.PREDECESSOR_GENERATION: 5_594,
+            q24.REFILL_GENERATION: 6_123,
+        },
+        "candidate_cursor_migrations": {},
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    configured_engine.feeder.STATE = str(state_path)
+
+    preview = q24._candidate_successor_transition(
+        state_path, successor, execute=False
+    )
+    target_generation = q24._candidate_generation(successor)
+    assert preview["transition_serial"] == BASELINE_SERIAL + 17
+    assert preview["source_cursor"] == 6_123
+    assert target_generation not in json.loads(
+        state_path.read_text(encoding="utf-8")
+    )["candidate_cursors"]
+
+    migrated = q24._candidate_successor_transition(
+        state_path, successor, execute=True
+    )
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert migrated == preview
+    assert persisted["serial"] == BASELINE_SERIAL + 17
+    assert persisted["candidate_generation"] == q24.REFILL_GENERATION
+    assert persisted["candidate_cursor"] == 6_123
+    assert persisted["candidate_cursors"][target_generation] == 6_123
+    assert migrated["compatibility_entry_sha256"] == engine._digest(entry)
+
+    persisted["candidate_generation"] = target_generation
+    persisted["candidate_cursor"] = 6_130
+    persisted["candidate_cursors"][target_generation] = 6_130
+    state_path.write_text(json.dumps(persisted), encoding="utf-8")
+    assert q24._candidate_successor_transition(
+        state_path, successor, execute=True
+    ) == migrated
+    with pytest.raises(engine.GateError, match="rollback is forbidden"):
+        q24._candidate_successor_transition(
+            state_path, q24.REFILL_SOLVER, execute=True
+        )
+
+
+def test_successor_selection_keeps_existing_q24_manifest_pinned_to_initial_refill(
+    configured_engine, monkeypatch, tmp_path
+):
+    successor, _entry = _approve_successor(monkeypatch, tmp_path)
+    q24.configure_engine(
+        PACKAGE_SHA, BASELINE_SERIAL, BASELINE_ROWS, successor
+    )
+    state_path = tmp_path / "feeder_state.json"
+    _write_state(state_path)
+    _write_predecessor_manifest(state_path)
+    configured_engine.feeder.STATE = str(state_path)
+    monkeypatch.setattr(configured_engine.feeder, "dataset_row_count", lambda: BASELINE_ROWS)
+
+    manifest = q24._load_or_create_q24_manifest(
+        tmp_path / "q24.manifest.json",
+        state_path,
+        q24.DEFAULT_ELIGIBLE_ACCOUNTS,
+        execute=False,
+        baseline_serial=BASELINE_SERIAL,
+    )
+
+    assert configured_engine.CAMPAIGN_SOLVER == successor
+    assert manifest["solver_revision"] == q24.REFILL_SOLVER
+    assert manifest["migration"]["replacement_solver_revision"] == q24.REFILL_SOLVER
 
 
 def test_q24_manifest_adopts_q23_boundary_and_records_no_replay(
@@ -676,6 +800,28 @@ def test_q24_compatibility_is_exact_directional_and_restores_q22_pins(
     )
 
 
+def test_q24_compatibility_approves_exact_handle_loss_successor(
+    configured_engine,
+):
+    successor = "7768510433858c9056f04320e66819d5fcc90f1a"
+    q24.configure_engine(
+        PACKAGE_SHA, BASELINE_SERIAL, BASELINE_ROWS, successor
+    )
+
+    evidence = q24._verify_q24_compatibility()
+
+    selection = evidence["q24_refill_selection"]
+    assert selection["selected_refill_solver_revision"] == successor
+    assert selection["successor_rollout"]["parent_revision"] == (
+        "d424b75a0830693f9d16a4cbf2485cd9d1733a3c"
+    )
+    assert selection["successor_rollout"]["reviewed_fix_paths"] == [
+        "run_simulation_260706.py",
+        "tests/test_simulation_stability.py",
+    ]
+    assert configured_engine.CAMPAIGN_SOLVER == successor
+
+
 def test_execute_cycle_adopts_old_slots_but_passes_only_new_pin_to_refill(
     configured_engine, tmp_path
 ):
@@ -696,6 +842,9 @@ def test_execute_cycle_adopts_old_slots_but_passes_only_new_pin_to_refill(
             patch.object(engine, "verify_pool_and_policy", return_value=({}, 500))
         )
         stack.enter_context(
+            patch.object(q24, "_candidate_successor_transition", return_value={})
+        )
+        stack.enter_context(
             patch.object(engine, "_state_serial", side_effect=[18_000, 18_001])
         )
         stack.enter_context(patch.object(engine, "verify_owned_serials"))
@@ -707,6 +856,55 @@ def test_execute_cycle_adopts_old_slots_but_passes_only_new_pin_to_refill(
     assert step.call_args.kwargs["solver_revision"] == q24.REFILL_SOLVER
     assert "max_new_tasks" not in step.call_args.kwargs
     assert status["progress"]["accepted_simulations"] == 1
+    assert status["no_cancellation_performed"] is True
+
+
+def test_execute_cycle_rolls_refill_to_successor_without_changing_target(
+    configured_engine, monkeypatch, tmp_path
+):
+    successor, _entry = _approve_successor(monkeypatch, tmp_path)
+    q24.configure_engine(
+        PACKAGE_SHA, BASELINE_SERIAL, BASELINE_ROWS, successor
+    )
+    args = configured_engine._parser().parse_args([])
+    args.state_dir = tmp_path
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    manifest = {
+        "baseline_serial": BASELINE_SERIAL,
+        "identity_sha256": "identity",
+        "eligible_accounts": list(args.eligible_accounts),
+    }
+    transition = {"replacement_solver_revision": successor}
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(engine, "run_live_gates", return_value={}))
+        stack.enter_context(
+            patch.object(engine.feeder, "campaign_mutation_lock", return_value=nullcontext())
+        )
+        stack.enter_context(
+            patch.object(engine, "verify_pool_and_policy", return_value=({}, 500))
+        )
+        migrate = stack.enter_context(
+            patch.object(
+                q24,
+                "_candidate_successor_transition",
+                return_value=transition,
+            )
+        )
+        stack.enter_context(
+            patch.object(engine, "_state_serial", side_effect=[18_010, 18_011])
+        )
+        stack.enter_context(patch.object(engine, "verify_owned_serials"))
+        step = stack.enter_context(patch.object(engine.feeder, "step"))
+        status = engine.execute_cycle(args, manifest)
+
+    migrate.assert_called_once_with(
+        tmp_path / "feeder_state.json", successor, execute=True
+    )
+    assert step.call_args.kwargs["target"] == 500
+    assert step.call_args.kwargs["solver_revision"] == successor
+    assert status["logical_target"] == 500
+    assert status["selected_refill_solver_revision"] == successor
+    assert status["candidate_cursor_successor_transition"] == transition
     assert status["no_cancellation_performed"] is True
 
 
@@ -727,14 +925,24 @@ def test_post_transition_ownership_ignores_adopted_old_serial_and_requires_new(
                     _task_name(q24.REFILL_SOLVER, BASELINE_SERIAL + 1),
                     _dedupe(q24.REFILL_SOLVER, BASELINE_SERIAL + 1),
                 ),
+                (
+                    _task_name(
+                        "7768510433858c9056f04320e66819d5fcc90f1a",
+                        BASELINE_SERIAL + 2,
+                    ),
+                    _dedupe(
+                        "7768510433858c9056f04320e66819d5fcc90f1a",
+                        BASELINE_SERIAL + 2,
+                    ),
+                ),
             ],
         )
     configured_engine.verify_owned_serials(
-        db_path, {"baseline_serial": BASELINE_SERIAL}, BASELINE_SERIAL + 1
+        db_path, {"baseline_serial": BASELINE_SERIAL}, BASELINE_SERIAL + 2
     )
-    with pytest.raises(engine.GateError, match="serial 18002"):
+    with pytest.raises(engine.GateError, match="serial 18003"):
         configured_engine.verify_owned_serials(
-            db_path, {"baseline_serial": BASELINE_SERIAL}, BASELINE_SERIAL + 2
+            db_path, {"baseline_serial": BASELINE_SERIAL}, BASELINE_SERIAL + 3
         )
 
 
