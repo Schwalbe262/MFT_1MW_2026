@@ -49,8 +49,23 @@ foreach ($Account in $EligibleAccounts) {
 while ($true) {
     $Started = Get-Date -Format o
     "[$Started] starting q22 open-ended controller" | Tee-Object -FilePath $LogPath -Append
-    & $Python @Arguments 2>&1 | Tee-Object -FilePath $LogPath -Append
-    $ExitCode = $LASTEXITCODE
+    $ExitCode = 1
+    try {
+        # Windows PowerShell can promote a native program's stderr stream to a
+        # terminating NativeCommandError when ErrorActionPreference is Stop.
+        # A controller gate failure must be logged and restarted; it must not
+        # kill this long-lived supervisor.
+        $ErrorActionPreference = 'Continue'
+        & $Python @Arguments 2>&1 | Tee-Object -FilePath $LogPath -Append
+        $ExitCode = $LASTEXITCODE
+    }
+    catch {
+        ($_ | Out-String) | Tee-Object -FilePath $LogPath -Append
+        $ExitCode = 1
+    }
+    finally {
+        $ErrorActionPreference = 'Stop'
+    }
     $Stopped = Get-Date -Format o
     "[$Stopped] controller exited rc=$ExitCode; restarting in ${RestartDelaySeconds}s" |
         Tee-Object -FilePath $LogPath -Append
