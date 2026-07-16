@@ -379,18 +379,19 @@ def automation_guard(lease: Any):
 
 
 def native_solve_window(lease: Any):
-    """Temporarily yield a held automation lock to a project-scoped solve."""
+    """Keep a held MFT automation transaction across native solve work.
+
+    AEDT 2025.2 did not remain process-stable when independent attached
+    clients released the session lock and entered blocking ``Analyze`` calls
+    concurrently.  The method remains as a compatibility context for the
+    existing solver/thermal call sites, but it deliberately never suspends the
+    session lock.  Three projects may stay attached to one Desktop; their
+    native solve, terminal-attestation, and extraction pipelines are serialized.
+    """
 
     if lease is None:
         raise RuntimeError("pooled native solve requires an active AEDT lease")
-    factory = getattr(lease, "native_solve_window", None)
-    if callable(factory):
-        return factory()
-    if int(getattr(lease, "protocol_version", 1) or 1) < 2:
-        return nullcontext()
-    raise RuntimeError(
-        "scheduler attach client has no native-solve window support"
-    )
+    return nullcontext()
 
 
 def wait_for_native_pipeline_barrier(lease: Any) -> dict[str, Any]:

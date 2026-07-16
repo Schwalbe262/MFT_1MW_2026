@@ -2454,7 +2454,7 @@ class Simulation():
         return status
 
     def aedt_native_solve_window(self):
-        """Yield a held automation transaction for one exact native solve."""
+        """Compatibility context that never yields pooled MFT automation."""
 
         if self._backend_mode() != "pooled":
             from contextlib import nullcontext
@@ -2463,7 +2463,7 @@ class Simulation():
         return pooled_native_solve_window(self.aedt_lease)
 
     def wait_for_pooled_native_pipeline(self):
-        """Join the cohort barrier before long Desktop-global extraction."""
+        """Join the cohort barrier after the serialized native extraction."""
 
         if self._backend_mode() != "pooled" or bool(getattr(
                 self, "pooled_native_pipeline_done", False)):
@@ -6259,11 +6259,10 @@ class Simulation():
         sibling lease is then able to acquire the automation lock, activate a
         different project, and corrupt the first macro (``project is not
         activated`` / incompatible calculator stack).  Keep the exact native
-        handle captured under the lock, suspend the lock only for the blocking
-        project-scoped Analyze call, then reacquire it before reading terminal
-        evidence.  Sibling native solves can still overlap while each caller
-        waits in its own blocking gRPC call; only unsafe asynchronous macros
-        are excluded.
+        handle and the session automation lock from blocking Analyze through
+        terminal evidence.  The enclosing ``analyze_and_extract`` transaction
+        extends that same ownership through result extraction, so attached
+        sibling projects cannot overlap native pipelines in one Desktop.
         """
 
         expected_design_type, expected_solution_type = (
@@ -6303,7 +6302,8 @@ class Simulation():
             if saved is False:
                 raise RuntimeError("native project Save returned False before solve")
             # Save can create or replace AEDT result metadata.  Re-attest at
-            # the last point before yielding the automation lock and Analyze.
+            # the last point before entering blocking Analyze while retaining
+            # the session automation lock.
             self._ensure_pooled_shared_results_directory(design_alias)
             odesktop = self._native_desktop_handle()
             message_cursor = capture_scoped_message_cursor(
@@ -6315,10 +6315,9 @@ class Simulation():
             # suppresses project release, and lets the host quarantine safely.
             self.solver_may_be_running = True
             started = clock()
-            # ``native_solve_window`` releases every nesting level of this
-            # lease's automation transaction, allowing sibling projects to
-            # model and start their own blocking native solves concurrently.
-            # It restores the lock before this context continues.
+            # The compatibility window is intentionally a no-op for MFT.  Keep
+            # every nesting level of this session transaction held so sibling
+            # projects cannot enter native Analyze concurrently.
             with self.aedt_native_solve_window():
                 analyze_result = odesign.Analyze(setup_name, True)
             if analyze_result is not None and (
@@ -6401,8 +6400,9 @@ class Simulation():
                         f"last_convergence_error={last_convergence_error}"
                     )
                 # Result/message files can flush shortly after a blocking call
-                # returns.  Do not hold the Desktop automation lock while
-                # waiting for that project-local evidence.
+                # returns.  Keep the session transaction held during this
+                # bounded wait: a sibling Analyze must not start before exact
+                # terminal attestation and extraction complete.
                 with self.aedt_native_solve_window():
                     sleeper(min(poll_s, max(0.0, deadline - now)))
 
@@ -6509,25 +6509,33 @@ class Simulation():
             self.save_project(strict=True)
             return elapsed
 
+        pooled_backend = self._backend_mode() == "pooled"
+        # Cohort admission can block until every sibling has finished modeling;
+        # it must happen before this project takes the Desktop-global lock.
+        if pooled_backend:
+            self.activate_pooled_for_solve()
+
         analyze_started = time.monotonic()
-        elapsed = _analyze_once()
-        solve_finished = time.monotonic()
-        self.stage_timings[f"stage_time_{label}_solve_s"] = elapsed
-        self.stage_timings[f"stage_time_{label}_analyze_overhead_s"] = max(
-            0.0, solve_finished - analyze_started - elapsed
-        )
-        extraction_started = time.monotonic()
-        try:
-            if self._backend_mode() == "pooled":
-                expected_design_type, expected_solution_type = (
-                    self._pooled_stage_contract(label)
-                )
-                with self.aedt_automation_transaction():
-                    # A sibling can legitimately leave Desktop's active project
-                    # on its own lease while this task waits in blocking Analyze.
-                    # Re-attest and reactivate this exact project/design/setup at
-                    # the transaction boundary before any cached postprocessor,
-                    # FieldsReporter, or modeler proxy is allowed to run.
+        # One outer transaction is continuous from native Analyze through its
+        # terminal postflight and result extraction.  Nested stage helpers are
+        # re-entrant, and MFT's native-solve compatibility window is a no-op.
+        with self.aedt_automation_transaction():
+            elapsed = _analyze_once()
+            solve_finished = time.monotonic()
+            self.stage_timings[f"stage_time_{label}_solve_s"] = elapsed
+            self.stage_timings[f"stage_time_{label}_analyze_overhead_s"] = max(
+                0.0, solve_finished - analyze_started - elapsed
+            )
+            extraction_started = time.monotonic()
+            try:
+                if pooled_backend:
+                    expected_design_type, expected_solution_type = (
+                        self._pooled_stage_contract(label)
+                    )
+                    # Re-attest this exact project/design/setup before any
+                    # cached postprocessor, FieldsReporter, or modeler proxy is
+                    # allowed to run.  No sibling can transition Desktop state
+                    # between terminal postflight and this extraction.
                     self._verified_pooled_native_setup(
                         setup_name="Setup1",
                         expected_design_type=expected_design_type,
@@ -6536,17 +6544,15 @@ class Simulation():
                         project_refresh_retry_delay=0.5,
                         activate=True,
                     )
-                    extractor()
-            else:
                 extractor()
-        finally:
-            extraction_finished = time.monotonic()
-            self.stage_timings[f"stage_time_{label}_extract_s"] = (
-                extraction_finished - extraction_started
-            )
-            self.stage_timings[f"stage_time_{label}_analyze_total_s"] = (
-                extraction_finished - analyze_started
-            )
+            finally:
+                extraction_finished = time.monotonic()
+                self.stage_timings[f"stage_time_{label}_extract_s"] = (
+                    extraction_finished - extraction_started
+                )
+                self.stage_timings[f"stage_time_{label}_analyze_total_s"] = (
+                    extraction_finished - analyze_started
+                )
         return elapsed
 
     def get_execution_telemetry(self):
@@ -7512,8 +7518,8 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             )
             t0 = time.monotonic()
             try:
-                # Thermal build/monitor/extract share one transaction; its exact
-                # native Analyze temporarily yields the lock inside the helper.
+                # Thermal build, blocking Analyze, terminal postflight, and
+                # extraction share one uninterrupted session transaction.
                 sim.activate_pooled_for_solve()
                 with sim.aedt_automation_transaction():
                     df_thermal = run_thermal_analysis(sim)
@@ -7539,14 +7545,17 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             total_time += t_thermal
             result_parts += [df_thermal, pd.DataFrame({"time_thermal": [t_thermal]})]
 
-        # Thermal workflows join from inside ``run_thermal_analysis`` before
-        # their long Desktop-global field extraction.  A valid pooled workflow
-        # without thermal still has to mark its final native stage so a mixed
-        # sealed cohort cannot wait forever for a participant that never joins.
+        # Join only after this project's serialized native extraction has
+        # released the session lock.  The first member may then wait while its
+        # attached siblings acquire the lock and finish their own pipelines.
         if backend == "pooled" and not model_only \
                 and sim.pooled_activation_done \
                 and not sim.pooled_native_pipeline_done:
+            barrier_started = time.monotonic()
             sim.wait_for_pooled_native_pipeline()
+            sim.stage_timings["stage_time_native_pipeline_barrier_s"] = (
+                time.monotonic() - barrier_started
+            )
 
         if model_only:
             print(sim.df_plus)

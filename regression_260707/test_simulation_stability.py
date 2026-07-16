@@ -2108,11 +2108,13 @@ class AnalyzePolicyTests(unittest.TestCase):
         simulation._verified_pooled_native_setup = Mock(
             return_value=(object(), object())
         )
+        simulation.activate_pooled_for_solve = Mock()
         simulation.aedt_automation_transaction = lambda: nullcontext()
 
         simulation.analyze_and_extract("matrix", lambda: None)
 
         simulation._analyze_exact_pooled_design.assert_called_once_with("matrix")
+        simulation.activate_pooled_for_solve.assert_called_once_with()
         simulation._verified_pooled_native_setup.assert_called_once_with(
             setup_name="Setup1",
             expected_design_type="Maxwell 3D",
@@ -2131,6 +2133,7 @@ class AnalyzePolicyTests(unittest.TestCase):
         simulation._verified_pooled_native_setup = Mock(
             side_effect=RuntimeError("extractor project identity mismatch")
         )
+        simulation.activate_pooled_for_solve = Mock()
         simulation.aedt_automation_transaction = lambda: nullcontext()
         extractor = Mock()
 
@@ -2138,6 +2141,7 @@ class AnalyzePolicyTests(unittest.TestCase):
             simulation.analyze_and_extract("cap", extractor)
 
         simulation._analyze_exact_pooled_design.assert_called_once_with("cap")
+        simulation.activate_pooled_for_solve.assert_called_once_with()
         simulation._verified_pooled_native_setup.assert_called_once_with(
             setup_name="Setup1",
             expected_design_type="Maxwell 3D",

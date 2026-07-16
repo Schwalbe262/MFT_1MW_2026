@@ -96,6 +96,21 @@ def test_native_pipeline_barrier_fails_closed_with_old_v2_client():
         )
 
 
+def test_native_solve_window_never_delegates_or_yields_mft_session_lock():
+    lease = SimpleNamespace(
+        protocol_version=2,
+        native_solve_window=Mock(
+            side_effect=AssertionError("MFT must not suspend the session lock")
+        ),
+    )
+    lock_depth = 2
+
+    with adapter.native_solve_window(lease):
+        assert lock_depth == 2
+
+    lease.native_solve_window.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("raw_timeout", "expected"),
     (("0", 0.0), ("0.25", 0.25), ("900", 900.0)),
@@ -769,7 +784,7 @@ def test_pooled_results_preclaim_exact_design_alias_and_reject_traversal(
     ("label", "solution_type"),
     (("matrix", "AC Magnetic"), ("cap", "Electrostatic"), ("loss", "AC Magnetic")),
 )
-def test_pooled_native_analyze_blocks_outside_lock_and_allows_sibling_transition(
+def test_pooled_native_analyze_and_terminal_postflight_hold_session_lock(
     monkeypatch, tmp_path, label, solution_type,
 ):
     from run_simulation_260706 import Simulation
@@ -791,19 +806,6 @@ def test_pooled_native_analyze_blocks_outside_lock_and_allows_sibling_transition
             events.append("lock-exit")
             lock_depth[0] -= 1
 
-    class NativeWindow:
-        def __enter__(self):
-            assert lock_depth[0] > 0
-            self.depth = lock_depth[0]
-            lock_depth[0] = 0
-            events.append("native-window-yield")
-            return self
-
-        def __exit__(self, *_args):
-            assert lock_depth[0] == 0
-            lock_depth[0] = self.depth
-            events.append("native-window-restore")
-
     workspace = tmp_path / "lease-workspace"
     workspace.mkdir()
 
@@ -815,7 +817,7 @@ def test_pooled_native_analyze_blocks_outside_lock_and_allows_sibling_transition
             return Guard()
 
         def native_solve_window(self):
-            return NativeWindow()
+            raise AssertionError("MFT adapter must not delegate lock suspension")
 
     class Project:
         def Save(self):
@@ -828,12 +830,8 @@ def test_pooled_native_analyze_blocks_outside_lock_and_allows_sibling_transition
             return f"maxwell_{label}"
 
         def Analyze(self, setup_name, blocking):
-            # A sibling stage can own the Desktop automation transaction while
-            # this exact project-scoped blocking call waits for its solver.
-            assert lock_depth[0] == 0
+            assert lock_depth[0] > 0
             events.append(("analyze", setup_name, blocking))
-            with Guard():
-                events.append("sibling-stage-transition")
             desktop.completed = True
             return 0
 
@@ -912,12 +910,12 @@ def test_pooled_native_analyze_blocks_outside_lock_and_allows_sibling_transition
     assert events[0] == "activate"
     analyze_event = ("analyze", "Setup1", True)
     assert analyze_event in events
-    assert events.index("native-window-yield") < events.index(analyze_event)
-    assert events.index(analyze_event) < events.index("native-window-restore")
-    assert "sibling-stage-transition" in events
+    assert "native-window-yield" not in events
+    assert "sibling-stage-transition" not in events
     assert events.count(analyze_event) == 1
-    # One outer transaction plus the deliberately interleaved sibling.
-    assert events.count("lock-enter") == 2
+    assert events.count("lock-enter") == 1
+    assert events.index("lock-enter") < events.index(analyze_event)
+    assert events.index("export-convergence") < events.index("lock-exit")
     assert contracts == [
         {
             "setup_name": "Setup1",
@@ -946,37 +944,54 @@ def test_pooled_native_analyze_blocks_outside_lock_and_allows_sibling_transition
     assert design_results.stat().st_mode & 0o777 == 0o777
 
 
-def test_pooled_extractor_rebinds_exact_stage_inside_automation_guard():
+def test_pooled_analyze_terminal_and_extractor_share_one_outer_guard():
     from run_simulation_260706 import Simulation
 
     events = []
+    lock_depth = [0]
 
     class Guard:
         def __enter__(self):
+            lock_depth[0] += 1
             events.append("lock-enter")
             return self
 
         def __exit__(self, *_args):
             events.append("lock-exit")
+            lock_depth[0] -= 1
 
     simulation = Simulation.__new__(Simulation)
     simulation.aedt_backend = "pooled"
-    simulation._analyze_exact_pooled_design = Mock(return_value=0.0)
+    simulation.pooled_activation_done = False
+    simulation.activate_pooled_for_solve = lambda: events.append("activate")
+
+    def analyze(label):
+        assert label == "loss"
+        assert lock_depth[0] == 1
+        events.append("analyze-terminal")
+        return 0.0
+
+    simulation._analyze_exact_pooled_design = Mock(side_effect=analyze)
     simulation.aedt_automation_transaction = lambda: Guard()
 
     def verify(**kwargs):
+        assert lock_depth[0] == 1
         events.append(("verify", kwargs))
         return object(), object()
 
     simulation._verified_pooled_native_setup = verify
 
-    simulation.analyze_and_extract(
-        "loss", lambda: events.append("extract")
-    )
+    def extract():
+        assert lock_depth[0] == 1
+        events.append("extract")
+
+    simulation.analyze_and_extract("loss", extract)
 
     simulation._analyze_exact_pooled_design.assert_called_once_with("loss")
     assert events == [
+        "activate",
         "lock-enter",
+        "analyze-terminal",
         (
             "verify",
             {

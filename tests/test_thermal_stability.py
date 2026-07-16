@@ -409,7 +409,7 @@ class ThermalStabilityTest(unittest.TestCase):
             setup="ThermalSetup : SteadyState", pandas_output=True
         )
 
-    def test_pooled_field_summary_busy_polls_release_lock_for_siblings(self):
+    def test_pooled_field_summary_busy_polls_keep_outer_session_lock(self):
         from module import aedt_pool_adapter
 
         states = iter([True, "true", False])
@@ -426,12 +426,6 @@ class ThermalStabilityTest(unittest.TestCase):
                 events.append("lock-exit")
                 lock_depth[0] -= 1
 
-        @contextmanager
-        def native_window():
-            events.append("outer-suspended")
-            yield
-            events.append("outer-restored")
-
         def running():
             events.append(("running", lock_depth[0]))
             return next(states)
@@ -439,15 +433,13 @@ class ThermalStabilityTest(unittest.TestCase):
         desktop = SimpleNamespace(AreThereSimulationsRunning=Mock(side_effect=running))
         native_ipk = SimpleNamespace(odesktop=desktop)
         sim = SimpleNamespace(
-            aedt_native_solve_window=native_window,
             aedt_automation_transaction=guard,
         )
         now = [100.0]
 
         def sleep_and_advance(seconds):
-            self.assertEqual(lock_depth[0], 0)
-            with guard():
-                events.append("sibling-automation")
+            self.assertEqual(lock_depth[0], 1)
+            events.append("locked-flush-wait")
             now[0] += seconds
 
         with patch.object(
@@ -456,25 +448,27 @@ class ThermalStabilityTest(unittest.TestCase):
                     thermal, "_prepare_thermal_dispatch",
                     return_value={"native_ipk": native_ipk},
                 ):
-            with thermal._pooled_field_summary_window(
-                    sim, native_ipk, SimpleNamespace(),
-                    timeout_s=20.0, poll_s=2.0,
-                    clock=lambda: now[0], sleeper=sleep_and_advance,
-            ) as yielded:
-                self.assertIs(yielded, native_ipk)
-                self.assertEqual(lock_depth[0], 1)
-                events.append("field-export")
+            with guard():
+                with thermal._pooled_field_summary_window(
+                        sim, native_ipk, SimpleNamespace(),
+                        timeout_s=20.0, poll_s=2.0,
+                        clock=lambda: now[0], sleeper=sleep_and_advance,
+                ) as yielded:
+                    self.assertIs(yielded, native_ipk)
+                    self.assertEqual(lock_depth[0], 2)
+                    events.append("field-export")
 
         self.assertEqual(now[0], 104.0)
         self.assertEqual(desktop.AreThereSimulationsRunning.call_count, 3)
-        self.assertEqual(events.count("sibling-automation"), 2)
-        idle_index = events.index(("running", 1), events.index(("running", 1)) + 1)
-        idle_index = events.index(("running", 1), idle_index + 1)
+        self.assertEqual(events.count("locked-flush-wait"), 2)
+        self.assertNotIn("sibling-automation", events)
+        idle_index = events.index(("running", 2), events.index(("running", 2)) + 1)
+        idle_index = events.index(("running", 2), idle_index + 1)
         export_index = events.index("field-export")
         self.assertNotIn("lock-exit", events[idle_index:export_index])
         self.assertEqual(lock_depth[0], 0)
 
-    def test_pooled_field_summary_window_timeout_releases_every_busy_poll(self):
+    def test_pooled_field_summary_window_timeout_keeps_outer_session_lock(self):
         from module import aedt_pool_adapter
 
         desktop = SimpleNamespace(AreThereSimulationsRunning=Mock(return_value=True))
@@ -490,13 +484,12 @@ class ThermalStabilityTest(unittest.TestCase):
 
         native_ipk = SimpleNamespace(odesktop=desktop)
         sim = SimpleNamespace(
-            aedt_native_solve_window=lambda: nullcontext(),
             aedt_automation_transaction=guard,
         )
         now = [100.0]
 
         def sleep_and_advance(seconds):
-            self.assertEqual(lock_depth[0], 0)
+            self.assertEqual(lock_depth[0], 1)
             now[0] += seconds
 
         with patch.object(
@@ -507,12 +500,13 @@ class ThermalStabilityTest(unittest.TestCase):
                 ):
             with self.assertRaisesRegex(
                     RuntimeError, "timed out waiting for pooled AEDT"):
-                with thermal._pooled_field_summary_window(
-                        sim, native_ipk, SimpleNamespace(),
-                        timeout_s=3.0, poll_s=2.0,
-                        clock=lambda: now[0], sleeper=sleep_and_advance,
-                ):
-                    self.fail("busy pooled Desktop must not yield export window")
+                with guard():
+                    with thermal._pooled_field_summary_window(
+                            sim, native_ipk, SimpleNamespace(),
+                            timeout_s=3.0, poll_s=2.0,
+                            clock=lambda: now[0], sleeper=sleep_and_advance,
+                    ):
+                        self.fail("busy pooled Desktop must not yield export window")
 
         self.assertEqual(now[0], 103.0)
         self.assertEqual(lock_depth[0], 0)
@@ -539,23 +533,11 @@ class ThermalStabilityTest(unittest.TestCase):
         sim.aedt_native_solve_window.assert_not_called()
         sim.aedt_automation_transaction.assert_not_called()
 
-    def test_native_pipeline_barrier_suspends_every_outer_lock_depth(self):
+    def test_native_pipeline_barrier_runs_only_after_outer_lock_is_released(self):
         from module import aedt_pool_adapter
 
-        lock_depth = [2]
+        lock_depth = [0]
         events = []
-
-        @contextmanager
-        def native_window():
-            saved = lock_depth[0]
-            self.assertGreater(saved, 0)
-            lock_depth[0] = 0
-            events.append("suspended")
-            try:
-                yield
-            finally:
-                lock_depth[0] = saved
-                events.append("restored")
 
         def wait_for_cohort():
             self.assertEqual(lock_depth[0], 0)
@@ -563,7 +545,6 @@ class ThermalStabilityTest(unittest.TestCase):
             return {"native_pipeline_barrier_granted": True}
 
         sim = SimpleNamespace(
-            aedt_native_solve_window=native_window,
             wait_for_pooled_native_pipeline=wait_for_cohort,
         )
         with patch.object(
@@ -572,8 +553,8 @@ class ThermalStabilityTest(unittest.TestCase):
             status = thermal._wait_for_pooled_native_pipeline(sim)
 
         self.assertTrue(status["native_pipeline_barrier_granted"])
-        self.assertEqual(events, ["suspended", "cohort-complete", "restored"])
-        self.assertEqual(lock_depth[0], 2)
+        self.assertEqual(events, ["cohort-complete"])
+        self.assertEqual(lock_depth[0], 0)
 
     @staticmethod
     def _convergence(converged=True):
@@ -1303,8 +1284,10 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(row["thermal_solved"], 1)
         self.assertEqual(row["thermal_extraction_complete"], 1)
         self.assertEqual(ipk.rebind_project_mock.call_count, 5)
-        ipk.native_pipeline_barrier_mock.assert_called_once_with()
-        self.assertGreaterEqual(ipk.native_window_mock.call_count, 3)
+        ipk.native_pipeline_barrier_mock.assert_not_called()
+        # Only the Analyze compatibility context remains.  The MFT adapter
+        # makes it a no-op, and terminal polling/extraction never asks to yield.
+        self.assertEqual(ipk.native_window_mock.call_count, 1)
         self.assertEqual(solve_project.active_calls, 1)
         self.assertEqual(
             solve_project.last_design.analyze_calls,
