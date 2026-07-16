@@ -16,11 +16,14 @@ param(
     [ValidateRange(0, [int]::MaxValue)]
     [int]$AdoptBaselineDatasetRows,
 
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$RefillSolver = '7768510433858c9056f04320e66819d5fcc90f1a',
+
     [string]$Python = 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe',
     [string]$StateDir = 'Y:\git\MFT_1MW_2026\regression_260707\campaign',
     [string]$DatasetDir = 'Y:\git\MFT_solver_pooled_260714\regression_260707\data\dataset',
     [string]$LibraryRoot = 'Y:\git\pyaedt_library_release_e6b9_260715',
-    [string]$SchedulerUrl = 'http://127.0.0.1:8001',
+    [string]$SchedulerUrl = 'http://127.0.0.1:8002',
     [string]$PoolUrl = 'http://172.16.10.37:18790',
     [string[]]$EligibleAccounts = @(
         'dhj02', 'harry261', 'jji0930', 'dw16', 'r1jae262'
@@ -53,6 +56,7 @@ $Arguments = @(
     '--scheduler-package-revision', $SchedulerPackageRevision,
     '--adopt-baseline-serial', "$AdoptBaselineSerial",
     '--adopt-baseline-dataset-rows', "$AdoptBaselineDatasetRows",
+    '--refill-solver', $RefillSolver,
     '--interval-seconds', "$IntervalSeconds",
     '--state-dir', $StateDir,
     '--dataset-dir', $DatasetDir,
