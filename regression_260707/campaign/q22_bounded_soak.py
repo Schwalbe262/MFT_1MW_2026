@@ -77,6 +77,7 @@ TASK_TIMEOUT_SECONDS = 86_400
 RELEASE_TIMEOUT_SECONDS = 7_200
 AUTOMATION_TIMEOUT_SECONDS = 7_200
 NATIVE_BARRIER_TIMEOUT_SECONDS = 7_200
+POOL_FILL_TIMEOUT_SECONDS = 900
 CANDIDATE_SEED = 260710
 
 EXISTING_COHORT_SOLVER = "26afff8de2936f605783395fbff19d5f1d26b354"
@@ -180,7 +181,10 @@ def verify_profile(path: Path = PROFILE_PATH) -> dict[str, Any]:
     if profile.get("timeout_seconds") != TASK_TIMEOUT_SECONDS:
         raise GateError("q22 task timeout must be exactly 86400 seconds")
     if profile.get("cpus") != THIN_CLIENT_CPUS or profile.get("mem_mb") != 6144:
-        raise GateError("q22 pooled profile must request 1 CPU and 6144 MiB")
+        raise GateError(
+            "pooled profile must request "
+            f"{THIN_CLIENT_CPUS} CPU(s) and 6144 MiB"
+        )
     return profile
 
 
@@ -278,9 +282,11 @@ def verify_pool_and_policy(base_url: str) -> tuple[dict[str, Any], int]:
              if config.get(key) != value}
     if drift:
         raise GateError(
-            "AEDT pool must remain 167x3 with target 500, charge 4 host CPUs "
-            "per attached lease, and remain operational: "
-            f"{drift}"
+            "AEDT pool must remain "
+            f"{EXPECTED_POOL_SESSIONS}x{EXPECTED_PROJECTS_PER_AEDT} with "
+            f"target {EXPECTED_POOL_TARGET}, charge "
+            f"{HOST_CPUS_PER_ATTACHED_LEASE} host CPUs per attached lease, "
+            f"and remain operational: {drift}"
         )
     if EXPECTED_POOL_CAPACITY < MAX_LOGICAL_ACTIVE:
         raise GateError("configured AEDT pool capacity cannot serve logical target 500")
@@ -920,7 +926,7 @@ def pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "MFT_AEDT_RELEASE_WAIT_SECONDS": str(RELEASE_TIMEOUT_SECONDS),
         "MFT_AEDT_POOLED_SOLVE_TIMEOUT_SECONDS": "7200",
-        "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "900",
+        "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": str(POOL_FILL_TIMEOUT_SECONDS),
         "MFT_CAMPAIGN_ID": CAMPAIGN_ID,
         "MFT_CAMPAIGN_PHYSICS_DATA_REVISION": PHYSICS_REVISION,
         "MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION": SCHEDULER_PACKAGE_REVISION,
