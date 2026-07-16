@@ -46,6 +46,26 @@ Run `control` without `--once` for recurring generation discovery. Run
 controller and supervisor are separate processes so long model tuning cannot
 delay collection.
 
+The controller also atomically refreshes two operator-facing files in the
+pipeline runtime root on every cycle:
+
+- `surrogate_status.json` is the heartbeat. It records the PID, pinned solver
+  and library revisions, canonical dataset identity, strict-full row count,
+  queue totals, last planned job IDs, last error, and next check interval.
+- `active_surrogate.json` is the consumer hand-off. Before the 3,000-row gate
+  it explicitly says `awaiting_activation`. After promotion it pins the
+  immutable model generation, dataset, quality gate, and registry pointer
+  fingerprints.
+
+An NSGA-II run reads `active_surrogate.json` once at run start, verifies the
+fingerprints, and keeps that immutable generation for the whole run. It never
+hot-swaps a model in a running population. A newly promoted
+`training_run_id` schedules a separate idempotent search generation, so old
+searches and new-model searches can overlap safely. Production checkpoint
+promotion additionally requires a candidate to improve mean common-target
+loss by at least 0.5%, regress no individual target by more than 5%, and use
+no fewer strict-full rows; the absolute quality gate remains mandatory.
+
 ### Persistent Windows launcher
 
 For unattended operation, keep code/data in the reviewed checkout and put all
