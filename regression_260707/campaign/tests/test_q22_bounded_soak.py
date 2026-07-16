@@ -74,6 +74,57 @@ def test_manifest_dry_run_is_write_free_and_identity_is_fail_closed(tmp_path):
         q22.load_or_create_manifest(target, state, accounts, execute=False)
 
 
+def test_v2_manifest_is_atomic_append_only_account_superset(tmp_path):
+    state = tmp_path / "feeder_state.json"
+    state.write_text(json.dumps({"serial": 123}), encoding="utf-8")
+    predecessor = tmp_path / "manifest.json"
+    expanded_path = tmp_path / "manifest.v2.json"
+    original = ("account-a", "account-b")
+    expanded = (*original, "account-c", "account-d")
+    v1 = q22.load_or_create_manifest(
+        predecessor,
+        state,
+        original,
+        execute=True,
+        baseline_serial=120,
+    )
+    state.write_text(json.dumps({"serial": 127}), encoding="utf-8")
+
+    v2 = q22.load_or_create_account_expansion_manifest(
+        expanded_path,
+        predecessor,
+        state,
+        expanded,
+        execute=True,
+        baseline_serial=120,
+    )
+
+    assert v2["schema"] == q22.ACCOUNT_EXPANSION_SCHEMA
+    assert v2["baseline_serial"] == v1["baseline_serial"] == 120
+    assert v2["transition"] == {
+        "kind": "append-only-account-superset",
+        "predecessor_schema": q22.SCHEMA,
+        "predecessor_identity_sha256": v1["identity_sha256"],
+        "predecessor_eligible_accounts": list(original),
+        "transition_serial": 127,
+        "baseline_and_demand_semantics": (
+            "same-baseline-and-campaign-demand-no-resubmission"
+        ),
+    }
+    assert v2["eligible_accounts"] == list(expanded)
+    assert expanded_path.is_file()
+
+    with pytest.raises(q22.GateError, match="append a strict superset"):
+        q22.load_or_create_account_expansion_manifest(
+            tmp_path / "bad.v2.json",
+            predecessor,
+            state,
+            ("account-a", "account-c", "account-b"),
+            execute=False,
+            baseline_serial=120,
+        )
+
+
 def test_submission_contract_pins_accounts_resources_and_all_timeouts():
     args = q22._parser().parse_args([])
     args.eligible_accounts = q22.DEFAULT_ELIGIBLE_ACCOUNTS

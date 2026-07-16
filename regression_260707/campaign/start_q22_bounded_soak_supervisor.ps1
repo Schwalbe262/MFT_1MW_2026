@@ -8,6 +8,9 @@ param(
     [string]$LibraryRoot = 'Y:\git\pyaedt_library_release_e6b9_260715',
     [string]$SchedulerUrl = 'http://127.0.0.1:8001',
     [string]$PoolUrl = 'http://172.16.10.37:18790',
+    [ValidateSet(1, 2)]
+    [int]$ManifestVersion = 1,
+    [string[]]$EligibleAccounts = @('dhj02', 'harry261', 'jji0930'),
     [int]$IntervalSeconds = 60,
     [int]$RestartDelaySeconds = 15
 )
@@ -34,10 +37,14 @@ $Arguments = @(
     '--library-root', $LibraryRoot,
     '--scheduler-url', $SchedulerUrl,
     '--pool-url', $PoolUrl,
-    '--eligible-account', 'dhj02',
-    '--eligible-account', 'harry261',
-    '--eligible-account', 'jji0930'
+    '--manifest-version', "$ManifestVersion"
 )
+foreach ($Account in $EligibleAccounts) {
+    if ([string]::IsNullOrWhiteSpace($Account)) {
+        throw 'EligibleAccounts cannot contain an empty account name.'
+    }
+    $Arguments += @('--eligible-account', $Account)
+}
 
 while ($true) {
     $Started = Get-Date -Format o

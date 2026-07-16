@@ -51,6 +51,7 @@ from regression_260707 import quality_contract
 
 
 SCHEMA = "q22-bounded-soak-controller-v1"
+ACCOUNT_EXPANSION_SCHEMA = "q22-bounded-soak-controller-account-expansion-v2"
 CAMPAIGN_ID = "q22-bounded-soak500-260716"
 PROJECT = "MFT_1MW_2026v1"
 DEFAULT_TOTAL_DEMAND = 500
@@ -519,6 +520,61 @@ def build_manifest(identity: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def manifest_path_for_version(state_dir: Path, version: int) -> Path:
+    if version == 1:
+        return state_dir / f"{CAMPAIGN_ID}.manifest.json"
+    if version == 2:
+        return state_dir / f"{CAMPAIGN_ID}.manifest.v2.json"
+    raise GateError("controller manifest version must be 1 or 2")
+
+
+def _ordered_strict_superset(
+    previous: Sequence[str], expanded: Sequence[str]
+) -> bool:
+    """Require account expansion to append accounts without reordering old pins."""
+    return (
+        len(expanded) > len(previous)
+        and list(expanded[:len(previous)]) == list(previous)
+        and len(set(expanded)) == len(expanded)
+    )
+
+
+def account_expansion_identity(
+    previous_manifest: Mapping[str, Any],
+    state_path: Path,
+    eligible_accounts: Sequence[str],
+    transition_serial: int,
+) -> dict[str, Any]:
+    previous_accounts = previous_manifest.get("eligible_accounts")
+    if not isinstance(previous_accounts, list) or not all(
+        isinstance(item, str) and item for item in previous_accounts
+    ):
+        raise GateError("predecessor manifest account set is invalid")
+    if not _ordered_strict_superset(previous_accounts, eligible_accounts):
+        raise GateError(
+            "v2 eligible accounts must append a strict superset of v1 accounts"
+        )
+    baseline = int(previous_manifest["baseline_serial"])
+    if transition_serial < baseline:
+        raise GateError("account expansion transition serial precedes campaign baseline")
+    identity = manifest_identity(baseline, state_path, eligible_accounts)
+    identity.update({
+        "schema": ACCOUNT_EXPANSION_SCHEMA,
+        "manifest_version": 2,
+        "transition": {
+            "kind": "append-only-account-superset",
+            "predecessor_schema": previous_manifest["schema"],
+            "predecessor_identity_sha256": previous_manifest["identity_sha256"],
+            "predecessor_eligible_accounts": list(previous_accounts),
+            "transition_serial": int(transition_serial),
+            "baseline_and_demand_semantics": (
+                "same-baseline-and-campaign-demand-no-resubmission"
+            ),
+        },
+    })
+    return identity
+
+
 def validate_manifest(
     manifest: Mapping[str, Any],
     state_path: Path,
@@ -532,6 +588,104 @@ def validate_manifest(
     if actual != expected or manifest.get("identity_sha256") != _digest(expected):
         raise GateError("controller manifest immutable identity drifted")
     return dict(manifest)
+
+
+def validate_account_expansion_manifest(
+    manifest: Mapping[str, Any],
+    previous_manifest: Mapping[str, Any],
+    state_path: Path,
+    eligible_accounts: Sequence[str],
+) -> dict[str, Any]:
+    transition = manifest.get("transition")
+    transition_serial = transition.get("transition_serial") if isinstance(
+        transition, dict
+    ) else None
+    if (isinstance(transition_serial, bool)
+            or not isinstance(transition_serial, int)):
+        raise GateError("v2 manifest transition_serial is invalid")
+    expected = account_expansion_identity(
+        previous_manifest,
+        state_path,
+        eligible_accounts,
+        transition_serial,
+    )
+    actual = {key: manifest.get(key) for key in expected}
+    if actual != expected or manifest.get("identity_sha256") != _digest(expected):
+        raise GateError("v2 controller manifest immutable identity drifted")
+    return dict(manifest)
+
+
+def load_or_create_account_expansion_manifest(
+    path: Path,
+    predecessor_path: Path,
+    state_path: Path,
+    eligible_accounts: Sequence[str],
+    *,
+    execute: bool,
+    baseline_serial: int | None = None,
+) -> dict[str, Any]:
+    if not predecessor_path.is_file():
+        raise GateError(f"v2 predecessor manifest is missing: {predecessor_path}")
+    raw_previous = _read_json(predecessor_path)
+    previous_accounts = raw_previous.get("eligible_accounts")
+    if not isinstance(previous_accounts, list):
+        raise GateError("v2 predecessor eligible_accounts is invalid")
+    previous = validate_manifest(raw_previous, state_path, previous_accounts)
+    if (baseline_serial is not None
+            and int(previous["baseline_serial"]) != int(baseline_serial)):
+        raise GateError("v2 predecessor does not match adopted baseline serial")
+    if path.exists():
+        return validate_account_expansion_manifest(
+            _read_json(path), previous, state_path, eligible_accounts
+        )
+    transition_serial = _state_serial(state_path)
+    identity = account_expansion_identity(
+        previous, state_path, eligible_accounts, transition_serial
+    )
+    manifest = build_manifest(identity)
+    if not execute:
+        return manifest
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        return validate_account_expansion_manifest(
+            _read_json(path), previous, state_path, eligible_accounts
+        )
+    return manifest
+
+
+def load_manifest_version(
+    path: Path,
+    predecessor_path: Path,
+    state_path: Path,
+    eligible_accounts: Sequence[str],
+    *,
+    version: int,
+    execute: bool,
+    baseline_serial: int | None = None,
+) -> dict[str, Any]:
+    if version == 1:
+        return load_or_create_manifest(
+            path,
+            state_path,
+            eligible_accounts,
+            execute=execute,
+            baseline_serial=baseline_serial,
+        )
+    if version == 2:
+        return load_or_create_account_expansion_manifest(
+            path,
+            predecessor_path,
+            state_path,
+            eligible_accounts,
+            execute=execute,
+            baseline_serial=baseline_serial,
+        )
+    raise GateError("controller manifest version must be 1 or 2")
 
 
 def load_or_create_manifest(
@@ -789,6 +943,11 @@ def execute_cycle(
         return {
             "schema": SCHEMA,
             "campaign": CAMPAIGN_ID,
+            "manifest": {
+                "version": int(manifest.get("manifest_version") or 1),
+                "identity_sha256": manifest["identity_sha256"],
+                "eligible_accounts": list(manifest["eligible_accounts"]),
+            },
             "phase": "demand-satisfied" if not progress["remaining_simulations"] else (
                 "paused-by-active-policy" if not logical_target else "rolling-refill"
             ),
@@ -816,6 +975,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--live-readonly-gates", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=60)
+    parser.add_argument(
+        "--manifest-version",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help=(
+            "1 uses the original immutable manifest; 2 creates/loads an "
+            "append-only account-superset manifest referencing v1"
+        ),
+    )
     parser.add_argument("--planned-total-demand", type=int, default=DEFAULT_TOTAL_DEMAND)
     parser.add_argument(
         "--adopt-baseline-serial",
@@ -867,14 +1036,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise GateError(f"canonical feeder state does not exist: {state_path}")
     verify_compatibility(REPO_ROOT, COMPATIBILITY_PATH)
     verify_profile(PROFILE_PATH)
-    manifest_path = args.state_dir / f"{CAMPAIGN_ID}.manifest.json"
+    manifest_path = manifest_path_for_version(args.state_dir, args.manifest_version)
+    predecessor_path = manifest_path_for_version(args.state_dir, 1)
     status_path = args.state_dir / f"{CAMPAIGN_ID}.status.json"
 
     if not args.execute_mft_family_production:
-        manifest = load_or_create_manifest(
+        manifest = load_manifest_version(
             manifest_path,
+            predecessor_path,
             state_path,
             args.eligible_accounts,
+            version=args.manifest_version,
             execute=False,
             baseline_serial=args.adopt_baseline_serial,
         )
@@ -890,15 +1062,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         with FileLock(feeder.CONTROLLER_LOCK, timeout=0):
+            if args.manifest_version == 2:
+                # Never persist an expanded eligible-account identity until
+                # every appended account passes the exact remote package and
+                # environment audit. execute_cycle repeats these gates before
+                # every possible submission.
+                run_live_gates(args)
             with feeder.campaign_mutation_lock():
                 # Refuse to create the immutable baseline until the mutable
                 # demand API exists.  The initial UI value is expected to be
                 # 500, but it may subsequently change by CAS.
                 read_campaign_demand(args.scheduler_url)
-                manifest = load_or_create_manifest(
+                manifest = load_manifest_version(
                     manifest_path,
+                    predecessor_path,
                     state_path,
                     args.eligible_accounts,
+                    version=args.manifest_version,
                     execute=True,
                     baseline_serial=args.adopt_baseline_serial,
                 )
