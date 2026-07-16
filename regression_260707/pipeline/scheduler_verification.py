@@ -24,19 +24,17 @@ EXPERIMENTAL_CONFIG_FIELDS = {
     "aedt_backend",
     "submission_env",
     "accounts",
-    "q7_guard_task_ids",
-    "q7_guard_timeout_seconds",
+    "guard_cohort",
+    "guard_cohort_sha256",
+    "guard_timeout_seconds",
     "experimental_quality_status_sha256",
 }
-EXPERIMENTAL_SOLVER_REVISION = "267860a86dc8c8017c4b713f6674c0614cc365ce"
-EXPERIMENTAL_LIBRARY_REVISION = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
-Q7_GUARD_TASK_IDS = (41692, 41693, 41694)
-Q7_GUARD_ACCOUNTS = ("r1jae262", "dhj02", "r1jae262")
-Q7_NAME_PREFIX = "mft-1to3-q7-full-267860a-"
-Q7_SUBMISSION_ENV = {
+EXPERIMENTAL_SUBMISSION_ACCOUNTS = ("r1jae262", "dhj02", "r1jae262")
+EXPERIMENTAL_SUBMISSION_ENV = {
     "MFT_AEDT_BACKEND": "pooled",
     "MFT_AEDT_ISOLATION_POLICY": "family",
     "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "900",
+    "MFT_AEDT_RELEASE_WAIT_SECONDS": "7200",
     "MFT_AEDT_POOL_WORKSPACE": (
         "/gpfs/tmp_cpu2/mft_pool/mft-${SLURM_SCHED_TASK_ID}"
     ),
@@ -60,11 +58,136 @@ Q7_SUBMISSION_ENV = {
         "$HOME/slurm_scheduler/aedt_pool_client"
     ),
 }
+EXACT_COHORT_SCHEMA_VERSION = "mft-aedt-exact-cohort-v1"
+EXACT_COHORT_PROJECT = "MFT_1MW_2026v1"
+EXACT_COHORT_FIELDS = {
+    "schema_version",
+    "cohort_id",
+    "session_id",
+    "session_generation",
+    "solve_batch_generation",
+    "solver_revision",
+    "library_revision",
+    "members",
+}
+EXACT_COHORT_MEMBER_FIELDS = {
+    "task_id",
+    "lease_id",
+    "session_id",
+    "session_generation",
+    "solve_generation",
+    "slot_index",
+    "name",
+    "dedupe_key",
+    "account_name",
+    "project",
+    "priority",
+    "aedt_backend",
+    "solver_revision",
+    "library_revision",
+    "lease_request_key",
+    "lease_project_name",
+}
+EXACT_COHORT_RESULT_FLAGS = (
+    "result_valid_em",
+    "result_valid_thermal",
+    "thermal_solved",
+    "thermal_extraction_complete",
+    "thermal_convergence_available",
+    "thermal_converged",
+    "core_native_material_readback_attested",
+    "core_loss_native_attested",
+    "B_mean_faraday_attested",
+    "native_core_report_coverage_attested",
+)
 
 
 def _full_sha(value) -> bool:
     text = str(value or "").lower()
     return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
+
+
+def _git_sha(value) -> bool:
+    text = str(value or "").lower()
+    return len(text) == 40 and all(char in "0123456789abcdef" for char in text)
+
+
+def _canonical_sha256(value) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _positive_int(value) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
+def _exact_cohort_contract(cohort, supplied_sha256, solver_revision, library_revision):
+    """Authenticate one not-yet-known exact 1-AEDT/3-project cohort.
+
+    The cohort is deliberately configuration data rather than source constants:
+    q21b task and lease identities do not exist until that canary is submitted.
+    A canonical digest prevents a later retry from silently swapping any member.
+    """
+
+    if not isinstance(cohort, dict) or set(cohort) != EXACT_COHORT_FIELDS:
+        raise RuntimeError("experimental exact cohort schema is invalid")
+    digest = str(supplied_sha256 or "").lower()
+    if not _full_sha(digest) or digest != _canonical_sha256(cohort):
+        raise RuntimeError("experimental exact cohort seal is invalid")
+    session_id = cohort.get("session_id")
+    session_generation = cohort.get("session_generation")
+    solve_generation = cohort.get("solve_batch_generation")
+    members = cohort.get("members")
+    if (
+        cohort.get("schema_version") != EXACT_COHORT_SCHEMA_VERSION
+        or not str(cohort.get("cohort_id") or "").strip()
+        or not _positive_int(session_id)
+        or not _positive_int(session_generation)
+        or not _positive_int(solve_generation)
+        or str(cohort.get("solver_revision") or "").lower() != solver_revision
+        or str(cohort.get("library_revision") or "").lower() != library_revision
+        or not isinstance(members, list)
+        or len(members) != 3
+    ):
+        raise RuntimeError("experimental exact cohort contract is invalid")
+    task_ids = set()
+    lease_ids = set()
+    slots = set()
+    for member in members:
+        if not isinstance(member, dict) or set(member) != EXACT_COHORT_MEMBER_FIELDS:
+            raise RuntimeError("experimental exact cohort member schema is invalid")
+        task_id = member.get("task_id")
+        lease_id = member.get("lease_id")
+        slot_index = member.get("slot_index")
+        if (
+            not _positive_int(task_id)
+            or not _positive_int(lease_id)
+            or isinstance(slot_index, bool)
+            or not isinstance(slot_index, int)
+            or slot_index not in {0, 1, 2}
+            or member.get("session_id") != session_id
+            or member.get("session_generation") != session_generation
+            or member.get("solve_generation") != solve_generation
+            or member.get("project") != EXACT_COHORT_PROJECT
+            or member.get("priority") != 10
+            or member.get("aedt_backend") != "pooled"
+            or str(member.get("solver_revision") or "").lower() != solver_revision
+            or str(member.get("library_revision") or "").lower() != library_revision
+            or not str(member.get("name") or "").strip()
+            or not str(member.get("dedupe_key") or "").strip()
+            or not str(member.get("account_name") or "").strip()
+            or not str(member.get("lease_request_key") or "").strip()
+            or not str(member.get("lease_project_name") or "").strip()
+        ):
+            raise RuntimeError("experimental exact cohort member contract is invalid")
+        task_ids.add(task_id)
+        lease_ids.add(lease_id)
+        slots.add(slot_index)
+    if len(task_ids) != 3 or len(lease_ids) != 3 or slots != {0, 1, 2}:
+        raise RuntimeError("experimental exact cohort inventory is not one exact triple")
+    return json.loads(json.dumps(cohort, sort_keys=True))
 
 
 def _experimental_execution_contract(request, config):
@@ -87,6 +210,14 @@ def _experimental_execution_contract(request, config):
         config.get("experimental_quality_status_sha256") or ""
     ).lower()
     actual_quality_sha = str(request.get("quality_status_sha256") or "").lower()
+    solver_revision = str(request.get("solver_revision") or "").lower()
+    library_revision = str(request.get("library_revision") or "").lower()
+    training_solver_revision = str(
+        request.get("training_solver_revision") or ""
+    ).lower()
+    training_library_revision = str(
+        request.get("training_library_revision") or ""
+    ).lower()
     if (
         request.get("stage") != "fine"
         or request.get("expected_count") != 3
@@ -100,19 +231,19 @@ def _experimental_execution_contract(request, config):
         or not blockers
         or not _full_sha(actual_quality_sha)
         or actual_quality_sha != expected_quality_sha
+        or not _git_sha(solver_revision)
+        or not _git_sha(library_revision)
+        or not _git_sha(training_solver_revision)
+        or not _git_sha(training_library_revision)
+        or str(request.get("fea_solver_revision") or "").lower()
+        != solver_revision
+        or str(request.get("fea_library_revision") or "").lower()
+        != library_revision
     ):
         raise RuntimeError("experimental verification evidence contract is invalid")
-    if (
-        str(request.get("solver_revision") or "").lower()
-        != EXPERIMENTAL_SOLVER_REVISION
-        or str(request.get("library_revision") or "").lower()
-        != EXPERIMENTAL_LIBRARY_REVISION
-    ):
-        raise RuntimeError("experimental verification revision pins changed")
 
     priority = config.get("priority")
     accounts = config.get("accounts")
-    guard_ids = config.get("q7_guard_task_ids")
     submission_env = config.get("submission_env")
     if (
         isinstance(priority, bool)
@@ -122,105 +253,344 @@ def _experimental_execution_contract(request, config):
         or config.get("required_hard_cap") != 3
         or config.get("max_project_active_tasks") != 600
         or config.get("aedt_backend") != "pooled"
-        or accounts != list(Q7_GUARD_ACCOUNTS)
-        or guard_ids != list(Q7_GUARD_TASK_IDS)
-        or submission_env != Q7_SUBMISSION_ENV
+        or accounts != list(EXPERIMENTAL_SUBMISSION_ACCOUNTS)
+        or submission_env != EXPERIMENTAL_SUBMISSION_ENV
     ):
         raise RuntimeError("experimental scheduler safety contract is invalid")
     solver_root = os.path.abspath(os.fspath(config.get("solver_root") or ""))
     if not solver_root or not os.path.isdir(solver_root):
         raise RuntimeError("experimental verification needs a solver_root")
+    guard_cohort = _exact_cohort_contract(
+        config.get("guard_cohort"),
+        config.get("guard_cohort_sha256"),
+        solver_revision,
+        library_revision,
+    )
+    timeout = config.get("guard_timeout_seconds", 48 * 3600)
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or not 60 <= timeout <= 48 * 3600
+    ):
+        raise RuntimeError("experimental exact cohort timeout is invalid")
     return {
         "priority": priority,
         "accounts": list(accounts),
-        "guard_ids": list(guard_ids),
+        "guard_cohort": guard_cohort,
+        "guard_cohort_sha256": str(config["guard_cohort_sha256"]).lower(),
         "submission_env": dict(submission_env),
         "required_hard_cap": 3,
         "max_project_active_tasks": 600,
         "aedt_backend": "pooled",
         "solver_root": solver_root,
-        "guard_timeout_seconds": max(
-            60, int(config.get("q7_guard_timeout_seconds", 48 * 3600))
-        ),
+        "guard_timeout_seconds": timeout,
     }
 
 
-def _wait_for_q7_guard(scheduler, state, state_path, options, poll_seconds):
-    """Wait until the exact q7 trio has completed successfully.
+class _GuardEvidencePending(RuntimeError):
+    """A sealed identity exists but its public terminal evidence is not ready."""
 
-    Merely seeing terminal task states is insufficient: identity, priority,
-    pooled backend, account placement, and exit code must all remain sealed.
-    The durable state is updated on every observation so operators can see why
-    no experimental scheduler mutation has happened yet.
-    """
+
+def _guard_result_evidence(scheduler, member, solver_revision, library_revision):
+    try:
+        response = scheduler.requests.get(
+            f"{scheduler.SCHEDULER}/api/tasks/{member['task_id']}/stdout",
+            params={"max_bytes": 1_048_576},
+            timeout=30,
+        )
+        response.raise_for_status()
+        output = response.text
+    except Exception as exc:
+        raise _GuardEvidencePending(
+            f"stdout read pending:{type(exc).__name__}:{exc}"
+        ) from exc
+    library_marker = ""
+    result = None
+    for line in reversed(output.splitlines()):
+        if not library_marker and line.startswith("MFT_LIBRARY_GIT_HASH "):
+            candidate = line[len("MFT_LIBRARY_GIT_HASH "):].strip().lower()
+            if _git_sha(candidate):
+                library_marker = candidate
+        if result is None and line.startswith("RESULT_JSON "):
+            try:
+                candidate = json.loads(line[len("RESULT_JSON "):])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(candidate, dict):
+                result = candidate
+        if result is not None and library_marker:
+            break
+    if result is None or not library_marker:
+        raise _GuardEvidencePending("terminal RESULT_JSON/library marker is unavailable")
+    bad_flags = [key for key in EXACT_COHORT_RESULT_FLAGS if result.get(key) != 1]
+    if (
+        bad_flags
+        or result.get("thermal_required_missing_count") != 0
+        or result.get("thermal_probe_failure_count") != 0
+        or result.get("thermal_dispatch_status") != "success"
+        or result.get("matrix_solve_attempts") != 1
+        or result.get("loss_solve_attempts") != 1
+        or result.get("thermal_solve_attempts") != 1
+        or result.get("git_dirty") != 0
+        or result.get("pyaedt_library_git_dirty") != 0
+        or str(result.get("git_hash") or "").lower() != solver_revision
+        or str(result.get("pyaedt_library_git_hash") or "").lower()
+        != library_revision
+        or library_marker != library_revision
+        or str(result.get("project_name") or "")
+        != member["lease_project_name"]
+        or not str(result.get("saved_at") or "").strip()
+    ):
+        raise RuntimeError(
+            f"exact cohort result evidence changed for task {member['task_id']}: "
+            f"bad_flags={bad_flags}"
+        )
+    return {
+        "result_valid_em": 1,
+        "result_valid_thermal": 1,
+        "thermal_converged": 1,
+        "native_attestation_count": sum(
+            result.get(key) == 1 for key in EXACT_COHORT_RESULT_FLAGS
+        ),
+        "solver_revision": solver_revision,
+        "library_revision": library_revision,
+        "project_name": result["project_name"],
+        "saved_at": result.get("saved_at"),
+    }
+
+
+def _guard_pool_evidence(scheduler, cohort):
+    try:
+        response = scheduler.requests.get(
+            f"{scheduler.SCHEDULER}/api/aedt-pool", timeout=30
+        )
+        response.raise_for_status()
+        summary = response.json()
+    except Exception as exc:
+        raise _GuardEvidencePending(
+            f"AEDT pool evidence pending:{type(exc).__name__}:{exc}"
+        ) from exc
+    if not isinstance(summary, dict):
+        raise _GuardEvidencePending("AEDT pool summary is unavailable")
+    sessions = [
+        item
+        for collection in (summary.get("sessions"), summary.get("session_history"))
+        if isinstance(collection, list)
+        for item in collection
+        if isinstance(item, dict) and item.get("id") == cohort["session_id"]
+    ]
+    if not sessions:
+        raise _GuardEvidencePending("sealed AEDT session is absent from public evidence")
+    session = sessions[0]
+    if any(item != session for item in sessions[1:]):
+        raise RuntimeError("sealed AEDT session has conflicting public evidence")
+    try:
+        last_fault_evidence = json.loads(
+            str(session.get("last_fault_evidence_json") or "{}")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("sealed AEDT session fault evidence is invalid") from exc
+    if (
+        session.get("generation") != cohort["session_generation"]
+        or session.get("solve_batch_generation")
+        != cohort["solve_batch_generation"]
+        or session.get("slots_total") != 3
+        or str(session.get("failure_message") or "")
+        or str(session.get("quarantine_reason") or "")
+        or session.get("last_fault_at") not in (None, "")
+        or last_fault_evidence != {}
+        or not str(session.get("process_id") or "").strip()
+    ):
+        raise RuntimeError("sealed AEDT session identity/health evidence changed")
+    session_state = str(session.get("state") or "").lower()
+    currently_reusable = (
+        session_state == "ready"
+        and session.get("active_lease_count") == 0
+        and session.get("free_slot_count") == 3
+    )
+    idle_since = str(session.get("idle_since") or "")
+    drain_requested_at = str(session.get("drain_requested_at") or "")
+    closed_at = str(session.get("closed_at") or "")
+    clean_idle_close = (
+        session_state == "closed"
+        and session.get("active_lease_count") == 0
+        and session.get("free_slot_count") == 3
+        and bool(idle_since and drain_requested_at and closed_at)
+        and idle_since <= drain_requested_at <= closed_at
+    )
+    reusable_evidence = currently_reusable or clean_idle_close
+    if session_state in {"failed", "unhealthy"} or (
+        session_state == "closed" and not clean_idle_close
+    ):
+        raise RuntimeError(f"sealed AEDT session is not reusable: {session_state}")
+    leases = summary.get("leases")
+    if not isinstance(leases, list):
+        raise _GuardEvidencePending("AEDT lease inventory is unavailable")
+    by_id = {
+        item.get("id"): item for item in leases if isinstance(item, dict)
+    }
+    lease_observations = {}
+    leases_released = True
+    for member in cohort["members"]:
+        lease = by_id.get(member["lease_id"])
+        if lease is None:
+            raise _GuardEvidencePending(
+                f"sealed AEDT lease is absent: {member['lease_id']}"
+            )
+        identity_ok = (
+            lease.get("task_id") == member["task_id"]
+            and lease.get("session_id") == cohort["session_id"]
+            and lease.get("slot_index") == member["slot_index"]
+            and lease.get("request_key") == member["lease_request_key"]
+            and lease.get("project_name") == member["lease_project_name"]
+            and not str(lease.get("failure_message") or "")
+        )
+        if not identity_ok:
+            raise RuntimeError(
+                f"sealed AEDT lease identity changed: {member['lease_id']}"
+            )
+        lease_state = str(lease.get("state") or "").lower()
+        if lease_state in {"failed", "cancelled", "faulted"}:
+            raise RuntimeError(
+                f"sealed AEDT lease did not release: {member['lease_id']}:{lease_state}"
+            )
+        released = lease_state == "released"
+        leases_released = leases_released and released
+        lease_observations[str(member["lease_id"])] = {
+            "state": lease_state,
+            "released": released,
+            "task_id": member["task_id"],
+            "session_id": cohort["session_id"],
+            "slot_index": member["slot_index"],
+        }
+    return reusable_evidence and leases_released, {
+        "session": {
+            "id": cohort["session_id"],
+            "state": session_state,
+            "generation": session.get("generation"),
+            "solve_batch_generation": session.get("solve_batch_generation"),
+            "active_lease_count": session.get("active_lease_count"),
+            "free_slot_count": session.get("free_slot_count"),
+            "reusable_evidence": (
+                "currently_ready"
+                if currently_reusable
+                else "clean_idle_close_after_release"
+                if clean_idle_close
+                else "waiting"
+            ),
+        },
+        "leases": lease_observations,
+    }
+
+
+def _wait_for_exact_cohort_guard(
+    scheduler, state, state_path, options, poll_seconds
+):
+    """Require terminal, released, native-valid evidence for one sealed triple."""
 
     started = time.monotonic()
+    cohort = options["guard_cohort"]
+    task_ids = [member["task_id"] for member in cohort["members"]]
     guard = state.setdefault(
         "pre_submission_guard",
         {
-            "schema_version": 1,
-            "task_ids": options["guard_ids"],
+            "schema_version": 2,
+            "cohort_sha256": options["guard_cohort_sha256"],
+            "task_ids": task_ids,
             "outcome": "waiting",
             "observations": {},
         },
     )
-    if guard.get("task_ids") != options["guard_ids"]:
-        raise RuntimeError("q7 guard task inventory changed across retry")
+    if (
+        guard.get("schema_version") != 2
+        or guard.get("cohort_sha256") != options["guard_cohort_sha256"]
+        or guard.get("task_ids") != task_ids
+    ):
+        raise RuntimeError("exact cohort guard inventory changed across retry")
     while True:
         all_passed = True
         observations = {}
-        for task_id, expected_account in zip(
-            options["guard_ids"], Q7_GUARD_ACCOUNTS
-        ):
-            try:
-                response = scheduler.requests.get(
-                    f"{scheduler.SCHEDULER}/api/tasks/{task_id}", timeout=30
+        try:
+            for member in cohort["members"]:
+                task_id = member["task_id"]
+                try:
+                    response = scheduler.requests.get(
+                        f"{scheduler.SCHEDULER}/api/tasks/{task_id}", timeout=30
+                    )
+                    response.raise_for_status()
+                    task = response.json()
+                except Exception as exc:
+                    observations[str(task_id)] = {
+                        "status": "read_error",
+                        "error": f"{type(exc).__name__}:{exc}",
+                    }
+                    all_passed = False
+                    continue
+                status = str(task.get("status") or task.get("state") or "").lower()
+                identity_ok = (
+                    task.get("id", task.get("task_id")) == task_id
+                    and task.get("name") == member["name"]
+                    and task.get("dedupe_key") == member["dedupe_key"]
+                    and task.get("priority") == member["priority"]
+                    and task.get("project") == member["project"]
+                    and task.get("aedt_backend") == member["aedt_backend"]
+                    and task.get("account_name") == member["account_name"]
                 )
-                response.raise_for_status()
-                task = response.json()
-            except Exception as exc:
-                observations[str(task_id)] = {
-                    "status": "read_error",
-                    "error": f"{type(exc).__name__}:{exc}",
+                task_observation = {
+                    "status": status,
+                    "exit_code": task.get("exit_code"),
+                    "identity_ok": identity_ok,
+                    "finished_at": task.get("finished_at"),
+                }
+                observations[str(task_id)] = task_observation
+                if not identity_ok:
+                    raise RuntimeError(
+                        f"exact cohort task identity changed: {task_id}"
+                    )
+                if status in {"failed", "cancelled"}:
+                    raise RuntimeError(
+                        f"exact cohort task did not succeed: {task_id}:{status}"
+                    )
+                if status == "completed":
+                    if task.get("exit_code") != 0:
+                        raise RuntimeError(
+                            f"exact cohort task has nonzero/unknown exit code: {task_id}"
+                        )
+                    try:
+                        task_observation["result_evidence"] = _guard_result_evidence(
+                            scheduler,
+                            member,
+                            cohort["solver_revision"],
+                            cohort["library_revision"],
+                        )
+                    except _GuardEvidencePending as exc:
+                        task_observation["result_evidence_pending"] = str(exc)
+                        all_passed = False
+                elif status in {"queued", "attaching", "running"}:
+                    all_passed = False
+                else:
+                    raise RuntimeError(
+                        f"exact cohort task state is invalid: {task_id}:{status}"
+                    )
+            try:
+                pool_passed, pool_observation = _guard_pool_evidence(
+                    scheduler, cohort
+                )
+                observations["aedt_pool"] = pool_observation
+                all_passed = all_passed and pool_passed
+            except _GuardEvidencePending as exc:
+                observations["aedt_pool"] = {
+                    "status": "evidence_pending", "reason": str(exc)
                 }
                 all_passed = False
-                continue
-            status = str(task.get("status") or task.get("state") or "").lower()
-            identity_ok = (
-                task.get("id", task.get("task_id")) == task_id
-                and str(task.get("name") or "").startswith(Q7_NAME_PREFIX)
-                and task.get("priority") == 10
-                and task.get("project") == scheduler.MFT_PROJECT
-                and task.get("aedt_backend") == "pooled"
-                and task.get("account_name") == expected_account
+        except RuntimeError:
+            guard.update(
+                outcome="failed",
+                observations=observations,
+                observed_at_epoch=time.time(),
             )
-            observations[str(task_id)] = {
-                "status": status,
-                "exit_code": task.get("exit_code"),
-                "identity_ok": identity_ok,
-                "finished_at": task.get("finished_at"),
-            }
-            if not identity_ok:
-                guard.update(outcome="failed", observations=observations)
-                _atomic_json(state, state_path)
-                raise RuntimeError(f"q7 guard task identity changed: {task_id}")
-            if status in {"failed", "cancelled"}:
-                guard.update(outcome="failed", observations=observations)
-                _atomic_json(state, state_path)
-                raise RuntimeError(f"q7 guard task did not succeed: {task_id}:{status}")
-            if status == "completed":
-                if task.get("exit_code") != 0:
-                    guard.update(outcome="failed", observations=observations)
-                    _atomic_json(state, state_path)
-                    raise RuntimeError(
-                        f"q7 guard task has nonzero/unknown exit code: {task_id}"
-                    )
-            elif status in {"queued", "attaching", "running"}:
-                all_passed = False
-            else:
-                guard.update(outcome="failed", observations=observations)
-                _atomic_json(state, state_path)
-                raise RuntimeError(f"q7 guard task state is invalid: {task_id}:{status}")
+            _atomic_json(state, state_path)
+            raise
         guard.update(
             outcome="passed" if all_passed else "waiting",
             observations=observations,
@@ -230,7 +600,9 @@ def _wait_for_q7_guard(scheduler, state, state_path, options, poll_seconds):
         if all_passed:
             return
         if time.monotonic() - started >= options["guard_timeout_seconds"]:
-            raise RuntimeError("q7 guard timed out before successful completion")
+            raise RuntimeError(
+                "exact cohort guard timed out before reusable terminal evidence"
+            )
         time.sleep(poll_seconds)
 
 
@@ -343,7 +715,7 @@ def run_scheduler_verification(request_path, result_path, config):
         record.get("outcome") in ("new", "submitting", "retry_submitting")
         for record in records.values()
     ):
-        _wait_for_q7_guard(
+        _wait_for_exact_cohort_guard(
             scheduler, state, state_path, experimental_options, poll_seconds
         )
 
