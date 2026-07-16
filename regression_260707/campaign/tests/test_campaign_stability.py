@@ -880,46 +880,75 @@ class CollectorFetchTests(unittest.TestCase):
         self.assertEqual(get_mock.call_count, 1)
         sleep_mock.assert_not_called()
 
-    def test_small_scheduler_page_recovers_unseen_durable_ledger_task(self):
-        task = {"id": 99, "name": "mft-camp-ledger-99", "status": "running"}
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "feeder_state.json"
-            state_path.write_text(
-                json.dumps({"outstanding": [99]}), encoding="utf-8")
+    def test_compact_cursor_pagination_never_probes_task_details(self):
+        first_page = [
+            {
+                "id": task_id,
+                "name": f"mft-camp-{task_id}",
+                "status": "completed",
+                "project": "MFT_1MW_2026v1",
+                "started_at": "2026-07-16 00:00:00",
+            }
+            for task_id in range(4000, 4000 - collect_wave.TASK_LIST_LIMIT, -1)
+        ]
+        last_task = {
+            "id": 1999,
+            "name": "mft-camp-1999",
+            "status": "running",
+            "project": "MFT_1MW_2026v1",
+            "started_at": "2026-07-16 00:00:00",
+        }
+        calls = []
 
-            calls = []
+        def get_json(path, **kwargs):
+            calls.append((path, kwargs))
+            self.assertEqual(path, "/api/tasks")
+            if len(calls) == 1:
+                return first_page
+            if len(calls) == 2:
+                return [last_task]
+            raise AssertionError("unexpected scheduler page")
 
-            def get_json(path, **kwargs):
-                calls.append((path, kwargs))
-                if path == "/api/tasks":
-                    return {"tasks": []}
-                if path == "/api/tasks/99":
-                    return task
-                raise AssertionError(f"unexpected scheduler probe: {path}")
+        with mock.patch.object(
+                collect_wave, "_get_json", side_effect=get_json):
+            tasks = collect_wave.list_tasks("mft-camp")
 
-            with mock.patch.object(
-                    collect_wave, "FEEDER_STATE_PATH", str(state_path)), \
-                    mock.patch.object(
-                        collect_wave, "_load_cache",
-                        return_value={"nodata": [], "harvested": []}), \
-                    mock.patch.object(
-                        collect_wave, "_get_json", side_effect=get_json):
-                tasks = collect_wave.list_tasks("mft-camp")
-
-        self.assertEqual(tasks, [task])
-        self.assertEqual(
-            calls[0],
-            (
-                "/api/tasks",
-                {
-                    "params": {
-                        "limit": collect_wave.TASK_LIST_LIMIT,
-                        "name_prefix": "mft-camp",
-                    },
-                    "timeout": 30,
+        self.assertEqual(len(tasks), collect_wave.TASK_LIST_LIMIT + 1)
+        self.assertEqual(tasks[-1], last_task)
+        self.assertEqual(calls[0], (
+            "/api/tasks",
+            {
+                "params": {
+                    "compact": "true",
+                    "limit": collect_wave.TASK_LIST_LIMIT,
+                    "name_prefix": "mft-camp",
                 },
-            ),
+                "timeout": 30,
+            },
+        ))
+        self.assertEqual(
+            calls[1][1]["params"]["before_id"],
+            min(task["id"] for task in first_page),
         )
+
+    def test_compact_cursor_fails_closed_when_page_does_not_advance(self):
+        page = [
+            {"id": task_id, "name": f"mft-camp-{task_id}"}
+            for task_id in range(3000, 3000 - collect_wave.TASK_LIST_LIMIT, -1)
+        ]
+        with mock.patch.object(
+                collect_wave, "_get_json", return_value=page) as get_json:
+            with self.assertRaisesRegex(
+                    collect_wave.FetchError, "cursor did not advance"):
+                collect_wave.list_tasks("mft-camp")
+
+        self.assertEqual(get_json.call_count, 2)
+
+    def test_empty_prefix_is_rejected_without_scheduler_request(self):
+        with mock.patch.object(collect_wave, "_get_json") as get_json:
+            with self.assertRaisesRegex(ValueError, "prefix must be non-empty"):
+                collect_wave.list_tasks("")
+        get_json.assert_not_called()
 
 
 class CollectorDatasetTests(unittest.TestCase):

@@ -62,7 +62,8 @@ def _configured_scheduler_url():
 
 
 SCHEDULER = _configured_scheduler_url()
-TASK_LIST_LIMIT = 200
+TASK_LIST_LIMIT = 2000
+TASK_LIST_MAX_PAGES = 10000
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(HERE, "..", "data", "dataset")
 LOCAL_RESULTS_CSV = os.path.join(HERE, "..", "..", "simulation_results_260706.csv")
@@ -183,7 +184,7 @@ def fetch_stdout(task_id, timeout=30):
         params={"max_bytes": MAX_STDOUT_BYTES}, timeout=timeout).text
 
 
-def list_tasks(prefix):
+def _legacy_list_tasks_with_detail_probes(prefix):
     # 신 스케줄러(limit/name_prefix 지원) 우선
     # A 10k response takes longer than the 30 s client timeout on the live
     # scheduler.  The durable feeder ledger below recovers every task outside
@@ -259,6 +260,61 @@ def list_tasks(prefix):
             if r:
                 seen[tid] = r
     return list(seen.values())
+
+
+def list_tasks(prefix):
+    """Return every matching scheduler task without per-task detail probes.
+
+    The scheduler's compact inventory applies ``name_prefix`` before its
+    limit and exposes a descending ``before_id`` cursor. Walking that cursor
+    is complete and bounded. The former ID-by-ID recovery path generated
+    hundreds of requests for small campaign prefixes and could starve the web
+    UI and AEDT heartbeat handlers.
+    """
+
+    prefix = str(prefix or "")
+    if not prefix:
+        raise ValueError("task prefix must be non-empty")
+
+    seen = {}
+    before_id = 0
+    for _page_number in range(TASK_LIST_MAX_PAGES):
+        params = {
+            "compact": "true",
+            "limit": TASK_LIST_LIMIT,
+            "name_prefix": prefix,
+        }
+        if before_id:
+            params["before_id"] = before_id
+        payload = _get_json("/api/tasks", params=params, timeout=30)
+        tasks = payload if isinstance(payload, list) else payload.get("tasks", [])
+        if not isinstance(tasks, list):
+            raise FetchError("GET /api/tasks returned a non-list task inventory")
+
+        page_ids = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                raise FetchError("GET /api/tasks returned a non-object task row")
+            try:
+                task_id = int(task["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise FetchError("GET /api/tasks returned an invalid task ID") from exc
+            if task_id <= 0:
+                raise FetchError("GET /api/tasks returned a non-positive task ID")
+            page_ids.append(task_id)
+            if str(task.get("name", "")).startswith(prefix):
+                seen[task_id] = task
+
+        if len(tasks) < TASK_LIST_LIMIT:
+            return list(seen.values())
+        if not page_ids:
+            raise FetchError("GET /api/tasks returned a full page without task IDs")
+        next_before_id = min(page_ids)
+        if before_id and next_before_id >= before_id:
+            raise FetchError("GET /api/tasks cursor did not advance")
+        before_id = next_before_id
+
+    raise FetchError("GET /api/tasks exceeded the compact pagination limit")
 
 
 def list_tasks_for_prefixes(prefixes):
