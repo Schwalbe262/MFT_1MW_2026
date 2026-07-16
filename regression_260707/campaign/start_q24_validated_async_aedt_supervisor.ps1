@@ -6,6 +6,8 @@ param(
     [ValidatePattern('^[0-9a-f]{40}$')]
     [string]$SchedulerPackageRevision,
 
+    [string]$SchedulerPackageSuccessor = '',
+
     [Parameter(Mandatory = $true)]
     [ValidateRange(0, [int]::MaxValue)]
     [int]$AdoptBaselineSerial,
@@ -34,6 +36,12 @@ if (-not $ExecuteMftFamilyProduction) {
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     throw "Python executable not found: $Python"
 }
+if (
+    -not [string]::IsNullOrWhiteSpace($SchedulerPackageSuccessor) -and
+    $SchedulerPackageSuccessor -notmatch '^[0-9a-f]{40}$'
+) {
+    throw 'SchedulerPackageSuccessor must be a full lowercase commit SHA.'
+}
 
 $Controller = Join-Path $PSScriptRoot 'q24_validated_async_aedt_campaign.py'
 $LogDir = Join-Path $StateDir 'q24_logs'
@@ -52,6 +60,11 @@ $Arguments = @(
     '--scheduler-url', $SchedulerUrl,
     '--pool-url', $PoolUrl
 )
+if (-not [string]::IsNullOrWhiteSpace($SchedulerPackageSuccessor)) {
+    $Arguments += @(
+        '--scheduler-package-successor', $SchedulerPackageSuccessor
+    )
+}
 foreach ($Account in $EligibleAccounts) {
     if ([string]::IsNullOrWhiteSpace($Account)) {
         throw 'EligibleAccounts cannot contain an empty account name.'

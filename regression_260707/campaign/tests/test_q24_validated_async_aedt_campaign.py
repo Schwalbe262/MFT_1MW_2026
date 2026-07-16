@@ -20,6 +20,7 @@ from regression_260707 import quality_contract
 
 
 PACKAGE_SHA = "ffffffffffffffffffffffffffffffffffffffff"
+PACKAGE_SUCCESSOR_SHA = "04eb5156bcb1219ae0ee43bb24ab1aacd08f36af"
 BASELINE_SERIAL = 18_000
 BASELINE_ROWS = 5_233
 CONFIGURED_NAMES = (
@@ -64,11 +65,15 @@ def configured_engine():
     previous = {name: getattr(engine, name) for name in CONFIGURED_NAMES}
     previous_state = engine.feeder.STATE
     previous_active_refill = q24.ACTIVE_REFILL_SOLVER
+    previous_manifest_package = q24.MANIFEST_SCHEDULER_PACKAGE_REVISION
+    previous_active_package = q24.ACTIVE_SCHEDULER_PACKAGE_REVISION
     q24.configure_engine(PACKAGE_SHA, BASELINE_SERIAL, BASELINE_ROWS)
     try:
         yield engine
     finally:
         q24.ACTIVE_REFILL_SOLVER = previous_active_refill
+        q24.MANIFEST_SCHEDULER_PACKAGE_REVISION = previous_manifest_package
+        q24.ACTIVE_SCHEDULER_PACKAGE_REVISION = previous_active_package
         engine.feeder.STATE = previous_state
         for name, value in previous.items():
             setattr(engine, name, value)
@@ -175,6 +180,18 @@ def _dedupe(solver, serial):
     )
 
 
+def _package_transition_manifest():
+    return {
+        "baseline_serial": BASELINE_SERIAL,
+        "identity_sha256": "1" * 64,
+        "eligible_accounts": list(q24.DEFAULT_ELIGIBLE_ACCOUNTS),
+        "scheduler_package_revision": PACKAGE_SHA,
+        "migration": {
+            "replacement_scheduler_package_revision": PACKAGE_SHA,
+        },
+    }
+
+
 def test_q24_submission_emits_only_validated_async_replacement(configured_engine):
     args = configured_engine._parser().parse_args([])
     args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
@@ -198,6 +215,10 @@ def test_q24_submission_emits_only_validated_async_replacement(configured_engine
     )
     assert environment["MFT_AEDT_WORKLOAD_FAMILY"] == "mft_validated_async"
     assert environment["MFT_AEDT_ASYNC_DISPATCH_SETTLE_SECONDS"] == "2"
+    assert environment["MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION"] == PACKAGE_SHA
+    assert environment[
+        "MFT_CAMPAIGN_IMMUTABLE_SCHEDULER_PACKAGE_REVISION"
+    ] == PACKAGE_SHA
 
 
 def test_q24_refills_exact_deficit_while_resource_queue_is_backed_off(
@@ -777,6 +798,62 @@ def test_rolling_inventory_counts_both_exact_cohorts_and_rejects_others(tmp_path
         q24.verify_rolling_inventory(db_path)
 
 
+def test_rolling_inventory_keeps_old_and_new_package_tasks_in_one_target(
+    configured_engine, tmp_path
+):
+    q24.configure_engine(
+        PACKAGE_SHA,
+        BASELINE_SERIAL,
+        BASELINE_ROWS,
+        q24.REFILL_SOLVER,
+        PACKAGE_SUCCESSOR_SHA,
+    )
+    db_path = tmp_path / "scheduler.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE tasks (id INTEGER, name TEXT, status TEXT, "
+            "dedupe_key TEXT, project TEXT, submission_env TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    1,
+                    _task_name(q24.REFILL_SOLVER, BASELINE_SERIAL + 1),
+                    "running",
+                    _dedupe(q24.REFILL_SOLVER, BASELINE_SERIAL + 1),
+                    engine.PROJECT,
+                    json.dumps({
+                        "MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION": PACKAGE_SHA,
+                    }),
+                ),
+                (
+                    2,
+                    _task_name(q24.REFILL_SOLVER, BASELINE_SERIAL + 2),
+                    "queued",
+                    _dedupe(q24.REFILL_SOLVER, BASELINE_SERIAL + 2),
+                    engine.PROJECT,
+                    json.dumps({
+                        "MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION": (
+                            PACKAGE_SUCCESSOR_SHA
+                        ),
+                    }),
+                ),
+            ],
+        )
+
+    inventory = q24.verify_rolling_inventory(db_path)
+
+    assert inventory["logical_active"] == 2
+    assert inventory["replacement_live"] == 2
+    assert inventory["selected_refill_scheduler_package"] == (
+        PACKAGE_SUCCESSOR_SHA
+    )
+    assert "all exact solver and scheduler-package cohorts" in inventory[
+        "counting_semantics"
+    ]
+
+
 def test_cursor_transition_is_write_free_in_preview_and_idempotent_in_execute(
     configured_engine, tmp_path
 ):
@@ -874,6 +951,210 @@ def test_successor_cursor_transition_preserves_high_water_and_forbids_rollback(
         q24._candidate_successor_transition(
             state_path, q24.REFILL_SOLVER, execute=True
         )
+
+
+def test_scheduler_package_successor_ledger_is_append_only_and_restart_safe(
+    configured_engine, tmp_path
+):
+    q24.configure_engine(
+        PACKAGE_SHA,
+        BASELINE_SERIAL,
+        BASELINE_ROWS,
+        q24.REFILL_SOLVER,
+        PACKAGE_SUCCESSOR_SHA,
+    )
+    state_path = tmp_path / "feeder_state.json"
+    _write_state(state_path, serial=BASELINE_SERIAL + 17, cursor=6_123)
+    configured_engine.feeder.STATE = str(state_path)
+    manifest = _package_transition_manifest()
+
+    preview = q24._scheduler_package_successor_transition(
+        state_path,
+        manifest,
+        PACKAGE_SUCCESSOR_SHA,
+        execute=False,
+    )
+    assert preview["ledger_action"] == "preview-append"
+    assert preview["transition_serial"] == BASELINE_SERIAL + 17
+    assert preview["predecessor_scheduler_package_revision"] == PACKAGE_SHA
+    assert preview["replacement_scheduler_package_revision"] == (
+        PACKAGE_SUCCESSOR_SHA
+    )
+    assert q24.SCHEDULER_PACKAGE_SUCCESSOR_LEDGER_KEY not in json.loads(
+        state_path.read_text(encoding="utf-8")
+    )
+
+    appended = q24._scheduler_package_successor_transition(
+        state_path,
+        manifest,
+        PACKAGE_SUCCESSOR_SHA,
+        execute=True,
+    )
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    ledger = persisted[q24.SCHEDULER_PACKAGE_SUCCESSOR_LEDGER_KEY]
+    assert appended["ledger_action"] == "append"
+    assert len(ledger) == 1
+    assert ledger[0]["transition_sha256"] == engine._digest(
+        {
+            key: value
+            for key, value in ledger[0].items()
+            if key != "transition_sha256"
+        }
+    )
+    persisted_bytes = state_path.read_bytes()
+
+    adopted = q24._scheduler_package_successor_transition(
+        state_path,
+        manifest,
+        PACKAGE_SUCCESSOR_SHA,
+        execute=True,
+    )
+    assert adopted["ledger_action"] == "adopt"
+    assert adopted["transition_sha256"] == ledger[0]["transition_sha256"]
+    assert state_path.read_bytes() == persisted_bytes
+
+    with pytest.raises(engine.GateError, match="rollback is forbidden"):
+        q24._scheduler_package_successor_transition(
+            state_path,
+            manifest,
+            PACKAGE_SHA,
+            execute=True,
+        )
+
+
+def test_scheduler_package_successor_ledger_rejects_identity_tampering(
+    configured_engine, tmp_path
+):
+    q24.configure_engine(
+        PACKAGE_SHA,
+        BASELINE_SERIAL,
+        BASELINE_ROWS,
+        q24.REFILL_SOLVER,
+        PACKAGE_SUCCESSOR_SHA,
+    )
+    state_path = tmp_path / "feeder_state.json"
+    _write_state(state_path, serial=BASELINE_SERIAL + 1)
+    configured_engine.feeder.STATE = str(state_path)
+    manifest = _package_transition_manifest()
+    q24._scheduler_package_successor_transition(
+        state_path,
+        manifest,
+        PACKAGE_SUCCESSOR_SHA,
+        execute=True,
+    )
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted[q24.SCHEDULER_PACKAGE_SUCCESSOR_LEDGER_KEY][0][
+        "manifest_identity_sha256"
+    ] = "2" * 64
+    state_path.write_text(json.dumps(persisted), encoding="utf-8")
+
+    with pytest.raises(engine.GateError, match="ledger drifted"):
+        q24._scheduler_package_successor_transition(
+            state_path,
+            manifest,
+            PACKAGE_SUCCESSOR_SHA,
+            execute=False,
+        )
+
+
+def test_scheduler_package_successor_preserves_manifest_and_pins_new_refills(
+    configured_engine, monkeypatch, tmp_path
+):
+    state_path = tmp_path / "feeder_state.json"
+    manifest_path = tmp_path / "q24.manifest.json"
+    _write_state(state_path)
+    _write_predecessor_manifest(state_path)
+    configured_engine.feeder.STATE = str(state_path)
+    monkeypatch.setattr(
+        configured_engine.feeder,
+        "dataset_row_count",
+        lambda: BASELINE_ROWS,
+    )
+    original = q24._load_or_create_q24_manifest(
+        manifest_path,
+        state_path,
+        q24.DEFAULT_ELIGIBLE_ACCOUNTS,
+        execute=False,
+        baseline_serial=BASELINE_SERIAL,
+    )
+    manifest_path.write_text(
+        json.dumps(original, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    original_bytes = manifest_path.read_bytes()
+    changed_evidence = tmp_path / "changed-compatibility-evidence.json"
+    changed_evidence.write_text('{"changed": true}\n', encoding="utf-8")
+    monkeypatch.setattr(q24, "COMPATIBILITY_PATH", changed_evidence)
+
+    q24.configure_engine(
+        PACKAGE_SHA,
+        BASELINE_SERIAL,
+        BASELINE_ROWS,
+        q24.REFILL_SOLVER,
+        PACKAGE_SUCCESSOR_SHA,
+    )
+    adopted = q24._load_or_create_q24_manifest(
+        manifest_path,
+        state_path,
+        q24.DEFAULT_ELIGIBLE_ACCOUNTS,
+        execute=False,
+        baseline_serial=BASELINE_SERIAL,
+    )
+    args = configured_engine._parser().parse_args([])
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    environment = configured_engine.pooled_submission(args)["submission_env"]
+
+    assert adopted["identity_sha256"] == original["identity_sha256"]
+    assert adopted["scheduler_package_revision"] == PACKAGE_SHA
+    assert adopted["migration"]["compatibility_evidence_sha256"] == (
+        q24.IMMUTABLE_Q24_COMPATIBILITY_EVIDENCE_SHA256
+    )
+    assert manifest_path.read_bytes() == original_bytes
+    assert environment["MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION"] == (
+        PACKAGE_SUCCESSOR_SHA
+    )
+    assert environment[
+        "MFT_CAMPAIGN_IMMUTABLE_SCHEDULER_PACKAGE_REVISION"
+    ] == PACKAGE_SHA
+
+
+def test_scheduler_package_successor_remote_audit_targets_only_selected_package(
+    configured_engine, monkeypatch, tmp_path
+):
+    q24.configure_engine(
+        PACKAGE_SHA,
+        BASELINE_SERIAL,
+        BASELINE_ROWS,
+        q24.REFILL_SOLVER,
+        PACKAGE_SUCCESSOR_SHA,
+    )
+    observed = []
+
+    def fake_audit(_config, accounts, _python):
+        observed.append(engine.SCHEDULER_PACKAGE_REVISION)
+        return [
+            {
+                "account": account,
+                "package": engine.SCHEDULER_PACKAGE_REVISION,
+                "max_pool_fill_timeout_seconds": 7_200,
+            }
+            for account in accounts
+        ]
+
+    monkeypatch.setattr(q23, "_audit_q23_remote_packages", fake_audit)
+    evidence = q24._audit_q24_remote_packages(
+        tmp_path / "accounts.yaml",
+        q24.DEFAULT_ELIGIBLE_ACCOUNTS,
+        tmp_path / "python.exe",
+    )
+
+    assert observed == [PACKAGE_SUCCESSOR_SHA]
+    assert engine.SCHEDULER_PACKAGE_REVISION == PACKAGE_SHA
+    assert all(
+        row["selected_refill_package"] == PACKAGE_SUCCESSOR_SHA
+        and row["immutable_manifest_package"] == PACKAGE_SHA
+        for row in evidence
+    )
 
 
 def test_successor_selection_keeps_existing_q24_manifest_pinned_to_initial_refill(
@@ -1052,6 +1333,13 @@ def test_execute_cycle_adopts_old_slots_but_passes_only_new_pin_to_refill(
             patch.object(q24, "_candidate_successor_transition", return_value={})
         )
         stack.enter_context(
+            patch.object(
+                q24,
+                "_scheduler_package_successor_transition",
+                return_value={"ledger_action": "none"},
+            )
+        )
+        stack.enter_context(
             patch.object(engine, "_state_serial", side_effect=[18_000, 18_001])
         )
         stack.enter_context(patch.object(engine, "verify_owned_serials"))
@@ -1098,6 +1386,13 @@ def test_execute_cycle_rolls_refill_to_successor_without_changing_target(
             )
         )
         stack.enter_context(
+            patch.object(
+                q24,
+                "_scheduler_package_successor_transition",
+                return_value={"ledger_action": "none"},
+            )
+        )
+        stack.enter_context(
             patch.object(engine, "_state_serial", side_effect=[18_010, 18_011])
         )
         stack.enter_context(patch.object(engine, "verify_owned_serials"))
@@ -1112,6 +1407,75 @@ def test_execute_cycle_rolls_refill_to_successor_without_changing_target(
     assert status["logical_target"] == 500
     assert status["selected_refill_solver_revision"] == successor
     assert status["candidate_cursor_successor_transition"] == transition
+    assert status["no_cancellation_performed"] is True
+
+
+def test_execute_cycle_audits_then_uses_package_successor_only_for_new_refill(
+    configured_engine, tmp_path
+):
+    q24.configure_engine(
+        PACKAGE_SHA,
+        BASELINE_SERIAL,
+        BASELINE_ROWS,
+        q24.REFILL_SOLVER,
+        PACKAGE_SUCCESSOR_SHA,
+    )
+    args = configured_engine._parser().parse_args([])
+    args.state_dir = tmp_path
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    manifest = _package_transition_manifest()
+    preview = {"ledger_action": "preview-append"}
+    appended = {
+        "ledger_action": "append",
+        "replacement_scheduler_package_revision": PACKAGE_SUCCESSOR_SHA,
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(engine, "run_live_gates", return_value={}))
+        stack.enter_context(
+            patch.object(
+                engine.feeder,
+                "campaign_mutation_lock",
+                return_value=nullcontext(),
+            )
+        )
+        stack.enter_context(
+            patch.object(engine, "verify_pool_and_policy", return_value=({}, 500))
+        )
+        stack.enter_context(
+            patch.object(q24, "_candidate_successor_transition", return_value={})
+        )
+        package_transition = stack.enter_context(
+            patch.object(
+                q24,
+                "_scheduler_package_successor_transition",
+                side_effect=[preview, appended],
+            )
+        )
+        audit = stack.enter_context(patch.object(engine, "audit_remote_packages"))
+        stack.enter_context(
+            patch.object(engine, "_state_serial", side_effect=[18_010, 18_011])
+        )
+        stack.enter_context(patch.object(engine, "verify_owned_serials"))
+        step = stack.enter_context(patch.object(engine.feeder, "step"))
+        status = engine.execute_cycle(args, manifest)
+
+    assert package_transition.call_count == 2
+    audit.assert_called_once_with(
+        args.accounts_config,
+        q24.DEFAULT_ELIGIBLE_ACCOUNTS,
+        args.ssh_audit_python,
+    )
+    submission_environment = step.call_args.kwargs["pooled_submission"][
+        "submission_env"
+    ]
+    assert submission_environment[
+        "MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION"
+    ] == PACKAGE_SUCCESSOR_SHA
+    assert status["logical_target"] == 500
+    assert status["selected_refill_scheduler_package_revision"] == (
+        PACKAGE_SUCCESSOR_SHA
+    )
+    assert status["scheduler_package_successor_transition"] == appended
     assert status["no_cancellation_performed"] is True
 
 
@@ -1165,9 +1529,51 @@ def test_q24_main_rejects_manifest_override_and_partial_accounts(monkeypatch):
     with pytest.raises(engine.GateError, match="append-only version-1"):
         q24.main([*common, "--manifest-version=2"])
 
+    with pytest.raises(engine.GateError, match="full lowercase SHA"):
+        q24.configure_engine(
+            PACKAGE_SHA,
+            BASELINE_SERIAL,
+            BASELINE_ROWS,
+            q24.REFILL_SOLVER,
+            "short",
+        )
+
     monkeypatch.setattr(q24, "configure_engine", lambda *_args: None)
     with pytest.raises(engine.GateError, match="exact audited five-account"):
         q24.main([*common, "--eligible-account", "dhj02"])
+
+
+def test_q24_main_forwards_scheduler_package_successor_separately(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        q24,
+        "configure_engine",
+        lambda *args: captured.append(args),
+    )
+    monkeypatch.setattr(engine, "main", lambda _args: 0)
+    arguments = [
+        "--scheduler-package-revision",
+        PACKAGE_SHA,
+        "--scheduler-package-successor",
+        PACKAGE_SUCCESSOR_SHA,
+        "--adopt-baseline-serial",
+        str(BASELINE_SERIAL),
+        "--adopt-baseline-dataset-rows",
+        str(BASELINE_ROWS),
+    ]
+    for account in q24.DEFAULT_ELIGIBLE_ACCOUNTS:
+        arguments.extend(["--eligible-account", account])
+
+    assert q24.main(arguments) == 0
+    assert captured == [
+        (
+            PACKAGE_SHA,
+            BASELINE_SERIAL,
+            BASELINE_ROWS,
+            q24.REFILL_SOLVER,
+            PACKAGE_SUCCESSOR_SHA,
+        )
+    ]
 
 
 def test_q24_supervisor_is_open_ended_and_pins_transition_arguments():
@@ -1178,5 +1584,6 @@ def test_q24_supervisor_is_open_ended_and_pins_transition_arguments():
     assert "q24_validated_async_aedt_campaign.py" in source
     assert "--execute-mft-family-production" in source
     assert "--scheduler-package-revision" in source
+    assert "--scheduler-package-successor" in source
     assert "--adopt-baseline-serial" in source
     assert "--adopt-baseline-dataset-rows" in source

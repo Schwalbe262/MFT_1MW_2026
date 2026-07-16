@@ -1,10 +1,10 @@
 """Rolling q23 -> q24 controller for validated async pooled AEDT pipelines.
 
 The scheduler's MFT project count remains the one 500-way source of truth.
-Every live q23 task therefore continues to occupy its existing logical slot;
-this controller never cancels, resubmits, or rewrites it. Only deficits that
-appear after the transition are emitted with the reviewed 8fab610 solver pin
-and the scheduler-whitelisted async workload family.
+Every live predecessor task therefore continues to occupy its existing logical
+slot; this controller never cancels, resubmits, or rewrites it. Only deficits
+that appear after an append-only solver or scheduler-package transition are
+emitted with the selected refill pins and whitelisted async workload family.
 """
 
 from __future__ import annotations
@@ -52,6 +52,17 @@ REFILL_GENERATION = (
     f"{REFILL_SOLVER}:{LIBRARY_REVISION}:seed{engine.CANDIDATE_SEED}"
 )
 ACTIVE_REFILL_SOLVER = REFILL_SOLVER
+IMMUTABLE_Q24_COMPATIBILITY_EVIDENCE_SHA256 = (
+    "2021f45c414f697c7516fc75b5fe3423c229f9806c20c6858fb71645d26aa6cb"
+)
+SCHEDULER_PACKAGE_SUCCESSOR_LEDGER_KEY = (
+    "scheduler_package_successor_ledger"
+)
+SCHEDULER_PACKAGE_SUCCESSOR_SCHEMA = (
+    "q24-scheduler-package-successor-v1"
+)
+MANIFEST_SCHEDULER_PACKAGE_REVISION = engine.SCHEDULER_PACKAGE_REVISION
+ACTIVE_SCHEDULER_PACKAGE_REVISION = engine.SCHEDULER_PACKAGE_REVISION
 
 _ORIGINAL_VERIFY_COMPATIBILITY = q23._ORIGINAL_VERIFY_COMPATIBILITY
 _ORIGINAL_RUN_LIVE_GATES = q23._ORIGINAL_RUN_LIVE_GATES
@@ -166,6 +177,57 @@ def _select_refill_solver(solver_revision: str) -> str:
             "q24 --refill-solver is absent from the approved successor ledger"
         )
     return solver_revision
+
+
+def _select_scheduler_package_revision(
+    manifest_revision: str,
+    successor_revision: str | None,
+) -> str:
+    if not engine.FULL_SHA.fullmatch(str(manifest_revision or "")):
+        raise engine.GateError(
+            "q24 immutable scheduler package requires a full lowercase SHA"
+        )
+    if successor_revision is None:
+        return manifest_revision
+    if not engine.FULL_SHA.fullmatch(str(successor_revision or "")):
+        raise engine.GateError(
+            "q24 --scheduler-package-successor requires a full lowercase SHA"
+        )
+    if successor_revision == manifest_revision:
+        raise engine.GateError(
+            "q24 scheduler package successor must differ from the immutable "
+            "manifest package"
+        )
+    return successor_revision
+
+
+def _audit_q24_remote_packages(
+    config_path: Path,
+    eligible_accounts: Sequence[str],
+    audit_python: Path = engine.DEFAULT_SSH_AUDIT_PYTHON,
+) -> list[dict[str, Any]]:
+    """Audit the selected refill package without changing manifest identity."""
+
+    manifest_revision = engine.SCHEDULER_PACKAGE_REVISION
+    if manifest_revision != MANIFEST_SCHEDULER_PACKAGE_REVISION:
+        raise engine.GateError("q24 immutable scheduler package pin drifted")
+    engine.SCHEDULER_PACKAGE_REVISION = ACTIVE_SCHEDULER_PACKAGE_REVISION
+    try:
+        rows = q23._audit_q23_remote_packages(
+            config_path,
+            eligible_accounts,
+            audit_python,
+        )
+    finally:
+        engine.SCHEDULER_PACKAGE_REVISION = manifest_revision
+    return [
+        {
+            **row,
+            "immutable_manifest_package": MANIFEST_SCHEDULER_PACKAGE_REVISION,
+            "selected_refill_package": ACTIVE_SCHEDULER_PACKAGE_REVISION,
+        }
+        for row in rows
+    ]
 
 
 def _sha256_file(path: Path) -> str:
@@ -480,6 +542,171 @@ def _candidate_successor_transition(
     return transition
 
 
+def _scheduler_package_successor_transition(
+    state_path: Path,
+    manifest: Mapping[str, Any],
+    target_revision: str,
+    *,
+    execute: bool,
+) -> dict[str, Any]:
+    """Append or adopt one package-only refill transition.
+
+    Package rollout intentionally has no candidate-generation effect. Existing
+    tasks retain their persisted submission environment, while only serials
+    accepted after this record use the selected package.
+    """
+
+    manifest_revision = str(
+        manifest.get("scheduler_package_revision")
+        or MANIFEST_SCHEDULER_PACKAGE_REVISION
+    )
+    if manifest_revision != MANIFEST_SCHEDULER_PACKAGE_REVISION:
+        raise engine.GateError("q24 immutable scheduler package pin drifted")
+    migration = manifest.get("migration")
+    if (
+        isinstance(migration, Mapping)
+        and migration.get("replacement_scheduler_package_revision")
+        != manifest_revision
+    ):
+        raise engine.GateError("q24 manifest package migration pin drifted")
+    manifest_identity = manifest.get("identity_sha256")
+    if not isinstance(manifest_identity, str) or not manifest_identity:
+        raise engine.GateError("q24 manifest identity is invalid")
+    baseline_serial = manifest.get("baseline_serial")
+    if (
+        isinstance(baseline_serial, bool)
+        or not isinstance(baseline_serial, int)
+        or baseline_serial < 0
+    ):
+        raise engine.GateError("q24 manifest baseline serial is invalid")
+    if not engine.FULL_SHA.fullmatch(str(target_revision or "")):
+        raise engine.GateError(
+            "q24 selected scheduler package requires a full lowercase SHA"
+        )
+
+    state = engine._read_json(state_path)
+    state_serial = state.get("serial")
+    if (
+        isinstance(state_serial, bool)
+        or not isinstance(state_serial, int)
+        or state_serial < baseline_serial
+    ):
+        raise engine.GateError("q24 scheduler package ledger serial is invalid")
+    raw_ledger = state.get(SCHEDULER_PACKAGE_SUCCESSOR_LEDGER_KEY, [])
+    if not isinstance(raw_ledger, list):
+        raise engine.GateError("q24 scheduler package successor ledger is invalid")
+
+    ledger: list[dict[str, Any]] = []
+    expected_source = manifest_revision
+    previous_digest: str | None = None
+    previous_serial = baseline_serial
+    seen_revisions = {manifest_revision}
+    for index, raw_record in enumerate(raw_ledger, start=1):
+        if not isinstance(raw_record, dict):
+            raise engine.GateError(
+                "q24 scheduler package successor record is invalid"
+            )
+        record = dict(raw_record)
+        expected_fixed = {
+            "schema": SCHEDULER_PACKAGE_SUCCESSOR_SCHEMA,
+            "campaign_id": CAMPAIGN_ID,
+            "manifest_identity_sha256": manifest_identity,
+            "sequence": index,
+            "predecessor_scheduler_package_revision": expected_source,
+            "previous_transition_sha256": previous_digest,
+            "semantics": (
+                "existing-tasks-retain-package-new-refills-use-replacement"
+            ),
+            "live_counting": "all-package-cohorts-one-logical-project-target",
+            "task_mutation": "none",
+            "cancellation": "none",
+        }
+        drift = {
+            key: (expected, record.get(key))
+            for key, expected in expected_fixed.items()
+            if record.get(key) != expected
+        }
+        replacement = record.get("replacement_scheduler_package_revision")
+        transition_serial = record.get("transition_serial")
+        recorded_digest = record.get("transition_sha256")
+        digest_payload = {
+            key: value
+            for key, value in record.items()
+            if key != "transition_sha256"
+        }
+        if (
+            drift
+            or not engine.FULL_SHA.fullmatch(str(replacement or ""))
+            or replacement in seen_revisions
+            or isinstance(transition_serial, bool)
+            or not isinstance(transition_serial, int)
+            or transition_serial < previous_serial
+            or transition_serial > state_serial
+            or recorded_digest != engine._digest(digest_payload)
+        ):
+            raise engine.GateError(
+                f"q24 scheduler package successor ledger drifted: {drift}"
+            )
+        ledger.append(record)
+        seen_revisions.add(replacement)
+        expected_source = replacement
+        previous_serial = transition_serial
+        previous_digest = recorded_digest
+
+    if target_revision == expected_source:
+        if ledger:
+            return {
+                **ledger[-1],
+                "ledger_action": "adopt",
+                "ledger_length": len(ledger),
+            }
+        return {
+            "schema": SCHEDULER_PACKAGE_SUCCESSOR_SCHEMA,
+            "campaign_id": CAMPAIGN_ID,
+            "manifest_identity_sha256": manifest_identity,
+            "selected_scheduler_package_revision": manifest_revision,
+            "semantics": "immutable-manifest-package-no-successor-rollout",
+            "ledger_action": "none",
+            "ledger_length": 0,
+        }
+    if target_revision in seen_revisions:
+        raise engine.GateError(
+            "q24 scheduler package rollback is forbidden after successor rollout"
+        )
+
+    record_payload = {
+        "schema": SCHEDULER_PACKAGE_SUCCESSOR_SCHEMA,
+        "campaign_id": CAMPAIGN_ID,
+        "manifest_identity_sha256": manifest_identity,
+        "sequence": len(ledger) + 1,
+        "predecessor_scheduler_package_revision": expected_source,
+        "replacement_scheduler_package_revision": target_revision,
+        "transition_serial": state_serial,
+        "previous_transition_sha256": previous_digest,
+        "semantics": "existing-tasks-retain-package-new-refills-use-replacement",
+        "live_counting": "all-package-cohorts-one-logical-project-target",
+        "task_mutation": "none",
+        "cancellation": "none",
+    }
+    record = {
+        **record_payload,
+        "transition_sha256": engine._digest(record_payload),
+    }
+    action = "preview-append"
+    if execute:
+        if Path(engine.feeder.STATE).resolve() != state_path.resolve():
+            raise engine.GateError("q24 configured feeder state path drifted")
+        updated = dict(state)
+        updated[SCHEDULER_PACKAGE_SUCCESSOR_LEDGER_KEY] = [*ledger, record]
+        engine.feeder.save_state(updated, immediate_permission_fallback=True)
+        action = "append"
+    return {
+        **record,
+        "ledger_action": action,
+        "ledger_length": len(ledger) + 1,
+    }
+
+
 def verify_rolling_inventory(db_path: Path) -> dict[str, Any]:
     """Accept only the predecessor and append-only approved refill pins."""
 
@@ -536,6 +763,12 @@ def verify_rolling_inventory(db_path: Path) -> dict[str, Any]:
         "predecessor_live": len(ids["predecessor"]),
         "replacement_live": sum(len(ids[cohort]) for cohort in refill_cohorts),
         "selected_refill_solver": ACTIVE_REFILL_SOLVER,
+        "immutable_manifest_scheduler_package": (
+            MANIFEST_SCHEDULER_PACKAGE_REVISION
+        ),
+        "selected_refill_scheduler_package": (
+            ACTIVE_SCHEDULER_PACKAGE_REVISION
+        ),
         "selected_refill_live": len(
             ids[cohorts[ACTIVE_REFILL_SOLVER]]
         ),
@@ -546,8 +779,9 @@ def verify_rolling_inventory(db_path: Path) -> dict[str, Any]:
             for task_id in ids[cohort]
         ][:20],
         "counting_semantics": (
-            "all exact rolling cohorts count toward one MFT project target; "
-            "new submissions use the explicitly selected refill solver only"
+            "all exact solver and scheduler-package cohorts count toward one "
+            "MFT project target; new submissions use only the explicitly "
+            "selected refill solver and scheduler package"
         ),
         "cancellations": 0,
     }
@@ -684,6 +918,17 @@ def _verify_q24_compatibility(
             "selected_refill_solver_revision": selected_solver,
             "successor_rollout": successor_rollout,
         },
+        "q24_scheduler_package_selection": {
+            "immutable_manifest_scheduler_package_revision": (
+                MANIFEST_SCHEDULER_PACKAGE_REVISION
+            ),
+            "selected_refill_scheduler_package_revision": (
+                ACTIVE_SCHEDULER_PACKAGE_REVISION
+            ),
+            "manifest_mutation": "none",
+            "existing_task_mutation": "none",
+            "cancellation": "none",
+        },
     }
 
 
@@ -722,7 +967,12 @@ def _q24_manifest_identity(
             engine.SCHEDULER_PACKAGE_REVISION
         ),
         "transition_serial": int(baseline_serial),
-        "compatibility_evidence_sha256": _sha256_file(COMPATIBILITY_PATH),
+        # This digest is part of the already-persisted q24 manifest identity.
+        # Keep it frozen even if the separately audited evidence file gains
+        # operational metadata after the campaign starts.
+        "compatibility_evidence_sha256": (
+            IMMUTABLE_Q24_COMPATIBILITY_EVIDENCE_SHA256
+        ),
         "live_counting": "predecessor-plus-replacement-one-project-target",
         "new_refill": "replacement-only",
         "predecessor_task_mutation": "none",
@@ -810,6 +1060,12 @@ def _q24_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
         "MFT_CAMPAIGN_MIGRATION_REPLACEMENT_SOLVER": ACTIVE_REFILL_SOLVER,
         "MFT_AEDT_WORKLOAD_FAMILY": "mft_validated_async",
         "MFT_AEDT_ASYNC_DISPATCH_SETTLE_SECONDS": "2",
+        "MFT_CAMPAIGN_IMMUTABLE_SCHEDULER_PACKAGE_REVISION": (
+            MANIFEST_SCHEDULER_PACKAGE_REVISION
+        ),
+        "MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION": (
+            ACTIVE_SCHEDULER_PACKAGE_REVISION
+        ),
     })
     return {
         **submission,
@@ -885,12 +1141,31 @@ def _execute_q24_cycle(
     gates = engine.run_live_gates(args)
     state_path = args.state_dir / "feeder_state.json"
     successor_transition: dict[str, Any] | None = None
+    package_transition: dict[str, Any] | None = None
     with engine.feeder.campaign_mutation_lock():
         _pool, logical_target = engine.verify_pool_and_policy(args.scheduler_url)
         if logical_target:
             successor_transition = _candidate_successor_transition(
                 state_path,
                 ACTIVE_REFILL_SOLVER,
+                execute=True,
+            )
+            package_preview = _scheduler_package_successor_transition(
+                state_path,
+                manifest,
+                ACTIVE_SCHEDULER_PACKAGE_REVISION,
+                execute=False,
+            )
+            if package_preview["ledger_action"] == "preview-append":
+                engine.audit_remote_packages(
+                    args.accounts_config,
+                    args.eligible_accounts,
+                    args.ssh_audit_python,
+                )
+            package_transition = _scheduler_package_successor_transition(
+                state_path,
+                manifest,
+                ACTIVE_SCHEDULER_PACKAGE_REVISION,
                 execute=True,
             )
         current_serial = engine._state_serial(state_path)
@@ -921,6 +1196,9 @@ def _execute_q24_cycle(
                 "identity_sha256": manifest["identity_sha256"],
                 "eligible_accounts": list(manifest["eligible_accounts"]),
                 "initial_refill_solver_revision": REFILL_SOLVER,
+                "immutable_scheduler_package_revision": (
+                    MANIFEST_SCHEDULER_PACKAGE_REVISION
+                ),
             },
             "phase": (
                 "stop-requested-draining"
@@ -934,7 +1212,11 @@ def _execute_q24_cycle(
             "submission_ceiling": None,
             "completion_and_failure_refill": True,
             "selected_refill_solver_revision": ACTIVE_REFILL_SOLVER,
+            "selected_refill_scheduler_package_revision": (
+                ACTIVE_SCHEDULER_PACKAGE_REVISION
+            ),
             "candidate_cursor_successor_transition": successor_transition,
+            "scheduler_package_successor_transition": package_transition,
             "gates": gates,
             "no_cancellation_performed": True,
         }
@@ -1047,7 +1329,14 @@ def _q24_static_plan(
     plan["refill_rollout"] = {
         "immutable_manifest_solver": REFILL_SOLVER,
         "selected_refill_solver": ACTIVE_REFILL_SOLVER,
+        "immutable_manifest_scheduler_package": (
+            MANIFEST_SCHEDULER_PACKAGE_REVISION
+        ),
+        "selected_refill_scheduler_package": (
+            ACTIVE_SCHEDULER_PACKAGE_REVISION
+        ),
         "cursor_transition": "atomic-high-water-no-replay",
+        "scheduler_package_transition": "append-only-state-ledger",
         "live_task_mutation": "none",
         "cancellation": "none",
     }
@@ -1058,9 +1347,9 @@ def _q24_static_plan(
     plan["execution_requires"] = [
         "q23 controller is stopped but every q23 scheduler task remains untouched",
         "transition baseline equals the stopped feeder serial and dataset row count",
-        "all five accounts retain the exact audited scheduler package",
+        "all five accounts expose the exact selected refill scheduler package",
         "replacement solver is an advertised branch head",
-        "only replacement solver is emitted after the transition serial",
+        "only selected solver/package pins are emitted after their transitions",
     ]
     return plan
 
@@ -1070,12 +1359,21 @@ def configure_engine(
     baseline_serial: int,
     baseline_dataset_rows: int,
     refill_solver: str = REFILL_SOLVER,
+    scheduler_package_successor: str | None = None,
 ) -> None:
     global ACTIVE_REFILL_SOLVER
+    global ACTIVE_SCHEDULER_PACKAGE_REVISION
+    global MANIFEST_SCHEDULER_PACKAGE_REVISION
     ACTIVE_REFILL_SOLVER = _select_refill_solver(refill_solver)
+    selected_scheduler_package = _select_scheduler_package_revision(
+        scheduler_package_revision,
+        scheduler_package_successor,
+    )
     q23.configure_engine(
         scheduler_package_revision, baseline_serial, baseline_dataset_rows
     )
+    MANIFEST_SCHEDULER_PACKAGE_REVISION = scheduler_package_revision
+    ACTIVE_SCHEDULER_PACKAGE_REVISION = selected_scheduler_package
     engine.CAMPAIGN_ID = CAMPAIGN_ID
     engine.SCHEMA = SCHEMA
     engine.ACCOUNT_EXPANSION_SCHEMA = f"{SCHEMA}-unsupported-v2"
@@ -1093,6 +1391,7 @@ def configure_engine(
     engine.pooled_submission = _q24_pooled_submission
     engine.verify_owned_serials = _verify_q24_owned_serials
     engine.execute_cycle = _execute_q24_cycle
+    engine.audit_remote_packages = _audit_q24_remote_packages
     engine._write_status = _write_q24_status
 
 
@@ -1102,6 +1401,7 @@ def _bootstrap_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adopt-baseline-serial", required=True, type=int)
     parser.add_argument("--adopt-baseline-dataset-rows", required=True, type=int)
     parser.add_argument("--refill-solver", default=REFILL_SOLVER)
+    parser.add_argument("--scheduler-package-successor")
     return parser
 
 
@@ -1118,6 +1418,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         bootstrap.adopt_baseline_serial,
         bootstrap.adopt_baseline_dataset_rows,
         bootstrap.refill_solver,
+        bootstrap.scheduler_package_successor,
     )
     engine_argv = [
         *forwarded,
