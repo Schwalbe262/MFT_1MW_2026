@@ -201,6 +201,24 @@ class JobRunner:
             return self.queue.fail(
                 job.id, self.owner, "invalid environment payload", retry=False
             )
+        raw_non_retryable_codes = payload.get("non_retryable_exit_codes", [])
+        if (
+            not isinstance(raw_non_retryable_codes, list)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+                or value > 255
+                for value in raw_non_retryable_codes
+            )
+        ):
+            return self.queue.fail(
+                job.id,
+                self.owner,
+                "invalid non_retryable_exit_codes payload",
+                retry=False,
+            )
+        non_retryable_exit_codes = set(raw_non_retryable_codes)
         environment.update({str(key): str(value) for key, value in raw_environment.items()})
         log_path = work_dir / f"attempt-{job.attempt:03d}.log"
         process = None
@@ -247,11 +265,19 @@ class JobRunner:
                     base_backoff_seconds=5,
                 )
             if return_code != 0:
+                deterministic_terminal = return_code in non_retryable_exit_codes
                 return self.queue.fail(
                     job.id,
                     self.owner,
-                    f"command_exit:{return_code};log={log_path}",
-                    retry=bool(payload.get("retry", True)),
+                    (
+                        f"command_exit:{return_code};"
+                        f"non_retryable={str(deterministic_terminal).lower()};"
+                        f"log={log_path}"
+                    ),
+                    retry=(
+                        bool(payload.get("retry", True))
+                        and not deterministic_terminal
+                    ),
                     base_backoff_seconds=float(
                         payload.get("retry_backoff_seconds", 30)
                     ),
