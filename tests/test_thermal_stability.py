@@ -308,6 +308,20 @@ class _DesignWrapper:
 
 
 class ThermalStabilityTest(unittest.TestCase):
+    def test_blocking_solve_logs_visible_start_and_end_markers(self):
+        with patch.dict(
+            os.environ, {"MFT_AEDT_SOLVE_HEARTBEAT_SECONDS": "5"}
+        ), self.assertLogs(level="WARNING") as captured:
+            with thermal._blocking_solve_log_heartbeat(
+                "project-a", "icepak_thermal", "ThermalSetup"
+            ):
+                pass
+
+        output = "\n".join(captured.output)
+        self.assertIn("pooled blocking solve started", output)
+        self.assertIn("project=project-a", output)
+        self.assertIn("pooled blocking solve ended", output)
+
     def test_pooled_field_summary_uses_attested_shared_export(self):
         from module import aedt_pool_adapter
 

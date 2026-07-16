@@ -19,6 +19,7 @@ import math
 import logging
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,6 +58,78 @@ def _native_solver(app):
 
 _THERMAL_DESIGN_NAME = "icepak_thermal"
 _THERMAL_SETUP_NAME = "ThermalSetup"
+
+
+@contextmanager
+def _blocking_solve_log_heartbeat(project_name, design_name, setup_name):
+    """Emit progress without making any AEDT calls from the helper thread."""
+
+    raw_interval = os.environ.get(
+        "MFT_AEDT_SOLVE_HEARTBEAT_SECONDS", "60"
+    ).strip()
+    try:
+        interval_s = float(raw_interval)
+    except (TypeError, ValueError, OverflowError):
+        logging.warning(
+            "[thermal] invalid MFT_AEDT_SOLVE_HEARTBEAT_SECONDS=%r; using 60",
+            raw_interval,
+        )
+        interval_s = 60.0
+    if not math.isfinite(interval_s):
+        interval_s = 60.0
+    interval_s = min(600.0, max(5.0, interval_s))
+
+    started = time.monotonic()
+    stop = threading.Event()
+
+    def emit_heartbeat():
+        while not stop.wait(interval_s):
+            logging.warning(
+                "[thermal] pooled blocking solve heartbeat elapsed_s=%.1f "
+                "project=%s design=%s setup=%s",
+                time.monotonic() - started,
+                project_name,
+                design_name,
+                setup_name,
+            )
+
+    logging.warning(
+        "[thermal] pooled blocking solve started project=%s design=%s setup=%s "
+        "heartbeat_s=%.1f",
+        project_name,
+        design_name,
+        setup_name,
+        interval_s,
+    )
+    worker = threading.Thread(
+        target=emit_heartbeat,
+        name="mft-thermal-solve-heartbeat",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        yield
+    except BaseException:
+        logging.exception(
+            "[thermal] pooled blocking solve raised after %.1fs project=%s "
+            "design=%s setup=%s",
+            time.monotonic() - started,
+            project_name,
+            design_name,
+            setup_name,
+        )
+        raise
+    finally:
+        stop.set()
+        worker.join(timeout=1.0)
+        logging.warning(
+            "[thermal] pooled blocking solve ended elapsed_s=%.1f project=%s "
+            "design=%s setup=%s",
+            time.monotonic() - started,
+            project_name,
+            design_name,
+            setup_name,
+        )
 
 
 def _field_summary_data_frame(sim, field_summary, setup):
@@ -1055,8 +1128,11 @@ def _solve_exact_pooled_thermal_setup(
 
     sim.solver_may_be_running = True
     started = clock()
-    with sim.aedt_native_solve_window():
-        returned = native_design.Analyze(setup_name, True)
+    with _blocking_solve_log_heartbeat(
+        preflight["project"], preflight["design"], setup_name
+    ):
+        with sim.aedt_native_solve_window():
+            returned = native_design.Analyze(setup_name, True)
     if returned is not None and (type(returned) is not int or returned != 0):
         raise RuntimeError(
             "[thermal] native blocking Analyze returned invalid status: "
