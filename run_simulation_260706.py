@@ -1955,6 +1955,17 @@ class Simulation():
         self.NUM_CORE = max(1, min(avail, 4))
         self.NUM_TASK = 1
         self.desktop = desktop
+        # PyAEDT 0.22 re-enters ``Desktop.__init__`` whenever an application
+        # wrapper (Maxwell3d/Icepak) is constructed.  With multi-desktop mode
+        # enabled that path force-recreates the gRPC application and can leave
+        # ``desktop.odesktop`` temporarily unavailable even though the raw
+        # Desktop proxy and the authorized endpoint are still alive.  Keep the
+        # last observed raw proxy, but use it only after the strict project and
+        # endpoint attestation in ``_native_desktop_handle``.
+        self._last_known_native_desktop = None
+        self._last_known_native_desktop_identity = {}
+        self._pooled_desktop_reattach_attempted = False
+        self._remember_native_desktop_handle(desktop)
         self.full_model = False
         self.project_path = None
         self.solve_attempts = {"matrix": 0, "cap": 0, "loss": 0}
@@ -5697,6 +5708,189 @@ class Simulation():
         except Exception as message_error:
             logging.warning(f"[{label}] AEDT messages unavailable: {message_error}")
 
+    @staticmethod
+    def _positive_desktop_identity(value):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return parsed if parsed > 0 else 0
+
+    def _remember_native_desktop_handle(self, desktop_wrapper):
+        """Snapshot one live wrapper proxy and its immutable endpoint identity."""
+
+        if desktop_wrapper is None:
+            return None
+        try:
+            odesktop = getattr(desktop_wrapper, "odesktop", None)
+        except Exception:
+            return None
+        if odesktop is None or odesktop is False or not callable(
+                getattr(odesktop, "SetActiveProject", None)):
+            return None
+
+        process_id = self._positive_desktop_identity(
+            getattr(desktop_wrapper, "aedt_process_id", None)
+        )
+        port = self._positive_desktop_identity(
+            getattr(desktop_wrapper, "port", None)
+            or getattr(desktop_wrapper, "grpc_port", None)
+        )
+        self._last_known_native_desktop = odesktop
+        self._last_known_native_desktop_identity = {
+            "process_id": process_id,
+            "port": port,
+        }
+        return odesktop
+
+    def _attest_cached_native_desktop(self, odesktop):
+        """Fail closed unless a cached raw proxy is still this exact session."""
+
+        if odesktop is None or odesktop is False or not callable(
+                getattr(odesktop, "SetActiveProject", None)):
+            raise RuntimeError("cached native Desktop proxy is unavailable")
+        if bool(getattr(self, "pooled_release_done", False)):
+            raise RuntimeError("pooled lease has already been released")
+
+        lease = getattr(self, "aedt_lease", None)
+        lease_state = str(getattr(lease, "state", "") or "").strip().lower()
+        if lease_state in {
+                "releasing", "released", "failed", "cancelled", "expired"}:
+            raise RuntimeError(
+                f"pooled lease is no longer active: state={lease_state!r}"
+            )
+
+        identity = dict(getattr(
+            self, "_last_known_native_desktop_identity", {}
+        ) or {})
+        expected_process_id = self._positive_desktop_identity(
+            getattr(lease, "session_process_id", None)
+        ) or self._positive_desktop_identity(identity.get("process_id"))
+        expected_port = 0
+        endpoint = str(getattr(lease, "endpoint", "") or "").strip()
+        if ":" in endpoint:
+            expected_port = self._positive_desktop_identity(
+                endpoint.rsplit(":", 1)[1]
+            )
+        expected_port = expected_port or self._positive_desktop_identity(
+            identity.get("port")
+        )
+
+        get_process_id = getattr(odesktop, "GetProcessID", None)
+        if expected_process_id and callable(get_process_id):
+            actual_process_id = self._positive_desktop_identity(
+                get_process_id()
+            )
+            if actual_process_id != expected_process_id:
+                raise RuntimeError(
+                    "cached native Desktop PID mismatch: "
+                    f"expected={expected_process_id}, actual={actual_process_id}"
+                )
+
+        get_port = getattr(odesktop, "GetGrpcServerPort", None)
+        if expected_port and callable(get_port):
+            actual_port = self._positive_desktop_identity(get_port())
+            if actual_port != expected_port:
+                raise RuntimeError(
+                    "cached native Desktop port mismatch: "
+                    f"expected={expected_port}, actual={actual_port}"
+                )
+
+        get_projects = getattr(odesktop, "GetProjects", None)
+        if not callable(get_projects):
+            raise RuntimeError(
+                "cached native Desktop cannot enumerate live projects"
+            )
+        projects = list(get_projects() or [])
+        expected_project = str(
+            getattr(self, "PROJECT_NAME", "") or ""
+        ).strip()
+        if expected_project:
+            matches = []
+            errors = []
+            for index, project in enumerate(projects):
+                try:
+                    name = str(project.GetName() or "").strip()
+                except Exception as error:
+                    errors.append(
+                        f"project[{index}]={type(error).__name__}: {error}"
+                    )
+                    continue
+                if name == expected_project:
+                    matches.append(project)
+            if len(matches) != 1:
+                detail = f"; errors={errors}" if errors else ""
+                raise RuntimeError(
+                    "cached native Desktop exact-project attestation failed: "
+                    f"expected={expected_project!r}, found={len(matches)}"
+                    f"{detail}"
+                )
+        return odesktop
+
+    def _reattach_exact_pooled_desktop(self):
+        """Try one non-owning reconnect to the lease-authorized endpoint."""
+
+        if bool(getattr(self, "_pooled_desktop_reattach_attempted", False)):
+            raise RuntimeError(
+                "pooled Desktop same-lease reattach was already attempted"
+            )
+        self._pooled_desktop_reattach_attempted = True
+        if bool(getattr(self, "pooled_release_done", False)):
+            raise RuntimeError("pooled lease has already been released")
+
+        lease = getattr(self, "aedt_lease", None)
+        connector = getattr(lease, "connect_desktop", None)
+        if not callable(connector):
+            raise RuntimeError(
+                "pooled lease cannot reconnect its authorized Desktop"
+            )
+        lease_state = str(getattr(lease, "state", "") or "").strip().lower()
+        if lease_state in {
+                "releasing", "released", "failed", "cancelled", "expired"}:
+            raise RuntimeError(
+                f"pooled lease is no longer active: state={lease_state!r}"
+            )
+
+        # AedtProjectLease.connect_desktop first refreshes the token-authorized
+        # session identity, probes its exact endpoint, attaches with
+        # new_desktop=False/close_on_exit=False, and attests PID/version/port.
+        # It also nests through the same re-entrant automation lock, so this is
+        # safe when a caller discovered the missing handle inside a transaction.
+        desktop = connector(
+            non_graphical=GUI,
+            desktop_factory=_PooledDesktop,
+        )
+        odesktop = self._remember_native_desktop_handle(desktop)
+        if odesktop is None:
+            raise RuntimeError(
+                "same-lease Desktop reattach returned no native proxy"
+            )
+
+        previous_desktop = getattr(self, "desktop", None)
+        self.desktop = desktop
+        project_wrapper = getattr(self, "project", None)
+        try:
+            project_state = vars(project_wrapper)
+        except TypeError:
+            project_state = {}
+        if project_state and (
+                "desktop" in project_state
+                or project_state.get("desktop") is previous_desktop):
+            project_state["desktop"] = desktop
+
+        design = getattr(self, "design1", None)
+        app = getattr(design, "solver_instance", None)
+        if app is not None:
+            app_state = vars(app)
+            app_state["_desktop_class"] = desktop
+            app_state["_desktop"] = odesktop
+            app_state["_odesktop"] = odesktop
+
+        # connect_desktop's endpoint/PID checks are necessary but the lease's
+        # exact project must also still exist before the recovered proxy is
+        # admitted back into this runner.
+        return self._attest_cached_native_desktop(odesktop)
+
     def _native_desktop_handle(self):
         """Return the original Desktop handle, never a copied-design proxy."""
         candidates = [getattr(self, "desktop", None)]
@@ -5707,10 +5901,44 @@ class Simulation():
             project_state = {}
         candidates.append(project_state.get("desktop"))
         for candidate in candidates:
-            odesktop = getattr(candidate, "odesktop", None)
-            if odesktop is not None and odesktop is not False and callable(
-                    getattr(odesktop, "SetActiveProject", None)):
+            odesktop = self._remember_native_desktop_handle(candidate)
+            if odesktop is not None:
                 return odesktop
+
+        cached_error = None
+        cached = getattr(self, "_last_known_native_desktop", None)
+        if self._backend_mode() == "pooled" and cached is not None:
+            try:
+                attested = self._attest_cached_native_desktop(cached)
+            except Exception as error:
+                cached_error = error
+            else:
+                logging.warning(
+                    "PyAEDT Desktop wrapper was unavailable during gRPC "
+                    "recreation; using the endpoint/project-attested cached "
+                    "native proxy"
+                )
+                return attested
+        if self._backend_mode() == "pooled":
+            try:
+                reattached = self._reattach_exact_pooled_desktop()
+            except Exception as reattach_error:
+                details = []
+                if cached_error is not None:
+                    details.append(
+                        f"cached proxy attestation failed: {cached_error}"
+                    )
+                details.append(f"same-lease reattach failed: {reattach_error}")
+                raise RuntimeError(
+                    "original native AEDT Desktop handle is unavailable; "
+                    + "; ".join(details)
+                ) from reattach_error
+            logging.warning(
+                "PyAEDT Desktop wrapper and cached proxy were unavailable; "
+                "recovered the exact authorized endpoint with one non-owning "
+                "same-lease reattach"
+            )
+            return reattached
         raise RuntimeError("original native AEDT Desktop handle is unavailable")
 
     def _verified_pooled_native_setup(

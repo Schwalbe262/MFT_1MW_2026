@@ -290,6 +290,127 @@ def test_pooled_project_refresh_retries_only_transient_getprojects_grpc(
     assert caplog.text.count("GetProjects transient gRPC failure") == 2
 
 
+def test_native_desktop_handle_uses_only_endpoint_project_attested_cache(
+        tmp_path, caplog):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    native_desktop = simulation.desktop.odesktop
+    native_desktop.GetProcessID = lambda: 8123
+    native_desktop.GetGrpcServerPort = lambda: 57387
+    simulation.aedt_lease = SimpleNamespace(
+        protocol_version=2,
+        state="active",
+        session_process_id="8123",
+        endpoint="nib110.hpc:57387",
+    )
+
+    assert simulation._native_desktop_handle() is native_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with caplog.at_level("WARNING"):
+        recovered = simulation._native_desktop_handle()
+
+    assert recovered is native_desktop
+    assert "endpoint/project-attested cached native proxy" in caplog.text
+
+
+def test_native_desktop_handle_rejects_dead_or_replaced_cached_endpoint(
+        tmp_path):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    native_desktop = simulation.desktop.odesktop
+    native_desktop.GetProcessID = lambda: 9999
+    native_desktop.GetGrpcServerPort = lambda: 57387
+    simulation.aedt_lease = SimpleNamespace(
+        protocol_version=2,
+        state="active",
+        session_process_id="8123",
+        endpoint="nib110.hpc:57387",
+    )
+
+    assert simulation._native_desktop_handle() is native_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with pytest.raises(
+            RuntimeError, match="cached native Desktop PID mismatch"):
+        simulation._native_desktop_handle()
+
+
+def test_native_desktop_handle_reattaches_exact_lease_once_after_stale_cache(
+        tmp_path, caplog):
+    simulation, app, _design, _project_path = _simulation(tmp_path, "pooled")
+    stale_desktop = simulation.desktop.odesktop
+    stale_desktop.GetProcessID = lambda: 9999
+    fresh_project = simulation.desktop.odesktop.projects[0]
+    fresh_desktop = _FakeNativeDesktop([fresh_project])
+    fresh_desktop.GetProcessID = lambda: 8123
+    fresh_desktop.GetGrpcServerPort = lambda: 57387
+    fresh_wrapper = SimpleNamespace(
+        odesktop=fresh_desktop,
+        aedt_process_id=8123,
+        port=57387,
+    )
+    connect_calls = []
+
+    def connect_desktop(**kwargs):
+        connect_calls.append(kwargs)
+        return fresh_wrapper
+
+    simulation.aedt_lease = SimpleNamespace(
+        protocol_version=2,
+        state="active",
+        session_process_id="8123",
+        endpoint="nib110.hpc:57387",
+        connect_desktop=connect_desktop,
+    )
+
+    assert simulation._native_desktop_handle() is stale_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with caplog.at_level("WARNING"):
+        recovered = simulation._native_desktop_handle()
+
+    assert recovered is fresh_desktop
+    assert len(connect_calls) == 1
+    assert isinstance(connect_calls[0]["non_graphical"], bool)
+    assert connect_calls[0]["desktop_factory"].__name__ == "_PooledDesktop"
+    assert simulation.desktop is fresh_wrapper
+    assert simulation.project.desktop is fresh_wrapper
+    assert app._desktop_class is fresh_wrapper
+    assert app._desktop is fresh_desktop
+    assert app._odesktop is fresh_desktop
+    assert "one non-owning same-lease reattach" in caplog.text
+
+    # The recovered wrapper can itself enter another failed recreation gap,
+    # but one task must never create an unbounded reconnect loop.
+    fresh_desktop.GetProcessID = lambda: 7777
+    fresh_wrapper.odesktop = None
+    simulation.project.desktop.odesktop = None
+    with pytest.raises(RuntimeError, match="already attempted"):
+        simulation._native_desktop_handle()
+    assert len(connect_calls) == 1
+
+
+def test_native_desktop_handle_rejects_cached_proxy_after_lease_release(
+        tmp_path):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    native_desktop = simulation.desktop.odesktop
+    simulation.aedt_lease = SimpleNamespace(
+        protocol_version=2,
+        state="released",
+        session_process_id="",
+        endpoint="",
+    )
+
+    assert simulation._native_desktop_handle() is native_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with pytest.raises(RuntimeError, match="lease is no longer active"):
+        simulation._native_desktop_handle()
+
+
 def test_pooled_project_refresh_does_not_retry_non_grpc_getprojects_error(
         tmp_path):
     simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
