@@ -149,6 +149,7 @@ def test_q24_submission_emits_only_validated_async_replacement(configured_engine
     assert submission["cpus"] == 4
     assert submission["account_names"] == q24.DEFAULT_ELIGIBLE_ACCOUNTS
     assert submission["prevalidated_cycle"] is True
+    assert submission["scheduler_admission_owns_queueing"] is True
     assert environment["MFT_CAMPAIGN_ID"] == q24.CAMPAIGN_ID
     assert environment["MFT_CAMPAIGN_MIGRATION_PREDECESSOR"] == q23.CAMPAIGN_ID
     assert environment["MFT_CAMPAIGN_MIGRATION_PREDECESSOR_SOLVER"] == (
@@ -159,6 +160,102 @@ def test_q24_submission_emits_only_validated_async_replacement(configured_engine
     )
     assert environment["MFT_AEDT_WORKLOAD_FAMILY"] == "mft_validated_async"
     assert environment["MFT_AEDT_ASYNC_DISPATCH_SETTLE_SECONDS"] == "2"
+
+
+def test_q24_refills_exact_deficit_while_resource_queue_is_backed_off(
+    configured_engine, tmp_path
+):
+    args = configured_engine._parser().parse_args([])
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    submission = configured_engine.pooled_submission(args)
+    state = {"serial": BASELINE_SERIAL, "submitted_samples": 0}
+    counts = {"queued": 0, "attaching": 0, "running": 0}
+    capacity = {
+        "ready_fit_slots": 0,
+        "queue_state": "blocked",
+        "queue_reason": "allocation backoff active for cpu",
+        "queue_submission_allowed": False,
+        "project_counts": counts,
+        "project_active": 0,
+        "project_submission_slots": 3,
+        "submission_allowed": False,
+    }
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                engine.feeder.scheduler_client,
+                "campaign_mutation_lock_is_held",
+                return_value=True,
+            )
+        )
+        stack.enter_context(patch.object(engine.feeder, "load_state", return_value=state))
+        stack.enter_context(
+            patch.object(
+                engine.feeder,
+                "scheduler_snapshot",
+                return_value=(counts, counts, [], capacity),
+            )
+        )
+        stack.enter_context(
+            patch.object(engine.feeder, "dataset_collection_snapshot", return_value=(0, set()))
+        )
+        stack.enter_context(patch.object(engine.feeder, "campaign_inventory", return_value=[]))
+        stack.enter_context(
+            patch.object(engine.feeder, "cursor_after_valid_candidates", return_value=0)
+        )
+        stack.enter_context(
+            patch.object(
+                engine.feeder,
+                "next_valid_candidate",
+                side_effect=[
+                    (1, 0, {"candidate": 1}),
+                    (2, 1, {"candidate": 2}),
+                    (3, 2, {"candidate": 3}),
+                ],
+            )
+        )
+        submit = stack.enter_context(
+            patch.object(engine.feeder, "submit", side_effect=[901, 902, 903])
+        )
+        stack.enter_context(patch.object(engine.feeder, "save_state"))
+        stack.enter_context(patch.object(engine.feeder.time, "sleep"))
+        assert engine.feeder.step(
+            None,
+            target=3,
+            solver_revision=q24.REFILL_SOLVER,
+            library_revision=q24.LIBRARY_REVISION,
+            pooled_submission=submission,
+        )
+
+    assert submit.call_count == 3
+    assert state["serial"] == BASELINE_SERIAL + 3
+    assert all(
+        call.kwargs["submission_env"]["MFT_AEDT_WORKLOAD_FAMILY"]
+        == "mft_validated_async"
+        for call in submit.call_args_list
+    )
+
+
+def test_queueing_override_rejects_non_q24_campaign(configured_engine):
+    args = configured_engine._parser().parse_args([])
+    args.eligible_accounts = q24.DEFAULT_ELIGIBLE_ACCOUNTS
+    submission = configured_engine.pooled_submission(args)
+    submission["submission_env"] = {
+        **submission["submission_env"],
+        "MFT_CAMPAIGN_ID": q23.CAMPAIGN_ID,
+    }
+    with patch.object(
+        engine.feeder.scheduler_client,
+        "campaign_mutation_lock_is_held",
+        return_value=True,
+    ), pytest.raises(engine.feeder.SchedulerError, match="reserved for the exact q24"):
+        engine.feeder.step(
+            None,
+            target=3,
+            solver_revision=q24.REFILL_SOLVER,
+            library_revision=q24.LIBRARY_REVISION,
+            pooled_submission=submission,
+        )
 
 
 def test_q24_pool_gate_requires_server_side_validated_parallel(monkeypatch):

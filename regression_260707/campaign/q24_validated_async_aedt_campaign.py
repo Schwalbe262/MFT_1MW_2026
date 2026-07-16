@@ -489,7 +489,14 @@ def _q24_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
         "MFT_AEDT_WORKLOAD_FAMILY": "mft_validated_async",
         "MFT_AEDT_ASYNC_DISPATCH_SETTLE_SECONDS": "2",
     })
-    return {**submission, "submission_env": environment}
+    return {
+        **submission,
+        "submission_env": environment,
+        # Maintain the user-owned logical target even while immediate CPU
+        # placement is backlogged. Scheduler/AEDT admission still decides
+        # when each accepted task can attach and run.
+        "scheduler_admission_owns_queueing": True,
+    }
 
 
 def _run_q24_current_live_gates(args: argparse.Namespace) -> dict[str, Any]:

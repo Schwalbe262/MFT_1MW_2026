@@ -1010,6 +1010,8 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         "submission_delay_seconds", DEFAULT_SUBMISSION_DELAY_SECONDS)
     immediate_state_permission_fallback = cycle_submission_options.pop(
         "immediate_state_permission_fallback", False)
+    scheduler_admission_owns_queueing = cycle_submission_options.pop(
+        "scheduler_admission_owns_queueing", False)
     if (isinstance(submission_delay_seconds, bool)
             or not isinstance(submission_delay_seconds, (int, float))
             or not math.isfinite(float(submission_delay_seconds))
@@ -1020,6 +1022,9 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     if not isinstance(immediate_state_permission_fallback, bool):
         raise SchedulerError(
             "immediate_state_permission_fallback must be a bool")
+    if not isinstance(scheduler_admission_owns_queueing, bool):
+        raise SchedulerError(
+            "scheduler_admission_owns_queueing must be a bool")
     unbounded_dataset = max_samples is None
     if unbounded_dataset and not pooled_mode:
         raise SchedulerError(
@@ -1030,6 +1035,22 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     if pooled_mode and not pooled_authorized:
         raise SchedulerError(
             f"pooled feeder hard cap is {MAX_POOLED_ACTIVE}")
+    if scheduler_admission_owns_queueing:
+        environment = cycle_submission_options.get("submission_env") or {}
+        if (
+            not pooled_authorized
+            or cycle_submission_options.get("prevalidated_cycle") is not True
+            or environment.get("MFT_CAMPAIGN_ID")
+            != "q24-validated-async-aedt500-260716"
+            or environment.get("MFT_AEDT_WORKLOAD_FAMILY")
+            != "mft_validated_async"
+            or environment.get("MFT_CAMPAIGN_MIGRATION_REPLACEMENT_SOLVER")
+            != str(solver_revision)
+        ):
+            raise SchedulerError(
+                "scheduler-owned queueing is reserved for the exact q24 "
+                "validated-async rolling contract"
+            )
     if requested_active > MAX_STANDALONE_ACTIVE:
         rapid_authorized = (
             isinstance(_rapid_authorization, _RapidRefillAuthorization)
@@ -1108,9 +1129,13 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     immediate_headroom, total_cpus, free_cpus, global_active = cpu_submission_headroom(
         global_counts, allocations, ready_fit_slots)
     campaign_deficit = max(0, target + buffer - campaign_active)
+    project_slots = capacity_gate["project_submission_slots"]
+    submission_allowed = bool(
+        capacity_gate["submission_allowed"]
+        or (scheduler_admission_owns_queueing and project_slots > 0)
+    )
     deficit = (
-        min(campaign_deficit, capacity_gate["project_submission_slots"])
-        if capacity_gate["submission_allowed"] else 0
+        min(campaign_deficit, project_slots) if submission_allowed else 0
     )
     if _refill_journal is not None:
         _refill_journal.update({
@@ -1133,6 +1158,16 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
           f"{capacity_gate['project_submission_slots']}, "
           "dataset/reserved/projected="
           f"{data_rows}/{reserved_rows}/{projected_rows}")
+    if (
+        scheduler_admission_owns_queueing
+        and not capacity_gate["submission_allowed"]
+        and deficit > 0
+    ):
+        print(
+            "[feeder] q24 logical-target refill delegates resource queueing "
+            f"to scheduler admission: deficit={deficit}, "
+            f"queue_state={capacity_gate['queue_state']}"
+        )
     if not unbounded_dataset and data_rows >= max_samples:
         print(f"[feeder] dataset target reached ({data_rows}/{max_samples}) - no refill")
         if _refill_journal is not None:
