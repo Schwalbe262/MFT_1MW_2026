@@ -77,7 +77,7 @@ def test_q23_submission_is_clean_four_cpu_same_node_contract(configured_engine):
     assert configured_engine.EXPECTED_POOL_SESSIONS - packed_demand == 3
     assert submission["cpus"] == 4
     assert submission["account_names"] == q23.DEFAULT_ELIGIBLE_ACCOUNTS
-    assert environment["MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"] == "7200"
+    assert environment["MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"] == "900"
     assert environment["MFT_CAMPAIGN_ID"] == q23.CAMPAIGN_ID
     assert environment["MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION"] == PACKAGE_SHA
 

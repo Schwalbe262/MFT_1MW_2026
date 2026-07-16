@@ -30,6 +30,11 @@ EXPECTED_POOL_TARGET = 500
 PROJECT_CPUS = 4
 AEDT_SESSION_BASE_CPUS = 1
 POOL_FILL_TIMEOUT_SECONDS = 7_200
+# The scheduler-side pooled client can wait up to 7200 seconds, but the pinned
+# MFT solver adapter validates its own cohort-fill environment at 0..900.
+# Keep those two independent contracts explicit so a valid scheduler ceiling
+# is never forwarded as an invalid solver-adapter value.
+ADAPTER_POOL_FILL_TIMEOUT_SECONDS = 900
 DEFAULT_ELIGIBLE_ACCOUNTS = (
     "dhj02",
     "harry261",
@@ -51,7 +56,17 @@ _ORIGINAL_RUN_LIVE_GATES = engine.run_live_gates
 _ORIGINAL_STATIC_PLAN = engine.static_plan
 _ORIGINAL_MANIFEST_IDENTITY = engine.manifest_identity
 _ORIGINAL_LOAD_OR_CREATE_MANIFEST = engine.load_or_create_manifest
+_ORIGINAL_POOLED_SUBMISSION = engine.pooled_submission
 _RUNTIME_PREFLIGHT_ARGS: argparse.Namespace | None = None
+
+
+def _q23_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
+    submission = _ORIGINAL_POOLED_SUBMISSION(args)
+    environment = dict(submission.get("submission_env") or {})
+    environment["MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"] = str(
+        ADAPTER_POOL_FILL_TIMEOUT_SECONDS
+    )
+    return {**submission, "submission_env": environment}
 
 
 def verify_q22_retired(db_path: Path) -> dict[str, Any]:
@@ -359,6 +374,7 @@ def configure_engine(
     engine.static_plan = _q23_static_plan
     engine.manifest_identity = _q23_manifest_identity
     engine.load_or_create_manifest = _load_or_create_q23_manifest
+    engine.pooled_submission = _q23_pooled_submission
     engine.audit_remote_packages = _audit_q23_remote_packages
 
 
