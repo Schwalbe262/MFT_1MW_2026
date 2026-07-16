@@ -66,7 +66,17 @@ def _q23_pooled_submission(args: argparse.Namespace) -> dict[str, Any]:
     environment["MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"] = str(
         ADAPTER_POOL_FILL_TIMEOUT_SECONDS
     )
-    return {**submission, "submission_env": environment}
+    return {
+        **submission,
+        "submission_env": environment,
+        # feeder._step_locked has already read and bounded this entire cycle
+        # from one scheduler snapshot under the shared mutation lock.
+        "prevalidated_cycle": True,
+        "submission_delay_seconds": 0.0,
+        # RaiDrive denies replace even though the existing direct-write
+        # fallback succeeds. Avoid two known-useless sleeps only for q23.
+        "immediate_state_permission_fallback": True,
+    }
 
 
 def verify_q22_retired(db_path: Path) -> dict[str, Any]:

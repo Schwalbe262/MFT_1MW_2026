@@ -80,6 +80,9 @@ def test_q23_submission_is_clean_four_cpu_same_node_contract(configured_engine):
     assert environment["MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"] == "900"
     assert environment["MFT_CAMPAIGN_ID"] == q23.CAMPAIGN_ID
     assert environment["MFT_CAMPAIGN_SCHEDULER_PACKAGE_REVISION"] == PACKAGE_SHA
+    assert submission["prevalidated_cycle"] is True
+    assert submission["submission_delay_seconds"] == 0.0
+    assert submission["immediate_state_permission_fallback"] is True
 
 
 def test_q23_profile_and_manifest_identity_pin_four_cpus(configured_engine):

@@ -126,6 +126,7 @@ AEDT_SESSION_PROFILE = json.dumps(
 # four-core solver budget to the AEDT host from each accepted/live lease.
 DEFAULT_POOLED_CPUS = 1
 DEFAULT_POOLED_MEMORY_MB = 6144
+DEFAULT_SUBMISSION_DELAY_SECONDS = 0.3
 CPU_HEADROOM = 0.85
 SCHEDULER_ATTEMPTS = 3
 ACTIVE_TASK_STATUSES = ("queued", "attaching", "running")
@@ -481,7 +482,7 @@ def submit(
         cpus=CPUS_PER_TASK, memory_mb=32768, timeout_seconds=None,
         required_project_cap=None, aedt_backend=None, submission_env=None,
         required_hard_cap=None, max_project_active_tasks=None,
-        account_name="", profile_path=None):
+        account_name="", profile_path=None, prevalidated_cycle=False):
     with open(profile_path or PROFILE_PATH, encoding="utf-8") as stream:
         profile = json.load(stream)
     if timeout_seconds is not None:
@@ -496,6 +497,8 @@ def submit(
     if max_project_active_tasks is not None:
         submission_options["max_project_active_tasks"] = (
             max_project_active_tasks)
+    if prevalidated_cycle is not False:
+        submission_options["prevalidated_cycle"] = prevalidated_cycle
     return scheduler_client.submit_verification(
         name=name,
         workdir=workdir,
@@ -538,24 +541,32 @@ def load_state():
     return {"serial": 0, "submitted_samples": 0}
 
 
-def save_state(st):
+def save_state(st, *, immediate_permission_fallback=False):
+    if not isinstance(immediate_permission_fallback, bool):
+        raise TypeError("immediate_permission_fallback must be a bool")
     tmp = STATE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as stream:
         json.dump(st, stream)
 
     last_error = None
+    attempts_made = 0
     for attempt in range(3):
+        attempts_made = attempt + 1
         try:
             os.replace(tmp, STATE)
             return
         except OSError as exc:
             last_error = exc
+            if immediate_permission_fallback and isinstance(
+                    exc, PermissionError):
+                break
             if attempt < 2:
                 time.sleep(0.5)
 
     LOGGER.warning(
-        "atomic state update failed after 3 attempts (%s); "
+        "atomic state update failed after %s attempt(s) (%s); "
         "writing %s directly",
+        attempts_made,
         last_error,
         STATE,
     )
@@ -994,6 +1005,21 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     rapid_authorized = False
     adopted_authorized = False
     pooled_mode = _is_pooled_submission(_pooled_submission)
+    cycle_submission_options = dict(_pooled_submission or {})
+    submission_delay_seconds = cycle_submission_options.pop(
+        "submission_delay_seconds", DEFAULT_SUBMISSION_DELAY_SECONDS)
+    immediate_state_permission_fallback = cycle_submission_options.pop(
+        "immediate_state_permission_fallback", False)
+    if (isinstance(submission_delay_seconds, bool)
+            or not isinstance(submission_delay_seconds, (int, float))
+            or not math.isfinite(float(submission_delay_seconds))
+            or submission_delay_seconds < 0):
+        raise SchedulerError(
+            "submission_delay_seconds must be a finite non-negative number")
+    submission_delay_seconds = float(submission_delay_seconds)
+    if not isinstance(immediate_state_permission_fallback, bool):
+        raise SchedulerError(
+            "immediate_state_permission_fallback must be a bool")
     unbounded_dataset = max_samples is None
     if unbounded_dataset and not pooled_mode:
         raise SchedulerError(
@@ -1181,13 +1207,19 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
     planned = []
     ok = 0
 
+    def save_cycle_state():
+        if immediate_state_permission_fallback:
+            save_state(st, immediate_permission_fallback=True)
+        else:
+            save_state(st)
+
     def submit_planned(item):
         nonlocal ok, committed_state
         event = item["event"]
         try:
             submit_kwargs = dict(_submit_resources or {})
-            if _pooled_submission is not None:
-                submit_kwargs.update(_pooled_submission)
+            if cycle_submission_options:
+                submit_kwargs.update(cycle_submission_options)
             account_names = tuple(submit_kwargs.pop("account_names", ()) or ())
             if account_names:
                 # The persisted serial is part of the durable task identity.
@@ -1232,12 +1264,13 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
         if not batch_commit:
             # Legacy modes retain their per-task ledger commit.  The pool400
             # mode pre-seals the whole batch and commits once below.
-            save_state(st)
+            save_cycle_state()
             if event is not None:
                 event["ledger_committed"] = True
                 _refill_journal["submitted_count"] += 1
             committed_state = copy.deepcopy(st)
-        time.sleep(0.3)
+        if submission_delay_seconds:
+            time.sleep(submission_delay_seconds)
 
     for _ in range(n_new):
         st["serial"] += 1
@@ -1282,7 +1315,7 @@ def _step_locked(max_samples, target=TARGET_ACTIVE, buffer=BUFFER,
             submit_planned(item)
         # One immutable feeder generation and one ledger journal generation
         # commit the complete accepted batch at its boundary.
-        save_state(st)
+        save_cycle_state()
         for item in planned:
             if item["event"] is not None:
                 item["event"]["ledger_committed"] = True

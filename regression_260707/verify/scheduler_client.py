@@ -604,7 +604,8 @@ def submit_verification(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
-        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
+        prevalidated_cycle=False):
     """Submit one MFT task under the shared cross-process mutation lock."""
     submission_options = {}
     if aedt_backend is not None:
@@ -616,6 +617,8 @@ def submit_verification(
     if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
         submission_options["max_project_active_tasks"] = (
             max_project_active_tasks)
+    if prevalidated_cycle is not False:
+        submission_options["prevalidated_cycle"] = prevalidated_cycle
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
             name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
@@ -648,10 +651,20 @@ def _submit_verification_locked(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
-        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
+        prevalidated_cycle=False):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
+    if not isinstance(prevalidated_cycle, bool):
+        raise ValueError("prevalidated_cycle must be a bool")
+    if prevalidated_cycle and (
+            aedt_backend != "pooled"
+            or required_project_cap is not None
+            or required_hard_cap is None):
+        raise ProjectContractError(
+            "a prevalidated cycle requires pooled submission with an explicit "
+            "hard cap")
     if isinstance(priority, bool) or not isinstance(priority, int):
         raise ValueError("verification priority must be an integer")
     account_name = str(account_name or "").strip()
@@ -846,20 +859,21 @@ def _submit_verification_locked(
     if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
         validation_options["max_project_active_tasks"] = (
             max_project_active_tasks)
-    if require_exact_project_cap:
-        capacity = live_project_submission_snapshot(
-            required_hard_cap,
-            require_exact_project_cap=True,
-            require_full_project=True,
-            **validation_options,
-        )
-    else:
-        capacity = live_project_submission_snapshot(
-            required_hard_cap, **validation_options)
-    if capacity["project_submission_slots"] < 1:
-        raise ProjectCapacityError(
-            f"MFT project has no submission slots under cap "
-            f"{required_hard_cap}: {capacity}")
+    if not prevalidated_cycle:
+        if require_exact_project_cap:
+            capacity = live_project_submission_snapshot(
+                required_hard_cap,
+                require_exact_project_cap=True,
+                require_full_project=True,
+                **validation_options,
+            )
+        else:
+            capacity = live_project_submission_snapshot(
+                required_hard_cap, **validation_options)
+        if capacity["project_submission_slots"] < 1:
+            raise ProjectCapacityError(
+                f"MFT project has no submission slots under cap "
+                f"{required_hard_cap}: {capacity}")
     last_transient_error = None
     for attempt in range(SUBMISSION_POST_ATTEMPTS):
         if attempt:

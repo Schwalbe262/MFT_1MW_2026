@@ -258,6 +258,72 @@ class FeederPooledSubmissionTests(unittest.TestCase):
             "production promotion",
         )
 
+    def test_prevalidated_pooled_cycle_skips_only_capacity_reread(self):
+        accepted = Mock(status_code=201)
+        accepted.json.return_value = {"id": 124}
+        events = []
+
+        def reconcile(*_args, **_kwargs):
+            events.append("reconcile")
+            return None
+
+        def post(*_args, **_kwargs):
+            events.append("post")
+            return accepted
+
+        with patch.object(
+                feeder.scheduler_client,
+                "campaign_mutation_lock_is_held",
+                return_value=True,
+        ), patch.object(
+                feeder.scheduler_client,
+                "reconcile_task_id",
+                side_effect=reconcile,
+        ) as dedupe, patch.object(
+                feeder.scheduler_client,
+                "live_project_submission_snapshot",
+        ) as capacity, patch.object(
+                feeder.scheduler_client.requests,
+                "post",
+                side_effect=post,
+        ) as submit:
+            task_id = feeder.scheduler_client.submit_verification(
+                "q23-prevalidated", "wd", {"candidate": 1}, {},
+                solver_revision=SOLVER_REVISION,
+                library_revision=LIBRARY_REVISION,
+                aedt_backend="pooled",
+                required_hard_cap=500,
+                max_project_active_tasks=600,
+                prevalidated_cycle=True,
+            )
+
+        self.assertEqual(task_id, 124)
+        self.assertEqual(events, ["reconcile", "post"])
+        dedupe.assert_called_once()
+        capacity.assert_not_called()
+        submit.assert_called_once()
+
+    def test_prevalidated_cycle_cannot_bypass_non_pooled_capacity(self):
+        with patch.object(
+                feeder.scheduler_client,
+                "campaign_mutation_lock_is_held",
+                return_value=True,
+        ), patch.object(
+                feeder.scheduler_client.requests,
+                "post",
+        ) as post:
+            with self.assertRaisesRegex(
+                    feeder.scheduler_client.ProjectContractError,
+                    "requires pooled submission"):
+                feeder.scheduler_client.submit_verification(
+                    "invalid-prevalidated", "wd", {}, {},
+                    solver_revision=SOLVER_REVISION,
+                    library_revision=LIBRARY_REVISION,
+                    required_hard_cap=500,
+                    prevalidated_cycle=True,
+                )
+        post.assert_not_called()
+
     def test_trust_pinned_revisions_bypasses_local_revision_vetting(self):
         with patch("builtins.print") as output:
             self._capture_cli_payload(
@@ -639,6 +705,126 @@ def test_save_state_falls_back_to_direct_write(tmp_path):
     assert sleep.call_args_list == [call(0.5), call(0.5)]
     assert json.loads(state_path.read_text(encoding="utf-8")) == state
     assert not tmp_state_path.exists()
+
+
+def test_q23_state_permission_fallback_skips_known_useless_retries(tmp_path):
+    state_path = tmp_path / "feeder_state.json"
+    tmp_state_path = Path(f"{state_path}.tmp")
+    state = {"serial": 24, "submitted_samples": 120}
+
+    with patch.object(feeder, "STATE", str(state_path)), patch.object(
+            feeder.os,
+            "replace",
+            side_effect=PermissionError(5, "atomic rename unsupported"),
+    ) as replace, patch.object(feeder.time, "sleep") as sleep:
+        feeder.save_state(state, immediate_permission_fallback=True)
+
+    replace.assert_called_once_with(str(tmp_state_path), str(state_path))
+    sleep.assert_not_called()
+    assert json.loads(state_path.read_text(encoding="utf-8")) == state
+    assert not tmp_state_path.exists()
+
+
+def test_q23_state_fallback_still_retries_other_os_errors(tmp_path):
+    state_path = tmp_path / "feeder_state.json"
+    state = {"serial": 25, "submitted_samples": 125}
+    real_replace = feeder.os.replace
+    attempts = 0
+
+    def transient_replace(source, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(16, "temporarily busy")
+        return real_replace(source, target)
+
+    with patch.object(feeder, "STATE", str(state_path)), patch.object(
+            feeder.os,
+            "replace",
+            side_effect=transient_replace,
+    ) as replace, patch.object(feeder.time, "sleep") as sleep:
+        feeder.save_state(state, immediate_permission_fallback=True)
+
+    assert replace.call_count == 2
+    sleep.assert_called_once_with(0.5)
+    assert json.loads(state_path.read_text(encoding="utf-8")) == state
+
+
+def test_q23_sealed_cycle_forwards_prevalidation_and_has_no_submit_delay():
+    counts = {"queued": 0, "attaching": 0, "running": 0}
+    capacity = {
+        "ready_fit_slots": 500,
+        "project_submission_slots": 500,
+        "submission_allowed": True,
+        "queue_state": "ready",
+        "queue_reason": "",
+        "project_active": 0,
+    }
+    state = {"serial": 0, "submitted_samples": 0}
+    q23_submission = {
+        "aedt_backend": "pooled",
+        "prevalidated_cycle": True,
+        "submission_delay_seconds": 0.0,
+        "immediate_state_permission_fallback": True,
+    }
+
+    with patch.object(
+            feeder.scheduler_client,
+            "campaign_mutation_lock_is_held",
+            return_value=True,
+    ), patch.object(
+            feeder,
+            "scheduler_snapshot",
+            return_value=(counts, counts, [], capacity),
+    ) as snapshot, patch.object(
+            feeder,
+            "dataset_collection_snapshot",
+            return_value=(0, set()),
+    ), patch.object(
+            feeder,
+            "campaign_inventory",
+            return_value=[],
+    ), patch.object(
+            feeder,
+            "reserved_unjudged_rows",
+            return_value=0,
+    ), patch.object(
+            feeder,
+            "load_state",
+            return_value=state,
+    ), patch.object(
+            feeder,
+            "cursor_after_valid_candidates",
+            return_value=0,
+    ), patch.object(
+            feeder,
+            "next_valid_candidate",
+            return_value=(1, 0, {"candidate": 1}),
+    ), patch.object(
+            feeder,
+            "submit",
+            return_value=701,
+    ) as submit, patch.object(
+            feeder,
+            "save_state",
+    ) as save, patch.object(feeder.time, "sleep") as sleep:
+        assert feeder._step_locked(
+            None,
+            target=1,
+            solver_revision=SOLVER_REVISION,
+            library_revision=LIBRARY_REVISION,
+            _pooled_submission=q23_submission,
+        ) is True
+
+    snapshot.assert_called_once()
+    submit.assert_called_once()
+    assert submit.call_args.kwargs["prevalidated_cycle"] is True
+    assert "submission_delay_seconds" not in submit.call_args.kwargs
+    assert "immediate_state_permission_fallback" not in submit.call_args.kwargs
+    assert submit.call_args.kwargs["required_hard_cap"] == 1
+    save.assert_called_once()
+    assert save.call_args.kwargs == {"immediate_permission_fallback": True}
+    sleep.assert_not_called()
 
 
 if __name__ == "__main__":
