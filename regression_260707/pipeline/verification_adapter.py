@@ -211,26 +211,54 @@ def _fine_selection(generation, expected_count: int) -> list[dict]:
     return output
 
 
+def _exact_git_sha(value) -> bool:
+    text = str(value or "").lower()
+    return len(text) == 40 and all(char in "0123456789abcdef" for char in text)
+
+
 def _source_revisions(stage, generation):
     if stage == "standard":
-        manifest = json.loads(
+        source = json.loads(
             (generation.path / "optimization_manifest.json").read_text(
                 encoding="utf-8"
             )
         )
-        solver = manifest.get("solver_revision")
-        library = manifest.get("library_revision")
     else:
-        selection = json.loads(
+        source = json.loads(
             (generation.path / "selection.json").read_text(encoding="utf-8")
         )
-        solver = selection.get("solver_revision")
-        library = selection.get("library_revision")
-    for label, value in (("solver", solver), ("library", library)):
-        text = str(value or "").lower()
-        if len(text) != 40 or any(char not in "0123456789abcdef" for char in text):
-            raise RuntimeError(f"verification source has no pinned {label} revision")
-    return str(solver).lower(), str(library).lower()
+    revisions = {
+        key: str(source.get(key) or "").lower()
+        for key in (
+            "training_solver_revision",
+            "training_library_revision",
+            "fea_solver_revision",
+            "fea_library_revision",
+        )
+    }
+    if not all(_exact_git_sha(value) for value in revisions.values()):
+        raise RuntimeError(
+            "verification source has no separate exact training/FEA revisions"
+        )
+    # Old names remain model provenance in optimization manifests, but are
+    # execution pins in selection requests.  Both meanings are authenticated
+    # explicitly instead of silently copying one revision into the other.
+    if stage == "standard":
+        if (
+            str(source.get("solver_revision") or "").lower()
+            != revisions["training_solver_revision"]
+            or str(source.get("library_revision") or "").lower()
+            != revisions["training_library_revision"]
+        ):
+            raise RuntimeError("optimization training provenance is inconsistent")
+    elif (
+        str(source.get("solver_revision") or "").lower()
+        != revisions["fea_solver_revision"]
+        or str(source.get("library_revision") or "").lower()
+        != revisions["fea_library_revision"]
+    ):
+        raise RuntimeError("verification FEA execution provenance is inconsistent")
+    return revisions
 
 
 def run(stage, input_generation, output_dir, expected_count, adapter_config):
@@ -253,7 +281,9 @@ def run(stage, input_generation, output_dir, expected_count, adapter_config):
     )
     if len(candidates) != expected:
         raise RuntimeError("verification selection count mismatch")
-    solver_revision, library_revision = _source_revisions(stage, generation)
+    revisions = _source_revisions(stage, generation)
+    solver_revision = revisions["fea_solver_revision"]
+    library_revision = revisions["fea_library_revision"]
 
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -276,6 +306,7 @@ def run(stage, input_generation, output_dir, expected_count, adapter_config):
         "input_generation_id": generation.generation_id,
         "solver_revision": solver_revision,
         "library_revision": library_revision,
+        **revisions,
         "input_manifest_sha256": hashlib.sha256(
             (generation.path / "manifest.json").read_bytes()
         ).hexdigest(),

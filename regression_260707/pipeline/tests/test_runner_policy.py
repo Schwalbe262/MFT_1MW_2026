@@ -429,6 +429,38 @@ class NsgaParallelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "between 1 and 4"):
             run_nsga2.run_restarts(object(), 16, 200, workers=5)
 
+    def test_infeasible_population_report_uses_stable_constraint_schema(self):
+        from regression_260707.optimization import nsga2_problem, run_nsga2
+
+        names = nsga2_problem.CONSTRAINT_NAMES
+        self.assertEqual(len(names), nsga2_problem.N_IEQ_CONSTRAINTS)
+        self.assertEqual(names[0], "Llt_robust_band")
+        self.assertEqual(names[-1], "Llt_ensemble_disagreement")
+
+        constraints = np.full((2, len(names)), -1.0)
+        constraints[0, 0] = 2.0
+        constraints[1, 0] = 0.25
+        constraints[1, 1] = 0.5
+        chromosomes = np.vstack((
+            np.zeros(3, dtype=float),
+            np.ones(3, dtype=float),
+        ))
+
+        class Population:
+            def get(self, key):
+                return {"G": constraints, "X": chromosomes}[key]
+
+        report = run_nsga2._population_infeasibility(Population(), names)
+        self.assertTrue(report["available"])
+        self.assertEqual(report["population_size"], 2)
+        self.assertEqual(report["feasible_count"], 0)
+        self.assertEqual(report["closest_candidate"]["population_index"], 1)
+        by_name = {item["name"]: item for item in report["constraints"]}
+        self.assertEqual(by_name["Llt_robust_band"]["passing_count"], 0)
+        self.assertEqual(
+            by_name[names[2]]["passing_count"], 2
+        )
+
     def test_al_driver_no_longer_promotes_models(self):
         from regression_260707 import al_driver
 

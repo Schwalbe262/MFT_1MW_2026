@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "training"))
 
 from optimization.nsga2_problem import (  # noqa: E402
+    CONSTRAINT_NAMES,
     DEFAULT_SPEC,
     MFTProblem,
     NSGA_FIXED_THERMAL_STACK_MM,
@@ -50,6 +51,7 @@ EXPERIMENTAL_MIN_STRICT_FULL_ROWS = 2000
 VETTED_QUALITY_THRESHOLDS = os.path.abspath(os.path.join(
     HERE, "..", "training", "model_quality_thresholds.json"
 ))
+DETERMINISTIC_INFEASIBLE_EXIT_CODE = 42
 
 
 def _sha256(path):
@@ -58,6 +60,89 @@ def _sha256(path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _atomic_json(path, value):
+    staged = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(staged, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=1, sort_keys=True, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged, path)
+    finally:
+        if os.path.exists(staged):
+            os.unlink(staged)
+
+
+def _finite_float(value):
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def _population_infeasibility(population, constraint_names=CONSTRAINT_NAMES):
+    """Return compact final-population evidence even when pymoo has no result.X."""
+
+    if population is None or not callable(getattr(population, "get", None)):
+        return {"available": False, "population_size": 0}
+    constraints = np.asarray(population.get("G"), dtype=float)
+    chromosomes = np.asarray(population.get("X"), dtype=float)
+    if constraints.ndim != 2 or constraints.shape[1] != len(constraint_names):
+        raise RuntimeError(
+            "NSGA final population constraint width does not match the sealed schema"
+        )
+    if chromosomes.ndim != 2 or chromosomes.shape[0] != constraints.shape[0]:
+        raise RuntimeError("NSGA final population chromosome evidence is invalid")
+    positive = np.maximum(constraints, 0.0)
+    finite_rows = np.isfinite(constraints).all(axis=1)
+    total_violation = np.where(
+        finite_rows, positive.sum(axis=1), np.inf
+    )
+    feasible = finite_rows & (constraints <= 0.0).all(axis=1)
+    closest_index = (
+        int(np.argmin(total_violation))
+        if len(total_violation) and np.isfinite(total_violation).any()
+        else None
+    )
+    per_constraint = []
+    for index, name in enumerate(constraint_names):
+        values = constraints[:, index]
+        finite = values[np.isfinite(values)]
+        per_constraint.append({
+            "index": index,
+            "name": name,
+            "finite_count": int(len(finite)),
+            "passing_count": int(np.count_nonzero(finite <= 0.0)),
+            "minimum_value": _finite_float(np.min(finite)) if len(finite) else None,
+            "median_value": _finite_float(np.median(finite)) if len(finite) else None,
+            "minimum_violation": (
+                _finite_float(np.min(np.maximum(finite, 0.0)))
+                if len(finite) else None
+            ),
+        })
+    closest = None
+    if closest_index is not None:
+        closest = {
+            "population_index": closest_index,
+            "total_positive_violation": _finite_float(
+                total_violation[closest_index]
+            ),
+            "chromosome_unit": [
+                _finite_float(value) for value in chromosomes[closest_index]
+            ],
+            "constraint_values": {
+                name: _finite_float(constraints[closest_index, index])
+                for index, name in enumerate(constraint_names)
+            },
+        }
+    return {
+        "available": True,
+        "population_size": int(constraints.shape[0]),
+        "finite_row_count": int(np.count_nonzero(finite_rows)),
+        "feasible_count": int(np.count_nonzero(feasible)),
+        "closest_candidate": closest,
+        "constraints": per_constraint,
+    }
 
 
 def _sobol_schema():
@@ -290,10 +375,17 @@ def _run_one_arrays(problem, seed, pop, warm_X, max_gen):
     result = run_one(
         problem, seed=seed, pop=pop, warm_X=warm_X, max_gen=max_gen
     )
+    final_population = getattr(result, "pop", None)
+    if final_population is None:
+        final_population = getattr(getattr(result, "algorithm", None), "pop", None)
     return (
         result.X,
         result.F,
         int(result.algorithm.n_gen),
+        _population_infeasibility(
+            final_population,
+            constraint_names=getattr(problem, "constraint_names", CONSTRAINT_NAMES),
+        ),
     )
 
 
@@ -378,6 +470,16 @@ def main():
             "explicit failed provisional-2000 quality evidence; runs only a "
             "non-production active-learning search"
         ),
+    )
+    ap.add_argument(
+        "--fea-solver-revision",
+        default=None,
+        help="exact solver commit reserved for downstream FEA verification",
+    )
+    ap.add_argument(
+        "--fea-library-revision",
+        default=None,
+        help="exact PyAEDT library commit reserved for downstream FEA verification",
     )
     ap.add_argument("--output-root", default=os.path.join(HERE, "..", "al_rounds"))
     ap.add_argument(
@@ -483,6 +585,31 @@ def main():
                 "dataset strict-full cohort does not match quality metadata"
             )
 
+    training_solver_revision = str(quality.get("solver_revision") or "").lower()
+    training_library_revision = str(quality.get("library_revision") or "").lower()
+    fea_solver_revision = str(
+        args.fea_solver_revision or training_solver_revision
+    ).lower()
+    fea_library_revision = str(
+        args.fea_library_revision or training_library_revision
+    ).lower()
+    for label, revision in (
+        ("training solver", training_solver_revision),
+        ("training library", training_library_revision),
+        ("FEA solver", fea_solver_revision),
+        ("FEA library", fea_library_revision),
+    ):
+        if len(revision) != 40 or any(
+            char not in "0123456789abcdef" for char in revision
+        ):
+            raise SystemExit(f"optimization has no exact {label} revision")
+    if experimental and (
+        not args.fea_solver_revision or not args.fea_library_revision
+    ):
+        raise SystemExit(
+            "experimental optimization requires explicit downstream FEA revisions"
+        )
+
     models = load_models(
         registry_for_models,
         generation=pinned_generation,
@@ -529,7 +656,14 @@ def main():
         warm_X=warm,
         workers=args.workers,
     )
-    for r, (result_x, result_f, generations) in enumerate(restart_results):
+    restart_diagnostics = []
+    for r, (result_x, result_f, generations, diagnostic) in enumerate(restart_results):
+        restart_diagnostics.append({
+            "restart": r,
+            "seed": 1000 + r,
+            "generations": generations,
+            **diagnostic,
+        })
         if result_x is None:
             feasible_counts.append(0)
             continue
@@ -542,7 +676,52 @@ def main():
               f"loss {F[:,1].min():.0f}-{F[:,1].max():.0f}W, gen {generations}")
 
     if not X_list:
-        raise SystemExit("모든 재시작에서 feasible 해 없음 - 제약 조임/데이터 커버리지 점검 필요")
+        report_path = os.path.join(out_dir, "infeasibility_report.json")
+        report = {
+            "schema_version": "mft-nsga2-infeasibility-v1",
+            "terminal_reason": "deterministic_no_feasible_solution",
+            "exit_code": DETERMINISTIC_INFEASIBLE_EXIT_CODE,
+            "production_eligible": False,
+            "experimental_active_learning": experimental,
+            "dataset_path": os.path.abspath(args.dataset),
+            "dataset_sha256": _sha256(args.dataset),
+            "strict_full_rows": verified_strict_rows,
+            "registry_generation": os.path.abspath(generation_artifact_root),
+            "generation_report_sha256": _sha256(os.path.join(
+                generation_artifact_root, "train_report.json"
+            )),
+            "quality_status_sha256": (
+                _sha256(supplied_quality) if supplied_quality else None
+            ),
+            "training_solver_revision": training_solver_revision,
+            "training_library_revision": training_library_revision,
+            "fea_solver_revision": fea_solver_revision,
+            "fea_library_revision": fea_library_revision,
+            "optimization_source_sha256": _sha256(__file__),
+            "problem_source_sha256": _sha256(os.path.join(
+                HERE, "nsga2_problem.py"
+            )),
+            "constraint_names": list(CONSTRAINT_NAMES),
+            "effective_spec": spec,
+            "fixed_thermal_stack_mm": NSGA_FIXED_THERMAL_STACK_MM,
+            "density_gate_enabled": gate is not None,
+            "restarts": args.restarts,
+            "population": args.pop,
+            "workers": min(args.workers, args.restarts),
+            "seeds": [1000 + index for index in range(args.restarts)],
+            "termination": {
+                "ftol": 0.0025, "period": 30, "max_generations": 600,
+            },
+            "restart_diagnostics": restart_diagnostics,
+        }
+        _atomic_json(report_path, report)
+        print(json.dumps({
+            "event": "deterministic_no_feasible_solution",
+            "exit_code": DETERMINISTIC_INFEASIBLE_EXIT_CODE,
+            "infeasibility_report": os.path.abspath(report_path),
+            "infeasibility_report_sha256": _sha256(report_path),
+        }, sort_keys=True), flush=True)
+        raise SystemExit(DETERMINISTIC_INFEASIBLE_EXIT_CODE)
 
     Xp, Fp, _ = nds_merge(F_list, X_list, [[None] * len(x) for x in X_list])
     pareto_x_path = os.path.join(out_dir, "pareto_X.npy")
@@ -628,8 +807,14 @@ def main():
             ),
             "strict_full_rows": verified_strict_rows,
             "quality_thresholds_sha256": vetted_thresholds_sha256,
-            "solver_revision": quality.get("solver_revision"),
-            "library_revision": quality.get("library_revision"),
+            # Backward-compatible training provenance.  Downstream FEA must
+            # use the separately sealed execution revisions below.
+            "solver_revision": training_solver_revision,
+            "library_revision": training_library_revision,
+            "training_solver_revision": training_solver_revision,
+            "training_library_revision": training_library_revision,
+            "fea_solver_revision": fea_solver_revision,
+            "fea_library_revision": fea_library_revision,
             "registry_generation": os.path.abspath(generation_artifact_root),
             "generation_report_sha256": _sha256(os.path.join(
                 generation_artifact_root, "train_report.json"

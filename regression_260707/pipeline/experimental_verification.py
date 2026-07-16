@@ -17,11 +17,7 @@ import os
 from pathlib import Path
 
 from .artifacts import GenerationStore, sha256_file
-from .scheduler_verification import (
-    EXPERIMENTAL_LIBRARY_REVISION,
-    EXPERIMENTAL_SOLVER_REVISION,
-    run_scheduler_verification,
-)
+from .scheduler_verification import run_scheduler_verification
 from .verification_adapter import (
     SCHEMA_VERSION,
     _atomic_json,
@@ -32,6 +28,11 @@ from .verification_adapter import (
 
 EXPECTED_KIND = "experimental_optimization"
 EXPECTED_COUNT = 3
+
+
+def _exact_git_sha(value) -> bool:
+    text = str(value or "").lower()
+    return len(text) == 40 and all(char in "0123456789abcdef" for char in text)
 
 
 def _load_experimental_generation(path: str | os.PathLike[str]):
@@ -57,6 +58,10 @@ def _optimization_contract(generation):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     blockers = manifest.get("quality_blockers")
     quality_sha = str(manifest.get("quality_status_sha256") or "").lower()
+    training_solver = str(manifest.get("training_solver_revision") or "").lower()
+    training_library = str(manifest.get("training_library_revision") or "").lower()
+    fea_solver = str(manifest.get("fea_solver_revision") or "").lower()
+    fea_library = str(manifest.get("fea_library_revision") or "").lower()
     if (
         manifest.get("experimental_active_learning") is not True
         or manifest.get("production_eligible") is not False
@@ -65,10 +70,13 @@ def _optimization_contract(generation):
         or not blockers
         or int(manifest.get("strict_full_rows") or 0) < 2000
         or manifest.get("experimental_minimum_strict_full_rows") != 2000
+        or not all(_exact_git_sha(value) for value in (
+            training_solver, training_library, fea_solver, fea_library
+        ))
         or str(manifest.get("solver_revision") or "").lower()
-        != EXPERIMENTAL_SOLVER_REVISION
+        != training_solver
         or str(manifest.get("library_revision") or "").lower()
-        != EXPERIMENTAL_LIBRARY_REVISION
+        != training_library
         or len(quality_sha) != 64
         or any(char not in "0123456789abcdef" for char in quality_sha)
         or manifest.get("pareto_front_sha256") != sha256_file(front_path)
@@ -113,8 +121,14 @@ def run(input_generation, output_dir, adapter_config):
             generation.path / "optimization_manifest.json"
         ),
         "input_generation_id": generation.generation_id,
-        "solver_revision": EXPERIMENTAL_SOLVER_REVISION,
-        "library_revision": EXPERIMENTAL_LIBRARY_REVISION,
+        # The legacy request names are execution pins.  Model provenance is
+        # carried separately and must never select the downstream checkout.
+        "solver_revision": optimization["fea_solver_revision"],
+        "library_revision": optimization["fea_library_revision"],
+        "training_solver_revision": optimization["training_solver_revision"],
+        "training_library_revision": optimization["training_library_revision"],
+        "fea_solver_revision": optimization["fea_solver_revision"],
+        "fea_library_revision": optimization["fea_library_revision"],
         "input_manifest_sha256": sha256_file(generation.path / "manifest.json"),
         "candidates": candidates,
     }
@@ -158,8 +172,12 @@ def run(input_generation, output_dir, adapter_config):
         "source_training_run_id": optimization.get("training_run_id"),
         "quality_status_sha256": quality_sha,
         "quality_blockers": blockers,
-        "solver_revision": EXPERIMENTAL_SOLVER_REVISION,
-        "library_revision": EXPERIMENTAL_LIBRARY_REVISION,
+        "solver_revision": optimization["fea_solver_revision"],
+        "library_revision": optimization["fea_library_revision"],
+        "training_solver_revision": optimization["training_solver_revision"],
+        "training_library_revision": optimization["training_library_revision"],
+        "fea_solver_revision": optimization["fea_solver_revision"],
+        "fea_library_revision": optimization["fea_library_revision"],
         "selection_sha256": sha256_file(request_path),
         "verification_results_sha256": sha256_file(result_path),
         "feedback_contract": {
