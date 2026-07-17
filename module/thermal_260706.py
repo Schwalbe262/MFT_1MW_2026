@@ -1100,6 +1100,13 @@ def _solve_exact_pooled_thermal_setup(
                 )
                 message_cursor = update.cursor
                 if update.fatal_messages:
+                    # A scoped fatal message is terminal evidence for this
+                    # exact design: its native solve cannot continue.  Close
+                    # only this project instead of quarantining the shared
+                    # AEDT session and healthy siblings.  Dispatch/transport
+                    # exceptions before terminal evidence still retain the
+                    # session-fault uncertainty flag.
+                    sim.solver_may_be_running = False
                     evidence = " | ".join(update.fatal_messages[-6:])[:2000]
                     raise RuntimeError(
                         "[thermal] exact AEDT design reported a terminal error: "

@@ -6594,6 +6594,13 @@ class Simulation():
                 )
                 message_cursor = update.cursor
                 if update.fatal_messages:
+                    # A scoped fatal message is terminal evidence for this
+                    # exact design: its native solve cannot continue.  Treat
+                    # it as a project-local failure so the host closes only
+                    # this lease and healthy siblings keep their shared
+                    # Desktop.  Dispatch/transport exceptions before terminal
+                    # evidence still leave the uncertainty flag set.
+                    self.solver_may_be_running = False
                     evidence = " | ".join(update.fatal_messages[-6:])[:2000]
                     raise RuntimeError(
                         f"[{label}] exact AEDT design reported a terminal error: "

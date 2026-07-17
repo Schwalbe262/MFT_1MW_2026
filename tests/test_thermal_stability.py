@@ -584,6 +584,62 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(events, ["cohort-complete"])
         self.assertEqual(lock_depth[0], 0)
 
+    def test_pooled_thermal_terminal_error_is_project_local(self):
+        native_design = SimpleNamespace(Analyze=Mock(return_value=0))
+        native_ipk = SimpleNamespace()
+        preflight = {
+            "project": "thermal_test",
+            "design": "icepak_thermal",
+            "native_design": native_design,
+            "native_ipk": native_ipk,
+        }
+        sim = SimpleNamespace(
+            solver_may_be_running=False,
+            _ensure_pooled_shared_results_directory=Mock(),
+            aedt_native_solve_window=lambda: nullcontext(),
+            aedt_automation_transaction=lambda: nullcontext(),
+        )
+        native_design.GetName = Mock(return_value="icepak_thermal")
+        cursor = SimpleNamespace()
+        fatal_update = SimpleNamespace(
+            cursor=cursor,
+            fatal_messages=("The quality of some mesh elements is not acceptable",),
+            normal_completion=False,
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                thermal, "_prepare_thermal_dispatch", return_value=preflight
+            ))
+            stack.enter_context(patch.object(
+                thermal, "_snapshot_thermal_monitors", return_value={}
+            ))
+            stack.enter_context(patch.object(
+                thermal, "_thermal_desktop_handle", return_value=SimpleNamespace()
+            ))
+            stack.enter_context(patch.object(
+                thermal, "capture_scoped_message_cursor", return_value=cursor
+            ))
+            stack.enter_context(patch.object(
+                thermal, "advance_scoped_message_cursor", return_value=fatal_update
+            ))
+            stack.enter_context(patch.object(
+                thermal, "_thermal_convergence_telemetry",
+                return_value=self._convergence(),
+            ))
+            with self.assertRaisesRegex(
+                    RuntimeError, "exact AEDT design reported a terminal error"):
+                thermal._solve_exact_pooled_thermal_setup(
+                    sim,
+                    native_ipk,
+                    SimpleNamespace(),
+                    timeout_s=1,
+                    poll_s=0,
+                )
+
+        native_design.Analyze.assert_called_once_with("ThermalSetup", False)
+        self.assertFalse(sim.solver_may_be_running)
+
     @staticmethod
     def _convergence(converged=True):
         return {

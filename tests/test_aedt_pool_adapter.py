@@ -1293,7 +1293,7 @@ def test_pooled_terminal_design_mismatch_fails_closed_and_keeps_uncertainty():
     assert simulation.solver_may_be_running is True
 
 
-def test_pooled_new_exact_design_error_is_fatal_and_keeps_uncertainty():
+def test_pooled_new_exact_design_error_is_fatal_but_project_local():
     simulation, _design = _minimal_pooled_terminal_harness(
         normal=True, fatal=True
     )
@@ -1304,4 +1304,6 @@ def test_pooled_new_exact_design_error_is_fatal_and_keeps_uncertainty():
         )
 
     simulation._pooled_terminal_convergence_locked.assert_not_called()
-    assert simulation.solver_may_be_running is True
+    # A scoped terminal error proves this project's native solve cannot
+    # continue and must release only its lease, not quarantine siblings.
+    assert simulation.solver_may_be_running is False
