@@ -41,7 +41,8 @@ from module.core_material_contract import PHYSICS_DATA_REVISION
 SCHEMA = "mft-pooled10x30-soak-controller-v1"
 CAMPAIGN_ID = "mft-pooled10x30-soak-260717"
 PROJECT = "MFT_1MW_2026v1"
-SOLVER_REVISION = "7768510433858c9056f04320e66819d5fcc90f1a"
+PREVIOUS_SOLVER_REVISION = "7768510433858c9056f04320e66819d5fcc90f1a"
+SOLVER_REVISION = "ed3eede4b476e96f17651e1a5f3bbf5c1059514d"
 LIBRARY_REVISION = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
 IMMUTABLE_SCHEDULER_PACKAGE_REVISION = (
     "4df497a49a7eccfe441b0d198540990ebbffcd4a"
@@ -59,7 +60,10 @@ TASK_CPUS = 1
 TASK_MEMORY_MB = 6144
 TASK_TIMEOUT_SECONDS = 86_400
 NAME_PREFIX = (
-    f"mft-camp-s{SOLVER_REVISION[:7]}-l{LIBRARY_REVISION[:7]}-p10x30-"
+    # Keep the original campaign namespace so the rolling controller counts
+    # in-flight predecessor tasks while every replacement uses SOLVER_REVISION.
+    f"mft-camp-s{PREVIOUS_SOLVER_REVISION[:7]}-"
+    f"l{LIBRARY_REVISION[:7]}-p10x30-"
 )
 ACTIVE_STATES = ("queued", "attaching", "running")
 ELIGIBLE_ACCOUNTS = (
@@ -263,7 +267,6 @@ def load_state(path: Path) -> dict[str, Any]:
     fixed = {
         "schema": SCHEMA,
         "campaign_id": CAMPAIGN_ID,
-        "solver_revision": SOLVER_REVISION,
         "library_revision": LIBRARY_REVISION,
         "candidate_seed": CANDIDATE_SEED,
     }
@@ -271,6 +274,18 @@ def load_state(path: Path) -> dict[str, Any]:
              if value.get(key) != expected}
     if drift:
         raise GateError(f"pooled10x30 state identity drifted: {drift}")
+    state_solver = str(value.get("solver_revision") or "").strip().lower()
+    if state_solver == PREVIOUS_SOLVER_REVISION:
+        # One reviewed transport-only successor is a rolling migration, not a
+        # new campaign.  Preserve the serial/candidate cursor and atomically
+        # advance the durable pin before any replacement submission.
+        value["solver_revision"] = SOLVER_REVISION
+        write_json(path, value)
+    elif state_solver != SOLVER_REVISION:
+        raise GateError(
+            "pooled10x30 state identity drifted: "
+            f"{{'solver_revision': {value.get('solver_revision')!r}}}"
+        )
     for key in ("serial", "candidate_cursor", "accepted_tasks"):
         if type(value.get(key)) is not int or int(value[key]) < 0:
             raise GateError(f"pooled10x30 state {key} is invalid")

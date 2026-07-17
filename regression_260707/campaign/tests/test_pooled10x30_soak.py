@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -96,6 +97,39 @@ def test_environment_preserves_validated_async_contract():
     assert env["MFT_CAMPAIGN_MIGRATION_REPLACEMENT_SOLVER"] == (
         soak.SOLVER_REVISION
     )
+
+
+def test_state_rolls_forward_only_from_reviewed_predecessor(tmp_path):
+    state_path = tmp_path / "state.json"
+    predecessor = {
+        **soak._initial_state(),
+        "solver_revision": soak.PREVIOUS_SOLVER_REVISION,
+        "serial": 23,
+        "candidate_cursor": 456,
+        "accepted_tasks": 23,
+    }
+    state_path.write_text(json.dumps(predecessor), encoding="utf-8")
+
+    migrated = soak.load_state(state_path)
+
+    assert migrated["solver_revision"] == soak.SOLVER_REVISION
+    assert migrated["serial"] == 23
+    assert migrated["candidate_cursor"] == 456
+    assert json.loads(state_path.read_text(encoding="utf-8"))[
+        "solver_revision"
+    ] == soak.SOLVER_REVISION
+
+    foreign = {**migrated, "solver_revision": "f" * 40}
+    state_path.write_text(json.dumps(foreign), encoding="utf-8")
+    with pytest.raises(soak.GateError, match="identity drifted"):
+        soak.load_state(state_path)
+
+
+def test_rolling_solver_keeps_original_active_inventory_namespace():
+    assert soak.NAME_PREFIX.startswith(
+        f"mft-camp-s{soak.PREVIOUS_SOLVER_REVISION[:7]}-"
+    )
+    assert soak.SOLVER_REVISION != soak.PREVIOUS_SOLVER_REVISION
 
 
 def test_cycle_submits_only_own_deficit_and_respects_shared_project_slots(tmp_path):
