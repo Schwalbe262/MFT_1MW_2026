@@ -51,8 +51,10 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertRegex(
                 queue.get(result.jobs["train"]).idempotency_key,
-                r"-o[0-9a-f]{12}$",
+                r"-e[0-9a-f]{12}$",
             )
+            threads_index = command.index("--model-threads")
+            self.assertEqual(command[threads_index + 1], "24")
 
     def test_checkpoint_route_change_creates_a_distinct_idempotency_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -93,6 +95,49 @@ class OrchestratorTests(unittest.TestCase):
             self.assertNotEqual(
                 queue.get(first.jobs["train"]).idempotency_key,
                 queue.get(second.jobs["train"]).idempotency_key,
+            )
+
+    def test_checkpoint_thread_budget_changes_execution_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "training").mkdir(parents=True)
+            dataset = root / "train.parquet"
+            dataset.write_bytes(b"thread-budget checkpoint dataset")
+            queue = DurableJobQueue(root / "pipeline" / "jobs.sqlite3")
+            store = GenerationStore(root / "pipeline" / "artifacts")
+
+            first = PipelineOrchestrator(
+                queue, store, runtime
+            ).plan_cycle(
+                dataset_path=dataset,
+                strict_full_rows=3000,
+                solver_revision="a" * 40,
+                library_revision="b" * 40,
+                model_threads=4,
+                now=1200,
+            )
+            second = PipelineOrchestrator(
+                queue, store, runtime
+            ).plan_cycle(
+                dataset_path=dataset,
+                strict_full_rows=3000,
+                solver_revision="a" * 40,
+                library_revision="b" * 40,
+                model_threads=8,
+                now=1200,
+            )
+
+            first_job = queue.get(first.jobs["train"])
+            second_job = queue.get(second.jobs["train"])
+            self.assertNotEqual(
+                first_job.idempotency_key, second_job.idempotency_key
+            )
+            second_threads = second_job.payload["command"].index(
+                "--model-threads"
+            )
+            self.assertEqual(
+                second_job.payload["command"][second_threads + 1], "8"
             )
 
     def test_checkpoint_output_root_defaults_to_runtime_training(self):

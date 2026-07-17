@@ -72,6 +72,26 @@ class AtomicStrictStatusTests(unittest.TestCase):
 
 
 class TrainingCommandTests(unittest.TestCase):
+    def test_candidate_command_forwards_model_thread_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = checkpoint.training_commands(
+                str(root / "snapshot.parquet"),
+                str(root / "learning_curve.csv"),
+                str(root / "registry"),
+                100,
+                str(root / "profile.json"),
+                3000,
+                str(root / "metrics.json"),
+                str(root / "candidate.json"),
+                model_threads=8,
+            )
+
+        candidate = commands[1]
+        self.assertEqual(
+            candidate[candidate.index("--model-threads") + 1], "8"
+        )
+
     def test_checkpoint_command_writes_non_authoritative_parity_sidecar(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -298,9 +298,15 @@ class PipelineOrchestrator:
                 pass
         checkpoint = next_training_checkpoint(rows, active_rows)
         if checkpoint is not None:
-            checkpoint_output_key = hashlib.sha256(
-                os.fsencode(os.path.normcase(str(self.checkpoint_output_root)))
-            ).hexdigest()[:12]
+            checkpoint_execution_key = hashlib.sha256(json.dumps(
+                {
+                    "model_threads": model_threads,
+                    "output_root": os.path.normcase(
+                        str(self.checkpoint_output_root)
+                    ),
+                },
+                sort_keys=True,
+            ).encode("utf-8")).hexdigest()[:12]
             dependencies = [tune_job.id] if tune_job else []
             params_argument: list[str] = []
             if tune_job:
@@ -324,12 +330,13 @@ class PipelineOrchestrator:
                 "--solver-revision", solver_revision.lower(),
                 "--library-revision", library_revision.lower(),
                 "--source-dataset-generation", dataset_identity,
+                "--model-threads", str(model_threads),
             ] + params_argument
             train = self.queue.enqueue(
                 "train",
                 (
                     f"checkpoint-{checkpoint}-{dataset.generation_id}"
-                    f"-o{checkpoint_output_key}"
+                    f"-e{checkpoint_execution_key}"
                 ),
                 {
                     "command": train_command,

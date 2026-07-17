@@ -522,7 +522,7 @@ def _run(command):
 def training_commands(
     snapshot, curve, registry, min_rows, profile, threshold, metrics_result,
     candidate_result=None, params=None, source_dataset_path=None,
-    source_dataset_generation=None,
+    source_dataset_generation=None, model_threads=None,
 ):
     """Build child commands with one already-normalized absolute profile path."""
     if not profile or not os.path.isabs(profile):
@@ -557,6 +557,10 @@ def training_commands(
         if source_dataset_generation:
             candidate_command.extend(
                 ["--source-dataset-generation", source_dataset_generation]
+            )
+        if model_threads is not None:
+            candidate_command.extend(
+                ["--model-threads", str(int(model_threads))]
             )
         commands.append(candidate_command)
     return commands
@@ -679,6 +683,10 @@ def main():
         help="immutable Optuna params.json generation pinned into this contract",
     )
     parser.add_argument("--min-rows", type=int, default=200)
+    parser.add_argument(
+        "--model-threads", type=int, default=None,
+        help="maximum threads used by each candidate model fit",
+    )
     parser.add_argument("--solver-revision", default=None)
     parser.add_argument("--library-revision", default=None)
     parser.add_argument(
@@ -709,6 +717,8 @@ def main():
         args.library_revision = args.library_revision.lower()
     if args.retry_min_new_rows < 0 or args.retry_backoff_seconds < 0:
         parser.error("checkpoint retry limits must be non-negative")
+    if args.model_threads is not None and args.model_threads < 1:
+        parser.error("model threads must be positive")
     if args.expected_contract_key and not re.fullmatch(
         r"[0-9a-fA-F]{16}", args.expected_contract_key
     ):
@@ -984,6 +994,7 @@ def main():
                     args.params,
                     dataset,
                     args.source_dataset_generation,
+                    args.model_threads,
                 ):
                     _run(command)
                 with open(metrics_result, encoding="utf-8") as handle:
