@@ -9,6 +9,7 @@ planner repeatedly is therefore the normal control loop.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import os
@@ -297,6 +298,9 @@ class PipelineOrchestrator:
                 pass
         checkpoint = next_training_checkpoint(rows, active_rows)
         if checkpoint is not None:
+            checkpoint_output_key = hashlib.sha256(
+                os.fsencode(os.path.normcase(str(self.checkpoint_output_root)))
+            ).hexdigest()[:12]
             dependencies = [tune_job.id] if tune_job else []
             params_argument: list[str] = []
             if tune_job:
@@ -323,7 +327,10 @@ class PipelineOrchestrator:
             ] + params_argument
             train = self.queue.enqueue(
                 "train",
-                f"checkpoint-{checkpoint}-{dataset.generation_id}",
+                (
+                    f"checkpoint-{checkpoint}-{dataset.generation_id}"
+                    f"-o{checkpoint_output_key}"
+                ),
                 {
                     "command": train_command,
                     "cwd": str(self.runtime_root),

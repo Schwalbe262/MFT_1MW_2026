@@ -49,6 +49,51 @@ class OrchestratorTests(unittest.TestCase):
                 Path(command[output_index + 1]),
                 Path(command[run_index + 1]),
             )
+            self.assertRegex(
+                queue.get(result.jobs["train"]).idempotency_key,
+                r"-o[0-9a-f]{12}$",
+            )
+
+    def test_checkpoint_route_change_creates_a_distinct_idempotency_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "training").mkdir(parents=True)
+            dataset = root / "train.parquet"
+            dataset.write_bytes(b"same immutable checkpoint dataset")
+            queue = DurableJobQueue(root / "pipeline" / "jobs.sqlite3")
+            store = GenerationStore(root / "pipeline" / "artifacts")
+
+            first = PipelineOrchestrator(
+                queue,
+                store,
+                runtime,
+                checkpoint_output_root=root / "first-output",
+            ).plan_cycle(
+                dataset_path=dataset,
+                strict_full_rows=3000,
+                solver_revision="a" * 40,
+                library_revision="b" * 40,
+                now=1200,
+            )
+            second = PipelineOrchestrator(
+                queue,
+                store,
+                runtime,
+                checkpoint_output_root=root / "second-output",
+            ).plan_cycle(
+                dataset_path=dataset,
+                strict_full_rows=3000,
+                solver_revision="a" * 40,
+                library_revision="b" * 40,
+                now=1200,
+            )
+
+            self.assertNotEqual(first.jobs["train"], second.jobs["train"])
+            self.assertNotEqual(
+                queue.get(first.jobs["train"]).idempotency_key,
+                queue.get(second.jobs["train"]).idempotency_key,
+            )
 
     def test_checkpoint_output_root_defaults_to_runtime_training(self):
         with tempfile.TemporaryDirectory() as directory:
