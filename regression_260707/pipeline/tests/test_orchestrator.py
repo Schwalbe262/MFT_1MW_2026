@@ -10,6 +10,73 @@ from regression_260707.pipeline.queue import DurableJobQueue
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_checkpoint_output_root_is_separate_from_identity_run_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "training").mkdir(parents=True)
+            dataset = root / "train.parquet"
+            dataset.write_bytes(b"strict checkpoint dataset")
+            local_output = root / "local-checkpoint-output"
+            queue = DurableJobQueue(root / "pipeline" / "jobs.sqlite3")
+            orchestrator = PipelineOrchestrator(
+                queue,
+                GenerationStore(root / "pipeline" / "artifacts"),
+                runtime,
+                python=str(root / "python"),
+                checkpoint_output_root=local_output,
+            )
+
+            result = orchestrator.plan_cycle(
+                dataset_path=dataset,
+                strict_full_rows=3000,
+                solver_revision="a" * 40,
+                library_revision="b" * 40,
+                now=1200,
+            )
+
+            command = queue.get(result.jobs["train"]).payload["command"]
+            output_index = command.index("--output-root")
+            run_index = command.index("--run-root")
+            self.assertEqual(
+                Path(command[output_index + 1]), local_output.resolve()
+            )
+            self.assertEqual(
+                Path(command[run_index + 1]).parent,
+                (runtime / "training" / "checkpoint_runs").resolve(),
+            )
+            self.assertNotEqual(
+                Path(command[output_index + 1]),
+                Path(command[run_index + 1]),
+            )
+
+    def test_checkpoint_output_root_defaults_to_runtime_training(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "training").mkdir(parents=True)
+            dataset = root / "train.parquet"
+            dataset.write_bytes(b"default checkpoint dataset")
+            queue = DurableJobQueue(root / "pipeline" / "jobs.sqlite3")
+            result = PipelineOrchestrator(
+                queue,
+                GenerationStore(root / "pipeline" / "artifacts"),
+                runtime,
+            ).plan_cycle(
+                dataset_path=dataset,
+                strict_full_rows=3000,
+                solver_revision="a" * 40,
+                library_revision="b" * 40,
+                now=1200,
+            )
+
+            command = queue.get(result.jobs["train"]).payload["command"]
+            output_index = command.index("--output-root")
+            self.assertEqual(
+                Path(command[output_index + 1]),
+                (runtime / "training").resolve(),
+            )
+
     def test_4k_cycle_orders_tuning_before_training_and_overlaps_collection(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

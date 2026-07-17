@@ -79,6 +79,7 @@ def main() -> None:
     control = sub.add_parser("control")
     control.add_argument("--dataset", default=None)
     control.add_argument("--registry", default=None)
+    control.add_argument("--checkpoint-output-root", default=None)
     control.add_argument("--solver-revision", required=True)
     control.add_argument("--library-revision", required=True)
     control.add_argument("--interval-seconds", type=int, default=600)
@@ -95,6 +96,7 @@ def main() -> None:
     plan.add_argument("--solver-revision", required=True)
     plan.add_argument("--library-revision", required=True)
     plan.add_argument("--registry", default=None)
+    plan.add_argument("--checkpoint-output-root", default=None)
     plan.add_argument("--no-active-model", action="store_true")
     plan.add_argument("--drift-detected", action="store_true")
     plan.add_argument("--quality-regression", action="store_true")
@@ -143,17 +145,26 @@ def main() -> None:
         )
         return
     if args.command == "control":
+        checkpoint_output_root = Path(
+            args.checkpoint_output_root or runtime / "training"
+        ).resolve()
         verification_commands = None
         if args.verification_commands:
             verification_commands = json.loads(
                 Path(args.verification_commands).read_text(encoding="utf-8")
             )
         controller = ContinuousController(
-            PipelineOrchestrator(queue, store, runtime, python=sys.executable),
+            PipelineOrchestrator(
+                queue,
+                store,
+                runtime,
+                python=sys.executable,
+                checkpoint_output_root=checkpoint_output_root,
+            ),
             dataset=(
                 args.dataset or runtime / "data" / "dataset" / "train.parquet"
             ),
-            registry=(args.registry or runtime / "training" / "registry"),
+            registry=(args.registry or checkpoint_output_root / "registry"),
             solver_revision=args.solver_revision.lower(),
             library_revision=args.library_revision.lower(),
             optuna_trials=args.optuna_trials,
@@ -186,7 +197,8 @@ def main() -> None:
         args.dataset or runtime / "data" / "dataset" / "train.parquet"
     )
     registry = os.path.abspath(
-        args.registry or runtime / "training" / "registry"
+        args.registry
+        or Path(args.checkpoint_output_root or runtime / "training") / "registry"
     )
     active = None
     if not args.no_active_model and os.path.isfile(
@@ -199,7 +211,11 @@ def main() -> None:
             Path(args.verification_commands).read_text(encoding="utf-8")
         )
     result = PipelineOrchestrator(
-        queue, store, runtime, python=sys.executable
+        queue,
+        store,
+        runtime,
+        python=sys.executable,
+        checkpoint_output_root=args.checkpoint_output_root,
     ).plan_cycle(
         dataset_path=dataset,
         strict_full_rows=args.strict_full_rows,

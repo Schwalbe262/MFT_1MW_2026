@@ -50,11 +50,15 @@ class PipelineOrchestrator:
         runtime_root: str | os.PathLike[str],
         *,
         python: str = sys.executable,
+        checkpoint_output_root: str | os.PathLike[str] | None = None,
     ):
         self.queue = queue
         self.store = store
         self.runtime_root = Path(runtime_root).resolve()
         self.python = os.path.abspath(python)
+        self.checkpoint_output_root = Path(
+            checkpoint_output_root or self.runtime_root / "training"
+        ).resolve()
 
     def latest_tuning(
         self,
@@ -227,7 +231,7 @@ class PipelineOrchestrator:
             )
         )
         active_rows = int((active_model or {}).get("strict_full_rows") or 0)
-        status_path = self.runtime_root / "training" / "strict_data_status.json"
+        status_path = self.checkpoint_output_root / "strict_data_status.json"
         if status_path.is_file():
             try:
                 status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -310,7 +314,7 @@ class PipelineOrchestrator:
                 "--dataset-series", os.path.abspath(
                     os.fspath(dataset_series_path or dataset_path)
                 ),
-                "--output-root", str(self.runtime_root / "training"),
+                "--output-root", str(self.checkpoint_output_root),
                 "--run-root", str(checkpoint_run_root),
                 "--execute",
                 "--solver-revision", solver_revision.lower(),
