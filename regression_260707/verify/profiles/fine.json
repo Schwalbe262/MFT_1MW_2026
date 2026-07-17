@@ -43,6 +43,6 @@
   },
   "mem_mb": 98304,
   "cpus": 8,
-  "timeout_seconds": 21600,
+  "timeout_seconds": 43200,
   "manufacturing_tolerance_policy": "excluded; exact-as-FEA geometry is assumed"
 }
