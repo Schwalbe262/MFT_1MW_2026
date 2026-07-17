@@ -1111,6 +1111,33 @@ def _download_verified_sftp(
     ) from last_error
 
 
+def _quarantine_stale_local_artifact(task_dir: Path, filename: str) -> dict | None:
+    """Move a local byte stream aside when the authoritative remote file is absent.
+
+    Older text-API harvests could leave zero-length or UTF-8-corrupted ``.npy``
+    files.  A terminal remote inventory that says the artifact is absent must
+    not leave those bytes discoverable under the canonical filename.
+    """
+    destination = task_dir / filename
+    if not destination.exists():
+        return None
+    if destination.is_symlink() or not destination.is_file():
+        raise RuntimeError(f"unsafe stale local artifact: {filename}")
+    byte_count = destination.stat().st_size
+    digest = sha256_file(destination)
+    quarantine = task_dir / ".stale"
+    quarantine.mkdir(parents=True, exist_ok=True)
+    quarantined = quarantine / f"{filename}.{digest}.stale"
+    os.replace(destination, quarantined)
+    return {
+        "file": filename,
+        "bytes": byte_count,
+        "sha256": digest,
+        "quarantined_path": str(quarantined),
+        "reason": "authoritative_remote_artifact_absent",
+    }
+
+
 def _safe_lane_output_relative(value: object, task_id: int, lane_id: str) -> str:
     raw = str(value or "")
     if not raw or "\\" in raw:
@@ -1410,6 +1437,7 @@ def _harvest_one_submission(
     inventory_is_sealed = bool(sealed_records or sealed_missing)
     row["downloaded"] = []
     row["missing"] = []
+    row["quarantined_stale_local"] = []
     row.pop("download_warnings", None)
     row.pop("integrity_errors", None)
     all_reused = True
@@ -1425,6 +1453,9 @@ def _harvest_one_submission(
             )
         except RemoteArtifactMissing:
             row["missing"].append(filename)
+            quarantined = _quarantine_stale_local_artifact(task_dir, filename)
+            if quarantined is not None:
+                row["quarantined_stale_local"].append(quarantined)
             if inventory_is_sealed and filename in sealed_records:
                 terminal_mutations.append(f"terminal_artifact_disappeared:{filename}")
             if filename not in prior_missing:

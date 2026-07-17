@@ -431,6 +431,66 @@ def test_harvest_one_lane_failure_does_not_drop_other_lanes(tmp_path, monkeypatc
     assert summary["lanes"][1]["error"] is None
 
 
+def test_missing_remote_artifact_quarantines_stale_text_api_bytes(
+    tmp_path, monkeypatch
+):
+    deployment, dataset, generation, quality, runner = _fixture(tmp_path)
+    plan, _ = offload.build_plan(
+        deployment,
+        dataset,
+        generation,
+        quality,
+        tmp_path / "plans",
+        "/gpfs/tmp_cpu2/test",
+        runner=runner,
+    )
+    submission, remote_files = _remote_fixture(plan, 551, state="infeasible")
+    output_root = (
+        plan["remote_bundle"].rstrip("/")
+        + "/runs/task-551/lane-551/round_00/"
+    )
+    del remote_files[output_root + "pareto_X.npy"]
+    del remote_files[output_root + "pareto_F.npy"]
+    offload.atomic_json(
+        Path(plan["local_plan_dir"]) / "submissions.json",
+        {
+            "schema_version": offload.PLAN_SCHEMA,
+            "bundle_id": plan["bundle_id"],
+            "submissions": [submission],
+        },
+    )
+    task_dir = Path(plan["local_plan_dir"]) / "harvest" / "task-551"
+    stale_x = _write(task_dir / "pareto_X.npy", b"text-api-corruption-X")
+    stale_f = _write(task_dir / "pareto_F.npy", b"text-api-corruption-F")
+    stale_digests = {_sha(stale_x), _sha(stale_f)}
+    _install_fake_sftp(monkeypatch, remote_files)
+
+    def fake_json(url, method="GET", payload=None, timeout=30):
+        del url, method, payload, timeout
+        return {
+            "task_id": 551,
+            "status": "completed",
+            "account_name": "account-551",
+            "actual_node_name": "n551",
+            "remote_cwd": plan["remote_bundle"],
+        }
+
+    monkeypatch.setattr(offload, "_api_json", fake_json)
+    summary = offload.harvest_status(
+        Path(plan["local_plan_dir"]) / "offload_plan.json",
+        scheduler_url="http://scheduler",
+    )
+    row = summary["lanes"][0]
+    assert row["artifacts_complete"] is True
+    assert {"pareto_X.npy", "pareto_F.npy"} <= set(row["missing"])
+    assert not stale_x.exists()
+    assert not stale_f.exists()
+    quarantined = row["quarantined_stale_local"]
+    assert {item["sha256"] for item in quarantined} == stale_digests
+    assert all(Path(item["quarantined_path"]).suffix == ".stale" for item in quarantined)
+    assert all(Path(item["quarantined_path"]).is_file() for item in quarantined)
+
+
 def test_harvest_retries_corrupt_sftp_and_isolates_permanent_failure(
     tmp_path, monkeypatch
 ):
