@@ -108,6 +108,14 @@ PHYSICS_EQUIVALENT_SOLVER_REVISIONS: dict[str, frozenset[str]] = {
     # pin must not silently accept this later runtime or an arbitrary
     # descendant.
     "7768510433858c9056f04320e66819d5fcc90f1a": frozenset({
+        # Reviewed 2026-07-17: ed3eede is the direct 7768510 descendant.
+        # It only makes an already scoped, terminal AEDT design error clear
+        # ``solver_may_be_running`` so that pooled cleanup rejects that one
+        # project lease instead of quarantining healthy sibling projects.
+        # Geometry, materials, setup/expression definitions, normal solve and
+        # extraction paths, and PHYSICS_DATA_REVISION are unchanged.  See
+        # campaign/q26_ed3_project_local_failure_physics_compatibility.json.
+        "ed3eede4b476e96f17651e1a5f3bbf5c1059514d",
         "8fab610dfca7180732bd0b38923aa6c71e2129bb",
         "8b1a65ca46509b0fe3fe64420709dea2d15de1a4",
         "092a35bb6e9552fa9c0ef7388c6059606844f2cd",

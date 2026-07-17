@@ -377,12 +377,16 @@ class StrictRowContractTests(unittest.TestCase):
 
     def test_current_production_solver_reuses_only_reviewed_physics_rows(self):
         expected_solver = "7768510433858c9056f04320e66819d5fcc90f1a"
+        project_local_failure_solver = (
+            "ed3eede4b476e96f17651e1a5f3bbf5c1059514d"
+        )
         predecessor = "8fab610dfca7180732bd0b38923aa6c71e2129bb"
         approved_historical = "bffbb15fe2cdec74a72f47e7eb9bacbf0f4e95f7"
         unreviewed_intermediate = "d424b75".ljust(40, "0")
         unreviewed_descendant = "f" * 40
 
         approved = QUALITY_SOLVER_EQUIVALENCE[expected_solver]
+        self.assertIn(project_local_failure_solver, approved)
         self.assertIn(predecessor, approved)
         self.assertIn(approved_historical, approved)
         self.assertNotIn(unreviewed_intermediate, approved)
@@ -390,6 +394,7 @@ class StrictRowContractTests(unittest.TestCase):
 
         rows = [
             _valid_native_result(git_hash=expected_solver),
+            _valid_native_result(git_hash=project_local_failure_solver),
             _valid_native_result(git_hash=predecessor),
             _valid_native_result(git_hash=approved_historical),
             _valid_native_result(git_hash=unreviewed_intermediate),
@@ -406,15 +411,15 @@ class StrictRowContractTests(unittest.TestCase):
         )
         self.assertEqual(
             audited["_strict_valid_full"].tolist(),
-            [True, True, True, False, False, False],
+            [True, True, True, True, False, False, False],
         )
-        self.assertEqual(audited.attrs["provenance_equivalent_rows"], 2)
+        self.assertEqual(audited.attrs["provenance_equivalent_rows"], 3)
 
         # Directional: retaining the old expected pin must not authorize rows
         # emitted by the newer production runtime.
         old_expected = "26afff8de2936f605783395fbff19d5f1d26b354"
         newer_row_under_old_pin = validate_record(
-            rows[0],
+            rows[1],
             expected_solver_revision=old_expected,
             expected_library_revision=TEST_LIBRARY_REVISION,
         )
