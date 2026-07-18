@@ -7,6 +7,7 @@ import time
 from unittest import mock
 
 import pandas as pd
+import pytest
 
 from regression_260707.training import train_models
 
@@ -29,6 +30,8 @@ def test_target_workers_train_independent_targets_concurrently():
             source_dataset_path=str(dataset),
             source_dataset_generation="dataset:" + "a" * 64,
             target_workers=4,
+            model_threads=2,
+            max_model_thread_budget=8,
         )
         frame = pd.DataFrame({target: [1.0] for target in targets})
         frame["feature"] = 1.0
@@ -72,3 +75,21 @@ def test_target_workers_train_independent_targets_concurrently():
         assert maximum >= 2
         assert set(report["report"]) == set(targets)
         assert set(report["target_physics_data_revision_cohorts"].values()) == {"v3"}
+        assert report["training_parallelism"] == {
+            "target_workers": 4,
+            "model_threads": 2,
+            "maximum_model_thread_budget": 8,
+            "effective_model_thread_budget": 8,
+        }
+
+
+def test_target_workers_cannot_oversubscribe_declared_budget():
+    argv = [
+        "train_models.py",
+        "--model-threads", "3",
+        "--target-workers", "4",
+        "--max-model-thread-budget", "8",
+    ]
+    with mock.patch("sys.argv", argv):
+        with pytest.raises(SystemExit):
+            train_models.main()

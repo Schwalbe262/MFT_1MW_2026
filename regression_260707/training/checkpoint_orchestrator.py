@@ -522,7 +522,8 @@ def _run(command):
 def training_commands(
     snapshot, curve, registry, min_rows, profile, threshold, metrics_result,
     candidate_result=None, params=None, source_dataset_path=None,
-    source_dataset_generation=None, model_threads=None,
+    source_dataset_generation=None, model_threads=None, target_workers=None,
+    max_model_thread_budget=None,
 ):
     """Build child commands with one already-normalized absolute profile path."""
     if not profile or not os.path.isabs(profile):
@@ -562,6 +563,15 @@ def training_commands(
             candidate_command.extend(
                 ["--model-threads", str(int(model_threads))]
             )
+        if target_workers is not None:
+            candidate_command.extend(
+                ["--target-workers", str(int(target_workers))]
+            )
+        if max_model_thread_budget is not None:
+            candidate_command.extend([
+                "--max-model-thread-budget",
+                str(int(max_model_thread_budget)),
+            ])
         commands.append(candidate_command)
     return commands
 
@@ -687,6 +697,14 @@ def main():
         "--model-threads", type=int, default=None,
         help="maximum threads used by each candidate model fit",
     )
+    parser.add_argument(
+        "--target-workers", type=int, default=1,
+        help="independent surrogate targets trained concurrently",
+    )
+    parser.add_argument(
+        "--max-model-thread-budget", type=int, default=None,
+        help="fail-closed ceiling for target-workers times model-threads",
+    )
     parser.add_argument("--solver-revision", default=None)
     parser.add_argument("--library-revision", default=None)
     parser.add_argument(
@@ -719,6 +737,19 @@ def main():
         parser.error("checkpoint retry limits must be non-negative")
     if args.model_threads is not None and args.model_threads < 1:
         parser.error("model threads must be positive")
+    if args.target_workers < 1:
+        parser.error("target workers must be positive")
+    if args.max_model_thread_budget is not None:
+        if args.max_model_thread_budget < 1:
+            parser.error("maximum model thread budget must be positive")
+        if args.model_threads is None:
+            parser.error(
+                "maximum model thread budget requires explicit model threads"
+            )
+        if args.model_threads * args.target_workers > args.max_model_thread_budget:
+            parser.error(
+                "target workers times model threads exceeds maximum thread budget"
+            )
     if args.expected_contract_key and not re.fullmatch(
         r"[0-9a-fA-F]{16}", args.expected_contract_key
     ):
@@ -995,6 +1026,8 @@ def main():
                     dataset,
                     args.source_dataset_generation,
                     args.model_threads,
+                    args.target_workers,
+                    args.max_model_thread_budget,
                 ):
                     _run(command)
                 with open(metrics_result, encoding="utf-8") as handle:

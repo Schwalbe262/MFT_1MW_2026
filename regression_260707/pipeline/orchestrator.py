@@ -31,6 +31,22 @@ from .queue import DurableJobQueue, Job
 
 
 DEFAULT_MODEL_THREADS = 24
+MAX_CHECKPOINT_TARGET_WORKERS = 4
+
+
+def checkpoint_training_parallelism(total_thread_budget: int) -> tuple[int, int]:
+    """Split one bounded checkpoint budget across independent targets.
+
+    Production has 21 surrogate targets.  Four concurrent targets keeps the
+    memory footprint bounded while using the same explicit total CPU budget as
+    the sequential path.  The returned tuple is ``(target_workers,
+    model_threads_per_target)`` and never oversubscribes the caller's budget.
+    """
+    budget = int(total_thread_budget)
+    if isinstance(total_thread_budget, bool) or budget < 1:
+        raise ValueError("total_thread_budget must be a positive integer")
+    workers = min(MAX_CHECKPOINT_TARGET_WORKERS, budget)
+    return workers, max(1, budget // workers)
 
 
 @dataclass(frozen=True)
@@ -422,6 +438,9 @@ class PipelineOrchestrator:
         if isinstance(model_threads, bool) or int(model_threads) < 1:
             raise ValueError("model_threads must be a positive integer")
         model_threads = int(model_threads)
+        checkpoint_target_workers, checkpoint_model_threads = (
+            checkpoint_training_parallelism(model_threads)
+        )
         for label, revision in (
             ("solver", solver_revision), ("library", library_revision)
         ):
@@ -692,7 +711,9 @@ class PipelineOrchestrator:
         if checkpoint is not None:
             checkpoint_execution_key = hashlib.sha256(json.dumps(
                 {
-                    "model_threads": model_threads,
+                    "max_model_thread_budget": model_threads,
+                    "candidate_model_threads": checkpoint_model_threads,
+                    "candidate_target_workers": checkpoint_target_workers,
                     "output_root": os.path.normcase(
                         str(self.checkpoint_output_root)
                     ),
@@ -753,7 +774,9 @@ class PipelineOrchestrator:
                     "--solver-revision", solver_revision.lower(),
                     "--library-revision", library_revision.lower(),
                     "--source-dataset-generation", dataset_identity,
-                    "--model-threads", str(model_threads),
+                    "--model-threads", str(checkpoint_model_threads),
+                    "--target-workers", str(checkpoint_target_workers),
+                    "--max-model-thread-budget", str(model_threads),
                 ] + params_argument
                 train = self.queue.enqueue(
                     "train",
@@ -769,6 +792,12 @@ class PipelineOrchestrator:
                             "MFT_PIPELINE_ROOT": str(self.store.root.parent),
                         },
                         "dependency_kinds": {},
+                        "execution_contract": {
+                            "kind": "pipeline_checkpoint_train_v2",
+                            "max_model_thread_budget": model_threads,
+                            "model_threads": checkpoint_model_threads,
+                            "target_workers": checkpoint_target_workers,
+                        },
                         "retry": True,
                         "retry_backoff_seconds": 600,
                     },

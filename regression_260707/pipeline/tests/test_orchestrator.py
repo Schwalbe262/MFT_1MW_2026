@@ -12,12 +12,22 @@ from regression_260707.pipeline.artifacts import GenerationStore
 from regression_260707.pipeline.controller import ContinuousController
 from regression_260707.pipeline.orchestrator import (
     PipelineOrchestrator,
+    checkpoint_training_parallelism,
     descriptor_from_active_registry,
 )
 from regression_260707.pipeline.queue import DurableJobQueue
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_checkpoint_parallelism_never_exceeds_total_budget(self):
+        self.assertEqual(checkpoint_training_parallelism(1), (1, 1))
+        self.assertEqual(checkpoint_training_parallelism(4), (4, 1))
+        self.assertEqual(checkpoint_training_parallelism(8), (4, 2))
+        self.assertEqual(checkpoint_training_parallelism(24), (4, 6))
+        for budget in range(1, 33):
+            workers, threads = checkpoint_training_parallelism(budget)
+            self.assertLessEqual(workers * threads, budget)
+
     def test_checkpoint_output_root_is_separate_from_identity_run_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -62,7 +72,11 @@ class OrchestratorTests(unittest.TestCase):
                 r"-e[0-9a-f]{12}$",
             )
             threads_index = command.index("--model-threads")
-            self.assertEqual(command[threads_index + 1], "24")
+            workers_index = command.index("--target-workers")
+            budget_index = command.index("--max-model-thread-budget")
+            self.assertEqual(command[threads_index + 1], "6")
+            self.assertEqual(command[workers_index + 1], "4")
+            self.assertEqual(command[budget_index + 1], "24")
 
     def test_checkpoint_route_change_creates_a_distinct_idempotency_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,7 +159,28 @@ class OrchestratorTests(unittest.TestCase):
                 "--model-threads"
             )
             self.assertEqual(
-                second_job.payload["command"][second_threads + 1], "8"
+                second_job.payload["command"][second_threads + 1], "2"
+            )
+            second_workers = second_job.payload["command"].index(
+                "--target-workers"
+            )
+            second_budget = second_job.payload["command"].index(
+                "--max-model-thread-budget"
+            )
+            self.assertEqual(
+                second_job.payload["command"][second_workers + 1], "4"
+            )
+            self.assertEqual(
+                second_job.payload["command"][second_budget + 1], "8"
+            )
+            self.assertEqual(
+                second_job.payload["execution_contract"],
+                {
+                    "kind": "pipeline_checkpoint_train_v2",
+                    "max_model_thread_budget": 8,
+                    "model_threads": 2,
+                    "target_workers": 4,
+                },
             )
 
     def test_checkpoint_output_root_defaults_to_runtime_training(self):
@@ -927,7 +962,9 @@ class OrchestratorTests(unittest.TestCase):
             ).encode("utf-8")).hexdigest()[:12]
             checkpoint_execution_key = hashlib.sha256(json.dumps(
                 {
-                    "model_threads": 24,
+                    "max_model_thread_budget": 24,
+                    "candidate_model_threads": 6,
+                    "candidate_target_workers": 4,
                     "output_root": os.path.normcase(
                         str((runtimes[1] / "training").resolve())
                     ),

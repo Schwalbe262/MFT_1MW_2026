@@ -843,6 +843,17 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
         report = {
             "schema_version": REGISTRY_SCHEMA_VERSION,
             "time": datetime.now().isoformat(timespec="seconds"),
+            "training_parallelism": {
+                "target_workers": target_workers,
+                "model_threads": getattr(args, "model_threads", None),
+                "maximum_model_thread_budget": (
+                    getattr(args, "max_model_thread_budget", None)
+                ),
+                "effective_model_thread_budget": (
+                    target_workers * getattr(args, "model_threads", 0)
+                    if getattr(args, "model_threads", None) is not None else None
+                ),
+            },
             "training_run_id": run_id,
             "dataset_path": args.dataset,
             "dataset_sha256": dataset_sha256,
@@ -921,6 +932,10 @@ def main():
         "--target-workers", type=int, default=1,
         help="number of independent targets trained concurrently (default: 1)",
     )
+    parser.add_argument(
+        "--max-model-thread-budget", type=int, default=None,
+        help="fail-closed ceiling for target-workers times model-threads",
+    )
     args = parser.parse_args()
 
     from quality_contract import annotate_validity
@@ -942,6 +957,17 @@ def main():
         parser.error("model threads must be positive")
     if args.target_workers < 1:
         parser.error("target workers must be positive")
+    if args.max_model_thread_budget is not None:
+        if args.max_model_thread_budget < 1:
+            parser.error("maximum model thread budget must be positive")
+        if args.model_threads is None:
+            parser.error(
+                "maximum model thread budget requires explicit model threads"
+            )
+        if args.model_threads * args.target_workers > args.max_model_thread_budget:
+            parser.error(
+                "target workers times model threads exceeds maximum thread budget"
+            )
 
     raw = pd.read_parquet(args.dataset)
     frame = to_physical(annotate_validity(raw, args.profile))

@@ -72,6 +72,17 @@ class AtomicStrictStatusTests(unittest.TestCase):
 
 
 class TrainingCommandTests(unittest.TestCase):
+    def test_cli_rejects_parallelism_above_declared_thread_budget(self):
+        argv = [
+            "checkpoint_orchestrator.py",
+            "--model-threads", "3",
+            "--target-workers", "4",
+            "--max-model-thread-budget", "8",
+        ]
+        with mock.patch.object(checkpoint.sys, "argv", argv):
+            with self.assertRaises(SystemExit):
+                checkpoint.main()
+
     def test_candidate_command_forwards_model_thread_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -85,11 +96,19 @@ class TrainingCommandTests(unittest.TestCase):
                 str(root / "metrics.json"),
                 str(root / "candidate.json"),
                 model_threads=8,
+                target_workers=4,
+                max_model_thread_budget=32,
             )
 
         candidate = commands[1]
         self.assertEqual(
             candidate[candidate.index("--model-threads") + 1], "8"
+        )
+        self.assertEqual(
+            candidate[candidate.index("--target-workers") + 1], "4"
+        )
+        self.assertEqual(
+            candidate[candidate.index("--max-model-thread-budget") + 1], "32"
         )
 
     def test_checkpoint_command_writes_non_authoritative_parity_sidecar(self):
