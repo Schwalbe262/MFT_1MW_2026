@@ -10,6 +10,7 @@ output params so checkpoint training can consume them without a mutable
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -77,6 +78,72 @@ def _atomic_json(value, path):
     finally:
         if os.path.exists(staged):
             os.remove(staged)
+
+
+def run_tuning_jobs(
+    jobs,
+    trials,
+    frame,
+    features,
+    *,
+    model_threads,
+    job_workers,
+    max_model_thread_budget,
+):
+    """Tune independent target/family studies under one explicit CPU budget."""
+
+    if (
+        isinstance(job_workers, bool)
+        or isinstance(max_model_thread_budget, bool)
+        or int(job_workers) < 1
+        or int(max_model_thread_budget) < 1
+    ):
+        raise ValueError("tuning worker and thread budgets must be positive")
+    workers = min(int(job_workers), max(1, len(jobs)))
+    if workers * int(model_threads) > int(max_model_thread_budget):
+        raise ValueError(
+            "job_workers * model_threads exceeds max_model_thread_budget"
+        )
+
+    def execute(index, target, family):
+        print(f"\n=== tune {target} / {family} ({trials} trials) ===")
+        best, value, eligible_rows = tune(
+            target,
+            family,
+            trials,
+            frame,
+            features,
+            model_threads=model_threads,
+        )
+        return index, target, family, best, value, eligible_rows
+
+    completed = [None] * len(jobs)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(execute, index, target, family)
+            for index, (target, family) in enumerate(jobs)
+        ]
+        for future in as_completed(futures):
+            item = future.result()
+            completed[item[0]] = item
+
+    params = {}
+    results = []
+    for item in completed:
+        if item is None:
+            raise RuntimeError("parallel tuning result inventory is incomplete")
+        _index, target, family, best, value, eligible_rows = item
+        params.setdefault(family, {})[target] = {
+            "params": best,
+            "cv_mse_transformed": value,
+        }
+        results.append({
+            "target": target,
+            "family": family,
+            "eligible_rows": eligible_rows,
+            "cv_mse_transformed": value,
+        })
+    return params, results, workers
 
 
 def sample_params(trial, family):
@@ -251,6 +318,21 @@ def main():
             f"(default: {DEFAULT_MODEL_THREADS})"
         ),
     )
+    parser.add_argument(
+        "--job-workers",
+        type=int,
+        default=1,
+        help="parallel independent target/family studies (default: 1)",
+    )
+    parser.add_argument(
+        "--max-model-thread-budget",
+        type=int,
+        default=None,
+        help=(
+            "maximum job-workers * model-threads; defaults to model-threads "
+            "so existing single-study callers remain unchanged"
+        ),
+    )
     parser.add_argument("--dataset", default=str(DATASET))
     parser.add_argument("--artifact-root", default=None)
     parser.add_argument("--result-json", default=None)
@@ -296,6 +378,7 @@ def main():
     if (
         args.trials < 1
         or args.model_threads < 1
+        or args.job_workers < 1
         or args.min_strict_full_rows < minimum_floor
     ):
         parser.error(
@@ -336,27 +419,22 @@ def main():
             for family in FAMILIES
         ]
     )
-    results = []
-    for target, family in jobs:
-        print(f"\n=== tune {target} / {family} ({args.trials} trials) ===")
-        best, value, eligible_rows = tune(
-            target,
-            family,
-            args.trials,
-            frame,
-            features,
-            model_threads=args.model_threads,
-        )
-        params.setdefault(family, {})[target] = {
-            "params": best,
-            "cv_mse_transformed": value,
-        }
-        results.append({
-            "target": target,
-            "family": family,
-            "eligible_rows": eligible_rows,
-            "cv_mse_transformed": value,
-        })
+    maximum_thread_budget = (
+        args.max_model_thread_budget
+        if args.max_model_thread_budget is not None
+        else args.model_threads
+    )
+    tuned_params, results, actual_job_workers = run_tuning_jobs(
+        jobs,
+        args.trials,
+        frame,
+        features,
+        model_threads=args.model_threads,
+        job_workers=args.job_workers,
+        max_model_thread_budget=maximum_thread_budget,
+    )
+    for family, targets in tuned_params.items():
+        params.setdefault(family, {}).update(targets)
 
     artifact_root = os.path.abspath(
         args.artifact_root or REGRESSION_ROOT / "pipeline_runtime" / "artifacts"
@@ -384,6 +462,11 @@ def main():
         ).hexdigest(),
         "trials_per_job": args.trials,
         "model_threads": args.model_threads,
+        "job_workers": actual_job_workers,
+        "maximum_total_model_threads": (
+            actual_job_workers * args.model_threads
+        ),
+        "max_model_thread_budget": maximum_thread_budget,
         "jobs": results,
         "sampler": "TPESampler(seed=7)",
         "pruner": "MedianPruner(n_warmup_steps=1)",

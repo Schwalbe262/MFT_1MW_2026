@@ -1800,6 +1800,56 @@ class ProbeSanitizerTests(unittest.TestCase):
                 collect_wave.sanitize_bad_probes(frame)
         self.assertEqual(frame["Tprobe_core_center_max"].iloc[0], 87.0)
 
+    def test_immutable_deployment_can_use_explicit_solver_git_repo(self):
+        frame = self._probe_frame(self.SIDE_ABBREV)
+        reviewed_repo = str((Path.cwd() / "solver-repo").resolve())
+        with mock.patch.dict(
+                collect_wave.os.environ,
+                {"MFT_SOLVER_GIT_REPO": reviewed_repo}), mock.patch(
+                    "subprocess.run", side_effect=self._git_side_effect()) as run:
+            sanitized, count = collect_wave.sanitize_bad_probes(frame.copy())
+
+        self.assertEqual(count, 0)
+        self.assertEqual(sanitized["Tprobe_core_center_max"].iloc[0], 87.0)
+        self.assertTrue(run.call_args_list)
+        self.assertTrue(all(
+            call.kwargs["cwd"] == reviewed_repo for call in run.call_args_list
+        ))
+
+    def test_immutable_deployment_routes_mutable_collector_paths_to_canonical_root(self):
+        reviewed_repo = str((Path.cwd() / "solver-repo").resolve())
+        reviewed_dataset = str((Path.cwd() / "live-dataset").resolve())
+        with mock.patch.dict(
+            collect_wave.os.environ,
+            {
+                "MFT_SOLVER_GIT_REPO": reviewed_repo,
+                "MFT_COLLECTOR_DATASET_DIR": reviewed_dataset,
+            },
+            clear=False,
+        ):
+            paths = collect_wave._configured_dynamic_paths()
+
+        self.assertEqual(paths["dataset_dir"], reviewed_dataset)
+        self.assertEqual(
+            paths["local_results_csv"],
+            str((Path(reviewed_repo) / "simulation_results_260706.csv").resolve()),
+        )
+        self.assertEqual(
+            paths["local_results_parts_dir"],
+            str((Path(reviewed_repo) / "results_parts_260706").resolve()),
+        )
+        self.assertEqual(
+            paths["feeder_state_path"],
+            str(
+                (
+                    Path(reviewed_repo)
+                    / "regression_260707"
+                    / "campaign"
+                    / "feeder_state.json"
+                ).resolve()
+            ),
+        )
+
 
 class ThermalValidityTests(unittest.TestCase):
     def test_legacy_false_success_is_demoted_but_em_row_is_preserved(self):

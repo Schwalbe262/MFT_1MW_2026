@@ -204,7 +204,11 @@ def main() -> None:
     if not args.no_active_model and os.path.isfile(
         os.path.join(registry, "current.json")
     ):
-        active = descriptor_from_active_registry(registry)
+        active = descriptor_from_active_registry(
+            registry,
+            solver_revision=args.solver_revision,
+            library_revision=args.library_revision,
+        )
     commands = None
     if args.verification_commands:
         commands = json.loads(

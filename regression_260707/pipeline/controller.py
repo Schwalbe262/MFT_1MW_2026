@@ -268,7 +268,11 @@ class ContinuousController:
         snapshot = None
         try:
             if os.path.isfile(os.path.join(self.registry, "current.json")):
-                active = descriptor_from_active_registry(self.registry)
+                active = descriptor_from_active_registry(
+                    self.registry,
+                    solver_revision=self.solver_revision,
+                    library_revision=self.library_revision,
+                )
             snapshot = self._snapshot_dataset()
             strict_rows = self.inspect_strict_rows(snapshot)
             self._last_strict_rows = int(strict_rows)

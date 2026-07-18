@@ -67,10 +67,37 @@ SCHEDULER = _configured_scheduler_url()
 TASK_LIST_LIMIT = 2000
 TASK_LIST_MAX_PAGES = 10000
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATASET_DIR = os.path.join(HERE, "..", "data", "dataset")
-LOCAL_RESULTS_CSV = os.path.join(HERE, "..", "..", "simulation_results_260706.csv")
-LOCAL_RESULTS_PARTS_DIR = os.path.join(HERE, "..", "..", "results_parts_260706")
-FEEDER_STATE_PATH = os.path.join(HERE, "feeder_state.json")
+
+
+def _configured_dynamic_paths():
+    """Resolve mutable collector inputs outside an immutable deployment."""
+
+    solver_repo = str(os.environ.get("MFT_SOLVER_GIT_REPO") or "").strip()
+    solver_repo = solver_repo or os.path.abspath(os.path.join(HERE, "..", ".."))
+    regression_root = os.path.join(solver_repo, "regression_260707")
+    dataset_dir = str(
+        os.environ.get("MFT_COLLECTOR_DATASET_DIR") or ""
+    ).strip()
+    dataset_dir = dataset_dir or os.path.join(regression_root, "data", "dataset")
+    return {
+        "dataset_dir": os.path.abspath(dataset_dir),
+        "local_results_csv": os.path.abspath(
+            os.path.join(solver_repo, "simulation_results_260706.csv")
+        ),
+        "local_results_parts_dir": os.path.abspath(
+            os.path.join(solver_repo, "results_parts_260706")
+        ),
+        "feeder_state_path": os.path.abspath(
+            os.path.join(regression_root, "campaign", "feeder_state.json")
+        ),
+    }
+
+
+_DYNAMIC_PATHS = _configured_dynamic_paths()
+DATASET_DIR = _DYNAMIC_PATHS["dataset_dir"]
+LOCAL_RESULTS_CSV = _DYNAMIC_PATHS["local_results_csv"]
+LOCAL_RESULTS_PARTS_DIR = _DYNAMIC_PATHS["local_results_parts_dir"]
+FEEDER_STATE_PATH = _DYNAMIC_PATHS["feeder_state_path"]
 
 SOURCE_RANK_COLUMN = "_collector_source_rank"
 SOURCE_RANK_TERMINAL_CSV = 10
@@ -654,6 +681,14 @@ def _probe_fix_git_run(command):
     """Run a read-only git query against the solver repository."""
     import subprocess
 
+    # Immutable controller deployments intentionally contain only the runtime
+    # source files, not a mutable/large ``.git`` directory.  Let the launcher
+    # pin a reviewed solver repository whose object database is used only for
+    # ancestry queries.  Falling back to this source tree preserves developer
+    # and normal checkout behaviour.
+    git_repo = str(os.environ.get("MFT_SOLVER_GIT_REPO") or "").strip()
+    if not git_repo:
+        git_repo = os.path.abspath(os.path.join(HERE, "..", ".."))
     return subprocess.run(
         command,
         check=False,
@@ -661,7 +696,7 @@ def _probe_fix_git_run(command):
         text=True,
         encoding="utf-8",
         errors="replace",
-        cwd=os.path.join(HERE, "..", ".."),
+        cwd=git_repo,
     )
 
 

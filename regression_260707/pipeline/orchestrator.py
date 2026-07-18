@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .artifacts import GenerationStore
 from .policy import (
@@ -52,6 +52,7 @@ class PipelineOrchestrator:
         *,
         python: str = sys.executable,
         checkpoint_output_root: str | os.PathLike[str] | None = None,
+        solver_git_repo: str | os.PathLike[str] | None = None,
     ):
         self.queue = queue
         self.store = store
@@ -60,6 +61,14 @@ class PipelineOrchestrator:
         self.checkpoint_output_root = Path(
             checkpoint_output_root or self.runtime_root / "training"
         ).resolve()
+        configured_solver_git_repo = str(
+            solver_git_repo or os.environ.get("MFT_SOLVER_GIT_REPO") or ""
+        ).strip()
+        self.solver_git_repo = (
+            Path(configured_solver_git_repo).resolve()
+            if configured_solver_git_repo
+            else None
+        )
 
     def latest_tuning(
         self,
@@ -84,6 +93,292 @@ class PipelineOrchestrator:
                     (rows, str(generation.path), generation.generation_id)
                 )
         return max(candidates, default=None, key=lambda item: (item[0], item[2]))
+
+    def active_coalesced_job(
+        self,
+        job_type: str,
+        coalesce_key: str,
+        *,
+        idempotency_prefix: str | None = None,
+        idempotency_suffix: str | None = None,
+        payload_match: Callable[[Mapping[str, object]], bool] | None = None,
+        pending_input_generation: str | None = None,
+        now: float | None = None,
+    ) -> Job | None:
+        """Return one already-owned cohort job instead of replacing its input.
+
+        Production tuning is intentionally long-running.  Replacing its queued
+        successor on every collector snapshot also replaced the dependent train
+        job, which meant a continuously growing dataset could prevent *any*
+        tuned checkpoint from reaching training.  A running job is the cohort
+        authority; otherwise the newest matching pending job is reused.  Train
+        callers may require the current dataset generation so an unstarted
+        checkpoint follows newly collected data without interrupting a running
+        checkpoint.  Re-enqueuing
+        that exact durable row atomically removes stale pending siblings while
+        preserving its immutable input and any active worker lease.
+        """
+
+        candidates = [
+            job
+            for job in self.queue.list(
+                states=["running", "queued", "retry_wait"],
+                job_types=[job_type],
+            )
+            if job.coalesce_key == coalesce_key
+            and (
+                idempotency_prefix is None
+                or job.idempotency_key.startswith(idempotency_prefix)
+            )
+            and (
+                idempotency_suffix is None
+                or job.idempotency_key.endswith(idempotency_suffix)
+            )
+            and (payload_match is None or payload_match(job.payload))
+        ]
+        dependency_jobs = {
+            job.id: self.queue.dependencies(job.id)
+            for job in candidates
+        }
+        # A legacy successor may depend on a pending tune that was just
+        # cancelled when the older running tune became authoritative.  Never
+        # revive that dead branch.  Zero-dependency and succeeded-dependency
+        # jobs remain valid across the tune-due -> tune-complete transition.
+        candidates = [
+            job
+            for job in candidates
+            if all(
+                dependency.state not in {"failed", "cancelled"}
+                for dependency in dependency_jobs[job.id]
+            )
+            and (
+                not dependency_jobs[job.id]
+                if job_type == "tune"
+                else all(
+                    dependency.job_type == "tune"
+                    and dependency.coalesce_key == coalesce_key
+                    for dependency in dependency_jobs[job.id]
+                )
+            )
+        ]
+        running = [job for job in candidates if job.state == "running"]
+        if running:
+            authority = max(running, key=lambda job: job.id)
+        else:
+            pending = [
+                job
+                for job in candidates
+                if job.state in {"queued", "retry_wait"}
+                and (
+                    pending_input_generation is None
+                    or job.input_generation == pending_input_generation
+                )
+            ]
+            authority = max(pending, default=None, key=lambda job: job.id)
+        if authority is None:
+            return None
+
+        reused = self.queue.enqueue(
+            authority.job_type,
+            authority.idempotency_key,
+            authority.payload,
+            input_generation=authority.input_generation,
+            coalesce_key=authority.coalesce_key,
+            coalesce_pending=True,
+            dependencies=[
+                dependency.id for dependency in dependency_jobs[authority.id]
+            ],
+            priority=authority.priority,
+            max_attempts=authority.max_attempts,
+            now=now,
+        )
+        if reused.state in {"running", "queued", "retry_wait"}:
+            return reused
+        return None
+
+    @staticmethod
+    def _script_identity(path: str | os.PathLike[str]) -> str:
+        """Return a path-independent identity when script bytes are available."""
+
+        script = Path(path)
+        try:
+            if script.is_file():
+                return "sha256:" + hashlib.sha256(script.read_bytes()).hexdigest()
+        except OSError:
+            pass
+        # Missing scripts are never considered equivalent across deployments.
+        # This keeps test/developer fixtures deterministic and fails closed if
+        # an immutable deployment has already been removed.
+        return "missing:" + os.path.normcase(os.path.abspath(os.fspath(script)))
+
+    @classmethod
+    def _tune_contract_from_command(
+        cls, command: object
+    ) -> dict[str, object] | None:
+        if (
+            not isinstance(command, list)
+            or len(command) < 2
+            or not all(isinstance(value, str) for value in command)
+        ):
+            return None
+
+        def integer_option(name: str) -> int:
+            index = command.index(name)
+            return int(command[index + 1])
+
+        try:
+            return {
+                "kind": "pipeline_tune_v1",
+                "python": os.path.normcase(os.path.abspath(command[0])),
+                "script_identity": cls._script_identity(command[1]),
+                "all_models": "--all" in command,
+                "trials": integer_option("--trials"),
+                "model_threads": integer_option("--model-threads"),
+                "job_workers": integer_option("--job-workers"),
+                "max_model_thread_budget": integer_option(
+                    "--max-model-thread-budget"
+                ),
+            }
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _tune_contract_from_payload(
+        cls, payload: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        declared = payload.get("execution_contract")
+        if (
+            isinstance(declared, dict)
+            and declared.get("kind") == "pipeline_tune_v1"
+        ):
+            return dict(declared)
+        return cls._tune_contract_from_command(payload.get("command"))
+
+    @staticmethod
+    def _collector_contract_from_payload(
+        payload: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Return the deployment-independent identity of one full scan.
+
+        The command's Python and script paths deliberately do not participate.
+        Immutable controller generations move those paths even when the scan
+        scope is identical.  The reviewed solver repository *does* participate
+        because probe ancestry classification is part of the data contract.
+        """
+
+        command = payload.get("command")
+        environment = payload.get("env")
+        if (
+            not isinstance(command, list)
+            or len(command) < 2
+            or not all(isinstance(value, str) for value in command)
+            or not isinstance(environment, dict)
+        ):
+            return None
+        solver_git_repo = str(
+            environment.get("MFT_SOLVER_GIT_REPO") or ""
+        ).strip()
+        collector_dataset_dir = str(
+            environment.get("MFT_COLLECTOR_DATASET_DIR") or ""
+        ).strip()
+        if not solver_git_repo or not collector_dataset_dir:
+            return None
+
+        def option(name: str) -> str:
+            index = command.index(name)
+            return command[index + 1]
+
+        try:
+            prefixes = [option("--prefix")]
+            prefixes.extend(
+                command[index + 1]
+                for index, value in enumerate(command[:-1])
+                if value == "--extra-prefix"
+            )
+            running_fetch_limit = int(option("--running-fetch-limit"))
+        except (IndexError, TypeError, ValueError):
+            return None
+        if running_fetch_limit != 0:
+            return None
+        return {
+            "kind": "pipeline_collect_full_scan_v1",
+            "prefixes": sorted(set(prefixes)),
+            "running_fetch_limit": 0,
+            "solver_git_repo": os.path.normcase(
+                str(Path(solver_git_repo).resolve())
+            ),
+            "collector_dataset_dir": os.path.normcase(
+                str(Path(collector_dataset_dir).resolve())
+            ),
+        }
+
+    @staticmethod
+    def _collector_bucket(job: Job) -> int | None:
+        demand = job.payload.get("collector_demand")
+        if isinstance(demand, dict):
+            try:
+                return int(demand["bucket"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        marker = "-window-"
+        if marker not in job.idempotency_key:
+            return None
+        try:
+            return int(job.idempotency_key.rsplit(marker, 1)[1])
+        except ValueError:
+            return None
+
+    def active_semantic_collector(
+        self,
+        execution_contract: Mapping[str, object],
+        *,
+        dataset_identity: str,
+        bucket: int,
+    ) -> Job | None:
+        """Reuse the current scan demand across immutable deployments.
+
+        A scan can outlive several collection windows.  Repeated controller
+        cycles for the same dataset/window reuse the existing authority.  A
+        newer window or dataset generation is allowed to create one pending
+        follow-up; enqueue coalescing replaces that pending row as still newer
+        demand arrives without disturbing the running scan.
+        """
+
+        candidates = [
+            job
+            for job in self.queue.list(
+                states=["running", "queued", "retry_wait", "succeeded"],
+                job_types=["collect"],
+            )
+            if self._collector_contract_from_payload(job.payload)
+            == dict(execution_contract)
+        ]
+        exact = [
+            job
+            for job in candidates
+            if self._collector_bucket(job) == int(bucket)
+            and (
+                job.input_generation == dataset_identity
+                # v4 jobs predate dataset-bound collection demand.  Treat a
+                # running legacy scan as the authority during the v5 rollout;
+                # its fixed canonical-repository contract still matches.
+                or (job.input_generation is None and job.state == "running")
+            )
+        ]
+        active_exact = [
+            job
+            for job in exact
+            if job.state in {"running", "queued", "retry_wait"}
+        ]
+        if active_exact:
+            return max(
+                active_exact,
+                key=lambda job: (job.state == "running", job.id),
+            )
+        succeeded_exact = [job for job in exact if job.state == "succeeded"]
+        if succeeded_exact:
+            return max(succeeded_exact, key=lambda job: job.id)
+        return None
 
     def plan_cycle(
         self,
@@ -144,29 +439,78 @@ class PipelineOrchestrator:
         dataset_identity = f"dataset:{dataset.generation_id}"
         timestamp = time.time() if now is None else float(now)
         bucket = int(timestamp // max(1, int(collect_interval_seconds)))
-        jobs: dict[str, int] = {}
-        collect = self.queue.enqueue(
-            "collect",
-            f"collector-v2-window-{bucket}",
+        runtime_execution_key = hashlib.sha256(json.dumps(
             {
-                "command": [
-                    self.python,
-                    str(self.runtime_root / "campaign" / "collect_wave.py"),
-                    "--prefix", "mft-camp",
-                    "--extra-prefix", "mft-1to3",
-                    "--extra-prefix", "mft-1x3",
-                    "--extra-prefix", "mft-mixed",
-                    "--extra-prefix", "mft-9way",
-                    "--running-fetch-limit", "0",
-                ],
-                "cwd": str(self.runtime_root),
-                "retry": True,
-                "retry_backoff_seconds": 60,
+                "python": os.path.normcase(self.python),
+                "runtime_root": os.path.normcase(str(self.runtime_root)),
             },
-            priority=100,
-            max_attempts=5,
-            now=timestamp,
+            sort_keys=True,
+        ).encode("utf-8")).hexdigest()[:12]
+        jobs: dict[str, int] = {}
+        collector_payload = {
+            "command": [
+                self.python,
+                str(self.runtime_root / "campaign" / "collect_wave.py"),
+                "--prefix", "mft-camp",
+                "--extra-prefix", "mft-1to3",
+                "--extra-prefix", "mft-1x3",
+                "--extra-prefix", "mft-mixed",
+                "--extra-prefix", "mft-9way",
+                "--running-fetch-limit", "0",
+            ],
+            "cwd": str(self.runtime_root),
+            "env": (
+                {
+                    "MFT_SOLVER_GIT_REPO": str(self.solver_git_repo),
+                    "MFT_COLLECTOR_DATASET_DIR": str(
+                        Path(dataset_series_path or dataset_path).resolve().parent
+                    ),
+                }
+                if self.solver_git_repo is not None
+                else {}
+            ),
+            "collector_demand": {
+                "bucket": bucket,
+                "dataset_generation": dataset_identity,
+            },
+            "retry": True,
+            "retry_backoff_seconds": 60,
+        }
+        collector_contract = self._collector_contract_from_payload(
+            collector_payload
         )
+        collect = (
+            self.active_semantic_collector(
+                collector_contract,
+                dataset_identity=dataset_identity,
+                bucket=bucket,
+            )
+            if collector_contract is not None
+            else None
+        )
+        if collect is None:
+            collector_contract_key = hashlib.sha256(json.dumps(
+                collector_contract or {
+                    "runtime_execution_key": runtime_execution_key,
+                },
+                sort_keys=True,
+            ).encode("utf-8")).hexdigest()[:12]
+            collector_payload["execution_contract"] = collector_contract
+            collect = self.queue.enqueue(
+                "collect",
+                (
+                    f"collector-v4-e{runtime_execution_key}"
+                    f"-c{collector_contract_key}"
+                    f"-d{dataset.generation_id[:12]}-window-{bucket}"
+                ),
+                collector_payload,
+                input_generation=dataset_identity,
+                coalesce_key=f"collector-full-scan:{collector_contract_key}",
+                coalesce_pending=True,
+                priority=100,
+                max_attempts=5,
+                now=timestamp,
+            )
         jobs["collect"] = collect.id
 
         latest_tuning = self.latest_tuning(
@@ -183,39 +527,68 @@ class PipelineOrchestrator:
         tune_job: Job | None = None
         params_path = latest_tuning[1] + os.sep + "params.json" if latest_tuning else None
         if tune.due:
-            result_json = "{work_dir}" + os.sep + "tuning_result.json"
-            tune_job = self.queue.enqueue(
+            tune_script = self.runtime_root / "training" / "tune_optuna.py"
+            tune_execution_contract = self._tune_contract_from_command([
+                self.python,
+                str(tune_script),
+                "--all",
+                "--trials", str(int(optuna_trials)),
+                "--model-threads", "1",
+                "--job-workers", str(model_threads),
+                "--max-model-thread-budget", str(model_threads),
+            ])
+            if tune_execution_contract is None:
+                raise RuntimeError("invalid tune execution contract")
+            tune_execution_key = hashlib.sha256(json.dumps(
+                tune_execution_contract,
+                sort_keys=True,
+            ).encode("utf-8")).hexdigest()[:12]
+            tune_job = self.active_coalesced_job(
                 "tune",
-                f"tune-{dataset.generation_id}",
-                {
-                    "command": [
-                        self.python,
-                        str(self.runtime_root / "training" / "tune_optuna.py"),
-                        "--all",
-                        "--trials", str(int(optuna_trials)),
-                        "--model-threads", str(model_threads),
-                        "--dataset", str(dataset.path / "train.parquet"),
-                        "--artifact-root", str(self.store.root),
-                        "--result-json", result_json,
-                        "--solver-revision", solver_revision.lower(),
-                        "--library-revision", library_revision.lower(),
-                        "--data-contract-sha256", data_contract_sha256,
-                    ],
-                    "cwd": str(self.runtime_root),
-                    "result_json": result_json,
-                    "result_output_key": "generation_path",
-                    "result_generation_kind": "tuning",
-                    "result_generation_id_key": "generation_id",
-                    "retry": True,
-                    "retry_backoff_seconds": 300,
-                },
-                input_generation=dataset_identity,
-                coalesce_key=cohort_key,
-                coalesce_pending=True,
-                priority=70,
-                max_attempts=3,
+                cohort_key,
+                payload_match=lambda payload: (
+                    self._tune_contract_from_payload(payload)
+                    == tune_execution_contract
+                ),
                 now=timestamp,
             )
+            if tune_job is None:
+                result_json = "{work_dir}" + os.sep + "tuning_result.json"
+                tune_job = self.queue.enqueue(
+                    "tune",
+                    f"tune-{dataset.generation_id}-e{tune_execution_key}",
+                    {
+                        "command": [
+                            self.python,
+                            str(tune_script),
+                            "--all",
+                            "--trials", str(int(optuna_trials)),
+                            "--model-threads", "1",
+                            "--job-workers", str(model_threads),
+                            "--max-model-thread-budget", str(model_threads),
+                            "--dataset", str(dataset.path / "train.parquet"),
+                            "--artifact-root", str(self.store.root),
+                            "--result-json", result_json,
+                            "--solver-revision", solver_revision.lower(),
+                            "--library-revision", library_revision.lower(),
+                            "--data-contract-sha256", data_contract_sha256,
+                        ],
+                        "cwd": str(self.runtime_root),
+                        "execution_contract": tune_execution_contract,
+                        "result_json": result_json,
+                        "result_output_key": "generation_path",
+                        "result_generation_kind": "tuning",
+                        "result_generation_id_key": "generation_id",
+                        "retry": True,
+                        "retry_backoff_seconds": 300,
+                    },
+                    input_generation=dataset_identity,
+                    coalesce_key=cohort_key,
+                    coalesce_pending=True,
+                    priority=70,
+                    max_attempts=3,
+                    now=timestamp,
+                )
             jobs["tune"] = tune_job.id
         else:
             self.queue.cancel_coalesced_pending(
@@ -304,58 +677,90 @@ class PipelineOrchestrator:
                     "output_root": os.path.normcase(
                         str(self.checkpoint_output_root)
                     ),
+                    "runtime_execution_key": runtime_execution_key,
+                    "script_sha256": (
+                        hashlib.sha256(
+                            (
+                                self.runtime_root
+                                / "training"
+                                / "checkpoint_orchestrator.py"
+                            ).read_bytes()
+                        ).hexdigest()
+                        if (
+                            self.runtime_root
+                            / "training"
+                            / "checkpoint_orchestrator.py"
+                        ).is_file()
+                        else "missing"
+                    ),
                 },
                 sort_keys=True,
             ).encode("utf-8")).hexdigest()[:12]
             dependencies = [tune_job.id] if tune_job else []
-            params_argument: list[str] = []
-            if tune_job:
-                params_argument = [
-                    "--params",
-                    "{dependency_tune_output}" + os.sep + "params.json",
-                ]
-            elif params_path:
-                params_argument = ["--params", params_path]
-            train_command = [
-                self.python,
-                str(self.runtime_root / "training" / "checkpoint_orchestrator.py"),
-                "--runtime-root", str(self.runtime_root),
-                "--dataset", str(dataset.path / "train.parquet"),
-                "--dataset-series", os.path.abspath(
-                    os.fspath(dataset_series_path or dataset_path)
-                ),
-                "--output-root", str(self.checkpoint_output_root),
-                "--run-root", str(checkpoint_run_root),
-                "--execute",
-                "--solver-revision", solver_revision.lower(),
-                "--library-revision", library_revision.lower(),
-                "--source-dataset-generation", dataset_identity,
-                "--model-threads", str(model_threads),
-            ] + params_argument
-            train = self.queue.enqueue(
+            train = self.active_coalesced_job(
                 "train",
-                (
-                    f"checkpoint-{checkpoint}-{dataset.generation_id}"
-                    f"-e{checkpoint_execution_key}"
-                ),
-                {
-                    "command": train_command,
-                    "cwd": str(self.runtime_root),
-                    "env": {
-                        "MFT_PIPELINE_ROOT": str(self.store.root.parent),
-                    },
-                    "dependency_kinds": ({"tune": "tuning"} if tune_job else {}),
-                    "retry": True,
-                    "retry_backoff_seconds": 600,
-                },
-                input_generation=dataset_identity,
-                coalesce_key=cohort_key,
-                coalesce_pending=True,
-                dependencies=dependencies,
-                priority=80,
-                max_attempts=3,
+                cohort_key,
+                idempotency_prefix=f"checkpoint-{checkpoint}-",
+                idempotency_suffix=f"-e{checkpoint_execution_key}",
+                pending_input_generation=dataset_identity,
                 now=timestamp,
             )
+            if train is None:
+                params_argument: list[str] = []
+                if tune_job:
+                    params_argument = [
+                        "--params",
+                        "{dependency_tune_output}" + os.sep + "params.json",
+                    ]
+                elif params_path:
+                    params_argument = ["--params", params_path]
+                train_command = [
+                    self.python,
+                    str(
+                        self.runtime_root
+                        / "training"
+                        / "checkpoint_orchestrator.py"
+                    ),
+                    "--runtime-root", str(self.runtime_root),
+                    "--dataset", str(dataset.path / "train.parquet"),
+                    "--dataset-series", os.path.abspath(
+                        os.fspath(dataset_series_path or dataset_path)
+                    ),
+                    "--output-root", str(self.checkpoint_output_root),
+                    "--run-root", str(checkpoint_run_root),
+                    "--execute",
+                    "--solver-revision", solver_revision.lower(),
+                    "--library-revision", library_revision.lower(),
+                    "--source-dataset-generation", dataset_identity,
+                    "--model-threads", str(model_threads),
+                ] + params_argument
+                train = self.queue.enqueue(
+                    "train",
+                    (
+                        f"checkpoint-{checkpoint}-{dataset.generation_id}"
+                        f"-t{tune_job.id if tune_job else 0}"
+                        f"-e{checkpoint_execution_key}"
+                    ),
+                    {
+                        "command": train_command,
+                        "cwd": str(self.runtime_root),
+                        "env": {
+                            "MFT_PIPELINE_ROOT": str(self.store.root.parent),
+                        },
+                        "dependency_kinds": (
+                            {"tune": "tuning"} if tune_job else {}
+                        ),
+                        "retry": True,
+                        "retry_backoff_seconds": 600,
+                    },
+                    input_generation=dataset_identity,
+                    coalesce_key=cohort_key,
+                    coalesce_pending=True,
+                    dependencies=dependencies,
+                    priority=80,
+                    max_attempts=3,
+                    now=timestamp,
+                )
             jobs["train"] = train.id
         else:
             self.queue.cancel_coalesced_pending(
@@ -533,7 +938,12 @@ class PipelineOrchestrator:
         return CycleResult(dataset_identity, jobs)
 
 
-def descriptor_from_active_registry(registry: str | os.PathLike[str]) -> dict:
+def descriptor_from_active_registry(
+    registry: str | os.PathLike[str],
+    *,
+    solver_revision: str | None = None,
+    library_revision: str | None = None,
+) -> dict:
     """Return a pinned descriptor accepted by ``plan_cycle``."""
     registry = os.path.abspath(os.fspath(registry))
     training_dir = str(Path(__file__).resolve().parents[1] / "training")
@@ -543,6 +953,18 @@ def descriptor_from_active_registry(registry: str | os.PathLike[str]) -> dict:
 
     active = load_active_generation(registry)
     report = active["report"]
+    quality = active["quality"]
+    for label, expected in (
+        ("solver", solver_revision),
+        ("library", library_revision),
+    ):
+        if expected is None:
+            continue
+        actual = quality.get(f"{label}_revision")
+        if actual != str(expected).lower():
+            raise RuntimeError(
+                f"active model {label} revision does not match controller"
+            )
     dataset = os.path.abspath(report["dataset_path"])
     if not os.path.isfile(dataset):
         raise RuntimeError("active model's immutable dataset snapshot is missing")

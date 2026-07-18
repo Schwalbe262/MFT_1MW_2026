@@ -1,4 +1,5 @@
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -133,6 +134,60 @@ class ModelThreadBudgetTests(unittest.TestCase):
                 tune_optuna.model_params_with_thread_budget(
                     "lightgbm", {}, invalid
                 )
+
+    def test_parallel_studies_share_one_budget_and_keep_declared_order(self):
+        calls = []
+
+        def fake_tune(
+            target, family, trials, _frame, _features, *, model_threads
+        ):
+            calls.append((target, family, trials, model_threads))
+            if target == "slow":
+                time.sleep(0.02)
+            value = 1.0 if target == "slow" else 2.0
+            return {"target": target}, value, 100
+
+        with mock.patch.object(tune_optuna, "tune", side_effect=fake_tune):
+            params, results, workers = tune_optuna.run_tuning_jobs(
+                [("slow", "lightgbm"), ("fast", "xgboost")],
+                3,
+                object(),
+                ["feature"],
+                model_threads=1,
+                job_workers=2,
+                max_model_thread_budget=2,
+            )
+
+        self.assertEqual(workers, 2)
+        self.assertEqual([item["target"] for item in results], ["slow", "fast"])
+        self.assertEqual(
+            params["lightgbm"]["slow"]["params"], {"target": "slow"}
+        )
+        self.assertEqual(
+            params["xgboost"]["fast"]["params"], {"target": "fast"}
+        )
+        self.assertEqual(
+            {
+                (target, family, trials, threads)
+                for target, family, trials, threads in calls
+            },
+            {
+                ("slow", "lightgbm", 3, 1),
+                ("fast", "xgboost", 3, 1),
+            },
+        )
+
+    def test_parallel_studies_reject_an_oversubscribed_budget(self):
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            tune_optuna.run_tuning_jobs(
+                [("a", "lightgbm"), ("b", "xgboost")],
+                1,
+                object(),
+                ["feature"],
+                model_threads=2,
+                job_workers=2,
+                max_model_thread_budget=3,
+            )
 
 
 if __name__ == "__main__":
