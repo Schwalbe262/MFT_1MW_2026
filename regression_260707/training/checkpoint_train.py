@@ -51,7 +51,12 @@ def _atomic_json(value, path):
     path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, staged = tempfile.mkstemp(
-        prefix=f".{os.path.basename(path)}.", suffix=".tmp",
+        # The checkpoint run root is deliberately identity-scoped and deep.
+        # Repeating a parity sidecar's full basename in the temporary name can
+        # push an otherwise valid final path past the legacy Windows MAX_PATH
+        # boundary.  mkstemp already supplies collision-safe randomness; a
+        # constant short prefix preserves same-directory atomic replacement.
+        prefix=".tmp-", suffix=".tmp",
         dir=os.path.dirname(path),
     )
     try:

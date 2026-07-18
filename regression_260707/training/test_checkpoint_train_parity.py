@@ -13,6 +13,27 @@ from regression_260707.training import checkpoint_train as checkpoint
 
 
 class CheckpointParityTests(unittest.TestCase):
+    def test_atomic_json_uses_short_same_directory_staging_name(self):
+        real_mkstemp = checkpoint.tempfile.mkstemp
+        calls = []
+
+        def record_mkstemp(*args, **kwargs):
+            calls.append(dict(kwargs))
+            return real_mkstemp(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            checkpoint.tempfile, "mkstemp", side_effect=record_mkstemp
+        ):
+            path = Path(directory) / (
+                "threshold_000500_attempt_000001.parity.json"
+            )
+            checkpoint._atomic_json({"ok": True}, path)
+            self.assertEqual(calls[0]["prefix"], ".tmp-")
+            self.assertEqual(Path(calls[0]["dir"]), path.parent)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")), {"ok": True}
+            )
+
     def test_capacitance_target_contract_excludes_resonance_outputs(self):
         capacitance_targets = {
             "C_tx_tx_F", "C_rx_rx_F", "C_tx_rx_F"
