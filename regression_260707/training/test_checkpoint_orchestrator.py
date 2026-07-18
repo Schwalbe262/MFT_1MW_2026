@@ -137,5 +137,103 @@ class TrainingCommandTests(unittest.TestCase):
         self.assertNotIn("--skip-curve-append", command)
 
 
+class CheckpointIdentityRelocationTests(unittest.TestCase):
+    @staticmethod
+    def _identity(root, *, profile_sha="profile-sha", thresholds_sha="thresholds-sha"):
+        return {
+            "dataset": "Y:/canonical/train.parquet",
+            "profile_path": str(Path(root) / "profiles" / "standard.json"),
+            "profile_sha256": profile_sha,
+            "thresholds_path": str(Path(root) / "training" / "thresholds.json"),
+            "thresholds_sha256": thresholds_sha,
+            "activation_minimum_strict_full_rows": 3000,
+            "quality_contract_sha256": "quality-sha",
+            "model_targets_sha256": "targets-sha",
+            "checkpoint_contract_schema_version": 2,
+            "checkpoint_contract_sha256": "contract-sha",
+            "checkpoint_contract_key": "contract-key",
+            "registry_protocol_version": 2,
+            "physics_data_revision": "physics-v1",
+            "solver_revision_cohort": "solver-cohort",
+            "library_revision": "library-revision",
+        }
+
+    def test_content_identical_immutable_path_move_preserves_completions(self):
+        old = self._identity("C:/deployments/old")
+        new = self._identity("C:/deployments/new")
+        completion = {"threshold": 3000, "training_run_id": "accepted-run"}
+        state = {"identity": old, "completed": [completion]}
+
+        changed = checkpoint._ensure_identity(state, new)
+
+        self.assertTrue(changed)
+        self.assertEqual(state["identity"], new)
+        self.assertEqual(state["completed"], [completion])
+        self.assertEqual(
+            state["recovery"][-1]["reason"],
+            "checkpoint_identity_paths_relocated",
+        )
+        self.assertEqual(
+            state["recovery"][-1]["fields"],
+            ["profile_path", "thresholds_path"],
+        )
+
+    def test_path_move_with_changed_content_still_fails_closed(self):
+        old = self._identity("C:/deployments/old")
+        new = self._identity("C:/deployments/new", profile_sha="changed-profile")
+        state = {"identity": old, "completed": [{"threshold": 3000}]}
+
+        with self.assertRaisesRegex(
+                RuntimeError, "checkpoint runtime identity changed"):
+            checkpoint._ensure_identity(state, new)
+
+        self.assertEqual(state["identity"], old)
+        self.assertEqual(state["completed"], [{"threshold": 3000}])
+
+    def test_metrics_completion_accepts_same_hash_profile_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot.parquet"
+            snapshot.write_bytes(b"immutable snapshot")
+            snapshot_sha = checkpoint._sha256(snapshot)
+            old_profile = root / "old" / "profiles" / "standard.json"
+            new_profile = root / "new" / "profiles" / "standard.json"
+            metrics = root / "metrics.json"
+            metrics.write_text(json.dumps({
+                "checkpoint": 500,
+                "dataset": str(snapshot.resolve()),
+                "dataset_sha256": snapshot_sha,
+                "profile": str(old_profile.resolve()),
+                "profile_sha256": "profile-sha",
+                "strict_full_rows": 500,
+                "metrics": [{"target": "Llt_phys"}],
+            }), encoding="utf-8")
+            item = {
+                "kind": "metrics_only",
+                "threshold": 500,
+                "actual_strict_full_rows": 500,
+                "snapshot": str(snapshot),
+                "snapshot_sha256": snapshot_sha,
+                "metrics_result": str(metrics),
+                "metrics_result_sha256": checkpoint._sha256(metrics),
+                "profile_path": str(old_profile),
+                "profile_sha256": "profile-sha",
+                "thresholds_sha256": "thresholds-sha",
+                "activation_minimum_strict_full_rows": 3000,
+            }
+            expected = {
+                "profile_path": str(new_profile),
+                "profile_sha256": "profile-sha",
+                "thresholds_sha256": "thresholds-sha",
+                "activation_minimum_strict_full_rows": 3000,
+            }
+
+            error = checkpoint._completion_error(
+                item, str(root / "registry"), expected
+            )
+
+        self.assertIsNone(error)
+
+
 if __name__ == "__main__":
     unittest.main()

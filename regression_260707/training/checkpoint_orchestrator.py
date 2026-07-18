@@ -293,13 +293,45 @@ def _ensure_identity(state, identity):
     if not isinstance(stored, dict):
         raise RuntimeError("checkpoint runtime identity is invalid")
     common = set(stored) & set(identity)
-    mismatched = [key for key in common if stored.get(key) != identity.get(key)]
+    # Immutable deployments intentionally move the profile and thresholds to
+    # a new absolute source root.  Their paths are provenance, not contract
+    # identity: the canonical JSON hashes and the aggregate checkpoint
+    # contract digest are the authority.  Treat a path-only move as a durable
+    # state relocation while continuing to fail closed if either file's
+    # content (or any other identity component) changed.
+    relocatable_paths = {
+        "profile_path": "profile_sha256",
+        "thresholds_path": "thresholds_sha256",
+    }
+    relocated = []
+    mismatched = []
+    for key in common:
+        if stored.get(key) == identity.get(key):
+            continue
+        digest_key = relocatable_paths.get(key)
+        if (
+            digest_key
+            and stored.get(digest_key) == identity.get(digest_key)
+            and stored.get("checkpoint_contract_sha256")
+            == identity.get("checkpoint_contract_sha256")
+        ):
+            relocated.append(key)
+            continue
+        mismatched.append(key)
     if mismatched:
         raise RuntimeError(
             "checkpoint runtime identity changed ("
             + ", ".join(sorted(mismatched))
             + "); use a new output root or archive state"
         )
+    if relocated and set(stored) == set(identity):
+        state["identity"] = identity
+        state.setdefault("recovery", []).append({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "reason": "checkpoint_identity_paths_relocated",
+            "fields": sorted(relocated),
+        })
+        return True
     if stored != identity:
         changed_keys = sorted(set(stored) ^ set(identity))
         if state.get("completed"):
@@ -343,7 +375,7 @@ def _completion_error(item, registry, expected_identity=None):
         return "completion_threshold_invalid"
     if expected_identity:
         for key in (
-            "profile_path", "profile_sha256", "thresholds_sha256",
+            "profile_sha256", "thresholds_sha256",
             "activation_minimum_strict_full_rows",
         ):
             if key in expected_identity and item.get(key) != expected_identity.get(key):
@@ -785,7 +817,7 @@ def main():
         if args.source_dataset_generation
         else (_sha256(dataset) if os.path.isfile(dataset) else None)
     )
-    profile_data = load_profile(args.profile)
+    load_profile(args.profile)
     contract_identity = checkpoint_contract_identity(
         args.profile,
         args.thresholds,
