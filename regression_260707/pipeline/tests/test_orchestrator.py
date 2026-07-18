@@ -1343,6 +1343,71 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(descriptor["training_run_id"], "model-g1")
 
 
+class RunningCheckpointAuthorityTests(unittest.TestCase):
+    def test_running_train_remains_authority_when_checkpoint_prefix_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "training").mkdir(parents=True)
+            queue = DurableJobQueue(root / "pipeline" / "jobs.sqlite3")
+            orchestrator = PipelineOrchestrator(
+                queue,
+                GenerationStore(root / "pipeline" / "artifacts"),
+                runtime,
+            )
+            cohort_key = "solver:library:contract"
+            running = queue.enqueue(
+                "train",
+                "checkpoint-3000-data-t0-eabc123",
+                {"command": ["running-train"]},
+                input_generation="dataset:data",
+                coalesce_key=cohort_key,
+                coalesce_pending=True,
+                dependencies=[],
+                priority=80,
+                max_attempts=3,
+                now=1200,
+            )
+            running = queue.claim(
+                "trainer",
+                job_types=["train"],
+                lease_seconds=1000,
+                now=1201,
+            )
+            self.assertIsNotNone(running)
+            pending = queue.enqueue(
+                "train",
+                "checkpoint-500-data-t0-eabc123",
+                {"command": ["duplicate-pending-train"]},
+                input_generation="dataset:data",
+                coalesce_key=cohort_key,
+                coalesce_pending=True,
+                dependencies=[],
+                priority=80,
+                max_attempts=3,
+                now=1202,
+            )
+
+            reused = orchestrator.active_coalesced_job(
+                "train",
+                cohort_key,
+                idempotency_prefix="checkpoint-500-",
+                idempotency_suffix="-eabc123",
+                pending_input_generation="dataset:data",
+                required_dependency_ids=(),
+                now=1203,
+            )
+
+            self.assertIsNotNone(reused)
+            self.assertEqual(reused.id, running.id)
+            self.assertEqual(reused.state, "running")
+            self.assertEqual(queue.get(pending.id).state, "cancelled")
+            self.assertEqual(
+                queue.get(pending.id).terminal_reason,
+                f"superseded_by:{running.id}",
+            )
+
+
 class ControllerSnapshotTests(unittest.TestCase):
     def test_count_and_plan_consume_the_same_immutable_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
