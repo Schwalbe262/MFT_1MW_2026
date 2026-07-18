@@ -246,6 +246,22 @@ class CheckpointParityTests(unittest.TestCase):
             self.assertEqual(payload["checkpoint"], 500)
             self.assertEqual(payload["strict_full_rows"], 100)
             self.assertEqual(payload["features"], ["feature"])
+            self.assertEqual(
+                payload["training_parallelism"]["model_threads"], 1
+            )
+            self.assertEqual(
+                payload["training_parallelism"]["effective_target_workers"],
+                1,
+            )
+            self.assertEqual(
+                payload["training_parallelism"][
+                    "effective_total_model_threads"
+                ],
+                1,
+            )
+            self.assertFalse(
+                payload["training_parallelism"]["budget_externally_declared"]
+            )
             self.assertEqual(set(payload["targets"]), {"Llt_phys"})
             self.assertEqual(
                 payload["target_physics_data_revision_cohorts"],

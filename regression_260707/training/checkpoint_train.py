@@ -7,6 +7,7 @@
 - 사용: python checkpoint_train.py [--full]  (--full 이면 4패밀리 앙상블까지)
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -22,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REGRESSION_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 if REGRESSION_ROOT not in sys.path:
     sys.path.insert(0, REGRESSION_ROOT)
-from model_targets import (
+from model_targets import (  # noqa: E402 - direct-script path is installed above
     SURROGATE_CAPACITANCE_TARGETS,
     SURROGATE_TEMPERATURE_TARGETS,
     SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
@@ -37,6 +38,8 @@ PARITY_MAX_PAIRS_PER_TARGET = 2_000
 LEGACY_PHYSICS_DATA_REVISION = "legacy_unspecified"
 MAPE_ZERO_ABS_TOLERANCE = 1e-9
 CAPACITANCE_RELATIVE_METRIC_TOLERANCE = 0.0
+DEFAULT_MODEL_THREADS = 1
+DEFAULT_TARGET_WORKERS = 1
 
 
 def _sha256(path):
@@ -243,9 +246,19 @@ def cv_metrics(
     seed=42,
     return_yhat=False,
     relative_tolerance=MAPE_ZERO_ABS_TOLERANCE,
+    model_threads=DEFAULT_MODEL_THREADS,
 ):
     import lightgbm as lgb
     from sklearn.model_selection import KFold
+
+    if isinstance(model_threads, bool):
+        raise ValueError("model_threads must be a positive integer")
+    try:
+        model_threads = int(model_threads)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("model_threads must be a positive integer") from exc
+    if model_threads < 1:
+        raise ValueError("model_threads must be a positive integer")
 
     yt = transform_y(y, kind)
     preds = np.full(len(y), np.nan)
@@ -254,7 +267,7 @@ def cv_metrics(
         model = lgb.LGBMRegressor(
             n_estimators=800, learning_rate=0.05, num_leaves=63,
             subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
-            random_state=seed, verbose=-1)
+            random_state=seed, verbose=-1, n_jobs=model_threads)
         model.fit(X.iloc[tr], yt[tr])
         preds[te] = model.predict(X.iloc[te])
     yhat = inverse_y(preds, kind)
@@ -324,6 +337,232 @@ def _parity_target(y, yhat, row_index, limit=PARITY_MAX_PAIRS_PER_TARGET):
     }
 
 
+def _checkpoint_parallelism(
+    model_threads,
+    target_workers,
+    max_model_thread_budget=None,
+):
+    """Return one fail-closed target/model thread budget.
+
+    Each concurrent target can request ``model_threads`` LightGBM workers.
+    Production supplies an independently declared total ceiling. Standalone
+    callers that omit it still get a finite ceiling equal to the requested
+    product, never the model library's unbounded default.
+    """
+    values = {
+        "model_threads": model_threads,
+        "target_workers": target_workers,
+    }
+    normalized = {}
+    for label, value in values.items():
+        if isinstance(value, bool):
+            raise ValueError(f"{label} must be a positive integer")
+        try:
+            normalized[label] = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} must be a positive integer") from exc
+        if normalized[label] < 1:
+            raise ValueError(f"{label} must be a positive integer")
+
+    requested = normalized["model_threads"] * normalized["target_workers"]
+    if max_model_thread_budget is None:
+        budget = requested
+        externally_declared = False
+    else:
+        if isinstance(max_model_thread_budget, bool):
+            raise ValueError(
+                "max_model_thread_budget must be a positive integer"
+            )
+        try:
+            budget = int(max_model_thread_budget)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "max_model_thread_budget must be a positive integer"
+            ) from exc
+        if budget < 1:
+            raise ValueError(
+                "max_model_thread_budget must be a positive integer"
+            )
+        externally_declared = True
+    if requested > budget:
+        raise ValueError(
+            "target_workers * model_threads exceeds max_model_thread_budget"
+        )
+    return {
+        **normalized,
+        "max_model_thread_budget": budget,
+        "maximum_total_model_threads": requested,
+        "budget_externally_declared": externally_declared,
+    }
+
+
+def _evaluate_target(
+    df,
+    feats,
+    profile,
+    target,
+    cfg,
+    *,
+    include_parity,
+    model_threads,
+    stamp,
+):
+    """Evaluate one target without mutating shared output state."""
+    if target not in df.columns:
+        return {
+            "target": target,
+            "rows": [],
+            "parity": None,
+            "revision_cohort": None,
+            "messages": [f"  [skip] {target} (column missing)"],
+        }
+
+    target_df = filter_valid_training_rows(df, target, profile)
+    revision_cohort = target_df.attrs.get(
+        "physics_data_revision_cohort", ""
+    )
+    sub = target_df.dropna(subset=[target])
+    sub = sub[np.isfinite(sub[target])]
+    if len(sub) < 100:
+        return {
+            "target": target,
+            "rows": [],
+            "parity": None,
+            "revision_cohort": None,
+            "messages": [f"  [skip] {target} (n={len(sub)} < 100)"],
+        }
+
+    X = sub[feats].fillna(0.0)
+    y = sub[target].to_numpy(dtype=float)
+    relative_tolerance = cfg.get(
+        "relative_metric_tolerance", MAPE_ZERO_ABS_TOLERANCE
+    )
+    parity = None
+    if include_parity:
+        metrics, yhat = cv_metrics(
+            X,
+            y,
+            cfg["transform"],
+            return_yhat=True,
+            relative_tolerance=relative_tolerance,
+            model_threads=model_threads,
+        )
+        parity = _parity_target(y, yhat, sub.index)
+        parity["physics_data_revision_cohort"] = revision_cohort
+    else:
+        metrics = cv_metrics(
+            X,
+            y,
+            cfg["transform"],
+            relative_tolerance=relative_tolerance,
+            model_threads=model_threads,
+        )
+
+    rows = [{
+        "time": stamp,
+        "target": target,
+        "n": len(sub),
+        **metrics,
+        "slice": "global",
+        "physics_data_revision_cohort": revision_cohort,
+    }]
+    messages = [
+        f"  {target:32s} n={len(sub):6d}  R2={metrics['r2']:.4f}  "
+        f"MAPE={metrics['mape_pct']:.2f}%  "
+        f"P90APE={metrics['p90_ape_pct']:.2f}%  "
+        f"RMSE={metrics['rmse']:.4g}"
+    ]
+
+    if "Llt_phys" in sub.columns:
+        sliced = sub[(sub["Llt_phys"] >= 20) & (sub["Llt_phys"] <= 40)]
+        if len(sliced) >= 100:
+            slice_metrics = cv_metrics(
+                sliced[feats].fillna(0.0),
+                sliced[target].to_numpy(dtype=float),
+                cfg["transform"],
+                relative_tolerance=relative_tolerance,
+                model_threads=model_threads,
+            )
+            rows.append({
+                "time": stamp,
+                "target": target,
+                "n": len(sliced),
+                **slice_metrics,
+                "slice": "Llt20-40",
+                "physics_data_revision_cohort": revision_cohort,
+            })
+            messages.append(
+                f"    slice Llt 20-40uH: n={len(sliced)}  "
+                f"MAPE={slice_metrics['mape_pct']:.2f}%  "
+                f"P90={slice_metrics['p90_ape_pct']:.2f}%"
+            )
+    return {
+        "target": target,
+        "rows": rows,
+        "parity": parity,
+        "revision_cohort": revision_cohort,
+        "messages": messages,
+    }
+
+
+def _evaluate_targets(
+    df,
+    feats,
+    profile,
+    targets,
+    *,
+    include_parity,
+    model_threads,
+    target_workers,
+    max_model_thread_budget,
+    stamp,
+):
+    """Run targets concurrently while returning declaration order."""
+    parallelism = _checkpoint_parallelism(
+        model_threads,
+        target_workers,
+        max_model_thread_budget,
+    )
+    items = list(targets.items())
+    if not items:
+        parallelism["effective_target_workers"] = 0
+        parallelism["effective_total_model_threads"] = 0
+        return [], parallelism
+    effective_workers = min(parallelism["target_workers"], len(items))
+    parallelism["effective_target_workers"] = effective_workers
+    parallelism["effective_total_model_threads"] = (
+        effective_workers * parallelism["model_threads"]
+    )
+
+    def evaluate(item):
+        target, cfg = item
+        return _evaluate_target(
+            df,
+            feats,
+            profile,
+            target,
+            cfg,
+            include_parity=include_parity,
+            model_threads=parallelism["model_threads"],
+            stamp=stamp,
+        )
+
+    if effective_workers == 1:
+        return [evaluate(item) for item in items], parallelism
+
+    ordered = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        futures = {
+            executor.submit(evaluate, item): index
+            for index, item in enumerate(items)
+        }
+        for future in as_completed(futures):
+            ordered[futures[future]] = future.result()
+    if any(result is None for result in ordered):
+        raise RuntimeError("parallel checkpoint target inventory is incomplete")
+    return ordered, parallelism
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default=DATASET)
@@ -333,6 +572,24 @@ def main():
     ap.add_argument("--parity-json", default=None)
     ap.add_argument("--skip-curve-append", action="store_true")
     ap.add_argument("--checkpoint", type=int, default=None)
+    ap.add_argument(
+        "--model-threads",
+        type=int,
+        default=DEFAULT_MODEL_THREADS,
+        help="threads used by each LightGBM fit (default: 1)",
+    )
+    ap.add_argument(
+        "--target-workers",
+        type=int,
+        default=DEFAULT_TARGET_WORKERS,
+        help="independent checkpoint targets evaluated concurrently (default: 1)",
+    )
+    ap.add_argument(
+        "--max-model-thread-budget",
+        type=int,
+        default=None,
+        help="fail-closed ceiling for target-workers times model-threads",
+    )
     args = ap.parse_args()
 
     from quality_contract import DEFAULT_PROFILE_PATH, annotate_validity, load_profile
@@ -348,6 +605,14 @@ def main():
     )
     if (args.result_json or args.parity_json) and args.checkpoint is None:
         ap.error("--checkpoint is required with --result-json or --parity-json")
+    try:
+        requested_parallelism = _checkpoint_parallelism(
+            args.model_threads,
+            args.target_workers,
+            args.max_model_thread_budget,
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
     profile_data = load_profile(args.profile)
     profile_sha256 = hashlib.sha256(
         json.dumps(
@@ -368,71 +633,27 @@ def main():
     rows = []
     parity_targets = {}
     target_revision_cohorts = {}
-    for target, cfg in TARGETS.items():
-        if target not in df.columns:
-            print(f"  [skip] {target} (컬럼 없음)")
+    evaluations, training_parallelism = _evaluate_targets(
+        df,
+        feats,
+        args.profile,
+        TARGETS,
+        include_parity=bool(args.parity_json),
+        model_threads=requested_parallelism["model_threads"],
+        target_workers=requested_parallelism["target_workers"],
+        max_model_thread_budget=args.max_model_thread_budget,
+        stamp=stamp,
+    )
+    for evaluation in evaluations:
+        for message in evaluation["messages"]:
+            print(message)
+        rows.extend(evaluation["rows"])
+        if evaluation["revision_cohort"] is None:
             continue
-        # 온도 타겟: thermal 솔브가 성공한 행만 (thermal_solved 플래그, 2026-07-09)
-        target_df = filter_valid_training_rows(df, target, args.profile)
-        revision_cohort = target_df.attrs.get(
-            "physics_data_revision_cohort", ""
-        )
-        sub = target_df.dropna(subset=[target])
-        sub = sub[np.isfinite(sub[target])]
-        if len(sub) < 100:
-            print(f"  [skip] {target} (n={len(sub)} < 100)")
-            continue
-        X = sub[feats].fillna(0.0)
-        y = sub[target].to_numpy(dtype=float)
-        relative_tolerance = cfg.get(
-            "relative_metric_tolerance", MAPE_ZERO_ABS_TOLERANCE
-        )
-
-        if args.parity_json:
-            m, yhat = cv_metrics(
-                X,
-                y,
-                cfg["transform"],
-                return_yhat=True,
-                relative_tolerance=relative_tolerance,
-            )
-            parity_targets[target] = _parity_target(y, yhat, sub.index)
-            parity_targets[target][
-                "physics_data_revision_cohort"
-            ] = revision_cohort
-        else:
-            m = cv_metrics(
-                X,
-                y,
-                cfg["transform"],
-                relative_tolerance=relative_tolerance,
-            )
-        target_revision_cohorts[target] = revision_cohort
-        row = {
-            "time": stamp, "target": target, "n": len(sub), **m,
-            "slice": "global",
-            "physics_data_revision_cohort": revision_cohort,
-        }
-        rows.append(row)
-        print(f"  {target:32s} n={len(sub):6d}  R2={m['r2']:.4f}  MAPE={m['mape_pct']:.2f}%  "
-              f"P90APE={m['p90_ape_pct']:.2f}%  RMSE={m['rmse']:.4g}")
-
-        # 관심 슬라이스: Llt_phys 20~40uH 영역
-        if "Llt_phys" in sub.columns:
-            sl = sub[(sub["Llt_phys"] >= 20) & (sub["Llt_phys"] <= 40)]
-            if len(sl) >= 100:
-                ms = cv_metrics(
-                    sl[feats].fillna(0.0),
-                    sl[target].to_numpy(dtype=float),
-                    cfg["transform"],
-                    relative_tolerance=relative_tolerance,
-                )
-                rows.append({
-                    "time": stamp, "target": target, "n": len(sl), **ms,
-                    "slice": "Llt20-40",
-                    "physics_data_revision_cohort": revision_cohort,
-                })
-                print(f"    └ slice Llt 20-40uH: n={len(sl)}  MAPE={ms['mape_pct']:.2f}%  P90={ms['p90_ape_pct']:.2f}%")
+        target = evaluation["target"]
+        target_revision_cohorts[target] = evaluation["revision_cohort"]
+        if evaluation["parity"] is not None:
+            parity_targets[target] = evaluation["parity"]
 
     if rows:
         if not args.skip_curve_append:
@@ -460,6 +681,7 @@ def main():
                 "profile_sha256": profile_sha256,
                 "strict_full_rows": n_total,
                 "features": list(feats),
+                "training_parallelism": training_parallelism,
                 "target_physics_data_revision_cohorts": target_revision_cohorts,
                 "metrics": rows,
             }, args.result_json)
@@ -477,6 +699,7 @@ def main():
                 "features": list(feats),
                 "prediction_kind": "out_of_fold",
                 "cv": {"n_splits": 5, "shuffle": True, "seed": 42},
+                "training_parallelism": training_parallelism,
                 "max_pairs_per_target": PARITY_MAX_PAIRS_PER_TARGET,
                 "target_physics_data_revision_cohorts": target_revision_cohorts,
                 "targets": parity_targets,

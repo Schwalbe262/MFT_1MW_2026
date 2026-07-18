@@ -38,6 +38,7 @@ if str(REGRESSION_ROOT) not in sys.path:
 DEFAULT_THRESHOLDS = HERE / "model_quality_thresholds.json"
 STATE_SCHEMA_VERSION = 2
 REGISTRY_PROTOCOL_VERSION = 2
+DEFAULT_MODEL_THREADS = 1
 
 
 def checkpoint_sequence(valid_count):
@@ -561,16 +562,32 @@ def training_commands(
     if not profile or not os.path.isabs(profile):
         raise ValueError("checkpoint profile must be an absolute path")
     parity_result = os.path.splitext(metrics_result)[0] + ".parity.json"
-    commands = [[
-            sys.executable,
-            str(HERE / "checkpoint_train.py"),
-            "--dataset", snapshot,
-            "--curve-csv", curve,
-            "--profile", profile,
-            "--checkpoint", str(threshold),
-            "--result-json", metrics_result,
-            "--parity-json", parity_result,
-        ]]
+    metrics_command = [
+        sys.executable,
+        str(HERE / "checkpoint_train.py"),
+        "--dataset", snapshot,
+        "--curve-csv", curve,
+        "--profile", profile,
+        "--checkpoint", str(threshold),
+        "--result-json", metrics_result,
+        "--parity-json", parity_result,
+    ]
+    parallelism_arguments = []
+    if model_threads is not None:
+        parallelism_arguments.extend(
+            ["--model-threads", str(int(model_threads))]
+        )
+    if target_workers is not None:
+        parallelism_arguments.extend(
+            ["--target-workers", str(int(target_workers))]
+        )
+    if max_model_thread_budget is not None:
+        parallelism_arguments.extend([
+            "--max-model-thread-budget",
+            str(int(max_model_thread_budget)),
+        ])
+    metrics_command.extend(parallelism_arguments)
+    commands = [metrics_command]
     if candidate_result:
         candidate_command = [
             sys.executable,
@@ -591,19 +608,7 @@ def training_commands(
             candidate_command.extend(
                 ["--source-dataset-generation", source_dataset_generation]
             )
-        if model_threads is not None:
-            candidate_command.extend(
-                ["--model-threads", str(int(model_threads))]
-            )
-        if target_workers is not None:
-            candidate_command.extend(
-                ["--target-workers", str(int(target_workers))]
-            )
-        if max_model_thread_budget is not None:
-            candidate_command.extend([
-                "--max-model-thread-budget",
-                str(int(max_model_thread_budget)),
-            ])
+        candidate_command.extend(parallelism_arguments)
         commands.append(candidate_command)
     return commands
 
@@ -726,8 +731,8 @@ def main():
     )
     parser.add_argument("--min-rows", type=int, default=200)
     parser.add_argument(
-        "--model-threads", type=int, default=None,
-        help="maximum threads used by each candidate model fit",
+        "--model-threads", type=int, default=DEFAULT_MODEL_THREADS,
+        help="maximum threads used by each model fit (default: 1)",
     )
     parser.add_argument(
         "--target-workers", type=int, default=1,

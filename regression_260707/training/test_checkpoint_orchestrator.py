@@ -111,6 +111,35 @@ class TrainingCommandTests(unittest.TestCase):
             candidate[candidate.index("--max-model-thread-budget") + 1], "32"
         )
 
+    def test_metrics_command_forwards_the_same_model_thread_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = checkpoint.training_commands(
+                str(root / "snapshot.parquet"),
+                str(root / "learning_curve.csv"),
+                str(root / "registry"),
+                100,
+                str(root / "profile.json"),
+                3000,
+                str(root / "metrics.json"),
+                str(root / "candidate.json"),
+                model_threads=2,
+                target_workers=4,
+                max_model_thread_budget=8,
+            )
+
+        metrics, candidate = commands
+        for command in (metrics, candidate):
+            self.assertEqual(
+                command[command.index("--model-threads") + 1], "2"
+            )
+            self.assertEqual(
+                command[command.index("--target-workers") + 1], "4"
+            )
+            self.assertEqual(
+                command[command.index("--max-model-thread-budget") + 1], "8"
+            )
+
     def test_checkpoint_command_writes_non_authoritative_parity_sidecar(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
