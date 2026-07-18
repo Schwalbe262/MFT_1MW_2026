@@ -67,6 +67,7 @@ class PipelineOrchestrator:
         *,
         python: str = sys.executable,
         checkpoint_output_root: str | os.PathLike[str] | None = None,
+        checkpoint_state_root: str | os.PathLike[str] | None = None,
         solver_git_repo: str | os.PathLike[str] | None = None,
     ):
         self.queue = queue
@@ -75,6 +76,13 @@ class PipelineOrchestrator:
         self.python = os.path.abspath(python)
         self.checkpoint_output_root = Path(
             checkpoint_output_root or self.runtime_root / "training"
+        ).resolve()
+        # Checkpoint progress is durable state, not deployment code.  Keeping
+        # its root independently configurable lets an immutable runtime be
+        # rolled forward without replaying already-completed thresholds.
+        self.checkpoint_state_root = Path(
+            checkpoint_state_root
+            or self.runtime_root / "training" / "checkpoint_runs"
         ).resolve()
         configured_solver_git_repo = str(
             solver_git_repo or os.environ.get("MFT_SOLVER_GIT_REPO") or ""
@@ -634,9 +642,7 @@ class PipelineOrchestrator:
             )
 
         checkpoint_run_root = (
-            self.runtime_root
-            / "training"
-            / "checkpoint_runs"
+            self.checkpoint_state_root
             / (
                 f"{library_revision.lower()}-c"
                 f"{contract['checkpoint_contract_key']}"
@@ -716,6 +722,9 @@ class PipelineOrchestrator:
                     "candidate_target_workers": checkpoint_target_workers,
                     "output_root": os.path.normcase(
                         str(self.checkpoint_output_root)
+                    ),
+                    "checkpoint_state_root": os.path.normcase(
+                        str(self.checkpoint_state_root)
                     ),
                     "runtime_execution_key": runtime_execution_key,
                     "script_sha256": (

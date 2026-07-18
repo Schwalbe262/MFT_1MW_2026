@@ -78,6 +78,38 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(command[workers_index + 1], "4")
             self.assertEqual(command[budget_index + 1], "24")
 
+    def test_checkpoint_state_root_survives_immutable_runtime_rollover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "immutable-runtime"
+            (runtime / "training").mkdir(parents=True)
+            dataset = root / "train.parquet"
+            dataset.write_bytes(b"strict checkpoint rollover dataset")
+            durable_state = root / "durable-checkpoint-state"
+            queue = DurableJobQueue(root / "pipeline" / "jobs.sqlite3")
+
+            result = PipelineOrchestrator(
+                queue,
+                GenerationStore(root / "pipeline" / "artifacts"),
+                runtime,
+                checkpoint_output_root=root / "checkpoint-output",
+                checkpoint_state_root=durable_state,
+            ).plan_cycle(
+                dataset_path=dataset,
+                strict_full_rows=3000,
+                solver_revision="a" * 40,
+                library_revision="b" * 40,
+                now=1200,
+            )
+
+            command = queue.get(result.jobs["train"]).payload["command"]
+            run_root = Path(command[command.index("--run-root") + 1])
+            self.assertEqual(run_root.parent, durable_state.resolve())
+            self.assertEqual(
+                Path(command[command.index("--runtime-root") + 1]),
+                runtime.resolve(),
+            )
+
     def test_checkpoint_route_change_creates_a_distinct_idempotency_key(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

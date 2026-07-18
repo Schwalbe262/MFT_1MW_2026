@@ -80,6 +80,7 @@ def main() -> None:
     control.add_argument("--dataset", default=None)
     control.add_argument("--registry", default=None)
     control.add_argument("--checkpoint-output-root", default=None)
+    control.add_argument("--checkpoint-state-root", default=None)
     control.add_argument("--solver-revision", required=True)
     control.add_argument("--library-revision", required=True)
     control.add_argument("--interval-seconds", type=int, default=600)
@@ -97,6 +98,7 @@ def main() -> None:
     plan.add_argument("--library-revision", required=True)
     plan.add_argument("--registry", default=None)
     plan.add_argument("--checkpoint-output-root", default=None)
+    plan.add_argument("--checkpoint-state-root", default=None)
     plan.add_argument("--no-active-model", action="store_true")
     plan.add_argument("--drift-detected", action="store_true")
     plan.add_argument("--quality-regression", action="store_true")
@@ -160,6 +162,7 @@ def main() -> None:
                 runtime,
                 python=sys.executable,
                 checkpoint_output_root=checkpoint_output_root,
+                checkpoint_state_root=args.checkpoint_state_root,
             ),
             dataset=(
                 args.dataset or runtime / "data" / "dataset" / "train.parquet"
@@ -185,6 +188,12 @@ def main() -> None:
                 "solver_revision": args.solver_revision.lower(),
                 "library_revision": args.library_revision.lower(),
                 "model_threads": args.model_threads,
+                "checkpoint_state_root": str(
+                    Path(
+                        args.checkpoint_state_root
+                        or runtime / "training" / "checkpoint_runs"
+                    ).resolve()
+                ),
                 "verification_config_sha256": _verification_config_identity(
                     args.verification_commands
                 ),
@@ -220,6 +229,7 @@ def main() -> None:
         runtime,
         python=sys.executable,
         checkpoint_output_root=args.checkpoint_output_root,
+        checkpoint_state_root=args.checkpoint_state_root,
     ).plan_cycle(
         dataset_path=dataset,
         strict_full_rows=args.strict_full_rows,
