@@ -156,6 +156,7 @@ class PipelineOrchestrator:
             )
             and (
                 idempotency_suffix is None
+                or job.state == "running"
                 or job.idempotency_key.endswith(idempotency_suffix)
             )
             and (payload_match is None or payload_match(job.payload))
@@ -199,11 +200,10 @@ class PipelineOrchestrator:
             )
         ]
         # A running checkpoint remains the cohort authority even if its worker
-        # has just initialized or advanced the durable completion ledger and
-        # the controller consequently computes a different next checkpoint.
-        # ``idempotency_prefix`` therefore narrows pending successors only;
-        # the execution suffix and dependency inventory still prevent reuse of
-        # a train from another deployment or the legacy tune-bound lane.
+        # has just initialized or advanced the durable completion ledger, or
+        # the controller itself rolls to a new immutable execution contract.
+        # Prefix/suffix filters therefore narrow pending successors only.  The
+        # dependency inventory and cohort key still prevent cross-lane reuse.
         running = [job for job in candidates if job.state == "running"]
         if running:
             authority = max(running, key=lambda job: job.id)

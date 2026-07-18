@@ -1413,7 +1413,7 @@ class OrchestratorTests(unittest.TestCase):
 
 
 class RunningCheckpointAuthorityTests(unittest.TestCase):
-    def test_running_train_remains_authority_when_checkpoint_prefix_changes(self):
+    def test_running_train_remains_authority_when_execution_key_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = root / "runtime"
@@ -1461,7 +1461,7 @@ class RunningCheckpointAuthorityTests(unittest.TestCase):
                 "train",
                 cohort_key,
                 idempotency_prefix="checkpoint-500-",
-                idempotency_suffix="-eabc123",
+                idempotency_suffix="-edef456",
                 pending_input_generation="dataset:data",
                 required_dependency_ids=(),
                 now=1203,
