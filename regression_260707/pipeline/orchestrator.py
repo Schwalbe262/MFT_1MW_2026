@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import sys
@@ -103,20 +102,20 @@ class PipelineOrchestrator:
         idempotency_suffix: str | None = None,
         payload_match: Callable[[Mapping[str, object]], bool] | None = None,
         pending_input_generation: str | None = None,
+        required_dependency_ids: tuple[int, ...] | None = None,
         now: float | None = None,
     ) -> Job | None:
         """Return one already-owned cohort job instead of replacing its input.
 
         Production tuning is intentionally long-running.  Replacing its queued
         successor on every collector snapshot also replaced the dependent train
-        job, which meant a continuously growing dataset could prevent *any*
-        tuned checkpoint from reaching training.  A running job is the cohort
-        authority; otherwise the newest matching pending job is reused.  Train
-        callers may require the current dataset generation so an unstarted
-        checkpoint follows newly collected data without interrupting a running
-        checkpoint.  Re-enqueuing
-        that exact durable row atomically removes stale pending siblings while
-        preserving its immutable input and any active worker lease.
+        job.  A running job is the cohort authority; otherwise the newest
+        matching pending job is reused.  Train callers may require the current
+        dataset generation and an exact dependency inventory so an obsolete
+        dependency-bound checkpoint cannot be mistaken for an independent
+        checkpoint.  Re-enqueuing that exact durable row atomically removes
+        stale pending siblings while preserving its immutable input and any
+        active worker lease.
         """
 
         candidates = [
@@ -140,6 +139,19 @@ class PipelineOrchestrator:
             job.id: self.queue.dependencies(job.id)
             for job in candidates
         }
+        if required_dependency_ids is not None:
+            required = tuple(sorted(int(value) for value in required_dependency_ids))
+            candidates = [
+                job
+                for job in candidates
+                if tuple(
+                    sorted(
+                        dependency.id
+                        for dependency in dependency_jobs[job.id]
+                    )
+                )
+                == required
+            ]
         # A legacy successor may depend on a pending tune that was just
         # cancelled when the older running tune became authoritative.  Never
         # revive that dead branch.  Zero-dependency and succeeded-dependency
@@ -696,23 +708,25 @@ class PipelineOrchestrator:
                 },
                 sort_keys=True,
             ).encode("utf-8")).hexdigest()[:12]
-            dependencies = [tune_job.id] if tune_job else []
             train = self.active_coalesced_job(
                 "train",
                 cohort_key,
                 idempotency_prefix=f"checkpoint-{checkpoint}-",
                 idempotency_suffix=f"-e{checkpoint_execution_key}",
                 pending_input_generation=dataset_identity,
+                required_dependency_ids=(),
                 now=timestamp,
             )
             if train is None:
                 params_argument: list[str] = []
-                if tune_job:
-                    params_argument = [
-                        "--params",
-                        "{dependency_tune_output}" + os.sep + "params.json",
-                    ]
-                elif params_path:
+                # Full-cohort HPO runs in its own durable lane and can take
+                # many hours.  The newest checkpoint must therefore train in
+                # parallel using the latest *completed* authenticated tuning
+                # generation, or reviewed defaults for the first wave.  A
+                # later checkpoint consumes newly published parameters.  The
+                # checkpoint quality/promotion gates remain unchanged and
+                # continue to fail closed.
+                if params_path:
                     params_argument = ["--params", params_path]
                 train_command = [
                     self.python,
@@ -738,7 +752,7 @@ class PipelineOrchestrator:
                     "train",
                     (
                         f"checkpoint-{checkpoint}-{dataset.generation_id}"
-                        f"-t{tune_job.id if tune_job else 0}"
+                        "-t0"
                         f"-e{checkpoint_execution_key}"
                     ),
                     {
@@ -747,16 +761,14 @@ class PipelineOrchestrator:
                         "env": {
                             "MFT_PIPELINE_ROOT": str(self.store.root.parent),
                         },
-                        "dependency_kinds": (
-                            {"tune": "tuning"} if tune_job else {}
-                        ),
+                        "dependency_kinds": {},
                         "retry": True,
                         "retry_backoff_seconds": 600,
                     },
                     input_generation=dataset_identity,
                     coalesce_key=cohort_key,
                     coalesce_pending=True,
-                    dependencies=dependencies,
+                    dependencies=[],
                     priority=80,
                     max_attempts=3,
                     now=timestamp,

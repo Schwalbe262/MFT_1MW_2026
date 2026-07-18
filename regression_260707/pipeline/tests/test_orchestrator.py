@@ -175,7 +175,7 @@ class OrchestratorTests(unittest.TestCase):
                 (runtime / "training").resolve(),
             )
 
-    def test_4k_cycle_orders_tuning_before_training_and_overlaps_collection(self):
+    def test_4k_cycle_runs_collection_tuning_and_training_in_parallel(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = root / "runtime"
@@ -211,7 +211,10 @@ class OrchestratorTests(unittest.TestCase):
                 ["mft-1to3", "mft-1x3", "mft-mixed", "mft-9way"],
             )
             train_dependencies = queue.dependencies(result.jobs["train"])
-            self.assertEqual([job.id for job in train_dependencies], [result.jobs["tune"]])
+            self.assertEqual(train_dependencies, [])
+            train = queue.get(result.jobs["train"])
+            self.assertNotIn("--params", train.payload["command"])
+            self.assertEqual(train.payload["dependency_kinds"], {})
             tune_command = queue.get(result.jobs["tune"]).payload["command"]
             thread_option = tune_command.index("--model-threads")
             worker_option = tune_command.index("--job-workers")
@@ -221,7 +224,10 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(tune_command[budget_option + 1], "24")
             self.assertIsNotNone(queue.claim("collector", job_types=["collect"], now=1201))
             self.assertIsNotNone(queue.claim("tuner", job_types=["tune"], now=1201))
-            self.assertIsNone(queue.claim("trainer", job_types=["train"], now=1201))
+            self.assertEqual(
+                queue.claim("trainer", job_types=["train"], now=1201).id,
+                result.jobs["train"],
+            )
 
     def test_collector_payload_pins_canonical_solver_git_repo(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -784,7 +790,7 @@ class OrchestratorTests(unittest.TestCase):
                     dependency.id
                     for dependency in queue.dependencies(second.jobs["train"])
                 ],
-                [first.jobs["tune"]],
+                [],
             )
 
     def test_new_runtime_deployment_gets_distinct_execution_keys(self):
@@ -976,10 +982,10 @@ class OrchestratorTests(unittest.TestCase):
                     dependency.id
                     for dependency in queue.dependencies(second.jobs["train"])
                 ],
-                [running.id],
+                [],
             )
             self.assertIn(
-                f"-t{running.id}-e",
+                "-t0-e",
                 queue.get(second.jobs["train"]).idempotency_key,
             )
             active_tunes = queue.list(
@@ -1070,7 +1076,7 @@ class OrchestratorTests(unittest.TestCase):
                     job.id
                     for job in queue.dependencies(recovered.jobs["train"])
                 ],
-                [running_tune.id],
+                [],
             )
 
             dataset.write_bytes(b"third")
@@ -1092,7 +1098,7 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertEqual(
                 [job.id for job in queue.dependencies(latest_train.id)],
-                [running_tune.id],
+                [],
             )
 
     def test_completed_tuning_wave_allows_the_next_growth_wave(self):
@@ -1138,9 +1144,9 @@ class OrchestratorTests(unittest.TestCase):
                 now=1202,
             )
 
-            # The child retains its original dependency edge after that tune
-            # succeeds.  Replanning identical bytes must reuse it instead of
-            # colliding with the same idempotency key and a rewritten payload.
+            # The independent child remains valid after that tune succeeds.
+            # Replanning identical bytes must reuse it rather than interrupt
+            # an already queued checkpoint to rewrite its parameter source.
             same_snapshot = orchestrator.plan_cycle(
                 dataset_path=dataset,
                 strict_full_rows=4000,
