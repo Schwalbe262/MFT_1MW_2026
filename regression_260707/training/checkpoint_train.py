@@ -126,6 +126,24 @@ def filter_valid_training_rows(df, target, profile=None):
                     df["cap_on"], errors="coerce"
                 ).eq(1)
                 keep &= cap_enabled
+            # A frame carrying the recovery contract has LC evidence columns.
+            # Capacitance rows from that frame are trainable only after the
+            # row-atomic three-target recovery succeeded.  Legacy/unit frames
+            # with no LC columns have no `required` marker and retain the
+            # historical passthrough behavior.
+            if "capacitance_recovery_required" in df.columns:
+                recovery_required = pd.to_numeric(
+                    df["capacitance_recovery_required"], errors="coerce"
+                ).eq(1)
+                recovered = (
+                    pd.to_numeric(
+                        df.get("capacitance_recovered_from_resonance"),
+                        errors="coerce",
+                    ).eq(1)
+                    if "capacitance_recovered_from_resonance" in df.columns
+                    else pd.Series(False, index=df.index)
+                )
+                keep &= ~recovery_required | recovered
         if target.startswith("Tprobe"):
             keep &= values.gt(MIN_TRUSTED_TEMPERATURE_C) & values.lt(
                 MAX_TRUSTED_TEMPERATURE_C
@@ -157,9 +175,13 @@ def filter_valid_training_rows(df, target, profile=None):
 
 def to_physical(df):
     """대칭 매트릭스 L 컬럼 -> 실물 (x2). 손실/B는 이미 _phys로 기록됨."""
-    from campaign.train_io import add_wcp_length_features
+    from campaign.train_io import (
+        add_wcp_length_features,
+        recover_quantized_capacitance_targets,
+    )
 
-    out = add_wcp_length_features(df)
+    out = recover_quantized_capacitance_targets(df)
+    out = add_wcp_length_features(out)
     sym = out.get("full_model", 0).fillna(0).astype(float) == 0
     for c in ["Ltx", "Lrx", "M", "Lmt", "Lmr", "Llt", "Llr"]:
         if c in out.columns:
@@ -623,6 +645,9 @@ def main():
     raw = pd.read_parquet(args.dataset)
     df = annotate_validity(raw, args.profile)
     df = to_physical(df)
+    from campaign.train_io import capacitance_recovery_audit
+
+    recovery_audit = capacitance_recovery_audit(df)
     feats = feature_columns(df)
     n_total = int(df["_strict_valid_full"].sum())
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -680,6 +705,7 @@ def main():
                 "profile": args.profile,
                 "profile_sha256": profile_sha256,
                 "strict_full_rows": n_total,
+                "capacitance_recovery": recovery_audit,
                 "features": list(feats),
                 "training_parallelism": training_parallelism,
                 "target_physics_data_revision_cohorts": target_revision_cohorts,
@@ -696,6 +722,7 @@ def main():
                 "profile": args.profile,
                 "profile_sha256": profile_sha256,
                 "strict_full_rows": n_total,
+                "capacitance_recovery": recovery_audit,
                 "features": list(feats),
                 "prediction_kind": "out_of_fold",
                 "cv": {"n_splits": 5, "shuffle": True, "seed": 42},

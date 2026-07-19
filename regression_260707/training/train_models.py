@@ -740,6 +740,7 @@ def _prune_inactive_generations_unlocked(registry, keep, protected_run_ids):
 
 def _build_candidate(args, frame, features, strict_count, targets, family_params_for):
     """Write one complete generation.  Caller must hold the registry lock."""
+    from campaign.train_io import capacitance_recovery_audit
     from quality_contract import load_profile
 
     registry = args.registry
@@ -757,6 +758,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             profile_data, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
     ).hexdigest()
+    recovery_audit = capacitance_recovery_audit(frame)
     target_reports = {}
     target_revision_cohorts = {}
     artifact_sha256 = {}
@@ -794,6 +796,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
                     "strict_full_rows": strict_count,
                     "profile_sha256": profile_sha256,
                     "feature_schema": list(features),
+                    "capacitance_recovery": recovery_audit,
                 }
             )
             target_dir = os.path.join(staging, target)
@@ -868,6 +871,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             ),
             "raw_rows": int(len(frame)),
             "strict_full_rows": strict_count,
+            "capacitance_recovery": recovery_audit,
             "profile_path": args.profile,
             "profile_sha256": profile_sha256,
             "params_path": getattr(args, "params", None),
@@ -894,6 +898,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             ),
             "dataset_sha256": dataset_sha256,
             "strict_full_rows": strict_count,
+            "capacitance_recovery": recovery_audit,
         }
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)

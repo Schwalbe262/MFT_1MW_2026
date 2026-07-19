@@ -11,7 +11,22 @@ import numpy as np
 import pandas as pd
 
 
-TRAIN_IO_SCHEMA_VERSION = 8
+TRAIN_IO_SCHEMA_VERSION = 9
+
+CAPACITANCE_RECOVERY_CONTRACT = "mft-capacitance-lc-inverse-v1"
+CAPACITANCE_QUANTIZATION_MAX_ABS_DELTA_F = 5.1e-11
+CAPACITANCE_RECOVERY_ATTR = "capacitance_recovery"
+CAPACITANCE_RECOVERY_COLUMNS = (
+    "capacitance_recovery_contract",
+    "capacitance_recovery_required",
+    "capacitance_recovered_from_resonance",
+    "capacitance_recovery_max_abs_delta_F",
+)
+CAPACITANCE_RECOVERY_SPECS = (
+    ("C_tx_tx_F", "f_res_tx_self_Hz", "cap_L_tx_self_H"),
+    ("C_rx_rx_F", "f_res_rx_self_Hz", "cap_L_rx_self_H"),
+    ("C_tx_rx_F", "f_res_interwinding_Hz", "cap_L_leakage_H"),
+)
 
 IDENTITY_COLUMNS = (
     "project_name",
@@ -380,6 +395,7 @@ TRAIN_IO_COLUMNS = (
     *INDUCTANCE_PHYSICAL_COLUMNS,
     *AGGREGATE_EM_OUTPUT_COLUMNS,
     *ELECTROSTATIC_OUTPUT_COLUMNS,
+    *CAPACITANCE_RECOVERY_COLUMNS,
     *AGGREGATE_TEMPERATURE_COLUMNS,
     *QUALITY_COLUMNS,
     *TIMING_PROVENANCE_COLUMNS,
@@ -391,6 +407,147 @@ def _column_or_missing(frame: pd.DataFrame, column: str) -> pd.Series:
     if column in frame.columns:
         return frame[column].copy()
     return pd.Series(np.nan, index=frame.index, name=column)
+
+
+def recover_quantized_capacitance_targets(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with legacy RESULT_JSON capacitance rounding repaired.
+
+    The solver emitted each physical LC resonance and its corresponding
+    physical inductance independently of the rounded capacitance JSON field.
+    Therefore ``C = 1 / ((2*pi*f)**2*L)`` recovers the pre-serialization value.
+
+    Recovery is row-atomic across all three targets.  It applies only to
+    ``cap_on=1`` rows whose L/f evidence is positive and finite and whose
+    stored capacitances are finite and non-negative.  The legacy serializer
+    can introduce at most half of one 1e-10-F step; a larger discrepancy is a
+    semantic or unit mismatch and fails closed instead of rewriting evidence.
+    Frames lacking the LC evidence columns pass through unchanged apart from
+    explicit recovery audit fields.
+    """
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("frame must be a pandas DataFrame")
+
+    out = frame.copy()
+    required = {"cap_on"}
+    for target, frequency, inductance in CAPACITANCE_RECOVERY_SPECS:
+        required.update((target, frequency, inductance))
+    missing = tuple(sorted(required.difference(out.columns)))
+
+    recovered_flag = pd.Series(0, index=out.index, dtype="int8")
+    recovery_required = pd.Series(0, index=out.index, dtype="int8")
+    row_max_delta = pd.Series(np.nan, index=out.index, dtype=float)
+    contract_column = pd.Series(pd.NA, index=out.index, dtype="string")
+    audit = {
+        "contract": CAPACITANCE_RECOVERY_CONTRACT,
+        "max_allowed_abs_delta_F": CAPACITANCE_QUANTIZATION_MAX_ABS_DELTA_F,
+        "row_count": int(len(out)),
+        "cap_enabled_row_count": 0,
+        "eligible_row_count": 0,
+        "recovered_row_count": 0,
+        "max_observed_abs_delta_F": None,
+        "missing_columns": list(missing),
+        "status": "columns_unavailable_passthrough" if missing else "applied",
+    }
+
+    if not missing and len(out):
+        cap_enabled = pd.to_numeric(out["cap_on"], errors="coerce").eq(1)
+        recovery_required.loc[cap_enabled] = 1
+        audit["cap_enabled_row_count"] = int(cap_enabled.sum())
+        eligible = cap_enabled.copy()
+        reconstructed = {}
+        stored = {}
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            for target, frequency, inductance in CAPACITANCE_RECOVERY_SPECS:
+                frequency_values = pd.to_numeric(
+                    out[frequency], errors="coerce"
+                ).astype(float)
+                inductance_values = pd.to_numeric(
+                    out[inductance], errors="coerce"
+                ).astype(float)
+                stored_values = pd.to_numeric(
+                    out[target], errors="coerce"
+                ).astype(float)
+                recovered_values = 1.0 / (
+                    (2.0 * np.pi * frequency_values) ** 2
+                    * inductance_values
+                )
+                inputs_valid = (
+                    np.isfinite(frequency_values)
+                    & frequency_values.gt(0.0)
+                    & np.isfinite(inductance_values)
+                    & inductance_values.gt(0.0)
+                )
+                stored_valid = (
+                    np.isfinite(stored_values) & stored_values.ge(0.0)
+                )
+                recovered_valid = (
+                    np.isfinite(recovered_values) & recovered_values.gt(0.0)
+                )
+                eligible &= inputs_valid & stored_valid & recovered_valid
+                reconstructed[target] = recovered_values
+                stored[target] = stored_values
+
+        deltas = pd.DataFrame(
+            {
+                target: (stored[target] - reconstructed[target]).abs()
+                for target, _, _ in CAPACITANCE_RECOVERY_SPECS
+            },
+            index=out.index,
+        )
+        row_max_delta = deltas.max(axis=1, skipna=False)
+        semantic_mismatch = eligible & row_max_delta.gt(
+            CAPACITANCE_QUANTIZATION_MAX_ABS_DELTA_F
+        )
+        if semantic_mismatch.any():
+            mismatch_count = int(semantic_mismatch.sum())
+            mismatch_max = float(row_max_delta.loc[semantic_mismatch].max())
+            raise ValueError(
+                "capacitance recovery semantic mismatch: "
+                f"{mismatch_count} row(s), max_abs_delta_F={mismatch_max:.17g}, "
+                f"allowed={CAPACITANCE_QUANTIZATION_MAX_ABS_DELTA_F:.17g}, "
+                f"contract={CAPACITANCE_RECOVERY_CONTRACT}"
+            )
+
+        recoverable = eligible
+        for target, _, _ in CAPACITANCE_RECOVERY_SPECS:
+            out.loc[recoverable, target] = reconstructed[target].loc[recoverable]
+        recovered_flag.loc[recoverable] = 1
+        contract_column.loc[recoverable] = CAPACITANCE_RECOVERY_CONTRACT
+        row_max_delta = row_max_delta.where(eligible)
+        audit["eligible_row_count"] = int(eligible.sum())
+        audit["recovered_row_count"] = int(recoverable.sum())
+        if recoverable.any():
+            audit["max_observed_abs_delta_F"] = float(
+                row_max_delta.loc[recoverable].max()
+            )
+
+    out["capacitance_recovery_contract"] = contract_column
+    out["capacitance_recovery_required"] = recovery_required
+    out["capacitance_recovered_from_resonance"] = recovered_flag
+    out["capacitance_recovery_max_abs_delta_F"] = row_max_delta
+    out.attrs.update(frame.attrs)
+    out.attrs[CAPACITANCE_RECOVERY_ATTR] = audit
+    return out
+
+
+def capacitance_recovery_audit(frame: pd.DataFrame) -> dict:
+    """Return stable JSON-safe recovery provenance for model artifacts."""
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("frame must be a pandas DataFrame")
+    value = frame.attrs.get(CAPACITANCE_RECOVERY_ATTR)
+    if isinstance(value, dict):
+        return dict(value)
+    return {
+        "contract": CAPACITANCE_RECOVERY_CONTRACT,
+        "max_allowed_abs_delta_F": CAPACITANCE_QUANTIZATION_MAX_ABS_DELTA_F,
+        "row_count": int(len(frame)),
+        "cap_enabled_row_count": None,
+        "eligible_row_count": None,
+        "recovered_row_count": 0,
+        "max_observed_abs_delta_F": None,
+        "missing_columns": None,
+        "status": "audit_unavailable",
+    }
 
 
 def add_wcp_length_features(frame: pd.DataFrame) -> pd.DataFrame:
@@ -430,6 +587,7 @@ def build_train_io(master: pd.DataFrame) -> pd.DataFrame:
     """Build the fixed-schema physical I/O view without mutating ``master``."""
     if not isinstance(master, pd.DataFrame):
         raise TypeError("master must be a pandas DataFrame")
+    master = recover_quantized_capacitance_targets(master)
     master = add_wcp_length_features(master)
 
     data = {
@@ -466,6 +624,7 @@ def build_train_io(master: pd.DataFrame) -> pd.DataFrame:
     for column in (
         *AGGREGATE_EM_OUTPUT_COLUMNS,
         *ELECTROSTATIC_OUTPUT_COLUMNS,
+        *CAPACITANCE_RECOVERY_COLUMNS,
         *AGGREGATE_TEMPERATURE_COLUMNS,
         *QUALITY_COLUMNS,
         *TIMING_PROVENANCE_COLUMNS,
@@ -474,4 +633,6 @@ def build_train_io(master: pd.DataFrame) -> pd.DataFrame:
         data[column] = _column_or_missing(master, column)
 
     out = pd.DataFrame(data, index=master.index)
-    return out.loc[:, TRAIN_IO_COLUMNS].reset_index(drop=True)
+    out = out.loc[:, TRAIN_IO_COLUMNS].reset_index(drop=True)
+    out.attrs.update(master.attrs)
+    return out

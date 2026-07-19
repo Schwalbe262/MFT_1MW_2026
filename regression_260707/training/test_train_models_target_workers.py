@@ -35,6 +35,12 @@ def test_target_workers_train_independent_targets_concurrently():
         )
         frame = pd.DataFrame({target: [1.0] for target in targets})
         frame["feature"] = 1.0
+        recovery_audit = {
+            "contract": "mft-capacitance-lc-inverse-v1",
+            "recovered_row_count": 7212,
+            "max_observed_abs_delta_F": 4.999e-11,
+        }
+        frame.attrs["capacitance_recovery"] = recovery_audit
         active = 0
         maximum = 0
         lock = threading.Lock()
@@ -81,6 +87,15 @@ def test_target_workers_train_independent_targets_concurrently():
             "maximum_model_thread_budget": 8,
             "effective_model_thread_budget": 8,
         }
+        assert report["capacitance_recovery"] == recovery_audit
+        assert result["capacitance_recovery"] == recovery_audit
+        for target in targets:
+            metadata = json.loads(
+                (
+                    Path(result["generation_path"]) / target / "meta.json"
+                ).read_text(encoding="utf-8")
+            )
+            assert metadata["capacitance_recovery"] == recovery_audit
 
 
 def test_target_workers_cannot_oversubscribe_declared_budget():

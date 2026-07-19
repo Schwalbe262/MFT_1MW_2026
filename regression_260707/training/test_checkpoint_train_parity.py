@@ -34,6 +34,39 @@ class CheckpointParityTests(unittest.TestCase):
                 json.loads(path.read_text(encoding="utf-8")), {"ok": True}
             )
 
+    def test_to_physical_recovers_quantized_capacitance_targets(self):
+        exact = {
+            "C_tx_tx_F": 1.856789012345678e-10,
+            "C_rx_rx_F": 8.721234567890123e-10,
+            "C_tx_rx_F": 3.456789012345678e-10,
+        }
+        inductance = {
+            "cap_L_tx_self_H": 180e-6,
+            "cap_L_rx_self_H": 780e-6,
+            "cap_L_leakage_H": 27.5e-6,
+        }
+        row = {"cap_on": 1, "full_model": 1}
+        specs = (
+            ("C_tx_tx_F", "f_res_tx_self_Hz", "cap_L_tx_self_H"),
+            ("C_rx_rx_F", "f_res_rx_self_Hz", "cap_L_rx_self_H"),
+            ("C_tx_rx_F", "f_res_interwinding_Hz", "cap_L_leakage_H"),
+        )
+        for target, frequency, inductance_column in specs:
+            row[target] = round(exact[target] / 1e-10) * 1e-10
+            row[inductance_column] = inductance[inductance_column]
+            row[frequency] = 1.0 / (
+                2.0 * np.pi
+                * np.sqrt(inductance[inductance_column] * exact[target])
+            )
+
+        physical = checkpoint.to_physical(pd.DataFrame([row]))
+
+        self.assertEqual(
+            physical.loc[0, "capacitance_recovered_from_resonance"], 1
+        )
+        for target in exact:
+            self.assertAlmostEqual(physical.loc[0, target], exact[target], 24)
+
     def test_capacitance_target_contract_excludes_resonance_outputs(self):
         capacitance_targets = {
             "C_tx_tx_F", "C_rx_rx_F", "C_tx_rx_F"
@@ -83,6 +116,20 @@ class CheckpointParityTests(unittest.TestCase):
         )
 
         self.assertEqual(filtered["sample"].tolist(), ["valid"])
+
+    def test_capacitance_rows_with_lc_contract_require_successful_recovery(self):
+        frame = pd.DataFrame({
+            "sample": ["recovered", "partial-evidence"],
+            "C_rx_rx_F": [3e-10, 4e-10],
+            "cap_on": [1, 1],
+            "capacitance_recovery_required": [1, 1],
+            "capacitance_recovered_from_resonance": [1, 0],
+            "_strict_valid_full": [True, True],
+        })
+
+        filtered = checkpoint.filter_valid_training_rows(frame, "C_rx_rx_F")
+
+        self.assertEqual(filtered["sample"].tolist(), ["recovered"])
 
     def test_target_cohort_rejects_physics_revision_mixing(self):
         frame = pd.DataFrame({
@@ -186,7 +233,7 @@ class CheckpointParityTests(unittest.TestCase):
             checkpoint.main()
         self.assertEqual(raised.exception.code, 2)
 
-    def test_parity_only_cli_writes_atomic_sidecar_without_curve_append(self):
+    def test_checkpoint_cli_seals_recovery_in_result_and_parity_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "snapshot.parquet"
@@ -194,6 +241,7 @@ class CheckpointParityTests(unittest.TestCase):
             profile = root / "profile.json"
             profile.write_text("{}", encoding="utf-8")
             parity = root / "metrics.parity.json"
+            result = root / "metrics.result.json"
             curve = root / "learning_curve.csv"
             frame = pd.DataFrame({
                 "feature": np.arange(100, dtype=float),
@@ -217,6 +265,7 @@ class CheckpointParityTests(unittest.TestCase):
                 "--curve-csv", str(curve),
                 "--profile", str(profile),
                 "--checkpoint", "500",
+                "--result-json", str(result),
                 "--parity-json", str(parity),
                 "--skip-curve-append",
             ]
@@ -240,6 +289,7 @@ class CheckpointParityTests(unittest.TestCase):
                 checkpoint.main()
 
             payload = json.loads(parity.read_text(encoding="utf-8"))
+            result_payload = json.loads(result.read_text(encoding="utf-8"))
             self.assertFalse(curve.exists())
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["artifact_type"], "checkpoint_cv_oof_parity")
@@ -261,6 +311,17 @@ class CheckpointParityTests(unittest.TestCase):
             )
             self.assertFalse(
                 payload["training_parallelism"]["budget_externally_declared"]
+            )
+            self.assertEqual(
+                payload["capacitance_recovery"]["contract"],
+                "mft-capacitance-lc-inverse-v1",
+            )
+            self.assertEqual(
+                payload["capacitance_recovery"]["recovered_row_count"], 0
+            )
+            self.assertEqual(
+                result_payload["capacitance_recovery"],
+                payload["capacitance_recovery"],
             )
             self.assertEqual(set(payload["targets"]), {"Llt_phys"})
             self.assertEqual(
