@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import pickle
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -35,6 +36,7 @@ from training.checkpoint_train import (
     filter_valid_training_rows,
 )
 from training.model_quality_gate import evaluate_generation, evaluate_registry
+from training.capacitance_recovery_guard import CAPACITANCE_RECOVERY_CONTRACT
 from training.train_models import (
     capture_active_generation, promote_generation, registry_pointer_token,
     restore_active_generation,
@@ -892,15 +894,29 @@ class ModelQualityGateTests(unittest.TestCase):
             generation = os.path.join(registry, "generations", "run1")
             target_dir = os.path.join(generation, "Llt_phys")
             os.makedirs(target_dir)
-            Path(os.path.join(target_dir, "models.pkl")).write_bytes(b"model")
             metrics = {
                 "r2": 0.99,
                 "mape_pct": 1.0,
                 "interval_coverage": 0.90,
             }
+            recovery = {
+                "contract": CAPACITANCE_RECOVERY_CONTRACT,
+                "recovered_row_count": 3000,
+                "max_observed_abs_delta_F": 4.9e-11,
+            }
+            model_path = Path(target_dir, "models.pkl")
+            with model_path.open("wb") as handle:
+                pickle.dump({
+                    "training_run_id": "run1",
+                    "dataset_sha256": digest,
+                    "profile_sha256": "profile-sha",
+                    "capacitance_recovery": recovery,
+                }, handle)
             meta = {
                 "training_run_id": "run1",
                 "dataset_sha256": digest,
+                "profile_sha256": "profile-sha",
+                "capacitance_recovery": recovery,
                 "features": ["N1_main"],
                 "metrics": metrics,
             }
@@ -912,9 +928,14 @@ class ModelQualityGateTests(unittest.TestCase):
                 "dataset_sha256": digest,
                 "strict_full_rows": 3000,
                 "profile_sha256": "profile-sha",
+                "capacitance_recovery": recovery,
                 "features": ["N1_main"],
+                "targets": ["Llt_phys"],
+                "report": {"Llt_phys": metrics},
                 "artifacts": {
-                    "Llt_phys/models.pkl": hashlib.sha256(b"model").hexdigest(),
+                    "Llt_phys/models.pkl": hashlib.sha256(
+                        model_path.read_bytes()
+                    ).hexdigest(),
                     "Llt_phys/meta.json": hashlib.sha256(
                         json.dumps(meta).encode("utf-8")
                     ).hexdigest(),
@@ -954,38 +975,72 @@ class ModelQualityGateTests(unittest.TestCase):
             old = os.path.join(registry, "generations", "old")
             target_dir = Path(old, "Llt_phys")
             target_dir.mkdir(parents=True)
-            Path(target_dir, "models.pkl").write_bytes(b"old-model")
-            Path(target_dir, "meta.json").write_text("{}", encoding="utf-8")
             old_dataset = Path(tmp, "old-dataset.bin")
             old_dataset.write_bytes(b"dataset")
             old_dataset_sha256 = hashlib.sha256(b"dataset").hexdigest()
+            recovery = {
+                "contract": CAPACITANCE_RECOVERY_CONTRACT,
+                "recovered_row_count": 3000,
+                "max_observed_abs_delta_F": 4.9e-11,
+            }
+            metrics = {
+                "r2": 0.99,
+                "mape_pct": 1.0,
+                "interval_coverage": 0.90,
+            }
+            model_path = Path(target_dir, "models.pkl")
+            with model_path.open("wb") as handle:
+                pickle.dump({
+                    "training_run_id": "old",
+                    "dataset_sha256": old_dataset_sha256,
+                    "profile_sha256": "profile",
+                    "capacitance_recovery": recovery,
+                }, handle)
+            meta = {
+                "training_run_id": "old",
+                "dataset_sha256": old_dataset_sha256,
+                "profile_sha256": "profile",
+                "capacitance_recovery": recovery,
+                "features": ["N1_main"],
+                "metrics": metrics,
+            }
+            meta_path = Path(target_dir, "meta.json")
+            meta_path.write_text(json.dumps(meta), encoding="utf-8")
             report = {
                 "training_run_id": "old", "targets": ["Llt_phys"],
                 "dataset_sha256": old_dataset_sha256,
                 "profile_sha256": "profile",
-                "strict_full_rows": 3000, "report": {},
+                "strict_full_rows": 3000,
+                "capacitance_recovery": recovery,
+                "features": ["N1_main"],
+                "report": {"Llt_phys": metrics},
                 "artifacts": {
-                    "Llt_phys/models.pkl": hashlib.sha256(b"old-model").hexdigest(),
-                    "Llt_phys/meta.json": hashlib.sha256(b"{}").hexdigest(),
+                    "Llt_phys/models.pkl": hashlib.sha256(
+                        model_path.read_bytes()
+                    ).hexdigest(),
+                    "Llt_phys/meta.json": hashlib.sha256(
+                        meta_path.read_bytes()
+                    ).hexdigest(),
                 },
             }
             report_path = Path(old, "train_report.json")
             report_path.write_text(json.dumps(report), encoding="utf-8")
-            quality = {
-                "passed": True, "training_run_id": "old",
-                "dataset_sha256": old_dataset_sha256,
-                "profile_sha256": "profile",
-                "thresholds_sha256": "thresholds",
-                "generation": "generations/old",
-                "generation_report_sha256": hashlib.sha256(
-                    report_path.read_bytes()
-                ).hexdigest(),
+            thresholds = {
+                "minimum_strict_full_rows": 3000,
+                "minimum_interval_coverage": 0.85,
+                "targets": {
+                    "Llt_phys": {"min_r2": 0.98, "max_mape_pct": 2.0}
+                },
             }
+            quality = evaluate_generation(
+                registry, old, old_dataset, thresholds
+            )
+            self.assertTrue(quality["passed"], quality["reasons"])
             promote_generation(
                 registry, old, quality,
                 dataset=old_dataset,
                 profile_sha256="profile",
-                thresholds_sha256="thresholds",
+                thresholds_sha256=quality["thresholds_sha256"],
                 expected_pointer=registry_pointer_token(registry),
             )
             captured = capture_active_generation(registry)

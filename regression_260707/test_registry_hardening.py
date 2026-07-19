@@ -32,6 +32,9 @@ from training.checkpoint_contract import (  # noqa: E402
 )
 from training.model_quality_gate import evaluate_generation  # noqa: E402
 import training.train_models as train_models  # noqa: E402
+from training.capacitance_recovery_guard import (  # noqa: E402
+    CAPACITANCE_RECOVERY_CONTRACT,
+)
 from training.predictor import EnsemblePredictor  # noqa: E402
 from monitoring.readers import ArtifactService  # noqa: E402
 from pipeline.artifacts import GenerationStore  # noqa: E402
@@ -50,6 +53,14 @@ class ConstantModel:
 
 def _sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _recovery_evidence():
+    return {
+        "contract": CAPACITANCE_RECOVERY_CONTRACT,
+        "recovered_row_count": 3000,
+        "max_observed_abs_delta_F": 4.9e-11,
+    }
 
 
 def _candidate(
@@ -83,6 +94,8 @@ def _candidate(
         "metrics": metrics,
         "training_run_id": run_id,
         "dataset_sha256": dataset_sha256,
+        "profile_sha256": "profile-sha",
+        "capacitance_recovery": _recovery_evidence(),
         "source_dataset_path": str(source_dataset),
         "source_dataset_sha256": _sha256(source_dataset),
         "source_dataset_generation": source_identity,
@@ -100,6 +113,7 @@ def _candidate(
         "source_dataset_generation": source_identity,
         "profile_sha256": "profile-sha",
         "strict_full_rows": int(strict_full_rows),
+        "capacitance_recovery": _recovery_evidence(),
         "features": ["N1_main"],
         "targets": ["Llt_phys"],
         "report": {"Llt_phys": metrics},

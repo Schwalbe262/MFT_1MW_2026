@@ -28,6 +28,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATASET = os.path.join(HERE, "..", "data", "dataset", "train.parquet")
 REGISTRY = os.path.join(HERE, "registry")
 
+try:  # package import in tests; flat import in deployed training scripts
+    from .capacitance_recovery_guard import (
+        validate_generation_capacitance_recovery,
+    )
+except ImportError:  # pragma: no cover - exercised by deployed script mode
+    from capacitance_recovery_guard import (
+        validate_generation_capacitance_recovery,
+    )
+
 from checkpoint_train import (  # noqa: E402
     MAPE_ZERO_ABS_TOLERANCE,
     TARGETS,
@@ -592,6 +601,21 @@ def promote_generation(
             or report.get("profile_sha256") != profile_sha256
         ):
             raise RuntimeError("quality gate profile_sha256 mismatch")
+        recovery = validate_generation_capacitance_recovery(
+            record["generation"],
+            report,
+            dataset_sha256=dataset_sha256,
+            profile_sha256=profile_sha256,
+        )
+        if recovery.get("passed") is not True:
+            raise RuntimeError(
+                "capacitance recovery provenance rejected: "
+                + "; ".join(recovery.get("reasons") or ["unknown failure"])
+            )
+        if quality.get("capacitance_recovery") != recovery:
+            raise RuntimeError(
+                "quality gate capacitance recovery evidence mismatch"
+            )
         if (
             not isinstance(thresholds_sha256, str)
             or not thresholds_sha256

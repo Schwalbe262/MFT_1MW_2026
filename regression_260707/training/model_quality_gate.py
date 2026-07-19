@@ -10,6 +10,15 @@ import math
 import os
 import tempfile
 
+try:  # package import in tests; flat import in deployed training scripts
+    from .capacitance_recovery_guard import (
+        validate_generation_capacitance_recovery,
+    )
+except ImportError:  # pragma: no cover - exercised by deployed script mode
+    from capacitance_recovery_guard import (
+        validate_generation_capacitance_recovery,
+    )
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_REGISTRY = os.path.join(HERE, "registry")
@@ -92,6 +101,12 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
             "reasons": [f"registry_unavailable:{exc}"],
             "advisories": [],
             "targets": {},
+            "capacitance_recovery": {
+                "schema_version": 1,
+                "passed": False,
+                "reasons": ["generation_unavailable"],
+                "targets": {},
+            },
         }
 
     run_id = report.get("training_run_id")
@@ -133,6 +148,17 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
                 reasons.append(f"artifact_missing:{relative_path}")
             elif _sha256(artifact) != expected_sha256:
                 reasons.append(f"artifact_fingerprint_mismatch:{relative_path}")
+
+    recovery = validate_generation_capacitance_recovery(
+        generation,
+        report,
+        dataset_sha256=dataset_sha,
+        profile_sha256=report.get("profile_sha256"),
+    )
+    reasons.extend(
+        f"capacitance_recovery:{reason}"
+        for reason in recovery["reasons"]
+    )
     strict_rows = report.get("strict_full_rows")
     if not _finite(strict_rows) or int(strict_rows) < int(
         thresholds["minimum_strict_full_rows"]
@@ -234,6 +260,8 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
                 reasons.append("accepted_generation_path_mismatch")
             if accepted.get("generation_report_sha256") != report_sha256:
                 reasons.append("accepted_generation_report_mismatch")
+            if accepted.get("capacitance_recovery") != recovery:
+                reasons.append("accepted_capacitance_recovery_mismatch")
         except Exception as exc:
             reasons.append(f"acceptance_evidence_unavailable:{exc}")
 
@@ -249,6 +277,7 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
         "generation_report_sha256": report_sha256,
         "strict_full_rows": strict_rows,
         "targets": target_status,
+        "capacitance_recovery": recovery,
         "manufacturing_tolerance_policy": (
             "excluded; exact-as-FEA geometry is assumed"
         ),
