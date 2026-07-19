@@ -1,4 +1,6 @@
+import json
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -59,6 +61,192 @@ def _fake_optuna():
 
 
 class ModelThreadBudgetTests(unittest.TestCase):
+    @staticmethod
+    def _applied_recovery_audit():
+        return {
+            "contract": tune_optuna.CAPACITANCE_RECOVERY_CONTRACT,
+            "max_allowed_abs_delta_F": 5.1e-11,
+            "row_count": 7212,
+            "cap_enabled_row_count": 7212,
+            "eligible_row_count": 7212,
+            "recovered_row_count": 7212,
+            "max_observed_abs_delta_F": 4.999e-11,
+            "missing_columns": [],
+            "status": "applied",
+        }
+
+    def test_strict_loader_preserves_corrected_capacitance_audit(self):
+        exact = {
+            "C_tx_tx_F": 1.856789012345678e-10,
+            "C_rx_rx_F": 8.721234567890123e-10,
+            "C_tx_rx_F": 3.456789012345678e-10,
+        }
+        evidence = {
+            "C_tx_tx_F": ("f_res_tx_self_Hz", "cap_L_tx_self_H", 180e-6),
+            "C_rx_rx_F": ("f_res_rx_self_Hz", "cap_L_rx_self_H", 780e-6),
+            "C_tx_rx_F": (
+                "f_res_interwinding_Hz", "cap_L_leakage_H", 27.5e-6
+            ),
+        }
+        row = {"cap_on": 1, "full_model": 1}
+        for target, value in exact.items():
+            frequency, inductance, inductance_value = evidence[target]
+            row[target] = round(value / 1e-10) * 1e-10
+            row[inductance] = inductance_value
+            row[frequency] = 1.0 / (
+                2.0 * np.pi * np.sqrt(inductance_value * value)
+            )
+        raw = pd.DataFrame([row])
+
+        def annotate(frame, **_kwargs):
+            return frame.assign(_strict_valid_full=True)
+
+        with mock.patch.object(
+            tune_optuna.pd, "read_parquet", return_value=raw
+        ), mock.patch("quality_contract.annotate_validity", side_effect=annotate):
+            frame, strict_count = tune_optuna._load_strict_dataset("unused")
+
+        audit = tune_optuna.capacitance_recovery_audit(frame)
+        self.assertEqual(strict_count, 1)
+        self.assertEqual(audit["contract"], tune_optuna.CAPACITANCE_RECOVERY_CONTRACT)
+        self.assertEqual(audit["status"], "applied")
+        self.assertEqual(audit["recovered_row_count"], 1)
+        self.assertIsNotNone(audit["max_observed_abs_delta_F"])
+
+    def test_production_capacitance_gate_is_fail_closed(self):
+        jobs = [("C_tx_tx_F", "lightgbm")]
+        legacy = {
+            **self._applied_recovery_audit(),
+            "recovered_row_count": 0,
+            "max_observed_abs_delta_F": None,
+            "status": "evidence_unavailable_legacy_passthrough",
+        }
+        with self.assertRaisesRegex(RuntimeError, "requires applied corrected"):
+            tune_optuna._require_production_capacitance_recovery(
+                jobs, legacy, experimental=False
+            )
+
+        # Experimental HPO remains usable for legacy fixtures, and production
+        # jobs without a capacitance target are outside this recovery gate.
+        tune_optuna._require_production_capacitance_recovery(
+            jobs, legacy, experimental=True
+        )
+        tune_optuna._require_production_capacitance_recovery(
+            [("Llt_phys", "lightgbm")], legacy, experimental=False
+        )
+
+    def test_main_seals_recovery_audit_into_generation_metadata(self):
+        audit = self._applied_recovery_audit()
+        frame = pd.DataFrame({
+            "feature": [1.0],
+            "C_tx_tx_F": [1.8e-10],
+        })
+        frame.attrs[tune_optuna.CAPACITANCE_RECOVERY_ATTR] = audit
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "strict.parquet"
+            dataset.write_bytes(b"strict dataset")
+            result_json = root / "result.json"
+            argv = [
+                "tune_optuna.py",
+                "--target", "C_tx_tx_F",
+                "--family", "lightgbm",
+                "--trials", "1",
+                "--dataset", str(dataset),
+                "--artifact-root", str(root / "artifacts"),
+                "--result-json", str(result_json),
+            ]
+            published = {
+                "schema_version": 1,
+                "generation_id": "generation",
+                "generation_path": str(root / "generation"),
+                "params_path": str(root / "generation" / "params.json"),
+                "manifest_path": str(root / "generation" / "manifest.json"),
+            }
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                tune_optuna,
+                "_load_strict_dataset",
+                return_value=(frame, 4000),
+            ), mock.patch.object(
+                tune_optuna, "feature_columns", return_value=["feature"]
+            ), mock.patch.object(
+                tune_optuna,
+                "run_tuning_jobs",
+                return_value=(
+                    {"lightgbm": {"C_tx_tx_F": {"params": {}}}},
+                    [{
+                        "target": "C_tx_tx_F",
+                        "family": "lightgbm",
+                        "eligible_rows": 4000,
+                        "cv_mse_transformed": 0.0,
+                    }],
+                    1,
+                ),
+            ), mock.patch.object(
+                tune_optuna, "_publish_generation", return_value=published
+            ) as publish:
+                tune_optuna.main()
+
+        metadata = publish.call_args.args[2]
+        self.assertEqual(metadata["capacitance_recovery"], audit)
+
+    def test_main_rejects_uncorrected_production_capacitance_hpo(self):
+        frame = pd.DataFrame({
+            "feature": [1.0],
+            "C_tx_tx_F": [2e-10],
+        })
+        frame.attrs[tune_optuna.CAPACITANCE_RECOVERY_ATTR] = {
+            **self._applied_recovery_audit(),
+            "recovered_row_count": 0,
+            "max_observed_abs_delta_F": None,
+            "status": "evidence_unavailable_legacy_passthrough",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = Path(directory) / "strict.parquet"
+            dataset.write_bytes(b"legacy dataset")
+            argv = [
+                "tune_optuna.py",
+                "--target", "C_tx_tx_F",
+                "--family", "lightgbm",
+                "--trials", "1",
+                "--dataset", str(dataset),
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                tune_optuna,
+                "_load_strict_dataset",
+                return_value=(frame, 4000),
+            ), mock.patch.object(
+                tune_optuna, "feature_columns", return_value=["feature"]
+            ), mock.patch.object(tune_optuna, "run_tuning_jobs") as tuning:
+                with self.assertRaisesRegex(
+                    RuntimeError, "requires applied corrected"
+                ):
+                    tune_optuna.main()
+        tuning.assert_not_called()
+
+    def test_publish_result_and_manifest_seal_recovery_audit(self):
+        audit = self._applied_recovery_audit()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result_json = root / "result.json"
+            result = tune_optuna._publish_generation(
+                root / "artifacts",
+                {"lightgbm": {}},
+                {
+                    "dataset_sha256": "a" * 64,
+                    "capacitance_recovery": audit,
+                },
+                result_json=result_json,
+            )
+            manifest = json.loads(
+                Path(result["manifest_path"]).read_text(encoding="utf-8")
+            )
+            persisted_result = json.loads(result_json.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["metadata"]["capacitance_recovery"], audit)
+        self.assertEqual(result["capacitance_recovery"], audit)
+        self.assertEqual(persisted_result["capacitance_recovery"], audit)
+
     def test_every_model_family_receives_the_explicit_runtime_budget(self):
         expected_parameters = {
             "lightgbm": "n_jobs",

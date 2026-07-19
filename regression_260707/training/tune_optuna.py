@@ -51,6 +51,12 @@ from checkpoint_train import (  # noqa: E402
     to_physical,
     transform_y,
 )
+from campaign.train_io import (  # noqa: E402
+    CAPACITANCE_RECOVERY_ATTR,
+    CAPACITANCE_RECOVERY_CONTRACT,
+    capacitance_recovery_audit,
+)
+from model_targets import SURROGATE_CAPACITANCE_TARGETS  # noqa: E402
 from train_models import make_model  # noqa: E402
 
 
@@ -270,7 +276,63 @@ def _load_strict_dataset(path, solver_revision=None, library_revision=None):
         expected_library_revision=library_revision,
     )
     strict_count = int(audited["_strict_valid_full"].sum())
-    return to_physical(audited), strict_count
+    physical = to_physical(audited)
+    # Keep this provenance attached across the validity/physical conversion.
+    # The two-value return contract is intentionally preserved for legacy
+    # callers and unit fixtures.
+    physical.attrs[CAPACITANCE_RECOVERY_ATTR] = capacitance_recovery_audit(
+        physical
+    )
+    return physical, strict_count
+
+
+def _require_production_capacitance_recovery(
+    jobs, recovery_audit, *, experimental
+):
+    """Fail closed before production HPO consumes a capacitance target."""
+
+    capacitance_targets = sorted({
+        target
+        for target, _family in jobs
+        if target in SURROGATE_CAPACITANCE_TARGETS
+    })
+    if experimental or not capacitance_targets:
+        return
+
+    audit = recovery_audit if isinstance(recovery_audit, dict) else {}
+    recovered = audit.get("recovered_row_count")
+    observed_delta = audit.get("max_observed_abs_delta_F")
+    allowed_delta = audit.get("max_allowed_abs_delta_F")
+    valid_recovered_count = (
+        not isinstance(recovered, bool)
+        and isinstance(recovered, (int, np.integer))
+        and int(recovered) > 0
+    )
+    valid_observed_delta = (
+        not isinstance(observed_delta, bool)
+        and isinstance(observed_delta, (int, float, np.integer, np.floating))
+        and np.isfinite(float(observed_delta))
+        and float(observed_delta) >= 0.0
+    )
+    valid_allowed_delta = (
+        not isinstance(allowed_delta, bool)
+        and isinstance(allowed_delta, (int, float, np.integer, np.floating))
+        and np.isfinite(float(allowed_delta))
+        and float(allowed_delta) >= 0.0
+    )
+    if (
+        audit.get("contract") != CAPACITANCE_RECOVERY_CONTRACT
+        or audit.get("status") != "applied"
+        or not valid_recovered_count
+        or not valid_observed_delta
+        or not valid_allowed_delta
+        or float(observed_delta) > float(allowed_delta)
+    ):
+        raise RuntimeError(
+            "production capacitance HPO requires applied corrected recovery "
+            f"with recovered_row_count > 0: targets={capacitance_targets}, "
+            f"audit={audit}"
+        )
 
 
 def _publish_generation(
@@ -294,6 +356,10 @@ def _publish_generation(
         "params_path": str(generation.path / "params.json"),
         "manifest_path": str(generation.path / "manifest.json"),
     }
+    if "capacitance_recovery" in metadata:
+        result["capacitance_recovery"] = dict(
+            metadata["capacitance_recovery"]
+        )
     if result_json:
         _atomic_json(result, result_json)
     if legacy_output:
@@ -398,6 +464,7 @@ def main():
         args.solver_revision.lower() if args.solver_revision else None,
         args.library_revision.lower() if args.library_revision else None,
     )
+    recovery_audit = capacitance_recovery_audit(frame)
     if strict_count < args.min_strict_full_rows:
         raise SystemExit(
             f"Optuna requires >= {args.min_strict_full_rows} strict-full rows; "
@@ -418,6 +485,9 @@ def main():
             for target in TARGETS if target in frame.columns
             for family in FAMILIES
         ]
+    )
+    _require_production_capacitance_recovery(
+        jobs, recovery_audit, experimental=args.experimental
     )
     maximum_thread_budget = (
         args.max_model_thread_budget
@@ -446,6 +516,7 @@ def main():
         "fea_submission_approved": not args.experimental,
         "dataset_sha256": _sha256(dataset),
         "strict_full_rows": strict_count,
+        "capacitance_recovery": recovery_audit,
         "solver_revision": (
             args.solver_revision.lower() if args.solver_revision else None
         ),
