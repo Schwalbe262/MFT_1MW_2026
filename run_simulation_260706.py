@@ -86,6 +86,21 @@ import pandas as pd
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)
 
+# pandas defaults to 10 decimal places when serializing JSON.  That rounds
+# capacitances expressed in farads (typically 1e-10 to 1e-9 F) into visible
+# steps and can even turn smaller values into zero.  Fifteen is pandas' maximum
+# supported precision and keeps the RESULT_JSON transport faithful enough for
+# surrogate training while retaining pandas' datetime/NumPy handling.
+PANDAS_JSON_DOUBLE_PRECISION = 15
+
+
+def _series_to_json(series, *, date_format=None):
+    """Serialize one pandas row without quantizing sub-nF result fields."""
+    kwargs = {"double_precision": PANDAS_JSON_DOUBLE_PRECISION}
+    if date_format is not None:
+        kwargs["date_format"] = date_format
+    return series.to_json(**kwargs)
+
 import platform
 import csv
 
@@ -6649,7 +6664,9 @@ class Simulation():
             with FileLock(fallback_path + ".lock"):
                 with open(fallback_path, "a", encoding="utf-8", newline="\n") as stream:
                     for _, row in results_df.iterrows():
-                        stream.write(row.to_json(date_format="iso") + "\n")
+                        stream.write(
+                            _series_to_json(row, date_format="iso") + "\n"
+                        )
             logging.warning(
                 f"primary result sinks unavailable; saved JSONL fallback to {fallback_path}"
             )
@@ -6921,7 +6938,9 @@ def log_failed_sample(input_df, reason, filename="failed_samples_260706.jsonl"):
             if input_df.empty:
                 parameters = {}
             else:
-                parameters = json.loads(input_df.iloc[0].to_json(date_format="iso"))
+                parameters = json.loads(
+                    _series_to_json(input_df.iloc[0], date_format="iso")
+                )
         elif isinstance(input_df, dict):
             parameters = dict(input_df)
         else:
@@ -7643,7 +7662,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         # 스케줄러 stdout 회수용: 결과 1행을 JSON 한 줄로 즉시 스트리밍
         # (랜덤 모드도 포함 - 태스크 완주를 기다리지 않고 샘플 단위로 데이터 회수 가능)
         try:
-            d = json.loads(result.iloc[0].to_json())
+            d = json.loads(_series_to_json(result.iloc[0]))
             d.update(getattr(sim, "last_save_meta", {}))  # git_hash/project_name/saved_at (dedup 키)
             print("RESULT_JSON " + json.dumps(d), flush=True)
         except Exception as e:
