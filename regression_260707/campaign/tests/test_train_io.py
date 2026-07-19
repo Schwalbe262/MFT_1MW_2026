@@ -58,6 +58,9 @@ def raw_rows():
             "f_res_tx_self_Hz": 20_000.0,
             "f_res_rx_self_Hz": 8_000.0,
             "f_res_interwinding_Hz": 1_300_000.0,
+            "cap_L_tx_self_H": 0.004221715985097407,
+            "cap_L_rx_self_H": 0.3957858736028819,
+            "cap_L_leakage_H": 3.747085193873438e-05,
             "winding_flux_linkage_readback_status": "unavailable",
             "winding_flux_linkage_readback_applicable": 0,
             "winding_flux_linkage_readback_available": 0,
@@ -161,9 +164,9 @@ class TrainIoBuilderTests(unittest.TestCase):
         )
         self.assertEqual(view["thermal_core_k_inplane"].tolist(), [7.68, 2.0])
         self.assertEqual(view["P_winding_total"].tolist(), [4000.0, 4100.0])
-        self.assertEqual(view.loc[0, "C_tx_tx_F"], 1.5e-8)
-        self.assertEqual(view.loc[0, "C_rx_rx_F"], 1.0e-9)
-        self.assertEqual(view.loc[0, "C_tx_rx_F"], 4.0e-10)
+        self.assertAlmostEqual(view.loc[0, "C_tx_tx_F"], 1.5e-8, 22)
+        self.assertAlmostEqual(view.loc[0, "C_rx_rx_F"], 1.0e-9, 22)
+        self.assertAlmostEqual(view.loc[0, "C_tx_rx_F"], 4.0e-10, 22)
         self.assertEqual(view.loc[0, "f_res_tx_self_Hz"], 20_000.0)
         self.assertEqual(view.loc[0, "f_res_rx_self_Hz"], 8_000.0)
         self.assertEqual(view.loc[0, "f_res_interwinding_Hz"], 1_300_000.0)

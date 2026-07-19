@@ -428,10 +428,20 @@ def recover_quantized_capacitance_targets(frame: pd.DataFrame) -> pd.DataFrame:
         raise TypeError("frame must be a pandas DataFrame")
 
     out = frame.copy()
-    required = {"cap_on"}
+    evidence_columns = set()
     for target, frequency, inductance in CAPACITANCE_RECOVERY_SPECS:
-        required.update((target, frequency, inductance))
+        evidence_columns.update((target, frequency, inductance))
+    required = {"cap_on", *evidence_columns}
     missing = tuple(sorted(required.difference(out.columns)))
+    present_evidence = tuple(sorted(evidence_columns.intersection(out.columns)))
+    legacy_passthrough = not present_evidence
+    if not legacy_passthrough and missing:
+        raise ValueError(
+            "partial capacitance recovery schema: "
+            f"present_evidence={list(present_evidence)}, "
+            f"missing={list(missing)}, "
+            f"contract={CAPACITANCE_RECOVERY_CONTRACT}"
+        )
 
     recovered_flag = pd.Series(0, index=out.index, dtype="int8")
     recovery_required = pd.Series(0, index=out.index, dtype="int8")
@@ -446,10 +456,13 @@ def recover_quantized_capacitance_targets(frame: pd.DataFrame) -> pd.DataFrame:
         "recovered_row_count": 0,
         "max_observed_abs_delta_F": None,
         "missing_columns": list(missing),
-        "status": "columns_unavailable_passthrough" if missing else "applied",
+        "status": (
+            "evidence_unavailable_legacy_passthrough"
+            if legacy_passthrough else "applied"
+        ),
     }
 
-    if not missing and len(out):
+    if not legacy_passthrough and len(out):
         cap_enabled = pd.to_numeric(out["cap_on"], errors="coerce").eq(1)
         recovery_required.loc[cap_enabled] = 1
         audit["cap_enabled_row_count"] = int(cap_enabled.sum())

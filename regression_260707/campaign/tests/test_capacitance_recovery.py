@@ -80,7 +80,7 @@ class CapacitanceRecoveryTests(unittest.TestCase):
                 pd.DataFrame([row])
             )
 
-    def test_missing_lc_columns_preserves_legacy_values(self):
+    def test_partial_target_only_schema_fails_closed(self):
         raw = pd.DataFrame({
             "cap_on": [1],
             "C_tx_tx_F": [1.5e-8],
@@ -88,13 +88,25 @@ class CapacitanceRecoveryTests(unittest.TestCase):
             "C_tx_rx_F": [4.0e-10],
         })
 
+        with self.assertRaisesRegex(ValueError, "partial capacitance recovery schema"):
+            train_io.recover_quantized_capacitance_targets(raw)
+
+    def test_one_lc_evidence_column_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "partial capacitance recovery schema"):
+            train_io.recover_quantized_capacitance_targets(pd.DataFrame({
+                "cap_on": [1],
+                "cap_L_tx_self_H": [180e-6],
+            }))
+
+    def test_no_capacitance_evidence_preserves_legacy_frame(self):
+        raw = pd.DataFrame({"cap_on": [0], "Llt": [13.75]})
+
         recovered = train_io.recover_quantized_capacitance_targets(raw)
 
-        for target, _, _ in SPECS:
-            self.assertEqual(recovered.loc[0, target], raw.loc[0, target])
+        self.assertEqual(recovered.loc[0, "Llt"], raw.loc[0, "Llt"])
         self.assertEqual(
             recovered.attrs[train_io.CAPACITANCE_RECOVERY_ATTR]["status"],
-            "columns_unavailable_passthrough",
+            "evidence_unavailable_legacy_passthrough",
         )
         self.assertEqual(
             recovered.loc[0, "capacitance_recovered_from_resonance"], 0
