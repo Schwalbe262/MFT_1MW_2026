@@ -113,7 +113,14 @@ preflight = {
     "offspring_physics_repair": True,
     "initial_repair_attested": True,
     "warm_repair_attested": True,
-    "every_offspring_decode_repair_attested": True,
+    "offspring_repair_operator_installed": True,
+    "offspring_repair_operator_contract_sha256": (
+        args.optimizer_repair_contract_sha256
+    ),
+    "offspring_repair_execution_status": (
+        "deferred_until_optimizer_execution"
+    ),
+    "every_offspring_decode_repair_attested": False,
     "terminal_physical_replay_required": True,
     "legacy_feedback_wrapper_used": False,
     "local_adapter_authentication_replayed": False,
@@ -124,8 +131,31 @@ preflight = {
     "aedt_used": False,
     "automatic_promotion_allowed": False,
 }
+preflight["payload_sha256"] = canonical(preflight)
 Path(args.remote_preflight).write_text(json.dumps(preflight))
 time.sleep(0.1)
+hard_spec = {
+    "Llt_target_uH": 27.5,
+    "Llt_tol_uH": 0.55,
+    "T_limit_C": 110.0,
+    "B_limit_T": 1.2,
+    "insulation_min_mm": 40.0,
+    "n_core_group_max": 4,
+    "primary_conductor_thickness_mm": 5.0,
+    "resonance_min_Hz": 15000.0,
+    "size_W_max_mm": 1200.0,
+    "size_L_max_mm": 1200.0,
+    "size_H_max_mm": 750.0,
+}
+dummy_artifact = Path(args.output, "dummy.bin")
+dummy_artifact.write_bytes(b"sealed-current7-dummy")
+artifact_inventory = {
+    "dummy": {
+        "path": dummy_artifact.name,
+        "sha256": hashlib.sha256(dummy_artifact.read_bytes()).hexdigest(),
+        "size_bytes": dummy_artifact.stat().st_size,
+    }
+}
 result = {
     "schema_version": "mft-tier1-current7-search-seed-v1",
     "bundle_id": args.bundle_id,
@@ -147,6 +177,11 @@ result = {
     "hard_constraint_contract_sha256": identity[
         "hard_constraint_contract_sha256"
     ],
+    "hard_spec": hard_spec,
+    "stage_spec_sha256": canonical(hard_spec),
+    "constraint_version": (
+        "1200x1200x750-res15k-t110-core4-cw1-5-lmhalf"
+    ),
     "island_profile_sha256": args.island_profile_sha256,
     "warm_artifact_sha256": hashlib.sha256(
         Path(args.warm_start).read_bytes()
@@ -167,6 +202,10 @@ result = {
     "initial_population_repair_attested": True,
     "warm_start_repair_attested": True,
     "every_offspring_decode_repair_attested": True,
+    "offspring_repair_operator_call_count": int(args.max_generations),
+    "offspring_repair_operator_row_count": (
+        int(args.population) * int(args.max_generations)
+    ),
     "terminal_physical_replay_attested": True,
     "optimizer_repair_contract_sha256": args.optimizer_repair_contract_sha256,
     "optimizer_topology_evolution_audit": {
@@ -176,6 +215,8 @@ result = {
         "terminal_epsilon_zero": True,
         "all_required_topologies_preserved": True,
     },
+    "artifact_inventory": artifact_inventory,
+    "artifact_inventory_sha256": canonical(artifact_inventory),
     "feasible_pareto_count": 0,
     "production_eligible": False,
     "fea_submission_approved": False,
@@ -183,6 +224,7 @@ result = {
     "aedt_used": False,
     "automatic_promotion_allowed": False,
 }
+result["payload_sha256"] = canonical(result)
 Path(args.output, "result.json").write_text(json.dumps(result))
 """.lstrip()
 

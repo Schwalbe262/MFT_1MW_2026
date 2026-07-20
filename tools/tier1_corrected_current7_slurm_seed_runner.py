@@ -368,6 +368,12 @@ def _process_rss_bytes(pid: int) -> int | None:
     return None
 
 
+def _payload_sha_matches(value: Mapping[str, Any]) -> bool:
+    expected = value.get("payload_sha256")
+    unsigned = {key: item for key, item in value.items() if key != "payload_sha256"}
+    return isinstance(expected, str) and expected == canonical_sha256(unsigned)
+
+
 def validate_remote_preflight(
     value: Mapping[str, Any],
     *,
@@ -383,6 +389,7 @@ def validate_remote_preflight(
     observed_rss = max(reported_rss, live_rss or 0)
     if (
         value.get("schema_version") != REMOTE_PREFLIGHT_SCHEMA
+        or not _payload_sha_matches(value)
         or value.get("status") != "passed"
         or value.get("bundle_id") != payload["bundle_id"]
         or value.get("seed") != payload["seed"]
@@ -422,7 +429,12 @@ def validate_remote_preflight(
         or value.get("offspring_physics_repair") is not True
         or value.get("initial_repair_attested") is not True
         or value.get("warm_repair_attested") is not True
-        or value.get("every_offspring_decode_repair_attested") is not True
+        or value.get("offspring_repair_operator_installed") is not True
+        or value.get("offspring_repair_operator_contract_sha256")
+        != payload["optimizer_repair_contract_sha256"]
+        or value.get("offspring_repair_execution_status")
+        != "deferred_until_optimizer_execution"
+        or value.get("every_offspring_decode_repair_attested") is not False
         or value.get("terminal_physical_replay_required") is not True
         or value.get("legacy_feedback_wrapper_used") is not False
         or value.get("local_adapter_authentication_replayed") is not False
@@ -451,8 +463,12 @@ def validate_result(
         for target in CURRENT_TEMPERATURE_TARGETS
     ]
     topology = result.get("optimizer_topology_evolution_audit") or {}
+    hard_spec = result.get("hard_spec")
+    artifact_inventory = result.get("artifact_inventory")
+    constraint_names = result.get("constraint_names")
     if (
         result.get("schema_version") != RESULT_SCHEMA
+        or not _payload_sha_matches(result)
         or result.get("bundle_id") != payload["bundle_id"]
         or result.get("seed") != payload["seed"]
         or result.get("island_id") != lane["island_id"]
@@ -473,6 +489,30 @@ def validate_result(
         != payload["temperature_contract_sha256"]
         or result.get("hard_constraint_contract_sha256")
         != payload["hard_constraint_contract_sha256"]
+        or not isinstance(hard_spec, dict)
+        or not hard_spec
+        or result.get("stage_spec_sha256") != canonical_sha256(hard_spec)
+        or not isinstance(result.get("constraint_version"), str)
+        or not result.get("constraint_version")
+        or not isinstance(constraint_names, list)
+        or not constraint_names
+        or any(not isinstance(name, str) or not name for name in constraint_names)
+        or len(constraint_names) != len(set(constraint_names))
+        or not isinstance(artifact_inventory, dict)
+        or not artifact_inventory
+        or result.get("artifact_inventory_sha256")
+        != canonical_sha256(artifact_inventory)
+        or any(
+            not isinstance(record, dict)
+            or not isinstance(record.get("path"), str)
+            or not record.get("path")
+            or not isinstance(record.get("sha256"), str)
+            or len(record["sha256"]) != 64
+            or isinstance(record.get("size_bytes"), bool)
+            or not isinstance(record.get("size_bytes"), int)
+            or record["size_bytes"] <= 0
+            for record in artifact_inventory.values()
+        )
         or result.get("island_profile_sha256")
         != payload["island_profile_sha256"]
         or result.get("warm_artifact_sha256")
@@ -489,6 +529,13 @@ def validate_result(
         or result.get("initial_population_repair_attested") is not True
         or result.get("warm_start_repair_attested") is not True
         or result.get("every_offspring_decode_repair_attested") is not True
+        or isinstance(result.get("offspring_repair_operator_call_count"), bool)
+        or not isinstance(result.get("offspring_repair_operator_call_count"), int)
+        or result.get("offspring_repair_operator_call_count")
+        < payload["max_generations"]
+        or isinstance(result.get("offspring_repair_operator_row_count"), bool)
+        or not isinstance(result.get("offspring_repair_operator_row_count"), int)
+        or result.get("offspring_repair_operator_row_count") <= 0
         or result.get("terminal_physical_replay_attested") is not True
         or result.get("optimizer_repair_contract_sha256")
         != payload["optimizer_repair_contract_sha256"]
