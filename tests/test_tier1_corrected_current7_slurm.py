@@ -10,6 +10,8 @@ import pytest
 
 from tools import tier1_corrected_current7_receipt as receipt_contract
 from tools import tier1_corrected_current7_slurm_bundle as bundle_tool
+from tools import tier1_corrected_current7_slurm_controller as controller
+from tools import tier1_corrected_current7_slurm_publish as publisher
 from tools import tier1_corrected_current7_slurm_seed_runner as runner
 
 
@@ -28,7 +30,7 @@ def _sha(path: Path) -> str:
 
 
 def _fake_search_source() -> str:
-    return r'''
+    return r"""
 import argparse
 import hashlib
 import json
@@ -182,7 +184,7 @@ result = {
     "automatic_promotion_allowed": False,
 }
 Path(args.output, "result.json").write_text(json.dumps(result))
-'''.lstrip()
+""".lstrip()
 
 
 def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
@@ -192,9 +194,7 @@ def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
     generation.mkdir(parents=True)
     artifact_hashes = {}
     artifact_sizes = {}
-    for index, relative in enumerate(
-        receipt_contract.expected_generation_artifacts()
-    ):
+    for index, relative in enumerate(receipt_contract.expected_generation_artifacts()):
         path = generation / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(f"artifact-{index}-{relative}".encode())
@@ -265,13 +265,9 @@ def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
             "guard_target_count": 21,
             "guard_passed_target_count": 21,
         },
-        "generation_targets": list(
-            receipt_contract.CORRECTED_GENERATION_TARGETS
-        ),
+        "generation_targets": list(receipt_contract.CORRECTED_GENERATION_TARGETS),
         "generation_target_count": 21,
-        "required_model_targets": list(
-            receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS
-        ),
+        "required_model_targets": list(receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS),
         "required_model_targets_sha256": (
             receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS_SHA256
         ),
@@ -390,9 +386,7 @@ def _plan(tmp_path: Path, *, repair_ready: bool = True):
     return fixture, plan, manifest
 
 
-def _local_publish(
-    tmp_path: Path, fixture: dict, plan: dict, manifest: dict
-) -> Path:
+def _local_publish(tmp_path: Path, fixture: dict, plan: dict, manifest: dict) -> Path:
     bundle = tmp_path / "published" / manifest["bundle_id"]
     bundle.mkdir(parents=True)
     source_map = json.loads(Path(plan["local_sources"]).read_text())
@@ -411,9 +405,7 @@ def _local_publish(
             "every_file_sha256_verified": True,
             "runtime_verified": True,
             "code_inventory_sha256": manifest["code_inventory_sha256"],
-            "relocation_contract_sha256": manifest["relocation"][
-                "contract_sha256"
-            ],
+            "relocation_contract_sha256": manifest["relocation"]["contract_sha256"],
             "remote_git_checkout_performed": False,
         },
     )
@@ -447,12 +439,8 @@ def test_actual_first_smoke_receipt_shape_is_authenticated_but_launch_blocked(
         "launch_eligible": False,
     }
     value["model_loading"] = {
-        "required_targets": list(
-            receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS
-        ),
-        "required_targets_sha256": old_loading[
-            "loaded_model_targets_sha256"
-        ],
+        "required_targets": list(receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS),
+        "required_targets_sha256": old_loading["loaded_model_targets_sha256"],
         "loaded_target_count": old_loading["loaded_model_count"],
         "cache_load_calls": old_loading["load_calls"],
         "full_generation_authentication_passes": old_loading[
@@ -495,12 +483,10 @@ def test_bundle_is_content_addressed_and_relocates_absolute_paths(tmp_path):
     assert manifest["remote_git_checkout_required"] is False
     assert manifest["bundle_code_revision"] == "9" * 40
     assert manifest["scheduler_api_contract"]["endpoint_path"] == "/api/tasks"
-    assert manifest["scheduler_api_contract"][
-        "requested_allocation_id_allowed"
-    ] is False
-    assert manifest["scheduler_api_contract"][
-        "scheduler_submission_performed"
-    ] is False
+    assert (
+        manifest["scheduler_api_contract"]["requested_allocation_id_allowed"] is False
+    )
+    assert manifest["scheduler_api_contract"]["scheduler_submission_performed"] is False
     assert all(
         not relative.endswith("tier1_slurm_seed_runner.py")
         for relative in manifest["code_inventory"]
@@ -551,6 +537,7 @@ def test_task_waves_are_4_plus_32_and_use_requested_resources(tmp_path):
         assert task["priority"] == 0
         assert task["payload_json"]["optimizer_processes"] == 1
         assert task["payload_json"]["offspring_physics_repair"] is True
+        assert "$PWD/artifacts/python-site" in task["command"]
         assert "tier1_corrected_current7_slurm_seed_runner.py" in task["command"]
         assert "tier1_slurm_seed_runner.py" not in task["command"]
 
@@ -645,9 +632,7 @@ def test_hash_chained_ledger_refills_open_ended_24_4_4_4_quotas(tmp_path):
         )
         for island_id in manifest["open_ended_refill"]["island_active_quotas"]
     }
-    assert active_counts == manifest["open_ended_refill"][
-        "island_active_quotas"
-    ]
+    assert active_counts == manifest["open_ended_refill"]["island_active_quotas"]
 
     stopped = bundle_tool.seal_seed_ledger(
         manifest,
@@ -686,9 +671,12 @@ def test_remote_runner_verifies_relocation_and_completes_fake_seed(
     assert relocation["source_absolute_paths_are_documentary_only"] is True
 
     monkeypatch.setenv("SLURM_SCHED_TASK_ID", "local-smoke-1")
-    assert runner.run(
-        bundle, payload_path, payload_root, payload_sha, heartbeat_seconds=0.02
-    ) == 0
+    assert (
+        runner.run(
+            bundle, payload_path, payload_root, payload_sha, heartbeat_seconds=0.02
+        )
+        == 0
+    )
     status = json.loads(
         (bundle / "runs" / "task-local-smoke-1" / "seed_status.json").read_text()
     )
@@ -725,3 +713,476 @@ def test_remote_runner_rejects_relocated_artifact_tamper(tmp_path, monkeypatch):
             payload_root,
             receipt_contract.canonical_sha256(payload),
         )
+
+
+class _FakePublicationTransport:
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+        self.dirs: set[str] = {"/"}
+        self.write_count = 0
+        self.operations: list[tuple[str, str]] = []
+        self.file_writes: list[str] = []
+        self.fail_after: int | None = None
+
+    def _write(self, operation: str, path: str) -> None:
+        if self.fail_after is not None and self.write_count >= self.fail_after:
+            raise RuntimeError("injected publication interruption")
+        self.write_count += 1
+        self.operations.append((operation, path))
+
+    def exists(self, path: str) -> bool:
+        return path in self.files or path in self.dirs
+
+    def is_dir(self, path: str) -> bool:
+        return path in self.dirs
+
+    def read_bytes(self, path: str) -> bytes:
+        return self.files[path]
+
+    def mkdir(self, path: str, mode: int = 0o755) -> None:
+        if path in self.dirs:
+            return
+        self._write(f"mkdir:{mode:o}", path)
+        pieces = path.rstrip("/").split("/")
+        for index in range(1, len(pieces) + 1):
+            value = "/".join(pieces[:index]) or "/"
+            if path.startswith("/"):
+                value = "/" + value.lstrip("/")
+            self.dirs.add(value)
+
+    def upload_file(self, local: Path, remote: str) -> None:
+        self._write("upload", remote)
+        self.files[remote] = local.read_bytes()
+        self.file_writes.append(remote)
+
+    def write_bytes(self, path: str, value: bytes) -> None:
+        self._write("write", path)
+        self.files[path] = bytes(value)
+        self.file_writes.append(path)
+
+    def replace(self, source: str, destination: str) -> None:
+        self._write("replace", destination)
+        self.files[destination] = self.files.pop(source)
+
+    def file_record(self, path: str):
+        value = self.files.get(path)
+        if value is None:
+            return None
+        return {
+            "size": len(value),
+            "sha256": hashlib.sha256(value).hexdigest(),
+        }
+
+    def verify_runtime(
+        self,
+        root: str,
+        *,
+        requirements_relative: str,
+        expected_packages: dict[str, str],
+    ):
+        assert requirements_relative == "artifacts/runtime/requirements.lock"
+        self._write("runtime", root)
+        return dict(expected_packages)
+
+    def seal_permissions(self, root: str) -> None:
+        self._write("seal", root)
+
+    def promote_directory(self, incoming: str, destination: str) -> None:
+        self._write("promote", destination)
+        moved_files = {
+            destination + path.removeprefix(incoming): value
+            for path, value in self.files.items()
+            if path == incoming or path.startswith(incoming + "/")
+        }
+        for path in list(self.files):
+            if path == incoming or path.startswith(incoming + "/"):
+                del self.files[path]
+        moved_dirs = {
+            destination + path.removeprefix(incoming)
+            for path in self.dirs
+            if path == incoming or path.startswith(incoming + "/")
+        }
+        self.dirs = {
+            path
+            for path in self.dirs
+            if path != incoming and not path.startswith(incoming + "/")
+        }
+        self.files.update(moved_files)
+        self.dirs.update(moved_dirs)
+
+
+class _FakeScheduler:
+    def __init__(self):
+        self.post_count = 0
+        self.next_id = 1000
+        self.tasks: dict[int, dict] = {}
+        self.by_dedupe: dict[str, int] = {}
+        self.seed_statuses: dict[int, dict] = {}
+        self.crash_after_create_once = False
+
+    def find_task_by_dedupe(self, dedupe_key: str):
+        task_id = self.by_dedupe.get(dedupe_key)
+        return None if task_id is None else dict(self.tasks[task_id])
+
+    def submit_task(self, payload):
+        dedupe = payload["dedupe_key"]
+        assert "requested_allocation_id" not in payload
+        if dedupe in self.by_dedupe:
+            return dict(self.tasks[self.by_dedupe[dedupe]])
+        task_id = self.next_id
+        self.next_id += 1
+        task = {
+            **copy.deepcopy(dict(payload)),
+            "id": task_id,
+            "task_id": task_id,
+            "status": "queued",
+        }
+        self.tasks[task_id] = task
+        self.by_dedupe[dedupe] = task_id
+        self.post_count += 1
+        if self.crash_after_create_once:
+            self.crash_after_create_once = False
+            raise RuntimeError("injected post-response interruption")
+        return dict(task)
+
+    def get_task(self, task_id: int):
+        value = self.tasks.get(task_id)
+        return None if value is None else dict(value)
+
+    def read_seed_status(self, task_id: int):
+        value = self.seed_statuses.get(task_id)
+        return None if value is None else dict(value)
+
+
+def _published_fixture(tmp_path: Path):
+    fixture, plan, manifest = _plan(tmp_path)
+    remote = _FakePublicationTransport()
+    plan_path = Path(plan["bundle_manifest"]).parent / "offload_plan.json"
+    publication = publisher.publish_bundle(plan_path, apply=True, transport=remote)
+    return fixture, plan, manifest, plan_path, remote, publication
+
+
+def _pass_canary_gates(scheduler: _FakeScheduler, manifest: dict) -> None:
+    for lane in manifest["fast_ramp"]["canaries"]:
+        matching = [
+            task
+            for task in scheduler.tasks.values()
+            if task["payload_json"]["seed"] == lane["seed"]
+        ]
+        assert len(matching) == 1
+        task = matching[0]
+        scheduler.seed_statuses[task["id"]] = {
+            "schema_version": bundle_tool.STATUS_SCHEMA,
+            "bundle_id": manifest["bundle_id"],
+            "seed": lane["seed"],
+            "island_id": lane["island_id"],
+            "ramp_gate_passed": True,
+            "optimizer_processes": 1,
+            "inference_threads": 8,
+            "loaded_model_count": 20,
+            "full_generation_authentication_passes": 1,
+            "authenticated_artifact_count": 42,
+            "observed_peak_rss_bytes": 20 * 1024**3,
+            "optimizer_started": True,
+            "terminal": False,
+        }
+
+
+def test_publisher_dry_run_write_zero_and_interrupted_apply_resumes_ready_last(
+    tmp_path,
+):
+    _fixture_value, plan, manifest = _plan(tmp_path)
+    plan_path = Path(plan["bundle_manifest"]).parent / "offload_plan.json"
+    remote = _FakePublicationTransport()
+    dry = publisher.publish_bundle(plan_path, apply=False, transport=remote)
+    assert dry["publication_complete"] is False
+    assert dry["remote_write_performed"] is False
+    assert remote.write_count == 0
+
+    remote.fail_after = 12
+    with pytest.raises(RuntimeError, match="interruption"):
+        publisher.publish_bundle(plan_path, apply=True, transport=remote)
+    assert not remote.exists(plan["remote_bundle"] + "/READY.json")
+    partial_count = sum(
+        remote.file_record(dry["incoming_bundle"] + "/" + relative) == expected
+        for relative, expected in manifest["files"].items()
+    )
+    assert partial_count > 0
+
+    remote.fail_after = None
+    receipt = publisher.publish_bundle(plan_path, apply=True, transport=remote)
+    assert receipt["publication_complete"] is True
+    assert receipt["resumed_files"] >= partial_count
+    assert remote.exists(plan["remote_bundle"] + "/READY.json")
+    assert remote.file_writes[-1].endswith("/READY.json")
+    assert remote.operations[-1] == ("promote", plan["remote_bundle"])
+    ready = receipt["ready"]
+    assert ready["every_file_sha256_verified"] is True
+    assert ready["code_inventory_sha256"] == manifest["code_inventory_sha256"]
+    assert (
+        ready["relocation_contract_sha256"] == manifest["relocation"]["contract_sha256"]
+    )
+    assert ready["remote_git_checkout_performed"] is False
+
+    before = remote.write_count
+    repeated = publisher.publish_bundle(plan_path, apply=True, transport=remote)
+    assert repeated["already_ready"] is True
+    assert remote.write_count == before
+
+
+def test_publisher_ready_and_pinned_site_satisfy_remote_runner_contract(
+    tmp_path, monkeypatch
+):
+    _fixture_value, plan, manifest, _plan_path, remote, _publication = (
+        _published_fixture(tmp_path)
+    )
+    remote_prefix = plan["remote_bundle"] + "/"
+    local_bundle = tmp_path / "publisher-materialized"
+    for path, value in remote.files.items():
+        if not path.startswith(remote_prefix):
+            continue
+        destination = local_bundle / path.removeprefix(remote_prefix)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(value)
+    task = bundle_tool.build_task_waves(plan, manifest)["canaries"][0]
+    payload = task["payload_json"]
+    payload_root = tmp_path / "scheduler-runs"
+    payload_path = payload_root / "task-51" / "payload.json"
+    _write_json(payload_path, payload)
+    monkeypatch.setattr(
+        runner.importlib.metadata,
+        "version",
+        lambda name: manifest["runtime"]["critical_packages"][name],
+    )
+    verified, observed_manifest, _relocation = runner.verify_payload(
+        local_bundle,
+        payload_path,
+        payload_root,
+        receipt_contract.canonical_sha256(payload),
+    )
+    assert verified == payload
+    assert observed_manifest["bundle_id"] == manifest["bundle_id"]
+    assert "$PWD/artifacts/python-site" in task["command"]
+
+
+def test_controller_dry_run_has_zero_local_and_scheduler_writes(tmp_path):
+    _fixture_value, plan, _manifest, plan_path, remote, publication = (
+        _published_fixture(tmp_path)
+    )
+    scheduler = _FakeScheduler()
+    state_path = tmp_path / "controller.json"
+    result = controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=False,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+    )
+    assert result["scheduler_post_count"] == 0
+    assert result["state_writes"] == 0
+    assert not state_path.exists()
+    assert scheduler.post_count == 0
+    assert sum(action["action"] == "would_submit" for action in result["actions"]) == 4
+    assert plan["submission_performed"] is False
+
+
+def test_controller_rejects_repair_false_before_any_write(tmp_path):
+    _fixture_value, plan, _manifest = _plan(tmp_path, repair_ready=False)
+    plan_path = Path(plan["bundle_manifest"]).parent / "offload_plan.json"
+    scheduler = _FakeScheduler()
+    with pytest.raises(RuntimeError, match="repair=true"):
+        controller.control_once(
+            plan_path,
+            {},
+            state_path=tmp_path / "blocked.json",
+            apply=True,
+            scheduler=scheduler,
+        )
+    assert scheduler.post_count == 0
+    assert not (tmp_path / "blocked.json").exists()
+
+
+def test_controller_recovers_post_crash_then_releases_exact_32_once(tmp_path):
+    _fixture_value, _plan_value, manifest, plan_path, remote, publication = (
+        _published_fixture(tmp_path)
+    )
+    scheduler = _FakeScheduler()
+    scheduler.crash_after_create_once = True
+    state_path = tmp_path / "controller.json"
+    with pytest.raises(RuntimeError, match="post-response"):
+        controller.control_once(
+            plan_path,
+            publication,
+            state_path=state_path,
+            apply=True,
+            scheduler=scheduler,
+            ready_probe=controller.TransportReadyProbe(remote),
+        )
+    assert scheduler.post_count == 1
+    assert len(scheduler.tasks) == 1
+
+    held = controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+    )
+    assert held["submission_count"] == 4
+    assert scheduler.post_count == 4
+    assert held["ramp_released"] is False
+
+    _pass_canary_gates(scheduler, manifest)
+    released = controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+    )
+    assert released["ramp_released"] is True
+    assert released["submission_count"] == 36
+    assert scheduler.post_count == 36
+    assert (
+        sum(
+            action["action"] == "submitted" and action["wave"] == "ramp"
+            for action in released["actions"]
+        )
+        == 32
+    )
+
+    repeated = controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+    )
+    assert repeated["submission_count"] == 36
+    assert scheduler.post_count == 36
+
+
+def test_controller_refills_each_terminal_island_gap_without_duplicates(tmp_path):
+    _fixture_value, _plan_value, manifest, plan_path, remote, publication = (
+        _published_fixture(tmp_path)
+    )
+    scheduler = _FakeScheduler()
+    state_path = tmp_path / "controller.json"
+    controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+    )
+    _pass_canary_gates(scheduler, manifest)
+    controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+    )
+    assert scheduler.post_count == 36
+    for island_id in manifest["open_ended_refill"]["island_active_quotas"]:
+        matching = [
+            task
+            for task in scheduler.tasks.values()
+            if task["payload_json"]["lane"]["island_id"] == island_id
+        ]
+        scheduler.tasks[matching[0]["id"]]["status"] = "completed"
+    result = controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+    )
+    assert scheduler.post_count == 40
+    assert result["submission_count"] == 40
+    assert result["ledger_active_count"] == 36
+    assert result["ledger_terminal_count"] == 4
+    assert len(scheduler.by_dedupe) == 40
+
+    repeated = controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+    )
+    assert scheduler.post_count == 40
+    assert repeated["ledger_active_count"] == 36
+
+    # Even with fresh terminal gaps available, the explicit stop is sealed
+    # before the controller can reserve or POST another refill.
+    refill_tasks = [
+        task
+        for task in scheduler.tasks.values()
+        if task["payload_json"]["lane"]["wave"] == "refill"
+    ]
+    assert len(refill_tasks) == 4
+    for task in refill_tasks:
+        scheduler.tasks[task["id"]]["status"] = "completed"
+    stopped = controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+        request_stop=True,
+    )
+    assert stopped["stop_requested"] is True
+    assert scheduler.post_count == 40
+
+
+def test_controller_stop_flag_precedes_canary_or_refill_submission(tmp_path):
+    _fixture_value, _plan_value, _manifest, plan_path, remote, publication = (
+        _published_fixture(tmp_path)
+    )
+    scheduler = _FakeScheduler()
+    state_path = tmp_path / "controller.json"
+    result = controller.control_once(
+        plan_path,
+        publication,
+        state_path=state_path,
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=controller.TransportReadyProbe(remote),
+        request_stop=True,
+    )
+    assert result["stop_requested"] is True
+    assert result["scheduler_post_count"] == 0
+    assert scheduler.post_count == 0
+    state = json.loads(state_path.read_text())
+    assert state["ledger"]["stop_requested"] is True
+
+
+def test_controller_rejects_live_ready_mismatch_before_scheduler_post(tmp_path):
+    _fixture_value, plan, _manifest, plan_path, remote, publication = (
+        _published_fixture(tmp_path)
+    )
+    ready_path = plan["remote_bundle"] + "/READY.json"
+    value = json.loads(remote.files[ready_path])
+    value["bundle_manifest_sha256"] = "0" * 64
+    remote.files[ready_path] = json.dumps(value).encode()
+    scheduler = _FakeScheduler()
+    with pytest.raises(RuntimeError, match="live remote READY"):
+        controller.control_once(
+            plan_path,
+            publication,
+            state_path=tmp_path / "controller.json",
+            apply=True,
+            scheduler=scheduler,
+            ready_probe=controller.TransportReadyProbe(remote),
+        )
+    assert scheduler.post_count == 0

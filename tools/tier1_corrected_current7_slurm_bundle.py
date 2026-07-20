@@ -150,9 +150,7 @@ def _hex(value: Any, length: int, label: str) -> str:
     if len(normalized) != length or any(
         character not in "0123456789abcdef" for character in normalized
     ):
-        raise RuntimeError(
-            f"{label} must be a {length}-character hexadecimal digest"
-        )
+        raise RuntimeError(f"{label} must be a {length}-character hexadecimal digest")
     return normalized
 
 
@@ -189,9 +187,7 @@ def _documentary_paths(receipt: Mapping[str, Any]) -> dict[str, str]:
         "registry": str(adapter.get("registry") or ""),
         "train_report": str((adapter.get("train_report") or {}).get("path") or ""),
         "candidate": str((adapter.get("candidate") or {}).get("path") or ""),
-        "quality_status": str(
-            (adapter.get("quality_status") or {}).get("path") or ""
-        ),
+        "quality_status": str((adapter.get("quality_status") or {}).get("path") or ""),
         "dataset": str((adapter.get("dataset") or {}).get("path") or ""),
         "profile": str((adapter.get("profile") or {}).get("path") or ""),
         "adapter_code": str((adapter.get("code") or {}).get("path") or ""),
@@ -207,12 +203,15 @@ def runtime_package_versions() -> dict[str, str]:
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError as exc:
-            raise RuntimeError(f"critical runtime package is unavailable: {package}") from exc
+            raise RuntimeError(
+                f"critical runtime package is unavailable: {package}"
+            ) from exc
     return versions
 
 
 def authenticate_clean_code_root(
-    code_root: Path, expected_revision: str,
+    code_root: Path,
+    expected_revision: str,
 ) -> dict[str, Any]:
     root = code_root.resolve(strict=True)
     expected = _hex(expected_revision, 40, "bundle code revision")
@@ -379,8 +378,7 @@ def _generation_sources(
         if record["size"] != identity.artifact_sizes_bytes[relative]:
             raise RuntimeError(f"generation artifact size mismatch: {relative}")
         bundle_relative = (
-            "artifacts/registry/generations/"
-            f"{identity.training_run_id}/{relative}"
+            f"artifacts/registry/generations/{identity.training_run_id}/{relative}"
         )
         sources[bundle_relative] = source
         generation_inventory[relative] = record
@@ -400,8 +398,7 @@ def _generation_sources(
             "profile": "artifacts/profile/standard.json",
             "registry": "artifacts/registry",
             "generation": (
-                "artifacts/registry/generations/"
-                f"{identity.training_run_id}"
+                f"artifacts/registry/generations/{identity.training_run_id}"
             ),
             "train_report": (
                 "artifacts/registry/generations/"
@@ -530,7 +527,9 @@ def seed_lanes() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         for offset in range(island.active_quota):
             seed = island.seed_start + offset
             if seed in occupied or seed >= island.seed_window_end_exclusive:
-                raise RuntimeError("current7 seed allocation overlaps or escapes its window")
+                raise RuntimeError(
+                    "current7 seed allocation overlaps or escapes its window"
+                )
             occupied.add(seed)
             lane = {
                 "island_id": island.island_id,
@@ -575,26 +574,25 @@ def build_plan(
     )
     if code_identity.get("clean") is not True:
         raise RuntimeError("bundle code identity is not clean")
-    code_revision = _hex(
-        code_identity.get("revision"), 40, "bundle code revision"
-    )
+    code_revision = _hex(code_identity.get("revision"), 40, "bundle code revision")
     entrypoint = _safe_relative(optimizer_entrypoint, "optimizer entrypoint")
     entrypoint_bundle = f"artifacts/code/{entrypoint}"
-    runner_bundle = (
-        "artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py"
-    )
+    runner_bundle = "artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py"
     normalized_code_sources = {}
     for relative, source in code_sources.items():
         relative = _safe_relative(relative, "code bundle path")
-        if relative in PROHIBITED_LEGACY_CODE or relative.removeprefix(
-            "artifacts/code/"
-        ) in PROHIBITED_LEGACY_CODE:
+        if (
+            relative in PROHIBITED_LEGACY_CODE
+            or relative.removeprefix("artifacts/code/") in PROHIBITED_LEGACY_CODE
+        ):
             raise RuntimeError("legacy all11 runner cannot enter a current7 bundle")
         if not relative.startswith("artifacts/code/"):
             raise RuntimeError("code source must be below artifacts/code")
         normalized_code_sources[relative] = Path(source).resolve(strict=True)
     if entrypoint_bundle not in normalized_code_sources:
-        raise RuntimeError("current7 optimizer entrypoint is absent from code inventory")
+        raise RuntimeError(
+            "current7 optimizer entrypoint is absent from code inventory"
+        )
     if runner_bundle not in normalized_code_sources:
         raise RuntimeError("current7 Slurm runner is absent from code inventory")
     if any(
@@ -631,7 +629,10 @@ def build_plan(
     }
     files = {relative: _record(source) for relative, source in sorted(sources.items())}
     files.update(
-        {relative: _synthetic_record(payload) for relative, payload in synthetic.items()}
+        {
+            relative: _synthetic_record(payload)
+            for relative, payload in synthetic.items()
+        }
     )
     code_inventory = {
         relative: files[relative]
@@ -661,8 +662,7 @@ def build_plan(
         "seed_reuse_allowed": False,
         "ledger_schema_version": SEED_LEDGER_SCHEMA,
         "island_active_quotas": {
-            island.island_id: island.active_quota
-            for island in DEEP_CROSSOVER_ISLANDS
+            island.island_id: island.active_quota for island in DEEP_CROSSOVER_ISLANDS
         },
         "seed_windows": {
             island.island_id: {
@@ -688,9 +688,7 @@ def build_plan(
         "code_inventory_sha256": canonical_sha256(code_inventory),
         "adapter_receipt": {
             "path": "artifacts/evidence/adapter_receipt.json",
-            "file_sha256": files[
-                "artifacts/evidence/adapter_receipt.json"
-            ]["sha256"],
+            "file_sha256": files["artifacts/evidence/adapter_receipt.json"]["sha256"],
             "identity": identity,
             "launch_eligible": identity["launch_eligible"],
         },
@@ -702,9 +700,9 @@ def build_plan(
         "generation_artifacts": relocation["relocated_identity"][
             "generation_artifacts"
         ],
-        "generation_artifact_inventory_sha256": relocation[
-            "relocated_identity"
-        ]["generation_artifact_inventory_sha256"],
+        "generation_artifact_inventory_sha256": relocation["relocated_identity"][
+            "generation_artifact_inventory_sha256"
+        ],
         "islands": islands,
         "search_execution": {
             "schema_version": SEARCH_INTERFACE_SCHEMA,
@@ -744,9 +742,7 @@ def build_plan(
             ],
             "requested_allocation_id_allowed": False,
             "active_dedupe_returns_existing_task": True,
-            "scheduler_payload_environment_variable": (
-                "SLURM_SCHEDULER_PAYLOAD_PATH"
-            ),
+            "scheduler_payload_environment_variable": ("SLURM_SCHEDULER_PAYLOAD_PATH"),
             "scheduler_submission_performed": False,
         },
         "fast_ramp": fast_ramp,
@@ -857,10 +853,7 @@ def build_task_payload(
         or receipt_identity.get("fixed_primary_turns_supported") != [5, 6]
         or receipt_identity.get("initial_repair_attested") is not True
         or receipt_identity.get("warm_repair_attested") is not True
-        or receipt_identity.get(
-            "every_offspring_decode_repair_attested"
-        )
-        is not True
+        or receipt_identity.get("every_offspring_decode_repair_attested") is not True
         or receipt_identity.get("terminal_physical_replay_attested") is not True
     ):
         raise RuntimeError(
@@ -887,18 +880,14 @@ def build_task_payload(
         "max_generations": FIXED_GENERATIONS,
         "inference_threads": INFERENCE_THREADS,
         "optimizer_processes": 1,
-        "adapter_receipt_file_sha256": manifest["adapter_receipt"][
-            "file_sha256"
-        ],
+        "adapter_receipt_file_sha256": manifest["adapter_receipt"]["file_sha256"],
         "adapter_manifest_sha256": manifest["adapter_receipt"]["identity"][
             "adapter_manifest_sha256"
         ],
         "train_report_sha256": manifest["adapter_receipt"]["identity"][
             "train_report_sha256"
         ],
-        "dataset_sha256": manifest["adapter_receipt"]["identity"][
-            "dataset_sha256"
-        ],
+        "dataset_sha256": manifest["adapter_receipt"]["identity"]["dataset_sha256"],
         "profile_canonical_sha256": manifest["adapter_receipt"]["identity"][
             "profile_canonical_sha256"
         ],
@@ -906,9 +895,9 @@ def build_task_payload(
         "temperature_contract_sha256": manifest["adapter_receipt"]["identity"][
             "temperature_contract_sha256"
         ],
-        "hard_constraint_contract_sha256": manifest["adapter_receipt"][
-            "identity"
-        ]["hard_constraint_contract_sha256"],
+        "hard_constraint_contract_sha256": manifest["adapter_receipt"]["identity"][
+            "hard_constraint_contract_sha256"
+        ],
         "optimizer_repair_contract_sha256": receipt_identity[
             "optimizer_repair_contract_sha256"
         ],
@@ -921,16 +910,10 @@ def build_task_payload(
         "generation_artifact_inventory_sha256": manifest[
             "generation_artifact_inventory_sha256"
         ],
-        "relocation_contract_sha256": manifest["relocation"][
-            "contract_sha256"
-        ],
+        "relocation_contract_sha256": manifest["relocation"]["contract_sha256"],
         "search_interface_schema_version": SEARCH_INTERFACE_SCHEMA,
-        "preflight_timeout_seconds": manifest["fast_ramp"][
-            "preflight_timeout_seconds"
-        ],
-        "maximum_peak_rss_bytes": manifest["fast_ramp"][
-            "maximum_peak_rss_bytes"
-        ],
+        "preflight_timeout_seconds": manifest["fast_ramp"]["preflight_timeout_seconds"],
+        "maximum_peak_rss_bytes": manifest["fast_ramp"]["maximum_peak_rss_bytes"],
         "production_eligible": False,
         "fea_submission_approved": False,
         "fea_submission_performed": False,
@@ -941,7 +924,8 @@ def build_task_payload(
     command = "\n".join(
         [
             "set -euo pipefail",
-            'export PYTHONPATH="$PWD/artifacts/code${PYTHONPATH:+:$PYTHONPATH}"',
+            'export PYTHONPATH="$PWD/artifacts/python-site:$PWD/artifacts/code'
+            '${PYTHONPATH:+:$PYTHONPATH}"',
             'payload_path="${SLURM_SCHEDULER_PAYLOAD_PATH:?scheduler payload path is missing}"',
             'case "$payload_path" in /*) ;; *) payload_path="$HOME/$payload_path" ;; esac',
             'payload_path=$(realpath -e -- "$payload_path")',
@@ -985,8 +969,10 @@ def build_task_payload(
 
 
 def build_task_waves(
-    plan: Mapping[str, Any], manifest: Mapping[str, Any],
-    *, priority: int | None = None,
+    plan: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    priority: int | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     result = {}
     for wave in ("canaries", "ramp"):
@@ -999,12 +985,8 @@ def build_task_waves(
     return result
 
 
-ACTIVE_LEDGER_STATES = frozenset(
-    {"planned", "submitted", "queued", "running"}
-)
-TERMINAL_LEDGER_STATES = frozenset(
-    {"completed", "failed", "cancelled", "timed_out"}
-)
+ACTIVE_LEDGER_STATES = frozenset({"planned", "submitted", "queued", "running"})
+TERMINAL_LEDGER_STATES = frozenset({"completed", "failed", "cancelled", "timed_out"})
 
 
 def seal_seed_ledger(
@@ -1033,9 +1015,9 @@ def seal_seed_ledger(
         state = str(entry.get("state") or "")
         if (
             not window
-            or not int(window["start"]) <= int(entry["seed"]) < int(
-                window["end_exclusive"]
-            )
+            or not int(window["start"])
+            <= int(entry["seed"])
+            < int(window["end_exclusive"])
             or state not in ACTIVE_LEDGER_STATES | TERMINAL_LEDGER_STATES
             or not isinstance(entry.get("task_payload_sha256"), str)
             or len(entry["task_payload_sha256"]) != 64
@@ -1064,9 +1046,7 @@ def seal_seed_ledger(
 def validate_seed_ledger(
     manifest: Mapping[str, Any], ledger: Mapping[str, Any]
 ) -> dict[str, Any]:
-    unsigned = {
-        key: item for key, item in ledger.items() if key != "ledger_sha256"
-    }
+    unsigned = {key: item for key, item in ledger.items() if key != "ledger_sha256"}
     if (
         ledger.get("schema_version") != SEED_LEDGER_SCHEMA
         or ledger.get("bundle_id") != manifest.get("bundle_id")
@@ -1087,8 +1067,10 @@ def validate_seed_ledger(
 
 
 def initial_seed_ledger(
-    plan: Mapping[str, Any], manifest: Mapping[str, Any],
-    *, priority: int | None = None,
+    plan: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    priority: int | None = None,
 ) -> dict[str, Any]:
     waves = build_task_waves(plan, manifest, priority=priority)
     entries = []
@@ -1133,8 +1115,7 @@ def plan_refill_wave(
     gaps = {}
     for island_id, quota in refill["island_active_quotas"].items():
         active = sum(
-            entry["island_id"] == island_id
-            and entry["state"] in ACTIVE_LEDGER_STATES
+            entry["island_id"] == island_id and entry["state"] in ACTIVE_LEDGER_STATES
             for entry in entries
         )
         if active > int(quota):
@@ -1148,9 +1129,7 @@ def plan_refill_wave(
                 candidate += 1
             if candidate >= int(window["end_exclusive"]):
                 raise RuntimeError(f"seed window exhausted for island {island_id}")
-            task = build_task_payload(
-                plan, manifest, seed=candidate, priority=priority
-            )
+            task = build_task_payload(plan, manifest, seed=candidate, priority=priority)
             tasks.append(task)
             payload = task["payload_json"]
             entries.append(
@@ -1191,11 +1170,10 @@ def plan_refill_wave(
 
 
 def assess_fast_ramp(
-    manifest: Mapping[str, Any], statuses: Sequence[Mapping[str, Any]],
+    manifest: Mapping[str, Any],
+    statuses: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    expected = {
-        int(lane["seed"]): lane for lane in manifest["fast_ramp"]["canaries"]
-    }
+    expected = {int(lane["seed"]): lane for lane in manifest["fast_ramp"]["canaries"]}
     observed = {int(status.get("seed", -1)): status for status in statuses}
     reasons = []
     if set(observed) != set(expected):
@@ -1217,7 +1195,8 @@ def assess_fast_ramp(
             "artifact_count": status.get("authenticated_artifact_count")
             == len(expected_generation_artifacts()),
             "rss": isinstance(status.get("observed_peak_rss_bytes"), int)
-            and 0 < status["observed_peak_rss_bytes"]
+            and 0
+            < status["observed_peak_rss_bytes"]
             <= manifest["fast_ramp"]["maximum_peak_rss_bytes"],
             "running": status.get("optimizer_started") is True
             and status.get("terminal") is not True,
@@ -1281,9 +1260,7 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _parser().parse_args()
     if args.command == "plan":
-        code_identity = authenticate_clean_code_root(
-            args.code_root, args.code_revision
-        )
+        code_identity = authenticate_clean_code_root(args.code_root, args.code_revision)
         code_sources = collect_tracked_code_sources(
             args.code_root,
             optimizer_entrypoint=args.optimizer_entrypoint,
@@ -1315,16 +1292,16 @@ def main() -> None:
             priority=args.priority,
         )
     elif args.command in {
-        "render-task-waves", "render-initial-ledger", "render-refill-wave",
+        "render-task-waves",
+        "render-initial-ledger",
+        "render-refill-wave",
     }:
         plan = read_json(args.plan)
         manifest = read_json(Path(plan["bundle_manifest"]))
         if args.command == "render-task-waves":
             value = build_task_waves(plan, manifest, priority=args.priority)
         elif args.command == "render-initial-ledger":
-            value = initial_seed_ledger(
-                plan, manifest, priority=args.priority
-            )
+            value = initial_seed_ledger(plan, manifest, priority=args.priority)
         else:
             value = plan_refill_wave(
                 plan,
