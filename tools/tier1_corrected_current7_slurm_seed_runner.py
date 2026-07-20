@@ -25,6 +25,7 @@ try:
         CURRENT_TEMPERATURE_TARGETS,
         canonical_sha256,
         expected_generation_artifacts,
+        training_profile_sha256,
         validate_adapter_receipt,
     )
     from tier1_corrected_current7_slurm_bundle import (
@@ -45,6 +46,7 @@ except ImportError:  # pragma: no cover - repository import path
         CURRENT_TEMPERATURE_TARGETS,
         canonical_sha256,
         expected_generation_artifacts,
+        training_profile_sha256,
         validate_adapter_receipt,
     )
     from tools.tier1_corrected_current7_slurm_bundle import (
@@ -349,7 +351,7 @@ def verify_payload(
         if sha256_file(contained(bundle, paths[key])) != digest:
             raise RuntimeError(f"relocated {key} fingerprint mismatch")
     profile = read_json(contained(bundle, paths["profile"]))
-    if canonical_sha256(profile) != identity["profile_canonical_sha256"]:
+    if training_profile_sha256(profile) != identity["profile_canonical_sha256"]:
         raise RuntimeError("relocated profile canonical fingerprint mismatch")
     report = read_json(contained(bundle, paths["train_report"]))
     if (

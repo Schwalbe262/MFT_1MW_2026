@@ -441,7 +441,12 @@ def _v2_receipt(adapter: dict, *, repair_ready: bool) -> dict:
     return receipt
 
 
-def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
+def _fixture(
+    tmp_path: Path,
+    *,
+    repair_ready: bool = True,
+    profile_payload: dict | None = None,
+) -> dict:
     run_id = "20260720T000000-current7"
     registry = tmp_path / "registry"
     generation = registry / "generations" / run_id
@@ -458,7 +463,9 @@ def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
     dataset = tmp_path / "strict.parquet"
     dataset.write_bytes(b"strict-current7-dataset")
     profile = tmp_path / "profile.json"
-    _write_json(profile, {"profile": "standard", "version": 7})
+    if profile_payload is None:
+        profile_payload = {"profile": "standard", "version": 7}
+    _write_json(profile, profile_payload)
     candidate = tmp_path / "candidate.json"
     _write_json(candidate, {"schema_version": 2, "candidate": "corrected"})
     quality = tmp_path / "quality_status.json"
@@ -472,7 +479,7 @@ def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
         "dataset_path": r"C:\original\strict.parquet",
         "dataset_sha256": _sha(dataset),
         "profile_path": r"C:\original\profile.json",
-        "profile_sha256": receipt_contract.canonical_sha256(
+        "profile_sha256": receipt_contract.training_profile_sha256(
             json.loads(profile.read_text())
         ),
         "strict_full_rows": 6151,
@@ -605,8 +612,17 @@ def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
     }
 
 
-def _plan(tmp_path: Path, *, repair_ready: bool = True):
-    fixture = _fixture(tmp_path, repair_ready=repair_ready)
+def _plan(
+    tmp_path: Path,
+    *,
+    repair_ready: bool = True,
+    profile_payload: dict | None = None,
+):
+    fixture = _fixture(
+        tmp_path,
+        repair_ready=repair_ready,
+        profile_payload=profile_payload,
+    )
     plan, manifest = bundle_tool.build_plan(
         local_root=tmp_path / "plans",
         remote_root="/remote/current7",
@@ -750,6 +766,41 @@ def test_bundle_is_content_addressed_and_relocates_absolute_paths(tmp_path):
     )
     assert second_plan["bundle_id"] == plan["bundle_id"]
     assert second_manifest == manifest
+
+
+def test_training_profile_hash_accepts_non_ascii_locally_and_remotely(
+    tmp_path, monkeypatch
+):
+    profile_payload = {"profile": "표준", "version": 7}
+    training_sha = receipt_contract.training_profile_sha256(profile_payload)
+    assert training_sha != receipt_contract.canonical_sha256(profile_payload)
+
+    fixture, plan, manifest = _plan(
+        tmp_path,
+        profile_payload=profile_payload,
+    )
+    identity = manifest["adapter_receipt"]["identity"]
+    assert identity["profile_canonical_sha256"] == training_sha
+
+    bundle = _local_publish(tmp_path, fixture, plan, manifest)
+    task = bundle_tool.build_task_waves(plan, manifest)["canaries"][0]
+    payload = task["payload_json"]
+    payload_root = tmp_path / "scheduler-runs"
+    payload_path = payload_root / "task-1" / "payload.json"
+    _write_json(payload_path, payload)
+    monkeypatch.setattr(
+        runner.importlib.metadata,
+        "version",
+        lambda name: manifest["runtime"]["critical_packages"][name],
+    )
+
+    verified, _observed_manifest, _relocation = runner.verify_payload(
+        bundle,
+        payload_path,
+        payload_root,
+        receipt_contract.canonical_sha256(payload),
+    )
+    assert verified == payload
 
 
 def test_task_waves_are_4_plus_32_and_use_requested_resources(tmp_path):

@@ -30,6 +30,7 @@ try:
         adapter_manifest_view,
         canonical_sha256,
         expected_generation_artifacts,
+        training_profile_sha256,
         validate_adapter_receipt,
     )
     from tier1_deep_crossover_contract import (
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover - repository import path
         adapter_manifest_view,
         canonical_sha256,
         expected_generation_artifacts,
+        training_profile_sha256,
         validate_adapter_receipt,
     )
     from tools.tier1_deep_crossover_contract import (
@@ -361,7 +363,7 @@ def _generation_sources(
     for relative, expected in expected_file_shas.items():
         _record(sources[relative], expected_sha256=expected)
     profile = read_json(profile_path)
-    if canonical_sha256(profile) != identity.profile_canonical_sha256:
+    if training_profile_sha256(profile) != identity.profile_canonical_sha256:
         raise RuntimeError("relocated profile canonical SHA-256 mismatch")
 
     generation_inventory: dict[str, dict[str, Any]] = {}

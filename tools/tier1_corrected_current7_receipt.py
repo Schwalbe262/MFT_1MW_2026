@@ -23,6 +23,7 @@ try:
         CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
         CURRENT_TEMPERATURE_TARGETS,
         canonical_sha256,
+        training_profile_sha256,
     )
     from tier1_corrected_generation_preflight import (
         CURRENT7_CONSTRAINT_NAMES,
@@ -41,6 +42,7 @@ except ImportError:  # pragma: no cover - repository package path
         CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
         CURRENT_TEMPERATURE_TARGETS,
         canonical_sha256,
+        training_profile_sha256,
     )
     from tools.tier1_corrected_generation_preflight import (
         CURRENT7_CONSTRAINT_NAMES,
@@ -67,6 +69,7 @@ __all__ = (
     "adapter_manifest_view",
     "canonical_sha256",
     "expected_generation_artifacts",
+    "training_profile_sha256",
     "validate_adapter_receipt",
 )
 
