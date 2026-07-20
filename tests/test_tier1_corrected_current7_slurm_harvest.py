@@ -368,7 +368,9 @@ def test_apply_is_additive_content_addressed_and_idempotent(tmp_path):
     assert legacy.read_bytes() == b"legacy-all11-sentinel\n"
 
 
-@pytest.mark.parametrize("failure_mode", ["partial", "tampered", "unstable"])
+@pytest.mark.parametrize(
+    "failure_mode", ["partial", "tampered", "unstable", "artifact_tamper"]
+)
 def test_partial_tampered_or_unstable_remote_is_refused_without_writes(
     tmp_path, failure_mode
 ):
@@ -384,7 +386,14 @@ def test_partial_tampered_or_unstable_remote_is_refused_without_writes(
         status["result_sha256"] = "0" * 64
         files[status_key] = _bytes(status)
     else:
-        unstable = (result_key,)
+        if failure_mode == "unstable":
+            unstable = (result_key,)
+        else:
+            artifact_key = next(
+                key for key in files if key[1].endswith("terminal_X.npy")
+            )
+            original = files[artifact_key]
+            files[artifact_key] = b"X" + original[1:]
     runtime = tmp_path / "runtime"
     result = harvest.harvest_snapshot(
         plan=plan,
