@@ -16,6 +16,7 @@ from module import input_parameter_260706 as current_input
 from regression_260707.optimization.design_summary import (
     design_analytical_b_field_t,
 )
+from regression_260707.monitoring.readers import CANDIDATE_REPORT_FIELDS
 from regression_260707.optimization.geometry_metrics import bounding_box_lit
 from tools import tier1_corrected_generation_adapter as adapter
 from tools import tier1_corrected_generation_preflight as preflight
@@ -661,6 +662,11 @@ def test_repaired_runner_uses_same_operator_for_warm_offspring_and_terminal(
     assert candidate["total_loss_W"] == candidate["predicted_total_loss_W"]
     assert candidate["pred_Llt_phys"] == candidate["pred_Llt_phys_uH"]
     assert candidate["B_design_analytic_T"] == candidate["analytical_B_T"]
+    assert set(CANDIDATE_REPORT_FIELDS).issubset(candidate)
+    assert candidate["rated_power_W"] == 1_000_000.0
+    assert candidate["pred_efficiency_pct"] == pytest.approx(
+        1_000_000.0 / (1_000_000.0 + candidate["total_loss_W"]) * 100.0
+    )
     assert set(candidate["physical_constraint_G"]) == set(
         preflight.CURRENT7_CONSTRAINT_NAMES
     )
@@ -773,6 +779,7 @@ def test_smoke_receipt_seals_both_repaired_strata_and_is_launch_eligible(tmp_pat
         predictor=None,
         train_models=None,
         geometry_metrics=None,
+        design_summary=None,
         input_parameter=None,
         evidence={"synthetic": True},
     )

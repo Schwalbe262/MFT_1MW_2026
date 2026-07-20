@@ -1882,6 +1882,7 @@ class Current7Modules:
     predictor: Any
     train_models: Any
     geometry_metrics: Any
+    design_summary: Any
     input_parameter: Any
     evidence: dict[str, Any]
 
@@ -1922,6 +1923,9 @@ def load_current7_modules(code_root: Path) -> Current7Modules:
         "train_models": importlib.import_module("train_models"),
         "geometry_metrics": importlib.import_module(
             "optimization.geometry_metrics"
+        ),
+        "design_summary": importlib.import_module(
+            "optimization.design_summary"
         ),
         "input_parameter": importlib.import_module(
             "module.input_parameter_260706"
@@ -1973,6 +1977,7 @@ def load_current7_modules(code_root: Path) -> Current7Modules:
         predictor=predictor,
         train_models=modules["train_models"],
         geometry_metrics=modules["geometry_metrics"],
+        design_summary=modules["design_summary"],
         input_parameter=input_parameter,
         evidence=evidence,
     )
@@ -3394,19 +3399,26 @@ def _candidate_records(
             aggregate_loss, float(f[index, 1]), rel_tol=1e-9, abs_tol=1e-6
         ):
             raise RuntimeError("terminal loss objective differs from model harvest")
-        volume_l, dimensions = runner.modules.geometry_metrics.bounding_box_lit(row)
-        width_mm, length_mm, height_mm = (
-            _finite_number(value, "exterior dimension") for value in dimensions
+        design_report = runner.modules.design_summary.pareto_design_summary(
+            row,
+            means,
+            aggregate_loss,
+            leakage_target_uH=runner.problem.spec["Llt_target_uH"],
+            core_lamination_factor=runner.problem.spec[
+                "core_lamination_factor"
+            ],
+            B_area_basis=runner.problem.spec["B_area_basis"],
         )
+        width_mm = _finite_number(design_report["size_W_mm"], "exterior width")
+        length_mm = _finite_number(
+            design_report["size_L_mm"], "exterior length"
+        )
+        height_mm = _finite_number(
+            design_report["size_H_mm"], "exterior height"
+        )
+        volume_l = _finite_number(design_report["volume_L"], "volume")
         analytical_b = _finite_number(
-            runner.modules.nsga2_problem.design_analytical_b_field_t(
-                row,
-                core_lamination_factor=runner.problem.spec[
-                    "core_lamination_factor"
-                ],
-                area_basis=runner.problem.spec["B_area_basis"],
-            ),
-            "analytical B",
+            design_report["B_design_analytic_T"], "analytical B"
         )
         resonance = derive_half_magnetizing_self_resonance(
             {
@@ -3468,6 +3480,7 @@ def _candidate_records(
         if budget.get("passed") is not True:
             raise RuntimeError("harvest winding-budget identity failed")
         record = {
+            **design_report,
             "candidate_id": f"terminal-{index:04d}",
             "terminal_population_index": index,
             "coordinate_unit": x[index].tolist(),
