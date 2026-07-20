@@ -446,6 +446,7 @@ def _fixture(
     *,
     repair_ready: bool = True,
     profile_payload: dict | None = None,
+    adapter_code_revision: str = "9" * 40,
 ) -> dict:
     run_id = "20260720T000000-current7"
     registry = tmp_path / "registry"
@@ -556,7 +557,11 @@ def _fixture(
         "hard_constraint_contract_sha256": (
             generation_adapter.CURRENT_STAGE_HARD_CONTRACT_SHA256
         ),
-        "code": {"path": r"C:\original\code", "revision": "4" * 40, "clean": True},
+        "code": {
+            "path": r"C:\original\code",
+            "revision": adapter_code_revision,
+            "clean": True,
+        },
         "model_loading": {
             "process_scope": "single_local_process",
             "cache_policy": "one_generation_authentication_and_unpickle_pass",
@@ -737,6 +742,9 @@ def test_bundle_is_content_addressed_and_relocates_absolute_paths(tmp_path):
     assert relocation["original_paths"]["dataset"].startswith("C:\\")
     assert manifest["remote_git_checkout_required"] is False
     assert manifest["bundle_code_revision"] == "9" * 40
+    assert manifest["adapter_receipt"]["identity"]["adapter_code_revision"] == (
+        manifest["bundle_code_revision"]
+    )
     assert manifest["scheduler_api_contract"]["endpoint_path"] == "/api/tasks"
     assert (
         manifest["scheduler_api_contract"]["requested_allocation_id_allowed"] is False
@@ -766,6 +774,30 @@ def test_bundle_is_content_addressed_and_relocates_absolute_paths(tmp_path):
     )
     assert second_plan["bundle_id"] == plan["bundle_id"]
     assert second_manifest == manifest
+
+
+def test_bundle_refuses_adapter_code_revision_mismatch_before_plan_write(tmp_path):
+    fixture = _fixture(tmp_path, adapter_code_revision="4" * 40)
+    plan_root = tmp_path / "mismatched-plan-must-not-exist"
+
+    with pytest.raises(RuntimeError, match="bundle/adapter code identity mismatch"):
+        bundle_tool.build_plan(
+            local_root=plan_root,
+            remote_root="/remote/current7",
+            receipt_path=fixture["receipt"],
+            generation=fixture["generation"],
+            candidate_path=fixture["candidate"],
+            quality_path=fixture["quality"],
+            dataset_path=fixture["dataset"],
+            profile_path=fixture["profile"],
+            code_identity={"revision": "9" * 40, "clean": True},
+            code_sources=fixture["code_sources"],
+            optimizer_entrypoint="tools/fake_current7_search.py",
+            warm_starts=fixture["warm"],
+            runtime_packages=fixture["runtime_packages"],
+        )
+
+    assert not plan_root.exists()
 
 
 def test_training_profile_hash_accepts_non_ascii_locally_and_remotely(

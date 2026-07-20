@@ -565,6 +565,12 @@ def build_plan(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     receipt_path = receipt_path.resolve(strict=True)
     receipt = read_json(receipt_path)
+    receipt_identity = validate_adapter_receipt(receipt)
+    if code_identity.get("clean") is not True:
+        raise RuntimeError("bundle code identity is not clean")
+    code_revision = _hex(code_identity.get("revision"), 40, "bundle code revision")
+    if code_revision != receipt_identity.adapter_code_revision:
+        raise RuntimeError("bundle/adapter code identity mismatch")
     identity, sources, relocation = _generation_sources(
         receipt=receipt,
         receipt_path=receipt_path,
@@ -574,9 +580,6 @@ def build_plan(
         dataset_path=dataset_path,
         profile_path=profile_path,
     )
-    if code_identity.get("clean") is not True:
-        raise RuntimeError("bundle code identity is not clean")
-    code_revision = _hex(code_identity.get("revision"), 40, "bundle code revision")
     entrypoint = _safe_relative(optimizer_entrypoint, "optimizer entrypoint")
     entrypoint_bundle = f"artifacts/code/{entrypoint}"
     runner_bundle = "artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py"
