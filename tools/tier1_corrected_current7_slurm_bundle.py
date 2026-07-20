@@ -692,6 +692,17 @@ def build_plan(
             "identity": identity,
             "launch_eligible": identity["launch_eligible"],
         },
+        "constraint_version": identity["constraint_version"],
+        "hard_spec": identity["hard_spec"],
+        "hard_spec_sha256": identity["hard_spec_sha256"],
+        "constraint_names": identity["constraint_names"],
+        "temperature_targets": list(CURRENT_TEMPERATURE_TARGETS),
+        "temperature_contract_sha256": identity[
+            "temperature_contract_sha256"
+        ],
+        "hard_constraint_contract_sha256": identity[
+            "hard_constraint_contract_sha256"
+        ],
         "relocation": {
             "path": "artifacts/evidence/relocation.json",
             "sha256": files["artifacts/evidence/relocation.json"]["sha256"],
@@ -847,6 +858,9 @@ def build_task_payload(
     if manifest.get("bundle_id") != plan.get("bundle_id"):
         raise RuntimeError("plan/manifest bundle identity mismatch")
     receipt_identity = manifest["adapter_receipt"]["identity"]
+    repair_contracts = receipt_identity.get(
+        "optimizer_repair_contract_sha256_by_fixed_primary_turns"
+    )
     if (
         receipt_identity.get("launch_eligible") is not True
         or receipt_identity.get("offspring_physics_repair") is not True
@@ -855,6 +869,12 @@ def build_task_payload(
         or receipt_identity.get("warm_repair_attested") is not True
         or receipt_identity.get("every_offspring_decode_repair_attested") is not True
         or receipt_identity.get("terminal_physical_replay_attested") is not True
+        or not isinstance(repair_contracts, dict)
+        or set(repair_contracts) != {"5", "6"}
+        or any(
+            not isinstance(value, str) or len(value) != 64
+            for value in repair_contracts.values()
+        )
     ):
         raise RuntimeError(
             "current7 receipt is smoke-only or lacks the mandatory "
@@ -898,8 +918,8 @@ def build_task_payload(
         "hard_constraint_contract_sha256": manifest["adapter_receipt"]["identity"][
             "hard_constraint_contract_sha256"
         ],
-        "optimizer_repair_contract_sha256": receipt_identity[
-            "optimizer_repair_contract_sha256"
+        "optimizer_repair_contract_sha256": repair_contracts[
+            str(lane["fixed_primary_turns"])
         ],
         "offspring_physics_repair": True,
         "fixed_primary_turns_supported": [5, 6],

@@ -13,6 +13,8 @@ from tools import tier1_corrected_current7_slurm_bundle as bundle_tool
 from tools import tier1_corrected_current7_slurm_controller as controller
 from tools import tier1_corrected_current7_slurm_publish as publisher
 from tools import tier1_corrected_current7_slurm_seed_runner as runner
+from tools import tier1_corrected_generation_adapter as generation_adapter
+from tools import tier1_corrected_generation_preflight as generation_preflight
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -134,19 +136,7 @@ preflight = {
 preflight["payload_sha256"] = canonical(preflight)
 Path(args.remote_preflight).write_text(json.dumps(preflight))
 time.sleep(0.1)
-hard_spec = {
-    "Llt_target_uH": 27.5,
-    "Llt_tol_uH": 0.55,
-    "T_limit_C": 110.0,
-    "B_limit_T": 1.2,
-    "insulation_min_mm": 40.0,
-    "n_core_group_max": 4,
-    "primary_conductor_thickness_mm": 5.0,
-    "resonance_min_Hz": 15000.0,
-    "size_W_max_mm": 1200.0,
-    "size_L_max_mm": 1200.0,
-    "size_H_max_mm": 750.0,
-}
+hard_spec = identity["hard_spec"]
 dummy_artifact = Path(args.output, "dummy.bin")
 dummy_artifact.write_bytes(b"sealed-current7-dummy")
 artifact_inventory = {
@@ -178,10 +168,8 @@ result = {
         "hard_constraint_contract_sha256"
     ],
     "hard_spec": hard_spec,
-    "stage_spec_sha256": canonical(hard_spec),
-    "constraint_version": (
-        "1200x1200x750-res15k-t110-core4-cw1-5-lmhalf"
-    ),
+    "stage_spec_sha256": identity["hard_spec_sha256"],
+    "constraint_version": identity["constraint_version"],
     "island_profile_sha256": args.island_profile_sha256,
     "warm_artifact_sha256": hashlib.sha256(
         Path(args.warm_start).read_bytes()
@@ -190,11 +178,7 @@ result = {
         Path(args.warm_contract).read_bytes()
     ).hexdigest(),
     "temperature_targets": TEMPERATURES,
-    "constraint_names": [
-        "Llt_robust_band",
-        *["temperature_robust_limit:" + item for item in TEMPERATURES],
-        "half_magnetizing_resonance_minimum",
-    ],
+    "constraint_names": identity["constraint_names"],
     "fixed_primary_turns": int(args.fixed_primary_turns),
     "terminal_population_primary_turn_values": [int(args.fixed_primary_turns)],
     "terminal_population_fixed_primary_turns_verified": True,
@@ -227,6 +211,234 @@ result = {
 result["payload_sha256"] = canonical(result)
 Path(args.output, "result.json").write_text(json.dumps(result))
 """.lstrip()
+
+
+def _sealed(value: dict) -> dict:
+    result = copy.deepcopy(value)
+    result["sha256"] = receipt_contract.canonical_sha256(result)
+    return result
+
+
+def _v2_receipt(adapter: dict, *, repair_ready: bool) -> dict:
+    expected_turns = list(generation_preflight.SUPPORTED_FIXED_PRIMARY_TURNS)
+    expected_stages = {
+        "initial_population": True,
+        "warm_start": True,
+        "every_offspring": True,
+        "terminal_physical_replay": True,
+    }
+    strata = {}
+    for turns in expected_turns:
+        key = str(turns)
+        contract = {
+            "schema_version": generation_preflight.OPTIMIZER_REPAIR_SCHEMA,
+            "projection_source_revision": (
+                generation_preflight.PINNED_PROJECTION_SOURCE_REVISION
+            ),
+            "fixed_cw1_mm": 5.0,
+            "cw1_enforcement": "inside_decoder_winding_budget",
+            "fixed_primary_turns": turns,
+            "required_stages": [
+                "initial_population",
+                "authenticated_warm_start",
+                "every_pymoo_offspring",
+                "terminal_unscaled_physical_replay",
+            ],
+        }
+        repair_contract_sha = receipt_contract.canonical_sha256(contract)
+        stage_evidence = _sealed(
+            {
+                "schema_version": "mft-tier1-current7-repair-smoke-v1",
+                "fixed_primary_turns": turns,
+                "stages": expected_stages,
+                "same_problem_repair_used_for_all_stages": True,
+            }
+        )
+        optimizer_repair = _sealed(
+            {
+                "schema_version": generation_preflight.OPTIMIZER_REPAIR_SCHEMA,
+                "contract": contract,
+                "contract_sha256": repair_contract_sha,
+                "stages": expected_stages,
+                "stage_evidence": stage_evidence,
+                "fixed_primary_turns_repair": True,
+                "fixed_primary_turns": turns,
+                "launch_eligible": True,
+            }
+        )
+        problem = _sealed(
+            {
+                "fixed_primary_turns": turns,
+                "primary_winding_budget_identity_attested": True,
+                "primary_winding_budget_identity": {"passed": True},
+                "optimizer_repair_contract_sha256": repair_contract_sha,
+                "launch_eligible": True,
+            }
+        )
+        model_smoke = _sealed(
+            {
+                "target_count": len(
+                    receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS
+                ),
+                "all_required_targets_exercised": True,
+                "targets": {
+                    target: {"finite": True}
+                    for target in receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS
+                },
+                "additional_half_width_multiplier": 1.0,
+            }
+        )
+        physical_smoke = _sealed(
+            {
+                "decoder_valid": True,
+                "decoded_controls": {
+                    "cw1": 5.0,
+                    "N1_main": turns,
+                    "N1_side": 0,
+                },
+                "objectives": {
+                    "bounding_box_volume_L": 800.0,
+                    "predicted_total_loss_W": 6000.0,
+                },
+                "physical_constraint_G": {
+                    name: -1.0
+                    for name in generation_preflight.CURRENT7_CONSTRAINT_NAMES
+                },
+                "finite_objectives": True,
+                "finite_constraints": True,
+                "design_feasibility_required_for_smoke": False,
+            }
+        )
+        strata[key] = _sealed(
+            {
+                "fixed_primary_turns": turns,
+                "problem": problem,
+                "optimizer_repair": optimizer_repair,
+                "model_smoke": model_smoke,
+                "smoke": physical_smoke,
+                "launch_eligible": True,
+            }
+        )
+
+    model_load = {
+        "required_targets": list(receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS),
+        "required_targets_sha256": (
+            receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS_SHA256
+        ),
+        "loaded_target_count": len(
+            receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS
+        ),
+        "cache_load_calls": 1,
+        "full_generation_authentication_passes": 1,
+        "models_loaded_once_per_process": True,
+        "generation_copy_performed": False,
+        "inference_binding": {"target_count": 20, "threads_per_model": 1},
+        "model_smoke_completed": True,
+        "supported_fixed_primary_turns": expected_turns,
+        "strata": {key: strata[key]["model_smoke"] for key in strata},
+        "all_supported_strata_exercised": True,
+    }
+    problem_contract = {
+        "stage_spec": generation_preflight.CURRENT_STAGE_SPEC,
+        "stage_spec_sha256": generation_preflight.CURRENT_STAGE_SPEC_SHA256,
+        "temperature_contract": generation_adapter.CURRENT_TEMPERATURE_CONTRACT,
+        "temperature_contract_sha256": (
+            generation_adapter.CURRENT_TEMPERATURE_CONTRACT_SHA256
+        ),
+        "hard_constraint_contract": (
+            generation_adapter.CURRENT_STAGE_HARD_CONTRACT
+        ),
+        "hard_constraint_contract_sha256": (
+            generation_adapter.CURRENT_STAGE_HARD_CONTRACT_SHA256
+        ),
+        "constraint_names": list(generation_preflight.CURRENT7_CONSTRAINT_NAMES),
+        "constraint_count": len(generation_preflight.CURRENT7_CONSTRAINT_NAMES),
+        "base_constraint_count": len(generation_preflight.BASE_CONSTRAINT_NAMES),
+        "additive_hard_constraint_count": len(
+            generation_preflight.ADDITIVE_HARD_CONSTRAINT_NAMES
+        ),
+        "base_secondary_vertical_insulation_retained": True,
+        "minimum_physical_insulation_is_authoritative_superset": True,
+        "variable_cooling_dimensions": list(
+            generation_preflight.VARIABLE_COOLING_DIMENSIONS
+        ),
+        "fixed_cooling_pads_mm": generation_preflight.FIXED_COOLING_PADS_MM,
+        "simple_base_20mm_plate_clamp_superseded": True,
+        "primary_conductor_enforcement": (
+            "fixed_cw1_consumed_inside_decoder_winding_budget"
+        ),
+        "side_temperature_condition_applied": True,
+        "q90_additional_multiplier": 1.0,
+        "supported_fixed_primary_turns": expected_turns,
+        "strata": {key: strata[key]["problem"] for key in strata},
+    }
+    optimizer_repair = {
+        "schema_version": generation_preflight.OPTIMIZER_REPAIR_SCHEMA,
+        "supported_fixed_primary_turns": expected_turns,
+        "strata": {key: strata[key]["optimizer_repair"] for key in strata},
+        "all_supported_strata_passed": True,
+        "launch_eligible": True,
+    }
+    smoke = {
+        "coordinate": {
+            "path": r"C:\original\smoke.npy",
+            "sha256": "c" * 64,
+            "shape": [1, 1],
+            "coordinate_unit_sha256": "d" * 64,
+        },
+        "supported_fixed_primary_turns": expected_turns,
+        "strata": {key: strata[key]["smoke"] for key in strata},
+        "all_supported_strata_smoked": True,
+    }
+    receipt = {
+        "schema_version": receipt_contract.SMOKE_RECEIPT_SCHEMA,
+        "status": (
+            "authenticated_dual_stratum_model_and_repair_smoke_passed_"
+            "launch_eligible"
+        ),
+        "created_at": "2026-07-20T00:00:00+09:00",
+        "supported_fixed_primary_turns": expected_turns,
+        "strata": strata,
+        "runner": {
+            "schema_version": generation_preflight.RUNNER_SCHEMA,
+            "problem_schema": generation_preflight.PROBLEM_SCHEMA,
+            "run_interface": "Current7Tier1Runner.run_one",
+            "current_run_nsga2_semantics_source": "optimization.run_nsga2.run_one",
+            "current_initialization_semantics_source": (
+                "optimization.run_nsga2.run_one"
+            ),
+            "supported_fixed_primary_turns": expected_turns,
+            "full_nsga_executed": False,
+            "launch_eligible": True,
+        },
+        "adapter_manifest": adapter,
+        "adapter_manifest_sha256": receipt_contract.canonical_sha256(adapter),
+        "code_modules": {"synthetic": True},
+        "model_load": model_load,
+        "model_load_sha256": receipt_contract.canonical_sha256(model_load),
+        "problem_contract": problem_contract,
+        "problem_contract_sha256": receipt_contract.canonical_sha256(
+            problem_contract
+        ),
+        "optimizer_repair": optimizer_repair,
+        "optimizer_repair_sha256": receipt_contract.canonical_sha256(
+            optimizer_repair
+        ),
+        "smoke": smoke,
+        "smoke_sha256": receipt_contract.canonical_sha256(smoke),
+        "portability": generation_adapter.CURRENT_STAGE_HARD_CONTRACT[
+            "portability"
+        ],
+        "scheduler_write_performed": False,
+        "slurm_submission_performed": False,
+        "canonical_pointer_write_performed": False,
+        "production_eligible": False,
+        "automatic_promotion_allowed": False,
+    }
+    if not repair_ready:
+        receipt["strata"].pop("6")
+    receipt["payload_sha256"] = receipt_contract.canonical_sha256(receipt)
+    return receipt
 
 
 def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
@@ -303,6 +515,17 @@ def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
             "canonical_sha256": report["profile_sha256"],
         },
         "capacitance_recovery": {
+            "contract": generation_adapter.RECOVERY_CONTRACT,
+            "max_allowed_abs_delta_F": (
+                generation_adapter.RECOVERY_MAX_ABS_DELTA_F
+            ),
+            "row_count": 6151,
+            "cap_enabled_row_count": 6151,
+            "eligible_row_count": 6151,
+            "recovered_row_count": 6151,
+            "max_observed_abs_delta_F": 5.0e-11,
+            "missing_columns": [],
+            "status": generation_adapter.RECOVERY_STATUS,
             "guard_passed": True,
             "guard_target_count": 21,
             "guard_passed_target_count": 21,
@@ -315,8 +538,17 @@ def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
         ),
         "artifact_count": 42,
         "artifact_sizes_bytes": artifact_sizes,
-        "temperature_contract_sha256": "a" * 64,
-        "hard_constraint_contract_sha256": "b" * 64,
+        "full_artifact_hash_pass_deferred_to_single_model_load": True,
+        "temperature_contract": generation_adapter.CURRENT_TEMPERATURE_CONTRACT,
+        "temperature_contract_sha256": (
+            generation_adapter.CURRENT_TEMPERATURE_CONTRACT_SHA256
+        ),
+        "hard_constraint_contract": (
+            generation_adapter.CURRENT_STAGE_HARD_CONTRACT
+        ),
+        "hard_constraint_contract_sha256": (
+            generation_adapter.CURRENT_STAGE_HARD_CONTRACT_SHA256
+        ),
         "code": {"path": r"C:\original\code", "revision": "4" * 40, "clean": True},
         "model_loading": {
             "process_scope": "single_local_process",
@@ -324,51 +556,16 @@ def _fixture(tmp_path: Path, *, repair_ready: bool = True) -> dict:
             "generation_copy_performed": False,
             "legacy_feedback_wrapper_used": False,
         },
+        "portability": generation_adapter.CURRENT_STAGE_HARD_CONTRACT[
+            "portability"
+        ],
         "production_eligible": False,
         "automatic_promotion_allowed": False,
         "scheduler_write_performed": False,
         "slurm_submission_performed": False,
         "canonical_pointer_write_performed": False,
     }
-    repair = {
-        "schema_version": "mft-tier1-current7-physics-repair-attestation-v1",
-        "offspring_physics_repair": repair_ready,
-        "fixed_primary_turns_repair": repair_ready,
-        "fixed_primary_turns_supported": [5, 6],
-        "stages": {
-            "initial_population_repair": repair_ready,
-            "warm_start_repair": repair_ready,
-            "every_offspring_decode_repair": repair_ready,
-            "terminal_physical_replay": repair_ready,
-        },
-        "warm_coordinates_are_donors_only": True,
-        "source_prediction_or_pass_classification_inherited": False,
-        "launch_eligible": repair_ready,
-    }
-    repair["sha256"] = receipt_contract.canonical_sha256(repair)
-    receipt = {
-        "schema_version": receipt_contract.SMOKE_RECEIPT_SCHEMA,
-        "status": "passed",
-        "adapter_manifest": adapter,
-        "adapter_manifest_sha256": receipt_contract.canonical_sha256(adapter),
-        "model_load": {
-            "process_scope": "single_local_process",
-            "local_process_count": 1,
-            "cache_loaded_once": True,
-            "load_calls": 1,
-            "full_generation_authentication_passes": 1,
-            "loaded_model_count": 20,
-            "loaded_model_targets_sha256": (
-                receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS_SHA256
-            ),
-        },
-        "optimizer_repair": repair,
-        "production_eligible": False,
-        "automatic_promotion_allowed": False,
-        "scheduler_write_performed": False,
-        "slurm_submission_performed": False,
-        "canonical_pointer_write_performed": False,
-    }
+    receipt = _v2_receipt(adapter, repair_ready=repair_ready)
     receipt_path = tmp_path / "authentication_receipt.json"
     _write_json(receipt_path, receipt)
 
@@ -462,52 +659,52 @@ def test_receipt_mapping_seals_current7_and_repair_gate(tmp_path):
     assert identity.launch_eligible is True
     assert identity.offspring_physics_repair is True
     assert identity.fixed_primary_turns_supported == (5, 6)
+    assert set(
+        identity.optimizer_repair_contract_sha256_by_fixed_primary_turns
+    ) == {"5", "6"}
+    assert (
+        identity.optimizer_repair_contract_sha256_by_fixed_primary_turns["5"]
+        != identity.optimizer_repair_contract_sha256_by_fixed_primary_turns["6"]
+    )
+    assert identity.hard_spec == generation_preflight.CURRENT_STAGE_SPEC
+    assert identity.hard_spec_sha256 == generation_preflight.CURRENT_STAGE_SPEC_SHA256
+    assert identity.constraint_names == generation_preflight.CURRENT7_CONSTRAINT_NAMES
     assert identity.artifact_count == 42
     assert identity.required_model_targets_sha256 == (
         receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS_SHA256
     )
 
 
-def test_actual_first_smoke_receipt_shape_is_authenticated_but_launch_blocked(
-    tmp_path,
-):
+def test_legacy_or_incomplete_smoke_receipt_is_rejected(tmp_path):
     fixture = _fixture(tmp_path)
     value = json.loads(fixture["receipt"].read_text())
-    old_loading = value.pop("model_load")
+    value["schema_version"] = "mft-tier1-corrected-generation-smoke-receipt-v1"
     value["status"] = "authenticated_model_smoke_passed_launch_blocked"
-    value["runner"] = {
-        "schema_version": "mft-tier1-current7-corrected-runner-v1",
-        "full_nsga_executed": False,
-        "launch_eligible": False,
-    }
-    value["model_loading"] = {
-        "required_targets": list(receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS),
-        "required_targets_sha256": old_loading["loaded_model_targets_sha256"],
-        "loaded_target_count": old_loading["loaded_model_count"],
-        "cache_load_calls": old_loading["load_calls"],
-        "full_generation_authentication_passes": old_loading[
-            "full_generation_authentication_passes"
-        ],
-        "models_loaded_once_per_process": True,
-        "generation_copy_performed": False,
-        "model_smoke_completed": True,
-    }
-    value.pop("optimizer_repair")
-    value["physics_repair"] = {
-        "schema_version": "mft-tier1-current7-physics-repair-pending-v1",
-        "initial_population_repair": False,
-        "warm_start_repair": False,
-        "offspring_physics_repair": False,
-        "terminal_physical_replay": False,
-        "fixed_primary_turns_repair": False,
-        "fixed_primary_turns": None,
-        "launch_eligible": False,
-    }
+    value.pop("payload_sha256")
     value["payload_sha256"] = receipt_contract.canonical_sha256(value)
-    identity = receipt_contract.validate_adapter_receipt(value)
-    assert identity.local_model_load_smoke_passed is True
-    assert identity.offspring_physics_repair is False
-    assert identity.launch_eligible is False
+    with pytest.raises(RuntimeError, match="unsupported"):
+        receipt_contract.validate_adapter_receipt(value)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("missing_stratum", "repair_contract_sha", "repair_stage_sha"),
+)
+def test_receipt_v2_stratum_and_repair_seals_are_fail_closed(tmp_path, tamper):
+    fixture = _fixture(tmp_path)
+    value = json.loads(fixture["receipt"].read_text())
+    if tamper == "missing_stratum":
+        value["strata"].pop("6")
+    elif tamper == "repair_contract_sha":
+        value["strata"]["5"]["optimizer_repair"]["contract_sha256"] = "0" * 64
+    else:
+        value["strata"]["6"]["optimizer_repair"]["stage_evidence"][
+            "sha256"
+        ] = "0" * 64
+    value.pop("payload_sha256")
+    value["payload_sha256"] = receipt_contract.canonical_sha256(value)
+    with pytest.raises(RuntimeError):
+        receipt_contract.validate_adapter_receipt(value)
 
 
 def test_bundle_is_content_addressed_and_relocates_absolute_paths(tmp_path):
@@ -579,16 +776,20 @@ def test_task_waves_are_4_plus_32_and_use_requested_resources(tmp_path):
         assert task["priority"] == 0
         assert task["payload_json"]["optimizer_processes"] == 1
         assert task["payload_json"]["offspring_physics_repair"] is True
+        fixed_turns = str(task["payload_json"]["lane"]["fixed_primary_turns"])
+        assert task["payload_json"]["optimizer_repair_contract_sha256"] == (
+            manifest["adapter_receipt"]["identity"][
+                "optimizer_repair_contract_sha256_by_fixed_primary_turns"
+            ][fixed_turns]
+        )
         assert "$PWD/artifacts/python-site" in task["command"]
         assert "tier1_corrected_current7_slurm_seed_runner.py" in task["command"]
         assert "tier1_slurm_seed_runner.py" not in task["command"]
 
 
 def test_smoke_only_or_repair_false_receipt_cannot_render_tasks(tmp_path):
-    _fixture_value, plan, manifest = _plan(tmp_path, repair_ready=False)
-    assert manifest["adapter_receipt"]["launch_eligible"] is False
-    with pytest.raises(RuntimeError, match="smoke-only"):
-        bundle_tool.build_task_waves(plan, manifest)
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        _plan(tmp_path, repair_ready=False)
 
 
 def test_fast_ramp_releases_all_32_without_waiting_for_completion(tmp_path):
@@ -749,6 +950,32 @@ def test_remote_runner_rejects_relocated_artifact_tamper(tmp_path, monkeypatch):
     )
     (generation / artifact).write_bytes(b"tampered-size")
     with pytest.raises(RuntimeError, match="missing/wrong size"):
+        runner.verify_payload(
+            bundle,
+            payload_path,
+            payload_root,
+            receipt_contract.canonical_sha256(payload),
+        )
+
+
+def test_remote_runner_rejects_cross_stratum_repair_contract(tmp_path, monkeypatch):
+    fixture, plan, manifest = _plan(tmp_path)
+    bundle = _local_publish(tmp_path, fixture, plan, manifest)
+    task = bundle_tool.build_task_waves(plan, manifest)["canaries"][0]
+    payload = copy.deepcopy(task["payload_json"])
+    assert payload["lane"]["fixed_primary_turns"] == 5
+    payload["optimizer_repair_contract_sha256"] = manifest[
+        "adapter_receipt"
+    ]["identity"]["optimizer_repair_contract_sha256_by_fixed_primary_turns"]["6"]
+    payload_root = tmp_path / "scheduler-runs"
+    payload_path = payload_root / "task-1" / "payload.json"
+    _write_json(payload_path, payload)
+    monkeypatch.setattr(
+        runner.importlib.metadata,
+        "version",
+        lambda name: manifest["runtime"]["critical_packages"][name],
+    )
+    with pytest.raises(RuntimeError, match="N1 stratum"):
         runner.verify_payload(
             bundle,
             payload_path,
@@ -1068,13 +1295,19 @@ def test_controller_dry_run_has_zero_local_and_scheduler_writes(tmp_path):
 
 
 def test_controller_rejects_repair_false_before_any_write(tmp_path):
-    _fixture_value, plan, _manifest = _plan(tmp_path, repair_ready=False)
-    plan_path = Path(plan["bundle_manifest"]).parent / "offload_plan.json"
+    fixture, _plan_value, _manifest, plan_path, _remote, publication = (
+        _published_fixture(tmp_path)
+    )
+    receipt = json.loads(fixture["receipt"].read_text())
+    receipt["strata"].pop("6")
+    receipt.pop("payload_sha256")
+    receipt["payload_sha256"] = receipt_contract.canonical_sha256(receipt)
+    _write_json(fixture["receipt"], receipt)
     scheduler = _FakeScheduler()
-    with pytest.raises(RuntimeError, match="repair=true"):
+    with pytest.raises(RuntimeError):
         controller.control_once(
             plan_path,
-            {},
+            publication,
             state_path=tmp_path / "blocked.json",
             apply=True,
             scheduler=scheduler,

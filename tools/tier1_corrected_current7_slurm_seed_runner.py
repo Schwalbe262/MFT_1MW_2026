@@ -134,7 +134,13 @@ def _require_fail_closed(value: Mapping[str, Any], label: str) -> None:
         raise RuntimeError(f"{label} fail-closed policy mismatch")
 
 
-def _validate_repair_gate(identity: Mapping[str, Any], label: str) -> None:
+def _validate_repair_gate(
+    identity: Mapping[str, Any], label: str, *, stratum_map: bool
+) -> None:
+    repair_contracts = identity.get(
+        "optimizer_repair_contract_sha256_by_fixed_primary_turns"
+    )
+    repair_contract = identity.get("optimizer_repair_contract_sha256")
     if (
         identity.get("launch_eligible") is not True
         or identity.get("offspring_physics_repair") is not True
@@ -143,7 +149,21 @@ def _validate_repair_gate(identity: Mapping[str, Any], label: str) -> None:
         or identity.get("warm_repair_attested") is not True
         or identity.get("every_offspring_decode_repair_attested") is not True
         or identity.get("terminal_physical_replay_attested") is not True
-        or not isinstance(identity.get("optimizer_repair_contract_sha256"), str)
+        or (
+            stratum_map
+            and (
+                not isinstance(repair_contracts, dict)
+                or set(repair_contracts) != {"5", "6"}
+                or any(
+                    not isinstance(value, str) or len(value) != 64
+                    for value in repair_contracts.values()
+                )
+            )
+        )
+        or (
+            not stratum_map
+            and (not isinstance(repair_contract, str) or len(repair_contract) != 64)
+        )
     ):
         raise RuntimeError(f"{label} fixed-turn offspring repair/replay gate mismatch")
 
@@ -182,6 +202,7 @@ def verify_payload(
             },
         },
         "task payload",
+        stratum_map=False,
     )
 
     manifest_path = bundle / "bundle_manifest.json"
@@ -198,7 +219,20 @@ def verify_payload(
         raise RuntimeError("bundle/task schema identity mismatch")
     _require_fail_closed(manifest, "bundle manifest")
     identity = (manifest.get("adapter_receipt") or {}).get("identity") or {}
-    _validate_repair_gate(identity, "bundle adapter receipt")
+    _validate_repair_gate(identity, "bundle adapter receipt", stratum_map=True)
+    if (
+        manifest.get("constraint_version") != identity.get("constraint_version")
+        or manifest.get("hard_spec") != identity.get("hard_spec")
+        or manifest.get("hard_spec_sha256") != identity.get("hard_spec_sha256")
+        or manifest.get("constraint_names") != identity.get("constraint_names")
+        or manifest.get("temperature_targets")
+        != list(CURRENT_TEMPERATURE_TARGETS)
+        or manifest.get("temperature_contract_sha256")
+        != identity.get("temperature_contract_sha256")
+        or manifest.get("hard_constraint_contract_sha256")
+        != identity.get("hard_constraint_contract_sha256")
+    ):
+        raise RuntimeError("bundle hard-constraint identity is not pinned to receipt")
     for field in (
         "adapter_manifest_sha256",
         "train_report_sha256",
@@ -207,7 +241,6 @@ def verify_payload(
         "required_model_targets_sha256",
         "temperature_contract_sha256",
         "hard_constraint_contract_sha256",
-        "optimizer_repair_contract_sha256",
     ):
         payload_field = (
             "adapter_manifest_sha256"
@@ -216,6 +249,14 @@ def verify_payload(
         )
         if payload.get(payload_field) != identity.get(field):
             raise RuntimeError(f"task payload {field} is not pinned to receipt")
+    lane = payload.get("lane") or {}
+    repair_contracts = identity[
+        "optimizer_repair_contract_sha256_by_fixed_primary_turns"
+    ]
+    if payload.get("optimizer_repair_contract_sha256") != repair_contracts.get(
+        str(lane.get("fixed_primary_turns"))
+    ):
+        raise RuntimeError("task repair contract is not pinned to its N1 stratum")
     if (
         payload.get("generation_artifact_inventory_sha256")
         != manifest.get("generation_artifact_inventory_sha256")
@@ -453,6 +494,7 @@ def validate_result(
     manifest: Mapping[str, Any],
 ) -> None:
     lane = payload["lane"]
+    identity = manifest["adapter_receipt"]["identity"]
     thermal_constraints = [
         name
         for name in result.get("constraint_names", [])
@@ -492,12 +534,14 @@ def validate_result(
         or not isinstance(hard_spec, dict)
         or not hard_spec
         or result.get("stage_spec_sha256") != canonical_sha256(hard_spec)
-        or not isinstance(result.get("constraint_version"), str)
-        or not result.get("constraint_version")
+        or hard_spec != identity.get("hard_spec")
+        or result.get("stage_spec_sha256") != identity.get("hard_spec_sha256")
+        or result.get("constraint_version") != identity.get("constraint_version")
         or not isinstance(constraint_names, list)
         or not constraint_names
         or any(not isinstance(name, str) or not name for name in constraint_names)
         or len(constraint_names) != len(set(constraint_names))
+        or constraint_names != identity.get("constraint_names")
         or not isinstance(artifact_inventory, dict)
         or not artifact_inventory
         or result.get("artifact_inventory_sha256")

@@ -20,6 +20,7 @@ from regression_260707.monitoring.readers import CANDIDATE_REPORT_FIELDS
 from regression_260707.optimization.geometry_metrics import bounding_box_lit
 from tools import tier1_corrected_generation_adapter as adapter
 from tools import tier1_corrected_generation_preflight as preflight
+from tools import tier1_corrected_current7_slurm_seed_runner as slurm_seed_runner
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -1156,3 +1157,55 @@ def test_search_seed_cli_runs_synthetic_optimizer_and_seals_artifacts(
         path = output / artifact["path"]
         assert path.stat().st_size == artifact["size_bytes"]
         assert adapter.sha256_file(path) == artifact["sha256"]
+
+    # Cross the actual producer/consumer seam: the immutable Slurm runner must
+    # accept the real search entrypoint's truthful preflight and terminal seal.
+    slurm_identity = {
+        "hard_spec": preflight.CURRENT_STAGE_SPEC,
+        "hard_spec_sha256": preflight.CURRENT_STAGE_SPEC_SHA256,
+        "constraint_version": adapter.CURRENT_STAGE_HARD_CONTRACT["stage"],
+        "constraint_names": list(preflight.CURRENT7_CONSTRAINT_NAMES),
+    }
+    slurm_manifest = {
+        **manifest,
+        "adapter_receipt": {"identity": slurm_identity},
+    }
+    slurm_payload = {
+        "bundle_id": bundle_id,
+        "seed": 5,
+        "lane": {"island_id": island_id, "fixed_primary_turns": 5},
+        "population": 64,
+        "max_generations": 2,
+        "inference_threads": 8,
+        "generation_artifact_inventory_sha256": manifest[
+            "generation_artifact_inventory_sha256"
+        ],
+        "adapter_manifest_sha256": receipt["adapter_manifest_sha256"],
+        "train_report_sha256": adapter_evidence["train_report"]["sha256"],
+        "dataset_sha256": adapter_evidence["dataset"]["sha256"],
+        "profile_canonical_sha256": adapter_evidence["profile"][
+            "canonical_sha256"
+        ],
+        "temperature_contract_sha256": (
+            adapter.CURRENT_TEMPERATURE_CONTRACT_SHA256
+        ),
+        "hard_constraint_contract_sha256": (
+            adapter.CURRENT_STAGE_HARD_CONTRACT_SHA256
+        ),
+        "island_profile_sha256": island_profile["sha256"],
+        "warm_artifact_sha256": warm_sha,
+        "warm_contract_sha256": warm_record["contract"]["sha256"],
+        "optimizer_repair_contract_sha256": repair_sha,
+        "maximum_peak_rss_bytes": 10_000_000_000,
+    }
+    assert slurm_seed_runner.validate_remote_preflight(
+        remote,
+        payload=slurm_payload,
+        manifest=slurm_manifest,
+        optimizer_pid=remote["optimizer_pid"],
+    ) >= remote["observed_peak_rss_bytes"]
+    slurm_seed_runner.validate_result(
+        result,
+        payload=slurm_payload,
+        manifest=slurm_manifest,
+    )

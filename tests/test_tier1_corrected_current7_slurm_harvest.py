@@ -35,10 +35,24 @@ def _contracts(seeds=(101,)):
         "bundle_manifest_sha256": "a" * 64,
         "remote_bundle": "/gpfs/tmp_cpu2/current7-test",
     }
+    hard_spec = {
+        "Llt_target_uH": 27.5,
+        "Llt_tol_uH": 0.55,
+        "T_limit_C": 110.0,
+        "resonance_min_Hz": 15_000.0,
+    }
     manifest = {
         "contract_sha256": "b" * 64,
         "task_schema_version": "mft-tier1-current7-slurm-seed-task-v1",
         "status_schema_version": harvest.STATUS_SCHEMA,
+        "constraint_version": (
+            "1200x1200x750-res15k-t110-core4-cw1-5-lmhalf"
+        ),
+        "hard_spec": hard_spec,
+        "hard_spec_sha256": harvest.canonical_sha256(hard_spec),
+        "hard_constraint_contract_sha256": "c" * 64,
+        "temperature_contract_sha256": "d" * 64,
+        "constraint_names": ["Llt_robust_band", "exterior_width_limit"],
         "temperature_targets": [f"temperature-{index}" for index in range(7)],
         "search_execution": {
             "result_schema_version": harvest.RESULT_SCHEMA,
@@ -104,19 +118,7 @@ def _task_and_files(plan, manifest, state, *, terminal="completed", candidates=N
     task_id = submission["task_id"]
     seed = submission["seed"]
     expected = _payload_builder(plan, manifest, seed=seed)
-    hard_spec = {
-        "Llt_target_uH": 27.5,
-        "Llt_tol_uH": 0.55,
-        "T_limit_C": 110.0,
-        "B_limit_T": 1.2,
-        "insulation_min_mm": 40.0,
-        "n_core_group_max": 4,
-        "primary_conductor_thickness_mm": 5.0,
-        "resonance_min_Hz": 15_000.0,
-        "size_W_max_mm": 1_200.0,
-        "size_L_max_mm": 1_200.0,
-        "size_H_max_mm": 750.0,
-    }
+    hard_spec = manifest["hard_spec"]
     supplied_candidates = candidates or []
     default_least = {
         "decoded_params": {"fallback": 1},
@@ -200,14 +202,16 @@ def _task_and_files(plan, manifest, state, *, terminal="completed", candidates=N
         "bundle_id": plan["bundle_id"],
         "seed": seed,
         "completed_generations": 201,
-        "constraint_version": (
-            "1200x1200x750-res15k-t110-core4-cw1-5-lmhalf"
-        ),
+        "constraint_version": manifest["constraint_version"],
         "hard_spec": hard_spec,
-        "stage_spec_sha256": harvest.canonical_sha256(hard_spec),
-        "hard_constraint_contract_sha256": "c" * 64,
-        "temperature_contract_sha256": "d" * 64,
-        "constraint_names": ["Llt_robust_band", "exterior_width_limit"],
+        "stage_spec_sha256": manifest["hard_spec_sha256"],
+        "hard_constraint_contract_sha256": manifest[
+            "hard_constraint_contract_sha256"
+        ],
+        "temperature_contract_sha256": manifest[
+            "temperature_contract_sha256"
+        ],
+        "constraint_names": manifest["constraint_names"],
         "temperature_targets": list(manifest["temperature_targets"]),
         "terminal_population_count": max(1, len(supplied_candidates)),
         "physical_feasible_count": len(pareto_candidates),

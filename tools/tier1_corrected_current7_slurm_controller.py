@@ -314,6 +314,9 @@ def _receipt_launch_gate(
         raise RuntimeError("adapter receipt is absent from local bundle sources")
     identity = validate_adapter_receipt(read_json(source)).to_dict()
     expected = manifest["adapter_receipt"]["identity"]
+    repair_contracts = identity.get(
+        "optimizer_repair_contract_sha256_by_fixed_primary_turns"
+    )
     mandatory = (
         identity == expected
         and identity.get("launch_eligible") is True
@@ -323,8 +326,12 @@ def _receipt_launch_gate(
         and identity.get("warm_repair_attested") is True
         and identity.get("every_offspring_decode_repair_attested") is True
         and identity.get("terminal_physical_replay_attested") is True
-        and isinstance(identity.get("optimizer_repair_contract_sha256"), str)
-        and len(identity["optimizer_repair_contract_sha256"]) == 64
+        and isinstance(repair_contracts, dict)
+        and set(repair_contracts) == {"5", "6"}
+        and all(
+            isinstance(value, str) and len(value) == 64
+            for value in repair_contracts.values()
+        )
     )
     if not mandatory:
         raise RuntimeError(

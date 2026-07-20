@@ -933,6 +933,55 @@ def aggregate_candidates(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
 def authenticated_constraint_identity(
     records: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
+    expected = {
+        "constraint_version": manifest.get("constraint_version"),
+        "hard_spec": copy.deepcopy(manifest.get("hard_spec")),
+        "hard_spec_sha256": manifest.get("hard_spec_sha256"),
+        "hard_constraint_contract_sha256": manifest.get(
+            "hard_constraint_contract_sha256"
+        ),
+        "temperature_contract_sha256": manifest.get(
+            "temperature_contract_sha256"
+        ),
+        "constraint_names": copy.deepcopy(manifest.get("constraint_names")),
+        "temperature_targets": copy.deepcopy(manifest.get("temperature_targets")),
+    }
+    if (
+        not isinstance(expected["constraint_version"], str)
+        or not expected["constraint_version"]
+        or not isinstance(expected["hard_spec"], dict)
+        or not expected["hard_spec"]
+        or expected["hard_spec_sha256"]
+        != canonical_sha256(expected["hard_spec"])
+        or not isinstance(expected["constraint_names"], list)
+        or not expected["constraint_names"]
+        or any(
+            not isinstance(name, str) or not name
+            for name in expected["constraint_names"]
+        )
+        or len(expected["constraint_names"])
+        != len(set(expected["constraint_names"]))
+        or not isinstance(expected["temperature_targets"], list)
+        or not expected["temperature_targets"]
+        or any(
+            not isinstance(target, str) or not target
+            for target in expected["temperature_targets"]
+        )
+        or len(expected["temperature_targets"])
+        != len(set(expected["temperature_targets"]))
+    ):
+        raise RuntimeError("bundle hard-constraint identity is invalid")
+    expected["hard_spec_sha256"] = _hex(
+        expected["hard_spec_sha256"], "bundle hard spec SHA"
+    )
+    expected["hard_constraint_contract_sha256"] = _hex(
+        expected["hard_constraint_contract_sha256"],
+        "bundle hard constraint contract SHA",
+    )
+    expected["temperature_contract_sha256"] = _hex(
+        expected["temperature_contract_sha256"],
+        "bundle temperature contract SHA",
+    )
     identities = []
     for record in records:
         result = record.get("_result")
@@ -951,7 +1000,7 @@ def authenticated_constraint_identity(
             or not constraint_names
             or any(not isinstance(name, str) or not name for name in constraint_names)
             or len(constraint_names) != len(set(constraint_names))
-            or temperatures != list(manifest.get("temperature_targets") or [])
+            or temperatures != expected["temperature_targets"]
             or not isinstance(constraint_version, str)
             or not constraint_version
         ):
@@ -973,18 +1022,7 @@ def authenticated_constraint_identity(
                 "temperature_targets": list(temperatures),
             }
         )
-    if not identities:
-        return {
-            "constraint_version": None,
-            "hard_spec": None,
-            "hard_spec_sha256": None,
-            "hard_constraint_contract_sha256": None,
-            "temperature_contract_sha256": None,
-            "constraint_names": [],
-            "temperature_targets": list(manifest.get("temperature_targets") or []),
-        }
-    expected = identities[0]
-    if any(item != expected for item in identities[1:]):
+    if any(item != expected for item in identities):
         raise RuntimeError("terminal results mix hard-constraint identities")
     return expected
 

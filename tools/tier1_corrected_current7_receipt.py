@@ -13,80 +13,61 @@ the corresponding bytes to bundle-relative paths instead.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
-import json
 from typing import Any, Mapping
 
-
-ADAPTER_SCHEMA = "mft-tier1-corrected-generation-adapter-v1"
-SMOKE_RECEIPT_SCHEMA = "mft-tier1-corrected-generation-smoke-receipt-v1"
-
-CURRENT_TEMPERATURE_TARGETS = (
-    "Tprobe_Tx_leeward_max",
-    "Tprobe_Rx_main_leeward_max",
-    "Tprobe_Rx_side_leeward_max",
-    "Tprobe_core_center_max",
-    "Tprobe_core_center_leg_max",
-    "Tprobe_core_side_leg_max",
-    "Tprobe_core_top_yoke_max",
-)
-
-CORRECTED_GENERATION_TARGETS = (
-    "Llt_phys",
-    "k",
-    "C_tx_tx_F",
-    "C_rx_rx_F",
-    "C_tx_rx_F",
-    "P_winding_total",
-    "P_Tx_main_group",
-    "P_Rx_main_group",
-    "P_Rx_side_total",
-    "P_core_total",
-    "P_core_plate_total",
-    "P_wcp_total",
-    "B_max_core",
-    "B_mean_core",
-    *CURRENT_TEMPERATURE_TARGETS,
-)
-
-CURRENT_REQUIRED_MODEL_TARGETS = (
-    "Llt_phys",
-    "k",
-    "C_tx_tx_F",
-    "C_rx_rx_F",
-    "C_tx_rx_F",
-    "P_winding_total",
-    "P_core_total",
-    "P_core_plate_total",
-    "P_wcp_total",
-    "P_Tx_main_group",
-    "P_Rx_main_group",
-    "P_Rx_side_total",
-    "B_mean_core",
-    *CURRENT_TEMPERATURE_TARGETS,
-)
+try:
+    from tier1_corrected_generation_adapter import (
+        ADAPTER_SCHEMA,
+        CORRECTED_GENERATION_TARGETS,
+        CURRENT_REQUIRED_MODEL_TARGETS,
+        CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
+        CURRENT_TEMPERATURE_TARGETS,
+        canonical_sha256,
+    )
+    from tier1_corrected_generation_preflight import (
+        CURRENT7_CONSTRAINT_NAMES,
+        CURRENT_STAGE_HARD_CONTRACT,
+        CURRENT_STAGE_SPEC,
+        CURRENT_STAGE_SPEC_SHA256,
+        RECEIPT_SCHEMA as SMOKE_RECEIPT_SCHEMA,
+        SUPPORTED_FIXED_PRIMARY_TURNS,
+        validate_smoke_receipt as authoritative_validate_smoke_receipt,
+    )
+except ImportError:  # pragma: no cover - repository package path
+    from tools.tier1_corrected_generation_adapter import (
+        ADAPTER_SCHEMA,
+        CORRECTED_GENERATION_TARGETS,
+        CURRENT_REQUIRED_MODEL_TARGETS,
+        CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
+        CURRENT_TEMPERATURE_TARGETS,
+        canonical_sha256,
+    )
+    from tools.tier1_corrected_generation_preflight import (
+        CURRENT7_CONSTRAINT_NAMES,
+        CURRENT_STAGE_HARD_CONTRACT,
+        CURRENT_STAGE_SPEC,
+        CURRENT_STAGE_SPEC_SHA256,
+        RECEIPT_SCHEMA as SMOKE_RECEIPT_SCHEMA,
+        SUPPORTED_FIXED_PRIMARY_TURNS,
+        validate_smoke_receipt as authoritative_validate_smoke_receipt,
+    )
 
 LEGACY_ALL11_TARGETS = frozenset(
     ("T_max_Tx", "T_max_Rx_main", "T_max_Rx_side", "T_max_core")
 )
 
-
-def canonical_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def canonical_sha256(value: Any) -> str:
-    return hashlib.sha256(canonical_bytes(value)).hexdigest()
-
-
-CURRENT_REQUIRED_MODEL_TARGETS_SHA256 = canonical_sha256(
-    list(CURRENT_REQUIRED_MODEL_TARGETS)
+__all__ = (
+    "ADAPTER_SCHEMA",
+    "CORRECTED_GENERATION_TARGETS",
+    "CURRENT_REQUIRED_MODEL_TARGETS",
+    "CURRENT_REQUIRED_MODEL_TARGETS_SHA256",
+    "CURRENT_TEMPERATURE_TARGETS",
+    "SMOKE_RECEIPT_SCHEMA",
+    "CorrectedReceiptIdentity",
+    "adapter_manifest_view",
+    "canonical_sha256",
+    "expected_generation_artifacts",
+    "validate_adapter_receipt",
 )
 
 
@@ -127,7 +108,9 @@ def _positive_integer(value: Any, label: str) -> int:
     return integer
 
 
-def _adapter_view(receipt: Mapping[str, Any]) -> tuple[Mapping[str, Any], bool]:
+def _adapter_view(
+    receipt: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any] | None]:
     """Return the adapter manifest and whether a model-load smoke was sealed.
 
     This is the intentionally isolated field-mapping seam.  The first adapter
@@ -137,34 +120,23 @@ def _adapter_view(receipt: Mapping[str, Any]) -> tuple[Mapping[str, Any], bool]:
 
     schema = receipt.get("schema_version")
     if schema == ADAPTER_SCHEMA:
-        return receipt, False
+        return receipt, None
     if schema != SMOKE_RECEIPT_SCHEMA:
         raise RuntimeError("unsupported corrected adapter receipt schema")
-    if receipt.get("status") not in {
-        "passed",
-        "authenticated_model_smoke_passed_launch_blocked",
-        "authenticated_model_smoke_passed_launch_eligible",
-    }:
-        raise RuntimeError("corrected adapter smoke receipt did not pass")
-    if "payload_sha256" in receipt:
-        unsigned = {
-            key: item for key, item in receipt.items() if key != "payload_sha256"
-        }
-        if receipt.get("payload_sha256") != canonical_sha256(unsigned):
-            raise RuntimeError("corrected adapter smoke payload SHA-256 mismatch")
-    adapter = _mapping(receipt.get("adapter_manifest"), "adapter_manifest")
-    if adapter.get("schema_version") != ADAPTER_SCHEMA:
-        raise RuntimeError("smoke receipt nested adapter schema mismatch")
-    if receipt.get("adapter_manifest_sha256") != canonical_sha256(adapter):
-        raise RuntimeError("smoke receipt adapter-manifest SHA-256 mismatch")
-    return adapter, True
+    # The producer owns all v2 dual-stratum semantics.  This adapter deliberately
+    # does not duplicate that validator; it extracts only a sealed Slurm view.
+    validated = authoritative_validate_smoke_receipt(
+        dict(receipt), relocated_source_evidence=True
+    )
+    adapter = _mapping(validated.get("adapter_manifest"), "adapter_manifest")
+    return adapter, validated
 
 
 def adapter_manifest_view(value: Any) -> Mapping[str, Any]:
     """Expose the normalized adapter object for documentary-path sealing only."""
 
     receipt = _mapping(value, "corrected adapter receipt")
-    adapter, _is_smoke = _adapter_view(receipt)
+    adapter, _smoke = _adapter_view(receipt)
     return adapter
 
 
@@ -190,13 +162,17 @@ class CorrectedReceiptIdentity:
     hard_constraint_contract_sha256: str
     adapter_code_revision: str
     local_model_load_smoke_passed: bool
-    optimizer_repair_contract_sha256: str | None
+    optimizer_repair_contract_sha256_by_fixed_primary_turns: dict[str, str]
     offspring_physics_repair: bool
     fixed_primary_turns_supported: tuple[int, ...]
     initial_repair_attested: bool
     warm_repair_attested: bool
     every_offspring_decode_repair_attested: bool
     terminal_physical_replay_attested: bool
+    constraint_version: str | None
+    hard_spec: dict[str, Any] | None
+    hard_spec_sha256: str | None
+    constraint_names: tuple[str, ...]
     launch_eligible: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -204,6 +180,7 @@ class CorrectedReceiptIdentity:
         value["fixed_primary_turns_supported"] = list(
             self.fixed_primary_turns_supported
         )
+        value["constraint_names"] = list(self.constraint_names)
         return value
 
 
@@ -211,7 +188,8 @@ def validate_adapter_receipt(value: Any) -> CorrectedReceiptIdentity:
     """Validate one local receipt without resolving any recorded path."""
 
     receipt = _mapping(value, "corrected adapter receipt")
-    adapter, is_smoke = _adapter_view(receipt)
+    adapter, smoke_receipt = _adapter_view(receipt)
+    is_smoke = smoke_receipt is not None
     if adapter.get("schema_version") != ADAPTER_SCHEMA:
         raise RuntimeError("corrected adapter manifest schema mismatch")
 
@@ -283,112 +261,34 @@ def validate_adapter_receipt(value: Any) -> CorrectedReceiptIdentity:
     ):
         raise RuntimeError("corrected adapter fail-closed policy mismatch")
 
-    repair_contract: Mapping[str, Any] = {}
-    repair_contract_sha: str | None = None
+    repair_contract_by_turns: dict[str, str] = {}
     repair_gate = False
-    if is_smoke:
-        if isinstance(receipt.get("model_loading"), Mapping):
-            smoke = receipt["model_loading"]
-            smoke_passed = bool(
-                smoke.get("required_targets")
-                == list(CURRENT_REQUIRED_MODEL_TARGETS)
-                and smoke.get("required_targets_sha256")
-                == CURRENT_REQUIRED_MODEL_TARGETS_SHA256
-                and smoke.get("loaded_target_count")
-                == len(CURRENT_REQUIRED_MODEL_TARGETS)
-                and smoke.get("cache_load_calls") == 1
-                and smoke.get("full_generation_authentication_passes") == 1
-                and smoke.get("models_loaded_once_per_process") is True
-                and smoke.get("generation_copy_performed") is False
-                and smoke.get("model_smoke_completed") is True
+    constraint_version: str | None = None
+    hard_spec: dict[str, Any] | None = None
+    hard_spec_sha: str | None = None
+    constraint_names: tuple[str, ...] = ()
+    if smoke_receipt is not None:
+        for turns in SUPPORTED_FIXED_PRIMARY_TURNS:
+            key = str(turns)
+            stratum = smoke_receipt["strata"][key]
+            repair_contract_by_turns[key] = _hex(
+                stratum["optimizer_repair"]["contract_sha256"],
+                64,
+                f"N1={turns} optimizer repair contract SHA-256",
             )
-        else:
-            smoke = _mapping(receipt.get("model_load"), "model_load")
-            smoke_passed = bool(
-                smoke.get("process_scope") == "single_local_process"
-                and smoke.get("local_process_count") == 1
-                and smoke.get("cache_loaded_once") is True
-                and smoke.get("load_calls") == 1
-                and smoke.get("full_generation_authentication_passes") == 1
-                and smoke.get("loaded_model_count")
-                == len(CURRENT_REQUIRED_MODEL_TARGETS)
-                and smoke.get("loaded_model_targets_sha256")
-                == CURRENT_REQUIRED_MODEL_TARGETS_SHA256
-            )
-        if not smoke_passed:
-            raise RuntimeError("corrected adapter one-process smoke gate mismatch")
-        if any(
-            receipt.get(field) is not False
-            for field in (
-                "production_eligible",
-                "automatic_promotion_allowed",
-                "scheduler_write_performed",
-                "slurm_submission_performed",
-                "canonical_pointer_write_performed",
-            )
-        ):
-            raise RuntimeError("corrected adapter smoke fail-closed policy mismatch")
-        candidate_repair = receipt.get("physics_repair")
-        if not isinstance(candidate_repair, Mapping):
-            candidate_repair = receipt.get("optimizer_repair")
-        if isinstance(candidate_repair, Mapping):
-            repair_contract = candidate_repair
-            unsigned = {
-                key: item
-                for key, item in repair_contract.items()
-                if key != "sha256"
-            }
-            repair_contract_sha = canonical_sha256(unsigned)
-            has_seal = repair_contract.get("sha256") == repair_contract_sha
-            if repair_contract.get("sha256") is not None and not has_seal:
-                raise RuntimeError("optimizer repair contract SHA-256 mismatch")
-            stages = repair_contract.get("stages")
-            if not isinstance(stages, Mapping):
-                stages = {
-                    "initial_population_repair": repair_contract.get(
-                        "initial_population_repair"
-                    ),
-                    "warm_start_repair": repair_contract.get(
-                        "warm_start_repair"
-                    ),
-                    "every_offspring_decode_repair": repair_contract.get(
-                        "every_offspring_decode_repair",
-                        repair_contract.get("offspring_physics_repair"),
-                    ),
-                    "terminal_physical_replay": repair_contract.get(
-                        "terminal_physical_replay"
-                    ),
-                }
-            fixed_supported = repair_contract.get(
-                "fixed_primary_turns_supported"
-            )
-            if fixed_supported is None:
-                fixed_supported = repair_contract.get("fixed_primary_turns")
-            if isinstance(fixed_supported, int):
-                fixed_supported = [fixed_supported]
-            runner_contract = receipt.get("runner") or {}
-            repair_gate = bool(
-                has_seal
-                and repair_contract.get("schema_version")
-                == "mft-tier1-current7-physics-repair-attestation-v1"
-                and repair_contract.get("offspring_physics_repair") is True
-                and repair_contract.get("fixed_primary_turns_repair") is True
-                and fixed_supported == [5, 6]
-                and stages.get("initial_population_repair") is True
-                and stages.get("warm_start_repair") is True
-                and stages.get("every_offspring_decode_repair") is True
-                and stages.get("terminal_physical_replay") is True
-                and repair_contract.get("warm_coordinates_are_donors_only") is True
-                and repair_contract.get(
-                    "source_prediction_or_pass_classification_inherited"
-                )
-                is False
-                and repair_contract.get("launch_eligible") is True
-                and (
-                    not runner_contract
-                    or runner_contract.get("launch_eligible") is True
-                )
-            )
+        problem = smoke_receipt["problem_contract"]
+        hard_spec = dict(problem["stage_spec"])
+        hard_spec_sha = _hex(
+            problem["stage_spec_sha256"], 64, "hard spec SHA-256"
+        )
+        constraint_names = tuple(problem["constraint_names"])
+        constraint_version = str(CURRENT_STAGE_HARD_CONTRACT["stage"])
+        repair_gate = bool(
+            hard_spec == CURRENT_STAGE_SPEC
+            and hard_spec_sha == CURRENT_STAGE_SPEC_SHA256
+            and constraint_names == tuple(CURRENT7_CONSTRAINT_NAMES)
+            and set(repair_contract_by_turns) == {"5", "6"}
+        )
 
     report = _mapping(adapter.get("train_report"), "train_report")
     candidate = _mapping(adapter.get("candidate"), "candidate")
@@ -448,51 +348,20 @@ def validate_adapter_receipt(value: Any) -> CorrectedReceiptIdentity:
             code.get("revision"), 40, "adapter code revision"
         ),
         local_model_load_smoke_passed=is_smoke,
-        optimizer_repair_contract_sha256=repair_contract_sha,
-        offspring_physics_repair=bool(
-            repair_contract.get("offspring_physics_repair") is True
+        optimizer_repair_contract_sha256_by_fixed_primary_turns=(
+            repair_contract_by_turns
         ),
-        fixed_primary_turns_supported=tuple(
-            (
-                repair_contract.get("fixed_primary_turns_supported")
-                or repair_contract.get("fixed_primary_turns")
-                or ()
-            )
-            if not isinstance(
-                repair_contract.get("fixed_primary_turns_supported")
-                or repair_contract.get("fixed_primary_turns"),
-                int,
-            )
-            else [
-                repair_contract.get("fixed_primary_turns_supported")
-                or repair_contract.get("fixed_primary_turns")
-            ]
+        offspring_physics_repair=bool(is_smoke and repair_gate),
+        fixed_primary_turns_supported=(
+            tuple(SUPPORTED_FIXED_PRIMARY_TURNS) if is_smoke else ()
         ),
-        initial_repair_attested=bool(
-            (repair_contract.get("stages") or repair_contract).get(
-                "initial_population_repair"
-            )
-            is True
-        ),
-        warm_repair_attested=bool(
-            (repair_contract.get("stages") or repair_contract).get(
-                "warm_start_repair"
-            )
-            is True
-        ),
-        every_offspring_decode_repair_attested=bool(
-            (repair_contract.get("stages") or {}).get(
-                "every_offspring_decode_repair"
-            )
-            is True
-            or repair_contract.get("every_offspring_decode_repair") is True
-            or repair_contract.get("offspring_physics_repair") is True
-        ),
-        terminal_physical_replay_attested=bool(
-            (repair_contract.get("stages") or repair_contract).get(
-                "terminal_physical_replay"
-            )
-            is True
-        ),
+        initial_repair_attested=bool(is_smoke and repair_gate),
+        warm_repair_attested=bool(is_smoke and repair_gate),
+        every_offspring_decode_repair_attested=bool(is_smoke and repair_gate),
+        terminal_physical_replay_attested=bool(is_smoke and repair_gate),
+        constraint_version=constraint_version,
+        hard_spec=hard_spec,
+        hard_spec_sha256=hard_spec_sha,
+        constraint_names=constraint_names,
         launch_eligible=bool(is_smoke and repair_gate),
     )
