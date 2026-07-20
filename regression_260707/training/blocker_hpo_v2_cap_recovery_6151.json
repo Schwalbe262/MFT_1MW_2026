@@ -1,0 +1,97 @@
+{
+  "schema_version": "mft-production-blocker-hpo-config-v2",
+  "mode": "production_blocker_only_nested_holdout",
+  "objective": "nested_gate_metric_ratio_deterministic_proposals_v2",
+  "source": {
+    "training_run_id": "20260719T151445-b8810300",
+    "generation": "generations/20260719T151445-b8810300",
+    "dataset_sha256": "0f0cb22a528cf029ce42101e7703d38200ae03038bd0aa95cc1619f34bca06a3",
+    "profile_sha256": "559e8289150e72a9daa70327aee0afc7050923838b323df4374bcc713d135101",
+    "strict_full_rows": 6151,
+    "quality_status_sha256": "e5f8fcdabe9b5426d240bfc29486a9f6c520e05248ed870021131c5420f41c0a",
+    "quality_thresholds_sha256": "e8f83cc0f49a5b511d6b34a44f7f05c2259747064bb2dc86f312032b88aadd2b",
+    "quality_thresholds_file_sha256": "608bd946449e5075fbc81dae3e710f34e97568e6875ff6ef8994c30b87b1ba30"
+  },
+  "cohort": {
+    "solver_revision": "7768510433858c9056f04320e66819d5fcc90f1a",
+    "library_revision": "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+  },
+  "capacitance_recovery": {
+    "contract": "mft-capacitance-lc-inverse-v1",
+    "recovered_row_count": 6151,
+    "max_allowed_abs_delta_F": 5.1e-11
+  },
+  "blockers": [
+    "Llt_phys",
+    "P_Tx_main_group",
+    "P_Rx_main_group",
+    "B_max_core",
+    "Tprobe_Tx_leeward_max",
+    "Tprobe_Rx_main_leeward_max",
+    "Tprobe_Rx_side_leeward_max",
+    "Tprobe_core_center_max",
+    "Tprobe_core_center_leg_max",
+    "Tprobe_core_side_leg_max",
+    "Tprobe_core_top_yoke_max"
+  ],
+  "expected_blocking_reasons": {
+    "Llt_phys": [
+      "metric_above_maximum:mape_pct",
+      "metric_above_maximum:p90_ape_pct",
+      "metric_above_maximum:interval_p90_half_width_pct"
+    ],
+    "P_Tx_main_group": ["interval_coverage_below_minimum"],
+    "P_Rx_main_group": ["metric_above_maximum:interval_p90_half_width_pct"],
+    "B_max_core": [
+      "metric_above_maximum:mape_pct",
+      "metric_above_maximum:p90_ape_pct",
+      "metric_above_maximum:interval_p90_half_width_pct"
+    ],
+    "Tprobe_Tx_leeward_max": [
+      "metric_above_maximum:rmse",
+      "metric_above_maximum:p90_ape_pct",
+      "metric_above_maximum:interval_p90_width"
+    ],
+    "Tprobe_Rx_main_leeward_max": [
+      "metric_above_maximum:rmse",
+      "metric_above_maximum:p90_ape_pct",
+      "metric_above_maximum:interval_p90_width"
+    ],
+    "Tprobe_Rx_side_leeward_max": ["metric_above_maximum:interval_p90_width"],
+    "Tprobe_core_center_max": [
+      "metric_above_maximum:rmse",
+      "metric_above_maximum:interval_p90_width"
+    ],
+    "Tprobe_core_center_leg_max": [
+      "metric_below_minimum:r2",
+      "metric_above_maximum:rmse",
+      "metric_above_maximum:p90_ape_pct",
+      "metric_above_maximum:interval_p90_width"
+    ],
+    "Tprobe_core_side_leg_max": [
+      "metric_above_maximum:rmse",
+      "metric_above_maximum:interval_p90_width"
+    ],
+    "Tprobe_core_top_yoke_max": [
+      "metric_above_maximum:rmse",
+      "metric_above_maximum:interval_p90_width"
+    ]
+  },
+  "families": ["lightgbm", "xgboost", "catboost", "extratrees"],
+  "trial_stages": [20, 50, 200],
+  "trials_per_job": 200,
+  "maximum_job_workers": 8,
+  "maximum_model_thread_budget": 8,
+  "maximum_process_rss_gb": 64.0,
+  "objective_execution_contract": {
+    "model_threads": 1,
+    "thread_environment": {
+      "OMP_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "NUMEXPR_NUM_THREADS": "1"
+    }
+  },
+  "minimum_eligible_rows_per_target": 4000,
+  "sample_weight_column": "sample_weight"
+}

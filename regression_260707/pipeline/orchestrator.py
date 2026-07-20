@@ -572,6 +572,12 @@ class PipelineOrchestrator:
         )
         tune_job: Job | None = None
         params_path = latest_tuning[1] + os.sep + "params.json" if latest_tuning else None
+        params_receipt_path = (
+            latest_tuning[1] + os.sep + "hpo_receipt.json"
+            if latest_tuning
+            and os.path.isfile(latest_tuning[1] + os.sep + "hpo_receipt.json")
+            else None
+        )
         if tune.due:
             tune_script = self.runtime_root / "training" / "tune_optuna.py"
             tune_execution_contract = self._tune_contract_from_command([
@@ -765,6 +771,10 @@ class PipelineOrchestrator:
                 # continue to fail closed.
                 if params_path:
                     params_argument = ["--params", params_path]
+                    if params_receipt_path:
+                        params_argument.extend([
+                            "--params-receipt", params_receipt_path,
+                        ])
                 train_command = [
                     self.python,
                     str(

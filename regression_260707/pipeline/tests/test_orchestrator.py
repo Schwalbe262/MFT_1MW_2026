@@ -1196,9 +1196,14 @@ class OrchestratorTests(unittest.TestCase):
             ]
             params = root / "params.json"
             params.write_text("{}", encoding="utf-8")
+            receipt = root / "hpo_receipt.json"
+            receipt.write_text("{}", encoding="utf-8")
             tuning = store.publish_files(
                 "tuning",
-                {"params.json": params},
+                {
+                    "params.json": params,
+                    "hpo_receipt.json": receipt,
+                },
                 metadata={
                     "strict_full_rows": 4000,
                     "solver_revision": "a" * 40,
@@ -1251,6 +1256,12 @@ class OrchestratorTests(unittest.TestCase):
             )
             self.assertEqual(
                 ready_train.id, below_growth_gate.jobs["train"]
+            )
+            train_command = ready_train.payload["command"]
+            self.assertIn("--params-receipt", train_command)
+            self.assertEqual(
+                Path(train_command[train_command.index("--params-receipt") + 1]),
+                tuning.path / "hpo_receipt.json",
             )
 
             dataset.write_bytes(b"six thousand")

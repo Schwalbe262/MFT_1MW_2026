@@ -554,7 +554,8 @@ def _run(command):
 
 def training_commands(
     snapshot, curve, registry, min_rows, profile, threshold, metrics_result,
-    candidate_result=None, params=None, source_dataset_path=None,
+    candidate_result=None, params=None, params_receipt=None,
+    source_dataset_path=None,
     source_dataset_generation=None, model_threads=None, target_workers=None,
     max_model_thread_budget=None,
 ):
@@ -600,6 +601,10 @@ def training_commands(
         ]
         if params:
             candidate_command.extend(["--params", params])
+        if params_receipt:
+            if not params:
+                raise ValueError("params receipt requires params")
+            candidate_command.extend(["--params-receipt", params_receipt])
         if source_dataset_path:
             candidate_command.extend(
                 ["--source-dataset-path", source_dataset_path]
@@ -729,6 +734,11 @@ def main():
         "--params", default=None,
         help="immutable Optuna params.json generation pinned into this contract",
     )
+    parser.add_argument(
+        "--params-receipt",
+        default=None,
+        help="explicit blocker-HPO-v2 receipt paired with --params",
+    )
     parser.add_argument("--min-rows", type=int, default=200)
     parser.add_argument(
         "--model-threads", type=int, default=DEFAULT_MODEL_THREADS,
@@ -808,7 +818,15 @@ def main():
     args.profile = os.path.abspath(args.profile or DEFAULT_PROFILE_PATH)
     args.thresholds = os.path.abspath(args.thresholds)
     args.params = os.path.abspath(args.params) if args.params else None
+    args.params_receipt = (
+        os.path.abspath(args.params_receipt) if args.params_receipt else None
+    )
+    if args.params_receipt and not args.params:
+        parser.error("params-receipt requires params")
     params_sha256 = _sha256(args.params) if args.params else None
+    params_receipt_sha256 = (
+        _sha256(args.params_receipt) if args.params_receipt else None
+    )
     if args.source_dataset_generation and not re.fullmatch(
         r"dataset:[0-9a-fA-F]{64}", args.source_dataset_generation
     ):
@@ -918,6 +936,8 @@ def main():
         "expected_library_revision": args.library_revision,
         "params_path": args.params,
         "params_sha256": params_sha256,
+        "params_receipt_path": args.params_receipt,
+        "params_receipt_sha256": params_receipt_sha256,
         "source_dataset_path": dataset,
         "source_dataset_sha256": source_dataset_sha256,
         "source_dataset_generation": args.source_dataset_generation,
@@ -968,6 +988,11 @@ def main():
             )
         if args.params and _sha256(args.params) != params_sha256:
             raise RuntimeError("tuned parameter generation changed during inspection")
+        if (
+            args.params_receipt
+            and _sha256(args.params_receipt) != params_receipt_sha256
+        ):
+            raise RuntimeError("tuned parameter receipt changed during inspection")
         raw, audited, strict, quarantine = inspect_dataset(
             dataset, args.profile, args.solver_revision, args.library_revision
         )
@@ -1060,6 +1085,7 @@ def main():
                     args.profile, threshold, metrics_result,
                     candidate_result if activation_required else None,
                     args.params,
+                    args.params_receipt,
                     dataset,
                     args.source_dataset_generation,
                     args.model_threads,
@@ -1094,6 +1120,8 @@ def main():
                     "thresholds_sha256": locked_thresholds_sha256,
                     "params_path": args.params,
                     "params_sha256": params_sha256,
+                    "params_receipt_path": args.params_receipt,
+                    "params_receipt_sha256": params_receipt_sha256,
                     "source_dataset_path": dataset,
                     "source_dataset_sha256": source_dataset_sha256,
                     "source_dataset_generation": args.source_dataset_generation,

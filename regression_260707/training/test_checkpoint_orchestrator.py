@@ -111,6 +111,30 @@ class TrainingCommandTests(unittest.TestCase):
             candidate[candidate.index("--max-model-thread-budget") + 1], "32"
         )
 
+    def test_candidate_command_forwards_v2_params_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            params = str(root / "params.json")
+            receipt = str(root / "hpo_receipt.json")
+            commands = checkpoint.training_commands(
+                str(root / "snapshot.parquet"),
+                str(root / "learning_curve.csv"),
+                str(root / "registry"),
+                100,
+                str(root / "profile.json"),
+                3000,
+                str(root / "metrics.json"),
+                str(root / "candidate.json"),
+                params=params,
+                params_receipt=receipt,
+            )
+
+        candidate = commands[1]
+        self.assertEqual(candidate[candidate.index("--params") + 1], params)
+        self.assertEqual(
+            candidate[candidate.index("--params-receipt") + 1], receipt
+        )
+
     def test_metrics_command_forwards_the_same_model_thread_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

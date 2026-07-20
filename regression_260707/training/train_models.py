@@ -62,6 +62,23 @@ MODEL_THREAD_PARAMETERS = {
     "catboost": "thread_count",
     "extratrees": "n_jobs",
 }
+V2_BLOCKER_TARGETS = (
+    "Llt_phys",
+    "P_Tx_main_group",
+    "P_Rx_main_group",
+    "B_max_core",
+    "Tprobe_Tx_leeward_max",
+    "Tprobe_Rx_main_leeward_max",
+    "Tprobe_Rx_side_leeward_max",
+    "Tprobe_core_center_max",
+    "Tprobe_core_center_leg_max",
+    "Tprobe_core_side_leg_max",
+    "Tprobe_core_top_yoke_max",
+)
+V2_HPO_FAMILIES = ("lightgbm", "xgboost", "catboost", "extratrees")
+V2_HPO_RESULT_SCHEMA = "mft-production-blocker-hpo-result-v2"
+V2_HPO_PARAMS_SCHEMA = "mft-production-blocker-hpo-params-v2"
+V2_HPO_PARAMS_MARKER = "__mft_blocker_hpo_v2__"
 
 
 def default_family_params():
@@ -77,6 +94,45 @@ def default_family_params():
         "catboost": dict(iterations=1200, learning_rate=0.04, depth=8, verbose=0),
         "extratrees": dict(n_estimators=600, min_samples_leaf=2, n_jobs=-1),
     }
+
+
+def family_params_for_target(target, tuned=None, model_threads=None):
+    """Merge one immutable tuning artifact into the training defaults.
+
+    Keeping this compatibility boundary public makes parameter-only HPO
+    generations testable without constructing a registry candidate.  Unknown
+    metadata next to ``params`` is deliberately ignored; execution thread
+    limits are always reapplied after the merge.
+    """
+
+    if tuned is None:
+        tuned = {}
+    if not isinstance(tuned, dict):
+        raise ValueError("tuning parameter artifact must be a top-level mapping")
+    output = {}
+    for family, base in default_family_params().items():
+        params = dict(base)
+        specification = tuned.get(family, {})
+        if family in tuned and not isinstance(specification, dict):
+            raise ValueError(f"invalid tuning family payload: {family}")
+        if target in specification:
+            target_specification = specification[target]
+            if (
+                not isinstance(target_specification, dict)
+                or not isinstance(target_specification.get("params"), dict)
+            ):
+                raise ValueError(
+                    f"invalid tuning target payload: {family}/{target}"
+                )
+            params.update(specification[target]["params"])
+        elif specification and all(
+            not isinstance(value, dict) for value in specification.values()
+        ):
+            params.update(specification)
+        output[family] = with_model_thread_budget(
+            family, params, model_threads
+        )
+    return output
 
 
 def make_model(family, params, seed):
@@ -284,6 +340,125 @@ def _sha256(path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _canonical_sha256(value):
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def load_tuning_params(params_path, receipt_path=None):
+    """Load legacy params or authenticate an explicitly supplied v2 receipt.
+
+    No receipt means legacy compatibility mode; a v2 artifact is never inferred
+    from the parameter shape.  Supplying a receipt selects strict v2 mode and
+    requires the complete 11-target by four-family inventory.
+    """
+
+    params_path = os.path.abspath(os.fspath(params_path))
+    if not os.path.isfile(params_path):
+        raise RuntimeError(f"tuning parameter artifact is unavailable: {params_path}")
+    with open(params_path, encoding="utf-8") as handle:
+        tuned = json.load(handle)
+    if not isinstance(tuned, dict):
+        raise RuntimeError("tuning parameter artifact must be a top-level mapping")
+
+    marker = tuned.get(V2_HPO_PARAMS_MARKER)
+
+    provenance = {
+        "mode": "legacy_explicit_no_v2_receipt",
+        "params_path": params_path,
+        "params_sha256": _sha256(params_path),
+        "receipt_path": None,
+        "receipt_sha256": None,
+    }
+    if receipt_path is None:
+        if marker is not None:
+            raise RuntimeError(
+                "blocker-HPO-v2 params require an explicit params receipt"
+            )
+        return tuned, provenance
+
+    receipt_path = os.path.abspath(os.fspath(receipt_path))
+    if not os.path.isfile(receipt_path):
+        raise RuntimeError(f"v2 HPO receipt is unavailable: {receipt_path}")
+    with open(receipt_path, encoding="utf-8") as handle:
+        receipt = json.load(handle)
+    if not isinstance(receipt, dict) or receipt.get(
+        "schema_version"
+    ) != V2_HPO_RESULT_SCHEMA:
+        raise RuntimeError("v2 HPO receipt schema mismatch")
+    receipt_sha = receipt.get("sha256")
+    unsigned_receipt = {key: value for key, value in receipt.items() if key != "sha256"}
+    if (
+        not isinstance(receipt_sha, str)
+        or receipt_sha != _canonical_sha256(unsigned_receipt)
+    ):
+        raise RuntimeError("v2 HPO receipt canonical fingerprint mismatch")
+    if receipt.get("params_sha256") != provenance["params_sha256"]:
+        raise RuntimeError("v2 HPO params file fingerprint mismatch")
+    if receipt.get("params_canonical_sha256") != _canonical_sha256(tuned):
+        raise RuntimeError("v2 HPO params canonical fingerprint mismatch")
+    if not isinstance(marker, dict) or marker.get(
+        "schema_version"
+    ) != V2_HPO_PARAMS_SCHEMA:
+        raise RuntimeError("v2 HPO params marker mismatch")
+    if tuple(marker.get("blockers") or ()) != V2_BLOCKER_TARGETS:
+        raise RuntimeError("v2 HPO params marker blocker inventory mismatch")
+    if tuple(marker.get("families") or ()) != V2_HPO_FAMILIES:
+        raise RuntimeError("v2 HPO params marker family inventory mismatch")
+    tuned = {
+        key: value for key, value in tuned.items()
+        if key != V2_HPO_PARAMS_MARKER
+    }
+
+    metadata = receipt.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("v2 HPO receipt metadata is missing")
+    required_flags = {
+        "parameter_artifact_eligible": True,
+        "production_eligible": False,
+        "production_model_eligible": False,
+        "fea_submission_approved": False,
+        "promotion_approved": False,
+    }
+    for key, expected in required_flags.items():
+        if metadata.get(key) is not expected:
+            raise RuntimeError(f"v2 HPO receipt flag mismatch: {key}")
+    if tuple(metadata.get("blockers") or ()) != V2_BLOCKER_TARGETS:
+        raise RuntimeError("v2 HPO receipt blocker inventory mismatch")
+    if tuple(metadata.get("families") or ()) != V2_HPO_FAMILIES:
+        raise RuntimeError("v2 HPO receipt family inventory mismatch")
+    if set(tuned) != set(V2_HPO_FAMILIES):
+        raise RuntimeError("v2 HPO params family inventory mismatch")
+    for family in V2_HPO_FAMILIES:
+        specifications = tuned.get(family)
+        if not isinstance(specifications, dict) or set(specifications) != set(
+            V2_BLOCKER_TARGETS
+        ):
+            raise RuntimeError(f"v2 HPO params target inventory mismatch: {family}")
+        for target in V2_BLOCKER_TARGETS:
+            specification = specifications[target]
+            if (
+                not isinstance(specification, dict)
+                or not isinstance(specification.get("params"), dict)
+                or not specification["params"]
+            ):
+                raise RuntimeError(
+                    f"v2 HPO params payload mismatch: {family}/{target}"
+                )
+
+    provenance.update({
+        "mode": "authenticated_blocker_hpo_v2",
+        "receipt_path": receipt_path,
+        "receipt_sha256": _sha256(receipt_path),
+        "receipt_canonical_sha256": receipt_sha,
+        "hpo_generation_stage": metadata.get(
+            "selected_cumulative_trials_per_job"
+        ),
+    })
+    return tuned, provenance
 
 
 def _atomic_json(value, path):
@@ -902,6 +1077,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
             "params_sha256": (
                 _sha256(args.params) if getattr(args, "params", None) else None
             ),
+            "params_provenance": getattr(args, "params_provenance", None),
             "features": list(features),
             "targets": list(targets),
             "target_physics_data_revision_cohorts": target_revision_cohorts,
@@ -945,6 +1121,13 @@ def main():
     parser.add_argument("--dataset", default=DATASET)
     parser.add_argument("--targets", nargs="*", default=None)
     parser.add_argument("--params", default=None)
+    parser.add_argument(
+        "--params-receipt",
+        default=None,
+        help=(
+            "explicit blocker-HPO-v2 receipt; omitted means legacy params mode"
+        ),
+    )
     parser.add_argument("--source-dataset-path", default=None)
     parser.add_argument("--source-dataset-generation", default=None)
     parser.add_argument("--weight-col", default="sample_weight")
@@ -973,6 +1156,9 @@ def main():
     args.registry = os.path.abspath(args.registry)
     args.profile = os.path.abspath(args.profile) if args.profile else None
     args.params = os.path.abspath(args.params) if args.params else None
+    args.params_receipt = (
+        os.path.abspath(args.params_receipt) if args.params_receipt else None
+    )
     args.source_dataset_path = (
         os.path.abspath(args.source_dataset_path)
         if args.source_dataset_path else args.dataset
@@ -1005,31 +1191,17 @@ def main():
         raise SystemExit("no design-time features remain after strict filtering")
     strict_count = int(frame["_strict_valid_full"].sum())
 
-    base_params = default_family_params()
+    if args.params_receipt and not args.params:
+        parser.error("params-receipt requires params")
     tuned = {}
-    if args.params and os.path.isfile(args.params):
-        with open(args.params, encoding="utf-8") as handle:
-            tuned = json.load(handle)
+    args.params_provenance = None
+    if args.params:
+        tuned, args.params_provenance = load_tuning_params(
+            args.params, args.params_receipt
+        )
 
     def family_params_for(target):
-        output = {}
-        for family, base in base_params.items():
-            params = dict(base)
-            specification = tuned.get(family, {})
-            if (
-                target in specification
-                and isinstance(specification[target], dict)
-                and "params" in specification[target]
-            ):
-                params.update(specification[target]["params"])
-            elif specification and all(
-                not isinstance(value, dict) for value in specification.values()
-            ):
-                params.update(specification)
-            output[family] = with_model_thread_budget(
-                family, params, args.model_threads
-            )
-        return output
+        return family_params_for_target(target, tuned, args.model_threads)
 
     targets = args.targets or list(TARGETS)
     omitted = [target for target in TARGETS if target not in targets]
