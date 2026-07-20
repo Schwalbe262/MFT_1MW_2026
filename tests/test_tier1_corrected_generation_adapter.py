@@ -12,6 +12,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from module import input_parameter_260706 as current_input
+from regression_260707.optimization.design_summary import (
+    design_analytical_b_field_t,
+)
+from regression_260707.optimization.geometry_metrics import bounding_box_lit
 from tools import tier1_corrected_generation_adapter as adapter
 from tools import tier1_corrected_generation_preflight as preflight
 
@@ -179,8 +184,15 @@ def test_authenticates_failed_quality_only_with_complete_recovery(tmp_path):
         },
     )
     assert adapter.validate_adapter_manifest(manifest) is manifest
-    assert manifest["portability"]["remote_relocation_supported"] is False
+    assert manifest["portability"]["remote_relocation_supported"] is True
     assert manifest["scheduler_write_performed"] is False
+    documentary = json.loads(json.dumps(manifest))
+    documentary["code"]["path"] = r"Y:\source-only\current7"
+    assert adapter.validate_adapter_manifest(
+        documentary, source_paths_required=False
+    ) is documentary
+    with pytest.raises(RuntimeError, match="identity is invalid"):
+        adapter.validate_adapter_manifest(documentary)
 
 
 def test_authentication_rejects_incomplete_recovery_and_target_guard(tmp_path):
@@ -212,6 +224,9 @@ class _FakePredictor:
             np.full(len(frame), self.value, dtype=float),
             np.full(len(frame), self.half_width, dtype=float),
         )
+
+    def disagreement(self, frame):
+        return np.zeros(len(frame), dtype=float)
 
 
 def _fake_cache_dependencies(authenticated, *, bad_q90=False):
@@ -370,18 +385,18 @@ def test_full_realized_insulation_and_side_temperature_are_fail_closed():
     ).tolist() == [3.0, -preflight.BIG, preflight.BIG]
 
 
-_SOBOL_DIMS = (
-    ("core_plate_t", 10.0, 30.0),
-    ("wcp_t", 10.0, 30.0),
-    ("wcp_len_pct", 20.0, 80.0),
-    ("other", 0.0, 1.0),
-)
+_SOBOL_DIMS = tuple(current_input._SOBOL_DIMS)
 
 
 class _FakeBaseProblem:
     def __init__(self, models, spec=None, density_gate=None, fixed_overrides=None):
         self.models = models
-        self.spec = dict(preflight.CURRENT_STAGE_SPEC, **(spec or {}))
+        self.spec = {
+            "core_lamination_factor": 0.85,
+            "B_area_basis": "gross_geometry_times_lamination_factor",
+            **preflight.CURRENT_STAGE_SPEC,
+            **(spec or {}),
+        }
         self.density_gate = density_gate
         self.constraint_names = preflight.BASE_CONSTRAINT_NAMES
         self.n_ieq_constr = len(self.constraint_names)
@@ -437,21 +452,66 @@ def _problem_models():
     }
 
 
+def _actual_problem(fixed_primary_turns):
+    modules = preflight.load_current7_modules(REPO)
+    cls = preflight.create_current7_problem_class(
+        base_problem_class=modules.nsga2_problem.MFTProblem,
+        base_constraint_names=modules.nsga2_problem.CONSTRAINT_NAMES,
+        base_fixed_stack_mm=modules.nsga2_problem.NSGA_FIXED_THERMAL_STACK_MM,
+        sobol_dims=modules.input_parameter._SOBOL_DIMS,
+        bounding_box_lit=modules.geometry_metrics.bounding_box_lit,
+        input_parameter_module=modules.input_parameter,
+        design_analytical_b_field_t=(
+            modules.nsga2_problem.design_analytical_b_field_t
+        ),
+    )
+    values = {
+        target: 1.0 for target in adapter.CURRENT_REQUIRED_MODEL_TARGETS
+    }
+    values.update({
+        "Llt_phys": 27.5,
+        "k": 0.9,
+        "C_tx_tx_F": 1.2e-9,
+        "C_rx_rx_F": 2.4e-11,
+        "C_tx_rx_F": 5.0e-10,
+        **{target: 50.0 for target in adapter.CURRENT_TEMPERATURE_TARGETS},
+    })
+    models = {
+        target: _FakePredictor(
+            {"features": ["l1"], "target": target},
+            value=value,
+            half_width=0.1,
+        )
+        for target, value in values.items()
+    }
+    return cls(
+        models,
+        density_gate=lambda frame: np.full(len(frame), -1.0),
+        fixed_primary_turns=fixed_primary_turns,
+    ), models, modules
+
+
 def _fake_problem_class():
     return preflight.create_current7_problem_class(
         base_problem_class=_FakeBaseProblem,
         base_constraint_names=preflight.BASE_CONSTRAINT_NAMES,
         base_fixed_stack_mm=preflight.EXPECTED_SIMPLE_BASE_FIXED_STACK_MM,
         sobol_dims=_SOBOL_DIMS,
-        bounding_box_lit=lambda row: (
-            1.0,
-            (row["bbox_x"], row["bbox_y"], row["bbox_z"]),
-        ),
+        bounding_box_lit=bounding_box_lit,
+        input_parameter_module=current_input,
+        design_analytical_b_field_t=design_analytical_b_field_t,
     )
 
 
-def test_problem_wrapper_restores_cooling_and_appends_all_hard_constraints():
-    problem = _fake_problem_class()(_problem_models(), density_gate=object())
+@pytest.mark.parametrize("fixed_primary_turns", [5, 6])
+def test_problem_wrapper_repairs_fixed_turns_budget_and_all_hard_constraints(
+    fixed_primary_turns,
+):
+    problem = _fake_problem_class()(
+        _problem_models(),
+        density_gate=object(),
+        fixed_primary_turns=fixed_primary_turns,
+    )
     assert problem.spec["q_sigma"] == 1.0
     assert problem.spec["T_limit_C"] == 110.0
     assert tuple(problem.constraint_names) == preflight.CURRENT7_CONSTRAINT_NAMES
@@ -461,21 +521,26 @@ def test_problem_wrapper_restores_cooling_and_appends_all_hard_constraints():
         index = [item[0] for item in _SOBOL_DIMS].index(name)
         assert problem.xl[index] == 0.0
         assert problem.xu[index] == 1.0
-    assert problem.fixed_overrides["cw1"] == 5.0
-
+    assert "cw1" not in problem.fixed_overrides
+    coordinate = np.full((1, len(_SOBOL_DIMS)), 0.5)
+    coordinate[0, 2] = 0.0
+    coordinate[0, 8] = 0.65
+    coordinate[0, 9] = 0.35
+    repaired = problem.repair_unit_coordinates(coordinate)
+    assert np.array_equal(problem.repair_unit_coordinates(repaired), repaired)
     out = {}
-    problem._evaluate(np.asarray([[0.35, 0.65, 0.5, 0.2]]), out)
+    problem._evaluate(repaired, out)
     assert out["G"].shape == (1, 19)
     side_index = problem.constraint_names.index(
         "temperature_robust_limit:Tprobe_Rx_side_leeward_max"
     )
     assert out["G"][0, side_index] == -preflight.BIG
     hard = dict(zip(problem.constraint_names, out["G"][0]))
-    assert hard["minimum_physical_insulation"] == 0.0
-    assert hard["core_group_manufacturability_limit"] == 0.0
-    assert hard["exterior_width_limit"] == 0.0
-    assert hard["exterior_length_limit"] == 0.0
-    assert hard["exterior_height_limit"] == 0.0
+    assert hard["minimum_physical_insulation"] <= 1e-9
+    assert hard["core_group_manufacturability_limit"] <= 1e-9
+    assert hard["exterior_width_limit"] <= 1e-9
+    assert hard["exterior_length_limit"] <= 1e-9
+    assert hard["exterior_height_limit"] <= 1e-9
     expected_screen = preflight.derive_half_magnetizing_self_resonance(
         {
             "Llt_phys": 27.5,
@@ -491,6 +556,16 @@ def test_problem_wrapper_restores_cooling_and_appends_all_hard_constraints():
     assert out["frame"].iloc[0]["cw1"] == 5.0
     assert out["frame"].iloc[0]["core_plate_t"] == 17.0
     assert out["frame"].iloc[0]["wcp_t"] == 23.0
+    assert (
+        int(out["frame"].iloc[0]["N1_main"])
+        + int(out["frame"].iloc[0]["N1_side"])
+        == fixed_primary_turns
+    )
+    budget = preflight.winding_budget_identity(
+        out["frame"].iloc[0], expected_cw1_mm=5.0
+    )
+    assert budget["passed"] is True
+    assert budget["post_decode_field_override_performed"] is False
 
 
 def test_actual_current_module_contract_can_build_additive_class():
@@ -501,13 +576,176 @@ def test_actual_current_module_contract_can_build_additive_class():
         base_fixed_stack_mm=modules.nsga2_problem.NSGA_FIXED_THERMAL_STACK_MM,
         sobol_dims=modules.input_parameter._SOBOL_DIMS,
         bounding_box_lit=modules.geometry_metrics.bounding_box_lit,
+        input_parameter_module=modules.input_parameter,
+        design_analytical_b_field_t=(
+            modules.nsga2_problem.design_analytical_b_field_t
+        ),
     )
     assert cls.__name__ == "Current7Tier1Problem"
-    assert cls.launch_eligible is False
-    assert cls.offspring_physics_repair is False
+    assert cls.launch_eligible is True
+    assert cls.offspring_physics_repair is True
 
 
-def test_smoke_receipt_is_self_hashed_and_explicitly_launch_blocked(tmp_path):
+@pytest.mark.parametrize("fixed_primary_turns", [5, 6])
+def test_repaired_runner_uses_same_operator_for_warm_offspring_and_terminal(
+    tmp_path,
+    fixed_primary_turns,
+):
+    problem, models, modules = _actual_problem(fixed_primary_turns)
+    runner = preflight.Current7Tier1Runner(
+        authenticated=None,
+        code_identity={},
+        modules=modules,
+        adapter_evidence={},
+        model_cache=None,
+        models=models,
+        inference_binding={},
+        density_gate=object(),
+        problem=problem,
+    )
+    raw = np.full((3, len(_SOBOL_DIMS)), 0.5)
+    raw[:, 2] = [0.0, 0.3, 0.6]
+    warm_path = tmp_path / f"warm_n1_{fixed_primary_turns}.npy"
+    np.save(warm_path, raw, allow_pickle=False)
+    pre_optimization = []
+    result = runner.run_one(
+        seed=11,
+        population=64,
+        max_generations=2,
+        warm_start_path=warm_path,
+        warm_start_sha256=adapter.sha256_file(warm_path),
+        pre_optimization_callback=pre_optimization.append,
+    )
+    assert len(pre_optimization) == 1
+    assert pre_optimization[0]["optimizer_execution_started"] is False
+    assert pre_optimization[0]["offspring_repair_operator"][
+        "call_count"
+    ] == 0
+    audit = result.tier1_repair_audit
+    assert audit["fixed_primary_turns"] == fixed_primary_turns
+    assert audit["stages"] == {
+        "initial_population": True,
+        "warm_start": True,
+        "every_offspring": True,
+        "terminal_physical_replay": True,
+    }
+    assert audit["pymoo_operator"]["call_count"] >= 1
+    assert audit["authenticated_warm_start"]["source_authentication"][
+        "single_read_hash_and_load"
+    ] is True
+    assert audit["terminal_physical_replay"][
+        "optimizer_physical_G_match"
+    ] is True
+    terminal = np.asarray(result.pop.get("X"), dtype=float)
+    index = problem.fixed_primary_turn_coordinate_index
+    assert np.isclose(
+        terminal[:, index],
+        problem.fixed_primary_turn_unit_coordinate,
+        rtol=0.0,
+        atol=1e-15,
+    ).all()
+    output = tmp_path / f"persisted_n1_{fixed_primary_turns}"
+    output.mkdir()
+    persisted = preflight.persist_search_outputs(runner, result, output)
+    assert persisted["terminal_population_primary_turn_values"] == [
+        fixed_primary_turns
+    ]
+    assert persisted["artifact_inventory_sha256"] == adapter.canonical_sha256(
+        persisted["artifact_inventory"]
+    )
+    candidates = json.loads(
+        (output / "least_violation_candidates.json").read_text(encoding="utf-8")
+    )["candidates"]
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["total_loss_W"] == candidate["predicted_total_loss_W"]
+    assert candidate["pred_Llt_phys"] == candidate["pred_Llt_phys_uH"]
+    assert candidate["B_design_analytic_T"] == candidate["analytical_B_T"]
+    assert set(candidate["physical_constraint_G"]) == set(
+        preflight.CURRENT7_CONSTRAINT_NAMES
+    )
+    assert candidate["decoded_params"]["cw1"] == 5.0
+
+
+def test_candidate_temperature_max_excludes_absent_rx_side_target():
+    problem, models, modules = _actual_problem(5)
+    models[preflight.SIDE_TEMPERATURE_TARGET].value = 500.0
+    runner = preflight.Current7Tier1Runner(
+        authenticated=None,
+        code_identity={},
+        modules=modules,
+        adapter_evidence={},
+        model_cache=None,
+        models=models,
+        inference_binding={},
+        density_gate=object(),
+        problem=problem,
+    )
+    raw = np.full((1, problem.n_var), 0.5)
+    raw[0, 2] = 0.0
+    repaired, _ = runner.repair_coordinates(raw, stage="candidate-test")
+    evaluation = runner.evaluate_coordinates(repaired)
+    assert int(evaluation["frame"].iloc[0]["N2_side"]) == 0
+    predictions = preflight._terminal_model_predictions(
+        models, evaluation["frame"]
+    )
+    record = preflight._candidate_records(
+        runner,
+        coordinates=repaired,
+        objectives=evaluation["F"],
+        physical_constraints=evaluation["G"],
+        frame=evaluation["frame"],
+        predictions=predictions,
+        indices=[0],
+    )[0]
+    assert record[f"pred_{preflight.SIDE_TEMPERATURE_TARGET}"] == 500.0
+    assert preflight.SIDE_TEMPERATURE_TARGET not in record[
+        "active_temperature_targets_for_maximum"
+    ]
+    assert record["pred_max_temperature_C"] == 50.0
+    assert record["pred_max_robust_temperature_C"] == 50.1
+
+
+def test_authenticate_warm_handoff_accepts_sealed_n1_6_coordinate_contract(
+    tmp_path,
+):
+    problem, _models, _modules = _actual_problem(6)
+    values = np.full((2, problem.n_var), 0.5)
+    warm_path = tmp_path / "next_warm_start.npy"
+    np.save(warm_path, values, allow_pickle=False)
+    contract_path = tmp_path / "warm_handoff_contract.json"
+    contract = {
+        "schema_version": "mft-tier1-fixed-n1-6-anchor-islands-warm-v1",
+        "fixed_primary_turns": 6,
+        "warm_start": {
+            "filename": warm_path.name,
+            "sha256": adapter.sha256_file(warm_path),
+            "shape": list(values.shape),
+            "dtype": str(values.dtype),
+            "coordinate_contract": (
+                "authenticated_n1_6_decoded_to_unit_then_current_repair_v1"
+            ),
+        },
+        "physical_hard_spec_mutation": False,
+        "objective_mutation": False,
+        "automatic_promotion_allowed": False,
+    }
+    _write_json(contract_path, contract)
+    loaded, evidence = preflight.authenticate_warm_handoff(
+        warm_path,
+        contract_path,
+        fixed_primary_turns=6,
+        n_var=problem.n_var,
+        expected_contract_file_sha256=adapter.sha256_file(contract_path),
+    )
+    assert np.array_equal(loaded, values)
+    assert evidence["coordinates_only"] is True
+    assert evidence["coordinate_contract"] == contract["warm_start"][
+        "coordinate_contract"
+    ]
+
+
+def test_smoke_receipt_seals_both_repaired_strata_and_is_launch_eligible(tmp_path):
     authenticated = _authenticate(_synthetic_generation(tmp_path))
     manifest = adapter.adapter_manifest(
         authenticated,
@@ -517,9 +755,6 @@ def test_smoke_receipt_is_self_hashed_and_explicitly_launch_blocked(tmp_path):
             "clean": True,
         },
     )
-    problem = _fake_problem_class()(_problem_models(), density_gate=object())
-    evaluation = {}
-    problem._evaluate(np.asarray([[0.35, 0.65, 0.5, 0.2]]), evaluation)
     all_models = {
         target: _FakePredictor(
             {"features": ["feature_a"], "target": target},
@@ -527,26 +762,25 @@ def test_smoke_receipt_is_self_hashed_and_explicitly_launch_blocked(tmp_path):
         )
         for target in adapter.CURRENT_REQUIRED_MODEL_TARGETS
     }
-    model_smoke = preflight._smoke_every_model(
-        all_models, evaluation["frame"].iloc[[0]]
-    )
     fake_cache = types.SimpleNamespace(
         loaded_once=True,
         load_calls=1,
         full_generation_authentication_passes=1,
     )
-    runner = preflight.Current7Tier1Runner(
+    modules = preflight.Current7Modules(
+        run_nsga2=None,
+        nsga2_problem=None,
+        predictor=None,
+        train_models=None,
+        geometry_metrics=None,
+        input_parameter=None,
+        evidence={"synthetic": True},
+    )
+    problem_class = _fake_problem_class()
+    first_runner = preflight.Current7Tier1Runner(
         authenticated=authenticated,
         code_identity={"path": str(tmp_path), "revision": "b" * 40, "clean": True},
-        modules=preflight.Current7Modules(
-            run_nsga2=None,
-            nsga2_problem=None,
-            predictor=None,
-            train_models=None,
-            geometry_metrics=None,
-            input_parameter=None,
-            evidence={"synthetic": True},
-        ),
+        modules=modules,
         adapter_evidence=manifest,
         model_cache=fake_cache,
         models=all_models,
@@ -557,23 +791,98 @@ def test_smoke_receipt_is_self_hashed_and_explicitly_launch_blocked(tmp_path):
             "families": ["extratrees"],
         },
         density_gate=object(),
-        problem=problem,
+        problem=problem_class(
+            all_models,
+            density_gate=object(),
+            fixed_primary_turns=5,
+        ),
     )
+    runners = {
+        "5": first_runner,
+        "6": preflight.runner_for_fixed_primary_turns(first_runner, 6),
+    }
+    raw = np.full((1, len(_SOBOL_DIMS)), 0.5)
+    raw[0, 2] = 0.0
+    evaluations = {}
+    repair_smoke_by_stratum = {}
+    model_smoke_by_stratum = {}
+    for turns in preflight.SUPPORTED_FIXED_PRIMARY_TURNS:
+        key = str(turns)
+        runner = runners[key]
+        problem = runner.problem
+        initial, initial_evidence = runner.repair_coordinates(
+            raw, stage="initial_population"
+        )
+        warm, warm_evidence = runner.repair_coordinates(
+            raw, stage="authenticated_warm_start"
+        )
+        assert np.array_equal(initial, warm)
+        operator = preflight.create_pymoo_physics_repair(problem)
+        offspring = operator._do(problem, np.mod(raw + 0.1, 1.0))
+        offspring, offspring_evidence = runner.repair_coordinates(
+            offspring, stage="every_pymoo_offspring"
+        )
+        evaluation = runner.evaluate_coordinates(initial)
+        _terminal, terminal_evidence = runner.terminal_physical_replay(
+            initial,
+            expected_f=evaluation["F"],
+            expected_g=evaluation["G"],
+        )
+        repair_smoke = {
+            "schema_version": "mft-tier1-current7-repair-smoke-v1",
+            "fixed_primary_turns": turns,
+            "stages": {
+                "initial_population": True,
+                "warm_start": True,
+                "every_offspring": True,
+                "terminal_physical_replay": True,
+            },
+            "initial_population": initial_evidence,
+            "authenticated_warm_start": warm_evidence,
+            "every_offspring": {
+                "coordinate_repair": offspring_evidence,
+                "pymoo_operator": operator.evidence(),
+                "output_sha256": adapter.canonical_sha256(offspring.tolist()),
+            },
+            "terminal_physical_replay": terminal_evidence,
+            "same_problem_repair_used_for_all_stages": True,
+        }
+        repair_smoke["sha256"] = adapter.canonical_sha256(repair_smoke)
+        evaluations[key] = evaluation
+        repair_smoke_by_stratum[key] = repair_smoke
+        model_smoke_by_stratum[key] = preflight._smoke_every_model(
+            all_models, evaluation["frame"].iloc[[0]]
+        )
     receipt = preflight.build_smoke_receipt(
-        runner=runner,
+        runners=runners,
         coordinate_evidence={
             "path": str(tmp_path / "smoke.npy"),
             "sha256": "c" * 64,
-            "shape": [1, 4],
+            "shape": [1, len(_SOBOL_DIMS)],
             "coordinate_unit_sha256": "d" * 64,
         },
-        evaluation=evaluation,
-        model_smoke=model_smoke,
+        evaluations=evaluations,
+        model_smoke_by_stratum=model_smoke_by_stratum,
+        repair_smoke_by_stratum=repair_smoke_by_stratum,
     )
     assert preflight.validate_smoke_receipt(receipt) is receipt
-    assert receipt["optimizer_repair"]["stages"]["every_offspring"] is False
-    assert receipt["runner"]["launch_eligible"] is False
+    assert receipt["supported_fixed_primary_turns"] == [5, 6]
+    assert set(receipt["strata"]) == {"5", "6"}
+    assert all(
+        receipt["optimizer_repair"]["strata"][key]["stages"][
+            "every_offspring"
+        ]
+        is True
+        for key in ("5", "6")
+    )
+    assert receipt["runner"]["launch_eligible"] is True
     assert receipt["problem_contract"]["constraint_count"] == 19
+    forged = json.loads(json.dumps(receipt))
+    forged["strata"].pop("6")
+    forged.pop("payload_sha256")
+    forged["payload_sha256"] = adapter.canonical_sha256(forged)
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        preflight.validate_smoke_receipt(forged)
     receipt_path = tmp_path / "receipt.json"
     _write_json(receipt_path, receipt)
     completed = subprocess.run(
@@ -588,7 +897,7 @@ def test_smoke_receipt_is_self_hashed_and_explicitly_launch_blocked(tmp_path):
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout)["launch_eligible"] is False
+    assert json.loads(completed.stdout)["launch_eligible"] is True
 
 
 def test_smoke_receipt_rejects_repair_or_launch_bit_flip(tmp_path):
@@ -603,15 +912,240 @@ def test_smoke_receipt_rejects_repair_or_launch_bit_flip(tmp_path):
     )
     fake = {
         "schema_version": preflight.RECEIPT_SCHEMA,
-        "status": "authenticated_model_smoke_passed_launch_blocked",
+        "status": (
+            "authenticated_model_and_repair_smoke_passed_launch_eligible"
+        ),
         "runner": {
             "schema_version": preflight.RUNNER_SCHEMA,
             "problem_schema": preflight.PROBLEM_SCHEMA,
             "full_nsga_executed": False,
-            "launch_eligible": True,
+            "launch_eligible": False,
         },
         "adapter_manifest": manifest,
     }
     fake["payload_sha256"] = adapter.canonical_sha256(fake)
     with pytest.raises(RuntimeError, match="contract mismatch"):
         preflight.validate_smoke_receipt(fake)
+
+
+def test_search_seed_cli_runs_synthetic_optimizer_and_seals_artifacts(
+    tmp_path, monkeypatch
+):
+    problem, models, modules = _actual_problem(5)
+    runner = preflight.Current7Tier1Runner(
+        authenticated=types.SimpleNamespace(),
+        code_identity={},
+        modules=modules,
+        adapter_evidence={},
+        model_cache=types.SimpleNamespace(
+            loaded_once=True,
+            load_calls=1,
+            full_generation_authentication_passes=1,
+        ),
+        models=models,
+        inference_binding={
+            "target_count": len(adapter.CURRENT_REQUIRED_MODEL_TARGETS),
+            "threads_per_model": 8,
+        },
+        density_gate=object(),
+        problem=problem,
+    )
+    original_topology = preflight.deep_topology_contract
+
+    def synthetic_topology(fixed_primary_turns):
+        value = json.loads(json.dumps(original_topology(fixed_primary_turns)))
+        value.pop("sha256")
+        value["minimum_evolution_generations"] = 2
+        value["survival"]["decay_to_zero_generation"] = 1
+        value["sha256"] = adapter.canonical_sha256(value)
+        return value
+
+    monkeypatch.setattr(preflight, "deep_topology_contract", synthetic_topology)
+    monkeypatch.setattr(preflight, "PRODUCTION_POPULATION", 64)
+    monkeypatch.setattr(preflight, "PRODUCTION_FIXED_GENERATIONS", 2)
+    monkeypatch.setattr(preflight, "observed_peak_rss_bytes", lambda: 123_456)
+
+    bundle = tmp_path / "bundle"
+    code_root = bundle / "artifacts" / "code"
+    code_root.mkdir(parents=True)
+    output = bundle / "runs" / "seed-5"
+    output.mkdir(parents=True)
+    warm_dir = bundle / "artifacts" / "warm" / "n1-5"
+    warm_dir.mkdir(parents=True)
+    warm_path = warm_dir / "coordinates.npy"
+    raw = np.full((4, problem.n_var), 0.5)
+    raw[:, 2] = [0.0, 0.25, 0.5, 0.75]
+    np.save(warm_path, raw, allow_pickle=False)
+    warm_sha = adapter.sha256_file(warm_path)
+    warm_contract_path = warm_dir / "contract.json"
+    warm_contract = {
+        "schema_version": "synthetic-warm-contract-v1",
+        "fixed_primary_turns": 5,
+        "warm_start": {"sha256": warm_sha, "shape": list(raw.shape)},
+        "warm_rows_are_coordinate_donors_only": True,
+        "physical_hard_spec_mutation": False,
+        "objective_mutation": False,
+        "automatic_promotion_allowed": False,
+    }
+    warm_contract["sha256"] = adapter.canonical_sha256(warm_contract)
+    _write_json(warm_contract_path, warm_contract)
+    topology = synthetic_topology(5)
+    island_id = "synthetic-n1-5"
+    island_profile = {
+        "schema_version": "mft-tier1-current7-deep-crossover-island-v1",
+        "island_id": island_id,
+        "fixed_primary_turns": 5,
+        "population": 64,
+        "fixed_generations": 2,
+        "inference_threads": 8,
+        "seed_start": 1,
+        "seed_window_end_exclusive": 10,
+        "optimizer_termination_strategy": (
+            preflight.FIXED_GENERATION_TERMINATION_STRATEGY
+        ),
+        "optimizer_resonance_scale_Hz": 150.0,
+        "optimizer_llt_scale_uH": 0.3,
+        "optimizer_all_current7_thermal_scale_C": 2.0,
+        "optimizer_resonance_allowance_Hz": None,
+        "optimizer_llt_allowance_uH": None,
+        "temperature_targets": list(adapter.CURRENT_TEMPERATURE_TARGETS),
+        "topology_evolution_contract": topology,
+        "offspring_physics_repair_required": True,
+        "terminal_physical_replay_required": True,
+        "physical_hard_spec_mutation": False,
+        "objective_mutation": False,
+        "automatic_promotion_allowed": False,
+    }
+    island_profile["sha256"] = adapter.canonical_sha256(island_profile)
+    warm_record = {
+        "artifact": {
+            "path": warm_path.relative_to(bundle).as_posix(),
+            "sha256": warm_sha,
+            "size": warm_path.stat().st_size,
+        },
+        "contract": {
+            "path": warm_contract_path.relative_to(bundle).as_posix(),
+            "sha256": adapter.sha256_file(warm_contract_path),
+            "size": warm_contract_path.stat().st_size,
+        },
+    }
+    code_revision = "a" * 40
+    adapter_evidence = {
+        "artifact_count": 42,
+        "code": {"revision": code_revision},
+        "train_report": {"sha256": "b" * 64},
+        "dataset": {"sha256": "c" * 64},
+        "profile": {"canonical_sha256": "d" * 64},
+    }
+    receipt = {
+        "adapter_manifest": adapter_evidence,
+        "adapter_manifest_sha256": adapter.canonical_sha256(adapter_evidence),
+        "strata": {
+            "5": {
+                "optimizer_repair": {
+                    "contract_sha256": problem.optimizer_repair_contract[
+                        "contract_sha256"
+                    ]
+                }
+            }
+        },
+    }
+    bundle_id = "current7-synthetic"
+    manifest = {
+        "bundle_id": bundle_id,
+        "bundle_code_revision": code_revision,
+        "generation_artifact_inventory_sha256": "e" * 64,
+        "search_execution": {
+            "remote_preflight_schema_version": (
+                preflight.REMOTE_PREFLIGHT_SCHEMA
+            ),
+            "result_schema_version": preflight.SEARCH_RESULT_SCHEMA,
+            "optimizer_processes_per_task": 1,
+            "model_mapping_instances_per_process": 1,
+            "remote_preflight_filename": "remote_preflight.json",
+            "result_filename": "result.json",
+        },
+        "islands": {
+            island_id: {
+                "current7_profile": island_profile,
+                "current7_profile_sha256": island_profile["sha256"],
+                "warm": warm_record,
+            }
+        },
+        "fast_ramp": {"maximum_peak_rss_bytes": 10_000_000_000},
+    }
+    authenticated = types.SimpleNamespace()
+    relocation = {"schema_version": "synthetic-relocation-v1"}
+    monkeypatch.setattr(
+        preflight,
+        "authenticate_relocated_bundle_generation",
+        lambda **kwargs: (authenticated, receipt, relocation, manifest),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "build_relocated_authenticated_runner",
+        lambda **kwargs: runner,
+    )
+    registry = bundle / "registry"
+    generation = registry / "generations" / "synthetic"
+    generation.mkdir(parents=True)
+    dataset = bundle / "dataset.parquet"
+    dataset.write_bytes(b"synthetic")
+    profile_path = bundle / "profile.json"
+    _write_json(profile_path, {"synthetic": True})
+    relocation_path = bundle / "relocation.json"
+    _write_json(relocation_path, relocation)
+    receipt_path = bundle / "receipt.json"
+    _write_json(receipt_path, receipt)
+    remote_path = output / "remote_preflight.json"
+    repair_sha = problem.optimizer_repair_contract["contract_sha256"]
+    assert preflight.main([
+        "search-seed",
+        "--bundle-root", str(bundle),
+        "--relocation", str(relocation_path),
+        "--adapter-receipt", str(receipt_path),
+        "--registry", str(registry),
+        "--generation", str(generation),
+        "--dataset", str(dataset),
+        "--profile", str(profile_path),
+        "--warm-start", str(warm_path),
+        "--warm-contract", str(warm_contract_path),
+        "--output", str(output),
+        "--remote-preflight", str(remote_path),
+        "--bundle-id", bundle_id,
+        "--island-id", island_id,
+        "--island-profile-sha256", island_profile["sha256"],
+        "--seed", "5",
+        "--population", "64",
+        "--max-generations", "2",
+        "--inference-threads", "8",
+        "--fixed-primary-turns", "5",
+        "--optimizer-termination-strategy",
+        preflight.FIXED_GENERATION_TERMINATION_STRATEGY,
+        "--optimizer-resonance-scale-hz", "150",
+        "--optimizer-llt-scale-uh", "0.3",
+        "--optimizer-all-thermal-scale-c", "2",
+        "--optimizer-repair-contract-sha256", repair_sha,
+    ]) == 0
+    remote = json.loads(remote_path.read_text(encoding="utf-8"))
+    assert remote["offspring_repair_operator_installed"] is True
+    assert remote["every_offspring_decode_repair_attested"] is False
+    assert remote["offspring_repair_execution_status"] == (
+        "deferred_until_optimizer_execution"
+    )
+    result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+    unsigned = dict(result)
+    payload_sha = unsigned.pop("payload_sha256")
+    assert payload_sha == adapter.canonical_sha256(unsigned)
+    assert result["every_offspring_decode_repair_attested"] is True
+    assert result["offspring_repair_operator_call_count"] >= 2
+    assert result["terminal_physical_replay_attested"] is True
+    assert result["hard_spec"] == preflight.CURRENT_STAGE_SPEC
+    assert result["stage_spec_sha256"] == preflight.CURRENT_STAGE_SPEC_SHA256
+    assert result["artifact_inventory_sha256"] == adapter.canonical_sha256(
+        result["artifact_inventory"]
+    )
+    for artifact in result["artifact_inventory"].values():
+        path = output / artifact["path"]
+        assert path.stat().st_size == artifact["size_bytes"]
+        assert adapter.sha256_file(path) == artifact["sha256"]

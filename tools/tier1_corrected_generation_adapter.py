@@ -99,7 +99,7 @@ CURRENT_TEMPERATURE_CONTRACT = {
 }
 
 CURRENT_STAGE_HARD_CONTRACT = {
-    "schema_version": "mft-tier1-current7-hard-constraint-contract-v1",
+    "schema_version": "mft-tier1-current7-hard-constraint-contract-v2",
     "stage": "1200x1200x750-res15k-t110-core4-cw1-5-lmhalf",
     "temperature_limit_C": 110.0,
     "temperature_targets": list(CURRENT_TEMPERATURE_TARGETS),
@@ -128,7 +128,7 @@ CURRENT_STAGE_HARD_CONTRACT = {
     "maximum_core_groups": 4,
     "primary_conductor_thickness_mm": 5.0,
     "primary_conductor_enforcement": (
-        "decoder_fixed_override_plus_post_decode_attestation"
+        "fixed_cw1_consumed_inside_winding_budget_plus_derived_identity_attestation"
     ),
     "cooling_geometry": {
         "variable_trained_dimensions": [
@@ -141,16 +141,17 @@ CURRENT_STAGE_HARD_CONTRACT = {
             "wcp_pad_t": 2.0,
         },
         "simple_base_20mm_plate_clamp_superseded": True,
-        "offspring_physics_projection_installed": False,
+        "offspring_physics_projection_installed": True,
         "authoritative_hard_constraints_remain_physical_G": True,
     },
     "portability": {
-        "mode": "source_local_absolute_evidence_v1",
-        "remote_relocation_supported": False,
+        "mode": "source_local_or_authenticated_bundle_relocation_v2",
+        "remote_relocation_supported": True,
         "immutable_source_evidence_rewritten": False,
+        "remote_relocation_schema": "mft-tier1-current7-relocation-v1",
         "remote_packaging_requirement": (
-            "seal original SHA identities and authenticate an explicit relocation "
-            "map plus bundle-relative evidence before remote execution"
+            "seal original SHA identities and authenticate the explicit relocation "
+            "map, bundle manifest, and bundle-relative evidence before execution"
         ),
     },
     "production_eligible": False,
@@ -769,7 +770,11 @@ def adapter_manifest(
     }
 
 
-def validate_adapter_manifest(value: Any) -> dict[str, Any]:
+def validate_adapter_manifest(
+    value: Any,
+    *,
+    source_paths_required: bool = True,
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError("corrected adapter manifest must be an object")
     code = value.get("code") or {}
@@ -783,7 +788,14 @@ def validate_adapter_manifest(value: Any) -> dict[str, Any]:
         for filename in ("meta.json", "models.pkl")
     }
     try:
-        code_root = Path(str(code.get("path") or "")).resolve(strict=True)
+        code_path = str(code.get("path") or "")
+        if not code_path:
+            raise RuntimeError("current7 code path is missing")
+        code_root = (
+            Path(code_path).resolve(strict=True)
+            if source_paths_required
+            else Path(code_path)
+        )
         code_revision = _hex(code.get("revision"), 40, "current7 code revision")
         strict_rows = _positive_integer(
             dataset.get("strict_full_rows"), "manifest strict rows"
@@ -840,7 +852,10 @@ def validate_adapter_manifest(value: Any) -> dict[str, Any]:
         or value.get("full_artifact_hash_pass_deferred_to_single_model_load")
         is not True
         or code.get("clean") is not True
-        or str(code_root) != str(Path(str(code.get("path"))).resolve())
+        or (
+            source_paths_required
+            and str(code_root) != str(Path(str(code.get("path"))).resolve())
+        )
         or code_revision != str(code.get("revision")).lower()
         or model_loading != {
             "process_scope": "single_local_process",
