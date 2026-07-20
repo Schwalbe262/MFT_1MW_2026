@@ -71,6 +71,8 @@ class PublicationTransport(Protocol):
 
     def write_bytes(self, path: str, value: bytes) -> None: ...
 
+    def write_ready(self, path: str, value: bytes) -> None: ...
+
     def replace(self, source: str, destination: str) -> None: ...
 
     def file_record(self, path: str) -> Mapping[str, Any] | None: ...
@@ -384,7 +386,7 @@ def publish_bundle(
     }
     # This is intentionally the final remote file write.  Only an atomic
     # same-filesystem directory rename follows it.
-    transport.write_bytes(f"{incoming}/READY.json", _json_bytes(ready))
+    transport.write_ready(f"{incoming}/READY.json", _json_bytes(ready))
     transport.promote_directory(incoming, final)
     live_ready = _parse_json_bytes(transport.read_bytes(ready_path), ready_path)
     if live_ready != ready or not _ready_matches(live_ready, plan, manifest):
@@ -444,6 +446,19 @@ class SSHPublicationTransport:
     def write_bytes(self, path: str, value: bytes) -> None:
         self.session.write_text_file(path, value.decode("utf-8"))
         self.write_count += 1
+
+    def write_ready(self, path: str, value: bytes) -> None:
+        part = path + ".part"
+        self.session.write_text_file(part, value.decode("utf-8"))
+        root = path.rsplit("/", 1)[0]
+        self._run(
+            "set -e; "
+            f"chmod 0444 {shlex.quote(part)}; "
+            f"mv -f -- {shlex.quote(part)} {shlex.quote(path)}; "
+            f"chmod a+rx,a-w {shlex.quote(root)}",
+            60,
+        )
+        self.write_count += 2
 
     def replace(self, source: str, destination: str) -> None:
         self._run(f"mv -f -- {shlex.quote(source)} {shlex.quote(destination)}", 60)
@@ -511,8 +526,11 @@ class SSHPublicationTransport:
         command = "\n".join(
             [
                 "set -euo pipefail",
+                f"chmod a+rx {shlex.quote(root)}",
+                f"chmod -R a+rX {shlex.quote(root + '/artifacts')}",
                 f"chmod -R a-w {shlex.quote(root + '/artifacts')}",
-                f"find {shlex.quote(root + '/artifacts')} -type d -exec chmod a+rx {{}} +",
+                f"chmod a+r,a-w {shlex.quote(root + '/bundle_manifest.json')}",
+                f"chmod a+r,a-w {shlex.quote(root + '/.publication-journal.json')}",
                 f"chmod 1777 {shlex.quote(root + '/runs')}",
             ]
         )

@@ -719,6 +719,7 @@ class _FakePublicationTransport:
     def __init__(self):
         self.files: dict[str, bytes] = {}
         self.dirs: set[str] = {"/"}
+        self.modes: dict[str, int] = {"/": 0o755}
         self.write_count = 0
         self.operations: list[tuple[str, str]] = []
         self.file_writes: list[str] = []
@@ -749,6 +750,7 @@ class _FakePublicationTransport:
             if path.startswith("/"):
                 value = "/" + value.lstrip("/")
             self.dirs.add(value)
+            self.modes.setdefault(value, mode if value == path else 0o755)
 
     def upload_file(self, local: Path, remote: str) -> None:
         self._write("upload", remote)
@@ -759,6 +761,11 @@ class _FakePublicationTransport:
         self._write("write", path)
         self.files[path] = bytes(value)
         self.file_writes.append(path)
+
+    def write_ready(self, path: str, value: bytes) -> None:
+        self.write_bytes(path, value)
+        self.modes[path] = 0o444
+        self.modes[path.rsplit("/", 1)[0]] = 0o555
 
     def replace(self, source: str, destination: str) -> None:
         self._write("replace", destination)
@@ -786,6 +793,16 @@ class _FakePublicationTransport:
 
     def seal_permissions(self, root: str) -> None:
         self._write("seal", root)
+        self.modes[root] = 0o755
+        for path in self.dirs:
+            if path == root + "/artifacts" or path.startswith(root + "/artifacts/"):
+                self.modes[path] = 0o555
+        for path in self.files:
+            if path.startswith(root + "/artifacts/"):
+                self.modes[path] = 0o444
+        self.modes[root + "/bundle_manifest.json"] = 0o444
+        self.modes[root + "/.publication-journal.json"] = 0o444
+        self.modes[root + "/runs"] = 0o1777
 
     def promote_directory(self, incoming: str, destination: str) -> None:
         self._write("promote", destination)
@@ -809,6 +826,17 @@ class _FakePublicationTransport:
         }
         self.files.update(moved_files)
         self.dirs.update(moved_dirs)
+        moved_modes = {
+            destination + path.removeprefix(incoming): mode
+            for path, mode in self.modes.items()
+            if path == incoming or path.startswith(incoming + "/")
+        }
+        self.modes = {
+            path: mode
+            for path, mode in self.modes.items()
+            if path != incoming and not path.startswith(incoming + "/")
+        }
+        self.modes.update(moved_modes)
 
 
 class _FakeScheduler:
@@ -923,6 +951,16 @@ def test_publisher_dry_run_write_zero_and_interrupted_apply_resumes_ready_last(
         ready["relocation_contract_sha256"] == manifest["relocation"]["contract_sha256"]
     )
     assert ready["remote_git_checkout_performed"] is False
+    final = plan["remote_bundle"]
+    assert remote.modes[final] & 0o005 == 0o005
+    assert remote.modes[final] & 0o222 == 0
+    assert remote.modes[final + "/bundle_manifest.json"] & 0o004
+    assert remote.modes[final + "/READY.json"] == 0o444
+    assert remote.modes[final + "/runs"] == 0o1777
+    for relative in manifest["files"]:
+        path = final + "/" + relative
+        assert remote.modes[path] & 0o004, path
+        assert remote.modes[path] & 0o222 == 0, path
 
     before = remote.write_count
     repeated = publisher.publish_bundle(plan_path, apply=True, transport=remote)
