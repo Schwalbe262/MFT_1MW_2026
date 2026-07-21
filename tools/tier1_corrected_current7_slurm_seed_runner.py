@@ -278,7 +278,7 @@ def verify_payload(
         or payload.get("search_interface_schema_version")
         != SEARCH_INTERFACE_SCHEMA
         or payload.get("population") != 320
-        or payload.get("max_generations") != 200
+        or payload.get("max_generations") != 300
         or payload.get("inference_threads") != 8
         or payload.get("optimizer_processes") != 1
     ):

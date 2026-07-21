@@ -758,6 +758,133 @@ def test_candidate_temperature_max_excludes_absent_rx_side_target():
     assert record["pred_max_robust_temperature_C"] == 50.1
 
 
+@pytest.mark.parametrize("target", ["P_Rx_side_total", "B_mean_core"])
+def test_terminal_surrogate_physicality_gate_rejects_without_clamping(target):
+    predictions = {
+        target: {
+            "mean": np.ones(2, dtype=float),
+            "q90_conformal_half_width": np.full(2, 0.1, dtype=float),
+        }
+        for target in adapter.CURRENT_REQUIRED_MODEL_TARGETS
+    }
+    predictions["k"]["mean"] = np.full(2, 0.9, dtype=float)
+    predictions[target]["mean"] = np.asarray([-0.25, 5.0])
+
+    valid, evidence = preflight._terminal_surrogate_physicality_gate(
+        predictions,
+        population_size=2,
+    )
+
+    assert valid.tolist() == [False, True]
+    assert evidence["invalid_population_indices"] == [0]
+    assert evidence["violation_count_by_target"] == {target: 1}
+    assert evidence["violations"] == [{
+        "population_index": 0,
+        "target": target,
+        "rule": "finite_and_nonnegative",
+        "predicted_mean": -0.25,
+    }]
+    assert evidence["clamping_performed"] is False
+    assert evidence["raw_predictions_preserved"] is True
+    unsigned = dict(evidence)
+    assert unsigned.pop("sha256") == adapter.canonical_sha256(unsigned)
+
+
+def test_least_violation_prefers_valid_alternative_and_preserves_raw_argmin():
+    optimizer_g = np.asarray([
+        [0.1, -1.0],
+        [0.2, -1.0],
+        [0.3, -1.0],
+    ])
+    selected = preflight._select_terminal_least_violation(
+        optimizer_g,
+        decoder_valid=[True, True, True],
+        surrogate_physical_valid=[False, True, True],
+    )
+    assert selected["raw_global_index"] == 0
+    assert selected["selected_index"] == 1
+    assert selected["eligible_count"] == 2
+    assert selected["fallback_to_quarantined_raw_global_least"] is False
+
+    fallback = preflight._select_terminal_least_violation(
+        optimizer_g,
+        decoder_valid=[True, True, True],
+        surrogate_physical_valid=[False, False, False],
+    )
+    assert fallback["raw_global_index"] == 0
+    assert fallback["selected_index"] == 0
+    assert fallback["eligible_count"] == 0
+    assert fallback["fallback_to_quarantined_raw_global_least"] is True
+
+
+def test_persistence_quarantines_negative_loss_instead_of_aborting_seed(
+    tmp_path,
+):
+    problem, models, modules = _actual_problem(6)
+    models["P_Rx_side_total"].value = -0.25
+    runner = preflight.Current7Tier1Runner(
+        authenticated=None,
+        code_identity={},
+        modules=modules,
+        adapter_evidence={},
+        model_cache=None,
+        models=models,
+        inference_binding={},
+        density_gate=object(),
+        problem=problem,
+    )
+    raw = np.full((3, len(_SOBOL_DIMS)), 0.5)
+    raw[:, 2] = [0.0, 0.3, 0.6]
+    warm_path = tmp_path / "negative-loss-warm.npy"
+    np.save(warm_path, raw, allow_pickle=False)
+    result = runner.run_one(
+        seed=2407500057,
+        population=64,
+        max_generations=2,
+        warm_start_path=warm_path,
+        warm_start_sha256=adapter.sha256_file(warm_path),
+    )
+    output = tmp_path / "negative-loss-persisted"
+    output.mkdir()
+
+    persisted = preflight.persist_search_outputs(runner, result, output)
+
+    gate = persisted["infeasibility_report"][
+        "terminal_surrogate_physicality_gate"
+    ]
+    assert gate["population_size"] == 64
+    assert gate["valid_count"] == 0
+    assert gate["invalid_count"] == 64
+    assert gate["violation_count_by_target"] == {"P_Rx_side_total": 64}
+    assert gate["clamping_performed"] is False
+    assert persisted["physical_feasible_count"] == 0
+    assert persisted["feasible_pareto_count"] == 0
+    least = json.loads(
+        (output / "least_violation_candidates.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert least["candidate_count"] == 1
+    assert least["raw_global_least_population_index"] == (
+        least["selected_least_population_index"]
+    )
+    assert least["fallback_to_quarantined_raw_global_least"] is True
+    candidate = least["candidates"][0]
+    assert candidate["candidate_record_status"] == (
+        "quarantined_nonphysical_surrogate_output"
+    )
+    assert candidate["predicted_Rx_side_winding_loss_W"] == -0.25
+    assert candidate["terminal_surrogate_physicality_gate"]["passed"] is False
+    assert candidate["terminal_surrogate_physicality_gate"][
+        "clamping_performed"
+    ] is False
+    assert candidate["physical_feasible"] is False
+    assert np.load(output / "terminal_X.npy", allow_pickle=False).shape == (
+        64,
+        problem.n_var,
+    )
+
+
 def test_authenticate_warm_handoff_accepts_sealed_n1_6_coordinate_contract(
     tmp_path,
 ):

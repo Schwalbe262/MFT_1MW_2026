@@ -17,7 +17,7 @@ from typing import Any
 SCHEMA = "mft-tier1-deep-crossover-island-v1"
 TERMINATION_STRATEGY = "fixed-n-gen-no-ftol-v1"
 POPULATION = 320
-FIXED_GENERATIONS = 200
+FIXED_GENERATIONS = 300
 INFERENCE_THREADS = 8
 TASK_PRIORITY = -1
 LEGACY_TASK_PRIORITY = -2
@@ -64,7 +64,7 @@ N1_5_BALANCED = DeepCrossoverIsland(
     runtime_suffix="mft_tier1_nsga_n1_5_deep_balanced_t110_res15k_260719",
     namespace=(
         "fixed-n1-5-deep-allthermal2c-llt0p30-res150-"
-        "p320-fixedg200-crosswarm64-v1"
+        "p320-fixedg300-crosswarm64-v1"
     ),
     task_name_stem="mft-t1n5deep",
     dedupe_namespace="mft-tier1-fixed-n1-5-deep-balanced-crossover-nsga",
@@ -94,7 +94,7 @@ def _n1_6(scale_token: str, scale: float, seed_start: int) -> DeepCrossoverIslan
         ),
         namespace=(
             f"fixed-n1-6-deep-allthermal{scale_token}-llt0p05-res150-"
-            "eps150-p320-fixedg200-anchorwarm64-v1"
+            "eps150-p320-fixedg300-anchorwarm64-v1"
         ),
         task_name_stem=f"mft-t1n6d{scale_token.replace('p', '')}",
         dedupe_namespace=(

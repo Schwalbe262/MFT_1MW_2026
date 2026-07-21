@@ -40,10 +40,10 @@ def test_fixed_generation_contract_is_exact_counter_plus_one():
     )
     assert observed["rule"] == {
         "kind": "pymoo_minimize_tuple_n_gen",
-        "n_max_gen": 200,
+        "n_max_gen": 300,
         "early_stop_allowed": False,
-        "completed_evolution_generations": 200,
-        "expected_algorithm_n_gen_counter": 201,
+        "completed_evolution_generations": 300,
+        "expected_algorithm_n_gen_counter": 301,
     }
     assert observed == runner.expected_optimizer_termination_contract(
         contract.TERMINATION_STRATEGY, contract.FIXED_GENERATIONS,
@@ -87,14 +87,14 @@ def test_fixed_optimizer_reuses_pinned_initialization_and_repair(monkeypatch):
     warm_values = np.ones((3, 2))
     result = feedback._run_optimizer(
         problem, seed=17, population=8, warm_start=warm_values,
-        max_generations=200,
+        max_generations=300,
         termination_strategy=contract.TERMINATION_STRATEGY,
     )
     assert calls["initial"] == (problem, 17, 8, warm_values)
     assert calls["algorithm"]["sampling"].shape == (8, 2)
     assert calls["algorithm"]["repair"] is repair
     assert calls["algorithm"]["eliminate_duplicates"] is True
-    assert calls["minimize"][2] == ("n_gen", 200)
+    assert calls["minimize"][2] == ("n_gen", 300)
     assert result.initialization_audit == {"sealed": True}
 
 
@@ -231,7 +231,7 @@ def test_turn_split_contract_has_real_pairing_migration_and_epsilon_survival(
         "terminal_epsilon": 0.0,
         "minimum_survivors_per_turn_split_sub_island": 4,
     }
-    assert value["minimum_evolution_generations"] == 200
+    assert value["minimum_evolution_generations"] == 300
     assert value["ftol_early_stop_allowed"] is False
     assert value["warm_donor_prediction_inheritance_allowed"] is False
     assert value["model_or_training_data_provenance_mutation"] is False
@@ -274,11 +274,15 @@ print(json.dumps({
     )
     assert value["termination"]["rule"][
         "expected_algorithm_n_gen_counter"
-    ] == 201
+    ] == 301
 
 
 def test_unsupported_termination_fails_closed():
     with pytest.raises(ValueError, match="unsupported"):
-        feedback.optimizer_termination_contract("ftol-maybe", 200)
+        feedback.optimizer_termination_contract(
+            "ftol-maybe", contract.FIXED_GENERATIONS,
+        )
     with pytest.raises(RuntimeError, match="unsupported"):
-        runner.expected_optimizer_termination_contract("ftol-maybe", 200)
+        runner.expected_optimizer_termination_contract(
+            "ftol-maybe", contract.FIXED_GENERATIONS,
+        )

@@ -78,7 +78,7 @@ OPTIMIZER_REPAIR_SCHEMA = "mft-tier1-current7-physics-repair-v1"
 PINNED_PROJECTION_SOURCE_REVISION = "7c832f7f78f92ee2d99b2d37e14c3131f07d9cae"
 SUPPORTED_FIXED_PRIMARY_TURNS = (5, 6)
 FIXED_GENERATION_TERMINATION_STRATEGY = "fixed-n-gen-no-ftol-v1"
-PRODUCTION_FIXED_GENERATIONS = 200
+PRODUCTION_FIXED_GENERATIONS = 300
 PRODUCTION_POPULATION = 320
 PRODUCTION_INFERENCE_THREADS = 8
 REMOTE_PREFLIGHT_SCHEMA = "mft-tier1-current7-remote-model-load-v1"
@@ -106,6 +106,31 @@ SIZE_CONSTRAINT_NAMES = (
     "exterior_height_limit",
 )
 SIDE_TEMPERATURE_TARGET = "Tprobe_Rx_side_leeward_max"
+
+# These surrogate means represent passive physical quantities.  Tree/boosting
+# ensembles trained in log1p space can extrapolate to a small negative value
+# after expm1, even though every training observation is non-negative.  Such a
+# prediction must never be clamped into apparent feasibility.  The terminal
+# gate below quarantines the candidate and preserves the raw prediction.
+TERMINAL_NONNEGATIVE_SURROGATE_TARGETS = (
+    "P_winding_total",
+    "P_core_total",
+    "P_core_plate_total",
+    "P_wcp_total",
+    "P_Tx_main_group",
+    "P_Rx_main_group",
+    "P_Rx_side_total",
+    "B_mean_core",
+)
+TERMINAL_POSITIVE_SURROGATE_TARGETS = (
+    "Llt_phys",
+    "C_tx_tx_F",
+    "C_rx_rx_F",
+    "C_tx_rx_F",
+)
+TERMINAL_SURROGATE_PHYSICALITY_SCHEMA = (
+    "mft-tier1-current7-terminal-surrogate-physicality-v1"
+)
 
 CURRENT_STAGE_SPEC = {
     "Llt_target_uH": 27.5,
@@ -3597,6 +3622,89 @@ def _terminal_model_predictions(
     return predictions
 
 
+def _terminal_surrogate_physicality_gate(
+    predictions: Mapping[str, Mapping[str, Any]],
+    *,
+    population_size: int,
+) -> tuple[Any, dict[str, Any]]:
+    """Reject non-physical terminal predictions without changing their value.
+
+    This is deliberately a candidate-validity gate rather than an additional
+    optimizer constraint.  It leaves the authenticated constraint contract
+    and terminal replay arrays untouched while ensuring that a non-physical
+    report-only component cannot be published as feasible or abort a completed
+    seed during serialization.
+    """
+
+    import numpy as np
+
+    count = int(population_size)
+    if count < 0:
+        raise RuntimeError("terminal surrogate gate population is invalid")
+    required = set(TERMINAL_NONNEGATIVE_SURROGATE_TARGETS) | set(
+        TERMINAL_POSITIVE_SURROGATE_TARGETS
+    ) | {"k"}
+    if not required.issubset(predictions):
+        raise RuntimeError("terminal surrogate gate target inventory is incomplete")
+
+    valid = np.ones(count, dtype=bool)
+    violations: list[dict[str, Any]] = []
+
+    def inspect(target: str, rule: str, predicate: Any) -> None:
+        values = np.asarray(predictions[target].get("mean"), dtype=float).reshape(-1)
+        if values.shape != (count,) or not np.isfinite(values).all():
+            raise RuntimeError(
+                f"terminal surrogate gate received invalid means: {target}"
+            )
+        failed = ~np.asarray(predicate(values), dtype=bool)
+        if failed.shape != (count,):
+            raise RuntimeError("terminal surrogate gate rule shape mismatch")
+        valid[failed] = False
+        for raw_index in np.flatnonzero(failed):
+            index = int(raw_index)
+            violations.append({
+                "population_index": index,
+                "target": target,
+                "rule": rule,
+                "predicted_mean": float(values[index]),
+            })
+
+    for target in TERMINAL_NONNEGATIVE_SURROGATE_TARGETS:
+        inspect(target, "finite_and_nonnegative", lambda values: values >= 0.0)
+    for target in TERMINAL_POSITIVE_SURROGATE_TARGETS:
+        inspect(target, "finite_and_strictly_positive", lambda values: values > 0.0)
+    inspect(
+        "k",
+        "finite_and_between_zero_and_one_exclusive",
+        lambda values: (values > 0.0) & (values < 1.0),
+    )
+
+    invalid_indices = np.flatnonzero(~valid).astype(int).tolist()
+    per_target: dict[str, int] = {}
+    for violation in violations:
+        target = str(violation["target"])
+        per_target[target] = per_target.get(target, 0) + 1
+    evidence = {
+        "schema_version": TERMINAL_SURROGATE_PHYSICALITY_SCHEMA,
+        "population_size": count,
+        "valid_count": int(np.count_nonzero(valid)),
+        "invalid_count": int(np.count_nonzero(~valid)),
+        "invalid_population_indices": invalid_indices,
+        "violations": violations,
+        "violation_count_by_target": dict(sorted(per_target.items())),
+        "nonnegative_targets": list(TERMINAL_NONNEGATIVE_SURROGATE_TARGETS),
+        "strictly_positive_targets": list(TERMINAL_POSITIVE_SURROGATE_TARGETS),
+        "coupling_rule": "0 < k < 1",
+        "raw_predictions_preserved": True,
+        "clamping_performed": False,
+        "invalid_candidates_marked_infeasible": True,
+        "optimizer_constraint_schema_mutated": False,
+        "optimizer_objectives_mutated": False,
+    }
+    evidence["sha256"] = canonical_sha256(evidence)
+    return valid, evidence
+
+
 def _minimum_realized_insulation_mm(row: Any) -> float:
     values = [
         _finite_number(_row_value(row, name), name)
@@ -3621,6 +3729,7 @@ def _candidate_records(
     physical_constraints: Any,
     frame: Any,
     predictions: Mapping[str, Mapping[str, Any]],
+    surrogate_physicality: Mapping[str, Any] | None = None,
     indices: Any,
 ) -> list[dict[str, Any]]:
     """Build explicit UI/harvest records from authoritative physical replay."""
@@ -3630,6 +3739,38 @@ def _candidate_records(
     x = np.asarray(coordinates, dtype=float)
     f = np.asarray(objectives, dtype=float)
     g = np.asarray(physical_constraints, dtype=float)
+    if surrogate_physicality is None:
+        _, surrogate_physicality = _terminal_surrogate_physicality_gate(
+            predictions,
+            population_size=len(x),
+        )
+    physicality = dict(surrogate_physicality)
+    physicality_sha = physicality.pop("sha256", None)
+    invalid_indices = physicality.get("invalid_population_indices")
+    violations = physicality.get("violations")
+    if (
+        physicality_sha != canonical_sha256(physicality)
+        or physicality.get("schema_version")
+        != TERMINAL_SURROGATE_PHYSICALITY_SCHEMA
+        or physicality.get("population_size") != len(x)
+        or not isinstance(invalid_indices, list)
+        or not isinstance(violations, list)
+        or physicality.get("clamping_performed") is not False
+        or physicality.get("raw_predictions_preserved") is not True
+    ):
+        raise RuntimeError("terminal surrogate physicality evidence is invalid")
+    invalid_index_set = {int(value) for value in invalid_indices}
+    violations_by_index: dict[int, list[dict[str, Any]]] = {}
+    for raw_violation in violations:
+        if not isinstance(raw_violation, dict):
+            raise RuntimeError("terminal surrogate physicality violation is invalid")
+        violation = dict(raw_violation)
+        population_index = int(violation.get("population_index", -1))
+        if population_index < 0 or population_index >= len(x):
+            raise RuntimeError("terminal surrogate physicality index is invalid")
+        violations_by_index.setdefault(population_index, []).append(violation)
+    if invalid_index_set != set(violations_by_index):
+        raise RuntimeError("terminal surrogate physicality indices are inconsistent")
     records: list[dict[str, Any]] = []
     for raw_index in np.asarray(indices, dtype=int).reshape(-1):
         index = int(raw_index)
@@ -3658,6 +3799,70 @@ def _candidate_records(
             aggregate_loss, float(f[index, 1]), rel_tol=1e-9, abs_tol=1e-6
         ):
             raise RuntimeError("terminal loss objective differs from model harvest")
+        constraint_g = {
+            name: float(g[index, position])
+            for position, name in enumerate(runner.problem.constraint_names)
+        }
+        physical_constraint_feasible = all(
+            value <= 0.0 for value in constraint_g.values()
+        )
+        candidate_violations = violations_by_index.get(index, [])
+        physicality_gate = {
+            "schema_version": TERMINAL_SURROGATE_PHYSICALITY_SCHEMA,
+            "passed": not candidate_violations,
+            "violations": candidate_violations,
+            "raw_predictions_preserved": True,
+            "clamping_performed": False,
+        }
+        physicality_gate["sha256"] = canonical_sha256(physicality_gate)
+        if candidate_violations:
+            volume_l, dimensions = runner.modules.geometry_metrics.bounding_box_lit(
+                row
+            )
+            width_mm, length_mm, height_mm = (
+                _finite_number(value, "exterior dimension")
+                for value in dimensions
+            )
+            record = {
+                "candidate_id": f"terminal-{index:04d}",
+                "candidate_record_status": (
+                    "quarantined_nonphysical_surrogate_output"
+                ),
+                "terminal_population_index": index,
+                "coordinate_unit": x[index].tolist(),
+                "size_W_mm": width_mm,
+                "size_L_mm": length_mm,
+                "size_H_mm": height_mm,
+                "volume_L": _finite_number(volume_l, "volume"),
+                "predicted_total_loss_W": float(aggregate_loss),
+                "total_loss_W": float(aggregate_loss),
+                "predicted_winding_loss_W": means["P_winding_total"],
+                "predicted_core_loss_W": means["P_core_total"],
+                "predicted_core_plate_loss_W": means["P_core_plate_total"],
+                "predicted_winding_cold_plate_loss_W": means["P_wcp_total"],
+                "predicted_Tx_main_winding_loss_W": means["P_Tx_main_group"],
+                "predicted_Rx_main_winding_loss_W": means["P_Rx_main_group"],
+                "predicted_Rx_side_winding_loss_W": means["P_Rx_side_total"],
+                "pred_Llt_phys_uH": means["Llt_phys"],
+                "pred_Llt_phys": means["Llt_phys"],
+                "surrogate_mean_predictions": means,
+                "surrogate_q90_conformal_half_widths": half_widths,
+                "terminal_surrogate_physicality_gate": physicality_gate,
+                "decoded_params": decoded,
+                "physical_constraint_G": constraint_g,
+                "physical_constraint_margin": {
+                    name: -value for name, value in constraint_g.items()
+                },
+                "physical_constraint_feasible": physical_constraint_feasible,
+                "physical_feasible": False,
+                "production_eligible": False,
+                "fea_submission_approved": False,
+                "fea_submission_performed": False,
+                "aedt_used": False,
+                "automatic_promotion_allowed": False,
+            }
+            records.append(record)
+            continue
         design_report = runner.modules.design_summary.pareto_design_summary(
             row,
             means,
@@ -3703,10 +3908,6 @@ def _candidate_records(
         cross_frequency = _positive_number(
             cross_frequency, "interwinding resonance frequency"
         )
-        constraint_g = {
-            name: float(g[index, position])
-            for position, name in enumerate(runner.problem.constraint_names)
-        }
         temperature_predictions = {
             target: {
                 "mean_C": means[target],
@@ -3817,11 +4018,13 @@ def _candidate_records(
             "surrogate_q90_conformal_half_widths": half_widths,
             "decoded_params": decoded,
             "winding_budget_identity": budget,
+            "terminal_surrogate_physicality_gate": physicality_gate,
             "physical_constraint_G": constraint_g,
             "physical_constraint_margin": {
                 name: -value for name, value in constraint_g.items()
             },
-            "physical_feasible": all(value <= 0.0 for value in constraint_g.values()),
+            "physical_constraint_feasible": physical_constraint_feasible,
+            "physical_feasible": physical_constraint_feasible,
             "production_eligible": False,
             "fea_submission_approved": False,
             "fea_submission_performed": False,
@@ -3853,6 +4056,47 @@ def _candidate_csv_frame(records: list[dict[str, Any]], *, template: dict[str, A
         rows.append(flat)
     frame = pd.DataFrame(rows)
     return frame if records else frame.iloc[0:0]
+
+
+def _select_terminal_least_violation(
+    optimizer_constraints: Any,
+    *,
+    decoder_valid: Any,
+    surrogate_physical_valid: Any,
+) -> dict[str, Any]:
+    """Select a reportable near-candidate without hiding the raw argmin."""
+
+    import numpy as np
+
+    constraints = np.asarray(optimizer_constraints, dtype=float)
+    decoded = np.asarray(decoder_valid, dtype=bool).reshape(-1)
+    physical = np.asarray(surrogate_physical_valid, dtype=bool).reshape(-1)
+    if (
+        constraints.ndim != 2
+        or len(constraints) < 1
+        or decoded.shape != (len(constraints),)
+        or physical.shape != (len(constraints),)
+        or not np.isfinite(constraints).all()
+    ):
+        raise RuntimeError("terminal least-violation selection inputs are invalid")
+    positive_sum = np.maximum(constraints, 0.0).sum(axis=1)
+    raw_global_index = int(np.argmin(positive_sum))
+    eligible_indices = np.flatnonzero(decoded & physical)
+    if len(eligible_indices):
+        selected_index = int(
+            eligible_indices[np.argmin(positive_sum[eligible_indices])]
+        )
+        fallback = False
+    else:
+        selected_index = raw_global_index
+        fallback = True
+    return {
+        "positive_G_sum": positive_sum,
+        "raw_global_index": raw_global_index,
+        "selected_index": selected_index,
+        "eligible_count": int(len(eligible_indices)),
+        "fallback_to_quarantined_raw_global_least": fallback,
+    }
 
 
 def persist_search_outputs(
@@ -3893,7 +4137,17 @@ def persist_search_outputs(
         or not np.isfinite(physical_g).all()
     ):
         raise RuntimeError("terminal persistence arrays are invalid")
-    physical_feasible = decoder_valid & np.all(physical_g <= 0.0, axis=1)
+    predictions = _terminal_model_predictions(runner.models, frame)
+    surrogate_physical_valid, surrogate_physicality = (
+        _terminal_surrogate_physicality_gate(
+            predictions,
+            population_size=len(terminal_x),
+        )
+    )
+    physical_constraint_feasible = decoder_valid & np.all(
+        physical_g <= 0.0, axis=1
+    )
+    physical_feasible = physical_constraint_feasible & surrogate_physical_valid
     feasible_indices = np.flatnonzero(physical_feasible)
     if len(feasible_indices):
         local = NonDominatedSorting().do(
@@ -3902,10 +4156,15 @@ def persist_search_outputs(
         pareto_indices = feasible_indices[np.asarray(local, dtype=int)]
     else:
         pareto_indices = np.empty(0, dtype=int)
-    optimizer_positive = np.maximum(optimizer_g, 0.0).sum(axis=1)
-    least_index = int(np.argmin(optimizer_positive))
+    least_selection = _select_terminal_least_violation(
+        optimizer_g,
+        decoder_valid=decoder_valid,
+        surrogate_physical_valid=surrogate_physical_valid,
+    )
+    optimizer_positive = least_selection["positive_G_sum"]
+    raw_global_least_index = int(least_selection["raw_global_index"])
+    least_index = int(least_selection["selected_index"])
     least_indices = np.asarray([least_index], dtype=int)
-    predictions = _terminal_model_predictions(runner.models, frame)
     pareto_records = _candidate_records(
         runner,
         coordinates=terminal_x,
@@ -3913,6 +4172,7 @@ def persist_search_outputs(
         physical_constraints=physical_g,
         frame=frame,
         predictions=predictions,
+        surrogate_physicality=surrogate_physicality,
         indices=pareto_indices,
     )
     least_records = _candidate_records(
@@ -3922,6 +4182,7 @@ def persist_search_outputs(
         physical_constraints=physical_g,
         frame=frame,
         predictions=predictions,
+        surrogate_physicality=surrogate_physicality,
         indices=least_indices,
     )
     paths = {
@@ -3977,6 +4238,15 @@ def persist_search_outputs(
     _atomic_json(paths["least_violation_candidates"], {
         "schema_version": "mft-tier1-current7-least-violation-candidates-v1",
         "ranking": "minimum_sum_positive_optimizer_normalized_G",
+        "ranking_eligibility": (
+            "decoded_and_terminal_surrogate_physicality_valid"
+        ),
+        "eligible_population_count": least_selection["eligible_count"],
+        "raw_global_least_population_index": raw_global_least_index,
+        "selected_least_population_index": least_index,
+        "fallback_to_quarantined_raw_global_least": least_selection[
+            "fallback_to_quarantined_raw_global_least"
+        ],
         "candidate_count": len(least_records),
         "candidates": least_records,
         "production_eligible": False,
@@ -4001,11 +4271,37 @@ def persist_search_outputs(
         "schema_version": "mft-tier1-current7-infeasibility-report-v1",
         "authoritative_constraints": "terminal_unscaled_physical_replay",
         "population_size": int(len(terminal_x)),
+        "physical_constraint_feasible_count": int(
+            np.count_nonzero(physical_constraint_feasible)
+        ),
         "physical_feasible_count": int(np.count_nonzero(physical_feasible)),
         "optimizer_feasible_count": int(
             np.count_nonzero(np.all(optimizer_g <= 0.0, axis=1))
         ),
+        "raw_global_least_population_index": raw_global_least_index,
+        "raw_global_least_optimizer_positive_G_sum": float(
+            optimizer_positive[raw_global_least_index]
+        ),
+        "raw_global_least_physical_positive_G_sum": float(
+            np.maximum(physical_g[raw_global_least_index], 0.0).sum()
+        ),
+        "raw_global_least_surrogate_physicality_passed": bool(
+            surrogate_physical_valid[raw_global_least_index]
+        ),
+        "raw_global_least_physical_constraint_G": {
+            name: float(physical_g[raw_global_least_index, position])
+            for position, name in enumerate(runner.problem.constraint_names)
+        },
         "least_violation_population_index": least_index,
+        "least_violation_selection_eligibility": (
+            "decoded_and_terminal_surrogate_physicality_valid"
+        ),
+        "least_violation_eligible_population_count": least_selection[
+            "eligible_count"
+        ],
+        "fallback_to_quarantined_raw_global_least": least_selection[
+            "fallback_to_quarantined_raw_global_least"
+        ],
         "least_optimizer_positive_G_sum": float(optimizer_positive[least_index]),
         "least_physical_positive_G_sum": float(
             np.maximum(physical_g[least_index], 0.0).sum()
@@ -4014,6 +4310,10 @@ def persist_search_outputs(
             name: float(physical_g[least_index, position])
             for position, name in enumerate(runner.problem.constraint_names)
         },
+        "least_candidate_surrogate_physicality_passed": bool(
+            surrogate_physical_valid[least_index]
+        ),
+        "terminal_surrogate_physicality_gate": surrogate_physicality,
         "constraints": per_constraint,
         "production_eligible": False,
         "fea_submission_performed": False,

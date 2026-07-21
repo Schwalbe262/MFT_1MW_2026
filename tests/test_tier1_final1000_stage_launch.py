@@ -54,7 +54,7 @@ def _base_task(stage: profiles.FinalGoalStage, seed: int | None = None) -> dict:
         },
         "seed": seed,
         "population": 320,
-        "max_generations": 200,
+        "max_generations": 300,
         "inference_threads": 8,
         "optimizer_processes": 1,
         "maximum_peak_rss_bytes": 42 * 1024**3,
@@ -160,6 +160,8 @@ def _rendered_plan() -> dict:
 def test_profiles_form_exact_parallel_staircase_and_final_goal():
     assert len(profiles.STAGES) == 4
     assert profiles.TOTAL_ACTIVE_QUOTA == 500
+    assert profiles.FIXED_GENERATIONS == 300
+    assert profiles.POPULATION * profiles.FIXED_GENERATIONS == 96_000
     assert [stage.active_quota for stage in profiles.STAGES] == [64, 96, 128, 212]
     assert [stage.size_W_max_mm for stage in profiles.STAGES] == [
         1200.0,
@@ -191,6 +193,7 @@ def test_profiles_form_exact_parallel_staircase_and_final_goal():
         assert profile["predecessor_completion_required"] is False
         assert profile["resonance_band"]["upper_exclusive"] is True
         assert profile["fixed_primary_turns"] == 6
+        assert profile["fixed_generations"] == 300
         assert profile["surrogate_only"] is True
         assert profile["aedt_used"] is False
         warm = profile["warm_pool_input_contract"]
@@ -248,6 +251,8 @@ def test_task_renderer_pins_stage_payload_and_requested_scheduler_resources():
     )
     assert payload["final_goal_stage_id"] == stage.stage_id
     assert payload["lane"]["fixed_primary_turns"] == 6
+    assert payload["max_generations"] == 300
+    assert payload["population"] * payload["max_generations"] == 96_000
     assert payload["maximum_peak_rss_bytes"] == 22 * 1024**3
     assert task["cpus"] == 4
     assert task["memory_mb"] == 28 * 1024

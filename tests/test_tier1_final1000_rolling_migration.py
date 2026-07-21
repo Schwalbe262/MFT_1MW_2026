@@ -29,7 +29,7 @@ def _base_task(stage: profiles.FinalGoalStage, seed: int) -> dict:
         },
         "seed": seed,
         "population": 320,
-        "max_generations": 200,
+        "max_generations": profiles.FIXED_GENERATIONS,
         "inference_threads": 8,
         "optimizer_processes": 1,
         "maximum_peak_rss_bytes": 42 * 1024**3,

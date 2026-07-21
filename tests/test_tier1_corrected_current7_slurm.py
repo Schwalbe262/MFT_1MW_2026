@@ -200,7 +200,7 @@ result = {
     "optimizer_topology_evolution_audit": {
         "migration_events": 1,
         "paired_parent_pairs_emitted": 10,
-        "survival_calls": 200,
+        "survival_calls": int(args.max_generations),
         "terminal_epsilon_zero": True,
         "all_required_topologies_preserved": True,
     },
@@ -855,6 +855,12 @@ def test_task_waves_are_4_plus_32_and_use_requested_resources(tmp_path):
         2_407_210_000,
     ]
     for task in tasks:
+        assert task["payload_json"]["max_generations"] == 300
+        assert (
+            task["payload_json"]["population"]
+            * task["payload_json"]["max_generations"]
+            == 96_000
+        )
         assert task["cpus"] == 8
         assert task["memory_mb"] == 65_536
         assert task["max_workers_per_node"] == 4

@@ -39,7 +39,7 @@ if (
     != island.optimizer_llt_allowance_uh
     or rolling.OPTIMIZER_TERMINATION_STRATEGY
     != "fixed-n-gen-no-ftol-v1"
-    or rolling.MAX_GENERATIONS != 200
+    or rolling.MAX_GENERATIONS != 300
 ):
     raise RuntimeError("deep crossover rolling contract drift")
 
