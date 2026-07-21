@@ -170,8 +170,9 @@ publishes one combined index per condition with explicit
 `source_bundle_cohorts`, `mixed_bundle_projection`, and
 `mixed_resource_policy_projection` evidence.
 
-A scheduler HTTP 429 while reading a canary status is treated only as
-`remote_preflight_pending` and retried on the next controller poll.  It never
+A scheduler HTTP 429 while reading a canary status is retried three times with
+a bounded 0.25/0.5-second backoff, then treated only as
+`remote_preflight_status_read_busy` until the next controller poll. It never
 passes the gate or terminates the watch loop; all non-busy identity and content
 errors remain fail-closed.
 

@@ -160,6 +160,7 @@ OBSERVED_TASK_SEAL_FIELDS = (
     "cpus",
     "memory_mb",
     "scheduling_profile",
+    "aedt_backend",
     "gpus",
     "priority",
     "timeout_seconds",

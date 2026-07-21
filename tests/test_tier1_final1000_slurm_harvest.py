@@ -501,9 +501,15 @@ def test_full_harvest_authenticates_legacy_and_successor_results_in_one_index(
     }
 
 
-def test_scheduler_resource_drift_is_refused_before_projection(tmp_path):
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (("cpus", 99), ("aedt_backend", "attached")),
+)
+def test_scheduler_resource_drift_is_refused_before_projection(
+    tmp_path, field, replacement
+):
     _fixture, plan, state, cohorts, tasks = _resource_only_mixed_campaign(tmp_path)
-    tasks[0]["cpus"] = 4 if tasks[0]["cpus"] == 8 else 8
+    tasks[0][field] = replacement
     scheduler = Scheduler(tasks)
 
     with pytest.raises(RuntimeError, match="scheduler task identity changed"):

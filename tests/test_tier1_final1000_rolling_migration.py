@@ -362,6 +362,59 @@ def test_successor_policy_preserves_science_threads_and_unlocks_allocation_cap()
     )
 
 
+def test_seed_status_http_429_retries_are_bounded(monkeypatch):
+    attempts = []
+    sleeps = []
+
+    def busy_urlopen(_request, *, timeout):
+        attempts.append(timeout)
+        raise urllib.error.HTTPError(
+            "http://scheduler/remote-file",
+            429,
+            "remote reads busy limit 4",
+            None,
+            io.BytesIO(b"remote reads busy limit 4"),
+        )
+
+    monkeypatch.setattr(controller.urllib.request, "urlopen", busy_urlopen)
+    monkeypatch.setattr(controller.time, "sleep", sleeps.append)
+    client = controller.SchedulerApiClient("http://scheduler:8002", timeout=7)
+
+    with pytest.raises(controller.SeedStatusReadBusy, match="after 3 attempts"):
+        client.read_seed_status(12345)
+
+    assert attempts == [7, 7, 7]
+    assert sleeps == [0.25, 0.5]
+
+
+def test_busy_seed_status_holds_canary_pending_without_false_pass(tmp_path):
+    fixture = _fixture(tmp_path)
+
+    class BusyScheduler(_Scheduler):
+        def read_seed_status(self, task_id: int):
+            raise controller.SeedStatusReadBusy(f"busy task {task_id}")
+
+    scheduler = BusyScheduler(fixture["predecessor"], fixture["state"])
+    result = controller.control_once(
+        fixture["successor_plan_path"],
+        state_path=tmp_path / "busy-controller-state.json",
+        apply=True,
+        scheduler=scheduler,
+        ready_probe=fixture["ready"],
+    )
+
+    assert result["ramp_released"] is False
+    assert result["canary_passed_stage_ids"] == []
+    assert result["active_count"] == 500
+    held = result["actions"][-1]
+    assert held["action"] == "ramp_held"
+    assert held["passed_stage_count"] == 0
+    assert held["reasons"] == [
+        f"{stage.stage_id}:remote_preflight_status_read_busy"
+        for stage in profiles.STAGES
+    ]
+
+
 def test_prepare_dry_run_imports_every_entry_and_seed_without_writes(tmp_path):
     fixture = _fixture(tmp_path)
     value = _prepare(fixture, apply=False)

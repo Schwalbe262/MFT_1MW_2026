@@ -25,6 +25,7 @@ import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 import urllib.error
 import urllib.parse
+import urllib.request
 
 try:
     from tier1_corrected_current7_receipt import canonical_sha256
@@ -92,6 +93,12 @@ SUCCESSOR_RESOURCE_POLICY_ID = "successor-4c-28672m-mw32-t8"
 ACTIVE_STATES = frozenset({"planned", "submitted", "queued", "running"})
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 REFILL_POLICY = "smooth-weighted-deficit-round-robin-v1"
+SEED_STATUS_BUSY_MAX_ATTEMPTS = 3
+SEED_STATUS_BUSY_RETRY_SECONDS = 0.25
+
+
+class SeedStatusReadBusy(RuntimeError):
+    """Scheduler remote-file readers are at their bounded concurrency limit."""
 
 
 def _now() -> str:
@@ -182,23 +189,44 @@ class SchedulerApiClient(Current7SchedulerApiClient):
         return [dict(task) for task in (self._inventory or {}).values()]
 
     def read_seed_status(self, task_id: int) -> Mapping[str, Any] | None:
-        """Treat scheduler HTTP 429 as an unobserved canary, never a pass.
+        """Read a canary seal with bounded retry for scheduler HTTP 429.
 
-        The scheduler protects expensive remote-file reads with a busy gate.
-        A busy response is transient evidence absence: the controller must
-        retain the pending gate and retry on its next watch iteration.  Every
-        other identity, JSON, or transport failure remains fail-closed.
+        The scheduler permits only a small number of simultaneous remote-file
+        reads. Exhausting that transient limit is not evidence that a canary
+        failed or passed, so surface a typed busy condition for the controller
+        to hold pending without terminating its watch loop.
         """
 
-        try:
-            return super().read_seed_status(task_id)
-        except RuntimeError as exc:
-            cause: BaseException | None = exc
-            while cause is not None:
-                if isinstance(cause, urllib.error.HTTPError) and cause.code == 429:
+        path = f"runs/task-{int(task_id)}/seed_status.json"
+        query = urllib.parse.urlencode({"path": path, "base": "remote_cwd"})
+        request = urllib.request.Request(
+            self.base_url + f"/api/tasks/{int(task_id)}/remote-file?{query}",
+            method="GET",
+        )
+        for attempt in range(SEED_STATUS_BUSY_MAX_ATTEMPTS):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code in {404, 409}:
                     return None
-                cause = cause.__cause__
-            raise
+                if exc.code == 429:
+                    if attempt + 1 < SEED_STATUS_BUSY_MAX_ATTEMPTS:
+                        time.sleep(SEED_STATUS_BUSY_RETRY_SECONDS * (attempt + 1))
+                        continue
+                    raise SeedStatusReadBusy(
+                        "scheduler remote status busy after "
+                        f"{SEED_STATUS_BUSY_MAX_ATTEMPTS} attempts: task {task_id}"
+                    ) from exc
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"scheduler remote status read failed: {detail}"
+                ) from exc
+            if not raw.strip():
+                return None
+            value = json.loads(raw.decode("utf-8"))
+            return value if isinstance(value, dict) else None
+        raise AssertionError("bounded seed-status retry loop fell through")
 
 
 def _seal_state(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -797,8 +825,13 @@ def _observe_canary_gates(
             and entry["task_id"] is not None
         ]
         stage_passed = False
+        status_read_busy = False
         for entry in candidates:
-            status = scheduler.read_seed_status(int(entry["task_id"]))
+            try:
+                status = scheduler.read_seed_status(int(entry["task_id"]))
+            except SeedStatusReadBusy:
+                status_read_busy = True
+                continue
             if status is None:
                 continue
             if (
@@ -812,7 +845,12 @@ def _observe_canary_gates(
                 passed.add(stage.stage_id)
                 break
         if not stage_passed:
-            reasons.append(f"{stage.stage_id}:remote_preflight_pending")
+            reason = (
+                "remote_preflight_status_read_busy"
+                if status_read_busy
+                else "remote_preflight_pending"
+            )
+            reasons.append(f"{stage.stage_id}:{reason}")
     state["canary_passed_stage_ids"] = sorted(passed)
     return passed, reasons
 
