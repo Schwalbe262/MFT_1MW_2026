@@ -468,6 +468,299 @@ def _fixture(tmp_path: Path):
     }
 
 
+def _plan_for_generations(plan: dict, generations: int) -> dict:
+    value = copy.deepcopy(plan)
+    value["stage_inventory"] = migration._stage_inventory_for_generations(
+        generations
+    )
+    policy, _quotas = migration._plan_policy_and_quotas(value)
+    for wave_name in ("canaries", "ramp"):
+        rendered = []
+        for source in value["task_waves"][wave_name]:
+            template = copy.deepcopy(source)
+            payload = template["payload_json"]
+            stage_id = payload["final_goal_stage_id"]
+            payload["max_generations"] = generations
+            payload["final_goal_stage_profile_sha256"] = (
+                migration._stage_profile_for_generations(stage_id, generations)[
+                    "sha256"
+                ]
+            )
+            rendered.append(
+                migration._render_from_template_for_policy(
+                    template,
+                    stage_id=stage_id,
+                    seed=int(payload["seed"]),
+                    wave=str(payload["lane"]["wave"]),
+                    policy=policy,
+                    fixed_generations=generations,
+                )
+            )
+        value["task_waves"][wave_name] = rendered
+    unsigned = {
+        key: item for key, item in value.items() if key != "launch_plan_sha256"
+    }
+    value["launch_plan_sha256"] = launch.canonical_sha256(unsigned)
+    return migration.validate_chained_predecessor_plan(value)
+
+
+def _rebundle_plan(plan: dict, prefix: str) -> dict:
+    value = copy.deepcopy(plan)
+    generations = migration._plan_fixed_generations(value)
+    policy, _quotas = migration._plan_policy_and_quotas(value)
+    templates = {
+        task["payload_json"]["final_goal_stage_id"]: task
+        for task in value["task_waves"]["canaries"]
+    }
+    for stage in profiles.STAGES:
+        binding = value["stage_bindings"][stage.stage_id]
+        binding["bundle_id"] = f"{prefix}-{stage.stage_id}"
+        binding["bundle_manifest_sha256"] = launch.canonical_sha256(
+            {"prefix": prefix, "stage_id": stage.stage_id, "kind": "manifest"}
+        )
+        binding["remote_bundle"] = f"/gpfs/{prefix}/{stage.stage_id}"
+        binding["publication_receipt_sha256"] = launch.canonical_sha256(
+            {"prefix": prefix, "stage_id": stage.stage_id, "kind": "receipt"}
+        )
+        binding["ready"]["bundle_id"] = binding["bundle_id"]
+        binding["ready_sha256"] = launch.canonical_sha256(binding["ready"])
+    for wave_name in ("canaries", "ramp"):
+        rendered = []
+        for source in value["task_waves"][wave_name]:
+            payload = source["payload_json"]
+            stage_id = payload["final_goal_stage_id"]
+            binding = value["stage_bindings"][stage_id]
+            template = copy.deepcopy(templates[stage_id])
+            template["payload_json"]["bundle_id"] = binding["bundle_id"]
+            template["payload_json"]["bundle_manifest_sha256"] = binding[
+                "bundle_manifest_sha256"
+            ]
+            template["remote_cwd"] = binding["remote_bundle"]
+            rendered.append(
+                migration._render_from_template_for_policy(
+                    template,
+                    stage_id=stage_id,
+                    seed=int(payload["seed"]),
+                    wave=str(payload["lane"]["wave"]),
+                    policy=policy,
+                    fixed_generations=generations,
+                )
+            )
+        value["task_waves"][wave_name] = rendered
+    unsigned = {
+        key: item for key, item in value.items() if key != "launch_plan_sha256"
+    }
+    value["launch_plan_sha256"] = launch.canonical_sha256(unsigned)
+    return value
+
+
+def _chained_fixture(tmp_path: Path, *, stopped: bool) -> dict:
+    base_successor = _successor_plan()
+    legacy = _predecessor_plan(base_successor)
+    historical = _historical_resource_quota_successor(legacy, base_successor)
+    historical = _plan_for_generations(historical, 200)
+    current = _plan_for_generations(_rebundle_plan(base_successor, "current"), 200)
+    gen300 = migration.validate_successor_plan(
+        _rebundle_plan(base_successor, "gen300")
+    )
+
+    entries = []
+    expected_tasks: dict[int, dict] = {}
+    task_id = 100_000
+    for task in migration._plan_tasks(historical):
+        task_id += 1
+        payload = task["payload_json"]
+        entries.append(
+            {
+                "stage_id": payload["final_goal_stage_id"],
+                "bundle_id": payload["bundle_id"],
+                "seed": int(payload["seed"]),
+                "wave": payload["lane"]["wave"],
+                "dedupe_key": task["dedupe_key"],
+                "task_id": task_id,
+                "state": "completed",
+                "origin": "predecessor",
+                "resource_policy_id": controller.SUCCESSOR_RESOURCE_POLICY_ID,
+            }
+        )
+        expected_tasks[task_id] = task
+
+    current_templates = {
+        task["payload_json"]["final_goal_stage_id"]: task
+        for task in current["task_waves"]["canaries"]
+    }
+    next_seed_by_stage = {}
+    canary_ids = {}
+    for stage in profiles.STAGES:
+        stage_ids = []
+        quota = launch.SUCCESSOR_ACTIVE_QUOTAS[stage.stage_id]
+        start = stage.seed_start + 10_000
+        for offset in range(quota):
+            task_id += 1
+            wave = "canary" if offset == 0 else "refill"
+            task = migration._render_from_template_for_policy(
+                current_templates[stage.stage_id],
+                stage_id=stage.stage_id,
+                seed=start + offset,
+                wave=wave,
+                policy=migration.SUCCESSOR_POLICY,
+                fixed_generations=200,
+            )
+            payload = task["payload_json"]
+            entries.append(
+                {
+                    "stage_id": stage.stage_id,
+                    "bundle_id": payload["bundle_id"],
+                    "seed": int(payload["seed"]),
+                    "wave": wave,
+                    "dedupe_key": task["dedupe_key"],
+                    "task_id": task_id,
+                    "state": "running",
+                    "origin": "successor",
+                    "resource_policy_id": controller.SUCCESSOR_RESOURCE_POLICY_ID,
+                }
+            )
+            expected_tasks[task_id] = task
+            if wave == "canary":
+                stage_ids.append(task_id)
+        canary_ids[stage.stage_id] = stage_ids
+        next_seed_by_stage[stage.stage_id] = start + quota
+
+    migration_value = {
+        "schema_version": migration.MIGRATION_SCHEMA,
+        "transition_mode": migration.PATCHED_BUNDLE,
+        "predecessor_controller_kind": "resource_quota_successor",
+        "predecessor_launch_plan_sha256": historical["launch_plan_sha256"],
+        "predecessor_state_sha256": "f" * 64,
+        "predecessor_state_revision": 1,
+        "successor_launch_plan_sha256": current["launch_plan_sha256"],
+        "scheduler_inventory_sha256": "e" * 64,
+        "predecessor_entry_count": 500,
+        "imported_active_count_by_stage": {
+            stage.stage_id: 0 for stage in profiles.STAGES
+        },
+        "next_seed_by_stage": copy.deepcopy(next_seed_by_stage),
+        "successor_resource_policy": copy.deepcopy(migration.SUCCESSOR_POLICY),
+        "successor_active_quotas": copy.deepcopy(launch.SUCCESSOR_ACTIVE_QUOTAS),
+        "harvest_cohorts": {
+            "predecessor": migration.harvest_cohort_identity(
+                role="predecessor",
+                plan=historical,
+                resource_policy_ids=[controller.SUCCESSOR_RESOURCE_POLICY_ID],
+            ),
+            "successor": migration.harvest_cohort_identity(
+                role="successor",
+                plan=current,
+                resource_policy_ids=[controller.SUCCESSOR_RESOURCE_POLICY_ID],
+            ),
+        },
+        "refill_policy": controller.REFILL_POLICY,
+        "successor_canary_task_ids_by_stage": canary_ids,
+        "successor_canary_status_by_stage": {
+            stage.stage_id: "remote_preflight_passed" for stage in profiles.STAGES
+        },
+        "scheduler_mutation_endpoints": ["POST /api/tasks"],
+        "cancellation_performed": False,
+        "preemption_performed": False,
+        "controller_stop_performed_by_this_tool": False,
+    }
+    state = controller._seal_state(
+        {
+            "schema_version": controller.STATE_SCHEMA,
+            "launch_plan_sha256": current["launch_plan_sha256"],
+            "revision": 9,
+            "parent_state_sha256": "d" * 64,
+            "stop_requested": stopped,
+            "ramp_released": True,
+            "canary_passed_stage_ids": sorted(profiles.BY_ID),
+            "entries": entries,
+            "next_seed_by_stage": next_seed_by_stage,
+            "scheduler_name_prefix": controller.TASK_NAME_PREFIX,
+            "scheduler_dedupe_prefix": controller.DEDUPE_PREFIX,
+            "scheduler_mutation_endpoints": ["POST /api/tasks"],
+            "scheduler_submit_count": len(entries),
+            "refill_policy": controller.REFILL_POLICY,
+            "refill_stage_cursor": 0,
+            "refill_deficit_credit_by_stage": {
+                stage.stage_id: 0 for stage in profiles.STAGES
+            },
+            "rolling_migration": migration_value,
+        }
+    )
+
+    class ChainedScheduler:
+        def __init__(self):
+            self.by_id = {}
+            self.by_dedupe = {}
+            self.seed_status = {}
+            self.post_count = 0
+            self.mutations = []
+            self.next_id = 200_000
+            for entry in entries:
+                task = copy.deepcopy(expected_tasks[int(entry["task_id"])])
+                task.update(
+                    {
+                        "id": int(entry["task_id"]),
+                        "task_id": int(entry["task_id"]),
+                        "status": entry["state"],
+                    }
+                )
+                self.by_id[task["id"]] = task
+                self.by_dedupe[task["dedupe_key"]] = task
+            self.by_id[72164] = {
+                "id": 72164,
+                "task_id": 72164,
+                "name": "mft-t1fg-c-refill-2457499999",
+                "dedupe_key": "mft-tier1-final1000:" + "9" * 64,
+                "status": "running",
+            }
+
+        def list_namespace_tasks(self):
+            return copy.deepcopy(list(self.by_id.values()))
+
+        def find_task_by_dedupe(self, dedupe_key: str):
+            return copy.deepcopy(self.by_dedupe.get(dedupe_key))
+
+        def submit_task(self, payload: dict):
+            self.next_id += 1
+            task = copy.deepcopy(payload)
+            task.update(
+                {"id": self.next_id, "task_id": self.next_id, "status": "queued"}
+            )
+            self.by_id[self.next_id] = task
+            self.by_dedupe[task["dedupe_key"]] = task
+            self.post_count += 1
+            self.mutations.append("POST /api/tasks")
+            return copy.deepcopy(task)
+
+        def get_task(self, task_id: int):
+            return copy.deepcopy(self.by_id.get(task_id))
+
+        def read_seed_status(self, task_id: int):
+            return copy.deepcopy(self.seed_status.get(task_id))
+
+    paths = {}
+    for name, value in (
+        ("ancestor_plan", historical),
+        ("predecessor_plan", current),
+        ("predecessor_state", state),
+        ("successor_plan", gen300),
+    ):
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        paths[name] = path
+    paths["successor_state"] = tmp_path / "successor_state.json"
+    return {
+        "ancestor": historical,
+        "predecessor": current,
+        "state": state,
+        "successor": gen300,
+        "scheduler": ChainedScheduler(),
+        "ready": _Ready(historical, current, gen300),
+        **paths,
+    }
+
+
 def _prepare(fixture: dict, *, apply: bool, **kwargs):
     return migration.prepare_successor_state(
         predecessor_plan_path=fixture["predecessor_plan_path"],
@@ -675,6 +968,131 @@ def test_prepare_dry_run_imports_every_entry_and_seed_without_writes(tmp_path):
     assert imported["rolling_migration"]["scheduler_mutation_endpoints"] == [
         "POST /api/tasks"
     ]
+
+
+def test_chained_live_shadow_imports_all_cohorts_without_external_task(tmp_path):
+    fixture = _chained_fixture(tmp_path, stopped=False)
+    value = migration.prepare_successor_state(
+        predecessor_plan_path=fixture["predecessor_plan"],
+        predecessor_state_path=fixture["predecessor_state"],
+        successor_plan_path=fixture["successor_plan"],
+        successor_state_path=fixture["successor_state"],
+        ancestor_plan_paths=[fixture["ancestor_plan"]],
+        scheduler=fixture["scheduler"],
+        predecessor_ready_probe=fixture["ready"],
+        successor_ready_probe=fixture["ready"],
+        allow_running_predecessor_shadow=True,
+    )
+
+    shadow = value["successor_state"]
+    assert value["schema_version"] == migration.CHAINED_MIGRATION_SCHEMA
+    assert value["shadow_only"] is True
+    assert value["cutover_ready"] is False
+    assert value["scheduler_post_count"] == 0
+    assert value["predecessor_entry_count"] == 1_000
+    assert value["imported_active_count"] == 500
+    assert value["imported_active_count_by_stage"] == launch.SUCCESSOR_ACTIVE_QUOTAS
+    assert value["namespace_extra_task_ids"] == [72164]
+    assert not fixture["successor_state"].exists()
+    assert 72164 not in {int(entry["task_id"]) for entry in shadow["entries"]}
+    assert all(entry["origin"] == "predecessor" for entry in shadow["entries"])
+    assert len({entry["harvest_cohort_id"] for entry in shadow["entries"]}) == 2
+    assert len(shadow["rolling_migration"]["harvest_cohorts"]) == 3
+    assert shadow["rolling_migration"]["successor_canary_status_by_stage"] == {
+        stage.stage_id: "waiting_for_natural_terminal_gap"
+        for stage in profiles.STAGES
+    }
+    assert shadow["rolling_migration"]["successor_canary_task_ids_by_stage"] == {
+        stage.stage_id: [] for stage in profiles.STAGES
+    }
+    with pytest.raises(RuntimeError, match="not cutover-ready"):
+        controller._validate_state(shadow, fixture["successor"])
+
+
+def test_chained_live_shadow_can_never_apply(tmp_path):
+    fixture = _chained_fixture(tmp_path, stopped=False)
+    with pytest.raises(RuntimeError, match="can never be applied"):
+        migration.prepare_successor_state(
+            predecessor_plan_path=fixture["predecessor_plan"],
+            predecessor_state_path=fixture["predecessor_state"],
+            successor_plan_path=fixture["successor_plan"],
+            successor_state_path=fixture["successor_state"],
+            ancestor_plan_paths=[fixture["ancestor_plan"]],
+            scheduler=fixture["scheduler"],
+            predecessor_ready_probe=fixture["ready"],
+            successor_ready_probe=fixture["ready"],
+            allow_running_predecessor_shadow=True,
+            apply=True,
+        )
+    assert fixture["scheduler"].post_count == 0
+    assert not fixture["successor_state"].exists()
+
+
+def test_chained_predecessor_requires_every_ancestor_plan(tmp_path):
+    fixture = _chained_fixture(tmp_path, stopped=True)
+    with pytest.raises(RuntimeError, match="cohort plan is missing"):
+        migration.prepare_successor_state(
+            predecessor_plan_path=fixture["predecessor_plan"],
+            predecessor_state_path=fixture["predecessor_state"],
+            successor_plan_path=fixture["successor_plan"],
+            successor_state_path=fixture["successor_state"],
+            scheduler=fixture["scheduler"],
+            predecessor_ready_probe=fixture["ready"],
+            successor_ready_probe=fixture["ready"],
+        )
+    assert fixture["scheduler"].post_count == 0
+
+
+def test_chained_cutover_waits_for_four_natural_gaps(tmp_path):
+    fixture = _chained_fixture(tmp_path, stopped=True)
+    prepared = migration.prepare_successor_state(
+        predecessor_plan_path=fixture["predecessor_plan"],
+        predecessor_state_path=fixture["predecessor_state"],
+        successor_plan_path=fixture["successor_plan"],
+        successor_state_path=fixture["successor_state"],
+        ancestor_plan_paths=[fixture["ancestor_plan"]],
+        scheduler=fixture["scheduler"],
+        predecessor_ready_probe=fixture["ready"],
+        successor_ready_probe=fixture["ready"],
+        apply=True,
+    )
+    assert prepared["cutover_ready"] is True
+    assert prepared["scheduler_post_count"] == 0
+    validated = controller._validate_state(
+        json.loads(fixture["successor_state"].read_text()), fixture["successor"]
+    )
+    assert sum(
+        entry["state"] in controller.ACTIVE_STATES
+        for entry in validated["entries"]
+    ) == 500
+
+    for stage in profiles.STAGES:
+        entry = next(
+            item
+            for item in validated["entries"]
+            if item["stage_id"] == stage.stage_id
+            and item["state"] in controller.ACTIVE_STATES
+        )
+        fixture["scheduler"].by_id[int(entry["task_id"])]["status"] = "completed"
+
+    result = controller.control_once(
+        fixture["successor_plan"],
+        state_path=fixture["successor_state"],
+        apply=True,
+        scheduler=fixture["scheduler"],
+        ready_probe=fixture["ready"],
+    )
+    assert result["active_count"] == 500
+    assert result["ramp_released"] is False
+    assert fixture["scheduler"].post_count == 4
+    assert fixture["scheduler"].mutations == ["POST /api/tasks"] * 4
+    assert result["successor_canary_status_by_stage"] == {
+        stage.stage_id: "remote_preflight_pending" for stage in profiles.STAGES
+    }
+    assert all(
+        len(result["successor_canary_task_ids_by_stage"][stage.stage_id]) == 1
+        for stage in profiles.STAGES
+    )
 
 
 def test_resource_quota_only_handoff_reuses_exact_current_bundle_bindings(tmp_path):

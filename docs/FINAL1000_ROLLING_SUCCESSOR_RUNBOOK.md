@@ -149,6 +149,43 @@ the patched-bundle canary gate.  Starting the patched controller again replaces
 natural terminal gaps only.  Old and patched bundle tasks may coexist safely;
 no running or queued task is cancelled or rewritten.
 
+## Chained patched/science successor (v2 cohort catalog)
+
+An already patched `200/160/90/50` controller can roll again without dropping
+its older terminal ledger. Supply the current predecessor plan normally and
+repeat `--ancestor-plan` once for every older immutable launch plan named by
+the predecessor state's sealed `harvest_cohorts` catalog. The migration
+reproduces every old task using its own 8c/4c resource policy and 200/300
+generation science identity. Missing, extra, or mismatched ancestor plans
+fail before any successor state is written.
+
+While the predecessor is still running, create read-only planning evidence:
+
+```powershell
+python tools\tier1_final1000_rolling_migration.py `
+  --predecessor-plan <current-gen200-plan.json> `
+  --ancestor-plan <older-cohort-plan.json> `
+  --predecessor-state <live-gen200-state.json> `
+  --successor-plan <gen300-plan.json> `
+  --successor-state <future-gen300-state.json> `
+  --scheduler-url http://127.0.0.1:8002 `
+  --allow-running-predecessor-shadow `
+  --evidence-output <sealed-local-dry-run-receipt.json>
+```
+
+This mode rejects `--apply`, never writes the successor state, marks the
+in-memory state `shadow_only=true`, and the successor controller rejects that
+shadow as not cutover-ready. It reports namespace tasks outside the ledger;
+they are never imported.
+
+For the real handoff, gracefully stop the predecessor first, omit
+`--allow-running-predecessor-shadow`, run the command once without `--apply`,
+then once with `--apply`. The v2 successor state imports every historical and
+active entry under an append-only cohort id. All imported entries become
+`origin=predecessor`; the four new successor canaries start only as natural
+terminal gaps appear. The controller still has no cancellation or preemption
+method.
+
 ## Keep one mixed-ledger UI projection during both phases
 
 The rolling state seals a fixed two-cohort harvest contract; it does not copy

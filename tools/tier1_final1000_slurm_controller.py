@@ -74,7 +74,9 @@ except ImportError:  # pragma: no cover - repository import path
 STATE_SCHEMA = "mft-tier1-final1000-slurm-controller-state-v1"
 RESULT_SCHEMA = "mft-tier1-final1000-slurm-controller-result-v1"
 ROLLING_MIGRATION_SCHEMA = "mft-tier1-final1000-rolling-migration-v1"
+CHAINED_ROLLING_MIGRATION_SCHEMA = "mft-tier1-final1000-rolling-migration-v2"
 HARVEST_COHORT_SCHEMA = "mft-tier1-final1000-harvest-cohort-v1"
+CHAINED_HARVEST_COHORT_SCHEMA = "mft-tier1-final1000-harvest-cohort-v2"
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME_PREFIX = "mft-t1fg-"
 DEDUPE_PREFIX = "mft-tier1-final1000:"
@@ -461,11 +463,16 @@ def _validate_state_for_sealed_active_quotas(
         expected_status_keys = set(BY_ID)
         if (
             not isinstance(migration, dict)
-            or migration.get("schema_version") != ROLLING_MIGRATION_SCHEMA
+            or migration.get("schema_version")
+            not in {ROLLING_MIGRATION_SCHEMA, CHAINED_ROLLING_MIGRATION_SCHEMA}
             or migration.get("transition_mode")
             not in {"resource_quota_only", "patched_bundle"}
             or migration.get("predecessor_controller_kind")
-            not in {"legacy_8c", "resource_quota_successor"}
+            not in {
+                "legacy_8c",
+                "resource_quota_successor",
+                "chained_patched_successor",
+            }
             or migration.get("sha256") != canonical_sha256(migration_unsigned)
             or migration.get("successor_launch_plan_sha256")
             != plan.get("launch_plan_sha256")
@@ -482,16 +489,45 @@ def _validate_state_for_sealed_active_quotas(
             != expected_status_keys
         ):
             raise RuntimeError("final1000 rolling migration seal mismatch")
+        if migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA and (
+            migration.get("predecessor_controller_kind")
+            != "chained_patched_successor"
+            or migration.get("transition_mode") != "patched_bundle"
+            or migration.get("predecessor_stop_observed") is not True
+            or migration.get("shadow_only") is not False
+        ):
+            raise RuntimeError("final1000 chained migration is not cutover-ready")
         cohorts = migration.get("harvest_cohorts")
+        chained_catalog = (
+            migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA
+        )
         if cohorts is None:
             cohorts = _derived_resource_only_harvest_cohorts(plan, migration)
-        if not isinstance(cohorts, dict) or set(cohorts) != {
-            "predecessor",
-            "successor",
-        }:
+        if not isinstance(cohorts, dict):
             raise RuntimeError("final1000 harvest cohort inventory mismatch")
-        for role in ("predecessor", "successor"):
-            cohort = cohorts.get(role)
+        if chained_catalog:
+            predecessor_cohort_ids = migration.get(
+                "predecessor_harvest_cohort_ids"
+            )
+            successor_cohort_id = migration.get("successor_harvest_cohort_id")
+            if (
+                not isinstance(predecessor_cohort_ids, list)
+                or predecessor_cohort_ids != sorted(set(predecessor_cohort_ids))
+                or not predecessor_cohort_ids
+                or not isinstance(successor_cohort_id, str)
+                or set(cohorts)
+                != set(predecessor_cohort_ids) | {successor_cohort_id}
+            ):
+                raise RuntimeError("final1000 chained cohort membership mismatch")
+            cohort_ids = sorted(cohorts)
+        else:
+            if set(cohorts) != {"predecessor", "successor"}:
+                raise RuntimeError("final1000 harvest cohort inventory mismatch")
+            predecessor_cohort_ids = ["predecessor"]
+            successor_cohort_id = "successor"
+            cohort_ids = ["predecessor", "successor"]
+        for cohort_id in cohort_ids:
+            cohort = cohorts.get(cohort_id)
             cohort_unsigned = (
                 {key: item for key, item in cohort.items() if key != "sha256"}
                 if isinstance(cohort, dict)
@@ -503,16 +539,22 @@ def _validate_state_for_sealed_active_quotas(
             policies = (
                 cohort.get("resource_policy_ids") if isinstance(cohort, dict) else None
             )
-            expected_plan_sha = (
-                migration.get("predecessor_launch_plan_sha256")
-                if role == "predecessor"
-                else plan.get("launch_plan_sha256")
+            expected_schema = (
+                CHAINED_HARVEST_COHORT_SCHEMA
+                if chained_catalog
+                else HARVEST_COHORT_SCHEMA
             )
             if (
                 not isinstance(cohort, dict)
-                or cohort.get("schema_version") != HARVEST_COHORT_SCHEMA
-                or cohort.get("role") != role
-                or cohort.get("launch_plan_sha256") != expected_plan_sha
+                or cohort.get("schema_version") != expected_schema
+                or (
+                    chained_catalog
+                    and cohort.get("cohort_id") != cohort_id
+                )
+                or (
+                    not chained_catalog
+                    and cohort.get("role") != cohort_id
+                )
                 or cohort.get("sha256") != canonical_sha256(cohort_unsigned)
                 or not isinstance(policies, list)
                 or not policies
@@ -545,26 +587,41 @@ def _validate_state_for_sealed_active_quotas(
                     != stage_profile(stage)["stage_spec_sha256"]
                 ):
                     raise RuntimeError("final1000 harvest stage binding seal mismatch")
-        predecessor_cohort = cohorts["predecessor"]
-        successor_cohort = cohorts["successor"]
+        successor_cohort = cohorts[successor_cohort_id]
         if successor_cohort["resource_policy_ids"] != [SUCCESSOR_RESOURCE_POLICY_ID]:
             raise RuntimeError("final1000 successor harvest policy drifted")
-        for stage in STAGES:
-            old = predecessor_cohort["stage_bindings"][stage.stage_id]
-            new = successor_cohort["stage_bindings"][stage.stage_id]
-            same_binding = old == new
-            different_bundle = all(
-                old[key] != new[key]
-                for key in ("bundle_id", "bundle_manifest_sha256", "remote_bundle")
-            )
-            if (
-                migration.get("transition_mode") == "resource_quota_only"
-                and not same_binding
-            ) or (
-                migration.get("transition_mode") == "patched_bundle"
-                and not different_bundle
-            ):
-                raise RuntimeError("final1000 harvest bundle transition drifted")
+        if successor_cohort.get("launch_plan_sha256") != plan.get(
+            "launch_plan_sha256"
+        ):
+            raise RuntimeError("final1000 successor cohort plan identity drifted")
+        if not any(
+            cohorts[cohort_id].get("launch_plan_sha256")
+            == migration.get("predecessor_launch_plan_sha256")
+            for cohort_id in predecessor_cohort_ids
+        ):
+            raise RuntimeError("final1000 primary predecessor cohort is missing")
+        for predecessor_cohort_id in predecessor_cohort_ids:
+            predecessor_cohort = cohorts[predecessor_cohort_id]
+            for stage in STAGES:
+                old = predecessor_cohort["stage_bindings"][stage.stage_id]
+                new = successor_cohort["stage_bindings"][stage.stage_id]
+                same_binding = old == new
+                different_bundle = all(
+                    old[key] != new[key]
+                    for key in (
+                        "bundle_id",
+                        "bundle_manifest_sha256",
+                        "remote_bundle",
+                    )
+                )
+                if (
+                    migration.get("transition_mode") == "resource_quota_only"
+                    and not same_binding
+                ) or (
+                    migration.get("transition_mode") == "patched_bundle"
+                    and not different_bundle
+                ):
+                    raise RuntimeError("final1000 harvest bundle transition drifted")
         validated_harvest_cohorts = copy.deepcopy(cohorts)
     dedupe: set[str] = set()
     task_ids: set[int] = set()
@@ -580,6 +637,7 @@ def _validate_state_for_sealed_active_quotas(
         identity = (stage_id, seed)
         origin = str(entry.get("origin") or "successor")
         resource_policy_id = entry.get("resource_policy_id")
+        harvest_cohort_id = str(entry.get("harvest_cohort_id") or "")
         if (
             stage is None
             or entry.get("state") not in ACTIVE_STATES | TERMINAL_STATES
@@ -609,7 +667,22 @@ def _validate_state_for_sealed_active_quotas(
         if isinstance(migration, dict):
             if validated_harvest_cohorts is None:  # pragma: no cover - guarded above
                 raise RuntimeError("final1000 harvest cohorts were not validated")
-            cohort = validated_harvest_cohorts[origin]
+            if chained_catalog:
+                expected_origin = (
+                    "successor"
+                    if harvest_cohort_id == successor_cohort_id
+                    else "predecessor"
+                )
+                if (
+                    harvest_cohort_id not in validated_harvest_cohorts
+                    or origin != expected_origin
+                ):
+                    raise RuntimeError("final1000 chained ledger cohort drifted")
+                cohort = validated_harvest_cohorts[harvest_cohort_id]
+            else:
+                if harvest_cohort_id:
+                    raise RuntimeError("legacy rolling ledger gained a cohort id")
+                cohort = validated_harvest_cohorts[origin]
             cohort_binding = cohort["stage_bindings"][stage_id]
             if (
                 resource_policy_id not in cohort["resource_policy_ids"]
@@ -791,6 +864,15 @@ def _append_refill(
         task,
         origin="successor" if state.get("rolling_migration") is not None else None,
     )
+    migration = state.get("rolling_migration")
+    if (
+        isinstance(migration, dict)
+        and migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA
+    ):
+        cohort_id = migration.get("successor_harvest_cohort_id")
+        if not isinstance(cohort_id, str) or not cohort_id:
+            raise RuntimeError("chained successor cohort id is unavailable")
+        entry["harvest_cohort_id"] = cohort_id
     state["entries"].append(entry)
     state["next_seed_by_stage"][stage_id] = seed + 1
     return entry
