@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import math
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 import urllib.parse
@@ -34,6 +35,7 @@ try:
         scheduler_publication_transport,
     )
     from tier1_final1000_slurm_launch import (
+        SUCCESSOR_ACTIVE_QUOTAS,
         build_stage_task,
         validate_launch_plan,
         validate_task,
@@ -53,6 +55,7 @@ except ImportError:  # pragma: no cover - repository import path
         scheduler_publication_transport,
     )
     from tools.tier1_final1000_slurm_launch import (
+        SUCCESSOR_ACTIVE_QUOTAS,
         build_stage_task,
         validate_launch_plan,
         validate_task,
@@ -66,12 +69,25 @@ except ImportError:  # pragma: no cover - repository import path
 
 STATE_SCHEMA = "mft-tier1-final1000-slurm-controller-state-v1"
 RESULT_SCHEMA = "mft-tier1-final1000-slurm-controller-result-v1"
+ROLLING_MIGRATION_SCHEMA = "mft-tier1-final1000-rolling-migration-v1"
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME_PREFIX = "mft-t1fg-"
 DEDUPE_PREFIX = "mft-tier1-final1000:"
+ROLLING_SUCCESSOR_RESOURCE_POLICY = {
+    "cpus_per_task": 4,
+    "memory_mb_per_task": 28 * 1024,
+    "max_workers_per_node": 32,
+    "priority": 1,
+    "scheduling_profile": "standard",
+    "gpus": 0,
+    "inference_threads": 8,
+}
+LEGACY_RESOURCE_POLICY_ID = "legacy-8c-28672m-mw8-t8"
+SUCCESSOR_RESOURCE_POLICY_ID = "successor-4c-28672m-mw32-t8"
 
 ACTIVE_STATES = frozenset({"planned", "submitted", "queued", "running"})
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
+REFILL_POLICY = "smooth-weighted-deficit-round-robin-v1"
 
 
 def _now() -> str:
@@ -157,6 +173,12 @@ class SchedulerApiClient(Current7SchedulerApiClient):
             raise RuntimeError("foreign or allocation-pinned final1000 submission")
         return super().submit_task(payload)
 
+    def list_namespace_tasks(self) -> list[Mapping[str, Any]]:
+        """Return the read-only final1000 inventory used by migration prep."""
+
+        self._load_inventory()
+        return [dict(task) for task in (self._inventory or {}).values()]
+
 
 def _seal_state(value: Mapping[str, Any]) -> dict[str, Any]:
     unsigned = {
@@ -164,6 +186,17 @@ def _seal_state(value: Mapping[str, Any]) -> dict[str, Any]:
         for key, item in value.items()
         if key != "state_sha256"
     }
+    migration = unsigned.get("rolling_migration")
+    if isinstance(migration, dict):
+        migration_unsigned = {
+            key: copy.deepcopy(item)
+            for key, item in migration.items()
+            if key != "sha256"
+        }
+        unsigned["rolling_migration"] = {
+            **migration_unsigned,
+            "sha256": canonical_sha256(migration_unsigned),
+        }
     return {**unsigned, "state_sha256": canonical_sha256(unsigned)}
 
 
@@ -195,10 +228,12 @@ def _all_tasks(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _entry(task: Mapping[str, Any]) -> dict[str, Any]:
+def _entry(
+    task: Mapping[str, Any], *, origin: str | None = None
+) -> dict[str, Any]:
     payload = task["payload_json"]
     lane = payload["lane"]
-    return {
+    entry = {
         "stage_id": payload["final_goal_stage_id"],
         "bundle_id": payload["bundle_id"],
         "seed": int(payload["seed"]),
@@ -207,11 +242,25 @@ def _entry(task: Mapping[str, Any]) -> dict[str, Any]:
         "task_id": None,
         "state": "planned",
     }
+    if origin is not None:
+        entry["origin"] = origin
+        if origin == "successor":
+            entry["resource_policy_id"] = SUCCESSOR_RESOURCE_POLICY_ID
+    return entry
 
 
 def _initial_state(plan: Mapping[str, Any]) -> dict[str, Any]:
     tasks = _all_tasks(plan)
     entries = [_entry(task) for task in tasks]
+    next_seed_by_stage = {
+        stage.stage_id: max(
+            int(entry["seed"])
+            for entry in entries
+            if entry["stage_id"] == stage.stage_id
+        )
+        + 1
+        for stage in STAGES
+    }
     unsigned = {
         "schema_version": STATE_SCHEMA,
         "launch_plan_sha256": plan["launch_plan_sha256"],
@@ -221,14 +270,16 @@ def _initial_state(plan: Mapping[str, Any]) -> dict[str, Any]:
         "ramp_released": False,
         "canary_passed_stage_ids": [],
         "entries": entries,
-        "next_seed_by_stage": {
-            stage.stage_id: stage.seed_start + stage.active_quota
-            for stage in STAGES
-        },
+        "next_seed_by_stage": next_seed_by_stage,
         "scheduler_name_prefix": TASK_NAME_PREFIX,
         "scheduler_dedupe_prefix": DEDUPE_PREFIX,
         "scheduler_mutation_endpoints": ["POST /api/tasks"],
         "scheduler_submit_count": 0,
+        "refill_policy": REFILL_POLICY,
+        "refill_stage_cursor": 0,
+        "refill_deficit_credit_by_stage": {
+            stage.stage_id: 0 for stage in STAGES
+        },
     }
     return _seal_state(unsigned)
 
@@ -252,17 +303,63 @@ def _validate_state(
         or not isinstance(next_seeds, dict)
         or set(next_seeds) != set(BY_ID)
         or set(state.get("canary_passed_stage_ids") or []) - set(BY_ID)
+        or state.get("refill_policy") != REFILL_POLICY
+        or isinstance(state.get("refill_stage_cursor"), bool)
+        or not isinstance(state.get("refill_stage_cursor"), int)
+        or not 0 <= int(state["refill_stage_cursor"]) < len(STAGES)
+        or set(state.get("refill_deficit_credit_by_stage") or {}) != set(BY_ID)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in (state.get("refill_deficit_credit_by_stage") or {}).values()
+        )
     ):
         raise RuntimeError("final1000 controller state identity/SHA mismatch")
+    migration = state.get("rolling_migration")
+    if migration is not None:
+        migration_unsigned = {
+            key: item for key, item in migration.items() if key != "sha256"
+        } if isinstance(migration, dict) else {}
+        expected_status_keys = set(BY_ID)
+        if (
+            not isinstance(migration, dict)
+            or migration.get("schema_version") != ROLLING_MIGRATION_SCHEMA
+            or migration.get("transition_mode")
+            not in {"resource_quota_only", "patched_bundle"}
+            or migration.get("predecessor_controller_kind")
+            not in {"legacy_8c", "resource_quota_successor"}
+            or migration.get("sha256") != canonical_sha256(migration_unsigned)
+            or migration.get("successor_launch_plan_sha256")
+            != plan.get("launch_plan_sha256")
+            or migration.get("successor_resource_policy")
+            != ROLLING_SUCCESSOR_RESOURCE_POLICY
+            or migration.get("successor_active_quotas")
+            != SUCCESSOR_ACTIVE_QUOTAS
+            or migration.get("refill_policy") != REFILL_POLICY
+            or migration.get("scheduler_mutation_endpoints") != ["POST /api/tasks"]
+            or migration.get("cancellation_performed") is not False
+            or migration.get("preemption_performed") is not False
+            or set(migration.get("successor_canary_task_ids_by_stage") or {})
+            != expected_status_keys
+            or set(migration.get("successor_canary_status_by_stage") or {})
+            != expected_status_keys
+        ):
+            raise RuntimeError("final1000 rolling migration seal mismatch")
     dedupe: set[str] = set()
     task_ids: set[int] = set()
     seed_identities: set[tuple[str, int]] = set()
+    max_seed = {stage.stage_id: stage.seed_start - 1 for stage in STAGES}
     for entry in entries:
         if not isinstance(entry, dict):
             raise RuntimeError("final1000 controller entry is not an object")
         stage = BY_ID.get(str(entry.get("stage_id") or ""))
         task_id = entry.get("task_id")
-        identity = (str(entry.get("bundle_id") or ""), int(entry.get("seed", -1)))
+        stage_id = str(entry.get("stage_id") or "")
+        seed = int(entry.get("seed", -1))
+        identity = (stage_id, seed)
+        origin = str(entry.get("origin") or "successor")
+        resource_policy_id = entry.get("resource_policy_id")
         if (
             stage is None
             or entry.get("state") not in ACTIVE_STATES | TERMINAL_STATES
@@ -276,6 +373,13 @@ def _validate_state(
                 entry.get("state") != "planned"
                 and (isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0)
             )
+            or (migration is not None and origin not in {"predecessor", "successor"})
+            or (
+                migration is not None
+                and resource_policy_id
+                not in {LEGACY_RESOURCE_POLICY_ID, SUCCESSOR_RESOURCE_POLICY_ID}
+            )
+            or (migration is None and origin != "successor")
         ):
             raise RuntimeError("final1000 controller ledger entry drifted")
         if entry["dedupe_key"] in dedupe or identity in seed_identities:
@@ -286,10 +390,56 @@ def _validate_state(
             if task_id in task_ids:
                 raise RuntimeError("one scheduler task maps to multiple entries")
             task_ids.add(task_id)
+        max_seed[stage_id] = max(max_seed[stage_id], seed)
     for stage in STAGES:
         candidate = int(next_seeds[stage.stage_id])
-        if not stage.seed_start <= candidate < stage.seed_window_end_exclusive:
+        if (
+            not stage.seed_start <= candidate < stage.seed_window_end_exclusive
+            or candidate <= max_seed[stage.stage_id]
+        ):
             raise RuntimeError("final1000 next seed escaped its sealed window")
+    if isinstance(migration, dict):
+        expected_canary_ids = {
+            stage.stage_id: sorted(
+                int(entry["task_id"])
+                for entry in entries
+                if entry["stage_id"] == stage.stage_id
+                and entry["wave"] == "canary"
+                and str(entry.get("origin") or "successor") == "successor"
+                and entry.get("task_id") is not None
+            )
+            for stage in STAGES
+        }
+        passed = set(state.get("canary_passed_stage_ids") or [])
+        expected_canary_status = {
+            stage.stage_id: (
+                "remote_preflight_passed"
+                if stage.stage_id in passed
+                else (
+                    "remote_preflight_pending"
+                    if expected_canary_ids[stage.stage_id]
+                    else "waiting_for_natural_terminal_gap"
+                )
+            )
+            for stage in STAGES
+        }
+        if (
+            migration.get("successor_canary_task_ids_by_stage")
+            != expected_canary_ids
+            or migration.get("successor_canary_status_by_stage")
+            != expected_canary_status
+            or migration.get("predecessor_entry_count")
+            != sum(
+                str(entry.get("origin") or "successor") == "predecessor"
+                for entry in entries
+            )
+            or migration.get("next_seed_by_stage")
+            != {
+                stage.stage_id: int(next_seeds[stage.stage_id])
+                for stage in STAGES
+            }
+        ):
+            raise RuntimeError("final1000 rolling migration ledger seal mismatch")
     return copy.deepcopy(dict(state))
 
 
@@ -381,7 +531,10 @@ def _append_refill(
     task = _refill_task(
         templates[stage_id], stage_id=stage_id, seed=seed, wave=wave
     )
-    entry = _entry(task)
+    entry = _entry(
+        task,
+        origin="successor" if state.get("rolling_migration") is not None else None,
+    )
     state["entries"].append(entry)
     state["next_seed_by_stage"][stage_id] = seed + 1
     return entry
@@ -418,6 +571,8 @@ def _submit_planned(
     for entry in entries:
         if entry["state"] != "planned":
             continue
+        if str(entry.get("origin") or "successor") != "successor":
+            raise RuntimeError("predecessor ledger entry cannot be submitted")
         task = _task_for_entry(
             entry, plan_index=plan_index, templates=templates
         )
@@ -471,6 +626,7 @@ def _observe_canary_gates(
             for entry in state["entries"]
             if entry["stage_id"] == stage.stage_id
             and entry["wave"] == "canary"
+            and str(entry.get("origin") or "successor") == "successor"
             and entry["task_id"] is not None
         ]
         stage_passed = False
@@ -494,12 +650,128 @@ def _observe_canary_gates(
     return passed, reasons
 
 
+def _refresh_migration_observation(state: dict[str, Any]) -> None:
+    migration = state.get("rolling_migration")
+    if not isinstance(migration, dict):
+        return
+    passed = set(state.get("canary_passed_stage_ids") or [])
+    ids: dict[str, list[int]] = {}
+    statuses: dict[str, str] = {}
+    for stage in STAGES:
+        candidates = [
+            entry
+            for entry in state["entries"]
+            if entry["stage_id"] == stage.stage_id
+            and entry["wave"] == "canary"
+            and str(entry.get("origin") or "successor") == "successor"
+            and entry.get("task_id") is not None
+        ]
+        ids[stage.stage_id] = sorted(int(entry["task_id"]) for entry in candidates)
+        if stage.stage_id in passed:
+            statuses[stage.stage_id] = "remote_preflight_passed"
+        elif candidates:
+            statuses[stage.stage_id] = "remote_preflight_pending"
+        else:
+            statuses[stage.stage_id] = "waiting_for_natural_terminal_gap"
+    migration["successor_canary_task_ids_by_stage"] = ids
+    migration["successor_canary_status_by_stage"] = statuses
+    migration["next_seed_by_stage"] = {
+        stage.stage_id: int(state["next_seed_by_stage"][stage.stage_id])
+        for stage in STAGES
+    }
+
+
 def _active_count(state: Mapping[str, Any], stage_id: str | None = None) -> int:
     return sum(
         entry["state"] in ACTIVE_STATES
         and (stage_id is None or entry["stage_id"] == stage_id)
         for entry in state["entries"]
     )
+
+
+def _weighted_deficit_refill_order(
+    state: dict[str, Any],
+    *,
+    slots: int,
+    reserve_missing_migration_canaries: bool,
+) -> list[str]:
+    """Choose a deterministic interleaved stage sequence for refill slots.
+
+    Smooth weighted round-robin operates only on stages below the successor
+    target.  During migration, one natural gap is first reserved for each
+    stage that has no live successor canary, even when that predecessor stage
+    is temporarily above its successor quota.  No task is cancelled to force
+    convergence; excess drains naturally and its slots move to deficits.
+    """
+
+    if slots < 0:
+        raise ValueError("refill slots cannot be negative")
+    stage_ids = [stage.stage_id for stage in STAGES]
+    current = {stage_id: _active_count(state, stage_id) for stage_id in stage_ids}
+    credits = {
+        stage_id: float(state["refill_deficit_credit_by_stage"][stage_id])
+        for stage_id in stage_ids
+    }
+    cursor = int(state["refill_stage_cursor"])
+    selected: list[str] = []
+
+    if reserve_missing_migration_canaries:
+        passed = set(state.get("canary_passed_stage_ids") or [])
+        missing = {
+            stage_id
+            for stage_id in stage_ids
+            if stage_id not in passed
+            and not any(
+                entry["stage_id"] == stage_id
+                and entry["wave"] == "canary"
+                and str(entry.get("origin") or "successor") == "successor"
+                and entry["state"] in ACTIVE_STATES
+                for entry in state["entries"]
+            )
+        }
+        while slots > 0 and missing:
+            offsets = range(len(stage_ids))
+            stage_id = next(
+                stage_ids[(cursor + offset) % len(stage_ids)]
+                for offset in offsets
+                if stage_ids[(cursor + offset) % len(stage_ids)] in missing
+            )
+            selected.append(stage_id)
+            current[stage_id] += 1
+            slots -= 1
+            missing.remove(stage_id)
+            cursor = (stage_ids.index(stage_id) + 1) % len(stage_ids)
+
+    while slots > 0:
+        eligible = [
+            stage_id
+            for stage_id in stage_ids
+            if current[stage_id] < SUCCESSOR_ACTIVE_QUOTAS[stage_id]
+        ]
+        if not eligible:
+            raise RuntimeError("no successor stage deficit exists for refill slot")
+        for stage_id in eligible:
+            credits[stage_id] += SUCCESSOR_ACTIVE_QUOTAS[stage_id]
+        total_weight = sum(SUCCESSOR_ACTIVE_QUOTAS[stage_id] for stage_id in eligible)
+        cyclic_rank = {
+            stage_ids[(cursor + offset) % len(stage_ids)]: offset
+            for offset in range(len(stage_ids))
+        }
+        stage_id = min(
+            eligible,
+            key=lambda candidate: (-credits[candidate], cyclic_rank[candidate]),
+        )
+        credits[stage_id] -= total_weight
+        selected.append(stage_id)
+        current[stage_id] += 1
+        slots -= 1
+        cursor = (stage_ids.index(stage_id) + 1) % len(stage_ids)
+
+    state["refill_stage_cursor"] = cursor
+    state["refill_deficit_credit_by_stage"] = {
+        stage_id: credits[stage_id] for stage_id in stage_ids
+    }
+    return selected
 
 
 def control_once(
@@ -529,6 +801,7 @@ def control_once(
 
     def persist() -> None:
         nonlocal state, writes
+        _refresh_migration_observation(state)
         state = _advance_state(state)
         if apply:
             _write_state(state_path, state)
@@ -556,8 +829,15 @@ def control_once(
         )
         return _result(state, actions, apply, writes, scheduler)
 
+    rolling_migration = state.get("rolling_migration") is not None
     canary_entries = [
-        entry for entry in state["entries"] if entry["wave"] == "canary"
+        entry
+        for entry in state["entries"]
+        if entry["wave"] == "canary"
+        and (
+            not rolling_migration
+            or str(entry.get("origin") or "successor") == "successor"
+        )
     ]
     if not apply:
         actions.append(
@@ -591,26 +871,48 @@ def control_once(
         prior_passed = set(state["canary_passed_stage_ids"])
         passed, reasons = _observe_canary_gates(state, scheduler)
         replacement_entries = []
-        for stage in STAGES:
-            if stage.stage_id in passed:
-                continue
-            stage_canaries = [
-                entry
-                for entry in state["entries"]
-                if entry["stage_id"] == stage.stage_id
-                and entry["wave"] == "canary"
-            ]
-            if stage_canaries and all(
-                entry["state"] in TERMINAL_STATES for entry in stage_canaries
-            ):
+        replacement_stage_order: list[str] = []
+        if rolling_migration:
+            # Preserve every predecessor task and transfer only naturally
+            # vacated slots.  The old 64/96/128/212 distribution is allowed
+            # to be temporarily over/under the successor 160/140/120/80
+            # targets; weighted deficit refill converges without cancellation.
+            replacement_stage_order = _weighted_deficit_refill_order(
+                state,
+                slots=TOTAL_ACTIVE_QUOTA - _active_count(state),
+                reserve_missing_migration_canaries=True,
+            )
+            for stage_id in replacement_stage_order:
+                wave = "refill" if stage_id in passed else "canary"
                 replacement_entries.append(
                     _append_refill(
                         state,
                         templates=templates,
-                        stage_id=stage.stage_id,
-                        wave="canary",
+                        stage_id=stage_id,
+                        wave=wave,
                     )
                 )
+        else:
+            for stage in STAGES:
+                if stage.stage_id in passed:
+                    continue
+                stage_canaries = [
+                    entry
+                    for entry in state["entries"]
+                    if entry["stage_id"] == stage.stage_id
+                    and entry["wave"] == "canary"
+                ]
+                if stage_canaries and all(
+                    entry["state"] in TERMINAL_STATES for entry in stage_canaries
+                ):
+                    replacement_entries.append(
+                        _append_refill(
+                            state,
+                            templates=templates,
+                            stage_id=stage.stage_id,
+                            wave="canary",
+                        )
+                    )
         replacement_submitted = 0
         replacement_reconciled = 0
         if replacement_entries:
@@ -626,19 +928,35 @@ def control_once(
             # Persist newly observed successful gates even without replacement.
             if passed != prior_passed and not replacement_entries:
                 persist()
+            if rolling_migration and _active_count(state) != TOTAL_ACTIVE_QUOTA:
+                raise RuntimeError(
+                    "rolling migration failed to preserve exact active target"
+                )
             actions.append(
                 {
-                    "action": "ramp_held",
+                    "action": (
+                        "rolling_canary_held" if rolling_migration else "ramp_held"
+                    ),
                     "passed_stage_count": len(passed),
                     "reasons": reasons,
                     "replacement_submitted": replacement_submitted,
                     "replacement_reconciled": replacement_reconciled,
+                    "replacement_stage_order": replacement_stage_order,
                 }
             )
             return _result(state, actions, True, writes, scheduler)
         state["ramp_released"] = True
         persist()
-        actions.append({"action": "ramp_released", "count": 496})
+        actions.append(
+            {
+                "action": (
+                    "rolling_successor_released"
+                    if rolling_migration
+                    else "ramp_released"
+                ),
+                "count": 0 if rolling_migration else 496,
+            }
+        )
 
     planned_entries = [
         entry for entry in state["entries"] if entry["state"] == "planned"
@@ -662,16 +980,17 @@ def control_once(
 
     changed = _reconcile(state, scheduler)
     refill_entries = []
-    for stage in STAGES:
-        gap = stage.active_quota - _active_count(state, stage.stage_id)
-        if gap < 0:
-            raise RuntimeError(f"{stage.stage_id} exceeds its active quota")
-        for _ in range(gap):
-            refill_entries.append(
-                _append_refill(
-                    state, templates=templates, stage_id=stage.stage_id
-                )
+    refill_stage_order = _weighted_deficit_refill_order(
+        state,
+        slots=TOTAL_ACTIVE_QUOTA - _active_count(state),
+        reserve_missing_migration_canaries=False,
+    )
+    for stage_id in refill_stage_order:
+        refill_entries.append(
+            _append_refill(
+                state, templates=templates, stage_id=stage_id
             )
+        )
     refill_submitted = 0
     refill_reconciled = 0
     if refill_entries:
@@ -690,6 +1009,7 @@ def control_once(
             "reserved": len(refill_entries),
             "submitted": refill_submitted,
             "reconciled": refill_reconciled,
+            "stage_order": refill_stage_order,
         }
     )
     if _active_count(state) != TOTAL_ACTIVE_QUOTA:
@@ -707,6 +1027,7 @@ def _result(
     stage_active = {
         stage.stage_id: _active_count(state, stage.stage_id) for stage in STAGES
     }
+    migration = state.get("rolling_migration")
     return {
         "schema_version": RESULT_SCHEMA,
         "apply": bool(apply),
@@ -727,6 +1048,17 @@ def _result(
         ),
         "entry_count": len(state["entries"]),
         "actions": [dict(action) for action in actions],
+        "rolling_migration": isinstance(migration, dict),
+        "successor_canary_task_ids_by_stage": (
+            copy.deepcopy(migration.get("successor_canary_task_ids_by_stage"))
+            if isinstance(migration, dict)
+            else None
+        ),
+        "successor_canary_status_by_stage": (
+            copy.deepcopy(migration.get("successor_canary_status_by_stage"))
+            if isinstance(migration, dict)
+            else None
+        ),
         "cancellation_performed": False,
         "fea_submission_performed": False,
         "aedt_used": False,

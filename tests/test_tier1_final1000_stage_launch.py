@@ -127,9 +127,9 @@ def _rendered_plan() -> dict:
         "stage_inventory": profiles.stage_inventory(),
         "stage_bindings": stage_bindings,
         "resources": {
-            "cpus_per_task": 8,
+            "cpus_per_task": 4,
             "memory_mb_per_task": 28 * 1024,
-            "max_workers_per_node": 8,
+            "max_workers_per_node": 32,
             "priority": 1,
             "scheduling_profile": "standard",
             "gpus": 0,
@@ -140,9 +140,7 @@ def _rendered_plan() -> dict:
         },
         "open_ended_refill": {
             "logical_active_target": 500,
-            "stage_active_quotas": {
-                stage.stage_id: stage.active_quota for stage in profiles.STAGES
-            },
+            "stage_active_quotas": launch.SUCCESSOR_ACTIVE_QUOTAS,
         },
         "task_waves": {"canaries": canaries, "ramp": ramp},
         "surrogate_only": True,
@@ -230,7 +228,13 @@ def test_logical_wave_is_4_canaries_plus_496_and_preserves_stage_quotas():
             lane["stage_id"] == stage.stage_id for lane in all_lanes
         )
         for stage in profiles.STAGES
-    } == {stage.stage_id: stage.active_quota for stage in profiles.STAGES}
+    } == launch.SUCCESSOR_ACTIVE_QUOTAS
+    assert launch.SUCCESSOR_ACTIVE_QUOTAS == {
+        "entry-1200-t125": 160,
+        "bridge-1150-t115": 140,
+        "close-1075-t107p5": 120,
+        "final-1000-t100": 80,
+    }
 
 
 def test_task_renderer_pins_stage_payload_and_requested_scheduler_resources():
@@ -245,9 +249,9 @@ def test_task_renderer_pins_stage_payload_and_requested_scheduler_resources():
     assert payload["final_goal_stage_id"] == stage.stage_id
     assert payload["lane"]["fixed_primary_turns"] == 6
     assert payload["maximum_peak_rss_bytes"] == 22 * 1024**3
-    assert task["cpus"] == 8
+    assert task["cpus"] == 4
     assert task["memory_mb"] == 28 * 1024
-    assert task["max_workers_per_node"] == 8
+    assert task["max_workers_per_node"] == 32
     assert task["priority"] == 1
     assert task["scheduling_profile"] == "standard"
     assert task["gpus"] == 0
@@ -264,10 +268,10 @@ def test_task_renderer_pins_stage_payload_and_requested_scheduler_resources():
 @pytest.mark.parametrize(
     ("location", "field", "value"),
     [
-        ("task", "cpus", 4),
+        ("task", "cpus", 8),
         ("task", "memory_mb", 65_536),
         ("task", "priority", 10),
-        ("task", "max_workers_per_node", 32),
+        ("task", "max_workers_per_node", 8),
         ("payload", "aedt_used", True),
         ("payload", "fea_submission_performed", True),
         ("payload", "stage_spec_sha256", "0" * 64),
@@ -295,7 +299,7 @@ def test_full_launch_plan_is_sealed_open_ended_500_and_detects_tamper():
     assert validated["aedt_used"] is False
 
     mutated = copy.deepcopy(plan)
-    mutated["task_waves"]["ramp"][0]["cpus"] = 4
+    mutated["task_waves"]["ramp"][0]["cpus"] = 8
     unsigned = {
         key: value
         for key, value in mutated.items()
@@ -567,7 +571,7 @@ def test_controller_releases_496_then_refills_each_terminal_gap(tmp_path):
     assert second["scheduler_post_count"] == 500
     assert second["active_count"] == 500
     assert second["active_count_by_stage"] == {
-        stage.stage_id: stage.active_quota for stage in profiles.STAGES
+        **launch.SUCCESSOR_ACTIVE_QUOTAS
     }
     assert len(scheduler.by_id) == 500
     assert all(
@@ -601,6 +605,9 @@ def test_controller_releases_496_then_refills_each_terminal_gap(tmp_path):
         "reserved": 1,
         "submitted": 1,
         "reconciled": 0,
+        "stage_order": [
+            scheduler.by_id[completed_id]["payload_json"]["final_goal_stage_id"]
+        ],
     }
 
 

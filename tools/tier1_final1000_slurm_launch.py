@@ -75,18 +75,33 @@ RESULT_PREFLIGHT_SCHEMA = "mft-tier1-final1000-result-preflight-v1"
 CURRENT7_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 CURRENT7_REPLAY_SCHEMA = "mft-tier1-current7-terminal-replay-v1"
 
-DEFAULT_CPUS = 8
+DEFAULT_CPUS = 4
 DEFAULT_MEMORY_MB = 28 * 1024
-# The optimizer binds every supported surrogate family to eight inference
-# threads.  Keep scheduler accounting exact and cap a 64-core node at eight
-# such workers even when several backing allocations land on the same node.
-DEFAULT_MAX_WORKERS_PER_NODE = 8
+# ``max_workers_per_node`` is an allocation-level cap for ``standard`` tasks
+# in the deployed scheduler (the name is historical).  CPU and memory fit are
+# still hard gates.  Thirty-two preserves the already-proven 4c/28GiB Current7
+# production identity (2,606/2,606 completed) without reducing a 64-core
+# allocation to the eight-worker cap used by the predecessor release.
+DEFAULT_MAX_WORKERS_PER_NODE = 32
 # This active final-goal search should be admitted ahead of the older
 # Current7 priority-0 refills while staying inside the user's normal 0--9
 # simulation priority band.  It does not preempt already-running work.
 DEFAULT_PRIORITY = 1
 DEFAULT_TIMEOUT_SECONDS = 86_400
 DEFAULT_PEAK_RSS_GATE_BYTES = 22 * 1024**3
+
+# Operational successor quotas are intentionally separate from the immutable
+# science stage profiles used by the predecessor bundles.  This lets migration
+# authenticate every predecessor task while shifting capacity toward the two
+# relaxed donor basins that currently have the highest useful throughput.
+SUCCESSOR_ACTIVE_QUOTAS = {
+    "entry-1200-t125": 160,
+    "bridge-1150-t115": 140,
+    "close-1075-t107p5": 120,
+    "final-1000-t100": 80,
+}
+if sum(SUCCESSOR_ACTIVE_QUOTAS.values()) != TOTAL_ACTIVE_QUOTA:  # pragma: no cover
+    raise RuntimeError("final1000 successor active quotas must sum to 500")
 
 REQUIRED_SCHEDULER_FIELDS = frozenset(
     {
@@ -220,9 +235,10 @@ def logical_lanes() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     ramp: list[dict[str, Any]] = []
     occupied: set[int] = set()
     for stage in STAGES:
-        if stage.seed_start + stage.active_quota > stage.seed_window_end_exclusive:
+        quota = SUCCESSOR_ACTIVE_QUOTAS[stage.stage_id]
+        if stage.seed_start + quota > stage.seed_window_end_exclusive:
             raise RuntimeError(f"{stage.stage_id} active quota escapes its seed window")
-        for offset in range(stage.active_quota):
+        for offset in range(quota):
             seed = stage.seed_start + offset
             if seed in occupied:
                 raise RuntimeError("final1000 logical seed allocation overlaps")
@@ -622,7 +638,8 @@ def build_launch_plan(bindings_path: Path) -> dict[str, Any]:
             "policy": "maintain_500_active_until_explicit_stop",
             "logical_active_target": TOTAL_ACTIVE_QUOTA,
             "stage_active_quotas": {
-                stage.stage_id: stage.active_quota for stage in STAGES
+                stage.stage_id: SUCCESSOR_ACTIVE_QUOTAS[stage.stage_id]
+                for stage in STAGES
             },
             "refill_each_observed_terminal_gap": True,
             "wait_for_full_wave": False,
@@ -674,6 +691,8 @@ def validate_launch_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         )
         or (value.get("open_ended_refill") or {}).get("logical_active_target")
         != TOTAL_ACTIVE_QUOTA
+        or (value.get("open_ended_refill") or {}).get("stage_active_quotas")
+        != SUCCESSOR_ACTIVE_QUOTAS
     ):
         raise RuntimeError("final1000 launch-plan top-level seal mismatch")
     for stage in STAGES:
@@ -719,7 +738,7 @@ def validate_launch_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         )
         for stage in STAGES
     }
-    if stage_counts != {stage.stage_id: stage.active_quota for stage in STAGES}:
+    if stage_counts != SUCCESSOR_ACTIVE_QUOTAS:
         raise RuntimeError("final1000 launch stage quota drifted")
     canary_stages = {
         task["payload_json"]["final_goal_stage_id"] for task in canaries
