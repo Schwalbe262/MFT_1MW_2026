@@ -114,6 +114,40 @@ def test_basin_seeding_reuses_same_lane_genomes_and_is_deterministic():
     }
 
 
+def test_rare_protected_topology_uses_only_authenticated_same_lane_donor():
+    topology = contract.topology_evolution_contract(6)
+    values = np.random.default_rng(29).random((320, 25))
+    values[:, 2] = _coordinate(34)
+    protected = []
+    for n2_main in (34, 35, 36, 37, 38, 60):
+        protected.extend([n2_main] * 8)
+    protected.extend([39, 39])
+    for index, n2_main in enumerate(protected):
+        values[index, 2] = _coordinate(n2_main)
+
+    _seeded, audit = seed_turn_split_sub_islands(
+        _RepairOnlyProblem(),
+        values,
+        topology,
+        warm_donor_count=len(protected),
+        protected_warm_donors_only=True,
+    )
+
+    rare = [
+        item for item in audit["donor_sources"]
+        if item["target_N2_main"] == 39
+    ]
+    assert len(rare) == 8
+    assert 39 in {item["source_N2_main"] for item in rare}
+    assert {item["source_N2_main"] for item in rare} <= {
+        35, 36, 37, 38, 39
+    }
+    assert {item["source_tier"] for item in rare} <= {
+        "same_topology", "same_basin_lane"
+    }
+    assert all(item["source_is_authenticated_warm"] for item in rare)
+
+
 def test_n1_6_operator_keeps_all_basin_topologies_in_terminal_population(
     monkeypatch,
 ):

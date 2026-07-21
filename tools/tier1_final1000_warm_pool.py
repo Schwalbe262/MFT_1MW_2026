@@ -28,6 +28,10 @@ try:
     from tier1_corrected_generation_preflight import (
         RESONANCE_MAXIMUM_CONSTRAINT,
         RESONANCE_MINIMUM_CONSTRAINT,
+        STRUCTURAL_DONOR_OPTIMIZER_GATES,
+        STRUCTURAL_DONOR_REQUIRED_GATES,
+        WARM_ROLE_PARTITION_SCHEMA,
+        authenticate_warm_handoff,
         canonical_sha256,
         stage_constraint_names,
         stage_spec_from_json_identity,
@@ -38,6 +42,10 @@ except ImportError:  # pragma: no cover - repository module import path
     from tools.tier1_corrected_generation_preflight import (
         RESONANCE_MAXIMUM_CONSTRAINT,
         RESONANCE_MINIMUM_CONSTRAINT,
+        STRUCTURAL_DONOR_OPTIMIZER_GATES,
+        STRUCTURAL_DONOR_REQUIRED_GATES,
+        WARM_ROLE_PARTITION_SCHEMA,
+        authenticate_warm_handoff,
         canonical_sha256,
         stage_constraint_names,
         stage_spec_from_json_identity,
@@ -451,8 +459,9 @@ def _basin_aware_indices(
             topology["bounded_diversity_budget"]["population"]
         ),
         "downstream_protected_seed_count": BASIN_PROTECTED_SELECTION_CAP,
-        "downstream_maximum_warm_injected_count": 160,
-        "downstream_fresh_random_count": 160,
+        "downstream_maximum_combined_authenticated_count": 160,
+        "downstream_maximum_standard_hard_feasible_count": 104,
+        "downstream_minimum_fresh_random_count": 160,
         "additional_model_evaluations_during_selection": 0,
     }
     audit["sha256"] = canonical_sha256(audit)
@@ -502,6 +511,8 @@ def build_warm_pool(
     fixed_primary_turns: int = 6,
     donor_index_paths: tuple[Path, ...] = (),
     basin_aware: bool = False,
+    standard_warm_start: Path | None = None,
+    standard_warm_contract: Path | None = None,
 ) -> tuple[Path, Path]:
     if isinstance(pool_size, bool) or not 4 <= int(pool_size) <= 4096:
         raise ValueError("pool_size must be from 4 through 4096")
@@ -521,6 +532,45 @@ def build_warm_pool(
     if not isinstance(basin_aware, bool):
         raise ValueError("basin_aware must be boolean")
     normalized_stage = validate_stage_spec(stage_spec)
+    if bool(standard_warm_start) != bool(standard_warm_contract):
+        raise ValueError(
+            "standard warm artifact and contract must be supplied together"
+        )
+    if basin_aware and standard_warm_start is None:
+        raise ValueError(
+            "basin-aware output requires an existing standard warm handoff"
+        )
+    if not basin_aware and standard_warm_start is not None:
+        raise ValueError("standard warm composition requires basin-aware mode")
+    standard_values = None
+    standard_authentication = None
+    standard_contract_value = None
+    if standard_warm_start is not None and standard_warm_contract is not None:
+        standard_contract_path = Path(standard_warm_contract).resolve(strict=True)
+        standard_contract_value = _read_json(standard_contract_path)
+        if (
+            standard_contract_value.get("stage_spec") != normalized_stage
+            or standard_contract_value.get("stage_spec_sha256")
+            != canonical_sha256(normalized_stage)
+            or int(
+                (standard_contract_value.get("hard_geometry_audit") or {}).get(
+                    "joint_count", 0
+                )
+            )
+            < 1
+        ):
+            raise RuntimeError(
+                "standard warm handoff lacks exact-stage hard-feasible evidence"
+            )
+        standard_values, standard_authentication = authenticate_warm_handoff(
+            Path(standard_warm_start),
+            standard_contract_path,
+            fixed_primary_turns=fixed_primary_turns,
+            n_var=25,
+            expected_contract_file_sha256=_sha256_file(
+                standard_contract_path
+            ),
+        )
     index_paths = tuple(
         path.resolve(strict=True)
         for path in (Path(index_path), *map(Path, donor_index_paths))
@@ -725,7 +775,25 @@ def build_warm_pool(
         )
     if len(selected) < 4:
         raise RuntimeError("staged warm selection produced fewer than four coordinates")
-    selected_x = np.asarray(x_all[selected], dtype="<f8")
+    basin_selected_x = np.asarray(x_all[selected], dtype="<f8")
+    standard_count = 0
+    if standard_values is not None:
+        standard_x = np.asarray(standard_values, dtype="<f8")
+        standard_count = int(len(standard_x))
+        selected_x = np.vstack((standard_x, basin_selected_x))
+    else:
+        selected_x = basin_selected_x
+    if basin_selection is not None:
+        basin_positions = {
+            int(source_index): standard_count + basin_rank
+            for basin_rank, source_index in enumerate(selected)
+        }
+        for item in basin_selection["protected_selection"]:
+            item["artifact_row_index"] = basin_positions[
+                int(item["source_row_index"])
+            ]
+        basin_selection.pop("sha256", None)
+        basin_selection["sha256"] = canonical_sha256(basin_selection)
     output_dir = output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise RuntimeError("warm-pool output directory must be absent or empty")
@@ -738,7 +806,9 @@ def build_warm_pool(
         row = np.asarray(x_all[index], dtype="<f8")
         selected_records.append(
             {
-                "rank": rank,
+                "rank": standard_count + rank,
+                "basin_rank": rank,
+                "artifact_row_index": standard_count + rank,
                 **metadata[index],
                 "positive_constraint_count": int(violation_count[index]),
                 "normalized_positive_G_sum": float(normalized_sum[index]),
@@ -746,6 +816,102 @@ def build_warm_pool(
                 "objective_total_loss_W": float(f_all[index, 1]),
                 "coordinate_sha256": hashlib.sha256(row.tobytes()).hexdigest(),
             }
+        )
+    warm_role_partition = None
+    standard_warm_source = None
+    if basin_aware:
+        if (
+            standard_values is None
+            or standard_authentication is None
+            or standard_contract_value is None
+        ):
+            raise RuntimeError("basin warm role composition was not authenticated")
+        standard_slice = selected_x[:standard_count]
+        basin_slice = selected_x[standard_count:]
+        standard_warm_source = {
+            "artifact": {
+                "path": str(Path(standard_warm_start).resolve(strict=True)),
+                "sha256": standard_authentication["artifact"]["sha256"],
+                "coordinate_unit_sha256": standard_authentication[
+                    "artifact"
+                ]["coordinate_unit_sha256"],
+                "shape": list(standard_slice.shape),
+            },
+            "contract": {
+                "path": str(Path(standard_warm_contract).resolve(strict=True)),
+                "file_sha256": standard_authentication[
+                    "contract_file_sha256"
+                ],
+                "canonical_sha256": standard_authentication[
+                    "contract_canonical_sha256"
+                ],
+                "schema_version": standard_authentication[
+                    "contract_schema_version"
+                ],
+            },
+            "hard_geometry_joint_count": int(
+                standard_contract_value["hard_geometry_audit"]["joint_count"]
+            ),
+            "remote_current_problem_hard_filter_required": True,
+        }
+        standard_warm_source["sha256"] = canonical_sha256(
+            standard_warm_source
+        )
+        warm_role_partition = {
+            "schema_version": WARM_ROLE_PARTITION_SCHEMA,
+            "fixed_primary_turns": fixed_primary_turns,
+            "total_count": int(len(selected_x)),
+            "standard_hard_feasible_candidates": {
+                "start": 0,
+                "count": standard_count,
+                "coordinate_unit_sha256": canonical_sha256(
+                    standard_slice.tolist()
+                ),
+                "full_hard_geometry_filter_required": True,
+                "ordinary_warm_sampling_allowed": True,
+                "source_artifact_sha256": standard_authentication[
+                    "artifact"
+                ]["sha256"],
+                "source_contract_file_sha256": standard_authentication[
+                    "contract_file_sha256"
+                ],
+                "source_hard_geometry_joint_count": int(
+                    standard_contract_value["hard_geometry_audit"][
+                        "joint_count"
+                    ]
+                ),
+            },
+            "basin_structural_coordinate_donors": {
+                "start": standard_count,
+                "count": int(len(basin_slice)),
+                "coordinate_unit_sha256": canonical_sha256(
+                    basin_slice.tolist()
+                ),
+                "required_gate_names": list(
+                    STRUCTURAL_DONOR_REQUIRED_GATES
+                ),
+                "optimizer_gate_names_not_used_for_donor_admission": list(
+                    STRUCTURAL_DONOR_OPTIMIZER_GATES
+                ),
+                "required_topologies_N2_main": list(
+                    basin_selection["required_topologies_N2_main"]
+                ),
+                "source_selection_contract_sha256": basin_selection[
+                    "sha256"
+                ],
+                "coordinate_donors_only": True,
+                "protected_topology_slots_only": True,
+                "ordinary_warm_sampling_allowed": False,
+                "prior_prediction_or_pass_classification_inherited": False,
+            },
+            "maximum_combined_authenticated_fraction": 0.5,
+            "minimum_fresh_random_fraction": 0.5,
+            "physical_constraint_G_mutation": False,
+            "physical_objective_mutation": False,
+            "terminal_physical_replay_required": True,
+        }
+        warm_role_partition["sha256"] = canonical_sha256(
+            warm_role_partition
         )
     contract = {
         "schema_version": CONTRACT_SCHEMA,
@@ -783,9 +949,13 @@ def build_warm_pool(
             np.count_nonzero(np.all(staged_g <= 0.0, axis=1))
         ),
         "selected_count": int(len(selected_x)),
+        "standard_hard_feasible_candidate_count": standard_count,
+        "basin_structural_candidate_count": int(len(basin_selected_x)),
+        "selection_record_scope": "basin_structural_candidate_rows_only",
         "candidate_limit": min(int(candidate_limit), len(x_all)),
         "minimum_coordinate_l2_distance": float(minimum_distance),
         "basin_aware_selection": basin_selection,
+        "standard_warm_source": standard_warm_source,
         "selection": selected_records,
         "coordinate_artifact": {
             "path": coordinate_path.name,
@@ -809,6 +979,7 @@ def build_warm_pool(
                 "current_repair_v1"
             ),
         },
+        "warm_role_partition": warm_role_partition,
         "downstream_repair_required": True,
         "prior_objectives_reused_for_optimizer": False,
         "prior_constraints_reused_for_optimizer": False,
@@ -849,6 +1020,8 @@ def main(argv: list[str] | None = None) -> int:
         help="additional authenticated stage index (repeatable)",
     )
     parser.add_argument("--basin-aware", action="store_true")
+    parser.add_argument("--standard-warm-start", type=Path)
+    parser.add_argument("--standard-warm-contract", type=Path)
     args = parser.parse_args(argv)
     stage_spec = stage_spec_from_json_identity(
         args.stage_spec_json, args.stage_spec_sha256
@@ -864,6 +1037,8 @@ def main(argv: list[str] | None = None) -> int:
         fixed_primary_turns=args.fixed_primary_turns,
         donor_index_paths=tuple(args.donor_index),
         basin_aware=args.basin_aware,
+        standard_warm_start=args.standard_warm_start,
+        standard_warm_contract=args.standard_warm_contract,
     )
     print(
         json.dumps(

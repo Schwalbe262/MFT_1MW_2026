@@ -195,6 +195,43 @@ def test_build_pool_rejects_status_tampering(tmp_path: Path):
         )
 
 
+def _standard_warm_handoff(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "standard-warm"
+    root.mkdir(parents=True)
+    values = np.random.default_rng(991).random((4, 25))
+    artifact = root / "coordinates.npy"
+    np.save(artifact, values, allow_pickle=False)
+    contract = {
+        "schema_version": "mft-tier1-final1000-current7-warm-handoff-v1",
+        "fixed_primary_turns": 6,
+        "fixed_primary_turns_scope": (
+            "runner_repair_after_authenticated_inverse_coordinate_handoff"
+        ),
+        "stage_spec": _stage(),
+        "stage_spec_sha256": canonical_sha256(_stage()),
+        "hard_geometry_audit": {
+            "joint_count": 1,
+            "unique_geometry_count": 1,
+        },
+        "warm_rows_are_coordinate_donors_only": True,
+        "warm_start": {
+            "path": artifact.name,
+            "sha256": _sha(artifact),
+            "shape": list(values.shape),
+            "coordinate_contract": (
+                "authenticated_coordinate_donors_then_current_repair_v1"
+            ),
+        },
+        "physical_hard_spec_mutation": False,
+        "objective_mutation": False,
+        "automatic_promotion_allowed": False,
+    }
+    contract["sha256"] = canonical_sha256(contract)
+    contract_path = root / "contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    return artifact, contract_path
+
+
 def _basin_fixture(
     tmp_path: Path,
     *,
@@ -274,6 +311,7 @@ def _basin_fixture(
 def test_basin_pool_combines_indexes_and_seals_actual_source_result_provenance(
     tmp_path: Path,
 ):
+    standard_artifact, standard_contract = _standard_warm_handoff(tmp_path)
     primary = _basin_fixture(
         tmp_path,
         name="primary",
@@ -296,13 +334,38 @@ def test_basin_pool_combines_indexes_and_seals_actual_source_result_provenance(
         pool_size=56,
         candidate_limit=82,
         minimum_distance=0.0,
+        standard_warm_start=standard_artifact,
+        standard_warm_contract=standard_contract,
     )
 
     values = np.load(coordinates, allow_pickle=False)
     payload = json.loads(contract_path.read_text(encoding="utf-8"))
     basin = payload["basin_aware_selection"]
-    observed = 60 - np.rint(48.0 * values[:, 2]).astype(int)
+    role = payload["warm_role_partition"]
+    basin_role = role["basin_structural_coordinate_donors"]
+    basin_values = values[
+        basin_role["start"] : basin_role["start"] + basin_role["count"]
+    ]
+    observed = 60 - np.rint(48.0 * basin_values[:, 2]).astype(int)
     assert set(observed) >= {34, 35, 36, 37, 38, 39, 60}
+    assert values.shape == (60, 25)
+    assert role["standard_hard_feasible_candidates"]["count"] == 4
+    assert basin_role["count"] == 56
+    source = payload["standard_warm_source"]
+    unsigned_source = dict(source)
+    assert unsigned_source.pop("sha256") == canonical_sha256(unsigned_source)
+    assert source["hard_geometry_joint_count"] == 1
+    unsigned_role = dict(role)
+    assert unsigned_role.pop("sha256") == canonical_sha256(unsigned_role)
+    loaded, authentication = authenticate_warm_handoff(
+        coordinates,
+        contract_path,
+        fixed_primary_turns=6,
+        n_var=25,
+        expected_contract_file_sha256=_sha(contract_path),
+    )
+    np.testing.assert_array_equal(loaded, values)
+    assert authentication["warm_role_partition"] == role
     assert len(payload["source_indexes"]) == 2
     assert basin["source_available_counts"] == {
         "34": 40,
@@ -315,7 +378,8 @@ def test_basin_pool_combines_indexes_and_seals_actual_source_result_provenance(
     }
     assert basin["protected_selection_count"] == 50
     assert basin["protected_selection_cap"] == 56
-    assert basin["downstream_fresh_random_count"] == 160
+    assert basin["downstream_minimum_fresh_random_count"] == 160
+    assert basin["downstream_maximum_standard_hard_feasible_count"] == 104
     assert all(
         len(item["source_result_sha256"]) == 64
         and len(item["source_index_sha256"]) == 64
@@ -330,6 +394,7 @@ def test_basin_pool_combines_indexes_and_seals_actual_source_result_provenance(
 def test_basin_pool_fails_closed_when_a_required_topology_is_absent(
     tmp_path: Path,
 ):
+    standard_artifact, standard_contract = _standard_warm_handoff(tmp_path)
     primary = _basin_fixture(
         tmp_path,
         name="primary-missing",
@@ -353,12 +418,15 @@ def test_basin_pool_fails_closed_when_a_required_topology_is_absent(
             pool_size=56,
             candidate_limit=80,
             minimum_distance=0.0,
+            standard_warm_start=standard_artifact,
+            standard_warm_contract=standard_contract,
         )
 
 
 def test_basin_pool_fails_closed_on_source_result_identity_mismatch(
     tmp_path: Path,
 ):
+    standard_artifact, standard_contract = _standard_warm_handoff(tmp_path)
     primary = _basin_fixture(
         tmp_path,
         name="primary-mismatch",
@@ -376,4 +444,6 @@ def test_basin_pool_fails_closed_on_source_result_identity_mismatch(
             pool_size=56,
             candidate_limit=56,
             minimum_distance=0.0,
+            standard_warm_start=standard_artifact,
+            standard_warm_contract=standard_contract,
         )
