@@ -9,6 +9,7 @@ import pytest
 
 from tools.tier1_corrected_generation_preflight import (
     CURRENT_STAGE_SPEC,
+    authenticate_warm_handoff,
     canonical_sha256,
     stage_constraint_names,
     validate_stage_spec,
@@ -149,12 +150,32 @@ def test_build_pool_authenticates_n1_6_and_writes_sealed_artifacts(tmp_path: Pat
 
     values = np.load(coordinates, allow_pickle=False)
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    unsigned = {key: value for key, value in contract.items() if key != "contract_sha256"}
+    legacy_unsigned = {
+        key: value
+        for key, value in contract.items()
+        if key not in {"contract_sha256", "sha256"}
+    }
+    handoff_unsigned = {
+        key: value for key, value in contract.items() if key != "sha256"
+    }
     assert values.shape == (4, 25)
     assert contract["schema_version"] == CONTRACT_SCHEMA
     assert contract["source_status"]["authenticated_terminal_records"] == 1
     assert contract["coordinate_artifact"]["sha256"] == _sha(coordinates)
-    assert contract["contract_sha256"] == canonical_sha256(unsigned)
+    assert contract["contract_sha256"] == canonical_sha256(legacy_unsigned)
+    assert contract["sha256"] == canonical_sha256(handoff_unsigned)
+    assert contract["fixed_primary_turns"] == 6
+    assert contract["warm_rows_are_coordinate_donors_only"] is True
+    loaded, evidence = authenticate_warm_handoff(
+        coordinates,
+        contract_path,
+        fixed_primary_turns=6,
+        n_var=values.shape[1],
+        expected_contract_file_sha256=_sha(contract_path),
+    )
+    np.testing.assert_array_equal(loaded, values)
+    assert evidence["contract_canonical_sha256"] == contract["sha256"]
+    assert evidence["coordinates_only"] is True
     assert all(item["island_id"] == "n1-6-test" for item in contract["selection"])
 
 

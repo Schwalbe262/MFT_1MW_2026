@@ -499,6 +499,7 @@ def build_warm_pool(
     candidate_limit: int = 8_192,
     minimum_distance: float = 0.01,
     island_prefix: str = "n1-6-",
+    fixed_primary_turns: int = 6,
     donor_index_paths: tuple[Path, ...] = (),
     basin_aware: bool = False,
 ) -> tuple[Path, Path]:
@@ -508,6 +509,15 @@ def build_warm_pool(
         raise ValueError("candidate_limit must be at least pool_size")
     if not math.isfinite(float(minimum_distance)) or minimum_distance < 0.0:
         raise ValueError("minimum_distance must be finite and non-negative")
+    if (
+        isinstance(fixed_primary_turns, bool)
+        or int(fixed_primary_turns) != fixed_primary_turns
+        or int(fixed_primary_turns) not in (5, 6)
+    ):
+        raise ValueError("fixed_primary_turns must be exactly 5 or 6")
+    fixed_primary_turns = int(fixed_primary_turns)
+    if not str(island_prefix).startswith(f"n1-{fixed_primary_turns}-"):
+        raise ValueError("island_prefix disagrees with fixed_primary_turns")
     if not isinstance(basin_aware, bool):
         raise ValueError("basin_aware must be boolean")
     normalized_stage = validate_stage_spec(stage_spec)
@@ -785,9 +795,27 @@ def build_warm_pool(
             "dtype": "float64-little-endian",
             "allow_pickle": False,
         },
+        "fixed_primary_turns": fixed_primary_turns,
+        "fixed_primary_turns_scope": (
+            "runner_repair_after_authenticated_inverse_coordinate_handoff"
+        ),
+        "warm_rows_are_coordinate_donors_only": True,
+        "warm_start": {
+            "path": coordinate_path.name,
+            "sha256": _sha256_file(coordinate_path),
+            "shape": list(selected_x.shape),
+            "coordinate_contract": (
+                "authenticated_staged_terminal_unit_coordinates_then_"
+                "current_repair_v1"
+            ),
+        },
         "downstream_repair_required": True,
         "prior_objectives_reused_for_optimizer": False,
         "prior_constraints_reused_for_optimizer": False,
+        "source_prediction_or_pass_classification_inherited": False,
+        "physical_hard_spec_mutation": False,
+        "hard_constraint_mutation": False,
+        "objective_mutation": False,
         "terminal_physical_replay_required": True,
         "surrogate_only": True,
         "production_eligible": False,
@@ -797,6 +825,7 @@ def build_warm_pool(
         "automatic_promotion_allowed": False,
     }
     contract["contract_sha256"] = canonical_sha256(contract)
+    contract["sha256"] = canonical_sha256(contract)
     _atomic_json(contract_path, contract)
     return coordinate_path, contract_path
 
@@ -811,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--candidate-limit", type=int, default=8192)
     parser.add_argument("--minimum-distance", type=float, default=0.01)
     parser.add_argument("--island-prefix", default="n1-6-")
+    parser.add_argument("--fixed-primary-turns", type=int, default=6)
     parser.add_argument(
         "--donor-index",
         type=Path,
@@ -831,6 +861,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_limit=args.candidate_limit,
         minimum_distance=args.minimum_distance,
         island_prefix=args.island_prefix,
+        fixed_primary_turns=args.fixed_primary_turns,
         donor_index_paths=tuple(args.donor_index),
         basin_aware=args.basin_aware,
     )
