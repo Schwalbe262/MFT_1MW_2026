@@ -107,7 +107,7 @@ def _rendered_plan() -> dict:
             "cpus_per_task": 8,
             "memory_mb_per_task": 28 * 1024,
             "max_workers_per_node": 8,
-            "priority": 0,
+            "priority": 1,
             "scheduling_profile": "standard",
             "gpus": 0,
         },
@@ -225,7 +225,7 @@ def test_task_renderer_pins_stage_payload_and_requested_scheduler_resources():
     assert task["cpus"] == 8
     assert task["memory_mb"] == 28 * 1024
     assert task["max_workers_per_node"] == 8
-    assert task["priority"] == 0
+    assert task["priority"] == 1
     assert task["scheduling_profile"] == "standard"
     assert task["gpus"] == 0
     assert task["aedt_backend"] == "standalone"

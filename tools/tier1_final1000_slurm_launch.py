@@ -78,7 +78,10 @@ DEFAULT_MEMORY_MB = 28 * 1024
 # threads.  Keep scheduler accounting exact and cap a 64-core node at eight
 # such workers even when several backing allocations land on the same node.
 DEFAULT_MAX_WORKERS_PER_NODE = 8
-DEFAULT_PRIORITY = 0
+# This active final-goal search should be admitted ahead of the older
+# Current7 priority-0 refills while staying inside the user's normal 0--9
+# simulation priority band.  It does not preempt already-running work.
+DEFAULT_PRIORITY = 1
 DEFAULT_TIMEOUT_SECONDS = 86_400
 DEFAULT_PEAK_RSS_GATE_BYTES = 22 * 1024**3
 
