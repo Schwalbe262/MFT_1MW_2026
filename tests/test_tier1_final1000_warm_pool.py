@@ -9,6 +9,7 @@ import pytest
 
 from tools.tier1_corrected_generation_preflight import (
     CURRENT_STAGE_SPEC,
+    authenticate_warm_handoff,
     canonical_sha256,
     stage_constraint_names,
     validate_stage_spec,
@@ -17,6 +18,7 @@ from tools.tier1_final1000_warm_pool import (
     CONTRACT_SCHEMA,
     build_warm_pool,
     transform_physical_g,
+    upgrade_existing_handoff_contract,
 )
 
 
@@ -155,7 +157,91 @@ def test_build_pool_authenticates_n1_6_and_writes_sealed_artifacts(tmp_path: Pat
     assert contract["source_status"]["authenticated_terminal_records"] == 1
     assert contract["coordinate_artifact"]["sha256"] == _sha(coordinates)
     assert contract["contract_sha256"] == canonical_sha256(unsigned)
+    assert contract["fixed_primary_turns"] == 6
+    assert contract["warm_start"]["sha256"] == _sha(coordinates)
+    assert contract["warm_start"]["shape"] == [4, 25]
+    authenticated, evidence = authenticate_warm_handoff(
+        coordinates,
+        contract_path,
+        fixed_primary_turns=6,
+        n_var=25,
+        expected_contract_file_sha256=_sha(contract_path),
+    )
+    assert authenticated.shape == (4, 25)
+    assert evidence["coordinates_only"] is True
     assert all(item["island_id"] == "n1-6-test" for item in contract["selection"])
+
+
+def test_build_pool_seals_n1_5_identity_for_remote_authenticator(tmp_path: Path):
+    coordinates, contract_path = build_warm_pool(
+        index_path=_fixture(tmp_path),
+        stage_spec=_stage(),
+        output_dir=tmp_path / "out-n1-5",
+        pool_size=4,
+        candidate_limit=8,
+        minimum_distance=0.0,
+        island_prefix="n1-5-",
+    )
+
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert contract["fixed_primary_turns"] == 5
+    values, _evidence = authenticate_warm_handoff(
+        coordinates,
+        contract_path,
+        fixed_primary_turns=5,
+        n_var=25,
+        expected_contract_file_sha256=_sha(contract_path),
+    )
+    assert values.shape == (4, 25)
+
+
+def test_existing_pool_contract_can_be_upgraded_without_rewriting_coordinates(
+    tmp_path: Path,
+):
+    coordinates, contract_path = build_warm_pool(
+        index_path=_fixture(tmp_path),
+        stage_spec=_stage(),
+        output_dir=tmp_path / "out",
+        pool_size=4,
+        candidate_limit=8,
+        minimum_distance=0.0,
+    )
+    original_coordinate_sha = _sha(coordinates)
+    legacy = json.loads(contract_path.read_text(encoding="utf-8"))
+    for field in (
+        "fixed_primary_turns",
+        "fixed_primary_turns_scope",
+        "warm_start",
+        "warm_rows_are_coordinate_donors_only",
+        "physical_hard_spec_mutation",
+        "objective_mutation",
+    ):
+        legacy.pop(field)
+    legacy.pop("contract_sha256")
+    legacy["contract_sha256"] = canonical_sha256(legacy)
+    legacy_path = tmp_path / "legacy-contract.json"
+    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+    upgraded_path = tmp_path / "current7-contract.json"
+
+    actual = upgrade_existing_handoff_contract(
+        warm_start=coordinates,
+        source_contract=legacy_path,
+        output_contract=upgraded_path,
+        fixed_primary_turns=6,
+    )
+
+    assert actual == upgraded_path
+    assert _sha(coordinates) == original_coordinate_sha
+    upgraded = json.loads(upgraded_path.read_text(encoding="utf-8"))
+    assert upgraded["compatibility_upgrade"]["coordinate_bytes_rewritten"] is False
+    values, _evidence = authenticate_warm_handoff(
+        coordinates,
+        upgraded_path,
+        fixed_primary_turns=6,
+        n_var=25,
+        expected_contract_file_sha256=_sha(upgraded_path),
+    )
+    assert values.shape == (4, 25)
 
 
 def test_build_pool_rejects_status_tampering(tmp_path: Path):

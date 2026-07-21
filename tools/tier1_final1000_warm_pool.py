@@ -28,6 +28,7 @@ try:
     from tier1_corrected_generation_preflight import (
         RESONANCE_MAXIMUM_CONSTRAINT,
         RESONANCE_MINIMUM_CONSTRAINT,
+        authenticate_warm_handoff,
         canonical_sha256,
         stage_constraint_names,
         stage_spec_from_json_identity,
@@ -37,6 +38,7 @@ except ImportError:  # pragma: no cover - repository module import path
     from tools.tier1_corrected_generation_preflight import (
         RESONANCE_MAXIMUM_CONSTRAINT,
         RESONANCE_MINIMUM_CONSTRAINT,
+        authenticate_warm_handoff,
         canonical_sha256,
         stage_constraint_names,
         stage_spec_from_json_identity,
@@ -113,6 +115,29 @@ def _finite(value: Any, label: str) -> float:
     if not math.isfinite(number):
         raise RuntimeError(f"{label} must be finite")
     return number
+
+
+def _fixed_primary_turns(
+    island_prefix: str, explicit: int | None = None
+) -> int:
+    """Resolve the fixed-turn identity that remote warm repair authenticates."""
+
+    if explicit is not None:
+        if isinstance(explicit, bool) or int(explicit) not in (5, 6):
+            raise ValueError("fixed_primary_turns must be 5 or 6")
+        turns = int(explicit)
+    elif str(island_prefix).startswith("n1-5-"):
+        turns = 5
+    elif str(island_prefix).startswith("n1-6-"):
+        turns = 6
+    else:
+        raise ValueError(
+            "fixed_primary_turns is required for a nonstandard island prefix"
+        )
+    expected_prefix = f"n1-{turns}-"
+    if not str(island_prefix).startswith(expected_prefix):
+        raise ValueError("fixed_primary_turns and island_prefix disagree")
+    return turns
 
 
 def _load_source(index_path: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
@@ -317,6 +342,7 @@ def build_warm_pool(
     candidate_limit: int = 8_192,
     minimum_distance: float = 0.01,
     island_prefix: str = "n1-6-",
+    fixed_primary_turns: int | None = None,
 ) -> tuple[Path, Path]:
     if isinstance(pool_size, bool) or not 4 <= int(pool_size) <= 4096:
         raise ValueError("pool_size must be from 4 through 4096")
@@ -324,6 +350,7 @@ def build_warm_pool(
         raise ValueError("candidate_limit must be at least pool_size")
     if not math.isfinite(float(minimum_distance)) or minimum_distance < 0.0:
         raise ValueError("minimum_distance must be finite and non-negative")
+    fixed_turns = _fixed_primary_turns(island_prefix, fixed_primary_turns)
     normalized_stage = validate_stage_spec(stage_spec)
     canonical_index, status, containment_root = _load_source(index_path)
     source_names = tuple(str(name) for name in status["constraint_names"])
@@ -488,6 +515,25 @@ def build_warm_pool(
             "dtype": "float64-little-endian",
             "allow_pickle": False,
         },
+        # These aliases are the exact fail-closed interface consumed by
+        # tier1_corrected_generation_preflight.authenticate_warm_handoff.
+        # The optimizer repairs every donor after authentication; no prior
+        # objective or constraint classification crosses the handoff.
+        "fixed_primary_turns": fixed_turns,
+        "fixed_primary_turns_scope": (
+            "runner_repair_after_authenticated_inverse_coordinate_handoff"
+        ),
+        "warm_start": {
+            "path": coordinate_path.name,
+            "sha256": _sha256_file(coordinate_path),
+            "shape": list(selected_x.shape),
+            "coordinate_contract": (
+                "authenticated_coordinate_donors_then_current_repair_v1"
+            ),
+        },
+        "warm_rows_are_coordinate_donors_only": True,
+        "physical_hard_spec_mutation": False,
+        "objective_mutation": False,
         "downstream_repair_required": True,
         "prior_objectives_reused_for_optimizer": False,
         "prior_constraints_reused_for_optimizer": False,
@@ -501,20 +547,165 @@ def build_warm_pool(
     }
     contract["contract_sha256"] = canonical_sha256(contract)
     _atomic_json(contract_path, contract)
+    authenticate_warm_handoff(
+        coordinate_path,
+        contract_path,
+        fixed_primary_turns=fixed_turns,
+        n_var=int(selected_x.shape[1]),
+        expected_contract_file_sha256=_sha256_file(contract_path),
+    )
     return coordinate_path, contract_path
+
+
+def upgrade_existing_handoff_contract(
+    *,
+    warm_start: Path,
+    source_contract: Path,
+    output_contract: Path,
+    fixed_primary_turns: int,
+) -> Path:
+    """Reseal an existing staged pool for the Current7 remote authenticator.
+
+    This is intentionally a metadata-only upgrade.  The coordinate bytes are
+    authenticated against the original final1000 contract and never copied or
+    rewritten, so already generated pools can be made launch-ready quickly.
+    """
+
+    turns = _fixed_primary_turns(f"n1-{int(fixed_primary_turns)}-", fixed_primary_turns)
+    warm_path = warm_start.resolve(strict=True)
+    source_path = source_contract.resolve(strict=True)
+    output_path = output_contract.resolve()
+    if output_path.exists():
+        raise RuntimeError("upgraded warm contract output must not already exist")
+    source = _read_json(source_path)
+    if source.get("schema_version") != CONTRACT_SCHEMA:
+        raise RuntimeError("unsupported final1000 source warm contract schema")
+    unsigned_source = dict(source)
+    source_seal = unsigned_source.pop("contract_sha256", None)
+    if source_seal != canonical_sha256(unsigned_source):
+        raise RuntimeError("source final1000 warm contract seal mismatch")
+    artifact = source.get("coordinate_artifact") or {}
+    expected_sha = str(artifact.get("sha256") or "").lower()
+    if _sha256_file(warm_path) != expected_sha:
+        raise RuntimeError("source final1000 warm coordinate SHA-256 mismatch")
+    try:
+        values = np.asarray(np.load(warm_path, allow_pickle=False), dtype=float)
+    except (OSError, TypeError, ValueError) as exc:
+        raise RuntimeError("source final1000 warm coordinate array is invalid") from exc
+    if (
+        values.ndim != 2
+        or values.shape[0] < 1
+        or values.shape[1] != 25
+        or list(values.shape) != artifact.get("shape")
+        or not np.isfinite(values).all()
+        or np.any(values < 0.0)
+        or np.any(values > 1.0)
+    ):
+        raise RuntimeError("source final1000 warm coordinate shape/range mismatch")
+    stage_spec = validate_stage_spec(source.get("stage_spec") or {})
+    if source.get("stage_spec_sha256") != canonical_sha256(stage_spec):
+        raise RuntimeError("source final1000 warm stage identity mismatch")
+
+    upgraded = dict(source)
+    upgraded.pop("contract_sha256", None)
+    upgraded.update(
+        {
+            "fixed_primary_turns": turns,
+            "fixed_primary_turns_scope": (
+                "runner_repair_after_authenticated_inverse_coordinate_handoff"
+            ),
+            "warm_start": {
+                "path": warm_path.name,
+                "sha256": expected_sha,
+                "shape": list(values.shape),
+                "coordinate_contract": (
+                    "authenticated_coordinate_donors_then_current_repair_v1"
+                ),
+            },
+            "warm_rows_are_coordinate_donors_only": True,
+            "physical_hard_spec_mutation": False,
+            "objective_mutation": False,
+            "compatibility_upgrade": {
+                "schema_version": (
+                    "mft-tier1-final1000-current7-warm-compatibility-v1"
+                ),
+                "source_contract_file_sha256": _sha256_file(source_path),
+                "source_contract_canonical_sha256": source_seal,
+                "coordinate_bytes_rewritten": False,
+            },
+        }
+    )
+    upgraded["contract_sha256"] = canonical_sha256(upgraded)
+    _atomic_json(output_path, upgraded)
+    authenticate_warm_handoff(
+        warm_path,
+        output_path,
+        fixed_primary_turns=turns,
+        n_var=int(values.shape[1]),
+        expected_contract_file_sha256=_sha256_file(output_path),
+    )
+    return output_path
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--index", type=Path, required=True)
-    parser.add_argument("--stage-spec-json", required=True)
-    parser.add_argument("--stage-spec-sha256", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--index", type=Path)
+    parser.add_argument("--stage-spec-json")
+    parser.add_argument("--stage-spec-sha256")
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--pool-size", type=int, default=320)
     parser.add_argument("--candidate-limit", type=int, default=8192)
     parser.add_argument("--minimum-distance", type=float, default=0.01)
     parser.add_argument("--island-prefix", default="n1-6-")
+    parser.add_argument("--fixed-primary-turns", type=int, choices=(5, 6))
+    parser.add_argument("--upgrade-existing-contract", type=Path)
+    parser.add_argument("--upgrade-existing-warm", type=Path)
+    parser.add_argument("--upgrade-output-contract", type=Path)
     args = parser.parse_args(argv)
+    upgrade_values = (
+        args.upgrade_existing_contract,
+        args.upgrade_existing_warm,
+        args.upgrade_output_contract,
+    )
+    if any(value is not None for value in upgrade_values):
+        if (
+            any(value is None for value in upgrade_values)
+            or args.fixed_primary_turns is None
+            or any(
+                value is not None
+                for value in (
+                    args.index,
+                    args.stage_spec_json,
+                    args.stage_spec_sha256,
+                    args.output,
+                )
+            )
+        ):
+            parser.error(
+                "contract upgrade requires the three --upgrade-* paths and "
+                "--fixed-primary-turns, without pool-build inputs"
+            )
+        upgraded = upgrade_existing_handoff_contract(
+            warm_start=args.upgrade_existing_warm,
+            source_contract=args.upgrade_existing_contract,
+            output_contract=args.upgrade_output_contract,
+            fixed_primary_turns=args.fixed_primary_turns,
+        )
+        print(json.dumps({"contract": str(upgraded)}, sort_keys=True))
+        return 0
+    if any(
+        value is None
+        for value in (
+            args.index,
+            args.stage_spec_json,
+            args.stage_spec_sha256,
+            args.output,
+        )
+    ):
+        parser.error(
+            "pool build requires --index, --stage-spec-json, "
+            "--stage-spec-sha256, and --output"
+        )
     stage_spec = stage_spec_from_json_identity(
         args.stage_spec_json, args.stage_spec_sha256
     )
@@ -526,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_limit=args.candidate_limit,
         minimum_distance=args.minimum_distance,
         island_prefix=args.island_prefix,
+        fixed_primary_turns=args.fixed_primary_turns,
     )
     print(
         json.dumps(
