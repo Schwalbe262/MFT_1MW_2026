@@ -104,9 +104,9 @@ def _rendered_plan() -> dict:
         "stage_inventory": profiles.stage_inventory(),
         "stage_bindings": stage_bindings,
         "resources": {
-            "cpus_per_task": 4,
+            "cpus_per_task": 8,
             "memory_mb_per_task": 28 * 1024,
-            "max_workers_per_node": 32,
+            "max_workers_per_node": 8,
             "priority": 0,
             "scheduling_profile": "standard",
             "gpus": 0,
@@ -222,9 +222,9 @@ def test_task_renderer_pins_stage_payload_and_requested_scheduler_resources():
     assert payload["final_goal_stage_id"] == stage.stage_id
     assert payload["lane"]["fixed_primary_turns"] == 6
     assert payload["maximum_peak_rss_bytes"] == 22 * 1024**3
-    assert task["cpus"] == 4
+    assert task["cpus"] == 8
     assert task["memory_mb"] == 28 * 1024
-    assert task["max_workers_per_node"] == 32
+    assert task["max_workers_per_node"] == 8
     assert task["priority"] == 0
     assert task["scheduling_profile"] == "standard"
     assert task["gpus"] == 0
@@ -241,10 +241,10 @@ def test_task_renderer_pins_stage_payload_and_requested_scheduler_resources():
 @pytest.mark.parametrize(
     ("location", "field", "value"),
     [
-        ("task", "cpus", 8),
+        ("task", "cpus", 4),
         ("task", "memory_mb", 65_536),
         ("task", "priority", 10),
-        ("task", "max_workers_per_node", 4),
+        ("task", "max_workers_per_node", 32),
         ("payload", "aedt_used", True),
         ("payload", "fea_submission_performed", True),
         ("payload", "stage_spec_sha256", "0" * 64),
@@ -272,7 +272,7 @@ def test_full_launch_plan_is_sealed_open_ended_500_and_detects_tamper():
     assert validated["aedt_used"] is False
 
     mutated = copy.deepcopy(plan)
-    mutated["task_waves"]["ramp"][0]["cpus"] = 8
+    mutated["task_waves"]["ramp"][0]["cpus"] = 4
     unsigned = {
         key: value
         for key, value in mutated.items()

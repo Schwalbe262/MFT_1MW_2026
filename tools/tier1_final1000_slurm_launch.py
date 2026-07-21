@@ -72,9 +72,12 @@ BINDINGS_SCHEMA = "mft-tier1-final1000-stage-bundle-bindings-v1"
 LAUNCH_SCHEMA = "mft-tier1-final1000-slurm-launch-plan-v1"
 RESULT_PREFLIGHT_SCHEMA = "mft-tier1-final1000-result-preflight-v1"
 
-DEFAULT_CPUS = 4
+DEFAULT_CPUS = 8
 DEFAULT_MEMORY_MB = 28 * 1024
-DEFAULT_MAX_WORKERS_PER_NODE = 32
+# The optimizer binds every supported surrogate family to eight inference
+# threads.  Keep scheduler accounting exact and cap a 64-core node at eight
+# such workers even when several backing allocations land on the same node.
+DEFAULT_MAX_WORKERS_PER_NODE = 8
 DEFAULT_PRIORITY = 0
 DEFAULT_TIMEOUT_SECONDS = 86_400
 DEFAULT_PEAK_RSS_GATE_BYTES = 22 * 1024**3
