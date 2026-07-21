@@ -49,6 +49,7 @@ try:
         validate_result as validate_current7_result,
     )
     from tier1_final1000_slurm_controller import (
+        CHAINED_ROLLING_MIGRATION_SCHEMA,
         STATE_SCHEMA as CONTROLLER_STATE_SCHEMA,
         TASK_NAME_PREFIX,
         DEDUPE_PREFIX,
@@ -56,14 +57,19 @@ try:
         _task_for_entry,
         _task_index,
         _task_templates,
+        _validate_chained_shadow_state,
         _validate_state,
     )
     from tier1_final1000_rolling_migration import (
+        CHAINED_HARVEST_COHORT_SCHEMA,
         RESOURCE_POLICIES,
         SUCCESSOR_RESOURCE_POLICY_ID,
+        _plan_fixed_generations,
         _render_from_template_for_policy,
         _validate_task_for_policy,
+        chained_harvest_cohort_identity,
         harvest_cohort_identity,
+        validate_chained_predecessor_plan,
         validate_historical_resource_quota_successor_plan,
         validate_predecessor_plan,
         validate_successor_plan,
@@ -100,6 +106,7 @@ except ImportError:  # pragma: no cover - repository import path
         validate_result as validate_current7_result,
     )
     from tools.tier1_final1000_slurm_controller import (
+        CHAINED_ROLLING_MIGRATION_SCHEMA,
         STATE_SCHEMA as CONTROLLER_STATE_SCHEMA,
         TASK_NAME_PREFIX,
         DEDUPE_PREFIX,
@@ -107,14 +114,19 @@ except ImportError:  # pragma: no cover - repository import path
         _task_for_entry,
         _task_index,
         _task_templates,
+        _validate_chained_shadow_state,
         _validate_state,
     )
     from tools.tier1_final1000_rolling_migration import (
+        CHAINED_HARVEST_COHORT_SCHEMA,
         RESOURCE_POLICIES,
         SUCCESSOR_RESOURCE_POLICY_ID,
+        _plan_fixed_generations,
         _render_from_template_for_policy,
         _validate_task_for_policy,
+        chained_harvest_cohort_identity,
         harvest_cohort_identity,
+        validate_chained_predecessor_plan,
         validate_historical_resource_quota_successor_plan,
         validate_predecessor_plan,
         validate_successor_plan,
@@ -271,6 +283,7 @@ def _validate_plan_bindings(
     plan: Mapping[str, Any],
     bindings: Mapping[str, Mapping[str, Any]],
     resource_policy_ids: Sequence[str],
+    cohort_id: str | None = None,
 ) -> dict[str, Any]:
     """Authenticate one immutable launch/binding cohort for ledger replay."""
 
@@ -296,10 +309,18 @@ def _validate_plan_bindings(
             raise RuntimeError(
                 f"{role} {stage.stage_id} launch/manifest/READY binding mismatch"
             )
-    identity = harvest_cohort_identity(
-        role=role,
-        plan=plan,
-        resource_policy_ids=resource_policy_ids,
+    identity = (
+        chained_harvest_cohort_identity(
+            cohort_id=cohort_id,
+            plan=plan,
+            resource_policy_ids=resource_policy_ids,
+        )
+        if cohort_id is not None
+        else harvest_cohort_identity(
+            role=role,
+            plan=plan,
+            resource_policy_ids=resource_policy_ids,
+        )
     )
     templates = {
         str(task["payload_json"]["final_goal_stage_id"]): copy.deepcopy(task)
@@ -309,11 +330,13 @@ def _validate_plan_bindings(
         raise RuntimeError(f"{role} final1000 canary template set is incomplete")
     return {
         "role": role,
+        "cohort_id": cohort_id or role,
         "plan": copy.deepcopy(dict(plan)),
         "bindings": copy.deepcopy(dict(bindings)),
         "resource_policy_ids": list(identity["resource_policy_ids"]),
         "identity": identity,
         "templates": templates,
+        "fixed_generations": _plan_fixed_generations(plan),
     }
 
 
@@ -324,12 +347,20 @@ def _validate_inputs(
     *,
     predecessor_launch_plan_path: Path | None = None,
     predecessor_bindings_path: Path | None = None,
+    ancestor_launch_plan_paths: Sequence[Path] = (),
+    ancestor_bindings_paths: Sequence[Path] = (),
+    allow_chained_shadow_state: bool = False,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]:
+    if len(ancestor_launch_plan_paths) != len(ancestor_bindings_paths):
+        raise RuntimeError("ancestor launch-plan/bindings counts differ")
     successor_plan = validate_successor_plan(
         _read_json(launch_plan_path.resolve(strict=True))
     )
-    state = _validate_state(
-        _read_json(controller_state_path.resolve(strict=True)), successor_plan
+    raw_state = _read_json(controller_state_path.resolve(strict=True))
+    state = (
+        _validate_chained_shadow_state(raw_state, successor_plan)
+        if allow_chained_shadow_state
+        else _validate_state(raw_state, successor_plan)
     )
     if state.get("schema_version") != CONTROLLER_STATE_SCHEMA:
         raise RuntimeError("final1000 controller state schema drifted")
@@ -338,6 +369,8 @@ def _validate_inputs(
         if (
             predecessor_launch_plan_path is not None
             or predecessor_bindings_path is not None
+            or ancestor_launch_plan_paths
+            or ancestor_bindings_paths
         ):
             raise RuntimeError("predecessor inputs require a rolling migration state")
         successor = _validate_plan_bindings(
@@ -352,6 +385,72 @@ def _validate_inputs(
         raise RuntimeError(
             "rolling migration harvest requires predecessor launch and bindings"
         )
+    if migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA:
+        input_pairs = [
+            (predecessor_launch_plan_path, predecessor_bindings_path),
+            *zip(ancestor_launch_plan_paths, ancestor_bindings_paths, strict=True),
+        ]
+        plan_inputs: dict[str, tuple[dict[str, Any], Path]] = {}
+        for plan_path, cohort_bindings_path in input_pairs:
+            cohort_plan = validate_chained_predecessor_plan(
+                _read_json(plan_path.resolve(strict=True))
+            )
+            plan_sha = str(cohort_plan["launch_plan_sha256"])
+            if plan_sha in plan_inputs:
+                raise RuntimeError("a chained harvest plan was supplied twice")
+            plan_inputs[plan_sha] = (cohort_plan, cohort_bindings_path)
+        sealed_cohorts = migration.get("harvest_cohorts")
+        predecessor_ids = migration.get("predecessor_harvest_cohort_ids")
+        successor_id = migration.get("successor_harvest_cohort_id")
+        if (
+            not isinstance(sealed_cohorts, dict)
+            or not isinstance(predecessor_ids, list)
+            or not isinstance(successor_id, str)
+            or set(sealed_cohorts) != set(predecessor_ids) | {successor_id}
+            or sealed_cohorts[successor_id].get("schema_version")
+            != CHAINED_HARVEST_COHORT_SCHEMA
+        ):
+            raise RuntimeError("chained harvest catalog is invalid")
+        required_predecessor_plan_shas = {
+            str(sealed_cohorts[cohort_id]["launch_plan_sha256"])
+            for cohort_id in predecessor_ids
+        }
+        if set(plan_inputs) != required_predecessor_plan_shas:
+            raise RuntimeError(
+                "chained harvest predecessor plan inputs are incomplete or excessive"
+            )
+        cohorts: dict[str, dict[str, Any]] = {}
+        for cohort_id in predecessor_ids:
+            sealed = sealed_cohorts[cohort_id]
+            cohort_plan, cohort_bindings_path = plan_inputs[
+                str(sealed["launch_plan_sha256"])
+            ]
+            cohorts[cohort_id] = _validate_plan_bindings(
+                role="predecessor",
+                cohort_id=cohort_id,
+                plan=cohort_plan,
+                bindings=load_stage_bindings(cohort_bindings_path),
+                resource_policy_ids=sealed["resource_policy_ids"],
+            )
+        cohorts[successor_id] = _validate_plan_bindings(
+            role="successor",
+            cohort_id=successor_id,
+            plan=successor_plan,
+            bindings=load_stage_bindings(bindings_path),
+            resource_policy_ids=[SUCCESSOR_RESOURCE_POLICY_ID],
+        )
+        expected = {
+            cohort_id: cohort["identity"]
+            for cohort_id, cohort in cohorts.items()
+        }
+        if sealed_cohorts != expected:
+            raise RuntimeError(
+                "chained migration harvest inputs do not match the sealed catalog"
+            )
+        return successor_plan, cohorts, state
+
+    if ancestor_launch_plan_paths or ancestor_bindings_paths:
+        raise RuntimeError("v1 rolling harvest does not accept ancestor inputs")
     predecessor_raw = _read_json(predecessor_launch_plan_path.resolve(strict=True))
     predecessor_kind = str(migration.get("predecessor_controller_kind") or "")
     if predecessor_kind == "legacy_8c":
@@ -477,7 +576,8 @@ def _entry_task_context(
         return expected, binding, "successor", SUCCESSOR_RESOURCE_POLICY_ID
 
     role = str(entry.get("origin") or "")
-    cohort = cohorts.get(role)
+    cohort_key = str(entry.get("harvest_cohort_id") or role)
+    cohort = cohorts.get(cohort_key)
     policy_id = str(entry.get("resource_policy_id") or "")
     if cohort is None or policy_id not in cohort["resource_policy_ids"]:
         raise RuntimeError("rolling ledger entry cohort/resource identity is unknown")
@@ -494,8 +594,13 @@ def _entry_task_context(
         seed=int(entry["seed"]),
         wave=str(entry["wave"]),
         policy=policy,
+        fixed_generations=int(cohort["fixed_generations"]),
     )
-    _validate_task_for_policy(expected, policy=policy)
+    _validate_task_for_policy(
+        expected,
+        policy=policy,
+        fixed_generations=int(cohort["fixed_generations"]),
+    )
     payload = expected["payload_json"]
     if (
         expected["dedupe_key"] != entry["dedupe_key"]
@@ -505,7 +610,7 @@ def _entry_task_context(
         or expected.get("remote_cwd") != bundle_plan.get("remote_bundle")
     ):
         raise RuntimeError("rolling ledger entry cannot reproduce its sealed task")
-    return expected, binding, role, policy_id
+    return expected, binding, cohort_key, policy_id
 
 
 def _batch_scheduler_inventory(
@@ -944,15 +1049,16 @@ def _project_stage(
     for cohort in source_cohorts:
         binding = cohort["bindings"][stage_id]
         summary = cohort["identity"]["stage_bindings"][stage_id]
-        cohort_projection.append(
-            {
-                "role": cohort["role"],
-                "launch_plan_sha256": cohort["plan"]["launch_plan_sha256"],
-                "resource_policy_ids": list(cohort["resource_policy_ids"]),
-                **copy.deepcopy(summary),
-                "manifest_contract_sha256": binding["manifest"]["contract_sha256"],
-            }
-        )
+        item = {
+            "role": cohort["role"],
+            "launch_plan_sha256": cohort["plan"]["launch_plan_sha256"],
+            "resource_policy_ids": list(cohort["resource_policy_ids"]),
+            **copy.deepcopy(summary),
+            "manifest_contract_sha256": binding["manifest"]["contract_sha256"],
+        }
+        if cohort["cohort_id"] != cohort["role"]:
+            item["cohort_id"] = cohort["cohort_id"]
+        cohort_projection.append(item)
     cohort_projection_sha = canonical_sha256(cohort_projection)
     mixed_bundles = len({item["bundle_id"] for item in cohort_projection}) > 1
     mixed_resources = (
@@ -1067,6 +1173,9 @@ def harvest_once(
     *,
     predecessor_launch_plan_path: Path | None = None,
     predecessor_bindings_path: Path | None = None,
+    ancestor_launch_plan_paths: Sequence[Path] = (),
+    ancestor_bindings_paths: Sequence[Path] = (),
+    allow_chained_shadow_state: bool = False,
     scheduler: SchedulerReader,
     remote: RemoteReader,
     runtime: Path = DEFAULT_RUNTIME,
@@ -1074,6 +1183,8 @@ def harvest_once(
     apply: bool = False,
     observed_at: str | None = None,
 ) -> dict[str, Any]:
+    if allow_chained_shadow_state and apply:
+        raise RuntimeError("an authenticated chained shadow is read-only")
     runtime = runtime.resolve()
     _assert_runtime_isolated(runtime, protected_current7_index)
     state_path = controller_state_path.resolve(strict=True)
@@ -1085,6 +1196,9 @@ def harvest_once(
         state_path,
         predecessor_launch_plan_path=predecessor_launch_plan_path,
         predecessor_bindings_path=predecessor_bindings_path,
+        ancestor_launch_plan_paths=ancestor_launch_plan_paths,
+        ancestor_bindings_paths=ancestor_bindings_paths,
+        allow_chained_shadow_state=allow_chained_shadow_state,
     )
     scheduler_get_before = int(getattr(scheduler, "get_count", 0))
     scheduler_batch_get_before = int(getattr(scheduler, "batch_get_count", 0))
@@ -1098,15 +1212,30 @@ def harvest_once(
     )
     heartbeat = observed_at or _observed_at()
     projections = []
-    source_cohorts = [
-        cohorts[role] for role in ("predecessor", "successor") if role in cohorts
-    ]
+    migration = state.get("rolling_migration")
+    if (
+        isinstance(migration, dict)
+        and migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA
+    ):
+        successor_cohort_key = str(migration["successor_harvest_cohort_id"])
+        source_cohort_keys = [
+            *migration["predecessor_harvest_cohort_ids"],
+            successor_cohort_key,
+        ]
+    else:
+        successor_cohort_key = "successor"
+        source_cohort_keys = [
+            role for role in ("predecessor", "successor") if role in cohorts
+        ]
+    source_cohorts = [cohorts[key] for key in source_cohort_keys]
     for stage in STAGES:
         stage_runtime = runtime / "conditions" / stage.stage_id
         projections.append(
             _project_stage(
                 stage_id=stage.stage_id,
-                anchor_binding=cohorts["successor"]["bindings"][stage.stage_id],
+                anchor_binding=cohorts[successor_cohort_key]["bindings"][
+                    stage.stage_id
+                ],
                 source_cohorts=source_cohorts,
                 inventory=by_stage[stage.stage_id],
                 remote=remote,
@@ -1163,6 +1292,12 @@ def harvest_once(
         "apply": bool(apply),
         "launch_plan_sha256": plan["launch_plan_sha256"],
         "controller_state_sha256": state["state_sha256"],
+        "chained_shadow_state": bool(
+            isinstance(migration, dict)
+            and migration.get("schema_version")
+            == CHAINED_ROLLING_MIGRATION_SCHEMA
+            and migration.get("shadow_only") is True
+        ),
         "observed_at": heartbeat,
         "scheduler_get_count": int(getattr(scheduler, "get_count", 0))
         - scheduler_get_before,
@@ -1201,6 +1336,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bindings", type=Path, required=True)
     parser.add_argument("--predecessor-launch-plan", type=Path)
     parser.add_argument("--predecessor-bindings", type=Path)
+    parser.add_argument(
+        "--ancestor-launch-plan", type=Path, action="append", default=[]
+    )
+    parser.add_argument(
+        "--ancestor-bindings", type=Path, action="append", default=[]
+    )
+    parser.add_argument(
+        "--allow-chained-shadow-state",
+        action="store_true",
+        help=(
+            "authenticate a migration shadow for a single read-only preflight; "
+            "incompatible with --apply and --watch"
+        ),
+    )
     parser.add_argument("--controller-state", type=Path, required=True)
     parser.add_argument("--scheduler-url", default=DEFAULT_SCHEDULER_URL)
     parser.add_argument("--accounts", type=Path, default=DEFAULT_ACCOUNTS)
@@ -1222,6 +1371,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.watch and not args.apply:
         raise RuntimeError("--watch requires --apply")
+    if args.allow_chained_shadow_state and (args.apply or args.watch):
+        raise RuntimeError("--allow-chained-shadow-state is dry-run only")
     if args.poll_seconds <= 0:
         raise ValueError("poll seconds must be positive")
     scheduler = Final1000ReadOnlySchedulerApi(args.scheduler_url)
@@ -1237,6 +1388,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.controller_state,
                     predecessor_launch_plan_path=args.predecessor_launch_plan,
                     predecessor_bindings_path=args.predecessor_bindings,
+                    ancestor_launch_plan_paths=args.ancestor_launch_plan,
+                    ancestor_bindings_paths=args.ancestor_bindings,
+                    allow_chained_shadow_state=args.allow_chained_shadow_state,
                     scheduler=scheduler,
                     remote=remote,
                     runtime=args.runtime,

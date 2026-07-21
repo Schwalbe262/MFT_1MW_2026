@@ -170,13 +170,42 @@ python tools\tier1_final1000_rolling_migration.py `
   --successor-state <future-gen300-state.json> `
   --scheduler-url http://127.0.0.1:8002 `
   --allow-running-predecessor-shadow `
+  --shadow-state-evidence-output <sealed-shadow-state-evidence.json> `
   --evidence-output <sealed-local-dry-run-receipt.json>
 ```
 
 This mode rejects `--apply`, never writes the successor state, marks the
 in-memory state `shadow_only=true`, and the successor controller rejects that
-shadow as not cutover-ready. It reports namespace tasks outside the ledger;
-they are never imported.
+shadow as not cutover-ready. The optional shadow-state evidence is an atomic,
+SHA-sealed local artifact intended only for the harvester dry-run below; the
+normal controller validator also rejects it. It reports namespace tasks
+outside the ledger; they are never imported.
+
+Authenticate and project all three current cohorts without writing indexes:
+
+```powershell
+python tools\tier1_final1000_slurm_harvest.py `
+  --launch-plan <gen300-plan.json> `
+  --bindings <gen300-stage-bindings.json> `
+  --predecessor-launch-plan <current-gen200-plan.json> `
+  --predecessor-bindings <current-gen200-stage-bindings.json> `
+  --ancestor-launch-plan <older-gen200-plan.json> `
+  --ancestor-bindings <older-gen200-stage-bindings.json> `
+  --controller-state <sealed-shadow-state-evidence.json> `
+  --allow-chained-shadow-state `
+  --runtime <final1000-runtime> `
+  --scheduler-url http://127.0.0.1:8002 `
+  --protected-current7-index <current7-primary-index.json>
+```
+
+This is a single dry-run only. `--allow-chained-shadow-state` is incompatible
+with both `--apply` and `--watch`. It performs scheduler GET and optional SFTP
+reads, but scheduler mutation, remote write, local index write, AEDT, and FEA
+counts remain zero. All catalog members, plans, manifests, READY receipts,
+ledger entries, fixed-generation science identities, and task resource seals
+must authenticate. The older plan/binding pair is repeated once per ancestor;
+missing or excessive pairs fail closed. The legacy v1 two-role form remains
+supported and explicitly rejects ancestor arguments.
 
 For the real handoff, gracefully stop the predecessor first, omit
 `--allow-running-predecessor-shadow`, run the command once without `--apply`,
@@ -186,11 +215,23 @@ active entry under an append-only cohort id. All imported entries become
 terminal gaps appear. The controller still has no cancellation or preemption
 method.
 
+Exactly one successor canary is permitted per stage. If more than four natural
+gaps exist before all four remote preflights pass, only the four stage canaries
+are submitted and every extra gap is held empty. Thus active count may be
+temporarily below 500 during this bounded safety gate. No extra task may be
+labelled canary and no refill may bypass the gate. After all four pass, weighted
+deficit refill restores exact active 500. A failed or terminal canary is not
+silently replaced; operator diagnosis is required. This policy is sealed as
+`successor_canary_gap_policy` in the v2 migration state and controller action
+evidence.
+
 ## Keep one mixed-ledger UI projection during both phases
 
-The rolling state seals a fixed two-cohort harvest contract; it does not copy
-plans, manifests, or per-task envelopes into growing migration metadata.  Run
-the harvester with both immutable input pairs for the entire natural drain:
+The v1 rolling state seals a fixed two-cohort harvest contract. The v2 state
+uses an append-only multi-cohort catalog, without copying plans, manifests, or
+per-task envelopes into growing migration metadata. Run the harvester with the
+successor pair, current predecessor pair, and one repeated ancestor pair for
+every older catalog plan for the entire natural drain:
 
 ```powershell
 python tools\tier1_final1000_slurm_harvest.py `
@@ -198,6 +239,8 @@ python tools\tier1_final1000_slurm_harvest.py `
   --bindings <successor-stage-bindings.json> `
   --predecessor-launch-plan <stopped-predecessor-plan.json> `
   --predecessor-bindings <stopped-predecessor-stage-bindings.json> `
+  --ancestor-launch-plan <older-plan.json> `
+  --ancestor-bindings <older-stage-bindings.json> `
   --controller-state <successor-state.json> `
   --runtime C:\Users\peets\slurm_scheduler_runtime\mft_tier1_final_goal_1000_t100_resmax20_260721 `
   --scheduler-url http://127.0.0.1:8002 --apply --watch --poll-seconds 30

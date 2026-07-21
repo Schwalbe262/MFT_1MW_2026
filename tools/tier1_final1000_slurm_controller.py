@@ -91,6 +91,14 @@ ROLLING_SUCCESSOR_RESOURCE_POLICY = {
 }
 LEGACY_RESOURCE_POLICY_ID = "legacy-8c-28672m-mw8-t8"
 SUCCESSOR_RESOURCE_POLICY_ID = "successor-4c-28672m-mw32-t8"
+CHAINED_CANARY_GAP_POLICY = {
+    "required_stage_ids": sorted(BY_ID),
+    "maximum_canary_tasks_per_stage": 1,
+    "replacement_canaries_allowed": False,
+    "additional_natural_gaps_before_all_passed": "held_unfilled",
+    "active_target_before_all_passed": "temporarily_at_or_below_500",
+    "post_pass_refill": "weighted_deficit_to_exact_500",
+}
 HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS = {
     "entry-1200-t125": 160,
     "bridge-1150-t115": 140,
@@ -418,6 +426,7 @@ def _validate_state_for_sealed_active_quotas(
     plan: Mapping[str, Any],
     *,
     expected_active_quotas: Mapping[str, int],
+    allow_chained_shadow: bool = False,
 ) -> dict[str, Any]:
     expected_quotas = dict(expected_active_quotas)
     if expected_quotas not in (
@@ -489,14 +498,23 @@ def _validate_state_for_sealed_active_quotas(
             != expected_status_keys
         ):
             raise RuntimeError("final1000 rolling migration seal mismatch")
-        if migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA and (
-            migration.get("predecessor_controller_kind")
-            != "chained_patched_successor"
-            or migration.get("transition_mode") != "patched_bundle"
-            or migration.get("predecessor_stop_observed") is not True
-            or migration.get("shadow_only") is not False
-        ):
-            raise RuntimeError("final1000 chained migration is not cutover-ready")
+        if migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA:
+            cutover_ready = (
+                migration.get("predecessor_stop_observed") is True
+                and migration.get("shadow_only") is False
+            )
+            authenticated_shadow = (
+                allow_chained_shadow
+                and migration.get("predecessor_stop_observed") is False
+                and migration.get("shadow_only") is True
+            )
+            if (
+                migration.get("predecessor_controller_kind")
+                != "chained_patched_successor"
+                or migration.get("transition_mode") != "patched_bundle"
+                or not (cutover_ready or authenticated_shadow)
+            ):
+                raise RuntimeError("final1000 chained migration is not cutover-ready")
         cohorts = migration.get("harvest_cohorts")
         chained_catalog = (
             migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA
@@ -721,6 +739,24 @@ def _validate_state_for_sealed_active_quotas(
             )
             for stage in STAGES
         }
+        successor_canary_entry_count_by_stage = {
+            stage.stage_id: sum(
+                entry["stage_id"] == stage.stage_id
+                and entry["wave"] == "canary"
+                and str(entry.get("origin") or "successor") == "successor"
+                for entry in entries
+            )
+            for stage in STAGES
+        }
+        if chained_catalog and (
+            migration.get("successor_canary_gap_policy")
+            != CHAINED_CANARY_GAP_POLICY
+            or any(
+                count > 1
+                for count in successor_canary_entry_count_by_stage.values()
+            )
+        ):
+            raise RuntimeError("final1000 chained canary cardinality drifted")
         passed = set(state.get("canary_passed_stage_ids") or [])
         expected_canary_status = {
             stage.stage_id: (
@@ -760,6 +796,28 @@ def _validate_state(
         plan,
         expected_active_quotas=SUCCESSOR_ACTIVE_QUOTAS,
     )
+
+
+def _validate_chained_shadow_state(
+    state: Mapping[str, Any], plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Authenticate a non-runnable v2 state for read-only preflight only."""
+
+    value = _validate_state_for_sealed_active_quotas(
+        state,
+        plan,
+        expected_active_quotas=SUCCESSOR_ACTIVE_QUOTAS,
+        allow_chained_shadow=True,
+    )
+    migration = value.get("rolling_migration")
+    if (
+        not isinstance(migration, dict)
+        or migration.get("schema_version") != CHAINED_ROLLING_MIGRATION_SCHEMA
+        or migration.get("predecessor_stop_observed") is not False
+        or migration.get("shadow_only") is not True
+    ):
+        raise RuntimeError("final1000 state is not an authenticated chained shadow")
+    return value
 
 
 def _validate_historical_resource_quota_successor_state(
@@ -1093,9 +1151,10 @@ def _weighted_deficit_refill_order(
 
     Smooth weighted round-robin operates only on stages below the successor
     target.  During migration, one natural gap is first reserved for each
-    stage that has no live successor canary, even when that predecessor stage
-    is temporarily above its successor quota.  No task is cancelled to force
-    convergence; excess drains naturally and its slots move to deficits.
+    stage that has never received its one successor canary, even when that
+    predecessor stage is temporarily above its successor quota.  No task is
+    cancelled to force convergence; excess drains naturally and its slots
+    move to deficits.
     """
 
     if slots < 0:
@@ -1119,7 +1178,6 @@ def _weighted_deficit_refill_order(
                 entry["stage_id"] == stage_id
                 and entry["wave"] == "canary"
                 and str(entry.get("origin") or "successor") == "successor"
-                and entry["state"] in ACTIVE_STATES
                 for entry in state["entries"]
             )
         }
@@ -1271,19 +1329,36 @@ def control_once(
             # vacated slots.  The old 64/96/128/212 distribution is allowed
             # to be temporarily over/under the successor 200/160/90/50
             # targets; weighted deficit refill converges without cancellation.
+            missing_canary_stage_count = sum(
+                stage.stage_id not in passed
+                and not any(
+                    entry["stage_id"] == stage.stage_id
+                    and entry["wave"] == "canary"
+                    and str(entry.get("origin") or "successor") == "successor"
+                    for entry in state["entries"]
+                )
+                for stage in STAGES
+            )
+            # Before all four remote preflights pass, reserve at most one
+            # natural gap per still-unrepresented stage.  Any extra natural
+            # gaps intentionally remain empty.  Filling those gaps as
+            # ``canary`` would create an unbounded canary batch; filling them
+            # as ``refill`` would bypass the remote preflight gate.
             replacement_stage_order = _weighted_deficit_refill_order(
                 state,
-                slots=TOTAL_ACTIVE_QUOTA - _active_count(state),
+                slots=min(
+                    TOTAL_ACTIVE_QUOTA - _active_count(state),
+                    missing_canary_stage_count,
+                ),
                 reserve_missing_migration_canaries=True,
             )
             for stage_id in replacement_stage_order:
-                wave = "refill" if stage_id in passed else "canary"
                 replacement_entries.append(
                     _append_refill(
                         state,
                         templates=templates,
                         stage_id=stage_id,
-                        wave=wave,
+                        wave="canary",
                     )
                 )
         else:
@@ -1321,10 +1396,7 @@ def control_once(
             # Persist newly observed successful gates even without replacement.
             if passed != prior_passed and not replacement_entries:
                 persist()
-            if rolling_migration and _active_count(state) != TOTAL_ACTIVE_QUOTA:
-                raise RuntimeError(
-                    "rolling migration failed to preserve exact active target"
-                )
+            active_shortfall = max(0, TOTAL_ACTIVE_QUOTA - _active_count(state))
             actions.append(
                 {
                     "action": (
@@ -1335,6 +1407,17 @@ def control_once(
                     "replacement_submitted": replacement_submitted,
                     "replacement_reconciled": replacement_reconciled,
                     "replacement_stage_order": replacement_stage_order,
+                    "successor_canary_gap_policy": (
+                        copy.deepcopy(CHAINED_CANARY_GAP_POLICY)
+                        if isinstance(state.get("rolling_migration"), dict)
+                        and state["rolling_migration"].get("schema_version")
+                        == CHAINED_ROLLING_MIGRATION_SCHEMA
+                        else None
+                    ),
+                    "active_target_temporarily_relaxed": bool(active_shortfall),
+                    "active_shortfall_held_until_all_canaries_passed": (
+                        active_shortfall
+                    ),
                 }
             )
             return _result(state, actions, True, writes, scheduler)

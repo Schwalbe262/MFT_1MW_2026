@@ -1095,6 +1095,123 @@ def test_chained_cutover_waits_for_four_natural_gaps(tmp_path):
     )
 
 
+def test_chained_cutover_holds_extra_gaps_until_exactly_four_canaries_pass(
+    tmp_path,
+):
+    fixture = _chained_fixture(tmp_path, stopped=True)
+    migration.prepare_successor_state(
+        predecessor_plan_path=fixture["predecessor_plan"],
+        predecessor_state_path=fixture["predecessor_state"],
+        successor_plan_path=fixture["successor_plan"],
+        successor_state_path=fixture["successor_state"],
+        ancestor_plan_paths=[fixture["ancestor_plan"]],
+        scheduler=fixture["scheduler"],
+        predecessor_ready_probe=fixture["ready"],
+        successor_ready_probe=fixture["ready"],
+        apply=True,
+    )
+    state = controller._validate_state(
+        json.loads(fixture["successor_state"].read_text()), fixture["successor"]
+    )
+    for stage in profiles.STAGES:
+        victims = [
+            entry
+            for entry in state["entries"]
+            if entry["stage_id"] == stage.stage_id
+            and entry["state"] in controller.ACTIVE_STATES
+        ][:3]
+        assert len(victims) == 3
+        for entry in victims:
+            fixture["scheduler"].by_id[int(entry["task_id"])]["status"] = "completed"
+
+    held = controller.control_once(
+        fixture["successor_plan"],
+        state_path=fixture["successor_state"],
+        apply=True,
+        scheduler=fixture["scheduler"],
+        ready_probe=fixture["ready"],
+    )
+    assert held["active_count"] == 492
+    assert held["ramp_released"] is False
+    assert fixture["scheduler"].post_count == 4
+    assert sum(
+        len(task_ids)
+        for task_ids in held["successor_canary_task_ids_by_stage"].values()
+    ) == 4
+    hold_action = next(
+        action for action in held["actions"] if action["action"] == "rolling_canary_held"
+    )
+    assert hold_action["active_target_temporarily_relaxed"] is True
+    assert hold_action["active_shortfall_held_until_all_canaries_passed"] == 8
+    assert hold_action["successor_canary_gap_policy"] == (
+        controller.CHAINED_CANARY_GAP_POLICY
+    )
+
+    held_again = controller.control_once(
+        fixture["successor_plan"],
+        state_path=fixture["successor_state"],
+        apply=True,
+        scheduler=fixture["scheduler"],
+        ready_probe=fixture["ready"],
+    )
+    assert held_again["active_count"] == 492
+    assert fixture["scheduler"].post_count == 4
+    assert sum(
+        len(task_ids)
+        for task_ids in held_again["successor_canary_task_ids_by_stage"].values()
+    ) == 4
+
+    state = json.loads(fixture["successor_state"].read_text())
+    canary_entries = [
+        entry
+        for entry in state["entries"]
+        if entry["wave"] == "canary"
+        and str(entry.get("origin") or "successor") == "successor"
+    ]
+    for entry in canary_entries:
+        fixture["scheduler"].seed_status[int(entry["task_id"])] = {
+            "seed": entry["seed"],
+            "bundle_id": entry["bundle_id"],
+            "ramp_gate_passed": True,
+            "aedt_used": False,
+            "fea_submission_performed": False,
+        }
+    released = controller.control_once(
+        fixture["successor_plan"],
+        state_path=fixture["successor_state"],
+        apply=True,
+        scheduler=fixture["scheduler"],
+        ready_probe=fixture["ready"],
+    )
+    assert released["ramp_released"] is True
+    assert released["active_count"] == 500
+    assert fixture["scheduler"].post_count == 12
+    final_state = controller._validate_state(
+        json.loads(fixture["successor_state"].read_text()), fixture["successor"]
+    )
+    final_canaries = [
+        entry
+        for entry in final_state["entries"]
+        if entry["wave"] == "canary"
+        and str(entry.get("origin") or "successor") == "successor"
+    ]
+    assert len(final_canaries) == 4
+    assert {entry["stage_id"] for entry in final_canaries} == set(profiles.BY_ID)
+    assert fixture["scheduler"].mutations == ["POST /api/tasks"] * 12
+
+    tampered = copy.deepcopy(final_state)
+    controller._append_refill(
+        tampered,
+        templates=controller._task_templates(fixture["successor"]),
+        stage_id=profiles.STAGES[0].stage_id,
+        wave="canary",
+    )
+    controller._refresh_migration_observation(tampered)
+    tampered = controller._advance_state(tampered)
+    with pytest.raises(RuntimeError, match="canary cardinality drifted"):
+        controller._validate_state(tampered, fixture["successor"])
+
+
 def test_resource_quota_only_handoff_reuses_exact_current_bundle_bindings(tmp_path):
     fixture = _fixture(tmp_path)
     resource_plan = _resource_only_successor(

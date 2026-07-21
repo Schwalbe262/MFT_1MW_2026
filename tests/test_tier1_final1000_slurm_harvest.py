@@ -622,6 +622,213 @@ def test_migration_inputs_require_both_authenticated_plan_binding_pairs(
     )
 
 
+def test_chained_inputs_authenticate_every_cohort_and_replay_ledger(
+    tmp_path, monkeypatch
+):
+    fixture = rolling_fixtures._chained_fixture(tmp_path, stopped=True)
+    rolling_fixtures.migration.prepare_successor_state(
+        predecessor_plan_path=fixture["predecessor_plan"],
+        predecessor_state_path=fixture["predecessor_state"],
+        successor_plan_path=fixture["successor_plan"],
+        successor_state_path=fixture["successor_state"],
+        ancestor_plan_paths=[fixture["ancestor_plan"]],
+        scheduler=fixture["scheduler"],
+        predecessor_ready_probe=fixture["ready"],
+        successor_ready_probe=fixture["ready"],
+        apply=True,
+    )
+    successor_bindings = tmp_path / "successor-bindings.json"
+    predecessor_bindings = tmp_path / "predecessor-bindings.json"
+    ancestor_bindings = tmp_path / "ancestor-bindings.json"
+    for path in (successor_bindings, predecessor_bindings, ancestor_bindings):
+        path.write_text("{}")
+    binding_values = {
+        successor_bindings.resolve(): _bindings(fixture["successor"]),
+        predecessor_bindings.resolve(): _bindings(fixture["predecessor"]),
+        ancestor_bindings.resolve(): _bindings(fixture["ancestor"]),
+    }
+    monkeypatch.setattr(
+        harvest,
+        "load_stage_bindings",
+        lambda path: binding_values[Path(path).resolve()],
+    )
+
+    plan, cohorts, state = harvest._validate_inputs(
+        fixture["successor_plan"],
+        successor_bindings,
+        fixture["successor_state"],
+        predecessor_launch_plan_path=fixture["predecessor_plan"],
+        predecessor_bindings_path=predecessor_bindings,
+        ancestor_launch_plan_paths=[fixture["ancestor_plan"]],
+        ancestor_bindings_paths=[ancestor_bindings],
+    )
+    migration_value = state["rolling_migration"]
+    assert {
+        cohort_id: cohort["identity"] for cohort_id, cohort in cohorts.items()
+    } == migration_value["harvest_cohorts"]
+    assert len(cohorts) == 3
+    assert {cohort["fixed_generations"] for cohort in cohorts.values()} == {200, 300}
+
+    scheduler = Scheduler(fixture["scheduler"].by_id.values())
+    by_stage, pending_cache, cache_hits = harvest._inventory_tasks(
+        plan,
+        state,
+        cohorts=cohorts,
+        scheduler=scheduler,
+        runtime=tmp_path / "harvest-runtime",
+    )
+    items = [item for stage_items in by_stage.values() for item in stage_items]
+    predecessor_ids = set(migration_value["predecessor_harvest_cohort_ids"])
+    assert len(items) == 1_000
+    assert {item["binding_role"] for item in items} == predecessor_ids
+    assert migration_value["successor_harvest_cohort_id"] not in {
+        item["binding_role"] for item in items
+    }
+    assert 72164 not in {item["task_id"] for item in items}
+    assert len(pending_cache) == 500
+    assert cache_hits == 0
+    assert scheduler.get_count == 2
+    assert fixture["scheduler"].post_count == 0
+    assert fixture["scheduler"].mutations == []
+
+
+def test_chained_inputs_fail_closed_on_missing_or_mismatched_cohort(
+    tmp_path, monkeypatch
+):
+    fixture = rolling_fixtures._chained_fixture(tmp_path, stopped=True)
+    rolling_fixtures.migration.prepare_successor_state(
+        predecessor_plan_path=fixture["predecessor_plan"],
+        predecessor_state_path=fixture["predecessor_state"],
+        successor_plan_path=fixture["successor_plan"],
+        successor_state_path=fixture["successor_state"],
+        ancestor_plan_paths=[fixture["ancestor_plan"]],
+        scheduler=fixture["scheduler"],
+        predecessor_ready_probe=fixture["ready"],
+        successor_ready_probe=fixture["ready"],
+        apply=True,
+    )
+    successor_bindings = tmp_path / "successor-bindings.json"
+    predecessor_bindings = tmp_path / "predecessor-bindings.json"
+    ancestor_bindings = tmp_path / "ancestor-bindings.json"
+    for path in (successor_bindings, predecessor_bindings, ancestor_bindings):
+        path.write_text("{}")
+    binding_values = {
+        successor_bindings.resolve(): _bindings(fixture["successor"]),
+        predecessor_bindings.resolve(): _bindings(fixture["predecessor"]),
+        ancestor_bindings.resolve(): _bindings(fixture["ancestor"]),
+    }
+    monkeypatch.setattr(
+        harvest,
+        "load_stage_bindings",
+        lambda path: binding_values[Path(path).resolve()],
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete or excessive"):
+        harvest._validate_inputs(
+            fixture["successor_plan"],
+            successor_bindings,
+            fixture["successor_state"],
+            predecessor_launch_plan_path=fixture["predecessor_plan"],
+            predecessor_bindings_path=predecessor_bindings,
+        )
+    with pytest.raises(RuntimeError, match="counts differ"):
+        harvest._validate_inputs(
+            fixture["successor_plan"],
+            successor_bindings,
+            fixture["successor_state"],
+            predecessor_launch_plan_path=fixture["predecessor_plan"],
+            predecessor_bindings_path=predecessor_bindings,
+            ancestor_launch_plan_paths=[fixture["ancestor_plan"]],
+        )
+
+    tampered = _bindings(fixture["ancestor"])
+    tampered[profiles.STAGES[0].stage_id]["publication"]["ready_sha256"] = "0" * 64
+    binding_values[ancestor_bindings.resolve()] = tampered
+    with pytest.raises(RuntimeError, match="launch/manifest/READY binding mismatch"):
+        harvest._validate_inputs(
+            fixture["successor_plan"],
+            successor_bindings,
+            fixture["successor_state"],
+            predecessor_launch_plan_path=fixture["predecessor_plan"],
+            predecessor_bindings_path=predecessor_bindings,
+            ancestor_launch_plan_paths=[fixture["ancestor_plan"]],
+            ancestor_bindings_paths=[ancestor_bindings],
+        )
+
+
+def test_chained_shadow_input_is_explicitly_read_only(tmp_path, monkeypatch):
+    fixture = rolling_fixtures._chained_fixture(tmp_path, stopped=False)
+    prepared = rolling_fixtures.migration.prepare_successor_state(
+        predecessor_plan_path=fixture["predecessor_plan"],
+        predecessor_state_path=fixture["predecessor_state"],
+        successor_plan_path=fixture["successor_plan"],
+        successor_state_path=fixture["successor_state"],
+        ancestor_plan_paths=[fixture["ancestor_plan"]],
+        scheduler=fixture["scheduler"],
+        predecessor_ready_probe=fixture["ready"],
+        successor_ready_probe=fixture["ready"],
+        allow_running_predecessor_shadow=True,
+        apply=False,
+    )
+    shadow_path = tmp_path / "shadow-state-evidence.json"
+    shadow_path.write_text(json.dumps(prepared["successor_state"]))
+    successor_bindings = tmp_path / "successor-bindings.json"
+    predecessor_bindings = tmp_path / "predecessor-bindings.json"
+    ancestor_bindings = tmp_path / "ancestor-bindings.json"
+    for path in (successor_bindings, predecessor_bindings, ancestor_bindings):
+        path.write_text("{}")
+    binding_values = {
+        successor_bindings.resolve(): _bindings(fixture["successor"]),
+        predecessor_bindings.resolve(): _bindings(fixture["predecessor"]),
+        ancestor_bindings.resolve(): _bindings(fixture["ancestor"]),
+    }
+    monkeypatch.setattr(
+        harvest,
+        "load_stage_bindings",
+        lambda path: binding_values[Path(path).resolve()],
+    )
+
+    with pytest.raises(RuntimeError, match="not cutover-ready"):
+        harvest._validate_inputs(
+            fixture["successor_plan"],
+            successor_bindings,
+            shadow_path,
+            predecessor_launch_plan_path=fixture["predecessor_plan"],
+            predecessor_bindings_path=predecessor_bindings,
+            ancestor_launch_plan_paths=[fixture["ancestor_plan"]],
+            ancestor_bindings_paths=[ancestor_bindings],
+        )
+    _plan, cohorts, state = harvest._validate_inputs(
+        fixture["successor_plan"],
+        successor_bindings,
+        shadow_path,
+        predecessor_launch_plan_path=fixture["predecessor_plan"],
+        predecessor_bindings_path=predecessor_bindings,
+        ancestor_launch_plan_paths=[fixture["ancestor_plan"]],
+        ancestor_bindings_paths=[ancestor_bindings],
+        allow_chained_shadow_state=True,
+    )
+    assert state["rolling_migration"]["shadow_only"] is True
+    assert set(cohorts) == set(state["rolling_migration"]["harvest_cohorts"])
+
+    with pytest.raises(RuntimeError, match="shadow is read-only"):
+        harvest.harvest_once(
+            fixture["successor_plan"],
+            successor_bindings,
+            shadow_path,
+            predecessor_launch_plan_path=fixture["predecessor_plan"],
+            predecessor_bindings_path=predecessor_bindings,
+            ancestor_launch_plan_paths=[fixture["ancestor_plan"]],
+            ancestor_bindings_paths=[ancestor_bindings],
+            allow_chained_shadow_state=True,
+            scheduler=Scheduler([]),
+            remote=NoRemoteReads(),
+            runtime=tmp_path,
+            protected_current7_index=tmp_path.parent / "protected" / "index.json",
+            apply=True,
+        )
+
+
 def test_patched_bundle_mixed_ledger_replays_old_and_new_bindings(tmp_path):
     fixture = rolling_fixtures._historical_transition_fixture(tmp_path / "rolling")
     resource_plan = fixture["predecessor"]

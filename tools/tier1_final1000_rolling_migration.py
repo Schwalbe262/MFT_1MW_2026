@@ -27,6 +27,7 @@ try:
     from tier1_corrected_current7_slurm_publish import scheduler_publication_transport
     from tier1_final1000_slurm_controller import (
         ACTIVE_STATES,
+        CHAINED_CANARY_GAP_POLICY,
         DEDUPE_PREFIX,
         HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
         LEGACY_RESOURCE_POLICY_ID,
@@ -69,6 +70,7 @@ except ImportError:  # pragma: no cover - repository import path
     )
     from tools.tier1_final1000_slurm_controller import (
         ACTIVE_STATES,
+        CHAINED_CANARY_GAP_POLICY,
         DEDUPE_PREFIX,
         HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
         LEGACY_RESOURCE_POLICY_ID,
@@ -1088,6 +1090,17 @@ def _validate_chained_predecessor_state(
     }
     if (
         migration.get("successor_canary_task_ids_by_stage") != expected_canary_ids
+        or (
+            migration.get("schema_version") == CHAINED_MIGRATION_SCHEMA
+            and (
+                migration.get("successor_canary_gap_policy")
+                != CHAINED_CANARY_GAP_POLICY
+                or any(
+                    len(task_ids) > 1
+                    for task_ids in expected_canary_ids.values()
+                )
+            )
+        )
         or migration.get("successor_canary_status_by_stage")
         != {stage.stage_id: "remote_preflight_passed" for stage in STAGES}
         or migration.get("next_seed_by_stage")
@@ -1464,6 +1477,9 @@ def prepare_successor_state(
                 "predecessor_harvest_cohort_ids": predecessor_cohort_ids,
                 "successor_harvest_cohort_id": successor_cohort_id,
                 "harvest_cohorts": catalog,
+                "successor_canary_gap_policy": copy.deepcopy(
+                    CHAINED_CANARY_GAP_POLICY
+                ),
                 "predecessor_stop_observed": bool(
                     predecessor_state["_predecessor_stopped"]
                 ),
@@ -1542,6 +1558,9 @@ def prepare_successor_state(
         "successor_canary_status_by_stage": copy.deepcopy(
             migration["successor_canary_status_by_stage"]
         ),
+        "successor_canary_gap_policy": copy.deepcopy(
+            migration.get("successor_canary_gap_policy")
+        ),
         "harvest_cohort_ids": sorted(migration["harvest_cohorts"]),
         "namespace_extra_task_ids": namespace_extra_task_ids,
         "namespace_extra_task_count": len(namespace_extra_task_ids),
@@ -1583,6 +1602,14 @@ def _parser() -> argparse.ArgumentParser:
         "--evidence-output",
         type=Path,
         help="atomically write a sealed local receipt for a non-applying dry-run",
+    )
+    parser.add_argument(
+        "--shadow-state-evidence-output",
+        type=Path,
+        help=(
+            "atomically persist the sealed, non-runnable shadow state for a "
+            "read-only chained harvester preflight"
+        ),
     )
     parser.add_argument(
         "--resource-quota-only",
@@ -1628,6 +1655,36 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
         )
     compact = {key: item for key, item in value.items() if key != "successor_state"}
+    if args.shadow_state_evidence_output is not None:
+        if args.apply or not args.allow_running_predecessor_shadow:
+            raise RuntimeError(
+                "shadow state evidence requires a non-applying running-predecessor shadow"
+            )
+        shadow_path = args.shadow_state_evidence_output.resolve()
+        protected_shadow_targets = {
+            path.resolve()
+            for path in (
+                args.predecessor_plan,
+                args.predecessor_state,
+                args.successor_plan,
+                args.successor_state,
+                *args.ancestor_plan,
+            )
+        }
+        if shadow_path in protected_shadow_targets:
+            raise RuntimeError("shadow state evidence cannot overwrite an input/state file")
+        if (
+            args.evidence_output is not None
+            and shadow_path == args.evidence_output.resolve()
+        ):
+            raise RuntimeError("shadow state and receipt evidence paths must differ")
+        shadow_state = value["successor_state"]
+        if shadow_path.exists() and _read_json(shadow_path) != shadow_state:
+            raise RuntimeError("shadow state evidence target has another identity")
+        if not shadow_path.exists():
+            _write_state(shadow_path, shadow_state)
+        compact["shadow_state_evidence_path"] = str(shadow_path)
+        compact["shadow_state_evidence_sha256"] = shadow_state["state_sha256"]
     if args.evidence_output is not None:
         if args.apply:
             raise RuntimeError("dry-run evidence output is incompatible with --apply")
@@ -1641,6 +1698,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 *args.ancestor_plan,
             )
         }
+        if args.shadow_state_evidence_output is not None:
+            protected.add(args.shadow_state_evidence_output.resolve())
         evidence_path = args.evidence_output.resolve()
         if evidence_path in protected:
             raise RuntimeError("dry-run evidence cannot overwrite an input/state file")
