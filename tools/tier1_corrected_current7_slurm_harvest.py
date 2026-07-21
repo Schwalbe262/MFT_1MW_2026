@@ -21,6 +21,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import sys
+import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 import urllib.error
 import urllib.request
@@ -60,6 +61,22 @@ AGGREGATE_SCHEMA = "mft-tier1-current7-slurm-aggregate-v1"
 COMPATIBILITY_SCHEMA = "mft-tier1-current7-monitor-compatibility-v1"
 SNAPSHOT_IDENTITY_SCHEMA = "mft-tier1-current7-snapshot-identity-v1"
 LEGACY_MONITOR_GENERATION = "84ff69f-cap-parity-overlay-20260719"
+
+# Windows readers can briefly hold the destination without delete sharing,
+# which makes an otherwise atomic ``os.replace`` fail with WinError 5 or 32.
+# Keep publication fail-closed, but tolerate that bounded transient window.
+ATOMIC_REPLACE_RETRY_DELAYS_SECONDS = (
+    0.05,
+    0.10,
+    0.20,
+    0.40,
+    0.80,
+    1.00,
+    1.00,
+    1.50,
+    2.00,
+    3.00,
+)
 
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:8002"
 DEFAULT_RUNTIME = Path(
@@ -1172,6 +1189,31 @@ def legacy_8010_compatibility(manifest: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _replace_with_bounded_retry(temporary: Path, path: Path) -> None:
+    for delay in (*ATOMIC_REPLACE_RETRY_DELAYS_SECONDS, None):
+        try:
+            os.replace(temporary, path)
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32} or delay is None:
+                raise
+            time.sleep(delay)
+
+
+def _write_then_replace(temporary: Path, path: Path, payload: bytes) -> None:
+    temporary.write_bytes(payload)
+    try:
+        _replace_with_bounded_retry(temporary, path)
+    except OSError:
+        # A failed publication must not poison every later watch cycle with a
+        # same-PID stale temporary.  Preserve the original replacement error.
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def _immutable_write(path: Path, payload: bytes) -> int:
     if path.exists():
         if not path.is_file() or path.read_bytes() != payload:
@@ -1181,8 +1223,7 @@ def _immutable_write(path: Path, payload: bytes) -> int:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     if temporary.exists():
         raise RuntimeError(f"stale atomic write temporary exists: {temporary}")
-    temporary.write_bytes(payload)
-    os.replace(temporary, path)
+    _write_then_replace(temporary, path, payload)
     return 1
 
 
@@ -1193,8 +1234,7 @@ def _atomic_replace(path: Path, payload: bytes) -> int:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     if temporary.exists():
         raise RuntimeError(f"stale atomic write temporary exists: {temporary}")
-    temporary.write_bytes(payload)
-    os.replace(temporary, path)
+    _write_then_replace(temporary, path, payload)
     return 1
 
 

@@ -3,11 +3,63 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from tools import tier1_corrected_current7_slurm_harvest as harvest
+
+
+def _windows_busy_error(winerror: int = 5) -> PermissionError:
+    error = PermissionError(13, "destination is temporarily busy")
+    error.winerror = winerror
+    return error
+
+
+def test_atomic_replace_retries_transient_windows_reader_lock(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "current7-index.json"
+    path.write_bytes(b"old")
+    real_replace = os.replace
+    calls = []
+    sleeps = []
+
+    def transient(source, destination):
+        calls.append((source, destination))
+        if len(calls) < 3:
+            raise _windows_busy_error()
+        real_replace(source, destination)
+
+    monkeypatch.setattr(harvest.os, "replace", transient)
+    monkeypatch.setattr(harvest.time, "sleep", sleeps.append)
+
+    assert harvest._atomic_replace(path, b"new") == 1
+    assert path.read_bytes() == b"new"
+    assert len(calls) == 3
+    assert sleeps == [0.05, 0.10]
+    assert not path.with_name(f".{path.name}.{os.getpid()}.tmp").exists()
+
+
+def test_atomic_replace_exhaustion_removes_same_pid_temporary(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "current7-index.json"
+    path.write_bytes(b"old")
+    monkeypatch.setattr(harvest, "ATOMIC_REPLACE_RETRY_DELAYS_SECONDS", (0, 0))
+    monkeypatch.setattr(harvest.time, "sleep", lambda _delay: None)
+
+    def always_busy(*_args):
+        raise _windows_busy_error()
+
+    monkeypatch.setattr(harvest.os, "replace", always_busy)
+
+    with pytest.raises(PermissionError):
+        harvest._atomic_replace(path, b"new")
+
+    assert path.read_bytes() == b"old"
+    assert not path.with_name(f".{path.name}.{os.getpid()}.tmp").exists()
 
 
 def _bytes(value: object) -> bytes:
