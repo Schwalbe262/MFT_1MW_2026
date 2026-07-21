@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import urllib.parse
 
 import pytest
 
@@ -22,12 +23,28 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 class Scheduler:
-    def __init__(self, tasks):
+    def __init__(self, tasks, *, batch_omit_ids=()):
         self.tasks = {int(task["id"]): copy.deepcopy(task) for task in tasks}
+        self.batch_omit_ids = {int(value) for value in batch_omit_ids}
         self.get_count = 0
+        self.batch_get_count = 0
+        self.task_get_count = 0
+
+    def list_tasks(self, *, name_prefix, limit):
+        assert name_prefix == controller.TASK_NAME_PREFIX
+        assert limit == harvest.SCHEDULER_BATCH_LIMIT
+        self.get_count += 1
+        self.batch_get_count += 1
+        return [
+            copy.deepcopy(task)
+            for task_id, task in sorted(self.tasks.items(), reverse=True)
+            if task_id not in self.batch_omit_ids
+            and str(task.get("name") or "").startswith(name_prefix)
+        ][:limit]
 
     def get_task(self, task_id):
         self.get_count += 1
+        self.task_get_count += 1
         value = self.tasks.get(int(task_id))
         return copy.deepcopy(value) if value is not None else None
 
@@ -41,7 +58,7 @@ class NoRemoteReads:
         raise AssertionError("running-only projection must not read SFTP")
 
 
-def _state_and_tasks(plan, *, scheduler_state="running"):
+def _state_and_tasks(plan, *, scheduler_state="running", all_entries=False):
     state = controller._initial_state(plan)
     plan_index = controller._task_index(plan)
     templates = controller._task_templates(plan)
@@ -49,7 +66,7 @@ def _state_and_tasks(plan, *, scheduler_state="running"):
     task_id = 91_000
     seen_stages = set()
     for entry in state["entries"]:
-        if entry["stage_id"] in seen_stages:
+        if not all_entries and entry["stage_id"] in seen_stages:
             continue
         seen_stages.add(entry["stage_id"])
         task_id += 1
@@ -159,7 +176,9 @@ def test_apply_publishes_four_isolated_condition_indexes_and_never_primary(
 
     assert result["scheduler_mutation_count"] == 0
     assert result["remote_write_count"] == 0
-    assert result["scheduler_get_count"] == 4
+    assert result["scheduler_get_count"] == 1
+    assert result["scheduler_batch_get_count"] == 1
+    assert result["scheduler_task_get_count"] == 0
     assert protected.read_bytes() == b"current7-primary-sentinel\n"
     indexes = result["condition_inventory"]["indexes"]
     assert [item["stage_id"] for item in indexes] == [
@@ -186,7 +205,7 @@ def test_apply_publishes_four_isolated_condition_indexes_and_never_primary(
         assert index["condition_display_only"] is True
 
 
-def test_terminal_scheduler_envelope_is_cached_without_more_gets(tmp_path):
+def test_terminal_scheduler_envelope_uses_detail_get_then_caches(tmp_path):
     plan = _rendered_plan()
     state, tasks = _state_and_tasks(plan, scheduler_state="completed")
     runtime = tmp_path / "final1000-runtime"
@@ -196,7 +215,9 @@ def test_terminal_scheduler_envelope_is_cached_without_more_gets(tmp_path):
     )
 
     assert sum(len(items) for items in by_stage.values()) == 4
-    assert scheduler.get_count == 4
+    assert scheduler.get_count == 5
+    assert scheduler.batch_get_count == 1
+    assert scheduler.task_get_count == 4
     assert hits == 0
     assert len(pending) == 4
     for path, payload in pending:
@@ -208,9 +229,141 @@ def test_terminal_scheduler_envelope_is_cached_without_more_gets(tmp_path):
     )
 
     assert sum(len(items) for items in by_stage.values()) == 4
-    assert scheduler.get_count == 4
+    assert scheduler.get_count == 5
+    assert scheduler.batch_get_count == 1
+    assert scheduler.task_get_count == 4
     assert hits == 4
     assert pending == []
+
+
+def test_500_running_tasks_use_one_campaign_inventory_get(tmp_path):
+    plan = _rendered_plan()
+    state, tasks = _state_and_tasks(plan, all_entries=True)
+    assert len(tasks) == 500
+    scheduler = Scheduler(tasks)
+
+    by_stage, pending, hits = harvest._inventory_tasks(
+        plan,
+        state,
+        scheduler=scheduler,
+        runtime=tmp_path / "final1000-runtime",
+    )
+
+    assert sum(len(items) for items in by_stage.values()) == 500
+    assert scheduler.get_count == 1
+    assert scheduler.batch_get_count == 1
+    assert scheduler.task_get_count == 0
+    assert pending == []
+    assert hits == 0
+
+
+def test_task_missing_from_capped_batch_uses_one_fail_closed_detail_get(tmp_path):
+    plan = _rendered_plan()
+    state, tasks = _state_and_tasks(plan)
+    omitted_id = int(tasks[0]["id"])
+    scheduler = Scheduler(tasks, batch_omit_ids={omitted_id})
+
+    by_stage, pending, hits = harvest._inventory_tasks(
+        plan,
+        state,
+        scheduler=scheduler,
+        runtime=tmp_path / "final1000-runtime",
+    )
+
+    assert sum(len(items) for items in by_stage.values()) == 4
+    assert scheduler.get_count == 2
+    assert scheduler.batch_get_count == 1
+    assert scheduler.task_get_count == 1
+    assert pending == []
+    assert hits == 0
+
+
+def test_batch_inventory_identity_mismatch_fails_closed(tmp_path):
+    plan = _rendered_plan()
+    state, tasks = _state_and_tasks(plan)
+    tasks[0]["dedupe_key"] = "foreign-dedupe"
+    scheduler = Scheduler(tasks)
+
+    with pytest.raises(RuntimeError, match="inventory identity changed"):
+        harvest._inventory_tasks(
+            plan,
+            state,
+            scheduler=scheduler,
+            runtime=tmp_path / "final1000-runtime",
+        )
+
+    assert scheduler.get_count == 1
+    assert scheduler.batch_get_count == 1
+    assert scheduler.task_get_count == 0
+
+
+def test_terminal_batch_row_requires_matching_detail_evidence(tmp_path):
+    plan = _rendered_plan()
+    state, tasks = _state_and_tasks(plan, scheduler_state="completed")
+
+    class ChangedTerminalScheduler(Scheduler):
+        def get_task(self, task_id):
+            value = super().get_task(task_id)
+            assert value is not None
+            value["status"] = "failed"
+            return value
+
+    scheduler = ChangedTerminalScheduler(tasks)
+
+    with pytest.raises(RuntimeError, match="terminal scheduler evidence changed"):
+        harvest._inventory_tasks(
+            plan,
+            state,
+            scheduler=scheduler,
+            runtime=tmp_path / "final1000-runtime",
+        )
+
+    assert scheduler.get_count == 2
+    assert scheduler.batch_get_count == 1
+    assert scheduler.task_get_count == 1
+
+
+def test_read_only_api_uses_filtered_max_limit_inventory_get(monkeypatch):
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read():
+            return b"[]"
+
+    def fake_urlopen(request, *, timeout):
+        requests.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(harvest.urllib.request, "urlopen", fake_urlopen)
+    scheduler = harvest.Final1000ReadOnlySchedulerApi(
+        "http://scheduler:8002", timeout=7
+    )
+
+    assert scheduler.list_tasks(
+        name_prefix=controller.TASK_NAME_PREFIX,
+        limit=harvest.SCHEDULER_BATCH_LIMIT,
+    ) == []
+
+    assert len(requests) == 1
+    request, timeout = requests[0]
+    parsed = urllib.parse.urlparse(request.full_url)
+    assert request.get_method() == "GET"
+    assert parsed.path == "/api/tasks"
+    assert urllib.parse.parse_qs(parsed.query) == {
+        "name_prefix": [controller.TASK_NAME_PREFIX],
+        "limit": [str(harvest.SCHEDULER_BATCH_LIMIT)],
+    }
+    assert timeout == 7
+    assert scheduler.get_count == 1
+    assert scheduler.batch_get_count == 1
+    assert scheduler.task_get_count == 0
 
 
 def test_runtime_overlap_with_current7_primary_fails_before_writes(tmp_path):

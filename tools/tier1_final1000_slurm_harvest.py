@@ -19,6 +19,9 @@ import os
 from pathlib import Path
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
+import urllib.error
+import urllib.parse
+import urllib.request
 
 try:
     from tier1_corrected_current7_receipt import canonical_sha256
@@ -111,6 +114,7 @@ except ImportError:  # pragma: no cover - repository import path
 HARVEST_SCHEMA = "mft-tier1-final1000-slurm-harvest-result-v1"
 INDEX_INVENTORY_SCHEMA = "mft-tier1-final1000-condition-index-inventory-v1"
 SCHEDULER_CACHE_SCHEMA = "mft-tier1-final1000-terminal-scheduler-cache-v1"
+SCHEDULER_BATCH_LIMIT = 10_000
 
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:8002"
 DEFAULT_RUNTIME = Path(
@@ -133,8 +137,65 @@ TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "timeout"})
 
 class SchedulerReader(Protocol):
     get_count: int
+    batch_get_count: int
+    task_get_count: int
+
+    def list_tasks(
+        self, *, name_prefix: str, limit: int
+    ) -> Sequence[Mapping[str, Any]]: ...
 
     def get_task(self, task_id: int) -> Mapping[str, Any] | None: ...
+
+
+class Final1000ReadOnlySchedulerApi(ReadOnlySchedulerApi):
+    """GET-only client with one campaign-scoped inventory request per poll."""
+
+    def __init__(self, base_url: str = DEFAULT_SCHEDULER_URL, timeout: float = 20):
+        super().__init__(base_url, timeout)
+        self.batch_get_count = 0
+        self.task_get_count = 0
+
+    def list_tasks(
+        self, *, name_prefix: str, limit: int
+    ) -> Sequence[Mapping[str, Any]]:
+        if name_prefix != TASK_NAME_PREFIX:
+            raise RuntimeError("final1000 scheduler inventory prefix changed")
+        if int(limit) != SCHEDULER_BATCH_LIMIT:
+            raise RuntimeError("final1000 scheduler inventory limit changed")
+        query = urllib.parse.urlencode(
+            {"name_prefix": name_prefix, "limit": int(limit)}
+        )
+        request = urllib.request.Request(
+            self.base_url + f"/api/tasks?{query}", method="GET"
+        )
+        self.get_count += 1
+        self.batch_get_count += 1
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"scheduler GET final1000 inventory failed: {detail}"
+            ) from exc
+
+        def reject_constant(token: str) -> None:
+            raise ValueError(f"non-finite JSON constant {token}")
+
+        try:
+            value = json.loads(
+                payload.decode("utf-8"),
+                parse_constant=reject_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("invalid scheduler final1000 inventory JSON") from exc
+        if not isinstance(value, list):
+            raise RuntimeError("final1000 scheduler inventory is not a list")
+        return value
+
+    def get_task(self, task_id: int) -> Mapping[str, Any] | None:
+        self.task_get_count += 1
+        return super().get_task(task_id)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -233,6 +294,79 @@ def _load_scheduler_cache(
     return copy.deepcopy(task)
 
 
+def _scheduler_task_id(task: Mapping[str, Any]) -> int:
+    candidate = task.get("id")
+    if candidate is None:
+        candidate = task.get("task_id")
+    if isinstance(candidate, bool):
+        raise RuntimeError("scheduler task id is not a positive integer")
+    try:
+        task_id = int(candidate)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("scheduler task id is not a positive integer") from exc
+    if task_id <= 0:
+        raise RuntimeError("scheduler task id is not a positive integer")
+    return task_id
+
+
+def _validate_observed_task(
+    task: Mapping[str, Any],
+    *,
+    task_id: int,
+    expected: Mapping[str, Any],
+) -> str:
+    scheduler_state = str(task.get("status") or "").lower()
+    if (
+        _scheduler_task_id(task) != int(task_id)
+        or task.get("name") != expected["name"]
+        or task.get("dedupe_key") != expected["dedupe_key"]
+        or not str(task.get("name") or "").startswith(TASK_NAME_PREFIX)
+        or not str(task.get("dedupe_key") or "").startswith(DEDUPE_PREFIX)
+        or scheduler_state not in VISIBLE_SCHEDULER_STATES
+    ):
+        raise RuntimeError(f"scheduler task identity changed: {task_id}")
+    return scheduler_state
+
+
+def _batch_scheduler_inventory(
+    scheduler: SchedulerReader,
+) -> dict[int, dict[str, Any]]:
+    values = scheduler.list_tasks(
+        name_prefix=TASK_NAME_PREFIX,
+        limit=SCHEDULER_BATCH_LIMIT,
+    )
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray)
+    ):
+        raise RuntimeError("final1000 scheduler inventory is not a sequence")
+    by_id: dict[int, dict[str, Any]] = {}
+    by_dedupe: dict[str, int] = {}
+    for value in values:
+        if not isinstance(value, Mapping):
+            raise RuntimeError("final1000 scheduler inventory row is not an object")
+        task = copy.deepcopy(dict(value))
+        task_id = _scheduler_task_id(task)
+        name = str(task.get("name") or "")
+        dedupe_key = str(task.get("dedupe_key") or "")
+        scheduler_state = str(task.get("status") or "").lower()
+        if (
+            not name.startswith(TASK_NAME_PREFIX)
+            or not dedupe_key.startswith(DEDUPE_PREFIX)
+            or scheduler_state not in VISIBLE_SCHEDULER_STATES
+        ):
+            raise RuntimeError(
+                f"final1000 scheduler inventory identity changed: {task_id}"
+            )
+        if task_id in by_id:
+            raise RuntimeError("final1000 scheduler inventory duplicated a task id")
+        prior_task_id = by_dedupe.get(dedupe_key)
+        if prior_task_id is not None and prior_task_id != task_id:
+            raise RuntimeError("final1000 scheduler inventory duplicated a dedupe key")
+        by_id[task_id] = task
+        by_dedupe[dedupe_key] = task_id
+    return by_id
+
+
 def _inventory_tasks(
     plan: Mapping[str, Any],
     state: Mapping[str, Any],
@@ -246,6 +380,7 @@ def _inventory_tasks(
     pending_cache: list[tuple[Path, bytes]] = []
     cache_hits = 0
     seen_task_ids: set[int] = set()
+    prepared: list[dict[str, Any]] = []
     for entry in state["entries"]:
         task_id = entry.get("task_id")
         if task_id is None:
@@ -267,22 +402,61 @@ def _inventory_tasks(
         )
         if observed is not None:
             cache_hits += 1
+        prepared.append(
+            {
+                "entry": entry,
+                "task_id": task_id,
+                "expected": expected,
+                "cache_path": cache_path,
+                "observed": observed,
+            }
+        )
+
+    uncached_count = sum(item["observed"] is None for item in prepared)
+    batch_by_id = (
+        _batch_scheduler_inventory(scheduler) if uncached_count else {}
+    )
+    for prepared_item in prepared:
+        entry = prepared_item["entry"]
+        task_id = int(prepared_item["task_id"])
+        expected = prepared_item["expected"]
+        cache_path = prepared_item["cache_path"]
+        observed = prepared_item["observed"]
+        if observed is None:
+            batch_observed = batch_by_id.get(task_id)
+            if batch_observed is None:
+                detail = scheduler.get_task(task_id)
+                if detail is None:
+                    raise RuntimeError(f"scheduler task disappeared: {task_id}")
+                observed = copy.deepcopy(dict(detail))
+                scheduler_state = _validate_observed_task(
+                    observed, task_id=task_id, expected=expected
+                )
+            else:
+                batch_state = _validate_observed_task(
+                    batch_observed, task_id=task_id, expected=expected
+                )
+                observed = batch_observed
+                scheduler_state = batch_state
+                if batch_state in TERMINAL_STATES:
+                    detail = scheduler.get_task(task_id)
+                    if detail is None:
+                        raise RuntimeError(
+                            f"terminal scheduler task disappeared: {task_id}"
+                        )
+                    observed = copy.deepcopy(dict(detail))
+                    detail_state = _validate_observed_task(
+                        observed, task_id=task_id, expected=expected
+                    )
+                    if detail_state != batch_state:
+                        raise RuntimeError(
+                            f"terminal scheduler evidence changed: {task_id}"
+                        )
+                    scheduler_state = detail_state
         else:
-            value = scheduler.get_task(task_id)
-            if value is None:
-                raise RuntimeError(f"scheduler task disappeared: {task_id}")
-            observed = copy.deepcopy(dict(value))
-        observed_id = int(observed.get("id") or observed.get("task_id") or 0)
-        scheduler_state = str(observed.get("status") or "").lower()
-        if (
-            observed_id != task_id
-            or observed.get("name") != expected["name"]
-            or observed.get("dedupe_key") != expected["dedupe_key"]
-            or not str(observed.get("name") or "").startswith(TASK_NAME_PREFIX)
-            or not str(observed.get("dedupe_key") or "").startswith(DEDUPE_PREFIX)
-            or scheduler_state not in VISIBLE_SCHEDULER_STATES
-        ):
-            raise RuntimeError(f"scheduler task identity changed: {task_id}")
+            scheduler_state = _validate_observed_task(
+                observed, task_id=task_id, expected=expected
+            )
         if scheduler_state in TERMINAL_STATES and not cache_path.is_file():
             pending_cache.append(
                 (cache_path, _json_bytes(_sealed_scheduler_cache(observed)))
@@ -635,6 +809,10 @@ def harvest_once(
         launch_plan_path, bindings_path, state_path
     )
     scheduler_get_before = int(getattr(scheduler, "get_count", 0))
+    scheduler_batch_get_before = int(
+        getattr(scheduler, "batch_get_count", 0)
+    )
+    scheduler_task_get_before = int(getattr(scheduler, "task_get_count", 0))
     by_stage, pending_scheduler_cache, scheduler_cache_hits = _inventory_tasks(
         plan, state, scheduler=scheduler, runtime=runtime
     )
@@ -704,6 +882,14 @@ def harvest_once(
         "observed_at": heartbeat,
         "scheduler_get_count": int(getattr(scheduler, "get_count", 0))
         - scheduler_get_before,
+        "scheduler_batch_get_count": int(
+            getattr(scheduler, "batch_get_count", 0)
+        )
+        - scheduler_batch_get_before,
+        "scheduler_task_get_count": int(
+            getattr(scheduler, "task_get_count", 0)
+        )
+        - scheduler_task_get_before,
         "scheduler_terminal_cache_hit_count": scheduler_cache_hits,
         "scheduler_mutation_count": 0,
         "remote_write_count": 0,
@@ -756,7 +942,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise RuntimeError("--watch requires --apply")
     if args.poll_seconds <= 0:
         raise ValueError("poll seconds must be positive")
-    scheduler = ReadOnlySchedulerApi(args.scheduler_url)
+    scheduler = Final1000ReadOnlySchedulerApi(args.scheduler_url)
     remote = AccountSftpReader(args.accounts, args.scheduler_source)
     try:
         while True:
