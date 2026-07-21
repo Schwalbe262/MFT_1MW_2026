@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import copy
+import gzip
 import json
 from pathlib import Path
 import subprocess
@@ -14,6 +16,27 @@ from tools import tier1_final1000_stage_profiles as profiles
 
 
 REPO = Path(__file__).resolve().parents[1]
+ACTUAL_CANARY_FIXTURE = (
+    REPO
+    / "tests"
+    / "fixtures"
+    / "final1000_actual_canaries_68216_68219.json.gz.b64"
+)
+
+
+def _actual_infeasible_canaries() -> list[dict]:
+    compressed = base64.b64decode(ACTUAL_CANARY_FIXTURE.read_text().strip())
+    return json.loads(gzip.decompress(compressed))
+
+
+def _reseal_result(value: dict) -> None:
+    unsigned = {key: item for key, item in value.items() if key != "payload_sha256"}
+    value["payload_sha256"] = launch.canonical_sha256(unsigned)
+
+
+def _reseal_nested(value: dict) -> None:
+    unsigned = {key: item for key, item in value.items() if key != "sha256"}
+    value["sha256"] = launch.canonical_sha256(unsigned)
 
 
 def _base_task(stage: profiles.FinalGoalStage, seed: int | None = None) -> dict:
@@ -315,6 +338,79 @@ def test_result_preflight_requires_exact_dynamic_stage_and_physical_replay():
     mutated["hard_spec"]["resonance_max_Hz"] = 20_001.0
     with pytest.raises(RuntimeError, match="result stage/replay seal mismatch"):
         launch.validate_stage_result(mutated, task)
+
+
+def test_result_preflight_accepts_all_four_actual_infeasible_canary_results():
+    fixtures = _actual_infeasible_canaries()
+    assert [item["task_id"] for item in fixtures] == [68216, 68217, 68218, 68219]
+    assert {item["stage_id"] for item in fixtures} == set(profiles.BY_ID)
+    for item in fixtures:
+        stage = profiles.BY_ID[item["stage_id"]]
+        task = launch.build_stage_task(
+            _base_task(stage, item["seed"]), stage=stage, wave="canary"
+        )
+        result = item["result"]
+        assert result["physical_feasible_count"] == 0
+        assert result["feasible_pareto_count"] == 0
+        assert all(
+            field not in result
+            for field in (
+                "constraint_minimum_G",
+                "terminal_population_best_constraint_G",
+                "optimizer_terminal_best_physical_constraint_G",
+            )
+        )
+        receipt = launch.validate_stage_result(result, task)
+        assert receipt["stage_id"] == stage.stage_id
+        assert receipt["seed"] == item["seed"]
+        assert receipt["terminal_physical_replay_attested"] is True
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "replay_truth",
+        "physical_artifact_shape",
+        "constraint_row_identity",
+        "partial_legacy_summary",
+        "payload_seal",
+    ],
+)
+def test_actual_compact_canary_replay_tampering_fails_closed(tamper: str):
+    item = copy.deepcopy(_actual_infeasible_canaries()[0])
+    stage = profiles.BY_ID[item["stage_id"]]
+    task = launch.build_stage_task(
+        _base_task(stage, item["seed"]), stage=stage, wave="canary"
+    )
+    result = item["result"]
+    if tamper == "replay_truth":
+        replay = result["terminal_physical_replay_evidence"]
+        replay["optimizer_physical_G_match"] = False
+        _reseal_nested(replay)
+        repair_audit = result["optimizer_repair_audit"]
+        repair_audit["terminal_physical_replay"] = copy.deepcopy(replay)
+        _reseal_nested(repair_audit)
+        _reseal_result(result)
+    elif tamper == "physical_artifact_shape":
+        inventory = result["artifact_inventory"]
+        inventory["terminal_G_physical"]["shape"] = [320, 19]
+        result["artifact_inventory_sha256"] = launch.canonical_sha256(inventory)
+        _reseal_result(result)
+    elif tamper == "constraint_row_identity":
+        rows = result["infeasibility_report"]["constraints"]
+        rows[0]["name"] = "wrong-constraint"
+        _reseal_result(result)
+    elif tamper == "partial_legacy_summary":
+        result["constraint_minimum_G"] = {
+            name: -1.0 for name in result["constraint_names"]
+        }
+        _reseal_result(result)
+    elif tamper == "payload_seal":
+        result["payload_sha256"] = "0" * 64
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(tamper)
+    with pytest.raises(RuntimeError, match="result stage/replay seal mismatch"):
+        launch.validate_stage_result(result, task)
 
 
 def test_cli_is_render_validate_only_and_has_no_apply_or_submit_surface():

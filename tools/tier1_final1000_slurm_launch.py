@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -71,6 +72,8 @@ except ImportError:  # pragma: no cover - repository import path
 BINDINGS_SCHEMA = "mft-tier1-final1000-stage-bundle-bindings-v1"
 LAUNCH_SCHEMA = "mft-tier1-final1000-slurm-launch-plan-v1"
 RESULT_PREFLIGHT_SCHEMA = "mft-tier1-final1000-result-preflight-v1"
+CURRENT7_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
+CURRENT7_REPLAY_SCHEMA = "mft-tier1-current7-terminal-replay-v1"
 
 DEFAULT_CPUS = 8
 DEFAULT_MEMORY_MB = 28 * 1024
@@ -114,6 +117,29 @@ REQUIRED_REMOTE_CODE = frozenset(
 PAYLOAD_SHA_PATTERN = re.compile(
     r"(--payload-sha256\s+)([0-9a-f]{64})(?=\s*$)", re.MULTILINE
 )
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _sealed_mapping(value: Any) -> bool:
+    if not isinstance(value, dict) or not _is_sha256(value.get("sha256")):
+        return False
+    unsigned = {key: item for key, item in value.items() if key != "sha256"}
+    return value["sha256"] == canonical_sha256(unsigned)
+
+
+def _finite_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
 
 
 def _now() -> str:
@@ -703,6 +729,186 @@ def validate_launch_plan(value: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value)
 
 
+def _compact_terminal_replay_seal_matches(
+    result: Mapping[str, Any], constraints: Sequence[str]
+) -> bool:
+    """Authenticate the compact result emitted by the deployed preflight.
+
+    The current7 preflight persists the full terminal physical matrices as
+    hash-addressed artifacts.  It intentionally does not copy the older
+    three convenience summary dictionaries into ``result.json``.  Accept
+    that compact schema only when its result payload, replay audit,
+    inventory, shapes, and per-constraint infeasibility projection all form
+    one internally sealed physical replay.
+    """
+
+    if result.get("schema_version") != CURRENT7_RESULT_SCHEMA:
+        return False
+    payload_sha = result.get("payload_sha256")
+    unsigned_result = {
+        key: value for key, value in result.items() if key != "payload_sha256"
+    }
+    population = result.get("population")
+    terminal_count = result.get("terminal_population_count")
+    if (
+        not _is_sha256(payload_sha)
+        or payload_sha != canonical_sha256(unsigned_result)
+        or isinstance(population, bool)
+        or not isinstance(population, int)
+        or population <= 0
+        or terminal_count != population
+    ):
+        return False
+
+    replay = result.get("terminal_physical_replay_evidence")
+    repair_audit = result.get("optimizer_repair_audit")
+    replay_repair = replay.get("repair") if isinstance(replay, dict) else None
+    if (
+        not _sealed_mapping(replay)
+        or replay.get("schema_version") != CURRENT7_REPLAY_SCHEMA
+        or replay.get("coordinate_count") != population
+        or replay.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
+        or replay.get("optimizer_objectives_match") is not True
+        or replay.get("optimizer_physical_G_match") is not True
+        or replay.get("all_winding_budget_identities_passed") is not True
+        or any(
+            not _is_sha256(replay.get(field))
+            for field in (
+                "objective_sha256",
+                "optimizer_G_sha256",
+                "physical_unscaled_G_sha256",
+            )
+        )
+        or not _sealed_mapping(replay_repair)
+        or replay_repair.get("fixed_point_idempotent") is not True
+        or replay_repair.get("fixed_primary_coordinate_verified") is not True
+        or replay_repair.get("fixed_primary_turns") != FIXED_PRIMARY_TURNS
+        or replay_repair.get("input_count") != population
+        or replay_repair.get("output_count") != population
+        or not _sealed_mapping(repair_audit)
+        or repair_audit.get("authoritative_terminal_G")
+        != "physical_unscaled_replay"
+        or repair_audit.get("terminal_physical_replay") != replay
+        or repair_audit.get("stages")
+        != {
+            "initial_population": True,
+            "warm_start": True,
+            "every_offspring": True,
+            "terminal_physical_replay": True,
+        }
+    ):
+        return False
+
+    inventory = result.get("artifact_inventory")
+    if (
+        not isinstance(inventory, dict)
+        or result.get("artifact_inventory_sha256")
+        != canonical_sha256(inventory)
+    ):
+        return False
+    expected_arrays = {
+        "terminal_X": ("terminal_X.npy", [population, 25]),
+        "terminal_F": ("terminal_F.npy", [population, 2]),
+        "terminal_G_optimizer": (
+            "terminal_G_optimizer.npy",
+            [population, len(constraints)],
+        ),
+        "terminal_G_physical": (
+            "terminal_G_physical.npy",
+            [population, len(constraints)],
+        ),
+    }
+    for name, (path, shape) in expected_arrays.items():
+        record = inventory.get(name)
+        if (
+            not isinstance(record, dict)
+            or record.get("path") != path
+            or record.get("shape") != shape
+            or record.get("dtype") != "float64"
+            or not _is_sha256(record.get("sha256"))
+            or isinstance(record.get("size_bytes"), bool)
+            or not isinstance(record.get("size_bytes"), int)
+            or record["size_bytes"] <= 0
+        ):
+            return False
+
+    infeasibility = result.get("infeasibility_report")
+    rows = infeasibility.get("constraints") if isinstance(infeasibility, dict) else None
+    least_physical = (
+        infeasibility.get("least_physical_constraint_G")
+        if isinstance(infeasibility, dict)
+        else None
+    )
+    physical_feasible_count = result.get("physical_feasible_count")
+    if (
+        not isinstance(infeasibility, dict)
+        or infeasibility.get("schema_version")
+        != "mft-tier1-current7-infeasibility-report-v1"
+        or infeasibility.get("authoritative_constraints")
+        != "terminal_unscaled_physical_replay"
+        or infeasibility.get("population_size") != population
+        or isinstance(physical_feasible_count, bool)
+        or not isinstance(physical_feasible_count, int)
+        or not 0 <= physical_feasible_count <= population
+        or infeasibility.get("physical_feasible_count")
+        != physical_feasible_count
+        or not isinstance(rows, list)
+        or len(rows) != len(constraints)
+        or not isinstance(least_physical, dict)
+        or set(least_physical) != set(constraints)
+        or any(not _finite_number(value) for value in least_physical.values())
+        or any(
+            not isinstance(row, dict)
+            or row.get("index") != index
+            or row.get("name") != name
+            or row.get("finite_count") != population
+            or isinstance(row.get("passing_count"), bool)
+            or not isinstance(row.get("passing_count"), int)
+            or not 0 <= row["passing_count"] <= population
+            or any(
+                not _finite_number(row.get(field))
+                for field in (
+                    "minimum_physical_G",
+                    "median_physical_G",
+                    "minimum_positive_violation",
+                )
+            )
+            for index, (name, row) in enumerate(zip(constraints, rows))
+        )
+        or any(
+            infeasibility.get(field) is not False
+            for field in (
+                "production_eligible",
+                "fea_submission_performed",
+                "automatic_promotion_allowed",
+            )
+        )
+    ):
+        return False
+    return True
+
+
+def _physical_replay_seal_matches(
+    result: Mapping[str, Any], constraints: Sequence[str]
+) -> bool:
+    physical_fields = (
+        "constraint_minimum_G",
+        "terminal_population_best_constraint_G",
+        "optimizer_terminal_best_physical_constraint_G",
+    )
+    present = [field in result for field in physical_fields]
+    if all(present):
+        return all(
+            isinstance(result.get(field), dict)
+            and set(result[field]) == set(constraints)
+            and all(_finite_number(value) for value in result[field].values())
+            for field in physical_fields
+        )
+    if any(present):
+        return False
+    return _compact_terminal_replay_seal_matches(result, constraints)
+
+
 def validate_stage_result(
     result: Mapping[str, Any], task: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -710,11 +916,6 @@ def validate_stage_result(
     payload = validated_task["payload_json"]
     stage = BY_ID[payload["final_goal_stage_id"]]
     spec, constraints = optimizer_stage_contract(stage)
-    physical_fields = (
-        "constraint_minimum_G",
-        "terminal_population_best_constraint_G",
-        "optimizer_terminal_best_physical_constraint_G",
-    )
     if (
         result.get("hard_spec") != spec
         or result.get("stage_spec_sha256") != canonical_sha256(spec)
@@ -725,11 +926,7 @@ def validate_stage_result(
         != [FIXED_PRIMARY_TURNS]
         or result.get("terminal_population_fixed_primary_turns_verified") is not True
         or result.get("terminal_physical_replay_attested") is not True
-        or any(
-            not isinstance(result.get(field), dict)
-            or set(result[field]) != set(constraints)
-            for field in physical_fields
-        )
+        or not _physical_replay_seal_matches(result, constraints)
         or any(
             result.get(field) is not False
             for field in (
