@@ -4,8 +4,10 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 import pytest
@@ -373,6 +375,113 @@ class FakeDeltaTransport:
             self.sealed.remove(incoming)
             self.sealed.add(destination)
         self.promoted.add(destination)
+
+
+class FakeBatchSession:
+    def __init__(
+        self,
+        records: Mapping[str, Mapping[str, Any] | None],
+        *,
+        corrupt_output: str | None = None,
+    ):
+        self.records = records
+        self.corrupt_output = corrupt_output
+        self.commands: list[tuple[str, int]] = []
+
+    def run(self, command: str, timeout: int):
+        self.commands.append((command, timeout))
+        argv = shlex.split(command)
+        assert argv[:2] == ["bash", "-lc"]
+        script = argv[2]
+        set_line = next(line for line in script.splitlines() if line.startswith("set --"))
+        paths = shlex.split(set_line)[2:]
+        rows = []
+        for index, path in enumerate(paths):
+            record = self.records[path]
+            if record is None:
+                rows.append(f"M\t{index}")
+            else:
+                rows.append(f"R\t{index}\t{record['size']}\t{record['sha256']}")
+        if self.corrupt_output == "omit" and rows:
+            rows.pop()
+        elif self.corrupt_output == "bad-sha" and rows:
+            fields = rows[0].split("\t")
+            if fields[0] == "R":
+                fields[3] = "not-a-sha"
+                rows[0] = "\t".join(fields)
+        return SimpleNamespace(exit_code=0, stdout="\n".join(rows) + "\n", stderr="")
+
+
+def test_ssh_batch_records_are_command_bounded_and_complete():
+    paths = [
+        f"/gpfs/final bundle/artifacts/code/worker-{index:03d}-with-'quote'.py"
+        for index in range(30)
+    ]
+    expected = {
+        path: (
+            None
+            if index == 17
+            else {"size": index + 1, "sha256": f"{index + 1:064x}"}
+        )
+        for index, path in enumerate(paths)
+    }
+    session = FakeBatchSession(expected)
+    transport = delta.SSHDeltaTransport(session, "")
+    transport._MAX_BATCH_COMMAND_BYTES = 1_024
+
+    assert transport.file_records(paths) == expected
+    assert len(session.commands) > 1
+    assert all(
+        len(command.encode("utf-8")) <= transport._MAX_BATCH_COMMAND_BYTES
+        for command, _ in session.commands
+    )
+    assert all(
+        timeout == transport._BATCH_RECORD_TIMEOUT_SECONDS
+        for _, timeout in session.commands
+    )
+
+
+@pytest.mark.parametrize("corrupt_output", ["omit", "bad-sha"])
+def test_ssh_batch_records_fail_closed_on_incomplete_or_invalid_output(
+    corrupt_output: str,
+):
+    path = "/gpfs/final/artifacts/model.bin"
+    session = FakeBatchSession(
+        {path: {"size": 4, "sha256": "a" * 64}},
+        corrupt_output=corrupt_output,
+    )
+    transport = delta.SSHDeltaTransport(session, "")
+    with pytest.raises(RuntimeError, match="remote"):
+        transport.file_records([path])
+
+
+def test_inventory_batch_reader_covers_every_file_on_every_pass():
+    files = {
+        "artifacts/a.bin": {"size": 1, "sha256": "a" * 64},
+        "artifacts/b.bin": {"size": 2, "sha256": "b" * 64},
+    }
+
+    class BatchOnlyTransport:
+        def __init__(self):
+            self.calls: list[tuple[str, ...]] = []
+
+        def file_records(self, paths):
+            self.calls.append(tuple(paths))
+            return {
+                path: files[path.removeprefix("/remote/")] for path in paths
+            }
+
+        def file_record(self, path):
+            raise AssertionError(f"slow single-file fallback used for {path}")
+
+    transport = BatchOnlyTransport()
+    delta._verify_inventory(transport, "/remote", files, "child")
+    delta._verify_inventory(transport, "/remote", files, "child")
+    expected_paths = (
+        "/remote/artifacts/a.bin",
+        "/remote/artifacts/b.bin",
+    )
+    assert transport.calls == [expected_paths, expected_paths]
 
 
 def test_plan_is_content_addressed_and_classifies_only_small_delta(tmp_path: Path):

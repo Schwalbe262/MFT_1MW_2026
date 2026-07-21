@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path, PurePosixPath
+import re
 import shlex
 import sys
 from typing import Any, Iterator, Mapping, Protocol, Sequence
@@ -581,9 +582,22 @@ def _verify_inventory(
     files: Mapping[str, Any],
     label: str,
 ) -> None:
-    for relative, expected in sorted(files.items()):
-        relative = _safe_relative(str(relative))
-        if not _record_matches(transport.file_record(f"{root}/{relative}"), expected):
+    inventory = [
+        (_safe_relative(str(relative)), expected)
+        for relative, expected in sorted(files.items())
+    ]
+    paths = [f"{root}/{relative}" for relative, _ in inventory]
+    batch_reader = getattr(transport, "file_records", None)
+    if callable(batch_reader):
+        records = batch_reader(paths)
+        if not isinstance(records, Mapping) or set(records) != set(paths):
+            raise RuntimeError(f"{label} batch file authentication was incomplete")
+    else:
+        # Compatibility path for the in-memory publication test transport and
+        # third-party transports that implement the original single-file API.
+        records = {path: transport.file_record(path) for path in paths}
+    for (relative, expected), path in zip(inventory, paths, strict=True):
+        if not _record_matches(records[path], expected):
             raise RuntimeError(f"{label} file authentication failed: {relative}")
 
 
@@ -1021,6 +1035,110 @@ class SSHDeltaTransport(SSHPublicationTransport):
     """SSH transport with no regular-copy or runtime-install fallback."""
 
     _MAX_CONTROL_BYTES = 1_000_000
+    # Keep each fully quoted remote command well below common SSH server and
+    # shell command-size limits.  A manifest is still verified in full; it is
+    # merely split into several exact stat+SHA passes when necessary.
+    _MAX_BATCH_COMMAND_BYTES = 24 * 1024
+    _BATCH_RECORD_TIMEOUT_SECONDS = 3600
+    _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+    @staticmethod
+    def _batch_record_command(paths: Sequence[str]) -> str:
+        if not paths:
+            raise RuntimeError("remote batch file record requires at least one path")
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                "set -- " + " ".join(shlex.quote(path) for path in paths),
+                "i=0",
+                'for p in "$@"; do',
+                '  if test -f "$p"; then',
+                '    size=$(stat -c \'%s\' -- "$p")',
+                '    digest=$(sha256sum < "$p")',
+                '    digest=${digest%% *}',
+                "    printf 'R\\t%s\\t%s\\t%s\\n' \"$i\" \"$size\" \"$digest\"",
+                "  else",
+                "    printf 'M\\t%s\\n' \"$i\"",
+                "  fi",
+                "  i=$((i + 1))",
+                "done",
+            ]
+        )
+        return "bash -lc " + shlex.quote(script)
+
+    def _batch_record_chunks(self, paths: Sequence[str]) -> Iterator[list[str]]:
+        current: list[str] = []
+        for path in paths:
+            candidate = [*current, path]
+            command = self._batch_record_command(candidate)
+            if len(command.encode("utf-8")) <= self._MAX_BATCH_COMMAND_BYTES:
+                current = candidate
+                continue
+            if not current:
+                raise RuntimeError("remote file path exceeds safe batch command size")
+            yield current
+            current = [path]
+            command = self._batch_record_command(current)
+            if len(command.encode("utf-8")) > self._MAX_BATCH_COMMAND_BYTES:
+                raise RuntimeError("remote file path exceeds safe batch command size")
+        if current:
+            yield current
+
+    def _parse_batch_records(
+        self, paths: Sequence[str], output: str
+    ) -> dict[str, Mapping[str, Any] | None]:
+        lines = output.splitlines()
+        if len(lines) != len(paths):
+            raise RuntimeError("invalid remote batch file record count")
+        indexed: dict[int, Mapping[str, Any] | None] = {}
+        for line in lines:
+            fields = line.split("\t")
+            if len(fields) < 2 or fields[0] not in {"M", "R"}:
+                raise RuntimeError("invalid remote batch file record row")
+            try:
+                index = int(fields[1])
+            except ValueError as exc:
+                raise RuntimeError("invalid remote batch file record index") from exc
+            if not 0 <= index < len(paths) or index in indexed:
+                raise RuntimeError("invalid remote batch file record index")
+            if fields[0] == "M":
+                if len(fields) != 2:
+                    raise RuntimeError("invalid remote missing-file record")
+                indexed[index] = None
+                continue
+            if len(fields) != 4:
+                raise RuntimeError("invalid remote present-file record")
+            try:
+                size = int(fields[2])
+            except ValueError as exc:
+                raise RuntimeError("invalid remote file size") from exc
+            digest = fields[3]
+            if size < 0 or self._SHA256_PATTERN.fullmatch(digest) is None:
+                raise RuntimeError("invalid remote file size or SHA256")
+            indexed[index] = {"size": size, "sha256": digest}
+        if set(indexed) != set(range(len(paths))):
+            raise RuntimeError("remote batch file records omitted an input path")
+        return {path: indexed[index] for index, path in enumerate(paths)}
+
+    def file_records(
+        self, paths: Sequence[str]
+    ) -> Mapping[str, Mapping[str, Any] | None]:
+        """Return an exact record for every path using bounded SSH batches."""
+
+        requested = list(paths)
+        if len(set(requested)) != len(requested):
+            raise RuntimeError("remote batch file record paths must be unique")
+        records: dict[str, Mapping[str, Any] | None] = {}
+        for chunk in self._batch_record_chunks(requested):
+            command = self._batch_record_command(chunk)
+            output = self._run(command, self._BATCH_RECORD_TIMEOUT_SECONDS)
+            chunk_records = self._parse_batch_records(chunk, output)
+            if set(chunk_records) != set(chunk):
+                raise RuntimeError("remote batch file records were incomplete")
+            records.update(chunk_records)
+        if set(records) != set(requested):
+            raise RuntimeError("remote batch file records omitted an input path")
+        return records
 
     def write_control(self, path: str, value: bytes) -> None:
         if len(value) > self._MAX_CONTROL_BYTES:
