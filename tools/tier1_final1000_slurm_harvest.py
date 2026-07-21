@@ -603,6 +603,7 @@ def _inventory_tasks(
 
     uncached_count = sum(item["observed"] is None for item in prepared)
     batch_by_id = _batch_scheduler_inventory(scheduler) if uncached_count else {}
+    terminal_confirmation_by_id: dict[int, dict[str, Any]] | None = None
     for prepared_item in prepared:
         entry = prepared_item["entry"]
         task_id = int(prepared_item["task_id"])
@@ -629,12 +630,25 @@ def _inventory_tasks(
                 observed = batch_observed
                 scheduler_state = batch_state
                 if batch_state in TERMINAL_STATES:
-                    detail = scheduler.get_task(task_id)
-                    if detail is None:
+                    # Confirm terminal evidence against a second authoritative
+                    # campaign snapshot.  A single extra batch GET retains the
+                    # prior fail-closed two-observation contract without one
+                    # scheduler round trip per newly terminal task.
+                    if terminal_confirmation_by_id is None:
+                        terminal_confirmation_by_id = _batch_scheduler_inventory(
+                            scheduler
+                        )
+                    confirmation = terminal_confirmation_by_id.get(task_id)
+                    if confirmation is None:
+                        # The inventory endpoint is capped.  Preserve the
+                        # established detail-GET fallback if concurrent inserts
+                        # push an expected row outside either batch snapshot.
+                        confirmation = scheduler.get_task(task_id)
+                    if confirmation is None:
                         raise RuntimeError(
                             f"terminal scheduler task disappeared: {task_id}"
                         )
-                    observed = copy.deepcopy(dict(detail))
+                    observed = copy.deepcopy(dict(confirmation))
                     detail_state = _validate_observed_task(
                         observed, task_id=task_id, expected=expected
                     )

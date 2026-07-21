@@ -272,7 +272,7 @@ def test_apply_publishes_four_isolated_condition_indexes_and_never_primary(
         assert index["condition_display_only"] is True
 
 
-def test_terminal_scheduler_envelope_uses_detail_get_then_caches(tmp_path):
+def test_terminal_scheduler_envelope_uses_confirmation_batch_then_caches(tmp_path):
     plan = _rendered_plan()
     state, tasks = _state_and_tasks(plan, scheduler_state="completed")
     runtime = tmp_path / "final1000-runtime"
@@ -282,9 +282,9 @@ def test_terminal_scheduler_envelope_uses_detail_get_then_caches(tmp_path):
     )
 
     assert sum(len(items) for items in by_stage.values()) == 4
-    assert scheduler.get_count == 5
-    assert scheduler.batch_get_count == 1
-    assert scheduler.task_get_count == 4
+    assert scheduler.get_count == 2
+    assert scheduler.batch_get_count == 2
+    assert scheduler.task_get_count == 0
     assert hits == 0
     assert len(pending) == 4
     for path, payload in pending:
@@ -296,9 +296,9 @@ def test_terminal_scheduler_envelope_uses_detail_get_then_caches(tmp_path):
     )
 
     assert sum(len(items) for items in by_stage.values()) == 4
-    assert scheduler.get_count == 5
-    assert scheduler.batch_get_count == 1
-    assert scheduler.task_get_count == 4
+    assert scheduler.get_count == 2
+    assert scheduler.batch_get_count == 2
+    assert scheduler.task_get_count == 0
     assert hits == 4
     assert pending == []
 
@@ -322,6 +322,30 @@ def test_500_running_tasks_use_one_campaign_inventory_get(tmp_path):
     assert scheduler.batch_get_count == 1
     assert scheduler.task_get_count == 0
     assert pending == []
+    assert hits == 0
+
+
+def test_500_terminal_tasks_use_two_campaign_inventory_gets(tmp_path):
+    plan = _rendered_plan()
+    state, tasks = _state_and_tasks(
+        plan, scheduler_state="completed", all_entries=True
+    )
+    assert len(tasks) == 500
+    scheduler = Scheduler(tasks)
+
+    by_stage, pending, hits = harvest._inventory_tasks(
+        plan,
+        state,
+        cohorts=_cohorts(plan),
+        scheduler=scheduler,
+        runtime=tmp_path / "final1000-runtime",
+    )
+
+    assert sum(len(items) for items in by_stage.values()) == 500
+    assert scheduler.get_count == 2
+    assert scheduler.batch_get_count == 2
+    assert scheduler.task_get_count == 0
+    assert len(pending) == 500
     assert hits == 0
 
 
@@ -479,6 +503,11 @@ def test_full_harvest_authenticates_legacy_and_successor_results_in_one_index(
         observed_at="2026-07-22 01:00:00",
     )
 
+    assert result["scheduler_get_count"] == 2
+    assert result["scheduler_batch_get_count"] == 2
+    assert result["scheduler_task_get_count"] == 0
+    assert result["scheduler_mutation_count"] == 0
+    assert result["remote_write_count"] == 0
     stage_result = next(
         item for item in result["stages"] if item["stage_id"] == stage.stage_id
     )
@@ -819,16 +848,16 @@ def test_batch_inventory_identity_mismatch_fails_closed(tmp_path):
     assert scheduler.task_get_count == 0
 
 
-def test_terminal_batch_row_requires_matching_detail_evidence(tmp_path):
+def test_terminal_batch_row_requires_matching_confirmation_evidence(tmp_path):
     plan = _rendered_plan()
     state, tasks = _state_and_tasks(plan, scheduler_state="completed")
 
     class ChangedTerminalScheduler(Scheduler):
-        def get_task(self, task_id):
-            value = super().get_task(task_id)
-            assert value is not None
-            value["status"] = "failed"
-            return value
+        def list_tasks(self, *, name_prefix, limit):
+            values = super().list_tasks(name_prefix=name_prefix, limit=limit)
+            if self.batch_get_count == 2:
+                values[0]["status"] = "failed"
+            return values
 
     scheduler = ChangedTerminalScheduler(tasks)
 
@@ -842,8 +871,37 @@ def test_terminal_batch_row_requires_matching_detail_evidence(tmp_path):
         )
 
     assert scheduler.get_count == 2
-    assert scheduler.batch_get_count == 1
+    assert scheduler.batch_get_count == 2
+    assert scheduler.task_get_count == 0
+
+
+def test_terminal_missing_from_confirmation_batch_uses_detail_fallback(tmp_path):
+    plan = _rendered_plan()
+    state, tasks = _state_and_tasks(plan, scheduler_state="completed")
+    target_id = int(tasks[0]["id"])
+
+    class ConfirmationOmitScheduler(Scheduler):
+        def list_tasks(self, *, name_prefix, limit):
+            values = super().list_tasks(name_prefix=name_prefix, limit=limit)
+            if self.batch_get_count == 2:
+                return [item for item in values if int(item["id"]) != target_id]
+            return values
+
+    scheduler = ConfirmationOmitScheduler(tasks)
+    by_stage, pending, hits = harvest._inventory_tasks(
+        plan,
+        state,
+        cohorts=_cohorts(plan),
+        scheduler=scheduler,
+        runtime=tmp_path / "final1000-runtime",
+    )
+
+    assert sum(len(items) for items in by_stage.values()) == 4
+    assert scheduler.get_count == 3
+    assert scheduler.batch_get_count == 2
     assert scheduler.task_get_count == 1
+    assert len(pending) == 4
+    assert hits == 0
 
 
 def test_read_only_api_uses_filtered_max_limit_inventory_get(monkeypatch):
