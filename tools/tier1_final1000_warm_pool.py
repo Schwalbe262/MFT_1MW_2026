@@ -64,6 +64,20 @@ HEIGHT_CONSTRAINT = "exterior_height_limit"
 BASIN_POOL_SCHEMA = "mft-tier1-final1000-basin-warm-selection-v1"
 BASIN_PROTECTED_COPIES_EACH = 8
 BASIN_PROTECTED_SELECTION_CAP = 56
+JOINT_NICHE_POOL_SCHEMA = (
+    "mft-tier1-final1000-joint-niche-warm-selection-v1"
+)
+JOINT_NICHE_NAMES = (
+    "llt_robust_joint",
+    "core_center_top_joint",
+    "rx_main_joint",
+    "width_joint",
+)
+JOINT_NICHE_COPIES_EACH = 2
+JOINT_NICHE_SOURCE_MINIMUMS = {
+    "final-1000-t100": 8,
+    "close-1075-t107p5": 16,
+}
 
 
 def _now() -> str:
@@ -491,6 +505,312 @@ def _basin_aware_indices(
     return selected, audit
 
 
+def _joint_niche_indices(
+    coordinates: np.ndarray,
+    staged_g: np.ndarray,
+    objectives: np.ndarray,
+    *,
+    target_names: tuple[str, ...],
+    constraint_scales: np.ndarray,
+    global_order: np.ndarray,
+    source_stage_ids: tuple[str, ...],
+    pool_size: int,
+    minimum_distance: float,
+) -> tuple[list[int], dict[str, Any]]:
+    """Preserve four exact-final joint niches in every audited N1=6 basin.
+
+    The 56-row reservoir is deliberately the exact downstream protected
+    donor budget: two independent donors for each of four physical niches in
+    each of seven turn-split topologies.  Consequently the downstream
+    half-warm policy consumes every structural donor instead of sampling away
+    a rare niche.  Source-stage minimums are enforced without changing any
+    objective, physical ``G``, hard tolerance, or pass classification.
+    """
+
+    topology = topology_evolution_contract(6)
+    required_topologies = tuple(
+        int(value) for value in topology["turn_split_sub_islands_N2_main"]
+    )
+    expected_count = (
+        len(required_topologies)
+        * len(JOINT_NICHE_NAMES)
+        * JOINT_NICHE_COPIES_EACH
+    )
+    if (
+        required_topologies != (34, 35, 36, 37, 38, 39, 60)
+        or expected_count != BASIN_PROTECTED_SELECTION_CAP
+        or int(pool_size) != expected_count
+        or topology["bounded_diversity_budget"]["protected_slots"]
+        != expected_count
+    ):
+        raise RuntimeError("joint-niche warm protected budget mismatch")
+    coordinates = np.asarray(coordinates, dtype=float)
+    staged_g = np.asarray(staged_g, dtype=float)
+    objectives = np.asarray(objectives, dtype=float)
+    scales = np.asarray(constraint_scales, dtype=float)
+    if (
+        coordinates.ndim != 2
+        or staged_g.shape != (len(coordinates), len(target_names))
+        or objectives.shape != (len(coordinates), 2)
+        or scales.shape != (len(target_names),)
+        or not np.isfinite(coordinates).all()
+        or not np.isfinite(staged_g).all()
+        or not np.isfinite(objectives).all()
+        or not np.isfinite(scales).all()
+        or np.any(scales <= 0.0)
+    ):
+        raise RuntimeError("joint-niche ranking inventory mismatch")
+    if len(source_stage_ids) != len(coordinates):
+        raise RuntimeError("joint-niche source-stage inventory mismatch")
+
+    positions = {name: index for index, name in enumerate(target_names)}
+    core_center = f"{TEMPERATURE_PREFIX}Tprobe_core_center_max"
+    core_top = f"{TEMPERATURE_PREFIX}Tprobe_core_top_yoke_max"
+    rx_main = f"{TEMPERATURE_PREFIX}Tprobe_Rx_main_leeward_max"
+    required_names = {
+        "Llt_robust_band",
+        "Llt_ensemble_disagreement",
+        core_center,
+        core_top,
+        rx_main,
+        WIDTH_CONSTRAINT,
+        LENGTH_CONSTRAINT,
+        HEIGHT_CONSTRAINT,
+    }
+    if not required_names <= set(positions):
+        raise RuntimeError("joint-niche warm source omitted a ranking constraint")
+
+    n2_main = _n1_6_secondary_main_turns(coordinates)
+    global_order = np.asarray(global_order, dtype=int)
+    if (
+        global_order.shape != (len(coordinates),)
+        or len(np.unique(global_order)) != len(coordinates)
+        or np.any(global_order < 0)
+        or np.any(global_order >= len(coordinates))
+    ):
+        raise RuntimeError("joint-niche global ranking is not a permutation")
+    global_rank = np.empty(len(global_order), dtype=int)
+    global_rank[global_order] = np.arange(len(global_order))
+    normalized_positive = np.maximum(staged_g, 0.0) / scales
+
+    def niche_order(indices: tuple[int, ...]) -> np.ndarray:
+        positive = normalized_positive[:, indices]
+        return np.lexsort((
+            objectives[:, 1],
+            objectives[:, 0],
+            global_rank,
+            positive.sum(axis=1),
+            positive.max(axis=1),
+            np.count_nonzero(positive > 0.0, axis=1),
+        ))
+
+    size_indices = tuple(
+        positions[name]
+        for name in (WIDTH_CONSTRAINT, LENGTH_CONSTRAINT, HEIGHT_CONSTRAINT)
+    )
+    width_positive = normalized_positive[:, positions[WIDTH_CONSTRAINT]]
+    size_positive = normalized_positive[:, size_indices]
+    orders = {
+        "llt_robust_joint": niche_order((
+            positions["Llt_robust_band"],
+            positions["Llt_ensemble_disagreement"],
+        )),
+        "core_center_top_joint": niche_order((
+            positions[core_center], positions[core_top]
+        )),
+        "rx_main_joint": niche_order((positions[rx_main],)),
+        "width_joint": np.lexsort((
+            objectives[:, 1],
+            objectives[:, 0],
+            global_rank,
+            size_positive.sum(axis=1),
+            size_positive.max(axis=1),
+            np.count_nonzero(size_positive > 0.0, axis=1),
+            width_positive,
+            width_positive > 0.0,
+        )),
+    }
+    required_source_stage = {
+        34: "final-1000-t100",
+        35: "close-1075-t107p5",
+        36: "close-1075-t107p5",
+        37: "close-1075-t107p5",
+        38: "close-1075-t107p5",
+        39: None,
+        60: "final-1000-t100",
+    }
+    source_stage_array = np.asarray(source_stage_ids, dtype=object)
+    selected: list[int] = []
+    protected: list[dict[str, Any]] = []
+    availability: dict[str, dict[str, int]] = {}
+
+    def choose(
+        candidates: list[int],
+        topology_selected: list[int],
+        *,
+        stage_id: str | None,
+    ) -> int:
+        stage_eligible = [
+            index for index in candidates
+            if stage_id is None or source_stage_array[index] == stage_id
+        ]
+        if not stage_eligible:
+            label = stage_id or "any"
+            raise RuntimeError(
+                f"joint-niche warm source omitted required {label} donor"
+            )
+        eligible = [index for index in stage_eligible if index not in selected]
+        for index in eligible:
+            row = coordinates[index]
+            if not topology_selected or min(
+                float(np.linalg.norm(row - coordinates[prior]))
+                for prior in topology_selected
+            ) >= minimum_distance:
+                return index
+        if eligible:
+            return eligible[0]
+        # One audited topology currently has only seven distinct source rows
+        # for eight protected slots.  Reusing a fully authenticated coordinate
+        # is explicit and preferable to silently dropping its joint niche;
+        # downstream current repair still replays every row.
+        return stage_eligible[0]
+
+    for target in required_topologies:
+        topology_selected: list[int] = []
+        availability[str(target)] = {}
+        stage_id = required_source_stage[target]
+        for niche in JOINT_NICHE_NAMES:
+            candidates = [
+                int(index)
+                for index in orders[niche]
+                if n2_main[int(index)] == target
+                and (
+                    target != 60
+                    or bool(np.all(staged_g[int(index), size_indices] <= 0.0))
+                )
+            ]
+            availability[str(target)][niche] = len(candidates)
+            if len(candidates) < JOINT_NICHE_COPIES_EACH:
+                side = 60 - target
+                raise RuntimeError(
+                    f"joint-niche warm source omitted required "
+                    f"{target}/{side}/{niche} donors"
+                )
+            for copy_index in range(JOINT_NICHE_COPIES_EACH):
+                source_requirement = stage_id if copy_index == 0 else None
+                index = choose(
+                    candidates,
+                    topology_selected,
+                    stage_id=source_requirement,
+                )
+                selected.append(index)
+                topology_selected.append(index)
+                protected.append({
+                    "source_row_index": index,
+                    "lane": niche,
+                    "N2_main": target,
+                    "N2_side": 60 - target,
+                    "required_source_stage_id": source_requirement,
+                })
+
+    if len(selected) != expected_count:
+        raise RuntimeError("joint-niche warm selection escaped its exact budget")
+    reused_source_row_count = len(selected) - len(set(selected))
+    selected_stage_counts = {
+        stage_id: sum(source_stage_ids[index] == stage_id for index in selected)
+        for stage_id in sorted(set(source_stage_ids))
+    }
+    required_stage_slot_counts = {
+        stage_id: sum(
+            item["required_source_stage_id"] == stage_id
+            for item in protected
+        )
+        for stage_id in JOINT_NICHE_SOURCE_MINIMUMS
+    }
+    if required_stage_slot_counts != JOINT_NICHE_SOURCE_MINIMUMS:
+        raise RuntimeError("joint-niche source quota slot contract drifted")
+    for stage_id, minimum in JOINT_NICHE_SOURCE_MINIMUMS.items():
+        if selected_stage_counts.get(stage_id, 0) < minimum:
+            raise RuntimeError(
+                f"joint-niche source quota underfilled for {stage_id}"
+            )
+    selected_niche_counts = {
+        niche: sum(item["lane"] == niche for item in protected)
+        for niche in JOINT_NICHE_NAMES
+    }
+    selected_topology_counts = {
+        str(target): sum(item["N2_main"] == target for item in protected)
+        for target in required_topologies
+    }
+    if (
+        set(selected_niche_counts.values()) != {14}
+        or set(selected_topology_counts.values()) != {8}
+    ):
+        raise RuntimeError("joint-niche warm balance contract mismatch")
+    audit = {
+        "schema_version": JOINT_NICHE_POOL_SCHEMA,
+        "required_topologies_N2_main": list(required_topologies),
+        "joint_niches": list(JOINT_NICHE_NAMES),
+        "copies_per_topology_niche": JOINT_NICHE_COPIES_EACH,
+        "source_available_counts": availability,
+        "protected_selection_count": len(protected),
+        "protected_selection_cap": expected_count,
+        "protected_selection": protected,
+        "unique_source_row_count": len(set(selected)),
+        "reused_source_row_count": reused_source_row_count,
+        "authenticated_source_row_reuse_allowed_only_after_unique_exhaustion": True,
+        "selected_niche_counts": selected_niche_counts,
+        "selected_topology_counts": selected_topology_counts,
+        "selected_source_stage_counts": selected_stage_counts,
+        "source_stage_minimum_counts": dict(JOINT_NICHE_SOURCE_MINIMUMS),
+        "required_source_stage_slot_counts": required_stage_slot_counts,
+        "joint_feasibility_ranking": (
+            "positive_constraint_count_then_max_normalized_positive_G_"
+            "then_sum_normalized_positive_G"
+        ),
+        "niche_feasibility_rankings": {
+            "llt_robust_joint": (
+                "positive_constraint_count_then_max_normalized_positive_G_"
+                "then_sum_normalized_positive_G"
+            ),
+            "core_center_top_joint": (
+                "positive_constraint_count_then_max_normalized_positive_G_"
+                "then_sum_normalized_positive_G"
+            ),
+            "rx_main_joint": (
+                "positive_constraint_count_then_max_normalized_positive_G_"
+                "then_sum_normalized_positive_G"
+            ),
+            "width_joint": (
+                "width_positive_state_then_width_normalized_positive_G_then_"
+                "size_positive_constraint_count_then_max_normalized_"
+                "positive_G_then_sum_normalized_positive_G"
+            ),
+        },
+        "ranking_constraint_scales": {
+            name: float(scale) for name, scale in zip(target_names, scales)
+        },
+        "max_normalized_positive_G_pressure": True,
+        "whole_authenticated_population_ranked": True,
+        "missing_required_topologies": [],
+        "coordinate_donors_only": True,
+        "prior_prediction_or_pass_classification_inherited": False,
+        "downstream_population": int(
+            topology["bounded_diversity_budget"]["population"]
+        ),
+        "downstream_protected_seed_count": expected_count,
+        "downstream_maximum_combined_authenticated_count": 160,
+        "downstream_maximum_standard_hard_feasible_count": 104,
+        "downstream_minimum_fresh_random_count": 160,
+        "additional_model_evaluations_during_selection": 0,
+        "physical_constraint_G_mutation": False,
+        "physical_objective_mutation": False,
+        "terminal_physical_replay_required": True,
+    }
+    audit["sha256"] = canonical_sha256(audit)
+    return selected, audit
+
+
 def _atomic_npy(path: Path, values: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_raw = tempfile.mkstemp(
@@ -534,6 +854,7 @@ def build_warm_pool(
     fixed_primary_turns: int | None = None,
     donor_index_paths: tuple[Path, ...] = (),
     basin_aware: bool = False,
+    joint_niche_aware: bool = False,
     standard_warm_start: Path | None = None,
     standard_warm_contract: Path | None = None,
 ) -> tuple[Path, Path]:
@@ -546,6 +867,14 @@ def build_warm_pool(
     fixed_turns = _fixed_primary_turns(island_prefix, fixed_primary_turns)
     if not isinstance(basin_aware, bool):
         raise ValueError("basin_aware must be boolean")
+    if not isinstance(joint_niche_aware, bool):
+        raise ValueError("joint_niche_aware must be boolean")
+    if joint_niche_aware and not basin_aware:
+        raise ValueError("joint-niche selection requires basin-aware mode")
+    if joint_niche_aware and int(pool_size) != BASIN_PROTECTED_SELECTION_CAP:
+        raise ValueError(
+            "joint-niche selection requires the exact 56-row donor budget"
+        )
     normalized_stage = validate_stage_spec(stage_spec)
     if bool(standard_warm_start) != bool(standard_warm_contract):
         raise ValueError(
@@ -605,6 +934,9 @@ def build_warm_pool(
     for source_index_rank, current_index_path in enumerate(index_paths):
         current_index, status, containment_root = _load_source(
             current_index_path
+        )
+        source_stage_id = str(
+            current_index.get("final_goal_stage_id") or ""
         )
         current_names = tuple(
             str(name) for name in status["constraint_names"]
@@ -682,6 +1014,7 @@ def build_warm_pool(
                     "island_id": str(terminal["island_id"]),
                     "terminal_population_index": row,
                     "source_index_rank": source_index_rank,
+                    "source_stage_id": source_stage_id,
                     "source_index_sha256": _sha256_file(current_index_path),
                     "source_result_sha256": result_sha256,
                 }
@@ -720,6 +1053,7 @@ def build_warm_pool(
             "sha256": _sha256_file(current_index_path),
             "snapshot_sha256": current_index.get("snapshot_sha256"),
             "bundle_id": current_index.get("bundle_id"),
+            "final_goal_stage_id": source_stage_id,
             "status": {
                 "path": str(Path(current_index["status"]["path"]).resolve()),
                 "sha256": str(current_index["status"]["sha256"]),
@@ -747,20 +1081,51 @@ def build_warm_pool(
     scales = _constraint_scales(target_names, normalized_stage)
     positive = np.maximum(staged_g, 0.0)
     violation_count = np.count_nonzero(staged_g > 0.0, axis=1)
-    normalized_sum = np.sum(positive / scales, axis=1)
-    order = np.lexsort((f_all[:, 1], f_all[:, 0], normalized_sum, violation_count))
+    normalized_positive = positive / scales
+    normalized_sum = np.sum(normalized_positive, axis=1)
+    normalized_max = np.max(normalized_positive, axis=1)
+    if joint_niche_aware:
+        # Chebyshev/minimax pressure prevents one very large hard-constraint
+        # miss from hiding behind a small aggregate CV.  Raw physical G and
+        # objectives remain untouched and are still replayed downstream.
+        order = np.lexsort((
+            f_all[:, 1],
+            f_all[:, 0],
+            normalized_sum,
+            normalized_max,
+            violation_count,
+        ))
+    else:
+        order = np.lexsort((
+            f_all[:, 1], f_all[:, 0], normalized_sum, violation_count
+        ))
     basin_selection = None
     if basin_aware:
-        selected, basin_selection = _basin_aware_indices(
-            x_all,
-            staged_g,
-            f_all,
-            target_names=target_names,
-            global_order=order,
-            pool_size=int(pool_size),
-            candidate_limit=min(int(candidate_limit), len(x_all)),
-            minimum_distance=float(minimum_distance),
-        )
+        if joint_niche_aware:
+            selected, basin_selection = _joint_niche_indices(
+                x_all,
+                staged_g,
+                f_all,
+                target_names=target_names,
+                constraint_scales=scales,
+                global_order=order,
+                source_stage_ids=tuple(
+                    str(item["source_stage_id"]) for item in metadata
+                ),
+                pool_size=int(pool_size),
+                minimum_distance=float(minimum_distance),
+            )
+        else:
+            selected, basin_selection = _basin_aware_indices(
+                x_all,
+                staged_g,
+                f_all,
+                target_names=target_names,
+                global_order=order,
+                pool_size=int(pool_size),
+                candidate_limit=min(int(candidate_limit), len(x_all)),
+                minimum_distance=float(minimum_distance),
+            )
         for item in basin_selection["protected_selection"]:
             source = metadata[int(item["source_row_index"])]
             result_sha = str(source.get("source_result_sha256") or "")
@@ -775,6 +1140,7 @@ def build_warm_pool(
                     source["terminal_population_index"]
                 ),
                 "source_index_rank": int(source["source_index_rank"]),
+                "source_stage_id": str(source["source_stage_id"]),
                 "source_index_sha256": str(source["source_index_sha256"]),
                 "source_result_sha256": result_sha,
             })
@@ -799,14 +1165,29 @@ def build_warm_pool(
     else:
         selected_x = basin_selected_x
     if basin_selection is not None:
-        basin_positions = {
-            int(source_index): standard_count + basin_rank
-            for basin_rank, source_index in enumerate(selected)
-        }
-        for item in basin_selection["protected_selection"]:
-            item["artifact_row_index"] = basin_positions[
-                int(item["source_row_index"])
-            ]
+        if joint_niche_aware:
+            protected = basin_selection["protected_selection"]
+            if len(protected) != len(selected):
+                raise RuntimeError(
+                    "joint-niche protected artifact mapping mismatch"
+                )
+            for basin_rank, (item, source_index) in enumerate(
+                zip(protected, selected)
+            ):
+                if int(item["source_row_index"]) != int(source_index):
+                    raise RuntimeError(
+                        "joint-niche protected selection order drifted"
+                    )
+                item["artifact_row_index"] = standard_count + basin_rank
+        else:
+            basin_positions = {
+                int(source_index): standard_count + basin_rank
+                for basin_rank, source_index in enumerate(selected)
+            }
+            for item in basin_selection["protected_selection"]:
+                item["artifact_row_index"] = basin_positions[
+                    int(item["source_row_index"])
+                ]
         basin_selection.pop("sha256", None)
         basin_selection["sha256"] = canonical_sha256(basin_selection)
     output_dir = output_dir.resolve()
@@ -826,6 +1207,7 @@ def build_warm_pool(
                 "artifact_row_index": standard_count + rank,
                 **metadata[index],
                 "positive_constraint_count": int(violation_count[index]),
+                "max_normalized_positive_G": float(normalized_max[index]),
                 "normalized_positive_G_sum": float(normalized_sum[index]),
                 "objective_volume_L": float(f_all[index, 0]),
                 "objective_total_loss_W": float(f_all[index, 1]),
@@ -955,6 +1337,11 @@ def build_warm_pool(
             name: float(scale) for name, scale in zip(target_names, scales)
         },
         "ranking": (
+            "positive_constraint_count_then_max_positive_physical_G_over_"
+            "sealed_scale_then_sum_positive_physical_G_over_sealed_scale_"
+            "then_volume_then_loss"
+            if joint_niche_aware
+            else
             "positive_constraint_count_then_sum_positive_physical_G_over_"
             "sealed_scale_then_volume_then_loss"
         ),
@@ -970,6 +1357,7 @@ def build_warm_pool(
         "candidate_limit": min(int(candidate_limit), len(x_all)),
         "minimum_coordinate_l2_distance": float(minimum_distance),
         "basin_aware_selection": basin_selection,
+        "joint_niche_aware_selection": joint_niche_aware,
         "standard_warm_source": standard_warm_source,
         "selection": selected_records,
         "coordinate_artifact": {
@@ -1146,6 +1534,7 @@ def main(argv: list[str] | None = None) -> int:
         help="additional authenticated stage index (repeatable)",
     )
     parser.add_argument("--basin-aware", action="store_true")
+    parser.add_argument("--joint-niche-aware", action="store_true")
     parser.add_argument("--standard-warm-start", type=Path)
     parser.add_argument("--standard-warm-contract", type=Path)
     args = parser.parse_args(argv)
@@ -1171,6 +1560,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             or bool(args.donor_index)
             or args.basin_aware
+            or args.joint_niche_aware
         ):
             parser.error(
                 "contract upgrade requires the three --upgrade-* paths and "
@@ -1211,6 +1601,7 @@ def main(argv: list[str] | None = None) -> int:
         fixed_primary_turns=args.fixed_primary_turns,
         donor_index_paths=tuple(args.donor_index),
         basin_aware=args.basin_aware,
+        joint_niche_aware=args.joint_niche_aware,
         standard_warm_start=args.standard_warm_start,
         standard_warm_contract=args.standard_warm_contract,
     )

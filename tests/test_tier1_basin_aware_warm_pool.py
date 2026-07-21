@@ -8,6 +8,12 @@ from tools import tier1_deep_crossover_contract as contract
 from tools.tier1_corrected_generation_preflight import (
     seed_turn_split_sub_islands,
     select_basin_warm_start_indices,
+    stage_constraint_names,
+)
+from tools.tier1_final1000_stage_profiles import BASE_HARD_SPEC
+from tools.tier1_final1000_warm_pool import (
+    _constraint_scales,
+    _joint_niche_indices,
 )
 
 
@@ -29,6 +35,141 @@ class _RepairOnlyProblem:
     def repair_unit_coordinates(self, values):
         self.repair_calls += 1
         return np.clip(np.asarray(values, dtype=float), 0.0, 1.0)
+
+
+def _joint_niche_fixture():
+    names = tuple(stage_constraint_names(
+        BASE_HARD_SPEC
+    ))
+    topologies = (34, 35, 36, 37, 38, 39, 60)
+    rng = np.random.default_rng(71)
+    values = rng.random((len(topologies) * 12, 25))
+    constraints = np.zeros((len(values), len(names)), dtype=float)
+    objectives = rng.random((len(values), 2))
+    stages = []
+    for topology_index, topology in enumerate(topologies):
+        start = topology_index * 12
+        stop = start + 12
+        values[start:stop, 2] = _coordinate(topology)
+        constraints[start:stop, names.index("Llt_robust_band")] = np.linspace(
+            -0.2, 0.4, 12
+        )
+        constraints[
+            start:stop,
+            names.index("Llt_ensemble_disagreement"),
+        ] = np.linspace(0.3, -0.3, 12)
+        constraints[
+            start:stop,
+            names.index(
+                "temperature_robust_limit:Tprobe_core_center_max"
+            ),
+        ] = np.linspace(-5.0, 8.0, 12)
+        constraints[
+            start:stop,
+            names.index(
+                "temperature_robust_limit:Tprobe_core_top_yoke_max"
+            ),
+        ] = np.linspace(8.0, -5.0, 12)
+        constraints[
+            start:stop,
+            names.index(
+                "temperature_robust_limit:Tprobe_Rx_main_leeward_max"
+            ),
+        ] = np.linspace(-4.0, 7.0, 12)
+        for size_name in (
+            "exterior_width_limit",
+            "exterior_length_limit",
+            "exterior_height_limit",
+        ):
+            constraints[start:stop, names.index(size_name)] = -1.0
+        if topology in (34, 60):
+            stages.extend(["final-1000-t100"] * 8 + ["bridge"] * 4)
+        elif topology in (35, 36, 37, 38):
+            stages.extend(["close-1075-t107p5"] * 8 + ["bridge"] * 4)
+        else:
+            stages.extend(["bridge"] * 12)
+    global_order = np.arange(len(values), dtype=int)
+    return values, constraints, objectives, names, tuple(stages), global_order
+
+
+def test_joint_niche_selector_preserves_exact_balanced_budget_and_stage_quotas():
+    fixture = _joint_niche_fixture()
+    values, constraints, objectives, names, stages, global_order = fixture
+    source_values = values.copy()
+    source_constraints = constraints.copy()
+    selected, audit = _joint_niche_indices(
+        values,
+        constraints,
+        objectives,
+        target_names=names,
+        constraint_scales=_constraint_scales(names, BASE_HARD_SPEC),
+        global_order=global_order,
+        source_stage_ids=stages,
+        pool_size=56,
+        minimum_distance=0.0,
+    )
+    repeated, repeated_audit = _joint_niche_indices(
+        values.copy(),
+        constraints.copy(),
+        objectives.copy(),
+        target_names=names,
+        constraint_scales=_constraint_scales(names, BASE_HARD_SPEC),
+        global_order=global_order.copy(),
+        source_stage_ids=stages,
+        pool_size=56,
+        minimum_distance=0.0,
+    )
+
+    assert selected == repeated
+    assert audit == repeated_audit
+    assert len(selected) == len(set(selected)) == 56
+    assert set(audit["selected_niche_counts"].values()) == {14}
+    assert set(audit["selected_topology_counts"].values()) == {8}
+    assert audit["selected_source_stage_counts"]["final-1000-t100"] >= 8
+    assert audit["selected_source_stage_counts"]["close-1075-t107p5"] >= 16
+    assert audit["required_source_stage_slot_counts"] == {
+        "final-1000-t100": 8,
+        "close-1075-t107p5": 16,
+    }
+    assert audit["max_normalized_positive_G_pressure"] is True
+    assert audit["physical_constraint_G_mutation"] is False
+    assert audit["physical_objective_mutation"] is False
+    np.testing.assert_array_equal(values, source_values)
+    np.testing.assert_array_equal(constraints, source_constraints)
+
+
+def test_joint_niche_selector_uses_minimax_before_normalized_sum():
+    fixture = _joint_niche_fixture()
+    values, constraints, objectives, names, stages, global_order = fixture
+    start = 5 * 12  # N2_main=39 has no source-stage preference.
+    llt = names.index("Llt_robust_band")
+    disagreement = names.index("Llt_ensemble_disagreement")
+    constraints[start : start + 12, llt] = 2.0
+    constraints[start : start + 12, disagreement] = 2.0
+    # Both rows violate two constraints.  Row A has the larger sum but the
+    # smaller worst normalized miss, so Chebyshev/minimax must rank A first.
+    constraints[start, [llt, disagreement]] = [0.44, 0.44]
+    constraints[start + 1, [llt, disagreement]] = [0.495, 0.055]
+
+    selected, audit = _joint_niche_indices(
+        values,
+        constraints,
+        objectives,
+        target_names=names,
+        constraint_scales=_constraint_scales(names, BASE_HARD_SPEC),
+        global_order=global_order,
+        source_stage_ids=stages,
+        pool_size=56,
+        minimum_distance=0.0,
+    )
+
+    llt_39 = [
+        item["source_row_index"]
+        for item in audit["protected_selection"]
+        if item["N2_main"] == 39 and item["lane"] == "llt_robust_joint"
+    ]
+    assert llt_39 == [start, start + 1]
+    assert selected[40:42] == llt_39
 
 
 def test_rare_basin_warm_topologies_are_never_lost_by_half_pool_sampling():

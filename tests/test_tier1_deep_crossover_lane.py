@@ -234,10 +234,19 @@ def test_turn_split_contract_has_real_pairing_migration_and_epsilon_survival(
     assert value["migration"]["period_generations"] == 5
     assert value["migration"]["migrants_per_event"] == len(topologies)
     assert value["survival"] == {
-        "kind": "normalized_positive_G_sum_epsilon_then_rank_crowding",
+        "kind": (
+            "per_constraint_normalized_positive_G_epsilon_then_"
+            "positive_count_max_sum_then_rank_crowding"
+        ),
         "initial_epsilon": 20.0,
         "decay_to_zero_generation": 160,
         "terminal_epsilon": 0.0,
+        "infeasible_order": (
+            "positive_constraint_count_then_max_normalized_positive_G_"
+            "then_sum_normalized_positive_G"
+        ),
+        "physical_G_mutation": False,
+        "objective_mutation": False,
         "minimum_survivors_per_turn_split_sub_island": minimum_each,
     }
     budget = value["bounded_diversity_budget"]

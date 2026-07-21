@@ -357,6 +357,7 @@ def _basin_fixture(
     seed: int,
     topologies: list[int],
     result_seed: int | None = None,
+    stage_id: str | None = None,
 ) -> Path:
     root = tmp_path / name
     cache = root / "cache"
@@ -421,9 +422,84 @@ def _basin_fixture(
         "snapshot_sha256": f"{seed % 16:x}" * 64,
         "status": {"path": str(status_path), "sha256": _sha(status_path)},
     }
+    if stage_id is not None:
+        index["final_goal_stage_id"] = stage_id
     index_path = canonical / "current7-index.json"
     index_path.write_text(json.dumps(index), encoding="utf-8")
     return index_path
+
+
+def test_joint_niche_pool_uses_exact_downstream_budget_and_stage_minimums(
+    tmp_path: Path,
+):
+    standard_artifact, standard_contract = _standard_warm_handoff(tmp_path)
+    final = _basin_fixture(
+        tmp_path,
+        name="joint-final",
+        seed=81,
+        topologies=[34] * 12 + [60] * 12,
+        stage_id="final-1000-t100",
+    )
+    close = _basin_fixture(
+        tmp_path,
+        name="joint-close",
+        seed=82,
+        topologies=(
+            [35] * 12 + [36] * 12 + [37] * 12 + [38] * 12
+        ),
+        stage_id="close-1075-t107p5",
+    )
+    bridge = _basin_fixture(
+        tmp_path,
+        name="joint-bridge",
+        seed=83,
+        topologies=[39] * 12,
+        stage_id="bridge-1150-t115",
+    )
+
+    coordinates, contract_path = build_warm_pool(
+        index_path=final,
+        donor_index_paths=(bridge, close),
+        basin_aware=True,
+        joint_niche_aware=True,
+        stage_spec=_stage(),
+        output_dir=tmp_path / "joint-out",
+        pool_size=56,
+        candidate_limit=84,
+        minimum_distance=0.0,
+        standard_warm_start=standard_artifact,
+        standard_warm_contract=standard_contract,
+    )
+
+    values = np.load(coordinates, allow_pickle=False)
+    payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    audit = payload["basin_aware_selection"]
+    assert values.shape == (60, 25)
+    assert payload["joint_niche_aware_selection"] is True
+    assert audit["protected_selection_count"] == 56
+    assert set(audit["selected_niche_counts"].values()) == {14}
+    assert set(audit["selected_topology_counts"].values()) == {8}
+    assert audit["selected_source_stage_counts"]["final-1000-t100"] >= 8
+    assert audit["selected_source_stage_counts"]["close-1075-t107p5"] >= 16
+    assert audit["required_source_stage_slot_counts"] == {
+        "final-1000-t100": 8,
+        "close-1075-t107p5": 16,
+    }
+    assert audit["joint_feasibility_ranking"].startswith(
+        "positive_constraint_count_then_max"
+    )
+    assert payload["ranking"].startswith(
+        "positive_constraint_count_then_max"
+    )
+    assert all(
+        item["source_stage_id"]
+        in {
+            "final-1000-t100",
+            "close-1075-t107p5",
+            "bridge-1150-t115",
+        }
+        for item in audit["protected_selection"]
+    )
 
 
 def test_basin_pool_combines_indexes_and_seals_actual_source_result_provenance(

@@ -2058,16 +2058,27 @@ def _deep_topology_components(
             coordinate_index=coordinate_index,
         )
 
-    def individual_score(individual) -> tuple[float, float, float]:
+    def individual_score(
+        individual,
+    ) -> tuple[float, int, float, float, float]:
         rank = individual.get("rank")
         crowding = individual.get("crowding")
         constraints = np.asarray(individual.get("G"), dtype=float)
-        positive_g = float(np.maximum(constraints, 0.0).sum())
+        positive_g = np.maximum(constraints, 0.0)
+        positive_count = int(np.count_nonzero(positive_g > 0.0))
+        positive_max = float(positive_g.max())
+        positive_sum = float(positive_g.sum())
         rank_value = float(rank) if rank is not None else math.inf
         crowding_value = (
             float(crowding) if crowding is not None else -math.inf
         )
-        return (rank_value, positive_g, -crowding_value)
+        return (
+            rank_value,
+            positive_count,
+            positive_max,
+            positive_sum,
+            -crowding_value,
+        )
 
     class TurnSplitPairedSelection(Selection):
         def __init__(self):
@@ -2182,9 +2193,15 @@ def _deep_topology_components(
             )
             epsilon = initial_epsilon * fraction * fraction
             constraints = np.asarray(pop.get("G"), dtype=float)
-            positive_sum = np.maximum(constraints, 0.0).sum(axis=1)
-            epsilon_feasible = np.flatnonzero(positive_sum <= epsilon)
-            epsilon_infeasible = np.flatnonzero(positive_sum > epsilon)
+            positive_g = np.maximum(constraints, 0.0)
+            epsilon_excess = np.maximum(positive_g - epsilon, 0.0)
+            positive_count = np.count_nonzero(
+                epsilon_excess > 0.0, axis=1
+            )
+            positive_max = epsilon_excess.max(axis=1)
+            positive_sum = epsilon_excess.sum(axis=1)
+            epsilon_feasible = np.flatnonzero(positive_count == 0)
+            epsilon_infeasible = np.flatnonzero(positive_count > 0)
             global_order = []
             if len(epsilon_feasible):
                 ranked = self.ranking._do(
@@ -2194,13 +2211,18 @@ def _deep_topology_components(
                 )
                 identity = {id(individual): index for index, individual in enumerate(pop)}
                 global_order.extend(identity[id(individual)] for individual in ranked)
+            infeasible_order = np.lexsort((
+                positive_sum[epsilon_infeasible],
+                positive_max[epsilon_infeasible],
+                positive_count[epsilon_infeasible],
+            ))
             for rank_offset, index in enumerate(
-                epsilon_infeasible[np.argsort(
-                    positive_sum[epsilon_infeasible], kind="stable",
-                )]
+                epsilon_infeasible[infeasible_order]
             ):
                 pop[int(index)].set("rank", len(global_order) + rank_offset)
-                pop[int(index)].set("crowding", -float(positive_sum[int(index)]))
+                pop[int(index)].set(
+                    "crowding", -float(positive_max[int(index)])
+                )
                 global_order.append(int(index))
             observed = topology_values(pop)
             selected = []
