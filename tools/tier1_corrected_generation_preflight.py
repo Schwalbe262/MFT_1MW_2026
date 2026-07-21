@@ -81,6 +81,7 @@ FIXED_GENERATION_TERMINATION_STRATEGY = "fixed-n-gen-no-ftol-v1"
 PRODUCTION_FIXED_GENERATIONS = 300
 PRODUCTION_POPULATION = 320
 PRODUCTION_INFERENCE_THREADS = 8
+DETERMINISTIC_TERMINAL_INFERENCE_THREADS = 1
 REMOTE_PREFLIGHT_SCHEMA = "mft-tier1-current7-remote-model-load-v1"
 SEARCH_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 WARM_ROLE_PARTITION_SCHEMA = "mft-tier1-authenticated-warm-role-partition-v1"
@@ -2734,6 +2735,59 @@ def validate_warm_role_partition(
     return value
 
 
+def _terminal_inference_binding_contract(
+    binding: Mapping[str, Any],
+) -> tuple[bool, int]:
+    """Reject partial thread bindings while allowing empty unit-test runners."""
+
+    if not isinstance(binding, Mapping):
+        raise RuntimeError("terminal replay inference binding must be a mapping")
+    if not binding:
+        return False, DETERMINISTIC_TERMINAL_INFERENCE_THREADS
+    required = {
+        "threads_per_model",
+        "target_count",
+        "model_count",
+        "families",
+        "policy",
+    }
+    if not required.issubset(binding):
+        raise RuntimeError("terminal replay inference binding is partial")
+    threads = binding.get("threads_per_model")
+    target_count = binding.get("target_count")
+    model_count = binding.get("model_count")
+    families = binding.get("families")
+    policy = binding.get("policy")
+    expected_policy = (
+        "outer_restart_parallelism_inner_model_serial_v1"
+        if isinstance(threads, int) and threads <= 4
+        else "single_optimizer_process_eight_cpu_supported_family_binding_v1"
+    )
+    supported_families = {
+        "lightgbm",
+        "xgboost",
+        "catboost",
+        "extratrees",
+    }
+    if (
+        isinstance(threads, bool)
+        or not isinstance(threads, int)
+        or not 1 <= threads <= PRODUCTION_INFERENCE_THREADS
+        or isinstance(target_count, bool)
+        or target_count != len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or isinstance(model_count, bool)
+        or not isinstance(model_count, int)
+        or model_count < target_count
+        or not isinstance(families, list)
+        or not families
+        or families != sorted(set(families))
+        or not set(families).issubset(supported_families)
+        or policy != expected_policy
+    ):
+        raise RuntimeError("terminal replay inference binding contract mismatch")
+    return True, int(threads)
+
+
 @dataclass
 class Current7Tier1Runner:
     authenticated: Any
@@ -2960,6 +3014,7 @@ class Current7Tier1Runner:
         *,
         expected_f: Any | None = None,
         expected_g: Any | None = None,
+        terminal_population: Any | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         import numpy as np
 
@@ -2968,14 +3023,59 @@ class Current7Tier1Runner:
         )
         if not np.array_equal(repaired, np.asarray(coordinates, dtype=float)):
             raise RuntimeError("terminal population was not already repaired")
-        replay = self.evaluate_coordinates(repaired, physical=True)
+
+        managed_binding, optimizer_threads = _terminal_inference_binding_contract(
+            self.inference_binding
+        )
+        optimizer_binding = None
+        serial_binding = {
+            "threads_per_model": DETERMINISTIC_TERMINAL_INFERENCE_THREADS,
+            "policy": "implicit_serial_unmanaged_test_runner_v1",
+        }
+        restored_binding = None
+        if managed_binding:
+            optimizer_binding = bind_surrogate_inference(
+                self.models,
+                self.modules.run_nsga2,
+                threads=optimizer_threads,
+            )
+            if optimizer_binding != self.inference_binding:
+                raise RuntimeError("optimizer inference binding attestation drifted")
+        try:
+            if managed_binding:
+                serial_binding = bind_surrogate_inference(
+                    self.models,
+                    self.modules.run_nsga2,
+                    threads=DETERMINISTIC_TERMINAL_INFERENCE_THREADS,
+                )
+            deterministic_optimizer = self.evaluate_coordinates(
+                repaired, physical=False
+            )
+            replay = self.evaluate_coordinates(repaired, physical=True)
+            terminal_predictions = None
+            if tuple(self.models) == CURRENT_REQUIRED_MODEL_TARGETS:
+                terminal_predictions = _terminal_model_predictions(
+                    self.models, replay["frame"]
+                )
+        finally:
+            if managed_binding:
+                restored_binding = bind_surrogate_inference(
+                    self.models,
+                    self.modules.run_nsga2,
+                    threads=optimizer_threads,
+                )
+                if restored_binding != self.inference_binding:
+                    raise RuntimeError(
+                        "optimizer inference binding was not restored after terminal replay"
+                    )
+
         objectives = np.asarray(replay["F"], dtype=float)
         constraints = np.asarray(replay["G"], dtype=float)
-        f_match = expected_f is None or np.allclose(
-            objectives,
-            np.asarray(expected_f, dtype=float),
-            rtol=0.0,
-            atol=1e-10,
+        deterministic_objectives = np.asarray(
+            deterministic_optimizer["F"], dtype=float
+        )
+        deterministic_constraints = np.asarray(
+            deterministic_optimizer["G"], dtype=float
         )
         optimizer_constraints = constraints
         if self.optimizer_scaling is not None:
@@ -2984,14 +3084,117 @@ class Current7Tier1Runner:
                 self.optimizer_scaling["allowance_vector"], dtype=float
             )
             optimizer_constraints = (constraints - allowances) / scales
-        g_match = expected_g is None or np.allclose(
-            optimizer_constraints,
-            np.asarray(expected_g, dtype=float),
-            rtol=0.0,
-            atol=1e-10,
+
+        f_match = np.array_equal(objectives, deterministic_objectives)
+        g_match = np.array_equal(
+            optimizer_constraints, deterministic_constraints
         )
         if not f_match or not g_match:
-            raise RuntimeError("terminal physical replay differs from optimizer state")
+            raise RuntimeError(
+                "deterministic serial terminal replay differs from optimizer-side replay"
+            )
+
+        expected_objectives = None
+        expected_constraints = None
+        if expected_f is not None:
+            expected_objectives = np.asarray(expected_f, dtype=float)
+            if (
+                expected_objectives.shape != objectives.shape
+                or not np.isfinite(expected_objectives).all()
+            ):
+                raise RuntimeError("terminal optimizer objective snapshot is invalid")
+        if expected_g is not None:
+            expected_constraints = np.asarray(expected_g, dtype=float)
+            if (
+                expected_constraints.shape != optimizer_constraints.shape
+                or not np.isfinite(expected_constraints).all()
+            ):
+                raise RuntimeError("terminal optimizer G snapshot is invalid")
+        snapshot_f_exact = expected_objectives is None or np.array_equal(
+            expected_objectives, objectives
+        )
+        snapshot_g_exact = expected_constraints is None or np.array_equal(
+            expected_constraints, optimizer_constraints
+        )
+        if optimizer_threads == DETERMINISTIC_TERMINAL_INFERENCE_THREADS and (
+            not snapshot_f_exact or not snapshot_g_exact
+        ):
+            raise RuntimeError(
+                "serial optimizer snapshot differs from deterministic terminal replay"
+            )
+
+        snapshot_f_delta = (
+            None
+            if expected_objectives is None
+            else float(np.max(np.abs(expected_objectives - objectives), initial=0.0))
+        )
+        snapshot_g_delta = (
+            None
+            if expected_constraints is None
+            else float(
+                np.max(
+                    np.abs(expected_constraints - optimizer_constraints),
+                    initial=0.0,
+                )
+            )
+        )
+        snapshot_feasibility_match = (
+            expected_constraints is None
+            or np.array_equal(
+                expected_constraints <= 0.0,
+                optimizer_constraints <= 0.0,
+            )
+        )
+
+        population_canonicalized = False
+        canonical_cv_sha256 = None
+        if terminal_population is not None:
+            if not callable(getattr(terminal_population, "get", None)) or not callable(
+                getattr(terminal_population, "set", None)
+            ):
+                raise RuntimeError("terminal population cannot be canonicalized")
+            population_x = np.asarray(terminal_population.get("X"), dtype=float)
+            if not np.array_equal(population_x, repaired):
+                raise RuntimeError(
+                    "terminal population coordinates differ from deterministic replay"
+                )
+            terminal_population.set("F", objectives)
+            terminal_population.set("G", optimizer_constraints)
+            terminal_population.set("CV", None)
+            canonical_cv = np.asarray(terminal_population.get("CV"), dtype=float)
+            if not np.array_equal(
+                np.asarray(terminal_population.get("F"), dtype=float), objectives
+            ) or not np.array_equal(
+                np.asarray(terminal_population.get("G"), dtype=float),
+                optimizer_constraints,
+            ) or (
+                canonical_cv.shape != (len(repaired), 1)
+                or not np.isfinite(canonical_cv).all()
+                or not np.array_equal(
+                    np.asarray(terminal_population.get("CV"), dtype=float),
+                    canonical_cv,
+                )
+            ):
+                raise RuntimeError(
+                    "terminal population canonicalization attestation failed"
+                )
+            canonical_cv_sha256 = canonical_sha256(canonical_cv.tolist())
+            population_canonicalized = True
+
+        replay["optimizer_G"] = optimizer_constraints
+        terminal_prediction_sha256 = None
+        if terminal_predictions is not None:
+            replay["terminal_model_predictions"] = terminal_predictions
+            terminal_prediction_sha256 = canonical_sha256(
+                _canonical_terminal_prediction_payload(
+                    terminal_predictions,
+                    population_size=len(repaired),
+                )
+            )
+        replay["terminal_model_predictions_serially_replayed"] = (
+            terminal_predictions is not None
+        )
+        replay["terminal_model_predictions_sha256"] = terminal_prediction_sha256
         budget_passed = []
         for index in range(len(replay["frame"])):
             if not replay["decoder_valid"][index]:
@@ -3007,6 +3210,73 @@ class Current7Tier1Runner:
             )
         if not all(budget_passed):
             raise RuntimeError("terminal winding-budget identity failed")
+        deterministic_replay = {
+            "schema_version": "mft-tier1-deterministic-terminal-inference-v1",
+            "optimizer_inference_threads": optimizer_threads,
+            "terminal_replay_inference_threads": (
+                DETERMINISTIC_TERMINAL_INFERENCE_THREADS
+            ),
+            "managed_inference_binding": managed_binding,
+            "optimizer_binding": optimizer_binding,
+            "serial_binding": serial_binding,
+            "restored_binding": restored_binding,
+            "optimizer_binding_restored": (
+                not managed_binding or restored_binding == self.inference_binding
+            ),
+            "optimizer_side_objective_sha256": canonical_sha256(
+                deterministic_objectives.tolist()
+            ),
+            "optimizer_side_G_sha256": canonical_sha256(
+                deterministic_constraints.tolist()
+            ),
+            "physical_replay_objective_sha256": canonical_sha256(
+                objectives.tolist()
+            ),
+            "physical_replay_optimizer_G_sha256": canonical_sha256(
+                optimizer_constraints.tolist()
+            ),
+            "terminal_model_predictions_sha256": terminal_prediction_sha256,
+            "terminal_model_predictions_serially_replayed": (
+                terminal_predictions is not None
+            ),
+            "objectives_bit_exact": bool(f_match),
+            "optimizer_G_bit_exact": bool(g_match),
+            "numeric_tolerance_relaxed": False,
+            "comparison_rtol": 0.0,
+            "comparison_atol": 0.0,
+        }
+        deterministic_replay["sha256"] = canonical_sha256(deterministic_replay)
+        optimizer_snapshot = {
+            "schema_version": "mft-tier1-multithread-optimizer-snapshot-v1",
+            "provided_objectives": expected_objectives is not None,
+            "provided_G": expected_constraints is not None,
+            "objective_sha256": (
+                None
+                if expected_objectives is None
+                else canonical_sha256(expected_objectives.tolist())
+            ),
+            "optimizer_G_sha256": (
+                None
+                if expected_constraints is None
+                else canonical_sha256(expected_constraints.tolist())
+            ),
+            "objectives_bit_exact_to_serial_authority": bool(snapshot_f_exact),
+            "optimizer_G_bit_exact_to_serial_authority": bool(snapshot_g_exact),
+            "maximum_absolute_objective_delta": snapshot_f_delta,
+            "maximum_absolute_optimizer_G_delta": snapshot_g_delta,
+            "constraint_feasibility_classification_match": bool(
+                snapshot_feasibility_match
+            ),
+            "numeric_comparison_used_as_terminal_gate": False,
+            "canonicalized_from_serial_authority": population_canonicalized,
+            "canonical_constraint_violation_sha256": canonical_cv_sha256,
+            "stale_constraint_violation_cache_cleared": population_canonicalized,
+            "trajectory_rank_or_crowding_used_for_persistence": False,
+            "terminal_pareto_recomputed_from_canonical_F_G": (
+                population_canonicalized
+            ),
+        }
+        optimizer_snapshot["sha256"] = canonical_sha256(optimizer_snapshot)
         evidence = {
             "schema_version": "mft-tier1-current7-terminal-replay-v1",
             "coordinate_count": int(len(repaired)),
@@ -3020,6 +3290,13 @@ class Current7Tier1Runner:
             ),
             "optimizer_objectives_match": bool(f_match),
             "optimizer_physical_G_match": bool(g_match),
+            "comparison_basis": (
+                "deterministic_serial_optimizer_side_vs_serial_physical_replay"
+            ),
+            "deterministic_terminal_inference": deterministic_replay,
+            "multithread_optimizer_snapshot": optimizer_snapshot,
+            "terminal_population_canonicalized": population_canonicalized,
+            "authoritative_terminal_state": "deterministic_serial_physical_replay",
             "all_winding_budget_identities_passed": True,
             "fixed_primary_turns": self.problem.fixed_primary_turns,
         }
@@ -3293,7 +3570,10 @@ class Current7Tier1Runner:
             terminal_x,
             expected_f=terminal_f,
             expected_g=terminal_g,
+            terminal_population=terminal,
         )
+        if terminal_audit.get("terminal_population_canonicalized") is not True:
+            raise RuntimeError("terminal population was not canonicalized")
         executed_repair = getattr(result.algorithm, "repair", None)
         if not callable(getattr(executed_repair, "evidence", None)):
             raise RuntimeError("executed optimizer lost the physics repair operator")
@@ -4281,6 +4561,51 @@ def _terminal_model_predictions(
     return predictions
 
 
+def _canonical_terminal_prediction_payload(
+    predictions: Mapping[str, Mapping[str, Any]],
+    *,
+    population_size: int,
+) -> dict[str, dict[str, list[float]]]:
+    """Validate and serialize the in-memory deterministic prediction snapshot."""
+
+    import numpy as np
+
+    count = int(population_size)
+    if count < 1 or not isinstance(predictions, Mapping):
+        raise RuntimeError("terminal prediction snapshot is invalid")
+    if tuple(predictions) != CURRENT_REQUIRED_MODEL_TARGETS:
+        raise RuntimeError("terminal prediction snapshot target order/set mismatch")
+    payload: dict[str, dict[str, list[float]]] = {}
+    for target in CURRENT_REQUIRED_MODEL_TARGETS:
+        prediction = predictions[target]
+        if not isinstance(prediction, Mapping) or set(prediction) != {
+            "mean",
+            "q90_conformal_half_width",
+        }:
+            raise RuntimeError(
+                f"terminal prediction snapshot schema mismatch: {target}"
+            )
+        mean = np.asarray(prediction["mean"], dtype=float).reshape(-1)
+        half_width = np.asarray(
+            prediction["q90_conformal_half_width"], dtype=float
+        ).reshape(-1)
+        if (
+            mean.shape != (count,)
+            or half_width.shape != (count,)
+            or not np.isfinite(mean).all()
+            or not np.isfinite(half_width).all()
+            or np.any(half_width < 0.0)
+        ):
+            raise RuntimeError(
+                f"terminal prediction snapshot values are invalid: {target}"
+            )
+        payload[target] = {
+            "mean": mean.tolist(),
+            "q90_conformal_half_width": half_width.tolist(),
+        }
+    return payload
+
+
 def _terminal_surrogate_physicality_gate(
     predictions: Mapping[str, Mapping[str, Any]],
     *,
@@ -4796,7 +5121,39 @@ def persist_search_outputs(
         or not np.isfinite(physical_g).all()
     ):
         raise RuntimeError("terminal persistence arrays are invalid")
-    predictions = _terminal_model_predictions(runner.models, frame)
+    predictions = replay.get("terminal_model_predictions")
+    serial_predictions = replay.get(
+        "terminal_model_predictions_serially_replayed"
+    )
+    if serial_predictions is True:
+        replay_objectives = np.asarray(replay.get("F"), dtype=float)
+        replay_optimizer_g = np.asarray(replay.get("optimizer_G"), dtype=float)
+        if not np.array_equal(
+            terminal_f, replay_objectives
+        ) or not np.array_equal(optimizer_g, replay_optimizer_g):
+            raise RuntimeError(
+                "terminal population differs from deterministic replay authority"
+            )
+        if predictions is None:
+            raise RuntimeError(
+                "deterministic terminal prediction snapshot is missing"
+            )
+        prediction_payload = _canonical_terminal_prediction_payload(
+            predictions,
+            population_size=len(terminal_x),
+        )
+        if replay.get("terminal_model_predictions_sha256") != canonical_sha256(
+            prediction_payload
+        ):
+            raise RuntimeError(
+                "deterministic terminal prediction snapshot SHA mismatch"
+            )
+    elif serial_predictions is False:
+        raise RuntimeError(
+            "canonical terminal replay omitted serial model predictions"
+        )
+    elif predictions is None:
+        predictions = _terminal_model_predictions(runner.models, frame)
     surrogate_physical_valid, surrogate_physicality = (
         _terminal_surrogate_physicality_gate(
             predictions,
@@ -5918,6 +6275,12 @@ def run_search_seed(
     topology_audit = result.tier1_topology_evolution_audit
     operator_audit = repair_audit.get("pymoo_operator") or {}
     terminal_replay_audit = repair_audit.get("terminal_physical_replay") or {}
+    deterministic_terminal = terminal_replay_audit.get(
+        "deterministic_terminal_inference"
+    ) or {}
+    optimizer_snapshot = terminal_replay_audit.get(
+        "multithread_optimizer_snapshot"
+    ) or {}
     if (
         repair_audit.get("stages") != {
             "initial_population": True,
@@ -5930,6 +6293,26 @@ def run_search_seed(
         or not isinstance(operator_audit.get("row_count"), int)
         or operator_audit["row_count"] < 1
         or terminal_replay_audit.get("optimizer_physical_G_match") is not True
+        or terminal_replay_audit.get("terminal_population_canonicalized") is not True
+        or deterministic_terminal.get("optimizer_inference_threads")
+        != PRODUCTION_INFERENCE_THREADS
+        or deterministic_terminal.get("terminal_replay_inference_threads")
+        != DETERMINISTIC_TERMINAL_INFERENCE_THREADS
+        or deterministic_terminal.get("optimizer_binding_restored") is not True
+        or deterministic_terminal.get("objectives_bit_exact") is not True
+        or deterministic_terminal.get("optimizer_G_bit_exact") is not True
+        or deterministic_terminal.get("numeric_tolerance_relaxed") is not False
+        or deterministic_terminal.get(
+            "terminal_model_predictions_serially_replayed"
+        )
+        is not True
+        or optimizer_snapshot.get("canonicalized_from_serial_authority") is not True
+        or optimizer_snapshot.get("stale_constraint_violation_cache_cleared")
+        is not True
+        or not isinstance(
+            optimizer_snapshot.get("canonical_constraint_violation_sha256"), str
+        )
+        or len(optimizer_snapshot["canonical_constraint_violation_sha256"]) != 64
         or topology_audit.get("terminal_epsilon_zero") is not True
         or topology_audit.get("all_required_topologies_preserved") is not True
         or int(result.tier1_evaluated_generations) != int(max_generations)

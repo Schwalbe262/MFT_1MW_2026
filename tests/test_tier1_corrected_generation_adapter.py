@@ -216,10 +216,23 @@ def test_authentication_rejects_incomplete_recovery_and_target_guard(tmp_path):
 
 class _FakePredictor:
     def __init__(self, bundle, value=1.0, half_width=0.1):
+        self.fitted = types.SimpleNamespace(n_jobs=1)
+        bundle = dict(bundle)
+        bundle.setdefault("models", [("extratrees", self.fitted)])
         self.bundle = bundle
         self.features = bundle["features"]
         self.value = value
         self.half_width = half_width
+        self.inference_threads = 1
+
+    def configure_inference_threads(self, threads=1):
+        self.inference_threads = int(threads)
+        self.fitted.n_jobs = int(threads)
+        return {
+            "threads": int(threads),
+            "model_count": 1,
+            "families": ["extratrees"],
+        }
 
     def predict_mu_sigma(self, frame, conformal=True):
         assert conformal is True
@@ -492,6 +505,200 @@ def _actual_problem(fixed_primary_turns):
         density_gate=lambda frame: np.full(len(frame), -1.0),
         fixed_primary_turns=fixed_primary_turns,
     ), models, modules
+
+
+class _ThreadControlledPredictor:
+    def __init__(self, target, value, *, multithread_delta=0.0):
+        self.fitted = types.SimpleNamespace(n_jobs=8)
+        self.bundle = {
+            "features": ["l1"],
+            "target": target,
+            "models": [("extratrees", self.fitted)],
+        }
+        self.features = self.bundle["features"]
+        self.value = float(value)
+        self.multithread_delta = float(multithread_delta)
+        self.half_width = 0.1
+        self.inference_threads = 8
+
+    def configure_inference_threads(self, threads=1):
+        self.inference_threads = int(threads)
+        self.fitted.n_jobs = int(threads)
+        return {
+            "threads": int(threads),
+            "model_count": 1,
+            "families": ["extratrees"],
+        }
+
+    def predict_mu_sigma(self, frame, conformal=True):
+        assert conformal is True
+        delta = self.multithread_delta if self.inference_threads > 1 else 0.0
+        return (
+            np.full(len(frame), self.value + delta, dtype=float),
+            np.full(len(frame), self.half_width, dtype=float),
+        )
+
+    def disagreement(self, frame):
+        return np.zeros(len(frame), dtype=float)
+
+
+def _thread_sensitive_terminal_runner():
+    from pymoo.core.population import Population
+
+    problem, base_models, modules = _actual_problem(5)
+    deltas = {
+        "Llt_phys": 1.0e-6,
+        "P_core_total": 1.0e-4,
+    }
+    models = {
+        target: _ThreadControlledPredictor(
+            target,
+            predictor.value,
+            multithread_delta=deltas.get(target, 0.0),
+        )
+        for target, predictor in base_models.items()
+    }
+    problem.models = models
+    binding = preflight.bind_surrogate_inference(
+        models, modules.run_nsga2, threads=8
+    )
+    runner = preflight.Current7Tier1Runner(
+        authenticated=None,
+        code_identity={},
+        modules=modules,
+        adapter_evidence={},
+        model_cache=None,
+        models=models,
+        inference_binding=binding,
+        density_gate=object(),
+        problem=problem,
+    )
+    physical_evaluate, scaling = preflight.install_optimizer_scaling(
+        problem,
+        resonance_scale_hz=150.0,
+        llt_scale_uh=0.3,
+        all_thermal_scale_c=2.0,
+        resonance_allowance_hz=3.0,
+        llt_allowance_uh=0.1,
+    )
+    runner.physical_evaluate = physical_evaluate
+    runner.optimizer_scaling = scaling
+    raw = np.full((1, problem.n_var), 0.5)
+    raw[:, 2] = 0.0
+    coordinates, _repair = runner.repair_coordinates(
+        raw, stage="thread_sensitive_terminal_fixture"
+    )
+    optimizer = runner.evaluate_coordinates(coordinates)
+    population = Population.new(
+        X=coordinates,
+        F=optimizer["F"],
+        G=optimizer["G"],
+        CV=np.full((1, 1), 999.0),
+    )
+    return runner, coordinates, optimizer, population
+
+
+def test_terminal_replay_serializes_and_canonicalizes_eight_thread_snapshot(
+    tmp_path,
+):
+    runner, coordinates, optimizer, population = (
+        _thread_sensitive_terminal_runner()
+    )
+
+    replay, evidence = runner.terminal_physical_replay(
+        coordinates,
+        expected_f=optimizer["F"],
+        expected_g=optimizer["G"],
+        terminal_population=population,
+    )
+
+    deterministic = evidence["deterministic_terminal_inference"]
+    snapshot = evidence["multithread_optimizer_snapshot"]
+    assert deterministic["optimizer_inference_threads"] == 8
+    assert deterministic["terminal_replay_inference_threads"] == 1
+    assert deterministic["objectives_bit_exact"] is True
+    assert deterministic["optimizer_G_bit_exact"] is True
+    assert deterministic["numeric_tolerance_relaxed"] is False
+    assert deterministic["comparison_atol"] == 0.0
+    assert deterministic["optimizer_binding_restored"] is True
+    assert snapshot["maximum_absolute_objective_delta"] > 0.0
+    assert snapshot["maximum_absolute_optimizer_G_delta"] > 0.0
+    assert snapshot["numeric_comparison_used_as_terminal_gate"] is False
+    assert snapshot["canonicalized_from_serial_authority"] is True
+    assert snapshot["canonical_constraint_violation_sha256"]
+    assert snapshot["stale_constraint_violation_cache_cleared"] is True
+    assert snapshot["trajectory_rank_or_crowding_used_for_persistence"] is False
+    assert snapshot["terminal_pareto_recomputed_from_canonical_F_G"] is True
+    assert evidence["terminal_population_canonicalized"] is True
+    assert np.array_equal(population.get("F"), replay["F"])
+    assert np.array_equal(population.get("G"), replay["optimizer_G"])
+    assert not np.array_equal(population.get("CV"), np.full((1, 1), 999.0))
+    assert "terminal_model_predictions" in replay
+    assert deterministic["terminal_model_predictions_sha256"]
+    assert all(model.inference_threads == 8 for model in runner.models.values())
+    assert all(model.fitted.n_jobs == 8 for model in runner.models.values())
+
+    def unexpected_multithread_prediction(*_args, **_kwargs):
+        raise AssertionError("persistence repeated terminal model inference")
+
+    for model in runner.models.values():
+        model.predict_mu_sigma = unexpected_multithread_prediction
+    output = tmp_path / "serial_terminal_persistence"
+    output.mkdir()
+    result = types.SimpleNamespace(
+        pop=population,
+        tier1_terminal_physical_replay=replay,
+    )
+    preflight.persist_search_outputs(runner, result, output)
+    assert np.array_equal(np.load(output / "terminal_F.npy"), replay["F"])
+    assert np.array_equal(
+        np.load(output / "terminal_G_optimizer.npy"), replay["optimizer_G"]
+    )
+
+
+def test_terminal_replay_rejects_one_ulp_serial_drift_and_restores_threads():
+    runner, coordinates, optimizer, population = (
+        _thread_sensitive_terminal_runner()
+    )
+    physical_evaluate = runner.physical_evaluate
+    constraint_index = runner.problem.constraint_names.index(
+        "core_group_manufacturability_limit"
+    )
+
+    def one_ulp_physical_drift(values, out, *args, **kwargs):
+        physical_evaluate(values, out, *args, **kwargs)
+        constraints = np.asarray(out["G"], dtype=float).copy()
+        constraints[:, constraint_index] = np.nextafter(
+            constraints[:, constraint_index], np.inf
+        )
+        out["G"] = constraints
+
+    runner.physical_evaluate = one_ulp_physical_drift
+    with pytest.raises(RuntimeError, match="deterministic serial terminal replay"):
+        runner.terminal_physical_replay(
+            coordinates,
+            expected_f=optimizer["F"],
+            expected_g=optimizer["G"],
+            terminal_population=population,
+        )
+
+    assert all(model.inference_threads == 8 for model in runner.models.values())
+    assert all(model.fitted.n_jobs == 8 for model in runner.models.values())
+
+
+def test_terminal_replay_rejects_partial_inference_binding():
+    runner, coordinates, optimizer, population = (
+        _thread_sensitive_terminal_runner()
+    )
+    runner.inference_binding = {"threads_per_model": 8}
+
+    with pytest.raises(RuntimeError, match="inference binding is partial"):
+        runner.terminal_physical_replay(
+            coordinates,
+            expected_f=optimizer["F"],
+            expected_g=optimizer["G"],
+            terminal_population=population,
+        )
 
 
 def _fake_problem_class():
@@ -1144,8 +1351,28 @@ def test_smoke_receipt_seals_both_repaired_strata_and_is_launch_eligible(tmp_pat
         load_calls=1,
         full_generation_authentication_passes=1,
     )
+
+    def bound_fake_inference(models, threads=1):
+        configured = [
+            model.configure_inference_threads(threads)
+            for model in models.values()
+        ]
+        return {
+            "threads_per_model": int(threads),
+            "target_count": len(configured),
+            "model_count": sum(item["model_count"] for item in configured),
+            "families": sorted({
+                family
+                for item in configured
+                for family in item["families"]
+            }),
+            "policy": "outer_restart_parallelism_inner_model_serial_v1",
+        }
+
     modules = preflight.Current7Modules(
-        run_nsga2=None,
+        run_nsga2=types.SimpleNamespace(
+            _bound_surrogate_inference=bound_fake_inference
+        ),
         nsga2_problem=None,
         predictor=None,
         train_models=None,
@@ -1169,12 +1396,7 @@ def test_smoke_receipt_seals_both_repaired_strata_and_is_launch_eligible(tmp_pat
         adapter_evidence=manifest,
         model_cache=fake_cache,
         models=all_models,
-        inference_binding={
-            "target_count": 20,
-            "threads_per_model": 1,
-            "model_count": 80,
-            "families": ["extratrees"],
-        },
+        inference_binding=bound_fake_inference(all_models, threads=1),
         density_gate=object(),
         problem=problem_class(
             all_models,
@@ -1336,10 +1558,9 @@ def test_search_seed_cli_runs_synthetic_optimizer_and_seals_artifacts(
             full_generation_authentication_passes=1,
         ),
         models=models,
-        inference_binding={
-            "target_count": len(adapter.CURRENT_REQUIRED_MODEL_TARGETS),
-            "threads_per_model": 8,
-        },
+        inference_binding=preflight.bind_surrogate_inference(
+            models, modules.run_nsga2, threads=8
+        ),
         density_gate=object(),
         problem=problem,
     )
