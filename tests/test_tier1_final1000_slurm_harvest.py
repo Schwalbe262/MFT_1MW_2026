@@ -829,6 +829,33 @@ def test_chained_shadow_input_is_explicitly_read_only(tmp_path, monkeypatch):
         )
 
 
+def test_terminal_validator_uses_each_task_generation_identity(tmp_path, monkeypatch):
+    fixture = rolling_fixtures._chained_fixture(tmp_path, stopped=True)
+    validated_generations = []
+
+    monkeypatch.setattr(
+        harvest,
+        "validate_current7_result",
+        lambda result, *, payload, manifest: None,
+    )
+
+    def validate_stage(result, task, *, task_validator):
+        del result
+        validated = task_validator(task)
+        validated_generations.append(validated["payload_json"]["max_generations"])
+        return {}
+
+    monkeypatch.setattr(harvest, "validate_stage_result", validate_stage)
+    for plan in (fixture["predecessor"], fixture["successor"]):
+        task = plan["task_waves"]["canaries"][0]
+        validator = harvest._result_validator(
+            task, controller.SUCCESSOR_RESOURCE_POLICY_ID
+        )
+        validator({}, payload={}, manifest={})
+
+    assert validated_generations == [200, 300]
+
+
 def test_patched_bundle_mixed_ledger_replays_old_and_new_bindings(tmp_path):
     fixture = rolling_fixtures._historical_transition_fixture(tmp_path / "rolling")
     resource_plan = fixture["predecessor"]

@@ -925,9 +925,23 @@ def _result_validator(
     policy = RESOURCE_POLICIES.get(resource_policy_id)
     if policy is None:
         raise RuntimeError("terminal result resource policy is unsupported")
+    payload = expected_task.get("payload_json")
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("terminal result task has no science identity")
+    fixed_generations = payload.get("max_generations")
+    if (
+        isinstance(fixed_generations, bool)
+        or not isinstance(fixed_generations, int)
+        or fixed_generations <= 0
+    ):
+        raise RuntimeError("terminal result task science identity is invalid")
 
     def validate_task_policy(task: Mapping[str, Any]) -> Mapping[str, Any]:
-        return _validate_task_for_policy(task, policy=policy)
+        return _validate_task_for_policy(
+            task,
+            policy=policy,
+            fixed_generations=fixed_generations,
+        )
 
     def validate(
         result: Mapping[str, Any],
