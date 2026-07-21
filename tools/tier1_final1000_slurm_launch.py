@@ -95,10 +95,10 @@ DEFAULT_PEAK_RSS_GATE_BYTES = 22 * 1024**3
 # authenticate every predecessor task while shifting capacity toward the two
 # relaxed donor basins that currently have the highest useful throughput.
 SUCCESSOR_ACTIVE_QUOTAS = {
-    "entry-1200-t125": 160,
-    "bridge-1150-t115": 140,
-    "close-1075-t107p5": 120,
-    "final-1000-t100": 80,
+    "entry-1200-t125": 200,
+    "bridge-1150-t115": 160,
+    "close-1075-t107p5": 90,
+    "final-1000-t100": 50,
 }
 if sum(SUCCESSOR_ACTIVE_QUOTAS.values()) != TOTAL_ACTIVE_QUOTA:  # pragma: no cover
     raise RuntimeError("final1000 successor active quotas must sum to 500")

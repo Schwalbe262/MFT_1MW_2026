@@ -730,10 +730,10 @@ def test_rolling_controller_fills_only_natural_gaps_and_keeps_exact_500(tmp_path
     assert released["active_count"] == 500
     assert set(released["canary_passed_stage_ids"]) == set(profiles.BY_ID)
 
-    # Drain only the predecessor excess (close +8, final +132).  The
-    # successor must transfer those 140 naturally vacated slots into entry
-    # +96 and bridge +44 without cancelling anything.
-    remaining = {"close-1075-t107p5": 8, "final-1000-t100": 132}
+    # Drain only the predecessor excess (close +38, final +162).  The
+    # successor must transfer those 200 naturally vacated slots into entry
+    # +136 and bridge +64 without cancelling anything.
+    remaining = {"close-1075-t107p5": 38, "final-1000-t100": 162}
     for task in fixture["scheduler"].by_id.values():
         stage_id = task["payload_json"]["final_goal_stage_id"]
         if (
@@ -754,11 +754,11 @@ def test_rolling_controller_fills_only_natural_gaps_and_keeps_exact_500(tmp_path
     )
     assert refilled["active_count"] == 500
     assert refilled["active_count_by_stage"] == launch.SUCCESSOR_ACTIVE_QUOTAS
-    assert refilled["scheduler_post_count"] == 144
-    assert fixture["scheduler"].mutations == ["POST /api/tasks"] * 144
+    assert refilled["scheduler_post_count"] == 204
+    assert fixture["scheduler"].mutations == ["POST /api/tasks"] * 204
     transfer_order = fixture["scheduler"].submitted_stage_ids[4:]
-    assert transfer_order.count("entry-1200-t125") == 96
-    assert transfer_order.count("bridge-1150-t115") == 44
+    assert transfer_order.count("entry-1200-t125") == 136
+    assert transfer_order.count("bridge-1150-t115") == 64
     assert "close-1075-t107p5" not in transfer_order
     assert "final-1000-t100" not in transfer_order
     # Weighted scheduling must interleave while both deficits remain; it may

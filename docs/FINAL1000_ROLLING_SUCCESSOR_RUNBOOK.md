@@ -1,7 +1,7 @@
 # final1000 cancellation-free successor rollout
 
 This runbook first rolls the active `mft-t1fg-*` search to the 4-CPU resource
-and 160/140/120/80 quota policy while reusing the exact current stage bundles.
+and 200/160/90/50 quota policy while reusing the exact current stage bundles.
 That fast resource cutover does not wait for a new smoke receipt.  A second,
 identical cancellation-free handoff can later dual-bind the negative-loss
 patched bundles after their replay and publication evidence is complete.
@@ -14,7 +14,7 @@ patched bundles after their replay and publication evidence is complete.
 - `max_workers_per_node`: 32
 - priority: 1
 - surrogate inference threads: 8 (science/runtime identity is unchanged)
-- logical active target: 500 = 160 + 140 + 120 + 80
+- logical active target: 500 = 200 + 160 + 90 + 50
 - refill: smooth weighted-deficit round-robin, never stage-block append
 - scheduler mutation allow-list: `POST /api/tasks` only
 - cancellation, preemption, AEDT, and FEA: prohibited
@@ -32,7 +32,7 @@ bypassing 4-CPU or 28-GiB accounting.  This is also the previously proven
    the release containing `tier1_final1000_slurm_launch.py` from this change.
 2. Confirm the launch plan reports exactly `4 / 28672 / 32 / priority 1` and
    every payload reports `inference_threads=8`.
-3. Confirm its operational quotas are exactly 160/140/120/80.  The stage
+3. Confirm its operational quotas are exactly 200/160/90/50.  The stage
    science profiles and all four bundle/READY identities must remain exact.
 4. Keep the predecessor running until this local plan is fully validated.
 
@@ -110,13 +110,13 @@ The imported active tasks keep running untouched.  The new controller submits
 only a gap created when one naturally becomes terminal.  The old distribution
 64/96/128/212 is allowed temporarily: close/final excess drains naturally and
 weighted-deficit refill transfers those slots into entry/bridge until the live
-distribution reaches 160/140/120/80.  Total logical active remains 500 after
+distribution reaches 200/160/90/50.  Total logical active remains 500 after
 every successful reconciliation cycle; no per-stage excess is cancelled.
 
 Monitor these fields in each controller result:
 
 - `active_count=500`
-- `active_count_by_stage` converging naturally to 160/140/120/80
+- `active_count_by_stage` converging naturally to 200/160/90/50
 - `rolling_migration=true`
 - `successor_canary_task_ids_by_stage`
 - `successor_canary_status_by_stage`

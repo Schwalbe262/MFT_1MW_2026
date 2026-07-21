@@ -230,10 +230,10 @@ def test_logical_wave_is_4_canaries_plus_496_and_preserves_stage_quotas():
         for stage in profiles.STAGES
     } == launch.SUCCESSOR_ACTIVE_QUOTAS
     assert launch.SUCCESSOR_ACTIVE_QUOTAS == {
-        "entry-1200-t125": 160,
-        "bridge-1150-t115": 140,
-        "close-1075-t107p5": 120,
-        "final-1000-t100": 80,
+        "entry-1200-t125": 200,
+        "bridge-1150-t115": 160,
+        "close-1075-t107p5": 90,
+        "final-1000-t100": 50,
     }
 
 

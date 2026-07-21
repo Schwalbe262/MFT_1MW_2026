@@ -1080,7 +1080,7 @@ def control_once(
         if rolling_migration:
             # Preserve every predecessor task and transfer only naturally
             # vacated slots.  The old 64/96/128/212 distribution is allowed
-            # to be temporarily over/under the successor 160/140/120/80
+            # to be temporarily over/under the successor 200/160/90/50
             # targets; weighted deficit refill converges without cancellation.
             replacement_stage_order = _weighted_deficit_refill_order(
                 state,
