@@ -33,6 +33,7 @@ try:
         stage_spec_from_json_identity,
         validate_stage_spec,
     )
+    from tier1_deep_crossover_contract import topology_evolution_contract
 except ImportError:  # pragma: no cover - repository module import path
     from tools.tier1_corrected_generation_preflight import (
         RESONANCE_MAXIMUM_CONSTRAINT,
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover - repository module import path
         stage_spec_from_json_identity,
         validate_stage_spec,
     )
+    from tools.tier1_deep_crossover_contract import topology_evolution_contract
 
 
 CONTRACT_SCHEMA = "mft-tier1-final1000-warm-pool-v1"
@@ -51,6 +53,9 @@ TEMPERATURE_PREFIX = "temperature_robust_limit:"
 WIDTH_CONSTRAINT = "exterior_width_limit"
 LENGTH_CONSTRAINT = "exterior_length_limit"
 HEIGHT_CONSTRAINT = "exterior_height_limit"
+BASIN_POOL_SCHEMA = "mft-tier1-final1000-basin-warm-selection-v1"
+BASIN_PROTECTED_COPIES_EACH = 8
+BASIN_PROTECTED_SELECTION_CAP = 56
 
 
 def _now() -> str:
@@ -277,6 +282,183 @@ def _diverse_indices(
     return selected
 
 
+def _n1_6_secondary_main_turns(coordinates: np.ndarray) -> np.ndarray:
+    values = np.asarray(coordinates, dtype=float)
+    if values.ndim != 2 or values.shape[1] <= 2:
+        raise RuntimeError("basin warm coordinates have an invalid schema")
+    return 60 - np.rint(48.0 * np.clip(values[:, 2], 0.0, 1.0)).astype(int)
+
+
+def _basin_aware_indices(
+    coordinates: np.ndarray,
+    staged_g: np.ndarray,
+    objectives: np.ndarray,
+    *,
+    target_names: tuple[str, ...],
+    global_order: np.ndarray,
+    pool_size: int,
+    candidate_limit: int,
+    minimum_distance: float,
+) -> tuple[list[int], dict[str, Any]]:
+    """Reserve authenticated donors for each audited N1=6 basin."""
+
+    topology = topology_evolution_contract(6)
+    required_topologies = tuple(
+        int(value) for value in topology["turn_split_sub_islands_N2_main"]
+    )
+    if (
+        int(pool_size) < BASIN_PROTECTED_SELECTION_CAP
+        or required_topologies != (34, 35, 36, 37, 38, 39, 60)
+        or topology["bounded_diversity_budget"]["protected_slots"]
+        != BASIN_PROTECTED_SELECTION_CAP
+    ):
+        raise RuntimeError("basin warm protected budget contract mismatch")
+    positions = {name: index for index, name in enumerate(target_names)}
+    required_names = {
+        "Llt_robust_band",
+        "Llt_ensemble_disagreement",
+        WIDTH_CONSTRAINT,
+        LENGTH_CONSTRAINT,
+        HEIGHT_CONSTRAINT,
+    }
+    temperature_indices = [
+        index
+        for index, name in enumerate(target_names)
+        if name.startswith(TEMPERATURE_PREFIX)
+    ]
+    if not required_names <= set(positions) or not temperature_indices:
+        raise RuntimeError("basin warm source omitted a ranking constraint")
+    n2_main = _n1_6_secondary_main_turns(coordinates)
+    global_rank = np.empty(len(global_order), dtype=int)
+    global_rank[np.asarray(global_order, dtype=int)] = np.arange(len(global_order))
+    llt_order = np.lexsort((
+        objectives[:, 1],
+        global_rank,
+        staged_g[:, positions["Llt_ensemble_disagreement"]],
+        staged_g[:, positions["Llt_robust_band"]],
+    ))
+    temperature = staged_g[:, temperature_indices]
+    thermal_order = np.lexsort((
+        objectives[:, 1],
+        global_rank,
+        np.maximum(temperature, 0.0).sum(axis=1),
+        temperature.max(axis=1),
+    ))
+    size_indices = [
+        positions[name]
+        for name in (WIDTH_CONSTRAINT, LENGTH_CONSTRAINT, HEIGHT_CONSTRAINT)
+    ]
+    size_g = staged_g[:, size_indices]
+    size_order = np.lexsort((
+        objectives[:, 1],
+        global_rank,
+        np.maximum(size_g, 0.0).sum(axis=1),
+        np.count_nonzero(size_g > 0.0, axis=1),
+    ))
+    lane_for_topology = {
+        34: "llt_target_mean_q90",
+        37: "llt_target_mean_q90",
+        35: "thermal_split",
+        36: "thermal_split",
+        38: "thermal_split",
+        39: "thermal_split",
+        60: "exact_size_no_side",
+    }
+    order_for_lane = {
+        "llt_target_mean_q90": llt_order,
+        "thermal_split": thermal_order,
+        "exact_size_no_side": size_order,
+    }
+    selected: list[int] = []
+    protected: list[dict[str, Any]] = []
+    availability: dict[str, int] = {}
+    for target in required_topologies:
+        lane = lane_for_topology[target]
+        candidates = [
+            int(index)
+            for index in order_for_lane[lane]
+            if n2_main[int(index)] == target
+            and (
+                target != 60
+                or bool(np.all(size_g[int(index)] <= 0.0))
+            )
+        ]
+        availability[str(target)] = len(candidates)
+        if not candidates:
+            side = 60 - target
+            raise RuntimeError(
+                f"basin warm source omitted required {target}/{side} donor"
+            )
+        topology_selected: list[int] = []
+        for index in candidates:
+            row = coordinates[index]
+            if not topology_selected or min(
+                float(np.linalg.norm(row - coordinates[prior]))
+                for prior in topology_selected
+            ) >= minimum_distance:
+                topology_selected.append(index)
+            if len(topology_selected) == BASIN_PROTECTED_COPIES_EACH:
+                break
+        for index in candidates:
+            if index not in topology_selected:
+                topology_selected.append(index)
+            if len(topology_selected) == BASIN_PROTECTED_COPIES_EACH:
+                break
+        for index in topology_selected:
+            if index in selected:
+                raise RuntimeError("basin warm donor topology identity overlapped")
+            selected.append(index)
+            protected.append({
+                "source_row_index": index,
+                "lane": lane,
+                "N2_main": target,
+                "N2_side": 60 - target,
+            })
+    if not 0 < len(protected) <= BASIN_PROTECTED_SELECTION_CAP:
+        raise RuntimeError("basin warm protected selection escaped its cap")
+    candidates = [
+        int(value) for value in global_order[:candidate_limit]
+        if int(value) not in selected
+    ]
+    for index in candidates:
+        row = coordinates[index]
+        if not selected or min(
+            float(np.linalg.norm(row - coordinates[prior]))
+            for prior in selected
+        ) >= minimum_distance:
+            selected.append(index)
+        if len(selected) == pool_size:
+            break
+    for index in candidates:
+        if index not in selected:
+            selected.append(index)
+        if len(selected) == pool_size:
+            break
+    if len(selected) != pool_size:
+        raise RuntimeError("basin warm selection could not fill the requested pool")
+    audit = {
+        "schema_version": BASIN_POOL_SCHEMA,
+        "required_topologies_N2_main": list(required_topologies),
+        "source_available_counts": availability,
+        "requested_copies_each": BASIN_PROTECTED_COPIES_EACH,
+        "protected_selection_count": len(protected),
+        "protected_selection_cap": BASIN_PROTECTED_SELECTION_CAP,
+        "protected_selection": protected,
+        "missing_required_topologies": [],
+        "coordinate_donors_only": True,
+        "prior_prediction_or_pass_classification_inherited": False,
+        "downstream_population": int(
+            topology["bounded_diversity_budget"]["population"]
+        ),
+        "downstream_protected_seed_count": BASIN_PROTECTED_SELECTION_CAP,
+        "downstream_maximum_warm_injected_count": 160,
+        "downstream_fresh_random_count": 160,
+        "additional_model_evaluations_during_selection": 0,
+    }
+    audit["sha256"] = canonical_sha256(audit)
+    return selected, audit
+
+
 def _atomic_npy(path: Path, values: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_raw = tempfile.mkstemp(
@@ -317,6 +499,8 @@ def build_warm_pool(
     candidate_limit: int = 8_192,
     minimum_distance: float = 0.01,
     island_prefix: str = "n1-6-",
+    donor_index_paths: tuple[Path, ...] = (),
+    basin_aware: bool = False,
 ) -> tuple[Path, Path]:
     if isinstance(pool_size, bool) or not 4 <= int(pool_size) <= 4096:
         raise ValueError("pool_size must be from 4 through 4096")
@@ -324,72 +508,153 @@ def build_warm_pool(
         raise ValueError("candidate_limit must be at least pool_size")
     if not math.isfinite(float(minimum_distance)) or minimum_distance < 0.0:
         raise ValueError("minimum_distance must be finite and non-negative")
+    if not isinstance(basin_aware, bool):
+        raise ValueError("basin_aware must be boolean")
     normalized_stage = validate_stage_spec(stage_spec)
-    canonical_index, status, containment_root = _load_source(index_path)
-    source_names = tuple(str(name) for name in status["constraint_names"])
-    source_spec = status["hard_spec"]
+    index_paths = tuple(
+        path.resolve(strict=True)
+        for path in (Path(index_path), *map(Path, donor_index_paths))
+    )
+    if len(index_paths) != len(set(index_paths)):
+        raise RuntimeError("basin warm source indexes must be unique")
     coordinates = []
-    physical_g = []
+    staged_g_blocks = []
     objectives = []
     metadata: list[dict[str, Any]] = []
     authenticated_artifacts: list[dict[str, Any]] = []
-    for terminal in status.get("terminal_results") or []:
-        if (
-            terminal.get("authenticated") is not True
-            or terminal.get("terminal_state") != "completed"
-            or not str(terminal.get("island_id") or "").startswith(island_prefix)
-        ):
-            continue
-        artifacts = terminal.get("artifact_objects") or {}
-        paths = {
-            key: _artifact(artifacts.get(key) or {}, containment_root, key)
-            for key in ("terminal_X", "terminal_G_physical", "terminal_F")
-        }
-        try:
-            x = np.load(paths["terminal_X"], allow_pickle=False)
-            g = np.load(paths["terminal_G_physical"], allow_pickle=False)
-            f = np.load(paths["terminal_F"], allow_pickle=False)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("authenticated terminal NumPy artifact is invalid") from exc
-        if (
-            x.ndim != 2
-            or g.shape != (len(x), len(source_names))
-            or f.shape != (len(x), 2)
-            or not np.isfinite(x).all()
-            or not np.isfinite(g).all()
-            or not np.isfinite(f).all()
-        ):
-            raise RuntimeError("authenticated terminal array schema mismatch")
-        coordinates.append(np.asarray(x, dtype=float))
-        physical_g.append(np.asarray(g, dtype=float))
-        objectives.append(np.asarray(f, dtype=float))
-        metadata.extend(
-            {
+    source_indexes = []
+    canonical_index = None
+    source_names = None
+    source_spec = None
+    target_names = None
+    for source_index_rank, current_index_path in enumerate(index_paths):
+        current_index, status, containment_root = _load_source(
+            current_index_path
+        )
+        current_names = tuple(
+            str(name) for name in status["constraint_names"]
+        )
+        current_spec = status["hard_spec"]
+        if canonical_index is None:
+            canonical_index = current_index
+            source_names = current_names
+            source_spec = current_spec
+        source_terminal_count = 0
+        for terminal in status.get("terminal_results") or []:
+            if (
+                terminal.get("authenticated") is not True
+                or terminal.get("terminal_state") != "completed"
+                or not str(terminal.get("island_id") or "").startswith(
+                    island_prefix
+                )
+            ):
+                continue
+            artifacts = terminal.get("artifact_objects") or {}
+            paths = {
+                key: _artifact(
+                    artifacts.get(key) or {}, containment_root, key
+                )
+                for key in ("terminal_X", "terminal_G_physical", "terminal_F")
+            }
+            result_sha256 = None
+            if basin_aware:
+                result_record = terminal.get("result_object") or {}
+                result_path = _artifact(
+                    result_record, containment_root, "source result"
+                )
+                result_value = _read_json(result_path)
+                result_sha256 = str(result_record.get("sha256") or "")
+                if (
+                    int(result_value.get("seed", -1))
+                    != int(terminal["seed"])
+                    or result_value.get("island_id")
+                    != terminal.get("island_id")
+                ):
+                    raise RuntimeError("basin warm source result identity mismatch")
+            try:
+                x = np.load(paths["terminal_X"], allow_pickle=False)
+                g = np.load(paths["terminal_G_physical"], allow_pickle=False)
+                f = np.load(paths["terminal_F"], allow_pickle=False)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    "authenticated terminal NumPy artifact is invalid"
+                ) from exc
+            if (
+                x.ndim != 2
+                or g.shape != (len(x), len(current_names))
+                or f.shape != (len(x), 2)
+                or not np.isfinite(x).all()
+                or not np.isfinite(g).all()
+                or not np.isfinite(f).all()
+            ):
+                raise RuntimeError("authenticated terminal array schema mismatch")
+            current_staged_g, current_target_names = transform_physical_g(
+                g,
+                source_names=current_names,
+                source_spec=current_spec,
+                stage_spec=normalized_stage,
+            )
+            if target_names is None:
+                target_names = current_target_names
+            elif current_target_names != target_names:
+                raise RuntimeError("basin warm target constraint schema drifted")
+            coordinates.append(np.asarray(x, dtype=float))
+            staged_g_blocks.append(current_staged_g)
+            objectives.append(np.asarray(f, dtype=float))
+            metadata.extend(
+                {
+                    "seed": int(terminal["seed"]),
+                    "island_id": str(terminal["island_id"]),
+                    "terminal_population_index": row,
+                    "source_index_rank": source_index_rank,
+                    "source_index_sha256": _sha256_file(current_index_path),
+                    "source_result_sha256": result_sha256,
+                }
+                for row in range(len(x))
+            )
+            object_records = {
+                key: {
+                    "sha256": str(artifacts[key]["sha256"]),
+                    "size_bytes": int(
+                        artifacts[key].get(
+                            "size_bytes", artifacts[key].get("size")
+                        )
+                    ),
+                }
+                for key in paths
+            }
+            if result_sha256 is not None:
+                object_records["source_result"] = {
+                    "sha256": result_sha256,
+                    "size_bytes": int(
+                        (terminal["result_object"]).get(
+                            "size_bytes", terminal["result_object"].get("size")
+                        )
+                    ),
+                }
+            authenticated_artifacts.append({
                 "seed": int(terminal["seed"]),
                 "island_id": str(terminal["island_id"]),
-                "terminal_population_index": row,
-            }
-            for row in range(len(x))
-        )
-        authenticated_artifacts.append(
-            {
-                "seed": int(terminal["seed"]),
-                "island_id": str(terminal["island_id"]),
-                "objects": {
-                    key: {
-                        "sha256": str(artifacts[key]["sha256"]),
-                        "size_bytes": int(
-                            artifacts[key].get("size_bytes", artifacts[key].get("size"))
-                        ),
-                    }
-                    for key in paths
-                },
-            }
-        )
+                "source_index_rank": source_index_rank,
+                "objects": object_records,
+            })
+            source_terminal_count += 1
+        source_indexes.append({
+            "rank": source_index_rank,
+            "path": str(current_index_path),
+            "sha256": _sha256_file(current_index_path),
+            "snapshot_sha256": current_index.get("snapshot_sha256"),
+            "bundle_id": current_index.get("bundle_id"),
+            "status": {
+                "path": str(Path(current_index["status"]["path"]).resolve()),
+                "sha256": str(current_index["status"]["sha256"]),
+            },
+            "authenticated_terminal_records": source_terminal_count,
+        })
     if not coordinates:
         raise RuntimeError("no authenticated terminal coordinates matched the island prefix")
     x_all = np.vstack(coordinates)
-    g_all = np.vstack(physical_g)
+    staged_g = np.vstack(staged_g_blocks)
     f_all = np.vstack(objectives)
     unique_keys = np.ascontiguousarray(x_all).view(
         np.dtype((np.void, x_all.dtype.itemsize * x_all.shape[1]))
@@ -397,27 +662,57 @@ def build_warm_pool(
     _, unique_indices = np.unique(unique_keys, return_index=True)
     unique_indices = np.sort(unique_indices)
     x_all = x_all[unique_indices]
-    g_all = g_all[unique_indices]
+    staged_g = staged_g[unique_indices]
     f_all = f_all[unique_indices]
     metadata = [metadata[int(index)] for index in unique_indices]
-    staged_g, target_names = transform_physical_g(
-        g_all,
-        source_names=source_names,
-        source_spec=source_spec,
-        stage_spec=normalized_stage,
-    )
+    if canonical_index is None or source_names is None or source_spec is None:
+        raise RuntimeError("warm source identity was not initialized")
+    if target_names is None:
+        raise RuntimeError("warm target constraint schema was not initialized")
     scales = _constraint_scales(target_names, normalized_stage)
     positive = np.maximum(staged_g, 0.0)
     violation_count = np.count_nonzero(staged_g > 0.0, axis=1)
     normalized_sum = np.sum(positive / scales, axis=1)
     order = np.lexsort((f_all[:, 1], f_all[:, 0], normalized_sum, violation_count))
-    selected = _diverse_indices(
-        x_all,
-        order,
-        pool_size=min(int(pool_size), len(x_all)),
-        candidate_limit=min(int(candidate_limit), len(x_all)),
-        minimum_distance=float(minimum_distance),
-    )
+    basin_selection = None
+    if basin_aware:
+        selected, basin_selection = _basin_aware_indices(
+            x_all,
+            staged_g,
+            f_all,
+            target_names=target_names,
+            global_order=order,
+            pool_size=int(pool_size),
+            candidate_limit=min(int(candidate_limit), len(x_all)),
+            minimum_distance=float(minimum_distance),
+        )
+        for item in basin_selection["protected_selection"]:
+            source = metadata[int(item["source_row_index"])]
+            result_sha = str(source.get("source_result_sha256") or "")
+            if len(result_sha) != 64:
+                raise RuntimeError(
+                    "basin warm protected donor lacks source-result SHA"
+                )
+            item.update({
+                "source_seed": int(source["seed"]),
+                "source_island_id": str(source["island_id"]),
+                "source_terminal_population_index": int(
+                    source["terminal_population_index"]
+                ),
+                "source_index_rank": int(source["source_index_rank"]),
+                "source_index_sha256": str(source["source_index_sha256"]),
+                "source_result_sha256": result_sha,
+            })
+        basin_selection.pop("sha256", None)
+        basin_selection["sha256"] = canonical_sha256(basin_selection)
+    else:
+        selected = _diverse_indices(
+            x_all,
+            order,
+            pool_size=min(int(pool_size), len(x_all)),
+            candidate_limit=min(int(candidate_limit), len(x_all)),
+            minimum_distance=float(minimum_distance),
+        )
     if len(selected) < 4:
         raise RuntimeError("staged warm selection produced fewer than four coordinates")
     selected_x = np.asarray(x_all[selected], dtype="<f8")
@@ -451,6 +746,7 @@ def build_warm_pool(
             "snapshot_sha256": canonical_index.get("snapshot_sha256"),
             "bundle_id": canonical_index.get("bundle_id"),
         },
+        "source_indexes": source_indexes,
         "source_status": {
             "path": str(
                 Path(canonical_index["status"]["path"]).resolve(strict=True)
@@ -479,6 +775,7 @@ def build_warm_pool(
         "selected_count": int(len(selected_x)),
         "candidate_limit": min(int(candidate_limit), len(x_all)),
         "minimum_coordinate_l2_distance": float(minimum_distance),
+        "basin_aware_selection": basin_selection,
         "selection": selected_records,
         "coordinate_artifact": {
             "path": coordinate_path.name,
@@ -514,6 +811,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--candidate-limit", type=int, default=8192)
     parser.add_argument("--minimum-distance", type=float, default=0.01)
     parser.add_argument("--island-prefix", default="n1-6-")
+    parser.add_argument(
+        "--donor-index",
+        type=Path,
+        action="append",
+        default=[],
+        help="additional authenticated stage index (repeatable)",
+    )
+    parser.add_argument("--basin-aware", action="store_true")
     args = parser.parse_args(argv)
     stage_spec = stage_spec_from_json_identity(
         args.stage_spec_json, args.stage_spec_sha256
@@ -526,6 +831,8 @@ def main(argv: list[str] | None = None) -> int:
         candidate_limit=args.candidate_limit,
         minimum_distance=args.minimum_distance,
         island_prefix=args.island_prefix,
+        donor_index_paths=tuple(args.donor_index),
+        basin_aware=args.basin_aware,
     )
     print(
         json.dumps(

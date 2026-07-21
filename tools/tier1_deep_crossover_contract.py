@@ -28,10 +28,47 @@ TURN_SPLIT_PARENT_PAIRS = (
     (28, 31), (29, 32), (30, 33),
     (28, 33), (29, 31), (30, 32),
 )
+BASIN_TURN_SPLIT_TOPOLOGIES_N1_6 = (34, 35, 36, 37, 38, 39, 60)
+BASIN_TURN_SPLIT_PARENT_PAIRS_N1_6 = (
+    (34, 37),
+    (35, 38),
+    (36, 39),
+    (37, 35),
+    (38, 36),
+    (39, 37),
+    (34, 38),
+    (37, 60),
+    (39, 60),
+    (35, 60),
+    (34, 60),
+)
+BASIN_DONOR_LANES_N1_6 = {
+    "llt_target_mean_q90": {
+        "topologies_N2_main_N2_side": [[34, 26], [37, 23]],
+        "selection_signal": (
+            "minimum_Llt_robust_band_with_Llt_mean_target_27p5uH_"
+            "and_q90_half_width_at_most_0p55uH"
+        ),
+        "target_mean_uH": 27.5,
+        "maximum_q90_half_width_uH": 0.55,
+    },
+    "thermal_split": {
+        "topologies_N2_main_N2_side": [
+            [35, 25], [36, 24], [37, 23], [38, 22], [39, 21],
+        ],
+        "selection_signal": "minimum_all_target_robust_temperature",
+    },
+    "exact_size_no_side": {
+        "topologies_N2_main_N2_side": [[60, 0]],
+        "selection_signal": "exact_size_pass_before_other_constraints",
+    },
+}
 TOPOLOGY_COORDINATE_NAME = "u_N2_side"
 TOPOLOGY_COORDINATE_INDEX = 2
 TOPOLOGY_INITIAL_COPIES_EACH = 4
 TOPOLOGY_MINIMUM_SURVIVORS_EACH = 4
+BASIN_TOPOLOGY_INITIAL_COPIES_EACH_N1_6 = 8
+BASIN_TOPOLOGY_MINIMUM_SURVIVORS_EACH_N1_6 = 8
 TOPOLOGY_MIGRATION_PERIOD_GENERATIONS = 5
 TOPOLOGY_MIGRANTS_PER_EVENT = 6
 EPSILON_INITIAL_NORMALIZED_POSITIVE_G_SUM = 20.0
@@ -213,38 +250,64 @@ def topology_evolution_contract(fixed_primary_turns: int) -> dict[str, Any]:
     fixed_primary_turns = int(fixed_primary_turns)
     if fixed_primary_turns not in (5, 6):
         raise ValueError("deep crossover topology evolution requires N1=5 or 6")
-    topology_shift = fixed_primary_turns - 5
-    topologies = tuple(
-        topology + topology_shift for topology in TURN_SPLIT_TOPOLOGIES
-    )
-    parent_pairs = tuple(
-        tuple(topology + topology_shift for topology in pair)
-        for pair in TURN_SPLIT_PARENT_PAIRS
+    if fixed_primary_turns == 6:
+        topologies = BASIN_TURN_SPLIT_TOPOLOGIES_N1_6
+        parent_pairs = BASIN_TURN_SPLIT_PARENT_PAIRS_N1_6
+        initial_copies = BASIN_TOPOLOGY_INITIAL_COPIES_EACH_N1_6
+        minimum_survivors = BASIN_TOPOLOGY_MINIMUM_SURVIVORS_EACH_N1_6
+        donor_lanes = BASIN_DONOR_LANES_N1_6
+        unavailable_topologies: list[int] = []
+    else:
+        topologies = TURN_SPLIT_TOPOLOGIES
+        parent_pairs = TURN_SPLIT_PARENT_PAIRS
+        initial_copies = TOPOLOGY_INITIAL_COPIES_EACH
+        minimum_survivors = TOPOLOGY_MINIMUM_SURVIVORS_EACH
+        donor_lanes = {
+            "legacy_turn_split": {
+                "topologies_N2_main_N2_side": [
+                    [topology, 50 - topology] for topology in topologies
+                ],
+                "selection_signal": "legacy_deep_crossover",
+            }
+        }
+        unavailable_topologies = []
+    protected_slots = minimum_survivors * len(topologies)
+    maximum_single_topology = POPULATION - minimum_survivors * (
+        len(topologies) - 1
     )
     value = {
-        "schema_version": "mft-tier1-turn-split-evolution-v1",
+        "schema_version": "mft-tier1-basin-aware-turn-split-evolution-v2",
         "fixed_primary_turns": fixed_primary_turns,
         "secondary_total_turns": fixed_primary_turns * 10,
-        "requested_global_turn_split_N2_main": list(TURN_SPLIT_TOPOLOGIES),
+        "requested_global_turn_split_N2_main": list(topologies),
         "turn_split_sub_islands_N2_main": list(topologies),
         "unavailable_requested_topologies_due_pinned_physics_repair": (
-            [] if fixed_primary_turns == 5 else [28]
+            unavailable_topologies
         ),
         "pinned_repair_N2_side_upper_fraction": 0.52,
+        "basin_donor_lanes": donor_lanes,
+        "basin_donor_lanes_are_coordinate_only": True,
+        "source_prediction_or_pass_classification_inherited": False,
         "turn_split_parent_pair_schedule": [
             list(pair) for pair in parent_pairs
+        ],
+        "cross_lane_parent_pairs": [
+            list(pair)
+            for pair in parent_pairs
+            if fixed_primary_turns == 6
+            and (60 in pair or pair in ((34, 38), (37, 35), (39, 37)))
         ],
         "coordinate_name": TOPOLOGY_COORDINATE_NAME,
         "coordinate_index": TOPOLOGY_COORDINATE_INDEX,
         "initial_repaired_copies_per_sub_island": (
-            TOPOLOGY_INITIAL_COPIES_EACH
+            initial_copies
         ),
         "paired_mating": "cross_distinct_turn_split_sub_islands_every_generation",
         "migration": {
             "kind": "copy_elite_genome_then_change_only_u_N2_side",
             "period_generations": TOPOLOGY_MIGRATION_PERIOD_GENERATIONS,
             "first_evolution_generation_included": True,
-            "migrants_per_event": TOPOLOGY_MIGRANTS_PER_EVENT,
+            "migrants_per_event": len(topologies),
             "target_cycle": list(topologies),
             "offspring_physics_repair_required": True,
         },
@@ -254,8 +317,25 @@ def topology_evolution_contract(fixed_primary_turns: int) -> dict[str, Any]:
             "decay_to_zero_generation": EPSILON_DECAY_GENERATIONS,
             "terminal_epsilon": 0.0,
             "minimum_survivors_per_turn_split_sub_island": (
-                TOPOLOGY_MINIMUM_SURVIVORS_EACH
+                minimum_survivors
             ),
+        },
+        "bounded_diversity_budget": {
+            "population": POPULATION,
+            "protected_topology_count": len(topologies),
+            "minimum_survivors_each": minimum_survivors,
+            "protected_slots": protected_slots,
+            "protected_population_fraction": protected_slots / POPULATION,
+            "maximum_single_protected_topology_count": (
+                maximum_single_topology
+            ),
+            "maximum_single_protected_topology_fraction": (
+                maximum_single_topology / POPULATION
+            ),
+            "additional_model_evaluations": 0,
+            "population_change": 0,
+            "generation_change": 0,
+            "scheduler_task_or_resource_change": False,
         },
         "minimum_evolution_generations": FIXED_GENERATIONS,
         "ftol_early_stop_allowed": False,

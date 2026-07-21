@@ -172,3 +172,187 @@ def test_build_pool_rejects_status_tampering(tmp_path: Path):
             pool_size=4,
             candidate_limit=8,
         )
+
+
+def _basin_fixture(
+    tmp_path: Path,
+    *,
+    name: str,
+    seed: int,
+    topologies: list[int],
+    result_seed: int | None = None,
+) -> Path:
+    root = tmp_path / name
+    cache = root / "cache"
+    canonical = root / "canonical"
+    cache.mkdir(parents=True)
+    canonical.mkdir(parents=True)
+    names = tuple(stage_constraint_names(CURRENT_STAGE_SPEC))
+    rng = np.random.default_rng(seed)
+    x = rng.random((len(topologies), 25))
+    x[:, 2] = np.asarray([(60 - value) / 48.0 for value in topologies])
+    g = np.zeros((len(x), len(names)), dtype=float)
+    g[:, names.index("half_magnetizing_resonance_minimum")] = -1_000.0
+    g[:, names.index("exterior_width_limit")] = -250.0
+    g[:, names.index("exterior_length_limit")] = -250.0
+    g[:, names.index("exterior_height_limit")] = -10.0
+    g[:, names.index("Llt_robust_band")] = np.linspace(-0.2, 0.2, len(x))
+    f = np.column_stack((
+        np.linspace(500.0, 600.0, len(x)),
+        np.linspace(5_000.0, 6_000.0, len(x)),
+    ))
+    artifacts = {}
+    for key, values in {
+        "terminal_X": x,
+        "terminal_G_physical": g,
+        "terminal_F": f,
+    }.items():
+        path = cache / f"{seed}-{key}.npy"
+        np.save(path, values, allow_pickle=False)
+        artifacts[key] = _artifact(path)
+    result_path = cache / f"{seed}-result.json"
+    result_path.write_text(
+        json.dumps({
+            "seed": seed if result_seed is None else result_seed,
+            "island_id": "n1-6-test",
+        }),
+        encoding="utf-8",
+    )
+    status = {
+        "schema_version": "mft-tier1-current7-slurm-rolling-status-v1",
+        "bundle_id": f"fixture-{name}",
+        "constraint_names": list(names),
+        "hard_spec": CURRENT_STAGE_SPEC,
+        "hard_spec_sha256": canonical_sha256(CURRENT_STAGE_SPEC),
+        "terminal_results": [{
+            "seed": seed,
+            "island_id": "n1-6-test",
+            "authenticated": True,
+            "terminal_state": "completed",
+            "artifact_objects": artifacts,
+            "result_object": _artifact(result_path),
+        }],
+    }
+    status_path = canonical / "status.json"
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    index = {
+        "schema_version": "mft-tier1-current7-slurm-rolling-index-v1",
+        "bundle_id": f"fixture-{name}",
+        "path_containment_root": str(root),
+        "constraint_names": list(names),
+        "hard_spec": CURRENT_STAGE_SPEC,
+        "hard_spec_sha256": canonical_sha256(CURRENT_STAGE_SPEC),
+        "snapshot_sha256": f"{seed % 16:x}" * 64,
+        "status": {"path": str(status_path), "sha256": _sha(status_path)},
+    }
+    index_path = canonical / "current7-index.json"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    return index_path
+
+
+def test_basin_pool_combines_indexes_and_seals_actual_source_result_provenance(
+    tmp_path: Path,
+):
+    primary = _basin_fixture(
+        tmp_path,
+        name="primary",
+        seed=31,
+        topologies=[34] * 40 + [35] * 8 + [60] * 8,
+    )
+    donor = _basin_fixture(
+        tmp_path,
+        name="donor",
+        seed=32,
+        topologies=[36] * 8 + [37] * 8 + [38] * 8 + [39] * 2,
+    )
+
+    coordinates, contract_path = build_warm_pool(
+        index_path=primary,
+        donor_index_paths=(donor,),
+        basin_aware=True,
+        stage_spec=_stage(),
+        output_dir=tmp_path / "basin-out",
+        pool_size=56,
+        candidate_limit=82,
+        minimum_distance=0.0,
+    )
+
+    values = np.load(coordinates, allow_pickle=False)
+    payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    basin = payload["basin_aware_selection"]
+    observed = 60 - np.rint(48.0 * values[:, 2]).astype(int)
+    assert set(observed) >= {34, 35, 36, 37, 38, 39, 60}
+    assert len(payload["source_indexes"]) == 2
+    assert basin["source_available_counts"] == {
+        "34": 40,
+        "35": 8,
+        "36": 8,
+        "37": 8,
+        "38": 8,
+        "39": 2,
+        "60": 8,
+    }
+    assert basin["protected_selection_count"] == 50
+    assert basin["protected_selection_cap"] == 56
+    assert basin["downstream_fresh_random_count"] == 160
+    assert all(
+        len(item["source_result_sha256"]) == 64
+        and len(item["source_index_sha256"]) == 64
+        for item in basin["protected_selection"]
+    )
+    unsigned_basin = {
+        key: value for key, value in basin.items() if key != "sha256"
+    }
+    assert basin["sha256"] == canonical_sha256(unsigned_basin)
+
+
+def test_basin_pool_fails_closed_when_a_required_topology_is_absent(
+    tmp_path: Path,
+):
+    primary = _basin_fixture(
+        tmp_path,
+        name="primary-missing",
+        seed=41,
+        topologies=[34] * 40 + [35] * 8 + [60] * 8,
+    )
+    donor = _basin_fixture(
+        tmp_path,
+        name="donor-missing",
+        seed=42,
+        topologies=[36] * 8 + [37] * 8 + [38] * 8,
+    )
+
+    with pytest.raises(RuntimeError, match="omitted required 39/21 donor"):
+        build_warm_pool(
+            index_path=primary,
+            donor_index_paths=(donor,),
+            basin_aware=True,
+            stage_spec=_stage(),
+            output_dir=tmp_path / "missing-out",
+            pool_size=56,
+            candidate_limit=80,
+            minimum_distance=0.0,
+        )
+
+
+def test_basin_pool_fails_closed_on_source_result_identity_mismatch(
+    tmp_path: Path,
+):
+    primary = _basin_fixture(
+        tmp_path,
+        name="primary-mismatch",
+        seed=51,
+        result_seed=999,
+        topologies=[34] * 40 + [35] * 8 + [60] * 8,
+    )
+
+    with pytest.raises(RuntimeError, match="source result identity mismatch"):
+        build_warm_pool(
+            index_path=primary,
+            basin_aware=True,
+            stage_spec=_stage(),
+            output_dir=tmp_path / "mismatch-out",
+            pool_size=56,
+            candidate_limit=56,
+            minimum_distance=0.0,
+        )

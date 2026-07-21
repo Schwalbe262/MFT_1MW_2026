@@ -1924,13 +1924,62 @@ def _seed_turn_split_sub_islands(
     required = len(topologies) * copies
     if values.ndim != 2 or len(values) < required:
         raise RuntimeError("population is too small for turn-split initialization")
+    lanes = contract.get("basin_donor_lanes") or {}
+    lane_topologies = {
+        str(name): tuple(int(pair[0]) for pair in lane[
+            "topologies_N2_main_N2_side"
+        ])
+        for name, lane in lanes.items()
+    }
+    if not lane_topologies:
+        raise RuntimeError("turn-split contract has no basin donor lanes")
+    source_values = values.copy()
+    source_observed = _turn_split_main_values(
+        source_values,
+        fixed_primary_turns=contract["fixed_primary_turns"],
+        coordinate_index=coordinate_index,
+    )
+    donor_sources = []
     for copy_index in range(copies):
         for topology_index, n2_main in enumerate(topologies):
             row = copy_index * len(topologies) + topology_index
+            same_lane = {
+                topology
+                for values_in_lane in lane_topologies.values()
+                if n2_main in values_in_lane
+                for topology in values_in_lane
+            }
+            candidate_tiers = (
+                ("same_topology", source_observed == n2_main),
+                ("same_basin_lane", np.isin(source_observed, sorted(same_lane))),
+                ("protected_basin_topology", np.isin(source_observed, topologies)),
+                ("any_initial_coordinate", np.ones(len(values), dtype=bool)),
+            )
+            ordered_candidates = []
+            candidate_source_tier = {}
+            for tier, mask in candidate_tiers:
+                candidates = np.flatnonzero(mask)
+                for candidate in candidates:
+                    candidate = int(candidate)
+                    if candidate not in candidate_source_tier:
+                        ordered_candidates.append(candidate)
+                        candidate_source_tier[candidate] = tier
+            if not ordered_candidates:  # pragma: no cover
+                raise RuntimeError("turn-split basin has no coordinate donor")
+            source_index = ordered_candidates[copy_index % len(ordered_candidates)]
+            source_tier = candidate_source_tier[source_index]
+            values[row] = source_values[source_index]
             values[row, coordinate_index] = _turn_split_unit_coordinate(
                 n2_main,
                 fixed_primary_turns=contract["fixed_primary_turns"],
             )
+            donor_sources.append({
+                "target_N2_main": n2_main,
+                "copy_index": copy_index,
+                "source_row": source_index,
+                "source_N2_main": int(source_observed[source_index]),
+                "source_tier": source_tier,
+            })
     values = np.asarray(problem.repair_unit_coordinates(values), dtype=float)
     observed = _turn_split_main_values(
         values, fixed_primary_turns=contract["fixed_primary_turns"],
@@ -1943,11 +1992,25 @@ def _seed_turn_split_sub_islands(
     if any(counts[str(topology)] < copies for topology in topologies):
         raise RuntimeError("turn-split initialization repair lost a sub-island")
     audit = {
-        "schema_version": "mft-tier1-turn-split-initialization-v1",
+        "schema_version": "mft-tier1-basin-aware-initialization-v2",
         "topology_counts_after_current_repair": counts,
         "minimum_copies_each_verified": True,
+        "basin_lane_topologies": {
+            name: list(values_in_lane)
+            for name, values_in_lane in lane_topologies.items()
+        },
+        "basin_seeded_counts": {
+            name: sum(counts[str(topology)] for topology in values_in_lane)
+            for name, values_in_lane in lane_topologies.items()
+        },
+        "donor_sources": donor_sources,
+        "same_or_same_lane_donor_count": sum(
+            item["source_tier"] in {"same_topology", "same_basin_lane"}
+            for item in donor_sources
+        ),
         "warm_coordinates_are_donors_only": True,
         "source_prediction_or_pass_classification_inherited": False,
+        "additional_model_evaluations": 0,
     }
     audit["sha256"] = _json_sha(audit)
     return values, audit
@@ -2104,6 +2167,7 @@ def _deep_topology_components(
             self.last_epsilon = None
             self.last_topology_counts = {}
             self.minimum_topology_count_observed = math.inf
+            self.maximum_single_topology_count_observed = 0
 
         def _do(
             self, problem, pop, *args, n_survive=None,
@@ -2167,6 +2231,10 @@ def _deep_topology_components(
             self.last_topology_counts = counts
             self.minimum_topology_count_observed = min(
                 self.minimum_topology_count_observed, min(counts.values()),
+            )
+            self.maximum_single_topology_count_observed = max(
+                self.maximum_single_topology_count_observed,
+                max(counts.values()),
             )
             return survivors
 
@@ -2243,6 +2311,9 @@ def _run_optimizer(
             ),
             "minimum_topology_count_observed": int(
                 executed.survival.minimum_topology_count_observed
+            ),
+            "maximum_single_topology_count_observed": int(
+                executed.survival.maximum_single_topology_count_observed
             ),
             "last_topology_counts": dict(
                 executed.survival.last_topology_counts
@@ -2510,6 +2581,24 @@ def run_search_seed(
                 "minimum_survivors_per_turn_split_sub_island"
             ]
         )
+        diversity_budget = topology_contract["bounded_diversity_budget"]
+        maximum_single_topology = int(
+            diversity_budget["maximum_single_protected_topology_count"]
+        )
+        lane_topologies = {
+            str(name): tuple(
+                int(pair[0])
+                for pair in lane["topologies_N2_main_N2_side"]
+            )
+            for name, lane in topology_contract["basin_donor_lanes"].items()
+        }
+        terminal_lane_counts = {
+            name: sum(
+                terminal_topology_counts[str(topology)]
+                for topology in values
+            )
+            for name, values in lane_topologies.items()
+        }
         operator_audit = getattr(result, "topology_operator_audit", None)
         if (
             not isinstance(operator_audit, dict)
@@ -2520,6 +2609,9 @@ def run_search_seed(
             or operator_audit.get("survival_calls", 0) < 2
             or operator_audit.get("minimum_topology_count_observed", 0)
             < minimum_each
+            or operator_audit.get(
+                "maximum_single_topology_count_observed", math.inf
+            ) > maximum_single_topology
             or operator_audit.get("last_topology_counts")
             != terminal_topology_counts
             or any(
@@ -2545,7 +2637,10 @@ def run_search_seed(
             "schema_version": "mft-tier1-turn-split-evolution-audit-v1",
             **operator_audit,
             "terminal_topology_counts": terminal_topology_counts,
+            "terminal_basin_lane_counts": terminal_lane_counts,
+            "bounded_diversity_budget": diversity_budget,
             "all_required_topologies_preserved": True,
+            "single_topology_collapse_prevented": True,
             "terminal_epsilon_zero": bool(expected_last_epsilon == 0.0),
             "physical_constraint_G_mutation": False,
             "physical_objective_mutation": False,
