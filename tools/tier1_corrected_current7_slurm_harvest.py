@@ -14,6 +14,7 @@ import argparse
 from collections import Counter
 import copy
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import math
@@ -235,7 +236,51 @@ class ReadOnlySchedulerApi:
 
 
 class AccountSftpReader:
-    """Read-only account-aware SFTP transport backed by scheduler config."""
+    """Read-only account-aware SFTP transport backed by scheduler config.
+
+    A Paramiko SFTP client is a channel on the account's SSH transport. Opening
+    a fresh channel for every ``stat`` and ``read`` made the stable-read seal
+    (three stats and two reads per object) spend most of its wall time in SSH
+    channel setup. This reader is used synchronously by the harvester, so one
+    channel per account can safely be retained without changing the order or
+    number of authenticated file operations.
+
+    On an actual transport failure the account's channel and SSH session are
+    discarded and the same operation is retried once on a fresh connection.
+    Content, permission, path, and validation failures are never retried.
+    """
+
+    _RETRYABLE_SOCKET_ERRNOS = frozenset(
+        value
+        for value in (
+            errno.ECONNABORTED,
+            errno.ECONNRESET,
+            errno.ENETDOWN,
+            errno.ENETRESET,
+            errno.ENETUNREACH,
+            errno.ENOTCONN,
+            errno.EPIPE,
+            errno.ETIMEDOUT,
+            getattr(errno, "ESHUTDOWN", None),
+            # Winsock values are not always mapped to errno constants by
+            # third-party transports on Windows.
+            10053,
+            10054,
+            10057,
+            10060,
+        )
+        if value is not None
+    )
+    _RETRYABLE_TRANSPORT_MESSAGES = (
+        "channel closed",
+        "channel is not open",
+        "connection aborted",
+        "connection reset",
+        "connection timed out",
+        "server connection dropped",
+        "session not active",
+        "socket is closed",
+    )
 
     def __init__(self, accounts_path: Path, scheduler_source: Path):
         source = scheduler_source.resolve(strict=True)
@@ -243,14 +288,25 @@ class AccountSftpReader:
             sys.path.insert(0, str(source))
         from slurm_scheduler.config import load_accounts
         from slurm_scheduler.slurm import SSHSession
+        from paramiko.ssh_exception import ChannelException, SSHException
 
         self._session_type = SSHSession
+        self._transport_exception_types = (
+            ConnectionError,
+            EOFError,
+            ChannelException,
+            TimeoutError,
+        )
+        self._ssh_exception_type = SSHException
         self._accounts = {
             account.name: account for account in load_accounts(accounts_path)
         }
         self._sessions: dict[str, Any] = {}
+        self._sftp_clients: dict[str, Any] = {}
         self.read_count = 0
         self.stat_count = 0
+        self.sftp_open_count = 0
+        self.sftp_reconnect_count = 0
 
     def _session(self, account_name: str):
         if account_name not in self._accounts:
@@ -258,43 +314,113 @@ class AccountSftpReader:
         session = self._sessions.get(account_name)
         if session is None:
             session = self._session_type(self._accounts[account_name])
-            session.ensure_connected()
+            try:
+                session.ensure_connected()
+            except Exception:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                raise
             self._sessions[account_name] = session
         return session
 
+    def _sftp(self, account_name: str):
+        sftp = self._sftp_clients.get(account_name)
+        if sftp is None:
+            session = self._session(account_name)
+            self.sftp_open_count += 1
+            sftp = session.client.open_sftp()
+            self._sftp_clients[account_name] = sftp
+        return sftp
+
+    def _discard_sftp(self, account_name: str) -> None:
+        sftp = self._sftp_clients.pop(account_name, None)
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def _discard_account(self, account_name: str) -> None:
+        self._discard_sftp(account_name)
+        session = self._sessions.pop(account_name, None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _is_retryable_transport_error(self, error: BaseException) -> bool:
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, self._transport_exception_types):
+                return True
+            if isinstance(current, (OSError, self._ssh_exception_type)):
+                if (
+                    getattr(current, "errno", None)
+                    in self._RETRYABLE_SOCKET_ERRNOS
+                ):
+                    return True
+                message = str(current).lower()
+                if any(
+                    marker in message
+                    for marker in self._RETRYABLE_TRANSPORT_MESSAGES
+                ):
+                    return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _with_sftp(
+        self, account_name: str, operation: Callable[[Any], Any]
+    ) -> Any:
+        for attempt in range(2):
+            try:
+                return operation(self._sftp(account_name))
+            except Exception as exc:
+                # Never reuse a channel after any failed protocol operation.
+                # Only a positively classified transport failure earns the one
+                # bounded retry; all other errors fail closed immediately.
+                self._discard_sftp(account_name)
+                if attempt or not self._is_retryable_transport_error(exc):
+                    raise
+                self._discard_account(account_name)
+                self.sftp_reconnect_count += 1
+        raise AssertionError("bounded SFTP retry loop fell through")
+
     def stat(self, account_name: str, path: str) -> RemoteFileStat:
-        session = self._session(account_name)
-        sftp = session.client.open_sftp()
         self.stat_count += 1
-        try:
+
+        def operation(sftp: Any) -> RemoteFileStat:
             value = sftp.stat(path)
             return RemoteFileStat(
                 size=int(value.st_size),
                 mtime=int(value.st_mtime),
                 mode=int(value.st_mode),
             )
-        finally:
-            sftp.close()
+
+        return self._with_sftp(account_name, operation)
 
     def read_bytes(
         self, account_name: str, path: str, *, maximum_bytes: int
     ) -> bytes:
-        session = self._session(account_name)
-        sftp = session.client.open_sftp()
         self.read_count += 1
-        try:
+
+        def operation(sftp: Any) -> bytes:
             with sftp.file(path, "rb") as stream:
-                value = stream.read(int(maximum_bytes) + 1)
-        finally:
-            sftp.close()
+                return bytes(stream.read(int(maximum_bytes) + 1))
+
+        value = self._with_sftp(account_name, operation)
         if len(value) > int(maximum_bytes):
             raise RuntimeError(f"remote artifact exceeds byte limit: {path}")
-        return bytes(value)
+        return value
 
     def close(self) -> None:
-        for session in self._sessions.values():
-            session.close()
-        self._sessions.clear()
+        accounts = set(self._sftp_clients) | set(self._sessions)
+        for account_name in accounts:
+            self._discard_account(account_name)
 
 
 def read_stable_remote_file(
