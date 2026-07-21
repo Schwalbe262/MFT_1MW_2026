@@ -21,7 +21,7 @@ import math
 import os
 from pathlib import Path
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 try:
     from tier1_corrected_current7_receipt import canonical_sha256
@@ -293,18 +293,14 @@ def _selected_base_island(
     manifest: Mapping[str, Any], stage: FinalGoalStage
 ) -> tuple[str, dict[str, Any]]:
     matches = []
-    refill_windows = (manifest.get("open_ended_refill") or {}).get(
-        "seed_windows"
-    ) or {}
+    refill_windows = (manifest.get("open_ended_refill") or {}).get("seed_windows") or {}
     for island_id, island in (manifest.get("islands") or {}).items():
         profile = (island or {}).get("current7_profile") or {}
         window = refill_windows.get(island_id) or {}
         if (
             profile.get("fixed_primary_turns") == FIXED_PRIMARY_TURNS
             and int(window.get("start", -1)) <= stage.seed_start
-            and stage.seed_window_end_exclusive <= int(
-                window.get("end_exclusive", -1)
-            )
+            and stage.seed_window_end_exclusive <= int(window.get("end_exclusive", -1))
         ):
             matches.append((str(island_id), dict(profile)))
     if len(matches) != 1:
@@ -329,9 +325,7 @@ def validate_stage_binding(
         raise RuntimeError(f"{stage.stage_id} bundle binding fields drifted")
     if record.get("stage_id") != stage.stage_id:
         raise RuntimeError("bundle binding stage identity mismatch")
-    plan_path = _resolve_from(
-        bindings_root, record.get("offload_plan"), "offload plan"
-    )
+    plan_path = _resolve_from(bindings_root, record.get("offload_plan"), "offload plan")
     publication_path = _resolve_from(
         bindings_root,
         record.get("publication_receipt"),
@@ -564,9 +558,7 @@ def validate_task(
         or task.get("required_capability") != "conda:pyaedt2026v1"
         or task.get("env_profile") != "pyaedt2026v1"
         or not str(task.get("remote_cwd") or "").startswith("/")
-        or not str(task.get("dedupe_key") or "").startswith(
-            "mft-tier1-final1000:"
-        )
+        or not str(task.get("dedupe_key") or "").startswith("mft-tier1-final1000:")
         or not str(task.get("name") or "").startswith("mft-t1fg-")
         or f"--payload-sha256 {payload_sha}" not in command
         or any(token in command.lower() for token in ("ansysedt", "pyaedt.desktop"))
@@ -590,9 +582,7 @@ def build_launch_plan(bindings_path: Path) -> dict[str, Any]:
                 seed=int(lane["seed"]),
                 priority=DEFAULT_PRIORITY,
             )
-            task_waves[wave_name].append(
-                build_stage_task(base, stage=stage, wave=wave)
-            )
+            task_waves[wave_name].append(build_stage_task(base, stage=stage, wave=wave))
     summaries = {
         stage.stage_id: {
             "bundle_id": bindings[stage.stage_id]["plan"]["bundle_id"],
@@ -604,9 +594,7 @@ def build_launch_plan(bindings_path: Path) -> dict[str, Any]:
                 "receipt_sha256"
             ],
             "ready": bindings[stage.stage_id]["publication"]["ready"],
-            "ready_sha256": bindings[stage.stage_id]["publication"][
-                "ready_sha256"
-            ],
+            "ready_sha256": bindings[stage.stage_id]["publication"]["ready_sha256"],
             "base_island_id": bindings[stage.stage_id]["base_island_id"],
             "stage_spec_sha256": stage_profile(stage)["stage_spec_sha256"],
         }
@@ -660,9 +648,7 @@ def build_launch_plan(bindings_path: Path) -> dict[str, Any]:
 
 
 def validate_launch_plan(value: Mapping[str, Any]) -> dict[str, Any]:
-    unsigned = {
-        key: item for key, item in value.items() if key != "launch_plan_sha256"
-    }
+    unsigned = {key: item for key, item in value.items() if key != "launch_plan_sha256"}
     waves = value.get("task_waves") or {}
     canaries = waves.get("canaries") if isinstance(waves, dict) else None
     ramp = waves.get("ramp") if isinstance(waves, dict) else None
@@ -713,9 +699,7 @@ def validate_launch_plan(value: Mapping[str, Any]) -> dict[str, Any]:
             or not isinstance(binding.get("base_island_id"), str)
             or not binding["base_island_id"]
         ):
-            raise RuntimeError(
-                f"{stage.stage_id} launch binding/READY seal mismatch"
-            )
+            raise RuntimeError(f"{stage.stage_id} launch binding/READY seal mismatch")
     tasks = [*canaries, *ramp]
     for task in canaries:
         validate_task(task, expected_wave="canary")
@@ -740,9 +724,7 @@ def validate_launch_plan(value: Mapping[str, Any]) -> dict[str, Any]:
     }
     if stage_counts != SUCCESSOR_ACTIVE_QUOTAS:
         raise RuntimeError("final1000 launch stage quota drifted")
-    canary_stages = {
-        task["payload_json"]["final_goal_stage_id"] for task in canaries
-    }
+    canary_stages = {task["payload_json"]["final_goal_stage_id"] for task in canaries}
     if canary_stages != set(BY_ID):
         raise RuntimeError("final1000 canary set is incomplete")
     return dict(value)
@@ -805,8 +787,7 @@ def _compact_terminal_replay_seal_matches(
         or replay_repair.get("input_count") != population
         or replay_repair.get("output_count") != population
         or not _sealed_mapping(repair_audit)
-        or repair_audit.get("authoritative_terminal_G")
-        != "physical_unscaled_replay"
+        or repair_audit.get("authoritative_terminal_G") != "physical_unscaled_replay"
         or repair_audit.get("terminal_physical_replay") != replay
         or repair_audit.get("stages")
         != {
@@ -819,11 +800,9 @@ def _compact_terminal_replay_seal_matches(
         return False
 
     inventory = result.get("artifact_inventory")
-    if (
-        not isinstance(inventory, dict)
-        or result.get("artifact_inventory_sha256")
-        != canonical_sha256(inventory)
-    ):
+    if not isinstance(inventory, dict) or result.get(
+        "artifact_inventory_sha256"
+    ) != canonical_sha256(inventory):
         return False
     expected_arrays = {
         "terminal_X": ("terminal_X.npy", [population, 25]),
@@ -869,8 +848,7 @@ def _compact_terminal_replay_seal_matches(
         or isinstance(physical_feasible_count, bool)
         or not isinstance(physical_feasible_count, int)
         or not 0 <= physical_feasible_count <= population
-        or infeasibility.get("physical_feasible_count")
-        != physical_feasible_count
+        or infeasibility.get("physical_feasible_count") != physical_feasible_count
         or not isinstance(rows, list)
         or len(rows) != len(constraints)
         or not isinstance(least_physical, dict)
@@ -929,9 +907,20 @@ def _physical_replay_seal_matches(
 
 
 def validate_stage_result(
-    result: Mapping[str, Any], task: Mapping[str, Any]
+    result: Mapping[str, Any],
+    task: Mapping[str, Any],
+    *,
+    task_validator: Callable[[Mapping[str, Any]], Mapping[str, Any]] = validate_task,
 ) -> dict[str, Any]:
-    validated_task = validate_task(task)
+    """Validate terminal physics after authenticating its scheduler envelope.
+
+    ``task_validator`` exists for rolling migrations whose immutable legacy
+    envelopes use the prior 8-core resource policy.  The default remains the
+    current launch policy, and callers must supply an equally strict validator
+    rather than bypassing task authentication.
+    """
+
+    validated_task = dict(task_validator(task))
     payload = validated_task["payload_json"]
     stage = BY_ID[payload["final_goal_stage_id"]]
     spec, constraints = optimizer_stage_contract(stage)

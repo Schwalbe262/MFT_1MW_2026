@@ -23,6 +23,7 @@ from pathlib import Path
 import math
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
+import urllib.error
 import urllib.parse
 
 try:
@@ -44,6 +45,7 @@ try:
         BY_ID,
         STAGES,
         TOTAL_ACTIVE_QUOTA,
+        stage_profile,
     )
 except ImportError:  # pragma: no cover - repository import path
     from tools.tier1_corrected_current7_receipt import canonical_sha256
@@ -64,12 +66,14 @@ except ImportError:  # pragma: no cover - repository import path
         BY_ID,
         STAGES,
         TOTAL_ACTIVE_QUOTA,
+        stage_profile,
     )
 
 
 STATE_SCHEMA = "mft-tier1-final1000-slurm-controller-state-v1"
 RESULT_SCHEMA = "mft-tier1-final1000-slurm-controller-result-v1"
 ROLLING_MIGRATION_SCHEMA = "mft-tier1-final1000-rolling-migration-v1"
+HARVEST_COHORT_SCHEMA = "mft-tier1-final1000-harvest-cohort-v1"
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME_PREFIX = "mft-t1fg-"
 DEDUPE_PREFIX = "mft-tier1-final1000:"
@@ -155,9 +159,7 @@ class SchedulerApiClient(Current7SchedulerApiClient):
                 continue
             if not dedupe.startswith(DEDUPE_PREFIX):
                 raise RuntimeError("final1000 namespace task has foreign dedupe key")
-            if dedupe in inventory and int(inventory[dedupe]["id"]) != int(
-                task["id"]
-            ):
+            if dedupe in inventory and int(inventory[dedupe]["id"]) != int(task["id"]):
                 raise RuntimeError(
                     f"scheduler contains duplicate final1000 dedupe: {dedupe}"
                 )
@@ -179,12 +181,29 @@ class SchedulerApiClient(Current7SchedulerApiClient):
         self._load_inventory()
         return [dict(task) for task in (self._inventory or {}).values()]
 
+    def read_seed_status(self, task_id: int) -> Mapping[str, Any] | None:
+        """Treat scheduler HTTP 429 as an unobserved canary, never a pass.
+
+        The scheduler protects expensive remote-file reads with a busy gate.
+        A busy response is transient evidence absence: the controller must
+        retain the pending gate and retry on its next watch iteration.  Every
+        other identity, JSON, or transport failure remains fail-closed.
+        """
+
+        try:
+            return super().read_seed_status(task_id)
+        except RuntimeError as exc:
+            cause: BaseException | None = exc
+            while cause is not None:
+                if isinstance(cause, urllib.error.HTTPError) and cause.code == 429:
+                    return None
+                cause = cause.__cause__
+            raise
+
 
 def _seal_state(value: Mapping[str, Any]) -> dict[str, Any]:
     unsigned = {
-        key: copy.deepcopy(item)
-        for key, item in value.items()
-        if key != "state_sha256"
+        key: copy.deepcopy(item) for key, item in value.items() if key != "state_sha256"
     }
     migration = unsigned.get("rolling_migration")
     if isinstance(migration, dict):
@@ -228,9 +247,65 @@ def _all_tasks(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _entry(
-    task: Mapping[str, Any], *, origin: str | None = None
-) -> dict[str, Any]:
+def _derived_resource_only_harvest_cohorts(
+    plan: Mapping[str, Any], migration: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Derive the bounded catalog for the already-running phase-1 state.
+
+    The first resource-only successor release predates the explicit catalog.
+    Its old and new tasks intentionally share identical bundle bindings, so
+    those bindings can be reconstructed without ambiguity from the sealed
+    successor plan.  This compatibility path is prohibited for patched-bundle
+    transitions where two distinct binding sets are required.
+    """
+
+    if (
+        migration.get("transition_mode") != "resource_quota_only"
+        or migration.get("predecessor_controller_kind") != "legacy_8c"
+        or migration.get("harvest_cohorts") is not None
+    ):
+        raise RuntimeError("legacy harvest cohort derivation is not applicable")
+    summaries = plan.get("stage_bindings")
+    if not isinstance(summaries, dict) or set(summaries) != set(BY_ID):
+        raise RuntimeError("legacy harvest cohort plan bindings are incomplete")
+
+    def cohort(role: str, launch_plan_sha256: str, policy_id: str) -> dict[str, Any]:
+        stage_bindings = {
+            stage.stage_id: {
+                key: copy.deepcopy(summaries[stage.stage_id].get(key))
+                for key in (
+                    "bundle_id",
+                    "bundle_manifest_sha256",
+                    "remote_bundle",
+                    "publication_receipt_sha256",
+                    "ready_sha256",
+                    "stage_spec_sha256",
+                )
+            }
+            for stage in STAGES
+        }
+        unsigned = {
+            "schema_version": HARVEST_COHORT_SCHEMA,
+            "role": role,
+            "launch_plan_sha256": launch_plan_sha256,
+            "resource_policy_ids": [policy_id],
+            "stage_bindings": stage_bindings,
+        }
+        return {**unsigned, "sha256": canonical_sha256(unsigned)}
+
+    predecessor_sha = str(migration.get("predecessor_launch_plan_sha256") or "")
+    successor_sha = str(plan.get("launch_plan_sha256") or "")
+    if len(predecessor_sha) != 64 or len(successor_sha) != 64:
+        raise RuntimeError("legacy harvest cohort launch identity is invalid")
+    return {
+        "predecessor": cohort(
+            "predecessor", predecessor_sha, LEGACY_RESOURCE_POLICY_ID
+        ),
+        "successor": cohort("successor", successor_sha, SUCCESSOR_RESOURCE_POLICY_ID),
+    }
+
+
+def _entry(task: Mapping[str, Any], *, origin: str | None = None) -> dict[str, Any]:
     payload = task["payload_json"]
     lane = payload["lane"]
     entry = {
@@ -277,9 +352,7 @@ def _initial_state(plan: Mapping[str, Any]) -> dict[str, Any]:
         "scheduler_submit_count": 0,
         "refill_policy": REFILL_POLICY,
         "refill_stage_cursor": 0,
-        "refill_deficit_credit_by_stage": {
-            stage.stage_id: 0 for stage in STAGES
-        },
+        "refill_deficit_credit_by_stage": {stage.stage_id: 0 for stage in STAGES},
     }
     return _seal_state(unsigned)
 
@@ -287,9 +360,7 @@ def _initial_state(plan: Mapping[str, Any]) -> dict[str, Any]:
 def _validate_state(
     state: Mapping[str, Any], plan: Mapping[str, Any]
 ) -> dict[str, Any]:
-    unsigned = {
-        key: item for key, item in state.items() if key != "state_sha256"
-    }
+    unsigned = {key: item for key, item in state.items() if key != "state_sha256"}
     entries = state.get("entries")
     next_seeds = state.get("next_seed_by_stage")
     if (
@@ -317,10 +388,13 @@ def _validate_state(
     ):
         raise RuntimeError("final1000 controller state identity/SHA mismatch")
     migration = state.get("rolling_migration")
+    validated_harvest_cohorts: dict[str, dict[str, Any]] | None = None
     if migration is not None:
-        migration_unsigned = {
-            key: item for key, item in migration.items() if key != "sha256"
-        } if isinstance(migration, dict) else {}
+        migration_unsigned = (
+            {key: item for key, item in migration.items() if key != "sha256"}
+            if isinstance(migration, dict)
+            else {}
+        )
         expected_status_keys = set(BY_ID)
         if (
             not isinstance(migration, dict)
@@ -334,8 +408,7 @@ def _validate_state(
             != plan.get("launch_plan_sha256")
             or migration.get("successor_resource_policy")
             != ROLLING_SUCCESSOR_RESOURCE_POLICY
-            or migration.get("successor_active_quotas")
-            != SUCCESSOR_ACTIVE_QUOTAS
+            or migration.get("successor_active_quotas") != SUCCESSOR_ACTIVE_QUOTAS
             or migration.get("refill_policy") != REFILL_POLICY
             or migration.get("scheduler_mutation_endpoints") != ["POST /api/tasks"]
             or migration.get("cancellation_performed") is not False
@@ -346,6 +419,90 @@ def _validate_state(
             != expected_status_keys
         ):
             raise RuntimeError("final1000 rolling migration seal mismatch")
+        cohorts = migration.get("harvest_cohorts")
+        if cohorts is None:
+            cohorts = _derived_resource_only_harvest_cohorts(plan, migration)
+        if not isinstance(cohorts, dict) or set(cohorts) != {
+            "predecessor",
+            "successor",
+        }:
+            raise RuntimeError("final1000 harvest cohort inventory mismatch")
+        for role in ("predecessor", "successor"):
+            cohort = cohorts.get(role)
+            cohort_unsigned = (
+                {key: item for key, item in cohort.items() if key != "sha256"}
+                if isinstance(cohort, dict)
+                else {}
+            )
+            bindings = (
+                cohort.get("stage_bindings") if isinstance(cohort, dict) else None
+            )
+            policies = (
+                cohort.get("resource_policy_ids") if isinstance(cohort, dict) else None
+            )
+            expected_plan_sha = (
+                migration.get("predecessor_launch_plan_sha256")
+                if role == "predecessor"
+                else plan.get("launch_plan_sha256")
+            )
+            if (
+                not isinstance(cohort, dict)
+                or cohort.get("schema_version") != HARVEST_COHORT_SCHEMA
+                or cohort.get("role") != role
+                or cohort.get("launch_plan_sha256") != expected_plan_sha
+                or cohort.get("sha256") != canonical_sha256(cohort_unsigned)
+                or not isinstance(policies, list)
+                or not policies
+                or policies != sorted(set(policies))
+                or set(policies)
+                - {LEGACY_RESOURCE_POLICY_ID, SUCCESSOR_RESOURCE_POLICY_ID}
+                or not isinstance(bindings, dict)
+                or set(bindings) != set(BY_ID)
+            ):
+                raise RuntimeError("final1000 harvest cohort seal mismatch")
+            for stage in STAGES:
+                binding = bindings.get(stage.stage_id)
+                if (
+                    not isinstance(binding, dict)
+                    or set(binding)
+                    != {
+                        "bundle_id",
+                        "bundle_manifest_sha256",
+                        "remote_bundle",
+                        "publication_receipt_sha256",
+                        "ready_sha256",
+                        "stage_spec_sha256",
+                    }
+                    or not str(binding.get("bundle_id") or "")
+                    or len(str(binding.get("bundle_manifest_sha256") or "")) != 64
+                    or not str(binding.get("remote_bundle") or "").startswith("/")
+                    or len(str(binding.get("publication_receipt_sha256") or "")) != 64
+                    or len(str(binding.get("ready_sha256") or "")) != 64
+                    or binding.get("stage_spec_sha256")
+                    != stage_profile(stage)["stage_spec_sha256"]
+                ):
+                    raise RuntimeError("final1000 harvest stage binding seal mismatch")
+        predecessor_cohort = cohorts["predecessor"]
+        successor_cohort = cohorts["successor"]
+        if successor_cohort["resource_policy_ids"] != [SUCCESSOR_RESOURCE_POLICY_ID]:
+            raise RuntimeError("final1000 successor harvest policy drifted")
+        for stage in STAGES:
+            old = predecessor_cohort["stage_bindings"][stage.stage_id]
+            new = successor_cohort["stage_bindings"][stage.stage_id]
+            same_binding = old == new
+            different_bundle = all(
+                old[key] != new[key]
+                for key in ("bundle_id", "bundle_manifest_sha256", "remote_bundle")
+            )
+            if (
+                migration.get("transition_mode") == "resource_quota_only"
+                and not same_binding
+            ) or (
+                migration.get("transition_mode") == "patched_bundle"
+                and not different_bundle
+            ):
+                raise RuntimeError("final1000 harvest bundle transition drifted")
+        validated_harvest_cohorts = copy.deepcopy(cohorts)
     dedupe: set[str] = set()
     task_ids: set[int] = set()
     seed_identities: set[tuple[str, int]] = set()
@@ -371,7 +528,11 @@ def _validate_state(
             or (entry.get("state") == "planned" and task_id is not None)
             or (
                 entry.get("state") != "planned"
-                and (isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0)
+                and (
+                    isinstance(task_id, bool)
+                    or not isinstance(task_id, int)
+                    or task_id <= 0
+                )
             )
             or (migration is not None and origin not in {"predecessor", "successor"})
             or (
@@ -382,6 +543,20 @@ def _validate_state(
             or (migration is None and origin != "successor")
         ):
             raise RuntimeError("final1000 controller ledger entry drifted")
+        if isinstance(migration, dict):
+            if validated_harvest_cohorts is None:  # pragma: no cover - guarded above
+                raise RuntimeError("final1000 harvest cohorts were not validated")
+            cohort = validated_harvest_cohorts[origin]
+            cohort_binding = cohort["stage_bindings"][stage_id]
+            if (
+                resource_policy_id not in cohort["resource_policy_ids"]
+                or entry.get("bundle_id") != cohort_binding["bundle_id"]
+                or (
+                    origin == "successor"
+                    and resource_policy_id != SUCCESSOR_RESOURCE_POLICY_ID
+                )
+            ):
+                raise RuntimeError("final1000 controller ledger cohort drifted")
         if entry["dedupe_key"] in dedupe or identity in seed_identities:
             raise RuntimeError("final1000 controller ledger contains duplicate work")
         dedupe.add(entry["dedupe_key"])
@@ -424,8 +599,7 @@ def _validate_state(
             for stage in STAGES
         }
         if (
-            migration.get("successor_canary_task_ids_by_stage")
-            != expected_canary_ids
+            migration.get("successor_canary_task_ids_by_stage") != expected_canary_ids
             or migration.get("successor_canary_status_by_stage")
             != expected_canary_status
             or migration.get("predecessor_entry_count")
@@ -434,10 +608,7 @@ def _validate_state(
                 for entry in entries
             )
             or migration.get("next_seed_by_stage")
-            != {
-                stage.stage_id: int(next_seeds[stage.stage_id])
-                for stage in STAGES
-            }
+            != {stage.stage_id: int(next_seeds[stage.stage_id]) for stage in STAGES}
         ):
             raise RuntimeError("final1000 rolling migration ledger seal mismatch")
     return copy.deepcopy(dict(state))
@@ -528,9 +699,7 @@ def _append_refill(
     seed = int(state["next_seed_by_stage"][stage_id])
     if not stage.seed_start <= seed < stage.seed_window_end_exclusive:
         raise RuntimeError(f"{stage_id} seed window exhausted")
-    task = _refill_task(
-        templates[stage_id], stage_id=stage_id, seed=seed, wave=wave
-    )
+    task = _refill_task(templates[stage_id], stage_id=stage_id, seed=seed, wave=wave)
     entry = _entry(
         task,
         origin="successor" if state.get("rolling_migration") is not None else None,
@@ -573,18 +742,17 @@ def _submit_planned(
             continue
         if str(entry.get("origin") or "successor") != "successor":
             raise RuntimeError("predecessor ledger entry cannot be submitted")
-        task = _task_for_entry(
-            entry, plan_index=plan_index, templates=templates
-        )
+        task = _task_for_entry(entry, plan_index=plan_index, templates=templates)
         existing = scheduler.find_task_by_dedupe(entry["dedupe_key"])
         if existing is None:
             existing = scheduler.submit_task(task)
             submitted += 1
         else:
             reconciled += 1
-        if str(existing.get("dedupe_key") or entry["dedupe_key"]) != entry[
-            "dedupe_key"
-        ]:
+        if (
+            str(existing.get("dedupe_key") or entry["dedupe_key"])
+            != entry["dedupe_key"]
+        ):
             raise RuntimeError("scheduler response changed final1000 dedupe identity")
         entry["task_id"] = _task_id(existing)
         entry["state"] = _scheduler_state(existing.get("status")) or "submitted"
@@ -592,9 +760,7 @@ def _submit_planned(
     return submitted, reconciled
 
 
-def _reconcile(
-    state: dict[str, Any], scheduler: SchedulerClient
-) -> int:
+def _reconcile(state: dict[str, Any], scheduler: SchedulerClient) -> int:
     changed = 0
     for entry in state["entries"]:
         if entry["task_id"] is None or entry["state"] in TERMINAL_STATES:
@@ -602,9 +768,10 @@ def _reconcile(
         observed = scheduler.get_task(int(entry["task_id"]))
         if observed is None:
             continue
-        if str(observed.get("dedupe_key") or entry["dedupe_key"]) != entry[
-            "dedupe_key"
-        ]:
+        if (
+            str(observed.get("dedupe_key") or entry["dedupe_key"])
+            != entry["dedupe_key"]
+        ):
             raise RuntimeError("scheduler task changed final1000 dedupe identity")
         mapped = _scheduler_state(observed.get("status"))
         if mapped is not None and mapped != entry["state"]:
@@ -899,8 +1066,7 @@ def control_once(
                 stage_canaries = [
                     entry
                     for entry in state["entries"]
-                    if entry["stage_id"] == stage.stage_id
-                    and entry["wave"] == "canary"
+                    if entry["stage_id"] == stage.stage_id and entry["wave"] == "canary"
                 ]
                 if stage_canaries and all(
                     entry["state"] in TERMINAL_STATES for entry in stage_canaries
@@ -987,9 +1153,7 @@ def control_once(
     )
     for stage_id in refill_stage_order:
         refill_entries.append(
-            _append_refill(
-                state, templates=templates, stage_id=stage_id
-            )
+            _append_refill(state, templates=templates, stage_id=stage_id)
         )
     refill_submitted = 0
     refill_reconciled = 0

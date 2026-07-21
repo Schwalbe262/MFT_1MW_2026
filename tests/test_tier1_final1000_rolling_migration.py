@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 from pathlib import Path
+import urllib.error
 
 import pytest
 
 from tools import tier1_final1000_rolling_migration as migration
+from tools import tier1_corrected_current7_slurm_controller as current7_controller
 from tools import tier1_final1000_slurm_controller as controller
 from tools import tier1_final1000_slurm_launch as launch
 from tools import tier1_final1000_stage_profiles as profiles
@@ -76,9 +79,7 @@ def _successor_plan() -> dict:
         ready = {
             "schema_version": "mft-tier1-current7-slurm-ready-v1",
             "bundle_id": f"successor-{stage.stage_id}",
-            "stage_spec_sha256": profiles.stage_profile(stage)[
-                "stage_spec_sha256"
-            ],
+            "stage_spec_sha256": profiles.stage_profile(stage)["stage_spec_sha256"],
         }
         bindings[stage.stage_id] = {
             "bundle_id": f"successor-{stage.stage_id}",
@@ -88,9 +89,7 @@ def _successor_plan() -> dict:
             "ready": ready,
             "ready_sha256": launch.canonical_sha256(ready),
             "base_island_id": "n1-6-base",
-            "stage_spec_sha256": profiles.stage_profile(stage)[
-                "stage_spec_sha256"
-            ],
+            "stage_spec_sha256": profiles.stage_profile(stage)["stage_spec_sha256"],
         }
     unsigned = {
         "schema_version": launch.LAUNCH_SCHEMA,
@@ -153,11 +152,7 @@ def _predecessor_plan(successor: dict) -> dict:
                 seed=stage.seed_start + offset,
                 wave=wave,
             )
-            plan["task_waves"][
-                "canaries" if wave == "canary" else "ramp"
-            ].append(
-                task
-            )
+            plan["task_waves"]["canaries" if wave == "canary" else "ramp"].append(task)
     plan["resources"] = {
         key: migration.PREDECESSOR_POLICY[key]
         for key in (
@@ -172,7 +167,9 @@ def _predecessor_plan(successor: dict) -> dict:
     plan["open_ended_refill"]["stage_active_quotas"] = {
         stage.stage_id: stage.active_quota for stage in profiles.STAGES
     }
-    unsigned = {key: value for key, value in plan.items() if key != "launch_plan_sha256"}
+    unsigned = {
+        key: value for key, value in plan.items() if key != "launch_plan_sha256"
+    }
     plan["launch_plan_sha256"] = launch.canonical_sha256(unsigned)
     return migration.validate_predecessor_plan(plan)
 
@@ -188,9 +185,7 @@ def _resource_only_successor(predecessor: dict, successor: dict) -> dict:
             stage_id = payload["final_goal_stage_id"]
             binding = plan["stage_bindings"][stage_id]
             payload["bundle_id"] = binding["bundle_id"]
-            payload["bundle_manifest_sha256"] = binding[
-                "bundle_manifest_sha256"
-            ]
+            payload["bundle_manifest_sha256"] = binding["bundle_manifest_sha256"]
             template["remote_cwd"] = binding["remote_bundle"]
             rendered.append(
                 migration._render_from_template_for_policy(
@@ -244,10 +239,7 @@ class _Ready:
 
 class _Scheduler:
     def __init__(self, plan: dict, state: dict):
-        tasks = {
-            task["dedupe_key"]: task
-            for task in migration._plan_tasks(plan)
-        }
+        tasks = {task["dedupe_key"]: task for task in migration._plan_tasks(plan)}
         self.by_id: dict[int, dict] = {}
         self.by_dedupe: dict[str, dict] = {}
         self.seed_status: dict[int, dict] = {}
@@ -301,10 +293,7 @@ class _Scheduler:
     def pass_successor_canaries(self):
         for task_id, task in self.by_id.items():
             payload = task["payload_json"]
-            if (
-                payload["lane"]["wave"] == "canary"
-                and task["cpus"] == 4
-            ):
+            if payload["lane"]["wave"] == "canary" and task["cpus"] == 4:
                 self.seed_status[task_id] = {
                     "seed": payload["seed"],
                     "bundle_id": payload["bundle_id"],
@@ -383,7 +372,10 @@ def test_prepare_dry_run_imports_every_entry_and_seed_without_writes(tmp_path):
     assert not fixture["successor_state_path"].exists()
     assert all(entry["origin"] == "predecessor" for entry in imported["entries"])
     assert imported["next_seed_by_stage"] == fixture["state"]["next_seed_by_stage"]
-    assert len({(entry["stage_id"], entry["seed"]) for entry in imported["entries"]}) == 500
+    assert (
+        len({(entry["stage_id"], entry["seed"]) for entry in imported["entries"]})
+        == 500
+    )
     assert imported["rolling_migration"]["scheduler_mutation_endpoints"] == [
         "POST /api/tasks"
     ]
@@ -407,6 +399,17 @@ def test_resource_quota_only_handoff_reuses_exact_current_bundle_bindings(tmp_pa
     assert value["successor_state"]["rolling_migration"]["transition_mode"] == (
         migration.RESOURCE_QUOTA_ONLY
     )
+    cohorts = value["successor_state"]["rolling_migration"]["harvest_cohorts"]
+    assert set(cohorts) == {"predecessor", "successor"}
+    assert cohorts["predecessor"]["resource_policy_ids"] == [
+        controller.LEGACY_RESOURCE_POLICY_ID
+    ]
+    assert cohorts["successor"]["resource_policy_ids"] == [
+        controller.SUCCESSOR_RESOURCE_POLICY_ID
+    ]
+    assert len(cohorts["predecessor"]["stage_bindings"]) == 4
+    assert len(cohorts["successor"]["stage_bindings"]) == 4
+    assert len(json.dumps(cohorts, sort_keys=True)) < 10_000
     for stage in profiles.STAGES:
         assert (
             resource_plan["stage_bindings"][stage.stage_id]
@@ -417,9 +420,7 @@ def test_resource_quota_only_handoff_reuses_exact_current_bundle_bindings(tmp_pa
 def test_stopped_resource_successor_can_dual_bind_patched_bundles(tmp_path):
     fixture = _fixture(tmp_path)
     patched_plan = fixture["successor"]
-    resource_plan = _resource_only_successor(
-        fixture["predecessor"], patched_plan
-    )
+    resource_plan = _resource_only_successor(fixture["predecessor"], patched_plan)
     fixture["successor"] = resource_plan
     fixture["successor_plan_path"].write_text(json.dumps(resource_plan))
     fixture["ready"] = _Ready(fixture["predecessor"], resource_plan, patched_plan)
@@ -471,13 +472,139 @@ def test_stopped_resource_successor_can_dual_bind_patched_bundles(tmp_path):
     assert value["transition_mode"] == migration.PATCHED_BUNDLE
     assert value["scheduler_post_count"] == 0
     assert value["predecessor_entry_count"] == 504
-    assert value["successor_state"]["rolling_migration"][
-        "predecessor_controller_kind"
-    ] == "resource_quota_successor"
+    assert (
+        value["successor_state"]["rolling_migration"]["predecessor_controller_kind"]
+        == "resource_quota_successor"
+    )
     assert all(
         entry["origin"] == "predecessor"
         for entry in value["successor_state"]["entries"]
     )
+    cohorts = value["successor_state"]["rolling_migration"]["harvest_cohorts"]
+    assert cohorts["predecessor"]["resource_policy_ids"] == [
+        controller.LEGACY_RESOURCE_POLICY_ID,
+        controller.SUCCESSOR_RESOURCE_POLICY_ID,
+    ]
+    assert cohorts["successor"]["resource_policy_ids"] == [
+        controller.SUCCESSOR_RESOURCE_POLICY_ID
+    ]
+    for stage in profiles.STAGES:
+        assert (
+            cohorts["predecessor"]["stage_bindings"][stage.stage_id]["bundle_id"]
+            != cohorts["successor"]["stage_bindings"][stage.stage_id]["bundle_id"]
+        )
+
+
+def test_controller_rejects_entry_that_crosses_harvest_cohort_boundary(tmp_path):
+    fixture = _fixture(tmp_path)
+    value = _prepare(fixture, apply=False)
+    state = value["successor_state"]
+    entry = next(item for item in state["entries"] if item["origin"] == "predecessor")
+    stage_id = entry["stage_id"]
+    entry["bundle_id"] = state["rolling_migration"]["harvest_cohorts"]["successor"][
+        "stage_bindings"
+    ][stage_id]["bundle_id"]
+    state = controller._seal_state(state)
+
+    with pytest.raises(RuntimeError, match="ledger cohort drifted"):
+        controller._validate_state(state, fixture["successor"])
+
+
+def test_controller_rejects_tampered_harvest_cohort_seal(tmp_path):
+    fixture = _fixture(tmp_path)
+    value = _prepare(fixture, apply=False)
+    state = value["successor_state"]
+    state["rolling_migration"]["harvest_cohorts"]["predecessor"][
+        "resource_policy_ids"
+    ] = [controller.SUCCESSOR_RESOURCE_POLICY_ID]
+    state = controller._seal_state(state)
+
+    with pytest.raises(RuntimeError, match="harvest cohort seal mismatch"):
+        controller._validate_state(state, fixture["successor"])
+
+
+def test_live_phase1_state_without_catalog_derives_same_bundle_cohorts(tmp_path):
+    fixture = _fixture(tmp_path)
+    resource_plan = _resource_only_successor(
+        fixture["predecessor"], fixture["successor"]
+    )
+    fixture["successor"] = resource_plan
+    fixture["successor_plan_path"].write_text(json.dumps(resource_plan))
+    fixture["ready"] = _Ready(fixture["predecessor"], resource_plan)
+    value = _prepare(
+        fixture,
+        apply=False,
+        transition_mode=migration.RESOURCE_QUOTA_ONLY,
+    )
+    live_compatible = copy.deepcopy(value["successor_state"])
+    live_compatible["rolling_migration"].pop("harvest_cohorts")
+    live_compatible = controller._seal_state(live_compatible)
+
+    validated = controller._validate_state(live_compatible, resource_plan)
+    assert validated["entries"] == live_compatible["entries"]
+    assert validated["next_seed_by_stage"] == live_compatible["next_seed_by_stage"]
+    assert "harvest_cohorts" not in validated["rolling_migration"]
+    derived = controller._derived_resource_only_harvest_cohorts(
+        resource_plan, validated["rolling_migration"]
+    )
+    assert (
+        derived["predecessor"]["stage_bindings"]
+        == derived["successor"]["stage_bindings"]
+    )
+    assert derived["predecessor"]["resource_policy_ids"] == [
+        controller.LEGACY_RESOURCE_POLICY_ID
+    ]
+    assert derived["successor"]["resource_policy_ids"] == [
+        controller.SUCCESSOR_RESOURCE_POLICY_ID
+    ]
+
+    invalid = copy.deepcopy(live_compatible)
+    invalid["rolling_migration"]["transition_mode"] = migration.PATCHED_BUNDLE
+    invalid = controller._seal_state(invalid)
+    with pytest.raises(RuntimeError, match="derivation is not applicable"):
+        controller._validate_state(invalid, resource_plan)
+
+
+def test_controller_keeps_canary_pending_on_transient_remote_status_429(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path)
+    _prepare(fixture, apply=True)
+    controller.control_once(
+        fixture["successor_plan_path"],
+        state_path=fixture["successor_state_path"],
+        apply=True,
+        scheduler=fixture["scheduler"],
+        ready_probe=fixture["ready"],
+    )
+
+    def busy(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "http://scheduler/remote-file",
+            429,
+            "busy",
+            {},
+            io.BytesIO(b'{"detail":"remote read busy"}'),
+        )
+
+    monkeypatch.setattr(current7_controller.urllib.request, "urlopen", busy)
+    api = controller.SchedulerApiClient("http://scheduler")
+    fixture["scheduler"].read_seed_status = api.read_seed_status
+    value = controller.control_once(
+        fixture["successor_plan_path"],
+        state_path=fixture["successor_state_path"],
+        apply=True,
+        scheduler=fixture["scheduler"],
+        ready_probe=fixture["ready"],
+    )
+
+    assert value["ramp_released"] is False
+    assert value["active_count"] == 500
+    assert value["canary_passed_stage_ids"] == []
+    assert set(value["successor_canary_status_by_stage"].values()) == {
+        "remote_preflight_pending"
+    }
+    assert fixture["scheduler"].mutations == ["POST /api/tasks"] * 4
 
 
 def test_prepare_fails_closed_if_predecessor_state_drifts(tmp_path):
@@ -585,8 +712,7 @@ def test_rolling_controller_fills_only_natural_gaps_and_keeps_exact_500(tmp_path
     # not append one complete stage block followed by the other.
     assert len(set(transfer_order[:12])) == 2
     assert any(
-        transfer_order[index] != transfer_order[index + 1]
-        for index in range(20)
+        transfer_order[index] != transfer_order[index + 1] for index in range(20)
     )
     assert refilled["cancellation_performed"] is False
     assert not hasattr(controller.SchedulerApiClient, "cancel_task")

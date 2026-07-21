@@ -143,3 +143,41 @@ ledger, imports all of them, preserves the next-seed cursors, and resets only
 the patched-bundle canary gate.  Starting the patched controller again replaces
 natural terminal gaps only.  Old and patched bundle tasks may coexist safely;
 no running or queued task is cancelled or rewritten.
+
+## Keep one mixed-ledger UI projection during both phases
+
+The rolling state seals a fixed two-cohort harvest contract; it does not copy
+plans, manifests, or per-task envelopes into growing migration metadata.  Run
+the harvester with both immutable input pairs for the entire natural drain:
+
+```powershell
+python tools\tier1_final1000_slurm_harvest.py `
+  --launch-plan <successor-plan.json> `
+  --bindings <successor-stage-bindings.json> `
+  --predecessor-launch-plan <stopped-predecessor-plan.json> `
+  --predecessor-bindings <stopped-predecessor-stage-bindings.json> `
+  --controller-state <successor-state.json> `
+  --runtime C:\Users\peets\slurm_scheduler_runtime\mft_tier1_final_goal_1000_t100_resmax20_260721 `
+  --scheduler-url http://127.0.0.1:8002 --apply --watch --poll-seconds 30
+```
+
+In phase 1 the two roles share bundle IDs but authenticate different 8-core
+and 4-core resource envelopes.  In phase 2 the predecessor role may contain
+both resource policies under the old bundle IDs while the successor role uses
+the patched bundle IDs.  Every terminal result is checked against the
+manifest/READY receipt belonging to its ledger origin.  The harvester then
+publishes one combined index per condition with explicit
+`source_bundle_cohorts`, `mixed_bundle_projection`, and
+`mixed_resource_policy_projection` evidence.
+
+A scheduler HTTP 429 while reading a canary status is treated only as
+`remote_preflight_pending` and retried on the next controller poll.  It never
+passes the gate or terminates the watch loop; all non-busy identity and content
+errors remain fail-closed.
+
+The already-running phase-1 state created before `harvest_cohorts` was added
+is supported without rewriting it.  Compatibility derivation is allowed only
+for `resource_quota_only + legacy_8c`, where predecessor and successor share
+the exact four bundle bindings.  The harvester still requires both plan and
+binding pairs and checks the predecessor plan SHA before accepting that
+derivation.  A catalog-less patched-bundle state is always rejected.

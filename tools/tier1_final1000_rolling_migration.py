@@ -103,6 +103,7 @@ except ImportError:  # pragma: no cover - repository import path
 
 
 MIGRATION_SCHEMA = "mft-tier1-final1000-rolling-migration-v1"
+HARVEST_COHORT_SCHEMA = "mft-tier1-final1000-harvest-cohort-v1"
 RESOURCE_QUOTA_ONLY = "resource_quota_only"
 PATCHED_BUNDLE = "patched_bundle"
 PREDECESSOR_CPUS = 8
@@ -127,6 +128,11 @@ SUCCESSOR_POLICY = {
     "scheduling_profile": "standard",
     "gpus": 0,
     "inference_threads": INFERENCE_THREADS,
+}
+
+RESOURCE_POLICIES = {
+    LEGACY_RESOURCE_POLICY_ID: PREDECESSOR_POLICY,
+    SUCCESSOR_RESOURCE_POLICY_ID: SUCCESSOR_POLICY,
 }
 
 PAYLOAD_SHA_PATTERN = re.compile(
@@ -163,9 +169,7 @@ def _seal_nested(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def _seal_state(value: Mapping[str, Any]) -> dict[str, Any]:
     unsigned = {
-        key: copy.deepcopy(item)
-        for key, item in value.items()
-        if key != "state_sha256"
+        key: copy.deepcopy(item) for key, item in value.items() if key != "state_sha256"
     }
     migration = unsigned.get("rolling_migration")
     if isinstance(migration, dict):
@@ -179,6 +183,54 @@ def _plan_tasks(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         *[dict(task) for task in waves.get("canaries") or []],
         *[dict(task) for task in waves.get("ramp") or []],
     ]
+
+
+def harvest_cohort_identity(
+    *,
+    role: str,
+    plan: Mapping[str, Any],
+    resource_policy_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Return the bounded identity needed to replay one ledger cohort.
+
+    The controller ledger keeps only a bundle id and resource-policy id per
+    task.  Full launch plans and manifests remain immutable external inputs;
+    this two-role seal proves which of those inputs a harvester may use without
+    copying an ever-growing task history into migration metadata.
+    """
+
+    if role not in {"predecessor", "successor"}:
+        raise ValueError("unknown final1000 harvest cohort role")
+    policies = sorted({str(value) for value in resource_policy_ids})
+    if not policies or any(value not in RESOURCE_POLICIES for value in policies):
+        raise RuntimeError("harvest cohort resource policy identity is invalid")
+    bindings = plan.get("stage_bindings")
+    if not isinstance(bindings, Mapping) or set(bindings) != set(BY_ID):
+        raise RuntimeError("harvest cohort stage binding set is incomplete")
+    stage_bindings: dict[str, dict[str, Any]] = {}
+    for stage in STAGES:
+        binding = bindings.get(stage.stage_id)
+        if not isinstance(binding, Mapping):
+            raise RuntimeError("harvest cohort stage binding is invalid")
+        stage_bindings[stage.stage_id] = {
+            key: copy.deepcopy(binding.get(key))
+            for key in (
+                "bundle_id",
+                "bundle_manifest_sha256",
+                "remote_bundle",
+                "publication_receipt_sha256",
+                "ready_sha256",
+                "stage_spec_sha256",
+            )
+        }
+    unsigned = {
+        "schema_version": HARVEST_COHORT_SCHEMA,
+        "role": role,
+        "launch_plan_sha256": plan.get("launch_plan_sha256"),
+        "resource_policy_ids": policies,
+        "stage_bindings": stage_bindings,
+    }
+    return {**unsigned, "sha256": canonical_sha256(unsigned)}
 
 
 def _task_resources(policy: Mapping[str, Any]) -> dict[str, Any]:
@@ -266,9 +318,7 @@ def _validate_task_for_policy(
 def _validate_plan_for_policy(
     value: Mapping[str, Any], *, policy: Mapping[str, Any]
 ) -> dict[str, Any]:
-    unsigned = {
-        key: item for key, item in value.items() if key != "launch_plan_sha256"
-    }
+    unsigned = {key: item for key, item in value.items() if key != "launch_plan_sha256"}
     waves = value.get("task_waves") or {}
     canaries = waves.get("canaries") if isinstance(waves, dict) else None
     ramp = waves.get("ramp") if isinstance(waves, dict) else None
@@ -352,10 +402,9 @@ def _validate_plan_for_policy(
     for task in tasks:
         payload = task["payload_json"]
         binding = bindings[payload["final_goal_stage_id"]]
-        if (
-            payload.get("bundle_id") != binding.get("bundle_id")
-            or task.get("remote_cwd") != binding.get("remote_bundle")
-        ):
+        if payload.get("bundle_id") != binding.get("bundle_id") or task.get(
+            "remote_cwd"
+        ) != binding.get("remote_bundle"):
             raise RuntimeError("final1000 migration task/bundle identity mismatch")
     return copy.deepcopy(dict(value))
 
@@ -427,9 +476,7 @@ def _render_from_template(
 def _validate_predecessor_state(
     state: Mapping[str, Any], plan: Mapping[str, Any]
 ) -> dict[str, Any]:
-    unsigned = {
-        key: item for key, item in state.items() if key != "state_sha256"
-    }
+    unsigned = {key: item for key, item in state.items() if key != "state_sha256"}
     entries = state.get("entries")
     next_seeds = state.get("next_seed_by_stage")
     if (
@@ -592,9 +639,7 @@ def _scheduler_inventory(
             or not dedupe.startswith(DEDUPE_PREFIX)
         ):
             raise RuntimeError("scheduler final1000 inventory identity drifted")
-        if task_id in by_id or (
-            dedupe in by_dedupe and by_dedupe[dedupe] != task_id
-        ):
+        if task_id in by_id or (dedupe in by_dedupe and by_dedupe[dedupe] != task_id):
             raise RuntimeError("scheduler final1000 inventory duplicated identity")
         by_id[task_id] = row
         by_dedupe[dedupe] = task_id
@@ -646,9 +691,7 @@ def prepare_successor_state(
 ) -> dict[str, Any]:
     """Validate and optionally atomically write a migration controller state."""
 
-    predecessor_plan_raw = _read_json(
-        predecessor_plan_path.resolve(strict=True)
-    )
+    predecessor_plan_raw = _read_json(predecessor_plan_path.resolve(strict=True))
     predecessor_resources = predecessor_plan_raw.get("resources")
     predecessor_controller_kind: str
     if predecessor_resources == {
@@ -688,7 +731,9 @@ def prepare_successor_state(
         predecessor_controller_kind == "resource_quota_successor"
         and transition_mode != PATCHED_BUNDLE
     ):
-        raise RuntimeError("resource/quota successor may transition only to patched bundles")
+        raise RuntimeError(
+            "resource/quota successor may transition only to patched bundles"
+        )
     for stage in STAGES:
         old = predecessor_plan["stage_bindings"][stage.stage_id]
         new = successor_plan["stage_bindings"][stage.stage_id]
@@ -708,15 +753,11 @@ def prepare_successor_state(
             or (transition_mode == PATCHED_BUNDLE and not different_binding)
         ):
             raise RuntimeError("successor bundle transition mode/identity mismatch")
-    predecessor_state_raw = _read_json(
-        predecessor_state_path.resolve(strict=True)
-    )
+    predecessor_state_raw = _read_json(predecessor_state_path.resolve(strict=True))
     predecessor_state = (
         _validate_predecessor_state(predecessor_state_raw, predecessor_plan)
         if predecessor_controller_kind == "legacy_8c"
-        else _validate_resource_successor_state(
-            predecessor_state_raw, predecessor_plan
-        )
+        else _validate_resource_successor_state(predecessor_state_raw, predecessor_plan)
     )
     _verify_ready(predecessor_plan, predecessor_ready_probe, role="predecessor")
     _verify_ready(successor_plan, successor_ready_probe, role="successor")
@@ -725,14 +766,11 @@ def prepare_successor_state(
     )
     if before_final_state_read is not None:
         before_final_state_read()
-    final_predecessor_state = _read_json(
-        predecessor_state_path.resolve(strict=True)
-    )
-    if (
-        final_predecessor_state.get("state_sha256")
-        != predecessor_state_raw.get("state_sha256")
-        or canonical_sha256(final_predecessor_state)
-        != canonical_sha256(predecessor_state_raw)
+    final_predecessor_state = _read_json(predecessor_state_path.resolve(strict=True))
+    if final_predecessor_state.get("state_sha256") != predecessor_state_raw.get(
+        "state_sha256"
+    ) or canonical_sha256(final_predecessor_state) != canonical_sha256(
+        predecessor_state_raw
     ):
         raise RuntimeError("predecessor state drifted during migration preflight")
 
@@ -741,14 +779,13 @@ def prepare_successor_state(
         entry = copy.deepcopy(dict(old_entry))
         entry["state"] = observed_states[int(entry["task_id"])]
         entry["origin"] = "predecessor"
-        entry["resource_policy_id"] = predecessor_state[
-            "_resource_policy_id_by_id"
-        ][int(entry["task_id"])]
+        entry["resource_policy_id"] = predecessor_state["_resource_policy_id_by_id"][
+            int(entry["task_id"])
+        ]
         entries.append(entry)
     active_by_stage = {
         stage.stage_id: sum(
-            entry["stage_id"] == stage.stage_id
-            and entry["state"] in ACTIVE_STATES
+            entry["stage_id"] == stage.stage_id and entry["state"] in ACTIVE_STATES
             for entry in entries
         )
         for stage in STAGES
@@ -767,14 +804,18 @@ def prepare_successor_state(
         ),
         key=lambda row: row["task_id"],
     )
+    predecessor_policy_ids = sorted(
+        {
+            str(value)
+            for value in predecessor_state["_resource_policy_id_by_id"].values()
+        }
+    )
     migration = _seal_nested(
         {
             "schema_version": MIGRATION_SCHEMA,
             "transition_mode": transition_mode,
             "predecessor_controller_kind": predecessor_controller_kind,
-            "predecessor_launch_plan_sha256": predecessor_plan[
-                "launch_plan_sha256"
-            ],
+            "predecessor_launch_plan_sha256": predecessor_plan["launch_plan_sha256"],
             "predecessor_state_sha256": predecessor_state_raw["state_sha256"],
             "predecessor_state_revision": int(predecessor_state_raw["revision"]),
             "successor_launch_plan_sha256": successor_plan["launch_plan_sha256"],
@@ -786,13 +827,24 @@ def prepare_successor_state(
             ),
             "successor_resource_policy": copy.deepcopy(SUCCESSOR_POLICY),
             "successor_active_quotas": copy.deepcopy(SUCCESSOR_ACTIVE_QUOTAS),
+            "harvest_cohorts": {
+                "predecessor": harvest_cohort_identity(
+                    role="predecessor",
+                    plan=predecessor_plan,
+                    resource_policy_ids=predecessor_policy_ids,
+                ),
+                "successor": harvest_cohort_identity(
+                    role="successor",
+                    plan=successor_plan,
+                    resource_policy_ids=[SUCCESSOR_RESOURCE_POLICY_ID],
+                ),
+            },
             "refill_policy": REFILL_POLICY,
             "successor_canary_task_ids_by_stage": {
                 stage.stage_id: [] for stage in STAGES
             },
             "successor_canary_status_by_stage": {
-                stage.stage_id: "waiting_for_natural_terminal_gap"
-                for stage in STAGES
+                stage.stage_id: "waiting_for_natural_terminal_gap" for stage in STAGES
             },
             "scheduler_mutation_endpoints": ["POST /api/tasks"],
             "cancellation_performed": False,
@@ -818,16 +870,16 @@ def prepare_successor_state(
         ),
         "refill_policy": REFILL_POLICY,
         "refill_stage_cursor": 0,
-        "refill_deficit_credit_by_stage": {
-            stage.stage_id: 0 for stage in STAGES
-        },
+        "refill_deficit_credit_by_stage": {stage.stage_id: 0 for stage in STAGES},
         "rolling_migration": migration,
     }
     successor_state = _seal_state(unsigned_state)
     if successor_state_path.exists():
         existing = _read_json(successor_state_path)
         if existing != successor_state:
-            raise RuntimeError("successor state target already exists with other identity")
+            raise RuntimeError(
+                "successor state target already exists with other identity"
+            )
     elif apply:
         _write_state(successor_state_path, successor_state)
     return {

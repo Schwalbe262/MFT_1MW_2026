@@ -52,14 +52,23 @@ try:
         STATE_SCHEMA as CONTROLLER_STATE_SCHEMA,
         TASK_NAME_PREFIX,
         DEDUPE_PREFIX,
+        _derived_resource_only_harvest_cohorts,
         _task_for_entry,
         _task_index,
         _task_templates,
         _validate_state,
     )
+    from tier1_final1000_rolling_migration import (
+        RESOURCE_POLICIES,
+        SUCCESSOR_RESOURCE_POLICY_ID,
+        _render_from_template_for_policy,
+        _validate_task_for_policy,
+        harvest_cohort_identity,
+        validate_predecessor_plan,
+        validate_successor_plan,
+    )
     from tier1_final1000_slurm_launch import (
         load_stage_bindings,
-        validate_launch_plan,
         validate_stage_result,
         validate_task,
     )
@@ -93,14 +102,23 @@ except ImportError:  # pragma: no cover - repository import path
         STATE_SCHEMA as CONTROLLER_STATE_SCHEMA,
         TASK_NAME_PREFIX,
         DEDUPE_PREFIX,
+        _derived_resource_only_harvest_cohorts,
         _task_for_entry,
         _task_index,
         _task_templates,
         _validate_state,
     )
+    from tools.tier1_final1000_rolling_migration import (
+        RESOURCE_POLICIES,
+        SUCCESSOR_RESOURCE_POLICY_ID,
+        _render_from_template_for_policy,
+        _validate_task_for_policy,
+        harvest_cohort_identity,
+        validate_predecessor_plan,
+        validate_successor_plan,
+    )
     from tools.tier1_final1000_slurm_launch import (
         load_stage_bindings,
-        validate_launch_plan,
         validate_stage_result,
         validate_task,
     )
@@ -133,6 +151,20 @@ VISIBLE_SCHEDULER_STATES = frozenset(
 )
 COMPLETED_STATE = "completed"
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "timeout"})
+OBSERVED_TASK_SEAL_FIELDS = (
+    "name",
+    "dedupe_key",
+    "remote_cwd",
+    "required_capability",
+    "env_profile",
+    "cpus",
+    "memory_mb",
+    "scheduling_profile",
+    "gpus",
+    "priority",
+    "timeout_seconds",
+    "max_workers_per_node",
+)
 
 
 class SchedulerReader(Protocol):
@@ -230,36 +262,130 @@ def _assert_runtime_isolated(runtime: Path, protected_index: Path) -> None:
         )
 
 
-def _validate_inputs(
-    launch_plan_path: Path,
-    bindings_path: Path,
-    controller_state_path: Path,
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]:
-    plan = validate_launch_plan(
-        _read_json(launch_plan_path.resolve(strict=True))
-    )
-    bindings = load_stage_bindings(bindings_path)
-    state = _validate_state(
-        _read_json(controller_state_path.resolve(strict=True)), plan
-    )
-    if state.get("schema_version") != CONTROLLER_STATE_SCHEMA:
-        raise RuntimeError("final1000 controller state schema drifted")
+def _validate_plan_bindings(
+    *,
+    role: str,
+    plan: Mapping[str, Any],
+    bindings: Mapping[str, Mapping[str, Any]],
+    resource_policy_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Authenticate one immutable launch/binding cohort for ledger replay."""
+
+    if set(bindings) != set(BY_ID):
+        raise RuntimeError(f"{role} final1000 binding set is incomplete")
     for stage in STAGES:
         summary = plan["stage_bindings"][stage.stage_id]
         binding = bindings[stage.stage_id]
         bundle_plan = binding["plan"]
+        publication = binding["publication"]
         if (
             summary.get("bundle_id") != bundle_plan.get("bundle_id")
             or summary.get("bundle_manifest_sha256")
             != bundle_plan.get("bundle_manifest_sha256")
             or summary.get("remote_bundle") != bundle_plan.get("remote_bundle")
+            or summary.get("publication_receipt_sha256")
+            != publication.get("receipt_sha256")
+            or summary.get("ready") != publication.get("ready")
+            or summary.get("ready_sha256") != publication.get("ready_sha256")
             or summary.get("stage_spec_sha256")
             != stage_profile(stage)["stage_spec_sha256"]
         ):
             raise RuntimeError(
-                f"{stage.stage_id} launch/bundle binding identity mismatch"
+                f"{role} {stage.stage_id} launch/manifest/READY binding mismatch"
             )
-    return plan, bindings, state
+    identity = harvest_cohort_identity(
+        role=role,
+        plan=plan,
+        resource_policy_ids=resource_policy_ids,
+    )
+    templates = {
+        str(task["payload_json"]["final_goal_stage_id"]): copy.deepcopy(task)
+        for task in (plan.get("task_waves") or {}).get("canaries") or []
+    }
+    if set(templates) != set(BY_ID):
+        raise RuntimeError(f"{role} final1000 canary template set is incomplete")
+    return {
+        "role": role,
+        "plan": copy.deepcopy(dict(plan)),
+        "bindings": copy.deepcopy(dict(bindings)),
+        "resource_policy_ids": list(identity["resource_policy_ids"]),
+        "identity": identity,
+        "templates": templates,
+    }
+
+
+def _validate_inputs(
+    launch_plan_path: Path,
+    bindings_path: Path,
+    controller_state_path: Path,
+    *,
+    predecessor_launch_plan_path: Path | None = None,
+    predecessor_bindings_path: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]:
+    successor_plan = validate_successor_plan(
+        _read_json(launch_plan_path.resolve(strict=True))
+    )
+    state = _validate_state(
+        _read_json(controller_state_path.resolve(strict=True)), successor_plan
+    )
+    if state.get("schema_version") != CONTROLLER_STATE_SCHEMA:
+        raise RuntimeError("final1000 controller state schema drifted")
+    migration = state.get("rolling_migration")
+    if migration is None:
+        if (
+            predecessor_launch_plan_path is not None
+            or predecessor_bindings_path is not None
+        ):
+            raise RuntimeError("predecessor inputs require a rolling migration state")
+        successor = _validate_plan_bindings(
+            role="successor",
+            plan=successor_plan,
+            bindings=load_stage_bindings(bindings_path),
+            resource_policy_ids=[SUCCESSOR_RESOURCE_POLICY_ID],
+        )
+        return successor_plan, {"successor": successor}, state
+
+    if predecessor_launch_plan_path is None or predecessor_bindings_path is None:
+        raise RuntimeError(
+            "rolling migration harvest requires predecessor launch and bindings"
+        )
+    predecessor_raw = _read_json(predecessor_launch_plan_path.resolve(strict=True))
+    predecessor_kind = str(migration.get("predecessor_controller_kind") or "")
+    if predecessor_kind == "legacy_8c":
+        predecessor_plan = validate_predecessor_plan(predecessor_raw)
+    elif predecessor_kind == "resource_quota_successor":
+        predecessor_plan = validate_successor_plan(predecessor_raw)
+    else:  # The controller validation should already reject this.
+        raise RuntimeError("rolling migration predecessor kind is unsupported")
+    predecessor_policy_ids = sorted(
+        {
+            str(entry.get("resource_policy_id") or "")
+            for entry in state["entries"]
+            if str(entry.get("origin") or "successor") == "predecessor"
+        }
+    )
+    predecessor = _validate_plan_bindings(
+        role="predecessor",
+        plan=predecessor_plan,
+        bindings=load_stage_bindings(predecessor_bindings_path),
+        resource_policy_ids=predecessor_policy_ids,
+    )
+    successor = _validate_plan_bindings(
+        role="successor",
+        plan=successor_plan,
+        bindings=load_stage_bindings(bindings_path),
+        resource_policy_ids=[SUCCESSOR_RESOURCE_POLICY_ID],
+    )
+    cohorts = {"predecessor": predecessor, "successor": successor}
+    expected = {role: cohort["identity"] for role, cohort in cohorts.items()}
+    sealed_cohorts = migration.get("harvest_cohorts")
+    if sealed_cohorts is None:
+        sealed_cohorts = _derived_resource_only_harvest_cohorts(
+            successor_plan, migration
+        )
+    if sealed_cohorts != expected:
+        raise RuntimeError("rolling migration harvest cohort inputs do not match state")
+    return successor_plan, cohorts, state
 
 
 def _scheduler_cache_path(stage_runtime: Path, task_id: int) -> Path:
@@ -318,14 +444,63 @@ def _validate_observed_task(
     scheduler_state = str(task.get("status") or "").lower()
     if (
         _scheduler_task_id(task) != int(task_id)
-        or task.get("name") != expected["name"]
-        or task.get("dedupe_key") != expected["dedupe_key"]
+        or any(
+            task.get(field) != expected.get(field)
+            for field in OBSERVED_TASK_SEAL_FIELDS
+        )
         or not str(task.get("name") or "").startswith(TASK_NAME_PREFIX)
         or not str(task.get("dedupe_key") or "").startswith(DEDUPE_PREFIX)
         or scheduler_state not in VISIBLE_SCHEDULER_STATES
     ):
         raise RuntimeError(f"scheduler task identity changed: {task_id}")
     return scheduler_state
+
+
+def _entry_task_context(
+    entry: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    plan_index: Mapping[str, Mapping[str, Any]],
+    templates: Mapping[str, Mapping[str, Any]],
+    cohorts: Mapping[str, Mapping[str, Any]],
+    rolling_migration: bool,
+) -> tuple[dict[str, Any], Mapping[str, Any], str, str]:
+    stage_id = str(entry["stage_id"])
+    if not rolling_migration:
+        expected = _task_for_entry(entry, plan_index=plan_index, templates=templates)
+        binding = cohorts["successor"]["bindings"][stage_id]
+        return expected, binding, "successor", SUCCESSOR_RESOURCE_POLICY_ID
+
+    role = str(entry.get("origin") or "")
+    cohort = cohorts.get(role)
+    policy_id = str(entry.get("resource_policy_id") or "")
+    if cohort is None or policy_id not in cohort["resource_policy_ids"]:
+        raise RuntimeError("rolling ledger entry cohort/resource identity is unknown")
+    policy = RESOURCE_POLICIES.get(policy_id)
+    if policy is None:
+        raise RuntimeError("rolling ledger entry resource policy is unsupported")
+    binding = cohort["bindings"][stage_id]
+    bundle_plan = binding["plan"]
+    if entry.get("bundle_id") != bundle_plan.get("bundle_id"):
+        raise RuntimeError("rolling ledger entry bundle does not match its cohort")
+    expected = _render_from_template_for_policy(
+        cohort["templates"][stage_id],
+        stage_id=stage_id,
+        seed=int(entry["seed"]),
+        wave=str(entry["wave"]),
+        policy=policy,
+    )
+    _validate_task_for_policy(expected, policy=policy)
+    payload = expected["payload_json"]
+    if (
+        expected["dedupe_key"] != entry["dedupe_key"]
+        or payload.get("bundle_id") != bundle_plan.get("bundle_id")
+        or payload.get("bundle_manifest_sha256")
+        != bundle_plan.get("bundle_manifest_sha256")
+        or expected.get("remote_cwd") != bundle_plan.get("remote_bundle")
+    ):
+        raise RuntimeError("rolling ledger entry cannot reproduce its sealed task")
+    return expected, binding, role, policy_id
 
 
 def _batch_scheduler_inventory(
@@ -335,9 +510,7 @@ def _batch_scheduler_inventory(
         name_prefix=TASK_NAME_PREFIX,
         limit=SCHEDULER_BATCH_LIMIT,
     )
-    if not isinstance(values, Sequence) or isinstance(
-        values, (str, bytes, bytearray)
-    ):
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray)):
         raise RuntimeError("final1000 scheduler inventory is not a sequence")
     by_id: dict[int, dict[str, Any]] = {}
     by_dedupe: dict[str, int] = {}
@@ -371,6 +544,7 @@ def _inventory_tasks(
     plan: Mapping[str, Any],
     state: Mapping[str, Any],
     *,
+    cohorts: Mapping[str, Mapping[str, Any]],
     scheduler: SchedulerReader,
     runtime: Path,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[tuple[Path, bytes]], int]:
@@ -381,6 +555,7 @@ def _inventory_tasks(
     cache_hits = 0
     seen_task_ids: set[int] = set()
     prepared: list[dict[str, Any]] = []
+    rolling_migration = isinstance(state.get("rolling_migration"), dict)
     for entry in state["entries"]:
         task_id = entry.get("task_id")
         if task_id is None:
@@ -389,10 +564,16 @@ def _inventory_tasks(
         if task_id in seen_task_ids:
             raise RuntimeError("final1000 controller task id is duplicated")
         seen_task_ids.add(task_id)
-        expected = _task_for_entry(
-            entry, plan_index=plan_index, templates=templates
+        expected, binding, binding_role, resource_policy_id = _entry_task_context(
+            entry,
+            plan=plan,
+            plan_index=plan_index,
+            templates=templates,
+            cohorts=cohorts,
+            rolling_migration=rolling_migration,
         )
-        validate_task(expected, expected_stage=BY_ID[entry["stage_id"]])
+        if not rolling_migration:
+            validate_task(expected, expected_stage=BY_ID[entry["stage_id"]])
         stage_runtime = runtime / "conditions" / str(entry["stage_id"])
         cache_path = _scheduler_cache_path(stage_runtime, task_id)
         observed = _load_scheduler_cache(
@@ -409,19 +590,23 @@ def _inventory_tasks(
                 "expected": expected,
                 "cache_path": cache_path,
                 "observed": observed,
+                "binding": binding,
+                "binding_role": binding_role,
+                "resource_policy_id": resource_policy_id,
             }
         )
 
     uncached_count = sum(item["observed"] is None for item in prepared)
-    batch_by_id = (
-        _batch_scheduler_inventory(scheduler) if uncached_count else {}
-    )
+    batch_by_id = _batch_scheduler_inventory(scheduler) if uncached_count else {}
     for prepared_item in prepared:
         entry = prepared_item["entry"]
         task_id = int(prepared_item["task_id"])
         expected = prepared_item["expected"]
         cache_path = prepared_item["cache_path"]
         observed = prepared_item["observed"]
+        binding = prepared_item["binding"]
+        binding_role = str(prepared_item["binding_role"])
+        resource_policy_id = str(prepared_item["resource_policy_id"])
         if observed is None:
             batch_observed = batch_by_id.get(task_id)
             if batch_observed is None:
@@ -469,6 +654,9 @@ def _inventory_tasks(
                 "name": expected["name"],
                 "dedupe_key": expected["dedupe_key"],
                 "bundle_id": payload["bundle_id"],
+                "bundle_manifest_sha256": payload["bundle_manifest_sha256"],
+                "binding_role": binding_role,
+                "resource_policy_id": resource_policy_id,
                 "seed": int(payload["seed"]),
                 "island_id": lane["island_id"],
                 "wave": lane["wave"],
@@ -482,6 +670,7 @@ def _inventory_tasks(
                 "payload": payload,
                 "payload_sha256": canonical_sha256(payload),
                 "_expected_task": expected,
+                "_binding": binding,
             }
         )
     for items in by_stage.values():
@@ -507,9 +696,7 @@ class _LocalCacheReader:
             mode=int(value.st_mode),
         )
 
-    def read_bytes(
-        self, _account_name: str, path: str, *, maximum_bytes: int
-    ) -> bytes:
+    def read_bytes(self, _account_name: str, path: str, *, maximum_bytes: int) -> bytes:
         value = self._path(path).read_bytes()
         if len(value) > int(maximum_bytes):
             raise RuntimeError(f"cached artifact exceeds byte limit: {path}")
@@ -608,7 +795,16 @@ def _load_cached_completed(
     )
 
 
-def _result_validator(expected_task: Mapping[str, Any]) -> Callable[..., None]:
+def _result_validator(
+    expected_task: Mapping[str, Any], resource_policy_id: str
+) -> Callable[..., None]:
+    policy = RESOURCE_POLICIES.get(resource_policy_id)
+    if policy is None:
+        raise RuntimeError("terminal result resource policy is unsupported")
+
+    def validate_task_policy(task: Mapping[str, Any]) -> Mapping[str, Any]:
+        return _validate_task_for_policy(task, policy=policy)
+
     def validate(
         result: Mapping[str, Any],
         *,
@@ -616,7 +812,11 @@ def _result_validator(expected_task: Mapping[str, Any]) -> Callable[..., None]:
         manifest: Mapping[str, Any],
     ) -> None:
         validate_current7_result(result, payload=payload, manifest=manifest)
-        validate_stage_result(result, expected_task)
+        validate_stage_result(
+            result,
+            expected_task,
+            task_validator=validate_task_policy,
+        )
 
     return validate
 
@@ -624,25 +824,35 @@ def _result_validator(expected_task: Mapping[str, Any]) -> Callable[..., None]:
 def _project_stage(
     *,
     stage_id: str,
-    binding: Mapping[str, Any],
+    anchor_binding: Mapping[str, Any],
+    source_cohorts: Sequence[Mapping[str, Any]],
     inventory: Sequence[Mapping[str, Any]],
     remote: RemoteReader,
     runtime: Path,
     observed_at: str,
     fallback_event_at: str,
 ) -> dict[str, Any]:
-    plan = binding["plan"]
-    manifest = binding["manifest"]
+    anchor_plan = anchor_binding["plan"]
+    anchor_manifest = anchor_binding["manifest"]
     observations: list[dict[str, Any]] = []
     refusals: list[dict[str, Any]] = []
     cached_reuse_count = 0
     terminal_failures = [
-        item for item in inventory if item["status"] in TERMINAL_STATES - {COMPLETED_STATE}
+        item
+        for item in inventory
+        if item["status"] in TERMINAL_STATES - {COMPLETED_STATE}
     ]
     for item in inventory:
         if item["status"] != COMPLETED_STATE:
             continue
-        validator = _result_validator(item["_expected_task"])
+        binding = item.get("_binding")
+        if not isinstance(binding, Mapping):
+            raise RuntimeError("terminal task has no authenticated bundle binding")
+        plan = binding["plan"]
+        manifest = binding["manifest"]
+        validator = _result_validator(
+            item["_expected_task"], str(item["resource_policy_id"])
+        )
         public_item = {
             key: copy.deepcopy(value)
             for key, value in item.items()
@@ -671,7 +881,7 @@ def _project_stage(
             refusals.append(
                 {
                     "task_id": int(item["task_id"]),
-                    "bundle_id": plan["bundle_id"],
+                    "bundle_id": item["bundle_id"],
                     "seed": int(item["seed"]),
                     "reason": f"{type(exc).__name__}:{exc}",
                 }
@@ -679,8 +889,7 @@ def _project_stage(
     deduplicated = deduplicate_observations(observations)
     cached, _ = cache_seed_records(runtime, deduplicated, apply=False)
     by_key = {
-        (str(item["bundle_id"]), int(item["seed"])): item
-        for item in deduplicated
+        (str(item["bundle_id"]), int(item["seed"])): item for item in deduplicated
     }
     aggregate_records = []
     for item in cached:
@@ -701,8 +910,8 @@ def _project_stage(
         for item in inventory
     ]
     status, compatibility, index = build_current7_snapshot(
-        plan=plan,
-        manifest=manifest,
+        plan=anchor_plan,
+        manifest=anchor_manifest,
         inventory=public_inventory,
         records=aggregate_records,
         refusals=refusals,
@@ -712,6 +921,40 @@ def _project_stage(
         # Keep an empty/pre-submit cohort immutable across heartbeat cycles.
         # ``observed_at`` belongs only to the mutable index pointer.
         status["updated_at"] = fallback_event_at
+    cohort_projection = []
+    for cohort in source_cohorts:
+        binding = cohort["bindings"][stage_id]
+        summary = cohort["identity"]["stage_bindings"][stage_id]
+        cohort_projection.append(
+            {
+                "role": cohort["role"],
+                "launch_plan_sha256": cohort["plan"]["launch_plan_sha256"],
+                "resource_policy_ids": list(cohort["resource_policy_ids"]),
+                **copy.deepcopy(summary),
+                "manifest_contract_sha256": binding["manifest"]["contract_sha256"],
+            }
+        )
+    cohort_projection_sha = canonical_sha256(cohort_projection)
+    mixed_bundles = len({item["bundle_id"] for item in cohort_projection}) > 1
+    mixed_resources = (
+        len(
+            {
+                policy
+                for item in cohort_projection
+                for policy in item["resource_policy_ids"]
+            }
+        )
+        > 1
+    )
+    status.update(
+        {
+            "projection_anchor_bundle_id": anchor_plan["bundle_id"],
+            "source_bundle_cohorts": cohort_projection,
+            "source_bundle_cohorts_sha256": cohort_projection_sha,
+            "mixed_bundle_projection": mixed_bundles,
+            "mixed_resource_policy_projection": mixed_resources,
+        }
+    )
     index.update(
         {
             "updated_at": status["updated_at"],
@@ -720,6 +963,11 @@ def _project_stage(
             "final_goal_stage_id": stage_id,
             "final_goal_stage_profile_sha256": stage_profile(BY_ID[stage_id])["sha256"],
             "condition_display_only": True,
+            "projection_anchor_bundle_id": anchor_plan["bundle_id"],
+            "source_bundle_cohorts": cohort_projection,
+            "source_bundle_cohorts_sha256": cohort_projection_sha,
+            "mixed_bundle_projection": mixed_bundles,
+            "mixed_resource_policy_projection": mixed_resources,
         }
     )
     index["status"]["sha256"] = _sha_bytes(_json_bytes(status))
@@ -759,6 +1007,11 @@ def _condition_inventory(
                 "projected_file_sha256": _sha_bytes(_json_bytes(index)),
                 "hard_spec_sha256": index["hard_spec_sha256"],
                 "stage_profile_sha256": index["final_goal_stage_profile_sha256"],
+                "source_bundle_cohorts_sha256": index["source_bundle_cohorts_sha256"],
+                "mixed_bundle_projection": index["mixed_bundle_projection"],
+                "mixed_resource_policy_projection": index[
+                    "mixed_resource_policy_projection"
+                ],
             }
         )
     unsigned = {
@@ -793,6 +1046,8 @@ def harvest_once(
     bindings_path: Path,
     controller_state_path: Path,
     *,
+    predecessor_launch_plan_path: Path | None = None,
+    predecessor_bindings_path: Path | None = None,
     scheduler: SchedulerReader,
     remote: RemoteReader,
     runtime: Path = DEFAULT_RUNTIME,
@@ -805,25 +1060,35 @@ def harvest_once(
     state_path = controller_state_path.resolve(strict=True)
     if not state_path.is_relative_to(runtime):
         raise RuntimeError("final1000 controller state is outside its runtime")
-    plan, bindings, state = _validate_inputs(
-        launch_plan_path, bindings_path, state_path
+    plan, cohorts, state = _validate_inputs(
+        launch_plan_path,
+        bindings_path,
+        state_path,
+        predecessor_launch_plan_path=predecessor_launch_plan_path,
+        predecessor_bindings_path=predecessor_bindings_path,
     )
     scheduler_get_before = int(getattr(scheduler, "get_count", 0))
-    scheduler_batch_get_before = int(
-        getattr(scheduler, "batch_get_count", 0)
-    )
+    scheduler_batch_get_before = int(getattr(scheduler, "batch_get_count", 0))
     scheduler_task_get_before = int(getattr(scheduler, "task_get_count", 0))
     by_stage, pending_scheduler_cache, scheduler_cache_hits = _inventory_tasks(
-        plan, state, scheduler=scheduler, runtime=runtime
+        plan,
+        state,
+        cohorts=cohorts,
+        scheduler=scheduler,
+        runtime=runtime,
     )
     heartbeat = observed_at or _observed_at()
     projections = []
+    source_cohorts = [
+        cohorts[role] for role in ("predecessor", "successor") if role in cohorts
+    ]
     for stage in STAGES:
         stage_runtime = runtime / "conditions" / stage.stage_id
         projections.append(
             _project_stage(
                 stage_id=stage.stage_id,
-                binding=bindings[stage.stage_id],
+                anchor_binding=cohorts["successor"]["bindings"][stage.stage_id],
+                source_cohorts=source_cohorts,
                 inventory=by_stage[stage.stage_id],
                 remote=remote,
                 runtime=stage_runtime,
@@ -882,13 +1147,9 @@ def harvest_once(
         "observed_at": heartbeat,
         "scheduler_get_count": int(getattr(scheduler, "get_count", 0))
         - scheduler_get_before,
-        "scheduler_batch_get_count": int(
-            getattr(scheduler, "batch_get_count", 0)
-        )
+        "scheduler_batch_get_count": int(getattr(scheduler, "batch_get_count", 0))
         - scheduler_batch_get_before,
-        "scheduler_task_get_count": int(
-            getattr(scheduler, "task_get_count", 0)
-        )
+        "scheduler_task_get_count": int(getattr(scheduler, "task_get_count", 0))
         - scheduler_task_get_before,
         "scheduler_terminal_cache_hit_count": scheduler_cache_hits,
         "scheduler_mutation_count": 0,
@@ -919,6 +1180,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launch-plan", type=Path, required=True)
     parser.add_argument("--bindings", type=Path, required=True)
+    parser.add_argument("--predecessor-launch-plan", type=Path)
+    parser.add_argument("--predecessor-bindings", type=Path)
     parser.add_argument("--controller-state", type=Path, required=True)
     parser.add_argument("--scheduler-url", default=DEFAULT_SCHEDULER_URL)
     parser.add_argument("--accounts", type=Path, default=DEFAULT_ACCOUNTS)
@@ -953,6 +1216,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.launch_plan,
                     args.bindings,
                     args.controller_state,
+                    predecessor_launch_plan_path=args.predecessor_launch_plan,
+                    predecessor_bindings_path=args.predecessor_bindings,
                     scheduler=scheduler,
                     remote=remote,
                     runtime=args.runtime,
