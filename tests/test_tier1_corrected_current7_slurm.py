@@ -66,6 +66,7 @@ for name in (
     "optimizer-termination-strategy", "optimizer-resonance-scale-hz",
     "optimizer-llt-scale-uh", "optimizer-all-thermal-scale-c",
     "optimizer-repair-contract-sha256",
+    "stage-spec-json", "stage-spec-sha256",
 ):
     parser.add_argument("--" + name, required=True)
 parser.add_argument("--optimizer-resonance-allowance-hz")
@@ -73,6 +74,9 @@ parser.add_argument("--optimizer-llt-allowance-uh")
 args = parser.parse_args()
 relocation = json.loads(Path(args.relocation).read_text())
 identity = relocation["relocated_identity"]
+stage_spec = json.loads(args.stage_spec_json)
+assert stage_spec == identity["hard_spec"]
+assert canonical(stage_spec) == args.stage_spec_sha256
 preflight = {
     "schema_version": "mft-tier1-current7-remote-model-load-v1",
     "status": "passed",
@@ -96,6 +100,7 @@ preflight = {
     "hard_constraint_contract_sha256": identity[
         "hard_constraint_contract_sha256"
     ],
+    "stage_spec_sha256": args.stage_spec_sha256,
     "island_profile_sha256": args.island_profile_sha256,
     "warm_artifact_sha256": hashlib.sha256(
         Path(args.warm_start).read_bytes()

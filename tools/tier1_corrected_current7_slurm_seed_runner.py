@@ -235,6 +235,17 @@ def verify_payload(
         != identity.get("hard_constraint_contract_sha256")
     ):
         raise RuntimeError("bundle hard-constraint identity is not pinned to receipt")
+    if (
+        payload.get("hard_spec") != manifest.get("hard_spec")
+        or payload.get("hard_spec_sha256") != manifest.get("hard_spec_sha256")
+        or canonical_sha256(payload.get("hard_spec"))
+        != payload.get("hard_spec_sha256")
+        or payload.get("constraint_version")
+        != manifest.get("constraint_version")
+        or payload.get("constraint_names")
+        != manifest.get("constraint_names")
+    ):
+        raise RuntimeError("task staged hard-spec identity mismatch")
     for field in (
         "adapter_manifest_sha256",
         "train_report_sha256",
@@ -456,6 +467,7 @@ def validate_remote_preflight(
         != payload["temperature_contract_sha256"]
         or value.get("hard_constraint_contract_sha256")
         != payload["hard_constraint_contract_sha256"]
+        or value.get("stage_spec_sha256") != payload["hard_spec_sha256"]
         or value.get("island_profile_sha256")
         != payload["island_profile_sha256"]
         or value.get("warm_artifact_sha256")
@@ -665,6 +677,16 @@ def _optimizer_command(
         str(profile["optimizer_all_current7_thermal_scale_C"]),
         "--optimizer-repair-contract-sha256",
         str(payload["optimizer_repair_contract_sha256"]),
+        "--stage-spec-json",
+        json.dumps(
+            payload["hard_spec"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ),
+        "--stage-spec-sha256",
+        str(payload["hard_spec_sha256"]),
     ]
     resonance_allowance = profile.get("optimizer_resonance_allowance_Hz")
     llt_allowance = profile.get("optimizer_llt_allowance_uH")

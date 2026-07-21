@@ -923,6 +923,10 @@ def build_task_payload(
         "hard_constraint_contract_sha256": manifest["adapter_receipt"]["identity"][
             "hard_constraint_contract_sha256"
         ],
+        "constraint_version": manifest["constraint_version"],
+        "hard_spec": manifest["hard_spec"],
+        "hard_spec_sha256": manifest["hard_spec_sha256"],
+        "constraint_names": manifest["constraint_names"],
         "optimizer_repair_contract_sha256": repair_contracts[
             str(lane["fixed_primary_turns"])
         ],

@@ -14,6 +14,7 @@ inside the winding-budget calculation rather than mutating decoded geometry.
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -93,15 +94,17 @@ BASE_CONSTRAINT_NAMES = (
     "strict_full_density_support",
     "Llt_ensemble_disagreement",
 )
-ADDITIVE_HARD_CONSTRAINT_NAMES = (
+ADDITIVE_HARD_CONSTRAINT_PREFIX_NAMES = (
     "minimum_physical_insulation",
     "core_group_manufacturability_limit",
-    "half_magnetizing_resonance_minimum",
+)
+RESONANCE_MINIMUM_CONSTRAINT = "half_magnetizing_resonance_minimum"
+RESONANCE_MAXIMUM_CONSTRAINT = "half_magnetizing_resonance_maximum"
+SIZE_CONSTRAINT_NAMES = (
     "exterior_width_limit",
     "exterior_length_limit",
     "exterior_height_limit",
 )
-CURRENT7_CONSTRAINT_NAMES = BASE_CONSTRAINT_NAMES + ADDITIVE_HARD_CONSTRAINT_NAMES
 SIDE_TEMPERATURE_TARGET = "Tprobe_Rx_side_leeward_max"
 
 CURRENT_STAGE_SPEC = {
@@ -111,15 +114,218 @@ CURRENT_STAGE_SPEC = {
     "B_limit_T": 1.2,
     "insulation_min_mm": 40.0,
     "q_sigma": 1.0,
-    "n_core_group_max": 4,
+    "n_core_group_max": 4.0,
     "primary_conductor_thickness_mm": 5.0,
     "resonance_min_Hz": 15_000.0,
+    "resonance_max_Hz": None,
     "magnetizing_inductance_factor": 0.5,
     "size_W_max_mm": 1_200.0,
     "size_L_max_mm": 1_200.0,
     "size_H_max_mm": 750.0,
 }
 CURRENT_STAGE_SPEC_SHA256 = canonical_sha256(CURRENT_STAGE_SPEC)
+STAGED_SPEC_OPTIONAL_KEYS = frozenset()
+STAGED_SPEC_MUTABLE_KEYS = frozenset({
+    "T_limit_C",
+    "resonance_min_Hz",
+    "resonance_max_Hz",
+    "size_W_max_mm",
+    "size_L_max_mm",
+    "size_H_max_mm",
+})
+STAGED_HARD_CONTRACT_SCHEMA = "mft-tier1-staged-hard-constraint-contract-v1"
+
+
+def _stage_positive_number(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise RuntimeError(f"{label} must be finite and positive")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(f"{label} must be finite and positive") from exc
+    if not math.isfinite(number) or number <= 0.0:
+        raise RuntimeError(f"{label} must be finite and positive")
+    return number
+
+
+def validate_stage_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a canonical staged hard spec or fail closed.
+
+    Geometry, robust temperature and self-resonance limits are the only stage
+    axes.  Manufacturing, leakage, flux and magnetizing-inductance semantics
+    remain pinned to the authenticated current-seven problem.
+    """
+
+    if not isinstance(spec, Mapping):
+        raise RuntimeError("Tier-1 stage spec must be an object")
+    supplied = dict(spec)
+    required = set(CURRENT_STAGE_SPEC)
+    allowed = required | set(STAGED_SPEC_OPTIONAL_KEYS)
+    if set(supplied) - allowed or required - set(supplied):
+        raise RuntimeError("Tier-1 stage spec has missing or unknown keys")
+    normalized: dict[str, Any] = {}
+    for name in CURRENT_STAGE_SPEC:
+        value = supplied[name]
+        if name in {"resonance_min_Hz", "resonance_max_Hz"} and value is None:
+            normalized[name] = None
+        else:
+            normalized[name] = _stage_positive_number(
+                value, f"stage spec {name}"
+            )
+    maximum = supplied.get("resonance_max_Hz")
+    normalized["resonance_max_Hz"] = (
+        None
+        if maximum is None
+        else _stage_positive_number(maximum, "stage spec resonance_max_Hz")
+    )
+    for name, expected in CURRENT_STAGE_SPEC.items():
+        if name in STAGED_SPEC_MUTABLE_KEYS:
+            continue
+        if not math.isclose(
+            float(normalized[name]), float(expected), rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise RuntimeError(f"Tier-1 staged search forbids overriding {name}")
+    minimum = normalized["resonance_min_Hz"]
+    maximum = normalized["resonance_max_Hz"]
+    if minimum is None and maximum is None:
+        raise RuntimeError("Tier-1 stage requires a resonance lower or upper bound")
+    if minimum is not None and maximum is not None and minimum >= maximum:
+        raise RuntimeError("Tier-1 resonance lower bound must be below upper bound")
+    return normalized
+
+
+def stage_constraint_names(spec: Mapping[str, Any]) -> tuple[str, ...]:
+    normalized = validate_stage_spec(spec)
+    resonance = []
+    if normalized["resonance_min_Hz"] is not None:
+        resonance.append(RESONANCE_MINIMUM_CONSTRAINT)
+    if normalized["resonance_max_Hz"] is not None:
+        resonance.append(RESONANCE_MAXIMUM_CONSTRAINT)
+    return (
+        BASE_CONSTRAINT_NAMES
+        + ADDITIVE_HARD_CONSTRAINT_PREFIX_NAMES
+        + tuple(resonance)
+        + SIZE_CONSTRAINT_NAMES
+    )
+
+
+def stage_spec_from_json_identity(
+    encoded: str, expected_sha256: str
+) -> dict[str, Any]:
+    try:
+        value = json.loads(encoded)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("staged hard spec is not valid JSON") from exc
+    normalized = validate_stage_spec(value)
+    if canonical_sha256(normalized) != str(expected_sha256):
+        raise RuntimeError("staged hard-spec SHA-256 mismatch")
+    return normalized
+
+
+def half_magnetizing_resonance_band_violations(
+    frequency_hz: Any, spec: Mapping[str, Any]
+) -> dict[str, float]:
+    """Return authoritative physical ``G <= 0`` values for a staged band."""
+
+    normalized = validate_stage_spec(spec)
+    return _resonance_band_violations(
+        frequency_hz,
+        normalized["resonance_min_Hz"],
+        normalized["resonance_max_Hz"],
+    )
+
+
+def _resonance_band_violations(
+    frequency_hz: Any,
+    minimum_hz: float | None,
+    maximum_hz: float | None,
+) -> dict[str, float]:
+    frequency = _stage_positive_number(
+        frequency_hz, "half-magnetizing self-resonance frequency"
+    )
+    violations: dict[str, float] = {}
+    if minimum_hz is not None:
+        violations[RESONANCE_MINIMUM_CONSTRAINT] = (
+            float(minimum_hz) - frequency
+        )
+    if maximum_hz is not None:
+        strict_maximum = math.nextafter(float(maximum_hz), -math.inf)
+        violations[RESONANCE_MAXIMUM_CONSTRAINT] = frequency - strict_maximum
+    return violations
+
+
+def stage_temperature_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = validate_stage_spec(spec)
+    if math.isclose(
+        normalized["T_limit_C"],
+        CURRENT_STAGE_SPEC["T_limit_C"],
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        return copy.deepcopy(CURRENT_TEMPERATURE_CONTRACT)
+    contract = copy.deepcopy(CURRENT_TEMPERATURE_CONTRACT)
+    limit = float(normalized["T_limit_C"])
+    contract.update({
+        "schema_version": "mft-tier1-current7-temperature-contract-v2",
+        "semantic_version": (
+            f"current7-robust-q90-half-width-staged-{limit:g}C-v1"
+        ),
+        "robust_upper_bound_C": limit,
+    })
+    return contract
+
+
+def stage_hard_constraint_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = validate_stage_spec(spec)
+    if normalized == validate_stage_spec(CURRENT_STAGE_SPEC):
+        return copy.deepcopy(CURRENT_STAGE_HARD_CONTRACT)
+    minimum = normalized["resonance_min_Hz"]
+    maximum = normalized["resonance_max_Hz"]
+    resonance: dict[str, Any] = {
+        "aggregation": "min(f_res_tx_self_Hz,f_res_rx_self_Hz)",
+        "magnetizing_inductance_factor": normalized[
+            "magnetizing_inductance_factor"
+        ],
+        "interwinding_resonance_is_not_part_of_this_band": True,
+        "lower_bound_inclusive_Hz": minimum,
+        "upper_bound_exclusive_Hz": maximum,
+        "minimum_violation_formula": (
+            None
+            if minimum is None
+            else "resonance_min_Hz-min(f_res_tx_half_Lm_Hz,f_res_rx_half_Lm_Hz)"
+        ),
+        "maximum_violation_formula": (
+            None
+            if maximum is None
+            else (
+                "min(f_res_tx_half_Lm_Hz,f_res_rx_half_Lm_Hz)-"
+                "nextafter(resonance_max_Hz,-inf)"
+            )
+        ),
+    }
+    contract = copy.deepcopy(CURRENT_STAGE_HARD_CONTRACT)
+    contract.update({
+        "schema_version": STAGED_HARD_CONTRACT_SCHEMA,
+        "stage": f"staged-{canonical_sha256(normalized)[:16]}",
+        "temperature_limit_C": normalized["T_limit_C"],
+        "self_resonance": resonance,
+        "size_limits_mm": {
+            "W": normalized["size_W_max_mm"],
+            "L": normalized["size_L_max_mm"],
+            "H": normalized["size_H_max_mm"],
+        },
+        "constraint_names": list(stage_constraint_names(normalized)),
+        "stage_spec_sha256": canonical_sha256(normalized),
+    })
+    return contract
+
+
+ADDITIVE_HARD_CONSTRAINT_NAMES = (
+    ADDITIVE_HARD_CONSTRAINT_PREFIX_NAMES
+    + (RESONANCE_MINIMUM_CONSTRAINT,)
+    + SIZE_CONSTRAINT_NAMES
+)
+CURRENT7_CONSTRAINT_NAMES = stage_constraint_names(CURRENT_STAGE_SPEC)
 
 EXPECTED_SIMPLE_BASE_FIXED_STACK_MM = {
     "core_plate_t": 20.0,
@@ -983,16 +1189,12 @@ def create_current7_problem_class(
             fixed_overrides: Mapping[str, Any] | None = None,
             fixed_primary_turns: int | None = None,
         ) -> None:
-            effective_spec = dict(CURRENT_STAGE_SPEC)
-            for name, value in dict(spec or {}).items():
-                if name in CURRENT_STAGE_SPEC and not math.isclose(
-                    _finite_number(value, name),
-                    float(CURRENT_STAGE_SPEC[name]),
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                ):
-                    raise ValueError(f"Tier-1 hard stage forbids overriding {name}")
-                effective_spec[name] = value
+            effective_spec = validate_stage_spec(spec or CURRENT_STAGE_SPEC)
+            constraint_names = stage_constraint_names(effective_spec)
+            temperature_contract = stage_temperature_contract(effective_spec)
+            hard_constraint_contract = stage_hard_constraint_contract(
+                effective_spec
+            )
 
             overrides = dict(fixed_overrides or {})
             for name in VARIABLE_COOLING_DIMENSIONS:
@@ -1024,7 +1226,11 @@ def create_current7_problem_class(
                 raise RuntimeError("current7 base constraint schema drifted")
             if int(self.n_ieq_constr) != len(BASE_CONSTRAINT_NAMES):
                 raise RuntimeError("current7 base constraint width drifted")
-            for name, expected in CURRENT_STAGE_SPEC.items():
+            for name, expected in effective_spec.items():
+                if expected is None:
+                    if self.spec.get(name) is not None:
+                        raise RuntimeError(f"Tier-1 stage spec escaped: {name}")
+                    continue
                 if not math.isclose(
                     _finite_number(self.spec.get(name), name),
                     float(expected),
@@ -1090,8 +1296,21 @@ def create_current7_problem_class(
             )
 
             self.base_constraint_names = BASE_CONSTRAINT_NAMES
-            self.constraint_names = CURRENT7_CONSTRAINT_NAMES
-            self.n_ieq_constr = len(CURRENT7_CONSTRAINT_NAMES)
+            self.stage_spec = effective_spec
+            self.stage_spec_sha256 = canonical_sha256(effective_spec)
+            self.temperature_contract = temperature_contract
+            self.temperature_contract_sha256 = canonical_sha256(
+                temperature_contract
+            )
+            self.hard_constraint_contract = hard_constraint_contract
+            self.hard_constraint_contract_sha256 = canonical_sha256(
+                hard_constraint_contract
+            )
+            self.constraint_names = constraint_names
+            self.constraint_index = {
+                name: index for index, name in enumerate(constraint_names)
+            }
+            self.n_ieq_constr = len(constraint_names)
             self.variable_cooling_dimensions = VARIABLE_COOLING_DIMENSIONS
             self.sobol_dimension_names = tuple(names)
             self.fixed_cooling_pads_mm = dict(FIXED_COOLING_PADS_MM)
@@ -1554,7 +1773,7 @@ def create_current7_problem_class(
             for index in np.flatnonzero(valid):
                 row = _frame_row(frame, int(index))
                 for name, expected in {
-                    "cw1": CURRENT_STAGE_SPEC[
+                    "cw1": self.spec[
                         "primary_conductor_thickness_mm"
                     ],
                     **FIXED_COOLING_PADS_MM,
@@ -1765,7 +1984,7 @@ def create_current7_problem_class(
                 frame, _shrink, valid = self._last_decode
                 objectives = np.asarray(out.get("F"), dtype=float)
                 constraints = np.asarray(out.get("G"), dtype=float)
-                expected_shape = (len(values), len(CURRENT7_CONSTRAINT_NAMES))
+                expected_shape = (len(values), len(self.constraint_names))
                 if objectives.shape != (len(values), 2):
                     raise RuntimeError("current7 objective shape mismatch")
                 if constraints.shape != expected_shape:
@@ -1779,16 +1998,21 @@ def create_current7_problem_class(
                     sub = frame.iloc[indices] if hasattr(frame, "iloc") else [
                         frame[int(index)] for index in indices
                     ]
-                    side_index = self.constraint_names.index(
+                    side_index = self.constraint_index[
                         f"temperature_robust_limit:{SIDE_TEMPERATURE_TARGET}"
-                    )
+                    ]
                     constraints[indices, side_index] = (
                         apply_current7_side_temperature_condition(
                             constraints[indices, side_index], sub, invalid_value=BIG
                         )
                     )
-                    first_additive = len(BASE_CONSTRAINT_NAMES)
-                    constraints[indices, first_additive] = (
+                    insulation_index = self.constraint_index[
+                        "minimum_physical_insulation"
+                    ]
+                    group_index = self.constraint_index[
+                        "core_group_manufacturability_limit"
+                    ]
+                    constraints[indices, insulation_index] = (
                         minimum_physical_insulation_violation(
                             sub,
                             self.spec["insulation_min_mm"],
@@ -1804,10 +2028,10 @@ def create_current7_problem_class(
                                 "n_core_group",
                             )
                             constraints[
-                                global_index, first_additive + 1
+                                global_index, group_index
                             ] = group_count - float(self.spec["n_core_group_max"])
                         except RuntimeError:
-                            constraints[global_index, first_additive + 1] = BIG
+                            constraints[global_index, group_index] = BIG
 
                     mean_llt, _ = self._predict("Llt_phys", sub)
                     mean_k, _ = self._predict("k", sub)
@@ -1829,11 +2053,28 @@ def create_current7_problem_class(
                                 ],
                             )
                             minimum = screen["f_res_min_tx_rx_only_Hz"]
-                            constraints[
-                                global_index, first_additive + 2
-                            ] = float(self.spec["resonance_min_Hz"]) - minimum
+                            resonance_g = (
+                                _resonance_band_violations(
+                                    minimum,
+                                    self.stage_spec["resonance_min_Hz"],
+                                    self.stage_spec["resonance_max_Hz"],
+                                )
+                            )
+                            for resonance_name, violation in resonance_g.items():
+                                constraints[
+                                    global_index,
+                                    self.constraint_index[resonance_name],
+                                ] = violation
                         except (RuntimeError, ValueError, OverflowError, ZeroDivisionError):
-                            constraints[global_index, first_additive + 2] = BIG
+                            for resonance_name in (
+                                RESONANCE_MINIMUM_CONSTRAINT,
+                                RESONANCE_MAXIMUM_CONSTRAINT,
+                            ):
+                                if resonance_name in self.constraint_names:
+                                    constraints[
+                                        global_index,
+                                        self.constraint_index[resonance_name],
+                                    ] = BIG
 
                         try:
                             _volume, dimensions = bounding_box_lit(row)
@@ -1848,18 +2089,17 @@ def create_current7_problem_class(
                                 self.spec["size_L_max_mm"],
                                 self.spec["size_H_max_mm"],
                             )
-                            constraints[
-                                global_index,
-                                first_additive + 3:first_additive + 6,
-                            ] = [
-                                observed - float(limit)
-                                for observed, limit in zip(dimensions, limits)
-                            ]
+                            for name, observed, limit in zip(
+                                SIZE_CONSTRAINT_NAMES, dimensions, limits
+                            ):
+                                constraints[
+                                    global_index, self.constraint_index[name]
+                                ] = observed - float(limit)
                         except (RuntimeError, KeyError, TypeError, ValueError, OverflowError):
-                            constraints[
-                                global_index,
-                                first_additive + 3:first_additive + 6,
-                            ] = BIG
+                            for name in SIZE_CONSTRAINT_NAMES:
+                                constraints[
+                                    global_index, self.constraint_index[name]
+                                ] = BIG
 
                 objectives[~np.isfinite(objectives)] = BIG
                 constraints[~np.isfinite(constraints)] = BIG
@@ -2019,9 +2259,19 @@ def install_optimizer_scaling(
     scales = {name: 1.0 for name in names}
     allowances = {name: 0.0 for name in names}
     scales["Llt_robust_band"] = llt_scale
-    scales["half_magnetizing_resonance_minimum"] = resonance_scale
+    for resonance_name in (
+        RESONANCE_MINIMUM_CONSTRAINT,
+        RESONANCE_MAXIMUM_CONSTRAINT,
+    ):
+        if resonance_name in names:
+            scales[resonance_name] = resonance_scale
     allowances["Llt_robust_band"] = llt_allowance
-    allowances["half_magnetizing_resonance_minimum"] = resonance_allowance
+    for resonance_name in (
+        RESONANCE_MINIMUM_CONSTRAINT,
+        RESONANCE_MAXIMUM_CONSTRAINT,
+    ):
+        if resonance_name in names:
+            allowances[resonance_name] = resonance_allowance
     for name in names:
         if name.startswith("temperature_robust_limit:"):
             scales[name] = thermal_scale
@@ -2178,7 +2428,9 @@ class Current7Tier1Runner:
         valid = np.asarray(out.get("decoder_valid"), dtype=bool)
         if (
             objectives.shape != (len(values), 2)
-            or constraints.shape != (len(values), len(CURRENT7_CONSTRAINT_NAMES))
+            or constraints.shape != (
+                len(values), len(self.problem.constraint_names)
+            )
             or valid.shape != (len(values),)
             or not np.isfinite(objectives).all()
             or not np.isfinite(constraints).all()
@@ -2237,7 +2489,7 @@ class Current7Tier1Runner:
             budget_passed.append(
                 winding_budget_identity(
                     replay["frame"].iloc[index],
-                    expected_cw1_mm=CURRENT_STAGE_SPEC[
+                    expected_cw1_mm=self.problem.spec[
                         "primary_conductor_thickness_mm"
                     ],
                 ).get("passed") is True
@@ -2631,6 +2883,7 @@ def build_authenticated_runner(
     code_root: Path,
     expected_code_revision: str,
     fixed_primary_turns: int,
+    stage_spec: Mapping[str, Any] | None = None,
     inference_threads: int = 1,
 ) -> Current7Tier1Runner:
     """Authenticate, load exactly once, and construct the smoke-only runner."""
@@ -2684,12 +2937,15 @@ def build_authenticated_runner(
     )
     problem = problem_class(
         models,
+        spec=stage_spec,
         density_gate=density_gate,
         fixed_primary_turns=fixed_primary_turns,
     )
     if (
-        tuple(problem.constraint_names) != CURRENT7_CONSTRAINT_NAMES
-        or int(problem.n_ieq_constr) != len(CURRENT7_CONSTRAINT_NAMES)
+        tuple(problem.constraint_names) != stage_constraint_names(
+            problem.stage_spec
+        )
+        or int(problem.n_ieq_constr) != len(problem.constraint_names)
         or problem.offspring_physics_repair is not True
         or problem.launch_eligible is not True
     ):
@@ -2717,6 +2973,7 @@ def runner_for_fixed_primary_turns(
         raise ValueError("fixed_primary_turns must be exactly 5 or 6")
     problem = type(runner.problem)(
         runner.models,
+        spec=runner.problem.stage_spec,
         density_gate=runner.density_gate,
         fixed_primary_turns=int(fixed_primary_turns),
     )
@@ -2963,6 +3220,7 @@ def build_relocated_authenticated_runner(
     code_root: Path,
     fixed_primary_turns: int,
     inference_threads: int,
+    stage_spec: Mapping[str, Any],
 ) -> Current7Tier1Runner:
     """Load one relocated generation once and construct one fixed-N1 runner."""
 
@@ -2997,6 +3255,7 @@ def build_relocated_authenticated_runner(
     )
     problem = problem_class(
         models,
+        spec=stage_spec,
         density_gate=density_gate,
         fixed_primary_turns=fixed_primary_turns,
     )
@@ -3446,7 +3705,7 @@ def _candidate_records(
         )
         constraint_g = {
             name: float(g[index, position])
-            for position, name in enumerate(CURRENT7_CONSTRAINT_NAMES)
+            for position, name in enumerate(runner.problem.constraint_names)
         }
         temperature_predictions = {
             target: {
@@ -3473,7 +3732,7 @@ def _candidate_records(
         )
         budget = winding_budget_identity(
             row,
-            expected_cw1_mm=CURRENT_STAGE_SPEC[
+            expected_cw1_mm=runner.problem.spec[
                 "primary_conductor_thickness_mm"
             ],
         )
@@ -3619,7 +3878,7 @@ def persist_search_outputs(
     physical_g = np.asarray(replay["G"], dtype=float)
     decoder_valid = np.asarray(replay["decoder_valid"], dtype=bool)
     frame = replay["frame"]
-    expected = (len(terminal_x), len(CURRENT7_CONSTRAINT_NAMES))
+    expected = (len(terminal_x), len(runner.problem.constraint_names))
     if (
         terminal_x.ndim != 2
         or terminal_x.shape[1] != int(runner.problem.n_var)
@@ -3725,7 +3984,7 @@ def persist_search_outputs(
         "automatic_promotion_allowed": False,
     })
     per_constraint = []
-    for position, name in enumerate(CURRENT7_CONSTRAINT_NAMES):
+    for position, name in enumerate(runner.problem.constraint_names):
         values = physical_g[:, position]
         per_constraint.append({
             "index": position,
@@ -3753,7 +4012,7 @@ def persist_search_outputs(
         ),
         "least_physical_constraint_G": {
             name: float(physical_g[least_index, position])
-            for position, name in enumerate(CURRENT7_CONSTRAINT_NAMES)
+            for position, name in enumerate(runner.problem.constraint_names)
         },
         "constraints": per_constraint,
         "production_eligible": False,
@@ -3810,6 +4069,10 @@ def build_smoke_receipt(
     if not supplied or set(runners) != set(expected_keys):
         raise RuntimeError("dual-stratum smoke inventory must be exactly N1=5 and N1=6")
     first = runners[expected_keys[0]]
+    stage_spec = validate_stage_spec(first.problem.stage_spec)
+    constraint_names = tuple(first.problem.constraint_names)
+    temperature_contract = first.problem.temperature_contract
+    hard_constraint_contract = first.problem.hard_constraint_contract
     if (
         not first.model_cache.loaded_once
         or first.model_cache.load_calls != 1
@@ -3833,6 +4096,8 @@ def build_smoke_receipt(
             or runner.modules is not first.modules
             or runner.authenticated is not first.authenticated
             or runner.problem.fixed_primary_turns != turns
+            or runner.problem.stage_spec != stage_spec
+            or tuple(runner.problem.constraint_names) != constraint_names
             or not runner.launch_eligible
             or not runner.problem.launch_eligible
         ):
@@ -3844,7 +4109,7 @@ def build_smoke_receipt(
         frame = evaluation["frame"]
         if (
             objectives.shape != (1, 2)
-            or constraints.shape != (1, len(CURRENT7_CONSTRAINT_NAMES))
+            or constraints.shape != (1, len(constraint_names))
             or valid.tolist() != [True]
             or len(frame) != 1
             or not np.isfinite(objectives).all()
@@ -3873,14 +4138,14 @@ def build_smoke_receipt(
         )
         if observed_turns != turns or not math.isclose(
             decoded_controls["cw1"],
-            CURRENT_STAGE_SPEC["primary_conductor_thickness_mm"],
+            stage_spec["primary_conductor_thickness_mm"],
             rel_tol=0.0,
             abs_tol=1e-12,
         ):
             raise RuntimeError(f"N1={turns} decoded fixed controls escaped")
         budget_identity = winding_budget_identity(
             row,
-            expected_cw1_mm=CURRENT_STAGE_SPEC[
+            expected_cw1_mm=stage_spec[
                 "primary_conductor_thickness_mm"
             ],
         )
@@ -3932,7 +4197,7 @@ def build_smoke_receipt(
             },
             "physical_constraint_G": {
                 name: float(constraints[0, index])
-                for index, name in enumerate(CURRENT7_CONSTRAINT_NAMES)
+                for index, name in enumerate(constraint_names)
             },
             "finite_objectives": True,
             "finite_constraints": True,
@@ -3969,16 +4234,22 @@ def build_smoke_receipt(
         "all_supported_strata_exercised": True,
     }
     problem_contract = {
-        "stage_spec": CURRENT_STAGE_SPEC,
-        "stage_spec_sha256": CURRENT_STAGE_SPEC_SHA256,
-        "temperature_contract": CURRENT_TEMPERATURE_CONTRACT,
-        "temperature_contract_sha256": CURRENT_TEMPERATURE_CONTRACT_SHA256,
-        "hard_constraint_contract": CURRENT_STAGE_HARD_CONTRACT,
-        "hard_constraint_contract_sha256": CURRENT_STAGE_HARD_CONTRACT_SHA256,
-        "constraint_names": list(CURRENT7_CONSTRAINT_NAMES),
-        "constraint_count": len(CURRENT7_CONSTRAINT_NAMES),
+        "stage_spec": stage_spec,
+        "stage_spec_sha256": canonical_sha256(stage_spec),
+        "temperature_contract": temperature_contract,
+        "temperature_contract_sha256": canonical_sha256(
+            temperature_contract
+        ),
+        "hard_constraint_contract": hard_constraint_contract,
+        "hard_constraint_contract_sha256": canonical_sha256(
+            hard_constraint_contract
+        ),
+        "constraint_names": list(constraint_names),
+        "constraint_count": len(constraint_names),
         "base_constraint_count": len(BASE_CONSTRAINT_NAMES),
-        "additive_hard_constraint_count": len(ADDITIVE_HARD_CONSTRAINT_NAMES),
+        "additive_hard_constraint_count": (
+            len(constraint_names) - len(BASE_CONSTRAINT_NAMES)
+        ),
         "base_secondary_vertical_insulation_retained": True,
         "minimum_physical_insulation_is_authoritative_superset": True,
         "variable_cooling_dimensions": list(VARIABLE_COOLING_DIMENSIONS),
@@ -4043,7 +4314,7 @@ def build_smoke_receipt(
         "optimizer_repair_sha256": canonical_sha256(optimizer_repair),
         "smoke": smoke,
         "smoke_sha256": canonical_sha256(smoke),
-        "portability": CURRENT_STAGE_HARD_CONTRACT["portability"],
+        "portability": hard_constraint_contract["portability"],
         "scheduler_write_performed": False,
         "slurm_submission_performed": False,
         "canonical_pointer_write_performed": False,
@@ -4074,6 +4345,15 @@ def validate_smoke_receipt(
     expected_turns = list(SUPPORTED_FIXED_PRIMARY_TURNS)
     expected_keys = {str(turns) for turns in SUPPORTED_FIXED_PRIMARY_TURNS}
     strata = value.get("strata") or {}
+    try:
+        stage_spec = validate_stage_spec(problem.get("stage_spec") or {})
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "corrected-generation smoke receipt contract mismatch"
+        ) from exc
+    expected_constraint_names = stage_constraint_names(stage_spec)
+    expected_temperature_contract = stage_temperature_contract(stage_spec)
+    expected_hard_contract = stage_hard_constraint_contract(stage_spec)
     if (
         value.get("schema_version") != RECEIPT_SCHEMA
         or value.get("status")
@@ -4105,17 +4385,17 @@ def validate_smoke_receipt(
         or loading.get("supported_fixed_primary_turns") != expected_turns
         or set((loading.get("strata") or {})) != expected_keys
         or loading.get("all_supported_strata_exercised") is not True
-        or problem.get("stage_spec") != CURRENT_STAGE_SPEC
-        or problem.get("stage_spec_sha256") != CURRENT_STAGE_SPEC_SHA256
-        or problem.get("temperature_contract") != CURRENT_TEMPERATURE_CONTRACT
+        or problem.get("stage_spec") != stage_spec
+        or problem.get("stage_spec_sha256") != canonical_sha256(stage_spec)
+        or problem.get("temperature_contract") != expected_temperature_contract
         or problem.get("temperature_contract_sha256")
-        != CURRENT_TEMPERATURE_CONTRACT_SHA256
+        != canonical_sha256(expected_temperature_contract)
         or problem.get("hard_constraint_contract")
-        != CURRENT_STAGE_HARD_CONTRACT
+        != expected_hard_contract
         or problem.get("hard_constraint_contract_sha256")
-        != CURRENT_STAGE_HARD_CONTRACT_SHA256
-        or problem.get("constraint_names") != list(CURRENT7_CONSTRAINT_NAMES)
-        or problem.get("constraint_count") != len(CURRENT7_CONSTRAINT_NAMES)
+        != canonical_sha256(expected_hard_contract)
+        or problem.get("constraint_names") != list(expected_constraint_names)
+        or problem.get("constraint_count") != len(expected_constraint_names)
         or problem.get("minimum_physical_insulation_is_authoritative_superset")
         is not True
         or problem.get("simple_base_20mm_plate_clamp_superseded") is not True
@@ -4132,7 +4412,7 @@ def validate_smoke_receipt(
         or smoke.get("supported_fixed_primary_turns") != expected_turns
         or set((smoke.get("strata") or {})) != expected_keys
         or smoke.get("all_supported_strata_smoked") is not True
-        or value.get("portability") != CURRENT_STAGE_HARD_CONTRACT["portability"]
+        or value.get("portability") != expected_hard_contract["portability"]
         or any(
             value.get(field) is not False
             for field in (
@@ -4228,7 +4508,7 @@ def validate_smoke_receipt(
             or stratum_smoke.get("finite_objectives") is not True
             or stratum_smoke.get("finite_constraints") is not True
             or set((stratum_smoke.get("physical_constraint_G") or {}))
-            != set(CURRENT7_CONSTRAINT_NAMES)
+            != set(expected_constraint_names)
         ):
             raise RuntimeError(f"N1={turns} corrected-generation stratum mismatch")
         for label, nested in (
@@ -4341,6 +4621,8 @@ def run_search_seed(
     optimizer_llt_scale_uh: float,
     optimizer_all_thermal_scale_c: float,
     optimizer_repair_contract_sha256: str,
+    stage_spec: Mapping[str, Any],
+    stage_spec_sha256: str,
     optimizer_resonance_allowance_hz: float | None = None,
     optimizer_llt_allowance_uh: float | None = None,
 ) -> Path:
@@ -4365,6 +4647,17 @@ def run_search_seed(
             profile=profile,
         )
     )
+    normalized_stage_spec = validate_stage_spec(stage_spec)
+    if (
+        canonical_sha256(normalized_stage_spec) != str(stage_spec_sha256)
+        or (receipt.get("problem_contract") or {}).get("stage_spec")
+        != normalized_stage_spec
+        or (receipt.get("problem_contract") or {}).get("stage_spec_sha256")
+        != str(stage_spec_sha256)
+        or manifest.get("hard_spec") != normalized_stage_spec
+        or manifest.get("hard_spec_sha256") != str(stage_spec_sha256)
+    ):
+        raise RuntimeError("staged hard-spec manifest/receipt identity mismatch")
     execution = manifest.get("search_execution") or {}
     remote_path = remote_preflight.resolve()
     result_path = output_root / str(execution.get("result_filename") or "")
@@ -4499,6 +4792,7 @@ def run_search_seed(
         code_root=code_root,
         fixed_primary_turns=int(fixed_primary_turns),
         inference_threads=int(inference_threads),
+        stage_spec=normalized_stage_spec,
     )
     stratum_repair = receipt["strata"][str(int(fixed_primary_turns))][
         "optimizer_repair"
@@ -4594,8 +4888,13 @@ def run_search_seed(
             "profile_canonical_sha256": adapter_evidence["profile"][
                 "canonical_sha256"
             ],
-            "temperature_contract_sha256": CURRENT_TEMPERATURE_CONTRACT_SHA256,
-            "hard_constraint_contract_sha256": CURRENT_STAGE_HARD_CONTRACT_SHA256,
+            "temperature_contract_sha256": (
+                runner.problem.temperature_contract_sha256
+            ),
+            "hard_constraint_contract_sha256": (
+                runner.problem.hard_constraint_contract_sha256
+            ),
+            "stage_spec_sha256": runner.problem.stage_spec_sha256,
             "island_profile_sha256": recorded_profile_sha,
             "warm_artifact_sha256": warm_artifact_record["sha256"],
             "warm_contract_sha256": warm_contract_record["sha256"],
@@ -4694,11 +4993,15 @@ def run_search_seed(
         "profile_canonical_sha256": adapter_evidence["profile"][
             "canonical_sha256"
         ],
-        "temperature_contract_sha256": CURRENT_TEMPERATURE_CONTRACT_SHA256,
-        "hard_constraint_contract_sha256": CURRENT_STAGE_HARD_CONTRACT_SHA256,
-        "hard_spec": CURRENT_STAGE_SPEC,
-        "stage_spec_sha256": CURRENT_STAGE_SPEC_SHA256,
-        "constraint_version": CURRENT_STAGE_HARD_CONTRACT["stage"],
+        "temperature_contract_sha256": (
+            runner.problem.temperature_contract_sha256
+        ),
+        "hard_constraint_contract_sha256": (
+            runner.problem.hard_constraint_contract_sha256
+        ),
+        "hard_spec": runner.problem.stage_spec,
+        "stage_spec_sha256": runner.problem.stage_spec_sha256,
+        "constraint_version": runner.problem.hard_constraint_contract["stage"],
         "island_profile_sha256": recorded_profile_sha,
         "warm_artifact_sha256": warm_artifact_record["sha256"],
         "warm_contract_sha256": warm_contract_record["sha256"],
@@ -4706,7 +5009,7 @@ def run_search_seed(
         "loaded_model_count": len(runner.models),
         "loaded_model_targets_sha256": CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
         "temperature_targets": list(CURRENT_TEMPERATURE_TARGETS),
-        "constraint_names": list(CURRENT7_CONSTRAINT_NAMES),
+        "constraint_names": list(runner.problem.constraint_names),
         "fixed_primary_turns": int(fixed_primary_turns),
         "terminal_population_primary_turn_values": terminal_turn_values,
         "terminal_population_fixed_primary_turns_verified": True,
@@ -4767,6 +5070,7 @@ def run_smoke_preflight(
     warm_start_paths: Mapping[int, Path],
     warm_start_sha256: Mapping[int, str],
     output: Path,
+    stage_spec: Mapping[str, Any] | None = None,
     inference_threads: int = 1,
 ) -> Path:
     import numpy as np
@@ -4777,6 +5081,7 @@ def run_smoke_preflight(
     if not output_root.parent.is_dir():
         raise RuntimeError("corrected-generation preflight output parent is missing")
 
+    normalized_stage_spec = validate_stage_spec(stage_spec or CURRENT_STAGE_SPEC)
     first_runner = build_authenticated_runner(
         generation=generation,
         candidate_path=candidate_path,
@@ -4784,6 +5089,7 @@ def run_smoke_preflight(
         code_root=code_root,
         expected_code_revision=expected_code_revision,
         fixed_primary_turns=SUPPORTED_FIXED_PRIMARY_TURNS[0],
+        stage_spec=normalized_stage_spec,
         inference_threads=inference_threads,
     )
     runners = {
@@ -4926,6 +5232,8 @@ def _parser() -> argparse.ArgumentParser:
     smoke.add_argument("--warm-start-n1-6-sha256", required=True)
     smoke.add_argument("--output", type=Path, required=True)
     smoke.add_argument("--inference-threads", type=int, default=1)
+    smoke.add_argument("--stage-spec-json")
+    smoke.add_argument("--stage-spec-sha256")
     search = subparsers.add_parser("search-seed")
     search.add_argument("--bundle-root", type=Path, required=True)
     search.add_argument("--relocation", type=Path, required=True)
@@ -4955,6 +5263,8 @@ def _parser() -> argparse.ArgumentParser:
         "--optimizer-all-thermal-scale-c", type=float, required=True
     )
     search.add_argument("--optimizer-repair-contract-sha256", required=True)
+    search.add_argument("--stage-spec-json", required=True)
+    search.add_argument("--stage-spec-sha256", required=True)
     search.add_argument("--optimizer-resonance-allowance-hz", type=float)
     search.add_argument("--optimizer-llt-allowance-uh", type=float)
     validate = subparsers.add_parser("validate-receipt")
@@ -4975,6 +5285,9 @@ def main(argv: list[str] | None = None) -> int:
         }, sort_keys=True))
         return 0
     if args.command == "search-seed":
+        stage_spec = stage_spec_from_json_identity(
+            args.stage_spec_json, args.stage_spec_sha256
+        )
         result_path = run_search_seed(
             bundle_root=args.bundle_root,
             relocation_path=args.relocation,
@@ -5008,6 +5321,8 @@ def main(argv: list[str] | None = None) -> int:
             optimizer_repair_contract_sha256=(
                 args.optimizer_repair_contract_sha256
             ),
+            stage_spec=stage_spec,
+            stage_spec_sha256=args.stage_spec_sha256,
             optimizer_resonance_allowance_hz=(
                 args.optimizer_resonance_allowance_hz
             ),
@@ -5015,6 +5330,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(result_path)
         return 0
+    if (args.stage_spec_json is None) != (args.stage_spec_sha256 is None):
+        raise RuntimeError("smoke stage-spec JSON/SHA must be supplied together")
+    smoke_stage_spec = (
+        validate_stage_spec(CURRENT_STAGE_SPEC)
+        if args.stage_spec_json is None
+        else stage_spec_from_json_identity(
+            args.stage_spec_json, args.stage_spec_sha256
+        )
+    )
     receipt_path = run_smoke_preflight(
         generation=args.generation,
         candidate_path=args.candidate,
@@ -5032,6 +5356,7 @@ def main(argv: list[str] | None = None) -> int:
             6: args.warm_start_n1_6_sha256,
         },
         output=args.output,
+        stage_spec=smoke_stage_spec,
         inference_threads=args.inference_threads,
     )
     print(receipt_path)

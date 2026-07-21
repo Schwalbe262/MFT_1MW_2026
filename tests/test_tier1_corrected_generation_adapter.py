@@ -20,6 +20,7 @@ from regression_260707.monitoring.readers import CANDIDATE_REPORT_FIELDS
 from regression_260707.optimization.geometry_metrics import bounding_box_lit
 from tools import tier1_corrected_generation_adapter as adapter
 from tools import tier1_corrected_generation_preflight as preflight
+from tools import tier1_corrected_current7_receipt as current7_receipt
 from tools import tier1_corrected_current7_slurm_seed_runner as slurm_seed_runner
 
 
@@ -570,6 +571,50 @@ def test_problem_wrapper_repairs_fixed_turns_budget_and_all_hard_constraints(
     assert budget["post_decode_field_override_performed"] is False
 
 
+def test_problem_wrapper_evaluates_staged_resonance_band_with_dynamic_schema():
+    stage = {
+        **preflight.CURRENT_STAGE_SPEC,
+        "T_limit_C": 100.0,
+        "size_W_max_mm": 1_000.0,
+        "size_L_max_mm": 1_000.0,
+        "resonance_min_Hz": 15_000.0,
+        "resonance_max_Hz": 20_000.0,
+    }
+    models = _problem_models()
+    problem = _fake_problem_class()(
+        models,
+        spec=stage,
+        density_gate=object(),
+        fixed_primary_turns=5,
+    )
+    assert problem.constraint_names == preflight.stage_constraint_names(stage)
+    assert problem.n_ieq_constr == 20
+    assert problem.temperature_contract["robust_upper_bound_C"] == 100.0
+
+    coordinate = np.full((1, len(_SOBOL_DIMS)), 0.5)
+    coordinate[0, 2] = 0.0
+    coordinate = problem.repair_unit_coordinates(coordinate)
+    out = {}
+    problem._evaluate(coordinate, out)
+    row = out["frame"].iloc[0]
+    screen = preflight.derive_half_magnetizing_self_resonance(
+        {
+            "Llt_phys": 27.5,
+            "k": 0.9,
+            "C_tx_tx_F": 1.2e-9,
+            "C_rx_rx_F": 2.4e-11,
+        },
+        row,
+        magnetizing_inductance_factor=0.5,
+    )
+    expected = preflight.half_magnetizing_resonance_band_violations(
+        screen["f_res_min_tx_rx_only_Hz"], stage
+    )
+    for name, violation in expected.items():
+        index = problem.constraint_names.index(name)
+        assert out["G"][0, index] == pytest.approx(violation)
+
+
 def test_actual_current_module_contract_can_build_additive_class():
     modules = preflight.load_current7_modules(REPO)
     cls = preflight.create_current7_problem_class(
@@ -785,6 +830,13 @@ def test_smoke_receipt_seals_both_repaired_strata_and_is_launch_eligible(tmp_pat
         evidence={"synthetic": True},
     )
     problem_class = _fake_problem_class()
+    staged_spec = {
+        **preflight.CURRENT_STAGE_SPEC,
+        "T_limit_C": 100.0,
+        "size_W_max_mm": 1_000.0,
+        "size_L_max_mm": 1_000.0,
+        "resonance_max_Hz": 20_000.0,
+    }
     first_runner = preflight.Current7Tier1Runner(
         authenticated=authenticated,
         code_identity={"path": str(tmp_path), "revision": "b" * 40, "clean": True},
@@ -801,6 +853,7 @@ def test_smoke_receipt_seals_both_repaired_strata_and_is_launch_eligible(tmp_pat
         density_gate=object(),
         problem=problem_class(
             all_models,
+            spec=staged_spec,
             density_gate=object(),
             fixed_primary_turns=5,
         ),
@@ -884,7 +937,14 @@ def test_smoke_receipt_seals_both_repaired_strata_and_is_launch_eligible(tmp_pat
         for key in ("5", "6")
     )
     assert receipt["runner"]["launch_eligible"] is True
-    assert receipt["problem_contract"]["constraint_count"] == 19
+    assert receipt["problem_contract"]["stage_spec"] == staged_spec
+    assert receipt["problem_contract"]["constraint_count"] == 20
+    staged_identity = current7_receipt.validate_adapter_receipt(receipt)
+    assert staged_identity.hard_spec == staged_spec
+    assert staged_identity.constraint_names == preflight.stage_constraint_names(
+        staged_spec
+    )
+    assert staged_identity.launch_eligible is True
     forged = json.loads(json.dumps(receipt))
     forged["strata"].pop("6")
     forged.pop("payload_sha256")
@@ -1048,6 +1108,10 @@ def test_search_seed_cli_runs_synthetic_optimizer_and_seals_artifacts(
     receipt = {
         "adapter_manifest": adapter_evidence,
         "adapter_manifest_sha256": adapter.canonical_sha256(adapter_evidence),
+        "problem_contract": {
+            "stage_spec": problem.stage_spec,
+            "stage_spec_sha256": problem.stage_spec_sha256,
+        },
         "strata": {
             "5": {
                 "optimizer_repair": {
@@ -1061,6 +1125,8 @@ def test_search_seed_cli_runs_synthetic_optimizer_and_seals_artifacts(
     bundle_id = "current7-synthetic"
     manifest = {
         "bundle_id": bundle_id,
+        "hard_spec": problem.stage_spec,
+        "hard_spec_sha256": problem.stage_spec_sha256,
         "bundle_code_revision": code_revision,
         "generation_artifact_inventory_sha256": "e" * 64,
         "search_execution": {
@@ -1134,6 +1200,10 @@ def test_search_seed_cli_runs_synthetic_optimizer_and_seals_artifacts(
         "--optimizer-llt-scale-uh", "0.3",
         "--optimizer-all-thermal-scale-c", "2",
         "--optimizer-repair-contract-sha256", repair_sha,
+        "--stage-spec-json", json.dumps(
+            problem.stage_spec, sort_keys=True, separators=(",", ":")
+        ),
+        "--stage-spec-sha256", problem.stage_spec_sha256,
     ]) == 0
     remote = json.loads(remote_path.read_text(encoding="utf-8"))
     assert remote["offspring_repair_operator_installed"] is True
@@ -1172,6 +1242,10 @@ def test_search_seed_cli_runs_synthetic_optimizer_and_seals_artifacts(
     }
     slurm_payload = {
         "bundle_id": bundle_id,
+        "hard_spec": problem.stage_spec,
+        "hard_spec_sha256": problem.stage_spec_sha256,
+        "constraint_version": slurm_identity["constraint_version"],
+        "constraint_names": slurm_identity["constraint_names"],
         "seed": 5,
         "lane": {"island_id": island_id, "fixed_primary_turns": 5},
         "population": 64,

@@ -26,13 +26,13 @@ try:
         training_profile_sha256,
     )
     from tier1_corrected_generation_preflight import (
-        CURRENT7_CONSTRAINT_NAMES,
-        CURRENT_STAGE_HARD_CONTRACT,
-        CURRENT_STAGE_SPEC,
-        CURRENT_STAGE_SPEC_SHA256,
         RECEIPT_SCHEMA as SMOKE_RECEIPT_SCHEMA,
         SUPPORTED_FIXED_PRIMARY_TURNS,
+        stage_constraint_names,
+        stage_hard_constraint_contract,
+        stage_temperature_contract,
         validate_smoke_receipt as authoritative_validate_smoke_receipt,
+        validate_stage_spec,
     )
 except ImportError:  # pragma: no cover - repository package path
     from tools.tier1_corrected_generation_adapter import (
@@ -45,13 +45,13 @@ except ImportError:  # pragma: no cover - repository package path
         training_profile_sha256,
     )
     from tools.tier1_corrected_generation_preflight import (
-        CURRENT7_CONSTRAINT_NAMES,
-        CURRENT_STAGE_HARD_CONTRACT,
-        CURRENT_STAGE_SPEC,
-        CURRENT_STAGE_SPEC_SHA256,
         RECEIPT_SCHEMA as SMOKE_RECEIPT_SCHEMA,
         SUPPORTED_FIXED_PRIMARY_TURNS,
+        stage_constraint_names,
+        stage_hard_constraint_contract,
+        stage_temperature_contract,
         validate_smoke_receipt as authoritative_validate_smoke_receipt,
+        validate_stage_spec,
     )
 
 LEGACY_ALL11_TARGETS = frozenset(
@@ -270,6 +270,8 @@ def validate_adapter_receipt(value: Any) -> CorrectedReceiptIdentity:
     hard_spec: dict[str, Any] | None = None
     hard_spec_sha: str | None = None
     constraint_names: tuple[str, ...] = ()
+    staged_temperature_contract_sha: str | None = None
+    staged_hard_contract_sha: str | None = None
     if smoke_receipt is not None:
         for turns in SUPPORTED_FIXED_PRIMARY_TURNS:
             key = str(turns)
@@ -280,16 +282,27 @@ def validate_adapter_receipt(value: Any) -> CorrectedReceiptIdentity:
                 f"N1={turns} optimizer repair contract SHA-256",
             )
         problem = smoke_receipt["problem_contract"]
-        hard_spec = dict(problem["stage_spec"])
+        hard_spec = validate_stage_spec(problem["stage_spec"])
         hard_spec_sha = _hex(
             problem["stage_spec_sha256"], 64, "hard spec SHA-256"
         )
         constraint_names = tuple(problem["constraint_names"])
-        constraint_version = str(CURRENT_STAGE_HARD_CONTRACT["stage"])
+        hard_contract = stage_hard_constraint_contract(hard_spec)
+        temperature_contract = stage_temperature_contract(hard_spec)
+        constraint_version = str(hard_contract["stage"])
+        staged_temperature_contract_sha = canonical_sha256(
+            temperature_contract
+        )
+        staged_hard_contract_sha = canonical_sha256(hard_contract)
         repair_gate = bool(
-            hard_spec == CURRENT_STAGE_SPEC
-            and hard_spec_sha == CURRENT_STAGE_SPEC_SHA256
-            and constraint_names == tuple(CURRENT7_CONSTRAINT_NAMES)
+            hard_spec_sha == canonical_sha256(hard_spec)
+            and constraint_names == stage_constraint_names(hard_spec)
+            and problem.get("temperature_contract") == temperature_contract
+            and problem.get("temperature_contract_sha256")
+            == staged_temperature_contract_sha
+            and problem.get("hard_constraint_contract") == hard_contract
+            and problem.get("hard_constraint_contract_sha256")
+            == staged_hard_contract_sha
             and set(repair_contract_by_turns) == {"5", "6"}
         )
 
@@ -338,12 +351,14 @@ def validate_adapter_receipt(value: Any) -> CorrectedReceiptIdentity:
         artifact_sizes_bytes=normalized_sizes,
         required_model_targets_sha256=CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
         temperature_contract_sha256=_hex(
-            adapter.get("temperature_contract_sha256"),
+            staged_temperature_contract_sha
+            or adapter.get("temperature_contract_sha256"),
             64,
             "temperature contract SHA-256",
         ),
         hard_constraint_contract_sha256=_hex(
-            adapter.get("hard_constraint_contract_sha256"),
+            staged_hard_contract_sha
+            or adapter.get("hard_constraint_contract_sha256"),
             64,
             "hard constraint contract SHA-256",
         ),
