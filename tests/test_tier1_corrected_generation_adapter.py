@@ -719,6 +719,204 @@ def test_repaired_runner_uses_same_operator_for_warm_offspring_and_terminal(
     assert candidate["decoded_params"]["cw1"] == 5.0
 
 
+def test_role_partition_keeps_37_and_60_in_actual_initialization_deterministically(
+    tmp_path,
+):
+    default_problem, models, modules = _actual_problem(6)
+    final_spec = {
+        **preflight.CURRENT_STAGE_SPEC,
+        "T_limit_C": 100.0,
+        "size_W_max_mm": 1_000.0,
+        "size_L_max_mm": 1_000.0,
+        "resonance_max_Hz": 20_000.0,
+    }
+    standard = np.asarray([
+        0.3750093752343808,
+        0.5,
+        0.0020833333333333333,
+        0.5166666666666667,
+        0.7128571428571429,
+        0.5,
+        0.34833333333333333,
+        0.16667222240741356,
+        0.0,
+        0.0,
+        *([1.0 / 3.0] * 4),
+        0.34444444444444444,
+        *([1.0 / 3.0] * 4),
+        0.5,
+        1.0,
+        0.0,
+        0.5,
+        0.4999999999999999,
+        0.5,
+    ])
+    assert standard.shape == (25,)
+    topologies = (34, 35, 36, 37, 38, 39, 60)
+    donors = []
+    for copy_index in range(8):
+        for topology in topologies:
+            row = standard.copy()
+            row[2] = (60 - topology) / 48.0
+            row[24] = 0.45 + 0.01 * copy_index
+            donors.append(row)
+    donors = np.asarray(donors)
+    values = np.vstack((standard.reshape(1, -1), donors))
+    role = {
+        "schema_version": preflight.WARM_ROLE_PARTITION_SCHEMA,
+        "fixed_primary_turns": 6,
+        "total_count": len(values),
+        "standard_hard_feasible_candidates": {
+            "start": 0,
+            "count": 1,
+            "coordinate_unit_sha256": adapter.canonical_sha256(
+                values[:1].tolist()
+            ),
+            "full_hard_geometry_filter_required": True,
+            "ordinary_warm_sampling_allowed": True,
+            "source_artifact_sha256": "a" * 64,
+            "source_contract_file_sha256": "b" * 64,
+            "source_hard_geometry_joint_count": 1,
+        },
+        "basin_structural_coordinate_donors": {
+            "start": 1,
+            "count": len(donors),
+            "coordinate_unit_sha256": adapter.canonical_sha256(
+                donors.tolist()
+            ),
+            "required_gate_names": list(
+                preflight.STRUCTURAL_DONOR_REQUIRED_GATES
+            ),
+            "optimizer_gate_names_not_used_for_donor_admission": list(
+                preflight.STRUCTURAL_DONOR_OPTIMIZER_GATES
+            ),
+            "required_topologies_N2_main": list(topologies),
+            "source_selection_contract_sha256": "c" * 64,
+            "coordinate_donors_only": True,
+            "protected_topology_slots_only": True,
+            "ordinary_warm_sampling_allowed": False,
+        },
+        "maximum_combined_authenticated_fraction": 0.5,
+        "minimum_fresh_random_fraction": 0.5,
+        "physical_constraint_G_mutation": False,
+        "physical_objective_mutation": False,
+        "terminal_physical_replay_required": True,
+    }
+    role["sha256"] = adapter.canonical_sha256(role)
+    warm_path = tmp_path / "role-partitioned-warm.npy"
+    np.save(warm_path, values, allow_pickle=False)
+
+    class StopBeforeOptimizer(RuntimeError):
+        pass
+
+    captured = []
+    for _repeat in range(2):
+        problem = type(default_problem)(
+            models,
+            spec=final_spec,
+            density_gate=lambda frame: np.full(len(frame), -1.0),
+            fixed_primary_turns=6,
+        )
+        constraint_names = tuple(problem.constraint_names)
+        hard_contract_sha = problem.hard_constraint_contract_sha256
+        runner = preflight.Current7Tier1Runner(
+            authenticated=None,
+            code_identity={},
+            modules=modules,
+            adapter_evidence={},
+            model_cache=None,
+            models=models,
+            inference_binding={},
+            density_gate=object(),
+            problem=problem,
+        )
+        observed = []
+
+        def capture(evidence):
+            observed.append(evidence)
+            raise StopBeforeOptimizer
+
+        with pytest.raises(StopBeforeOptimizer):
+            runner.run_one(
+                seed=2457500999,
+                population=128,
+                max_generations=2,
+                warm_start_path=warm_path,
+                warm_start_sha256=adapter.sha256_file(warm_path),
+                warm_start_role_partition=role,
+                pre_optimization_callback=capture,
+            )
+        assert tuple(problem.constraint_names) == constraint_names
+        assert problem.hard_constraint_contract_sha256 == hard_contract_sha
+        captured.append(observed[0])
+
+    assert captured[0] == captured[1]
+    initialization = captured[0]["initial_population"]
+    current = initialization["current_run_nsga2"]
+    assert current["authenticated_standard_hard_feasible_warm_count"] == 1
+    assert current["authenticated_structural_donor_count"] == 56
+    assert current["fresh_random_count"] == 71
+    topology = initialization["turn_split_sub_islands"]
+    assert topology["topology_counts_after_current_repair"]["37"] >= 8
+    assert topology["topology_counts_after_current_repair"]["60"] >= 8
+    assert all(
+        item["source_is_authenticated_warm"]
+        for item in topology["donor_sources"]
+    )
+    preservation = initialization["role_partition_preservation"]
+    assert preservation[
+        "standard_warm_rows_preserved_after_topology_seeding"
+    ] is True
+    assert preservation["standard_warm_count"] == 1
+    role_audit = captured[0]["authenticated_warm_start"]["role_audit"]
+    donor_filter = role_audit["basin_structural_donor_filter"]
+    assert donor_filter["decoded_unique_count"] == 56
+    assert donor_filter["optimizer_gate_passed_counts"] == {
+        "shrink": 56,
+        "box": 8,
+        "analytical_B": 8,
+    }
+    assert donor_filter["physical_constraint_G_mutation"] is False
+    assert donor_filter["additional_model_evaluations"] == 0
+    assert captured[0]["offspring_repair_operator"]["call_count"] == 0
+
+    terminal_problem = type(default_problem)(
+        models,
+        spec=final_spec,
+        density_gate=lambda frame: np.full(len(frame), -1.0),
+        fixed_primary_turns=6,
+    )
+    terminal_runner = preflight.Current7Tier1Runner(
+        authenticated=None,
+        code_identity={},
+        modules=modules,
+        adapter_evidence={},
+        model_cache=None,
+        models=models,
+        inference_binding={},
+        density_gate=object(),
+        problem=terminal_problem,
+    )
+    result = terminal_runner.run_one(
+        seed=2457500999,
+        population=128,
+        max_generations=2,
+        warm_start_path=warm_path,
+        warm_start_sha256=adapter.sha256_file(warm_path),
+        warm_start_role_partition=role,
+    )
+    execution = result.tier1_repair_audit
+    assert execution["terminal_physical_replay"][
+        "optimizer_physical_G_match"
+    ] is True
+    assert execution["authoritative_terminal_G"] == (
+        "physical_unscaled_replay"
+    )
+    assert result.tier1_topology_evolution_audit[
+        "all_required_topologies_preserved"
+    ] is True
+
+
 def test_candidate_temperature_max_excludes_absent_rx_side_target():
     problem, models, modules = _actual_problem(5)
     models[preflight.SIDE_TEMPERATURE_TARGET].value = 500.0

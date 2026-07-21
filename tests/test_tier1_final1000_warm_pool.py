@@ -151,23 +151,33 @@ def test_build_pool_authenticates_n1_6_and_writes_sealed_artifacts(tmp_path: Pat
 
     values = np.load(coordinates, allow_pickle=False)
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    unsigned = {key: value for key, value in contract.items() if key != "contract_sha256"}
+    legacy_unsigned = {
+        key: value
+        for key, value in contract.items()
+        if key not in {"contract_sha256", "sha256"}
+    }
+    handoff_unsigned = {
+        key: value for key, value in contract.items() if key != "sha256"
+    }
     assert values.shape == (4, 25)
     assert contract["schema_version"] == CONTRACT_SCHEMA
     assert contract["source_status"]["authenticated_terminal_records"] == 1
     assert contract["coordinate_artifact"]["sha256"] == _sha(coordinates)
-    assert contract["contract_sha256"] == canonical_sha256(unsigned)
+    assert contract["contract_sha256"] == canonical_sha256(legacy_unsigned)
+    assert contract["sha256"] == canonical_sha256(handoff_unsigned)
     assert contract["fixed_primary_turns"] == 6
     assert contract["warm_start"]["sha256"] == _sha(coordinates)
     assert contract["warm_start"]["shape"] == [4, 25]
-    authenticated, evidence = authenticate_warm_handoff(
+    assert contract["warm_rows_are_coordinate_donors_only"] is True
+    loaded, evidence = authenticate_warm_handoff(
         coordinates,
         contract_path,
         fixed_primary_turns=6,
-        n_var=25,
+        n_var=values.shape[1],
         expected_contract_file_sha256=_sha(contract_path),
     )
-    assert authenticated.shape == (4, 25)
+    np.testing.assert_array_equal(loaded, values)
+    assert evidence["contract_canonical_sha256"] == contract["sha256"]
     assert evidence["coordinates_only"] is True
     assert all(item["island_id"] == "n1-6-test" for item in contract["selection"])
 
@@ -217,6 +227,7 @@ def test_existing_pool_contract_can_be_upgraded_without_rewriting_coordinates(
         "objective_mutation",
     ):
         legacy.pop(field)
+    legacy.pop("sha256")
     legacy.pop("contract_sha256")
     legacy["contract_sha256"] = canonical_sha256(legacy)
     legacy_path = tmp_path / "legacy-contract.json"
@@ -244,6 +255,48 @@ def test_existing_pool_contract_can_be_upgraded_without_rewriting_coordinates(
     assert values.shape == (4, 25)
 
 
+def test_dual_sealed_pool_contract_can_be_resealed_without_coordinate_rewrite(
+    tmp_path: Path,
+):
+    coordinates, contract_path = build_warm_pool(
+        index_path=_fixture(tmp_path),
+        stage_spec=_stage(),
+        output_dir=tmp_path / "dual-source",
+        pool_size=4,
+        candidate_limit=8,
+        minimum_distance=0.0,
+    )
+    coordinate_sha = _sha(coordinates)
+    output_path = tmp_path / "dual-upgraded.json"
+
+    upgrade_existing_handoff_contract(
+        warm_start=coordinates,
+        source_contract=contract_path,
+        output_contract=output_path,
+        fixed_primary_turns=6,
+    )
+
+    assert _sha(coordinates) == coordinate_sha
+    upgraded = json.loads(output_path.read_text(encoding="utf-8"))
+    handoff_unsigned = dict(upgraded)
+    assert handoff_unsigned.pop("sha256") == canonical_sha256(
+        handoff_unsigned
+    )
+    legacy_unsigned = dict(handoff_unsigned)
+    assert legacy_unsigned.pop("contract_sha256") == canonical_sha256(
+        legacy_unsigned
+    )
+    values, evidence = authenticate_warm_handoff(
+        coordinates,
+        output_path,
+        fixed_primary_turns=6,
+        n_var=25,
+        expected_contract_file_sha256=_sha(output_path),
+    )
+    assert values.shape == (4, 25)
+    assert evidence["contract_canonical_sha256"] == upgraded["sha256"]
+
+
 def test_build_pool_rejects_status_tampering(tmp_path: Path):
     index_path = _fixture(tmp_path)
     index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -257,4 +310,258 @@ def test_build_pool_rejects_status_tampering(tmp_path: Path):
             output_dir=tmp_path / "out",
             pool_size=4,
             candidate_limit=8,
+        )
+
+
+def _standard_warm_handoff(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "standard-warm"
+    root.mkdir(parents=True)
+    values = np.random.default_rng(991).random((4, 25))
+    artifact = root / "coordinates.npy"
+    np.save(artifact, values, allow_pickle=False)
+    contract = {
+        "schema_version": "mft-tier1-final1000-current7-warm-handoff-v1",
+        "fixed_primary_turns": 6,
+        "fixed_primary_turns_scope": (
+            "runner_repair_after_authenticated_inverse_coordinate_handoff"
+        ),
+        "stage_spec": _stage(),
+        "stage_spec_sha256": canonical_sha256(_stage()),
+        "hard_geometry_audit": {
+            "joint_count": 1,
+            "unique_geometry_count": 1,
+        },
+        "warm_rows_are_coordinate_donors_only": True,
+        "warm_start": {
+            "path": artifact.name,
+            "sha256": _sha(artifact),
+            "shape": list(values.shape),
+            "coordinate_contract": (
+                "authenticated_coordinate_donors_then_current_repair_v1"
+            ),
+        },
+        "physical_hard_spec_mutation": False,
+        "objective_mutation": False,
+        "automatic_promotion_allowed": False,
+    }
+    contract["sha256"] = canonical_sha256(contract)
+    contract_path = root / "contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    return artifact, contract_path
+
+
+def _basin_fixture(
+    tmp_path: Path,
+    *,
+    name: str,
+    seed: int,
+    topologies: list[int],
+    result_seed: int | None = None,
+) -> Path:
+    root = tmp_path / name
+    cache = root / "cache"
+    canonical = root / "canonical"
+    cache.mkdir(parents=True)
+    canonical.mkdir(parents=True)
+    names = tuple(stage_constraint_names(CURRENT_STAGE_SPEC))
+    rng = np.random.default_rng(seed)
+    x = rng.random((len(topologies), 25))
+    x[:, 2] = np.asarray([(60 - value) / 48.0 for value in topologies])
+    g = np.zeros((len(x), len(names)), dtype=float)
+    g[:, names.index("half_magnetizing_resonance_minimum")] = -1_000.0
+    g[:, names.index("exterior_width_limit")] = -250.0
+    g[:, names.index("exterior_length_limit")] = -250.0
+    g[:, names.index("exterior_height_limit")] = -10.0
+    g[:, names.index("Llt_robust_band")] = np.linspace(-0.2, 0.2, len(x))
+    f = np.column_stack((
+        np.linspace(500.0, 600.0, len(x)),
+        np.linspace(5_000.0, 6_000.0, len(x)),
+    ))
+    artifacts = {}
+    for key, values in {
+        "terminal_X": x,
+        "terminal_G_physical": g,
+        "terminal_F": f,
+    }.items():
+        path = cache / f"{seed}-{key}.npy"
+        np.save(path, values, allow_pickle=False)
+        artifacts[key] = _artifact(path)
+    result_path = cache / f"{seed}-result.json"
+    result_path.write_text(
+        json.dumps({
+            "seed": seed if result_seed is None else result_seed,
+            "island_id": "n1-6-test",
+        }),
+        encoding="utf-8",
+    )
+    status = {
+        "schema_version": "mft-tier1-current7-slurm-rolling-status-v1",
+        "bundle_id": f"fixture-{name}",
+        "constraint_names": list(names),
+        "hard_spec": CURRENT_STAGE_SPEC,
+        "hard_spec_sha256": canonical_sha256(CURRENT_STAGE_SPEC),
+        "terminal_results": [{
+            "seed": seed,
+            "island_id": "n1-6-test",
+            "authenticated": True,
+            "terminal_state": "completed",
+            "artifact_objects": artifacts,
+            "result_object": _artifact(result_path),
+        }],
+    }
+    status_path = canonical / "status.json"
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    index = {
+        "schema_version": "mft-tier1-current7-slurm-rolling-index-v1",
+        "bundle_id": f"fixture-{name}",
+        "path_containment_root": str(root),
+        "constraint_names": list(names),
+        "hard_spec": CURRENT_STAGE_SPEC,
+        "hard_spec_sha256": canonical_sha256(CURRENT_STAGE_SPEC),
+        "snapshot_sha256": f"{seed % 16:x}" * 64,
+        "status": {"path": str(status_path), "sha256": _sha(status_path)},
+    }
+    index_path = canonical / "current7-index.json"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    return index_path
+
+
+def test_basin_pool_combines_indexes_and_seals_actual_source_result_provenance(
+    tmp_path: Path,
+):
+    standard_artifact, standard_contract = _standard_warm_handoff(tmp_path)
+    primary = _basin_fixture(
+        tmp_path,
+        name="primary",
+        seed=31,
+        topologies=[34] * 40 + [35] * 8 + [60] * 8,
+    )
+    donor = _basin_fixture(
+        tmp_path,
+        name="donor",
+        seed=32,
+        topologies=[36] * 8 + [37] * 8 + [38] * 8 + [39] * 2,
+    )
+
+    coordinates, contract_path = build_warm_pool(
+        index_path=primary,
+        donor_index_paths=(donor,),
+        basin_aware=True,
+        stage_spec=_stage(),
+        output_dir=tmp_path / "basin-out",
+        pool_size=56,
+        candidate_limit=82,
+        minimum_distance=0.0,
+        standard_warm_start=standard_artifact,
+        standard_warm_contract=standard_contract,
+    )
+
+    values = np.load(coordinates, allow_pickle=False)
+    payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    basin = payload["basin_aware_selection"]
+    role = payload["warm_role_partition"]
+    basin_role = role["basin_structural_coordinate_donors"]
+    basin_values = values[
+        basin_role["start"] : basin_role["start"] + basin_role["count"]
+    ]
+    observed = 60 - np.rint(48.0 * basin_values[:, 2]).astype(int)
+    assert set(observed) >= {34, 35, 36, 37, 38, 39, 60}
+    assert values.shape == (60, 25)
+    assert role["standard_hard_feasible_candidates"]["count"] == 4
+    assert basin_role["count"] == 56
+    source = payload["standard_warm_source"]
+    unsigned_source = dict(source)
+    assert unsigned_source.pop("sha256") == canonical_sha256(unsigned_source)
+    assert source["hard_geometry_joint_count"] == 1
+    unsigned_role = dict(role)
+    assert unsigned_role.pop("sha256") == canonical_sha256(unsigned_role)
+    loaded, authentication = authenticate_warm_handoff(
+        coordinates,
+        contract_path,
+        fixed_primary_turns=6,
+        n_var=25,
+        expected_contract_file_sha256=_sha(contract_path),
+    )
+    np.testing.assert_array_equal(loaded, values)
+    assert authentication["warm_role_partition"] == role
+    assert len(payload["source_indexes"]) == 2
+    assert basin["source_available_counts"] == {
+        "34": 40,
+        "35": 8,
+        "36": 8,
+        "37": 8,
+        "38": 8,
+        "39": 2,
+        "60": 8,
+    }
+    assert basin["protected_selection_count"] == 50
+    assert basin["protected_selection_cap"] == 56
+    assert basin["downstream_minimum_fresh_random_count"] == 160
+    assert basin["downstream_maximum_standard_hard_feasible_count"] == 104
+    assert all(
+        len(item["source_result_sha256"]) == 64
+        and len(item["source_index_sha256"]) == 64
+        for item in basin["protected_selection"]
+    )
+    unsigned_basin = {
+        key: value for key, value in basin.items() if key != "sha256"
+    }
+    assert basin["sha256"] == canonical_sha256(unsigned_basin)
+
+
+def test_basin_pool_fails_closed_when_a_required_topology_is_absent(
+    tmp_path: Path,
+):
+    standard_artifact, standard_contract = _standard_warm_handoff(tmp_path)
+    primary = _basin_fixture(
+        tmp_path,
+        name="primary-missing",
+        seed=41,
+        topologies=[34] * 40 + [35] * 8 + [60] * 8,
+    )
+    donor = _basin_fixture(
+        tmp_path,
+        name="donor-missing",
+        seed=42,
+        topologies=[36] * 8 + [37] * 8 + [38] * 8,
+    )
+
+    with pytest.raises(RuntimeError, match="omitted required 39/21 donor"):
+        build_warm_pool(
+            index_path=primary,
+            donor_index_paths=(donor,),
+            basin_aware=True,
+            stage_spec=_stage(),
+            output_dir=tmp_path / "missing-out",
+            pool_size=56,
+            candidate_limit=80,
+            minimum_distance=0.0,
+            standard_warm_start=standard_artifact,
+            standard_warm_contract=standard_contract,
+        )
+
+
+def test_basin_pool_fails_closed_on_source_result_identity_mismatch(
+    tmp_path: Path,
+):
+    standard_artifact, standard_contract = _standard_warm_handoff(tmp_path)
+    primary = _basin_fixture(
+        tmp_path,
+        name="primary-mismatch",
+        seed=51,
+        result_seed=999,
+        topologies=[34] * 40 + [35] * 8 + [60] * 8,
+    )
+
+    with pytest.raises(RuntimeError, match="source result identity mismatch"):
+        build_warm_pool(
+            index_path=primary,
+            basin_aware=True,
+            stage_spec=_stage(),
+            output_dir=tmp_path / "mismatch-out",
+            pool_size=56,
+            candidate_limit=56,
+            minimum_distance=0.0,
+            standard_warm_start=standard_artifact,
+            standard_warm_contract=standard_contract,
         )

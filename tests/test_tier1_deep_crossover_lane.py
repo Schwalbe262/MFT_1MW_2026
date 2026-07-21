@@ -207,30 +207,47 @@ def test_turn_split_contract_has_real_pairing_migration_and_epsilon_survival(
     fixed_primary_turns,
 ):
     value = contract.topology_evolution_contract(fixed_primary_turns)
-    shift = fixed_primary_turns - 5
-    assert value["requested_global_turn_split_N2_main"] == [28, 29, 30, 31, 32, 33]
-    assert value["turn_split_sub_islands_N2_main"] == [
-        28 + shift, 29 + shift, 30 + shift,
-        31 + shift, 32 + shift, 33 + shift,
-    ]
+    if fixed_primary_turns == 5:
+        topologies = [28, 29, 30, 31, 32, 33]
+        pairs = {
+            (28, 31), (29, 32), (30, 33),
+            (28, 33), (29, 31), (30, 32),
+        }
+        minimum_each = 4
+    else:
+        topologies = [34, 35, 36, 37, 38, 39, 60]
+        pairs = set(contract.BASIN_TURN_SPLIT_PARENT_PAIRS_N1_6)
+        minimum_each = 8
+        assert value["basin_donor_lanes"] == (
+            contract.BASIN_DONOR_LANES_N1_6
+        )
+        assert {tuple(pair) for pair in value["cross_lane_parent_pairs"]} >= {
+            (34, 38), (37, 60), (39, 60)
+        }
+    assert value["requested_global_turn_split_N2_main"] == topologies
+    assert value["turn_split_sub_islands_N2_main"] == topologies
     assert value[
         "unavailable_requested_topologies_due_pinned_physics_repair"
-    ] == ([] if fixed_primary_turns == 5 else [28])
-    assert {tuple(pair) for pair in value["turn_split_parent_pair_schedule"]} == {
-        (28 + shift, 31 + shift), (29 + shift, 32 + shift),
-        (30 + shift, 33 + shift), (28 + shift, 33 + shift),
-        (29 + shift, 31 + shift), (30 + shift, 32 + shift),
-    }
+    ] == []
+    assert {tuple(pair) for pair in value["turn_split_parent_pair_schedule"]} == pairs
     assert value["paired_mating"].startswith("cross_distinct")
     assert value["migration"]["period_generations"] == 5
-    assert value["migration"]["migrants_per_event"] == 6
+    assert value["migration"]["migrants_per_event"] == len(topologies)
     assert value["survival"] == {
         "kind": "normalized_positive_G_sum_epsilon_then_rank_crowding",
         "initial_epsilon": 20.0,
         "decay_to_zero_generation": 160,
         "terminal_epsilon": 0.0,
-        "minimum_survivors_per_turn_split_sub_island": 4,
+        "minimum_survivors_per_turn_split_sub_island": minimum_each,
     }
+    budget = value["bounded_diversity_budget"]
+    assert budget["additional_model_evaluations"] == 0
+    assert budget["population_change"] == budget["generation_change"] == 0
+    if fixed_primary_turns == 6:
+        assert budget["protected_slots"] == 56
+        assert budget["protected_population_fraction"] == 0.175
+        assert budget["maximum_single_protected_topology_count"] == 272
+        assert budget["maximum_single_protected_topology_fraction"] == 0.85
     assert value["minimum_evolution_generations"] == 300
     assert value["ftol_early_stop_allowed"] is False
     assert value["warm_donor_prediction_inheritance_allowed"] is False

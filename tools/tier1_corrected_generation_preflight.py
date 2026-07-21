@@ -83,6 +83,7 @@ PRODUCTION_POPULATION = 320
 PRODUCTION_INFERENCE_THREADS = 8
 REMOTE_PREFLIGHT_SCHEMA = "mft-tier1-current7-remote-model-load-v1"
 SEARCH_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
+WARM_ROLE_PARTITION_SCHEMA = "mft-tier1-authenticated-warm-role-partition-v1"
 BIG = 1e6
 
 BASE_CONSTRAINT_NAMES = (
@@ -106,6 +107,43 @@ SIZE_CONSTRAINT_NAMES = (
     "exterior_height_limit",
 )
 SIDE_TEMPERATURE_TARGET = "Tprobe_Rx_side_leeward_max"
+STRUCTURAL_DONOR_REQUIRED_GATES = (
+    "decoder",
+    "minimum_physical_insulation",
+    "core_group",
+    "winding_budget_identity",
+    "fixed_primary_turns",
+)
+STRUCTURAL_DONOR_OPTIMIZER_GATES = (
+    "shrink",
+    "box",
+    "analytical_B",
+)
+
+# These surrogate means represent passive physical quantities.  Tree/boosting
+# ensembles trained in log1p space can extrapolate to a small negative value
+# after expm1, even though every training observation is non-negative.  Such a
+# prediction must never be clamped into apparent feasibility.  The terminal
+# gate below quarantines the candidate and preserves the raw prediction.
+TERMINAL_NONNEGATIVE_SURROGATE_TARGETS = (
+    "P_winding_total",
+    "P_core_total",
+    "P_core_plate_total",
+    "P_wcp_total",
+    "P_Tx_main_group",
+    "P_Rx_main_group",
+    "P_Rx_side_total",
+    "B_mean_core",
+)
+TERMINAL_POSITIVE_SURROGATE_TARGETS = (
+    "Llt_phys",
+    "C_tx_tx_F",
+    "C_rx_rx_F",
+    "C_tx_rx_F",
+)
+TERMINAL_SURROGATE_PHYSICALITY_SCHEMA = (
+    "mft-tier1-current7-terminal-surrogate-physicality-v1"
+)
 
 # These surrogate means represent passive physical quantities.  Tree/boosting
 # ensembles trained in log1p space can extrapolate to a small negative value
@@ -782,12 +820,106 @@ def _turn_split_unit_coordinate(
     return float(value)
 
 
+def _basin_lane_topologies(
+    contract: Mapping[str, Any],
+) -> dict[str, tuple[int, ...]]:
+    lanes = contract.get("basin_donor_lanes") or {}
+    if not isinstance(lanes, Mapping) or not lanes:
+        raise RuntimeError("turn-split contract has no basin donor lanes")
+    result: dict[str, tuple[int, ...]] = {}
+    for name, lane in lanes.items():
+        pairs = (lane or {}).get("topologies_N2_main_N2_side") or []
+        topologies = tuple(int(pair[0]) for pair in pairs)
+        if not topologies or len(topologies) != len(set(topologies)):
+            raise RuntimeError("basin donor lane topology inventory is invalid")
+        result[str(name)] = topologies
+    return result
+
+
+def select_basin_warm_start_indices(
+    coordinates: Any,
+    *,
+    count: int,
+    contract: Mapping[str, Any],
+    random_state: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """Select warm donors without dropping a rare authenticated topology."""
+
+    import numpy as np
+
+    values = np.asarray(coordinates, dtype=float)
+    count = min(int(count), len(values))
+    if values.ndim != 2 or count < 0:
+        raise RuntimeError("basin warm selection shape is invalid")
+    topologies = tuple(
+        int(value) for value in contract["turn_split_sub_islands_N2_main"]
+    )
+    observed = _turn_split_main_values(
+        values,
+        fixed_primary_turns=contract["fixed_primary_turns"],
+        coordinate_index=contract["coordinate_index"],
+    )
+    selected: list[int] = []
+    copies = int(contract["initial_repaired_copies_per_sub_island"])
+    for topology in topologies:
+        candidates = np.flatnonzero(observed == topology)
+        if len(candidates):
+            candidates = random_state.permutation(candidates)
+            selected.extend(
+                int(index) for index in candidates[: min(copies, len(candidates))]
+                if int(index) not in selected
+            )
+    if len(selected) > count:
+        selected = selected[:count]
+    remaining = np.asarray(
+        [index for index in range(len(values)) if index not in selected],
+        dtype=int,
+    )
+    if len(selected) < count:
+        selected.extend(
+            int(index)
+            for index in random_state.permutation(remaining)[
+                : count - len(selected)
+            ]
+        )
+    selected_values = observed[np.asarray(selected, dtype=int)]
+    selected_counts = {
+        str(topology): int(np.count_nonzero(selected_values == topology))
+        for topology in topologies
+    }
+    available_counts = {
+        str(topology): int(np.count_nonzero(observed == topology))
+        for topology in topologies
+    }
+    audit = {
+        "schema_version": "mft-tier1-basin-warm-selection-v1",
+        "requested_count": count,
+        "selected_count": len(selected),
+        "available_topology_counts": available_counts,
+        "selected_topology_counts": selected_counts,
+        "rare_available_topology_dropped": any(
+            available_counts[str(topology)] > 0
+            and selected_counts[str(topology)] == 0
+            for topology in topologies
+        ),
+        "prior_prediction_or_pass_classification_inherited": False,
+        "additional_model_evaluations": 0,
+    }
+    if audit["rare_available_topology_dropped"]:
+        raise RuntimeError("basin warm selection dropped an available topology")
+    audit["sha256"] = canonical_sha256(audit)
+    return np.asarray(selected, dtype=int), audit
+
+
 def seed_turn_split_sub_islands(
     problem: Any,
     initial: Any,
     contract: Mapping[str, Any],
+    *,
+    warm_donor_count: int = 0,
+    protected_warm_donors_only: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
-    """Install the required repaired copies of every turn-split topology."""
+    """Install repaired copies while retaining distinct basin donor genomes."""
 
     import numpy as np
 
@@ -802,13 +934,79 @@ def seed_turn_split_sub_islands(
         raise RuntimeError(
             f"population requires at least {required} rows for topology seeding"
         )
+    if not 0 <= int(warm_donor_count) <= len(values):
+        raise RuntimeError("warm donor count escaped the initial population")
+    if not isinstance(protected_warm_donors_only, bool):
+        raise RuntimeError("protected warm-donor policy must be boolean")
+    if protected_warm_donors_only and int(warm_donor_count) < 1:
+        raise RuntimeError("protected warm-donor policy has no donor rows")
+    lanes = _basin_lane_topologies(contract)
+    source_values = values.copy()
+    source_observed = _turn_split_main_values(
+        source_values,
+        fixed_primary_turns=contract["fixed_primary_turns"],
+        coordinate_index=coordinate_index,
+    )
+    protected = set(topologies)
+    donor_sources = []
     for copy_index in range(copies):
         for topology_index, n2_main in enumerate(topologies):
             row = copy_index * len(topologies) + topology_index
+            lane_topologies = {
+                topology
+                for values_in_lane in lanes.values()
+                if n2_main in values_in_lane
+                for topology in values_in_lane
+            }
+            candidate_tiers = (
+                ("same_topology", source_observed == n2_main),
+                (
+                    "same_basin_lane",
+                    np.isin(source_observed, sorted(lane_topologies)),
+                ),
+                (
+                    "protected_basin_topology",
+                    np.isin(source_observed, sorted(protected)),
+                ),
+                ("any_initial_coordinate", np.ones(len(values), dtype=bool)),
+            )
+            ordered_candidates: list[int] = []
+            candidate_source_tier: dict[int, str] = {}
+            for tier, mask in candidate_tiers:
+                candidates = np.flatnonzero(mask)
+                if protected_warm_donors_only:
+                    candidates = candidates[
+                        candidates < int(warm_donor_count)
+                    ]
+                elif int(warm_donor_count):
+                    candidates = np.concatenate((
+                        candidates[candidates < int(warm_donor_count)],
+                        candidates[candidates >= int(warm_donor_count)],
+                    ))
+                for candidate in candidates:
+                    candidate = int(candidate)
+                    if candidate not in candidate_source_tier:
+                        ordered_candidates.append(candidate)
+                        candidate_source_tier[candidate] = tier
+            if not ordered_candidates:  # pragma: no cover
+                raise RuntimeError("turn-split basin has no coordinate donor")
+            source_index = ordered_candidates[copy_index % len(ordered_candidates)]
+            source_tier = candidate_source_tier[source_index]
+            values[row] = source_values[source_index]
             values[row, coordinate_index] = _turn_split_unit_coordinate(
                 n2_main,
                 fixed_primary_turns=contract["fixed_primary_turns"],
             )
+            donor_sources.append({
+                "target_N2_main": n2_main,
+                "copy_index": copy_index,
+                "source_row": source_index,
+                "source_N2_main": int(source_observed[source_index]),
+                "source_is_authenticated_warm": bool(
+                    source_index < int(warm_donor_count)
+                ),
+                "source_tier": source_tier,
+            })
     values = np.asarray(problem.repair_unit_coordinates(values), dtype=float)
     observed = _turn_split_main_values(
         values,
@@ -822,11 +1020,29 @@ def seed_turn_split_sub_islands(
     if any(counts[str(topology)] < copies for topology in topologies):
         raise RuntimeError("turn-split initialization repair lost a sub-island")
     audit = {
-        "schema_version": "mft-tier1-turn-split-initialization-v1",
+        "schema_version": "mft-tier1-basin-aware-initialization-v2",
         "topology_counts_after_current_repair": counts,
         "minimum_copies_each_verified": True,
+        "basin_lane_topologies": {
+            name: list(lane_topologies)
+            for name, lane_topologies in lanes.items()
+        },
+        "basin_seeded_counts": {
+            name: sum(
+                counts[str(topology)] for topology in lane_topologies
+            )
+            for name, lane_topologies in lanes.items()
+        },
+        "donor_sources": donor_sources,
+        "same_or_same_lane_donor_count": sum(
+            item["source_tier"] in {"same_topology", "same_basin_lane"}
+            for item in donor_sources
+        ),
+        "warm_donor_count": int(warm_donor_count),
+        "protected_warm_donors_only": protected_warm_donors_only,
         "warm_coordinates_are_donors_only": True,
         "source_prediction_or_pass_classification_inherited": False,
+        "additional_model_evaluations": 0,
     }
     audit["sha256"] = canonical_sha256(audit)
     return values, audit
@@ -1013,6 +1229,7 @@ def create_deep_topology_components(
             self.last_epsilon = None
             self.last_topology_counts: dict[str, int] = {}
             self.minimum_topology_count_observed = math.inf
+            self.maximum_single_topology_count_observed = 0
 
         def _do(
             self,
@@ -1085,6 +1302,10 @@ def create_deep_topology_components(
             self.last_topology_counts = counts
             self.minimum_topology_count_observed = min(
                 self.minimum_topology_count_observed, min(counts.values())
+            )
+            self.maximum_single_topology_count_observed = max(
+                self.maximum_single_topology_count_observed,
+                max(counts.values()),
             )
             return survivors
 
@@ -1970,6 +2191,83 @@ def create_current7_problem_class(
                 ],
             }
 
+        def filter_structural_donor_coordinates(
+            self, coordinates: Any
+        ) -> tuple[Any, dict[str, Any]]:
+            """Keep coordinate-only donors without claiming hard feasibility.
+
+            Basin donors are allowed to violate optimizer-facing shrink, box,
+            and analytical-flux gates.  Those physical ``G`` terms remain in
+            the unchanged problem evaluation and terminal replay.  Decoder,
+            manufacturing, insulation, winding-budget, and fixed-turn
+            identities are mandatory before a donor may seed a protected
+            topology slot.
+            """
+
+            values = np.asarray(coordinates, dtype=float)
+            audit = self.hard_geometry_audit(values)
+            gate_masks = audit["gate_masks"]
+            if not set(STRUCTURAL_DONOR_REQUIRED_GATES) <= set(gate_masks):
+                raise RuntimeError("structural donor gate inventory drifted")
+            structural_mask = np.logical_and.reduce(tuple(
+                np.asarray(gate_masks[name], dtype=bool)
+                for name in STRUCTURAL_DONOR_REQUIRED_GATES
+            ))
+            repaired = audit["repaired_coordinates"]
+            kept = []
+            seen = set()
+            for index in np.flatnonzero(structural_mask):
+                identity = audit["geometry_identities"][int(index)]
+                if identity is None or identity in seen:
+                    continue
+                seen.add(identity)
+                kept.append(repaired[int(index)])
+            result = (
+                np.asarray(kept, dtype=float).reshape(-1, self.n_var)
+                if kept
+                else np.empty((0, self.n_var), dtype=float)
+            )
+            evidence = {
+                "schema_version": (
+                    "mft-tier1-coordinate-only-structural-donor-filter-v1"
+                ),
+                "input_count": int(len(values)),
+                "structurally_accepted_count": int(
+                    np.count_nonzero(structural_mask)
+                ),
+                "decoded_unique_count": int(len(result)),
+                "structurally_rejected_count": int(
+                    len(values) - np.count_nonzero(structural_mask)
+                ),
+                "duplicate_geometry_count": int(
+                    np.count_nonzero(structural_mask) - len(result)
+                ),
+                "required_gate_names": list(
+                    STRUCTURAL_DONOR_REQUIRED_GATES
+                ),
+                "required_gate_passed_counts": {
+                    name: int(np.count_nonzero(gate_masks[name]))
+                    for name in STRUCTURAL_DONOR_REQUIRED_GATES
+                },
+                "optimizer_gate_names_not_used_for_donor_admission": list(
+                    STRUCTURAL_DONOR_OPTIMIZER_GATES
+                ),
+                "optimizer_gate_passed_counts": {
+                    name: int(np.count_nonzero(gate_masks[name]))
+                    for name in STRUCTURAL_DONOR_OPTIMIZER_GATES
+                },
+                "coordinate_sha256": canonical_sha256(result.tolist()),
+                "coordinate_donors_only": True,
+                "ordinary_warm_sampling_allowed": False,
+                "prior_objectives_or_constraints_inherited": False,
+                "additional_model_evaluations": 0,
+                "physical_constraint_G_mutation": False,
+                "physical_objective_mutation": False,
+                "terminal_physical_replay_required": True,
+            }
+            evidence["sha256"] = canonical_sha256(evidence)
+            return result, evidence
+
         def _predict(self, target: str, frame: Any) -> tuple[Any, Any]:
             cache_key = (str(target), tuple(getattr(frame, "index", range(len(frame)))))
             if self._prediction_cache is not None and cache_key in self._prediction_cache:
@@ -2345,6 +2643,97 @@ def install_optimizer_scaling(
     return physical_evaluate, contract
 
 
+def validate_warm_role_partition(
+    partition: Mapping[str, Any],
+    coordinates: Any,
+    *,
+    fixed_primary_turns: int,
+) -> dict[str, Any]:
+    """Authenticate disjoint standard-warm and structural-donor row roles."""
+
+    import numpy as np
+
+    values = np.asarray(coordinates, dtype=float)
+    if values.ndim != 2:
+        raise RuntimeError("warm role partition coordinate schema mismatch")
+    value = dict(partition or {})
+    unsigned = dict(value)
+    recorded_sha = unsigned.pop("sha256", None)
+    standard = value.get("standard_hard_feasible_candidates") or {}
+    basin = value.get("basin_structural_coordinate_donors") or {}
+    standard_start = standard.get("start")
+    standard_count = standard.get("count")
+    basin_start = basin.get("start")
+    basin_count = basin.get("count")
+    integer_fields = (
+        standard_start,
+        standard_count,
+        basin_start,
+        basin_count,
+        value.get("total_count"),
+    )
+    if any(
+        isinstance(item, bool) or not isinstance(item, int) or item < 0
+        for item in integer_fields
+    ):
+        raise RuntimeError("warm role partition ranges are invalid")
+    if (
+        value.get("schema_version") != WARM_ROLE_PARTITION_SCHEMA
+        or recorded_sha != canonical_sha256(unsigned)
+        or int(fixed_primary_turns) != 6
+        or value.get("fixed_primary_turns") != int(fixed_primary_turns)
+        or standard_start != 0
+        or standard_count < 1
+        or basin_start != standard_count
+        or basin_count < 1
+        or value.get("total_count") != len(values)
+        or standard_count + basin_count != len(values)
+        or standard.get("full_hard_geometry_filter_required") is not True
+        or standard.get("ordinary_warm_sampling_allowed") is not True
+        or len(str(standard.get("source_artifact_sha256") or "")) != 64
+        or len(str(standard.get("source_contract_file_sha256") or "")) != 64
+        or not isinstance(
+            standard.get("source_hard_geometry_joint_count"), int
+        )
+        or standard.get("source_hard_geometry_joint_count") < 1
+        or basin.get("coordinate_donors_only") is not True
+        or basin.get("protected_topology_slots_only") is not True
+        or basin.get("ordinary_warm_sampling_allowed") is not False
+        or basin.get("required_gate_names")
+        != list(STRUCTURAL_DONOR_REQUIRED_GATES)
+        or basin.get("optimizer_gate_names_not_used_for_donor_admission")
+        != list(STRUCTURAL_DONOR_OPTIMIZER_GATES)
+        or basin.get("required_topologies_N2_main")
+        != list(
+            deep_topology_contract(6)[
+                "turn_split_sub_islands_N2_main"
+            ]
+        )
+        or len(
+            str(basin.get("source_selection_contract_sha256") or "")
+        )
+        != 64
+        or value.get("maximum_combined_authenticated_fraction") != 0.5
+        or value.get("minimum_fresh_random_fraction") != 0.5
+        or value.get("physical_constraint_G_mutation") is not False
+        or value.get("physical_objective_mutation") is not False
+        or value.get("terminal_physical_replay_required") is not True
+    ):
+        raise RuntimeError("warm role partition contract mismatch")
+    standard_values = values[
+        standard_start : standard_start + standard_count
+    ]
+    basin_values = values[basin_start : basin_start + basin_count]
+    if (
+        standard.get("coordinate_unit_sha256")
+        != canonical_sha256(standard_values.tolist())
+        or basin.get("coordinate_unit_sha256")
+        != canonical_sha256(basin_values.tolist())
+    ):
+        raise RuntimeError("warm role partition coordinate identity mismatch")
+    return value
+
+
 @dataclass
 class Current7Tier1Runner:
     authenticated: Any
@@ -2427,6 +2816,103 @@ class Current7Tier1Runner:
         }
         evidence["sha256"] = canonical_sha256(evidence)
         return repaired, evidence
+
+    def prepare_authenticated_warm_start(
+        self,
+        coordinates: Any,
+        *,
+        role_partition: Mapping[str, Any] | None,
+        stage: str,
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        """Repair and separate ordinary warm rows from basin-only donors."""
+
+        import numpy as np
+
+        values = np.asarray(coordinates, dtype=float)
+        partition = None
+        if role_partition is not None:
+            partition = validate_warm_role_partition(
+                role_partition,
+                values,
+                fixed_primary_turns=self.problem.fixed_primary_turns,
+            )
+        repaired, repair_evidence = self.repair_coordinates(
+            values, stage=stage
+        )
+        if partition is None:
+            standard_values = repaired
+            donor_values = np.empty((0, self.problem.n_var), dtype=float)
+        else:
+            standard = partition["standard_hard_feasible_candidates"]
+            basin = partition["basin_structural_coordinate_donors"]
+            standard_start = int(standard["start"])
+            basin_start = int(basin["start"])
+            standard_values = repaired[
+                standard_start : standard_start + int(standard["count"])
+            ]
+            donor_values = repaired[
+                basin_start : basin_start + int(basin["count"])
+            ]
+        standard_warm, standard_filter = (
+            self.problem.filter_warm_start_coordinates(standard_values)
+        )
+        if len(standard_warm) < 1:
+            raise RuntimeError(
+                "authenticated standard warm role has no hard-feasible design"
+            )
+        donor_filter = None
+        structural_donors = np.empty(
+            (0, self.problem.n_var), dtype=float
+        )
+        topology_counts: dict[str, int] = {}
+        if partition is not None:
+            structural_donors, donor_filter = (
+                self.problem.filter_structural_donor_coordinates(donor_values)
+            )
+            if len(structural_donors) < 1:
+                raise RuntimeError(
+                    "authenticated basin role has no structural coordinate donor"
+                )
+            topology_contract = deep_topology_contract(
+                self.problem.fixed_primary_turns
+            )
+            observed = _turn_split_main_values(
+                structural_donors,
+                fixed_primary_turns=self.problem.fixed_primary_turns,
+                coordinate_index=topology_contract["coordinate_index"],
+            )
+            required = tuple(
+                int(item)
+                for item in topology_contract[
+                    "turn_split_sub_islands_N2_main"
+                ]
+            )
+            topology_counts = {
+                str(topology): int(np.count_nonzero(observed == topology))
+                for topology in required
+            }
+            if any(topology_counts[str(topology)] < 1 for topology in required):
+                raise RuntimeError(
+                    "authenticated basin role omitted a required topology"
+                )
+        evidence = {
+            "schema_version": "mft-tier1-authenticated-warm-role-audit-v1",
+            "role_partitioned": partition is not None,
+            "repair": repair_evidence,
+            "standard_hard_geometry_filter": standard_filter,
+            "standard_hard_feasible_count": int(len(standard_warm)),
+            "basin_structural_donor_filter": donor_filter,
+            "basin_structural_donor_count": int(len(structural_donors)),
+            "basin_structural_topology_counts": topology_counts,
+            "structural_donors_excluded_from_ordinary_warm_sampling": True,
+            "prior_objectives_or_constraints_inherited": False,
+            "additional_model_evaluations": 0,
+            "physical_constraint_G_mutation": False,
+            "physical_objective_mutation": False,
+            "terminal_physical_replay_required": True,
+        }
+        evidence["sha256"] = canonical_sha256(evidence)
+        return standard_warm, structural_donors, evidence
 
     def evaluate_coordinates(
         self,
@@ -2548,6 +3034,7 @@ class Current7Tier1Runner:
         max_generations: int = 600,
         warm_start_path: Path | None = None,
         warm_start_sha256: str | None = None,
+        warm_start_role_partition: Mapping[str, Any] | None = None,
         optimizer_termination_strategy: str = (
             FIXED_GENERATION_TERMINATION_STRATEGY
         ),
@@ -2586,45 +3073,116 @@ class Current7Tier1Runner:
             raise RuntimeError(
                 "warm-start path and expected SHA-256 must be supplied together"
             )
+        if warm_start_role_partition is not None and warm_start_path is None:
+            raise RuntimeError("warm role partition requires a warm-start artifact")
         warm_audit = None
         warm = None
+        structural_donors = None
         if warm_start_path is not None:
             warm_values, source_authentication = load_authenticated_warm_start(
                 warm_start_path,
                 str(warm_start_sha256),
                 n_var=self.problem.n_var,
             )
-            warm, warm_repair = self.repair_coordinates(
-                warm_values, stage="authenticated_warm_start"
+            warm, structural_donors, role_audit = (
+                self.prepare_authenticated_warm_start(
+                    warm_values,
+                    role_partition=warm_start_role_partition,
+                    stage="authenticated_warm_start",
+                )
             )
-            warm, filter_audit = self.problem.filter_warm_start_coordinates(warm)
-            if len(warm) == 0:
-                raise RuntimeError("authenticated warm pool has no hard-feasible design")
             warm_audit = {
                 "source_authentication": source_authentication,
-                "repair": warm_repair,
-                "filter": filter_audit,
+                "role_audit": role_audit,
                 "source_sha_verified": True,
             }
             warm_audit["sha256"] = canonical_sha256(warm_audit)
 
-        if warm is not None and len(warm):
-            count = min(len(warm), population // 2)
-            selected = rng.choice(len(warm), count, replace=False)
+        warm_selection_audit = None
+        standard_selection_audit = None
+        donor_selection_audit = None
+        donor_count = 0
+        standard_count = 0
+        if structural_donors is not None and len(structural_donors):
+            protected_count = int(
+                topology_contract["initial_repaired_copies_per_sub_island"]
+            ) * len(topology_contract["turn_split_sub_islands_N2_main"])
+            maximum_authenticated = population // 2
+            if protected_count >= maximum_authenticated:
+                raise RuntimeError(
+                    "population cannot mix protected donors, standard warm, "
+                    "and at least one-half fresh random"
+                )
+            if len(structural_donors) < protected_count:
+                raise RuntimeError(
+                    "structural donor reservoir is smaller than its protected "
+                    "topology budget"
+                )
+            donor_count = protected_count
+            standard_count = min(
+                len(warm), maximum_authenticated - donor_count
+            )
+            donor_selected, donor_selection_audit = (
+                select_basin_warm_start_indices(
+                    structural_donors,
+                    count=donor_count,
+                    contract=topology_contract,
+                    random_state=rng,
+                )
+            )
+            standard_selected, standard_selection_audit = (
+                select_basin_warm_start_indices(
+                    warm,
+                    count=standard_count,
+                    contract=topology_contract,
+                    random_state=rng,
+                )
+            )
+            if (
+                len(donor_selected) != donor_count
+                or len(standard_selected) != standard_count
+            ):
+                raise RuntimeError("authenticated warm role selection underfilled")
+            raw_initial = np.vstack([
+                structural_donors[donor_selected],
+                warm[standard_selected],
+                rng.random((
+                    population - donor_count - standard_count,
+                    self.problem.n_var,
+                )),
+            ])
+            warm_selection_audit = donor_selection_audit
+        elif warm is not None and len(warm):
+            standard_count = min(len(warm), population // 2)
+            selected, standard_selection_audit = select_basin_warm_start_indices(
+                warm,
+                count=standard_count,
+                contract=topology_contract,
+                random_state=rng,
+            )
             raw_initial = np.vstack([
                 warm[selected],
-                rng.random((population - count, self.problem.n_var)),
+                rng.random((population - standard_count, self.problem.n_var)),
             ])
+            warm_selection_audit = standard_selection_audit
         else:
-            count = 0
             raw_initial = rng.random((population, self.problem.n_var))
+        authenticated_count = donor_count + standard_count
         current_initialization_audit = {
             "schema_version": "mft-current-run-nsga2-initialization-v1",
             "policy_source": "optimization.run_nsga2.run_one",
             "population": population,
-            "authenticated_warm_injected_count": int(count),
-            "fresh_random_count": int(population - count),
+            "authenticated_warm_injected_count": int(authenticated_count),
+            "authenticated_standard_hard_feasible_warm_count": int(
+                standard_count
+            ),
+            "authenticated_structural_donor_count": int(donor_count),
+            "fresh_random_count": int(population - authenticated_count),
             "maximum_warm_fraction": 0.5,
+            "basin_stratified_warm_selection": warm_selection_audit,
+            "standard_warm_selection": standard_selection_audit,
+            "structural_donor_selection": donor_selection_audit,
+            "structural_donors_excluded_from_ordinary_warm_sampling": True,
         }
         current_initialization_audit["sha256"] = canonical_sha256(
             current_initialization_audit
@@ -2632,16 +3190,56 @@ class Current7Tier1Runner:
         initial, base_initial_repair = self.repair_coordinates(
             raw_initial, stage="initial_population"
         )
+        standard_before_topology_sha = None
+        if donor_count:
+            standard_before_topology_sha = canonical_sha256(
+                initial[
+                    donor_count : donor_count + standard_count
+                ].tolist()
+            )
         repair_operator = (
             self.prepared_repair_operator
             or create_pymoo_physics_repair(self.problem)
         )
         initial, topology_initialization = seed_turn_split_sub_islands(
-            self.problem, initial, topology_contract
+            self.problem,
+            initial,
+            topology_contract,
+            warm_donor_count=donor_count or standard_count,
+            protected_warm_donors_only=bool(donor_count),
         )
+        if donor_count and not all(
+            item["source_is_authenticated_warm"]
+            for item in topology_initialization["donor_sources"]
+        ):
+            raise RuntimeError(
+                "protected topology initialization escaped structural donors"
+            )
         initial, initial_audit = self.repair_coordinates(
             initial, stage="initial_population_after_topology_seeding"
         )
+        role_partition_preservation = None
+        if donor_count:
+            standard_after_topology_sha = canonical_sha256(
+                initial[
+                    donor_count : donor_count + standard_count
+                ].tolist()
+            )
+            if standard_after_topology_sha != standard_before_topology_sha:
+                raise RuntimeError(
+                    "protected topology seeding overwrote standard warm rows"
+                )
+            role_partition_preservation = {
+                "standard_warm_rows_preserved_after_topology_seeding": True,
+                "standard_warm_coordinate_sha256": (
+                    standard_after_topology_sha
+                ),
+                "standard_warm_count": int(standard_count),
+                "structural_donor_protected_slot_count": int(donor_count),
+            }
+            role_partition_preservation["sha256"] = canonical_sha256(
+                role_partition_preservation
+            )
         pre_optimization_evidence = {
             "schema_version": "mft-tier1-current7-pre-optimization-v1",
             "fixed_primary_turns": self.problem.fixed_primary_turns,
@@ -2650,6 +3248,7 @@ class Current7Tier1Runner:
                 "base_repair": base_initial_repair,
                 "turn_split_sub_islands": topology_initialization,
                 "repair": initial_audit,
+                "role_partition_preservation": role_partition_preservation,
             },
             "authenticated_warm_start": warm_audit,
             "offspring_repair_operator": repair_operator.evidence(),
@@ -2718,6 +3317,18 @@ class Current7Tier1Runner:
                 "minimum_survivors_per_turn_split_sub_island"
             ]
         )
+        diversity_budget = topology_contract["bounded_diversity_budget"]
+        maximum_single_topology = int(
+            diversity_budget["maximum_single_protected_topology_count"]
+        )
+        lane_topologies = _basin_lane_topologies(topology_contract)
+        terminal_lane_counts = {
+            name: sum(
+                terminal_topology_counts[str(topology)]
+                for topology in values
+            )
+            for name, values in lane_topologies.items()
+        }
         operator_audit = {
             "paired_selection_calls": int(
                 executed.mating.selection.selection_calls
@@ -2733,6 +3344,9 @@ class Current7Tier1Runner:
             ),
             "minimum_topology_count_observed": int(
                 executed.survival.minimum_topology_count_observed
+            ),
+            "maximum_single_topology_count_observed": int(
+                executed.survival.maximum_single_topology_count_observed
             ),
             "last_topology_counts": dict(
                 executed.survival.last_topology_counts
@@ -2753,6 +3367,8 @@ class Current7Tier1Runner:
             or operator_audit["migrants_created"] < len(topologies)
             or operator_audit["survival_calls"] < 2
             or operator_audit["minimum_topology_count_observed"] < minimum_each
+            or operator_audit["maximum_single_topology_count_observed"]
+            > maximum_single_topology
             or operator_audit["last_topology_counts"] != terminal_topology_counts
             or any(
                 terminal_topology_counts[str(topology)] < minimum_each
@@ -2775,7 +3391,10 @@ class Current7Tier1Runner:
             "schema_version": "mft-tier1-turn-split-evolution-audit-v1",
             **operator_audit,
             "terminal_topology_counts": terminal_topology_counts,
+            "terminal_basin_lane_counts": terminal_lane_counts,
+            "bounded_diversity_budget": diversity_budget,
             "all_required_topologies_preserved": True,
+            "single_topology_collapse_prevented": True,
             "terminal_epsilon_zero": bool(expected_last_epsilon == 0.0),
             "physical_constraint_G_mutation": False,
             "physical_objective_mutation": False,
@@ -2792,6 +3411,7 @@ class Current7Tier1Runner:
                 "base_repair": base_initial_repair,
                 "turn_split_sub_islands": topology_initialization,
                 "repair": initial_audit,
+                "role_partition_preservation": role_partition_preservation,
             },
             "authenticated_warm_start": warm_audit,
             "pymoo_operator": executed_repair.evidence(),
@@ -3433,6 +4053,44 @@ def authenticate_warm_handoff(
         expected_warm_sha,
         n_var=n_var,
     )
+    role_partition = contract.get("warm_role_partition")
+    validated_role_partition = (
+        None
+        if role_partition is None
+        else validate_warm_role_partition(
+            role_partition,
+            values,
+            fixed_primary_turns=int(fixed_primary_turns),
+        )
+    )
+    if validated_role_partition is not None:
+        standard_role = validated_role_partition[
+            "standard_hard_feasible_candidates"
+        ]
+        basin_role = validated_role_partition[
+            "basin_structural_coordinate_donors"
+        ]
+        basin_selection = contract.get("basin_aware_selection") or {}
+        standard_source = contract.get("standard_warm_source") or {}
+        unsigned_standard_source = dict(standard_source)
+        standard_source_sha = unsigned_standard_source.pop("sha256", None)
+        if (
+            standard_source_sha != canonical_sha256(unsigned_standard_source)
+            or standard_role.get("source_artifact_sha256")
+            != (standard_source.get("artifact") or {}).get("sha256")
+            or standard_role.get("source_contract_file_sha256")
+            != (standard_source.get("contract") or {}).get("file_sha256")
+            or standard_role.get("source_hard_geometry_joint_count")
+            != standard_source.get("hard_geometry_joint_count")
+            or standard_source.get(
+                "remote_current_problem_hard_filter_required"
+            )
+            is not True
+            or basin_role.get("source_selection_contract_sha256")
+            != basin_selection.get("sha256")
+            or basin_selection.get("coordinate_donors_only") is not True
+        ):
+            raise RuntimeError("warm basin role/source selection identity mismatch")
     if (
         (
             expected_contract_file_sha256 is not None
@@ -3477,6 +4135,7 @@ def authenticate_warm_handoff(
         "source_sha_verified_before_repair": True,
         "coordinates_only": True,
         "coordinate_contract": warm_record.get("coordinate_contract"),
+        "warm_role_partition": validated_role_partition,
         "prior_prediction_or_pass_classification_reused": False,
     }
     evidence["sha256"] = canonical_sha256(evidence)
@@ -5120,14 +5779,19 @@ def run_search_seed(
         n_var=runner.problem.n_var,
         expected_contract_file_sha256=warm_contract_record["sha256"],
     )
-    repaired_warm, warm_repair = runner.repair_coordinates(
-        warm_values, stage="remote_preflight_authenticated_warm_start"
-    )
-    filtered_warm, warm_filter = runner.problem.filter_warm_start_coordinates(
-        repaired_warm
+    filtered_warm, structural_donors, warm_role_preflight = (
+        runner.prepare_authenticated_warm_start(
+            warm_values,
+            role_partition=warm_handoff.get("warm_role_partition"),
+            stage="remote_preflight_authenticated_warm_start",
+        )
     )
     if len(filtered_warm) < 1:
         raise RuntimeError("remote warm preflight has no repaired hard-feasible row")
+    if warm_handoff.get("warm_role_partition") is not None and len(
+        structural_donors
+    ) < 1:
+        raise RuntimeError("remote warm preflight has no structural basin donor")
     physical_evaluate, optimizer_scaling = install_optimizer_scaling(
         runner.problem,
         resonance_scale_hz=optimizer_resonance_scale_hz,
@@ -5219,8 +5883,11 @@ def run_search_seed(
             "terminal_physical_replay_required": True,
             "initial_population_repair_evidence": initial,
             "warm_handoff_authentication": warm_handoff,
-            "warm_preflight_repair": warm_repair,
-            "warm_preflight_filter": warm_filter,
+            "warm_preflight_repair": warm_role_preflight["repair"],
+            "warm_preflight_filter": warm_role_preflight[
+                "standard_hard_geometry_filter"
+            ],
+            "warm_role_preflight": warm_role_preflight,
             "pre_optimization_evidence": dict(pre_optimization),
             "repair_installation": repair_installation,
             "legacy_feedback_wrapper_used": False,
@@ -5241,6 +5908,7 @@ def run_search_seed(
         max_generations=int(max_generations),
         warm_start_path=supplied_warm_path,
         warm_start_sha256=warm_artifact_record["sha256"],
+        warm_start_role_partition=warm_handoff.get("warm_role_partition"),
         optimizer_termination_strategy=optimizer_termination_strategy,
         pre_optimization_callback=seal_remote_preflight,
     )
