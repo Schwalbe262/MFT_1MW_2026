@@ -132,6 +132,11 @@ logs, and diagnose the identity mismatch.  Never use cancellation as rollback.
 After negative-loss quarantine exact replay and all four immutable patched
 bundle publications pass, render another 4c/28GiB/max32 plan from those new
 bindings.  Gracefully stop the phase-1 controller through its own stop file.
+This quota-optimized release accepts the stopped phase-1 predecessor only at
+its historically sealed 160/140/120/80 quotas and accepts the patched
+successor only at 200/160/90/50.  Neither side accepts an arbitrary quota
+mapping.  The differing policies are authenticated independently before any
+scheduler inventory GET.
 Then invoke `tier1_final1000_rolling_migration.py` again with:
 
 - predecessor plan/state = the stopped phase-1 resource/quota plan and state;

@@ -89,6 +89,18 @@ ROLLING_SUCCESSOR_RESOURCE_POLICY = {
 }
 LEGACY_RESOURCE_POLICY_ID = "legacy-8c-28672m-mw8-t8"
 SUCCESSOR_RESOURCE_POLICY_ID = "successor-4c-28672m-mw32-t8"
+HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS = {
+    "entry-1200-t125": 160,
+    "bridge-1150-t115": 140,
+    "close-1075-t107p5": 120,
+    "final-1000-t100": 80,
+}
+if (
+    set(HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS) != set(BY_ID)
+    or sum(HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS.values())
+    != TOTAL_ACTIVE_QUOTA
+):  # pragma: no cover - immutable release invariant
+    raise RuntimeError("historical resource/quota successor policy is invalid")
 
 ACTIVE_STATES = frozenset({"planned", "submitted", "queued", "running"})
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
@@ -385,9 +397,18 @@ def _initial_state(plan: Mapping[str, Any]) -> dict[str, Any]:
     return _seal_state(unsigned)
 
 
-def _validate_state(
-    state: Mapping[str, Any], plan: Mapping[str, Any]
+def _validate_state_for_sealed_active_quotas(
+    state: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    *,
+    expected_active_quotas: Mapping[str, int],
 ) -> dict[str, Any]:
+    expected_quotas = dict(expected_active_quotas)
+    if expected_quotas not in (
+        SUCCESSOR_ACTIVE_QUOTAS,
+        HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
+    ):
+        raise RuntimeError("unsealed final1000 active quota policy")
     unsigned = {key: item for key, item in state.items() if key != "state_sha256"}
     entries = state.get("entries")
     next_seeds = state.get("next_seed_by_stage")
@@ -436,7 +457,7 @@ def _validate_state(
             != plan.get("launch_plan_sha256")
             or migration.get("successor_resource_policy")
             != ROLLING_SUCCESSOR_RESOURCE_POLICY
-            or migration.get("successor_active_quotas") != SUCCESSOR_ACTIVE_QUOTAS
+            or migration.get("successor_active_quotas") != expected_quotas
             or migration.get("refill_policy") != REFILL_POLICY
             or migration.get("scheduler_mutation_endpoints") != ["POST /api/tasks"]
             or migration.get("cancellation_performed") is not False
@@ -640,6 +661,30 @@ def _validate_state(
         ):
             raise RuntimeError("final1000 rolling migration ledger seal mismatch")
     return copy.deepcopy(dict(state))
+
+
+def _validate_state(
+    state: Mapping[str, Any], plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate a state owned by this release's 200/160/90/50 controller."""
+
+    return _validate_state_for_sealed_active_quotas(
+        state,
+        plan,
+        expected_active_quotas=SUCCESSOR_ACTIVE_QUOTAS,
+    )
+
+
+def _validate_historical_resource_quota_successor_state(
+    state: Mapping[str, Any], plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Authenticate the one sealed 160/140/120/80 phase-1 predecessor."""
+
+    return _validate_state_for_sealed_active_quotas(
+        state,
+        plan,
+        expected_active_quotas=HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
+    )
 
 
 def _verify_live_ready(

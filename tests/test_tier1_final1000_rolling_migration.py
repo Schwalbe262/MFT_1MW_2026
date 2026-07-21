@@ -204,6 +204,143 @@ def _resource_only_successor(predecessor: dict, successor: dict) -> dict:
     return migration.validate_successor_plan(plan)
 
 
+def _historical_resource_quota_successor(
+    predecessor: dict, successor: dict
+) -> dict:
+    """Render the exact 0033c48 phase-1 160/140/120/80 plan identity."""
+
+    plan = _resource_only_successor(predecessor, successor)
+    templates = {
+        task["payload_json"]["final_goal_stage_id"]: task
+        for task in plan["task_waves"]["canaries"]
+    }
+    canaries: list[dict] = []
+    ramp: list[dict] = []
+    for stage in profiles.STAGES:
+        quota = controller.HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS[
+            stage.stage_id
+        ]
+        for offset in range(quota):
+            wave = "canary" if offset == 0 else "ramp"
+            task = migration._render_from_template_for_policy(
+                templates[stage.stage_id],
+                stage_id=stage.stage_id,
+                seed=stage.seed_start + offset,
+                wave=wave,
+                policy=migration.SUCCESSOR_POLICY,
+            )
+            (canaries if wave == "canary" else ramp).append(task)
+    plan["task_waves"] = {"canaries": canaries, "ramp": ramp}
+    plan["open_ended_refill"]["stage_active_quotas"] = copy.deepcopy(
+        controller.HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS
+    )
+    unsigned = {
+        key: value for key, value in plan.items() if key != "launch_plan_sha256"
+    }
+    plan["launch_plan_sha256"] = launch.canonical_sha256(unsigned)
+    return migration.validate_historical_resource_quota_successor_plan(plan)
+
+
+def _stopped_historical_resource_quota_state(plan: dict) -> dict:
+    """Build a sealed stopped phase-1 state without running old release code."""
+
+    state = controller._initial_state(plan)
+    next_task_id = 90_000
+    for entry in state["entries"]:
+        next_task_id += 1
+        entry["task_id"] = next_task_id
+        entry["state"] = "running"
+        entry["origin"] = "successor"
+        entry["resource_policy_id"] = controller.SUCCESSOR_RESOURCE_POLICY_ID
+    state["stop_requested"] = True
+    state["ramp_released"] = True
+    state["canary_passed_stage_ids"] = sorted(profiles.BY_ID)
+    state["scheduler_submit_count"] = 500
+    legacy_plan_identity = copy.deepcopy(plan)
+    legacy_plan_identity["launch_plan_sha256"] = "e" * 64
+    canary_ids = {
+        stage.stage_id: sorted(
+            int(entry["task_id"])
+            for entry in state["entries"]
+            if entry["stage_id"] == stage.stage_id and entry["wave"] == "canary"
+        )
+        for stage in profiles.STAGES
+    }
+    state["rolling_migration"] = {
+        "schema_version": migration.MIGRATION_SCHEMA,
+        "transition_mode": migration.RESOURCE_QUOTA_ONLY,
+        "predecessor_controller_kind": "legacy_8c",
+        "predecessor_launch_plan_sha256": "e" * 64,
+        "predecessor_state_sha256": "f" * 64,
+        "predecessor_state_revision": 1,
+        "successor_launch_plan_sha256": plan["launch_plan_sha256"],
+        "scheduler_inventory_sha256": "a" * 64,
+        "predecessor_entry_count": 0,
+        "imported_active_count_by_stage": {
+            stage.stage_id: 0 for stage in profiles.STAGES
+        },
+        "next_seed_by_stage": copy.deepcopy(state["next_seed_by_stage"]),
+        "successor_resource_policy": copy.deepcopy(
+            controller.ROLLING_SUCCESSOR_RESOURCE_POLICY
+        ),
+        "successor_active_quotas": copy.deepcopy(
+            controller.HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS
+        ),
+        "harvest_cohorts": {
+            "predecessor": migration.harvest_cohort_identity(
+                role="predecessor",
+                plan=legacy_plan_identity,
+                resource_policy_ids=[controller.LEGACY_RESOURCE_POLICY_ID],
+            ),
+            "successor": migration.harvest_cohort_identity(
+                role="successor",
+                plan=plan,
+                resource_policy_ids=[controller.SUCCESSOR_RESOURCE_POLICY_ID],
+            ),
+        },
+        "refill_policy": controller.REFILL_POLICY,
+        "successor_canary_task_ids_by_stage": canary_ids,
+        "successor_canary_status_by_stage": {
+            stage.stage_id: "remote_preflight_passed" for stage in profiles.STAGES
+        },
+        "scheduler_mutation_endpoints": ["POST /api/tasks"],
+        "cancellation_performed": False,
+        "preemption_performed": False,
+        "controller_stop_performed_by_this_tool": False,
+    }
+    sealed = controller._seal_state(state)
+    return controller._validate_historical_resource_quota_successor_state(
+        sealed, plan
+    )
+
+
+def _historical_transition_fixture(tmp_path: Path) -> dict:
+    fixture = _fixture(tmp_path)
+    patched_plan = fixture["successor"]
+    historical_plan = _historical_resource_quota_successor(
+        fixture["predecessor"], patched_plan
+    )
+    historical_state = _stopped_historical_resource_quota_state(historical_plan)
+    predecessor_plan_path = tmp_path / "historical-resource-plan.json"
+    predecessor_state_path = tmp_path / "historical-resource-state.json"
+    successor_plan_path = tmp_path / "patched-plan.json"
+    successor_state_path = tmp_path / "patched-state.json"
+    predecessor_plan_path.write_text(json.dumps(historical_plan))
+    predecessor_state_path.write_text(json.dumps(historical_state))
+    successor_plan_path.write_text(json.dumps(patched_plan))
+    return {
+        "predecessor": historical_plan,
+        "state": historical_state,
+        "successor": patched_plan,
+        "predecessor_plan_path": predecessor_plan_path,
+        "predecessor_state_path": predecessor_state_path,
+        "successor_plan_path": successor_plan_path,
+        "successor_state_path": successor_state_path,
+        "scheduler": _Scheduler(historical_plan, historical_state),
+        "ready": _Ready(historical_plan, patched_plan),
+    }
+
+
 def _predecessor_state(plan: dict) -> dict:
     state = controller._initial_state(plan)
     terminal_stage_ids: set[str] = set()
@@ -344,6 +481,20 @@ def _prepare(fixture: dict, *, apply: bool, **kwargs):
     )
 
 
+def _prepare_historical(fixture: dict, *, apply: bool = False):
+    return migration.prepare_successor_state(
+        predecessor_plan_path=fixture["predecessor_plan_path"],
+        predecessor_state_path=fixture["predecessor_state_path"],
+        successor_plan_path=fixture["successor_plan_path"],
+        successor_state_path=fixture["successor_state_path"],
+        scheduler=fixture["scheduler"],
+        predecessor_ready_probe=fixture["ready"],
+        successor_ready_probe=fixture["ready"],
+        apply=apply,
+        transition_mode=migration.PATCHED_BUNDLE,
+    )
+
+
 def test_successor_policy_preserves_science_threads_and_unlocks_allocation_cap():
     plan = migration.validate_successor_plan(_successor_plan())
     assert plan["resources"] == {
@@ -473,58 +624,44 @@ def test_resource_quota_only_handoff_reuses_exact_current_bundle_bindings(tmp_pa
 def test_stopped_resource_successor_can_dual_bind_patched_bundles(tmp_path):
     fixture = _fixture(tmp_path)
     patched_plan = fixture["successor"]
-    resource_plan = _resource_only_successor(fixture["predecessor"], patched_plan)
-    fixture["successor"] = resource_plan
-    fixture["successor_plan_path"].write_text(json.dumps(resource_plan))
-    fixture["ready"] = _Ready(fixture["predecessor"], resource_plan, patched_plan)
-    _prepare(
-        fixture,
-        apply=True,
-        transition_mode=migration.RESOURCE_QUOTA_ONLY,
+    resource_plan = _historical_resource_quota_successor(
+        fixture["predecessor"], patched_plan
     )
-    controller.control_once(
-        fixture["successor_plan_path"],
-        state_path=fixture["successor_state_path"],
-        apply=True,
-        scheduler=fixture["scheduler"],
-        ready_probe=fixture["ready"],
-    )
-    fixture["scheduler"].pass_successor_canaries()
-    controller.control_once(
-        fixture["successor_plan_path"],
-        state_path=fixture["successor_state_path"],
-        apply=True,
-        scheduler=fixture["scheduler"],
-        ready_probe=fixture["ready"],
-    )
-    stopped = controller.control_once(
-        fixture["successor_plan_path"],
-        state_path=fixture["successor_state_path"],
-        apply=True,
-        scheduler=fixture["scheduler"],
-        ready_probe=fixture["ready"],
-        request_stop=True,
-    )
-    assert stopped["stop_requested"] is True
-    assert stopped["cancellation_performed"] is False
+    resource_state = _stopped_historical_resource_quota_state(resource_plan)
+    resource_plan_path = tmp_path / "historical-resource-plan.json"
+    resource_state_path = tmp_path / "historical-resource-state.json"
+    resource_plan_path.write_text(json.dumps(resource_plan))
+    resource_state_path.write_text(json.dumps(resource_state))
+    scheduler = _Scheduler(resource_plan, resource_state)
+    ready = _Ready(resource_plan, patched_plan)
 
     patched_path = tmp_path / "patched-plan.json"
     patched_state_path = tmp_path / "patched-state.json"
     patched_path.write_text(json.dumps(patched_plan))
     value = migration.prepare_successor_state(
-        predecessor_plan_path=fixture["successor_plan_path"],
-        predecessor_state_path=fixture["successor_state_path"],
+        predecessor_plan_path=resource_plan_path,
+        predecessor_state_path=resource_state_path,
         successor_plan_path=patched_path,
         successor_state_path=patched_state_path,
-        scheduler=fixture["scheduler"],
-        predecessor_ready_probe=fixture["ready"],
-        successor_ready_probe=fixture["ready"],
+        scheduler=scheduler,
+        predecessor_ready_probe=ready,
+        successor_ready_probe=ready,
         apply=False,
         transition_mode=migration.PATCHED_BUNDLE,
     )
     assert value["transition_mode"] == migration.PATCHED_BUNDLE
     assert value["scheduler_post_count"] == 0
-    assert value["predecessor_entry_count"] == 504
+    assert value["predecessor_entry_count"] == 500
+    assert value["imported_active_count"] == 500
+    assert value["imported_active_count_by_stage"] == (
+        controller.HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS
+    )
+    assert value["next_seed_by_stage"] == resource_state["next_seed_by_stage"]
+    assert value["scheduler_post_count"] == 0
+    assert scheduler.post_count == 0
+    assert scheduler.mutations == []
+    assert value["cancellation_performed"] is False
+    assert value["preemption_performed"] is False
     assert (
         value["successor_state"]["rolling_migration"]["predecessor_controller_kind"]
         == "resource_quota_successor"
@@ -535,8 +672,7 @@ def test_stopped_resource_successor_can_dual_bind_patched_bundles(tmp_path):
     )
     cohorts = value["successor_state"]["rolling_migration"]["harvest_cohorts"]
     assert cohorts["predecessor"]["resource_policy_ids"] == [
-        controller.LEGACY_RESOURCE_POLICY_ID,
-        controller.SUCCESSOR_RESOURCE_POLICY_ID,
+        controller.SUCCESSOR_RESOURCE_POLICY_ID
     ]
     assert cohorts["successor"]["resource_policy_ids"] == [
         controller.SUCCESSOR_RESOURCE_POLICY_ID
@@ -546,6 +682,99 @@ def test_stopped_resource_successor_can_dual_bind_patched_bundles(tmp_path):
             cohorts["predecessor"]["stage_bindings"][stage.stage_id]["bundle_id"]
             != cohorts["successor"]["stage_bindings"][stage.stage_id]["bundle_id"]
         )
+
+
+def test_historical_transition_rejects_wrong_predecessor_quota(tmp_path):
+    fixture = _historical_transition_fixture(tmp_path)
+    plan = copy.deepcopy(fixture["predecessor"])
+    quotas = plan["open_ended_refill"]["stage_active_quotas"]
+    quotas["entry-1200-t125"] += 1
+    quotas["final-1000-t100"] -= 1
+    unsigned = {
+        key: value for key, value in plan.items() if key != "launch_plan_sha256"
+    }
+    plan["launch_plan_sha256"] = launch.canonical_sha256(unsigned)
+    fixture["predecessor_plan_path"].write_text(json.dumps(plan))
+
+    with pytest.raises(RuntimeError, match="launch-plan seal mismatch"):
+        _prepare_historical(fixture)
+
+
+def test_historical_transition_rejects_wrong_successor_quota(tmp_path):
+    fixture = _historical_transition_fixture(tmp_path)
+    plan = copy.deepcopy(fixture["successor"])
+    quotas = plan["open_ended_refill"]["stage_active_quotas"]
+    quotas["entry-1200-t125"] -= 1
+    quotas["final-1000-t100"] += 1
+    unsigned = {
+        key: value for key, value in plan.items() if key != "launch_plan_sha256"
+    }
+    plan["launch_plan_sha256"] = launch.canonical_sha256(unsigned)
+    fixture["successor_plan_path"].write_text(json.dumps(plan))
+
+    with pytest.raises(RuntimeError, match="launch-plan top-level seal mismatch"):
+        _prepare_historical(fixture)
+
+
+def test_historical_transition_rejects_state_plan_seal_mismatch(tmp_path):
+    fixture = _historical_transition_fixture(tmp_path)
+    state = copy.deepcopy(fixture["state"])
+    state["launch_plan_sha256"] = "b" * 64
+    state = controller._seal_state(state)
+    fixture["predecessor_state_path"].write_text(json.dumps(state))
+
+    with pytest.raises(RuntimeError, match="state identity/SHA mismatch"):
+        _prepare_historical(fixture)
+
+
+def test_historical_transition_rejects_active_total_above_500(tmp_path):
+    fixture = _historical_transition_fixture(tmp_path)
+    state = copy.deepcopy(fixture["state"])
+    stage = profiles.BY_ID["entry-1200-t125"]
+    seed = int(state["next_seed_by_stage"][stage.stage_id])
+    template = next(
+        task
+        for task in fixture["predecessor"]["task_waves"]["canaries"]
+        if task["payload_json"]["final_goal_stage_id"] == stage.stage_id
+    )
+    task = migration._render_from_template_for_policy(
+        template,
+        stage_id=stage.stage_id,
+        seed=seed,
+        wave="refill",
+        policy=migration.SUCCESSOR_POLICY,
+    )
+    task_id = max(int(entry["task_id"]) for entry in state["entries"]) + 1
+    entry = controller._entry(task, origin="successor")
+    entry.update({"task_id": task_id, "state": "running"})
+    state["entries"].append(entry)
+    state["next_seed_by_stage"][stage.stage_id] = seed + 1
+    state["rolling_migration"]["next_seed_by_stage"] = copy.deepcopy(
+        state["next_seed_by_stage"]
+    )
+    state = controller._seal_state(state)
+    fixture["predecessor_state_path"].write_text(json.dumps(state))
+    row = copy.deepcopy(task)
+    row.update({"id": task_id, "task_id": task_id, "status": "running"})
+    fixture["scheduler"].by_id[task_id] = row
+    fixture["scheduler"].by_dedupe[row["dedupe_key"]] = row
+
+    with pytest.raises(RuntimeError, match="exceeds total active quota"):
+        _prepare_historical(fixture)
+
+
+def test_historical_transition_rejects_cancellation_endpoint(tmp_path):
+    fixture = _historical_transition_fixture(tmp_path)
+    state = copy.deepcopy(fixture["state"])
+    state["scheduler_mutation_endpoints"] = [
+        "POST /api/tasks",
+        "POST /api/tasks/{id}/cancel",
+    ]
+    state = controller._seal_state(state)
+    fixture["predecessor_state_path"].write_text(json.dumps(state))
+
+    with pytest.raises(RuntimeError, match="state identity/SHA mismatch"):
+        _prepare_historical(fixture)
 
 
 def test_controller_rejects_entry_that_crosses_harvest_cohort_boundary(tmp_path):

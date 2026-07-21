@@ -594,33 +594,15 @@ def test_migration_inputs_require_both_authenticated_plan_binding_pairs(
 
 
 def test_patched_bundle_mixed_ledger_replays_old_and_new_bindings(tmp_path):
-    fixture, resource_plan, _state, _cohorts_value, _tasks = (
-        _resource_only_mixed_campaign(tmp_path)
-    )
-    fixture["scheduler"].pass_successor_canaries()
-    controller.control_once(
-        fixture["successor_plan_path"],
-        state_path=fixture["successor_state_path"],
-        apply=True,
-        scheduler=fixture["scheduler"],
-        ready_probe=fixture["ready"],
-    )
-    controller.control_once(
-        fixture["successor_plan_path"],
-        state_path=fixture["successor_state_path"],
-        apply=True,
-        scheduler=fixture["scheduler"],
-        ready_probe=fixture["ready"],
-        request_stop=True,
-    )
-    patched_plan = rolling_fixtures._successor_plan()
-    patched_plan_path = tmp_path / "patched-plan.json"
-    patched_state_path = tmp_path / "patched-state.json"
-    patched_plan_path.write_text(json.dumps(patched_plan))
-    ready = rolling_fixtures._Ready(fixture["predecessor"], resource_plan, patched_plan)
+    fixture = rolling_fixtures._historical_transition_fixture(tmp_path / "rolling")
+    resource_plan = fixture["predecessor"]
+    patched_plan = fixture["successor"]
+    patched_plan_path = fixture["successor_plan_path"]
+    patched_state_path = fixture["successor_state_path"]
+    ready = fixture["ready"]
     rolling_fixtures.migration.prepare_successor_state(
-        predecessor_plan_path=fixture["successor_plan_path"],
-        predecessor_state_path=fixture["successor_state_path"],
+        predecessor_plan_path=fixture["predecessor_plan_path"],
+        predecessor_state_path=fixture["predecessor_state_path"],
         successor_plan_path=patched_plan_path,
         successor_state_path=patched_state_path,
         scheduler=fixture["scheduler"],
@@ -647,6 +629,7 @@ def test_patched_bundle_mixed_ledger_replays_old_and_new_bindings(tmp_path):
     predecessor_policies = patched_state["rolling_migration"]["harvest_cohorts"][
         "predecessor"
     ]["resource_policy_ids"]
+    assert predecessor_policies == [controller.SUCCESSOR_RESOURCE_POLICY_ID]
     cohorts = {
         "predecessor": _rolling_cohort(
             "predecessor", resource_plan, predecessor_policies

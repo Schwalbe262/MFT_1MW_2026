@@ -27,6 +27,7 @@ try:
     from tier1_final1000_slurm_controller import (
         ACTIVE_STATES,
         DEDUPE_PREFIX,
+        HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
         LEGACY_RESOURCE_POLICY_ID,
         REFILL_POLICY,
         STATE_SCHEMA,
@@ -35,7 +36,7 @@ try:
         SchedulerApiClient,
         SUCCESSOR_RESOURCE_POLICY_ID,
         _scheduler_state,
-        _validate_state as _validate_controller_state,
+        _validate_historical_resource_quota_successor_state,
         _write_state,
     )
     from tier1_final1000_slurm_launch import (
@@ -68,6 +69,7 @@ except ImportError:  # pragma: no cover - repository import path
     from tools.tier1_final1000_slurm_controller import (
         ACTIVE_STATES,
         DEDUPE_PREFIX,
+        HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
         LEGACY_RESOURCE_POLICY_ID,
         REFILL_POLICY,
         STATE_SCHEMA,
@@ -76,7 +78,7 @@ except ImportError:  # pragma: no cover - repository import path
         SchedulerApiClient,
         SUCCESSOR_RESOURCE_POLICY_ID,
         _scheduler_state,
-        _validate_state as _validate_controller_state,
+        _validate_historical_resource_quota_successor_state,
         _write_state,
     )
     from tools.tier1_final1000_slurm_launch import (
@@ -316,8 +318,26 @@ def _validate_task_for_policy(
 
 
 def _validate_plan_for_policy(
-    value: Mapping[str, Any], *, policy: Mapping[str, Any]
+    value: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any],
+    expected_active_quotas: Mapping[str, int],
 ) -> dict[str, Any]:
+    expected_quotas = dict(expected_active_quotas)
+    legacy_quotas = {stage.stage_id: stage.active_quota for stage in STAGES}
+    policy_identity = dict(policy)
+    if not (
+        (policy_identity == PREDECESSOR_POLICY and expected_quotas == legacy_quotas)
+        or (
+            policy_identity == SUCCESSOR_POLICY
+            and expected_quotas
+            in (
+                HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
+                SUCCESSOR_ACTIVE_QUOTAS,
+            )
+        )
+    ):
+        raise RuntimeError("unsealed final1000 migration quota policy")
     unsigned = {key: item for key, item in value.items() if key != "launch_plan_sha256"}
     waves = value.get("task_waves") or {}
     canaries = waves.get("canaries") if isinstance(waves, dict) else None
@@ -334,11 +354,6 @@ def _validate_plan_for_policy(
             "gpus",
         )
     }
-    expected_quotas = (
-        {stage.stage_id: stage.active_quota for stage in STAGES}
-        if dict(policy) == PREDECESSOR_POLICY
-        else SUCCESSOR_ACTIVE_QUOTAS
-    )
     if (
         value.get("schema_version") != LAUNCH_SCHEMA
         or value.get("launch_plan_sha256") != canonical_sha256(unsigned)
@@ -410,12 +425,34 @@ def _validate_plan_for_policy(
 
 
 def validate_predecessor_plan(value: Mapping[str, Any]) -> dict[str, Any]:
-    return _validate_plan_for_policy(value, policy=PREDECESSOR_POLICY)
+    return _validate_plan_for_policy(
+        value,
+        policy=PREDECESSOR_POLICY,
+        expected_active_quotas={
+            stage.stage_id: stage.active_quota for stage in STAGES
+        },
+    )
+
+
+def validate_historical_resource_quota_successor_plan(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate the exact 160/140/120/80 phase-1 predecessor plan."""
+
+    return _validate_plan_for_policy(
+        value,
+        policy=SUCCESSOR_POLICY,
+        expected_active_quotas=HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
+    )
 
 
 def validate_successor_plan(value: Mapping[str, Any]) -> dict[str, Any]:
     validated = validate_launch_plan(value)
-    return _validate_plan_for_policy(validated, policy=SUCCESSOR_POLICY)
+    return _validate_plan_for_policy(
+        validated,
+        policy=SUCCESSOR_POLICY,
+        expected_active_quotas=SUCCESSOR_ACTIVE_QUOTAS,
+    )
 
 
 def _render_from_template_for_policy(
@@ -566,7 +603,7 @@ def _validate_resource_successor_state(
 ) -> dict[str, Any]:
     """Validate phase-1 state before dual-binding patched bundles."""
 
-    value = _validate_controller_state(state, plan)
+    value = _validate_historical_resource_quota_successor_state(state, plan)
     migration = value.get("rolling_migration") or {}
     if (
         value.get("stop_requested") is not True
@@ -718,7 +755,9 @@ def prepare_successor_state(
             "gpus",
         )
     }:
-        predecessor_plan = validate_successor_plan(predecessor_plan_raw)
+        predecessor_plan = validate_historical_resource_quota_successor_plan(
+            predecessor_plan_raw
+        )
         predecessor_controller_kind = "resource_quota_successor"
     else:
         raise RuntimeError("predecessor launch resource policy is unsupported")

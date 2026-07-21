@@ -64,6 +64,7 @@ try:
         _render_from_template_for_policy,
         _validate_task_for_policy,
         harvest_cohort_identity,
+        validate_historical_resource_quota_successor_plan,
         validate_predecessor_plan,
         validate_successor_plan,
     )
@@ -114,6 +115,7 @@ except ImportError:  # pragma: no cover - repository import path
         _render_from_template_for_policy,
         _validate_task_for_policy,
         harvest_cohort_identity,
+        validate_historical_resource_quota_successor_plan,
         validate_predecessor_plan,
         validate_successor_plan,
     )
@@ -355,7 +357,9 @@ def _validate_inputs(
     if predecessor_kind == "legacy_8c":
         predecessor_plan = validate_predecessor_plan(predecessor_raw)
     elif predecessor_kind == "resource_quota_successor":
-        predecessor_plan = validate_successor_plan(predecessor_raw)
+        predecessor_plan = validate_historical_resource_quota_successor_plan(
+            predecessor_raw
+        )
     else:  # The controller validation should already reject this.
         raise RuntimeError("rolling migration predecessor kind is unsupported")
     predecessor_policy_ids = sorted(
