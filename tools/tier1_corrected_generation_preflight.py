@@ -3501,13 +3501,25 @@ class Current7Tier1Runner:
             values, stage=stage
         )
         if niche_partition is not None:
-            niche_warm, niche_filter = (
+            unique_niche_warm, niche_filter = (
                 self.problem.filter_structural_donor_coordinates(repaired)
             )
-            if len(niche_warm) != 160:
+            if (
+                len(repaired) != 160
+                or niche_filter.get("structurally_accepted_count") != 160
+                or niche_filter.get("structurally_rejected_count") != 0
+                or len(unique_niche_warm)
+                != niche_filter.get("decoded_unique_count")
+            ):
                 raise RuntimeError(
-                    "topology niche warm repair/filter did not retain all 160 rows"
+                    "topology niche warm repair/filter did not structurally accept all 160 rows"
                 )
+            # The ordinary basin path deduplicates decoded geometry.  The
+            # topology-niche artifact instead seals an exact semantic 160-row
+            # partition, so retain every structurally accepted repaired row
+            # (including repeated decoded geometries) to preserve its quotas.
+            # Fresh Sobol rows still provide 160 independent coordinates.
+            niche_warm = repaired
             topology_contract = deep_topology_contract(
                 6, enable_final1000_topology_niche=True
             )
@@ -3536,6 +3548,11 @@ class Current7Tier1Runner:
                 "repair": repair_evidence,
                 "structural_geometry_filter": niche_filter,
                 "retained_count": int(len(niche_warm)),
+                "decoded_unique_count": int(len(unique_niche_warm)),
+                "duplicate_geometry_count": int(
+                    len(niche_warm) - len(unique_niche_warm)
+                ),
+                "exact_semantic_partition_rows_preserved_before_dedupe": True,
                 "topology_counts": {
                     str(key): item for key, item in counts.items()
                 },

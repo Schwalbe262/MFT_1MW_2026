@@ -9,6 +9,7 @@ import pytest
 
 from tools import tier1_final1000_topology_niche_contract as niche
 from tools.tier1_corrected_generation_preflight import (
+    Current7Tier1Runner,
     build_topology_niche_initial_population,
     create_deep_topology_components,
     install_optimizer_scaling,
@@ -145,6 +146,62 @@ def test_initial_population_is_deterministic_exact_160_warm_160_sobol():
         for key, value in niche.TOPOLOGY_QUOTA_BY_N2_MAIN.items()
     }
     assert problem.model_evaluation_calls == 0
+
+
+def test_topology_warm_preflight_preserves_exact_partition_before_dedupe():
+    warm, partition = _warm_fixture()
+
+    class StructuralProblem:
+        n_var = 25
+        fixed_primary_turns = 6
+        fixed_primary_turn_coordinate_index = 0
+        fixed_primary_turn_unit_coordinate = 0.5
+
+        def repair_unit_coordinates(self, values):
+            repaired = np.asarray(values, dtype=float).copy()
+            repaired[:, self.fixed_primary_turn_coordinate_index] = (
+                self.fixed_primary_turn_unit_coordinate
+            )
+            return repaired
+
+        def filter_structural_donor_coordinates(self, values):
+            # Production structural filtering reports every semantic row as
+            # accepted, but its ordinary return value is decoded-geometry
+            # deduplicated.  Niche quotas must retain the authenticated rows.
+            unique = np.asarray(values, dtype=float)[:52]
+            return unique, {
+                "structurally_accepted_count": 160,
+                "structurally_rejected_count": 0,
+                "decoded_unique_count": 52,
+            }
+
+    runner = Current7Tier1Runner(
+        authenticated=None,
+        code_identity={},
+        modules=None,
+        adapter_evidence={},
+        model_cache=None,
+        models={},
+        inference_binding={},
+        density_gate=None,
+        problem=StructuralProblem(),
+    )
+    retained, structural, audit = runner.prepare_authenticated_warm_start(
+        warm,
+        role_partition=None,
+        topology_niche_partition=partition,
+        stage="topology_niche_smoke",
+    )
+
+    assert retained.shape == (160, 25)
+    assert structural.shape == (0, 25)
+    assert audit["retained_count"] == 160
+    assert audit["decoded_unique_count"] == 52
+    assert audit["duplicate_geometry_count"] == 108
+    assert audit["exact_semantic_partition_rows_preserved_before_dedupe"] is True
+    assert audit["topology_counts"] == {
+        str(key): value for key, value in niche.WARM_TOPOLOGY_COUNTS.items()
+    }
 
 
 def test_survival_preserves_exact_counts_every_generation_and_never_mutates_G():
