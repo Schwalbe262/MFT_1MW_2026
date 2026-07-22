@@ -37,6 +37,7 @@ try:
         scheduler_publication_transport,
     )
     from tier1_final1000_slurm_launch import (
+        PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
         SUCCESSOR_ACTIVE_QUOTAS,
         build_stage_task,
         validate_launch_plan,
@@ -58,6 +59,7 @@ except ImportError:  # pragma: no cover - repository import path
         scheduler_publication_transport,
     )
     from tools.tier1_final1000_slurm_launch import (
+        PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
         SUCCESSOR_ACTIVE_QUOTAS,
         build_stage_task,
         validate_launch_plan,
@@ -431,6 +433,7 @@ def _validate_state_for_sealed_active_quotas(
     expected_quotas = dict(expected_active_quotas)
     if expected_quotas not in (
         SUCCESSOR_ACTIVE_QUOTAS,
+        PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
         HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
     ):
         raise RuntimeError("unsealed final1000 active quota policy")
@@ -789,12 +792,24 @@ def _validate_state_for_sealed_active_quotas(
 def _validate_state(
     state: Mapping[str, Any], plan: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Validate a state owned by this release's 200/160/90/50 controller."""
+    """Validate a state owned by the 300/150/40/10 topology successor."""
 
     return _validate_state_for_sealed_active_quotas(
         state,
         plan,
         expected_active_quotas=SUCCESSOR_ACTIVE_QUOTAS,
+    )
+
+
+def _validate_previous_successor_state(
+    state: Mapping[str, Any], plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Authenticate the running 200/160/90/50 predecessor release."""
+
+    return _validate_state_for_sealed_active_quotas(
+        state,
+        plan,
+        expected_active_quotas=PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
     )
 
 

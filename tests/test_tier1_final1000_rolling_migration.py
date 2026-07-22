@@ -962,7 +962,27 @@ def test_prepare_dry_run_imports_every_entry_and_seed_without_writes(tmp_path):
     assert value["imported_active_count"] == 496
     assert not fixture["successor_state_path"].exists()
     assert all(entry["origin"] == "predecessor" for entry in imported["entries"])
-    assert imported["next_seed_by_stage"] == fixture["state"]["next_seed_by_stage"]
+    planned_seeds = {
+        stage.stage_id: {
+            int(task["payload_json"]["seed"])
+            for wave in ("canaries", "ramp")
+            for task in fixture["successor"]["task_waves"][wave]
+            if task["payload_json"]["final_goal_stage_id"] == stage.stage_id
+        }
+        for stage in profiles.STAGES
+    }
+    assert imported["next_seed_by_stage"] == {
+        stage.stage_id: max(
+            int(fixture["state"]["next_seed_by_stage"][stage.stage_id]),
+            max(planned_seeds[stage.stage_id]) + 1,
+        )
+        for stage in profiles.STAGES
+    }
+    assert all(
+        imported["next_seed_by_stage"][stage.stage_id]
+        not in planned_seeds[stage.stage_id]
+        for stage in profiles.STAGES
+    )
     assert (
         len({(entry["stage_id"], entry["seed"]) for entry in imported["entries"]})
         == 500
@@ -1285,7 +1305,27 @@ def test_stopped_resource_successor_can_dual_bind_patched_bundles(tmp_path):
     assert value["imported_active_count_by_stage"] == (
         controller.HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS
     )
-    assert value["next_seed_by_stage"] == resource_state["next_seed_by_stage"]
+    planned_seeds = {
+        stage.stage_id: {
+            int(task["payload_json"]["seed"])
+            for wave in ("canaries", "ramp")
+            for task in patched_plan["task_waves"][wave]
+            if task["payload_json"]["final_goal_stage_id"] == stage.stage_id
+        }
+        for stage in profiles.STAGES
+    }
+    assert value["next_seed_by_stage"] == {
+        stage.stage_id: max(
+            int(resource_state["next_seed_by_stage"][stage.stage_id]),
+            max(planned_seeds[stage.stage_id]) + 1,
+        )
+        for stage in profiles.STAGES
+    }
+    assert all(
+        value["next_seed_by_stage"][stage.stage_id]
+        not in planned_seeds[stage.stage_id]
+        for stage in profiles.STAGES
+    )
     assert value["scheduler_post_count"] == 0
     assert scheduler.post_count == 0
     assert scheduler.mutations == []
@@ -1588,10 +1628,10 @@ def test_rolling_controller_fills_only_natural_gaps_and_keeps_exact_500(tmp_path
     assert released["active_count"] == 500
     assert set(released["canary_passed_stage_ids"]) == set(profiles.BY_ID)
 
-    # Drain only the predecessor excess (close +38, final +162).  The
-    # successor must transfer those 200 naturally vacated slots into entry
-    # +136 and bridge +64 without cancelling anything.
-    remaining = {"close-1075-t107p5": 38, "final-1000-t100": 162}
+    # Drain only the predecessor excess (close +88, final +202).  The
+    # successor must transfer those 290 naturally vacated slots into entry
+    # +236 and bridge +54 without cancelling anything.
+    remaining = {"close-1075-t107p5": 88, "final-1000-t100": 202}
     for task in fixture["scheduler"].by_id.values():
         stage_id = task["payload_json"]["final_goal_stage_id"]
         if (
@@ -1612,11 +1652,11 @@ def test_rolling_controller_fills_only_natural_gaps_and_keeps_exact_500(tmp_path
     )
     assert refilled["active_count"] == 500
     assert refilled["active_count_by_stage"] == launch.SUCCESSOR_ACTIVE_QUOTAS
-    assert refilled["scheduler_post_count"] == 204
-    assert fixture["scheduler"].mutations == ["POST /api/tasks"] * 204
+    assert refilled["scheduler_post_count"] == 294
+    assert fixture["scheduler"].mutations == ["POST /api/tasks"] * 294
     transfer_order = fixture["scheduler"].submitted_stage_ids[4:]
-    assert transfer_order.count("entry-1200-t125") == 136
-    assert transfer_order.count("bridge-1150-t115") == 64
+    assert transfer_order.count("entry-1200-t125") == 236
+    assert transfer_order.count("bridge-1150-t115") == 54
     assert "close-1075-t107p5" not in transfer_order
     assert "final-1000-t100" not in transfer_order
     # Weighted scheduling must interleave while both deficits remain; it may

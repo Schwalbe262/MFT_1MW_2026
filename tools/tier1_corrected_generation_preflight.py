@@ -17,6 +17,7 @@ import argparse
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import importlib
 import inspect
@@ -82,7 +83,9 @@ PRODUCTION_FIXED_GENERATIONS = 300
 PRODUCTION_POPULATION = 320
 PRODUCTION_INFERENCE_THREADS = 8
 DETERMINISTIC_TERMINAL_INFERENCE_THREADS = 1
-SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {"extratrees"}
+SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {
+    "extratrees", "randomforest",
+}
 FAMILY_SPECIFIC_INFERENCE_POLICY = (
     "family_specific_semaphore_free_sklearn_forest_v1"
 )
@@ -771,7 +774,11 @@ def optimizer_repair_contract(
     }
 
 
-def deep_topology_contract(fixed_primary_turns: int) -> dict[str, Any]:
+def deep_topology_contract(
+    fixed_primary_turns: int,
+    *,
+    enable_final1000_topology_niche: bool = False,
+) -> dict[str, Any]:
     """Load and self-authenticate the tracked deep-crossover contract."""
 
     try:
@@ -779,7 +786,10 @@ def deep_topology_contract(fixed_primary_turns: int) -> dict[str, Any]:
     except ImportError:  # pragma: no cover - repository module import path
         from tools.tier1_deep_crossover_contract import topology_evolution_contract
 
-    value = topology_evolution_contract(int(fixed_primary_turns))
+    value = topology_evolution_contract(
+        int(fixed_primary_turns),
+        enable_final1000_topology_niche=enable_final1000_topology_niche,
+    )
     sealed = dict(value)
     expected = sealed.pop("sha256", None)
     if (
@@ -823,6 +833,154 @@ def _turn_split_unit_coordinate(
     if not 0.0 <= value <= 1.0:
         raise RuntimeError("turn-split migration coordinate escaped unit interval")
     return float(value)
+
+
+def _topology_quota_for_population(
+    contract: Mapping[str, Any], population: int
+) -> dict[int, int]:
+    """Return deterministic topology quotas, exact at production size.
+
+    Small optimizer tests retain the historical minimum for every topology and
+    apportion only their remaining slots.  The production population consumes
+    the complete sealed Final1000 quota map without an unprotected remainder.
+    """
+
+    topologies = tuple(
+        int(value) for value in contract["turn_split_sub_islands_N2_main"]
+    )
+    population = int(population)
+    minimum_each = int(
+        contract["survival"]["minimum_survivors_per_turn_split_sub_island"]
+    )
+    raw = contract.get("exact_survivor_quota_by_N2_main")
+    if not raw:
+        if population < minimum_each * len(topologies):
+            raise RuntimeError("population cannot preserve every topology minimum")
+        result = {topology: minimum_each for topology in topologies}
+        result[topologies[0]] += population - sum(result.values())
+        return result
+    sealed = {int(key): int(value) for key, value in raw.items()}
+    if (
+        set(sealed) != set(topologies)
+        or any(value < minimum_each for value in sealed.values())
+        or sum(sealed.values()) <= 0
+    ):
+        raise RuntimeError("sealed topology quota map is invalid")
+    contract_population = int(
+        (contract.get("bounded_diversity_budget") or {}).get("population", 0)
+    )
+    if population == contract_population:
+        if sum(sealed.values()) != population:
+            raise RuntimeError("production topology quotas do not fill population")
+        return sealed
+    minimum_total = minimum_each * len(topologies)
+    if population < minimum_total:
+        raise RuntimeError("test population cannot preserve topology minima")
+    remaining = population - minimum_total
+    weights = {
+        topology: max(0, sealed[topology] - minimum_each)
+        for topology in topologies
+    }
+    weight_total = sum(weights.values())
+    result = {topology: minimum_each for topology in topologies}
+    if remaining and weight_total:
+        fractional = {
+            topology: remaining * weights[topology] / weight_total
+            for topology in topologies
+        }
+        for topology in topologies:
+            result[topology] += int(math.floor(fractional[topology]))
+        left = population - sum(result.values())
+        order = sorted(
+            topologies,
+            key=lambda topology: (
+                -(fractional[topology] - math.floor(fractional[topology])),
+                -sealed[topology],
+                topology,
+            ),
+        )
+        for topology in order[:left]:
+            result[topology] += 1
+    elif remaining:
+        result[topologies[0]] += remaining
+    if sum(result.values()) != population:
+        raise RuntimeError("apportioned topology quota does not fill population")
+    return result
+
+
+def validate_topology_niche_warm_partition(
+    partition: Mapping[str, Any], coordinates: Any
+) -> dict[str, Any]:
+    """Authenticate the exact 160-row Final1000 warm semantic partition."""
+
+    import numpy as np
+
+    try:
+        from tier1_final1000_topology_niche_contract import (
+            WARM_PARTITION_SCHEMA,
+            WARM_SOURCE_GROUPS,
+            WARM_TOPOLOGY_COUNTS,
+        )
+    except ImportError:  # pragma: no cover - repository module import path
+        from tools.tier1_final1000_topology_niche_contract import (
+            WARM_PARTITION_SCHEMA,
+            WARM_SOURCE_GROUPS,
+            WARM_TOPOLOGY_COUNTS,
+        )
+
+    values = np.asarray(coordinates, dtype=float)
+    value = dict(partition or {})
+    unsigned = dict(value)
+    recorded_sha = unsigned.pop("sha256", None)
+    groups = value.get("groups") or {}
+    if (
+        values.ndim != 2
+        or len(values) != 160
+        or value.get("schema_version") != WARM_PARTITION_SCHEMA
+        or recorded_sha != canonical_sha256(unsigned)
+        or value.get("fixed_primary_turns") != 6
+        or value.get("total_count") != len(values)
+        or set(groups) != set(WARM_SOURCE_GROUPS)
+        or value.get("N2_main_60_warm_count") != 0
+        or value.get("same_current7_physics_repair_required") is not True
+        or value.get("physical_constraint_G_mutation") is not False
+        or value.get("physical_objective_mutation") is not False
+    ):
+        raise RuntimeError("topology niche warm partition header mismatch")
+    cursor = 0
+    aggregate = {topology: 0 for topology in WARM_TOPOLOGY_COUNTS}
+    for name, expected in WARM_SOURCE_GROUPS.items():
+        group = groups.get(name) or {}
+        count = int(expected["count"])
+        if group.get("start") != cursor or group.get("count") != count:
+            raise RuntimeError("topology niche warm group range mismatch")
+        rows = values[cursor : cursor + count]
+        observed = _turn_split_main_values(
+            rows, fixed_primary_turns=6, coordinate_index=2
+        )
+        counts = {
+            topology: int(np.count_nonzero(observed == topology))
+            for topology in WARM_TOPOLOGY_COUNTS
+        }
+        expected_counts = {
+            int(key): int(item)
+            for key, item in expected["topology_counts"].items()
+        }
+        if (
+            {key: item for key, item in counts.items() if item}
+            != expected_counts
+            or group.get("topology_counts")
+            != {str(key): item for key, item in expected_counts.items()}
+            or group.get("coordinate_sha256")
+            != canonical_sha256(rows.tolist())
+        ):
+            raise RuntimeError("topology niche warm group coordinate mismatch")
+        for topology, item in counts.items():
+            aggregate[topology] += item
+        cursor += count
+    if aggregate != WARM_TOPOLOGY_COUNTS or cursor != len(values):
+        raise RuntimeError("topology niche warm aggregate mismatch")
+    return value
 
 
 def _basin_lane_topologies(
@@ -1053,6 +1211,132 @@ def seed_turn_split_sub_islands(
     return values, audit
 
 
+def build_topology_niche_initial_population(
+    problem: Any,
+    authenticated_warm: Any,
+    contract: Mapping[str, Any],
+    *,
+    seed: int,
+) -> tuple[Any, dict[str, Any]]:
+    """Build the sealed 160 warm + 160 topology-stratified Sobol population."""
+
+    import numpy as np
+    from scipy.stats import qmc
+
+    try:
+        from tier1_final1000_topology_niche_contract import (
+            FRESH_SOBOL_TOPOLOGY_COUNTS,
+            WARM_TOPOLOGY_COUNTS,
+            validate_contract as validate_niche_contract,
+        )
+    except ImportError:  # pragma: no cover - repository module import path
+        from tools.tier1_final1000_topology_niche_contract import (
+            FRESH_SOBOL_TOPOLOGY_COUNTS,
+            WARM_TOPOLOGY_COUNTS,
+            validate_contract as validate_niche_contract,
+        )
+
+    niche = validate_niche_contract(
+        contract.get("final1000_topology_niche_contract") or {}
+    )
+    warm = np.asarray(authenticated_warm, dtype=float).copy()
+    if warm.shape != (160, int(problem.n_var)) or not np.isfinite(warm).all():
+        raise RuntimeError("topology niche warm population must be exactly 160xN")
+    warm_labels = np.asarray([
+        topology
+        for topology, count in WARM_TOPOLOGY_COUNTS.items()
+        for _ in range(count)
+    ], dtype=int)
+    # The artifact is grouped semantically rather than by topology.  Preserve
+    # its rows and read their authenticated topology instead of reordering it.
+    warm_observed = _turn_split_main_values(
+        warm,
+        fixed_primary_turns=6,
+        coordinate_index=int(contract["coordinate_index"]),
+    )
+    warm_counts = {
+        topology: int(np.count_nonzero(warm_observed == topology))
+        for topology in WARM_TOPOLOGY_COUNTS
+    }
+    if warm_counts != WARM_TOPOLOGY_COUNTS or np.any(warm_observed == 60):
+        raise RuntimeError("authenticated topology niche warm mix drifted")
+    del warm_labels
+
+    sobol = qmc.Sobol(d=int(problem.n_var), scramble=True, seed=int(seed))
+    # 256 is the smallest power-of-two draw containing the required 160 rows;
+    # using random_base2 avoids Sobol balance warnings and is reproducible.
+    fresh = np.asarray(sobol.random_base2(m=8)[:160], dtype=float)
+    fresh_labels = np.asarray([
+        topology
+        for topology, count in FRESH_SOBOL_TOPOLOGY_COUNTS.items()
+        for _ in range(count)
+    ], dtype=int)
+    if len(fresh_labels) != len(fresh):
+        raise RuntimeError("fresh Sobol topology quota does not contain 160 rows")
+    coordinate_index = int(contract["coordinate_index"])
+    for row, topology in enumerate(fresh_labels):
+        fresh[row, coordinate_index] = _turn_split_unit_coordinate(
+            int(topology), fixed_primary_turns=6
+        )
+    raw = np.vstack([warm, fresh])
+    repaired = np.asarray(problem.repair_unit_coordinates(raw), dtype=float)
+    if repaired.shape != raw.shape or not np.isfinite(repaired).all():
+        raise RuntimeError("topology niche initialization repair failed")
+    observed = _turn_split_main_values(
+        repaired,
+        fixed_primary_turns=6,
+        coordinate_index=coordinate_index,
+    )
+    expected = {
+        int(key): int(item)
+        for key, item in niche["topology_quota_by_N2_main"].items()
+    }
+    counts = {
+        topology: int(np.count_nonzero(observed == topology))
+        for topology in expected
+    }
+    if counts != expected:
+        raise RuntimeError("physics repair changed a sealed topology niche quota")
+    fresh_observed = observed[160:]
+    fresh_counts = {
+        topology: int(np.count_nonzero(fresh_observed == topology))
+        for topology in expected
+    }
+    if fresh_counts != FRESH_SOBOL_TOPOLOGY_COUNTS:
+        raise RuntimeError("fresh Sobol sentinel/topology mix drifted")
+    audit = {
+        "schema_version": "mft-tier1-final1000-topology-initialization-v1",
+        "seed": int(seed),
+        "population": len(repaired),
+        "authenticated_warm_count": 160,
+        "fresh_sobol_count": 160,
+        "warm_topology_counts": {
+            str(key): item for key, item in warm_counts.items()
+        },
+        "fresh_sobol_topology_counts": {
+            str(key): item for key, item in fresh_counts.items()
+        },
+        "complete_topology_counts": {
+            str(key): item for key, item in counts.items()
+        },
+        "fresh_N2_main_60_sentinel_count": fresh_counts[60],
+        "warm_N2_main_60_count": warm_counts[60],
+        "sobol": {
+            "implementation": "scipy.stats.qmc.Sobol",
+            "scramble": True,
+            "power_of_two_draw": 256,
+            "used_prefix_count": 160,
+            "raw_prefix_sha256": canonical_sha256(fresh.tolist()),
+        },
+        "same_current7_physics_repair_applied": True,
+        "additional_model_evaluations": 0,
+        "physical_constraint_G_mutation": False,
+        "physical_objective_mutation": False,
+    }
+    audit["sha256"] = canonical_sha256(audit)
+    return repaired, audit
+
+
 def create_deep_topology_components(
     problem: Any,
     contract: Mapping[str, Any],
@@ -1087,6 +1371,50 @@ def create_deep_topology_components(
     )
     migration_period = int(contract["migration"]["period_generations"])
     migrants_per_event = int(contract["migration"]["migrants_per_event"])
+    topology_local_mating = bool(contract.get("topology_local_mating_required"))
+    niche_mating = contract.get("topology_niche_mating_contract") or {}
+    niche_pair_counts = {
+        str(key): int(item)
+        for key, item in (
+            niche_mating.get("parent_pair_counts_per_160") or {}
+        ).items()
+    }
+    niche_pair_cycle: tuple[tuple[int, int], ...] = tuple()
+    if niche_pair_counts:
+        if sum(niche_pair_counts.values()) != 160:
+            raise RuntimeError("topology niche parent-pair schedule must sum to 160")
+        parsed_pairs = []
+        for label, count in niche_pair_counts.items():
+            parts = label.split("x")
+            if len(parts) != 2:
+                raise RuntimeError("topology niche parent-pair label is invalid")
+            pair = (int(parts[0]), int(parts[1]))
+            if not set(pair) <= set(topologies) or count < 0:
+                raise RuntimeError("topology niche parent-pair schedule is invalid")
+            parsed_pairs.extend([pair] * count)
+        niche_pair_cycle = tuple(parsed_pairs)
+        if (
+            niche_mating.get("priority_cross_pair") != "36x37"
+            or niche_pair_counts.get("36x37") != 64
+            or not math.isclose(
+                float(niche_mating.get("priority_cross_pair_fraction", -1.0)),
+                0.4,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+        ):
+            raise RuntimeError("N36/N37 priority mating schedule drifted")
+    production_population = int(
+        (contract.get("bounded_diversity_budget") or {}).get("population", 0)
+    )
+    production_quotas = _topology_quota_for_population(
+        contract, production_population
+    )
+    topology_parent_cycle = tuple(
+        topology
+        for topology in topologies
+        for _ in range(max(1, production_quotas[topology] // 2))
+    )
 
     def topology_values(population: Any) -> Any:
         return _turn_split_main_values(
@@ -1120,6 +1448,13 @@ def create_deep_topology_components(
             super().__init__()
             self.selection_calls = 0
             self.parent_pairs_emitted = 0
+            self.topology_local_pairs_emitted = 0
+            self.parent_pair_topology_counts = {
+                str(topology): 0 for topology in topologies
+            }
+            self.cross_36x37_pairs_emitted = 0
+            self.last_parent_pair_topologies: list[tuple[int, int]] = []
+            self.generation_parent_pair_counts: list[dict[str, Any]] = []
 
         @staticmethod
         def _pick(pop: Any, candidates: Any, random_state: Any) -> int:
@@ -1146,14 +1481,51 @@ def create_deep_topology_components(
             observed = topology_values(pop)
             selected = np.empty((int(n_select), 2), dtype=int)
             offset = self.parent_pairs_emitted
+            call_pairs: list[tuple[int, int]] = []
             for index in range(int(n_select)):
-                left, right = parent_pairs[(offset + index) % len(parent_pairs)]
+                if niche_pair_cycle:
+                    left, right = niche_pair_cycle[
+                        (offset + index) % len(niche_pair_cycle)
+                    ]
+                elif topology_local_mating:
+                    left = right = topology_parent_cycle[
+                        (offset + index) % len(topology_parent_cycle)
+                    ]
+                else:
+                    left, right = parent_pairs[(offset + index) % len(parent_pairs)]
                 selected[index, 0] = self._pick(
                     pop, np.flatnonzero(observed == left), random_state
                 )
                 selected[index, 1] = self._pick(
                     pop, np.flatnonzero(observed == right), random_state
                 )
+                call_pairs.append((left, right))
+                if left == right:
+                    self.topology_local_pairs_emitted += 1
+                    self.parent_pair_topology_counts[str(left)] += 1
+                elif {left, right} == {36, 37}:
+                    self.cross_36x37_pairs_emitted += 1
+            pair_counts = {
+                label: sum(
+                    pair == tuple(int(value) for value in label.split("x"))
+                    for pair in call_pairs
+                )
+                for label in niche_pair_counts
+            }
+            algorithm = kwargs.get("algorithm")
+            generation = int(getattr(algorithm, "n_gen", 0) or 0)
+            pair_record = {
+                "selection_call": self.selection_calls + 1,
+                "algorithm_generation": generation,
+                "pair_count": len(call_pairs),
+                "pair_counts": pair_counts,
+                "cross_36x37_pair_count": sum(
+                    set(pair) == {36, 37} for pair in call_pairs
+                ),
+            }
+            pair_record["sha256"] = canonical_sha256(pair_record)
+            self.generation_parent_pair_counts.append(pair_record)
+            self.last_parent_pair_topologies = call_pairs
             self.selection_calls += 1
             self.parent_pairs_emitted += int(n_select)
             return selected
@@ -1171,6 +1543,8 @@ def create_deep_topology_components(
             self.migration_events = 0
             self.migrants_created = 0
             self.last_migration_generation = None
+            self.cross_36x37_offspring_attributed = 0
+            self.generation_cross_offspring_counts: list[dict[str, Any]] = []
 
         def _do(
             self,
@@ -1183,6 +1557,12 @@ def create_deep_topology_components(
         ) -> Any:
             if active_problem is not problem:
                 raise RuntimeError("turn-split mating received a different problem")
+            algorithm = kwargs.get("algorithm")
+            generation = int(getattr(algorithm, "n_gen", 0) or 0)
+            # The optimizer-only allowance wrapper reads this value during the
+            # immediately following offspring evaluation.  Physical replay
+            # never consumes it.
+            problem._tier1_optimizer_generation = generation
             offspring = super()._do(
                 active_problem,
                 pop,
@@ -1191,50 +1571,105 @@ def create_deep_topology_components(
                 random_state=random_state,
                 **kwargs,
             )
-            algorithm = kwargs.get("algorithm")
-            generation = int(getattr(algorithm, "n_gen", 0) or 0)
             migrate = (
                 self.last_migration_generation is None
                 or generation - self.last_migration_generation >= migration_period
             )
-            if not migrate or len(offspring) == 0:
-                return offspring
-            observed = topology_values(pop)
-            migrants = []
-            for target_index, target in enumerate(topologies):
-                source = topologies[target_index - 1]
-                candidates = np.flatnonzero(observed == source)
-                if len(candidates) == 0:
-                    continue
-                elite_index = min(
-                    candidates, key=lambda index: individual_score(pop[index])
+            if migrate and len(offspring):
+                observed = topology_values(pop)
+                migrants = []
+                for target_index, target in enumerate(topologies):
+                    source = topologies[target_index - 1]
+                    candidates = np.flatnonzero(observed == source)
+                    if len(candidates) == 0:
+                        continue
+                    elite_index = min(
+                        candidates, key=lambda index: individual_score(pop[index])
+                    )
+                    coordinate = np.asarray(
+                        pop[int(elite_index)].X, dtype=float
+                    ).copy()
+                    coordinate[coordinate_index] = _turn_split_unit_coordinate(
+                        target, fixed_primary_turns=fixed_turns
+                    )
+                    migrants.append(coordinate)
+                if migrants:
+                    while len(migrants) < migrants_per_event:
+                        migrants.extend(list(migrants))
+                    migrants = migrants[: min(migrants_per_event, len(offspring))]
+                    repaired_migrants = np.asarray(
+                        repair._do(
+                            active_problem,
+                            np.asarray(migrants, dtype=float),
+                            algorithm=algorithm,
+                        ),
+                        dtype=float,
+                    )
+                    if repaired_migrants.shape != (
+                        len(migrants), int(active_problem.n_var)
+                    ):
+                        raise RuntimeError("turn-split migrant repair shape mismatch")
+                    for index, coordinate in enumerate(repaired_migrants):
+                        offspring[index].set("X", coordinate)
+                    self.migration_events += 1
+                    self.migrants_created += len(migrants)
+                    self.last_migration_generation = generation
+
+            cross_pair_count = sum(
+                set(pair) == {36, 37}
+                for pair in self.selection.last_parent_pair_topologies
+            )
+            cross_offspring_count = min(
+                len(offspring), 2 * int(cross_pair_count)
+            )
+            attributed_counts = {36: 0, 37: 0}
+            if niche_pair_cycle and cross_offspring_count:
+                coordinates = np.asarray(
+                    [offspring[index].X for index in range(cross_offspring_count)],
+                    dtype=float,
                 )
-                coordinate = np.asarray(pop[int(elite_index)].X, dtype=float).copy()
-                coordinate[coordinate_index] = _turn_split_unit_coordinate(
-                    target, fixed_primary_turns=fixed_turns
-                )
-                migrants.append(coordinate)
-            if migrants:
-                while len(migrants) < migrants_per_event:
-                    migrants.extend(list(migrants))
-                migrants = migrants[: min(migrants_per_event, len(offspring))]
-                repaired_migrants = np.asarray(
+                for index in range(cross_offspring_count):
+                    topology = 36 if index % 2 == 0 else 37
+                    coordinates[index, coordinate_index] = (
+                        _turn_split_unit_coordinate(
+                            topology, fixed_primary_turns=fixed_turns
+                        )
+                    )
+                    attributed_counts[topology] += 1
+                repaired_cross = np.asarray(
                     repair._do(
                         active_problem,
-                        np.asarray(migrants, dtype=float),
+                        coordinates,
                         algorithm=algorithm,
                     ),
                     dtype=float,
                 )
-                if repaired_migrants.shape != (
-                    len(migrants), int(active_problem.n_var)
+                observed_cross = _turn_split_main_values(
+                    repaired_cross,
+                    fixed_primary_turns=fixed_turns,
+                    coordinate_index=coordinate_index,
+                )
+                if (
+                    repaired_cross.shape != coordinates.shape
+                    or int(np.count_nonzero(observed_cross == 36))
+                    != attributed_counts[36]
+                    or int(np.count_nonzero(observed_cross == 37))
+                    != attributed_counts[37]
                 ):
-                    raise RuntimeError("turn-split migrant repair shape mismatch")
-                for index, coordinate in enumerate(repaired_migrants):
+                    raise RuntimeError("N36/N37 cross offspring attribution failed")
+                for index, coordinate in enumerate(repaired_cross):
                     offspring[index].set("X", coordinate)
-                self.migration_events += 1
-                self.migrants_created += len(migrants)
-                self.last_migration_generation = generation
+                self.cross_36x37_offspring_attributed += cross_offspring_count
+            cross_record = {
+                "algorithm_generation": generation,
+                "cross_36x37_parent_pair_count": int(cross_pair_count),
+                "cross_offspring_attributed_count": int(cross_offspring_count),
+                "attributed_topology_counts": {
+                    str(key): item for key, item in attributed_counts.items()
+                },
+            }
+            cross_record["sha256"] = canonical_sha256(cross_record)
+            self.generation_cross_offspring_counts.append(cross_record)
             return offspring
 
     class TurnSplitEpsilonSurvival(Survival):
@@ -1246,6 +1681,7 @@ def create_deep_topology_components(
             self.last_topology_counts: dict[str, int] = {}
             self.minimum_topology_count_observed = math.inf
             self.maximum_single_topology_count_observed = 0
+            self.generation_topology_counts: list[dict[str, Any]] = []
 
         def _do(
             self,
@@ -1306,13 +1742,31 @@ def create_deep_topology_components(
                 global_order.append(int(index))
             observed = topology_values(pop)
             selected: list[int] = []
+            exact_quota_mode = bool(
+                contract.get("exact_survivor_quota_by_N2_main")
+            )
+            quota = _topology_quota_for_population(contract, n_survive)
             for topology in topologies:
-                selected.extend([
+                topology_rows = [
                     index
                     for index in global_order
                     if observed[index] == topology and index not in selected
-                ][:minimum_each])
-            selected.extend(index for index in global_order if index not in selected)
+                ]
+                required = quota[topology] if exact_quota_mode else minimum_each
+                if len(topology_rows) < required:
+                    raise RuntimeError(
+                        "topology-local survival candidate pool underfilled"
+                    )
+                selected.extend(topology_rows[:required])
+            if exact_quota_mode:
+                if len(selected) != n_survive:
+                    raise RuntimeError(
+                        "topology-local survival quotas do not fill population"
+                    )
+            else:
+                selected.extend(
+                    index for index in global_order if index not in selected
+                )
             survivors = pop[np.asarray(selected[:n_survive], dtype=int)]
             survivor_topologies = topology_values(survivors)
             counts = {
@@ -1321,7 +1775,21 @@ def create_deep_topology_components(
                 )
                 for topology in topologies
             }
-            if any(counts[str(topology)] < minimum_each for topology in topologies):
+            expected_counts = (
+                {
+                    str(topology): int(quota[topology])
+                    for topology in topologies
+                }
+                if exact_quota_mode
+                else counts
+            )
+            if exact_quota_mode and counts != expected_counts:
+                raise RuntimeError(
+                    "epsilon survival violated an exact topology niche quota"
+                )
+            if not exact_quota_mode and any(
+                counts[str(topology)] < minimum_each for topology in topologies
+            ):
                 raise RuntimeError(
                     "epsilon survival lost a required turn-split sub-island"
                 )
@@ -1335,6 +1803,15 @@ def create_deep_topology_components(
                 self.maximum_single_topology_count_observed,
                 max(counts.values()),
             )
+            count_record = {
+                "survival_call": self.survival_calls,
+                "algorithm_generation": generation,
+                "counts": counts,
+                "expected_counts": expected_counts,
+                "exact_quota_verified": exact_quota_mode,
+            }
+            count_record["sha256"] = canonical_sha256(count_record)
+            self.generation_topology_counts.append(count_record)
             return survivors
 
     selection = TurnSplitPairedSelection()
@@ -2582,6 +3059,7 @@ def install_optimizer_scaling(
     all_thermal_scale_c: float,
     resonance_allowance_hz: float | None = None,
     llt_allowance_uh: float | None = None,
+    topology_allowance_contract: Mapping[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Normalize optimizer G while retaining the physical evaluator for replay."""
 
@@ -2607,6 +3085,21 @@ def install_optimizer_scaling(
     if resonance_allowance < 0.0 or llt_allowance < 0.0:
         raise ValueError("optimizer allowances must be non-negative")
     names = tuple(problem.constraint_names)
+    dynamic_niche = None
+    if topology_allowance_contract is not None:
+        try:
+            from tier1_final1000_topology_niche_contract import (
+                optimizer_allowances as niche_optimizer_allowances,
+                validate_contract as validate_niche_contract,
+            )
+        except ImportError:  # pragma: no cover - repository module import path
+            from tools.tier1_final1000_topology_niche_contract import (
+                optimizer_allowances as niche_optimizer_allowances,
+                validate_contract as validate_niche_contract,
+            )
+        dynamic_niche = validate_niche_contract(topology_allowance_contract)
+    else:
+        niche_optimizer_allowances = None
     scales = {name: 1.0 for name in names}
     allowances = {name: 0.0 for name in names}
     scales["Llt_robust_band"] = llt_scale
@@ -2638,6 +3131,7 @@ def install_optimizer_scaling(
     ):
         raise RuntimeError("optimizer scaling vector is invalid")
     physical_evaluate = problem._evaluate
+    problem._tier1_optimizer_generation = 0
 
     def optimizer_evaluate(
         values: Any,
@@ -2649,7 +3143,41 @@ def install_optimizer_scaling(
         physical_g = np.asarray(out.get("G"), dtype=float)
         if physical_g.ndim != 2 or physical_g.shape[1] != len(names):
             raise RuntimeError("physical G shape escaped optimizer normalization")
-        out["G"] = (physical_g - allowance_vector) / scale_vector
+        dynamic_allowance = np.zeros_like(physical_g)
+        if dynamic_niche is not None:
+            topologies = _turn_split_main_values(
+                values,
+                fixed_primary_turns=6,
+                coordinate_index=int(dynamic_niche["coordinate_index"]),
+            )
+            generation = int(
+                getattr(problem, "_tier1_optimizer_generation", 0) or 0
+            )
+            for topology in np.unique(topologies):
+                allowance = niche_optimizer_allowances(
+                    int(topology), generation
+                )
+                rows = np.flatnonzero(topologies == topology)
+                for index, name in enumerate(names):
+                    if name in {
+                        "Llt_robust_band",
+                        "Llt_ensemble_disagreement",
+                    }:
+                        dynamic_allowance[rows, index] = allowance["Llt_uH"]
+                    elif name.startswith("temperature_robust_limit:"):
+                        dynamic_allowance[rows, index] = allowance[
+                            "temperature_C"
+                        ]
+                    elif name in {
+                        RESONANCE_MINIMUM_CONSTRAINT,
+                        RESONANCE_MAXIMUM_CONSTRAINT,
+                    }:
+                        dynamic_allowance[rows, index] = allowance[
+                            "resonance_Hz"
+                        ]
+        out["G"] = (
+            physical_g - allowance_vector - dynamic_allowance
+        ) / scale_vector
 
     contract = {
         "schema_version": "mft-tier1-current7-optimizer-scaling-v1",
@@ -2659,7 +3187,18 @@ def install_optimizer_scaling(
         "scale_vector": scale_vector.tolist(),
         "allowance_vector": allowance_vector.tolist(),
         "physical_constraint_sign_preserved_without_allowance": (
-            resonance_allowance == 0.0 and llt_allowance == 0.0
+            resonance_allowance == 0.0
+            and llt_allowance == 0.0
+            and dynamic_niche is None
+        ),
+        "dynamic_topology_allowance_contract": dynamic_niche,
+        "dynamic_topology_allowance_contract_sha256": (
+            None if dynamic_niche is None else dynamic_niche["sha256"]
+        ),
+        "dynamic_allowances_zero_from_generation": (
+            None
+            if dynamic_niche is None
+            else dynamic_niche["allowances_zero_from_generation"]
         ),
         "physical_hard_constraint_mutation": False,
         "physical_objective_mutation": False,
@@ -2795,6 +3334,7 @@ def _terminal_inference_binding_contract(
         "xgboost",
         "catboost",
         "extratrees",
+        "randomforest",
     }
     if (
         isinstance(threads, bool)
@@ -2851,10 +3391,26 @@ class Current7Tier1Runner:
     def launch_eligible(self) -> bool:
         return True
 
-    def install_offspring_repair_operator(self) -> dict[str, Any]:
+    def install_offspring_repair_operator(
+        self,
+        *,
+        topology_contract: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self.prepared_repair_operator is not None:
             raise RuntimeError("offspring repair operator was already installed")
-        topology = deep_topology_contract(self.problem.fixed_primary_turns)
+        topology = dict(
+            topology_contract
+            or deep_topology_contract(self.problem.fixed_primary_turns)
+        )
+        sealed_topology = {
+            key: item for key, item in topology.items() if key != "sha256"
+        }
+        if (
+            topology.get("sha256") != canonical_sha256(sealed_topology)
+            or topology.get("fixed_primary_turns")
+            != self.problem.fixed_primary_turns
+        ):
+            raise RuntimeError("offspring topology contract is unauthenticated")
         operator = create_pymoo_physics_repair(self.problem)
         self.prepared_repair_operator = operator
         self.prepared_topology_contract = topology
@@ -2920,6 +3476,7 @@ class Current7Tier1Runner:
         *,
         role_partition: Mapping[str, Any] | None,
         stage: str,
+        topology_niche_partition: Mapping[str, Any] | None = None,
     ) -> tuple[Any, Any, dict[str, Any]]:
         """Repair and separate ordinary warm rows from basin-only donors."""
 
@@ -2927,15 +3484,70 @@ class Current7Tier1Runner:
 
         values = np.asarray(coordinates, dtype=float)
         partition = None
+        niche_partition = None
+        if role_partition is not None and topology_niche_partition is not None:
+            raise RuntimeError("warm start supplied two incompatible role contracts")
         if role_partition is not None:
             partition = validate_warm_role_partition(
                 role_partition,
                 values,
                 fixed_primary_turns=self.problem.fixed_primary_turns,
             )
+        if topology_niche_partition is not None:
+            niche_partition = validate_topology_niche_warm_partition(
+                topology_niche_partition, values
+            )
         repaired, repair_evidence = self.repair_coordinates(
             values, stage=stage
         )
+        if niche_partition is not None:
+            niche_warm, niche_filter = (
+                self.problem.filter_structural_donor_coordinates(repaired)
+            )
+            if len(niche_warm) != 160:
+                raise RuntimeError(
+                    "topology niche warm repair/filter did not retain all 160 rows"
+                )
+            topology_contract = deep_topology_contract(
+                6, enable_final1000_topology_niche=True
+            )
+            observed = _turn_split_main_values(
+                niche_warm,
+                fixed_primary_turns=6,
+                coordinate_index=topology_contract["coordinate_index"],
+            )
+            expected = {
+                int(key): int(item)
+                for key, item in topology_contract[
+                    "final1000_topology_niche_contract"
+                ]["initialization"]["warm_topology_counts"].items()
+            }
+            counts = {
+                topology: int(np.count_nonzero(observed == topology))
+                for topology in expected
+            }
+            if counts != expected or counts[60] != 0:
+                raise RuntimeError("topology niche warm repair changed its mix")
+            empty = np.empty((0, self.problem.n_var), dtype=float)
+            evidence = {
+                "schema_version": "mft-tier1-authenticated-topology-niche-warm-audit-v1",
+                "role_partitioned": True,
+                "topology_niche_partition": niche_partition,
+                "repair": repair_evidence,
+                "structural_geometry_filter": niche_filter,
+                "retained_count": int(len(niche_warm)),
+                "topology_counts": {
+                    str(key): item for key, item in counts.items()
+                },
+                "N2_main_60_warm_excluded": True,
+                "prior_objectives_or_constraints_inherited": False,
+                "additional_model_evaluations": 0,
+                "physical_constraint_G_mutation": False,
+                "physical_objective_mutation": False,
+                "terminal_physical_replay_required": True,
+            }
+            evidence["sha256"] = canonical_sha256(evidence)
+            return niche_warm, empty, evidence
         if partition is None:
             standard_values = repaired
             donor_values = np.empty((0, self.problem.n_var), dtype=float)
@@ -3355,6 +3967,7 @@ class Current7Tier1Runner:
         warm_start_path: Path | None = None,
         warm_start_sha256: str | None = None,
         warm_start_role_partition: Mapping[str, Any] | None = None,
+        warm_start_niche_partition: Mapping[str, Any] | None = None,
         optimizer_termination_strategy: str = (
             FIXED_GENERATION_TERMINATION_STRATEGY
         ),
@@ -3378,10 +3991,31 @@ class Current7Tier1Runner:
             pre_optimization_callback
         ):
             raise TypeError("pre_optimization_callback must be callable")
-        topology_contract = dict(
-            self.prepared_topology_contract
-            or deep_topology_contract(self.problem.fixed_primary_turns)
+        niche_active = warm_start_niche_partition is not None
+        if niche_active and (
+            self.problem.fixed_primary_turns != 6 or population != 320
+        ):
+            raise RuntimeError(
+                "Final1000 topology niche requires N1=6 population320"
+            )
+        topology_contract = (
+            deep_topology_contract(
+                self.problem.fixed_primary_turns,
+                enable_final1000_topology_niche=True,
+            )
+            if niche_active
+            else deep_topology_contract(self.problem.fixed_primary_turns)
         )
+        if self.prepared_topology_contract is not None:
+            prepared_niche = self.prepared_topology_contract.get(
+                "final1000_topology_niche_contract"
+            )
+            if niche_active and prepared_niche is None:
+                raise RuntimeError(
+                    "Final1000 topology niche was not activated before optimization"
+                )
+            if niche_active:
+                topology_contract = dict(self.prepared_topology_contract)
         coordinate_index = int(topology_contract["coordinate_index"])
         if (
             self.problem.sobol_dimension_names[coordinate_index]
@@ -3395,6 +4029,13 @@ class Current7Tier1Runner:
             )
         if warm_start_role_partition is not None and warm_start_path is None:
             raise RuntimeError("warm role partition requires a warm-start artifact")
+        if warm_start_niche_partition is not None and warm_start_path is None:
+            raise RuntimeError("warm niche partition requires a warm-start artifact")
+        if (
+            warm_start_role_partition is not None
+            and warm_start_niche_partition is not None
+        ):
+            raise RuntimeError("warm start cannot have two role partitions")
         warm_audit = None
         warm = None
         structural_donors = None
@@ -3409,6 +4050,7 @@ class Current7Tier1Runner:
                     warm_values,
                     role_partition=warm_start_role_partition,
                     stage="authenticated_warm_start",
+                    topology_niche_partition=warm_start_niche_partition,
                 )
             )
             warm_audit = {
@@ -3423,7 +4065,22 @@ class Current7Tier1Runner:
         donor_selection_audit = None
         donor_count = 0
         standard_count = 0
-        if structural_donors is not None and len(structural_donors):
+        niche_initialization_audit = None
+        if warm_start_niche_partition is not None:
+            if warm is None or len(warm) != 160 or (
+                structural_donors is not None and len(structural_donors)
+            ):
+                raise RuntimeError("topology niche warm execution shape mismatch")
+            raw_initial, niche_initialization_audit = (
+                build_topology_niche_initial_population(
+                    self.problem,
+                    warm,
+                    topology_contract,
+                    seed=int(seed),
+                )
+            )
+            standard_count = 160
+        elif structural_donors is not None and len(structural_donors):
             protected_count = int(
                 topology_contract["initial_repaired_copies_per_sub_island"]
             ) * len(topology_contract["turn_split_sub_islands_N2_main"])
@@ -3503,6 +4160,7 @@ class Current7Tier1Runner:
             "standard_warm_selection": standard_selection_audit,
             "structural_donor_selection": donor_selection_audit,
             "structural_donors_excluded_from_ordinary_warm_sampling": True,
+            "topology_niche_initialization": niche_initialization_audit,
         }
         current_initialization_audit["sha256"] = canonical_sha256(
             current_initialization_audit
@@ -3521,13 +4179,16 @@ class Current7Tier1Runner:
             self.prepared_repair_operator
             or create_pymoo_physics_repair(self.problem)
         )
-        initial, topology_initialization = seed_turn_split_sub_islands(
-            self.problem,
-            initial,
-            topology_contract,
-            warm_donor_count=donor_count or standard_count,
-            protected_warm_donors_only=bool(donor_count),
-        )
+        if niche_initialization_audit is not None:
+            topology_initialization = niche_initialization_audit
+        else:
+            initial, topology_initialization = seed_turn_split_sub_islands(
+                self.problem,
+                initial,
+                topology_contract,
+                warm_donor_count=donor_count or standard_count,
+                protected_warm_donors_only=bool(donor_count),
+            )
         if donor_count and not all(
             item["source_is_authenticated_warm"]
             for item in topology_initialization["donor_sources"]
@@ -3609,6 +4270,7 @@ class Current7Tier1Runner:
         terminal_x = np.asarray(terminal.get("X"), dtype=float)
         terminal_f = np.asarray(terminal.get("F"), dtype=float)
         terminal_g = np.asarray(terminal.get("G"), dtype=float)
+        self.problem._tier1_optimizer_generation = max_generations
         replay, terminal_audit = self.terminal_physical_replay(
             terminal_x,
             expected_f=terminal_f,
@@ -3640,9 +4302,20 @@ class Current7Tier1Runner:
                 "minimum_survivors_per_turn_split_sub_island"
             ]
         )
+        expected_terminal_quota = _topology_quota_for_population(
+            topology_contract, population
+        )
+        exact_quota_mode = bool(
+            topology_contract.get("exact_survivor_quota_by_N2_main")
+        )
         diversity_budget = topology_contract["bounded_diversity_budget"]
+        niche_diversity_budget = topology_contract.get(
+            "topology_niche_diversity_budget"
+        )
         maximum_single_topology = int(
-            diversity_budget["maximum_single_protected_topology_count"]
+            niche_diversity_budget["maximum_single_topology_count"]
+            if niche_diversity_budget
+            else diversity_budget["maximum_single_protected_topology_count"]
         )
         lane_topologies = _basin_lane_topologies(topology_contract)
         terminal_lane_counts = {
@@ -3659,6 +4332,28 @@ class Current7Tier1Runner:
             "paired_parent_pairs_emitted": int(
                 executed.mating.selection.parent_pairs_emitted
             ),
+            "topology_local_pairs_emitted": int(
+                executed.mating.selection.topology_local_pairs_emitted
+            ),
+            "cross_36x37_pairs_emitted": int(
+                executed.mating.selection.cross_36x37_pairs_emitted
+            ),
+            "cross_36x37_pair_fraction": float(
+                executed.mating.selection.cross_36x37_pairs_emitted
+                / max(1, executed.mating.selection.parent_pairs_emitted)
+            ),
+            "parent_pair_topology_counts": dict(
+                executed.mating.selection.parent_pair_topology_counts
+            ),
+            "generation_parent_pair_counts": list(
+                executed.mating.selection.generation_parent_pair_counts
+            ),
+            "cross_36x37_offspring_attributed": int(
+                executed.mating.cross_36x37_offspring_attributed
+            ),
+            "generation_cross_offspring_counts": list(
+                executed.mating.generation_cross_offspring_counts
+            ),
             "migration_events": int(executed.mating.migration_events),
             "migrants_created": int(executed.mating.migrants_created),
             "survival_calls": int(executed.survival.survival_calls),
@@ -3674,6 +4369,13 @@ class Current7Tier1Runner:
             "last_topology_counts": dict(
                 executed.survival.last_topology_counts
             ),
+            "generation_topology_counts": list(
+                executed.survival.generation_topology_counts
+            ),
+            "generation_topology_count_seals_sha256": canonical_sha256([
+                record["sha256"]
+                for record in executed.survival.generation_topology_counts
+            ]),
         }
         expected_last_epsilon = float(
             topology_contract["survival"]["initial_epsilon"]
@@ -3686,6 +4388,33 @@ class Current7Tier1Runner:
         if (
             operator_audit["paired_selection_calls"] < 1
             or operator_audit["paired_parent_pairs_emitted"] < 1
+            or (
+                topology_contract.get("topology_local_mating_required") is True
+                and operator_audit["topology_local_pairs_emitted"]
+                != operator_audit["paired_parent_pairs_emitted"]
+            )
+            or (
+                topology_contract.get("topology_niche_mating_contract")
+                and (
+                    operator_audit["cross_36x37_pairs_emitted"] < 1
+                    or operator_audit["cross_36x37_pair_fraction"] < 0.39
+                    or operator_audit["cross_36x37_offspring_attributed"] < 1
+                    or not operator_audit["generation_parent_pair_counts"]
+                    or not operator_audit["generation_cross_offspring_counts"]
+                    or any(
+                        record.get("sha256")
+                        != canonical_sha256({
+                            key: value
+                            for key, value in record.items()
+                            if key != "sha256"
+                        })
+                        for record in (
+                            operator_audit["generation_parent_pair_counts"]
+                            + operator_audit["generation_cross_offspring_counts"]
+                        )
+                    )
+                )
+            )
             or operator_audit["migration_events"] < 1
             or operator_audit["migrants_created"] < len(topologies)
             or operator_audit["survival_calls"] < 2
@@ -3693,9 +4422,35 @@ class Current7Tier1Runner:
             or operator_audit["maximum_single_topology_count_observed"]
             > maximum_single_topology
             or operator_audit["last_topology_counts"] != terminal_topology_counts
+            or (
+                exact_quota_mode
+                and terminal_topology_counts
+                != {
+                    str(topology): expected_terminal_quota[topology]
+                    for topology in topologies
+                }
+            )
+            or (
+                not exact_quota_mode
+                and any(
+                    terminal_topology_counts[str(topology)] < minimum_each
+                    for topology in topologies
+                )
+            )
+            or len(operator_audit["generation_topology_counts"])
+            != operator_audit["survival_calls"]
             or any(
-                terminal_topology_counts[str(topology)] < minimum_each
-                for topology in topologies
+                (
+                    exact_quota_mode
+                    and record.get("exact_quota_verified") is not True
+                )
+                or record.get("sha256")
+                != canonical_sha256({
+                    key: value
+                    for key, value in record.items()
+                    if key != "sha256"
+                })
+                for record in operator_audit["generation_topology_counts"]
             )
             or not math.isclose(
                 operator_audit["last_optimizer_epsilon"],
@@ -3716,8 +4471,10 @@ class Current7Tier1Runner:
             "terminal_topology_counts": terminal_topology_counts,
             "terminal_basin_lane_counts": terminal_lane_counts,
             "bounded_diversity_budget": diversity_budget,
+            "topology_niche_diversity_budget": niche_diversity_budget,
             "all_required_topologies_preserved": True,
             "single_topology_collapse_prevented": True,
+            "exact_topology_quota_every_generation_verified": exact_quota_mode,
             "terminal_epsilon_zero": bool(expected_last_epsilon == 0.0),
             "physical_constraint_G_mutation": False,
             "physical_objective_mutation": False,
@@ -4358,6 +5115,14 @@ def authenticate_warm_handoff(
             fixed_primary_turns=int(fixed_primary_turns),
         )
     )
+    niche_partition = contract.get("topology_niche_partition")
+    validated_niche_partition = (
+        None
+        if niche_partition is None
+        else validate_topology_niche_warm_partition(niche_partition, values)
+    )
+    if validated_niche_partition is not None and validated_role_partition is not None:
+        raise RuntimeError("warm handoff cannot mix legacy and topology niche roles")
     if validated_role_partition is not None:
         standard_role = validated_role_partition[
             "standard_hard_feasible_candidates"
@@ -4431,6 +5196,7 @@ def authenticate_warm_handoff(
         "coordinates_only": True,
         "coordinate_contract": warm_record.get("coordinate_contract"),
         "warm_role_partition": validated_role_partition,
+        "topology_niche_partition": validated_niche_partition,
         "prior_prediction_or_pass_classification_reused": False,
     }
     evidence["sha256"] = canonical_sha256(evidence)
@@ -4507,6 +5273,113 @@ def _smoke_every_model(
         "explicit_conformal_argument": True,
         "additional_half_width_multiplier": 1.0,
     }
+
+
+def _dev_shm_semaphore_snapshot() -> dict[str, Any]:
+    """Observe Linux POSIX semaphore files without mutating shared memory."""
+
+    root = Path("/dev/shm")
+    if os.name != "posix" or not root.is_dir():
+        return {
+            "available": False,
+            "semaphore_names": [],
+            "semaphore_count": 0,
+            "free_bytes": None,
+            "free_inodes": None,
+        }
+    names = sorted(
+        item.name for item in root.iterdir() if item.name.startswith("sem.")
+    )
+    stat = os.statvfs(root)
+    return {
+        "available": True,
+        "semaphore_names": names,
+        "semaphore_count": len(names),
+        "free_bytes": int(stat.f_bavail * stat.f_frsize),
+        "free_inodes": int(stat.f_favail),
+    }
+
+
+def semlock_safe_prediction_stress(
+    models: Mapping[str, Any],
+    frame: Any,
+    inference_binding: Mapping[str, Any],
+    *,
+    rounds: int = 8,
+) -> dict[str, Any]:
+    """Repeat every prediction and fail closed on SemLock/ENOSPC evidence."""
+
+    import numpy as np
+
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 2:
+        raise ValueError("SemLock stress rounds must be an integer >= 2")
+    managed, _threads = _terminal_inference_binding_contract(inference_binding)
+    family_threads = dict(inference_binding.get("family_threads") or {})
+    if (
+        not managed
+        or inference_binding.get("semaphore_free_sklearn_forest") is not True
+        or "extratrees" not in family_threads
+        or family_threads.get("extratrees") != 1
+    ):
+        raise RuntimeError("SemLock stress requires serial sklearn forests")
+    before = _dev_shm_semaphore_snapshot()
+    prediction_digests = []
+    calls = 0
+    enospc_observed = False
+    try:
+        for _round in range(rounds):
+            for target in CURRENT_REQUIRED_MODEL_TARGETS:
+                mean, half_width = models[target].predict_mu_sigma(
+                    frame, conformal=True
+                )
+                mean = np.asarray(mean, dtype=float).reshape(-1)
+                half_width = np.asarray(half_width, dtype=float).reshape(-1)
+                if (
+                    mean.shape != (len(frame),)
+                    or half_width.shape != (len(frame),)
+                    or not np.isfinite(mean).all()
+                    or not np.isfinite(half_width).all()
+                ):
+                    raise RuntimeError("SemLock stress prediction became non-finite")
+                prediction_digests.append(canonical_sha256({
+                    "target": target,
+                    "mean": mean.tolist(),
+                    "half_width": half_width.tolist(),
+                }))
+                calls += 1
+    except OSError as exc:
+        enospc_observed = exc.errno == errno.ENOSPC
+        if enospc_observed:
+            raise RuntimeError(
+                "SemLock-safe prediction stress hit ENOSPC"
+            ) from exc
+        raise
+    after = _dev_shm_semaphore_snapshot()
+    new_names = sorted(
+        set(after["semaphore_names"]) - set(before["semaphore_names"])
+    )
+    if before["available"] and new_names:
+        raise RuntimeError(
+            "prediction stress left new /dev/shm semaphore entries"
+        )
+    value = {
+        "schema_version": "mft-tier1-semlock-safe-prediction-stress-v1",
+        "rounds": rounds,
+        "target_count": len(CURRENT_REQUIRED_MODEL_TARGETS),
+        "prediction_call_count": calls,
+        "prediction_digest_sha256": canonical_sha256(prediction_digests),
+        "inference_policy": inference_binding.get("policy"),
+        "family_threads": family_threads,
+        "sklearn_extratrees_n_jobs": family_threads["extratrees"],
+        "before": before,
+        "after": after,
+        "new_semaphore_names": new_names,
+        "semaphore_entry_growth_count": len(new_names),
+        "enospc_observed": enospc_observed,
+        "stress_passed": True,
+    }
+    value["sha256"] = canonical_sha256(value)
+    return value
 
 
 def _jsonable_decoded_parameters(row: Any) -> dict[str, Any]:
@@ -5483,9 +6356,34 @@ def build_smoke_receipt(
         if budget_identity.get("passed") is not True:
             raise RuntimeError(f"N1={turns} winding-budget identity failed")
         model_smoke = dict(model_smoke_by_stratum[key])
+        semlock_stress = model_smoke.get("semlock_safe_prediction_stress") or {}
+        if not semlock_stress:
+            # Direct authenticated callers predating the SemLock gate may
+            # supply the ordinary model smoke only.  Execute the same stress
+            # here instead of weakening the launch receipt.
+            semlock_stress = semlock_safe_prediction_stress(
+                runner.models,
+                frame.iloc[[0]],
+                runner.inference_binding,
+                rounds=8,
+            )
+            model_smoke["semlock_safe_prediction_stress"] = semlock_stress
+        semlock_unsigned = {
+            name: item
+            for name, item in semlock_stress.items()
+            if name != "sha256"
+        }
         if (
             model_smoke.get("target_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
             or model_smoke.get("all_required_targets_exercised") is not True
+            or semlock_stress.get("sha256")
+            != canonical_sha256(semlock_unsigned)
+            or semlock_stress.get("prediction_call_count")
+            != 8 * len(CURRENT_REQUIRED_MODEL_TARGETS)
+            or semlock_stress.get("sklearn_extratrees_n_jobs") != 1
+            or semlock_stress.get("semaphore_entry_growth_count") != 0
+            or semlock_stress.get("enospc_observed") is not False
+            or semlock_stress.get("stress_passed") is not True
         ):
             raise RuntimeError(f"N1={turns} model inference inventory mismatch")
         model_smoke["sha256"] = canonical_sha256(model_smoke)
@@ -5563,6 +6461,11 @@ def build_smoke_receipt(
             key: strata[key]["model_smoke"] for key in expected_keys
         },
         "all_supported_strata_exercised": True,
+        "semlock_safe_prediction_stress_required": True,
+        "sklearn_extratrees_n_jobs": 1,
+        "repeated_prediction_stress_rounds_per_stratum": 8,
+        "dev_shm_semaphore_growth_allowed": False,
+        "enospc_allowed": False,
     }
     problem_contract = {
         "stage_spec": stage_spec,
@@ -5716,6 +6619,11 @@ def validate_smoke_receipt(
         or loading.get("supported_fixed_primary_turns") != expected_turns
         or set((loading.get("strata") or {})) != expected_keys
         or loading.get("all_supported_strata_exercised") is not True
+        or loading.get("semlock_safe_prediction_stress_required") is not True
+        or loading.get("sklearn_extratrees_n_jobs") != 1
+        or loading.get("repeated_prediction_stress_rounds_per_stratum") != 8
+        or loading.get("dev_shm_semaphore_growth_allowed") is not False
+        or loading.get("enospc_allowed") is not False
         or problem.get("stage_spec") != stage_spec
         or problem.get("stage_spec_sha256") != canonical_sha256(stage_spec)
         or problem.get("temperature_contract") != expected_temperature_contract
@@ -5791,6 +6699,14 @@ def validate_smoke_receipt(
         stratum_smoke = stratum.get("smoke") or {}
         contract = stratum_repair.get("contract") or {}
         stage_evidence = stratum_repair.get("stage_evidence") or {}
+        semlock_stress = (
+            stratum_model.get("semlock_safe_prediction_stress") or {}
+        )
+        semlock_unsigned = {
+            name: item
+            for name, item in semlock_stress.items()
+            if name != "sha256"
+        }
         if (
             stratum_sha != canonical_sha256(sealed_stratum)
             or stratum.get("fixed_primary_turns") != turns
@@ -5835,6 +6751,14 @@ def validate_smoke_receipt(
             or set((stratum_model.get("targets") or {}))
             != set(CURRENT_REQUIRED_MODEL_TARGETS)
             or stratum_model.get("additional_half_width_multiplier") != 1.0
+            or semlock_stress.get("sha256")
+            != canonical_sha256(semlock_unsigned)
+            or semlock_stress.get("prediction_call_count")
+            != 8 * len(CURRENT_REQUIRED_MODEL_TARGETS)
+            or semlock_stress.get("sklearn_extratrees_n_jobs") != 1
+            or semlock_stress.get("semaphore_entry_growth_count") != 0
+            or semlock_stress.get("enospc_observed") is not False
+            or semlock_stress.get("stress_passed") is not True
             or stratum_smoke.get("decoder_valid") is not True
             or stratum_smoke.get("finite_objectives") is not True
             or stratum_smoke.get("finite_constraints") is not True
@@ -6036,7 +6960,18 @@ def run_search_seed(
     island_profile = island.get("current7_profile") or {}
     unsigned_profile = dict(island_profile)
     recorded_profile_sha = unsigned_profile.pop("sha256", None)
-    topology_contract = deep_topology_contract(int(fixed_primary_turns))
+    profile_topology = island_profile.get("topology_evolution_contract") or {}
+    topology_niche_enabled = (
+        profile_topology.get("final1000_topology_niche_contract") is not None
+    )
+    topology_contract = (
+        deep_topology_contract(
+            int(fixed_primary_turns),
+            enable_final1000_topology_niche=True,
+        )
+        if topology_niche_enabled
+        else deep_topology_contract(int(fixed_primary_turns))
+    )
     expected_allowance_resonance = island_profile.get(
         "optimizer_resonance_allowance_Hz"
     )
@@ -6185,6 +7120,9 @@ def run_search_seed(
             warm_values,
             role_partition=warm_handoff.get("warm_role_partition"),
             stage="remote_preflight_authenticated_warm_start",
+            topology_niche_partition=warm_handoff.get(
+                "topology_niche_partition"
+            ),
         )
     )
     if len(filtered_warm) < 1:
@@ -6193,6 +7131,20 @@ def run_search_seed(
         structural_donors
     ) < 1:
         raise RuntimeError("remote warm preflight has no structural basin donor")
+    stress_evaluation = runner.evaluate_coordinates(filtered_warm[:1])
+    if not bool(stress_evaluation["decoder_valid"][0]):
+        raise RuntimeError("remote SemLock stress coordinate did not decode")
+    remote_semlock_stress = semlock_safe_prediction_stress(
+        runner.models,
+        stress_evaluation["frame"].iloc[[0]],
+        runner.inference_binding,
+        rounds=8,
+    )
+    if (
+        (warm_handoff.get("topology_niche_partition") is not None)
+        is not topology_niche_enabled
+    ):
+        raise RuntimeError("bundle profile/warm topology niche activation mismatch")
     physical_evaluate, optimizer_scaling = install_optimizer_scaling(
         runner.problem,
         resonance_scale_hz=optimizer_resonance_scale_hz,
@@ -6200,10 +7152,15 @@ def run_search_seed(
         all_thermal_scale_c=optimizer_all_thermal_scale_c,
         resonance_allowance_hz=optimizer_resonance_allowance_hz,
         llt_allowance_uh=optimizer_llt_allowance_uh,
+        topology_allowance_contract=topology_contract.get(
+            "final1000_topology_niche_contract"
+        ),
     )
     runner.physical_evaluate = physical_evaluate
     runner.optimizer_scaling = optimizer_scaling
-    repair_installation = runner.install_offspring_repair_operator()
+    repair_installation = runner.install_offspring_repair_operator(
+        topology_contract=topology_contract
+    )
     maximum_rss = int((manifest.get("fast_ramp") or {}).get(
         "maximum_peak_rss_bytes", 0
     ))
@@ -6274,7 +7231,16 @@ def run_search_seed(
             "maximum_peak_rss_bytes": maximum_rss,
             "optimizer_repair_contract_sha256": problem_repair_sha,
             "optimizer_scaling_contract_sha256": optimizer_scaling["sha256"],
+            "semlock_safe_prediction_stress": remote_semlock_stress,
             "topology_evolution_contract_sha256": topology_contract["sha256"],
+            "topology_niche_contract_sha256": (
+                None
+                if topology_contract.get("final1000_topology_niche_contract")
+                is None
+                else topology_contract["final1000_topology_niche_contract"][
+                    "sha256"
+                ]
+            ),
             "offspring_physics_repair": True,
             "initial_repair_attested": True,
             "warm_repair_attested": True,
@@ -6313,6 +7279,9 @@ def run_search_seed(
         warm_start_path=supplied_warm_path,
         warm_start_sha256=warm_artifact_record["sha256"],
         warm_start_role_partition=warm_handoff.get("warm_role_partition"),
+        warm_start_niche_partition=warm_handoff.get(
+            "topology_niche_partition"
+        ),
         optimizer_termination_strategy=optimizer_termination_strategy,
         pre_optimization_callback=seal_remote_preflight,
     )
@@ -6428,6 +7397,17 @@ def run_search_seed(
         "optimizer_topology_evolution_contract": (
             result.tier1_topology_evolution_contract
         ),
+        "topology_evolution_contract_sha256": topology_contract["sha256"],
+        "topology_niche_contract_sha256": (
+            None
+            if topology_contract.get("final1000_topology_niche_contract") is None
+            else topology_contract["final1000_topology_niche_contract"]["sha256"]
+        ),
+        "semlock_safe_prediction_stress": remote_semlock_stress,
+        "semlock_safe_prediction_stress_sha256": remote_semlock_stress[
+            "sha256"
+        ],
+        "semlock_safe_prediction_stress_attested": True,
         "optimizer_topology_evolution_audit": topology_audit,
         "terminal_population_count": persisted["terminal_population_count"],
         "physical_feasible_count": persisted["physical_feasible_count"],
@@ -6594,9 +7574,17 @@ def run_smoke_preflight(
         }
         repair_smoke["sha256"] = canonical_sha256(repair_smoke)
         evaluations[key] = evaluation
-        model_smoke_by_stratum[key] = _smoke_every_model(
-            runner.models, evaluation["frame"].iloc[[0]]
+        smoke_frame = evaluation["frame"].iloc[[0]]
+        model_smoke = _smoke_every_model(runner.models, smoke_frame)
+        model_smoke["semlock_safe_prediction_stress"] = (
+            semlock_safe_prediction_stress(
+                runner.models,
+                smoke_frame,
+                runner.inference_binding,
+                rounds=8,
+            )
         )
+        model_smoke_by_stratum[key] = model_smoke
         repair_smoke_by_stratum[key] = repair_smoke
     receipt = build_smoke_receipt(
         runners=runners,
@@ -6654,7 +7642,10 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("--population", type=int, required=True)
     search.add_argument("--max-generations", type=int, required=True)
     search.add_argument("--inference-threads", type=int, required=True)
-    search.add_argument("--scheduler-cpus", type=int, required=True)
+    # Backward-compatible for authenticated direct callers; the production
+    # Slurm runner supplies this explicitly and run_search_seed fail-closes to
+    # the same value as --inference-threads when it is omitted.
+    search.add_argument("--scheduler-cpus", type=int)
     search.add_argument("--fixed-primary-turns", type=int, required=True)
     search.add_argument("--optimizer-termination-strategy", required=True)
     search.add_argument(

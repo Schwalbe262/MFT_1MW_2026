@@ -261,6 +261,7 @@ def collect_tracked_code_sources(
         "tools/tier1_corrected_current7_slurm_bundle.py",
         "tools/tier1_corrected_current7_slurm_seed_runner.py",
         "tools/tier1_deep_crossover_contract.py",
+        "tools/tier1_final1000_topology_niche_contract.py",
         "tools/tier1_n1_6_anchor_island_contract.py",
         *(_safe_relative(item, "extra code file") for item in extra_code_files),
     }
@@ -442,9 +443,42 @@ def _island_contracts(
             "contract": {"path": contract_relative, **contract_record},
         }
 
+    n1_6_contract_value = read_json(
+        Path(warm_starts["n1-6"]["contract"]).resolve(strict=True)
+    )
+    n1_6_unsigned = {
+        key: item
+        for key, item in n1_6_contract_value.items()
+        if key != "sha256"
+    }
+    topology_niche_enabled = (
+        n1_6_contract_value.get("schema_version")
+        == "mft-tier1-final1000-topology-warm-pool-v1"
+        and n1_6_contract_value.get("topology_niche_partition") is not None
+    )
+    if (
+        (
+            n1_6_contract_value.get("schema_version")
+            == "mft-tier1-final1000-topology-warm-pool-v1"
+        )
+        != (n1_6_contract_value.get("topology_niche_partition") is not None)
+        or (
+            topology_niche_enabled
+            and n1_6_contract_value.get("sha256")
+            != canonical_sha256(n1_6_unsigned)
+        )
+    ):
+        raise RuntimeError("N1=6 topology niche warm activation is unauthenticated")
+
     islands = {}
     for island in DEEP_CROSSOVER_ISLANDS:
-        source_profile = island_profile(island)
+        island_niche_enabled = (
+            topology_niche_enabled and island.fixed_primary_turns == 6
+        )
+        source_profile = island_profile(
+            island,
+            enable_final1000_topology_niche=island_niche_enabled,
+        )
         current7_profile = {
             "schema_version": "mft-tier1-current7-deep-crossover-island-v1",
             "island_id": island.island_id,
@@ -461,9 +495,11 @@ def _island_contracts(
                 island.optimizer_all_thermal_scale_c
             ),
             "optimizer_resonance_allowance_Hz": (
-                island.optimizer_resonance_allowance_hz
+                source_profile["optimizer_resonance_allowance_hz"]
             ),
-            "optimizer_llt_allowance_uH": island.optimizer_llt_allowance_uh,
+            "optimizer_llt_allowance_uH": source_profile[
+                "optimizer_llt_allowance_uh"
+            ],
             "optimizer_resonance_scale_Hz": source_profile[
                 "optimizer_resonance_scale_Hz"
             ],
@@ -887,6 +923,12 @@ def build_task_payload(
         )
     lane = _lane_by_seed(manifest, seed)
     island = manifest["islands"][lane["island_id"]]
+    topology_contract = island["current7_profile"][
+        "topology_evolution_contract"
+    ]
+    topology_niche = topology_contract.get(
+        "final1000_topology_niche_contract"
+    )
     resources = dict(manifest["resources"])
     if priority is not None:
         resources = _resource_contract(priority)
@@ -930,6 +972,10 @@ def build_task_payload(
         "optimizer_repair_contract_sha256": repair_contracts[
             str(lane["fixed_primary_turns"])
         ],
+        "topology_evolution_contract_sha256": topology_contract["sha256"],
+        "topology_niche_contract_sha256": (
+            None if topology_niche is None else topology_niche["sha256"]
+        ),
         "offspring_physics_repair": True,
         "fixed_primary_turns_supported": [5, 6],
         "initial_repair_attested": True,

@@ -432,6 +432,10 @@ def verify_payload(
     lane = payload.get("lane") or {}
     island = (manifest.get("islands") or {}).get(lane.get("island_id")) or {}
     profile = island.get("current7_profile") or {}
+    topology_contract = profile.get("topology_evolution_contract") or {}
+    topology_niche = topology_contract.get(
+        "final1000_topology_niche_contract"
+    )
     if (
         profile.get("sha256") != payload.get("island_profile_sha256")
         or profile.get("fixed_primary_turns") != lane.get("fixed_primary_turns")
@@ -439,6 +443,10 @@ def verify_payload(
         or profile.get("offspring_physics_repair_required") is not True
         or profile.get("terminal_physical_replay_required") is not True
         or profile.get("temperature_targets") != list(CURRENT_TEMPERATURE_TARGETS)
+        or payload.get("topology_evolution_contract_sha256")
+        != topology_contract.get("sha256")
+        or payload.get("topology_niche_contract_sha256")
+        != (None if topology_niche is None else topology_niche.get("sha256"))
     ):
         raise RuntimeError("current7 fixed-turn island profile mismatch")
     warm = island.get("warm") or {}
@@ -489,6 +497,10 @@ def validate_remote_preflight(
         raise RuntimeError("remote preflight RSS observation is unavailable")
     live_rss = _process_rss_bytes(optimizer_pid)
     observed_rss = max(reported_rss, live_rss or 0)
+    semlock = value.get("semlock_safe_prediction_stress") or {}
+    semlock_unsigned = {
+        key: item for key, item in semlock.items() if key != "sha256"
+    }
     if (
         value.get("schema_version") != REMOTE_PREFLIGHT_SCHEMA
         or not _payload_sha_matches(value)
@@ -531,6 +543,24 @@ def validate_remote_preflight(
         != payload.get("scheduler_cpus", payload["inference_threads"])
         or value.get("optimizer_repair_contract_sha256")
         != payload["optimizer_repair_contract_sha256"]
+        or (
+            "topology_evolution_contract_sha256" in payload
+            and value.get("topology_evolution_contract_sha256")
+            != payload["topology_evolution_contract_sha256"]
+        )
+        or (
+            "topology_niche_contract_sha256" in payload
+            and value.get("topology_niche_contract_sha256")
+            != payload["topology_niche_contract_sha256"]
+        )
+        or semlock.get("sha256") != canonical_sha256(semlock_unsigned)
+        or semlock.get("rounds") != 8
+        or semlock.get("prediction_call_count")
+        != 8 * len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or semlock.get("sklearn_extratrees_n_jobs") != 1
+        or semlock.get("semaphore_entry_growth_count") != 0
+        or semlock.get("enospc_observed") is not False
+        or semlock.get("stress_passed") is not True
         or value.get("offspring_physics_repair") is not True
         or value.get("initial_repair_attested") is not True
         or value.get("warm_repair_attested") is not True
@@ -569,6 +599,23 @@ def validate_result(
         for target in CURRENT_TEMPERATURE_TARGETS
     ]
     topology = result.get("optimizer_topology_evolution_audit") or {}
+    topology_unsigned = {
+        key: item for key, item in topology.items() if key != "sha256"
+    }
+    topology_niche_required = (
+        payload.get("topology_niche_contract_sha256") is not None
+    )
+    topology_contract = result.get("optimizer_topology_evolution_contract") or {}
+    topology_contract_unsigned = {
+        key: item for key, item in topology_contract.items() if key != "sha256"
+    }
+    result_niche_contract = topology_contract.get(
+        "final1000_topology_niche_contract"
+    )
+    semlock = result.get("semlock_safe_prediction_stress") or {}
+    semlock_unsigned = {
+        key: item for key, item in semlock.items() if key != "sha256"
+    }
     hard_spec = result.get("hard_spec")
     artifact_inventory = result.get("artifact_inventory")
     constraint_names = result.get("constraint_names")
@@ -584,7 +631,7 @@ def validate_result(
         or result.get("completed_generations") != payload["max_generations"] + 1
         or result.get("optimizer_processes") != 1
         or result.get("optimizer_processes")
-        != payload.get("optimizer_processes")
+        != payload.get("optimizer_processes", 1)
         or result.get("inference_threads") != payload["inference_threads"]
         or result.get("scheduler_cpus")
         != payload.get("scheduler_cpus", payload["inference_threads"])
@@ -652,11 +699,54 @@ def validate_result(
         or result.get("terminal_physical_replay_attested") is not True
         or result.get("optimizer_repair_contract_sha256")
         != payload["optimizer_repair_contract_sha256"]
+        or topology_contract.get("sha256")
+        != canonical_sha256(topology_contract_unsigned)
+        or result.get("topology_evolution_contract_sha256")
+        != topology_contract.get("sha256")
+        or result.get("topology_niche_contract_sha256")
+        != (
+            None
+            if result_niche_contract is None
+            else result_niche_contract.get("sha256")
+        )
+        or (
+            "topology_evolution_contract_sha256" in payload
+            and result.get("topology_evolution_contract_sha256")
+            != payload["topology_evolution_contract_sha256"]
+        )
+        or (
+            "topology_niche_contract_sha256" in payload
+            and result.get("topology_niche_contract_sha256")
+            != payload["topology_niche_contract_sha256"]
+        )
+        or result.get("semlock_safe_prediction_stress_sha256")
+        != semlock.get("sha256")
+        or result.get("semlock_safe_prediction_stress_attested") is not True
+        or semlock.get("sha256") != canonical_sha256(semlock_unsigned)
+        or semlock.get("rounds") != 8
+        or semlock.get("prediction_call_count")
+        != 8 * len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or semlock.get("sklearn_extratrees_n_jobs") != 1
+        or semlock.get("semaphore_entry_growth_count") != 0
+        or semlock.get("enospc_observed") is not False
+        or semlock.get("stress_passed") is not True
+        or topology.get("sha256") != canonical_sha256(topology_unsigned)
         or topology.get("migration_events", 0) < 1
         or topology.get("paired_parent_pairs_emitted", 0) < 1
         or topology.get("survival_calls", 0) < 2
         or topology.get("terminal_epsilon_zero") is not True
         or topology.get("all_required_topologies_preserved") is not True
+        or (
+            topology_niche_required
+            and (
+                topology.get("exact_topology_quota_every_generation_verified")
+                is not True
+                or topology.get("cross_36x37_pairs_emitted", 0) < 1
+                or topology.get("cross_36x37_pair_fraction", 0.0) < 0.39
+                or topology.get("cross_36x37_offspring_attributed", 0) < 1
+                or topology.get("topology_niche_diversity_budget") is None
+            )
+        )
     ):
         raise RuntimeError("terminal current7 result/replay seal mismatch")
     _require_fail_closed(result, "terminal result")

@@ -52,7 +52,9 @@ VETTED_QUALITY_THRESHOLDS = os.path.abspath(os.path.join(
     HERE, "..", "training", "model_quality_thresholds.json"
 ))
 DETERMINISTIC_INFEASIBLE_EXIT_CODE = 42
-SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {"extratrees"}
+SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {
+    "extratrees", "randomforest",
+}
 FAMILY_SPECIFIC_INFERENCE_POLICY = (
     "family_specific_semaphore_free_sklearn_forest_v1"
 )

@@ -234,10 +234,10 @@ def test_logical_wave_is_4_canaries_plus_496_and_preserves_stage_quotas():
         for stage in profiles.STAGES
     } == launch.SUCCESSOR_ACTIVE_QUOTAS
     assert launch.SUCCESSOR_ACTIVE_QUOTAS == {
-        "entry-1200-t125": 200,
-        "bridge-1150-t115": 160,
-        "close-1075-t107p5": 90,
-        "final-1000-t100": 50,
+        "entry-1200-t125": 300,
+        "bridge-1150-t115": 150,
+        "close-1075-t107p5": 40,
+        "final-1000-t100": 10,
     }
 
 
@@ -436,7 +436,10 @@ def test_cli_is_render_validate_only_and_has_no_apply_or_submit_surface():
     assert "render" in help_text
     assert "validate" in help_text
     assert "--apply" not in help_text
-    assert "{profiles,render,validate,validate-result}" in help_text
+    assert (
+        "{profiles,render,render-topology-canary,validate,validate-result}"
+        in help_text
+    )
 
 
 def test_binding_schema_rejects_missing_stage_before_any_remote_action(tmp_path):

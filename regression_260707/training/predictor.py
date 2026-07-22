@@ -11,14 +11,45 @@ REGISTRY = os.path.join(HERE, "registry")
 LEGACY_SIGMA_FLOOR_POLICY = "legacy_absolute_1e-9"
 RELATIVE_SIGMA_FLOOR_POLICY = "relative_machine_epsilon_v1"
 SUPPORTED_INFERENCE_FAMILIES = {
-    "lightgbm", "xgboost", "catboost", "extratrees",
+    "lightgbm", "xgboost", "catboost", "extratrees", "randomforest",
 }
-SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {"extratrees"}
+SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {
+    "extratrees", "randomforest",
+}
+INFERENCE_FAMILY_ALIASES = {
+    "extra_trees": "extratrees",
+    "extratreesregressor": "extratrees",
+    "random_forest": "randomforest",
+    "randomforestregressor": "randomforest",
+}
 FAMILY_SPECIFIC_INFERENCE_POLICY = (
     "family_specific_semaphore_free_sklearn_forest_v1"
 )
 
 from checkpoint_train import inverse_y  # noqa: E402
+
+
+def normalize_inference_family(family, model=None):
+    """Return one audited family name and reject mislabeled sklearn forests."""
+
+    family_name = str(family).strip().lower().replace("-", "_")
+    family_name = INFERENCE_FAMILY_ALIASES.get(family_name, family_name)
+    estimator_family = None
+    if model is not None and type(model).__module__.startswith("sklearn."):
+        estimator_family = INFERENCE_FAMILY_ALIASES.get(
+            type(model).__name__.strip().lower()
+        )
+    if estimator_family in SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES:
+        if family_name != estimator_family:
+            raise RuntimeError(
+                "sklearn forest family label does not match estimator type"
+            )
+        family_name = estimator_family
+    if family_name not in SUPPORTED_INFERENCE_FAMILIES:
+        raise RuntimeError(
+            f"cannot bound unsupported ensemble family: {family}"
+        )
+    return family_name
 
 
 class EnsemblePredictor:
@@ -65,11 +96,7 @@ class EnsemblePredictor:
         configured = []
         family_threads = {}
         for family, model in self.bundle["models"]:
-            family_name = str(family).lower()
-            if family_name not in SUPPORTED_INFERENCE_FAMILIES:
-                raise RuntimeError(
-                    f"cannot bound unsupported ensemble family: {family}"
-                )
+            family_name = normalize_inference_family(family, model)
             effective_threads = (
                 1
                 if family_name in SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
@@ -112,7 +139,7 @@ class EnsemblePredictor:
     def _predict_model(self, family, model, frame):
         if (
             self.inference_threads is not None
-            and str(family).lower() == "catboost"
+            and normalize_inference_family(family, model) == "catboost"
         ):
             return model.predict(
                 frame,

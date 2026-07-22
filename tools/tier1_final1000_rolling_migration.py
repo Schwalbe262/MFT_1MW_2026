@@ -48,6 +48,7 @@ try:
         DEFAULT_TIMEOUT_SECONDS,
         LAUNCH_SCHEMA,
         REQUIRED_SCHEDULER_FIELDS,
+        PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
         SUCCESSOR_ACTIVE_QUOTAS,
         optimizer_stage_contract,
         validate_launch_plan,
@@ -91,6 +92,7 @@ except ImportError:  # pragma: no cover - repository import path
         DEFAULT_TIMEOUT_SECONDS,
         LAUNCH_SCHEMA,
         REQUIRED_SCHEDULER_FIELDS,
+        PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
         SUCCESSOR_ACTIVE_QUOTAS,
         optimizer_stage_contract,
         validate_launch_plan,
@@ -440,6 +442,7 @@ def _validate_plan_for_policy(
             and expected_quotas
             in (
                 HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
+                PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
                 SUCCESSOR_ACTIVE_QUOTAS,
             )
         )
@@ -564,6 +567,18 @@ def validate_historical_resource_quota_successor_plan(
     )
 
 
+def validate_previous_successor_plan(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate the running 200/160/90/50 patched predecessor plan."""
+
+    return _validate_plan_for_policy(
+        value,
+        policy=SUCCESSOR_POLICY,
+        expected_active_quotas=PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
+    )
+
+
 def validate_successor_plan(value: Mapping[str, Any]) -> dict[str, Any]:
     validated = validate_launch_plan(value)
     return _validate_plan_for_policy(
@@ -612,6 +627,7 @@ def validate_chained_predecessor_plan(
         else quotas
         in (
             HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS,
+            PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS,
             SUCCESSOR_ACTIVE_QUOTAS,
         )
     )
@@ -891,6 +907,12 @@ def _validate_chained_predecessor_state(
     migration_unsigned = {
         key: item for key, item in migration.items() if key != "sha256"
     }
+    primary_quotas = dict(
+        (primary_plan.get("open_ended_refill") or {}).get(
+            "stage_active_quotas"
+        )
+        or {}
+    )
     if (
         migration.get("schema_version")
         not in {MIGRATION_SCHEMA, CHAINED_MIGRATION_SCHEMA}
@@ -899,7 +921,7 @@ def _validate_chained_predecessor_state(
         or migration.get("successor_launch_plan_sha256")
         != primary_plan.get("launch_plan_sha256")
         or migration.get("successor_resource_policy") != SUCCESSOR_POLICY
-        or migration.get("successor_active_quotas") != SUCCESSOR_ACTIVE_QUOTAS
+        or migration.get("successor_active_quotas") != primary_quotas
         or migration.get("refill_policy") != REFILL_POLICY
         or migration.get("scheduler_mutation_endpoints") != ["POST /api/tasks"]
         or migration.get("cancellation_performed") is not False
@@ -1251,6 +1273,21 @@ def prepare_successor_state(
             "scheduling_profile",
             "gpus",
         )
+    } and predecessor_quotas == PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS:
+        predecessor_plan = validate_previous_successor_plan(
+            predecessor_plan_raw
+        )
+        predecessor_controller_kind = "chained_patched_successor"
+    elif predecessor_resources == {
+        key: SUCCESSOR_POLICY[key]
+        for key in (
+            "cpus_per_task",
+            "memory_mb_per_task",
+            "max_workers_per_node",
+            "priority",
+            "scheduling_profile",
+            "gpus",
+        )
     } and predecessor_quotas == SUCCESSOR_ACTIVE_QUOTAS:
         predecessor_plan = validate_chained_predecessor_plan(predecessor_plan_raw)
         predecessor_controller_kind = "chained_patched_successor"
@@ -1271,6 +1308,16 @@ def prepare_successor_state(
     successor_plan = validate_successor_plan(
         _read_json(successor_plan_path.resolve(strict=True))
     )
+    successor_plan_next_seed_by_stage = {
+        stage.stage_id: max(
+            int(task["payload_json"]["seed"])
+            for wave in ("canaries", "ramp")
+            for task in successor_plan["task_waves"][wave]
+            if task["payload_json"]["final_goal_stage_id"] == stage.stage_id
+        )
+        + 1
+        for stage in STAGES
+    }
     predecessor_generations = _plan_fixed_generations(predecessor_plan)
     if predecessor_generations not in SUPPORTED_PREDECESSOR_GENERATIONS:
         raise RuntimeError("unsupported predecessor science transition")
@@ -1278,7 +1325,10 @@ def prepare_successor_state(
         raise ValueError("unknown final1000 transition mode")
     if (
         predecessor_controller_kind
-        in {"resource_quota_successor", "chained_patched_successor"}
+        in {
+            "resource_quota_successor",
+            "chained_patched_successor",
+        }
         and transition_mode != PATCHED_BUNDLE
     ):
         raise RuntimeError(
@@ -1334,6 +1384,17 @@ def prepare_successor_state(
             plan_by_sha256=cohort_plan_by_sha,
             allow_running_shadow=allow_running_predecessor_shadow,
         )
+    successor_next_seed_by_stage = {
+        stage.stage_id: max(
+            int(predecessor_state["next_seed_by_stage"][stage.stage_id]),
+            int(successor_plan_next_seed_by_stage[stage.stage_id]),
+        )
+        for stage in STAGES
+    }
+    for stage in STAGES:
+        candidate = successor_next_seed_by_stage[stage.stage_id]
+        if not stage.seed_start <= candidate < stage.seed_window_end_exclusive:
+            raise RuntimeError("successor topology seed cursor escaped stage window")
     for index, cohort_plan in enumerate(cohort_plan_by_sha.values()):
         _verify_ready(
             cohort_plan,
@@ -1359,6 +1420,22 @@ def prepare_successor_state(
                 plan_by_sha256=cohort_plan_by_sha,
                 allow_running_shadow=True,
             )
+            successor_next_seed_by_stage = {
+                stage.stage_id: max(
+                    int(predecessor_state["next_seed_by_stage"][stage.stage_id]),
+                    int(successor_plan_next_seed_by_stage[stage.stage_id]),
+                )
+                for stage in STAGES
+            }
+            if any(
+                not stage.seed_start
+                <= successor_next_seed_by_stage[stage.stage_id]
+                < stage.seed_window_end_exclusive
+                for stage in STAGES
+            ):
+                raise RuntimeError(
+                    "refreshed successor seed cursor escaped stage window"
+                )
     inventory, observed_states = _scheduler_inventory(
         scheduler, predecessor_state=predecessor_state
     )
@@ -1429,7 +1506,13 @@ def prepare_successor_state(
         "scheduler_inventory_sha256": canonical_sha256(normalized_inventory),
         "predecessor_entry_count": len(entries),
         "imported_active_count_by_stage": active_by_stage,
-        "next_seed_by_stage": copy.deepcopy(predecessor_state["next_seed_by_stage"]),
+        "predecessor_next_seed_by_stage": copy.deepcopy(
+            predecessor_state["next_seed_by_stage"]
+        ),
+        "successor_plan_next_seed_by_stage": copy.deepcopy(
+            successor_plan_next_seed_by_stage
+        ),
+        "next_seed_by_stage": copy.deepcopy(successor_next_seed_by_stage),
         "successor_resource_policy": copy.deepcopy(SUCCESSOR_POLICY),
         "successor_active_quotas": copy.deepcopy(SUCCESSOR_ACTIVE_QUOTAS),
         "refill_policy": REFILL_POLICY,
@@ -1509,7 +1592,7 @@ def prepare_successor_state(
         "ramp_released": False,
         "canary_passed_stage_ids": [],
         "entries": entries,
-        "next_seed_by_stage": copy.deepcopy(predecessor_state["next_seed_by_stage"]),
+        "next_seed_by_stage": copy.deepcopy(successor_next_seed_by_stage),
         "scheduler_name_prefix": TASK_NAME_PREFIX,
         "scheduler_dedupe_prefix": DEDUPE_PREFIX,
         "scheduler_mutation_endpoints": ["POST /api/tasks"],
@@ -1548,7 +1631,13 @@ def prepare_successor_state(
         "imported_active_count": sum(active_by_stage.values()),
         "imported_active_count_by_stage": active_by_stage,
         "logical_active_target": TOTAL_ACTIVE_QUOTA,
-        "next_seed_by_stage": copy.deepcopy(predecessor_state["next_seed_by_stage"]),
+        "predecessor_next_seed_by_stage": copy.deepcopy(
+            predecessor_state["next_seed_by_stage"]
+        ),
+        "successor_plan_next_seed_by_stage": copy.deepcopy(
+            successor_plan_next_seed_by_stage
+        ),
+        "next_seed_by_stage": copy.deepcopy(successor_next_seed_by_stage),
         "successor_state_sha256": successor_state["state_sha256"],
         "successor_state_shadow_generated": True,
         "successor_state_written": bool(apply and successor_state_path.is_file()),

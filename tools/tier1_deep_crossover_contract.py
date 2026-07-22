@@ -13,6 +13,17 @@ import json
 import math
 from typing import Any
 
+try:
+    from tier1_final1000_topology_niche_contract import (
+        contract as final1000_topology_niche_contract,
+        validate_contract as validate_final1000_topology_niche_contract,
+    )
+except ImportError:  # pragma: no cover - repository module import path
+    from tools.tier1_final1000_topology_niche_contract import (
+        contract as final1000_topology_niche_contract,
+        validate_contract as validate_final1000_topology_niche_contract,
+    )
+
 
 SCHEMA = "mft-tier1-deep-crossover-island-v1"
 TERMINATION_STRATEGY = "fixed-n-gen-no-ftol-v1"
@@ -246,10 +257,22 @@ def validate_anchor_current_replay(
     }
 
 
-def topology_evolution_contract(fixed_primary_turns: int) -> dict[str, Any]:
+def topology_evolution_contract(
+    fixed_primary_turns: int,
+    *,
+    enable_final1000_topology_niche: bool = False,
+) -> dict[str, Any]:
     fixed_primary_turns = int(fixed_primary_turns)
     if fixed_primary_turns not in (5, 6):
         raise ValueError("deep crossover topology evolution requires N1=5 or 6")
+    if not isinstance(enable_final1000_topology_niche, bool):
+        raise TypeError("Final1000 topology niche activation must be boolean")
+    niche_enabled = fixed_primary_turns == 6 and enable_final1000_topology_niche
+    niche = None
+    if niche_enabled:
+        niche = validate_final1000_topology_niche_contract(
+            final1000_topology_niche_contract()
+        )
     if fixed_primary_turns == 6:
         topologies = BASIN_TURN_SPLIT_TOPOLOGIES_N1_6
         parent_pairs = BASIN_TURN_SPLIT_PARENT_PAIRS_N1_6
@@ -357,12 +380,65 @@ def topology_evolution_contract(fixed_primary_turns: int) -> dict[str, Any]:
         "capacitance_label_precision_remediation_included": False,
         "terminal_physical_replay_required": True,
         "warm_donor_prediction_inheritance_allowed": False,
+        "final1000_topology_niche_contract": (
+            niche if niche_enabled else None
+        ),
+        "topology_local_mating_required": False,
+        "topology_niche_mating_contract": (
+            {
+                "parent_pair_counts_per_160": niche[
+                    "parent_pair_counts_per_160"
+                ],
+                "priority_cross_pair": "36x37",
+                "priority_cross_pair_fraction": niche[
+                    "N36xN37_cross_pair_fraction"
+                ],
+                "cross_offspring_topology_attribution": niche[
+                    "cross_offspring_topology_attribution"
+                ],
+                "per_generation_pair_count_seal_required": True,
+            }
+            if niche_enabled
+            else None
+        ),
+        "authenticated_warm_fresh_mix_required": niche_enabled,
+        "exact_survivor_quota_by_N2_main": (
+            niche["topology_quota_by_N2_main"]
+            if niche_enabled
+            else None
+        ),
+        "exact_quota_required_when_population_is_320": (
+            niche_enabled
+        ),
+        "generation_topology_count_seal_required": (
+            niche_enabled
+        ),
+        "topology_niche_diversity_budget": (
+            {
+                "population": POPULATION,
+                "protected_slots": POPULATION,
+                "protected_population_fraction": 1.0,
+                "maximum_single_topology_count": max(
+                    int(item)
+                    for item in niche[
+                        "topology_quota_by_N2_main"
+                    ].values()
+                ),
+                "unprotected_remainder": 0,
+            }
+            if niche_enabled
+            else None
+        ),
     }
     value["sha256"] = canonical_sha(value)
     return value
 
 
-def island_profile(island: DeepCrossoverIsland) -> dict[str, Any]:
+def island_profile(
+    island: DeepCrossoverIsland,
+    *,
+    enable_final1000_topology_niche: bool = False,
+) -> dict[str, Any]:
     profile = {
         "schema_version": SCHEMA,
         **asdict(island),
@@ -374,13 +450,23 @@ def island_profile(island: DeepCrossoverIsland) -> dict[str, Any]:
         "optimizer_resonance_scale_Hz": RESONANCE_SCALE_HZ,
         "optimizer_termination_strategy": TERMINATION_STRATEGY,
         "topology_evolution_contract": topology_evolution_contract(
-            island.fixed_primary_turns
+            island.fixed_primary_turns,
+            enable_final1000_topology_niche=(
+                enable_final1000_topology_niche
+            ),
         ),
         "physical_hard_spec_mutation": False,
         "objective_mutation": False,
         "authoritative_terminal_G": "physical_unscaled_unchanged",
         "automatic_promotion_allowed": False,
     }
+    if enable_final1000_topology_niche:
+        if island.fixed_primary_turns != 6:
+            raise ValueError("Final1000 topology niche requires N1=6")
+        # The dynamic per-topology schedule is the sole optimizer allowance
+        # authority and reaches exact physical zero at generation 240.
+        profile["optimizer_resonance_allowance_hz"] = 0.0
+        profile["optimizer_llt_allowance_uh"] = 0.0
     profile["sha256"] = canonical_sha(profile)
     return profile
 

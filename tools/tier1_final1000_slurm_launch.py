@@ -6,8 +6,9 @@ authenticates every local source and publication/READY receipt before it can
 render scheduler envelopes.  The CLI intentionally has no submit/apply/watch
 surface: its only write is the requested local JSON launch plan.
 
-The output keeps 500 logical seed tasks active (64/96/128/212 by stage) until
-an explicit stop is requested by a separate authorized controller.  No task
+The topology successor keeps 500 logical seed tasks active
+(300/150/40/10 by stage) until an explicit stop is requested by a separate
+authorized controller.  No task
 uses AEDT or FEA; ``aedt_backend=standalone`` is retained solely because it is
 a required scheduler API envelope field and does not reserve an AEDT session.
 """
@@ -72,6 +73,9 @@ except ImportError:  # pragma: no cover - repository import path
 BINDINGS_SCHEMA = "mft-tier1-final1000-stage-bundle-bindings-v1"
 LAUNCH_SCHEMA = "mft-tier1-final1000-slurm-launch-plan-v1"
 RESULT_PREFLIGHT_SCHEMA = "mft-tier1-final1000-result-preflight-v1"
+TOPOLOGY_CANARY_LAUNCH_SCHEMA = (
+    "mft-tier1-final1000-topology-pre-cutover-canary-plan-v1"
+)
 CURRENT7_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 CURRENT7_REPLAY_SCHEMA = "mft-tier1-current7-terminal-replay-v1"
 
@@ -90,17 +94,27 @@ DEFAULT_PRIORITY = 1
 DEFAULT_TIMEOUT_SECONDS = 86_400
 DEFAULT_PEAK_RSS_GATE_BYTES = 22 * 1024**3
 
-# Operational successor quotas are intentionally separate from the immutable
-# science stage profiles used by the predecessor bundles.  This lets migration
-# authenticate every predecessor task while shifting capacity toward the two
-# relaxed donor basins that currently have the highest useful throughput.
-SUCCESSOR_ACTIVE_QUOTAS = {
+# Preserve the 2026-07-22 running release as an authenticated predecessor
+# policy.  The evidence-driven topology successor below shifts additional
+# capacity to the entry N36/N37 transition after 11,555 terminal completions
+# still yielded zero physically feasible rows.
+PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS = {
     "entry-1200-t125": 200,
     "bridge-1150-t115": 160,
     "close-1075-t107p5": 90,
     "final-1000-t100": 50,
 }
-if sum(SUCCESSOR_ACTIVE_QUOTAS.values()) != TOTAL_ACTIVE_QUOTA:  # pragma: no cover
+SUCCESSOR_ACTIVE_QUOTAS = {
+    "entry-1200-t125": 300,
+    "bridge-1150-t115": 150,
+    "close-1075-t107p5": 40,
+    "final-1000-t100": 10,
+}
+if (
+    set(PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS) != set(SUCCESSOR_ACTIVE_QUOTAS)
+    or sum(PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS.values()) != TOTAL_ACTIVE_QUOTA
+    or sum(SUCCESSOR_ACTIVE_QUOTAS.values()) != TOTAL_ACTIVE_QUOTA
+):  # pragma: no cover
     raise RuntimeError("final1000 successor active quotas must sum to 500")
 
 REQUIRED_SCHEDULER_FIELDS = frozenset(
@@ -126,6 +140,8 @@ REQUIRED_REMOTE_CODE = frozenset(
     {
         "artifacts/code/tools/tier1_corrected_generation_preflight.py",
         "artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py",
+        "artifacts/code/tools/tier1_deep_crossover_contract.py",
+        "artifacts/code/tools/tier1_final1000_topology_niche_contract.py",
         "artifacts/code/tools/tier1_final1000_stage_profiles.py",
     }
 )
@@ -570,8 +586,27 @@ def validate_task(
 def build_launch_plan(bindings_path: Path) -> dict[str, Any]:
     bindings = load_stage_bindings(bindings_path)
     canary_lanes, ramp_lanes = logical_lanes()
+    return _build_launch_plan_from_lanes(
+        bindings,
+        canary_lanes=canary_lanes,
+        ramp_lanes=ramp_lanes,
+    )
+
+
+def _build_launch_plan_from_lanes(
+    bindings: Mapping[str, Mapping[str, Any]],
+    *,
+    canary_lanes: Sequence[Mapping[str, Any]],
+    ramp_lanes: Sequence[Mapping[str, Any]],
+    topology_science_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Render the controller's exact 4+496 shape from sealed logical lanes."""
+
     task_waves: dict[str, list[dict[str, Any]]] = {"canaries": [], "ramp": []}
-    for wave_name, lanes in (("canaries", canary_lanes), ("ramp", ramp_lanes)):
+    for wave_name, lanes in (
+        ("canaries", canary_lanes),
+        ("ramp", ramp_lanes),
+    ):
         wave = "canary" if wave_name == "canaries" else "ramp"
         for lane in lanes:
             stage = BY_ID[lane["stage_id"]]
@@ -582,7 +617,39 @@ def build_launch_plan(bindings_path: Path) -> dict[str, Any]:
                 seed=int(lane["seed"]),
                 priority=DEFAULT_PRIORITY,
             )
-            task_waves[wave_name].append(build_stage_task(base, stage=stage, wave=wave))
+            logical_child = lane.get("topology_logical_child")
+            if logical_child is not None:
+                payload = dict(base["payload_json"])
+                payload.update(
+                    {
+                        "topology_successor_science_plan_sha256": (
+                            topology_science_identity["science_plan_sha256"]
+                        ),
+                        "topology_successor_logical_payload_sha256": (
+                            logical_child["payload_sha256"]
+                        ),
+                        "topology_successor_logical_dedupe_key": (
+                            logical_child["dedupe_key"]
+                        ),
+                    }
+                )
+                base = {**base, "payload_json": payload}
+            task = build_stage_task(base, stage=stage, wave=wave)
+            if logical_child is not None:
+                payload = task["payload_json"]
+                if (
+                    payload.get("lane", {}).get("island_id")
+                    != logical_child["optimizer_island_id"]
+                    or payload.get("topology_niche_contract_sha256")
+                    != topology_science_identity["topology_niche_contract_sha256"]
+                    or payload.get("population") != logical_child["population"]
+                    or payload.get("max_generations")
+                    != logical_child["max_generations"]
+                ):
+                    raise RuntimeError(
+                        "topology logical child/bundle island binding mismatch"
+                    )
+            task_waves[wave_name].append(task)
     summaries = {
         stage.stage_id: {
             "bundle_id": bindings[stage.stage_id]["plan"]["bundle_id"],
@@ -643,8 +710,247 @@ def build_launch_plan(bindings_path: Path) -> dict[str, Any]:
         "aedt_used": False,
         "automatic_promotion_allowed": False,
     }
+    if topology_science_identity is not None:
+        identity = dict(topology_science_identity)
+        unsigned_identity = {
+            key: item for key, item in identity.items() if key != "sha256"
+        }
+        if identity.get("sha256") != canonical_sha256(unsigned_identity):
+            raise RuntimeError("topology successor science identity seal mismatch")
+        unsigned["topology_successor_science_identity"] = identity
     plan = {**unsigned, "launch_plan_sha256": canonical_sha256(unsigned)}
     return validate_launch_plan(plan)
+
+
+def build_topology_successor_launch_plan(
+    bindings_path: Path,
+    science_plan_path: Path,
+) -> dict[str, Any]:
+    """Bind topology-balanced exact500 science to the proven single-seed path.
+
+    The separate 16-seed science canary remains a pre-cutover gate.  Once it
+    passes, this launch plan exposes exactly one controller canary template per
+    stage and 496 ramp tasks, so rolling migration can inherit the live 500 and
+    fill only natural terminal gaps without changing controller semantics.
+    """
+
+    try:
+        from tier1_final1000_topology_successor_plan import validate_plan
+    except ImportError:  # pragma: no cover - repository import path
+        from tools.tier1_final1000_topology_successor_plan import validate_plan
+
+    bindings = load_stage_bindings(bindings_path)
+    raw = _read_json(science_plan_path.resolve(strict=True))
+    science = validate_plan(raw.get("plan") if "plan" in raw else raw)
+    production = science["production"]["logical_children"]
+    canary_lanes: list[dict[str, Any]] = []
+    ramp_lanes: list[dict[str, Any]] = []
+    for stage in STAGES:
+        children = [
+            child for child in production if child["stage_id"] == stage.stage_id
+        ]
+        expected = SUCCESSOR_ACTIVE_QUOTAS[stage.stage_id]
+        if len(children) != expected:
+            raise RuntimeError("topology production quota differs from controller")
+        for index, child in enumerate(children):
+            lane = {
+                "stage_id": stage.stage_id,
+                "variant": stage.variant,
+                "seed": int(child["seed"]),
+                "fixed_primary_turns": FIXED_PRIMARY_TURNS,
+                "wave": "canary" if index == 0 else "ramp",
+                "topology_logical_child": child,
+            }
+            (canary_lanes if index == 0 else ramp_lanes).append(lane)
+    child_identities = [
+        {
+            "stage_id": child["stage_id"],
+            "seed": child["seed"],
+            "payload_sha256": child["payload_sha256"],
+            "dedupe_key": child["dedupe_key"],
+        }
+        for child in production
+    ]
+    identity = {
+        "schema_version": "mft-tier1-final1000-topology-rollout-binding-v1",
+        "science_plan_sha256": science["sha256"],
+        "topology_niche_contract_sha256": science[
+            "topology_niche_contract_sha256"
+        ],
+        "pre_cutover_canary_logical_seed_count": science["canary"][
+            "logical_seed_count"
+        ],
+        "controller_canary_template_count": len(canary_lanes),
+        "controller_ramp_count": len(ramp_lanes),
+        "production_logical_child_count": len(production),
+        "production_logical_child_identity_sha256": canonical_sha256(
+            child_identities
+        ),
+        "single_seed_adapter_task_path_unchanged": True,
+        "parent_lane_packing_is_science_independent": True,
+        "scheduler_submission_performed": False,
+    }
+    identity["sha256"] = canonical_sha256(identity)
+    return _build_launch_plan_from_lanes(
+        bindings,
+        canary_lanes=canary_lanes,
+        ramp_lanes=ramp_lanes,
+        topology_science_identity=identity,
+    )
+
+
+def build_topology_pre_cutover_canary_plan(
+    bindings_path: Path,
+    science_plan_path: Path,
+) -> dict[str, Any]:
+    """Render the sealed 16-seed terminal gate without scheduler mutation."""
+
+    try:
+        from tier1_final1000_topology_successor_plan import validate_plan
+    except ImportError:  # pragma: no cover - repository import path
+        from tools.tier1_final1000_topology_successor_plan import validate_plan
+
+    bindings = load_stage_bindings(bindings_path)
+    raw = _read_json(science_plan_path.resolve(strict=True))
+    science = validate_plan(raw.get("plan") if "plan" in raw else raw)
+    tasks = []
+    for child in science["canary"]["logical_children"]:
+        stage = BY_ID[child["stage_id"]]
+        binding = bindings[stage.stage_id]
+        base = build_current7_task_payload(
+            binding["plan"],
+            binding["manifest"],
+            seed=int(child["seed"]),
+            priority=DEFAULT_PRIORITY,
+        )
+        base_payload = {
+            **base["payload_json"],
+            "topology_successor_science_plan_sha256": science["sha256"],
+            "topology_successor_logical_payload_sha256": child[
+                "payload_sha256"
+            ],
+            "topology_successor_logical_dedupe_key": child["dedupe_key"],
+            "topology_pre_cutover_canary": True,
+        }
+        task = build_stage_task(
+            {**base, "payload_json": base_payload},
+            stage=stage,
+            wave="canary",
+        )
+        payload = task["payload_json"]
+        if (
+            payload.get("lane", {}).get("island_id")
+            != child["optimizer_island_id"]
+            or payload.get("topology_niche_contract_sha256")
+            != science["topology_niche_contract_sha256"]
+            or payload.get("population") != child["population"]
+            or payload.get("max_generations") != child["max_generations"]
+        ):
+            raise RuntimeError("topology canary/bundle island binding mismatch")
+        tasks.append(task)
+    unsigned = {
+        "schema_version": TOPOLOGY_CANARY_LAUNCH_SCHEMA,
+        "created_at": _now(),
+        "science_plan_sha256": science["sha256"],
+        "topology_niche_contract_sha256": science[
+            "topology_niche_contract_sha256"
+        ],
+        "logical_seed_count": len(tasks),
+        "stage_counts": dict(science["canary"]["stage_counts"]),
+        "resources": {
+            "cpus_per_task": DEFAULT_CPUS,
+            "memory_mb_per_task": DEFAULT_MEMORY_MB,
+            "max_workers_per_node": DEFAULT_MAX_WORKERS_PER_NODE,
+            "priority": DEFAULT_PRIORITY,
+            "scheduling_profile": "standard",
+            "gpus": 0,
+        },
+        "tasks": tasks,
+        "terminal_gate": dict(science["canary"]["gate"]),
+        "same_single_seed_adapter_task_path_as_production": True,
+        "production_launch_allowed_before_all_16_terminal": False,
+        "scheduler_write_performed": False,
+        "submission_performed": False,
+        "fea_submission_performed": False,
+        "aedt_used": False,
+        "automatic_promotion_allowed": False,
+    }
+    value = {**unsigned, "sha256": canonical_sha256(unsigned)}
+    return validate_topology_pre_cutover_canary_plan(value)
+
+
+def validate_topology_pre_cutover_canary_plan(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    unsigned = {key: item for key, item in value.items() if key != "sha256"}
+    tasks = value.get("tasks")
+    if (
+        value.get("schema_version") != TOPOLOGY_CANARY_LAUNCH_SCHEMA
+        or value.get("sha256") != canonical_sha256(unsigned)
+        or not _is_sha256(value.get("science_plan_sha256"))
+        or not _is_sha256(value.get("topology_niche_contract_sha256"))
+        or not isinstance(tasks, list)
+        or value.get("logical_seed_count") != 16
+        or len(tasks) != 16
+        or value.get("stage_counts")
+        != {
+            "entry-1200-t125": 6,
+            "bridge-1150-t115": 6,
+            "close-1075-t107p5": 2,
+            "final-1000-t100": 2,
+        }
+        or value.get("same_single_seed_adapter_task_path_as_production") is not True
+        or value.get("production_launch_allowed_before_all_16_terminal")
+        is not False
+        or any(
+            value.get(field) is not False
+            for field in (
+                "scheduler_write_performed",
+                "submission_performed",
+                "fea_submission_performed",
+                "aedt_used",
+                "automatic_promotion_allowed",
+            )
+        )
+    ):
+        raise RuntimeError("topology pre-cutover canary top-level seal mismatch")
+    for task in tasks:
+        validate_task(task, expected_wave="canary")
+        payload = task["payload_json"]
+        if (
+            payload.get("topology_pre_cutover_canary") is not True
+            or payload.get("topology_successor_science_plan_sha256")
+            != value["science_plan_sha256"]
+            or payload.get("topology_niche_contract_sha256")
+            != value["topology_niche_contract_sha256"]
+            or not _is_sha256(
+                payload.get("topology_successor_logical_payload_sha256")
+            )
+            or not str(
+                payload.get("topology_successor_logical_dedupe_key") or ""
+            ).startswith("mft-final1000-topology-canary-")
+        ):
+            raise RuntimeError("topology pre-cutover canary task mismatch")
+    if (
+        len({task["dedupe_key"] for task in tasks}) != 16
+        or len(
+            {
+                task["payload_json"]["topology_successor_logical_dedupe_key"]
+                for task in tasks
+            }
+        )
+        != 16
+        or {
+            stage.stage_id: sum(
+                task["payload_json"]["final_goal_stage_id"] == stage.stage_id
+                for task in tasks
+            )
+            for stage in STAGES
+        }
+        != value["stage_counts"]
+    ):
+        raise RuntimeError("topology pre-cutover canary identity/quota mismatch")
+    return dict(value)
 
 
 def validate_launch_plan(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -727,6 +1033,83 @@ def validate_launch_plan(value: Mapping[str, Any]) -> dict[str, Any]:
     canary_stages = {task["payload_json"]["final_goal_stage_id"] for task in canaries}
     if canary_stages != set(BY_ID):
         raise RuntimeError("final1000 canary set is incomplete")
+    topology_identity = value.get("topology_successor_science_identity")
+    topology_fields = (
+        "topology_successor_science_plan_sha256",
+        "topology_successor_logical_payload_sha256",
+        "topology_successor_logical_dedupe_key",
+    )
+    if topology_identity is None:
+        if any(
+            any(field in task["payload_json"] for field in topology_fields)
+            for task in tasks
+        ):
+            raise RuntimeError("unsealed topology successor task metadata")
+    else:
+        if not _sealed_mapping(topology_identity):
+            raise RuntimeError("topology successor science identity is unsealed")
+        logical_identities = []
+        for stage in STAGES:
+            stage_tasks = [
+                task
+                for task in tasks
+                if task["payload_json"]["final_goal_stage_id"] == stage.stage_id
+            ]
+            for task in stage_tasks:
+                payload = task["payload_json"]
+                if (
+                    payload.get("topology_successor_science_plan_sha256")
+                    != topology_identity.get("science_plan_sha256")
+                    or payload.get("topology_niche_contract_sha256")
+                    != topology_identity.get("topology_niche_contract_sha256")
+                    or not _is_sha256(
+                        payload.get("topology_successor_logical_payload_sha256")
+                    )
+                    or not str(
+                        payload.get("topology_successor_logical_dedupe_key") or ""
+                    ).startswith("mft-final1000-topology-production-")
+                ):
+                    raise RuntimeError("topology successor task identity mismatch")
+                logical_identities.append(
+                    {
+                        "stage_id": stage.stage_id,
+                        "seed": payload["seed"],
+                        "payload_sha256": payload[
+                            "topology_successor_logical_payload_sha256"
+                        ],
+                        "dedupe_key": payload[
+                            "topology_successor_logical_dedupe_key"
+                        ],
+                    }
+                )
+        if (
+            topology_identity.get("schema_version")
+            != "mft-tier1-final1000-topology-rollout-binding-v1"
+            or not _is_sha256(topology_identity.get("science_plan_sha256"))
+            or not _is_sha256(
+                topology_identity.get("topology_niche_contract_sha256")
+            )
+            or topology_identity.get("pre_cutover_canary_logical_seed_count") != 16
+            or topology_identity.get("controller_canary_template_count") != 4
+            or topology_identity.get("controller_ramp_count") != 496
+            or topology_identity.get("production_logical_child_count") != 500
+            or topology_identity.get(
+                "production_logical_child_identity_sha256"
+            )
+            != canonical_sha256(logical_identities)
+            or topology_identity.get("single_seed_adapter_task_path_unchanged")
+            is not True
+            or topology_identity.get("parent_lane_packing_is_science_independent")
+            is not True
+            or topology_identity.get("scheduler_submission_performed") is not False
+            or len(
+                {
+                    identity["dedupe_key"] for identity in logical_identities
+                }
+            )
+            != TOTAL_ACTIVE_QUOTA
+        ):
+            raise RuntimeError("topology successor rollout binding mismatch")
     return dict(value)
 
 
@@ -970,7 +1353,19 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("profiles")
     render = commands.add_parser("render")
     render.add_argument("--bindings", type=Path, required=True)
+    render.add_argument(
+        "--topology-science-plan",
+        type=Path,
+        help=(
+            "optional sealed topology successor plan; renders its high-offset "
+            "exact500 logical seeds through the existing single-seed controller"
+        ),
+    )
     render.add_argument("--output", type=Path, required=True)
+    topology_canary = commands.add_parser("render-topology-canary")
+    topology_canary.add_argument("--bindings", type=Path, required=True)
+    topology_canary.add_argument("--topology-science-plan", type=Path, required=True)
+    topology_canary.add_argument("--output", type=Path, required=True)
     validate = commands.add_parser("validate")
     validate.add_argument("--plan", type=Path, required=True)
     result = commands.add_parser("validate-result")
@@ -984,7 +1379,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "profiles":
         value = stage_inventory()
     elif args.command == "render":
-        value = build_launch_plan(args.bindings)
+        value = (
+            build_launch_plan(args.bindings)
+            if args.topology_science_plan is None
+            else build_topology_successor_launch_plan(
+                args.bindings, args.topology_science_plan
+            )
+        )
+        _atomic_json(args.output, value)
+    elif args.command == "render-topology-canary":
+        value = build_topology_pre_cutover_canary_plan(
+            args.bindings, args.topology_science_plan
+        )
         _atomic_json(args.output, value)
     elif args.command == "validate":
         value = validate_launch_plan(_read_json(args.plan.resolve(strict=True)))
