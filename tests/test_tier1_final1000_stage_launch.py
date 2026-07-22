@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import copy
 import gzip
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 
 import pytest
@@ -561,24 +563,203 @@ def test_reconcile_uses_one_bulk_inventory_and_only_falls_back_for_missing_activ
         controller._reconcile(state, scheduler)
 
 
-def test_scheduler_bulk_inventory_requests_latest_namespace_window(monkeypatch):
+def _inventory_task(task_id: int) -> dict:
+    return {
+        "id": task_id,
+        "name": f"{controller.TASK_NAME_PREFIX}{task_id}",
+        "dedupe_key": f"{controller.DEDUPE_PREFIX}{task_id}",
+        "status": "completed",
+    }
+
+
+def _inventory_page(tasks: list[dict], path: str) -> dict:
+    parsed = urllib.parse.parse_qs(path.split("?", 1)[1])
+    assert parsed["name_prefix"] == [controller.TASK_NAME_PREFIX]
+    assert parsed["sort_by"] == ["id"]
+    assert parsed["sort_order"] == ["desc"]
+    assert parsed["paged"] == ["true"]
+    page = int(parsed["page"][0])
+    page_size = int(parsed["page_size"][0])
+    before_id = int(parsed["before_id"][0])
+    eligible = sorted(
+        (
+            dict(task)
+            for task in tasks
+            if not before_id or int(task["id"]) < before_id
+        ),
+        key=lambda task: int(task["id"]),
+        reverse=True,
+    )
+    total = len(eligible)
+    page_count = max(1, (total + page_size - 1) // page_size)
+    start = (page - 1) * page_size
+    return {
+        "filtered_total": total,
+        "page": page,
+        "page_size": page_size,
+        "page_count": page_count,
+        "has_previous": page > 1,
+        "has_next": page < page_count,
+        "sort_by": "id",
+        "sort_order": "desc",
+        "filters": {
+            "project": "",
+            "name_prefix": controller.TASK_NAME_PREFIX,
+            "name_contains": "",
+            "status": None,
+            "before_id": before_id,
+        },
+        "items": eligible[start : start + page_size],
+    }
+
+
+def test_scheduler_bulk_inventory_reads_every_pinned_namespace_page(monkeypatch):
     client = controller.SchedulerApiClient("http://scheduler.invalid")
+    tasks = [_inventory_task(task_id) for task_id in range(1, 13_006)]
     paths: list[str] = []
 
-    def request(path: str, **_kwargs):
+    def request(path: str):
         paths.append(path)
-        return []
+        response = _inventory_page(tasks, path)
+        if len(paths) == 1:
+            # Simulate a concurrent insert after the anchor.  The fixed
+            # before_id must exclude it from every authoritative page.
+            tasks.append(_inventory_task(13_006))
+        return response
 
-    monkeypatch.setattr(client, "_request", request)
-    assert client.list_namespace_tasks() == []
-    query = paths[0].split("?", 1)[1]
-    parsed = urllib.parse.parse_qs(query)
-    assert parsed == {
-        "name_prefix": [controller.TASK_NAME_PREFIX],
-        "sort_by": ["id"],
-        "sort_order": ["desc"],
-        "limit": ["10000"],
+    monkeypatch.setattr(client, "_request_inventory_page", request)
+    observed = client.list_namespace_tasks()
+
+    assert len(observed) == 13_005
+    assert [int(task["id"]) for task in observed] == list(
+        range(13_005, 0, -1)
+    )
+    assert len(paths) == 3  # one anchor plus two authoritative pages
+    anchor = urllib.parse.parse_qs(paths[0].split("?", 1)[1])
+    page_1 = urllib.parse.parse_qs(paths[1].split("?", 1)[1])
+    page_2 = urllib.parse.parse_qs(paths[2].split("?", 1)[1])
+    assert anchor["page_size"] == ["1"]
+    assert anchor["before_id"] == ["0"]
+    assert page_1["page_size"] == ["10000"]
+    assert page_1["before_id"] == ["13006"]
+    assert page_2["before_id"] == ["13006"]
+    assert page_2["page"] == ["2"]
+    snapshot_unsigned = {
+        "schema_version": controller.INVENTORY_SNAPSHOT_SCHEMA,
+        "high_watermark_task_id": 13_005,
+        "before_id": 13_006,
+        "filtered_total": 13_005,
+        "page_size": 10_000,
+        "page_count": 2,
+        "task_ids_sha256": controller.canonical_sha256(
+            list(range(13_005, 0, -1))
+        ),
+        "server_snapshot_revision": None,
     }
+    assert client.inventory_snapshot_receipt == {
+        **snapshot_unsigned,
+        "sha256": controller.canonical_sha256(snapshot_unsigned),
+    }
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("overlap", "repeats a task id"),
+        ("missing", "page cardinality mismatch"),
+    ],
+)
+def test_scheduler_bulk_inventory_rejects_page_overlap_or_missing_id(
+    monkeypatch, fault, message
+):
+    client = controller.SchedulerApiClient("http://scheduler.invalid")
+    tasks = [_inventory_task(task_id) for task_id in range(1, 10_002)]
+
+    def request(path: str):
+        response = _inventory_page(tasks, path)
+        parsed = urllib.parse.parse_qs(path.split("?", 1)[1])
+        if parsed["page_size"] == ["10000"] and parsed["page"] == ["2"]:
+            if fault == "overlap":
+                response["items"][0] = _inventory_task(2)
+            else:
+                response["items"].pop()
+        return response
+
+    monkeypatch.setattr(client, "_request_inventory_page", request)
+    with pytest.raises(RuntimeError, match=message):
+        client.list_namespace_tasks()
+    assert client.inventory_snapshot_receipt is None
+
+
+def test_scheduler_bulk_inventory_rejects_unstable_snapshot_revision(monkeypatch):
+    client = controller.SchedulerApiClient("http://scheduler.invalid")
+    tasks = [_inventory_task(task_id) for task_id in range(1, 10_002)]
+
+    def request(path: str):
+        response = _inventory_page(tasks, path)
+        parsed = urllib.parse.parse_qs(path.split("?", 1)[1])
+        if parsed["page_size"] == ["10000"]:
+            response["snapshot_revision"] = (
+                "revision-a" if parsed["page"] == ["1"] else "revision-b"
+            )
+        return response
+
+    monkeypatch.setattr(client, "_request_inventory_page", request)
+    with pytest.raises(RuntimeError, match="snapshot revision changed"):
+        client.list_namespace_tasks()
+    assert client.inventory_snapshot_receipt is None
+
+
+def test_scheduler_inventory_http_429_retry_is_bounded(monkeypatch):
+    client = controller.SchedulerApiClient("http://scheduler.invalid", timeout=7)
+    attempts: list[float] = []
+    sleeps: list[float] = []
+    successful = _inventory_page([], controller.SchedulerApiClient._inventory_query(
+        page=1, page_size=1, before_id=0
+    ))
+
+    def throttled_urlopen(_request, *, timeout):
+        attempts.append(timeout)
+        if len(attempts) < 3:
+            raise urllib.error.HTTPError(
+                "http://scheduler.invalid/api/tasks",
+                429,
+                "rate limited",
+                None,
+                io.BytesIO(b"rate limited"),
+            )
+        return io.BytesIO(json.dumps(successful).encode("utf-8"))
+
+    monkeypatch.setattr(controller.urllib.request, "urlopen", throttled_urlopen)
+    monkeypatch.setattr(controller.time, "sleep", sleeps.append)
+    value = client._request_inventory_page(
+        client._inventory_query(page=1, page_size=1, before_id=0)
+    )
+    assert value == successful
+    assert attempts == [7, 7, 7]
+    assert sleeps == [0.25, 0.5]
+    assert client.inventory_get_count == 3
+
+    attempts.clear()
+    sleeps.clear()
+
+    def always_throttled(_request, *, timeout):
+        attempts.append(timeout)
+        raise urllib.error.HTTPError(
+            "http://scheduler.invalid/api/tasks",
+            429,
+            "rate limited",
+            None,
+            io.BytesIO(b"rate limited"),
+        )
+
+    monkeypatch.setattr(controller.urllib.request, "urlopen", always_throttled)
+    with pytest.raises(RuntimeError, match="rate-limited after 3 attempts"):
+        client._request_inventory_page(
+            client._inventory_query(page=1, page_size=1, before_id=0)
+        )
+    assert attempts == [7, 7, 7]
+    assert sleeps == [0.25, 0.5]
 
 
 def _write_plan(tmp_path: Path) -> tuple[Path, dict]:

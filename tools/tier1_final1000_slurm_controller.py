@@ -119,6 +119,10 @@ TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "timeout"})
 REFILL_POLICY = "smooth-weighted-deficit-round-robin-v1"
 SEED_STATUS_BUSY_MAX_ATTEMPTS = 3
 SEED_STATUS_BUSY_RETRY_SECONDS = 0.25
+INVENTORY_PAGE_SIZE = 10_000
+INVENTORY_BUSY_MAX_ATTEMPTS = 3
+INVENTORY_BUSY_RETRY_SECONDS = 0.25
+INVENTORY_SNAPSHOT_SCHEMA = "mft-tier1-final1000-inventory-snapshot-v1"
 
 
 class SeedStatusReadBusy(RuntimeError):
@@ -175,27 +179,219 @@ class ReadyProbe(Protocol):
 class SchedulerApiClient(Current7SchedulerApiClient):
     """Scheduler client restricted to the final-goal task namespace."""
 
-    def _load_inventory(self) -> None:
+    def __init__(self, base_url: str, timeout: float = 30.0):
+        super().__init__(base_url, timeout=timeout)
+        self.inventory_get_count = 0
+        self.inventory_snapshot_receipt: dict[str, Any] | None = None
+
+    def _request_inventory_page(self, path: str) -> Mapping[str, Any]:
+        """Read one inventory page with bounded retry for HTTP 429 only."""
+
+        request = urllib.request.Request(self.base_url + path, method="GET")
+        for attempt in range(INVENTORY_BUSY_MAX_ATTEMPTS):
+            self.inventory_get_count += 1
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429:
+                    if attempt + 1 < INVENTORY_BUSY_MAX_ATTEMPTS:
+                        time.sleep(INVENTORY_BUSY_RETRY_SECONDS * (attempt + 1))
+                        continue
+                    raise RuntimeError(
+                        "scheduler inventory remained rate-limited after "
+                        f"{INVENTORY_BUSY_MAX_ATTEMPTS} attempts"
+                    ) from exc
+                raise RuntimeError(
+                    f"scheduler inventory GET {path} failed with HTTP "
+                    f"{exc.code}: {detail}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    f"scheduler inventory GET {path} failed: {exc.reason}"
+                ) from exc
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("scheduler inventory page is not valid JSON") from exc
+            if not isinstance(value, dict):
+                raise RuntimeError("scheduler paged inventory is not an object")
+            return value
+        raise AssertionError("bounded inventory retry loop fell through")
+
+    @staticmethod
+    def _inventory_query(*, page: int, page_size: int, before_id: int) -> str:
         query = urllib.parse.urlencode(
             {
                 "name_prefix": TASK_NAME_PREFIX,
                 "sort_by": "id",
                 "sort_order": "desc",
-                "limit": 10_000,
+                "paged": "true",
+                "page": page,
+                "page_size": page_size,
+                "before_id": before_id,
             }
         )
-        value = self._request(f"/api/tasks?{query}")
-        if not isinstance(value, list):
-            raise RuntimeError("final1000 scheduler inventory is not a list")
+        return f"/api/tasks?{query}"
+
+    @staticmethod
+    def _validate_inventory_page(
+        value: Mapping[str, Any],
+        *,
+        page: int,
+        page_size: int,
+        before_id: int,
+        expected_total: int | None,
+        expected_page_count: int | None,
+        expected_server_revision: Any,
+        check_server_revision: bool,
+    ) -> tuple[list[Mapping[str, Any]], int, int, Any]:
+        def strict_int(name: str) -> int:
+            candidate = value.get(name)
+            if (
+                isinstance(candidate, bool)
+                or not isinstance(candidate, int)
+                or candidate < 0
+            ):
+                raise RuntimeError(
+                    f"scheduler inventory {name} is not a non-negative integer"
+                )
+            return candidate
+
+        filtered_total = strict_int("filtered_total")
+        observed_page = strict_int("page")
+        observed_page_size = strict_int("page_size")
+        page_count = strict_int("page_count")
+        calculated_page_count = max(1, math.ceil(filtered_total / page_size))
+        if (
+            observed_page != page
+            or observed_page_size != page_size
+            or page_count != calculated_page_count
+            or value.get("has_previous") is not (page > 1)
+            or value.get("has_next") is not (page < page_count)
+            or value.get("sort_by") != "id"
+            or value.get("sort_order") != "desc"
+        ):
+            raise RuntimeError("scheduler inventory page metadata mismatch")
+        filters = value.get("filters")
+        if filters != {
+            "project": "",
+            "name_prefix": TASK_NAME_PREFIX,
+            "name_contains": "",
+            "status": None,
+            "before_id": before_id,
+        }:
+            raise RuntimeError("scheduler inventory page filters changed")
+        if (
+            expected_total is not None
+            and (
+                filtered_total != expected_total
+                or (
+                    expected_page_count is not None
+                    and page_count != expected_page_count
+                )
+            )
+        ):
+            raise RuntimeError("scheduler inventory snapshot metadata changed")
+        server_revision = value.get("snapshot_revision")
+        if check_server_revision and server_revision != expected_server_revision:
+            raise RuntimeError("scheduler inventory snapshot revision changed")
+        items = value.get("items")
+        if not isinstance(items, list):
+            raise RuntimeError("scheduler inventory page items are not a list")
+        expected_items = min(
+            page_size,
+            max(0, filtered_total - ((page - 1) * page_size)),
+        )
+        if len(items) != expected_items:
+            raise RuntimeError("scheduler inventory page cardinality mismatch")
+        if not all(isinstance(item, dict) for item in items):
+            raise RuntimeError("scheduler inventory page contains a non-object row")
+        return items, filtered_total, page_count, server_revision
+
+    def _load_inventory(self) -> None:
+        # Establish a high-watermark first.  Authoritative page reads are then
+        # pinned below it so concurrent inserts cannot shift OFFSET pages.
+        anchor = self._request_inventory_page(
+            self._inventory_query(page=1, page_size=1, before_id=0)
+        )
+        anchor_items, anchor_total, _anchor_page_count, _anchor_revision = (
+            self._validate_inventory_page(
+                anchor,
+                page=1,
+                page_size=1,
+                before_id=0,
+                expected_total=None,
+                expected_page_count=None,
+                expected_server_revision=None,
+                check_server_revision=False,
+            )
+        )
+        if anchor_items:
+            high_watermark_task_id = _task_id(anchor_items[0])
+        else:
+            high_watermark_task_id = 0
+        before_id = high_watermark_task_id + 1
+
+        rows: list[Mapping[str, Any]] = []
+        seen_task_ids: set[int] = set()
+        previous_task_id: int | None = None
+        expected_page_count: int | None = None
+        expected_server_revision: Any = None
+        page = 1
+        while expected_page_count is None or page <= expected_page_count:
+            value = self._request_inventory_page(
+                self._inventory_query(
+                    page=page,
+                    page_size=INVENTORY_PAGE_SIZE,
+                    before_id=before_id,
+                )
+            )
+            page_items, _filtered_total, page_count, server_revision = (
+                self._validate_inventory_page(
+                    value,
+                    page=page,
+                    page_size=INVENTORY_PAGE_SIZE,
+                    before_id=before_id,
+                    expected_total=anchor_total,
+                    expected_page_count=expected_page_count,
+                    expected_server_revision=expected_server_revision,
+                    check_server_revision=page > 1,
+                )
+            )
+            if expected_page_count is None:
+                expected_page_count = page_count
+                expected_server_revision = server_revision
+            for task in page_items:
+                task_id = _task_id(task)
+                if task_id >= before_id:
+                    raise RuntimeError(
+                        "scheduler inventory escaped its fixed high-watermark"
+                    )
+                if task_id in seen_task_ids:
+                    raise RuntimeError("scheduler inventory repeats a task id")
+                if previous_task_id is not None and task_id >= previous_task_id:
+                    raise RuntimeError(
+                        "scheduler inventory task ids are not strictly descending"
+                    )
+                seen_task_ids.add(task_id)
+                previous_task_id = task_id
+                rows.append(task)
+            page += 1
+
+        if len(rows) != anchor_total:
+            raise RuntimeError("scheduler inventory snapshot is missing task ids")
+        if rows and _task_id(rows[0]) != high_watermark_task_id:
+            raise RuntimeError("scheduler inventory high-watermark identity changed")
+
         inventory: dict[str, Mapping[str, Any]] = {}
         task_ids: dict[int, str] = {}
-        for task in value:
-            if not isinstance(task, dict):
-                continue
+        for task in rows:
             name = str(task.get("name") or "")
             dedupe = str(task.get("dedupe_key") or "")
             if not name.startswith(TASK_NAME_PREFIX):
-                continue
+                raise RuntimeError("final1000 inventory escaped its name namespace")
             if not dedupe.startswith(DEDUPE_PREFIX):
                 raise RuntimeError("final1000 namespace task has foreign dedupe key")
             task_id = _task_id(task)
@@ -209,6 +405,20 @@ class SchedulerApiClient(Current7SchedulerApiClient):
                     f"scheduler contains duplicate final1000 dedupe: {dedupe}"
                 )
             inventory[dedupe] = task
+        snapshot_unsigned = {
+            "schema_version": INVENTORY_SNAPSHOT_SCHEMA,
+            "high_watermark_task_id": high_watermark_task_id,
+            "before_id": before_id,
+            "filtered_total": anchor_total,
+            "page_size": INVENTORY_PAGE_SIZE,
+            "page_count": expected_page_count,
+            "task_ids_sha256": canonical_sha256([_task_id(task) for task in rows]),
+            "server_snapshot_revision": expected_server_revision,
+        }
+        self.inventory_snapshot_receipt = {
+            **snapshot_unsigned,
+            "sha256": canonical_sha256(snapshot_unsigned),
+        }
         self._inventory = inventory
 
     def submit_task(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1040,9 +1250,8 @@ def _reconcile(state: dict[str, Any], scheduler: SchedulerClient) -> int:
         observed = (
             bulk_by_id.get(expected_task_id) if bulk_by_id is not None else None
         )
-        # The bulk endpoint is capped at the latest 10,000 namespace rows.  A
-        # long-running active task can be older than that window, so only those
-        # missing active IDs fall back to the detail endpoint.
+        # A task may disappear between the sealed bulk snapshot and this
+        # reconciliation pass, so only missing active IDs use the detail read.
         if observed is None:
             observed = scheduler.get_task(expected_task_id)
         if observed is None:
