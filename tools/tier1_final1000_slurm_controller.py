@@ -121,6 +121,106 @@ INVENTORY_PAGE_SIZE = 10_000
 INVENTORY_BUSY_MAX_ATTEMPTS = 3
 INVENTORY_BUSY_RETRY_SECONDS = 0.25
 INVENTORY_SNAPSHOT_SCHEMA = "mft-tier1-final1000-inventory-snapshot-v1"
+EXTERNAL_CANARY_ATTESTATION_SCHEMA = (
+    "mft-tier1-final1000-external-canary-attestation-v1"
+)
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_external_canary_attestation(
+    value: Mapping[str, Any], plan: Mapping[str, Any]
+) -> None:
+    unsigned = {key: item for key, item in value.items() if key != "sha256"}
+    stages = value.get("stage_attestations")
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "source_driver_state_schema_version",
+            "source_driver_state_sha256",
+            "source_driver_state_revision",
+            "source_driver_launch_plan_sha256",
+            "source_driver_phase",
+            "source_monitoring_capability_sha256",
+            "successor_launch_plan_sha256",
+            "gate_phase",
+            "stage_attestations",
+            "scheduler_mutation_endpoints",
+            "scheduler_post_count_delta",
+            "cancellation_performed",
+            "preemption_performed",
+            "sha256",
+        }
+        or value.get("schema_version") != EXTERNAL_CANARY_ATTESTATION_SCHEMA
+        or value.get("sha256") != canonical_sha256(unsigned)
+        or value.get("source_driver_state_schema_version")
+        != "mft-tier1-final1000-multiseed-production-driver-v2"
+        or not _is_sha256(value.get("source_driver_state_sha256"))
+        or isinstance(value.get("source_driver_state_revision"), bool)
+        or not isinstance(value.get("source_driver_state_revision"), int)
+        or int(value["source_driver_state_revision"]) < 0
+        or value.get("source_driver_launch_plan_sha256")
+        != plan.get("launch_plan_sha256")
+        or value.get("successor_launch_plan_sha256")
+        != plan.get("launch_plan_sha256")
+        or value.get("source_driver_phase")
+        not in {"batch4", "awaiting_predecessor_stop", "cutover_prepared", "refill"}
+        or not _is_sha256(value.get("source_monitoring_capability_sha256"))
+        or value.get("gate_phase") != "batch1"
+        or not isinstance(stages, dict)
+        or set(stages) != set(BY_ID)
+        or value.get("scheduler_mutation_endpoints") != []
+        or value.get("scheduler_post_count_delta") != 0
+        or value.get("cancellation_performed") is not False
+        or value.get("preemption_performed") is not False
+    ):
+        raise RuntimeError("external successor canary attestation seal mismatch")
+    task_ids: set[int] = set()
+    for stage in STAGES:
+        item = stages.get(stage.stage_id)
+        if (
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "task_id",
+                "parent_dedupe_key",
+                "task_sha256",
+                "bundle_id",
+                "seeds",
+                "scheduler_status",
+                "batch_manifest_sha256",
+                "task_status_sha256",
+                "child_receipt_sha256s",
+                "remote_evidence_sha256",
+            }
+            or isinstance(item.get("task_id"), bool)
+            or not isinstance(item.get("task_id"), int)
+            or int(item["task_id"]) <= 0
+            or int(item["task_id"]) in task_ids
+            or not str(item.get("parent_dedupe_key") or "").startswith(
+                "mft-tier1-final1000:lane:"
+            )
+            or not _is_sha256(item.get("task_sha256"))
+            or item.get("bundle_id")
+            != plan["stage_bindings"][stage.stage_id]["bundle_id"]
+            or item.get("seeds") != [stage.seed_window_end_exclusive - 5]
+            or item.get("scheduler_status") != "completed"
+            or not _is_sha256(item.get("batch_manifest_sha256"))
+            or not _is_sha256(item.get("task_status_sha256"))
+            or not isinstance(item.get("child_receipt_sha256s"), list)
+            or len(item["child_receipt_sha256s"]) != 1
+            or not all(_is_sha256(digest) for digest in item["child_receipt_sha256s"])
+            or not _is_sha256(item.get("remote_evidence_sha256"))
+        ):
+            raise RuntimeError("external successor canary stage attestation drifted")
+        task_ids.add(int(item["task_id"]))
 
 
 class SeedStatusReadBusy(RuntimeError):
@@ -747,6 +847,13 @@ def _validate_state_for_sealed_active_quotas(
             != expected_status_keys
         ):
             raise RuntimeError("final1000 rolling migration seal mismatch")
+        external_attestation = migration.get("external_canary_attestation")
+        if external_attestation is not None:
+            if not isinstance(external_attestation, Mapping):
+                raise RuntimeError(
+                    "external successor canary attestation is not an object"
+                )
+            _validate_external_canary_attestation(external_attestation, plan)
         if migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA:
             cutover_ready = (
                 migration.get("predecessor_stop_observed") is True
@@ -1019,10 +1126,21 @@ def _validate_state_for_sealed_active_quotas(
             )
             for stage in STAGES
         }
+        external_attestation_present = (
+            migration.get("external_canary_attestation") is not None
+        )
+        external_prepassed_shape = (
+            state.get("ramp_released") is True
+            and passed == set(BY_ID)
+            and all(not task_ids for task_ids in expected_canary_ids.values())
+            and expected_canary_status
+            == {stage.stage_id: "remote_preflight_passed" for stage in STAGES}
+        )
         if (
             migration.get("successor_canary_task_ids_by_stage") != expected_canary_ids
             or migration.get("successor_canary_status_by_stage")
             != expected_canary_status
+            or external_attestation_present != external_prepassed_shape
             or migration.get("predecessor_entry_count")
             != sum(
                 str(entry.get("origin") or "successor") == "predecessor"
