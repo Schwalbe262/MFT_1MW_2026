@@ -14,19 +14,28 @@ from tools import tier1_final1000_slurm_launch as launch
 from tools import tier1_final1000_stage_profiles as profiles
 
 
-def _config(parent: dict[str, Any]) -> dict[str, Any]:
+def _config(
+    parent: dict[str, Any],
+    *,
+    seed: int | None = None,
+    seed_selection_policy: str | None = None,
+) -> dict[str, Any]:
     payload = parent["payload_json"]
+    stage = profiles.BY_ID[canary.ENTRY_STAGE_ID]
+    selected_seed = (
+        int(payload["children"][0]["seed"]) if seed is None else int(seed)
+    )
+    selected_policy = seed_selection_policy or (
+        canary.LEGACY_SEED_SELECTION_POLICY
+        if selected_seed == stage.seed_window_end_exclusive - 1
+        else canary.EXPLICIT_SEED_SELECTION_POLICY
+    )
     unsigned = {
         "schema_version": canary.CONFIG_SCHEMA,
         "diagnostic_id": "test-entry-delta-shape1-v1",
         "stage_id": canary.ENTRY_STAGE_ID,
-        "seed": profiles.BY_ID[
-            canary.ENTRY_STAGE_ID
-        ].seed_window_end_exclusive
-        - 1,
-        "seed_selection_policy": (
-            "last-entry-window-seed-reserved-for-this-delta-shape1-diagnostic"
-        ),
+        "seed": selected_seed,
+        "seed_selection_policy": selected_policy,
         "expected_offload_plan_file_sha256": "1" * 64,
         "expected_bundle_id": payload["bundle_id"],
         "expected_bundle_manifest_sha256": payload["bundle_manifest_sha256"],
@@ -51,11 +60,11 @@ def _config(parent: dict[str, Any]) -> dict[str, Any]:
     return {**unsigned, "config_sha256": canary.canonical_sha256(unsigned)}
 
 
-def _package() -> tuple[dict[str, Any], dict[str, Any]]:
+def _package(*, seed: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     stage = profiles.BY_ID[canary.ENTRY_STAGE_ID]
-    seed = stage.seed_window_end_exclusive - 1
+    selected_seed = stage.seed_window_end_exclusive - 1 if seed is None else seed
     child = launch.build_stage_task(
-        _base_task(stage, seed), stage=stage, wave="refill"
+        _base_task(stage, selected_seed), stage=stage, wave="refill"
     )
     parent = phase_b.build_concurrent_batch_task([child])
     config = _config(parent)
@@ -151,6 +160,36 @@ def test_committed_entry_delta_config_is_exactly_sealed():
     )
 
 
+def test_shape1_retry_accepts_explicit_unused_seed_inside_entry_window():
+    stage = profiles.BY_ID[canary.ENTRY_STAGE_ID]
+    retry_seed = stage.seed_window_end_exclusive - 2
+    package, _publication = _package(seed=retry_seed)
+    config = _config(package["parent_task"])
+
+    assert retry_seed == 2_257_499_998
+    assert canary.validate_config(config) == config
+    assert package["seed"] == retry_seed
+    assert package["parent_task"]["payload_json"]["children"][0]["seed"] == retry_seed
+
+
+@pytest.mark.parametrize("offset", [-1, 0])
+def test_shape1_retry_rejects_seed_outside_authenticated_entry_window(offset: int):
+    stage = profiles.BY_ID[canary.ENTRY_STAGE_ID]
+    seed = (
+        stage.seed_start - 1
+        if offset < 0
+        else stage.seed_window_end_exclusive
+    )
+    package, _publication = _package()
+    config = _config(
+        package["parent_task"],
+        seed=seed,
+        seed_selection_policy=canary.EXPLICIT_SEED_SELECTION_POLICY,
+    )
+    with pytest.raises(RuntimeError, match="config seal mismatch"):
+        canary.validate_config(config)
+
+
 def test_package_uses_phase_b_parent_and_exposes_all_terminal_evidence():
     package, _publication = _package()
     sealed = canary.validate_package(package)
@@ -221,6 +260,26 @@ def test_any_prior_parent_or_logical_dedupe_fails_closed(collision: str):
             package=package,
             publication=publication,
             transport=FakeTransport(publication["ready"], events),
+            scheduler=scheduler,
+            apply=False,
+            receipt_out=None,
+        )
+    assert scheduler.post_count == 0
+
+
+def test_explicit_retry_seed_reuse_is_blocked_by_complete_namespace():
+    stage = profiles.BY_ID[canary.ENTRY_STAGE_ID]
+    package, publication = _package(seed=stage.seed_window_end_exclusive - 2)
+    row = _scheduler_row(package["parent_task"])
+    row.pop("task_json")
+    row["dedupe_key"] = package["logical_child_dedupe_key"]
+    scheduler = FakeScheduler(package["parent_task"], [], rows=[row])
+
+    with pytest.raises(RuntimeError, match="not distinct from all prior tasks"):
+        canary._submission_outcome(
+            package=package,
+            publication=publication,
+            transport=FakeTransport(publication["ready"], []),
             scheduler=scheduler,
             apply=False,
             receipt_out=None,

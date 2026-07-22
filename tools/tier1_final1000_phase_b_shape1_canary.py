@@ -116,6 +116,12 @@ FINAL1000_TASK_PREFIX = "mft-t1fg-"
 PAGE_SIZE = 10_000
 MAX_PAGES = 10_000
 DIAGNOSTIC_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{7,127}$")
+LEGACY_SEED_SELECTION_POLICY = (
+    "last-entry-window-seed-reserved-for-this-delta-shape1-diagnostic"
+)
+EXPLICIT_SEED_SELECTION_POLICY = (
+    "explicit-entry-window-seed-with-complete-namespace-dedupe-proof"
+)
 
 
 def _now() -> str:
@@ -185,14 +191,27 @@ def validate_config(value: Mapping[str, Any]) -> dict[str, Any]:
         "config_sha256",
     }
     stage = BY_ID[ENTRY_STAGE_ID]
+    seed = value.get("seed")
+    seed_policy = value.get("seed_selection_policy")
+    seed_is_in_authenticated_window = (
+        isinstance(seed, int)
+        and not isinstance(seed, bool)
+        and stage.seed_start <= seed < stage.seed_window_end_exclusive
+    )
+    seed_policy_is_valid = (
+        seed_policy == EXPLICIT_SEED_SELECTION_POLICY
+        or (
+            seed_policy == LEGACY_SEED_SELECTION_POLICY
+            and seed == stage.seed_window_end_exclusive - 1
+        )
+    )
     if (
         set(value) != required
         or value.get("schema_version") != CONFIG_SCHEMA
         or not DIAGNOSTIC_ID_PATTERN.fullmatch(str(value.get("diagnostic_id") or ""))
         or value.get("stage_id") != ENTRY_STAGE_ID
-        or value.get("seed") != stage.seed_window_end_exclusive - 1
-        or value.get("seed_selection_policy")
-        != "last-entry-window-seed-reserved-for-this-delta-shape1-diagnostic"
+        or not seed_is_in_authenticated_window
+        or not seed_policy_is_valid
         or not _is_sha256(value.get("expected_offload_plan_file_sha256"))
         or not str(value.get("expected_bundle_id") or "").startswith("current7-")
         or not _is_sha256(value.get("expected_bundle_manifest_sha256"))
