@@ -25,6 +25,15 @@ POPULATION = 320
 FIXED_PRIMARY_TURNS = 6
 TOPOLOGY_COORDINATE_INDEX = 2
 
+# With N1 fixed at six the authoritative Current7 decoder fixes N2=60 and
+# computes ``N2_side = round(60 * (u_N2_side * 0.8))`` for a repaired unit
+# coordinate.  Thus every integer N2_main in [12, 60] is legal.  SBX/PM may
+# produce any member of this finite domain even though only the seven niche
+# values below are eligible for exact-quota survival.
+LEGAL_DECODER_N2_MAIN = tuple(range(12, 61))
+ALLOWANCE_NAMES = ("temperature_C", "Llt_uH", "resonance_Hz")
+UNASSIGNED_OFFSPRING_ALLOWANCE = "zero"
+
 # The complete population is reserved.  Consequently no topology can consume
 # an unassigned remainder and the sentinel topology can never dominate again.
 TOPOLOGY_QUOTA_BY_N2_MAIN = {
@@ -175,11 +184,18 @@ def _interpolate(points: list[list[float]], generation: int) -> float:
 def optimizer_allowances(n2_main: int, generation: int) -> dict[str, float]:
     """Return finite optimizer-only allowances for one topology/generation."""
 
-    schedule = ALLOWANCE_SCHEDULES[int(n2_main)]
-    value = {
-        name: _interpolate(points, generation)
-        for name, points in schedule.items()
-    }
+    topology = int(n2_main)
+    if topology not in LEGAL_DECODER_N2_MAIN:
+        raise ValueError("N2_main escaped the fixed-N1=6 legal decoder domain")
+    schedule = ALLOWANCE_SCHEDULES.get(topology)
+    value = (
+        {name: 0.0 for name in ALLOWANCE_NAMES}
+        if schedule is None
+        else {
+            name: _interpolate(schedule[name], generation)
+            for name in ALLOWANCE_NAMES
+        }
+    )
     if any(not math.isfinite(item) or item < 0.0 for item in value.values()):
         raise RuntimeError("topology allowance schedule produced an invalid value")
     return value
@@ -244,6 +260,9 @@ def contract() -> dict[str, Any]:
             str(topology): schedule
             for topology, schedule in ALLOWANCE_SCHEDULES.items()
         },
+        "legal_decoder_N2_main_domain": list(LEGAL_DECODER_N2_MAIN),
+        "unassigned_offspring_allowance": UNASSIGNED_OFFSPRING_ALLOWANCE,
+        "unassigned_offspring_survival": "ineligible_for_exact_quota",
         "allowance_interpolation": "piecewise_linear_by_evolution_generation",
         "allowance_units": {
             "resonance_Hz": "Hz",
@@ -297,6 +316,18 @@ def validate_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         != "N2_main_36_x_N2_main_37"
         or priority.get("warm_repaired_crossover_parents") != [36, 37]
         or result.get("allowances_zero_from_generation") != 240
+        or result.get("legal_decoder_N2_main_domain")
+        != list(LEGAL_DECODER_N2_MAIN)
+        or result.get("unassigned_offspring_allowance")
+        != UNASSIGNED_OFFSPRING_ALLOWANCE
+        or result.get("unassigned_offspring_survival")
+        != "ineligible_for_exact_quota"
+        or any(
+            set(optimizer_allowances(topology, generation).values()) != {0.0}
+            for topology in LEGAL_DECODER_N2_MAIN
+            if topology not in quotas
+            for generation in (0, 1, 40, 80, 160, 239, 240, 300)
+        )
         or any(
             any(abs(item) > 0.0 for item in optimizer_allowances(topology, 240).values())
             for topology in quotas

@@ -1164,6 +1164,13 @@ def validate_child_receipt(
         "runtime_scratch_relative_path",
         "runtime_scratch_cleanup_performed",
         "shared_tmp_deleted",
+        "stdout_relative_path",
+        "stdout_sha256",
+        "stdout_size_bytes",
+        "stderr_relative_path",
+        "stderr_sha256",
+        "stderr_size_bytes",
+        "stdio_capture_complete",
         "production_eligible",
         "fea_submission_performed",
         "aedt_used",
@@ -1176,6 +1183,7 @@ def validate_child_receipt(
     wall = value.get("wall_time_seconds")
     cpu_set = value.get("cpu_set")
     child_resource_telemetry = value.get("child_resource_telemetry")
+    seed_value = value.get("seed")
     if (
         set(value) != required
         or value.get("schema_version") != CHILD_RECEIPT_SCHEMA
@@ -1199,6 +1207,15 @@ def validate_child_receipt(
         != f"seed-{value.get('seed')}/runtime"
         or value.get("runtime_scratch_cleanup_performed") is not True
         or value.get("shared_tmp_deleted") is not False
+        or value.get("stdout_relative_path")
+        != f"seed-{seed_value}/child_stdout.log"
+        or not _is_sha256(value.get("stdout_sha256"))
+        or _integer(value.get("stdout_size_bytes"), "stdout size", minimum=0) < 0
+        or value.get("stderr_relative_path")
+        != f"seed-{seed_value}/child_stderr.log"
+        or not _is_sha256(value.get("stderr_sha256"))
+        or _integer(value.get("stderr_size_bytes"), "stderr size", minimum=0) < 0
+        or value.get("stdio_capture_complete") is not True
         or not isinstance(legacy, dict)
         or value.get("legacy_status_sha256") != phase_a.canonical_sha256(legacy)
         or not _is_sha256(value.get("manifest_sha256"))

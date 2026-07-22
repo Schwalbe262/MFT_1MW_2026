@@ -89,6 +89,18 @@ def test_contract_fills_complete_population_and_terminal_allowances_are_zero():
     assert niche.optimizer_allowances(37, 40)["resonance_Hz"] == 2500.0
     assert niche.optimizer_allowances(34, 0)["temperature_C"] == 40.0
     assert niche.optimizer_allowances(34, 0)["Llt_uH"] == 1.75
+    assert contract["legal_decoder_N2_main_domain"] == list(range(12, 61))
+    assert contract["unassigned_offspring_allowance"] == "zero"
+    assert contract["unassigned_offspring_survival"] == "ineligible_for_exact_quota"
+    for topology in niche.LEGAL_DECODER_N2_MAIN:
+        allowances = niche.optimizer_allowances(topology, 0)
+        assert set(allowances) == set(niche.ALLOWANCE_NAMES)
+        if topology not in niche.TOPOLOGY_QUOTA_BY_N2_MAIN:
+            assert set(allowances.values()) == {0.0}
+    with pytest.raises(ValueError, match="legal decoder domain"):
+        niche.optimizer_allowances(11, 0)
+    with pytest.raises(ValueError, match="legal decoder domain"):
+        niche.optimizer_allowances(61, 0)
     for topology in niche.TOPOLOGY_QUOTA_BY_N2_MAIN:
         assert set(niche.optimizer_allowances(topology, 240).values()) == {0.0}
         assert set(niche.optimizer_allowances(topology, 300).values()) == {0.0}
@@ -398,12 +410,27 @@ def test_dynamic_allowance_is_optimizer_only_and_zero_for_terminal_replay():
     terminal = {}
     problem._evaluate(x, terminal)
 
+    # SBX/PM can legally mutate a niche parent to N2_main=41.  It remains a
+    # physical candidate with zero optimizer allowance and is subsequently
+    # excluded by exact-quota survival; evaluating it must never KeyError.
+    mutated = np.zeros((1, 25), dtype=float)
+    mutated[:, 2] = _coordinate(41)
+    mutated_physical = {}
+    physical(mutated, mutated_physical)
+    problem._tier1_optimizer_generation = 0
+    mutated_optimizer = {}
+    problem._evaluate(mutated, mutated_optimizer)
+
     np.testing.assert_array_equal(physical_out["G"], before)
     np.testing.assert_allclose(
         terminal["G"],
         before / np.asarray(contract["scale_vector"], dtype=float),
     )
     assert early["G"][0, 3] < terminal["G"][0, 3]
+    np.testing.assert_allclose(
+        mutated_optimizer["G"],
+        mutated_physical["G"] / np.asarray(contract["scale_vector"], dtype=float),
+    )
     assert contract["physical_hard_constraint_mutation"] is False
     assert contract["physical_objective_mutation"] is False
     assert contract["dynamic_allowances_zero_from_generation"] == 240

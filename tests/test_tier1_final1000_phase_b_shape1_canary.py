@@ -163,6 +163,8 @@ def test_package_uses_phase_b_parent_and_exposes_all_terminal_evidence():
     assert task["payload_json"]["aedt_used"] is False
     evidence = sealed["terminal_evidence"]
     assert evidence["child_receipt_path"].endswith("/seed_status.json")
+    assert evidence["child_stdout_path"].endswith("/child_stdout.log")
+    assert evidence["child_stderr_path"].endswith("/child_stderr.log")
     assert "semlock_stress_sha256" in evidence["semlock_evidence_json_pointer"]
     assert evidence["affinity_evidence_json_pointer"] == "/cpu_set"
     assert "observed_peak_rss_bytes" in evidence["rss_evidence_json_pointer"]
@@ -421,13 +423,26 @@ def test_remote_terminal_evaluator_binds_files_result_and_cpu_receipt(
     monkeypatch.setattr(canary, "SchedulerApiClient", lambda _url: CompletedScheduler())
     result_bytes = b'{"result":"ok"}\n'
     result_sha = canary.hashlib.sha256(result_bytes).hexdigest()
+    stdout_bytes = b"optimizer stdout\n"
+    stderr_bytes = b""
     manifest = {"manifest_sha256": "d" * 64}
     status = {"status_sha256": "e" * 64}
-    child = {"receipt_sha256": "f" * 64, "result_sha256": result_sha}
+    child = {
+        "receipt_sha256": "f" * 64,
+        "result_sha256": result_sha,
+        "stdout_relative_path": f"seed-{package['seed']}/child_stdout.log",
+        "stdout_sha256": canary.hashlib.sha256(stdout_bytes).hexdigest(),
+        "stdout_size_bytes": len(stdout_bytes),
+        "stderr_relative_path": f"seed-{package['seed']}/child_stderr.log",
+        "stderr_sha256": canary.hashlib.sha256(stderr_bytes).hexdigest(),
+        "stderr_size_bytes": len(stderr_bytes),
+    }
     raw_by_suffix = {
         "batch_manifest.json": json.dumps(manifest).encode(),
         "task_status.json": json.dumps(status).encode(),
         "seed_status.json": json.dumps(child).encode(),
+        "child_stdout.log": stdout_bytes,
+        "child_stderr.log": stderr_bytes,
         "result.json": result_bytes,
     }
 
@@ -465,6 +480,11 @@ def test_remote_terminal_evaluator_binds_files_result_and_cpu_receipt(
     )
     assert sealed["scheduler_status"] == "completed"
     assert sealed["remote_files"]["result"]["sha256"] == result_sha
+    assert sealed["remote_files"]["child_stdout"]["sha256"] == child[
+        "stdout_sha256"
+    ]
+    assert sealed["remote_files"]["child_stderr"]["size"] == 0
+    assert sealed["scheduler_remote_file_get_count"] == 6
     assert sealed["terminal_cpu_evidence_sha256"] == "9" * 64
     assert sealed["shape4_submission_allowed"] is True
     assert sealed["scheduler_post_count"] == 0

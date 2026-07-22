@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from typing import Any
 
 import pytest
@@ -200,6 +201,13 @@ def _completed_receipt(
             "runtime_scratch_relative_path": f"seed-{child['seed']}/runtime",
             "runtime_scratch_cleanup_performed": True,
             "shared_tmp_deleted": False,
+            "stdout_relative_path": f"seed-{child['seed']}/child_stdout.log",
+            "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+            "stdout_size_bytes": 0,
+            "stderr_relative_path": f"seed-{child['seed']}/child_stderr.log",
+            "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+            "stderr_size_bytes": 0,
+            "stdio_capture_complete": True,
             "production_eligible": False,
             "fea_submission_performed": False,
             "aedt_used": False,

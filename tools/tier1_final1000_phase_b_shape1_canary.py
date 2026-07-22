@@ -235,6 +235,8 @@ def _terminal_evidence(remote_cwd: str, seed: int) -> dict[str, Any]:
         "task_status_path": (root / "task_status.json").as_posix(),
         "legacy_child_status_path": (child / "legacy_seed_status.json").as_posix(),
         "child_receipt_path": (child / "seed_status.json").as_posix(),
+        "child_stdout_path": (child / "child_stdout.log").as_posix(),
+        "child_stderr_path": (child / "child_stderr.log").as_posix(),
         "result_path": (child / "result.json").as_posix(),
         "semlock_evidence_json_pointer": (
             "/legacy_status/phase_b_semlock_stress_sha256"
@@ -1214,6 +1216,23 @@ def evaluate_remote_terminal(
         _json_bytes_object(raw["child_receipt"], "child receipt"),
         manifest=manifest,
     )
+    for label in ("stdout", "stderr"):
+        receipt_relative = str(child_receipt[f"{label}_relative_path"])
+        relative_paths[f"child_{label}"] = f"{task_root}/{receipt_relative}"
+        stream = _remote_file_bytes(
+            scheduler_url=scheduler_url,
+            task_id=task_id,
+            relative_path=relative_paths[f"child_{label}"],
+        )
+        if (
+            len(stream) != int(child_receipt[f"{label}_size_bytes"])
+            or hashlib.sha256(stream).hexdigest()
+            != child_receipt[f"{label}_sha256"]
+        ):
+            raise RuntimeError(
+                f"remote child {label} bytes differ from child receipt seal"
+            )
+        raw[f"child_{label}"] = stream
     result_sha = child_receipt.get("result_sha256")
     result_relative = f"{task_root}/seed-{seed}/result.json"
     result_bytes = None
@@ -1264,7 +1283,7 @@ def evaluate_remote_terminal(
         "task_id": task_id,
         "scheduler_status": scheduler_status,
         "scheduler_detail_get_count": 2,
-        "scheduler_remote_file_get_count": 3 + int(result_bytes is not None),
+        "scheduler_remote_file_get_count": 5 + int(result_bytes is not None),
         "remote_files": file_records,
         "batch_manifest_sha256": manifest["manifest_sha256"],
         "task_status_sha256": task_status["status_sha256"],

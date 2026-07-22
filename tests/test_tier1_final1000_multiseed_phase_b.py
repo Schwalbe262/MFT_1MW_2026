@@ -57,6 +57,7 @@ args = parser.parse_args()
 payload = json.loads(args.payload.read_text(encoding="utf-8"))
 seed = int(payload["seed"])
 task_id = os.environ["SLURM_SCHED_TASK_ID"]
+print(f"phase-b seed {seed} stdout", flush=True)
 output = args.bundle_root / "runs" / f"task-{task_id}" / f"seed-{seed}"
 output.mkdir(parents=True, exist_ok=True)
 (output / "runtime_env.json").write_text(
@@ -112,6 +113,7 @@ if os.environ.get("PHASE_B_TEST_OMIT_SEMLOCK_ATTESTATION") != "1":
     status["phase_b_semlock_stress_sha256"] = "e" * 64
 exit_code = 0
 if failure_seed is not None and seed == int(failure_seed):
+    print("synthetic seed-local optimizer failure", file=sys.stderr, flush=True)
     status.update(
         state="failed",
         loaded_model_count=8,
@@ -131,6 +133,9 @@ else:
 (output / "legacy_seed_status.json").write_text(
     json.dumps(status, sort_keys=True), encoding="utf-8"
 )
+exit_override_seed = os.environ.get("PHASE_B_TEST_EXIT_OVERRIDE_SEED")
+if exit_override_seed is not None and seed == int(exit_override_seed):
+    exit_code = 23
 (output / "finished.txt").write_text(str(time.time()), encoding="ascii")
 raise SystemExit(exit_code)
 """
@@ -1043,6 +1048,19 @@ def test_real_four_child_concurrency_isolated_journals_and_prefix_receipts(
             child_telemetry["process_tree_cpu_seconds"]
             / child_telemetry["cpu_capacity_seconds"]
         )
+        child_dir = run_root / f"seed-{receipt['seed']}"
+        for label in ("stdout", "stderr"):
+            stream = child_dir / f"child_{label}.log"
+            assert stream.is_file()
+            assert receipt[f"{label}_relative_path"] == (
+                f"seed-{receipt['seed']}/child_{label}.log"
+            )
+            assert receipt[f"{label}_size_bytes"] == stream.stat().st_size
+            assert receipt[f"{label}_sha256"] == hashlib.sha256(
+                stream.read_bytes()
+            ).hexdigest()
+            assert not (child_dir / f"child_{label}.log.active").exists()
+        assert receipt["stdio_capture_complete"] is True
     status = contract.validate_task_status(
         json.loads((run_root / "task_status.json").read_text())
     )
@@ -1118,7 +1136,7 @@ def test_one_seed_local_failure_does_not_stop_siblings(
             task,
             monotonic=_scaled_clock(300),
         )
-        == 0
+        == runner.CHILD_FAILURE_EXIT_CODE
     )
     run_root = bundle / "runs" / "task-99401"
     receipts = [
@@ -1130,6 +1148,10 @@ def test_one_seed_local_failure_does_not_stop_siblings(
     status = json.loads((run_root / "task_status.json").read_text())
     assert status["state"] == "completed_with_failures"
     assert status["sealed_child_count"] == 4
+    failed = next(receipt for receipt in receipts if receipt["state"] == "failed")
+    stderr_path = run_root / failed["stderr_relative_path"]
+    assert "synthetic seed-local optimizer failure" in stderr_path.read_text()
+    assert failed["stderr_sha256"] == hashlib.sha256(stderr_path.read_bytes()).hexdigest()
 
 
 def test_out_of_order_completion_stays_hidden_until_prefix_and_restart_refuses(
@@ -1180,6 +1202,35 @@ def test_out_of_order_completion_stays_hidden_until_prefix_and_restart_refuses(
     )
     with pytest.raises(RuntimeError, match="new physical parent identity"):
         _run(bundle, payload_root, payload_path, task)
+
+
+def test_nonzero_process_exit_cannot_be_hidden_by_completed_child_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    bundle, payload_root, payload_path, task = _prepare(
+        tmp_path, monkeypatch, length=1, task_id=99409
+    )
+    seed = int(task["payload_json"]["children"][0]["seed"])
+    monkeypatch.setenv("PHASE_B_TEST_EXIT_OVERRIDE_SEED", str(seed))
+
+    assert (
+        _run(
+            bundle,
+            payload_root,
+            payload_path,
+            task,
+            monotonic=_scaled_clock(300),
+        )
+        == runner.LANE_FATAL_EXIT_CODE
+    )
+    run_root = bundle / "runs" / "task-99409"
+    status = json.loads((run_root / "task_status.json").read_text())
+    receipt = json.loads(
+        (run_root / f"seed-{seed}" / "seed_status.json").read_text()
+    )
+    assert status["state"] == "failed"
+    assert receipt["state"] == "refused"
+    assert "exit-code mismatch" in receipt["failure"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group signal contract")

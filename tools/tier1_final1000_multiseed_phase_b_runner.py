@@ -82,8 +82,15 @@ DEFAULT_CHILD_TERMINATION_GRACE_SECONDS = 30.0
 LANE_FATAL_EXIT_CODE = 74
 STOPPED_EXIT_CODE = 75
 CHILD_LAUNCH_FAILURE_EXIT_CODE = 76
+CHILD_FAILURE_EXIT_CODE = 77
 FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGABRT)
 LEGACY_STATUS_FILENAME = "legacy_seed_status.json"
+CHILD_STDOUT_FILENAME = "child_stdout.log"
+CHILD_STDERR_FILENAME = "child_stderr.log"
+CHILD_STDOUT_ACTIVE_FILENAME = CHILD_STDOUT_FILENAME + ".active"
+CHILD_STDERR_ACTIVE_FILENAME = CHILD_STDERR_FILENAME + ".active"
+_CHILD_STDOUT_ACTIVE_ENV = "MFT_PHASE_B_CHILD_STDOUT_ACTIVE_PATH"
+_CHILD_STDERR_ACTIVE_ENV = "MFT_PHASE_B_CHILD_STDERR_ACTIVE_PATH"
 CPU_TELEMETRY_SCHEMA = "mft-tier1-final1000-phase-b-cpu-telemetry-v1"
 
 
@@ -208,12 +215,28 @@ class ProcessLauncher(Protocol):
 def _default_process_launcher(
     *, command: Sequence[str], cwd: Path, environment: Mapping[str, str]
 ) -> ChildProcess:
+    child_environment = dict(environment)
+    try:
+        stdout_path = Path(child_environment.pop(_CHILD_STDOUT_ACTIVE_ENV))
+        stderr_path = Path(child_environment.pop(_CHILD_STDERR_ACTIVE_ENV))
+    except KeyError as exc:
+        raise RuntimeError("Phase B child stdio capture path is missing") from exc
     options: dict[str, Any] = {}
     if os.name == "posix":
         options["start_new_session"] = True
     elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    return subprocess.Popen(list(command), cwd=cwd, env=dict(environment), **options)
+    with stdout_path.open("ab", buffering=0) as stdout, stderr_path.open(
+        "ab", buffering=0
+    ) as stderr:
+        return subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            env=child_environment,
+            stdout=stdout,
+            stderr=stderr,
+            **options,
+        )
 
 
 class ProcessSetStopLatch:
@@ -320,6 +343,68 @@ def prepare_child_runtime(child_dir: Path) -> tuple[Path, dict[str, str]]:
         for name, relative in RUNTIME_ISOLATION["environment_variables"].items()
     }
     return runtime, environment
+
+
+def prepare_child_stdio(child_dir: Path) -> dict[str, str]:
+    """Create seed-owned active streams before the child can emit output."""
+
+    child_dir = child_dir.resolve(strict=True)
+    paths = {
+        _CHILD_STDOUT_ACTIVE_ENV: child_dir / CHILD_STDOUT_ACTIVE_FILENAME,
+        _CHILD_STDERR_ACTIVE_ENV: child_dir / CHILD_STDERR_ACTIVE_FILENAME,
+    }
+    final_paths = (
+        child_dir / CHILD_STDOUT_FILENAME,
+        child_dir / CHILD_STDERR_FILENAME,
+    )
+    if any(
+        path.exists() or path.is_symlink()
+        for path in (*paths.values(), *final_paths)
+    ):
+        raise RuntimeError("Phase B child stdio capture already exists")
+    for path in paths.values():
+        path.open("xb").close()
+    return {name: str(path) for name, path in paths.items()}
+
+
+def _append_child_stderr(child_dir: Path, message: str) -> None:
+    path = child_dir.resolve(strict=True) / CHILD_STDERR_ACTIVE_FILENAME
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("Phase B active child stderr capture drifted")
+    with path.open("ab", buffering=0) as stream:
+        stream.write(
+            (str(message).rstrip("\n") + "\n").encode(
+                "utf-8", errors="replace"
+            )
+        )
+
+
+def finalize_child_stdio(child_dir: Path, *, seed: int) -> dict[str, Any]:
+    """Atomically publish and hash-bind reaped-child stdout and stderr."""
+
+    child_dir = child_dir.resolve(strict=True)
+    if child_dir.name != f"seed-{int(seed)}":
+        raise RuntimeError("Phase B child stdio seed directory drifted")
+    evidence: dict[str, Any] = {"stdio_capture_complete": True}
+    for label, active_name, final_name in (
+        ("stdout", CHILD_STDOUT_ACTIVE_FILENAME, CHILD_STDOUT_FILENAME),
+        ("stderr", CHILD_STDERR_ACTIVE_FILENAME, CHILD_STDERR_FILENAME),
+    ):
+        active = child_dir / active_name
+        final = child_dir / final_name
+        if (
+            active.is_symlink()
+            or not active.is_file()
+            or final.exists()
+            or final.is_symlink()
+        ):
+            raise RuntimeError(f"Phase B child {label} capture drifted")
+        active.replace(final)
+        size = final.stat().st_size
+        evidence[f"{label}_relative_path"] = f"seed-{int(seed)}/{final_name}"
+        evidence[f"{label}_sha256"] = phase_a_runner._sha256_file(final)
+        evidence[f"{label}_size_bytes"] = int(size)
+    return evidence
 
 
 def cleanup_child_runtime(child_dir: Path, runtime: Path) -> None:
@@ -467,6 +552,19 @@ def _legacy_terminal(
             None,
             "legacy child status identity/terminal seal mismatch",
         )
+    recorded_exit_code = legacy.get("exit_code")
+    if (
+        isinstance(recorded_exit_code, bool)
+        or not isinstance(recorded_exit_code, int)
+        or recorded_exit_code != int(exit_code)
+    ):
+        return (
+            legacy,
+            "refused",
+            True,
+            None,
+            "legacy child status/process exit-code mismatch",
+        )
     try:
         validate_child_resource_telemetry(
             legacy.get("phase_b_child_resource_telemetry") or {}
@@ -486,6 +584,14 @@ def _legacy_terminal(
         and all(character in "0123456789abcdef" for character in semlock_stress_sha)
     )
     if legacy.get("state") == "completed":
+        if exit_code != 0:
+            return (
+                legacy,
+                "refused",
+                True,
+                None,
+                "completed child process exited nonzero",
+            )
         if not semlock_gate_passed:
             return (
                 legacy,
@@ -703,12 +809,14 @@ def run(
                     runtime_scratch, runtime_environment = prepare_child_runtime(
                         child_dir
                     )
+                    stdio_environment = prepare_child_stdio(child_dir)
                     environment = os.environ.copy()
                     environment[PHASE_B_CHILD_MARKER_ENV] = PHASE_B_CHILD_MARKER
                     environment[PHASE_B_CHILD_CPUSET_ENV] = ",".join(
                         str(cpu) for cpu in cpu_sets[ordinal]
                     )
                     environment.update(runtime_environment)
+                    environment.update(stdio_environment)
                     launched_at = now()
                     launched_clock = duration_clock()
                     launch_clocks.append(launched_clock)
@@ -723,6 +831,10 @@ def run(
                         stop_latch.bind(process)
                     except Exception as exc:
                         exit_code = CHILD_LAUNCH_FAILURE_EXIT_CODE
+                        _append_child_stderr(
+                            child_dir,
+                            f"Phase B child launcher failed: {type(exc).__name__}:{exc}",
+                        )
                         child_wall = max(0.0, duration_clock() - launched_clock)
                         unavailable_telemetry = _unavailable_child_resource_telemetry(
                             child_wall
@@ -755,6 +867,7 @@ def run(
                             )
                         )
                         cleanup_child_runtime(child_dir, runtime_scratch)
+                        stdio_evidence = finalize_child_stdio(child_dir, seed=seed)
                         finished[ordinal] = {
                             "child": child,
                             "legacy": legacy,
@@ -769,6 +882,7 @@ def run(
                             "child_resource_telemetry": unavailable_telemetry,
                             "cpu_set": cpu_sets[ordinal],
                             "runtime_scratch_cleanup_performed": True,
+                            "stdio_evidence": stdio_evidence,
                         }
                         lane_fatal = True
                     else:
@@ -805,6 +919,9 @@ def run(
                     stop_reason=stop_latch.reason,
                 )
                 cleanup_child_runtime(record["child_dir"], record["runtime_scratch"])
+                stdio_evidence = finalize_child_stdio(
+                    record["child_dir"], seed=int(record["seed"])
+                )
                 finished[ordinal] = {
                     "child": child,
                     "legacy": legacy,
@@ -823,6 +940,7 @@ def run(
                     ),
                     "cpu_set": record["cpu_set"],
                     "runtime_scratch_cleanup_performed": True,
+                    "stdio_evidence": stdio_evidence,
                 }
                 del active[ordinal]
                 if child_fatal and not stop_latch.requested:
@@ -876,6 +994,7 @@ def run(
                             record["runtime_scratch_cleanup_performed"]
                         ),
                         "shared_tmp_deleted": False,
+                        **record["stdio_evidence"],
                         "production_eligible": False,
                         "fea_submission_performed": False,
                         "aedt_used": False,
@@ -950,6 +1069,8 @@ def run(
             return STOPPED_EXIT_CODE
         if lane_fatal:
             return LANE_FATAL_EXIT_CODE
+        if int(status["failed_child_count"]):
+            return CHILD_FAILURE_EXIT_CODE
         return 0
     finally:
         stop_latch.terminate_processes()
