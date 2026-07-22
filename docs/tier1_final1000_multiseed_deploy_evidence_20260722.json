@@ -1,8 +1,8 @@
 {
-  "schema_version": "mft-tier1-final1000-multiseed-deploy-local-evidence-v1",
-  "created_at_kst": "2026-07-22T14:50:00+09:00",
+  "schema_version": "mft-tier1-final1000-multiseed-deploy-local-evidence-v2",
+  "created_at_kst": "2026-07-22T15:58:00+09:00",
   "science_base_revision": "579c651b621198953f5a45ddf898a454f599e612",
-  "integration_parent_revision": "575d3d5",
+  "integration_parent_revision": "3e24c9428d5d24400bd4dbc68736848ddd5f9f43",
   "branch": "codex/final1000-multiseed-deploy-260722",
   "objective": {
     "physical_active_target": 500,
@@ -21,7 +21,8 @@
     "source_parent_gate_revision": "30811ea159c6379647291e67f1961d74bcb23658",
     "science_base_authenticated": true,
     "clean_checkout_required": true,
-    "transitive_import_closure_count": 11,
+    "transitive_import_closure_count": 21,
+    "consumer_transitive_closure_included": true,
     "isolated_import_smoke_passed": true,
     "candidate_and_delta_reproducible": true,
     "ready_reused": false,
@@ -41,8 +42,18 @@
     "scheduler_mutation_endpoints": [
       "POST /api/tasks"
     ],
-    "harvester_single_writer_handoff_integrated": false,
-    "production_cutover_ready": false
+    "driver_state_schema": "mft-tier1-final1000-multiseed-production-driver-v2",
+    "cutover_prepared_controller_export": true,
+    "cutover_prepared_refill_post_count": 0,
+    "canonical_capability_schema_v2_required": true,
+    "exact_v1_harvester_handoff_required": true,
+    "active_writer_lease_required_before_every_refill": true,
+    "consumer_poll_seconds": 15,
+    "driver_poll_seconds": 30,
+    "prior_controller_capability_is_bounded_catchup": true,
+    "harvester_single_writer_handoff_integrated": true,
+    "production_cutover_ready": true,
+    "production_cutover_performed": false
   },
   "live_read_only_probe": {
     "fixture": "tests/fixtures/tier1_final1000_live_v3_chain.json",
@@ -64,6 +75,7 @@
   "crash_recovery": {
     "post_before_state_write_gate_recovered": true,
     "post_before_state_write_refill_recovered": true,
+    "prepared_artifact_before_state_crash_recovered": true,
     "additional_post_count_after_restart": 0,
     "duplicate_seed_count": 0,
     "exact_scheduler_task_id_recovered": true,
@@ -71,22 +83,33 @@
   },
   "tests": {
     "command_scope": "10 Final1000/Current7 relevant test modules",
-    "passed": 162,
+    "passed": 164,
     "failed": 0,
-    "elapsed_seconds": 274.08,
+    "elapsed_seconds": 358.47,
     "live_exact_probe_passed": 1,
-    "post_crash_window_passed": 1
+    "post_crash_window_passed": 1,
+    "phase_a_passed": 25,
+    "consumer_passed": 9,
+    "invalid_consumer_receipt_classes_tested": [
+      "shadow",
+      "tampered",
+      "stale",
+      "unlocked"
+    ],
+    "isolated_consumer_import_smoke_passed": true
   },
   "static_checks": {
     "ruff": "passed",
     "py_compile": "passed"
   },
   "code_sha256": {
-    "tools/tier1_final1000_multiseed_release.py": "28a05a42b96875d14638782569bfa8df97592ee01e3253dc7ca62b4bc9453551",
-    "tools/tier1_final1000_multiseed_driver.py": "1206d16dccc9ad1642450b9abfdbf707c1b4acbfb8de84c2fea183f641457ea1",
+    "tools/tier1_final1000_multiseed_release.py": "e4d6d277995716bb417f02f4b8e155239796044180ab7ee46cf9aad45225904d",
+    "tools/tier1_final1000_multiseed_driver.py": "8508783c1932909c7e299449f5513679a9646ce37e02c5adc351f276a8f0f862",
+    "tools/tier1_final1000_multiseed_consumer.py": "493342ac5dbe74ad24aabc51b975fddc1274ecc4367ccfeebf82a0f3cc0c2381",
     "tools/tier1_final1000_multiseed_controller.py": "d3df97bf96a50c4c398e364ea1f30bcc7c0c1eb9dad7a065cf0df51434299536",
-    "tools/tier1_final1000_multiseed_harvest.py": "e06da50a006029aebbefd9b77b2d18dee7b25eedec267361b596381bc8bb4a13",
+    "tools/tier1_final1000_multiseed_harvest.py": "09b823beeefe722827cc9f6cf46df66ac642b8cbd75c23070e848d0d882940cf",
     "tools/tier1_final1000_multiseed_monitor.py": "373240901436cca10b03182a3df4882fd57c771d6c2d61a3bd9d652c06568189",
+    "tools/tier1_final1000_multiseed_status.py": "8d61f5cb1476e49ed829ce6d9450b6137438244794fccc8df3a0b7595a9b29b3",
     "tools/tier1_corrected_current7_slurm_harvest.py": "a666078fabd9287142624f5e03bfe6725a89a6f530d9d7401a296bfef2edf8c7",
     "tools/tier1_corrected_current7_slurm_seed_runner.py": "6628a0548677f2e6c871a1b041569c580a807379671c9661e49b9ef2a95d2707"
   },

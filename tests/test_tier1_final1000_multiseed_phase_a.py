@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -14,6 +15,7 @@ from tools import tier1_corrected_current7_slurm_harvest as single_harvest
 from tools import tier1_corrected_current7_slurm_seed_runner as single_runner
 from tools import tier1_corrected_generation_preflight as generation_preflight
 from tools import tier1_final1000_multiseed_contract as contract
+from tools import tier1_final1000_multiseed_consumer as consumer
 from tools import tier1_final1000_multiseed_controller as controller
 from tools import tier1_final1000_multiseed_driver as driver
 from tools import tier1_final1000_multiseed_harvest as harvest
@@ -765,6 +767,100 @@ def _monitoring_capability(tmp_path: Path) -> dict[str, Any]:
     )
 
 
+@contextmanager
+def _consumer_capability(
+    tmp_path: Path,
+    plan: dict[str, Any],
+    controller_state: dict[str, Any],
+    *,
+    publish_mode: str = "canonical",
+):
+    root = tmp_path / f"consumer-{publish_mode}"
+    runtime = root / "runtime"
+    publication = runtime if publish_mode == "canonical" else root / "shadow"
+    indexes = []
+    for stage in profiles.STAGES:
+        pointer_root = publication / "conditions" / stage.stage_id / "canonical"
+        snapshot = compact.build_compact_snapshot(
+            stage_id=stage.stage_id,
+            physical_lanes=[],
+            seed_records=[],
+            frontend_static={},
+            updated_at="2026-07-22T05:00:00+00:00",
+        )
+        compact.publish_compact_snapshot(
+            pointer_root, *snapshot, pointer_name=consumer.POINTER_NAME
+        )
+        indexes.append(
+            {
+                "stage_id": stage.stage_id,
+                "path": str((pointer_root / consumer.POINTER_NAME).resolve()),
+            }
+        )
+    inputs = consumer.ConsumerInputs(
+        plan=plan,
+        state=controller_state,
+        cohorts_by_plan_sha={},
+    )
+    inventory = consumer._condition_inventory(
+        output_root=publication,
+        inputs=inputs,
+        indexes=indexes,
+        observed_at="2026-07-22T05:00:00+00:00",
+    )
+    inventory_path = publication / "canonical" / "condition-indexes.json"
+    consumer._atomic_json(inventory_path, inventory)
+
+    handoff_path = None
+    if publish_mode == "canonical":
+        old_stop = root / "STOP_OLD_V1_HARVESTER"
+        old_stop.write_text("stopped\n", encoding="utf-8")
+        old_indexes = {}
+        for stage in profiles.STAGES:
+            path = root / "sealed-v1" / f"{stage.stage_id}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(
+                contract.json_bytes(
+                    {
+                        "schema_version": consumer.CURRENT7_INDEX_SCHEMA,
+                        "final_goal_stage_id": stage.stage_id,
+                        "identity": f"sealed-{stage.stage_id}",
+                    }
+                )
+            )
+            old_indexes[stage.stage_id] = path
+        handoff = consumer.build_v1_handoff_receipt(
+            old_pid=2_000_000_000,
+            stop_file=old_stop,
+            condition_indexes=old_indexes,
+        )
+        handoff_path = root / "v1-handoff.json"
+        consumer._atomic_json(handoff_path, handoff)
+
+    result = {
+        "publish_mode": publish_mode,
+        "observed_at": "2026-07-22T05:00:00+00:00",
+        "launch_plan_sha256": plan["launch_plan_sha256"],
+        "controller_state_sha256": controller_state["state_sha256"],
+        "condition_inventory": inventory,
+    }
+    receipt_path = publication / "canonical" / "consumer-capability.json"
+    with consumer.WriterLease(
+        publication / "canonical" / "consumer-writer.lock"
+    ) as lease:
+        receipt = consumer.build_capability_receipt(
+            result=result,
+            inventory_path=inventory_path,
+            poll_seconds=15,
+            freshness_deadline_seconds=120,
+            runtime_root=runtime,
+            writer_lease=lease,
+            handoff_receipt_path=handoff_path,
+        )
+        consumer._atomic_json(receipt_path, receipt)
+        yield receipt_path, receipt
+
+
 def _running_v1_with_scheduler(
     plan: dict[str, Any], scheduler: "FakePhaseAScheduler"
 ) -> dict[str, Any]:
@@ -894,6 +990,44 @@ class PassingGateReader:
         }
 
 
+def _reach_prepared_cutover(tmp_path: Path):
+    plan = launch.validate_launch_plan(_rendered_plan())
+    capability = _monitoring_capability(tmp_path)
+    scheduler = FakePhaseAScheduler()
+    predecessor = _running_v1_with_scheduler(plan, scheduler)
+    reader = PassingGateReader(scheduler)
+    initial = driver.initial_driver_state(predecessor, plan, plan, capability)
+    batch1, _ = driver.cycle(initial, plan, capability, scheduler, reader, apply=True)
+    for dedupe in batch1["gate_lanes"]["batch1"]:
+        scheduler.rows[dedupe]["status"] = "completed"
+    batch4, _ = driver.cycle(batch1, plan, capability, scheduler, reader, apply=True)
+    for dedupe in batch4["gate_lanes"]["batch4"]:
+        scheduler.rows[dedupe]["status"] = "completed"
+    awaiting, _ = driver.cycle(batch4, plan, capability, scheduler, reader, apply=True)
+    final_entries = copy.deepcopy(predecessor["entries"])
+    final_entries[0]["state"] = "completed"
+    scheduler.rows[final_entries[0]["dedupe_key"]]["status"] = "completed"
+    final_predecessor = single_controller._advance_state(
+        {**predecessor, "entries": final_entries, "stop_requested": True}
+    )
+    stop = driver.write_stop_file(tmp_path / "PREPARED-STOP.json", final_predecessor)
+    prepared, intents = driver.cycle(
+        awaiting,
+        plan,
+        capability,
+        scheduler,
+        reader,
+        apply=True,
+        stop=stop,
+        final_predecessor_state=final_predecessor,
+        source_plan=plan,
+    )
+    assert intents == []
+    assert prepared["phase"] == "cutover_prepared"
+    assert scheduler.post_count == 8
+    return plan, capability, scheduler, reader, awaiting, prepared
+
+
 def test_production_driver_is_post0_by_default_and_gates_refill_until_two_waves(
     tmp_path: Path,
 ):
@@ -901,9 +1035,7 @@ def test_production_driver_is_post0_by_default_and_gates_refill_until_two_waves(
     capability = _monitoring_capability(tmp_path)
     scheduler = FakePhaseAScheduler()
     predecessor = _running_v1_with_scheduler(plan, scheduler)
-    state = driver.initial_driver_state(
-        predecessor, plan, plan, capability
-    )
+    state = driver.initial_driver_state(predecessor, plan, plan, capability)
     reader = PassingGateReader(scheduler)
 
     preview, intents = driver.cycle(
@@ -925,7 +1057,10 @@ def test_production_driver_is_post0_by_default_and_gates_refill_until_two_waves(
     assert applied["phase"] == "batch1"
     assert applied["refill_released"] is False
     assert applied["controller_state"] is None
-    assert sum(row["status"] in {"queued", "running"} for row in scheduler.rows.values()) == 504
+    assert (
+        sum(row["status"] in {"queued", "running"} for row in scheduler.rows.values())
+        == 504
+    )
 
     unchanged, intents = driver.cycle(
         applied, plan, capability, scheduler, reader, apply=True
@@ -944,7 +1079,10 @@ def test_production_driver_is_post0_by_default_and_gates_refill_until_two_waves(
     assert len(intents) == 4
     assert {task["payload_json"]["batch_length"] for task in intents} == {4}
     assert scheduler.post_count == 8
-    assert sum(row["status"] in {"queued", "running"} for row in scheduler.rows.values()) == 504
+    assert (
+        sum(row["status"] in {"queued", "running"} for row in scheduler.rows.values())
+        == 504
+    )
 
     batch4_dedupes = set(batch4["gate_lanes"]["batch4"])
     for dedupe in batch4_dedupes:
@@ -961,9 +1099,7 @@ def test_production_driver_is_post0_by_default_and_gates_refill_until_two_waves(
     stale_predecessor = single_controller._seal_state(
         {**predecessor, "stop_requested": True}
     )
-    stale_stop = driver.write_stop_file(
-        tmp_path / "STALE-STOP.json", stale_predecessor
-    )
+    stale_stop = driver.write_stop_file(tmp_path / "STALE-STOP.json", stale_predecessor)
     with pytest.raises(RuntimeError, match="stale initial predecessor"):
         driver.cycle(
             awaiting,
@@ -992,7 +1128,7 @@ def test_production_driver_is_post0_by_default_and_gates_refill_until_two_waves(
         tmp_path / "STOP.json",
         final_predecessor,
     )
-    refill, intents = driver.cycle(
+    prepared, intents = driver.cycle(
         awaiting,
         plan,
         capability,
@@ -1003,6 +1139,24 @@ def test_production_driver_is_post0_by_default_and_gates_refill_until_two_waves(
         final_predecessor_state=final_predecessor,
         source_plan=plan,
     )
+    assert prepared["phase"] == "cutover_prepared"
+    assert prepared["refill_released"] is False
+    assert prepared["consumer_cutover_capability"] is None
+    assert intents == []
+    assert scheduler.post_count == 8
+    with _consumer_capability(tmp_path, plan, prepared["controller_state"]) as (
+        consumer_receipt,
+        _receipt,
+    ):
+        refill, intents = driver.cycle(
+            prepared,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            consumer_capability_path=consumer_receipt,
+        )
     assert refill["phase"] == "refill"
     assert refill["refill_released"] is True
     assert refill["cutover_source"]["state_sha256"] == final_predecessor["state_sha256"]
@@ -1018,13 +1172,9 @@ def test_production_driver_fails_closed_on_gate_terminal_and_capability_tamper(
     capability = _monitoring_capability(tmp_path)
     scheduler = FakePhaseAScheduler()
     predecessor = _running_v1_with_scheduler(plan, scheduler)
-    state = driver.initial_driver_state(
-        predecessor, plan, plan, capability
-    )
+    state = driver.initial_driver_state(predecessor, plan, plan, capability)
     reader = PassingGateReader(scheduler)
-    applied, _ = driver.cycle(
-        state, plan, capability, scheduler, reader, apply=True
-    )
+    applied, _ = driver.cycle(state, plan, capability, scheduler, reader, apply=True)
     first = scheduler.rows[next(iter(applied["gate_lanes"]["batch1"]))]
     first["status"] = "failed"
     failed, intents = driver.cycle(
@@ -1054,14 +1204,267 @@ def test_production_driver_fails_closed_on_gate_terminal_and_capability_tamper(
         store.load(plan, capability)
 
 
+def test_v2_gate_keeps_refill_zero_while_old_controller_and_harvester_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    plan = launch.validate_launch_plan(_rendered_plan())
+    capability = _monitoring_capability(tmp_path)
+    scheduler = FakePhaseAScheduler()
+    predecessor = _running_v1_with_scheduler(plan, scheduler)
+    state = driver.initial_driver_state(predecessor, plan, plan, capability)
+    monkeypatch.setattr(consumer, "_pid_is_running", lambda _pid: True)
+
+    preview, intents = driver.cycle(
+        state,
+        plan,
+        capability,
+        scheduler,
+        PassingGateReader(scheduler),
+        apply=False,
+    )
+    assert preview["schema_version"] == driver.DRIVER_STATE_SCHEMA
+    assert preview["refill_released"] is False
+    assert preview["controller_state"] is None
+    assert {task["payload_json"]["batch_length"] for task in intents} == {1}
+    assert scheduler.post_count == 0
+
+
+def test_consumer_gate_refuses_invalid_receipts_and_catches_up_before_refill(
+    tmp_path: Path,
+):
+    plan, capability, scheduler, reader, _awaiting, prepared = _reach_prepared_cutover(
+        tmp_path
+    )
+    posts_before = scheduler.post_count
+
+    with _consumer_capability(
+        tmp_path, plan, prepared["controller_state"], publish_mode="shadow"
+    ) as (shadow_path, _shadow):
+        with pytest.raises(RuntimeError, match="capability/freshness"):
+            driver.cycle(
+                prepared,
+                plan,
+                capability,
+                scheduler,
+                reader,
+                apply=True,
+                consumer_capability_path=shadow_path,
+            )
+    assert scheduler.post_count == posts_before
+
+    with _consumer_capability(tmp_path, plan, prepared["controller_state"]) as (
+        receipt_path,
+        receipt,
+    ):
+        tampered = copy.deepcopy(receipt)
+        tampered["run_id"] = "tampered"
+        consumer._atomic_json(receipt_path, tampered)
+        with pytest.raises(RuntimeError, match="capability/freshness"):
+            driver.cycle(
+                prepared,
+                plan,
+                capability,
+                scheduler,
+                reader,
+                apply=True,
+                consumer_capability_path=receipt_path,
+            )
+        assert scheduler.post_count == posts_before
+
+        stale = copy.deepcopy(receipt)
+        stale["published_at"] = "2000-01-01T00:00:00+00:00"
+        stale["receipt_sha256"] = contract.canonical_sha256(
+            {key: item for key, item in stale.items() if key != "receipt_sha256"}
+        )
+        consumer._atomic_json(receipt_path, stale)
+        with pytest.raises(RuntimeError, match="capability/freshness"):
+            driver.cycle(
+                prepared,
+                plan,
+                capability,
+                scheduler,
+                reader,
+                apply=True,
+                consumer_capability_path=receipt_path,
+            )
+        assert scheduler.post_count == posts_before
+
+        consumer._atomic_json(receipt_path, receipt)
+        state_path = tmp_path / "dry-run-driver-state.json"
+        driver._atomic_write(state_path, prepared)
+        state_before = state_path.read_bytes()
+        preview, intents = driver.cycle(
+            prepared,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=False,
+            consumer_capability_path=receipt_path,
+        )
+        assert preview["phase"] == "refill"
+        assert len(intents) == 1
+        assert scheduler.post_count == posts_before
+        assert state_path.read_bytes() == state_before
+
+        refill, intents = driver.cycle(
+            prepared,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            consumer_capability_path=receipt_path,
+        )
+        assert len(intents) == 1
+        assert scheduler.post_count == posts_before + 1
+
+        # The still-fresh C(n-1) capability is a normal poll race.  It pauses
+        # rather than terminating watch or allowing an unaudited refill POST.
+        catching_up, intents = driver.cycle(
+            refill,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            consumer_capability_path=receipt_path,
+        )
+        assert intents == []
+        assert catching_up["controller_state"] == refill["controller_state"]
+        assert scheduler.post_count == posts_before + 1
+
+    with pytest.raises(RuntimeError, match="writer lease"):
+        driver.cycle(
+            catching_up,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            consumer_capability_path=receipt_path,
+        )
+    assert scheduler.post_count == posts_before + 1
+
+    with _consumer_capability(tmp_path, plan, catching_up["controller_state"]) as (
+        caught_up_path,
+        caught_up_receipt,
+    ):
+        stale = copy.deepcopy(caught_up_receipt)
+        stale["published_at"] = "2000-01-01T00:00:00+00:00"
+        stale["receipt_sha256"] = contract.canonical_sha256(
+            {key: item for key, item in stale.items() if key != "receipt_sha256"}
+        )
+        consumer._atomic_json(caught_up_path, stale)
+        with pytest.raises(RuntimeError, match="capability/freshness"):
+            driver.cycle(
+                catching_up,
+                plan,
+                capability,
+                scheduler,
+                reader,
+                apply=True,
+                consumer_capability_path=caught_up_path,
+            )
+        assert scheduler.post_count == posts_before + 1
+
+        consumer._atomic_json(caught_up_path, caught_up_receipt)
+        victim = next(
+            entry
+            for entry in catching_up["controller_state"]["entries"]
+            if entry["parent_dedupe_key"] in scheduler.rows
+            and entry["state"] in controller.ACTIVE_STATES
+        )
+        scheduler.rows[victim["parent_dedupe_key"]]["status"] = "completed"
+        resumed, intents = driver.cycle(
+            catching_up,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            consumer_capability_path=caught_up_path,
+        )
+        assert resumed["phase"] == "refill"
+        assert len(intents) == 1
+        assert scheduler.post_count == posts_before + 2
+
+
+def test_prepared_controller_artifact_crash_is_restart_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    plan, capability, scheduler, reader, awaiting, prepared = _reach_prepared_cutover(
+        tmp_path
+    )
+    awaiting_root = driver._seal(
+        {
+            **{key: item for key, item in awaiting.items() if key != "state_sha256"},
+            "revision": 0,
+            "parent_state_sha256": None,
+        }
+    )
+    prepared_root = driver._seal(
+        {
+            **{key: item for key, item in prepared.items() if key != "state_sha256"},
+            "revision": 1,
+            "parent_state_sha256": awaiting_root["state_sha256"],
+        }
+    )
+    driver.validate_driver_state(awaiting_root, plan, capability)
+    driver.validate_driver_state(prepared_root, plan, capability)
+    store = driver.AtomicStateStore(tmp_path / "artifact-crash-state.json")
+    store.write(None, awaiting_root, plan, capability)
+    original_write = driver._atomic_write
+
+    def crash_before_state(path: Path, value):
+        if path == store.path:
+            raise OSError("synthetic crash before driver-state replace")
+        return original_write(path, value)
+
+    monkeypatch.setattr(driver, "_atomic_write", crash_before_state)
+    with pytest.raises(OSError, match="synthetic crash"):
+        store.write(awaiting_root, prepared_root, plan, capability)
+    assert json.loads(store.path.read_text()) == awaiting_root
+    assert (
+        json.loads(store.controller_path.read_text())
+        == prepared_root["controller_state"]
+    )
+
+    monkeypatch.setattr(driver, "_atomic_write", original_write)
+    store.write(awaiting_root, prepared_root, plan, capability)
+    assert store.load(plan, capability) == prepared_root
+
+    with _consumer_capability(tmp_path, plan, prepared_root["controller_state"]) as (
+        receipt_path,
+        _receipt,
+    ):
+        refill, _ = driver.cycle(
+            prepared_root,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            consumer_capability_path=receipt_path,
+        )
+    store.write(prepared_root, refill, plan, capability)
+    future_controller = controller.request_stop(refill["controller_state"], plan)
+    future = driver._advance_driver(
+        refill, plan, capability, controller_state=future_controller
+    )
+    monkeypatch.setattr(driver, "_atomic_write", crash_before_state)
+    with pytest.raises(OSError, match="synthetic crash"):
+        store.write(refill, future, plan, capability)
+    assert store.load(plan, capability) == refill
+    assert json.loads(store.controller_path.read_text()) == future_controller
+
+
 def test_watch_restart_keeps_500_and_never_duplicates_a_submission(tmp_path: Path):
     plan = launch.validate_launch_plan(_rendered_plan())
     capability = _monitoring_capability(tmp_path)
     scheduler = FakePhaseAScheduler()
     predecessor = _running_v1_with_scheduler(plan, scheduler)
-    initial = driver.initial_driver_state(
-        predecessor, plan, plan, capability
-    )
+    initial = driver.initial_driver_state(predecessor, plan, plan, capability)
     store = driver.AtomicStateStore(tmp_path / "watch-state.json")
     store.write(None, initial, plan, capability)
     reader = PassingGateReader(scheduler)
@@ -1079,6 +1482,7 @@ def test_watch_restart_keeps_500_and_never_duplicates_a_submission(tmp_path: Pat
         scheduler,
         reader,
         capability_loader=lambda: capability,
+        consumer_capability_path_loader=lambda: None,
         predecessor_loader=lambda: predecessor,
         predecessor_stop_loader=lambda: None,
         supervisor_stop_loader=lambda: None,
@@ -1103,7 +1507,7 @@ def test_watch_restart_keeps_500_and_never_duplicates_a_submission(tmp_path: Pat
     )
     stop = driver.write_stop_file(tmp_path / "PREDECESSOR-STOP.json", final_predecessor)
     restarted = store.load(plan, capability)
-    refill, summaries = driver.run_cycles(
+    prepared, summaries = driver.run_cycles(
         restarted,
         plan,
         plan,
@@ -1111,6 +1515,7 @@ def test_watch_restart_keeps_500_and_never_duplicates_a_submission(tmp_path: Pat
         scheduler,
         reader,
         capability_loader=lambda: capability,
+        consumer_capability_path_loader=lambda: None,
         predecessor_loader=lambda: final_predecessor,
         predecessor_stop_loader=lambda: stop,
         supervisor_stop_loader=lambda: None,
@@ -1121,29 +1526,62 @@ def test_watch_restart_keeps_500_and_never_duplicates_a_submission(tmp_path: Pat
         max_cycles=1,
         sleeper=lambda _seconds: None,
     )
+    assert prepared["phase"] == "cutover_prepared"
+    assert summaries[0]["planned_task_count"] == 0
+    assert scheduler.post_count == 8
+    assert json.loads(store.controller_path.read_text()) == prepared["controller_state"]
+
+    with _consumer_capability(tmp_path, plan, prepared["controller_state"]) as (
+        consumer_receipt,
+        _receipt,
+    ):
+        refill, summaries = driver.run_cycles(
+            store.load(plan, capability),
+            plan,
+            plan,
+            (),
+            scheduler,
+            reader,
+            capability_loader=lambda: capability,
+            consumer_capability_path_loader=lambda: consumer_receipt,
+            predecessor_loader=lambda: final_predecessor,
+            predecessor_stop_loader=lambda: stop,
+            supervisor_stop_loader=lambda: None,
+            store=store,
+            apply=True,
+            watch=True,
+            poll_seconds=0.1,
+            max_cycles=1,
+            sleeper=lambda _seconds: None,
+        )
     assert refill["phase"] == "refill"
     assert summaries[0]["physical_active_lanes"] == 500
     assert scheduler.post_count == 9
 
     restarted = store.load(plan, capability)
-    stable, summaries = driver.run_cycles(
-        restarted,
-        plan,
-        plan,
-        (),
-        scheduler,
-        reader,
-        capability_loader=lambda: capability,
-        predecessor_loader=lambda: final_predecessor,
-        predecessor_stop_loader=lambda: stop,
-        supervisor_stop_loader=lambda: None,
-        store=store,
-        apply=True,
-        watch=True,
-        poll_seconds=0.1,
-        max_cycles=1,
-        sleeper=lambda _seconds: None,
-    )
+    with _consumer_capability(tmp_path, plan, restarted["controller_state"]) as (
+        consumer_receipt,
+        _receipt,
+    ):
+        stable, summaries = driver.run_cycles(
+            restarted,
+            plan,
+            plan,
+            (),
+            scheduler,
+            reader,
+            capability_loader=lambda: capability,
+            consumer_capability_path_loader=lambda: consumer_receipt,
+            predecessor_loader=lambda: final_predecessor,
+            predecessor_stop_loader=lambda: stop,
+            supervisor_stop_loader=lambda: None,
+            store=store,
+            apply=True,
+            watch=True,
+            poll_seconds=0.1,
+            max_cycles=1,
+            sleeper=lambda _seconds: None,
+        )
     assert summaries[0]["planned_task_count"] == 0
     assert scheduler.post_count == 9
     assert driver.operational_counts(stable)["physical_active_lanes"] == 500
@@ -1199,9 +1637,7 @@ def test_post_before_state_write_crash_recovers_gate_and_refill_without_duplicat
     store.write(recovered_gate, batch4, plan, capability)
     for dedupe in batch4["gate_lanes"]["batch4"]:
         scheduler.rows[dedupe]["status"] = "completed"
-    awaiting, _ = driver.cycle(
-        batch4, plan, capability, scheduler, reader, apply=True
-    )
+    awaiting, _ = driver.cycle(batch4, plan, capability, scheduler, reader, apply=True)
     store.write(batch4, awaiting, plan, capability)
     assert scheduler.post_count == 8
 
@@ -1215,10 +1651,9 @@ def test_post_before_state_write_crash_recovers_gate_and_refill_without_duplicat
         tmp_path / "CRASH-WINDOW-PREDECESSOR-STOP.json", final_predecessor
     )
 
-    # Repeat the same crash window for the first natural refill.  The imported
-    # final state chooses the same seed, so latest10k dedupe recovers the posted
-    # row instead of consuming a second seed or issuing a second POST.
-    crashed_refill, first_refill_intents = driver.cycle(
+    # The first cutover phase persists an exact controller artifact without a
+    # refill POST, breaking the controller/canonical-consumer dependency cycle.
+    prepared, prepare_intents = driver.cycle(
         awaiting,
         plan,
         capability,
@@ -1229,22 +1664,41 @@ def test_post_before_state_write_crash_recovers_gate_and_refill_without_duplicat
         final_predecessor_state=final_predecessor,
         source_plan=plan,
     )
-    assert len(first_refill_intents) == 1
-    assert scheduler.post_count == 9
-    assert store.load(plan, capability) == awaiting
-    refill_task = first_refill_intents[0]
-    refill_task_id = scheduler.rows[refill_task["dedupe_key"]]["id"]
-    recovered_refill, recovered_refill_intents = driver.cycle(
-        store.load(plan, capability),
-        plan,
-        capability,
-        scheduler,
-        reader,
-        apply=True,
-        stop=stop,
-        final_predecessor_state=final_predecessor,
-        source_plan=plan,
-    )
+    assert prepared["phase"] == "cutover_prepared"
+    assert prepare_intents == []
+    assert scheduler.post_count == 8
+    store.write(awaiting, prepared, plan, capability)
+    assert json.loads(store.controller_path.read_text()) == prepared["controller_state"]
+
+    # Repeat the POST-before-state-write crash window for the first natural
+    # refill. latest10k dedupe recovers the exact posted row on restart.
+    with _consumer_capability(tmp_path, plan, prepared["controller_state"]) as (
+        consumer_receipt,
+        _receipt,
+    ):
+        crashed_refill, first_refill_intents = driver.cycle(
+            prepared,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            consumer_capability_path=consumer_receipt,
+        )
+        assert len(first_refill_intents) == 1
+        assert scheduler.post_count == 9
+        assert store.load(plan, capability) == prepared
+        refill_task = first_refill_intents[0]
+        refill_task_id = scheduler.rows[refill_task["dedupe_key"]]["id"]
+        recovered_refill, recovered_refill_intents = driver.cycle(
+            store.load(plan, capability),
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            consumer_capability_path=consumer_receipt,
+        )
     assert scheduler.post_count == 9
     assert recovered_refill_intents == first_refill_intents
     recovered_entry = next(

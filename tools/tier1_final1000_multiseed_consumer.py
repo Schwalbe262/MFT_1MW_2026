@@ -188,7 +188,7 @@ V1_HANDOFF_SCHEMA = "mft-tier1-final1000-v1-harvester-handoff-v1"
 STOP_HANDOFF_SCHEMA = "mft-tier1-final1000-multiseed-consumer-stop-v1"
 WRITER_LEASE_SCHEMA = "mft-tier1-final1000-multiseed-writer-lease-v1"
 MAX_POLL_SECONDS = 60.0
-DEFAULT_POLL_SECONDS = 30.0
+DEFAULT_POLL_SECONDS = 15.0
 DEFAULT_FRESHNESS_SECONDS = 120
 DEFAULT_SHADOW_NAME = "multiseed-shadow"
 POINTER_NAME = "current7-index.json"
@@ -1316,6 +1316,9 @@ def require_consumer_capability(
         inventory_value.get("schema_version") != CONDITION_INVENTORY_SCHEMA
         or inventory_value.get("inventory_sha256")
         != canonical_sha256(inventory_unsigned)
+        or inventory_value.get("launch_plan_sha256") != value.get("launch_plan_sha256")
+        or inventory_value.get("controller_state_sha256")
+        != value.get("controller_state_sha256")
         or Path(str(inventory_value.get("path_containment_root") or "")).resolve()
         != publication_root
         or {

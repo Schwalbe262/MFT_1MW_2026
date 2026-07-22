@@ -23,17 +23,29 @@ history contains science base `579c651`. For the four-stage form it also
 authenticates the immutable 30811ea release gate, all four parent plan hashes,
 and the pass-2 publication receipts.
 
-The release closure currently contains 11 repository modules:
+The release closure currently contains 21 repository modules. In addition to
+the lane execution roots it includes the production consumer and its complete
+harvest/status/monitor/controller transitive closure:
 
 - `tools/tier1_corrected_current7_receipt.py`
 - `tools/tier1_corrected_current7_slurm_bundle.py`
+- `tools/tier1_corrected_current7_slurm_controller.py`
+- `tools/tier1_corrected_current7_slurm_harvest.py`
 - `tools/tier1_corrected_current7_slurm_publish.py`
 - `tools/tier1_corrected_current7_slurm_seed_runner.py`
 - `tools/tier1_corrected_generation_adapter.py`
 - `tools/tier1_corrected_generation_preflight.py`
 - `tools/tier1_deep_crossover_contract.py`
 - `tools/tier1_final1000_multiseed_contract.py`
+- `tools/tier1_final1000_multiseed_consumer.py`
+- `tools/tier1_final1000_multiseed_controller.py`
+- `tools/tier1_final1000_multiseed_harvest.py`
 - `tools/tier1_final1000_multiseed_lane_runner.py`
+- `tools/tier1_final1000_multiseed_monitor.py`
+- `tools/tier1_final1000_multiseed_status.py`
+- `tools/tier1_final1000_rolling_migration.py`
+- `tools/tier1_final1000_slurm_controller.py`
+- `tools/tier1_final1000_slurm_harvest.py`
 - `tools/tier1_final1000_slurm_launch.py`
 - `tools/tier1_final1000_stage_profiles.py`
 
@@ -61,11 +73,14 @@ submit its tasks until a separate release authorization is given.
    Import its final SHA, revision, entry count, four exact harvest cohorts, and
    the cohort-specific 200/300-generation task envelopes. The initial shadow
    snapshot is never accepted for cutover.
-5. Require the old canonical harvester's final stop/exit/index SHA and the new
-   mixed consumer's healthy, fresh, single-writer receipt. This handoff is the
-   remaining integration blocker; refill must remain closed until its schema
-   and tests land.
-6. Release cancellation-free natural replacement to exactly 500 physical
+5. Persist `cutover_prepared` plus the exact upgraded controller export before
+   starting canonical consumption. This phase is controller-write-only and
+   performs refill POST0. Artifact-first/state-second persistence makes a
+   crash restart deterministic without an operator-authored JSON extraction.
+6. Require capability schema v2, the exact four-index v1 harvester handoff,
+   old PID exit, canonical runtime containment, and an active OS writer lease.
+   The receipt must bind the prepared controller SHA before refill is released.
+7. Release cancellation-free natural replacement to exactly 500 physical
    lanes and quotas 200/160/90/50. The driver uses only `POST /api/tasks`; it
    has no cancellation or preemption path.
 
@@ -83,6 +98,13 @@ before state persistence, restart derives the same gate/refill task and seed,
 finds its exact dedupe in latest10k, recovers the Scheduler task ID, and issues
 zero additional POSTs. A terminal gate failure, capability drift, state-chain
 tamper, missing active task, or envelope mismatch fails closed.
+
+Every refill reconcile also requires a fresh canonical capability for its
+current exported controller SHA and an active writer lease. Missing capability
+or a healthy receipt still describing C(n-1) performs reserve/POST0 while the
+15-second consumer catches the 30-second driver. Stale, shadow, tampered, or
+unlocked receipts are fatal. This prevents continued refill if UI harvesting
+has stopped.
 
 The operator stop is a sealed latch checked before the next Scheduler GET. It
 does not cancel already submitted work.

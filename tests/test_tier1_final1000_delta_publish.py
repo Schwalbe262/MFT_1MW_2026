@@ -266,6 +266,10 @@ def test_multiseed_release_preparation_uses_full_closure_and_never_reuses_ready(
     assert "tools/tier1_final1000_slurm_launch.py" in closures
     assert "tools/tier1_final1000_stage_profiles.py" in closures
     assert "tools/tier1_corrected_current7_slurm_publish.py" in closures
+    assert "tools/tier1_final1000_multiseed_consumer.py" in closures
+    assert "tools/tier1_final1000_multiseed_harvest.py" in closures
+    assert "tools/tier1_final1000_multiseed_status.py" in closures
+    assert "tools/tier1_final1000_multiseed_monitor.py" in closures
 
     receipts = []
     for ordinal in range(2):
@@ -284,9 +288,10 @@ def test_multiseed_release_preparation_uses_full_closure_and_never_reuses_ready(
         assert receipt["scheduler_submission_performed"] is False
         assert not any(path.name == "READY" for path in output.rglob("*"))
     assert receipts[0]["candidate_bundle_id"] == receipts[1]["candidate_bundle_id"]
-    assert receipts[0]["candidate_contract_sha256"] == receipts[1][
-        "candidate_contract_sha256"
-    ]
+    assert (
+        receipts[0]["candidate_contract_sha256"]
+        == receipts[1]["candidate_contract_sha256"]
+    )
     assert receipts[0]["delta_bundle_id"] == receipts[1]["delta_bundle_id"]
 
 
@@ -450,7 +455,9 @@ class FakeBatchSession:
         argv = shlex.split(command)
         assert argv[:2] == ["bash", "-lc"]
         script = argv[2]
-        set_line = next(line for line in script.splitlines() if line.startswith("set --"))
+        set_line = next(
+            line for line in script.splitlines() if line.startswith("set --")
+        )
         paths = shlex.split(set_line)[2:]
         rows = []
         for index, path in enumerate(paths):
@@ -476,9 +483,7 @@ def test_ssh_batch_records_are_command_bounded_and_complete():
     ]
     expected = {
         path: (
-            None
-            if index == 17
-            else {"size": index + 1, "sha256": f"{index + 1:064x}"}
+            None if index == 17 else {"size": index + 1, "sha256": f"{index + 1:064x}"}
         )
         for index, path in enumerate(paths)
     }
@@ -524,9 +529,7 @@ def test_inventory_batch_reader_covers_every_file_on_every_pass():
 
         def file_records(self, paths):
             self.calls.append(tuple(paths))
-            return {
-                path: files[path.removeprefix("/remote/")] for path in paths
-            }
+            return {path: files[path.removeprefix("/remote/")] for path in paths}
 
         def file_record(self, path):
             raise AssertionError(f"slow single-file fallback used for {path}")

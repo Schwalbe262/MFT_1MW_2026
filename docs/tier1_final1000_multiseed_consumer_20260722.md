@@ -45,7 +45,7 @@ explicit local-write authorization:
 python -m tools.tier1_final1000_multiseed_consumer run \
   <the same authenticated inputs> \
   --output-root <live-runtime>/multiseed-shadow \
-  --publish-mode shadow --apply --watch --poll-seconds 30
+  --publish-mode shadow --apply --watch --poll-seconds 15
 ```
 
 The 8010 backend can read each resulting
@@ -55,20 +55,30 @@ The 8010 backend can read each resulting
 ## Canonical cutover
 
 Canonical mode is intentionally unavailable while the v1 harvester owns the
-four live pointers. Cutover requires this sequence:
+four live pointers. The 15-second consumer default is half the production
+driver's 30-second reconcile interval so a newly exported controller state can
+be observed before the next refill reconcile. Cutover requires this sequence:
 
 1. Ask the v1 harvester to stop through its authenticated stop-file contract.
 2. Verify the old PID has exited and the four v1 pointers are stable.
 3. Preview a handoff receipt with `seal-v1-handoff` (write count remains zero).
 4. Repeat with `--apply` to write the exact handoff receipt.
-5. Start one canonical consumer with `--handoff-receipt`, `--apply`, and
-   `--watch`. Its nonblocking OS lease refuses a concurrent writer.
+5. Let the production driver persist `cutover_prepared` and its atomic
+   `--prepared-controller-state` export. This phase performs refill POST0.
+6. Start one canonical consumer against that exact controller export with
+   `--handoff-receipt`, `--apply`, `--watch`, and `--poll-seconds 15`. Its
+   nonblocking OS lease refuses a concurrent writer.
+7. Pass its capability path to the driver with `--consumer-capability`. Only a
+   fresh canonical receipt for the current controller SHA releases refill.
 
 Canonical publication also requires `--output-root` to equal `--runtime`.
 After each successful cycle, the consumer writes a freshness-bounded
 capability receipt that exact-binds the inventory and all four condition
-indexes. `check-capability` is the driver gate. A clean stop writes a separate
-restart handoff receipt; `--previous-stop-handoff` verifies it before the next
-writer starts.
+indexes. `check-capability` is the driver gate. The driver repeats this check
+before every new reserve/POST: a valid receipt for the prior controller SHA is
+treated as normal `capability_catching_up` and performs POST0, while stale,
+shadow, tampered, or unlocked receipts fail closed. A clean stop writes a
+separate restart handoff receipt; `--previous-stop-handoff` verifies it before
+the next writer starts.
 
 No canonical cutover or live process stop is performed by this change.

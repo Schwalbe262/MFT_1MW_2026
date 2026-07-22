@@ -24,7 +24,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 try:
     from tier1_corrected_current7_receipt import canonical_sha256
-    from tier1_corrected_current7_slurm_bundle import atomic_json, read_json, sha256_file
+    from tier1_corrected_current7_slurm_bundle import (
+        atomic_json,
+        read_json,
+        sha256_file,
+    )
     from tier1_corrected_current7_slurm_publish import load_bundle_plan
     from tier1_final1000_delta_publish import ParentIdentity, create_delta_plan
 except ImportError:  # pragma: no cover - repository import path
@@ -48,6 +52,7 @@ ROOT_MODULES = (
     "tools/tier1_corrected_current7_slurm_seed_runner.py",
     "tools/tier1_final1000_multiseed_contract.py",
     "tools/tier1_final1000_multiseed_lane_runner.py",
+    "tools/tier1_final1000_multiseed_consumer.py",
 )
 MANDATORY_CLOSURE = frozenset(
     {
@@ -123,7 +128,10 @@ def _module_candidates(
         if not parts:
             continue
         result.extend(
-            [code_root.joinpath(*parts).with_suffix(".py"), code_root.joinpath(*parts, "__init__.py")]
+            [
+                code_root.joinpath(*parts).with_suffix(".py"),
+                code_root.joinpath(*parts, "__init__.py"),
+            ]
         )
     return result
 
@@ -181,7 +189,9 @@ def repository_import_closure(
                     pending.append(dependency)
     missing = sorted(MANDATORY_CLOSURE.difference(seen))
     if missing:
-        raise RuntimeError(f"multi-seed transitive import closure is incomplete: {missing}")
+        raise RuntimeError(
+            f"multi-seed transitive import closure is incomplete: {missing}"
+        )
     return tuple(sorted(seen))
 
 
@@ -284,7 +294,9 @@ def _write_candidate(
     source_map_path = candidate_root / "local_sources.json"
     plan_path = candidate_root / "offload_plan.json"
     atomic_json(manifest_path, manifest)
-    atomic_json(source_map_path, {key: str(path) for key, path in sorted(sources.items())})
+    atomic_json(
+        source_map_path, {key: str(path) for key, path in sorted(sources.items())}
+    )
 
     plan = {
         key: copy.deepcopy(value)
@@ -422,8 +434,7 @@ def prepare_release(
     }
     stages = gate.get("stages")
     if (
-        gate.get("source_revision")
-        != "30811ea159c6379647291e67f1961d74bcb23658"
+        gate.get("source_revision") != "30811ea159c6379647291e67f1961d74bcb23658"
         or gate.get("status")
         != "passed_remote_publish_no_write_replay_and_two_pass_full_sha"
         or gate.get("evidence_sha256") != canonical_sha256(gate_unsigned)
@@ -446,7 +457,9 @@ def prepare_release(
             try:
                 path.relative_to(release_root)
             except ValueError as exc:
-                raise RuntimeError("30811ea parent evidence escaped release root") from exc
+                raise RuntimeError(
+                    "30811ea parent evidence escaped release root"
+                ) from exc
         if (
             sha256_file(plan_path) != row.get("plan_file_sha256")
             or sha256_file(publication_path) != pass2.get("receipt_file_sha256")
