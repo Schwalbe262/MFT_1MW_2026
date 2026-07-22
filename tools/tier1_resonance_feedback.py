@@ -2194,14 +2194,16 @@ def _deep_topology_components(
             epsilon = initial_epsilon * fraction * fraction
             constraints = np.asarray(pop.get("G"), dtype=float)
             positive_g = np.maximum(constraints, 0.0)
-            epsilon_excess = np.maximum(positive_g - epsilon, 0.0)
             positive_count = np.count_nonzero(
-                epsilon_excess > 0.0, axis=1
+                positive_g > 0.0, axis=1
             )
-            positive_max = epsilon_excess.max(axis=1)
-            positive_sum = epsilon_excess.sum(axis=1)
-            epsilon_feasible = np.flatnonzero(positive_count == 0)
-            epsilon_infeasible = np.flatnonzero(positive_count > 0)
+            positive_max = positive_g.max(axis=1)
+            positive_sum = positive_g.sum(axis=1)
+            # The established epsilon is an aggregate positive-G budget.
+            # Minimax pressure is only a deterministic ordering inside the
+            # population that fails that budget.
+            epsilon_feasible = np.flatnonzero(positive_sum <= epsilon)
+            epsilon_infeasible = np.flatnonzero(positive_sum > epsilon)
             global_order = []
             if len(epsilon_feasible):
                 ranked = self.ranking._do(

@@ -313,12 +313,15 @@ def topology_evolution_contract(fixed_primary_turns: int) -> dict[str, Any]:
         },
         "survival": {
             "kind": (
-                "per_constraint_normalized_positive_G_epsilon_then_"
+                "normalized_positive_G_sum_epsilon_then_"
                 "positive_count_max_sum_then_rank_crowding"
             ),
             "initial_epsilon": EPSILON_INITIAL_NORMALIZED_POSITIVE_G_SUM,
             "decay_to_zero_generation": EPSILON_DECAY_GENERATIONS,
             "terminal_epsilon": 0.0,
+            "epsilon_feasibility": (
+                "sum_normalized_positive_G_less_than_or_equal_to_epsilon"
+            ),
             "infeasible_order": (
                 "positive_constraint_count_then_max_normalized_positive_G_"
                 "then_sum_normalized_positive_G"

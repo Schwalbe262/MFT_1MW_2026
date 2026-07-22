@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from tools import tier1_deep_crossover_contract as contract
+from tools import tier1_corrected_generation_preflight as preflight
 from tools import tier1_fixed_n1_5_deep_crossover_warm_handoff as warm
 from tools import tier1_resonance_feedback as feedback
 from tools import tier1_slurm_seed_runner as runner
@@ -151,6 +152,68 @@ def test_turn_split_operators_execute_pairing_migration_and_epsilon_survival(
     ] is False
 
 
+@pytest.mark.parametrize(
+    "factory",
+    [
+        preflight.create_deep_topology_components,
+        feedback._deep_topology_components,
+    ],
+    ids=["preflight", "resonance-runtime"],
+)
+def test_epsilon_admission_remains_aggregate_before_minimax_order(factory):
+    from pymoo.core.population import Population
+    from pymoo.core.problem import Problem
+    from pymoo.core.repair import Repair
+
+    class ToyProblem(Problem):
+        def __init__(self):
+            super().__init__(
+                n_var=25,
+                n_obj=2,
+                n_ieq_constr=2,
+                xl=np.zeros(25),
+                xu=np.ones(25),
+            )
+
+        def repair_unit_coordinates(self, values):
+            return np.asarray(values, dtype=float)
+
+    class ToyRepair(Repair):
+        def _do(self, problem, values, **kwargs):
+            return np.asarray(values, dtype=float)
+
+    problem = ToyProblem()
+    topology = contract.topology_evolution_contract(6)
+    topologies = topology["turn_split_sub_islands_N2_main"]
+    copies = topology["initial_repaired_copies_per_sub_island"]
+    count = len(topologies) * copies
+    x = np.random.default_rng(1901).random((count, problem.n_var))
+    for topology_index, n2_main in enumerate(topologies):
+        start = topology_index * copies
+        x[start : start + copies, 2] = (60 - n2_main) / 48.0
+    f = np.c_[np.arange(count, dtype=float), np.arange(count, dtype=float)]
+    g = np.full((count, 2), -1.0, dtype=float)
+    g[0] = [15.0, 15.0]  # aggregate 30 > epsilon 20
+    g[1] = [19.0, -1.0]  # aggregate 19 <= epsilon 20
+    population = Population.new("X", x, "F", f, "G", g)
+    _selection, _mating, survival = factory(
+        problem, topology, ToyRepair()
+    )
+
+    survival._do(
+        problem,
+        population,
+        n_survive=count,
+        random_state=np.random.default_rng(1902),
+        algorithm=types.SimpleNamespace(n_gen=1),
+    )
+
+    assert survival.last_epsilon == 20.0
+    assert population[0].get("rank") == count - 1
+    assert population[0].get("crowding") == -15.0
+    assert population[1].get("rank") < population[0].get("rank")
+
+
 def test_warm_subset_selection_is_deterministic_and_unique():
     values = np.arange(64 * 25, dtype=float).reshape(64, 25)
     values /= values.max()
@@ -235,12 +298,15 @@ def test_turn_split_contract_has_real_pairing_migration_and_epsilon_survival(
     assert value["migration"]["migrants_per_event"] == len(topologies)
     assert value["survival"] == {
         "kind": (
-            "per_constraint_normalized_positive_G_epsilon_then_"
+            "normalized_positive_G_sum_epsilon_then_"
             "positive_count_max_sum_then_rank_crowding"
         ),
         "initial_epsilon": 20.0,
         "decay_to_zero_generation": 160,
         "terminal_epsilon": 0.0,
+        "epsilon_feasibility": (
+            "sum_normalized_positive_G_less_than_or_equal_to_epsilon"
+        ),
         "infeasible_order": (
             "positive_constraint_count_then_max_normalized_positive_G_"
             "then_sum_normalized_positive_G"
