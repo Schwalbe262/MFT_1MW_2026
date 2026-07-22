@@ -298,10 +298,17 @@ def collect_tracked_code_sources(
         raise RuntimeError(f"required current7 code is not committed: {missing}")
 
     selected = set(required_tools)
+    # ``regression_260707`` imports the repository-root ``module`` namespace
+    # at runtime (most immediately ``module.input_parameter_260706`` and its
+    # core-material contract).  A relocated bundle has no repository checkout
+    # to satisfy that import, so both runtime trees must be part of the sealed
+    # code inventory.  Selecting the complete tracked Python/JSON subtree also
+    # prevents a later lazy import from escaping the content-addressed bundle.
+    runtime_prefixes = ("regression_260707/", "module/")
     selected.update(
         item
         for item in tracked
-        if item.startswith("regression_260707/")
+        if item.startswith(runtime_prefixes)
         and PurePosixPath(item).suffix in {".py", ".json"}
     )
     selected.update(

@@ -1005,6 +1005,84 @@ def test_phase_b_bundle_build_refuses_semlock_helper_byte_drift(tmp_path):
         )
 
 
+def test_tracked_code_closure_includes_root_module_and_imports_when_relocated(
+    tmp_path,
+):
+    """The authenticated optimizer must not depend on the source checkout."""
+
+    sources = bundle_tool.collect_tracked_code_sources(
+        REPO,
+        optimizer_entrypoint="tools/tier1_corrected_generation_preflight.py",
+    )
+    tracked_module_runtime = {
+        f"artifacts/code/{relative}"
+        for relative in subprocess.run(
+            ["git", "-C", str(REPO), "ls-files", "module"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.splitlines()
+        if Path(relative).suffix in {".py", ".json"}
+    }
+    assert tracked_module_runtime
+    assert tracked_module_runtime <= set(sources)
+    assert "artifacts/code/module/input_parameter_260706.py" in sources
+    assert "artifacts/code/module/core_material_contract.py" in sources
+
+    code_root = tmp_path / "relocated" / "artifacts" / "code"
+    for relative, source in sources.items():
+        target = tmp_path / "relocated" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+    stub_site = tmp_path / "import-only-third-party-stubs"
+    (stub_site / "pymoo" / "core").mkdir(parents=True)
+    (stub_site / "pandas.py").write_text(
+        "class DataFrame: pass\nclass Series: pass\n", encoding="utf-8"
+    )
+    (stub_site / "filelock.py").write_text(
+        "class FileLock: pass\n", encoding="utf-8"
+    )
+    (stub_site / "pymoo" / "__init__.py").write_text("", encoding="utf-8")
+    (stub_site / "pymoo" / "core" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
+    (stub_site / "pymoo" / "core" / "problem.py").write_text(
+        "class Problem: pass\n", encoding="utf-8"
+    )
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import pathlib,sys; "
+                f"root=pathlib.Path({str(code_root)!r}).resolve(strict=True); "
+                "sys.path.insert(0,str(root)); "
+                f"sys.path.insert(1,{str(stub_site)!r}); "
+                "from tools.tier1_corrected_generation_preflight import "
+                "load_current7_modules; "
+                "modules=load_current7_modules(root); "
+                "assert pathlib.Path(modules.run_nsga2.__file__).resolve()."
+                "is_relative_to(root); "
+                "assert pathlib.Path(modules.input_parameter.__file__).resolve()."
+                "is_relative_to(root)"
+            ),
+        ],
+        cwd=tmp_path,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONHOME", "PYTHONPATH"}
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+
+
 def test_bundle_refuses_adapter_code_revision_mismatch_before_plan_write(tmp_path):
     fixture = _fixture(tmp_path, adapter_code_revision="4" * 40)
     plan_root = tmp_path / "mismatched-plan-must-not-exist"
