@@ -175,7 +175,102 @@ class ReadyProbe(Protocol):
 
 
 class SchedulerApiClient(Current7SchedulerApiClient):
-    """Scheduler client restricted to the final-goal task namespace."""
+    """Bounded final-goal client for the long-running watch controller."""
+
+    def _load_inventory(self) -> None:
+        query = urllib.parse.urlencode(
+            {
+                "name_prefix": TASK_NAME_PREFIX,
+                "sort_by": "id",
+                "sort_order": "desc",
+                "limit": 10_000,
+            }
+        )
+        value = self._request(f"/api/tasks?{query}")
+        if not isinstance(value, list):
+            raise RuntimeError("final1000 scheduler inventory is not a list")
+        inventory: dict[str, Mapping[str, Any]] = {}
+        task_ids: dict[int, str] = {}
+        for task in value:
+            if not isinstance(task, dict):
+                continue
+            name = str(task.get("name") or "")
+            dedupe = str(task.get("dedupe_key") or "")
+            if not name.startswith(TASK_NAME_PREFIX):
+                continue
+            if not dedupe.startswith(DEDUPE_PREFIX):
+                raise RuntimeError("final1000 namespace task has foreign dedupe key")
+            task_id = _task_id(task)
+            if task_id in task_ids and task_ids[task_id] != dedupe:
+                raise RuntimeError(
+                    "scheduler contains one final1000 task id with multiple dedupes"
+                )
+            task_ids[task_id] = dedupe
+            if dedupe in inventory and int(inventory[dedupe]["id"]) != int(task["id"]):
+                raise RuntimeError(
+                    f"scheduler contains duplicate final1000 dedupe: {dedupe}"
+                )
+            inventory[dedupe] = task
+        self._inventory = inventory
+
+    def submit_task(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        if (
+            not str(payload.get("name") or "").startswith(TASK_NAME_PREFIX)
+            or not str(payload.get("dedupe_key") or "").startswith(DEDUPE_PREFIX)
+            or "requested_allocation_id" in payload
+        ):
+            raise RuntimeError("foreign or allocation-pinned final1000 submission")
+        return super().submit_task(payload)
+
+    def list_namespace_tasks(self) -> list[Mapping[str, Any]]:
+        """Return the bounded namespace window used by watch reconciliation."""
+
+        self._load_inventory()
+        return [dict(task) for task in (self._inventory or {}).values()]
+
+    def read_seed_status(self, task_id: int) -> Mapping[str, Any] | None:
+        """Read a canary seal with bounded retry for scheduler HTTP 429.
+
+        The scheduler permits only a small number of simultaneous remote-file
+        reads. Exhausting that transient limit is not evidence that a canary
+        failed or passed, so surface a typed busy condition for the controller
+        to hold pending without terminating its watch loop.
+        """
+
+        path = f"runs/task-{int(task_id)}/seed_status.json"
+        query = urllib.parse.urlencode({"path": path, "base": "remote_cwd"})
+        request = urllib.request.Request(
+            self.base_url + f"/api/tasks/{int(task_id)}/remote-file?{query}",
+            method="GET",
+        )
+        for attempt in range(SEED_STATUS_BUSY_MAX_ATTEMPTS):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code in {404, 409}:
+                    return None
+                if exc.code == 429:
+                    if attempt + 1 < SEED_STATUS_BUSY_MAX_ATTEMPTS:
+                        time.sleep(SEED_STATUS_BUSY_RETRY_SECONDS * (attempt + 1))
+                        continue
+                    raise SeedStatusReadBusy(
+                        "scheduler remote status busy after "
+                        f"{SEED_STATUS_BUSY_MAX_ATTEMPTS} attempts: task {task_id}"
+                    ) from exc
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"scheduler remote status read failed: {detail}"
+                ) from exc
+            if not raw.strip():
+                return None
+            value = json.loads(raw.decode("utf-8"))
+            return value if isinstance(value, dict) else None
+        raise AssertionError("bounded seed-status retry loop fell through")
+
+
+class CompleteInventorySchedulerApiClient(SchedulerApiClient):
+    """One-shot, full namespace reader restricted to migration preparation."""
 
     def __init__(self, base_url: str, timeout: float = 30.0):
         super().__init__(base_url, timeout=timeout)
@@ -418,62 +513,6 @@ class SchedulerApiClient(Current7SchedulerApiClient):
             "sha256": canonical_sha256(snapshot_unsigned),
         }
         self._inventory = inventory
-
-    def submit_task(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        if (
-            not str(payload.get("name") or "").startswith(TASK_NAME_PREFIX)
-            or not str(payload.get("dedupe_key") or "").startswith(DEDUPE_PREFIX)
-            or "requested_allocation_id" in payload
-        ):
-            raise RuntimeError("foreign or allocation-pinned final1000 submission")
-        return super().submit_task(payload)
-
-    def list_namespace_tasks(self) -> list[Mapping[str, Any]]:
-        """Return the read-only final1000 inventory used by migration prep."""
-
-        self._load_inventory()
-        return [dict(task) for task in (self._inventory or {}).values()]
-
-    def read_seed_status(self, task_id: int) -> Mapping[str, Any] | None:
-        """Read a canary seal with bounded retry for scheduler HTTP 429.
-
-        The scheduler permits only a small number of simultaneous remote-file
-        reads. Exhausting that transient limit is not evidence that a canary
-        failed or passed, so surface a typed busy condition for the controller
-        to hold pending without terminating its watch loop.
-        """
-
-        path = f"runs/task-{int(task_id)}/seed_status.json"
-        query = urllib.parse.urlencode({"path": path, "base": "remote_cwd"})
-        request = urllib.request.Request(
-            self.base_url + f"/api/tasks/{int(task_id)}/remote-file?{query}",
-            method="GET",
-        )
-        for attempt in range(SEED_STATUS_BUSY_MAX_ATTEMPTS):
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    raw = response.read()
-            except urllib.error.HTTPError as exc:
-                if exc.code in {404, 409}:
-                    return None
-                if exc.code == 429:
-                    if attempt + 1 < SEED_STATUS_BUSY_MAX_ATTEMPTS:
-                        time.sleep(SEED_STATUS_BUSY_RETRY_SECONDS * (attempt + 1))
-                        continue
-                    raise SeedStatusReadBusy(
-                        "scheduler remote status busy after "
-                        f"{SEED_STATUS_BUSY_MAX_ATTEMPTS} attempts: task {task_id}"
-                    ) from exc
-                detail = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"scheduler remote status read failed: {detail}"
-                ) from exc
-            if not raw.strip():
-                return None
-            value = json.loads(raw.decode("utf-8"))
-            return value if isinstance(value, dict) else None
-        raise AssertionError("bounded seed-status retry loop fell through")
-
 
 def _seal_state(value: Mapping[str, Any]) -> dict[str, Any]:
     unsigned = {

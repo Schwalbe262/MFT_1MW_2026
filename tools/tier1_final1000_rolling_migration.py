@@ -35,7 +35,7 @@ try:
         STATE_SCHEMA,
         TASK_NAME_PREFIX,
         TERMINAL_STATES,
-        SchedulerApiClient,
+        CompleteInventorySchedulerApiClient,
         SUCCESSOR_RESOURCE_POLICY_ID,
         _scheduler_state,
         _validate_historical_resource_quota_successor_state,
@@ -78,7 +78,7 @@ except ImportError:  # pragma: no cover - repository import path
         STATE_SCHEMA,
         TASK_NAME_PREFIX,
         TERMINAL_STATES,
-        SchedulerApiClient,
+        CompleteInventorySchedulerApiClient,
         SUCCESSOR_RESOURCE_POLICY_ID,
         _scheduler_state,
         _validate_historical_resource_quota_successor_state,
@@ -1632,7 +1632,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parser().parse_args(argv)
-    scheduler = SchedulerApiClient(args.scheduler_url)
+    # Full terminal history is required exactly once while preparing a
+    # handoff.  The long-running successor controller deliberately continues
+    # to use the bounded SchedulerApiClient inventory path.
+    scheduler = CompleteInventorySchedulerApiClient(args.scheduler_url)
     with scheduler_publication_transport(
         accounts_path=args.accounts,
         scheduler_source=args.scheduler_source,

@@ -925,6 +925,61 @@ def test_seed_status_http_429_retries_are_bounded(monkeypatch):
     assert sleeps == [0.25, 0.5]
 
 
+def test_migration_cli_alone_uses_complete_inventory_reader(
+    monkeypatch, tmp_path, capsys
+):
+    constructed: list[tuple[str, object]] = []
+
+    class CompleteReader:
+        def __init__(self, scheduler_url):
+            constructed.append((scheduler_url, self))
+
+    class TransportContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    def prepare(**kwargs):
+        assert kwargs["scheduler"] is constructed[0][1]
+        return {
+            "apply": False,
+            "scheduler_post_count": 0,
+            "successor_state": {},
+        }
+
+    monkeypatch.setattr(
+        migration, "CompleteInventorySchedulerApiClient", CompleteReader
+    )
+    monkeypatch.setattr(
+        migration,
+        "scheduler_publication_transport",
+        lambda **_kwargs: TransportContext(),
+    )
+    monkeypatch.setattr(migration, "prepare_successor_state", prepare)
+    migration.main(
+        [
+            "--predecessor-plan",
+            str(tmp_path / "predecessor-plan.json"),
+            "--predecessor-state",
+            str(tmp_path / "predecessor-state.json"),
+            "--successor-plan",
+            str(tmp_path / "successor-plan.json"),
+            "--successor-state",
+            str(tmp_path / "successor-state.json"),
+            "--scheduler-url",
+            "http://scheduler:8002",
+        ]
+    )
+
+    assert constructed == [("http://scheduler:8002", constructed[0][1])]
+    assert json.loads(capsys.readouterr().out) == {
+        "apply": False,
+        "scheduler_post_count": 0,
+    }
+
+
 def test_busy_seed_status_holds_canary_pending_without_false_pass(tmp_path):
     fixture = _fixture(tmp_path)
 

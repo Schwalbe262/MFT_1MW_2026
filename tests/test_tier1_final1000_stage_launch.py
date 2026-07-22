@@ -610,8 +610,31 @@ def _inventory_page(tasks: list[dict], path: str) -> dict:
     }
 
 
-def test_scheduler_bulk_inventory_reads_every_pinned_namespace_page(monkeypatch):
+def test_watch_scheduler_inventory_remains_bounded_to_recent_10000(monkeypatch):
     client = controller.SchedulerApiClient("http://scheduler.invalid")
+    paths: list[str] = []
+
+    def request(path: str, **_kwargs):
+        paths.append(path)
+        return []
+
+    monkeypatch.setattr(client, "_request", request)
+    assert client.list_namespace_tasks() == []
+    assert len(paths) == 1
+    parsed = urllib.parse.parse_qs(paths[0].split("?", 1)[1])
+    assert parsed == {
+        "name_prefix": [controller.TASK_NAME_PREFIX],
+        "sort_by": ["id"],
+        "sort_order": ["desc"],
+        "limit": ["10000"],
+    }
+    assert not hasattr(client, "inventory_snapshot_receipt")
+
+
+def test_scheduler_bulk_inventory_reads_every_pinned_namespace_page(monkeypatch):
+    client = controller.CompleteInventorySchedulerApiClient(
+        "http://scheduler.invalid"
+    )
     tasks = [_inventory_task(task_id) for task_id in range(1, 13_006)]
     paths: list[str] = []
 
@@ -669,7 +692,9 @@ def test_scheduler_bulk_inventory_reads_every_pinned_namespace_page(monkeypatch)
 def test_scheduler_bulk_inventory_rejects_page_overlap_or_missing_id(
     monkeypatch, fault, message
 ):
-    client = controller.SchedulerApiClient("http://scheduler.invalid")
+    client = controller.CompleteInventorySchedulerApiClient(
+        "http://scheduler.invalid"
+    )
     tasks = [_inventory_task(task_id) for task_id in range(1, 10_002)]
 
     def request(path: str):
@@ -689,7 +714,9 @@ def test_scheduler_bulk_inventory_rejects_page_overlap_or_missing_id(
 
 
 def test_scheduler_bulk_inventory_rejects_unstable_snapshot_revision(monkeypatch):
-    client = controller.SchedulerApiClient("http://scheduler.invalid")
+    client = controller.CompleteInventorySchedulerApiClient(
+        "http://scheduler.invalid"
+    )
     tasks = [_inventory_task(task_id) for task_id in range(1, 10_002)]
 
     def request(path: str):
@@ -708,12 +735,17 @@ def test_scheduler_bulk_inventory_rejects_unstable_snapshot_revision(monkeypatch
 
 
 def test_scheduler_inventory_http_429_retry_is_bounded(monkeypatch):
-    client = controller.SchedulerApiClient("http://scheduler.invalid", timeout=7)
+    client = controller.CompleteInventorySchedulerApiClient(
+        "http://scheduler.invalid", timeout=7
+    )
     attempts: list[float] = []
     sleeps: list[float] = []
-    successful = _inventory_page([], controller.SchedulerApiClient._inventory_query(
-        page=1, page_size=1, before_id=0
-    ))
+    successful = _inventory_page(
+        [],
+        controller.CompleteInventorySchedulerApiClient._inventory_query(
+            page=1, page_size=1, before_id=0
+        ),
+    )
 
     def throttled_urlopen(_request, *, timeout):
         attempts.append(timeout)
