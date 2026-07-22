@@ -18,7 +18,7 @@ CONFIG_PATH = (
     Path(__file__).resolve().parents[1]
     / "docs"
     / "evidence"
-    / "tier1_final1000_resource2_canary_v4_20260723.json"
+    / "tier1_final1000_resource2_canary_v5_20260723.json"
 )
 
 
@@ -284,21 +284,21 @@ def test_sealed_config_is_exact_and_candidate_seed_is_distinct():
     assert config["candidate_memory_mb"] == 28_672
 
 
-def test_v3_config_and_package_identity_are_launch_forbidden():
+def test_v4_config_and_package_identity_are_launch_forbidden():
     old_config = json.loads(
         (
             CONFIG_PATH.parent
-            / "tier1_final1000_resource2_canary_20260723.json"
+            / "tier1_final1000_resource2_canary_v4_20260723.json"
         ).read_text(encoding="utf-8")
     )
     with pytest.raises(RuntimeError, match="config seal mismatch"):
         canary.validate_config(old_config)
     assert (
-        canary.SUPERSEDED_V3_PACKAGE_SHA256
-        == "98a16b3177a3f66f9644ee92c0bfac27304746b7e3ed3db74a59f5b8d2e3e303"
+        canary.SUPERSEDED_V4_PACKAGE_SHA256
+        == "eb8f20defeb69ce11c9aede94ccdc4d751bd492e3d2789b481e5c8fcebe311a8"
     )
-    assert canary.PACKAGE_SCHEMA.endswith("-v2")
-    assert canary.TELEMETRY_SCHEMA.endswith("-v2")
+    assert canary.PACKAGE_SCHEMA.endswith("-v3")
+    assert canary.TELEMETRY_SCHEMA.endswith("-v3")
 
 
 def test_render_fails_closed_when_baseline_files_are_absent(tmp_path: Path):
@@ -369,6 +369,14 @@ def test_candidate_is_exact_2cpu_isolated_and_uses_only_pbd6_single_runner(
         "command"
     ]
     assert "SLURM_CPUS_PER_TASK" in candidate["command"]
+    policy = canary._cgroup_memory_policy()
+    assert policy["raw_snapshot_exact_mapping_binding_required"] is True
+    assert policy["task_scope_not_assumed"] is True
+    assert policy["finite_ancestor_usage_scope_may_be_system_wide"] is True
+    assert policy["independent_process_rss_gate_required"] is True
+    gates = canary._terminal_gates()
+    assert gates["cgroup_usage_not_interpreted_as_task_rss"] is True
+    assert gates["independent_process_rss_gate_required"] is True
 
 
 def test_pbd6_runtime_hard_hash_rejects_any_runner_drift():
@@ -474,6 +482,35 @@ def test_telemetry_accepts_actual_slurm_v1_memory_hierarchy(
     sealed = canary.validate_telemetry(telemetry, package=package, task_id=90001)
     assert sealed["cgroup_after"]["cgroup_version"] == "v1"
     assert sealed["cgroup_after"]["mount_relative_path"] == "memory"
+
+
+def test_telemetry_rejects_raw_v1_diagnostics_paired_with_v2_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = _config()
+    package = _minimal_package(config, monkeypatch)
+    telemetry = _telemetry(package)
+    texts = {
+        "proc_self_cgroup": "6:memory:/slurm_n012/system\n",
+        "proc_self_mountinfo": (
+            "41 32 0:34 / /sys/fs/cgroup/memory "
+            "rw,nosuid,nodev,noexec,relatime shared:18 "
+            "- cgroup cgroup rw,memory\n"
+        ),
+    }
+    for phase in ("before", "after"):
+        for label, text in texts.items():
+            raw = text.encode("utf-8")
+            record = telemetry["cgroup_diagnostics"][phase][label]
+            record["bytes_captured"] = len(raw)
+            record["sha256"] = hashlib.sha256(raw).hexdigest()
+            record["text"] = text
+    unsigned = {
+        key: value for key, value in telemetry.items() if key != "telemetry_sha256"
+    }
+    telemetry["telemetry_sha256"] = canary.canonical_sha256(unsigned)
+    with pytest.raises(RuntimeError, match="exact raw procfs"):
+        canary.validate_telemetry(telemetry, package=package, task_id=90001)
 
 
 def test_terminal_calls_manifest_bound_result_validator_and_passes_throughput(

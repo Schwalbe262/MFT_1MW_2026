@@ -101,13 +101,13 @@ except ImportError:  # pragma: no cover - repository import path
     from tools.tier1_final1000_stage_profiles import BY_ID
 
 
-CONFIG_SCHEMA = "mft-tier1-final1000-resource2-canary-config-v2"
-PACKAGE_SCHEMA = "mft-tier1-final1000-resource2-canary-package-v2"
-SUBMISSION_SCHEMA = "mft-tier1-final1000-resource2-canary-submission-v2"
-TELEMETRY_SCHEMA = "mft-tier1-final1000-resource2-canary-telemetry-v2"
-TERMINAL_SCHEMA = "mft-tier1-final1000-resource2-canary-terminal-v2"
-REMOTE_TERMINAL_SCHEMA = "mft-tier1-final1000-resource2-canary-remote-terminal-v2"
-CANARY_PAYLOAD_SCHEMA = "mft-tier1-final1000-resource2-canary-payload-v2"
+CONFIG_SCHEMA = "mft-tier1-final1000-resource2-canary-config-v3"
+PACKAGE_SCHEMA = "mft-tier1-final1000-resource2-canary-package-v3"
+SUBMISSION_SCHEMA = "mft-tier1-final1000-resource2-canary-submission-v3"
+TELEMETRY_SCHEMA = "mft-tier1-final1000-resource2-canary-telemetry-v3"
+TERMINAL_SCHEMA = "mft-tier1-final1000-resource2-canary-terminal-v3"
+REMOTE_TERMINAL_SCHEMA = "mft-tier1-final1000-resource2-canary-remote-terminal-v3"
+CANARY_PAYLOAD_SCHEMA = "mft-tier1-final1000-resource2-canary-payload-v3"
 
 ENTRY_STAGE_ID = "entry-1200-t125"
 BASELINE_TASK_ID = 84_880
@@ -149,8 +149,8 @@ REMOTE_READ_BACKOFF_SECONDS = (0.25, 0.5, 1.0)
 HTTP_ERROR_BODY_LIMIT_BYTES = 64 * 1024
 SCHEDULER_JSON_HARD_CAP_BYTES = 64 * 1024**2
 SCHEDULER_POST_RESPONSE_HARD_CAP_BYTES = 1024**2
-SUPERSEDED_V3_PACKAGE_SHA256 = (
-    "98a16b3177a3f66f9644ee92c0bfac27304746b7e3ed3db74a59f5b8d2e3e303"
+SUPERSEDED_V4_PACKAGE_SHA256 = (
+    "eb8f20defeb69ce11c9aede94ccdc4d751bd492e3d2789b481e5c8fcebe311a8"
 )
 PBD6_RUNTIME_SHA256 = {
     "artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py": (
@@ -267,6 +267,10 @@ def _cgroup_memory_policy() -> dict[str, Any]:
         "v1_unlimited_minimum_bytes": cgroup_memory.CGROUP_V1_UNLIMITED_MIN_BYTES,
         "diagnostic_schema": cgroup_memory.CGROUP_DIAGNOSTIC_SCHEMA,
         "snapshot_schema": cgroup_memory.CGROUP_SNAPSHOT_SCHEMA,
+        "raw_snapshot_exact_mapping_binding_required": True,
+        "task_scope_not_assumed": True,
+        "finite_ancestor_usage_scope_may_be_system_wide": True,
+        "independent_process_rss_gate_required": True,
     }
     return {**unsigned, "sha256": canonical_sha256(unsigned)}
 
@@ -966,7 +970,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-SCHEMA = "mft-tier1-final1000-resource2-canary-telemetry-v2"
+SCHEMA = "mft-tier1-final1000-resource2-canary-telemetry-v3"
 THREADS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
 def now():
@@ -1305,6 +1309,9 @@ def _terminal_gates() -> dict[str, Any]:
         "finite_cgroup_memory_ancestor_required": True,
         "finite_cgroup_limit_covers_requested_memory": True,
         "cgroup_peak_within_finite_limit": True,
+        "raw_snapshot_exact_mapping_binding_required": True,
+        "cgroup_usage_not_interpreted_as_task_rss": True,
+        "independent_process_rss_gate_required": True,
         "minimum_single_seed_throughput_ratio_vs_4cpu": (
             MIN_SINGLE_SEED_THROUGHPUT_RATIO
         ),
@@ -1403,9 +1410,9 @@ def _assemble_package(
         "cgroup_memory_policy": _cgroup_memory_policy(),
         "remote_read_policy": _remote_read_policy(),
         "scheduler_client_policy": _scheduler_client_policy(),
-        "superseded_launch_forbidden_package_sha256": SUPERSEDED_V3_PACKAGE_SHA256,
+        "superseded_launch_forbidden_package_sha256": SUPERSEDED_V4_PACKAGE_SHA256,
         "superseded_launch_forbidden_reason": (
-            "v3 assumed a unique cgroup-v2 membership and cannot attest this Slurm host"
+            "v4 did not bind raw procfs diagnostics to its claimed cgroup snapshot"
         ),
         "complete_production_and_canary_namespaces_required": True,
         "post_submit_namespace_rescan_required": True,
@@ -1606,9 +1613,9 @@ def validate_package(value: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("remote_read_policy") != _remote_read_policy()
         or value.get("scheduler_client_policy") != _scheduler_client_policy()
         or value.get("superseded_launch_forbidden_package_sha256")
-        != SUPERSEDED_V3_PACKAGE_SHA256
+        != SUPERSEDED_V4_PACKAGE_SHA256
         or value.get("superseded_launch_forbidden_reason")
-        != "v3 assumed a unique cgroup-v2 membership and cannot attest this Slurm host"
+        != "v4 did not bind raw procfs diagnostics to its claimed cgroup snapshot"
         or value.get("complete_production_and_canary_namespaces_required") is not True
         or value.get("post_submit_namespace_rescan_required") is not True
         or value.get("remote_ready_reread_required") is not True
@@ -2271,6 +2278,12 @@ def validate_telemetry(
     )
     diagnostics_after = cgroup_memory.validate_cgroup_diagnostics(
         dict(diagnostics["after"])  # type: ignore[index]
+    )
+    before = cgroup_memory.validate_cgroup_snapshot_diagnostics_binding(
+        before, diagnostics_before
+    )
+    after = cgroup_memory.validate_cgroup_snapshot_diagnostics_binding(
+        after, diagnostics_after
     )
     before_selected = before["selected_finite_ancestor"]
     after_selected = after["selected_finite_ancestor"]

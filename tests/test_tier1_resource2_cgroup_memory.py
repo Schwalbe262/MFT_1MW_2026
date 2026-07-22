@@ -155,6 +155,41 @@ def test_v1_unlimited_leaf_selects_nearest_finite_parent(tmp_path: Path):
     cgroup.validate_cgroup_snapshot(snapshot)
 
 
+def test_v1_unlimited_sentinel_boundary_is_exactly_two_to_the_sixty(
+    tmp_path: Path,
+):
+    root = tmp_path / "cgroup"
+    leaf = root / "memory" / "slurm_n012" / "system"
+    parent = leaf.parent
+    _write_triplet(
+        leaf,
+        version="v1",
+        limit=str((1 << 60) - 1),
+        current=100,
+        peak=200,
+    )
+    _write_triplet(
+        parent,
+        version="v1",
+        limit="68719476736",
+        current=300,
+        peak=400,
+    )
+    finite = cgroup.cgroup_snapshot_from_text(
+        "6:memory:/slurm_n012/system\n", ACTUAL_V1_MOUNTINFO, root
+    )
+    assert finite["selected_finite_ancestor"]["depth_from_leaf"] == 0
+    assert finite["selected_finite_ancestor"]["memory_limit_bytes"] == (1 << 60) - 1
+
+    (leaf / "memory.limit_in_bytes").write_text(str(1 << 60) + "\n", encoding="ascii")
+    unbounded = cgroup.cgroup_snapshot_from_text(
+        "6:memory:/slurm_n012/system\n", ACTUAL_V1_MOUNTINFO, root
+    )
+    assert unbounded["nearest_accounting_limit_unbounded"] is True
+    assert unbounded["selected_finite_ancestor"]["depth_from_leaf"] == 1
+    cgroup.validate_cgroup_snapshot(unbounded)
+
+
 def test_v2_unbounded_leaf_and_finite_parent_are_supported(tmp_path: Path):
     root = tmp_path / "cgroup"
     leaf = root / "slurm" / "job" / "task"
@@ -312,6 +347,138 @@ def test_snapshot_validator_rejects_path_hierarchy_and_limit_mutations(
         mutation(bad)
         with pytest.raises(RuntimeError):
             cgroup.validate_cgroup_snapshot(bad)
+
+
+def test_snapshot_validator_rejects_shifted_absolute_depth_and_mount_escape(
+    tmp_path: Path,
+):
+    root = tmp_path / "cgroup"
+    leaf = root / "memory" / "slurm_n012" / "system"
+    _write_triplet(
+        leaf,
+        version="v1",
+        limit="30064771072",
+        current=100,
+        peak=200,
+    )
+    good = cgroup.cgroup_snapshot_from_text(
+        "6:memory:/slurm_n012/system\n", ACTUAL_V1_MOUNTINFO, root
+    )
+    shifted = copy.deepcopy(good)
+    shifted["ancestors"][0]["depth_from_leaf"] = 3
+    shifted["nearest_accounting_depth"] = 3
+    shifted["selected_finite_ancestor"]["depth_from_leaf"] = 3
+    with pytest.raises(RuntimeError, match="ancestor value"):
+        cgroup.validate_cgroup_snapshot(shifted)
+
+    escaped = copy.deepcopy(good)
+    escaped_record = copy.deepcopy(escaped["ancestors"][0])
+    escaped_record["depth_from_leaf"] = len(
+        PurePosixPath(escaped["leaf_relative_path"]).parts
+    )
+    escaped_record["relative_path"] = "."
+    escaped["ancestors"] = [escaped_record]
+    escaped["nearest_accounting_depth"] = escaped_record["depth_from_leaf"]
+    escaped["selected_finite_ancestor"] = copy.deepcopy(escaped_record)
+    with pytest.raises(RuntimeError, match="ancestor value"):
+        cgroup.validate_cgroup_snapshot(escaped)
+
+
+def test_raw_diagnostics_are_exactly_bound_to_v1_snapshot_and_reject_v2_mismatch(
+    tmp_path: Path,
+):
+    root = tmp_path / "cgroup"
+    _write_triplet(
+        root / "memory" / "slurm_n012" / "system",
+        version="v1",
+        limit="30064771072",
+        current=100,
+        peak=200,
+    )
+    snapshot = cgroup.cgroup_snapshot_from_text(
+        "6:memory:/slurm_n012/system\n", ACTUAL_V1_MOUNTINFO, root
+    )
+    cgroup_path = tmp_path / "proc-cgroup"
+    mountinfo_path = tmp_path / "proc-mountinfo"
+    cgroup_path.write_text("6:memory:/slurm_n012/system\n", encoding="utf-8")
+    mountinfo_path.write_text(ACTUAL_V1_MOUNTINFO, encoding="utf-8")
+    diagnostics = cgroup.capture_cgroup_diagnostics(
+        cgroup_path=cgroup_path,
+        mountinfo_path=mountinfo_path,
+    )
+    diagnostics["proc_self_cgroup"]["path"] = "/proc/self/cgroup"
+    diagnostics["proc_self_mountinfo"]["path"] = "/proc/self/mountinfo"
+    sealed = cgroup.validate_cgroup_snapshot_diagnostics_binding(
+        snapshot, diagnostics
+    )
+    assert sealed["cgroup_version"] == "v1"
+
+    mismatched = copy.deepcopy(snapshot)
+    mismatched.update(
+        {
+            "cgroup_version": "v2",
+            "hierarchy_id": 0,
+            "membership_controllers": [],
+            "limit_filename": "memory.max",
+            "current_filename": "memory.current",
+            "peak_filename": "memory.peak",
+        }
+    )
+    with pytest.raises(RuntimeError, match="exact raw procfs"):
+        cgroup.validate_cgroup_snapshot_diagnostics_binding(
+            mismatched, diagnostics
+        )
+
+
+def test_raw_diagnostics_binding_handles_hybrid_and_rejects_duplicate_mapping(
+    tmp_path: Path,
+):
+    root = tmp_path / "cgroup"
+    _write_triplet(
+        root / "memory" / "slurm_n012" / "system",
+        version="v1",
+        limit="30064771072",
+        current=100,
+        peak=200,
+    )
+    snapshot = cgroup.cgroup_snapshot_from_text(
+        "6:memory:/slurm_n012/system\n", ACTUAL_V1_MOUNTINFO, root
+    )
+    cgroup_path = tmp_path / "proc-cgroup"
+    mountinfo_path = tmp_path / "proc-mountinfo"
+    cgroup_path.write_text(
+        "0::/ignored\n6:memory:/slurm_n012/system\n", encoding="utf-8"
+    )
+    hybrid_mountinfo = (
+        "30 29 0:26 / /sys/fs/cgroup/unified rw - cgroup2 cgroup rw\n"
+        + ACTUAL_V1_MOUNTINFO
+    )
+    mountinfo_path.write_text(hybrid_mountinfo, encoding="utf-8")
+    diagnostics = cgroup.capture_cgroup_diagnostics(
+        cgroup_path=cgroup_path,
+        mountinfo_path=mountinfo_path,
+    )
+    diagnostics["proc_self_cgroup"]["path"] = "/proc/self/cgroup"
+    diagnostics["proc_self_mountinfo"]["path"] = "/proc/self/mountinfo"
+    assert (
+        cgroup.validate_cgroup_snapshot_diagnostics_binding(snapshot, diagnostics)[
+            "cgroup_version"
+        ]
+        == "v1"
+    )
+
+    duplicate_text = hybrid_mountinfo + (
+        "42 32 0:35 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n"
+    )
+    mountinfo_path.write_text(duplicate_text, encoding="utf-8")
+    duplicate = cgroup.capture_cgroup_diagnostics(
+        cgroup_path=cgroup_path,
+        mountinfo_path=mountinfo_path,
+    )
+    duplicate["proc_self_cgroup"]["path"] = "/proc/self/cgroup"
+    duplicate["proc_self_mountinfo"]["path"] = "/proc/self/mountinfo"
+    with pytest.raises(RuntimeError, match="exact raw procfs"):
+        cgroup.validate_cgroup_snapshot_diagnostics_binding(snapshot, duplicate)
 
 
 def test_bounded_raw_diagnostics_are_sealed_and_truncation_is_rejected(

@@ -533,6 +533,12 @@ def validate_cgroup_snapshot(value):
             or not isinstance(depth, int)
             or depth <= prior_depth
             or (leaf_relative != path and path not in leaf_relative.parents)
+            or depth != len(leaf_relative.parts) - len(path.parts)
+            or (
+                mount_relative != PurePosixPath(".")
+                and path != mount_relative
+                and mount_relative not in path.parents
+            )
             or (
                 prior_path is not None
                 and (path not in prior_path.parents or depth - prior_depth != len(prior_path.parts) - len(path.parts))
@@ -584,6 +590,76 @@ def validate_cgroup_snapshot(value):
     result["ancestors"] = normalized
     result["selected_finite_ancestor"] = dict(selected)
     return result
+
+
+def validate_cgroup_snapshot_diagnostics_binding(snapshot, diagnostics):
+    """Bind a sealed snapshot to exactly one raw procfs hierarchy mapping.
+
+    This deliberately does not reread remote sysfs files: terminal validation
+    may run on a different host.  The raw membership and mountinfo records do,
+    however, fully determine the hierarchy identity, mount mapping, leaf path,
+    and the set of structurally possible ancestor paths.  Requiring one exact
+    mapping prevents a self-consistent snapshot from being paired with raw
+    diagnostics from a different cgroup v1/v2 hierarchy.
+    """
+
+    sealed_snapshot = validate_cgroup_snapshot(snapshot)
+    sealed_diagnostics = validate_cgroup_diagnostics(diagnostics)
+    memberships = _parse_cgroup_memberships(
+        sealed_diagnostics["proc_self_cgroup"]["text"]
+    )
+    mounts = _parse_cgroup_mounts(
+        sealed_diagnostics["proc_self_mountinfo"]["text"]
+    )
+    logical_sysfs = PurePosixPath("/sys/fs/cgroup")
+    matches = []
+    for membership in memberships:
+        for mount in mounts:
+            if membership["version"] != mount["version"]:
+                continue
+            relative = _relative_membership(
+                membership["membership_path"], mount["mount_root"]
+            )
+            if relative is None:
+                continue
+            logical_mount = PurePosixPath(mount["mount_point"])
+            mount_relative = (
+                PurePosixPath(".")
+                if logical_mount == logical_sysfs
+                else logical_mount.relative_to(logical_sysfs)
+            )
+            leaf_relative = (
+                mount_relative
+                if relative == PurePosixPath(".")
+                else mount_relative / relative
+            )
+            identity = {
+                "cgroup_version": membership["version"],
+                "hierarchy_id": membership["hierarchy_id"],
+                "membership_controllers": list(membership["controllers"]),
+                "membership_path": membership["membership_path"],
+                "mount_root": mount["mount_root"],
+                "mount_relative_path": mount_relative.as_posix(),
+                "leaf_relative_path": leaf_relative.as_posix(),
+            }
+            if all(sealed_snapshot.get(key) == item for key, item in identity.items()):
+                matches.append(identity)
+    if len(matches) != 1:
+        raise RuntimeError(
+            "cgroup snapshot is not bound to one exact raw procfs hierarchy mapping"
+        )
+    selected = sealed_snapshot["selected_finite_ancestor"]
+    selected_path = PurePosixPath(selected["relative_path"])
+    leaf_path = PurePosixPath(sealed_snapshot["leaf_relative_path"])
+    expected_depth = len(leaf_path.parts) - len(selected_path.parts)
+    if (
+        selected["depth_from_leaf"] != expected_depth
+        or (selected_path != leaf_path and selected_path not in leaf_path.parents)
+    ):
+        raise RuntimeError(
+            "selected finite cgroup ancestor is not derivable from the raw mapping"
+        )
+    return sealed_snapshot
 
 
 _EMBEDDED_FUNCTIONS = (
