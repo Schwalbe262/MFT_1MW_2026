@@ -8,7 +8,6 @@ receipts; undeclared result files are never read or trusted.
 
 from __future__ import annotations
 
-import errno
 from typing import Any, Callable, Mapping, Sequence
 
 try:
@@ -69,12 +68,6 @@ TERMINAL_SCHEDULER_STATES = frozenset(
     {"completed", "failed", "cancelled", "timeout", "timed_out"}
 )
 HARVESTABLE_BATCH_STATES = frozenset({"running"}) | TERMINAL_SCHEDULER_STATES
-
-
-def _remote_missing(error: BaseException) -> bool:
-    return isinstance(error, FileNotFoundError) or (
-        isinstance(error, OSError) and getattr(error, "errno", None) == errno.ENOENT
-    )
 
 
 def _batch_parent_task(
@@ -189,7 +182,13 @@ def harvest_batch_lane(
     declared_sealed_count = int(task_status["sealed_child_count"])
     declared_completed = 0
     declared_failed = 0
-    for ordinal in range(int(batch_manifest["batch_length"])):
+    # The mutable task journal is the sole visibility cursor.  In particular,
+    # an immutable child receipt that lands just before the journal advances is
+    # not yet public: scanning beyond this prefix would contradict the status
+    # capability and expose a running child without an authenticated cursor.
+    # Terminal crash recovery, if introduced, needs its own sealed attestation
+    # instead of weakening this rule.
+    for ordinal in range(declared_sealed_count):
         child = parent_payload["children"][ordinal]
         seed = int(child["seed"])
         receipt_path = _remote_child(
@@ -199,17 +198,12 @@ def harvest_batch_lane(
             f"seed-{seed}",
             "seed_status.json",
         )
-        try:
-            stable_receipt = read_stable_remote_json(
-                remote,
-                account_name=account,
-                path=receipt_path,
-                maximum_bytes=MAX_STATUS_BYTES,
-            )
-        except OSError as exc:
-            if ordinal >= declared_sealed_count and _remote_missing(exc):
-                break
-            raise
+        stable_receipt = read_stable_remote_json(
+            remote,
+            account_name=account,
+            path=receipt_path,
+            maximum_bytes=MAX_STATUS_BYTES,
+        )
         if stable_receipt.stat.mode & 0o222:
             raise RuntimeError("remote batch child receipt is not immutable")
         receipt = validate_child_receipt(stable_receipt.value, manifest=batch_manifest)
@@ -329,6 +323,7 @@ def harvest_mixed_inventory(
     manifest: Mapping[str, Any],
     remote: RemoteReader,
     result_validator: Callable[..., None] = validate_current7_result,
+    cohort_contexts: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Flatten v1 terminal tasks and v2 journal progress into seed records."""
 
@@ -372,15 +367,33 @@ def harvest_mixed_inventory(
                     not in TERMINAL_SCHEDULER_STATES
                 ):
                     continue
-                observations.append(
-                    harvest_terminal_task(
-                        item,
-                        plan=plan,
-                        manifest=manifest,
-                        remote=remote,
-                        result_validator=result_validator,
-                    )
+                cohort_id = item.get("source_harvest_cohort_id")
+                selected_plan = plan
+                selected_manifest = manifest
+                if cohort_id is not None:
+                    context = (cohort_contexts or {}).get(str(cohort_id))
+                    if (
+                        not isinstance(context, dict)
+                        or not isinstance(context.get("plan"), dict)
+                        or not isinstance(context.get("manifest"), dict)
+                        or context["plan"].get("launch_plan_sha256")
+                        != item.get("source_launch_plan_sha256")
+                    ):
+                        raise RuntimeError(
+                            "v1 mixed harvest cohort context is missing or mismatched"
+                        )
+                    selected_plan = context["plan"]
+                    selected_manifest = context["manifest"]
+                observation = harvest_terminal_task(
+                    item,
+                    plan=selected_plan,
+                    manifest=selected_manifest,
+                    remote=remote,
+                    result_validator=result_validator,
                 )
+                if cohort_id is not None:
+                    observation["harvest_cohort_id"] = str(cohort_id)
+                observations.append(observation)
         except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
             refusals.append(
                 {

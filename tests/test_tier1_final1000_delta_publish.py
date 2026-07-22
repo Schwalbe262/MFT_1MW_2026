@@ -15,6 +15,7 @@ import pytest
 from tools import tier1_corrected_current7_slurm_bundle as bundle
 from tools import tier1_corrected_current7_slurm_publish as publisher
 from tools import tier1_final1000_delta_publish as delta
+from tools import tier1_final1000_multiseed_release as multiseed_release
 from tools.tier1_corrected_current7_receipt import canonical_sha256
 
 
@@ -244,6 +245,62 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
         "child_code": child_code,
         "stage_profile": stage_profile,
     }
+
+
+def test_multiseed_release_preparation_uses_full_closure_and_never_reuses_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fixture = _fixture(tmp_path / "fixture")
+    checkout = {
+        "revision": "1" * 40,
+        "clean": True,
+        "science_base_revision": multiseed_release.SCIENCE_BASE_REVISION,
+    }
+    monkeypatch.setattr(
+        multiseed_release,
+        "authenticate_checkout",
+        lambda _root: copy.deepcopy(checkout),
+    )
+    closures = multiseed_release.repository_import_closure(REPO)
+    assert multiseed_release.MANDATORY_CLOSURE.issubset(closures)
+    assert "tools/tier1_final1000_slurm_launch.py" in closures
+    assert "tools/tier1_final1000_stage_profiles.py" in closures
+    assert "tools/tier1_corrected_current7_slurm_publish.py" in closures
+
+    receipts = []
+    for ordinal in range(2):
+        output = tmp_path / f"release-{ordinal}"
+        receipt = multiseed_release.prepare_stage(
+            parent_plan_path=fixture["parent_plan_path"],
+            parent_publication_path=fixture["parent_publication_path"],
+            code_root=REPO,
+            output_root=output,
+            created_at="2026-07-22T00:00:00+00:00",
+        )
+        receipts.append(receipt)
+        assert receipt["isolated_import_smoke"]["passed"] is True
+        assert receipt["ready_reused"] is False
+        assert receipt["remote_write_performed"] is False
+        assert receipt["scheduler_submission_performed"] is False
+        assert not any(path.name == "READY" for path in output.rglob("*"))
+    assert receipts[0]["candidate_bundle_id"] == receipts[1]["candidate_bundle_id"]
+    assert receipts[0]["candidate_contract_sha256"] == receipts[1][
+        "candidate_contract_sha256"
+    ]
+    assert receipts[0]["delta_bundle_id"] == receipts[1]["delta_bundle_id"]
+
+
+def test_multiseed_release_closure_fails_if_transitive_dependency_is_missing(
+    tmp_path: Path,
+):
+    root = tmp_path / "code"
+    (root / "tools").mkdir(parents=True)
+    for relative in multiseed_release.ROOT_MODULES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("VALUE = 1\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="closure is incomplete"):
+        multiseed_release.repository_import_closure(root)
 
 
 class FakeDeltaTransport:

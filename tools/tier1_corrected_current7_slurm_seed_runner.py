@@ -582,6 +582,9 @@ def validate_result(
         or result.get("max_generations") != payload["max_generations"]
         or result.get("evaluated_generations") != payload["max_generations"]
         or result.get("completed_generations") != payload["max_generations"] + 1
+        or result.get("optimizer_processes") != 1
+        or result.get("optimizer_processes")
+        != payload.get("optimizer_processes")
         or result.get("inference_threads") != payload["inference_threads"]
         or result.get("scheduler_cpus")
         != payload.get("scheduler_cpus", payload["inference_threads"])

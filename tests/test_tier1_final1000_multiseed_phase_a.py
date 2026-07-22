@@ -15,8 +15,10 @@ from tools import tier1_corrected_current7_slurm_seed_runner as single_runner
 from tools import tier1_corrected_generation_preflight as generation_preflight
 from tools import tier1_final1000_multiseed_contract as contract
 from tools import tier1_final1000_multiseed_controller as controller
+from tools import tier1_final1000_multiseed_driver as driver
 from tools import tier1_final1000_multiseed_harvest as harvest
 from tools import tier1_final1000_multiseed_lane_runner as runner
+from tools import tier1_final1000_multiseed_monitor as monitor
 from tools import tier1_final1000_multiseed_status as compact
 from tools import tier1_final1000_slurm_controller as single_controller
 from tools import tier1_final1000_slurm_launch as launch
@@ -735,6 +737,574 @@ def test_controller_v2_reserves_four_seeds_per_physical_gap_and_maps_timeout():
         controller.reserve_lane(stopped, plan, stage_id=vacated_stage)
 
 
+def _monitoring_capability(tmp_path: Path) -> dict[str, Any]:
+    snapshot = compact.build_compact_snapshot(
+        stage_id=profiles.STAGES[0].stage_id,
+        physical_lanes=[],
+        seed_records=[],
+    )
+    snapshot_root = tmp_path / "monitor-snapshot"
+    compact.publish_compact_snapshot(snapshot_root, *snapshot)
+    backend = tmp_path / "backend.py"
+    backend.write_text("CAPABILITY = 'compact-v2'\n", encoding="utf-8")
+    evidence = tmp_path / "monitor-tests.json"
+    evidence.write_text('{"passed":true,"tests":1}\n', encoding="utf-8")
+    return monitor.build_backend_capability_receipt(
+        index_path=snapshot_root / "index.json",
+        code_files={
+            "tools/tier1_final1000_multiseed_monitor.py": Path(monitor.__file__),
+            "tools/tier1_final1000_multiseed_status.py": Path(compact.__file__),
+        },
+        code_revision="a" * 40,
+        backend_files={"regression_260707/monitor.py": backend},
+        backend_revision="b" * 40,
+        test_evidence_files={"tests/monitor.json": evidence},
+        test_revision="c" * 40,
+    )
+
+
+def _running_v1_with_scheduler(
+    plan: dict[str, Any], scheduler: "FakePhaseAScheduler"
+) -> dict[str, Any]:
+    v1 = single_controller._initial_state(plan)
+    entries = copy.deepcopy(v1["entries"])
+    index = single_controller._task_index(plan)
+    templates = single_controller._task_templates(plan)
+    for offset, entry in enumerate(entries):
+        task = single_controller._task_for_entry(
+            entry, plan_index=index, templates=templates
+        )
+        entry["state"] = "running"
+        entry["task_id"] = 880_000 + offset
+        scheduler.rows[entry["dedupe_key"]] = {
+            "id": entry["task_id"],
+            "name": task["name"],
+            "dedupe_key": task["dedupe_key"],
+            "status": "running",
+            "task_json": task,
+        }
+    return single_controller._advance_state({**v1, "entries": entries})
+
+
+class FakePhaseAScheduler:
+    def __init__(self):
+        self.rows: dict[str, dict[str, Any]] = {}
+        self.post_count = 0
+        self.next_id = 990_000
+        self.detail_reads: list[int] = []
+
+    def latest_10000(self):
+        return [copy.deepcopy(row) for row in self.rows.values()]
+
+    def task_detail(self, task_id: int):
+        self.detail_reads.append(int(task_id))
+        for row in self.rows.values():
+            if row["id"] == int(task_id):
+                return copy.deepcopy(row)
+        return None
+
+    def post_task(self, task):
+        self.post_count += 1
+        self.next_id += 1
+        row = {
+            "id": self.next_id,
+            "name": task["name"],
+            "dedupe_key": task["dedupe_key"],
+            "status": "queued",
+            "task_json": copy.deepcopy(task),
+        }
+        self.rows[task["dedupe_key"]] = row
+        return copy.deepcopy(row)
+
+
+class PassingGateReader:
+    def __init__(self, scheduler: FakePhaseAScheduler):
+        self.scheduler = scheduler
+
+    def lane_evidence(self, task_id: int, seeds):
+        row = next(row for row in self.scheduler.rows.values() if row["id"] == task_id)
+        task = row["task_json"]
+        manifest = contract.batch_manifest_from_payload(task["payload_json"])
+        receipts = []
+        for ordinal, child in enumerate(manifest["ordered_children"]):
+            legacy = {
+                "schema_version": single_contract.STATUS_SCHEMA,
+                "state": "completed",
+                "terminal": True,
+                "seed": child["seed"],
+            }
+            receipts.append(
+                contract.seal_child_receipt(
+                    {
+                        "schema_version": contract.CHILD_RECEIPT_SCHEMA,
+                        "protocol_version": contract.PROTOCOL_VERSION,
+                        "task_id": str(task_id),
+                        "manifest_sha256": manifest["manifest_sha256"],
+                        "ordinal": ordinal,
+                        "seed": child["seed"],
+                        "payload_sha256": child["payload_sha256"],
+                        "logical_dedupe_key": child["logical_dedupe_key"],
+                        "state": "completed",
+                        "terminal": True,
+                        "lane_fatal": False,
+                        "exit_code": 0,
+                        "legacy_status": legacy,
+                        "legacy_status_sha256": contract.canonical_sha256(legacy),
+                        "result_sha256": "d" * 64,
+                        "started_at": "2026-07-22T00:00:00+00:00",
+                        "finished_at": "2026-07-22T00:01:00+00:00",
+                        "wall_time_seconds": 60.0,
+                        "failure": None,
+                        "production_eligible": False,
+                        "fea_submission_performed": False,
+                        "aedt_used": False,
+                    }
+                )
+            )
+        status = contract.seal_task_status(
+            {
+                "schema_version": contract.TASK_STATUS_SCHEMA,
+                "protocol_version": contract.PROTOCOL_VERSION,
+                "task_id": str(task_id),
+                "manifest_sha256": manifest["manifest_sha256"],
+                "state": "completed",
+                "stop_requested": False,
+                "stop_reason": None,
+                "current_ordinal": None,
+                "current_seed": None,
+                "sealed_child_count": len(seeds),
+                "completed_child_count": len(seeds),
+                "failed_child_count": 0,
+                "started_at": "2026-07-22T00:00:00+00:00",
+                "updated_at": "2026-07-22T00:01:00+00:00",
+                "finished_at": "2026-07-22T00:01:00+00:00",
+                "subprocess_per_seed": True,
+                "model_context_reuse": False,
+                "scheduler_mutation_performed": False,
+                "fea_submission_performed": False,
+                "aedt_used": False,
+            }
+        )
+        return {
+            "manifest": manifest,
+            "task_status": status,
+            "child_receipts": receipts,
+        }
+
+
+def test_production_driver_is_post0_by_default_and_gates_refill_until_two_waves(
+    tmp_path: Path,
+):
+    plan = launch.validate_launch_plan(_rendered_plan())
+    capability = _monitoring_capability(tmp_path)
+    scheduler = FakePhaseAScheduler()
+    predecessor = _running_v1_with_scheduler(plan, scheduler)
+    state = driver.initial_driver_state(
+        predecessor, plan, plan, capability
+    )
+    reader = PassingGateReader(scheduler)
+
+    preview, intents = driver.cycle(
+        state, plan, capability, scheduler, reader, apply=False
+    )
+    assert scheduler.post_count == 0
+    assert len(intents) == 4
+    assert {task["payload_json"]["batch_length"] for task in intents} == {1}
+    assert preview["phase"] == "batch1"
+    assert preview["refill_released"] is False
+    assert preview["controller_state"] is None
+    assert state["source_start"]["state_sha256"] == predecessor["state_sha256"]
+
+    applied, intents = driver.cycle(
+        state, plan, capability, scheduler, reader, apply=True
+    )
+    assert len(intents) == 4
+    assert scheduler.post_count == 4
+    assert applied["phase"] == "batch1"
+    assert applied["refill_released"] is False
+    assert applied["controller_state"] is None
+    assert sum(row["status"] in {"queued", "running"} for row in scheduler.rows.values()) == 504
+
+    unchanged, intents = driver.cycle(
+        applied, plan, capability, scheduler, reader, apply=True
+    )
+    assert intents == []
+    assert scheduler.post_count == 4
+    assert unchanged["source_start"] == applied["source_start"]
+
+    for dedupe in applied["gate_lanes"]["batch1"]:
+        scheduler.rows[dedupe]["status"] = "completed"
+    batch4, intents = driver.cycle(
+        unchanged, plan, capability, scheduler, reader, apply=True
+    )
+    assert batch4["phase"] == "batch4"
+    assert batch4["refill_released"] is False
+    assert len(intents) == 4
+    assert {task["payload_json"]["batch_length"] for task in intents} == {4}
+    assert scheduler.post_count == 8
+    assert sum(row["status"] in {"queued", "running"} for row in scheduler.rows.values()) == 504
+
+    batch4_dedupes = set(batch4["gate_lanes"]["batch4"])
+    for dedupe in batch4_dedupes:
+        scheduler.rows[dedupe]["status"] = "completed"
+    awaiting, intents = driver.cycle(
+        batch4, plan, capability, scheduler, reader, apply=True
+    )
+    assert awaiting["phase"] == "awaiting_predecessor_stop"
+    assert awaiting["refill_released"] is False
+    assert awaiting["controller_state"] is None
+    assert intents == []
+    assert scheduler.post_count == 8
+
+    stale_predecessor = single_controller._seal_state(
+        {**predecessor, "stop_requested": True}
+    )
+    stale_stop = driver.write_stop_file(
+        tmp_path / "STALE-STOP.json", stale_predecessor
+    )
+    with pytest.raises(RuntimeError, match="stale initial predecessor"):
+        driver.cycle(
+            awaiting,
+            plan,
+            capability,
+            scheduler,
+            reader,
+            apply=True,
+            stop=stale_stop,
+            final_predecessor_state=stale_predecessor,
+            source_plan=plan,
+        )
+
+    final_predecessor = copy.deepcopy(predecessor)
+    final_entries = copy.deepcopy(final_predecessor["entries"])
+    final_entries[0]["state"] = "completed"
+    scheduler.rows[final_entries[0]["dedupe_key"]]["status"] = "completed"
+    final_predecessor = single_controller._advance_state(
+        {
+            **final_predecessor,
+            "entries": final_entries,
+            "stop_requested": True,
+        }
+    )
+    stop = driver.write_stop_file(
+        tmp_path / "STOP.json",
+        final_predecessor,
+    )
+    refill, intents = driver.cycle(
+        awaiting,
+        plan,
+        capability,
+        scheduler,
+        reader,
+        apply=True,
+        stop=stop,
+        final_predecessor_state=final_predecessor,
+        source_plan=plan,
+    )
+    assert refill["phase"] == "refill"
+    assert refill["refill_released"] is True
+    assert refill["cutover_source"]["state_sha256"] == final_predecessor["state_sha256"]
+    assert len(intents) == 1
+    assert scheduler.post_count == 9
+    assert controller.active_physical_count(refill["controller_state"]) == 500
+
+
+def test_production_driver_fails_closed_on_gate_terminal_and_capability_tamper(
+    tmp_path: Path,
+):
+    plan = launch.validate_launch_plan(_rendered_plan())
+    capability = _monitoring_capability(tmp_path)
+    scheduler = FakePhaseAScheduler()
+    predecessor = _running_v1_with_scheduler(plan, scheduler)
+    state = driver.initial_driver_state(
+        predecessor, plan, plan, capability
+    )
+    reader = PassingGateReader(scheduler)
+    applied, _ = driver.cycle(
+        state, plan, capability, scheduler, reader, apply=True
+    )
+    first = scheduler.rows[next(iter(applied["gate_lanes"]["batch1"]))]
+    first["status"] = "failed"
+    failed, intents = driver.cycle(
+        applied, plan, capability, scheduler, reader, apply=True
+    )
+    assert failed["phase"] == "failed"
+    assert intents == []
+    assert scheduler.post_count == 4
+
+    tampered = {**capability, "running_child_journal_visible": False}
+    tampered_unsigned = {
+        key: value for key, value in tampered.items() if key != "receipt_sha256"
+    }
+    tampered["receipt_sha256"] = contract.canonical_sha256(tampered_unsigned)
+    with pytest.raises(RuntimeError, match="capability"):
+        driver.initial_driver_state(predecessor, plan, plan, tampered)
+
+    store = driver.AtomicStateStore(tmp_path / "driver-state.json")
+    store.write(None, state, plan, capability)
+    store.write(state, applied, plan, capability)
+    assert store.load(plan, capability) == applied
+    history = store.history / f"{state['state_sha256']}.json"
+    damaged = json.loads(history.read_text())
+    damaged["phase"] = "failed"
+    history.write_text(json.dumps(damaged))
+    with pytest.raises(RuntimeError, match="state seal|ancestor"):
+        store.load(plan, capability)
+
+
+def test_watch_restart_keeps_500_and_never_duplicates_a_submission(tmp_path: Path):
+    plan = launch.validate_launch_plan(_rendered_plan())
+    capability = _monitoring_capability(tmp_path)
+    scheduler = FakePhaseAScheduler()
+    predecessor = _running_v1_with_scheduler(plan, scheduler)
+    initial = driver.initial_driver_state(
+        predecessor, plan, plan, capability
+    )
+    store = driver.AtomicStateStore(tmp_path / "watch-state.json")
+    store.write(None, initial, plan, capability)
+    reader = PassingGateReader(scheduler)
+
+    def finish_batch1(_seconds: float) -> None:
+        saved = store.load(plan, capability)
+        for dedupe in saved["gate_lanes"]["batch1"]:
+            scheduler.rows[dedupe]["status"] = "completed"
+
+    batch4, summaries = driver.run_cycles(
+        initial,
+        plan,
+        plan,
+        (),
+        scheduler,
+        reader,
+        capability_loader=lambda: capability,
+        predecessor_loader=lambda: predecessor,
+        predecessor_stop_loader=lambda: None,
+        supervisor_stop_loader=lambda: None,
+        store=store,
+        apply=True,
+        watch=True,
+        poll_seconds=0.1,
+        max_cycles=2,
+        sleeper=finish_batch1,
+    )
+    assert [item["physical_active_lanes"] for item in summaries] == [504, 504]
+    assert scheduler.post_count == 8
+    assert store.load(plan, capability) == batch4
+
+    for dedupe in batch4["gate_lanes"]["batch4"]:
+        scheduler.rows[dedupe]["status"] = "completed"
+    final_entries = copy.deepcopy(predecessor["entries"])
+    final_entries[0]["state"] = "completed"
+    scheduler.rows[final_entries[0]["dedupe_key"]]["status"] = "completed"
+    final_predecessor = single_controller._advance_state(
+        {**predecessor, "entries": final_entries, "stop_requested": True}
+    )
+    stop = driver.write_stop_file(tmp_path / "PREDECESSOR-STOP.json", final_predecessor)
+    restarted = store.load(plan, capability)
+    refill, summaries = driver.run_cycles(
+        restarted,
+        plan,
+        plan,
+        (),
+        scheduler,
+        reader,
+        capability_loader=lambda: capability,
+        predecessor_loader=lambda: final_predecessor,
+        predecessor_stop_loader=lambda: stop,
+        supervisor_stop_loader=lambda: None,
+        store=store,
+        apply=True,
+        watch=True,
+        poll_seconds=0.1,
+        max_cycles=1,
+        sleeper=lambda _seconds: None,
+    )
+    assert refill["phase"] == "refill"
+    assert summaries[0]["physical_active_lanes"] == 500
+    assert scheduler.post_count == 9
+
+    restarted = store.load(plan, capability)
+    stable, summaries = driver.run_cycles(
+        restarted,
+        plan,
+        plan,
+        (),
+        scheduler,
+        reader,
+        capability_loader=lambda: capability,
+        predecessor_loader=lambda: final_predecessor,
+        predecessor_stop_loader=lambda: stop,
+        supervisor_stop_loader=lambda: None,
+        store=store,
+        apply=True,
+        watch=True,
+        poll_seconds=0.1,
+        max_cycles=1,
+        sleeper=lambda _seconds: None,
+    )
+    assert summaries[0]["planned_task_count"] == 0
+    assert scheduler.post_count == 9
+    assert driver.operational_counts(stable)["physical_active_lanes"] == 500
+
+
+def test_post_before_state_write_crash_recovers_gate_and_refill_without_duplicate(
+    tmp_path: Path,
+):
+    plan = launch.validate_launch_plan(_rendered_plan())
+    capability = _monitoring_capability(tmp_path)
+    scheduler = FakePhaseAScheduler()
+    predecessor = _running_v1_with_scheduler(plan, scheduler)
+    initial = driver.initial_driver_state(predecessor, plan, plan, capability)
+    store = driver.AtomicStateStore(tmp_path / "crash-window-state.json")
+    store.write(None, initial, plan, capability)
+    reader = PassingGateReader(scheduler)
+
+    # Simulate death after all four POSTs return but before run_cycles writes the
+    # returned state.  Reconciliation from the old state must find the exact
+    # deterministic tasks in latest10k and recover their Scheduler ids.
+    crashed_gate, first_gate_intents = driver.cycle(
+        initial, plan, capability, scheduler, reader, apply=True
+    )
+    assert len(first_gate_intents) == 4
+    assert scheduler.post_count == 4
+    assert store.load(plan, capability) == initial
+    gate_task_ids = {
+        task["dedupe_key"]: scheduler.rows[task["dedupe_key"]]["id"]
+        for task in first_gate_intents
+    }
+    recovered_gate, recovered_gate_intents = driver.cycle(
+        store.load(plan, capability),
+        plan,
+        capability,
+        scheduler,
+        reader,
+        apply=True,
+    )
+    assert scheduler.post_count == 4
+    assert recovered_gate_intents == first_gate_intents
+    assert {
+        dedupe: lane["task_id"]
+        for dedupe, lane in recovered_gate["gate_lanes"]["batch1"].items()
+    } == gate_task_ids
+    assert crashed_gate["gate_lanes"] == recovered_gate["gate_lanes"]
+    store.write(initial, recovered_gate, plan, capability)
+
+    for dedupe in recovered_gate["gate_lanes"]["batch1"]:
+        scheduler.rows[dedupe]["status"] = "completed"
+    batch4, _ = driver.cycle(
+        recovered_gate, plan, capability, scheduler, reader, apply=True
+    )
+    store.write(recovered_gate, batch4, plan, capability)
+    for dedupe in batch4["gate_lanes"]["batch4"]:
+        scheduler.rows[dedupe]["status"] = "completed"
+    awaiting, _ = driver.cycle(
+        batch4, plan, capability, scheduler, reader, apply=True
+    )
+    store.write(batch4, awaiting, plan, capability)
+    assert scheduler.post_count == 8
+
+    final_entries = copy.deepcopy(predecessor["entries"])
+    final_entries[0]["state"] = "completed"
+    scheduler.rows[final_entries[0]["dedupe_key"]]["status"] = "completed"
+    final_predecessor = single_controller._advance_state(
+        {**predecessor, "entries": final_entries, "stop_requested": True}
+    )
+    stop = driver.write_stop_file(
+        tmp_path / "CRASH-WINDOW-PREDECESSOR-STOP.json", final_predecessor
+    )
+
+    # Repeat the same crash window for the first natural refill.  The imported
+    # final state chooses the same seed, so latest10k dedupe recovers the posted
+    # row instead of consuming a second seed or issuing a second POST.
+    crashed_refill, first_refill_intents = driver.cycle(
+        awaiting,
+        plan,
+        capability,
+        scheduler,
+        reader,
+        apply=True,
+        stop=stop,
+        final_predecessor_state=final_predecessor,
+        source_plan=plan,
+    )
+    assert len(first_refill_intents) == 1
+    assert scheduler.post_count == 9
+    assert store.load(plan, capability) == awaiting
+    refill_task = first_refill_intents[0]
+    refill_task_id = scheduler.rows[refill_task["dedupe_key"]]["id"]
+    recovered_refill, recovered_refill_intents = driver.cycle(
+        store.load(plan, capability),
+        plan,
+        capability,
+        scheduler,
+        reader,
+        apply=True,
+        stop=stop,
+        final_predecessor_state=final_predecessor,
+        source_plan=plan,
+    )
+    assert scheduler.post_count == 9
+    assert recovered_refill_intents == first_refill_intents
+    recovered_entry = next(
+        entry
+        for entry in recovered_refill["controller_state"]["entries"]
+        if entry["parent_dedupe_key"] == refill_task["dedupe_key"]
+    )
+    assert recovered_entry["task_id"] == refill_task_id
+    assert crashed_refill["controller_state"] == recovered_refill["controller_state"]
+    all_seeds = [
+        seed
+        for entry in recovered_refill["controller_state"]["entries"]
+        for seed in entry["seeds"]
+    ]
+    assert len(all_seeds) == len(set(all_seeds))
+    assert driver.operational_counts(recovered_refill)["physical_active_lanes"] == 500
+
+
+def test_scheduler_client_retries_transient_get_but_never_blindly_retries_post(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"[]"
+
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def flaky(request, timeout):
+        calls.append(request.get_method())
+        if len(calls) < 3:
+            raise driver.urllib.error.URLError("transient")
+        return Response()
+
+    monkeypatch.setattr(driver.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(driver.time, "sleep", sleeps.append)
+    api = driver.SchedulerApi(
+        "http://scheduler", get_attempts=3, get_backoff_seconds=0.25
+    )
+    assert api.latest_10000() == []
+    assert calls == ["GET", "GET", "GET"]
+    assert sleeps == [0.25, 0.5]
+
+    calls.clear()
+
+    def failed_post(request, timeout):
+        calls.append(request.get_method())
+        raise driver.urllib.error.URLError("ambiguous post")
+
+    monkeypatch.setattr(driver.urllib.request, "urlopen", failed_post)
+    api = driver.SchedulerApi("http://scheduler", apply=True, get_attempts=5)
+    with pytest.raises(driver.urllib.error.URLError):
+        api.post_task(contract.build_batch_task(_child_tasks(1)))
+    assert calls == ["POST"]
+
+
 class MemoryRemote:
     def __init__(self, files: dict[str, bytes]):
         self.files = dict(files)
@@ -822,8 +1392,10 @@ def test_running_batch_harvests_only_journal_declared_receipts_and_mixes_v1(
             missing_dedupe, plan=plan, manifest=manifest, remote=remote
         )
 
-    # Crash window: the immutable receipt is visible before the mutable cursor
-    # advances. The receipt remains harvestable and the seed is never rerun.
+    # Crash window: an immutable receipt that lands before the mutable cursor
+    # advances is deliberately not public. Running-parent visibility is exactly
+    # the journal-declared sealed prefix; terminal recovery needs a separate
+    # attestation rather than an opportunistic receipt scan.
     task_status_path = next(
         path for path in remote.files if path.endswith("task_status.json")
     )
@@ -847,7 +1419,7 @@ def test_running_batch_harvests_only_journal_declared_receipts_and_mixes_v1(
     crash_window = harvest.harvest_batch_lane(
         item, plan=plan, manifest=manifest, remote=remote
     )
-    assert len(crash_window) == 1
+    assert crash_window == []
     remote.files[task_status_path] = original_task_status
 
     manifest_path = next(
@@ -882,6 +1454,29 @@ def test_running_batch_harvests_only_journal_declared_receipts_and_mixes_v1(
     assert mixed["v1_physical_task_count"] == 1
     assert mixed["v2_physical_task_count"] == 1
     assert mixed["virtual_scheduler_task_ids_created"] is False
+
+    cohort_plan = {**plan, "launch_plan_sha256": "e" * 64}
+    cohort_item = {
+        "task_id": 99202,
+        "status": "completed",
+        "source_harvest_cohort_id": "legacy-200g",
+        "source_launch_plan_sha256": "e" * 64,
+    }
+    cohort_mixed = harvest.harvest_mixed_inventory(
+        [cohort_item],
+        plan=plan,
+        manifest=manifest,
+        remote=remote,
+        cohort_contexts={
+            "legacy-200g": {"plan": cohort_plan, "manifest": {"cohort": 200}}
+        },
+    )
+    assert cohort_mixed["records"][0]["harvest_cohort_id"] == "legacy-200g"
+    refused_cohort = harvest.harvest_mixed_inventory(
+        [cohort_item], plan=plan, manifest=manifest, remote=remote
+    )
+    assert refused_cohort["authenticated_seed_count"] == 0
+    assert refused_cohort["refused_physical_task_count"] == 1
 
     receipt_path = next(
         path for path in remote.files if path.endswith("seed_status.json")

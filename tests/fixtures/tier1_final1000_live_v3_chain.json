@@ -1,0 +1,69 @@
+{
+  "schema_version": "mft-tier1-final1000-live-v3-regression-fixture-v1",
+  "runtime_root": "C:/Users/peets/slurm_scheduler_runtime/mft_tier1_final_goal_1000_t100_resmax20_260721",
+  "source_state": "controller/state-basin-e0d7d52-generation300-resource4-quota200-160-90-50-v3.json",
+  "source_plan": "launch/launch-plan-basin-e0d7d52-generation300-resource4-quota200-160-90-50.json",
+  "ancestor_plans": [
+    "launch/launch-plan-generation300-ac6e92a-resource4-quota200-160-90-50-ops2c40fba.json",
+    "launch/launch-plan-resource4-quota-v1.json",
+    "launch/launch-plan-physicality-moduleparent-3bc05d6-resource4-quota200-160-90-50-ops62d321c.json"
+  ],
+  "expected_harvest_cohort_ids": [
+    "predecessor-3835df0278b4",
+    "successor-3f7b944e569a",
+    "successor-d1450cd27a68",
+    "successor-f2b0b02c2a06"
+  ],
+  "expected_generation_counts": [200, 300],
+  "captured_snapshot": {
+    "probe_completed_at_kst": "2026-07-22T14:42:28+09:00",
+    "source": {
+      "file_sha256": "5bcafced96b4cfd3b677f5236f1c1382404816cadd6c3149b9dfa5ffd16cf3cb",
+      "state_sha256": "a61161a5e20f5af74253bde750c41d430f4cba98420bcebd8d50745b8330d5ea",
+      "revision": 906,
+      "entry_count": 9497
+    },
+    "plans": {
+      "launch/launch-plan-basin-e0d7d52-generation300-resource4-quota200-160-90-50.json": {
+        "file_sha256": "199b84241980bec571c4edef087fa7f555134558089de70e0758590fb74591a6",
+        "launch_plan_sha256": "3f7b944e569a963a0ab18fba262946bc1d86ed3c1cca6cd8e601d04c6b7ac76a"
+      },
+      "launch/launch-plan-generation300-ac6e92a-resource4-quota200-160-90-50-ops2c40fba.json": {
+        "file_sha256": "6e1f891da331510fa28885b15ff261fda9a5f8660f8fb279052410f5daf51766",
+        "launch_plan_sha256": "f2b0b02c2a0669d9a9125fb8f22f91414f7b62c058df35e67760ff1179fd588f"
+      },
+      "launch/launch-plan-resource4-quota-v1.json": {
+        "file_sha256": "8f2ada934f622b174526c4e9090f701e234c17e0350105ae122faaadba53e3d0",
+        "launch_plan_sha256": "3835df0278b40e7d7f5d3c4cc943efb83a695b7fafa070d16c943e8b39a49481"
+      },
+      "launch/launch-plan-physicality-moduleparent-3bc05d6-resource4-quota200-160-90-50-ops62d321c.json": {
+        "file_sha256": "e3278c6a8ad7ca0fd705e8a8e0061dd9c9cbfe47418e5b533bac4574747932d7",
+        "launch_plan_sha256": "d1450cd27a680061d649b2bafbc5e70de5e77a951e6f18be8485ab10fa3f5b11"
+      }
+    },
+    "upgrade": {
+      "state_sha256": "7c3e6cfebd0c478180bcda0e2dbfd2752015e1253bcc5a94ca6a4b7be8271edb",
+      "entry_count": 9497,
+      "active_physical_count": 500,
+      "entry_counts_by_cohort_and_generations": {
+        "predecessor-3835df0278b4:200": 2703,
+        "successor-3f7b944e569a:300": 3795,
+        "successor-d1450cd27a68:200": 2361,
+        "successor-f2b0b02c2a06:300": 638
+      },
+      "validate_identity": true,
+      "json_restart_identity": true,
+      "source_in_memory_unchanged": true,
+      "elapsed_seconds": 21.22
+    },
+    "effects": {
+      "scheduler_http_requests": 0,
+      "scheduler_posts": 0,
+      "remote_reads": 0,
+      "remote_writes": 0,
+      "source_files_written": 0
+    }
+  },
+  "remote_access_required": false,
+  "scheduler_http_required": false
+}

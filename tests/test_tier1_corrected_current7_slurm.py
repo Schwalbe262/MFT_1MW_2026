@@ -161,6 +161,7 @@ result = {
     "max_generations": int(args.max_generations),
     "evaluated_generations": int(args.max_generations),
     "completed_generations": int(args.max_generations) + 1,
+    "optimizer_processes": 1,
     "inference_threads": int(args.inference_threads),
     "scheduler_cpus": int(args.scheduler_cpus),
     "generation_artifact_inventory_sha256": identity[
@@ -1024,6 +1025,33 @@ def test_remote_runner_verifies_relocation_and_completes_fake_seed(
     assert status["full_generation_authentication_passes"] == 1
     assert status["authenticated_artifact_count"] == 42
     assert status["observed_peak_rss_bytes"] <= 42 * 1024**3
+    result_path = next(
+        path
+        for path in (bundle / "runs" / "task-local-smoke-1").rglob("result.json")
+    )
+    valid_result = json.loads(result_path.read_text())
+    assert valid_result["optimizer_processes"] == 1
+    runner.validate_result(valid_result, payload=payload, manifest=manifest)
+
+    missing_process_count = copy.deepcopy(valid_result)
+    missing_process_count.pop("optimizer_processes")
+    missing_process_count.pop("payload_sha256")
+    missing_process_count["payload_sha256"] = receipt_contract.canonical_sha256(
+        missing_process_count
+    )
+    with pytest.raises(RuntimeError, match="terminal current7 result"):
+        runner.validate_result(
+            missing_process_count, payload=payload, manifest=manifest
+        )
+
+    wrong_process_count = copy.deepcopy(valid_result)
+    wrong_process_count["optimizer_processes"] = 2
+    wrong_process_count.pop("payload_sha256")
+    wrong_process_count["payload_sha256"] = receipt_contract.canonical_sha256(
+        wrong_process_count
+    )
+    with pytest.raises(RuntimeError, match="terminal current7 result"):
+        runner.validate_result(wrong_process_count, payload=payload, manifest=manifest)
 
 
 def test_remote_runner_rejects_relocated_artifact_tamper(tmp_path, monkeypatch):

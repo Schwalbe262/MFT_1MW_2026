@@ -856,6 +856,15 @@ def deduplicate_observations(
             raise RuntimeError(
                 f"divergent terminal results for bundle+seed {bundle_id}:{seed}"
             )
+        harvest_cohort_ids = {
+            str(item["harvest_cohort_id"])
+            for item in group
+            if item.get("harvest_cohort_id") is not None
+        }
+        if len(harvest_cohort_ids) > 1:
+            raise RuntimeError(
+                f"divergent harvest cohorts for bundle+seed {bundle_id}:{seed}"
+            )
         chosen = min(completed or group, key=lambda item: int(item["task_id"]))
         status_objects = sorted(
             (
@@ -889,6 +898,8 @@ def deduplicate_observations(
                 for item in group
             },
         }
+        if harvest_cohort_ids:
+            record["harvest_cohort_id"] = next(iter(harvest_cohort_ids))
         if completed:
             result_value = chosen["_result"]
             record.update(

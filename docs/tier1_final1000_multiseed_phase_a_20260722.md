@@ -49,7 +49,7 @@ Remote journal paths are:
 
 ## Controller, harvest, and status seam
 
-The controller-v2 transition layer upgrades an authenticated v1 ledger without
+The controller-v3 transition layer upgrades an authenticated v1 ledger without
 cancelling it, counts physical lanes against the exact 500 target and
 200/160/90/50 stage quotas, reserves an entire child block atomically, and maps
 both `timeout` and `timed_out` to a terminal state. It is intentionally a pure
@@ -58,6 +58,13 @@ For rolling migrations, every v1 entry stores the exact task envelope, source
 launch-plan SHA, resource-policy identity, and envelope SHA authenticated from
 its predecessor or successor cohort. Scheduler observation therefore never
 reconstructs an old predecessor refill from a different successor template.
+
+The production reconciliation driver is a separate layer. It defaults to
+dry-run, is write-enabled only by explicit `--apply`, and has exactly one
+Scheduler mutation endpoint: `POST /api/tasks`. It does not cancel or preempt
+the predecessor. Its restartable watch loop persists a sealed state/history
+chain after every cycle and reconciles a deterministic dedupe from the
+latest-10,000 inventory after a POST-before-state-write crash.
 
 The existing single-seed controller's read path now requests one namespace
 inventory ordered by descending task ID per control cycle. Active IDs present
@@ -81,27 +88,36 @@ that fits when a multi-record page would cross the cap.
 
 ## Required release gates
 
-No task produced by this branch may be submitted against an older bundle. A new
-authenticated bundle must include these extra remote code files:
-
-- `tools/tier1_final1000_multiseed_contract.py`
-- `tools/tier1_final1000_multiseed_lane_runner.py`
-- `tools/tier1_corrected_current7_slurm_seed_runner.py`
+No task produced by this branch may be submitted against an older bundle. The
+release preparation tool computes the full repository-local transitive import
+closure from the optimizer preflight, seed runner, batch contract, and lane
+runner. The old three-file extra-code list is not a complete bundle inventory
+and must not be used as a release gate.
 
 The bundle's authenticated optimizer entrypoint must be this commit's
 `tools/tier1_corrected_generation_preflight.py`; it contains the runtime
 CPU/profile/result validation. Reusing an older READY identity is prohibited.
 
-Use the current7 bundle planner's repeated `--extra-code-file` option, publish a
-new immutable bundle/READY identity, and bind a new launch plan to it. Backend
-v2 status/index support must be deployed before any batch task, because the
-deployed v1 reader assumes one Scheduler task per seed.
+The local release tool overlays every repository source already present in the
+parent plus that computed closure, replaces `.source-revision`, performs an
+isolated import smoke, and creates reproducible candidate/delta plans. It never
+copies or creates READY. A later, separately authorized operation must publish
+a new immutable bundle/READY identity and bind a new launch plan to it. Exact
+backend/status/index/test capability must be deployed and sealed before any
+batch task, because the deployed v1 reader assumes one Scheduler task per seed.
 
-The rollout order remains: semaphore-free single-seed successor passes its
-stage/node canaries; four additive one-child lane canaries pass; then four
-additive four-child lane canaries pass. Only then may cancellation-free natural
-replacement begin. Batch length 8 and in-process model reuse remain separate
-changes requiring separate evidence.
+The rollout order remains: the old 500-lane controller keeps progressing; four
+additive one-child lanes (one per stage, temporary physical maximum 504) pass;
+then four additive four-child lanes (again one per stage, temporary maximum
+504) pass. The phases reserve the upper five seeds of every stage (`end-5`,
+then `end-4..end-1`) and never refill between gates. After both pass, the
+driver waits for the exact final predecessor state and the canonical harvester
+single-writer handoff. Only then may cancellation-free natural replacement
+return to exactly 500 physical lanes and 200/160/90/50 stage quotas. Batch
+length 8 and in-process model reuse remain separate changes requiring separate
+evidence.
 
-This implementation contains no Scheduler HTTP mutation client, cancellation,
-preemption, remote publication, AEDT, or FEA path.
+This implementation has not performed Scheduler HTTP mutation, cancellation,
+preemption, remote publication, AEDT, or FEA. Production cutover remains
+blocked until the mixed v1/v2 consumer handoff receipt is integrated and
+tested.
