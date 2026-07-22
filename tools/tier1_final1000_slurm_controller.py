@@ -123,6 +123,106 @@ INVENTORY_PAGE_SIZE = 10_000
 INVENTORY_BUSY_MAX_ATTEMPTS = 3
 INVENTORY_BUSY_RETRY_SECONDS = 0.25
 INVENTORY_SNAPSHOT_SCHEMA = "mft-tier1-final1000-inventory-snapshot-v1"
+EXTERNAL_CANARY_ATTESTATION_SCHEMA = (
+    "mft-tier1-final1000-external-canary-attestation-v1"
+)
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_external_canary_attestation(
+    value: Mapping[str, Any], plan: Mapping[str, Any]
+) -> None:
+    unsigned = {key: item for key, item in value.items() if key != "sha256"}
+    stages = value.get("stage_attestations")
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "source_driver_state_schema_version",
+            "source_driver_state_sha256",
+            "source_driver_state_revision",
+            "source_driver_launch_plan_sha256",
+            "source_driver_phase",
+            "source_monitoring_capability_sha256",
+            "successor_launch_plan_sha256",
+            "gate_phase",
+            "stage_attestations",
+            "scheduler_mutation_endpoints",
+            "scheduler_post_count_delta",
+            "cancellation_performed",
+            "preemption_performed",
+            "sha256",
+        }
+        or value.get("schema_version") != EXTERNAL_CANARY_ATTESTATION_SCHEMA
+        or value.get("sha256") != canonical_sha256(unsigned)
+        or value.get("source_driver_state_schema_version")
+        != "mft-tier1-final1000-multiseed-production-driver-v2"
+        or not _is_sha256(value.get("source_driver_state_sha256"))
+        or isinstance(value.get("source_driver_state_revision"), bool)
+        or not isinstance(value.get("source_driver_state_revision"), int)
+        or int(value["source_driver_state_revision"]) < 0
+        or value.get("source_driver_launch_plan_sha256")
+        != plan.get("launch_plan_sha256")
+        or value.get("successor_launch_plan_sha256")
+        != plan.get("launch_plan_sha256")
+        or value.get("source_driver_phase")
+        not in {"batch4", "awaiting_predecessor_stop", "cutover_prepared", "refill"}
+        or not _is_sha256(value.get("source_monitoring_capability_sha256"))
+        or value.get("gate_phase") != "batch1"
+        or not isinstance(stages, dict)
+        or set(stages) != set(BY_ID)
+        or value.get("scheduler_mutation_endpoints") != []
+        or value.get("scheduler_post_count_delta") != 0
+        or value.get("cancellation_performed") is not False
+        or value.get("preemption_performed") is not False
+    ):
+        raise RuntimeError("external successor canary attestation seal mismatch")
+    task_ids: set[int] = set()
+    for stage in STAGES:
+        item = stages.get(stage.stage_id)
+        if (
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "task_id",
+                "parent_dedupe_key",
+                "task_sha256",
+                "bundle_id",
+                "seeds",
+                "scheduler_status",
+                "batch_manifest_sha256",
+                "task_status_sha256",
+                "child_receipt_sha256s",
+                "remote_evidence_sha256",
+            }
+            or isinstance(item.get("task_id"), bool)
+            or not isinstance(item.get("task_id"), int)
+            or int(item["task_id"]) <= 0
+            or int(item["task_id"]) in task_ids
+            or not str(item.get("parent_dedupe_key") or "").startswith(
+                "mft-tier1-final1000:lane:"
+            )
+            or not _is_sha256(item.get("task_sha256"))
+            or item.get("bundle_id")
+            != plan["stage_bindings"][stage.stage_id]["bundle_id"]
+            or item.get("seeds") != [stage.seed_window_end_exclusive - 5]
+            or item.get("scheduler_status") != "completed"
+            or not _is_sha256(item.get("batch_manifest_sha256"))
+            or not _is_sha256(item.get("task_status_sha256"))
+            or not isinstance(item.get("child_receipt_sha256s"), list)
+            or len(item["child_receipt_sha256s"]) != 1
+            or not all(_is_sha256(digest) for digest in item["child_receipt_sha256s"])
+            or not _is_sha256(item.get("remote_evidence_sha256"))
+        ):
+            raise RuntimeError("external successor canary stage attestation drifted")
+        task_ids.add(int(item["task_id"]))
 
 
 class SeedStatusReadBusy(RuntimeError):
@@ -177,7 +277,104 @@ class ReadyProbe(Protocol):
 
 
 class SchedulerApiClient(Current7SchedulerApiClient):
-    """Scheduler client restricted to the final-goal task namespace."""
+    """Bounded final-goal client for the long-running watch controller."""
+
+    def _load_inventory(self) -> None:
+        """Load one bounded recent window for the 15-second watch loop."""
+
+        query = urllib.parse.urlencode(
+            {
+                "name_prefix": TASK_NAME_PREFIX,
+                "sort_by": "id",
+                "sort_order": "desc",
+                "limit": 10_000,
+            }
+        )
+        value = self._request(f"/api/tasks?{query}")
+        if not isinstance(value, list):
+            raise RuntimeError("final1000 recent scheduler inventory is not a list")
+        inventory: dict[str, Mapping[str, Any]] = {}
+        task_ids: dict[int, str] = {}
+        for task in value:
+            if not isinstance(task, dict):
+                raise RuntimeError("final1000 recent inventory contains a non-object")
+            name = str(task.get("name") or "")
+            dedupe = str(task.get("dedupe_key") or "")
+            if not name.startswith(TASK_NAME_PREFIX):
+                raise RuntimeError("final1000 recent inventory escaped its namespace")
+            if not dedupe.startswith(DEDUPE_PREFIX):
+                raise RuntimeError("final1000 namespace task has foreign dedupe key")
+            task_id = _task_id(task)
+            if task_id in task_ids and task_ids[task_id] != dedupe:
+                raise RuntimeError(
+                    "scheduler contains one final1000 task id with multiple dedupes"
+                )
+            task_ids[task_id] = dedupe
+            if dedupe in inventory and int(inventory[dedupe]["id"]) != task_id:
+                raise RuntimeError(
+                    f"scheduler contains duplicate final1000 dedupe: {dedupe}"
+                )
+            inventory[dedupe] = task
+        self._inventory = inventory
+
+    def submit_task(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        if (
+            not str(payload.get("name") or "").startswith(TASK_NAME_PREFIX)
+            or not str(payload.get("dedupe_key") or "").startswith(DEDUPE_PREFIX)
+            or "requested_allocation_id" in payload
+        ):
+            raise RuntimeError("foreign or allocation-pinned final1000 submission")
+        return super().submit_task(payload)
+
+    def list_namespace_tasks(self) -> list[Mapping[str, Any]]:
+        """Return the bounded namespace window used by watch reconciliation."""
+
+        self._load_inventory()
+        return [dict(task) for task in (self._inventory or {}).values()]
+
+    def read_seed_status(self, task_id: int) -> Mapping[str, Any] | None:
+        """Read a canary seal with bounded retry for scheduler HTTP 429.
+
+        The scheduler permits only a small number of simultaneous remote-file
+        reads. Exhausting that transient limit is not evidence that a canary
+        failed or passed, so surface a typed busy condition for the controller
+        to hold pending without terminating its watch loop.
+        """
+
+        path = f"runs/task-{int(task_id)}/seed_status.json"
+        query = urllib.parse.urlencode({"path": path, "base": "remote_cwd"})
+        request = urllib.request.Request(
+            self.base_url + f"/api/tasks/{int(task_id)}/remote-file?{query}",
+            method="GET",
+        )
+        for attempt in range(SEED_STATUS_BUSY_MAX_ATTEMPTS):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code in {404, 409}:
+                    return None
+                if exc.code == 429:
+                    if attempt + 1 < SEED_STATUS_BUSY_MAX_ATTEMPTS:
+                        time.sleep(SEED_STATUS_BUSY_RETRY_SECONDS * (attempt + 1))
+                        continue
+                    raise SeedStatusReadBusy(
+                        "scheduler remote status busy after "
+                        f"{SEED_STATUS_BUSY_MAX_ATTEMPTS} attempts: task {task_id}"
+                    ) from exc
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"scheduler remote status read failed: {detail}"
+                ) from exc
+            if not raw.strip():
+                return None
+            value = json.loads(raw.decode("utf-8"))
+            return value if isinstance(value, dict) else None
+        raise AssertionError("bounded seed-status retry loop fell through")
+
+
+class CompleteInventorySchedulerApiClient(SchedulerApiClient):
+    """One-shot, full namespace reader restricted to migration preparation."""
 
     def __init__(self, base_url: str, timeout: float = 30.0):
         super().__init__(base_url, timeout=timeout)
@@ -310,7 +507,7 @@ class SchedulerApiClient(Current7SchedulerApiClient):
             raise RuntimeError("scheduler inventory page contains a non-object row")
         return items, filtered_total, page_count, server_revision
 
-    def _load_complete_inventory(self) -> None:
+    def _load_inventory(self) -> None:
         # Establish a high-watermark first.  Authoritative page reads are then
         # pinned below it so concurrent inserts cannot shift OFFSET pages.
         anchor = self._request_inventory_page(
@@ -420,106 +617,6 @@ class SchedulerApiClient(Current7SchedulerApiClient):
             "sha256": canonical_sha256(snapshot_unsigned),
         }
         self._inventory = inventory
-
-    def _load_inventory(self) -> None:
-        """Load one bounded recent window for the 15-second watch loop."""
-
-        query = urllib.parse.urlencode(
-            {
-                "name_prefix": TASK_NAME_PREFIX,
-                "sort_by": "id",
-                "sort_order": "desc",
-                "limit": 10_000,
-            }
-        )
-        value = self._request(f"/api/tasks?{query}")
-        if not isinstance(value, list):
-            raise RuntimeError("final1000 recent scheduler inventory is not a list")
-        inventory: dict[str, Mapping[str, Any]] = {}
-        task_ids: dict[int, str] = {}
-        for task in value:
-            if not isinstance(task, dict):
-                raise RuntimeError("final1000 recent inventory contains a non-object")
-            name = str(task.get("name") or "")
-            dedupe = str(task.get("dedupe_key") or "")
-            if not name.startswith(TASK_NAME_PREFIX):
-                raise RuntimeError("final1000 recent inventory escaped its namespace")
-            if not dedupe.startswith(DEDUPE_PREFIX):
-                raise RuntimeError("final1000 namespace task has foreign dedupe key")
-            task_id = _task_id(task)
-            if task_id in task_ids and task_ids[task_id] != dedupe:
-                raise RuntimeError(
-                    "scheduler contains one final1000 task id with multiple dedupes"
-                )
-            task_ids[task_id] = dedupe
-            if dedupe in inventory and int(inventory[dedupe]["id"]) != task_id:
-                raise RuntimeError(
-                    f"scheduler contains duplicate final1000 dedupe: {dedupe}"
-                )
-            inventory[dedupe] = task
-        self._inventory = inventory
-
-    def submit_task(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        if (
-            not str(payload.get("name") or "").startswith(TASK_NAME_PREFIX)
-            or not str(payload.get("dedupe_key") or "").startswith(DEDUPE_PREFIX)
-            or "requested_allocation_id" in payload
-        ):
-            raise RuntimeError("foreign or allocation-pinned final1000 submission")
-        return super().submit_task(payload)
-
-    def list_namespace_tasks(self) -> list[Mapping[str, Any]]:
-        """Return a bounded recent view for recurring watch reconciliation."""
-
-        self._load_inventory()
-        return [dict(task) for task in (self._inventory or {}).values()]
-
-    def list_complete_namespace_tasks(self) -> list[Mapping[str, Any]]:
-        """Return a one-shot, high-watermark-pinned migration authority."""
-
-        self._load_complete_inventory()
-        return [dict(task) for task in (self._inventory or {}).values()]
-
-    def read_seed_status(self, task_id: int) -> Mapping[str, Any] | None:
-        """Read a canary seal with bounded retry for scheduler HTTP 429.
-
-        The scheduler permits only a small number of simultaneous remote-file
-        reads. Exhausting that transient limit is not evidence that a canary
-        failed or passed, so surface a typed busy condition for the controller
-        to hold pending without terminating its watch loop.
-        """
-
-        path = f"runs/task-{int(task_id)}/seed_status.json"
-        query = urllib.parse.urlencode({"path": path, "base": "remote_cwd"})
-        request = urllib.request.Request(
-            self.base_url + f"/api/tasks/{int(task_id)}/remote-file?{query}",
-            method="GET",
-        )
-        for attempt in range(SEED_STATUS_BUSY_MAX_ATTEMPTS):
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    raw = response.read()
-            except urllib.error.HTTPError as exc:
-                if exc.code in {404, 409}:
-                    return None
-                if exc.code == 429:
-                    if attempt + 1 < SEED_STATUS_BUSY_MAX_ATTEMPTS:
-                        time.sleep(SEED_STATUS_BUSY_RETRY_SECONDS * (attempt + 1))
-                        continue
-                    raise SeedStatusReadBusy(
-                        "scheduler remote status busy after "
-                        f"{SEED_STATUS_BUSY_MAX_ATTEMPTS} attempts: task {task_id}"
-                    ) from exc
-                detail = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"scheduler remote status read failed: {detail}"
-                ) from exc
-            if not raw.strip():
-                return None
-            value = json.loads(raw.decode("utf-8"))
-            return value if isinstance(value, dict) else None
-        raise AssertionError("bounded seed-status retry loop fell through")
-
 
 def _seal_state(value: Mapping[str, Any]) -> dict[str, Any]:
     unsigned = {
@@ -755,6 +852,13 @@ def _validate_state_for_sealed_active_quotas(
             != expected_status_keys
         ):
             raise RuntimeError("final1000 rolling migration seal mismatch")
+        external_attestation = migration.get("external_canary_attestation")
+        if external_attestation is not None:
+            if not isinstance(external_attestation, Mapping):
+                raise RuntimeError(
+                    "external successor canary attestation is not an object"
+                )
+            _validate_external_canary_attestation(external_attestation, plan)
         if migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA:
             cutover_ready = (
                 migration.get("predecessor_stop_observed") is True
@@ -1027,10 +1131,21 @@ def _validate_state_for_sealed_active_quotas(
             )
             for stage in STAGES
         }
+        external_attestation_present = (
+            migration.get("external_canary_attestation") is not None
+        )
+        external_prepassed_shape = (
+            state.get("ramp_released") is True
+            and passed == set(BY_ID)
+            and all(not task_ids for task_ids in expected_canary_ids.values())
+            and expected_canary_status
+            == {stage.stage_id: "remote_preflight_passed" for stage in STAGES}
+        )
         if (
             migration.get("successor_canary_task_ids_by_stage") != expected_canary_ids
             or migration.get("successor_canary_status_by_stage")
             != expected_canary_status
+            or external_attestation_present != external_prepassed_shape
             or migration.get("predecessor_entry_count")
             != sum(
                 str(entry.get("origin") or "successor") == "predecessor"

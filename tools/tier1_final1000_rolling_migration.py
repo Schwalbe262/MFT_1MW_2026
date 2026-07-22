@@ -35,7 +35,7 @@ try:
         STATE_SCHEMA,
         TASK_NAME_PREFIX,
         TERMINAL_STATES,
-        SchedulerApiClient,
+        CompleteInventorySchedulerApiClient,
         SUCCESSOR_RESOURCE_POLICY_ID,
         _scheduler_state,
         _validate_historical_resource_quota_successor_state,
@@ -79,7 +79,7 @@ except ImportError:  # pragma: no cover - repository import path
         STATE_SCHEMA,
         TASK_NAME_PREFIX,
         TERMINAL_STATES,
-        SchedulerApiClient,
+        CompleteInventorySchedulerApiClient,
         SUCCESSOR_RESOURCE_POLICY_ID,
         _scheduler_state,
         _validate_historical_resource_quota_successor_state,
@@ -158,6 +158,285 @@ class ReadyProbe(Protocol):
 
 class InventoryClient(Protocol):
     def list_namespace_tasks(self) -> Sequence[Mapping[str, Any]]: ...
+
+    def get_task(self, task_id: int) -> Mapping[str, Any] | None: ...
+
+
+class ExternalCanaryGateReader(Protocol):
+    def lane_evidence(
+        self, task_id: int, seeds: Sequence[int]
+    ) -> Mapping[str, Any] | None: ...
+
+
+EXTERNAL_CANARY_ATTESTATION_SCHEMA = (
+    "mft-tier1-final1000-external-canary-attestation-v1"
+)
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def validate_external_canary_attestation(
+    value: Mapping[str, Any],
+    *,
+    successor_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the sealed, read-only Phase-A batch1 gate reuse receipt."""
+
+    unsigned = {key: item for key, item in value.items() if key != "sha256"}
+    expected_fields = {
+        "schema_version",
+        "source_driver_state_schema_version",
+        "source_driver_state_sha256",
+        "source_driver_state_revision",
+        "source_driver_launch_plan_sha256",
+        "source_driver_phase",
+        "source_monitoring_capability_sha256",
+        "successor_launch_plan_sha256",
+        "gate_phase",
+        "stage_attestations",
+        "scheduler_mutation_endpoints",
+        "scheduler_post_count_delta",
+        "cancellation_performed",
+        "preemption_performed",
+        "sha256",
+    }
+    stages = value.get("stage_attestations")
+    if (
+        set(value) != expected_fields
+        or value.get("schema_version") != EXTERNAL_CANARY_ATTESTATION_SCHEMA
+        or value.get("sha256") != canonical_sha256(unsigned)
+        or value.get("source_driver_state_schema_version")
+        != "mft-tier1-final1000-multiseed-production-driver-v2"
+        or not _is_sha256(value.get("source_driver_state_sha256"))
+        or isinstance(value.get("source_driver_state_revision"), bool)
+        or not isinstance(value.get("source_driver_state_revision"), int)
+        or int(value["source_driver_state_revision"]) < 0
+        or value.get("source_driver_launch_plan_sha256")
+        != successor_plan.get("launch_plan_sha256")
+        or value.get("successor_launch_plan_sha256")
+        != successor_plan.get("launch_plan_sha256")
+        or value.get("source_driver_phase")
+        not in {"batch4", "awaiting_predecessor_stop", "cutover_prepared", "refill"}
+        or not _is_sha256(value.get("source_monitoring_capability_sha256"))
+        or value.get("gate_phase") != "batch1"
+        or not isinstance(stages, dict)
+        or set(stages) != set(BY_ID)
+        or value.get("scheduler_mutation_endpoints") != []
+        or value.get("scheduler_post_count_delta") != 0
+        or value.get("cancellation_performed") is not False
+        or value.get("preemption_performed") is not False
+    ):
+        raise RuntimeError("external successor canary attestation seal mismatch")
+
+    task_ids: set[int] = set()
+    for stage in STAGES:
+        item = stages.get(stage.stage_id)
+        expected_binding = successor_plan["stage_bindings"][stage.stage_id]
+        if (
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "task_id",
+                "parent_dedupe_key",
+                "task_sha256",
+                "bundle_id",
+                "seeds",
+                "scheduler_status",
+                "batch_manifest_sha256",
+                "task_status_sha256",
+                "child_receipt_sha256s",
+                "remote_evidence_sha256",
+            }
+            or isinstance(item.get("task_id"), bool)
+            or not isinstance(item.get("task_id"), int)
+            or int(item["task_id"]) <= 0
+            or int(item["task_id"]) in task_ids
+            or not str(item.get("parent_dedupe_key") or "").startswith(
+                "mft-tier1-final1000:lane:"
+            )
+            or not _is_sha256(item.get("task_sha256"))
+            or item.get("bundle_id") != expected_binding["bundle_id"]
+            or item.get("seeds") != [stage.seed_window_end_exclusive - 5]
+            or item.get("scheduler_status") != "completed"
+            or not _is_sha256(item.get("batch_manifest_sha256"))
+            or not _is_sha256(item.get("task_status_sha256"))
+            or not isinstance(item.get("child_receipt_sha256s"), list)
+            or len(item["child_receipt_sha256s"]) != 1
+            or not all(_is_sha256(digest) for digest in item["child_receipt_sha256s"])
+            or not _is_sha256(item.get("remote_evidence_sha256"))
+        ):
+            raise RuntimeError("external successor canary stage attestation drifted")
+        task_ids.add(int(item["task_id"]))
+    return copy.deepcopy(dict(value))
+
+
+def authenticate_external_batch1_canaries(
+    *,
+    driver_state: Mapping[str, Any],
+    monitoring_capability: Mapping[str, Any],
+    successor_plan: Mapping[str, Any],
+    scheduler: InventoryClient,
+    gate_reader: ExternalCanaryGateReader,
+) -> dict[str, Any]:
+    """Re-read and authenticate already completed safe-bundle batch1 gates.
+
+    The physical Scheduler tasks remain outside the single-seed controller
+    ledger because they are multi-seed parent envelopes.  Their immutable
+    identity and every remote terminal seal are instead captured in a nested
+    migration receipt, allowing an immediate exact-target refill after handoff.
+    """
+
+    # These imports are deliberately local: the pure multi-seed controller
+    # imports this migration module to reproduce older cohort tasks.
+    try:
+        from tier1_final1000_multiseed_contract import (
+            batch_manifest_from_payload,
+            scheduler_task_identity_matches,
+            scheduler_task_observation,
+            validate_batch_manifest,
+            validate_child_receipt,
+            validate_task_status,
+        )
+        from tier1_final1000_multiseed_controller import build_reserved_gate_task
+        from tier1_final1000_multiseed_driver import validate_driver_state
+    except ImportError:  # pragma: no cover - repository import path
+        from tools.tier1_final1000_multiseed_contract import (
+            batch_manifest_from_payload,
+            scheduler_task_identity_matches,
+            scheduler_task_observation,
+            validate_batch_manifest,
+            validate_child_receipt,
+            validate_task_status,
+        )
+        from tools.tier1_final1000_multiseed_controller import (
+            build_reserved_gate_task,
+        )
+        from tools.tier1_final1000_multiseed_driver import validate_driver_state
+
+    plan = validate_successor_plan(successor_plan)
+    state = validate_driver_state(driver_state, plan, monitoring_capability)
+    gates = state["gate_lanes"]["batch1"]
+    if (
+        len(gates) != len(STAGES)
+        or state.get("failure") is not None
+        or state.get("phase")
+        not in {"batch4", "awaiting_predecessor_stop", "cutover_prepared", "refill"}
+    ):
+        raise RuntimeError("external successor batch1 gate set is incomplete")
+
+    start_post_count = int(getattr(scheduler, "post_count", 0))
+    stage_attestations: dict[str, dict[str, Any]] = {}
+    for stage in STAGES:
+        candidates = [
+            lane for lane in gates.values() if lane.get("stage_id") == stage.stage_id
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError("external successor batch1 stage cardinality drifted")
+        lane = candidates[0]
+        expected_task = build_reserved_gate_task(
+            plan, stage_id=stage.stage_id, phase="batch1"
+        )
+        task_id = lane.get("task_id")
+        if (
+            lane.get("state") != "passed"
+            or isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id <= 0
+            or lane.get("task") != expected_task
+            or lane.get("task_sha256") != canonical_sha256(expected_task)
+        ):
+            raise RuntimeError("external successor batch1 driver gate drifted")
+        get_task = getattr(scheduler, "get_task", None)
+        if not callable(get_task):
+            raise RuntimeError("scheduler cannot authenticate external canary tasks")
+        observed = get_task(task_id)
+        observation = (
+            scheduler_task_observation(observed)
+            if isinstance(observed, Mapping)
+            else None
+        )
+        if (
+            observation != (task_id, "completed")
+            or not scheduler_task_identity_matches(observed, expected_task)
+        ):
+            raise RuntimeError("external successor Scheduler task identity drifted")
+        seeds = [int(child["seed"]) for child in expected_task["payload_json"]["children"]]
+        try:
+            evidence = gate_reader.lane_evidence(task_id, seeds)
+        except Exception as exc:
+            raise RuntimeError("external successor canary evidence read failed") from exc
+        if not isinstance(evidence, Mapping):
+            raise RuntimeError("external successor canary evidence is missing")
+        manifest = validate_batch_manifest(evidence.get("manifest") or {})
+        expected_manifest = batch_manifest_from_payload(expected_task["payload_json"])
+        status = validate_task_status(evidence.get("task_status") or {})
+        receipts_raw = evidence.get("child_receipts")
+        if (
+            manifest != expected_manifest
+            or status.get("manifest_sha256") != manifest["manifest_sha256"]
+            or status.get("state") != "completed"
+            or status.get("task_id") != str(task_id)
+            or status.get("completed_child_count") != len(seeds)
+            or status.get("failed_child_count") != 0
+            or status.get("scheduler_mutation_performed") is not False
+            or status.get("fea_submission_performed") is not False
+            or status.get("aedt_used") is not False
+            or not isinstance(receipts_raw, list)
+            or len(receipts_raw) != len(seeds)
+        ):
+            raise RuntimeError("external successor canary terminal status failed")
+        receipts = [
+            validate_child_receipt(receipt, manifest=manifest)
+            for receipt in receipts_raw
+        ]
+        if any(
+            receipt.get("state") != "completed"
+            or receipt.get("task_id") != str(task_id)
+            or receipt.get("fea_submission_performed") is not False
+            or receipt.get("aedt_used") is not False
+            for receipt in receipts
+        ):
+            raise RuntimeError("external successor canary child failed")
+        stage_attestations[stage.stage_id] = {
+            "task_id": task_id,
+            "parent_dedupe_key": expected_task["dedupe_key"],
+            "task_sha256": canonical_sha256(expected_task),
+            "bundle_id": expected_task["payload_json"]["bundle_id"],
+            "seeds": seeds,
+            "scheduler_status": "completed",
+            "batch_manifest_sha256": manifest["manifest_sha256"],
+            "task_status_sha256": status["status_sha256"],
+            "child_receipt_sha256s": [
+                receipt["receipt_sha256"] for receipt in receipts
+            ],
+            "remote_evidence_sha256": canonical_sha256(evidence),
+        }
+    if int(getattr(scheduler, "post_count", 0)) != start_post_count:
+        raise RuntimeError("external canary authentication performed a Scheduler POST")
+    unsigned_receipt = {
+        "schema_version": EXTERNAL_CANARY_ATTESTATION_SCHEMA,
+        "source_driver_state_schema_version": state["schema_version"],
+        "source_driver_state_sha256": state["state_sha256"],
+        "source_driver_state_revision": int(state["revision"]),
+        "source_driver_launch_plan_sha256": state["launch_plan_sha256"],
+        "source_driver_phase": state["phase"],
+        "source_monitoring_capability_sha256": state[
+            "monitoring_capability_sha256"
+        ],
+        "successor_launch_plan_sha256": plan["launch_plan_sha256"],
+        "gate_phase": "batch1",
+        "stage_attestations": stage_attestations,
+        "scheduler_mutation_endpoints": [],
+        "scheduler_post_count_delta": 0,
+        "cancellation_performed": False,
+        "preemption_performed": False,
+    }
+    return validate_external_canary_attestation(
+        {**unsigned_receipt, "sha256": canonical_sha256(unsigned_receipt)},
+        successor_plan=plan,
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -929,6 +1208,14 @@ def _validate_chained_predecessor_state(
         or migration.get("controller_stop_performed_by_this_tool") is not False
     ):
         raise RuntimeError("chained predecessor rolling migration seal mismatch")
+    external_attestation = migration.get("external_canary_attestation")
+    if external_attestation is not None:
+        if not isinstance(external_attestation, Mapping):
+            raise RuntimeError("external successor canary attestation is not an object")
+        validate_external_canary_attestation(
+            external_attestation,
+            successor_plan=primary_plan,
+        )
 
     stored_cohorts = migration.get("harvest_cohorts")
     if not isinstance(stored_cohorts, dict) or not stored_cohorts:
@@ -1110,6 +1397,10 @@ def _validate_chained_predecessor_state(
         )
         for stage in STAGES
     }
+    all_external_ids_empty = all(not task_ids for task_ids in expected_canary_ids.values())
+    external_attestation_present = external_attestation is not None
+    if external_attestation_present != all_external_ids_empty:
+        raise RuntimeError("chained predecessor external canary linkage mismatch")
     if (
         migration.get("successor_canary_task_ids_by_stage") != expected_canary_ids
         or (
@@ -1230,11 +1521,23 @@ def prepare_successor_state(
     before_final_state_read: Callable[[], None] | None = None,
     ancestor_plan_paths: Sequence[Path] = (),
     allow_running_predecessor_shadow: bool = False,
+    external_canary_driver_state_path: Path | None = None,
+    external_canary_monitoring_capability_path: Path | None = None,
+    external_canary_gate_reader: ExternalCanaryGateReader | None = None,
 ) -> dict[str, Any]:
     """Validate and optionally atomically write a migration controller state."""
 
     if apply and allow_running_predecessor_shadow:
         raise RuntimeError("a live predecessor shadow can never be applied")
+    external_inputs = (
+        external_canary_driver_state_path,
+        external_canary_monitoring_capability_path,
+        external_canary_gate_reader,
+    )
+    if any(item is not None for item in external_inputs) and not all(
+        item is not None for item in external_inputs
+    ):
+        raise RuntimeError("external canary reuse requires every attestation input")
     predecessor_plan_raw = _read_json(predecessor_plan_path.resolve(strict=True))
     predecessor_resources = predecessor_plan_raw.get("resources")
     predecessor_quotas = (
@@ -1326,6 +1629,21 @@ def prepare_successor_state(
         + 1
         for stage in STAGES
     }
+    external_canary_attestation: dict[str, Any] | None = None
+    if external_canary_driver_state_path is not None:
+        assert external_canary_monitoring_capability_path is not None
+        assert external_canary_gate_reader is not None
+        external_canary_attestation = authenticate_external_batch1_canaries(
+            driver_state=_read_json(
+                external_canary_driver_state_path.resolve(strict=True)
+            ),
+            monitoring_capability=_read_json(
+                external_canary_monitoring_capability_path.resolve(strict=True)
+            ),
+            successor_plan=successor_plan,
+            scheduler=scheduler,
+            gate_reader=external_canary_gate_reader,
+        )
     predecessor_generations = _plan_fixed_generations(predecessor_plan)
     if predecessor_generations not in SUPPORTED_PREDECESSOR_GENERATIONS:
         raise RuntimeError("unsupported predecessor science transition")
@@ -1498,6 +1816,7 @@ def prepare_successor_state(
     }
     if sum(active_by_stage.values()) > TOTAL_ACTIVE_QUOTA:
         raise RuntimeError("predecessor scheduler inventory exceeds total active quota")
+    imported_entry_count = len(entries)
     normalized_inventory = sorted(
         (
             {
@@ -1532,7 +1851,7 @@ def prepare_successor_state(
         "successor_launch_plan_sha256": successor_plan["launch_plan_sha256"],
         "scheduler_inventory_sha256": canonical_sha256(normalized_inventory),
         "scheduler_complete_inventory_snapshot": inventory_snapshot_receipt,
-        "predecessor_entry_count": len(entries),
+        "predecessor_entry_count": imported_entry_count,
         "imported_active_count_by_stage": active_by_stage,
         "predecessor_next_seed_by_stage": copy.deepcopy(
             predecessor_state["next_seed_by_stage"]
@@ -1548,13 +1867,32 @@ def prepare_successor_state(
             stage.stage_id: [] for stage in STAGES
         },
         "successor_canary_status_by_stage": {
-            stage.stage_id: "waiting_for_natural_terminal_gap" for stage in STAGES
+            stage.stage_id: (
+                "remote_preflight_passed"
+                if external_canary_attestation is not None
+                else "waiting_for_natural_terminal_gap"
+            )
+            for stage in STAGES
         },
         "scheduler_mutation_endpoints": ["POST /api/tasks"],
         "cancellation_performed": False,
         "preemption_performed": False,
         "controller_stop_performed_by_this_tool": False,
     }
+    if external_canary_attestation is not None:
+        migration_payload["external_canary_attestation"] = copy.deepcopy(
+            external_canary_attestation
+        )
+        migration_payload.update(
+            {
+                "external_canary_imported_active_count": sum(
+                    active_by_stage.values()
+                ),
+                "external_canary_initial_shortfall": (
+                    TOTAL_ACTIVE_QUOTA - sum(active_by_stage.values())
+                ),
+            }
+        )
     if predecessor_controller_kind == "chained_patched_successor":
         catalog = copy.deepcopy(predecessor_state["_harvest_cohort_catalog"])
         successor_cohort_id = _cohort_id(
@@ -1617,8 +1955,10 @@ def prepare_successor_state(
         "revision": 0,
         "parent_state_sha256": predecessor_state_raw["state_sha256"],
         "stop_requested": False,
-        "ramp_released": False,
-        "canary_passed_stage_ids": [],
+        "ramp_released": external_canary_attestation is not None,
+        "canary_passed_stage_ids": (
+            sorted(BY_ID) if external_canary_attestation is not None else []
+        ),
         "entries": entries,
         "next_seed_by_stage": copy.deepcopy(successor_next_seed_by_stage),
         "scheduler_name_prefix": TASK_NAME_PREFIX,
@@ -1658,9 +1998,12 @@ def prepare_successor_state(
         ),
         "shadow_only": bool(migration.get("shadow_only", False)),
         "cutover_ready": not bool(migration.get("shadow_only", False)),
-        "predecessor_entry_count": len(entries),
+        "predecessor_entry_count": imported_entry_count,
         "imported_active_count": sum(active_by_stage.values()),
         "imported_active_count_by_stage": active_by_stage,
+        "initial_active_shortfall": (
+            TOTAL_ACTIVE_QUOTA - sum(active_by_stage.values())
+        ),
         "logical_active_target": TOTAL_ACTIVE_QUOTA,
         "predecessor_next_seed_by_stage": copy.deepcopy(
             predecessor_state["next_seed_by_stage"]
@@ -1680,6 +2023,19 @@ def prepare_successor_state(
         ),
         "successor_canary_gap_policy": copy.deepcopy(
             migration.get("successor_canary_gap_policy")
+        ),
+        "external_canary_attestation_sha256": (
+            external_canary_attestation["sha256"]
+            if external_canary_attestation is not None
+            else None
+        ),
+        "external_canary_source_task_ids": (
+            sorted(
+                int(item["task_id"])
+                for item in external_canary_attestation["stage_attestations"].values()
+            )
+            if external_canary_attestation is not None
+            else []
         ),
         "harvest_cohort_ids": sorted(migration["harvest_cohorts"]),
         "namespace_extra_task_ids": namespace_extra_task_ids,
@@ -1719,6 +2075,21 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--external-canary-driver-state",
+        type=Path,
+        help=(
+            "sealed Phase-A driver state whose completed batch1 lanes are "
+            "re-read as successor canary evidence"
+        ),
+    )
+    parser.add_argument(
+        "--external-canary-monitoring-capability",
+        type=Path,
+        help=(
+            "sealed monitoring capability bound to --external-canary-driver-state"
+        ),
+    )
+    parser.add_argument(
         "--evidence-output",
         type=Path,
         help="atomically write a sealed local receipt for a non-applying dry-run",
@@ -1752,7 +2123,18 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parser().parse_args(argv)
-    scheduler = SchedulerApiClient(args.scheduler_url)
+    # Full terminal history is required exactly once while preparing a
+    # handoff.  The long-running successor controller deliberately continues
+    # to use the bounded SchedulerApiClient inventory path.
+    scheduler = CompleteInventorySchedulerApiClient(args.scheduler_url)
+    external_gate_reader: ExternalCanaryGateReader | None = None
+    if args.external_canary_driver_state is not None:
+        try:
+            from tier1_final1000_multiseed_driver import SchedulerGateReader
+        except ImportError:  # pragma: no cover - repository import path
+            from tools.tier1_final1000_multiseed_driver import SchedulerGateReader
+
+        external_gate_reader = SchedulerGateReader(args.scheduler_url)
     with scheduler_publication_transport(
         accounts_path=args.accounts,
         scheduler_source=args.scheduler_source,
@@ -1770,6 +2152,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             apply=args.apply,
             ancestor_plan_paths=args.ancestor_plan,
             allow_running_predecessor_shadow=args.allow_running_predecessor_shadow,
+            external_canary_driver_state_path=args.external_canary_driver_state,
+            external_canary_monitoring_capability_path=(
+                args.external_canary_monitoring_capability
+            ),
+            external_canary_gate_reader=external_gate_reader,
             transition_mode=(
                 RESOURCE_QUOTA_ONLY if args.resource_quota_only else PATCHED_BUNDLE
             ),
@@ -1788,6 +2175,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.predecessor_state,
                 args.successor_plan,
                 args.successor_state,
+                *(
+                    [args.external_canary_driver_state]
+                    if args.external_canary_driver_state is not None
+                    else []
+                ),
+                *(
+                    [args.external_canary_monitoring_capability]
+                    if args.external_canary_monitoring_capability is not None
+                    else []
+                ),
                 *args.ancestor_plan,
             )
         }

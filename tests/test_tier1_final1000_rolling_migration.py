@@ -10,7 +10,12 @@ import pytest
 
 from tools import tier1_final1000_rolling_migration as migration
 from tools import tier1_corrected_current7_slurm_controller as current7_controller
+from tools import tier1_corrected_current7_slurm_bundle as single_contract
+from tools import tier1_final1000_multiseed_contract as multiseed_contract
 from tools import tier1_final1000_multiseed_controller as multiseed_controller
+from tools import tier1_final1000_multiseed_driver as multiseed_driver
+from tools import tier1_final1000_multiseed_monitor as multiseed_monitor
+from tools import tier1_final1000_multiseed_status as multiseed_status
 from tools import tier1_final1000_slurm_controller as controller
 from tools import tier1_final1000_slurm_launch as launch
 from tools import tier1_final1000_stage_profiles as profiles
@@ -932,6 +937,61 @@ def test_seed_status_http_429_retries_are_bounded(monkeypatch):
     assert sleeps == [0.25, 0.5]
 
 
+def test_migration_cli_alone_uses_complete_inventory_reader(
+    monkeypatch, tmp_path, capsys
+):
+    constructed: list[tuple[str, object]] = []
+
+    class CompleteReader:
+        def __init__(self, scheduler_url):
+            constructed.append((scheduler_url, self))
+
+    class TransportContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    def prepare(**kwargs):
+        assert kwargs["scheduler"] is constructed[0][1]
+        return {
+            "apply": False,
+            "scheduler_post_count": 0,
+            "successor_state": {},
+        }
+
+    monkeypatch.setattr(
+        migration, "CompleteInventorySchedulerApiClient", CompleteReader
+    )
+    monkeypatch.setattr(
+        migration,
+        "scheduler_publication_transport",
+        lambda **_kwargs: TransportContext(),
+    )
+    monkeypatch.setattr(migration, "prepare_successor_state", prepare)
+    migration.main(
+        [
+            "--predecessor-plan",
+            str(tmp_path / "predecessor-plan.json"),
+            "--predecessor-state",
+            str(tmp_path / "predecessor-state.json"),
+            "--successor-plan",
+            str(tmp_path / "successor-plan.json"),
+            "--successor-state",
+            str(tmp_path / "successor-state.json"),
+            "--scheduler-url",
+            "http://scheduler:8002",
+        ]
+    )
+
+    assert constructed == [("http://scheduler:8002", constructed[0][1])]
+    assert json.loads(capsys.readouterr().out) == {
+        "apply": False,
+        "scheduler_post_count": 0,
+    }
+
+
 def test_busy_seed_status_holds_canary_pending_without_false_pass(tmp_path):
     fixture = _fixture(tmp_path)
 
@@ -1693,3 +1753,434 @@ def test_prepare_rejects_unstopped_controller_and_scheduler_identity_tamper(tmp_
     first["cpus"] = 1
     with pytest.raises(RuntimeError, match="seal differs from ledger"):
         _prepare(fixture, apply=False)
+
+
+def _phase_a_safe_successor_plan() -> dict:
+    value = _successor_plan()
+    for stage in profiles.STAGES:
+        value["stage_bindings"][stage.stage_id]["remote_bundle"] = (
+            f"/gpfs/successor-{stage.stage_id}"
+        )
+    for wave_name in ("canaries", "ramp"):
+        for task in value["task_waves"][wave_name]:
+            stage_id = task["payload_json"]["final_goal_stage_id"]
+            task["remote_cwd"] = value["stage_bindings"][stage_id]["remote_bundle"]
+            task["command"] = multiseed_contract._single_seed_command(
+                launch.canonical_sha256(task["payload_json"])
+            )
+    unsigned = {
+        key: item for key, item in value.items() if key != "launch_plan_sha256"
+    }
+    value["launch_plan_sha256"] = launch.canonical_sha256(unsigned)
+    return migration.validate_successor_plan(value)
+
+
+def _external_monitoring_capability(tmp_path: Path) -> dict:
+    snapshot = multiseed_status.build_compact_snapshot(
+        stage_id=profiles.STAGES[0].stage_id,
+        physical_lanes=[],
+        seed_records=[],
+    )
+    snapshot_root = tmp_path / "monitor-snapshot"
+    multiseed_status.publish_compact_snapshot(snapshot_root, *snapshot)
+    backend = tmp_path / "backend.py"
+    backend.write_text("CAPABILITY = 'compact-v2'\n", encoding="utf-8")
+    evidence = tmp_path / "monitor-tests.json"
+    evidence.write_text('{"passed":true,"tests":1}\n', encoding="utf-8")
+    return multiseed_monitor.build_backend_capability_receipt(
+        index_path=snapshot_root / "index.json",
+        code_files={
+            "tools/tier1_final1000_multiseed_monitor.py": Path(
+                multiseed_monitor.__file__
+            ),
+            "tools/tier1_final1000_multiseed_status.py": Path(
+                multiseed_status.__file__
+            ),
+        },
+        code_revision="a" * 40,
+        backend_files={"regression_260707/monitor.py": backend},
+        backend_revision="b" * 40,
+        test_evidence_files={"tests/monitor.json": evidence},
+        test_revision="c" * 40,
+    )
+
+
+class _ExternalGateReader:
+    def __init__(self, scheduler: _Scheduler, *, mode: str = "pass"):
+        self.scheduler = scheduler
+        self.mode = mode
+
+    def lane_evidence(self, task_id: int, seeds):
+        if self.mode == "missing":
+            return None
+        if self.mode == "429":
+            raise urllib.error.HTTPError(
+                "http://scheduler/remote-file",
+                429,
+                "busy",
+                {},
+                io.BytesIO(b"busy"),
+            )
+        task = self.scheduler.by_id[int(task_id)]["task_json"]
+        manifest = multiseed_contract.batch_manifest_from_payload(
+            task["payload_json"]
+        )
+        receipts = []
+        for ordinal, child in enumerate(manifest["ordered_children"]):
+            legacy = {
+                "schema_version": single_contract.STATUS_SCHEMA,
+                "state": "completed",
+                "terminal": True,
+                "seed": child["seed"],
+            }
+            receipts.append(
+                multiseed_contract.seal_child_receipt(
+                    {
+                        "schema_version": multiseed_contract.CHILD_RECEIPT_SCHEMA,
+                        "protocol_version": multiseed_contract.PROTOCOL_VERSION,
+                        "task_id": str(task_id),
+                        "manifest_sha256": manifest["manifest_sha256"],
+                        "ordinal": ordinal,
+                        "seed": child["seed"],
+                        "payload_sha256": child["payload_sha256"],
+                        "logical_dedupe_key": child["logical_dedupe_key"],
+                        "state": "completed",
+                        "terminal": True,
+                        "lane_fatal": False,
+                        "exit_code": 0,
+                        "legacy_status": legacy,
+                        "legacy_status_sha256": launch.canonical_sha256(legacy),
+                        "result_sha256": "d" * 64,
+                        "started_at": "2026-07-22T00:00:00+00:00",
+                        "finished_at": "2026-07-22T00:01:00+00:00",
+                        "wall_time_seconds": 60.0,
+                        "failure": None,
+                        "production_eligible": False,
+                        "fea_submission_performed": False,
+                        "aedt_used": False,
+                    }
+                )
+            )
+        failed = self.mode == "failed"
+        status = multiseed_contract.seal_task_status(
+            {
+                "schema_version": multiseed_contract.TASK_STATUS_SCHEMA,
+                "protocol_version": multiseed_contract.PROTOCOL_VERSION,
+                "task_id": str(task_id),
+                "manifest_sha256": manifest["manifest_sha256"],
+                "state": "failed" if failed else "completed",
+                "stop_requested": False,
+                "stop_reason": None,
+                "current_ordinal": None,
+                "current_seed": None,
+                "sealed_child_count": len(seeds),
+                "completed_child_count": 0 if failed else len(seeds),
+                "failed_child_count": len(seeds) if failed else 0,
+                "started_at": "2026-07-22T00:00:00+00:00",
+                "updated_at": "2026-07-22T00:01:00+00:00",
+                "finished_at": "2026-07-22T00:01:00+00:00",
+                "subprocess_per_seed": True,
+                "model_context_reuse": False,
+                "scheduler_mutation_performed": False,
+                "fea_submission_performed": False,
+                "aedt_used": False,
+            }
+        )
+        return {
+            "manifest": manifest,
+            "task_status": status,
+            "child_receipts": receipts,
+        }
+
+
+def _external_canary_fixture(tmp_path: Path) -> dict:
+    successor = _phase_a_safe_successor_plan()
+    predecessor = _predecessor_plan(successor)
+    state = _predecessor_state(predecessor)
+    for entry in state["entries"]:
+        entry["state"] = "running"
+    terminal_budget = {
+        "entry-1200-t125": 6,
+        "bridge-1150-t115": 4,
+        "close-1075-t107p5": 2,
+        "final-1000-t100": 0,
+    }
+    for entry in state["entries"]:
+        stage_id = entry["stage_id"]
+        if terminal_budget[stage_id] > 0:
+            entry["state"] = "completed"
+            terminal_budget[stage_id] -= 1
+    assert not any(terminal_budget.values())
+    state = controller._seal_state(state)
+    scheduler = _Scheduler(predecessor, state)
+    capability = _external_monitoring_capability(tmp_path)
+    driver_state = multiseed_driver.initial_driver_state(
+        state, predecessor, successor, capability
+    )
+    gates = {"batch1": {}, "batch4": {}}
+    next_task_id = 810_000
+    for stage in profiles.STAGES:
+        next_task_id += 1
+        task = multiseed_controller.build_reserved_gate_task(
+            successor, stage_id=stage.stage_id, phase="batch1"
+        )
+        row = {
+            **copy.deepcopy(task),
+            "id": next_task_id,
+            "task_id": next_task_id,
+            "status": "completed",
+            "state": "succeeded",
+            "task_json": copy.deepcopy(task),
+        }
+        scheduler.by_id[next_task_id] = row
+        scheduler.by_dedupe[task["dedupe_key"]] = row
+        gates["batch1"][task["dedupe_key"]] = {
+            "parent_dedupe_key": task["dedupe_key"],
+            "stage_id": stage.stage_id,
+            "batch_length": 1,
+            "task_id": next_task_id,
+            "state": "passed",
+            "task": task,
+            "task_sha256": launch.canonical_sha256(task),
+        }
+    driver_state = multiseed_driver._advance_driver(
+        driver_state,
+        successor,
+        capability,
+        gate_lanes=gates,
+        phase="batch4",
+    )
+    paths = {}
+    for name, value in (
+        ("predecessor_plan", predecessor),
+        ("predecessor_state", state),
+        ("successor_plan", successor),
+        ("driver_state", driver_state),
+        ("monitoring_capability", capability),
+    ):
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        paths[f"{name}_path"] = path
+    return {
+        "predecessor": predecessor,
+        "state": state,
+        "successor": successor,
+        "driver_state": driver_state,
+        "capability": capability,
+        "scheduler": scheduler,
+        "ready": _Ready(predecessor, successor),
+        "successor_state_path": tmp_path / "successor-state.json",
+        **paths,
+    }
+
+
+def _prepare_external(fixture: dict, *, reader=None):
+    return migration.prepare_successor_state(
+        predecessor_plan_path=fixture["predecessor_plan_path"],
+        predecessor_state_path=fixture["predecessor_state_path"],
+        successor_plan_path=fixture["successor_plan_path"],
+        successor_state_path=fixture["successor_state_path"],
+        scheduler=fixture["scheduler"],
+        predecessor_ready_probe=fixture["ready"],
+        successor_ready_probe=fixture["ready"],
+        apply=False,
+        transition_mode=migration.PATCHED_BUNDLE,
+        external_canary_driver_state_path=fixture["driver_state_path"],
+        external_canary_monitoring_capability_path=fixture[
+            "monitoring_capability_path"
+        ],
+        external_canary_gate_reader=(
+            reader or _ExternalGateReader(fixture["scheduler"])
+        ),
+    )
+
+
+def test_external_batch1_attestation_releases_first_cycle_refill_post0_shadow(
+    tmp_path,
+):
+    fixture = _external_canary_fixture(tmp_path)
+    result = _prepare_external(fixture)
+    state = result["successor_state"]
+    migration_value = state["rolling_migration"]
+    receipt = migration_value["external_canary_attestation"]
+
+    assert result["imported_active_count"] == 488
+    assert result["initial_active_shortfall"] == 12
+    assert result["scheduler_post_count"] == 0
+    assert fixture["scheduler"].post_count == 0
+    assert fixture["scheduler"].mutations == []
+    assert state["ramp_released"] is True
+    assert set(state["canary_passed_stage_ids"]) == set(profiles.BY_ID)
+    assert migration_value["successor_canary_task_ids_by_stage"] == {
+        stage.stage_id: [] for stage in profiles.STAGES
+    }
+    assert migration_value["successor_canary_status_by_stage"] == {
+        stage.stage_id: "remote_preflight_passed" for stage in profiles.STAGES
+    }
+    assert receipt["source_driver_state_sha256"] == fixture["driver_state"][
+        "state_sha256"
+    ]
+    assert receipt["successor_launch_plan_sha256"] == fixture["successor"][
+        "launch_plan_sha256"
+    ]
+    assert sorted(
+        item["task_id"] for item in receipt["stage_attestations"].values()
+    ) == [810_001, 810_002, 810_003, 810_004]
+    assert all(
+        item["seeds"] == [profiles.BY_ID[stage_id].seed_window_end_exclusive - 5]
+        for stage_id, item in receipt["stage_attestations"].items()
+    )
+    assert not any(entry["state"] == "planned" for entry in state["entries"])
+    controller._validate_state(state, fixture["successor"])
+
+    # Two more natural terminals may appear after the migration snapshot but
+    # before the first successor cycle.  Because the external receipt already
+    # released the ramp, that same first cycle must reconcile all 14 gaps,
+    # submit safe-bundle refills, and return to exact500.
+    newly_terminal = 0
+    for task in fixture["scheduler"].by_id.values():
+        if (
+            task.get("status") == "running"
+            and task.get("payload_json", {}).get("bundle_id", "").startswith(
+                "predecessor-"
+            )
+            and newly_terminal < 2
+        ):
+            task["status"] = "completed"
+            task["state"] = "succeeded"
+            fixture["scheduler"].by_dedupe[task["dedupe_key"]]["status"] = (
+                "completed"
+            )
+            fixture["scheduler"].by_dedupe[task["dedupe_key"]]["state"] = (
+                "succeeded"
+            )
+            newly_terminal += 1
+    assert newly_terminal == 2
+    task_ids_before_first_cycle = set(fixture["scheduler"].by_id)
+    fixture["successor_state_path"].write_text(json.dumps(state), encoding="utf-8")
+    first = controller.control_once(
+        fixture["successor_plan_path"],
+        state_path=fixture["successor_state_path"],
+        apply=True,
+        scheduler=fixture["scheduler"],
+        ready_probe=fixture["ready"],
+    )
+    assert first["active_count"] == 500
+    assert sum(first["active_count_by_stage"].values()) == 500
+    assert first["scheduler_post_count"] == 14
+    refill_action = next(
+        action for action in first["actions"] if action["action"] == "refill"
+    )
+    assert refill_action["reserved"] == 14
+    assert refill_action["submitted"] == 14
+    assert refill_action["reconciled"] == 0
+    assert first["cancellation_performed"] is False
+    assert state["rolling_migration"]["preemption_performed"] is False
+    assert fixture["scheduler"].mutations == ["POST /api/tasks"] * 14
+    submitted = [
+        task
+        for task_id, task in fixture["scheduler"].by_id.items()
+        if task_id not in task_ids_before_first_cycle
+    ]
+    assert len(submitted) == 14
+    assert all(
+        task["payload_json"]["bundle_id"]
+        == fixture["successor"]["stage_bindings"][
+            task["payload_json"]["final_goal_stage_id"]
+        ]["bundle_id"]
+        for task in submitted
+    )
+
+
+@pytest.mark.parametrize("mode", ["missing", "429", "failed"])
+def test_external_batch1_remote_evidence_failures_fail_closed(tmp_path, mode):
+    fixture = _external_canary_fixture(tmp_path / mode)
+    with pytest.raises(RuntimeError, match="external successor canary"):
+        _prepare_external(
+            fixture,
+            reader=_ExternalGateReader(fixture["scheduler"], mode=mode),
+        )
+    assert fixture["scheduler"].post_count == 0
+    assert fixture["scheduler"].mutations == []
+
+
+def test_external_batch1_driver_and_scheduler_tamper_fail_closed(tmp_path):
+    fixture = _external_canary_fixture(tmp_path / "driver")
+    damaged = copy.deepcopy(fixture["driver_state"])
+    damaged["phase"] = "refill"
+    fixture["driver_state_path"].write_text(json.dumps(damaged), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="driver state seal mismatch"):
+        _prepare_external(fixture)
+
+    fixture = _external_canary_fixture(tmp_path / "scheduler")
+    task = fixture["scheduler"].by_id[810_001]
+    task["task_json"] = copy.deepcopy(task["task_json"])
+    task["task_json"]["cpus"] = 1
+    with pytest.raises(RuntimeError, match="Scheduler task identity drifted"):
+        _prepare_external(fixture)
+    assert fixture["scheduler"].post_count == 0
+
+
+def test_external_attestation_semantic_linkage_and_seed_are_fail_closed(tmp_path):
+    fixture = _external_canary_fixture(tmp_path)
+    state = _prepare_external(fixture)["successor_state"]
+
+    missing = copy.deepcopy(state)
+    missing["rolling_migration"].pop("external_canary_attestation")
+    missing["rolling_migration"] = migration._seal_nested(
+        missing["rolling_migration"]
+    )
+    missing = controller._seal_state(missing)
+    with pytest.raises(RuntimeError, match="rolling migration ledger seal mismatch"):
+        controller._validate_state(missing, fixture["successor"])
+
+    wrong_ramp = copy.deepcopy(state)
+    wrong_ramp["ramp_released"] = False
+    wrong_ramp = controller._seal_state(wrong_ramp)
+    with pytest.raises(RuntimeError, match="rolling migration ledger seal mismatch"):
+        controller._validate_state(wrong_ramp, fixture["successor"])
+
+    wrong_seed = copy.deepcopy(state)
+    receipt = wrong_seed["rolling_migration"]["external_canary_attestation"]
+    first_stage = profiles.STAGES[0]
+    receipt["stage_attestations"][first_stage.stage_id]["seeds"] = [
+        first_stage.seed_window_end_exclusive - 4
+    ]
+    receipt_unsigned = {key: item for key, item in receipt.items() if key != "sha256"}
+    receipt["sha256"] = migration.canonical_sha256(receipt_unsigned)
+    wrong_seed["rolling_migration"] = migration._seal_nested(
+        wrong_seed["rolling_migration"]
+    )
+    wrong_seed = controller._seal_state(wrong_seed)
+    with pytest.raises(RuntimeError, match="stage attestation drifted"):
+        controller._validate_state(wrong_seed, fixture["successor"])
+
+def test_external_canary_prepare_fails_on_final_predecessor_drift(tmp_path):
+    fixture = _external_canary_fixture(tmp_path)
+
+    def drift():
+        current = json.loads(fixture["predecessor_state_path"].read_text())
+        current["revision"] += 1
+        current = controller._seal_state(current)
+        fixture["predecessor_state_path"].write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+
+    with pytest.raises(RuntimeError, match="drifted during migration"):
+        migration.prepare_successor_state(
+            predecessor_plan_path=fixture["predecessor_plan_path"],
+            predecessor_state_path=fixture["predecessor_state_path"],
+            successor_plan_path=fixture["successor_plan_path"],
+            successor_state_path=fixture["successor_state_path"],
+            scheduler=fixture["scheduler"],
+            predecessor_ready_probe=fixture["ready"],
+            successor_ready_probe=fixture["ready"],
+            apply=False,
+            transition_mode=migration.PATCHED_BUNDLE,
+            before_final_state_read=drift,
+            external_canary_driver_state_path=fixture["driver_state_path"],
+            external_canary_monitoring_capability_path=fixture[
+                "monitoring_capability_path"
+            ],
+            external_canary_gate_reader=_ExternalGateReader(fixture["scheduler"]),
+        )
