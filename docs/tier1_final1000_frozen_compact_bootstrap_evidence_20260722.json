@@ -1,0 +1,83 @@
+{
+  "schema_version": "mft-tier1-final1000-frozen-compact-v2-bootstrap-local-evidence-v1",
+  "created_at_kst": "2026-07-22T16:37:43+09:00",
+  "base_revision": "77a9d485fd81b5405b837a04cc003f0e37e13a32",
+  "branch": "codex/8010-frozen-compact-bootstrap-260722",
+  "verified_contracts": {
+    "deterministic_pre_writer_bootstrap": true,
+    "existing_build_compact_snapshot_used": true,
+    "existing_publish_compact_snapshot_used": true,
+    "single_seed_physical_lane_present": true,
+    "batch4_physical_lane_present": true,
+    "positive_physical_task_ids_only": true,
+    "sealed_child_prefix_visible": true,
+    "unsealed_child_hidden": true,
+    "virtual_scheduler_task_ids_created": false,
+    "content_addressed_frozen_index": true,
+    "generated_json_probe_evidence": true,
+    "generated_junit_probe_evidence": true,
+    "adapter_code_identity_sealed": true,
+    "caller_backend_files_and_revision_sealed": true,
+    "frozen_index_identity_sealed": true,
+    "tamper_refused": true,
+    "relocation_refused": true,
+    "coherent_index_advance_refused": true,
+    "explicit_local_output_root_required": true,
+    "maximum_wire_bytes_exclusive": 33554432
+  },
+  "deterministic_probe": {
+    "stage_id": "final1000-compact-v2-bootstrap-probe",
+    "updated_at": "2026-07-22T00:00:00+00:00",
+    "physical_lane_count": 2,
+    "logical_seed_count": 5,
+    "logical_sealed_seed_count": 3,
+    "logical_unsealed_seed_count": 2,
+    "hidden_unsealed_seed_record_count": 1,
+    "authenticated_terminal_seed_count": 3,
+    "index_bytes": 1300,
+    "status_bytes": 1733,
+    "manifest_bytes": 958,
+    "shard_bytes": [
+      634,
+      440
+    ],
+    "index_file_sha256": "f65bf5a1368c4f840fef1cac34119a746cb271b063cb275cf483446b2594604c",
+    "index_sha256": "aafe88c9cde40e2d34fa57a546417b3267def9365831320cd244e2ada8ac0ad1",
+    "status_file_sha256": "66815036f5e26f917dd1c65ad9d2f0ebcf40ace3733241ce73b1e78b574a78b0",
+    "status_sha256": "4fa2dabc0f4daf9dd6b99ba8bb6f24297d3d82d69551c46dcabd82a161bfb28a",
+    "manifest_file_sha256": "27e1d6da05657591efd858f443b77828e5127a496483fafdab3d825477c89810",
+    "manifest_sha256": "babf107541c776fd81ff4ea07620b7a1179d74727d23f5aff3a0883d3854e170"
+  },
+  "tests": {
+    "focused_command": "python -m pytest -q tests/test_tier1_final1000_multiseed_monitor_bootstrap.py tests/test_tier1_final1000_multiseed_monitor.py tests/test_tier1_final1000_multiseed_consumer.py",
+    "focused_passed": 21,
+    "focused_failed": 0,
+    "broader_command": "python -m pytest -q tests/test_tier1_final1000_multiseed_monitor_bootstrap.py tests/test_tier1_final1000_multiseed_monitor.py tests/test_tier1_final1000_multiseed_consumer.py tests/test_tier1_final1000_multiseed_phase_a.py tests/test_tier1_final1000_multiseed_live_v3.py tests/test_tier1_final1000_delta_publish.py",
+    "broader_passed": 62,
+    "broader_failed": 0,
+    "broader_elapsed_seconds": 240.85
+  },
+  "static_checks": {
+    "ruff_format_check": "passed",
+    "ruff_check": "passed",
+    "compileall": "passed",
+    "git_diff_check": "passed"
+  },
+  "code_sha256": {
+    "tools/tier1_final1000_multiseed_monitor_bootstrap.py": "87abf905780304e81a3396c6446a63714ee04ef0b9ced7a2fc90e0c132b24a2b",
+    "tests/test_tier1_final1000_multiseed_monitor_bootstrap.py": "0a9a610a372cbb952be2d2c79921ce8a1a6c1f58e382709a36d4702c8d773c8c",
+    "docs/tier1_final1000_frozen_compact_bootstrap_20260722.md": "bd42f584ce602547d2d0f730db03636d7450cc3e3cc8ad9a58588db2eb5231a7"
+  },
+  "effects": {
+    "scheduler_http_requests": 0,
+    "scheduler_posts": 0,
+    "scheduler_cancellations": 0,
+    "remote_reads": 0,
+    "remote_writes": 0,
+    "port_8010_integration_performed": false,
+    "port_8010_restart_performed": false,
+    "current_fc51_modified": false,
+    "aedt_used": false,
+    "fea_submission_performed": false
+  }
+}
