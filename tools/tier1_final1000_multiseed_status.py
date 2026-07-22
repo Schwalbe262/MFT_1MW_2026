@@ -231,6 +231,7 @@ def build_compact_snapshot(
     frontend_static: Mapping[str, Any] | None = None,
     shard_size: int = DEFAULT_SHARD_SIZE,
     relative_root: str = "seed-results",
+    updated_at: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     """Return compact status, shard manifest, shard objects, and compact index."""
 
@@ -307,7 +308,7 @@ def build_compact_snapshot(
         "authenticated_terminal_seed_count",
     ):
         static.pop(forbidden, None)
-    timestamp = now()
+    timestamp = str(updated_at or now())
     status_unsigned = {
         "schema_version": COMPACT_STATUS_SCHEMA,
         "stage_id": stage_id,
@@ -532,8 +533,10 @@ def _safe_child(root: Path, relative: str) -> Path:
     return path
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
+def _atomic_write(path: Path, payload: bytes) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file() and path.read_bytes() == payload:
+        return 0
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         temporary.write_bytes(payload)
@@ -541,6 +544,7 @@ def _atomic_write(path: Path, payload: bytes) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+    return 1
 
 
 def publish_compact_snapshot(
@@ -549,6 +553,8 @@ def publish_compact_snapshot(
     shard_manifest: Mapping[str, Any],
     shard_objects: Sequence[Mapping[str, Any]],
     index: Mapping[str, Any],
+    *,
+    pointer_name: str = "index.json",
 ) -> int:
     """Publish only beneath a caller-supplied local root."""
 
@@ -594,5 +600,8 @@ def publish_compact_snapshot(
     writes += _immutable_write(
         _safe_child(root, str(status_ref.get("path") or "")), status_payload
     )
-    _atomic_write(_safe_child(root, "index.json"), json_bytes(index))
-    return writes + 1
+    pointer = PurePosixPath(pointer_name)
+    if len(pointer.parts) != 1 or pointer.suffix != ".json":
+        raise RuntimeError("compact snapshot pointer name is unsafe")
+    writes += _atomic_write(_safe_child(root, pointer_name), json_bytes(index))
+    return writes

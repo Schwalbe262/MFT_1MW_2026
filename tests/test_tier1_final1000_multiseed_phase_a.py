@@ -343,23 +343,25 @@ def test_batch4_contract_preserves_exact_child_identity_and_detects_tamper():
 
 
 def test_phase_a_child_thread_environment_matches_scheduler_cpu_request():
-    child = contract.build_batch_task(_child_tasks(1))["payload_json"]["children"][
-        0
-    ]["task"]
+    child = contract.build_batch_task(_child_tasks(1))["payload_json"]["children"][0][
+        "task"
+    ]
     environment = single_runner.optimizer_environment(
         {"OMP_NUM_THREADS": "99", "UNRELATED": "preserved"},
         child["payload_json"],
     )
     assert environment["UNRELATED"] == "preserved"
     assert {
-        environment[name]
-        for name in single_runner.THREAD_LIMIT_ENVIRONMENT_VARIABLES
+        environment[name] for name in single_runner.THREAD_LIMIT_ENVIRONMENT_VARIABLES
     } == {"4"}
-    assert generation_preflight.validate_search_thread_contract(
-        profile_inference_threads=8,
-        inference_threads=4,
-        scheduler_cpus=4,
-    ) == 4
+    assert (
+        generation_preflight.validate_search_thread_contract(
+            profile_inference_threads=8,
+            inference_threads=4,
+            scheduler_cpus=4,
+        )
+        == 4
+    )
     mismatched = copy.deepcopy(child["payload_json"])
     mismatched["inference_threads"] = 8
     with pytest.raises(RuntimeError, match="CPU/thread"):

@@ -1,0 +1,61 @@
+{
+  "schema_version": "mft-tier1-final1000-multiseed-consumer-local-evidence-v1",
+  "created_at": "2026-07-22T15:13:25+09:00",
+  "base_commit": "575d3d521fb9e18c53f54309c1bf057da6502863",
+  "branch": "codex/multiseed-production-harvester-260722",
+  "consumer_schema": "mft-tier1-final1000-multiseed-consumer-result-v1",
+  "capability_receipt_schema": "mft-tier1-final1000-multiseed-consumer-capability-v2",
+  "verified_contracts": {
+    "mixed_v1_v2_scheduler_inventory": true,
+    "scheduler_access": "GET-only",
+    "remote_access": "read-only",
+    "running_parent_stable_journal_read": true,
+    "sealed_child_count_prefix_only": true,
+    "exact_result_validation": true,
+    "bundle_seed_deduplication": true,
+    "compact_v2_atomic_publication": true,
+    "four_pointer_prepare_before_apply": true,
+    "live_v1_cohort_identity_preserved": true,
+    "virtual_scheduler_task_ids_created": false,
+    "shadow_default_is_write_free": true,
+    "canonical_v1_handoff_required": true,
+    "canonical_runtime_path_containment_sealed": true,
+    "active_os_writer_lease_sealed": true,
+    "canonical_driver_rejects_shadow_receipt": true,
+    "stop_restart_handoff": true,
+    "maximum_poll_seconds": 60,
+    "identity_schema_manifest_result_divergence_is_fatal": true,
+    "transport_retry_budget": 5
+  },
+  "tests": {
+    "focused_command": "python -m pytest -q tests/test_tier1_final1000_multiseed_consumer.py tests/test_tier1_final1000_multiseed_phase_a.py tests/test_tier1_final1000_multiseed_monitor.py",
+    "focused_passed": 33,
+    "broader_command": "python -m pytest -q tests/test_tier1_final1000_multiseed_consumer.py tests/test_tier1_final1000_multiseed_phase_a.py tests/test_tier1_final1000_multiseed_monitor.py tests/test_tier1_final1000_slurm_harvest.py tests/test_tier1_final1000_rolling_migration.py tests/test_tier1_final1000_stage_launch.py",
+    "broader_passed": 105
+  },
+  "static_checks": {
+    "ruff_format_check": "passed",
+    "ruff_check": "passed",
+    "py_compile": "passed",
+    "git_diff_check": "passed"
+  },
+  "code_sha256": {
+    "tools/tier1_final1000_multiseed_consumer.py": "78a3599582b45a5554dcf9302a8f0cd1deb6c50ae2e6e955e041deefcc1fadb6",
+    "tools/tier1_final1000_multiseed_harvest.py": "faa51b9988221beeda0024994c5162266b839ea51bd06370cbadf8f1cf5f985f",
+    "tools/tier1_final1000_multiseed_status.py": "8d61f5cb1476e49ed829ce6d9450b6137438244794fccc8df3a0b7595a9b29b3",
+    "tests/test_tier1_final1000_multiseed_consumer.py": "bba4be43c464d93c1984a03fdfc0b3dc951e424f094d1b86080b81ac23c0dfaa",
+    "tests/test_tier1_final1000_multiseed_phase_a.py": "39c733c5ad4e75029a0ad3b8b04ff51dac767543459918b43709df3f0f801ba7",
+    "docs/tier1_final1000_multiseed_consumer_20260722.md": "e764824abfa9a66512ebd91d8fdde0c28a60e85969a4e3f664819dac59bd4326"
+  },
+  "boundaries": {
+    "scheduler_http_mutation_performed": false,
+    "remote_publication_performed": false,
+    "task_submission_performed": false,
+    "task_cancellation_performed": false,
+    "live_harvester_pid_44816_stopped_or_modified": false,
+    "canonical_cutover_performed": false,
+    "deployment_performed": false,
+    "aedt_used": false,
+    "fea_submission_performed": false
+  }
+}

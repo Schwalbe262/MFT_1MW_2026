@@ -167,14 +167,24 @@ def harvest_batch_lane(
     manifest: Mapping[str, Any],
     remote: RemoteReader,
     result_validator: Callable[..., None] = validate_current7_result,
+    journal_snapshot: tuple[
+        Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], str
+    ]
+    | None = None,
 ) -> list[dict[str, Any]]:
     """Harvest journal-declared children even while the parent is running."""
 
-    parent_task = _batch_parent_task(item, plan=plan, manifest=manifest)
+    if journal_snapshot is None:
+        parent_task = _batch_parent_task(item, plan=plan, manifest=manifest)
+        batch_manifest, task_status, remote_root = _read_batch_journal(
+            item, parent_task=parent_task, remote=remote
+        )
+    else:
+        parent_task, batch_manifest, task_status, remote_root = journal_snapshot
+        expected_parent = _batch_parent_task(item, plan=plan, manifest=manifest)
+        if dict(parent_task) != expected_parent:
+            raise RuntimeError("preloaded batch journal parent identity mismatch")
     parent_payload = parent_task["payload_json"]
-    batch_manifest, task_status, remote_root = _read_batch_journal(
-        item, parent_task=parent_task, remote=remote
-    )
     account = str(item["account_name"])
     task_id = int(item["task_id"])
     scheduler_state = str(item.get("status") or "").lower()
@@ -182,11 +192,12 @@ def harvest_batch_lane(
     declared_sealed_count = int(task_status["sealed_child_count"])
     declared_completed = 0
     declared_failed = 0
-    # The mutable task journal is the sole visibility cursor.  In particular,
-    # an immutable child receipt that lands just before the journal advances is
-    # not yet public: scanning beyond this prefix would contradict the status
-    # capability and expose a running child without an authenticated cursor.
-    # Terminal crash recovery, if introduced, needs its own sealed attestation
+    # The mutable task-status cursor is the only authority that exposes child
+    # receipts to a consumer.  A receipt may already exist in the narrow
+    # receipt-before-cursor crash window, but reading it would make a later
+    # cursor rollback indistinguishable from an authenticated publication.
+    # Consume exactly the durable prefix and let the next poll observe the
+    # cursor advance. Terminal recovery needs a separate sealed attestation
     # instead of weakening this rule.
     for ordinal in range(declared_sealed_count):
         child = parent_payload["children"][ordinal]
@@ -324,6 +335,12 @@ def harvest_mixed_inventory(
     remote: RemoteReader,
     result_validator: Callable[..., None] = validate_current7_result,
     cohort_contexts: Mapping[str, Mapping[str, Any]] | None = None,
+    journal_snapshots: Mapping[
+        int,
+        tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], str],
+    ]
+    | None = None,
+    strict: bool = False,
 ) -> dict[str, Any]:
     """Flatten v1 terminal tasks and v2 journal progress into seed records."""
 
@@ -358,6 +375,7 @@ def harvest_mixed_inventory(
                         manifest=manifest,
                         remote=remote,
                         result_validator=result_validator,
+                        journal_snapshot=(journal_snapshots or {}).get(task_id),
                     )
                 )
             else:
@@ -395,6 +413,8 @@ def harvest_mixed_inventory(
                     observation["harvest_cohort_id"] = str(cohort_id)
                 observations.append(observation)
         except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
+            if strict:
+                raise
             refusals.append(
                 {
                     "task_id": task_id,
@@ -403,6 +423,33 @@ def harvest_mixed_inventory(
                 }
             )
     records = deduplicate_observations(observations)
+    provenance_by_identity: dict[tuple[str, int], tuple[int, int, str]] = {}
+    for observation in observations:
+        parent_task_id = observation.get("physical_parent_task_id")
+        if parent_task_id is None:
+            continue
+        identity = (str(observation["bundle_id"]), int(observation["seed"]))
+        provenance = (
+            int(parent_task_id),
+            int(observation["batch_ordinal"]),
+            str(observation["batch_manifest_sha256"]),
+        )
+        prior = provenance_by_identity.setdefault(identity, provenance)
+        if prior != provenance:
+            raise RuntimeError(
+                "one scientific seed has divergent physical batch provenance"
+            )
+    for record in records:
+        provenance = provenance_by_identity.get(
+            (str(record["bundle_id"]), int(record["seed"]))
+        )
+        if provenance is None:
+            continue
+        (
+            record["physical_parent_task_id"],
+            record["batch_ordinal"],
+            record["batch_manifest_sha256"],
+        ) = provenance
     return {
         "physical_task_count": len(physical_task_ids),
         "v1_physical_task_count": v1_count,
