@@ -7451,6 +7451,8 @@ def run_smoke_preflight(
     warm_start_paths: Mapping[int, Path],
     warm_start_sha256: Mapping[int, str],
     output: Path,
+    warm_start_contract_paths: Mapping[int, Path] | None = None,
+    warm_start_contract_sha256: Mapping[int, str] | None = None,
     stage_spec: Mapping[str, Any] | None = None,
     inference_threads: int = 1,
 ) -> Path:
@@ -7485,12 +7487,20 @@ def run_smoke_preflight(
         warm_start_sha256
     ) != set(SUPPORTED_FIXED_PRIMARY_TURNS):
         raise RuntimeError("warm-start inventory must contain exact N1=5 and N1=6 paths")
+    contract_paths = dict(warm_start_contract_paths or {})
+    contract_sha256 = dict(warm_start_contract_sha256 or {})
+    if (
+        set(contract_paths) != set(contract_sha256)
+        or not set(contract_paths) <= set(SUPPORTED_FIXED_PRIMARY_TURNS)
+    ):
+        raise RuntimeError("smoke warm-contract path/SHA inventory mismatch")
     for protected in (
         first_runner.authenticated.generation,
         first_runner.authenticated.registry,
         Path(first_runner.code_identity["path"]),
         coordinate_path.resolve(strict=True),
         *(warm_start_paths[turns].resolve(strict=True) for turns in SUPPORTED_FIXED_PRIMARY_TURNS),
+        *(contract_paths[turns].resolve(strict=True) for turns in contract_paths),
     ):
         if _path_is_below(output_root, protected) or _path_is_below(
             protected, output_root
@@ -7511,17 +7521,77 @@ def run_smoke_preflight(
         initial, initial_repair = runner.repair_coordinates(
             raw_coordinate, stage="initial_population"
         )
-        warm_raw, warm_authentication = load_authenticated_warm_start(
-            warm_start_paths[turns],
-            warm_start_sha256[turns],
-            n_var=runner.problem.n_var,
-        )
-        warm, warm_repair = runner.repair_coordinates(
-            warm_raw, stage="authenticated_warm_start"
-        )
-        filtered_warm, warm_filter = runner.problem.filter_warm_start_coordinates(warm)
-        if len(filtered_warm) < 1:
-            raise RuntimeError(f"N1={turns} warm pool has no repaired hard-feasible row")
+        if turns in contract_paths:
+            warm_raw, warm_authentication = authenticate_warm_handoff(
+                warm_start_paths[turns],
+                contract_paths[turns],
+                fixed_primary_turns=turns,
+                n_var=runner.problem.n_var,
+                expected_contract_file_sha256=contract_sha256[turns],
+            )
+            if (
+                (warm_authentication.get("artifact") or {}).get("sha256")
+                != str(warm_start_sha256[turns]).strip().lower()
+            ):
+                raise RuntimeError(
+                    f"N1={turns} smoke warm artifact SHA disagrees with contract"
+                )
+            filtered_warm, structural_donors, warm_role_audit = (
+                runner.prepare_authenticated_warm_start(
+                    warm_raw,
+                    role_partition=warm_authentication.get(
+                        "warm_role_partition"
+                    ),
+                    topology_niche_partition=warm_authentication.get(
+                        "topology_niche_partition"
+                    ),
+                    stage="authenticated_warm_start",
+                )
+            )
+            niche_partition = warm_authentication.get(
+                "topology_niche_partition"
+            )
+            warm_repair = warm_role_audit["repair"]
+            if niche_partition is not None:
+                # A topology-niche pool is deliberately a 160-row structural
+                # coordinate-donor handoff.  Its source may contain zero rows
+                # satisfying the final box/thermal search gates.  Authenticate
+                # its exact semantic partition and require all rows to survive
+                # the same decoder/manufacturing/insulation repair as the
+                # production runner; physical G is still evaluated unchanged.
+                if len(filtered_warm) != 160 or len(structural_donors) != 0:
+                    raise RuntimeError(
+                        f"N1={turns} topology niche smoke did not retain exact 160 donors"
+                    )
+                warm_filter = warm_role_audit["structural_geometry_filter"]
+                warm_filter_semantics = "structural_coordinate_donors"
+            else:
+                if len(filtered_warm) < 1:
+                    raise RuntimeError(
+                        f"N1={turns} warm pool has no repaired hard-feasible row"
+                    )
+                warm_filter = warm_role_audit[
+                    "standard_hard_geometry_filter"
+                ]
+                warm_filter_semantics = "hard_geometry_feasible"
+        else:
+            warm_raw, warm_authentication = load_authenticated_warm_start(
+                warm_start_paths[turns],
+                warm_start_sha256[turns],
+                n_var=runner.problem.n_var,
+            )
+            warm, warm_repair = runner.repair_coordinates(
+                warm_raw, stage="authenticated_warm_start"
+            )
+            filtered_warm, warm_filter = (
+                runner.problem.filter_warm_start_coordinates(warm)
+            )
+            if len(filtered_warm) < 1:
+                raise RuntimeError(
+                    f"N1={turns} warm pool has no repaired hard-feasible row"
+                )
+            warm_role_audit = None
+            warm_filter_semantics = "hard_geometry_feasible"
         mutation = np.mod(
             raw_coordinate
             + np.linspace(0.013, 0.211, runner.problem.n_var).reshape(1, -1),
@@ -7558,6 +7628,8 @@ def run_smoke_preflight(
                 "source_authentication": warm_authentication,
                 "coordinate_repair": warm_repair,
                 "hard_geometry_filter": warm_filter,
+                "filter_semantics": warm_filter_semantics,
+                "role_audit": warm_role_audit,
                 "filtered_coordinate_sha256": canonical_sha256(
                     np.asarray(filtered_warm, dtype=float).tolist()
                 ),
@@ -7619,6 +7691,8 @@ def _parser() -> argparse.ArgumentParser:
     smoke.add_argument("--warm-start-n1-5-sha256", required=True)
     smoke.add_argument("--warm-start-n1-6", type=Path, required=True)
     smoke.add_argument("--warm-start-n1-6-sha256", required=True)
+    smoke.add_argument("--warm-start-n1-6-contract", type=Path)
+    smoke.add_argument("--warm-start-n1-6-contract-sha256")
     smoke.add_argument("--output", type=Path, required=True)
     smoke.add_argument("--inference-threads", type=int, default=1)
     smoke.add_argument("--stage-spec-json")
@@ -7726,6 +7800,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if (args.stage_spec_json is None) != (args.stage_spec_sha256 is None):
         raise RuntimeError("smoke stage-spec JSON/SHA must be supplied together")
+    if (args.warm_start_n1_6_contract is None) != (
+        args.warm_start_n1_6_contract_sha256 is None
+    ):
+        raise RuntimeError("N1=6 smoke warm-contract path/SHA must be supplied together")
     smoke_stage_spec = (
         validate_stage_spec(CURRENT_STAGE_SPEC)
         if args.stage_spec_json is None
@@ -7749,6 +7827,16 @@ def main(argv: list[str] | None = None) -> int:
             5: args.warm_start_n1_5_sha256,
             6: args.warm_start_n1_6_sha256,
         },
+        warm_start_contract_paths=(
+            {}
+            if args.warm_start_n1_6_contract is None
+            else {6: args.warm_start_n1_6_contract}
+        ),
+        warm_start_contract_sha256=(
+            {}
+            if args.warm_start_n1_6_contract_sha256 is None
+            else {6: args.warm_start_n1_6_contract_sha256}
+        ),
         output=args.output,
         stage_spec=smoke_stage_spec,
         inference_threads=args.inference_threads,
