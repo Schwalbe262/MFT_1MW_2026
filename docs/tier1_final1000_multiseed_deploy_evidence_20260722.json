@@ -3,9 +3,9 @@
   "created_at_kst": "2026-07-22T16:43:16+09:00",
   "science_base_revision": "579c651b621198953f5a45ddf898a454f599e612",
   "integration_parent_revision": "3e24c9428d5d24400bd4dbc68736848ddd5f9f43",
-  "verified_code_revision": "6ff6caf003eebc311f290dac7bc554f21c59ac4b",
+  "verified_code_revision": "c15f22a76f0db9d0ef856a9456a3394b4d435e68",
   "code_hash_policy": "sha256(git-cat-file-blob-verified_code_revision:path)",
-  "branch": "codex/multiseed-publish-fix-local-260722",
+  "branch": "codex/final1000-multiseed-integrated-260722",
   "objective": {
     "physical_active_target": 500,
     "stage_physical_active_quotas": {
@@ -146,6 +146,9 @@
   "audit_corrections": {
     "mixed_eol_worktree_hashes_replaced": true,
     "hashes_derived_from_committed_blob_bytes": true,
+    "combined_history_rebound_from_revision": "6ff6caf003eebc311f290dac7bc554f21c59ac4b",
+    "combined_history_rebound_to_revision": "c15f22a76f0db9d0ef856a9456a3394b4d435e68",
+    "cherry_pick_preserved_all_15_committed_blob_hashes": true,
     "previous_full_format_claim_was_not_reproducible": true,
     "formatted_files": [
       "tools/tier1_final1000_multiseed_contract.py",
@@ -180,5 +183,5 @@
     "aedt_used": false,
     "fea_submission_performed": false
   },
-  "evidence_sha256": "a654779b9b713f40ff45ed1ecd1f66b32f4529aa2410ab926f8cdc103633652e"
+  "evidence_sha256": "1b70e844c3abd714b580395b5a50a0bea2ecc7413e7c6ffb6a1b4150a8588508"
 }
