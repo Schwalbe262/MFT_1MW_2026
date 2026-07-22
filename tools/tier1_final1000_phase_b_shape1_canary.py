@@ -14,12 +14,15 @@ from __future__ import annotations
 import argparse
 import copy
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 from typing import Any, Mapping, Sequence
 import urllib.parse
+import urllib.error
+import urllib.request
 
 try:
     from tier1_corrected_current7_receipt import canonical_sha256
@@ -42,8 +45,10 @@ try:
         CHILD_MEMORY_MB,
         INFERENCE_SAFETY,
         REMOTE_CODE_FILES,
+        batch_manifest_from_payload,
         build_concurrent_batch_task,
         validate_batch_task,
+        validate_batch_manifest,
         validate_child_receipt,
         validate_task_status,
     )
@@ -80,8 +85,10 @@ except ImportError:  # pragma: no cover - repository import path
         CHILD_MEMORY_MB,
         INFERENCE_SAFETY,
         REMOTE_CODE_FILES,
+        batch_manifest_from_payload,
         build_concurrent_batch_task,
         validate_batch_task,
+        validate_batch_manifest,
         validate_child_receipt,
         validate_task_status,
     )
@@ -101,6 +108,9 @@ CONFIG_SCHEMA = "mft-tier1-final1000-phase-b-shape1-diagnostic-config-v1"
 PACKAGE_SCHEMA = "mft-tier1-final1000-phase-b-shape1-diagnostic-package-v1"
 SUBMISSION_SCHEMA = "mft-tier1-final1000-phase-b-shape1-submission-v1"
 CPU_EVIDENCE_SCHEMA = "mft-tier1-final1000-phase-b-terminal-cpu-evidence-v1"
+REMOTE_TERMINAL_SCHEMA = (
+    "mft-tier1-final1000-phase-b-shape1-remote-terminal-evidence-v1"
+)
 ENTRY_STAGE_ID = "entry-1200-t125"
 FINAL1000_TASK_PREFIX = "mft-t1fg-"
 PAGE_SIZE = 10_000
@@ -1101,6 +1111,190 @@ def _submission_outcome(
     return value
 
 
+def _remote_file_bytes(
+    *, scheduler_url: str, task_id: int, relative_path: str
+) -> bytes:
+    if (
+        not relative_path
+        or relative_path.startswith("/")
+        or ".." in PurePosixPath(relative_path).parts
+    ):
+        raise RuntimeError("unsafe Scheduler remote evidence path")
+    query = urllib.parse.urlencode({"path": relative_path, "base": "remote_cwd"})
+    request = urllib.request.Request(
+        scheduler_url.rstrip("/")
+        + f"/api/tasks/{int(task_id)}/remote-file?{query}",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30.0) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Scheduler remote evidence GET failed for {relative_path}: {detail}"
+        ) from exc
+
+
+def _json_bytes_object(value: bytes, label: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"remote {label} is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"remote {label} must be a JSON object")
+    return parsed
+
+
+def evaluate_remote_terminal(
+    *,
+    package_path: Path,
+    submission_receipt_path: Path,
+    scheduler_url: str,
+    task_id: int,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Read and seal terminal shape1 evidence without any remote mutation."""
+
+    package = validate_package(_read_json(package_path, "diagnostic package"))
+    submission = _validate_submission_receipt(
+        _read_json(submission_receipt_path, "shape1 submission receipt"),
+        package=package,
+    )
+    if (
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or submission.get("task_id") != task_id
+    ):
+        raise RuntimeError("terminal evaluator task id/submission receipt mismatch")
+    scheduler = SchedulerApiClient(scheduler_url)
+    detail = scheduler.get_task(task_id)
+    observed_id, scheduler_status = _authenticate_task(
+        detail, package["parent_task"], label="terminal Scheduler task detail"
+    )
+    if observed_id != task_id:
+        raise RuntimeError("terminal Scheduler detail task id mismatch")
+    if scheduler_status not in {
+        "completed",
+        "failed",
+        "cancelled",
+        "timeout",
+        "timed_out",
+    }:
+        raise RuntimeError(
+            f"shape1 task {task_id} is not terminal: {scheduler_status}"
+        )
+
+    seed = int(package["seed"])
+    task_root = f"runs/task-{task_id}"
+    relative_paths = {
+        "batch_manifest": f"{task_root}/batch_manifest.json",
+        "task_status": f"{task_root}/task_status.json",
+        "child_receipt": f"{task_root}/seed-{seed}/seed_status.json",
+    }
+    raw = {
+        label: _remote_file_bytes(
+            scheduler_url=scheduler_url,
+            task_id=task_id,
+            relative_path=relative,
+        )
+        for label, relative in relative_paths.items()
+    }
+    manifest = validate_batch_manifest(
+        _json_bytes_object(raw["batch_manifest"], "batch manifest")
+    )
+    expected_manifest = batch_manifest_from_payload(package["parent_task"]["payload_json"])
+    if manifest != expected_manifest:
+        raise RuntimeError("remote terminal manifest differs from the submitted parent")
+    task_status = validate_task_status(
+        _json_bytes_object(raw["task_status"], "task status")
+    )
+    child_receipt = validate_child_receipt(
+        _json_bytes_object(raw["child_receipt"], "child receipt"),
+        manifest=manifest,
+    )
+    result_sha = child_receipt.get("result_sha256")
+    result_relative = f"{task_root}/seed-{seed}/result.json"
+    result_bytes = None
+    if result_sha is not None:
+        result_bytes = _remote_file_bytes(
+            scheduler_url=scheduler_url,
+            task_id=task_id,
+            relative_path=result_relative,
+        )
+        if hashlib.sha256(result_bytes).hexdigest() != result_sha:
+            raise RuntimeError("remote result bytes differ from child receipt SHA")
+
+    metrics = evaluate_terminal_cpu_evidence(
+        task_status,
+        [child_receipt],
+        expected_shape=1,
+    )
+    final_detail = scheduler.get_task(task_id)
+    final_id, final_status = _authenticate_task(
+        final_detail,
+        package["parent_task"],
+        label="post-evidence Scheduler task detail",
+    )
+    if final_id != task_id or final_status != scheduler_status:
+        raise RuntimeError("Scheduler identity/state changed during terminal evidence read")
+    file_records = {
+        label: {
+            "relative_path": relative_paths[label],
+            "size": len(value),
+            "sha256": hashlib.sha256(value).hexdigest(),
+        }
+        for label, value in raw.items()
+    }
+    file_records["result"] = {
+        "relative_path": result_relative,
+        "size": len(result_bytes) if result_bytes is not None else None,
+        "sha256": (
+            hashlib.sha256(result_bytes).hexdigest()
+            if result_bytes is not None
+            else None
+        ),
+    }
+    unsigned = {
+        "schema_version": REMOTE_TERMINAL_SCHEMA,
+        "observed_at": _now(),
+        "package_sha256": package["package_sha256"],
+        "submission_receipt_sha256": submission["receipt_sha256"],
+        "task_id": task_id,
+        "scheduler_status": scheduler_status,
+        "scheduler_detail_get_count": 2,
+        "scheduler_remote_file_get_count": 3 + int(result_bytes is not None),
+        "remote_files": file_records,
+        "batch_manifest_sha256": manifest["manifest_sha256"],
+        "task_status_sha256": task_status["status_sha256"],
+        "child_receipt_sha256": child_receipt["receipt_sha256"],
+        "terminal_cpu_evidence": metrics,
+        "terminal_cpu_evidence_sha256": metrics[
+            "terminal_cpu_evidence_sha256"
+        ],
+        "promotion_eligible": (
+            scheduler_status == "completed"
+            and metrics["promotion_eligible"] is True
+        ),
+        "shape4_submission_allowed": (
+            scheduler_status == "completed"
+            and metrics["promotion_eligible"] is True
+        ),
+        "scheduler_access": "GET-only",
+        "scheduler_post_count": 0,
+        "scheduler_cancel_count": 0,
+        "scheduler_preempt_count": 0,
+        "remote_access": "read-only",
+        "remote_write_count": 0,
+        "fea_submission_performed": False,
+        "aedt_used": False,
+    }
+    value = {**unsigned, "remote_terminal_sha256": canonical_sha256(unsigned)}
+    _atomic_json(output_path, value)
+    return value
+
+
 def submit(
     *,
     config_path: Path,
@@ -1161,6 +1355,10 @@ def _parser() -> argparse.ArgumentParser:
     evaluate = sub.add_parser(
         "evaluate", help="seal terminal CPU/affinity/RSS evidence from local JSON"
     )
+    evaluate_remote = sub.add_parser(
+        "evaluate-remote",
+        help="GET and seal submitted shape1 terminal evidence from Scheduler",
+    )
     for command in (render, submit_parser):
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--offload-plan", type=Path, required=True)
@@ -1183,6 +1381,15 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--shape", type=int, choices=(1, 4, 8), required=True)
     evaluate.add_argument("--baseline-metrics", type=Path)
     evaluate.add_argument("--out", type=Path, required=True)
+    evaluate_remote.add_argument("--package", type=Path, required=True)
+    evaluate_remote.add_argument(
+        "--submission-receipt", type=Path, required=True
+    )
+    evaluate_remote.add_argument(
+        "--scheduler-url", default="http://127.0.0.1:8002"
+    )
+    evaluate_remote.add_argument("--task-id", type=int, required=True)
+    evaluate_remote.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -1209,7 +1416,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             receipt_out=args.receipt_out,
             dry_run_out=args.dry_run_out,
         )
-    else:
+    elif args.operation == "evaluate":
         baseline = (
             _read_json(args.baseline_metrics, "baseline terminal CPU evidence")
             if args.baseline_metrics is not None
@@ -1225,6 +1432,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             baseline_metrics=baseline,
         )
         _atomic_json(args.out, value)
+    else:
+        value = evaluate_remote_terminal(
+            package_path=args.package,
+            submission_receipt_path=args.submission_receipt,
+            scheduler_url=args.scheduler_url,
+            task_id=args.task_id,
+            output_path=args.out,
+        )
     print(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
 
 

@@ -339,3 +339,133 @@ def test_terminal_cpu_evaluator_derives_core_use_and_blocks_low_utilization(
     assert "affinity-thread-environment" in low["low_cpu_diagnosis"]
     assert low["promotion_eligible"] is False
     assert low["automatic_promotion_performed"] is False
+
+
+def _submission_receipt_for_package(
+    package: dict[str, Any], *, task_id: int = 99001
+) -> dict[str, Any]:
+    unsigned = {
+        "schema_version": canary.SUBMISSION_SCHEMA,
+        "observed_at": "2026-07-23T02:42:57+09:00",
+        "apply": True,
+        "package_sha256": package["package_sha256"],
+        "bundle_id": package["bundle_id"],
+        "ready_sha256": package["ready_sha256"],
+        "remote_ready_reread_count": 1,
+        "complete_namespace_row_count": 1,
+        "complete_namespace_sha256": "c" * 64,
+        "parent_dedupe_key": package["parent_dedupe_key"],
+        "logical_child_dedupe_key": package["logical_child_dedupe_key"],
+        "both_dedupes_absent_before_post": True,
+        "task_id": task_id,
+        "task_status": "queued",
+        "submitted_count": 1,
+        "scheduler_endpoint": "POST /api/tasks",
+        "scheduler_post_count": 1,
+        "scheduler_cancel_count": 0,
+        "scheduler_preempt_count": 0,
+        "remote_write_count": 0,
+        "terminal_evidence": package["terminal_evidence"],
+        "terminal_gates": package["terminal_gates"],
+        "fea_submission_performed": False,
+        "aedt_used": False,
+    }
+    return {**unsigned, "receipt_sha256": canary.canonical_sha256(unsigned)}
+
+
+def test_remote_terminal_evaluator_refuses_nonterminal_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    package, _publication = _package()
+    package_path = tmp_path / "package.json"
+    submission_path = tmp_path / "submission.json"
+    package_path.write_text(json.dumps(package), encoding="utf-8")
+    submission_path.write_text(
+        json.dumps(_submission_receipt_for_package(package)), encoding="utf-8"
+    )
+    events: list[str] = []
+    scheduler = FakeScheduler(package["parent_task"], events)
+    monkeypatch.setattr(canary, "SchedulerApiClient", lambda _url: scheduler)
+    with pytest.raises(RuntimeError, match="not terminal: queued"):
+        canary.evaluate_remote_terminal(
+            package_path=package_path,
+            submission_receipt_path=submission_path,
+            scheduler_url="http://scheduler.test",
+            task_id=99001,
+            output_path=tmp_path / "terminal.json",
+        )
+    assert not (tmp_path / "terminal.json").exists()
+
+
+def test_remote_terminal_evaluator_binds_files_result_and_cpu_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    package, _publication = _package()
+    package_path = tmp_path / "package.json"
+    submission_path = tmp_path / "submission.json"
+    package_path.write_text(json.dumps(package), encoding="utf-8")
+    submission_path.write_text(
+        json.dumps(_submission_receipt_for_package(package)), encoding="utf-8"
+    )
+    row = _scheduler_row(package["parent_task"])
+    row["status"] = "completed"
+    row["state"] = "succeeded"
+
+    class CompletedScheduler:
+        post_count = 0
+
+        def get_task(self, task_id: int) -> dict[str, Any]:
+            assert task_id == 99001
+            return copy.deepcopy(row)
+
+    monkeypatch.setattr(canary, "SchedulerApiClient", lambda _url: CompletedScheduler())
+    result_bytes = b'{"result":"ok"}\n'
+    result_sha = canary.hashlib.sha256(result_bytes).hexdigest()
+    manifest = {"manifest_sha256": "d" * 64}
+    status = {"status_sha256": "e" * 64}
+    child = {"receipt_sha256": "f" * 64, "result_sha256": result_sha}
+    raw_by_suffix = {
+        "batch_manifest.json": json.dumps(manifest).encode(),
+        "task_status.json": json.dumps(status).encode(),
+        "seed_status.json": json.dumps(child).encode(),
+        "result.json": result_bytes,
+    }
+
+    def remote_bytes(**kwargs: Any) -> bytes:
+        path = kwargs["relative_path"]
+        return next(value for suffix, value in raw_by_suffix.items() if path.endswith(suffix))
+
+    metrics = {
+        "terminal_cpu_evidence_sha256": "9" * 64,
+        "promotion_eligible": True,
+    }
+    monkeypatch.setattr(canary, "_remote_file_bytes", remote_bytes)
+    monkeypatch.setattr(canary, "validate_batch_manifest", lambda value: dict(value))
+    monkeypatch.setattr(
+        canary, "batch_manifest_from_payload", lambda _payload: copy.deepcopy(manifest)
+    )
+    monkeypatch.setattr(canary, "validate_task_status", lambda value: dict(value))
+    monkeypatch.setattr(
+        canary,
+        "validate_child_receipt",
+        lambda value, **_kwargs: dict(value),
+    )
+    monkeypatch.setattr(
+        canary,
+        "evaluate_terminal_cpu_evidence",
+        lambda *_args, **_kwargs: copy.deepcopy(metrics),
+    )
+    output = tmp_path / "terminal.json"
+    sealed = canary.evaluate_remote_terminal(
+        package_path=package_path,
+        submission_receipt_path=submission_path,
+        scheduler_url="http://scheduler.test",
+        task_id=99001,
+        output_path=output,
+    )
+    assert sealed["scheduler_status"] == "completed"
+    assert sealed["remote_files"]["result"]["sha256"] == result_sha
+    assert sealed["terminal_cpu_evidence_sha256"] == "9" * 64
+    assert sealed["shape4_submission_allowed"] is True
+    assert sealed["scheduler_post_count"] == 0
+    assert output.is_file()
