@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import math
+from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
 
 try:
@@ -37,6 +38,12 @@ BATCH_MANIFEST_SCHEMA = "mft-tier1-final1000-concurrent-batch-manifest-v1"
 TASK_STATUS_SCHEMA = "mft-tier1-final1000-concurrent-task-status-v1"
 CHILD_RECEIPT_SCHEMA = "mft-tier1-final1000-concurrent-child-receipt-v1"
 CHILD_RESOURCE_TELEMETRY_SCHEMA = "mft-tier1-final1000-phase-b-child-cpu-telemetry-v1"
+TERMINAL_RECEIPT_RECOVERY_SCHEMA = (
+    "mft-tier1-final1000-phase-b-terminal-receipt-recovery-v1"
+)
+TERMINAL_RECOVERY_SCHEDULER_STATES = frozenset(
+    {"completed", "failed", "cancelled", "timeout", "timed_out"}
+)
 
 CANARY_CONCURRENCY = 4
 PRODUCTION_CONCURRENCY = 8
@@ -116,11 +123,26 @@ CPU_TELEMETRY = {
     "automatic_child_cpu_reduction_allowed": False,
 }
 DEDUPE_PREFIX = "mft-tier1-final1000:concurrent-lane:"
+PHYSICAL_ATTEMPT_DEDUPE_PREFIX = "mft-tier1-final1000:concurrent-attempt:"
 REMOTE_CODE_FILES = (
+    "module/core_material_contract.py",
+    "module/input_parameter_260706.py",
+    "tools/tier1_corrected_current7_receipt.py",
+    "tools/tier1_corrected_current7_slurm_bundle.py",
+    "tools/tier1_corrected_current7_slurm_publish.py",
     "tools/tier1_corrected_current7_slurm_seed_runner.py",
+    "tools/tier1_corrected_generation_adapter.py",
+    "tools/tier1_corrected_generation_preflight.py",
+    "tools/tier1_deep_crossover_contract.py",
     "tools/tier1_final1000_multiseed_contract.py",
+    "tools/tier1_final1000_multiseed_lane_runner.py",
     "tools/tier1_final1000_multiseed_phase_b_contract.py",
     "tools/tier1_final1000_multiseed_phase_b_runner.py",
+    "tools/tier1_final1000_slurm_launch.py",
+    "tools/tier1_final1000_stage_profiles.py",
+    "tools/tier1_final1000_topology_niche_contract.py",
+    "tools/tier1_final1000_topology_successor_plan.py",
+    "tools/tier1_n1_6_anchor_island_contract.py",
     "tools/tier1_semlock_safe_inference_smoke.py",
 )
 
@@ -523,6 +545,102 @@ def validate_batch_task(task: Mapping[str, Any]) -> dict[str, Any]:
     )
     if task["dedupe_key"] != f"{DEDUPE_PREFIX}{expected_dedupe}":
         raise RuntimeError("Phase B parent dedupe identity mismatch")
+    return copy.deepcopy(dict(task))
+
+
+def canonical_parent_from_runtime_task(task: Mapping[str, Any]) -> dict[str, Any]:
+    """Recover the canonical science parent while ignoring physical dedupe."""
+
+    if set(task) != REQUIRED_SCHEDULER_FIELDS or "requested_allocation_id" in task:
+        raise RuntimeError("Phase B Scheduler envelope fields drifted")
+    payload = validate_batch_payload(task.get("payload_json") or {})
+    stage = BY_ID[payload["stage_id"]]
+    legacy_children = [
+        phase_a._legacy_child_task_from_phase_a(
+            child["task"],
+            expected_stage=stage,
+            expected_wave=payload["wave"],
+        )
+        for child in payload["children"]
+    ]
+    canonical = build_concurrent_batch_task(
+        legacy_children,
+        internal_deadline_seconds=int(payload["internal_deadline_seconds"]),
+        cleanup_reserve_seconds=int(payload["cleanup_reserve_seconds"]),
+        minimum_child_start_budget_seconds=int(
+            payload["minimum_child_start_budget_seconds"]
+        ),
+        model_load_stagger_seconds=float(payload["model_load_stagger_seconds"]),
+    )
+    if any(
+        task.get(field) != canonical.get(field)
+        for field in REQUIRED_SCHEDULER_FIELDS - {"dedupe_key"}
+    ):
+        raise RuntimeError("Phase B physical attempt changed its canonical payload")
+    return canonical
+
+
+def validate_runtime_batch_task(
+    task: Mapping[str, Any],
+    *,
+    submission_intent: Mapping[str, Any] | None = None,
+    authority: Mapping[str, Any] | None = None,
+    reconciliation_plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Accept a canonical parent or a liveness-bound new physical attempt.
+
+    Only the top-level Scheduler dedupe may differ.  Payload, command,
+    resources, child identities, and all scientific seals must reproduce the
+    canonical Phase-B task byte-for-byte.
+    """
+
+    canonical = canonical_parent_from_runtime_task(task)
+    observed_dedupe = str(task.get("dedupe_key") or "")
+    if observed_dedupe == canonical["dedupe_key"]:
+        return copy.deepcopy(dict(task))
+    suffix = observed_dedupe.removeprefix(PHYSICAL_ATTEMPT_DEDUPE_PREFIX)
+    if (
+        not observed_dedupe.startswith(PHYSICAL_ATTEMPT_DEDUPE_PREFIX)
+        or len(suffix) != 64
+        or any(character not in "0123456789abcdef" for character in suffix)
+    ):
+        raise RuntimeError("Phase B physical attempt dedupe identity mismatch")
+    if (
+        not isinstance(submission_intent, Mapping)
+        or not isinstance(authority, Mapping)
+        or not isinstance(reconciliation_plan, Mapping)
+    ):
+        raise RuntimeError(
+            "Phase B physical attempt lacks its sealed intent/authority/outbox lineage"
+        )
+    try:
+        from tier1_final1000_multiseed_phase_b_liveness import (
+            validate_reconciliation_plan,
+            validate_submission_intent,
+        )
+    except ImportError:  # pragma: no cover - repository import path
+        from tools.tier1_final1000_multiseed_phase_b_liveness import (
+            validate_reconciliation_plan,
+            validate_submission_intent,
+        )
+    sealed_intent = validate_submission_intent(submission_intent, authority=authority)
+    sealed_plan = validate_reconciliation_plan(
+        reconciliation_plan, authority=authority
+    )
+    pending = sealed_plan["next_checkpoint"]["pending_submission_intents"]
+    if (
+        sealed_intent.get("parent_task") != dict(task)
+        or sealed_intent.get("physical_parent_dedupe_key") != observed_dedupe
+        or sealed_intent.get("parent_task_sha256")
+        != phase_a.canonical_sha256(task)
+        or sealed_intent not in sealed_plan["submission_intents"]
+        or sealed_intent not in pending
+        or sealed_intent.get("plan_generation")
+        != sealed_plan["plan_generation"]
+        or sealed_plan.get("post_precondition_checkpoint_sha256")
+        != sealed_plan["next_checkpoint"]["checkpoint_sha256"]
+    ):
+        raise RuntimeError("Phase B physical attempt/intent/outbox lineage mismatch")
     return copy.deepcopy(dict(task))
 
 
@@ -1100,4 +1218,313 @@ def validate_child_receipt(
             != value.get("logical_dedupe_key")
         ):
             raise RuntimeError("Phase B child receipt/manifest binding mismatch")
+    return copy.deepcopy(dict(value))
+
+
+def _terminal_recovery_receipt_path(
+    parent_task: Mapping[str, Any], *, task_id: int, seed: int
+) -> str:
+    return (
+        PurePosixPath(str(parent_task["remote_cwd"]))
+        / "runs"
+        / f"task-{task_id}"
+        / f"seed-{seed}"
+        / "seed_status.json"
+    ).as_posix()
+
+
+def build_terminal_receipt_recovery_attestation(
+    *,
+    parent_task: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    task_status: Mapping[str, Any],
+    task_id: int,
+    scheduler_state: str,
+    receipt_scan: Sequence[Mapping[str, Any]],
+    watcher_capability_sha256: str,
+    watcher_revision_sha256: str,
+    scheduler_get_count: int,
+) -> dict[str, Any]:
+    """Seal a watcher-authenticated terminal receipt-before-cursor scan.
+
+    ``receipt_scan`` must contain one explicit present/missing record for every
+    batch ordinal.  Present records carry the already validated JSON receipt
+    plus the SHA-256, byte size, mode, and stable-read counts observed by the
+    read-only watcher.  Missing records carry stable absence probes.  This
+    function is pure and never contacts Scheduler or the remote filesystem.
+    """
+
+    present_ordinals = [
+        int(record.get("ordinal", -1))
+        for record in receipt_scan
+        if isinstance(record, Mapping) and record.get("present") is True
+    ]
+    missing_ordinals = [
+        int(record.get("ordinal", -1))
+        for record in receipt_scan
+        if isinstance(record, Mapping) and record.get("present") is False
+    ]
+    unsigned = {
+        "schema_version": TERMINAL_RECEIPT_RECOVERY_SCHEMA,
+        "protocol_version": PROTOCOL_VERSION,
+        "task_id": int(task_id),
+        "terminal_scheduler_state": str(scheduler_state).lower(),
+        "parent_task_sha256": phase_a.canonical_sha256(parent_task),
+        "parent_payload_sha256": phase_a.canonical_sha256(
+            parent_task.get("payload_json")
+        ),
+        "parent_dedupe_key": parent_task.get("dedupe_key"),
+        "manifest_sha256": manifest.get("manifest_sha256"),
+        "status_sha256": task_status.get("status_sha256"),
+        "stale_status_sealed_child_count": task_status.get(
+            "sealed_child_count"
+        ),
+        "batch_ordinal_count": manifest.get("batch_length"),
+        "recovered_receipt_count": len(present_ordinals),
+        "present_ordinals": present_ordinals,
+        "missing_ordinals": missing_ordinals,
+        "receipt_scan": copy.deepcopy(list(receipt_scan)),
+        "scan_complete": True,
+        "receipt_prefix_contiguous": True,
+        "watcher_capability_sha256": watcher_capability_sha256,
+        "watcher_revision_sha256": watcher_revision_sha256,
+        "scheduler_access": "GET-only",
+        "scheduler_get_count": int(scheduler_get_count),
+        "scheduler_post_count": 0,
+        "remote_access": "read-only",
+        "remote_stat_count": sum(
+            int(record.get("stable_stat_count", 0))
+            for record in receipt_scan
+            if isinstance(record, Mapping)
+        ),
+        "remote_byte_read_count": sum(
+            int(record.get("stable_byte_read_count", 0))
+            for record in receipt_scan
+            if isinstance(record, Mapping)
+        ),
+        "remote_write_count": 0,
+    }
+    sealed = {
+        **unsigned,
+        "attestation_sha256": phase_a.canonical_sha256(unsigned),
+    }
+    return validate_terminal_receipt_recovery_attestation(
+        sealed,
+        parent_task=parent_task,
+        manifest=manifest,
+        task_status=task_status,
+        task_id=task_id,
+        scheduler_state=scheduler_state,
+        expected_watcher_capability_sha256=watcher_capability_sha256,
+        expected_watcher_revision_sha256=watcher_revision_sha256,
+    )
+
+
+def validate_terminal_receipt_recovery_attestation(
+    value: Mapping[str, Any],
+    *,
+    parent_task: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    task_status: Mapping[str, Any],
+    task_id: int,
+    scheduler_state: str,
+    expected_watcher_capability_sha256: str,
+    expected_watcher_revision_sha256: str,
+) -> dict[str, Any]:
+    """Validate a complete terminal recovery scan without weakening cursor use."""
+
+    required = {
+        "schema_version",
+        "protocol_version",
+        "task_id",
+        "terminal_scheduler_state",
+        "parent_task_sha256",
+        "parent_payload_sha256",
+        "parent_dedupe_key",
+        "manifest_sha256",
+        "status_sha256",
+        "stale_status_sealed_child_count",
+        "batch_ordinal_count",
+        "recovered_receipt_count",
+        "present_ordinals",
+        "missing_ordinals",
+        "receipt_scan",
+        "scan_complete",
+        "receipt_prefix_contiguous",
+        "watcher_capability_sha256",
+        "watcher_revision_sha256",
+        "scheduler_access",
+        "scheduler_get_count",
+        "scheduler_post_count",
+        "remote_access",
+        "remote_stat_count",
+        "remote_byte_read_count",
+        "remote_write_count",
+        "attestation_sha256",
+    }
+    unsigned = {
+        key: copy.deepcopy(item)
+        for key, item in value.items()
+        if key != "attestation_sha256"
+    }
+    normalized_scheduler_state = str(scheduler_state).lower()
+    if (
+        set(value) != required
+        or value.get("schema_version") != TERMINAL_RECEIPT_RECOVERY_SCHEMA
+        or value.get("protocol_version") != PROTOCOL_VERSION
+        or value.get("attestation_sha256")
+        != phase_a.canonical_sha256(unsigned)
+        or normalized_scheduler_state not in TERMINAL_RECOVERY_SCHEDULER_STATES
+        or value.get("terminal_scheduler_state") != normalized_scheduler_state
+        or not _is_sha256(expected_watcher_capability_sha256)
+        or not _is_sha256(expected_watcher_revision_sha256)
+        or value.get("watcher_capability_sha256")
+        != expected_watcher_capability_sha256
+        or value.get("watcher_revision_sha256")
+        != expected_watcher_revision_sha256
+        or value.get("scheduler_access") != "GET-only"
+        or _integer(value.get("scheduler_get_count"), "recovery Scheduler GET count", minimum=1)
+        < 1
+        or value.get("scheduler_post_count") != 0
+        or value.get("remote_access") != "read-only"
+        or value.get("remote_write_count") != 0
+        or value.get("scan_complete") is not True
+        or value.get("receipt_prefix_contiguous") is not True
+    ):
+        raise RuntimeError("Phase B terminal receipt recovery attestation seal mismatch")
+
+    task_id = _integer(task_id, "recovery task id", minimum=1)
+    # A liveness retry is authenticated by the harvester before this shared
+    # validator is reached.  Here we reproduce and bind its canonical science
+    # envelope while retaining the exact physical parent hash and dedupe.
+    canonical_parent_from_runtime_task(parent_task)
+    manifest = validate_batch_manifest(manifest)
+    task_status = validate_task_status(task_status)
+    expected_manifest = batch_manifest_from_payload(parent_task["payload_json"])
+    if (
+        manifest != expected_manifest
+        or str(task_status.get("task_id")) != str(task_id)
+        or task_status.get("manifest_sha256") != manifest["manifest_sha256"]
+        or value.get("task_id") != task_id
+        or value.get("parent_task_sha256")
+        != phase_a.canonical_sha256(parent_task)
+        or value.get("parent_payload_sha256")
+        != phase_a.canonical_sha256(parent_task["payload_json"])
+        or value.get("parent_dedupe_key") != parent_task.get("dedupe_key")
+        or value.get("manifest_sha256") != manifest["manifest_sha256"]
+        or value.get("status_sha256") != task_status["status_sha256"]
+        or value.get("stale_status_sealed_child_count")
+        != task_status["sealed_child_count"]
+        or value.get("batch_ordinal_count") != manifest["batch_length"]
+    ):
+        raise RuntimeError("Phase B terminal recovery parent/journal binding mismatch")
+
+    scan = value.get("receipt_scan")
+    children = manifest["ordered_children"]
+    if (
+        not isinstance(scan, list)
+        or len(scan) != len(children)
+        or [record.get("ordinal") for record in scan if isinstance(record, Mapping)]
+        != list(range(len(children)))
+    ):
+        raise RuntimeError("Phase B terminal recovery scan is incomplete")
+
+    scan_fields = {
+        "ordinal",
+        "seed",
+        "present",
+        "remote_path",
+        "receipt",
+        "remote_receipt_sha256",
+        "remote_receipt_size",
+        "remote_mode",
+        "stable_stat_count",
+        "stable_byte_read_count",
+        "absence_confirmed",
+    }
+    present_ordinals: list[int] = []
+    missing_ordinals: list[int] = []
+    expected_stat_count = 0
+    expected_byte_read_count = 0
+    for ordinal, (record, child) in enumerate(zip(scan, children)):
+        if not isinstance(record, Mapping) or set(record) != scan_fields:
+            raise RuntimeError("Phase B terminal recovery scan record drifted")
+        seed = int(child["seed"])
+        expected_path = _terminal_recovery_receipt_path(
+            parent_task, task_id=task_id, seed=seed
+        )
+        if (
+            record.get("ordinal") != ordinal
+            or record.get("seed") != seed
+            or record.get("remote_path") != expected_path
+            or not isinstance(record.get("present"), bool)
+        ):
+            raise RuntimeError("Phase B terminal recovery scan identity mismatch")
+        if record["present"]:
+            receipt = record.get("receipt")
+            mode = record.get("remote_mode")
+            size = record.get("remote_receipt_size")
+            if (
+                not isinstance(receipt, Mapping)
+                or not _is_sha256(record.get("remote_receipt_sha256"))
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size <= 0
+                or isinstance(mode, bool)
+                or not isinstance(mode, int)
+                or mode < 0
+                or mode & 0o222
+                or record.get("stable_stat_count") != 3
+                or record.get("stable_byte_read_count") != 2
+                or record.get("absence_confirmed") is not False
+            ):
+                raise RuntimeError(
+                    "Phase B terminal recovery present receipt is not immutable"
+                )
+            receipt = validate_child_receipt(receipt, manifest=manifest)
+            legacy = receipt["legacy_status"]
+            if (
+                str(receipt["task_id"]) != str(task_id)
+                or int(receipt["ordinal"]) != ordinal
+                or int(receipt["seed"]) != seed
+                or legacy.get("seed") != seed
+                or legacy.get("payload_sha256") != child["payload_sha256"]
+            ):
+                raise RuntimeError(
+                    "Phase B terminal recovery receipt/parent identity mismatch"
+                )
+            present_ordinals.append(ordinal)
+            expected_stat_count += 3
+            expected_byte_read_count += 2
+        else:
+            if (
+                record.get("receipt") is not None
+                or record.get("remote_receipt_sha256") is not None
+                or record.get("remote_receipt_size") is not None
+                or record.get("remote_mode") is not None
+                or record.get("stable_stat_count") != 2
+                or record.get("stable_byte_read_count") != 0
+                or record.get("absence_confirmed") is not True
+            ):
+                raise RuntimeError(
+                    "Phase B terminal recovery missing receipt was not stably scanned"
+                )
+            missing_ordinals.append(ordinal)
+            expected_stat_count += 2
+
+    recovered_count = len(present_ordinals)
+    stale_cursor = int(task_status["sealed_child_count"])
+    if (
+        present_ordinals != list(range(recovered_count))
+        or missing_ordinals != list(range(recovered_count, len(children)))
+        or value.get("present_ordinals") != present_ordinals
+        or value.get("missing_ordinals") != missing_ordinals
+        or value.get("recovered_receipt_count") != recovered_count
+        or recovered_count <= stale_cursor
+        or value.get("remote_stat_count") != expected_stat_count
+        or value.get("remote_byte_read_count") != expected_byte_read_count
+    ):
+        raise RuntimeError(
+            "Phase B terminal recovery receipt prefix is not a complete cursor advance"
+        )
     return copy.deepcopy(dict(value))

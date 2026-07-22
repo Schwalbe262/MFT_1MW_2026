@@ -1,0 +1,136 @@
+{
+  "aedt_used": false,
+  "assessment": "blocked-fail-closed",
+  "blocking_reasons": [
+    "the authenticated topology successor plan is explicitly launch_eligible=false",
+    "the authenticated topology successor plan has no complete bundle bindings",
+    "no publisher READY marker exists for the assessed candidate bundle set",
+    "the assessed bundle manifests contain only 9 of 19 required Phase-B/runtime-closure files",
+    "the assessed bundle manifests predate the required_runtime_code attestation",
+    "no authenticated 1/4/8 Phase-B smoke result exists"
+  ],
+  "bundle_assessments": [
+    {
+      "bundle_id": "current7-9d57e0fb3b4f2a4e4756",
+      "code_inventory_sha256": "10d29cd5b7d87d446fab525152ec3c35349a4f2fa57d992126ebad01dbcf1c34",
+      "contract_sha256": "9d57e0fb3b4f2a4e47566b79d63fd2477db712b0004988ec9f74de0a653d29a2",
+      "kind": "topology64-base",
+      "manifest_sha256": "6409fdea24a9acff5c5b648132aea152533c6e2b60f4904fd3ab6ae0b63a1af8",
+      "offload_plan_sha256": "dc73b576a0f706ac3a72d7da7c738bcb04d04a07e1d763fae7c26253be5cd691",
+      "required_runtime_code_present": false,
+      "stage_id": "entry-1200-t125"
+    },
+    {
+      "bundle_id": "current7-2ef4e06f86d10b657240",
+      "code_inventory_sha256": "10d29cd5b7d87d446fab525152ec3c35349a4f2fa57d992126ebad01dbcf1c34",
+      "contract_sha256": "2ef4e06f86d10b657240d0f3748ecd4fd90a7e2f0840b1fd7b53e5c4387e9c8f",
+      "kind": "delta-over-safe",
+      "manifest_sha256": "2f2f16d758408bdacd9cc1f1c8eda504b48c127fd3808bc6d99559e1a1407ae6",
+      "offload_plan_sha256": "5fed133c8182c90b56416a6c8c8144817ffec4dbde0a109ea3c3b173cc0faf7d",
+      "required_runtime_code_present": false,
+      "stage_id": "entry-1200-t125"
+    },
+    {
+      "bundle_id": "current7-6d1e1d94fbcfd4e22dd8",
+      "code_inventory_sha256": "10d29cd5b7d87d446fab525152ec3c35349a4f2fa57d992126ebad01dbcf1c34",
+      "contract_sha256": "6d1e1d94fbcfd4e22dd803aff2794dcdc99cca93acb3567185c6520a2dbd10fe",
+      "kind": "topology64-base",
+      "manifest_sha256": "8e62fb2ccfceceb01f61e19a24c47526f1fe6f12ba3307cf5a8cb61f603d7da0",
+      "offload_plan_sha256": "2e486313499057cd16bb0a8cc6613c6101e059cfcfc390775906085071866c5f",
+      "required_runtime_code_present": false,
+      "stage_id": "bridge-1150-t115"
+    },
+    {
+      "bundle_id": "current7-af90bd45770b0f51eaba",
+      "code_inventory_sha256": "10d29cd5b7d87d446fab525152ec3c35349a4f2fa57d992126ebad01dbcf1c34",
+      "contract_sha256": "af90bd45770b0f51eaba714a117edcc49d061902d83a7a44a534308b1591321c",
+      "kind": "delta-over-safe",
+      "manifest_sha256": "69529da72fc11be2c634c2b1b6121c31d1c56ac96657188771a064d4b6a43c02",
+      "offload_plan_sha256": "02114a85d876365fec351fd9dede0eeee2c3a6738252b29be77fa461483fa1c4",
+      "required_runtime_code_present": false,
+      "stage_id": "bridge-1150-t115"
+    },
+    {
+      "bundle_id": "current7-16ab1d623e7c2b45fbbd",
+      "code_inventory_sha256": "10d29cd5b7d87d446fab525152ec3c35349a4f2fa57d992126ebad01dbcf1c34",
+      "contract_sha256": "16ab1d623e7c2b45fbbda68e6d627891b49facc0c9f146ba68ddd347b74b604e",
+      "kind": "topology64-base",
+      "manifest_sha256": "7ca8ce64a6bced172ff924a970e435b42ef98d5dba02252bb38791c5dfab3959",
+      "offload_plan_sha256": "3563514fcc5cfba323670ae34eb5c898b0d1f06d7f380761a90f43a79cc4dd9b",
+      "required_runtime_code_present": false,
+      "stage_id": "close-1075-t107p5"
+    },
+    {
+      "bundle_id": "current7-896425edd6f3bee6e0a7",
+      "code_inventory_sha256": "10d29cd5b7d87d446fab525152ec3c35349a4f2fa57d992126ebad01dbcf1c34",
+      "contract_sha256": "896425edd6f3bee6e0a7b353b9c83ee5ec44b015830b0471df108ec2194cbb72",
+      "kind": "delta-over-safe",
+      "manifest_sha256": "84c7a2ffa47a366346d79a5609fba370b31cccbcea58d684912753a1618607f9",
+      "offload_plan_sha256": "f7fb8707af8af7d61900afd675c4775f0c97d6bd2bfc49be210c097a218f5747",
+      "required_runtime_code_present": false,
+      "stage_id": "close-1075-t107p5"
+    },
+    {
+      "bundle_id": "current7-19be3a997d931cdba628",
+      "code_inventory_sha256": "10d29cd5b7d87d446fab525152ec3c35349a4f2fa57d992126ebad01dbcf1c34",
+      "contract_sha256": "19be3a997d931cdba62856682c75aa111f9d2b7f0bb2edfbd8eb01089ac7f6ed",
+      "kind": "topology64-base",
+      "manifest_sha256": "f71e10766aa87138a9819c04adf5312275e7d712c78e63ee7f70a137c2c077a7",
+      "offload_plan_sha256": "f1f26a825f006059f4a271b1b94170a1ac97b2d32ca7b7252215fb21db5468e3",
+      "required_runtime_code_present": false,
+      "stage_id": "final-1000-t100"
+    },
+    {
+      "bundle_id": "current7-67610940e0c9cc451d3b",
+      "code_inventory_sha256": "10d29cd5b7d87d446fab525152ec3c35349a4f2fa57d992126ebad01dbcf1c34",
+      "contract_sha256": "67610940e0c9cc451d3b1530bcd0aedfcba5ecf5a0e42e10719f8e2099977cdc",
+      "kind": "delta-over-safe",
+      "manifest_sha256": "04565c9abbb1528802daeb75f6ecb9ac62bd14020918234a029a18e1cea09661",
+      "offload_plan_sha256": "2cfc543c48e0b5a008c69d9aea2f6885413d24bcd015ddd93423692ad1d00333",
+      "required_runtime_code_present": false,
+      "stage_id": "final-1000-t100"
+    }
+  ],
+  "evidence_sha256": "3e3bec87234b4bff4e603f235642926c207819933778943592058b775c3d3b50",
+  "fea_submission_performed": false,
+  "observed_at": "2026-07-23T00:18:00+09:00",
+  "production_eligible": false,
+  "publication_performed": false,
+  "ready_marker_present": false,
+  "remote_write_performed": false,
+  "required_runtime_code_contract": {
+    "assessed_manifest_required_file_count_present": 9,
+    "missing_required_files": [
+      "module/core_material_contract.py",
+      "module/input_parameter_260706.py",
+      "tools/tier1_corrected_current7_slurm_publish.py",
+      "tools/tier1_final1000_multiseed_contract.py",
+      "tools/tier1_final1000_multiseed_lane_runner.py",
+      "tools/tier1_final1000_multiseed_phase_b_contract.py",
+      "tools/tier1_final1000_multiseed_phase_b_runner.py",
+      "tools/tier1_final1000_slurm_launch.py",
+      "tools/tier1_final1000_topology_successor_plan.py",
+      "tools/tier1_semlock_safe_inference_smoke.py"
+    ],
+    "required_file_count": 19,
+    "semlock_helper_relative_path": "tools/tier1_semlock_safe_inference_smoke.py",
+    "semlock_helper_sha256": "c25afd39752a990c31e1b934c77282d88ac11dab1cad763d4f07c95e4b87dd80"
+  },
+  "scheduler_write_performed": false,
+  "schema_version": "mft-tier1-final1000-phase-b-smoke-prerelease-assessment-v1",
+  "smoke_release_emitted": false,
+  "smoke_task_shapes_emitted": [],
+  "source_root": "C:/Users/peets/slurm_scheduler_runtime/mft_tier1_final_goal_1000_t100_resmax20_260721/topology_niche_successor_candidate_20260722",
+  "submission_performed": false,
+  "successor_plan": {
+    "bundle_bindings_complete": false,
+    "canary_logical_seed_count": 16,
+    "file_sha256": "c44ace1532a53a9e8c33e2bc365efc637aa7458b18bf614c66f4362b35980c4d",
+    "inner_plan_sha256": "00f9402b43031a990a2355fc161bbaa097692e7235acd13790c0f9afe6a8d96f",
+    "launch_eligible": false,
+    "production_logical_seed_count": 500,
+    "relative_path": "plan-n36x37-64c0763-unbound/successor-plan.json",
+    "schema_version": "mft-tier1-final1000-topology-successor-plan-v1",
+    "topology_niche_contract_sha256": "67a6f395d3a946c83ac23e1e5f1feb5d76d228945ff505deb19722f09ff03aab"
+  }
+}

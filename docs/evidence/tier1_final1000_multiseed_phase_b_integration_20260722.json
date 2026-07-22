@@ -21,8 +21,23 @@
     "scheduler_ready_lane_reserve": 0,
     "speculative_ready_lane_submission_allowed": false
   },
-  "elapsed_seconds": 85.73,
-  "evidence_sha256": "f798b97c6188e3edd94c4048383c71e93d3dcec542aeddfcd754e7db39384c77",
+  "durable_liveness_contract": {
+    "checkpoint_before_post_required": true,
+    "durable_cas_monotonic_epoch_tested": true,
+    "exact_500_stage_quotas_tested": true,
+    "explicit_stop_and_revocation_fence_tested": true,
+    "original_reconciliation_plan_required_for_retry_harvest": true,
+    "paged_watcher_exact_inventory_tested": true,
+    "retry_attempt_intent_outbox_lineage_tested": true,
+    "same_fence_deterministic_authority_and_dedupe_tested": true,
+    "stale_or_alternate_owner_refused": true,
+    "submit_before_checkpoint_allowed": false,
+    "terminal_receipt_before_cursor_recovery_tested": true,
+    "terminal_recovery_remote_bytes_rechecked": true,
+    "terminal_recovery_watcher_revision_cross_bound": true
+  },
+  "elapsed_seconds": 847.58,
+  "evidence_sha256": "709b6c9631458002015009eefd86d86a04dd19067982645b1fef8d1f294f51dc",
   "failed": 0,
   "fea_submission_performed": false,
   "finite_cpu_benchmark_design": {
@@ -49,8 +64,8 @@
   },
   "independent_root_run": false,
   "isolated_worktree_run": true,
-  "observed_at": "2026-07-22T23:11:05+09:00",
-  "passed": 16,
+  "observed_at": "2026-07-23T01:05:07+09:00",
+  "passed": 227,
   "phase_b_migration_scheduler_post_count": 0,
   "production_eligible": false,
   "real_four_child_overlap_test_passed": true,
@@ -66,11 +81,69 @@
     "tmp_isolation_claimed_as_fix": false
   },
   "resource_envelope_1_through_8_tested": true,
+  "runtime_bundle_closure": {
+    "bundle_only_optimizer_import_smoke_passed": true,
+    "full_tracked_module_subtree_collected": true,
+    "module_input_parameter_260706_present": true,
+    "required_runtime_file_count": 19,
+    "semlock_helper_hard_hash_tested": true,
+    "topology_canary_exit72_missing_module_regression_covered": true
+  },
   "scheduler_write_performed": false,
-  "schema_version": "mft-tier1-final1000-phase-b-integration-test-evidence-v1",
+  "schema_version": "mft-tier1-final1000-phase-b-integration-test-evidence-v2",
   "shared_tmp_cleanup_performed": false,
   "single_mutation_authority_handoff_tested": true,
-  "skipped": 1,
+  "skipped": 3,
   "submission_performed": false,
-  "test_command": "python -m pytest -q tests/test_tier1_final1000_multiseed_phase_b.py"
+  "test_runs": [
+    {
+      "command": "python -m pytest -q tests/test_tier1_final1000_multiseed_phase_b.py tests/test_tier1_final1000_multiseed_phase_b_liveness.py",
+      "elapsed_seconds": 214.9,
+      "failed": 0,
+      "passed": 28,
+      "skipped": 1
+    },
+    {
+      "command": "python -m pytest -q tests/test_tier1_corrected_current7_slurm.py",
+      "elapsed_seconds": 10.97,
+      "failed": 0,
+      "passed": 26,
+      "skipped": 0
+    },
+    {
+      "command": "python -m pytest -q tests/test_tier1_final1000_rolling_migration.py tests/test_tier1_final1000_topology_niche_successor.py tests/test_tier1_slurm_rolling.py",
+      "elapsed_seconds": 134.68,
+      "failed": 0,
+      "passed": 67,
+      "skipped": 1
+    },
+    {
+      "command": "python -m pytest -q tests/test_tier1_final1000_multiseed_phase_a.py tests/test_tier1_final1000_multiseed_consumer.py tests/test_tier1_final1000_multiseed_monitor.py tests/test_tier1_final1000_multiseed_monitor_bootstrap.py tests/test_tier1_final1000_multiseed_evidence.py tests/test_tier1_final1000_slurm_harvest.py",
+      "elapsed_seconds": 354.53,
+      "failed": 0,
+      "passed": 85,
+      "skipped": 0
+    },
+    {
+      "command": "python -m pytest -q tests/test_tier1_final1000_multiseed_phase_b.py::test_remote_smoke_release_renders_authenticated_1_4_8_lane_tasks tests/test_tier1_final1000_multiseed_phase_b.py::test_dry_run_repack_covers_exact_500_without_mutation",
+      "elapsed_seconds": 41.17,
+      "failed": 0,
+      "passed": 2,
+      "skipped": 0
+    },
+    {
+      "command": "python -m pytest -q tests/test_tier1_final1000_multiseed_phase_b_liveness.py",
+      "elapsed_seconds": 90.19,
+      "failed": 0,
+      "passed": 10,
+      "skipped": 0
+    },
+    {
+      "command": "python -m pytest -q tests/test_tier1_final1000_topology_niche_successor.py",
+      "elapsed_seconds": 1.14,
+      "failed": 0,
+      "passed": 9,
+      "skipped": 1
+    }
+  ]
 }

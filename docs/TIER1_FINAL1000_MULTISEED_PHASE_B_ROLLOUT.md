@@ -116,6 +116,90 @@ Immutable dry evidence:
 
 - `docs/evidence/tier1_final1000_multiseed_phase_b_dry_run_20260722.json`
 - `docs/evidence/tier1_final1000_multiseed_phase_b_integration_20260722.json`
+- `docs/evidence/tier1_final1000_multiseed_phase_b_smoke_prerelease_20260723.json`
+
+### Immutable runtime bundle and 1/4/8 smoke release
+
+Every production candidate must be rebuilt with the complete Phase-B runtime
+closure. The bundle planner's `--phase-b-runtime` switch adds all 19 mandatory
+remote and optimizer-closure modules (including the repository-root
+`module/input_parameter_260706.py` dependency), while the generic code
+collector also carries every tracked `module/**/*.py` file. The planner seals
+their file records in `files` and `code_inventory` and adds a
+`required_runtime_code` attestation. The SemLock-safe inference helper is also
+bound to its reviewed hard SHA-256. Missing files, line-ending drift, or helper
+content drift stops planning before any publication:
+
+```text
+python -m tools.tier1_corrected_current7_slurm_bundle plan \
+  ...existing authenticated plan arguments... \
+  --phase-b-runtime
+```
+
+After immutable publication, the smoke renderer accepts only an exact launch
+plan, content-addressed manifest, and publisher `READY` seal. It verifies every
+file and runtime identity before rendering diagnostic 1/4/8-lane envelopes.
+The command prints JSON only; it has no Scheduler client and performs no POST:
+
+```text
+python -m tools.tier1_final1000_multiseed_phase_b_smoke_release \
+  --launch-plan <bound-launch-plan.json> \
+  --bundle-manifest <bundle_manifest.json> \
+  --ready <READY.json> \
+  --stage-id entry-1200-t125
+```
+
+Execution order is diagnostic `1 -> 4 -> 8`, while production promotion is
+gated `4 -> 8`. The four-lane parent requests 16 CPUs / 114,688 MiB and the
+eight-lane parent requests 32 CPUs / 229,376 MiB. Promotion requires zero
+failures, SemLock attempts, and affinity escapes; child peak RSS at most 22
+GiB; dispatch fill at most 35 seconds; bounded p50/p95 and CPU-hours/seed
+regressions; and at least 1.7x eight-vs-four throughput.
+
+The 2026-07-23 prerelease assessment is intentionally blocked. It authenticates
+the real topology64 successor bytes and eight base/delta bundle manifests, but
+the source successor is unbound and `launch_eligible=false`, no `READY` exists,
+and those manifests contain only 9 of the 19 mandatory runtime-closure modules
+with no
+`required_runtime_code` attestation. Therefore it emits no smoke task and must
+not be interpreted as a failed performance run. Regenerate the assessment only
+after a newly integrated bundle, READY seal, and launch binding exist; never
+copy task or result hashes from an older bundle.
+
+### Exact-500 liveness reconciliation
+
+`tier1_final1000_multiseed_phase_b_liveness.py` is a pure, bounded reconciliation
+layer. A planning authority is derived deterministically from the current
+durable CAS control fence. Its owner, monotonic epoch/store revision, Phase-A
+handoff, watcher/submitter capabilities, and CAS read-back receipt are sealed;
+stale, alternate-owner, stopped, or revoked fences are rejected. The authority
+consumes an exact paged watcher receipt and a durable checkpoint, then emits
+idempotent submission intents only. It has no HTTP client, cancellation path,
+or Scheduler write method. A terminal physical
+parent recovers only its incomplete logical children with the same seed,
+payload, and logical dedupe; completed children are replaced by fresh
+stage-local seeds. Tails are deterministically regrouped into at most eight
+children, preserving exact quotas `300/150/40/10` and an active target of 500.
+
+The next checkpoint and intent outbox must be durably CAS-committed before an
+external authorized driver may POST; submit-before-checkpoint is prohibited.
+Immediately before every POST, that driver must re-read the current control
+fence and require the same active epoch. The original reconciliation plan,
+intent, physical attempt, and exact next-checkpoint outbox remain one harvest
+lineage. A POST-before-observation crash therefore replays the committed intent
+rather than allocating another seed.
+
+A receipt written before the mutable status cursor is not exposed casually.
+After a terminal Scheduler state, a separate GET-only recovery attestation must
+scan every ordinal twice/stably, bind present and missing paths, prove one
+immutable contiguous receipt prefix, and match the watcher pagination revision.
+The harvester re-reads and compares the actual remote SHA/size/mode/value before
+publishing the recovered receipt. Runtime parents use a new physical-attempt
+dedupe, while the runner and mixed harvester reconstruct and validate the
+byte-identical canonical science envelope. Any payload, command, CPU, memory,
+child identity, outbox, watcher, or dedupe drift fails closed. Explicit stop is
+a monotonic `stopped`/`revoked` CAS fence; an old active checkpoint cannot
+produce or submit more refill intents.
 
 ## Phase-A PID 55304 authority handoff
 

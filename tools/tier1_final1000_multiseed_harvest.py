@@ -87,7 +87,12 @@ def _batch_parent_task(
         and candidate_payload.get("schema_version")
         == phase_b_contract.BATCH_PAYLOAD_SCHEMA
     ):
-        task = phase_b_contract.validate_batch_task(candidate)
+        task = phase_b_contract.validate_runtime_batch_task(
+            candidate,
+            submission_intent=item.get("phase_b_submission_intent"),
+            authority=item.get("phase_b_authority_lease"),
+            reconciliation_plan=item.get("phase_b_reconciliation_plan"),
+        )
     else:
         task = validate_batch_task(candidate)
     payload = task["payload_json"]
@@ -223,9 +228,40 @@ def harvest_batch_lane(
     # receipt-before-cursor crash window, but reading it would make a later
     # cursor rollback indistinguishable from an authenticated publication.
     # Consume exactly the durable prefix and let the next poll observe the
-    # cursor advance. Terminal recovery needs a separate sealed attestation
-    # instead of weakening this rule.
-    for ordinal in range(declared_sealed_count):
+    # cursor advance. A terminal watcher may close that narrow crash window,
+    # but only through the shared sealed complete-scan attestation. Missing or
+    # invalid evidence never widens this prefix.
+    exposed_receipt_count = declared_sealed_count
+    recovery_attestation: dict[str, Any] | None = None
+    raw_recovery = item.get("phase_b_terminal_receipt_recovery_attestation")
+    if raw_recovery is not None:
+        if (
+            batch_manifest.get("schema_version")
+            != phase_b_contract.BATCH_MANIFEST_SCHEMA
+        ):
+            raise RuntimeError("terminal receipt recovery is Phase-B-only")
+        if not isinstance(raw_recovery, Mapping):
+            raise RuntimeError("terminal receipt recovery attestation is invalid")
+        recovery_attestation = (
+            phase_b_contract.validate_terminal_receipt_recovery_attestation(
+                raw_recovery,
+                parent_task=parent_task,
+                manifest=batch_manifest,
+                task_status=task_status,
+                task_id=task_id,
+                scheduler_state=scheduler_state,
+                expected_watcher_capability_sha256=str(
+                    item.get("phase_b_watcher_capability_sha256") or ""
+                ),
+                expected_watcher_revision_sha256=str(
+                    item.get("phase_b_watcher_revision_sha256") or ""
+                ),
+            )
+        )
+        exposed_receipt_count = int(
+            recovery_attestation["recovered_receipt_count"]
+        )
+    for ordinal in range(exposed_receipt_count):
         child = parent_payload["children"][ordinal]
         seed = int(child["seed"])
         receipt_path = _remote_child(
@@ -251,6 +287,21 @@ def harvest_batch_lane(
             == phase_b_contract.BATCH_MANIFEST_SCHEMA
             else validate_child_receipt(stable_receipt.value, manifest=batch_manifest)
         )
+        if recovery_attestation is not None:
+            recovery_record = recovery_attestation["receipt_scan"][ordinal]
+            if (
+                recovery_record.get("present") is not True
+                or recovery_record.get("remote_path") != receipt_path
+                or recovery_record.get("remote_receipt_sha256")
+                != stable_receipt.sha256
+                or recovery_record.get("remote_receipt_size")
+                != stable_receipt.size
+                or recovery_record.get("remote_mode") != stable_receipt.stat.mode
+                or recovery_record.get("receipt") != receipt
+            ):
+                raise RuntimeError(
+                    "terminal recovery attestation differs from remote receipt bytes"
+                )
         legacy_status = receipt["legacy_status"]
         if (
             str(receipt["task_id"]) != str(task_id)

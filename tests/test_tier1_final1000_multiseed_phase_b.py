@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,8 +30,10 @@ from tools import tier1_final1000_multiseed_harvest as harvest
 from tools import tier1_final1000_multiseed_phase_b_contract as contract
 from tools import tier1_final1000_multiseed_phase_b_runner as runner
 from tools import tier1_final1000_multiseed_phase_b_evidence as evidence
+from tools import tier1_final1000_multiseed_phase_b_smoke_release as smoke_release
 from tools import tier1_final1000_multiseed_phase_b_successor as successor
 from tools import tier1_final1000_multiseed_driver as phase_a_driver
+from tools import tier1_final1000_slurm_launch as final1000_launch
 from tools import tier1_final1000_stage_profiles as profiles
 
 
@@ -256,6 +259,167 @@ def test_exact_variable_parent_envelopes_and_deterministic_seals():
         contract.validate_batch_task(tampered)
 
 
+def test_remote_smoke_release_renders_authenticated_1_4_8_lane_tasks():
+    plan = _rendered_plan()
+    required_hashes = {
+        contract.INFERENCE_SAFETY["required_helper_path"]: contract.INFERENCE_SAFETY[
+            "required_helper_sha256"
+        ]
+    }
+    records = {
+        f"artifacts/code/{relative}": {
+            "sha256": required_hashes.get(relative, f"{index + 1:064x}"),
+            "size": index + 10,
+        }
+        for index, relative in enumerate(sorted(contract.REMOTE_CODE_FILES))
+    }
+    required_unsigned = {
+        "schema_version": "mft-tier1-required-runtime-code-inventory-v1",
+        "required_files": sorted(contract.REMOTE_CODE_FILES),
+        "code_records": records,
+        "code_records_sha256": phase_a.canonical_sha256(records),
+        "required_sha256": required_hashes,
+    }
+    stable_manifest = {
+        "schema_version": "mft-tier1-current7-slurm-bundle-v1",
+        "files": copy.deepcopy(records),
+        "code_inventory": copy.deepcopy(records),
+        "code_inventory_sha256": phase_a.canonical_sha256(records),
+        "required_runtime_code": {
+            **required_unsigned,
+            "sha256": phase_a.canonical_sha256(required_unsigned),
+        },
+        "relocation": {"contract_sha256": "d" * 64},
+        "runtime": {"critical_packages": {"numpy": "test"}},
+    }
+    contract_sha = phase_a.canonical_sha256(stable_manifest)
+    manifest = {
+        **stable_manifest,
+        "bundle_id": f"current7-{contract_sha[:20]}",
+        "contract_sha256": contract_sha,
+    }
+    selected_stage = profiles.STAGES[0]
+    for wave in ("canaries", "ramp"):
+        for task in plan["task_waves"][wave]:
+            payload = task["payload_json"]
+            if payload["final_goal_stage_id"] != selected_stage.stage_id:
+                continue
+            payload["bundle_id"] = manifest["bundle_id"]
+            payload_sha = phase_a.canonical_sha256(payload)
+            task["command"] = final1000_launch._replace_payload_sha(
+                task["command"], payload_sha
+            )
+            task["remote_cwd"] = f"/remote/{manifest['bundle_id']}"
+            resources = {
+                key: task[key]
+                for key in (
+                    "cpus",
+                    "memory_mb",
+                    "scheduling_profile",
+                    "aedt_backend",
+                    "gpus",
+                    "priority",
+                    "timeout_seconds",
+                    "max_workers_per_node",
+                )
+            }
+            task["dedupe_key"] = "mft-tier1-final1000:" + phase_a.canonical_sha256(
+                {
+                    "goal": "final1000",
+                    "stage_profile_sha256": profiles.stage_profile(selected_stage)[
+                        "sha256"
+                    ],
+                    "bundle_id": manifest["bundle_id"],
+                    "payload": payload,
+                    "resources": resources,
+                }
+            )
+            final1000_launch.validate_task(task)
+    binding = plan["stage_bindings"][selected_stage.stage_id]
+    binding["bundle_id"] = manifest["bundle_id"]
+    binding["remote_bundle"] = f"/remote/{manifest['bundle_id']}"
+    binding["ready"]["bundle_id"] = manifest["bundle_id"]
+    binding["ready_sha256"] = phase_a.canonical_sha256(binding["ready"])
+    plan_unsigned = {
+        key: value for key, value in plan.items() if key != "launch_plan_sha256"
+    }
+    plan["launch_plan_sha256"] = phase_a.canonical_sha256(plan_unsigned)
+    plan = final1000_launch.validate_launch_plan(plan)
+    ready = {
+        "schema_version": "mft-tier1-current7-slurm-ready-v1",
+        "bundle_id": manifest["bundle_id"],
+        "contract_sha256": contract_sha,
+        "bundle_manifest_sha256": "a" * 64,
+        "file_count": len(records),
+        "byte_count": sum(record["size"] for record in records.values()),
+        "every_file_sha256_verified": True,
+        "all_file_sha256_verified": True,
+        "runtime_verified": True,
+        "runtime_packages": {"numpy": "test"},
+        "code_inventory_sha256": manifest["code_inventory_sha256"],
+        "relocation_contract_sha256": "d" * 64,
+        "remote_git_checkout_performed": False,
+        "artifacts_read_only": True,
+        "runs_mode": "1777",
+        "published_at": "2026-07-22T00:00:00+09:00",
+    }
+
+    release = smoke_release.build_smoke_release(
+        plan,
+        manifest,
+        ready,
+        manifest_file_sha256="a" * 64,
+    )
+
+    assert release["lane_shapes"] == [1, 4, 8]
+    assert [task["cpus"] for task in release["tasks"]] == [4, 16, 32]
+    assert [task["memory_mb"] for task in release["tasks"]] == [
+        28_672,
+        114_688,
+        229_376,
+    ]
+    children = [
+        child
+        for task in release["tasks"]
+        for child in task["payload_json"]["children"]
+    ]
+    assert len(children) == 13
+    assert len({child["seed"] for child in children}) == 13
+    assert len({child["logical_dedupe_key"] for child in children}) == 13
+    assert release["four_lane_is_mandatory_first_production_canary"] is True
+    assert release["smoke_ready"] is True
+    assert release["scheduler_write_performed"] is False
+    assert release["submission_performed"] is False
+
+    tampered = copy.deepcopy(manifest)
+    tampered["code_inventory"].pop(next(iter(records)))
+    with pytest.raises(RuntimeError, match="content-address|code inventory"):
+        smoke_release.build_smoke_release(
+            plan,
+            tampered,
+            ready,
+            manifest_file_sha256="a" * 64,
+        )
+    for missing_ready_field in (
+        "contract_sha256",
+        "file_count",
+        "byte_count",
+        "all_file_sha256_verified",
+        "artifacts_read_only",
+        "runs_mode",
+        "runtime_packages",
+    ):
+        incomplete_ready = copy.deepcopy(ready)
+        incomplete_ready.pop(missing_ready_field)
+        with pytest.raises(RuntimeError, match="READY seal mismatch"):
+            smoke_release.build_smoke_release(
+                plan,
+                manifest,
+                incomplete_ready,
+                manifest_file_sha256="a" * 64,
+            )
+
+
 def test_dry_run_repack_covers_exact_500_without_mutation():
     first = evidence.build_dry_run_evidence(
         _rendered_plan(), source_file_sha256="a" * 64
@@ -342,6 +506,53 @@ def test_dry_run_repack_covers_exact_500_without_mutation():
         integration_unsigned
     )
     assert integration["repeated_predict_stress"]["predict_call_count"] == 1280
+
+    prerelease = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "docs"
+            / "evidence"
+            / "tier1_final1000_multiseed_phase_b_smoke_prerelease_20260723.json"
+        ).read_text(encoding="utf-8")
+    )
+    prerelease_unsigned = {
+        key: value for key, value in prerelease.items() if key != "evidence_sha256"
+    }
+    assert prerelease["evidence_sha256"] == phase_a.canonical_sha256(
+        prerelease_unsigned
+    )
+    assert prerelease["assessment"] == "blocked-fail-closed"
+    assert prerelease["production_eligible"] is False
+    assert prerelease["smoke_release_emitted"] is False
+    assert prerelease["smoke_task_shapes_emitted"] == []
+    assert prerelease["ready_marker_present"] is False
+    assert prerelease["successor_plan"]["launch_eligible"] is False
+    assert prerelease["successor_plan"]["bundle_bindings_complete"] is False
+    assert prerelease["successor_plan"]["production_logical_seed_count"] == 500
+    assert len(prerelease["bundle_assessments"]) == 8
+    assert {
+        item["stage_id"] for item in prerelease["bundle_assessments"]
+    } == {stage.stage_id for stage in profiles.STAGES}
+    assert {
+        item["kind"] for item in prerelease["bundle_assessments"]
+    } == {"topology64-base", "delta-over-safe"}
+    assert all(
+        item["required_runtime_code_present"] is False
+        for item in prerelease["bundle_assessments"]
+    )
+    assert prerelease["required_runtime_code_contract"]["required_file_count"] == 19
+    assert (
+        prerelease["required_runtime_code_contract"][
+            "assessed_manifest_required_file_count_present"
+        ]
+        == 9
+    )
+    assert len(
+        prerelease["required_runtime_code_contract"]["missing_required_files"]
+    ) == 10
+    assert prerelease["scheduler_write_performed"] is False
+    assert prerelease["submission_performed"] is False
+    assert prerelease["remote_write_performed"] is False
 
 
 def test_cpu_efficiency_benchmark_is_finite_paired_and_non_mutating():
@@ -1044,6 +1255,281 @@ class MemoryRemote:
         payload = self.files[path]
         assert len(payload) <= maximum_bytes
         return payload
+
+
+def test_terminal_receipt_before_cursor_recovery_is_complete_bound_and_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    bundle, payload_root, payload_path, task = _prepare(
+        tmp_path, monkeypatch, task_id=99408
+    )
+    monkeypatch.setenv("PHASE_B_TEST_SLEEP", "0.01")
+    assert (
+        _run(
+            bundle,
+            payload_root,
+            payload_path,
+            task,
+            monotonic=_scaled_clock(300),
+        )
+        == 0
+    )
+    run_root = bundle / "runs" / "task-99408"
+    remote_root = task["remote_cwd"]
+    batch_manifest = json.loads((run_root / "batch_manifest.json").read_text())
+    final_status = json.loads((run_root / "task_status.json").read_text())
+
+    # Model the narrow crash: ordinal 0's immutable receipt reached disk, but
+    # the parent died after Scheduler terminalized and before cursor commit.
+    stale_status = contract.seal_task_status(
+        {
+            **final_status,
+            "state": "running",
+            "active_children": [],
+            "launched_child_count": 1,
+            "finished_child_count": 1,
+            "sealed_child_count": 0,
+            "completed_child_count": 0,
+            "failed_child_count": 0,
+            "finished_at": None,
+            "resource_telemetry": None,
+        }
+    )
+    child = task["payload_json"]["children"][0]
+    seed = int(child["seed"])
+    receipt = json.loads(
+        (run_root / f"seed-{seed}" / "seed_status.json").read_text()
+    )
+    result_value = {
+        "seed": seed,
+        "completed_generations": 1,
+        "feasible_pareto_count": 0,
+        "production_eligible": False,
+        "fea_submission_approved": False,
+        "fea_submission_performed": False,
+        "aedt_used": False,
+        "automatic_promotion_allowed": False,
+    }
+    result_payload = phase_a.json_bytes(result_value)
+    receipt["result_sha256"] = hashlib.sha256(result_payload).hexdigest()
+    receipt = contract.seal_child_receipt(receipt)
+    receipt_payload = phase_a.json_bytes(receipt)
+    receipt_path = (
+        f"{remote_root}/runs/task-99408/seed-{seed}/seed_status.json"
+    )
+    result_path = f"{remote_root}/runs/task-99408/seed-{seed}/result.json"
+    files = {
+        f"{remote_root}/runs/task-99408/batch_manifest.json": phase_a.json_bytes(
+            batch_manifest
+        ),
+        f"{remote_root}/runs/task-99408/task_status.json": phase_a.json_bytes(
+            stale_status
+        ),
+        receipt_path: receipt_payload,
+        result_path: result_payload,
+    }
+    receipt_scan = []
+    for ordinal, manifest_child in enumerate(batch_manifest["ordered_children"]):
+        child_seed = int(manifest_child["seed"])
+        path = (
+            f"{remote_root}/runs/task-99408/seed-{child_seed}/seed_status.json"
+        )
+        if ordinal == 0:
+            receipt_scan.append(
+                {
+                    "ordinal": ordinal,
+                    "seed": child_seed,
+                    "present": True,
+                    "remote_path": path,
+                    "receipt": copy.deepcopy(receipt),
+                    "remote_receipt_sha256": hashlib.sha256(
+                        receipt_payload
+                    ).hexdigest(),
+                    "remote_receipt_size": len(receipt_payload),
+                    "remote_mode": 0o444,
+                    "stable_stat_count": 3,
+                    "stable_byte_read_count": 2,
+                    "absence_confirmed": False,
+                }
+            )
+        else:
+            receipt_scan.append(
+                {
+                    "ordinal": ordinal,
+                    "seed": child_seed,
+                    "present": False,
+                    "remote_path": path,
+                    "receipt": None,
+                    "remote_receipt_sha256": None,
+                    "remote_receipt_size": None,
+                    "remote_mode": None,
+                    "stable_stat_count": 2,
+                    "stable_byte_read_count": 0,
+                    "absence_confirmed": True,
+                }
+            )
+    watcher_capability_sha256 = "a" * 64
+    watcher_revision_sha256 = "b" * 64
+    recovery = contract.build_terminal_receipt_recovery_attestation(
+        parent_task=task,
+        manifest=batch_manifest,
+        task_status=stale_status,
+        task_id=99408,
+        scheduler_state="completed",
+        receipt_scan=receipt_scan,
+        watcher_capability_sha256=watcher_capability_sha256,
+        watcher_revision_sha256=watcher_revision_sha256,
+        scheduler_get_count=1,
+    )
+    base_item = {
+        "task_id": 99408,
+        "name": task["name"],
+        "dedupe_key": task["dedupe_key"],
+        "account_name": "fixture",
+        "status": "completed",
+        "exit_code": 0,
+        "parent_task": copy.deepcopy(task),
+        "scheduler_task": copy.deepcopy(task),
+        "phase_b_watcher_capability_sha256": watcher_capability_sha256,
+        "phase_b_watcher_revision_sha256": watcher_revision_sha256,
+    }
+    plan = {
+        "bundle_id": task["payload_json"]["bundle_id"],
+        "bundle_manifest_sha256": task["payload_json"][
+            "bundle_manifest_sha256"
+        ],
+        "remote_bundle": remote_root,
+    }
+    bundle_manifest = {
+        "bundle_id": task["payload_json"]["bundle_id"],
+        "search_execution": {"result_filename": "result.json"},
+    }
+    monkeypatch.setattr(
+        harvest,
+        "_harvest_result_artifacts",
+        lambda **_kwargs: ({}, {}, []),
+    )
+
+    # No recovery proof preserves the stale, empty cursor prefix.
+    assert (
+        harvest.harvest_batch_lane(
+            base_item,
+            plan=plan,
+            manifest=bundle_manifest,
+            remote=MemoryRemote(copy.deepcopy(files)),
+            result_validator=lambda *_args, **_kwargs: None,
+        )
+        == []
+    )
+    recovered_item = {
+        **base_item,
+        "phase_b_terminal_receipt_recovery_attestation": recovery,
+    }
+    observations = harvest.harvest_batch_lane(
+        recovered_item,
+        plan=plan,
+        manifest=bundle_manifest,
+        remote=MemoryRemote(copy.deepcopy(files)),
+        result_validator=lambda *_args, **_kwargs: None,
+    )
+    assert len(observations) == 1
+    assert observations[0]["seed"] == seed
+    assert observations[0]["terminal_state"] == "completed"
+    assert observations[0]["result_object"]["sha256"] == receipt[
+        "result_sha256"
+    ]
+    assert recovery["scheduler_access"] == "GET-only"
+    assert recovery["scheduler_post_count"] == 0
+    assert recovery["remote_access"] == "read-only"
+    assert recovery["remote_write_count"] == 0
+
+    def reseal(value: dict[str, Any]) -> dict[str, Any]:
+        unsigned = {
+            key: item for key, item in value.items() if key != "attestation_sha256"
+        }
+        value["attestation_sha256"] = phase_a.canonical_sha256(unsigned)
+        return value
+
+    invalid_recoveries = []
+    incomplete = copy.deepcopy(recovery)
+    incomplete["receipt_scan"].pop()
+    invalid_recoveries.append(reseal(incomplete))
+    tampered_receipt = copy.deepcopy(recovery)
+    tampered_receipt["receipt_scan"][0]["receipt"]["failure"] = "tampered"
+    invalid_recoveries.append(reseal(tampered_receipt))
+    parent_mismatch = copy.deepcopy(recovery)
+    parent_mismatch["parent_task_sha256"] = "c" * 64
+    invalid_recoveries.append(reseal(parent_mismatch))
+    scheduler_write = copy.deepcopy(recovery)
+    scheduler_write["scheduler_post_count"] = 1
+    invalid_recoveries.append(reseal(scheduler_write))
+    for invalid in invalid_recoveries:
+        with pytest.raises(RuntimeError, match="terminal recovery|terminal receipt"):
+            harvest.harvest_batch_lane(
+                {
+                    **base_item,
+                    "phase_b_terminal_receipt_recovery_attestation": invalid,
+                },
+                plan=plan,
+                manifest=bundle_manifest,
+                remote=MemoryRemote(copy.deepcopy(files)),
+                result_validator=lambda *_args, **_kwargs: None,
+            )
+
+    with pytest.raises(RuntimeError, match="attestation seal mismatch"):
+        harvest.harvest_batch_lane(
+            {
+                **recovered_item,
+                "phase_b_watcher_revision_sha256": "d" * 64,
+            },
+            plan=plan,
+            manifest=bundle_manifest,
+            remote=MemoryRemote(copy.deepcopy(files)),
+            result_validator=lambda *_args, **_kwargs: None,
+        )
+    with pytest.raises(RuntimeError, match="attestation seal mismatch"):
+        harvest.harvest_batch_lane(
+            {**recovered_item, "status": "running"},
+            plan=plan,
+            manifest=bundle_manifest,
+            remote=MemoryRemote(copy.deepcopy(files)),
+            result_validator=lambda *_args, **_kwargs: None,
+        )
+
+    # Even a self-consistent attestation cannot substitute different remote
+    # immutable bytes: the harvester re-reads and hashes the actual receipt.
+    wrong_hash = copy.deepcopy(recovery)
+    wrong_hash["receipt_scan"][0]["remote_receipt_sha256"] = "f" * 64
+    wrong_hash = reseal(wrong_hash)
+    with pytest.raises(RuntimeError, match="differs from remote receipt bytes"):
+        harvest.harvest_batch_lane(
+            {
+                **base_item,
+                "phase_b_terminal_receipt_recovery_attestation": wrong_hash,
+            },
+            plan=plan,
+            manifest=bundle_manifest,
+            remote=MemoryRemote(copy.deepcopy(files)),
+            result_validator=lambda *_args, **_kwargs: None,
+        )
+
+    # The status object is an exact input to the recovery seal, not merely a
+    # numeric cursor copied into it.
+    changed_status = contract.seal_task_status(
+        {**stale_status, "updated_at": "2026-07-23T01:02:03+09:00"}
+    )
+    changed_files = copy.deepcopy(files)
+    changed_files[
+        f"{remote_root}/runs/task-99408/task_status.json"
+    ] = phase_a.json_bytes(changed_status)
+    with pytest.raises(RuntimeError, match="parent/journal binding"):
+        harvest.harvest_batch_lane(
+            recovered_item,
+            plan=plan,
+            manifest=bundle_manifest,
+            remote=MemoryRemote(changed_files),
+            result_validator=lambda *_args, **_kwargs: None,
+        )
 
 
 def test_stopped_parent_terminal_prefix_replays_without_virtual_task_ids(

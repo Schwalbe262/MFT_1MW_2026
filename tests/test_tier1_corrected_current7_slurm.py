@@ -3,8 +3,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -15,6 +18,7 @@ from tools import tier1_corrected_current7_slurm_publish as publisher
 from tools import tier1_corrected_current7_slurm_seed_runner as runner
 from tools import tier1_corrected_generation_adapter as generation_adapter
 from tools import tier1_corrected_generation_preflight as generation_preflight
+from tools import tier1_final1000_multiseed_phase_b_contract as phase_b_contract
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -74,9 +78,25 @@ parser.add_argument("--optimizer-llt-allowance-uh")
 args = parser.parse_args()
 relocation = json.loads(Path(args.relocation).read_text())
 identity = relocation["relocated_identity"]
+bundle_manifest = json.loads(
+    Path(args.bundle_root, "bundle_manifest.json").read_text()
+)
+topology_contract = bundle_manifest["islands"][args.island_id][
+    "current7_profile"
+]["topology_evolution_contract"]
+topology_niche = topology_contract.get("final1000_topology_niche_contract")
 stage_spec = json.loads(args.stage_spec_json)
 assert stage_spec == identity["hard_spec"]
 assert canonical(stage_spec) == args.stage_spec_sha256
+semlock_stress = {
+    "rounds": 8,
+    "prediction_call_count": 8 * 20,
+    "sklearn_extratrees_n_jobs": 1,
+    "semaphore_entry_growth_count": 0,
+    "enospc_observed": False,
+    "stress_passed": True,
+}
+semlock_stress["sha256"] = canonical(semlock_stress)
 preflight = {
     "schema_version": "mft-tier1-current7-remote-model-load-v1",
     "status": "passed",
@@ -118,6 +138,11 @@ preflight = {
     "optimizer_repair_contract_sha256": (
         args.optimizer_repair_contract_sha256
     ),
+    "topology_evolution_contract_sha256": topology_contract["sha256"],
+    "topology_niche_contract_sha256": (
+        None if topology_niche is None else topology_niche["sha256"]
+    ),
+    "semlock_safe_prediction_stress": semlock_stress,
     "offspring_physics_repair": True,
     "initial_repair_attested": True,
     "warm_repair_attested": True,
@@ -152,6 +177,14 @@ artifact_inventory = {
         "size_bytes": dummy_artifact.stat().st_size,
     }
 }
+topology_audit = {
+    "migration_events": 1,
+    "paired_parent_pairs_emitted": 10,
+    "survival_calls": int(args.max_generations),
+    "terminal_epsilon_zero": True,
+    "all_required_topologies_preserved": True,
+}
+topology_audit["sha256"] = canonical(topology_audit)
 result = {
     "schema_version": "mft-tier1-current7-search-seed-v1",
     "bundle_id": args.bundle_id,
@@ -200,13 +233,15 @@ result = {
     ),
     "terminal_physical_replay_attested": True,
     "optimizer_repair_contract_sha256": args.optimizer_repair_contract_sha256,
-    "optimizer_topology_evolution_audit": {
-        "migration_events": 1,
-        "paired_parent_pairs_emitted": 10,
-        "survival_calls": int(args.max_generations),
-        "terminal_epsilon_zero": True,
-        "all_required_topologies_preserved": True,
-    },
+    "optimizer_topology_evolution_contract": topology_contract,
+    "topology_evolution_contract_sha256": topology_contract["sha256"],
+    "topology_niche_contract_sha256": (
+        None if topology_niche is None else topology_niche["sha256"]
+    ),
+    "optimizer_topology_evolution_audit": topology_audit,
+    "semlock_safe_prediction_stress": semlock_stress,
+    "semlock_safe_prediction_stress_sha256": semlock_stress["sha256"],
+    "semlock_safe_prediction_stress_attested": True,
     "artifact_inventory": artifact_inventory,
     "artifact_inventory_sha256": canonical(artifact_inventory),
     "feasible_pareto_count": 0,
@@ -294,6 +329,16 @@ def _v2_receipt(adapter: dict, *, repair_ready: bool) -> dict:
                     for target in receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS
                 },
                 "additional_half_width_multiplier": 1.0,
+                "semlock_safe_prediction_stress": _sealed(
+                    {
+                        "prediction_call_count": 8
+                        * len(receipt_contract.CURRENT_REQUIRED_MODEL_TARGETS),
+                        "sklearn_extratrees_n_jobs": 1,
+                        "semaphore_entry_growth_count": 0,
+                        "enospc_observed": False,
+                        "stress_passed": True,
+                    }
+                ),
             }
         )
         physical_smoke = _sealed(
@@ -345,6 +390,11 @@ def _v2_receipt(adapter: dict, *, repair_ready: bool) -> dict:
         "supported_fixed_primary_turns": expected_turns,
         "strata": {key: strata[key]["model_smoke"] for key in strata},
         "all_supported_strata_exercised": True,
+        "semlock_safe_prediction_stress_required": True,
+        "sklearn_extratrees_n_jobs": 1,
+        "repeated_prediction_stress_rounds_per_stratum": 8,
+        "dev_shm_semaphore_growth_allowed": False,
+        "enospc_allowed": False,
     }
     problem_contract = {
         "stage_spec": generation_preflight.CURRENT_STAGE_SPEC,
@@ -782,6 +832,177 @@ def test_bundle_is_content_addressed_and_relocates_absolute_paths(tmp_path):
     )
     assert second_plan["bundle_id"] == plan["bundle_id"]
     assert second_manifest == manifest
+
+
+def test_phase_b_bundle_build_seals_every_required_remote_code_file(tmp_path):
+    fixture = _fixture(tmp_path)
+    required = bundle_tool.phase_b_remote_code_files()
+    required_hashes = bundle_tool.phase_b_required_code_sha256()
+    assert required == tuple(sorted(phase_b_contract.REMOTE_CODE_FILES))
+    optimizer_entrypoint = "regression_260707/optimization/nsga2_problem.py"
+    collected_sources = bundle_tool.collect_phase_b_tracked_code_sources(
+        REPO,
+        optimizer_entrypoint=optimizer_entrypoint,
+    )
+    tracked_module_files = {
+        path.relative_to(REPO).as_posix()
+        for path in (REPO / "module").rglob("*.py")
+    }
+    assert tracked_module_files
+    assert {
+        relative.removeprefix("artifacts/code/")
+        for relative in collected_sources
+        if relative.startswith("artifacts/code/module/")
+    } == tracked_module_files
+    assert "artifacts/code/module/input_parameter_260706.py" in collected_sources
+    # Keep the publish fixture short enough for Windows while exercising the
+    # exact optimizer import closure that failed on the topology canary.
+    optimizer_import_files = {
+        "regression_260707/optimization/nsga2_problem.py",
+        "regression_260707/optimization/geometry_metrics.py",
+        "regression_260707/optimization/design_summary.py",
+        "regression_260707/model_targets.py",
+    }
+    code_sources = dict(fixture["code_sources"])
+    code_sources.update(
+        {
+            f"artifacts/code/{relative}": REPO / relative
+            for relative in {*required, *optimizer_import_files}
+        }
+    )
+    plan, manifest = bundle_tool.build_plan(
+        local_root=tmp_path / "phase-b-plan",
+        remote_root="/remote/current7",
+        receipt_path=fixture["receipt"],
+        generation=fixture["generation"],
+        candidate_path=fixture["candidate"],
+        quality_path=fixture["quality"],
+        dataset_path=fixture["dataset"],
+        profile_path=fixture["profile"],
+        code_identity={"revision": "9" * 40, "clean": True},
+        code_sources=code_sources,
+        optimizer_entrypoint=optimizer_entrypoint,
+        warm_starts=fixture["warm"],
+        runtime_packages=fixture["runtime_packages"],
+        required_code_files=required,
+        required_code_sha256=required_hashes,
+    )
+
+    attestation = bundle_tool.validate_required_runtime_code(
+        manifest, required, required_code_sha256=required_hashes
+    )
+    assert attestation == manifest["required_runtime_code"]
+    for relative in required:
+        bundle_relative = f"artifacts/code/{relative}"
+        assert manifest["code_inventory"][bundle_relative]["sha256"] == _sha(
+            REPO / relative
+        )
+
+    published = _local_publish(tmp_path, fixture, plan, manifest)
+    bundle_tool.validate_required_runtime_code(
+        manifest,
+        required,
+        required_code_sha256=required_hashes,
+        bundle_root=published,
+    )
+    import_smoke = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import pathlib, sys, types; "
+                f"sys.path.insert(0, {str(published / 'artifacts' / 'code')!r}); "
+                f"sys.path.insert(0, {str(published / 'artifacts' / 'code' / 'regression_260707')!r}); "
+                "pymoo=types.ModuleType('pymoo'); "
+                "core=types.ModuleType('pymoo.core'); "
+                "problem=types.ModuleType('pymoo.core.problem'); "
+                "problem.Problem=type('Problem', (), {}); "
+                "sys.modules.update({'pymoo':pymoo,'pymoo.core':core,'pymoo.core.problem':problem}); "
+                "import tools.tier1_final1000_multiseed_phase_b_contract; "
+                "import tools.tier1_final1000_multiseed_phase_b_runner; "
+                "import optimization.nsga2_problem as nsga; "
+                "import module.input_parameter_260706 as parameters; "
+                f"root=pathlib.Path({str(published / 'artifacts' / 'code')!r}).resolve(); "
+                "assert pathlib.Path(nsga.__file__).resolve().is_relative_to(root); "
+                "assert pathlib.Path(parameters.__file__).resolve().is_relative_to(root)"
+            ),
+        ],
+        cwd=published,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert import_smoke.returncode == 0, import_smoke.stderr
+    first = published / "artifacts" / "code" / Path(required[0])
+    first.write_bytes(first.read_bytes() + b"\n# drift\n")
+    with pytest.raises(RuntimeError, match="bytes drifted"):
+        bundle_tool.validate_required_runtime_code(
+            manifest,
+            required,
+            required_code_sha256=required_hashes,
+            bundle_root=published,
+        )
+
+
+def test_phase_b_bundle_build_refuses_missing_required_remote_code(tmp_path):
+    fixture = _fixture(tmp_path)
+    required = bundle_tool.phase_b_remote_code_files()
+    with pytest.raises(RuntimeError, match="required runtime code is absent"):
+        bundle_tool.build_plan(
+            local_root=tmp_path / "missing-phase-b-plan",
+            remote_root="/remote/current7",
+            receipt_path=fixture["receipt"],
+            generation=fixture["generation"],
+            candidate_path=fixture["candidate"],
+            quality_path=fixture["quality"],
+            dataset_path=fixture["dataset"],
+            profile_path=fixture["profile"],
+            code_identity={"revision": "9" * 40, "clean": True},
+            code_sources=fixture["code_sources"],
+            optimizer_entrypoint="tools/fake_current7_search.py",
+            warm_starts=fixture["warm"],
+            runtime_packages=fixture["runtime_packages"],
+            required_code_files=required,
+            required_code_sha256=bundle_tool.phase_b_required_code_sha256(),
+        )
+
+
+def test_phase_b_bundle_build_refuses_semlock_helper_byte_drift(tmp_path):
+    fixture = _fixture(tmp_path)
+    required = bundle_tool.phase_b_remote_code_files()
+    code_sources = dict(fixture["code_sources"])
+    code_sources.update(
+        {
+            f"artifacts/code/{relative}": REPO / relative
+            for relative in required
+        }
+    )
+    helper_relative = next(iter(bundle_tool.phase_b_required_code_sha256()))
+    drifted_helper = tmp_path / "drifted-semlock-helper.py"
+    original = (REPO / helper_relative).read_bytes()
+    drifted_helper.write_bytes(original.replace(b"\r\n", b"\n") + b"\n# drift\n")
+    code_sources[f"artifacts/code/{helper_relative}"] = drifted_helper
+
+    with pytest.raises(RuntimeError, match="hard hash mismatch"):
+        bundle_tool.build_plan(
+            local_root=tmp_path / "drifted-phase-b-plan",
+            remote_root="/remote/current7",
+            receipt_path=fixture["receipt"],
+            generation=fixture["generation"],
+            candidate_path=fixture["candidate"],
+            quality_path=fixture["quality"],
+            dataset_path=fixture["dataset"],
+            profile_path=fixture["profile"],
+            code_identity={"revision": "9" * 40, "clean": True},
+            code_sources=code_sources,
+            optimizer_entrypoint="tools/fake_current7_search.py",
+            warm_starts=fixture["warm"],
+            runtime_packages=fixture["runtime_packages"],
+            required_code_files=required,
+            required_code_sha256=bundle_tool.phase_b_required_code_sha256(),
+        )
 
 
 def test_bundle_refuses_adapter_code_revision_mismatch_before_plan_write(tmp_path):

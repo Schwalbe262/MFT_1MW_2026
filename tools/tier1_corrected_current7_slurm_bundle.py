@@ -74,6 +74,7 @@ SEARCH_INTERFACE_SCHEMA = "mft-tier1-current7-search-seed-cli-v1"
 REMOTE_PREFLIGHT_SCHEMA = "mft-tier1-current7-remote-model-load-v1"
 RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 READY_SCHEMA = "mft-tier1-current7-slurm-ready-v1"
+REQUIRED_RUNTIME_CODE_SCHEMA = "mft-tier1-required-runtime-code-inventory-v1"
 
 DEFAULT_REMOTE_ROOT = "/gpfs/tmp_cpu2/mft_tier1_current7_bundles"
 DEFAULT_CPUS = 8
@@ -256,6 +257,12 @@ def collect_tracked_code_sources(
     entrypoint = _safe_relative(optimizer_entrypoint, "optimizer entrypoint")
     required_tools = {
         entrypoint,
+        # The current optimizer imports these from the repository-root
+        # ``module`` namespace.  They are not below regression_260707, so an
+        # optimizer-only selection silently produced an import-incomplete
+        # immutable bundle.
+        "module/core_material_contract.py",
+        "module/input_parameter_260706.py",
         "tools/tier1_corrected_generation_adapter.py",
         "tools/tier1_corrected_current7_receipt.py",
         "tools/tier1_corrected_current7_slurm_bundle.py",
@@ -297,11 +304,206 @@ def collect_tracked_code_sources(
         if item.startswith("regression_260707/")
         and PurePosixPath(item).suffix in {".py", ".json"}
     )
+    selected.update(
+        item
+        for item in tracked
+        if item.startswith("module/") and PurePosixPath(item).suffix == ".py"
+    )
     selected.difference_update(PROHIBITED_LEGACY_CODE)
     return {
         f"artifacts/code/{relative}": (root / relative).resolve(strict=True)
         for relative in sorted(selected)
     }
+
+
+def phase_b_remote_code_files() -> tuple[str, ...]:
+    """Return the Phase-B runtime inventory without creating an import cycle.
+
+    The Phase-B contract imports this module through its Phase-A dependency, so
+    the import must remain lazy.  Production bundle construction uses this
+    helper instead of relying on callers to repeat an easy-to-drift file list.
+    """
+
+    try:
+        from tier1_final1000_multiseed_phase_b_contract import REMOTE_CODE_FILES
+    except ImportError:  # pragma: no cover - repository import path
+        from tools.tier1_final1000_multiseed_phase_b_contract import (
+            REMOTE_CODE_FILES,
+        )
+
+    return tuple(
+        sorted(
+            {_safe_relative(item, "Phase-B runtime code") for item in REMOTE_CODE_FILES}
+        )
+    )
+
+
+def phase_b_required_code_sha256() -> dict[str, str]:
+    """Return immutable byte-level gates that are part of Phase-B science."""
+
+    try:
+        from tier1_final1000_multiseed_phase_b_contract import INFERENCE_SAFETY
+    except ImportError:  # pragma: no cover - repository import path
+        from tools.tier1_final1000_multiseed_phase_b_contract import INFERENCE_SAFETY
+
+    return {
+        str(INFERENCE_SAFETY["required_helper_path"]): str(
+            INFERENCE_SAFETY["required_helper_sha256"]
+        )
+    }
+
+
+def collect_phase_b_tracked_code_sources(
+    code_root: Path,
+    *,
+    optimizer_entrypoint: str,
+    extra_code_files: Iterable[str] = (),
+) -> dict[str, Path]:
+    """Collect a bundle source map that cannot omit Phase-B remote code."""
+
+    return collect_tracked_code_sources(
+        code_root,
+        optimizer_entrypoint=optimizer_entrypoint,
+        extra_code_files=(*phase_b_remote_code_files(), *tuple(extra_code_files)),
+    )
+
+
+def validate_bundle_manifest_identity(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the content-addressed immutable bundle manifest envelope."""
+
+    if not isinstance(manifest, Mapping):
+        raise RuntimeError("bundle manifest must be an object")
+    stable = {
+        key: item
+        for key, item in manifest.items()
+        if key not in {"bundle_id", "contract_sha256"}
+    }
+    contract_sha = canonical_sha256(stable)
+    files = manifest.get("files")
+    code_inventory = manifest.get("code_inventory")
+    if (
+        manifest.get("schema_version") != BUNDLE_SCHEMA
+        or manifest.get("contract_sha256") != contract_sha
+        or manifest.get("bundle_id") != f"current7-{contract_sha[:20]}"
+        or not isinstance(files, dict)
+        or not files
+        or not isinstance(code_inventory, dict)
+        or not code_inventory
+    ):
+        raise RuntimeError("bundle manifest content-address identity mismatch")
+    for relative, record in files.items():
+        if (
+            _safe_relative(relative, "bundle file") != relative
+            or not isinstance(record, dict)
+            or set(record) != {"sha256", "size"}
+            or not isinstance(record.get("sha256"), str)
+            or len(record["sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in record["sha256"]
+            )
+            or isinstance(record.get("size"), bool)
+            or not isinstance(record.get("size"), int)
+            or record["size"] < 0
+        ):
+            raise RuntimeError(f"bundle manifest file record is invalid: {relative}")
+    expected_code_inventory = {
+        relative: record
+        for relative, record in sorted(files.items())
+        if relative.startswith("artifacts/code/")
+    }
+    if (
+        code_inventory != expected_code_inventory
+        or manifest.get("code_inventory_sha256")
+        != canonical_sha256(expected_code_inventory)
+    ):
+        raise RuntimeError("bundle code inventory SHA-256 mismatch")
+    return dict(manifest)
+
+
+def validate_required_runtime_code(
+    manifest: Mapping[str, Any],
+    required_code_files: Iterable[str],
+    *,
+    required_code_sha256: Mapping[str, str] | None = None,
+    bundle_root: Path | None = None,
+) -> dict[str, Any]:
+    """Authenticate an immutable manifest's mandatory runtime code subset.
+
+    When ``bundle_root`` is supplied the deployed bytes are re-hashed as well;
+    otherwise this validates the content-addressed manifest contract only.
+    """
+
+    required = tuple(
+        sorted({_safe_relative(item, "required runtime code") for item in required_code_files})
+    )
+    if not required:
+        raise RuntimeError("required runtime code inventory is empty")
+    validate_bundle_manifest_identity(manifest)
+    files = manifest["files"]
+    code_inventory = manifest["code_inventory"]
+    attestation = manifest.get("required_runtime_code")
+    required_hashes = {
+        _safe_relative(relative, "required runtime code hash"): str(expected)
+        for relative, expected in (required_code_sha256 or {}).items()
+    }
+    if set(required_hashes) - set(required):
+        raise RuntimeError("required runtime hash escaped the required file inventory")
+    if any(
+        len(expected) != 64
+        or any(character not in "0123456789abcdef" for character in expected)
+        for expected in required_hashes.values()
+    ):
+        raise RuntimeError("required runtime code hash is not a SHA-256")
+    bundle_paths = tuple(f"artifacts/code/{item}" for item in required)
+    selected: dict[str, Any] = {}
+    for relative in bundle_paths:
+        record = code_inventory.get(relative)
+        if (
+            not isinstance(record, dict)
+            or record != files.get(relative)
+            or set(record) != {"sha256", "size"}
+            or not isinstance(record.get("sha256"), str)
+            or len(record["sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in record["sha256"]
+            )
+            or isinstance(record.get("size"), bool)
+            or not isinstance(record.get("size"), int)
+            or record["size"] < 0
+        ):
+            raise RuntimeError(f"required runtime code is absent or unsealed: {relative}")
+        source_relative = relative.removeprefix("artifacts/code/")
+        if (
+            source_relative in required_hashes
+            and record["sha256"] != required_hashes[source_relative]
+        ):
+            raise RuntimeError(
+                f"required runtime code hard hash mismatch: {source_relative}"
+            )
+        selected[relative] = record
+    unsigned = {
+        "schema_version": REQUIRED_RUNTIME_CODE_SCHEMA,
+        "required_files": list(required),
+        "code_records": selected,
+        "code_records_sha256": canonical_sha256(selected),
+        "required_sha256": required_hashes,
+    }
+    expected = {**unsigned, "sha256": canonical_sha256(unsigned)}
+    if attestation != expected:
+        raise RuntimeError("required runtime code attestation mismatch")
+    if bundle_root is not None:
+        root = Path(bundle_root).resolve(strict=True)
+        for relative, record in selected.items():
+            source = (root / PurePosixPath(relative)).resolve(strict=True)
+            try:
+                source.relative_to(root)
+            except ValueError as exc:
+                raise RuntimeError("required runtime code escaped bundle root") from exc
+            if _record(source) != record:
+                raise RuntimeError(f"required runtime code bytes drifted: {relative}")
+    return expected
 
 
 def _generation_sources(
@@ -598,6 +800,8 @@ def build_plan(
     warm_starts: Mapping[str, Mapping[str, Path]],
     runtime_packages: Mapping[str, str],
     priority: int = DEFAULT_PRIORITY,
+    required_code_files: Iterable[str] = (),
+    required_code_sha256: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     receipt_path = receipt_path.resolve(strict=True)
     receipt = read_json(receipt_path)
@@ -607,6 +811,20 @@ def build_plan(
     code_revision = _hex(code_identity.get("revision"), 40, "bundle code revision")
     if code_revision != receipt_identity.adapter_code_revision:
         raise RuntimeError("bundle/adapter code identity mismatch")
+    required_runtime_files = tuple(
+        sorted(
+            {
+                _safe_relative(item, "required runtime code")
+                for item in required_code_files
+            }
+        )
+    )
+    required_runtime_hashes = {
+        _safe_relative(relative, "required runtime code hash"): str(expected)
+        for relative, expected in (required_code_sha256 or {}).items()
+    }
+    if set(required_runtime_hashes) - set(required_runtime_files):
+        raise RuntimeError("required runtime hash escaped the required file inventory")
     identity, sources, relocation = _generation_sources(
         receipt=receipt,
         receipt_path=receipt_path,
@@ -680,6 +898,33 @@ def build_plan(
         for relative in sorted(files)
         if relative.startswith("artifacts/code/")
     }
+    required_runtime_code = None
+    if required_runtime_files:
+        required_records: dict[str, Any] = {}
+        for relative in required_runtime_files:
+            bundle_relative = f"artifacts/code/{relative}"
+            record = code_inventory.get(bundle_relative)
+            if record is None:
+                raise RuntimeError(
+                    f"required runtime code is absent from bundle: {relative}"
+                )
+            expected_sha = required_runtime_hashes.get(relative)
+            if expected_sha is not None and record["sha256"] != expected_sha:
+                raise RuntimeError(
+                    f"required runtime code hard hash mismatch: {relative}"
+                )
+            required_records[bundle_relative] = record
+        required_runtime_unsigned = {
+            "schema_version": REQUIRED_RUNTIME_CODE_SCHEMA,
+            "required_files": list(required_runtime_files),
+            "code_records": required_records,
+            "code_records_sha256": canonical_sha256(required_records),
+            "required_sha256": required_runtime_hashes,
+        }
+        required_runtime_code = {
+            **required_runtime_unsigned,
+            "sha256": canonical_sha256(required_runtime_unsigned),
+        }
     resource_contract = _resource_contract(priority)
     canaries, ramp = seed_lanes()
     fast_ramp = {
@@ -805,6 +1050,8 @@ def build_plan(
         "aedt_used": False,
         "automatic_promotion_allowed": False,
     }
+    if required_runtime_code is not None:
+        stable_contract["required_runtime_code"] = required_runtime_code
     contract_sha = canonical_sha256(stable_contract)
     bundle_id = f"current7-{contract_sha[:20]}"
     manifest = {
@@ -812,6 +1059,13 @@ def build_plan(
         "bundle_id": bundle_id,
         "contract_sha256": contract_sha,
     }
+    validate_bundle_manifest_identity(manifest)
+    if required_runtime_files:
+        validate_required_runtime_code(
+            manifest,
+            required_runtime_files,
+            required_code_sha256=required_runtime_hashes,
+        )
     local_root = local_root.resolve()
     plan_dir = local_root / bundle_id
     plan_dir.mkdir(parents=True, exist_ok=True)
@@ -1311,6 +1565,14 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--code-revision", required=True)
     plan.add_argument("--optimizer-entrypoint", required=True)
     plan.add_argument("--extra-code-file", action="append", default=[])
+    plan.add_argument(
+        "--phase-b-runtime",
+        action="store_true",
+        help=(
+            "include and seal every final1000 Phase-B remote runtime file; "
+            "fail if any tracked source is absent"
+        ),
+    )
     plan.add_argument("--n1-5-warm", type=Path, required=True)
     plan.add_argument("--n1-5-warm-contract", type=Path, required=True)
     plan.add_argument("--n1-6-warm", type=Path, required=True)
@@ -1336,11 +1598,22 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "plan":
         code_identity = authenticate_clean_code_root(args.code_root, args.code_revision)
-        code_sources = collect_tracked_code_sources(
-            args.code_root,
-            optimizer_entrypoint=args.optimizer_entrypoint,
-            extra_code_files=args.extra_code_file,
-        )
+        required_code_files: tuple[str, ...] = ()
+        required_code_sha256: dict[str, str] = {}
+        if args.phase_b_runtime:
+            required_code_files = phase_b_remote_code_files()
+            required_code_sha256 = phase_b_required_code_sha256()
+            code_sources = collect_phase_b_tracked_code_sources(
+                args.code_root,
+                optimizer_entrypoint=args.optimizer_entrypoint,
+                extra_code_files=args.extra_code_file,
+            )
+        else:
+            code_sources = collect_tracked_code_sources(
+                args.code_root,
+                optimizer_entrypoint=args.optimizer_entrypoint,
+                extra_code_files=args.extra_code_file,
+            )
         value, _manifest = build_plan(
             local_root=args.local_root,
             remote_root=args.remote_root,
@@ -1365,6 +1638,8 @@ def main() -> None:
             },
             runtime_packages=runtime_package_versions(),
             priority=args.priority,
+            required_code_files=required_code_files,
+            required_code_sha256=required_code_sha256,
         )
     elif args.command in {
         "render-task-waves",
