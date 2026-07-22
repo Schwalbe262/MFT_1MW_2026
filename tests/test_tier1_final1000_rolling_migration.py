@@ -10,6 +10,7 @@ import pytest
 
 from tools import tier1_final1000_rolling_migration as migration
 from tools import tier1_corrected_current7_slurm_controller as current7_controller
+from tools import tier1_final1000_multiseed_controller as multiseed_controller
 from tools import tier1_final1000_slurm_controller as controller
 from tools import tier1_final1000_slurm_launch as launch
 from tools import tier1_final1000_stage_profiles as profiles
@@ -493,6 +494,97 @@ def _prepare_historical(fixture: dict, *, apply: bool = False):
         apply=apply,
         transition_mode=migration.PATCHED_BUNDLE,
     )
+
+
+def test_multiseed_upgrade_observes_exact_rolling_predecessor_envelope(tmp_path):
+    fixture = _fixture(tmp_path)
+    # Replace one active planned-wave task with a genuine predecessor refill
+    # that is absent from both launch-plan task waves.  This is the identity
+    # that cannot be reconstructed from the successor template after handoff.
+    predecessor_state = copy.deepcopy(fixture["state"])
+    source_entry = next(
+        item for item in predecessor_state["entries"] if item["state"] == "running"
+    )
+    stage_id = source_entry["stage_id"]
+    refill_seed = int(predecessor_state["next_seed_by_stage"][stage_id])
+    template = next(
+        task
+        for task in fixture["predecessor"]["task_waves"]["canaries"]
+        if task["payload_json"]["final_goal_stage_id"] == stage_id
+    )
+    refill_task = migration._render_from_template(
+        template,
+        stage_id=stage_id,
+        seed=refill_seed,
+        wave="refill",
+    )
+    old_dedupe = source_entry["dedupe_key"]
+    source_entry.update(
+        bundle_id=refill_task["payload_json"]["bundle_id"],
+        seed=refill_seed,
+        wave="refill",
+        dedupe_key=refill_task["dedupe_key"],
+    )
+    predecessor_state["next_seed_by_stage"][stage_id] = refill_seed + 1
+    predecessor_state = controller._seal_state(predecessor_state)
+    fixture["state"] = predecessor_state
+    fixture["predecessor_state_path"].write_text(
+        json.dumps(predecessor_state), encoding="utf-8"
+    )
+    task_id = int(source_entry["task_id"])
+    scheduler_task = copy.deepcopy(refill_task)
+    scheduler_task.update({"id": task_id, "task_id": task_id, "status": "running"})
+    fixture["scheduler"].by_dedupe.pop(old_dedupe)
+    fixture["scheduler"].by_dedupe[refill_task["dedupe_key"]] = scheduler_task
+    fixture["scheduler"].by_id[task_id] = scheduler_task
+
+    prepared = _prepare(fixture, apply=False)
+    rolling_state = prepared["successor_state"]
+
+    with pytest.raises(RuntimeError, match="predecessor plan is required"):
+        multiseed_controller.upgrade_v1_state(
+            rolling_state,
+            fixture["successor"],
+            batch_length=4,
+        )
+
+    state = multiseed_controller.upgrade_v1_state(
+        rolling_state,
+        fixture["successor"],
+        predecessor_plan=fixture["predecessor"],
+        batch_length=4,
+    )
+    entry = next(
+        item
+        for item in state["entries"]
+        if item["origin"] == "predecessor"
+        and item["wave"] == "refill"
+        and item["seeds"] == [refill_seed]
+    )
+    task = copy.deepcopy(entry["task_envelope"])
+    assert task["payload_json"]["bundle_id"] == entry["bundle_id"]
+    assert task["payload_json"]["bundle_id"].startswith("predecessor-")
+    assert entry["source_launch_plan_sha256"] == fixture["predecessor"][
+        "launch_plan_sha256"
+    ]
+    observed = multiseed_controller.observe_scheduler_task(
+        state,
+        fixture["successor"],
+        parent_dedupe_key=entry["parent_dedupe_key"],
+        scheduler_task={
+            "id": entry["task_id"],
+            "name": task["name"],
+            "dedupe_key": task["dedupe_key"],
+            "status": "running",
+            "task_json": task,
+        },
+    )
+    observed_entry = next(
+        item
+        for item in observed["entries"]
+        if item["parent_dedupe_key"] == entry["parent_dedupe_key"]
+    )
+    assert observed_entry["state"] == "running"
 
 
 def test_successor_policy_preserves_science_threads_and_unlocks_allocation_cap():

@@ -61,6 +61,43 @@ except ImportError:  # pragma: no cover - repository import path
     )
 
 
+THREAD_LIMIT_ENVIRONMENT_VARIABLES = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def optimizer_environment(
+    base: Mapping[str, str], payload: Mapping[str, Any]
+) -> dict[str, str]:
+    """Return one fail-closed CPU/thread environment for the child optimizer."""
+
+    threads = payload.get("inference_threads")
+    scheduler_cpus = payload.get("scheduler_cpus")
+    if (
+        isinstance(threads, bool)
+        or not isinstance(threads, int)
+        or threads <= 0
+        or (
+            scheduler_cpus is not None
+            and (
+                isinstance(scheduler_cpus, bool)
+                or not isinstance(scheduler_cpus, int)
+                or scheduler_cpus <= 0
+                or scheduler_cpus != threads
+            )
+        )
+    ):
+        raise RuntimeError("task CPU/thread execution contract mismatch")
+    environment = dict(base)
+    for variable in THREAD_LIMIT_ENVIRONMENT_VARIABLES:
+        environment[variable] = str(threads)
+    return environment
+
+
 def now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -270,6 +307,17 @@ def verify_payload(
         str(lane.get("fixed_primary_turns"))
     ):
         raise RuntimeError("task repair contract is not pinned to its N1 stratum")
+    scheduler_cpus = payload.get("scheduler_cpus")
+    execution_threads_match = (
+        payload.get("inference_threads") == 8
+        if scheduler_cpus is None
+        else (
+            not isinstance(scheduler_cpus, bool)
+            and isinstance(scheduler_cpus, int)
+            and scheduler_cpus > 0
+            and payload.get("inference_threads") == scheduler_cpus
+        )
+    )
     if (
         payload.get("generation_artifact_inventory_sha256")
         != manifest.get("generation_artifact_inventory_sha256")
@@ -279,7 +327,7 @@ def verify_payload(
         != SEARCH_INTERFACE_SCHEMA
         or payload.get("population") != 320
         or payload.get("max_generations") != 300
-        or payload.get("inference_threads") != 8
+        or not execution_threads_match
         or payload.get("optimizer_processes") != 1
     ):
         raise RuntimeError("task payload execution contract mismatch")
@@ -479,6 +527,8 @@ def validate_remote_preflight(
         != CURRENT_REQUIRED_MODEL_TARGETS_SHA256
         or value.get("temperature_targets") != list(CURRENT_TEMPERATURE_TARGETS)
         or value.get("inference_threads") != payload["inference_threads"]
+        or value.get("scheduler_cpus")
+        != payload.get("scheduler_cpus", payload["inference_threads"])
         or value.get("optimizer_repair_contract_sha256")
         != payload["optimizer_repair_contract_sha256"]
         or value.get("offspring_physics_repair") is not True
@@ -533,6 +583,8 @@ def validate_result(
         or result.get("evaluated_generations") != payload["max_generations"]
         or result.get("completed_generations") != payload["max_generations"] + 1
         or result.get("inference_threads") != payload["inference_threads"]
+        or result.get("scheduler_cpus")
+        != payload.get("scheduler_cpus", payload["inference_threads"])
         or result.get("generation_artifact_inventory_sha256")
         != manifest["generation_artifact_inventory_sha256"]
         or result.get("adapter_manifest_sha256")
@@ -665,6 +717,8 @@ def _optimizer_command(
         str(payload["max_generations"]),
         "--inference-threads",
         str(payload["inference_threads"]),
+        "--scheduler-cpus",
+        str(payload.get("scheduler_cpus", payload["inference_threads"])),
         "--fixed-primary-turns",
         str(lane["fixed_primary_turns"]),
         "--optimizer-termination-strategy",
@@ -749,16 +803,7 @@ def run(
     command = _optimizer_command(
         bundle, payload, manifest, relocation, output, preflight_path
     )
-    environment = os.environ.copy()
-    threads = str(payload["inference_threads"])
-    for variable in (
-        "OMP_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-    ):
-        environment[variable] = threads
+    environment = optimizer_environment(os.environ, payload)
     process = subprocess.Popen(
         command,
         cwd=contained(bundle, "artifacts/code"),

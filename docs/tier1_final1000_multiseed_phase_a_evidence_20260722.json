@@ -1,0 +1,80 @@
+{
+  "schema_version": "mft-tier1-final1000-multiseed-phase-a-local-evidence-v1",
+  "created_at": "2026-07-22T00:00:00+09:00",
+  "base_commit": "30811ea159c6379647291e67f1961d74bcb23658",
+  "branch": "codex/final1000-multiseed-phase-a-260722",
+  "protocol_version": "final1000-finite-multiseed-phase-a-v2",
+  "operational_batch_lengths": [
+    1,
+    4
+  ],
+  "phase_a_batch_length": 4,
+  "scheduler_cpus_per_lane": 4,
+  "inference_threads_per_child": 4,
+  "optimizer_processes_per_child": 1,
+  "thread_environment_variables": [
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS"
+  ],
+  "tests": {
+    "tests/test_tier1_final1000_multiseed_phase_a.py": 17,
+    "tests/test_tier1_corrected_current7_slurm.py": 23,
+    "tests/test_tier1_final1000_stage_launch.py": 25,
+    "tests/test_tier1_final1000_rolling_migration.py": 20,
+    "tests/test_tier1_final1000_slurm_harvest.py": 18,
+    "total_passed": 103
+  },
+  "static_checks": {
+    "ruff": "passed",
+    "compileall": "passed",
+    "git_diff_check": "passed"
+  },
+  "synthetic_batch4_contract_seals": {
+    "production_task": false,
+    "seeds": [
+      2207500000,
+      2207500001,
+      2207500002,
+      2207500003
+    ],
+    "task_sha256": "3aaab8ae483a655ea2a8f21e34d217ef083561c92ff79f2ce5480f244d0c85b7",
+    "payload_sha256": "4effa62746dcf6ba1b37d823afeb800c1b9a8122aa08d4611522aa1f34a069ab",
+    "manifest_sha256": "e7d4da1b7899c801e882d568e846156eec30c265c19f1b098014d5140389a515",
+    "dedupe_key": "mft-tier1-final1000:lane:de683cca1269fdfbd41744a5b15d4777e9d47a94100f437a3ede83c63ccee16c",
+    "scheduler_submission_performed": false
+  },
+  "code_sha256": {
+    "tools/tier1_corrected_generation_preflight.py": "3389f0e00081fd972f48e0620595b3b07df1019c9218cbea1a3344117471fcd3",
+    "tools/tier1_corrected_current7_slurm_seed_runner.py": "e19a595e76de6315555ff3bcad3f491fd33c475962135694a44aa4ec57079d2b",
+    "tools/tier1_final1000_multiseed_contract.py": "c1d33e82759b1c705db48778dbfd2b69ddfe19472754ab835af33300a28dfada",
+    "tools/tier1_final1000_multiseed_lane_runner.py": "0339210d0e5b886d55f75c5a9ba1a5ff577253d7099324dd237fc0d78750d997",
+    "tools/tier1_final1000_multiseed_controller.py": "80b9482b7858d105dbc313317103fb83b2b25712e956b57eb824515d444bef42",
+    "tools/tier1_final1000_multiseed_harvest.py": "7e62b57543d7788c760a15e498712fa6ecf3ac017bc33d1bc040297a19b520f7",
+    "tools/tier1_final1000_multiseed_status.py": "931095f7b22f05da560f6c85ecb0bf30e894753fedb6425eb5c72c9b565b29af",
+    "tools/tier1_final1000_slurm_controller.py": "a43dedf107e56a920cbaf149bb688869dde37bbc34ba1a05ee625ee672b7f375"
+  },
+  "bundle_publication_inputs": {
+    "optimizer_entrypoint_must_be_current_commit": true,
+    "optimizer_entrypoint": "tools/tier1_corrected_generation_preflight.py",
+    "extra_code_files": [
+      "tools/tier1_corrected_current7_slurm_seed_runner.py",
+      "tools/tier1_final1000_multiseed_contract.py",
+      "tools/tier1_final1000_multiseed_lane_runner.py"
+    ],
+    "new_immutable_bundle_required": true,
+    "existing_ready_reuse_allowed": false
+  },
+  "boundaries": {
+    "scheduler_http_mutation_performed": false,
+    "remote_publication_performed": false,
+    "task_submission_performed": false,
+    "task_cancellation_performed": false,
+    "aedt_used": false,
+    "fea_submission_performed": false,
+    "controller_v2_contains_http_apply_loop": false,
+    "harvest_accepts_running_v2_parent_with_immutable_receipts": true
+  }
+}

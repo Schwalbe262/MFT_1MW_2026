@@ -103,7 +103,7 @@ if (
     raise RuntimeError("historical resource/quota successor policy is invalid")
 
 ACTIVE_STATES = frozenset({"planned", "submitted", "queued", "running"})
-TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "timeout"})
 REFILL_POLICY = "smooth-weighted-deficit-round-robin-v1"
 SEED_STATUS_BUSY_MAX_ATTEMPTS = 3
 SEED_STATUS_BUSY_RETRY_SECONDS = 0.25
@@ -149,6 +149,8 @@ class SchedulerClient(Protocol):
 
     def get_task(self, task_id: int) -> Mapping[str, Any] | None: ...
 
+    def list_namespace_tasks(self) -> Sequence[Mapping[str, Any]]: ...
+
     def read_seed_status(self, task_id: int) -> Mapping[str, Any] | None: ...
 
 
@@ -163,12 +165,18 @@ class SchedulerApiClient(Current7SchedulerApiClient):
 
     def _load_inventory(self) -> None:
         query = urllib.parse.urlencode(
-            {"name_prefix": TASK_NAME_PREFIX, "limit": 10_000}
+            {
+                "name_prefix": TASK_NAME_PREFIX,
+                "sort_by": "id",
+                "sort_order": "desc",
+                "limit": 10_000,
+            }
         )
         value = self._request(f"/api/tasks?{query}")
         if not isinstance(value, list):
             raise RuntimeError("final1000 scheduler inventory is not a list")
         inventory: dict[str, Mapping[str, Any]] = {}
+        task_ids: dict[int, str] = {}
         for task in value:
             if not isinstance(task, dict):
                 continue
@@ -178,6 +186,12 @@ class SchedulerApiClient(Current7SchedulerApiClient):
                 continue
             if not dedupe.startswith(DEDUPE_PREFIX):
                 raise RuntimeError("final1000 namespace task has foreign dedupe key")
+            task_id = _task_id(task)
+            if task_id in task_ids and task_ids[task_id] != dedupe:
+                raise RuntimeError(
+                    "scheduler contains one final1000 task id with multiple dedupes"
+                )
+            task_ids[task_id] = dedupe
             if dedupe in inventory and int(inventory[dedupe]["id"]) != int(task["id"]):
                 raise RuntimeError(
                     f"scheduler contains duplicate final1000 dedupe: {dedupe}"
@@ -790,6 +804,8 @@ def _scheduler_state(value: Any) -> str | None:
         "completed": "completed",
         "failed": "failed",
         "cancelled": "cancelled",
+        "timeout": "timeout",
+        "timed_out": "timeout",
     }.get(str(value or "").lower())
 
 
@@ -834,18 +850,64 @@ def _submit_planned(
 
 
 def _reconcile(state: dict[str, Any], scheduler: SchedulerClient) -> int:
+    active_entries = [
+        entry
+        for entry in state["entries"]
+        if entry["task_id"] is not None and entry["state"] not in TERMINAL_STATES
+    ]
+    bulk_by_id: dict[int, Mapping[str, Any]] | None = None
+    list_namespace_tasks = getattr(scheduler, "list_namespace_tasks", None)
+    if callable(list_namespace_tasks):
+        inventory = list_namespace_tasks()
+        if not isinstance(inventory, Sequence):
+            raise RuntimeError("scheduler bulk inventory is not a sequence")
+        bulk_by_id = {}
+        for observed in inventory:
+            if not isinstance(observed, Mapping):
+                raise RuntimeError("scheduler bulk inventory row is not an object")
+            task_id = _task_id(observed)
+            dedupe = str(observed.get("dedupe_key") or "")
+            if (
+                not str(observed.get("name") or "").startswith(TASK_NAME_PREFIX)
+                or not dedupe.startswith(DEDUPE_PREFIX)
+            ):
+                raise RuntimeError("scheduler bulk inventory escaped final1000 namespace")
+            prior = bulk_by_id.get(task_id)
+            if prior is not None and prior.get("dedupe_key") != dedupe:
+                raise RuntimeError(
+                    "scheduler bulk inventory repeats a task id with changed identity"
+                )
+            bulk_by_id[task_id] = observed
+
     changed = 0
-    for entry in state["entries"]:
-        if entry["task_id"] is None or entry["state"] in TERMINAL_STATES:
-            continue
-        observed = scheduler.get_task(int(entry["task_id"]))
+    for entry in active_entries:
+        expected_task_id = int(entry["task_id"])
+        observed = (
+            bulk_by_id.get(expected_task_id) if bulk_by_id is not None else None
+        )
+        # The bulk endpoint is capped at the latest 10,000 namespace rows.  A
+        # long-running active task can be older than that window, so only those
+        # missing active IDs fall back to the detail endpoint.
+        if observed is None:
+            observed = scheduler.get_task(expected_task_id)
         if observed is None:
             continue
+        observed_ids = {
+            int(value)
+            for value in (observed.get("id"), observed.get("task_id"))
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        expected_name = (
+            f"{BY_ID[str(entry['stage_id'])].task_name_stem}-"
+            f"{entry['wave']}-{int(entry['seed'])}"
+        )
         if (
-            str(observed.get("dedupe_key") or entry["dedupe_key"])
-            != entry["dedupe_key"]
+            not observed_ids
+            or observed_ids != {expected_task_id}
+            or str(observed.get("dedupe_key") or "") != entry["dedupe_key"]
+            or str(observed.get("name") or "") != expected_name
         ):
-            raise RuntimeError("scheduler task changed final1000 dedupe identity")
+            raise RuntimeError("scheduler task changed final1000 task identity")
         mapped = _scheduler_state(observed.get("status"))
         if mapped is not None and mapped != entry["state"]:
             entry["state"] = mapped

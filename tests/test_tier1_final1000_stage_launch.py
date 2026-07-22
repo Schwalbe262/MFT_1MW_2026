@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import urllib.parse
 
 import pytest
 
@@ -468,6 +469,17 @@ class _Scheduler:
         self.by_dedupe = {}
         self.by_id = {}
         self.seed_status = {}
+        self.bulk_list_count = 0
+        self.detail_get_count = 0
+        self.bulk_omit_ids: set[int] = set()
+
+    def list_namespace_tasks(self):
+        self.bulk_list_count += 1
+        return [
+            copy.deepcopy(value)
+            for task_id, value in self.by_id.items()
+            if task_id not in self.bulk_omit_ids
+        ]
 
     def find_task_by_dedupe(self, dedupe_key: str):
         value = self.by_dedupe.get(dedupe_key)
@@ -492,6 +504,7 @@ class _Scheduler:
         return copy.deepcopy(value)
 
     def get_task(self, task_id: int):
+        self.detail_get_count += 1
         value = self.by_id.get(task_id)
         return copy.deepcopy(value) if value is not None else None
 
@@ -511,6 +524,58 @@ class _Scheduler:
                 "aedt_used": False,
                 "fea_submission_performed": False,
             }
+
+
+def test_reconcile_uses_one_bulk_inventory_and_only_falls_back_for_missing_active():
+    plan = _rendered_plan()
+    state = controller._initial_state(plan)
+    scheduler = _Scheduler()
+    submitted, reconciled = controller._submit_planned(
+        state,
+        entries=state["entries"],
+        plan_index=controller._task_index(plan),
+        templates=controller._task_templates(plan),
+        scheduler=scheduler,
+    )
+    assert (submitted, reconciled) == (profiles.TOTAL_ACTIVE_QUOTA, 0)
+    scheduler.bulk_list_count = 0
+    scheduler.detail_get_count = 0
+
+    assert controller._reconcile(state, scheduler) == 0
+    assert scheduler.bulk_list_count == 1
+    assert scheduler.detail_get_count == 0
+
+    missing = int(state["entries"][-1]["task_id"])
+    scheduler.bulk_omit_ids = {missing}
+    scheduler.by_id[missing]["status"] = "running"
+    assert controller._reconcile(state, scheduler) == 1
+    assert scheduler.bulk_list_count == 2
+    assert scheduler.detail_get_count == 1
+
+    changed = int(state["entries"][0]["task_id"])
+    scheduler.by_id[changed]["dedupe_key"] = controller.DEDUPE_PREFIX + "f" * 64
+    with pytest.raises(RuntimeError, match="task identity"):
+        controller._reconcile(state, scheduler)
+
+
+def test_scheduler_bulk_inventory_requests_latest_namespace_window(monkeypatch):
+    client = controller.SchedulerApiClient("http://scheduler.invalid")
+    paths: list[str] = []
+
+    def request(path: str, **_kwargs):
+        paths.append(path)
+        return []
+
+    monkeypatch.setattr(client, "_request", request)
+    assert client.list_namespace_tasks() == []
+    query = paths[0].split("?", 1)[1]
+    parsed = urllib.parse.parse_qs(query)
+    assert parsed == {
+        "name_prefix": [controller.TASK_NAME_PREFIX],
+        "sort_by": ["id"],
+        "sort_order": ["desc"],
+        "limit": ["10000"],
+    }
 
 
 def _write_plan(tmp_path: Path) -> tuple[Path, dict]:

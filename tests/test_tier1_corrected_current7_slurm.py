@@ -62,7 +62,7 @@ for name in (
     "generation", "dataset", "profile", "warm-start", "warm-contract",
     "output", "remote-preflight", "bundle-id", "island-id",
     "island-profile-sha256", "seed", "population", "max-generations",
-    "inference-threads", "fixed-primary-turns",
+    "inference-threads", "scheduler-cpus", "fixed-primary-turns",
     "optimizer-termination-strategy", "optimizer-resonance-scale-hz",
     "optimizer-llt-scale-uh", "optimizer-all-thermal-scale-c",
     "optimizer-repair-contract-sha256",
@@ -114,6 +114,7 @@ preflight = {
     ),
     "temperature_targets": TEMPERATURES,
     "inference_threads": int(args.inference_threads),
+    "scheduler_cpus": int(args.scheduler_cpus),
     "optimizer_repair_contract_sha256": (
         args.optimizer_repair_contract_sha256
     ),
@@ -161,6 +162,7 @@ result = {
     "evaluated_generations": int(args.max_generations),
     "completed_generations": int(args.max_generations) + 1,
     "inference_threads": int(args.inference_threads),
+    "scheduler_cpus": int(args.scheduler_cpus),
     "generation_artifact_inventory_sha256": identity[
         "generation_artifact_inventory_sha256"
     ],

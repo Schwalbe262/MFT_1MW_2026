@@ -5926,6 +5926,29 @@ def _profile_number_matches(value: Any, expected: Any, label: str) -> bool:
     )
 
 
+def validate_search_thread_contract(
+    *,
+    profile_inference_threads: Any,
+    inference_threads: Any,
+    scheduler_cpus: Any,
+) -> int:
+    """Authenticate an execution cap beneath the sealed eight-thread profile."""
+
+    values = (profile_inference_threads, inference_threads, scheduler_cpus)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        raise RuntimeError("search CPU/thread contract must contain integers")
+    profile_threads = int(profile_inference_threads)
+    runtime_threads = int(inference_threads)
+    allocated_cpus = int(scheduler_cpus)
+    if (
+        profile_threads != PRODUCTION_INFERENCE_THREADS
+        or not 1 <= runtime_threads <= profile_threads
+        or allocated_cpus != runtime_threads
+    ):
+        raise RuntimeError("search CPU/thread allocation exceeds its sealed profile")
+    return runtime_threads
+
+
 def run_search_seed(
     *,
     bundle_root: Path,
@@ -5946,6 +5969,7 @@ def run_search_seed(
     population: int,
     max_generations: int,
     inference_threads: int,
+    scheduler_cpus: int | None = None,
     fixed_primary_turns: int,
     optimizer_termination_strategy: str,
     optimizer_resonance_scale_hz: float,
@@ -6017,6 +6041,11 @@ def run_search_seed(
         "optimizer_resonance_allowance_Hz"
     )
     expected_allowance_llt = island_profile.get("optimizer_llt_allowance_uH")
+    runtime_threads = validate_search_thread_contract(
+        profile_inference_threads=island_profile.get("inference_threads"),
+        inference_threads=inference_threads,
+        scheduler_cpus=(inference_threads if scheduler_cpus is None else scheduler_cpus),
+    )
     if (
         int(fixed_primary_turns) not in SUPPORTED_FIXED_PRIMARY_TURNS
         or recorded_profile_sha != canonical_sha256(unsigned_profile)
@@ -6031,7 +6060,7 @@ def run_search_seed(
         or int(max_generations) != PRODUCTION_FIXED_GENERATIONS
         or island_profile.get("inference_threads")
         != PRODUCTION_INFERENCE_THREADS
-        or int(inference_threads) != PRODUCTION_INFERENCE_THREADS
+        or int(inference_threads) != runtime_threads
         or island_profile.get("optimizer_termination_strategy")
         != FIXED_GENERATION_TERMINATION_STRATEGY
         or optimizer_termination_strategy
@@ -6238,6 +6267,9 @@ def run_search_seed(
             "loaded_model_targets_sha256": CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
             "temperature_targets": list(CURRENT_TEMPERATURE_TARGETS),
             "inference_threads": int(inference_threads),
+            "scheduler_cpus": int(
+                inference_threads if scheduler_cpus is None else scheduler_cpus
+            ),
             "observed_peak_rss_bytes": observed_rss,
             "maximum_peak_rss_bytes": maximum_rss,
             "optimizer_repair_contract_sha256": problem_repair_sha,
@@ -6310,7 +6342,7 @@ def run_search_seed(
         or terminal_replay_audit.get("optimizer_physical_G_match") is not True
         or terminal_replay_audit.get("terminal_population_canonicalized") is not True
         or deterministic_terminal.get("optimizer_inference_threads")
-        != PRODUCTION_INFERENCE_THREADS
+        != runtime_threads
         or deterministic_terminal.get("terminal_replay_inference_threads")
         != DETERMINISTIC_TERMINAL_INFERENCE_THREADS
         or deterministic_terminal.get("optimizer_binding_restored") is not True
@@ -6348,6 +6380,9 @@ def run_search_seed(
         "evaluated_generations": int(result.tier1_evaluated_generations),
         "completed_generations": int(result.tier1_completed_generations),
         "inference_threads": int(inference_threads),
+        "scheduler_cpus": int(
+            inference_threads if scheduler_cpus is None else scheduler_cpus
+        ),
         "optimizer_pid": os.getpid(),
         "optimizer_processes": 1,
         "generation_artifact_inventory_sha256": manifest[
@@ -6619,6 +6654,7 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("--population", type=int, required=True)
     search.add_argument("--max-generations", type=int, required=True)
     search.add_argument("--inference-threads", type=int, required=True)
+    search.add_argument("--scheduler-cpus", type=int, required=True)
     search.add_argument("--fixed-primary-turns", type=int, required=True)
     search.add_argument("--optimizer-termination-strategy", required=True)
     search.add_argument(
@@ -6673,6 +6709,7 @@ def main(argv: list[str] | None = None) -> int:
             population=args.population,
             max_generations=args.max_generations,
             inference_threads=args.inference_threads,
+            scheduler_cpus=args.scheduler_cpus,
             fixed_primary_turns=args.fixed_primary_turns,
             optimizer_termination_strategy=(
                 args.optimizer_termination_strategy
