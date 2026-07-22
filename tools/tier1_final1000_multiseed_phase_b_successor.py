@@ -6,10 +6,12 @@ envelopes, and it defines the state that a future authorized controller must
 carry across the Phase-A -> Phase-B handoff.  It has no HTTP client, no
 Scheduler mutation method, and no FEA/AEDT surface.
 
-The current production packing target is 500 logical seeds with stage quotas
-300/150/40/10.  The observed empty-pool allocation histogram can start 431 of
-those seeds in 62 physical parents; the remaining 69 seeds are represented by
-9 queued parents.  Packing never crosses a stage, bundle, or wave boundary.
+The production packing target is 500 logical seeds with stage quotas
+300/150/40/10.  Placement is rendered from a sealed live allocation inventory,
+not a hard-coded active-task count.  Only the authenticated 8/4/1 envelopes
+are eligible for production planning; every allocation is decomposed
+largest-first with zero lane loss, and packing never crosses a stage, bundle,
+or wave boundary.
 """
 
 from __future__ import annotations
@@ -30,7 +32,9 @@ try:
         CHILD_MEMORY_MB,
         DEFAULT_MODEL_LOAD_STAGGER_SECONDS,
         MAX_CONCURRENT_CHILDREN,
+        PRODUCTION_PACKING_SHAPES,
         PROTOCOL_VERSION,
+        UNAUTHENTICATED_PRODUCTION_TAIL_SHAPES,
         build_concurrent_batch_task,
         validate_batch_task,
     )
@@ -48,7 +52,9 @@ except ImportError:  # pragma: no cover - repository import path
         CHILD_MEMORY_MB,
         DEFAULT_MODEL_LOAD_STAGGER_SECONDS,
         MAX_CONCURRENT_CHILDREN,
+        PRODUCTION_PACKING_SHAPES,
         PROTOCOL_VERSION,
+        UNAUTHENTICATED_PRODUCTION_TAIL_SHAPES,
         build_concurrent_batch_task,
         validate_batch_task,
     )
@@ -67,6 +73,9 @@ PHASE_A_EXIT_RECEIPT_SCHEMA = "mft-tier1-final1000-phase-a-exit-receipt-v1"
 FULL_INVENTORY_SHADOW_SCHEMA = "mft-tier1-final1000-phase-b-full-inventory-shadow-v1"
 MUTATION_AUTHORITY_PROTOCOL = "single-owner-phase-a-phase-b-handoff-v1"
 CPU_BENCHMARK_SCHEMA = "mft-tier1-final1000-phase-b-cpu-benchmark-design-v1"
+SHAPE_CAPACITY_RECHECK_SCHEMA = (
+    "mft-tier1-final1000-phase-b-shape-capacity-recheck-v1"
+)
 FULL_INVENTORY_REQUIREMENTS = {
     "protocol": "stable-before-id-paged-full-inventory-v1",
     "required_helper_commit": "dafb4509d52f4abcacb68c7bacfc850468d7dc1f",
@@ -87,6 +96,17 @@ FULL_INVENTORY_REQUIREMENTS = {
 DISPATCH_ADMISSION_POLICY = {
     "schema_version": "mft-tier1-final1000-phase-b-dispatch-admission-v1",
     "logical_child_cpus": CHILD_CPUS,
+    "logical_child_memory_mb": CHILD_MEMORY_MB,
+    "production_packing_shapes": list(PRODUCTION_PACKING_SHAPES),
+    "packing_order": "global-lane-count-descending-v1",
+    "unavailable_shape_intent_action": (
+        "skip-and-continue-lower-shapes-with-fresh-capacity-get-v1"
+    ),
+    "head_of_line_blocking_allowed": False,
+    "pure_eight_only_allowed": False,
+    "unauthenticated_tail_shapes": sorted(
+        UNAUTHENTICATED_PRODUCTION_TAIL_SHAPES
+    ),
     "default_model_load_stagger_seconds": DEFAULT_MODEL_LOAD_STAGGER_SECONDS,
     "eight_lane_dispatch_fill_seconds": (
         (MAX_CONCURRENT_CHILDREN - 1) * DEFAULT_MODEL_LOAD_STAGGER_SECONDS
@@ -96,17 +116,28 @@ DISPATCH_ADMISSION_POLICY = {
     "speculative_ready_lane_submission_allowed": False,
     "empty_node_or_capacity_prediction_allowed": False,
     "capacity_snapshot_recheck_before_activation_required": True,
+    "shape_capacity_endpoint_path": "/api/task-capacity",
+    "shape_capacity_recheck_before_each_post_required": True,
+    "shape_capacity_snapshot_fence_required": True,
     "capacity_snapshot_drift_action": "rerender-or-fail-closed",
+    "persistent_pool_allocations_shared_by_scheduler_tasks": True,
+    "packing_effect_scope": "task-attach-control-plane-and-owned-lane-use-v1",
+    "allocation_pool_capacity_increase_claimed": False,
+    "account_maxjobs_allocation_slot_reduction_claimed": False,
+    "exact_500_running_requires": (
+        "live-allocation-pool-growth-or-rightsize-or-authenticated-resource-change"
+    ),
 }
 
 TOTAL_LOGICAL_TARGET = 500
-RUNNING_LOGICAL_TARGET = 431
-QUEUED_LOGICAL_TARGET = 69
 EXPECTED_PHASE_A_SUPERVISOR_PID = 55_304
 
-# Each value is an allocation's usable count of 4-CPU/28-GiB logical lanes.
-CURRENT_EMPTY_POOL_LANE_HISTOGRAM: dict[int, int] = {
-    16: 15,
+# The latest read-only audit is a fixture, not a placement identity.  The
+# planner accepts any newly sealed inventory composed of these audited lane
+# capacities and derives its running/queued boundary dynamically.
+AUDITED_LIVE_LANE_CAPACITIES = frozenset({2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16})
+LATEST_AUDITED_LANE_HISTOGRAM: dict[int, int] = {
+    16: 16,
     14: 1,
     12: 1,
     11: 3,
@@ -126,23 +157,8 @@ STAGE_LOGICAL_QUOTAS: dict[str, int] = {
     STAGES[3].stage_id: 10,
 }
 
-# Shape counts are stated explicitly so review can verify every stage and the
-# running/queued boundary without trusting a greedy packing algorithm.
-RUNNING_STAGE_SHAPES: dict[str, dict[int, int]] = {
-    STAGES[0].stage_id: {8: 18, 7: 7, 6: 1, 5: 3, 4: 1, 3: 3, 2: 1, 1: 2},
-    STAGES[1].stage_id: {8: 18, 6: 1},
-    STAGES[2].stage_id: {8: 5},
-    STAGES[3].stage_id: {8: 1, 2: 1},
-}
-QUEUED_STAGE_SHAPES: dict[str, dict[int, int]] = {
-    STAGES[0].stage_id: {8: 8, 5: 1},
-    STAGES[1].stage_id: {},
-    STAGES[2].stage_id: {},
-    STAGES[3].stage_id: {},
-}
-EXPECTED_RUNNING_SHAPES = {8: 42, 7: 7, 6: 2, 5: 3, 4: 1, 3: 3, 2: 2, 1: 2}
-EXPECTED_QUEUED_SHAPES = {8: 8, 5: 1}
-EXPECTED_TOTAL_SHAPES = {8: 50, 7: 7, 6: 2, 5: 4, 4: 1, 3: 3, 2: 2, 1: 2}
+LATEST_AUDITED_RUNNING_SHAPES = {8: 44, 4: 13, 1: 43}
+LATEST_AUDITED_QUEUED_SHAPES = {8: 6, 4: 1, 1: 1}
 
 
 def _is_sha256(value: Any) -> bool:
@@ -238,26 +254,16 @@ def validate_static_packing_contract() -> None:
         raise RuntimeError("Phase-B stage quota identity drifted")
     if sum(STAGE_LOGICAL_QUOTAS.values()) != TOTAL_LOGICAL_TARGET:
         raise RuntimeError("Phase-B stage quotas must sum to 500")
-    running = _shape_counts(RUNNING_STAGE_SHAPES)
-    queued = _shape_counts(QUEUED_STAGE_SHAPES)
-    if dict(running) != EXPECTED_RUNNING_SHAPES:
-        raise RuntimeError("Phase-B running shape contract drifted")
-    if dict(queued) != EXPECTED_QUEUED_SHAPES:
-        raise RuntimeError("Phase-B queued shape contract drifted")
-    if dict(running + queued) != EXPECTED_TOTAL_SHAPES:
-        raise RuntimeError("Phase-B total shape contract drifted")
-    if _logical_count(running) != RUNNING_LOGICAL_TARGET:
-        raise RuntimeError("Phase-B running logical target drifted")
-    if _logical_count(queued) != QUEUED_LOGICAL_TARGET:
-        raise RuntimeError("Phase-B queued logical target drifted")
-    for stage in STAGES:
-        stage_id = stage.stage_id
-        actual = _logical_count(
-            Counter(RUNNING_STAGE_SHAPES[stage_id])
-            + Counter(QUEUED_STAGE_SHAPES[stage_id])
-        )
-        if actual != STAGE_LOGICAL_QUOTAS[stage_id]:
-            raise RuntimeError(f"Phase-B {stage_id} quota/shape identity drifted")
+    if tuple(PRODUCTION_PACKING_SHAPES) != (8, 4, 1):
+        raise RuntimeError("Phase-B production packing shapes drifted")
+    if set(PRODUCTION_PACKING_SHAPES).intersection(
+        UNAUTHENTICATED_PRODUCTION_TAIL_SHAPES
+    ):
+        raise RuntimeError("unauthenticated tail entered production packing")
+    if _logical_count(LATEST_AUDITED_RUNNING_SHAPES) != 447:
+        raise RuntimeError("latest audited running shape fixture drifted")
+    if _logical_count(LATEST_AUDITED_QUEUED_SHAPES) != 53:
+        raise RuntimeError("latest audited queued shape fixture drifted")
 
 
 validate_static_packing_contract()
@@ -386,12 +392,14 @@ def build_allocation_inventory(
     for allocation in allocations:
         allocation_id = str(allocation.get("allocation_id") or "")
         capacity = allocation.get("usable_lane_capacity")
+        state = str(allocation.get("state") or "")
         if (
             not allocation_id
             or allocation_id in seen
+            or state != "active"
             or isinstance(capacity, bool)
             or not isinstance(capacity, int)
-            or capacity < 1
+            or capacity not in AUDITED_LIVE_LANE_CAPACITIES
         ):
             raise RuntimeError("allocation inventory row is invalid")
         seen.add(allocation_id)
@@ -412,6 +420,7 @@ def build_allocation_inventory(
         "allocations": normalized,
         "allocation_count": len(normalized),
         "usable_lane_count": sum(row["usable_lane_capacity"] for row in normalized),
+        "audited_capacity_domain": sorted(AUDITED_LIVE_LANE_CAPACITIES),
     }
     return _seal(unsigned, "allocation_inventory_sha256")
 
@@ -440,39 +449,49 @@ def validate_allocation_inventory(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def current_empty_pool_inventory(
-    *, observed_at: str = "2026-07-22T00:00:00+09:00"
+    *, observed_at: str = "2026-07-23T01:20:00+09:00"
 ) -> dict[str, Any]:
+    """Return the latest audited fixture; live callers must supply a fresh GET."""
+
     rows: list[dict[str, Any]] = []
-    for capacity, count in sorted(CURRENT_EMPTY_POOL_LANE_HISTOGRAM.items()):
+    for capacity, count in sorted(LATEST_AUDITED_LANE_HISTOGRAM.items()):
         for ordinal in range(count):
             rows.append(
                 {
                     "allocation_id": f"documentary-cap{capacity:02d}-{ordinal + 1:02d}",
                     "usable_lane_capacity": capacity,
+                    "state": "active",
                 }
             )
     return build_allocation_inventory(
         rows,
         observed_at=observed_at,
-        source="documentary-current-active39-empty-pool-histogram",
+        source="documentary-latest-active40-live-capacity-audit",
     )
 
 
 def decompose_allocation_inventory(
     inventory: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Split each allocation into exact <=8-child parent slots."""
+    """Split each allocation largest-first into exact authenticated 8/4/1 slots."""
 
     validated = validate_allocation_inventory(inventory)
     slots: list[dict[str, Any]] = []
     for allocation in validated["allocations"]:
         capacity = int(allocation["usable_lane_capacity"])
-        shapes = [MAX_CONCURRENT_CHILDREN] * (capacity // MAX_CONCURRENT_CHILDREN)
-        remainder = capacity % MAX_CONCURRENT_CHILDREN
+        shapes: list[int] = []
+        remainder = capacity
+        for shape in PRODUCTION_PACKING_SHAPES:
+            count, remainder = divmod(remainder, shape)
+            shapes.extend([shape] * count)
         if remainder:
-            shapes.append(remainder)
+            raise RuntimeError("authenticated packing shapes cannot consume capacity")
         if sum(shapes) != capacity:
             raise AssertionError("allocation decomposition lost capacity")
+        if shapes != sorted(shapes, reverse=True) or any(
+            shape not in PRODUCTION_PACKING_SHAPES for shape in shapes
+        ):
+            raise AssertionError("allocation decomposition is not largest-first 8/4/1")
         for ordinal, lane_count in enumerate(shapes):
             slots.append(
                 {
@@ -512,83 +531,184 @@ def require_inventory_identity(
         )
 
 
-def _stage_shape_sequence(
-    shapes_by_stage: Mapping[str, Mapping[int, int]],
-) -> dict[str, list[int]]:
-    return {
-        stage.stage_id: [
-            shape
-            for shape in range(MAX_CONCURRENT_CHILDREN, 0, -1)
-            for _ in range(int(shapes_by_stage[stage.stage_id].get(shape, 0)))
-        ]
-        for stage in STAGES
+def _largest_first_shapes(logical_count: int) -> list[int]:
+    if isinstance(logical_count, bool) or not isinstance(logical_count, int):
+        raise RuntimeError("logical packing count must be an integer")
+    if logical_count < 0:
+        raise RuntimeError("logical packing count cannot be negative")
+    result: list[int] = []
+    remaining = logical_count
+    for shape in PRODUCTION_PACKING_SHAPES:
+        count, remaining = divmod(remaining, shape)
+        result.extend([shape] * count)
+    if remaining or sum(result) != logical_count:
+        raise RuntimeError("authenticated packing shapes lost logical capacity")
+    return result
+
+
+def _assign_shapes_to_stages(
+    total_shapes: Mapping[int, int],
+) -> dict[str, dict[int, int]]:
+    """Allocate a global 8/4/1 multiset without crossing stage quotas.
+
+    Small stages consume their exact largest-first share first; the 300-lane
+    entry stage deliberately absorbs live-allocation fragmentation.  This
+    makes the final intent inventory global lane-descending while retaining
+    exact 300/150/40/10 science quotas.
+    """
+
+    remaining = Counter(
+        {
+            int(shape): int(count)
+            for shape, count in total_shapes.items()
+            if int(count)
+        }
+    )
+    if set(remaining).difference(PRODUCTION_PACKING_SHAPES) or any(
+        count < 0 for count in remaining.values()
+    ):
+        raise RuntimeError("stage packing contains an unauthenticated shape")
+    result: dict[str, dict[int, int]] = {}
+    ordered = sorted(
+        STAGES,
+        key=lambda stage: (STAGE_LOGICAL_QUOTAS[stage.stage_id], stage.stage_id),
+    )
+    for stage in ordered[:-1]:
+        needed = STAGE_LOGICAL_QUOTAS[stage.stage_id]
+        counts: Counter[int] = Counter()
+        for shape in PRODUCTION_PACKING_SHAPES:
+            take = min(int(remaining[shape]), needed // shape)
+            if take:
+                counts[shape] = take
+                remaining[shape] -= take
+                needed -= shape * take
+        if needed:
+            raise RuntimeError("global shape inventory cannot fill an exact stage")
+        result[stage.stage_id] = dict(counts)
+    last = ordered[-1]
+    if _logical_count(remaining) != STAGE_LOGICAL_QUOTAS[last.stage_id]:
+        raise RuntimeError("entry stage did not absorb exact packing fragmentation")
+    result[last.stage_id] = {
+        shape: int(remaining[shape])
+        for shape in PRODUCTION_PACKING_SHAPES
+        if int(remaining[shape])
     }
+    return {stage.stage_id: result[stage.stage_id] for stage in STAGES}
 
 
-def _assign_running_slots(
-    slots: Sequence[Mapping[str, Any]],
+def _assign_capacity_and_queue_slots(
+    running_slots: Sequence[Mapping[str, Any]],
+    stage_shapes: Mapping[str, Mapping[int, int]],
 ) -> list[dict[str, Any]]:
-    available_by_shape: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for slot in slots:
-        available_by_shape[int(slot["lane_count"])].append(copy.deepcopy(dict(slot)))
-    for values in available_by_shape.values():
-        values.sort(
+    available: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for slot in running_slots:
+        shape = int(slot["lane_count"])
+        if shape not in PRODUCTION_PACKING_SHAPES:
+            raise RuntimeError("running slot uses an unauthenticated shape")
+        available[shape].append(copy.deepcopy(dict(slot)))
+    for slots in available.values():
+        slots.sort(
             key=lambda item: (
                 str(item["allocation_id"]),
                 int(item["allocation_slot_ordinal"]),
             )
         )
-    expected = Counter(EXPECTED_RUNNING_SHAPES)
-    actual = Counter(
-        {shape: len(values) for shape, values in available_by_shape.items()}
-    )
-    if actual != expected:
-        raise RuntimeError(
-            "allocation inventory does not match the reviewed running shape; "
-            "rerender and audit a new placement"
-        )
+
     assigned: list[dict[str, Any]] = []
-    remaining = copy.deepcopy(available_by_shape)
-    sequences = _stage_shape_sequence(RUNNING_STAGE_SHAPES)
-    for stage in STAGES:
-        for stage_parent_ordinal, shape in enumerate(sequences[stage.stage_id]):
-            if not remaining[shape]:
-                raise RuntimeError("running stage shape cannot be assigned")
-            slot = remaining[shape].pop(0)
-            assigned.append(
-                {
-                    **slot,
-                    "stage_id": stage.stage_id,
-                    "stage_parent_ordinal": stage_parent_ordinal,
-                    "scheduler_disposition": "running-capacity",
-                }
-            )
-    if any(remaining.values()):
-        raise RuntimeError("running placement left an allocation slot unused")
+    ordered_stages = sorted(
+        STAGES,
+        key=lambda stage: (STAGE_LOGICAL_QUOTAS[stage.stage_id], stage.stage_id),
+    )
+    stage_ordinals = {stage.stage_id: 0 for stage in STAGES}
+    for stage in ordered_stages:
+        for shape in PRODUCTION_PACKING_SHAPES:
+            for _ in range(int(stage_shapes[stage.stage_id].get(shape, 0))):
+                ordinal = stage_ordinals[stage.stage_id]
+                stage_ordinals[stage.stage_id] += 1
+                if available[shape]:
+                    slot = available[shape].pop(0)
+                    disposition = "running-capacity"
+                else:
+                    slot = {
+                        "allocation_id": None,
+                        "allocation_slot_ordinal": None,
+                        "lane_count": shape,
+                        "cpus": shape * CHILD_CPUS,
+                        "memory_mb": shape * CHILD_MEMORY_MB,
+                    }
+                    disposition = "queued-capacity"
+                assigned.append(
+                    {
+                        **slot,
+                        "stage_id": stage.stage_id,
+                        "stage_parent_ordinal": ordinal,
+                        "scheduler_disposition": disposition,
+                    }
+                )
+    if any(available.values()):
+        raise RuntimeError("placement left live allocation capacity unused")
+
+    stage_index = {stage.stage_id: index for index, stage in enumerate(STAGES)}
+    assigned.sort(
+        key=lambda item: (
+            -int(item["lane_count"]),
+            0 if item["scheduler_disposition"] == "running-capacity" else 1,
+            stage_index[str(item["stage_id"])],
+            int(item["stage_parent_ordinal"]),
+        )
+    )
+    queued_ordinal = 0
+    for item in assigned:
+        if item["scheduler_disposition"] == "queued-capacity":
+            item["queued_parent_ordinal"] = queued_ordinal
+            queued_ordinal += 1
     return assigned
 
 
-def _queued_slots() -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    sequences = _stage_shape_sequence(QUEUED_STAGE_SHAPES)
-    global_ordinal = 0
-    for stage in STAGES:
-        for stage_parent_ordinal, shape in enumerate(sequences[stage.stage_id]):
-            result.append(
-                {
-                    "allocation_id": None,
-                    "allocation_slot_ordinal": None,
-                    "lane_count": shape,
-                    "cpus": shape * CHILD_CPUS,
-                    "memory_mb": shape * CHILD_MEMORY_MB,
-                    "stage_id": stage.stage_id,
-                    "stage_parent_ordinal": stage_parent_ordinal,
-                    "queued_parent_ordinal": global_ordinal,
-                    "scheduler_disposition": "queued-capacity",
-                }
-            )
-            global_ordinal += 1
-    return result
+def _shape_capacity_recheck_contract(
+    *, allocation_inventory_sha256: str, used_shapes: Iterable[int]
+) -> dict[str, Any]:
+    if not _is_sha256(allocation_inventory_sha256):
+        raise RuntimeError("shape-capacity fence inventory identity is invalid")
+    shapes = sorted({int(shape) for shape in used_shapes}, reverse=True)
+    if tuple(shapes) != tuple(PRODUCTION_PACKING_SHAPES):
+        raise RuntimeError("placement must exercise the authenticated 8/4/1 shapes")
+    return {
+        "schema_version": SHAPE_CAPACITY_RECHECK_SCHEMA,
+        "allocation_inventory_sha256": allocation_inventory_sha256,
+        "endpoint_path": "/api/task-capacity",
+        "packing_shapes": list(PRODUCTION_PACKING_SHAPES),
+        "global_intent_order": "lane-count-descending-v1",
+        "unavailable_shape_intent_action": (
+            "skip-and-continue-lower-shapes-with-fresh-capacity-get-v1"
+        ),
+        "head_of_line_blocking_allowed": False,
+        "queries": [
+            {
+                "lane_count": shape,
+                "cpus": shape * CHILD_CPUS,
+                "memory_mb": shape * CHILD_MEMORY_MB,
+                "scheduling_profile": "standard",
+                "aedt_backend": "standalone",
+                "gpus": 0,
+                "required_capability": "conda:pyaedt2026v1",
+                "env_profile": "pyaedt2026v1",
+                "partition": "auto",
+                "node_name": "",
+                "max_workers_per_node": 32,
+            }
+            for shape in PRODUCTION_PACKING_SHAPES
+        ],
+        "live_get_before_each_post_required": True,
+        "positive_capacity_for_exact_shape_required": True,
+        "response_sha256_and_snapshot_revision_fence_required": True,
+        "scheduler_response_snapshot_revision_verified": False,
+        "atomic_capacity_reservation_supported": False,
+        "inventory_and_capacity_drift_action": "rerender-or-fail-closed",
+        "actual_capacity_aware_submitter_implementation_present": False,
+        "capacity_fence_present": False,
+        "production_eligible": False,
+    }
 
 
 def _logical_child_summary(
@@ -674,21 +794,35 @@ def build_placement_plan(
     next_seed_by_stage: Mapping[str, Any],
     allocation_inventory: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Render the reviewed capacity-aware 431-running/69-queued plan."""
+    """Render an exact-500 plan from a sealed live allocation inventory."""
 
     source_plan = validate_launch_plan(plan)
     inventory = validate_allocation_inventory(allocation_inventory)
-    if _histogram_from_inventory(inventory) != CURRENT_EMPTY_POOL_LANE_HISTOGRAM:
-        raise RuntimeError(
-            "current allocation histogram changed; static placement is ineligible"
+    running_slots = decompose_allocation_inventory(inventory)
+    running_capacity = sum(int(slot["lane_count"]) for slot in running_slots)
+    if not 0 < running_capacity <= TOTAL_LOGICAL_TARGET:
+        raise RuntimeError("live usable capacity is outside the exact-500 target")
+    queued_shapes = _largest_first_shapes(TOTAL_LOGICAL_TARGET - running_capacity)
+    total_shape_counts = Counter(
+        int(slot["lane_count"]) for slot in running_slots
+    ) + Counter(queued_shapes)
+    stage_shapes = _assign_shapes_to_stages(total_shape_counts)
+    placements = _assign_capacity_and_queue_slots(running_slots, stage_shapes)
+    if _histogram_from_inventory(inventory) == LATEST_AUDITED_LANE_HISTOGRAM:
+        audited_running = Counter(
+            int(slot["lane_count"]) for slot in running_slots
         )
-    running_slots = _assign_running_slots(decompose_allocation_inventory(inventory))
-    queued_slots = _queued_slots()
+        audited_queued = Counter(queued_shapes)
+        if (
+            dict(audited_running) != LATEST_AUDITED_RUNNING_SHAPES
+            or dict(audited_queued) != LATEST_AUDITED_QUEUED_SHAPES
+        ):
+            raise RuntimeError("latest live capacity audit decomposition drifted")
     children = _build_stage_children(source_plan, next_seed_by_stage)
     cursors = {stage.stage_id: 0 for stage in STAGES}
     parent_tasks: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
-    for placement in [*running_slots, *queued_slots]:
+    for placement in placements:
         stage_id = str(placement["stage_id"])
         start = cursors[stage_id]
         stop = start + int(placement["lane_count"])
@@ -719,6 +853,27 @@ def build_placement_plan(
         for summary in summaries
         if summary["scheduler_disposition"] == "queued-capacity"
     )
+    if running_count != running_capacity or queued_count != (
+        TOTAL_LOGICAL_TARGET - running_capacity
+    ):
+        raise RuntimeError("placement running/queued boundary lost live capacity")
+    if [summary["lane_count"] for summary in summaries] != sorted(
+        (summary["lane_count"] for summary in summaries), reverse=True
+    ):
+        raise RuntimeError("submission intents are not globally lane-descending")
+    running_stage_shapes: dict[str, Counter[int]] = {
+        stage.stage_id: Counter() for stage in STAGES
+    }
+    queued_stage_shapes: dict[str, Counter[int]] = {
+        stage.stage_id: Counter() for stage in STAGES
+    }
+    for summary in summaries:
+        target = (
+            running_stage_shapes
+            if summary["scheduler_disposition"] == "running-capacity"
+            else queued_stage_shapes
+        )
+        target[summary["stage_id"]][int(summary["lane_count"])] += 1
     logical_sha = logical_child_inventory_sha256(parent_tasks)
 
     # Repack the exact same child tasks one-per-parent.  This is not a launch
@@ -739,30 +894,56 @@ def build_placement_plan(
         "rendered_from_allocation_inventory_sha256": inventory[
             "allocation_inventory_sha256"
         ],
+        "allocation_inventory_snapshot": copy.deepcopy(inventory),
         "allocation_histogram": {
             str(key): value
             for key, value in sorted(_histogram_from_inventory(inventory).items())
         },
         "stage_logical_quotas": copy.deepcopy(STAGE_LOGICAL_QUOTAS),
+        "packing_shapes": list(PRODUCTION_PACKING_SHAPES),
+        "unauthenticated_production_tail_shapes": sorted(
+            UNAUTHENTICATED_PRODUCTION_TAIL_SHAPES
+        ),
+        "pure_eight_only_allowed": False,
+        "global_intent_order": "lane-count-descending-v1",
+        "unavailable_shape_intent_action": (
+            "skip-and-continue-lower-shapes-with-fresh-capacity-get-v1"
+        ),
+        "head_of_line_blocking_allowed": False,
+        "live_inventory_driven": True,
+        "capacity_loss_lanes": 0,
         "next_seed_by_stage": {
             stage.stage_id: int(next_seed_by_stage[stage.stage_id]) for stage in STAGES
         },
         "running_logical_count": running_count,
         "queued_logical_count": queued_count,
+        "live_allocation_logical_capacity": running_capacity,
+        "exact_500_running_capacity_gap": queued_count,
+        "packing_increases_allocation_pool_capacity": False,
+        "packing_releases_account_maxjobs_allocation_slots": False,
+        "packing_effect_scope": "task-attach-control-plane-and-owned-lane-use-v1",
         "logical_seed_count": running_count + queued_count,
         "physical_parent_count": len(parent_tasks),
-        "running_parent_count": len(running_slots),
-        "queued_parent_count": len(queued_slots),
+        "running_parent_count": sum(
+            1
+            for summary in summaries
+            if summary["scheduler_disposition"] == "running-capacity"
+        ),
+        "queued_parent_count": sum(
+            1
+            for summary in summaries
+            if summary["scheduler_disposition"] == "queued-capacity"
+        ),
         "shape_parent_counts": {
             str(shape): shape_counts[shape] for shape in sorted(shape_counts)
         },
         "running_stage_shapes": {
             stage_id: {str(shape): count for shape, count in sorted(shapes.items())}
-            for stage_id, shapes in RUNNING_STAGE_SHAPES.items()
+            for stage_id, shapes in running_stage_shapes.items()
         },
         "queued_stage_shapes": {
             stage_id: {str(shape): count for shape, count in sorted(shapes.items())}
-            for stage_id, shapes in QUEUED_STAGE_SHAPES.items()
+            for stage_id, shapes in queued_stage_shapes.items()
         },
         "parent_summaries": summaries,
         "parent_task_inventory_sha256": canonical_sha256(
@@ -774,6 +955,26 @@ def build_placement_plan(
         "no_stage_bundle_or_wave_crossing": True,
         "inventory_recheck_required_at_activation": True,
         "inventory_drift_action": "rerender-or-fail-closed",
+        "shape_capacity_recheck": _shape_capacity_recheck_contract(
+            allocation_inventory_sha256=inventory[
+                "allocation_inventory_sha256"
+            ],
+            used_shapes=shape_counts,
+        ),
+        "required_remote_smoke_shapes": list(PRODUCTION_PACKING_SHAPES),
+        "authenticated_remote_smoke_shapes": [],
+        "actual_capacity_aware_submitter_implementation_present": False,
+        "production_blockers": [
+            "authenticated real 1/4/8 remote smoke receipts are absent",
+            "capacity-aware Scheduler submitter implementation is absent",
+            "per-shape live /api/task-capacity fence is absent",
+            "Scheduler capacity response has no verified revision/reservation fence",
+        ]
+        + (
+            ["live allocation pool capacity is below exact-500 running target"]
+            if queued_count
+            else []
+        ),
         "dispatch_admission_policy": copy.deepcopy(DISPATCH_ADMISSION_POLICY),
         "production_eligible": False,
         "scheduler_write_performed": False,
@@ -798,6 +999,124 @@ def validate_placement_plan(
         for key, item in plan_without_tasks.items()
         if key != "placement_plan_sha256"
     }
+    summaries = value.get("parent_summaries")
+    if not isinstance(summaries, list) or not summaries:
+        raise RuntimeError("Phase-B placement parent inventory drifted")
+    try:
+        lane_sequence = [int(summary["lane_count"]) for summary in summaries]
+        running_count = sum(
+            int(summary["lane_count"])
+            for summary in summaries
+            if summary["scheduler_disposition"] == "running-capacity"
+        )
+        queued_count = sum(
+            int(summary["lane_count"])
+            for summary in summaries
+            if summary["scheduler_disposition"] == "queued-capacity"
+        )
+        running_parents = sum(
+            summary["scheduler_disposition"] == "running-capacity"
+            for summary in summaries
+        )
+        queued_parents = sum(
+            summary["scheduler_disposition"] == "queued-capacity"
+            for summary in summaries
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Phase-B placement parent inventory is invalid") from exc
+    shape_counts = Counter(lane_sequence)
+    stage_counts = {stage.stage_id: 0 for stage in STAGES}
+    running_stage_shapes = {stage.stage_id: Counter() for stage in STAGES}
+    queued_stage_shapes = {stage.stage_id: Counter() for stage in STAGES}
+    for summary in summaries:
+        stage_id = str(summary.get("stage_id") or "")
+        shape = int(summary["lane_count"])
+        disposition = summary.get("scheduler_disposition")
+        if (
+            stage_id not in stage_counts
+            or shape not in PRODUCTION_PACKING_SHAPES
+            or summary.get("cpus") != shape * CHILD_CPUS
+            or summary.get("memory_mb") != shape * CHILD_MEMORY_MB
+            or disposition not in {"running-capacity", "queued-capacity"}
+        ):
+            raise RuntimeError("Phase-B placement uses an invalid production shape")
+        stage_counts[stage_id] += shape
+        target = (
+            running_stage_shapes
+            if disposition == "running-capacity"
+            else queued_stage_shapes
+        )
+        target[stage_id][shape] += 1
+    normalized_running_stage_shapes = {
+        stage_id: {str(shape): count for shape, count in sorted(counts.items())}
+        for stage_id, counts in running_stage_shapes.items()
+    }
+    normalized_queued_stage_shapes = {
+        stage_id: {str(shape): count for shape, count in sorted(counts.items())}
+        for stage_id, counts in queued_stage_shapes.items()
+    }
+    expected_capacity_contract = _shape_capacity_recheck_contract(
+        allocation_inventory_sha256=str(
+            value.get("rendered_from_allocation_inventory_sha256") or ""
+        ),
+        used_shapes=shape_counts,
+    )
+    embedded_inventory = value.get("allocation_inventory_snapshot")
+    if not isinstance(embedded_inventory, Mapping):
+        raise RuntimeError("Phase-B placement allocation inventory is absent")
+    try:
+        validated_embedded_inventory = validate_allocation_inventory(
+            embedded_inventory
+        )
+        expected_running_slots = decompose_allocation_inventory(
+            validated_embedded_inventory
+        )
+    except RuntimeError as exc:
+        raise RuntimeError("Phase-B placement allocation inventory drifted") from exc
+    expected_running_slot_counter = Counter(
+        (
+            slot["allocation_id"],
+            int(slot["allocation_slot_ordinal"]),
+            int(slot["lane_count"]),
+            int(slot["cpus"]),
+            int(slot["memory_mb"]),
+        )
+        for slot in expected_running_slots
+    )
+    actual_running_slot_counter = Counter(
+        (
+            summary.get("allocation_id"),
+            summary.get("allocation_slot_ordinal"),
+            int(summary["lane_count"]),
+            int(summary["cpus"]),
+            int(summary["memory_mb"]),
+        )
+        for summary in summaries
+        if summary["scheduler_disposition"] == "running-capacity"
+    )
+    queued_slots_are_unbound = all(
+        summary.get("allocation_id") is None
+        and summary.get("allocation_slot_ordinal") is None
+        for summary in summaries
+        if summary["scheduler_disposition"] == "queued-capacity"
+    )
+    if (
+        validated_embedded_inventory.get("allocation_inventory_sha256")
+        != value.get("rendered_from_allocation_inventory_sha256")
+        or actual_running_slot_counter != expected_running_slot_counter
+        or not queued_slots_are_unbound
+    ):
+        raise RuntimeError("Phase-B placement allocation binding drifted")
+    expected_production_blockers = [
+        "authenticated real 1/4/8 remote smoke receipts are absent",
+        "capacity-aware Scheduler submitter implementation is absent",
+        "per-shape live /api/task-capacity fence is absent",
+        "Scheduler capacity response has no verified revision/reservation fence",
+    ] + (
+        ["live allocation pool capacity is below exact-500 running target"]
+        if queued_count
+        else []
+    )
     if (
         value.get("schema_version") != PLACEMENT_PLAN_SCHEMA
         or value.get("phase_b_protocol_version") != PROTOCOL_VERSION
@@ -805,20 +1124,49 @@ def validate_placement_plan(
         or not _is_sha256(value.get("source_launch_plan_sha256"))
         or not _is_sha256(value.get("rendered_from_allocation_inventory_sha256"))
         or value.get("stage_logical_quotas") != STAGE_LOGICAL_QUOTAS
-        or value.get("running_logical_count") != RUNNING_LOGICAL_TARGET
-        or value.get("queued_logical_count") != QUEUED_LOGICAL_TARGET
+        or value.get("packing_shapes") != list(PRODUCTION_PACKING_SHAPES)
+        or value.get("unauthenticated_production_tail_shapes")
+        != sorted(UNAUTHENTICATED_PRODUCTION_TAIL_SHAPES)
+        or value.get("pure_eight_only_allowed") is not False
+        or value.get("global_intent_order") != "lane-count-descending-v1"
+        or value.get("unavailable_shape_intent_action")
+        != "skip-and-continue-lower-shapes-with-fresh-capacity-get-v1"
+        or value.get("head_of_line_blocking_allowed") is not False
+        or value.get("live_inventory_driven") is not True
+        or value.get("capacity_loss_lanes") != 0
+        or lane_sequence != sorted(lane_sequence, reverse=True)
+        or set(shape_counts) != set(PRODUCTION_PACKING_SHAPES)
+        or value.get("running_logical_count") != running_count
+        or value.get("queued_logical_count") != queued_count
+        or value.get("live_allocation_logical_capacity") != running_count
+        or value.get("exact_500_running_capacity_gap") != queued_count
+        or value.get("packing_increases_allocation_pool_capacity") is not False
+        or value.get("packing_releases_account_maxjobs_allocation_slots") is not False
+        or value.get("packing_effect_scope")
+        != "task-attach-control-plane-and-owned-lane-use-v1"
         or value.get("logical_seed_count") != TOTAL_LOGICAL_TARGET
-        or value.get("physical_parent_count") != 71
-        or value.get("running_parent_count") != 62
-        or value.get("queued_parent_count") != 9
+        or running_count + queued_count != TOTAL_LOGICAL_TARGET
+        or value.get("physical_parent_count") != len(summaries)
+        or value.get("running_parent_count") != running_parents
+        or value.get("queued_parent_count") != queued_parents
         or value.get("shape_parent_counts")
-        != {str(shape): count for shape, count in sorted(EXPECTED_TOTAL_SHAPES.items())}
+        != {str(shape): count for shape, count in sorted(shape_counts.items())}
+        or value.get("running_stage_shapes") != normalized_running_stage_shapes
+        or value.get("queued_stage_shapes") != normalized_queued_stage_shapes
+        or stage_counts != STAGE_LOGICAL_QUOTAS
         or value.get("lane_count_independent_science_identity") is not True
         or value.get("logical_child_inventory_sha256")
         != value.get("one_lane_repack_logical_child_inventory_sha256")
         or value.get("no_stage_bundle_or_wave_crossing") is not True
         or value.get("inventory_recheck_required_at_activation") is not True
         or value.get("inventory_drift_action") != "rerender-or-fail-closed"
+        or value.get("shape_capacity_recheck") != expected_capacity_contract
+        or value.get("required_remote_smoke_shapes")
+        != list(PRODUCTION_PACKING_SHAPES)
+        or value.get("authenticated_remote_smoke_shapes") != []
+        or value.get("actual_capacity_aware_submitter_implementation_present")
+        is not False
+        or value.get("production_blockers") != expected_production_blockers
         or value.get("dispatch_admission_policy") != DISPATCH_ADMISSION_POLICY
         or any(
             value.get(field) is not False
@@ -833,13 +1181,16 @@ def validate_placement_plan(
         )
     ):
         raise RuntimeError("Phase-B placement plan seal mismatch")
-    summaries = value.get("parent_summaries")
-    if not isinstance(summaries, list) or len(summaries) != 71:
-        raise RuntimeError("Phase-B placement parent inventory drifted")
     if parent_tasks is not None:
         validated_tasks = [validate_batch_task(task) for task in parent_tasks]
+        if len(validated_tasks) != len(summaries):
+            raise RuntimeError("Phase-B placement task inventory drifted")
+        rebound_summaries = [
+            _parent_summary(task, summary)
+            for task, summary in zip(validated_tasks, summaries, strict=True)
+        ]
         if (
-            len(validated_tasks) != 71
+            rebound_summaries != summaries
             or canonical_sha256({"parent_tasks": validated_tasks})
             != value.get("parent_task_inventory_sha256")
             or logical_child_inventory_sha256(validated_tasks)
@@ -862,8 +1213,29 @@ def build_placement_evidence(
         "allocation_inventory_sha256": inventory["allocation_inventory_sha256"],
         "allocation_histogram": placement["allocation_histogram"],
         "stage_logical_quotas": placement["stage_logical_quotas"],
+        "packing_shapes": placement["packing_shapes"],
+        "unauthenticated_production_tail_shapes": placement[
+            "unauthenticated_production_tail_shapes"
+        ],
+        "pure_eight_only_allowed": False,
+        "global_intent_order": placement["global_intent_order"],
+        "unavailable_shape_intent_action": placement[
+            "unavailable_shape_intent_action"
+        ],
+        "head_of_line_blocking_allowed": False,
+        "live_inventory_driven": True,
+        "capacity_loss_lanes": placement["capacity_loss_lanes"],
         "running_logical_count": placement["running_logical_count"],
         "queued_logical_count": placement["queued_logical_count"],
+        "live_allocation_logical_capacity": placement[
+            "live_allocation_logical_capacity"
+        ],
+        "exact_500_running_capacity_gap": placement[
+            "exact_500_running_capacity_gap"
+        ],
+        "packing_increases_allocation_pool_capacity": False,
+        "packing_releases_account_maxjobs_allocation_slots": False,
+        "packing_effect_scope": placement["packing_effect_scope"],
         "logical_seed_count": placement["logical_seed_count"],
         "physical_parent_count": placement["physical_parent_count"],
         "running_parent_count": placement["running_parent_count"],
@@ -879,6 +1251,11 @@ def build_placement_evidence(
         "lane_count_independent_science_identity": True,
         "capacity_snapshot_recheck_required": True,
         "capacity_snapshot_drift_action": "rerender-or-fail-closed",
+        "shape_capacity_recheck": placement["shape_capacity_recheck"],
+        "required_remote_smoke_shapes": placement["required_remote_smoke_shapes"],
+        "authenticated_remote_smoke_shapes": [],
+        "actual_capacity_aware_submitter_implementation_present": False,
+        "production_blockers": placement["production_blockers"],
         "dispatch_admission_policy": copy.deepcopy(DISPATCH_ADMISSION_POLICY),
         "documentary_only": True,
         "production_eligible": False,

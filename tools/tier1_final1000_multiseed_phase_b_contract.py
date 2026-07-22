@@ -5,8 +5,9 @@ Every logical child remains the canonical four-CPU Phase-A child task with its
 own immutable payload, dedupe identity, subprocess, seed directory, journal,
 and receipt.  A parent requests the exact sum of those child resources and
 runs four for the mandatory first canary, eight for normal production, or an
-exact 1..7 tail shape after the canary to fill an allocation without wasting
-CPU slots.
+exact 1..8 shape for diagnostics and recovery. Production packing is limited
+to authenticated 8/4/1 envelopes so it can fill allocations without wasting
+CPU slots while unauthenticated tail shapes remain fail-closed.
 
 This module is side-effect free.  In particular, it never contacts Scheduler
 and never submits FEA/AEDT work.
@@ -49,11 +50,18 @@ CANARY_CONCURRENCY = 4
 PRODUCTION_CONCURRENCY = 8
 MIN_CONCURRENT_CHILDREN = 1
 MAX_CONCURRENT_CHILDREN = 8
-# Four is the mandatory first canary and eight is the normal production
-# shape.  The other exact shapes are post-canary allocation-tail fillers: for
-# example 44 CPUs pack as 8+3 children, 48 as 8+4, and 60 as 8+7.
+# Four is the mandatory first canary and eight is the normal production shape.
+# The runner retains every exact shape for diagnostic/recovery compatibility.
 OPERATIONAL_BATCH_LENGTHS = frozenset(
     range(MIN_CONCURRENT_CHILDREN, MAX_CONCURRENT_CHILDREN + 1)
+)
+# The runner can execute every exact 1..8 tail for diagnostics and recovery,
+# but only these three envelopes have a defined remote-smoke path.  Production
+# placement must therefore pack largest-first with 8/4/1 until an additional
+# shape has its own authenticated remote receipt.
+PRODUCTION_PACKING_SHAPES = (8, 4, 1)
+UNAUTHENTICATED_PRODUCTION_TAIL_SHAPES = frozenset(
+    OPERATIONAL_BATCH_LENGTHS.difference(PRODUCTION_PACKING_SHAPES)
 )
 CHILD_CPUS = 4
 CHILD_MEMORY_MB = 28 * 1024

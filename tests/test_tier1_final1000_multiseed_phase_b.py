@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import copy
 import hashlib
 import json
@@ -429,22 +430,25 @@ def test_dry_run_repack_covers_exact_500_without_mutation():
     )
     assert first == second
     assert first["logical_seed_count"] == 500
-    assert first["running_logical_count"] == 431
-    assert first["queued_logical_count"] == 69
-    assert first["physical_parent_count"] == 71
-    assert first["running_parent_count"] == 62
-    assert first["queued_parent_count"] == 9
+    assert first["running_logical_count"] == 447
+    assert first["queued_logical_count"] == 53
+    assert first["physical_parent_count"] == 108
+    assert first["running_parent_count"] == 100
+    assert first["queued_parent_count"] == 8
     assert first["shape_parent_counts"] == {
-        "1": 2,
-        "2": 2,
-        "3": 3,
-        "4": 1,
-        "5": 4,
-        "6": 2,
-        "7": 7,
+        "1": 44,
+        "4": 14,
         "8": 50,
     }
-    assert first["maxjobs_reduction"] == 429
+    assert first["scheduler_task_envelope_reduction"] == 392
+    assert first["account_maxjobs_allocation_slot_reduction"] == 0
+    assert first["live_allocation_logical_capacity"] == 447
+    assert first["exact_500_running_capacity_gap"] == 53
+    assert first["packing_increases_allocation_pool_capacity"] is False
+    assert first["packing_releases_account_maxjobs_allocation_slots"] is False
+    assert first["packing_effect_scope"] == (
+        "task-attach-control-plane-and-owned-lane-use-v1"
+    )
     assert first["stage_logical_quotas"] == {
         profiles.STAGES[0].stage_id: 300,
         profiles.STAGES[1].stage_id: 150,
@@ -452,15 +456,55 @@ def test_dry_run_repack_covers_exact_500_without_mutation():
         profiles.STAGES[3].stage_id: 10,
     }
     assert first["queued_stage_shapes"][profiles.STAGES[0].stage_id] == {
-        "5": 1,
-        "8": 8,
+        "1": 1,
+        "4": 1,
+        "8": 6,
     }
+    assert first["packing_shapes"] == [8, 4, 1]
+    assert first["unauthenticated_production_tail_shapes"] == [2, 3, 5, 6, 7]
+    assert first["pure_eight_only_allowed"] is False
+    assert first["global_intent_order"] == "lane-count-descending-v1"
+    assert first["unavailable_shape_intent_action"] == (
+        "skip-and-continue-lower-shapes-with-fresh-capacity-get-v1"
+    )
+    assert first["head_of_line_blocking_allowed"] is False
+    assert first["live_inventory_driven"] is True
+    assert first["capacity_loss_lanes"] == 0
+    assert first["actual_capacity_aware_submitter_implementation_present"] is False
+    assert first["authenticated_remote_smoke_shapes"] == []
+    assert first["shape_capacity_recheck"]["endpoint_path"] == "/api/task-capacity"
+    assert [
+        item["lane_count"] for item in first["shape_capacity_recheck"]["queries"]
+    ] == [8, 4, 1]
+    assert all(
+        item["partition"] == "auto"
+        for item in first["shape_capacity_recheck"]["queries"]
+    )
+    assert (
+        first["shape_capacity_recheck"][
+            "scheduler_response_snapshot_revision_verified"
+        ]
+        is False
+    )
+    assert (
+        first["shape_capacity_recheck"]["atomic_capacity_reservation_supported"]
+        is False
+    )
     assert first["lane_count_independent_science_identity"] is True
     assert first["capacity_snapshot_recheck_required"] is True
     assert first["static_eight_first_pack_production_eligible"] is False
     assert first["dispatch_admission_policy"] == {
         "schema_version": "mft-tier1-final1000-phase-b-dispatch-admission-v1",
         "logical_child_cpus": 4,
+        "logical_child_memory_mb": 28_672,
+        "production_packing_shapes": [8, 4, 1],
+        "packing_order": "global-lane-count-descending-v1",
+        "unavailable_shape_intent_action": (
+            "skip-and-continue-lower-shapes-with-fresh-capacity-get-v1"
+        ),
+        "head_of_line_blocking_allowed": False,
+        "pure_eight_only_allowed": False,
+        "unauthenticated_tail_shapes": [2, 3, 5, 6, 7],
         "default_model_load_stagger_seconds": 5.0,
         "eight_lane_dispatch_fill_seconds": 35.0,
         "scheduler_ready_lane_reserve": 0,
@@ -468,7 +512,17 @@ def test_dry_run_repack_covers_exact_500_without_mutation():
         "speculative_ready_lane_submission_allowed": False,
         "empty_node_or_capacity_prediction_allowed": False,
         "capacity_snapshot_recheck_before_activation_required": True,
+        "shape_capacity_endpoint_path": "/api/task-capacity",
+        "shape_capacity_recheck_before_each_post_required": True,
+        "shape_capacity_snapshot_fence_required": True,
         "capacity_snapshot_drift_action": "rerender-or-fail-closed",
+        "persistent_pool_allocations_shared_by_scheduler_tasks": True,
+        "packing_effect_scope": "task-attach-control-plane-and-owned-lane-use-v1",
+        "allocation_pool_capacity_increase_claimed": False,
+        "account_maxjobs_allocation_slot_reduction_claimed": False,
+        "exact_500_running_requires": (
+            "live-allocation-pool-growth-or-rightsize-or-authenticated-resource-change"
+        ),
     }
     assert first["scheduler_write_performed"] is False
     assert first["submission_performed"] is False
@@ -488,9 +542,10 @@ def test_dry_run_repack_covers_exact_500_without_mutation():
         key: value for key, value in published.items() if key != "evidence_sha256"
     }
     assert published["evidence_sha256"] == phase_a.canonical_sha256(published_unsigned)
-    assert published == evidence.build_dry_run_evidence(
-        _rendered_plan(), source_file_sha256=published["source_file_sha256"]
-    )
+    # This immutable file is the archived active39 snapshot.  Its seal remains
+    # valid, but it must not be rebuilt as though it represented live capacity.
+    assert published["running_logical_count"] == 431
+    assert published["queued_logical_count"] == 69
     integration = json.loads(
         (
             Path(__file__).parents[1]
@@ -598,19 +653,51 @@ def test_capacity_aware_placement_exact_shapes_stage_boundaries_and_drift():
     )
     tasks = rendered.pop("parent_tasks")
     assert successor.validate_placement_plan(rendered, parent_tasks=tasks) == rendered
-    assert len(tasks) == 71
+    assert len(tasks) == 108
     assert rendered["logical_seed_count"] == 500
-    assert rendered["running_logical_count"] == 431
-    assert rendered["queued_logical_count"] == 69
+    assert rendered["running_logical_count"] == 447
+    assert rendered["queued_logical_count"] == 53
+    assert rendered["live_allocation_logical_capacity"] == 447
+    assert rendered["exact_500_running_capacity_gap"] == 53
+    assert rendered["packing_increases_allocation_pool_capacity"] is False
+    assert rendered["packing_releases_account_maxjobs_allocation_slots"] is False
+    assert (
+        "live allocation pool capacity is below exact-500 running target"
+        in rendered["production_blockers"]
+    )
     assert rendered["shape_parent_counts"] == {
-        "1": 2,
-        "2": 2,
-        "3": 3,
-        "4": 1,
-        "5": 4,
-        "6": 2,
-        "7": 7,
+        "1": 44,
+        "4": 14,
         "8": 50,
+    }
+    assert rendered["packing_shapes"] == [8, 4, 1]
+    assert rendered["unauthenticated_production_tail_shapes"] == [2, 3, 5, 6, 7]
+    assert rendered["pure_eight_only_allowed"] is False
+    assert rendered["capacity_loss_lanes"] == 0
+    assert rendered["actual_capacity_aware_submitter_implementation_present"] is False
+    assert rendered["authenticated_remote_smoke_shapes"] == []
+    assert [summary["lane_count"] for summary in rendered["parent_summaries"]] == (
+        sorted(
+            (summary["lane_count"] for summary in rendered["parent_summaries"]),
+            reverse=True,
+        )
+    )
+    assert {
+        summary["lane_count"]
+        for summary in rendered["parent_summaries"]
+        if summary["scheduler_disposition"] == "running-capacity"
+    } == {8, 4, 1}
+    assert rendered["running_stage_shapes"] == {
+        profiles.STAGES[0].stage_id: {"1": 39, "4": 12, "8": 20},
+        profiles.STAGES[1].stage_id: {"1": 2, "4": 1, "8": 18},
+        profiles.STAGES[2].stage_id: {"8": 5},
+        profiles.STAGES[3].stage_id: {"1": 2, "8": 1},
+    }
+    assert rendered["queued_stage_shapes"] == {
+        profiles.STAGES[0].stage_id: {"1": 1, "4": 1, "8": 6},
+        profiles.STAGES[1].stage_id: {},
+        profiles.STAGES[2].stage_id: {},
+        profiles.STAGES[3].stage_id: {},
     }
     assert (
         rendered["logical_child_inventory_sha256"]
@@ -632,11 +719,97 @@ def test_capacity_aware_placement_exact_shapes_stage_boundaries_and_drift():
         for task in tasks
     )
     successor.require_inventory_identity(rendered, inventory)
+
+    def reseal_placement(value: dict[str, Any]) -> None:
+        unsigned = {
+            key: item
+            for key, item in value.items()
+            if key != "placement_plan_sha256"
+        }
+        value["placement_plan_sha256"] = phase_a.canonical_sha256(unsigned)
+
+    forged_allocation = copy.deepcopy(rendered)
+    running_summary = next(
+        summary
+        for summary in forged_allocation["parent_summaries"]
+        if summary["scheduler_disposition"] == "running-capacity"
+    )
+    running_summary["allocation_id"] = "forged-allocation"
+    reseal_placement(forged_allocation)
+    with pytest.raises(RuntimeError, match="allocation binding drifted"):
+        successor.validate_placement_plan(forged_allocation, parent_tasks=tasks)
+
+    swapped_disposition = copy.deepcopy(rendered)
+    same_shape_running = next(
+        summary
+        for summary in swapped_disposition["parent_summaries"]
+        if summary["scheduler_disposition"] == "running-capacity"
+        and summary["stage_id"] == profiles.STAGES[0].stage_id
+        and summary["lane_count"] == 8
+    )
+    same_shape_queued = next(
+        summary
+        for summary in swapped_disposition["parent_summaries"]
+        if summary["scheduler_disposition"] == "queued-capacity"
+        and summary["stage_id"] == profiles.STAGES[0].stage_id
+        and summary["lane_count"] == 8
+    )
+    same_shape_running["scheduler_disposition"] = "queued-capacity"
+    same_shape_queued["scheduler_disposition"] = "running-capacity"
+    reseal_placement(swapped_disposition)
+    with pytest.raises(RuntimeError, match="allocation binding drifted"):
+        successor.validate_placement_plan(swapped_disposition, parent_tasks=tasks)
+
+    forged_task_binding = copy.deepcopy(rendered)
+    forged_task_binding["parent_summaries"][0]["seed_start"] += 1
+    reseal_placement(forged_task_binding)
+    with pytest.raises(RuntimeError, match="task inventory drifted"):
+        successor.validate_placement_plan(forged_task_binding, parent_tasks=tasks)
+
     drifted = successor.current_empty_pool_inventory(
         observed_at="2026-07-22T00:00:01+09:00"
     )
     with pytest.raises(RuntimeError, match="inventory drifted"):
         successor.require_inventory_identity(rendered, drifted)
+
+
+def test_live_capacity_decomposition_is_exact_largest_first_8_4_1():
+    allowed = (2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16)
+    for capacity in allowed:
+        inventory = successor.build_allocation_inventory(
+            [
+                {
+                    "allocation_id": f"capacity-{capacity}",
+                    "usable_lane_capacity": capacity,
+                    "state": "active",
+                }
+            ],
+            observed_at="2026-07-23T01:20:00+09:00",
+        )
+        slots = successor.decompose_allocation_inventory(inventory)
+        shapes = [slot["lane_count"] for slot in slots]
+        assert shapes == sorted(shapes, reverse=True)
+        assert set(shapes) <= {8, 4, 1}
+        assert sum(shapes) == capacity
+
+    latest = successor.current_empty_pool_inventory()
+    latest_slots = successor.decompose_allocation_inventory(latest)
+    latest_shapes = Counter(slot["lane_count"] for slot in latest_slots)
+    assert latest["allocation_count"] == 40
+    assert latest["usable_lane_count"] == 447
+    assert latest_shapes == Counter({8: 44, 4: 13, 1: 43})
+
+    with pytest.raises(RuntimeError, match="inventory row is invalid"):
+        successor.build_allocation_inventory(
+            [
+                {
+                    "allocation_id": "draining-must-not-count",
+                    "usable_lane_capacity": 16,
+                    "state": "draining",
+                }
+            ],
+            observed_at="2026-07-23T01:20:00+09:00",
+        )
 
 
 def test_phase_a_batch4_migration_waits_without_intents(tmp_path: Path):

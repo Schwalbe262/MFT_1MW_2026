@@ -14,7 +14,10 @@ independently released.
 - One physical Phase-B parent runs exactly 1..8 children concurrently and asks
   for `4 * lanes` CPUs and `28,672 * lanes` MiB. The first canary is 4 children
   (16 CPUs/114,688 MiB); the normal full parent is 8 children
-  (32 CPUs/229,376 MiB). The 1..7 shapes are exact capacity-tail parents.
+  (32 CPUs/229,376 MiB). The runner can represent every exact 1..8 envelope,
+  but production packing is restricted to authenticated `8 -> 4 -> 1` shapes.
+  Shapes 2/3/5/6/7 remain diagnostic-only until each has an authenticated
+  remote smoke receipt.
 - The outer Scheduler step already owns its CPUs through
   `srun --exact --exclusive`. A nested exclusive `srun -c4` can wait on CPUs
   already owned by the outer step, so it is prohibited. The parent partitions
@@ -66,35 +69,45 @@ the same contract with a smaller fixed repeat count before optimizer release.
 
 ## Capacity-aware exact packing
 
-Lane unit: 4 CPUs / 28,672 MiB. The reviewed current active39 empty-pool
+Lane unit: 4 CPUs / 28,672 MiB. The reviewed current active40 empty-pool
 capacity histogram is:
 
-`{16:15, 14:1, 12:1, 11:3, 10:1, 9:2, 8:4, 7:7, 6:1, 5:3, 2:1}`
+`{16:16, 14:1, 12:1, 11:3, 10:1, 9:2, 8:4, 7:7, 6:1, 5:3, 2:1}`
 
-Splitting each allocation into exact parents of at most eight children yields
-62 immediately placeable parents and this exact active shape:
+Splitting each allocation largest-first into only authenticated 8/4/1 parents
+yields 100 immediately placeable parents and this exact active shape:
 
-`{8:42, 7:7, 6:2, 5:3, 4:1, 3:3, 2:2, 1:2}` = 431 logical children.
+`{8:44, 4:13, 1:43}` = 447 logical children.
 
-The remaining queue is exactly eight 8-child parents plus one 5-child parent:
+The remaining queue is exactly six 8-child parents, one 4-child parent, and
+one 1-child parent:
 
-`{8:8, 5:1}` = 69 logical children.
+`{8:6, 4:1, 1:1}` = 53 logical children.
 
-The exact 500-child/71-parent aggregate is therefore:
+The exact 500-child/108-parent aggregate is therefore:
 
-`{8:50, 7:7, 6:2, 5:4, 4:1, 3:3, 2:2, 1:2}`.
+`{8:50, 4:14, 1:44}`.
+
+These parents run inside persistent pool allocations shared by Scheduler
+tasks. The 8/4/1 packing reduces task attach/control-plane envelopes and uses
+all already-owned lane capacity exactly; it does **not** create physical
+capacity, release account `MaxJobs` allocation slots, or turn the audited 447
+live lanes into 500 live lanes. The remaining 53 stay queued. Reaching 500
+simultaneously running logical children requires pool growth/right-sizing as
+`MaxJobs` slots naturally recycle, or a separately measured and authenticated
+per-seed resource change.
 
 Latest logical science quotas and homogeneous parent shapes are:
 
 | Stage | Quota | Exact parent shapes |
 |---|---:|---|
-| entry | 300 | `{8:26,7:7,6:1,5:4,4:1,3:3,2:1,1:2}` |
-| bridge | 150 | `{8:18,6:1}` |
+| entry | 300 | `{8:26,4:13,1:40}` |
+| bridge | 150 | `{8:18,4:1,1:2}` |
 | close | 40 | `{8:5}` |
-| final | 10 | `{8:1,2:1}` |
+| final | 10 | `{8:1,1:2}` |
 
-For the reviewed snapshot, the queued `{8:8,5:1}` tail belongs to entry; the
-remaining per-stage shapes map exactly to the 431 active slots. No parent
+For the reviewed snapshot, the queued `{8:6,4:1,1:1}` tail belongs to entry;
+the remaining per-stage shapes map exactly to the 447 active slots. No parent
 crosses a stage, bundle, or wave. Repacking the same children into one-child
 parents produces the identical logical child inventory SHA, proving that lane
 count does not alter science identity.
@@ -103,7 +116,28 @@ The allocation inventory includes immutable allocation IDs and a canonical
 snapshot SHA. Immediately before activation, the controller must compare a
 fresh snapshot with `rendered_from_allocation_inventory_sha256`. Any change in
 identity, state, or usable capacity requires rerender plus review, or a hard
-stop. A generic static "8 first" pack is documentary only and cannot activate.
+stop. Before every external POST, the driver must also call the live
+`/api/task-capacity` endpoint for that exact 8/4/1 shape and bind its response
+SHA plus snapshot revision to the POST fence. A generic static "8 first" pack
+is documentary only and cannot activate.
+
+The currently inspected endpoint is read-only and does not expose a verified
+snapshot revision or atomic capacity reservation. A client-side response hash
+alone cannot close the GET-to-POST race. Consequently the present renderer is
+documentary and fail-closed: production remains ineligible until the Scheduler
+provides that fence and an authenticated submitter consumes it immediately
+before each POST.
+
+Only rows explicitly marked `active` enter the inventory; `draining` and every
+other state are rejected rather than counted. Running parent summaries are
+rebound exactly to the sealed allocation ID, slot ordinal, shape, CPU, and
+memory inventory, while queued summaries must have no allocation binding.
+The globally descending intent order may place an unavailable queued 8-lane
+intent before a live 4- or 1-lane intent. A future submitter must skip that
+unavailable shape, refresh capacity for the lower shape, and continue; head-of-
+line blocking is prohibited. Some otherwise audited capacity histograms may
+still be un-packable across exact stage quotas and therefore fail closed until
+a reviewed stage-aware resplit exists.
 
 Scheduler ready-lane reserve is deliberately zero: the successor does not
 guess where an empty node will appear or submit against predicted capacity.
@@ -267,9 +301,10 @@ writing the stop latch. A stale source driver SHA cannot release authority.
 4. **8-child canary**: one 32-CPU/229,376-MiB parent per stage. Require exact
    memory/CPU accounting, disjoint masks, staggered loads, no ThreadPool/SemLock
    churn, and sibling survival under one injected seed-local failure.
-5. **Tail canary**: exercise representative 44/48/60 CPU packing (8+3, 8+4,
-   8+7) and every exact 1..8 resource envelope used by the placement.
-6. **Capacity-aware shadow**: rerender the live inventory, prove exact 431+69,
+5. **Tail canary**: exercise representative 44/48/60 CPU packing using only
+   authenticated 8/4/1 parents. Shapes 2/3/5/6/7 are diagnostics and cannot
+   enter production until separately authenticated remotely.
+6. **Capacity-aware shadow**: rerender the live inventory, prove exact 447+53,
    exact 300/150/40/10 quotas, and zero stage/bundle/wave crossing.
 7. **Authority gate**: complete the PID 55304 stop/exit/stable-read/consumer
    capability sequence above, then separately authorize activation.
