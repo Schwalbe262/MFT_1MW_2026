@@ -89,6 +89,16 @@ SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {
 FAMILY_SPECIFIC_INFERENCE_POLICY = (
     "family_specific_semaphore_free_sklearn_forest_v1"
 )
+REPEATED_PREDICT_STRESS_SCHEMA = "mft-tier1-current7-semlock-free-repeated-predict-v1"
+REPEATED_PREDICT_STRESS_REPEATS = 8
+PHASE_B_CHILD_PROTOCOL = "final1000-finite-multiseed-phase-b-v1"
+PHASE_B_CHILD_PROTOCOL_ENV = "MFT_FINAL1000_PHASE_B_CHILD_PROTOCOL"
+SEMLOCK_SAFE_RELEASE_COMMIT = "6ea0e17e5e028ebb8d89d910c3cec1a0f014dae5"
+SEMLOCK_SAFE_SMOKE_SCHEMA = "mft-tier1-semlock-safe-inference-smoke-v1"
+SEMLOCK_SAFE_HELPER_RELATIVE = "tools/tier1_semlock_safe_inference_smoke.py"
+SEMLOCK_SAFE_HELPER_SHA256 = (
+    "c25afd39752a990c31e1b934c77282d88ac11dab1cad763d4f07c95e4b87dd80"
+)
 REMOTE_PREFLIGHT_SCHEMA = "mft-tier1-current7-remote-model-load-v1"
 SEARCH_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 WARM_ROLE_PARTITION_SCHEMA = "mft-tier1-authenticated-warm-role-partition-v1"
@@ -196,14 +206,16 @@ CURRENT_STAGE_SPEC = {
 }
 CURRENT_STAGE_SPEC_SHA256 = canonical_sha256(CURRENT_STAGE_SPEC)
 STAGED_SPEC_OPTIONAL_KEYS = frozenset()
-STAGED_SPEC_MUTABLE_KEYS = frozenset({
-    "T_limit_C",
-    "resonance_min_Hz",
-    "resonance_max_Hz",
-    "size_W_max_mm",
-    "size_L_max_mm",
-    "size_H_max_mm",
-})
+STAGED_SPEC_MUTABLE_KEYS = frozenset(
+    {
+        "T_limit_C",
+        "resonance_min_Hz",
+        "resonance_max_Hz",
+        "size_W_max_mm",
+        "size_L_max_mm",
+        "size_H_max_mm",
+    }
+)
 STAGED_HARD_CONTRACT_SCHEMA = "mft-tier1-staged-hard-constraint-contract-v1"
 
 
@@ -240,9 +252,7 @@ def validate_stage_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
         if name in {"resonance_min_Hz", "resonance_max_Hz"} and value is None:
             normalized[name] = None
         else:
-            normalized[name] = _stage_positive_number(
-                value, f"stage spec {name}"
-            )
+            normalized[name] = _stage_positive_number(value, f"stage spec {name}")
     maximum = supplied.get("resonance_max_Hz")
     normalized["resonance_max_Hz"] = (
         None
@@ -280,9 +290,7 @@ def stage_constraint_names(spec: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
-def stage_spec_from_json_identity(
-    encoded: str, expected_sha256: str
-) -> dict[str, Any]:
+def stage_spec_from_json_identity(encoded: str, expected_sha256: str) -> dict[str, Any]:
     try:
         value = json.loads(encoded)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -316,9 +324,7 @@ def _resonance_band_violations(
     )
     violations: dict[str, float] = {}
     if minimum_hz is not None:
-        violations[RESONANCE_MINIMUM_CONSTRAINT] = (
-            float(minimum_hz) - frequency
-        )
+        violations[RESONANCE_MINIMUM_CONSTRAINT] = float(minimum_hz) - frequency
     if maximum_hz is not None:
         strict_maximum = math.nextafter(float(maximum_hz), -math.inf)
         violations[RESONANCE_MAXIMUM_CONSTRAINT] = frequency - strict_maximum
@@ -336,13 +342,15 @@ def stage_temperature_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
         return copy.deepcopy(CURRENT_TEMPERATURE_CONTRACT)
     contract = copy.deepcopy(CURRENT_TEMPERATURE_CONTRACT)
     limit = float(normalized["T_limit_C"])
-    contract.update({
-        "schema_version": "mft-tier1-current7-temperature-contract-v2",
-        "semantic_version": (
-            f"current7-robust-q90-half-width-staged-{limit:g}C-v1"
-        ),
-        "robust_upper_bound_C": limit,
-    })
+    contract.update(
+        {
+            "schema_version": "mft-tier1-current7-temperature-contract-v2",
+            "semantic_version": (
+                f"current7-robust-q90-half-width-staged-{limit:g}C-v1"
+            ),
+            "robust_upper_bound_C": limit,
+        }
+    )
     return contract
 
 
@@ -354,9 +362,7 @@ def stage_hard_constraint_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
     maximum = normalized["resonance_max_Hz"]
     resonance: dict[str, Any] = {
         "aggregation": "min(f_res_tx_self_Hz,f_res_rx_self_Hz)",
-        "magnetizing_inductance_factor": normalized[
-            "magnetizing_inductance_factor"
-        ],
+        "magnetizing_inductance_factor": normalized["magnetizing_inductance_factor"],
         "interwinding_resonance_is_not_part_of_this_band": True,
         "lower_bound_inclusive_Hz": minimum,
         "upper_bound_exclusive_Hz": maximum,
@@ -375,19 +381,21 @@ def stage_hard_constraint_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
         ),
     }
     contract = copy.deepcopy(CURRENT_STAGE_HARD_CONTRACT)
-    contract.update({
-        "schema_version": STAGED_HARD_CONTRACT_SCHEMA,
-        "stage": f"staged-{canonical_sha256(normalized)[:16]}",
-        "temperature_limit_C": normalized["T_limit_C"],
-        "self_resonance": resonance,
-        "size_limits_mm": {
-            "W": normalized["size_W_max_mm"],
-            "L": normalized["size_L_max_mm"],
-            "H": normalized["size_H_max_mm"],
-        },
-        "constraint_names": list(stage_constraint_names(normalized)),
-        "stage_spec_sha256": canonical_sha256(normalized),
-    })
+    contract.update(
+        {
+            "schema_version": STAGED_HARD_CONTRACT_SCHEMA,
+            "stage": f"staged-{canonical_sha256(normalized)[:16]}",
+            "temperature_limit_C": normalized["T_limit_C"],
+            "self_resonance": resonance,
+            "size_limits_mm": {
+                "W": normalized["size_W_max_mm"],
+                "L": normalized["size_L_max_mm"],
+                "H": normalized["size_H_max_mm"],
+            },
+            "constraint_names": list(stage_constraint_names(normalized)),
+            "stage_spec_sha256": canonical_sha256(normalized),
+        }
+    )
     return contract
 
 
@@ -623,8 +631,7 @@ def decode_unit_sample_with_fixed_cw1(
     minimum_turns = int(input_parameter_module.N1_MIN_TURNS)
     maximum_turns = int(input_parameter_module.N1_MAX_TURNS)
     n1 = minimum_turns + int(
-        float(effective["u_N1"])
-        * (maximum_turns - minimum_turns + 0.9999)
+        float(effective["u_N1"]) * (maximum_turns - minimum_turns + 0.9999)
     )
     n1_side = 0
     n1_main = n1 - n1_side
@@ -703,14 +710,11 @@ def winding_budget_identity(row: Any, *, expected_cw1_mm: float) -> dict[str, An
     except RuntimeError:
         return {"passed": False, "reason": "invalid_turn_count"}
     pack_deltas = {
-        name: values[name] - expected_value
-        for name, expected_value in expected.items()
+        name: values[name] - expected_value for name, expected_value in expected.items()
     }
     side_stack = values["w1s_cs_space_x"] + values["nwl2_side"]
     if values["N1_side"] > 0.0:
-        side_stack += (
-            values["nwl1_side"] + values["w2s_w1s_space_x"]
-        )
+        side_stack += values["nwl1_side"] + values["w2s_w1s_space_x"]
     reconstructed_l2 = (
         values["cc_w2c_space_x"]
         + values["nwl2_main"]
@@ -721,9 +725,7 @@ def winding_budget_identity(row: Any, *, expected_cw1_mm: float) -> dict[str, An
     )
     space_delta = values["l2"] - reconstructed_l2
     passed = (
-        math.isclose(
-            values["cw1"], float(expected_cw1_mm), rel_tol=0.0, abs_tol=1e-12
-        )
+        math.isclose(values["cw1"], float(expected_cw1_mm), rel_tol=0.0, abs_tol=1e-12)
         and all(abs(delta) <= 1e-9 for delta in pack_deltas.values())
         and abs(space_delta) <= 1e-9
     )
@@ -815,9 +817,7 @@ def _turn_split_main_values(
         values = values.reshape(1, -1)
     secondary_turns = 10 * int(fixed_primary_turns)
     side_turns = np.rint(
-        secondary_turns
-        * np.clip(values[:, int(coordinate_index)], 0.0, 1.0)
-        * 0.8
+        secondary_turns * np.clip(values[:, int(coordinate_index)], 0.0, 1.0) * 0.8
     ).astype(int)
     return secondary_turns - side_turns
 
@@ -1029,7 +1029,8 @@ def select_basin_warm_start_indices(
         if len(candidates):
             candidates = random_state.permutation(candidates)
             selected.extend(
-                int(index) for index in candidates[: min(copies, len(candidates))]
+                int(index)
+                for index in candidates[: min(copies, len(candidates))]
                 if int(index) not in selected
             )
     if len(selected) > count:
@@ -1041,9 +1042,7 @@ def select_basin_warm_start_indices(
     if len(selected) < count:
         selected.extend(
             int(index)
-            for index in random_state.permutation(remaining)[
-                : count - len(selected)
-            ]
+            for index in random_state.permutation(remaining)[: count - len(selected)]
         )
     selected_values = observed[np.asarray(selected, dtype=int)]
     selected_counts = {
@@ -1061,8 +1060,7 @@ def select_basin_warm_start_indices(
         "available_topology_counts": available_counts,
         "selected_topology_counts": selected_counts,
         "rare_available_topology_dropped": any(
-            available_counts[str(topology)] > 0
-            and selected_counts[str(topology)] == 0
+            available_counts[str(topology)] > 0 and selected_counts[str(topology)] == 0
             for topology in topologies
         ),
         "prior_prediction_or_pass_classification_inherited": False,
@@ -1087,9 +1085,9 @@ def seed_turn_split_sub_islands(
     import numpy as np
 
     values = np.asarray(initial, dtype=float).copy()
-    topologies = tuple(int(value) for value in contract[
-        "turn_split_sub_islands_N2_main"
-    ])
+    topologies = tuple(
+        int(value) for value in contract["turn_split_sub_islands_N2_main"]
+    )
     copies = int(contract["initial_repaired_copies_per_sub_island"])
     coordinate_index = int(contract["coordinate_index"])
     required = len(topologies) * copies
@@ -1138,14 +1136,14 @@ def seed_turn_split_sub_islands(
             for tier, mask in candidate_tiers:
                 candidates = np.flatnonzero(mask)
                 if protected_warm_donors_only:
-                    candidates = candidates[
-                        candidates < int(warm_donor_count)
-                    ]
+                    candidates = candidates[candidates < int(warm_donor_count)]
                 elif int(warm_donor_count):
-                    candidates = np.concatenate((
-                        candidates[candidates < int(warm_donor_count)],
-                        candidates[candidates >= int(warm_donor_count)],
-                    ))
+                    candidates = np.concatenate(
+                        (
+                            candidates[candidates < int(warm_donor_count)],
+                            candidates[candidates >= int(warm_donor_count)],
+                        )
+                    )
                 for candidate in candidates:
                     candidate = int(candidate)
                     if candidate not in candidate_source_tier:
@@ -1160,16 +1158,18 @@ def seed_turn_split_sub_islands(
                 n2_main,
                 fixed_primary_turns=contract["fixed_primary_turns"],
             )
-            donor_sources.append({
-                "target_N2_main": n2_main,
-                "copy_index": copy_index,
-                "source_row": source_index,
-                "source_N2_main": int(source_observed[source_index]),
-                "source_is_authenticated_warm": bool(
-                    source_index < int(warm_donor_count)
-                ),
-                "source_tier": source_tier,
-            })
+            donor_sources.append(
+                {
+                    "target_N2_main": n2_main,
+                    "copy_index": copy_index,
+                    "source_row": source_index,
+                    "source_N2_main": int(source_observed[source_index]),
+                    "source_is_authenticated_warm": bool(
+                        source_index < int(warm_donor_count)
+                    ),
+                    "source_tier": source_tier,
+                }
+            )
     values = np.asarray(problem.repair_unit_coordinates(values), dtype=float)
     observed = _turn_split_main_values(
         values,
@@ -1187,13 +1187,10 @@ def seed_turn_split_sub_islands(
         "topology_counts_after_current_repair": counts,
         "minimum_copies_each_verified": True,
         "basin_lane_topologies": {
-            name: list(lane_topologies)
-            for name, lane_topologies in lanes.items()
+            name: list(lane_topologies) for name, lane_topologies in lanes.items()
         },
         "basin_seeded_counts": {
-            name: sum(
-                counts[str(topology)] for topology in lane_topologies
-            )
+            name: sum(counts[str(topology)] for topology in lane_topologies)
             for name, lane_topologies in lanes.items()
         },
         "donor_sources": donor_sources,
@@ -1353,9 +1350,9 @@ def create_deep_topology_components(
     from pymoo.operators.mutation.pm import PM
     from pymoo.operators.survival.rank_and_crowding import RankAndCrowding
 
-    topologies = tuple(int(value) for value in contract[
-        "turn_split_sub_islands_N2_main"
-    ])
+    topologies = tuple(
+        int(value) for value in contract["turn_split_sub_islands_N2_main"]
+    )
     parent_pairs = tuple(
         tuple(int(value) for value in pair)
         for pair in contract["turn_split_parent_pair_schedule"]
@@ -1366,9 +1363,7 @@ def create_deep_topology_components(
         contract["survival"]["minimum_survivors_per_turn_split_sub_island"]
     )
     initial_epsilon = float(contract["survival"]["initial_epsilon"])
-    epsilon_decay_generation = int(
-        contract["survival"]["decay_to_zero_generation"]
-    )
+    epsilon_decay_generation = int(contract["survival"]["decay_to_zero_generation"])
     migration_period = int(contract["migration"]["period_generations"])
     migrants_per_event = int(contract["migration"]["migrants_per_event"])
     topology_local_mating = bool(contract.get("topology_local_mating_required"))
@@ -1698,15 +1693,11 @@ def create_deep_topology_components(
             algorithm = kwargs.get("algorithm")
             generation = int(getattr(algorithm, "n_gen", 1) or 1)
             evolution_generation = max(0, generation - 1)
-            fraction = max(
-                0.0, 1.0 - evolution_generation / epsilon_decay_generation
-            )
+            fraction = max(0.0, 1.0 - evolution_generation / epsilon_decay_generation)
             epsilon = initial_epsilon * fraction * fraction
             constraints = np.asarray(pop.get("G"), dtype=float)
             positive_g = np.maximum(constraints, 0.0)
-            positive_count = np.count_nonzero(
-                positive_g > 0.0, axis=1
-            )
+            positive_count = np.count_nonzero(positive_g > 0.0, axis=1)
             positive_max = positive_g.max(axis=1)
             positive_sum = positive_g.sum(axis=1)
             # Preserve the sealed aggregate epsilon admission exactly.  The
@@ -1727,18 +1718,16 @@ def create_deep_topology_components(
                     id(individual): index for index, individual in enumerate(pop)
                 }
                 global_order.extend(identity[id(individual)] for individual in ranked)
-            infeasible_order = np.lexsort((
-                positive_sum[epsilon_infeasible],
-                positive_max[epsilon_infeasible],
-                positive_count[epsilon_infeasible],
-            ))
-            for rank_offset, index in enumerate(
-                epsilon_infeasible[infeasible_order]
-            ):
-                pop[int(index)].set("rank", len(global_order) + rank_offset)
-                pop[int(index)].set(
-                    "crowding", -float(positive_max[int(index)])
+            infeasible_order = np.lexsort(
+                (
+                    positive_sum[epsilon_infeasible],
+                    positive_max[epsilon_infeasible],
+                    positive_count[epsilon_infeasible],
                 )
+            )
+            for rank_offset, index in enumerate(epsilon_infeasible[infeasible_order]):
+                pop[int(index)].set("rank", len(global_order) + rank_offset)
+                pop[int(index)].set("crowding", -float(positive_max[int(index)]))
                 global_order.append(int(index))
             observed = topology_values(pop)
             selected: list[int] = []
@@ -1770,9 +1759,7 @@ def create_deep_topology_components(
             survivors = pop[np.asarray(selected[:n_survive], dtype=int)]
             survivor_topologies = topology_values(survivors)
             counts = {
-                str(topology): int(
-                    np.count_nonzero(survivor_topologies == topology)
-                )
+                str(topology): int(np.count_nonzero(survivor_topologies == topology))
                 for topology in topologies
             }
             expected_counts = (
@@ -1832,9 +1819,7 @@ def derive_half_magnetizing_self_resonance(
         getattr(params, "get", None)
     ):
         raise RuntimeError("resonance inputs must be mappings")
-    leakage_h = _positive_number(
-        measurements.get("Llt_phys"), "Llt_phys"
-    ) * 1e-6
+    leakage_h = _positive_number(measurements.get("Llt_phys"), "Llt_phys") * 1e-6
     coupling = _finite_number(measurements.get("k"), "k")
     if not 0.0 < coupling < 1.0:
         raise RuntimeError("k must satisfy 0 < k < 1")
@@ -1860,9 +1845,7 @@ def derive_half_magnetizing_self_resonance(
     rx_magnetizing_h = tx_magnetizing_h * (n2 / n1) ** 2
 
     def lc_hz(inductance_h: float, capacitance_f: float) -> float:
-        frequency = 1.0 / (
-            2.0 * math.pi * math.sqrt(inductance_h * capacitance_f)
-        )
+        frequency = 1.0 / (2.0 * math.pi * math.sqrt(inductance_h * capacitance_f))
         return _positive_number(frequency, "self resonance frequency")
 
     tx_frequency = lc_hz(factor * tx_magnetizing_h, c_tx)
@@ -1895,8 +1878,7 @@ def create_current7_problem_class(
     if dict(base_fixed_stack_mm) != EXPECTED_SIMPLE_BASE_FIXED_STACK_MM:
         raise RuntimeError("current7 simple-base fixed-stack schema mismatch")
     normalized_dims = tuple(
-        (str(name), float(lower), float(upper))
-        for name, lower, upper in sobol_dims
+        (str(name), float(lower), float(upper)) for name, lower, upper in sobol_dims
     )
     names = [item[0] for item in normalized_dims]
     if len(names) != len(set(names)):
@@ -1943,9 +1925,7 @@ def create_current7_problem_class(
             effective_spec = validate_stage_spec(spec or CURRENT_STAGE_SPEC)
             constraint_names = stage_constraint_names(effective_spec)
             temperature_contract = stage_temperature_contract(effective_spec)
-            hard_constraint_contract = stage_hard_constraint_contract(
-                effective_spec
-            )
+            hard_constraint_contract = stage_hard_constraint_contract(effective_spec)
 
             overrides = dict(fixed_overrides or {})
             for name in VARIABLE_COOLING_DIMENSIONS:
@@ -2050,9 +2030,7 @@ def create_current7_problem_class(
             self.stage_spec = effective_spec
             self.stage_spec_sha256 = canonical_sha256(effective_spec)
             self.temperature_contract = temperature_contract
-            self.temperature_contract_sha256 = canonical_sha256(
-                temperature_contract
-            )
+            self.temperature_contract_sha256 = canonical_sha256(temperature_contract)
             self.hard_constraint_contract = hard_constraint_contract
             self.hard_constraint_contract_sha256 = canonical_sha256(
                 hard_constraint_contract
@@ -2072,9 +2050,7 @@ def create_current7_problem_class(
         def _unit_from_physical(name: str, value: float) -> float:
             index = sobol_index[name]
             _dimension, lower, upper = normalized_dims[index]
-            return float(np.clip(
-                (float(value) - lower) / (upper - lower), 0.0, 1.0
-            ))
+            return float(np.clip((float(value) - lower) / (upper - lower), 0.0, 1.0))
 
         @staticmethod
         def _physical_from_unit(name: str, value: float) -> float:
@@ -2085,9 +2061,7 @@ def create_current7_problem_class(
         @staticmethod
         def _integer_unit(target: int, minimum: int, maximum: int) -> float:
             scale = maximum - minimum + 0.9999
-            return float(np.clip(
-                (target - minimum + 0.5) / scale, 0.0, 1.0
-            ))
+            return float(np.clip((target - minimum + 0.5) / scale, 0.0, 1.0))
 
         def _project_row(self, raw: Any) -> Any:
             """Port the pinned 7c hard-physics coordinate projection."""
@@ -2112,14 +2086,14 @@ def create_current7_problem_class(
                 n2_side = 0
             else:
                 decoded_native = round(n2 * side_selector * 0.8)
-                n2_side = int(np.clip(
-                    decoded_native,
-                    int(np.ceil(0.20 * n2)),
-                    int(np.floor(0.52 * n2)),
-                ))
-            row[sobol_index["u_N2_side"]] = min(
-                1.0, (n2_side + 0.1) / (0.8 * n2)
-            )
+                n2_side = int(
+                    np.clip(
+                        decoded_native,
+                        int(np.ceil(0.20 * n2)),
+                        int(np.floor(0.52 * n2)),
+                    )
+                )
+            row[sobol_index["u_N2_side"]] = min(1.0, (n2_side + 0.1) / (0.8 * n2))
 
             length_limit = min(
                 float(self.spec["size_L_max_mm"]),
@@ -2129,9 +2103,7 @@ def create_current7_problem_class(
                 float(self.spec["size_H_max_mm"]),
                 float(normalized_dims[sobol_index["total_height"]][2]),
             )
-            put("total_height", np.clip(
-                get("total_height"), 500.0, height_limit
-            ))
+            put("total_height", np.clip(get("total_height"), 500.0, height_limit))
 
             for name in (
                 "cc_w2c_space_x",
@@ -2161,41 +2133,34 @@ def create_current7_problem_class(
 
             defaults = input_parameter_module.get_drawing_default_params()
             plate_t = round(float(get("core_plate_t")), 1)
-            core_stack = (
-                plate_t + 2.0 * FIXED_COOLING_PADS_MM["core_plate_pad_t"]
-            )
+            core_stack = plate_t + 2.0 * FIXED_COOLING_PADS_MM["core_plate_pad_t"]
             d_min = float(defaults["core_depth_min"])
             d_max = float(defaults["core_depth_max"])
             maximum_groups = int(self.spec["n_core_group_max"])
             floors = np.asarray([40.0, 40.0, 40.5, 40.0])
-            l1_box_ceiling = (
-                length_limit - 2.0 * float(floors.sum()) / 0.45
-            ) / 4.0
+            l1_box_ceiling = (length_limit - 2.0 * float(floors.sum()) / 0.45) / 4.0
             l1_ceiling = min(100.0, l1_box_ceiling)
             if n2_side:
-                projected_x_spaces = np.asarray([
-                    get("cc_w2c_space_x"),
-                    get("w2c_w1c_space_x"),
-                    get("w1c_w2s_space_x"),
-                    get("w1s_cs_space_x"),
-                ])
-                minimum_side_pack = (
-                    n2_side * 0.3 + max(n2_side - 1, 0) * 0.3
+                projected_x_spaces = np.asarray(
+                    [
+                        get("cc_w2c_space_x"),
+                        get("w2c_w1c_space_x"),
+                        get("w1c_w2s_space_x"),
+                        get("w1s_cs_space_x"),
+                    ]
                 )
+                minimum_side_pack = n2_side * 0.3 + max(n2_side - 1, 0) * 0.3
                 side_exterior_l1_ceiling = (
                     length_limit
                     - 2.0 * float(projected_x_spaces.sum()) / 0.45
-                    - 2.0 * (
-                        float(projected_x_spaces[3]) + minimum_side_pack
-                    )
+                    - 2.0 * (float(projected_x_spaces[3]) + minimum_side_pack)
                 ) / 4.0
-                l1_ceiling = min(
-                    l1_ceiling, max(40.0, side_exterior_l1_ceiling)
-                )
+                l1_ceiling = min(l1_ceiling, max(40.0, side_exterior_l1_ceiling))
             l1 = float(np.clip(round(get("l1")), 40.0, l1_ceiling))
 
             required_area_mm2 = (
-                float(defaults["V1_rms"]) * 1e6
+                float(defaults["V1_rms"])
+                * 1e6
                 / (
                     4.0
                     * float(defaults["freq"])
@@ -2208,49 +2173,37 @@ def create_current7_problem_class(
             current_rounded_w1 = round(get("w1"))
             current_n_min = max(
                 1,
-                int(np.ceil(
-                    (current_rounded_w1 - core_stack)
-                    / (d_max + core_stack)
-                )),
+                int(np.ceil((current_rounded_w1 - core_stack) / (d_max + core_stack))),
             )
             current_n_max = max(
                 current_n_min,
-                int(np.floor(
-                    (current_rounded_w1 - core_stack)
-                    / (d_min + core_stack)
-                )),
+                int(np.floor((current_rounded_w1 - core_stack) / (d_min + core_stack))),
             )
             desired_group = current_n_min + int(
                 selector * (current_n_max - current_n_min + 0.9999)
             )
-            desired_group = int(np.clip(
-                desired_group, 1, maximum_groups
-            ))
-            minimum_group_for_b = int(np.ceil(
-                required_area_mm2 / (2.0 * max(l1, 1.0) * d_max)
-            ))
-            target_group = int(np.clip(
-                max(desired_group, minimum_group_for_b),
-                1,
-                maximum_groups,
-            ))
-            required_l1 = (
-                required_area_mm2 / (2.0 * target_group * d_max) * 1.005
+            desired_group = int(np.clip(desired_group, 1, maximum_groups))
+            minimum_group_for_b = int(
+                np.ceil(required_area_mm2 / (2.0 * max(l1, 1.0) * d_max))
             )
-            l1 = float(np.clip(
-                max(l1, required_l1), 40.0, l1_ceiling
-            ))
+            target_group = int(
+                np.clip(
+                    max(desired_group, minimum_group_for_b),
+                    1,
+                    maximum_groups,
+                )
+            )
+            required_l1 = required_area_mm2 / (2.0 * target_group * d_max) * 1.005
+            l1 = float(np.clip(max(l1, required_l1), 40.0, l1_ceiling))
             put("l1", l1)
 
             required_iron_depth = required_area_mm2 / (2.0 * l1) * 1.005
             minimum_iron_depth = max(target_group * d_min, required_iron_depth)
             maximum_iron_depth = target_group * d_max * (1.0 - 1e-6)
-            raw_iron_depth = (
-                get("w1") - (target_group + 1.0) * core_stack
+            raw_iron_depth = get("w1") - (target_group + 1.0) * core_stack
+            iron_depth = float(
+                np.clip(raw_iron_depth, minimum_iron_depth, maximum_iron_depth)
             )
-            iron_depth = float(np.clip(
-                raw_iron_depth, minimum_iron_depth, maximum_iron_depth
-            ))
             put("w1", iron_depth + (target_group + 1.0) * core_stack)
 
             def project_budget() -> None:
@@ -2261,15 +2214,10 @@ def create_current7_problem_class(
                     "w1c_w2s_space_x",
                     "w1s_cs_space_x",
                 )
-                spaces = np.asarray([
-                    max(get(name), 40.0) for name in x_names
-                ])
+                spaces = np.asarray([max(get(name), 40.0) for name in x_names])
                 spaces[2] = max(spaces[2], 40.5)
                 total_length = min(round(get("total_length")), length_limit)
-                minimum_length = (
-                    4.0 * projected_l1
-                    + 2.0 * float(spaces.sum()) / 0.45
-                )
+                minimum_length = 4.0 * projected_l1 + 2.0 * float(spaces.sum()) / 0.45
                 if minimum_length > length_limit:
                     available = max(
                         float(floors.sum()),
@@ -2278,12 +2226,9 @@ def create_current7_problem_class(
                     excess = max(0.0, float(spaces.sum()) - available)
                     reducible = spaces - floors
                     if reducible.sum() > 0.0:
-                        spaces -= reducible * min(
-                            1.0, excess / reducible.sum()
-                        )
+                        spaces -= reducible * min(1.0, excess / reducible.sum())
                     minimum_length = (
-                        4.0 * projected_l1
-                        + 2.0 * float(spaces.sum()) / 0.45
+                        4.0 * projected_l1 + 2.0 * float(spaces.sum()) / 0.45
                     )
                 for name, value in zip(x_names, spaces):
                     put(name, value)
@@ -2294,17 +2239,10 @@ def create_current7_problem_class(
                     n1 * self.spec["primary_conductor_thickness_mm"]
                     + max(n1 - 1, 0) * gap1
                 )
-                secondary_gaps = (
-                    max(n2 - n2_side - 1, 0)
-                    + max(n2_side - 1, 0)
-                )
+                secondary_gaps = max(n2 - n2_side - 1, 0) + max(n2_side - 1, 0)
                 secondary_pack = n2 * 0.3 + secondary_gaps * gap2
-                required_l2 = (
-                    float(spaces.sum()) + primary_pack + secondary_pack
-                )
-                winding_minimum_length = (
-                    4.0 * projected_l1 + 2.0 * required_l2
-                )
+                required_l2 = float(spaces.sum()) + primary_pack + secondary_pack
+                winding_minimum_length = 4.0 * projected_l1 + 2.0 * required_l2
                 if winding_minimum_length > length_limit and secondary_gaps:
                     available_gap_budget = (
                         (length_limit - 4.0 * projected_l1) / 2.0
@@ -2312,86 +2250,70 @@ def create_current7_problem_class(
                         - primary_pack
                         - n2 * 0.3
                     )
-                    gap2 = np.clip(
-                        available_gap_budget / secondary_gaps, 0.3, gap2
-                    )
+                    gap2 = np.clip(available_gap_budget / secondary_gaps, 0.3, gap2)
                     secondary_pack = n2 * 0.3 + secondary_gaps * gap2
                     winding_minimum_length = 4.0 * projected_l1 + 2.0 * (
                         float(spaces.sum()) + primary_pack + secondary_pack
                     )
                 total_length = np.clip(
-                    np.ceil(max(
-                        total_length,
-                        minimum_length + 1.0,
-                        winding_minimum_length,
-                    )),
+                    np.ceil(
+                        max(
+                            total_length,
+                            minimum_length + 1.0,
+                            winding_minimum_length,
+                        )
+                    ),
                     500.0,
                     length_limit,
                 )
 
                 def secondary_packs(length: float) -> tuple[float, float]:
-                    decoded_l2 = (
-                        round(length) - 4.0 * projected_l1
-                    ) / 2.0
+                    decoded_l2 = (round(length) - 4.0 * projected_l1) / 2.0
                     winding_budget = decoded_l2 - float(spaces.sum())
                     available_secondary = winding_budget - primary_pack
-                    cw2 = (
-                        available_secondary - secondary_gaps * gap2
-                    ) / n2
+                    cw2 = (available_secondary - secondary_gaps * gap2) / n2
                     cw2 = round(cw2, 3)
                     main_turns = n2 - n2_side
-                    main_pack = (
-                        main_turns * cw2
-                        + max(main_turns - 1, 0) * gap2
-                    )
+                    main_pack = main_turns * cw2 + max(main_turns - 1, 0) * gap2
                     side_pack = (
-                        n2_side * cw2
-                        + max(n2_side - 1, 0) * gap2
-                        if n2_side else 0.0
+                        n2_side * cw2 + max(n2_side - 1, 0) * gap2 if n2_side else 0.0
                     )
                     return main_pack, side_pack
 
                 main_pack, side_pack = secondary_packs(total_length)
                 if n2_side:
-                    exterior_x = total_length + 2.0 * (
-                        float(spaces[3]) + side_pack
-                    )
+                    exterior_x = total_length + 2.0 * (float(spaces[3]) + side_pack)
                     if exterior_x > length_limit and gap2 > 0.3:
                         gap2 = 0.3
                         secondary_pack = n2 * 0.3 + secondary_gaps * gap2
                         winding_minimum_length = 4.0 * projected_l1 + 2.0 * (
-                            float(spaces.sum())
-                            + primary_pack
-                            + secondary_pack
+                            float(spaces.sum()) + primary_pack + secondary_pack
                         )
                         main_pack, side_pack = secondary_packs(total_length)
-                        exterior_x = total_length + 2.0 * (
-                            float(spaces[3]) + side_pack
-                        )
+                        exterior_x = total_length + 2.0 * (float(spaces[3]) + side_pack)
                     excess = max(0.0, exterior_x - length_limit)
                     if excess:
                         side_fraction = n2_side / n2
                         reduced = np.floor(
-                            total_length
-                            - excess / (1.0 + side_fraction)
-                            - 1.0
+                            total_length - excess / (1.0 + side_fraction) - 1.0
                         )
                         total_length = max(
-                            np.ceil(max(
-                                minimum_length + 1.0,
-                                winding_minimum_length,
-                            )),
+                            np.ceil(
+                                max(
+                                    minimum_length + 1.0,
+                                    winding_minimum_length,
+                                )
+                            ),
                             reduced,
                         )
                         main_pack, side_pack = secondary_packs(total_length)
 
-                slot = round(get("wcp_t"), 1) + 2.0 * (
-                    FIXED_COOLING_PADS_MM["wcp_pad_t"]
+                slot = (
+                    round(get("wcp_t"), 1) + 2.0 * (FIXED_COOLING_PADS_MM["wcp_pad_t"])
                 )
                 tx_y_gap_sum = 2.0 * slot + max(n1 - 3, 0) * gap1
                 primary_y_pack = (
-                    n1 * self.spec["primary_conductor_thickness_mm"]
-                    + tx_y_gap_sum
+                    n1 * self.spec["primary_conductor_thickness_mm"] + tx_y_gap_sum
                 )
                 center_y_allowance = 2.0 * (
                     get("cc_w2c_space_y")
@@ -2400,12 +2322,11 @@ def create_current7_problem_class(
                     + primary_y_pack
                 )
                 side_y_allowance = (
-                    2.0 * (get("cs_w1s_space_y") + side_pack)
-                    if n2_side else 0.0
+                    2.0 * (get("cs_w1s_space_y") + side_pack) if n2_side else 0.0
                 )
-                maximum_core_width = float(
-                    self.spec["size_W_max_mm"]
-                ) - max(center_y_allowance, side_y_allowance)
+                maximum_core_width = float(self.spec["size_W_max_mm"]) - max(
+                    center_y_allowance, side_y_allowance
+                )
                 put("w1", min(get("w1"), np.floor(maximum_core_width)))
                 put("total_length", total_length)
                 put("gap1", gap1)
@@ -2413,30 +2334,22 @@ def create_current7_problem_class(
 
                 h1 = round(get("total_height")) - 2.0 * projected_l1
                 if h1 > 0.0:
-                    wh2_limit = (
-                        1.0
-                        - 2.0 * self.spec["insulation_min_mm"] / h1
-                    )
+                    wh2_limit = 1.0 - 2.0 * self.spec["insulation_min_mm"] / h1
                     put("wh2", min(get("wh2"), wh2_limit))
 
             project_budget()
             rounded_w1 = round(get("w1"))
             n_min = max(
                 1,
-                int(np.ceil(
-                    (rounded_w1 - core_stack) / (d_max + core_stack)
-                )),
+                int(np.ceil((rounded_w1 - core_stack) / (d_max + core_stack))),
             )
             n_max = max(
                 n_min,
-                int(np.floor(
-                    (rounded_w1 - core_stack) / (d_min + core_stack)
-                )),
+                int(np.floor((rounded_w1 - core_stack) / (d_min + core_stack))),
             )
             target_group = int(np.clip(target_group, n_min, n_max))
             row[sobol_index["u_ngroup"]] = np.clip(
-                (target_group - n_min + 0.5)
-                / (n_max - n_min + 0.9999),
+                (target_group - n_min + 0.5) / (n_max - n_min + 0.9999),
                 0.0,
                 1.0,
             )
@@ -2459,9 +2372,7 @@ def create_current7_problem_class(
                 self.fixed_primary_turn_unit_coordinate
             )
             for _iteration in range(MAX_REPAIR_FIXED_POINT_ITERATIONS):
-                projected = np.vstack([
-                    self._project_row(row) for row in repaired
-                ])
+                projected = np.vstack([self._project_row(row) for row in repaired])
                 projected[:, self.fixed_primary_turn_coordinate_index] = (
                     self.fixed_primary_turn_unit_coordinate
                 )
@@ -2496,19 +2407,19 @@ def create_current7_problem_class(
                     decoded = decode_unit_sample_with_fixed_cw1(
                         input_parameter_module,
                         sample,
-                        fixed_cw1_mm=self.spec[
-                            "primary_conductor_thickness_mm"
-                        ],
+                        fixed_cw1_mm=self.spec["primary_conductor_thickness_mm"],
                         allow_space_shrink=False,
                         space_min=self.spec["insulation_min_mm"],
                     )
                     shrink[index] = decoded.pop("_space_shrink_needed", 0.0)
                     decoded.update(self.fixed_overrides)
-                    frame_input = input_parameter_module.create_input_parameter({
-                        key: decoded[key]
-                        for key in input_parameter_module.KEYS
-                        if key in decoded
-                    })
+                    frame_input = input_parameter_module.create_input_parameter(
+                        {
+                            key: decoded[key]
+                            for key in input_parameter_module.KEYS
+                            if key in decoded
+                        }
+                    )
                     ok, derived = input_parameter_module.validation_check(
                         frame_input, strict=False
                     )
@@ -2524,9 +2435,7 @@ def create_current7_problem_class(
             for index in np.flatnonzero(valid):
                 row = _frame_row(frame, int(index))
                 for name, expected in {
-                    "cw1": self.spec[
-                        "primary_conductor_thickness_mm"
-                    ],
+                    "cw1": self.spec["primary_conductor_thickness_mm"],
                     **FIXED_COOLING_PADS_MM,
                 }.items():
                     if not np.isclose(
@@ -2540,20 +2449,16 @@ def create_current7_problem_class(
                     _finite_number(_row_value(row, name), name)
                 budget = winding_budget_identity(
                     row,
-                    expected_cw1_mm=self.spec[
-                        "primary_conductor_thickness_mm"
-                    ],
+                    expected_cw1_mm=self.spec["primary_conductor_thickness_mm"],
                 )
                 if budget.get("passed") is not True:
                     raise RuntimeError(
                         "decoded winding budget identity failed: "
                         f"{budget.get('reason', 'numerical_mismatch')}"
                     )
-                observed_n1 = int(_finite_number(
-                    _row_value(row, "N1_main"), "N1_main"
-                )) + int(_finite_number(
-                    _row_value(row, "N1_side"), "N1_side"
-                ))
+                observed_n1 = int(
+                    _finite_number(_row_value(row, "N1_main"), "N1_main")
+                ) + int(_finite_number(_row_value(row, "N1_side"), "N1_side"))
                 if observed_n1 != self.fixed_primary_turns:
                     raise RuntimeError("decoded primary turns escaped fixed stratum")
             self._last_decode = (frame, np.asarray(shrink, dtype=float), valid)
@@ -2563,9 +2468,7 @@ def create_current7_problem_class(
             values = np.asarray(coordinates, dtype=float)
             if values.ndim == 1:
                 values = values.reshape(1, -1)
-            repaired = np.asarray(
-                self.repair_unit_coordinates(values), dtype=float
-            )
+            repaired = np.asarray(self.repair_unit_coordinates(values), dtype=float)
             frame, shrink, decoder_valid = self.decode_batch(repaired)
             insulation = minimum_physical_insulation_violation(
                 frame,
@@ -2585,10 +2488,9 @@ def create_current7_problem_class(
                     continue
                 row = frame.iloc[index]
                 try:
-                    groups[index] = (
-                        _finite_number(row["n_core_group"], "n_core_group")
-                        <= float(self.spec["n_core_group_max"])
-                    )
+                    groups[index] = _finite_number(
+                        row["n_core_group"], "n_core_group"
+                    ) <= float(self.spec["n_core_group_max"])
                     _volume, dimensions = bounding_box_lit(row)
                     boxes[index] = all(
                         _finite_number(observed, "box dimension") <= limit
@@ -2601,24 +2503,17 @@ def create_current7_problem_class(
                             ),
                         )
                     )
-                    flux[index] = (
-                        _finite_number(
-                            design_analytical_b_field_t(
-                                row,
-                                core_lamination_factor=self.spec[
-                                    "core_lamination_factor"
-                                ],
-                                area_basis=self.spec["B_area_basis"],
-                            ),
-                            "analytical B",
-                        )
-                        <= float(self.spec["B_limit_T"])
-                    )
+                    flux[index] = _finite_number(
+                        design_analytical_b_field_t(
+                            row,
+                            core_lamination_factor=self.spec["core_lamination_factor"],
+                            area_basis=self.spec["B_area_basis"],
+                        ),
+                        "analytical B",
+                    ) <= float(self.spec["B_limit_T"])
                     budget = winding_budget_identity(
                         row,
-                        expected_cw1_mm=self.spec[
-                            "primary_conductor_thickness_mm"
-                        ],
+                        expected_cw1_mm=self.spec["primary_conductor_thickness_mm"],
                     )
                     budget_evidence[index] = budget
                     budgets[index] = budget.get("passed") is True
@@ -2651,8 +2546,7 @@ def create_current7_problem_class(
             return {
                 "count": count,
                 "counts": {
-                    name: int(np.count_nonzero(mask))
-                    for name, mask in masks.items()
+                    name: int(np.count_nonzero(mask)) for name, mask in masks.items()
                 },
                 "joint_count": int(np.count_nonzero(joint)),
                 "unique_geometry_count": len(unique),
@@ -2714,10 +2608,12 @@ def create_current7_problem_class(
             gate_masks = audit["gate_masks"]
             if not set(STRUCTURAL_DONOR_REQUIRED_GATES) <= set(gate_masks):
                 raise RuntimeError("structural donor gate inventory drifted")
-            structural_mask = np.logical_and.reduce(tuple(
-                np.asarray(gate_masks[name], dtype=bool)
-                for name in STRUCTURAL_DONOR_REQUIRED_GATES
-            ))
+            structural_mask = np.logical_and.reduce(
+                tuple(
+                    np.asarray(gate_masks[name], dtype=bool)
+                    for name in STRUCTURAL_DONOR_REQUIRED_GATES
+                )
+            )
             repaired = audit["repaired_coordinates"]
             kept = []
             seen = set()
@@ -2737,9 +2633,7 @@ def create_current7_problem_class(
                     "mft-tier1-coordinate-only-structural-donor-filter-v1"
                 ),
                 "input_count": int(len(values)),
-                "structurally_accepted_count": int(
-                    np.count_nonzero(structural_mask)
-                ),
+                "structurally_accepted_count": int(np.count_nonzero(structural_mask)),
                 "decoded_unique_count": int(len(result)),
                 "structurally_rejected_count": int(
                     len(values) - np.count_nonzero(structural_mask)
@@ -2747,9 +2641,7 @@ def create_current7_problem_class(
                 "duplicate_geometry_count": int(
                     np.count_nonzero(structural_mask) - len(result)
                 ),
-                "required_gate_names": list(
-                    STRUCTURAL_DONOR_REQUIRED_GATES
-                ),
+                "required_gate_names": list(STRUCTURAL_DONOR_REQUIRED_GATES),
                 "required_gate_passed_counts": {
                     name: int(np.count_nonzero(gate_masks[name]))
                     for name in STRUCTURAL_DONOR_REQUIRED_GATES
@@ -2775,7 +2667,10 @@ def create_current7_problem_class(
 
         def _predict(self, target: str, frame: Any) -> tuple[Any, Any]:
             cache_key = (str(target), tuple(getattr(frame, "index", range(len(frame)))))
-            if self._prediction_cache is not None and cache_key in self._prediction_cache:
+            if (
+                self._prediction_cache is not None
+                and cache_key in self._prediction_cache
+            ):
                 return self._prediction_cache[cache_key]
             try:
                 mean, half_width = self.models[target].predict_mu_sigma(
@@ -2802,7 +2697,9 @@ def create_current7_problem_class(
                 self._prediction_cache[cache_key] = result
             return result
 
-        def _evaluate(self, values: Any, out: dict[str, Any], *args: Any, **kwargs: Any) -> None:
+        def _evaluate(
+            self, values: Any, out: dict[str, Any], *args: Any, **kwargs: Any
+        ) -> None:
             self._last_decode = None
             self._prediction_cache = {}
             try:
@@ -2817,15 +2714,19 @@ def create_current7_problem_class(
                     raise RuntimeError("current7 objective shape mismatch")
                 if constraints.shape != expected_shape:
                     raise RuntimeError("current7 constraint shape mismatch")
-                additive = constraints[:, len(BASE_CONSTRAINT_NAMES):]
+                additive = constraints[:, len(BASE_CONSTRAINT_NAMES) :]
                 if not np.all(additive == BIG):
-                    raise RuntimeError("current7 base wrote into additive hard constraints")
+                    raise RuntimeError(
+                        "current7 base wrote into additive hard constraints"
+                    )
 
                 indices = np.flatnonzero(valid)
                 if len(indices):
-                    sub = frame.iloc[indices] if hasattr(frame, "iloc") else [
-                        frame[int(index)] for index in indices
-                    ]
+                    sub = (
+                        frame.iloc[indices]
+                        if hasattr(frame, "iloc")
+                        else [frame[int(index)] for index in indices]
+                    )
                     side_index = self.constraint_index[
                         f"temperature_robust_limit:{SIDE_TEMPERATURE_TARGET}"
                     ]
@@ -2855,9 +2756,9 @@ def create_current7_problem_class(
                                 _row_value(row, "n_core_group"),
                                 "n_core_group",
                             )
-                            constraints[
-                                global_index, group_index
-                            ] = group_count - float(self.spec["n_core_group_max"])
+                            constraints[global_index, group_index] = (
+                                group_count - float(self.spec["n_core_group_max"])
+                            )
                         except RuntimeError:
                             constraints[global_index, group_index] = BIG
 
@@ -2881,19 +2782,22 @@ def create_current7_problem_class(
                                 ],
                             )
                             minimum = screen["f_res_min_tx_rx_only_Hz"]
-                            resonance_g = (
-                                _resonance_band_violations(
-                                    minimum,
-                                    self.stage_spec["resonance_min_Hz"],
-                                    self.stage_spec["resonance_max_Hz"],
-                                )
+                            resonance_g = _resonance_band_violations(
+                                minimum,
+                                self.stage_spec["resonance_min_Hz"],
+                                self.stage_spec["resonance_max_Hz"],
                             )
                             for resonance_name, violation in resonance_g.items():
                                 constraints[
                                     global_index,
                                     self.constraint_index[resonance_name],
                                 ] = violation
-                        except (RuntimeError, ValueError, OverflowError, ZeroDivisionError):
+                        except (
+                            RuntimeError,
+                            ValueError,
+                            OverflowError,
+                            ZeroDivisionError,
+                        ):
                             for resonance_name in (
                                 RESONANCE_MINIMUM_CONSTRAINT,
                                 RESONANCE_MAXIMUM_CONSTRAINT,
@@ -2923,7 +2827,13 @@ def create_current7_problem_class(
                                 constraints[
                                     global_index, self.constraint_index[name]
                                 ] = observed - float(limit)
-                        except (RuntimeError, KeyError, TypeError, ValueError, OverflowError):
+                        except (
+                            RuntimeError,
+                            KeyError,
+                            TypeError,
+                            ValueError,
+                            OverflowError,
+                        ):
                             for name in SIZE_CONSTRAINT_NAMES:
                                 constraints[
                                     global_index, self.constraint_index[name]
@@ -2957,9 +2867,9 @@ class Current7Modules:
 
 def _path_is_below(path: Path, root: Path) -> bool:
     try:
-        return os.path.commonpath(
-            [str(path.resolve()), str(root.resolve())]
-        ) == str(root.resolve())
+        return os.path.commonpath([str(path.resolve()), str(root.resolve())]) == str(
+            root.resolve()
+        )
     except (OSError, ValueError):
         return False
 
@@ -2989,20 +2899,11 @@ def load_current7_modules(code_root: Path) -> Current7Modules:
         "nsga2_problem": importlib.import_module("optimization.nsga2_problem"),
         "predictor": importlib.import_module("predictor"),
         "train_models": importlib.import_module("train_models"),
-        "geometry_metrics": importlib.import_module(
-            "optimization.geometry_metrics"
-        ),
-        "design_summary": importlib.import_module(
-            "optimization.design_summary"
-        ),
-        "input_parameter": importlib.import_module(
-            "module.input_parameter_260706"
-        ),
+        "geometry_metrics": importlib.import_module("optimization.geometry_metrics"),
+        "design_summary": importlib.import_module("optimization.design_summary"),
+        "input_parameter": importlib.import_module("module.input_parameter_260706"),
     }
-    paths = {
-        name: _module_path(module, root, name)
-        for name, module in modules.items()
-    }
+    paths = {name: _module_path(module, root, name) for name, module in modules.items()}
     run_nsga2 = modules["run_nsga2"]
     nsga2_problem = modules["nsga2_problem"]
     predictor = modules["predictor"]
@@ -3120,9 +3021,7 @@ def install_optimizer_scaling(
         if name.startswith("temperature_robust_limit:"):
             scales[name] = thermal_scale
     scale_vector = np.asarray([scales[name] for name in names], dtype=float)
-    allowance_vector = np.asarray(
-        [allowances[name] for name in names], dtype=float
-    )
+    allowance_vector = np.asarray([allowances[name] for name in names], dtype=float)
     if (
         not np.isfinite(scale_vector).all()
         or np.any(scale_vector <= 0.0)
@@ -3259,27 +3158,17 @@ def validate_warm_role_partition(
         or standard.get("ordinary_warm_sampling_allowed") is not True
         or len(str(standard.get("source_artifact_sha256") or "")) != 64
         or len(str(standard.get("source_contract_file_sha256") or "")) != 64
-        or not isinstance(
-            standard.get("source_hard_geometry_joint_count"), int
-        )
+        or not isinstance(standard.get("source_hard_geometry_joint_count"), int)
         or standard.get("source_hard_geometry_joint_count") < 1
         or basin.get("coordinate_donors_only") is not True
         or basin.get("protected_topology_slots_only") is not True
         or basin.get("ordinary_warm_sampling_allowed") is not False
-        or basin.get("required_gate_names")
-        != list(STRUCTURAL_DONOR_REQUIRED_GATES)
+        or basin.get("required_gate_names") != list(STRUCTURAL_DONOR_REQUIRED_GATES)
         or basin.get("optimizer_gate_names_not_used_for_donor_admission")
         != list(STRUCTURAL_DONOR_OPTIMIZER_GATES)
         or basin.get("required_topologies_N2_main")
-        != list(
-            deep_topology_contract(6)[
-                "turn_split_sub_islands_N2_main"
-            ]
-        )
-        or len(
-            str(basin.get("source_selection_contract_sha256") or "")
-        )
-        != 64
+        != list(deep_topology_contract(6)["turn_split_sub_islands_N2_main"])
+        or len(str(basin.get("source_selection_contract_sha256") or "")) != 64
         or value.get("maximum_combined_authenticated_fraction") != 0.5
         or value.get("minimum_fresh_random_fraction") != 0.5
         or value.get("physical_constraint_G_mutation") is not False
@@ -3287,16 +3176,11 @@ def validate_warm_role_partition(
         or value.get("terminal_physical_replay_required") is not True
     ):
         raise RuntimeError("warm role partition contract mismatch")
-    standard_values = values[
-        standard_start : standard_start + standard_count
-    ]
+    standard_values = values[standard_start : standard_start + standard_count]
     basin_values = values[basin_start : basin_start + basin_count]
-    if (
-        standard.get("coordinate_unit_sha256")
-        != canonical_sha256(standard_values.tolist())
-        or basin.get("coordinate_unit_sha256")
-        != canonical_sha256(basin_values.tolist())
-    ):
+    if standard.get("coordinate_unit_sha256") != canonical_sha256(
+        standard_values.tolist()
+    ) or basin.get("coordinate_unit_sha256") != canonical_sha256(basin_values.tolist()):
         raise RuntimeError("warm role partition coordinate identity mismatch")
     return value
 
@@ -3353,17 +3237,11 @@ def _terminal_inference_binding_contract(
         or set(family_threads) != set(families)
         or any(
             family_threads[family]
-            != (
-                1
-                if family in SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
-                else threads
-            )
+            != (1 if family in SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES else threads)
             for family in families
         )
         or semaphore_free_families
-        != sorted(
-            set(families) & SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
-        )
+        != sorted(set(families) & SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES)
         or binding.get("semaphore_free_sklearn_forest") is not True
         or policy != FAMILY_SPECIFIC_INFERENCE_POLICY
     ):
@@ -3440,9 +3318,7 @@ class Current7Tier1Runner:
         values = np.asarray(coordinates, dtype=float)
         if values.ndim != 2 or values.shape[1] != int(self.problem.n_var):
             raise RuntimeError(f"{stage} repair coordinate schema mismatch")
-        repaired = np.asarray(
-            self.problem.repair_unit_coordinates(values), dtype=float
-        )
+        repaired = np.asarray(self.problem.repair_unit_coordinates(values), dtype=float)
         repeated = np.asarray(
             self.problem.repair_unit_coordinates(repaired), dtype=float
         )
@@ -3463,9 +3339,7 @@ class Current7Tier1Runner:
             "fixed_point_idempotent": True,
             "fixed_primary_turns": self.problem.fixed_primary_turns,
             "fixed_primary_coordinate_verified": True,
-            "repaired_coordinate_sha256": canonical_sha256(
-                repaired.tolist()
-            ),
+            "repaired_coordinate_sha256": canonical_sha256(repaired.tolist()),
         }
         evidence["sha256"] = canonical_sha256(evidence)
         return repaired, evidence
@@ -3576,20 +3450,16 @@ class Current7Tier1Runner:
             standard_values = repaired[
                 standard_start : standard_start + int(standard["count"])
             ]
-            donor_values = repaired[
-                basin_start : basin_start + int(basin["count"])
-            ]
-        standard_warm, standard_filter = (
-            self.problem.filter_warm_start_coordinates(standard_values)
+            donor_values = repaired[basin_start : basin_start + int(basin["count"])]
+        standard_warm, standard_filter = self.problem.filter_warm_start_coordinates(
+            standard_values
         )
         if len(standard_warm) < 1:
             raise RuntimeError(
                 "authenticated standard warm role has no hard-feasible design"
             )
         donor_filter = None
-        structural_donors = np.empty(
-            (0, self.problem.n_var), dtype=float
-        )
+        structural_donors = np.empty((0, self.problem.n_var), dtype=float)
         topology_counts: dict[str, int] = {}
         if partition is not None:
             structural_donors, donor_filter = (
@@ -3599,9 +3469,7 @@ class Current7Tier1Runner:
                 raise RuntimeError(
                     "authenticated basin role has no structural coordinate donor"
                 )
-            topology_contract = deep_topology_contract(
-                self.problem.fixed_primary_turns
-            )
+            topology_contract = deep_topology_contract(self.problem.fixed_primary_turns)
             observed = _turn_split_main_values(
                 structural_donors,
                 fixed_primary_turns=self.problem.fixed_primary_turns,
@@ -3609,9 +3477,7 @@ class Current7Tier1Runner:
             )
             required = tuple(
                 int(item)
-                for item in topology_contract[
-                    "turn_split_sub_islands_N2_main"
-                ]
+                for item in topology_contract["turn_split_sub_islands_N2_main"]
             )
             topology_counts = {
                 str(topology): int(np.count_nonzero(observed == topology))
@@ -3665,9 +3531,7 @@ class Current7Tier1Runner:
         valid = np.asarray(out.get("decoder_valid"), dtype=bool)
         if (
             objectives.shape != (len(values), 2)
-            or constraints.shape != (
-                len(values), len(self.problem.constraint_names)
-            )
+            or constraints.shape != (len(values), len(self.problem.constraint_names))
             or valid.shape != (len(values),)
             or not np.isfinite(objectives).all()
             or not np.isfinite(constraints).all()
@@ -3743,9 +3607,7 @@ class Current7Tier1Runner:
 
         objectives = np.asarray(replay["F"], dtype=float)
         constraints = np.asarray(replay["G"], dtype=float)
-        deterministic_objectives = np.asarray(
-            deterministic_optimizer["F"], dtype=float
-        )
+        deterministic_objectives = np.asarray(deterministic_optimizer["F"], dtype=float)
         deterministic_constraints = np.asarray(
             deterministic_optimizer["G"], dtype=float
         )
@@ -3758,9 +3620,7 @@ class Current7Tier1Runner:
             optimizer_constraints = (constraints - allowances) / scales
 
         f_match = np.array_equal(objectives, deterministic_objectives)
-        g_match = np.array_equal(
-            optimizer_constraints, deterministic_constraints
-        )
+        g_match = np.array_equal(optimizer_constraints, deterministic_constraints)
         if not f_match or not g_match:
             raise RuntimeError(
                 "deterministic serial terminal replay differs from optimizer-side replay"
@@ -3810,12 +3670,9 @@ class Current7Tier1Runner:
                 )
             )
         )
-        snapshot_feasibility_match = (
-            expected_constraints is None
-            or np.array_equal(
-                expected_constraints <= 0.0,
-                optimizer_constraints <= 0.0,
-            )
+        snapshot_feasibility_match = expected_constraints is None or np.array_equal(
+            expected_constraints <= 0.0,
+            optimizer_constraints <= 0.0,
         )
 
         population_canonicalized = False
@@ -3834,17 +3691,21 @@ class Current7Tier1Runner:
             terminal_population.set("G", optimizer_constraints)
             terminal_population.set("CV", None)
             canonical_cv = np.asarray(terminal_population.get("CV"), dtype=float)
-            if not np.array_equal(
-                np.asarray(terminal_population.get("F"), dtype=float), objectives
-            ) or not np.array_equal(
-                np.asarray(terminal_population.get("G"), dtype=float),
-                optimizer_constraints,
-            ) or (
-                canonical_cv.shape != (len(repaired), 1)
-                or not np.isfinite(canonical_cv).all()
+            if (
+                not np.array_equal(
+                    np.asarray(terminal_population.get("F"), dtype=float), objectives
+                )
                 or not np.array_equal(
-                    np.asarray(terminal_population.get("CV"), dtype=float),
-                    canonical_cv,
+                    np.asarray(terminal_population.get("G"), dtype=float),
+                    optimizer_constraints,
+                )
+                or (
+                    canonical_cv.shape != (len(repaired), 1)
+                    or not np.isfinite(canonical_cv).all()
+                    or not np.array_equal(
+                        np.asarray(terminal_population.get("CV"), dtype=float),
+                        canonical_cv,
+                    )
                 )
             ):
                 raise RuntimeError(
@@ -3875,10 +3736,9 @@ class Current7Tier1Runner:
             budget_passed.append(
                 winding_budget_identity(
                     replay["frame"].iloc[index],
-                    expected_cw1_mm=self.problem.spec[
-                        "primary_conductor_thickness_mm"
-                    ],
-                ).get("passed") is True
+                    expected_cw1_mm=self.problem.spec["primary_conductor_thickness_mm"],
+                ).get("passed")
+                is True
             )
         if not all(budget_passed):
             raise RuntimeError("terminal winding-budget identity failed")
@@ -3901,9 +3761,7 @@ class Current7Tier1Runner:
             "optimizer_side_G_sha256": canonical_sha256(
                 deterministic_constraints.tolist()
             ),
-            "physical_replay_objective_sha256": canonical_sha256(
-                objectives.tolist()
-            ),
+            "physical_replay_objective_sha256": canonical_sha256(objectives.tolist()),
             "physical_replay_optimizer_G_sha256": canonical_sha256(
                 optimizer_constraints.tolist()
             ),
@@ -3944,9 +3802,7 @@ class Current7Tier1Runner:
             "canonical_constraint_violation_sha256": canonical_cv_sha256,
             "stale_constraint_violation_cache_cleared": population_canonicalized,
             "trajectory_rank_or_crowding_used_for_persistence": False,
-            "terminal_pareto_recomputed_from_canonical_F_G": (
-                population_canonicalized
-            ),
+            "terminal_pareto_recomputed_from_canonical_F_G": (population_canonicalized),
         }
         optimizer_snapshot["sha256"] = canonical_sha256(optimizer_snapshot)
         evidence = {
@@ -3954,12 +3810,8 @@ class Current7Tier1Runner:
             "coordinate_count": int(len(repaired)),
             "repair": repair_evidence,
             "objective_sha256": canonical_sha256(objectives.tolist()),
-            "physical_unscaled_G_sha256": canonical_sha256(
-                constraints.tolist()
-            ),
-            "optimizer_G_sha256": canonical_sha256(
-                optimizer_constraints.tolist()
-            ),
+            "physical_unscaled_G_sha256": canonical_sha256(constraints.tolist()),
+            "optimizer_G_sha256": canonical_sha256(optimizer_constraints.tolist()),
             "optimizer_objectives_match": bool(f_match),
             "optimizer_physical_G_match": bool(g_match),
             "comparison_basis": (
@@ -4113,16 +3965,12 @@ class Current7Tier1Runner:
                     "topology budget"
                 )
             donor_count = protected_count
-            standard_count = min(
-                len(warm), maximum_authenticated - donor_count
-            )
-            donor_selected, donor_selection_audit = (
-                select_basin_warm_start_indices(
-                    structural_donors,
-                    count=donor_count,
-                    contract=topology_contract,
-                    random_state=rng,
-                )
+            standard_count = min(len(warm), maximum_authenticated - donor_count)
+            donor_selected, donor_selection_audit = select_basin_warm_start_indices(
+                structural_donors,
+                count=donor_count,
+                contract=topology_contract,
+                random_state=rng,
             )
             standard_selected, standard_selection_audit = (
                 select_basin_warm_start_indices(
@@ -4137,14 +3985,18 @@ class Current7Tier1Runner:
                 or len(standard_selected) != standard_count
             ):
                 raise RuntimeError("authenticated warm role selection underfilled")
-            raw_initial = np.vstack([
-                structural_donors[donor_selected],
-                warm[standard_selected],
-                rng.random((
-                    population - donor_count - standard_count,
-                    self.problem.n_var,
-                )),
-            ])
+            raw_initial = np.vstack(
+                [
+                    structural_donors[donor_selected],
+                    warm[standard_selected],
+                    rng.random(
+                        (
+                            population - donor_count - standard_count,
+                            self.problem.n_var,
+                        )
+                    ),
+                ]
+            )
             warm_selection_audit = donor_selection_audit
         elif warm is not None and len(warm):
             standard_count = min(len(warm), population // 2)
@@ -4154,10 +4006,12 @@ class Current7Tier1Runner:
                 contract=topology_contract,
                 random_state=rng,
             )
-            raw_initial = np.vstack([
-                warm[selected],
-                rng.random((population - standard_count, self.problem.n_var)),
-            ])
+            raw_initial = np.vstack(
+                [
+                    warm[selected],
+                    rng.random((population - standard_count, self.problem.n_var)),
+                ]
+            )
             warm_selection_audit = standard_selection_audit
         else:
             raw_initial = rng.random((population, self.problem.n_var))
@@ -4167,9 +4021,7 @@ class Current7Tier1Runner:
             "policy_source": "optimization.run_nsga2.run_one",
             "population": population,
             "authenticated_warm_injected_count": int(authenticated_count),
-            "authenticated_standard_hard_feasible_warm_count": int(
-                standard_count
-            ),
+            "authenticated_standard_hard_feasible_warm_count": int(standard_count),
             "authenticated_structural_donor_count": int(donor_count),
             "fresh_random_count": int(population - authenticated_count),
             "maximum_warm_fraction": 0.5,
@@ -4188,13 +4040,10 @@ class Current7Tier1Runner:
         standard_before_topology_sha = None
         if donor_count:
             standard_before_topology_sha = canonical_sha256(
-                initial[
-                    donor_count : donor_count + standard_count
-                ].tolist()
+                initial[donor_count : donor_count + standard_count].tolist()
             )
-        repair_operator = (
-            self.prepared_repair_operator
-            or create_pymoo_physics_repair(self.problem)
+        repair_operator = self.prepared_repair_operator or create_pymoo_physics_repair(
+            self.problem
         )
         if niche_initialization_audit is not None:
             topology_initialization = niche_initialization_audit
@@ -4219,9 +4068,7 @@ class Current7Tier1Runner:
         role_partition_preservation = None
         if donor_count:
             standard_after_topology_sha = canonical_sha256(
-                initial[
-                    donor_count : donor_count + standard_count
-                ].tolist()
+                initial[donor_count : donor_count + standard_count].tolist()
             )
             if standard_after_topology_sha != standard_before_topology_sha:
                 raise RuntimeError(
@@ -4229,9 +4076,7 @@ class Current7Tier1Runner:
                 )
             role_partition_preservation = {
                 "standard_warm_rows_preserved_after_topology_seeding": True,
-                "standard_warm_coordinate_sha256": (
-                    standard_after_topology_sha
-                ),
+                "standard_warm_coordinate_sha256": (standard_after_topology_sha),
                 "standard_warm_count": int(standard_count),
                 "structural_donor_protected_slot_count": int(donor_count),
             }
@@ -4304,8 +4149,7 @@ class Current7Tier1Runner:
         executed = result.algorithm
         terminal_frame = replay["frame"]
         topologies = tuple(
-            int(value)
-            for value in topology_contract["turn_split_sub_islands_N2_main"]
+            int(value) for value in topology_contract["turn_split_sub_islands_N2_main"]
         )
         terminal_topology_counts = {
             str(topology): sum(
@@ -4315,9 +4159,7 @@ class Current7Tier1Runner:
             for topology in topologies
         }
         minimum_each = int(
-            topology_contract["survival"][
-                "minimum_survivors_per_turn_split_sub_island"
-            ]
+            topology_contract["survival"]["minimum_survivors_per_turn_split_sub_island"]
         )
         expected_terminal_quota = _topology_quota_for_population(
             topology_contract, population
@@ -4336,16 +4178,11 @@ class Current7Tier1Runner:
         )
         lane_topologies = _basin_lane_topologies(topology_contract)
         terminal_lane_counts = {
-            name: sum(
-                terminal_topology_counts[str(topology)]
-                for topology in values
-            )
+            name: sum(terminal_topology_counts[str(topology)] for topology in values)
             for name, values in lane_topologies.items()
         }
         operator_audit = {
-            "paired_selection_calls": int(
-                executed.mating.selection.selection_calls
-            ),
+            "paired_selection_calls": int(executed.mating.selection.selection_calls),
             "paired_parent_pairs_emitted": int(
                 executed.mating.selection.parent_pairs_emitted
             ),
@@ -4374,9 +4211,7 @@ class Current7Tier1Runner:
             "migration_events": int(executed.mating.migration_events),
             "migrants_created": int(executed.mating.migrants_created),
             "survival_calls": int(executed.survival.survival_calls),
-            "last_optimizer_epsilon": float(
-                executed.survival.last_epsilon
-            ),
+            "last_optimizer_epsilon": float(executed.survival.last_epsilon),
             "minimum_topology_count_observed": int(
                 executed.survival.minimum_topology_count_observed
             ),
@@ -4394,14 +4229,16 @@ class Current7Tier1Runner:
                 for record in executed.survival.generation_topology_counts
             ]),
         }
-        expected_last_epsilon = float(
-            topology_contract["survival"]["initial_epsilon"]
-        ) * max(
-            0.0,
-            1.0
-            - max(0, max_generations - 1)
-            / int(topology_contract["survival"]["decay_to_zero_generation"]),
-        ) ** 2
+        expected_last_epsilon = (
+            float(topology_contract["survival"]["initial_epsilon"])
+            * max(
+                0.0,
+                1.0
+                - max(0, max_generations - 1)
+                / int(topology_contract["survival"]["decay_to_zero_generation"]),
+            )
+            ** 2
+        )
         if (
             operator_audit["paired_selection_calls"] < 1
             or operator_audit["paired_parent_pairs_emitted"] < 1
@@ -4577,16 +4414,187 @@ def bind_surrogate_inference(
 ) -> dict[str, Any]:
     """Bind safe per-family threads up to the eight-CPU lane limit."""
 
-    if isinstance(threads, bool) or int(threads) != threads or not 1 <= int(threads) <= 8:
+    if (
+        isinstance(threads, bool)
+        or int(threads) != threads
+        or not 1 <= int(threads) <= 8
+    ):
         raise ValueError("inference threads must be an integer from 1 through 8")
     threads = int(threads)
-    binding = run_nsga2_module._bound_surrogate_inference(
-        models, threads=threads
-    )
+    binding = run_nsga2_module._bound_surrogate_inference(models, threads=threads)
     managed, bound_threads = _terminal_inference_binding_contract(binding)
     if not managed or bound_threads != threads:
         raise RuntimeError("family-specific inference binding attestation failed")
     return binding
+
+
+def attest_semlock_free_repeated_predict(
+    models: Mapping[str, Any],
+    frame: Any,
+    *,
+    repeats: int = REPEATED_PREDICT_STRESS_REPEATS,
+    parallel_backends_module: Any | None = None,
+) -> dict[str, Any]:
+    """Fail if repeated sklearn prediction constructs ThreadPool/SemLock.
+
+    The live ENOSPC trace was not a filesystem-TMP exhaustion: joblib's
+    ``ThreadingBackend`` created a new ``multiprocessing.pool.ThreadPool`` and
+    ``SimpleQueue``/``SemLock`` for repeated forest predictions.  Binding
+    sklearn forests to ``n_jobs=1`` avoids that path.  This runtime attestation
+    exercises every loaded target repeatedly while both primitive constructors
+    are fail-fast, so Phase-B cannot amplify an unverified inference path.
+    """
+
+    import _multiprocessing
+    import importlib
+    from unittest import mock
+
+    import numpy as np
+
+    if parallel_backends_module is None:
+        try:
+            parallel_backends_module = importlib.import_module(
+                "joblib._parallel_backends"
+            )
+        except ImportError:  # compact unit/smoke environments
+            parallel_backends_module = importlib.import_module("multiprocessing.pool")
+
+    if (
+        isinstance(repeats, bool)
+        or not isinstance(repeats, int)
+        or repeats < 2
+        or len(frame) < 1
+        or tuple(models) != CURRENT_REQUIRED_MODEL_TARGETS
+    ):
+        raise RuntimeError("repeated-predict SemLock stress input is invalid")
+    forest_count = 0
+    for target, predictor in models.items():
+        bundle = getattr(predictor, "bundle", None)
+        members = bundle.get("models") if isinstance(bundle, Mapping) else None
+        if not isinstance(members, list) or not members:
+            raise RuntimeError(f"surrogate model inventory is unavailable: {target}")
+        for family, fitted in members:
+            if str(family).lower() not in SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES:
+                continue
+            forest_count += 1
+            if (
+                not hasattr(fitted, "n_jobs")
+                or isinstance(fitted.n_jobs, bool)
+                or int(fitted.n_jobs) != 1
+            ):
+                raise RuntimeError(
+                    f"sklearn forest is not semaphore-free before stress: {target}"
+                )
+    if forest_count < len(CURRENT_REQUIRED_MODEL_TARGETS):
+        raise RuntimeError("repeated-predict stress did not cover every target forest")
+
+    attempts = {"joblib_thread_pool": 0, "multiprocessing_semlock": 0}
+
+    def forbidden_thread_pool(*_args: Any, **_kwargs: Any) -> Any:
+        attempts["joblib_thread_pool"] += 1
+        raise RuntimeError("joblib ThreadPool construction is forbidden")
+
+    def forbidden_semlock(*_args: Any, **_kwargs: Any) -> Any:
+        attempts["multiprocessing_semlock"] += 1
+        raise RuntimeError("multiprocessing SemLock construction is forbidden")
+
+    output_hashes: list[str] = []
+    sample = frame.iloc[:1] if hasattr(frame, "iloc") else frame[:1]
+    with (
+        mock.patch.object(
+            parallel_backends_module,
+            "ThreadPool",
+            side_effect=forbidden_thread_pool,
+        ),
+        mock.patch.object(_multiprocessing, "SemLock", side_effect=forbidden_semlock),
+    ):
+        for _repeat in range(repeats):
+            for target in CURRENT_REQUIRED_MODEL_TARGETS:
+                mean, half_width = models[target].predict_mu_sigma(
+                    sample, conformal=True
+                )
+                mean = np.asarray(mean, dtype=float).reshape(-1)
+                half_width = np.asarray(half_width, dtype=float).reshape(-1)
+                if (
+                    len(mean) != 1
+                    or len(half_width) != 1
+                    or not np.isfinite(mean).all()
+                    or not np.isfinite(half_width).all()
+                ):
+                    raise RuntimeError(
+                        f"repeated-predict stress output is invalid: {target}"
+                    )
+                output_hashes.append(
+                    canonical_sha256(
+                        {
+                            "target": target,
+                            "mean": mean.tolist(),
+                            "half_width": half_width.tolist(),
+                        }
+                    )
+                )
+    if attempts != {"joblib_thread_pool": 0, "multiprocessing_semlock": 0}:
+        raise RuntimeError("parallel primitive was constructed during stress")
+    per_repeat = len(CURRENT_REQUIRED_MODEL_TARGETS)
+    first = output_hashes[:per_repeat]
+    if any(
+        output_hashes[offset : offset + per_repeat] != first
+        for offset in range(0, len(output_hashes), per_repeat)
+    ):
+        raise RuntimeError("repeated-predict stress was not deterministic")
+    unsigned = {
+        "schema_version": REPEATED_PREDICT_STRESS_SCHEMA,
+        "status": "passed",
+        "repeats": repeats,
+        "sample_rows": 1,
+        "target_count": len(CURRENT_REQUIRED_MODEL_TARGETS),
+        "predict_call_count": repeats * len(CURRENT_REQUIRED_MODEL_TARGETS),
+        "covered_sklearn_forest_count": forest_count,
+        "joblib_thread_pool_construction_attempt_count": 0,
+        "multiprocessing_semlock_construction_attempt_count": 0,
+        "sklearn_forest_n_jobs": 1,
+        "output_identity_sha256": canonical_sha256({"per_target_output_sha256": first}),
+        "tmp_isolation_claimed_as_fix": False,
+        "direct_enospc_cause": "joblib-threadpool-simplequeue-semlock-churn",
+    }
+    return {**unsigned, "sha256": canonical_sha256(unsigned)}
+
+
+def phase_b_semlock_safe_release_identity(
+    *, code_root: Path, manifest: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Bind Phase-B preflight to the reviewed 6ea SemLock-safe helper bytes."""
+
+    marker = os.environ.get(PHASE_B_CHILD_PROTOCOL_ENV)
+    if marker is None:
+        return None
+    if marker != PHASE_B_CHILD_PROTOCOL:
+        raise RuntimeError("Phase-B child protocol marker is invalid")
+    helper = _contained_input(
+        code_root,
+        code_root / SEMLOCK_SAFE_HELPER_RELATIVE,
+        "SemLock-safe inference helper",
+    )
+    inventory_key = f"artifacts/code/{SEMLOCK_SAFE_HELPER_RELATIVE}"
+    inventory_record = (manifest.get("code_inventory") or {}).get(inventory_key)
+    if (
+        not helper.is_file()
+        or sha256_file(helper) != SEMLOCK_SAFE_HELPER_SHA256
+        or not isinstance(inventory_record, Mapping)
+        or inventory_record.get("sha256") != SEMLOCK_SAFE_HELPER_SHA256
+        or inventory_record.get("size") != helper.stat().st_size
+    ):
+        raise RuntimeError("Phase-B SemLock-safe 6ea helper identity mismatch")
+    value = {
+        "required_release_commit": SEMLOCK_SAFE_RELEASE_COMMIT,
+        "smoke_schema": SEMLOCK_SAFE_SMOKE_SCHEMA,
+        "helper_relative_path": SEMLOCK_SAFE_HELPER_RELATIVE,
+        "helper_sha256": SEMLOCK_SAFE_HELPER_SHA256,
+        "semaphore_free_sklearn_families": ["extratrees", "randomforest"],
+        "helper_code_inventory_authenticated": True,
+        "tmp_isolation_claimed_as_enospc_fix": False,
+    }
+    return {**value, "sha256": canonical_sha256(value)}
 
 
 def build_authenticated_runner(
@@ -4602,7 +4610,10 @@ def build_authenticated_runner(
 ) -> Current7Tier1Runner:
     """Authenticate, load exactly once, and construct the smoke-only runner."""
 
-    if isinstance(inference_threads, bool) or int(inference_threads) != inference_threads:
+    if (
+        isinstance(inference_threads, bool)
+        or int(inference_threads) != inference_threads
+    ):
         raise ValueError("inference_threads must be an integer")
     inference_threads = int(inference_threads)
     if not 1 <= inference_threads <= 8:
@@ -4645,9 +4656,7 @@ def build_authenticated_runner(
         sobol_dims=modules.input_parameter._SOBOL_DIMS,
         bounding_box_lit=modules.geometry_metrics.bounding_box_lit,
         input_parameter_module=modules.input_parameter,
-        design_analytical_b_field_t=(
-            modules.nsga2_problem.design_analytical_b_field_t
-        ),
+        design_analytical_b_field_t=(modules.nsga2_problem.design_analytical_b_field_t),
     )
     problem = problem_class(
         models,
@@ -4656,9 +4665,7 @@ def build_authenticated_runner(
         fixed_primary_turns=fixed_primary_turns,
     )
     if (
-        tuple(problem.constraint_names) != stage_constraint_names(
-            problem.stage_spec
-        )
+        tuple(problem.constraint_names) != stage_constraint_names(problem.stage_spec)
         or int(problem.n_ieq_constr) != len(problem.constraint_names)
         or problem.offspring_physics_repair is not True
         or problem.launch_eligible is not True
@@ -4730,8 +4737,7 @@ def _authenticate_relocated_code_inventory(
     if (
         not isinstance(inventory, Mapping)
         or not inventory
-        or manifest.get("code_inventory_sha256")
-        != canonical_sha256(inventory)
+        or manifest.get("code_inventory_sha256") != canonical_sha256(inventory)
     ):
         raise RuntimeError("bundle code inventory identity mismatch")
     files = manifest.get("files") or {}
@@ -4801,9 +4807,7 @@ def authenticate_relocated_bundle_generation(
         raise RuntimeError("bundle manifest canonical identity mismatch")
     code_authentication = _authenticate_relocated_code_inventory(root, manifest)
     relocation_path = _contained_input(root, relocation_path, "relocation map")
-    receipt_path = _contained_input(
-        root, adapter_receipt_path, "adapter receipt"
-    )
+    receipt_path = _contained_input(root, adapter_receipt_path, "adapter receipt")
     registry = _contained_input(root, registry, "relocated registry")
     generation = _contained_input(root, generation, "relocated generation")
     dataset = _contained_input(root, dataset, "relocated dataset")
@@ -4839,8 +4843,7 @@ def authenticate_relocated_bundle_generation(
     if (
         manifest.get("relocation", {}).get("contract_sha256")
         != canonical_sha256(relocation)
-        or manifest.get("relocation", {}).get("sha256")
-        != sha256_file(relocation_path)
+        or manifest.get("relocation", {}).get("sha256") != sha256_file(relocation_path)
         or manifest.get("adapter_receipt", {}).get("file_sha256")
         != sha256_file(receipt_path)
     ):
@@ -4865,8 +4868,7 @@ def authenticate_relocated_bundle_generation(
         != (adapter_evidence.get("candidate") or {}).get("sha256")
         or sha256_file(quality_path)
         != (adapter_evidence.get("quality_status") or {}).get("sha256")
-        or sha256_file(dataset)
-        != (adapter_evidence.get("dataset") or {}).get("sha256")
+        or sha256_file(dataset) != (adapter_evidence.get("dataset") or {}).get("sha256")
         or training_profile_sha256(read_json(profile))
         != (adapter_evidence.get("profile") or {}).get("canonical_sha256")
         or set(generation_inventory) != set(report.get("artifacts") or {})
@@ -4881,36 +4883,38 @@ def authenticate_relocated_bundle_generation(
         if record.get("sha256") != expected_sha:
             raise RuntimeError(f"relocated generation inventory mismatch: {relative}")
     evidence = dict(adapter_evidence)
-    evidence.update({
-        "generation": str(generation),
-        "registry": str(registry),
-        "generation_relative": generation.relative_to(registry).as_posix(),
-        "train_report": {
-            "path": str(report_path),
-            "sha256": sha256_file(report_path),
-        },
-        "candidate": {
-            "path": str(candidate_path),
-            "sha256": sha256_file(candidate_path),
-        },
-        "quality_status": {
-            **dict(adapter_evidence["quality_status"]),
-            "path": str(quality_path),
-        },
-        "dataset": {
-            **dict(adapter_evidence["dataset"]),
-            "path": str(dataset),
-        },
-        "profile": {
-            **dict(adapter_evidence["profile"]),
-            "path": str(profile),
-        },
-        "relocation_contract_sha256": canonical_sha256(relocation),
-        "generation_artifact_inventory_sha256": canonical_sha256(
-            generation_inventory
-        ),
-        "relocated_code_authentication": code_authentication,
-    })
+    evidence.update(
+        {
+            "generation": str(generation),
+            "registry": str(registry),
+            "generation_relative": generation.relative_to(registry).as_posix(),
+            "train_report": {
+                "path": str(report_path),
+                "sha256": sha256_file(report_path),
+            },
+            "candidate": {
+                "path": str(candidate_path),
+                "sha256": sha256_file(candidate_path),
+            },
+            "quality_status": {
+                **dict(adapter_evidence["quality_status"]),
+                "path": str(quality_path),
+            },
+            "dataset": {
+                **dict(adapter_evidence["dataset"]),
+                "path": str(dataset),
+            },
+            "profile": {
+                **dict(adapter_evidence["profile"]),
+                "path": str(profile),
+            },
+            "relocation_contract_sha256": canonical_sha256(relocation),
+            "generation_artifact_inventory_sha256": canonical_sha256(
+                generation_inventory
+            ),
+            "relocated_code_authentication": code_authentication,
+        }
+    )
     authenticated = AuthenticatedCorrectedGeneration(
         generation=generation,
         registry=registry,
@@ -4963,9 +4967,7 @@ def build_relocated_authenticated_runner(
         sobol_dims=modules.input_parameter._SOBOL_DIMS,
         bounding_box_lit=modules.geometry_metrics.bounding_box_lit,
         input_parameter_module=modules.input_parameter,
-        design_analytical_b_field_t=(
-            modules.nsga2_problem.design_analytical_b_field_t
-        ),
+        design_analytical_b_field_t=(modules.nsga2_problem.design_analytical_b_field_t),
     )
     problem = problem_class(
         models,
@@ -4989,13 +4991,16 @@ def build_relocated_authenticated_runner(
 
 
 def _atomic_json(path: Path, value: Any) -> None:
-    payload = json.dumps(
-        value,
-        indent=1,
-        sort_keys=True,
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8") + b"\n"
+    payload = (
+        json.dumps(
+            value,
+            indent=1,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
     descriptor, staged_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -5141,12 +5146,8 @@ def authenticate_warm_handoff(
     if validated_niche_partition is not None and validated_role_partition is not None:
         raise RuntimeError("warm handoff cannot mix legacy and topology niche roles")
     if validated_role_partition is not None:
-        standard_role = validated_role_partition[
-            "standard_hard_feasible_candidates"
-        ]
-        basin_role = validated_role_partition[
-            "basin_structural_coordinate_donors"
-        ]
+        standard_role = validated_role_partition["standard_hard_feasible_candidates"]
+        basin_role = validated_role_partition["basin_structural_coordinate_donors"]
         basin_selection = contract.get("basin_aware_selection") or {}
         standard_source = contract.get("standard_warm_source") or {}
         unsigned_standard_source = dict(standard_source)
@@ -5159,9 +5160,7 @@ def authenticate_warm_handoff(
             != (standard_source.get("contract") or {}).get("file_sha256")
             or standard_role.get("source_hard_geometry_joint_count")
             != standard_source.get("hard_geometry_joint_count")
-            or standard_source.get(
-                "remote_current_problem_hard_filter_required"
-            )
+            or standard_source.get("remote_current_problem_hard_filter_required")
             is not True
             or basin_role.get("source_selection_contract_sha256")
             != basin_selection.get("sha256")
@@ -5173,10 +5172,7 @@ def authenticate_warm_handoff(
             expected_contract_file_sha256 is not None
             and contract_file_sha != str(expected_contract_file_sha256).lower()
         )
-        or (
-            recorded_sha is not None
-            and recorded_sha != canonical_sha256(unsigned)
-        )
+        or (recorded_sha is not None and recorded_sha != canonical_sha256(unsigned))
         or contract.get("fixed_primary_turns") != int(fixed_primary_turns)
         or warm_record.get("shape") != list(values.shape)
         or not (
@@ -5186,10 +5182,7 @@ def authenticate_warm_handoff(
             or (
                 int(fixed_primary_turns) == 6
                 and warm_record.get("coordinate_contract")
-                == (
-                    "authenticated_n1_6_decoded_to_unit_then_"
-                    "current_repair_v1"
-                )
+                == ("authenticated_n1_6_decoded_to_unit_then_current_repair_v1")
             )
         )
         or contract.get(
@@ -5230,7 +5223,9 @@ def load_smoke_coordinate(
 
     coordinate_path = path.resolve(strict=True)
     expected = str(expected_sha256 or "").strip().lower()
-    if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+    if len(expected) != 64 or any(
+        character not in "0123456789abcdef" for character in expected
+    ):
         raise RuntimeError("smoke coordinate expected SHA-256 is invalid")
     actual = sha256_file(coordinate_path)
     if actual != expected:
@@ -5442,9 +5437,7 @@ def _terminal_model_predictions(
     predictions: dict[str, dict[str, Any]] = {}
     for target in CURRENT_REQUIRED_MODEL_TARGETS:
         try:
-            mean, half_width = models[target].predict_mu_sigma(
-                frame, conformal=True
-            )
+            mean, half_width = models[target].predict_mu_sigma(frame, conformal=True)
         except TypeError as exc:
             raise RuntimeError(
                 f"terminal model does not accept conformal=True: {target}"
@@ -5530,9 +5523,11 @@ def _terminal_surrogate_physicality_gate(
     count = int(population_size)
     if count < 0:
         raise RuntimeError("terminal surrogate gate population is invalid")
-    required = set(TERMINAL_NONNEGATIVE_SURROGATE_TARGETS) | set(
-        TERMINAL_POSITIVE_SURROGATE_TARGETS
-    ) | {"k"}
+    required = (
+        set(TERMINAL_NONNEGATIVE_SURROGATE_TARGETS)
+        | set(TERMINAL_POSITIVE_SURROGATE_TARGETS)
+        | {"k"}
+    )
     if not required.issubset(predictions):
         raise RuntimeError("terminal surrogate gate target inventory is incomplete")
 
@@ -5551,12 +5546,14 @@ def _terminal_surrogate_physicality_gate(
         valid[failed] = False
         for raw_index in np.flatnonzero(failed):
             index = int(raw_index)
-            violations.append({
-                "population_index": index,
-                "target": target,
-                "rule": rule,
-                "predicted_mean": float(values[index]),
-            })
+            violations.append(
+                {
+                    "population_index": index,
+                    "target": target,
+                    "rule": rule,
+                    "predicted_mean": float(values[index]),
+                }
+            )
 
     for target in TERMINAL_NONNEGATIVE_SURROGATE_TARGETS:
         inspect(target, "finite_and_nonnegative", lambda values: values >= 0.0)
@@ -5639,8 +5636,7 @@ def _candidate_records(
     violations = physicality.get("violations")
     if (
         physicality_sha != canonical_sha256(physicality)
-        or physicality.get("schema_version")
-        != TERMINAL_SURROGATE_PHYSICALITY_SCHEMA
+        or physicality.get("schema_version") != TERMINAL_SURROGATE_PHYSICALITY_SCHEMA
         or physicality.get("population_size") != len(x)
         or not isinstance(invalid_indices, list)
         or not isinstance(violations, list)
@@ -5670,9 +5666,7 @@ def _candidate_records(
             for target in CURRENT_REQUIRED_MODEL_TARGETS
         }
         half_widths = {
-            target: float(
-                predictions[target]["q90_conformal_half_width"][index]
-            )
+            target: float(predictions[target]["q90_conformal_half_width"][index])
             for target in CURRENT_REQUIRED_MODEL_TARGETS
         }
         aggregate_loss = sum(
@@ -5705,18 +5699,13 @@ def _candidate_records(
         }
         physicality_gate["sha256"] = canonical_sha256(physicality_gate)
         if candidate_violations:
-            volume_l, dimensions = runner.modules.geometry_metrics.bounding_box_lit(
-                row
-            )
+            volume_l, dimensions = runner.modules.geometry_metrics.bounding_box_lit(row)
             width_mm, length_mm, height_mm = (
-                _finite_number(value, "exterior dimension")
-                for value in dimensions
+                _finite_number(value, "exterior dimension") for value in dimensions
             )
             record = {
                 "candidate_id": f"terminal-{index:04d}",
-                "candidate_record_status": (
-                    "quarantined_nonphysical_surrogate_output"
-                ),
+                "candidate_record_status": ("quarantined_nonphysical_surrogate_output"),
                 "terminal_population_index": index,
                 "coordinate_unit": x[index].tolist(),
                 "size_W_mm": width_mm,
@@ -5757,18 +5746,12 @@ def _candidate_records(
             means,
             aggregate_loss,
             leakage_target_uH=runner.problem.spec["Llt_target_uH"],
-            core_lamination_factor=runner.problem.spec[
-                "core_lamination_factor"
-            ],
+            core_lamination_factor=runner.problem.spec["core_lamination_factor"],
             B_area_basis=runner.problem.spec["B_area_basis"],
         )
         width_mm = _finite_number(design_report["size_W_mm"], "exterior width")
-        length_mm = _finite_number(
-            design_report["size_L_mm"], "exterior length"
-        )
-        height_mm = _finite_number(
-            design_report["size_H_mm"], "exterior height"
-        )
+        length_mm = _finite_number(design_report["size_L_mm"], "exterior length")
+        height_mm = _finite_number(design_report["size_H_mm"], "exterior height")
         volume_l = _finite_number(design_report["volume_L"], "volume")
         analytical_b = _finite_number(
             design_report["B_design_analytic_T"], "analytical B"
@@ -5805,9 +5788,7 @@ def _candidate_records(
             }
             for target in CURRENT_TEMPERATURE_TARGETS
         }
-        n2_side = int(
-            _finite_number(_row_value(row, "N2_side"), "N2_side")
-        )
+        n2_side = int(_finite_number(_row_value(row, "N2_side"), "N2_side"))
         active_temperature_targets = [
             target
             for target in CURRENT_TEMPERATURE_TARGETS
@@ -5817,14 +5798,11 @@ def _candidate_records(
             means[target] for target in active_temperature_targets
         )
         maximum_robust_temperature = max(
-            means[target] + half_widths[target]
-            for target in active_temperature_targets
+            means[target] + half_widths[target] for target in active_temperature_targets
         )
         budget = winding_budget_identity(
             row,
-            expected_cw1_mm=runner.problem.spec[
-                "primary_conductor_thickness_mm"
-            ],
+            expected_cw1_mm=runner.problem.spec["primary_conductor_thickness_mm"],
         )
         if budget.get("passed") is not True:
             raise RuntimeError("harvest winding-budget identity failed")
@@ -5857,22 +5835,14 @@ def _candidate_records(
             "q90_B_mean_core_half_width_T": half_widths["B_mean_core"],
             "analytical_B_T": analytical_b,
             "B_design_analytic_T": analytical_b,
-            "minimum_realized_insulation_mm": (
-                _minimum_realized_insulation_mm(row)
-            ),
+            "minimum_realized_insulation_mm": (_minimum_realized_insulation_mm(row)),
             "pred_C_tx_tx_F": means["C_tx_tx_F"],
             "pred_C_rx_rx_F": means["C_rx_rx_F"],
             "pred_C_tx_rx_F": means["C_tx_rx_F"],
             **resonance,
-            "pred_f_res_tx_screen_Hz": resonance[
-                "f_res_tx_half_magnetizing_Hz"
-            ],
-            "pred_f_res_rx_screen_Hz": resonance[
-                "f_res_rx_half_magnetizing_Hz"
-            ],
-            "pred_f_res_min_screen_Hz": resonance[
-                "f_res_min_tx_rx_only_Hz"
-            ],
+            "pred_f_res_tx_screen_Hz": resonance["f_res_tx_half_magnetizing_Hz"],
+            "pred_f_res_rx_screen_Hz": resonance["f_res_rx_half_magnetizing_Hz"],
+            "pred_f_res_min_screen_Hz": resonance["f_res_min_tx_rx_only_Hz"],
             "pred_f_res_interwinding_screen_Hz": cross_frequency,
             "pred_max_temperature_C": maximum_temperature,
             "pred_max_robust_temperature_C": maximum_robust_temperature,
@@ -5886,9 +5856,7 @@ def _candidate_records(
                 for target in CURRENT_TEMPERATURE_TARGETS
             },
             **{
-                f"robust_{target}_upper_C": (
-                    means[target] + half_widths[target]
-                )
+                f"robust_{target}_upper_C": (means[target] + half_widths[target])
                 for target in CURRENT_TEMPERATURE_TARGETS
             },
             "N1_main": int(_finite_number(_row_value(row, "N1_main"), "N1_main")),
@@ -5900,9 +5868,7 @@ def _candidate_records(
             ),
             "cw1_mm": _finite_number(_row_value(row, "cw1"), "cw1"),
             "temperature_predictions": temperature_predictions,
-            "active_temperature_targets_for_maximum": (
-                active_temperature_targets
-            ),
+            "active_temperature_targets_for_maximum": (active_temperature_targets),
             "surrogate_mean_predictions": means,
             "surrogate_q90_conformal_half_widths": half_widths,
             "decoded_params": decoded,
@@ -5924,7 +5890,9 @@ def _candidate_records(
     return records
 
 
-def _candidate_csv_frame(records: list[dict[str, Any]], *, template: dict[str, Any]) -> Any:
+def _candidate_csv_frame(
+    records: list[dict[str, Any]], *, template: dict[str, Any]
+) -> Any:
     import pandas as pd
 
     rows = []
@@ -6027,22 +5995,18 @@ def persist_search_outputs(
     ):
         raise RuntimeError("terminal persistence arrays are invalid")
     predictions = replay.get("terminal_model_predictions")
-    serial_predictions = replay.get(
-        "terminal_model_predictions_serially_replayed"
-    )
+    serial_predictions = replay.get("terminal_model_predictions_serially_replayed")
     if serial_predictions is True:
         replay_objectives = np.asarray(replay.get("F"), dtype=float)
         replay_optimizer_g = np.asarray(replay.get("optimizer_G"), dtype=float)
-        if not np.array_equal(
-            terminal_f, replay_objectives
-        ) or not np.array_equal(optimizer_g, replay_optimizer_g):
+        if not np.array_equal(terminal_f, replay_objectives) or not np.array_equal(
+            optimizer_g, replay_optimizer_g
+        ):
             raise RuntimeError(
                 "terminal population differs from deterministic replay authority"
             )
         if predictions is None:
-            raise RuntimeError(
-                "deterministic terminal prediction snapshot is missing"
-            )
+            raise RuntimeError("deterministic terminal prediction snapshot is missing")
         prediction_payload = _canonical_terminal_prediction_payload(
             predictions,
             population_size=len(terminal_x),
@@ -6054,9 +6018,7 @@ def persist_search_outputs(
                 "deterministic terminal prediction snapshot SHA mismatch"
             )
     elif serial_predictions is False:
-        raise RuntimeError(
-            "canonical terminal replay omitted serial model predictions"
-        )
+        raise RuntimeError("canonical terminal replay omitted serial model predictions")
     elif predictions is None:
         predictions = _terminal_model_predictions(runner.models, frame)
     surrogate_physical_valid, surrogate_physicality = (
@@ -6065,9 +6027,7 @@ def persist_search_outputs(
             population_size=len(terminal_x),
         )
     )
-    physical_constraint_feasible = decoder_valid & np.all(
-        physical_g <= 0.0, axis=1
-    )
+    physical_constraint_feasible = decoder_valid & np.all(physical_g <= 0.0, axis=1)
     physical_feasible = physical_constraint_feasible & surrogate_physical_valid
     feasible_indices = np.flatnonzero(physical_feasible)
     if len(feasible_indices):
@@ -6147,47 +6107,51 @@ def persist_search_outputs(
         paths["least_violation_front"],
         _candidate_csv_frame(least_records, template=least_records[0]),
     )
-    _atomic_json(paths["pareto_candidates"], {
-        "schema_version": "mft-tier1-current7-pareto-candidates-v1",
-        "authoritative_constraints": "terminal_unscaled_physical_replay",
-        "candidate_count": len(pareto_records),
-        "candidates": pareto_records,
-        "production_eligible": False,
-        "fea_submission_performed": False,
-        "automatic_promotion_allowed": False,
-    })
-    _atomic_json(paths["least_violation_candidates"], {
-        "schema_version": "mft-tier1-current7-least-violation-candidates-v1",
-        "ranking": "minimum_sum_positive_optimizer_normalized_G",
-        "ranking_eligibility": (
-            "decoded_and_terminal_surrogate_physicality_valid"
-        ),
-        "eligible_population_count": least_selection["eligible_count"],
-        "raw_global_least_population_index": raw_global_least_index,
-        "selected_least_population_index": least_index,
-        "fallback_to_quarantined_raw_global_least": least_selection[
-            "fallback_to_quarantined_raw_global_least"
-        ],
-        "candidate_count": len(least_records),
-        "candidates": least_records,
-        "production_eligible": False,
-        "fea_submission_performed": False,
-        "automatic_promotion_allowed": False,
-    })
+    _atomic_json(
+        paths["pareto_candidates"],
+        {
+            "schema_version": "mft-tier1-current7-pareto-candidates-v1",
+            "authoritative_constraints": "terminal_unscaled_physical_replay",
+            "candidate_count": len(pareto_records),
+            "candidates": pareto_records,
+            "production_eligible": False,
+            "fea_submission_performed": False,
+            "automatic_promotion_allowed": False,
+        },
+    )
+    _atomic_json(
+        paths["least_violation_candidates"],
+        {
+            "schema_version": "mft-tier1-current7-least-violation-candidates-v1",
+            "ranking": "minimum_sum_positive_optimizer_normalized_G",
+            "ranking_eligibility": ("decoded_and_terminal_surrogate_physicality_valid"),
+            "eligible_population_count": least_selection["eligible_count"],
+            "raw_global_least_population_index": raw_global_least_index,
+            "selected_least_population_index": least_index,
+            "fallback_to_quarantined_raw_global_least": least_selection[
+                "fallback_to_quarantined_raw_global_least"
+            ],
+            "candidate_count": len(least_records),
+            "candidates": least_records,
+            "production_eligible": False,
+            "fea_submission_performed": False,
+            "automatic_promotion_allowed": False,
+        },
+    )
     per_constraint = []
     for position, name in enumerate(runner.problem.constraint_names):
         values = physical_g[:, position]
-        per_constraint.append({
-            "index": position,
-            "name": name,
-            "finite_count": int(np.count_nonzero(np.isfinite(values))),
-            "passing_count": int(np.count_nonzero(values <= 0.0)),
-            "minimum_physical_G": float(np.min(values)),
-            "median_physical_G": float(np.median(values)),
-            "minimum_positive_violation": float(
-                np.min(np.maximum(values, 0.0))
-            ),
-        })
+        per_constraint.append(
+            {
+                "index": position,
+                "name": name,
+                "finite_count": int(np.count_nonzero(np.isfinite(values))),
+                "passing_count": int(np.count_nonzero(values <= 0.0)),
+                "minimum_physical_G": float(np.min(values)),
+                "median_physical_G": float(np.median(values)),
+                "minimum_positive_violation": float(np.min(np.maximum(values, 0.0))),
+            }
+        )
     infeasibility = {
         "schema_version": "mft-tier1-current7-infeasibility-report-v1",
         "authoritative_constraints": "terminal_unscaled_physical_replay",
@@ -6217,9 +6181,7 @@ def persist_search_outputs(
         "least_violation_selection_eligibility": (
             "decoded_and_terminal_surrogate_physicality_valid"
         ),
-        "least_violation_eligible_population_count": least_selection[
-            "eligible_count"
-        ],
+        "least_violation_eligible_population_count": least_selection["eligible_count"],
         "fallback_to_quarantined_raw_global_least": least_selection[
             "fallback_to_quarantined_raw_global_least"
         ],
@@ -6257,11 +6219,21 @@ def persist_search_outputs(
         "physical_feasible_count": int(np.count_nonzero(physical_feasible)),
         "feasible_pareto_count": int(len(pareto_indices)),
         "least_violation_count": 1,
-        "terminal_population_primary_turn_values": sorted({
-            int(_finite_number(_row_value(_frame_row(frame, index), "N1_main"), "N1_main"))
-            + int(_finite_number(_row_value(_frame_row(frame, index), "N1_side"), "N1_side"))
-            for index in range(len(frame))
-        }),
+        "terminal_population_primary_turn_values": sorted(
+            {
+                int(
+                    _finite_number(
+                        _row_value(_frame_row(frame, index), "N1_main"), "N1_main"
+                    )
+                )
+                + int(
+                    _finite_number(
+                        _row_value(_frame_row(frame, index), "N1_side"), "N1_side"
+                    )
+                )
+                for index in range(len(frame))
+            }
+        ),
         "artifact_inventory": inventory,
         "artifact_inventory_sha256": canonical_sha256(inventory),
         "infeasibility_report": infeasibility,
@@ -6322,7 +6294,9 @@ def build_smoke_receipt(
             or not runner.launch_eligible
             or not runner.problem.launch_eligible
         ):
-            raise RuntimeError("dual-stratum runners do not share one authenticated load")
+            raise RuntimeError(
+                "dual-stratum runners do not share one authenticated load"
+            )
         evaluation = evaluations[key]
         objectives = np.asarray(evaluation["F"], dtype=float)
         constraints = np.asarray(evaluation["G"], dtype=float)
@@ -6366,9 +6340,7 @@ def build_smoke_receipt(
             raise RuntimeError(f"N1={turns} decoded fixed controls escaped")
         budget_identity = winding_budget_identity(
             row,
-            expected_cw1_mm=stage_spec[
-                "primary_conductor_thickness_mm"
-            ],
+            expected_cw1_mm=stage_spec["primary_conductor_thickness_mm"],
         )
         if budget_identity.get("passed") is not True:
             raise RuntimeError(f"N1={turns} winding-budget identity failed")
@@ -6474,9 +6446,7 @@ def build_smoke_receipt(
         "inference_binding": first.inference_binding,
         "model_smoke_completed": True,
         "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
-        "strata": {
-            key: strata[key]["model_smoke"] for key in expected_keys
-        },
+        "strata": {key: strata[key]["model_smoke"] for key in expected_keys},
         "all_supported_strata_exercised": True,
         "semlock_safe_prediction_stress_required": True,
         "sklearn_extratrees_n_jobs": 1,
@@ -6488,13 +6458,9 @@ def build_smoke_receipt(
         "stage_spec": stage_spec,
         "stage_spec_sha256": canonical_sha256(stage_spec),
         "temperature_contract": temperature_contract,
-        "temperature_contract_sha256": canonical_sha256(
-            temperature_contract
-        ),
+        "temperature_contract_sha256": canonical_sha256(temperature_contract),
         "hard_constraint_contract": hard_constraint_contract,
-        "hard_constraint_contract_sha256": canonical_sha256(
-            hard_constraint_contract
-        ),
+        "hard_constraint_contract_sha256": canonical_sha256(hard_constraint_contract),
         "constraint_names": list(constraint_names),
         "constraint_count": len(constraint_names),
         "base_constraint_count": len(BASE_CONSTRAINT_NAMES),
@@ -6517,9 +6483,7 @@ def build_smoke_receipt(
     optimizer_repair = {
         "schema_version": OPTIMIZER_REPAIR_SCHEMA,
         "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
-        "strata": {
-            key: strata[key]["optimizer_repair"] for key in expected_keys
-        },
+        "strata": {key: strata[key]["optimizer_repair"] for key in expected_keys},
         "all_supported_strata_passed": True,
         "launch_eligible": True,
     }
@@ -6532,21 +6496,18 @@ def build_smoke_receipt(
     receipt = {
         "schema_version": RECEIPT_SCHEMA,
         "status": (
-            "authenticated_dual_stratum_model_and_repair_smoke_passed_"
-            "launch_eligible"
+            "authenticated_dual_stratum_model_and_repair_smoke_passed_launch_eligible"
         ),
-        "created_at": datetime.now(timezone.utc).astimezone().isoformat(
-            timespec="seconds"
-        ),
+        "created_at": datetime.now(timezone.utc)
+        .astimezone()
+        .isoformat(timespec="seconds"),
         "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
         "strata": strata,
         "runner": {
             "schema_version": RUNNER_SCHEMA,
             "problem_schema": PROBLEM_SCHEMA,
             "run_interface": "Current7Tier1Runner.run_one",
-            "current_run_nsga2_semantics_source": (
-                "optimization.run_nsga2.run_one"
-            ),
+            "current_run_nsga2_semantics_source": ("optimization.run_nsga2.run_one"),
             "current_initialization_semantics_source": (
                 "optimization.run_nsga2.run_one"
             ),
@@ -6608,10 +6569,7 @@ def validate_smoke_receipt(
     if (
         value.get("schema_version") != RECEIPT_SCHEMA
         or value.get("status")
-        != (
-            "authenticated_dual_stratum_model_and_repair_smoke_passed_"
-            "launch_eligible"
-        )
+        != ("authenticated_dual_stratum_model_and_repair_smoke_passed_launch_eligible")
         or value.get("supported_fixed_primary_turns") != expected_turns
         or set(strata) != expected_keys
         or runner.get("schema_version") != RUNNER_SCHEMA
@@ -6646,8 +6604,7 @@ def validate_smoke_receipt(
         or problem.get("temperature_contract") != expected_temperature_contract
         or problem.get("temperature_contract_sha256")
         != canonical_sha256(expected_temperature_contract)
-        or problem.get("hard_constraint_contract")
-        != expected_hard_contract
+        or problem.get("hard_constraint_contract") != expected_hard_contract
         or problem.get("hard_constraint_contract_sha256")
         != canonical_sha256(expected_hard_contract)
         or problem.get("constraint_names") != list(expected_constraint_names)
@@ -6737,7 +6694,8 @@ def validate_smoke_receipt(
             is not True
             or (stratum_problem.get("primary_winding_budget_identity") or {}).get(
                 "passed"
-            ) is not True
+            )
+            is not True
             or stratum_problem.get("launch_eligible") is not True
             or stratum_repair.get("schema_version") != OPTIMIZER_REPAIR_SCHEMA
             or stratum_repair.get("stages") != expected_stages
@@ -6750,20 +6708,18 @@ def validate_smoke_receipt(
             or contract.get("fixed_cw1_mm") != 5.0
             or contract.get("cw1_enforcement") != "inside_decoder_winding_budget"
             or contract.get("fixed_primary_turns") != turns
-            or contract.get("required_stages") != [
+            or contract.get("required_stages")
+            != [
                 "initial_population",
                 "authenticated_warm_start",
                 "every_pymoo_offspring",
                 "terminal_unscaled_physical_replay",
             ]
-            or stratum_repair.get("contract_sha256")
-            != canonical_sha256(contract)
+            or stratum_repair.get("contract_sha256") != canonical_sha256(contract)
             or stage_evidence.get("stages") != expected_stages
             or stage_evidence.get("fixed_primary_turns") != turns
-            or stage_evidence.get("same_problem_repair_used_for_all_stages")
-            is not True
-            or stratum_model.get("target_count")
-            != len(CURRENT_REQUIRED_MODEL_TARGETS)
+            or stage_evidence.get("same_problem_repair_used_for_all_stages") is not True
+            or stratum_model.get("target_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
             or stratum_model.get("all_required_targets_exercised") is not True
             or set((stratum_model.get("targets") or {}))
             != set(CURRENT_REQUIRED_MODEL_TARGETS)
@@ -6844,10 +6800,12 @@ def observed_peak_rss_bytes() -> int:
             if ctypes.windll.psapi.GetProcessMemoryInfo(
                 handle, ctypes.byref(counters), counters.cb
             ):
-                candidates.extend([
-                    int(counters.PeakWorkingSetSize),
-                    int(counters.WorkingSetSize),
-                ])
+                candidates.extend(
+                    [
+                        int(counters.PeakWorkingSetSize),
+                        int(counters.WorkingSetSize),
+                    ]
+                )
         except (AttributeError, OSError, TypeError, ValueError):
             pass
     observed = max(candidates, default=0)
@@ -6959,8 +6917,7 @@ def run_search_seed(
     result_path = output_root / str(execution.get("result_filename") or "")
     if (
         manifest.get("bundle_id") != str(bundle_id)
-        or execution.get("remote_preflight_schema_version")
-        != REMOTE_PREFLIGHT_SCHEMA
+        or execution.get("remote_preflight_schema_version") != REMOTE_PREFLIGHT_SCHEMA
         or execution.get("result_schema_version") != SEARCH_RESULT_SCHEMA
         or execution.get("optimizer_processes_per_task") != 1
         or execution.get("model_mapping_instances_per_process") != 1
@@ -6996,7 +6953,9 @@ def run_search_seed(
     runtime_threads = validate_search_thread_contract(
         profile_inference_threads=island_profile.get("inference_threads"),
         inference_threads=inference_threads,
-        scheduler_cpus=(inference_threads if scheduler_cpus is None else scheduler_cpus),
+        scheduler_cpus=(
+            inference_threads if scheduler_cpus is None else scheduler_cpus
+        ),
     )
     if (
         int(fixed_primary_turns) not in SUPPORTED_FIXED_PRIMARY_TURNS
@@ -7007,18 +6966,14 @@ def run_search_seed(
         or island_profile.get("fixed_primary_turns") != int(fixed_primary_turns)
         or island_profile.get("population") != PRODUCTION_POPULATION
         or int(population) != PRODUCTION_POPULATION
-        or island_profile.get("fixed_generations")
-        != PRODUCTION_FIXED_GENERATIONS
+        or island_profile.get("fixed_generations") != PRODUCTION_FIXED_GENERATIONS
         or int(max_generations) != PRODUCTION_FIXED_GENERATIONS
-        or island_profile.get("inference_threads")
-        != PRODUCTION_INFERENCE_THREADS
+        or island_profile.get("inference_threads") != PRODUCTION_INFERENCE_THREADS
         or int(inference_threads) != runtime_threads
         or island_profile.get("optimizer_termination_strategy")
         != FIXED_GENERATION_TERMINATION_STRATEGY
-        or optimizer_termination_strategy
-        != FIXED_GENERATION_TERMINATION_STRATEGY
-        or island_profile.get("topology_evolution_contract")
-        != topology_contract
+        or optimizer_termination_strategy != FIXED_GENERATION_TERMINATION_STRATEGY
+        or island_profile.get("topology_evolution_contract") != topology_contract
         or island_profile.get("temperature_targets")
         != list(CURRENT_TEMPERATURE_TARGETS)
         or island_profile.get("offspring_physics_repair_required") is not True
@@ -7059,12 +7014,9 @@ def run_search_seed(
     ):
         raise RuntimeError("deep-crossover island profile mismatch")
     adapter_evidence = receipt["adapter_manifest"]
-    if (
-        manifest.get("bundle_code_revision")
-        != (adapter_evidence.get("code") or {}).get("revision")
-        or receipt.get("adapter_manifest_sha256")
-        != canonical_sha256(adapter_evidence)
-    ):
+    if manifest.get("bundle_code_revision") != (adapter_evidence.get("code") or {}).get(
+        "revision"
+    ) or receipt.get("adapter_manifest_sha256") != canonical_sha256(adapter_evidence):
         raise RuntimeError("bundle/adapter code identity mismatch")
     warm = island.get("warm") or {}
     warm_artifact_record = warm.get("artifact") or {}
@@ -7080,23 +7032,24 @@ def run_search_seed(
         "island warm contract",
     )
     supplied_warm_path = _contained_input(root, warm_start, "warm artifact")
-    supplied_warm_contract_path = _contained_input(
-        root, warm_contract, "warm contract"
-    )
+    supplied_warm_contract_path = _contained_input(root, warm_contract, "warm contract")
     if (
         expected_warm_path != supplied_warm_path
         or expected_warm_contract_path != supplied_warm_contract_path
         or warm_artifact_record.get("sha256") != sha256_file(supplied_warm_path)
         or warm_contract_record.get("sha256")
         != sha256_file(supplied_warm_contract_path)
-        or warm_artifact_record.get("size")
-        != supplied_warm_path.stat().st_size
+        or warm_artifact_record.get("size") != supplied_warm_path.stat().st_size
         or warm_contract_record.get("size")
         != supplied_warm_contract_path.stat().st_size
     ):
         raise RuntimeError("island warm artifact identity mismatch")
     code_root = _contained_input(
         root, root / "artifacts" / "code", "relocated code root"
+    )
+    semlock_safe_release = phase_b_semlock_safe_release_identity(
+        code_root=code_root,
+        manifest=manifest,
     )
     runner = build_relocated_authenticated_runner(
         authenticated=authenticated,
@@ -7109,9 +7062,7 @@ def run_search_seed(
     stratum_repair = receipt["strata"][str(int(fixed_primary_turns))][
         "optimizer_repair"
     ]
-    problem_repair_sha = runner.problem.optimizer_repair_contract[
-        "contract_sha256"
-    ]
+    problem_repair_sha = runner.problem.optimizer_repair_contract["contract_sha256"]
     if (
         stratum_repair.get("contract_sha256") != problem_repair_sha
         or str(optimizer_repair_contract_sha256) != problem_repair_sha
@@ -7121,8 +7072,7 @@ def run_search_seed(
         or tuple(runner.models) != CURRENT_REQUIRED_MODEL_TARGETS
         or runner.inference_binding.get("target_count")
         != len(CURRENT_REQUIRED_MODEL_TARGETS)
-        or runner.inference_binding.get("threads_per_model")
-        != int(inference_threads)
+        or runner.inference_binding.get("threads_per_model") != int(inference_threads)
     ):
         raise RuntimeError("remote model-load/repair identity mismatch")
     warm_values, warm_handoff = authenticate_warm_handoff(
@@ -7144,9 +7094,10 @@ def run_search_seed(
     )
     if len(filtered_warm) < 1:
         raise RuntimeError("remote warm preflight has no repaired hard-feasible row")
-    if warm_handoff.get("warm_role_partition") is not None and len(
-        structural_donors
-    ) < 1:
+    if (
+        warm_handoff.get("warm_role_partition") is not None
+        and len(structural_donors) < 1
+    ):
         raise RuntimeError("remote warm preflight has no structural basin donor")
     stress_evaluation = runner.evaluate_coordinates(filtered_warm[:1])
     if not bool(stress_evaluation["decoder_valid"][0]):
@@ -7162,6 +7113,17 @@ def run_search_seed(
         is not topology_niche_enabled
     ):
         raise RuntimeError("bundle profile/warm topology niche activation mismatch")
+    semaphore_stress = None
+    if semlock_safe_release is not None:
+        stress_frame, _stress_shrink, stress_valid = runner.problem.decode_batch(
+            filtered_warm[:1]
+        )
+        if len(stress_frame) != 1 or not bool(stress_valid[0]):
+            raise RuntimeError("remote repeated-predict stress has no valid sample")
+        semaphore_stress = attest_semlock_free_repeated_predict(
+            runner.models,
+            stress_frame,
+        )
     physical_evaluate, optimizer_scaling = install_optimizer_scaling(
         runner.problem,
         resonance_scale_hz=optimizer_resonance_scale_hz,
@@ -7195,10 +7157,8 @@ def run_search_seed(
         if (
             operator.get("call_count") != 0
             or operator.get("row_count") != 0
-            or pre_optimization.get("offspring_repair_operator_installed")
-            is not True
-            or pre_optimization.get("offspring_repair_operator_executed")
-            is not False
+            or pre_optimization.get("offspring_repair_operator_installed") is not True
+            or pre_optimization.get("offspring_repair_operator_executed") is not False
             or not initial
             or not warm_execution
             or observed_rss > maximum_rss
@@ -7215,21 +7175,15 @@ def run_search_seed(
             "optimizer_processes": 1,
             "model_mapping_instances": 1,
             "full_generation_authentication_passes": 1,
-            "authenticated_artifact_count": int(
-                adapter_evidence["artifact_count"]
-            ),
+            "authenticated_artifact_count": int(adapter_evidence["artifact_count"]),
             "generation_artifact_inventory_sha256": manifest[
                 "generation_artifact_inventory_sha256"
             ],
             "adapter_manifest_sha256": receipt["adapter_manifest_sha256"],
             "train_report_sha256": adapter_evidence["train_report"]["sha256"],
             "dataset_sha256": adapter_evidence["dataset"]["sha256"],
-            "profile_canonical_sha256": adapter_evidence["profile"][
-                "canonical_sha256"
-            ],
-            "temperature_contract_sha256": (
-                runner.problem.temperature_contract_sha256
-            ),
+            "profile_canonical_sha256": adapter_evidence["profile"]["canonical_sha256"],
+            "temperature_contract_sha256": (runner.problem.temperature_contract_sha256),
             "hard_constraint_contract_sha256": (
                 runner.problem.hard_constraint_contract_sha256
             ),
@@ -7241,6 +7195,15 @@ def run_search_seed(
             "loaded_model_targets_sha256": CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
             "temperature_targets": list(CURRENT_TEMPERATURE_TARGETS),
             "inference_threads": int(inference_threads),
+            **(
+                {
+                    "inference_binding": dict(runner.inference_binding),
+                    "semlock_free_repeated_predict": semaphore_stress,
+                    "semlock_safe_inference_release": semlock_safe_release,
+                }
+                if semlock_safe_release is not None
+                else {}
+            ),
             "scheduler_cpus": int(
                 inference_threads if scheduler_cpus is None else scheduler_cpus
             ),
@@ -7264,9 +7227,7 @@ def run_search_seed(
             "every_offspring_decode_repair_attested": False,
             "offspring_repair_operator_installed": True,
             "offspring_repair_operator_contract_sha256": problem_repair_sha,
-            "offspring_repair_execution_status": (
-                "deferred_until_optimizer_execution"
-            ),
+            "offspring_repair_execution_status": ("deferred_until_optimizer_execution"),
             "terminal_physical_replay_required": True,
             "initial_population_repair_evidence": initial,
             "warm_handoff_authentication": warm_handoff,
@@ -7308,14 +7269,15 @@ def run_search_seed(
     topology_audit = result.tier1_topology_evolution_audit
     operator_audit = repair_audit.get("pymoo_operator") or {}
     terminal_replay_audit = repair_audit.get("terminal_physical_replay") or {}
-    deterministic_terminal = terminal_replay_audit.get(
-        "deterministic_terminal_inference"
-    ) or {}
-    optimizer_snapshot = terminal_replay_audit.get(
-        "multithread_optimizer_snapshot"
-    ) or {}
+    deterministic_terminal = (
+        terminal_replay_audit.get("deterministic_terminal_inference") or {}
+    )
+    optimizer_snapshot = (
+        terminal_replay_audit.get("multithread_optimizer_snapshot") or {}
+    )
     if (
-        repair_audit.get("stages") != {
+        repair_audit.get("stages")
+        != {
             "initial_population": True,
             "warm_start": True,
             "every_offspring": True,
@@ -7327,17 +7289,14 @@ def run_search_seed(
         or operator_audit["row_count"] < 1
         or terminal_replay_audit.get("optimizer_physical_G_match") is not True
         or terminal_replay_audit.get("terminal_population_canonicalized") is not True
-        or deterministic_terminal.get("optimizer_inference_threads")
-        != runtime_threads
+        or deterministic_terminal.get("optimizer_inference_threads") != runtime_threads
         or deterministic_terminal.get("terminal_replay_inference_threads")
         != DETERMINISTIC_TERMINAL_INFERENCE_THREADS
         or deterministic_terminal.get("optimizer_binding_restored") is not True
         or deterministic_terminal.get("objectives_bit_exact") is not True
         or deterministic_terminal.get("optimizer_G_bit_exact") is not True
         or deterministic_terminal.get("numeric_tolerance_relaxed") is not False
-        or deterministic_terminal.get(
-            "terminal_model_predictions_serially_replayed"
-        )
+        or deterministic_terminal.get("terminal_model_predictions_serially_replayed")
         is not True
         or optimizer_snapshot.get("canonicalized_from_serial_authority") is not True
         or optimizer_snapshot.get("stale_constraint_violation_cache_cleared")
@@ -7377,12 +7336,8 @@ def run_search_seed(
         "adapter_manifest_sha256": receipt["adapter_manifest_sha256"],
         "train_report_sha256": adapter_evidence["train_report"]["sha256"],
         "dataset_sha256": adapter_evidence["dataset"]["sha256"],
-        "profile_canonical_sha256": adapter_evidence["profile"][
-            "canonical_sha256"
-        ],
-        "temperature_contract_sha256": (
-            runner.problem.temperature_contract_sha256
-        ),
+        "profile_canonical_sha256": adapter_evidence["profile"]["canonical_sha256"],
+        "temperature_contract_sha256": (runner.problem.temperature_contract_sha256),
         "hard_constraint_contract_sha256": (
             runner.problem.hard_constraint_contract_sha256
         ),
@@ -7447,8 +7402,7 @@ def run_search_seed(
     if (
         expected_sha != canonical_sha256(sealed)
         or written.get("schema_version") != SEARCH_RESULT_SCHEMA
-        or written.get("terminal_population_fixed_primary_turns_verified")
-        is not True
+        or written.get("terminal_population_fixed_primary_turns_verified") is not True
         or written.get("every_offspring_decode_repair_attested") is not True
         or written.get("terminal_physical_replay_attested") is not True
     ):
@@ -7739,13 +7693,9 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("--scheduler-cpus", type=int)
     search.add_argument("--fixed-primary-turns", type=int, required=True)
     search.add_argument("--optimizer-termination-strategy", required=True)
-    search.add_argument(
-        "--optimizer-resonance-scale-hz", type=float, required=True
-    )
+    search.add_argument("--optimizer-resonance-scale-hz", type=float, required=True)
     search.add_argument("--optimizer-llt-scale-uh", type=float, required=True)
-    search.add_argument(
-        "--optimizer-all-thermal-scale-c", type=float, required=True
-    )
+    search.add_argument("--optimizer-all-thermal-scale-c", type=float, required=True)
     search.add_argument("--optimizer-repair-contract-sha256", required=True)
     search.add_argument("--stage-spec-json", required=True)
     search.add_argument("--stage-spec-sha256", required=True)
@@ -7761,12 +7711,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "validate-receipt":
         receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
         validate_smoke_receipt(receipt)
-        print(json.dumps({
-            "valid": True,
-            "schema_version": receipt["schema_version"],
-            "payload_sha256": receipt["payload_sha256"],
-            "launch_eligible": True,
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "valid": True,
+                    "schema_version": receipt["schema_version"],
+                    "payload_sha256": receipt["payload_sha256"],
+                    "launch_eligible": True,
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     if args.command == "search-seed":
         stage_spec = stage_spec_from_json_identity(
@@ -7793,24 +7748,14 @@ def main(argv: list[str] | None = None) -> int:
             inference_threads=args.inference_threads,
             scheduler_cpus=args.scheduler_cpus,
             fixed_primary_turns=args.fixed_primary_turns,
-            optimizer_termination_strategy=(
-                args.optimizer_termination_strategy
-            ),
-            optimizer_resonance_scale_hz=(
-                args.optimizer_resonance_scale_hz
-            ),
+            optimizer_termination_strategy=(args.optimizer_termination_strategy),
+            optimizer_resonance_scale_hz=(args.optimizer_resonance_scale_hz),
             optimizer_llt_scale_uh=args.optimizer_llt_scale_uh,
-            optimizer_all_thermal_scale_c=(
-                args.optimizer_all_thermal_scale_c
-            ),
-            optimizer_repair_contract_sha256=(
-                args.optimizer_repair_contract_sha256
-            ),
+            optimizer_all_thermal_scale_c=(args.optimizer_all_thermal_scale_c),
+            optimizer_repair_contract_sha256=(args.optimizer_repair_contract_sha256),
             stage_spec=stage_spec,
             stage_spec_sha256=args.stage_spec_sha256,
-            optimizer_resonance_allowance_hz=(
-                args.optimizer_resonance_allowance_hz
-            ),
+            optimizer_resonance_allowance_hz=(args.optimizer_resonance_allowance_hz),
             optimizer_llt_allowance_uh=args.optimizer_llt_allowance_uh,
         )
         print(result_path)
@@ -7824,9 +7769,7 @@ def main(argv: list[str] | None = None) -> int:
     smoke_stage_spec = (
         validate_stage_spec(CURRENT_STAGE_SPEC)
         if args.stage_spec_json is None
-        else stage_spec_from_json_identity(
-            args.stage_spec_json, args.stage_spec_sha256
-        )
+        else stage_spec_from_json_identity(args.stage_spec_json, args.stage_spec_sha256)
     )
     receipt_path = run_smoke_preflight(
         generation=args.generation,

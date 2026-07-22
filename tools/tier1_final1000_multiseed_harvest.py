@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Callable, Mapping, Sequence
 
 try:
+    import tier1_final1000_multiseed_phase_b_contract as phase_b_contract
     from tier1_corrected_current7_slurm_harvest import (
         MAX_RESULT_BYTES,
         MAX_STATUS_BYTES,
@@ -36,6 +37,7 @@ try:
         validate_task_status,
     )
 except ImportError:  # pragma: no cover - repository import path
+    from tools import tier1_final1000_multiseed_phase_b_contract as phase_b_contract
     from tools.tier1_corrected_current7_slurm_harvest import (
         MAX_RESULT_BYTES,
         MAX_STATUS_BYTES,
@@ -79,7 +81,15 @@ def _batch_parent_task(
     candidate = item.get("parent_task")
     if not isinstance(candidate, dict):
         raise RuntimeError("batch inventory item has no authenticated parent envelope")
-    task = validate_batch_task(candidate)
+    candidate_payload = candidate.get("payload_json")
+    if (
+        isinstance(candidate_payload, dict)
+        and candidate_payload.get("schema_version")
+        == phase_b_contract.BATCH_PAYLOAD_SCHEMA
+    ):
+        task = phase_b_contract.validate_batch_task(candidate)
+    else:
+        task = validate_batch_task(candidate)
     payload = task["payload_json"]
     task_id = item.get("task_id")
     scheduler_state = str(item.get("status") or "").lower()
@@ -124,8 +134,20 @@ def _read_batch_journal(
     )
     if stable_manifest.stat.mode & 0o222:
         raise RuntimeError("remote batch manifest is not immutable")
-    manifest = validate_batch_manifest(stable_manifest.value)
-    expected_manifest = batch_manifest_from_payload(parent_task["payload_json"])
+    is_phase_b = (
+        parent_task["payload_json"].get("schema_version")
+        == phase_b_contract.BATCH_PAYLOAD_SCHEMA
+    )
+    manifest = (
+        phase_b_contract.validate_batch_manifest(stable_manifest.value)
+        if is_phase_b
+        else validate_batch_manifest(stable_manifest.value)
+    )
+    expected_manifest = (
+        phase_b_contract.batch_manifest_from_payload(parent_task["payload_json"])
+        if is_phase_b
+        else batch_manifest_from_payload(parent_task["payload_json"])
+    )
     if manifest != expected_manifest:
         raise RuntimeError("remote batch manifest differs from parent payload")
     status_path = _remote_child(
@@ -137,7 +159,11 @@ def _read_batch_journal(
         path=status_path,
         maximum_bytes=MAX_TASK_STATUS_BYTES,
     )
-    status = validate_task_status(stable_status.value)
+    status = (
+        phase_b_contract.validate_task_status(stable_status.value)
+        if is_phase_b
+        else validate_task_status(stable_status.value)
+    )
     if (
         str(status["task_id"]) != str(task_id)
         or status["manifest_sha256"] != manifest["manifest_sha256"]
@@ -217,7 +243,14 @@ def harvest_batch_lane(
         )
         if stable_receipt.stat.mode & 0o222:
             raise RuntimeError("remote batch child receipt is not immutable")
-        receipt = validate_child_receipt(stable_receipt.value, manifest=batch_manifest)
+        receipt = (
+            phase_b_contract.validate_child_receipt(
+                stable_receipt.value, manifest=batch_manifest
+            )
+            if batch_manifest.get("schema_version")
+            == phase_b_contract.BATCH_MANIFEST_SCHEMA
+            else validate_child_receipt(stable_receipt.value, manifest=batch_manifest)
+        )
         legacy_status = receipt["legacy_status"]
         if (
             str(receipt["task_id"]) != str(task_id)
@@ -358,7 +391,8 @@ def harvest_mixed_inventory(
         is_v2 = (
             isinstance(parent, dict)
             and isinstance(parent.get("payload_json"), dict)
-            and parent["payload_json"].get("schema_version") == BATCH_PAYLOAD_SCHEMA
+            and parent["payload_json"].get("schema_version")
+            in {BATCH_PAYLOAD_SCHEMA, phase_b_contract.BATCH_PAYLOAD_SCHEMA}
         )
         try:
             if is_v2:

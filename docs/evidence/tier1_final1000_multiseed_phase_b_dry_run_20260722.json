@@ -1,0 +1,103 @@
+{
+  "aedt_used": false,
+  "allocation_histogram": {
+    "10": 1,
+    "11": 3,
+    "12": 1,
+    "14": 1,
+    "16": 15,
+    "2": 1,
+    "5": 3,
+    "6": 1,
+    "7": 7,
+    "8": 4,
+    "9": 2
+  },
+  "allocation_inventory_sha256": "e6c213559f0b2e9bb2925c7bab7b06b90f4891ae03d974f52db687d68f1c4d4d",
+  "capacity_snapshot_drift_action": "rerender-or-fail-closed",
+  "capacity_snapshot_recheck_required": true,
+  "documentary_only": true,
+  "dispatch_admission_policy": {
+    "capacity_snapshot_drift_action": "rerender-or-fail-closed",
+    "capacity_snapshot_recheck_before_activation_required": true,
+    "default_model_load_stagger_seconds": 5.0,
+    "eight_lane_dispatch_fill_seconds": 35.0,
+    "empty_node_or_capacity_prediction_allowed": false,
+    "logical_child_cpus": 4,
+    "scheduler_ready_lane_policy": "natural-terminal-vacancy-only-v1",
+    "scheduler_ready_lane_reserve": 0,
+    "schema_version": "mft-tier1-final1000-phase-b-dispatch-admission-v1",
+    "speculative_ready_lane_submission_allowed": false
+  },
+  "evidence_sha256": "d441146321298f582f24c849d57be90af2b0518e6d04e53a72ae26e0a64f12df",
+  "fea_submission_performed": false,
+  "lane_count_independent_science_identity": true,
+  "logical_child_inventory_sha256": "64406482d64993993a162ad11240cf031a9b88a254dffebdaf4ef8951722c2ed",
+  "logical_seed_count": 500,
+  "maxjobs_reduction": 429,
+  "one_lane_repack_logical_child_inventory_sha256": "64406482d64993993a162ad11240cf031a9b88a254dffebdaf4ef8951722c2ed",
+  "parent_task_inventory_sha256": "69d1d12f9dc7ffbf0655a16af4e023a192815d5b956442dec0be953249a39316",
+  "physical_parent_count": 71,
+  "placement_plan_sha256": "24e6fa213b2dcd910bb8aaedfd32fe3f03d80e15f2c9dbd9f5661b3e0c2adb09",
+  "production_eligible": false,
+  "queued_logical_count": 69,
+  "queued_parent_count": 9,
+  "queued_stage_shapes": {
+    "bridge-1150-t115": {},
+    "close-1075-t107p5": {},
+    "entry-1200-t125": {
+      "5": 1,
+      "8": 8
+    },
+    "final-1000-t100": {}
+  },
+  "remote_write_performed": false,
+  "running_logical_count": 431,
+  "running_parent_count": 62,
+  "running_stage_shapes": {
+    "bridge-1150-t115": {
+      "6": 1,
+      "8": 18
+    },
+    "close-1075-t107p5": {
+      "8": 5
+    },
+    "entry-1200-t125": {
+      "1": 2,
+      "2": 1,
+      "3": 3,
+      "4": 1,
+      "5": 3,
+      "6": 1,
+      "7": 7,
+      "8": 18
+    },
+    "final-1000-t100": {
+      "2": 1,
+      "8": 1
+    }
+  },
+  "scheduler_write_performed": false,
+  "schema_version": "mft-tier1-final1000-multiseed-phase-b-dry-run-v2",
+  "shape_parent_counts": {
+    "1": 2,
+    "2": 2,
+    "3": 3,
+    "4": 1,
+    "5": 4,
+    "6": 2,
+    "7": 7,
+    "8": 50
+  },
+  "source_file_sha256": "d2edb290167b264943924a8deb714e3a0c62b8c4063718276a7aafd5d7360290",
+  "source_launch_plan_sha256": "4923076ea96790eb9369997d5a26a25e5be8f92f2c601b89940cb11efa642935",
+  "stage_logical_quotas": {
+    "bridge-1150-t115": 150,
+    "close-1075-t107p5": 40,
+    "entry-1200-t125": 300,
+    "final-1000-t100": 10
+  },
+  "static_eight_first_pack_production_eligible": false,
+  "submission_performed": false,
+  "virtual_scheduler_task_ids_created": false
+}

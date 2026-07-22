@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 try:
     from tier1_corrected_current7_receipt import (
@@ -67,6 +67,12 @@ THREAD_LIMIT_ENVIRONMENT_VARIABLES = (
     "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
+)
+PHASE_B_SEMLOCK_STRESS_SCHEMA = "mft-tier1-current7-semlock-free-repeated-predict-v1"
+PHASE_B_INFERENCE_POLICY = "family_specific_semaphore_free_sklearn_forest_v1"
+PHASE_B_SEMLOCK_SAFE_RELEASE_COMMIT = "6ea0e17e5e028ebb8d89d910c3cec1a0f014dae5"
+PHASE_B_SEMLOCK_SAFE_HELPER_SHA256 = (
+    "c25afd39752a990c31e1b934c77282d88ac11dab1cad763d4f07c95e4b87dd80"
 )
 
 
@@ -264,8 +270,7 @@ def verify_payload(
         or manifest.get("hard_spec") != identity.get("hard_spec")
         or manifest.get("hard_spec_sha256") != identity.get("hard_spec_sha256")
         or manifest.get("constraint_names") != identity.get("constraint_names")
-        or manifest.get("temperature_targets")
-        != list(CURRENT_TEMPERATURE_TARGETS)
+        or manifest.get("temperature_targets") != list(CURRENT_TEMPERATURE_TARGETS)
         or manifest.get("temperature_contract_sha256")
         != identity.get("temperature_contract_sha256")
         or manifest.get("hard_constraint_contract_sha256")
@@ -275,12 +280,9 @@ def verify_payload(
     if (
         payload.get("hard_spec") != manifest.get("hard_spec")
         or payload.get("hard_spec_sha256") != manifest.get("hard_spec_sha256")
-        or canonical_sha256(payload.get("hard_spec"))
-        != payload.get("hard_spec_sha256")
-        or payload.get("constraint_version")
-        != manifest.get("constraint_version")
-        or payload.get("constraint_names")
-        != manifest.get("constraint_names")
+        or canonical_sha256(payload.get("hard_spec")) != payload.get("hard_spec_sha256")
+        or payload.get("constraint_version") != manifest.get("constraint_version")
+        or payload.get("constraint_names") != manifest.get("constraint_names")
     ):
         raise RuntimeError("task staged hard-spec identity mismatch")
     for field in (
@@ -293,9 +295,7 @@ def verify_payload(
         "hard_constraint_contract_sha256",
     ):
         payload_field = (
-            "adapter_manifest_sha256"
-            if field == "adapter_manifest_sha256"
-            else field
+            "adapter_manifest_sha256" if field == "adapter_manifest_sha256" else field
         )
         if payload.get(payload_field) != identity.get(field):
             raise RuntimeError(f"task payload {field} is not pinned to receipt")
@@ -323,8 +323,7 @@ def verify_payload(
         != manifest.get("generation_artifact_inventory_sha256")
         or payload.get("relocation_contract_sha256")
         != (manifest.get("relocation") or {}).get("contract_sha256")
-        or payload.get("search_interface_schema_version")
-        != SEARCH_INTERFACE_SCHEMA
+        or payload.get("search_interface_schema_version") != SEARCH_INTERFACE_SCHEMA
         or payload.get("population") != 320
         or payload.get("max_generations") != 300
         or not execution_threads_match
@@ -339,8 +338,7 @@ def verify_payload(
         or ready.get("bundle_manifest_sha256") != manifest_sha
         or ready.get("every_file_sha256_verified") is not True
         or ready.get("runtime_verified") is not True
-        or ready.get("code_inventory_sha256")
-        != manifest.get("code_inventory_sha256")
+        or ready.get("code_inventory_sha256") != manifest.get("code_inventory_sha256")
         or ready.get("relocation_contract_sha256")
         != manifest["relocation"]["contract_sha256"]
         or ready.get("remote_git_checkout_performed") is not False
@@ -360,9 +358,7 @@ def verify_payload(
     for relative, record in manifest["code_inventory"].items():
         _verify_file(contained(bundle, relative), record, f"code file {relative}")
     marker = contained(bundle, "artifacts/code/.source-revision")
-    if marker.read_text(encoding="ascii").strip() != manifest[
-        "bundle_code_revision"
-    ]:
+    if marker.read_text(encoding="ascii").strip() != manifest["bundle_code_revision"]:
         raise RuntimeError("bundle source revision marker mismatch")
 
     relocation_path = contained(bundle, manifest["relocation"]["path"])
@@ -373,8 +369,7 @@ def verify_payload(
         relocation.get("schema_version") != RELOCATION_SCHEMA
         or canonical_sha256(relocation) != manifest["relocation"]["contract_sha256"]
         or relocation.get("source_absolute_paths_are_documentary_only") is not True
-        or relocation.get("local_adapter_authentication_replayed_remotely")
-        is not False
+        or relocation.get("local_adapter_authentication_replayed_remotely") is not False
         or relocation.get("generation_report_bytes_mutated") is not False
         or relocation.get("remote_git_checkout_required") is not False
     ):
@@ -391,8 +386,7 @@ def verify_payload(
 
     receipt_path = contained(bundle, paths["adapter_receipt"])
     if (
-        sha256_file(receipt_path)
-        != manifest["adapter_receipt"]["file_sha256"]
+        sha256_file(receipt_path) != manifest["adapter_receipt"]["file_sha256"]
         or sha256_file(receipt_path) != payload["adapter_receipt_file_sha256"]
     ):
         raise RuntimeError("relocated adapter receipt fingerprint mismatch")
@@ -413,14 +407,12 @@ def verify_payload(
     if training_profile_sha256(profile) != identity["profile_canonical_sha256"]:
         raise RuntimeError("relocated profile canonical fingerprint mismatch")
     report = read_json(contained(bundle, paths["train_report"]))
-    if (
-        report.get("targets") != list(CORRECTED_GENERATION_TARGETS)
-        or report.get("artifacts")
-        != {
-            relative: record["sha256"]
-            for relative, record in manifest["generation_artifacts"].items()
-        }
-    ):
+    if report.get("targets") != list(CORRECTED_GENERATION_TARGETS) or report.get(
+        "artifacts"
+    ) != {
+        relative: record["sha256"]
+        for relative, record in manifest["generation_artifacts"].items()
+    }:
         raise RuntimeError("relocated generation report inventory mismatch")
     generation = contained(bundle, paths["generation"])
     for relative in expected_generation_artifacts():
@@ -456,10 +448,9 @@ def verify_payload(
             warm[kind],
             f"selected warm {kind}",
         )
-    if (
-        warm["artifact"]["sha256"] != payload.get("warm_artifact_sha256")
-        or warm["contract"]["sha256"] != payload.get("warm_contract_sha256")
-    ):
+    if warm["artifact"]["sha256"] != payload.get("warm_artifact_sha256") or warm[
+        "contract"
+    ]["sha256"] != payload.get("warm_contract_sha256"):
         raise RuntimeError("task warm identity mismatch")
     return payload, manifest, relocation
 
@@ -476,6 +467,109 @@ def _process_rss_bytes(pid: int) -> int | None:
     except (OSError, UnicodeError, ValueError, IndexError):
         return None
     return None
+
+
+PHASE_B_CHILD_MARKER = "final1000-finite-multiseed-phase-b-v1"
+PHASE_B_CHILD_CPUSET_ENV = "MFT_FINAL1000_PHASE_B_CHILD_CPUSET"
+PHASE_B_CHILD_MARKER_ENV = "MFT_FINAL1000_PHASE_B_CHILD_PROTOCOL"
+PHASE_B_CHILD_CPUS = 4
+PHASE_B_CHILD_RESOURCE_TELEMETRY_SCHEMA = (
+    "mft-tier1-final1000-phase-b-child-cpu-telemetry-v1"
+)
+
+
+def _process_tree_cpu_seconds() -> float | None:
+    try:
+        import resource
+
+        own = resource.getrusage(resource.RUSAGE_SELF)
+        children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    except (ImportError, OSError, ValueError):
+        return None
+    value = (
+        float(own.ru_utime)
+        + float(own.ru_stime)
+        + float(children.ru_utime)
+        + float(children.ru_stime)
+    )
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def phase_b_child_resource_telemetry(
+    *,
+    wall_started: float,
+    cpu_started: float | None,
+) -> dict[str, Any]:
+    """Measure this seed-runner plus its optimizer descendants."""
+
+    wall = max(0.0, time.monotonic() - wall_started)
+    cpu_finished = _process_tree_cpu_seconds()
+    available = cpu_started is not None and cpu_finished is not None
+    cpu = max(0.0, cpu_finished - cpu_started) if available else None
+    capacity = wall * PHASE_B_CHILD_CPUS
+    utilization = (
+        cpu / capacity
+        if cpu is not None and capacity > 0
+        else (0.0 if cpu is not None else None)
+    )
+    return {
+        "schema_version": PHASE_B_CHILD_RESOURCE_TELEMETRY_SCHEMA,
+        "available": available,
+        "measurement": (
+            "resource.getrusage(self+children)-delta"
+            if available
+            else "unavailable-on-platform"
+        ),
+        "child_cpus": PHASE_B_CHILD_CPUS,
+        "wall_time_seconds": wall,
+        "process_tree_cpu_seconds": cpu,
+        "cpu_capacity_seconds": capacity,
+        "cpu_utilization_fraction": utilization,
+    }
+
+
+def apply_phase_b_child_affinity(
+    environment: Mapping[str, str],
+    *,
+    platform_name: str | None = None,
+    affinity_getter: Callable[[int], set[int]] | None = None,
+    affinity_setter: Callable[[int, set[int]], None] | None = None,
+) -> tuple[int, ...] | None:
+    """Apply one declared disjoint child cpuset before optimizer creation.
+
+    The Scheduler already starts the concurrent parent inside one exact,
+    exclusive 16/32-CPU step.  Starting nested ``srun --exclusive`` steps from
+    inside that owning step can deadlock on the CPUs held by the outer step, so
+    Phase B partitions the inherited cgroup/affinity mask in userspace.  The
+    optimizer inherits this exact mask from its fresh seed-runner subprocess.
+    """
+
+    marker = environment.get(PHASE_B_CHILD_MARKER_ENV)
+    encoded = environment.get(PHASE_B_CHILD_CPUSET_ENV)
+    if marker is None and encoded is None:
+        return None
+    if marker != PHASE_B_CHILD_MARKER or encoded is None:
+        raise RuntimeError("Phase B child affinity declaration is incomplete")
+    fields = encoded.split(",")
+    if len(fields) != PHASE_B_CHILD_CPUS or any(
+        not field.isascii() or not field.isdigit() for field in fields
+    ):
+        raise RuntimeError("Phase B child cpuset is not four canonical CPU ids")
+    cpus = tuple(int(field) for field in fields)
+    if len(set(cpus)) != PHASE_B_CHILD_CPUS or encoded != ",".join(map(str, cpus)):
+        raise RuntimeError("Phase B child cpuset is not canonical and unique")
+    selected_platform = platform_name or os.name
+    getter = affinity_getter or getattr(os, "sched_getaffinity", None)
+    setter = affinity_setter or getattr(os, "sched_setaffinity", None)
+    if selected_platform != "posix" or getter is None or setter is None:
+        raise RuntimeError("Phase B child affinity requires Linux sched affinity")
+    inherited = set(getter(0))
+    if not set(cpus).issubset(inherited):
+        raise RuntimeError("Phase B child cpuset escaped the Scheduler affinity mask")
+    setter(0, set(cpus))
+    if set(getter(0)) != set(cpus):
+        raise RuntimeError("Phase B child cpuset could not be enforced exactly")
+    return cpus
 
 
 def _payload_sha_matches(value: Mapping[str, Any]) -> bool:
@@ -517,23 +611,18 @@ def validate_remote_preflight(
         != len(expected_generation_artifacts())
         or value.get("generation_artifact_inventory_sha256")
         != manifest["generation_artifact_inventory_sha256"]
-        or value.get("adapter_manifest_sha256")
-        != payload["adapter_manifest_sha256"]
+        or value.get("adapter_manifest_sha256") != payload["adapter_manifest_sha256"]
         or value.get("train_report_sha256") != payload["train_report_sha256"]
         or value.get("dataset_sha256") != payload["dataset_sha256"]
-        or value.get("profile_canonical_sha256")
-        != payload["profile_canonical_sha256"]
+        or value.get("profile_canonical_sha256") != payload["profile_canonical_sha256"]
         or value.get("temperature_contract_sha256")
         != payload["temperature_contract_sha256"]
         or value.get("hard_constraint_contract_sha256")
         != payload["hard_constraint_contract_sha256"]
         or value.get("stage_spec_sha256") != payload["hard_spec_sha256"]
-        or value.get("island_profile_sha256")
-        != payload["island_profile_sha256"]
-        or value.get("warm_artifact_sha256")
-        != payload["warm_artifact_sha256"]
-        or value.get("warm_contract_sha256")
-        != payload["warm_contract_sha256"]
+        or value.get("island_profile_sha256") != payload["island_profile_sha256"]
+        or value.get("warm_artifact_sha256") != payload["warm_artifact_sha256"]
+        or value.get("warm_contract_sha256") != payload["warm_contract_sha256"]
         or value.get("loaded_model_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
         or value.get("loaded_model_targets_sha256")
         != CURRENT_REQUIRED_MODEL_TARGETS_SHA256
@@ -581,6 +670,69 @@ def validate_remote_preflight(
     return observed_rss
 
 
+def validate_phase_b_semlock_preflight(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Require the repeated-predict SemLock gate for concurrent Phase B."""
+
+    binding = value.get("inference_binding")
+    stress = value.get("semlock_free_repeated_predict")
+    release = value.get("semlock_safe_inference_release")
+    if (
+        not isinstance(binding, dict)
+        or not isinstance(stress, dict)
+        or not isinstance(release, dict)
+    ):
+        raise RuntimeError("Phase B SemLock preflight evidence is missing")
+    stress_unsigned = {key: item for key, item in stress.items() if key != "sha256"}
+    family_threads = binding.get("family_threads")
+    families = binding.get("families")
+    semaphore_free_families = binding.get("semaphore_free_families")
+    release_unsigned = {key: item for key, item in release.items() if key != "sha256"}
+    if (
+        binding.get("target_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or not isinstance(binding.get("model_count"), int)
+        or binding["model_count"] < len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or not isinstance(families, list)
+        or not families
+        or families != sorted(set(families))
+        or not isinstance(family_threads, dict)
+        or not isinstance(semaphore_free_families, list)
+        or not semaphore_free_families
+        or semaphore_free_families
+        != sorted(set(families) & {"extratrees", "randomforest"})
+        or any(family_threads.get(family) != 1 for family in semaphore_free_families)
+        or binding.get("semaphore_free_sklearn_forest") is not True
+        or binding.get("policy") != PHASE_B_INFERENCE_POLICY
+        or stress.get("schema_version") != PHASE_B_SEMLOCK_STRESS_SCHEMA
+        or stress.get("sha256") != canonical_sha256(stress_unsigned)
+        or stress.get("status") != "passed"
+        or not isinstance(stress.get("repeats"), int)
+        or stress["repeats"] < 2
+        or stress.get("target_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or stress.get("predict_call_count")
+        != stress["repeats"] * len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or stress.get("covered_sklearn_forest_count", 0)
+        < len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or stress.get("joblib_thread_pool_construction_attempt_count") != 0
+        or stress.get("multiprocessing_semlock_construction_attempt_count") != 0
+        or stress.get("sklearn_forest_n_jobs") != 1
+        or stress.get("tmp_isolation_claimed_as_fix") is not False
+        or stress.get("direct_enospc_cause")
+        != "joblib-threadpool-simplequeue-semlock-churn"
+        or release.get("sha256") != canonical_sha256(release_unsigned)
+        or release.get("required_release_commit") != PHASE_B_SEMLOCK_SAFE_RELEASE_COMMIT
+        or release.get("smoke_schema") != "mft-tier1-semlock-safe-inference-smoke-v1"
+        or release.get("helper_relative_path")
+        != "tools/tier1_semlock_safe_inference_smoke.py"
+        or release.get("helper_sha256") != PHASE_B_SEMLOCK_SAFE_HELPER_SHA256
+        or release.get("semaphore_free_sklearn_families")
+        != ["extratrees", "randomforest"]
+        or release.get("helper_code_inventory_authenticated") is not True
+        or release.get("tmp_isolation_claimed_as_enospc_fix") is not False
+    ):
+        raise RuntimeError("Phase B repeated-predict SemLock gate mismatch")
+    return dict(stress)
+
+
 def validate_result(
     result: Mapping[str, Any],
     *,
@@ -595,8 +747,7 @@ def validate_result(
         if str(name).startswith("temperature_robust_limit:")
     ]
     expected_constraints = [
-        f"temperature_robust_limit:{target}"
-        for target in CURRENT_TEMPERATURE_TARGETS
+        f"temperature_robust_limit:{target}" for target in CURRENT_TEMPERATURE_TARGETS
     ]
     topology = result.get("optimizer_topology_evolution_audit") or {}
     topology_unsigned = {
@@ -637,12 +788,10 @@ def validate_result(
         != payload.get("scheduler_cpus", payload["inference_threads"])
         or result.get("generation_artifact_inventory_sha256")
         != manifest["generation_artifact_inventory_sha256"]
-        or result.get("adapter_manifest_sha256")
-        != payload["adapter_manifest_sha256"]
+        or result.get("adapter_manifest_sha256") != payload["adapter_manifest_sha256"]
         or result.get("train_report_sha256") != payload["train_report_sha256"]
         or result.get("dataset_sha256") != payload["dataset_sha256"]
-        or result.get("profile_canonical_sha256")
-        != payload["profile_canonical_sha256"]
+        or result.get("profile_canonical_sha256") != payload["profile_canonical_sha256"]
         or result.get("temperature_contract_sha256")
         != payload["temperature_contract_sha256"]
         or result.get("hard_constraint_contract_sha256")
@@ -673,12 +822,9 @@ def validate_result(
             or record["size_bytes"] <= 0
             for record in artifact_inventory.values()
         )
-        or result.get("island_profile_sha256")
-        != payload["island_profile_sha256"]
-        or result.get("warm_artifact_sha256")
-        != payload["warm_artifact_sha256"]
-        or result.get("warm_contract_sha256")
-        != payload["warm_contract_sha256"]
+        or result.get("island_profile_sha256") != payload["island_profile_sha256"]
+        or result.get("warm_artifact_sha256") != payload["warm_artifact_sha256"]
+        or result.get("warm_contract_sha256") != payload["warm_contract_sha256"]
         or result.get("temperature_targets") != list(CURRENT_TEMPERATURE_TARGETS)
         or thermal_constraints != expected_constraints
         or result.get("fixed_primary_turns") != lane["fixed_primary_turns"]
@@ -862,14 +1008,26 @@ def run(
     payload, manifest, relocation = verify_payload(
         bundle, payload_path, payload_root, expected_payload_sha256
     )
+    phase_b_cpu_set = apply_phase_b_child_affinity(os.environ)
+    phase_b_wall_started = time.monotonic()
+    phase_b_cpu_started = (
+        _process_tree_cpu_seconds() if phase_b_cpu_set is not None else None
+    )
     task_id = str(os.environ.get("SLURM_SCHED_TASK_ID") or f"pid-{os.getpid()}")
     seed = int(payload["seed"])
     output = bundle / "runs" / f"task-{task_id}" / f"seed-{seed}"
     output.mkdir(parents=True, exist_ok=True)
-    status_path = output.parent / "seed_status.json"
-    preflight_path = output / manifest["search_execution"][
-        "remote_preflight_filename"
-    ]
+    # Sequential Phase A retains its exact legacy journal path.  Concurrent
+    # Phase B must never let sibling subprocesses overwrite one shared file,
+    # so its opt-in marker places the mutable legacy status inside the seed's
+    # already isolated output directory.  The parent later seals this status
+    # into the immutable child receipt without changing task/payload identity.
+    status_path = (
+        output / "legacy_seed_status.json"
+        if phase_b_cpu_set is not None
+        else output.parent / "seed_status.json"
+    )
+    preflight_path = output / manifest["search_execution"]["remote_preflight_filename"]
     status: dict[str, Any] = {
         "schema_version": STATUS_SCHEMA,
         "state": "starting",
@@ -892,6 +1050,9 @@ def run(
         "aedt_used": False,
         "automatic_promotion_allowed": False,
     }
+    if phase_b_cpu_set is not None:
+        status["phase_b_cpu_set"] = list(phase_b_cpu_set)
+        status["phase_b_child_journal_isolated"] = True
     atomic_json(status_path, status)
     command = _optimizer_command(
         bundle, payload, manifest, relocation, output, preflight_path
@@ -939,6 +1100,11 @@ def run(
             manifest=manifest,
             optimizer_pid=process.pid,
         )
+        semlock_stress = (
+            validate_phase_b_semlock_preflight(preflight)
+            if phase_b_cpu_set is not None
+            else None
+        )
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         if process.poll() is None:
             process.terminate()
@@ -958,6 +1124,13 @@ def run(
             "finished_at": now(),
             "updated_at": now(),
         }
+        if phase_b_cpu_set is not None:
+            failed["phase_b_child_resource_telemetry"] = (
+                phase_b_child_resource_telemetry(
+                    wall_started=phase_b_wall_started,
+                    cpu_started=phase_b_cpu_started,
+                )
+            )
         atomic_json(status_path, failed)
         return 72
     status.update(
@@ -968,9 +1141,10 @@ def run(
         full_generation_authentication_passes=preflight[
             "full_generation_authentication_passes"
         ],
-        authenticated_artifact_count=preflight[
-            "authenticated_artifact_count"
-        ],
+        authenticated_artifact_count=preflight["authenticated_artifact_count"],
+        phase_b_semlock_stress_sha256=(
+            semlock_stress["sha256"] if semlock_stress is not None else None
+        ),
         observed_peak_rss_bytes=observed_rss,
         updated_at=now(),
     )
@@ -1019,6 +1193,11 @@ def run(
     else:
         terminal["failure"] = f"optimizer exit code {exit_code}"
     terminal["exit_code"] = exit_code
+    if phase_b_cpu_set is not None:
+        terminal["phase_b_child_resource_telemetry"] = phase_b_child_resource_telemetry(
+            wall_started=phase_b_wall_started,
+            cpu_started=phase_b_cpu_started,
+        )
     atomic_json(status_path, terminal)
     return exit_code
 

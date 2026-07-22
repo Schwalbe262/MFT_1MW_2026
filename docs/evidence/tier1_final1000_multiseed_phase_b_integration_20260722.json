@@ -1,0 +1,76 @@
+{
+  "aedt_used": false,
+  "authority_release_requires_stable_exit_consumer_and_inventory": true,
+  "child_runtime_tmp_isolation_tested": true,
+  "cpu_affinity_isolation_tested": true,
+  "cpu_telemetry": {
+    "automatic_child_cpu_reduction_allowed": false,
+    "current_child_cpus": 4,
+    "future_comparison_child_cpu_counts": [
+      1,
+      2,
+      4
+    ],
+    "parent_aggregate_cpu_time_contract_tested": true,
+    "per_child_process_tree_cpu_elapsed_utilization_tested": true,
+    "parent_child_cpu_crosscheck_tested": true
+  },
+  "dispatch_admission": {
+    "default_model_load_stagger_seconds": 5.0,
+    "eight_lane_dispatch_fill_seconds": 35.0,
+    "scheduler_ready_lane_reserve": 0,
+    "speculative_ready_lane_submission_allowed": false
+  },
+  "elapsed_seconds": 85.73,
+  "evidence_sha256": "f798b97c6188e3edd94c4048383c71e93d3dcec542aeddfcd754e7db39384c77",
+  "failed": 0,
+  "fea_submission_performed": false,
+  "finite_cpu_benchmark_design": {
+    "automatic_resource_policy_change_allowed": false,
+    "cpu_counts": [
+      4,
+      6,
+      8
+    ],
+    "density_configurations": [
+      "exact-8x4",
+      "experimental-10x4-on-32"
+    ],
+    "same_node_model_seed_required": true,
+    "total_logical_run_count": 58
+  },
+  "full_inventory_shadow": {
+    "helper_commit": "dafb4509d52f4abcacb68c7bacfc850468d7dc1f",
+    "live_scheduler_shadow_performed": false,
+    "page_count": 2,
+    "reviewed_helper_interface_fixture": true,
+    "row_count": 13005,
+    "scheduler_post_count": 0
+  },
+  "independent_root_run": false,
+  "isolated_worktree_run": true,
+  "observed_at": "2026-07-22T23:11:05+09:00",
+  "passed": 16,
+  "phase_b_migration_scheduler_post_count": 0,
+  "production_eligible": false,
+  "real_four_child_overlap_test_passed": true,
+  "remote_write_performed": false,
+  "repeated_predict_stress": {
+    "direct_enospc_cause": "joblib-threadpool-simplequeue-semlock-churn",
+    "joblib_thread_pool_construction_attempt_count": 0,
+    "multiprocessing_semlock_construction_attempt_count": 0,
+    "predict_call_count": 1280,
+    "repeats": 64,
+    "sklearn_forest_n_jobs": 1,
+    "target_count": 20,
+    "tmp_isolation_claimed_as_fix": false
+  },
+  "resource_envelope_1_through_8_tested": true,
+  "scheduler_write_performed": false,
+  "schema_version": "mft-tier1-final1000-phase-b-integration-test-evidence-v1",
+  "shared_tmp_cleanup_performed": false,
+  "single_mutation_authority_handoff_tested": true,
+  "skipped": 1,
+  "submission_performed": false,
+  "test_command": "python -m pytest -q tests/test_tier1_final1000_multiseed_phase_b.py"
+}
