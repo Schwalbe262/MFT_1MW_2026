@@ -82,7 +82,9 @@ PRODUCTION_FIXED_GENERATIONS = 300
 PRODUCTION_POPULATION = 320
 PRODUCTION_INFERENCE_THREADS = 8
 DETERMINISTIC_TERMINAL_INFERENCE_THREADS = 1
-SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {"extratrees"}
+SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {
+    "extratrees", "randomforest",
+}
 FAMILY_SPECIFIC_INFERENCE_POLICY = (
     "family_specific_semaphore_free_sklearn_forest_v1"
 )
@@ -2795,6 +2797,7 @@ def _terminal_inference_binding_contract(
         "xgboost",
         "catboost",
         "extratrees",
+        "randomforest",
     }
     if (
         isinstance(threads, bool)
