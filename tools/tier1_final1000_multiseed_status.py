@@ -26,6 +26,8 @@ try:
         COMPACT_INDEX_SCHEMA,
         COMPACT_STATUS_SCHEMA,
         MAX_PHYSICAL_LANES,
+        MAX_BATCH_LENGTH,
+        PROTOCOL_VERSION,
         SHARD_MANIFEST_SCHEMA,
         json_bytes,
         now,
@@ -40,6 +42,8 @@ except ImportError:  # pragma: no cover - repository import path
         COMPACT_INDEX_SCHEMA,
         COMPACT_STATUS_SCHEMA,
         MAX_PHYSICAL_LANES,
+        MAX_BATCH_LENGTH,
+        PROTOCOL_VERSION,
         SHARD_MANIFEST_SCHEMA,
         json_bytes,
         now,
@@ -51,6 +55,20 @@ DEFAULT_SHARD_SIZE = 256
 DEFAULT_FRONTEND_PAGE_SIZE = 256
 MAX_FRONTEND_PAGE_SIZE = 4096
 MAX_HOT_WIRE_BYTES = 32 * 1024 * 1024
+SINGLE_SEED_PROTOCOL = "final1000-single-seed-v1"
+TERMINAL_LANE_STATES = frozenset(
+    {
+        "completed",
+        "completed_with_failures",
+        "failed",
+        "cancelled",
+        "canceled",
+        "timeout",
+        "timed_out",
+        "stopped",
+        "deadline",
+    }
+)
 
 
 def _sha_bytes(value: bytes) -> str:
@@ -69,6 +87,25 @@ def _physical_lane(value: Mapping[str, Any]) -> dict[str, Any]:
     task_id = value.get("task_id", value.get("id"))
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
         raise RuntimeError("compact status physical lane lacks a Scheduler task id")
+    protocol = value.get("protocol_version") or SINGLE_SEED_PROTOCOL
+    if protocol not in {SINGLE_SEED_PROTOCOL, PROTOCOL_VERSION}:
+        raise RuntimeError("compact status physical lane protocol is unknown")
+    state = str(value.get("state") or "unknown").lower()
+    if protocol == PROTOCOL_VERSION:
+        batch_length = value.get("batch_length")
+        sealed_child_count = value.get("sealed_child_count")
+        if (
+            isinstance(batch_length, bool)
+            or not isinstance(batch_length, int)
+            or not 1 <= batch_length <= MAX_BATCH_LENGTH
+            or isinstance(sealed_child_count, bool)
+            or not isinstance(sealed_child_count, int)
+            or not 0 <= sealed_child_count <= batch_length
+        ):
+            raise RuntimeError("compact status batch lane cursor is invalid")
+    else:
+        batch_length = 1
+        sealed_child_count = 1 if state in TERMINAL_LANE_STATES else 0
     # Payloads are authenticated elsewhere and intentionally excluded from the
     # hot wire.  This is a bounded physical-lane summary, not scientific history.
     return {
@@ -84,7 +121,66 @@ def _physical_lane(value: Mapping[str, Any]) -> dict[str, Any]:
             "started_at",
             "updated_at",
         )
-    } | {"task_id": int(task_id)}
+    } | {
+        "task_id": int(task_id),
+        "protocol_version": protocol,
+        "state": state,
+        "batch_length": int(batch_length),
+        "sealed_child_count": int(sealed_child_count),
+    }
+
+
+def _visible_seed_records(
+    lanes: Sequence[Mapping[str, Any]],
+    seed_records: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Return only child records proven inside each visible parent's seal.
+
+    Historical records whose physical parent is no longer in the bounded hot
+    lane inventory remain visible.  When a batch parent is present, however,
+    its ordinal must be authenticated and strictly below ``sealed_child_count``.
+    This keeps a receipt observed in the cursor/receipt crash window out of the
+    8010 projection until the parent journal seals that exact prefix.
+    """
+
+    by_task_id = {int(lane["task_id"]): lane for lane in lanes}
+    visible: list[dict[str, Any]] = []
+    hidden = 0
+    for raw in seed_records:
+        record = _public(raw)
+        parent_task_id = record.get("physical_parent_task_id")
+        if parent_task_id is None:
+            visible.append(record)
+            continue
+        if (
+            isinstance(parent_task_id, bool)
+            or not isinstance(parent_task_id, int)
+            or parent_task_id <= 0
+        ):
+            raise RuntimeError("compact status child record parent id is invalid")
+        lane = by_task_id.get(parent_task_id)
+        if lane is None:
+            # The compact hot inventory is bounded to current physical lanes;
+            # immutable history from an older parent is already sealed by the
+            # harvester and must not disappear merely because that lane drained.
+            visible.append(record)
+            continue
+        if lane.get("protocol_version") != PROTOCOL_VERSION:
+            raise RuntimeError(
+                "compact status child record points at a non-batch physical lane"
+            )
+        ordinal = record.get("batch_ordinal")
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or not 0 <= ordinal < int(lane["batch_length"])
+        ):
+            raise RuntimeError("compact status child record ordinal is invalid")
+        if ordinal >= int(lane["sealed_child_count"]):
+            hidden += 1
+            continue
+        visible.append(record)
+    return visible, hidden
 
 
 def _normalized_frontend_status(
@@ -101,6 +197,13 @@ def _normalized_frontend_status(
         "schema_version": COHORT_STATUS_SCHEMA,
         "updated_at": status["updated_at"],
         "scheduler_task_count": status["physical_lane_count"],
+        "physical_lane_count": status["physical_lane_count"],
+        "logical_seed_count": status["logical_seed_count"],
+        "logical_sealed_seed_count": status["logical_sealed_seed_count"],
+        "logical_unsealed_seed_count": status["logical_unsealed_seed_count"],
+        "hidden_unsealed_seed_record_count": status[
+            "hidden_unsealed_seed_record_count"
+        ],
         "state_counts": copy.deepcopy(status["state_counts"]),
         "latest_tasks": copy.deepcopy(status["latest_tasks"]),
         "authenticated_terminal_seed_count": status[
@@ -139,8 +242,9 @@ def build_compact_snapshot(
     task_ids = [int(item["task_id"]) for item in lanes]
     if len(task_ids) != len(set(task_ids)):
         raise RuntimeError("compact status repeats a physical Scheduler task id")
+    visible_records, hidden_unsealed_count = _visible_seed_records(lanes, seed_records)
     records = sorted(
-        (_public(item) for item in seed_records),
+        visible_records,
         key=lambda item: (str(item.get("bundle_id") or ""), int(item.get("seed", -1))),
     )
     identities = [
@@ -209,6 +313,15 @@ def build_compact_snapshot(
         "stage_id": stage_id,
         "updated_at": timestamp,
         "physical_lane_count": len(lanes),
+        "logical_seed_count": sum(int(item["batch_length"]) for item in lanes),
+        "logical_sealed_seed_count": sum(
+            int(item["sealed_child_count"]) for item in lanes
+        ),
+        "logical_unsealed_seed_count": sum(
+            int(item["batch_length"]) - int(item["sealed_child_count"])
+            for item in lanes
+        ),
+        "hidden_unsealed_seed_record_count": hidden_unsealed_count,
         "state_counts": dict(
             sorted(
                 Counter(str(item.get("state") or "unknown") for item in lanes).items()
@@ -274,6 +387,11 @@ def build_compact_snapshot(
             "normalized_index_schema_version": CURRENT7_INDEX_SCHEMA,
             "terminal_results_field": "terminal_results",
             "on_demand": True,
+        },
+        "count_contract": {
+            "scheduler_task_count_field": "physical_lane_count",
+            "logical_seed_count_field": "logical_seed_count",
+            "sealed_prefix_rule": "batch_ordinal < sealed_child_count",
         },
         "virtual_scheduler_task_ids_created": False,
     }
