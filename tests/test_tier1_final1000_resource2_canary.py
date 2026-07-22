@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 from pathlib import Path
 from typing import Any
+import urllib.error
 import urllib.parse
 
 import pytest
@@ -408,13 +410,19 @@ def test_remote_baseline_reverification_reads_and_hashes_actual_bytes(
     )
     assert receipt["reverified"] is True
     assert receipt["scheduler_remote_file_get_count"] == 1
+    assert receipt["scheduler_remote_file_attempt_count"] == 1
+    assert receipt["remote_read_policy"] == canary._remote_read_policy()
+    assert (
+        receipt["remote_file_read_attempts"][0]["read_limit_bytes"] == len(payload) + 1
+    )
 
 
-def test_bounded_remote_reader_requests_full_bound_and_checks_receipt(
+def test_bounded_remote_reader_requests_expected_size_plus_one_and_checks_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ):
     payload = b"sealed remote evidence\n"
     observed: dict[str, Any] = {}
+    audit: list[dict[str, Any]] = []
 
     class Response:
         def __enter__(self):
@@ -439,16 +447,27 @@ def test_bounded_remote_reader_requests_full_bound_and_checks_receipt(
         relative_path="runs/task-84880/result.json",
         expected_size=len(payload),
         expected_sha256=hashlib.sha256(payload).hexdigest(),
+        attempt_audit=audit,
     )
     query = urllib.parse.parse_qs(urllib.parse.urlparse(observed["url"]).query)
     assert result == payload
     assert query == {
         "base": ["remote_cwd"],
-        "max_bytes": [str(canary.MAX_REMOTE_EVIDENCE_BYTES)],
+        "max_bytes": [str(len(payload) + 1)],
         "path": ["runs/task-84880/result.json"],
     }
-    assert observed["read_limit"] == canary.MAX_REMOTE_EVIDENCE_BYTES + 1
+    assert observed["read_limit"] == len(payload) + 1
     assert observed["timeout"] == 60.0
+    assert audit == [
+        {
+            "relative_path": "runs/task-84880/result.json",
+            "expected_size": len(payload),
+            "request_max_bytes": len(payload) + 1,
+            "read_limit_bytes": len(payload) + 1,
+            "attempt_count": 1,
+            "retry_count": 0,
+        }
+    ]
 
 
 def test_bounded_remote_reader_accepts_sealed_empty_file(
@@ -480,14 +499,309 @@ def test_bounded_remote_reader_accepts_sealed_empty_file(
 
 
 def test_bounded_remote_reader_fails_closed_on_oversize_receipt():
-    with pytest.raises(RuntimeError, match="exceeds the 100 MiB bound"):
+    with pytest.raises(RuntimeError, match="reaches or exceeds the 16 MiB hard cap"):
         canary._remote_file_bytes_bounded(
             scheduler_url="http://127.0.0.1:8002",
             task_id=84_880,
             relative_path="result.json",
-            expected_size=canary.MAX_REMOTE_EVIDENCE_BYTES + 1,
+            expected_size=canary.REMOTE_EVIDENCE_HARD_CAP_BYTES,
             expected_sha256="a" * 64,
         )
+
+
+@pytest.mark.parametrize(
+    "mutated",
+    [b"prefix-sealed", b"sealed-suffix"],
+)
+def test_bounded_remote_reader_rejects_extra_prefix_or_suffix(
+    monkeypatch: pytest.MonkeyPatch, mutated: bytes
+):
+    expected = b"sealed"
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, limit: int) -> bytes:
+            return mutated[:limit]
+
+    monkeypatch.setattr(
+        canary.urllib.request, "urlopen", lambda *_args, **_kwargs: Response()
+    )
+    with pytest.raises(RuntimeError, match="length differs"):
+        canary._remote_file_bytes_bounded(
+            scheduler_url="http://127.0.0.1:8002",
+            task_id=84_880,
+            relative_path="result.json",
+            expected_size=len(expected),
+            expected_sha256=hashlib.sha256(expected).hexdigest(),
+        )
+
+
+def test_bounded_remote_reader_rejects_same_length_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    expected = b"sealed"
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b"SEaled"
+
+    monkeypatch.setattr(
+        canary.urllib.request, "urlopen", lambda *_args, **_kwargs: Response()
+    )
+    with pytest.raises(RuntimeError, match="SHA differs"):
+        canary._remote_file_bytes_bounded(
+            scheduler_url="http://127.0.0.1:8002",
+            task_id=84_880,
+            relative_path="result.json",
+            expected_size=len(expected),
+            expected_sha256=hashlib.sha256(expected).hexdigest(),
+        )
+
+
+def test_unsealed_remote_reader_rejects_ambiguous_live_hard_cap(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, limit: int) -> bytes:
+            assert limit == canary.REMOTE_EVIDENCE_HARD_CAP_BYTES
+            return b"x" * limit
+
+    monkeypatch.setattr(
+        canary.urllib.request, "urlopen", lambda *_args, **_kwargs: Response()
+    )
+    with pytest.raises(RuntimeError, match="ambiguous hard bound"):
+        canary._remote_file_bytes_bounded(
+            scheduler_url="http://127.0.0.1:8002",
+            task_id=84_880,
+            relative_path="result.json",
+        )
+
+
+def _http_error(code: int, body: bytes) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "http://127.0.0.1:8002/api/tasks/84880/remote-file",
+        code,
+        "busy",
+        {},
+        io.BytesIO(body),
+    )
+
+
+def test_remote_reader_retries_429_and_503_with_sealed_increasing_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = b"sealed"
+    outcomes: list[Any] = [_http_error(429, b"busy"), _http_error(503, b"busy")]
+    sleeps: list[float] = []
+    audit: list[dict[str, Any]] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return payload
+
+    outcomes.append(Response())
+
+    def urlopen(*_args, **_kwargs):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(canary.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(canary.time, "sleep", sleeps.append)
+    assert (
+        canary._remote_file_bytes_bounded(
+            scheduler_url="http://127.0.0.1:8002",
+            task_id=84_880,
+            relative_path="result.json",
+            expected_size=len(payload),
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            attempt_audit=audit,
+        )
+        == payload
+    )
+    assert sleeps == [0.25, 0.5]
+    assert audit[0]["attempt_count"] == 3
+    assert audit[0]["retry_count"] == 2
+    assert canary._remote_read_policy()["maximum_attempts"] == 4
+
+
+def test_remote_reader_bounds_error_body_and_retry_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = 0
+    sleeps: list[float] = []
+
+    def urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return (_ for _ in ()).throw(
+            _http_error(
+                429,
+                b"A" * canary.HTTP_ERROR_BODY_LIMIT_BYTES + b"SECRET-SUFFIX",
+            )
+        )
+
+    monkeypatch.setattr(canary.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(canary.time, "sleep", sleeps.append)
+    with pytest.raises(RuntimeError) as caught:
+        canary._remote_file_bytes_bounded(
+            scheduler_url="http://127.0.0.1:8002",
+            task_id=84_880,
+            relative_path="result.json",
+        )
+    assert calls == canary.REMOTE_READ_MAX_ATTEMPTS
+    assert sleeps == list(canary.REMOTE_READ_BACKOFF_SECONDS)
+    assert "after 4/4 attempts" in str(caught.value)
+    assert "[truncated]" in str(caught.value)
+    assert "SECRET-SUFFIX" not in str(caught.value)
+
+
+def test_real_resource2_client_allows_exactly_one_exact_additive_post(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    package = _minimal_package(_config(), monkeypatch)
+    candidate = package["candidate_task"]
+    requests: list[Any] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return json.dumps({"id": 90_001, **candidate}).encode("utf-8")
+
+    def urlopen(request, *, timeout: float):
+        requests.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(canary.urllib.request, "urlopen", urlopen)
+    client = canary.Resource2AdditiveSchedulerClient(
+        "http://127.0.0.1:8002", expected_task=candidate
+    )
+    response = client.submit_task(candidate)
+    assert response["id"] == 90_001
+    assert client.post_count == 1
+    assert len(requests) == 1
+    request, timeout = requests[0]
+    assert request.method == "POST"
+    assert request.full_url == "http://127.0.0.1:8002/api/tasks"
+    assert json.loads(request.data.decode("utf-8")) == candidate
+    assert timeout == 30.0
+    for forbidden in (
+        "cancel_task",
+        "preempt_task",
+        "request_allocation",
+        "pin_allocation",
+        "_request",
+    ):
+        assert not hasattr(client, forbidden)
+    with pytest.raises(RuntimeError, match="already attempted"):
+        client.submit_task(candidate)
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "mutator"),
+    [
+        ("name", lambda value: "extra-" + value),
+        ("name", lambda value: value + "-suffix"),
+        ("dedupe_key", lambda value: "extra-" + value),
+        ("dedupe_key", lambda value: value + "f"),
+    ],
+)
+def test_resource2_client_rejects_extra_prefix_or_suffix_identity(
+    monkeypatch: pytest.MonkeyPatch, field: str, mutator
+):
+    package = _minimal_package(_config(), monkeypatch)
+    candidate = copy.deepcopy(package["candidate_task"])
+    candidate[field] = mutator(candidate[field])
+    with pytest.raises(RuntimeError, match="exact namespace"):
+        canary.Resource2AdditiveSchedulerClient(
+            "http://127.0.0.1:8002", expected_task=candidate
+        )
+
+
+def test_resource2_client_post_does_not_retry_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    package = _minimal_package(_config(), monkeypatch)
+    candidate = package["candidate_task"]
+    calls = 0
+
+    def urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise _http_error(429, b"busy")
+
+    monkeypatch.setattr(canary.urllib.request, "urlopen", urlopen)
+    client = canary.Resource2AdditiveSchedulerClient(
+        "http://127.0.0.1:8002", expected_task=candidate
+    )
+    with pytest.raises(RuntimeError, match="without retry"):
+        client.submit_task(candidate)
+    assert calls == 1
+    assert client.post_count == 1
+
+
+def test_resource2_client_get_retries_503_with_bounded_policy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    outcomes: list[Any] = [_http_error(503, b"busy")]
+    sleeps: list[float] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b'{"id":90001}'
+
+    outcomes.append(Response())
+
+    def urlopen(*_args, **_kwargs):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(canary.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(canary.time, "sleep", sleeps.append)
+    client = canary.Resource2AdditiveSchedulerClient("http://127.0.0.1:8002")
+    assert client.get_task(90_001) == {"id": 90_001}
+    assert client.get_attempt_count == 2
+    assert client.get_retry_count == 1
+    assert sleeps == [canary.REMOTE_READ_BACKOFF_SECONDS[0]]
+    assert canary._scheduler_client_policy()["get_retry_maximum_attempts"] == 4
 
 
 def test_complete_namespace_dry_run_never_posts(monkeypatch: pytest.MonkeyPatch):

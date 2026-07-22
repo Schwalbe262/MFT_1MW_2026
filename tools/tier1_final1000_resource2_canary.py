@@ -23,6 +23,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import time
 from typing import Any, Mapping, Sequence
 import urllib.error
 import urllib.parse
@@ -51,7 +52,6 @@ try:
         INFERENCE_SAFETY,
         REMOTE_CODE_FILES,
     )
-    from tier1_final1000_slurm_controller import SchedulerApiClient
     from tier1_final1000_slurm_launch import (
         DEFAULT_MAX_WORKERS_PER_NODE,
         DEFAULT_PEAK_RSS_GATE_BYTES,
@@ -86,7 +86,6 @@ except ImportError:  # pragma: no cover - repository import path
         INFERENCE_SAFETY,
         REMOTE_CODE_FILES,
     )
-    from tools.tier1_final1000_slurm_controller import SchedulerApiClient
     from tools.tier1_final1000_slurm_launch import (
         DEFAULT_MAX_WORKERS_PER_NODE,
         DEFAULT_PEAK_RSS_GATE_BYTES,
@@ -140,7 +139,17 @@ THREAD_VARIABLES = (
     "VECLIB_MAXIMUM_THREADS",
 )
 TELEMETRY_FILENAME = "resource2_canary_telemetry.json"
-MAX_REMOTE_EVIDENCE_BYTES = 100 * 1024**2
+REMOTE_EVIDENCE_HARD_CAP_BYTES = 16 * 1024**2
+REMOTE_EVIDENCE_MAX_SEALED_BYTES = REMOTE_EVIDENCE_HARD_CAP_BYTES - 1
+REMOTE_READ_MAX_ATTEMPTS = 4
+REMOTE_READ_RETRYABLE_HTTP_STATUSES = (429, 503)
+REMOTE_READ_BACKOFF_SECONDS = (0.25, 0.5, 1.0)
+HTTP_ERROR_BODY_LIMIT_BYTES = 64 * 1024
+SCHEDULER_JSON_HARD_CAP_BYTES = 64 * 1024**2
+SCHEDULER_POST_RESPONSE_HARD_CAP_BYTES = 1024**2
+SUPERSEDED_V2_PACKAGE_SHA256 = (
+    "47a4bff263905b9d1de9d42096c332b3866b0e0369d41962724ab62127b1ddcf"
+)
 PBD6_RUNTIME_SHA256 = {
     "artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py": (
         "44fddbc60874fe3c2e14d31dc4f7b0b40cb3bc046c8006b0cccf24b323b59d36"
@@ -203,6 +212,50 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             staged.unlink()
 
 
+def _remote_read_policy() -> dict[str, Any]:
+    unsigned = {
+        "schema_version": "mft-tier1-resource2-remote-read-policy-v1",
+        "hard_cap_bytes": REMOTE_EVIDENCE_HARD_CAP_BYTES,
+        "maximum_sealed_size_bytes": REMOTE_EVIDENCE_MAX_SEALED_BYTES,
+        "expected_size_plus_one_required": True,
+        "ambiguous_hard_cap_rejected": True,
+        "maximum_attempts": REMOTE_READ_MAX_ATTEMPTS,
+        "retryable_http_statuses": list(REMOTE_READ_RETRYABLE_HTTP_STATUSES),
+        "increasing_backoff_seconds": list(REMOTE_READ_BACKOFF_SECONDS),
+        "error_body_limit_bytes": HTTP_ERROR_BODY_LIMIT_BYTES,
+    }
+    return {**unsigned, "sha256": canonical_sha256(unsigned)}
+
+
+def _scheduler_client_policy() -> dict[str, Any]:
+    unsigned = {
+        "schema_version": "mft-tier1-resource2-additive-client-policy-v1",
+        "client_class": "Resource2AdditiveSchedulerClient",
+        "allowed_name_prefix": CANARY_PREFIX,
+        "allowed_dedupe_prefix": CANARY_DEDUPE_PREFIX,
+        "exact_expected_task_required": True,
+        "maximum_post_attempts": 1,
+        "post_retry_allowed": False,
+        "allocation_pin_allowed": False,
+        "cancel_surface_available": False,
+        "preempt_surface_available": False,
+        "get_retry_maximum_attempts": REMOTE_READ_MAX_ATTEMPTS,
+        "get_retryable_http_statuses": list(REMOTE_READ_RETRYABLE_HTTP_STATUSES),
+        "get_increasing_backoff_seconds": list(REMOTE_READ_BACKOFF_SECONDS),
+        "error_body_limit_bytes": HTTP_ERROR_BODY_LIMIT_BYTES,
+        "scheduler_json_hard_cap_bytes": SCHEDULER_JSON_HARD_CAP_BYTES,
+        "post_response_hard_cap_bytes": SCHEDULER_POST_RESPONSE_HARD_CAP_BYTES,
+    }
+    return {**unsigned, "sha256": canonical_sha256(unsigned)}
+
+
+def _bounded_http_error_detail(exc: urllib.error.HTTPError) -> str:
+    raw = exc.read(HTTP_ERROR_BODY_LIMIT_BYTES + 1)
+    truncated = len(raw) > HTTP_ERROR_BODY_LIMIT_BYTES
+    detail = raw[:HTTP_ERROR_BODY_LIMIT_BYTES].decode("utf-8", errors="replace")
+    return detail + ("...[truncated]" if truncated else "")
+
+
 def _remote_file_bytes_bounded(
     *,
     scheduler_url: str,
@@ -210,11 +263,15 @@ def _remote_file_bytes_bounded(
     relative_path: str,
     expected_size: int | None = None,
     expected_sha256: str | None = None,
+    attempt_audit: list[dict[str, Any]] | None = None,
 ) -> bytes:
     if (
         not relative_path
         or relative_path.startswith("/")
         or ".." in PurePosixPath(relative_path).parts
+        or isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
         or isinstance(expected_size, bool)
         or (
             expected_size is not None
@@ -223,30 +280,47 @@ def _remote_file_bytes_bounded(
         or (expected_sha256 is not None and not _is_sha256(expected_sha256))
     ):
         raise RuntimeError("unsafe or unsealed Scheduler remote evidence request")
-    if expected_size is not None and expected_size > MAX_REMOTE_EVIDENCE_BYTES:
-        raise RuntimeError("Scheduler remote evidence exceeds the 100 MiB bound")
+    if expected_size is not None and expected_size > REMOTE_EVIDENCE_MAX_SEALED_BYTES:
+        raise RuntimeError(
+            "Scheduler sealed remote evidence reaches or exceeds the 16 MiB hard cap"
+        )
+    request_limit = (
+        expected_size + 1
+        if expected_size is not None
+        else REMOTE_EVIDENCE_HARD_CAP_BYTES
+    )
     query = urllib.parse.urlencode(
         {
             "path": relative_path,
             "base": "remote_cwd",
-            "max_bytes": MAX_REMOTE_EVIDENCE_BYTES,
+            "max_bytes": request_limit,
         }
     )
-    request = urllib.request.Request(
-        scheduler_url.rstrip("/") + f"/api/tasks/{int(task_id)}/remote-file?{query}",
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60.0) as response:
-            payload = response.read(MAX_REMOTE_EVIDENCE_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"bounded Scheduler remote evidence GET failed for {relative_path}: {detail}"
-        ) from exc
-    if len(payload) > MAX_REMOTE_EVIDENCE_BYTES:
-        raise RuntimeError("Scheduler returned evidence beyond the 100 MiB bound")
-    if expected_size is None and len(payload) == MAX_REMOTE_EVIDENCE_BYTES:
+    url = scheduler_url.rstrip("/") + f"/api/tasks/{int(task_id)}/remote-file?{query}"
+    attempts = 0
+    for attempt in range(REMOTE_READ_MAX_ATTEMPTS):
+        attempts += 1
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=60.0) as response:
+                payload = response.read(request_limit)
+        except urllib.error.HTTPError as exc:
+            detail = _bounded_http_error_detail(exc)
+            if (
+                exc.code in REMOTE_READ_RETRYABLE_HTTP_STATUSES
+                and attempt + 1 < REMOTE_READ_MAX_ATTEMPTS
+            ):
+                time.sleep(REMOTE_READ_BACKOFF_SECONDS[attempt])
+                continue
+            raise RuntimeError(
+                "bounded Scheduler remote evidence GET failed for "
+                f"{relative_path} after {attempts}/{REMOTE_READ_MAX_ATTEMPTS} "
+                f"attempts with HTTP {exc.code}: {detail}"
+            ) from exc
+        break
+    else:  # pragma: no cover - bounded loop either succeeds or raises
+        raise AssertionError("bounded Scheduler remote evidence retry fell through")
+    if expected_size is None and len(payload) == REMOTE_EVIDENCE_HARD_CAP_BYTES:
         raise RuntimeError("Scheduler remote evidence reached an ambiguous hard bound")
     if expected_size is not None and len(payload) != expected_size:
         raise RuntimeError("Scheduler remote evidence length differs from its receipt")
@@ -255,7 +329,186 @@ def _remote_file_bytes_bounded(
         and hashlib.sha256(payload).hexdigest() != expected_sha256
     ):
         raise RuntimeError("Scheduler remote evidence SHA differs from its receipt")
+    if attempt_audit is not None:
+        attempt_audit.append(
+            {
+                "relative_path": relative_path,
+                "expected_size": expected_size,
+                "request_max_bytes": request_limit,
+                "read_limit_bytes": request_limit,
+                "attempt_count": attempts,
+                "retry_count": attempts - 1,
+            }
+        )
     return payload
+
+
+class Resource2AdditiveSchedulerClient:
+    """GET-only inventory/detail client plus one exact resource2 POST.
+
+    The class intentionally has no generic method selector and no allocation,
+    cancellation, or preemption method.  A mutating request is possible only
+    after binding the client to one immutable candidate task.
+    """
+
+    __slots__ = (
+        "base_url",
+        "timeout",
+        "_expected_task",
+        "get_attempt_count",
+        "get_retry_count",
+        "post_count",
+    )
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        expected_task: Mapping[str, Any] | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._expected_task = (
+            copy.deepcopy(dict(expected_task)) if expected_task is not None else None
+        )
+        self.get_attempt_count = 0
+        self.get_retry_count = 0
+        self.post_count = 0
+        if self._expected_task is not None:
+            self._validate_expected_task(self._expected_task)
+
+    @staticmethod
+    def _validate_expected_task(task: Mapping[str, Any]) -> None:
+        payload = task.get("payload_json")
+        seed = payload.get("seed") if isinstance(payload, Mapping) else None
+        dedupe = str(task.get("dedupe_key") or "")
+        if (
+            set(task) != REQUIRED_SCHEDULER_FIELDS
+            or "requested_allocation_id" in task
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or task.get("name") != f"{CANARY_PREFIX}entry-{seed}"
+            or not dedupe.startswith(CANARY_DEDUPE_PREFIX)
+            or not _is_sha256(dedupe.removeprefix(CANARY_DEDUPE_PREFIX))
+        ):
+            raise RuntimeError(
+                "resource2 additive client candidate escaped its exact namespace"
+            )
+
+    @staticmethod
+    def _decode_json(raw: bytes, *, label: str) -> Any:
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{label} is not bounded valid JSON") from exc
+
+    def _get_json(self, path: str, *, allow_not_found: bool = False) -> Any:
+        parsed = urllib.parse.urlsplit(path)
+        is_task_list = parsed.path == "/api/tasks"
+        is_task_detail = (
+            re.fullmatch(r"/api/tasks/[1-9][0-9]*", parsed.path) is not None
+        )
+        if (
+            parsed.scheme
+            or parsed.netloc
+            or parsed.fragment
+            or not (is_task_list or is_task_detail)
+            or (is_task_detail and bool(parsed.query))
+        ):
+            raise RuntimeError("resource2 additive client refused a foreign GET path")
+        attempts = 0
+        for attempt in range(REMOTE_READ_MAX_ATTEMPTS):
+            attempts += 1
+            self.get_attempt_count += 1
+            request = urllib.request.Request(self.base_url + path, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read(SCHEDULER_JSON_HARD_CAP_BYTES)
+            except urllib.error.HTTPError as exc:
+                detail = _bounded_http_error_detail(exc)
+                if exc.code == 404 and allow_not_found:
+                    return None
+                if (
+                    exc.code in REMOTE_READ_RETRYABLE_HTTP_STATUSES
+                    and attempt + 1 < REMOTE_READ_MAX_ATTEMPTS
+                ):
+                    self.get_retry_count += 1
+                    time.sleep(REMOTE_READ_BACKOFF_SECONDS[attempt])
+                    continue
+                raise RuntimeError(
+                    "resource2 Scheduler GET failed after "
+                    f"{attempts}/{REMOTE_READ_MAX_ATTEMPTS} attempts with "
+                    f"HTTP {exc.code}: {detail}"
+                ) from exc
+            if len(raw) == SCHEDULER_JSON_HARD_CAP_BYTES:
+                raise RuntimeError("resource2 Scheduler GET reached an ambiguous cap")
+            return self._decode_json(raw, label="resource2 Scheduler GET response")
+        raise AssertionError("bounded resource2 Scheduler GET retry fell through")
+
+    def read_inventory_path(self, path: str) -> Any:
+        parsed = urllib.parse.urlsplit(path)
+        if parsed.path != "/api/tasks" or not parsed.query:
+            raise RuntimeError("resource2 inventory path is not a task-list GET")
+        return self._get_json(path)
+
+    def list_complete_namespace_tasks(self) -> list[dict[str, Any]]:
+        return [
+            *_paged_namespace(self, prefix=PRODUCTION_PREFIX),
+            *_paged_namespace(self, prefix=CANARY_PREFIX),
+        ]
+
+    def get_task(self, task_id: int) -> Mapping[str, Any] | None:
+        if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+            raise RuntimeError("resource2 task detail id is invalid")
+        value = self._get_json(f"/api/tasks/{task_id}", allow_not_found=True)
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise RuntimeError("resource2 task detail response is not an object")
+        return value
+
+    def submit_task(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self.post_count != 0:
+            raise RuntimeError(
+                "resource2 additive client already attempted its one POST"
+            )
+        if self._expected_task is None:
+            raise RuntimeError("resource2 additive client has no sealed expected task")
+        self._validate_expected_task(payload)
+        if dict(payload) != self._expected_task:
+            raise RuntimeError("resource2 POST differs from its exact sealed candidate")
+        body = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            self.base_url + "/api/tasks",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        self.post_count += 1
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read(SCHEDULER_POST_RESPONSE_HARD_CAP_BYTES)
+        except urllib.error.HTTPError as exc:
+            detail = _bounded_http_error_detail(exc)
+            raise RuntimeError(
+                "resource2 one-shot Scheduler POST failed without retry with "
+                f"HTTP {exc.code}: {detail}"
+            ) from exc
+        if len(raw) == SCHEDULER_POST_RESPONSE_HARD_CAP_BYTES:
+            raise RuntimeError(
+                "resource2 Scheduler POST response reached an ambiguous cap"
+            )
+        value = self._decode_json(raw, label="resource2 Scheduler POST response")
+        if not isinstance(value, dict):
+            raise RuntimeError("resource2 Scheduler POST response is not an object")
+        return value
 
 
 def _thread_environment() -> dict[str, str]:
@@ -503,6 +756,64 @@ def _baseline_summary(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_remote_read_attempts(
+    value: Any, *, verified_files: Mapping[str, Any], expected_total_attempts: Any
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise RuntimeError("remote evidence attempt audit is not a list")
+    by_path: dict[str, Mapping[str, Any]] = {}
+    for raw in verified_files.values():
+        if isinstance(raw, Mapping) and isinstance(raw.get("size"), int):
+            by_path[str(raw.get("relative_path") or "")] = raw
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("remote evidence attempt audit contains a non-object")
+        path = str(raw.get("relative_path") or "")
+        expected = by_path.get(path)
+        attempt_count = raw.get("attempt_count")
+        retry_count = raw.get("retry_count")
+        size = raw.get("expected_size")
+        if (
+            set(raw)
+            != {
+                "relative_path",
+                "expected_size",
+                "request_max_bytes",
+                "read_limit_bytes",
+                "attempt_count",
+                "retry_count",
+            }
+            or expected is None
+            or path in seen
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size != expected.get("size")
+            or size > REMOTE_EVIDENCE_MAX_SEALED_BYTES
+            or raw.get("request_max_bytes") != size + 1
+            or raw.get("read_limit_bytes") != size + 1
+            or isinstance(attempt_count, bool)
+            or not isinstance(attempt_count, int)
+            or not 1 <= attempt_count <= REMOTE_READ_MAX_ATTEMPTS
+            or retry_count != attempt_count - 1
+        ):
+            raise RuntimeError("remote evidence attempt audit drifted")
+        seen.add(path)
+        result.append(dict(raw))
+    expected_paths = {
+        path for path, record in by_path.items() if record.get("sha256") is not None
+    }
+    if (
+        seen != expected_paths
+        or isinstance(expected_total_attempts, bool)
+        or not isinstance(expected_total_attempts, int)
+        or expected_total_attempts != sum(int(item["attempt_count"]) for item in result)
+    ):
+        raise RuntimeError("remote evidence attempt totals/path coverage drifted")
+    return result
+
+
 def _reverify_baseline_remote(
     *,
     config: Mapping[str, Any],
@@ -512,7 +823,7 @@ def _reverify_baseline_remote(
     scheduler: Any | None = None,
     remote_file_reader: Any | None = None,
 ) -> dict[str, Any]:
-    scheduler = scheduler or SchedulerApiClient(scheduler_url)
+    scheduler = scheduler or Resource2AdditiveSchedulerClient(scheduler_url)
     reader = remote_file_reader or _remote_file_bytes_bounded
     task_id, status = _authenticate_task(
         scheduler.get_task(BASELINE_TASK_ID),
@@ -525,6 +836,7 @@ def _reverify_baseline_remote(
     if not isinstance(records, Mapping) or not records:
         raise RuntimeError("baseline remote terminal has no remote file inventory")
     verified: dict[str, dict[str, Any]] = {}
+    read_attempts: list[dict[str, Any]] = []
     get_count = 0
     for label, raw_record in sorted(records.items()):
         if not isinstance(raw_record, Mapping):
@@ -561,6 +873,7 @@ def _reverify_baseline_remote(
                 {
                     "expected_size": expected_size,
                     "expected_sha256": expected_sha,
+                    "attempt_audit": read_attempts,
                 }
                 if remote_file_reader is None
                 else {}
@@ -572,6 +885,17 @@ def _reverify_baseline_remote(
             or hashlib.sha256(payload).hexdigest() != expected_sha
         ):
             raise RuntimeError(f"baseline remote file changed: {label}")
+        if remote_file_reader is not None:
+            read_attempts.append(
+                {
+                    "relative_path": path,
+                    "expected_size": expected_size,
+                    "request_max_bytes": expected_size + 1,
+                    "read_limit_bytes": expected_size + 1,
+                    "attempt_count": 1,
+                    "retry_count": 0,
+                }
+            )
         verified[str(label)] = {
             "relative_path": path,
             "size": expected_size,
@@ -593,6 +917,11 @@ def _reverify_baseline_remote(
         "remote_terminal_sha256": baseline_terminal["remote_terminal_sha256"],
         "scheduler_detail_get_count": 2,
         "scheduler_remote_file_get_count": get_count,
+        "scheduler_remote_file_attempt_count": sum(
+            int(item["attempt_count"]) for item in read_attempts
+        ),
+        "remote_read_policy": _remote_read_policy(),
+        "remote_file_read_attempts": read_attempts,
         "verified_remote_files": verified,
         "scheduler_access": "GET-only",
         "scheduler_post_count": 0,
@@ -1082,6 +1411,12 @@ def _assemble_package(
             str(candidate["remote_cwd"]), int(config["seed"])
         ),
         "terminal_gates": _terminal_gates(),
+        "remote_read_policy": _remote_read_policy(),
+        "scheduler_client_policy": _scheduler_client_policy(),
+        "superseded_launch_forbidden_package_sha256": SUPERSEDED_V2_PACKAGE_SHA256,
+        "superseded_launch_forbidden_reason": (
+            "production-client and remote-read policies were not sufficiently bounded"
+        ),
         "complete_production_and_canary_namespaces_required": True,
         "post_submit_namespace_rescan_required": True,
         "remote_ready_reread_required": True,
@@ -1136,6 +1471,10 @@ def validate_package(value: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_dedupe_key",
         "terminal_evidence",
         "terminal_gates",
+        "remote_read_policy",
+        "scheduler_client_policy",
+        "superseded_launch_forbidden_package_sha256",
+        "superseded_launch_forbidden_reason",
         "complete_production_and_canary_namespaces_required",
         "post_submit_namespace_rescan_required",
         "remote_ready_reread_required",
@@ -1181,6 +1520,23 @@ def validate_package(value: Mapping[str, Any]) -> dict[str, Any]:
         config=config,
         baseline=baseline,  # type: ignore[arg-type]
     )
+    verified_remote_files = baseline_reverification.get("verified_remote_files")
+    if (
+        not isinstance(verified_remote_files, Mapping)
+        or baseline_reverification.get("remote_read_policy") != _remote_read_policy()
+    ):
+        raise RuntimeError("resource2 baseline remote-read policy seal mismatch")
+    remote_attempts = _validate_remote_read_attempts(
+        baseline_reverification.get("remote_file_read_attempts"),
+        verified_files=verified_remote_files,
+        expected_total_attempts=baseline_reverification.get(
+            "scheduler_remote_file_attempt_count"
+        ),
+    )
+    if baseline_reverification.get("scheduler_remote_file_get_count") != len(
+        remote_attempts
+    ):
+        raise RuntimeError("resource2 baseline remote-file GET count drifted")
     baseline_required = {
         "task_id",
         "seed",
@@ -1255,6 +1611,12 @@ def validate_package(value: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("terminal_evidence")
         != _terminal_evidence(str(candidate["remote_cwd"]), int(config["seed"]))
         or value.get("terminal_gates") != _terminal_gates()
+        or value.get("remote_read_policy") != _remote_read_policy()
+        or value.get("scheduler_client_policy") != _scheduler_client_policy()
+        or value.get("superseded_launch_forbidden_package_sha256")
+        != SUPERSEDED_V2_PACKAGE_SHA256
+        or value.get("superseded_launch_forbidden_reason")
+        != "production-client and remote-read policies were not sufficiently bounded"
         or value.get("complete_production_and_canary_namespaces_required") is not True
         or value.get("post_submit_namespace_rescan_required") is not True
         or value.get("remote_ready_reread_required") is not True
@@ -1428,9 +1790,9 @@ def _validate_rows_for_prefix(
 
 
 def _paged_namespace(scheduler: Any, *, prefix: str) -> list[dict[str, Any]]:
-    request = getattr(scheduler, "_request", None)
+    request = getattr(scheduler, "read_inventory_path", None)
     if not callable(request):
-        raise RuntimeError("Scheduler client lacks complete namespace pagination")
+        raise RuntimeError("Scheduler client lacks read-only namespace pagination")
 
     def read_page(*, page: int, before_id: int) -> dict[str, Any]:
         query: dict[str, Any] = {
@@ -1591,6 +1953,9 @@ def _validate_submission_receipt(
         "task_status",
         "submitted_count",
         "scheduler_endpoint",
+        "scheduler_client_policy",
+        "scheduler_get_attempt_count",
+        "scheduler_get_retry_count",
         "scheduler_post_count",
         "scheduler_cancel_count",
         "scheduler_preempt_count",
@@ -1614,6 +1979,15 @@ def _validate_submission_receipt(
         != package["source_4cpu_logical_dedupe_key"]
         or value.get("both_dedupes_and_seed_absent_before_post") is not True
         or value.get("submitted_count") != int(apply)
+        or value.get("scheduler_client_policy") != _scheduler_client_policy()
+        or isinstance(value.get("scheduler_get_attempt_count"), bool)
+        or not isinstance(value.get("scheduler_get_attempt_count"), int)
+        or value.get("scheduler_get_attempt_count") < 0
+        or isinstance(value.get("scheduler_get_retry_count"), bool)
+        or not isinstance(value.get("scheduler_get_retry_count"), int)
+        or not 0
+        <= value.get("scheduler_get_retry_count")
+        <= value.get("scheduler_get_attempt_count")
         or value.get("scheduler_post_count") != int(apply)
         or value.get("scheduler_cancel_count") != 0
         or value.get("scheduler_preempt_count") != 0
@@ -1765,6 +2139,9 @@ def _submission_outcome(
         "task_status": status,
         "submitted_count": int(apply),
         "scheduler_endpoint": "POST /api/tasks",
+        "scheduler_client_policy": _scheduler_client_policy(),
+        "scheduler_get_attempt_count": int(getattr(scheduler, "get_attempt_count", 0)),
+        "scheduler_get_retry_count": int(getattr(scheduler, "get_retry_count", 0)),
         "scheduler_post_count": int(getattr(scheduler, "post_count", 0)),
         "scheduler_cancel_count": 0,
         "scheduler_preempt_count": 0,
@@ -1830,7 +2207,9 @@ def submit(
             baseline_package=baseline_package,
             publication=publication,
             transport=transport,
-            scheduler=SchedulerApiClient(scheduler_url),
+            scheduler=Resource2AdditiveSchedulerClient(
+                scheduler_url, expected_task=package["candidate_task"]
+            ),
             apply=apply,
             receipt_out=receipt_out,
         )
@@ -2407,7 +2786,7 @@ def evaluate_remote_terminal(
         or task_id <= 0
     ):
         raise RuntimeError("resource2 terminal task/submission identity mismatch")
-    scheduler = SchedulerApiClient(scheduler_url)
+    scheduler = Resource2AdditiveSchedulerClient(scheduler_url)
     observed_id, scheduler_status = _authenticate_task(
         scheduler.get_task(task_id),
         package["candidate_task"],
@@ -2421,10 +2800,12 @@ def evaluate_remote_terminal(
         "seed_status": f"{root}/seed_status.json",
         "result": f"{root}/seed-{int(package['seed'])}/result.json",
     }
+    remote_read_attempts: list[dict[str, Any]] = []
     telemetry_raw = _remote_file_bytes_bounded(
         scheduler_url=scheduler_url,
         task_id=task_id,
         relative_path=relative["telemetry"],
+        attempt_audit=remote_read_attempts,
     )
     telemetry_parsed = shape1._json_bytes_object(telemetry_raw, "telemetry")
     telemetry_sealed = validate_telemetry(
@@ -2438,6 +2819,7 @@ def evaluate_remote_terminal(
         relative_path=relative["seed_status"],
         expected_size=int(status_record["size"]),
         expected_sha256=str(status_record["sha256"]),
+        attempt_audit=remote_read_attempts,
     )
     result_raw = _remote_file_bytes_bounded(
         scheduler_url=scheduler_url,
@@ -2445,6 +2827,7 @@ def evaluate_remote_terminal(
         relative_path=relative["result"],
         expected_size=int(result_record["size"]),
         expected_sha256=str(result_record["sha256"]),
+        attempt_audit=remote_read_attempts,
     )
     raw = {
         "telemetry": telemetry_raw,
@@ -2493,6 +2876,11 @@ def evaluate_remote_terminal(
         "scheduler_status": scheduler_status,
         "scheduler_detail_get_count": 2,
         "scheduler_remote_file_get_count": len(raw),
+        "scheduler_remote_file_attempt_count": sum(
+            int(item["attempt_count"]) for item in remote_read_attempts
+        ),
+        "remote_read_policy": _remote_read_policy(),
+        "remote_file_read_attempts": remote_read_attempts,
         "remote_files": file_records,
         "terminal_evidence": terminal,
         "terminal_sha256": terminal["terminal_sha256"],
@@ -2529,7 +2917,7 @@ def attest_baseline(
     )
     if output_path.exists():
         raise RuntimeError(f"immutable output already exists: {output_path}")
-    scheduler = SchedulerApiClient(scheduler_url)
+    scheduler = Resource2AdditiveSchedulerClient(scheduler_url)
     observed_id, scheduler_status = _authenticate_task(
         scheduler.get_task(BASELINE_TASK_ID),
         package["parent_task"],
