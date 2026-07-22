@@ -18,7 +18,7 @@ CONFIG_PATH = (
     Path(__file__).resolve().parents[1]
     / "docs"
     / "evidence"
-    / "tier1_final1000_resource2_canary_20260723.json"
+    / "tier1_final1000_resource2_canary_v4_20260723.json"
 )
 
 
@@ -154,6 +154,56 @@ def _telemetry(package: dict[str, Any], task_id: int = 90001) -> dict[str, Any]:
         "memory_current_bytes": 512,
         "memory_peak_bytes": 1024,
     }
+    cgroup_text = "0::/slurm/job/task\n"
+    mountinfo_text = (
+        "30 29 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime "
+        "- cgroup2 cgroup rw\n"
+    )
+
+    def diagnostic(path: str, text: str) -> dict[str, Any]:
+        raw = text.encode("utf-8")
+        return {
+            "path": path,
+            "maximum_bytes": canary.cgroup_memory.CGROUP_DIAGNOSTIC_MAX_BYTES,
+            "bytes_captured": len(raw),
+            "truncated": False,
+            "utf8_valid": True,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "text": text,
+            "error": None,
+        }
+
+    diagnostics = {
+        "schema_version": canary.cgroup_memory.CGROUP_DIAGNOSTIC_SCHEMA,
+        "maximum_bytes_per_file": (
+            canary.cgroup_memory.CGROUP_DIAGNOSTIC_MAX_BYTES
+        ),
+        "sysfs_root": "/sys/fs/cgroup",
+        "proc_self_cgroup": diagnostic("/proc/self/cgroup", cgroup_text),
+        "proc_self_mountinfo": diagnostic(
+            "/proc/self/mountinfo", mountinfo_text
+        ),
+    }
+
+    def snapshot(selected: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "schema_version": canary.cgroup_memory.CGROUP_SNAPSHOT_SCHEMA,
+            "cgroup_version": "v2",
+            "hierarchy_id": 0,
+            "membership_controllers": [],
+            "membership_path": "/slurm/job/task",
+            "mount_root": "/",
+            "mount_relative_path": ".",
+            "leaf_relative_path": "slurm/job/task",
+            "nearest_accounting_depth": 0,
+            "nearest_accounting_limit_unbounded": True,
+            "limit_filename": "memory.max",
+            "current_filename": "memory.current",
+            "peak_filename": "memory.peak",
+            "ancestors": [leaf, selected],
+            "selected_finite_ancestor": selected,
+        }
+
     unsigned = {
         "schema_version": canary.TELEMETRY_SCHEMA,
         "started_at": "2026-07-23T05:00:00+09:00",
@@ -179,18 +229,12 @@ def _telemetry(package: dict[str, Any], task_id: int = 90001) -> dict[str, Any]:
         "average_cores_used": 1.35,
         "cpu_utilization_fraction": 0.675,
         "peak_rss_bytes": 2 * 1024**3,
-        "cgroup_before": {
-            "leaf_relative_path": "slurm/job/task",
-            "leaf_memory_max_unbounded": True,
-            "ancestors": [leaf, selected_before],
-            "selected_finite_ancestor": selected_before,
+        "cgroup_diagnostics": {
+            "before": copy.deepcopy(diagnostics),
+            "after": copy.deepcopy(diagnostics),
         },
-        "cgroup_after": {
-            "leaf_relative_path": "slurm/job/task",
-            "leaf_memory_max_unbounded": True,
-            "ancestors": [leaf, selected_after],
-            "selected_finite_ancestor": selected_after,
-        },
+        "cgroup_before": snapshot(selected_before),
+        "cgroup_after": snapshot(selected_after),
         "seed_status": {
             "relative_path": f"runs/task-{task_id}/seed_status.json",
             "size": 100,
@@ -234,10 +278,27 @@ def _minimal_package(
 
 def test_sealed_config_is_exact_and_candidate_seed_is_distinct():
     config = _config()
-    assert config["seed"] == 2_257_499_994
+    assert config["seed"] == 2_257_499_993
     assert config["baseline_task_id"] == 84_880
     assert config["candidate_cpus"] == 2
     assert config["candidate_memory_mb"] == 28_672
+
+
+def test_v3_config_and_package_identity_are_launch_forbidden():
+    old_config = json.loads(
+        (
+            CONFIG_PATH.parent
+            / "tier1_final1000_resource2_canary_20260723.json"
+        ).read_text(encoding="utf-8")
+    )
+    with pytest.raises(RuntimeError, match="config seal mismatch"):
+        canary.validate_config(old_config)
+    assert (
+        canary.SUPERSEDED_V3_PACKAGE_SHA256
+        == "98a16b3177a3f66f9644ee92c0bfac27304746b7e3ed3db74a59f5b8d2e3e303"
+    )
+    assert canary.PACKAGE_SCHEMA.endswith("-v2")
+    assert canary.TELEMETRY_SCHEMA.endswith("-v2")
 
 
 def test_render_fails_closed_when_baseline_files_are_absent(tmp_path: Path):
@@ -301,7 +362,12 @@ def test_candidate_is_exact_2cpu_isolated_and_uses_only_pbd6_single_runner(
     assert candidate["dedupe_key"].startswith(canary.CANARY_DEDUPE_PREFIX)
     assert "tier1_corrected_current7_slurm_seed_runner.py" in candidate["command"]
     assert "tier1_final1000_multiseed_phase_b_runner.py" not in candidate["command"]
-    assert "no finite cgroup-v2 memory.max ancestor exists" in candidate["command"]
+    assert "unique finite cgroup memory hierarchy is unavailable" in candidate["command"]
+    assert "memory.limit_in_bytes" in candidate["command"]
+    assert "memory.max_usage_in_bytes" in candidate["command"]
+    assert 'cgroup_diagnostics["before"] = capture_cgroup_diagnostics()' in candidate[
+        "command"
+    ]
     assert "SLURM_CPUS_PER_TASK" in candidate["command"]
 
 
@@ -325,14 +391,89 @@ def test_telemetry_accepts_unbounded_leaf_with_finite_parent(
     package = _minimal_package(config, monkeypatch)
     telemetry = _telemetry(package)
     sealed = canary.validate_telemetry(telemetry, package=package, task_id=90001)
-    assert sealed["cgroup_after"]["leaf_memory_max_unbounded"] is True
+    assert sealed["cgroup_after"]["nearest_accounting_limit_unbounded"] is True
     assert sealed["cgroup_after"]["selected_finite_ancestor"]["depth_from_leaf"] == 1
     bad = copy.deepcopy(telemetry)
     bad["cgroup_after"]["selected_finite_ancestor"]["memory_limit_bytes"] = None
     unsigned = {k: v for k, v in bad.items() if k != "telemetry_sha256"}
     bad["telemetry_sha256"] = canary.canonical_sha256(unsigned)
-    with pytest.raises(RuntimeError, match="cgroup ancestor"):
+    with pytest.raises(RuntimeError, match="cgroup"):
         canary.validate_telemetry(bad, package=package, task_id=90001)
+
+
+def test_telemetry_accepts_actual_slurm_v1_memory_hierarchy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = _config()
+    package = _minimal_package(config, monkeypatch)
+    telemetry = _telemetry(package)
+    cgroup_text = "6:memory:/slurm_n012/system\n"
+    mountinfo_text = (
+        "41 32 0:34 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime "
+        "shared:18 - cgroup cgroup rw,memory\n"
+    )
+
+    def record(path: str, text: str) -> dict[str, Any]:
+        raw = text.encode("utf-8")
+        return {
+            "path": path,
+            "maximum_bytes": canary.cgroup_memory.CGROUP_DIAGNOSTIC_MAX_BYTES,
+            "bytes_captured": len(raw),
+            "truncated": False,
+            "utf8_valid": True,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "text": text,
+            "error": None,
+        }
+
+    diagnostics = {
+        "schema_version": canary.cgroup_memory.CGROUP_DIAGNOSTIC_SCHEMA,
+        "maximum_bytes_per_file": (
+            canary.cgroup_memory.CGROUP_DIAGNOSTIC_MAX_BYTES
+        ),
+        "sysfs_root": "/sys/fs/cgroup",
+        "proc_self_cgroup": record("/proc/self/cgroup", cgroup_text),
+        "proc_self_mountinfo": record("/proc/self/mountinfo", mountinfo_text),
+    }
+
+    def snapshot(current: int, peak: int) -> dict[str, Any]:
+        selected = {
+            "depth_from_leaf": 0,
+            "relative_path": "memory/slurm_n012/system",
+            "memory_max_raw": str(canary.CANDIDATE_MEMORY_MB * 1024**2),
+            "memory_limit_bytes": canary.CANDIDATE_MEMORY_MB * 1024**2,
+            "memory_current_bytes": current,
+            "memory_peak_bytes": peak,
+        }
+        return {
+            "schema_version": canary.cgroup_memory.CGROUP_SNAPSHOT_SCHEMA,
+            "cgroup_version": "v1",
+            "hierarchy_id": 6,
+            "membership_controllers": ["memory"],
+            "membership_path": "/slurm_n012/system",
+            "mount_root": "/",
+            "mount_relative_path": "memory",
+            "leaf_relative_path": "memory/slurm_n012/system",
+            "nearest_accounting_depth": 0,
+            "nearest_accounting_limit_unbounded": False,
+            "limit_filename": "memory.limit_in_bytes",
+            "current_filename": "memory.usage_in_bytes",
+            "peak_filename": "memory.max_usage_in_bytes",
+            "ancestors": [selected],
+            "selected_finite_ancestor": selected,
+        }
+
+    telemetry["cgroup_diagnostics"] = {
+        "before": copy.deepcopy(diagnostics),
+        "after": copy.deepcopy(diagnostics),
+    }
+    telemetry["cgroup_before"] = snapshot(1024, 2048)
+    telemetry["cgroup_after"] = snapshot(2048, 4096)
+    unsigned = {key: value for key, value in telemetry.items() if key != "telemetry_sha256"}
+    telemetry["telemetry_sha256"] = canary.canonical_sha256(unsigned)
+    sealed = canary.validate_telemetry(telemetry, package=package, task_id=90001)
+    assert sealed["cgroup_after"]["cgroup_version"] == "v1"
+    assert sealed["cgroup_after"]["mount_relative_path"] == "memory"
 
 
 def test_terminal_calls_manifest_bound_result_validator_and_passes_throughput(

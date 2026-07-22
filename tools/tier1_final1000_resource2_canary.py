@@ -30,6 +30,7 @@ import urllib.parse
 import urllib.request
 
 try:
+    import tier1_resource2_cgroup_memory as cgroup_memory
     import tier1_final1000_phase_b_shape1_canary as shape1
     from tier1_corrected_current7_receipt import canonical_sha256
     from tier1_corrected_current7_slurm_bundle import (
@@ -64,6 +65,7 @@ try:
     )
     from tier1_final1000_stage_profiles import BY_ID
 except ImportError:  # pragma: no cover - repository import path
+    from tools import tier1_resource2_cgroup_memory as cgroup_memory
     from tools import tier1_final1000_phase_b_shape1_canary as shape1
     from tools.tier1_corrected_current7_receipt import canonical_sha256
     from tools.tier1_corrected_current7_slurm_bundle import (
@@ -99,13 +101,13 @@ except ImportError:  # pragma: no cover - repository import path
     from tools.tier1_final1000_stage_profiles import BY_ID
 
 
-CONFIG_SCHEMA = "mft-tier1-final1000-resource2-canary-config-v1"
-PACKAGE_SCHEMA = "mft-tier1-final1000-resource2-canary-package-v1"
-SUBMISSION_SCHEMA = "mft-tier1-final1000-resource2-canary-submission-v1"
-TELEMETRY_SCHEMA = "mft-tier1-final1000-resource2-canary-telemetry-v1"
-TERMINAL_SCHEMA = "mft-tier1-final1000-resource2-canary-terminal-v1"
-REMOTE_TERMINAL_SCHEMA = "mft-tier1-final1000-resource2-canary-remote-terminal-v1"
-CANARY_PAYLOAD_SCHEMA = "mft-tier1-final1000-resource2-canary-payload-v1"
+CONFIG_SCHEMA = "mft-tier1-final1000-resource2-canary-config-v2"
+PACKAGE_SCHEMA = "mft-tier1-final1000-resource2-canary-package-v2"
+SUBMISSION_SCHEMA = "mft-tier1-final1000-resource2-canary-submission-v2"
+TELEMETRY_SCHEMA = "mft-tier1-final1000-resource2-canary-telemetry-v2"
+TERMINAL_SCHEMA = "mft-tier1-final1000-resource2-canary-terminal-v2"
+REMOTE_TERMINAL_SCHEMA = "mft-tier1-final1000-resource2-canary-remote-terminal-v2"
+CANARY_PAYLOAD_SCHEMA = "mft-tier1-final1000-resource2-canary-payload-v2"
 
 ENTRY_STAGE_ID = "entry-1200-t125"
 BASELINE_TASK_ID = 84_880
@@ -147,8 +149,8 @@ REMOTE_READ_BACKOFF_SECONDS = (0.25, 0.5, 1.0)
 HTTP_ERROR_BODY_LIMIT_BYTES = 64 * 1024
 SCHEDULER_JSON_HARD_CAP_BYTES = 64 * 1024**2
 SCHEDULER_POST_RESPONSE_HARD_CAP_BYTES = 1024**2
-SUPERSEDED_V2_PACKAGE_SHA256 = (
-    "47a4bff263905b9d1de9d42096c332b3866b0e0369d41962724ab62127b1ddcf"
+SUPERSEDED_V3_PACKAGE_SHA256 = (
+    "98a16b3177a3f66f9644ee92c0bfac27304746b7e3ed3db74a59f5b8d2e3e303"
 )
 PBD6_RUNTIME_SHA256 = {
     "artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py": (
@@ -245,6 +247,26 @@ def _scheduler_client_policy() -> dict[str, Any]:
         "error_body_limit_bytes": HTTP_ERROR_BODY_LIMIT_BYTES,
         "scheduler_json_hard_cap_bytes": SCHEDULER_JSON_HARD_CAP_BYTES,
         "post_response_hard_cap_bytes": SCHEDULER_POST_RESPONSE_HARD_CAP_BYTES,
+    }
+    return {**unsigned, "sha256": canonical_sha256(unsigned)}
+
+
+def _cgroup_memory_policy() -> dict[str, Any]:
+    unsigned = {
+        "schema_version": "mft-tier1-resource2-cgroup-memory-policy-v2",
+        "supported_hierarchies": ["v1", "v2"],
+        "hybrid_unique_memory_hierarchy_required": True,
+        "proc_membership_and_mountinfo_captured_before_parse": True,
+        "maximum_diagnostic_bytes_per_file": (
+            cgroup_memory.CGROUP_DIAGNOSTIC_MAX_BYTES
+        ),
+        "mount_root": "/sys/fs/cgroup",
+        "mount_and_membership_path_containment_required": True,
+        "nearest_finite_ancestor_required": True,
+        "current_and_peak_memory_required": True,
+        "v1_unlimited_minimum_bytes": cgroup_memory.CGROUP_V1_UNLIMITED_MIN_BYTES,
+        "diagnostic_schema": cgroup_memory.CGROUP_DIAGNOSTIC_SCHEMA,
+        "snapshot_schema": cgroup_memory.CGROUP_SNAPSHOT_SCHEMA,
     }
     return {**unsigned, "sha256": canonical_sha256(unsigned)}
 
@@ -933,18 +955,18 @@ def _reverify_baseline_remote(
     return {**unsigned, "sha256": canonical_sha256(unsigned)}
 
 
-_INLINE_WRAPPER = r"""import hashlib
+_INLINE_WRAPPER_PREFIX = r"""import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import resource
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
-SCHEMA = "mft-tier1-final1000-resource2-canary-telemetry-v1"
+SCHEMA = "mft-tier1-final1000-resource2-canary-telemetry-v2"
 THREADS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
 def now():
@@ -966,61 +988,9 @@ def atomic_json(path, value):
     finally:
         if staged.exists():
             staged.unlink()
+"""
 
-def read_int(path, allow_zero=False):
-    raw = path.read_text(encoding="ascii").strip()
-    if raw == "max":
-        return None, raw
-    value = int(raw)
-    if value < 0 or (value == 0 and not allow_zero):
-        raise RuntimeError("invalid cgroup memory value: " + str(path))
-    return value, raw
-
-def cgroup_snapshot():
-    lines = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
-    matches = [line.split("::", 1)[1] for line in lines if line.startswith("0::")]
-    if len(matches) != 1:
-        raise RuntimeError("unique cgroup-v2 membership is unavailable")
-    root = Path("/sys/fs/cgroup").resolve(strict=True)
-    leaf = (root / matches[0].lstrip("/")).resolve(strict=True)
-    if root != leaf and root not in leaf.parents:
-        raise RuntimeError("cgroup membership escaped /sys/fs/cgroup")
-    records = []
-    selected = None
-    current = leaf
-    depth = 0
-    while True:
-        max_path = current / "memory.max"
-        current_path = current / "memory.current"
-        peak_path = current / "memory.peak"
-        if max_path.is_file() and current_path.is_file() and peak_path.is_file():
-            limit, raw_limit = read_int(max_path)
-            current_bytes, _ = read_int(current_path, allow_zero=True)
-            peak_bytes, _ = read_int(peak_path, allow_zero=True)
-            record = {
-                "depth_from_leaf": depth,
-                "relative_path": "." if current == root else current.relative_to(root).as_posix(),
-                "memory_max_raw": raw_limit,
-                "memory_limit_bytes": limit,
-                "memory_current_bytes": current_bytes,
-                "memory_peak_bytes": peak_bytes,
-            }
-            records.append(record)
-            if selected is None and limit is not None:
-                selected = dict(record)
-        if current == root:
-            break
-        current = current.parent
-        depth += 1
-    if not records or selected is None:
-        raise RuntimeError("no finite cgroup-v2 memory.max ancestor exists")
-    return {
-        "leaf_relative_path": "." if leaf == root else leaf.relative_to(root).as_posix(),
-        "leaf_memory_max_unbounded": records[0]["memory_limit_bytes"] is None,
-        "ancestors": records,
-        "selected_finite_ancestor": selected,
-    }
-
+_INLINE_WRAPPER_SUFFIX = r"""
 payload_path = Path(sys.argv[1]).resolve(strict=True)
 payload_root = Path(sys.argv[2]).resolve(strict=True)
 payload_sha = sys.argv[3]
@@ -1041,11 +1011,13 @@ cpu_set_before = []
 cpu_set_after = []
 cgroup_before = None
 cgroup_after = None
+cgroup_diagnostics = {"before": None, "after": None}
 wall = None
 cpu_seconds = None
 peak_rss_bytes = None
 status_record = {"relative_path": "runs/task-" + task_id + "/seed_status.json", "size": None, "sha256": None, "state": None, "terminal": None, "exit_code": None}
 result_record = {"relative_path": "runs/task-" + task_id + "/seed-" + str(seed) + "/result.json", "size": None, "sha256": None}
+cgroup_diagnostics["before"] = capture_cgroup_diagnostics()
 try:
     if payload_path.name != "payload.json" or payload_root not in payload_path.parents:
         raise RuntimeError("scheduler payload escaped run root")
@@ -1059,7 +1031,7 @@ try:
         raise RuntimeError("SLURM_CPUS_PER_TASK is not exactly two")
     if any(os.environ.get(name) != "2" for name in THREADS):
         raise RuntimeError("inference thread environment is not exactly two")
-    cgroup_before = cgroup_snapshot()
+    cgroup_before = cgroup_snapshot_from_diagnostics(cgroup_diagnostics["before"])
     selected_before = cgroup_before["selected_finite_ancestor"]
     if int(selected_before["memory_limit_bytes"]) < requested_memory_bytes:
         raise RuntimeError("finite cgroup ancestor does not cover requested memory")
@@ -1079,12 +1051,15 @@ try:
     cpu_seconds = max(0.0, (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime))
     peak_rss_bytes = int(after.ru_maxrss) * 1024
     cpu_set_after = sorted(os.sched_getaffinity(0))
-    cgroup_after = cgroup_snapshot()
+    cgroup_diagnostics["after"] = capture_cgroup_diagnostics()
+    cgroup_after = cgroup_snapshot_from_diagnostics(cgroup_diagnostics["after"])
     selected_after = cgroup_after["selected_finite_ancestor"]
-    if selected_after["relative_path"] != selected_before["relative_path"] or selected_after["memory_limit_bytes"] != selected_before["memory_limit_bytes"]:
+    if cgroup_diagnostics["after"]["proc_self_cgroup"]["sha256"] != cgroup_diagnostics["before"]["proc_self_cgroup"]["sha256"] or cgroup_diagnostics["after"]["proc_self_mountinfo"]["sha256"] != cgroup_diagnostics["before"]["proc_self_mountinfo"]["sha256"]:
+        raise RuntimeError("cgroup membership or mount mapping changed during execution")
+    if cgroup_after["cgroup_version"] != cgroup_before["cgroup_version"] or cgroup_after["mount_relative_path"] != cgroup_before["mount_relative_path"] or cgroup_after["membership_path"] != cgroup_before["membership_path"] or selected_after["relative_path"] != selected_before["relative_path"] or selected_after["memory_limit_bytes"] != selected_before["memory_limit_bytes"]:
         raise RuntimeError("finite cgroup memory ancestor changed during execution")
-    if int(selected_after["memory_peak_bytes"]) > int(selected_after["memory_limit_bytes"]):
-        raise RuntimeError("cgroup memory peak exceeds finite limit")
+    if int(selected_after["memory_current_bytes"]) > int(selected_after["memory_limit_bytes"]) or int(selected_after["memory_peak_bytes"]) > int(selected_after["memory_limit_bytes"]):
+        raise RuntimeError("cgroup memory usage or peak exceeds finite limit")
     status_path = task_root / "seed_status.json"
     if status_path.is_file():
         raw = status_path.read_bytes()
@@ -1132,6 +1107,7 @@ unsigned = {
     "average_cores_used": average_cores,
     "cpu_utilization_fraction": utilization,
     "peak_rss_bytes": peak_rss_bytes,
+    "cgroup_diagnostics": cgroup_diagnostics,
     "cgroup_before": cgroup_before,
     "cgroup_after": cgroup_after,
     "seed_status": status_record,
@@ -1146,6 +1122,14 @@ value["telemetry_sha256"] = canonical(unsigned)
 atomic_json(telemetry_path, value)
 raise SystemExit(exit_code)
 """
+
+_INLINE_WRAPPER = (
+    _INLINE_WRAPPER_PREFIX
+    + "\n"
+    + cgroup_memory.embedded_runtime_source()
+    + "\n"
+    + _INLINE_WRAPPER_SUFFIX
+)
 
 
 def _resource2_command(payload_sha256: str, baseline_sha256: str) -> str:
@@ -1199,6 +1183,7 @@ def _transform_source_task(
         "requested_cpus": CANDIDATE_CPUS,
         "requested_memory_mb": CANDIDATE_MEMORY_MB,
         "thread_environment": _thread_environment(),
+        "cgroup_memory_policy_sha256": _cgroup_memory_policy()["sha256"],
         "controller_harvester_isolated": True,
         "production_eligible": False,
         "automatic_promotion_allowed": False,
@@ -1293,6 +1278,8 @@ def _terminal_evidence(remote_cwd: str, seed: int) -> dict[str, Any]:
         "per_seed_wall_json_pointer": "/wall_time_seconds",
         "per_seed_cpu_json_pointer": "/process_tree_cpu_seconds",
         "per_seed_rss_json_pointer": "/peak_rss_bytes",
+        "cgroup_diagnostics_json_pointer": "/cgroup_diagnostics",
+        "cgroup_version_json_pointer": "/cgroup_after/cgroup_version",
         "finite_cgroup_ancestor_json_pointer": (
             "/cgroup_after/selected_finite_ancestor"
         ),
@@ -1313,6 +1300,8 @@ def _terminal_gates() -> dict[str, Any]:
         "result_inference_threads": CANDIDATE_CPUS,
         "result_scheduler_cpus": CANDIDATE_CPUS,
         "maximum_peak_rss_bytes": DEFAULT_PEAK_RSS_GATE_BYTES,
+        "supported_cgroup_memory_hierarchies": ["v1", "v2"],
+        "bounded_raw_membership_and_mountinfo_required": True,
         "finite_cgroup_memory_ancestor_required": True,
         "finite_cgroup_limit_covers_requested_memory": True,
         "cgroup_peak_within_finite_limit": True,
@@ -1411,11 +1400,12 @@ def _assemble_package(
             str(candidate["remote_cwd"]), int(config["seed"])
         ),
         "terminal_gates": _terminal_gates(),
+        "cgroup_memory_policy": _cgroup_memory_policy(),
         "remote_read_policy": _remote_read_policy(),
         "scheduler_client_policy": _scheduler_client_policy(),
-        "superseded_launch_forbidden_package_sha256": SUPERSEDED_V2_PACKAGE_SHA256,
+        "superseded_launch_forbidden_package_sha256": SUPERSEDED_V3_PACKAGE_SHA256,
         "superseded_launch_forbidden_reason": (
-            "production-client and remote-read policies were not sufficiently bounded"
+            "v3 assumed a unique cgroup-v2 membership and cannot attest this Slurm host"
         ),
         "complete_production_and_canary_namespaces_required": True,
         "post_submit_namespace_rescan_required": True,
@@ -1471,6 +1461,7 @@ def validate_package(value: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_dedupe_key",
         "terminal_evidence",
         "terminal_gates",
+        "cgroup_memory_policy",
         "remote_read_policy",
         "scheduler_client_policy",
         "superseded_launch_forbidden_package_sha256",
@@ -1611,12 +1602,13 @@ def validate_package(value: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("terminal_evidence")
         != _terminal_evidence(str(candidate["remote_cwd"]), int(config["seed"]))
         or value.get("terminal_gates") != _terminal_gates()
+        or value.get("cgroup_memory_policy") != _cgroup_memory_policy()
         or value.get("remote_read_policy") != _remote_read_policy()
         or value.get("scheduler_client_policy") != _scheduler_client_policy()
         or value.get("superseded_launch_forbidden_package_sha256")
-        != SUPERSEDED_V2_PACKAGE_SHA256
+        != SUPERSEDED_V3_PACKAGE_SHA256
         or value.get("superseded_launch_forbidden_reason")
-        != "production-client and remote-read policies were not sufficiently bounded"
+        != "v3 assumed a unique cgroup-v2 membership and cannot attest this Slurm host"
         or value.get("complete_production_and_canary_namespaces_required") is not True
         or value.get("post_submit_namespace_rescan_required") is not True
         or value.get("remote_ready_reread_required") is not True
@@ -2243,6 +2235,7 @@ def validate_telemetry(
         "average_cores_used",
         "cpu_utilization_fraction",
         "peak_rss_bytes",
+        "cgroup_diagnostics",
         "cgroup_before",
         "cgroup_after",
         "seed_status",
@@ -2257,94 +2250,28 @@ def validate_telemetry(
     payload_sha = canonical_sha256(task["payload_json"])
     before = value.get("cgroup_before")
     after = value.get("cgroup_after")
+    diagnostics = value.get("cgroup_diagnostics")
     status = value.get("seed_status")
     result = value.get("result")
-    if not all(isinstance(item, Mapping) for item in (before, after, status, result)):
+    if not all(
+        isinstance(item, Mapping)
+        for item in (before, after, diagnostics, status, result)
+    ):
         raise RuntimeError("resource2 telemetry nested evidence is absent")
 
     def validate_cgroup_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
-        if set(snapshot) != {
-            "leaf_relative_path",
-            "leaf_memory_max_unbounded",
-            "ancestors",
-            "selected_finite_ancestor",
-        }:
-            raise RuntimeError("resource2 cgroup snapshot fields drifted")
-        ancestors = snapshot.get("ancestors")
-        selected = snapshot.get("selected_finite_ancestor")
-        if (
-            not isinstance(snapshot.get("leaf_relative_path"), str)
-            or not snapshot["leaf_relative_path"]
-            or not isinstance(snapshot.get("leaf_memory_max_unbounded"), bool)
-            or not isinstance(ancestors, list)
-            or not ancestors
-            or not isinstance(selected, Mapping)
-        ):
-            raise RuntimeError("resource2 cgroup snapshot is incomplete")
-        normalized: list[dict[str, Any]] = []
-        prior_depth = -1
-        for raw in ancestors:
-            if not isinstance(raw, Mapping) or set(raw) != {
-                "depth_from_leaf",
-                "relative_path",
-                "memory_max_raw",
-                "memory_limit_bytes",
-                "memory_current_bytes",
-                "memory_peak_bytes",
-            }:
-                raise RuntimeError("resource2 cgroup ancestor record drifted")
-            depth = raw.get("depth_from_leaf")
-            limit_value = raw.get("memory_limit_bytes")
-            current_value = raw.get("memory_current_bytes")
-            peak_value = raw.get("memory_peak_bytes")
-            if (
-                isinstance(depth, bool)
-                or not isinstance(depth, int)
-                or depth <= prior_depth
-                or not isinstance(raw.get("relative_path"), str)
-                or not raw["relative_path"]
-                or (
-                    limit_value is not None
-                    and (
-                        isinstance(limit_value, bool)
-                        or not isinstance(limit_value, int)
-                        or limit_value <= 0
-                    )
-                )
-                or (limit_value is None and raw.get("memory_max_raw") != "max")
-                or (
-                    limit_value is not None
-                    and raw.get("memory_max_raw") != str(limit_value)
-                )
-                or isinstance(current_value, bool)
-                or not isinstance(current_value, int)
-                or current_value < 0
-                or isinstance(peak_value, bool)
-                or not isinstance(peak_value, int)
-                or peak_value < 0
-            ):
-                raise RuntimeError("resource2 cgroup ancestor value drifted")
-            prior_depth = depth
-            normalized.append(dict(raw))
-        if normalized[0]["depth_from_leaf"] != 0:
-            raise RuntimeError("resource2 cgroup ancestry omitted the leaf")
-        finite = [item for item in normalized if item["memory_limit_bytes"] is not None]
-        if (
-            not finite
-            or dict(selected) != finite[0]
-            or snapshot["leaf_memory_max_unbounded"]
-            is not (normalized[0]["memory_limit_bytes"] is None)
-        ):
-            raise RuntimeError("resource2 nearest finite cgroup ancestor drifted")
-        return {
-            "leaf_relative_path": snapshot["leaf_relative_path"],
-            "leaf_memory_max_unbounded": snapshot["leaf_memory_max_unbounded"],
-            "ancestors": normalized,
-            "selected_finite_ancestor": dict(selected),
-        }
+        return cgroup_memory.validate_cgroup_snapshot(dict(snapshot))
 
     before = validate_cgroup_snapshot(before)  # type: ignore[arg-type]
     after = validate_cgroup_snapshot(after)  # type: ignore[arg-type]
+    if set(diagnostics) != {"before", "after"}:  # type: ignore[arg-type]
+        raise RuntimeError("resource2 cgroup diagnostic phases drifted")
+    diagnostics_before = cgroup_memory.validate_cgroup_diagnostics(
+        dict(diagnostics["before"])  # type: ignore[index]
+    )
+    diagnostics_after = cgroup_memory.validate_cgroup_diagnostics(
+        dict(diagnostics["after"])  # type: ignore[index]
+    )
     before_selected = before["selected_finite_ancestor"]
     after_selected = after["selected_finite_ancestor"]
     before_ancestors = before["ancestors"]
@@ -2388,14 +2315,20 @@ def validate_telemetry(
         or cpu_before != sorted(cpu_before)
         or cpu_after != sorted(cpu_after)
         or cpu_before != cpu_after
-        or before.get("leaf_relative_path") != after.get("leaf_relative_path")  # type: ignore[union-attr]
-        or not isinstance(before.get("leaf_memory_max_unbounded"), bool)  # type: ignore[union-attr]
-        or before.get("leaf_memory_max_unbounded")  # type: ignore[union-attr]
-        != after.get("leaf_memory_max_unbounded")  # type: ignore[union-attr]
-        or not isinstance(before_ancestors[0], Mapping)
-        or not isinstance(after_ancestors[0], Mapping)
-        or before_ancestors[0].get("depth_from_leaf") != 0
-        or after_ancestors[0].get("depth_from_leaf") != 0
+        or before.get("schema_version") != cgroup_memory.CGROUP_SNAPSHOT_SCHEMA
+        or after.get("schema_version") != cgroup_memory.CGROUP_SNAPSHOT_SCHEMA
+        or before.get("cgroup_version") != after.get("cgroup_version")
+        or before.get("hierarchy_id") != after.get("hierarchy_id")
+        or before.get("membership_controllers")
+        != after.get("membership_controllers")
+        or before.get("membership_path") != after.get("membership_path")
+        or before.get("mount_root") != after.get("mount_root")
+        or before.get("mount_relative_path") != after.get("mount_relative_path")
+        or before.get("leaf_relative_path") != after.get("leaf_relative_path")
+        or diagnostics_before["proc_self_cgroup"]["sha256"]
+        != diagnostics_after["proc_self_cgroup"]["sha256"]
+        or diagnostics_before["proc_self_mountinfo"]["sha256"]
+        != diagnostics_after["proc_self_mountinfo"]["sha256"]
         or before_selected.get("relative_path") != after_selected.get("relative_path")
         or before_selected.get("memory_limit_bytes") != limit
         or isinstance(limit, bool)
@@ -2405,6 +2338,7 @@ def validate_telemetry(
         or not isinstance(cgroup_peak, int)
         or cgroup_peak < 0
         or cgroup_peak > limit
+        or after_selected.get("memory_current_bytes") > limit
         or status.get("state") != "completed"  # type: ignore[union-attr]
         or status.get("terminal") is not True  # type: ignore[union-attr]
         or status.get("exit_code") != 0  # type: ignore[union-attr]
@@ -2538,6 +2472,15 @@ def evaluate_terminal_evidence(
         "per_seed_peak_rss_within_gate": (
             int(evidence["peak_rss_bytes"]) <= DEFAULT_PEAK_RSS_GATE_BYTES
         ),
+        "bounded_cgroup_diagnostics_sealed": (
+            evidence["cgroup_diagnostics"]["before"]["schema_version"]
+            == cgroup_memory.CGROUP_DIAGNOSTIC_SCHEMA
+            and evidence["cgroup_diagnostics"]["after"]["schema_version"]
+            == cgroup_memory.CGROUP_DIAGNOSTIC_SCHEMA
+        ),
+        "supported_cgroup_memory_hierarchy": (
+            evidence["cgroup_after"]["cgroup_version"] in {"v1", "v2"}
+        ),
         "finite_cgroup_ancestor_covers_request": (
             isinstance(cgroup_selected.get("memory_limit_bytes"), int)
             and cgroup_selected["memory_limit_bytes"] >= CANDIDATE_MEMORY_MB * 1024**2
@@ -2579,6 +2522,14 @@ def evaluate_terminal_evidence(
         "candidate_theoretical_slots": CANDIDATE_THEORETICAL_SLOTS,
         "slot_weighted_throughput_ratio_vs_4cpu": slot_ratio,
         "core_use_ratio_vs_4cpu": core_ratio,
+        "cgroup_version": evidence["cgroup_after"]["cgroup_version"],
+        "cgroup_membership_path": evidence["cgroup_after"]["membership_path"],
+        "cgroup_mount_relative_path": evidence["cgroup_after"][
+            "mount_relative_path"
+        ],
+        "cgroup_diagnostics_sha256": canonical_sha256(
+            evidence["cgroup_diagnostics"]
+        ),
         "finite_cgroup_ancestor": copy.deepcopy(cgroup_selected),
         "gate_results": gate_results,
         "promotion_eligible": all(gate_results.values()),
@@ -2618,6 +2569,10 @@ def validate_terminal_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_theoretical_slots",
         "slot_weighted_throughput_ratio_vs_4cpu",
         "core_use_ratio_vs_4cpu",
+        "cgroup_version",
+        "cgroup_membership_path",
+        "cgroup_mount_relative_path",
+        "cgroup_diagnostics_sha256",
         "finite_cgroup_ancestor",
         "gate_results",
         "promotion_eligible",
@@ -2638,6 +2593,11 @@ def validate_terminal_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("promotion_eligible") is not all(value["gate_results"].values())
         or value.get("baseline_theoretical_slots") != BASELINE_THEORETICAL_SLOTS
         or value.get("candidate_theoretical_slots") != CANDIDATE_THEORETICAL_SLOTS
+        or value.get("cgroup_version") not in {"v1", "v2"}
+        or not isinstance(value.get("cgroup_membership_path"), str)
+        or not str(value.get("cgroup_membership_path")).startswith("/")
+        or not isinstance(value.get("cgroup_mount_relative_path"), str)
+        or not _is_sha256(value.get("cgroup_diagnostics_sha256"))
         or value.get("automatic_promotion_performed") is not False
         or value.get("scheduler_post_count") != 0
         or value.get("scheduler_cancel_count") != 0
