@@ -1,0 +1,1504 @@
+{
+  "anchor": {
+    "child_task": {
+      "aedt_backend": "standalone",
+      "command": "set -euo pipefail\nexport PYTHONPATH=\"$PWD/artifacts/python-site:$PWD/artifacts/code${PYTHONPATH:+:$PYTHONPATH}\"\npayload_path=\"${SLURM_SCHEDULER_PAYLOAD_PATH:?scheduler payload path is missing}\"\ncase \"$payload_path\" in /*) ;; *) payload_path=\"$HOME/$payload_path\" ;; esac\npayload_path=$(realpath -e -- \"$payload_path\")\npayload_root=$(realpath -e -- \"$HOME/slurm_scheduler/runs\")\ncase \"$payload_path\" in \"$payload_root\"/*/payload.json) ;; *) echo \"unsafe scheduler payload path: $payload_path\" >&2; exit 66 ;; esac\nexec python -u artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py --bundle-root \"$PWD\" --payload \"$payload_path\" --payload-root \"$payload_root\" --payload-sha256 6fb21e402dfac0e946748a0d3850c510a7e1d13f64733b0b3b5924bf9019003f",
+      "cpus": 4,
+      "dedupe_key": "mft-tier1-final1000:b5aeb7c2a00a6770806e030a8825e55c3814a1a12e3ead96c468ad8c669c0757",
+      "env_profile": "pyaedt2026v1",
+      "gpus": 0,
+      "max_workers_per_node": 32,
+      "memory_mb": 28672,
+      "name": "mft-t1fg-e-refill-2257498123",
+      "payload_json": {
+        "adapter_manifest_sha256": "567d98cb62a2b4697be8a466daab0818d60403dd7d668741f0b13061c2dd8cb1",
+        "adapter_receipt_file_sha256": "ab286228efbb40147eb30166a62b7df2d70011092702aeae0bff66023c586882",
+        "aedt_used": false,
+        "automatic_promotion_allowed": false,
+        "bundle_id": "current7-c2d90bf33d513c607f8f",
+        "bundle_manifest_sha256": "86bf540b8ac9fb4a86fecaf20064cd97f464d682b3f58ffd0f23ba85e45bbcd3",
+        "cohort_id": "current7-c2d90bf33d513c607f8f-deep36",
+        "constraint_names": [
+          "Llt_robust_band",
+          "temperature_robust_limit:Tprobe_Tx_leeward_max",
+          "temperature_robust_limit:Tprobe_Rx_main_leeward_max",
+          "temperature_robust_limit:Tprobe_Rx_side_leeward_max",
+          "temperature_robust_limit:Tprobe_core_center_max",
+          "temperature_robust_limit:Tprobe_core_center_leg_max",
+          "temperature_robust_limit:Tprobe_core_side_leg_max",
+          "temperature_robust_limit:Tprobe_core_top_yoke_max",
+          "analytical_flux_density_limit",
+          "decoded_space_shrink",
+          "secondary_vertical_insulation",
+          "strict_full_density_support",
+          "Llt_ensemble_disagreement",
+          "minimum_physical_insulation",
+          "core_group_manufacturability_limit",
+          "half_magnetizing_resonance_minimum",
+          "half_magnetizing_resonance_maximum",
+          "exterior_width_limit",
+          "exterior_length_limit",
+          "exterior_height_limit"
+        ],
+        "constraint_version": "staged-3e767d06441260d9",
+        "dataset_sha256": "0f0cb22a528cf029ce42101e7703d38200ae03038bd0aa95cc1619f34bca06a3",
+        "every_offspring_decode_repair_attested": true,
+        "fea_submission_approved": false,
+        "fea_submission_performed": false,
+        "final_goal_stage_id": "entry-1200-t125",
+        "final_goal_stage_profile_sha256": "02544c1003c184b134c36d39b306a843ac34b1598dfb5d705f275235726bcf8f",
+        "fixed_primary_turns_supported": [
+          5,
+          6
+        ],
+        "generation_artifact_inventory_sha256": "f27276bb36aebdeb59b7908f3294773aaf6e99b39c5dfb09aea69bdd14537de5",
+        "hard_constraint_contract_sha256": "7a5deb9da7f3d3829126f3bb29921d77e4705ec594c8ce42d82c0d63afb2ad6a",
+        "hard_spec": {
+          "B_limit_T": 1.2,
+          "Llt_target_uH": 27.5,
+          "Llt_tol_uH": 0.55,
+          "T_limit_C": 125.0,
+          "insulation_min_mm": 40.0,
+          "magnetizing_inductance_factor": 0.5,
+          "n_core_group_max": 4.0,
+          "primary_conductor_thickness_mm": 5.0,
+          "q_sigma": 1.0,
+          "resonance_max_Hz": 20000.0,
+          "resonance_min_Hz": 15000.0,
+          "size_H_max_mm": 750.0,
+          "size_L_max_mm": 1200.0,
+          "size_W_max_mm": 1200.0
+        },
+        "hard_spec_sha256": "3e767d06441260d9a77c0515e7152c4928802f76c43c77924110c7885823251e",
+        "inference_threads": 4,
+        "initial_repair_attested": true,
+        "island_profile_sha256": "0b32cb8be124e9d0f3e565bc784b52b6804e8e519c250d69f27c98824e319592",
+        "lane": {
+          "fixed_primary_turns": 6,
+          "island_id": "n1-6-resanchor-allthermal-2p50c",
+          "seed": 2257498123,
+          "stage_id": "entry-1200-t125",
+          "stage_variant": "final1000-n1-6-entry-1200-t125-v1",
+          "variant": "fixed-n1-6-deep-allthermal-2p50c-v1-current7",
+          "wave": "refill"
+        },
+        "max_generations": 300,
+        "maximum_peak_rss_bytes": 23622320128,
+        "offspring_physics_repair": true,
+        "optimizer_processes": 1,
+        "optimizer_repair_contract_sha256": "aeee41c8bcdc39d3e914543929b8428c8366666914a5d79de590c812b9069adb",
+        "population": 320,
+        "preflight_timeout_seconds": 1200,
+        "production_eligible": false,
+        "profile_canonical_sha256": "559e8289150e72a9daa70327aee0afc7050923838b323df4374bcc713d135101",
+        "relocation_contract_sha256": "4108d55bebf73345a47abc0442db1d579ad4752a34322b0559c4cb6bd533e201",
+        "required_model_targets_sha256": "3aa7a549f0c81cf68a38dcfded20d6ac3c081bda8c81d629201992cc02573ff9",
+        "scheduler_cpus": 4,
+        "schema_version": "mft-tier1-current7-slurm-seed-task-v1",
+        "search_interface_schema_version": "mft-tier1-current7-search-seed-cli-v1",
+        "seed": 2257498123,
+        "stage_spec_sha256": "3e767d06441260d9a77c0515e7152c4928802f76c43c77924110c7885823251e",
+        "temperature_contract_sha256": "441aa2f9353b5c7c1584704eb797f722fe5ca524d7dee5deee90db16e6aed254",
+        "terminal_physical_replay_attested": true,
+        "topology_evolution_contract_sha256": "9060aeb2920f3862142f238e6fd3272e1922ce12b839706563227e5b18a27848",
+        "topology_niche_contract_sha256": "8b0da184dd6ed601b0b3835f3dad6b35030fe7f59e49a43ced5373832426986b",
+        "train_report_sha256": "ea404f6f637bb53971bc198f3b3a366b6e3d2eb81d203ad37734de5b44c2c045",
+        "warm_artifact_sha256": "081f3e17dfeb6d6022ab11dfa2e00b5bc794c9bdbd719df72d81cf152f37b216",
+        "warm_contract_sha256": "0ef60cd5acf430dcd9116e38e76cdb732feeb514793028d00e303149b584e09d",
+        "warm_id": "n1-6",
+        "warm_repair_attested": true
+      },
+      "priority": 1,
+      "remote_cwd": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f",
+      "required_capability": "conda:pyaedt2026v1",
+      "scheduling_profile": "standard",
+      "timeout_seconds": 86400
+    },
+    "cpus": 4,
+    "parent_task": {
+      "aedt_backend": "standalone",
+      "command": "set -euo pipefail\nexport PYTHONPATH=\"$PWD/artifacts/python-site:$PWD/artifacts/code${PYTHONPATH:+:$PYTHONPATH}\"\npayload_path=\"${SLURM_SCHEDULER_PAYLOAD_PATH:?scheduler payload path is missing}\"\ncase \"$payload_path\" in /*) ;; *) payload_path=\"$HOME/$payload_path\" ;; esac\npayload_path=$(realpath -e -- \"$payload_path\")\npayload_root=$(realpath -e -- \"$HOME/slurm_scheduler/runs\")\ncase \"$payload_path\" in \"$payload_root\"/*/payload.json) ;; *) echo \"unsafe scheduler payload path: $payload_path\" >&2; exit 66 ;; esac\nexec python -u artifacts/code/tools/tier1_final1000_multiseed_phase_b_runner.py --bundle-root \"$PWD\" --payload \"$payload_path\" --payload-root \"$payload_root\" --payload-sha256 03849be9958c43480ee5a3a008d9f150c8c6f71a9ba4a0d65cd53a61b075cb73",
+      "cpus": 4,
+      "dedupe_key": "mft-tier1-final1000:concurrent-lane:b8a3be8be8316aebf283a3a6a0f5ce1e38fc797027250b972215dadbcb9f37ad",
+      "env_profile": "pyaedt2026v1",
+      "gpus": 0,
+      "max_workers_per_node": 32,
+      "memory_mb": 28672,
+      "name": "mft-t1fg-clane-entry-12-2257498123-2257498123",
+      "payload_json": {
+        "aedt_used": false,
+        "automatic_promotion_allowed": false,
+        "batch_length": 1,
+        "bundle_id": "current7-c2d90bf33d513c607f8f",
+        "bundle_manifest_sha256": "86bf540b8ac9fb4a86fecaf20064cd97f464d682b3f58ffd0f23ba85e45bbcd3",
+        "child_resource_policy": {
+          "aedt_backend": "standalone",
+          "cpus": 4,
+          "env_profile": "pyaedt2026v1",
+          "gpus": 0,
+          "max_workers_per_node": 32,
+          "memory_mb": 28672,
+          "priority": 1,
+          "remote_cwd": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f",
+          "required_capability": "conda:pyaedt2026v1",
+          "scheduling_profile": "standard",
+          "timeout_seconds": 86400
+        },
+        "children": [
+          {
+            "child_task_sha256": "95f458f11a7cd2063908e304bc3fe04a182d5dff8fdfb2fe6a9aac4e9f66794c",
+            "logical_dedupe_key": "mft-tier1-final1000:b5aeb7c2a00a6770806e030a8825e55c3814a1a12e3ead96c468ad8c669c0757",
+            "ordinal": 0,
+            "payload_sha256": "6fb21e402dfac0e946748a0d3850c510a7e1d13f64733b0b3b5924bf9019003f",
+            "seed": 2257498123,
+            "task": {
+              "aedt_backend": "standalone",
+              "command": "set -euo pipefail\nexport PYTHONPATH=\"$PWD/artifacts/python-site:$PWD/artifacts/code${PYTHONPATH:+:$PYTHONPATH}\"\npayload_path=\"${SLURM_SCHEDULER_PAYLOAD_PATH:?scheduler payload path is missing}\"\ncase \"$payload_path\" in /*) ;; *) payload_path=\"$HOME/$payload_path\" ;; esac\npayload_path=$(realpath -e -- \"$payload_path\")\npayload_root=$(realpath -e -- \"$HOME/slurm_scheduler/runs\")\ncase \"$payload_path\" in \"$payload_root\"/*/payload.json) ;; *) echo \"unsafe scheduler payload path: $payload_path\" >&2; exit 66 ;; esac\nexec python -u artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py --bundle-root \"$PWD\" --payload \"$payload_path\" --payload-root \"$payload_root\" --payload-sha256 6fb21e402dfac0e946748a0d3850c510a7e1d13f64733b0b3b5924bf9019003f",
+              "cpus": 4,
+              "dedupe_key": "mft-tier1-final1000:b5aeb7c2a00a6770806e030a8825e55c3814a1a12e3ead96c468ad8c669c0757",
+              "env_profile": "pyaedt2026v1",
+              "gpus": 0,
+              "max_workers_per_node": 32,
+              "memory_mb": 28672,
+              "name": "mft-t1fg-e-refill-2257498123",
+              "payload_json": {
+                "adapter_manifest_sha256": "567d98cb62a2b4697be8a466daab0818d60403dd7d668741f0b13061c2dd8cb1",
+                "adapter_receipt_file_sha256": "ab286228efbb40147eb30166a62b7df2d70011092702aeae0bff66023c586882",
+                "aedt_used": false,
+                "automatic_promotion_allowed": false,
+                "bundle_id": "current7-c2d90bf33d513c607f8f",
+                "bundle_manifest_sha256": "86bf540b8ac9fb4a86fecaf20064cd97f464d682b3f58ffd0f23ba85e45bbcd3",
+                "cohort_id": "current7-c2d90bf33d513c607f8f-deep36",
+                "constraint_names": [
+                  "Llt_robust_band",
+                  "temperature_robust_limit:Tprobe_Tx_leeward_max",
+                  "temperature_robust_limit:Tprobe_Rx_main_leeward_max",
+                  "temperature_robust_limit:Tprobe_Rx_side_leeward_max",
+                  "temperature_robust_limit:Tprobe_core_center_max",
+                  "temperature_robust_limit:Tprobe_core_center_leg_max",
+                  "temperature_robust_limit:Tprobe_core_side_leg_max",
+                  "temperature_robust_limit:Tprobe_core_top_yoke_max",
+                  "analytical_flux_density_limit",
+                  "decoded_space_shrink",
+                  "secondary_vertical_insulation",
+                  "strict_full_density_support",
+                  "Llt_ensemble_disagreement",
+                  "minimum_physical_insulation",
+                  "core_group_manufacturability_limit",
+                  "half_magnetizing_resonance_minimum",
+                  "half_magnetizing_resonance_maximum",
+                  "exterior_width_limit",
+                  "exterior_length_limit",
+                  "exterior_height_limit"
+                ],
+                "constraint_version": "staged-3e767d06441260d9",
+                "dataset_sha256": "0f0cb22a528cf029ce42101e7703d38200ae03038bd0aa95cc1619f34bca06a3",
+                "every_offspring_decode_repair_attested": true,
+                "fea_submission_approved": false,
+                "fea_submission_performed": false,
+                "final_goal_stage_id": "entry-1200-t125",
+                "final_goal_stage_profile_sha256": "02544c1003c184b134c36d39b306a843ac34b1598dfb5d705f275235726bcf8f",
+                "fixed_primary_turns_supported": [
+                  5,
+                  6
+                ],
+                "generation_artifact_inventory_sha256": "f27276bb36aebdeb59b7908f3294773aaf6e99b39c5dfb09aea69bdd14537de5",
+                "hard_constraint_contract_sha256": "7a5deb9da7f3d3829126f3bb29921d77e4705ec594c8ce42d82c0d63afb2ad6a",
+                "hard_spec": {
+                  "B_limit_T": 1.2,
+                  "Llt_target_uH": 27.5,
+                  "Llt_tol_uH": 0.55,
+                  "T_limit_C": 125.0,
+                  "insulation_min_mm": 40.0,
+                  "magnetizing_inductance_factor": 0.5,
+                  "n_core_group_max": 4.0,
+                  "primary_conductor_thickness_mm": 5.0,
+                  "q_sigma": 1.0,
+                  "resonance_max_Hz": 20000.0,
+                  "resonance_min_Hz": 15000.0,
+                  "size_H_max_mm": 750.0,
+                  "size_L_max_mm": 1200.0,
+                  "size_W_max_mm": 1200.0
+                },
+                "hard_spec_sha256": "3e767d06441260d9a77c0515e7152c4928802f76c43c77924110c7885823251e",
+                "inference_threads": 4,
+                "initial_repair_attested": true,
+                "island_profile_sha256": "0b32cb8be124e9d0f3e565bc784b52b6804e8e519c250d69f27c98824e319592",
+                "lane": {
+                  "fixed_primary_turns": 6,
+                  "island_id": "n1-6-resanchor-allthermal-2p50c",
+                  "seed": 2257498123,
+                  "stage_id": "entry-1200-t125",
+                  "stage_variant": "final1000-n1-6-entry-1200-t125-v1",
+                  "variant": "fixed-n1-6-deep-allthermal-2p50c-v1-current7",
+                  "wave": "refill"
+                },
+                "max_generations": 300,
+                "maximum_peak_rss_bytes": 23622320128,
+                "offspring_physics_repair": true,
+                "optimizer_processes": 1,
+                "optimizer_repair_contract_sha256": "aeee41c8bcdc39d3e914543929b8428c8366666914a5d79de590c812b9069adb",
+                "population": 320,
+                "preflight_timeout_seconds": 1200,
+                "production_eligible": false,
+                "profile_canonical_sha256": "559e8289150e72a9daa70327aee0afc7050923838b323df4374bcc713d135101",
+                "relocation_contract_sha256": "4108d55bebf73345a47abc0442db1d579ad4752a34322b0559c4cb6bd533e201",
+                "required_model_targets_sha256": "3aa7a549f0c81cf68a38dcfded20d6ac3c081bda8c81d629201992cc02573ff9",
+                "scheduler_cpus": 4,
+                "schema_version": "mft-tier1-current7-slurm-seed-task-v1",
+                "search_interface_schema_version": "mft-tier1-current7-search-seed-cli-v1",
+                "seed": 2257498123,
+                "stage_spec_sha256": "3e767d06441260d9a77c0515e7152c4928802f76c43c77924110c7885823251e",
+                "temperature_contract_sha256": "441aa2f9353b5c7c1584704eb797f722fe5ca524d7dee5deee90db16e6aed254",
+                "terminal_physical_replay_attested": true,
+                "topology_evolution_contract_sha256": "9060aeb2920f3862142f238e6fd3272e1922ce12b839706563227e5b18a27848",
+                "topology_niche_contract_sha256": "8b0da184dd6ed601b0b3835f3dad6b35030fe7f59e49a43ced5373832426986b",
+                "train_report_sha256": "ea404f6f637bb53971bc198f3b3a366b6e3d2eb81d203ad37734de5b44c2c045",
+                "warm_artifact_sha256": "081f3e17dfeb6d6022ab11dfa2e00b5bc794c9bdbd719df72d81cf152f37b216",
+                "warm_contract_sha256": "0ef60cd5acf430dcd9116e38e76cdb732feeb514793028d00e303149b584e09d",
+                "warm_id": "n1-6",
+                "warm_repair_attested": true
+              },
+              "priority": 1,
+              "remote_cwd": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f",
+              "required_capability": "conda:pyaedt2026v1",
+              "scheduling_profile": "standard",
+              "timeout_seconds": 86400
+            }
+          }
+        ],
+        "cleanup_reserve_seconds": 1800,
+        "concurrent_children": 1,
+        "cpu_isolation": {
+          "cpus_per_child": 4,
+          "disjoint_child_cpuset_required": true,
+          "inherited_scheduler_cpuset_required": true,
+          "nested_srun_used": false,
+          "strategy": "child-self-sched-setaffinity-v1"
+        },
+        "cpu_telemetry": {
+          "automatic_child_cpu_reduction_allowed": false,
+          "current_child_cpu_contract": 4,
+          "dispatch_fill_seconds_required": true,
+          "future_comparison_child_cpu_counts": [
+            1,
+            2,
+            4
+          ],
+          "logical_child_capacity_seconds_required": true,
+          "logical_child_utilization_required": true,
+          "parent_aggregate_child_cpu_time_required": true,
+          "parent_child_cpu_crosscheck_required": true,
+          "parent_wall_time_required": true,
+          "per_child_elapsed_utilization_required": true,
+          "per_child_process_tree_cpu_time_required": true,
+          "requested_cpu_capacity_seconds_required": true,
+          "schema_version": "mft-tier1-final1000-phase-b-cpu-telemetry-policy-v1"
+        },
+        "execution_mode": "concurrent",
+        "fea_submission_approved": false,
+        "fea_submission_performed": false,
+        "inference_safety": {
+          "direct_enospc_cause": "joblib-threadpool-simplequeue-semlock-churn",
+          "joblib_thread_pool_construction_allowed": false,
+          "minimum_repeated_predict_calls_per_target": 2,
+          "multiprocessing_semlock_construction_allowed": false,
+          "policy": "family_specific_semaphore_free_sklearn_forest_v1",
+          "repeated_predict_stress_required": true,
+          "required_helper_path": "tools/tier1_semlock_safe_inference_smoke.py",
+          "required_helper_sha256": "c25afd39752a990c31e1b934c77282d88ac11dab1cad763d4f07c95e4b87dd80",
+          "required_release_commit": "6ea0e17e5e028ebb8d89d910c3cec1a0f014dae5",
+          "required_smoke_schema": "mft-tier1-semlock-safe-inference-smoke-v1",
+          "semaphore_free_sklearn_families": [
+            "extratrees",
+            "randomforest"
+          ],
+          "sklearn_forest_n_jobs": 1,
+          "tmp_isolation_claimed_as_enospc_fix": false
+        },
+        "internal_deadline_seconds": 82800,
+        "minimum_child_start_budget_seconds": 7200,
+        "model_context_reuse": false,
+        "model_load_stagger_seconds": 5.0,
+        "parent_resource_policy": {
+          "aedt_backend": "standalone",
+          "cpus": 4,
+          "env_profile": "pyaedt2026v1",
+          "gpus": 0,
+          "max_workers_per_node": 32,
+          "memory_mb": 28672,
+          "priority": 1,
+          "remote_cwd": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f",
+          "required_capability": "conda:pyaedt2026v1",
+          "scheduling_profile": "standard",
+          "timeout_seconds": 86400
+        },
+        "production_eligible": false,
+        "protocol_version": "final1000-finite-multiseed-phase-b-v1",
+        "rng_context_reuse": false,
+        "runtime_isolation": {
+          "cache_relative_path": "cache",
+          "cleanup_owner": "parent-after-child-reaped",
+          "cleanup_scope": "child-runtime-root-only",
+          "environment_variables": {
+            "JOBLIB_TEMP_FOLDER": "joblib",
+            "TEMP": "tmp",
+            "TMP": "tmp",
+            "TMPDIR": "tmp",
+            "XDG_CACHE_HOME": "cache"
+          },
+          "joblib_relative_path": "joblib",
+          "root_template": "runs/task-{physical_task_id}/seed-{seed}/runtime",
+          "shared_tmp_cleanup_allowed": false,
+          "tmp_relative_path": "tmp"
+        },
+        "schema_version": "mft-tier1-final1000-concurrent-lane-task-v1",
+        "seed_reuse_allowed": false,
+        "stage_id": "entry-1200-t125",
+        "stage_profile_sha256": "02544c1003c184b134c36d39b306a843ac34b1598dfb5d705f275235726bcf8f",
+        "subprocess_per_seed": true,
+        "wave": "refill"
+      },
+      "priority": 1,
+      "remote_cwd": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f",
+      "required_capability": "conda:pyaedt2026v1",
+      "scheduling_profile": "standard",
+      "timeout_seconds": 86400
+    },
+    "seed": 2257498123,
+    "source_child_logical_dedupe_key": "mft-tier1-final1000:b5aeb7c2a00a6770806e030a8825e55c3814a1a12e3ead96c468ad8c669c0757",
+    "source_child_payload_sha256": "6fb21e402dfac0e946748a0d3850c510a7e1d13f64733b0b3b5924bf9019003f",
+    "source_child_task_sha256": "95f458f11a7cd2063908e304bc3fe04a182d5dff8fdfb2fe6a9aac4e9f66794c",
+    "source_package_sha256": "2eb0618a0e12476cacee70c6966ce93cf5a90168e0e88893e2d82f9ac6a5dc2d",
+    "source_parent_dedupe_key": "mft-tier1-final1000:concurrent-lane:b8a3be8be8316aebf283a3a6a0f5ce1e38fc797027250b972215dadbcb9f37ad",
+    "source_parent_task_sha256": "69263c2ad94dfd32d212c25c7072c7b9c3a477facc753310f75271a41fb123bf",
+    "source_submission_receipt_sha256": "544e88f29a8618be4054cf54bd7b2ec5ef84780b6d0d04bbe28bb2da1c295464",
+    "task_id": 87052
+  },
+  "anchor_failure_observation": {
+    "allocation_id": 14011,
+    "exit_code": 1,
+    "failure_message": "RuntimeError: Phase B parent memory evidence seal mismatch",
+    "finished_at": "2026-07-22 23:50:37",
+    "observed_at": "2026-07-23T08:52:00+09:00",
+    "scheduler_access": "GET-only",
+    "scheduler_write_count": 0,
+    "started_at": "2026-07-22 23:16:04",
+    "status": "failed",
+    "task_id": 87052
+  },
+  "batch_rollout_policy": {
+    "account_and_node_limits_are_hard": true,
+    "allocation_local_cpu_and_memory_fit_required": true,
+    "allocation_states_counted": [
+      "active"
+    ],
+    "automatic_rollout_allowed": false,
+    "cross_allocation_resource_packing_allowed": false,
+    "exclusive_allocations_counted": false,
+    "fallback_cpus_before_promotion": 4,
+    "maintain_selected_active_target_until_stop": true,
+    "max_workers_per_node": 32,
+    "objective": "maximize-completed-seeds-per-wall-clock",
+    "one_durable_reservation_and_one_post_at_a_time": true,
+    "per_seed_latency_priority": false,
+    "promotion_requires_paired_comparison_and_independent_review": true,
+    "recompute_capacity_each_controller_cycle": true,
+    "resource2_rollout_currently_allowed": false,
+    "resource2_unpaired_evidence_is_not_promotion_evidence": true,
+    "resource_pool": "cpu",
+    "target_formula": "exact_fit_slots[selected_cpus]"
+  },
+  "capacity": {
+    "aggregate_cross_allocation_packing_allowed": false,
+    "allocation_local": true,
+    "capacity_sha256": "392e2e5bc7cc91d8b2d616760651eb9e213e76c8b158f683562ce5d84a8bfb40",
+    "eligible_allocation_count": 41,
+    "exact_fit_slots": {
+      "2": 719,
+      "3": 567,
+      "4": 459
+    },
+    "formula": "min(floor(total_cpus/cpus),floor(total_memory_mb/28672),32)",
+    "max_workers_per_node": 32,
+    "memory_mb_per_task": 28672,
+    "per_allocation": [
+      {
+        "allocation_id": 13741,
+        "exact_fit_slots": {
+          "2": 24,
+          "3": 21,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 700751
+      },
+      {
+        "allocation_id": 13742,
+        "exact_fit_slots": {
+          "2": 23,
+          "3": 21,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 666799
+      },
+      {
+        "allocation_id": 13744,
+        "exact_fit_slots": {
+          "2": 22,
+          "3": 14,
+          "4": 11
+        },
+        "total_cpus": 44,
+        "total_memory_mb": 691200
+      },
+      {
+        "allocation_id": 13745,
+        "exact_fit_slots": {
+          "2": 22,
+          "3": 14,
+          "4": 11
+        },
+        "total_cpus": 44,
+        "total_memory_mb": 691200
+      },
+      {
+        "allocation_id": 13747,
+        "exact_fit_slots": {
+          "2": 22,
+          "3": 14,
+          "4": 11
+        },
+        "total_cpus": 44,
+        "total_memory_mb": 691200
+      },
+      {
+        "allocation_id": 13749,
+        "exact_fit_slots": {
+          "2": 26,
+          "3": 21,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 754907
+      },
+      {
+        "allocation_id": 13750,
+        "exact_fit_slots": {
+          "2": 16,
+          "3": 10,
+          "4": 8
+        },
+        "total_cpus": 32,
+        "total_memory_mb": 631613
+      },
+      {
+        "allocation_id": 13754,
+        "exact_fit_slots": {
+          "2": 16,
+          "3": 10,
+          "4": 8
+        },
+        "total_cpus": 32,
+        "total_memory_mb": 520087
+      },
+      {
+        "allocation_id": 13756,
+        "exact_fit_slots": {
+          "2": 16,
+          "3": 10,
+          "4": 8
+        },
+        "total_cpus": 32,
+        "total_memory_mb": 472983
+      },
+      {
+        "allocation_id": 13759,
+        "exact_fit_slots": {
+          "2": 14,
+          "3": 9,
+          "4": 7
+        },
+        "total_cpus": 28,
+        "total_memory_mb": 729988
+      },
+      {
+        "allocation_id": 13762,
+        "exact_fit_slots": {
+          "2": 14,
+          "3": 9,
+          "4": 7
+        },
+        "total_cpus": 28,
+        "total_memory_mb": 693862
+      },
+      {
+        "allocation_id": 13765,
+        "exact_fit_slots": {
+          "2": 6,
+          "3": 6,
+          "4": 6
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 180491
+      },
+      {
+        "allocation_id": 13768,
+        "exact_fit_slots": {
+          "2": 14,
+          "3": 9,
+          "4": 7
+        },
+        "total_cpus": 28,
+        "total_memory_mb": 673137
+      },
+      {
+        "allocation_id": 13772,
+        "exact_fit_slots": {
+          "2": 14,
+          "3": 9,
+          "4": 7
+        },
+        "total_cpus": 28,
+        "total_memory_mb": 663248
+      },
+      {
+        "allocation_id": 13774,
+        "exact_fit_slots": {
+          "2": 10,
+          "3": 6,
+          "4": 5
+        },
+        "total_cpus": 20,
+        "total_memory_mb": 938463
+      },
+      {
+        "allocation_id": 13776,
+        "exact_fit_slots": {
+          "2": 18,
+          "3": 12,
+          "4": 9
+        },
+        "total_cpus": 36,
+        "total_memory_mb": 947945
+      },
+      {
+        "allocation_id": 13777,
+        "exact_fit_slots": {
+          "2": 14,
+          "3": 9,
+          "4": 7
+        },
+        "total_cpus": 28,
+        "total_memory_mb": 658914
+      },
+      {
+        "allocation_id": 13780,
+        "exact_fit_slots": {
+          "2": 18,
+          "3": 12,
+          "4": 9
+        },
+        "total_cpus": 36,
+        "total_memory_mb": 928621
+      },
+      {
+        "allocation_id": 13781,
+        "exact_fit_slots": {
+          "2": 14,
+          "3": 9,
+          "4": 7
+        },
+        "total_cpus": 28,
+        "total_memory_mb": 508836
+      },
+      {
+        "allocation_id": 13782,
+        "exact_fit_slots": {
+          "2": 4,
+          "3": 2,
+          "4": 2
+        },
+        "total_cpus": 8,
+        "total_memory_mb": 750969
+      },
+      {
+        "allocation_id": 13783,
+        "exact_fit_slots": {
+          "2": 17,
+          "3": 11,
+          "4": 8
+        },
+        "total_cpus": 34,
+        "total_memory_mb": 568387
+      },
+      {
+        "allocation_id": 13784,
+        "exact_fit_slots": {
+          "2": 12,
+          "3": 9,
+          "4": 7
+        },
+        "total_cpus": 28,
+        "total_memory_mb": 369915
+      },
+      {
+        "allocation_id": 13785,
+        "exact_fit_slots": {
+          "2": 10,
+          "3": 6,
+          "4": 5
+        },
+        "total_cpus": 20,
+        "total_memory_mb": 910571
+      },
+      {
+        "allocation_id": 13899,
+        "exact_fit_slots": {
+          "2": 14,
+          "3": 14,
+          "4": 14
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 407117
+      },
+      {
+        "allocation_id": 13957,
+        "exact_fit_slots": {
+          "2": 24,
+          "3": 16,
+          "4": 12
+        },
+        "total_cpus": 48,
+        "total_memory_mb": 964242
+      },
+      {
+        "allocation_id": 13963,
+        "exact_fit_slots": {
+          "2": 20,
+          "3": 13,
+          "4": 10
+        },
+        "total_cpus": 40,
+        "total_memory_mb": 691200
+      },
+      {
+        "allocation_id": 14004,
+        "exact_fit_slots": {
+          "2": 10,
+          "3": 6,
+          "4": 5
+        },
+        "total_cpus": 20,
+        "total_memory_mb": 887454
+      },
+      {
+        "allocation_id": 14009,
+        "exact_fit_slots": {
+          "2": 26,
+          "3": 21,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 764630
+      },
+      {
+        "allocation_id": 14010,
+        "exact_fit_slots": {
+          "2": 26,
+          "3": 21,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 764630
+      },
+      {
+        "allocation_id": 14011,
+        "exact_fit_slots": {
+          "2": 17,
+          "3": 17,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 489536
+      },
+      {
+        "allocation_id": 14021,
+        "exact_fit_slots": {
+          "2": 20,
+          "3": 20,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 587519
+      },
+      {
+        "allocation_id": 14022,
+        "exact_fit_slots": {
+          "2": 16,
+          "3": 16,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 480466
+      },
+      {
+        "allocation_id": 14029,
+        "exact_fit_slots": {
+          "2": 23,
+          "3": 21,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 668608
+      },
+      {
+        "allocation_id": 14032,
+        "exact_fit_slots": {
+          "2": 19,
+          "3": 19,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 552382
+      },
+      {
+        "allocation_id": 14033,
+        "exact_fit_slots": {
+          "2": 20,
+          "3": 20,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 585135
+      },
+      {
+        "allocation_id": 14042,
+        "exact_fit_slots": {
+          "2": 17,
+          "3": 17,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 500578
+      },
+      {
+        "allocation_id": 14043,
+        "exact_fit_slots": {
+          "2": 20,
+          "3": 20,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 596882
+      },
+      {
+        "allocation_id": 14045,
+        "exact_fit_slots": {
+          "2": 20,
+          "3": 20,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 574605
+      },
+      {
+        "allocation_id": 14046,
+        "exact_fit_slots": {
+          "2": 16,
+          "3": 16,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 460772
+      },
+      {
+        "allocation_id": 14060,
+        "exact_fit_slots": {
+          "2": 21,
+          "3": 21,
+          "4": 16
+        },
+        "total_cpus": 64,
+        "total_memory_mb": 629892
+      },
+      {
+        "allocation_id": 14099,
+        "exact_fit_slots": {
+          "2": 24,
+          "3": 16,
+          "4": 12
+        },
+        "total_cpus": 48,
+        "total_memory_mb": 698814
+      }
+    ],
+    "schema_version": "mft-tier1-final1000-paired-resource-capacity-v1"
+  },
+  "companions": {
+    "2": {
+      "aedt_backend": "standalone",
+      "command": "set -euo pipefail\nexport PYTHONPATH=\"$PWD/artifacts/python-site:$PWD/artifacts/code${PYTHONPATH:+:$PYTHONPATH}\"\nexport OMP_NUM_THREADS=2\nexport OPENBLAS_NUM_THREADS=2\nexport MKL_NUM_THREADS=2\nexport NUMEXPR_NUM_THREADS=2\nexport VECLIB_MAXIMUM_THREADS=2\npayload_path=\"${SLURM_SCHEDULER_PAYLOAD_PATH:?scheduler payload path is missing}\"\ncase \"$payload_path\" in /*) ;; *) payload_path=\"$HOME/$payload_path\" ;; esac\npayload_path=$(realpath -e -- \"$payload_path\")\npayload_root=$(realpath -e -- \"$HOME/slurm_scheduler/runs\")\ncase \"$payload_path\" in \"$payload_root\"/*/payload.json) ;; *) echo \"unsafe scheduler payload path: $payload_path\" >&2; exit 66 ;; esac\npython -u - \"$payload_path\" \"$payload_root\" 9355bacfa407037b6d1c66bca1ae0dc1fdcf4829d2ea6e73c40b9f6282a96b6a 2257498123 2 30064771072 23622320128 4ca2f2304007a929c3f202cab89bca9067f3263aa53c8c153b358423bb6e6cfa <<'PY'\nimport hashlib\nimport json\nimport math\nimport os\nfrom pathlib import Path\nimport resource\nimport subprocess\nimport sys\nimport time\nfrom datetime import datetime, timezone\n\nSCHEMA = \"mft-tier1-final1000-paired-resource-comparator-telemetry-v1\"\nTHREADS = (\"OMP_NUM_THREADS\", \"OPENBLAS_NUM_THREADS\", \"MKL_NUM_THREADS\", \"NUMEXPR_NUM_THREADS\", \"VECLIB_MAXIMUM_THREADS\")\nREMOVED = frozenset((\"payload_sha256\", \"optimizer_pid\", \"inference_threads\", \"scheduler_cpus\", \"optimizer_inference_threads\", \"threads_per_model\", \"family_threads\"))\n\ndef now():\n    return datetime.now(timezone.utc).astimezone().isoformat(timespec=\"seconds\")\n\ndef sha_bytes(raw):\n    return hashlib.sha256(raw).hexdigest()\n\ndef canonical(value):\n    raw = json.dumps(value, sort_keys=True, separators=(\",\", \":\"), ensure_ascii=False, allow_nan=False).encode(\"utf-8\")\n    return hashlib.sha256(raw).hexdigest()\n\ndef atomic_json(path, value):\n    path.parent.mkdir(parents=True, exist_ok=True)\n    staged = path.with_name(\".\" + path.name + \".\" + str(os.getpid()) + \".tmp\")\n    try:\n        staged.write_bytes(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False).encode(\"utf-8\") + b\"\\n\")\n        os.replace(staged, path)\n    finally:\n        if staged.exists():\n            staged.unlink()\n\ndef science_value(value):\n    if isinstance(value, dict):\n        return {str(key): science_value(item) for key, item in value.items() if str(key) not in REMOVED}\n    if isinstance(value, list):\n        return [science_value(item) for item in value]\n    return value\n\nCGROUP_DIAGNOSTIC_SCHEMA = \"mft-tier1-cgroup-memory-diagnostics-v2\"\nCGROUP_SNAPSHOT_SCHEMA = \"mft-tier1-cgroup-memory-snapshot-v2\"\nCGROUP_DIAGNOSTIC_MAX_BYTES = 262144\nCGROUP_V1_UNLIMITED_MIN_BYTES = 1152921504606846976\n\ndef _canonical_absolute_posix(value, label):\n    if (\n        not isinstance(value, str)\n        or not value.startswith(\"/\")\n        or value.startswith(\"//\")\n        or \"\\\\\" in value\n        or \"\\x00\" in value\n    ):\n        raise RuntimeError(label + \" is not one canonical absolute POSIX path\")\n    parsed = PurePosixPath(value)\n    if \"..\" in parsed.parts or \".\" in parsed.parts:\n        raise RuntimeError(label + \" contains a traversal component\")\n    canonical = \"/\" if parsed == PurePosixPath(\"/\") else \"/\" + \"/\".join(parsed.parts[1:])\n    if value != canonical:\n        raise RuntimeError(label + \" is not canonical\")\n    return parsed\n\ndef _mountinfo_unescape(value):\n    result = value\n    for encoded, decoded in (\n        (\"\\\\040\", \" \"),\n        (\"\\\\011\", \"\\t\"),\n        (\"\\\\012\", \"\\n\"),\n        (\"\\\\134\", \"\\\\\"),\n    ):\n        result = result.replace(encoded, decoded)\n    if \"\\\\\" in result or \"\\x00\" in result or \"\\n\" in result or \"\\r\" in result:\n        raise RuntimeError(\"unsupported or unsafe mountinfo path escape\")\n    return result\n\ndef _parse_cgroup_memberships(text):\n    if not isinstance(text, str) or not text or \"\\x00\" in text:\n        raise RuntimeError(\"/proc/self/cgroup is empty or malformed\")\n    result = []\n    seen_hierarchy_ids = set()\n    seen_v2 = 0\n    seen_memory = 0\n    for line in text.splitlines():\n        if not line:\n            raise RuntimeError(\"/proc/self/cgroup contains an empty record\")\n        fields = line.split(\":\", 2)\n        if len(fields) != 3 or not fields[0].isascii() or not fields[0].isdigit():\n            raise RuntimeError(\"/proc/self/cgroup contains a malformed record\")\n        hierarchy_id = int(fields[0])\n        if hierarchy_id in seen_hierarchy_ids:\n            raise RuntimeError(\"/proc/self/cgroup repeats a hierarchy id\")\n        seen_hierarchy_ids.add(hierarchy_id)\n        controllers_raw = fields[1]\n        controllers = [] if not controllers_raw else controllers_raw.split(\",\")\n        if any(\n            not controller\n            or not controller.isascii()\n            or any(not (character.isalnum() or character in \"_-=.\") for character in controller)\n            for controller in controllers\n        ):\n            raise RuntimeError(\"/proc/self/cgroup controller list is malformed\")\n        if len(controllers) != len(set(controllers)):\n            raise RuntimeError(\"/proc/self/cgroup repeats a controller\")\n        membership = _canonical_absolute_posix(fields[2], \"cgroup membership\")\n        version = None\n        if not controllers:\n            if hierarchy_id != 0:\n                raise RuntimeError(\"empty controller membership is not cgroup v2\")\n            seen_v2 += 1\n            version = \"v2\"\n        elif \"memory\" in controllers:\n            if hierarchy_id == 0:\n                raise RuntimeError(\"cgroup v1 memory hierarchy id must be nonzero\")\n            seen_memory += 1\n            version = \"v1\"\n        if version is not None:\n            result.append(\n                {\n                    \"version\": version,\n                    \"hierarchy_id\": hierarchy_id,\n                    \"controllers\": sorted(controllers),\n                    \"membership_path\": membership.as_posix(),\n                }\n            )\n    if seen_v2 > 1 or seen_memory > 1:\n        raise RuntimeError(\"cgroup memory membership is ambiguous\")\n    if not result:\n        raise RuntimeError(\"no cgroup v1 memory or v2 membership is available\")\n    return result\n\ndef _parse_cgroup_mounts(text):\n    if not isinstance(text, str) or not text or \"\\x00\" in text:\n        raise RuntimeError(\"/proc/self/mountinfo is empty or malformed\")\n    result = []\n    for line in text.splitlines():\n        fields = line.split()\n        separators = [index for index, field in enumerate(fields) if field == \"-\"]\n        if len(separators) != 1:\n            raise RuntimeError(\"mountinfo record has an ambiguous separator\")\n        separator = separators[0]\n        if separator < 6 or len(fields) < separator + 4:\n            raise RuntimeError(\"mountinfo record is truncated\")\n        filesystem = fields[separator + 1]\n        if filesystem not in {\"cgroup\", \"cgroup2\"}:\n            continue\n        mount_root_raw = _mountinfo_unescape(fields[3])\n        mount_point_raw = _mountinfo_unescape(fields[4])\n        mount_root = _canonical_absolute_posix(mount_root_raw, \"cgroup mount root\")\n        mount_point = _canonical_absolute_posix(mount_point_raw, \"cgroup mount point\")\n        sysfs = PurePosixPath(\"/sys/fs/cgroup\")\n        if mount_point != sysfs and sysfs not in mount_point.parents:\n            raise RuntimeError(\"cgroup mount point escaped /sys/fs/cgroup\")\n        option_tokens = set()\n        for field in [*fields[5:separator], *fields[separator + 2 :]]:\n            option_tokens.update(token for token in field.split(\",\") if token)\n        if filesystem == \"cgroup\" and \"memory\" not in option_tokens:\n            continue\n        result.append(\n            {\n                \"version\": \"v2\" if filesystem == \"cgroup2\" else \"v1\",\n                \"mount_root\": mount_root.as_posix(),\n                \"mount_point\": mount_point.as_posix(),\n            }\n        )\n    if not result:\n        raise RuntimeError(\"no cgroup memory-capable mount is available\")\n    return result\n\ndef _relative_membership(membership_path, mount_root):\n    membership = PurePosixPath(membership_path)\n    root = PurePosixPath(mount_root)\n    if membership == root:\n        return PurePosixPath(\".\")\n    if root != PurePosixPath(\"/\") and root not in membership.parents:\n        return None\n    if root == PurePosixPath(\"/\"):\n        return PurePosixPath(*membership.parts[1:])\n    return membership.relative_to(root)\n\ndef _safe_cgroup_file(directory, filename, mount_path):\n    candidate = directory / filename\n    if not candidate.exists():\n        if candidate.is_symlink():\n            raise RuntimeError(\"broken cgroup accounting symlink\")\n        return None\n    if candidate.is_symlink():\n        raise RuntimeError(\"cgroup accounting file must not be a symlink\")\n    resolved = candidate.resolve(strict=True)\n    if resolved.parent != directory or (resolved != mount_path and mount_path not in resolved.parents):\n        raise RuntimeError(\"cgroup accounting file escaped its mount\")\n    if not resolved.is_file():\n        raise RuntimeError(\"cgroup accounting path is not a file\")\n    return resolved\n\ndef _read_cgroup_integer(path, allow_unbounded, version):\n    with path.open(\"rb\") as stream:\n        raw_bytes = stream.read(129)\n    if len(raw_bytes) > 128:\n        raise RuntimeError(\"cgroup accounting value exceeds 128 bytes\")\n    try:\n        raw = raw_bytes.decode(\"ascii\").strip()\n    except UnicodeDecodeError as exc:\n        raise RuntimeError(\"cgroup accounting value is not ASCII\") from exc\n    if not raw or any(character.isspace() for character in raw):\n        raise RuntimeError(\"cgroup accounting value is empty or multiline\")\n    if raw == \"max\":\n        if not allow_unbounded:\n            raise RuntimeError(\"only a cgroup limit may be unbounded\")\n        return None, raw\n    if not raw.isascii() or not raw.isdigit():\n        raise RuntimeError(\"cgroup accounting value is not an unsigned integer\")\n    value = int(raw)\n    if allow_unbounded and version == \"v1\" and value >= (1 << 60):\n        return None, raw\n    return value, raw\n\ndef _candidate_snapshot(candidate, mount, sysfs_root):\n    relative = _relative_membership(candidate[\"membership_path\"], mount[\"mount_root\"])\n    if relative is None:\n        return None\n    sysfs_root = Path(sysfs_root).resolve(strict=True)\n    logical_mount = PurePosixPath(mount[\"mount_point\"])\n    logical_sysfs = PurePosixPath(\"/sys/fs/cgroup\")\n    mount_relative = (\n        PurePosixPath(\".\")\n        if logical_mount == logical_sysfs\n        else logical_mount.relative_to(logical_sysfs)\n    )\n    mount_path = (sysfs_root / mount_relative.as_posix()).resolve(strict=True)\n    if mount_path != sysfs_root and sysfs_root not in mount_path.parents:\n        raise RuntimeError(\"resolved cgroup mount escaped the sysfs root\")\n    leaf = (mount_path / relative.as_posix()).resolve(strict=True)\n    if leaf != mount_path and mount_path not in leaf.parents:\n        raise RuntimeError(\"resolved cgroup membership escaped its mount\")\n    if not leaf.is_dir():\n        return None\n    filenames = (\n        (\"memory.max\", \"memory.current\", \"memory.peak\")\n        if candidate[\"version\"] == \"v2\"\n        else (\n            \"memory.limit_in_bytes\",\n            \"memory.usage_in_bytes\",\n            \"memory.max_usage_in_bytes\",\n        )\n    )\n    records = []\n    current = leaf\n    depth = 0\n    while True:\n        files = [_safe_cgroup_file(current, name, mount_path) for name in filenames]\n        if any(item is not None for item in files):\n            if not all(item is not None for item in files):\n                raise RuntimeError(\"cgroup memory accounting files are partial\")\n            limit, raw_limit = _read_cgroup_integer(files[0], True, candidate[\"version\"])\n            usage, _ = _read_cgroup_integer(files[1], False, candidate[\"version\"])\n            peak, _ = _read_cgroup_integer(files[2], False, candidate[\"version\"])\n            if peak < usage:\n                raise RuntimeError(\"cgroup peak memory is below current usage\")\n            records.append(\n                {\n                    \"depth_from_leaf\": depth,\n                    \"relative_path\": (\n                        \".\"\n                        if current == sysfs_root\n                        else current.relative_to(sysfs_root).as_posix()\n                    ),\n                    \"memory_max_raw\": raw_limit,\n                    \"memory_limit_bytes\": limit,\n                    \"memory_current_bytes\": usage,\n                    \"memory_peak_bytes\": peak,\n                }\n            )\n        if current == mount_path:\n            break\n        current = current.parent\n        depth += 1\n    if not records:\n        return None\n    finite = [record for record in records if record[\"memory_limit_bytes\"] is not None]\n    if not finite:\n        return None\n    return {\n        \"schema_version\": \"mft-tier1-cgroup-memory-snapshot-v2\",\n        \"cgroup_version\": candidate[\"version\"],\n        \"hierarchy_id\": candidate[\"hierarchy_id\"],\n        \"membership_controllers\": list(candidate[\"controllers\"]),\n        \"membership_path\": candidate[\"membership_path\"],\n        \"mount_root\": mount[\"mount_root\"],\n        \"mount_relative_path\": mount_relative.as_posix(),\n        \"leaf_relative_path\": (\n            \".\" if leaf == sysfs_root else leaf.relative_to(sysfs_root).as_posix()\n        ),\n        \"nearest_accounting_depth\": records[0][\"depth_from_leaf\"],\n        \"nearest_accounting_limit_unbounded\": records[0][\"memory_limit_bytes\"] is None,\n        \"limit_filename\": filenames[0],\n        \"current_filename\": filenames[1],\n        \"peak_filename\": filenames[2],\n        \"ancestors\": records,\n        \"selected_finite_ancestor\": dict(finite[0]),\n    }\n\ndef cgroup_snapshot_from_text(cgroup_text, mountinfo_text, sysfs_root):\n    memberships = _parse_cgroup_memberships(cgroup_text)\n    mounts = _parse_cgroup_mounts(mountinfo_text)\n    candidates = []\n    seen = set()\n    for membership in memberships:\n        for mount in mounts:\n            if membership[\"version\"] != mount[\"version\"]:\n                continue\n            identity = (\n                membership[\"version\"],\n                membership[\"membership_path\"],\n                mount[\"mount_root\"],\n                mount[\"mount_point\"],\n            )\n            if identity in seen:\n                raise RuntimeError(\"cgroup memory mount mapping is duplicated\")\n            seen.add(identity)\n            snapshot = _candidate_snapshot(membership, mount, sysfs_root)\n            if snapshot is not None:\n                candidates.append(snapshot)\n    if len(candidates) != 1:\n        raise RuntimeError(\"unique finite cgroup memory hierarchy is unavailable\")\n    return candidates[0]\n\ndef _bounded_diagnostic_record(path, maximum_bytes):\n    record = {\n        \"path\": str(path),\n        \"maximum_bytes\": maximum_bytes,\n        \"bytes_captured\": 0,\n        \"truncated\": False,\n        \"utf8_valid\": False,\n        \"sha256\": None,\n        \"text\": None,\n        \"error\": None,\n    }\n    try:\n        with Path(path).open(\"rb\") as stream:\n            raw = stream.read(maximum_bytes + 1)\n        record[\"truncated\"] = len(raw) > maximum_bytes\n        bounded = raw[:maximum_bytes]\n        record[\"bytes_captured\"] = len(bounded)\n        record[\"sha256\"] = hashlib.sha256(bounded).hexdigest()\n        try:\n            record[\"text\"] = bounded.decode(\"utf-8\")\n            record[\"utf8_valid\"] = True\n        except UnicodeDecodeError:\n            record[\"text\"] = bounded.decode(\"utf-8\", errors=\"replace\")\n    except Exception as exc:\n        record[\"error\"] = type(exc).__name__ + \":\" + str(exc)\n    return record\n\ndef capture_cgroup_diagnostics(\n    cgroup_path=Path(\"/proc/self/cgroup\"),\n    mountinfo_path=Path(\"/proc/self/mountinfo\"),\n    sysfs_root=Path(\"/sys/fs/cgroup\"),\n    maximum_bytes=CGROUP_DIAGNOSTIC_MAX_BYTES,\n):\n    if isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int) or maximum_bytes <= 0:\n        raise RuntimeError(\"cgroup diagnostic byte bound is invalid\")\n    return {\n        \"schema_version\": \"mft-tier1-cgroup-memory-diagnostics-v2\",\n        \"maximum_bytes_per_file\": maximum_bytes,\n        \"sysfs_root\": str(sysfs_root).replace(\"\\\\\", \"/\"),\n        \"proc_self_cgroup\": _bounded_diagnostic_record(cgroup_path, maximum_bytes),\n        \"proc_self_mountinfo\": _bounded_diagnostic_record(mountinfo_path, maximum_bytes),\n    }\n\ndef cgroup_snapshot_from_diagnostics(diagnostics, sysfs_root=Path(\"/sys/fs/cgroup\")):\n    if not isinstance(diagnostics, dict):\n        raise RuntimeError(\"cgroup diagnostics are absent\")\n    cgroup = diagnostics.get(\"proc_self_cgroup\")\n    mountinfo = diagnostics.get(\"proc_self_mountinfo\")\n    if not isinstance(cgroup, dict) or not isinstance(mountinfo, dict):\n        raise RuntimeError(\"cgroup diagnostic records are absent\")\n    for record in (cgroup, mountinfo):\n        if (\n            record.get(\"error\") is not None\n            or record.get(\"truncated\") is not False\n            or record.get(\"utf8_valid\") is not True\n            or not isinstance(record.get(\"text\"), str)\n        ):\n            raise RuntimeError(\"cgroup diagnostic input is incomplete or truncated\")\n    return cgroup_snapshot_from_text(cgroup[\"text\"], mountinfo[\"text\"], sysfs_root)\n\n\npayload_path = Path(sys.argv[1]).resolve(strict=True)\npayload_root = Path(sys.argv[2]).resolve(strict=True)\npayload_sha = sys.argv[3]\nseed = int(sys.argv[4])\nrequested_cpus = int(sys.argv[5])\nrequested_memory_bytes = int(sys.argv[6])\nrss_gate_bytes = int(sys.argv[7])\ncomparator_identity_sha = sys.argv[8]\nbundle = Path.cwd().resolve(strict=True)\ntask_id = str(os.environ.get(\"SLURM_SCHED_TASK_ID\") or \"\")\nif not task_id.isascii() or not task_id.isdigit() or int(task_id) <= 0:\n    raise SystemExit(\"missing canonical SLURM_SCHED_TASK_ID\")\ntask_root = bundle / \"runs\" / (\"task-\" + task_id)\ntelemetry_path = task_root / \"paired_resource_telemetry.json\"\nstarted_at = now()\nfailure = None\nexit_code = 79\ncpu_set_before = []\ncpu_set_after = []\ncgroup_before = None\ncgroup_after = None\ncgroup_diagnostics = {\"before\": None, \"after\": None}\nwall = None\ncpu_seconds = None\npeak_rss_bytes = None\nscience = None\nstatus_record = {\"relative_path\": \"runs/task-\" + task_id + \"/seed_status.json\", \"size\": None, \"sha256\": None, \"state\": None, \"terminal\": None, \"exit_code\": None}\nresult_record = {\"relative_path\": \"runs/task-\" + task_id + \"/seed-\" + str(seed) + \"/result.json\", \"size\": None, \"sha256\": None}\ncgroup_diagnostics[\"before\"] = capture_cgroup_diagnostics()\ntry:\n    if payload_path.name != \"payload.json\" or payload_root not in payload_path.parents:\n        raise RuntimeError(\"scheduler payload escaped run root\")\n    payload = json.loads(payload_path.read_text(encoding=\"utf-8\"))\n    if canonical(payload) != payload_sha:\n        raise RuntimeError(\"scheduler payload canonical SHA mismatch\")\n    if payload.get(\"seed\") != seed or payload.get(\"inference_threads\") != requested_cpus or payload.get(\"scheduler_cpus\") != requested_cpus:\n        raise RuntimeError(\"payload seed/CPU/thread binding drifted\")\n    cpu_set_before = sorted(os.sched_getaffinity(0))\n    if len(cpu_set_before) != requested_cpus or len(set(cpu_set_before)) != requested_cpus:\n        raise RuntimeError(\"inherited Scheduler cpuset does not match requested CPUs\")\n    if os.environ.get(\"SLURM_CPUS_PER_TASK\") != str(requested_cpus):\n        raise RuntimeError(\"SLURM_CPUS_PER_TASK does not match requested CPUs\")\n    if any(os.environ.get(name) != str(requested_cpus) for name in THREADS):\n        raise RuntimeError(\"inference thread environment does not match requested CPUs\")\n    cgroup_before = cgroup_snapshot_from_diagnostics(cgroup_diagnostics[\"before\"])\n    selected_before = cgroup_before[\"selected_finite_ancestor\"]\n    if int(selected_before[\"memory_limit_bytes\"]) < requested_memory_bytes:\n        raise RuntimeError(\"finite cgroup ancestor does not cover requested memory\")\n    before = resource.getrusage(resource.RUSAGE_CHILDREN)\n    wall_started = time.monotonic()\n    command = [\n        sys.executable, \"-u\",\n        str(bundle / \"artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py\"),\n        \"--bundle-root\", str(bundle),\n        \"--payload\", str(payload_path),\n        \"--payload-root\", str(payload_root),\n        \"--payload-sha256\", payload_sha,\n    ]\n    completed = subprocess.run(command, cwd=bundle / \"artifacts/code\", check=False)\n    wall = max(0.0, time.monotonic() - wall_started)\n    after = resource.getrusage(resource.RUSAGE_CHILDREN)\n    cpu_seconds = max(0.0, (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime))\n    peak_rss_bytes = int(after.ru_maxrss) * 1024\n    cpu_set_after = sorted(os.sched_getaffinity(0))\n    cgroup_diagnostics[\"after\"] = capture_cgroup_diagnostics()\n    cgroup_after = cgroup_snapshot_from_diagnostics(cgroup_diagnostics[\"after\"])\n    selected_after = cgroup_after[\"selected_finite_ancestor\"]\n    if cgroup_diagnostics[\"after\"][\"proc_self_cgroup\"][\"sha256\"] != cgroup_diagnostics[\"before\"][\"proc_self_cgroup\"][\"sha256\"] or cgroup_diagnostics[\"after\"][\"proc_self_mountinfo\"][\"sha256\"] != cgroup_diagnostics[\"before\"][\"proc_self_mountinfo\"][\"sha256\"]:\n        raise RuntimeError(\"cgroup membership or mount mapping changed\")\n    if cgroup_after[\"cgroup_version\"] != cgroup_before[\"cgroup_version\"] or cgroup_after[\"mount_relative_path\"] != cgroup_before[\"mount_relative_path\"] or cgroup_after[\"membership_path\"] != cgroup_before[\"membership_path\"] or selected_after[\"relative_path\"] != selected_before[\"relative_path\"] or selected_after[\"memory_limit_bytes\"] != selected_before[\"memory_limit_bytes\"]:\n        raise RuntimeError(\"finite cgroup memory ancestor changed\")\n    if int(selected_after[\"memory_current_bytes\"]) > int(selected_after[\"memory_limit_bytes\"]) or int(selected_after[\"memory_peak_bytes\"]) > int(selected_after[\"memory_limit_bytes\"]):\n        raise RuntimeError(\"cgroup memory usage/peak exceeds finite limit\")\n    status_path = task_root / \"seed_status.json\"\n    if status_path.is_file():\n        raw = status_path.read_bytes()\n        status = json.loads(raw.decode(\"utf-8\"))\n        status_record = {\"relative_path\": status_record[\"relative_path\"], \"size\": len(raw), \"sha256\": sha_bytes(raw), \"state\": status.get(\"state\"), \"terminal\": status.get(\"terminal\"), \"exit_code\": status.get(\"exit_code\")}\n    result_path = task_root / (\"seed-\" + str(seed)) / \"result.json\"\n    if result_path.is_file():\n        raw = result_path.read_bytes()\n        result = json.loads(raw.decode(\"utf-8\"))\n        result_record = {\"relative_path\": result_record[\"relative_path\"], \"size\": len(raw), \"sha256\": sha_bytes(raw)}\n        science = {\"schema_version\": \"mft-tier1-final1000-resource-science-fingerprint-v1\", \"removed_resource_keys\": sorted(REMOVED), \"projection_sha256\": canonical(science_value(result))}\n    exit_code = int(completed.returncode)\n    if exit_code != 0 or status_record[\"state\"] != \"completed\" or status_record[\"terminal\"] is not True or status_record[\"exit_code\"] != 0 or result_record[\"sha256\"] is None or science is None:\n        failure = \"single-seed runner did not produce one completed sealed result\"\n        exit_code = 78 if exit_code == 0 else exit_code\n    elif cpu_set_after != cpu_set_before:\n        failure = \"wrapper affinity changed during execution\"\n        exit_code = 78\n    elif peak_rss_bytes <= 0 or peak_rss_bytes > rss_gate_bytes:\n        failure = \"per-seed peak RSS is outside its gate\"\n        exit_code = 78\nexcept Exception as exc:\n    failure = type(exc).__name__ + \":\" + str(exc)\n    exit_code = 79\n\ncapacity = wall * requested_cpus if wall is not None else None\naverage_cores = cpu_seconds / wall if cpu_seconds is not None and wall and wall > 0 else None\nutilization = cpu_seconds / capacity if cpu_seconds is not None and capacity and capacity > 0 else None\nunsigned = {\n    \"schema_version\": SCHEMA,\n    \"started_at\": started_at,\n    \"finished_at\": now(),\n    \"task_id\": int(task_id),\n    \"seed\": seed,\n    \"comparator_identity_sha256\": comparator_identity_sha,\n    \"payload_sha256\": payload_sha,\n    \"requested_cpus\": requested_cpus,\n    \"requested_memory_bytes\": requested_memory_bytes,\n    \"rss_gate_bytes\": rss_gate_bytes,\n    \"slurm_cpus_per_task\": os.environ.get(\"SLURM_CPUS_PER_TASK\"),\n    \"thread_environment\": {name: os.environ.get(name) for name in THREADS},\n    \"cpu_set_before\": cpu_set_before,\n    \"cpu_set_after\": cpu_set_after,\n    \"wall_time_seconds\": wall,\n    \"process_tree_cpu_seconds\": cpu_seconds,\n    \"cpu_capacity_seconds\": capacity,\n    \"average_cores_used\": average_cores,\n    \"cpu_utilization_fraction\": utilization,\n    \"peak_rss_bytes\": peak_rss_bytes,\n    \"cgroup_diagnostics\": cgroup_diagnostics,\n    \"cgroup_before\": cgroup_before,\n    \"cgroup_after\": cgroup_after,\n    \"seed_status\": status_record,\n    \"result\": result_record,\n    \"science_fingerprint\": science,\n    \"exit_code\": exit_code,\n    \"failure\": failure,\n    \"fea_submission_performed\": False,\n    \"aedt_used\": False,\n}\nvalue = dict(unsigned)\nvalue[\"telemetry_sha256\"] = canonical(unsigned)\natomic_json(telemetry_path, value)\nraise SystemExit(exit_code)\n\nPY",
+      "cpus": 2,
+      "dedupe_key": "mft-tier1-resource-comparator:87052:c2:d2eae3e03e072d7690cfe45165a46a752aa74d6439a08c3adb9196e26b498572",
+      "env_profile": "pyaedt2026v1",
+      "gpus": 0,
+      "max_workers_per_node": 32,
+      "memory_mb": 28672,
+      "name": "mft-t1rc-87052-c2-s2257498123",
+      "payload_json": {
+        "adapter_manifest_sha256": "567d98cb62a2b4697be8a466daab0818d60403dd7d668741f0b13061c2dd8cb1",
+        "adapter_receipt_file_sha256": "ab286228efbb40147eb30166a62b7df2d70011092702aeae0bff66023c586882",
+        "aedt_used": false,
+        "automatic_promotion_allowed": false,
+        "bundle_id": "current7-c2d90bf33d513c607f8f",
+        "bundle_manifest_sha256": "86bf540b8ac9fb4a86fecaf20064cd97f464d682b3f58ffd0f23ba85e45bbcd3",
+        "cohort_id": "current7-c2d90bf33d513c607f8f-deep36",
+        "constraint_names": [
+          "Llt_robust_band",
+          "temperature_robust_limit:Tprobe_Tx_leeward_max",
+          "temperature_robust_limit:Tprobe_Rx_main_leeward_max",
+          "temperature_robust_limit:Tprobe_Rx_side_leeward_max",
+          "temperature_robust_limit:Tprobe_core_center_max",
+          "temperature_robust_limit:Tprobe_core_center_leg_max",
+          "temperature_robust_limit:Tprobe_core_side_leg_max",
+          "temperature_robust_limit:Tprobe_core_top_yoke_max",
+          "analytical_flux_density_limit",
+          "decoded_space_shrink",
+          "secondary_vertical_insulation",
+          "strict_full_density_support",
+          "Llt_ensemble_disagreement",
+          "minimum_physical_insulation",
+          "core_group_manufacturability_limit",
+          "half_magnetizing_resonance_minimum",
+          "half_magnetizing_resonance_maximum",
+          "exterior_width_limit",
+          "exterior_length_limit",
+          "exterior_height_limit"
+        ],
+        "constraint_version": "staged-3e767d06441260d9",
+        "dataset_sha256": "0f0cb22a528cf029ce42101e7703d38200ae03038bd0aa95cc1619f34bca06a3",
+        "every_offspring_decode_repair_attested": true,
+        "fea_submission_approved": false,
+        "fea_submission_performed": false,
+        "final_goal_stage_id": "entry-1200-t125",
+        "final_goal_stage_profile_sha256": "02544c1003c184b134c36d39b306a843ac34b1598dfb5d705f275235726bcf8f",
+        "fixed_primary_turns_supported": [
+          5,
+          6
+        ],
+        "generation_artifact_inventory_sha256": "f27276bb36aebdeb59b7908f3294773aaf6e99b39c5dfb09aea69bdd14537de5",
+        "hard_constraint_contract_sha256": "7a5deb9da7f3d3829126f3bb29921d77e4705ec594c8ce42d82c0d63afb2ad6a",
+        "hard_spec": {
+          "B_limit_T": 1.2,
+          "Llt_target_uH": 27.5,
+          "Llt_tol_uH": 0.55,
+          "T_limit_C": 125.0,
+          "insulation_min_mm": 40.0,
+          "magnetizing_inductance_factor": 0.5,
+          "n_core_group_max": 4.0,
+          "primary_conductor_thickness_mm": 5.0,
+          "q_sigma": 1.0,
+          "resonance_max_Hz": 20000.0,
+          "resonance_min_Hz": 15000.0,
+          "size_H_max_mm": 750.0,
+          "size_L_max_mm": 1200.0,
+          "size_W_max_mm": 1200.0
+        },
+        "hard_spec_sha256": "3e767d06441260d9a77c0515e7152c4928802f76c43c77924110c7885823251e",
+        "inference_threads": 2,
+        "initial_repair_attested": true,
+        "island_profile_sha256": "0b32cb8be124e9d0f3e565bc784b52b6804e8e519c250d69f27c98824e319592",
+        "lane": {
+          "fixed_primary_turns": 6,
+          "island_id": "n1-6-resanchor-allthermal-2p50c",
+          "seed": 2257498123,
+          "stage_id": "entry-1200-t125",
+          "stage_variant": "final1000-n1-6-entry-1200-t125-v1",
+          "variant": "fixed-n1-6-deep-allthermal-2p50c-v1-current7",
+          "wave": "refill"
+        },
+        "max_generations": 300,
+        "maximum_peak_rss_bytes": 23622320128,
+        "offspring_physics_repair": true,
+        "optimizer_processes": 1,
+        "optimizer_repair_contract_sha256": "aeee41c8bcdc39d3e914543929b8428c8366666914a5d79de590c812b9069adb",
+        "population": 320,
+        "preflight_timeout_seconds": 1200,
+        "production_eligible": false,
+        "profile_canonical_sha256": "559e8289150e72a9daa70327aee0afc7050923838b323df4374bcc713d135101",
+        "relocation_contract_sha256": "4108d55bebf73345a47abc0442db1d579ad4752a34322b0559c4cb6bd533e201",
+        "required_model_targets_sha256": "3aa7a549f0c81cf68a38dcfded20d6ac3c081bda8c81d629201992cc02573ff9",
+        "scheduler_cpus": 2,
+        "schema_version": "mft-tier1-current7-slurm-seed-task-v1",
+        "search_interface_schema_version": "mft-tier1-current7-search-seed-cli-v1",
+        "seed": 2257498123,
+        "stage_spec_sha256": "3e767d06441260d9a77c0515e7152c4928802f76c43c77924110c7885823251e",
+        "temperature_contract_sha256": "441aa2f9353b5c7c1584704eb797f722fe5ca524d7dee5deee90db16e6aed254",
+        "terminal_physical_replay_attested": true,
+        "topology_evolution_contract_sha256": "9060aeb2920f3862142f238e6fd3272e1922ce12b839706563227e5b18a27848",
+        "topology_niche_contract_sha256": "8b0da184dd6ed601b0b3835f3dad6b35030fe7f59e49a43ced5373832426986b",
+        "train_report_sha256": "ea404f6f637bb53971bc198f3b3a366b6e3d2eb81d203ad37734de5b44c2c045",
+        "warm_artifact_sha256": "081f3e17dfeb6d6022ab11dfa2e00b5bc794c9bdbd719df72d81cf152f37b216",
+        "warm_contract_sha256": "0ef60cd5acf430dcd9116e38e76cdb732feeb514793028d00e303149b584e09d",
+        "warm_id": "n1-6",
+        "warm_repair_attested": true
+      },
+      "priority": 1,
+      "remote_cwd": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f",
+      "required_capability": "conda:pyaedt2026v1",
+      "scheduling_profile": "standard",
+      "timeout_seconds": 86400
+    },
+    "3": {
+      "aedt_backend": "standalone",
+      "command": "set -euo pipefail\nexport PYTHONPATH=\"$PWD/artifacts/python-site:$PWD/artifacts/code${PYTHONPATH:+:$PYTHONPATH}\"\nexport OMP_NUM_THREADS=3\nexport OPENBLAS_NUM_THREADS=3\nexport MKL_NUM_THREADS=3\nexport NUMEXPR_NUM_THREADS=3\nexport VECLIB_MAXIMUM_THREADS=3\npayload_path=\"${SLURM_SCHEDULER_PAYLOAD_PATH:?scheduler payload path is missing}\"\ncase \"$payload_path\" in /*) ;; *) payload_path=\"$HOME/$payload_path\" ;; esac\npayload_path=$(realpath -e -- \"$payload_path\")\npayload_root=$(realpath -e -- \"$HOME/slurm_scheduler/runs\")\ncase \"$payload_path\" in \"$payload_root\"/*/payload.json) ;; *) echo \"unsafe scheduler payload path: $payload_path\" >&2; exit 66 ;; esac\npython -u - \"$payload_path\" \"$payload_root\" 9ebbb8cac3ec88d755b0c1d45ba98f7d6cd3cf2479887b33c9fd843a162380cd 2257498123 3 30064771072 23622320128 4ca2f2304007a929c3f202cab89bca9067f3263aa53c8c153b358423bb6e6cfa <<'PY'\nimport hashlib\nimport json\nimport math\nimport os\nfrom pathlib import Path\nimport resource\nimport subprocess\nimport sys\nimport time\nfrom datetime import datetime, timezone\n\nSCHEMA = \"mft-tier1-final1000-paired-resource-comparator-telemetry-v1\"\nTHREADS = (\"OMP_NUM_THREADS\", \"OPENBLAS_NUM_THREADS\", \"MKL_NUM_THREADS\", \"NUMEXPR_NUM_THREADS\", \"VECLIB_MAXIMUM_THREADS\")\nREMOVED = frozenset((\"payload_sha256\", \"optimizer_pid\", \"inference_threads\", \"scheduler_cpus\", \"optimizer_inference_threads\", \"threads_per_model\", \"family_threads\"))\n\ndef now():\n    return datetime.now(timezone.utc).astimezone().isoformat(timespec=\"seconds\")\n\ndef sha_bytes(raw):\n    return hashlib.sha256(raw).hexdigest()\n\ndef canonical(value):\n    raw = json.dumps(value, sort_keys=True, separators=(\",\", \":\"), ensure_ascii=False, allow_nan=False).encode(\"utf-8\")\n    return hashlib.sha256(raw).hexdigest()\n\ndef atomic_json(path, value):\n    path.parent.mkdir(parents=True, exist_ok=True)\n    staged = path.with_name(\".\" + path.name + \".\" + str(os.getpid()) + \".tmp\")\n    try:\n        staged.write_bytes(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False).encode(\"utf-8\") + b\"\\n\")\n        os.replace(staged, path)\n    finally:\n        if staged.exists():\n            staged.unlink()\n\ndef science_value(value):\n    if isinstance(value, dict):\n        return {str(key): science_value(item) for key, item in value.items() if str(key) not in REMOVED}\n    if isinstance(value, list):\n        return [science_value(item) for item in value]\n    return value\n\nCGROUP_DIAGNOSTIC_SCHEMA = \"mft-tier1-cgroup-memory-diagnostics-v2\"\nCGROUP_SNAPSHOT_SCHEMA = \"mft-tier1-cgroup-memory-snapshot-v2\"\nCGROUP_DIAGNOSTIC_MAX_BYTES = 262144\nCGROUP_V1_UNLIMITED_MIN_BYTES = 1152921504606846976\n\ndef _canonical_absolute_posix(value, label):\n    if (\n        not isinstance(value, str)\n        or not value.startswith(\"/\")\n        or value.startswith(\"//\")\n        or \"\\\\\" in value\n        or \"\\x00\" in value\n    ):\n        raise RuntimeError(label + \" is not one canonical absolute POSIX path\")\n    parsed = PurePosixPath(value)\n    if \"..\" in parsed.parts or \".\" in parsed.parts:\n        raise RuntimeError(label + \" contains a traversal component\")\n    canonical = \"/\" if parsed == PurePosixPath(\"/\") else \"/\" + \"/\".join(parsed.parts[1:])\n    if value != canonical:\n        raise RuntimeError(label + \" is not canonical\")\n    return parsed\n\ndef _mountinfo_unescape(value):\n    result = value\n    for encoded, decoded in (\n        (\"\\\\040\", \" \"),\n        (\"\\\\011\", \"\\t\"),\n        (\"\\\\012\", \"\\n\"),\n        (\"\\\\134\", \"\\\\\"),\n    ):\n        result = result.replace(encoded, decoded)\n    if \"\\\\\" in result or \"\\x00\" in result or \"\\n\" in result or \"\\r\" in result:\n        raise RuntimeError(\"unsupported or unsafe mountinfo path escape\")\n    return result\n\ndef _parse_cgroup_memberships(text):\n    if not isinstance(text, str) or not text or \"\\x00\" in text:\n        raise RuntimeError(\"/proc/self/cgroup is empty or malformed\")\n    result = []\n    seen_hierarchy_ids = set()\n    seen_v2 = 0\n    seen_memory = 0\n    for line in text.splitlines():\n        if not line:\n            raise RuntimeError(\"/proc/self/cgroup contains an empty record\")\n        fields = line.split(\":\", 2)\n        if len(fields) != 3 or not fields[0].isascii() or not fields[0].isdigit():\n            raise RuntimeError(\"/proc/self/cgroup contains a malformed record\")\n        hierarchy_id = int(fields[0])\n        if hierarchy_id in seen_hierarchy_ids:\n            raise RuntimeError(\"/proc/self/cgroup repeats a hierarchy id\")\n        seen_hierarchy_ids.add(hierarchy_id)\n        controllers_raw = fields[1]\n        controllers = [] if not controllers_raw else controllers_raw.split(\",\")\n        if any(\n            not controller\n            or not controller.isascii()\n            or any(not (character.isalnum() or character in \"_-=.\") for character in controller)\n            for controller in controllers\n        ):\n            raise RuntimeError(\"/proc/self/cgroup controller list is malformed\")\n        if len(controllers) != len(set(controllers)):\n            raise RuntimeError(\"/proc/self/cgroup repeats a controller\")\n        membership = _canonical_absolute_posix(fields[2], \"cgroup membership\")\n        version = None\n        if not controllers:\n            if hierarchy_id != 0:\n                raise RuntimeError(\"empty controller membership is not cgroup v2\")\n            seen_v2 += 1\n            version = \"v2\"\n        elif \"memory\" in controllers:\n            if hierarchy_id == 0:\n                raise RuntimeError(\"cgroup v1 memory hierarchy id must be nonzero\")\n            seen_memory += 1\n            version = \"v1\"\n        if version is not None:\n            result.append(\n                {\n                    \"version\": version,\n                    \"hierarchy_id\": hierarchy_id,\n                    \"controllers\": sorted(controllers),\n                    \"membership_path\": membership.as_posix(),\n                }\n            )\n    if seen_v2 > 1 or seen_memory > 1:\n        raise RuntimeError(\"cgroup memory membership is ambiguous\")\n    if not result:\n        raise RuntimeError(\"no cgroup v1 memory or v2 membership is available\")\n    return result\n\ndef _parse_cgroup_mounts(text):\n    if not isinstance(text, str) or not text or \"\\x00\" in text:\n        raise RuntimeError(\"/proc/self/mountinfo is empty or malformed\")\n    result = []\n    for line in text.splitlines():\n        fields = line.split()\n        separators = [index for index, field in enumerate(fields) if field == \"-\"]\n        if len(separators) != 1:\n            raise RuntimeError(\"mountinfo record has an ambiguous separator\")\n        separator = separators[0]\n        if separator < 6 or len(fields) < separator + 4:\n            raise RuntimeError(\"mountinfo record is truncated\")\n        filesystem = fields[separator + 1]\n        if filesystem not in {\"cgroup\", \"cgroup2\"}:\n            continue\n        mount_root_raw = _mountinfo_unescape(fields[3])\n        mount_point_raw = _mountinfo_unescape(fields[4])\n        mount_root = _canonical_absolute_posix(mount_root_raw, \"cgroup mount root\")\n        mount_point = _canonical_absolute_posix(mount_point_raw, \"cgroup mount point\")\n        sysfs = PurePosixPath(\"/sys/fs/cgroup\")\n        if mount_point != sysfs and sysfs not in mount_point.parents:\n            raise RuntimeError(\"cgroup mount point escaped /sys/fs/cgroup\")\n        option_tokens = set()\n        for field in [*fields[5:separator], *fields[separator + 2 :]]:\n            option_tokens.update(token for token in field.split(\",\") if token)\n        if filesystem == \"cgroup\" and \"memory\" not in option_tokens:\n            continue\n        result.append(\n            {\n                \"version\": \"v2\" if filesystem == \"cgroup2\" else \"v1\",\n                \"mount_root\": mount_root.as_posix(),\n                \"mount_point\": mount_point.as_posix(),\n            }\n        )\n    if not result:\n        raise RuntimeError(\"no cgroup memory-capable mount is available\")\n    return result\n\ndef _relative_membership(membership_path, mount_root):\n    membership = PurePosixPath(membership_path)\n    root = PurePosixPath(mount_root)\n    if membership == root:\n        return PurePosixPath(\".\")\n    if root != PurePosixPath(\"/\") and root not in membership.parents:\n        return None\n    if root == PurePosixPath(\"/\"):\n        return PurePosixPath(*membership.parts[1:])\n    return membership.relative_to(root)\n\ndef _safe_cgroup_file(directory, filename, mount_path):\n    candidate = directory / filename\n    if not candidate.exists():\n        if candidate.is_symlink():\n            raise RuntimeError(\"broken cgroup accounting symlink\")\n        return None\n    if candidate.is_symlink():\n        raise RuntimeError(\"cgroup accounting file must not be a symlink\")\n    resolved = candidate.resolve(strict=True)\n    if resolved.parent != directory or (resolved != mount_path and mount_path not in resolved.parents):\n        raise RuntimeError(\"cgroup accounting file escaped its mount\")\n    if not resolved.is_file():\n        raise RuntimeError(\"cgroup accounting path is not a file\")\n    return resolved\n\ndef _read_cgroup_integer(path, allow_unbounded, version):\n    with path.open(\"rb\") as stream:\n        raw_bytes = stream.read(129)\n    if len(raw_bytes) > 128:\n        raise RuntimeError(\"cgroup accounting value exceeds 128 bytes\")\n    try:\n        raw = raw_bytes.decode(\"ascii\").strip()\n    except UnicodeDecodeError as exc:\n        raise RuntimeError(\"cgroup accounting value is not ASCII\") from exc\n    if not raw or any(character.isspace() for character in raw):\n        raise RuntimeError(\"cgroup accounting value is empty or multiline\")\n    if raw == \"max\":\n        if not allow_unbounded:\n            raise RuntimeError(\"only a cgroup limit may be unbounded\")\n        return None, raw\n    if not raw.isascii() or not raw.isdigit():\n        raise RuntimeError(\"cgroup accounting value is not an unsigned integer\")\n    value = int(raw)\n    if allow_unbounded and version == \"v1\" and value >= (1 << 60):\n        return None, raw\n    return value, raw\n\ndef _candidate_snapshot(candidate, mount, sysfs_root):\n    relative = _relative_membership(candidate[\"membership_path\"], mount[\"mount_root\"])\n    if relative is None:\n        return None\n    sysfs_root = Path(sysfs_root).resolve(strict=True)\n    logical_mount = PurePosixPath(mount[\"mount_point\"])\n    logical_sysfs = PurePosixPath(\"/sys/fs/cgroup\")\n    mount_relative = (\n        PurePosixPath(\".\")\n        if logical_mount == logical_sysfs\n        else logical_mount.relative_to(logical_sysfs)\n    )\n    mount_path = (sysfs_root / mount_relative.as_posix()).resolve(strict=True)\n    if mount_path != sysfs_root and sysfs_root not in mount_path.parents:\n        raise RuntimeError(\"resolved cgroup mount escaped the sysfs root\")\n    leaf = (mount_path / relative.as_posix()).resolve(strict=True)\n    if leaf != mount_path and mount_path not in leaf.parents:\n        raise RuntimeError(\"resolved cgroup membership escaped its mount\")\n    if not leaf.is_dir():\n        return None\n    filenames = (\n        (\"memory.max\", \"memory.current\", \"memory.peak\")\n        if candidate[\"version\"] == \"v2\"\n        else (\n            \"memory.limit_in_bytes\",\n            \"memory.usage_in_bytes\",\n            \"memory.max_usage_in_bytes\",\n        )\n    )\n    records = []\n    current = leaf\n    depth = 0\n    while True:\n        files = [_safe_cgroup_file(current, name, mount_path) for name in filenames]\n        if any(item is not None for item in files):\n            if not all(item is not None for item in files):\n                raise RuntimeError(\"cgroup memory accounting files are partial\")\n            limit, raw_limit = _read_cgroup_integer(files[0], True, candidate[\"version\"])\n            usage, _ = _read_cgroup_integer(files[1], False, candidate[\"version\"])\n            peak, _ = _read_cgroup_integer(files[2], False, candidate[\"version\"])\n            if peak < usage:\n                raise RuntimeError(\"cgroup peak memory is below current usage\")\n            records.append(\n                {\n                    \"depth_from_leaf\": depth,\n                    \"relative_path\": (\n                        \".\"\n                        if current == sysfs_root\n                        else current.relative_to(sysfs_root).as_posix()\n                    ),\n                    \"memory_max_raw\": raw_limit,\n                    \"memory_limit_bytes\": limit,\n                    \"memory_current_bytes\": usage,\n                    \"memory_peak_bytes\": peak,\n                }\n            )\n        if current == mount_path:\n            break\n        current = current.parent\n        depth += 1\n    if not records:\n        return None\n    finite = [record for record in records if record[\"memory_limit_bytes\"] is not None]\n    if not finite:\n        return None\n    return {\n        \"schema_version\": \"mft-tier1-cgroup-memory-snapshot-v2\",\n        \"cgroup_version\": candidate[\"version\"],\n        \"hierarchy_id\": candidate[\"hierarchy_id\"],\n        \"membership_controllers\": list(candidate[\"controllers\"]),\n        \"membership_path\": candidate[\"membership_path\"],\n        \"mount_root\": mount[\"mount_root\"],\n        \"mount_relative_path\": mount_relative.as_posix(),\n        \"leaf_relative_path\": (\n            \".\" if leaf == sysfs_root else leaf.relative_to(sysfs_root).as_posix()\n        ),\n        \"nearest_accounting_depth\": records[0][\"depth_from_leaf\"],\n        \"nearest_accounting_limit_unbounded\": records[0][\"memory_limit_bytes\"] is None,\n        \"limit_filename\": filenames[0],\n        \"current_filename\": filenames[1],\n        \"peak_filename\": filenames[2],\n        \"ancestors\": records,\n        \"selected_finite_ancestor\": dict(finite[0]),\n    }\n\ndef cgroup_snapshot_from_text(cgroup_text, mountinfo_text, sysfs_root):\n    memberships = _parse_cgroup_memberships(cgroup_text)\n    mounts = _parse_cgroup_mounts(mountinfo_text)\n    candidates = []\n    seen = set()\n    for membership in memberships:\n        for mount in mounts:\n            if membership[\"version\"] != mount[\"version\"]:\n                continue\n            identity = (\n                membership[\"version\"],\n                membership[\"membership_path\"],\n                mount[\"mount_root\"],\n                mount[\"mount_point\"],\n            )\n            if identity in seen:\n                raise RuntimeError(\"cgroup memory mount mapping is duplicated\")\n            seen.add(identity)\n            snapshot = _candidate_snapshot(membership, mount, sysfs_root)\n            if snapshot is not None:\n                candidates.append(snapshot)\n    if len(candidates) != 1:\n        raise RuntimeError(\"unique finite cgroup memory hierarchy is unavailable\")\n    return candidates[0]\n\ndef _bounded_diagnostic_record(path, maximum_bytes):\n    record = {\n        \"path\": str(path),\n        \"maximum_bytes\": maximum_bytes,\n        \"bytes_captured\": 0,\n        \"truncated\": False,\n        \"utf8_valid\": False,\n        \"sha256\": None,\n        \"text\": None,\n        \"error\": None,\n    }\n    try:\n        with Path(path).open(\"rb\") as stream:\n            raw = stream.read(maximum_bytes + 1)\n        record[\"truncated\"] = len(raw) > maximum_bytes\n        bounded = raw[:maximum_bytes]\n        record[\"bytes_captured\"] = len(bounded)\n        record[\"sha256\"] = hashlib.sha256(bounded).hexdigest()\n        try:\n            record[\"text\"] = bounded.decode(\"utf-8\")\n            record[\"utf8_valid\"] = True\n        except UnicodeDecodeError:\n            record[\"text\"] = bounded.decode(\"utf-8\", errors=\"replace\")\n    except Exception as exc:\n        record[\"error\"] = type(exc).__name__ + \":\" + str(exc)\n    return record\n\ndef capture_cgroup_diagnostics(\n    cgroup_path=Path(\"/proc/self/cgroup\"),\n    mountinfo_path=Path(\"/proc/self/mountinfo\"),\n    sysfs_root=Path(\"/sys/fs/cgroup\"),\n    maximum_bytes=CGROUP_DIAGNOSTIC_MAX_BYTES,\n):\n    if isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int) or maximum_bytes <= 0:\n        raise RuntimeError(\"cgroup diagnostic byte bound is invalid\")\n    return {\n        \"schema_version\": \"mft-tier1-cgroup-memory-diagnostics-v2\",\n        \"maximum_bytes_per_file\": maximum_bytes,\n        \"sysfs_root\": str(sysfs_root).replace(\"\\\\\", \"/\"),\n        \"proc_self_cgroup\": _bounded_diagnostic_record(cgroup_path, maximum_bytes),\n        \"proc_self_mountinfo\": _bounded_diagnostic_record(mountinfo_path, maximum_bytes),\n    }\n\ndef cgroup_snapshot_from_diagnostics(diagnostics, sysfs_root=Path(\"/sys/fs/cgroup\")):\n    if not isinstance(diagnostics, dict):\n        raise RuntimeError(\"cgroup diagnostics are absent\")\n    cgroup = diagnostics.get(\"proc_self_cgroup\")\n    mountinfo = diagnostics.get(\"proc_self_mountinfo\")\n    if not isinstance(cgroup, dict) or not isinstance(mountinfo, dict):\n        raise RuntimeError(\"cgroup diagnostic records are absent\")\n    for record in (cgroup, mountinfo):\n        if (\n            record.get(\"error\") is not None\n            or record.get(\"truncated\") is not False\n            or record.get(\"utf8_valid\") is not True\n            or not isinstance(record.get(\"text\"), str)\n        ):\n            raise RuntimeError(\"cgroup diagnostic input is incomplete or truncated\")\n    return cgroup_snapshot_from_text(cgroup[\"text\"], mountinfo[\"text\"], sysfs_root)\n\n\npayload_path = Path(sys.argv[1]).resolve(strict=True)\npayload_root = Path(sys.argv[2]).resolve(strict=True)\npayload_sha = sys.argv[3]\nseed = int(sys.argv[4])\nrequested_cpus = int(sys.argv[5])\nrequested_memory_bytes = int(sys.argv[6])\nrss_gate_bytes = int(sys.argv[7])\ncomparator_identity_sha = sys.argv[8]\nbundle = Path.cwd().resolve(strict=True)\ntask_id = str(os.environ.get(\"SLURM_SCHED_TASK_ID\") or \"\")\nif not task_id.isascii() or not task_id.isdigit() or int(task_id) <= 0:\n    raise SystemExit(\"missing canonical SLURM_SCHED_TASK_ID\")\ntask_root = bundle / \"runs\" / (\"task-\" + task_id)\ntelemetry_path = task_root / \"paired_resource_telemetry.json\"\nstarted_at = now()\nfailure = None\nexit_code = 79\ncpu_set_before = []\ncpu_set_after = []\ncgroup_before = None\ncgroup_after = None\ncgroup_diagnostics = {\"before\": None, \"after\": None}\nwall = None\ncpu_seconds = None\npeak_rss_bytes = None\nscience = None\nstatus_record = {\"relative_path\": \"runs/task-\" + task_id + \"/seed_status.json\", \"size\": None, \"sha256\": None, \"state\": None, \"terminal\": None, \"exit_code\": None}\nresult_record = {\"relative_path\": \"runs/task-\" + task_id + \"/seed-\" + str(seed) + \"/result.json\", \"size\": None, \"sha256\": None}\ncgroup_diagnostics[\"before\"] = capture_cgroup_diagnostics()\ntry:\n    if payload_path.name != \"payload.json\" or payload_root not in payload_path.parents:\n        raise RuntimeError(\"scheduler payload escaped run root\")\n    payload = json.loads(payload_path.read_text(encoding=\"utf-8\"))\n    if canonical(payload) != payload_sha:\n        raise RuntimeError(\"scheduler payload canonical SHA mismatch\")\n    if payload.get(\"seed\") != seed or payload.get(\"inference_threads\") != requested_cpus or payload.get(\"scheduler_cpus\") != requested_cpus:\n        raise RuntimeError(\"payload seed/CPU/thread binding drifted\")\n    cpu_set_before = sorted(os.sched_getaffinity(0))\n    if len(cpu_set_before) != requested_cpus or len(set(cpu_set_before)) != requested_cpus:\n        raise RuntimeError(\"inherited Scheduler cpuset does not match requested CPUs\")\n    if os.environ.get(\"SLURM_CPUS_PER_TASK\") != str(requested_cpus):\n        raise RuntimeError(\"SLURM_CPUS_PER_TASK does not match requested CPUs\")\n    if any(os.environ.get(name) != str(requested_cpus) for name in THREADS):\n        raise RuntimeError(\"inference thread environment does not match requested CPUs\")\n    cgroup_before = cgroup_snapshot_from_diagnostics(cgroup_diagnostics[\"before\"])\n    selected_before = cgroup_before[\"selected_finite_ancestor\"]\n    if int(selected_before[\"memory_limit_bytes\"]) < requested_memory_bytes:\n        raise RuntimeError(\"finite cgroup ancestor does not cover requested memory\")\n    before = resource.getrusage(resource.RUSAGE_CHILDREN)\n    wall_started = time.monotonic()\n    command = [\n        sys.executable, \"-u\",\n        str(bundle / \"artifacts/code/tools/tier1_corrected_current7_slurm_seed_runner.py\"),\n        \"--bundle-root\", str(bundle),\n        \"--payload\", str(payload_path),\n        \"--payload-root\", str(payload_root),\n        \"--payload-sha256\", payload_sha,\n    ]\n    completed = subprocess.run(command, cwd=bundle / \"artifacts/code\", check=False)\n    wall = max(0.0, time.monotonic() - wall_started)\n    after = resource.getrusage(resource.RUSAGE_CHILDREN)\n    cpu_seconds = max(0.0, (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime))\n    peak_rss_bytes = int(after.ru_maxrss) * 1024\n    cpu_set_after = sorted(os.sched_getaffinity(0))\n    cgroup_diagnostics[\"after\"] = capture_cgroup_diagnostics()\n    cgroup_after = cgroup_snapshot_from_diagnostics(cgroup_diagnostics[\"after\"])\n    selected_after = cgroup_after[\"selected_finite_ancestor\"]\n    if cgroup_diagnostics[\"after\"][\"proc_self_cgroup\"][\"sha256\"] != cgroup_diagnostics[\"before\"][\"proc_self_cgroup\"][\"sha256\"] or cgroup_diagnostics[\"after\"][\"proc_self_mountinfo\"][\"sha256\"] != cgroup_diagnostics[\"before\"][\"proc_self_mountinfo\"][\"sha256\"]:\n        raise RuntimeError(\"cgroup membership or mount mapping changed\")\n    if cgroup_after[\"cgroup_version\"] != cgroup_before[\"cgroup_version\"] or cgroup_after[\"mount_relative_path\"] != cgroup_before[\"mount_relative_path\"] or cgroup_after[\"membership_path\"] != cgroup_before[\"membership_path\"] or selected_after[\"relative_path\"] != selected_before[\"relative_path\"] or selected_after[\"memory_limit_bytes\"] != selected_before[\"memory_limit_bytes\"]:\n        raise RuntimeError(\"finite cgroup memory ancestor changed\")\n    if int(selected_after[\"memory_current_bytes\"]) > int(selected_after[\"memory_limit_bytes\"]) or int(selected_after[\"memory_peak_bytes\"]) > int(selected_after[\"memory_limit_bytes\"]):\n        raise RuntimeError(\"cgroup memory usage/peak exceeds finite limit\")\n    status_path = task_root / \"seed_status.json\"\n    if status_path.is_file():\n        raw = status_path.read_bytes()\n        status = json.loads(raw.decode(\"utf-8\"))\n        status_record = {\"relative_path\": status_record[\"relative_path\"], \"size\": len(raw), \"sha256\": sha_bytes(raw), \"state\": status.get(\"state\"), \"terminal\": status.get(\"terminal\"), \"exit_code\": status.get(\"exit_code\")}\n    result_path = task_root / (\"seed-\" + str(seed)) / \"result.json\"\n    if result_path.is_file():\n        raw = result_path.read_bytes()\n        result = json.loads(raw.decode(\"utf-8\"))\n        result_record = {\"relative_path\": result_record[\"relative_path\"], \"size\": len(raw), \"sha256\": sha_bytes(raw)}\n        science = {\"schema_version\": \"mft-tier1-final1000-resource-science-fingerprint-v1\", \"removed_resource_keys\": sorted(REMOVED), \"projection_sha256\": canonical(science_value(result))}\n    exit_code = int(completed.returncode)\n    if exit_code != 0 or status_record[\"state\"] != \"completed\" or status_record[\"terminal\"] is not True or status_record[\"exit_code\"] != 0 or result_record[\"sha256\"] is None or science is None:\n        failure = \"single-seed runner did not produce one completed sealed result\"\n        exit_code = 78 if exit_code == 0 else exit_code\n    elif cpu_set_after != cpu_set_before:\n        failure = \"wrapper affinity changed during execution\"\n        exit_code = 78\n    elif peak_rss_bytes <= 0 or peak_rss_bytes > rss_gate_bytes:\n        failure = \"per-seed peak RSS is outside its gate\"\n        exit_code = 78\nexcept Exception as exc:\n    failure = type(exc).__name__ + \":\" + str(exc)\n    exit_code = 79\n\ncapacity = wall * requested_cpus if wall is not None else None\naverage_cores = cpu_seconds / wall if cpu_seconds is not None and wall and wall > 0 else None\nutilization = cpu_seconds / capacity if cpu_seconds is not None and capacity and capacity > 0 else None\nunsigned = {\n    \"schema_version\": SCHEMA,\n    \"started_at\": started_at,\n    \"finished_at\": now(),\n    \"task_id\": int(task_id),\n    \"seed\": seed,\n    \"comparator_identity_sha256\": comparator_identity_sha,\n    \"payload_sha256\": payload_sha,\n    \"requested_cpus\": requested_cpus,\n    \"requested_memory_bytes\": requested_memory_bytes,\n    \"rss_gate_bytes\": rss_gate_bytes,\n    \"slurm_cpus_per_task\": os.environ.get(\"SLURM_CPUS_PER_TASK\"),\n    \"thread_environment\": {name: os.environ.get(name) for name in THREADS},\n    \"cpu_set_before\": cpu_set_before,\n    \"cpu_set_after\": cpu_set_after,\n    \"wall_time_seconds\": wall,\n    \"process_tree_cpu_seconds\": cpu_seconds,\n    \"cpu_capacity_seconds\": capacity,\n    \"average_cores_used\": average_cores,\n    \"cpu_utilization_fraction\": utilization,\n    \"peak_rss_bytes\": peak_rss_bytes,\n    \"cgroup_diagnostics\": cgroup_diagnostics,\n    \"cgroup_before\": cgroup_before,\n    \"cgroup_after\": cgroup_after,\n    \"seed_status\": status_record,\n    \"result\": result_record,\n    \"science_fingerprint\": science,\n    \"exit_code\": exit_code,\n    \"failure\": failure,\n    \"fea_submission_performed\": False,\n    \"aedt_used\": False,\n}\nvalue = dict(unsigned)\nvalue[\"telemetry_sha256\"] = canonical(unsigned)\natomic_json(telemetry_path, value)\nraise SystemExit(exit_code)\n\nPY",
+      "cpus": 3,
+      "dedupe_key": "mft-tier1-resource-comparator:87052:c3:057429dcc11cd15e6d0b9a60ddc6cec7975402ae1cd561670915107b06935d21",
+      "env_profile": "pyaedt2026v1",
+      "gpus": 0,
+      "max_workers_per_node": 32,
+      "memory_mb": 28672,
+      "name": "mft-t1rc-87052-c3-s2257498123",
+      "payload_json": {
+        "adapter_manifest_sha256": "567d98cb62a2b4697be8a466daab0818d60403dd7d668741f0b13061c2dd8cb1",
+        "adapter_receipt_file_sha256": "ab286228efbb40147eb30166a62b7df2d70011092702aeae0bff66023c586882",
+        "aedt_used": false,
+        "automatic_promotion_allowed": false,
+        "bundle_id": "current7-c2d90bf33d513c607f8f",
+        "bundle_manifest_sha256": "86bf540b8ac9fb4a86fecaf20064cd97f464d682b3f58ffd0f23ba85e45bbcd3",
+        "cohort_id": "current7-c2d90bf33d513c607f8f-deep36",
+        "constraint_names": [
+          "Llt_robust_band",
+          "temperature_robust_limit:Tprobe_Tx_leeward_max",
+          "temperature_robust_limit:Tprobe_Rx_main_leeward_max",
+          "temperature_robust_limit:Tprobe_Rx_side_leeward_max",
+          "temperature_robust_limit:Tprobe_core_center_max",
+          "temperature_robust_limit:Tprobe_core_center_leg_max",
+          "temperature_robust_limit:Tprobe_core_side_leg_max",
+          "temperature_robust_limit:Tprobe_core_top_yoke_max",
+          "analytical_flux_density_limit",
+          "decoded_space_shrink",
+          "secondary_vertical_insulation",
+          "strict_full_density_support",
+          "Llt_ensemble_disagreement",
+          "minimum_physical_insulation",
+          "core_group_manufacturability_limit",
+          "half_magnetizing_resonance_minimum",
+          "half_magnetizing_resonance_maximum",
+          "exterior_width_limit",
+          "exterior_length_limit",
+          "exterior_height_limit"
+        ],
+        "constraint_version": "staged-3e767d06441260d9",
+        "dataset_sha256": "0f0cb22a528cf029ce42101e7703d38200ae03038bd0aa95cc1619f34bca06a3",
+        "every_offspring_decode_repair_attested": true,
+        "fea_submission_approved": false,
+        "fea_submission_performed": false,
+        "final_goal_stage_id": "entry-1200-t125",
+        "final_goal_stage_profile_sha256": "02544c1003c184b134c36d39b306a843ac34b1598dfb5d705f275235726bcf8f",
+        "fixed_primary_turns_supported": [
+          5,
+          6
+        ],
+        "generation_artifact_inventory_sha256": "f27276bb36aebdeb59b7908f3294773aaf6e99b39c5dfb09aea69bdd14537de5",
+        "hard_constraint_contract_sha256": "7a5deb9da7f3d3829126f3bb29921d77e4705ec594c8ce42d82c0d63afb2ad6a",
+        "hard_spec": {
+          "B_limit_T": 1.2,
+          "Llt_target_uH": 27.5,
+          "Llt_tol_uH": 0.55,
+          "T_limit_C": 125.0,
+          "insulation_min_mm": 40.0,
+          "magnetizing_inductance_factor": 0.5,
+          "n_core_group_max": 4.0,
+          "primary_conductor_thickness_mm": 5.0,
+          "q_sigma": 1.0,
+          "resonance_max_Hz": 20000.0,
+          "resonance_min_Hz": 15000.0,
+          "size_H_max_mm": 750.0,
+          "size_L_max_mm": 1200.0,
+          "size_W_max_mm": 1200.0
+        },
+        "hard_spec_sha256": "3e767d06441260d9a77c0515e7152c4928802f76c43c77924110c7885823251e",
+        "inference_threads": 3,
+        "initial_repair_attested": true,
+        "island_profile_sha256": "0b32cb8be124e9d0f3e565bc784b52b6804e8e519c250d69f27c98824e319592",
+        "lane": {
+          "fixed_primary_turns": 6,
+          "island_id": "n1-6-resanchor-allthermal-2p50c",
+          "seed": 2257498123,
+          "stage_id": "entry-1200-t125",
+          "stage_variant": "final1000-n1-6-entry-1200-t125-v1",
+          "variant": "fixed-n1-6-deep-allthermal-2p50c-v1-current7",
+          "wave": "refill"
+        },
+        "max_generations": 300,
+        "maximum_peak_rss_bytes": 23622320128,
+        "offspring_physics_repair": true,
+        "optimizer_processes": 1,
+        "optimizer_repair_contract_sha256": "aeee41c8bcdc39d3e914543929b8428c8366666914a5d79de590c812b9069adb",
+        "population": 320,
+        "preflight_timeout_seconds": 1200,
+        "production_eligible": false,
+        "profile_canonical_sha256": "559e8289150e72a9daa70327aee0afc7050923838b323df4374bcc713d135101",
+        "relocation_contract_sha256": "4108d55bebf73345a47abc0442db1d579ad4752a34322b0559c4cb6bd533e201",
+        "required_model_targets_sha256": "3aa7a549f0c81cf68a38dcfded20d6ac3c081bda8c81d629201992cc02573ff9",
+        "scheduler_cpus": 3,
+        "schema_version": "mft-tier1-current7-slurm-seed-task-v1",
+        "search_interface_schema_version": "mft-tier1-current7-search-seed-cli-v1",
+        "seed": 2257498123,
+        "stage_spec_sha256": "3e767d06441260d9a77c0515e7152c4928802f76c43c77924110c7885823251e",
+        "temperature_contract_sha256": "441aa2f9353b5c7c1584704eb797f722fe5ca524d7dee5deee90db16e6aed254",
+        "terminal_physical_replay_attested": true,
+        "topology_evolution_contract_sha256": "9060aeb2920f3862142f238e6fd3272e1922ce12b839706563227e5b18a27848",
+        "topology_niche_contract_sha256": "8b0da184dd6ed601b0b3835f3dad6b35030fe7f59e49a43ced5373832426986b",
+        "train_report_sha256": "ea404f6f637bb53971bc198f3b3a366b6e3d2eb81d203ad37734de5b44c2c045",
+        "warm_artifact_sha256": "081f3e17dfeb6d6022ab11dfa2e00b5bc794c9bdbd719df72d81cf152f37b216",
+        "warm_contract_sha256": "0ef60cd5acf430dcd9116e38e76cdb732feeb514793028d00e303149b584e09d",
+        "warm_id": "n1-6",
+        "warm_repair_attested": true
+      },
+      "priority": 1,
+      "remote_cwd": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f",
+      "required_capability": "conda:pyaedt2026v1",
+      "scheduling_profile": "standard",
+      "timeout_seconds": 86400
+    }
+  },
+  "comparator_identity": {
+    "capacity_sha256": "392e2e5bc7cc91d8b2d616760651eb9e213e76c8b158f683562ce5d84a8bfb40",
+    "companion_cpus": [
+      2,
+      3
+    ],
+    "config_sha256": "dca22b9c40b833dbc0e9600b736bf0542cb7bcbaaa0d79b257b9c5cb880d3ecb",
+    "identity_sha256": "4ca2f2304007a929c3f202cab89bca9067f3263aa53c8c153b358423bb6e6cfa",
+    "namespace": "final1000-task87052-paired-resource-comparator-v1",
+    "source_child_payload_sha256": "6fb21e402dfac0e946748a0d3850c510a7e1d13f64733b0b3b5924bf9019003f",
+    "source_child_task_sha256": "95f458f11a7cd2063908e304bc3fe04a182d5dff8fdfb2fe6a9aac4e9f66794c",
+    "source_parent_task_sha256": "69263c2ad94dfd32d212c25c7072c7b9c3a477facc753310f75271a41fb123bf"
+  },
+  "config": {
+    "anchor_cpus": 4,
+    "anchor_failure_observation": {
+      "allocation_id": 14011,
+      "exit_code": 1,
+      "failure_message": "RuntimeError: Phase B parent memory evidence seal mismatch",
+      "finished_at": "2026-07-22 23:50:37",
+      "observed_at": "2026-07-23T08:52:00+09:00",
+      "scheduler_access": "GET-only",
+      "scheduler_write_count": 0,
+      "started_at": "2026-07-22 23:16:04",
+      "status": "failed",
+      "task_id": 87052
+    },
+    "anchor_seed": 2257498123,
+    "anchor_task_id": 87052,
+    "batch_rollout_policy": {
+      "account_and_node_limits_are_hard": true,
+      "allocation_local_cpu_and_memory_fit_required": true,
+      "allocation_states_counted": [
+        "active"
+      ],
+      "automatic_rollout_allowed": false,
+      "cross_allocation_resource_packing_allowed": false,
+      "exclusive_allocations_counted": false,
+      "fallback_cpus_before_promotion": 4,
+      "maintain_selected_active_target_until_stop": true,
+      "max_workers_per_node": 32,
+      "objective": "maximize-completed-seeds-per-wall-clock",
+      "one_durable_reservation_and_one_post_at_a_time": true,
+      "per_seed_latency_priority": false,
+      "promotion_requires_paired_comparison_and_independent_review": true,
+      "recompute_capacity_each_controller_cycle": true,
+      "resource2_rollout_currently_allowed": false,
+      "resource2_unpaired_evidence_is_not_promotion_evidence": true,
+      "resource_pool": "cpu",
+      "target_formula": "exact_fit_slots[selected_cpus]"
+    },
+    "bundle_contract_sha256": "c2d90bf33d513c607f8f7cea15c0b85bdeb7d1d640000f85e84b51f6d5808a02",
+    "bundle_id": "current7-c2d90bf33d513c607f8f",
+    "bundle_manifest_sha256": "86bf540b8ac9fb4a86fecaf20064cd97f464d682b3f58ffd0f23ba85e45bbcd3",
+    "capacity_observed_at": "2026-07-23T08:37:11+09:00",
+    "capacity_source": {
+      "exclusive_node": false,
+      "resource_pool": "cpu",
+      "scheduler_endpoint": "GET /api/allocations",
+      "scheduler_write_count": 0,
+      "states_counted": [
+        "active"
+      ]
+    },
+    "companion_cpus": [
+      2,
+      3
+    ],
+    "comparator_id": "task87052-paired-resource-20260723t0837kst",
+    "config_sha256": "dca22b9c40b833dbc0e9600b736bf0542cb7bcbaaa0d79b257b9c5cb880d3ecb",
+    "decision_policy": {
+      "automatic_promotion_allowed": false,
+      "formula": "sum(min(floor(total_cpus/cpus),floor(total_memory_mb/28672),32))/wall_seconds",
+      "metric": "allocation-local-exact-slots-per-second",
+      "minimum_ratio_vs_anchor_for_resource_change": 1.0,
+      "per_seed_latency_gate": null,
+      "per_seed_latency_override_allowed": false,
+      "science_fingerprint_match_required": true,
+      "strict_improvement_required": true
+    },
+    "eligible_allocations": [
+      {
+        "allocation_id": 13741,
+        "total_cpus": 64,
+        "total_memory_mb": 700751
+      },
+      {
+        "allocation_id": 13742,
+        "total_cpus": 64,
+        "total_memory_mb": 666799
+      },
+      {
+        "allocation_id": 13744,
+        "total_cpus": 44,
+        "total_memory_mb": 691200
+      },
+      {
+        "allocation_id": 13745,
+        "total_cpus": 44,
+        "total_memory_mb": 691200
+      },
+      {
+        "allocation_id": 13747,
+        "total_cpus": 44,
+        "total_memory_mb": 691200
+      },
+      {
+        "allocation_id": 13749,
+        "total_cpus": 64,
+        "total_memory_mb": 754907
+      },
+      {
+        "allocation_id": 13750,
+        "total_cpus": 32,
+        "total_memory_mb": 631613
+      },
+      {
+        "allocation_id": 13754,
+        "total_cpus": 32,
+        "total_memory_mb": 520087
+      },
+      {
+        "allocation_id": 13756,
+        "total_cpus": 32,
+        "total_memory_mb": 472983
+      },
+      {
+        "allocation_id": 13759,
+        "total_cpus": 28,
+        "total_memory_mb": 729988
+      },
+      {
+        "allocation_id": 13762,
+        "total_cpus": 28,
+        "total_memory_mb": 693862
+      },
+      {
+        "allocation_id": 13765,
+        "total_cpus": 64,
+        "total_memory_mb": 180491
+      },
+      {
+        "allocation_id": 13768,
+        "total_cpus": 28,
+        "total_memory_mb": 673137
+      },
+      {
+        "allocation_id": 13772,
+        "total_cpus": 28,
+        "total_memory_mb": 663248
+      },
+      {
+        "allocation_id": 13774,
+        "total_cpus": 20,
+        "total_memory_mb": 938463
+      },
+      {
+        "allocation_id": 13776,
+        "total_cpus": 36,
+        "total_memory_mb": 947945
+      },
+      {
+        "allocation_id": 13777,
+        "total_cpus": 28,
+        "total_memory_mb": 658914
+      },
+      {
+        "allocation_id": 13780,
+        "total_cpus": 36,
+        "total_memory_mb": 928621
+      },
+      {
+        "allocation_id": 13781,
+        "total_cpus": 28,
+        "total_memory_mb": 508836
+      },
+      {
+        "allocation_id": 13782,
+        "total_cpus": 8,
+        "total_memory_mb": 750969
+      },
+      {
+        "allocation_id": 13783,
+        "total_cpus": 34,
+        "total_memory_mb": 568387
+      },
+      {
+        "allocation_id": 13784,
+        "total_cpus": 28,
+        "total_memory_mb": 369915
+      },
+      {
+        "allocation_id": 13785,
+        "total_cpus": 20,
+        "total_memory_mb": 910571
+      },
+      {
+        "allocation_id": 13899,
+        "total_cpus": 64,
+        "total_memory_mb": 407117
+      },
+      {
+        "allocation_id": 13957,
+        "total_cpus": 48,
+        "total_memory_mb": 964242
+      },
+      {
+        "allocation_id": 13963,
+        "total_cpus": 40,
+        "total_memory_mb": 691200
+      },
+      {
+        "allocation_id": 14004,
+        "total_cpus": 20,
+        "total_memory_mb": 887454
+      },
+      {
+        "allocation_id": 14009,
+        "total_cpus": 64,
+        "total_memory_mb": 764630
+      },
+      {
+        "allocation_id": 14010,
+        "total_cpus": 64,
+        "total_memory_mb": 764630
+      },
+      {
+        "allocation_id": 14011,
+        "total_cpus": 64,
+        "total_memory_mb": 489536
+      },
+      {
+        "allocation_id": 14021,
+        "total_cpus": 64,
+        "total_memory_mb": 587519
+      },
+      {
+        "allocation_id": 14022,
+        "total_cpus": 64,
+        "total_memory_mb": 480466
+      },
+      {
+        "allocation_id": 14029,
+        "total_cpus": 64,
+        "total_memory_mb": 668608
+      },
+      {
+        "allocation_id": 14032,
+        "total_cpus": 64,
+        "total_memory_mb": 552382
+      },
+      {
+        "allocation_id": 14033,
+        "total_cpus": 64,
+        "total_memory_mb": 585135
+      },
+      {
+        "allocation_id": 14042,
+        "total_cpus": 64,
+        "total_memory_mb": 500578
+      },
+      {
+        "allocation_id": 14043,
+        "total_cpus": 64,
+        "total_memory_mb": 596882
+      },
+      {
+        "allocation_id": 14045,
+        "total_cpus": 64,
+        "total_memory_mb": 574605
+      },
+      {
+        "allocation_id": 14046,
+        "total_cpus": 64,
+        "total_memory_mb": 460772
+      },
+      {
+        "allocation_id": 14060,
+        "total_cpus": 64,
+        "total_memory_mb": 629892
+      },
+      {
+        "allocation_id": 14099,
+        "total_cpus": 48,
+        "total_memory_mb": 698814
+      }
+    ],
+    "launch_policy": {
+      "block_reason": "task87052-failed-parent-memory-evidence-seal",
+      "launch_allowed": false,
+      "new_identity_package_and_independent_approval_required": true,
+      "phase_b_parent_memory_fix_required": true,
+      "replacement_anchor_must_complete_and_pass_terminal_gates": true,
+      "replacement_exact_4cpu_anchor_required": true
+    },
+    "max_workers_per_node": 32,
+    "memory_mb": 28672,
+    "offload_plan_file_sha256": "84777d678736411db9179f921adda498e01f5888d1f2ba52864c7ba5ade3b4b2",
+    "peak_rss_gate_bytes": 23622320128,
+    "prior_unpaired_evidence": {
+      "baseline_wall_time_seconds": 1871.5297520039603,
+      "candidate_average_cores_used": 1.2403052070911338,
+      "candidate_peak_rss_bytes": 18983600128,
+      "candidate_wall_time_seconds": 4600.7869332283735,
+      "core_use_ratio_vs_4cpu": 0.8183366656776067,
+      "interpretation": "unpaired-seed-complexity-confounded-not-promotable",
+      "promotion_eligible": false,
+      "remote_terminal_sha256": "5ca1c0cd9b32b39e7425c42c589b882788aaae8f1dd036eb76da9dbb91253217",
+      "seed": 2257499993,
+      "single_seed_throughput_ratio_vs_4cpu": 0.40678470426160496,
+      "slot_weighted_throughput_ratio_vs_4cpu": 0.6324728623306833,
+      "task_id": 86501,
+      "terminal_file_sha256": "50da2ea68201fab06e8ff19f5261fde09645e1f3014be1eae5e884f4f280de45"
+    },
+    "safety_policy": {
+      "aedt_allowed": false,
+      "allocation_mutation_allowed": false,
+      "anchor_terminal_attestation_required_before_each_apply": true,
+      "cancellation_allowed": false,
+      "complete_production_and_comparator_namespace_scan_required": true,
+      "fea_submission_allowed": false,
+      "independent_approval_required_before_each_apply": true,
+      "maximum_scheduler_posts_per_companion": 1,
+      "post_submit_namespace_rescan_required": true,
+      "preemption_allowed": false,
+      "publication_allowed": false
+    },
+    "schema_version": "mft-tier1-final1000-paired-resource-comparator-config-v1",
+    "source_child_payload_sha256": "6fb21e402dfac0e946748a0d3850c510a7e1d13f64733b0b3b5924bf9019003f",
+    "source_child_task_sha256": "95f458f11a7cd2063908e304bc3fe04a182d5dff8fdfb2fe6a9aac4e9f66794c",
+    "source_config_file_sha256": "8d54a56059540206509b6460fab695b04cfe5f469383460f88019baa414c20fe",
+    "source_config_sha256": "c7c51dd8f0767ef48a38158ad7276e9de4950e50969e12874b226425bc425ba0",
+    "source_package_file_sha256": "f2438490c00530131a73939be5cbfd2d831be04455d13e69f829630ea03180e4",
+    "source_package_sha256": "2eb0618a0e12476cacee70c6966ce93cf5a90168e0e88893e2d82f9ac6a5dc2d",
+    "source_parent_task_sha256": "69263c2ad94dfd32d212c25c7072c7b9c3a477facc753310f75271a41fb123bf",
+    "source_submission_file_sha256": "e61f16439c98f0f91627565e12996c36bb1600cbbde38d0bdd7038b846cc7a80",
+    "source_submission_receipt_sha256": "544e88f29a8618be4054cf54bd7b2ec5ef84780b6d0d04bbe28bb2da1c295464",
+    "stage_id": "entry-1200-t125"
+  },
+  "decision_policy": {
+    "automatic_promotion_allowed": false,
+    "formula": "sum(min(floor(total_cpus/cpus),floor(total_memory_mb/28672),32))/wall_seconds",
+    "metric": "allocation-local-exact-slots-per-second",
+    "minimum_ratio_vs_anchor_for_resource_change": 1.0,
+    "per_seed_latency_gate": null,
+    "per_seed_latency_override_allowed": false,
+    "science_fingerprint_match_required": true,
+    "strict_improvement_required": true
+  },
+  "launch_policy": {
+    "block_reason": "task87052-failed-parent-memory-evidence-seal",
+    "launch_allowed": false,
+    "new_identity_package_and_independent_approval_required": true,
+    "phase_b_parent_memory_fix_required": true,
+    "replacement_anchor_must_complete_and_pass_terminal_gates": true,
+    "replacement_exact_4cpu_anchor_required": true
+  },
+  "package_sha256": "50a71468bc1abed323f4bcfe479aa29a6deb8a37a8e668a95a242a1e5019d1ac",
+  "prior_unpaired_evidence": {
+    "baseline_wall_time_seconds": 1871.5297520039603,
+    "candidate_average_cores_used": 1.2403052070911338,
+    "candidate_peak_rss_bytes": 18983600128,
+    "candidate_wall_time_seconds": 4600.7869332283735,
+    "core_use_ratio_vs_4cpu": 0.8183366656776067,
+    "interpretation": "unpaired-seed-complexity-confounded-not-promotable",
+    "promotion_eligible": false,
+    "remote_terminal_sha256": "5ca1c0cd9b32b39e7425c42c589b882788aaae8f1dd036eb76da9dbb91253217",
+    "seed": 2257499993,
+    "single_seed_throughput_ratio_vs_4cpu": 0.40678470426160496,
+    "slot_weighted_throughput_ratio_vs_4cpu": 0.6324728623306833,
+    "task_id": 86501,
+    "terminal_file_sha256": "50da2ea68201fab06e8ff19f5261fde09645e1f3014be1eae5e884f4f280de45"
+  },
+  "rendered_at": "2026-07-23T08:37:11+09:00",
+  "schema_version": "mft-tier1-final1000-paired-resource-comparator-package-v1",
+  "submission_policy": {
+    "aedt_used": false,
+    "allocation_mutation_count": 0,
+    "anchor_task_must_be_exact_completed_and_promotion_eligible": true,
+    "automatic_production_promotion_allowed": false,
+    "companion_retries_without_new_package_and_approval_allowed": false,
+    "complete_namespace_prefixes": [
+      "mft-t1fg-",
+      "mft-t1rc-87052-"
+    ],
+    "dry_run_default": true,
+    "explicit_apply_required": true,
+    "fea_submission_performed": false,
+    "independent_approval_required": true,
+    "one_additive_post_maximum_per_companion": true,
+    "post_submit_rescan_required": true,
+    "publication_count": 0,
+    "scheduler_cancel_count": 0,
+    "scheduler_preempt_count": 0
+  },
+  "terminal_evidence": {
+    "2": {
+      "cgroup_diagnostics_json_pointer": "/cgroup_diagnostics",
+      "exact_cpuset_json_pointers": [
+        "/cpu_set_before",
+        "/cpu_set_after"
+      ],
+      "exact_cpuset_length": 2,
+      "finite_cgroup_ancestor_json_pointer": "/cgroup_after/selected_finite_ancestor",
+      "process_tree_cpu_json_pointer": "/process_tree_cpu_seconds",
+      "result_path": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f/runs/task-{scheduler_task_id}/seed-2257498123/result.json",
+      "rss_json_pointer": "/peak_rss_bytes",
+      "scheduler_detail_required": true,
+      "science_fingerprint_json_pointer": "/science_fingerprint",
+      "seed_status_path": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f/runs/task-{scheduler_task_id}/seed_status.json",
+      "task_root": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f/runs/task-{scheduler_task_id}",
+      "telemetry_path": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f/runs/task-{scheduler_task_id}/paired_resource_telemetry.json",
+      "thread_environment_json_pointer": "/thread_environment",
+      "wall_json_pointer": "/wall_time_seconds"
+    },
+    "3": {
+      "cgroup_diagnostics_json_pointer": "/cgroup_diagnostics",
+      "exact_cpuset_json_pointers": [
+        "/cpu_set_before",
+        "/cpu_set_after"
+      ],
+      "exact_cpuset_length": 3,
+      "finite_cgroup_ancestor_json_pointer": "/cgroup_after/selected_finite_ancestor",
+      "process_tree_cpu_json_pointer": "/process_tree_cpu_seconds",
+      "result_path": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f/runs/task-{scheduler_task_id}/seed-2257498123/result.json",
+      "rss_json_pointer": "/peak_rss_bytes",
+      "scheduler_detail_required": true,
+      "science_fingerprint_json_pointer": "/science_fingerprint",
+      "seed_status_path": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f/runs/task-{scheduler_task_id}/seed_status.json",
+      "task_root": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f/runs/task-{scheduler_task_id}",
+      "telemetry_path": "/gpfs/tmp_cpu2/mft_tier1_current7_bundles/current7-c2d90bf33d513c607f8f/runs/task-{scheduler_task_id}/paired_resource_telemetry.json",
+      "thread_environment_json_pointer": "/thread_environment",
+      "wall_json_pointer": "/wall_time_seconds"
+    }
+  }
+}
