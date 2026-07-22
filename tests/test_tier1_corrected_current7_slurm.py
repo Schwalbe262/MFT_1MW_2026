@@ -910,15 +910,19 @@ def test_phase_b_bundle_build_seals_every_required_remote_code_file(tmp_path):
             sys.executable,
             "-I",
             "-c",
-            (
-                "import pathlib, sys, types; "
-                f"sys.path.insert(0, {str(published / 'artifacts' / 'code')!r}); "
-                f"sys.path.insert(0, {str(published / 'artifacts' / 'code' / 'regression_260707')!r}); "
-                "pymoo=types.ModuleType('pymoo'); "
-                "core=types.ModuleType('pymoo.core'); "
-                "problem=types.ModuleType('pymoo.core.problem'); "
-                "problem.Problem=type('Problem', (), {}); "
-                "sys.modules.update({'pymoo':pymoo,'pymoo.core':core,'pymoo.core.problem':problem}); "
+                (
+                    "import pathlib, sys, types; "
+                    f"sys.path.insert(0, {str(published / 'artifacts' / 'code')!r}); "
+                    f"sys.path.insert(0, {str(published / 'artifacts' / 'code' / 'regression_260707')!r}); "
+                    "numpy=types.ModuleType('numpy'); "
+                    "pandas=types.ModuleType('pandas'); "
+                    "pandas.DataFrame=type('DataFrame', (), {}); "
+                    "pandas.Series=type('Series', (), {}); "
+                    "pymoo=types.ModuleType('pymoo'); "
+                    "core=types.ModuleType('pymoo.core'); "
+                    "problem=types.ModuleType('pymoo.core.problem'); "
+                    "problem.Problem=type('Problem', (), {}); "
+                    "sys.modules.update({'numpy':numpy,'pandas':pandas,'pymoo':pymoo,'pymoo.core':core,'pymoo.core.problem':problem}); "
                 "import tools.tier1_final1000_multiseed_phase_b_contract; "
                 "import tools.tier1_final1000_multiseed_phase_b_runner; "
                 "import optimization.nsga2_problem as nsga; "
@@ -1017,7 +1021,15 @@ def test_tracked_code_closure_includes_root_module_and_imports_when_relocated(
     tracked_module_runtime = {
         f"artifacts/code/{relative}"
         for relative in subprocess.run(
-            ["git", "-C", str(REPO), "ls-files", "module"],
+            [
+                "git",
+                "-c",
+                f"safe.directory={REPO.as_posix()}",
+                "-C",
+                str(REPO),
+                "ls-files",
+                "module",
+            ],
             text=True,
             capture_output=True,
             check=True,
@@ -1037,6 +1049,7 @@ def test_tracked_code_closure_includes_root_module_and_imports_when_relocated(
 
     stub_site = tmp_path / "import-only-third-party-stubs"
     (stub_site / "pymoo" / "core").mkdir(parents=True)
+    (stub_site / "numpy.py").write_text("", encoding="utf-8")
     (stub_site / "pandas.py").write_text(
         "class DataFrame: pass\nclass Series: pass\n", encoding="utf-8"
     )
