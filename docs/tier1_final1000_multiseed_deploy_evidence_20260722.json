@@ -1,9 +1,11 @@
 {
-  "schema_version": "mft-tier1-final1000-multiseed-deploy-local-evidence-v2",
-  "created_at_kst": "2026-07-22T15:58:00+09:00",
+  "schema_version": "mft-tier1-final1000-multiseed-deploy-local-evidence-v3",
+  "created_at_kst": "2026-07-22T16:43:16+09:00",
   "science_base_revision": "579c651b621198953f5a45ddf898a454f599e612",
   "integration_parent_revision": "3e24c9428d5d24400bd4dbc68736848ddd5f9f43",
-  "branch": "codex/final1000-multiseed-deploy-260722",
+  "verified_code_revision": "6ff6caf003eebc311f290dac7bc554f21c59ac4b",
+  "code_hash_policy": "sha256(git-cat-file-blob-verified_code_revision:path)",
+  "branch": "codex/multiseed-publish-fix-local-260722",
   "objective": {
     "physical_active_target": 500,
     "stage_physical_active_quotas": {
@@ -26,7 +28,12 @@
     "isolated_import_smoke_passed": true,
     "candidate_and_delta_reproducible": true,
     "ready_reused": false,
-    "actual_release_preparation_run": false,
+    "actual_release_preparation_run": true,
+    "release_preparation_path": "C:\\Users\\peets\\slurm_scheduler_runtime\\mft_tier1_final_goal_1000_t100_resmax20_260721\\multiseed_release_77a9d485_260722\\release_preparation_receipt.json",
+    "release_preparation_file_sha256": "f5f60a71c1a999f43e4561ed5410d3603e7390a074465f8b2ba0994dd8641462",
+    "release_preparation_receipt_sha256": "19d8fddcda1118f6c0cfac32acccd5dd883db94099c466cfaa8622b84629163c",
+    "dynamic_parent_guard_required": true,
+    "generic_legacy_parent_cli_allowed": false,
     "bundle_publication_performed": false
   },
   "rollout": {
@@ -52,8 +59,39 @@
     "driver_poll_seconds": 30,
     "prior_controller_capability_is_bounded_catchup": true,
     "harvester_single_writer_handoff_integrated": true,
-    "production_cutover_ready": true,
+    "production_cutover_ready": false,
+    "production_cutover_blocker": "four authenticated bundle publications and the 4+4 canary gates remain intentionally unperformed",
     "production_cutover_performed": false
+  },
+  "publication_dry_run": {
+    "publisher": "tools/tier1_final1000_multiseed_publish.py",
+    "expected_checkout_revision": "77a9d485fd81b5405b837a04cc003f0e37e13a32",
+    "all_four_stages_authenticated": true,
+    "remote_transport_constructed": false,
+    "remote_write_count": 0,
+    "scheduler_submission_count": 0,
+    "stages": {
+      "entry-1200-t125": {
+        "parent_bundle_id": "current7-ee90659dfbbd232eb540",
+        "bundle_id": "current7-dec30e93e489968548e9",
+        "operation_receipt_sha256": "2ae120d709ddd9a0aa4220784ca92bc1e792ca667a74a4da9dc24adad713cceb"
+      },
+      "bridge-1150-t115": {
+        "parent_bundle_id": "current7-648cff4cfe5444f7dd32",
+        "bundle_id": "current7-52a1faa775c7659fa82e",
+        "operation_receipt_sha256": "63bbf2d8ed258b28ceb29c4237b33202d316c42085acd9c50890c007345f6a6d"
+      },
+      "close-1075-t107p5": {
+        "parent_bundle_id": "current7-2f4dd37991abc0910597",
+        "bundle_id": "current7-282d478a1534f5a98a2a",
+        "operation_receipt_sha256": "12c2d4c34b8f65a5f605865395e0d65b5b1c5bd395afd77b5b03d09727f8196a"
+      },
+      "final-1000-t100": {
+        "parent_bundle_id": "current7-aae5a3d0a967cd0e65c7",
+        "bundle_id": "current7-a176eccdbf510500acce",
+        "operation_receipt_sha256": "7018be07011eb42f472a0734ceffa006fdc2a3de36f97914aeffd2dd42a998d7"
+      }
+    }
   },
   "live_read_only_probe": {
     "fixture": "tests/fixtures/tier1_final1000_live_v3_chain.json",
@@ -82,10 +120,12 @@
     "physical_active_after_refill": 500
   },
   "tests": {
-    "command_scope": "10 Final1000/Current7 relevant test modules",
-    "passed": 164,
+    "command_scope": "11 Final1000/Current7 publication and evidence modules",
+    "passed": 169,
     "failed": 0,
-    "elapsed_seconds": 358.47,
+    "ten_module_regression_passed": 167,
+    "ten_module_regression_elapsed_seconds": 409.42,
+    "committed_blob_evidence_tests_passed": 2,
     "live_exact_probe_passed": 1,
     "post_crash_window_passed": 1,
     "phase_a_passed": 25,
@@ -99,19 +139,37 @@
     "isolated_consumer_import_smoke_passed": true
   },
   "static_checks": {
+    "ruff_format_check": "passed after formatting multiseed contract/controller",
     "ruff": "passed",
     "py_compile": "passed"
   },
+  "audit_corrections": {
+    "mixed_eol_worktree_hashes_replaced": true,
+    "hashes_derived_from_committed_blob_bytes": true,
+    "previous_full_format_claim_was_not_reproducible": true,
+    "formatted_files": [
+      "tools/tier1_final1000_multiseed_contract.py",
+      "tools/tier1_final1000_multiseed_controller.py"
+    ],
+    "test_claims_removed_or_hidden": false,
+    "self_check": "python tools/tier1_final1000_multiseed_evidence_check.py --evidence docs/tier1_final1000_multiseed_deploy_evidence_20260722.json --code-root ."
+  },
   "code_sha256": {
-    "tools/tier1_final1000_multiseed_release.py": "e4d6d277995716bb417f02f4b8e155239796044180ab7ee46cf9aad45225904d",
-    "tools/tier1_final1000_multiseed_driver.py": "8508783c1932909c7e299449f5513679a9646ce37e02c5adc351f276a8f0f862",
-    "tools/tier1_final1000_multiseed_consumer.py": "493342ac5dbe74ad24aabc51b975fddc1274ecc4367ccfeebf82a0f3cc0c2381",
-    "tools/tier1_final1000_multiseed_controller.py": "d3df97bf96a50c4c398e364ea1f30bcc7c0c1eb9dad7a065cf0df51434299536",
-    "tools/tier1_final1000_multiseed_harvest.py": "09b823beeefe722827cc9f6cf46df66ac642b8cbd75c23070e848d0d882940cf",
-    "tools/tier1_final1000_multiseed_monitor.py": "373240901436cca10b03182a3df4882fd57c771d6c2d61a3bd9d652c06568189",
-    "tools/tier1_final1000_multiseed_status.py": "8d61f5cb1476e49ed829ce6d9450b6137438244794fccc8df3a0b7595a9b29b3",
-    "tools/tier1_corrected_current7_slurm_harvest.py": "a666078fabd9287142624f5e03bfe6725a89a6f530d9d7401a296bfef2edf8c7",
-    "tools/tier1_corrected_current7_slurm_seed_runner.py": "6628a0548677f2e6c871a1b041569c580a807379671c9661e49b9ef2a95d2707"
+    "tools/tier1_final1000_multiseed_release.py": "58a65b30311727b30f365f5be5053a6be4f3c805a52d62704ccd225840d6c390",
+    "tools/tier1_final1000_multiseed_driver.py": "5b4bdc2d0b664c1e08bde266c3fdcd5219a3d6193ae8d8027b31c60c6698f055",
+    "tools/tier1_final1000_multiseed_consumer.py": "8414cdb15fb03c475592a9188d8e30ea4bc1e4d029835cfd6e9086a6264b8a10",
+    "tools/tier1_final1000_multiseed_controller.py": "23d566cadc9b683b2faebb72be0ce543dcb951d0bdbca4894e49168fa7b8aed5",
+    "tools/tier1_final1000_multiseed_contract.py": "70ddef0398086d58a205b1d471507a81bb82329f68d48cfbaa96fa33d34e2dae",
+    "tools/tier1_final1000_multiseed_harvest.py": "a25b4aefa8559f65410d60d4af5869d592de5ee19ab7c5a7f8a44222786e0fb1",
+    "tools/tier1_final1000_multiseed_monitor.py": "875ec255ab4f464c746d09a40aaa600630757e5d3e56dedd38e47d0bbc2b86df",
+    "tools/tier1_final1000_multiseed_status.py": "2fc31a1e1300405433f95c614c4443c43572bab6fc89b8234f37cb79d6d8bcd4",
+    "tools/tier1_final1000_multiseed_publish.py": "7b7ef670adf3172a5ba55065b24c2eb09f267fda03bdada9275f112ca0229cd7",
+    "tools/tier1_final1000_multiseed_evidence_check.py": "ae6482033bb8d3ae6335f1ee7cbc513b6f73a50b2cf1ecba299adbe0158b9c58",
+    "tools/tier1_corrected_current7_slurm_harvest.py": "1840ba1fd74e0ac86e0e268ca3c977af9b5ed4e93bbab03255217db9fd56de8c",
+    "tools/tier1_corrected_current7_slurm_seed_runner.py": "c61a2f96672bc1daddbb4473951387c84ceb9baf8b969faa392755f85adf2c76",
+    "tests/test_tier1_final1000_delta_publish.py": "613233247cbbe91c8c409e0446e2a3649cd55696f5a4bc9d095539da591b2e5a",
+    "tests/test_tier1_final1000_multiseed_evidence.py": "68f0cae4b412f66a37195fb10c114507a6e58081f4709a8d11c7a62274a3960a",
+    "docs/tier1_final1000_multiseed_deploy_runbook_20260722.md": "a7641243e2dd8697debe67a2af105746c715c89d19b8874f0fe40ce93ab45e04"
   },
   "effects": {
     "scheduler_http_requests": 0,
@@ -121,5 +179,6 @@
     "remote_writes": 0,
     "aedt_used": false,
     "fea_submission_performed": false
-  }
+  },
+  "evidence_sha256": "a654779b9b713f40ff45ed1ecd1f66b32f4529aa2410ab926f8cdc103633652e"
 }
