@@ -385,6 +385,8 @@ class _Scheduler:
         self.post_count = 0
         self.mutations: list[str] = []
         self.submitted_stage_ids: list[str] = []
+        self.recent_inventory_read_count = 0
+        self.complete_inventory_read_count = 0
         for entry in state["entries"]:
             task = copy.deepcopy(tasks[entry["dedupe_key"]])
             task.update(
@@ -398,6 +400,11 @@ class _Scheduler:
             self.by_dedupe[task["dedupe_key"]] = task
 
     def list_namespace_tasks(self):
+        self.recent_inventory_read_count += 1
+        return [copy.deepcopy(task) for task in self.by_id.values()]
+
+    def list_complete_namespace_tasks(self):
+        self.complete_inventory_read_count += 1
         return [copy.deepcopy(task) for task in self.by_id.values()]
 
     def find_task_by_dedupe(self, dedupe_key: str):
@@ -956,6 +963,8 @@ def test_busy_seed_status_holds_canary_pending_without_false_pass(tmp_path):
 def test_prepare_dry_run_imports_every_entry_and_seed_without_writes(tmp_path):
     fixture = _fixture(tmp_path)
     value = _prepare(fixture, apply=False)
+    assert fixture["scheduler"].complete_inventory_read_count == 1
+    assert fixture["scheduler"].recent_inventory_read_count == 0
     imported = value["successor_state"]
     assert value["scheduler_post_count"] == 0
     assert value["predecessor_entry_count"] == 500

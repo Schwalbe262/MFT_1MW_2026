@@ -628,7 +628,7 @@ def test_scheduler_bulk_inventory_reads_every_pinned_namespace_page(monkeypatch)
         return response
 
     monkeypatch.setattr(client, "_request_inventory_page", request)
-    observed = client.list_namespace_tasks()
+    observed = client.list_complete_namespace_tasks()
 
     assert len(observed) == 13_005
     assert [int(task["id"]) for task in observed] == list(
@@ -687,7 +687,7 @@ def test_scheduler_bulk_inventory_rejects_page_overlap_or_missing_id(
 
     monkeypatch.setattr(client, "_request_inventory_page", request)
     with pytest.raises(RuntimeError, match=message):
-        client.list_namespace_tasks()
+        client.list_complete_namespace_tasks()
     assert client.inventory_snapshot_receipt is None
 
 
@@ -706,7 +706,7 @@ def test_scheduler_bulk_inventory_rejects_unstable_snapshot_revision(monkeypatch
 
     monkeypatch.setattr(client, "_request_inventory_page", request)
     with pytest.raises(RuntimeError, match="snapshot revision changed"):
-        client.list_namespace_tasks()
+        client.list_complete_namespace_tasks()
     assert client.inventory_snapshot_receipt is None
 
 
@@ -760,6 +760,27 @@ def test_scheduler_inventory_http_429_retry_is_bounded(monkeypatch):
         )
     assert attempts == [7, 7, 7]
     assert sleeps == [0.25, 0.5]
+
+
+def test_watch_inventory_remains_one_bounded_recent_read(monkeypatch):
+    client = controller.SchedulerApiClient("http://scheduler.invalid")
+    paths = []
+
+    def request(path: str, **_kwargs):
+        paths.append(path)
+        return []
+
+    monkeypatch.setattr(client, "_request", request)
+    assert client.list_namespace_tasks() == []
+    assert len(paths) == 1
+    parsed = urllib.parse.parse_qs(paths[0].split("?", 1)[1])
+    assert parsed == {
+        "name_prefix": [controller.TASK_NAME_PREFIX],
+        "sort_by": ["id"],
+        "sort_order": ["desc"],
+        "limit": ["10000"],
+    }
+    assert client.inventory_snapshot_receipt is None
 
 
 def _write_plan(tmp_path: Path) -> tuple[Path, dict]:

@@ -310,7 +310,7 @@ class SchedulerApiClient(Current7SchedulerApiClient):
             raise RuntimeError("scheduler inventory page contains a non-object row")
         return items, filtered_total, page_count, server_revision
 
-    def _load_inventory(self) -> None:
+    def _load_complete_inventory(self) -> None:
         # Establish a high-watermark first.  Authoritative page reads are then
         # pinned below it so concurrent inserts cannot shift OFFSET pages.
         anchor = self._request_inventory_page(
@@ -421,6 +421,44 @@ class SchedulerApiClient(Current7SchedulerApiClient):
         }
         self._inventory = inventory
 
+    def _load_inventory(self) -> None:
+        """Load one bounded recent window for the 15-second watch loop."""
+
+        query = urllib.parse.urlencode(
+            {
+                "name_prefix": TASK_NAME_PREFIX,
+                "sort_by": "id",
+                "sort_order": "desc",
+                "limit": 10_000,
+            }
+        )
+        value = self._request(f"/api/tasks?{query}")
+        if not isinstance(value, list):
+            raise RuntimeError("final1000 recent scheduler inventory is not a list")
+        inventory: dict[str, Mapping[str, Any]] = {}
+        task_ids: dict[int, str] = {}
+        for task in value:
+            if not isinstance(task, dict):
+                raise RuntimeError("final1000 recent inventory contains a non-object")
+            name = str(task.get("name") or "")
+            dedupe = str(task.get("dedupe_key") or "")
+            if not name.startswith(TASK_NAME_PREFIX):
+                raise RuntimeError("final1000 recent inventory escaped its namespace")
+            if not dedupe.startswith(DEDUPE_PREFIX):
+                raise RuntimeError("final1000 namespace task has foreign dedupe key")
+            task_id = _task_id(task)
+            if task_id in task_ids and task_ids[task_id] != dedupe:
+                raise RuntimeError(
+                    "scheduler contains one final1000 task id with multiple dedupes"
+                )
+            task_ids[task_id] = dedupe
+            if dedupe in inventory and int(inventory[dedupe]["id"]) != task_id:
+                raise RuntimeError(
+                    f"scheduler contains duplicate final1000 dedupe: {dedupe}"
+                )
+            inventory[dedupe] = task
+        self._inventory = inventory
+
     def submit_task(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         if (
             not str(payload.get("name") or "").startswith(TASK_NAME_PREFIX)
@@ -431,9 +469,15 @@ class SchedulerApiClient(Current7SchedulerApiClient):
         return super().submit_task(payload)
 
     def list_namespace_tasks(self) -> list[Mapping[str, Any]]:
-        """Return the read-only final1000 inventory used by migration prep."""
+        """Return a bounded recent view for recurring watch reconciliation."""
 
         self._load_inventory()
+        return [dict(task) for task in (self._inventory or {}).values()]
+
+    def list_complete_namespace_tasks(self) -> list[Mapping[str, Any]]:
+        """Return a one-shot, high-watermark-pinned migration authority."""
+
+        self._load_complete_inventory()
         return [dict(task) for task in (self._inventory or {}).values()]
 
     def read_seed_status(self, task_id: int) -> Mapping[str, Any] | None:

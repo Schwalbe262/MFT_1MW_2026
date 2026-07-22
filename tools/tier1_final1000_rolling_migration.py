@@ -1157,7 +1157,15 @@ def _scheduler_inventory(
     *,
     predecessor_state: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[int, str]]:
-    rows = [dict(row) for row in scheduler.list_namespace_tasks()]
+    complete_reader = getattr(scheduler, "list_complete_namespace_tasks", None)
+    rows = [
+        dict(row)
+        for row in (
+            complete_reader()
+            if callable(complete_reader)
+            else scheduler.list_namespace_tasks()
+        )
+    ]
     by_id: dict[int, dict[str, Any]] = {}
     by_dedupe: dict[str, int] = {}
     for row in rows:
@@ -1439,6 +1447,25 @@ def prepare_successor_state(
     inventory, observed_states = _scheduler_inventory(
         scheduler, predecessor_state=predecessor_state
     )
+    inventory_snapshot_receipt = copy.deepcopy(
+        getattr(scheduler, "inventory_snapshot_receipt", None)
+    )
+    if inventory_snapshot_receipt is not None:
+        if not isinstance(inventory_snapshot_receipt, dict):
+            raise RuntimeError("scheduler complete inventory receipt mismatch")
+        snapshot_unsigned = {
+            key: item
+            for key, item in inventory_snapshot_receipt.items()
+            if key != "sha256"
+        }
+        if (
+            inventory_snapshot_receipt.get("schema_version")
+            != "mft-tier1-final1000-inventory-snapshot-v1"
+            or inventory_snapshot_receipt.get("sha256")
+            != canonical_sha256(snapshot_unsigned)
+            or inventory_snapshot_receipt.get("filtered_total") != len(inventory)
+        ):
+            raise RuntimeError("scheduler complete inventory receipt mismatch")
     if before_final_state_read is not None:
         before_final_state_read()
     final_predecessor_state = _read_json(predecessor_state_path.resolve(strict=True))
@@ -1504,6 +1531,7 @@ def prepare_successor_state(
         "predecessor_state_revision": int(predecessor_state_raw["revision"]),
         "successor_launch_plan_sha256": successor_plan["launch_plan_sha256"],
         "scheduler_inventory_sha256": canonical_sha256(normalized_inventory),
+        "scheduler_complete_inventory_snapshot": inventory_snapshot_receipt,
         "predecessor_entry_count": len(entries),
         "imported_active_count_by_stage": active_by_stage,
         "predecessor_next_seed_by_stage": copy.deepcopy(
@@ -1622,6 +1650,9 @@ def prepare_successor_state(
         "predecessor_state_sha256": predecessor_state_raw["state_sha256"],
         "successor_launch_plan_sha256": successor_plan["launch_plan_sha256"],
         "scheduler_inventory_sha256": migration["scheduler_inventory_sha256"],
+        "scheduler_complete_inventory_snapshot": copy.deepcopy(
+            migration.get("scheduler_complete_inventory_snapshot")
+        ),
         "predecessor_stopped": bool(
             predecessor_state.get("_predecessor_stopped", True)
         ),
