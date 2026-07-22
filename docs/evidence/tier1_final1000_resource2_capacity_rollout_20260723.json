@@ -1,0 +1,73 @@
+{
+  "aedt_used": false,
+  "cancellation_performed": false,
+  "capacity_policy": {
+    "allocation_states_counted": [
+      "active"
+    ],
+    "draining_counted": false,
+    "exclusive_node": false,
+    "pending_counted": false,
+    "recompute_each_cycle": true,
+    "resource_pool": "cpu",
+    "scheduling_profile": "standard",
+    "slot_formula": "exact-bin-pack(2cpu-promoted-stages,4cpu-unpromoted-stages,28672MiB,32-workers)",
+    "target_formula": "max(500,min(exact_mixed_fit,maximum_active_target))",
+    "warm_counted": false
+  },
+  "config_sha256": "f407a7847925f15ac188c315fa17b4422fda3cf7056a530156ec3a02d4c1f70a",
+  "cross_stage_resource2_expansion_allowed": false,
+  "failure_policy": {
+    "cancel_existing_tasks": false,
+    "fallback_active_target": 500,
+    "fallback_mode": "resource4-fallback",
+    "resource2_terminal_failure_threshold": 1,
+    "retry_resource2_automatically": false
+  },
+  "fallback_resource4_policy": {
+    "cpus_per_task": 4,
+    "gpus": 0,
+    "inference_threads": 8,
+    "max_workers_per_node": 32,
+    "memory_mb_per_task": 28672,
+    "priority": 1,
+    "scheduling_profile": "standard"
+  },
+  "fea_submission_performed": false,
+  "maximum_active_target": 1000,
+  "minimum_active_target": 500,
+  "predecessor_controller_revision": "4aaf99a02f54d134dfe202b2867a73bab1460577",
+  "predecessor_launch_plan_sha256": "90af982bf32b8fb005b8557db77f1822f5cc8a2c3dc6e377c29da41e4cdfe730",
+  "preemption_performed": false,
+  "promotion_basis": {
+    "bridge-1150-t115": "not-promoted-requires-own-2cpu-terminal-gate",
+    "close-1075-t107p5": "not-promoted-requires-own-2cpu-terminal-gate",
+    "entry-1200-t125": "terminal-gate-task-86501",
+    "final-1000-t100": "not-promoted-requires-own-2cpu-terminal-gate"
+  },
+  "resource2_canary_package_sha256": "12f8ca284d4cf3d12f8bc9e6ac528473e9872e8e81300849dfc1ae03a6e9a7b8",
+  "resource2_canary_submission_receipt_sha256": "da0bcbde3c626ce2b9f003746b8f0bb5b6e4f2130edc54ac6bc8123545bdd742",
+  "resource2_canary_task_id": 86501,
+  "resource2_policy": {
+    "cpus_per_task": 2,
+    "gpus": 0,
+    "inference_threads": 2,
+    "max_workers_per_node": 32,
+    "memory_mb_per_task": 28672,
+    "priority": 1,
+    "scheduling_profile": "standard"
+  },
+  "resource2_promoted_stage_ids": [
+    "entry-1200-t125"
+  ],
+  "scheduler_mutation_endpoints": [
+    "POST /api/tasks"
+  ],
+  "schema_version": "mft-tier1-final1000-resource2-capacity-rollout-config-v1",
+  "stage_weight_basis": {
+    "bridge-1150-t115": 160,
+    "close-1075-t107p5": 90,
+    "entry-1200-t125": 200,
+    "final-1000-t100": 50
+  }
+}

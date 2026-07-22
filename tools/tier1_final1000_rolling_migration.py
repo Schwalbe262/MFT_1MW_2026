@@ -119,6 +119,8 @@ PREDECESSOR_CPUS = 8
 PREDECESSOR_MAX_WORKERS = 8
 SUCCESSOR_CPUS = 4
 SUCCESSOR_MAX_WORKERS = 32
+RESOURCE2_CPUS = 2
+RESOURCE2_MAX_WORKERS = 32
 
 PREDECESSOR_POLICY = {
     "cpus_per_task": PREDECESSOR_CPUS,
@@ -138,10 +140,28 @@ SUCCESSOR_POLICY = {
     "gpus": 0,
     "inference_threads": INFERENCE_THREADS,
 }
+RESOURCE2_POLICY = {
+    "cpus_per_task": RESOURCE2_CPUS,
+    "memory_mb_per_task": DEFAULT_MEMORY_MB,
+    "max_workers_per_node": RESOURCE2_MAX_WORKERS,
+    "priority": DEFAULT_PRIORITY,
+    "scheduling_profile": "standard",
+    "gpus": 0,
+    "inference_threads": RESOURCE2_CPUS,
+}
+RESOURCE2_RESOURCE_POLICY_ID = "successor-2c-28672m-mw32-t2"
+RESOURCE2_THREAD_ENVIRONMENT = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
 
 RESOURCE_POLICIES = {
     LEGACY_RESOURCE_POLICY_ID: PREDECESSOR_POLICY,
     SUCCESSOR_RESOURCE_POLICY_ID: SUCCESSOR_POLICY,
+    RESOURCE2_RESOURCE_POLICY_ID: RESOURCE2_POLICY,
 }
 
 PAYLOAD_SHA_PATTERN = re.compile(
@@ -357,16 +377,19 @@ def authenticate_external_batch1_canaries(
             if isinstance(observed, Mapping)
             else None
         )
-        if (
-            observation != (task_id, "completed")
-            or not scheduler_task_identity_matches(observed, expected_task)
+        if observation != (task_id, "completed") or not scheduler_task_identity_matches(
+            observed, expected_task
         ):
             raise RuntimeError("external successor Scheduler task identity drifted")
-        seeds = [int(child["seed"]) for child in expected_task["payload_json"]["children"]]
+        seeds = [
+            int(child["seed"]) for child in expected_task["payload_json"]["children"]
+        ]
         try:
             evidence = gate_reader.lane_evidence(task_id, seeds)
         except Exception as exc:
-            raise RuntimeError("external successor canary evidence read failed") from exc
+            raise RuntimeError(
+                "external successor canary evidence read failed"
+            ) from exc
         if not isinstance(evidence, Mapping):
             raise RuntimeError("external successor canary evidence is missing")
         manifest = validate_batch_manifest(evidence.get("manifest") or {})
@@ -422,9 +445,7 @@ def authenticate_external_batch1_canaries(
         "source_driver_state_revision": int(state["revision"]),
         "source_driver_launch_plan_sha256": state["launch_plan_sha256"],
         "source_driver_phase": state["phase"],
-        "source_monitoring_capability_sha256": state[
-            "monitoring_capability_sha256"
-        ],
+        "source_monitoring_capability_sha256": state["monitoring_capability_sha256"],
         "successor_launch_plan_sha256": plan["launch_plan_sha256"],
         "gate_phase": "batch1",
         "stage_attestations": stage_attestations,
@@ -499,8 +520,7 @@ def _stage_profile_for_generations(stage_id: str, generations: int) -> dict[str,
 def _stage_inventory_for_generations(generations: int) -> dict[str, Any]:
     inventory = copy.deepcopy(stage_inventory())
     profiles = [
-        _stage_profile_for_generations(stage.stage_id, generations)
-        for stage in STAGES
+        _stage_profile_for_generations(stage.stage_id, generations) for stage in STAGES
     ]
     inventory["profiles"] = profiles
     inventory["profile_sha256_by_stage"] = {
@@ -645,13 +665,14 @@ def _validate_task_for_policy(
     if stage is None:
         raise RuntimeError("final1000 migration task stage is unknown")
     spec, constraints = optimizer_stage_contract(stage)
-    expected_profile = _stage_profile_for_generations(
-        stage.stage_id, fixed_generations
-    )
+    expected_profile = _stage_profile_for_generations(stage.stage_id, fixed_generations)
     lane = payload.get("lane") or {}
     seed = int(payload.get("seed", -1))
     wave = str(lane.get("wave") or "")
     resources = _task_resources(policy)
+    runtime_threads = int(policy["inference_threads"])
+    scheduler_cpus = payload.get("scheduler_cpus")
+    resource2 = policy == RESOURCE2_POLICY
     dedupe = canonical_sha256(
         {
             "goal": "final1000",
@@ -671,10 +692,25 @@ def _validate_task_for_policy(
         or payload.get("hard_spec_sha256") != canonical_sha256(spec)
         or payload.get("stage_spec_sha256") != canonical_sha256(spec)
         or payload.get("constraint_names") != constraints
-        or payload.get("final_goal_stage_profile_sha256")
-        != expected_profile["sha256"]
+        or payload.get("final_goal_stage_profile_sha256") != expected_profile["sha256"]
         or payload.get("max_generations") != fixed_generations
-        or payload.get("inference_threads") != INFERENCE_THREADS
+        or payload.get("inference_threads") != runtime_threads
+        or (
+            resource2
+            and (
+                scheduler_cpus != RESOURCE2_CPUS
+                or any(
+                    f"export {name}={RESOURCE2_CPUS}"
+                    not in str(task.get("command") or "")
+                    for name in RESOURCE2_THREAD_ENVIRONMENT
+                )
+            )
+        )
+        or (
+            not resource2
+            and scheduler_cpus is not None
+            and scheduler_cpus != runtime_threads
+        )
         or payload.get("optimizer_processes") != 1
         or payload.get("maximum_peak_rss_bytes") != DEFAULT_PEAK_RSS_GATE_BYTES
         or any(
@@ -828,9 +864,7 @@ def validate_predecessor_plan(value: Mapping[str, Any]) -> dict[str, Any]:
     return _validate_plan_for_policy(
         value,
         policy=PREDECESSOR_POLICY,
-        expected_active_quotas={
-            stage.stage_id: stage.active_quota for stage in STAGES
-        },
+        expected_active_quotas={stage.stage_id: stage.active_quota for stage in STAGES},
     )
 
 
@@ -937,6 +971,9 @@ def _render_from_template_for_policy(
     lane["seed"] = int(seed)
     lane["wave"] = wave
     payload["lane"] = lane
+    if policy == RESOURCE2_POLICY:
+        payload["inference_threads"] = RESOURCE2_CPUS
+        payload["scheduler_cpus"] = RESOURCE2_CPUS
     task["payload_json"] = payload
     task["name"] = f"{stage.task_name_stem}-{wave}-{int(seed)}"
     payload_sha = canonical_sha256(payload)
@@ -946,6 +983,21 @@ def _render_from_template_for_policy(
     )
     if count != 1:
         raise RuntimeError("predecessor task command payload seal is ambiguous")
+    if policy == RESOURCE2_POLICY:
+        lines = command.splitlines()
+        if not lines or lines[0] != "set -euo pipefail":
+            raise RuntimeError("resource2 task command has no strict shell prologue")
+        exports = [
+            f"export {name}={RESOURCE2_CPUS}" for name in RESOURCE2_THREAD_ENVIRONMENT
+        ]
+        if any(
+            any(line.startswith(f"export {name}=") for line in lines)
+            for name in RESOURCE2_THREAD_ENVIRONMENT
+        ):
+            raise RuntimeError(
+                "resource2 task template already binds thread environment"
+            )
+        command = "\n".join([lines[0], *exports, *lines[1:]])
     task["command"] = command
     resources = _task_resources(policy)
     task.update(resources)
@@ -1187,10 +1239,7 @@ def _validate_chained_predecessor_state(
         key: item for key, item in migration.items() if key != "sha256"
     }
     primary_quotas = dict(
-        (primary_plan.get("open_ended_refill") or {}).get(
-            "stage_active_quotas"
-        )
-        or {}
+        (primary_plan.get("open_ended_refill") or {}).get("stage_active_quotas") or {}
     )
     if (
         migration.get("schema_version")
@@ -1223,11 +1272,12 @@ def _validate_chained_predecessor_state(
     entry_cohort_id: dict[int, str] = {}
     catalog: dict[str, dict[str, Any]] = {}
     if migration["schema_version"] == MIGRATION_SCHEMA:
-        if (
-            migration.get("predecessor_controller_kind")
-            != "resource_quota_successor"
-            or set(stored_cohorts) != {"predecessor", "successor"}
-        ):
+        if migration.get(
+            "predecessor_controller_kind"
+        ) != "resource_quota_successor" or set(stored_cohorts) != {
+            "predecessor",
+            "successor",
+        }:
             raise RuntimeError("legacy rolling cohort roles drifted")
         role_to_cohort_id: dict[str, str] = {}
         for role in ("predecessor", "successor"):
@@ -1264,8 +1314,7 @@ def _validate_chained_predecessor_state(
         predecessor_ids = migration.get("predecessor_harvest_cohort_ids")
         successor_id = migration.get("successor_harvest_cohort_id")
         if (
-            migration.get("predecessor_controller_kind")
-            != "chained_patched_successor"
+            migration.get("predecessor_controller_kind") != "chained_patched_successor"
             or migration.get("predecessor_stop_observed") is not True
             or migration.get("shadow_only") is not False
             or not isinstance(predecessor_ids, list)
@@ -1300,7 +1349,9 @@ def _validate_chained_predecessor_state(
         str(cohort["launch_plan_sha256"]) for cohort in catalog.values()
     }
     if set(plan_by_sha256) != referenced_plan_shas:
-        raise RuntimeError("predecessor cohort plan inventory is incomplete or excessive")
+        raise RuntimeError(
+            "predecessor cohort plan inventory is incomplete or excessive"
+        )
     successor_candidates = [
         cohort_id
         for cohort_id, cohort in catalog.items()
@@ -1352,8 +1403,7 @@ def _validate_chained_predecessor_state(
             or not stage.seed_start <= seed < stage.seed_window_end_exclusive
             or policy is None
             or policy_id not in cohort["resource_policy_ids"]
-            or entry.get("bundle_id")
-            != cohort["stage_bindings"][stage_id]["bundle_id"]
+            or entry.get("bundle_id") != cohort["stage_bindings"][stage_id]["bundle_id"]
         ):
             raise RuntimeError("chained predecessor ledger entry drifted")
         expected = _render_from_template_for_policy(
@@ -1397,7 +1447,9 @@ def _validate_chained_predecessor_state(
         )
         for stage in STAGES
     }
-    all_external_ids_empty = all(not task_ids for task_ids in expected_canary_ids.values())
+    all_external_ids_empty = all(
+        not task_ids for task_ids in expected_canary_ids.values()
+    )
     external_attestation_present = external_attestation is not None
     if external_attestation_present != all_external_ids_empty:
         raise RuntimeError("chained predecessor external canary linkage mismatch")
@@ -1408,10 +1460,7 @@ def _validate_chained_predecessor_state(
             and (
                 migration.get("successor_canary_gap_policy")
                 != CHAINED_CANARY_GAP_POLICY
-                or any(
-                    len(task_ids) > 1
-                    for task_ids in expected_canary_ids.values()
-                )
+                or any(len(task_ids) > 1 for task_ids in expected_canary_ids.values())
             )
         )
         or migration.get("successor_canary_status_by_stage")
@@ -1540,10 +1589,8 @@ def prepare_successor_state(
         raise RuntimeError("external canary reuse requires every attestation input")
     predecessor_plan_raw = _read_json(predecessor_plan_path.resolve(strict=True))
     predecessor_resources = predecessor_plan_raw.get("resources")
-    predecessor_quotas = (
-        (predecessor_plan_raw.get("open_ended_refill") or {}).get(
-            "stage_active_quotas"
-        )
+    predecessor_quotas = (predecessor_plan_raw.get("open_ended_refill") or {}).get(
+        "stage_active_quotas"
     )
     predecessor_controller_kind: str
     if predecessor_resources == {
@@ -1559,47 +1606,57 @@ def prepare_successor_state(
     }:
         predecessor_plan = validate_predecessor_plan(predecessor_plan_raw)
         predecessor_controller_kind = "legacy_8c"
-    elif predecessor_resources == {
-        key: SUCCESSOR_POLICY[key]
-        for key in (
-            "cpus_per_task",
-            "memory_mb_per_task",
-            "max_workers_per_node",
-            "priority",
-            "scheduling_profile",
-            "gpus",
-        )
-    } and predecessor_quotas == HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS:
+    elif (
+        predecessor_resources
+        == {
+            key: SUCCESSOR_POLICY[key]
+            for key in (
+                "cpus_per_task",
+                "memory_mb_per_task",
+                "max_workers_per_node",
+                "priority",
+                "scheduling_profile",
+                "gpus",
+            )
+        }
+        and predecessor_quotas == HISTORICAL_RESOURCE_QUOTA_SUCCESSOR_ACTIVE_QUOTAS
+    ):
         predecessor_plan = validate_historical_resource_quota_successor_plan(
             predecessor_plan_raw
         )
         predecessor_controller_kind = "resource_quota_successor"
-    elif predecessor_resources == {
-        key: SUCCESSOR_POLICY[key]
-        for key in (
-            "cpus_per_task",
-            "memory_mb_per_task",
-            "max_workers_per_node",
-            "priority",
-            "scheduling_profile",
-            "gpus",
-        )
-    } and predecessor_quotas == PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS:
-        predecessor_plan = validate_previous_successor_plan(
-            predecessor_plan_raw
-        )
+    elif (
+        predecessor_resources
+        == {
+            key: SUCCESSOR_POLICY[key]
+            for key in (
+                "cpus_per_task",
+                "memory_mb_per_task",
+                "max_workers_per_node",
+                "priority",
+                "scheduling_profile",
+                "gpus",
+            )
+        }
+        and predecessor_quotas == PREVIOUS_SUCCESSOR_ACTIVE_QUOTAS
+    ):
+        predecessor_plan = validate_previous_successor_plan(predecessor_plan_raw)
         predecessor_controller_kind = "chained_patched_successor"
-    elif predecessor_resources == {
-        key: SUCCESSOR_POLICY[key]
-        for key in (
-            "cpus_per_task",
-            "memory_mb_per_task",
-            "max_workers_per_node",
-            "priority",
-            "scheduling_profile",
-            "gpus",
-        )
-    } and predecessor_quotas == SUCCESSOR_ACTIVE_QUOTAS:
+    elif (
+        predecessor_resources
+        == {
+            key: SUCCESSOR_POLICY[key]
+            for key in (
+                "cpus_per_task",
+                "memory_mb_per_task",
+                "max_workers_per_node",
+                "priority",
+                "scheduling_profile",
+                "gpus",
+            )
+        }
+        and predecessor_quotas == SUCCESSOR_ACTIVE_QUOTAS
+    ):
         predecessor_plan = validate_chained_predecessor_plan(predecessor_plan_raw)
         predecessor_controller_kind = "chained_patched_successor"
     elif predecessor_resources == {
@@ -1736,9 +1793,7 @@ def prepare_successor_state(
         # Refresh the live snapshot only after those checks, immediately before
         # the single scheduler inventory GET, to minimize benign shadow drift.
         refreshed = _read_json(predecessor_state_path.resolve(strict=True))
-        if refreshed.get("state_sha256") != predecessor_state_raw.get(
-            "state_sha256"
-        ):
+        if refreshed.get("state_sha256") != predecessor_state_raw.get("state_sha256"):
             predecessor_state_raw = refreshed
             predecessor_state = _validate_chained_predecessor_state(
                 predecessor_state_raw,
@@ -1803,9 +1858,9 @@ def prepare_successor_state(
             int(entry["task_id"])
         ]
         if predecessor_controller_kind == "chained_patched_successor":
-            entry["harvest_cohort_id"] = predecessor_state[
-                "_harvest_cohort_id_by_id"
-            ][int(entry["task_id"])]
+            entry["harvest_cohort_id"] = predecessor_state["_harvest_cohort_id_by_id"][
+                int(entry["task_id"])
+            ]
         entries.append(entry)
     active_by_stage = {
         stage.stage_id: sum(
@@ -1863,9 +1918,7 @@ def prepare_successor_state(
         "successor_resource_policy": copy.deepcopy(SUCCESSOR_POLICY),
         "successor_active_quotas": copy.deepcopy(SUCCESSOR_ACTIVE_QUOTAS),
         "refill_policy": REFILL_POLICY,
-        "successor_canary_task_ids_by_stage": {
-            stage.stage_id: [] for stage in STAGES
-        },
+        "successor_canary_task_ids_by_stage": {stage.stage_id: [] for stage in STAGES},
         "successor_canary_status_by_stage": {
             stage.stage_id: (
                 "remote_preflight_passed"
@@ -1885,9 +1938,7 @@ def prepare_successor_state(
         )
         migration_payload.update(
             {
-                "external_canary_imported_active_count": sum(
-                    active_by_stage.values()
-                ),
+                "external_canary_imported_active_count": sum(active_by_stage.values()),
                 "external_canary_initial_shortfall": (
                     TOTAL_ACTIVE_QUOTA - sum(active_by_stage.values())
                 ),
@@ -1926,9 +1977,7 @@ def prepare_successor_state(
                 "predecessor_harvest_cohort_ids": predecessor_cohort_ids,
                 "successor_harvest_cohort_id": successor_cohort_id,
                 "harvest_cohorts": catalog,
-                "successor_canary_gap_policy": copy.deepcopy(
-                    CHAINED_CANARY_GAP_POLICY
-                ),
+                "successor_canary_gap_policy": copy.deepcopy(CHAINED_CANARY_GAP_POLICY),
                 "predecessor_stop_observed": bool(
                     predecessor_state["_predecessor_stopped"]
                 ),
@@ -2085,9 +2134,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--external-canary-monitoring-capability",
         type=Path,
-        help=(
-            "sealed monitoring capability bound to --external-canary-driver-state"
-        ),
+        help=("sealed monitoring capability bound to --external-canary-driver-state"),
     )
     parser.add_argument(
         "--evidence-output",
@@ -2189,7 +2236,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         }
         if shadow_path in protected_shadow_targets:
-            raise RuntimeError("shadow state evidence cannot overwrite an input/state file")
+            raise RuntimeError(
+                "shadow state evidence cannot overwrite an input/state file"
+            )
         if (
             args.evidence_output is not None
             and shadow_path == args.evidence_output.resolve()
@@ -2225,7 +2274,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "scheduler_url": args.scheduler_url,
             "predecessor_plan": str(args.predecessor_plan.resolve()),
             "predecessor_state": str(args.predecessor_state.resolve()),
-            "ancestor_plans": sorted(str(path.resolve()) for path in args.ancestor_plan),
+            "ancestor_plans": sorted(
+                str(path.resolve()) for path in args.ancestor_plan
+            ),
             "successor_plan": str(args.successor_plan.resolve()),
             "successor_state_target": str(args.successor_state.resolve()),
             "result": compact,

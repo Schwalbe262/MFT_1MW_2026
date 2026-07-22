@@ -72,7 +72,14 @@ try:
         validate_chained_predecessor_plan,
         validate_historical_resource_quota_successor_plan,
         validate_predecessor_plan,
+        validate_previous_successor_plan,
         validate_successor_plan,
+    )
+    from tier1_final1000_resource2_capacity_rollout import (
+        STATE_SCHEMA as RESOURCE2_ROLLOUT_STATE_SCHEMA,
+        validate_config as validate_resource2_rollout_config,
+        validate_promotion_gate as validate_resource2_promotion_gate,
+        validate_state as validate_resource2_rollout_state,
     )
     from tier1_final1000_slurm_launch import (
         load_stage_bindings,
@@ -129,7 +136,14 @@ except ImportError:  # pragma: no cover - repository import path
         validate_chained_predecessor_plan,
         validate_historical_resource_quota_successor_plan,
         validate_predecessor_plan,
+        validate_previous_successor_plan,
         validate_successor_plan,
+    )
+    from tools.tier1_final1000_resource2_capacity_rollout import (
+        STATE_SCHEMA as RESOURCE2_ROLLOUT_STATE_SCHEMA,
+        validate_config as validate_resource2_rollout_config,
+        validate_promotion_gate as validate_resource2_promotion_gate,
+        validate_state as validate_resource2_rollout_state,
     )
     from tools.tier1_final1000_slurm_launch import (
         load_stage_bindings,
@@ -350,19 +364,61 @@ def _validate_inputs(
     ancestor_launch_plan_paths: Sequence[Path] = (),
     ancestor_bindings_paths: Sequence[Path] = (),
     allow_chained_shadow_state: bool = False,
+    resource2_rollout_config_path: Path | None = None,
+    resource2_terminal_gate_path: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]:
     if len(ancestor_launch_plan_paths) != len(ancestor_bindings_paths):
         raise RuntimeError("ancestor launch-plan/bindings counts differ")
-    successor_plan = validate_successor_plan(
-        _read_json(launch_plan_path.resolve(strict=True))
-    )
     raw_state = _read_json(controller_state_path.resolve(strict=True))
-    state = (
-        _validate_chained_shadow_state(raw_state, successor_plan)
-        if allow_chained_shadow_state
-        else _validate_state(raw_state, successor_plan)
+    resource2_rollout = (
+        raw_state.get("schema_version") == RESOURCE2_ROLLOUT_STATE_SCHEMA
     )
-    if state.get("schema_version") != CONTROLLER_STATE_SCHEMA:
+    if resource2_rollout:
+        if allow_chained_shadow_state:
+            raise RuntimeError("resource2 rollout state is not a chained shadow")
+        if (
+            resource2_rollout_config_path is None
+            or resource2_terminal_gate_path is None
+        ):
+            raise RuntimeError(
+                "resource2 rollout harvest requires config and terminal gate"
+            )
+        successor_plan = validate_previous_successor_plan(
+            _read_json(launch_plan_path.resolve(strict=True))
+        )
+        rollout_config = validate_resource2_rollout_config(
+            _read_json(resource2_rollout_config_path.resolve(strict=True))
+        )
+        terminal_gate = validate_resource2_promotion_gate(
+            _read_json(resource2_terminal_gate_path.resolve(strict=True)),
+            config=rollout_config,
+        )
+        state = validate_resource2_rollout_state(
+            raw_state,
+            plan=successor_plan,
+            config=rollout_config,
+            terminal_gate=terminal_gate,
+        )
+    else:
+        if (
+            resource2_rollout_config_path is not None
+            or resource2_terminal_gate_path is not None
+        ):
+            raise RuntimeError(
+                "resource2 rollout harvest inputs supplied for a legacy state"
+            )
+        successor_plan = validate_successor_plan(
+            _read_json(launch_plan_path.resolve(strict=True))
+        )
+        state = (
+            _validate_chained_shadow_state(raw_state, successor_plan)
+            if allow_chained_shadow_state
+            else _validate_state(raw_state, successor_plan)
+        )
+    if state.get("schema_version") not in {
+        CONTROLLER_STATE_SCHEMA,
+        RESOURCE2_ROLLOUT_STATE_SCHEMA,
+    }:
         raise RuntimeError("final1000 controller state schema drifted")
     migration = state.get("rolling_migration")
     if migration is None:
@@ -437,11 +493,10 @@ def _validate_inputs(
             cohort_id=successor_id,
             plan=successor_plan,
             bindings=load_stage_bindings(bindings_path),
-            resource_policy_ids=[SUCCESSOR_RESOURCE_POLICY_ID],
+            resource_policy_ids=sealed_cohorts[successor_id]["resource_policy_ids"],
         )
         expected = {
-            cohort_id: cohort["identity"]
-            for cohort_id, cohort in cohorts.items()
+            cohort_id: cohort["identity"] for cohort_id, cohort in cohorts.items()
         }
         if sealed_cohorts != expected:
             raise RuntimeError(
@@ -474,19 +529,25 @@ def _validate_inputs(
         bindings=load_stage_bindings(predecessor_bindings_path),
         resource_policy_ids=predecessor_policy_ids,
     )
-    successor = _validate_plan_bindings(
-        role="successor",
-        plan=successor_plan,
-        bindings=load_stage_bindings(bindings_path),
-        resource_policy_ids=[SUCCESSOR_RESOURCE_POLICY_ID],
-    )
-    cohorts = {"predecessor": predecessor, "successor": successor}
-    expected = {role: cohort["identity"] for role, cohort in cohorts.items()}
     sealed_cohorts = migration.get("harvest_cohorts")
     if sealed_cohorts is None:
         sealed_cohorts = _derived_resource_only_harvest_cohorts(
             successor_plan, migration
         )
+    successor = _validate_plan_bindings(
+        role="successor",
+        plan=successor_plan,
+        bindings=load_stage_bindings(bindings_path),
+        resource_policy_ids=(
+            sealed_cohorts["successor"]["resource_policy_ids"]
+            if resource2_rollout
+            and isinstance(sealed_cohorts, dict)
+            and "successor" in sealed_cohorts
+            else [SUCCESSOR_RESOURCE_POLICY_ID]
+        ),
+    )
+    cohorts = {"predecessor": predecessor, "successor": successor}
+    expected = {role: cohort["identity"] for role, cohort in cohorts.items()}
     if sealed_cohorts != expected:
         raise RuntimeError("rolling migration harvest cohort inputs do not match state")
     return successor_plan, cohorts, state
@@ -1158,7 +1219,7 @@ def _condition_inventory(
         "launch_plan_sha256": launch_plan["launch_plan_sha256"],
         "controller_state_sha256": controller_state["state_sha256"],
         "controller_namespace": {
-            "state_schema": CONTROLLER_STATE_SCHEMA,
+            "state_schema": controller_state["schema_version"],
             "task_name_prefix": TASK_NAME_PREFIX,
             "dedupe_prefix": DEDUPE_PREFIX,
         },
@@ -1190,6 +1251,8 @@ def harvest_once(
     ancestor_launch_plan_paths: Sequence[Path] = (),
     ancestor_bindings_paths: Sequence[Path] = (),
     allow_chained_shadow_state: bool = False,
+    resource2_rollout_config_path: Path | None = None,
+    resource2_terminal_gate_path: Path | None = None,
     scheduler: SchedulerReader,
     remote: RemoteReader,
     runtime: Path = DEFAULT_RUNTIME,
@@ -1213,6 +1276,8 @@ def harvest_once(
         ancestor_launch_plan_paths=ancestor_launch_plan_paths,
         ancestor_bindings_paths=ancestor_bindings_paths,
         allow_chained_shadow_state=allow_chained_shadow_state,
+        resource2_rollout_config_path=resource2_rollout_config_path,
+        resource2_terminal_gate_path=resource2_terminal_gate_path,
     )
     scheduler_get_before = int(getattr(scheduler, "get_count", 0))
     scheduler_batch_get_before = int(getattr(scheduler, "batch_get_count", 0))
@@ -1308,8 +1373,7 @@ def harvest_once(
         "controller_state_sha256": state["state_sha256"],
         "chained_shadow_state": bool(
             isinstance(migration, dict)
-            and migration.get("schema_version")
-            == CHAINED_ROLLING_MIGRATION_SCHEMA
+            and migration.get("schema_version") == CHAINED_ROLLING_MIGRATION_SCHEMA
             and migration.get("shadow_only") is True
         ),
         "observed_at": heartbeat,
@@ -1353,9 +1417,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ancestor-launch-plan", type=Path, action="append", default=[]
     )
-    parser.add_argument(
-        "--ancestor-bindings", type=Path, action="append", default=[]
-    )
+    parser.add_argument("--ancestor-bindings", type=Path, action="append", default=[])
     parser.add_argument(
         "--allow-chained-shadow-state",
         action="store_true",
@@ -1365,6 +1427,8 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--controller-state", type=Path, required=True)
+    parser.add_argument("--resource2-rollout-config", type=Path)
+    parser.add_argument("--resource2-terminal-gate", type=Path)
     parser.add_argument("--scheduler-url", default=DEFAULT_SCHEDULER_URL)
     parser.add_argument("--accounts", type=Path, default=DEFAULT_ACCOUNTS)
     parser.add_argument(
@@ -1405,6 +1469,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ancestor_launch_plan_paths=args.ancestor_launch_plan,
                     ancestor_bindings_paths=args.ancestor_bindings,
                     allow_chained_shadow_state=args.allow_chained_shadow_state,
+                    resource2_rollout_config_path=args.resource2_rollout_config,
+                    resource2_terminal_gate_path=args.resource2_terminal_gate,
                     scheduler=scheduler,
                     remote=remote,
                     runtime=args.runtime,
