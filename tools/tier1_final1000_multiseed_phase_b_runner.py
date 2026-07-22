@@ -13,7 +13,7 @@ import argparse
 import copy
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import signal
 import shutil
 import subprocess
@@ -37,11 +37,14 @@ try:
         CHILD_RECEIPT_SCHEMA,
         CHILD_RESOURCE_TELEMETRY_SCHEMA,
         CPU_ISOLATION,
+        PARENT_MEMORY_EVIDENCE_FILENAME,
+        PARENT_MEMORY_EVIDENCE_SCHEMA,
         PROTOCOL_VERSION,
         RUNTIME_ISOLATION,
         TASK_STATUS_SCHEMA,
         batch_manifest_from_payload,
         seal_child_receipt,
+        seal_parent_memory_evidence,
         seal_task_status,
         validate_batch_manifest,
         validate_batch_payload,
@@ -65,11 +68,14 @@ except ImportError:  # pragma: no cover - repository import path
         CHILD_RECEIPT_SCHEMA,
         CHILD_RESOURCE_TELEMETRY_SCHEMA,
         CPU_ISOLATION,
+        PARENT_MEMORY_EVIDENCE_FILENAME,
+        PARENT_MEMORY_EVIDENCE_SCHEMA,
         PROTOCOL_VERSION,
         RUNTIME_ISOLATION,
         TASK_STATUS_SCHEMA,
         batch_manifest_from_payload,
         seal_child_receipt,
+        seal_parent_memory_evidence,
         seal_task_status,
         validate_batch_manifest,
         validate_batch_payload,
@@ -92,6 +98,301 @@ CHILD_STDERR_ACTIVE_FILENAME = CHILD_STDERR_FILENAME + ".active"
 _CHILD_STDOUT_ACTIVE_ENV = "MFT_PHASE_B_CHILD_STDOUT_ACTIVE_PATH"
 _CHILD_STDERR_ACTIVE_ENV = "MFT_PHASE_B_CHILD_STDERR_ACTIVE_PATH"
 CPU_TELEMETRY_SCHEMA = "mft-tier1-final1000-phase-b-cpu-telemetry-v1"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+_CGROUP_V1_UNBOUNDED_MIN_BYTES = 1 << 60
+
+
+def _canonical_cgroup_path(value: str) -> str | None:
+    if not value.startswith("/") or "\x00" in value:
+        return None
+    candidate = PurePosixPath(value)
+    if ".." in candidate.parts:
+        return None
+    return candidate.as_posix()
+
+
+def _safe_cgroup_directory(root: Path, membership: str) -> Path | None:
+    canonical = _canonical_cgroup_path(membership)
+    if canonical is None:
+        return None
+    try:
+        resolved_root = root.resolve(strict=True)
+        relative = PurePosixPath(canonical).relative_to("/")
+        candidate = resolved_root.joinpath(*relative.parts).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if candidate != resolved_root and not candidate.is_relative_to(resolved_root):
+        return None
+    return candidate if candidate.is_dir() else None
+
+
+def _read_cgroup_scalar(path: Path, *, allow_max: bool = False) -> int | str | None:
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if len(raw) > 128:
+        return None
+    try:
+        value = raw.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return None
+    if allow_max and value == "max":
+        return "max"
+    if not value or not value.isascii() or not value.isdigit():
+        return None
+    parsed = int(value)
+    return parsed if parsed >= 0 else None
+
+
+def _unavailable_cgroup_memory(
+    reason: str,
+    *,
+    version: int | None = None,
+    cgroup_path: str | None = None,
+    current: int | None = None,
+    peak: int | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "cgroup_available": False,
+        "cgroup_version": version,
+        "cgroup_path": cgroup_path,
+        "cgroup_measurement": (
+            "unavailable-on-platform"
+            if version is None
+            else "unavailable-or-incomplete"
+        ),
+        "cgroup_unavailable_reason": reason,
+        "cgroup_current_bytes": current,
+        "cgroup_peak_bytes": peak,
+        "cgroup_limit_bytes": limit,
+        "cgroup_limit_unbounded": False,
+    }
+
+
+def _collect_parent_cgroup_memory(
+    *,
+    platform_name: str | None = None,
+    proc_self_cgroup: Path = _PROC_SELF_CGROUP,
+    cgroup_root: Path = _CGROUP_ROOT,
+) -> dict[str, Any]:
+    """Read the owning Linux memory cgroup without following an escape path."""
+
+    selected_platform = platform_name or sys.platform
+    if not selected_platform.startswith("linux"):
+        return _unavailable_cgroup_memory("non-linux-platform")
+    try:
+        raw = proc_self_cgroup.read_bytes()
+    except OSError:
+        return _unavailable_cgroup_memory("proc-self-cgroup-unavailable")
+    if len(raw) > 1024 * 1024:
+        return _unavailable_cgroup_memory("proc-self-cgroup-oversized")
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return _unavailable_cgroup_memory("proc-self-cgroup-non-ascii")
+
+    v2_path: str | None = None
+    v1_path: str | None = None
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        hierarchy, controllers, membership = fields
+        canonical = _canonical_cgroup_path(membership)
+        if canonical is None:
+            continue
+        if hierarchy == "0" and controllers == "":
+            v2_path = canonical
+            break
+        if "memory" in controllers.split(","):
+            v1_path = canonical
+
+    if v2_path is not None:
+        directory = _safe_cgroup_directory(cgroup_root, v2_path)
+        if directory is None:
+            return _unavailable_cgroup_memory(
+                "cgroup-v2-directory-unavailable", version=2, cgroup_path=v2_path
+            )
+        current_raw = _read_cgroup_scalar(directory / "memory.current")
+        peak_raw = _read_cgroup_scalar(directory / "memory.peak")
+        limit_raw = _read_cgroup_scalar(directory / "memory.max", allow_max=True)
+        current = current_raw if isinstance(current_raw, int) else None
+        peak = peak_raw if isinstance(peak_raw, int) else None
+        unbounded = limit_raw == "max"
+        limit = limit_raw if isinstance(limit_raw, int) and limit_raw > 0 else None
+        if current is None or peak is None or (limit is None and not unbounded):
+            return _unavailable_cgroup_memory(
+                "cgroup-v2-memory-files-incomplete",
+                version=2,
+                cgroup_path=v2_path,
+                current=current,
+                peak=peak,
+                limit=limit,
+            )
+        return {
+            "cgroup_available": True,
+            "cgroup_version": 2,
+            "cgroup_path": v2_path,
+            "cgroup_measurement": "linux-cgroup-v2-memory-files",
+            "cgroup_unavailable_reason": None,
+            "cgroup_current_bytes": current,
+            "cgroup_peak_bytes": peak,
+            "cgroup_limit_bytes": limit,
+            "cgroup_limit_unbounded": unbounded,
+        }
+
+    if v1_path is not None:
+        directory = _safe_cgroup_directory(cgroup_root / "memory", v1_path)
+        if directory is None:
+            directory = _safe_cgroup_directory(cgroup_root, v1_path)
+        if directory is None:
+            return _unavailable_cgroup_memory(
+                "cgroup-v1-directory-unavailable", version=1, cgroup_path=v1_path
+            )
+        current_raw = _read_cgroup_scalar(directory / "memory.usage_in_bytes")
+        peak_raw = _read_cgroup_scalar(directory / "memory.max_usage_in_bytes")
+        limit_raw = _read_cgroup_scalar(directory / "memory.limit_in_bytes")
+        current = current_raw if isinstance(current_raw, int) else None
+        peak = peak_raw if isinstance(peak_raw, int) else None
+        parsed_limit = limit_raw if isinstance(limit_raw, int) else None
+        unbounded = bool(
+            parsed_limit is not None
+            and parsed_limit >= _CGROUP_V1_UNBOUNDED_MIN_BYTES
+        )
+        limit = (
+            parsed_limit
+            if parsed_limit is not None and parsed_limit > 0 and not unbounded
+            else None
+        )
+        if current is None or peak is None or (limit is None and not unbounded):
+            return _unavailable_cgroup_memory(
+                "cgroup-v1-memory-files-incomplete",
+                version=1,
+                cgroup_path=v1_path,
+                current=current,
+                peak=peak,
+                limit=limit,
+            )
+        return {
+            "cgroup_available": True,
+            "cgroup_version": 1,
+            "cgroup_path": v1_path,
+            "cgroup_measurement": "linux-cgroup-v1-memory-files",
+            "cgroup_unavailable_reason": None,
+            "cgroup_current_bytes": current,
+            "cgroup_peak_bytes": peak,
+            "cgroup_limit_bytes": limit,
+            "cgroup_limit_unbounded": unbounded,
+        }
+
+    return _unavailable_cgroup_memory("memory-cgroup-membership-unavailable")
+
+
+def _build_parent_memory_evidence(
+    *,
+    task_id: str,
+    manifest_sha256: str,
+    terminal_status: Mapping[str, Any],
+    children: Sequence[Mapping[str, Any]],
+    finished: Mapping[int, Mapping[str, Any]],
+    cgroup_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    observations: list[dict[str, Any]] = []
+    peaks: list[int] = []
+    for child in children:
+        ordinal = int(child["ordinal"])
+        record = finished.get(ordinal)
+        legacy = record.get("legacy") if isinstance(record, Mapping) else None
+        raw_peak = (
+            legacy.get("observed_peak_rss_bytes")
+            if isinstance(legacy, Mapping)
+            else None
+        )
+        peak = (
+            int(raw_peak)
+            if isinstance(raw_peak, int)
+            and not isinstance(raw_peak, bool)
+            and raw_peak > 0
+            else None
+        )
+        if peak is not None:
+            peaks.append(peak)
+        observations.append(
+            {
+                "ordinal": ordinal,
+                "seed": int(child["seed"]),
+                "legacy_status_sha256": (
+                    canonical_sha256(legacy)
+                    if isinstance(legacy, Mapping)
+                    else None
+                ),
+                "observed_peak_rss_bytes": peak,
+            }
+        )
+
+    logical_children = len(children)
+    child_requested = CHILD_MEMORY_MB * 1024**2
+    parent_requested = logical_children * child_requested
+    rss_sum = sum(peaks)
+    child_within = len(peaks) == logical_children and rss_sum <= parent_requested
+    cgroup_available = cgroup_memory.get("cgroup_available") is True
+    cgroup_unbounded = cgroup_memory.get("cgroup_limit_unbounded") is True
+    cgroup_peak = cgroup_memory.get("cgroup_peak_bytes")
+    cgroup_limit = cgroup_memory.get("cgroup_limit_bytes")
+    peak_within = bool(
+        cgroup_available
+        and not cgroup_unbounded
+        and isinstance(cgroup_peak, int)
+        and not isinstance(cgroup_peak, bool)
+        and isinstance(cgroup_limit, int)
+        and not isinstance(cgroup_limit, bool)
+        and cgroup_peak <= cgroup_limit
+    )
+    limit_covers = bool(
+        cgroup_available
+        and not cgroup_unbounded
+        and isinstance(cgroup_limit, int)
+        and not isinstance(cgroup_limit, bool)
+        and cgroup_limit >= parent_requested
+    )
+    return seal_parent_memory_evidence(
+        {
+            "schema_version": PARENT_MEMORY_EVIDENCE_SCHEMA,
+            "protocol_version": PROTOCOL_VERSION,
+            "task_id": str(task_id),
+            "manifest_sha256": str(manifest_sha256),
+            "task_status_sha256": str(terminal_status["status_sha256"]),
+            "logical_child_count": logical_children,
+            "child_requested_memory_bytes": child_requested,
+            "parent_requested_memory_bytes": parent_requested,
+            "child_peak_rss_available_count": len(peaks),
+            "child_peak_rss_sum_bytes": rss_sum,
+            "child_peak_rss_max_bytes": max(peaks) if peaks else None,
+            "child_peak_rss_observations_sha256": canonical_sha256(observations),
+            "cgroup_available": cgroup_memory.get("cgroup_available"),
+            "cgroup_version": cgroup_memory.get("cgroup_version"),
+            "cgroup_path": cgroup_memory.get("cgroup_path"),
+            "cgroup_measurement": cgroup_memory.get("cgroup_measurement"),
+            "cgroup_unavailable_reason": cgroup_memory.get(
+                "cgroup_unavailable_reason"
+            ),
+            "cgroup_current_bytes": cgroup_memory.get("cgroup_current_bytes"),
+            "cgroup_peak_bytes": cgroup_memory.get("cgroup_peak_bytes"),
+            "cgroup_limit_bytes": cgroup_memory.get("cgroup_limit_bytes"),
+            "cgroup_limit_unbounded": cgroup_memory.get(
+                "cgroup_limit_unbounded"
+            ),
+            "total_child_peak_rss_within_parent_request": child_within,
+            "cgroup_peak_within_limit": peak_within,
+            "cgroup_limit_covers_parent_request": limit_covers,
+            "safety_passed": child_within and peak_within and limit_covers,
+            "fea_submission_performed": False,
+            "aedt_used": False,
+        }
+    )
 
 
 def _aggregate_reaped_child_cpu_seconds() -> float | None:
@@ -709,11 +1010,13 @@ def run(
     run_root.mkdir(parents=True, exist_ok=True)
     manifest_path = run_root / "batch_manifest.json"
     status_path = run_root / "task_status.json"
+    memory_evidence_path = run_root / PARENT_MEMORY_EVIDENCE_FILENAME
     # Same-parent restart is fail-closed.  The immutable receipt prefix remains
     # harvestable, while recovery proceeds only through a new physical parent
     # identity; an unsealed child is never silently resumed or duplicated.
     if (
         status_path.exists()
+        or memory_evidence_path.exists()
         or any(run_root.glob(f"seed-*/{LEGACY_STATUS_FILENAME}"))
         or any(run_root.glob("seed-*/seed_status.json"))
     ):
@@ -1065,6 +1368,15 @@ def run(
             ),
         )
         phase_a_runner._atomic_json(status_path, status)
+        memory_evidence = _build_parent_memory_evidence(
+            task_id=task_id,
+            manifest_sha256=manifest["manifest_sha256"],
+            terminal_status=status,
+            children=payload["children"],
+            finished=finished,
+            cgroup_memory=_collect_parent_cgroup_memory(),
+        )
+        phase_a_runner._immutable_json(memory_evidence_path, memory_evidence)
         if stop_latch.requested:
             return STOPPED_EXIT_CODE
         if lane_fatal:

@@ -39,6 +39,10 @@ BATCH_MANIFEST_SCHEMA = "mft-tier1-final1000-concurrent-batch-manifest-v1"
 TASK_STATUS_SCHEMA = "mft-tier1-final1000-concurrent-task-status-v1"
 CHILD_RECEIPT_SCHEMA = "mft-tier1-final1000-concurrent-child-receipt-v1"
 CHILD_RESOURCE_TELEMETRY_SCHEMA = "mft-tier1-final1000-phase-b-child-cpu-telemetry-v1"
+PARENT_MEMORY_EVIDENCE_FILENAME = "parent_memory_evidence.json"
+PARENT_MEMORY_EVIDENCE_SCHEMA = (
+    "mft-tier1-final1000-phase-b-parent-memory-evidence-v1"
+)
 TERMINAL_RECEIPT_RECOVERY_SCHEMA = (
     "mft-tier1-final1000-phase-b-terminal-receipt-recovery-v1"
 )
@@ -1060,6 +1064,195 @@ def seal_child_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
     return validate_child_receipt(
         {**unsigned, "receipt_sha256": phase_a.canonical_sha256(unsigned)}
     )
+
+
+def seal_parent_memory_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Seal task-root memory evidence without changing status/receipt schemas."""
+
+    unsigned = {
+        key: copy.deepcopy(item)
+        for key, item in value.items()
+        if key != "evidence_sha256"
+    }
+    return validate_parent_memory_evidence(
+        {**unsigned, "evidence_sha256": phase_a.canonical_sha256(unsigned)}
+    )
+
+
+def validate_parent_memory_evidence(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate immutable parent cgroup and aggregate child-RSS evidence.
+
+    Missing cgroup files and an explicitly unbounded cgroup are representable
+    terminal observations, but neither can satisfy the safety gate.
+    """
+
+    unsigned = {
+        key: item for key, item in value.items() if key != "evidence_sha256"
+    }
+    required = {
+        "schema_version",
+        "protocol_version",
+        "task_id",
+        "manifest_sha256",
+        "task_status_sha256",
+        "logical_child_count",
+        "child_requested_memory_bytes",
+        "parent_requested_memory_bytes",
+        "child_peak_rss_available_count",
+        "child_peak_rss_sum_bytes",
+        "child_peak_rss_max_bytes",
+        "child_peak_rss_observations_sha256",
+        "cgroup_available",
+        "cgroup_version",
+        "cgroup_path",
+        "cgroup_measurement",
+        "cgroup_unavailable_reason",
+        "cgroup_current_bytes",
+        "cgroup_peak_bytes",
+        "cgroup_limit_bytes",
+        "cgroup_limit_unbounded",
+        "total_child_peak_rss_within_parent_request",
+        "cgroup_peak_within_limit",
+        "cgroup_limit_covers_parent_request",
+        "safety_passed",
+        "fea_submission_performed",
+        "aedt_used",
+        "evidence_sha256",
+    }
+    logical_children = _integer(
+        value.get("logical_child_count"),
+        "memory evidence logical child count",
+        minimum=1,
+    )
+    child_request = _integer(
+        value.get("child_requested_memory_bytes"),
+        "memory evidence child requested bytes",
+        minimum=1,
+    )
+    parent_request = _integer(
+        value.get("parent_requested_memory_bytes"),
+        "memory evidence parent requested bytes",
+        minimum=1,
+    )
+    rss_count = _integer(
+        value.get("child_peak_rss_available_count"),
+        "memory evidence child RSS count",
+    )
+    rss_sum = _integer(
+        value.get("child_peak_rss_sum_bytes"),
+        "memory evidence child RSS sum",
+    )
+    rss_max = value.get("child_peak_rss_max_bytes")
+    if rss_max is not None:
+        rss_max = _integer(rss_max, "memory evidence child RSS maximum", minimum=1)
+
+    cgroup_available = value.get("cgroup_available")
+    cgroup_version = value.get("cgroup_version")
+    cgroup_path = value.get("cgroup_path")
+    cgroup_measurement = value.get("cgroup_measurement")
+    unavailable_reason = value.get("cgroup_unavailable_reason")
+    current = value.get("cgroup_current_bytes")
+    peak = value.get("cgroup_peak_bytes")
+    limit = value.get("cgroup_limit_bytes")
+    unbounded = value.get("cgroup_limit_unbounded")
+    for label, item in (
+        ("cgroup current bytes", current),
+        ("cgroup peak bytes", peak),
+        ("cgroup limit bytes", limit),
+    ):
+        if item is not None:
+            _integer(item, label, minimum=0 if label != "cgroup limit bytes" else 1)
+
+    valid_cgroup_version = (
+        isinstance(cgroup_version, int)
+        and not isinstance(cgroup_version, bool)
+        and cgroup_version in {1, 2}
+    )
+    expected_measurement = (
+        f"linux-cgroup-v{cgroup_version}-memory-files"
+        if valid_cgroup_version
+        else None
+    )
+    cgroup_identity_valid = (
+        valid_cgroup_version
+        and isinstance(cgroup_path, str)
+        and cgroup_path.startswith("/")
+        and "\x00" not in cgroup_path
+        and ".." not in PurePosixPath(cgroup_path).parts
+        and PurePosixPath(cgroup_path).as_posix() == cgroup_path
+    )
+    cgroup_complete = (
+        cgroup_identity_valid
+        and cgroup_measurement == expected_measurement
+        and unavailable_reason is None
+        and current is not None
+        and peak is not None
+        and (unbounded is True or limit is not None)
+        and not (unbounded is True and limit is not None)
+    )
+    unavailable_valid = (
+        cgroup_available is False
+        and cgroup_measurement
+        in {"unavailable-on-platform", "unavailable-or-incomplete"}
+        and isinstance(unavailable_reason, str)
+        and bool(unavailable_reason)
+        and unbounded is False
+        and (
+            (cgroup_version is None and cgroup_path is None)
+            or cgroup_identity_valid
+        )
+    )
+    expected_child_within = rss_count == logical_children and rss_sum <= parent_request
+    expected_peak_within = bool(
+        cgroup_complete
+        and unbounded is False
+        and limit is not None
+        and peak is not None
+        and peak <= limit
+    )
+    expected_limit_covers = bool(
+        cgroup_complete
+        and unbounded is False
+        and limit is not None
+        and limit >= parent_request
+    )
+    expected_safety = bool(
+        expected_child_within and expected_peak_within and expected_limit_covers
+    )
+    if (
+        set(value) != required
+        or value.get("schema_version") != PARENT_MEMORY_EVIDENCE_SCHEMA
+        or value.get("protocol_version") != PROTOCOL_VERSION
+        or not isinstance(value.get("task_id"), str)
+        or not value.get("task_id")
+        or not _is_sha256(value.get("manifest_sha256"))
+        or not _is_sha256(value.get("task_status_sha256"))
+        or logical_children not in OPERATIONAL_BATCH_LENGTHS
+        or child_request != CHILD_MEMORY_MB * 1024**2
+        or parent_request != logical_children * child_request
+        or not 0 <= rss_count <= logical_children
+        or (rss_count == 0 and (rss_sum != 0 or rss_max is not None))
+        or (rss_count > 0 and (rss_max is None or rss_max > rss_sum))
+        or not _is_sha256(value.get("child_peak_rss_observations_sha256"))
+        or not isinstance(cgroup_available, bool)
+        or not isinstance(unbounded, bool)
+        or (cgroup_available is True and not cgroup_complete)
+        or (cgroup_available is False and not unavailable_valid)
+        or (current is not None and peak is not None and peak < current)
+        or value.get("total_child_peak_rss_within_parent_request")
+        is not expected_child_within
+        or value.get("cgroup_peak_within_limit") is not expected_peak_within
+        or value.get("cgroup_limit_covers_parent_request")
+        is not expected_limit_covers
+        or value.get("safety_passed") is not expected_safety
+        or value.get("fea_submission_performed") is not False
+        or value.get("aedt_used") is not False
+        or value.get("evidence_sha256") != phase_a.canonical_sha256(unsigned)
+    ):
+        raise RuntimeError("Phase B parent memory evidence seal mismatch")
+    return copy.deepcopy(dict(value))
 
 
 def validate_child_resource_telemetry(

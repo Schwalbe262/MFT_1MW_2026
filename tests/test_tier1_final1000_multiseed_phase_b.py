@@ -94,6 +94,9 @@ status = {
     "terminal": True,
     "phase": "terminal",
     "phase_b_test_cpuset": os.environ["MFT_FINAL1000_PHASE_B_CHILD_CPUSET"],
+    "observed_peak_rss_bytes": int(
+        os.environ.get("PHASE_B_TEST_OBSERVED_PEAK_RSS_BYTES", str(1024**3))
+    ),
 }
 child_wall = max(0.0, time.monotonic() - wall_started)
 child_cpu = max(0.0, time.process_time() - cpu_started)
@@ -231,6 +234,162 @@ def _run(
         monotonic=monotonic,
         available_cpus=range(int(task["cpus"])),
     )
+
+
+def _bounded_cgroup_snapshot(*, limit_bytes: int) -> dict[str, Any]:
+    return {
+        "cgroup_available": True,
+        "cgroup_version": 2,
+        "cgroup_path": "/slurm/job-test/step-test",
+        "cgroup_measurement": "linux-cgroup-v2-memory-files",
+        "cgroup_unavailable_reason": None,
+        "cgroup_current_bytes": 2 * 1024**3,
+        "cgroup_peak_bytes": 8 * 1024**3,
+        "cgroup_limit_bytes": limit_bytes,
+        "cgroup_limit_unbounded": False,
+    }
+
+
+def test_parent_memory_contract_is_sealed_and_unavailable_or_unbounded_fails_closed():
+    children = [{"ordinal": 0, "seed": 101}, {"ordinal": 1, "seed": 102}]
+    finished = {
+        0: {"legacy": {"observed_peak_rss_bytes": 3 * 1024**3}},
+        1: {"legacy": {"observed_peak_rss_bytes": 4 * 1024**3}},
+    }
+    parent_request = 2 * contract.CHILD_MEMORY_MB * 1024**2
+    bounded = runner._build_parent_memory_evidence(
+        task_id="99001",
+        manifest_sha256="a" * 64,
+        terminal_status={"status_sha256": "b" * 64},
+        children=children,
+        finished=finished,
+        cgroup_memory=_bounded_cgroup_snapshot(limit_bytes=parent_request),
+    )
+    assert contract.validate_parent_memory_evidence(bounded) == bounded
+    assert bounded["child_requested_memory_bytes"] == 28 * 1024**3
+    assert bounded["parent_requested_memory_bytes"] == parent_request
+    assert bounded["child_peak_rss_available_count"] == 2
+    assert bounded["child_peak_rss_sum_bytes"] == 7 * 1024**3
+    assert bounded["child_peak_rss_max_bytes"] == 4 * 1024**3
+    assert bounded["total_child_peak_rss_within_parent_request"] is True
+    assert bounded["cgroup_peak_within_limit"] is True
+    assert bounded["cgroup_limit_covers_parent_request"] is True
+    assert bounded["safety_passed"] is True
+
+    bad_gate = {
+        key: value for key, value in bounded.items() if key != "evidence_sha256"
+    }
+    bad_gate["safety_passed"] = False
+    with pytest.raises(RuntimeError, match="parent memory evidence"):
+        contract.seal_parent_memory_evidence(bad_gate)
+
+    unbounded_snapshot = _bounded_cgroup_snapshot(limit_bytes=parent_request)
+    unbounded_snapshot.update(
+        cgroup_limit_bytes=None,
+        cgroup_limit_unbounded=True,
+    )
+    unbounded = runner._build_parent_memory_evidence(
+        task_id="99001",
+        manifest_sha256="a" * 64,
+        terminal_status={"status_sha256": "b" * 64},
+        children=children,
+        finished=finished,
+        cgroup_memory=unbounded_snapshot,
+    )
+    assert contract.validate_parent_memory_evidence(unbounded) == unbounded
+    assert unbounded["cgroup_available"] is True
+    assert unbounded["cgroup_limit_unbounded"] is True
+    assert unbounded["cgroup_peak_within_limit"] is False
+    assert unbounded["cgroup_limit_covers_parent_request"] is False
+    assert unbounded["safety_passed"] is False
+
+    unavailable = runner._build_parent_memory_evidence(
+        task_id="99001",
+        manifest_sha256="a" * 64,
+        terminal_status={"status_sha256": "b" * 64},
+        children=children,
+        finished=finished,
+        cgroup_memory=runner._unavailable_cgroup_memory("non-linux-platform"),
+    )
+    assert contract.validate_parent_memory_evidence(unavailable) == unavailable
+    assert unavailable["cgroup_available"] is False
+    assert unavailable["safety_passed"] is False
+
+    incomplete_children = runner._build_parent_memory_evidence(
+        task_id="99001",
+        manifest_sha256="a" * 64,
+        terminal_status={"status_sha256": "b" * 64},
+        children=children,
+        finished={0: finished[0]},
+        cgroup_memory=_bounded_cgroup_snapshot(limit_bytes=parent_request),
+    )
+    assert incomplete_children["child_peak_rss_available_count"] == 1
+    assert incomplete_children[
+        "total_child_peak_rss_within_parent_request"
+    ] is False
+    assert incomplete_children["safety_passed"] is False
+
+
+def test_linux_cgroup_v2_and_v1_memory_files_are_collected_safely(tmp_path: Path):
+    proc = tmp_path / "self.cgroup"
+    cgroup_root = tmp_path / "cgroup"
+    v2 = cgroup_root / "slurm" / "job-1"
+    v2.mkdir(parents=True)
+    proc.write_text("0::/slurm/job-1\n", encoding="ascii")
+    (v2 / "memory.current").write_text("100\n", encoding="ascii")
+    (v2 / "memory.peak").write_text("250\n", encoding="ascii")
+    (v2 / "memory.max").write_text("500\n", encoding="ascii")
+    assert runner._collect_parent_cgroup_memory(
+        platform_name="linux",
+        proc_self_cgroup=proc,
+        cgroup_root=cgroup_root,
+    ) == {
+        "cgroup_available": True,
+        "cgroup_version": 2,
+        "cgroup_path": "/slurm/job-1",
+        "cgroup_measurement": "linux-cgroup-v2-memory-files",
+        "cgroup_unavailable_reason": None,
+        "cgroup_current_bytes": 100,
+        "cgroup_peak_bytes": 250,
+        "cgroup_limit_bytes": 500,
+        "cgroup_limit_unbounded": False,
+    }
+    (v2 / "memory.max").write_text("max\n", encoding="ascii")
+    unbounded = runner._collect_parent_cgroup_memory(
+        platform_name="linux",
+        proc_self_cgroup=proc,
+        cgroup_root=cgroup_root,
+    )
+    assert unbounded["cgroup_available"] is True
+    assert unbounded["cgroup_limit_bytes"] is None
+    assert unbounded["cgroup_limit_unbounded"] is True
+
+    v1 = cgroup_root / "memory" / "slurm" / "job-2"
+    v1.mkdir(parents=True)
+    proc.write_text("7:cpu:/slurm/job-2\n9:memory:/slurm/job-2\n", encoding="ascii")
+    (v1 / "memory.usage_in_bytes").write_text("125\n", encoding="ascii")
+    (v1 / "memory.max_usage_in_bytes").write_text("275\n", encoding="ascii")
+    (v1 / "memory.limit_in_bytes").write_text("550\n", encoding="ascii")
+    v1_evidence = runner._collect_parent_cgroup_memory(
+        platform_name="linux",
+        proc_self_cgroup=proc,
+        cgroup_root=cgroup_root,
+    )
+    assert v1_evidence["cgroup_available"] is True
+    assert v1_evidence["cgroup_version"] == 1
+    assert v1_evidence["cgroup_path"] == "/slurm/job-2"
+    assert v1_evidence["cgroup_current_bytes"] == 125
+    assert v1_evidence["cgroup_peak_bytes"] == 275
+    assert v1_evidence["cgroup_limit_bytes"] == 550
+
+    proc.write_text("0::/../../escape\n", encoding="ascii")
+    escaped = runner._collect_parent_cgroup_memory(
+        platform_name="linux",
+        proc_self_cgroup=proc,
+        cgroup_root=cgroup_root,
+    )
+    assert escaped["cgroup_available"] is False
+    assert escaped["cgroup_path"] is None
 
 
 def test_exact_variable_parent_envelopes_and_deterministic_seals():
@@ -999,6 +1158,12 @@ def test_real_four_child_concurrency_isolated_journals_and_prefix_receipts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     bundle, payload_root, payload_path, task = _prepare(tmp_path, monkeypatch)
+    parent_memory_bytes = int(task["memory_mb"]) * 1024**2
+    monkeypatch.setattr(
+        runner,
+        "_collect_parent_cgroup_memory",
+        lambda: _bounded_cgroup_snapshot(limit_bytes=parent_memory_bytes),
+    )
     monkeypatch.setenv("PHASE_B_TEST_SLEEP", "0.35")
     shared_sentinel = tmp_path / "shared-tmp-sentinel"
     shared_sentinel.write_text("must survive", encoding="ascii")
@@ -1068,6 +1233,38 @@ def test_real_four_child_concurrency_isolated_journals_and_prefix_receipts(
     assert status["sealed_child_count"] == 4
     assert status["physical_scheduler_task_count"] == 1
     assert status["virtual_scheduler_task_ids_created"] is False
+    memory_path = run_root / contract.PARENT_MEMORY_EVIDENCE_FILENAME
+    memory_evidence = contract.validate_parent_memory_evidence(
+        json.loads(memory_path.read_text(encoding="utf-8"))
+    )
+    observations = [
+        {
+            "ordinal": receipt["ordinal"],
+            "seed": receipt["seed"],
+            "legacy_status_sha256": receipt["legacy_status_sha256"],
+            "observed_peak_rss_bytes": receipt["legacy_status"][
+                "observed_peak_rss_bytes"
+            ],
+        }
+        for receipt in receipts
+    ]
+    assert memory_evidence["task_id"] == "99400"
+    assert memory_evidence["manifest_sha256"] == json.loads(
+        (run_root / "batch_manifest.json").read_text(encoding="utf-8")
+    )["manifest_sha256"]
+    assert memory_evidence["task_status_sha256"] == status["status_sha256"]
+    assert memory_evidence["logical_child_count"] == 4
+    assert memory_evidence["parent_requested_memory_bytes"] == parent_memory_bytes
+    assert memory_evidence["child_peak_rss_available_count"] == 4
+    assert memory_evidence["child_peak_rss_sum_bytes"] == 4 * 1024**3
+    assert memory_evidence["child_peak_rss_max_bytes"] == 1024**3
+    assert memory_evidence["child_peak_rss_observations_sha256"] == (
+        phase_a.canonical_sha256(observations)
+    )
+    assert memory_evidence["safety_passed"] is True
+    assert memory_evidence["fea_submission_performed"] is False
+    assert memory_evidence["aedt_used"] is False
+    assert not list(run_root.glob(f".{memory_path.name}*.tmp"))
     telemetry = status["resource_telemetry"]
     assert telemetry["parent_requested_cpus"] == 16
     assert telemetry["logical_child_cpus"] == 4
