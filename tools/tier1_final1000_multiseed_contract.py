@@ -195,7 +195,9 @@ def _phase_a_child_task(task: Mapping[str, Any]) -> dict[str, Any]:
     legacy = validate_task(task)
     transformed = copy.deepcopy(legacy)
     payload = transformed["payload_json"]
-    scheduler_cpus = _integer(transformed.get("cpus"), "child Scheduler CPUs", minimum=1)
+    scheduler_cpus = _integer(
+        transformed.get("cpus"), "child Scheduler CPUs", minimum=1
+    )
     payload["scheduler_cpus"] = scheduler_cpus
     payload["inference_threads"] = scheduler_cpus
     payload_sha = canonical_sha256(payload)

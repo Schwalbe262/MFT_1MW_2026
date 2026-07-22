@@ -15,6 +15,7 @@ import pytest
 from tools import tier1_corrected_current7_slurm_bundle as bundle
 from tools import tier1_corrected_current7_slurm_publish as publisher
 from tools import tier1_final1000_delta_publish as delta
+from tools import tier1_final1000_multiseed_publish as multiseed_publish
 from tools import tier1_final1000_multiseed_release as multiseed_release
 from tools.tier1_corrected_current7_receipt import canonical_sha256
 
@@ -773,3 +774,266 @@ def test_cli_exposes_explicit_plan_and_dry_run_publish_surface():
     )
     assert publish_help.returncode == 0
     assert "--apply" in publish_help.stdout
+
+
+def _multiseed_publication_fixture(tmp_path: Path) -> dict[str, Any]:
+    release_root = tmp_path / "authenticated-release"
+    fixture = _fixture(release_root)
+    candidate_plan, candidate_manifest, candidate_sources = publisher.load_bundle_plan(
+        fixture["candidate_plan_path"]
+    )
+    checkout_revision = "1" * 40
+    preparation_root = tmp_path / "prepared-four-stage"
+    stage_receipts: dict[str, Any] = {}
+    gate_rows = []
+    for stage_id in sorted(multiseed_publish.EXPECTED_STAGE_IDS):
+        stage_root = preparation_root / stage_id
+        candidate_path, _ = _standard_plan(
+            stage_root / "candidate",
+            candidate_manifest,
+            candidate_sources,
+            remote_root=candidate_plan["remote_root"],
+        )
+        planned, planned_manifest, delta_receipt = delta.create_delta_plan(
+            candidate_path,
+            fixture["parent_plan_path"],
+            fixture["parent_publication_path"],
+            stage_root / "delta",
+            identity=fixture["identity"],
+        )
+        delta_plan_path = Path(planned["bundle_manifest"]).with_name(
+            "offload_plan.json"
+        )
+        unsigned_stage = {
+            "schema_version": multiseed_release.RELEASE_PREPARATION_SCHEMA,
+            "checkout": {
+                "revision": checkout_revision,
+                "clean": True,
+                "science_base_revision": multiseed_release.SCIENCE_BASE_REVISION,
+            },
+            "parent_identity": fixture["identity"].__dict__,
+            "candidate_plan": str(candidate_path.resolve()),
+            "candidate_bundle_id": candidate_manifest["bundle_id"],
+            "candidate_contract_sha256": candidate_manifest["contract_sha256"],
+            "delta_plan": str(delta_plan_path.resolve()),
+            "delta_bundle_id": planned["bundle_id"],
+            "delta_contract_sha256": planned_manifest["contract_sha256"],
+            "delta_plan_receipt_sha256": delta_receipt["receipt_sha256"],
+            "transitive_import_closure": [],
+            "isolated_import_smoke": {"isolated": True, "passed": True},
+            "ready_reused": False,
+            "remote_write_performed": False,
+            "scheduler_submission_performed": False,
+        }
+        stage_receipt = {
+            **unsigned_stage,
+            "receipt_sha256": canonical_sha256(unsigned_stage),
+        }
+        _write_json(stage_root / "release_preparation_receipt.json", stage_receipt)
+        stage_receipts[stage_id] = stage_receipt
+        parent = fixture["identity"]
+        gate_rows.append(
+            {
+                "stage_id": stage_id,
+                "bundle_id": parent.bundle_id,
+                "contract_sha256": parent.contract_sha256,
+                "manifest_file_sha256": parent.manifest_sha256,
+                "plan_file_sha256": parent.plan_sha256,
+                "source_map_file_sha256": parent.source_map_sha256,
+                "remote_bundle": parent.remote_bundle,
+                "plan_path": str(fixture["parent_plan_path"].resolve()),
+                "publication": {
+                    "pass2": {
+                        "receipt_path": str(
+                            fixture["parent_publication_path"].resolve()
+                        ),
+                        "receipt_file_sha256": parent.publication_file_sha256,
+                        "receipt_sha256": fixture["parent_publication"][
+                            "receipt_sha256"
+                        ],
+                        "already_ready": True,
+                        "remote_write_performed": False,
+                    }
+                },
+            }
+        )
+    gate_unsigned = {
+        "schema_version": multiseed_publish.REMOTE_GATE_SCHEMA,
+        "source_revision": multiseed_publish.REMOTE_GATE_SOURCE_REVISION,
+        "status": multiseed_publish.REMOTE_GATE_STATUS,
+        "stages": gate_rows,
+        "all_family_thread_bindings_authenticated": True,
+        "all_manifest_files_full_sha_verified_twice_independently": True,
+        "all_pass2_already_ready_without_remote_write": True,
+        "all_permissions_and_runtime_packages_verified": True,
+        "all_ready_written_last": True,
+        "all_remote_relocations_authenticated": True,
+        "final_warm_handoff_authenticated": True,
+        "aedt_count": 0,
+        "fea_count": 0,
+        "controller_mutation_count": 0,
+        "scheduler_post_count": 0,
+        "scheduler_cancel_count": 0,
+        "scheduler_preempt_count": 0,
+    }
+    gate = {**gate_unsigned, "evidence_sha256": canonical_sha256(gate_unsigned)}
+    gate_path = release_root / "evidence" / "remote_release_gate.json"
+    _write_json(gate_path, gate)
+    unsigned_preparation = {
+        "schema_version": multiseed_release.MULTISTAGE_PREPARATION_SCHEMA,
+        "parent_release_gate_path": str(gate_path.resolve()),
+        "parent_release_gate_file_sha256": bundle.sha256_file(gate_path),
+        "parent_release_gate_evidence_sha256": gate["evidence_sha256"],
+        "stages": stage_receipts,
+        "stage_count": 4,
+        "ready_reused": False,
+        "remote_write_performed": False,
+        "scheduler_submission_performed": False,
+    }
+    preparation = {
+        **unsigned_preparation,
+        "receipt_sha256": canonical_sha256(unsigned_preparation),
+    }
+    preparation_path = preparation_root / "release_preparation_receipt.json"
+    _write_json(preparation_path, preparation)
+    return {
+        "path": preparation_path,
+        "root": preparation_root,
+        "gate_path": gate_path,
+        "revision": checkout_revision,
+        "fixture": fixture,
+    }
+
+
+def test_multiseed_publication_uses_authenticated_dynamic_parent_and_dry_run_write0(
+    tmp_path: Path,
+):
+    prepared = _multiseed_publication_fixture(tmp_path)
+    authenticated = multiseed_publish.authenticate_multiseed_stage(
+        prepared["path"],
+        stage_id="entry-1200-t125",
+        expected_checkout_revision=prepared["revision"],
+    )
+    assert authenticated.parent_identity == prepared["fixture"]["identity"]
+    assert authenticated.parent_identity != delta.PRODUCTION_PARENT
+
+    output = multiseed_publish.publish_authenticated_stage(authenticated)
+    assert output["apply"] is False
+    assert output["remote_write_performed"] is False
+    assert output["publication"]["remote_write_performed"] is False
+    assert output["parent_identity"] == prepared["fixture"]["identity"].__dict__
+    assert output["receipt_sha256"] == canonical_sha256(
+        {key: value for key, value in output.items() if key != "receipt_sha256"}
+    )
+
+
+def test_multiseed_publication_rejects_seal_path_stage_parent_and_ready_tamper(
+    tmp_path: Path,
+):
+    prepared = _multiseed_publication_fixture(tmp_path)
+    path = prepared["path"]
+    original_top = path.read_bytes()
+    top = json.loads(original_top)
+    top["stage_count"] = 3
+    _write_json(path, top)
+    with pytest.raises(RuntimeError, match="four-stage preparation seal mismatch"):
+        multiseed_publish.authenticate_multiseed_stage(
+            path,
+            stage_id="entry-1200-t125",
+            expected_checkout_revision=prepared["revision"],
+        )
+    path.write_bytes(original_top)
+
+    with pytest.raises(RuntimeError, match="unknown Final1000"):
+        multiseed_publish.authenticate_multiseed_stage(
+            path,
+            stage_id="not-a-stage",
+            expected_checkout_revision=prepared["revision"],
+        )
+
+    stage_id = "entry-1200-t125"
+    stage_path = prepared["root"] / stage_id / "release_preparation_receipt.json"
+    original_stage = stage_path.read_bytes()
+    stage = json.loads(original_stage)
+    stage["delta_plan"] = str(prepared["fixture"]["parent_plan_path"].resolve())
+    stage_unsigned = {
+        key: value for key, value in stage.items() if key != "receipt_sha256"
+    }
+    stage["receipt_sha256"] = canonical_sha256(stage_unsigned)
+    _write_json(stage_path, stage)
+    top = json.loads(original_top)
+    top["stages"][stage_id] = stage
+    top_unsigned = {key: value for key, value in top.items() if key != "receipt_sha256"}
+    top["receipt_sha256"] = canonical_sha256(top_unsigned)
+    _write_json(path, top)
+    with pytest.raises(RuntimeError, match="delta plan escaped"):
+        multiseed_publish.authenticate_multiseed_stage(
+            path,
+            stage_id=stage_id,
+            expected_checkout_revision=prepared["revision"],
+        )
+    stage_path.write_bytes(original_stage)
+    path.write_bytes(original_top)
+
+    stage = json.loads(original_stage)
+    stage["parent_identity"]["bundle_id"] = "current7-tampered-parent"
+    stage_unsigned = {
+        key: value for key, value in stage.items() if key != "receipt_sha256"
+    }
+    stage["receipt_sha256"] = canonical_sha256(stage_unsigned)
+    _write_json(stage_path, stage)
+    top = json.loads(original_top)
+    top["stages"][stage_id] = stage
+    top_unsigned = {key: value for key, value in top.items() if key != "receipt_sha256"}
+    top["receipt_sha256"] = canonical_sha256(top_unsigned)
+    _write_json(path, top)
+    with pytest.raises(RuntimeError, match="dynamic parent identity"):
+        multiseed_publish.authenticate_multiseed_stage(
+            path,
+            stage_id=stage_id,
+            expected_checkout_revision=prepared["revision"],
+        )
+    stage_path.write_bytes(original_stage)
+    path.write_bytes(original_top)
+
+    delta_receipt_path = Path(json.loads(original_stage)["delta_plan"]).with_name(
+        "delta_plan_receipt.json"
+    )
+    original_delta_receipt = delta_receipt_path.read_bytes()
+    delta_receipt = json.loads(original_delta_receipt)
+    delta_receipt["delta_byte_count"] += 1
+    _write_json(delta_receipt_path, delta_receipt)
+    with pytest.raises(RuntimeError, match="delta plan receipt seal mismatch"):
+        multiseed_publish.authenticate_multiseed_stage(
+            path,
+            stage_id=stage_id,
+            expected_checkout_revision=prepared["revision"],
+        )
+    delta_receipt_path.write_bytes(original_delta_receipt)
+
+    ready_path = prepared["root"] / stage_id / "READY.json"
+    ready_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="reuse READY"):
+        multiseed_publish.authenticate_multiseed_stage(
+            path,
+            stage_id=stage_id,
+            expected_checkout_revision=prepared["revision"],
+        )
+
+
+def test_multiseed_publication_cli_is_dry_run_default_and_apply_receipt_explicit():
+    process = subprocess.run(
+        [
+            sys.executable,
+            "tools/tier1_final1000_multiseed_publish.py",
+            "--help",
+        ],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert process.returncode == 0
+    assert "--expected-checkout-revision" in process.stdout
+    assert "--apply" in process.stdout
+    assert "--receipt-out" in process.stdout

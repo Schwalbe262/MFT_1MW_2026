@@ -55,8 +55,50 @@ isolated `python -I` import smoke, and seals deterministic candidate/delta
 plans. READY is never copied, generated, or reused. Preparation itself has no
 remote transport and no Scheduler client.
 
-Do not run preparation against the real release root, publish its output, or
-submit its tasks until a separate release authorization is given.
+Do not submit tasks until a separate release authorization is given. Bundle
+publication is a distinct, explicit operation: the generic delta CLI is not a
+valid publication surface for this release because its production guard is
+pinned to the older single Current7 parent.
+
+### Authenticated publication commands
+
+The multi-seed publisher authenticates the sealed four-stage preparation,
+the exact 30811ea remote gate and its file/evidence hashes, all four stage
+receipt files, the clean checkout revision, canonical contained candidate and
+delta paths, each exact delta-plan receipt, and each stage's dynamically
+derived parent identity. It always passes that dynamic identity to the
+hardened delta publisher. It never calls the delta publisher with an
+unconstrained parent.
+
+The prepared 77a9d485 release can be revalidated with four remote-write-free
+dry runs using these exact PowerShell commands. No Scheduler transport is
+constructed in dry-run mode:
+
+```powershell
+$Preparation = 'C:\Users\peets\slurm_scheduler_runtime\mft_tier1_final_goal_1000_t100_resmax20_260721\multiseed_release_77a9d485_260722\release_preparation_receipt.json'
+$Revision = '77a9d485fd81b5405b837a04cc003f0e37e13a32'
+$Stages = @('entry-1200-t125', 'bridge-1150-t115', 'close-1075-t107p5', 'final-1000-t100')
+foreach ($Stage in $Stages) {
+    python tools\tier1_final1000_multiseed_publish.py --preparation-receipt $Preparation --stage $Stage --expected-checkout-revision $Revision
+}
+```
+
+After an independent release authorization, publication itself requires both
+`--apply` and a new explicit receipt path. An existing receipt path is refused.
+This loop publishes exactly those four prepared deltas and performs no task
+submission, controller stop, AEDT, or FEA action:
+
+```powershell
+$ReceiptRoot = 'C:\Users\peets\slurm_scheduler_runtime\mft_tier1_final_goal_1000_t100_resmax20_260721\multiseed_release_77a9d485_260722\publication_receipts'
+foreach ($Stage in $Stages) {
+    python tools\tier1_final1000_multiseed_publish.py --preparation-receipt $Preparation --stage $Stage --expected-checkout-revision $Revision --apply --receipt-out "$ReceiptRoot\$Stage.json"
+}
+```
+
+The apply path uses the same bounded/batched `SSHDeltaTransport` and Scheduler
+account loader as the hardened delta publisher. READY is written only by that
+publisher after complete remote authentication; no READY file may exist in
+the local preparation tree.
 
 ## Required rollout gates
 

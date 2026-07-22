@@ -320,9 +320,7 @@ def upgrade_v1_state(
     source_templates = _task_templates(validated_source_plan)
     for entry in v1_state["entries"]:
         origin = str(entry.get("origin") or "successor")
-        policy_id = str(
-            entry.get("resource_policy_id") or SUCCESSOR_RESOURCE_POLICY_ID
-        )
+        policy_id = str(entry.get("resource_policy_id") or SUCCESSOR_RESOURCE_POLICY_ID)
         source_cohort_id: str | None = None
         if chained_catalog:
             source_cohort_id = str(entry.get("harvest_cohort_id") or "")
@@ -355,9 +353,7 @@ def upgrade_v1_state(
                 source_launch_plan_sha256=source_plan_sha,
                 source_resource_policy_id=policy_id,
                 source_harvest_cohort_id=source_cohort_id,
-                source_fixed_generations=int(
-                    task["payload_json"]["max_generations"]
-                ),
+                source_fixed_generations=int(task["payload_json"]["max_generations"]),
             )
         )
     unsigned = {
@@ -366,9 +362,7 @@ def upgrade_v1_state(
         "revision": 0,
         "parent_state_sha256": None,
         "stop_requested": (
-            False
-            if clear_stop_for_successor
-            else bool(v1_state.get("stop_requested"))
+            False if clear_stop_for_successor else bool(v1_state.get("stop_requested"))
         ),
         "batch_length": int(batch_length),
         "physical_active_target": TOTAL_ACTIVE_QUOTA,
@@ -567,9 +561,7 @@ def validate_state(value: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[st
                     or entry.get("source_fixed_generations") not in {200, 300}
                     or (
                         entry.get("source_harvest_cohort_id") is not None
-                        and not isinstance(
-                            entry.get("source_harvest_cohort_id"), str
-                        )
+                        and not isinstance(entry.get("source_harvest_cohort_id"), str)
                     )
                 )
             )
