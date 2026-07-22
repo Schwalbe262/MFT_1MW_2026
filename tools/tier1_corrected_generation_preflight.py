@@ -6848,6 +6848,33 @@ def validate_search_thread_contract(
     return runtime_threads
 
 
+def select_remote_warm_preflight_filter(
+    warm_role_preflight: Mapping[str, Any],
+    *,
+    topology_niche_enabled: bool,
+) -> Mapping[str, Any]:
+    """Select the authenticated filter evidence for the active warm role.
+
+    Topology-niche warm pools are structural coordinate donors by design and
+    therefore do not carry the ordinary hard-feasible filter field.  Keep the
+    selection explicit and fail closed on a role/schema mismatch so the remote
+    preflight cannot silently attest the wrong warm-pool semantics.
+    """
+
+    if topology_niche_enabled:
+        expected_schema = "mft-tier1-authenticated-topology-niche-warm-audit-v1"
+        filter_key = "structural_geometry_filter"
+    else:
+        expected_schema = "mft-tier1-authenticated-warm-role-audit-v1"
+        filter_key = "standard_hard_geometry_filter"
+    if warm_role_preflight.get("schema_version") != expected_schema:
+        raise RuntimeError("remote warm preflight role/schema mismatch")
+    evidence = warm_role_preflight.get(filter_key)
+    if not isinstance(evidence, Mapping) or not evidence:
+        raise RuntimeError("remote warm preflight filter evidence is missing")
+    return evidence
+
+
 def run_search_seed(
     *,
     bundle_root: Path,
@@ -7099,6 +7126,10 @@ def run_search_seed(
         and len(structural_donors) < 1
     ):
         raise RuntimeError("remote warm preflight has no structural basin donor")
+    warm_preflight_filter = select_remote_warm_preflight_filter(
+        warm_role_preflight,
+        topology_niche_enabled=topology_niche_enabled,
+    )
     stress_evaluation = runner.evaluate_coordinates(filtered_warm[:1])
     if not bool(stress_evaluation["decoder_valid"][0]):
         raise RuntimeError("remote SemLock stress coordinate did not decode")
@@ -7232,9 +7263,7 @@ def run_search_seed(
             "initial_population_repair_evidence": initial,
             "warm_handoff_authentication": warm_handoff,
             "warm_preflight_repair": warm_role_preflight["repair"],
-            "warm_preflight_filter": warm_role_preflight[
-                "standard_hard_geometry_filter"
-            ],
+            "warm_preflight_filter": warm_preflight_filter,
             "warm_role_preflight": warm_role_preflight,
             "pre_optimization_evidence": dict(pre_optimization),
             "repair_installation": repair_installation,

@@ -13,6 +13,7 @@ from tools.tier1_corrected_generation_preflight import (
     build_topology_niche_initial_population,
     create_deep_topology_components,
     install_optimizer_scaling,
+    select_remote_warm_preflight_filter,
     validate_topology_niche_warm_partition,
 )
 from tools.tier1_deep_crossover_contract import topology_evolution_contract
@@ -202,6 +203,41 @@ def test_topology_warm_preflight_preserves_exact_partition_before_dedupe():
     assert audit["topology_counts"] == {
         str(key): value for key, value in niche.WARM_TOPOLOGY_COUNTS.items()
     }
+
+
+def test_remote_topology_preflight_selects_structural_filter_evidence():
+    evidence = {
+        "schema_version": "mft-tier1-authenticated-topology-niche-warm-audit-v1",
+        "structural_geometry_filter": {
+            "structurally_accepted_count": 160,
+            "decoded_unique_count": 52,
+        },
+    }
+
+    assert select_remote_warm_preflight_filter(
+        evidence, topology_niche_enabled=True
+    ) == evidence["structural_geometry_filter"]
+    with pytest.raises(RuntimeError, match="role/schema mismatch"):
+        select_remote_warm_preflight_filter(
+            evidence, topology_niche_enabled=False
+        )
+
+
+def test_remote_standard_preflight_still_requires_hard_filter_evidence():
+    evidence = {
+        "schema_version": "mft-tier1-authenticated-warm-role-audit-v1",
+        "standard_hard_geometry_filter": {"hard_feasible_count": 1},
+    }
+
+    assert select_remote_warm_preflight_filter(
+        evidence, topology_niche_enabled=False
+    ) == evidence["standard_hard_geometry_filter"]
+    forged = dict(evidence)
+    forged.pop("standard_hard_geometry_filter")
+    with pytest.raises(RuntimeError, match="filter evidence is missing"):
+        select_remote_warm_preflight_filter(
+            forged, topology_niche_enabled=False
+        )
 
 
 def test_survival_preserves_exact_counts_every_generation_and_never_mutates_G():
