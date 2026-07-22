@@ -113,6 +113,8 @@ SUPERVISOR_STOP_SCHEMA = "mft-tier1-final1000-multiseed-supervisor-stop-v1"
 GATE_LANES_PER_STAGE = 1
 NAMESPACE_PREFIX = "mft-t1fg-"
 DEDUPE_PREFIX = "mft-tier1-final1000:"
+GATE_GET_ATTEMPTS = 7
+GATE_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
 class Scheduler(Protocol):
@@ -659,13 +661,15 @@ class SchedulerGateReader:
         base_url: str,
         *,
         timeout: float = 30.0,
-        get_attempts: int = 5,
+        get_attempts: int = GATE_GET_ATTEMPTS,
         get_backoff_seconds: float = 1.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = float(timeout)
         self.get_attempts = int(get_attempts)
         self.get_backoff_seconds = float(get_backoff_seconds)
+        if self.get_attempts < 1 or self.get_backoff_seconds < 0:
+            raise ValueError("Scheduler gate GET retry policy is invalid")
 
     def _json_file(self, task_id: int, relative: str) -> Mapping[str, Any] | None:
         query = urllib.parse.urlencode({"path": relative, "base": "remote_cwd"})
@@ -683,11 +687,12 @@ class SchedulerGateReader:
                 if exc.code in {404, 409}:
                     return None
                 if (
-                    exc.code not in {429, 500, 502, 503, 504}
+                    exc.code not in GATE_TRANSIENT_HTTP_STATUSES
                     or attempt + 1 >= self.get_attempts
                 ):
                     raise
-            except urllib.error.URLError:
+                exc.close()
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
                 if attempt + 1 >= self.get_attempts:
                     raise
             time.sleep(min(30.0, self.get_backoff_seconds * (2**attempt)))

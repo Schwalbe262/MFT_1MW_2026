@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from contextlib import contextmanager
 import hashlib
+import io
 import json
 from pathlib import Path
 import signal
@@ -1861,11 +1862,8 @@ def test_live_compact_api_adopts_partial_gate_and_posts_only_missing_three(
     assert len(intents) == 4
     assert scheduler.post_count == 4
     assert len(recovered["gate_lanes"]["batch1"]) == 4
-    assert {
-        lane["task_id"] for lane in recovered["gate_lanes"]["batch1"].values()
-    } == {
-        scheduler.rows[dedupe]["id"]
-        for dedupe in recovered["gate_lanes"]["batch1"]
+    assert {lane["task_id"] for lane in recovered["gate_lanes"]["batch1"].values()} == {
+        scheduler.rows[dedupe]["id"] for dedupe in recovered["gate_lanes"]["batch1"]
     }
     assert all(
         task["payload_json"]["aedt_used"] is False
@@ -1963,6 +1961,147 @@ def test_scheduler_client_retries_transient_get_but_never_blindly_retries_post(
     with pytest.raises(driver.urllib.error.URLError):
         api.post_task(contract.build_batch_task(_child_tasks(1)))
     assert calls == ["POST"]
+
+
+class _GateResponse:
+    def __init__(self, value: bytes = b'{"ready": true}'):
+        self.value = value
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self.value
+
+
+def _gate_http_error(status: int) -> driver.urllib.error.HTTPError:
+    return driver.urllib.error.HTTPError(
+        "http://scheduler/api/tasks/42/remote-file",
+        status,
+        "transient",
+        None,
+        io.BytesIO(b"transient"),
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(lambda: _gate_http_error(429), id="http-429"),
+        pytest.param(lambda: _gate_http_error(500), id="http-500"),
+        pytest.param(lambda: _gate_http_error(502), id="http-502"),
+        pytest.param(lambda: _gate_http_error(503), id="http-503"),
+        pytest.param(lambda: _gate_http_error(504), id="http-504"),
+        pytest.param(
+            lambda: driver.urllib.error.URLError("scheduler restart"),
+            id="url-error",
+        ),
+        pytest.param(lambda: TimeoutError("scheduler timeout"), id="timeout"),
+        pytest.param(
+            lambda: ConnectionError("scheduler connection reset"),
+            id="connection-error",
+        ),
+    ],
+)
+def test_scheduler_gate_reader_retries_transient_get_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    failure,
+):
+    calls: list[str] = []
+    sleeps: list[float] = []
+    outcomes = iter([failure(), _GateResponse()])
+
+    def transient(request, timeout):
+        assert timeout == 7
+        calls.append(request.get_method())
+        outcome = next(outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(driver.urllib.request, "urlopen", transient)
+    monkeypatch.setattr(driver.time, "sleep", sleeps.append)
+    reader = driver.SchedulerGateReader(
+        "http://scheduler",
+        timeout=7,
+        get_attempts=2,
+        get_backoff_seconds=0.25,
+    )
+
+    assert reader._json_file(42, "runs/task-42/task_status.json") == {"ready": True}
+    assert calls == ["GET", "GET"]
+    assert sleeps == [0.25]
+
+
+def test_scheduler_gate_reader_default_backoff_survives_six_http_429s(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def rate_limited(request, timeout):
+        assert timeout == 30
+        calls.append(request.get_method())
+        if len(calls) <= 6:
+            raise _gate_http_error(429)
+        return _GateResponse()
+
+    monkeypatch.setattr(driver.urllib.request, "urlopen", rate_limited)
+    monkeypatch.setattr(driver.time, "sleep", sleeps.append)
+    reader = driver.SchedulerGateReader("http://scheduler")
+
+    assert reader._json_file(42, "runs/task-42/task_status.json") == {"ready": True}
+    assert calls == ["GET"] * 7
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+
+
+@pytest.mark.parametrize("status", [404, 409])
+def test_scheduler_gate_reader_preserves_not_ready_status_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+):
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def not_ready(request, timeout):
+        calls.append(request.get_method())
+        raise _gate_http_error(status)
+
+    monkeypatch.setattr(driver.urllib.request, "urlopen", not_ready)
+    monkeypatch.setattr(driver.time, "sleep", sleeps.append)
+
+    assert (
+        driver.SchedulerGateReader("http://scheduler")._json_file(
+            42, "runs/task-42/task_status.json"
+        )
+        is None
+    )
+    assert calls == ["GET"]
+    assert sleeps == []
+
+
+def test_scheduler_gate_reader_does_not_retry_nontransient_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def forbidden(request, timeout):
+        calls.append(request.get_method())
+        raise _gate_http_error(403)
+
+    monkeypatch.setattr(driver.urllib.request, "urlopen", forbidden)
+    monkeypatch.setattr(driver.time, "sleep", sleeps.append)
+    reader = driver.SchedulerGateReader("http://scheduler")
+
+    with pytest.raises(driver.urllib.error.HTTPError) as raised:
+        reader._json_file(42, "runs/task-42/task_status.json")
+    assert raised.value.code == 403
+    assert calls == ["GET"]
+    assert sleeps == []
 
 
 class MemoryRemote:
