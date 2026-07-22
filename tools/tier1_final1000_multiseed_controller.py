@@ -19,6 +19,8 @@ try:
         PROTOCOL_VERSION,
         batch_manifest_from_payload,
         build_batch_task,
+        scheduler_task_identity_matches,
+        scheduler_task_observation,
         validate_batch_task,
     )
     from tier1_final1000_slurm_controller import (
@@ -53,6 +55,8 @@ except ImportError:  # pragma: no cover - repository import path
         PROTOCOL_VERSION,
         batch_manifest_from_payload,
         build_batch_task,
+        scheduler_task_identity_matches,
+        scheduler_task_observation,
         validate_batch_task,
     )
     from tools.tier1_final1000_slurm_controller import (
@@ -866,20 +870,17 @@ def observe_scheduler_tasks(
             raise RuntimeError("controller-v2 scheduler observation has no unique lane")
         if scheduler_task.get("dedupe_key") != parent_dedupe_key:
             raise RuntimeError("Scheduler changed controller-v2 parent dedupe identity")
-        mapped = scheduler_state(scheduler_task.get("status"))
+        observation = scheduler_task_observation(scheduler_task)
+        if observation is None:
+            raise RuntimeError(
+                "controller-v2 Scheduler observation has an invalid id/status pair"
+            )
+        mapped = scheduler_state(observation[1])
         if mapped is None:
             raise RuntimeError("controller-v2 observed an unknown Scheduler state")
-        task_id = scheduler_task.get("id") or scheduler_task.get("task_id")
-        if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
-            raise RuntimeError("controller-v2 Scheduler observation lacks a task id")
+        task_id = observation[0]
         expected_task = _expected_task_for_entry(entry, plan)
-        observed_envelope = scheduler_task.get("task_json")
-        if (
-            not isinstance(observed_envelope, dict)
-            or set(observed_envelope) != REQUIRED_SCHEDULER_FIELDS
-            or dict(observed_envelope) != expected_task
-            or scheduler_task.get("name") != expected_task["name"]
-        ):
+        if not scheduler_task_identity_matches(scheduler_task, expected_task):
             raise RuntimeError("controller-v2 Scheduler envelope identity changed")
         if entry.get("task_id") not in (None, int(task_id)):
             raise RuntimeError("controller-v2 Scheduler task identity changed")

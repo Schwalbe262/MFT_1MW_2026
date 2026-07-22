@@ -83,6 +83,94 @@ RESOURCE_FIELDS = (
     "max_workers_per_node",
 )
 
+# The live Scheduler's compact task serializer deliberately omits the command
+# and payload_json fields from both POST and GET responses.  Every remaining
+# required envelope field is still returned verbatim and the dedupe key is a
+# cryptographic commitment to the batch manifest, ordered child payload/task
+# hashes, bundle/stage identity, and resource policy.  Keep this allowlist
+# explicit: adding a new Scheduler envelope field must fail closed until the
+# compact serializer and this contract are reviewed together.
+COMPACT_SCHEDULER_IDENTITY_FIELDS = tuple(
+    sorted(REQUIRED_SCHEDULER_FIELDS - {"command", "payload_json"})
+)
+_MISSING = object()
+SCHEDULER_TASK_STATUSES = frozenset(
+    {
+        "queued",
+        "attaching",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "timeout",
+        "timed_out",
+    }
+)
+
+
+def scheduler_task_observation(row: Mapping[str, Any]) -> tuple[int, str] | None:
+    """Return the exact live API task id/status pair or fail closed.
+
+    The deployed serializer emits both id aliases and derives ``state`` from
+    ``status`` (``completed`` becomes ``succeeded``).  Requiring that canonical
+    pair prevents a compact response from hiding an id or lifecycle mismatch.
+    """
+
+    if not isinstance(row, Mapping):
+        return None
+    task_id = row.get("id")
+    alias = row.get("task_id")
+    if (
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or isinstance(alias, bool)
+        or not isinstance(alias, int)
+        or alias != task_id
+    ):
+        return None
+    status = row.get("status")
+    if not isinstance(status, str) or status not in SCHEDULER_TASK_STATUSES:
+        return None
+    expected_state = "succeeded" if status == "completed" else status
+    if row.get("state") != expected_state:
+        return None
+    return task_id, status
+
+
+def scheduler_task_identity_matches(
+    row: Mapping[str, Any], expected: Mapping[str, Any]
+) -> bool:
+    """Authenticate a full or live compact Scheduler task representation.
+
+    A present ``task_json`` always takes the original strict path.  A null or
+    malformed full envelope is therefore rejected instead of being silently
+    downgraded.  Only an actually absent ``task_json`` may use the compact
+    path, which compares every Scheduler-visible immutable envelope field with
+    exact JSON scalar types.  Terminal batch manifests and child receipts then
+    authenticate the hidden payload before a gate can pass.
+    """
+
+    if not isinstance(row, Mapping) or set(expected) != REQUIRED_SCHEDULER_FIELDS:
+        return False
+    observed = row.get("task_json", _MISSING)
+    if observed is not _MISSING:
+        return (
+            isinstance(observed, dict)
+            and set(observed) == REQUIRED_SCHEDULER_FIELDS
+            and dict(observed) == dict(expected)
+            and row.get("name") == expected["name"]
+            and row.get("dedupe_key") == expected["dedupe_key"]
+        )
+    for field in COMPACT_SCHEDULER_IDENTITY_FIELDS:
+        if field not in row:
+            return False
+        actual = row[field]
+        wanted = expected[field]
+        if type(actual) is not type(wanted) or actual != wanted:
+            return False
+    return True
+
 
 def now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")

@@ -866,9 +866,11 @@ def test_multiseed_upgrade_observes_exact_rolling_predecessor_envelope(tmp_path)
         parent_dedupe_key=entry["parent_dedupe_key"],
         scheduler_task={
             "id": entry["task_id"],
+            "task_id": entry["task_id"],
             "name": task["name"],
             "dedupe_key": task["dedupe_key"],
             "status": "running",
+            "state": "running",
             "task_json": task,
         },
     )

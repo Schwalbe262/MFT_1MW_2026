@@ -27,6 +27,8 @@ try:
     from tier1_corrected_current7_slurm_bundle import read_json
     from tier1_final1000_multiseed_contract import (
         batch_manifest_from_payload,
+        scheduler_task_identity_matches,
+        scheduler_task_observation,
         validate_batch_manifest,
         validate_child_receipt,
         validate_task_status,
@@ -66,6 +68,8 @@ except ImportError:  # pragma: no cover - repository import path
     from tools.tier1_corrected_current7_slurm_bundle import read_json
     from tools.tier1_final1000_multiseed_contract import (
         batch_manifest_from_payload,
+        scheduler_task_identity_matches,
+        scheduler_task_observation,
         validate_batch_manifest,
         validate_child_receipt,
         validate_task_status,
@@ -720,11 +724,7 @@ class SchedulerGateReader:
 
 
 def _exact_task(row: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
-    return (
-        row.get("name") == expected["name"]
-        and row.get("dedupe_key") == expected["dedupe_key"]
-        and row.get("task_json") == expected
-    )
+    return scheduler_task_identity_matches(row, expected)
 
 
 def scheduler_inventory(
@@ -859,9 +859,10 @@ def cycle(
                 continue
             if not _exact_task(row, lane["task"]):
                 raise RuntimeError("Scheduler changed additive gate identity")
-            task_id = row.get("id") or row.get("task_id")
-            if not isinstance(task_id, int) or task_id <= 0:
+            observation = scheduler_task_observation(row)
+            if observation is None:
                 raise RuntimeError("additive gate lacks a Scheduler task id")
+            task_id, status = observation
             lane["task_id"] = task_id
             observed = {
                 "queued": "active",
@@ -872,7 +873,7 @@ def cycle(
                 "cancelled": "failed",
                 "timeout": "failed",
                 "timed_out": "failed",
-            }.get(str(row.get("status") or "").lower())
+            }.get(status)
             if observed is None:
                 raise RuntimeError("additive gate has an unknown Scheduler state")
             if observed == "failed":
@@ -1039,15 +1040,23 @@ def cycle(
     for task in intents:
         existing = inventory.get(task["dedupe_key"])
         row = existing or scheduler.post_task(task)
-        task_id = row.get("id") or row.get("task_id")
-        detail = (
-            scheduler.task_detail(int(task_id)) if isinstance(task_id, int) else None
-        )
-        sealed = detail or row
-        if not _exact_task(sealed, task):
+        observation = scheduler_task_observation(row)
+        if observation is None or not _exact_task(row, task):
             raise RuntimeError("Scheduler submission response changed the exact task")
+        task_id = observation[0]
+        detail = scheduler.task_detail(task_id)
+        detail_observation = (
+            scheduler_task_observation(detail) if detail is not None else None
+        )
+        if (
+            detail_observation is None
+            or detail_observation[0] != task_id
+            or not _exact_task(detail, task)
+        ):
+            raise RuntimeError("Scheduler task detail changed the exact task")
+        sealed = detail
         if phase in {"batch1", "batch4"}:
-            gates[phase][task["dedupe_key"]]["task_id"] = int(task_id)
+            gates[phase][task["dedupe_key"]]["task_id"] = task_id
             gates[phase][task["dedupe_key"]]["state"] = "active"
         elif controller is not None:
             controller = observe_scheduler_tasks(

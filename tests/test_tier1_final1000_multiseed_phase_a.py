@@ -275,6 +275,73 @@ def _run_lane(
     )
 
 
+def _compact_scheduler_row(
+    task: dict[str, Any], *, task_id: int = 99100, status: str = "queued"
+) -> dict[str, Any]:
+    """Mirror the flat task shape returned by the deployed Scheduler 8002."""
+
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "status": status,
+        "state": "succeeded" if status == "completed" else status,
+        **{
+            field: copy.deepcopy(task[field])
+            for field in contract.COMPACT_SCHEDULER_IDENTITY_FIELDS
+        },
+        "allocation_id": None,
+        "account_name": "",
+        "partition": "auto",
+        "queue_state": status,
+    }
+
+
+def test_live_8002_compact_identity_is_exact_and_fails_closed():
+    plan = launch.validate_launch_plan(_rendered_plan())
+    task = controller.build_reserved_gate_task(
+        plan, stage_id="entry-1200-t125", phase="batch1"
+    )
+    contract.validate_batch_task(task)
+    compact_row = _compact_scheduler_row(task)
+
+    assert "task_json" not in compact_row
+    assert "command" not in compact_row
+    assert "payload_json" not in compact_row
+    assert contract.scheduler_task_identity_matches(compact_row, task)
+
+    strict_row = {**compact_row, "task_json": copy.deepcopy(task)}
+    assert contract.scheduler_task_identity_matches(strict_row, task)
+    strict_row["task_json"]["payload_json"]["children"][0]["seed"] += 1
+    assert not contract.scheduler_task_identity_matches(strict_row, task)
+    assert not contract.scheduler_task_identity_matches(
+        {**compact_row, "task_json": None}, task
+    )
+
+    for field in contract.COMPACT_SCHEDULER_IDENTITY_FIELDS:
+        missing = copy.deepcopy(compact_row)
+        missing.pop(field)
+        assert not contract.scheduler_task_identity_matches(missing, task), field
+
+        changed = copy.deepcopy(compact_row)
+        value = changed[field]
+        changed[field] = value + 1 if isinstance(value, int) else f"{value}-changed"
+        assert not contract.scheduler_task_identity_matches(changed, task), field
+
+    type_changed = copy.deepcopy(compact_row)
+    type_changed["cpus"] = True
+    assert not contract.scheduler_task_identity_matches(type_changed, task)
+
+    for mutation in (
+        {"task_id": 99101},
+        {"id": True, "task_id": True},
+        {"status": "unknown", "state": "unknown"},
+        {"status": "completed", "state": "completed"},
+    ):
+        malformed = {**compact_row, **mutation}
+        assert contract.scheduler_task_observation(malformed) is None
+    assert contract.scheduler_task_observation(compact_row) == (99100, "queued")
+
+
 def test_batch4_contract_preserves_exact_child_identity_and_detects_tamper():
     children = _child_tasks()
     task = contract.build_batch_task(children)
@@ -671,11 +738,26 @@ def test_controller_v2_reserves_four_seeds_per_physical_gap_and_maps_timeout():
     def observed(status: str) -> dict[str, Any]:
         return {
             "id": 99100,
+            "task_id": 99100,
             "name": task["name"],
             "dedupe_key": dedupe,
             "status": status,
+            "state": "succeeded" if status == "completed" else status,
             "task_json": copy.deepcopy(task),
         }
+
+    compact_observed = controller.observe_scheduler_task(
+        state,
+        plan,
+        parent_dedupe_key=dedupe,
+        scheduler_task=_compact_scheduler_row(task, status="running"),
+    )
+    compact_entry = next(
+        entry
+        for entry in compact_observed["entries"]
+        if entry["parent_dedupe_key"] == dedupe
+    )
+    assert compact_entry["state"] == "running"
 
     with pytest.raises(RuntimeError, match="dedupe identity"):
         controller.observe_scheduler_task(
@@ -684,8 +766,10 @@ def test_controller_v2_reserves_four_seeds_per_physical_gap_and_maps_timeout():
             parent_dedupe_key=dedupe,
             scheduler_task={
                 "id": 99100,
+                "task_id": 99100,
                 "name": task["name"],
                 "status": "running",
+                "state": "running",
                 "task_json": copy.deepcopy(task),
             },
         )
@@ -891,14 +975,23 @@ class FakePhaseAScheduler:
         self.next_id = 990_000
         self.detail_reads: list[int] = []
 
+    @staticmethod
+    def _api_row(row: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(row)
+        value["task_id"] = value["id"]
+        value["state"] = (
+            "succeeded" if value["status"] == "completed" else value["status"]
+        )
+        return value
+
     def latest_10000(self):
-        return [copy.deepcopy(row) for row in self.rows.values()]
+        return [self._api_row(row) for row in self.rows.values()]
 
     def task_detail(self, task_id: int):
         self.detail_reads.append(int(task_id))
         for row in self.rows.values():
             if row["id"] == int(task_id):
-                return copy.deepcopy(row)
+                return self._api_row(row)
         return None
 
     def post_task(self, task):
@@ -912,7 +1005,31 @@ class FakePhaseAScheduler:
             "task_json": copy.deepcopy(task),
         }
         self.rows[task["dedupe_key"]] = row
-        return copy.deepcopy(row)
+        return self._api_row(row)
+
+
+class CompactPhaseAScheduler(FakePhaseAScheduler):
+    """Store exact tasks while exposing only the deployed flat API identity."""
+
+    @staticmethod
+    def _compact(row: dict[str, Any]) -> dict[str, Any]:
+        return _compact_scheduler_row(
+            row["task_json"], task_id=row["id"], status=row["status"]
+        )
+
+    def latest_10000(self):
+        return [self._compact(copy.deepcopy(row)) for row in self.rows.values()]
+
+    def task_detail(self, task_id: int):
+        self.detail_reads.append(int(task_id))
+        for row in self.rows.values():
+            if row["id"] == int(task_id):
+                return self._compact(copy.deepcopy(row))
+        return None
+
+    def post_task(self, task):
+        row = super().post_task(task)
+        return self._compact(row)
 
 
 class PassingGateReader:
@@ -1715,6 +1832,93 @@ def test_post_before_state_write_crash_recovers_gate_and_refill_without_duplicat
     ]
     assert len(all_seeds) == len(set(all_seeds))
     assert driver.operational_counts(recovered_refill)["physical_active_lanes"] == 500
+
+
+def test_live_compact_api_adopts_partial_gate_and_posts_only_missing_three(
+    tmp_path: Path,
+):
+    plan = launch.validate_launch_plan(_rendered_plan())
+    capability = _monitoring_capability(tmp_path)
+    scheduler = CompactPhaseAScheduler()
+    predecessor = _running_v1_with_scheduler(plan, scheduler)
+    initial = driver.initial_driver_state(predecessor, plan, plan, capability)
+    partial = controller.build_reserved_gate_task(
+        plan, stage_id="entry-1200-t125", phase="batch1"
+    )
+
+    first_row = scheduler.post_task(partial)
+    assert scheduler.post_count == 1
+    assert contract.scheduler_task_identity_matches(first_row, partial)
+
+    recovered, intents = driver.cycle(
+        initial,
+        plan,
+        capability,
+        scheduler,
+        PassingGateReader(scheduler),
+        apply=True,
+    )
+    assert len(intents) == 4
+    assert scheduler.post_count == 4
+    assert len(recovered["gate_lanes"]["batch1"]) == 4
+    assert {
+        lane["task_id"] for lane in recovered["gate_lanes"]["batch1"].values()
+    } == {
+        scheduler.rows[dedupe]["id"]
+        for dedupe in recovered["gate_lanes"]["batch1"]
+    }
+    assert all(
+        task["payload_json"]["aedt_used"] is False
+        and task["payload_json"]["fea_submission_approved"] is False
+        and task["payload_json"]["fea_submission_performed"] is False
+        for task in intents
+    )
+
+
+def test_driver_rejects_compact_post_or_detail_identity_drift(tmp_path: Path):
+    plan = launch.validate_launch_plan(_rendered_plan())
+    capability = _monitoring_capability(tmp_path)
+
+    class MutatingCompactScheduler(CompactPhaseAScheduler):
+        def __init__(self, surface: str):
+            super().__init__()
+            self.surface = surface
+
+        def post_task(self, task):
+            row = super().post_task(task)
+            if self.surface == "post_id":
+                row["task_id"] += 1
+            elif self.surface == "post_state":
+                row["state"] = "running"
+            return row
+
+        def task_detail(self, task_id: int):
+            row = super().task_detail(task_id)
+            if row is not None and self.surface == "detail_resource":
+                row["memory_mb"] += 1
+            elif row is not None and self.surface == "detail_id":
+                row["id"] += 1
+            return row
+
+    for surface, message in (
+        ("post_id", "submission response"),
+        ("post_state", "submission response"),
+        ("detail_resource", "task detail"),
+        ("detail_id", "task detail"),
+    ):
+        scheduler = MutatingCompactScheduler(surface)
+        predecessor = _running_v1_with_scheduler(plan, scheduler)
+        initial = driver.initial_driver_state(predecessor, plan, plan, capability)
+        with pytest.raises(RuntimeError, match=message):
+            driver.cycle(
+                initial,
+                plan,
+                capability,
+                scheduler,
+                PassingGateReader(scheduler),
+                apply=True,
+            )
+        assert scheduler.post_count == 1
 
 
 def test_scheduler_client_retries_transient_get_but_never_blindly_retries_post(
