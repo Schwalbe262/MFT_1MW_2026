@@ -72,14 +72,32 @@ def _config(*, plan_sha: str = PLAN_SHA) -> dict:
 
 
 def _gate(config: dict, monkeypatch: pytest.MonkeyPatch) -> dict:
-    terminal = {
-        "terminal_sha256": "7" * 64,
+    terminal_unsigned = {
+        "task_id": 86501,
+        "package_sha256": PACKAGE_SHA,
+        "scheduler_status": "completed",
+        "gate_results": {
+            name: True for name in rollout.REQUIRED_RESOURCE2_TERMINAL_GATES
+        },
         "promotion_eligible": True,
     }
+    terminal = {
+        **terminal_unsigned,
+        "terminal_sha256": rollout.canonical_sha256(terminal_unsigned),
+    }
+
+    def validate_terminal(value: dict) -> dict:
+        unsigned = {
+            key: item for key, item in value.items() if key != "terminal_sha256"
+        }
+        if value.get("terminal_sha256") != rollout.canonical_sha256(unsigned):
+            raise RuntimeError("resource2 terminal evidence seal mismatch")
+        return copy.deepcopy(dict(value))
+
     monkeypatch.setattr(
         rollout,
         "validate_terminal_evidence",
-        lambda value: copy.deepcopy(dict(value)),
+        validate_terminal,
     )
     unsigned = {
         "schema_version": canary.REMOTE_TERMINAL_SCHEMA,
@@ -105,6 +123,20 @@ def _gate(config: dict, monkeypatch: pytest.MonkeyPatch) -> dict:
         **unsigned,
         "remote_terminal_sha256": rollout.canonical_sha256(unsigned),
     }
+
+
+def _reseal_gate(gate: dict, *, reseal_terminal: bool = True) -> None:
+    terminal = gate["terminal_evidence"]
+    if reseal_terminal:
+        terminal_unsigned = {
+            key: value for key, value in terminal.items() if key != "terminal_sha256"
+        }
+        terminal["terminal_sha256"] = rollout.canonical_sha256(terminal_unsigned)
+    gate["terminal_sha256"] = terminal["terminal_sha256"]
+    unsigned = {
+        key: value for key, value in gate.items() if key != "remote_terminal_sha256"
+    }
+    gate["remote_terminal_sha256"] = rollout.canonical_sha256(unsigned)
 
 
 def _allocation_rows(*, include_41st: bool = True) -> list[dict]:
@@ -520,6 +552,87 @@ def test_terminal_gate_is_mandatory_before_any_scheduler_post(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("task_id", 90_001),
+        ("package_sha256", "8" * 64),
+        ("scheduler_status", "failed"),
+    ],
+)
+def test_terminal_gate_cross_binds_inner_evidence(
+    monkeypatch, field: str, changed: object
+):
+    config = _config()
+    gate = _gate(config, monkeypatch)
+    gate["terminal_evidence"][field] = changed
+    _reseal_gate(gate)
+    with pytest.raises(RuntimeError, match="promotion gate did not pass"):
+        rollout.validate_promotion_gate(gate, config=config)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("task_id", 90_001),
+        ("package_sha256", "8" * 64),
+        ("submission_receipt_sha256", "9" * 64),
+        ("scheduler_status", "failed"),
+        ("terminal_sha256", "a" * 64),
+    ],
+)
+def test_terminal_gate_binds_outer_identity_to_config_and_terminal(
+    monkeypatch, field: str, changed: object
+):
+    config = _config()
+    gate = _gate(config, monkeypatch)
+    gate[field] = changed
+    unsigned = {
+        key: value for key, value in gate.items() if key != "remote_terminal_sha256"
+    }
+    gate["remote_terminal_sha256"] = rollout.canonical_sha256(unsigned)
+    with pytest.raises(RuntimeError, match="promotion gate did not pass"):
+        rollout.validate_promotion_gate(gate, config=config)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "false", "truthy-int"])
+def test_terminal_gate_requires_exact_identity_typed_true_gate_set(
+    monkeypatch, mutation: str
+):
+    config = _config()
+    gate = _gate(config, monkeypatch)
+    gates = gate["terminal_evidence"]["gate_results"]
+    name = "exact_two_cpu_affinity"
+    if mutation == "missing":
+        gates.pop(name)
+    elif mutation == "extra":
+        gates["unsealed_extra_gate"] = True
+    elif mutation == "false":
+        gates[name] = False
+    else:
+        gates[name] = 1
+    _reseal_gate(gate)
+    with pytest.raises(RuntimeError, match="promotion gate did not pass"):
+        rollout.validate_promotion_gate(gate, config=config)
+
+
+def test_terminal_gate_rejects_inner_and_outer_sha_drift(monkeypatch):
+    config = _config()
+    gate = _gate(config, monkeypatch)
+    rollout.validate_promotion_gate(gate, config=config)
+
+    inner_drift = copy.deepcopy(gate)
+    inner_drift["terminal_evidence"]["task_id"] = 90_001
+    _reseal_gate(inner_drift, reseal_terminal=False)
+    with pytest.raises(RuntimeError, match="terminal evidence seal mismatch"):
+        rollout.validate_promotion_gate(inner_drift, config=config)
+
+    outer_drift = copy.deepcopy(gate)
+    outer_drift["remote_terminal_sha256"] = "b" * 64
+    with pytest.raises(RuntimeError, match="promotion gate did not pass"):
+        rollout.validate_promotion_gate(outer_drift, config=config)
+
+
 def test_immediate_resource2_submit_failure_is_persisted_as_fallback(monkeypatch):
     plan, config, gate, _predecessor, state = _prepared(monkeypatch)
 
@@ -549,9 +662,329 @@ def test_immediate_resource2_submit_failure_is_persisted_as_fallback(monkeypatch
     assert result["refill_mode"] == rollout.REFILL_MODE_RESOURCE4
     assert result["logical_active_target"] == 500
     assert state["resource2_rollout"]["resource2_terminal_failure_task_ids"]
+    assert scheduler.post_count == 1
+    assert len(scheduler.by_id) == 1
     rollout.validate_state(
         state,
         plan=plan,
         config=config,
         terminal_gate=gate,
     )
+
+
+def test_failure_after_n_halts_every_later_post(monkeypatch):
+    plan, config, gate, _predecessor, state = _prepared(monkeypatch)
+
+    class ThirdResource2FailureScheduler(_Scheduler):
+        resource2_count = 0
+        failed_at_post: int | None = None
+
+        def submit_task(self, payload: dict):
+            task = super().submit_task(payload)
+            if payload["cpus"] == 2:
+                self.resource2_count += 1
+                if self.resource2_count == 3:
+                    self.failed_at_post = self.post_count
+                    self.by_id[task["id"]]["status"] = "failed"
+                    self.by_dedupe[task["dedupe_key"]]["status"] = "failed"
+                    task["status"] = "failed"
+            return task
+
+    scheduler = ThirdResource2FailureScheduler()
+    state, result = rollout.control_once(
+        plan=plan,
+        state=state,
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    assert scheduler.failed_at_post is not None
+    assert scheduler.post_count == scheduler.failed_at_post
+    assert scheduler.resource2_count == 3
+    assert result["refill_mode"] == rollout.REFILL_MODE_RESOURCE4
+    assert result["actions"][-1]["detected_failure_task_ids"]
+
+    posts = scheduler.post_count
+    state, _ = rollout.control_once(
+        plan=plan,
+        state=state,
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    assert scheduler.post_count == posts
+    assert state["resource2_rollout"]["refill_mode"] == rollout.REFILL_MODE_RESOURCE4
+
+
+def test_queued_and_running_responses_are_not_terminal_failures(monkeypatch):
+    plan, config, gate, _predecessor, state = _prepared(monkeypatch)
+
+    class ActiveResponseScheduler(_Scheduler):
+        def submit_task(self, payload: dict):
+            task = super().submit_task(payload)
+            status = "running" if self.post_count % 2 else "queued"
+            self.by_id[task["id"]]["status"] = status
+            self.by_dedupe[task["dedupe_key"]]["status"] = status
+            task["status"] = status
+            return task
+
+    scheduler = ActiveResponseScheduler()
+    state, result = rollout.control_once(
+        plan=plan,
+        state=state,
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    assert scheduler.post_count == 74
+    assert result["refill_mode"] == rollout.REFILL_MODE_RESOURCE2
+    assert result["active_count"] == 574
+    assert not state["resource2_rollout"]["resource2_terminal_failure_task_ids"]
+
+
+def test_crash_after_post_before_persist_reconciles_dedupe_once(monkeypatch):
+    plan, config, gate, _predecessor, state = _prepared(monkeypatch)
+    scheduler = _Scheduler()
+    durable = []
+    persist_calls = 0
+
+    def crash_before_second_persist(value):
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 2:
+            raise RuntimeError("simulated crash after POST before state persist")
+        durable.append(copy.deepcopy(dict(value)))
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        rollout.control_once(
+            plan=plan,
+            state=state,
+            config=config,
+            terminal_gate=gate,
+            allocations=_allocation_rows(),
+            scheduler=scheduler,
+            apply=True,
+            persist=crash_before_second_persist,
+        )
+    assert scheduler.post_count == 1
+    assert len(durable) == 1
+    assert durable[0]["entries"][-1]["state"] == "planned"
+    assert durable[0]["entries"][-1]["task_id"] is None
+
+    state, result = rollout.control_once(
+        plan=plan,
+        state=durable[0],
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    assert scheduler.post_count == 74
+    assert len(scheduler.by_dedupe) == 74
+    assert result["active_count"] == 574
+    assert not any(entry["state"] == "planned" for entry in state["entries"])
+
+
+def test_detected_failure_releases_unposted_durable_reservation(monkeypatch):
+    plan, config, gate, _predecessor, state = _prepared(monkeypatch)
+    scheduler = _Scheduler()
+    state, _ = rollout.control_once(
+        plan=plan,
+        state=state,
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    completed = next(task for task in scheduler.by_id.values() if task["cpus"] == 4)
+    scheduler.by_id[completed["id"]]["status"] = "completed"
+    scheduler.by_dedupe[completed["dedupe_key"]]["status"] = "completed"
+    durable = None
+    persist_calls = 0
+
+    def crash_after_reservation(value):
+        nonlocal durable, persist_calls
+        persist_calls += 1
+        if persist_calls == 2:
+            durable = copy.deepcopy(dict(value))
+            raise RuntimeError("simulated crash after durable reservation")
+
+    with pytest.raises(RuntimeError, match="durable reservation"):
+        rollout.control_once(
+            plan=plan,
+            state=state,
+            config=config,
+            terminal_gate=gate,
+            allocations=_allocation_rows(),
+            scheduler=scheduler,
+            apply=True,
+            persist=crash_after_reservation,
+        )
+    assert durable is not None
+    planned = durable["entries"][-1]
+    assert planned["state"] == "planned"
+    assert scheduler.find_task_by_dedupe(planned["dedupe_key"]) is None
+    planned_seed = planned["seed"]
+    planned_stage = planned["stage_id"]
+
+    failed = next(task for task in scheduler.by_id.values() if task["cpus"] == 2)
+    scheduler.by_id[failed["id"]]["status"] = "failed"
+    scheduler.by_dedupe[failed["dedupe_key"]]["status"] = "failed"
+    posts = scheduler.post_count
+    state, result = rollout.control_once(
+        plan=plan,
+        state=durable,
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    assert scheduler.post_count == posts
+    assert result["actions"][-1]["pending_released_without_post"] == 1
+    assert state["next_seed_by_stage"][planned_stage] == planned_seed
+    assert all(entry["dedupe_key"] != planned["dedupe_key"] for entry in state["entries"])
+    assert state["resource2_rollout"]["refill_mode"] == rollout.REFILL_MODE_RESOURCE4
+
+
+def test_manual_fallback_releases_pending_resource2_without_post(monkeypatch):
+    plan, config, gate, _predecessor, state = _prepared(monkeypatch)
+    scheduler = _Scheduler()
+    durable = None
+
+    def crash_after_first_reservation(value):
+        nonlocal durable
+        durable = copy.deepcopy(dict(value))
+        raise RuntimeError("simulated stop after reservation")
+
+    with pytest.raises(RuntimeError, match="after reservation"):
+        rollout.control_once(
+            plan=plan,
+            state=state,
+            config=config,
+            terminal_gate=gate,
+            allocations=_allocation_rows(),
+            scheduler=scheduler,
+            apply=True,
+            persist=crash_after_first_reservation,
+        )
+    assert durable is not None
+    planned = durable["entries"][-1]
+    assert planned["state"] == "planned"
+    assert planned["resource_policy_id"] == migration.RESOURCE2_RESOURCE_POLICY_ID
+    state = rollout.activate_manual_fallback(
+        durable,
+        plan=plan,
+        config=config,
+        terminal_gate=gate,
+        expected_state_sha256=durable["state_sha256"],
+    )
+    state, result = rollout.control_once(
+        plan=plan,
+        state=state,
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    assert scheduler.post_count == 0
+    assert result["refill_mode"] == rollout.REFILL_MODE_RESOURCE4
+    assert state["next_seed_by_stage"][planned["stage_id"]] == planned["seed"]
+    assert all(entry["dedupe_key"] != planned["dedupe_key"] for entry in state["entries"])
+
+
+def test_stale_second_controller_reconciles_all_dedupes_without_duplicate_posts(
+    monkeypatch,
+):
+    plan, config, gate, _predecessor, initial = _prepared(monkeypatch)
+    scheduler = _Scheduler()
+    first, _ = rollout.control_once(
+        plan=plan,
+        state=initial,
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    assert scheduler.post_count == 74
+    second, result = rollout.control_once(
+        plan=plan,
+        state=initial,
+        config=config,
+        terminal_gate=gate,
+        allocations=_allocation_rows(),
+        scheduler=scheduler,
+        apply=True,
+        persist=lambda _value: None,
+    )
+    assert scheduler.post_count == 74
+    assert result["active_count"] == 574
+    assert rollout._entry_identities(first["entries"]) == rollout._entry_identities(
+        second["entries"]
+    )
+
+
+def test_recovered_dedupe_with_changed_task_identity_fails_closed(monkeypatch):
+    plan, config, gate, _predecessor, state = _prepared(monkeypatch)
+    scheduler = _Scheduler()
+    durable = None
+
+    def crash_after_first_reservation(value):
+        nonlocal durable
+        durable = copy.deepcopy(dict(value))
+        raise RuntimeError("simulated stop after reservation")
+
+    with pytest.raises(RuntimeError, match="after reservation"):
+        rollout.control_once(
+            plan=plan,
+            state=state,
+            config=config,
+            terminal_gate=gate,
+            allocations=_allocation_rows(),
+            scheduler=scheduler,
+            apply=True,
+            persist=crash_after_first_reservation,
+        )
+    assert durable is not None
+    entry = durable["entries"][-1]
+    task = rollout._task_for_rollout_entry(entry, templates=controller._task_templates(plan))
+    task.update(
+        {
+            "id": 300_001,
+            "task_id": 300_001,
+            "status": "queued",
+            "cpus": 4,
+        }
+    )
+    scheduler.by_id[300_001] = task
+    scheduler.by_dedupe[entry["dedupe_key"]] = task
+    with pytest.raises(RuntimeError, match="changed capacity refill task identity"):
+        rollout.control_once(
+            plan=plan,
+            state=durable,
+            config=config,
+            terminal_gate=gate,
+            allocations=_allocation_rows(),
+            scheduler=scheduler,
+            apply=True,
+            persist=lambda _value: None,
+        )
+    assert scheduler.post_count == 0

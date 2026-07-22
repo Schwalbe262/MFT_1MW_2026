@@ -29,6 +29,7 @@ try:
         REMOTE_TERMINAL_SCHEMA,
         validate_terminal_evidence,
     )
+    from tier1_final1000_multiseed_contract import scheduler_task_identity_matches
     from tier1_final1000_rolling_migration import (
         RESOURCE2_POLICY,
         RESOURCE2_RESOURCE_POLICY_ID,
@@ -61,6 +62,9 @@ except ImportError:  # pragma: no cover - repository import path
     from tools.tier1_final1000_resource2_canary import (
         REMOTE_TERMINAL_SCHEMA,
         validate_terminal_evidence,
+    )
+    from tools.tier1_final1000_multiseed_contract import (
+        scheduler_task_identity_matches,
     )
     from tools.tier1_final1000_rolling_migration import (
         RESOURCE2_POLICY,
@@ -103,6 +107,23 @@ STAGE_WEIGHT_BASIS = {
     "close-1075-t107p5": 90,
     "final-1000-t100": 50,
 }
+REQUIRED_RESOURCE2_TERMINAL_GATES = frozenset(
+    {
+        "scheduler_completed",
+        "wrapper_and_seed_completed",
+        "exact_two_cpu_affinity",
+        "exact_two_thread_binding",
+        "per_seed_peak_rss_within_gate",
+        "bounded_cgroup_diagnostics_sealed",
+        "supported_cgroup_memory_hierarchy",
+        "finite_cgroup_ancestor_covers_request",
+        "single_seed_throughput_retains_75pct",
+        "slot_weighted_throughput_improves_10pct",
+        "core_use_retains_80pct",
+        "manifest_result_validation_passed",
+        "baseline_terminal_was_promotion_eligible",
+    }
+)
 
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:8002"
 DEFAULT_ACCOUNTS = Path(r"Y:\runtime\slurm_scheduler\config\accounts.yaml")
@@ -293,6 +314,7 @@ def validate_promotion_gate(
     if not isinstance(terminal, dict):
         raise RuntimeError("resource2 canary terminal evidence is missing")
     terminal = validate_terminal_evidence(terminal)
+    terminal_gates = terminal.get("gate_results")
     if (
         value.get("schema_version") != REMOTE_TERMINAL_SCHEMA
         or value.get("remote_terminal_sha256") != canonical_sha256(unsigned)
@@ -302,6 +324,12 @@ def validate_promotion_gate(
         != config["resource2_canary_submission_receipt_sha256"]
         or value.get("scheduler_status") != "completed"
         or value.get("terminal_sha256") != terminal["terminal_sha256"]
+        or terminal.get("task_id") != value.get("task_id")
+        or terminal.get("package_sha256") != value.get("package_sha256")
+        or terminal.get("scheduler_status") != value.get("scheduler_status")
+        or not isinstance(terminal_gates, dict)
+        or set(terminal_gates) != REQUIRED_RESOURCE2_TERMINAL_GATES
+        or any(result is not True for result in terminal_gates.values())
         or value.get("promotion_eligible") is not True
         or terminal.get("promotion_eligible") is not True
         or value.get("scheduler_access") != "GET-only"
@@ -656,6 +684,10 @@ def prepare_state(
     migration["harvest_cohorts"] = cohorts
     migration = _seal_nested(migration)
     prefix = copy.deepcopy(predecessor["entries"])
+    if any(entry.get("state") == "planned" for entry in prefix):
+        raise RuntimeError(
+            "resource2 handoff requires predecessor reservations to be reconciled"
+        )
     rollout = {
         "config_sha256": config["config_sha256"],
         "resource2_terminal_gate_sha256": terminal["remote_terminal_sha256"],
@@ -786,6 +818,15 @@ def validate_state(
         or set(rollout["predecessor_next_seed_by_stage"]) != set(BY_ID)
     ):
         raise RuntimeError("resource2 predecessor ledger prefix changed")
+    planned_indexes = [
+        index for index, entry in enumerate(entries) if entry.get("state") == "planned"
+    ]
+    if (
+        len(planned_indexes) > 1
+        or any(index < prefix_count for index in planned_indexes)
+        or (planned_indexes and planned_indexes[0] != len(entries) - 1)
+    ):
+        raise RuntimeError("resource2 rollout has an unsafe pending reservation set")
     validate_capacity_snapshot(rollout.get("capacity") or {}, config=config)
     if rollout["refill_mode"] == REFILL_MODE_RESOURCE2:
         if rollout.get("fallback") is not None:
@@ -899,9 +940,15 @@ def _active_count(state: Mapping[str, Any], stage_id: str | None = None) -> int:
 
 def _resource2_terminal_failure_ids(state: Mapping[str, Any]) -> list[int]:
     prefix_count = int(state["resource2_rollout"]["predecessor_entry_count"])
+    return _resource2_failure_ids_for_entries(state["entries"][prefix_count:])
+
+
+def _resource2_failure_ids_for_entries(
+    entries: Sequence[Mapping[str, Any]],
+) -> list[int]:
     return sorted(
         int(entry["task_id"])
-        for entry in state["entries"][prefix_count:]
+        for entry in entries
         if entry.get("resource_policy_id") == RESOURCE2_RESOURCE_POLICY_ID
         and entry.get("state") in TERMINAL_STATES - {"completed"}
         and entry.get("task_id") is not None
@@ -1088,11 +1135,12 @@ def _submit_planned(
     templates: Mapping[str, Mapping[str, Any]],
     scheduler: CapacityScheduler,
 ) -> tuple[int, int]:
+    planned = [entry for entry in entries if entry["state"] == "planned"]
+    if len(planned) > 1:
+        raise RuntimeError("capacity controller may submit only one reservation at a time")
     submitted = 0
     reconciled = 0
-    for entry in entries:
-        if entry["state"] != "planned":
-            continue
+    for entry in planned:
         task = _task_for_rollout_entry(entry, templates=templates)
         observed = scheduler.find_task_by_dedupe(entry["dedupe_key"])
         if observed is None:
@@ -1100,12 +1148,59 @@ def _submit_planned(
             submitted += 1
         else:
             reconciled += 1
-        if observed.get("dedupe_key", entry["dedupe_key"]) != entry["dedupe_key"]:
-            raise RuntimeError("Scheduler changed capacity refill dedupe identity")
+        if not scheduler_task_identity_matches(observed, task):
+            raise RuntimeError("Scheduler changed capacity refill task identity")
         entry["task_id"] = _task_id(observed)
         entry["state"] = _scheduler_state(observed.get("status")) or "submitted"
     state["scheduler_submit_count"] = int(state["scheduler_submit_count"]) + submitted
     return submitted, reconciled
+
+
+def _settle_or_release_planned_without_post(
+    state: dict[str, Any],
+    *,
+    templates: Mapping[str, Mapping[str, Any]],
+    scheduler: CapacityScheduler,
+) -> tuple[int, int]:
+    """Resolve the sole durable reservation after fallback without a POST."""
+
+    planned = [entry for entry in state["entries"] if entry["state"] == "planned"]
+    if len(planned) > 1:
+        raise RuntimeError("fallback encountered multiple pending reservations")
+    if not planned:
+        return 0, 0
+    entry = planned[0]
+    task = _task_for_rollout_entry(entry, templates=templates)
+    observed = scheduler.find_task_by_dedupe(entry["dedupe_key"])
+    if observed is not None:
+        if not scheduler_task_identity_matches(observed, task):
+            raise RuntimeError("Scheduler changed pending fallback task identity")
+        entry["task_id"] = _task_id(observed)
+        entry["state"] = _scheduler_state(observed.get("status")) or "submitted"
+        return 1, 0
+
+    prefix_count = int(state["resource2_rollout"]["predecessor_entry_count"])
+    index = state["entries"].index(entry)
+    stage_id = str(entry["stage_id"])
+    seed = int(entry["seed"])
+    if (
+        index < prefix_count
+        or index != len(state["entries"]) - 1
+        or int(state["next_seed_by_stage"][stage_id]) != seed + 1
+        or entry.get("task_id") is not None
+    ):
+        raise RuntimeError("pending fallback reservation cannot be released safely")
+    state["entries"].pop()
+    state["next_seed_by_stage"][stage_id] = seed
+    counter = (
+        "resource2_refill_count"
+        if entry["resource_policy_id"] == RESOURCE2_RESOURCE_POLICY_ID
+        else "resource4_refill_count"
+    )
+    state["resource2_rollout"][counter] = (
+        int(state["resource2_rollout"][counter]) - 1
+    )
+    return 0, 1
 
 
 def control_once(
@@ -1169,6 +1264,7 @@ def control_once(
         return working, _result(preview, actions, False, 0, None)
 
     assert scheduler is not None
+    templates = _task_templates(plan)
     changed, failure_ids = _reconcile(working, scheduler)
     fallback_activated = False
     if failure_ids:
@@ -1177,9 +1273,52 @@ def control_once(
             failure_task_ids=failure_ids,
             reason="resource2_terminal_failure",
         )
-    if changed or fallback_activated:
+        pending_reconciled, pending_released = _settle_or_release_planned_without_post(
+            working,
+            templates=templates,
+            scheduler=scheduler,
+        )
+        all_failure_ids = _resource2_terminal_failure_ids(working)
+        fallback_updated = _activate_fallback(
+            working,
+            failure_task_ids=all_failure_ids,
+            reason="resource2_terminal_failure",
+        )
         save()
-    templates = _task_templates(plan)
+        actions.append(
+            {
+                "action": "resource2_failure_halt",
+                "refill_mode": working["resource2_rollout"]["refill_mode"],
+                "capacity_target": 500,
+                "detected_failure_task_ids": all_failure_ids,
+                "pending_reconciled_without_post": pending_reconciled,
+                "pending_released_without_post": pending_released,
+                "fallback_activated": fallback_activated or fallback_updated,
+                "cancelled_task_ids": [],
+            }
+        )
+        return working, _result(working, actions, True, writes, scheduler)
+    if changed:
+        save()
+    if (
+        working["resource2_rollout"]["refill_mode"] == REFILL_MODE_RESOURCE4
+        and any(entry["state"] == "planned" for entry in working["entries"])
+    ):
+        _pending_reconciled, _pending_released = (
+            _settle_or_release_planned_without_post(
+                working,
+                templates=templates,
+                scheduler=scheduler,
+            )
+        )
+        remaining_failure_ids = _resource2_terminal_failure_ids(working)
+        if remaining_failure_ids:
+            _activate_fallback(
+                working,
+                failure_task_ids=remaining_failure_ids,
+                reason="resource4_fallback_pending_reservation_recovery",
+            )
+        save()
     previously_planned = [
         entry for entry in working["entries"] if entry["state"] == "planned"
     ]
@@ -1189,14 +1328,32 @@ def control_once(
         templates=templates,
         scheduler=scheduler,
     )
-    recovered_failure_ids = _resource2_terminal_failure_ids(working)
-    recovered_fallback = bool(recovered_failure_ids) and _activate_fallback(
-        working,
-        failure_task_ids=recovered_failure_ids,
-        reason="resource2_terminal_failure_during_planned_recovery",
-    )
+    recovered_failure_ids = _resource2_failure_ids_for_entries(previously_planned)
+    recovered_fallback = False
+    if recovered_failure_ids:
+        recovered_fallback = _activate_fallback(
+            working,
+            failure_task_ids=recovered_failure_ids,
+            reason="resource2_terminal_failure_during_planned_recovery",
+        )
     if recovered_submitted or recovered_reconciled or recovered_fallback:
         save()
+    if recovered_failure_ids:
+        actions.append(
+            {
+                "action": "resource2_failure_halt",
+                "refill_mode": working["resource2_rollout"]["refill_mode"],
+                "capacity_target": 500,
+                "detected_failure_task_ids": recovered_failure_ids,
+                "pending_reconciled_without_post": 0,
+                "pending_released_without_post": 0,
+                "fallback_activated": recovered_fallback,
+                "recovered_planned_submitted": recovered_submitted,
+                "recovered_planned_reconciled": recovered_reconciled,
+                "cancelled_task_ids": [],
+            }
+        )
+        return working, _result(working, actions, True, writes, scheduler)
     mode = working["resource2_rollout"]["refill_mode"]
     target = 500 if mode == REFILL_MODE_RESOURCE4 else snapshot["bounded_active_target"]
     targets = (
@@ -1204,35 +1361,51 @@ def control_once(
         if mode == REFILL_MODE_RESOURCE4
         else snapshot["stage_active_targets"]
     )
-    slots = max(0, target - _active_count(working))
-    order = _weighted_refill_order(working, slots=slots, targets=targets)
-    reserved = [
-        _append_refill(
+    reserved_count = 0
+    submitted = 0
+    reconciled = 0
+    order: list[str] = []
+    immediate_failure_ids: list[int] = []
+    immediate_fallback = False
+    terminal_response_halt = False
+    while _active_count(working) < target:
+        stage_id = _weighted_refill_order(working, slots=1, targets=targets)[0]
+        entry = _append_refill(
             working,
             templates=templates,
             stage_id=stage_id,
             config=config,
         )
-        for stage_id in order
-    ]
-    # Persist reservations before any POST.  Restart then reconciles the exact
-    # deterministic dedupe if a process dies after POST but before final save.
-    if reserved:
+        order.append(stage_id)
+        reserved_count += 1
+        # Persist exactly one reservation before its POST.  A restart can then
+        # reconcile that dedupe, while no unposted batch remains behind it.
         save()
-    submitted, reconciled = _submit_planned(
-        working,
-        entries=reserved,
-        templates=templates,
-        scheduler=scheduler,
-    )
-    immediate_failure_ids = _resource2_terminal_failure_ids(working)
-    immediate_fallback = bool(immediate_failure_ids) and _activate_fallback(
-        working,
-        failure_task_ids=immediate_failure_ids,
-        reason="resource2_terminal_failure_during_refill_submission",
-    )
-    if submitted or reconciled or immediate_fallback:
+        one_submitted, one_reconciled = _submit_planned(
+            working,
+            entries=[entry],
+            templates=templates,
+            scheduler=scheduler,
+        )
+        submitted += one_submitted
+        reconciled += one_reconciled
+        immediate_failure_ids = _resource2_failure_ids_for_entries([entry])
+        if immediate_failure_ids:
+            immediate_fallback = _activate_fallback(
+                working,
+                failure_task_ids=immediate_failure_ids,
+                reason="resource2_terminal_failure_during_refill_submission",
+            )
         save()
+        if immediate_failure_ids:
+            # The state transition and fallback are durable before returning;
+            # no later reservation or Scheduler POST is allowed in this cycle.
+            break
+        if entry["state"] in TERMINAL_STATES:
+            # Avoid an unbounded same-cycle loop for an immediately terminal
+            # non-resource2 response.  The next watch tick may refill again.
+            terminal_response_halt = True
+            break
     mode = working["resource2_rollout"]["refill_mode"]
     target = 500 if mode == REFILL_MODE_RESOURCE4 else snapshot["bounded_active_target"]
     actions.append(
@@ -1240,7 +1413,7 @@ def control_once(
             "action": "capacity_refill",
             "refill_mode": mode,
             "capacity_target": target,
-            "reserved": len(reserved),
+            "reserved": reserved_count,
             "submitted": submitted,
             "reconciled": reconciled,
             "recovered_planned_submitted": recovered_submitted,
@@ -1249,10 +1422,16 @@ def control_once(
             "fallback_activated": (
                 fallback_activated or recovered_fallback or immediate_fallback
             ),
+            "detected_failure_task_ids": immediate_failure_ids,
+            "terminal_response_halt": terminal_response_halt,
             "cancelled_task_ids": [],
         }
     )
-    if _active_count(working) < target:
+    if (
+        _active_count(working) < target
+        and not immediate_failure_ids
+        and not terminal_response_halt
+    ):
         raise RuntimeError("capacity controller failed to restore its active target")
     return working, _result(working, actions, True, writes, scheduler)
 

@@ -52,7 +52,12 @@ python "$Source\tools\tier1_final1000_resource2_canary.py" evaluate-remote `
 The rollout validator must report `promotion_eligible=true`,
 `scheduler_status=completed`, GET-only access, zero Scheduler POST/cancel/
 preempt, and the exact task/package/submission identities above. There is no
-override flag.
+override flag. The nested terminal schema does not carry a submission-receipt
+field, so submission identity is bound by the outer remote-evidence hash and
+then matched to the sealed rollout config. Task, package, status, and terminal
+SHA are additionally cross-checked between the outer wrapper and nested
+terminal. The exact 13-gate inventory is required and every value must be the
+JSON boolean `true`; missing, extra, false, or merely truthy values fail closed.
 
 ## Dry-run before handoff
 
@@ -121,8 +126,14 @@ The first non-completed terminal result from any new 2-CPU task atomically
 switches future refills to the sealed 4-CPU policy and lowers the target to
 500. Existing 2-CPU and 4-CPU tasks continue naturally. No cancellation,
 preemption, FEA, AEDT, allocation, service, or database mutation exists in the
-controller. A manual fallback is available only after stopping the controller
-and requires the exact current state SHA:
+controller. Refill reservations are persisted and posted one at a time. A
+first 2-CPU terminal failure is persisted together with fallback before any
+later reservation or POST; a crash after POST but before the response state is
+persisted reconciles the same exact dedupe on restart. At most one unposted
+reservation can exist, and fallback either authenticates an already-created
+task or releases that reservation and rewinds its seed without a POST. A
+manual fallback is available only after stopping the controller and requires
+the exact current state SHA:
 
 ```powershell
 python "$Release\tools\tier1_final1000_resource2_capacity_rollout.py" fallback `
