@@ -10,6 +10,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REGISTRY = os.path.join(HERE, "registry")
 LEGACY_SIGMA_FLOOR_POLICY = "legacy_absolute_1e-9"
 RELATIVE_SIGMA_FLOOR_POLICY = "relative_machine_epsilon_v1"
+SUPPORTED_INFERENCE_FAMILIES = {
+    "lightgbm", "xgboost", "catboost", "extratrees",
+}
+SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {"extratrees"}
+FAMILY_SPECIFIC_INFERENCE_POLICY = (
+    "family_specific_semaphore_free_sklearn_forest_v1"
+)
 
 from checkpoint_train import inverse_y  # noqa: E402
 
@@ -21,6 +28,7 @@ class EnsemblePredictor:
         self.kind = bundle["transform"]
         self.q90 = bundle["q90"]
         self.inference_threads = None
+        self.inference_family_threads = {}
         self.sigma_floor_policy = bundle.get(
             "sigma_floor_policy", LEGACY_SIGMA_FLOOR_POLICY
         )
@@ -35,11 +43,13 @@ class EnsemblePredictor:
     def configure_inference_threads(self, threads=1):
         """Bound nested model prediction parallelism for outer-parallel jobs.
 
-        NSGA-II already parallelizes independent restarts.  Letting every
-        ensemble member also use all host cores creates nested joblib/OpenMP
-        pools, repeated sklearn warnings and severe oversubscription.  Keep
-        the default unchanged for other consumers; optimization explicitly
-        opts into this bound after loading its pinned model generation.
+        Native-threaded libraries may use the requested bounded budget, but
+        sklearn forests stay serial.  Their joblib threading backend creates
+        ``multiprocessing.ThreadPool`` queues and POSIX ``SemLock`` objects
+        even though the workers are threads; hundreds of Slurm lanes can
+        exhaust the node semaphore namespace.  Keep the default unchanged for
+        other consumers; optimization explicitly opts into this family-aware
+        bound after loading its pinned model generation.
         """
 
         if isinstance(threads, bool):
@@ -50,32 +60,53 @@ class EnsemblePredictor:
             raise ValueError(
                 "inference threads must be a positive integer"
             ) from exc
-        if normalized < 1 or normalized > 4:
-            raise ValueError("inference threads must be between 1 and 4")
-        supported = {"lightgbm", "xgboost", "catboost", "extratrees"}
+        if normalized < 1 or normalized > 8:
+            raise ValueError("inference threads must be between 1 and 8")
         configured = []
+        family_threads = {}
         for family, model in self.bundle["models"]:
             family_name = str(family).lower()
-            if family_name not in supported:
+            if family_name not in SUPPORTED_INFERENCE_FAMILIES:
                 raise RuntimeError(
                     f"cannot bound unsupported ensemble family: {family}"
                 )
+            effective_threads = (
+                1
+                if family_name in SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
+                else normalized
+            )
             if family_name != "catboost":
                 if not hasattr(model, "n_jobs"):
                     raise RuntimeError(
                         f"{family_name} model has no n_jobs inference control"
                     )
-                model.n_jobs = normalized
-                if int(model.n_jobs) != normalized:
+                model.n_jobs = effective_threads
+                if int(model.n_jobs) != effective_threads:
                     raise RuntimeError(
                         f"failed to bind {family_name} inference threads"
                     )
+            prior = family_threads.setdefault(family_name, effective_threads)
+            if prior != effective_threads:
+                raise RuntimeError(
+                    f"inconsistent {family_name} inference thread binding"
+                )
             configured.append(family_name)
         self.inference_threads = normalized
+        self.inference_family_threads = dict(sorted(family_threads.items()))
+        semaphore_free_families = sorted(
+            set(configured) & SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
+        )
         return {
             "threads": normalized,
             "model_count": len(configured),
             "families": configured,
+            "family_threads": dict(self.inference_family_threads),
+            "semaphore_free_families": semaphore_free_families,
+            "semaphore_free_sklearn_forest": all(
+                self.inference_family_threads[family_name] == 1
+                for family_name in semaphore_free_families
+            ),
+            "policy": FAMILY_SPECIFIC_INFERENCE_POLICY,
         }
 
     def _predict_model(self, family, model, frame):
@@ -84,7 +115,12 @@ class EnsemblePredictor:
             and str(family).lower() == "catboost"
         ):
             return model.predict(
-                frame, thread_count=int(self.inference_threads)
+                frame,
+                thread_count=int(
+                    self.inference_family_threads.get(
+                        "catboost", self.inference_threads
+                    )
+                ),
             )
         return model.predict(frame)
 

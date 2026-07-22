@@ -52,6 +52,10 @@ VETTED_QUALITY_THRESHOLDS = os.path.abspath(os.path.join(
     HERE, "..", "training", "model_quality_thresholds.json"
 ))
 DETERMINISTIC_INFEASIBLE_EXIT_CODE = 42
+SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {"extratrees"}
+FAMILY_SPECIFIC_INFERENCE_POLICY = (
+    "family_specific_semaphore_free_sklearn_forest_v1"
+)
 
 
 def _sha256(path):
@@ -289,7 +293,7 @@ def load_models(registry=None, generation=None, *, allow_unaccepted=False):
 
 
 def _bound_surrogate_inference(models, threads=1):
-    """Disable nested all-core prediction below restart-level parallelism."""
+    """Bind per-family inference without sklearn forest semaphore creation."""
 
     evidence = []
     for target in sorted(models):
@@ -309,6 +313,43 @@ def _bound_surrogate_inference(models, threads=1):
         for result in evidence
         for family in result.get("families", [])
     })
+    family_threads = {}
+    semaphore_free_families = set()
+    for result in evidence:
+        result_families = set(result.get("families") or [])
+        result_threads = result.get("family_threads")
+        expected_semaphore_free = sorted(
+            result_families & SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
+        )
+        if (
+            not isinstance(result_threads, dict)
+            or set(result_threads) != result_families
+            or result.get("semaphore_free_families")
+            != expected_semaphore_free
+            or result.get("semaphore_free_sklearn_forest") is not True
+            or result.get("policy") != FAMILY_SPECIFIC_INFERENCE_POLICY
+        ):
+            raise RuntimeError(
+                "surrogate family-specific inference attestation failed"
+            )
+        for family, effective_threads in result_threads.items():
+            expected_threads = (
+                1
+                if family in SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
+                else int(threads)
+            )
+            if effective_threads != expected_threads:
+                raise RuntimeError(
+                    f"unsafe {family} inference thread binding"
+                )
+            prior = family_threads.setdefault(family, effective_threads)
+            if prior != effective_threads:
+                raise RuntimeError(
+                    f"inconsistent {family} inference thread binding"
+                )
+        semaphore_free_families.update(expected_semaphore_free)
+    if set(family_threads) != set(families):
+        raise RuntimeError("surrogate family thread inventory is incomplete")
     return {
         "threads_per_model": int(threads),
         "target_count": len(evidence),
@@ -316,7 +357,10 @@ def _bound_surrogate_inference(models, threads=1):
             int(result.get("model_count") or 0) for result in evidence
         ),
         "families": families,
-        "policy": "outer_restart_parallelism_inner_model_serial_v1",
+        "family_threads": dict(sorted(family_threads.items())),
+        "semaphore_free_families": sorted(semaphore_free_families),
+        "semaphore_free_sklearn_forest": True,
+        "policy": FAMILY_SPECIFIC_INFERENCE_POLICY,
     }
 
 

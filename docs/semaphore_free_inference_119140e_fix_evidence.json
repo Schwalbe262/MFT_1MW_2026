@@ -1,0 +1,94 @@
+{
+  "schema_version": "mft-tier1-semaphore-free-inference-fix-evidence-v1",
+  "status": "passed_local_only_candidate",
+  "source_parent_revision": "119140e3227d90ae8ca8903b8187ba07a6de994a",
+  "candidate_branch": "codex/119140e-semlock-fix-260722",
+  "candidate_worktree": "C:/w/mftsf119",
+  "incident": {
+    "task_id": 75543,
+    "failure": "OSError:[Errno 28] No space left on device",
+    "stack_path": "sklearn ExtraTrees predict -> joblib ThreadingBackend -> multiprocessing.ThreadPool -> SimpleQueue/Lock -> _multiprocessing.SemLock",
+    "stderr_utf8_sha256": "929b6290f3e83de71a4ea8c7da704f975a030a30973cccb745f07945e4f9733b",
+    "stderr_character_count": 8034
+  },
+  "inference_policy": {
+    "policy": "family_specific_semaphore_free_sklearn_forest_v1",
+    "requested_inference_threads": 8,
+    "effective_family_threads": {
+      "catboost": 8,
+      "extratrees": 1,
+      "lightgbm": 8,
+      "xgboost": 8
+    },
+    "sklearn_forest_semaphore_free": true,
+    "preflight_rejects_extratrees_threads_other_than_one": true
+  },
+  "changed_file_sha256": {
+    "regression_260707/optimization/run_nsga2.py": "e10e006ac004c1b05c8bdf114639607536055e6946745e28636a74b0a64fc649",
+    "regression_260707/pipeline/tests/test_runner_policy.py": "5146c962e9cc1e438b238587acfc804d2b0a4d3fdf1598342a52f925dcb3a08a",
+    "regression_260707/training/predictor.py": "a37e6eb53046e748b433a9ed508da34628ac8b0d0e7182d576b72419922f8818",
+    "tests/test_tier1_corrected_generation_adapter.py": "708d0bca19ecbacd0ade89e59b233f1baef8af9638242fa10bac9c0421abb683",
+    "tools/tier1_corrected_generation_preflight.py": "4a3d8a5732b32facffff2ec90472929726d9350970427ddcc07a453eaa772a1c"
+  },
+  "tests": {
+    "environment": {
+      "python": "3.11.14",
+      "numpy": "2.2.6",
+      "pandas": "2.3.3",
+      "scikit_learn": "1.9.0",
+      "joblib": "1.5.3"
+    },
+    "focused_threadpool_semlock_and_binding": "2 passed",
+    "focused_preflight_family_contract": "1 passed",
+    "predictor_preflight_full_files": "49 passed in 30.69s",
+    "direct_dependents": "90 passed in 12.74s",
+    "release_launch_harvest_and_n1_contracts": "59 passed in 7.81s",
+    "unique_relevant_test_count": 198,
+    "unique_relevant_failure_count": 0,
+    "git_diff_check_passed": true,
+    "ruff_check_passed": true
+  },
+  "production_artifact_prediction_proof": {
+    "target": "k",
+    "artifact_sha256": "aee3d8b714843934ba3f5986cd4a2fc23c25f2b96eb96a205bab7d833feffa71",
+    "artifact_size": 805573015,
+    "model_count": 20,
+    "families": [
+      "catboost",
+      "extratrees",
+      "lightgbm",
+      "xgboost"
+    ],
+    "feature_count": 69,
+    "batch_rows": 320,
+    "pre_fix_two_full_ensemble_predict_seconds": 0.5425455999793485,
+    "fixed_two_full_ensemble_predict_seconds": 0.33530460007023066,
+    "fixed_to_pre_fix_runtime_ratio": 0.6180210476004113,
+    "fixed_runtime_reduction_fraction": 0.3819789523995887,
+    "fixed_mu_repeated_bitwise": true,
+    "fixed_sigma_repeated_bitwise": true,
+    "pre_fix_mu_repeated_bitwise": false,
+    "pre_fix_sigma_repeated_bitwise": false,
+    "pre_fix_vs_fixed_mu_allclose_rtol_1e_15_atol_1e_15": true,
+    "pre_fix_vs_fixed_sigma_allclose_rtol_1e_15_atol_1e_15": true,
+    "mu_max_abs_delta": 3.3306690738754696e-16,
+    "sigma_max_abs_delta": 2.6020852139652106e-17,
+    "threadpool_construction_forbidden_during_fixed_repeated_predictions": true,
+    "semlock_construction_forbidden_during_fixed_repeated_predictions": true
+  },
+  "runtime_assessment": {
+    "measured_result": "no slowdown on the pinned production k ensemble; two 320-row predictions were 38.2 percent faster locally",
+    "end_to_end_projection": "optimizer runtime should be unchanged or lower because only ExtraTrees loses joblib pool overhead while the other three families retain eight native threads",
+    "projection_is_not_a_remote_wall_clock_measurement": true
+  },
+  "mutation_accounting": {
+    "remote_write_count": 0,
+    "scheduler_post_count": 0,
+    "scheduler_cancel_count": 0,
+    "scheduler_preempt_count": 0,
+    "controller_mutation_count": 0,
+    "aedt_count": 0,
+    "fea_count": 0
+  },
+  "sha256": "880dd1f47f69c39c8107f06e3bcfdea765bfc97ed8553ce5e3858a57aff56bb4"
+}

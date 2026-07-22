@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -227,11 +228,15 @@ class _FakePredictor:
 
     def configure_inference_threads(self, threads=1):
         self.inference_threads = int(threads)
-        self.fitted.n_jobs = int(threads)
+        self.fitted.n_jobs = 1
         return {
             "threads": int(threads),
             "model_count": 1,
             "families": ["extratrees"],
+            "family_threads": {"extratrees": 1},
+            "semaphore_free_families": ["extratrees"],
+            "semaphore_free_sklearn_forest": True,
+            "policy": preflight.FAMILY_SPECIFIC_INFERENCE_POLICY,
         }
 
     def predict_mu_sigma(self, frame, conformal=True):
@@ -523,11 +528,15 @@ class _ThreadControlledPredictor:
 
     def configure_inference_threads(self, threads=1):
         self.inference_threads = int(threads)
-        self.fitted.n_jobs = int(threads)
+        self.fitted.n_jobs = 1
         return {
             "threads": int(threads),
             "model_count": 1,
             "families": ["extratrees"],
+            "family_threads": {"extratrees": 1},
+            "semaphore_free_families": ["extratrees"],
+            "semaphore_free_sklearn_forest": True,
+            "policy": preflight.FAMILY_SPECIFIC_INFERENCE_POLICY,
         }
 
     def predict_mu_sigma(self, frame, conformal=True):
@@ -540,6 +549,73 @@ class _ThreadControlledPredictor:
 
     def disagreement(self, frame):
         return np.zeros(len(frame), dtype=float)
+
+
+def test_production_family_binding_keeps_sklearn_forest_semaphore_free():
+    modules = preflight.load_current7_modules(REPO)
+
+    class NJobsModel:
+        def __init__(self, value):
+            self.n_jobs = -1
+            self.value = float(value)
+
+        def predict(self, frame):
+            return np.full(len(frame), self.value, dtype=float)
+
+    class CatBoostModel:
+        def __init__(self, value):
+            self.value = float(value)
+            self.thread_counts = []
+
+        def predict(self, frame, thread_count=None):
+            self.thread_counts.append(thread_count)
+            return np.full(len(frame), self.value, dtype=float)
+
+    fitted_by_target = {}
+    models = {}
+    for target in adapter.CURRENT_REQUIRED_MODEL_TARGETS:
+        fitted = {
+            "lightgbm": NJobsModel(1.0),
+            "xgboost": NJobsModel(2.0),
+            "catboost": CatBoostModel(3.0),
+            "extratrees": NJobsModel(4.0),
+        }
+        fitted_by_target[target] = fitted
+        models[target] = modules.predictor.EnsemblePredictor({
+            "models": list(fitted.items()),
+            "features": ["l1"],
+            "transform": "identity",
+            "q90": 1.0,
+        })
+
+    binding = preflight.bind_surrogate_inference(
+        models, modules.run_nsga2, threads=8
+    )
+
+    assert binding["threads_per_model"] == 8
+    assert binding["family_threads"] == {
+        "catboost": 8,
+        "extratrees": 1,
+        "lightgbm": 8,
+        "xgboost": 8,
+    }
+    assert binding["semaphore_free_families"] == ["extratrees"]
+    assert binding["semaphore_free_sklearn_forest"] is True
+    assert binding["policy"] == preflight.FAMILY_SPECIFIC_INFERENCE_POLICY
+    assert preflight._terminal_inference_binding_contract(binding) == (True, 8)
+    for fitted in fitted_by_target.values():
+        assert fitted["extratrees"].n_jobs == 1
+        assert fitted["lightgbm"].n_jobs == 8
+        assert fitted["xgboost"].n_jobs == 8
+
+    first_target = adapter.CURRENT_REQUIRED_MODEL_TARGETS[0]
+    models[first_target].predict_mu_sigma(pd.DataFrame({"l1": [0.0]}))
+    assert fitted_by_target[first_target]["catboost"].thread_counts == [8]
+
+    unsafe = copy.deepcopy(binding)
+    unsafe["family_threads"]["extratrees"] = 8
+    with pytest.raises(RuntimeError, match="inference binding contract mismatch"):
+        preflight._terminal_inference_binding_contract(unsafe)
 
 
 def _thread_sensitive_terminal_runner():
@@ -636,7 +712,7 @@ def test_terminal_replay_serializes_and_canonicalizes_eight_thread_snapshot(
     assert "terminal_model_predictions" in replay
     assert deterministic["terminal_model_predictions_sha256"]
     assert all(model.inference_threads == 8 for model in runner.models.values())
-    assert all(model.fitted.n_jobs == 8 for model in runner.models.values())
+    assert all(model.fitted.n_jobs == 1 for model in runner.models.values())
 
     def unexpected_multithread_prediction(*_args, **_kwargs):
         raise AssertionError("persistence repeated terminal model inference")
@@ -683,7 +759,7 @@ def test_terminal_replay_rejects_one_ulp_serial_drift_and_restores_threads():
         )
 
     assert all(model.inference_threads == 8 for model in runner.models.values())
-    assert all(model.fitted.n_jobs == 8 for model in runner.models.values())
+    assert all(model.fitted.n_jobs == 1 for model in runner.models.values())
 
 
 def test_terminal_replay_rejects_partial_inference_binding():
@@ -1366,7 +1442,10 @@ def test_smoke_receipt_seals_both_repaired_strata_and_is_launch_eligible(tmp_pat
                 for item in configured
                 for family in item["families"]
             }),
-            "policy": "outer_restart_parallelism_inner_model_serial_v1",
+            "family_threads": {"extratrees": 1},
+            "semaphore_free_families": ["extratrees"],
+            "semaphore_free_sklearn_forest": True,
+            "policy": preflight.FAMILY_SPECIFIC_INFERENCE_POLICY,
         }
 
     modules = preflight.Current7Modules(

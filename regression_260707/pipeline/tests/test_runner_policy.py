@@ -458,7 +458,7 @@ class NsgaParallelTests(unittest.TestCase):
         })
 
         evidence = run_nsga2._bound_surrogate_inference(
-            {"Llt_phys": ensemble}, threads=1
+            {"Llt_phys": ensemble}, threads=8
         )
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -467,14 +467,76 @@ class NsgaParallelTests(unittest.TestCase):
 
         self.assertEqual(caught, [])
         self.assertEqual(joblib_model.n_jobs, 1)
-        self.assertEqual(catboost_model.thread_counts, [1, 1])
+        self.assertEqual(catboost_model.thread_counts, [8, 8])
         self.assertEqual(evidence, {
-            "threads_per_model": 1,
+            "threads_per_model": 8,
             "target_count": 1,
             "model_count": 2,
             "families": ["catboost", "extratrees"],
-            "policy": "outer_restart_parallelism_inner_model_serial_v1",
+            "family_threads": {"catboost": 8, "extratrees": 1},
+            "semaphore_free_families": ["extratrees"],
+            "semaphore_free_sklearn_forest": True,
+            "policy": "family_specific_semaphore_free_sklearn_forest_v1",
         })
+
+    def test_extratrees_prediction_never_constructs_threadpool_or_semlock(self):
+        import _multiprocessing
+        import joblib._parallel_backends as parallel_backends
+        from sklearn.ensemble import ExtraTreesRegressor
+        from regression_260707.optimization import run_nsga2  # noqa: F401
+        import predictor
+
+        rng = np.random.default_rng(20260722)
+        train_x = rng.normal(size=(96, 5))
+        train_y = (
+            0.4 * train_x[:, 0]
+            - 0.2 * train_x[:, 1]
+            + train_x[:, 2] ** 2
+        )
+        frame = pd.DataFrame(
+            rng.normal(size=(48, 5)),
+            columns=[f"x{index}" for index in range(5)],
+        )
+        train_frame = pd.DataFrame(train_x, columns=frame.columns)
+        forest = ExtraTreesRegressor(
+            n_estimators=32,
+            max_depth=8,
+            random_state=20260722,
+            n_jobs=1,
+        ).fit(train_frame, train_y)
+        ensemble = predictor.EnsemblePredictor({
+            "models": [("extratrees", forest)],
+            "features": list(frame.columns),
+            "transform": "identity",
+            "q90": 1.0,
+        })
+
+        serial_reference = ensemble.predict_mu_sigma(frame)
+        forest.n_jobs = 4
+        threaded_reference = ensemble.predict_mu_sigma(frame)
+        evidence = ensemble.configure_inference_threads(8)
+        self.assertEqual(forest.n_jobs, 1)
+        self.assertEqual(evidence["family_threads"], {"extratrees": 1})
+
+        forbidden = AssertionError("parallel primitive construction is forbidden")
+        with mock.patch.object(
+            parallel_backends, "ThreadPool", side_effect=forbidden
+        ), mock.patch.object(_multiprocessing, "SemLock", side_effect=forbidden):
+            first = ensemble.predict_mu_sigma(frame)
+            second = ensemble.predict_mu_sigma(frame)
+            disagreement = ensemble.disagreement(frame)
+
+        np.testing.assert_array_equal(first[0], second[0])
+        np.testing.assert_array_equal(first[1], second[1])
+        np.testing.assert_array_equal(first[0], serial_reference[0])
+        np.testing.assert_array_equal(first[1], serial_reference[1])
+        np.testing.assert_allclose(
+            first[0], threaded_reference[0], rtol=1e-15, atol=1e-15
+        )
+        np.testing.assert_allclose(
+            first[1], threaded_reference[1], rtol=0.0, atol=0.0
+        )
+        np.testing.assert_array_equal(disagreement, np.zeros(len(frame)))
 
     def test_nsga_inference_bound_rejects_unknown_nested_parallelism(self):
         import predictor

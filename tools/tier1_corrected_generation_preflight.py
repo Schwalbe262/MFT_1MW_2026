@@ -82,6 +82,10 @@ PRODUCTION_FIXED_GENERATIONS = 300
 PRODUCTION_POPULATION = 320
 PRODUCTION_INFERENCE_THREADS = 8
 DETERMINISTIC_TERMINAL_INFERENCE_THREADS = 1
+SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES = {"extratrees"}
+FAMILY_SPECIFIC_INFERENCE_POLICY = (
+    "family_specific_semaphore_free_sklearn_forest_v1"
+)
 REMOTE_PREFLIGHT_SCHEMA = "mft-tier1-current7-remote-model-load-v1"
 SEARCH_RESULT_SCHEMA = "mft-tier1-current7-search-seed-v1"
 WARM_ROLE_PARTITION_SCHEMA = "mft-tier1-authenticated-warm-role-partition-v1"
@@ -2772,6 +2776,9 @@ def _terminal_inference_binding_contract(
         "target_count",
         "model_count",
         "families",
+        "family_threads",
+        "semaphore_free_families",
+        "semaphore_free_sklearn_forest",
         "policy",
     }
     if not required.issubset(binding):
@@ -2780,12 +2787,9 @@ def _terminal_inference_binding_contract(
     target_count = binding.get("target_count")
     model_count = binding.get("model_count")
     families = binding.get("families")
+    family_threads = binding.get("family_threads")
+    semaphore_free_families = binding.get("semaphore_free_families")
     policy = binding.get("policy")
-    expected_policy = (
-        "outer_restart_parallelism_inner_model_serial_v1"
-        if isinstance(threads, int) and threads <= 4
-        else "single_optimizer_process_eight_cpu_supported_family_binding_v1"
-    )
     supported_families = {
         "lightgbm",
         "xgboost",
@@ -2805,7 +2809,23 @@ def _terminal_inference_binding_contract(
         or not families
         or families != sorted(set(families))
         or not set(families).issubset(supported_families)
-        or policy != expected_policy
+        or not isinstance(family_threads, Mapping)
+        or set(family_threads) != set(families)
+        or any(
+            family_threads[family]
+            != (
+                1
+                if family in SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
+                else threads
+            )
+            for family in families
+        )
+        or semaphore_free_families
+        != sorted(
+            set(families) & SKLEARN_FOREST_SEMAPHORE_FREE_FAMILIES
+        )
+        or binding.get("semaphore_free_sklearn_forest") is not True
+        or policy != FAMILY_SPECIFIC_INFERENCE_POLICY
     ):
         raise RuntimeError("terminal replay inference binding contract mismatch")
     return True, int(threads)
@@ -3781,46 +3801,18 @@ def bind_surrogate_inference(
     *,
     threads: int,
 ) -> dict[str, Any]:
-    """Bind the supported ensemble families up to the eight-CPU lane limit."""
+    """Bind safe per-family threads up to the eight-CPU lane limit."""
 
     if isinstance(threads, bool) or int(threads) != threads or not 1 <= int(threads) <= 8:
         raise ValueError("inference threads must be an integer from 1 through 8")
     threads = int(threads)
-    if threads <= 4:
-        return run_nsga2_module._bound_surrogate_inference(
-            models, threads=threads
-        )
-    evidence = []
-    for target in CURRENT_REQUIRED_MODEL_TARGETS:
-        model = models[target]
-        configured = []
-        for family, fitted in model.bundle["models"]:
-            family_name = str(family).lower()
-            if family_name not in {
-                "lightgbm",
-                "xgboost",
-                "catboost",
-                "extratrees",
-            }:
-                raise RuntimeError(f"cannot bind unsupported family: {family_name}")
-            if family_name != "catboost":
-                if not hasattr(fitted, "n_jobs"):
-                    raise RuntimeError(f"{family_name} model has no n_jobs control")
-                fitted.n_jobs = threads
-                if int(fitted.n_jobs) != threads:
-                    raise RuntimeError(f"failed to bind {family_name} threads")
-            configured.append(family_name)
-        model.inference_threads = threads
-        evidence.append({"target": target, "families": configured})
-    return {
-        "threads_per_model": threads,
-        "target_count": len(evidence),
-        "model_count": sum(len(item["families"]) for item in evidence),
-        "families": sorted({
-            family for item in evidence for family in item["families"]
-        }),
-        "policy": "single_optimizer_process_eight_cpu_supported_family_binding_v1",
-    }
+    binding = run_nsga2_module._bound_surrogate_inference(
+        models, threads=threads
+    )
+    managed, bound_threads = _terminal_inference_binding_contract(binding)
+    if not managed or bound_threads != threads:
+        raise RuntimeError("family-specific inference binding attestation failed")
+    return binding
 
 
 def build_authenticated_runner(
