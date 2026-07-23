@@ -376,6 +376,184 @@ def _git_provenance():
 GIT_HASH, GIT_DIRTY = _git_provenance()
 
 
+STANDALONE_CORE_CONTRACT_VERSION = "mft-standalone-core-optin-v1"
+STANDALONE_CORE_CONTRACT_ENV = "MFT_STANDALONE_CORE_CONTRACT"
+STANDALONE_CORE_COUNT_ENV = "MFT_STANDALONE_CORE_COUNT"
+STANDALONE_CORE_AUTH_ENV = "MFT_STANDALONE_CORE_AUTH_SHA256"
+STANDALONE_CORE_OPT_IN_COUNT = 8
+_STANDALONE_CORE_OPT_IN_ENV_NAMES = (
+    STANDALONE_CORE_CONTRACT_ENV,
+    STANDALONE_CORE_COUNT_ENV,
+    STANDALONE_CORE_AUTH_ENV,
+)
+
+
+def standalone_core_contract_auth_sha256(
+        solver_revision, requested_num_cores=STANDALONE_CORE_OPT_IN_COUNT):
+    """Return the revision-bound digest required by the 8-core opt-in.
+
+    This is deliberately an integrity/authentication token rather than a
+    general-purpose tuning knob. A submitter must bind the exact committed
+    solver revision, standalone backend, Slurm CPU request, and core count.
+    """
+    revision = str(solver_revision or "").strip().lower()
+    requested = int(requested_num_cores)
+    payload = {
+        "backend": "standalone",
+        "contract_version": STANDALONE_CORE_CONTRACT_VERSION,
+        "requested_num_cores": requested,
+        "required_slurm_cpus_per_task": requested,
+        "solver_revision": revision,
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _positive_decimal_environment(environ, name):
+    value = str(environ.get(name, "") or "").strip()
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise RuntimeError(
+            f"standalone core opt-in requires positive decimal {name}; "
+            f"actual={value!r}"
+        )
+    return int(value)
+
+
+def resolve_solver_core_policy(
+        backend, *, environ=None, affinity_count=None,
+        solver_revision=None, solver_dirty=None):
+    """Resolve the default four-core cap or the exact fail-closed 8-core opt-in."""
+    env = os.environ if environ is None else environ
+    backend_mode = str(backend or "").strip().lower()
+    revision = str(
+        GIT_HASH if solver_revision is None else solver_revision
+    ).strip().lower()
+    dirty = int(GIT_DIRTY if solver_dirty is None else solver_dirty)
+
+    if affinity_count is None:
+        try:
+            available = len(os.sched_getaffinity(0))
+        except AttributeError:
+            available = 4
+    else:
+        available = int(affinity_count)
+    if available < 1:
+        raise RuntimeError(
+            f"solver CPU affinity readback is invalid: {available!r}"
+        )
+
+    present = tuple(
+        name for name in _STANDALONE_CORE_OPT_IN_ENV_NAMES if name in env
+    )
+    slurm_cpus_raw = str(env.get("SLURM_CPUS_PER_TASK", "") or "").strip()
+    task_id_raw = str(env.get("SLURM_SCHED_TASK_ID", "") or "").strip()
+    slurm_job_id_raw = str(env.get("SLURM_JOB_ID", "") or "").strip()
+    if not present:
+        effective = max(1, min(available, 4))
+        return {
+            "schema": "mft-solver-core-policy-v1",
+            "contract_version": "default-four-core-cap-v1",
+            "opt_in": False,
+            "backend": backend_mode,
+            "requested_num_cores": 4,
+            "effective_num_cores": effective,
+            "num_tasks": 1,
+            "affinity_count_readback": available,
+            "slurm_cpus_per_task_readback": slurm_cpus_raw,
+            "scheduler_task_id_readback": task_id_raw,
+            "slurm_job_id_readback": slurm_job_id_raw,
+            "auth_sha256": "",
+            "solver_revision": revision,
+            "solver_dirty": dirty,
+        }
+
+    if len(present) != len(_STANDALONE_CORE_OPT_IN_ENV_NAMES):
+        missing = sorted(set(_STANDALONE_CORE_OPT_IN_ENV_NAMES) - set(present))
+        raise RuntimeError(
+            "partial standalone core opt-in rejected; "
+            f"present={list(present)}, missing={missing}"
+        )
+    if backend_mode != "standalone":
+        raise RuntimeError(
+            "standalone core opt-in is forbidden for backend "
+            f"{backend_mode!r}"
+        )
+    if dirty != 0:
+        raise RuntimeError(
+            "standalone core opt-in requires a clean committed solver revision"
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError(
+            "standalone core opt-in requires an exact 40-hex solver revision; "
+            f"actual={revision!r}"
+        )
+
+    contract = str(env.get(STANDALONE_CORE_CONTRACT_ENV, "") or "").strip()
+    if contract != STANDALONE_CORE_CONTRACT_VERSION:
+        raise RuntimeError(
+            "standalone core contract version mismatch: "
+            f"expected={STANDALONE_CORE_CONTRACT_VERSION!r}, actual={contract!r}"
+        )
+    requested = _positive_decimal_environment(env, STANDALONE_CORE_COUNT_ENV)
+    if requested != STANDALONE_CORE_OPT_IN_COUNT:
+        raise RuntimeError(
+            "standalone core opt-in permits exactly "
+            f"{STANDALONE_CORE_OPT_IN_COUNT} cores; actual={requested}"
+        )
+    expected_auth = standalone_core_contract_auth_sha256(revision, requested)
+    actual_auth = str(env.get(STANDALONE_CORE_AUTH_ENV, "") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", actual_auth) or actual_auth != expected_auth:
+        raise RuntimeError(
+            "standalone core opt-in authentication digest mismatch"
+        )
+
+    slurm_cpus = _positive_decimal_environment(env, "SLURM_CPUS_PER_TASK")
+    if slurm_cpus != requested:
+        raise RuntimeError(
+            "standalone core opt-in Slurm allocation mismatch: "
+            f"requested={requested}, SLURM_CPUS_PER_TASK={slurm_cpus}"
+        )
+    scheduler_task_id = _positive_decimal_environment(
+        env, "SLURM_SCHED_TASK_ID"
+    )
+    slurm_job_id = _positive_decimal_environment(env, "SLURM_JOB_ID")
+    if available < requested:
+        raise RuntimeError(
+            "standalone core opt-in affinity is smaller than the authenticated "
+            f"request: requested={requested}, affinity={available}"
+        )
+
+    return {
+        "schema": "mft-solver-core-policy-v1",
+        "contract_version": contract,
+        "opt_in": True,
+        "backend": backend_mode,
+        "requested_num_cores": requested,
+        "effective_num_cores": requested,
+        "num_tasks": 1,
+        "affinity_count_readback": available,
+        "slurm_cpus_per_task_readback": slurm_cpus,
+        "scheduler_task_id_readback": scheduler_task_id,
+        "slurm_job_id_readback": slurm_job_id,
+        "auth_sha256": actual_auth,
+        "solver_revision": revision,
+        "solver_dirty": dirty,
+    }
+
+
+def _emit_solver_core_evidence(marker, evidence):
+    print(
+        f"{marker} "
+        + json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        ),
+        flush=True,
+    )
+
+
 def _library_git_provenance():
     """Return the imported pyaedt_library full revision and tracked-src dirty flag."""
     try:
@@ -1948,12 +2126,19 @@ class Simulation():
         # 실제 사용가능 코어(cgroup affinity)에 맞춤. SLURM_CPUS_PER_TASK는 packed
         # 잡에서 잡 전체 값(예: 64)이라 4코어 cgroup에 64스레드를 요청하는 사고 유발
         # (2026-07-09 심야 전면 저속의 원인). 상한 4 = 검증된 캠페인 구성.
-        try:
-            avail = len(os.sched_getaffinity(0))
-        except AttributeError:
-            avail = 4  # Windows
-        self.NUM_CORE = max(1, min(avail, 4))
-        self.NUM_TASK = 1
+        # Default behavior remains capped at four cores. The only exception is
+        # the revision-bound standalone contract resolved before AEDT starts.
+        self.aedt_backend = aedt_backend()
+        self.solver_core_policy = resolve_solver_core_policy(self.aedt_backend)
+        self.NUM_CORE = int(
+            self.solver_core_policy["effective_num_cores"]
+        )
+        self.NUM_TASK = int(self.solver_core_policy["num_tasks"])
+        self.solver_core_dispatch_evidence = {}
+        self.solver_core_readback_evidence = {}
+        _emit_solver_core_evidence(
+            "SOLVER_CORE_CONTRACT_JSON", self.solver_core_policy
+        )
         self.desktop = desktop
         # PyAEDT 0.22 re-enters ``Desktop.__init__`` whenever an application
         # wrapper (Maxwell3d/Icepak) is constructed.  With multi-desktop mode
@@ -1974,7 +2159,6 @@ class Simulation():
         self.extraction_units = {}
         self.spawned_descendants = {}
         self.stage_timings = {}
-        self.aedt_backend = aedt_backend()
         self.aedt_lease = None
         self.pooled_release_done = False
         self.pooled_activation_done = False
@@ -2445,6 +2629,16 @@ class Simulation():
     def _backend_mode(self):
         """Return the backend captured for this runner instance."""
         return str(getattr(self, "aedt_backend", "") or aedt_backend())
+
+    def _record_solver_core_dispatch(self, label, evidence):
+        if not hasattr(self, "solver_core_dispatch_evidence"):
+            self.solver_core_dispatch_evidence = {}
+        record = dict(evidence)
+        record.setdefault("schema", "mft-solver-core-dispatch-v1")
+        record.setdefault("stage", str(label))
+        self.solver_core_dispatch_evidence[str(label)] = record
+        _emit_solver_core_evidence("SOLVER_CORE_DISPATCH_JSON", record)
+        return record
 
     def aedt_automation_transaction(self):
         """Protect one Desktop-global attach/model/extract/save transaction."""
@@ -6064,7 +6258,7 @@ class Simulation():
         return oproject, odesign
 
     def _validated_matrix_hpc_acf(self, acf_path=None):
-        """Return the matrix solve's exact 4-core/one-engine DSO configuration."""
+        """Return the matrix solve's exact requested-core/one-engine DSO config."""
         if acf_path is None:
             matrix_design = getattr(self, "design_matrix", None)
             solver = getattr(matrix_design, "solver_instance", None)
@@ -6114,6 +6308,21 @@ class Simulation():
             raise RuntimeError(
                 f"authoritative matrix HPC ACF contract mismatch: {mismatches}"
             )
+        evidence = {
+            "schema": "mft-solver-core-readback-v1",
+            "source": "matrix_hpc_acf",
+            "num_cores_readback": int(self.NUM_CORE),
+            "num_engines_readback": int(self.NUM_TASK),
+            "num_gpus_readback": 0,
+            "config_name_readback": "pyaedt_config",
+            "acf_sha256": hashlib.sha256(
+                text.encode("utf-8")
+            ).hexdigest(),
+        }
+        if not hasattr(self, "solver_core_readback_evidence"):
+            self.solver_core_readback_evidence = {}
+        self.solver_core_readback_evidence["matrix_hpc_acf"] = evidence
+        _emit_solver_core_evidence("SOLVER_CORE_READBACK_JSON", evidence)
         return path
 
     def _capture_matrix_hpc_acf(
@@ -6284,6 +6493,7 @@ class Simulation():
                     "registry_key": registry_key,
                     "original_config": original_config,
                     "acf_path": acf_path,
+                    "dso_config_readback": actual,
                 }
             except _AedtIdentityMismatch:
                 if config_may_be_active and original_config:
@@ -6669,6 +6879,15 @@ class Simulation():
                         if pooled_backend
                         else {"cores": self.NUM_CORE}
                     )
+                    self._record_solver_core_dispatch(label, {
+                        "dispatch": "pyaedt_setup_analyze",
+                        "backend": (
+                            "pooled" if pooled_backend else "standalone"
+                        ),
+                        "cores_argument": analyze_kwargs.get("cores"),
+                        "tasks_argument": analyze_kwargs.get("tasks"),
+                        "gpus_argument": analyze_kwargs.get("gpus"),
+                    })
                     analyze_result = self.design1.setup.analyze(**analyze_kwargs)
                     if analyze_result is False:
                         raise RuntimeError(f"[{label}] Setup1 analyze returned False")
@@ -6698,6 +6917,19 @@ class Simulation():
                 self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
                 t0 = time.time()
                 try:
+                    self._record_solver_core_dispatch(label, {
+                        "dispatch": "native_analyze_validated_dso",
+                        "backend": "standalone",
+                        "cores_argument": int(self.NUM_CORE),
+                        "tasks_argument": int(self.NUM_TASK),
+                        "gpus_argument": 0,
+                        "dso_config_readback": context.get(
+                            "dso_config_readback"
+                        ),
+                        "acf_sha256": getattr(
+                            self, "solver_core_readback_evidence", {}
+                        ).get("matrix_hpc_acf", {}).get("acf_sha256", ""),
+                    })
                     if getattr(self, "aedt_backend", "standalone") == "pooled":
                         self.solver_may_be_running = True
                     analyze_result = dispatch_design.Analyze("Setup1", True)
@@ -6798,6 +7030,63 @@ class Simulation():
         )
         row["matrix_conductor_policy"] = getattr(
             self, "matrix_conductor_policy", "not_recorded"
+        )
+        core_policy = dict(getattr(self, "solver_core_policy", {}) or {})
+        row["solver_core_policy_schema"] = core_policy.get(
+            "schema", "not_recorded"
+        )
+        row["solver_core_contract_version"] = core_policy.get(
+            "contract_version", "not_recorded"
+        )
+        row["solver_core_opt_in"] = int(bool(core_policy.get("opt_in", False)))
+        row["solver_core_backend"] = core_policy.get(
+            "backend", getattr(self, "aedt_backend", "not_recorded")
+        )
+        row["solver_num_cores_requested"] = int(core_policy.get(
+            "requested_num_cores", getattr(self, "NUM_CORE", -1)
+        ))
+        row["solver_num_cores_effective"] = int(core_policy.get(
+            "effective_num_cores", getattr(self, "NUM_CORE", -1)
+        ))
+        row["solver_num_tasks_effective"] = int(core_policy.get(
+            "num_tasks", getattr(self, "NUM_TASK", -1)
+        ))
+        row["solver_core_affinity_count_readback"] = int(core_policy.get(
+            "affinity_count_readback", -1
+        ))
+        row["solver_core_slurm_cpus_per_task_readback"] = str(
+            core_policy.get("slurm_cpus_per_task_readback", "")
+        )
+        row["solver_core_scheduler_task_id_readback"] = str(
+            core_policy.get("scheduler_task_id_readback", "")
+        )
+        row["solver_core_slurm_job_id_readback"] = str(
+            core_policy.get("slurm_job_id_readback", "")
+        )
+        row["solver_core_auth_sha256"] = core_policy.get("auth_sha256", "")
+        dispatch_evidence = dict(
+            getattr(self, "solver_core_dispatch_evidence", {}) or {}
+        )
+        readback_evidence = dict(
+            getattr(self, "solver_core_readback_evidence", {}) or {}
+        )
+        row["solver_core_dispatch_evidence_json"] = json.dumps(
+            dispatch_evidence, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        row["solver_core_readback_evidence_json"] = json.dumps(
+            readback_evidence, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        matrix_readback = readback_evidence.get("matrix_hpc_acf", {})
+        row["solver_matrix_hpc_num_cores_readback"] = int(
+            matrix_readback.get("num_cores_readback", -1)
+        )
+        row["solver_matrix_hpc_num_engines_readback"] = int(
+            matrix_readback.get("num_engines_readback", -1)
+        )
+        row["solver_matrix_hpc_acf_sha256"] = matrix_readback.get(
+            "acf_sha256", ""
         )
         row["loss_copy_prepare_attempts"] = int(getattr(
             self, "loss_copy_prepare_attempts", 0
