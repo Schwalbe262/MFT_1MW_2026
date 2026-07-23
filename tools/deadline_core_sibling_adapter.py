@@ -195,7 +195,7 @@ CANDIDATES = {
             "9f43cd81cf79fc4bc786eea4a11937facfae3f4d0723d161d903b13c20f1b32f",
         "license_snapshot_sha256":
             "04d600475854ff002f976a1c8b06a816781149fd452de7b51e3bb40cadbdf812",
-        "standard_task_ids": frozenset({95031}),
+        "standard_task_ids": frozenset({95031, 95043}),
     },
     95033: {
         "task_name": "mft-b428t2f6p5full16c-f-697dd4ac3e0b086b",
