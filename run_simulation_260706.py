@@ -377,38 +377,179 @@ GIT_HASH, GIT_DIRTY = _git_provenance()
 
 
 STANDALONE_CORE_CONTRACT_VERSION = "mft-standalone-core-optin-v1"
+STANDALONE_CORE_16_CONTRACT_VERSION = "mft-standalone-core-16-optin-v1"
 STANDALONE_CORE_CONTRACT_ENV = "MFT_STANDALONE_CORE_CONTRACT"
 STANDALONE_CORE_COUNT_ENV = "MFT_STANDALONE_CORE_COUNT"
 STANDALONE_CORE_AUTH_ENV = "MFT_STANDALONE_CORE_AUTH_SHA256"
+STANDALONE_CORE_LICENSE_CONTRACT_ENV = (
+    "MFT_STANDALONE_CORE_LICENSE_CONTRACT"
+)
+STANDALONE_CORE_LICENSE_SNAPSHOT_ENV = (
+    "MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_JSON"
+)
+STANDALONE_CORE_LICENSE_SNAPSHOT_SHA_ENV = (
+    "MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_SHA256"
+)
+STANDALONE_CORE_16_LICENSE_CONTRACT_VERSION = (
+    "mft-aedt-hpc-license-snapshot-v1"
+)
 STANDALONE_CORE_OPT_IN_COUNT = 8
+STANDALONE_CORE_16_OPT_IN_COUNT = 16
 _STANDALONE_CORE_OPT_IN_ENV_NAMES = (
     STANDALONE_CORE_CONTRACT_ENV,
     STANDALONE_CORE_COUNT_ENV,
     STANDALONE_CORE_AUTH_ENV,
 )
+_STANDALONE_CORE_LICENSE_ENV_NAMES = (
+    STANDALONE_CORE_LICENSE_CONTRACT_ENV,
+    STANDALONE_CORE_LICENSE_SNAPSHOT_ENV,
+    STANDALONE_CORE_LICENSE_SNAPSHOT_SHA_ENV,
+)
+_STANDALONE_CORE_CONTRACT_BY_COUNT = {
+    STANDALONE_CORE_OPT_IN_COUNT: STANDALONE_CORE_CONTRACT_VERSION,
+    STANDALONE_CORE_16_OPT_IN_COUNT: STANDALONE_CORE_16_CONTRACT_VERSION,
+}
 
 
 def standalone_core_contract_auth_sha256(
-        solver_revision, requested_num_cores=STANDALONE_CORE_OPT_IN_COUNT):
-    """Return the revision-bound digest required by the 8-core opt-in.
+        solver_revision, requested_num_cores=STANDALONE_CORE_OPT_IN_COUNT,
+        *, license_contract="", license_snapshot_sha256=""):
+    """Return the revision-bound digest required by a core-count opt-in.
 
     This is deliberately an integrity/authentication token rather than a
     general-purpose tuning knob. A submitter must bind the exact committed
     solver revision, standalone backend, Slurm CPU request, and core count.
+    The isolated 16-core sibling additionally binds a fresh license snapshot.
     """
     revision = str(solver_revision or "").strip().lower()
     requested = int(requested_num_cores)
+    contract_version = _STANDALONE_CORE_CONTRACT_BY_COUNT.get(requested)
+    if contract_version is None:
+        raise ValueError(
+            f"unsupported standalone core opt-in count: {requested}"
+        )
     payload = {
         "backend": "standalone",
-        "contract_version": STANDALONE_CORE_CONTRACT_VERSION,
+        "contract_version": contract_version,
         "requested_num_cores": requested,
         "required_slurm_cpus_per_task": requested,
         "solver_revision": revision,
     }
+    if requested == STANDALONE_CORE_16_OPT_IN_COUNT:
+        payload["license_contract"] = str(license_contract or "").strip()
+        payload["license_snapshot_sha256"] = str(
+            license_snapshot_sha256 or ""
+        ).strip().lower()
     canonical = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validated_16_core_license_snapshot(environ, now_utc=None):
+    """Authenticate a fresh scheduler license snapshot for the 16-core sibling."""
+    present = tuple(
+        name for name in _STANDALONE_CORE_LICENSE_ENV_NAMES if name in environ
+    )
+    if len(present) != len(_STANDALONE_CORE_LICENSE_ENV_NAMES):
+        missing = sorted(set(_STANDALONE_CORE_LICENSE_ENV_NAMES) - set(present))
+        raise RuntimeError(
+            "16-core standalone opt-in requires complete license evidence; "
+            f"present={list(present)}, missing={missing}"
+        )
+    contract = str(
+        environ.get(STANDALONE_CORE_LICENSE_CONTRACT_ENV, "") or ""
+    ).strip()
+    if contract != STANDALONE_CORE_16_LICENSE_CONTRACT_VERSION:
+        raise RuntimeError(
+            "16-core license contract version mismatch: "
+            f"expected={STANDALONE_CORE_16_LICENSE_CONTRACT_VERSION!r}, "
+            f"actual={contract!r}"
+        )
+    snapshot_json = str(
+        environ.get(STANDALONE_CORE_LICENSE_SNAPSHOT_ENV, "") or ""
+    ).strip()
+    actual_sha = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    expected_sha = str(
+        environ.get(STANDALONE_CORE_LICENSE_SNAPSHOT_SHA_ENV, "") or ""
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha) or actual_sha != expected_sha:
+        raise RuntimeError("16-core license snapshot SHA-256 mismatch")
+    try:
+        snapshot = json.loads(snapshot_json)
+    except Exception as error:
+        raise RuntimeError("16-core license snapshot JSON is invalid") from error
+    if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("schema")
+            != "mft-aedt-license-headroom-snapshot-v1"
+            or snapshot.get("server_up") is not True
+            or snapshot.get("server") != "1055@172.16.10.81"):
+        raise RuntimeError("16-core license snapshot identity is invalid")
+    checked_at_raw = str(snapshot.get("checked_at") or "").strip()
+    try:
+        checked_at = datetime.fromisoformat(
+            checked_at_raw.replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "16-core license snapshot timestamp is invalid"
+        ) from error
+    if checked_at.tzinfo is None:
+        raise RuntimeError("16-core license snapshot timestamp has no timezone")
+    observed_now = (
+        datetime.now(timezone.utc) if now_utc is None else now_utc
+    )
+    if observed_now.tzinfo is None:
+        raise RuntimeError("16-core license validation clock has no timezone")
+    age_seconds = (
+        observed_now.astimezone(timezone.utc)
+        - checked_at.astimezone(timezone.utc)
+    ).total_seconds()
+    if age_seconds < -30.0 or age_seconds > 600.0:
+        raise RuntimeError(
+            "16-core license snapshot is stale: "
+            f"age_seconds={age_seconds:.3f}"
+        )
+    features = snapshot.get("features")
+    if not isinstance(features, dict):
+        raise RuntimeError("16-core license feature readback is invalid")
+    required_headroom = {
+        "anshpc": 16,
+        "elec_solve_maxwell": 1,
+        "electronics_desktop": 1,
+        "electronics3d_gui": 1,
+    }
+    headroom = {}
+    for feature, minimum in required_headroom.items():
+        record = features.get(feature)
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"16-core license snapshot is missing {feature}"
+            )
+        total = record.get("total")
+        used = record.get("used")
+        if (
+                isinstance(total, bool) or not isinstance(total, int)
+                or isinstance(used, bool) or not isinstance(used, int)
+                or total < 0 or used < 0 or used > total):
+            raise RuntimeError(
+                f"16-core license snapshot has invalid {feature} counters"
+            )
+        available = total - used
+        if available < minimum:
+            raise RuntimeError(
+                f"16-core license headroom is insufficient for {feature}: "
+                f"required={minimum}, available={available}"
+            )
+        headroom[feature] = available
+    return {
+        "contract": contract,
+        "snapshot_sha256": actual_sha,
+        "checked_at": checked_at.astimezone(timezone.utc).isoformat(),
+        "age_seconds": age_seconds,
+        "headroom_readback": headroom,
+    }
 
 
 def _positive_decimal_environment(environ, name):
@@ -423,8 +564,8 @@ def _positive_decimal_environment(environ, name):
 
 def resolve_solver_core_policy(
         backend, *, environ=None, affinity_count=None,
-        solver_revision=None, solver_dirty=None):
-    """Resolve the default four-core cap or the exact fail-closed 8-core opt-in."""
+        solver_revision=None, solver_dirty=None, license_now_utc=None):
+    """Resolve the default cap or an exact fail-closed 8/16-core opt-in."""
     env = os.environ if environ is None else environ
     backend_mode = str(backend or "").strip().lower()
     revision = str(
@@ -491,18 +632,38 @@ def resolve_solver_core_policy(
         )
 
     contract = str(env.get(STANDALONE_CORE_CONTRACT_ENV, "") or "").strip()
-    if contract != STANDALONE_CORE_CONTRACT_VERSION:
+    requested = _positive_decimal_environment(env, STANDALONE_CORE_COUNT_ENV)
+    expected_contract = _STANDALONE_CORE_CONTRACT_BY_COUNT.get(requested)
+    if expected_contract is None:
+        raise RuntimeError(
+            "standalone core opt-in permits exactly 8 or 16 cores; "
+            f"actual={requested}"
+        )
+    if contract != expected_contract:
         raise RuntimeError(
             "standalone core contract version mismatch: "
-            f"expected={STANDALONE_CORE_CONTRACT_VERSION!r}, actual={contract!r}"
+            f"expected={expected_contract!r}, actual={contract!r}"
         )
-    requested = _positive_decimal_environment(env, STANDALONE_CORE_COUNT_ENV)
-    if requested != STANDALONE_CORE_OPT_IN_COUNT:
+    license_evidence = None
+    if requested == STANDALONE_CORE_16_OPT_IN_COUNT:
+        license_evidence = _validated_16_core_license_snapshot(
+            env, now_utc=license_now_utc
+        )
+    elif any(name in env for name in _STANDALONE_CORE_LICENSE_ENV_NAMES):
         raise RuntimeError(
-            "standalone core opt-in permits exactly "
-            f"{STANDALONE_CORE_OPT_IN_COUNT} cores; actual={requested}"
+            "8-core standalone opt-in rejects unexpected 16-core license "
+            "evidence"
         )
-    expected_auth = standalone_core_contract_auth_sha256(revision, requested)
+    expected_auth = standalone_core_contract_auth_sha256(
+        revision,
+        requested,
+        license_contract=(
+            license_evidence["contract"] if license_evidence else ""
+        ),
+        license_snapshot_sha256=(
+            license_evidence["snapshot_sha256"] if license_evidence else ""
+        ),
+    )
     actual_auth = str(env.get(STANDALONE_CORE_AUTH_ENV, "") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", actual_auth) or actual_auth != expected_auth:
         raise RuntimeError(
@@ -525,7 +686,7 @@ def resolve_solver_core_policy(
             f"request: requested={requested}, affinity={available}"
         )
 
-    return {
+    policy = {
         "schema": "mft-solver-core-policy-v1",
         "contract_version": contract,
         "opt_in": True,
@@ -541,6 +702,21 @@ def resolve_solver_core_policy(
         "solver_revision": revision,
         "solver_dirty": dirty,
     }
+    if license_evidence is not None:
+        policy.update({
+            "license_contract": license_evidence["contract"],
+            "license_snapshot_sha256": license_evidence[
+                "snapshot_sha256"
+            ],
+            "license_checked_at_readback": license_evidence["checked_at"],
+            "license_snapshot_age_seconds_readback": license_evidence[
+                "age_seconds"
+            ],
+            "license_headroom_readback": license_evidence[
+                "headroom_readback"
+            ],
+        })
+    return policy
 
 
 def _emit_solver_core_evidence(marker, evidence):
@@ -7064,6 +7240,22 @@ class Simulation():
             core_policy.get("slurm_job_id_readback", "")
         )
         row["solver_core_auth_sha256"] = core_policy.get("auth_sha256", "")
+        row["solver_core_license_contract"] = core_policy.get(
+            "license_contract", ""
+        )
+        row["solver_core_license_snapshot_sha256"] = core_policy.get(
+            "license_snapshot_sha256", ""
+        )
+        row["solver_core_license_checked_at_readback"] = core_policy.get(
+            "license_checked_at_readback", ""
+        )
+        row["solver_core_license_snapshot_age_seconds_readback"] = (
+            core_policy.get("license_snapshot_age_seconds_readback", "")
+        )
+        row["solver_core_license_headroom_readback_json"] = json.dumps(
+            core_policy.get("license_headroom_readback", {}),
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
         dispatch_evidence = dict(
             getattr(self, "solver_core_dispatch_evidence", {}) or {}
         )
