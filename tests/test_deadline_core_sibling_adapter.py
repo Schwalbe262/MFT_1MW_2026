@@ -101,6 +101,7 @@ def test_standard_pair_allowlist_is_exact():
     assert adapter.CANDIDATES[95033]["standard_task_ids"] == {95037}
     assert adapter.CANDIDATES[95039]["standard_task_ids"] == {95034}
     assert adapter.CANDIDATES[95040]["standard_task_ids"] == {95038}
+    assert adapter.CANDIDATES[95042]["standard_task_ids"] == {95041}
 
 
 def test_revision_attestation_matches_exact_reviewed_chain():

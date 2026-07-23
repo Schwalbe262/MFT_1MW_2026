@@ -254,6 +254,25 @@ CANDIDATES = {
             "faa26bd0efa5a638bebd82992cf5dcf5f56fed363a13ac27c1254339605b38bc",
         "standard_task_ids": frozenset({95038}),
     },
+    95042: {
+        "task_name": "mft-b428t1f6full16cs-f-7c3a5ab1d7a29df6",
+        "plan_sha256":
+            "bb53291ec11ef071be50021c88fa6223576dd55f97a2b6720e01c918105f4737",
+        "source_receipt_sha256":
+            "c08958eb4846387306c7c394e924417f96204b4377905ca15adfbacad90e2093",
+        "identity":
+            "9a5cdb2a7a842df0ab3ac0e4050c349844be1eaea4d322a63a328be76d27ceed",
+        "digest":
+            "7c3a5ab1d7a29df67c7941934df87ed7e573dd60f41b82c31d9d6a4ce5512084",
+        "runtime_revision": CORE16_SOLVER_REVISION,
+        "cores": 16,
+        "core_contract_version": "mft-standalone-core-16-optin-v1",
+        "core_auth":
+            "29528e4e5752d7e015c6df3e23db3d144b6c471bad59f3cdc27094e6965c3eac",
+        "license_snapshot_sha256":
+            "d3ffa5e7f445efcfbded81c06524bd8bc0ca06f37bc6119d3c841d41eb33d042",
+        "standard_task_ids": frozenset({95041}),
+    },
 }
 
 
