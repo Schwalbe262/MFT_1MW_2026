@@ -4120,6 +4120,7 @@ class Simulation():
 
         for attempt in range(1, max_attempts + 1):
             self.extraction_attempts[extraction_key] = self.extraction_attempts.get(extraction_key, 0) + 1
+            singleton_recovered = False
             try:
                 self._prepare_pooled_solution_data_app()
                 post = self.design1.post
@@ -4170,8 +4171,83 @@ class Simulation():
                         except (TypeError, ValueError, OverflowError) as e:
                             missing.append(expression)
                             last_error = e
+                    # AEDT 2025 R2 can return a partially populated Fields
+                    # SolutionData object for a large named-expression batch.
+                    # This is an extraction transport defect, not missing
+                    # physics: retry only the missing expressions as singleton
+                    # native field queries before discarding the solved design.
+                    # Values already read from the batch remain untouched.
+                    if missing and report_category == "Fields":
+                        missing_aliases = {
+                            expression: alias
+                            for expression, alias in zip(expressions, aliases)
+                            if expression in missing
+                        }
+                        still_missing = []
+                        for expression in missing:
+                            try:
+                                singleton = post.get_solution_data_per_variation(
+                                    solution_type="Fields",
+                                    setup_sweep_name="Setup1 : LastAdaptive",
+                                    context=[],
+                                    sweeps={
+                                        "Freq": ["All"],
+                                        "Phase": ["0deg"],
+                                    },
+                                    expressions=[expression],
+                                )
+                                if singleton is None or singleton is False:
+                                    raise RuntimeError(
+                                        "singleton field query returned no "
+                                        "usable response"
+                                    )
+                                singleton_units = (
+                                    getattr(singleton, "units_data", {}) or {}
+                                )
+                                if hasattr(singleton, "get_expression_data"):
+                                    _, values = singleton.get_expression_data(
+                                        expression, formula="real"
+                                    )
+                                else:
+                                    values = singleton.data_real(expression)
+                                if (
+                                    values is None
+                                    or values is False
+                                    or len(values) == 0
+                                ):
+                                    raise RuntimeError(
+                                        "singleton field query returned no "
+                                        "values"
+                                    )
+                                value = _convert_solution_unit(
+                                    float(values[0]),
+                                    singleton_units.get(expression, ""),
+                                    target_units.get(expression, ""),
+                                )
+                                if not math.isfinite(value):
+                                    raise RuntimeError(
+                                        "singleton field query returned a "
+                                        "non-finite value"
+                                    )
+                                row[missing_aliases[expression]] = value
+                                singleton_recovered = True
+                                units[expression] = singleton_units.get(
+                                    expression, ""
+                                )
+                            except Exception as recovery_error:
+                                still_missing.append(expression)
+                                last_error = recovery_error
+                        missing = still_missing
+                        self.extraction_units[extraction_key] = {
+                            expression: str(units.get(expression, "") or "")
+                            for expression in expressions
+                        }
                     if not missing:
-                        self.extraction_backends[extraction_key] = backend
+                        self.extraction_backends[extraction_key] = (
+                            backend + "+singleton_recovery"
+                            if singleton_recovered
+                            else backend
+                        )
                         return pd.DataFrame([row], columns=aliases)
                     last_error = RuntimeError("missing/non-finite expressions: " + ", ".join(missing))
             except Exception as e:

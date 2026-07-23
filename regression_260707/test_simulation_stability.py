@@ -635,6 +635,70 @@ class SolutionDataTests(unittest.TestCase):
             "get_solution_data_per_variation",
         )
 
+    def test_partial_fields_batch_recovers_only_missing_singletons(self):
+        post = _FakePost([
+            _FakeSolution(
+                {"P_core": [12.5], "B_max_core": []},
+                {"P_core": "W", "B_max_core": "T"},
+            ),
+            _FakeSolution(
+                {"B_max_core": [1.125]},
+                {"B_max_core": "T"},
+            ),
+        ])
+        simulation = _simulation_with_post(post)
+
+        frame = simulation._solution_data_frame(
+            ["P_core", "B_max_core"],
+            report_category="Fields",
+            extraction_key="loss",
+            retry_delay=0,
+        )
+
+        self.assertEqual(frame["P_core"].iloc[0], 12.5)
+        self.assertEqual(frame["B_max_core"].iloc[0], 1.125)
+        self.assertEqual(len(post.field_calls), 2)
+        self.assertEqual(
+            post.field_calls[1]["expressions"],
+            ["B_max_core"],
+        )
+        self.assertEqual(
+            simulation.extraction_backends["loss"],
+            "get_solution_data_per_variation+singleton_recovery",
+        )
+
+    def test_partial_fields_singleton_recovery_remains_fail_closed(self):
+        responses = []
+        for _ in range(3):
+            responses.extend([
+                _FakeSolution(
+                    {"P_core": [12.5], "B_max_core": []},
+                    {"P_core": "W", "B_max_core": "T"},
+                ),
+                _FakeSolution(
+                    {"B_max_core": []},
+                    {"B_max_core": "T"},
+                ),
+            ])
+        post = _FakePost(responses)
+        simulation = _simulation_with_post(post)
+
+        with self.assertRaisesRegex(
+                RuntimeError, "missing/non-finite expressions: B_max_core"):
+            simulation._solution_data_frame(
+                ["P_core", "B_max_core"],
+                report_category="Fields",
+                extraction_key="loss",
+                retry_delay=0,
+            )
+
+        self.assertEqual(len(post.field_calls), 6)
+        self.assertNotIn("loss", simulation.extraction_backends)
+        self.assertTrue(all(
+            call["expressions"] == ["B_max_core"]
+            for call in post.field_calls[1::2]
+        ))
+
     def test_partial_expression_data_is_not_verified_no_data(self):
         partial = _FakeSolution({"L": [1.0], "M": []})
         simulation = _simulation_with_post(_FakePost([partial, partial, partial]))
