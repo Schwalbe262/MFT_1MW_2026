@@ -45,6 +45,9 @@ class _Materials:
         self.material_keys[name] = material
         return material
 
+    def __getitem__(self, name):
+        return self.material_keys[name]
+
 
 class _Boundary:
     def __init__(self, props=None, update_result=True, post_update_props=None):
@@ -784,7 +787,18 @@ class ThermalStabilityTest(unittest.TestCase):
                 aedt_pool_adapter, "pooled_backend_enabled", return_value=pooled
             ))
             stack.enter_context(patch.object(thermal, "set_design_variables"))
-            stack.enter_context(patch.object(thermal, "_create_thermal_materials"))
+            stack.enter_context(patch.object(
+                thermal,
+                "_create_thermal_materials",
+                return_value=(
+                    1.0,
+                    1.0,
+                    {
+                        "thermal_conductivity_W_mK": 3.0,
+                        "electrical_conductivity_S_m": 0.0,
+                    },
+                ),
+            ))
             stack.enter_context(patch.object(thermal, "_build_geometry", return_value=objects))
             stack.enter_context(patch.object(
                 thermal, "_create_probe_sheets", return_value=probe_sheets))
@@ -899,9 +913,17 @@ class ThermalStabilityTest(unittest.TestCase):
             thermal._core_thermal_material_for_piece("core_1")
 
         materials = _Materials()
-        thermal._create_thermal_materials(
-            SimpleNamespace(materials=materials), self._core_k_frame()
-        )
+        with patch.object(
+            thermal,
+            "_raw_aedt_material_props",
+            return_value={
+                "thermal_conductivity": "3W_per_mK",
+                "conductivity": "0S_per_m",
+            },
+        ):
+            thermal._create_thermal_materials(
+                SimpleNamespace(materials=materials), self._core_k_frame()
+            )
         self.assertEqual(
             materials.material_keys[
                 "core_amorphous_thermal_leg"
@@ -921,17 +943,62 @@ class ThermalStabilityTest(unittest.TestCase):
         )
         self.assertEqual(
             thermal.THERMAL_PAD_MATERIAL_POLICY,
-            "deadline_tim_k3_fixed_3WmK_electrically_insulating",
+            "deadline_tim_k3_native_attested_3WmK_electrically_insulating_v2",
         )
         self.assertEqual(
-            thermal._thermal_pad_result_metadata(),
+            thermal._thermal_pad_result_metadata({
+                "thermal_conductivity_W_mK": 3.0,
+                "electrical_conductivity_S_m": 0.0,
+            }),
             {
                 "thermal_pad_conductivity_W_mK": [3.0],
                 "thermal_pad_material_policy": [
-                    "deadline_tim_k3_fixed_3WmK_electrically_insulating"
+                    "deadline_tim_k3_native_attested_3WmK_electrically_insulating_v2"
                 ],
+                "thermal_pad_native_readback_contract_version": [
+                    "thermal-pad-native-material-readback-v1"
+                ],
+                "thermal_pad_native_readback_attested": [1],
+                "thermal_pad_native_thermal_conductivity_W_mK": [3.0],
+                "thermal_pad_native_electrical_conductivity_S_m": [0.0],
             },
         )
+
+    def test_existing_thermal_pad_is_overwritten_and_native_attested(self):
+        materials = _Materials()
+        stale = materials.add_material("thermal_pad")
+        stale.conductivity = 123.0
+        stale.thermal_conductivity = 0.2
+        with patch.object(
+            thermal,
+            "_raw_aedt_material_props",
+            return_value={
+                "thermal_conductivity": "3W_per_mK",
+                "conductivity": "0S_per_m",
+            },
+        ):
+            _, _, readback = thermal._create_thermal_materials(
+                SimpleNamespace(materials=materials), self._core_k_frame()
+            )
+        self.assertEqual(stale.conductivity, 0)
+        self.assertEqual(stale.thermal_conductivity, 3.0)
+        self.assertEqual(readback, {
+            "thermal_conductivity_W_mK": 3.0,
+            "electrical_conductivity_S_m": 0.0,
+        })
+
+    def test_thermal_pad_native_readback_rejects_stale_value(self):
+        with patch.object(
+            thermal,
+            "_raw_aedt_material_props",
+            return_value={
+                "thermal_conductivity": "0.2W_per_mK",
+                "conductivity": "0S_per_m",
+            },
+        ), self.assertRaisesRegex(
+            RuntimeError, "thermal_conductivity mismatch"
+        ):
+            thermal._thermal_pad_native_readback(_Materials())
 
     def test_legacy_core_material_path_remains_scalar(self):
         frame = self._core_k_frame(anisotropic=0, legacy=2.75)
@@ -944,9 +1011,17 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(contract["thermal_core_k_throughstack"], 2.75)
 
         materials = _Materials()
-        thermal._create_thermal_materials(
-            SimpleNamespace(materials=materials), frame
-        )
+        with patch.object(
+            thermal,
+            "_raw_aedt_material_props",
+            return_value={
+                "thermal_conductivity": "3W_per_mK",
+                "conductivity": "0S_per_m",
+            },
+        ):
+            thermal._create_thermal_materials(
+                SimpleNamespace(materials=materials), frame
+            )
         self.assertEqual(
             materials.material_keys[
                 "core_amorphous_thermal"

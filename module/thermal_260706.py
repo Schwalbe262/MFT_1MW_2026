@@ -32,7 +32,7 @@ from module.modeling_260706 import (
     compute_layer_positions,
 )
 from module.input_parameter_260706 import get_tx_y_gaps, set_design_variables
-from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.core_material_contract import PHYSICS_DATA_REVISION, _aedt_number
 from module.thermal_probe_contract import (
     ProbeSheetCollection,
     RX_SIDE_FACE_MAX_RULE,
@@ -59,17 +59,97 @@ _THERMAL_DESIGN_NAME = "icepak_thermal"
 _THERMAL_SETUP_NAME = "ThermalSetup"
 THERMAL_PAD_CONDUCTIVITY_W_MK = 3.0
 THERMAL_PAD_MATERIAL_POLICY = (
-    "deadline_tim_k3_fixed_3WmK_electrically_insulating"
+    "deadline_tim_k3_native_attested_3WmK_electrically_insulating_v2"
+)
+THERMAL_PAD_NATIVE_READBACK_CONTRACT_VERSION = (
+    "thermal-pad-native-material-readback-v1"
 )
 
 
-def _thermal_pad_result_metadata():
-    """Echo the isolated deadline TIM policy in every thermal result."""
+def _raw_aedt_material_props(materials, material_name):
+    """Return fresh native material data, bypassing PyAEDT's assigned cache."""
+    manager = getattr(materials, "omaterial_manager", None)
+    if manager is None or not callable(getattr(manager, "GetData", None)):
+        raise RuntimeError("AEDT material manager cannot provide native readback")
+    try:
+        raw = list(manager.GetData(str(material_name)))
+        from ansys.aedt.core.generic.data_handlers import _arg2dict
+
+        parsed = {}
+        _arg2dict(raw, parsed)
+    except Exception as exc:
+        raise RuntimeError(
+            f"native AEDT material readback failed for {material_name!r}"
+        ) from exc
+    if len(parsed) != 1:
+        raise RuntimeError(
+            f"unexpected native material payload for {material_name!r}: "
+            f"top-level keys={list(parsed)}"
+        )
+    props = next(iter(parsed.values()))
+    if not isinstance(props, dict) or not props:
+        raise RuntimeError(
+            f"native AEDT material payload is empty for {material_name!r}"
+        )
+    return props
+
+
+def _thermal_pad_native_readback(materials):
+    """Fail closed unless AEDT itself reports the requested TIM properties."""
+    props = _raw_aedt_material_props(materials, "thermal_pad")
+    thermal_k = _aedt_number(
+        props.get("thermal_conductivity"),
+        "thermal_pad.thermal_conductivity",
+    )
+    electrical_sigma = _aedt_number(
+        props.get("conductivity"),
+        "thermal_pad.conductivity",
+    )
+    if not math.isclose(
+        thermal_k,
+        THERMAL_PAD_CONDUCTIVITY_W_MK,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError(
+            "native thermal_pad thermal_conductivity mismatch: "
+            f"{thermal_k!r} != {THERMAL_PAD_CONDUCTIVITY_W_MK!r}"
+        )
+    if not math.isclose(
+        electrical_sigma,
+        0.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError(
+            "native thermal_pad conductivity mismatch: "
+            f"{electrical_sigma!r} != 0.0"
+        )
+    return {
+        "thermal_conductivity_W_mK": thermal_k,
+        "electrical_conductivity_S_m": electrical_sigma,
+    }
+
+
+def _thermal_pad_result_metadata(native_readback):
+    """Record both requested policy and fresh native AEDT material readback."""
+    if not isinstance(native_readback, dict):
+        raise RuntimeError("thermal_pad native readback evidence is missing")
     return {
         "thermal_pad_conductivity_W_mK": [
             THERMAL_PAD_CONDUCTIVITY_W_MK
         ],
         "thermal_pad_material_policy": [THERMAL_PAD_MATERIAL_POLICY],
+        "thermal_pad_native_readback_contract_version": [
+            THERMAL_PAD_NATIVE_READBACK_CONTRACT_VERSION
+        ],
+        "thermal_pad_native_readback_attested": [1],
+        "thermal_pad_native_thermal_conductivity_W_mK": [
+            float(native_readback["thermal_conductivity_W_mK"])
+        ],
+        "thermal_pad_native_electrical_conductivity_S_m": [
+            float(native_readback["electrical_conductivity_S_m"])
+        ],
     }
 
 
@@ -1623,10 +1703,19 @@ def _create_thermal_materials(ipk, df):
 
     if "thermal_pad" not in mats.material_keys:
         m = mats.add_material("thermal_pad")
-        m.conductivity = 0
-        m.thermal_conductivity = THERMAL_PAD_CONDUCTIVITY_W_MK
+    else:
+        m = mats["thermal_pad"]
+    if m is None or m is False:
+        raise RuntimeError("thermal_pad material is unavailable")
 
-    return k_in, k_th
+    # Maxwell creates this project material at 0.2 W/(m*K) before the Icepak
+    # design is copied. Reapply both properties unconditionally: merely
+    # checking material existence silently retained the stale Maxwell value.
+    m.conductivity = 0
+    m.thermal_conductivity = THERMAL_PAD_CONDUCTIVITY_W_MK
+    thermal_pad_readback = _thermal_pad_native_readback(mats)
+
+    return k_in, k_th, thermal_pad_readback
 
 
 # ---------------------------------------------------------------------------
@@ -2552,7 +2641,7 @@ def run_thermal_analysis(sim):
 
     set_design_variables(ipk, sim.input_df)
     core_conductivity = _core_thermal_conductivity_contract(df)
-    _create_thermal_materials(ipk, df)
+    _, _, thermal_pad_readback = _create_thermal_materials(ipk, df)
     objs = _build_geometry(ipk, sim, eighth=eighth, mode=mode)
     probe_sheets = _create_probe_sheets(ipk, df, objs, eighth=eighth, mode=mode)
     _assign_losses(ipk, sim, objs, eighth=eighth, mode=mode)
@@ -2791,7 +2880,7 @@ def run_thermal_analysis(sim):
             "thermal_setup_s": [thermal_setup_s],
             "thermal_solve_s": [thermal_solve_s],
             "thermal_extraction_s": [thermal_extraction_s],
-            **_thermal_pad_result_metadata(),
+            **_thermal_pad_result_metadata(thermal_pad_readback),
             "thermal_rx_model": [sim.thermal_rx_model],
             "thermal_core_conductivity_model": [
                 core_conductivity["thermal_core_conductivity_model"]
@@ -3129,7 +3218,7 @@ def run_thermal_analysis(sim):
         "thermal_setup_s": [thermal_setup_s],
         "thermal_solve_s": [thermal_solve_s],
         "thermal_extraction_s": [thermal_extraction_s],
-        **_thermal_pad_result_metadata(),
+        **_thermal_pad_result_metadata(thermal_pad_readback),
         "thermal_rx_model": [sim.thermal_rx_model],
         "thermal_core_conductivity_model": [
             core_conductivity["thermal_core_conductivity_model"]
