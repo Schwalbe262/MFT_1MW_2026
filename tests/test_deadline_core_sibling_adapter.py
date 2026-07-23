@@ -95,10 +95,12 @@ def test_standard_pair_allowlist_is_exact():
         95014, 95015
     }
     assert 95009 not in adapter.CANDIDATES[95016]["standard_task_ids"]
-    assert adapter.CANDIDATES[95019]["standard_task_ids"] == {95018}
+    assert adapter.CANDIDATES[95019]["standard_task_ids"] == {95035}
     assert adapter.CANDIDATES[95030]["standard_task_ids"] == {95022}
     assert adapter.CANDIDATES[95032]["standard_task_ids"] == {95031}
-    assert adapter.CANDIDATES[95033]["standard_task_ids"] == {95020}
+    assert adapter.CANDIDATES[95033]["standard_task_ids"] == {95037}
+    assert adapter.CANDIDATES[95039]["standard_task_ids"] == {95034}
+    assert adapter.CANDIDATES[95040]["standard_task_ids"] == {95038}
 
 
 def test_revision_attestation_matches_exact_reviewed_chain():

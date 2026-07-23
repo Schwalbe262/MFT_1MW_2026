@@ -157,7 +157,7 @@ CANDIDATES = {
         "core_auth":
             "9f8a84190adfefa3d4776892f46b6b6ec59b246935096ece0e3863a27301acc7",
         "license_snapshot_sha256": None,
-        "standard_task_ids": frozenset({95018}),
+        "standard_task_ids": frozenset({95035}),
     },
     95030: {
         "task_name": "mft-b428t1f5p5full16c-f-d07236e9d0f60381",
@@ -214,7 +214,45 @@ CANDIDATES = {
             "f1781e043a78fb9cdbb39347c4d19ba0b547d955b46c9022ec03ddab9d127c49",
         "license_snapshot_sha256":
             "dcc373513b50efd4981932af8dacca6e5bec0087388c9f6f42f01954d106d269",
-        "standard_task_ids": frozenset({95020}),
+        "standard_task_ids": frozenset({95037}),
+    },
+    95039: {
+        "task_name": "mft-d414t2f5full16cs-f-dce5021c699da8ee",
+        "plan_sha256":
+            "7f192796acdc8fc64524c388929957f64f3b0d1ba1981b19b038d1bcf3af0066",
+        "source_receipt_sha256":
+            "9393c819d2612f43ac37b20a0f1bee60eae78656ff955f0cc5cf53a33d64d293",
+        "identity":
+            "9d29a2a3afe8798a11df66e6cccdc7015c8590577be4e0b76b085678dc8c2aca",
+        "digest":
+            "dce5021c699da8ee8e5337befbd188ba04d6e66199fffa8819db728731773b3c",
+        "runtime_revision": CORE16_SOLVER_REVISION,
+        "cores": 16,
+        "core_contract_version": "mft-standalone-core-16-optin-v1",
+        "core_auth":
+            "2ac69edd94ba4947083a41ea6a6052b7b8bd20452a20ca24a181a45d8d6b4933",
+        "license_snapshot_sha256":
+            "64ec5f53b744b13cd8f7348039e10d2b806404ec8866d1bba4599c5897e362f2",
+        "standard_task_ids": frozenset({95034}),
+    },
+    95040: {
+        "task_name": "mft-b428t2f7full16cs-f-e2d5eaff695cd6dc",
+        "plan_sha256":
+            "aa6c836b5f8ed18a7833b2c7954ed1a261ba1f12d9792521f075fe73d9894d20",
+        "source_receipt_sha256":
+            "43924664c38920e8c351d8885579c5daefcb00ac2e9b7af94e0f85fd26287319",
+        "identity":
+            "6d04f1e38dccca3a4e60d296ddc153569aa362de494fb656b1568acd87332013",
+        "digest":
+            "e2d5eaff695cd6dc1d6e3e61b632f0e2e7fb78ab87b4b1a6626dd5a4279fbe5d",
+        "runtime_revision": CORE16_SOLVER_REVISION,
+        "cores": 16,
+        "core_contract_version": "mft-standalone-core-16-optin-v1",
+        "core_auth":
+            "b37084d42ff934247dc4f96399e7f12dd75d7543b1b86906e459acbf259c5586",
+        "license_snapshot_sha256":
+            "faa26bd0efa5a638bebd82992cf5dcf5f56fed363a13ac27c1254339605b38bc",
+        "standard_task_ids": frozenset({95038}),
     },
 }
 
