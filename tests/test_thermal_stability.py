@@ -915,6 +915,23 @@ class ThermalStabilityTest(unittest.TestCase):
             [k_inplane, k_inplane, k_throughstack],
         )
         self.assertNotIn("core_amorphous_thermal", materials.material_keys)
+        self.assertEqual(
+            materials.material_keys["thermal_pad"].thermal_conductivity,
+            3.0,
+        )
+        self.assertEqual(
+            thermal.THERMAL_PAD_MATERIAL_POLICY,
+            "deadline_tim_k3_fixed_3WmK_electrically_insulating",
+        )
+        self.assertEqual(
+            thermal._thermal_pad_result_metadata(),
+            {
+                "thermal_pad_conductivity_W_mK": [3.0],
+                "thermal_pad_material_policy": [
+                    "deadline_tim_k3_fixed_3WmK_electrically_insulating"
+                ],
+            },
+        )
 
     def test_legacy_core_material_path_remains_scalar(self):
         frame = self._core_k_frame(anisotropic=0, legacy=2.75)

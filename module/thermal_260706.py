@@ -57,6 +57,20 @@ def _native_solver(app):
 
 _THERMAL_DESIGN_NAME = "icepak_thermal"
 _THERMAL_SETUP_NAME = "ThermalSetup"
+THERMAL_PAD_CONDUCTIVITY_W_MK = 3.0
+THERMAL_PAD_MATERIAL_POLICY = (
+    "deadline_tim_k3_fixed_3WmK_electrically_insulating"
+)
+
+
+def _thermal_pad_result_metadata():
+    """Echo the isolated deadline TIM policy in every thermal result."""
+    return {
+        "thermal_pad_conductivity_W_mK": [
+            THERMAL_PAD_CONDUCTIVITY_W_MK
+        ],
+        "thermal_pad_material_policy": [THERMAL_PAD_MATERIAL_POLICY],
+    }
 
 
 def _field_summary_data_frame(sim, field_summary, setup):
@@ -1610,7 +1624,7 @@ def _create_thermal_materials(ipk, df):
     if "thermal_pad" not in mats.material_keys:
         m = mats.add_material("thermal_pad")
         m.conductivity = 0
-        m.thermal_conductivity = 0.2
+        m.thermal_conductivity = THERMAL_PAD_CONDUCTIVITY_W_MK
 
     return k_in, k_th
 
@@ -2777,6 +2791,7 @@ def run_thermal_analysis(sim):
             "thermal_setup_s": [thermal_setup_s],
             "thermal_solve_s": [thermal_solve_s],
             "thermal_extraction_s": [thermal_extraction_s],
+            **_thermal_pad_result_metadata(),
             "thermal_rx_model": [sim.thermal_rx_model],
             "thermal_core_conductivity_model": [
                 core_conductivity["thermal_core_conductivity_model"]
@@ -3114,6 +3129,7 @@ def run_thermal_analysis(sim):
         "thermal_setup_s": [thermal_setup_s],
         "thermal_solve_s": [thermal_solve_s],
         "thermal_extraction_s": [thermal_extraction_s],
+        **_thermal_pad_result_metadata(),
         "thermal_rx_model": [sim.thermal_rx_model],
         "thermal_core_conductivity_model": [
             core_conductivity["thermal_core_conductivity_model"]
