@@ -61,17 +61,19 @@ temperature, and fixed-boundary readback.
 
 ## Scheduler cutover and admission gate
 
-Submission is pinned to `http://127.0.0.1:8002`. Port 8000 and the prior live
-`a58` deployment are not accepted. `submit-standard` requires a sealed
+Submission is pinned to `http://127.0.0.1:8002`. Port 8000 and prior
+deployments are not accepted. `submit-standard` requires a sealed
 `slurm-scheduler-prune-protection-cutover-receipt-v1` proving:
 
-- commit `190f10de7e109a410fa03f743c24f2d682279ce8`;
-- tree `810993c84d83b5632bdf48238a0df18579c3fa84`;
+- commit `0800a8d204da3cf772c4848814008b5755c92739`;
+- tree `7377e526e81af6d171c136e9cc7346d9f96e140f`;
 - release-manifest SHA
-  `9d1fe324f4e11fee99aca5048d2355997b326c43919a0aeda38f8016b6ec573d`;
+  `2b666a8fc6552cf2c18021d9a39fe6db1e3b76579bfd877852b5176d50e2a2c8`;
 - live-launcher SHA
-  `832847c134c002f7d1a80e2773297fc890f190ecc27d668f80e52f6f37015978`;
+  `e26c3eeb0453cd5f049e9f3280213b46e9c194d149e139b34dc5d9947c137c3d`;
 - verified `slurm-scheduler-prune-protection-v1` marker semantics;
+- split attached-task CPU identity: the real bursty step envelope remains
+  separately attested while the solver sees its reviewed task CPU contract;
 - zero goal-active and zero all-nonterminal tasks at cutover.
 
 Immediately before POST, the tool re-hashes the live launcher twice, reads
