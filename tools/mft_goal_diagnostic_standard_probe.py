@@ -218,6 +218,30 @@ def _absolute_directory(value: Any, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _same_absolute_regular_file_identity(left: Any, right: Any) -> bool:
+    """Compare two absolute file spellings after strict local resolution.
+
+    Windows mapped-drive paths can resolve to the backing UNC path.  Submission
+    records intentionally store that resolved identity, while the cutover
+    receipt retains the operator-facing mapped-drive spelling.  Both inputs
+    must still name an existing non-symlink regular file; byte identity is
+    checked separately by the sealed launcher SHA.
+    """
+
+    try:
+        left_path = _absolute_regular_file(
+            left, "recorded Scheduler live launcher"
+        )
+        right_path = _absolute_regular_file(
+            right, "cutover Scheduler live launcher"
+        )
+    except (HandoffContractError, OSError):
+        return False
+    return os.path.normcase(str(left_path)) == os.path.normcase(
+        str(right_path)
+    )
+
+
 def _live_launcher_identity(receipt: Mapping[str, Any]) -> dict[str, Any]:
     launcher = _absolute_regular_file(
         receipt.get("live_launcher_path"),
@@ -2366,7 +2390,9 @@ def _load_submission(
     if (
         not isinstance(launcher, dict)
         or set(launcher) != {"path", "sha256", "size_bytes"}
-        or launcher.get("path") != cutover["live_launcher_path"]
+        or not _same_absolute_regular_file_identity(
+            launcher.get("path"), cutover["live_launcher_path"]
+        )
         or launcher.get("sha256") != SCHEDULER_LIVE_LAUNCHER_SHA256
         or isinstance(launcher.get("size_bytes"), bool)
         or not isinstance(launcher.get("size_bytes"), int)

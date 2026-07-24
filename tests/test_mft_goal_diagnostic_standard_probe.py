@@ -680,6 +680,28 @@ def test_submit_and_collect_remain_diagnostic_after_actual_pass(
     assert truth["retained_symmetric_aedtresults"]["file_count"] == 1
 
 
+def test_scheduler_launcher_identity_accepts_same_resolved_path_alias(
+    tmp_path,
+):
+    launcher = tmp_path / "scheduler-live-launcher.cmd"
+    launcher.write_bytes(b"reviewed-launcher")
+    alias_parent = tmp_path / "path-alias"
+    alias_parent.mkdir()
+    alias = alias_parent / ".." / launcher.name
+    other = tmp_path / "other-launcher.cmd"
+    other.write_bytes(launcher.read_bytes())
+
+    assert probe._same_absolute_regular_file_identity(
+        str(alias.absolute()), str(launcher.resolve())
+    )
+    assert not probe._same_absolute_regular_file_identity(
+        str(other.resolve()), str(launcher.resolve())
+    )
+    assert not probe._same_absolute_regular_file_identity(
+        str(tmp_path / "missing.cmd"), str(launcher.resolve())
+    )
+
+
 def test_submit_freshly_reauthenticates_source_before_scheduler_mutation(
     tmp_path, monkeypatch
 ):

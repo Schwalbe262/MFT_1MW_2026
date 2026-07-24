@@ -1613,7 +1613,9 @@ def _load_full_submission(
         != cutover["payload_sha256"]
         or not isinstance(launcher, dict)
         or set(launcher) != {"path", "sha256", "size_bytes"}
-        or launcher.get("path") != cutover["live_launcher_path"]
+        or not diagnostic._same_absolute_regular_file_identity(
+            launcher.get("path"), cutover["live_launcher_path"]
+        )
         or launcher.get("sha256")
         != diagnostic.SCHEDULER_LIVE_LAUNCHER_SHA256
         or admission.get("scheduler_url") != stage["scheduler_url"]
