@@ -435,9 +435,30 @@ def run_local_preflight(
     quality_status: Path,
     code_root: Path,
     expected_code_revision: str,
+    dataset_path_override: Path | None = None,
+    profile_path_override: Path | None = None,
+    expected_documentary_generation_path: str | None = None,
 ) -> tuple[dict[str, Any], preflight.Current7Tier1Runner]:
     import numpy as np
 
+    relocation_values = (
+        dataset_path_override,
+        profile_path_override,
+        expected_documentary_generation_path,
+    )
+    relocation_requested = any(value is not None for value in relocation_values)
+    if relocation_requested and (
+        dataset_path_override is None
+        or profile_path_override is None
+        or not isinstance(expected_documentary_generation_path, str)
+        or not expected_documentary_generation_path.strip()
+        or expected_documentary_generation_path
+        != expected_documentary_generation_path.strip()
+    ):
+        raise RuntimeError(
+            "goal local preflight relocation requires runtime dataset, "
+            "runtime profile, and exact documentary generation path together"
+        )
     first = preflight.build_authenticated_runner(
         generation=generation,
         candidate_path=candidate,
@@ -447,6 +468,11 @@ def run_local_preflight(
         fixed_primary_turns=GOAL_PRIMARY_TURN_STRATA[0],
         stage_spec=GOAL_STAGE_SPEC,
         inference_threads=INFERENCE_THREADS,
+        dataset_path_override=dataset_path_override,
+        profile_path_override=profile_path_override,
+        expected_documentary_generation_path=(
+            expected_documentary_generation_path
+        ),
     )
     quality_contract = _quality_contract(
         quality=first.authenticated.quality,
@@ -534,6 +560,9 @@ def run_local_preflight(
         "quality_status_sha256": first.authenticated.evidence[
             "quality_status"
         ]["sha256"],
+        "source_relocation": copy.deepcopy(
+            first.authenticated.evidence["relocation"]
+        ),
         "dataset_sha256": first.authenticated.evidence["dataset"]["sha256"],
         "profile_sha256": first.authenticated.evidence["profile"][
             "canonical_sha256"
@@ -901,6 +930,11 @@ def prepare_bundle(args: argparse.Namespace) -> Path:
         quality_status=args.quality_status,
         code_root=code_root,
         expected_code_revision=args.expected_code_revision,
+        dataset_path_override=args.runtime_dataset,
+        profile_path_override=args.runtime_profile,
+        expected_documentary_generation_path=(
+            args.expected_documentary_generation_path
+        ),
     )
     code_sources = _collect_goal_code_sources(code_root)
     code_manifest = _build_goal_code_manifest(
@@ -1820,6 +1854,31 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--quality-status", type=Path, required=True)
     prepare.add_argument("--code-root", type=Path, required=True)
     prepare.add_argument("--expected-code-revision", required=True)
+    prepare.add_argument(
+        "--runtime-dataset",
+        type=Path,
+        help=(
+            "content-identical local dataset for a relocated generation; "
+            "requires --runtime-profile and "
+            "--expected-documentary-generation-path"
+        ),
+    )
+    prepare.add_argument(
+        "--runtime-profile",
+        type=Path,
+        help=(
+            "content-identical local profile for a relocated generation; "
+            "requires --runtime-dataset and "
+            "--expected-documentary-generation-path"
+        ),
+    )
+    prepare.add_argument(
+        "--expected-documentary-generation-path",
+        help=(
+            "exact original generation_path sealed by a remotely trained "
+            "candidate; requires both runtime relocation paths"
+        ),
+    )
     prepare.add_argument(
         "--mode",
         choices=("single", "rolling32", "rolling"),

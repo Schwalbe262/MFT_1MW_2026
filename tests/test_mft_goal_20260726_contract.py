@@ -22,6 +22,78 @@ from tools import mft_goal_20260726_launch as launch
 REPO = Path(__file__).resolve().parents[1]
 
 
+def test_local_preflight_relocation_requires_complete_triplet(
+    monkeypatch,
+):
+    called = False
+
+    def unexpected_runner(**_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("authentication must not start")
+
+    monkeypatch.setattr(
+        preflight,
+        "build_authenticated_runner",
+        unexpected_runner,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="requires runtime dataset, runtime profile",
+    ):
+        launch.run_local_preflight(
+            generation=Path("generation"),
+            candidate=Path("candidate.json"),
+            quality_status=Path("quality.json"),
+            code_root=Path("code"),
+            expected_code_revision="a" * 40,
+            dataset_path_override=Path("dataset.parquet"),
+        )
+    assert called is False
+
+
+def test_local_preflight_forwards_exact_remote_documentary_identity(
+    monkeypatch,
+):
+    observed = {}
+
+    class AuthenticationReached(RuntimeError):
+        pass
+
+    def capture_runner(**kwargs):
+        observed.update(kwargs)
+        raise AuthenticationReached
+
+    monkeypatch.setattr(
+        preflight,
+        "build_authenticated_runner",
+        capture_runner,
+    )
+    dataset = Path("harvested/strict_al.parquet")
+    profile = Path("harvested/goal_standard.json")
+    documentary = (
+        "/gpfs/tmp_cpu2/mft_goal_20260726/al/"
+        "runs/task-123/registry/generations/example"
+    )
+    with pytest.raises(AuthenticationReached):
+        launch.run_local_preflight(
+            generation=Path("harvested/registry/generations/example"),
+            candidate=Path("harvested/candidate.json"),
+            quality_status=Path("harvested/quality_status.json"),
+            code_root=Path("code"),
+            expected_code_revision="b" * 40,
+            dataset_path_override=dataset,
+            profile_path_override=profile,
+            expected_documentary_generation_path=documentary,
+        )
+    assert observed["dataset_path_override"] is dataset
+    assert observed["profile_path_override"] is profile
+    assert (
+        observed["expected_documentary_generation_path"]
+        == documentary
+    )
+
+
 def _synthetic_goal_code_manifest(revision: str = "c" * 40):
     records = {
         "artifacts/code/.source-revision": {
