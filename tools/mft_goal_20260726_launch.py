@@ -11,10 +11,14 @@ from __future__ import annotations
 import argparse
 import copy
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
+import shutil
+import subprocess
 import sys
 import tempfile
 from typing import Any, Mapping
@@ -50,6 +54,21 @@ SCHEDULER_MANIFEST_SCHEMA = "mft-goal-20260726-scheduler-manifest-v1"
 RELOCATION_SCHEMA = "mft-goal-20260726-worker-relocation-v1"
 SEARCH_RESULT_SCHEMA = "mft-goal-20260726-search-seed-v1"
 GLOBAL_PARETO_SCHEMA = "mft-goal-20260726-global-pareto-v1"
+CODE_MANIFEST_SCHEMA = preflight.GOAL_CODE_MANIFEST_SCHEMA
+RUNTIME_SOURCE_ROLES = (
+    "generation",
+    "candidate",
+    "quality_status",
+    "code_root",
+    "dataset",
+    "profile",
+)
+GOAL_RUNTIME_TOOL_FILES = (
+    "tools/mft_goal_20260726_launch.py",
+    "tools/tier1_corrected_generation_adapter.py",
+    "tools/tier1_corrected_generation_preflight.py",
+    "tools/tier1_semlock_safe_inference_smoke.py",
+)
 POPULATION = 320
 GENERATIONS = 300
 INFERENCE_THREADS = 8
@@ -129,6 +148,122 @@ def _path_is_below(path: Path, root: Path) -> bool:
         ) == str(root.resolve())
     except (OSError, ValueError):
         return False
+
+
+def _git_environment(root: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    count = int(environment.get("GIT_CONFIG_COUNT", "0"))
+    environment[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
+    environment[f"GIT_CONFIG_VALUE_{count}"] = root.as_posix()
+    environment["GIT_CONFIG_COUNT"] = str(count + 1)
+    return environment
+
+
+def _collect_goal_code_sources(code_root: Path) -> dict[str, Path]:
+    """Collect the committed goal runtime without importing Scheduler code."""
+
+    root = code_root.resolve(strict=True)
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z"],
+        capture_output=True,
+        check=False,
+        env=_git_environment(root),
+    )
+    if listed.returncode != 0:
+        raise RuntimeError("cannot enumerate committed goal runtime code")
+    tracked = {
+        item.decode("utf-8").replace("\\", "/")
+        for item in listed.stdout.split(b"\0")
+        if item
+    }
+    required = set(GOAL_RUNTIME_TOOL_FILES)
+    missing = sorted(required - tracked)
+    if missing:
+        raise RuntimeError(f"required goal runtime code is not committed: {missing}")
+    selected = set(required)
+    selected.update(
+        relative
+        for relative in tracked
+        if relative.startswith(("module/", "regression_260707/"))
+        and PurePosixPath(relative).suffix in {".py", ".json"}
+    )
+    sources: dict[str, Path] = {}
+    for relative in sorted(selected):
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or ".." in pure.parts:
+            raise RuntimeError(f"goal runtime code path is unsafe: {relative}")
+        source = root.joinpath(*pure.parts).resolve(strict=True)
+        if not source.is_file() or not _path_is_below(source, root):
+            raise RuntimeError(f"goal runtime code escaped checkout: {relative}")
+        sources[f"artifacts/code/{relative}"] = source
+    return sources
+
+
+def _build_goal_code_manifest(
+    sources: Mapping[str, Path], *, code_revision: str
+) -> dict[str, Any]:
+    revision = str(code_revision).lower()
+    if (
+        len(revision) != 40
+        or any(character not in "0123456789abcdef" for character in revision)
+    ):
+        raise RuntimeError("goal code revision is invalid")
+    records = {
+        relative: {
+            "sha256": adapter.sha256_file(Path(source)),
+            "size": Path(source).stat().st_size,
+        }
+        for relative, source in sorted(sources.items())
+    }
+    marker_bytes = f"{revision}\n".encode("ascii")
+    records["artifacts/code/.source-revision"] = {
+        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+        "size": len(marker_bytes),
+    }
+    return _seal(
+        {
+            "schema_version": CODE_MANIFEST_SCHEMA,
+            "campaign_id": "mft-goal-20260726",
+            "code_revision": revision,
+            "code_root_relative": "artifacts/code",
+            "revision_marker": "artifacts/code/.source-revision",
+            "files": records,
+            "code_inventory": records,
+            "code_inventory_sha256": canonical_sha256(records),
+            "staged_path_rule": "bundle_root/<code_inventory_key>",
+            "source_checkout_mutated": False,
+            "remote_git_checkout_required": False,
+            "scheduler_project_code_included": False,
+        }
+    )
+
+
+def _stage_goal_code(
+    output: Path,
+    *,
+    sources: Mapping[str, Path],
+    manifest: Mapping[str, Any],
+) -> Path:
+    output.mkdir(parents=True, exist_ok=False)
+    for relative, source in sorted(sources.items()):
+        pure = PurePosixPath(relative)
+        destination = output.joinpath(*pure.parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(source), destination)
+    marker = output / "artifacts" / "code" / ".source-revision"
+    marker.write_bytes(f"{manifest['code_revision']}\n".encode("ascii"))
+    manifest_path = output / "code_manifest.json"
+    _atomic_json(manifest_path, manifest)
+    preflight.authenticate_goal_code_inventory(
+        code_root=output / "artifacts" / "code",
+        code_manifest_path=manifest_path,
+        expected_manifest_payload_sha256=str(manifest["payload_sha256"]),
+        expected_code_inventory_sha256=str(
+            manifest["code_inventory_sha256"]
+        ),
+        expected_code_revision=str(manifest["code_revision"]),
+    )
+    return manifest_path
 
 
 def seed_assignments(
@@ -396,6 +531,9 @@ def run_local_preflight(
             "quality_status"
         ]["sha256"],
         "dataset_sha256": first.authenticated.evidence["dataset"]["sha256"],
+        "profile_sha256": first.authenticated.evidence["profile"][
+            "canonical_sha256"
+        ],
         "evaluation_model_sha256": canonical_sha256(artifacts),
         "generation_targets": list(GOAL_G0_MODEL_TARGETS),
         "required_model_targets": list(adapter.GOAL_REQUIRED_MODEL_TARGETS),
@@ -426,8 +564,30 @@ def build_bundle_values(
     assignments: list[dict[str, Any]],
     output_root: Path,
     source: Mapping[str, str],
+    code_manifest: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     _validate_seal(dict(local_preflight), schema=LOCAL_PREFLIGHT_SCHEMA)
+    validated_code_manifest = _validate_seal(
+        dict(code_manifest), schema=CODE_MANIFEST_SCHEMA
+    )
+    if (
+        set(source)
+        != {*RUNTIME_SOURCE_ROLES, "expected_code_revision"}
+        or source.get("expected_code_revision")
+        != validated_code_manifest.get("code_revision")
+        or (local_preflight.get("code") or {}).get("revision")
+        != validated_code_manifest.get("code_revision")
+        or validated_code_manifest.get("code_inventory_sha256")
+        != canonical_sha256(validated_code_manifest.get("code_inventory"))
+        or validated_code_manifest.get("staged_path_rule")
+        != "bundle_root/<code_inventory_key>"
+        or validated_code_manifest.get("source_checkout_mutated") is not False
+        or validated_code_manifest.get("remote_git_checkout_required")
+        is not False
+        or validated_code_manifest.get("scheduler_project_code_included")
+        is not False
+    ):
+        raise RuntimeError("goal bundle source/code manifest mismatch")
     tasks: list[dict[str, Any]] = []
     for assignment in assignments:
         seed = int(assignment["seed"])
@@ -471,10 +631,17 @@ def build_bundle_values(
                         "quality_status_sha256"
                     ],
                     "dataset_sha256": local_preflight["dataset_sha256"],
+                    "profile_sha256": local_preflight["profile_sha256"],
                     "evaluation_model_sha256": local_preflight[
                         "evaluation_model_sha256"
                     ],
                     "code_revision": local_preflight["code"]["revision"],
+                    "code_manifest_payload_sha256": (
+                        validated_code_manifest["payload_sha256"]
+                    ),
+                    "code_inventory_sha256": validated_code_manifest[
+                        "code_inventory_sha256"
+                    ],
                 },
                 "result_schema_version": SEARCH_RESULT_SCHEMA,
                 "terminal_table_schema_version": (
@@ -522,17 +689,24 @@ def build_bundle_values(
                 for task in tasks
             ],
             "source_bound_paths": dict(source),
+            "code_manifest": {
+                "path": "code_manifest.json",
+                "schema_version": CODE_MANIFEST_SCHEMA,
+                "payload_sha256": validated_code_manifest["payload_sha256"],
+                "code_inventory_sha256": validated_code_manifest[
+                    "code_inventory_sha256"
+                ],
+                "code_revision": validated_code_manifest["code_revision"],
+            },
             "relocation_contract": {
                 "schema_version": RELOCATION_SCHEMA,
                 "mode": (
                     "source_paths_or_explicit_worker_role_path_relocation"
                 ),
-                "roles": [
-                    "generation",
-                    "candidate",
-                    "quality_status",
-                    "code_root",
-                ],
+                "roles": list(RUNTIME_SOURCE_ROLES),
+                "code_manifest_path_required_for_relocation": True,
+                "relocation_files_emitted": False,
+                "stager_must_generate_task_bound_relocation": True,
                 "source_absolute_paths_are_not_worker_authority": True,
                 "relocated_paths_must_reauthenticate_all_bound_SHA256": True,
                 "task_payload_sha256_must_match": True,
@@ -604,7 +778,10 @@ def validate_task_payload(value: Any) -> dict[str, Any]:
             "candidate_sha256",
             "quality_status_sha256",
             "dataset_sha256",
+            "profile_sha256",
             "evaluation_model_sha256",
+            "code_manifest_payload_sha256",
+            "code_inventory_sha256",
         )
     ]
     if (
@@ -623,21 +800,23 @@ def validate_task_payload(value: Any) -> dict[str, Any]:
         or task.get("production_eligible") is not False
         or task.get("automatic_promotion_allowed") is not False
         or set(task.get("source") or {})
-        != {
-            "generation",
-            "candidate",
-            "quality_status",
-            "code_root",
-            "expected_code_revision",
-        }
+        != {*RUNTIME_SOURCE_ROLES, "expected_code_revision"}
+        or any(
+            not isinstance((task.get("source") or {}).get(name), str)
+            or not (task.get("source") or {})[name]
+            for name in (*RUNTIME_SOURCE_ROLES, "expected_code_revision")
+        )
         or set(task.get("source_identity") or {})
         != {
             "train_report_sha256",
             "candidate_sha256",
             "quality_status_sha256",
             "dataset_sha256",
+            "profile_sha256",
             "evaluation_model_sha256",
             "code_revision",
+            "code_manifest_payload_sha256",
+            "code_inventory_sha256",
         }
         or any(
             not isinstance(digest, str)
@@ -647,6 +826,10 @@ def validate_task_payload(value: Any) -> dict[str, Any]:
         )
         or not isinstance(source_identity.get("code_revision"), str)
         or len(source_identity["code_revision"]) != 40
+        or any(
+            character not in "0123456789abcdef"
+            for character in source_identity["code_revision"]
+        )
         or source_identity["code_revision"]
         != (task.get("source") or {}).get("expected_code_revision")
         or task.get("dataset_sha256")
@@ -660,24 +843,45 @@ def validate_task_payload(value: Any) -> dict[str, Any]:
 
 def resolve_worker_source(
     task: Mapping[str, Any], relocation_path: Path | None
-) -> dict[str, str]:
+) -> tuple[dict[str, str], Path | None]:
     source = dict(task["source"])
     if relocation_path is None:
-        return source
+        return source, None
     relocation = _validate_seal(
         _read_json(relocation_path.resolve(strict=True)),
         schema=RELOCATION_SCHEMA,
     )
     paths = relocation.get("paths")
+    code_manifest_path = relocation.get("code_manifest_path")
     if (
-        relocation.get("task_payload_sha256") != task["payload_sha256"]
+        set(relocation)
+        != {
+            "schema_version",
+            "task_payload_sha256",
+            "paths",
+            "code_manifest_path",
+            "source_absolute_paths_are_documentary_only",
+            "remote_git_checkout_required",
+            "payload_sha256",
+        }
+        or relocation.get("task_payload_sha256") != task["payload_sha256"]
         or not isinstance(paths, dict)
-        or set(paths)
-        != {"generation", "candidate", "quality_status", "code_root"}
+        or set(paths) != set(RUNTIME_SOURCE_ROLES)
+        or any(
+            not isinstance(paths.get(name), str) or not paths[name]
+            or not Path(paths[name]).is_absolute()
+            for name in RUNTIME_SOURCE_ROLES
+        )
+        or not isinstance(code_manifest_path, str)
+        or not code_manifest_path
+        or not Path(code_manifest_path).is_absolute()
+        or relocation.get("source_absolute_paths_are_documentary_only")
+        is not True
+        or relocation.get("remote_git_checkout_required") is not False
     ):
         raise RuntimeError("worker relocation contract mismatch")
     source.update({name: str(paths[name]) for name in paths})
-    return source
+    return source, Path(code_manifest_path)
 
 
 def prepare_bundle(args: argparse.Namespace) -> Path:
@@ -687,19 +891,36 @@ def prepare_bundle(args: argparse.Namespace) -> Path:
         raise RuntimeError("goal bundle output already exists")
     if _path_is_below(output, code_root):
         raise RuntimeError("goal bundle output must be outside the clean code root")
-    local_preflight, _runner = run_local_preflight(
+    local_preflight, runner = run_local_preflight(
         generation=args.generation,
         candidate=args.candidate,
         quality_status=args.quality_status,
         code_root=code_root,
         expected_code_revision=args.expected_code_revision,
     )
+    code_sources = _collect_goal_code_sources(code_root)
+    code_manifest = _build_goal_code_manifest(
+        code_sources,
+        code_revision=local_preflight["code"]["revision"],
+    )
+    _stage_goal_code(
+        output,
+        sources=code_sources,
+        manifest=code_manifest,
+    )
+    documentary_generation = str(
+        runner.authenticated.candidate.get("generation_path") or ""
+    )
+    if not documentary_generation:
+        raise RuntimeError("goal candidate documentary generation path is missing")
     source = {
-        "generation": str(args.generation.resolve(strict=True)),
+        "generation": documentary_generation,
         "candidate": str(args.candidate.resolve(strict=True)),
         "quality_status": str(args.quality_status.resolve(strict=True)),
         "code_root": str(code_root),
-        "expected_code_revision": args.expected_code_revision,
+        "dataset": str(runner.authenticated.dataset_path),
+        "profile": str(runner.authenticated.profile_path),
+        "expected_code_revision": local_preflight["code"]["revision"],
     }
     assignments = seed_assignments(
         mode=args.mode,
@@ -713,8 +934,8 @@ def prepare_bundle(args: argparse.Namespace) -> Path:
         assignments=assignments,
         output_root=output,
         source=source,
+        code_manifest=code_manifest,
     )
-    output.mkdir(parents=True)
     _atomic_json(output / "local_preflight.json", local_preflight)
     for task in tasks:
         path = (
@@ -733,7 +954,10 @@ def execute_seed(args: argparse.Namespace) -> Path:
     output = args.output.resolve()
     if output.exists():
         raise RuntimeError("goal seed output already exists")
-    source = resolve_worker_source(task, args.relocation)
+    source, relocated_code_manifest = resolve_worker_source(
+        task, args.relocation
+    )
+    relocated = relocated_code_manifest is not None
     runner = preflight.build_authenticated_runner(
         generation=Path(source["generation"]),
         candidate_path=Path(source["candidate"]),
@@ -743,6 +967,26 @@ def execute_seed(args: argparse.Namespace) -> Path:
         fixed_primary_turns=int(task["fixed_primary_turns"]),
         stage_spec=task["stage_spec"],
         inference_threads=INFERENCE_THREADS,
+        dataset_path_override=(
+            Path(source["dataset"]) if relocated else None
+        ),
+        profile_path_override=(
+            Path(source["profile"]) if relocated else None
+        ),
+        expected_documentary_generation_path=(
+            str(task["source"]["generation"]) if relocated else None
+        ),
+        code_manifest_path=relocated_code_manifest,
+        expected_code_manifest_payload_sha256=(
+            task["source_identity"]["code_manifest_payload_sha256"]
+            if relocated
+            else None
+        ),
+        expected_code_inventory_sha256=(
+            task["source_identity"]["code_inventory_sha256"]
+            if relocated
+            else None
+        ),
     )
     source_identity = task["source_identity"]
     if (
@@ -754,9 +998,23 @@ def execute_seed(args: argparse.Namespace) -> Path:
         != source_identity["quality_status_sha256"]
         or runner.authenticated.evidence["dataset"]["sha256"]
         != source_identity["dataset_sha256"]
+        or runner.authenticated.evidence["profile"]["canonical_sha256"]
+        != source_identity["profile_sha256"]
         or canonical_sha256(runner.authenticated.report["artifacts"])
         != source_identity["evaluation_model_sha256"]
         or runner.code_identity["revision"] != source_identity["code_revision"]
+        or (
+            relocated
+            and runner.code_identity.get("code_inventory_sha256")
+            != source_identity["code_inventory_sha256"]
+        )
+        or (
+            relocated
+            and (
+                runner.code_identity.get("code_manifest") or {}
+            ).get("payload_sha256")
+            != source_identity["code_manifest_payload_sha256"]
+        )
         or runner.problem.hard_constraint_contract_sha256
         != task["hard_constraint_contract_sha256"]
     ):
@@ -900,7 +1158,121 @@ def execute_seed(args: argparse.Namespace) -> Path:
     return path
 
 
-def _validated_seed_table(result_path: Path) -> tuple[dict[str, Any], Any]:
+def _contained_relative_file(root: Path, value: Any, label: str) -> Path:
+    relative = PurePosixPath(str(value or ""))
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or ".." in relative.parts
+    ):
+        raise RuntimeError(f"{label} path is unsafe")
+    base = root.resolve(strict=True)
+    path = base.joinpath(*relative.parts).resolve(strict=True)
+    try:
+        path.relative_to(base)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} escaped its authenticated root") from exc
+    if not path.is_file():
+        raise RuntimeError(f"{label} is unavailable")
+    return path
+
+
+def load_bundle_task_ledger(
+    bundle_manifest_path: Path,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Authenticate one original bundle and its complete sealed task ledger."""
+
+    manifest_path = bundle_manifest_path.resolve(strict=True)
+    bundle = _validate_seal(
+        _read_json(manifest_path),
+        schema=BUNDLE_SCHEMA,
+    )
+    paths = bundle.get("task_relative_paths")
+    payloads = bundle.get("task_payload_sha256")
+    count = bundle.get("task_count")
+    code_record = bundle.get("code_manifest") or {}
+    if (
+        bundle.get("goal_contract_schema") != GOAL_CONTRACT_SCHEMA
+        or bundle.get("stage_spec_sha256") != GOAL_STAGE_SPEC_SHA256
+        or bundle.get("temperature_contract_sha256")
+        != GOAL_TEMPERATURE_CONTRACT_SHA256
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 1
+        or not isinstance(paths, list)
+        or not isinstance(payloads, list)
+        or len(paths) != count
+        or len(payloads) != count
+        or len(set(paths)) != count
+        or len(set(payloads)) != count
+        or code_record.get("schema_version") != CODE_MANIFEST_SCHEMA
+    ):
+        raise RuntimeError("goal bundle task ledger contract mismatch")
+    code_manifest_path = _contained_relative_file(
+        manifest_path.parent,
+        code_record.get("path"),
+        "goal code manifest",
+    )
+    code_manifest = _validate_seal(
+        _read_json(code_manifest_path),
+        schema=CODE_MANIFEST_SCHEMA,
+    )
+    if (
+        code_manifest.get("payload_sha256")
+        != code_record.get("payload_sha256")
+        or code_manifest.get("code_inventory_sha256")
+        != code_record.get("code_inventory_sha256")
+        or code_manifest.get("code_revision")
+        != code_record.get("code_revision")
+    ):
+        raise RuntimeError("goal bundle code manifest identity mismatch")
+
+    ledger: dict[str, dict[str, Any]] = {}
+    seeds: set[int] = set()
+    turns: list[int] = []
+    for relative, expected_payload in zip(paths, payloads):
+        task_path = _contained_relative_file(
+            manifest_path.parent,
+            relative,
+            "goal task payload",
+        )
+        task = validate_task_payload(_read_json(task_path))
+        if (
+            task["payload_sha256"] != expected_payload
+            or task.get("source") != bundle.get("source_bound_paths")
+            or task["source_identity"]["code_manifest_payload_sha256"]
+            != code_manifest["payload_sha256"]
+            or task["source_identity"]["code_inventory_sha256"]
+            != code_manifest["code_inventory_sha256"]
+            or task["source_identity"]["code_revision"]
+            != code_manifest["code_revision"]
+            or task.get("search_only_proposal")
+            != bundle.get("search_only_proposal")
+            or PurePosixPath(str(relative)).as_posix()
+            != (
+                f"tasks/seed-{task['seed']}-"
+                f"n1-{task['fixed_primary_turns']}.json"
+            )
+        ):
+            raise RuntimeError("goal bundle task ledger identity mismatch")
+        seed = int(task["seed"])
+        if seed in seeds:
+            raise RuntimeError("goal bundle task ledger has duplicate seeds")
+        seeds.add(seed)
+        turns.append(int(task["fixed_primary_turns"]))
+        ledger[task["payload_sha256"]] = task
+    if len(ledger) != count:
+        raise RuntimeError("goal bundle task ledger is incomplete")
+    if count > 1 and set(turns) != set(GOAL_PRIMARY_TURN_STRATA):
+        raise RuntimeError("goal bundle task ledger lacks all N1 strata")
+    return bundle, ledger
+
+
+def _validated_seed_table(
+    result_path: Path,
+    *,
+    expected_task: Mapping[str, Any],
+) -> tuple[dict[str, Any], Any]:
     import numpy as np
     import pandas as pd
 
@@ -920,10 +1292,35 @@ def _validated_seed_table(result_path: Path) -> tuple[dict[str, Any], Any]:
         != list(preflight.GOAL_CONSTRAINT_NAMES)
         or result.get("temperature_targets")
         != list(GOAL_TEMPERATURE_TARGETS)
+        or result.get("task_payload_sha256")
+        != expected_task.get("payload_sha256")
+        or result.get("seed") != expected_task.get("seed")
+        or result.get("fixed_primary_turns")
+        != expected_task.get("fixed_primary_turns")
         or result.get("population") != POPULATION
+        or result.get("population") != expected_task.get("population")
         or result.get("generations") != GENERATIONS
+        or result.get("generations") != expected_task.get("generations")
+        or isinstance(result.get("evaluated_generations"), bool)
+        or not isinstance(result.get("evaluated_generations"), int)
+        or result.get("evaluated_generations") != GENERATIONS
+        or isinstance(result.get("completed_generations"), bool)
+        or not isinstance(result.get("completed_generations"), int)
+        or result.get("completed_generations") != GENERATIONS
         or result.get("terminal_population_count") != POPULATION
         or not isinstance(result.get("search_only_proposal"), bool)
+        or result.get("search_only_proposal")
+        != expected_task.get("search_only_proposal")
+        or result.get("dataset_sha256")
+        != expected_task.get("dataset_sha256")
+        or result.get("evaluation_model_sha256")
+        != expected_task.get("evaluation_model_sha256")
+        or result.get("hard_constraint_contract_sha256")
+        != expected_task.get("hard_constraint_contract_sha256")
+        or result.get("cooling_contract_sha256")
+        != expected_task.get("cooling_contract_sha256")
+        or result.get("operating_point_sha256")
+        != expected_task.get("operating_point_sha256")
         or result.get("production_eligible") is not False
         or result.get("automatic_promotion_allowed") is not False
         or result.get("legacy_current7_stage_or_release_identity_reused")
@@ -931,16 +1328,24 @@ def _validated_seed_table(result_path: Path) -> tuple[dict[str, Any], Any]:
     ):
         raise RuntimeError(f"goal seed result contract mismatch: {path}")
     inventory = result.get("artifact_inventory") or {}
+    if result.get("artifact_inventory_sha256") != canonical_sha256(inventory):
+        raise RuntimeError(f"goal seed artifact inventory mismatch: {path}")
     table_record = inventory.get("terminal_physical_candidates") or {}
     manifest_record = inventory.get(
         "terminal_physical_candidates_manifest"
     ) or {}
-    table_path = path.parent / str(table_record.get("path") or "")
-    manifest_path = path.parent / str(manifest_record.get("path") or "")
+    table_path = _contained_relative_file(
+        path.parent,
+        table_record.get("path"),
+        "goal terminal table",
+    )
+    manifest_path = _contained_relative_file(
+        path.parent,
+        manifest_record.get("path"),
+        "goal terminal table manifest",
+    )
     if (
-        not table_path.is_file()
-        or not manifest_path.is_file()
-        or adapter.sha256_file(table_path) != table_record.get("sha256")
+        adapter.sha256_file(table_path) != table_record.get("sha256")
         or adapter.sha256_file(manifest_path) != manifest_record.get("sha256")
     ):
         raise RuntimeError(f"goal terminal table artifact mismatch: {path}")
@@ -995,6 +1400,12 @@ def _validated_seed_table(result_path: Path) -> tuple[dict[str, Any], Any]:
         "cooling_contract_sha256": result["cooling_contract_sha256"],
         "operating_point_sha256": result["operating_point_sha256"],
         "source_bundle_id": result["task_payload_sha256"],
+        "source_island_id": (
+            f"n1-{int(expected_task['fixed_primary_turns'])}"
+        ),
+        "evaluation_model_generation_sha256": expected_task[
+            "source_identity"
+        ]["train_report_sha256"],
     }
     if (
         len(table) != POPULATION
@@ -1039,6 +1450,32 @@ def _validated_seed_table(result_path: Path) -> tuple[dict[str, Any], Any]:
         ).all()
     ):
         raise RuntimeError(f"goal terminal table content mismatch: {path}")
+    try:
+        decoded_turns = []
+        for value in table["decoded_physical_params_json"]:
+            decoded = json.loads(value)
+            main = float(decoded["N1_main"])
+            side = float(decoded["N1_side"])
+            if (
+                not math.isfinite(main)
+                or not math.isfinite(side)
+                or not main.is_integer()
+                or not side.is_integer()
+            ):
+                raise ValueError("decoded primary turns are not integers")
+            decoded_turns.append(int(main) + int(side))
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        OverflowError,
+    ) as exc:
+        raise RuntimeError(
+            f"goal terminal decoded N1 evidence mismatch: {path}"
+        ) from exc
+    if set(decoded_turns) != {int(expected_task["fixed_primary_turns"])}:
+        raise RuntimeError(f"goal terminal decoded N1 evidence mismatch: {path}")
     flag_columns = (
         "decoder_valid",
         "surrogate_physical_valid",
@@ -1076,6 +1513,8 @@ def _validated_seed_table(result_path: Path) -> tuple[dict[str, Any], Any]:
             table["physical_feasible"].to_numpy(dtype=bool),
             expected_physical_feasible,
         )
+        or int(result.get("physical_feasible_count") or 0)
+        != int(expected_physical_feasible.sum())
     ):
         raise RuntimeError(f"goal terminal physicality evidence mismatch: {path}")
     table = table.copy()
@@ -1100,7 +1539,11 @@ def _atomic_csv(path: Path, frame: Any) -> None:
 
 
 def aggregate_results(
-    *, result_paths: list[Path], output: Path, minimum_seeds: int
+    *,
+    result_paths: list[Path],
+    bundle_manifest_path: Path,
+    output: Path,
+    minimum_seeds: int,
 ) -> Path:
     import numpy as np
     import pandas as pd
@@ -1115,18 +1558,46 @@ def aggregate_results(
         or minimum_seeds < 2
     ):
         raise ValueError("minimum_seeds must be an integer >= 2")
-    resolved = sorted({path.resolve(strict=True) for path in result_paths})
+    resolved = sorted(path.resolve(strict=True) for path in result_paths)
+    if len(set(resolved)) != len(resolved):
+        raise RuntimeError("global Pareto inputs contain duplicate result paths")
+    bundle, task_ledger = load_bundle_task_ledger(bundle_manifest_path)
     if len(resolved) < minimum_seeds:
         raise RuntimeError("authenticated seed result count is below minimum")
+    if len(resolved) != len(task_ledger):
+        raise RuntimeError(
+            "global Pareto requires one result for every original bundle task"
+        )
     output = output.resolve()
     if output.exists():
         raise RuntimeError("global Pareto output already exists")
     results = []
     frames = []
+    observed_tasks: set[str] = set()
     for path in resolved:
-        result, frame = _validated_seed_table(path)
+        envelope = _validate_seal(
+            _read_json(path),
+            schema=SEARCH_RESULT_SCHEMA,
+        )
+        task_sha = str(envelope.get("task_payload_sha256") or "")
+        expected_task = task_ledger.get(task_sha)
+        if expected_task is None:
+            raise RuntimeError(
+                "global Pareto result is not in the original task ledger"
+            )
+        if task_sha in observed_tasks:
+            raise RuntimeError(
+                "global Pareto inputs contain duplicate task results"
+            )
+        observed_tasks.add(task_sha)
+        result, frame = _validated_seed_table(
+            path,
+            expected_task=expected_task,
+        )
         results.append(result)
         frames.append(frame)
+    if observed_tasks != set(task_ledger):
+        raise RuntimeError("global Pareto original task results are incomplete")
     seeds = [int(result["seed"]) for result in results]
     if len(set(seeds)) != len(seeds):
         raise RuntimeError("global Pareto inputs contain duplicate seeds")
@@ -1260,6 +1731,24 @@ def aggregate_results(
                 }
                 for path in resolved
             ],
+            "authenticated_bundle": {
+                "path": str(bundle_manifest_path.resolve(strict=True)),
+                "sha256": adapter.sha256_file(
+                    bundle_manifest_path.resolve(strict=True)
+                ),
+                "payload_sha256": bundle["payload_sha256"],
+                "task_count": bundle["task_count"],
+                "task_ledger_sha256": canonical_sha256(
+                    sorted(task_ledger)
+                ),
+                "all_four_N1_strata_covered": (
+                    {
+                        int(task["fixed_primary_turns"])
+                        for task in task_ledger.values()
+                    }
+                    == set(GOAL_PRIMARY_TURN_STRATA)
+                ),
+            },
             "artifacts": {
                 "global_terminal_candidates": {
                     "path": all_path.name,
@@ -1323,6 +1812,7 @@ def _parser() -> argparse.ArgumentParser:
     sources = aggregate.add_mutually_exclusive_group(required=True)
     sources.add_argument("--result", type=Path, action="append")
     sources.add_argument("--results-root", type=Path)
+    aggregate.add_argument("--bundle-manifest", type=Path, required=True)
     aggregate.add_argument("--minimum-seeds", type=int, default=32)
     aggregate.add_argument("--output", type=Path, required=True)
     return parser
@@ -1345,6 +1835,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         result = aggregate_results(
             result_paths=result_paths,
+            bundle_manifest_path=args.bundle_manifest,
             output=args.output,
             minimum_seeds=args.minimum_seeds,
         )

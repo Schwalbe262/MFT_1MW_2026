@@ -4,6 +4,7 @@ import copy
 import json
 from pathlib import Path
 import types
+from typing import Mapping
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,31 @@ from tools import mft_goal_20260726_launch as launch
 
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def _synthetic_goal_code_manifest(revision: str = "c" * 40):
+    records = {
+        "artifacts/code/.source-revision": {
+            "sha256": "9" * 64,
+            "size": 41,
+        }
+    }
+    return launch._seal(
+        {
+            "schema_version": launch.CODE_MANIFEST_SCHEMA,
+            "campaign_id": "mft-goal-20260726",
+            "code_revision": revision,
+            "code_root_relative": "artifacts/code",
+            "revision_marker": "artifacts/code/.source-revision",
+            "files": records,
+            "code_inventory": records,
+            "code_inventory_sha256": goal.canonical_sha256(records),
+            "staged_path_rule": "bundle_root/<code_inventory_key>",
+            "source_checkout_mutated": False,
+            "remote_git_checkout_required": False,
+            "scheduler_project_code_included": False,
+        }
+    )
 
 
 class _Predictor:
@@ -322,6 +348,7 @@ def test_goal_launcher_builds_isolated_32_seed_canary_rolling_payloads(
             "schema_version": launch.LOCAL_PREFLIGHT_SCHEMA,
             "hard_constraint_contract_sha256": "d" * 64,
             "dataset_sha256": "a" * 64,
+            "profile_sha256": "2" * 64,
             "evaluation_model_sha256": "b" * 64,
             "train_report_sha256": "e" * 64,
             "candidate_sha256": "f" * 64,
@@ -335,13 +362,17 @@ def test_goal_launcher_builds_isolated_32_seed_canary_rolling_payloads(
         "candidate": "candidate.json",
         "quality_status": "quality.json",
         "code_root": "repo",
+        "dataset": "strict.parquet",
+        "profile": "profile.json",
         "expected_code_revision": "c" * 40,
     }
+    code_manifest = _synthetic_goal_code_manifest()
     bundle, tasks, scheduler = launch.build_bundle_values(
         local_preflight=local_preflight,
         assignments=assignments,
         output_root=tmp_path,
         source=source,
+        code_manifest=code_manifest,
     )
     assert bundle["schema_version"] == launch.BUNDLE_SCHEMA
     assert bundle["task_count"] == 32
@@ -351,6 +382,20 @@ def test_goal_launcher_builds_isolated_32_seed_canary_rolling_payloads(
     )
     assert bundle["relocation_contract"][
         "source_absolute_paths_are_not_worker_authority"
+    ] is True
+    assert bundle["relocation_contract"]["roles"] == list(
+        launch.RUNTIME_SOURCE_ROLES
+    )
+    assert bundle["code_manifest"]["payload_sha256"] == (
+        code_manifest["payload_sha256"]
+    )
+    assert code_manifest["staged_path_rule"] == (
+        "bundle_root/<code_inventory_key>"
+    )
+    assert code_manifest["source_checkout_mutated"] is False
+    assert bundle["relocation_contract"]["relocation_files_emitted"] is False
+    assert bundle["relocation_contract"][
+        "stager_must_generate_task_bound_relocation"
     ] is True
     assert scheduler["maximum_parallel_tasks"] == 32
     assert scheduler["canary_seed_count"] == 4
@@ -374,6 +419,7 @@ def test_goal_launcher_task_rejects_legacy_scalar_temperature():
             "schema_version": launch.LOCAL_PREFLIGHT_SCHEMA,
             "hard_constraint_contract_sha256": "d" * 64,
             "dataset_sha256": "a" * 64,
+            "profile_sha256": "2" * 64,
             "evaluation_model_sha256": "b" * 64,
             "train_report_sha256": "e" * 64,
             "candidate_sha256": "f" * 64,
@@ -391,8 +437,11 @@ def test_goal_launcher_task_rejects_legacy_scalar_temperature():
             "candidate": "candidate.json",
             "quality_status": "quality.json",
             "code_root": "repo",
+            "dataset": "strict.parquet",
+            "profile": "profile.json",
             "expected_code_revision": "c" * 40,
         },
+        code_manifest=_synthetic_goal_code_manifest(),
     )
     forged = copy.deepcopy(tasks[0])
     forged.pop("payload_sha256")
@@ -640,16 +689,23 @@ def test_terminal_320_table_contains_physical_dedupe_and_provenance():
         )
 
 
-def _write_synthetic_goal_seed_result(root: Path, *, seed: int) -> Path:
+def _write_synthetic_goal_seed_result(
+    root: Path, *, task: Mapping[str, object]
+) -> Path:
     root.mkdir()
+    seed = int(task["seed"])
+    fixed_primary_turns = int(task["fixed_primary_turns"])
     constraints = list(preflight.GOAL_CONSTRAINT_NAMES)
-    task_sha = goal.canonical_sha256({"synthetic_task_seed": seed})
+    task_sha = str(task["payload_sha256"])
     rows = []
     for index in range(launch.POPULATION):
         if index == 0:
-            volume, loss = (
-                (100.0, 200.0) if seed == 101 else (110.0, 190.0)
-            )
+            if seed == 101:
+                volume, loss = 100.0, 200.0
+            elif seed == 102:
+                volume, loss = 110.0, 190.0
+            else:
+                volume, loss = 500.0 + seed, 500.0 + seed
         elif seed == 101 and index == 1:
             # Physical G alone passes, but a negative objective must remain
             # quarantined by the canonical surrogate-physicality evidence.
@@ -675,27 +731,39 @@ def _write_synthetic_goal_seed_result(root: Path, *, seed: int) -> Path:
             "physical_G_json": "{}",
             "normalized_G_json": "{}",
             "coordinate_unit_json": "[]",
-            "decoded_physical_params_json": "{}",
+            "decoded_physical_params_json": json.dumps(
+                {
+                    "N1_main": fixed_primary_turns,
+                    "N1_side": 0,
+                },
+                sort_keys=True,
+            ),
             "source_seed": seed,
             "source_task_id": f"task-{seed}",
             "source_bundle_id": task_sha,
-            "source_island_id": f"n1-{5 + (seed % 2)}",
-            "dataset_sha256": "a" * 64,
-            "evaluation_model_sha256": "b" * 64,
-            "constraint_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
+            "source_island_id": f"n1-{fixed_primary_turns}",
+            "dataset_sha256": task["dataset_sha256"],
+            "evaluation_model_sha256": task["evaluation_model_sha256"],
+            "constraint_spec_sha256": task["stage_spec_sha256"],
             "cooling_contract_sha256": (
                 goal.FIXED_COOLING_IDENTITY_SHA256
             ),
             "operating_point_sha256": (
                 goal.FIXED_OPERATING_IDENTITY_SHA256
             ),
-            "evaluation_model_artifacts_sha256": "b" * 64,
-            "evaluation_model_generation_sha256": "c" * 64,
-            "evaluation_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
+            "evaluation_model_artifacts_sha256": task[
+                "evaluation_model_sha256"
+            ],
+            "evaluation_model_generation_sha256": task[
+                "source_identity"
+            ]["train_report_sha256"],
+            "evaluation_spec_sha256": task["stage_spec_sha256"],
             "evaluation_temperature_contract_sha256": (
                 goal.GOAL_TEMPERATURE_CONTRACT_SHA256
             ),
-            "evaluation_hard_constraint_contract_sha256": "d" * 64,
+            "evaluation_hard_constraint_contract_sha256": task[
+                "hard_constraint_contract_sha256"
+            ],
         }
         row.update({f"physical_G:{name}": -1.0 for name in constraints})
         row.update({f"normalized_G:{name}": -0.5 for name in constraints})
@@ -722,7 +790,9 @@ def _write_synthetic_goal_seed_result(root: Path, *, seed: int) -> Path:
             "temperature_contract_sha256": (
                 goal.GOAL_TEMPERATURE_CONTRACT_SHA256
             ),
-            "hard_constraint_contract_sha256": "d" * 64,
+            "hard_constraint_contract_sha256": task[
+                "hard_constraint_contract_sha256"
+            ],
             "one_row_per_terminal_individual": True,
             "physical_deduplication_key": "physical_geometry_sha256",
             "global_pareto_provenance_ready": True,
@@ -749,7 +819,7 @@ def _write_synthetic_goal_seed_result(root: Path, *, seed: int) -> Path:
             "goal_contract_schema": goal.GOAL_CONTRACT_SCHEMA,
             "task_payload_sha256": task_sha,
             "seed": seed,
-            "fixed_primary_turns": 5 + (seed % 2),
+            "fixed_primary_turns": fixed_primary_turns,
             "population": launch.POPULATION,
             "generations": launch.GENERATIONS,
             "evaluated_generations": launch.GENERATIONS,
@@ -762,9 +832,11 @@ def _write_synthetic_goal_seed_result(root: Path, *, seed: int) -> Path:
             "temperature_contract_sha256": (
                 goal.GOAL_TEMPERATURE_CONTRACT_SHA256
             ),
-            "hard_constraint_contract_sha256": "d" * 64,
-            "dataset_sha256": "a" * 64,
-            "evaluation_model_sha256": "b" * 64,
+            "hard_constraint_contract_sha256": task[
+                "hard_constraint_contract_sha256"
+            ],
+            "dataset_sha256": task["dataset_sha256"],
+            "evaluation_model_sha256": task["evaluation_model_sha256"],
             "operating_point_sha256": (
                 goal.FIXED_OPERATING_IDENTITY_SHA256
             ),
@@ -782,7 +854,7 @@ def _write_synthetic_goal_seed_result(root: Path, *, seed: int) -> Path:
             "artifact_inventory_sha256": goal.canonical_sha256(inventory),
             "terminal_physical_candidates_manifest": manifest,
             "legacy_current7_stage_or_release_identity_reused": False,
-            "search_only_proposal": False,
+            "search_only_proposal": task["search_only_proposal"],
             "production_eligible": False,
             "fea_submission_performed": False,
             "automatic_promotion_allowed": False,
@@ -793,26 +865,94 @@ def _write_synthetic_goal_seed_result(root: Path, *, seed: int) -> Path:
     return result_path
 
 
+def _write_synthetic_goal_bundle(
+    root: Path,
+    *,
+    seeds: tuple[int, int, int, int],
+    turns: tuple[int, int, int, int] = (5, 6, 7, 8),
+) -> tuple[Path, list[dict[str, object]]]:
+    root.mkdir()
+    assignments = launch.seed_assignments(
+        mode="rolling32",
+        seed_start=seeds[0],
+    )[:4]
+    for assignment, seed, fixed_turns in zip(assignments, seeds, turns):
+        assignment["seed"] = seed
+        assignment["fixed_primary_turns"] = fixed_turns
+    local_preflight = launch._seal(
+        {
+            "schema_version": launch.LOCAL_PREFLIGHT_SCHEMA,
+            "hard_constraint_contract_sha256": "d" * 64,
+            "dataset_sha256": "a" * 64,
+            "profile_sha256": "2" * 64,
+            "evaluation_model_sha256": "b" * 64,
+            "train_report_sha256": "e" * 64,
+            "candidate_sha256": "f" * 64,
+            "quality_status_sha256": "1" * 64,
+            "code": {"revision": "c" * 40},
+            "search_only_proposal": False,
+        }
+    )
+    source = {
+        "generation": r"Z:\documentary\registry\generations\G0",
+        "candidate": r"Z:\documentary\candidate.json",
+        "quality_status": r"Z:\documentary\quality.json",
+        "code_root": r"Z:\documentary\code",
+        "dataset": r"Z:\documentary\strict.parquet",
+        "profile": r"Z:\documentary\profile.json",
+        "expected_code_revision": "c" * 40,
+    }
+    code_manifest = _synthetic_goal_code_manifest()
+    bundle, tasks, _scheduler = launch.build_bundle_values(
+        local_preflight=local_preflight,
+        assignments=assignments,
+        output_root=root,
+        source=source,
+        code_manifest=code_manifest,
+    )
+    launch._atomic_json(root / "code_manifest.json", code_manifest)
+    for task in tasks:
+        launch._atomic_json(
+            root
+            / "tasks"
+            / f"seed-{task['seed']}-n1-{task['fixed_primary_turns']}.json",
+            task,
+        )
+    bundle_path = root / "bundle_manifest.json"
+    launch._atomic_json(bundle_path, bundle)
+    return bundle_path, tasks
+
+
 def test_global_pareto_recomputes_from_all_terminal_rows_and_physicality(
     tmp_path,
 ):
+    bundle_path, tasks = _write_synthetic_goal_bundle(
+        tmp_path / "bundle",
+        seeds=(101, 102, 103, 104),
+    )
     results = [
-        _write_synthetic_goal_seed_result(tmp_path / "seed-101", seed=101),
-        _write_synthetic_goal_seed_result(tmp_path / "seed-102", seed=102),
+        _write_synthetic_goal_seed_result(
+            tmp_path / f"seed-{task['seed']}",
+            task=task,
+        )
+        for task in tasks
     ]
     manifest_path = launch.aggregate_results(
         result_paths=results,
+        bundle_manifest_path=bundle_path,
         output=tmp_path / "global",
-        minimum_seeds=2,
+        minimum_seeds=4,
     )
     manifest = launch._validate_seal(
         json.loads(manifest_path.read_text(encoding="utf-8")),
         schema=launch.GLOBAL_PARETO_SCHEMA,
     )
-    assert manifest["input_terminal_row_count"] == 640
-    assert manifest["physical_feasible_count"] == 639
+    assert manifest["input_terminal_row_count"] == 1280
+    assert manifest["physical_feasible_count"] == 1279
     assert manifest["global_pareto_count"] == 2
     assert manifest["seed_local_pareto_merge_used"] is False
+    assert manifest["authenticated_bundle"]["task_count"] == 4
+    assert manifest["authenticated_bundle"]["all_four_N1_strata_covered"] is True
     pareto = pd.read_csv(tmp_path / "global" / "global_pareto_front.csv")
     assert sorted(
         zip(
@@ -829,3 +969,247 @@ def test_global_pareto_recomputes_from_all_terminal_rows_and_physicality(
     ].iloc[0]
     assert bool(quarantined["physical_feasible"]) is False
     assert quarantined["global_non_dominated_rank"] == -1
+
+
+def _write_goal_code_inventory_fixture(root: Path):
+    code_root = root / "artifacts" / "code"
+    runtime_file = code_root / "module" / "runtime.py"
+    runtime_file.parent.mkdir(parents=True)
+    runtime_file.write_text("VALUE = 1\n", encoding="utf-8")
+    revision = "a" * 40
+    marker = code_root / ".source-revision"
+    marker.write_bytes(f"{revision}\n".encode("ascii"))
+    records = {
+        "artifacts/code/.source-revision": {
+            "sha256": adapter.sha256_file(marker),
+            "size": marker.stat().st_size,
+        },
+        "artifacts/code/module/runtime.py": {
+            "sha256": adapter.sha256_file(runtime_file),
+            "size": runtime_file.stat().st_size,
+        },
+    }
+    manifest = launch._seal(
+        {
+            "schema_version": launch.CODE_MANIFEST_SCHEMA,
+            "campaign_id": "mft-goal-20260726",
+            "code_revision": revision,
+            "code_root_relative": "artifacts/code",
+            "revision_marker": "artifacts/code/.source-revision",
+            "files": records,
+            "code_inventory": records,
+            "code_inventory_sha256": goal.canonical_sha256(records),
+            "staged_path_rule": "bundle_root/<code_inventory_key>",
+            "source_checkout_mutated": False,
+            "remote_git_checkout_required": False,
+            "scheduler_project_code_included": False,
+        }
+    )
+    manifest_path = root / "code_manifest.json"
+    launch._atomic_json(manifest_path, manifest)
+    return code_root, runtime_file, marker, manifest_path, manifest
+
+
+def test_checkout_free_goal_code_inventory_rehashes_and_fails_closed(tmp_path):
+    code_root, runtime_file, _marker, manifest_path, manifest = (
+        _write_goal_code_inventory_fixture(tmp_path / "valid")
+    )
+    evidence = preflight.authenticate_goal_code_inventory(
+        code_root=code_root,
+        code_manifest_path=manifest_path,
+        expected_manifest_payload_sha256=manifest["payload_sha256"],
+        expected_code_inventory_sha256=manifest["code_inventory_sha256"],
+        expected_code_revision=manifest["code_revision"],
+    )
+    assert evidence["authentication_mode"] == "sealed_goal_code_inventory"
+    assert evidence["git_checkout_required"] is False
+    assert evidence["verified_file_count"] == 2
+    with pytest.raises(RuntimeError, match="manifest identity mismatch"):
+        preflight.authenticate_goal_code_inventory(
+            code_root=code_root,
+            code_manifest_path=manifest_path,
+            expected_manifest_payload_sha256="0" * 64,
+            expected_code_inventory_sha256=manifest["code_inventory_sha256"],
+            expected_code_revision=manifest["code_revision"],
+        )
+
+    runtime_file.write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="code file authentication failed"):
+        preflight.authenticate_goal_code_inventory(
+            code_root=code_root,
+            code_manifest_path=manifest_path,
+            expected_manifest_payload_sha256=manifest["payload_sha256"],
+            expected_code_inventory_sha256=manifest["code_inventory_sha256"],
+            expected_code_revision=manifest["code_revision"],
+        )
+
+    code_root, _runtime_file, _marker, manifest_path, manifest = (
+        _write_goal_code_inventory_fixture(tmp_path / "extra")
+    )
+    (code_root / "module" / "shadow.py").write_text(
+        "RAISE = True\n", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="inventory is not exact"):
+        preflight.authenticate_goal_code_inventory(
+            code_root=code_root,
+            code_manifest_path=manifest_path,
+            expected_manifest_payload_sha256=manifest["payload_sha256"],
+            expected_code_inventory_sha256=manifest["code_inventory_sha256"],
+            expected_code_revision=manifest["code_revision"],
+        )
+
+    code_root, _runtime_file, marker, manifest_path, manifest = (
+        _write_goal_code_inventory_fixture(tmp_path / "marker")
+    )
+    marker.write_bytes(f"{'b' * 40}\n".encode("ascii"))
+    with pytest.raises(RuntimeError, match="code file authentication failed"):
+        preflight.authenticate_goal_code_inventory(
+            code_root=code_root,
+            code_manifest_path=manifest_path,
+            expected_manifest_payload_sha256=manifest["payload_sha256"],
+            expected_code_inventory_sha256=manifest["code_inventory_sha256"],
+            expected_code_revision=manifest["code_revision"],
+        )
+
+
+def test_worker_relocation_requires_six_roles_and_bound_code_manifest(tmp_path):
+    bundle_path, tasks = _write_synthetic_goal_bundle(
+        tmp_path / "bundle",
+        seeds=(201, 202, 203, 204),
+    )
+    task = tasks[0]
+    runtime_paths = {
+        name: str((tmp_path / "worker" / name).resolve())
+        for name in launch.RUNTIME_SOURCE_ROLES
+    }
+    relocation = launch._seal(
+        {
+            "schema_version": launch.RELOCATION_SCHEMA,
+            "task_payload_sha256": task["payload_sha256"],
+            "paths": runtime_paths,
+            "code_manifest_path": str(
+                bundle_path.parent / "code_manifest.json"
+            ),
+            "source_absolute_paths_are_documentary_only": True,
+            "remote_git_checkout_required": False,
+        }
+    )
+    relocation_path = tmp_path / "relocation.json"
+    launch._atomic_json(relocation_path, relocation)
+    resolved, code_manifest_path = launch.resolve_worker_source(
+        task, relocation_path
+    )
+    assert {
+        name: resolved[name] for name in launch.RUNTIME_SOURCE_ROLES
+    } == runtime_paths
+    assert resolved["expected_code_revision"] == "c" * 40
+    assert code_manifest_path == bundle_path.parent / "code_manifest.json"
+    assert task["source"]["generation"].startswith("Z:")
+
+    forged = copy.deepcopy(relocation)
+    forged.pop("payload_sha256")
+    forged["paths"].pop("dataset")
+    launch._atomic_json(relocation_path, launch._seal(forged))
+    with pytest.raises(RuntimeError, match="relocation contract mismatch"):
+        launch.resolve_worker_source(task, relocation_path)
+
+
+def test_global_pareto_rejects_results_outside_original_task_ledger(tmp_path):
+    bundle_path, tasks = _write_synthetic_goal_bundle(
+        tmp_path / "bundle-a",
+        seeds=(301, 302, 303, 304),
+    )
+    _other_bundle, other_tasks = _write_synthetic_goal_bundle(
+        tmp_path / "bundle-b",
+        seeds=(401, 402, 403, 404),
+    )
+    results = [
+        _write_synthetic_goal_seed_result(
+            tmp_path / f"seed-a-{task['seed']}",
+            task=task,
+        )
+        for task in tasks
+    ]
+    results[0] = _write_synthetic_goal_seed_result(
+        tmp_path / "self-sealed-foreign-result",
+        task=other_tasks[0],
+    )
+    with pytest.raises(RuntimeError, match="not in the original task ledger"):
+        launch.aggregate_results(
+            result_paths=results,
+            bundle_manifest_path=bundle_path,
+            output=tmp_path / "forged-global",
+            minimum_seeds=4,
+        )
+
+    valid_results = [
+        _write_synthetic_goal_seed_result(
+            tmp_path / f"seed-valid-{task['seed']}",
+            task=task,
+        )
+        for task in tasks
+    ]
+    with pytest.raises(RuntimeError, match="one result for every"):
+        launch.aggregate_results(
+            result_paths=valid_results[:-1],
+            bundle_manifest_path=bundle_path,
+            output=tmp_path / "partial-global",
+            minimum_seeds=3,
+        )
+
+
+def test_global_pareto_rejects_tampered_generation_and_escaped_artifact(
+    tmp_path,
+):
+    bundle_path, tasks = _write_synthetic_goal_bundle(
+        tmp_path / "bundle",
+        seeds=(501, 502, 503, 504),
+    )
+    results = [
+        _write_synthetic_goal_seed_result(
+            tmp_path / f"seed-{task['seed']}",
+            task=task,
+        )
+        for task in tasks
+    ]
+    first = json.loads(results[0].read_text(encoding="utf-8"))
+    first.pop("payload_sha256")
+    first["completed_generations"] = launch.GENERATIONS - 1
+    launch._atomic_json(results[0], launch._seal(first))
+    with pytest.raises(RuntimeError, match="seed result contract mismatch"):
+        launch.aggregate_results(
+            result_paths=results,
+            bundle_manifest_path=bundle_path,
+            output=tmp_path / "short-global",
+            minimum_seeds=4,
+        )
+
+    first.pop("completed_generations")
+    first["completed_generations"] = launch.GENERATIONS
+    launch._atomic_json(results[0], launch._seal(first))
+    second = json.loads(results[1].read_text(encoding="utf-8"))
+    second.pop("payload_sha256")
+    second["artifact_inventory"]["terminal_physical_candidates"][
+        "path"
+    ] = "../terminal_physical_candidates.csv"
+    second["artifact_inventory_sha256"] = goal.canonical_sha256(
+        second["artifact_inventory"]
+    )
+    launch._atomic_json(results[1], launch._seal(second))
+    with pytest.raises(RuntimeError, match="path is unsafe"):
+        launch.aggregate_results(
+            result_paths=results,
+            bundle_manifest_path=bundle_path,
+            output=tmp_path / "escaped-global",
+            minimum_seeds=4,
+        )
+
+
+def test_bundle_task_ledger_requires_all_four_primary_turn_strata(tmp_path):
+    bundle_path, _tasks = _write_synthetic_goal_bundle(
+        tmp_path / "single-stratum-bundle",
+        seeds=(601, 602, 603, 604),
+        turns=(5, 5, 5, 5),
+    )
+    with pytest.raises(RuntimeError, match="lacks all N1 strata"):
+        launch.load_bundle_task_ledger(bundle_path)

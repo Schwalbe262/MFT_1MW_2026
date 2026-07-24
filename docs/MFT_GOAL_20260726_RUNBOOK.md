@@ -89,8 +89,13 @@ python tools/mft_goal_20260726_launch.py prepare `
 
 remote worker의 경로가 prepare host와 다르면 task별 relocation JSON을 만든다.
 형식은 `mft-goal-20260726-worker-relocation-v1`이며
-`task_payload_sha256`, `generation/candidate/quality_status/code_root` 네 role path,
-그리고 canonical `payload_sha256` seal을 포함한다. 실행 시:
+`task_payload_sha256`, 정확히 여섯 runtime role
+`generation/candidate/quality_status/code_root/dataset/profile`,
+`code_manifest_path`, canonical `payload_sha256` seal을 포함한다.
+또한 `source_absolute_paths_are_documentary_only=true`,
+`remote_git_checkout_required=false`를 명시한다. prepare는 relocation 파일을
+미리 만들지 않는다. GPFS 절대 경로를 아는 staging/Scheduler 쪽이 task별로
+생성하고 seal해야 한다. 실행 시:
 
 ```powershell
 python tools/mft_goal_20260726_launch.py execute-seed `
@@ -99,8 +104,13 @@ python tools/mft_goal_20260726_launch.py execute-seed `
   --output <worker-run-directory>
 ```
 
-worker는 relocated path를 권위로 믿지 않고 train report, candidate, quality,
-dataset, complete model inventory, clean code revision SHA를 task와 다시 대조한다.
+prepare 결과의 code byte는 `<bundle>/artifacts/code/<repo-relative>`에 있고
+revision marker는 `<bundle>/artifacts/code/.source-revision`, manifest는
+`<bundle>/code_manifest.json`이다. 원본 checkout은 수정하지 않는다. worker는
+relocated path를 권위로 믿지 않고 train report, candidate, quality, dataset,
+profile, complete model inventory와 code inventory/revision marker를 task와
+다시 대조한다. staged code root에는 `.git`이 없어도 되며, relocation을 쓰지
+않는 로컬 경로는 기존 clean Git checkout 인증을 유지한다.
 
 마감은 2026-07-26 18:00 KST (`2026-07-26T09:00:00Z`)로 manifest에
 고정돼 있다. CLI 자체는 Scheduler API write/submission을 하지 않는다.
@@ -127,6 +137,7 @@ seed-local Pareto끼리만 합쳐서는 최종 Pareto로 인정하지 않는다.
 ```powershell
 python tools/mft_goal_20260726_launch.py aggregate `
   --results-root <outside-repo>/runs `
+  --bundle-manifest <outside-repo>/mft-goal-rolling32/bundle_manifest.json `
   --minimum-seeds 32 `
   --output <outside-repo>/global-pareto
 ```
@@ -134,7 +145,10 @@ python tools/mft_goal_20260726_launch.py aggregate `
 512-seed 본 실행 결과에는 `--minimum-seeds 512`를 사용한다. 출력은
 `global_terminal_candidates.csv`, `global_pareto_front.csv`,
 `aggregate_manifest.json`이며 입력 result와 공통 모델/데이터/물리 계약 SHA가
-모두 봉인된다.
+모두 봉인된다. 수집기는 bundle의 원본 task ledger를 읽고 모든 task에 정확히
+한 result가 있는지, seed/N1/population 320/fixed 300 generations와 네 N1
+strata가 일치하는지 확인한다. 임의로 self-seal한 result, 누락/중복 result,
+result 디렉터리 밖 artifact path는 거부한다.
 
 전역 Pareto에서 선정한 최종 후보는 동일한 fixed operating/cooling identity로
 full model과 symmetric model을 재실행하고 두 `.aedt` 파일 및 FEA 결과 identity를

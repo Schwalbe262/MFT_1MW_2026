@@ -412,8 +412,30 @@ def authenticate_corrected_generation(
     candidate_path: Path,
     quality_path: Path,
     goal_campaign: bool = False,
+    dataset_path_override: Path | None = None,
+    profile_path_override: Path | None = None,
+    expected_documentary_generation_path: str | None = None,
 ) -> AuthenticatedCorrectedGeneration:
     """Authenticate small-file provenance before the one full artifact pass."""
+
+    relocation_requested = any(
+        value is not None
+        for value in (
+            dataset_path_override,
+            profile_path_override,
+            expected_documentary_generation_path,
+        )
+    )
+    if relocation_requested and (
+        dataset_path_override is None
+        or profile_path_override is None
+        or not isinstance(expected_documentary_generation_path, str)
+        or not expected_documentary_generation_path
+    ):
+        raise RuntimeError(
+            "corrected generation relocation requires dataset, profile, "
+            "and documentary generation path together"
+        )
 
     generation_targets = (
         tuple(GOAL_G0_MODEL_TARGETS)
@@ -501,10 +523,20 @@ def authenticate_corrected_generation(
     if actual_directories != set(generation_targets):
         raise RuntimeError("corrected generation target directory inventory mismatch")
 
-    dataset_path = Path(str(report.get("dataset_path") or "")).resolve(strict=True)
+    documentary_dataset_path = str(report.get("dataset_path") or "")
+    documentary_profile_path = str(report.get("profile_path") or "")
+    dataset_path = (
+        Path(dataset_path_override).resolve(strict=True)
+        if relocation_requested
+        else Path(documentary_dataset_path).resolve(strict=True)
+    )
     if not dataset_path.is_file() or sha256_file(dataset_path) != dataset_sha:
         raise RuntimeError("corrected generation dataset fingerprint mismatch")
-    profile_path = Path(str(report.get("profile_path") or "")).resolve(strict=True)
+    profile_path = (
+        Path(profile_path_override).resolve(strict=True)
+        if relocation_requested
+        else Path(documentary_profile_path).resolve(strict=True)
+    )
     profile = read_json(profile_path)
     if training_profile_sha256(profile) != profile_sha:
         raise RuntimeError("corrected generation profile fingerprint mismatch")
@@ -516,11 +548,17 @@ def authenticate_corrected_generation(
         "candidate",
         strict_rows=strict_rows,
     )
+    candidate_generation_path = str(candidate.get("generation_path") or "")
+    candidate_path_matches = (
+        candidate_generation_path == expected_documentary_generation_path
+        if relocation_requested
+        else _same_path(Path(candidate_generation_path), generation)
+    )
     if (
         candidate.get("schema_version") != 2
         or candidate.get("training_run_id") != run_id
         or candidate.get("generation") != generation_relative
-        or not _same_path(Path(str(candidate.get("generation_path") or "")), generation)
+        or not candidate_path_matches
         or candidate.get("generation_report_sha256") != report_sha
         or candidate.get("dataset_sha256") != dataset_sha
         or candidate.get("strict_full_rows") != strict_rows
@@ -607,6 +645,17 @@ def authenticate_corrected_generation(
             "canonicalization": (
                 "json_sort_keys_compact_ensure_ascii_true_train_models_v1"
             ),
+        },
+        "relocation": {
+            "enabled": relocation_requested,
+            "source_absolute_paths_are_documentary_only": relocation_requested,
+            "documentary_generation_path": candidate_generation_path,
+            "runtime_generation_path": str(generation),
+            "documentary_dataset_path": documentary_dataset_path,
+            "runtime_dataset_path": str(dataset_path),
+            "documentary_profile_path": documentary_profile_path,
+            "runtime_profile_path": str(profile_path),
+            "content_identities_reauthenticated": relocation_requested,
         },
         "capacitance_recovery": {
             **recovery,

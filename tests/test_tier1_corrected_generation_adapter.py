@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import types
@@ -197,6 +198,99 @@ def test_authenticates_failed_quality_only_with_complete_recovery(tmp_path):
     ) is documentary
     with pytest.raises(RuntimeError, match="identity is invalid"):
         adapter.validate_adapter_manifest(documentary)
+
+
+def test_explicit_relocation_uses_content_not_source_absolute_paths(tmp_path):
+    paths = _synthetic_generation(tmp_path / "source")
+    report = dict(paths["report"])
+    documentary_generation = json.loads(
+        Path(paths["candidate"]).read_text(encoding="utf-8")
+    )["generation_path"]
+    relocated = tmp_path / "linux-worker"
+    relocated_generation = (
+        relocated
+        / "registry"
+        / "generations"
+        / Path(paths["generation"]).name
+    )
+    shutil.copytree(Path(paths["generation"]), relocated_generation)
+    relocated_candidate = relocated / "evidence" / "candidate.json"
+    relocated_quality = relocated / "evidence" / "quality.json"
+    relocated_candidate.parent.mkdir(parents=True)
+    shutil.copy2(Path(paths["candidate"]), relocated_candidate)
+    shutil.copy2(Path(paths["quality"]), relocated_quality)
+    relocated_dataset = relocated / "dataset" / "strict.parquet"
+    relocated_profile = relocated / "profile" / "standard.json"
+    relocated_dataset.parent.mkdir()
+    relocated_profile.parent.mkdir()
+    shutil.copy2(Path(report["dataset_path"]), relocated_dataset)
+    shutil.copy2(Path(report["profile_path"]), relocated_profile)
+    dataset_bytes = relocated_dataset.read_bytes()
+    shutil.rmtree(tmp_path / "source" / "runtime")
+
+    with pytest.raises((FileNotFoundError, RuntimeError)):
+        adapter.authenticate_corrected_generation(
+            generation=relocated_generation,
+            candidate_path=relocated_candidate,
+            quality_path=relocated_quality,
+        )
+    authenticated = adapter.authenticate_corrected_generation(
+        generation=relocated_generation,
+        candidate_path=relocated_candidate,
+        quality_path=relocated_quality,
+        dataset_path_override=relocated_dataset,
+        profile_path_override=relocated_profile,
+        expected_documentary_generation_path=documentary_generation,
+    )
+    assert authenticated.dataset_path == relocated_dataset.resolve()
+    assert authenticated.profile_path == relocated_profile.resolve()
+    assert authenticated.evidence["relocation"]["enabled"] is True
+    assert authenticated.evidence["relocation"][
+        "documentary_generation_path"
+    ] == documentary_generation
+    assert authenticated.evidence["relocation"][
+        "runtime_generation_path"
+    ] == str(relocated_generation.resolve())
+
+    with pytest.raises(RuntimeError, match="candidate identity mismatch"):
+        adapter.authenticate_corrected_generation(
+            generation=relocated_generation,
+            candidate_path=relocated_candidate,
+            quality_path=relocated_quality,
+            dataset_path_override=relocated_dataset,
+            profile_path_override=relocated_profile,
+            expected_documentary_generation_path=r"Z:\wrong\G0",
+        )
+    with pytest.raises(RuntimeError, match="requires dataset, profile"):
+        adapter.authenticate_corrected_generation(
+            generation=relocated_generation,
+            candidate_path=relocated_candidate,
+            quality_path=relocated_quality,
+            dataset_path_override=relocated_dataset,
+            expected_documentary_generation_path=documentary_generation,
+        )
+
+    relocated_dataset.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="dataset fingerprint mismatch"):
+        adapter.authenticate_corrected_generation(
+            generation=relocated_generation,
+            candidate_path=relocated_candidate,
+            quality_path=relocated_quality,
+            dataset_path_override=relocated_dataset,
+            profile_path_override=relocated_profile,
+            expected_documentary_generation_path=documentary_generation,
+        )
+    relocated_dataset.write_bytes(dataset_bytes)
+    _write_json(relocated_profile, {"tampered": True})
+    with pytest.raises(RuntimeError, match="profile fingerprint mismatch"):
+        adapter.authenticate_corrected_generation(
+            generation=relocated_generation,
+            candidate_path=relocated_candidate,
+            quality_path=relocated_quality,
+            dataset_path_override=relocated_dataset,
+            profile_path_override=relocated_profile,
+            expected_documentary_generation_path=documentary_generation,
+        )
 
 
 def test_authentication_rejects_incomplete_recovery_and_target_guard(tmp_path):

@@ -26,6 +26,7 @@ import json
 import math
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import sys
 import tempfile
 from typing import Any, Mapping
@@ -116,6 +117,7 @@ RECEIPT_SCHEMA = "mft-tier1-corrected-generation-smoke-receipt-v2"
 GOAL_RECEIPT_SCHEMA = "mft-goal-20260726-g0-smoke-receipt-v1"
 RUNNER_SCHEMA = "mft-tier1-current7-corrected-runner-v2"
 GOAL_RUNNER_SCHEMA = "mft-goal-20260726-g0-runner-v1"
+GOAL_CODE_MANIFEST_SCHEMA = "mft-goal-20260726-code-inventory-v1"
 PROBLEM_SCHEMA = "mft-tier1-current7-hard-problem-v2"
 OPTIMIZER_REPAIR_SCHEMA = "mft-tier1-current7-physics-repair-v1"
 PINNED_PROJECTION_SOURCE_REVISION = "7c832f7f78f92ee2d99b2d37e14c3131f07d9cae"
@@ -5025,6 +5027,123 @@ def phase_b_semlock_safe_release_identity(
     return {**value, "sha256": canonical_sha256(value)}
 
 
+def authenticate_goal_code_inventory(
+    *,
+    code_root: Path,
+    code_manifest_path: Path,
+    expected_manifest_payload_sha256: str,
+    expected_code_inventory_sha256: str,
+    expected_code_revision: str,
+) -> dict[str, Any]:
+    """Authenticate a checkout-free goal runtime before importing from it."""
+
+    root = code_root.resolve(strict=True)
+    manifest_path = code_manifest_path.resolve(strict=True)
+    manifest = read_json(manifest_path)
+    unsigned = dict(manifest)
+    payload_sha256 = unsigned.pop("payload_sha256", None)
+    revision = str(expected_code_revision).lower()
+    expected_manifest_sha = str(expected_manifest_payload_sha256).lower()
+    expected_inventory_sha = str(expected_code_inventory_sha256).lower()
+    for value, length, label in (
+        (revision, 40, "goal code revision"),
+        (expected_manifest_sha, 64, "goal code manifest SHA-256"),
+        (expected_inventory_sha, 64, "goal code inventory SHA-256"),
+    ):
+        if (
+            len(value) != length
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise RuntimeError(f"{label} is invalid")
+    inventory = manifest.get("code_inventory")
+    files = manifest.get("files")
+    if (
+        manifest.get("schema_version") != GOAL_CODE_MANIFEST_SCHEMA
+        or payload_sha256 != canonical_sha256(unsigned)
+        or payload_sha256 != expected_manifest_sha
+        or manifest.get("code_revision") != revision
+        or manifest.get("code_root_relative") != "artifacts/code"
+        or not isinstance(inventory, Mapping)
+        or not inventory
+        or files != inventory
+        or manifest.get("code_inventory_sha256")
+        != canonical_sha256(inventory)
+        or manifest.get("code_inventory_sha256") != expected_inventory_sha
+        or manifest.get("revision_marker")
+        != "artifacts/code/.source-revision"
+        or manifest.get("staged_path_rule")
+        != "bundle_root/<code_inventory_key>"
+        or manifest.get("source_checkout_mutated") is not False
+        or manifest.get("remote_git_checkout_required") is not False
+        or manifest.get("scheduler_project_code_included") is not False
+    ):
+        raise RuntimeError("goal code manifest identity mismatch")
+
+    verified: dict[str, Any] = {}
+    expected_runtime_files: set[str] = set()
+    for relative, record in sorted(inventory.items()):
+        pure = PurePosixPath(str(relative))
+        if (
+            pure.is_absolute()
+            or len(pure.parts) < 3
+            or pure.parts[:2] != ("artifacts", "code")
+            or ".." in pure.parts
+        ):
+            raise RuntimeError(f"goal code inventory path mismatch: {relative}")
+        runtime_relative = PurePosixPath(*pure.parts[2:]).as_posix()
+        path = root.joinpath(*PurePosixPath(runtime_relative).parts).resolve(strict=True)
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"goal code inventory file escaped root: {relative}"
+            ) from exc
+        if not path.is_file():
+            raise RuntimeError(f"goal code inventory file is missing: {relative}")
+        size = path.stat().st_size
+        digest = sha256_file(path)
+        if (
+            not isinstance(record, Mapping)
+            or set(record) != {"sha256", "size"}
+            or record.get("size") != size
+            or record.get("sha256") != digest
+        ):
+            raise RuntimeError(f"goal code file authentication failed: {relative}")
+        expected_runtime_files.add(runtime_relative)
+        verified[str(relative)] = {"sha256": digest, "size": size}
+
+    actual_runtime_files = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+    }
+    if actual_runtime_files != expected_runtime_files:
+        raise RuntimeError("goal staged code file inventory is not exact")
+    marker = root / ".source-revision"
+    if marker.read_bytes() != f"{revision}\n".encode("ascii"):
+        raise RuntimeError("goal staged code revision marker mismatch")
+
+    evidence = {
+        "path": str(root),
+        "revision": revision,
+        "clean": True,
+        "authentication_mode": "sealed_goal_code_inventory",
+        "code_manifest": {
+            "path": str(manifest_path),
+            "sha256": sha256_file(manifest_path),
+            "payload_sha256": payload_sha256,
+        },
+        "code_inventory_sha256": canonical_sha256(inventory),
+        "verified_inventory_sha256": canonical_sha256(verified),
+        "verified_file_count": len(verified),
+        "revision_marker_authenticated": True,
+        "git_checkout_required": False,
+    }
+    evidence["sha256"] = canonical_sha256(evidence)
+    return evidence
+
+
 def build_authenticated_runner(
     *,
     generation: Path,
@@ -5035,6 +5154,12 @@ def build_authenticated_runner(
     fixed_primary_turns: int,
     stage_spec: Mapping[str, Any] | None = None,
     inference_threads: int = 1,
+    dataset_path_override: Path | None = None,
+    profile_path_override: Path | None = None,
+    expected_documentary_generation_path: str | None = None,
+    code_manifest_path: Path | None = None,
+    expected_code_manifest_payload_sha256: str | None = None,
+    expected_code_inventory_sha256: str | None = None,
 ) -> Current7Tier1Runner:
     """Authenticate, load exactly once, and construct the smoke-only runner."""
 
@@ -5059,8 +5184,44 @@ def build_authenticated_runner(
         candidate_path=candidate_path,
         quality_path=quality_path,
         goal_campaign=goal_campaign,
+        dataset_path_override=dataset_path_override,
+        profile_path_override=profile_path_override,
+        expected_documentary_generation_path=(
+            expected_documentary_generation_path
+        ),
     )
-    code_identity = authenticate_code_root(code_root, expected_code_revision)
+    code_inventory_requested = any(
+        value is not None
+        for value in (
+            code_manifest_path,
+            expected_code_manifest_payload_sha256,
+            expected_code_inventory_sha256,
+        )
+    )
+    if code_inventory_requested:
+        if (
+            code_manifest_path is None
+            or expected_code_manifest_payload_sha256 is None
+            or expected_code_inventory_sha256 is None
+        ):
+            raise RuntimeError(
+                "goal staged code authentication requires manifest and identities"
+            )
+        if not goal_campaign:
+            raise RuntimeError(
+                "checkout-free code inventory is restricted to the goal campaign"
+            )
+        code_identity = authenticate_goal_code_inventory(
+            code_root=code_root,
+            code_manifest_path=code_manifest_path,
+            expected_manifest_payload_sha256=(
+                expected_code_manifest_payload_sha256
+            ),
+            expected_code_inventory_sha256=expected_code_inventory_sha256,
+            expected_code_revision=expected_code_revision,
+        )
+    else:
+        code_identity = authenticate_code_root(code_root, expected_code_revision)
     modules = load_current7_modules(Path(code_identity["path"]))
     if goal_campaign:
         manifest = {
