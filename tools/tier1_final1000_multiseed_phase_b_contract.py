@@ -138,7 +138,9 @@ DEDUPE_PREFIX = "mft-tier1-final1000:concurrent-lane:"
 PHYSICAL_ATTEMPT_DEDUPE_PREFIX = "mft-tier1-final1000:concurrent-attempt:"
 REMOTE_CODE_FILES = (
     "module/core_material_contract.py",
+    "module/fixed_boundary_contract.py",
     "module/input_parameter_260706.py",
+    "module/mft_goal_20260726_contract.py",
     "tools/tier1_corrected_current7_receipt.py",
     "tools/tier1_corrected_current7_slurm_bundle.py",
     "tools/tier1_corrected_current7_slurm_publish.py",
