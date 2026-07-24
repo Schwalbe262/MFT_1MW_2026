@@ -482,6 +482,21 @@ def _task_snapshot(submission):
     }
 
 
+def _timeout_task_snapshot(submission, **overrides):
+    snapshot = {
+        **_task_snapshot(submission),
+        "status": "failed",
+        "state": "failed",
+        "exit_code": 124,
+        "failure_message": "task timed out after 14400s",
+        "timeout_seconds": 14400,
+        "started_at": "2026-07-25 03:20:14",
+        "finished_at": "2026-07-25 07:20:45",
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
 def test_selection_is_deterministic_diverse_and_mean_band_bound(
     tmp_path, monkeypatch
 ):
@@ -595,6 +610,186 @@ def test_plan_has_only_standard_and_exact_fixed_physics(tmp_path, monkeypatch):
         production.HandoffContractError, match="payload seal"
     ):
         production._load_plan(plan_path)
+
+
+def test_timeout_retry_is_distinct_fixed_physics_and_requires_failed_124(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_scheduler = _FakeScheduler()
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "original-submission.json",
+        scheduler=original_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan, original_params, _selected = probe._load_plan(
+        original_plan_path
+    )
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+
+    with pytest.raises(
+        production.HandoffContractError,
+        match="terminal failed/124",
+    ):
+        probe.create_timeout_retry_plan(
+            original_plan_path=original_plan_path,
+            original_submission_path=original_submission_path,
+            output=tmp_path / "forbidden-running-retry",
+            task_reader=lambda **_kwargs: {
+                **_timeout_task_snapshot(original_submission),
+                "status": "running",
+                "state": "running",
+                "exit_code": None,
+                "failure_message": "",
+                "finished_at": None,
+            },
+        )
+    assert not (tmp_path / "forbidden-running-retry").exists()
+
+    retry_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "retry-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            original_submission
+        ),
+    )
+    retry_plan, retry_params, _retry_selected = probe._load_plan(
+        retry_plan_path
+    )
+    retry_profile = production._read_json(
+        retry_plan_path.parent / retry_plan["profile"]["path"]
+    )
+    original_profile = production._read_json(
+        original_plan_path.parent / original_plan["profile"]["path"]
+    )
+    assert retry_plan["available_submission_commands"] == [
+        "submit-timeout-retry"
+    ]
+    assert retry_plan["retry_of_timeout"]["retry_of_task_id"] == 71001
+    assert retry_plan["retry_of_timeout"]["original_task_execution"][
+        "exit_code"
+    ] == 124
+    assert retry_plan["stage"]["resources"] == {
+        "cpus": 8,
+        "timeout_seconds": 28800,
+    }
+    assert retry_profile["mem_mb"] == 32768
+    assert retry_profile["cpus"] == 8
+    assert retry_profile["timeout_seconds"] == 28800
+    assert retry_profile["param_overrides"] == original_profile[
+        "param_overrides"
+    ]
+    assert retry_profile["fixed_boundary_contract"] == original_profile[
+        "fixed_boundary_contract"
+    ]
+    assert retry_params == original_params
+    assert retry_plan["solver_revision"] == original_plan["solver_revision"]
+    assert retry_plan["library_revision"] == original_plan[
+        "library_revision"
+    ]
+    assert (
+        retry_plan["stage"]["profile_sha256"]
+        != original_plan["stage"]["profile_sha256"]
+    )
+    assert (
+        retry_plan["stage"]["retained_aedt_bundle"]["dedupe_key"]
+        != original_plan["stage"]["retained_aedt_bundle"]["dedupe_key"]
+    )
+    assert (
+        retry_plan["stage"]["retained_aedt_bundle"]["relative_directory"]
+        != original_plan["stage"]["retained_aedt_bundle"][
+            "relative_directory"
+        ]
+    )
+
+
+def test_timeout_retry_reauthenticates_failure_before_single_submission(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_scheduler = _FakeScheduler()
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "original-submission.json",
+        scheduler=original_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan = probe._load_plan(original_plan_path)[0]
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+    retry_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "retry-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            original_submission
+        ),
+    )
+
+    blocked_scheduler = _FakeScheduler()
+    with pytest.raises(
+        production.HandoffContractError,
+        match="terminal failed/124",
+    ):
+        probe.submit_timeout_retry(
+            plan_path=retry_plan_path,
+            scheduler_cutover_receipt_path=cutover_path,
+            output=tmp_path / "forbidden-retry-submission.json",
+            scheduler=blocked_scheduler,
+            predictor=_Predictor(),
+            live_reader=_live_scheduler_reader,
+            task_reader=lambda **_kwargs: _timeout_task_snapshot(
+                original_submission,
+                exit_code=1,
+                failure_message="other failure",
+            ),
+        )
+    assert blocked_scheduler.calls == []
+    assert not (tmp_path / "forbidden-retry-submission.json").exists()
+
+    class _RetryScheduler(_FakeScheduler):
+        def submit_verification(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return 71002
+
+    retry_scheduler = _RetryScheduler()
+    retry_submission_path = probe.submit_timeout_retry(
+        plan_path=retry_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "retry-submission.json",
+        scheduler=retry_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            original_submission
+        ),
+    )
+    retry_plan = probe._load_plan(retry_plan_path)[0]
+    retry_submission = probe._load_submission(
+        retry_submission_path, plan=retry_plan
+    )
+    assert retry_submission["task_id"] == 71002
+    assert retry_submission["retry_of_timeout"] == retry_plan[
+        "retry_of_timeout"
+    ]
+    assert len(retry_scheduler.calls) == 1
+    submitted_profile = retry_scheduler.calls[0][0][3]
+    assert submitted_profile["timeout_seconds"] == 28800
+    assert submitted_profile["cpus"] == 8
+    assert submitted_profile["mem_mb"] == 32768
 
 
 def test_submit_and_collect_remain_diagnostic_after_actual_pass(

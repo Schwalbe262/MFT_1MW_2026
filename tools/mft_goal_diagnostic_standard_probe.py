@@ -94,7 +94,21 @@ PROFILE_PATH = (
     / "profiles"
     / "goal_diagnostic_standard.json"
 )
+TIMEOUT_RETRY_PROFILE_PATH = (
+    REPOSITORY_ROOT
+    / "regression_260707"
+    / "verify"
+    / "profiles"
+    / "goal_diagnostic_standard_timeout_retry.json"
+)
 STANDARD_RESOURCES = {"cpus": 8, "timeout_seconds": 4 * 3600}
+TIMEOUT_RETRY_RESOURCES = {"cpus": 8, "timeout_seconds": 8 * 3600}
+TIMEOUT_RETRY_PROFILE_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-retry-profile-v1"
+)
+TIMEOUT_RETRY_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-retry-evidence-v1"
+)
 LLT_UNCERTAINTY_CONSTRAINTS = frozenset(
     {"Llt_robust_band", "Llt_ensemble_disagreement"}
 )
@@ -595,15 +609,36 @@ def _artifact(
     return target
 
 
-def _profile_content() -> tuple[dict[str, Any], dict[str, Any]]:
-    path = PROFILE_PATH.resolve(strict=True)
+def _profile_content(
+    *, timeout_retry: bool = False
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    path = (
+        TIMEOUT_RETRY_PROFILE_PATH if timeout_retry else PROFILE_PATH
+    ).resolve(strict=True)
     profile = production._read_json(path)
-    _validate_profile(profile)
+    _validate_profile(profile, timeout_retry=timeout_retry)
     return profile, production._file_record(path)
 
 
-def _validate_profile(profile: Mapping[str, Any]) -> None:
+def _validate_profile(
+    profile: Mapping[str, Any], *, timeout_retry: bool = False
+) -> None:
     production_profile, _source = production._profile_content("standard")
+    expected_schema = (
+        TIMEOUT_RETRY_PROFILE_SCHEMA
+        if timeout_retry
+        else "mft-goal-diagnostic-standard-profile-v1"
+    )
+    expected_resources = (
+        TIMEOUT_RETRY_RESOURCES if timeout_retry else STANDARD_RESOURCES
+    )
+    expected_comment = (
+        "Diagnostic-only eighth-symmetry Standard FEA timeout retry with "
+        "retained AEDT project and AEDT results"
+        if timeout_retry
+        else "Diagnostic-only eighth-symmetry Standard FEA with retained "
+        "AEDT project and AEDT results"
+    )
     if (
         set(profile)
         != {
@@ -620,8 +655,9 @@ def _validate_profile(profile: Mapping[str, Any]) -> None:
             "timeout_seconds",
         }
         or profile.get("schema_version")
-        != "mft-goal-diagnostic-standard-profile-v1"
+        != expected_schema
         or profile.get("stage") != "standard"
+        or profile.get("comment") != expected_comment
         or profile.get("reviewed_solver_path")
         != production.PROFILE_REVIEWED_PATH["standard"]
         or profile.get("cli_flags")
@@ -631,9 +667,9 @@ def _validate_profile(profile: Mapping[str, Any]) -> None:
         or profile.get("fixed_boundary_contract")
         != production_profile["fixed_boundary_contract"]
         or profile.get("mem_mb") != 32768
-        or profile.get("cpus") != STANDARD_RESOURCES["cpus"]
+        or profile.get("cpus") != expected_resources["cpus"]
         or profile.get("timeout_seconds")
-        != STANDARD_RESOURCES["timeout_seconds"]
+        != expected_resources["timeout_seconds"]
         or profile.get("artifact_retention")
         != {
             "schema_version": (
@@ -2074,6 +2110,334 @@ def create_plan(
     return destination / plan_path.name
 
 
+def _plan_is_timeout_retry(plan: Mapping[str, Any]) -> bool:
+    return "retry_of_timeout" in plan
+
+
+def _plan_resources(plan: Mapping[str, Any]) -> dict[str, int]:
+    return (
+        TIMEOUT_RETRY_RESOURCES
+        if _plan_is_timeout_retry(plan)
+        else STANDARD_RESOURCES
+    )
+
+
+def _recorded_external_file(record: Any, label: str) -> Path:
+    if not isinstance(record, dict) or set(record) != {
+        "path",
+        "sha256",
+        "size_bytes",
+    }:
+        raise HandoffContractError(f"{label} record is malformed")
+    path = Path(str(record.get("path") or "")).resolve(strict=True)
+    if production._file_record(path) != record:
+        raise HandoffContractError(f"{label} bytes drifted")
+    return path
+
+
+def _timeout_failure_evidence(
+    snapshot: Mapping[str, Any],
+    *,
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = {
+        "schema_version": TIMEOUT_RETRY_EVIDENCE_SCHEMA,
+        "task_id": snapshot.get("task_id", snapshot.get("id")),
+        "name": snapshot.get("name"),
+        "status": snapshot.get("status"),
+        "state": snapshot.get("state"),
+        "exit_code": snapshot.get("exit_code"),
+        "failure_message": snapshot.get("failure_message"),
+        "timeout_seconds": snapshot.get("timeout_seconds"),
+        "slurm_job_id": str(snapshot.get("slurm_job_id") or ""),
+        "allocation_id": snapshot.get(
+            "allocation_id", snapshot.get("assigned_allocation")
+        ),
+        "account_name": snapshot.get("account_name"),
+        "actual_node_name": snapshot.get("actual_node_name"),
+        "cpus": snapshot.get("cpus"),
+        "memory_mb": snapshot.get("memory_mb"),
+        "aedt_backend": snapshot.get("aedt_backend"),
+        "project": snapshot.get("project"),
+        "dedupe_key": snapshot.get("dedupe_key"),
+        "remote_cwd": snapshot.get("remote_cwd"),
+        "remote_dir": snapshot.get("remote_dir"),
+        "started_at": snapshot.get("started_at"),
+        "finished_at": snapshot.get("finished_at"),
+    }
+    allocation_id = evidence["allocation_id"]
+    expected_failure = (
+        f"task timed out after {STANDARD_RESOURCES['timeout_seconds']}s"
+    )
+    if (
+        evidence["task_id"] != submission["task_id"]
+        or evidence["name"] != submission["task_name"]
+        or evidence["status"] != "failed"
+        or evidence["state"] != "failed"
+        or evidence["exit_code"] != 124
+        or evidence["failure_message"] != expected_failure
+        or evidence["timeout_seconds"]
+        != STANDARD_RESOURCES["timeout_seconds"]
+        or not str(evidence["slurm_job_id"]).isdigit()
+        or isinstance(allocation_id, bool)
+        or not isinstance(allocation_id, int)
+        or allocation_id <= 0
+        or not str(evidence["account_name"] or "").strip()
+        or not str(evidence["actual_node_name"] or "").strip()
+        or evidence["cpus"] != 8
+        or evidence["memory_mb"] != 32768
+        or evidence["aedt_backend"] != "standalone"
+        or evidence["project"] != scheduler_client.MFT_PROJECT
+        or evidence["dedupe_key"] != submission["dedupe_key"]
+        or not str(evidence["remote_cwd"] or "").strip()
+        or not str(evidence["remote_dir"] or "").strip()
+        or not str(evidence["started_at"] or "").strip()
+        or not str(evidence["finished_at"] or "").strip()
+    ):
+        raise HandoffContractError(
+            "diagnostic Standard timeout retry requires the exact terminal "
+            "failed/124 Scheduler task"
+        )
+    return evidence
+
+
+def _validate_timeout_retry_record(
+    plan: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    record = plan.get("retry_of_timeout")
+    expected_fields = {
+        "schema_version",
+        "retry_of_task_id",
+        "original_plan",
+        "original_plan_payload_sha256",
+        "original_submission",
+        "original_submission_payload_sha256",
+        "original_task_execution",
+        "original_task_execution_sha256",
+        "scheduler_url",
+        "timeout_reason",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != expected_fields
+        or record.get("schema_version")
+        != TIMEOUT_RETRY_EVIDENCE_SCHEMA
+        or record.get("scheduler_url") != DIAGNOSTIC_SCHEDULER_URL
+        or record.get("timeout_reason")
+        != f"task timed out after {STANDARD_RESOURCES['timeout_seconds']}s"
+    ):
+        raise HandoffContractError(
+            "diagnostic Standard timeout retry record drifted"
+        )
+    original_plan_path = _recorded_external_file(
+        record["original_plan"], "original diagnostic plan"
+    )
+    original_plan, original_params, original_selected = _load_plan(
+        original_plan_path
+    )
+    if _plan_is_timeout_retry(original_plan):
+        raise HandoffContractError(
+            "a timeout retry cannot be based on another timeout retry"
+        )
+    original_submission_path = _recorded_external_file(
+        record["original_submission"], "original diagnostic submission"
+    )
+    original_submission = _load_submission(
+        original_submission_path, plan=original_plan
+    )
+    execution = record.get("original_task_execution")
+    if (
+        record.get("retry_of_task_id") != original_submission["task_id"]
+        or record.get("original_plan_payload_sha256")
+        != original_plan["payload_sha256"]
+        or record.get("original_submission_payload_sha256")
+        != original_submission["payload_sha256"]
+        or not isinstance(execution, dict)
+        or _timeout_failure_evidence(
+            execution, submission=original_submission
+        )
+        != execution
+        or canonical_sha256(execution)
+        != record.get("original_task_execution_sha256")
+        or any(
+            plan.get(name) != original_plan.get(name)
+            for name in (
+                "campaign_id",
+                "goal_contract_schema",
+                "hard_spec",
+                "hard_spec_sha256",
+                "temperature_contract_sha256",
+                "solver_revision",
+                "library_revision",
+                "candidate_physics_sha256",
+                "search_authority_sha256",
+                "fea_params_sha256",
+            )
+        )
+    ):
+        raise HandoffContractError(
+            "diagnostic Standard timeout retry ancestry drifted"
+        )
+    return original_plan, original_submission, execution
+
+
+def create_timeout_retry_plan(
+    *,
+    original_plan_path: Path,
+    original_submission_path: Path,
+    output: Path,
+    scheduler_url: str = DIAGNOSTIC_SCHEDULER_URL,
+    task_reader: Any = None,
+) -> Path:
+    original_plan, params, selected = _load_plan(original_plan_path)
+    if _plan_is_timeout_retry(original_plan):
+        raise HandoffContractError(
+            "a timeout retry cannot be based on another timeout retry"
+        )
+    original_submission = _load_submission(
+        original_submission_path, plan=original_plan
+    )
+    normalized_scheduler_url = scheduler_url.rstrip("/")
+    if normalized_scheduler_url != original_submission["scheduler_url"]:
+        raise HandoffContractError(
+            "timeout retry Scheduler origin differs from original submission"
+        )
+    reader = task_reader or _scheduler_task_snapshot
+    execution = _timeout_failure_evidence(
+        reader(
+            scheduler_url=normalized_scheduler_url,
+            task_id=int(original_submission["task_id"]),
+        ),
+        submission=original_submission,
+    )
+    original_profile = production._read_json(
+        original_plan_path.resolve(strict=True).parent
+        / original_plan["profile"]["path"]
+    )
+    retry_profile, retry_profile_source = _profile_content(
+        timeout_retry=True
+    )
+    if (
+        retry_profile["param_overrides"]
+        != original_profile["param_overrides"]
+        or retry_profile["fixed_boundary_contract"]
+        != original_profile["fixed_boundary_contract"]
+        or production._effective_params(params, retry_profile)
+        != production._effective_params(params, original_profile)
+    ):
+        raise HandoffContractError(
+            "timeout retry profile changes fixed physics"
+        )
+    stem = str(original_plan["candidate_physics_sha256"])[:12]
+    task_name = f"mft-goal-diag-standard-timeout-r1-{stem}"
+    workdir = f"mft_goal_diag_standard_timeout_r1_{stem}"
+    retained = scheduler_client.retained_aedt_identity(
+        task_name,
+        params,
+        retry_profile,
+        original_plan["solver_revision"],
+        original_plan["library_revision"],
+    )
+    original_retained = original_plan["stage"]["retained_aedt_bundle"]
+    if (
+        retained is None
+        or retained["dedupe_key"] == original_retained["dedupe_key"]
+        or retained["relative_directory"]
+        == original_retained["relative_directory"]
+        or retained["profile_sha256"]
+        == original_retained["profile_sha256"]
+    ):
+        raise HandoffContractError(
+            "timeout retry did not derive a distinct immutable identity"
+        )
+    retry_record = {
+        "schema_version": TIMEOUT_RETRY_EVIDENCE_SCHEMA,
+        "retry_of_task_id": original_submission["task_id"],
+        "original_plan": production._file_record(
+            original_plan_path.resolve(strict=True)
+        ),
+        "original_plan_payload_sha256": original_plan["payload_sha256"],
+        "original_submission": production._file_record(
+            original_submission_path.resolve(strict=True)
+        ),
+        "original_submission_payload_sha256": original_submission[
+            "payload_sha256"
+        ],
+        "original_task_execution": execution,
+        "original_task_execution_sha256": canonical_sha256(execution),
+        "scheduler_url": normalized_scheduler_url,
+        "timeout_reason": (
+            f"task timed out after {STANDARD_RESOURCES['timeout_seconds']}s"
+        ),
+    }
+    destination = output.resolve()
+    if destination.exists():
+        raise HandoffContractError(
+            f"diagnostic timeout retry plan output already exists: "
+            f"{destination}"
+        )
+    staging = destination.with_name(
+        f".{destination.name}.{os.getpid()}."
+        f"{next(tempfile._get_candidate_names())}.tmp"
+    )
+    staging.mkdir(parents=True)
+    try:
+        selected_path = production._write_immutable_json(
+            staging / "selected_candidate.json", selected
+        )
+        params_path = production._write_immutable_json(
+            staging / "fea_params.json", params
+        )
+        profile_path = production._write_immutable_json(
+            staging / "diagnostic_standard_timeout_retry_profile.json",
+            retry_profile,
+        )
+        unsigned_plan = copy.deepcopy(original_plan)
+        unsigned_plan.pop("payload_sha256", None)
+        unsigned_plan.update(
+            {
+                "selected_candidate": {
+                    "path": selected_path.name,
+                    "sha256": production._sha256_file(selected_path),
+                },
+                "fea_params": {
+                    "path": params_path.name,
+                    "sha256": production._sha256_file(params_path),
+                },
+                "profile": {
+                    "path": profile_path.name,
+                    "sha256": production._sha256_file(profile_path),
+                    "canonical_sha256": canonical_sha256(retry_profile),
+                    "source": retry_profile_source,
+                },
+                "stage": {
+                    **copy.deepcopy(original_plan["stage"]),
+                    "task_name": task_name,
+                    "workdir": workdir,
+                    "profile_sha256": canonical_sha256(retry_profile),
+                    "resources": copy.deepcopy(TIMEOUT_RETRY_RESOURCES),
+                    "retained_aedt_bundle": retained,
+                    "retention_run_root": _retention_run_root_evidence(
+                        retained
+                    ),
+                },
+                "available_submission_commands": [
+                    "submit-timeout-retry"
+                ],
+                "retry_of_timeout": retry_record,
+            }
+        )
+        plan_path = production._write_immutable_json(
+            staging / "diagnostic_timeout_retry_plan.json",
+            production._seal(unsigned_plan),
+        )
+        os.replace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return destination / plan_path.name
+
+
 def _plan_artifact(root: Path, record: Any, label: str) -> Path:
     if (
         not isinstance(record, dict)
@@ -2095,6 +2459,12 @@ def _load_plan(
     plan = production._validate_seal(
         production._read_json(resolved), PLAN_SCHEMA
     )
+    timeout_retry = _plan_is_timeout_retry(plan)
+    expected_commands = (
+        ["submit-timeout-retry"]
+        if timeout_retry
+        else ["submit-standard"]
+    )
     flags = _diagnostic_flags()
     if (
         plan.get("campaign_id") != "mft-goal-20260726"
@@ -2104,7 +2474,7 @@ def _load_plan(
         or plan.get("temperature_contract_sha256")
         != GOAL_TEMPERATURE_CONTRACT_SHA256
         or any(plan.get(name) is not value for name, value in flags.items())
-        or plan.get("available_submission_commands") != ["submit-standard"]
+        or plan.get("available_submission_commands") != expected_commands
         or plan.get("physics_override_allowed") is not False
         or plan.get("scheduler_repository_modified") is not False
         or plan.get("scheduler_project_mutation_performed") is not False
@@ -2155,7 +2525,7 @@ def _load_plan(
         root, profile_record, "diagnostic Standard profile"
     )
     profile = production._read_json(profile_path)
-    _validate_profile(profile)
+    _validate_profile(profile, timeout_retry=timeout_retry)
     effective = production._effective_params(params, profile)
     stage = plan.get("stage")
     if not isinstance(stage, dict):
@@ -2174,7 +2544,7 @@ def _load_plan(
         or stage.get("profile_sha256") != canonical_sha256(profile)
         or stage.get("effective_params_sha256")
         != canonical_sha256(effective)
-        or stage.get("resources") != STANDARD_RESOURCES
+        or stage.get("resources") != _plan_resources(plan)
         or stage.get("retained_aedt_bundle") != retained
         or stage.get("retention_run_root")
         != _retention_run_root_evidence(retained)
@@ -2187,6 +2557,8 @@ def _load_plan(
         raise HandoffContractError(
             "diagnostic Standard execution identity drifted"
         )
+    if timeout_retry:
+        _validate_timeout_retry_record(plan)
     return plan, params, selected
 
 
@@ -2250,17 +2622,29 @@ def _fresh_selection_reauthentication(
     }
 
 
-def submit_standard(
+def _submit_standard_plan(
     *,
     plan_path: Path,
     scheduler_cutover_receipt_path: Path,
     output: Path,
+    expected_timeout_retry: bool,
     priority: int = 0,
     scheduler: Any = scheduler_client,
     predictor: Any | None = None,
     live_reader: Any = _default_scheduler_live_reader,
+    task_reader: Any = None,
 ) -> Path:
     plan, params, selected = _load_plan(plan_path)
+    timeout_retry = _plan_is_timeout_retry(plan)
+    if timeout_retry is not expected_timeout_retry:
+        command = (
+            "submit-timeout-retry"
+            if timeout_retry
+            else "submit-standard"
+        )
+        raise HandoffContractError(
+            f"diagnostic plan requires {command}"
+        )
     reauthentication = _fresh_selection_reauthentication(
         plan=plan, selected=selected, predictor=predictor
     )
@@ -2282,6 +2666,27 @@ def submit_standard(
         raise HandoffContractError(
             "Scheduler live launcher changed during admission checks"
         )
+    retry_record = None
+    if timeout_retry:
+        (
+            _original_plan,
+            original_submission,
+            stored_execution,
+        ) = _validate_timeout_retry_record(plan)
+        reader = task_reader or _scheduler_task_snapshot
+        live_execution = _timeout_failure_evidence(
+            reader(
+                scheduler_url=stage["scheduler_url"],
+                task_id=int(original_submission["task_id"]),
+            ),
+            submission=original_submission,
+        )
+        if live_execution != stored_execution:
+            raise HandoffContractError(
+                "diagnostic timeout failure evidence changed before retry "
+                "submission"
+            )
+        retry_record = copy.deepcopy(plan["retry_of_timeout"])
     target = output.resolve()
     if target.exists():
         raise HandoffContractError(
@@ -2314,6 +2719,13 @@ def submit_standard(
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
         raise HandoffContractError(
             "diagnostic Scheduler submission returned no durable task ID"
+        )
+    if (
+        timeout_retry
+        and task_id == int(plan["retry_of_timeout"]["retry_of_task_id"])
+    ):
+        raise HandoffContractError(
+            "diagnostic timeout retry resolved to the original task ID"
         )
     receipt = production._seal(
         {
@@ -2355,10 +2767,61 @@ def submit_standard(
             "scheduler_submission_performed": True,
             "retention_required": True,
             "prune_protection_required": True,
+            **(
+                {"retry_of_timeout": retry_record}
+                if timeout_retry
+                else {}
+            ),
             **_diagnostic_flags(),
         }
     )
     return production._write_immutable_json(target, receipt)
+
+
+def submit_standard(
+    *,
+    plan_path: Path,
+    scheduler_cutover_receipt_path: Path,
+    output: Path,
+    priority: int = 0,
+    scheduler: Any = scheduler_client,
+    predictor: Any | None = None,
+    live_reader: Any = _default_scheduler_live_reader,
+) -> Path:
+    return _submit_standard_plan(
+        plan_path=plan_path,
+        scheduler_cutover_receipt_path=scheduler_cutover_receipt_path,
+        output=output,
+        expected_timeout_retry=False,
+        priority=priority,
+        scheduler=scheduler,
+        predictor=predictor,
+        live_reader=live_reader,
+    )
+
+
+def submit_timeout_retry(
+    *,
+    plan_path: Path,
+    scheduler_cutover_receipt_path: Path,
+    output: Path,
+    priority: int = 0,
+    scheduler: Any = scheduler_client,
+    predictor: Any | None = None,
+    live_reader: Any = _default_scheduler_live_reader,
+    task_reader: Any = None,
+) -> Path:
+    return _submit_standard_plan(
+        plan_path=plan_path,
+        scheduler_cutover_receipt_path=scheduler_cutover_receipt_path,
+        output=output,
+        expected_timeout_retry=True,
+        priority=priority,
+        scheduler=scheduler,
+        predictor=predictor,
+        live_reader=live_reader,
+        task_reader=task_reader,
+    )
 
 
 def _load_submission(
@@ -2368,6 +2831,7 @@ def _load_submission(
         production._read_json(path.resolve(strict=True)), SUBMISSION_SCHEMA
     )
     stage = plan["stage"]
+    timeout_retry = _plan_is_timeout_retry(plan)
     cutover_record = receipt.get("scheduler_cutover_receipt")
     if not isinstance(cutover_record, dict):
         raise HandoffContractError(
@@ -2452,7 +2916,7 @@ def _load_submission(
         or receipt.get("scheduler_cutover_payload_sha256")
         != cutover["payload_sha256"]
         or admission.get("scheduler_url") != stage["scheduler_url"]
-        or receipt.get("resources") != STANDARD_RESOURCES
+        or receipt.get("resources") != _plan_resources(plan)
         or receipt.get("solver_revision") != plan["solver_revision"]
         or receipt.get("library_revision") != plan["library_revision"]
         or receipt.get("profile_sha256") != stage["profile_sha256"]
@@ -2467,6 +2931,15 @@ def _load_submission(
         or receipt.get("scheduler_submission_performed") is not True
         or receipt.get("retention_required") is not True
         or receipt.get("prune_protection_required") is not True
+        or (
+            timeout_retry
+            and receipt.get("retry_of_timeout")
+            != plan.get("retry_of_timeout")
+        )
+        or (
+            not timeout_retry
+            and "retry_of_timeout" in receipt
+        )
         or any(
             receipt.get(name) is not value
             for name, value in _diagnostic_flags().items()
@@ -3389,6 +3862,16 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--library-revision", required=True)
     plan.add_argument("--output", type=Path, required=True)
 
+    retry_plan = commands.add_parser("plan-timeout-retry")
+    retry_plan.add_argument("--original-plan", type=Path, required=True)
+    retry_plan.add_argument(
+        "--original-submission", type=Path, required=True
+    )
+    retry_plan.add_argument(
+        "--scheduler-url", default=DIAGNOSTIC_SCHEDULER_URL
+    )
+    retry_plan.add_argument("--output", type=Path, required=True)
+
     submit = commands.add_parser("submit-standard")
     submit.add_argument("--plan", type=Path, required=True)
     submit.add_argument(
@@ -3398,6 +3881,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     submit.add_argument("--priority", type=int, default=0)
     submit.add_argument("--output", type=Path, required=True)
+
+    retry_submit = commands.add_parser("submit-timeout-retry")
+    retry_submit.add_argument("--plan", type=Path, required=True)
+    retry_submit.add_argument(
+        "--scheduler-cutover-receipt",
+        type=Path,
+        required=True,
+    )
+    retry_submit.add_argument("--priority", type=int, default=0)
+    retry_submit.add_argument("--output", type=Path, required=True)
 
     collect = commands.add_parser("collect")
     collect.add_argument("--plan", type=Path, required=True)
@@ -3431,8 +3924,24 @@ def main(argv: list[str] | None = None) -> int:
             library_revision=args.library_revision,
             output=args.output,
         )
+    elif args.command == "plan-timeout-retry":
+        result = create_timeout_retry_plan(
+            original_plan_path=args.original_plan,
+            original_submission_path=args.original_submission,
+            scheduler_url=args.scheduler_url,
+            output=args.output,
+        )
     elif args.command == "submit-standard":
         result = submit_standard(
+            plan_path=args.plan,
+            scheduler_cutover_receipt_path=(
+                args.scheduler_cutover_receipt
+            ),
+            priority=args.priority,
+            output=args.output,
+        )
+    elif args.command == "submit-timeout-retry":
+        result = submit_timeout_retry(
             plan_path=args.plan,
             scheduler_cutover_receipt_path=(
                 args.scheduler_cutover_receipt

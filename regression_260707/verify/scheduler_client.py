@@ -680,11 +680,21 @@ def retained_aedt_identity(
             or not results_manifest_filename.endswith(".manifest.json")
         ):
             raise ValueError("retained AEDT result-bundle contract is invalid")
-        expected_profile_name = (
-            "goal_diagnostic_standard.json"
-            if stage == "standard"
-            else "goal_truth_promotion_full.json"
-        )
+        if stage == "standard":
+            expected_profile_name = {
+                "mft-goal-diagnostic-standard-profile-v1": (
+                    "goal_diagnostic_standard.json"
+                ),
+                "mft-goal-diagnostic-standard-timeout-retry-profile-v1": (
+                    "goal_diagnostic_standard_timeout_retry.json"
+                ),
+            }.get(str(profile.get("schema_version") or ""))
+            if expected_profile_name is None:
+                raise ValueError(
+                    "retained Standard profile schema is not reviewed"
+                )
+        else:
+            expected_profile_name = "goal_truth_promotion_full.json"
     else:
         if set(retention) != required:
             raise ValueError("retained AEDT v1 profile contract is invalid")
