@@ -34,7 +34,8 @@ checkout.
 ## 1. Authenticate and build the isolated dataset
 
 Run only after at least eight collection files exist. The allow-list below
-prevents unrelated JSON files from entering the command.
+prevents unrelated JSON files from entering the command. Eleven timeout
+retries replace, rather than augment, their failed original logical slots.
 
 ```powershell
 $Py = 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe'
@@ -73,6 +74,53 @@ $CollectionAllowList = @(
     )
   }
 )
+$TimeoutRetryRoot = 'C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\standard_timeout_retries_r1_260725'
+$TimeoutRetryAllowList = @(
+  [pscustomobject]@{
+    Stem = '11e0d8daed35'; OriginalTaskId = 96218
+    RetryTaskId = 96256; Directory = 't96218_11e0d8daed35'
+  }
+  [pscustomobject]@{
+    Stem = '068b0607b43f'; OriginalTaskId = 96219
+    RetryTaskId = 96257; Directory = 't96219_068b0607b43f'
+  }
+  [pscustomobject]@{
+    Stem = '436565e3f360'; OriginalTaskId = 96224
+    RetryTaskId = 96258; Directory = 't96224_436565e3f360'
+  }
+  [pscustomobject]@{
+    Stem = '08750eb352cf'; OriginalTaskId = 96221
+    RetryTaskId = 96259; Directory = 't96221_08750eb352cf'
+  }
+  [pscustomobject]@{
+    Stem = '2a1bb6f2be79'; OriginalTaskId = 96223
+    RetryTaskId = 96260; Directory = 't96223_2a1bb6f2be79'
+  }
+  [pscustomobject]@{
+    Stem = '2347a292ad75'; OriginalTaskId = 96222
+    RetryTaskId = 96261; Directory = 't96222_2347a292ad75'
+  }
+  [pscustomobject]@{
+    Stem = '05580bda40b2'; OriginalTaskId = 96220
+    RetryTaskId = 96262; Directory = 't96220_05580bda40b2'
+  }
+  [pscustomobject]@{
+    Stem = '7a8c0bd079b1'; OriginalTaskId = 96226
+    RetryTaskId = 96263; Directory = 't96226_7a8c0bd079b1'
+  }
+  [pscustomobject]@{
+    Stem = '7a6ccac265d3'; OriginalTaskId = 96225
+    RetryTaskId = 96264; Directory = 't96225_7a6ccac265d3'
+  }
+  [pscustomobject]@{
+    Stem = 'b7c30cb70b95'; OriginalTaskId = 96230
+    RetryTaskId = 96265; Directory = 't96230_b7c30cb70b95'
+  }
+  [pscustomobject]@{
+    Stem = 'b4075d84aeee'; OriginalTaskId = 96229
+    RetryTaskId = 96266; Directory = 't96229_b4075d84aeee'
+  }
+)
 
 $Dirty = git -C $CodeRoot status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0 -or $Dirty) {
@@ -81,6 +129,14 @@ if ($LASTEXITCODE -ne 0 -or $Dirty) {
 $CodeRevision = (git -C $CodeRoot rev-parse HEAD).Trim()
 if ($CodeRevision.Length -ne 40) { throw 'invalid code revision' }
 
+$RetryByStem = @{}
+foreach ($Spec in $TimeoutRetryAllowList) {
+  if ($RetryByStem.ContainsKey($Spec.Stem)) {
+    throw "duplicate timeout-retry logical slot: $($Spec.Stem)"
+  }
+  $RetryByStem.Add($Spec.Stem, $Spec)
+}
+$OriginalSubmissionByStem = @{}
 $Collections = @(
   foreach ($Group in $CollectionAllowList) {
     foreach ($Stem in $Group.Stems) {
@@ -98,13 +154,62 @@ $Collections = @(
       ) {
         throw "allow-listed Standard submission identity drifted: $Submission"
       }
-      $Path = Join-Path $Group.Root "collections\$Stem.json"
-      if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        (Resolve-Path -LiteralPath $Path).Path
+      if ($OriginalSubmissionByStem.ContainsKey($Stem)) {
+        throw "duplicate original Standard logical slot: $Stem"
+      }
+      $OriginalSubmissionByStem.Add($Stem, $Submission)
+      if ($RetryByStem.ContainsKey($Stem)) {
+        $Spec = $RetryByStem[$Stem]
+        if ([int]$Receipt.task_id -ne [int]$Spec.OriginalTaskId) {
+          throw "timeout-retry original task identity drifted: $Submission"
+        }
+      } else {
+        $Path = Join-Path $Group.Root "collections\$Stem.json"
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+          (Resolve-Path -LiteralPath $Path).Path
+        }
       }
     }
   }
+  foreach ($Spec in $TimeoutRetryAllowList) {
+    $Root = Join-Path $TimeoutRetryRoot $Spec.Directory
+    $Submission = Join-Path $Root 'submission.json'
+    $Plan = Join-Path $Root 'plan\diagnostic_timeout_retry_plan.json'
+    $OriginalSubmission = $OriginalSubmissionByStem[$Spec.Stem]
+    if (
+      -not $OriginalSubmission -or
+      -not (Test-Path -LiteralPath $Submission -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $Plan -PathType Leaf)
+    ) {
+      throw "allow-listed timeout-retry ancestry is absent: $Root"
+    }
+    $Receipt = Get-Content -Raw -LiteralPath $Submission | ConvertFrom-Json
+    $Retry = $Receipt.retry_of_timeout
+    if (
+      $Receipt.schema_version -ne 'mft-goal-diagnostic-standard-submission-v1' -or
+      $Receipt.stage -ne 'standard' -or
+      $Receipt.scheduler_submission_performed -ne $true -or
+      [int]$Receipt.task_id -ne [int]$Spec.RetryTaskId -or
+      -not ([string]$Receipt.candidate_physics_sha256).StartsWith($Spec.Stem) -or
+      [string]$Receipt.plan.path -ne $Plan -or
+      $Retry.schema_version -ne 'mft-goal-diagnostic-standard-timeout-retry-evidence-v1' -or
+      [int]$Retry.retry_of_task_id -ne [int]$Spec.OriginalTaskId -or
+      [string]$Retry.original_submission.path -ne $OriginalSubmission -or
+      [int]$Retry.original_task_execution.task_id -ne [int]$Spec.OriginalTaskId -or
+      [string]$Retry.original_task_execution.status -ne 'failed' -or
+      [int]$Retry.original_task_execution.exit_code -ne 124
+    ) {
+      throw "allow-listed timeout-retry identity drifted: $Submission"
+    }
+    $Path = Join-Path $Root 'collection.json'
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+      (Resolve-Path -LiteralPath $Path).Path
+    }
+  }
 )
+if ($Collections.Count -ne @($Collections | Sort-Object -Unique).Count) {
+  throw 'strict AL logical-slot selection produced duplicate collection paths'
+}
 if ($Collections.Count -lt 8) {
   throw "strict AL requires at least eight collections; got $($Collections.Count)"
 }
@@ -140,7 +245,12 @@ if ($LASTEXITCODE -ne 0) { throw 'strict AL build failed' }
 ```
 
 `build` creates a new `strict_al.parquet` and sealed `manifest.json`; it never
-writes the base dataset or contacts Scheduler.
+writes the base dataset or contacts Scheduler. A superseded failed original
+collection path is never passed to ingestion. For a retry, the diagnostic
+collection authenticator follows the sealed plan back to the exact original
+plan, submission, and failed/124 Scheduler evidence, and verifies that the
+effective physics is unchanged. Strict ingestion also rejects duplicate
+candidate geometries, so an original and its retry cannot be counted twice.
 
 ## 2. Plan, stage, and submit one 8-CPU training task
 
