@@ -69,9 +69,16 @@ GOAL_PROFILE_PATH = (
     REGRESSION_ROOT / "verify" / "profiles" / "goal_standard.json"
 )
 DEFAULT_MINIMUM_USEFUL_ROWS = 8
+DEFAULT_MINIMUM_UNIQUE_GEOMETRIES = 8
 DEFAULT_MINIMUM_SOURCE_TASKS = 4
 RECOMMENDED_NEW_ROWS = 12
 MAX_DIAGNOSTIC_SELECTION_ROWS = 12
+TARGETED_PRIMARY_TURNS = 6
+NEXT_CAMPAIGN_SEED_START = 2_607_263_000
+NEXT_CAMPAIGN_SEED_COUNT = 512
+NEXT_CAMPAIGN_SEED_END = (
+    NEXT_CAMPAIGN_SEED_START + NEXT_CAMPAIGN_SEED_COUNT - 1
+)
 KST = timezone(timedelta(hours=9))
 STANDARD_MODE = {
     "full_model": 0,
@@ -577,6 +584,10 @@ def _validate_truth_row(
         raise StrictALIngestError(
             "result N1 differs from the authenticated source task stratum"
         )
+    if int(n1_number) != TARGETED_PRIMARY_TURNS:
+        raise StrictALIngestError(
+            f"active-learning truth is not targeted N1={TARGETED_PRIMARY_TURNS}"
+        )
 
     facts = {
         "adapter_kind": truth.adapter_kind,
@@ -768,24 +779,37 @@ def _admission(
     targeted_strata = sorted({
         int(fact["N1"]) for fact in collection_facts
     })
+    unique_geometries = {
+        str(fact["candidate_physics_sha256"])
+        for fact in collection_facts
+    }
     reasons = []
     if len(collection_facts) < minimum_useful_rows:
         reasons.append(
             f"strict_new_rows<{minimum_useful_rows}"
         )
+    if len(unique_geometries) < DEFAULT_MINIMUM_UNIQUE_GEOMETRIES:
+        reasons.append(
+            "unique_complete_geometries"
+            f"<{DEFAULT_MINIMUM_UNIQUE_GEOMETRIES}"
+        )
     if len(source_tasks) < minimum_source_tasks:
         reasons.append(
             f"unique_source_tasks<{minimum_source_tasks}"
+        )
+    if targeted_strata != [TARGETED_PRIMARY_TURNS]:
+        reasons.append(
+            f"targeted_strata!=[{TARGETED_PRIMARY_TURNS}]"
         )
     return {
         "allowed": not reasons,
         "reasons": reasons,
         "strict_new_rows": len(collection_facts),
         "minimum_useful_rows": minimum_useful_rows,
-        "unique_complete_geometries": len({
-            str(fact["candidate_physics_sha256"])
-            for fact in collection_facts
-        }),
+        "unique_complete_geometries": len(unique_geometries),
+        "minimum_unique_complete_geometries": (
+            DEFAULT_MINIMUM_UNIQUE_GEOMETRIES
+        ),
         "unique_source_tasks": len(source_tasks),
         "minimum_source_tasks": minimum_source_tasks,
         "targeted_strata": targeted_strata,
@@ -1054,6 +1078,15 @@ def build_immutable_bundle(
             "new_model_generation_required": True,
             "new_seed_campaign_required": True,
             "old_generation_result_mixing_allowed": False,
+            "next_campaign_contract": {
+                "seed_start": NEXT_CAMPAIGN_SEED_START,
+                "seed_end_inclusive": NEXT_CAMPAIGN_SEED_END,
+                "seed_count": NEXT_CAMPAIGN_SEED_COUNT,
+                "all_four_N1_strata_required": True,
+                "single_dataset_sha256_required": dataset_record["sha256"],
+                "single_model_generation_required": True,
+                "old_generation_result_mixing_allowed": False,
+            },
             "production_promotion_authority_granted": False,
         }
         manifest = dict(unsigned)

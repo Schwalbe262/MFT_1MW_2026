@@ -190,6 +190,13 @@ def test_build_isolated_dataset_adds_all_targets_and_preserves_base(
 
     assert prepared.retraining_admission["allowed"] is True
     assert prepared.retraining_admission["strict_new_rows"] == 8
+    assert prepared.retraining_admission["unique_complete_geometries"] == 8
+    assert (
+        prepared.retraining_admission[
+            "minimum_unique_complete_geometries"
+        ]
+        == 8
+    )
     assert prepared.retraining_admission["unique_source_tasks"] == 8
     assert prepared.retraining_admission["targeted_strata"] == [6]
     assert prepared.retraining_admission["global_N1_coverage_claimed"] is False
@@ -227,6 +234,15 @@ def test_build_isolated_dataset_adds_all_targets_and_preserves_base(
     assert manifest["scheduler_submission_performed"] is False
     assert manifest["new_model_generation_required"] is True
     assert manifest["old_generation_result_mixing_allowed"] is False
+    assert manifest["next_campaign_contract"] == {
+        "seed_start": 2607263000,
+        "seed_end_inclusive": 2607263511,
+        "seed_count": 512,
+        "all_four_N1_strata_required": True,
+        "single_dataset_sha256_required": manifest["output_dataset"]["sha256"],
+        "single_model_generation_required": True,
+        "old_generation_result_mixing_allowed": False,
+    }
     output_frame = pd.read_parquet(output / "strict_al.parquet")
     assert len(output_frame) == 16
     assert output_frame["goal_al_authenticated_standard_truth"].notna().sum() == 8
@@ -267,6 +283,13 @@ def test_eight_rows_from_only_three_source_tasks_are_not_ready(
     ("updates", "message"),
     [
         ({"fan_velocity": 2.0}, "fixed operating/cooling identity"),
+        ({"core_plate_pad_t": 3.0}, "fixed operating/cooling identity"),
+        ({"wcp_pad_t": 3.0}, "fixed operating/cooling identity"),
+        ({"k_ins": 0.3}, "fixed operating/cooling identity"),
+        (
+            {"thermal_pad_conductivity_W_mK": 0.3},
+            "fixed operating/cooling identity",
+        ),
         ({"git_dirty": 1}, "strict EM/thermal validity"),
         ({"C_tx_tx_F": float("nan")}, "target C_tx_tx_F"),
         ({"keep_project": 0}, "retained eighth-symmetry Standard"),
@@ -297,7 +320,7 @@ def test_truth_row_fails_closed_on_physics_or_target_drift(
 
 def test_prepare_rejects_duplicate_base_task_identity(tmp_path, monkeypatch):
     base = _base_dataset(tmp_path)
-    truth = _truth(tmp_path, task_id=100, n1=5)
+    truth = _truth(tmp_path, task_id=100, n1=6)
     monkeypatch.setattr(
         ingest, "authenticate_collection", lambda _path: truth
     )
@@ -311,6 +334,40 @@ def test_prepare_rejects_duplicate_base_task_identity(tmp_path, monkeypatch):
             expected_base_rows=8,
             collection_paths=[truth.collection_path],
         )
+
+
+def test_truth_row_rejects_non_n1_6_even_when_source_matches(tmp_path):
+    truth = _truth(tmp_path, task_id=5001, n1=5)
+
+    with pytest.raises(
+        ingest.StrictALIngestError, match="not targeted N1=6"
+    ):
+        ingest._validate_truth_row(
+            truth,
+            profile=_profile(),
+            physics_data_revision=PHYSICS_DATA_REVISION,
+        )
+
+
+def test_admission_requires_eight_unique_complete_geometries():
+    facts = [
+        {
+            "source_task_payload_sha256": _sha(f"source-{index % 4}"),
+            "candidate_physics_sha256": _sha(f"geometry-{index % 7}"),
+            "N1": 6,
+        }
+        for index in range(8)
+    ]
+
+    admission = ingest._admission(
+        facts,
+        minimum_useful_rows=8,
+        minimum_source_tasks=4,
+    )
+
+    assert admission["allowed"] is False
+    assert admission["unique_complete_geometries"] == 7
+    assert "unique_complete_geometries<8" in admission["reasons"]
 
 
 def test_generic_json_collection_is_rejected_without_adapter(tmp_path):

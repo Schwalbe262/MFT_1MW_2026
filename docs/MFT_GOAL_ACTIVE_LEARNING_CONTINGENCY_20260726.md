@@ -197,6 +197,13 @@ sealed ledger concurrently as its live account and node limits permit. It
 must not reuse the old campaign's task ledger, task IDs, result directory, or
 aggregate output.
 
+The strict AL dataset manifest seals this exact next-campaign interval as
+`2607263000..2607263511`, binds it to the derived dataset SHA, requires one new
+model generation, and forbids old-generation result mixing. The campaign
+launcher independently seals the dataset, train report, candidate, quality
+status, model inventory, task ledger, and seed identity into every task and
+rejects aggregate results that do not match that exact bundle.
+
 Aggregate only the 512 results authenticated against this exact new bundle:
 
 ```powershell
