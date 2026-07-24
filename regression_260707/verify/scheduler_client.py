@@ -461,12 +461,13 @@ def live_project_submission_snapshot(
     if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
         validation_options["max_project_active_tasks"] = (
             max_project_active_tasks)
+    contract_options = dict(validation_options)
     if scheduler_url is not None:
-        validation_options["scheduler_url"] = scheduler_url
+        contract_options["scheduler_url"] = scheduler_url
     project = require_live_project_mutation_contract(
         expected_cap=(required_hard_cap if require_exact_project_cap else None),
         require_full=require_full_project,
-        **validation_options,
+        **contract_options,
     )
     base_url = str(scheduler_url or SCHEDULER).rstrip("/")
     statuses = ",".join(MFT_ACTIVE_STATUSES)

@@ -305,6 +305,41 @@ def task_state(task_id=17, stage="WAIT"):
     }
 
 
+def test_live_capacity_keeps_custom_scheduler_url_out_of_pure_snapshot():
+    project = {
+        "name": scheduler_client.MFT_PROJECT,
+        "max_active_tasks": 500,
+        "auto_pull": False,
+    }
+    inventory = task_inventory_response([])
+    with patch.object(
+            scheduler_client,
+            "campaign_mutation_lock_is_held",
+            return_value=True), patch.object(
+            scheduler_client,
+            "require_live_project_mutation_contract",
+            return_value=project) as require_contract, patch.object(
+            scheduler_client.requests,
+            "get",
+            side_effect=[inventory, inventory]), patch.object(
+            scheduler_client,
+            "project_submission_snapshot",
+            wraps=scheduler_client.project_submission_snapshot) as snapshot:
+        result = scheduler_client.live_project_submission_snapshot(
+            500,
+            require_exact_project_cap=True,
+            require_full_project=True,
+            max_project_active_tasks=500,
+            scheduler_url="http://127.0.0.1:8002",
+        )
+
+    self_call = require_contract.call_args
+    assert self_call.kwargs["scheduler_url"] == "http://127.0.0.1:8002"
+    assert snapshot.call_args.kwargs["max_project_active_tasks"] == 500
+    assert "scheduler_url" not in snapshot.call_args.kwargs
+    assert result["project_submission_slots"] == 500
+
+
 class SchedulerClientIntegrityTests(unittest.TestCase):
     def setUp(self):
         project_contract = patch.object(
