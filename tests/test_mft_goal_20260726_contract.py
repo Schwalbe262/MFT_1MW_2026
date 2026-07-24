@@ -690,7 +690,10 @@ def test_terminal_320_table_contains_physical_dedupe_and_provenance():
 
 
 def _write_synthetic_goal_seed_result(
-    root: Path, *, task: Mapping[str, object]
+    root: Path,
+    *,
+    task: Mapping[str, object],
+    force_all_infeasible: bool = False,
 ) -> Path:
     root.mkdir()
     seed = int(task["seed"])
@@ -716,13 +719,16 @@ def _write_synthetic_goal_seed_result(
         geometry_sha = goal.canonical_sha256(
             {"seed": seed, "terminal_population_index": index}
         )
+        physical_constraint_feasible = not force_all_infeasible
         row = {
             "terminal_population_index": index,
             "decoder_valid": True,
             "surrogate_physical_valid": surrogate_valid,
             "surrogate_physicality_passed": surrogate_valid,
-            "physical_constraint_feasible": True,
-            "physical_feasible": surrogate_valid,
+            "physical_constraint_feasible": physical_constraint_feasible,
+            "physical_feasible": (
+                surrogate_valid and physical_constraint_feasible
+            ),
             "physical_geometry_sha256": geometry_sha,
             "canonical_physical_params_sha256": geometry_sha,
             "candidate_physics_sha": geometry_sha,
@@ -767,6 +773,9 @@ def _write_synthetic_goal_seed_result(
         }
         row.update({f"physical_G:{name}": -1.0 for name in constraints})
         row.update({f"normalized_G:{name}": -0.5 for name in constraints})
+        if force_all_infeasible:
+            row["physical_G:Llt_robust_band"] = 0.25
+            row["normalized_G:Llt_robust_band"] = 0.5
         rows.append(row)
     table = pd.DataFrame(rows)
     table_path = root / "terminal_physical_candidates.csv"
@@ -847,9 +856,11 @@ def _write_synthetic_goal_seed_result(
             "temperature_targets": list(goal.GOAL_TEMPERATURE_TARGETS),
             "terminal_population_count": launch.POPULATION,
             "physical_feasible_count": (
-                launch.POPULATION - (1 if seed == 101 else 0)
+                0
+                if force_all_infeasible
+                else launch.POPULATION - (1 if seed == 101 else 0)
             ),
-            "feasible_pareto_count": 1,
+            "feasible_pareto_count": 0 if force_all_infeasible else 1,
             "artifact_inventory": inventory,
             "artifact_inventory_sha256": goal.canonical_sha256(inventory),
             "terminal_physical_candidates_manifest": manifest,
@@ -985,6 +996,50 @@ def test_global_pareto_recomputes_from_all_terminal_rows_and_physicality(
     ].iloc[0]
     assert bool(quarantined["physical_feasible"]) is False
     assert quarantined["global_non_dominated_rank"] == -1
+
+
+def test_global_pareto_retains_nonempty_audit_front_when_feasible_front_empty(
+    tmp_path,
+):
+    bundle_path, tasks = _write_synthetic_goal_bundle(
+        tmp_path / "bundle",
+        seeds=(101, 102, 103, 104),
+    )
+    results = [
+        _write_synthetic_goal_seed_result(
+            tmp_path / f"seed-{task['seed']}",
+            task=task,
+            force_all_infeasible=True,
+        )
+        for task in tasks
+    ]
+    manifest_path = launch.aggregate_results(
+        result_paths=results,
+        bundle_manifest_path=bundle_path,
+        output=tmp_path / "global",
+        minimum_seeds=4,
+    )
+    manifest = launch._validate_seal(
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+        schema=launch.GLOBAL_PARETO_SCHEMA,
+    )
+    assert manifest["physical_feasible_count"] == 0
+    assert manifest["global_pareto_count"] == 0
+    assert manifest["global_objective_front_count"] == 1
+    assert pd.read_csv(
+        tmp_path / "global" / "global_pareto_front.csv"
+    ).empty
+    objective_front = pd.read_csv(
+        tmp_path / "global" / "global_objective_front.csv"
+    )
+    assert len(objective_front) == 1
+    assert bool(objective_front.iloc[0]["hard_feasible"]) is False
+    standard = pd.read_csv(
+        tmp_path / "global" / "standard_candidates.csv"
+    )
+    assert set(standard["standard_selection_basis"]) == {
+        "near_feasible_fallback"
+    }
 
 
 def _write_goal_code_inventory_fixture(root: Path):

@@ -570,33 +570,29 @@ def select_standard_candidates(
         if index not in selected:
             selected.append(index)
 
-    add(
-        int(
-            np.lexsort(
-                (
-                    pool["physical_geometry_sha256"].to_numpy(),
-                    objectives[:, 1],
-                    objectives[:, 0],
-                )
-            )[0]
-        ),
-        "minimum_volume",
+    minimum_volume_index = int(
+        np.lexsort(
+            (
+                pool["physical_geometry_sha256"].to_numpy(),
+                objectives[:, 1],
+                objectives[:, 0],
+            )
+        )[0]
     )
-    add(
-        int(
-            np.lexsort(
-                (
-                    pool["physical_geometry_sha256"].to_numpy(),
-                    objectives[:, 0],
-                    objectives[:, 1],
-                )
-            )[0]
-        ),
-        "minimum_total_loss",
+    minimum_loss_index = int(
+        np.lexsort(
+            (
+                pool["physical_geometry_sha256"].to_numpy(),
+                objectives[:, 0],
+                objectives[:, 1],
+            )
+        )[0]
     )
+    add(minimum_volume_index, "minimum_volume")
+    add(minimum_loss_index, "minimum_total_loss")
 
-    end_a = normalized[selected[0]]
-    end_b = normalized[selected[1]]
+    end_a = normalized[minimum_volume_index]
+    end_b = normalized[minimum_loss_index]
     chord = end_b - end_a
     chord_norm = float(np.linalg.norm(chord))
     if chord_norm > 0.0:
