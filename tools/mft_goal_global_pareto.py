@@ -512,6 +512,154 @@ def rank_candidates(
     ).reset_index(drop=True)
 
 
+def select_standard_candidates(
+    ranked: pd.DataFrame,
+    *,
+    objective_columns: Sequence[str],
+    normalized_constraint_columns: Sequence[str],
+    limit: int = 12,
+) -> pd.DataFrame:
+    """Select deterministic anchors plus objective-space spread points."""
+
+    if limit <= 0:
+        raise ParetoContractError("standard candidate limit must be positive")
+    feasible_front = ranked[
+        ranked["hard_feasible"] & (ranked["feasible_rank"] == 0)
+    ].copy()
+    if not feasible_front.empty:
+        pool = feasible_front
+        selection_basis = "robust_feasible_front0"
+    else:
+        pool = ranked.sort_values(
+            [
+                "normalized_constraint_violation",
+                "objective_rank_all",
+                *objective_columns,
+                "physical_geometry_sha256",
+            ],
+            kind="stable",
+        ).head(max(256, limit))
+        selection_basis = "near_feasible_fallback"
+    pool = pool.reset_index(drop=True)
+    objectives = pool[list(objective_columns)].to_numpy(dtype=float)
+    low = objectives.min(axis=0)
+    span = objectives.max(axis=0) - low
+    safe_span = np.where(span > 0.0, span, 1.0)
+    normalized = (objectives - low) / safe_span
+    normalized[:, span <= 0.0] = 0.0
+
+    selected: list[int] = []
+    roles: dict[int, list[str]] = {}
+
+    def add(index: int, role: str) -> None:
+        index = int(index)
+        roles.setdefault(index, []).append(role)
+        if index not in selected:
+            selected.append(index)
+
+    add(
+        int(
+            np.lexsort(
+                (
+                    pool["physical_geometry_sha256"].to_numpy(),
+                    objectives[:, 1],
+                    objectives[:, 0],
+                )
+            )[0]
+        ),
+        "minimum_volume",
+    )
+    add(
+        int(
+            np.lexsort(
+                (
+                    pool["physical_geometry_sha256"].to_numpy(),
+                    objectives[:, 0],
+                    objectives[:, 1],
+                )
+            )[0]
+        ),
+        "minimum_total_loss",
+    )
+
+    end_a = normalized[selected[0]]
+    end_b = normalized[selected[1]]
+    chord = end_b - end_a
+    chord_norm = float(np.linalg.norm(chord))
+    if chord_norm > 0.0:
+        relative = normalized - end_a
+        distance = np.abs(
+            relative[:, 0] * chord[1] - relative[:, 1] * chord[0]
+        ) / chord_norm
+        knee_index = int(
+            sorted(
+                range(len(pool)),
+                key=lambda index: (
+                    -float(distance[index]),
+                    float(np.linalg.norm(normalized[index])),
+                    str(pool.iloc[index]["physical_geometry_sha256"]),
+                ),
+            )[0]
+        )
+    else:
+        knee_index = int(
+            sorted(
+                range(len(pool)),
+                key=lambda index: (
+                    float(np.linalg.norm(normalized[index])),
+                    str(pool.iloc[index]["physical_geometry_sha256"]),
+                ),
+            )[0]
+        )
+    add(knee_index, "pareto_knee")
+
+    normalized_g = pool[list(normalized_constraint_columns)].to_numpy(
+        dtype=float
+    )
+    minimum_margin = np.min(-normalized_g, axis=1)
+    margin_index = int(
+        sorted(
+            range(len(pool)),
+            key=lambda index: (
+                -float(minimum_margin[index]),
+                float(np.linalg.norm(normalized[index])),
+                str(pool.iloc[index]["physical_geometry_sha256"]),
+            ),
+        )[0]
+    )
+    add(margin_index, "maximum_minimum_constraint_margin")
+
+    target_count = min(limit, len(pool))
+    while len(selected) < target_count:
+        selected_objectives = normalized[np.asarray(selected, dtype=int)]
+        remaining = [index for index in range(len(pool)) if index not in selected]
+        best = sorted(
+            remaining,
+            key=lambda index: (
+                -float(
+                    np.linalg.norm(
+                        selected_objectives - normalized[index], axis=1
+                    ).min()
+                ),
+                -float(
+                    pool.iloc[index]["feasible_crowding"]
+                    if np.isfinite(pool.iloc[index]["feasible_crowding"])
+                    else math.inf
+                ),
+                str(pool.iloc[index]["physical_geometry_sha256"]),
+            ),
+        )[0]
+        add(best, "objective_space_maximin")
+
+    selection = pool.iloc[selected].copy()
+    selection["standard_selection_order"] = np.arange(1, len(selection) + 1)
+    selection["standard_selection_roles"] = [
+        ",".join(roles[index]) for index in selected
+    ]
+    selection["standard_selection_basis"] = selection_basis
+    return selection.reset_index(drop=True)
+
+
 def _write_table(frame: pd.DataFrame, stem: Path) -> dict[str, Any]:
     csv_path = stem.with_suffix(".csv")
     parquet_path = stem.with_suffix(".parquet")
@@ -570,6 +718,13 @@ def build_global_pareto(
         ],
         kind="stable",
     ).head(256)
+    standard_candidates = select_standard_candidates(
+        ranked,
+        objective_columns=manifest["objective_columns"],
+        normalized_constraint_columns=manifest[
+            "normalized_constraint_columns"
+        ],
+    )
 
     artifacts = {
         "ranked_unique_candidates": _write_table(
@@ -583,6 +738,9 @@ def build_global_pareto(
         ),
         "near_feasible": _write_table(
             near_feasible, output / "near_feasible"
+        ),
+        "standard_candidates": _write_table(
+            standard_candidates, output / "standard_candidates"
         ),
     }
     summary = {
@@ -606,6 +764,7 @@ def build_global_pareto(
         "hard_feasible_count": int(ranked["hard_feasible"].sum()),
         "objective_front0_count": int(len(objective_front)),
         "feasible_front0_count": int(len(feasible_front)),
+        "standard_candidate_count": int(len(standard_candidates)),
         "global_sort_scope": "all_terminal_population_rows_after_physical_hash_dedupe",
         "artifacts": artifacts,
     }

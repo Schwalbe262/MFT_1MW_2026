@@ -136,6 +136,13 @@ def test_global_pareto_uses_every_terminal_row_and_dedupes(tmp_path: Path) -> No
     assert set(ranked["source_seed"]) == {1, 2}
     assert ranked["feasible_rank"].min() == 0
     assert (output / "feasible_front0.csv").is_file()
+    selected = pd.read_csv(output / "standard_candidates.csv")
+    assert len(selected) == 12
+    roles = ",".join(selected["standard_selection_roles"])
+    assert "minimum_volume" in roles
+    assert "minimum_total_loss" in roles
+    assert "pareto_knee" in roles
+    assert "maximum_minimum_constraint_margin" in roles
 
 
 def test_duplicate_physics_with_different_evaluation_fails_closed(
