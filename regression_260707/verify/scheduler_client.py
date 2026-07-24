@@ -113,6 +113,16 @@ _STANDARD_PROFILE = json.loads(
         encoding="utf-8"))
 STANDARD_PROFILE_CONTRACT = dict(_STANDARD_PROFILE["param_overrides"])
 DEFAULT_TASK_TIMEOUT_SECONDS = int(_STANDARD_PROFILE["timeout_seconds"])
+RETAINED_AEDT_SCHEMA = "mft-goal-fea-retained-aedt-v1"
+RETAINED_AEDT_RECEIPT_SCHEMA = "mft-goal-fea-remote-artifact-receipt-v1"
+RETAINED_AEDT_ROOT = "goal-fea-retained"
+RETAINED_AEDT_TEXT_CHUNK_SCHEMA = "mft-goal-fea-base64-chunks-v1"
+RETAINED_AEDT_RAW_CHUNK_BYTES = 768_000
+RETAINED_AEDT_MAX_ENCODED_CHUNK_BYTES = 1_024_000
+RETAINED_AEDT_MAX_BYTES = 64 * 1024 * 1024 * 1024
+SCHEDULER_PRESERVE_MARKER = ".slurm-scheduler-preserve.json"
+SCHEDULER_PRESERVE_SCHEMA = "slurm-scheduler-prune-protection-v1"
+RUNTIME_LICENSE_REFRESH_ENV = "MFT_STANDALONE_CORE_RUNTIME_LICENSE_REFRESH"
 LOCAL_SCRATCH_ROOT = "/enroot"
 LOCAL_SCRATCH_MIN_FREE_KB = 200 * 1024 * 1024
 LOCAL_SCRATCH_STALE_MINUTES = 8 * 60
@@ -564,6 +574,246 @@ def verification_submission_identity(
     }
 
 
+def retained_aedt_identity(
+        name, params, profile, solver_revision, library_revision):
+    """Return the exact opt-in remote AEDT retention identity.
+
+    Generic AL profiles have no ``artifact_retention`` object and preserve the
+    historical disposable-scratch behavior. Goal FEA profiles must provide the
+    complete contract below; the derived path is task-dedupe specific and
+    remains under the Scheduler task's remote_cwd.
+    """
+    retention = profile.get("artifact_retention")
+    if retention is None:
+        return None
+    required = {
+        "schema_version",
+        "stage",
+        "artifact_filename",
+        "receipt_filename",
+        "marker_filename",
+        "retention_required",
+        "prune_protection_required",
+    }
+    if not isinstance(retention, dict) or set(retention) != required:
+        raise ValueError("retained AEDT profile contract is incomplete")
+    stage = str(retention.get("stage") or "")
+    artifact = str(retention.get("artifact_filename") or "")
+    receipt = str(retention.get("receipt_filename") or "")
+    marker = str(retention.get("marker_filename") or "")
+    safe_name = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,126}")
+    if (
+        retention.get("schema_version") != RETAINED_AEDT_SCHEMA
+        or stage not in {"standard", "full"}
+        or not safe_name.fullmatch(artifact)
+        or not artifact.endswith(".aedt")
+        or not safe_name.fullmatch(receipt)
+        or not receipt.endswith(".json")
+        or marker != SCHEDULER_PRESERVE_MARKER
+        or retention.get("retention_required") is not True
+        or retention.get("prune_protection_required") is not True
+    ):
+        raise ValueError("retained AEDT profile contract is invalid")
+    expected_profile_path = (
+        Path(__file__).resolve().parent / "profiles" / f"goal_{stage}.json"
+    )
+    try:
+        expected_profile = json.loads(
+            expected_profile_path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("reviewed retained AEDT profile is unavailable") from exc
+    if profile != expected_profile:
+        raise ValueError("retained AEDT profile is not the reviewed immutable profile")
+    identity = verification_submission_identity(
+        name, params, profile, solver_revision, library_revision
+    )
+    task_identity = hashlib.sha256(
+        identity["dedupe_key"].encode("utf-8")
+    ).hexdigest()[:16]
+    relative_directory = f"{RETAINED_AEDT_ROOT}/{task_identity}"
+    profile_sha256 = hashlib.sha256(
+        json.dumps(
+            profile,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    marker_contract = {
+        "schema": SCHEDULER_PRESERVE_SCHEMA,
+        "preserve": True,
+        "reason": (
+            "Retain goal FEA AEDT until authenticated package collection; "
+            f"stage={stage}; dedupe_key={identity['dedupe_key']}"
+        ),
+        "owner": MFT_PROJECT,
+    }
+    marker_contract_sha256 = hashlib.sha256(
+        json.dumps(
+            marker_contract,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": RETAINED_AEDT_SCHEMA,
+        "stage": stage,
+        "dedupe_key": identity["dedupe_key"],
+        "parameter_digest": identity["parameter_digest"],
+        "solver_revision": identity["solver_revision"],
+        "library_revision": identity["library_revision"],
+        "profile_sha256": profile_sha256,
+        "relative_directory": relative_directory,
+        "artifact_path": f"{relative_directory}/{artifact}",
+        "receipt_path": f"{relative_directory}/{receipt}",
+        "marker_path": f"{relative_directory}/{marker}",
+        "transport": {
+            "schema_version": RETAINED_AEDT_TEXT_CHUNK_SCHEMA,
+            "encoding": "base64",
+            "chunk_directory": f"{relative_directory}/{artifact}.chunks",
+            "raw_chunk_bytes": RETAINED_AEDT_RAW_CHUNK_BYTES,
+            "max_encoded_chunk_bytes": RETAINED_AEDT_MAX_ENCODED_CHUNK_BYTES,
+        },
+        "marker_contract": marker_contract,
+        "marker_contract_sha256": marker_contract_sha256,
+        "retention_required": True,
+        "prune_protection_required": True,
+    }
+
+
+def _retained_aedt_export_command(retained):
+    if retained is None:
+        return ""
+    marker_contract_json = json.dumps(
+        retained["marker_contract"],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    receipt_context = {
+        "schema_version": RETAINED_AEDT_RECEIPT_SCHEMA,
+        "stage": retained["stage"],
+        "dedupe_key": retained["dedupe_key"],
+        "parameter_digest": retained["parameter_digest"],
+        "solver_revision": retained["solver_revision"],
+        "library_revision": retained["library_revision"],
+        "profile_sha256": retained["profile_sha256"],
+        "artifact_path": retained["artifact_path"],
+        "marker_path": retained["marker_path"],
+        "marker_contract_sha256": retained["marker_contract_sha256"],
+        "transport_schema_version": retained["transport"]["schema_version"],
+        "transport_encoding": retained["transport"]["encoding"],
+        "transport_chunk_directory": retained["transport"]["chunk_directory"],
+        "transport_raw_chunk_bytes": retained["transport"]["raw_chunk_bytes"],
+        "transport_max_encoded_chunk_bytes": retained["transport"][
+            "max_encoded_chunk_bytes"
+        ],
+        "retention_required": True,
+        "prune_protection_required": True,
+        "scheduler_cleanup_exclusion_required": True,
+    }
+    receipt_context_json = json.dumps(
+        receipt_context,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    script = (
+        "import base64,datetime,hashlib,json,os,pathlib,sys;"
+        "src=pathlib.Path(sys.argv[1]);dst=pathlib.Path(sys.argv[2]);"
+        "receipt=pathlib.Path(sys.argv[3]);marker=pathlib.Path(sys.argv[4]);"
+        "chunk_dir=pathlib.Path(sys.argv[5]);"
+        "marker_payload=json.loads(sys.argv[6]);"
+        "marker_payload['created_at']=datetime.datetime.now("
+        "datetime.timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z');"
+        "marker_data=(json.dumps(marker_payload,sort_keys=True,"
+        "separators=(',',':'))+'\\n').encode('utf-8');"
+        "context=json.loads(sys.argv[7]);"
+        f"source_size=src.stat().st_size;"
+        f"\nif not 0<source_size<={RETAINED_AEDT_MAX_BYTES}:"
+        " raise RuntimeError('retained AEDT size is outside transport bounds')\n"
+        "dst.parent.parent.mkdir(parents=True,exist_ok=True);"
+        "dst.parent.mkdir(exist_ok=False);"
+        "chunk_dir.mkdir(exist_ok=False);"
+        "tmp=dst.with_name('.'+dst.name+'.tmp');h=hashlib.sha256();size=0;"
+        "chunk_count=0;rf=src.open('rb');wf=tmp.open('xb');"
+        f"\nwhile True:\n chunk=rf.read({RETAINED_AEDT_RAW_CHUNK_BYTES})\n"
+        " if not chunk: break\n"
+        " wf.write(chunk);h.update(chunk);size+=len(chunk)\n"
+        " encoded=base64.b64encode(chunk)\n"
+        f" if len(encoded)>{RETAINED_AEDT_MAX_ENCODED_CHUNK_BYTES}:"
+        " raise RuntimeError('encoded AEDT chunk exceeds transport limit')\n"
+        " cp=chunk_dir/('%08d.b64'%chunk_count);cp.write_bytes(encoded);"
+        "os.chmod(cp,0o444);chunk_count+=1\n"
+        "wf.flush();os.fsync(wf.fileno());wf.close();rf.close();"
+        "os.replace(tmp,dst);"
+        "marker.write_bytes(marker_data);"
+        "context.update({'artifact_sha256':h.hexdigest(),"
+        "'artifact_size_bytes':size,'transport_chunk_count':chunk_count,"
+        "'marker_sha256':"
+        "hashlib.sha256(marker_data).hexdigest(),"
+        "'source_project_filename':src.name,"
+        "'source_project_name':src.stem});"
+        "receipt.write_text(json.dumps(context,sort_keys=True,"
+        "separators=(',',':'))+'\\n',encoding='utf-8');"
+        "os.chmod(dst,0o444);os.chmod(marker,0o444);"
+        "os.chmod(receipt,0o444);os.chmod(chunk_dir,0o555);"
+        "os.chmod(dst.parent,0o555)"
+    )
+    return (
+        "mapfile -d '' MFT_RETAINED_PROJECTS < <("
+        "find \"$MFT_WORKDIR\" -type f -name '*.aedt' -print0); "
+        "[ \"${#MFT_RETAINED_PROJECTS[@]}\" -eq 1 ] || "
+        "{ printf 'retained AEDT project count mismatch: %s\\n' "
+        "\"${#MFT_RETAINED_PROJECTS[@]}\" >&2; exit 91; }; "
+        f"python -c {shlex.quote(script)} "
+        "\"${MFT_RETAINED_PROJECTS[0]}\" "
+        f"\"$MFT_TASK_ROOT/{retained['artifact_path']}\" "
+        f"\"$MFT_TASK_ROOT/{retained['receipt_path']}\" "
+        f"\"$MFT_TASK_ROOT/{retained['marker_path']}\" "
+        f"\"$MFT_TASK_ROOT/{retained['transport']['chunk_directory']}\" "
+        f"{shlex.quote(marker_contract_json)} {shlex.quote(receipt_context_json)} "
+        "|| exit $?; "
+    )
+
+
+def _runtime_license_refresh_command(
+        retained, normalized_env, solver_revision):
+    if retained is None or retained.get("stage") != "full":
+        return ""
+    if normalized_env.get(RUNTIME_LICENSE_REFRESH_ENV) != "1":
+        raise ValueError(
+            "Full retained FEA requires task-start license refresh"
+        )
+    forbidden = {
+        "MFT_STANDALONE_CORE_AUTH_SHA256",
+        "MFT_STANDALONE_CORE_LICENSE_CONTRACT",
+        "MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_JSON",
+        "MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_SHA256",
+    }
+    present = sorted(forbidden.intersection(normalized_env))
+    if present:
+        raise ValueError(
+            "Full task-start license refresh rejects static evidence: "
+            + ", ".join(present)
+        )
+    runtime_dir = '"$MFT_WORKDIR/.goal-license-runtime"'
+    return (
+        f"python tools/mft_runtime_license_snapshot.py "
+        f"--output-dir {runtime_dir} --solver-revision {solver_revision} && "
+        "export MFT_STANDALONE_CORE_LICENSE_CONTRACT="
+        "mft-aedt-hpc-license-snapshot-v1 && "
+        "export MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_JSON="
+        f"\"$(cat {runtime_dir}/snapshot.json)\" && "
+        "export MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_SHA256="
+        f"\"$(cat {runtime_dir}/snapshot.sha256)\" && "
+        "export MFT_STANDALONE_CORE_AUTH_SHA256="
+        f"\"$(cat {runtime_dir}/auth.sha256)\" && "
+    )
+
+
 def verification_dedupe_key(
         name, params, profile, solver_revision, library_revision):
     return verification_submission_identity(
@@ -661,6 +911,9 @@ def _submit_verification_locked(
         )
     identity = verification_submission_identity(
         name, params, profile, solver_revision, library_revision)
+    retained = retained_aedt_identity(
+        name, params, profile, solver_revision, library_revision
+    )
     solver_revision = identity["solver_revision"]
     library_revision = identity["library_revision"]
     merged = identity["merged"]
@@ -767,6 +1020,10 @@ def _submit_verification_locked(
                   f"test \"$(git -C {quoted_library} rev-parse HEAD)\" = \"{library_revision}\" && "
                   f"[ -d {quoted_library}/src ] && "
                   f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n' && ")
+    retained_export = _retained_aedt_export_command(retained)
+    runtime_license_refresh = _runtime_license_refresh_command(
+        retained, normalized_env, solver_revision
+    )
     run_group = (
         env_exports
         + f"mkdir -p {quoted_workdir} && "
@@ -778,17 +1035,25 @@ def _submit_verification_locked(
         + "git diff --quiet HEAD -- && git clean -q -ffd && git clean -q -ffdX && "
         + "test -z \"$(git status --porcelain --untracked-files=all)\" && "
         + f"test \"$(git rev-parse HEAD)\" = \"{solver_revision}\" && "
+        + runtime_license_refresh
         + f"printf '%s' {shlex.quote(pjson)} > cand.json && "
         + f"python run_simulation_260706.py --fixed {extra} --params cand.json; "
         + "simulation_rc=$?; "
         + f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n'; "
+        + (
+            f"if [ \"$simulation_rc\" -eq 0 ]; then {retained_export}"
+            "else exit \"$simulation_rc\"; fi; "
+            if retained is not None
+            else ""
+        )
         + "exit $simulation_rc"
     )
     # Setup and simulation are one fail-fast subshell. The parent remains in the
     # scheduler workspace, so unconditional cleanup can target only this clone.
+    task_root_setup = "MFT_TASK_ROOT=$PWD; " if retained is not None else ""
     cmd = (
         BASE
-        + f"( {select_workdir}cleanup() {{ rm -rf -- {cleanup_workdirs} 2>/dev/null; }}; "
+        + f"( {task_root_setup}{select_workdir}cleanup() {{ rm -rf -- {cleanup_workdirs} 2>/dev/null; }}; "
         + "trap cleanup EXIT; trap 'exit 143' TERM INT; "
         + run_group
         + " )"
