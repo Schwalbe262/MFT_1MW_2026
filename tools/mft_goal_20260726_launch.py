@@ -71,6 +71,10 @@ GOAL_RUNTIME_TOOL_FILES = (
 )
 POPULATION = 320
 GENERATIONS = 300
+# Pymoo increments ``algorithm.n_gen`` after evaluating the final requested
+# generation.  Keep the scientific evolution count and the observed framework
+# counter distinct: 300 evaluated generations produce an n_gen counter of 301.
+EXPECTED_ALGORITHM_N_GEN_COUNTER = GENERATIONS + 1
 INFERENCE_THREADS = 8
 ROLLING_SEED_COUNT = 32
 CANARY_SEED_COUNT = 4
@@ -1306,7 +1310,8 @@ def _validated_seed_table(
         or result.get("evaluated_generations") != GENERATIONS
         or isinstance(result.get("completed_generations"), bool)
         or not isinstance(result.get("completed_generations"), int)
-        or result.get("completed_generations") != GENERATIONS
+        or result.get("completed_generations")
+        != EXPECTED_ALGORITHM_N_GEN_COUNTER
         or result.get("terminal_population_count") != POPULATION
         or not isinstance(result.get("search_only_proposal"), bool)
         or result.get("search_only_proposal")

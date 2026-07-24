@@ -134,7 +134,9 @@ def _result_fixture(*, task_id=95_684):
             "population": slurm.goal.POPULATION,
             "generations": slurm.goal.GENERATIONS,
             "evaluated_generations": slurm.goal.GENERATIONS,
-            "completed_generations": slurm.goal.GENERATIONS,
+            "completed_generations": (
+                slurm.goal.EXPECTED_ALGORITHM_N_GEN_COUNTER
+            ),
             "terminal_population_count": slurm.goal.POPULATION,
             "stage_spec_sha256": task["stage_spec_sha256"],
             "hard_constraint_contract_sha256": task[

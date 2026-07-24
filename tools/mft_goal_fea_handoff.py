@@ -817,7 +817,7 @@ def _authenticate_aggregate_authority(
                 result.get("completed_generations"),
                 "result completed generations",
             )
-            != launch.GENERATIONS
+            != launch.EXPECTED_ALGORITHM_N_GEN_COUNTER
             or result.get("fea_submission_performed") is not False
         ):
             raise HandoffContractError("aggregate result is outside its bundle task")

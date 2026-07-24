@@ -266,7 +266,7 @@ def _write_seed_result(tmp_path: Path, task, decoded):
             "population": launch.POPULATION,
             "generations": launch.GENERATIONS,
             "evaluated_generations": launch.GENERATIONS,
-            "completed_generations": launch.GENERATIONS,
+            "completed_generations": launch.EXPECTED_ALGORITHM_N_GEN_COUNTER,
             "stage_spec": copy.deepcopy(GOAL_STAGE_SPEC),
             "hard_spec": copy.deepcopy(GOAL_STAGE_SPEC),
             "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,

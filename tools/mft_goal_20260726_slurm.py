@@ -1278,7 +1278,8 @@ def _validate_result_header(
         or result.get("population") != goal.POPULATION
         or result.get("generations") != goal.GENERATIONS
         or result.get("evaluated_generations") != goal.GENERATIONS
-        or result.get("completed_generations") != goal.GENERATIONS
+        or result.get("completed_generations")
+        != goal.EXPECTED_ALGORITHM_N_GEN_COUNTER
         or result.get("terminal_population_count") != goal.POPULATION
         or result.get("stage_spec_sha256")
         != task["stage_spec_sha256"]

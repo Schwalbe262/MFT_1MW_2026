@@ -823,7 +823,7 @@ def _write_synthetic_goal_seed_result(
             "population": launch.POPULATION,
             "generations": launch.GENERATIONS,
             "evaluated_generations": launch.GENERATIONS,
-            "completed_generations": launch.GENERATIONS,
+            "completed_generations": launch.EXPECTED_ALGORITHM_N_GEN_COUNTER,
             "stage_spec": copy.deepcopy(goal.GOAL_STAGE_SPEC),
             "hard_spec": copy.deepcopy(goal.GOAL_STAGE_SPEC),
             "hard_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
@@ -1174,7 +1174,7 @@ def test_global_pareto_rejects_tampered_generation_and_escaped_artifact(
     ]
     first = json.loads(results[0].read_text(encoding="utf-8"))
     first.pop("payload_sha256")
-    first["completed_generations"] = launch.GENERATIONS - 1
+    first["completed_generations"] = launch.GENERATIONS
     launch._atomic_json(results[0], launch._seal(first))
     with pytest.raises(RuntimeError, match="seed result contract mismatch"):
         launch.aggregate_results(
@@ -1185,7 +1185,22 @@ def test_global_pareto_rejects_tampered_generation_and_escaped_artifact(
         )
 
     first.pop("completed_generations")
-    first["completed_generations"] = launch.GENERATIONS
+    first["completed_generations"] = (
+        launch.EXPECTED_ALGORITHM_N_GEN_COUNTER + 1
+    )
+    launch._atomic_json(results[0], launch._seal(first))
+    with pytest.raises(RuntimeError, match="seed result contract mismatch"):
+        launch.aggregate_results(
+            result_paths=results,
+            bundle_manifest_path=bundle_path,
+            output=tmp_path / "overrun-global",
+            minimum_seeds=4,
+        )
+
+    first.pop("completed_generations")
+    first["completed_generations"] = (
+        launch.EXPECTED_ALGORITHM_N_GEN_COUNTER
+    )
     launch._atomic_json(results[0], launch._seal(first))
     second = json.loads(results[1].read_text(encoding="utf-8"))
     second.pop("payload_sha256")
