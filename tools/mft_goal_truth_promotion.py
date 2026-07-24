@@ -1364,6 +1364,8 @@ def submit_full(
         priority=priority,
         aedt_backend="standalone",
         submission_env=environment,
+        required_project_cap=diagnostic.GOAL_FEA_PROJECT_CAP,
+        max_project_active_tasks=diagnostic.GOAL_FEA_PROJECT_CAP,
         scheduler_url=stage["scheduler_url"],
     )
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:

@@ -620,6 +620,14 @@ def test_submit_and_collect_remain_diagnostic_after_actual_pass(
         fake.calls[0][1]["scheduler_url"]
         == probe.DIAGNOSTIC_SCHEDULER_URL
     )
+    assert (
+        fake.calls[0][1]["required_project_cap"]
+        == probe.GOAL_FEA_PROJECT_CAP
+    )
+    assert (
+        fake.calls[0][1]["max_project_active_tasks"]
+        == probe.GOAL_FEA_PROJECT_CAP
+    )
     assert submission["scheduler_admission_snapshot"][
         "license_admission_verified"
     ]

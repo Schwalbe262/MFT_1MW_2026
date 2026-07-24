@@ -68,6 +68,10 @@ SCHEDULER_CUTOVER_SCHEMA = (
     "slurm-scheduler-prune-protection-cutover-receipt-v1"
 )
 DIAGNOSTIC_SCHEDULER_URL = "http://127.0.0.1:8002"
+# The live project policy is explicitly validated for 500 concurrent tasks.
+# Bind every diagnostic POST to that exact reviewed capacity instead of the
+# scheduler client's legacy 300-task default.
+GOAL_FEA_PROJECT_CAP = 500
 SCHEDULER_MARKER_AWARE_REVISION = (
     "190f10de7e109a410fa03f743c24f2d682279ce8"
 )
@@ -2279,6 +2283,8 @@ def submit_standard(
         priority=priority,
         aedt_backend="standalone",
         submission_env=environment,
+        required_project_cap=GOAL_FEA_PROJECT_CAP,
+        max_project_active_tasks=GOAL_FEA_PROJECT_CAP,
         scheduler_url=stage["scheduler_url"],
     )
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:

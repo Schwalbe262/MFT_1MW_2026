@@ -626,6 +626,14 @@ def test_full_submit_collect_and_self_contained_package(
     submitted_profile = scheduler.calls[0][0][3]
     assert call["cpus"] == 16
     assert call["scheduler_url"] == "http://127.0.0.1:8002"
+    assert (
+        call["required_project_cap"]
+        == diagnostic.GOAL_FEA_PROJECT_CAP
+    )
+    assert (
+        call["max_project_active_tasks"]
+        == diagnostic.GOAL_FEA_PROJECT_CAP
+    )
     assert submitted_profile["param_overrides"]["full_model"] == 1
     assert (
         submitted_profile["param_overrides"]["thermal_symmetry"] == "full"
