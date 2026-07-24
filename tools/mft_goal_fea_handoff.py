@@ -137,6 +137,18 @@ MAX_REMOTE_METADATA_BYTES = 128 * 1024
 MAX_REMOTE_TEXT_CHUNK_BYTES = 1024 * 1024
 MAX_AEDT_BYTES = scheduler_client.RETAINED_AEDT_MAX_BYTES
 MIN_AGGREGATE_SEED_COUNT = launch.ROLLING_SEED_COUNT
+EXPECTED_RELOCATION_CONTRACT = {
+    "schema_version": launch.RELOCATION_SCHEMA,
+    "mode": "source_paths_or_explicit_worker_role_path_relocation",
+    "roles": list(launch.RUNTIME_SOURCE_ROLES),
+    "code_manifest_path_required_for_relocation": True,
+    "relocation_files_emitted": False,
+    "stager_must_generate_task_bound_relocation": True,
+    "source_absolute_paths_are_not_worker_authority": True,
+    "relocated_paths_must_reauthenticate_all_bound_SHA256": True,
+    "task_payload_sha256_must_match": True,
+    "worker_override_file_supported": True,
+}
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 REMOTE_RECEIPT_FIELDS = {
@@ -579,17 +591,24 @@ def _rows_equivalent(selected: Mapping[str, Any], source: Mapping[str, Any]) -> 
 
 def _authenticate_bundle(
     bundle_manifest_path: Path,
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Path]]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, dict[str, Any]],
+    dict[str, Path],
+    dict[str, Any],
+]:
     bundle_path = bundle_manifest_path.resolve(strict=True)
     try:
-        bundle = launch._validate_seal(
-            _read_json(bundle_path), schema=launch.BUNDLE_SCHEMA
-        )
+        bundle, ledger = launch.load_bundle_task_ledger(bundle_path)
     except RuntimeError as exc:
-        raise HandoffContractError("goal bundle manifest seal failed") from exc
+        raise HandoffContractError(
+            "goal bundle/code-manifest/task ledger authentication failed"
+        ) from exc
     task_count = _integer(bundle.get("task_count"), "bundle task_count")
     payloads = bundle.get("task_payload_sha256")
     relative_paths = bundle.get("task_relative_paths")
+    code_record = bundle.get("code_manifest")
+    source_paths = bundle.get("source_bound_paths")
     if (
         bundle.get("campaign_id") != "mft-goal-20260726"
         or bundle.get("goal_contract_schema") != GOAL_CONTRACT_SCHEMA
@@ -609,8 +628,73 @@ def _authenticate_bundle(
         or len(relative_paths) != task_count
         or len(set(map(str, payloads))) != task_count
         or len(set(map(str, relative_paths))) != task_count
+        or len(ledger) != task_count
+        or bundle.get("relocation_contract")
+        != EXPECTED_RELOCATION_CONTRACT
+        or not isinstance(code_record, dict)
+        or set(code_record)
+        != {
+            "path",
+            "schema_version",
+            "payload_sha256",
+            "code_inventory_sha256",
+            "code_revision",
+        }
+        or code_record.get("schema_version")
+        != launch.CODE_MANIFEST_SCHEMA
+        or not isinstance(source_paths, dict)
+        or set(source_paths)
+        != {*launch.RUNTIME_SOURCE_ROLES, "expected_code_revision"}
+        or source_paths.get("expected_code_revision")
+        != code_record.get("code_revision")
     ):
         raise HandoffContractError("goal bundle authority drifted")
+    code_manifest_path = _contained_file(
+        bundle_path.parent,
+        code_record["path"],
+        "bundle code manifest",
+    )
+    try:
+        code_manifest = launch._validate_seal(
+            _read_json(code_manifest_path),
+            schema=launch.CODE_MANIFEST_SCHEMA,
+        )
+    except RuntimeError as exc:
+        raise HandoffContractError("bundle code manifest seal failed") from exc
+    if (
+        code_manifest.get("payload_sha256")
+        != code_record.get("payload_sha256")
+        or code_manifest.get("code_inventory_sha256")
+        != code_record.get("code_inventory_sha256")
+        or code_manifest.get("code_revision")
+        != code_record.get("code_revision")
+        or not isinstance(code_manifest.get("code_inventory"), dict)
+        or code_manifest.get("files") != code_manifest.get("code_inventory")
+        or code_manifest.get("code_inventory_sha256")
+        != canonical_sha256(code_manifest.get("code_inventory"))
+        or code_manifest.get("staged_path_rule")
+        != "bundle_root/<code_inventory_key>"
+        or code_manifest.get("source_checkout_mutated") is not False
+        or code_manifest.get("remote_git_checkout_required") is not False
+        or code_manifest.get("scheduler_project_code_included") is not False
+    ):
+        raise HandoffContractError("bundle code manifest identity drifted")
+    try:
+        code_authentication = preflight.authenticate_goal_code_inventory(
+            code_root=bundle_path.parent / "artifacts" / "code",
+            code_manifest_path=code_manifest_path,
+            expected_manifest_payload_sha256=code_manifest[
+                "payload_sha256"
+            ],
+            expected_code_inventory_sha256=code_manifest[
+                "code_inventory_sha256"
+            ],
+            expected_code_revision=code_manifest["code_revision"],
+        )
+    except (OSError, RuntimeError) as exc:
+        raise HandoffContractError(
+            "bundle staged runtime code inventory authentication failed"
+        ) from exc
     tasks: dict[str, dict[str, Any]] = {}
     paths: dict[str, Path] = {}
     seeds: set[int] = set()
@@ -623,6 +707,7 @@ def _authenticate_bundle(
         seed = _integer(task.get("seed"), "bundle task seed")
         if (
             task.get("payload_sha256") != digest
+            or ledger.get(digest) != task
             or turns not in strata
             or seed in seeds
         ):
@@ -634,7 +719,7 @@ def _authenticate_bundle(
     minimum_per_stratum = MIN_AGGREGATE_SEED_COUNT // len(strata)
     if any(count < minimum_per_stratum for count in strata.values()):
         raise HandoffContractError("bundle does not cover the four N1 strata")
-    return bundle, tasks, paths
+    return bundle, tasks, paths, code_authentication
 
 
 def _authenticate_aggregate_authority(
@@ -645,9 +730,25 @@ def _authenticate_aggregate_authority(
 ) -> dict[str, Any]:
     from tools.mft_goal_global_pareto import rank_candidates
 
-    bundle, bundle_tasks, bundle_task_paths = _authenticate_bundle(
-        bundle_manifest_path
-    )
+    (
+        bundle,
+        bundle_tasks,
+        bundle_task_paths,
+        bundle_code_authentication,
+    ) = _authenticate_bundle(bundle_manifest_path)
+    authenticated_bundle = aggregate.get("authenticated_bundle")
+    expected_bundle_authority = {
+        "path": str(bundle_manifest_path.resolve(strict=True)),
+        "sha256": _sha256_file(bundle_manifest_path.resolve(strict=True)),
+        "payload_sha256": bundle["payload_sha256"],
+        "task_count": len(bundle_tasks),
+        "task_ledger_sha256": canonical_sha256(sorted(bundle_tasks)),
+        "all_four_N1_strata_covered": True,
+    }
+    if authenticated_bundle != expected_bundle_authority:
+        raise HandoffContractError(
+            "aggregate original bundle/task ledger authority drifted"
+        )
     minimum = _integer(
         aggregate.get("minimum_seed_count"), "aggregate minimum_seed_count"
     )
@@ -678,18 +779,29 @@ def _authenticate_aggregate_authority(
         ):
             raise HandoffContractError("aggregate input result bytes drifted")
         try:
-            result, frame = launch._validated_seed_table(result_path)
+            envelope = launch._validate_seal(
+                _read_json(result_path),
+                schema=launch.SEARCH_RESULT_SCHEMA,
+            )
+            task_sha = _require_sha(
+                envelope.get("task_payload_sha256"),
+                "result task payload SHA",
+            )
+            task = bundle_tasks.get(task_sha)
+            if task is None:
+                raise HandoffContractError(
+                    "aggregate result is outside its original bundle task ledger"
+                )
+            result, frame = launch._validated_seed_table(
+                result_path,
+                expected_task=task,
+            )
         except RuntimeError as exc:
             raise HandoffContractError(
                 "aggregate seed terminal evidence failed authentication"
             ) from exc
-        task_sha = _require_sha(
-            result.get("task_payload_sha256"), "result task payload SHA"
-        )
-        task = bundle_tasks.get(task_sha)
         if (
-            task is None
-            or task_sha in observed_task_payloads
+            task_sha in observed_task_payloads
             or _integer(result.get("seed"), "result seed")
             != _integer(task.get("seed"), "task seed")
             or _integer(
@@ -855,6 +967,23 @@ def _authenticate_aggregate_authority(
         "bundle_manifest": _file_record(bundle_manifest_path),
         "bundle_payload_sha256": bundle["payload_sha256"],
         "bundle_task_count": len(bundle_tasks),
+        "bundle_task_ledger_sha256": expected_bundle_authority[
+            "task_ledger_sha256"
+        ],
+        "bundle_code_manifest": {
+            **copy.deepcopy(bundle["code_manifest"]),
+            "file": _file_record(
+                _contained_file(
+                    bundle_manifest_path.resolve(strict=True).parent,
+                    bundle["code_manifest"]["path"],
+                    "bundle code manifest",
+                )
+            ),
+            "staged_code_authentication": bundle_code_authentication,
+        },
+        "bundle_relocation_contract": copy.deepcopy(
+            EXPECTED_RELOCATION_CONTRACT
+        ),
         "bundle_task_paths": {
             digest: str(path) for digest, path in bundle_task_paths.items()
         },
@@ -985,8 +1114,31 @@ def authenticate_selection(
         if _integer(rank, "standard candidate feasible rank") != 0:
             raise HandoffContractError("standard candidate is not feasible rank 0")
 
+    task_path = task_payload_path.resolve(strict=True)
+    task = launch.validate_task_payload(_read_json(task_path))
+    if aggregate_authority is not None:
+        expected_task_path = Path(
+            aggregate_authority["bundle_task_paths"].get(
+                task["payload_sha256"], ""
+            )
+        )
+        if (
+            task["payload_sha256"]
+            not in aggregate_authority["bundle_task_paths"]
+            or expected_task_path.resolve(strict=True) != task_path
+        ):
+            raise HandoffContractError("selected task is outside authenticated bundle")
+
     source_path = source_result_path.resolve(strict=True)
-    source_result, terminal = launch._validated_seed_table(source_path)
+    try:
+        source_result, terminal = launch._validated_seed_table(
+            source_path,
+            expected_task=task,
+        )
+    except RuntimeError as exc:
+        raise HandoffContractError(
+            "selected source result failed original task-ledger authentication"
+        ) from exc
     source_result_sha = _sha256_file(source_path)
     if aggregate is not None:
         expected_result_path = Path(
@@ -1010,20 +1162,6 @@ def authenticate_selection(
     source_row = terminal.iloc[terminal_index].to_dict()
     _rows_equivalent(selected, source_row)
 
-    task_path = task_payload_path.resolve(strict=True)
-    task = launch.validate_task_payload(_read_json(task_path))
-    if aggregate_authority is not None:
-        expected_task_path = Path(
-            aggregate_authority["bundle_task_paths"].get(
-                task["payload_sha256"], ""
-            )
-        )
-        if (
-            task["payload_sha256"]
-            not in aggregate_authority["bundle_task_paths"]
-            or expected_task_path.resolve(strict=True) != task_path
-        ):
-            raise HandoffContractError("selected task is outside authenticated bundle")
     if (
         source_result.get("task_payload_sha256") != task.get("payload_sha256")
         or str(selected.get("source_bundle_id")) != task.get("payload_sha256")
@@ -1079,6 +1217,12 @@ def authenticate_selection(
                 task["fixed_primary_turns"], "task primary turns"
             ),
             "source_code_revision": task["source_identity"]["code_revision"],
+            "source_code_manifest_payload_sha256": task["source_identity"][
+                "code_manifest_payload_sha256"
+            ],
+            "source_code_inventory_sha256": task["source_identity"][
+                "code_inventory_sha256"
+            ],
         },
     }
 

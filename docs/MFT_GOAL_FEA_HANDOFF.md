@@ -12,6 +12,9 @@ bundle and every corresponding terminal seed result, requires at least 32
 unique seeds with all four fixed-primary-turn strata (5, 6, 7, and 8), checks
 the complete 320-member generation-300 terminal population, deduplicates
 physical geometry, and recomputes the global non-dominated ranks.
+The bundle's sealed code manifest and byte-exact staged runtime inventory,
+six-role worker relocation contract, original task ledger, and the aggregate manifest's exact
+`authenticated_bundle.task_ledger_sha256` are part of that authority.
 Both Standard and Full repeat that complete source/bundle/seed authentication
 and global NDS recomputation immediately before calling the Scheduler. A
 jointly edited and re-sealed plan and selected-candidate file therefore cannot

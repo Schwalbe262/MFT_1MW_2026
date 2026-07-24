@@ -73,6 +73,31 @@ def _decoded_params(primary_turns=6):
     return decoded
 
 
+def _synthetic_goal_code_manifest(revision="1" * 40):
+    records = {
+        "artifacts/code/.source-revision": {
+            "sha256": hashlib.sha256(f"{revision}\n".encode("ascii")).hexdigest(),
+            "size": 41,
+        }
+    }
+    return launch._seal(
+        {
+            "schema_version": launch.CODE_MANIFEST_SCHEMA,
+            "campaign_id": "mft-goal-20260726",
+            "code_revision": revision,
+            "code_root_relative": "artifacts/code",
+            "revision_marker": "artifacts/code/.source-revision",
+            "files": records,
+            "code_inventory": records,
+            "code_inventory_sha256": handoff.canonical_sha256(records),
+            "staged_path_rule": "bundle_root/<code_inventory_key>",
+            "source_checkout_mutated": False,
+            "remote_git_checkout_required": False,
+            "scheduler_project_code_included": False,
+        }
+    )
+
+
 def _bundle(tmp_path: Path):
     local = launch._seal(
         {
@@ -83,6 +108,7 @@ def _bundle(tmp_path: Path):
             "train_report_sha256": "c" * 64,
             "candidate_sha256": "e" * 64,
             "quality_status_sha256": "f" * 64,
+            "profile_sha256": "7" * 64,
             "code": {"revision": "1" * 40},
             "search_only_proposal": False,
         }
@@ -91,6 +117,7 @@ def _bundle(tmp_path: Path):
         mode="rolling32",
         seed_start=2607269001,
     )
+    code_manifest = _synthetic_goal_code_manifest()
     bundle, tasks, _scheduler = launch.build_bundle_values(
         local_preflight=local,
         assignments=assignments,
@@ -100,13 +127,20 @@ def _bundle(tmp_path: Path):
             "candidate": "candidate.json",
             "quality_status": "quality.json",
             "code_root": "repo",
+            "dataset": "dataset.csv",
+            "profile": "profile.json",
             "expected_code_revision": "1" * 40,
         },
+        code_manifest=code_manifest,
     )
     bundle_root = tmp_path / "bundle"
     bundle_root.mkdir()
     bundle_path = bundle_root / "bundle_manifest.json"
     launch._atomic_json(bundle_path, bundle)
+    launch._atomic_json(bundle_root / "code_manifest.json", code_manifest)
+    revision_marker = bundle_root / "artifacts" / "code" / ".source-revision"
+    revision_marker.parent.mkdir(parents=True)
+    revision_marker.write_bytes(b"1" * 40 + b"\n")
     task_paths = {}
     for task, relative in zip(tasks, bundle["task_relative_paths"]):
         task_path = bundle_root / relative
@@ -291,6 +325,7 @@ def _fixture(tmp_path: Path):
         result_by_payload[task["payload_sha256"]] = result_path
     aggregate_path = launch.aggregate_results(
         result_paths=result_paths,
+        bundle_manifest_path=bundle_path,
         output=tmp_path / "aggregate",
         minimum_seeds=launch.ROLLING_SEED_COUNT,
     )
@@ -529,6 +564,29 @@ def test_plan_authenticates_global_row_source_result_task_and_profiles(tmp_path)
     assert authority["minimum_seed_count"] == 32
     assert authority["all_bundle_seed_results_reauthenticated"] is True
     assert authority["global_nds_recomputed"] is True
+    assert authority["bundle_task_ledger_sha256"] == handoff.canonical_sha256(
+        sorted(
+            task["payload_sha256"]
+            for task in handoff.launch.load_bundle_task_ledger(
+                fixture["bundle_path"]
+            )[1].values()
+        )
+    )
+    assert authority["bundle_relocation_contract"] == (
+        handoff.EXPECTED_RELOCATION_CONTRACT
+    )
+    assert authority["bundle_code_manifest"]["payload_sha256"] == (
+        fixture["task"]["source_identity"]["code_manifest_payload_sha256"]
+    )
+    assert authority["bundle_code_manifest"]["staged_code_authentication"][
+        "revision_marker_authenticated"
+    ] is True
+    assert selected["task_identity"][
+        "source_code_manifest_payload_sha256"
+    ] == fixture["task"]["source_identity"]["code_manifest_payload_sha256"]
+    assert selected["task_identity"]["source_code_inventory_sha256"] == (
+        fixture["task"]["source_identity"]["code_inventory_sha256"]
+    )
     assert plan["stages"]["standard"]["resources"] == {
         "cpus": 8,
         "timeout_seconds": 14400,
@@ -654,6 +712,24 @@ def test_plan_fails_if_aggregate_omits_a_bundle_seed(tmp_path):
     with pytest.raises(
         handoff.HandoffContractError,
         match="aggregate seed inventory|omits one or more bundle",
+    ):
+        _make_plan(tmp_path, fixture)
+
+
+def test_plan_rejects_resealed_aggregate_task_ledger_identity(tmp_path):
+    fixture = _fixture(tmp_path)
+    aggregate = handoff._read_json(fixture["aggregate_path"])
+    unsigned = dict(aggregate)
+    unsigned.pop("payload_sha256")
+    unsigned["authenticated_bundle"] = dict(
+        unsigned["authenticated_bundle"]
+    )
+    unsigned["authenticated_bundle"]["task_ledger_sha256"] = "0" * 64
+    launch._atomic_json(fixture["aggregate_path"], launch._seal(unsigned))
+
+    with pytest.raises(
+        handoff.HandoffContractError,
+        match="original bundle/task ledger authority drifted",
     ):
         _make_plan(tmp_path, fixture)
 
