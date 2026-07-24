@@ -225,6 +225,96 @@ def _standard_collections(
     }
 
 
+def _standard_cohort_24(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    counts=(7, 6, 6, 5),
+    result_mutator=None,
+):
+    if len(counts) != 4 or sum(counts) != promotion.EXACT_COHORT_SIZE:
+        raise AssertionError(counts)
+    built = _standard_collections(
+        tmp_path,
+        monkeypatch,
+        turns=(5, 6, 7, 8),
+        result_mutator=result_mutator,
+    )
+    helpers = built["helpers"]
+    predictor = helpers._Predictor()
+    entries = list(built["entries"])
+    base_by_turns = {entry["turns"]: entry for entry in entries}
+    next_task_id = (
+        max(entry["submission"]["task_id"] for entry in entries) + 1
+    )
+    scheduler = _Scheduler(first_task_id=next_task_id)
+    for turns, count in zip((5, 6, 7, 8), counts, strict=True):
+        base = base_by_turns[turns]
+        for repeat in range(1, count):
+            submission_path = diagnostic.submit_standard(
+                plan_path=base["plan_path"],
+                scheduler_cutover_receipt_path=built["cutover_path"],
+                output=(
+                    tmp_path
+                    / f"standard-submission-{turns}-repeat-{repeat}.json"
+                ),
+                scheduler=scheduler,
+                predictor=predictor,
+                live_reader=helpers._live_scheduler_reader,
+            )
+            plan = diagnostic._load_plan(base["plan_path"])[0]
+            submission = diagnostic._load_submission(
+                submission_path, plan=plan
+            )
+            result = copy.deepcopy(base["result"])
+            result["solver_core_scheduler_task_id_readback"] = str(
+                submission["task_id"]
+            )
+            scheduler.result = result
+            metadata_reader, manifest_reader = helpers._remote_evidence(
+                submission, result
+            )
+            collection_path = diagnostic.collect_standard(
+                plan_path=base["plan_path"],
+                submission_path=submission_path,
+                output=(
+                    tmp_path
+                    / f"standard-collection-{turns}-repeat-{repeat}.json"
+                ),
+                scheduler=scheduler,
+                remote_reader=metadata_reader,
+                manifest_reader=manifest_reader,
+                task_reader=lambda _submission=submission, **_kwargs: (
+                    helpers._task_snapshot(_submission)
+                ),
+            )
+            entries.append(
+                {
+                    "turns": turns,
+                    "plan_path": base["plan_path"],
+                    "submission_path": submission_path,
+                    "submission": submission,
+                    "result": result,
+                    "metadata_reader": metadata_reader,
+                    "manifest_reader": manifest_reader,
+                    "collection_path": collection_path,
+                }
+            )
+    inventory_path = promotion.create_cohort_inventory(
+        standard_submission_paths=[
+            entry["submission_path"] for entry in entries
+        ],
+        output=tmp_path / "standard-cohort-inventory.json",
+        predictor=predictor,
+    )
+    return {
+        **built,
+        "entries": entries,
+        "inventory_path": inventory_path,
+        "predictor": predictor,
+    }
+
+
 def _first_full_plan(plan_set_path: Path) -> Path:
     value = production._read_json(plan_set_path)
     record = value["plans"][0]["plan"]
@@ -543,8 +633,15 @@ def test_combined_actual_truth_nds_deduplicates_and_bounds_full_plans(
         lambda result: result.__setitem__(
             "Tprobe_Tx_leeward_max", 100.1
         ),
+        lambda result: result.__setitem__("T_max_Tx", 100.1),
+        lambda result: result.__setitem__("T_max_core", 120.1),
     ],
-    ids=["resonance-threshold", "active-probe-temperature"],
+    ids=[
+        "resonance-threshold",
+        "active-probe-temperature",
+        "winding-body-temperature",
+        "core-body-temperature",
+    ],
 )
 def test_promotion_rejects_failed_actual_hard_constraint(
     tmp_path, monkeypatch, mutator
@@ -574,6 +671,387 @@ def test_promotion_rejects_failed_actual_hard_constraint(
             output=tmp_path / "forbidden-promotion",
             predictor=built["helpers"]._Predictor(),
         )
+
+
+def test_truth_v2_classifier_records_size_failure(
+    tmp_path, monkeypatch
+):
+    from regression_260707.verify import finalize
+
+    built = _standard_collections(
+        tmp_path, monkeypatch, turns=(6,)
+    )
+    predictor = built["helpers"]._Predictor()
+    collection_path = built["entries"][0]["collection_path"]
+    view = diagnostic.authenticate_collection(
+        collection_path, predictor=predictor
+    )
+    _original_volume, original_dimensions = (
+        geometry_metrics.bounding_box_lit(view["collection"]["result"])
+    )
+    dimensions = (
+        1200.1,
+        float(original_dimensions[1]),
+        float(original_dimensions[2]),
+    )
+    volume = dimensions[0] * dimensions[1] * dimensions[2] * 1e-6
+
+    def oversized(_result):
+        return volume, dimensions
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            promotion.geometry_metrics, "bounding_box_lit", oversized
+        )
+        context.setattr(finalize, "bounding_box_lit", oversized)
+        collection = view["collection"]
+        reasons = production._goal_result_reasons(
+            collection["result"], view["selected"]
+        )
+        assert "size_out_of_spec:W" in reasons
+        collection["goal_physical_spec_reasons"] = reasons
+        collection["goal_physical_spec_passed"] = False
+        collection["truth_evidence"]["actual_volume_L"] = volume
+        collection["truth_evidence"][
+            "actual_exterior_dimensions_mm"
+        ] = {
+            "W": dimensions[0],
+            "L": dimensions[1],
+            "H": dimensions[2],
+        }
+        _truth, status = promotion._actual_standard_observation(
+            view, collection_path=collection_path
+        )
+    assert status["actual_truth_feasible"] is False
+    assert "size_out_of_spec:W" in status[
+        "promotion_exclusion_reasons"
+    ]
+
+
+def test_truth_v2_exact_24_classifies_every_collection_and_blocks_zero(
+    tmp_path, monkeypatch
+):
+    def mixed_feasibility(result):
+        primary_turns = int(float(result["N1_main"])) + int(
+            float(result["N1_side"])
+        )
+        if primary_turns == 7:
+            result["f_res_min_tx_rx_only_Hz"] = 14999.9
+        if primary_turns == 8:
+            result["Tprobe_Tx_leeward_max"] = 100.1
+
+    built = _standard_cohort_24(
+        tmp_path,
+        monkeypatch,
+        counts=(7, 6, 6, 5),
+        result_mutator=mixed_feasibility,
+    )
+    predictor = built["predictor"]
+    collection_paths = [
+        entry["collection_path"] for entry in built["entries"]
+    ]
+    submission_paths = [
+        entry["submission_path"] for entry in built["entries"]
+    ]
+    inventory, cohort_entries = promotion._load_cohort_inventory(
+        built["inventory_path"], predictor=predictor
+    )
+    assert inventory["entry_count"] == 24
+    assert inventory["unique_candidate_count"] == 4
+    assert len({entry["task_id"] for entry in cohort_entries}) == 24
+    with pytest.raises(
+        production.HandoffContractError, match="exactly 24"
+    ):
+        promotion.create_cohort_inventory(
+            standard_submission_paths=submission_paths[:23],
+            output=tmp_path / "forbidden-cohort-23.json",
+            predictor=predictor,
+        )
+    with pytest.raises(
+        production.HandoffContractError, match="exactly 24"
+    ):
+        promotion.create_cohort_inventory(
+            standard_submission_paths=(
+                submission_paths + [submission_paths[0]]
+            ),
+            output=tmp_path / "forbidden-cohort-25.json",
+            predictor=predictor,
+        )
+    with pytest.raises(
+        production.HandoffContractError, match="must be unique"
+    ):
+        promotion.create_cohort_inventory(
+            standard_submission_paths=(
+                submission_paths[:23] + [submission_paths[0]]
+            ),
+            output=tmp_path / "forbidden-cohort-duplicate.json",
+            predictor=predictor,
+        )
+    with monkeypatch.context() as context:
+        context.setattr(
+            diagnostic,
+            "authenticate_collection",
+            lambda *_args, **_kwargs: {
+                "collection": {"task_id": 999999}
+            },
+        )
+        with pytest.raises(
+            production.HandoffContractError,
+            match="outside or duplicates",
+        ):
+            promotion._authenticate_cohort_inputs(
+                cohort_entries=cohort_entries,
+                collection_paths=collection_paths,
+                predictor=predictor,
+            )
+
+    with pytest.raises(
+        production.HandoffContractError, match="exactly 24"
+    ):
+        promotion.create_truth_promotion(
+            standard_collection_paths=collection_paths[:23],
+            cohort_inventory_path=built["inventory_path"],
+            output=tmp_path / "forbidden-missing-v2",
+            predictor=predictor,
+        )
+    with pytest.raises(
+        production.HandoffContractError, match="must be unique"
+    ):
+        promotion.create_truth_promotion(
+            standard_collection_paths=(
+                collection_paths[:23] + [collection_paths[0]]
+            ),
+            cohort_inventory_path=built["inventory_path"],
+            output=tmp_path / "forbidden-duplicate-v2",
+            predictor=predictor,
+        )
+    with pytest.raises(
+        production.HandoffContractError, match="exactly 24"
+    ):
+        promotion.create_truth_promotion(
+            standard_collection_paths=(
+                collection_paths + [collection_paths[0]]
+            ),
+            cohort_inventory_path=built["inventory_path"],
+            output=tmp_path / "forbidden-extra-v2",
+            predictor=predictor,
+        )
+
+    manifest_path = promotion.create_truth_promotion(
+        standard_collection_paths=list(reversed(collection_paths)),
+        cohort_inventory_path=built["inventory_path"],
+        output=tmp_path / "truth-promotion-v2",
+        predictor=predictor,
+    )
+    manifest, ranked, _by_candidate = promotion._load_truth_manifest(
+        manifest_path, predictor=predictor
+    )
+    assert manifest["schema_version"] == promotion.TRUTH_MANIFEST_SCHEMA_V2
+    assert manifest["authenticated_collection_count"] == 24
+    assert manifest["feasible_collection_count"] == 13
+    assert manifest["infeasible_collection_count"] == 11
+    assert len(manifest["classification_rows"]) == 24
+    assert len(ranked) == 2
+    assert all(row["truth_non_dominated_rank"] == 0 for row in ranked)
+    assert {
+        row["task_id"]
+        for row in manifest["classification_rows"]
+        if row["actual_truth_feasible"]
+    } == {
+        entry["submission"]["task_id"]
+        for entry in built["entries"]
+        if entry["turns"] in {5, 6}
+    }
+    assert any(
+        "self_resonance_below_minimum"
+        in row["promotion_exclusion_reasons"]
+        for row in manifest["classification_rows"]
+    )
+    assert any(
+        "temperature_out_of_spec:Tprobe_Tx_leeward_max"
+        in row["promotion_exclusion_reasons"]
+        for row in manifest["classification_rows"]
+    )
+    first_truth = copy.deepcopy(ranked[0])
+    first_classification = next(
+        row
+        for row in manifest["classification_rows"]
+        if row["candidate_physics_sha256"]
+        == first_truth["candidate_physics_sha256"]
+    )
+    conflicting_truth = copy.deepcopy(first_truth)
+    conflicting_truth["actual_total_loss_W"] += 0.001
+    with pytest.raises(
+        production.HandoffContractError,
+        match="mixed actual truth",
+    ):
+        promotion._validate_duplicate_cohort_observations(
+            [
+                ({}, first_truth, first_classification, {}),
+                ({}, conflicting_truth, first_classification, {}),
+            ]
+        )
+    plan_set_path = promotion.create_full_plans(
+        truth_manifest_path=manifest_path,
+        solver_revision="2" * 40,
+        library_revision="3" * 40,
+        output=tmp_path / "truth-full-plans-v2",
+        predictor=predictor,
+    )
+    plan_set, plans = promotion._load_full_plan_set(
+        plan_set_path, predictor=predictor
+    )
+    assert plan_set["selected_plan_count"] == len(ranked)
+    assert 1 <= len(plans) <= promotion.MAX_FULL_PLANS
+
+    tampered_collection = production._read_json(collection_paths[-1])
+    tampered_collection.pop("payload_sha256")
+    tampered_collection["goal_physical_spec_passed"] = not (
+        tampered_collection["goal_physical_spec_passed"]
+    )
+    tampered_collection_path = production._write_immutable_json(
+        tmp_path / "tampered-collection.json",
+        production._seal(tampered_collection),
+    )
+    with pytest.raises(production.HandoffContractError):
+        promotion.create_truth_promotion(
+            standard_collection_paths=(
+                collection_paths[:-1] + [tampered_collection_path]
+            ),
+            cohort_inventory_path=built["inventory_path"],
+            output=tmp_path / "forbidden-tampered-v2",
+            predictor=predictor,
+        )
+
+    tampered_manifest = production._read_json(manifest_path)
+    tampered_manifest.pop("payload_sha256")
+    classification = tampered_manifest["classification_rows"][0]
+    classification.pop("classification_sha256")
+    classification["actual_truth_feasible"] = not classification[
+        "actual_truth_feasible"
+    ]
+    classification["classification_sha256"] = (
+        production.canonical_sha256(classification)
+    )
+    tampered_manifest_path = production._write_immutable_json(
+        manifest_path.parent / "tampered-truth-manifest.json",
+        production._seal(tampered_manifest),
+    )
+    with pytest.raises(production.HandoffContractError):
+        promotion._load_truth_manifest(
+            tampered_manifest_path, predictor=predictor
+        )
+
+    entry_by_submission = {
+        str(Path(entry["submission"]["path"]).resolve()): entry
+        for entry in cohort_entries
+    }
+    last_submission = str(submission_paths[-1].resolve())
+
+    def mixed_revision_entry(path, *, predictor=None):
+        del predictor
+        entry = copy.deepcopy(
+            entry_by_submission[str(path.resolve(strict=True))]
+        )
+        if str(path.resolve(strict=True)) == last_submission:
+            entry["library_revision"] = "4" * 40
+            entry.pop("entry_sha256")
+            entry["entry_sha256"] = production.canonical_sha256(entry)
+        return entry
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            promotion,
+            "_authenticated_submission_entry",
+            mixed_revision_entry,
+        )
+        with pytest.raises(
+            production.HandoffContractError,
+            match="cannot mix solver/library",
+        ):
+            promotion.create_cohort_inventory(
+                standard_submission_paths=submission_paths,
+                output=tmp_path / "forbidden-mixed-revision.json",
+                predictor=predictor,
+            )
+
+    original_observation = promotion._actual_standard_observation
+
+    def force_infeasible(view, *, collection_path):
+        truth, status = original_observation(
+            view, collection_path=collection_path
+        )
+        status = copy.deepcopy(status)
+        status["goal_physical_spec_passed"] = False
+        status["goal_physical_spec_reasons"] = [
+            "test_forced_infeasible"
+        ]
+        status["actual_truth_feasible"] = False
+        status["promotion_exclusion_reasons"] = [
+            "test_forced_infeasible"
+        ]
+        return truth, status
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            promotion,
+            "_actual_standard_observation",
+            force_infeasible,
+        )
+        zero_path = promotion.create_truth_promotion(
+            standard_collection_paths=collection_paths,
+            cohort_inventory_path=built["inventory_path"],
+            output=tmp_path / "truth-promotion-v2-zero",
+            predictor=predictor,
+        )
+        zero_manifest, zero_ranked, _unused = (
+            promotion._load_truth_manifest(
+                zero_path, predictor=predictor
+            )
+        )
+        assert zero_ranked == []
+        assert zero_manifest["feasible_collection_count"] == 0
+        assert zero_manifest["rank0_count"] == 0
+        assert zero_manifest["full_plan_eligible"] is False
+        assert zero_manifest["zero_feasible_audited"] is True
+        with pytest.raises(
+            production.HandoffContractError,
+            match="no rank-0 candidate",
+        ):
+            promotion.create_full_plans(
+                truth_manifest_path=zero_path,
+                solver_revision="2" * 40,
+                library_revision="3" * 40,
+                output=tmp_path / "forbidden-zero-full",
+                predictor=predictor,
+            )
+
+
+def test_truth_sorting_includes_the_twenty_fourth_candidate():
+    rows = [
+        {
+            "candidate_physics_sha256": f"{index:064x}",
+            "actual_volume_L": float(100 + index),
+            "actual_total_loss_W": float(100 + index),
+        }
+        for index in range(23)
+    ]
+    last = {
+        "candidate_physics_sha256": "f" * 64,
+        "actual_volume_L": 1.0,
+        "actual_total_loss_W": 1.0,
+    }
+    ranked = promotion._rank_truth(rows + [last])
+    rank0 = [
+        row
+        for row in ranked
+        if row["truth_non_dominated_rank"] == 0
+    ]
+    assert len(ranked) == 24
+    assert [row["candidate_physics_sha256"] for row in rank0] == [
+        last["candidate_physics_sha256"]
+    ]
+    assert max(row["truth_non_dominated_rank"] for row in ranked) == 23
 
 
 def test_full_submit_collect_and_self_contained_package(

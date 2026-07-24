@@ -1,10 +1,12 @@
 """Actual-truth promotion from diagnostic Standard FEA to bounded Full FEA.
 
 This is deliberately separate from both ``mft_goal_diagnostic_standard_probe``
-and the production Pareto handoff.  Diagnostic collections are reauthenticated
-through their public API, ranked only by measured Standard volume/loss, and
-may authorize at most three explicit Full submissions.  No surrogate
-constraint is relaxed and no automatic promotion exists.
+and the production Pareto handoff.  The v2 path exact-binds 24 diagnostic
+submissions, reauthenticates and classifies all 24 collections, and ranks only
+the feasible measured Standard volume/loss observations.  At most three
+global rank-0 candidates may receive explicit Full plans.  No surrogate
+constraint is relaxed and no automatic promotion exists.  The bounded v1
+reader remains available for existing evidence.
 """
 
 from __future__ import annotations
@@ -51,6 +53,8 @@ from tools import mft_goal_fea_handoff as production  # noqa: E402
 
 
 TRUTH_MANIFEST_SCHEMA = "mft-goal-actual-truth-pareto-v1"
+TRUTH_MANIFEST_SCHEMA_V2 = "mft-goal-actual-truth-pareto-v2"
+COHORT_INVENTORY_SCHEMA = "mft-goal-diagnostic-standard-cohort-v1"
 FULL_PLAN_SET_SCHEMA = "mft-goal-truth-full-plan-set-v1"
 FULL_PLAN_SCHEMA = "mft-goal-truth-full-plan-v1"
 FULL_SUBMISSION_SCHEMA = "mft-goal-truth-full-submission-v1"
@@ -65,6 +69,7 @@ FULL_PROFILE_PATH = (
 )
 FULL_RESOURCES = {"cpus": 16, "timeout_seconds": 12 * 3600}
 MAX_PROMOTION_INPUTS = 12
+EXACT_COHORT_SIZE = 24
 MAX_FULL_PLANS = 3
 DIAGNOSTIC_COLLECTION_SCHEMA = diagnostic.COLLECTION_SCHEMA
 HandoffContractError = production.HandoffContractError
@@ -171,11 +176,11 @@ def _temperature_evidence(
     return active, evidence, passed
 
 
-def _actual_standard_truth(
+def _actual_standard_observation(
     view: Mapping[str, Any],
     *,
     collection_path: Path,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if set(view) != {
         "schema_version",
         "collection",
@@ -200,30 +205,31 @@ def _actual_standard_truth(
         != DIAGNOSTIC_COLLECTION_SCHEMA
         or not isinstance(result, dict)
         or not isinstance(truth, dict)
-        or collection.get("goal_physical_spec_passed") is not True
-        or collection.get(
-            "actual_body_probe_temperature_gate_passed"
-        )
-        is not True
         or any(
             collection.get(name) is not value
             for name, value in diagnostic._diagnostic_flags().items()
         )
     ):
         raise HandoffContractError(
-            "only passing diagnostic Standard collections may be promoted"
+            "diagnostic Standard collection truth fields drifted"
         )
     reasons = production._goal_result_reasons(result, selected)
-    if reasons or reasons != collection.get("goal_physical_spec_reasons"):
+    if (
+        reasons != collection.get("goal_physical_spec_reasons")
+        or collection.get("goal_physical_spec_passed") is not (not reasons)
+    ):
         raise HandoffContractError(
             "Standard actual physical goal recomputation failed"
         )
     active, temperatures, temperature_passed = _temperature_evidence(result)
     if (
-        not temperature_passed
-        or active != collection.get("active_temperature_targets")
+        active != collection.get("active_temperature_targets")
         or temperatures
         != collection.get("actual_body_probe_temperatures")
+        or collection.get(
+            "actual_body_probe_temperature_gate_passed"
+        )
+        is not temperature_passed
     ):
         raise HandoffContractError(
             "Standard actual temperature gate recomputation failed"
@@ -252,11 +258,7 @@ def _actual_standard_truth(
     fixed = attest_fixed_identity(identity_values)
     expected_dimensions = truth.get("actual_exterior_dimensions_mm")
     if (
-        width > float(limits["W"])
-        or length > float(limits["L"])
-        or height > float(limits["H"])
-        or resonance < float(GOAL_STAGE_SPEC["resonance_min_Hz"])
-        or not isinstance(expected_dimensions, dict)
+        not isinstance(expected_dimensions, dict)
         or any(
             not math.isclose(
                 value,
@@ -330,7 +332,7 @@ def _actual_standard_truth(
             for name, item in temperatures.items()
         },
     }
-    return {
+    truth_row = {
         "collection": _file_record(collection_path),
         "collection_payload_sha256": collection["payload_sha256"],
         "candidate_physics_sha256": collection[
@@ -370,6 +372,313 @@ def _actual_standard_truth(
         ]["marker_sha256"],
         **_authority_flags(),
     }
+    exclusion_reasons = list(reasons)
+    if not temperature_passed:
+        exclusion_reasons.append(
+            "actual_body_probe_temperature_gate_failed"
+        )
+    status = {
+        "goal_physical_spec_passed": not reasons,
+        "goal_physical_spec_reasons": list(reasons),
+        "actual_body_probe_temperature_gate_passed": temperature_passed,
+        "failed_temperature_targets": sorted(
+            name
+            for name, item in temperatures.items()
+            if item["passed"] is not True
+        ),
+        "actual_truth_feasible": not reasons and temperature_passed,
+        "promotion_exclusion_reasons": list(
+            dict.fromkeys(exclusion_reasons)
+        ),
+    }
+    return truth_row, status
+
+
+def _actual_standard_truth(
+    view: Mapping[str, Any],
+    *,
+    collection_path: Path,
+) -> dict[str, Any]:
+    truth, status = _actual_standard_observation(
+        view, collection_path=collection_path
+    )
+    if status["actual_truth_feasible"] is not True:
+        raise HandoffContractError(
+            "only passing diagnostic Standard collections may be promoted"
+        )
+    return truth
+
+
+COHORT_ENTRY_FIELDS = frozenset(
+    {
+        "entry_sha256",
+        "task_id",
+        "task_name",
+        "candidate_physics_sha256",
+        "source_task_payload_sha256",
+        "source_result_sha256",
+        "selection_manifest_sha256",
+        "plan",
+        "plan_payload_sha256",
+        "submission",
+        "submission_payload_sha256",
+        "solver_revision",
+        "library_revision",
+        "fea_params_sha256",
+        "search_authority_sha256",
+    }
+)
+
+COHORT_INVENTORY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "payload_sha256",
+        "campaign_id",
+        "goal_contract_schema",
+        "hard_spec",
+        "hard_spec_sha256",
+        "temperature_contract_sha256",
+        "exact_cohort_size",
+        "entry_count",
+        "unique_candidate_count",
+        "solver_revision",
+        "library_revision",
+        "cohort_entries_sha256",
+        "entries",
+        "scheduler_mutation_performed",
+        "collection_performed",
+        "truth_promotion_performed",
+    }
+)
+
+
+def _authenticated_submission_entry(
+    path: Path,
+    *,
+    predictor: Any | None = None,
+) -> dict[str, Any]:
+    resolved = path.resolve(strict=True)
+    unsigned = production._validate_seal(
+        production._read_json(resolved), diagnostic.SUBMISSION_SCHEMA
+    )
+    plan_record = unsigned.get("plan")
+    if not isinstance(plan_record, dict):
+        raise HandoffContractError(
+            "diagnostic cohort submission plan record is absent"
+        )
+    plan_path = Path(str(plan_record.get("path") or ""))
+    if _file_record(plan_path) != plan_record:
+        raise HandoffContractError(
+            "diagnostic cohort submission plan bytes drifted"
+        )
+    plan, _params, selected = diagnostic._load_plan(plan_path)
+    submission = diagnostic._load_submission(resolved, plan=plan)
+    refreshed = diagnostic._fresh_selection_reauthentication(
+        plan=plan, selected=selected, predictor=predictor
+    )
+    if refreshed != submission["search_authority_reauthentication"]:
+        raise HandoffContractError(
+            "diagnostic cohort submission source reauthentication drifted"
+        )
+    entry = {
+        "task_id": submission["task_id"],
+        "task_name": submission["task_name"],
+        "candidate_physics_sha256": plan[
+            "candidate_physics_sha256"
+        ],
+        "source_task_payload_sha256": selected["task_identity"][
+            "payload_sha256"
+        ],
+        "source_result_sha256": selected["source_result"]["sha256"],
+        "selection_manifest_sha256": selected["selection_source"][
+            "selection_manifest"
+        ]["sha256"],
+        "plan": _file_record(plan_path),
+        "plan_payload_sha256": plan["payload_sha256"],
+        "submission": _file_record(resolved),
+        "submission_payload_sha256": submission["payload_sha256"],
+        "solver_revision": plan["solver_revision"],
+        "library_revision": plan["library_revision"],
+        "fea_params_sha256": plan["fea_params_sha256"],
+        "search_authority_sha256": plan["search_authority_sha256"],
+    }
+    entry["entry_sha256"] = canonical_sha256(entry)
+    return entry
+
+
+def _validated_cohort_entries(
+    submission_paths: Sequence[Path],
+    *,
+    predictor: Any | None = None,
+) -> list[dict[str, Any]]:
+    if len(submission_paths) != EXACT_COHORT_SIZE:
+        raise HandoffContractError(
+            "diagnostic Standard cohort requires exactly 24 submissions"
+        )
+    try:
+        resolved = [path.resolve(strict=True) for path in submission_paths]
+    except (OSError, RuntimeError) as exc:
+        raise HandoffContractError(
+            "diagnostic Standard cohort submission is unavailable"
+        ) from exc
+    if len(set(resolved)) != EXACT_COHORT_SIZE:
+        raise HandoffContractError(
+            "diagnostic Standard cohort submissions must be unique"
+        )
+    entries = sorted(
+        (
+            _authenticated_submission_entry(path, predictor=predictor)
+            for path in resolved
+        ),
+        key=lambda item: (
+            item["task_id"],
+            item["candidate_physics_sha256"],
+            item["submission_payload_sha256"],
+        ),
+    )
+    if len({entry["task_id"] for entry in entries}) != EXACT_COHORT_SIZE:
+        raise HandoffContractError(
+            "diagnostic Standard cohort task IDs must be unique"
+        )
+    revisions = {
+        (entry["solver_revision"], entry["library_revision"])
+        for entry in entries
+    }
+    if len(revisions) != 1:
+        raise HandoffContractError(
+            "diagnostic Standard cohort cannot mix solver/library provenance"
+        )
+    return entries
+
+
+def create_cohort_inventory(
+    *,
+    standard_submission_paths: Sequence[Path],
+    output: Path,
+    predictor: Any | None = None,
+) -> Path:
+    validate_goal_stage_spec(GOAL_STAGE_SPEC)
+    entries = _validated_cohort_entries(
+        standard_submission_paths, predictor=predictor
+    )
+    solver_revision, library_revision = next(
+        iter(
+            {
+                (entry["solver_revision"], entry["library_revision"])
+                for entry in entries
+            }
+        )
+    )
+    inventory = production._seal(
+        {
+            "schema_version": COHORT_INVENTORY_SCHEMA,
+            "campaign_id": "mft-goal-20260726",
+            "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+            "hard_spec": copy.deepcopy(GOAL_STAGE_SPEC),
+            "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+            "temperature_contract_sha256": (
+                GOAL_TEMPERATURE_CONTRACT_SHA256
+            ),
+            "exact_cohort_size": EXACT_COHORT_SIZE,
+            "entry_count": len(entries),
+            "unique_candidate_count": len(
+                {
+                    entry["candidate_physics_sha256"]
+                    for entry in entries
+                }
+            ),
+            "solver_revision": solver_revision,
+            "library_revision": library_revision,
+            "cohort_entries_sha256": canonical_sha256(entries),
+            "entries": entries,
+            "scheduler_mutation_performed": False,
+            "collection_performed": False,
+            "truth_promotion_performed": False,
+        }
+    )
+    return production._write_immutable_json(output.resolve(), inventory)
+
+
+def _load_cohort_inventory(
+    path: Path,
+    *,
+    predictor: Any | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    resolved = path.resolve(strict=True)
+    inventory = production._validate_seal(
+        production._read_json(resolved), COHORT_INVENTORY_SCHEMA
+    )
+    records = inventory.get("entries")
+    if (
+        set(inventory) != COHORT_INVENTORY_FIELDS
+        or inventory.get("campaign_id") != "mft-goal-20260726"
+        or inventory.get("goal_contract_schema") != GOAL_CONTRACT_SCHEMA
+        or inventory.get("hard_spec") != GOAL_STAGE_SPEC
+        or inventory.get("hard_spec_sha256") != GOAL_STAGE_SPEC_SHA256
+        or inventory.get("temperature_contract_sha256")
+        != GOAL_TEMPERATURE_CONTRACT_SHA256
+        or inventory.get("exact_cohort_size") != EXACT_COHORT_SIZE
+        or inventory.get("entry_count") != EXACT_COHORT_SIZE
+        or not isinstance(records, list)
+        or len(records) != EXACT_COHORT_SIZE
+        or inventory.get("scheduler_mutation_performed") is not False
+        or inventory.get("collection_performed") is not False
+        or inventory.get("truth_promotion_performed") is not False
+    ):
+        raise HandoffContractError(
+            "diagnostic Standard cohort inventory contract drifted"
+        )
+    submission_paths = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != COHORT_ENTRY_FIELDS:
+            raise HandoffContractError(
+                "diagnostic Standard cohort entry fields drifted"
+            )
+        unsigned = {
+            name: value
+            for name, value in record.items()
+            if name != "entry_sha256"
+        }
+        if record.get("entry_sha256") != canonical_sha256(unsigned):
+            raise HandoffContractError(
+                "diagnostic Standard cohort entry seal drifted"
+            )
+        submission_record = record.get("submission")
+        if not isinstance(submission_record, dict):
+            raise HandoffContractError(
+                "diagnostic Standard cohort submission record is malformed"
+            )
+        submission_path = Path(
+            str(submission_record.get("path") or "")
+        )
+        if _file_record(submission_path) != submission_record:
+            raise HandoffContractError(
+                "diagnostic Standard cohort submission bytes drifted"
+            )
+        submission_paths.append(submission_path)
+    refreshed = _validated_cohort_entries(
+        submission_paths, predictor=predictor
+    )
+    if (
+        records != refreshed
+        or inventory.get("cohort_entries_sha256")
+        != canonical_sha256(refreshed)
+        or inventory.get("unique_candidate_count")
+        != len(
+            {
+                entry["candidate_physics_sha256"]
+                for entry in refreshed
+            }
+        )
+        or inventory.get("solver_revision")
+        != refreshed[0]["solver_revision"]
+        or inventory.get("library_revision")
+        != refreshed[0]["library_revision"]
+    ):
+        raise HandoffContractError(
+            "diagnostic Standard cohort inventory reauthentication drifted"
+        )
+    return inventory, refreshed
 
 
 def _authenticate_inputs(
@@ -401,6 +710,279 @@ def _authenticate_inputs(
             "truth promotion cannot mix solver/library provenance"
         )
     return authenticated
+
+
+COHORT_CLASSIFICATION_FIELDS = frozenset(
+    {
+        "classification_sha256",
+        "cohort_entry_sha256",
+        "task_id",
+        "candidate_physics_sha256",
+        "source_task_payload_sha256",
+        "plan_payload_sha256",
+        "submission_payload_sha256",
+        "collection",
+        "collection_payload_sha256",
+        "standard_result_sha256",
+        "solver_revision",
+        "library_revision",
+        "fea_params_sha256",
+        "goal_physical_spec_passed",
+        "goal_physical_spec_reasons",
+        "actual_body_probe_temperature_gate_passed",
+        "failed_temperature_targets",
+        "actual_truth_feasible",
+        "promotion_exclusion_reasons",
+        "actual_volume_L",
+        "actual_total_loss_W",
+        "actual_dimensions_mm",
+        "actual_resonance_Hz",
+        "actual_temperatures_C",
+        "actual_constraint_margins",
+    }
+)
+
+
+def _cohort_classification_row(
+    *,
+    entry: Mapping[str, Any],
+    truth: Mapping[str, Any],
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    row = {
+        "cohort_entry_sha256": entry["entry_sha256"],
+        "task_id": truth["standard_task_id"],
+        "candidate_physics_sha256": truth[
+            "candidate_physics_sha256"
+        ],
+        "source_task_payload_sha256": truth[
+            "source_task_payload_sha256"
+        ],
+        "plan_payload_sha256": entry["plan_payload_sha256"],
+        "submission_payload_sha256": entry[
+            "submission_payload_sha256"
+        ],
+        "collection": copy.deepcopy(truth["collection"]),
+        "collection_payload_sha256": truth[
+            "collection_payload_sha256"
+        ],
+        "standard_result_sha256": truth["standard_result_sha256"],
+        "solver_revision": truth["solver_revision"],
+        "library_revision": truth["library_revision"],
+        "fea_params_sha256": truth["fea_params_sha256"],
+        "goal_physical_spec_passed": status[
+            "goal_physical_spec_passed"
+        ],
+        "goal_physical_spec_reasons": copy.deepcopy(
+            status["goal_physical_spec_reasons"]
+        ),
+        "actual_body_probe_temperature_gate_passed": status[
+            "actual_body_probe_temperature_gate_passed"
+        ],
+        "failed_temperature_targets": copy.deepcopy(
+            status["failed_temperature_targets"]
+        ),
+        "actual_truth_feasible": status["actual_truth_feasible"],
+        "promotion_exclusion_reasons": copy.deepcopy(
+            status["promotion_exclusion_reasons"]
+        ),
+        "actual_volume_L": truth["actual_volume_L"],
+        "actual_total_loss_W": truth["actual_total_loss_W"],
+        "actual_dimensions_mm": copy.deepcopy(
+            truth["actual_dimensions_mm"]
+        ),
+        "actual_resonance_Hz": truth["actual_resonance_Hz"],
+        "actual_temperatures_C": copy.deepcopy(
+            truth["actual_temperatures_C"]
+        ),
+        "actual_constraint_margins": copy.deepcopy(
+            truth["actual_constraint_margins"]
+        ),
+    }
+    row["classification_sha256"] = canonical_sha256(row)
+    return row
+
+
+def _authenticate_cohort_inputs(
+    *,
+    cohort_entries: Sequence[Mapping[str, Any]],
+    collection_paths: Sequence[Path],
+    predictor: Any | None = None,
+) -> list[
+    tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+    ]
+]:
+    if (
+        len(cohort_entries) != EXACT_COHORT_SIZE
+        or len(collection_paths) != EXACT_COHORT_SIZE
+    ):
+        raise HandoffContractError(
+            "truth promotion v2 requires exactly 24 cohort collections"
+        )
+    try:
+        resolved = [path.resolve(strict=True) for path in collection_paths]
+    except (OSError, RuntimeError) as exc:
+        raise HandoffContractError(
+            "truth promotion v2 collection is unavailable"
+        ) from exc
+    if len(set(resolved)) != EXACT_COHORT_SIZE:
+        raise HandoffContractError(
+            "truth promotion v2 collections must be unique"
+        )
+    expected_by_task = {
+        entry["task_id"]: dict(entry) for entry in cohort_entries
+    }
+    if len(expected_by_task) != EXACT_COHORT_SIZE:
+        raise HandoffContractError(
+            "truth promotion v2 cohort task inventory is ambiguous"
+        )
+    observed_by_task = {}
+    for path in resolved:
+        view = diagnostic.authenticate_collection(
+            path, predictor=predictor
+        )
+        collection = view["collection"]
+        task_id = collection.get("task_id")
+        if task_id not in expected_by_task or task_id in observed_by_task:
+            raise HandoffContractError(
+                "truth promotion v2 collection is outside or duplicates "
+                "the exact cohort"
+            )
+        entry = expected_by_task[task_id]
+        truth, status = _actual_standard_observation(
+            view, collection_path=path
+        )
+        if (
+            collection.get("plan") != entry["plan"]
+            or collection.get("plan_payload_sha256")
+            != entry["plan_payload_sha256"]
+            or collection.get("submission") != entry["submission"]
+            or collection.get("submission_payload_sha256")
+            != entry["submission_payload_sha256"]
+            or collection.get("candidate_physics_sha256")
+            != entry["candidate_physics_sha256"]
+            or collection.get("selected_candidate_identity", {}).get(
+                "source_task_payload_sha256"
+            )
+            != entry["source_task_payload_sha256"]
+            or collection.get("selection_manifest", {}).get("sha256")
+            != entry["selection_manifest_sha256"]
+            or view["plan"].get("payload_sha256")
+            != entry["plan_payload_sha256"]
+            or view["submission"].get("payload_sha256")
+            != entry["submission_payload_sha256"]
+            or view["submission"].get("task_name")
+            != entry["task_name"]
+            or truth["solver_revision"] != entry["solver_revision"]
+            or truth["library_revision"] != entry["library_revision"]
+            or truth["fea_params_sha256"]
+            != entry["fea_params_sha256"]
+        ):
+            raise HandoffContractError(
+                "truth promotion v2 collection/cohort identity drifted"
+            )
+        classification = _cohort_classification_row(
+            entry=entry, truth=truth, status=status
+        )
+        observed_by_task[task_id] = (
+            view,
+            truth,
+            classification,
+            entry,
+        )
+    if set(observed_by_task) != set(expected_by_task):
+        raise HandoffContractError(
+            "truth promotion v2 exact cohort is incomplete"
+        )
+    authenticated = [
+        observed_by_task[entry["task_id"]] for entry in cohort_entries
+    ]
+    revisions = {
+        (truth["solver_revision"], truth["library_revision"])
+        for _view, truth, _classification, _entry in authenticated
+    }
+    if len(revisions) != 1:
+        raise HandoffContractError(
+            "truth promotion v2 cannot mix solver/library provenance"
+        )
+    return authenticated
+
+
+def _duplicate_observation_contract(
+    truth: Mapping[str, Any],
+    classification: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "candidate_physics_sha256": truth[
+            "candidate_physics_sha256"
+        ],
+        "solver_revision": truth["solver_revision"],
+        "library_revision": truth["library_revision"],
+        "fea_params_sha256": truth["fea_params_sha256"],
+        "actual_volume_L": truth["actual_volume_L"],
+        "actual_total_loss_W": truth["actual_total_loss_W"],
+        "actual_loss_components_W": truth["actual_loss_components_W"],
+        "actual_dimensions_mm": truth["actual_dimensions_mm"],
+        "actual_resonance_Hz": truth["actual_resonance_Hz"],
+        "actual_temperatures_C": truth["actual_temperatures_C"],
+        "actual_constraint_margins": truth[
+            "actual_constraint_margins"
+        ],
+        "fixed_identity_attestation": truth[
+            "fixed_identity_attestation"
+        ],
+        "goal_physical_spec_passed": classification[
+            "goal_physical_spec_passed"
+        ],
+        "goal_physical_spec_reasons": classification[
+            "goal_physical_spec_reasons"
+        ],
+        "actual_body_probe_temperature_gate_passed": classification[
+            "actual_body_probe_temperature_gate_passed"
+        ],
+        "failed_temperature_targets": classification[
+            "failed_temperature_targets"
+        ],
+        "actual_truth_feasible": classification[
+            "actual_truth_feasible"
+        ],
+        "promotion_exclusion_reasons": classification[
+            "promotion_exclusion_reasons"
+        ],
+    }
+
+
+def _validate_duplicate_cohort_observations(
+    authenticated: Sequence[
+        tuple[
+            Mapping[str, Any],
+            Mapping[str, Any],
+            Mapping[str, Any],
+            Mapping[str, Any],
+        ]
+    ],
+) -> None:
+    groups: dict[str, list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = {}
+    for _view, truth, classification, _entry in authenticated:
+        groups.setdefault(
+            truth["candidate_physics_sha256"], []
+        ).append((truth, classification))
+    for candidate, group in groups.items():
+        contracts = {
+            canonical_sha256(
+                _duplicate_observation_contract(truth, classification)
+            )
+            for truth, classification in group
+        }
+        if len(contracts) != 1:
+            raise HandoffContractError(
+                "duplicate cohort candidate has mixed actual truth: "
+                f"{candidate}"
+            )
 
 
 def _deduplicate_truth(
@@ -545,7 +1127,15 @@ def create_truth_promotion(
     standard_collection_paths: Sequence[Path],
     output: Path,
     predictor: Any | None = None,
+    cohort_inventory_path: Path | None = None,
 ) -> Path:
+    if cohort_inventory_path is not None:
+        return _create_truth_promotion_v2(
+            cohort_inventory_path=cohort_inventory_path,
+            standard_collection_paths=standard_collection_paths,
+            output=output,
+            predictor=predictor,
+        )
     validate_goal_stage_spec(GOAL_STAGE_SPEC)
     authenticated = _authenticate_inputs(
         standard_collection_paths, predictor=predictor
@@ -623,6 +1213,133 @@ def create_truth_promotion(
     return destination / path.name
 
 
+def _create_truth_promotion_v2(
+    *,
+    cohort_inventory_path: Path,
+    standard_collection_paths: Sequence[Path],
+    output: Path,
+    predictor: Any | None = None,
+) -> Path:
+    validate_goal_stage_spec(GOAL_STAGE_SPEC)
+    inventory, cohort_entries = _load_cohort_inventory(
+        cohort_inventory_path, predictor=predictor
+    )
+    authenticated = _authenticate_cohort_inputs(
+        cohort_entries=cohort_entries,
+        collection_paths=standard_collection_paths,
+        predictor=predictor,
+    )
+    _validate_duplicate_cohort_observations(authenticated)
+    feasible = [
+        (view, truth)
+        for view, truth, classification, _entry in authenticated
+        if classification["actual_truth_feasible"] is True
+    ]
+    deduplicated = _deduplicate_truth(feasible)
+    ranked = _rank_truth(deduplicated)
+    classifications = [
+        copy.deepcopy(classification)
+        for _view, _truth, classification, _entry in authenticated
+    ]
+    feasible_payloads = [
+        truth["collection_payload_sha256"]
+        for _view, truth, classification, _entry in authenticated
+        if classification["actual_truth_feasible"] is True
+    ]
+    infeasible_payloads = [
+        truth["collection_payload_sha256"]
+        for _view, truth, classification, _entry in authenticated
+        if classification["actual_truth_feasible"] is False
+    ]
+    destination = output.resolve()
+    if destination.exists():
+        raise HandoffContractError(
+            f"truth promotion output already exists: {destination}"
+        )
+    staging = destination.with_name(
+        f".{destination.name}.{os.getpid()}."
+        f"{next(tempfile._get_candidate_names())}.tmp"
+    )
+    staging.mkdir(parents=True)
+    try:
+        csv_path = _immutable_csv(
+            staging / "truth_validated_pareto_front.csv",
+            _truth_csv_frame(ranked),
+        )
+        manifest = production._seal(
+            {
+                "schema_version": TRUTH_MANIFEST_SCHEMA_V2,
+                "campaign_id": "mft-goal-20260726",
+                "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+                "hard_spec": copy.deepcopy(GOAL_STAGE_SPEC),
+                "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+                "temperature_contract_sha256": (
+                    GOAL_TEMPERATURE_CONTRACT_SHA256
+                ),
+                "cohort_inventory": _file_record(
+                    cohort_inventory_path
+                ),
+                "cohort_inventory_payload_sha256": inventory[
+                    "payload_sha256"
+                ],
+                "expected_collection_count": EXACT_COHORT_SIZE,
+                "authenticated_collection_count": len(authenticated),
+                "feasible_collection_count": len(feasible_payloads),
+                "infeasible_collection_count": len(infeasible_payloads),
+                "deduplicated_feasible_candidate_count": len(ranked),
+                "rank0_count": sum(
+                    row["truth_non_dominated_rank"] == 0
+                    for row in ranked
+                ),
+                "solver_revision": inventory["solver_revision"],
+                "library_revision": inventory["library_revision"],
+                "authenticated_collections": [
+                    copy.deepcopy(truth["collection"])
+                    for _view, truth, _classification, _entry
+                    in authenticated
+                ],
+                "authenticated_collection_payload_sha256": [
+                    truth["collection_payload_sha256"]
+                    for _view, truth, _classification, _entry
+                    in authenticated
+                ],
+                "classification_rows": classifications,
+                "feasible_collection_payload_sha256": feasible_payloads,
+                "infeasible_collection_payload_sha256": (
+                    infeasible_payloads
+                ),
+                "ranked_rows": ranked,
+                "truth_validated_pareto_front": {
+                    "path": csv_path.name,
+                    "sha256": production._sha256_file(csv_path),
+                    "size_bytes": csv_path.stat().st_size,
+                    "row_count": len(ranked),
+                    "columns": list(TRUTH_CSV_COLUMNS),
+                },
+                "sorting_authority": (
+                    "exact_24_cohort_all_reauthenticated_and_classified_"
+                    "then_all_feasible_actual_truth_rows_deduplicated_"
+                    "and_combined_nondominated_sort"
+                ),
+                "full_plan_eligible": bool(ranked),
+                "zero_feasible_audited": not ranked,
+                "full_plan_default_limit": MAX_FULL_PLANS,
+                "full_plan_hard_limit": MAX_FULL_PLANS,
+                "scheduler_submission_performed": False,
+                "full_submission_performed": False,
+                **_authority_flags(),
+            }
+        )
+        path = production._write_immutable_json(
+            staging / "truth_pareto_manifest.json", manifest
+        )
+        os.replace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return destination / path.name
+
+
 TRUTH_MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -651,7 +1368,45 @@ TRUTH_MANIFEST_FIELDS = frozenset(
 )
 
 
-def _load_truth_manifest(
+TRUTH_MANIFEST_V2_FIELDS = frozenset(
+    {
+        "schema_version",
+        "payload_sha256",
+        "campaign_id",
+        "goal_contract_schema",
+        "hard_spec",
+        "hard_spec_sha256",
+        "temperature_contract_sha256",
+        "cohort_inventory",
+        "cohort_inventory_payload_sha256",
+        "expected_collection_count",
+        "authenticated_collection_count",
+        "feasible_collection_count",
+        "infeasible_collection_count",
+        "deduplicated_feasible_candidate_count",
+        "rank0_count",
+        "solver_revision",
+        "library_revision",
+        "authenticated_collections",
+        "authenticated_collection_payload_sha256",
+        "classification_rows",
+        "feasible_collection_payload_sha256",
+        "infeasible_collection_payload_sha256",
+        "ranked_rows",
+        "truth_validated_pareto_front",
+        "sorting_authority",
+        "full_plan_eligible",
+        "zero_feasible_audited",
+        "full_plan_default_limit",
+        "full_plan_hard_limit",
+        "scheduler_submission_performed",
+        "full_submission_performed",
+        *_authority_flags(),
+    }
+)
+
+
+def _load_truth_manifest_v1(
     path: Path,
     *,
     predictor: Any | None = None,
@@ -759,6 +1514,231 @@ def _load_truth_manifest(
             "truth-validated Pareto CSV drifted"
         )
     return manifest, ranked, by_candidate
+
+
+def _load_truth_manifest_v2(
+    path: Path,
+    *,
+    predictor: Any | None = None,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    resolved = path.resolve(strict=True)
+    manifest = production._validate_seal(
+        production._read_json(resolved), TRUTH_MANIFEST_SCHEMA_V2
+    )
+    if (
+        set(manifest) != TRUTH_MANIFEST_V2_FIELDS
+        or manifest.get("campaign_id") != "mft-goal-20260726"
+        or manifest.get("goal_contract_schema") != GOAL_CONTRACT_SCHEMA
+        or manifest.get("hard_spec") != GOAL_STAGE_SPEC
+        or manifest.get("hard_spec_sha256") != GOAL_STAGE_SPEC_SHA256
+        or manifest.get("temperature_contract_sha256")
+        != GOAL_TEMPERATURE_CONTRACT_SHA256
+        or manifest.get("expected_collection_count")
+        != EXACT_COHORT_SIZE
+        or manifest.get("full_plan_default_limit") != MAX_FULL_PLANS
+        or manifest.get("full_plan_hard_limit") != MAX_FULL_PLANS
+        or manifest.get("scheduler_submission_performed") is not False
+        or manifest.get("full_submission_performed") is not False
+        or any(
+            manifest.get(name) is not value
+            for name, value in _authority_flags().items()
+        )
+    ):
+        raise HandoffContractError(
+            "truth Pareto v2 manifest contract drifted"
+        )
+    inventory_record = manifest.get("cohort_inventory")
+    if not isinstance(inventory_record, dict):
+        raise HandoffContractError(
+            "truth Pareto v2 cohort inventory record is absent"
+        )
+    inventory_path = Path(
+        str(inventory_record.get("path") or "")
+    )
+    if _file_record(inventory_path) != inventory_record:
+        raise HandoffContractError(
+            "truth Pareto v2 cohort inventory bytes drifted"
+        )
+    inventory, cohort_entries = _load_cohort_inventory(
+        inventory_path, predictor=predictor
+    )
+    records = manifest.get("authenticated_collections")
+    if (
+        not isinstance(records, list)
+        or len(records) != EXACT_COHORT_SIZE
+    ):
+        raise HandoffContractError(
+            "truth Pareto v2 collection inventory drifted"
+        )
+    collection_paths = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise HandoffContractError(
+                "truth Pareto v2 collection record is malformed"
+            )
+        source = Path(str(record.get("path") or ""))
+        if _file_record(source) != record:
+            raise HandoffContractError(
+                "truth Pareto v2 source collection bytes drifted"
+            )
+        collection_paths.append(source)
+    authenticated = _authenticate_cohort_inputs(
+        cohort_entries=cohort_entries,
+        collection_paths=collection_paths,
+        predictor=predictor,
+    )
+    _validate_duplicate_cohort_observations(authenticated)
+    classifications = [
+        copy.deepcopy(classification)
+        for _view, _truth, classification, _entry in authenticated
+    ]
+    for classification in classifications:
+        if (
+            set(classification) != COHORT_CLASSIFICATION_FIELDS
+            or classification.get("classification_sha256")
+            != canonical_sha256(
+                {
+                    name: value
+                    for name, value in classification.items()
+                    if name != "classification_sha256"
+                }
+            )
+        ):
+            raise HandoffContractError(
+                "truth Pareto v2 classification row drifted"
+            )
+    feasible = [
+        (view, truth)
+        for view, truth, classification, _entry in authenticated
+        if classification["actual_truth_feasible"] is True
+    ]
+    ranked = _rank_truth(_deduplicate_truth(feasible))
+    feasible_payloads = [
+        truth["collection_payload_sha256"]
+        for _view, truth, classification, _entry in authenticated
+        if classification["actual_truth_feasible"] is True
+    ]
+    infeasible_payloads = [
+        truth["collection_payload_sha256"]
+        for _view, truth, classification, _entry in authenticated
+        if classification["actual_truth_feasible"] is False
+    ]
+    by_collection_path = {
+        truth["collection"]["path"]: {
+            "view": view,
+            "truth": truth,
+        }
+        for view, truth, _classification, _entry in authenticated
+    }
+    by_candidate = {
+        row["candidate_physics_sha256"]: by_collection_path[
+            row["collection"]["path"]
+        ]
+        for row in ranked
+    }
+    artifact = manifest.get("truth_validated_pareto_front")
+    if (
+        manifest.get("cohort_inventory_payload_sha256")
+        != inventory["payload_sha256"]
+        or manifest.get("authenticated_collection_count")
+        != len(authenticated)
+        or manifest.get("feasible_collection_count")
+        != len(feasible_payloads)
+        or manifest.get("infeasible_collection_count")
+        != len(infeasible_payloads)
+        or manifest.get("deduplicated_feasible_candidate_count")
+        != len(ranked)
+        or manifest.get("rank0_count")
+        != sum(
+            row["truth_non_dominated_rank"] == 0 for row in ranked
+        )
+        or manifest.get("solver_revision")
+        != inventory["solver_revision"]
+        or manifest.get("library_revision")
+        != inventory["library_revision"]
+        or manifest.get("authenticated_collections")
+        != [
+            truth["collection"]
+            for _view, truth, _classification, _entry in authenticated
+        ]
+        or manifest.get("authenticated_collection_payload_sha256")
+        != [
+            truth["collection_payload_sha256"]
+            for _view, truth, _classification, _entry in authenticated
+        ]
+        or manifest.get("classification_rows") != classifications
+        or manifest.get("feasible_collection_payload_sha256")
+        != feasible_payloads
+        or manifest.get("infeasible_collection_payload_sha256")
+        != infeasible_payloads
+        or manifest.get("ranked_rows") != ranked
+        or manifest.get("full_plan_eligible") is not bool(ranked)
+        or manifest.get("zero_feasible_audited") is not (not ranked)
+        or manifest.get("sorting_authority")
+        != (
+            "exact_24_cohort_all_reauthenticated_and_classified_"
+            "then_all_feasible_actual_truth_rows_deduplicated_"
+            "and_combined_nondominated_sort"
+        )
+        or not isinstance(artifact, dict)
+        or set(artifact)
+        != {"path", "sha256", "size_bytes", "row_count", "columns"}
+    ):
+        raise HandoffContractError(
+            "truth Pareto v2 authority recomputation drifted"
+        )
+    csv_path = production._contained_file(
+        resolved.parent,
+        artifact.get("path"),
+        "truth-validated Pareto v2 CSV",
+    )
+    frame = pd.read_csv(csv_path)
+    if (
+        _file_record(csv_path)["sha256"] != artifact.get("sha256")
+        or csv_path.stat().st_size != artifact.get("size_bytes")
+        or artifact.get("row_count") != len(ranked)
+        or artifact.get("columns") != list(TRUTH_CSV_COLUMNS)
+        or list(frame.columns) != list(TRUTH_CSV_COLUMNS)
+        or frame["candidate_physics_sha256"].astype(str).tolist()
+        != [row["candidate_physics_sha256"] for row in ranked]
+        or frame["truth_row_sha256"].astype(str).tolist()
+        != [row["truth_row_sha256"] for row in ranked]
+        or frame["truth_non_dominated_rank"].astype(int).tolist()
+        != [row["truth_non_dominated_rank"] for row in ranked]
+    ):
+        raise HandoffContractError(
+            "truth-validated Pareto v2 CSV drifted"
+        )
+    return manifest, ranked, by_candidate
+
+
+def _load_truth_manifest(
+    path: Path,
+    *,
+    predictor: Any | None = None,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    resolved = path.resolve(strict=True)
+    value = production._read_json(resolved)
+    schema = value.get("schema_version")
+    if schema == TRUTH_MANIFEST_SCHEMA:
+        return _load_truth_manifest_v1(
+            resolved, predictor=predictor
+        )
+    if schema == TRUTH_MANIFEST_SCHEMA_V2:
+        return _load_truth_manifest_v2(
+            resolved, predictor=predictor
+        )
+    raise HandoffContractError(
+        "truth Pareto manifest schema is unsupported"
+    )
 
 
 def create_full_plans(
@@ -3461,14 +4441,28 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    cohort = commands.add_parser("create-cohort")
+    cohort.add_argument(
+        "--standard-submission",
+        type=Path,
+        action="append",
+        required=True,
+        help="repeat exactly 24 authenticated Standard submissions",
+    )
+    cohort.add_argument("--output", type=Path, required=True)
+
     promote = commands.add_parser("promote")
     promote.add_argument(
         "--standard-collection",
         type=Path,
         action="append",
         required=True,
-        help="repeat 1..12 authenticated diagnostic collections",
+        help=(
+            "repeat 1..12 collections for legacy v1, or exactly 24 "
+            "collections with --cohort-inventory for v2"
+        ),
     )
+    promote.add_argument("--cohort-inventory", type=Path)
     promote.add_argument("--output", type=Path, required=True)
 
     plan = commands.add_parser("plan-full")
@@ -3509,6 +4503,11 @@ def _parser() -> argparse.ArgumentParser:
     validate_truth = commands.add_parser("validate-truth")
     validate_truth.add_argument("--truth-manifest", type=Path, required=True)
 
+    validate_cohort = commands.add_parser("validate-cohort")
+    validate_cohort.add_argument(
+        "--cohort-inventory", type=Path, required=True
+    )
+
     validate_plan = commands.add_parser("validate-full-plan")
     validate_plan.add_argument("--plan", type=Path, required=True)
 
@@ -3531,10 +4530,16 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command == "promote":
+    if args.command == "create-cohort":
+        result: Any = create_cohort_inventory(
+            standard_submission_paths=args.standard_submission,
+            output=args.output,
+        )
+    elif args.command == "promote":
         result: Any = create_truth_promotion(
             standard_collection_paths=args.standard_collection,
             output=args.output,
+            cohort_inventory_path=args.cohort_inventory,
         )
     elif args.command == "plan-full":
         result = create_full_plans(
@@ -3569,6 +4574,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "validate-truth":
         result = _load_truth_manifest(args.truth_manifest)[0][
+            "payload_sha256"
+        ]
+    elif args.command == "validate-cohort":
+        result = _load_cohort_inventory(args.cohort_inventory)[0][
             "payload_sha256"
         ]
     elif args.command == "validate-full-plan":

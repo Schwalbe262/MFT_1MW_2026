@@ -4,25 +4,68 @@
 It does not change the diagnostic Standard CLI, and it does not treat a
 diagnostic collection as a production Standard handoff.
 
-The path accepts one to twelve sealed
-`mft-goal-diagnostic-standard-collection-v1` files. Every input is
-reauthenticated through
-`mft_goal_diagnostic_standard_probe.authenticate_collection()`. Dimensions,
-resonance, every active body/probe temperature, loss, solver/library
-provenance, and the fixed cooling/operating identity are recomputed from the
-actual diagnostic result. A surrogate prediction or relaxed surrogate
-constraint cannot authorize promotion.
+The deadline campaign uses the v2 exact-cohort path. It binds exactly 24
+sealed Standard submission receipts before promotion, then requires exactly
+one authenticated collection for every bound Scheduler task. Every
+collection, including a physically failing collection, is reauthenticated
+through `mft_goal_diagnostic_standard_probe.authenticate_collection()`.
+Dimensions, resonance, every active body/probe temperature, loss,
+solver/library provenance, and the fixed cooling/operating identity are
+recomputed from the actual diagnostic result. One missing, duplicate,
+unexpected, tampered, or mixed-provenance collection aborts the whole
+promotion.
 
-## 1. Build the combined actual-truth Pareto result
+Only the reauthenticated feasible observations enter the combined
+non-dominated sort. The v2 manifest still seals a 24-row classification
+ledger for both included and excluded observations. A surrogate prediction
+or relaxed surrogate constraint cannot authorize promotion.
+
+The legacy v1 path remains readable and accepts one to twelve passing
+collections without a cohort inventory. It cannot prove completeness for the
+24-task deadline cohort and must not be used for that result.
+
+## 1. Seal the exact 24-task cohort
+
+Create the inventory from the 24 immutable Standard submission receipts.
+This command performs no Scheduler request or mutation.
 
 ```powershell
-$Python = "C:\Users\peets\anaconda3\python.exe"
+$Python = "C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe"
+$Submissions = Get-ChildItem C:\evidence\standard-submissions\*.json |
+  Sort-Object FullName
 
-& $Python tools\mft_goal_truth_promotion.py promote `
-  --standard-collection C:\evidence\probe-01\collection.json `
-  --standard-collection C:\evidence\probe-02\collection.json `
-  --standard-collection C:\evidence\probe-03\collection.json `
-  --output C:\evidence\truth-promotion
+$Args = @("tools\mft_goal_truth_promotion.py", "create-cohort")
+foreach ($Submission in $Submissions) {
+  $Args += @("--standard-submission", $Submission.FullName)
+}
+$Args += @(
+  "--output",
+  "C:\evidence\standard-cohort-inventory.json"
+)
+& $Python @Args
+```
+
+`create-cohort` rejects any count other than 24, duplicate submission paths
+or task IDs, invalid plan/submission lineage, stale search authority, or any
+solver/library mixture.
+
+## 2. Build the combined actual-truth Pareto result
+
+```powershell
+$Collections = Get-ChildItem C:\evidence\standard-collections\*.json |
+  Sort-Object FullName
+
+$Args = @(
+  "tools\mft_goal_truth_promotion.py",
+  "promote",
+  "--cohort-inventory",
+  "C:\evidence\standard-cohort-inventory.json"
+)
+foreach ($Collection in $Collections) {
+  $Args += @("--standard-collection", $Collection.FullName)
+}
+$Args += @("--output", "C:\evidence\truth-promotion")
+& $Python @Args
 ```
 
 The output contains:
@@ -30,13 +73,19 @@ The output contains:
 - `truth_validated_pareto_front.csv`
 - `truth_pareto_manifest.json`
 
-Candidates are deterministically deduplicated by candidate physics identity.
+The v2 manifest seals the exact cohort inventory, all 24 source collection
+identities, pass/fail reasons and actual constraint evidence. Feasible
+candidates are deduplicated only when repeated actual observations agree.
+Mixed pass/fail or differing actual truth for the same candidate aborts.
 All remaining actual `(volume_L, total_loss_W)` observations are sorted
-together using non-dominated sorting. The manifest seals the complete ranked
-rows, source collection identities, CSV SHA-256, and no-surrogate authority
-flags.
+together using non-dominated sorting.
 
-## 2. Create rank-0 Full plans
+If all 24 observations fail, promotion still emits an auditable manifest and
+a header-only Pareto CSV with `rank0_count=0`,
+`full_plan_eligible=false`, and `zero_feasible_audited=true`. `plan-full`
+then fails closed without creating a plan or submitting work.
+
+## 3. Create rank-0 Full plans
 
 ```powershell
 & $Python tools\mft_goal_truth_promotion.py plan-full `
@@ -60,7 +109,7 @@ reviewed Full profile:
 
 Creating plans never submits a Scheduler task.
 
-## 3. Explicitly submit each Full plan
+## 4. Explicitly submit each Full plan
 
 Submission requires the reviewed Scheduler cutover receipt, a fresh live
 `/api/health` and `/api/licenses` admission result from the isolated Scheduler
@@ -80,7 +129,7 @@ rank, retained-artifact marker, or provenance check blocks Scheduler POST.
 The Scheduler repository/project remains separate from the 1MW MFT
 repository.
 
-## 4. GET-only Full collection
+## 5. GET-only Full collection
 
 After the task is terminal-success:
 
@@ -98,7 +147,7 @@ runtime license evidence, the Full AEDT receipt/results-tree manifest/marker,
 and reauthenticates the retained diagnostic symmetric evidence for the same
 candidate.
 
-## 5. Package both models and both result trees
+## 6. Package both models and both result trees
 
 Packaging is allowed only when both diagnostic actual truth and Full actual
 truth pass every hard constraint.
@@ -129,6 +178,9 @@ validation.
 ## Read-only validation commands
 
 ```powershell
+& $Python tools\mft_goal_truth_promotion.py validate-cohort `
+  --cohort-inventory C:\evidence\standard-cohort-inventory.json
+
 & $Python tools\mft_goal_truth_promotion.py validate-truth `
   --truth-manifest C:\evidence\truth-promotion\truth_pareto_manifest.json
 
