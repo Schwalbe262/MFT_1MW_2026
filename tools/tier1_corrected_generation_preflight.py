@@ -35,6 +35,8 @@ try:
         AuthenticatedCorrectedGeneration,
         CURRENT_REQUIRED_MODEL_TARGETS,
         CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
+        GOAL_REQUIRED_MODEL_TARGETS,
+        GOAL_REQUIRED_MODEL_TARGETS_SHA256,
         CURRENT_STAGE_HARD_CONTRACT,
         CURRENT_STAGE_HARD_CONTRACT_SHA256,
         CURRENT_TEMPERATURE_CONTRACT,
@@ -55,6 +57,8 @@ except ImportError:  # pragma: no cover - repository module import path
         AuthenticatedCorrectedGeneration,
         CURRENT_REQUIRED_MODEL_TARGETS,
         CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
+        GOAL_REQUIRED_MODEL_TARGETS,
+        GOAL_REQUIRED_MODEL_TARGETS_SHA256,
         CURRENT_STAGE_HARD_CONTRACT,
         CURRENT_STAGE_HARD_CONTRACT_SHA256,
         CURRENT_TEMPERATURE_CONTRACT,
@@ -71,13 +75,52 @@ except ImportError:  # pragma: no cover - repository module import path
         validate_adapter_manifest,
     )
 
+from module.mft_goal_20260726_contract import (
+    FIXED_COOLING_IDENTITY as GOAL_FIXED_COOLING_IDENTITY,
+    FIXED_COOLING_IDENTITY_SHA256 as GOAL_FIXED_COOLING_IDENTITY_SHA256,
+    FIXED_OPERATING_IDENTITY as GOAL_FIXED_OPERATING_IDENTITY,
+    FIXED_OPERATING_IDENTITY_SHA256 as GOAL_FIXED_OPERATING_IDENTITY_SHA256,
+    GOAL_CONTRACT_SCHEMA,
+    GOAL_CW1_MAX_MM,
+    GOAL_CW1_MIN_MM,
+    GOAL_CW1_STEP_MM,
+    GOAL_G0_MODEL_TARGETS,
+    GOAL_N_CORE_GROUP_MAX,
+    GOAL_N_CORE_GROUP_MIN,
+    GOAL_PRIMARY_TURN_STRATA,
+    GOAL_RESONANCE_MIN_HZ,
+    GOAL_SIZE_LIMITS_MM,
+    GOAL_STAGE_SPEC,
+    GOAL_STAGE_SPEC_SHA256,
+    GOAL_TERMINAL_TABLE_SCHEMA,
+    GOAL_TEMPERATURE_CONTRACT,
+    GOAL_TEMPERATURE_CONTRACT_SHA256,
+    GOAL_TEMPERATURE_TARGETS,
+    CORE_TEMPERATURE_TARGETS,
+    TEMPERATURE_TARGET_LIMITS_C,
+    WINDING_TEMPERATURE_TARGETS,
+    attest_fixed_identity,
+    canonical_sha256 as goal_canonical_sha256,
+    cw1_from_unit_coordinate,
+    cw1_unit_coordinate,
+    dynamic_core_group_bounds,
+    dynamic_core_group_violation,
+    is_goal_stage_spec,
+    temperature_limit_for_target,
+    validate_cw1_mm,
+    validate_goal_stage_spec,
+)
+
 
 RECEIPT_SCHEMA = "mft-tier1-corrected-generation-smoke-receipt-v2"
+GOAL_RECEIPT_SCHEMA = "mft-goal-20260726-g0-smoke-receipt-v1"
 RUNNER_SCHEMA = "mft-tier1-current7-corrected-runner-v2"
+GOAL_RUNNER_SCHEMA = "mft-goal-20260726-g0-runner-v1"
 PROBLEM_SCHEMA = "mft-tier1-current7-hard-problem-v2"
 OPTIMIZER_REPAIR_SCHEMA = "mft-tier1-current7-physics-repair-v1"
 PINNED_PROJECTION_SOURCE_REVISION = "7c832f7f78f92ee2d99b2d37e14c3131f07d9cae"
 SUPPORTED_FIXED_PRIMARY_TURNS = (5, 6)
+GOAL_SUPPORTED_PRIMARY_TURNS = GOAL_PRIMARY_TURN_STRATA
 FIXED_GENERATION_TERMINATION_STRATEGY = "fixed-n-gen-no-ftol-v1"
 PRODUCTION_FIXED_GENERATIONS = 300
 PRODUCTION_POPULATION = 320
@@ -117,6 +160,19 @@ ADDITIVE_HARD_CONSTRAINT_PREFIX_NAMES = (
     "minimum_physical_insulation",
     "core_group_manufacturability_limit",
 )
+GOAL_BASE_CONSTRAINT_NAMES = (
+    "Llt_robust_band",
+    *(f"temperature_robust_limit:{target}" for target in GOAL_TEMPERATURE_TARGETS),
+    "analytical_flux_density_limit",
+    "decoded_space_shrink",
+    "secondary_vertical_insulation",
+    "strict_full_density_support",
+    "Llt_ensemble_disagreement",
+)
+GOAL_ADDITIVE_HARD_CONSTRAINT_PREFIX_NAMES = (
+    "minimum_physical_insulation",
+    "core_group_dynamic_validity",
+)
 RESONANCE_MINIMUM_CONSTRAINT = "half_magnetizing_resonance_minimum"
 RESONANCE_MAXIMUM_CONSTRAINT = "half_magnetizing_resonance_maximum"
 SIZE_CONSTRAINT_NAMES = (
@@ -125,6 +181,10 @@ SIZE_CONSTRAINT_NAMES = (
     "exterior_height_limit",
 )
 SIDE_TEMPERATURE_TARGET = "Tprobe_Rx_side_leeward_max"
+GOAL_SIDE_TEMPERATURE_TARGETS = (
+    "T_max_Rx_side",
+    SIDE_TEMPERATURE_TARGET,
+)
 STRUCTURAL_DONOR_REQUIRED_GATES = (
     "decoder",
     "minimum_physical_insulation",
@@ -239,6 +299,8 @@ def validate_stage_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
     remain pinned to the authenticated current-seven problem.
     """
 
+    if is_goal_stage_spec(spec):
+        return validate_goal_stage_spec(spec)
     if not isinstance(spec, Mapping):
         raise RuntimeError("Tier-1 stage spec must be an object")
     supplied = dict(spec)
@@ -277,6 +339,13 @@ def validate_stage_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
 
 def stage_constraint_names(spec: Mapping[str, Any]) -> tuple[str, ...]:
     normalized = validate_stage_spec(spec)
+    if is_goal_stage_spec(normalized):
+        return (
+            GOAL_BASE_CONSTRAINT_NAMES
+            + GOAL_ADDITIVE_HARD_CONSTRAINT_PREFIX_NAMES
+            + (RESONANCE_MINIMUM_CONSTRAINT,)
+            + SIZE_CONSTRAINT_NAMES
+        )
     resonance = []
     if normalized["resonance_min_Hz"] is not None:
         resonance.append(RESONANCE_MINIMUM_CONSTRAINT)
@@ -307,6 +376,12 @@ def half_magnetizing_resonance_band_violations(
     """Return authoritative physical ``G <= 0`` values for a staged band."""
 
     normalized = validate_stage_spec(spec)
+    if is_goal_stage_spec(normalized):
+        return _resonance_band_violations(
+            frequency_hz,
+            normalized["resonance_min_Hz"],
+            None,
+        )
     return _resonance_band_violations(
         frequency_hz,
         normalized["resonance_min_Hz"],
@@ -333,6 +408,8 @@ def _resonance_band_violations(
 
 def stage_temperature_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
     normalized = validate_stage_spec(spec)
+    if is_goal_stage_spec(normalized):
+        return copy.deepcopy(GOAL_TEMPERATURE_CONTRACT)
     if math.isclose(
         normalized["T_limit_C"],
         CURRENT_STAGE_SPEC["T_limit_C"],
@@ -356,6 +433,52 @@ def stage_temperature_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
 
 def stage_hard_constraint_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
     normalized = validate_stage_spec(spec)
+    if is_goal_stage_spec(normalized):
+        return {
+            "schema_version": "mft-goal-20260726-hard-constraint-contract-v1",
+            "stage": "mft-goal-20260726",
+            "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+            "stage_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+            "temperature_contract": copy.deepcopy(
+                GOAL_TEMPERATURE_CONTRACT
+            ),
+            "temperature_contract_sha256": (
+                GOAL_TEMPERATURE_CONTRACT_SHA256
+            ),
+            "self_resonance": {
+                "operator": ">=",
+                "minimum_Hz": GOAL_RESONANCE_MIN_HZ,
+                "maximum_Hz": None,
+                "aggregation": "min(f_res_tx_self_Hz,f_res_rx_self_Hz)",
+                "magnetizing_inductance_factor": normalized[
+                    "magnetizing_inductance_factor"
+                ],
+            },
+            "size_limits_mm": copy.deepcopy(GOAL_SIZE_LIMITS_MM),
+            "cw1_search_mm": copy.deepcopy(normalized["cw1_search_mm"]),
+            "n_core_group_search": copy.deepcopy(
+                normalized["n_core_group_search"]
+            ),
+            "primary_turn_search": copy.deepcopy(
+                normalized["primary_turn_search"]
+            ),
+            "fixed_operating_identity": copy.deepcopy(
+                normalized["fixed_operating_identity"]
+            ),
+            "fixed_cooling_identity": copy.deepcopy(
+                normalized["fixed_cooling_identity"]
+            ),
+            "constraint_names": list(stage_constraint_names(normalized)),
+            "portability": {
+                "mode": "goal-g0-authenticated-bundle-v1",
+                "campaign_id": "mft-goal-20260726",
+                "legacy_current7_bundle_identity_reused": False,
+                "source_evidence_sha256_required": True,
+            },
+            "legacy_scalar_temperature_limit_allowed": False,
+            "legacy_fixed_cw1_allowed": False,
+            "legacy_core_group_ceiling_four_allowed": False,
+        }
     if normalized == validate_stage_spec(CURRENT_STAGE_SPEC):
         return copy.deepcopy(CURRENT_STAGE_HARD_CONTRACT)
     minimum = normalized["resonance_min_Hz"]
@@ -405,6 +528,7 @@ ADDITIVE_HARD_CONSTRAINT_NAMES = (
     + SIZE_CONSTRAINT_NAMES
 )
 CURRENT7_CONSTRAINT_NAMES = stage_constraint_names(CURRENT_STAGE_SPEC)
+GOAL_CONSTRAINT_NAMES = stage_constraint_names(GOAL_STAGE_SPEC)
 
 EXPECTED_SIMPLE_BASE_FIXED_STACK_MM = {
     "core_plate_t": 20.0,
@@ -578,8 +702,10 @@ def fixed_primary_turn_unit_coordinate(
     fixed = int(fixed_primary_turns)
     minimum = int(minimum_turns)
     maximum = int(maximum_turns)
-    if fixed not in (5, 6) or not minimum <= fixed <= maximum:
-        raise ValueError("corrected Tier-1 fixed primary turns must be 5 or 6")
+    if not minimum <= fixed <= maximum:
+        raise ValueError(
+            "corrected Tier-1 primary-turn stratum is outside decoder bounds"
+        )
     scale = maximum - minimum + 0.9999
     return float(np_clip((fixed - minimum + 0.5) / scale, 0.0, 1.0))
 
@@ -588,31 +714,33 @@ def np_clip(value: float, lower: float, upper: float) -> float:
     return min(max(float(value), float(lower)), float(upper))
 
 
-def decode_unit_sample_with_fixed_cw1(
+def decode_unit_sample_with_cw1(
     input_parameter_module: Any,
     sample: Mapping[str, Any],
     *,
-    fixed_cw1_mm: float,
+    selected_cw1_mm: float,
     allow_space_shrink: bool,
     space_min: float,
 ) -> dict[str, Any]:
-    """Use the current decoder with the exact old robust fixed-cw1 budget.
+    """Consume one selected physical cw1 inside the canonical winding budget.
 
-    The current decoder has no ``fixed_cw1_mm`` argument.  Its unfixed branch
+    The current decoder has no physical ``cw1_mm`` argument.  Its unfixed branch
     computes ``nwl1 = budget * f1_split`` and derives cw1 from that pack.  Set
-    the latent split to the exact fixed-cw1 primary pack before invoking it;
+    the latent split to the exact selected-cw1 primary pack before invoking it;
     every downstream secondary pack and realized clearance is then calculated
     by the current decoder from the same physical budget.  No decoded field is
-    overwritten afterwards.
+    overwritten afterwards.  The caller may choose a fixed value or the goal
+    campaign's 1.00..10.00 mm/0.01 mm decision grid; ``f1_split`` is never an
+    independent decision in either mode.
     """
 
-    fixed = _positive_number(fixed_cw1_mm, "fixed cw1")
+    selected = _positive_number(selected_cw1_mm, "selected cw1")
     maximum = _positive_number(
         input_parameter_module.PRIMARY_CONDUCTOR_MAX_THICKNESS_MM,
         "primary conductor maximum",
     )
-    if fixed > maximum:
-        raise RuntimeError("fixed cw1 exceeds the current conductor limit")
+    if selected > maximum:
+        raise RuntimeError("selected cw1 exceeds the current conductor limit")
     effective = dict(sample)
     space_names = (
         "cc_w2c_space_x",
@@ -648,7 +776,7 @@ def decode_unit_sample_with_fixed_cw1(
         raise RuntimeError("fixed-cw1 decoder has no finite winding budget")
     gap1 = round(float(effective["gap1"]), 1)
     primary_gap_count = max(n1_main - 1, 0) + max(n1_side - 1, 0)
-    primary_pack = n1 * fixed + primary_gap_count * gap1
+    primary_pack = n1 * selected + primary_gap_count * gap1
     effective["f1_split"] = primary_pack / budget
     decoded = input_parameter_module.decode_unit_sample(
         effective,
@@ -657,12 +785,31 @@ def decode_unit_sample_with_fixed_cw1(
     )
     if not math.isclose(
         _finite_number(decoded.get("cw1"), "decoded cw1"),
-        fixed,
+        selected,
         rel_tol=0.0,
         abs_tol=1e-12,
     ):
-        raise RuntimeError("fixed cw1 escaped the winding-budget decoder")
+        raise RuntimeError("selected cw1 escaped the winding-budget decoder")
     return decoded
+
+
+def decode_unit_sample_with_fixed_cw1(
+    input_parameter_module: Any,
+    sample: Mapping[str, Any],
+    *,
+    fixed_cw1_mm: float,
+    allow_space_shrink: bool,
+    space_min: float,
+) -> dict[str, Any]:
+    """Backward-compatible current7 fixed-cw1 entry point."""
+
+    return decode_unit_sample_with_cw1(
+        input_parameter_module,
+        sample,
+        selected_cw1_mm=fixed_cw1_mm,
+        allow_space_shrink=allow_space_shrink,
+        space_min=space_min,
+    )
 
 
 def winding_budget_identity(row: Any, *, expected_cw1_mm: float) -> dict[str, Any]:
@@ -739,11 +886,23 @@ def winding_budget_identity(row: Any, *, expected_cw1_mm: float) -> dict[str, An
     }
 
 
+def expected_problem_cw1_mm(problem: Any, row: Any) -> float:
+    """Return the exact cw1 authority for one decoded problem row."""
+
+    if getattr(problem, "goal_campaign", False):
+        return validate_cw1_mm(_row_value(row, "cw1"))
+    return _positive_number(
+        problem.spec["primary_conductor_thickness_mm"],
+        "fixed primary conductor thickness",
+    )
+
+
 def optimizer_repair_contract(
     *,
     fixed_primary_turns: int,
     coordinate_index: int,
     fixed_unit_coordinate: float,
+    goal_campaign: bool = False,
 ) -> dict[str, Any]:
     value = {
         "schema_version": OPTIMIZER_REPAIR_SCHEMA,
@@ -756,8 +915,25 @@ def optimizer_repair_contract(
         "coordinate_name": "u_N1",
         "coordinate_index": int(coordinate_index),
         "fixed_unit_coordinate": float(fixed_unit_coordinate),
-        "fixed_cw1_mm": 5.0,
-        "cw1_enforcement": "inside_decoder_winding_budget",
+        **(
+            {
+                "cw1_search_mm": {
+                    "minimum": GOAL_CW1_MIN_MM,
+                    "maximum": GOAL_CW1_MAX_MM,
+                    "step": GOAL_CW1_STEP_MM,
+                    "coordinate_name": "f1_split",
+                },
+                "f1_split_independent_search_allowed": False,
+                "cw1_enforcement": (
+                    "selected_grid_value_inside_decoder_winding_budget"
+                ),
+            }
+            if goal_campaign
+            else {
+                "fixed_cw1_mm": 5.0,
+                "cw1_enforcement": "inside_decoder_winding_budget",
+            }
+        ),
         "winding_budget_identity_required": True,
         "required_stages": [
             "initial_population",
@@ -780,9 +956,14 @@ def deep_topology_contract(
     fixed_primary_turns: int,
     *,
     enable_final1000_topology_niche: bool = False,
+    goal_campaign: bool = False,
 ) -> dict[str, Any]:
     """Load and self-authenticate the tracked deep-crossover contract."""
 
+    if goal_campaign:
+        if enable_final1000_topology_niche:
+            raise ValueError("goal campaign does not reuse the Final1000 niche")
+        return goal_topology_contract(fixed_primary_turns)
     try:
         from tier1_deep_crossover_contract import topology_evolution_contract
     except ImportError:  # pragma: no cover - repository module import path
@@ -801,6 +982,127 @@ def deep_topology_contract(
         or value.get("terminal_physical_replay_required") is not True
     ):
         raise RuntimeError("deep-crossover topology contract authentication failed")
+    return value
+
+
+def goal_topology_contract(fixed_primary_turns: int) -> dict[str, Any]:
+    """Return a campaign-local topology contract for every N1=5..8 stratum."""
+
+    turns = int(fixed_primary_turns)
+    if turns not in GOAL_SUPPORTED_PRIMARY_TURNS:
+        raise ValueError("goal topology requires an N1 stratum from 5 through 8")
+    total = 10 * turns
+    side_topologies = tuple(
+        sorted(
+            {
+                int(round(total * fraction))
+                for fraction in (0.56, 0.58, 0.60, 0.62, 0.64, 0.66)
+            }
+        )
+    )
+    topologies = (*side_topologies, total)
+    pairs = tuple(
+        (topologies[index], topologies[(index + 3) % len(topologies)])
+        for index in range(len(topologies))
+    )
+    minimum_survivors = 4
+    protected_slots = minimum_survivors * len(topologies)
+    donor_lanes = {
+        "goal_turn_split": {
+            "topologies_N2_main_N2_side": [
+                [topology, total - topology] for topology in topologies
+            ],
+            "selection_signal": "goal_campaign_geometry_and_thermal_diversity",
+        }
+    }
+    value = {
+        "schema_version": "mft-goal-20260726-turn-split-evolution-v1",
+        "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+        "goal_stage_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+        "fixed_primary_turns": turns,
+        "secondary_total_turns": total,
+        "requested_global_turn_split_N2_main": list(topologies),
+        "turn_split_sub_islands_N2_main": list(topologies),
+        "unavailable_requested_topologies_due_pinned_physics_repair": [],
+        "pinned_repair_N2_side_upper_fraction": 0.52,
+        "basin_donor_lanes": donor_lanes,
+        "basin_donor_lanes_are_coordinate_only": True,
+        "source_prediction_or_pass_classification_inherited": False,
+        "turn_split_parent_pair_schedule": [list(pair) for pair in pairs],
+        "cross_lane_parent_pairs": [list(pair) for pair in pairs],
+        "coordinate_name": "u_N2_side",
+        "coordinate_index": 2,
+        "initial_repaired_copies_per_sub_island": 4,
+        "paired_mating": "cross_distinct_turn_split_sub_islands_every_generation",
+        "migration": {
+            "kind": "copy_elite_genome_then_change_only_u_N2_side",
+            "period_generations": 5,
+            "first_evolution_generation_included": True,
+            "migrants_per_event": len(topologies),
+            "target_cycle": list(topologies),
+            "offspring_physics_repair_required": True,
+        },
+        "survival": {
+            "kind": (
+                "normalized_positive_G_sum_epsilon_then_"
+                "positive_count_max_sum_then_rank_crowding"
+            ),
+            "initial_epsilon": 20.0,
+            "decay_to_zero_generation": 160,
+            "terminal_epsilon": 0.0,
+            "epsilon_feasibility": (
+                "sum_normalized_positive_G_less_than_or_equal_to_epsilon"
+            ),
+            "infeasible_order": (
+                "positive_constraint_count_then_max_normalized_positive_G_"
+                "then_sum_normalized_positive_G"
+            ),
+            "physical_G_mutation": False,
+            "objective_mutation": False,
+            "minimum_survivors_per_turn_split_sub_island": minimum_survivors,
+        },
+        "bounded_diversity_budget": {
+            "population": PRODUCTION_POPULATION,
+            "protected_topology_count": len(topologies),
+            "minimum_survivors_each": minimum_survivors,
+            "protected_slots": protected_slots,
+            "protected_population_fraction": (
+                protected_slots / PRODUCTION_POPULATION
+            ),
+            "maximum_single_protected_topology_count": (
+                PRODUCTION_POPULATION
+                - minimum_survivors * (len(topologies) - 1)
+            ),
+            "maximum_single_protected_topology_fraction": (
+                (
+                    PRODUCTION_POPULATION
+                    - minimum_survivors * (len(topologies) - 1)
+                )
+                / PRODUCTION_POPULATION
+            ),
+            "additional_model_evaluations": 0,
+            "population_change": 0,
+            "generation_change": 0,
+            "scheduler_task_or_resource_change": False,
+        },
+        "minimum_evolution_generations": PRODUCTION_FIXED_GENERATIONS,
+        "ftol_early_stop_allowed": False,
+        "physical_constraint_G_mutation": False,
+        "physical_objective_mutation": False,
+        "model_or_training_data_provenance_mutation": False,
+        "capacitance_label_precision_remediation_included": False,
+        "terminal_physical_replay_required": True,
+        "warm_donor_prediction_inheritance_allowed": False,
+        "final1000_topology_niche_contract": None,
+        "topology_local_mating_required": False,
+        "topology_niche_mating_contract": None,
+        "authenticated_warm_fresh_mix_required": False,
+        "exact_survivor_quota_by_N2_main": None,
+        "exact_quota_required_when_population_is_320": False,
+        "generation_topology_count_seal_required": False,
+        "topology_niche_diversity_budget": None,
+    }
+    value["sha256"] = canonical_sha256(value)
     return value
 
 
@@ -1923,6 +2225,7 @@ def create_current7_problem_class(
             fixed_primary_turns: int | None = None,
         ) -> None:
             effective_spec = validate_stage_spec(spec or CURRENT_STAGE_SPEC)
+            goal_campaign = is_goal_stage_spec(effective_spec)
             constraint_names = stage_constraint_names(effective_spec)
             temperature_contract = stage_temperature_contract(effective_spec)
             hard_constraint_contract = stage_hard_constraint_contract(effective_spec)
@@ -1933,18 +2236,40 @@ def create_current7_problem_class(
                     raise ValueError(
                         f"Tier-1 corrected search requires variable cooling: {name}"
                     )
-            required_fixed = {
-                **FIXED_COOLING_PADS_MM,
-            }
+            required_fixed = (
+                {
+                    **GOAL_FIXED_OPERATING_IDENTITY,
+                    **{
+                        name: value
+                        for name, value in GOAL_FIXED_COOLING_IDENTITY.items()
+                        if name != "thermal_pad_conductivity_W_mK"
+                    },
+                }
+                if goal_campaign
+                else {**FIXED_COOLING_PADS_MM}
+            )
+
+            def fixed_value_matches(observed: Any, expected: Any) -> bool:
+                if isinstance(expected, str):
+                    return observed == expected
+                try:
+                    return bool(
+                        np.isclose(
+                            _finite_number(observed, "fixed control"),
+                            float(expected),
+                            rtol=0.0,
+                            atol=1e-12,
+                        )
+                    )
+                except RuntimeError:
+                    return False
+
             for name, expected in required_fixed.items():
-                if name in overrides and not np.isclose(
-                    _finite_number(overrides[name], name),
-                    expected,
-                    rtol=0.0,
-                    atol=1e-12,
+                if name in overrides and not fixed_value_matches(
+                    overrides[name], expected
                 ):
                     raise ValueError(
-                        f"Tier-1 corrected search fixes {name}={expected:g}"
+                        f"Tier-1 corrected search fixes {name}={expected!r}"
                     )
             overrides.update(required_fixed)
             super().__init__(
@@ -1953,16 +2278,24 @@ def create_current7_problem_class(
                 density_gate=density_gate,
                 fixed_overrides=overrides,
             )
-            if tuple(self.constraint_names) != BASE_CONSTRAINT_NAMES:
+            self.goal_campaign = goal_campaign
+            expected_base_constraint_names = (
+                GOAL_BASE_CONSTRAINT_NAMES
+                if goal_campaign
+                else BASE_CONSTRAINT_NAMES
+            )
+            if tuple(self.constraint_names) != expected_base_constraint_names:
                 raise RuntimeError("current7 base constraint schema drifted")
-            if int(self.n_ieq_constr) != len(BASE_CONSTRAINT_NAMES):
+            if int(self.n_ieq_constr) != len(expected_base_constraint_names):
                 raise RuntimeError("current7 base constraint width drifted")
             for name, expected in effective_spec.items():
-                if expected is None:
+                if goal_campaign:
+                    if self.spec.get(name) != expected:
+                        raise RuntimeError(f"goal stage spec escaped: {name}")
+                elif expected is None:
                     if self.spec.get(name) is not None:
                         raise RuntimeError(f"Tier-1 stage spec escaped: {name}")
-                    continue
-                if not math.isclose(
+                elif not math.isclose(
                     _finite_number(self.spec.get(name), name),
                     float(expected),
                     rel_tol=0.0,
@@ -1995,16 +2328,20 @@ def create_current7_problem_class(
                 ):
                     raise RuntimeError(f"cooling unit bounds remained clamped: {name}")
             for name, expected in required_fixed.items():
-                if not np.isclose(
-                    _finite_number(self.fixed_overrides.get(name), name),
-                    expected,
-                    rtol=0.0,
-                    atol=1e-12,
+                if not fixed_value_matches(
+                    self.fixed_overrides.get(name), expected
                 ):
                     raise RuntimeError(f"fixed manufacturing control escaped: {name}")
 
-            if fixed_primary_turns not in (5, 6):
-                raise ValueError("fixed_primary_turns must be exactly 5 or 6")
+            allowed_turns = (
+                GOAL_SUPPORTED_PRIMARY_TURNS
+                if goal_campaign
+                else SUPPORTED_FIXED_PRIMARY_TURNS
+            )
+            if fixed_primary_turns not in allowed_turns:
+                raise ValueError(
+                    "fixed_primary_turns is outside the campaign strata"
+                )
             self.fixed_primary_turns = int(fixed_primary_turns)
             self.fixed_primary_turn_coordinate_index = sobol_index["u_N1"]
             self.fixed_primary_turn_unit_coordinate = (
@@ -2024,9 +2361,11 @@ def create_current7_problem_class(
                 fixed_primary_turns=self.fixed_primary_turns,
                 coordinate_index=self.fixed_primary_turn_coordinate_index,
                 fixed_unit_coordinate=self.fixed_primary_turn_unit_coordinate,
+                goal_campaign=goal_campaign,
             )
+            self.cw1_coordinate_index = sobol_index["f1_split"]
 
-            self.base_constraint_names = BASE_CONSTRAINT_NAMES
+            self.base_constraint_names = expected_base_constraint_names
             self.stage_spec = effective_spec
             self.stage_spec_sha256 = canonical_sha256(effective_spec)
             self.temperature_contract = temperature_contract
@@ -2063,6 +2402,18 @@ def create_current7_problem_class(
             scale = maximum - minimum + 0.9999
             return float(np.clip((target - minimum + 0.5) / scale, 0.0, 1.0))
 
+        def _size_limit_mm(self, axis: str) -> float:
+            if self.goal_campaign:
+                return float(self.spec["size_limits_mm"][axis])
+            return float(self.spec[f"size_{axis}_max_mm"])
+
+        def _selected_cw1_mm(self, coordinate: Any) -> float:
+            if not self.goal_campaign:
+                return float(self.spec["primary_conductor_thickness_mm"])
+            return cw1_from_unit_coordinate(
+                coordinate[self.cw1_coordinate_index]
+            )
+
         def _project_row(self, raw: Any) -> Any:
             """Port the pinned 7c hard-physics coordinate projection."""
 
@@ -2080,6 +2431,11 @@ def create_current7_problem_class(
             row[self.fixed_primary_turn_coordinate_index] = (
                 self.fixed_primary_turn_unit_coordinate
             )
+            selected_cw1 = self._selected_cw1_mm(row)
+            if self.goal_campaign:
+                row[self.cw1_coordinate_index] = cw1_unit_coordinate(
+                    selected_cw1
+                )
             n2 = n1 * 10
             side_selector = float(row[sobol_index["u_N2_side"]])
             if side_selector < 0.10:
@@ -2096,11 +2452,13 @@ def create_current7_problem_class(
             row[sobol_index["u_N2_side"]] = min(1.0, (n2_side + 0.1) / (0.8 * n2))
 
             length_limit = min(
-                float(self.spec["size_L_max_mm"]),
+                self._size_limit_mm(
+                    "W" if self.goal_campaign else "L"
+                ),
                 float(normalized_dims[sobol_index["total_length"]][2]),
             )
             height_limit = min(
-                float(self.spec["size_H_max_mm"]),
+                self._size_limit_mm("H"),
                 float(normalized_dims[sobol_index["total_height"]][2]),
             )
             put("total_height", np.clip(get("total_height"), 500.0, height_limit))
@@ -2136,7 +2494,14 @@ def create_current7_problem_class(
             core_stack = plate_t + 2.0 * FIXED_COOLING_PADS_MM["core_plate_pad_t"]
             d_min = float(defaults["core_depth_min"])
             d_max = float(defaults["core_depth_max"])
-            maximum_groups = int(self.spec["n_core_group_max"])
+            minimum_groups = (
+                GOAL_N_CORE_GROUP_MIN if self.goal_campaign else 1
+            )
+            maximum_groups = (
+                GOAL_N_CORE_GROUP_MAX
+                if self.goal_campaign
+                else int(self.spec["n_core_group_max"])
+            )
             floors = np.asarray([40.0, 40.0, 40.5, 40.0])
             l1_box_ceiling = (length_limit - 2.0 * float(floors.sum()) / 0.45) / 4.0
             l1_ceiling = min(100.0, l1_box_ceiling)
@@ -2172,7 +2537,7 @@ def create_current7_problem_class(
             selector = float(row[sobol_index["u_ngroup"]])
             current_rounded_w1 = round(get("w1"))
             current_n_min = max(
-                1,
+                minimum_groups,
                 int(np.ceil((current_rounded_w1 - core_stack) / (d_max + core_stack))),
             )
             current_n_max = max(
@@ -2182,14 +2547,16 @@ def create_current7_problem_class(
             desired_group = current_n_min + int(
                 selector * (current_n_max - current_n_min + 0.9999)
             )
-            desired_group = int(np.clip(desired_group, 1, maximum_groups))
+            desired_group = int(
+                np.clip(desired_group, minimum_groups, maximum_groups)
+            )
             minimum_group_for_b = int(
                 np.ceil(required_area_mm2 / (2.0 * max(l1, 1.0) * d_max))
             )
             target_group = int(
                 np.clip(
                     max(desired_group, minimum_group_for_b),
-                    1,
+                    minimum_groups,
                     maximum_groups,
                 )
             )
@@ -2236,7 +2603,7 @@ def create_current7_problem_class(
                 gap1 = np.clip(round(get("gap1"), 1), 0.3, 5.0)
                 gap2 = np.clip(round(get("gap2"), 3), 0.3, 2.0)
                 primary_pack = (
-                    n1 * self.spec["primary_conductor_thickness_mm"]
+                    n1 * selected_cw1
                     + max(n1 - 1, 0) * gap1
                 )
                 secondary_gaps = max(n2 - n2_side - 1, 0) + max(n2_side - 1, 0)
@@ -2313,7 +2680,7 @@ def create_current7_problem_class(
                 )
                 tx_y_gap_sum = 2.0 * slot + max(n1 - 3, 0) * gap1
                 primary_y_pack = (
-                    n1 * self.spec["primary_conductor_thickness_mm"] + tx_y_gap_sum
+                    n1 * selected_cw1 + tx_y_gap_sum
                 )
                 center_y_allowance = 2.0 * (
                     get("cc_w2c_space_y")
@@ -2324,7 +2691,9 @@ def create_current7_problem_class(
                 side_y_allowance = (
                     2.0 * (get("cs_w1s_space_y") + side_pack) if n2_side else 0.0
                 )
-                maximum_core_width = float(self.spec["size_W_max_mm"]) - max(
+                maximum_core_width = self._size_limit_mm(
+                    "L" if self.goal_campaign else "W"
+                ) - max(
                     center_y_allowance, side_y_allowance
                 )
                 put("w1", min(get("w1"), np.floor(maximum_core_width)))
@@ -2340,14 +2709,20 @@ def create_current7_problem_class(
             project_budget()
             rounded_w1 = round(get("w1"))
             n_min = max(
-                1,
+                minimum_groups,
                 int(np.ceil((rounded_w1 - core_stack) / (d_max + core_stack))),
             )
             n_max = max(
                 n_min,
                 int(np.floor((rounded_w1 - core_stack) / (d_min + core_stack))),
             )
-            target_group = int(np.clip(target_group, n_min, n_max))
+            target_group = int(
+                np.clip(
+                    target_group,
+                    n_min,
+                    min(n_max, maximum_groups),
+                )
+            )
             row[sobol_index["u_ngroup"]] = np.clip(
                 (target_group - n_min + 0.5) / (n_max - n_min + 0.9999),
                 0.0,
@@ -2401,13 +2776,17 @@ def create_current7_problem_class(
             rows = []
             shrink = np.zeros(len(coordinates), dtype=float)
             valid = np.ones(len(coordinates), dtype=bool)
+            selected_cw1_values = np.asarray(
+                [self._selected_cw1_mm(row) for row in coordinates],
+                dtype=float,
+            )
             for index, coordinate in enumerate(coordinates):
                 try:
                     sample = input_parameter_module.unit_to_dims(coordinate)
-                    decoded = decode_unit_sample_with_fixed_cw1(
+                    decoded = decode_unit_sample_with_cw1(
                         input_parameter_module,
                         sample,
-                        fixed_cw1_mm=self.spec["primary_conductor_thickness_mm"],
+                        selected_cw1_mm=selected_cw1_values[index],
                         allow_space_shrink=False,
                         space_min=self.spec["insulation_min_mm"],
                     )
@@ -2435,7 +2814,7 @@ def create_current7_problem_class(
             for index in np.flatnonzero(valid):
                 row = _frame_row(frame, int(index))
                 for name, expected in {
-                    "cw1": self.spec["primary_conductor_thickness_mm"],
+                    "cw1": selected_cw1_values[index],
                     **FIXED_COOLING_PADS_MM,
                 }.items():
                     if not np.isclose(
@@ -2449,7 +2828,7 @@ def create_current7_problem_class(
                     _finite_number(_row_value(row, name), name)
                 budget = winding_budget_identity(
                     row,
-                    expected_cw1_mm=self.spec["primary_conductor_thickness_mm"],
+                    expected_cw1_mm=selected_cw1_values[index],
                 )
                 if budget.get("passed") is not True:
                     raise RuntimeError(
@@ -2461,6 +2840,15 @@ def create_current7_problem_class(
                 ) + int(_finite_number(_row_value(row, "N1_side"), "N1_side"))
                 if observed_n1 != self.fixed_primary_turns:
                     raise RuntimeError("decoded primary turns escaped fixed stratum")
+                if self.goal_campaign:
+                    validate_cw1_mm(_row_value(row, "cw1"))
+                    identity_values = _jsonable_decoded_parameters(row)
+                    identity_values["thermal_pad_conductivity_W_mK"] = (
+                        GOAL_FIXED_COOLING_IDENTITY[
+                            "thermal_pad_conductivity_W_mK"
+                        ]
+                    )
+                    attest_fixed_identity(identity_values)
             self._last_decode = (frame, np.asarray(shrink, dtype=float), valid)
             return frame, shrink, valid
 
@@ -2488,18 +2876,23 @@ def create_current7_problem_class(
                     continue
                 row = frame.iloc[index]
                 try:
-                    groups[index] = _finite_number(
-                        row["n_core_group"], "n_core_group"
-                    ) <= float(self.spec["n_core_group_max"])
+                    if self.goal_campaign:
+                        groups[index] = (
+                            dynamic_core_group_violation(row) <= 0.0
+                        )
+                    else:
+                        groups[index] = _finite_number(
+                            row["n_core_group"], "n_core_group"
+                        ) <= float(self.spec["n_core_group_max"])
                     _volume, dimensions = bounding_box_lit(row)
                     boxes[index] = all(
                         _finite_number(observed, "box dimension") <= limit
                         for observed, limit in zip(
                             dimensions,
                             (
-                                self.spec["size_W_max_mm"],
-                                self.spec["size_L_max_mm"],
-                                self.spec["size_H_max_mm"],
+                                self._size_limit_mm("W"),
+                                self._size_limit_mm("L"),
+                                self._size_limit_mm("H"),
                             ),
                         )
                     )
@@ -2513,7 +2906,7 @@ def create_current7_problem_class(
                     ) <= float(self.spec["B_limit_T"])
                     budget = winding_budget_identity(
                         row,
-                        expected_cw1_mm=self.spec["primary_conductor_thickness_mm"],
+                        expected_cw1_mm=_finite_number(row["cw1"], "cw1"),
                     )
                     budget_evidence[index] = budget
                     budgets[index] = budget.get("passed") is True
@@ -2714,7 +3107,7 @@ def create_current7_problem_class(
                     raise RuntimeError("current7 objective shape mismatch")
                 if constraints.shape != expected_shape:
                     raise RuntimeError("current7 constraint shape mismatch")
-                additive = constraints[:, len(BASE_CONSTRAINT_NAMES) :]
+                additive = constraints[:, len(self.base_constraint_names) :]
                 if not np.all(additive == BIG):
                     raise RuntimeError(
                         "current7 base wrote into additive hard constraints"
@@ -2727,19 +3120,31 @@ def create_current7_problem_class(
                         if hasattr(frame, "iloc")
                         else [frame[int(index)] for index in indices]
                     )
-                    side_index = self.constraint_index[
-                        f"temperature_robust_limit:{SIDE_TEMPERATURE_TARGET}"
-                    ]
-                    constraints[indices, side_index] = (
-                        apply_current7_side_temperature_condition(
-                            constraints[indices, side_index], sub, invalid_value=BIG
-                        )
+                    side_targets = (
+                        GOAL_SIDE_TEMPERATURE_TARGETS
+                        if self.goal_campaign
+                        else (SIDE_TEMPERATURE_TARGET,)
                     )
+                    for side_target in side_targets:
+                        side_index = self.constraint_index[
+                            f"temperature_robust_limit:{side_target}"
+                        ]
+                        constraints[indices, side_index] = (
+                            apply_current7_side_temperature_condition(
+                                constraints[indices, side_index],
+                                sub,
+                                invalid_value=BIG,
+                            )
+                        )
                     insulation_index = self.constraint_index[
                         "minimum_physical_insulation"
                     ]
                     group_index = self.constraint_index[
-                        "core_group_manufacturability_limit"
+                        (
+                            "core_group_dynamic_validity"
+                            if self.goal_campaign
+                            else "core_group_manufacturability_limit"
+                        )
                     ]
                     constraints[indices, insulation_index] = (
                         minimum_physical_insulation_violation(
@@ -2752,14 +3157,18 @@ def create_current7_problem_class(
                     for local_index, global_index in enumerate(indices):
                         row = _frame_row(sub, local_index)
                         try:
-                            group_count = _finite_number(
-                                _row_value(row, "n_core_group"),
-                                "n_core_group",
-                            )
                             constraints[global_index, group_index] = (
-                                group_count - float(self.spec["n_core_group_max"])
+                                dynamic_core_group_violation(row)
+                                if self.goal_campaign
+                                else (
+                                    _finite_number(
+                                        _row_value(row, "n_core_group"),
+                                        "n_core_group",
+                                    )
+                                    - float(self.spec["n_core_group_max"])
+                                )
                             )
-                        except RuntimeError:
+                        except (RuntimeError, ValueError):
                             constraints[global_index, group_index] = BIG
 
                     mean_llt, _ = self._predict("Llt_phys", sub)
@@ -2785,7 +3194,11 @@ def create_current7_problem_class(
                             resonance_g = _resonance_band_violations(
                                 minimum,
                                 self.stage_spec["resonance_min_Hz"],
-                                self.stage_spec["resonance_max_Hz"],
+                                (
+                                    None
+                                    if self.goal_campaign
+                                    else self.stage_spec["resonance_max_Hz"]
+                                ),
                             )
                             for resonance_name, violation in resonance_g.items():
                                 constraints[
@@ -2817,9 +3230,9 @@ def create_current7_problem_class(
                             if len(dimensions) != 3:
                                 raise RuntimeError("exterior dimension count mismatch")
                             limits = (
-                                self.spec["size_W_max_mm"],
-                                self.spec["size_L_max_mm"],
-                                self.spec["size_H_max_mm"],
+                                self._size_limit_mm("W"),
+                                self._size_limit_mm("L"),
+                                self._size_limit_mm("H"),
                             )
                             for name, observed, limit in zip(
                                 SIZE_CONSTRAINT_NAMES, dimensions, limits
@@ -3276,9 +3689,13 @@ class Current7Tier1Runner:
     ) -> dict[str, Any]:
         if self.prepared_repair_operator is not None:
             raise RuntimeError("offspring repair operator was already installed")
+        default_topology = (
+            goal_topology_contract(self.problem.fixed_primary_turns)
+            if getattr(self.problem, "goal_campaign", False)
+            else deep_topology_contract(self.problem.fixed_primary_turns)
+        )
         topology = dict(
-            topology_contract
-            or deep_topology_contract(self.problem.fixed_primary_turns)
+            topology_contract or default_topology
         )
         sealed_topology = {
             key: item for key, item in topology.items() if key != "sha256"
@@ -3469,7 +3886,11 @@ class Current7Tier1Runner:
                 raise RuntimeError(
                     "authenticated basin role has no structural coordinate donor"
                 )
-            topology_contract = deep_topology_contract(self.problem.fixed_primary_turns)
+            topology_contract = (
+                goal_topology_contract(self.problem.fixed_primary_turns)
+                if getattr(self.problem, "goal_campaign", False)
+                else deep_topology_contract(self.problem.fixed_primary_turns)
+            )
             observed = _turn_split_main_values(
                 structural_donors,
                 fixed_primary_turns=self.problem.fixed_primary_turns,
@@ -3588,11 +4009,10 @@ class Current7Tier1Runner:
                 repaired, physical=False
             )
             replay = self.evaluate_coordinates(repaired, physical=True)
-            terminal_predictions = None
-            if tuple(self.models) == CURRENT_REQUIRED_MODEL_TARGETS:
-                terminal_predictions = _terminal_model_predictions(
-                    self.models, replay["frame"]
-                )
+            _required_target_contract(self.models)
+            terminal_predictions = _terminal_model_predictions(
+                self.models, replay["frame"]
+            )
         finally:
             if managed_binding:
                 restored_binding = bind_surrogate_inference(
@@ -3736,7 +4156,9 @@ class Current7Tier1Runner:
             budget_passed.append(
                 winding_budget_identity(
                     replay["frame"].iloc[index],
-                    expected_cw1_mm=self.problem.spec["primary_conductor_thickness_mm"],
+                    expected_cw1_mm=expected_problem_cw1_mm(
+                        self.problem, replay["frame"].iloc[index]
+                    ),
                 ).get("passed")
                 is True
             )
@@ -3873,7 +4295,11 @@ class Current7Tier1Runner:
                 enable_final1000_topology_niche=True,
             )
             if niche_active
-            else deep_topology_contract(self.problem.fixed_primary_turns)
+            else (
+                goal_topology_contract(self.problem.fixed_primary_turns)
+                if getattr(self.problem, "goal_campaign", False)
+                else deep_topology_contract(self.problem.fixed_primary_turns)
+            )
         )
         if self.prepared_topology_contract is not None:
             prepared_niche = self.prepared_topology_contract.get(
@@ -3883,8 +4309,7 @@ class Current7Tier1Runner:
                 raise RuntimeError(
                     "Final1000 topology niche was not activated before optimization"
                 )
-            if niche_active:
-                topology_contract = dict(self.prepared_topology_contract)
+            topology_contract = dict(self.prepared_topology_contract)
         coordinate_index = int(topology_contract["coordinate_index"])
         if (
             self.problem.sobol_dimension_names[coordinate_index]
@@ -4459,12 +4884,12 @@ def attest_semlock_free_repeated_predict(
         except ImportError:  # compact unit/smoke environments
             parallel_backends_module = importlib.import_module("multiprocessing.pool")
 
+    required_targets = _required_target_contract(models)
     if (
         isinstance(repeats, bool)
         or not isinstance(repeats, int)
         or repeats < 2
         or len(frame) < 1
-        or tuple(models) != CURRENT_REQUIRED_MODEL_TARGETS
     ):
         raise RuntimeError("repeated-predict SemLock stress input is invalid")
     forest_count = 0
@@ -4485,7 +4910,7 @@ def attest_semlock_free_repeated_predict(
                 raise RuntimeError(
                     f"sklearn forest is not semaphore-free before stress: {target}"
                 )
-    if forest_count < len(CURRENT_REQUIRED_MODEL_TARGETS):
+    if forest_count < len(required_targets):
         raise RuntimeError("repeated-predict stress did not cover every target forest")
 
     attempts = {"joblib_thread_pool": 0, "multiprocessing_semlock": 0}
@@ -4509,7 +4934,7 @@ def attest_semlock_free_repeated_predict(
         mock.patch.object(_multiprocessing, "SemLock", side_effect=forbidden_semlock),
     ):
         for _repeat in range(repeats):
-            for target in CURRENT_REQUIRED_MODEL_TARGETS:
+            for target in required_targets:
                 mean, half_width = models[target].predict_mu_sigma(
                     sample, conformal=True
                 )
@@ -4535,7 +4960,7 @@ def attest_semlock_free_repeated_predict(
                 )
     if attempts != {"joblib_thread_pool": 0, "multiprocessing_semlock": 0}:
         raise RuntimeError("parallel primitive was constructed during stress")
-    per_repeat = len(CURRENT_REQUIRED_MODEL_TARGETS)
+    per_repeat = len(required_targets)
     first = output_hashes[:per_repeat]
     if any(
         output_hashes[offset : offset + per_repeat] != first
@@ -4547,7 +4972,7 @@ def attest_semlock_free_repeated_predict(
         "status": "passed",
         "repeats": repeats,
         "sample_rows": 1,
-        "target_count": len(CURRENT_REQUIRED_MODEL_TARGETS),
+        "target_count": len(required_targets),
         "predict_call_count": repeats * len(CURRENT_REQUIRED_MODEL_TARGETS),
         "covered_sklearn_forest_count": forest_count,
         "joblib_thread_pool_construction_attempt_count": 0,
@@ -4619,15 +5044,48 @@ def build_authenticated_runner(
     if not 1 <= inference_threads <= 8:
         raise ValueError("inference_threads must be from 1 through 8")
 
+    normalized_stage_spec = validate_stage_spec(stage_spec or CURRENT_STAGE_SPEC)
+    goal_campaign = is_goal_stage_spec(normalized_stage_spec)
+    expected_required_targets = (
+        GOAL_REQUIRED_MODEL_TARGETS
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS
+    )
     authenticated = authenticate_corrected_generation(
         generation=generation,
         candidate_path=candidate_path,
         quality_path=quality_path,
+        goal_campaign=goal_campaign,
     )
     code_identity = authenticate_code_root(code_root, expected_code_revision)
     modules = load_current7_modules(Path(code_identity["path"]))
-    manifest = adapter_manifest(authenticated, code_identity=code_identity)
-    validate_adapter_manifest(manifest)
+    if goal_campaign:
+        manifest = {
+            **authenticated.evidence,
+            "code": dict(code_identity),
+            "temperature_contract": copy.deepcopy(GOAL_TEMPERATURE_CONTRACT),
+            "temperature_contract_sha256": GOAL_TEMPERATURE_CONTRACT_SHA256,
+            "hard_constraint_contract": stage_hard_constraint_contract(
+                normalized_stage_spec
+            ),
+            "hard_constraint_contract_sha256": canonical_sha256(
+                stage_hard_constraint_contract(normalized_stage_spec)
+            ),
+            "stage_spec": copy.deepcopy(normalized_stage_spec),
+            "stage_spec_sha256": canonical_sha256(normalized_stage_spec),
+            "model_loading": {
+                "process_scope": "single_local_process",
+                "cache_policy": "one_generation_authentication_and_unpickle_pass",
+                "generation_copy_performed": False,
+                "legacy_feedback_wrapper_used": False,
+            },
+            "scheduler_write_performed": False,
+            "slurm_submission_performed": False,
+            "canonical_pointer_write_performed": False,
+        }
+    else:
+        manifest = adapter_manifest(authenticated, code_identity=code_identity)
+        validate_adapter_manifest(manifest)
 
     cache = process_model_cache(
         authenticated,
@@ -4635,13 +5093,13 @@ def build_authenticated_runner(
         predictor_class=modules.predictor.EnsemblePredictor,
     )
     models = cache.load()
-    if tuple(models) != CURRENT_REQUIRED_MODEL_TARGETS or not cache.loaded_once:
+    if tuple(models) != expected_required_targets or not cache.loaded_once:
         raise RuntimeError("corrected current7 models were not cached exactly once")
     inference_binding = bind_surrogate_inference(
         models, modules.run_nsga2, threads=inference_threads
     )
     if (
-        inference_binding.get("target_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
+        inference_binding.get("target_count") != len(expected_required_targets)
         or inference_binding.get("threads_per_model") != inference_threads
     ):
         raise RuntimeError("corrected current7 inference binding mismatch")
@@ -4660,7 +5118,7 @@ def build_authenticated_runner(
     )
     problem = problem_class(
         models,
-        spec=stage_spec,
+        spec=normalized_stage_spec,
         density_gate=density_gate,
         fixed_primary_turns=fixed_primary_turns,
     )
@@ -4690,8 +5148,13 @@ def runner_for_fixed_primary_turns(
 ) -> Current7Tier1Runner:
     """Reuse one authenticated model cache for the other fixed-N1 stratum."""
 
-    if fixed_primary_turns not in SUPPORTED_FIXED_PRIMARY_TURNS:
-        raise ValueError("fixed_primary_turns must be exactly 5 or 6")
+    allowed_turns = (
+        GOAL_SUPPORTED_PRIMARY_TURNS
+        if getattr(runner.problem, "goal_campaign", False)
+        else SUPPORTED_FIXED_PRIMARY_TURNS
+    )
+    if fixed_primary_turns not in allowed_turns:
+        raise ValueError("fixed_primary_turns is outside the campaign strata")
     problem = type(runner.problem)(
         runner.models,
         spec=runner.problem.stage_spec,
@@ -5244,16 +5707,26 @@ def load_smoke_coordinate(
     }
 
 
+def _required_target_contract(models_or_predictions: Mapping[str, Any]) -> tuple[str, ...]:
+    observed = tuple(models_or_predictions)
+    for allowed in (
+        CURRENT_REQUIRED_MODEL_TARGETS,
+        GOAL_REQUIRED_MODEL_TARGETS,
+    ):
+        if observed == allowed:
+            return allowed
+    raise RuntimeError("model target order/set mismatch")
+
+
 def _smoke_every_model(
     models: Mapping[str, Any],
     frame: Any,
 ) -> dict[str, Any]:
     import numpy as np
 
-    if tuple(models) != CURRENT_REQUIRED_MODEL_TARGETS:
-        raise RuntimeError("smoke model target order/set mismatch")
+    required_targets = _required_target_contract(models)
     evidence = {}
-    for target in CURRENT_REQUIRED_MODEL_TARGETS:
+    for target in required_targets:
         try:
             mean, half_width = models[target].predict_mu_sigma(
                 frame,
@@ -5334,13 +5807,14 @@ def semlock_safe_prediction_stress(
         or family_threads.get("extratrees") != 1
     ):
         raise RuntimeError("SemLock stress requires serial sklearn forests")
+    required_targets = _required_target_contract(models)
     before = _dev_shm_semaphore_snapshot()
     prediction_digests = []
     calls = 0
     enospc_observed = False
     try:
         for _round in range(rounds):
-            for target in CURRENT_REQUIRED_MODEL_TARGETS:
+            for target in required_targets:
                 mean, half_width = models[target].predict_mu_sigma(
                     frame, conformal=True
                 )
@@ -5377,7 +5851,7 @@ def semlock_safe_prediction_stress(
     value = {
         "schema_version": "mft-tier1-semlock-safe-prediction-stress-v1",
         "rounds": rounds,
-        "target_count": len(CURRENT_REQUIRED_MODEL_TARGETS),
+        "target_count": len(required_targets),
         "prediction_call_count": calls,
         "prediction_digest_sha256": canonical_sha256(prediction_digests),
         "inference_policy": inference_binding.get("policy"),
@@ -5432,10 +5906,9 @@ def _terminal_model_predictions(
 
     import numpy as np
 
-    if tuple(models) != CURRENT_REQUIRED_MODEL_TARGETS:
-        raise RuntimeError("terminal model target order/set mismatch")
+    required_targets = _required_target_contract(models)
     predictions: dict[str, dict[str, Any]] = {}
-    for target in CURRENT_REQUIRED_MODEL_TARGETS:
+    for target in required_targets:
         try:
             mean, half_width = models[target].predict_mu_sigma(frame, conformal=True)
         except TypeError as exc:
@@ -5471,10 +5944,9 @@ def _canonical_terminal_prediction_payload(
     count = int(population_size)
     if count < 1 or not isinstance(predictions, Mapping):
         raise RuntimeError("terminal prediction snapshot is invalid")
-    if tuple(predictions) != CURRENT_REQUIRED_MODEL_TARGETS:
-        raise RuntimeError("terminal prediction snapshot target order/set mismatch")
+    required_targets = _required_target_contract(predictions)
     payload: dict[str, dict[str, list[float]]] = {}
-    for target in CURRENT_REQUIRED_MODEL_TARGETS:
+    for target in required_targets:
         prediction = predictions[target]
         if not isinstance(prediction, Mapping) or set(prediction) != {
             "mean",
@@ -5657,17 +6129,61 @@ def _candidate_records(
     if invalid_index_set != set(violations_by_index):
         raise RuntimeError("terminal surrogate physicality indices are inconsistent")
     records: list[dict[str, Any]] = []
+    required_model_targets = _required_target_contract(predictions)
+    temperature_targets = tuple(
+        getattr(runner.problem, "temperature_targets", CURRENT_TEMPERATURE_TARGETS)
+    )
+    if getattr(runner.problem, "goal_campaign", False):
+        if temperature_targets != GOAL_TEMPERATURE_TARGETS:
+            raise RuntimeError("goal terminal temperature target schema mismatch")
+    elif temperature_targets != CURRENT_TEMPERATURE_TARGETS:
+        raise RuntimeError("current7 terminal temperature target schema mismatch")
     for raw_index in np.asarray(indices, dtype=int).reshape(-1):
         index = int(raw_index)
         row = _frame_row(frame, index)
         decoded = _jsonable_decoded_parameters(row)
+        physical_geometry = {
+            name: decoded.get(name)
+            for name in DECODED_GEOMETRY_IDENTITY_COLUMNS
+        }
+        physical_geometry_sha256 = canonical_sha256(physical_geometry)
+        canonical_physical_params_sha256 = canonical_sha256(decoded)
+        candidate_physics_sha = physical_geometry_sha256
+        goal_identity: dict[str, Any] = {}
+        if getattr(runner.problem, "goal_campaign", False):
+            identity_values = dict(decoded)
+            identity_values["thermal_pad_conductivity_W_mK"] = (
+                GOAL_FIXED_COOLING_IDENTITY[
+                    "thermal_pad_conductivity_W_mK"
+                ]
+            )
+            fixed_identity = attest_fixed_identity(identity_values)
+            goal_identity = {
+                "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+                "stage_spec_sha256": runner.problem.stage_spec_sha256,
+                "temperature_contract_sha256": (
+                    runner.problem.temperature_contract_sha256
+                ),
+                "fixed_operating_cooling_identity": (
+                    fixed_identity["observed"]
+                ),
+                "fixed_identity_attestation": fixed_identity,
+            }
+        provenance_identity = {
+            "physical_geometry_sha256": physical_geometry_sha256,
+            "canonical_physical_params_sha256": (
+                canonical_physical_params_sha256
+            ),
+            "candidate_physics_sha": candidate_physics_sha,
+            **goal_identity,
+        }
         means = {
             target: float(predictions[target]["mean"][index])
-            for target in CURRENT_REQUIRED_MODEL_TARGETS
+            for target in required_model_targets
         }
         half_widths = {
             target: float(predictions[target]["q90_conformal_half_width"][index])
-            for target in CURRENT_REQUIRED_MODEL_TARGETS
+            for target in required_model_targets
         }
         aggregate_loss = sum(
             means[target]
@@ -5704,6 +6220,7 @@ def _candidate_records(
                 _finite_number(value, "exterior dimension") for value in dimensions
             )
             record = {
+                **provenance_identity,
                 "candidate_id": f"terminal-{index:04d}",
                 "candidate_record_status": ("quarantined_nonphysical_surrogate_output"),
                 "terminal_population_index": index,
@@ -5780,19 +6297,38 @@ def _candidate_records(
         cross_frequency = _positive_number(
             cross_frequency, "interwinding resonance frequency"
         )
+        temperature_limits = getattr(
+            runner.problem, "temperature_limits_C", None
+        )
+        if temperature_limits is None:
+            temperature_limits = {
+                target: float(runner.problem.spec["T_limit_C"])
+                for target in temperature_targets
+            }
         temperature_predictions = {
             target: {
                 "mean_C": means[target],
                 "q90_conformal_half_width_C": half_widths[target],
                 "robust_upper_C": means[target] + half_widths[target],
+                "limit_C": float(temperature_limits[target]),
+                "robust_margin_C": (
+                    float(temperature_limits[target])
+                    - means[target]
+                    - half_widths[target]
+                ),
             }
-            for target in CURRENT_TEMPERATURE_TARGETS
+            for target in temperature_targets
         }
         n2_side = int(_finite_number(_row_value(row, "N2_side"), "N2_side"))
+        conditional_side_targets = (
+            set(GOAL_SIDE_TEMPERATURE_TARGETS)
+            if getattr(runner.problem, "goal_campaign", False)
+            else {SIDE_TEMPERATURE_TARGET}
+        )
         active_temperature_targets = [
             target
-            for target in CURRENT_TEMPERATURE_TARGETS
-            if target != SIDE_TEMPERATURE_TARGET or n2_side > 0
+            for target in temperature_targets
+            if target not in conditional_side_targets or n2_side > 0
         ]
         maximum_temperature = max(
             means[target] for target in active_temperature_targets
@@ -5800,14 +6336,31 @@ def _candidate_records(
         maximum_robust_temperature = max(
             means[target] + half_widths[target] for target in active_temperature_targets
         )
+        winding_targets = [
+            target
+            for target in active_temperature_targets
+            if target in WINDING_TEMPERATURE_TARGETS
+        ]
+        core_targets = [
+            target
+            for target in active_temperature_targets
+            if target in CORE_TEMPERATURE_TARGETS
+        ]
+        maximum_robust_winding_temperature = max(
+            means[target] + half_widths[target] for target in winding_targets
+        )
+        maximum_robust_core_temperature = max(
+            means[target] + half_widths[target] for target in core_targets
+        )
         budget = winding_budget_identity(
             row,
-            expected_cw1_mm=runner.problem.spec["primary_conductor_thickness_mm"],
+            expected_cw1_mm=expected_problem_cw1_mm(runner.problem, row),
         )
         if budget.get("passed") is not True:
             raise RuntimeError("harvest winding-budget identity failed")
         record = {
             **design_report,
+            **provenance_identity,
             "candidate_id": f"terminal-{index:04d}",
             "terminal_population_index": index,
             "coordinate_unit": x[index].tolist(),
@@ -5847,17 +6400,23 @@ def _candidate_records(
             "pred_max_temperature_C": maximum_temperature,
             "pred_max_robust_temperature_C": maximum_robust_temperature,
             "robust_max_temperature_C": maximum_robust_temperature,
+            "pred_max_robust_winding_temperature_C": (
+                maximum_robust_winding_temperature
+            ),
+            "pred_max_robust_core_temperature_C": (
+                maximum_robust_core_temperature
+            ),
             **{
                 f"pred_{target}": means[target]
-                for target in CURRENT_TEMPERATURE_TARGETS
+                for target in temperature_targets
             },
             **{
                 f"q90_{target}_half_width_C": half_widths[target]
-                for target in CURRENT_TEMPERATURE_TARGETS
+                for target in temperature_targets
             },
             **{
                 f"robust_{target}_upper_C": (means[target] + half_widths[target])
-                for target in CURRENT_TEMPERATURE_TARGETS
+                for target in temperature_targets
             },
             "N1_main": int(_finite_number(_row_value(row, "N1_main"), "N1_main")),
             "N1_side": int(_finite_number(_row_value(row, "N1_side"), "N1_side")),
@@ -5915,6 +6474,185 @@ def _candidate_csv_frame(
     return frame if records else frame.iloc[0:0]
 
 
+def _terminal_physical_candidate_frame(
+    runner: Current7Tier1Runner,
+    *,
+    coordinates: Any,
+    objectives: Any,
+    optimizer_constraints: Any,
+    physical_constraints: Any,
+    frame: Any,
+    decoder_valid: Any,
+    source_identity: Mapping[str, Any] | None,
+) -> Any:
+    """Build one provenance-complete row for every terminal individual."""
+
+    import numpy as np
+    import pandas as pd
+
+    x = np.asarray(coordinates, dtype=float)
+    f = np.asarray(objectives, dtype=float)
+    optimizer_g = np.asarray(optimizer_constraints, dtype=float)
+    physical_g = np.asarray(physical_constraints, dtype=float)
+    valid = np.asarray(decoder_valid, dtype=bool).reshape(-1)
+    count = len(x)
+    expected_g = (count, len(runner.problem.constraint_names))
+    if (
+        x.ndim != 2
+        or f.shape != (count, 2)
+        or optimizer_g.shape != expected_g
+        or physical_g.shape != expected_g
+        or valid.shape != (count,)
+        or len(frame) != count
+        or not np.isfinite(x).all()
+        or not np.isfinite(f).all()
+        or not np.isfinite(optimizer_g).all()
+        or not np.isfinite(physical_g).all()
+    ):
+        raise RuntimeError("terminal physical candidate table inputs are invalid")
+
+    source = dict(source_identity or {})
+    goal_campaign = bool(getattr(runner.problem, "goal_campaign", False))
+    required_source = {
+        "seed",
+        "task_id",
+        "bundle_id",
+        "dataset_sha256",
+        "model_artifacts_sha256",
+        "evaluation_spec_sha256",
+        "temperature_contract_sha256",
+        "hard_constraint_contract_sha256",
+    }
+    if goal_campaign:
+        if count != PRODUCTION_POPULATION:
+            raise RuntimeError(
+                "goal terminal physical candidate table requires 320 rows"
+            )
+        if not valid.all():
+            raise RuntimeError(
+                "goal terminal physical candidate table requires every row decoded"
+            )
+        if required_source - set(source):
+            raise RuntimeError(
+                "goal terminal physical candidate table source identity is incomplete"
+            )
+        if (
+            source["evaluation_spec_sha256"]
+            != runner.problem.stage_spec_sha256
+            or source["temperature_contract_sha256"]
+            != runner.problem.temperature_contract_sha256
+            or source["hard_constraint_contract_sha256"]
+            != runner.problem.hard_constraint_contract_sha256
+        ):
+            raise RuntimeError(
+                "goal terminal physical candidate table contract identity drifted"
+            )
+
+    rows: list[dict[str, Any]] = []
+    for index in range(count):
+        decoded = _jsonable_decoded_parameters(_frame_row(frame, index))
+        geometry = {
+            name: decoded.get(name)
+            for name in DECODED_GEOMETRY_IDENTITY_COLUMNS
+        }
+        if goal_campaign and any(value is None for value in geometry.values()):
+            raise RuntimeError(
+                "goal terminal physical geometry identity is incomplete"
+            )
+        geometry_sha = canonical_sha256(geometry)
+        physical_params_sha = canonical_sha256(decoded)
+        candidate_physics_sha = geometry_sha
+        physical_values = {
+            name: float(physical_g[index, position])
+            for position, name in enumerate(runner.problem.constraint_names)
+        }
+        normalized_values = {
+            name: float(optimizer_g[index, position])
+            for position, name in enumerate(runner.problem.constraint_names)
+        }
+        row = {
+            "terminal_population_index": index,
+            "decoder_valid": bool(valid[index]),
+            "physical_geometry_sha256": geometry_sha,
+            "canonical_physical_params_sha256": physical_params_sha,
+            "candidate_physics_sha": candidate_physics_sha,
+            "objective_volume_L": float(f[index, 0]),
+            "objective_total_loss_W": float(f[index, 1]),
+            "physical_constraint_feasible": bool(
+                valid[index] and all(value <= 0.0 for value in physical_values.values())
+            ),
+            "physical_G_json": json.dumps(
+                physical_values,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+            "normalized_G_json": json.dumps(
+                normalized_values,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+            "coordinate_unit_json": json.dumps(
+                x[index].tolist(),
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+            "decoded_physical_params_json": json.dumps(
+                decoded,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            "source_seed": source.get("seed"),
+            "source_task_id": source.get("task_id"),
+            "source_bundle_id": source.get("bundle_id"),
+            "source_island_id": source.get("island_id"),
+            "dataset_sha256": source.get("dataset_sha256"),
+            "evaluation_model_sha256": source.get(
+                "model_artifacts_sha256"
+            ),
+            "constraint_spec_sha256": runner.problem.stage_spec_sha256,
+            "cooling_contract_sha256": (
+                GOAL_FIXED_COOLING_IDENTITY_SHA256
+                if goal_campaign
+                else None
+            ),
+            "operating_point_sha256": (
+                GOAL_FIXED_OPERATING_IDENTITY_SHA256
+                if goal_campaign
+                else None
+            ),
+            "evaluation_model_artifacts_sha256": source.get(
+                "model_artifacts_sha256"
+            ),
+            "evaluation_model_generation_sha256": source.get(
+                "model_generation_sha256"
+            ),
+            "evaluation_spec_sha256": runner.problem.stage_spec_sha256,
+            "evaluation_temperature_contract_sha256": (
+                runner.problem.temperature_contract_sha256
+            ),
+            "evaluation_hard_constraint_contract_sha256": (
+                runner.problem.hard_constraint_contract_sha256
+            ),
+        }
+        for name, value in physical_values.items():
+            row[f"physical_G:{name}"] = value
+        for name, value in normalized_values.items():
+            row[f"normalized_G:{name}"] = value
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    if (
+        len(result) != count
+        or result["terminal_population_index"].tolist() != list(range(count))
+        or result["candidate_physics_sha"].isna().any()
+    ):
+        raise RuntimeError("terminal physical candidate table assembly failed")
+    return result
+
+
 def _select_terminal_least_violation(
     optimizer_constraints: Any,
     *,
@@ -5960,6 +6698,8 @@ def persist_search_outputs(
     runner: Current7Tier1Runner,
     result: Any,
     output: Path,
+    *,
+    source_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist physical terminal, Pareto and closest-candidate evidence."""
 
@@ -6066,6 +6806,16 @@ def persist_search_outputs(
         surrogate_physicality=surrogate_physicality,
         indices=least_indices,
     )
+    terminal_physical_candidates = _terminal_physical_candidate_frame(
+        runner,
+        coordinates=terminal_x,
+        objectives=terminal_f,
+        optimizer_constraints=optimizer_g,
+        physical_constraints=physical_g,
+        frame=frame,
+        decoder_valid=decoder_valid,
+        source_identity=source_identity,
+    )
     paths = {
         "pareto_X": output / "pareto_X.npy",
         "pareto_F": output / "pareto_F.npy",
@@ -6076,6 +6826,12 @@ def persist_search_outputs(
         "terminal_F": output / "terminal_F.npy",
         "terminal_G_optimizer": output / "terminal_G_optimizer.npy",
         "terminal_G_physical": output / "terminal_G_physical.npy",
+        "terminal_physical_candidates": (
+            output / "terminal_physical_candidates.csv"
+        ),
+        "terminal_physical_candidates_manifest": (
+            output / "terminal_physical_candidates.manifest.json"
+        ),
         "least_violation_X": output / "least_violation_X.npy",
         "least_violation_F": output / "least_violation_F.npy",
         "least_violation_G_physical": output / "least_violation_G_physical.npy",
@@ -6099,6 +6855,69 @@ def persist_search_outputs(
     }
     for name, values in arrays.items():
         _atomic_npy(paths[name], values)
+    _atomic_csv(
+        paths["terminal_physical_candidates"],
+        terminal_physical_candidates,
+    )
+    terminal_table_manifest = {
+        "schema_version": GOAL_TERMINAL_TABLE_SCHEMA,
+        "goal_contract_required": bool(
+            getattr(runner.problem, "goal_campaign", False)
+        ),
+        "row_count": int(len(terminal_physical_candidates)),
+        "terminal_population_index_min": int(
+            terminal_physical_candidates["terminal_population_index"].min()
+        ),
+        "terminal_population_index_max": int(
+            terminal_physical_candidates["terminal_population_index"].max()
+        ),
+        "columns": list(terminal_physical_candidates.columns),
+        "required_identity_columns": [
+            "terminal_population_index",
+            "physical_geometry_sha256",
+            "canonical_physical_params_sha256",
+            "candidate_physics_sha",
+            "objective_volume_L",
+            "objective_total_loss_W",
+            "physical_G_json",
+            "normalized_G_json",
+            "source_seed",
+            "source_task_id",
+            "source_bundle_id",
+            "dataset_sha256",
+            "evaluation_model_sha256",
+            "constraint_spec_sha256",
+            "cooling_contract_sha256",
+            "operating_point_sha256",
+            "evaluation_model_artifacts_sha256",
+            "evaluation_spec_sha256",
+            "evaluation_temperature_contract_sha256",
+            "evaluation_hard_constraint_contract_sha256",
+        ],
+        "csv": {
+            "path": paths["terminal_physical_candidates"].name,
+            "sha256": sha256_file(paths["terminal_physical_candidates"]),
+            "size_bytes": paths["terminal_physical_candidates"].stat().st_size,
+        },
+        "source_identity": copy.deepcopy(dict(source_identity or {})),
+        "stage_spec_sha256": runner.problem.stage_spec_sha256,
+        "temperature_contract_sha256": (
+            runner.problem.temperature_contract_sha256
+        ),
+        "hard_constraint_contract_sha256": (
+            runner.problem.hard_constraint_contract_sha256
+        ),
+        "one_row_per_terminal_individual": True,
+        "physical_deduplication_key": "physical_geometry_sha256",
+        "global_pareto_provenance_ready": True,
+    }
+    terminal_table_manifest["payload_sha256"] = canonical_sha256(
+        terminal_table_manifest
+    )
+    _atomic_json(
+        paths["terminal_physical_candidates_manifest"],
+        terminal_table_manifest,
+    )
     _atomic_csv(
         paths["pareto_front"],
         _candidate_csv_frame(pareto_records, template=least_records[0]),
@@ -6237,6 +7056,7 @@ def persist_search_outputs(
         "artifact_inventory": inventory,
         "artifact_inventory_sha256": canonical_sha256(inventory),
         "infeasibility_report": infeasibility,
+        "terminal_physical_candidates_manifest": terminal_table_manifest,
     }
 
 
@@ -6252,7 +7072,31 @@ def build_smoke_receipt(
 
     import numpy as np
 
-    expected_keys = tuple(str(value) for value in SUPPORTED_FIXED_PRIMARY_TURNS)
+    if not runners:
+        raise RuntimeError("smoke runner inventory is empty")
+    probe_runner = next(iter(runners.values()))
+    goal_campaign = bool(
+        getattr(probe_runner.problem, "goal_campaign", False)
+    )
+    supported_turns = (
+        GOAL_SUPPORTED_PRIMARY_TURNS
+        if goal_campaign
+        else SUPPORTED_FIXED_PRIMARY_TURNS
+    )
+    required_targets = (
+        GOAL_REQUIRED_MODEL_TARGETS
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS
+    )
+    required_targets_sha256 = (
+        GOAL_REQUIRED_MODEL_TARGETS_SHA256
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS_SHA256
+    )
+    base_constraint_names = (
+        GOAL_BASE_CONSTRAINT_NAMES if goal_campaign else BASE_CONSTRAINT_NAMES
+    )
+    expected_keys = tuple(str(value) for value in supported_turns)
     supplied = (
         tuple(sorted(runners))
         == tuple(sorted(evaluations))
@@ -6260,7 +7104,7 @@ def build_smoke_receipt(
         == tuple(sorted(repair_smoke_by_stratum))
     )
     if not supplied or set(runners) != set(expected_keys):
-        raise RuntimeError("dual-stratum smoke inventory must be exactly N1=5 and N1=6")
+        raise RuntimeError("smoke inventory does not cover every campaign N1 stratum")
     first = runners[expected_keys[0]]
     stage_spec = validate_stage_spec(first.problem.stage_spec)
     constraint_names = tuple(first.problem.constraint_names)
@@ -6272,7 +7116,16 @@ def build_smoke_receipt(
         or first.model_cache.full_generation_authentication_passes != 1
     ):
         raise RuntimeError("dual-stratum receipt requires one shared model load")
-    manifest = validate_adapter_manifest(dict(first.adapter_evidence))
+    manifest = dict(first.adapter_evidence)
+    if not goal_campaign:
+        manifest = validate_adapter_manifest(manifest)
+    elif (
+        manifest.get("schema_version")
+        != "mft-goal-20260726-g0-generation-adapter-v1"
+        or manifest.get("generation_targets") != list(GOAL_G0_MODEL_TARGETS)
+        or manifest.get("required_model_targets") != list(required_targets)
+    ):
+        raise RuntimeError("goal G0 adapter manifest mismatch")
     expected_repair_stages = {
         "initial_population": True,
         "warm_start": True,
@@ -6280,7 +7133,7 @@ def build_smoke_receipt(
         "terminal_physical_replay": True,
     }
     strata: dict[str, Any] = {}
-    for turns in SUPPORTED_FIXED_PRIMARY_TURNS:
+    for turns in supported_turns:
         key = str(turns)
         runner = runners[key]
         if (
@@ -6331,16 +7184,19 @@ def build_smoke_receipt(
         observed_turns = int(decoded_controls["N1_main"]) + int(
             decoded_controls["N1_side"]
         )
+        expected_cw1 = (
+            validate_cw1_mm(decoded_controls["cw1"])
+            if goal_campaign
+            else stage_spec["primary_conductor_thickness_mm"]
+        )
         if observed_turns != turns or not math.isclose(
-            decoded_controls["cw1"],
-            stage_spec["primary_conductor_thickness_mm"],
-            rel_tol=0.0,
-            abs_tol=1e-12,
+            decoded_controls["cw1"], expected_cw1,
+            rel_tol=0.0, abs_tol=1e-12,
         ):
             raise RuntimeError(f"N1={turns} decoded fixed controls escaped")
         budget_identity = winding_budget_identity(
             row,
-            expected_cw1_mm=stage_spec["primary_conductor_thickness_mm"],
+            expected_cw1_mm=expected_cw1,
         )
         if budget_identity.get("passed") is not True:
             raise RuntimeError(f"N1={turns} winding-budget identity failed")
@@ -6363,12 +7219,12 @@ def build_smoke_receipt(
             if name != "sha256"
         }
         if (
-            model_smoke.get("target_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
+            model_smoke.get("target_count") != len(required_targets)
             or model_smoke.get("all_required_targets_exercised") is not True
             or semlock_stress.get("sha256")
             != canonical_sha256(semlock_unsigned)
             or semlock_stress.get("prediction_call_count")
-            != 8 * len(CURRENT_REQUIRED_MODEL_TARGETS)
+            != 8 * len(required_targets)
             or semlock_stress.get("sklearn_extratrees_n_jobs") != 1
             or semlock_stress.get("semaphore_entry_growth_count") != 0
             or semlock_stress.get("enospc_observed") is not False
@@ -6434,8 +7290,8 @@ def build_smoke_receipt(
         strata[key] = stratum
 
     model_load = {
-        "required_targets": list(CURRENT_REQUIRED_MODEL_TARGETS),
-        "required_targets_sha256": CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
+        "required_targets": list(required_targets),
+        "required_targets_sha256": required_targets_sha256,
         "loaded_target_count": len(first.models),
         "cache_load_calls": first.model_cache.load_calls,
         "full_generation_authentication_passes": (
@@ -6445,7 +7301,7 @@ def build_smoke_receipt(
         "generation_copy_performed": False,
         "inference_binding": first.inference_binding,
         "model_smoke_completed": True,
-        "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
+        "supported_fixed_primary_turns": list(supported_turns),
         "strata": {key: strata[key]["model_smoke"] for key in expected_keys},
         "all_supported_strata_exercised": True,
         "semlock_safe_prediction_stress_required": True,
@@ -6463,9 +7319,9 @@ def build_smoke_receipt(
         "hard_constraint_contract_sha256": canonical_sha256(hard_constraint_contract),
         "constraint_names": list(constraint_names),
         "constraint_count": len(constraint_names),
-        "base_constraint_count": len(BASE_CONSTRAINT_NAMES),
+        "base_constraint_count": len(base_constraint_names),
         "additive_hard_constraint_count": (
-            len(constraint_names) - len(BASE_CONSTRAINT_NAMES)
+            len(constraint_names) - len(base_constraint_names)
         ),
         "base_secondary_vertical_insulation_retained": True,
         "minimum_physical_insulation_is_authoritative_superset": True,
@@ -6477,41 +7333,49 @@ def build_smoke_receipt(
         ),
         "side_temperature_condition_applied": True,
         "q90_additional_multiplier": 1.0,
-        "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
+        "supported_fixed_primary_turns": list(supported_turns),
         "strata": {key: strata[key]["problem"] for key in expected_keys},
     }
     optimizer_repair = {
         "schema_version": OPTIMIZER_REPAIR_SCHEMA,
-        "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
+        "supported_fixed_primary_turns": list(supported_turns),
         "strata": {key: strata[key]["optimizer_repair"] for key in expected_keys},
         "all_supported_strata_passed": True,
         "launch_eligible": True,
     }
     smoke = {
         "coordinate": dict(coordinate_evidence),
-        "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
+        "supported_fixed_primary_turns": list(supported_turns),
         "strata": {key: strata[key]["smoke"] for key in expected_keys},
         "all_supported_strata_smoked": True,
     }
     receipt = {
-        "schema_version": RECEIPT_SCHEMA,
+        "schema_version": (
+            GOAL_RECEIPT_SCHEMA if goal_campaign else RECEIPT_SCHEMA
+        ),
         "status": (
-            "authenticated_dual_stratum_model_and_repair_smoke_passed_launch_eligible"
+            (
+                "authenticated_goal_four_stratum_g0_smoke_passed_launch_eligible"
+                if goal_campaign
+                else "authenticated_dual_stratum_model_and_repair_smoke_passed_launch_eligible"
+            )
         ),
         "created_at": datetime.now(timezone.utc)
         .astimezone()
         .isoformat(timespec="seconds"),
-        "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
+        "supported_fixed_primary_turns": list(supported_turns),
         "strata": strata,
         "runner": {
-            "schema_version": RUNNER_SCHEMA,
+            "schema_version": (
+                GOAL_RUNNER_SCHEMA if goal_campaign else RUNNER_SCHEMA
+            ),
             "problem_schema": PROBLEM_SCHEMA,
             "run_interface": "Current7Tier1Runner.run_one",
             "current_run_nsga2_semantics_source": ("optimization.run_nsga2.run_one"),
             "current_initialization_semantics_source": (
                 "optimization.run_nsga2.run_one"
             ),
-            "supported_fixed_primary_turns": list(SUPPORTED_FIXED_PRIMARY_TURNS),
+            "supported_fixed_primary_turns": list(supported_turns),
             "full_nsga_executed": False,
             "launch_eligible": True,
         },
@@ -6554,8 +7418,6 @@ def validate_smoke_receipt(
     problem = value.get("problem_contract") or {}
     repair = value.get("optimizer_repair") or {}
     smoke = value.get("smoke") or {}
-    expected_turns = list(SUPPORTED_FIXED_PRIMARY_TURNS)
-    expected_keys = {str(turns) for turns in SUPPORTED_FIXED_PRIMARY_TURNS}
     strata = value.get("strata") or {}
     try:
         stage_spec = validate_stage_spec(problem.get("stage_spec") or {})
@@ -6566,13 +7428,41 @@ def validate_smoke_receipt(
     expected_constraint_names = stage_constraint_names(stage_spec)
     expected_temperature_contract = stage_temperature_contract(stage_spec)
     expected_hard_contract = stage_hard_constraint_contract(stage_spec)
+    goal_campaign = is_goal_stage_spec(stage_spec)
+    supported_turns = (
+        GOAL_SUPPORTED_PRIMARY_TURNS
+        if goal_campaign
+        else SUPPORTED_FIXED_PRIMARY_TURNS
+    )
+    required_targets = (
+        GOAL_REQUIRED_MODEL_TARGETS
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS
+    )
+    required_targets_sha256 = (
+        GOAL_REQUIRED_MODEL_TARGETS_SHA256
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS_SHA256
+    )
+    expected_turns = list(supported_turns)
+    expected_keys = {str(turns) for turns in supported_turns}
+    expected_receipt_schema = (
+        GOAL_RECEIPT_SCHEMA if goal_campaign else RECEIPT_SCHEMA
+    )
+    expected_runner_schema = (
+        GOAL_RUNNER_SCHEMA if goal_campaign else RUNNER_SCHEMA
+    )
+    expected_status = (
+        "authenticated_goal_four_stratum_g0_smoke_passed_launch_eligible"
+        if goal_campaign
+        else "authenticated_dual_stratum_model_and_repair_smoke_passed_launch_eligible"
+    )
     if (
-        value.get("schema_version") != RECEIPT_SCHEMA
-        or value.get("status")
-        != ("authenticated_dual_stratum_model_and_repair_smoke_passed_launch_eligible")
+        value.get("schema_version") != expected_receipt_schema
+        or value.get("status") != expected_status
         or value.get("supported_fixed_primary_turns") != expected_turns
         or set(strata) != expected_keys
-        or runner.get("schema_version") != RUNNER_SCHEMA
+        or runner.get("schema_version") != expected_runner_schema
         or runner.get("problem_schema") != PROBLEM_SCHEMA
         or runner.get("run_interface") != "Current7Tier1Runner.run_one"
         or runner.get("current_run_nsga2_semantics_source")
@@ -6582,10 +7472,10 @@ def validate_smoke_receipt(
         or runner.get("supported_fixed_primary_turns") != expected_turns
         or runner.get("full_nsga_executed") is not False
         or runner.get("launch_eligible") is not True
-        or loading.get("required_targets") != list(CURRENT_REQUIRED_MODEL_TARGETS)
+        or loading.get("required_targets") != list(required_targets)
         or loading.get("required_targets_sha256")
-        != CURRENT_REQUIRED_MODEL_TARGETS_SHA256
-        or loading.get("loaded_target_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
+        != required_targets_sha256
+        or loading.get("loaded_target_count") != len(required_targets)
         or loading.get("cache_load_calls") != 1
         or loading.get("full_generation_authentication_passes") != 1
         or loading.get("models_loaded_once_per_process") is not True
@@ -6638,10 +7528,22 @@ def validate_smoke_receipt(
         )
     ):
         raise RuntimeError("corrected-generation smoke receipt contract mismatch")
-    validate_adapter_manifest(
-        value.get("adapter_manifest"),
-        source_paths_required=not relocated_source_evidence,
-    )
+    if goal_campaign:
+        adapter_value = value.get("adapter_manifest") or {}
+        if (
+            adapter_value.get("schema_version")
+            != "mft-goal-20260726-g0-generation-adapter-v1"
+            or adapter_value.get("generation_targets")
+            != list(GOAL_G0_MODEL_TARGETS)
+            or adapter_value.get("required_model_targets")
+            != list(required_targets)
+        ):
+            raise RuntimeError("goal G0 adapter manifest contract mismatch")
+    else:
+        validate_adapter_manifest(
+            value.get("adapter_manifest"),
+            source_paths_required=not relocated_source_evidence,
+        )
     if value.get("adapter_manifest_sha256") != canonical_sha256(
         value["adapter_manifest"]
     ):
@@ -6660,7 +7562,7 @@ def validate_smoke_receipt(
         "every_offspring": True,
         "terminal_physical_replay": True,
     }
-    for turns in SUPPORTED_FIXED_PRIMARY_TURNS:
+    for turns in supported_turns:
         key = str(turns)
         stratum = strata[key]
         if not isinstance(stratum, dict):
@@ -6681,6 +7583,28 @@ def validate_smoke_receipt(
             for name, item in semlock_stress.items()
             if name != "sha256"
         }
+        cw1_contract_valid = (
+            (
+                contract.get("cw1_search_mm")
+                == {
+                    "minimum": GOAL_CW1_MIN_MM,
+                    "maximum": GOAL_CW1_MAX_MM,
+                    "step": GOAL_CW1_STEP_MM,
+                    "coordinate_name": "f1_split",
+                }
+                and contract.get("f1_split_independent_search_allowed")
+                is False
+                and contract.get("cw1_enforcement")
+                == "selected_grid_value_inside_decoder_winding_budget"
+                and "fixed_cw1_mm" not in contract
+            )
+            if goal_campaign
+            else (
+                contract.get("fixed_cw1_mm") == 5.0
+                and contract.get("cw1_enforcement")
+                == "inside_decoder_winding_budget"
+            )
+        )
         if (
             stratum_sha != canonical_sha256(sealed_stratum)
             or stratum.get("fixed_primary_turns") != turns
@@ -6705,8 +7629,7 @@ def validate_smoke_receipt(
             or contract.get("schema_version") != OPTIMIZER_REPAIR_SCHEMA
             or contract.get("projection_source_revision")
             != PINNED_PROJECTION_SOURCE_REVISION
-            or contract.get("fixed_cw1_mm") != 5.0
-            or contract.get("cw1_enforcement") != "inside_decoder_winding_budget"
+            or not cw1_contract_valid
             or contract.get("fixed_primary_turns") != turns
             or contract.get("required_stages")
             != [
@@ -6719,15 +7642,15 @@ def validate_smoke_receipt(
             or stage_evidence.get("stages") != expected_stages
             or stage_evidence.get("fixed_primary_turns") != turns
             or stage_evidence.get("same_problem_repair_used_for_all_stages") is not True
-            or stratum_model.get("target_count") != len(CURRENT_REQUIRED_MODEL_TARGETS)
+            or stratum_model.get("target_count") != len(required_targets)
             or stratum_model.get("all_required_targets_exercised") is not True
             or set((stratum_model.get("targets") or {}))
-            != set(CURRENT_REQUIRED_MODEL_TARGETS)
+            != set(required_targets)
             or stratum_model.get("additional_half_width_multiplier") != 1.0
             or semlock_stress.get("sha256")
             != canonical_sha256(semlock_unsigned)
             or semlock_stress.get("prediction_call_count")
-            != 8 * len(CURRENT_REQUIRED_MODEL_TARGETS)
+            != 8 * len(required_targets)
             or semlock_stress.get("sklearn_extratrees_n_jobs") != 1
             or semlock_stress.get("semaphore_entry_growth_count") != 0
             or semlock_stress.get("enospc_observed") is not False
@@ -6929,6 +7852,27 @@ def run_search_seed(
         )
     )
     normalized_stage_spec = validate_stage_spec(stage_spec)
+    goal_campaign = is_goal_stage_spec(normalized_stage_spec)
+    expected_turns = (
+        GOAL_SUPPORTED_PRIMARY_TURNS
+        if goal_campaign
+        else SUPPORTED_FIXED_PRIMARY_TURNS
+    )
+    expected_required_targets = (
+        GOAL_REQUIRED_MODEL_TARGETS
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS
+    )
+    expected_required_targets_sha256 = (
+        GOAL_REQUIRED_MODEL_TARGETS_SHA256
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS_SHA256
+    )
+    expected_temperature_targets = (
+        GOAL_TEMPERATURE_TARGETS
+        if goal_campaign
+        else CURRENT_TEMPERATURE_TARGETS
+    )
     if (
         canonical_sha256(normalized_stage_spec) != str(stage_spec_sha256)
         or (receipt.get("problem_contract") or {}).get("stage_spec")
@@ -6966,12 +7910,16 @@ def run_search_seed(
         profile_topology.get("final1000_topology_niche_contract") is not None
     )
     topology_contract = (
-        deep_topology_contract(
-            int(fixed_primary_turns),
-            enable_final1000_topology_niche=True,
+        goal_topology_contract(int(fixed_primary_turns))
+        if goal_campaign
+        else (
+            deep_topology_contract(
+                int(fixed_primary_turns),
+                enable_final1000_topology_niche=True,
+            )
+            if topology_niche_enabled
+            else deep_topology_contract(int(fixed_primary_turns))
         )
-        if topology_niche_enabled
-        else deep_topology_contract(int(fixed_primary_turns))
     )
     expected_allowance_resonance = island_profile.get(
         "optimizer_resonance_allowance_Hz"
@@ -6985,7 +7933,7 @@ def run_search_seed(
         ),
     )
     if (
-        int(fixed_primary_turns) not in SUPPORTED_FIXED_PRIMARY_TURNS
+        int(fixed_primary_turns) not in expected_turns
         or recorded_profile_sha != canonical_sha256(unsigned_profile)
         or recorded_profile_sha != str(island_profile_sha256)
         or island.get("current7_profile_sha256") != recorded_profile_sha
@@ -7002,7 +7950,7 @@ def run_search_seed(
         or optimizer_termination_strategy != FIXED_GENERATION_TERMINATION_STRATEGY
         or island_profile.get("topology_evolution_contract") != topology_contract
         or island_profile.get("temperature_targets")
-        != list(CURRENT_TEMPERATURE_TARGETS)
+        != list(expected_temperature_targets)
         or island_profile.get("offspring_physics_repair_required") is not True
         or island_profile.get("terminal_physical_replay_required") is not True
         or island_profile.get("physical_hard_spec_mutation") is not False
@@ -7096,9 +8044,9 @@ def run_search_seed(
         or not runner.model_cache.loaded_once
         or runner.model_cache.load_calls != 1
         or runner.model_cache.full_generation_authentication_passes != 1
-        or tuple(runner.models) != CURRENT_REQUIRED_MODEL_TARGETS
+        or tuple(runner.models) != expected_required_targets
         or runner.inference_binding.get("target_count")
-        != len(CURRENT_REQUIRED_MODEL_TARGETS)
+        != len(expected_required_targets)
         or runner.inference_binding.get("threads_per_model") != int(inference_threads)
     ):
         raise RuntimeError("remote model-load/repair identity mismatch")
@@ -7223,8 +8171,8 @@ def run_search_seed(
             "warm_artifact_sha256": warm_artifact_record["sha256"],
             "warm_contract_sha256": warm_contract_record["sha256"],
             "loaded_model_count": len(runner.models),
-            "loaded_model_targets_sha256": CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
-            "temperature_targets": list(CURRENT_TEMPERATURE_TARGETS),
+            "loaded_model_targets_sha256": expected_required_targets_sha256,
+            "temperature_targets": list(expected_temperature_targets),
             "inference_threads": int(inference_threads),
             **(
                 {
@@ -7340,7 +8288,44 @@ def run_search_seed(
         or int(result.tier1_completed_generations) != int(max_generations) + 1
     ):
         raise RuntimeError("terminal optimizer repair/topology audit failed")
-    persisted = persist_search_outputs(runner, result, output_root)
+    authenticated_report = getattr(authenticated, "report", {})
+    authenticated_artifacts = (
+        authenticated_report.get("artifacts")
+        if isinstance(authenticated_report, Mapping)
+        else None
+    )
+    model_artifacts_sha256 = (
+        canonical_sha256(authenticated_artifacts)
+        if isinstance(authenticated_artifacts, Mapping)
+        and authenticated_artifacts
+        else str(manifest["generation_artifact_inventory_sha256"])
+    )
+    persisted = persist_search_outputs(
+        runner,
+        result,
+        output_root,
+        source_identity={
+            "seed": int(seed),
+            "task_id": str(
+                os.environ.get("SLURM_SCHED_TASK_ID")
+                or f"pid-{os.getpid()}"
+            ),
+            "bundle_id": str(bundle_id),
+            "island_id": str(island_id),
+            "dataset_sha256": adapter_evidence["dataset"]["sha256"],
+            "model_artifacts_sha256": model_artifacts_sha256,
+            "model_generation_sha256": adapter_evidence["train_report"][
+                "sha256"
+            ],
+            "evaluation_spec_sha256": runner.problem.stage_spec_sha256,
+            "temperature_contract_sha256": (
+                runner.problem.temperature_contract_sha256
+            ),
+            "hard_constraint_contract_sha256": (
+                runner.problem.hard_constraint_contract_sha256
+            ),
+        },
+    )
     terminal_turn_values = persisted["terminal_population_primary_turn_values"]
     if terminal_turn_values != [int(fixed_primary_turns)]:
         raise RuntimeError("terminal population escaped fixed primary turns")
@@ -7378,8 +8363,8 @@ def run_search_seed(
         "warm_contract_sha256": warm_contract_record["sha256"],
         "relocation_contract_sha256": canonical_sha256(relocation),
         "loaded_model_count": len(runner.models),
-        "loaded_model_targets_sha256": CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
-        "temperature_targets": list(CURRENT_TEMPERATURE_TARGETS),
+        "loaded_model_targets_sha256": expected_required_targets_sha256,
+        "temperature_targets": list(expected_temperature_targets),
         "constraint_names": list(runner.problem.constraint_names),
         "fixed_primary_turns": int(fixed_primary_turns),
         "terminal_population_primary_turn_values": terminal_turn_values,
@@ -7417,6 +8402,9 @@ def run_search_seed(
         "artifact_inventory": persisted["artifact_inventory"],
         "artifact_inventory_sha256": persisted["artifact_inventory_sha256"],
         "infeasibility_report": persisted["infeasibility_report"],
+        "terminal_physical_candidates_manifest": persisted[
+            "terminal_physical_candidates_manifest"
+        ],
         "production_eligible": False,
         "fea_submission_approved": False,
         "fea_submission_performed": False,
@@ -7465,33 +8453,40 @@ def run_smoke_preflight(
         raise RuntimeError("corrected-generation preflight output parent is missing")
 
     normalized_stage_spec = validate_stage_spec(stage_spec or CURRENT_STAGE_SPEC)
+    supported_turns = (
+        GOAL_SUPPORTED_PRIMARY_TURNS
+        if is_goal_stage_spec(normalized_stage_spec)
+        else SUPPORTED_FIXED_PRIMARY_TURNS
+    )
     first_runner = build_authenticated_runner(
         generation=generation,
         candidate_path=candidate_path,
         quality_path=quality_path,
         code_root=code_root,
         expected_code_revision=expected_code_revision,
-        fixed_primary_turns=SUPPORTED_FIXED_PRIMARY_TURNS[0],
+        fixed_primary_turns=supported_turns[0],
         stage_spec=normalized_stage_spec,
         inference_threads=inference_threads,
     )
     runners = {
         str(turns): (
             first_runner
-            if turns == SUPPORTED_FIXED_PRIMARY_TURNS[0]
+            if turns == supported_turns[0]
             else runner_for_fixed_primary_turns(first_runner, turns)
         )
-        for turns in SUPPORTED_FIXED_PRIMARY_TURNS
+        for turns in supported_turns
     }
-    if set(warm_start_paths) != set(SUPPORTED_FIXED_PRIMARY_TURNS) or set(
+    if set(warm_start_paths) != set(supported_turns) or set(
         warm_start_sha256
-    ) != set(SUPPORTED_FIXED_PRIMARY_TURNS):
-        raise RuntimeError("warm-start inventory must contain exact N1=5 and N1=6 paths")
+    ) != set(supported_turns):
+        raise RuntimeError(
+            "warm-start inventory must cover every campaign N1 stratum"
+        )
     contract_paths = dict(warm_start_contract_paths or {})
     contract_sha256 = dict(warm_start_contract_sha256 or {})
     if (
         set(contract_paths) != set(contract_sha256)
-        or not set(contract_paths) <= set(SUPPORTED_FIXED_PRIMARY_TURNS)
+        or not set(contract_paths) <= set(supported_turns)
     ):
         raise RuntimeError("smoke warm-contract path/SHA inventory mismatch")
     for protected in (
@@ -7499,7 +8494,7 @@ def run_smoke_preflight(
         first_runner.authenticated.registry,
         Path(first_runner.code_identity["path"]),
         coordinate_path.resolve(strict=True),
-        *(warm_start_paths[turns].resolve(strict=True) for turns in SUPPORTED_FIXED_PRIMARY_TURNS),
+        *(warm_start_paths[turns].resolve(strict=True) for turns in supported_turns),
         *(contract_paths[turns].resolve(strict=True) for turns in contract_paths),
     ):
         if _path_is_below(output_root, protected) or _path_is_below(
@@ -7515,7 +8510,7 @@ def run_smoke_preflight(
     evaluations: dict[str, Any] = {}
     model_smoke_by_stratum: dict[str, Any] = {}
     repair_smoke_by_stratum: dict[str, Any] = {}
-    for turns in SUPPORTED_FIXED_PRIMARY_TURNS:
+    for turns in supported_turns:
         key = str(turns)
         runner = runners[key]
         initial, initial_repair = runner.repair_coordinates(

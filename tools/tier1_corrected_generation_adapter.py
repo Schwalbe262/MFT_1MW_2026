@@ -21,24 +21,30 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import MappingProxyType
 from typing import Any, Mapping
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from module.mft_goal_20260726_contract import (
+    GOAL_G0_MODEL_TARGETS,
+    GOAL_STAGE_SPEC,
+    GOAL_STAGE_SPEC_SHA256,
+    GOAL_TEMPERATURE_CONTRACT,
+    GOAL_TEMPERATURE_CONTRACT_SHA256,
+    GOAL_TEMPERATURE_TARGETS,
+    PROBE_TEMPERATURE_TARGETS,
+)
 
 ADAPTER_SCHEMA = "mft-tier1-corrected-generation-adapter-v1"
 RECOVERY_CONTRACT = "mft-capacitance-lc-inverse-v1"
 RECOVERY_MAX_ABS_DELTA_F = 5.1e-11
 RECOVERY_STATUS = "applied"
 
-CURRENT_TEMPERATURE_TARGETS = (
-    "Tprobe_Tx_leeward_max",
-    "Tprobe_Rx_main_leeward_max",
-    "Tprobe_Rx_side_leeward_max",
-    "Tprobe_core_center_max",
-    "Tprobe_core_center_leg_max",
-    "Tprobe_core_side_leg_max",
-    "Tprobe_core_top_yoke_max",
-)
+CURRENT_TEMPERATURE_TARGETS = PROBE_TEMPERATURE_TARGETS
 
 CORRECTED_GENERATION_TARGETS = (
     "Llt_phys",
@@ -74,6 +80,25 @@ CURRENT_REQUIRED_MODEL_TARGETS = (
     "B_mean_core",
     *CURRENT_TEMPERATURE_TARGETS,
 )
+
+GOAL_REQUIRED_MODEL_TARGETS = (
+    "Llt_phys",
+    "k",
+    "C_tx_tx_F",
+    "C_rx_rx_F",
+    "C_tx_rx_F",
+    "P_winding_total",
+    "P_core_total",
+    "P_core_plate_total",
+    "P_wcp_total",
+    "P_Tx_main_group",
+    "P_Rx_main_group",
+    "P_Rx_side_total",
+    "B_mean_core",
+    *GOAL_TEMPERATURE_TARGETS,
+)
+if len(GOAL_REQUIRED_MODEL_TARGETS) != 24:
+    raise RuntimeError("goal NSGA must consume exactly 24 of the 25 G0 targets")
 
 CURRENT_TEMPERATURE_CONTRACT = {
     "schema_version": "mft-tier1-current7-temperature-contract-v1",
@@ -194,6 +219,9 @@ CURRENT_STAGE_HARD_CONTRACT_SHA256 = canonical_sha256(
 )
 CURRENT_REQUIRED_MODEL_TARGETS_SHA256 = canonical_sha256(
     list(CURRENT_REQUIRED_MODEL_TARGETS)
+)
+GOAL_REQUIRED_MODEL_TARGETS_SHA256 = canonical_sha256(
+    list(GOAL_REQUIRED_MODEL_TARGETS)
 )
 
 
@@ -383,9 +411,23 @@ def authenticate_corrected_generation(
     generation: Path,
     candidate_path: Path,
     quality_path: Path,
+    goal_campaign: bool = False,
 ) -> AuthenticatedCorrectedGeneration:
     """Authenticate small-file provenance before the one full artifact pass."""
 
+    generation_targets = (
+        tuple(GOAL_G0_MODEL_TARGETS)
+        if goal_campaign
+        else CORRECTED_GENERATION_TARGETS
+    )
+    required_model_targets = (
+        GOAL_REQUIRED_MODEL_TARGETS
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS
+    )
+    required_model_targets_sha256 = canonical_sha256(
+        list(required_model_targets)
+    )
     generation = generation.resolve(strict=True)
     if not generation.is_dir() or generation.parent.name != "generations":
         raise RuntimeError("corrected generation must be below registry/generations")
@@ -405,7 +447,7 @@ def authenticate_corrected_generation(
     strict_rows = _positive_integer(report.get("strict_full_rows"), "strict rows")
 
     targets = report.get("targets")
-    if targets != list(CORRECTED_GENERATION_TARGETS):
+    if targets != list(generation_targets):
         raise RuntimeError("corrected generation target order/set mismatch")
     target_reports = report.get("report")
     if not isinstance(target_reports, Mapping) or set(target_reports) != set(targets):
@@ -413,7 +455,7 @@ def authenticate_corrected_generation(
     artifacts = report.get("artifacts")
     expected_artifacts = {
         f"{target}/{filename}"
-        for target in CORRECTED_GENERATION_TARGETS
+        for target in generation_targets
         for filename in ("meta.json", "models.pkl")
     }
     if not isinstance(artifacts, Mapping) or set(artifacts) != expected_artifacts:
@@ -456,7 +498,7 @@ def authenticate_corrected_generation(
         for item in generation.iterdir()
         if item.is_dir()
     }
-    if actual_directories != set(CORRECTED_GENERATION_TARGETS):
+    if actual_directories != set(generation_targets):
         raise RuntimeError("corrected generation target directory inventory mismatch")
 
     dataset_path = Path(str(report.get("dataset_path") or "")).resolve(strict=True)
@@ -499,6 +541,8 @@ def authenticate_corrected_generation(
     }
     if not isinstance(quality.get("passed"), bool):
         raise RuntimeError("corrected quality status has no terminal pass/fail state")
+    if goal_campaign and quality.get("passed") is not True:
+        raise RuntimeError("goal G0 quality gate must pass before search")
     if quality.get("passed") is False and not quality.get("reasons"):
         raise RuntimeError("failed corrected quality status has no sealed blockers")
     if (
@@ -534,7 +578,11 @@ def authenticate_corrected_generation(
         raise RuntimeError("corrected quality metric target inventory mismatch")
 
     evidence = {
-        "schema_version": ADAPTER_SCHEMA,
+        "schema_version": (
+            "mft-goal-20260726-g0-generation-adapter-v1"
+            if goal_campaign
+            else ADAPTER_SCHEMA
+        ),
         "generation": str(generation),
         "registry": str(registry),
         "generation_relative": generation_relative,
@@ -570,10 +618,11 @@ def authenticate_corrected_generation(
                 status.get("passed") is True for status in recovery_targets.values()
             ),
         },
-        "generation_targets": list(CORRECTED_GENERATION_TARGETS),
-        "generation_target_count": len(CORRECTED_GENERATION_TARGETS),
-        "required_model_targets": list(CURRENT_REQUIRED_MODEL_TARGETS),
-        "required_model_targets_sha256": CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
+        "generation_targets": list(generation_targets),
+        "generation_target_count": len(generation_targets),
+        "required_model_targets": list(required_model_targets),
+        "required_model_targets_sha256": required_model_targets_sha256,
+        "goal_campaign": bool(goal_campaign),
         "artifact_count": len(artifacts),
         "artifact_sizes_bytes": artifact_sizes,
         "full_artifact_hash_pass_deferred_to_single_model_load": True,
@@ -610,8 +659,14 @@ class CorrectedGenerationModelCache:
         self.train_models_module = train_models_module
         self.predictor_class = predictor_class
         self.required_targets = tuple(required_targets)
-        if self.required_targets != CURRENT_REQUIRED_MODEL_TARGETS:
-            raise RuntimeError("current7 required-model target contract mismatch")
+        expected_required_targets = tuple(
+            authenticated.evidence.get("required_model_targets") or ()
+        )
+        if self.required_targets != expected_required_targets or (
+            self.required_targets
+            not in (CURRENT_REQUIRED_MODEL_TARGETS, GOAL_REQUIRED_MODEL_TARGETS)
+        ):
+            raise RuntimeError("corrected required-model target contract mismatch")
         self._models: Mapping[str, Any] | None = None
         self._load_error: BaseException | None = None
         self.load_calls = 0
@@ -717,10 +772,19 @@ def process_model_cache(
 ) -> CorrectedGenerationModelCache:
     """Return the one cache authorized for this generation in this process."""
 
+    required_targets = tuple(
+        authenticated.evidence.get("required_model_targets") or ()
+    )
+    if required_targets not in (
+        CURRENT_REQUIRED_MODEL_TARGETS,
+        GOAL_REQUIRED_MODEL_TARGETS,
+    ):
+        raise RuntimeError("authenticated required-model target contract mismatch")
+    required_targets_sha256 = canonical_sha256(list(required_targets))
     key = (
         str(authenticated.generation),
         str(authenticated.evidence["train_report"]["sha256"]),
-        CURRENT_REQUIRED_MODEL_TARGETS_SHA256,
+        required_targets_sha256,
     )
     existing = _PROCESS_MODEL_CACHES.get(key)
     if existing is not None:
@@ -736,6 +800,7 @@ def process_model_cache(
         authenticated,
         train_models_module=train_models_module,
         predictor_class=predictor_class,
+        required_targets=required_targets,
     )
     _PROCESS_MODEL_CACHES[key] = created
     return created

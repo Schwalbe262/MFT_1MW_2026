@@ -23,6 +23,10 @@
     "Tprobe_core_center_max": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0},
     "Tprobe_core_center_leg_max": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0},
     "Tprobe_core_side_leg_max": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0},
-    "Tprobe_core_top_yoke_max": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0}
+    "Tprobe_core_top_yoke_max": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0},
+    "T_max_Tx": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0},
+    "T_max_Rx_main": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0},
+    "T_max_Rx_side": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0},
+    "T_max_core": {"min_r2": 0.85, "max_rmse": 5.0, "max_p90_ape_pct": 10.0, "max_interval_p90_width": 10.0}
   }
 }

@@ -136,10 +136,74 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
     if pointer is not None and pointer.get("dataset_sha256") != dataset_sha:
         reasons.append("pointer_dataset_fingerprint_mismatch")
 
+    configured_targets = thresholds.get("targets")
+    if not isinstance(configured_targets, dict) or not configured_targets:
+        return {
+            "passed": False,
+            "reasons": [*reasons, "quality_target_inventory_missing"],
+            "advisories": advisories,
+            "targets": {},
+            "capacitance_recovery": {
+                "schema_version": 1,
+                "passed": False,
+                "reasons": ["quality_target_inventory_missing"],
+                "targets": {},
+            },
+        }
+    required_targets = list(configured_targets)
+    report_targets = report.get("targets")
+    if not isinstance(report_targets, list):
+        reasons.extend(
+            f"{target}:train_report_target_inventory_missing"
+            for target in required_targets
+        )
+        report_targets = []
+    else:
+        missing_report_targets = [
+            target for target in required_targets if target not in report_targets
+        ]
+        unexpected_report_targets = [
+            target for target in report_targets if target not in required_targets
+        ]
+        reasons.extend(
+            f"{target}:train_report_target_inventory_missing"
+            for target in missing_report_targets
+        )
+        reasons.extend(
+            f"{target}:unexpected_train_report_target"
+            for target in unexpected_report_targets
+        )
+    report_metrics = report.get("report")
+    if not isinstance(report_metrics, dict):
+        reasons.extend(
+            f"{target}:train_report_metrics_missing"
+            for target in required_targets
+        )
+        report_metrics = {}
+    else:
+        reasons.extend(
+            f"{target}:train_report_metrics_missing"
+            for target in required_targets
+            if target not in report_metrics
+        )
+
     artifacts = report.get("artifacts")
     if not isinstance(artifacts, dict) or not artifacts:
         reasons.append("artifact_manifest_missing")
     else:
+        expected_artifacts = {
+            f"{target}/{filename}"
+            for target in required_targets
+            for filename in ("meta.json", "models.pkl")
+        }
+        reasons.extend(
+            f"{relative}:artifact_inventory_missing"
+            for relative in sorted(expected_artifacts - set(artifacts))
+        )
+        reasons.extend(
+            f"{relative}:unexpected_artifact_inventory"
+            for relative in sorted(set(artifacts) - expected_artifacts)
+        )
         for relative_path, expected_sha256 in artifacts.items():
             artifact = os.path.abspath(os.path.join(generation, relative_path))
             if os.path.commonpath([artifact, generation]) != generation:
@@ -184,7 +248,7 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
             reasons.append(f"postsolve_feature_leakage:{','.join(leaked)}")
 
     minimum_coverage = float(thresholds["minimum_interval_coverage"])
-    for target, limits in thresholds["targets"].items():
+    for target, limits in configured_targets.items():
         target_reasons = []
         blocking_value = limits.get("blocking", True)
         blocking = isinstance(blocking_value, bool) and blocking_value

@@ -26,6 +26,12 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import urllib.error
 import urllib.request
 
+from module.mft_goal_20260726_contract import (
+    GOAL_CONTRACT_SCHEMA,
+    GOAL_TERMINAL_TABLE_SCHEMA,
+    is_goal_stage_spec,
+)
+
 try:
     from tier1_corrected_current7_slurm_bundle import (
         RESULT_SCHEMA,
@@ -118,6 +124,12 @@ REQUIRED_SEARCH_ARTIFACTS = frozenset(
         "least_violation_front",
         "least_violation_candidates",
         "infeasibility_report",
+    }
+)
+TERMINAL_PHYSICAL_TABLE_ARTIFACTS = frozenset(
+    {
+        "terminal_physical_candidates",
+        "terminal_physical_candidates_manifest",
     }
 )
 
@@ -633,9 +645,19 @@ def _harvest_result_artifacts(
     remote: RemoteReader,
 ) -> tuple[dict[str, Any], dict[str, bytes], list[dict[str, Any]]]:
     inventory = result.get("artifact_inventory")
+    artifact_names = set(inventory) if isinstance(inventory, dict) else set()
+    goal_result = is_goal_stage_spec(result.get("hard_spec"))
     if (
         not isinstance(inventory, dict)
-        or set(inventory) != REQUIRED_SEARCH_ARTIFACTS
+        or not REQUIRED_SEARCH_ARTIFACTS.issubset(artifact_names)
+        or artifact_names - REQUIRED_SEARCH_ARTIFACTS
+        - TERMINAL_PHYSICAL_TABLE_ARTIFACTS
+        or (
+            goal_result
+            and not TERMINAL_PHYSICAL_TABLE_ARTIFACTS.issubset(
+                artifact_names
+            )
+        )
         or result.get("artifact_inventory_sha256") != canonical_sha256(inventory)
     ):
         raise RuntimeError("terminal result artifact inventory seal mismatch")
@@ -679,6 +701,7 @@ def _harvest_result_artifacts(
             "pareto_candidates",
             "least_violation_candidates",
             "infeasibility_report",
+            "terminal_physical_candidates_manifest",
         }:
             json_values[name] = _strict_json(stable.payload, remote_path)
 
@@ -716,6 +739,29 @@ def _harvest_result_artifacts(
     _artifact_json_flags(pareto, "pareto candidates")
     _artifact_json_flags(least, "least-violation candidates")
     _artifact_json_flags(report, "infeasibility report")
+    if "terminal_physical_candidates_manifest" in json_values:
+        table = json_values["terminal_physical_candidates_manifest"]
+        table_unsigned = dict(table)
+        table_sha = table_unsigned.pop("payload_sha256", None)
+        csv_record = inventory.get("terminal_physical_candidates") or {}
+        csv_binding = table.get("csv") or {}
+        required_columns = table.get("required_identity_columns")
+        if (
+            table.get("schema_version") != GOAL_TERMINAL_TABLE_SCHEMA
+            or table_sha != canonical_sha256(table_unsigned)
+            or int(table.get("row_count", -1))
+            != int(result.get("terminal_population_count", -2))
+            or csv_binding.get("path") != csv_record.get("path")
+            or csv_binding.get("sha256") != csv_record.get("sha256")
+            or csv_binding.get("size_bytes") != csv_record.get("size_bytes")
+            or not isinstance(required_columns, list)
+            or not set(required_columns).issubset(set(table.get("columns") or []))
+            or table.get("one_row_per_terminal_individual") is not True
+            or table.get("global_pareto_provenance_ready") is not True
+        ):
+            raise RuntimeError(
+                "terminal physical candidate table manifest mismatch"
+            )
     return objects, payloads, [*pareto_candidates, *least_candidates]
 
 
@@ -927,6 +973,16 @@ def deduplicate_observations(
                     "_candidates": copy.deepcopy(list(chosen["_candidates"])),
                 }
             )
+            if is_goal_stage_spec(result_value.get("hard_spec")):
+                record.update(
+                    {
+                        "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+                        "hard_spec": copy.deepcopy(result_value["hard_spec"]),
+                        "stage_spec_sha256": result_value[
+                            "stage_spec_sha256"
+                        ],
+                    }
+                )
         else:
             record["failure"] = chosen.get("failure")
         records.append(record)

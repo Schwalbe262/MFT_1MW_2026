@@ -27,9 +27,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from module.input_parameter_260706 import (  # noqa: E402
     KEYS, _SOBOL_DIMS, unit_to_dims, decode_unit_sample, create_input_parameter, validation_check,
 )
+from module.mft_goal_20260726_contract import (  # noqa: E402
+    FIXED_COOLING_IDENTITY,
+    FIXED_OPERATING_IDENTITY,
+    GOAL_TEMPERATURE_TARGETS,
+    is_goal_stage_spec,
+    validate_goal_stage_spec,
+)
 from optimization.geometry_metrics import bounding_box_lit  # noqa: E402
 from optimization.design_summary import design_analytical_b_field_t  # noqa: E402
 from model_targets import (  # noqa: E402
+    GOAL_G0_TEMPERATURE_TARGETS,
     SURROGATE_TEMPERATURE_TARGETS,
     SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
 )
@@ -53,6 +61,9 @@ DEFAULT_SPEC = {
 
 # 온도 타겟 (프로브 시트 기준)
 T_TARGETS = list(SURROGATE_TEMPERATURE_TARGETS)
+GOAL_T_TARGETS = list(GOAL_G0_TEMPERATURE_TARGETS)
+if tuple(GOAL_T_TARGETS) != GOAL_TEMPERATURE_TARGETS:
+    raise RuntimeError("goal G0 temperature target schema drifted")
 POST_TEMPERATURE_CONSTRAINT = 1 + len(T_TARGETS)
 N_IEQ_CONSTRAINTS = POST_TEMPERATURE_CONSTRAINT + 5
 CONSTRAINT_NAMES = (
@@ -89,9 +100,14 @@ class MFTProblem(Problem):
     """
 
     def __init__(self, models, spec=None, density_gate=None, fixed_overrides=None):
+        supplied_spec = dict(spec or {})
+        self.goal_campaign = is_goal_stage_spec(supplied_spec)
+        self.temperature_targets = tuple(
+            GOAL_T_TARGETS if self.goal_campaign else T_TARGETS
+        )
         required = {
             "Llt_phys", "P_winding_total", "P_core_total",
-            "P_core_plate_total", "P_wcp_total", *T_TARGETS,
+            "P_core_plate_total", "P_wcp_total", *self.temperature_targets,
             *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
         }
         missing = sorted(required.difference(models))
@@ -100,10 +116,54 @@ class MFTProblem(Problem):
         if density_gate is None:
             raise ValueError("a strict-full density gate is required")
         self.models = models
-        self.spec = dict(DEFAULT_SPEC, **(spec or {}))
+        if self.goal_campaign:
+            normalized_goal = validate_goal_stage_spec(supplied_spec)
+            self.spec = {
+                key: value
+                for key, value in DEFAULT_SPEC.items()
+                if key != "T_limit_C"
+            }
+            self.spec.update(normalized_goal)
+            self.temperature_limits_C = dict(
+                normalized_goal["temperature_target_limits_C"]
+            )
+        else:
+            self.spec = dict(DEFAULT_SPEC, **supplied_spec)
+            self.temperature_limits_C = {
+                target: float(self.spec["T_limit_C"])
+                for target in self.temperature_targets
+            }
         self.density_gate = density_gate
-        self.constraint_names = CONSTRAINT_NAMES
+        self.post_temperature_constraint = 1 + len(self.temperature_targets)
+        self.constraint_names = (
+            "Llt_robust_band",
+            *(
+                f"temperature_robust_limit:{target}"
+                for target in self.temperature_targets
+            ),
+            "analytical_flux_density_limit",
+            "decoded_space_shrink",
+            "secondary_vertical_insulation",
+            "strict_full_density_support",
+            "Llt_ensemble_disagreement",
+        )
         supplied_overrides = dict(fixed_overrides or {})
+        if self.goal_campaign:
+            goal_overrides = {
+                **FIXED_OPERATING_IDENTITY,
+                **{
+                    name: value
+                    for name, value in FIXED_COOLING_IDENTITY.items()
+                    if name != "thermal_pad_conductivity_W_mK"
+                },
+            }
+            for name, expected in goal_overrides.items():
+                if name in supplied_overrides and supplied_overrides[name] != expected:
+                    raise ValueError(
+                        f"goal campaign fixes {name}={expected!r}; "
+                        "conflicting override was supplied"
+                    )
+            supplied_overrides.update(goal_overrides)
         for name, expected in NSGA_FIXED_THERMAL_STACK_MM.items():
             if name in supplied_overrides and not np.isclose(
                 float(supplied_overrides[name]), expected,
@@ -131,7 +191,8 @@ class MFTProblem(Problem):
             lower[index] = unit_value
             upper[index] = unit_value
         # Llt(1) + all temperature targets + B/shrink/gap/density/disagreement(5).
-        super().__init__(n_var=n_var, n_obj=2, n_ieq_constr=N_IEQ_CONSTRAINTS,
+        super().__init__(n_var=n_var, n_obj=2,
+                         n_ieq_constr=len(self.constraint_names),
                          xl=lower, xu=upper)
 
     # ---- 배치 디코드: 단위 유전자 -> 파생 포함 특징 프레임 ----
@@ -192,10 +253,29 @@ class MFTProblem(Problem):
             # g0: 누설 밴드 (불확실성 조임)
             G[idx, 0] = np.abs(mu_llt - spec["Llt_target_uH"]) + q * sg_llt - spec["Llt_tol_uH"]
             # g1..: every independently trained temperature target.
-            for t_i, t_name in enumerate(T_TARGETS):
+            for t_i, t_name in enumerate(self.temperature_targets):
                 mu_t, sg_t = self._predict(t_name, sub)
-                G[idx, 1 + t_i] = mu_t + q * sg_t - spec["T_limit_C"]
-            post_temperature = POST_TEMPERATURE_CONSTRAINT
+                G[idx, 1 + t_i] = (
+                    mu_t + q * sg_t - self.temperature_limits_C[t_name]
+                )
+            if self.goal_campaign:
+                try:
+                    n2_side = sub["N2_side"].to_numpy(dtype=float)
+                    absent_side = np.isfinite(n2_side) & (n2_side == 0.0)
+                    invalid_side = ~np.isfinite(n2_side) | (n2_side < 0.0)
+                except (KeyError, TypeError, ValueError):
+                    absent_side = np.zeros(len(sub), dtype=bool)
+                    invalid_side = np.ones(len(sub), dtype=bool)
+                for target in (
+                    "T_max_Rx_side",
+                    "Tprobe_Rx_side_leeward_max",
+                ):
+                    column = 1 + self.temperature_targets.index(target)
+                    values = G[idx, column]
+                    values[absent_side] = -BIG
+                    values[invalid_side] = BIG
+                    G[idx, column] = values
+            post_temperature = self.post_temperature_constraint
             # Bulk volt-second design B.  A pointwise mesh/edge B_max is a
             # diagnostic only and must not reject an otherwise valid design.
             try:

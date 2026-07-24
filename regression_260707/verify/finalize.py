@@ -24,6 +24,20 @@ from module.input_parameter_260706 import (  # noqa: E402
     KEYS,
     SUPPORTED_CANDIDATE_INPUT_SCHEMAS,
 )
+from module.mft_goal_20260726_contract import (  # noqa: E402
+    GOAL_CONTRACT_SCHEMA,
+    GOAL_N1_MAX_TURNS,
+    GOAL_N1_MIN_TURNS,
+    GOAL_RESONANCE_MIN_HZ,
+    GOAL_SIZE_LIMITS_MM,
+    GOAL_TEMPERATURE_TARGETS,
+    TEMPERATURE_TARGET_LIMITS_C,
+    dynamic_core_group_violation,
+    fixed_identity_mismatches,
+    is_goal_stage_spec,
+    validate_cw1_mm,
+    validate_goal_stage_spec,
+)
 from model_targets import (  # noqa: E402
     SURROGATE_CAPACITANCE_TARGETS,
     SURROGATE_TEMPERATURE_TARGETS,
@@ -170,6 +184,25 @@ def physical_spec_reasons(result, candidate=None):
     columns are never evidence for an FEA pass.
     """
     reasons = []
+    candidate = candidate if isinstance(candidate, dict) else {}
+    hard_spec = result.get("hard_spec")
+    if not isinstance(hard_spec, dict):
+        hard_spec = candidate.get("hard_spec")
+    goal_claimed = (
+        is_goal_stage_spec(hard_spec)
+        or result.get("goal_contract_schema") == GOAL_CONTRACT_SCHEMA
+        or candidate.get("goal_contract_schema") == GOAL_CONTRACT_SCHEMA
+    )
+    if goal_claimed:
+        try:
+            validate_goal_stage_spec(hard_spec)
+        except (RuntimeError, TypeError, ValueError):
+            reasons.append("goal_contract_invalid")
+        if any(
+            isinstance(value, dict) and "T_limit_C" in value
+            for value in (result, candidate, hard_spec)
+        ):
+            reasons.append("goal_legacy_scalar_temperature_forbidden")
     try:
         llt = float(result["Llt"])
         if int(float(result["full_model"])) == 0:
@@ -181,14 +214,68 @@ def physical_spec_reasons(result, candidate=None):
     bmax = result.get("B_max_core")
     if not _finite(bmax) or not 0 <= float(bmax) <= SPEC["B_limit_T"]:
         reasons.append("B_max_out_of_spec")
-    for column in TEMPERATURE_COLUMNS:
+    temperature_columns = (
+        GOAL_TEMPERATURE_TARGETS if goal_claimed else TEMPERATURE_COLUMNS
+    )
+    temperature_limits = (
+        TEMPERATURE_TARGET_LIMITS_C
+        if goal_claimed
+        else {column: SPEC["T_limit_C"] for column in TEMPERATURE_COLUMNS}
+    )
+    for column in temperature_columns:
         # Rx-side is required whenever the candidate has side turns.
-        if column == "T_max_Rx_side" and _finite(result.get("N2_side")) \
+        if column in {
+            "T_max_Rx_side",
+            "Tprobe_Rx_side_leeward_max",
+        } and _finite(result.get("N2_side")) \
                 and float(result["N2_side"]) <= 0:
             continue
         value = result.get(column)
-        if not _finite(value) or float(value) > SPEC["T_limit_C"]:
+        if not _finite(value) or float(value) > temperature_limits[column]:
             reasons.append(f"temperature_out_of_spec:{column}")
+    if goal_claimed:
+        identity = dict(result)
+        nested_identity = result.get("fixed_operating_cooling_identity")
+        if isinstance(nested_identity, dict):
+            identity.update(nested_identity)
+        for mismatch in fixed_identity_mismatches(identity):
+            reasons.append(f"fixed_identity_mismatch:{mismatch['field']}")
+        try:
+            _volume, dimensions = bounding_box_lit(result)
+            for axis, observed in zip(("W", "L", "H"), dimensions):
+                if (
+                    not _finite(observed)
+                    or float(observed) > GOAL_SIZE_LIMITS_MM[axis]
+                ):
+                    reasons.append(f"size_out_of_spec:{axis}")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            reasons.append("size_geometry_unavailable")
+        resonance = result.get(
+            "f_res_min_tx_rx_only_Hz",
+            result.get("pred_f_res_min_screen_Hz"),
+        )
+        if (
+            not _finite(resonance)
+            or float(resonance) < GOAL_RESONANCE_MIN_HZ
+        ):
+            reasons.append("self_resonance_below_minimum")
+        try:
+            validate_cw1_mm(result["cw1"])
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            reasons.append("cw1_out_of_goal_search_contract")
+        try:
+            primary_turns = int(float(result["N1_main"])) + int(
+                float(result["N1_side"])
+            )
+            if not GOAL_N1_MIN_TURNS <= primary_turns <= GOAL_N1_MAX_TURNS:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, OverflowError):
+            reasons.append("primary_turns_out_of_goal_search_contract")
+        try:
+            if dynamic_core_group_violation(result) > 0.0:
+                reasons.append("core_group_out_of_dynamic_validity")
+        except (RuntimeError, TypeError, ValueError):
+            reasons.append("core_group_dynamic_validity_unavailable")
     for column in (
         "P_winding_total", "P_core_total", "P_core_plate_total", "P_wcp_total",
         *SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,

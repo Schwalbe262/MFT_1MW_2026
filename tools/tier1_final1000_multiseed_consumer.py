@@ -27,6 +27,14 @@ from typing import Any, Mapping, Sequence
 import urllib.error
 import uuid
 
+from module.mft_goal_20260726_contract import (
+    GOAL_CONTRACT_SCHEMA,
+    GOAL_STAGE_SPEC_SHA256,
+    GOAL_TEMPERATURE_CONTRACT_SHA256,
+    is_goal_stage_spec,
+    validate_goal_stage_spec,
+)
+
 try:
     from tier1_corrected_current7_receipt import canonical_sha256
     from tier1_corrected_current7_slurm_harvest import (
@@ -225,6 +233,35 @@ CAPABILITIES = {
     "aedt_used": False,
     "fea_submission_performed": False,
 }
+
+
+def validate_goal_result_contract(value: Mapping[str, Any]) -> bool:
+    """Fail closed when a terminal/public record claims the new goal."""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError("goal consumer payload must be an object")
+    hard_spec = value.get("hard_spec")
+    claims_goal = (
+        is_goal_stage_spec(hard_spec)
+        or value.get("goal_contract_schema") == GOAL_CONTRACT_SCHEMA
+    )
+    if not claims_goal:
+        return False
+    if "T_limit_C" in value or (
+        isinstance(hard_spec, Mapping) and "T_limit_C" in hard_spec
+    ):
+        raise RuntimeError(
+            "goal consumer rejects legacy scalar T_limit_C"
+        )
+    normalized = validate_goal_stage_spec(hard_spec)
+    if (
+        value.get("stage_spec_sha256") != GOAL_STAGE_SPEC_SHA256
+        or canonical_sha256(normalized) != GOAL_STAGE_SPEC_SHA256
+        or value.get("temperature_contract_sha256")
+        != GOAL_TEMPERATURE_CONTRACT_SHA256
+    ):
+        raise RuntimeError("goal consumer contract identity mismatch")
+    return True
 
 
 def _utc_now() -> str:
@@ -868,6 +905,7 @@ def _v2_result_validator(parent_task: Mapping[str, Any]):
         payload: Mapping[str, Any],
         manifest: Mapping[str, Any],
     ) -> None:
+        validate_goal_result_contract(result)
         validate_current7_result(result, payload=payload, manifest=manifest)
         child = by_seed.get(int(payload["seed"]))
         if child is None or child.get("payload_json") != payload:
@@ -972,6 +1010,10 @@ def _validate_public_record(value: Mapping[str, Any]) -> dict[str, Any]:
         or record.get("record_sha256") != canonical_sha256(unsigned)
     ):
         raise RuntimeError("canonical seed record identity is invalid")
+    validate_goal_result_contract(record)
+    embedded_result = record.get("_result")
+    if isinstance(embedded_result, Mapping):
+        validate_goal_result_contract(embedded_result)
     return record
 
 
