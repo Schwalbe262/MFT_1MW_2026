@@ -950,6 +950,7 @@ def test_global_pareto_recomputes_from_all_terminal_rows_and_physicality(
     assert manifest["input_terminal_row_count"] == 1280
     assert manifest["physical_feasible_count"] == 1279
     assert manifest["global_pareto_count"] == 2
+    assert manifest["global_objective_front_count"] == 1
     assert manifest["seed_local_pareto_merge_used"] is False
     assert manifest["authenticated_bundle"]["task_count"] == 4
     assert manifest["authenticated_bundle"]["all_four_N1_strata_covered"] is True
@@ -960,6 +961,21 @@ def test_global_pareto_recomputes_from_all_terminal_rows_and_physicality(
             pareto["objective_total_loss_W"],
         )
     ) == [(100.0, 200.0), (110.0, 190.0)]
+    objective_front = pd.read_csv(
+        tmp_path / "global" / "global_objective_front.csv"
+    )
+    assert list(
+        zip(
+            objective_front["objective_volume_L"],
+            objective_front["objective_total_loss_W"],
+        )
+    ) == [(-100.0, -100.0)]
+    assert (
+        manifest["artifacts"]["global_objective_front"][
+            "constraint_authority"
+        ]
+        == "unconstrained_audit_only_not_fea_eligible"
+    )
     merged = pd.read_csv(
         tmp_path / "global" / "global_terminal_candidates.csv"
     )

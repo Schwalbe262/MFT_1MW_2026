@@ -1687,6 +1687,13 @@ def aggregate_results(
         ["objective_volume_L", "objective_total_loss_W"],
         inplace=True,
     )
+    objective_front = ranked.loc[
+        ranked["objective_rank_all"].eq(0)
+    ].copy()
+    objective_front.sort_values(
+        ["objective_volume_L", "objective_total_loss_W"],
+        inplace=True,
+    )
     standard_candidates = select_standard_candidates(
         ranked,
         objective_columns=(
@@ -1698,9 +1705,11 @@ def aggregate_results(
     output.mkdir(parents=True)
     all_path = output / "global_terminal_candidates.csv"
     pareto_path = output / "global_pareto_front.csv"
+    objective_front_path = output / "global_objective_front.csv"
     standard_path = output / "standard_candidates.csv"
     _atomic_csv(all_path, ranked)
     _atomic_csv(pareto_path, pareto)
+    _atomic_csv(objective_front_path, objective_front)
     _atomic_csv(standard_path, standard_candidates)
     manifest = _seal(
         {
@@ -1721,11 +1730,17 @@ def aggregate_results(
             "physical_feasible_count": int(feasible.sum()),
             "non_dominated_front_count": front_count,
             "global_pareto_count": int(len(pareto)),
+            "global_objective_front_count": int(len(objective_front)),
             "standard_candidate_count": int(len(standard_candidates)),
             "sorting_authority": (
                 "all_authenticated_terminal_rows_then_physical_dedupe_"
                 "then_decoder_and_physical_G_and_surrogate_physicality_"
                 "feasible_then_exact_2d_nlogn_non_dominated_sort"
+            ),
+            "objective_front_authority": (
+                "all_authenticated_terminal_rows_then_physical_dedupe_"
+                "then_exact_2d_nlogn_non_dominated_sort_without_constraint_"
+                "filter_audit_only_not_fea_eligible"
             ),
             "seed_local_pareto_merge_used": False,
             "common_identity": common_identity,
@@ -1764,6 +1779,14 @@ def aggregate_results(
                     "path": pareto_path.name,
                     "sha256": adapter.sha256_file(pareto_path),
                     "row_count": int(len(pareto)),
+                },
+                "global_objective_front": {
+                    "path": objective_front_path.name,
+                    "sha256": adapter.sha256_file(objective_front_path),
+                    "row_count": int(len(objective_front)),
+                    "constraint_authority": (
+                        "unconstrained_audit_only_not_fea_eligible"
+                    ),
                 },
                 "standard_candidates": {
                     "path": standard_path.name,

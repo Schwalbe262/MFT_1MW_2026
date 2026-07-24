@@ -147,12 +147,20 @@ python tools/mft_goal_20260726_launch.py aggregate `
 
 512-seed 본 실행 결과에는 `--minimum-seeds 512`를 사용한다. 출력은
 `global_terminal_candidates.csv`, `global_pareto_front.csv`,
+`global_objective_front.csv`,
 `aggregate_manifest.json`이며 입력 result와 공통 모델/데이터/물리 계약 SHA가
 모두 봉인된다. 수집기는 bundle의 원본 task ledger를 읽고 모든 task에 정확히
 한 result가 있는지, seed/N1/population 320/fixed 300 evaluated generations,
 Pymoo 종료 카운터 301과 네 N1 strata가 일치하는지 확인한다. 임의로
 self-seal한 result, 누락/중복 result, result 디렉터리 밖 artifact path는
 거부한다.
+
+`global_pareto_front.csv`는 모든 hard constraint를 통과한 설계에만 대한
+production Pareto이다. `global_objective_front.csv`는 전체 인증 terminal
+population을 합친 뒤 objective만으로 다시 계산한 audit Pareto이며, 제약 미통과
+행을 포함할 수 있으므로 FEA 제출이나 production 승격 권한이 없다. 따라서
+feasible front가 비어도 다중 seed 전체의 non-dominated sorting 증거는 보존하되,
+이를 조건 만족 설계로 오인하지 않는다.
 
 전역 Pareto에서 선정한 최종 후보는 동일한 fixed operating/cooling identity로
 full model과 symmetric model을 재실행하고 두 `.aedt` 파일 및 FEA 결과 identity를
