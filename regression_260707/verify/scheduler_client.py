@@ -114,12 +114,22 @@ _STANDARD_PROFILE = json.loads(
 STANDARD_PROFILE_CONTRACT = dict(_STANDARD_PROFILE["param_overrides"])
 DEFAULT_TASK_TIMEOUT_SECONDS = int(_STANDARD_PROFILE["timeout_seconds"])
 RETAINED_AEDT_SCHEMA = "mft-goal-fea-retained-aedt-v1"
+RETAINED_AEDT_BUNDLE_SCHEMA = "mft-goal-diagnostic-retained-aedt-bundle-v1"
 RETAINED_AEDT_RECEIPT_SCHEMA = "mft-goal-fea-remote-artifact-receipt-v1"
+RETAINED_AEDT_BUNDLE_RECEIPT_SCHEMA = (
+    "mft-goal-diagnostic-remote-artifact-bundle-receipt-v1"
+)
+RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA = (
+    "mft-goal-diagnostic-aedtresults-manifest-v1"
+)
 RETAINED_AEDT_ROOT = "goal-fea-retained"
 RETAINED_AEDT_TEXT_CHUNK_SCHEMA = "mft-goal-fea-base64-chunks-v1"
 RETAINED_AEDT_RAW_CHUNK_BYTES = 768_000
 RETAINED_AEDT_MAX_ENCODED_CHUNK_BYTES = 1_024_000
 RETAINED_AEDT_MAX_BYTES = 64 * 1024 * 1024 * 1024
+RETAINED_AEDT_RESULTS_MAX_BYTES = 512 * 1024 * 1024 * 1024
+RETAINED_AEDT_RESULTS_MAX_FILES = 250_000
+RETAINED_AEDT_RESULTS_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 SCHEDULER_PRESERVE_MARKER = ".slurm-scheduler-preserve.json"
 SCHEDULER_PRESERVE_SCHEMA = "slurm-scheduler-prune-protection-v1"
 RUNTIME_LICENSE_REFRESH_ENV = "MFT_STANDALONE_CORE_RUNTIME_LICENSE_REFRESH"
@@ -278,11 +288,13 @@ def validate_project_mutation_contract(
 
 def require_live_project_mutation_contract(
         *, expected_cap=None, require_full=False,
-        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
+        scheduler_url=None):
     """Read and validate the live project immediately before a task POST."""
+    base_url = str(scheduler_url or SCHEDULER).rstrip("/")
     try:
         response = requests.get(
-            f"{SCHEDULER}/api/projects/{MFT_PROJECT}", timeout=30)
+            f"{base_url}/api/projects/{MFT_PROJECT}", timeout=30)
         response.raise_for_status()
         project = response.json()
     except Exception as exc:
@@ -430,7 +442,8 @@ def _task_rows(response, source):
 def live_project_submission_snapshot(
         required_hard_cap=MFT_PROJECT_MAX_ACTIVE_TASKS, *,
         require_exact_project_cap=False, require_full_project=False,
-        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
+        scheduler_url=None):
     """Read the absolute logical-project budget while the mutation lock is held."""
     if not campaign_mutation_lock_is_held():
         raise ProjectCapacityError(
@@ -439,15 +452,18 @@ def live_project_submission_snapshot(
     if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
         validation_options["max_project_active_tasks"] = (
             max_project_active_tasks)
+    if scheduler_url is not None:
+        validation_options["scheduler_url"] = scheduler_url
     project = require_live_project_mutation_contract(
         expected_cap=(required_hard_cap if require_exact_project_cap else None),
         require_full=require_full_project,
         **validation_options,
     )
+    base_url = str(scheduler_url or SCHEDULER).rstrip("/")
     statuses = ",".join(MFT_ACTIVE_STATUSES)
     try:
         project_tasks = _task_rows(requests.get(
-            f"{SCHEDULER}/api/tasks",
+            f"{base_url}/api/tasks",
             params={
                 "limit": 10000,
                 "project": MFT_PROJECT,
@@ -456,7 +472,7 @@ def live_project_submission_snapshot(
             timeout=30,
         ), "MFT project")
         legacy_tasks = _task_rows(requests.get(
-            f"{SCHEDULER}/api/tasks",
+            f"{base_url}/api/tasks",
             params={
                 "limit": 10000,
                 "name_prefix": LEGACY_MFT_NAME_PREFIX,
@@ -479,13 +495,16 @@ def live_project_submission_snapshot(
     )
 
 
-def reconcile_task_id(name, dedupe_key, attempts=3, retry_delay=1):
+def reconcile_task_id(
+        name, dedupe_key, attempts=3, retry_delay=1, *,
+        scheduler_url=None):
     """Find the newest exact task identity, including projectless legacy rows."""
+    base_url = str(scheduler_url or SCHEDULER).rstrip("/")
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
             response = requests.get(
-                f"{SCHEDULER}/api/tasks",
+                f"{base_url}/api/tasks",
                 params={
                     "limit": 10000,
                     "name_prefix": name,
@@ -595,15 +614,31 @@ def retained_aedt_identity(
         "retention_required",
         "prune_protection_required",
     }
-    if not isinstance(retention, dict) or set(retention) != required:
+    bundle_required = {
+        *required,
+        "results_directory",
+        "results_manifest_filename",
+    }
+    if (
+        not isinstance(retention, dict)
+        or set(retention) not in {frozenset(required), frozenset(bundle_required)}
+    ):
         raise ValueError("retained AEDT profile contract is incomplete")
+    bundle_retention = (
+        retention.get("schema_version") == RETAINED_AEDT_BUNDLE_SCHEMA
+    )
     stage = str(retention.get("stage") or "")
     artifact = str(retention.get("artifact_filename") or "")
     receipt = str(retention.get("receipt_filename") or "")
     marker = str(retention.get("marker_filename") or "")
+    results_directory = str(retention.get("results_directory") or "")
+    results_manifest_filename = str(
+        retention.get("results_manifest_filename") or ""
+    )
     safe_name = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,126}")
     if (
-        retention.get("schema_version") != RETAINED_AEDT_SCHEMA
+        retention.get("schema_version")
+        not in {RETAINED_AEDT_SCHEMA, RETAINED_AEDT_BUNDLE_SCHEMA}
         or stage not in {"standard", "full"}
         or not safe_name.fullmatch(artifact)
         or not artifact.endswith(".aedt")
@@ -614,8 +649,23 @@ def retained_aedt_identity(
         or retention.get("prune_protection_required") is not True
     ):
         raise ValueError("retained AEDT profile contract is invalid")
-    expected_profile_path = (
-        Path(__file__).resolve().parent / "profiles" / f"goal_{stage}.json"
+    if bundle_retention:
+        if (
+            set(retention) != bundle_required
+            or stage != "standard"
+            or not safe_name.fullmatch(results_directory)
+            or not results_directory.endswith(".aedtresults")
+            or not safe_name.fullmatch(results_manifest_filename)
+            or not results_manifest_filename.endswith(".manifest.json")
+        ):
+            raise ValueError("retained AEDT result-bundle contract is invalid")
+        expected_profile_name = "goal_diagnostic_standard.json"
+    else:
+        if set(retention) != required:
+            raise ValueError("retained AEDT v1 profile contract is invalid")
+        expected_profile_name = f"goal_{stage}.json"
+    expected_profile_path = Path(__file__).resolve().parent / "profiles" / (
+        expected_profile_name
     )
     try:
         expected_profile = json.loads(
@@ -640,11 +690,17 @@ def retained_aedt_identity(
             ensure_ascii=True,
         ).encode("utf-8")
     ).hexdigest()
+    retention_reason = (
+        "Retain diagnostic Standard AEDT and AEDT results until authenticated "
+        "diagnostic collection"
+        if bundle_retention
+        else "Retain goal FEA AEDT until authenticated package collection"
+    )
     marker_contract = {
         "schema": SCHEDULER_PRESERVE_SCHEMA,
         "preserve": True,
         "reason": (
-            "Retain goal FEA AEDT until authenticated package collection; "
+            f"{retention_reason}; "
             f"stage={stage}; dedupe_key={identity['dedupe_key']}"
         ),
         "owner": MFT_PROJECT,
@@ -657,7 +713,7 @@ def retained_aedt_identity(
             ensure_ascii=True,
         ).encode("utf-8")
     ).hexdigest()
-    return {
+    retained = {
         "schema_version": RETAINED_AEDT_SCHEMA,
         "stage": stage,
         "dedupe_key": identity["dedupe_key"],
@@ -681,11 +737,29 @@ def retained_aedt_identity(
         "retention_required": True,
         "prune_protection_required": True,
     }
+    if bundle_retention:
+        retained.update(
+            {
+                "schema_version": RETAINED_AEDT_BUNDLE_SCHEMA,
+                "results_path": (
+                    f"{relative_directory}/{results_directory}"
+                ),
+                "results_manifest_path": (
+                    f"{relative_directory}/{results_manifest_filename}"
+                ),
+                "results_manifest_schema_version": (
+                    RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA
+                ),
+            }
+        )
+    return retained
 
 
 def _retained_aedt_export_command(retained):
     if retained is None:
         return ""
+    if retained.get("schema_version") == RETAINED_AEDT_BUNDLE_SCHEMA:
+        return _retained_aedt_bundle_export_command(retained)
     marker_contract_json = json.dumps(
         retained["marker_contract"],
         sort_keys=True,
@@ -779,6 +853,236 @@ def _retained_aedt_export_command(retained):
     )
 
 
+def _retained_aedt_bundle_export_command(retained):
+    """Export one Standard project and its adjacent ``.aedtresults`` tree.
+
+    The diagnostic contract uses an atomic directory rename, a complete
+    content-addressed results manifest, and the same Scheduler prune marker as
+    the production project-only retention path. It is intentionally available
+    only to the reviewed diagnostic Standard profile.
+    """
+    required = {
+        "results_path",
+        "results_manifest_path",
+        "results_manifest_schema_version",
+    }
+    if (
+        retained.get("schema_version") != RETAINED_AEDT_BUNDLE_SCHEMA
+        or retained.get("stage") != "standard"
+        or not required.issubset(retained)
+    ):
+        raise ValueError("retained AEDT result-bundle identity is incomplete")
+    marker_contract_json = json.dumps(
+        retained["marker_contract"],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    receipt_context = {
+        "schema_version": RETAINED_AEDT_BUNDLE_RECEIPT_SCHEMA,
+        "stage": retained["stage"],
+        "dedupe_key": retained["dedupe_key"],
+        "parameter_digest": retained["parameter_digest"],
+        "solver_revision": retained["solver_revision"],
+        "library_revision": retained["library_revision"],
+        "profile_sha256": retained["profile_sha256"],
+        "artifact_path": retained["artifact_path"],
+        "results_path": retained["results_path"],
+        "results_manifest_path": retained["results_manifest_path"],
+        "results_manifest_schema_version": retained[
+            "results_manifest_schema_version"
+        ],
+        "marker_path": retained["marker_path"],
+        "marker_contract_sha256": retained["marker_contract_sha256"],
+        "transport_schema_version": retained["transport"]["schema_version"],
+        "transport_encoding": retained["transport"]["encoding"],
+        "transport_chunk_directory": retained["transport"]["chunk_directory"],
+        "transport_raw_chunk_bytes": retained["transport"]["raw_chunk_bytes"],
+        "transport_max_encoded_chunk_bytes": retained["transport"][
+            "max_encoded_chunk_bytes"
+        ],
+        "retention_required": True,
+        "prune_protection_required": True,
+        "scheduler_cleanup_exclusion_required": True,
+    }
+    receipt_context_json = json.dumps(
+        receipt_context,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    script = f"""
+import base64
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import sys
+
+src = pathlib.Path(sys.argv[1])
+dst = pathlib.Path(sys.argv[2])
+receipt = pathlib.Path(sys.argv[3])
+marker = pathlib.Path(sys.argv[4])
+chunk_dir = pathlib.Path(sys.argv[5])
+results_dst = pathlib.Path(sys.argv[6])
+results_manifest = pathlib.Path(sys.argv[7])
+marker_payload = json.loads(sys.argv[8])
+context = json.loads(sys.argv[9])
+src_results = src.with_suffix(".aedtresults")
+if not src.is_file() or not src_results.is_dir():
+    raise RuntimeError("retained Standard project/result pair is incomplete")
+if any(path.is_symlink() for path in src_results.rglob("*")):
+    raise RuntimeError("retained AEDT results contain a symbolic link")
+source_size = src.stat().st_size
+if not 0 < source_size <= {RETAINED_AEDT_MAX_BYTES}:
+    raise RuntimeError("retained AEDT size is outside transport bounds")
+final_root = dst.parent
+if (
+    receipt.parent != final_root
+    or marker.parent != final_root
+    or chunk_dir.parent != final_root
+    or results_dst.parent != final_root
+    or results_manifest.parent != final_root
+):
+    raise RuntimeError("retained bundle outputs do not share one directory")
+final_root.parent.mkdir(parents=True, exist_ok=True)
+tmp_root = final_root.with_name("." + final_root.name + ".tmp")
+if final_root.exists() or tmp_root.exists():
+    raise RuntimeError("retained bundle destination already exists")
+tmp_root.mkdir()
+tmp_dst = tmp_root / dst.name
+tmp_receipt = tmp_root / receipt.name
+tmp_marker = tmp_root / marker.name
+tmp_chunks = tmp_root / chunk_dir.name
+tmp_results = tmp_root / results_dst.name
+tmp_results_manifest = tmp_root / results_manifest.name
+tmp_chunks.mkdir()
+h = hashlib.sha256()
+size = 0
+chunk_count = 0
+with src.open("rb") as source_handle, tmp_dst.open("xb") as target_handle:
+    while True:
+        chunk = source_handle.read({RETAINED_AEDT_RAW_CHUNK_BYTES})
+        if not chunk:
+            break
+        target_handle.write(chunk)
+        h.update(chunk)
+        size += len(chunk)
+        encoded = base64.b64encode(chunk)
+        if len(encoded) > {RETAINED_AEDT_MAX_ENCODED_CHUNK_BYTES}:
+            raise RuntimeError("encoded AEDT chunk exceeds transport limit")
+        chunk_path = tmp_chunks / ("%08d.b64" % chunk_count)
+        chunk_path.write_bytes(encoded)
+        chunk_count += 1
+    target_handle.flush()
+    os.fsync(target_handle.fileno())
+shutil.copytree(src_results, tmp_results, copy_function=shutil.copy2)
+inventory = []
+results_size = 0
+for path in sorted(
+    (item for item in tmp_results.rglob("*") if item.is_file()),
+    key=lambda item: item.relative_to(tmp_results).as_posix(),
+):
+    relative = path.relative_to(tmp_results).as_posix()
+    file_hash = hashlib.sha256()
+    file_size = 0
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            file_hash.update(block)
+            file_size += len(block)
+    results_size += file_size
+    inventory.append(
+        {{"path": relative, "sha256": file_hash.hexdigest(), "size_bytes": file_size}}
+    )
+if (
+    not inventory
+    or len(inventory) > {RETAINED_AEDT_RESULTS_MAX_FILES}
+    or results_size > {RETAINED_AEDT_RESULTS_MAX_BYTES}
+):
+    raise RuntimeError("retained AEDT results inventory is outside bounds")
+inventory_bytes = json.dumps(
+    inventory, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+).encode("utf-8")
+results_tree_sha256 = hashlib.sha256(inventory_bytes).hexdigest()
+manifest_payload = {{
+    "schema_version": "{RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA}",
+    "source_project_name": src.stem,
+    "source_results_directory_name": src_results.name,
+    "retained_results_directory_name": results_dst.name,
+    "file_count": len(inventory),
+    "size_bytes": results_size,
+    "tree_sha256": results_tree_sha256,
+    "files": inventory,
+}}
+manifest_data = (
+    json.dumps(
+        manifest_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    + "\\n"
+).encode("utf-8")
+if len(manifest_data) > {RETAINED_AEDT_RESULTS_MANIFEST_MAX_BYTES}:
+    raise RuntimeError("retained AEDT results manifest exceeds transport bound")
+tmp_results_manifest.write_bytes(manifest_data)
+marker_payload["created_at"] = (
+    datetime.datetime.now(datetime.timezone.utc)
+    .isoformat(timespec="seconds")
+    .replace("+00:00", "Z")
+)
+marker_data = (
+    json.dumps(marker_payload, sort_keys=True, separators=(",", ":")) + "\\n"
+).encode("utf-8")
+tmp_marker.write_bytes(marker_data)
+context.update(
+    {{
+        "artifact_sha256": h.hexdigest(),
+        "artifact_size_bytes": size,
+        "transport_chunk_count": chunk_count,
+        "marker_sha256": hashlib.sha256(marker_data).hexdigest(),
+        "source_project_filename": src.name,
+        "source_project_name": src.stem,
+        "source_results_directory_name": src_results.name,
+        "results_manifest_sha256": hashlib.sha256(manifest_data).hexdigest(),
+        "results_tree_sha256": results_tree_sha256,
+        "results_file_count": len(inventory),
+        "results_size_bytes": results_size,
+    }}
+)
+tmp_receipt.write_text(
+    json.dumps(context, sort_keys=True, separators=(",", ":")) + "\\n",
+    encoding="utf-8",
+)
+for path in tmp_root.rglob("*"):
+    os.chmod(path, 0o555 if path.is_dir() else 0o444)
+os.chmod(tmp_root, 0o555)
+os.replace(tmp_root, final_root)
+"""
+    return (
+        "mapfile -d '' MFT_RETAINED_PROJECTS < <("
+        "find \"$MFT_WORKDIR\" -type f -name '*.aedt' -print0); "
+        "[ \"${#MFT_RETAINED_PROJECTS[@]}\" -eq 1 ] || "
+        "{ printf 'retained AEDT project count mismatch: %s\\n' "
+        "\"${#MFT_RETAINED_PROJECTS[@]}\" >&2; exit 91; }; "
+        f"python -c {shlex.quote(script)} "
+        "\"${MFT_RETAINED_PROJECTS[0]}\" "
+        f"\"$MFT_TASK_ROOT/{retained['artifact_path']}\" "
+        f"\"$MFT_TASK_ROOT/{retained['receipt_path']}\" "
+        f"\"$MFT_TASK_ROOT/{retained['marker_path']}\" "
+        f"\"$MFT_TASK_ROOT/{retained['transport']['chunk_directory']}\" "
+        f"\"$MFT_TASK_ROOT/{retained['results_path']}\" "
+        f"\"$MFT_TASK_ROOT/{retained['results_manifest_path']}\" "
+        f"{shlex.quote(marker_contract_json)} "
+        f"{shlex.quote(receipt_context_json)} || exit $?; "
+    )
+
+
 def _runtime_license_refresh_command(
         retained, normalized_env, solver_revision):
     if retained is None or retained.get("stage") != "full":
@@ -851,7 +1155,8 @@ def submit_verification(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
-        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
+        scheduler_url=None):
     """Submit one MFT task under the shared cross-process mutation lock."""
     submission_options = {}
     if aedt_backend is not None:
@@ -863,6 +1168,8 @@ def submit_verification(
     if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
         submission_options["max_project_active_tasks"] = (
             max_project_active_tasks)
+    if scheduler_url is not None:
+        submission_options["scheduler_url"] = scheduler_url
     if campaign_mutation_lock_is_held():
         return _submit_verification_locked(
             name, workdir, params, profile, mem_mb=mem_mb, cpus=cpus,
@@ -895,12 +1202,17 @@ def _submit_verification_locked(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
-        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS):
+        max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
+        scheduler_url=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
     if not campaign_mutation_lock_is_held():
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
     if isinstance(priority, bool) or not isinstance(priority, int):
         raise ValueError("verification priority must be an integer")
+    base_url = str(scheduler_url or SCHEDULER).rstrip("/")
+    endpoint_options = (
+        {"scheduler_url": base_url} if scheduler_url is not None else {}
+    )
     account_name = str(account_name or "").strip()
     node_name = str(node_name or "").strip()
     if (isinstance(max_workers_per_node, bool)
@@ -916,7 +1228,6 @@ def _submit_verification_locked(
     )
     solver_revision = identity["solver_revision"]
     library_revision = identity["library_revision"]
-    merged = identity["merged"]
     timeout_seconds = int(profile.get(
         "timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS))
     if timeout_seconds <= 0:
@@ -1079,7 +1390,7 @@ def _submit_verification_locked(
         payload["env_setup"] = pooled_env_setup
     if aedt_backend is not None:
         payload["aedt_backend"] = aedt_backend
-    existing = reconcile_task_id(name, dedupe_key)
+    existing = reconcile_task_id(name, dedupe_key, **endpoint_options)
     if existing is not None:
         return existing
     max_project_active_tasks = _validated_project_cap_ceiling(
@@ -1113,20 +1424,22 @@ def _submit_verification_locked(
             required_hard_cap,
             require_exact_project_cap=True,
             require_full_project=True,
+            **endpoint_options,
             **validation_options,
         )
     else:
         capacity = live_project_submission_snapshot(
-            required_hard_cap, **validation_options)
+            required_hard_cap, **endpoint_options, **validation_options)
     if capacity["project_submission_slots"] < 1:
         raise ProjectCapacityError(
             f"MFT project has no submission slots under cap "
             f"{required_hard_cap}: {capacity}")
     try:
-        r = requests.post(f"{SCHEDULER}/api/tasks", json=payload, timeout=20)
+        r = requests.post(f"{base_url}/api/tasks", json=payload, timeout=20)
     except Exception as post_error:
         try:
-            recovered = reconcile_task_id(name, dedupe_key)
+            recovered = reconcile_task_id(
+                name, dedupe_key, **endpoint_options)
         except TaskLookupError as lookup_error:
             raise TaskSubmissionUncertain(
                 f"POST response and reconciliation were both unavailable for {name!r}"
@@ -1137,7 +1450,8 @@ def _submit_verification_locked(
             f"POST response was lost and no durable task is visible yet for {name!r}"
         ) from post_error
     if r.status_code not in (200, 201):
-        recovered = reconcile_task_id(name, dedupe_key)
+        recovered = reconcile_task_id(
+            name, dedupe_key, **endpoint_options)
         if recovered is not None:
             return recovered
         return None
@@ -1148,7 +1462,7 @@ def _submit_verification_locked(
             return int(task_id)
     except Exception:
         pass
-    recovered = reconcile_task_id(name, dedupe_key)
+    recovered = reconcile_task_id(name, dedupe_key, **endpoint_options)
     if recovered is not None:
         return recovered
     raise TaskSubmissionUncertain(
@@ -1156,9 +1470,12 @@ def _submit_verification_locked(
     )
 
 
-def get_status(task_id):
+def get_status(task_id, *, scheduler_url=None):
+    base_url = str(scheduler_url or SCHEDULER).rstrip("/")
     try:
-        return requests.get(f"{SCHEDULER}/api/tasks/{task_id}", timeout=15).json().get("status")
+        return requests.get(
+            f"{base_url}/api/tasks/{task_id}", timeout=15
+        ).json().get("status")
     except Exception:
         return None
 
@@ -1682,7 +1999,8 @@ def is_valid_result(
 
 def fetch_result(
         task_id, attempts=3, retry_delay=2, expected_revision=None,
-        expected_library_revision=None, expected_profile=None):
+        expected_library_revision=None, expected_profile=None, *,
+        scheduler_url=None):
     """Return the latest well-formed RESULT_JSON and its validity state.
 
     Transport failures raise ResultFetchError. A successful stdout read with no
@@ -1691,10 +2009,11 @@ def fetch_result(
     """
     out = None
     last_error = None
+    base_url = str(scheduler_url or SCHEDULER).rstrip("/")
     for attempt in range(1, attempts + 1):
         try:
             response = requests.get(
-                f"{SCHEDULER}/api/tasks/{task_id}/stdout",
+                f"{base_url}/api/tasks/{task_id}/stdout",
                 params={"max_bytes": MAX_STDOUT_BYTES}, timeout=30)
             response.raise_for_status()
             out = response.text

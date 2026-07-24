@@ -591,6 +591,8 @@ def _rows_equivalent(selected: Mapping[str, Any], source: Mapping[str, Any]) -> 
 
 def _authenticate_bundle(
     bundle_manifest_path: Path,
+    *,
+    allow_search_only: bool = False,
 ) -> tuple[
     dict[str, Any],
     dict[str, dict[str, Any]],
@@ -615,7 +617,11 @@ def _authenticate_bundle(
         or bundle.get("stage_spec_sha256") != GOAL_STAGE_SPEC_SHA256
         or bundle.get("temperature_contract_sha256")
         != GOAL_TEMPERATURE_CONTRACT_SHA256
-        or bundle.get("search_only_proposal") is not False
+        or not isinstance(bundle.get("search_only_proposal"), bool)
+        or (
+            not allow_search_only
+            and bundle.get("search_only_proposal") is not False
+        )
         or bundle.get("production_eligible") is not False
         or bundle.get("automatic_promotion_allowed") is not False
         or bundle.get("scheduler_project_modified") is not False
@@ -727,6 +733,7 @@ def _authenticate_aggregate_authority(
     aggregate: Mapping[str, Any],
     manifest_path: Path,
     bundle_manifest_path: Path,
+    allow_search_only: bool = False,
 ) -> dict[str, Any]:
     from tools.mft_goal_global_pareto import rank_candidates
 
@@ -735,7 +742,10 @@ def _authenticate_aggregate_authority(
         bundle_tasks,
         bundle_task_paths,
         bundle_code_authentication,
-    ) = _authenticate_bundle(bundle_manifest_path)
+    ) = _authenticate_bundle(
+        bundle_manifest_path,
+        allow_search_only=allow_search_only,
+    )
     authenticated_bundle = aggregate.get("authenticated_bundle")
     expected_bundle_authority = {
         "path": str(bundle_manifest_path.resolve(strict=True)),
