@@ -19,6 +19,7 @@ import math
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 from contextlib import contextmanager
@@ -33,7 +34,7 @@ from module.modeling_260706 import (
     compute_layer_positions,
 )
 from module.input_parameter_260706 import get_tx_y_gaps, set_design_variables
-from module.core_material_contract import PHYSICS_DATA_REVISION
+from module.core_material_contract import PHYSICS_DATA_REVISION, _aedt_number
 from module.thermal_probe_contract import (
     ProbeSheetCollection,
     RX_SIDE_FACE_MAX_RULE,
@@ -48,6 +49,9 @@ from module.aedt_terminal_attestation import (
     advance_scoped_message_cursor,
     capture_scoped_message_cursor,
 )
+from module.fixed_boundary_contract import (
+    FIXED_THERMAL_PAD_CONDUCTIVITY_W_MK,
+)
 
 
 def _native_solver(app):
@@ -58,6 +62,497 @@ def _native_solver(app):
 
 _THERMAL_DESIGN_NAME = "icepak_thermal"
 _THERMAL_SETUP_NAME = "ThermalSetup"
+THERMAL_PAD_CONDUCTIVITY_W_MK = FIXED_THERMAL_PAD_CONDUCTIVITY_W_MK
+THERMAL_PAD_MATERIAL_POLICY = (
+    "fixed_boundary_tim_k0p2_native_attested_0p2WmK_"
+    "electrically_insulating_v1"
+)
+THERMAL_PAD_NATIVE_READBACK_CONTRACT_VERSION = (
+    "thermal-pad-native-material-readback-v1"
+)
+RX_EXPLICIT_INSULATION_MATERIAL = "winding_insulation"
+RX_EXPLICIT_INSULATION_POLICY = (
+    "rx-explicit-interturn-solid-candidate-k-ins-native-attested-v1"
+)
+RX_EXPLICIT_INSULATION_NATIVE_READBACK_CONTRACT_VERSION = (
+    "rx-explicit-insulation-native-material-readback-v1"
+)
+_RX_INSULATION_KEYS = (
+    "Rx_main_insulation",
+    "Rx_side_insulation",
+    "Rx_side2_insulation",
+)
+THERMAL_MESH_POLICY = "b3-rxmain-l5-wcp-pad-padded-regions-v1"
+THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v4"
+THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION = "thermal-mesh-preflight-v2"
+WCP_PAD_MESH_REGION_PADDING_TYPE = "Absolute Offset"
+WCP_PAD_MESH_REGION_PADDING_MM = 2.0
+_WCP_PAD_MESH_REGION_DIRECTIONS = (
+    "+X", "-X", "+Y", "-Y", "+Z", "-Z",
+)
+THERMAL_FLUENT_PROCESS_CONTRACT_VERSION = (
+    "thermal-fluent-total-processes-v1"
+)
+_THERMAL_UNMESHED_OBJECT = re.compile(
+    r"'(?P<object>[^']+)'\s*:\s*Object\s+does\s+not\s+have\s+mesh\b",
+    re.IGNORECASE,
+)
+
+
+def _standalone_thermal_parallel_policy(sim):
+    """Map one standalone CPU allocation to total Fluent worker processes.
+
+    Maxwell interprets ``NumCores`` as the requested core count and keeps
+    ``NumEngines=1``.  Icepak 2025.2 instead forwards ``NumEngines`` to
+    Fluent's ``-t``/``nprocs_string`` value and does not use ``NumCores`` as a
+    multiplier.  Keep the runner's one-task Maxwell contract unchanged while
+    requesting the same total count in both PyAEDT arguments for Icepak.
+    """
+
+    try:
+        total_processes = int(sim.NUM_CORE)
+        maxwell_tasks = int(getattr(sim, "NUM_TASK", 1))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "standalone Icepak parallel policy has invalid runner counts"
+        ) from exc
+    if total_processes < 1:
+        raise RuntimeError(
+            "standalone Icepak parallel policy requires a positive process count"
+        )
+    if maxwell_tasks != 1:
+        raise RuntimeError(
+            "standalone Icepak parallel policy must not change the one-engine "
+            f"Maxwell contract: NUM_TASK={maxwell_tasks}"
+        )
+
+    core_policy = dict(getattr(sim, "solver_core_policy", {}) or {})
+    strict = core_policy.get("opt_in") is True
+    if strict:
+        expected = {
+            "backend": "standalone",
+            "requested_num_cores": total_processes,
+            "effective_num_cores": total_processes,
+            "num_tasks": 1,
+            "slurm_cpus_per_task_readback": total_processes,
+        }
+        mismatches = {}
+        for key, value in expected.items():
+            actual = core_policy.get(key)
+            if key != "backend":
+                try:
+                    actual = int(actual)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            if actual != value:
+                mismatches[key] = {"expected": value, "actual": actual}
+        try:
+            affinity = int(core_policy.get("affinity_count_readback"))
+        except (TypeError, ValueError, OverflowError):
+            affinity = -1
+        if affinity < total_processes:
+            mismatches["affinity_count_readback"] = {
+                "expected_minimum": total_processes,
+                "actual": affinity,
+            }
+        if mismatches:
+            raise RuntimeError(
+                "standalone Icepak parallel policy does not match the "
+                f"authenticated allocation: {mismatches}"
+            )
+
+    policy = {
+        "schema": THERMAL_FLUENT_PROCESS_CONTRACT_VERSION,
+        "backend": "standalone",
+        "strict_attestation": strict,
+        "allocated_cpus": total_processes,
+        "maxwell_num_engines_unchanged": maxwell_tasks,
+        "pyaedt_cores_argument": total_processes,
+        "pyaedt_tasks_argument": total_processes,
+        "pyaedt_use_auto_settings_argument": False,
+        "expected_fluent_processes": total_processes,
+        "icepak_num_engines_semantics": "total_fluent_processes_not_multiplier",
+    }
+    sim.thermal_parallel_policy = dict(policy)
+    return policy
+
+
+def _thermal_hpc_acf_snapshot(native_ipk):
+    """Capture the exact Icepak ACF identity before PyAEDT rewrites it."""
+
+    working_directory = str(
+        getattr(native_ipk, "working_directory", "") or ""
+    ).strip()
+    if not working_directory:
+        raise RuntimeError(
+            "standalone Icepak HPC working directory is unavailable"
+        )
+    path = Path(working_directory).resolve() / "pyaedt_config.acf"
+    snapshot = {"path": str(path), "exists": path.is_file()}
+    if path.is_file():
+        stat_result = path.stat()
+        snapshot.update({
+            "size_bytes": int(stat_result.st_size),
+            "mtime_ns": int(stat_result.st_mtime_ns),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        })
+    return snapshot
+
+
+def _validated_thermal_hpc_acf(native_ipk, policy, before):
+    """Fail closed unless PyAEDT wrote the exact Icepak 16-process ACF."""
+
+    expected_path = Path(str(before.get("path", ""))).resolve()
+    current_path = Path(
+        str(_thermal_hpc_acf_snapshot(native_ipk)["path"])
+    ).resolve()
+    if current_path != expected_path:
+        raise RuntimeError(
+            "standalone Icepak HPC ACF path changed across dispatch: "
+            f"before={expected_path}, after={current_path}"
+        )
+    if not current_path.is_file():
+        raise RuntimeError(
+            f"standalone Icepak HPC ACF is missing: {current_path}"
+        )
+    stat_result = current_path.stat()
+    if stat_result.st_size <= 0 or stat_result.st_size > 65536:
+        raise RuntimeError(
+            f"standalone Icepak HPC ACF has invalid size: {current_path}"
+        )
+    text = current_path.read_text(encoding="utf-8", errors="strict")
+    total = int(policy["expected_fluent_processes"])
+    expected = {
+        "ConfigName": "'pyaedt_config'",
+        "DesignType": "'Icepak'",
+        "MachineName": "'localhost'",
+        "NumEngines": str(total),
+        "NumCores": str(total),
+        "NumGPUs": "0",
+        "UseAutoSettings": "False",
+    }
+    mismatches = {}
+    for key, value in expected.items():
+        matches = re.findall(
+            rf"(?m)^\s*{re.escape(key)}\s*=\s*([^\r\n]+?)\s*$",
+            text,
+        )
+        if matches != [value]:
+            mismatches[key] = {"expected": value, "actual": matches}
+    begin_count = text.count("$begin 'DSOConfig'")
+    end_count = text.count("$end 'DSOConfig'")
+    if begin_count != 1 or end_count != 1:
+        mismatches["DSOConfig"] = {
+            "expected": {"begin": 1, "end": 1},
+            "actual": {"begin": begin_count, "end": end_count},
+        }
+    if mismatches:
+        raise RuntimeError(
+            "standalone Icepak HPC ACF contract mismatch: "
+            f"{mismatches}"
+        )
+
+    current_identity = {
+        "size_bytes": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
+    if before.get("exists") is True and all(
+        current_identity.get(key) == before.get(key)
+        for key in ("size_bytes", "mtime_ns", "sha256")
+    ):
+        raise RuntimeError(
+            "standalone Icepak HPC ACF was not freshly rewritten for dispatch"
+        )
+    return {
+        "schema": "thermal-icepak-hpc-acf-readback-v1",
+        "passed": True,
+        "path": str(current_path),
+        "num_cores_readback": total,
+        "num_engines_readback": total,
+        "num_gpus_readback": 0,
+        "use_auto_settings_readback": False,
+        "acf_sha256": current_identity["sha256"],
+        "fresh_rewrite_attested": True,
+    }
+
+
+def _fluent_process_counts(commandline):
+    """Return explicit Fluent total-process declarations from one command."""
+
+    text = str(commandline or "")
+    thread_counts = [
+        int(value) for value in re.findall(
+            r"(?<!\S)-t\s*([1-9][0-9]*)(?=\s|$)", text
+        )
+    ]
+    nprocs_counts = [
+        int(value) for value in re.findall(
+            r"(?:^|[\s,;])nprocs_string\s*=\s*"
+            r"['\"]?([1-9][0-9]*)['\"]?(?=$|[\s,;])",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ]
+    return {
+        "thread_counts": thread_counts,
+        "nprocs_counts": nprocs_counts,
+    }
+
+
+def _is_fluent_runtime_command(commandline):
+    text = str(commandline or "").casefold()
+    return any(token in text for token in (
+        "fluent", "cortex", "3ddp_host", "3ddp_node", "nprocs_string=",
+    ))
+
+
+class _StandaloneThermalProcessAttestor:
+    """Observe only new descendants and attest Fluent's actual ``-t`` value."""
+
+    def __init__(self, expected_processes, root_pid=None, poll_s=0.1):
+        self.expected_processes = int(expected_processes)
+        self.root_pid = int(os.getpid() if root_pid is None else root_pid)
+        self.poll_s = float(poll_s)
+        self._stop = threading.Event()
+        self._thread = None
+        self._baseline = {}
+        self._records = {}
+        self._scan_count = 0
+        self._successful_scan_count = 0
+        self._scan_errors = []
+
+    @staticmethod
+    def _descendants(root_pid):
+        import psutil
+
+        root = psutil.Process(int(root_pid))
+        records = {}
+        for process in root.children(recursive=True):
+            try:
+                argv = [str(value) for value in (process.cmdline() or [])]
+                commandline = " ".join(shlex.quote(value) for value in argv)
+                records[int(process.pid)] = {
+                    "pid": int(process.pid),
+                    "ppid": int(process.ppid()),
+                    "create_time": float(process.create_time()),
+                    "name": str(process.name() or ""),
+                    "argv": argv,
+                    "commandline": commandline,
+                }
+            except (
+                psutil.NoSuchProcess,
+                psutil.AccessDenied,
+                OSError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+        return records
+
+    @staticmethod
+    def _identity(record):
+        return (int(record["pid"]), round(float(record["create_time"]), 3))
+
+    def start(self):
+        self._baseline = {
+            self._identity(record): record
+            for record in self._descendants(self.root_pid).values()
+        }
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mft-icepak-process-attestor",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._scan_count += 1
+            try:
+                current = self._descendants(self.root_pid)
+                self._successful_scan_count += 1
+                for record in current.values():
+                    identity = self._identity(record)
+                    if identity in self._baseline:
+                        continue
+                    commandline = record["commandline"]
+                    if not _is_fluent_runtime_command(commandline):
+                        continue
+                    counts = _fluent_process_counts(commandline)
+                    key = (
+                        identity,
+                        commandline,
+                    )
+                    if key in self._records:
+                        continue
+                    captured = {
+                        **record,
+                        **counts,
+                    }
+                    self._records[key] = captured
+                    if counts["thread_counts"] or counts["nprocs_counts"]:
+                        logging.warning(
+                            "[thermal] Fluent process command observed: %s",
+                            json.dumps(
+                                captured,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=True,
+                            ),
+                        )
+            except Exception as exc:
+                self._scan_errors.append(
+                    f"{type(exc).__name__}: {str(exc)[:256]}"
+                )
+                self._scan_errors = self._scan_errors[-8:]
+            self._stop.wait(self.poll_s)
+
+    def finish(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(2.0, self.poll_s * 10.0))
+            if self._thread.is_alive():
+                raise RuntimeError(
+                    "standalone Icepak process attestor did not stop"
+                )
+        records = list(self._records.values())
+        explicit = [
+            record for record in records
+            if record["thread_counts"] or record["nprocs_counts"]
+        ]
+        thread_values = [
+            value for record in explicit
+            for value in record["thread_counts"]
+        ]
+        nprocs_values = [
+            value for record in explicit
+            for value in record["nprocs_counts"]
+        ]
+        all_values = [*thread_values, *nprocs_values]
+        expected = self.expected_processes
+        mismatches = sorted(set(
+            value for value in all_values if value != expected
+        ))
+        evidence = {
+            "schema": "thermal-fluent-process-command-attestation-v1",
+            "passed": bool(thread_values) and not mismatches,
+            "expected_fluent_processes": expected,
+            "thread_count_readbacks": thread_values,
+            "nprocs_count_readbacks": nprocs_values,
+            "mismatched_process_counts": mismatches,
+            "oversubscription_detected": any(
+                value > expected for value in all_values
+            ),
+            "scan_count": int(self._scan_count),
+            "successful_scan_count": int(self._successful_scan_count),
+            "scan_errors": list(self._scan_errors),
+            "commands": explicit[:32],
+        }
+        if self._successful_scan_count < 1:
+            raise RuntimeError(
+                "standalone Icepak process attestation had no successful scan: "
+                + json.dumps(evidence, sort_keys=True)[:2000]
+            )
+        if not thread_values:
+            raise RuntimeError(
+                "standalone Icepak process attestation observed no Fluent -t "
+                "command: " + json.dumps(evidence, sort_keys=True)[:2000]
+            )
+        if mismatches:
+            raise RuntimeError(
+                "standalone Icepak process count mismatch: "
+                + json.dumps(evidence, sort_keys=True)[:4000]
+            )
+        return evidence
+
+
+def _raw_aedt_material_props(materials, material_name):
+    """Return fresh native material data, bypassing PyAEDT's assigned cache."""
+    manager = getattr(materials, "omaterial_manager", None)
+    if manager is None or not callable(getattr(manager, "GetData", None)):
+        raise RuntimeError("AEDT material manager cannot provide native readback")
+    try:
+        raw = list(manager.GetData(str(material_name)))
+        from ansys.aedt.core.generic.data_handlers import _arg2dict
+
+        parsed = {}
+        _arg2dict(raw, parsed)
+    except Exception as exc:
+        raise RuntimeError(
+            f"native AEDT material readback failed for {material_name!r}"
+        ) from exc
+    if len(parsed) != 1:
+        raise RuntimeError(
+            f"unexpected native material payload for {material_name!r}: "
+            f"top-level keys={list(parsed)}"
+        )
+    props = next(iter(parsed.values()))
+    if not isinstance(props, dict) or not props:
+        raise RuntimeError(
+            f"native AEDT material payload is empty for {material_name!r}"
+        )
+    return props
+
+
+def _thermal_pad_native_readback(materials):
+    """Fail closed unless AEDT itself reports the requested TIM properties."""
+    props = _raw_aedt_material_props(materials, "thermal_pad")
+    thermal_k = _aedt_number(
+        props.get("thermal_conductivity"),
+        "thermal_pad.thermal_conductivity",
+    )
+    electrical_sigma = _aedt_number(
+        props.get("conductivity"),
+        "thermal_pad.conductivity",
+    )
+    if not math.isclose(
+        thermal_k,
+        THERMAL_PAD_CONDUCTIVITY_W_MK,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError(
+            "native thermal_pad thermal_conductivity mismatch: "
+            f"{thermal_k!r} != {THERMAL_PAD_CONDUCTIVITY_W_MK!r}"
+        )
+    if not math.isclose(
+        electrical_sigma,
+        0.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError(
+            "native thermal_pad conductivity mismatch: "
+            f"{electrical_sigma!r} != 0.0"
+        )
+    return {
+        "thermal_conductivity_W_mK": thermal_k,
+        "electrical_conductivity_S_m": electrical_sigma,
+    }
+
+
+def _thermal_pad_result_metadata(native_readback):
+    """Record both requested policy and fresh native AEDT material readback."""
+    if not isinstance(native_readback, dict):
+        raise RuntimeError("thermal_pad native readback evidence is missing")
+    return {
+        "thermal_pad_conductivity_W_mK": [
+            THERMAL_PAD_CONDUCTIVITY_W_MK
+        ],
+        "thermal_pad_material_policy": [THERMAL_PAD_MATERIAL_POLICY],
+        "thermal_pad_native_readback_contract_version": [
+            THERMAL_PAD_NATIVE_READBACK_CONTRACT_VERSION
+        ],
+        "thermal_pad_native_readback_attested": [1],
+        "thermal_pad_native_thermal_conductivity_W_mK": [
+            float(native_readback["thermal_conductivity_W_mK"])
+        ],
+        "thermal_pad_native_electrical_conductivity_S_m": [
+            float(native_readback["electrical_conductivity_S_m"])
+        ],
+    }
 
 
 @contextmanager
@@ -130,6 +625,95 @@ def _blocking_solve_log_heartbeat(project_name, design_name, setup_name):
             design_name,
             setup_name,
         )
+
+
+def _rx_insulation_native_readback(materials, expected_thermal_k):
+    """Fail closed unless AEDT reports the explicit Rx insulation material."""
+    expected = float(expected_thermal_k)
+    if not math.isfinite(expected) or expected <= 0.0:
+        raise ValueError(
+            "winding_insulation expected thermal conductivity must be "
+            f"finite and > 0, got {expected_thermal_k!r}"
+        )
+    props = _raw_aedt_material_props(
+        materials, RX_EXPLICIT_INSULATION_MATERIAL
+    )
+    thermal_k = _aedt_number(
+        props.get("thermal_conductivity"),
+        f"{RX_EXPLICIT_INSULATION_MATERIAL}.thermal_conductivity",
+    )
+    electrical_sigma = _aedt_number(
+        props.get("conductivity"),
+        f"{RX_EXPLICIT_INSULATION_MATERIAL}.conductivity",
+    )
+    if not math.isclose(
+        thermal_k, expected, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise RuntimeError(
+            "native winding_insulation thermal_conductivity mismatch: "
+            f"{thermal_k!r} != {expected!r}"
+        )
+    if not math.isclose(
+        electrical_sigma, 0.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise RuntimeError(
+            "native winding_insulation conductivity mismatch: "
+            f"{electrical_sigma!r} != 0.0"
+        )
+    return {
+        "thermal_conductivity_W_mK": thermal_k,
+        "electrical_conductivity_S_m": electrical_sigma,
+    }
+
+
+def _rx_insulation_result_metadata(material_readback, counts):
+    """Emit topology and native-material evidence for explicit Rx insulation."""
+    normalized = {
+        key: int(counts.get(key, 0)) for key in _RX_INSULATION_KEYS
+    }
+    if any(value < 0 for value in normalized.values()):
+        raise RuntimeError(
+            f"invalid explicit Rx insulation counts: {normalized}"
+        )
+    total = sum(normalized.values())
+    native = (
+        material_readback.get("rx_explicit_insulation")
+        if isinstance(material_readback, dict) else None
+    )
+    if total and not isinstance(native, dict):
+        raise RuntimeError(
+            "explicit Rx insulation exists without native material readback"
+        )
+    return {
+        "thermal_rx_explicit_insulation_model": [
+            "solid_interturn_candidate_k_ins_v1"
+            if total else "not_required_no_adjacent_explicit_foils_v1"
+        ],
+        "thermal_rx_explicit_insulation_policy": [
+            RX_EXPLICIT_INSULATION_POLICY
+        ],
+        "thermal_rx_explicit_insulation_material": [
+            RX_EXPLICIT_INSULATION_MATERIAL if total else ""
+        ],
+        "thermal_rx_explicit_insulation_count": [total],
+        "thermal_rx_explicit_insulation_counts_json": [
+            json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        ],
+        "thermal_rx_explicit_insulation_native_readback_contract_version": [
+            RX_EXPLICIT_INSULATION_NATIVE_READBACK_CONTRACT_VERSION
+        ],
+        "thermal_rx_explicit_insulation_native_readback_attested": [
+            1 if total else 0
+        ],
+        "thermal_rx_explicit_insulation_native_thermal_conductivity_W_mK": [
+            float(native["thermal_conductivity_W_mK"])
+            if total else float("nan")
+        ],
+        "thermal_rx_explicit_insulation_native_electrical_conductivity_S_m": [
+            float(native["electrical_conductivity_S_m"])
+            if total else float("nan")
+        ],
+    }
 
 
 def _field_summary_data_frame(sim, field_summary, setup):
@@ -468,11 +1052,169 @@ def _require_thermal_geometry(
         raise RuntimeError(f"thermal geometry is missing required groups: {missing_groups}")
 
 
+def _cooling_plate_mesh_assemblies(objs):
+    """Return exact physical cooling-plate assemblies for local refinement.
+
+    A transformer-wide pad operation makes its refinement box span distant
+    core and winding plates.  Group each aluminum plate with only its two
+    adjacent TIM solids instead, while meshing every controlled object
+    separately so none of the thin pads can disappear from a shared bounding
+    region.  This mesh control does not change the model's thermal contacts.
+    """
+
+    specs = (
+        {
+            "kind": "core_plate",
+            "plates": objs.get("core_plates", []),
+            "pads": objs.get("core_pads", []),
+            "plate": re.compile(
+                r"^core_plate_(?P<index>\d+)_"
+                r"(?P<side>side_left|center|side_right)$"
+            ),
+            "pad": re.compile(
+                r"^core_plate_pad_(?P<index>\d+)_(?P<layer>a|b)_"
+                r"(?P<side>side_left|center|side_right)$"
+            ),
+            "layers": ("a", "b"),
+            # Core TIMs were all represented in the failed replicas.  Preserve
+            # their proven level while removing the giant global pad box.
+            "level": 2,
+        },
+        {
+            "kind": "wcp",
+            "plates": objs.get("wcp_plates", []),
+            "pads": objs.get("wcp_pads", []),
+            "plate": re.compile(
+                r"^Tx_main_wcp_(?P<index>\d+)_(?P<side>[pn])$"
+            ),
+            "pad": re.compile(
+                r"^Tx_main_wcp_pad_(?P<index>\d+)_"
+                r"(?P<layer>in|out)_(?P<side>[pn])$"
+            ),
+            "layers": ("in", "out"),
+            # The candidate's eight 1 mm winding TIMs disappeared at level 2.
+            # Level 5 is bounded to four local plate assemblies.
+            "level": 5,
+        },
+    )
+    assemblies = []
+    for spec in specs:
+        plates = list(spec["plates"])
+        pads = list(spec["pads"])
+        if not pads:
+            continue
+        by_key = {}
+        for obj in plates:
+            name = str(obj.name)
+            match = spec["plate"].fullmatch(name)
+            if not match:
+                raise RuntimeError(
+                    f"unexpected {spec['kind']} plate name: {name!r}"
+                )
+            key = (int(match.group("index")), match.group("side"))
+            entry = by_key.setdefault(
+                key, {"plate": None, "pads": {}}
+            )
+            if entry["plate"] is not None:
+                raise RuntimeError(
+                    f"duplicate {spec['kind']} plate assembly: {key!r}"
+                )
+            entry["plate"] = obj
+        for obj in pads:
+            name = str(obj.name)
+            match = spec["pad"].fullmatch(name)
+            if not match:
+                raise RuntimeError(
+                    f"unexpected {spec['kind']} pad name: {name!r}"
+                )
+            key = (int(match.group("index")), match.group("side"))
+            layer = match.group("layer")
+            entry = by_key.setdefault(
+                key, {"plate": None, "pads": {}}
+            )
+            if layer in entry["pads"]:
+                raise RuntimeError(
+                    f"duplicate {spec['kind']} pad {key!r}/{layer!r}"
+                )
+            entry["pads"][layer] = obj
+        expected_layers = set(spec["layers"])
+        for key in sorted(by_key, key=lambda item: (item[0], item[1])):
+            entry = by_key[key]
+            actual_layers = set(entry["pads"])
+            if entry["plate"] is None or actual_layers != expected_layers:
+                raise RuntimeError(
+                    f"incomplete {spec['kind']} assembly {key!r}: "
+                    f"plate={entry['plate'] is not None}, "
+                    f"pad_layers={sorted(actual_layers)!r}, "
+                    f"expected={sorted(expected_layers)!r}"
+                )
+            index, side = key
+            assemblies.append({
+                "kind": spec["kind"],
+                "name": (
+                    f"{spec['kind']}_assembly_mesh_level_{index}_{side}"
+                ),
+                "level": int(spec["level"]),
+                "objects": [
+                    entry["plate"],
+                    *(entry["pads"][layer] for layer in spec["layers"]),
+                ],
+            })
+    return assemblies
+
+
+def _thermal_mesh_length_mm(value, label):
+    """Normalize one AEDT mesh-envelope length to millimetres."""
+    if isinstance(value, bool):
+        raise ValueError(f"{label} is not a mesh length: {value!r}")
+    match = re.fullmatch(
+        r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+        r"\s*([A-Za-z\u00b5]*)\s*",
+        str(value),
+    )
+    if not match:
+        raise ValueError(f"{label} is not a mesh length: {value!r}")
+    number = float(match.group(1))
+    unit = match.group(2).casefold().replace("\u00b5", "u")
+    scale = {
+        "": 1.0,
+        "mm": 1.0,
+        "millimeter": 1.0,
+        "millimeters": 1.0,
+        "um": 1e-3,
+        "micrometer": 1e-3,
+        "micrometers": 1e-3,
+        "cm": 10.0,
+        "m": 1000.0,
+        "meter": 1000.0,
+        "meters": 1000.0,
+    }.get(unit)
+    if scale is None or not math.isfinite(number):
+        raise ValueError(
+            f"{label} has unsupported/nonfinite units: {value!r}"
+        )
+    return number * scale
+
+
 def _assign_thermal_mesh(ipk, objs, side_block_level=5):
-    """Keep thin solids represented without isolating their thermal interfaces."""
-    def _assign_levels(levels, name):
+    """Install assembly-local refinements resolved per controlled solid."""
+    plan = []
+    assigned = {}
+
+    def _assign_levels(levels, name, category):
         if not levels:
             return
+        normalized = {
+            str(object_name): int(level)
+            for object_name, level in levels.items()
+        }
+        for object_name in normalized:
+            previous = assigned.get(object_name)
+            if previous is not None:
+                raise RuntimeError(
+                    "thermal mesh object assigned to multiple operations: "
+                    f"{object_name!r} in {previous!r} and {name!r}"
+                )
         operation_names = ipk.mesh.assign_mesh_level(levels, name=name)
         if not isinstance(operation_names, (list, tuple)) or not operation_names:
             raise RuntimeError(f"{name} assignment returned no mesh operation")
@@ -480,14 +1222,19 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
             str(getattr(operation, "name", "")): operation
             for operation in getattr(ipk.mesh, "meshoperations", [])
         }
+        actual_operation_names = []
         for item in operation_names:
             operation = item if callable(getattr(item, "update", None)) else operations.get(str(item))
             update = getattr(operation, "update", None)
             if not callable(update):
                 raise RuntimeError(f"{name} mesh operation is unavailable: {item}")
-            # Separate-object cut-cell regions can leave a retained solid with no
-            # conductive/convective path to the surrounding fluid. Keep the object
-            # level control, but mesh all controlled solids in the shared region.
+            actual_operation_names.append(
+                str(getattr(operation, "name", "") or item)
+            )
+            # C3 proved that one shared assembly region can retain the OO
+            # assignment while creating zero cells for a subset of its thin
+            # solids. Resolve the same bounded assembly operation per object;
+            # the later native message scan still rejects any zero-cell solid.
             operation.auto_update = False
             # PyAEDT 0.22 exposes AEDT's read-only command metadata in the mesh
             # operation property bag.  Sending it back through ``update`` emits
@@ -497,20 +1244,237 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
             for key in tuple(operation.props):
                 if str(key).strip().casefold() == "command":
                     del operation.props[key]
-            operation.props["Mesh Object(s) Separately Enabled"] = False
+            operation.props["Mesh Object(s) Separately Enabled"] = True
             if not update():
                 raise RuntimeError(f"{name} mesh operation update failed: {item}")
-            if operation.props.get("Mesh Object(s) Separately Enabled") is not False:
-                raise RuntimeError(f"{name} shared-region mesh setting was not retained: {item}")
+            if operation.props.get("Mesh Object(s) Separately Enabled") is not True:
+                raise RuntimeError(
+                    f"{name} separate-object mesh setting was not retained: "
+                    f"{item}"
+                )
+            readback_objects = operation.props.get("Objects", [])
+            if isinstance(readback_objects, str):
+                readback_objects = [readback_objects]
+            if set(map(str, readback_objects or [])) != set(normalized):
+                raise RuntimeError(
+                    f"{name} object readback mismatch: "
+                    f"{list(readback_objects or [])!r} != "
+                    f"{list(normalized)!r}"
+                )
+            readback_level = operation.props.get("Level")
+            expected_levels = set(normalized.values())
+            if len(expected_levels) != 1 or str(readback_level) != str(
+                next(iter(expected_levels))
+            ):
+                raise RuntimeError(
+                    f"{name} level readback mismatch: "
+                    f"{readback_level!r} != {sorted(expected_levels)!r}"
+                )
+        assigned.update({object_name: name for object_name in normalized})
+        plan.append({
+            "name": str(name),
+            "category": str(category),
+            "operation_type": "object_level",
+            "level": next(iter(set(normalized.values()))),
+            "objects": sorted(normalized),
+            "shared_region": False,
+            "separate_objects": True,
+            "actual_operation_names": actual_operation_names,
+        })
 
-    pad_names = [o.name for o in objs.get("wcp_pads", []) + objs.get("core_pads", [])]
-    _assign_levels({name: 2 for name in pad_names}, "pad_mesh_level")
+    def _assign_single_object_region(obj, name, category):
+        object_name = str(obj.name)
+        previous = assigned.get(object_name)
+        if previous is not None:
+            raise RuntimeError(
+                "thermal mesh object assigned to multiple controls: "
+                f"{object_name!r} in {previous!r} and {name!r}"
+            )
+        assign_region = getattr(ipk.mesh, "assign_mesh_region", None)
+        if not callable(assign_region):
+            raise RuntimeError(
+                "Icepak per-object mesh-region API is unavailable"
+            )
+        region = assign_region(
+            assignment=[object_name],
+            level=5,
+            name=name,
+        )
+        if region is None or region is False:
+            raise RuntimeError(
+                f"{name} assignment returned no mesh region"
+            )
+        actual_name = str(getattr(region, "name", "") or "")
+        if actual_name != str(name):
+            raise RuntimeError(
+                f"{name} mesh-region name mismatch: {actual_name!r}"
+            )
+        if getattr(region, "enable", None) is not True:
+            raise RuntimeError(
+                f"{name} mesh region is not enabled"
+            )
+        if getattr(region, "manual_settings", None) is not False:
+            raise RuntimeError(
+                f"{name} mesh region did not retain automatic settings"
+            )
+        settings = getattr(region, "settings", None)
+        try:
+            level_readback = settings["MeshRegionResolution"]
+        except Exception as exc:
+            raise RuntimeError(
+                f"{name} mesh-region level readback is unavailable"
+            ) from exc
+        if str(level_readback) != "5":
+            raise RuntimeError(
+                f"{name} mesh-region level readback mismatch: "
+                f"{level_readback!r} != 5"
+            )
+        assignment = getattr(region, "assignment", None)
+        parts = getattr(assignment, "parts", None)
+        if not isinstance(parts, dict):
+            raise RuntimeError(
+                f"{name} mesh region has no exact subregion-part readback"
+            )
+        part_names = sorted(map(str, parts))
+        if part_names != [object_name]:
+            raise RuntimeError(
+                f"{name} mesh-region object readback mismatch: "
+                f"{part_names!r} != {[object_name]!r}"
+            )
+        # PyAEDT creates a SubRegion with zero percentage padding by default.
+        # Its six faces then coincide with the source pad and native Icepak
+        # serializes ``OverlappingMRFaces[0:]``: the local mesh has domains but
+        # no parent/global mesh interface.  Expand only the non-model mesh
+        # envelope; this does not mutate the physical TIM geometry.
+        expected_padding_types = [
+            WCP_PAD_MESH_REGION_PADDING_TYPE
+        ] * len(_WCP_PAD_MESH_REGION_DIRECTIONS)
+        expected_padding_values = [
+            f"{WCP_PAD_MESH_REGION_PADDING_MM:g}mm"
+        ] * len(_WCP_PAD_MESH_REGION_DIRECTIONS)
+        try:
+            assignment.padding_types = list(expected_padding_types)
+            assignment.padding_values = list(expected_padding_values)
+            padding_types = [
+                " ".join(str(value).split())
+                for value in assignment.padding_types
+            ]
+            padding_values_mm = [
+                _thermal_mesh_length_mm(
+                    value, f"{name} {direction} padding"
+                )
+                for direction, value in zip(
+                    _WCP_PAD_MESH_REGION_DIRECTIONS,
+                    assignment.padding_values,
+                )
+            ]
+        except Exception as exc:
+            raise RuntimeError(
+                f"{name} mesh-region padding update/readback failed"
+            ) from exc
+        if padding_types != expected_padding_types:
+            raise RuntimeError(
+                f"{name} mesh-region padding type mismatch: "
+                f"{padding_types!r} != {expected_padding_types!r}"
+            )
+        if (
+            len(padding_values_mm)
+            != len(_WCP_PAD_MESH_REGION_DIRECTIONS)
+            or any(
+                not math.isclose(
+                    value,
+                    WCP_PAD_MESH_REGION_PADDING_MM,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                for value in padding_values_mm
+            )
+        ):
+            raise RuntimeError(
+                f"{name} mesh-region padding value mismatch: "
+                f"{padding_values_mm!r}"
+            )
+        update = getattr(region, "update", None)
+        if not callable(update) or update() is not True:
+            raise RuntimeError(
+                f"{name} padded mesh-region update failed"
+            )
+        region_object_name = str(
+            getattr(assignment, "name", "") or ""
+        )
+        if not region_object_name:
+            raise RuntimeError(
+                f"{name} mesh region has no native subregion identity"
+            )
+        assigned[object_name] = name
+        plan.append({
+            "name": str(name),
+            "category": str(category),
+            "operation_type": "mesh_region",
+            "level": 5,
+            "objects": [object_name],
+            "shared_region": False,
+            "separate_objects": None,
+            "actual_operation_names": [actual_name],
+            "native_region_object_name": region_object_name,
+            "padding_types": expected_padding_types,
+            "padding_values_mm": padding_values_mm,
+        })
 
-    # Tx turns as thin as the sampled 1 mm lower bound can disappear from the
-    # shared cut-cell mesh. Level 4 preserves those solid zones while one shared
-    # operation avoids the isolated heat paths of separate-object meshing.
+    assemblies = _cooling_plate_mesh_assemblies(objs)
+    for assembly in assemblies:
+        assembly_objects = list(assembly["objects"])
+        if assembly["kind"] == "wcp":
+            # B3 replaces the two pad assignments in each object-level
+            # assembly with one padded MeshRegion per pad. Retain the plate
+            # itself as a level-5 object operation, so every controlled solid
+            # still has exactly one mesh control.
+            assembly_objects = [
+                obj for obj in assembly_objects
+                if not str(obj.name).startswith("Tx_main_wcp_pad_")
+            ]
+            if len(assembly_objects) != 1:
+                raise RuntimeError(
+                    "B3 winding cooling-plate assembly does not contain "
+                    f"exactly one plate: {assembly['name']!r}"
+                )
+        _assign_levels(
+            {
+                str(obj.name): int(assembly["level"])
+                for obj in assembly_objects
+            },
+            assembly["name"],
+            assembly["kind"],
+        )
+
+    for pad in sorted(
+        objs.get("wcp_pads", []), key=lambda item: str(item.name)
+    ):
+        pad_name = str(pad.name)
+        match = re.fullmatch(
+            r"Tx_main_wcp_pad_(\d+)_(in|out)_([pn])",
+            pad_name,
+        )
+        if not match:
+            raise RuntimeError(
+                f"unexpected B3 winding TIM name: {pad_name!r}"
+            )
+        index, layer, side = match.groups()
+        _assign_single_object_region(
+            pad,
+            f"wcp_pad_mesh_region_{index}_{layer}_{side}",
+            "wcp_pad_region",
+        )
+
+    # Tx turns as thin as the sampled 1 mm lower bound can disappear from a
+    # multi-object cut-cell region. Level 4 plus per-object resolution preserves
+    # those solid zones without changing the model's thermal contacts.
     tx_names = list(dict.fromkeys(obj.name for obj in objs.get("Tx", [])))
-    _assign_levels({name: 4 for name in tx_names}, "tx_mesh_level")
+    _assign_levels(
+        {name: 4 for name in tx_names},
+        "tx_mesh_level",
+        "tx_pack",
+    )
 
     # Keep each physical Rx pack in its own shared refinement region. Combining
     # the distant main and side packs creates one very large cut-cell region;
@@ -529,29 +1493,127 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
     )
     for key, operation_name, level in rx_block_specs:
         names = list(dict.fromkeys(obj.name for obj in objs.get(key, [])))
-        _assign_levels({name: level for name in names}, operation_name)
+        _assign_levels(
+            {name: level for name in names},
+            operation_name,
+            key,
+        )
 
-    explicit_rx = []
-    singleton_specs = (
-        ("Rx_main_explicit", "Rx_main_blocks", "rx_main_single_turn_mesh_level"),
-        ("Rx_side_explicit", "Rx_side_blocks", "rx_side_single_turn_mesh_level"),
-        ("Rx_side2_explicit", "Rx_side2_blocks", "rx_side2_single_turn_mesh_level"),
+    # C4 separate-object meshing reduced zero-cell solids from 35 to ten, but
+    # both retained Rx_main turns still disappeared at level 3.  Keep all three
+    # localized retained packs at level 5; their boxes remain pack-local.
+    retained_pack_specs = (
+        ("Rx_main_explicit", "rx_main_retained_pack_mesh_level", 5),
+        ("Rx_side_explicit", "rx_side_retained_pack_mesh_level", 5),
+        ("Rx_side2_explicit", "rx_side2_retained_pack_mesh_level", 5),
     )
-    for explicit_key, block_key, operation_name in singleton_specs:
+    retained_pack_count = 0
+    for explicit_key, operation_name, level in retained_pack_specs:
         group = list(objs.get(explicit_key, []))
-        if len(group) == 1 and not objs.get(block_key, []):
-            # Level 5 is Icepak's finest predefined object level. Keep this as a
-            # pack-local shared region so a 0.3 mm exact copper turn remains a
-            # solved solid without refining the distant main pack.
-            _assign_levels({group[0].name: 5}, operation_name)
-        else:
-            explicit_rx.extend(group)
+        names = list(dict.fromkeys(
+            str(obj.name) for obj in group
+        ))
+        if names:
+            retained_pack_count += 1
+        _assign_levels(
+            {name: level for name in names},
+            operation_name,
+            explicit_key.replace("_explicit", "_retained_pack"),
+        )
 
-    # Per-object cut-cell subregions created million-cell meshes with skew above
-    # 0.96 on thin foils. One object-level control keeps the foil represented
-    # without introducing subregion interfaces around every retained turn.
-    rx_names = list(dict.fromkeys(obj.name for obj in explicit_rx))
-    _assign_levels({name: 3 for name in rx_names}, "rx_mesh_level")
+    # Explicit insulation keeps its previous level 4, but each pack receives a
+    # local operation with per-object resolution.  It is intentionally not
+    # folded into either level-3 main copper or level-5 side copper, which would
+    # force one of the two physically distinct thin-solid classes to an
+    # unsupported density.
+    for insulation_key in _RX_INSULATION_KEYS:
+        insulation = list(objs.get(insulation_key, []))
+        explicit_key = insulation_key.replace("_insulation", "_explicit")
+        if insulation and not objs.get(explicit_key, []):
+            raise RuntimeError(
+                f"{insulation_key} exists without retained copper"
+            )
+        names = list(dict.fromkeys(
+            str(obj.name) for obj in insulation
+        ))
+        _assign_levels(
+            {name: 4 for name in names},
+            insulation_key.lower() + "_mesh_level",
+            insulation_key,
+        )
+
+    required_thin = {
+        str(obj.name)
+        for key in (
+            "core_pads",
+            "wcp_pads",
+            "Rx_main_explicit",
+            "Rx_side_explicit",
+            "Rx_side2_explicit",
+            *_RX_INSULATION_KEYS,
+        )
+        for obj in objs.get(key, [])
+    }
+    required_objects_missing = sorted(required_thin - set(assigned))
+    if required_objects_missing:
+        raise RuntimeError(
+            "thermal thin-solid mesh coverage is incomplete: "
+            f"{required_objects_missing!r}"
+        )
+    core_assembly_count = sum(
+        item["kind"] == "core_plate" for item in assemblies
+    )
+    wcp_assembly_count = sum(
+        item["kind"] == "wcp" for item in assemblies
+    )
+    plan_payload = {
+        "schema": THERMAL_MESH_PLAN_CONTRACT_VERSION,
+        "policy": THERMAL_MESH_POLICY,
+        "operations": plan,
+        "operation_count": len(plan),
+        "assigned_object_count": len(assigned),
+        "required_thin_object_count": len(required_thin),
+        "required_thin_objects": sorted(required_thin),
+        "required_objects_missing": required_objects_missing,
+        "core_plate_assembly_count": core_assembly_count,
+        "wcp_assembly_count": wcp_assembly_count,
+        "wcp_pad_mesh_region_count": sum(
+            operation["category"] == "wcp_pad_region"
+            for operation in plan
+        ),
+        "rx_retained_pack_count": retained_pack_count,
+        "shared_operation_count": 0,
+        "object_level_operation_count": sum(
+            operation["operation_type"] == "object_level"
+            for operation in plan
+        ),
+        "mesh_region_operation_count": sum(
+            operation["operation_type"] == "mesh_region"
+            for operation in plan
+        ),
+        "separate_object_operation_count": sum(
+            operation["separate_objects"] is True
+            for operation in plan
+        ),
+    }
+    canonical_payload = {
+        **plan_payload,
+        "operations": [
+            {
+                key: value
+                for key, value in operation.items()
+                if key != "actual_operation_names"
+            }
+            for operation in plan
+        ],
+    }
+    canonical = json.dumps(
+        canonical_payload, sort_keys=True, separators=(",", ":")
+    )
+    plan_payload["plan_sha256"] = hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
+    return plan_payload
 
 
 _THERMAL_RESIDUAL_FIELDS = (
@@ -680,6 +1742,401 @@ def _snapshot_thermal_monitors(sim, ipk):
     }
 
 
+def _thermal_mesh_artifact_candidates(sim, ipk):
+    """Return complete native Icepak grid artifacts without recursive scans."""
+    design_name = str(
+        getattr(ipk, "design_name", "") or _THERMAL_DESIGN_NAME
+    )
+    candidates = {}
+    for root in _thermal_monitor_roots(sim, ipk):
+        design_results = root / f"{design_name}.results"
+        search_root = design_results if design_results.is_dir() else root
+        if not search_root.is_dir() or search_root.is_symlink():
+            continue
+        for mesh_dir in search_root.glob("*_Meshes*_V*.sd"):
+            try:
+                if not mesh_dir.is_dir() or mesh_dir.is_symlink():
+                    continue
+                output = mesh_dir / "grid_output"
+                mapping = mesh_dir / "grid_mapping"
+                if (
+                    output.is_symlink()
+                    or mapping.is_symlink()
+                    or not output.is_file()
+                    or not mapping.is_file()
+                ):
+                    continue
+                output_signature = _thermal_monitor_signature(output)
+                mapping_signature = _thermal_monitor_signature(mapping)
+                if output_signature[0] <= 0 or mapping_signature[0] <= 0:
+                    continue
+                key = str(mesh_dir.resolve(strict=False)).casefold()
+            except OSError:
+                continue
+            candidates[key] = {
+                "path": mesh_dir,
+                "grid_output": output_signature,
+                "grid_mapping": mapping_signature,
+                "mtime_ns": max(
+                    output_signature[1], mapping_signature[1]
+                ),
+            }
+    return candidates
+
+
+def _snapshot_thermal_mesh_artifacts(sim, ipk):
+    """Snapshot complete native grid artifacts before GenerateMesh."""
+    return {
+        key: (
+            value["grid_output"][0],
+            value["grid_output"][2],
+            value["grid_mapping"][0],
+            value["grid_mapping"][2],
+        )
+        for key, value in _thermal_mesh_artifact_candidates(
+            sim, ipk
+        ).items()
+    }
+
+
+def _fresh_thermal_mesh_artifacts(sim, ipk, snapshot):
+    """Return only new or content-changed complete native grid artifacts."""
+    fresh = []
+    for key, value in _thermal_mesh_artifact_candidates(sim, ipk).items():
+        signature = (
+            value["grid_output"][0],
+            value["grid_output"][2],
+            value["grid_mapping"][0],
+            value["grid_mapping"][2],
+        )
+        if snapshot.get(key) == signature:
+            continue
+        fresh.append({
+            "directory": str(value["path"]),
+            "name": value["path"].name,
+            "grid_output_size": value["grid_output"][0],
+            "grid_output_sha256_sample": value["grid_output"][2],
+            "grid_mapping_size": value["grid_mapping"][0],
+            "grid_mapping_sha256_sample": value["grid_mapping"][2],
+            "mtime_ns": value["mtime_ns"],
+        })
+    fresh.sort(key=lambda item: (item["mtime_ns"], item["name"]))
+    return fresh
+
+
+def _parse_thermal_grid_mapping(path):
+    """Read one native Icepak ``grid_mapping`` without trusting file presence.
+
+    ``GenerateMesh`` can return ``True`` and publish large ``grid_output`` files
+    even when a thin solid owns no domain or a local MeshRegion is disconnected
+    from its parent.  The accompanying text ``grid_mapping`` is the native
+    source of truth for both conditions.
+    """
+
+    candidate = Path(path)
+    if candidate.is_symlink():
+        raise RuntimeError(
+            f"native thermal grid_mapping is a symlink: {candidate}"
+        )
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_file():
+        raise RuntimeError(
+            f"native thermal grid_mapping is not a file: {candidate}"
+        )
+    try:
+        text = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(
+            f"native thermal grid_mapping is unreadable: {resolved}"
+        ) from exc
+    if not text.strip().startswith("$begin 'MeshRegion'"):
+        raise RuntimeError(
+            f"native thermal grid_mapping has no MeshRegion root: {resolved}"
+        )
+
+    objects_start = text.find("$begin 'Objects'")
+    objects_end = text.find("$end 'Objects'", objects_start + 1)
+    if objects_start < 0 or objects_end < 0:
+        raise RuntimeError(
+            f"native thermal grid_mapping has no complete Objects tree: "
+            f"{resolved}"
+        )
+    header = text[:objects_start]
+    objects_text = text[objects_start:objects_end]
+
+    def _one(pattern, label, source=text):
+        matches = list(re.finditer(pattern, source, re.MULTILINE))
+        if len(matches) != 1:
+            raise RuntimeError(
+                "native thermal grid_mapping requires exactly one "
+                f"{label}: {resolved}; count={len(matches)}"
+            )
+        return matches[0]
+
+    region_name = _one(
+        r"^\s*Name='(?P<value>(?:''|[^'])*)'\s*$",
+        "root region name",
+        header,
+    ).group("value").replace("''", "'")
+    parent_region = int(_one(
+        r"^\s*ParentRegion=(?P<value>\d+)\s*$",
+        "ParentRegion",
+        header,
+    ).group("value"))
+    has_mesh_value = _one(
+        r"^\s*HasMesh=(?P<value>true|false)\s*$",
+        "HasMesh",
+        header,
+    ).group("value").casefold()
+    object_count = int(_one(
+        r"^\s*Count=(?P<value>\d+)\s*$",
+        "Objects Count",
+        objects_text,
+    ).group("value"))
+
+    object_blocks = list(re.finditer(
+        r"\$begin 'Object(?P<index>\d+)'\s*"
+        r"(?P<body>.*?)"
+        r"\$end 'Object(?P=index)'",
+        objects_text,
+        re.DOTALL,
+    ))
+    if len(object_blocks) != object_count:
+        raise RuntimeError(
+            "native thermal grid_mapping Objects count mismatch: "
+            f"{resolved}; parsed={len(object_blocks)}, "
+            f"declared={object_count}"
+        )
+    object_domains = {}
+    for block in object_blocks:
+        body = block.group("body")
+        name = _one(
+            r"^\s*Name='(?P<value>(?:''|[^'])*)'\s*$",
+            f"Object{block.group('index')} Name",
+            body,
+        ).group("value").replace("''", "'")
+        domains = _one(
+            r"^\s*Domains\[(?P<count>\d+):(?P<values>[^\]]*)\]\s*$",
+            f"Object{block.group('index')} Domains",
+            body,
+        )
+        declared = int(domains.group("count"))
+        raw_values = [
+            item.strip()
+            for item in domains.group("values").split(",")
+            if item.strip()
+        ]
+        if len(raw_values) != declared:
+            raise RuntimeError(
+                "native thermal grid_mapping domain count mismatch: "
+                f"{resolved}; object={name!r}, parsed={len(raw_values)}, "
+                f"declared={declared}"
+            )
+        if name in object_domains:
+            raise RuntimeError(
+                "native thermal grid_mapping has duplicate object: "
+                f"{resolved}; object={name!r}"
+            )
+        object_domains[name] = declared
+
+    overlaps = _one(
+        r"^\s*OverlappingMRFaces\[(?P<count>\d+):"
+        r"(?P<values>[^\]]*)\]\s*$",
+        "OverlappingMRFaces",
+    )
+    overlap_count = int(overlaps.group("count"))
+    overlap_values = [
+        item.strip()
+        for item in overlaps.group("values").split(",")
+        if item.strip()
+    ]
+    if len(overlap_values) != overlap_count:
+        raise RuntimeError(
+            "native thermal grid_mapping overlap count mismatch: "
+            f"{resolved}; parsed={len(overlap_values)}, "
+            f"declared={overlap_count}"
+        )
+
+    return {
+        "schema": "thermal-grid-mapping-readback-v1",
+        "region_name": region_name,
+        "parent_region": parent_region,
+        "has_mesh": has_mesh_value == "true",
+        "object_count": object_count,
+        "objects_with_domains": sorted(
+            name for name, count in object_domains.items() if count > 0
+        ),
+        "object_domain_value_counts": {
+            name: object_domains[name] for name in sorted(object_domains)
+        },
+        "overlapping_mr_face_count": overlap_count,
+    }
+
+
+def _thermal_mesh_mapping_coverage(mesh_plan, fresh_artifacts):
+    """Attest solid domains and parent coupling in fresh native mesh maps."""
+
+    required_objects = sorted(set(map(
+        str, mesh_plan.get("required_thin_objects", [])
+    )))
+    expected_regions = {
+        str(operation["name"]): sorted(set(map(
+            str, operation.get("objects", [])
+        )))
+        for operation in mesh_plan.get("operations", [])
+        if operation.get("operation_type") == "mesh_region"
+    }
+    readbacks = []
+    errors = []
+    for artifact in fresh_artifacts:
+        directory = Path(str(artifact.get("directory", "")))
+        mapping = directory / "grid_mapping"
+        try:
+            if directory.is_symlink():
+                raise RuntimeError(
+                    f"native thermal mesh artifact directory is a symlink: "
+                    f"{directory}"
+                )
+            resolved_directory = directory.resolve(strict=True)
+            resolved_mapping = mapping.resolve(strict=True)
+            if resolved_mapping.parent != resolved_directory:
+                raise RuntimeError(
+                    "native thermal grid_mapping escaped its mesh directory"
+                )
+            signature = _thermal_monitor_signature(resolved_mapping)
+            if (
+                signature[0]
+                != int(artifact.get("grid_mapping_size", -1))
+                or signature[2]
+                != str(artifact.get("grid_mapping_sha256_sample", ""))
+            ):
+                raise RuntimeError(
+                    "native thermal grid_mapping changed after idle barrier"
+                )
+            readback = _parse_thermal_grid_mapping(resolved_mapping)
+            readbacks.append({
+                **readback,
+                "artifact_name": str(artifact.get("name", "")),
+                "grid_mapping_size": signature[0],
+                "grid_mapping_sha256_sample": signature[2],
+            })
+        except Exception as exc:
+            errors.append(
+                f"{type(exc).__name__}: {str(exc)[:1000]}"
+            )
+
+    mapped_objects = sorted({
+        name
+        for readback in readbacks
+        if readback["has_mesh"]
+        for name in readback["objects_with_domains"]
+    })
+    required_missing = sorted(set(required_objects) - set(mapped_objects))
+    global_regions = [
+        item for item in readbacks if item["parent_region"] == 0
+    ]
+    region_missing = sorted(
+        name for name in expected_regions
+        if not any(item["region_name"] == name for item in readbacks)
+    )
+    region_without_mesh = sorted({
+        name for name in expected_regions
+        for item in readbacks
+        if item["region_name"] == name and item["has_mesh"] is not True
+    })
+    region_uncoupled = sorted({
+        name for name in expected_regions
+        for item in readbacks
+        if (
+            item["region_name"] == name
+            and (
+                item["parent_region"] <= 0
+                or item["overlapping_mr_face_count"] <= 0
+            )
+        )
+    })
+    region_objects_missing = sorted({
+        object_name
+        for region_name, object_names in expected_regions.items()
+        for item in readbacks
+        if item["region_name"] == region_name
+        for object_name in object_names
+        if object_name not in item["objects_with_domains"]
+    })
+    passed = (
+        bool(readbacks)
+        and not errors
+        and bool(global_regions)
+        and all(item["has_mesh"] is True for item in global_regions)
+        and not required_missing
+        and not region_missing
+        and not region_without_mesh
+        and not region_uncoupled
+        and not region_objects_missing
+    )
+    return {
+        "schema": "thermal-grid-mapping-coverage-v1",
+        "passed": passed,
+        "fresh_grid_mapping_count": len(readbacks),
+        "parse_errors": errors,
+        "global_region_count": len(global_regions),
+        "required_object_count": len(required_objects),
+        "mapped_required_object_count": (
+            len(required_objects) - len(required_missing)
+        ),
+        "required_objects_missing": required_missing,
+        "expected_local_region_count": len(expected_regions),
+        "missing_local_regions": region_missing,
+        "local_regions_without_mesh": region_without_mesh,
+        "uncoupled_local_regions": region_uncoupled,
+        "local_region_objects_missing": region_objects_missing,
+        "readbacks": readbacks,
+    }
+
+
+def _unmeshed_objects_from_messages(messages):
+    """Extract exact native objects that Icepak reported without mesh."""
+    found = []
+    unparsed = False
+    for message in messages or []:
+        value = str(message)
+        matches = list(_THERMAL_UNMESHED_OBJECT.finditer(value))
+        found.extend(match.group("object") for match in matches)
+        if "object does not have mesh" in value.casefold() and not matches:
+            unparsed = True
+    if unparsed:
+        found.append("<unparsed-native-unmeshed-object>")
+    return sorted(set(found))
+
+
+def _thermal_terminal_solver_messages(messages):
+    """Return exact native Icepak terminal markers not covered by severity."""
+    markers = (
+        "failed to run solver",
+        "simulation completed with execution error",
+    )
+    return list(dict.fromkeys(
+        str(message)
+        for message in messages or []
+        if any(marker in str(message).casefold() for marker in markers)
+    ))
+
+
+def _bounded_message_values(messages, limit=128, char_limit=32768):
+    """Bound stored forensic text after scanning the complete fresh suffix."""
+    values = list(messages or [])[-max(0, int(limit)):]
+    bounded = []
+    remaining = max(0, int(char_limit))
+    for message in values:
+        if remaining <= 0:
+            break
+        value = str(message).replace("\r", " ").replace("\n", " ")
+        value = value[:min(2048, remaining)]
+        bounded.append(value)
+        remaining -= len(value)
+    return bounded
+
+
 def _thermal_convergence_telemetry(
     sim, ipk, setup, attempts=3, retry_seconds=2, not_before_ns=None,
     monitor_snapshot=None,
@@ -789,7 +2246,7 @@ def _thermal_desktop_handle(sim, ipk):
     raise RuntimeError("native AEDT Desktop handle is unavailable")
 
 
-def _thermal_running_state(sim, ipk):
+def _thermal_running_state(sim, ipk, desktop=None):
     # Desktop-wide running state is meaningless on a shared pooled AEDT
     # session (sibling clients solve concurrently); callers treat this
     # exception as "no evidence" rather than a false positive.
@@ -799,7 +2256,13 @@ def _thermal_running_state(sim, ipk):
             "Desktop-wide simulation state is not meaningful on a shared "
             "pooled AEDT session"
         )
-    desktop = _thermal_desktop_handle(sim, ipk)
+    # Capture the raw Desktop proxy before Analyze. PyAEDT can invalidate or
+    # clear its wrapper-side Desktop attributes while restoring the global DSO
+    # configuration even though the native Icepak engine is still running.
+    # A caller-supplied proxy therefore remains the preferred completion
+    # barrier handle across the Analyze return boundary.
+    if desktop is None:
+        desktop = _thermal_desktop_handle(sim, ipk)
     is_running = getattr(desktop, "AreThereSimulationsRunning", None)
     if not callable(is_running):
         raise RuntimeError("native AEDT Desktop has no simulation-state query")
@@ -943,6 +2406,1521 @@ def _prepare_thermal_dispatch(
     }
 
 
+def _native_mesh_assignment_names(value, editor=None):
+    """Normalize AEDT OO ``Assignment``/``Parts`` readback to object names."""
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+    elif value is None:
+        values = []
+    else:
+        text = str(value).strip()
+        if not text:
+            values = []
+        else:
+            if text[:1] in "[(" and text[-1:] in "])":
+                text = text[1:-1]
+            values = re.split(r"\s*[,;]\s*", text)
+    names = {
+        str(item).strip().strip("'\"")
+        for item in values
+        if str(item).strip().strip("'\"")
+    }
+    get_name = getattr(editor, "GetObjectNameByID", None)
+    if callable(get_name):
+        converted = set()
+        for name in names:
+            try:
+                converted.add(str(get_name(int(name))))
+            except (TypeError, ValueError, OverflowError):
+                converted.add(name)
+        names = converted
+    return sorted(names)
+
+
+def _native_mesh_property_name(prop_names, *candidates):
+    by_normalized = {
+        re.sub(r"[^a-z0-9]", "", str(name).casefold()): str(name)
+        for name in prop_names
+    }
+    for candidate in candidates:
+        actual = by_normalized.get(
+            re.sub(r"[^a-z0-9]", "", str(candidate).casefold())
+        )
+        if actual is not None:
+            return actual
+    return ""
+
+
+def _native_mesh_integer_readback(get_prop_value, prop_name, operation_name):
+    """Read one native mesh integer without accepting truncation or booleans."""
+    try:
+        raw_value = get_prop_value(prop_name)
+    except Exception as exc:
+        raise RuntimeError(
+            "native thermal mesh integer property readback failed: "
+            f"{operation_name!r} {prop_name!r}"
+        ) from exc
+    if isinstance(raw_value, bool):
+        raise RuntimeError(
+            "native thermal mesh integer property readback is invalid: "
+            f"{operation_name!r} {prop_name!r}={raw_value!r}"
+        )
+    try:
+        numeric_value = float(str(raw_value).strip())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "native thermal mesh integer property readback is invalid: "
+            f"{operation_name!r} {prop_name!r}={raw_value!r}"
+        ) from exc
+    if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+        raise RuntimeError(
+            "native thermal mesh integer property readback is invalid: "
+            f"{operation_name!r} {prop_name!r}={raw_value!r}"
+        )
+    return int(numeric_value)
+
+
+def _native_mesh_region_part_names(native_editor, region_object_name):
+    """Resolve one native CreateSubRegion object to its exact source parts."""
+
+    get_child = getattr(native_editor, "GetChildObject", None)
+    if not callable(get_child):
+        raise RuntimeError(
+            "native thermal editor has no subregion object-tree readback"
+        )
+    region_child = get_child(str(region_object_name))
+    if region_child is None or region_child is False:
+        raise RuntimeError(
+            "native thermal mesh subregion object is missing: "
+            f"{region_object_name!r}"
+        )
+    candidates = [region_child]
+    get_history_names = getattr(region_child, "GetChildNames", None)
+    if callable(get_history_names):
+        history_names = tuple(str(name) for name in (
+            get_history_names() or []
+        ))
+        create_names = [
+            name for name in history_names
+            if name.casefold().startswith("createsubregion")
+        ]
+        if len(create_names) != 1:
+            raise RuntimeError(
+                "native thermal mesh subregion lacks one CreateSubRegion "
+                f"history: {region_object_name!r} -> {history_names!r}"
+            )
+        get_history_child = getattr(region_child, "GetChildObject", None)
+        if not callable(get_history_child):
+            raise RuntimeError(
+                "native thermal mesh subregion has no history readback"
+            )
+        history_child = get_history_child(create_names[0])
+        if history_child is None or history_child is False:
+            raise RuntimeError(
+                "native thermal mesh CreateSubRegion history disappeared: "
+                f"{region_object_name!r}"
+            )
+        candidates.insert(0, history_child)
+
+    for candidate in candidates:
+        get_prop_names = getattr(candidate, "GetPropNames", None)
+        get_prop_value = getattr(candidate, "GetPropValue", None)
+        if not callable(get_prop_names) or not callable(get_prop_value):
+            continue
+        prop_names = tuple(str(name) for name in (
+            get_prop_names() or []
+        ))
+        parts_prop = _native_mesh_property_name(
+            prop_names, "Part Names", "Parts", "Objects"
+        )
+        if not parts_prop:
+            continue
+        raw_parts = get_prop_value(parts_prop)
+        if isinstance(raw_parts, str):
+            raw_parts = [
+                item.strip()
+                for item in raw_parts.split(",")
+                if item.strip()
+            ]
+        return _native_mesh_assignment_names(
+            raw_parts, editor=native_editor
+        )
+    raise RuntimeError(
+        "native thermal mesh subregion has no exact part readback: "
+        f"{region_object_name!r}"
+    )
+
+
+def _native_mesh_number_readback(
+    get_prop_value, prop_name, operation_name
+):
+    try:
+        raw_value = get_prop_value(prop_name)
+        numeric_value = float(str(raw_value).strip())
+    except Exception as exc:
+        raise RuntimeError(
+            "native thermal mesh numeric property readback failed: "
+            f"{operation_name!r} {prop_name!r}"
+        ) from exc
+    if not math.isfinite(numeric_value):
+        raise RuntimeError(
+            "native thermal mesh numeric property readback is invalid: "
+            f"{operation_name!r} {prop_name!r}={raw_value!r}"
+        )
+    return numeric_value
+
+
+def _native_mesh_length_mm_readback(
+    get_prop_value, prop_name, operation_name
+):
+    try:
+        raw_value = get_prop_value(prop_name)
+    except Exception as exc:
+        raise RuntimeError(
+            "native thermal mesh length property readback failed: "
+            f"{operation_name!r} {prop_name!r}"
+        ) from exc
+    if isinstance(raw_value, bool):
+        raise RuntimeError(
+            "native thermal mesh length property readback is invalid: "
+            f"{operation_name!r} {prop_name!r}={raw_value!r}"
+        )
+    match = re.fullmatch(
+        r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+        r"\s*([A-Za-z\u00b5]*)\s*",
+        str(raw_value),
+    )
+    if not match:
+        raise RuntimeError(
+            "native thermal mesh length property readback is invalid: "
+            f"{operation_name!r} {prop_name!r}={raw_value!r}"
+        )
+    value = float(match.group(1))
+    unit = match.group(2).casefold().replace("\u00b5", "u")
+    scale = {
+        "": 1.0,
+        "mm": 1.0,
+        "millimeter": 1.0,
+        "millimeters": 1.0,
+        "um": 1e-3,
+        "micrometer": 1e-3,
+        "micrometers": 1e-3,
+        "cm": 10.0,
+        "m": 1000.0,
+        "meter": 1000.0,
+        "meters": 1000.0,
+    }.get(unit)
+    if scale is None or not math.isfinite(value):
+        raise RuntimeError(
+            "native thermal mesh length unit is unsupported: "
+            f"{operation_name!r} {prop_name!r}={raw_value!r}"
+        )
+    return value * scale
+
+
+def _native_thermal_mesh_region_readback(
+    mesh_child, native_names, mesh_plan
+):
+    """Require each WCP pad's manual anisotropic MeshRegion in native OO."""
+    regions = list(mesh_plan.get("mesh_regions", []))
+    if len(regions) != int(mesh_plan.get("mesh_region_count", -1)):
+        raise RuntimeError(
+            "thermal mesh plan has inconsistent MeshRegion count"
+        )
+    expected_names = []
+    by_name = {}
+    for region in regions:
+        actual_name = str(region.get("actual_region_name", ""))
+        if not actual_name or actual_name in by_name:
+            raise RuntimeError(
+                "thermal mesh plan has invalid MeshRegion identities"
+            )
+        expected_names.append(actual_name)
+        by_name[actual_name] = region
+    missing = sorted(set(expected_names) - set(native_names))
+    if missing:
+        raise RuntimeError(
+            "native thermal MeshRegion readback is incomplete: "
+            f"{missing!r}"
+        )
+
+    required_props = {
+        "assignment": ("Assignment", "Objects", "Parts"),
+        "enabled": ("Enabled", "Enable"),
+        "enclosing": ("Enclosing Geometries",),
+        "max_x": (
+            "MaxElementSizeX",
+            "Max Element Size X",
+            "Maximum Element Size/X",
+        ),
+        "max_y": (
+            "MaxElementSizeY",
+            "Max Element Size Y",
+            "Maximum Element Size/Y",
+        ),
+        "max_z": (
+            "MaxElementSizeZ",
+            "Max Element Size Z",
+            "Maximum Element Size/Z",
+        ),
+        "min_elements_gap": (
+            "MinElementsInGap",
+            "Minimum Elements in Gap",
+            "Mesh Parameters/Min Elements in Gap",
+        ),
+        "min_elements_edge": (
+            "MinElementsOnEdge",
+            "Minimum Elements on Edge",
+            "Mesh Parameters/Min Elements on Edge",
+        ),
+        "max_ratio": (
+            "MaxSizeRatio",
+            "Maximum Size Ratio",
+            "Mesh Parameters/Max Size Ratio",
+        ),
+        "min_gap_x": (
+            "MinGapX", "Minimum Gap X", "Minimum Gap/X"
+        ),
+        "min_gap_y": (
+            "MinGapY", "Minimum Gap Y", "Minimum Gap/Y"
+        ),
+        "min_gap_z": (
+            "MinGapZ", "Minimum Gap Z", "Minimum Gap/Z"
+        ),
+        "uniform_type": (
+            "UniformMeshParametersType",
+            "Uniform Mesh Parameters Type",
+            "Mesh Parameters/Uniform Mesh Parameters",
+        ),
+    }
+    readbacks = []
+    assignment_union = set()
+    for actual_name in expected_names:
+        region = by_name[actual_name]
+        child = mesh_child.GetChildObject(actual_name)
+        if child is None or child is False:
+            raise RuntimeError(
+                "native thermal MeshRegion child disappeared: "
+                f"{actual_name!r}"
+            )
+        get_prop_names = getattr(child, "GetPropNames", None)
+        get_prop_value = getattr(child, "GetPropValue", None)
+        if not callable(get_prop_names) or not callable(get_prop_value):
+            raise RuntimeError(
+                "native thermal MeshRegion has no OO property readback: "
+                f"{actual_name!r}"
+            )
+        prop_names = tuple(str(name) for name in (get_prop_names() or []))
+        props = {
+            key: _native_mesh_property_name(prop_names, *candidates)
+            for key, candidates in required_props.items()
+        }
+        missing_props = sorted(
+            key for key, value in props.items() if not value
+        )
+        if missing_props:
+            raise RuntimeError(
+                "native thermal MeshRegion lacks required OO properties: "
+                f"{actual_name!r} missing={missing_props!r}, "
+                f"available={list(prop_names)!r}"
+            )
+        expected_subregion = str(region["actual_subregion_name"])
+        actual_assignment = _native_mesh_assignment_names(
+            get_prop_value(props["assignment"])
+        )
+        if actual_assignment != [expected_subregion]:
+            raise RuntimeError(
+                "native thermal MeshRegion assignment mismatch: "
+                f"{actual_name!r}: {actual_assignment!r} != "
+                f"{[expected_subregion]!r}"
+            )
+        object_names = sorted(map(str, region.get("objects", [])))
+        actual_enclosing = _native_mesh_assignment_names(
+            get_prop_value(props["enclosing"])
+        )
+        if actual_enclosing != object_names:
+            raise RuntimeError(
+                "native thermal MeshRegion enclosing-geometry mismatch: "
+                f"{actual_name!r}: {actual_enclosing!r} != "
+                f"{object_names!r}"
+            )
+        if _thermal_bool(get_prop_value(props["enabled"])) is not True:
+            raise RuntimeError(
+                "native thermal MeshRegion is not enabled: "
+                f"{actual_name!r}"
+            )
+        expected = region["manual_settings"]
+        actual_lengths = {
+            "MaxElementSizeX": _native_mesh_length_mm_readback(
+                get_prop_value, props["max_x"], actual_name
+            ),
+            "MaxElementSizeY": _native_mesh_length_mm_readback(
+                get_prop_value, props["max_y"], actual_name
+            ),
+            "MaxElementSizeZ": _native_mesh_length_mm_readback(
+                get_prop_value, props["max_z"], actual_name
+            ),
+            "MinGapX": _native_mesh_length_mm_readback(
+                get_prop_value, props["min_gap_x"], actual_name
+            ),
+            "MinGapY": _native_mesh_length_mm_readback(
+                get_prop_value, props["min_gap_y"], actual_name
+            ),
+            "MinGapZ": _native_mesh_length_mm_readback(
+                get_prop_value, props["min_gap_z"], actual_name
+            ),
+        }
+        mismatched_lengths = {
+            key: (actual, float(expected[key]))
+            for key, actual in actual_lengths.items()
+            if not math.isclose(
+                actual, float(expected[key]),
+                rel_tol=1e-9, abs_tol=1e-9,
+            )
+        }
+        if mismatched_lengths:
+            raise RuntimeError(
+                "native thermal MeshRegion length readback mismatch: "
+                f"{actual_name!r} {mismatched_lengths!r}"
+            )
+        actual_gap_elements = _native_mesh_integer_readback(
+            get_prop_value, props["min_elements_gap"], actual_name
+        )
+        actual_edge_elements = _native_mesh_integer_readback(
+            get_prop_value, props["min_elements_edge"], actual_name
+        )
+        actual_ratio = _native_mesh_number_readback(
+            get_prop_value, props["max_ratio"], actual_name
+        )
+        if (
+            actual_gap_elements != int(expected["MinElementsInGap"])
+            or actual_edge_elements != int(expected["MinElementsOnEdge"])
+            or not math.isclose(
+                actual_ratio, float(expected["MaxSizeRatio"]),
+                rel_tol=0.0, abs_tol=1e-12,
+            )
+            or re.sub(
+                r"[^a-z0-9]",
+                "",
+                str(get_prop_value(props["uniform_type"])).casefold(),
+            ) != "xyzmaxsizes"
+        ):
+            raise RuntimeError(
+                "native thermal MeshRegion manual setting mismatch: "
+                f"{actual_name!r}"
+            )
+        if object_names != list(region["subregion_parts_readback"]):
+            raise RuntimeError(
+                "thermal MeshRegion SubRegion part binding changed: "
+                f"{actual_name!r}"
+            )
+        assignment_union.update(object_names)
+        readbacks.append({
+            "name": actual_name,
+            "assignment": actual_assignment,
+            "enclosing_geometries": actual_enclosing,
+            "objects": object_names,
+            "manual_settings": True,
+            "manual_settings_evidence": (
+                "native_manual_only_properties_complete"
+            ),
+            "wrapper_manual_settings_readback": True,
+            "wrapper_enforce_cutcell_readback": (
+                expected.get("EnforceCutCellMeshing") is True
+            ),
+            "manual_setting_values": {
+                **actual_lengths,
+                "MinElementsInGap": actual_gap_elements,
+                "MinElementsOnEdge": actual_edge_elements,
+                "MaxSizeRatio": actual_ratio,
+                "UniformMeshParametersType": "XYZ Max. Sizes",
+            },
+            "thin_axis": region["thin_axis"],
+            "thin_axis_divisions": int(
+                region["thin_axis_divisions"]
+            ),
+            "dimensions_mm": list(region["dimensions_mm"]),
+        })
+    expected_objects = set(map(
+        str, mesh_plan.get("wcp_pad_mesh_region_objects", [])
+    ))
+    if assignment_union != expected_objects:
+        raise RuntimeError(
+            "native thermal MeshRegion WCP-pad coverage mismatch: "
+            f"missing={sorted(expected_objects - assignment_union)!r}, "
+            f"unexpected={sorted(assignment_union - expected_objects)!r}"
+        )
+    return {
+        "contract_version": WCP_PAD_MESH_REGION_CONTRACT_VERSION,
+        "expected_mesh_region_count": len(regions),
+        "missing_mesh_region_names": missing,
+        "assigned_object_count": len(assignment_union),
+        "assigned_objects": sorted(assignment_union),
+        "mesh_region_readbacks": readbacks,
+    }
+
+
+def _native_thermal_mesh_operation_readback(
+    native_design, mesh_plan, native_editor=None
+):
+    """Require exact assignment, level, and object-separation OO readback.
+
+    PyAEDT 0.22 itself reads Icepak mesh assignments through
+    ``oDesign.GetChildObject("Mesh")`` and the child ``Assignment`` property.
+    Use the same nonblocking object tree and fail closed rather than falling
+    back to ``GetMeshOpAssignment``, which can block on large models.
+    """
+    get_child = getattr(native_design, "GetChildObject", None)
+    if not callable(get_child):
+        raise RuntimeError(
+            "native thermal design has no mesh object-tree readback"
+        )
+    mesh_child = get_child("Mesh")
+    if mesh_child is None or mesh_child is False:
+        raise RuntimeError("native thermal design returned no Mesh child")
+    get_names = getattr(mesh_child, "GetChildNames", None)
+    if not callable(get_names):
+        raise RuntimeError(
+            "native thermal Mesh child has no operation-name readback"
+        )
+    native_names = tuple(str(name) for name in (get_names() or []))
+    operations_by_actual_name = {}
+    for operation in mesh_plan.get("operations", []):
+        actual_names = [
+            str(name)
+            for name in operation.get("actual_operation_names", [])
+        ]
+        if len(actual_names) != 1:
+            raise RuntimeError(
+                "thermal mesh plan operation does not have one native identity: "
+                f"{operation.get('name', '')!r} -> {actual_names!r}"
+            )
+        operations_by_actual_name[actual_names[0]] = operation
+    expected_names = tuple(operations_by_actual_name)
+    if (
+        not expected_names
+        or len(expected_names) != int(mesh_plan["operation_count"])
+        or len(expected_names) != len(set(expected_names))
+    ):
+        raise RuntimeError(
+            "thermal mesh plan has invalid native operation identities"
+        )
+    missing = sorted(set(expected_names) - set(native_names))
+    if missing:
+        raise RuntimeError(
+            "native thermal mesh operation readback is incomplete: "
+            f"{missing!r}"
+        )
+    operation_readbacks = []
+    assignment_union = set()
+    for actual_name in expected_names:
+        child = mesh_child.GetChildObject(actual_name)
+        if child is None or child is False:
+            raise RuntimeError(
+                "native thermal mesh child disappeared during readback: "
+                f"{actual_name!r}"
+            )
+        get_prop_names = getattr(child, "GetPropNames", None)
+        get_prop_value = getattr(child, "GetPropValue", None)
+        if not callable(get_prop_names) or not callable(get_prop_value):
+            raise RuntimeError(
+                "native thermal mesh child has no property readback: "
+                f"{actual_name!r}"
+            )
+        prop_names = tuple(str(name) for name in (get_prop_names() or []))
+        expected_operation = operations_by_actual_name[actual_name]
+        operation_type = str(
+            expected_operation.get("operation_type", "object_level")
+        )
+        if operation_type == "mesh_region":
+            assignment_prop = _native_mesh_property_name(
+                prop_names, "Assignment", "Parts", "Objects"
+            )
+            resolution_prop = _native_mesh_property_name(
+                prop_names,
+                "MeshRegionResolution",
+                "Mesh Region Resolution",
+                "Mesh Resolution",
+                "Level",
+            )
+            enabled_prop = _native_mesh_property_name(
+                prop_names, "Enable", "Enabled"
+            )
+            enclosing_prop = _native_mesh_property_name(
+                prop_names, "Enclosing Geometries"
+            )
+            missing_props = [
+                label
+                for label, value in (
+                    ("Assignment", assignment_prop),
+                    ("MeshRegionResolution", resolution_prop),
+                    ("Enable", enabled_prop),
+                    ("Enclosing Geometries", enclosing_prop),
+                )
+                if not value
+            ]
+            if missing_props:
+                raise RuntimeError(
+                    "native thermal mesh region lacks required OO "
+                    f"properties: {actual_name!r} "
+                    f"missing={missing_props!r}, "
+                    f"available={list(prop_names)!r}"
+                )
+            expected_region_object = str(
+                expected_operation.get(
+                    "native_region_object_name", ""
+                ) or ""
+            )
+            if not expected_region_object:
+                raise RuntimeError(
+                    "thermal mesh-region plan lacks native subregion "
+                    f"identity: {actual_name!r}"
+                )
+            actual_region_objects = _native_mesh_assignment_names(
+                get_prop_value(assignment_prop),
+                editor=native_editor,
+            )
+            if actual_region_objects != [expected_region_object]:
+                raise RuntimeError(
+                    "native thermal mesh-region assignment mismatch: "
+                    f"{actual_name!r}: {actual_region_objects!r} != "
+                    f"{[expected_region_object]!r}"
+                )
+            expected_objects = sorted(map(
+                str, expected_operation.get("objects", [])
+            ))
+            enclosing_objects = _native_mesh_assignment_names(
+                get_prop_value(enclosing_prop),
+                editor=native_editor,
+            )
+            if enclosing_objects != expected_objects:
+                raise RuntimeError(
+                    "native thermal mesh-region enclosing-geometry "
+                    f"mismatch: {actual_name!r}: "
+                    f"{enclosing_objects!r} != {expected_objects!r}"
+                )
+            if _thermal_bool(get_prop_value(enabled_prop)) is not True:
+                raise RuntimeError(
+                    "native thermal mesh region is disabled: "
+                    f"{actual_name!r}"
+                )
+            expected_level = int(expected_operation["level"])
+            actual_level = _native_mesh_integer_readback(
+                get_prop_value, resolution_prop, actual_name
+            )
+            if actual_level != expected_level:
+                raise RuntimeError(
+                    "native thermal mesh-region level readback mismatch: "
+                    f"{actual_name!r}: {actual_level} != {expected_level}"
+                )
+            actual_objects = _native_mesh_region_part_names(
+                native_editor, expected_region_object
+            )
+            if actual_objects != expected_objects:
+                raise RuntimeError(
+                    "native thermal mesh-region part readback mismatch: "
+                    f"{actual_name!r}: {actual_objects!r} != "
+                    f"{expected_objects!r}"
+                )
+            assignment_union.update(actual_objects)
+            operation_readbacks.append({
+                "name": actual_name,
+                "operation_type": "mesh_region",
+                "assignment_count": len(actual_objects),
+                "assignment_sha256": hashlib.sha256(
+                    json.dumps(
+                        actual_objects, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "level": actual_level,
+                "level_schema": str(resolution_prop),
+                "min_level": None,
+                "max_level": None,
+                "incr_level": None,
+                "separate_objects": None,
+                "region_object_name": expected_region_object,
+                "region_object_count": len(actual_region_objects),
+                "enclosing_geometries": enclosing_objects,
+            })
+            continue
+        if operation_type != "object_level":
+            raise RuntimeError(
+                "thermal mesh plan has unsupported operation type: "
+                f"{actual_name!r} -> {operation_type!r}"
+            )
+        assignment_prop = _native_mesh_property_name(
+            prop_names, "Assignment", "Parts", "Objects"
+        )
+        level_prop = _native_mesh_property_name(prop_names, "Level")
+        min_level_prop = _native_mesh_property_name(prop_names, "MinLevel")
+        max_level_prop = _native_mesh_property_name(prop_names, "MaxLevel")
+        incr_level_prop = _native_mesh_property_name(prop_names, "IncrLevel")
+        separate_prop = _native_mesh_property_name(
+            prop_names, "Mesh Object(s) Separately Enabled"
+        )
+        missing_props = [
+            label
+            for label, value in (
+                ("Assignment", assignment_prop),
+                ("Mesh Object(s) Separately Enabled", separate_prop),
+            )
+            if not value
+        ]
+        if missing_props:
+            raise RuntimeError(
+                "native thermal mesh operation lacks required OO properties: "
+                f"{actual_name!r} missing={missing_props!r}, "
+                f"available={list(prop_names)!r}"
+            )
+        ranged_level_props = (
+            min_level_prop, max_level_prop, incr_level_prop
+        )
+        if level_prop and any(ranged_level_props):
+            raise RuntimeError(
+                "native thermal mesh operation has ambiguous level schema: "
+                f"{actual_name!r}, available={list(prop_names)!r}"
+            )
+        if not level_prop and not all(ranged_level_props):
+            missing_level_props = [
+                label
+                for label, value in (
+                    ("MinLevel", min_level_prop),
+                    ("MaxLevel", max_level_prop),
+                    ("IncrLevel", incr_level_prop),
+                )
+                if not value
+            ]
+            raise RuntimeError(
+                "native thermal mesh operation lacks one complete level schema: "
+                f"{actual_name!r} missing={missing_level_props!r}, "
+                f"available={list(prop_names)!r}"
+            )
+        expected_objects = sorted(map(
+            str, expected_operation.get("objects", [])
+        ))
+        actual_objects = _native_mesh_assignment_names(
+            get_prop_value(assignment_prop), editor=native_editor
+        )
+        if actual_objects != expected_objects:
+            raise RuntimeError(
+                "native thermal mesh assignment readback mismatch: "
+                f"{actual_name!r}: {actual_objects!r} != "
+                f"{expected_objects!r}"
+            )
+        expected_level = int(expected_operation["level"])
+        if level_prop:
+            level_schema = "Level"
+            actual_level = _native_mesh_integer_readback(
+                get_prop_value, level_prop, actual_name
+            )
+            actual_min_level = None
+            actual_max_level = None
+            actual_incr_level = None
+            if actual_level != expected_level:
+                raise RuntimeError(
+                    "native thermal mesh level readback mismatch: "
+                    f"{actual_name!r}: {actual_level} != {expected_level}"
+                )
+        else:
+            # AEDT's fixed object-level operation is serialized with equal
+            # MinLevel/MaxLevel and IncrLevel='0' (also exercised by the
+            # sealed replay contract).  Its 2025.2 OO tree exposes those
+            # resolved properties instead of PyAEDT's input-only ``Level``.
+            level_schema = "MinLevel/MaxLevel/IncrLevel"
+            actual_min_level = _native_mesh_integer_readback(
+                get_prop_value, min_level_prop, actual_name
+            )
+            actual_max_level = _native_mesh_integer_readback(
+                get_prop_value, max_level_prop, actual_name
+            )
+            actual_incr_level = _native_mesh_integer_readback(
+                get_prop_value, incr_level_prop, actual_name
+            )
+            if (
+                actual_min_level != expected_level
+                or actual_max_level != expected_level
+            ):
+                raise RuntimeError(
+                    "native thermal mesh level range readback mismatch: "
+                    f"{actual_name!r}: MinLevel={actual_min_level}, "
+                    f"MaxLevel={actual_max_level}, expected={expected_level}"
+                )
+            if actual_incr_level != 0:
+                raise RuntimeError(
+                    "native thermal mesh increment readback mismatch: "
+                    f"{actual_name!r}: IncrLevel={actual_incr_level} != 0"
+                )
+            actual_level = expected_level
+        expected_separate = expected_operation.get("separate_objects")
+        if type(expected_separate) is not bool:
+            raise RuntimeError(
+                "thermal mesh plan operation lacks exact separation intent: "
+                f"{actual_name!r}"
+            )
+        actual_separate = _thermal_bool(get_prop_value(separate_prop))
+        if actual_separate is not expected_separate:
+            raise RuntimeError(
+                "native thermal mesh object-separation readback mismatch: "
+                f"{actual_name!r}: {actual_separate!r} != "
+                f"{expected_separate!r}"
+            )
+        assignment_union.update(actual_objects)
+        operation_readbacks.append({
+            "name": actual_name,
+            "operation_type": "object_level",
+            "assignment_count": len(actual_objects),
+            "assignment_sha256": hashlib.sha256(
+                json.dumps(
+                    actual_objects, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+            "level": actual_level,
+            "level_schema": level_schema,
+            "min_level": actual_min_level,
+            "max_level": actual_max_level,
+            "incr_level": actual_incr_level,
+            "separate_objects": actual_separate,
+        })
+    expected_assignment_union = {
+        str(name)
+        for operation in mesh_plan.get("operations", [])
+        for name in operation.get("objects", [])
+    }
+    if assignment_union != expected_assignment_union:
+        raise RuntimeError(
+            "native thermal mesh total assignment coverage mismatch: "
+            f"missing={sorted(expected_assignment_union - assignment_union)!r}, "
+            f"unexpected={sorted(assignment_union - expected_assignment_union)!r}"
+        )
+    expected_required_thin = set(map(
+        str, mesh_plan.get("required_thin_objects", [])
+    ))
+    required_thin_objects = assignment_union & expected_required_thin
+    required_thin_missing = sorted(
+        expected_required_thin - required_thin_objects
+    )
+    if required_thin_missing:
+        raise RuntimeError(
+            "native thermal mesh required-thin coverage is incomplete: "
+            f"{required_thin_missing!r}"
+        )
+    payload = {
+        "expected_operation_count": len(expected_names),
+        "native_operation_count": len(native_names),
+        "missing_operation_names": missing,
+        "expected_operation_names": list(expected_names),
+        "operation_readbacks": operation_readbacks,
+        "assigned_object_count": len(assignment_union),
+        "required_thin_object_count": len(required_thin_objects),
+        "required_thin_objects_missing": required_thin_missing,
+        "object_level_operation_count": sum(
+            item.get("operation_type") == "object_level"
+            for item in operation_readbacks
+        ),
+        "mesh_region_operation_count": sum(
+            item.get("operation_type") == "mesh_region"
+            for item in operation_readbacks
+        ),
+        "mesh_region_part_readback_passed": all(
+            item.get("region_object_count") == 1
+            for item in operation_readbacks
+            if item.get("operation_type") == "mesh_region"
+        ),
+    }
+    payload["native_operation_names_sha256"] = hashlib.sha256(
+        json.dumps(
+            sorted(native_names), separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def _attest_standalone_mesh_desktop(sim, ipk, desktop):
+    """Re-attest one cached PID/endpoint immediately before idle readback."""
+    attestor = getattr(sim, "_attest_cached_native_desktop", None)
+    if not callable(attestor):
+        raise RuntimeError(
+            "standalone thermal mesh Desktop attestation is unavailable"
+        )
+    attested = attestor(desktop, require_endpoint_identity=True)
+    if attested is None or attested is False:
+        raise RuntimeError(
+            "standalone thermal mesh Desktop attestation returned no proxy"
+        )
+    return _thermal_running_state(sim, ipk, desktop=desktop)
+
+
+def _wait_for_standalone_mesh_idle(
+    sim,
+    ipk,
+    desktop,
+    artifact_snapshot,
+    *,
+    require_fresh_artifact,
+    timeout_s=None,
+    poll_s=1.0,
+    stable_artifact_s=1.0,
+    failure_idle_grace_s=30.0,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+):
+    """Prove post-GenerateMesh idle without touching live AEDT automation.
+
+    A single immediate ``False`` can precede delayed native mesh startup.
+    Successful generation therefore requires a fresh grid pair, a second
+    independently attested idle observation, and a stable artifact interval.
+    Failed/exceptional generation has no grid contract, but still receives a
+    bounded multi-poll idle grace before the uncertainty flag may be cleared.
+    """
+    timeout_s = _standalone_thermal_completion_timeout(timeout_s)
+    poll_s = float(poll_s)
+    stable_artifact_s = float(stable_artifact_s)
+    failure_idle_grace_s = float(failure_idle_grace_s)
+    if (
+        not math.isfinite(poll_s)
+        or poll_s < 0
+        or not math.isfinite(stable_artifact_s)
+        or stable_artifact_s < 0
+        or not math.isfinite(failure_idle_grace_s)
+        or failure_idle_grace_s < 0
+    ):
+        raise ValueError("thermal mesh idle-barrier timing is invalid")
+
+    started = clock()
+    deadline = started + timeout_s
+    first_idle_at = None
+    idle_observations = 0
+    stable_signature = None
+    stable_since = None
+    stable_observations = 0
+    fresh_artifacts = []
+    transitions = []
+    attestation_attempts = 0
+    last_running = None
+    last_error = ""
+    while True:
+        attestation_attempts += 1
+        running = None
+        error = ""
+        try:
+            running = _attest_standalone_mesh_desktop(
+                sim, ipk, desktop
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:512]}"
+        now = clock()
+        last_running = running
+        last_error = error
+        transition = (running, error)
+        if not transitions or transitions[-1]["state"] != transition:
+            if len(transitions) < 64:
+                transitions.append({
+                    "elapsed_s": round(max(0.0, now - started), 3),
+                    "running": running,
+                    "error": error,
+                    "state": transition,
+                })
+
+        if running is False and not error:
+            idle_observations += 1
+            if first_idle_at is None:
+                first_idle_at = now
+            # Filesystem evidence is inspected only after the exact cached
+            # Desktop was freshly re-attested and explicitly reported idle.
+            fresh_artifacts = _fresh_thermal_mesh_artifacts(
+                sim, ipk, artifact_snapshot
+            )
+            artifact_signature = json.dumps(
+                fresh_artifacts,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if fresh_artifacts:
+                if artifact_signature != stable_signature:
+                    stable_signature = artifact_signature
+                    stable_since = now
+                    stable_observations = 1
+                else:
+                    stable_observations += 1
+            else:
+                stable_signature = None
+                stable_since = None
+                stable_observations = 0
+
+            artifact_stable = (
+                bool(fresh_artifacts)
+                and stable_observations >= 2
+                and stable_since is not None
+                and now - stable_since >= stable_artifact_s
+            )
+            failure_idle_stable = (
+                not require_fresh_artifact
+                and idle_observations >= 2
+                and now - first_idle_at >= failure_idle_grace_s
+            )
+            if (
+                (require_fresh_artifact and artifact_stable)
+                or failure_idle_stable
+            ):
+                return {
+                    "schema": "thermal-mesh-idle-barrier-v1",
+                    "passed": True,
+                    "require_fresh_artifact": bool(
+                        require_fresh_artifact
+                    ),
+                    "desktop_attestation_attempts": attestation_attempts,
+                    "idle_observations": idle_observations,
+                    "stable_artifact_observations": (
+                        stable_observations
+                    ),
+                    "elapsed_s": round(
+                        max(0.0, now - started), 3
+                    ),
+                    "last_running": False,
+                    "last_error": "",
+                    "fresh_mesh_artifacts": fresh_artifacts,
+                    "running_transitions": [
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if key != "state"
+                        }
+                        for item in transitions
+                    ],
+                }
+        else:
+            first_idle_at = None
+            idle_observations = 0
+            stable_signature = None
+            stable_since = None
+            stable_observations = 0
+            fresh_artifacts = []
+
+        if now >= deadline:
+            return {
+                "schema": "thermal-mesh-idle-barrier-v1",
+                "passed": False,
+                "require_fresh_artifact": bool(
+                    require_fresh_artifact
+                ),
+                "desktop_attestation_attempts": attestation_attempts,
+                "idle_observations": idle_observations,
+                "stable_artifact_observations": stable_observations,
+                "elapsed_s": round(max(0.0, now - started), 3),
+                "last_running": last_running,
+                "last_error": last_error,
+                "fresh_mesh_artifacts": fresh_artifacts,
+                "running_transitions": [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key != "state"
+                    }
+                    for item in transitions
+                ],
+            }
+        sleeper(min(
+            poll_s,
+            max(0.0, deadline - now),
+        ))
+
+
+def _generate_and_attest_thermal_mesh(
+    sim,
+    ipk,
+    setup,
+    mesh_plan,
+    *,
+    idle_timeout_s=None,
+    idle_poll_s=1.0,
+    stable_artifact_s=1.0,
+    failure_idle_grace_s=30.0,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+):
+    """Generate and attest a fresh native grid before Analyze.
+
+    ``MeshIcepak.generate_mesh`` returns a Python boolean for AEDT's native
+    zero status.  Other return types are not interpreted as success.  A true
+    return is still insufficient: the exact project/design message cursor must
+    advance safely, every expected native mesh operation must remain present,
+    and AEDT must publish a new nonempty ``grid_output``/``grid_mapping`` pair.
+    """
+    required_objects_missing = list(
+        mesh_plan.get("required_objects_missing", [])
+    )
+    operation_count = int(mesh_plan.get("operation_count", 0))
+    object_level_operation_count = int(
+        mesh_plan.get("object_level_operation_count", -1)
+    )
+    mesh_region_operation_count = int(
+        mesh_plan.get("mesh_region_operation_count", -1)
+    )
+    static_contract_passed = (
+        mesh_plan.get("schema") == THERMAL_MESH_PLAN_CONTRACT_VERSION
+        and mesh_plan.get("policy") == THERMAL_MESH_POLICY
+        and not required_objects_missing
+        and operation_count > 0
+        and int(mesh_plan.get("shared_operation_count", -1)) == 0
+        and object_level_operation_count + mesh_region_operation_count
+        == operation_count
+        and int(mesh_plan.get("separate_object_operation_count", -1))
+        == object_level_operation_count
+        and mesh_region_operation_count
+        == int(mesh_plan.get("wcp_pad_mesh_region_count", -1))
+        and len(mesh_plan.get("required_thin_objects", []))
+        == int(mesh_plan.get("required_thin_object_count", -1))
+    )
+    from module.aedt_pool_adapter import pooled_backend_enabled
+    if pooled_backend_enabled():
+        raise RuntimeError(
+            "explicit native GenerateMesh preflight is standalone-only"
+        )
+    preflight = _prepare_thermal_dispatch(
+        sim,
+        ipk,
+        setup,
+        design_name=_THERMAL_DESIGN_NAME,
+        setup_name=_THERMAL_SETUP_NAME,
+    )
+    native_ipk = preflight["native_ipk"]
+    native_design = preflight["native_design"]
+
+    native_operation_readback = (
+        _native_thermal_mesh_operation_readback(
+            native_design,
+            mesh_plan,
+            native_editor=getattr(
+                getattr(native_ipk, "modeler", None), "oeditor", None
+            ),
+        )
+    )
+    artifact_snapshot = _snapshot_thermal_mesh_artifacts(
+        sim, native_ipk
+    )
+    desktop = _thermal_desktop_handle(sim, native_ipk)
+    cursor = capture_scoped_message_cursor(
+        desktop, preflight["project"], preflight["design"]
+    )
+    pre_running = _attest_standalone_mesh_desktop(
+        sim, native_ipk, desktop
+    )
+    if pre_running is not False:
+        raise RuntimeError(
+            "standalone thermal mesh preflight did not prove initial idle: "
+            f"{pre_running!r}"
+        )
+    generator = getattr(
+        getattr(native_ipk, "mesh", None), "generate_mesh", None
+    )
+    if not callable(generator):
+        raise RuntimeError("native Icepak mesh generation API is unavailable")
+
+    started = clock()
+    returned = None
+    generation_exception = ""
+    sim.solver_may_be_running = True
+    try:
+        returned = generator(_THERMAL_SETUP_NAME)
+    except Exception as exc:
+        generation_exception = (
+            f"{type(exc).__name__}: {str(exc)[:512]}"
+        )
+
+    idle_barrier = _wait_for_standalone_mesh_idle(
+        sim,
+        native_ipk,
+        desktop,
+        artifact_snapshot,
+        require_fresh_artifact=(
+            returned is True and not generation_exception
+        ),
+        timeout_s=idle_timeout_s,
+        poll_s=idle_poll_s,
+        stable_artifact_s=stable_artifact_s,
+        failure_idle_grace_s=failure_idle_grace_s,
+        clock=clock,
+        sleeper=sleeper,
+    )
+    if idle_barrier.get("passed") is not True:
+        # Do not scan messages, files, rebind a project, save, or release the
+        # Desktop.  The recovery process boundary owns containment while this
+        # flag remains asserted.
+        forensic = json.dumps(
+            {
+                "schema": THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION,
+                "passed": False,
+                "generate_mesh_returned": returned is True,
+                "generation_exception": generation_exception,
+                "standalone_idle_barrier": idle_barrier,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        logging.error(
+            "[thermal] unsafe native mesh completion: %s", forensic
+        )
+        raise RuntimeError(
+            "standalone native thermal mesh completion remains uncertain: "
+            + forensic[:8000]
+        )
+    sim.solver_may_be_running = False
+
+    message_scan_complete = False
+    new_messages = ()
+    new_errors = ()
+    fatal_messages = ()
+    message_scan_error = ""
+    try:
+        update = advance_scoped_message_cursor(desktop, cursor)
+        new_messages = tuple(update.new_messages)
+        new_errors = tuple(update.new_errors)
+        fatal_messages = tuple(update.fatal_messages)
+        message_scan_complete = True
+    except Exception as exc:
+        message_scan_error = (
+            f"{type(exc).__name__}: {str(exc)[:512]}"
+        )
+    unmeshed_objects = _unmeshed_objects_from_messages(
+        (*new_messages, *new_errors)
+    )
+
+    fresh_artifacts = list(
+        idle_barrier.get("fresh_mesh_artifacts", [])
+    )
+    artifact_readback_passed = bool(fresh_artifacts)
+    mapping_coverage = _thermal_mesh_mapping_coverage(
+        mesh_plan, fresh_artifacts
+    )
+
+    postflight_passed = False
+    postflight_error = ""
+    if returned is True:
+        try:
+            postflight = _prepare_thermal_dispatch(
+                sim,
+                native_ipk,
+                setup,
+                design_name=_THERMAL_DESIGN_NAME,
+                setup_name=_THERMAL_SETUP_NAME,
+            )
+            postflight_passed = (
+                postflight["project"] == preflight["project"]
+                and postflight["design"] == preflight["design"]
+                and postflight["setups"] == preflight["setups"]
+            )
+            if not postflight_passed:
+                raise RuntimeError(
+                    "thermal premesh postflight identity changed"
+                )
+        except Exception as exc:
+            postflight_error = (
+                f"{type(exc).__name__}: {str(exc)[:512]}"
+            )
+
+    message_payload = {
+        "messages": list(new_messages),
+        "errors": list(new_errors),
+    }
+    message_sha256 = hashlib.sha256(
+        json.dumps(
+            message_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    native_errors = list(dict.fromkeys(
+        [*new_errors, *fatal_messages]
+    ))
+    passed = (
+        static_contract_passed
+        and returned is True
+        and not generation_exception
+        and message_scan_complete
+        and not native_errors
+        and not unmeshed_objects
+        and artifact_readback_passed
+        and mapping_coverage["passed"] is True
+        and postflight_passed
+        and not native_operation_readback["missing_operation_names"]
+        and not native_operation_readback[
+            "required_thin_objects_missing"
+        ]
+        and idle_barrier.get("passed") is True
+    )
+    evidence = {
+        "schema": THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION,
+        "status": (
+            "passed_standalone_native_premesh"
+            if passed else "failed_standalone_native_premesh"
+        ),
+        "passed": passed,
+        "static_contract_passed": static_contract_passed,
+        "generate_mesh_returned": returned is True,
+        "generate_mesh_return_type": type(returned).__name__,
+        "generate_mesh_return_repr": repr(returned)[:128],
+        "generation_exception": generation_exception,
+        "message_scan_complete": message_scan_complete,
+        "message_scan_error": message_scan_error,
+        "native_message_sha256": message_sha256,
+        "native_errors": native_errors,
+        "required_objects_missing": required_objects_missing,
+        "unmeshed_objects": unmeshed_objects,
+        "native_operation_readback_passed": (
+            not native_operation_readback["missing_operation_names"]
+        ),
+        "native_operation_readback": native_operation_readback,
+        "standalone_idle_barrier_passed": True,
+        "standalone_idle_barrier": idle_barrier,
+        "mesh_artifact_readback_passed": artifact_readback_passed,
+        "mesh_mapping_coverage_passed": mapping_coverage["passed"],
+        "mesh_mapping_coverage": mapping_coverage,
+        "fresh_mesh_artifact_count": len(fresh_artifacts),
+        "fresh_mesh_artifacts": fresh_artifacts,
+        "postflight_identity_passed": postflight_passed,
+        "postflight_error": postflight_error,
+        "analysis_dispatched_after_premesh": False,
+        "mesh_policy": THERMAL_MESH_POLICY,
+        "mesh_plan_sha256": mesh_plan["plan_sha256"],
+        "mesh_operation_count": mesh_plan["operation_count"],
+        "mesh_assigned_object_count": (
+            mesh_plan["assigned_object_count"]
+        ),
+        "object_level_operation_count": (
+            mesh_plan["object_level_operation_count"]
+        ),
+        "mesh_region_operation_count": (
+            mesh_plan["mesh_region_operation_count"]
+        ),
+        "wcp_pad_mesh_region_count": (
+            mesh_plan["wcp_pad_mesh_region_count"]
+        ),
+        "core_plate_assembly_count": (
+            mesh_plan["core_plate_assembly_count"]
+        ),
+        "wcp_assembly_count": mesh_plan["wcp_assembly_count"],
+        "rx_retained_pack_count": (
+            mesh_plan["rx_retained_pack_count"]
+        ),
+        "elapsed_s": round(
+            max(0.0, clock() - started), 3
+        ),
+    }
+    forensic = json.dumps(
+        evidence,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    logging.warning("[thermal] native mesh preflight: %s", forensic)
+    if not passed:
+        raise RuntimeError(
+            "native thermal mesh preflight failed: "
+            + forensic[:8000]
+        )
+    return evidence
+
+
+def _pooled_thermal_mesh_preflight_not_applicable(mesh_plan):
+    """Record why pooled production keeps its existing exact-solve protocol."""
+    operation_count = int(mesh_plan.get("operation_count", 0))
+    object_level_operation_count = int(
+        mesh_plan.get("object_level_operation_count", -1)
+    )
+    mesh_region_operation_count = int(
+        mesh_plan.get("mesh_region_operation_count", -1)
+    )
+    static_contract_passed = (
+        mesh_plan.get("schema") == THERMAL_MESH_PLAN_CONTRACT_VERSION
+        and mesh_plan.get("policy") == THERMAL_MESH_POLICY
+        and mesh_plan.get("required_objects_missing") == []
+        and operation_count > 0
+        and int(mesh_plan.get("shared_operation_count", -1)) == 0
+        and object_level_operation_count + mesh_region_operation_count
+        == operation_count
+        and int(mesh_plan.get("separate_object_operation_count", -1))
+        == object_level_operation_count
+        and mesh_region_operation_count
+        == int(mesh_plan.get("wcp_pad_mesh_region_count", -1))
+    )
+    if not static_contract_passed:
+        raise RuntimeError(
+            "pooled thermal mesh static assignment contract failed"
+        )
+    return {
+        "schema": THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION,
+        "status": "not_applicable_pooled_exact_analyze_protocol",
+        "passed": False,
+        "static_contract_passed": True,
+        "generate_mesh_returned": False,
+        "message_scan_complete": False,
+        "analysis_dispatched_after_premesh": False,
+        "required_objects_missing": [],
+        "unmeshed_objects": [],
+        "mesh_artifact_readback_passed": False,
+        "mesh_mapping_coverage_passed": False,
+        "mesh_mapping_coverage": {
+            "schema": "thermal-grid-mapping-coverage-v1",
+            "passed": False,
+            "status": "not_applicable_pooled_exact_analyze_protocol",
+        },
+        "native_operation_readback_passed": False,
+        "postflight_identity_passed": False,
+        "mesh_policy": THERMAL_MESH_POLICY,
+        "mesh_plan_sha256": mesh_plan["plan_sha256"],
+        "mesh_operation_count": mesh_plan["operation_count"],
+        "mesh_assigned_object_count": (
+            mesh_plan["assigned_object_count"]
+        ),
+        "object_level_operation_count": (
+            mesh_plan["object_level_operation_count"]
+        ),
+        "mesh_region_operation_count": (
+            mesh_plan["mesh_region_operation_count"]
+        ),
+        "wcp_pad_mesh_region_count": (
+            mesh_plan["wcp_pad_mesh_region_count"]
+        ),
+        "core_plate_assembly_count": (
+            mesh_plan["core_plate_assembly_count"]
+        ),
+        "wcp_assembly_count": mesh_plan["wcp_assembly_count"],
+        "rx_retained_pack_count": (
+            mesh_plan["rx_retained_pack_count"]
+        ),
+    }
+
+
+def _thermal_mesh_result_metadata(mesh_plan, preflight):
+    """Serialize the exact mesh plan and native preflight into one result row."""
+    pooled_not_applicable = (
+        preflight.get("status")
+        == "not_applicable_pooled_exact_analyze_protocol"
+    )
+    common_valid = (
+        preflight.get("schema")
+        == THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION
+        and preflight.get("static_contract_passed") is True
+        and preflight.get("analysis_dispatched_after_premesh") is True
+        and preflight.get("required_objects_missing") == []
+        and preflight.get("unmeshed_objects") == []
+    )
+    standalone_valid = (
+        preflight.get("passed") is True
+        and preflight.get("generate_mesh_returned") is True
+        and preflight.get("message_scan_complete") is True
+        and preflight.get("mesh_artifact_readback_passed") is True
+        and preflight.get("mesh_mapping_coverage_passed") is True
+        and preflight.get("native_operation_readback_passed") is True
+        and preflight.get("standalone_idle_barrier_passed") is True
+        and preflight.get("postflight_identity_passed") is True
+    )
+    if not common_valid or (
+        not pooled_not_applicable and not standalone_valid
+    ):
+        raise RuntimeError(
+            "thermal mesh result metadata requires a passed pre-solve "
+            "attestation and a later Analyze dispatch"
+        )
+    return {
+        "thermal_mesh_policy": [THERMAL_MESH_POLICY],
+        "thermal_mesh_plan_contract_version": [
+            THERMAL_MESH_PLAN_CONTRACT_VERSION
+        ],
+        "thermal_mesh_plan_sha256": [mesh_plan["plan_sha256"]],
+        "thermal_mesh_operation_count": [
+            int(mesh_plan["operation_count"])
+        ],
+        "thermal_mesh_assigned_object_count": [
+            int(mesh_plan["assigned_object_count"])
+        ],
+        "thermal_mesh_required_thin_object_count": [
+            int(mesh_plan["required_thin_object_count"])
+        ],
+        "thermal_mesh_shared_operation_count": [
+            int(mesh_plan["shared_operation_count"])
+        ],
+        "thermal_mesh_separate_object_operation_count": [
+            int(mesh_plan["separate_object_operation_count"])
+        ],
+        "thermal_mesh_object_level_operation_count": [
+            int(mesh_plan["object_level_operation_count"])
+        ],
+        "thermal_mesh_region_operation_count": [
+            int(mesh_plan["mesh_region_operation_count"])
+        ],
+        "thermal_mesh_wcp_pad_region_count": [
+            int(mesh_plan["wcp_pad_mesh_region_count"])
+        ],
+        "thermal_mesh_core_plate_assembly_count": [
+            int(mesh_plan["core_plate_assembly_count"])
+        ],
+        "thermal_mesh_wcp_assembly_count": [
+            int(mesh_plan["wcp_assembly_count"])
+        ],
+        "thermal_mesh_rx_retained_pack_count": [
+            int(mesh_plan["rx_retained_pack_count"])
+        ],
+        "thermal_mesh_preflight_contract_version": [
+            THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION
+        ],
+        "thermal_mesh_preflight_status": [
+            preflight.get("status", "passed_standalone_native_premesh")
+        ],
+        "thermal_mesh_native_generation_passed": [
+            0 if pooled_not_applicable else 1
+        ],
+        "thermal_mesh_unmeshed_object_count": [0],
+        "thermal_mesh_unmeshed_objects_json": ["[]"],
+        "thermal_mesh_preflight_json": [
+            json.dumps(
+                preflight,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ],
+    }
+
+
+def _thermal_mesh_postsolve_probe_object_names(objs):
+    """Return the prior nine zero-cell solids when present in this topology."""
+    return sorted({
+        str(obj.name)
+        for obj in (
+            list(objs.get("wcp_pads", []))
+            + list(objs.get("Rx_side2_explicit", []))
+        )
+        if (
+            str(obj.name).startswith("Tx_main_wcp_pad_")
+            or str(obj.name) == "Rx_side2_22_0"
+        )
+    })
+
+
+def _thermal_mesh_postsolve_probe_status(object_names, temperatures):
+    """Require finite mean and maximum volume temperature for each solid."""
+    names = sorted(set(map(str, object_names)))
+    missing = [
+        name
+        for name in names
+        if not all(
+            column in temperatures
+            and math.isfinite(float(temperatures[column]))
+            for column in (f"T_mean_{name}", f"T_max_{name}")
+        )
+    ]
+    return {
+        "object_count": len(names),
+        "missing_count": len(missing),
+        "missing_objects": missing,
+        "complete": not missing,
+    }
+
+
 def _bounded_thermal_messages(sim, ipk, limit=12, char_limit=2048):
     """Capture a bounded AEDT message tail without letting cleanup mask the solve."""
     try:
@@ -967,7 +3945,7 @@ def _bounded_thermal_messages(sim, ipk, limit=12, char_limit=2048):
     return bounded
 
 
-def _bounded_thermal_model_context(ipk, operation_limit=24):
+def _bounded_thermal_model_context(ipk, operation_limit=64):
     """Capture bounded mesh/object context for solve-start pilot diagnostics."""
     context = {"object_count": None, "model_bounds": [], "mesh_operations": []}
     try:
@@ -1005,31 +3983,142 @@ def _bounded_thermal_model_context(ipk, operation_limit=24):
 
 def _poll_thermal_dispatch_evidence(
     sim, ipk, setup, monitor_snapshot, timeout_s=30.0, poll_s=2.0,
-    clock=time.monotonic, sleeper=time.sleep,
+    clock=time.monotonic, sleeper=time.sleep, completion_barrier=False,
+    idle_monitor_grace_s=30.0, desktop=None, desktop_attestor=None,
 ):
-    """Poll monitor evidence and native running state for a bounded grace period."""
-    deadline = clock() + max(0.0, float(timeout_s))
+    """Poll fresh monitor evidence and the native standalone solve state.
+
+    The legacy startup-evidence mode is retained for callers that do not set
+    ``completion_barrier``. Completion mode is deliberately stronger: a
+    native ``running=True`` state can never leave the loop, the first verified
+    idle state starts a short monitor-publication grace period, and a fresh
+    terminal residual monitor is authoritative once the engine is not
+    explicitly running. This covers PyAEDT builds where
+    ``analyze(blocking=True)`` returns before the native Icepak engine has
+    finished.
+    """
+    if completion_barrier and not callable(desktop_attestor):
+        raise ValueError(
+            "standalone completion barrier requires a Desktop attestor"
+        )
+    started = clock()
+    deadline = started + max(0.0, float(timeout_s))
     convergence = None
     running = None
     running_error = ""
+    idle_since = None
+    transitions = []
+    previous_transition = object()
+    outcome = "startup_grace_expired"
+    timed_out = False
+    desktop_attested = False
+    desktop_attestation_attempts = 0
+    desktop_attestation_error = ""
     while True:
         convergence = _thermal_convergence_telemetry(
             sim, ipk, setup, attempts=1, monitor_snapshot=monitor_snapshot
         )
+        if completion_barrier:
+            # Identity evidence is iteration-scoped, never sticky. In
+            # particular, the exact raw proxy is re-attested immediately
+            # before the running=False observation that can authorize
+            # extraction and release.
+            desktop_attested = False
+            desktop_attestation_attempts += 1
+            try:
+                attested = desktop_attestor(desktop)
+                if attested is None or attested is False:
+                    raise RuntimeError(
+                        "standalone Desktop attestation returned no proxy"
+                    )
+                desktop_attested = True
+                desktop_attestation_error = ""
+            except Exception as exc:
+                desktop_attestation_error = (
+                    f"{type(exc).__name__}: {str(exc)[:512]}"
+                )
         try:
-            running = _thermal_running_state(sim, ipk)
+            running = _thermal_running_state(sim, ipk, desktop=desktop)
             running_error = ""
         except Exception as exc:
             running = None
             running_error = f"{type(exc).__name__}: {str(exc)[:512]}"
+        now = clock()
+        transition = (running, running_error)
+        if transition != previous_transition:
+            if len(transitions) < 64:
+                transitions.append({
+                    "elapsed_s": round(max(0.0, now - started), 3),
+                    "running": running,
+                    "error": running_error,
+                })
+            previous_transition = transition
         if convergence["thermal_convergence_reason"] in {
             "converged", "residual_threshold",
-        }:
+        } and (
+            not completion_barrier
+            or (running is False and desktop_attested)
+        ):
+            outcome = "terminal_fresh_monitor"
             break
-        now = clock()
+
+        if not completion_barrier:
+            if now >= deadline:
+                break
+            sleeper(min(max(0.0, float(poll_s)), max(0.0, deadline - now)))
+            continue
+
+        if running is True:
+            # A verified running engine is an absolute no-release/no-retry
+            # barrier. If it later reports idle, the monitor still receives a
+            # bounded publication grace period before the result is rejected.
+            idle_since = None
+        elif running is False:
+            if idle_since is None:
+                idle_since = now
+            idle_deadline = idle_since + max(
+                0.0, float(idle_monitor_grace_s)
+            )
+            if now >= idle_deadline:
+                outcome = "idle_monitor_grace_expired"
+                break
+        else:
+            # Unknown is not proof of idle. Keep waiting for a terminal fresh
+            # monitor or the overall bounded completion timeout.
+            idle_since = None
+
         if now >= deadline:
+            outcome = "completion_timeout"
+            timed_out = True
             break
-        sleeper(min(max(0.0, float(poll_s)), max(0.0, deadline - now)))
+        sleep_until = deadline
+        if running is False and idle_since is not None:
+            sleep_until = min(
+                sleep_until,
+                idle_since + max(0.0, float(idle_monitor_grace_s)),
+            )
+        sleeper(min(
+            max(0.0, float(poll_s)),
+            max(0.0, sleep_until - now),
+        ))
+
+    if completion_barrier:
+        convergence = dict(convergence)
+        convergence["_thermal_completion_poll"] = {
+            "schema": "thermal-standalone-completion-poll-v1",
+            "timeout_s": float(timeout_s),
+            "idle_monitor_grace_s": float(idle_monitor_grace_s),
+            "poll_s": float(poll_s),
+            "elapsed_s": round(max(0.0, clock() - started), 3),
+            "outcome": outcome,
+            "timed_out": timed_out,
+            "last_running": running,
+            "last_running_error": running_error,
+            "desktop_attested": desktop_attested,
+            "desktop_attestation_attempts": desktop_attestation_attempts,
+            "desktop_attestation_error": desktop_attestation_error,
+            "running_transitions": transitions,
+        }
     return convergence, running, running_error
 
 
@@ -1046,6 +4135,32 @@ def _thermal_forensic_json(attempts, convergence):
         },
     }
     return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _standalone_thermal_completion_timeout(timeout_s=None):
+    """Return the bounded post-Analyze completion barrier timeout."""
+    if timeout_s is None:
+        raw_timeout = os.environ.get(
+            "MFT_AEDT_STANDALONE_SOLVE_TIMEOUT_SECONDS", "7200"
+        ).strip()
+        try:
+            timeout_s = float(raw_timeout)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError(
+                "MFT_AEDT_STANDALONE_SOLVE_TIMEOUT_SECONDS must be numeric"
+            ) from error
+        if not 30 <= timeout_s <= 86400:
+            raise RuntimeError(
+                "MFT_AEDT_STANDALONE_SOLVE_TIMEOUT_SECONDS must be between "
+                "30 and 86400"
+            )
+    else:
+        timeout_s = float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError(
+                "standalone thermal completion timeout must be positive"
+            )
+    return timeout_s
 
 
 def _pooled_thermal_poll_settings(timeout_s=None, poll_s=None):
@@ -1162,8 +4277,23 @@ def _solve_exact_pooled_thermal_setup(
             _thermal_desktop_handle(sim, ipk), message_cursor
         )
         message_cursor = update.cursor
-        if update.fatal_messages:
-            evidence = " | ".join(update.fatal_messages[-6:])[:2000]
+        fresh_messages = tuple(dict.fromkeys((
+            *update.new_messages,
+            *update.new_errors,
+        )))
+        unmeshed_objects = _unmeshed_objects_from_messages(fresh_messages)
+        terminal_messages = list(dict.fromkeys((
+            *update.fatal_messages,
+            *_thermal_terminal_solver_messages(fresh_messages),
+        )))
+        if unmeshed_objects or terminal_messages:
+            evidence = " | ".join([
+                *(
+                    ["unmeshed=" + ",".join(unmeshed_objects)]
+                    if unmeshed_objects else []
+                ),
+                *terminal_messages[-6:],
+            ])[:2000]
             raise RuntimeError(
                 "[thermal] exact AEDT design reported a terminal error: "
                 f"{evidence}"
@@ -1270,6 +4400,12 @@ def _solve_exact_thermal_setup(
             clock=clock, sleeper=sleeper,
         )
 
+    # Validate the fail-closed completion timeout before any native dispatch.
+    # A successful PyAEDT return is not sufficient completion evidence on
+    # standalone Icepak; live production has observed it return while the
+    # native engine continues to consume CPU.
+    completion_timeout_s = _standalone_thermal_completion_timeout()
+    standalone_parallel_policy = _standalone_thermal_parallel_policy(sim)
     attempts = []
     convergence = None
     previous_snapshot = None
@@ -1313,6 +4449,35 @@ def _solve_exact_thermal_setup(
         previous_snapshot = monitor_snapshot
         native_ipk = preflight.pop("native_ipk")
         native_design = preflight.pop("native_design")
+        strict_parallel_attestation = bool(
+            standalone_parallel_policy["strict_attestation"]
+        )
+        acf_before = None
+        acf_evidence = {}
+        acf_attestation_error = ""
+        process_attestor = None
+        process_evidence = {}
+        process_attestation_error = ""
+        if strict_parallel_attestation:
+            acf_before = _thermal_hpc_acf_snapshot(native_ipk)
+        # Preserve the exact raw proxy that proved this Desktop idle during
+        # preflight. PyAEDT may clear its wrapper handle while restoring DSO
+        # settings after Analyze, but the raw proxy remains valid for
+        # AreThereSimulationsRunning.
+        native_desktop = _thermal_desktop_handle(sim, native_ipk)
+        attest_cached_desktop = getattr(
+            sim, "_attest_cached_native_desktop", None
+        )
+        if not callable(attest_cached_desktop):
+            raise RuntimeError(
+                "standalone post-Analyze Desktop attestation is unavailable"
+            )
+        desktop_attestor = lambda desktop: attest_cached_desktop(
+            desktop, require_endpoint_identity=True
+        )
+        message_cursor = capture_scoped_message_cursor(
+            native_desktop, preflight["project"], preflight["design"]
+        )
         started = clock()
         status = "success"
         returned = None
@@ -1321,7 +4486,18 @@ def _solve_exact_thermal_setup(
         try:
             analyze_kwargs = {"setup": setup_name, "blocking": True}
             if not pooled_backend:
-                analyze_kwargs["cores"] = sim.NUM_CORE
+                analyze_kwargs.update({
+                    "cores": standalone_parallel_policy[
+                        "pyaedt_cores_argument"
+                    ],
+                    "tasks": standalone_parallel_policy[
+                        "pyaedt_tasks_argument"
+                    ],
+                    "gpus": 0,
+                    "use_auto_settings": standalone_parallel_policy[
+                        "pyaedt_use_auto_settings_argument"
+                    ],
+                })
             # Passing ``cores=`` asks PyAEDT to rewrite and later restore the
             # Desktop-global Icepak DSO registry.  A pooled Desktop can have a
             # sibling MFT/IPMSM project, so it must reuse the host-owned,
@@ -1331,6 +4507,19 @@ def _solve_exact_thermal_setup(
                 # materials, mesh, and setup failures above are project-local
                 # script errors and must not quarantine a healthy shared host.
                 sim.solver_may_be_running = True
+            else:
+                # Standalone PyAEDT can return from blocking Analyze before
+                # the native Icepak engine stops. Keep the same uncertainty
+                # flag asserted until the completion barrier proves either a
+                # terminal monitor with no verified running engine or an
+                # explicit idle state.
+                sim.solver_may_be_running = True
+                if strict_parallel_attestation:
+                    process_attestor = _StandaloneThermalProcessAttestor(
+                        standalone_parallel_policy[
+                            "expected_fluent_processes"
+                        ]
+                    ).start()
             if pooled_backend:
                 # The surrounding thermal transaction protects build and
                 # extraction. Yield it only around the exact project-scoped
@@ -1364,28 +4553,60 @@ def _solve_exact_thermal_setup(
             exception_message = str(exc)[:512]
             logging.exception("[thermal] exact ThermalSetup dispatch failed: %s", exc)
 
-        messages = _bounded_thermal_messages(sim, ipk) if status != "success" else []
-        convergence, running, running_error = _poll_thermal_dispatch_evidence(
-            sim, ipk, setup, monitor_snapshot,
-            timeout_s=monitor_grace_s, poll_s=poll_s,
-            clock=clock, sleeper=sleeper,
-        )
-        reason = convergence["thermal_convergence_reason"]
-        if pooled_backend and running is False:
-            # Only an exact project-scoped idle result proves that a False or
-            # exceptional native dispatch did not leave work in flight. A
-            # monitor can prove startup/progress, but not that the solver
-            # process has stopped.
-            sim.solver_may_be_running = False
-        if status != "success" or convergence["thermal_convergence_reason"] != "converged":
-            preflight["model_context"] = _bounded_thermal_model_context(ipk)
-            if not messages:
-                messages = _bounded_thermal_messages(sim, ipk)
+        messages = []
         try:
-            sim.save_project()
-        except Exception:
-            pass
-        attempts.append({
+            convergence, running, running_error = (
+                _poll_thermal_dispatch_evidence(
+                    sim, ipk, setup, monitor_snapshot,
+                    timeout_s=completion_timeout_s, poll_s=poll_s,
+                    clock=clock, sleeper=sleeper,
+                    completion_barrier=True,
+                    idle_monitor_grace_s=monitor_grace_s,
+                    desktop=native_desktop,
+                    desktop_attestor=desktop_attestor,
+                )
+            )
+        finally:
+            if process_attestor is not None:
+                try:
+                    process_evidence = process_attestor.finish()
+                except Exception as exc:
+                    process_attestation_error = (
+                        f"{type(exc).__name__}: {str(exc)[:4000]}"
+                    )
+        if strict_parallel_attestation:
+            try:
+                acf_evidence = _validated_thermal_hpc_acf(
+                    native_ipk, standalone_parallel_policy, acf_before
+                )
+            except Exception as exc:
+                acf_attestation_error = (
+                    f"{type(exc).__name__}: {str(exc)[:4000]}"
+                )
+        convergence = dict(convergence)
+        completion_poll = convergence.pop("_thermal_completion_poll", {})
+        reason = convergence["thermal_convergence_reason"]
+        parallel_attestation_error = " | ".join(
+            value for value in (
+                acf_attestation_error,
+                process_attestation_error,
+            ) if value
+        )
+        parallel_attestation_failed = bool(parallel_attestation_error)
+        if parallel_attestation_failed:
+            status = "parallel_attestation_error"
+            exception_type = "NativeIcepakParallelAttestationError"
+            exception_message = parallel_attestation_error[:512]
+            convergence["thermal_converged"] = 0
+            convergence["thermal_convergence_reason"] = (
+                "parallel_process_attestation_failed"
+            )
+            reason = convergence["thermal_convergence_reason"]
+        safe_idle = (
+            completion_poll.get("desktop_attested") is True
+            and running is False
+        )
+        attempt_record = {
             "attempt": len(attempts) + 1,
             "dispatch_status": status,
             "return_type": type(returned).__name__ if status != "exception" else "",
@@ -1394,12 +4615,141 @@ def _solve_exact_thermal_setup(
             "elapsed_s": round(max(0.0, clock() - started), 3),
             "native_running": running,
             "running_state_error": running_error,
+            "completion_poll": completion_poll,
             "monitor_reason": convergence["thermal_convergence_reason"],
-            "monitor_file": str(convergence.get("thermal_monitor_file", ""))[:256],
+            "monitor_file": str(
+                convergence.get("thermal_monitor_file", "")
+            )[:256],
             "aedt_messages": messages,
             "identity": preflight,
-        })
+            "mesh_preflight": {
+                "schema": getattr(
+                    sim, "thermal_mesh_preflight", {}
+                ).get("schema", ""),
+                "passed": getattr(
+                    sim, "thermal_mesh_preflight", {}
+                ).get("passed", False),
+                "mesh_plan_sha256": getattr(
+                    sim, "thermal_mesh_preflight", {}
+                ).get("mesh_plan_sha256", ""),
+                "mesh_artifact_readback_passed": getattr(
+                    sim, "thermal_mesh_preflight", {}
+                ).get("mesh_artifact_readback_passed", False),
+                "mesh_mapping_coverage_passed": getattr(
+                    sim, "thermal_mesh_preflight", {}
+                ).get("mesh_mapping_coverage_passed", False),
+                "analysis_dispatched_after_premesh": True,
+            },
+            "parallel_policy": dict(standalone_parallel_policy),
+            "parallel_attestation": {
+                "schema": "thermal-standalone-parallel-attestation-v1",
+                "passed": (
+                    strict_parallel_attestation
+                    and not parallel_attestation_failed
+                    and acf_evidence.get("passed") is True
+                    and process_evidence.get("passed") is True
+                ) if strict_parallel_attestation else None,
+                "strict": strict_parallel_attestation,
+                "acf": acf_evidence,
+                "acf_error": acf_attestation_error,
+                "process": process_evidence,
+                "process_error": process_attestation_error,
+            },
+        }
+        if not safe_idle:
+            # No model/message/save/retry automation is permitted after a
+            # premature Analyze return until the exact cached Desktop is
+            # re-attested and explicitly reports idle.
+            attempts.append(attempt_record)
+            forensic_json = _thermal_forensic_json(attempts, convergence)
+            logging.warning(
+                "[thermal] unsafe completion forensic: %s", forensic_json
+            )
+            raise RuntimeError(
+                "standalone thermal completion barrier did not prove exact "
+                "Desktop idle: " + forensic_json[:4000]
+            )
+        sim.solver_may_be_running = False
+        try:
+            message_update = advance_scoped_message_cursor(
+                native_desktop, message_cursor
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "standalone thermal post-Analyze exact message scan failed: "
+                f"{type(exc).__name__}: {str(exc)[:512]}"
+            ) from exc
+        fresh_messages = tuple(dict.fromkeys((
+            *message_update.new_messages,
+            *message_update.new_errors,
+        )))
+        messages = _bounded_message_values(fresh_messages)
+        unmeshed_objects = _unmeshed_objects_from_messages(
+            fresh_messages
+        )
+        terminal_messages = list(dict.fromkeys((
+            *message_update.fatal_messages,
+            *_thermal_terminal_solver_messages(fresh_messages),
+        )))
+        nonretryable_native_failure = bool(
+            unmeshed_objects or terminal_messages
+            or parallel_attestation_failed
+        )
+        if nonretryable_native_failure:
+            status = "terminal_error"
+            exception_type = "NativeIcepakTerminalError"
+            exception_message = " | ".join(
+                [
+                    *(
+                        ["unmeshed=" + ",".join(unmeshed_objects)]
+                        if unmeshed_objects else []
+                    ),
+                    *terminal_messages[-6:],
+                ]
+            )[:512]
+            convergence = dict(convergence)
+            convergence["thermal_converged"] = 0
+            convergence["thermal_convergence_reason"] = (
+                "native_unmeshed_objects"
+                if unmeshed_objects else "native_terminal_error"
+            )
+            reason = convergence["thermal_convergence_reason"]
+        if (
+            status != "success"
+            or convergence["thermal_convergence_reason"] != "converged"
+        ):
+            preflight["model_context"] = _bounded_thermal_model_context(ipk)
+        try:
+            sim.save_project()
+        except Exception:
+            pass
+        attempt_record["elapsed_s"] = round(
+            max(0.0, clock() - started), 3
+        )
+        attempt_record["aedt_messages"] = messages
+        attempt_record["unmeshed_objects"] = unmeshed_objects
+        attempt_record["terminal_messages"] = _bounded_message_values(
+            terminal_messages, limit=12, char_limit=4096
+        )
+        attempt_record["message_scan_complete"] = True
+        attempt_record["dispatch_status"] = status
+        attempt_record["exception_type"] = exception_type
+        attempt_record["exception_message"] = exception_message
+        attempt_record["monitor_reason"] = (
+            convergence["thermal_convergence_reason"]
+        )
+        attempts.append(attempt_record)
 
+        if nonretryable_native_failure:
+            logging.error(
+                "[thermal] refusing solver retry after exact native "
+                "terminal evidence: unmeshed=%s terminal=%s",
+                unmeshed_objects,
+                _bounded_message_values(
+                    terminal_messages, limit=6, char_limit=2048
+                ),
+            )
+            break
         if reason in {"converged", "residual_threshold", "monitor_malformed"}:
             break
         retryable = status in {"false", "exception"} \
@@ -1420,6 +4770,18 @@ def _solve_exact_thermal_setup(
         "exception_message": "",
     }
     forensic_json = _thermal_forensic_json(attempts, convergence)
+    sim.thermal_parallel_evidence = {
+        "schema": "thermal-standalone-parallel-evidence-v1",
+        "policy": dict(standalone_parallel_policy),
+        "attempts": [
+            dict(item.get("parallel_attestation", {}))
+            for item in attempts
+        ],
+        "passed": bool(attempts) and all(
+            item.get("parallel_attestation", {}).get("passed") is True
+            for item in attempts
+        ) if standalone_parallel_policy["strict_attestation"] else None,
+    }
     logging.warning("[thermal] dispatch forensic: %s", forensic_json)
     if pooled_backend and bool(getattr(sim, "solver_may_be_running", False)):
         # Never flow into normal project close/release with an uncertain native
@@ -1676,12 +5038,63 @@ def _create_thermal_materials(ipk, df):
         m.mass_density = 8900 * ff
         m.specific_heat = 385
 
+    # The retained explicit Rx foils still require the physical inter-turn
+    # electrical insulation. Earlier Full models left these gaps as fluid,
+    # while the homogenized middle pack included the same insulation in its
+    # effective conductivity. That topology disconnected the end foils
+    # thermally and produced non-physical 250--3000 C local temperatures.
+    #
+    # Do not add or attest this extra project material for the standard
+    # n_explicit_turns=0 topology: preserving that path avoids extending the
+    # production TIM3 contract when no explicit-insulation solid can exist.
+    needs_explicit_insulation = False
+    if "n_explicit_turns" in df.columns and "N2_main" in df.columns:
+        n_explicit = int(df["n_explicit_turns"].iloc[0])
+        turn_counts = [int(df["N2_main"].iloc[0])]
+        if "N2_side" in df.columns:
+            turn_counts.append(int(df["N2_side"].iloc[0]))
+        needs_explicit_insulation = any(
+            _explicit_rx_gap_indices(turn_count, n_explicit)
+            for turn_count in turn_counts
+        )
+
+    rx_insulation_readback = None
+    if needs_explicit_insulation:
+        if RX_EXPLICIT_INSULATION_MATERIAL not in mats.material_keys:
+            m = mats.add_material(RX_EXPLICIT_INSULATION_MATERIAL)
+        else:
+            m = mats[RX_EXPLICIT_INSULATION_MATERIAL]
+        if m is None or m is False:
+            raise RuntimeError("winding_insulation material is unavailable")
+        # Reapply unconditionally because a copied Maxwell design may already
+        # contain a stale project material with this name.
+        m.conductivity = 0
+        m.thermal_conductivity = k_ins
+        m.mass_density = 1200
+        m.specific_heat = 1000
+        rx_insulation_readback = _rx_insulation_native_readback(
+            mats, k_ins
+        )
+
     if "thermal_pad" not in mats.material_keys:
         m = mats.add_material("thermal_pad")
-        m.conductivity = 0
-        m.thermal_conductivity = 0.2
+    else:
+        m = mats["thermal_pad"]
+    if m is None or m is False:
+        raise RuntimeError("thermal_pad material is unavailable")
 
-    return k_in, k_th
+    # Maxwell creates this project material at 0.2 W/(m*K) before the Icepak
+    # design is copied. Reapply both properties unconditionally: merely
+    # checking material existence silently retained the stale Maxwell value.
+    m.conductivity = 0
+    m.thermal_conductivity = THERMAL_PAD_CONDUCTIVITY_W_MK
+    thermal_pad_readback = _thermal_pad_native_readback(mats)
+
+    if rx_insulation_readback is not None:
+        thermal_pad_readback["rx_explicit_insulation"] = (
+            rx_insulation_readback
+        )
+    return k_in, k_th, thermal_pad_readback
 
 
 # ---------------------------------------------------------------------------
@@ -1752,6 +5165,98 @@ def _partition_rx_turns(windings, n_explicit):
     return windings[:count] + windings[-count:], windings[count:-count]
 
 
+def _explicit_rx_gap_indices(turn_count, n_explicit):
+    """Return physical gaps whose two neighboring foils stay explicit."""
+    count = int(n_explicit)
+    turns = int(turn_count)
+    if turns <= 1 or count == 0:
+        return []
+    if count < 0 or 2 * count >= turns:
+        return list(range(turns - 1))
+    indices = list(range(max(count - 1, 0)))
+    indices.extend(range(turns - count, turns - 1))
+    return sorted(set(indices))
+
+
+def _expected_rx_insulation_counts(df, n_explicit, mode):
+    """Return the exact retained insulation-ring count for each Rx pack."""
+    mode = str(mode)
+    main_count = len(_explicit_rx_gap_indices(
+        int(df["N2_main"].iloc[0]), n_explicit
+    ))
+    side_turns = int(df["N2_side"].iloc[0])
+    side_count = (
+        len(_explicit_rx_gap_indices(side_turns, n_explicit))
+        if side_turns > 0 else 0
+    )
+    return {
+        "Rx_main_insulation": main_count,
+        "Rx_side_insulation": side_count,
+        "Rx_side2_insulation": side_count if mode == "full" else 0,
+    }
+
+
+def _build_explicit_rx_insulation(
+        ipk, df, prefix, name, offset_x, n_explicit, height):
+    """Fill retained-foil gaps with the candidate's solid insulation.
+
+    The middle homogenized block already includes every internal insulation
+    layer.  Only gaps between adjacent retained explicit foils are created
+    here; the explicit-to-block interfaces already meet the homogenized solid.
+    """
+    turn_count = int(df[f"N2_{prefix}"].iloc[0])
+    if turn_count <= 1:
+        return []
+    turn_count, cw, x_pos, y_pos = _rx_layout(df, prefix)
+    gap_indices = _explicit_rx_gap_indices(turn_count, n_explicit)
+    if not gap_indices:
+        return []
+
+    expected_gap = float(df["gap2"].iloc[0])
+    if not math.isfinite(expected_gap) or expected_gap <= 0:
+        raise RuntimeError(
+            f"{name} explicit insulation requires finite gap2 > 0"
+        )
+    insulation = []
+    for index in gap_indices:
+        x = 0.5 * (x_pos[index] + x_pos[index + 1])
+        y = 0.5 * (y_pos[index] + y_pos[index + 1])
+        gap_x = x_pos[index + 1] - x_pos[index] - cw
+        gap_y = y_pos[index + 1] - y_pos[index] - cw
+        if (
+            not math.isclose(gap_x, expected_gap, rel_tol=0.0, abs_tol=1e-9)
+            or not math.isclose(gap_y, expected_gap, rel_tol=0.0, abs_tol=1e-9)
+        ):
+            raise RuntimeError(
+                f"{name} explicit insulation gap mismatch at {index}: "
+                f"x={gap_x!r}, y={gap_y!r}, expected={expected_gap!r}"
+            )
+        points = [
+            [f"{x}mm + {offset_x}mm", f"{y}mm", "0mm"],
+            [f"{-x}mm + {offset_x}mm", f"{y}mm", "0mm"],
+            [f"{-x}mm + {offset_x}mm", f"{-y}mm", "0mm"],
+            [f"{x}mm + {offset_x}mm", f"{-y}mm", "0mm"],
+            [f"{x}mm + {offset_x}mm", f"{y}mm", "0mm"],
+        ]
+        obj = ipk.modeler.create_polyline(
+            points=points,
+            name=f"{name}_insulation_gap_{index}",
+            material=RX_EXPLICIT_INSULATION_MATERIAL,
+            xsection_orient="Auto",
+            xsection_type="Rectangle",
+            xsection_width=expected_gap,
+            xsection_height=float(height),
+            xsection_num_seg=6,
+            xsection_topwidth=expected_gap,
+        )
+        if not obj:
+            raise RuntimeError(
+                f"failed to create {name} explicit insulation gap {index}"
+            )
+        insulation.append(obj)
+    return insulation
+
+
 def _build_homog_blocks(ipk, df, prefix, name, offset_x, height):
     """Replace the selected Rx pack span with four anisotropic solid blocks."""
     n_exp = int(df["n_explicit_turns"].iloc[0])
@@ -1796,7 +5301,9 @@ def _build_homog_blocks(ipk, df, prefix, name, offset_x, height):
     return blocks
 
 
-def _build_rx_group(ipk, df, prefix, name, offset_x, n_explicit, height):
+def _build_rx_group(
+        ipk, df, prefix, name, offset_x, n_explicit, height,
+        insulation_sink=None):
     """Build the final Rx thermal representation without disposable geometry."""
     turn_count = int(df[f"N2_{prefix}"].iloc[0])
     n_explicit = int(n_explicit)
@@ -1822,6 +5329,11 @@ def _build_rx_group(ipk, df, prefix, name, offset_x, n_explicit, height):
         round_corner=False,
     )
     explicit, middle = _partition_rx_turns(windings, n_explicit)
+    insulation = _build_explicit_rx_insulation(
+        ipk, df, prefix, name, offset_x, n_explicit, height
+    )
+    if insulation_sink is not None:
+        insulation_sink.extend(insulation)
     if not middle:
         return explicit, []
 
@@ -1853,6 +5365,9 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     l2 = float(df["l2"].iloc[0])
     nwh1 = float(df["nwh1"].iloc[0])
     nwh2 = float(df["nwh2"].iloc[0])
+    expected_insulation_counts = _expected_rx_insulation_counts(
+        df, n_exp, mode
+    )
 
     objs = {}
 
@@ -1922,23 +5437,29 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     # ---- Rx 하이브리드 (main 1조 + side 2조) ----
     # n_explicit_turns = -1 이면 전 턴 explicit (블록 없음, 균질화 가정 제거).
     # 2*n_exp >= N 인 경우도 전 턴 explicit으로 처리 (중복/퇴화 블록 방지)
+    objs["Rx_main_insulation"] = []
     objs["Rx_main_explicit"], objs["Rx_main_blocks"] = _build_rx_group(
         ipk, df, "main", "Rx_main", 0.0, n_exp, nwh2,
+        insulation_sink=objs["Rx_main_insulation"],
     )
 
     objs["Rx_side_explicit"] = []
     objs["Rx_side_blocks"] = []
+    objs["Rx_side_insulation"] = []
     objs["Rx_side2_explicit"] = []
     objs["Rx_side2_blocks"] = []
+    objs["Rx_side2_insulation"] = []
     if int(df["N2_side"].iloc[0]) > 0:
         off = l1 + l2 + l1 / 2
         objs["Rx_side_explicit"], objs["Rx_side_blocks"] = _build_rx_group(
             ipk, df, "side", "Rx_side", -off, n_exp, nwh2,
+            insulation_sink=objs["Rx_side_insulation"],
         )
         if mode == "full":
             # 대칭 모드에서는 +x 측 링이 어차피 절단 제거되므로 생성 생략 (모델링 시간 절약)
             objs["Rx_side2_explicit"], objs["Rx_side2_blocks"] = _build_rx_group(
                 ipk, df, "side", "Rx_side2", +off, n_exp, nwh2,
+                insulation_sink=objs["Rx_side2_insulation"],
             )
 
     if mode in ("eighth", "quarter"):
@@ -1954,6 +5475,16 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     existing = set(ipk.modeler.object_names)
     for key in list(objs.keys()):
         objs[key] = [o for o in objs[key] if o.name in existing]
+
+    actual_insulation_counts = {
+        key: len(objs.get(key, [])) for key in _RX_INSULATION_KEYS
+    }
+    if actual_insulation_counts != expected_insulation_counts:
+        raise RuntimeError(
+            "explicit Rx insulation topology mismatch after symmetry split: "
+            f"actual={actual_insulation_counts}, "
+            f"expected={expected_insulation_counts}"
+        )
 
     _require_thermal_geometry(
         objs,
@@ -2607,8 +6138,14 @@ def run_thermal_analysis(sim):
 
     set_design_variables(ipk, sim.input_df)
     core_conductivity = _core_thermal_conductivity_contract(df)
-    _create_thermal_materials(ipk, df)
+    _, _, thermal_pad_readback = _create_thermal_materials(ipk, df)
     objs = _build_geometry(ipk, sim, eighth=eighth, mode=mode)
+    rx_insulation_counts = {
+        key: len(objs.get(key, [])) for key in _RX_INSULATION_KEYS
+    }
+    rx_insulation_metadata = _rx_insulation_result_metadata(
+        thermal_pad_readback, rx_insulation_counts
+    )
     probe_sheets = _create_probe_sheets(ipk, df, objs, eighth=eighth, mode=mode)
     _assign_losses(ipk, sim, objs, eighth=eighth, mode=mode)
     rx_balance = list(getattr(sim, "thermal_rx_power_balance", []))
@@ -2636,7 +6173,7 @@ def run_thermal_analysis(sim):
 
     # 서멀패드 메시 해상 강제: 패드(2mm)가 메시에 안 잡히면 도체가 고정온도 Al에
     # 수치적으로 직결되어 온도가 플레이트에 고정됨 (풀 도메인에서 실측된 함정)
-    _assign_thermal_mesh(
+    thermal_mesh_plan = _assign_thermal_mesh(
         ipk,
         objs,
         side_block_level=int(
@@ -2669,6 +6206,31 @@ def run_thermal_analysis(sim):
         raise RuntimeError(f"ThermalSetup configuration failed: {e}") from e
     thermal_setup_s = time.monotonic() - setup_started
 
+    from module.aedt_pool_adapter import pooled_backend_enabled
+    pooled_backend = pooled_backend_enabled()
+    if pooled_backend:
+        # A Desktop-wide idle state cannot identify one project in an attached
+        # multi-project AEDT host.  Preserve the existing project-scoped
+        # nonblocking Analyze protocol; standalone recovery alone opts into
+        # strict native GenerateMesh attestation.
+        thermal_mesh_preflight = (
+            _pooled_thermal_mesh_preflight_not_applicable(
+                thermal_mesh_plan
+            )
+        )
+    else:
+        # Generate the exact native grid before Analyze and require native OO
+        # assignment, exact messages, stable filesystem artifacts, and the
+        # cached Desktop idle barrier.  This turns deterministic zero-mesh
+        # solids into one pre-solve failure instead of two 10--14 minute runs.
+        thermal_mesh_preflight = _generate_and_attest_thermal_mesh(
+            sim, ipk, setup, thermal_mesh_plan
+        )
+    # The exact evidence belongs to the same solver transaction and is copied
+    # into every attempt's forensic record.  Keep the pre-dispatch value false;
+    # it is promoted only after the native Analyze call is actually made.
+    sim.thermal_mesh_preflight = dict(thermal_mesh_preflight)
+
     # Dispatch the one exact setup. Convergence evidence is independent of PyAEDT's
     # return value because the wrapper can report False after native work completed.
     solve_started = time.monotonic()
@@ -2682,6 +6244,16 @@ def run_thermal_analysis(sim):
     dispatch_exception_message = solve_result["dispatch_exception_message"]
     dispatch_forensic_json = solve_result["forensic_json"]
     convergence = solve_result["convergence"]
+    if int(solve_attempts) < 1:
+        raise RuntimeError(
+            "thermal Analyze was not dispatched after native mesh preflight"
+        )
+    thermal_mesh_preflight = dict(thermal_mesh_preflight)
+    thermal_mesh_preflight["analysis_dispatched_after_premesh"] = True
+    sim.thermal_mesh_preflight = dict(thermal_mesh_preflight)
+    thermal_mesh_metadata = _thermal_mesh_result_metadata(
+        thermal_mesh_plan, thermal_mesh_preflight
+    )
     logging.warning(
         "[thermal] convergence: available=%s converged=%s iteration=%s "
         "continuity=%s energy=%s reason=%s",
@@ -2732,7 +6304,11 @@ def run_thermal_analysis(sim):
     probe_failures = list(getattr(probe_sheets, "failures", []))
     vol_objs = (objs["Tx"] + objs["Rx_main_explicit"] + objs["Rx_main_blocks"]
                 + objs["Rx_side_explicit"] + objs["Rx_side_blocks"]
-                + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"] + objs["core"])
+                + objs["Rx_side2_explicit"] + objs["Rx_side2_blocks"]
+                + objs["core"] + objs.get("wcp_pads", []))
+    mesh_postsolve_probe_objects = (
+        _thermal_mesh_postsolve_probe_object_names(objs)
+    )
     for o in vol_objs:
         name = str(o.name)
         probe.append((name, True, f"T_mean_{name}", "mean"))
@@ -2845,6 +6421,16 @@ def run_thermal_analysis(sim):
             "thermal_solution_data_available": [0],
             "thermal_field_summary_attempts": [0],
             "thermal_field_summary_value_count": [0],
+            "thermal_mesh_postsolve_probe_object_count": [
+                len(mesh_postsolve_probe_objects)
+            ],
+            "thermal_mesh_postsolve_probe_missing_count": [
+                len(mesh_postsolve_probe_objects)
+            ],
+            "thermal_mesh_postsolve_probe_missing_objects_json": [
+                json.dumps(mesh_postsolve_probe_objects)
+            ],
+            "thermal_mesh_postsolve_probe_complete": [0],
             "thermal_calculator_attempts": [0],
             "thermal_extraction_method": ["not_attempted"],
             "thermal_extraction_failure_reason": [
@@ -2858,6 +6444,9 @@ def run_thermal_analysis(sim):
             "thermal_setup_s": [thermal_setup_s],
             "thermal_solve_s": [thermal_solve_s],
             "thermal_extraction_s": [thermal_extraction_s],
+            **thermal_mesh_metadata,
+            **_thermal_pad_result_metadata(thermal_pad_readback),
+            **rx_insulation_metadata,
             "thermal_rx_model": [sim.thermal_rx_model],
             "thermal_core_conductivity_model": [
                 core_conductivity["thermal_core_conductivity_model"]
@@ -3153,14 +6742,26 @@ def run_thermal_analysis(sim):
         if not group_objects[key] or not math.isfinite(float(group_values[key]))
     )
     required_complete = required_missing_count == 0 and required_group_count > 0
+    mesh_postsolve_probe_status = _thermal_mesh_postsolve_probe_status(
+        mesh_postsolve_probe_objects, temps
+    )
+    mesh_postsolve_probe_missing = (
+        mesh_postsolve_probe_status["missing_objects"]
+    )
+    mesh_postsolve_probe_complete = (
+        mesh_postsolve_probe_status["complete"]
+    )
     solution_data_available = n_fs > 0
     solved = (
         convergence["thermal_converged"] == 1
         and solution_data_available
         and required_complete
+        and mesh_postsolve_probe_complete
     )
     if required_missing_count:
         extraction_failure_reason = "required_volume_temperature_missing"
+    elif mesh_postsolve_probe_missing:
+        extraction_failure_reason = "mesh_postsolve_probe_missing"
     elif required_missing_cols:
         extraction_failure_reason = "required_probe_temperature_missing"
     else:
@@ -3189,6 +6790,18 @@ def run_thermal_analysis(sim):
         "thermal_solution_data_available": [1 if solution_data_available else 0],
         "thermal_field_summary_attempts": [field_summary_attempts],
         "thermal_field_summary_value_count": [n_fs],
+        "thermal_mesh_postsolve_probe_object_count": [
+            len(mesh_postsolve_probe_objects)
+        ],
+        "thermal_mesh_postsolve_probe_missing_count": [
+            len(mesh_postsolve_probe_missing)
+        ],
+        "thermal_mesh_postsolve_probe_missing_objects_json": [
+            json.dumps(mesh_postsolve_probe_missing)
+        ],
+        "thermal_mesh_postsolve_probe_complete": [
+            1 if mesh_postsolve_probe_complete else 0
+        ],
         "thermal_calculator_attempts": [calc_attempts],
         "thermal_extraction_method": [extraction_method],
         "thermal_extraction_failure_reason": [extraction_failure_reason],
@@ -3200,6 +6813,9 @@ def run_thermal_analysis(sim):
         "thermal_setup_s": [thermal_setup_s],
         "thermal_solve_s": [thermal_solve_s],
         "thermal_extraction_s": [thermal_extraction_s],
+        **thermal_mesh_metadata,
+        **_thermal_pad_result_metadata(thermal_pad_readback),
+        **rx_insulation_metadata,
         "thermal_rx_model": [sim.thermal_rx_model],
         "thermal_core_conductivity_model": [
             core_conductivity["thermal_core_conductivity_model"]

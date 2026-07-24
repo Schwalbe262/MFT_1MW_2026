@@ -635,6 +635,70 @@ class SolutionDataTests(unittest.TestCase):
             "get_solution_data_per_variation",
         )
 
+    def test_partial_fields_batch_recovers_only_missing_singletons(self):
+        post = _FakePost([
+            _FakeSolution(
+                {"P_core": [12.5], "B_max_core": []},
+                {"P_core": "W", "B_max_core": "T"},
+            ),
+            _FakeSolution(
+                {"B_max_core": [1.125]},
+                {"B_max_core": "T"},
+            ),
+        ])
+        simulation = _simulation_with_post(post)
+
+        frame = simulation._solution_data_frame(
+            ["P_core", "B_max_core"],
+            report_category="Fields",
+            extraction_key="loss",
+            retry_delay=0,
+        )
+
+        self.assertEqual(frame["P_core"].iloc[0], 12.5)
+        self.assertEqual(frame["B_max_core"].iloc[0], 1.125)
+        self.assertEqual(len(post.field_calls), 2)
+        self.assertEqual(
+            post.field_calls[1]["expressions"],
+            ["B_max_core"],
+        )
+        self.assertEqual(
+            simulation.extraction_backends["loss"],
+            "get_solution_data_per_variation+singleton_recovery",
+        )
+
+    def test_partial_fields_singleton_recovery_remains_fail_closed(self):
+        responses = []
+        for _ in range(3):
+            responses.extend([
+                _FakeSolution(
+                    {"P_core": [12.5], "B_max_core": []},
+                    {"P_core": "W", "B_max_core": "T"},
+                ),
+                _FakeSolution(
+                    {"B_max_core": []},
+                    {"B_max_core": "T"},
+                ),
+            ])
+        post = _FakePost(responses)
+        simulation = _simulation_with_post(post)
+
+        with self.assertRaisesRegex(
+                RuntimeError, "missing/non-finite expressions: B_max_core"):
+            simulation._solution_data_frame(
+                ["P_core", "B_max_core"],
+                report_category="Fields",
+                extraction_key="loss",
+                retry_delay=0,
+            )
+
+        self.assertEqual(len(post.field_calls), 6)
+        self.assertNotIn("loss", simulation.extraction_backends)
+        self.assertTrue(all(
+            call["expressions"] == ["B_max_core"]
+            for call in post.field_calls[1::2]
+        ))
+
     def test_partial_expression_data_is_not_verified_no_data(self):
         partial = _FakeSolution({"L": [1.0], "M": []})
         simulation = _simulation_with_post(_FakePost([partial, partial, partial]))
@@ -3136,8 +3200,12 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
         simulation = SimpleNamespace(
             PROJECT_NAME="simulation_test",
             NUM_CORE=4,
+            solver_may_be_running=False,
             _rebind_native_project_for_design_creation=rebind,
             _native_desktop_handle=Mock(return_value=desktop),
+            _attest_cached_native_desktop=(
+                lambda target, **_kwargs: target
+            ),
             _ensure_pooled_shared_results_directory=Mock(),
             save_project=Mock(),
             aedt_native_solve_window=lambda: nullcontext(),
@@ -3157,9 +3225,14 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
         native_design = native_solver.oproject.SetActiveDesign.return_value
         native_design.Analyze = Mock(return_value=None)
 
-        def emulated_pyaedt_analyze(*, setup, cores, blocking):
+        def emulated_pyaedt_analyze(
+                *, setup, cores, tasks, gpus, use_auto_settings, blocking):
             # PyAEDT analyze_setup silently returns its initial True value when
             # the requested name is absent from its cached setup_names.
+            self.assertEqual(
+                (cores, tasks, gpus, use_auto_settings),
+                (4, 4, 0, False),
+            )
             if setup in native_solver.setup_names:
                 return native_solver._odesign.Analyze(setup, blocking)
             return True
@@ -3206,7 +3279,8 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             )
 
         analyze.assert_called_once_with(
-            setup="ThermalSetup", cores=4, blocking=True
+            setup="ThermalSetup", cores=4, tasks=4, gpus=0,
+            use_auto_settings=False, blocking=True
         )
         rebind.assert_called_once_with()
         self.assertEqual(result["solve_attempts"], 1)
@@ -3332,7 +3406,12 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
         self.assertEqual(analyze.call_count, 2)
         for call in analyze.call_args_list:
             self.assertEqual(call.kwargs, {
-                "setup": "ThermalSetup", "cores": 4, "blocking": True,
+                "setup": "ThermalSetup",
+                "cores": 4,
+                "tasks": 4,
+                "gpus": 0,
+                "use_auto_settings": False,
+                "blocking": True,
             })
         self.assertEqual(rebind.call_count, 2)
         self.assertEqual(result["solve_attempts"], 2)
@@ -3345,7 +3424,7 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
         self.assertEqual(len(forensic["attempts"]), 2)
         self.assertEqual(
             forensic["attempts"][0]["aedt_messages"],
-            ["Icepak startup diagnostic"],
+            [],
         )
         self.assertEqual(
             forensic["attempts"][0]["identity"]["model_context"]
@@ -3368,7 +3447,8 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             )
 
         analyze.assert_called_once_with(
-            setup="ThermalSetup", cores=4, blocking=True
+            setup="ThermalSetup", cores=4, tasks=4, gpus=0,
+            use_auto_settings=False, blocking=True
         )
         rebind.assert_called_once_with()
         self.assertEqual(result["solve_attempts"], 1)
@@ -3424,7 +3504,8 @@ class ThermalDispatchPolicyTests(unittest.TestCase):
             )
 
         analyze.assert_called_once_with(
-            setup="ThermalSetup", cores=4, blocking=True
+            setup="ThermalSetup", cores=4, tasks=4, gpus=0,
+            use_auto_settings=False, blocking=True
         )
         rebind.assert_called_once_with()
         self.assertEqual(result["solve_attempts"], 1)
@@ -4177,6 +4258,7 @@ class ThermalMeshPolicyTests(unittest.TestCase):
     class _Mesh:
         def __init__(self, failing_name=None):
             self.meshoperations = []
+            self.meshregions = []
             self.calls = []
             self.failing_name = failing_name
 
@@ -4190,45 +4272,105 @@ class ThermalMeshPolicyTests(unittest.TestCase):
             self.meshoperations.append(operation)
             return [operation_name]
 
+        def assign_mesh_region(self, assignment, level, name):
+            if len(assignment) != 1:
+                raise AssertionError("B3 MeshRegion must bind one WCP pad")
+            object_name = str(assignment[0])
+            region = SimpleNamespace(
+                name=name,
+                enable=True,
+                settings={"MeshRegionResolution": int(level)},
+                manual_settings=False,
+                assignment=SimpleNamespace(
+                    name=f"{name}_subregion",
+                    parts={object_name: object()},
+                ),
+                update=Mock(return_value=True),
+            )
+            self.meshregions.append(region)
+            return region
+
     @staticmethod
     def _objects():
-        obj = lambda name: SimpleNamespace(name=name)
+        obj = lambda name: SimpleNamespace(
+            name=name,
+            bounding_box=[0.0, 0.0, 0.0, 100.0, 1.0, 100.0],
+        )
         return {
             "Tx": [obj("tx_0"), obj("tx_1")],
-            "wcp_pads": [obj("wcp_pad")],
-            "core_pads": [obj("core_pad")],
+            "wcp_plates": [obj("Tx_main_wcp_1_p")],
+            "wcp_pads": [
+                obj("Tx_main_wcp_pad_1_in_p"),
+                obj("Tx_main_wcp_pad_1_out_p"),
+            ],
+            "core_plates": [obj("core_plate_0_center")],
+            "core_pads": [
+                obj("core_plate_pad_0_a_center"),
+                obj("core_plate_pad_0_b_center"),
+            ],
             "Rx_main_explicit": [obj("rx_main")],
             "Rx_main_blocks": [obj("rx_main_block")],
             "Rx_side_explicit": [obj("rx_side")],
             "Rx_side_blocks": [obj("rx_side_block")],
             "Rx_side2_explicit": [],
             "Rx_side2_blocks": [],
+            "Rx_main_insulation": [],
+            "Rx_side_insulation": [],
+            "Rx_side2_insulation": [],
         }
 
-    def test_thin_solids_and_windings_share_the_fluid_mesh_region(self):
+    def test_thin_solids_and_windings_mesh_each_controlled_object(self):
         mesh = self._Mesh()
 
-        _assign_thermal_mesh(SimpleNamespace(mesh=mesh), self._objects())
+        _assign_thermal_mesh(
+            SimpleNamespace(
+                mesh=mesh,
+                modeler=SimpleNamespace(model_units="mm"),
+            ),
+            self._objects(),
+        )
 
         self.assertEqual(mesh.calls, [
-            ({"wcp_pad": 2, "core_pad": 2}, "pad_mesh_level"),
+            ({
+                "core_plate_0_center": 2,
+                "core_plate_pad_0_a_center": 2,
+                "core_plate_pad_0_b_center": 2,
+            }, "core_plate_assembly_mesh_level_0_center"),
+            ({
+                "Tx_main_wcp_1_p": 5,
+            }, "wcp_assembly_mesh_level_1_p"),
             ({"tx_0": 4, "tx_1": 4}, "tx_mesh_level"),
             ({"rx_main_block": 4}, "rx_main_block_mesh_level"),
             ({"rx_side_block": 5}, "rx_side_block_mesh_level"),
-            ({"rx_main": 3, "rx_side": 3}, "rx_mesh_level"),
+            ({"rx_main": 5}, "rx_main_retained_pack_mesh_level"),
+            ({"rx_side": 5}, "rx_side_retained_pack_mesh_level"),
         ])
-        self.assertEqual(len(mesh.meshoperations), 5)
+        self.assertEqual(len(mesh.meshoperations), 7)
+        self.assertEqual(len(mesh.meshregions), 2)
         for operation in mesh.meshoperations:
             self.assertFalse(operation.auto_update)
             self.assertNotIn("Command", operation.props)
-            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
+            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], True)
             self.assertEqual(operation.update_calls, 1)
+        for region in mesh.meshregions:
+            region.update.assert_called_once_with()
+            self.assertEqual(region.settings["MeshRegionResolution"], 5)
+            self.assertEqual(
+                region.assignment.padding_types,
+                ["Absolute Offset"] * 6,
+            )
+            self.assertEqual(region.assignment.padding_values, ["2mm"] * 6)
 
     def test_efficiency_ab_can_relax_only_multi_turn_side_blocks(self):
         mesh = self._Mesh()
 
         _assign_thermal_mesh(
-            SimpleNamespace(mesh=mesh), self._objects(), side_block_level=4
+            SimpleNamespace(
+                mesh=mesh,
+                modeler=SimpleNamespace(model_units="mm"),
+            ),
+            self._objects(),
+            side_block_level=4,
         )
 
         self.assertIn(
@@ -4240,26 +4382,35 @@ class ThermalMeshPolicyTests(unittest.TestCase):
         mesh = self._Mesh(failing_name="tx_mesh_level")
 
         with self.assertRaisesRegex(RuntimeError, "tx_mesh_level mesh operation update failed"):
-            _assign_thermal_mesh(SimpleNamespace(mesh=mesh), self._objects())
+            _assign_thermal_mesh(
+                SimpleNamespace(
+                    mesh=mesh,
+                    modeler=SimpleNamespace(model_units="mm"),
+                ),
+                self._objects(),
+            )
 
     def test_single_rx_turn_gets_pack_local_finest_mesh_level(self):
         mesh = self._Mesh()
         obj = lambda name: SimpleNamespace(name=name)
         objects = {
-            "Tx": [], "wcp_pads": [], "core_pads": [],
+            "Tx": [], "wcp_plates": [], "wcp_pads": [],
+            "core_plates": [], "core_pads": [],
             "Rx_main_explicit": [], "Rx_main_blocks": [obj("rx_main_block")],
             "Rx_side_explicit": [obj("Rx_side_0_0")], "Rx_side_blocks": [],
             "Rx_side2_explicit": [], "Rx_side2_blocks": [],
+            "Rx_main_insulation": [], "Rx_side_insulation": [],
+            "Rx_side2_insulation": [],
         }
 
         _assign_thermal_mesh(SimpleNamespace(mesh=mesh), objects)
 
         self.assertEqual(mesh.calls, [
             ({"rx_main_block": 4}, "rx_main_block_mesh_level"),
-            ({"Rx_side_0_0": 5}, "rx_side_single_turn_mesh_level"),
+            ({"Rx_side_0_0": 5}, "rx_side_retained_pack_mesh_level"),
         ])
         for operation in mesh.meshoperations:
-            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], False)
+            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], True)
 
 
 class FailureLogTests(unittest.TestCase):

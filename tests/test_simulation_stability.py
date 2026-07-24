@@ -227,7 +227,13 @@ def _simulation(tmp_path, backend):
     )
     stale_project = _FakeNativeProject("simulation_sibling", stale_design)
     native_desktop = _FakeNativeDesktop([fresh_project])
-    desktop = SimpleNamespace(odesktop=native_desktop)
+    native_desktop.GetProcessID = lambda: 8123
+    native_desktop.GetGrpcServerPort = lambda: 57387
+    desktop = SimpleNamespace(
+        odesktop=native_desktop,
+        aedt_process_id=8123,
+        port=57387,
+    )
     stale_desktop = SimpleNamespace(
         odesktop=_FakeNativeDesktop([stale_project])
     )
@@ -288,6 +294,208 @@ def test_pooled_project_refresh_retries_only_transient_getprojects_grpc(
     assert simulation.project.project is expected_project
     assert simulation.project.proj is expected_project
     assert caplog.text.count("GetProjects transient gRPC failure") == 2
+
+
+def test_native_desktop_handle_uses_only_endpoint_project_attested_cache(
+        tmp_path, caplog):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    native_desktop = simulation.desktop.odesktop
+    native_desktop.GetProcessID = lambda: 8123
+    native_desktop.GetGrpcServerPort = lambda: 57387
+    simulation.aedt_lease = SimpleNamespace(
+        protocol_version=2,
+        state="active",
+        session_process_id="8123",
+        endpoint="nib110.hpc:57387",
+    )
+
+    assert simulation._native_desktop_handle() is native_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with caplog.at_level("WARNING"):
+        recovered = simulation._native_desktop_handle()
+
+    assert recovered is native_desktop
+    assert "endpoint/project-attested cached native proxy" in caplog.text
+
+
+def test_native_desktop_handle_rejects_dead_or_replaced_cached_endpoint(
+        tmp_path):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    native_desktop = simulation.desktop.odesktop
+    native_desktop.GetProcessID = lambda: 9999
+    native_desktop.GetGrpcServerPort = lambda: 57387
+    simulation.aedt_lease = SimpleNamespace(
+        protocol_version=2,
+        state="active",
+        session_process_id="8123",
+        endpoint="nib110.hpc:57387",
+    )
+
+    assert simulation._native_desktop_handle() is native_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with pytest.raises(
+            RuntimeError, match="cached native Desktop PID mismatch"):
+        simulation._native_desktop_handle()
+
+
+def test_native_desktop_handle_reattaches_exact_lease_once_after_stale_cache(
+        tmp_path, caplog):
+    simulation, app, _design, _project_path = _simulation(tmp_path, "pooled")
+    stale_desktop = simulation.desktop.odesktop
+    stale_desktop.GetProcessID = lambda: 9999
+    fresh_project = simulation.desktop.odesktop.projects[0]
+    fresh_desktop = _FakeNativeDesktop([fresh_project])
+    fresh_desktop.GetProcessID = lambda: 8123
+    fresh_desktop.GetGrpcServerPort = lambda: 57387
+    fresh_wrapper = SimpleNamespace(
+        odesktop=fresh_desktop,
+        aedt_process_id=8123,
+        port=57387,
+    )
+    connect_calls = []
+
+    def connect_desktop(**kwargs):
+        connect_calls.append(kwargs)
+        return fresh_wrapper
+
+    simulation.aedt_lease = SimpleNamespace(
+        protocol_version=2,
+        state="active",
+        session_process_id="8123",
+        endpoint="nib110.hpc:57387",
+        connect_desktop=connect_desktop,
+    )
+
+    assert simulation._native_desktop_handle() is stale_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with caplog.at_level("WARNING"):
+        recovered = simulation._native_desktop_handle()
+
+    assert recovered is fresh_desktop
+    assert len(connect_calls) == 1
+    assert isinstance(connect_calls[0]["non_graphical"], bool)
+    assert connect_calls[0]["desktop_factory"].__name__ == "_PooledDesktop"
+    assert simulation.desktop is fresh_wrapper
+    assert simulation.project.desktop is fresh_wrapper
+    assert app._desktop_class is fresh_wrapper
+    assert app._desktop is fresh_desktop
+    assert app._odesktop is fresh_desktop
+    assert "one non-owning same-lease reattach" in caplog.text
+
+    # The recovered wrapper can itself enter another failed recreation gap,
+    # but one task must never create an unbounded reconnect loop.
+    fresh_desktop.GetProcessID = lambda: 7777
+    fresh_wrapper.odesktop = None
+    simulation.project.desktop.odesktop = None
+    with pytest.raises(RuntimeError, match="already attempted"):
+        simulation._native_desktop_handle()
+    assert len(connect_calls) == 1
+
+
+def test_native_desktop_handle_rejects_cached_proxy_after_lease_release(
+        tmp_path):
+    simulation, _app, _design, _project_path = _simulation(tmp_path, "pooled")
+    native_desktop = simulation.desktop.odesktop
+    simulation.aedt_lease = SimpleNamespace(
+        protocol_version=2,
+        state="released",
+        session_process_id="",
+        endpoint="",
+    )
+
+    assert simulation._native_desktop_handle() is native_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with pytest.raises(RuntimeError, match="lease is no longer active"):
+        simulation._native_desktop_handle()
+
+
+def test_native_desktop_handle_attests_cached_standalone_proxy_after_analyze(
+        tmp_path, caplog):
+    simulation, _app, _design, _project_path = _simulation(
+        tmp_path, "standalone"
+    )
+    native_desktop = simulation.desktop.odesktop
+
+    assert simulation._native_desktop_handle() is native_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with caplog.at_level("WARNING"):
+        recovered = simulation._native_desktop_handle()
+
+    assert recovered is native_desktop
+    assert (
+        "identity/project-attested cached standalone native proxy"
+        in caplog.text
+    )
+
+
+def test_native_desktop_handle_rejects_cached_standalone_project_mismatch(
+        tmp_path):
+    simulation, _app, _design, _project_path = _simulation(
+        tmp_path, "standalone"
+    )
+    native_desktop = simulation.desktop.odesktop
+
+    assert simulation._native_desktop_handle() is native_desktop
+    native_desktop.projects = [
+        _FakeNativeProject(
+            "simulation_replaced",
+            _FakeNativeDesign("simulation_replaced", "maxwell_matrix"),
+        )
+    ]
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with pytest.raises(
+            RuntimeError,
+            match="cached native Desktop exact-project attestation failed"):
+        simulation._native_desktop_handle()
+
+
+def test_native_desktop_handle_rejects_cached_standalone_without_endpoint_identity(
+        tmp_path):
+    simulation, _app, _design, _project_path = _simulation(
+        tmp_path, "standalone"
+    )
+    native_desktop = simulation.desktop.odesktop
+    simulation.desktop.aedt_process_id = 0
+    simulation.desktop.port = 0
+    simulation.project.desktop.aedt_process_id = 0
+    simulation.project.desktop.port = 0
+
+    assert simulation._native_desktop_handle() is native_desktop
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with pytest.raises(
+            RuntimeError, match="no captured positive PID"):
+        simulation._native_desktop_handle()
+
+
+def test_native_desktop_handle_rejects_cached_standalone_endpoint_mismatch(
+        tmp_path):
+    simulation, _app, _design, _project_path = _simulation(
+        tmp_path, "standalone"
+    )
+    native_desktop = simulation.desktop.odesktop
+
+    assert simulation._native_desktop_handle() is native_desktop
+    native_desktop.GetProcessID = lambda: 9999
+    simulation.desktop.odesktop = None
+    simulation.project.desktop.odesktop = None
+
+    with pytest.raises(
+            RuntimeError, match="cached native Desktop PID mismatch"):
+        simulation._native_desktop_handle()
 
 
 def test_pooled_project_refresh_does_not_retry_non_grpc_getprojects_error(
@@ -603,3 +811,98 @@ def test_standalone_non_strict_save_still_returns_false_on_persistent_failure(
     assert stale_project.save_calls == 1
     assert native_project.save_calls == 1
     assert app._oproject is stale_project
+
+
+@pytest.mark.parametrize("fixed_param", [None, {}])
+def test_run_one_loop_uncertain_standalone_never_closes_project(
+        monkeypatch, fixed_param):
+    import run_simulation_260706 as runner
+
+    close_project = pytest.fail
+    simulation = SimpleNamespace(
+        stage_timings={},
+        solver_may_be_running=True,
+        input_df=pd.DataFrame([{}]),
+        spawned_descendants={},
+        create_simulation_name=lambda: (_ for _ in ()).throw(
+            RuntimeError("completion barrier timed out")
+        ),
+        close_project=lambda: close_project(
+            "uncertain standalone project must not close"
+        ),
+    )
+    monkeypatch.setattr(runner, "aedt_backend", lambda: "standalone")
+    monkeypatch.setattr(
+        runner, "_load_fixed_input_parameter",
+        lambda _param: (pd.DataFrame([{}]), "physics-revision"),
+    )
+    monkeypatch.setattr(
+        runner, "_create_simulation_session",
+        lambda: (SimpleNamespace(), simulation),
+    )
+    monkeypatch.setattr(runner, "_snapshot_descendants", lambda: {})
+    monkeypatch.setattr(
+        runner, "_finalize_run_cleanup", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        runner, "log_failed_sample", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(
+            runner.UncertainStandaloneSolverExit,
+            match="standalone native solver remains uncertain"):
+        runner.run_one_loop(param=fixed_param)
+
+
+def _uncertain_cli_args(*, fixed):
+    return SimpleNamespace(
+        require_consecutive=False,
+        count=1,
+        headless=False,
+        golden=False,
+        fixed=fixed,
+        params=None,
+        model_only=False,
+        hold=False,
+        round_corner=None,
+        full=False,
+        matrix_on=None,
+        loss_on=None,
+        thermal_on=None,
+        set_overrides=[],
+    )
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+def test_main_hard_exits_fixed_and_random_uncertain_paths(
+        monkeypatch, fixed):
+    import run_simulation_260706 as runner
+
+    class HardExit(BaseException):
+        pass
+
+    exit_codes = []
+    sleep_calls = []
+    monkeypatch.setattr(
+        runner, "parse_args", lambda: _uncertain_cli_args(fixed=fixed)
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_one_loop",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            runner.UncertainStandaloneSolverExit("engine still running")
+        ),
+    )
+    monkeypatch.setattr(runner.time, "sleep", sleep_calls.append)
+
+    def hard_exit(code):
+        exit_codes.append(code)
+        raise HardExit()
+
+    monkeypatch.setattr(runner.os, "_exit", hard_exit)
+
+    with pytest.raises(HardExit):
+        runner.main()
+
+    assert exit_codes == [runner.UncertainStandaloneSolverExit.exit_code]
+    assert sleep_calls == []

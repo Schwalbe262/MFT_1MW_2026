@@ -11,6 +11,11 @@ from module.core_material_contract import (
     effective_area_m2,
     geometry_volume_and_masses,
 )
+from module.fixed_boundary_contract import (
+    FIXED_CORE_PLATE_PAD_THICKNESS_MM,
+    FIXED_FAN_VELOCITY_M_S,
+    FIXED_WCP_PAD_THICKNESS_MM,
+)
 
 
 N1_MIN_TURNS = 5
@@ -145,10 +150,11 @@ def get_drawing_default_params():
         # Length percentage is referenced to the clear x-direction straight
         # span inside the innermost Tx_main turn.  The physical geometry still
         # consumes the resolved millimetre value ``wcp_len_x``.
-        "wcp_t": 20.0, "wcp_pad_t": 2.0,
+        "wcp_t": 20.0,
+        "wcp_pad_t": FIXED_WCP_PAD_THICKNESS_MM,
         "wcp_len_x": 178.0, "wcp_on": 1,
         # 코어 콜드플레이트: 알루미늄 20T + 양면 서멀패드 각 2T.
-        "core_plate_pad_t": 2.0,
+        "core_plate_pad_t": FIXED_CORE_PLATE_PAD_THICKNESS_MM,
         # 코어 1조 깊이 허용 범위 [mm] (랜덤 모드에서 n_core_group 샘플링 제약.
         # 도면 설계(150mm/조)는 범위 밖이지만 fixed 모드에서는 경고만 하고 통과)
         "core_depth_min": 60.0, "core_depth_max": 120.0,
@@ -197,7 +203,7 @@ def get_drawing_default_params():
         # 열해석 조건
         "plate_temp": 50.0,      # 콜드플레이트 고정온도 [cel]
         "air_temp": 50.0,        # 팬 흡입공기/주변 온도 [cel]
-        "fan_velocity": 1.5,     # 팬 유속 [m/s], +y -> -y
+        "fan_velocity": FIXED_FAN_VELOCITY_M_S,  # 팬 유속 [m/s], +y -> -y
         "k_ins": 0.2,            # 권선 절연 열전도율 [W/mK]
         "core_k_thermal": 2.0,   # 코어 등가 열전도율 [W/mK] (아몰퍼스, 보수적 등방값)
         # Wound 2605SA1 ribbon: width is y everywhere and the stack normal is

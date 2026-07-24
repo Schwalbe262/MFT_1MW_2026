@@ -129,6 +129,11 @@ from module.core_material_contract import (
     square_wave_b_material_t,
     validate_native_lamination_readback,
 )
+from module.fixed_boundary_contract import (
+    FIXED_THERMAL_PAD_CONDUCTIVITY_W_MK,
+    evaluate_fixed_boundary,
+    fixed_boundary_classification_metadata,
+)
 from module.thermal_probe_contract import (
     RX_SIDE_FACE_MAX_RULE,
     RX_SIDE_FACE_MEAN_RULE,
@@ -390,6 +395,360 @@ def _git_provenance():
 GIT_HASH, GIT_DIRTY = _git_provenance()
 
 
+STANDALONE_CORE_CONTRACT_VERSION = "mft-standalone-core-optin-v1"
+STANDALONE_CORE_16_CONTRACT_VERSION = "mft-standalone-core-16-optin-v1"
+STANDALONE_CORE_CONTRACT_ENV = "MFT_STANDALONE_CORE_CONTRACT"
+STANDALONE_CORE_COUNT_ENV = "MFT_STANDALONE_CORE_COUNT"
+STANDALONE_CORE_AUTH_ENV = "MFT_STANDALONE_CORE_AUTH_SHA256"
+STANDALONE_CORE_LICENSE_CONTRACT_ENV = (
+    "MFT_STANDALONE_CORE_LICENSE_CONTRACT"
+)
+STANDALONE_CORE_LICENSE_SNAPSHOT_ENV = (
+    "MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_JSON"
+)
+STANDALONE_CORE_LICENSE_SNAPSHOT_SHA_ENV = (
+    "MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_SHA256"
+)
+STANDALONE_CORE_16_LICENSE_CONTRACT_VERSION = (
+    "mft-aedt-hpc-license-snapshot-v1"
+)
+STANDALONE_CORE_OPT_IN_COUNT = 8
+STANDALONE_CORE_16_OPT_IN_COUNT = 16
+_STANDALONE_CORE_OPT_IN_ENV_NAMES = (
+    STANDALONE_CORE_CONTRACT_ENV,
+    STANDALONE_CORE_COUNT_ENV,
+    STANDALONE_CORE_AUTH_ENV,
+)
+_STANDALONE_CORE_LICENSE_ENV_NAMES = (
+    STANDALONE_CORE_LICENSE_CONTRACT_ENV,
+    STANDALONE_CORE_LICENSE_SNAPSHOT_ENV,
+    STANDALONE_CORE_LICENSE_SNAPSHOT_SHA_ENV,
+)
+_STANDALONE_CORE_CONTRACT_BY_COUNT = {
+    STANDALONE_CORE_OPT_IN_COUNT: STANDALONE_CORE_CONTRACT_VERSION,
+    STANDALONE_CORE_16_OPT_IN_COUNT: STANDALONE_CORE_16_CONTRACT_VERSION,
+}
+
+
+def standalone_core_contract_auth_sha256(
+        solver_revision, requested_num_cores=STANDALONE_CORE_OPT_IN_COUNT,
+        *, license_contract="", license_snapshot_sha256=""):
+    """Return the revision-bound digest required by a core-count opt-in.
+
+    This is deliberately an integrity/authentication token rather than a
+    general-purpose tuning knob. A submitter must bind the exact committed
+    solver revision, standalone backend, Slurm CPU request, and core count.
+    The isolated 16-core sibling additionally binds a fresh license snapshot.
+    """
+    revision = str(solver_revision or "").strip().lower()
+    requested = int(requested_num_cores)
+    contract_version = _STANDALONE_CORE_CONTRACT_BY_COUNT.get(requested)
+    if contract_version is None:
+        raise ValueError(
+            f"unsupported standalone core opt-in count: {requested}"
+        )
+    payload = {
+        "backend": "standalone",
+        "contract_version": contract_version,
+        "requested_num_cores": requested,
+        "required_slurm_cpus_per_task": requested,
+        "solver_revision": revision,
+    }
+    if requested == STANDALONE_CORE_16_OPT_IN_COUNT:
+        payload["license_contract"] = str(license_contract or "").strip()
+        payload["license_snapshot_sha256"] = str(
+            license_snapshot_sha256 or ""
+        ).strip().lower()
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validated_16_core_license_snapshot(environ, now_utc=None):
+    """Authenticate a fresh scheduler license snapshot for the 16-core sibling."""
+    present = tuple(
+        name for name in _STANDALONE_CORE_LICENSE_ENV_NAMES if name in environ
+    )
+    if len(present) != len(_STANDALONE_CORE_LICENSE_ENV_NAMES):
+        missing = sorted(set(_STANDALONE_CORE_LICENSE_ENV_NAMES) - set(present))
+        raise RuntimeError(
+            "16-core standalone opt-in requires complete license evidence; "
+            f"present={list(present)}, missing={missing}"
+        )
+    contract = str(
+        environ.get(STANDALONE_CORE_LICENSE_CONTRACT_ENV, "") or ""
+    ).strip()
+    if contract != STANDALONE_CORE_16_LICENSE_CONTRACT_VERSION:
+        raise RuntimeError(
+            "16-core license contract version mismatch: "
+            f"expected={STANDALONE_CORE_16_LICENSE_CONTRACT_VERSION!r}, "
+            f"actual={contract!r}"
+        )
+    snapshot_json = str(
+        environ.get(STANDALONE_CORE_LICENSE_SNAPSHOT_ENV, "") or ""
+    ).strip()
+    actual_sha = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    expected_sha = str(
+        environ.get(STANDALONE_CORE_LICENSE_SNAPSHOT_SHA_ENV, "") or ""
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha) or actual_sha != expected_sha:
+        raise RuntimeError("16-core license snapshot SHA-256 mismatch")
+    try:
+        snapshot = json.loads(snapshot_json)
+    except Exception as error:
+        raise RuntimeError("16-core license snapshot JSON is invalid") from error
+    if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("schema")
+            != "mft-aedt-license-headroom-snapshot-v1"
+            or snapshot.get("server_up") is not True
+            or snapshot.get("server") != "1055@172.16.10.81"):
+        raise RuntimeError("16-core license snapshot identity is invalid")
+    checked_at_raw = str(snapshot.get("checked_at") or "").strip()
+    try:
+        checked_at = datetime.fromisoformat(
+            checked_at_raw.replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "16-core license snapshot timestamp is invalid"
+        ) from error
+    if checked_at.tzinfo is None:
+        raise RuntimeError("16-core license snapshot timestamp has no timezone")
+    observed_now = (
+        datetime.now(timezone.utc) if now_utc is None else now_utc
+    )
+    if observed_now.tzinfo is None:
+        raise RuntimeError("16-core license validation clock has no timezone")
+    age_seconds = (
+        observed_now.astimezone(timezone.utc)
+        - checked_at.astimezone(timezone.utc)
+    ).total_seconds()
+    if age_seconds < -30.0 or age_seconds > 600.0:
+        raise RuntimeError(
+            "16-core license snapshot is stale: "
+            f"age_seconds={age_seconds:.3f}"
+        )
+    features = snapshot.get("features")
+    if not isinstance(features, dict):
+        raise RuntimeError("16-core license feature readback is invalid")
+    required_headroom = {
+        "anshpc": 16,
+        "elec_solve_maxwell": 1,
+        "electronics_desktop": 1,
+        "electronics3d_gui": 1,
+    }
+    headroom = {}
+    for feature, minimum in required_headroom.items():
+        record = features.get(feature)
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"16-core license snapshot is missing {feature}"
+            )
+        total = record.get("total")
+        used = record.get("used")
+        if (
+                isinstance(total, bool) or not isinstance(total, int)
+                or isinstance(used, bool) or not isinstance(used, int)
+                or total < 0 or used < 0 or used > total):
+            raise RuntimeError(
+                f"16-core license snapshot has invalid {feature} counters"
+            )
+        available = total - used
+        if available < minimum:
+            raise RuntimeError(
+                f"16-core license headroom is insufficient for {feature}: "
+                f"required={minimum}, available={available}"
+            )
+        headroom[feature] = available
+    return {
+        "contract": contract,
+        "snapshot_sha256": actual_sha,
+        "checked_at": checked_at.astimezone(timezone.utc).isoformat(),
+        "age_seconds": age_seconds,
+        "headroom_readback": headroom,
+    }
+
+
+def _positive_decimal_environment(environ, name):
+    value = str(environ.get(name, "") or "").strip()
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise RuntimeError(
+            f"standalone core opt-in requires positive decimal {name}; "
+            f"actual={value!r}"
+        )
+    return int(value)
+
+
+def resolve_solver_core_policy(
+        backend, *, environ=None, affinity_count=None,
+        solver_revision=None, solver_dirty=None, license_now_utc=None):
+    """Resolve the default cap or an exact fail-closed 8/16-core opt-in."""
+    env = os.environ if environ is None else environ
+    backend_mode = str(backend or "").strip().lower()
+    revision = str(
+        GIT_HASH if solver_revision is None else solver_revision
+    ).strip().lower()
+    dirty = int(GIT_DIRTY if solver_dirty is None else solver_dirty)
+
+    if affinity_count is None:
+        try:
+            available = len(os.sched_getaffinity(0))
+        except AttributeError:
+            available = 4
+    else:
+        available = int(affinity_count)
+    if available < 1:
+        raise RuntimeError(
+            f"solver CPU affinity readback is invalid: {available!r}"
+        )
+
+    present = tuple(
+        name for name in _STANDALONE_CORE_OPT_IN_ENV_NAMES if name in env
+    )
+    slurm_cpus_raw = str(env.get("SLURM_CPUS_PER_TASK", "") or "").strip()
+    task_id_raw = str(env.get("SLURM_SCHED_TASK_ID", "") or "").strip()
+    slurm_job_id_raw = str(env.get("SLURM_JOB_ID", "") or "").strip()
+    if not present:
+        effective = max(1, min(available, 4))
+        return {
+            "schema": "mft-solver-core-policy-v1",
+            "contract_version": "default-four-core-cap-v1",
+            "opt_in": False,
+            "backend": backend_mode,
+            "requested_num_cores": 4,
+            "effective_num_cores": effective,
+            "num_tasks": 1,
+            "affinity_count_readback": available,
+            "slurm_cpus_per_task_readback": slurm_cpus_raw,
+            "scheduler_task_id_readback": task_id_raw,
+            "slurm_job_id_readback": slurm_job_id_raw,
+            "auth_sha256": "",
+            "solver_revision": revision,
+            "solver_dirty": dirty,
+        }
+
+    if len(present) != len(_STANDALONE_CORE_OPT_IN_ENV_NAMES):
+        missing = sorted(set(_STANDALONE_CORE_OPT_IN_ENV_NAMES) - set(present))
+        raise RuntimeError(
+            "partial standalone core opt-in rejected; "
+            f"present={list(present)}, missing={missing}"
+        )
+    if backend_mode != "standalone":
+        raise RuntimeError(
+            "standalone core opt-in is forbidden for backend "
+            f"{backend_mode!r}"
+        )
+    if dirty != 0:
+        raise RuntimeError(
+            "standalone core opt-in requires a clean committed solver revision"
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError(
+            "standalone core opt-in requires an exact 40-hex solver revision; "
+            f"actual={revision!r}"
+        )
+
+    contract = str(env.get(STANDALONE_CORE_CONTRACT_ENV, "") or "").strip()
+    requested = _positive_decimal_environment(env, STANDALONE_CORE_COUNT_ENV)
+    expected_contract = _STANDALONE_CORE_CONTRACT_BY_COUNT.get(requested)
+    if expected_contract is None:
+        raise RuntimeError(
+            "standalone core opt-in permits exactly 8 or 16 cores; "
+            f"actual={requested}"
+        )
+    if contract != expected_contract:
+        raise RuntimeError(
+            "standalone core contract version mismatch: "
+            f"expected={expected_contract!r}, actual={contract!r}"
+        )
+    license_evidence = None
+    if requested == STANDALONE_CORE_16_OPT_IN_COUNT:
+        license_evidence = _validated_16_core_license_snapshot(
+            env, now_utc=license_now_utc
+        )
+    elif any(name in env for name in _STANDALONE_CORE_LICENSE_ENV_NAMES):
+        raise RuntimeError(
+            "8-core standalone opt-in rejects unexpected 16-core license "
+            "evidence"
+        )
+    expected_auth = standalone_core_contract_auth_sha256(
+        revision,
+        requested,
+        license_contract=(
+            license_evidence["contract"] if license_evidence else ""
+        ),
+        license_snapshot_sha256=(
+            license_evidence["snapshot_sha256"] if license_evidence else ""
+        ),
+    )
+    actual_auth = str(env.get(STANDALONE_CORE_AUTH_ENV, "") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", actual_auth) or actual_auth != expected_auth:
+        raise RuntimeError(
+            "standalone core opt-in authentication digest mismatch"
+        )
+
+    slurm_cpus = _positive_decimal_environment(env, "SLURM_CPUS_PER_TASK")
+    if slurm_cpus != requested:
+        raise RuntimeError(
+            "standalone core opt-in Slurm allocation mismatch: "
+            f"requested={requested}, SLURM_CPUS_PER_TASK={slurm_cpus}"
+        )
+    scheduler_task_id = _positive_decimal_environment(
+        env, "SLURM_SCHED_TASK_ID"
+    )
+    slurm_job_id = _positive_decimal_environment(env, "SLURM_JOB_ID")
+    if available < requested:
+        raise RuntimeError(
+            "standalone core opt-in affinity is smaller than the authenticated "
+            f"request: requested={requested}, affinity={available}"
+        )
+
+    policy = {
+        "schema": "mft-solver-core-policy-v1",
+        "contract_version": contract,
+        "opt_in": True,
+        "backend": backend_mode,
+        "requested_num_cores": requested,
+        "effective_num_cores": requested,
+        "num_tasks": 1,
+        "affinity_count_readback": available,
+        "slurm_cpus_per_task_readback": slurm_cpus,
+        "scheduler_task_id_readback": scheduler_task_id,
+        "slurm_job_id_readback": slurm_job_id,
+        "auth_sha256": actual_auth,
+        "solver_revision": revision,
+        "solver_dirty": dirty,
+    }
+    if license_evidence is not None:
+        policy.update({
+            "license_contract": license_evidence["contract"],
+            "license_snapshot_sha256": license_evidence[
+                "snapshot_sha256"
+            ],
+            "license_checked_at_readback": license_evidence["checked_at"],
+            "license_snapshot_age_seconds_readback": license_evidence[
+                "age_seconds"
+            ],
+            "license_headroom_readback": license_evidence[
+                "headroom_readback"
+            ],
+        })
+    return policy
+
+
+def _emit_solver_core_evidence(marker, evidence):
+    print(
+        f"{marker} "
+        + json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        ),
+        flush=True,
+    )
+
+
 def _library_git_provenance():
     """Return the imported pyaedt_library full revision and tracked-src dirty flag."""
     try:
@@ -413,6 +772,12 @@ PYAEDT_LIBRARY_GIT_HASH, PYAEDT_LIBRARY_GIT_DIRTY = _library_git_provenance()
 
 class SolutionDataUnavailableError(RuntimeError):
     """Legacy extraction error retained for compatibility with external callers."""
+
+
+class UncertainStandaloneSolverExit(RuntimeError):
+    """Require hard process containment without PyAEDT atexit release."""
+
+    exit_code = 70
 
 
 class _AedtIdentityMismatch(RuntimeError):
@@ -1962,12 +2327,19 @@ class Simulation():
         # 실제 사용가능 코어(cgroup affinity)에 맞춤. SLURM_CPUS_PER_TASK는 packed
         # 잡에서 잡 전체 값(예: 64)이라 4코어 cgroup에 64스레드를 요청하는 사고 유발
         # (2026-07-09 심야 전면 저속의 원인). 상한 4 = 검증된 캠페인 구성.
-        try:
-            avail = len(os.sched_getaffinity(0))
-        except AttributeError:
-            avail = 4  # Windows
-        self.NUM_CORE = max(1, min(avail, 4))
-        self.NUM_TASK = 1
+        # Default behavior remains capped at four cores. The only exception is
+        # the revision-bound standalone contract resolved before AEDT starts.
+        self.aedt_backend = aedt_backend()
+        self.solver_core_policy = resolve_solver_core_policy(self.aedt_backend)
+        self.NUM_CORE = int(
+            self.solver_core_policy["effective_num_cores"]
+        )
+        self.NUM_TASK = int(self.solver_core_policy["num_tasks"])
+        self.solver_core_dispatch_evidence = {}
+        self.solver_core_readback_evidence = {}
+        _emit_solver_core_evidence(
+            "SOLVER_CORE_CONTRACT_JSON", self.solver_core_policy
+        )
         self.desktop = desktop
         self.full_model = False
         self.project_path = None
@@ -1977,7 +2349,6 @@ class Simulation():
         self.extraction_units = {}
         self.spawned_descendants = {}
         self.stage_timings = {}
-        self.aedt_backend = aedt_backend()
         self.aedt_lease = None
         self.pooled_release_done = False
         self.pooled_activation_done = False
@@ -2449,6 +2820,16 @@ class Simulation():
         """Return the backend captured for this runner instance."""
         return str(getattr(self, "aedt_backend", "") or aedt_backend())
 
+    def _record_solver_core_dispatch(self, label, evidence):
+        if not hasattr(self, "solver_core_dispatch_evidence"):
+            self.solver_core_dispatch_evidence = {}
+        record = dict(evidence)
+        record.setdefault("schema", "mft-solver-core-dispatch-v1")
+        record.setdefault("stage", str(label))
+        self.solver_core_dispatch_evidence[str(label)] = record
+        _emit_solver_core_evidence("SOLVER_CORE_DISPATCH_JSON", record)
+        return record
+
     def aedt_automation_transaction(self):
         """Protect one Desktop-global attach/model/extract/save transaction."""
 
@@ -2653,10 +3034,14 @@ class Simulation():
         # 서멀패드(실리콘 패드): 비도전성 (AC Magnetic 해석에서는 절연체로 동작)
         if "thermal_pad" not in self.design1.materials.material_keys:
             mat = self.design1.materials.add_material("thermal_pad")
-            mat.conductivity = 0
-            mat.permittivity = 4
-            mat.permeability = 1
-            mat.thermal_conductivity = 0.2  # W/(m*K)
+        else:
+            mat = self.design1.materials["thermal_pad"]
+        mat.conductivity = 0
+        mat.permittivity = 4
+        mat.permeability = 1
+        mat.thermal_conductivity = (
+            FIXED_THERMAL_PAD_CONDUCTIVITY_W_MK
+        )
 
     def _configure_1k101_native_material(self, material_name, direction):
         """Create/update one wound-core orientation and attest native AEDT data."""
@@ -4123,6 +4508,7 @@ class Simulation():
 
         for attempt in range(1, max_attempts + 1):
             self.extraction_attempts[extraction_key] = self.extraction_attempts.get(extraction_key, 0) + 1
+            singleton_recovered = False
             try:
                 self._prepare_pooled_solution_data_app()
                 post = self.design1.post
@@ -4173,8 +4559,83 @@ class Simulation():
                         except (TypeError, ValueError, OverflowError) as e:
                             missing.append(expression)
                             last_error = e
+                    # AEDT 2025 R2 can return a partially populated Fields
+                    # SolutionData object for a large named-expression batch.
+                    # This is an extraction transport defect, not missing
+                    # physics: retry only the missing expressions as singleton
+                    # native field queries before discarding the solved design.
+                    # Values already read from the batch remain untouched.
+                    if missing and report_category == "Fields":
+                        missing_aliases = {
+                            expression: alias
+                            for expression, alias in zip(expressions, aliases)
+                            if expression in missing
+                        }
+                        still_missing = []
+                        for expression in missing:
+                            try:
+                                singleton = post.get_solution_data_per_variation(
+                                    solution_type="Fields",
+                                    setup_sweep_name="Setup1 : LastAdaptive",
+                                    context=[],
+                                    sweeps={
+                                        "Freq": ["All"],
+                                        "Phase": ["0deg"],
+                                    },
+                                    expressions=[expression],
+                                )
+                                if singleton is None or singleton is False:
+                                    raise RuntimeError(
+                                        "singleton field query returned no "
+                                        "usable response"
+                                    )
+                                singleton_units = (
+                                    getattr(singleton, "units_data", {}) or {}
+                                )
+                                if hasattr(singleton, "get_expression_data"):
+                                    _, values = singleton.get_expression_data(
+                                        expression, formula="real"
+                                    )
+                                else:
+                                    values = singleton.data_real(expression)
+                                if (
+                                    values is None
+                                    or values is False
+                                    or len(values) == 0
+                                ):
+                                    raise RuntimeError(
+                                        "singleton field query returned no "
+                                        "values"
+                                    )
+                                value = _convert_solution_unit(
+                                    float(values[0]),
+                                    singleton_units.get(expression, ""),
+                                    target_units.get(expression, ""),
+                                )
+                                if not math.isfinite(value):
+                                    raise RuntimeError(
+                                        "singleton field query returned a "
+                                        "non-finite value"
+                                    )
+                                row[missing_aliases[expression]] = value
+                                singleton_recovered = True
+                                units[expression] = singleton_units.get(
+                                    expression, ""
+                                )
+                            except Exception as recovery_error:
+                                still_missing.append(expression)
+                                last_error = recovery_error
+                        missing = still_missing
+                        self.extraction_units[extraction_key] = {
+                            expression: str(units.get(expression, "") or "")
+                            for expression in expressions
+                        }
                     if not missing:
-                        self.extraction_backends[extraction_key] = backend
+                        self.extraction_backends[extraction_key] = (
+                            backend + "+singleton_recovery"
+                            if singleton_recovered
+                            else backend
+                        )
                         return pd.DataFrame([row], columns=aliases)
                     last_error = RuntimeError("missing/non-finite expressions: " + ", ".join(missing))
             except Exception as e:
@@ -5711,6 +6172,206 @@ class Simulation():
         except Exception as message_error:
             logging.warning(f"[{label}] AEDT messages unavailable: {message_error}")
 
+    @staticmethod
+    def _positive_desktop_identity(value):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return parsed if parsed > 0 else 0
+
+    def _remember_native_desktop_handle(self, desktop_wrapper):
+        """Snapshot one live wrapper proxy and its immutable endpoint identity."""
+
+        if desktop_wrapper is None:
+            return None
+        try:
+            odesktop = getattr(desktop_wrapper, "odesktop", None)
+        except Exception:
+            return None
+        if odesktop is None or odesktop is False or not callable(
+                getattr(odesktop, "SetActiveProject", None)):
+            return None
+
+        process_id = self._positive_desktop_identity(
+            getattr(desktop_wrapper, "aedt_process_id", None)
+        )
+        port = self._positive_desktop_identity(
+            getattr(desktop_wrapper, "port", None)
+            or getattr(desktop_wrapper, "grpc_port", None)
+        )
+        self._last_known_native_desktop = odesktop
+        self._last_known_native_desktop_identity = {
+            "process_id": process_id,
+            "port": port,
+        }
+        return odesktop
+
+    def _attest_cached_native_desktop(
+            self, odesktop, *, require_endpoint_identity=False):
+        """Fail closed unless a cached raw proxy is still this exact session."""
+
+        if odesktop is None or odesktop is False or not callable(
+                getattr(odesktop, "SetActiveProject", None)):
+            raise RuntimeError("cached native Desktop proxy is unavailable")
+        if bool(getattr(self, "pooled_release_done", False)):
+            raise RuntimeError("pooled lease has already been released")
+
+        lease = getattr(self, "aedt_lease", None)
+        lease_state = str(getattr(lease, "state", "") or "").strip().lower()
+        if lease_state in {
+                "releasing", "released", "failed", "cancelled", "expired"}:
+            raise RuntimeError(
+                f"pooled lease is no longer active: state={lease_state!r}"
+            )
+
+        identity = dict(getattr(
+            self, "_last_known_native_desktop_identity", {}
+        ) or {})
+        expected_process_id = self._positive_desktop_identity(
+            getattr(lease, "session_process_id", None)
+        ) or self._positive_desktop_identity(identity.get("process_id"))
+        expected_port = 0
+        endpoint = str(getattr(lease, "endpoint", "") or "").strip()
+        if ":" in endpoint:
+            expected_port = self._positive_desktop_identity(
+                endpoint.rsplit(":", 1)[1]
+            )
+        expected_port = expected_port or self._positive_desktop_identity(
+            identity.get("port")
+        )
+
+        get_process_id = getattr(odesktop, "GetProcessID", None)
+        if require_endpoint_identity and not expected_process_id:
+            raise RuntimeError(
+                "cached standalone Desktop has no captured positive PID"
+            )
+        if require_endpoint_identity and not callable(get_process_id):
+            raise RuntimeError(
+                "cached standalone Desktop has no native PID readback"
+            )
+        if expected_process_id and callable(get_process_id):
+            actual_process_id = self._positive_desktop_identity(
+                get_process_id()
+            )
+            if actual_process_id != expected_process_id:
+                raise RuntimeError(
+                    "cached native Desktop PID mismatch: "
+                    f"expected={expected_process_id}, actual={actual_process_id}"
+                )
+
+        get_port = getattr(odesktop, "GetGrpcServerPort", None)
+        if require_endpoint_identity and not expected_port:
+            raise RuntimeError(
+                "cached standalone Desktop has no captured positive gRPC port"
+            )
+        if require_endpoint_identity and not callable(get_port):
+            raise RuntimeError(
+                "cached standalone Desktop has no native gRPC port readback"
+            )
+        if expected_port and callable(get_port):
+            actual_port = self._positive_desktop_identity(get_port())
+            if actual_port != expected_port:
+                raise RuntimeError(
+                    "cached native Desktop port mismatch: "
+                    f"expected={expected_port}, actual={actual_port}"
+                )
+
+        get_projects = getattr(odesktop, "GetProjects", None)
+        if not callable(get_projects):
+            raise RuntimeError(
+                "cached native Desktop cannot enumerate live projects"
+            )
+        projects = list(get_projects() or [])
+        expected_project = str(
+            getattr(self, "PROJECT_NAME", "") or ""
+        ).strip()
+        if expected_project:
+            matches = []
+            errors = []
+            for index, project in enumerate(projects):
+                try:
+                    name = str(project.GetName() or "").strip()
+                except Exception as error:
+                    errors.append(
+                        f"project[{index}]={type(error).__name__}: {error}"
+                    )
+                    continue
+                if name == expected_project:
+                    matches.append(project)
+            if len(matches) != 1:
+                detail = f"; errors={errors}" if errors else ""
+                raise RuntimeError(
+                    "cached native Desktop exact-project attestation failed: "
+                    f"expected={expected_project!r}, found={len(matches)}"
+                    f"{detail}"
+                )
+        return odesktop
+
+    def _reattach_exact_pooled_desktop(self):
+        """Try one non-owning reconnect to the lease-authorized endpoint."""
+
+        if bool(getattr(self, "_pooled_desktop_reattach_attempted", False)):
+            raise RuntimeError(
+                "pooled Desktop same-lease reattach was already attempted"
+            )
+        self._pooled_desktop_reattach_attempted = True
+        if bool(getattr(self, "pooled_release_done", False)):
+            raise RuntimeError("pooled lease has already been released")
+
+        lease = getattr(self, "aedt_lease", None)
+        connector = getattr(lease, "connect_desktop", None)
+        if not callable(connector):
+            raise RuntimeError(
+                "pooled lease cannot reconnect its authorized Desktop"
+            )
+        lease_state = str(getattr(lease, "state", "") or "").strip().lower()
+        if lease_state in {
+                "releasing", "released", "failed", "cancelled", "expired"}:
+            raise RuntimeError(
+                f"pooled lease is no longer active: state={lease_state!r}"
+            )
+
+        # AedtProjectLease.connect_desktop first refreshes the token-authorized
+        # session identity, probes its exact endpoint, attaches with
+        # new_desktop=False/close_on_exit=False, and attests PID/version/port.
+        # It also nests through the same re-entrant automation lock, so this is
+        # safe when a caller discovered the missing handle inside a transaction.
+        desktop = connector(
+            non_graphical=GUI,
+            desktop_factory=_PooledDesktop,
+        )
+        odesktop = self._remember_native_desktop_handle(desktop)
+        if odesktop is None:
+            raise RuntimeError(
+                "same-lease Desktop reattach returned no native proxy"
+            )
+
+        previous_desktop = getattr(self, "desktop", None)
+        self.desktop = desktop
+        project_wrapper = getattr(self, "project", None)
+        try:
+            project_state = vars(project_wrapper)
+        except TypeError:
+            project_state = {}
+        if project_state and (
+                "desktop" in project_state
+                or project_state.get("desktop") is previous_desktop):
+            project_state["desktop"] = desktop
+
+        design = getattr(self, "design1", None)
+        app = getattr(design, "solver_instance", None)
+        if app is not None:
+            app_state = vars(app)
+            app_state["_desktop_class"] = desktop
+            app_state["_desktop"] = odesktop
+            app_state["_odesktop"] = odesktop
+
+        # connect_desktop's endpoint/PID checks are necessary but the lease's
+        # exact project must also still exist before the recovered proxy is
+        # admitted back into this runner.
+        return self._attest_cached_native_desktop(odesktop)
+
     def _native_desktop_handle(self):
         """Return the original Desktop handle, never a copied-design proxy."""
         candidates = [getattr(self, "desktop", None)]
@@ -5721,10 +6382,60 @@ class Simulation():
             project_state = {}
         candidates.append(project_state.get("desktop"))
         for candidate in candidates:
-            odesktop = getattr(candidate, "odesktop", None)
-            if odesktop is not None and odesktop is not False and callable(
-                    getattr(odesktop, "SetActiveProject", None)):
+            odesktop = self._remember_native_desktop_handle(candidate)
+            if odesktop is not None:
                 return odesktop
+
+        backend = self._backend_mode()
+        cached_error = None
+        cached = getattr(self, "_last_known_native_desktop", None)
+        if cached is not None:
+            try:
+                attested = self._attest_cached_native_desktop(
+                    cached,
+                    require_endpoint_identity=(backend != "pooled"),
+                )
+            except Exception as error:
+                cached_error = error
+            else:
+                if backend == "pooled":
+                    logging.warning(
+                        "PyAEDT Desktop wrapper was unavailable during gRPC "
+                        "recreation; using the endpoint/project-attested cached "
+                        "native proxy"
+                    )
+                else:
+                    logging.warning(
+                        "PyAEDT Desktop wrapper was unavailable after native "
+                        "Analyze; using the identity/project-attested cached "
+                        "standalone native proxy"
+                    )
+                return attested
+        if backend == "pooled":
+            try:
+                reattached = self._reattach_exact_pooled_desktop()
+            except Exception as reattach_error:
+                details = []
+                if cached_error is not None:
+                    details.append(
+                        f"cached proxy attestation failed: {cached_error}"
+                    )
+                details.append(f"same-lease reattach failed: {reattach_error}")
+                raise RuntimeError(
+                    "original native AEDT Desktop handle is unavailable; "
+                    + "; ".join(details)
+                ) from reattach_error
+            logging.warning(
+                "PyAEDT Desktop wrapper and cached proxy were unavailable; "
+                "recovered the exact authorized endpoint with one non-owning "
+                "same-lease reattach"
+            )
+            return reattached
+        if cached_error is not None:
+            raise RuntimeError(
+                "original native AEDT Desktop handle is unavailable; cached "
+                f"standalone proxy attestation failed: {cached_error}"
+            ) from cached_error
         raise RuntimeError("original native AEDT Desktop handle is unavailable")
 
     def _verified_pooled_native_setup(
@@ -5850,7 +6561,7 @@ class Simulation():
         return oproject, odesign
 
     def _validated_matrix_hpc_acf(self, acf_path=None):
-        """Return the matrix solve's exact 4-core/one-engine DSO configuration."""
+        """Return the matrix solve's exact requested-core/one-engine DSO config."""
         if acf_path is None:
             matrix_design = getattr(self, "design_matrix", None)
             solver = getattr(matrix_design, "solver_instance", None)
@@ -5900,6 +6611,21 @@ class Simulation():
             raise RuntimeError(
                 f"authoritative matrix HPC ACF contract mismatch: {mismatches}"
             )
+        evidence = {
+            "schema": "mft-solver-core-readback-v1",
+            "source": "matrix_hpc_acf",
+            "num_cores_readback": int(self.NUM_CORE),
+            "num_engines_readback": int(self.NUM_TASK),
+            "num_gpus_readback": 0,
+            "config_name_readback": "pyaedt_config",
+            "acf_sha256": hashlib.sha256(
+                text.encode("utf-8")
+            ).hexdigest(),
+        }
+        if not hasattr(self, "solver_core_readback_evidence"):
+            self.solver_core_readback_evidence = {}
+        self.solver_core_readback_evidence["matrix_hpc_acf"] = evidence
+        _emit_solver_core_evidence("SOLVER_CORE_READBACK_JSON", evidence)
         return path
 
     def _capture_matrix_hpc_acf(
@@ -6070,6 +6796,7 @@ class Simulation():
                     "registry_key": registry_key,
                     "original_config": original_config,
                     "acf_path": acf_path,
+                    "dso_config_readback": actual,
                 }
             except _AedtIdentityMismatch:
                 if config_may_be_active and original_config:
@@ -6451,6 +7178,15 @@ class Simulation():
                         if pooled_backend
                         else {"cores": self.NUM_CORE}
                     )
+                    self._record_solver_core_dispatch(label, {
+                        "dispatch": "pyaedt_setup_analyze",
+                        "backend": (
+                            "pooled" if pooled_backend else "standalone"
+                        ),
+                        "cores_argument": analyze_kwargs.get("cores"),
+                        "tasks_argument": analyze_kwargs.get("tasks"),
+                        "gpus_argument": analyze_kwargs.get("gpus"),
+                    })
                     analyze_result = self.design1.setup.analyze(**analyze_kwargs)
                     if analyze_result is False:
                         raise RuntimeError(f"[{label}] Setup1 analyze returned False")
@@ -6480,6 +7216,19 @@ class Simulation():
                 self.solve_attempts[label] = self.solve_attempts.get(label, 0) + 1
                 t0 = time.time()
                 try:
+                    self._record_solver_core_dispatch(label, {
+                        "dispatch": "native_analyze_validated_dso",
+                        "backend": "standalone",
+                        "cores_argument": int(self.NUM_CORE),
+                        "tasks_argument": int(self.NUM_TASK),
+                        "gpus_argument": 0,
+                        "dso_config_readback": context.get(
+                            "dso_config_readback"
+                        ),
+                        "acf_sha256": getattr(
+                            self, "solver_core_readback_evidence", {}
+                        ).get("matrix_hpc_acf", {}).get("acf_sha256", ""),
+                    })
                     if getattr(self, "aedt_backend", "standalone") == "pooled":
                         self.solver_may_be_running = True
                     analyze_result = dispatch_design.Analyze("Setup1", True)
@@ -6579,6 +7328,79 @@ class Simulation():
         )
         row["matrix_conductor_policy"] = getattr(
             self, "matrix_conductor_policy", "not_recorded"
+        )
+        core_policy = dict(getattr(self, "solver_core_policy", {}) or {})
+        row["solver_core_policy_schema"] = core_policy.get(
+            "schema", "not_recorded"
+        )
+        row["solver_core_contract_version"] = core_policy.get(
+            "contract_version", "not_recorded"
+        )
+        row["solver_core_opt_in"] = int(bool(core_policy.get("opt_in", False)))
+        row["solver_core_backend"] = core_policy.get(
+            "backend", getattr(self, "aedt_backend", "not_recorded")
+        )
+        row["solver_num_cores_requested"] = int(core_policy.get(
+            "requested_num_cores", getattr(self, "NUM_CORE", -1)
+        ))
+        row["solver_num_cores_effective"] = int(core_policy.get(
+            "effective_num_cores", getattr(self, "NUM_CORE", -1)
+        ))
+        row["solver_num_tasks_effective"] = int(core_policy.get(
+            "num_tasks", getattr(self, "NUM_TASK", -1)
+        ))
+        row["solver_core_affinity_count_readback"] = int(core_policy.get(
+            "affinity_count_readback", -1
+        ))
+        row["solver_core_slurm_cpus_per_task_readback"] = str(
+            core_policy.get("slurm_cpus_per_task_readback", "")
+        )
+        row["solver_core_scheduler_task_id_readback"] = str(
+            core_policy.get("scheduler_task_id_readback", "")
+        )
+        row["solver_core_slurm_job_id_readback"] = str(
+            core_policy.get("slurm_job_id_readback", "")
+        )
+        row["solver_core_auth_sha256"] = core_policy.get("auth_sha256", "")
+        row["solver_core_license_contract"] = core_policy.get(
+            "license_contract", ""
+        )
+        row["solver_core_license_snapshot_sha256"] = core_policy.get(
+            "license_snapshot_sha256", ""
+        )
+        row["solver_core_license_checked_at_readback"] = core_policy.get(
+            "license_checked_at_readback", ""
+        )
+        row["solver_core_license_snapshot_age_seconds_readback"] = (
+            core_policy.get("license_snapshot_age_seconds_readback", "")
+        )
+        row["solver_core_license_headroom_readback_json"] = json.dumps(
+            core_policy.get("license_headroom_readback", {}),
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        dispatch_evidence = dict(
+            getattr(self, "solver_core_dispatch_evidence", {}) or {}
+        )
+        readback_evidence = dict(
+            getattr(self, "solver_core_readback_evidence", {}) or {}
+        )
+        row["solver_core_dispatch_evidence_json"] = json.dumps(
+            dispatch_evidence, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        row["solver_core_readback_evidence_json"] = json.dumps(
+            readback_evidence, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        matrix_readback = readback_evidence.get("matrix_hpc_acf", {})
+        row["solver_matrix_hpc_num_cores_readback"] = int(
+            matrix_readback.get("num_cores_readback", -1)
+        )
+        row["solver_matrix_hpc_num_engines_readback"] = int(
+            matrix_readback.get("num_engines_readback", -1)
+        )
+        row["solver_matrix_hpc_acf_sha256"] = matrix_readback.get(
+            "acf_sha256", ""
         )
         row["loss_copy_prepare_attempts"] = int(getattr(
             self, "loss_copy_prepare_attempts", 0
@@ -7627,6 +8449,21 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             result_parts + [sim.get_execution_telemetry(), timing_frame,
                             simulation_time], axis=1
         )
+        observed_tim_k = FIXED_THERMAL_PAD_CONDUCTIVITY_W_MK
+        if "thermal_pad_conductivity_W_mK" in result.columns:
+            thermal_tim_k = result[
+                "thermal_pad_conductivity_W_mK"
+            ].iloc[0]
+            if not pd.isna(thermal_tim_k):
+                observed_tim_k = thermal_tim_k
+        fixed_boundary_evidence = evaluate_fixed_boundary(
+            sim.df_plus.iloc[0].to_dict(),
+            thermal_pad_conductivity_w_mk=observed_tim_k,
+        )
+        for name, value in fixed_boundary_classification_metadata(
+            fixed_boundary_evidence
+        ).items():
+            result[name] = value
         em_result_valid, em_validity_reason = _em_result_validation(
             result, matrix_on=matrix_on, loss_on=loss_on
         )
@@ -7678,6 +8515,13 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             print(f"\n=== HOLD: AEDT에 '{sim.PROJECT_NAME}' 프로젝트가 열린 채 유지됩니다. 확인 후 직접 닫으세요. ===")
             return bool(em_result_valid and thermal_result_valid)
 
+        if (
+                backend != "pooled"
+                and bool(getattr(sim, "solver_may_be_running", False))):
+            raise UncertainStandaloneSolverExit(
+                "standalone native solver is still uncertain before project "
+                "close"
+            )
         try:
             pooled_lifecycle_phase = "release_settlement"
             sim.close_project()
@@ -7724,6 +8568,14 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     pooled_release_suppressed[0] = solver_uncertain
                     pooled_settlement_error[0] = settlement_error
                     logging.exception("failed to settle pooled AEDT failure")
+        if (
+                sim is not None
+                and backend != "pooled"
+                and bool(getattr(sim, "solver_may_be_running", False))):
+            raise UncertainStandaloneSolverExit(
+                "standalone native solver remains uncertain after run "
+                f"failure: {type(e).__name__}: {e}"
+            ) from e
         if fixed_mode:
             # fixed 모드에서는 실패를 조용히 넘기지 않는다
             if (
@@ -7772,6 +8624,18 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                     logging.exception(
                         f"Error deleting pooled project after host ACK: {error}"
                     )
+        elif (
+                desktop is not None
+                and sim is not None
+                and bool(getattr(sim, "solver_may_be_running", False))):
+            # A standalone native engine that outlived PyAEDT's blocking
+            # Analyze return must never enter Desktop release. Releasing here
+            # blocks indefinitely and can detach/close a still-active project.
+            # The task/process cleanup below is the containment boundary.
+            logging.error(
+                "skipping standalone AEDT Desktop release because native "
+                "solver completion is still uncertain"
+            )
         elif desktop is not None:
             try:
                 if held[0]:
@@ -7850,7 +8714,7 @@ def _parse_set_overrides(pairs):
     return out
 
 
-def main():
+def _main_impl():
     global GUI
 
     args = parse_args()
@@ -7944,6 +8808,7 @@ def main():
     while True:
 
         ok = False
+        hard_containment = False
         try:
             ok = run_one_loop(param=None, model_only=args.model_only, hold=args.hold,
                               overrides=overrides or None)
@@ -7955,11 +8820,15 @@ def main():
             elif args.hold:
                 print(f"\n=== HOLD 모드: 이번 샘플 실패 (라이선스/해석 오류 등) -> "
                       f"새 랜덤 샘플로 재시도합니다 (시도 {attempts + 1}) ===\n", flush=True)
+        except UncertainStandaloneSolverExit:
+            hard_containment = True
+            raise
         except Exception as e:
             logging.exception(f"Error running simulation: {e}")
 
         finally:
-            time.sleep(10)
+            if not hard_containment:
+                time.sleep(10)
 
         attempts += 1
         if args.count is not None:
@@ -7984,6 +8853,30 @@ def main():
                 # RESULT_JSON rows already emitted by partial batches remain harvestable,
                 # but the scheduler must not count a short batch as fully completed.
                 os._exit(_completion_exit_code(successes, args.count))
+
+
+def main():
+    try:
+        return _main_impl()
+    except UncertainStandaloneSolverExit as error:
+        try:
+            print(
+                f"FATAL_CONTAINMENT {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except BaseException:
+            pass
+        try:
+            sys.stdout.flush()
+        except BaseException:
+            pass
+        try:
+            sys.stderr.flush()
+        except BaseException:
+            pass
+        os._exit(error.exit_code)
+        raise RuntimeError("os._exit returned unexpectedly")
 
 
 if __name__ == "__main__":
