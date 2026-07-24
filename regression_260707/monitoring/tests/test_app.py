@@ -15,6 +15,12 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     client = TestClient(create_app(service=artifact_service))
     page = client.get("/")
     assert page.status_code == 200
+    assert "/static/app.css?v=20260724-codex-work-v1" in page.text
+    assert "/static/app.js?v=20260724-codex-work-v1" in page.text
+    assert 'id="codex-work-panel"' in page.text
+    assert 'id="codex-current-list"' in page.text
+    assert 'id="codex-completed-list"' in page.text
+    assert 'id="codex-attention-list"' in page.text
     assert "최적설계 파이프라인" in page.text
     assert "data-chart" in page.text
     assert "현재 물리 revision 학습 가능" in page.text
@@ -134,6 +140,9 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "nodeLocal.active_host_tasks" in script.text
     assert "노드 로컬: 활성 호스트" in script.text
     assert '["matrix", "loss", "electrostatic", "icepak", "total"]' in script.text
+    assert 'fetch("/api/codex-work"' in script.text
+    assert "function renderCodexWork(payload = {})" in script.text
+    assert "function refreshCodexWork()" in script.text
 
     cohorts_script = client.get("/static/cohorts.js")
     assert cohorts_script.status_code == 200
@@ -158,6 +167,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert ".thermal-model-row" in stylesheet.text
     assert ".aedt-attach-card" in stylesheet.text
     assert ".aedt-node-local-progress" in stylesheet.text
+    assert ".codex-work-panel" in stylesheet.text
+    assert ".codex-work-column.attention" in stylesheet.text
 
     dashboard = client.get("/api/dashboard")
     assert dashboard.status_code == 200
@@ -183,6 +194,10 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert timing["stages"]["electrostatic"]["sample_count"] == 0
 
     assert client.get("/api/status").status_code == 200
+    codex_work = client.get("/api/codex-work")
+    assert codex_work.status_code == 200
+    assert codex_work.json()["schema_version"] == "mft-codex-work-status-v1"
+    assert codex_work.json()["available"] is False
     assert client.get("/api/data").json()["complete_rows"] == 1
     models = client.get("/api/models").json()
     assert models["trained_count"] == 2

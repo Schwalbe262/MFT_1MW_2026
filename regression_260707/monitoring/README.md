@@ -73,6 +73,17 @@ fine FEA JSON에는 `result` 객체와 선택적으로 `candidate_id`, `task_id`
 - `MFT_MONITOR_OPERATOR_HOSTS`: 변경 요청에 허용할 comma-separated Host 이름/IP.
   기본값은 `localhost,127.0.0.1,::1`이며 LAN 운영 시 반드시 실제 Host를 추가한다.
 - `MFT_MONITOR_DISABLE_HISTORY=1`: runtime snapshot/history 기록 중지
+- `MFT_CODEX_WORK_STATUS`: 첫 화면의 Codex 작업 현황 패널이 읽을 명시적 JSON
+  아티팩트의 절대 경로. 프로세스·브랜치·Scheduler 작업에서 상태를 추론하지 않는다.
+- `MFT_CODEX_WORK_STALE_SECONDS`: Codex 상태를 오래된 것으로 표시할 기준(초),
+  기본값 `1800`
+
+Codex 상태 JSON은 `mft-codex-work-status-v1` 스키마와 UTC offset이 포함된
+`generated_at`, `deadline_at`을 사용한다. `current`, `completed`, `attention`
+목록의 각 항목에는 고유한 `id`, `title`, `detail`, 해당 목록과 일치하는 `state`,
+`updated_at`을 넣는다. 선택적으로 `progress_pct`, 문자열 `evidence` 목록을 넣을 수
+있다. 파일은 요청마다 다시 읽으며 누락·스키마 오류·중복 ID는 fail-closed 상태로
+표시한다. UI와 API는 이 파일을 수정하지 않는다.
 
 ## 테스트
 

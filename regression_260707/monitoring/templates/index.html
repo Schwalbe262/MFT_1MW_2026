@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=20260724-codex-work-v1">
 </head>
 <body data-refresh-seconds="{{ refresh_seconds }}">
   <header class="topbar">
@@ -30,6 +30,36 @@
     <section id="alert-panel" class="alert-panel hidden" aria-live="polite">
       <div class="alert-icon">!</div>
       <div><strong>확인이 필요합니다</strong><ul id="alert-list"></ul></div>
+    </section>
+
+    <section id="codex-work-panel" class="codex-work-panel loading" aria-labelledby="codex-work-title" aria-live="polite">
+      <div class="codex-work-heading">
+        <div>
+          <p class="eyebrow">CODEX · ACTIVE GOAL · READ ONLY</p>
+          <h2 id="codex-work-title">2026-07-26 MFT 설계 목표 작업 현황</h2>
+          <p id="codex-work-summary">명시적 상태 아티팩트를 불러오는 중입니다.</p>
+        </div>
+        <div class="codex-work-meta">
+          <span id="codex-work-freshness" class="state-chip unknown">확인 중</span>
+          <strong id="codex-work-deadline">마감 —</strong>
+          <small id="codex-work-updated">갱신 —</small>
+        </div>
+      </div>
+      <div class="codex-work-grid">
+        <article class="codex-work-column current">
+          <header><div><span class="codex-work-dot"></span><h3>현재 작업 중</h3></div><strong id="codex-current-count">0</strong></header>
+          <div id="codex-current-list" class="codex-work-list"><p class="codex-work-empty">상태 확인 중</p></div>
+        </article>
+        <article class="codex-work-column completed">
+          <header><div><span class="codex-work-dot"></span><h3>완료</h3></div><strong id="codex-completed-count">0</strong></header>
+          <div id="codex-completed-list" class="codex-work-list"><p class="codex-work-empty">상태 확인 중</p></div>
+        </article>
+        <article class="codex-work-column attention">
+          <header><div><span class="codex-work-dot"></span><h3>주의 / 차단</h3></div><strong id="codex-attention-count">0</strong></header>
+          <div id="codex-attention-list" class="codex-work-list"><p class="codex-work-empty">상태 확인 중</p></div>
+        </article>
+      </div>
+      <p class="codex-work-authority">Scheduler 상태를 추론하지 않습니다. Codex가 발행한 타임스탬프 포함 읽기 전용 JSON만 표시합니다.</p>
     </section>
 
     <section class="parallel-control-panel" aria-labelledby="parallel-control-title">
@@ -413,6 +443,6 @@
   </dialog>
 
   <div id="loading-indicator" class="loading-indicator" aria-hidden="true"></div>
-  <script src="{{ url_for('static', path='/app.js') }}" defer></script>
+  <script src="{{ url_for('static', path='/app.js') }}?v=20260724-codex-work-v1" defer></script>
 </body>
 </html>

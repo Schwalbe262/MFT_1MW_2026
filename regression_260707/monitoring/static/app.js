@@ -5,11 +5,13 @@
   const $ = (selector) => document.querySelector(selector);
   const svgNS = "http://www.w3.org/2000/svg";
   const refreshSeconds = hasDOM ? Number(document.body.dataset.refreshSeconds || 20) : 20;
+  const codexWorkRequestTimeoutMs = 5000;
   const state = {
     dashboard: null, selectedModel: null, selectedModelData: null, refreshing: false,
     historyMetric: "r2",
     parityCache: new Map(), parityRequest: 0,
     parallelTargetDirty: false, updatingParallelTarget: false,
+    codexWork: null, codexWorkRequest: null,
   };
 
   const labels = {
@@ -1417,12 +1419,127 @@
     renderDiagnostics(payload);
   }
 
+  function codexTimeRemaining(deadlineAt) {
+    const deadline = new Date(deadlineAt);
+    if (Number.isNaN(deadline.getTime())) return "마감 —";
+    const remainingMs = deadline.getTime() - Date.now();
+    const absoluteMinutes = Math.floor(Math.abs(remainingMs) / 60000);
+    const days = Math.floor(absoluteMinutes / 1440);
+    const hours = Math.floor((absoluteMinutes % 1440) / 60);
+    const minutes = absoluteMinutes % 60;
+    const compactTime = days > 0
+      ? `${days}일 ${hours}시간`
+      : `${hours}시간 ${minutes}분`;
+    return remainingMs >= 0 ? `마감까지 ${compactTime}` : `마감 ${compactTime} 경과`;
+  }
+
+  function renderCodexWorkItem(item = {}) {
+    const card = element("article", `codex-work-item ${item.state || ""}`);
+    const header = element("div", "codex-work-item-heading");
+    header.append(
+      element("strong", "", item.title || item.id || "제목 없음"),
+      element("time", "", dateTime(item.updated_at)),
+    );
+    card.append(header, element("p", "", item.detail || "상세 설명 없음"));
+    if (item.progress_pct != null && Number.isFinite(Number(item.progress_pct))) {
+      const progress = element("div", "codex-work-progress");
+      const bar = element("span");
+      bar.style.width = `${Math.max(0, Math.min(100, Number(item.progress_pct)))}%`;
+      progress.append(bar);
+      progress.setAttribute("aria-label", `진척도 ${Number(item.progress_pct)}%`);
+      card.append(progress);
+    }
+    const evidence = Array.isArray(item.evidence) ? item.evidence : [];
+    if (evidence.length) {
+      const details = element("details", "codex-work-evidence");
+      details.append(element("summary", "", `근거 ${evidence.length}개`));
+      const list = element("ul");
+      evidence.forEach((value) => list.append(element("li", "", String(value))));
+      details.append(list);
+      card.append(details);
+    }
+    return card;
+  }
+
+  function renderCodexWorkGroup(group, items) {
+    const values = Array.isArray(items) ? items : [];
+    setText(`#codex-${group}-count`, number(values.length));
+    const list = $(`#codex-${group}-list`);
+    if (!list) return;
+    list.replaceChildren();
+    if (!values.length) {
+      list.append(element("p", "codex-work-empty", "항목 없음"));
+      return;
+    }
+    values.forEach((item) => list.append(renderCodexWorkItem(item)));
+  }
+
+  function renderCodexWork(payload = {}) {
+    state.codexWork = payload;
+    const panel = $("#codex-work-panel");
+    const freshness = $("#codex-work-freshness");
+    if (!panel || !freshness) return;
+    const verified = payload.available === true && payload.integrity_verified === true;
+    panel.classList.toggle("loading", !verified);
+    panel.classList.toggle("unavailable", !verified);
+    panel.classList.toggle("stale", verified && payload.stale === true);
+    if (!verified) {
+      setText("#codex-work-summary", payload.error || "Codex 상태 아티팩트를 사용할 수 없습니다.");
+      freshness.className = "state-chip fail";
+      freshness.textContent = "상태 확인 불가";
+      setText("#codex-work-deadline", "마감 —");
+      setText("#codex-work-updated", "갱신 —");
+      renderCodexWorkGroup("current", []);
+      renderCodexWorkGroup("completed", []);
+      renderCodexWorkGroup("attention", []);
+      return;
+    }
+    setText("#codex-work-title", payload.goal || "Codex 작업 현황");
+    setText("#codex-work-summary", payload.summary || "요약 없음");
+    setText("#codex-work-deadline", codexTimeRemaining(payload.deadline_at));
+    setText("#codex-work-updated", `${dateTime(payload.generated_at)} 갱신`);
+    freshness.className = `state-chip ${payload.stale ? "attention" : "pass"}`;
+    freshness.textContent = payload.stale
+      ? `오래된 상태 · ${duration(payload.age_seconds)}`
+      : `최신 · ${duration(payload.age_seconds)} 전`;
+    renderCodexWorkGroup("current", payload.current);
+    renderCodexWorkGroup("completed", payload.completed);
+    renderCodexWorkGroup("attention", payload.attention);
+  }
+
+  function refreshCodexWork() {
+    if (state.codexWorkRequest) return state.codexWorkRequest;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), codexWorkRequestTimeoutMs);
+    state.codexWorkRequest = fetch("/api/codex-work", {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then(renderCodexWork)
+      .catch((error) => renderCodexWork({
+        available: false,
+        integrity_verified: false,
+        error: `Codex 작업 상태 endpoint unavailable: ${error.message}`,
+      }))
+      .finally(() => {
+        window.clearTimeout(timer);
+        state.codexWorkRequest = null;
+      });
+    return state.codexWorkRequest;
+  }
+
   async function refresh() {
     if (state.refreshing) return;
     state.refreshing = true;
     $("#refresh-button").disabled = true;
     $("#loading-indicator").classList.add("loading");
     try {
+      refreshCodexWork();
       const response = await fetch("/api/dashboard", { cache: "no-store", headers: { Accept: "application/json" } });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();

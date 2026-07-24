@@ -23,6 +23,7 @@ from .readers import (
     SchedulerReader,
     SimulationPolicyConflict,
 )
+from .codex_status import CodexWorkStatusReader
 
 
 HERE = Path(__file__).resolve().parent
@@ -50,6 +51,7 @@ def _operator_host_allowlist() -> frozenset[str]:
 def create_app(
     regression_root: str | Path | None = None,
     service: ArtifactService | None = None,
+    codex_status_reader: Any | None = None,
 ) -> FastAPI:
     root = Path(
         regression_root or os.environ.get("MFT_MONITOR_ROOT") or DEFAULT_REGRESSION_ROOT
@@ -80,6 +82,9 @@ def create_app(
     app.state.service = service
     app.state.regression_root = root
     app.state.operator_host_allowlist = _operator_host_allowlist()
+    if codex_status_reader is None:
+        codex_status_reader = CodexWorkStatusReader()
+    app.state.codex_status_reader = codex_status_reader
     templates = Jinja2Templates(directory=str(HERE / "templates"))
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 
@@ -189,6 +194,10 @@ def create_app(
     @app.get("/api/dashboard")
     async def api_dashboard():
         return await invoke(service.dashboard, "dashboard")
+
+    @app.get("/api/codex-work")
+    async def api_codex_work():
+        return await invoke(codex_status_reader.snapshot, "codex_work")
 
     @app.get("/api/status")
     async def api_status():
