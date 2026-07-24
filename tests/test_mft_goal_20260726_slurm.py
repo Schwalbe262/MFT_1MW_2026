@@ -409,6 +409,27 @@ def test_result_header_rejects_tamper_and_path_traversal() -> None:
         )
 
 
+def test_result_header_uses_existing_pymoo_counter_semantics() -> None:
+    submission, payload, _csv, _manifest = _result_fixture()
+    value = json.loads(payload)
+    assert value["evaluated_generations"] == slurm.goal.GENERATIONS
+    assert value["completed_generations"] == (
+        slurm.goal.EXPECTED_ALGORITHM_N_GEN_COUNTER
+    )
+    assert slurm.goal.EXPECTED_ALGORITHM_N_GEN_COUNTER == (
+        slurm.goal.GENERATIONS + 1
+    )
+
+    value.pop("payload_sha256")
+    value["completed_generations"] = slurm.goal.GENERATIONS
+    shortened = slurm._sealed(value)
+    with pytest.raises(RuntimeError, match="goal result identity mismatch"):
+        slurm._validate_result_header(
+            payload=json.dumps(shortened).encode(),
+            submission=submission,
+        )
+
+
 def test_only_completed_exit_zero_reaches_harvest(tmp_path: Path) -> None:
     submission, _payload, _csv, _manifest = _result_fixture()
     context = {
