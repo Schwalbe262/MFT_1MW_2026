@@ -21,6 +21,7 @@ from regression_260707.verify import scheduler_client
 from tools import mft_goal_20260726_launch as launch
 from tools import mft_goal_diagnostic_standard_probe as probe
 from tools import mft_goal_fea_handoff as production
+from tools import mft_goal_strict_al_ingest as strict_al
 from tools import tier1_corrected_generation_adapter as adapter
 
 
@@ -790,6 +791,91 @@ def test_timeout_retry_reauthenticates_failure_before_single_submission(
     assert submitted_profile["timeout_seconds"] == 28800
     assert submitted_profile["cpus"] == 8
     assert submitted_profile["mem_mb"] == 32768
+
+
+def test_timeout_retry_collection_is_accepted_by_strict_al(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_scheduler = _FakeScheduler()
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "original-submission.json",
+        scheduler=original_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan = probe._load_plan(original_plan_path)[0]
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+    retry_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "retry-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            original_submission
+        ),
+    )
+
+    class _RetryScheduler(_FakeScheduler):
+        def submit_verification(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return 71002
+
+    retry_scheduler = _RetryScheduler()
+    retry_submission_path = probe.submit_timeout_retry(
+        plan_path=retry_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "retry-submission.json",
+        scheduler=retry_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            original_submission
+        ),
+    )
+    retry_plan, retry_params, retry_selected = probe._load_plan(
+        retry_plan_path
+    )
+    retry_submission = probe._load_submission(
+        retry_submission_path, plan=retry_plan
+    )
+    retry_scheduler.result = _result(
+        retry_plan_path, retry_submission
+    )
+    metadata_reader, manifest_reader = _remote_evidence(
+        retry_submission, retry_scheduler.result
+    )
+    collection_path = probe.collect_standard(
+        plan_path=retry_plan_path,
+        submission_path=retry_submission_path,
+        output=tmp_path / "retry-collection.json",
+        scheduler=retry_scheduler,
+        remote_reader=metadata_reader,
+        manifest_reader=manifest_reader,
+        task_reader=lambda **_kwargs: _task_snapshot(retry_submission),
+    )
+    monkeypatch.setattr(
+        probe,
+        "_load_llt_predictor",
+        lambda _identity: _Predictor(),
+    )
+
+    truth = strict_al.authenticate_collection(collection_path)
+
+    assert truth.adapter_kind == "diagnostic"
+    assert truth.collection["task_id"] == 71002
+    assert retry_plan["retry_of_timeout"]["retry_of_task_id"] == 71001
+    assert truth.source_task_payload_sha256 == (
+        retry_selected["task_identity"]["payload_sha256"]
+    )
+    assert retry_params["fan_velocity"] == 1.5
+    assert retry_params["wcp_pad_t"] == 2.0
+    assert retry_params["core_plate_pad_t"] == 2.0
 
 
 def test_submit_and_collect_remain_diagnostic_after_actual_pass(

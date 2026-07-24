@@ -336,6 +336,40 @@ def test_prepare_rejects_duplicate_base_task_identity(tmp_path, monkeypatch):
         )
 
 
+def test_prepare_rejects_original_and_retry_for_same_candidate(
+    tmp_path, monkeypatch
+):
+    base = _base_dataset(tmp_path)
+    original = _truth(tmp_path, task_id=5002, n1=6)
+    retry = _truth(tmp_path, task_id=5003, n1=6)
+    retry.collection["candidate_physics_sha256"] = (
+        original.collection["candidate_physics_sha256"]
+    )
+    truths = {
+        original.collection_path.resolve(): original,
+        retry.collection_path.resolve(): retry,
+    }
+    monkeypatch.setattr(
+        ingest,
+        "authenticate_collection",
+        lambda path: truths[path.resolve()],
+    )
+
+    with pytest.raises(
+        ingest.StrictALIngestError,
+        match="candidate_physics_sha256 identity is duplicated",
+    ):
+        ingest.prepare_ingest(
+            base_dataset=base,
+            expected_base_sha256=ingest._sha256_file(base),
+            expected_base_rows=8,
+            collection_paths=[
+                original.collection_path,
+                retry.collection_path,
+            ],
+        )
+
+
 def test_truth_row_rejects_non_n1_6_even_when_source_matches(tmp_path):
     truth = _truth(tmp_path, task_id=5001, n1=5)
 
