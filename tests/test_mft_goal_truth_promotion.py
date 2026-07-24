@@ -746,6 +746,7 @@ def test_truth_v2_exact_24_classifies_every_collection_and_blocks_zero(
         counts=(7, 6, 6, 5),
         result_mutator=mixed_feasibility,
     )
+    helpers = built["helpers"]
     predictor = built["predictor"]
     collection_paths = [
         entry["collection_path"] for entry in built["entries"]
@@ -872,6 +873,113 @@ def test_truth_v2_exact_24_classifies_every_collection_and_blocks_zero(
         in row["promotion_exclusion_reasons"]
         for row in manifest["classification_rows"]
     )
+
+    retry_base = built["entries"][-1]
+    retry_plan_path = diagnostic.create_timeout_retry_plan(
+        original_plan_path=retry_base["plan_path"],
+        original_submission_path=retry_base["submission_path"],
+        output=tmp_path / "cohort-timeout-retry-plan",
+        task_reader=lambda **_kwargs: helpers._timeout_task_snapshot(
+            retry_base["submission"]
+        ),
+    )
+    retry_scheduler = _Scheduler(
+        first_task_id=max(
+            entry["submission"]["task_id"] for entry in built["entries"]
+        )
+        + 100
+    )
+    retry_submission_path = diagnostic.submit_timeout_retry(
+        plan_path=retry_plan_path,
+        scheduler_cutover_receipt_path=built["cutover_path"],
+        output=tmp_path / "cohort-timeout-retry-submission.json",
+        scheduler=retry_scheduler,
+        predictor=predictor,
+        live_reader=helpers._live_scheduler_reader,
+        task_reader=lambda **_kwargs: helpers._timeout_task_snapshot(
+            retry_base["submission"]
+        ),
+    )
+    retry_plan = diagnostic._load_plan(retry_plan_path)[0]
+    retry_submission = diagnostic._load_submission(
+        retry_submission_path, plan=retry_plan
+    )
+    retry_result = copy.deepcopy(retry_base["result"])
+    retry_result["solver_core_scheduler_task_id_readback"] = str(
+        retry_submission["task_id"]
+    )
+    retry_scheduler.result = retry_result
+    retry_metadata_reader, retry_manifest_reader = (
+        helpers._remote_evidence(retry_submission, retry_result)
+    )
+    retry_collection_path = diagnostic.collect_standard(
+        plan_path=retry_plan_path,
+        submission_path=retry_submission_path,
+        output=tmp_path / "cohort-timeout-retry-collection.json",
+        scheduler=retry_scheduler,
+        remote_reader=retry_metadata_reader,
+        manifest_reader=retry_manifest_reader,
+        task_reader=lambda **_kwargs: helpers._task_snapshot(
+            retry_submission
+        ),
+    )
+    retry_collection_paths = [
+        *collection_paths[:-1],
+        retry_collection_path,
+    ]
+    retry_manifest_path = promotion.create_truth_promotion(
+        standard_collection_paths=retry_collection_paths,
+        cohort_inventory_path=built["inventory_path"],
+        output=tmp_path / "truth-promotion-v2-timeout-retry",
+        predictor=predictor,
+    )
+    retry_manifest, retry_ranked, _retry_by_candidate = (
+        promotion._load_truth_manifest(
+            retry_manifest_path, predictor=predictor
+        )
+    )
+    retry_entry = next(
+        entry
+        for entry in cohort_entries
+        if entry["task_id"] == retry_base["submission"]["task_id"]
+    )
+    retry_classification = next(
+        row
+        for row in retry_manifest["classification_rows"]
+        if row["cohort_entry_sha256"] == retry_entry["entry_sha256"]
+    )
+    assert retry_classification["task_id"] == retry_submission["task_id"]
+    assert [
+        (
+            row["candidate_physics_sha256"],
+            row["truth_non_dominated_rank"],
+            row["actual_volume_L"],
+            row["actual_total_loss_W"],
+        )
+        for row in retry_ranked
+    ] == [
+        (
+            row["candidate_physics_sha256"],
+            row["truth_non_dominated_rank"],
+            row["actual_volume_L"],
+            row["actual_total_loss_W"],
+        )
+        for row in ranked
+    ]
+    with pytest.raises(
+        production.HandoffContractError,
+        match="outside or duplicates",
+    ):
+        promotion.create_truth_promotion(
+            standard_collection_paths=[
+                retry_collection_path,
+                *collection_paths[1:],
+            ],
+            cohort_inventory_path=built["inventory_path"],
+            output=tmp_path / "forbidden-duplicate-timeout-retry-v2",
+            predictor=predictor,
+        )
+
     first_truth = copy.deepcopy(ranked[0])
     first_classification = next(
         row

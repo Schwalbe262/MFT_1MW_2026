@@ -803,6 +803,85 @@ def _cohort_classification_row(
     return row
 
 
+def _cohort_authority_task_id(
+    view: Mapping[str, Any],
+    *,
+    expected_by_task: Mapping[int, Mapping[str, Any]],
+) -> int:
+    """Resolve one execution onto its immutable original cohort slot.
+
+    A normal Standard execution is its own cohort authority.  A reviewed
+    timeout retry may stand in for the original task only when the retry's
+    sealed ancestry reauthenticates the exact original plan, submission, and
+    task already frozen in the cohort inventory.
+    """
+    collection = view.get("collection")
+    plan = view.get("plan")
+    submission = view.get("submission")
+    if (
+        not isinstance(collection, Mapping)
+        or not isinstance(plan, Mapping)
+        or not isinstance(submission, Mapping)
+    ):
+        raise HandoffContractError(
+            "truth promotion v2 collection is outside or duplicates the "
+            "exact cohort because its authenticated view is malformed"
+        )
+    execution_task_id = collection.get("task_id")
+    if (
+        isinstance(execution_task_id, bool)
+        or not isinstance(execution_task_id, int)
+        or execution_task_id <= 0
+    ):
+        raise HandoffContractError(
+            "truth promotion v2 execution task ID is invalid"
+        )
+    if not diagnostic._plan_is_timeout_retry(plan):
+        return execution_task_id
+
+    retry_record = plan.get("retry_of_timeout")
+    if not isinstance(retry_record, Mapping):
+        raise HandoffContractError(
+            "truth promotion v2 timeout retry ancestry is absent"
+        )
+    authority_task_id = retry_record.get("retry_of_task_id")
+    entry = expected_by_task.get(authority_task_id)
+    if entry is None:
+        raise HandoffContractError(
+            "truth promotion v2 timeout retry is outside the exact cohort"
+        )
+    original_plan, original_submission, _execution = (
+        diagnostic._validate_timeout_retry_record(plan)
+    )
+    if (
+        execution_task_id == authority_task_id
+        or submission.get("task_id") != execution_task_id
+        or retry_record.get("original_plan") != entry["plan"]
+        or retry_record.get("original_plan_payload_sha256")
+        != entry["plan_payload_sha256"]
+        or retry_record.get("original_submission") != entry["submission"]
+        or retry_record.get("original_submission_payload_sha256")
+        != entry["submission_payload_sha256"]
+        or original_plan.get("payload_sha256")
+        != entry["plan_payload_sha256"]
+        or original_submission.get("payload_sha256")
+        != entry["submission_payload_sha256"]
+        or original_submission.get("task_id") != entry["task_id"]
+        or original_submission.get("task_name") != entry["task_name"]
+        or plan.get("candidate_physics_sha256")
+        != entry["candidate_physics_sha256"]
+        or plan.get("solver_revision") != entry["solver_revision"]
+        or plan.get("library_revision") != entry["library_revision"]
+        or plan.get("fea_params_sha256") != entry["fea_params_sha256"]
+        or plan.get("search_authority_sha256")
+        != entry["search_authority_sha256"]
+    ):
+        raise HandoffContractError(
+            "truth promotion v2 timeout retry/cohort ancestry drifted"
+        )
+    return int(authority_task_id)
+
+
 def _authenticate_cohort_inputs(
     *,
     cohort_entries: Sequence[Mapping[str, Any]],
@@ -841,29 +920,32 @@ def _authenticate_cohort_inputs(
             "truth promotion v2 cohort task inventory is ambiguous"
         )
     observed_by_task = {}
+    observed_execution_task_ids = set()
     for path in resolved:
         view = diagnostic.authenticate_collection(
             path, predictor=predictor
         )
         collection = view["collection"]
-        task_id = collection.get("task_id")
-        if task_id not in expected_by_task or task_id in observed_by_task:
+        execution_task_id = collection.get("task_id")
+        authority_task_id = _cohort_authority_task_id(
+            view, expected_by_task=expected_by_task
+        )
+        if (
+            authority_task_id not in expected_by_task
+            or authority_task_id in observed_by_task
+            or execution_task_id in observed_execution_task_ids
+        ):
             raise HandoffContractError(
                 "truth promotion v2 collection is outside or duplicates "
                 "the exact cohort"
             )
-        entry = expected_by_task[task_id]
+        entry = expected_by_task[authority_task_id]
+        timeout_retry = diagnostic._plan_is_timeout_retry(view["plan"])
         truth, status = _actual_standard_observation(
             view, collection_path=path
         )
         if (
-            collection.get("plan") != entry["plan"]
-            or collection.get("plan_payload_sha256")
-            != entry["plan_payload_sha256"]
-            or collection.get("submission") != entry["submission"]
-            or collection.get("submission_payload_sha256")
-            != entry["submission_payload_sha256"]
-            or collection.get("candidate_physics_sha256")
+            collection.get("candidate_physics_sha256")
             != entry["candidate_physics_sha256"]
             or collection.get("selected_candidate_identity", {}).get(
                 "source_task_payload_sha256"
@@ -871,16 +953,38 @@ def _authenticate_cohort_inputs(
             != entry["source_task_payload_sha256"]
             or collection.get("selection_manifest", {}).get("sha256")
             != entry["selection_manifest_sha256"]
-            or view["plan"].get("payload_sha256")
-            != entry["plan_payload_sha256"]
-            or view["submission"].get("payload_sha256")
-            != entry["submission_payload_sha256"]
-            or view["submission"].get("task_name")
-            != entry["task_name"]
+            or view["plan"].get("candidate_physics_sha256")
+            != entry["candidate_physics_sha256"]
+            or view["plan"].get("solver_revision")
+            != entry["solver_revision"]
+            or view["plan"].get("library_revision")
+            != entry["library_revision"]
+            or view["plan"].get("fea_params_sha256")
+            != entry["fea_params_sha256"]
+            or view["plan"].get("search_authority_sha256")
+            != entry["search_authority_sha256"]
+            or truth["standard_task_id"] != execution_task_id
             or truth["solver_revision"] != entry["solver_revision"]
             or truth["library_revision"] != entry["library_revision"]
             or truth["fea_params_sha256"]
             != entry["fea_params_sha256"]
+            or (
+                not timeout_retry
+                and (
+                    collection.get("plan") != entry["plan"]
+                    or collection.get("plan_payload_sha256")
+                    != entry["plan_payload_sha256"]
+                    or collection.get("submission") != entry["submission"]
+                    or collection.get("submission_payload_sha256")
+                    != entry["submission_payload_sha256"]
+                    or view["plan"].get("payload_sha256")
+                    != entry["plan_payload_sha256"]
+                    or view["submission"].get("payload_sha256")
+                    != entry["submission_payload_sha256"]
+                    or view["submission"].get("task_name")
+                    != entry["task_name"]
+                )
+            )
         ):
             raise HandoffContractError(
                 "truth promotion v2 collection/cohort identity drifted"
@@ -888,12 +992,13 @@ def _authenticate_cohort_inputs(
         classification = _cohort_classification_row(
             entry=entry, truth=truth, status=status
         )
-        observed_by_task[task_id] = (
+        observed_by_task[authority_task_id] = (
             view,
             truth,
             classification,
             entry,
         )
+        observed_execution_task_ids.add(execution_task_id)
     if set(observed_by_task) != set(expected_by_task):
         raise HandoffContractError(
             "truth promotion v2 exact cohort is incomplete"
