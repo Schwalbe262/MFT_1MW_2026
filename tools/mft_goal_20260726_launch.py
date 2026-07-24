@@ -1104,7 +1104,10 @@ def aggregate_results(
 ) -> Path:
     import numpy as np
     import pandas as pd
-    from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+    from tools.mft_goal_global_pareto import (
+        rank_candidates,
+        select_standard_candidates,
+    )
 
     if (
         isinstance(minimum_seeds, bool)
@@ -1183,36 +1186,46 @@ def aggregate_results(
     deduplicated = merged.drop_duplicates(
         "physical_geometry_sha256", keep="first"
     ).copy()
-    feasible = deduplicated["physical_feasible"].to_numpy(dtype=bool)
-    deduplicated["global_physical_feasible"] = feasible
-    deduplicated["global_non_dominated_rank"] = -1
-    feasible_indices = np.flatnonzero(feasible)
-    fronts: list[Any] = []
-    if len(feasible_indices):
-        objectives = deduplicated.iloc[feasible_indices][
-            ["objective_volume_L", "objective_total_loss_W"]
-        ].to_numpy(dtype=float)
-        fronts = NonDominatedSorting().do(objectives)
-        rank_column = deduplicated.columns.get_loc(
-            "global_non_dominated_rank"
-        )
-        for rank, local_indices in enumerate(fronts):
-            global_indices = feasible_indices[
-                np.asarray(local_indices, dtype=int)
-            ]
-            deduplicated.iloc[global_indices, rank_column] = rank
-    pareto = deduplicated.loc[
-        deduplicated["global_non_dominated_rank"].eq(0)
+    ranked = rank_candidates(
+        deduplicated,
+        objective_columns=(
+            "objective_volume_L",
+            "objective_total_loss_W",
+        ),
+        physical_constraint_columns=physical_columns,
+        normalized_constraint_columns=normalized_columns,
+    )
+    ranked["global_physical_feasible"] = ranked["hard_feasible"]
+    ranked["global_non_dominated_rank"] = ranked["feasible_rank"]
+    feasible = ranked["hard_feasible"].to_numpy(dtype=bool)
+    feasible_ranks = ranked.loc[
+        ranked["feasible_rank"].ge(0), "feasible_rank"
+    ]
+    front_count = (
+        0 if feasible_ranks.empty else int(feasible_ranks.max()) + 1
+    )
+    pareto = ranked.loc[
+        ranked["global_non_dominated_rank"].eq(0)
     ].copy()
     pareto.sort_values(
         ["objective_volume_L", "objective_total_loss_W"],
         inplace=True,
     )
+    standard_candidates = select_standard_candidates(
+        ranked,
+        objective_columns=(
+            "objective_volume_L",
+            "objective_total_loss_W",
+        ),
+        normalized_constraint_columns=normalized_columns,
+    )
     output.mkdir(parents=True)
     all_path = output / "global_terminal_candidates.csv"
     pareto_path = output / "global_pareto_front.csv"
-    _atomic_csv(all_path, deduplicated)
+    standard_path = output / "standard_candidates.csv"
+    _atomic_csv(all_path, ranked)
     _atomic_csv(pareto_path, pareto)
+    _atomic_csv(standard_path, standard_candidates)
     manifest = _seal(
         {
             "schema_version": GLOBAL_PARETO_SCHEMA,
@@ -1228,14 +1241,15 @@ def aggregate_results(
             "minimum_seed_count": minimum_seeds,
             "seeds": sorted(seeds),
             "input_terminal_row_count": int(len(merged)),
-            "deduplicated_physical_geometry_count": int(len(deduplicated)),
+            "deduplicated_physical_geometry_count": int(len(ranked)),
             "physical_feasible_count": int(feasible.sum()),
-            "non_dominated_front_count": len(fronts),
+            "non_dominated_front_count": front_count,
             "global_pareto_count": int(len(pareto)),
+            "standard_candidate_count": int(len(standard_candidates)),
             "sorting_authority": (
                 "all_authenticated_terminal_rows_then_physical_dedupe_"
                 "then_decoder_and_physical_G_and_surrogate_physicality_"
-                "feasible_then_non_dominated_sort"
+                "feasible_then_exact_2d_nlogn_non_dominated_sort"
             ),
             "seed_local_pareto_merge_used": False,
             "common_identity": common_identity,
@@ -1256,6 +1270,14 @@ def aggregate_results(
                     "path": pareto_path.name,
                     "sha256": adapter.sha256_file(pareto_path),
                     "row_count": int(len(pareto)),
+                },
+                "standard_candidates": {
+                    "path": standard_path.name,
+                    "sha256": adapter.sha256_file(standard_path),
+                    "row_count": int(len(standard_candidates)),
+                    "selection": (
+                        "deterministic_anchors_knee_margin_and_front_spread"
+                    ),
                 },
             },
             "search_only_proposal": any(

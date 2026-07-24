@@ -478,7 +478,20 @@ def rank_candidates(
     normalized_g = ranked[list(normalized_constraint_columns)].to_numpy(
         dtype=float
     )
-    feasible = np.all(physical_g <= 0.0, axis=1)
+    constraint_feasible = np.all(physical_g <= 0.0, axis=1)
+    if "physical_feasible" in ranked.columns:
+        declared = ranked["physical_feasible"]
+        if not pd.api.types.is_bool_dtype(declared):
+            raise ParetoContractError(
+                "physical_feasible must be a canonical boolean column"
+            )
+        feasible = declared.to_numpy(dtype=bool)
+        if np.any(feasible & ~constraint_feasible):
+            raise ParetoContractError(
+                "physical_feasible contradicts positive physical constraints"
+            )
+    else:
+        feasible = constraint_feasible
     violation = np.maximum(normalized_g, 0.0).sum(axis=1)
 
     objective_rank = nondominated_ranks_2d(objectives)

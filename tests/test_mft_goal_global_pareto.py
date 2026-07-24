@@ -174,3 +174,30 @@ def test_mixed_identity_fails_closed(tmp_path: Path) -> None:
             manifest_path=manifest,
             output_dir=tmp_path / "output",
         )
+
+
+def test_surrogate_physicality_flag_quarantines_constraint_feasible_row(
+    tmp_path: Path,
+) -> None:
+    record = _write_seed(tmp_path, 1)
+    table = tmp_path / record["table_path"]
+    frame = pd.read_csv(table)
+    frame["physical_feasible"] = True
+    frame.loc[0, "physical_feasible"] = False
+    frame.to_csv(table, index=False)
+    record["table_sha256"] = _sha256(table)
+    manifest = _manifest(tmp_path, [record])
+
+    summary = build_global_pareto(
+        manifest_path=manifest,
+        output_dir=tmp_path / "output",
+    )
+
+    assert summary["hard_feasible_count"] == 319
+    ranked = pd.read_parquet(
+        tmp_path / "output" / "ranked_unique_candidates.parquet"
+    )
+    quarantined = ranked.loc[
+        ranked["terminal_population_index"].eq(0)
+    ].iloc[0]
+    assert bool(quarantined["hard_feasible"]) is False
