@@ -68,6 +68,7 @@ MAX_STATUS_WORKERS = 4
 MAX_ACCOUNT_WORKERS = 4
 DEFAULT_HARVEST_RETRIES = 3
 RESULT_JSON_MAX_BYTES = 1024 * 1024
+RESULT_JSON_SFTP_MAX_BYTES = 8 * 1024 * 1024
 TERMINAL_ARTIFACT_ROLES = (
     "terminal_physical_candidates",
     "terminal_physical_candidates_manifest",
@@ -1507,6 +1508,64 @@ def _ensure_declared_artifact(
     }
 
 
+def _fetch_contained_full_result(
+    *,
+    connection: Any,
+    remote_task_root: str,
+    task_dir: Path,
+    retries: int,
+) -> tuple[bytes, dict[str, Any]]:
+    """Read a result larger than the Scheduler text endpoint's hard cap."""
+
+    remote_file = posixpath.join(remote_task_root.rstrip("/"), "result.json")
+    identity = _contained_remote_identity(
+        connection.get(),
+        remote_task_root=remote_task_root,
+        remote_file=remote_file,
+    )
+    if int(identity["bytes"]) > RESULT_JSON_SFTP_MAX_BYTES:
+        raise RuntimeError("remote result.json exceeds SFTP safety limit")
+    cache = task_dir / ".result.json.remote-cache"
+    reused = False
+    if cache.exists():
+        if cache.is_symlink() or not cache.is_file():
+            raise RuntimeError("local result cache is unsafe")
+        reused = bool(
+            cache.stat().st_size == int(identity["bytes"])
+            and _sha256_file(cache) == identity["sha256"]
+        )
+    if not reused:
+        transport._download_verified_sftp(
+            connection,
+            remote_file,
+            cache,
+            retries,
+            expected_identity=identity,
+            max_bytes=RESULT_JSON_SFTP_MAX_BYTES,
+        )
+    after = _contained_remote_identity(
+        connection.get(),
+        remote_task_root=remote_task_root,
+        remote_file=remote_file,
+    )
+    if after != identity:
+        raise RuntimeError("remote result.json changed during fallback read")
+    payload = cache.read_bytes()
+    if (
+        len(payload) != int(identity["bytes"])
+        or hashlib.sha256(payload).hexdigest() != identity["sha256"]
+    ):
+        raise RuntimeError("local result cache identity mismatch")
+    return payload, {
+        "transport": (
+            "scheduler_remote_file_probe_then_contained_sftp"
+        ),
+        "remote_sha256": identity["sha256"],
+        "remote_size_bytes": int(identity["bytes"]),
+        "local_cache_reused": reused,
+    }
+
+
 def _harvest_one_completed_task(
     *,
     context: Mapping[str, Any],
@@ -1524,26 +1583,48 @@ def _harvest_one_completed_task(
         raise RuntimeError("only completed exit-0 tasks may be harvested")
     task_id = int(submission["task_id"])
     try:
-        result_bytes = _fetch_result_bytes(
-            scheduler_url=context["scheduler_url"],
-            task_id=task_id,
-            retries=retries,
-        )
-        result, selected = _validate_result_header(
-            payload=result_bytes,
-            submission=submission,
-        )
         task_dir = _safe_task_directory(
             Path(context["results_root"]),
             task_id,
         )
-        pending_result = task_dir / ".result.json.pending"
-        _atomic_bytes(pending_result, result_bytes)
         remote_task_root = posixpath.join(
             str(context["plan"]["remote_bundle"]).rstrip("/"),
             "runs",
             f"task-{task_id}",
         )
+        result_bytes = _fetch_result_bytes(
+            scheduler_url=context["scheduler_url"],
+            task_id=task_id,
+            retries=retries,
+        )
+        result_transport = {
+            "transport": "scheduler_remote_file_base_remote_cwd",
+            "remote_sha256": None,
+            "remote_size_bytes": None,
+            "local_cache_reused": False,
+        }
+        try:
+            result, selected = _validate_result_header(
+                payload=result_bytes,
+                submission=submission,
+            )
+        except RuntimeError:
+            if len(result_bytes) != RESULT_JSON_MAX_BYTES:
+                raise
+            result_bytes, result_transport = (
+                _fetch_contained_full_result(
+                    connection=connection,
+                    remote_task_root=remote_task_root,
+                    task_dir=task_dir,
+                    retries=retries,
+                )
+            )
+            result, selected = _validate_result_header(
+                payload=result_bytes,
+                submission=submission,
+            )
+        pending_result = task_dir / ".result.json.pending"
+        _atomic_bytes(pending_result, result_bytes)
         records: dict[str, dict[str, Any]] = {}
         for role in TERMINAL_ARTIFACT_ROLES:
             records[role] = _ensure_declared_artifact(
@@ -1587,9 +1668,7 @@ def _harvest_one_completed_task(
                     "sha256": result_sha,
                     "size_bytes": final_result.stat().st_size,
                     "payload_sha256": result["payload_sha256"],
-                    "transport": (
-                        "scheduler_remote_file_base_remote_cwd"
-                    ),
+                    **result_transport,
                 },
                 "terminal_artifacts": records,
                 "full_goal_seed_validation_passed": True,

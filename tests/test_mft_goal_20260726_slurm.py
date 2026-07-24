@@ -502,6 +502,101 @@ def test_resume_reuses_verified_local_terminal_files(
     )
 
 
+def test_result_api_cap_falls_back_to_contained_sftp(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    submission, payload, csv_bytes, manifest_bytes = _result_fixture()
+    padding = b" " * (
+        slurm.RESULT_JSON_MAX_BYTES - len(payload) + 100
+    )
+    full_payload = payload + padding
+    api_tail = full_payload[-slurm.RESULT_JSON_MAX_BYTES :]
+    task_id = submission["task_id"]
+    task_dir = tmp_path / f"task-{task_id}"
+    task_dir.mkdir()
+    (task_dir / "terminal_physical_candidates.csv").write_bytes(csv_bytes)
+    (
+        task_dir / "terminal_physical_candidates.manifest.json"
+    ).write_bytes(manifest_bytes)
+    monkeypatch.setattr(
+        slurm,
+        "_fetch_result_bytes",
+        lambda **_kwargs: api_tail,
+    )
+    identity = {
+        "bytes": len(full_payload),
+        "sha256": hashlib.sha256(full_payload).hexdigest(),
+    }
+    monkeypatch.setattr(
+        slurm,
+        "_contained_remote_identity",
+        lambda *_args, **_kwargs: identity,
+    )
+
+    def fake_download(
+        _connection,
+        _remote_file,
+        destination,
+        _retries,
+        **_kwargs,
+    ):
+        Path(destination).write_bytes(full_payload)
+        return {
+            "bytes": len(full_payload),
+            "sha256": identity["sha256"],
+            "transport": "direct_sftp",
+            "attempts": 1,
+        }
+
+    monkeypatch.setattr(
+        slurm.transport,
+        "_download_verified_sftp",
+        fake_download,
+    )
+    monkeypatch.setattr(
+        slurm.goal,
+        "_validated_seed_table",
+        lambda *_args, **_kwargs: ({}, object()),
+    )
+
+    class FakeConnection:
+        def get(self):
+            return object()
+
+    context = {
+        "scheduler_url": slurm.DEFAULT_SCHEDULER_URL,
+        "results_root": tmp_path,
+        "plan": {
+            "bundle_id": "mft-goal-" + "a" * 24,
+            "remote_bundle": "/gpfs/goal",
+        },
+    }
+    row = {
+        "task_id": task_id,
+        "scheduler_status": "completed",
+        "exit_code": 0,
+        "state_class": "completed_exit_zero",
+        "scheduler_task_identity_sha256": "5" * 64,
+        "harvested": False,
+        "error": None,
+    }
+    harvested = slurm._harvest_one_completed_task(
+        context=context,
+        submission=submission,
+        row=row,
+        connection=FakeConnection(),
+        retries=1,
+    )
+
+    assert harvested["harvested"] is True
+    receipt = slurm._read_json(task_dir / "harvest_receipt.json")
+    assert receipt["result"]["transport"] == (
+        "scheduler_remote_file_probe_then_contained_sftp"
+    )
+    assert receipt["result"]["remote_sha256"] == identity["sha256"]
+
+
 def test_harvest_cli_help_exposes_bounded_read_only_controls(capsys) -> None:
     with pytest.raises(SystemExit) as exc:
         slurm._parser().parse_args(["harvest", "--help"])
