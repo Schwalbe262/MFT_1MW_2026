@@ -39,13 +39,39 @@ prevents unrelated JSON files from entering the command.
 ```powershell
 $Py = 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe'
 $CodeRoot = 'C:\w\mft-goal-20260726'
-$Diag = 'C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\diagnostic_standard_retry12_sa1e4f70cefa1_q0800a8d204da_rde0b963f42d2_260725'
 $Base = 'C:\Users\peets\slurm_scheduler_runtime\mft_cap_recovery_runs\7d3efe22995e-8e89f6e8846d\dataset\strict_006151.parquet'
-$Stems = @(
-  '068b0607b43f','11add38e114d','11e0d8daed35',
-  '628c9fcfec1e','692c1a03e5fd','895990953c5a',
-  'a4ae16f8a0c3','ab33ef0ba3ef','b6a83bfc7212',
-  'bc50d459bcb4','c3195a79f5b2','cb3d96a527ac'
+$CollectionAllowList = @(
+  [pscustomobject]@{
+    Root = 'C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\diagnostic_standard_retry12_sa1e4f70cefa1_q0800a8d204da_rde0b963f42d2_260725'
+    Stems = @(
+      '068b0607b43f','11add38e114d','11e0d8daed35',
+      '628c9fcfec1e','692c1a03e5fd','895990953c5a',
+      'a4ae16f8a0c3','ab33ef0ba3ef','b6a83bfc7212',
+      'bc50d459bcb4','c3195a79f5b2','cb3d96a527ac'
+    )
+  }
+  [pscustomobject]@{
+    Root = 'C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\diagnostic_secondary_n1_6_excluded11_260725'
+    Stems = @(
+      '05580bda40b2','08750eb352cf','2347a292ad75',
+      '2a1bb6f2be79','436565e3f360','7a6ccac265d3',
+      '7a8c0bd079b1','7ce2bf976d48','90598193e992',
+      'b4075d84aeee','b7c30cb70b95','efffb6518d4e'
+    )
+  }
+  [pscustomobject]@{
+    Root = 'C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\diagnostic_expansion24_n1_6_excluded22_260725'
+    Stems = @(
+      '0db6751640ed','1a37a5bdf570','2fbcce18032d',
+      '30801ea43777','394982e87267','48c66215f6b1',
+      '52c0532d449b','5c81f854d1f6','5da1e899c646',
+      '65063da2abd2','85c1d3f685ee','a2aee0d6368f',
+      'a5faf61b52ec','aaa0a68f092f','b7140eaa3093',
+      'c6e25efd5cb3','c9ce907e92e2','e08397ffe3ba',
+      'e25be28b3941','e9a5f5d82946','edd23c7754e9',
+      'f87bf164246c','f9da67b59152','fba86bc49ff0'
+    )
+  }
 )
 
 $Dirty = git -C $CodeRoot status --porcelain --untracked-files=all
@@ -56,10 +82,26 @@ $CodeRevision = (git -C $CodeRoot rev-parse HEAD).Trim()
 if ($CodeRevision.Length -ne 40) { throw 'invalid code revision' }
 
 $Collections = @(
-  foreach ($Stem in $Stems) {
-    $Path = Join-Path $Diag "collections\$Stem.json"
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-      (Resolve-Path -LiteralPath $Path).Path
+  foreach ($Group in $CollectionAllowList) {
+    foreach ($Stem in $Group.Stems) {
+      $Submission = Join-Path $Group.Root "submissions\$Stem.json"
+      if (-not (Test-Path -LiteralPath $Submission -PathType Leaf)) {
+        throw "allow-listed Standard submission is absent: $Submission"
+      }
+      $Receipt = Get-Content -Raw -LiteralPath $Submission | ConvertFrom-Json
+      if (
+        $Receipt.schema_version -ne 'mft-goal-diagnostic-standard-submission-v1' -or
+        $Receipt.stage -ne 'standard' -or
+        $Receipt.scheduler_submission_performed -ne $true -or
+        [int]$Receipt.task_id -le 0 -or
+        -not ([string]$Receipt.candidate_physics_sha256).StartsWith($Stem)
+      ) {
+        throw "allow-listed Standard submission identity drifted: $Submission"
+      }
+      $Path = Join-Path $Group.Root "collections\$Stem.json"
+      if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        (Resolve-Path -LiteralPath $Path).Path
+      }
     }
   }
 )
