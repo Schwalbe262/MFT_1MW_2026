@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=20260724-codex-work-v1">
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=20260725-campaign-scope-v2">
 </head>
 <body data-refresh-seconds="{{ refresh_seconds }}">
   <header class="topbar">
@@ -65,9 +65,9 @@
     <section class="parallel-control-panel" aria-labelledby="parallel-control-title">
       <div class="parallel-control-heading">
         <div>
-          <p id="parallel-control-eyebrow" class="eyebrow">DURABLE SIMULATION POLICY · MFT ONLY</p>
-          <h2 id="parallel-control-title">MFT 병렬 실행 목표</h2>
-          <p id="parallel-control-description">Scheduler의 versioned desired/effective 정책을 확인하는 중입니다.</p>
+          <p id="parallel-control-eyebrow" class="eyebrow">LEGACY PROJECT POLICY · NOT THE DEADLINE CAMPAIGN</p>
+          <h2 id="parallel-control-title">기존 MFT 프로젝트 병렬 정책</h2>
+          <p id="parallel-control-description">이 패널의 0은 현재 512-seed Slurm 캠페인의 제출·실행 수가 아닙니다. 현재 캠페인의 권위 있는 수치는 위 Codex 작업 카드에 표시됩니다.</p>
         </div>
         <form id="parallel-target-form" class="parallel-target-form" autocomplete="off">
           <label for="parallel-target-input">Desired simulations</label>
@@ -87,7 +87,8 @@
           </dl>
         </div>
       </div>
-      <div class="parallel-live-grid" aria-label="MFT 실시간 작업 상태">
+      <p class="parallel-control-note">아래 값은 Scheduler project <code>MFT_1MW_2026v1</code>의 simulation-policy 범위입니다. 현재 마감 캠페인 task <code>95684–96195</code>와 분리해서 보십시오.</p>
+      <div class="parallel-live-grid" aria-label="기존 MFT 프로젝트 정책 상태">
         <div><span>Desired</span><strong id="parallel-current-target">—</strong></div>
         <div><span>Effective</span><strong id="parallel-effective-target">—</strong></div>
         <div><span>Validated limit</span><strong id="parallel-validated-limit">—</strong></div>
@@ -443,6 +444,6 @@
   </dialog>
 
   <div id="loading-indicator" class="loading-indicator" aria-hidden="true"></div>
-  <script src="{{ url_for('static', path='/app.js') }}?v=20260724-codex-work-v1" defer></script>
+  <script src="{{ url_for('static', path='/app.js') }}?v=20260725-campaign-scope-v2" defer></script>
 </body>
 </html>

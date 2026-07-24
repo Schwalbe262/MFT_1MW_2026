@@ -15,8 +15,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     client = TestClient(create_app(service=artifact_service))
     page = client.get("/")
     assert page.status_code == 200
-    assert "/static/app.css?v=20260724-codex-work-v1" in page.text
-    assert "/static/app.js?v=20260724-codex-work-v1" in page.text
+    assert "/static/app.css?v=20260725-campaign-scope-v2" in page.text
+    assert "/static/app.js?v=20260725-campaign-scope-v2" in page.text
     assert 'id="codex-work-panel"' in page.text
     assert 'id="codex-current-list"' in page.text
     assert 'id="codex-completed-list"' in page.text
@@ -39,7 +39,9 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "활성 코호트 타이밍 데이터 없음" in page.text
     assert "단계 소요시간" in page.text
     assert "final-time-matrix" in page.text
-    assert "MFT 병렬 실행 목표" in page.text
+    assert "기존 MFT 프로젝트 병렬 정책" in page.text
+    assert "현재 512-seed Slurm 캠페인의 제출·실행 수가 아닙니다" in page.text
+    assert "95684–96195" in page.text
     assert 'id="parallel-target-form" class="parallel-target-form"' in page.text
     assert "parallel-target-input" in page.text
     assert "parallel-effective-target" in page.text
@@ -91,6 +93,8 @@ def test_dashboard_page_and_all_read_only_apis(artifact_service):
     assert "/static/cohorts.js" in cohorts_page.text
 
     script = client.get("/static/app.js")
+    assert "NOT THE DEADLINE CAMPAIGN" in script.text
+    assert "현재 512-seed Slurm 캠페인의 job 수가 아닙니다" in script.text
     assert script.status_code == 200
     assert "function duration(value)" in script.text
     assert "data.current_physics_data_revision" in script.text

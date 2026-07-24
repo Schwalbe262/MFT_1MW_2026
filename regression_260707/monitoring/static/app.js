@@ -1339,13 +1339,13 @@
     $("#refill-controller-status").classList.toggle("hidden", policySupported);
     $("#parallel-target-status").classList.remove("hidden");
     $("#parallel-control-note").classList.remove("hidden");
-    setText("#parallel-control-eyebrow", policySupported ? "DURABLE SIMULATION POLICY · MFT ONLY" : "AUTOMATIC REFILL CONTROL · MFT ONLY");
-    setText("#parallel-control-title", policySupported ? "MFT 병렬 실행 목표" : "MFT 자동 실행 유지");
+    setText("#parallel-control-eyebrow", policySupported ? "LEGACY PROJECT POLICY · NOT THE DEADLINE CAMPAIGN" : "LEGACY REFILL CONTROL · NOT THE DEADLINE CAMPAIGN");
+    setText("#parallel-control-title", policySupported ? "기존 MFT 프로젝트 병렬 정책" : "기존 MFT 프로젝트 자동 실행 유지");
     setText(
       "#parallel-control-description",
       policySupported
-        ? "attaching + active 수를 desired 목표로 유지합니다. queued admission은 별도로 표시하며 IPMSM에는 적용하지 않습니다."
-        : "외부 refill-controller가 queued + attaching + running 합계를 자동으로 유지합니다.",
+        ? "이 0은 현재 512-seed Slurm 캠페인의 job 수가 아닙니다. 이 패널은 MFT_1MW_2026v1 simulation-policy만 표시하며, 현재 캠페인의 권위 있는 수치는 위 Codex 작업 카드에 표시됩니다."
+        : "이 패널은 기존 refill-controller 범위입니다. 현재 512-seed Slurm 캠페인의 권위 있는 수치는 위 Codex 작업 카드에 표시됩니다.",
     );
     if (!policySupported) renderRefillController(refillController);
     const input = $("#parallel-target-input");
