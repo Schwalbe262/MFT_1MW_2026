@@ -115,12 +115,21 @@ STANDARD_PROFILE_CONTRACT = dict(_STANDARD_PROFILE["param_overrides"])
 DEFAULT_TASK_TIMEOUT_SECONDS = int(_STANDARD_PROFILE["timeout_seconds"])
 RETAINED_AEDT_SCHEMA = "mft-goal-fea-retained-aedt-v1"
 RETAINED_AEDT_BUNDLE_SCHEMA = "mft-goal-diagnostic-retained-aedt-bundle-v1"
+RETAINED_AEDT_TRUTH_FULL_BUNDLE_SCHEMA = (
+    "mft-goal-truth-full-retained-aedt-bundle-v1"
+)
 RETAINED_AEDT_RECEIPT_SCHEMA = "mft-goal-fea-remote-artifact-receipt-v1"
 RETAINED_AEDT_BUNDLE_RECEIPT_SCHEMA = (
     "mft-goal-diagnostic-remote-artifact-bundle-receipt-v1"
 )
 RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA = (
     "mft-goal-diagnostic-aedtresults-manifest-v1"
+)
+RETAINED_AEDT_TRUTH_FULL_BUNDLE_RECEIPT_SCHEMA = (
+    "mft-goal-truth-full-remote-artifact-bundle-receipt-v1"
+)
+RETAINED_AEDT_TRUTH_FULL_RESULTS_MANIFEST_SCHEMA = (
+    "mft-goal-truth-full-aedtresults-manifest-v1"
 )
 RETAINED_AEDT_ROOT = "goal-fea-retained"
 RETAINED_AEDT_TEXT_CHUNK_SCHEMA = "mft-goal-fea-base64-chunks-v1"
@@ -624,9 +633,11 @@ def retained_aedt_identity(
         or set(retention) not in {frozenset(required), frozenset(bundle_required)}
     ):
         raise ValueError("retained AEDT profile contract is incomplete")
-    bundle_retention = (
-        retention.get("schema_version") == RETAINED_AEDT_BUNDLE_SCHEMA
-    )
+    bundle_schema = retention.get("schema_version")
+    bundle_retention = bundle_schema in {
+        RETAINED_AEDT_BUNDLE_SCHEMA,
+        RETAINED_AEDT_TRUTH_FULL_BUNDLE_SCHEMA,
+    }
     stage = str(retention.get("stage") or "")
     artifact = str(retention.get("artifact_filename") or "")
     receipt = str(retention.get("receipt_filename") or "")
@@ -638,7 +649,11 @@ def retained_aedt_identity(
     safe_name = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,126}")
     if (
         retention.get("schema_version")
-        not in {RETAINED_AEDT_SCHEMA, RETAINED_AEDT_BUNDLE_SCHEMA}
+        not in {
+            RETAINED_AEDT_SCHEMA,
+            RETAINED_AEDT_BUNDLE_SCHEMA,
+            RETAINED_AEDT_TRUTH_FULL_BUNDLE_SCHEMA,
+        }
         or stage not in {"standard", "full"}
         or not safe_name.fullmatch(artifact)
         or not artifact.endswith(".aedt")
@@ -650,16 +665,25 @@ def retained_aedt_identity(
     ):
         raise ValueError("retained AEDT profile contract is invalid")
     if bundle_retention:
+        expected_bundle_stage = (
+            "standard"
+            if bundle_schema == RETAINED_AEDT_BUNDLE_SCHEMA
+            else "full"
+        )
         if (
             set(retention) != bundle_required
-            or stage != "standard"
+            or stage != expected_bundle_stage
             or not safe_name.fullmatch(results_directory)
             or not results_directory.endswith(".aedtresults")
             or not safe_name.fullmatch(results_manifest_filename)
             or not results_manifest_filename.endswith(".manifest.json")
         ):
             raise ValueError("retained AEDT result-bundle contract is invalid")
-        expected_profile_name = "goal_diagnostic_standard.json"
+        expected_profile_name = (
+            "goal_diagnostic_standard.json"
+            if stage == "standard"
+            else "goal_truth_promotion_full.json"
+        )
     else:
         if set(retention) != required:
             raise ValueError("retained AEDT v1 profile contract is invalid")
@@ -690,12 +714,20 @@ def retained_aedt_identity(
             ensure_ascii=True,
         ).encode("utf-8")
     ).hexdigest()
-    retention_reason = (
-        "Retain diagnostic Standard AEDT and AEDT results until authenticated "
-        "diagnostic collection"
-        if bundle_retention
-        else "Retain goal FEA AEDT until authenticated package collection"
-    )
+    if bundle_schema == RETAINED_AEDT_BUNDLE_SCHEMA:
+        retention_reason = (
+            "Retain diagnostic Standard AEDT and AEDT results until "
+            "authenticated diagnostic collection"
+        )
+    elif bundle_schema == RETAINED_AEDT_TRUTH_FULL_BUNDLE_SCHEMA:
+        retention_reason = (
+            "Retain truth-promoted Full AEDT and AEDT results until "
+            "authenticated actual-truth package"
+        )
+    else:
+        retention_reason = (
+            "Retain goal FEA AEDT until authenticated package collection"
+        )
     marker_contract = {
         "schema": SCHEDULER_PRESERVE_SCHEMA,
         "preserve": True,
@@ -740,7 +772,7 @@ def retained_aedt_identity(
     if bundle_retention:
         retained.update(
             {
-                "schema_version": RETAINED_AEDT_BUNDLE_SCHEMA,
+                "schema_version": bundle_schema,
                 "results_path": (
                     f"{relative_directory}/{results_directory}"
                 ),
@@ -749,6 +781,8 @@ def retained_aedt_identity(
                 ),
                 "results_manifest_schema_version": (
                     RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA
+                    if stage == "standard"
+                    else RETAINED_AEDT_TRUTH_FULL_RESULTS_MANIFEST_SCHEMA
                 ),
             }
         )
@@ -758,7 +792,10 @@ def retained_aedt_identity(
 def _retained_aedt_export_command(retained):
     if retained is None:
         return ""
-    if retained.get("schema_version") == RETAINED_AEDT_BUNDLE_SCHEMA:
+    if retained.get("schema_version") in {
+        RETAINED_AEDT_BUNDLE_SCHEMA,
+        RETAINED_AEDT_TRUTH_FULL_BUNDLE_SCHEMA,
+    }:
         return _retained_aedt_bundle_export_command(retained)
     marker_contract_json = json.dumps(
         retained["marker_contract"],
@@ -854,24 +891,38 @@ def _retained_aedt_export_command(retained):
 
 
 def _retained_aedt_bundle_export_command(retained):
-    """Export one Standard project and its adjacent ``.aedtresults`` tree.
+    """Export one reviewed project and its adjacent ``.aedtresults`` tree.
 
-    The diagnostic contract uses an atomic directory rename, a complete
+    The reviewed bundle contracts use an atomic directory rename, a complete
     content-addressed results manifest, and the same Scheduler prune marker as
-    the production project-only retention path. It is intentionally available
-    only to the reviewed diagnostic Standard profile.
+    the production project-only retention path. They are available only to the
+    exact reviewed diagnostic Standard and truth-promotion Full profiles.
     """
     required = {
         "results_path",
         "results_manifest_path",
         "results_manifest_schema_version",
     }
+    bundle_schema = retained.get("schema_version")
+    stage = retained.get("stage")
+    allowed_identity = {
+        (RETAINED_AEDT_BUNDLE_SCHEMA, "standard"): (
+            RETAINED_AEDT_BUNDLE_RECEIPT_SCHEMA,
+            RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA,
+        ),
+        (RETAINED_AEDT_TRUTH_FULL_BUNDLE_SCHEMA, "full"): (
+            RETAINED_AEDT_TRUTH_FULL_BUNDLE_RECEIPT_SCHEMA,
+            RETAINED_AEDT_TRUTH_FULL_RESULTS_MANIFEST_SCHEMA,
+        ),
+    }
+    schemas = allowed_identity.get((bundle_schema, stage))
     if (
-        retained.get("schema_version") != RETAINED_AEDT_BUNDLE_SCHEMA
-        or retained.get("stage") != "standard"
+        schemas is None
         or not required.issubset(retained)
+        or retained.get("results_manifest_schema_version") != schemas[1]
     ):
         raise ValueError("retained AEDT result-bundle identity is incomplete")
+    receipt_schema, results_manifest_schema = schemas
     marker_contract_json = json.dumps(
         retained["marker_contract"],
         sort_keys=True,
@@ -879,7 +930,7 @@ def _retained_aedt_bundle_export_command(retained):
         ensure_ascii=True,
     )
     receipt_context = {
-        "schema_version": RETAINED_AEDT_BUNDLE_RECEIPT_SCHEMA,
+        "schema_version": receipt_schema,
         "stage": retained["stage"],
         "dedupe_key": retained["dedupe_key"],
         "parameter_digest": retained["parameter_digest"],
@@ -1010,7 +1061,7 @@ inventory_bytes = json.dumps(
 ).encode("utf-8")
 results_tree_sha256 = hashlib.sha256(inventory_bytes).hexdigest()
 manifest_payload = {{
-    "schema_version": "{RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA}",
+    "schema_version": "{results_manifest_schema}",
     "source_project_name": src.stem,
     "source_results_directory_name": src_results.name,
     "retained_results_directory_name": results_dst.name,
