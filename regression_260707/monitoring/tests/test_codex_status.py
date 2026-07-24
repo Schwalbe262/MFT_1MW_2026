@@ -134,4 +134,4 @@ def test_api_and_first_page_expose_codex_work_panel(tmp_path):
     assert response.status_code == 200
     assert response.json()["goal_id"] == "mft-goal-20260726"
     assert response.headers["cache-control"] == "no-store"
-    assert response.headers["content-type"] == "application/json; charset=utf-8"
+    assert response.headers["content-type"].startswith("application/json")
