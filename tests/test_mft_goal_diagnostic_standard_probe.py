@@ -496,6 +496,63 @@ def test_selection_is_deterministic_diverse_and_mean_band_bound(
     assert selection["automatic_promotion"] is False
 
 
+def test_final_aggregate_plan_reauthentication_allows_search_only_bundle(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    selection, table = probe._load_selection(fixture["selection_path"])
+    aggregate_path = tmp_path / "aggregate_manifest.json"
+    aggregate = launch._seal(
+        {"schema_version": launch.GLOBAL_PARETO_SCHEMA}
+    )
+    launch._atomic_json(aggregate_path, aggregate)
+    result_paths_by_sha256 = {
+        str(record["result"]["sha256"]): Path(record["result"]["path"])
+        for record in selection["source_results"]
+    }
+    aggregate_authority = {
+        "seed_count": len(result_paths_by_sha256),
+        "minimum_seed_count": len(result_paths_by_sha256),
+        "result_paths_by_sha256": result_paths_by_sha256,
+    }
+    selection["source_mode"] = "final_authenticated_aggregate"
+    selection["aggregate_source"] = {
+        "manifest": production._file_record(aggregate_path),
+        "payload_sha256": aggregate["payload_sha256"],
+        "seed_count": aggregate_authority["seed_count"],
+        "minimum_seed_count": aggregate_authority["minimum_seed_count"],
+        "all_bundle_seed_results_reauthenticated": True,
+        "global_nds_recomputed": True,
+        "input_result_sha256": sorted(result_paths_by_sha256),
+    }
+    monkeypatch.setattr(
+        probe,
+        "_load_selection",
+        lambda _path: (selection, table),
+    )
+    observed = {}
+
+    def authenticate_aggregate(**kwargs):
+        observed.update(kwargs)
+        return aggregate_authority
+
+    monkeypatch.setattr(
+        production,
+        "_authenticate_aggregate_authority",
+        authenticate_aggregate,
+    )
+    authenticated = probe.authenticate_candidate(
+        selection_manifest_path=fixture["selection_path"],
+        candidate_physics_sha256=fixture["geometry_by_turns"][6],
+        predictor=_Predictor(),
+    )
+    assert observed["allow_search_only"] is True
+    assert (
+        authenticated["selection_source"]["source_mode"]
+        == "final_authenticated_aggregate"
+    )
+
+
 def test_plan_has_only_standard_and_exact_fixed_physics(tmp_path, monkeypatch):
     fixture = _fixture(tmp_path, monkeypatch)
     plan_path = _make_plan(tmp_path, fixture)

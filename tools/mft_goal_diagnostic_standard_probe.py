@@ -1641,6 +1641,7 @@ def authenticate_candidate(
             aggregate=aggregate,
             manifest_path=aggregate_path,
             bundle_manifest_path=bundle_path,
+            allow_search_only=True,
         )
         refreshed_aggregate_source = {
             "manifest": production._file_record(aggregate_path),
