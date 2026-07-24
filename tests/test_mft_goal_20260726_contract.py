@@ -94,6 +94,134 @@ def test_local_preflight_forwards_exact_remote_documentary_identity(
     )
 
 
+def test_prepare_bundle_seals_all_three_relocation_cli_inputs(
+    monkeypatch,
+    tmp_path,
+):
+    revision = "c" * 40
+    code_root = tmp_path / "code"
+    code_root.mkdir()
+    candidate = tmp_path / "candidate.json"
+    quality = tmp_path / "quality.json"
+    runtime_dataset = tmp_path / "strict_al.parquet"
+    runtime_profile = tmp_path / "goal_standard.json"
+    for path in (
+        candidate,
+        quality,
+        runtime_dataset,
+        runtime_profile,
+    ):
+        path.write_text("{}", encoding="utf-8")
+    documentary = (
+        "/gpfs/tmp_cpu2/mft_goal_20260726/al_training/"
+        "bundle/runs/task-123/registry/generations/g1"
+    )
+    relocation = {
+        "enabled": True,
+        "source_absolute_paths_are_documentary_only": True,
+        "documentary_generation_path": documentary,
+        "runtime_generation_path": str(tmp_path / "generation"),
+        "documentary_dataset_path": (
+            "/gpfs/example/artifacts/input/strict_al.parquet"
+        ),
+        "runtime_dataset_path": str(runtime_dataset),
+        "documentary_profile_path": (
+            "/gpfs/example/artifacts/code/goal_standard.json"
+        ),
+        "runtime_profile_path": str(runtime_profile),
+        "content_identities_reauthenticated": True,
+    }
+    local_preflight = launch._seal(
+        {
+            "schema_version": launch.LOCAL_PREFLIGHT_SCHEMA,
+            "hard_constraint_contract_sha256": "d" * 64,
+            "dataset_sha256": "a" * 64,
+            "profile_sha256": "2" * 64,
+            "evaluation_model_sha256": "b" * 64,
+            "train_report_sha256": "e" * 64,
+            "candidate_sha256": "f" * 64,
+            "quality_status_sha256": "1" * 64,
+            "source_relocation": relocation,
+            "code": {"revision": revision},
+            "search_only_proposal": False,
+        }
+    )
+    authenticated = types.SimpleNamespace(
+        candidate={"generation_path": documentary},
+        dataset_path=runtime_dataset,
+        profile_path=runtime_profile,
+    )
+    observed = {}
+
+    def fake_preflight(**kwargs):
+        observed.update(kwargs)
+        return local_preflight, types.SimpleNamespace(
+            authenticated=authenticated
+        )
+
+    monkeypatch.setattr(launch, "run_local_preflight", fake_preflight)
+    monkeypatch.setattr(
+        launch,
+        "_collect_goal_code_sources",
+        lambda _root: {},
+    )
+    monkeypatch.setattr(
+        launch,
+        "_build_goal_code_manifest",
+        lambda _sources, *, code_revision: (
+            _synthetic_goal_code_manifest(code_revision)
+        ),
+    )
+
+    def fake_stage(output, *, sources, manifest):
+        assert sources == {}
+        output.mkdir(parents=True)
+        launch._atomic_json(output / "code_manifest.json", manifest)
+        return output / "code_manifest.json"
+
+    monkeypatch.setattr(launch, "_stage_goal_code", fake_stage)
+    output = tmp_path / "campaign"
+    args = launch._parser().parse_args(
+        [
+            "prepare",
+            "--generation",
+            str(tmp_path / "generation"),
+            "--candidate",
+            str(candidate),
+            "--quality-status",
+            str(quality),
+            "--code-root",
+            str(code_root),
+            "--expected-code-revision",
+            revision,
+            "--runtime-dataset",
+            str(runtime_dataset),
+            "--runtime-profile",
+            str(runtime_profile),
+            "--expected-documentary-generation-path",
+            documentary,
+            "--mode",
+            "single",
+            "--seed-start",
+            "2607263000",
+            "--output",
+            str(output),
+        ]
+    )
+    launch.prepare_bundle(args)
+    assert observed["dataset_path_override"] == runtime_dataset
+    assert observed["profile_path_override"] == runtime_profile
+    assert observed["expected_documentary_generation_path"] == documentary
+    sealed = json.loads(
+        (output / "local_preflight.json").read_text(encoding="utf-8")
+    )
+    launch._validate_seal(
+        sealed,
+        schema=launch.LOCAL_PREFLIGHT_SCHEMA,
+    )
+    assert sealed["source_relocation"] == relocation
+
+
 def _synthetic_goal_code_manifest(revision: str = "c" * 40):
     records = {
         "artifacts/code/.source-revision": {
