@@ -7,7 +7,10 @@ payload를 읽어 제출만 담당한다.
 
 ## 고정 실행 계약
 
-- population 320, fixed 300 generations, fixed-n-gen termination
+- population 320, fixed 300 evaluated generations, fixed-n-gen termination
+- Pymoo의 종료 후 `algorithm.n_gen` 카운터는 301이다. 결과 계약은
+  `evaluated_generations=300`, `completed_generations=301`을 함께 요구하며,
+  둘 중 하나라도 다르면 거부한다.
 - N1 strata 5, 6, 7, 8
 - `cw1` 1.00–10.00 mm, 0.01 mm grid
 - 25-target G0 generation, 24 models consumed by NSGA
@@ -146,9 +149,10 @@ python tools/mft_goal_20260726_launch.py aggregate `
 `global_terminal_candidates.csv`, `global_pareto_front.csv`,
 `aggregate_manifest.json`이며 입력 result와 공통 모델/데이터/물리 계약 SHA가
 모두 봉인된다. 수집기는 bundle의 원본 task ledger를 읽고 모든 task에 정확히
-한 result가 있는지, seed/N1/population 320/fixed 300 generations와 네 N1
-strata가 일치하는지 확인한다. 임의로 self-seal한 result, 누락/중복 result,
-result 디렉터리 밖 artifact path는 거부한다.
+한 result가 있는지, seed/N1/population 320/fixed 300 evaluated generations,
+Pymoo 종료 카운터 301과 네 N1 strata가 일치하는지 확인한다. 임의로
+self-seal한 result, 누락/중복 result, result 디렉터리 밖 artifact path는
+거부한다.
 
 전역 Pareto에서 선정한 최종 후보는 동일한 fixed operating/cooling identity로
 full model과 symmetric model을 재실행하고 두 `.aedt` 파일 및 FEA 결과 identity를
