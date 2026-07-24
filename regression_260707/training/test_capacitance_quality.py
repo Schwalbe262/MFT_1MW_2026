@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from regression_260707.training.model_quality_gate import evaluate_generation
-from regression_260707.training.checkpoint_train import TARGETS
+from regression_260707.training.checkpoint_train import TRAINABLE_TARGETS
 from regression_260707.training.capacitance_recovery_guard import (
     CAPACITANCE_RECOVERY_CONTRACT,
 )
@@ -126,7 +126,7 @@ class CapacitanceQualityThresholdTests(unittest.TestCase):
     def test_capacitance_thresholds_are_loose_and_advisory(self):
         threshold_path = Path(__file__).with_name("model_quality_thresholds.json")
         targets = json.loads(threshold_path.read_text(encoding="utf-8"))["targets"]
-        self.assertEqual(set(targets), set(TARGETS))
+        self.assertEqual(set(targets), set(TRAINABLE_TARGETS))
 
         expected = {
             "blocking": False,

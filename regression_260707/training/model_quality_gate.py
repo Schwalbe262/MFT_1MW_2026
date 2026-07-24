@@ -25,6 +25,12 @@ DEFAULT_REGISTRY = os.path.join(HERE, "registry")
 DEFAULT_THRESHOLDS = os.path.join(HERE, "model_quality_thresholds.json")
 REGISTRY_SCHEMA_VERSION = 2
 QUALITY_GATE_FILENAME = "quality_gate.json"
+OPTIONAL_GOAL_BODY_TEMPERATURE_TARGETS = {
+    "T_max_Tx",
+    "T_max_Rx_main",
+    "T_max_Rx_side",
+    "T_max_core",
+}
 
 
 def _sha256(path):
@@ -136,8 +142,8 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
     if pointer is not None and pointer.get("dataset_sha256") != dataset_sha:
         reasons.append("pointer_dataset_fingerprint_mismatch")
 
-    configured_targets = thresholds.get("targets")
-    if not isinstance(configured_targets, dict) or not configured_targets:
+    all_configured_targets = thresholds.get("targets")
+    if not isinstance(all_configured_targets, dict) or not all_configured_targets:
         return {
             "passed": False,
             "reasons": [*reasons, "quality_target_inventory_missing"],
@@ -150,8 +156,24 @@ def evaluate_registry(registry, dataset, thresholds, generation=None):
                 "targets": {},
             },
         }
-    required_targets = list(configured_targets)
     report_targets = report.get("targets")
+    legacy_target_set = (
+        set(all_configured_targets)
+        - OPTIONAL_GOAL_BODY_TEMPERATURE_TARGETS
+    )
+    if (
+        isinstance(report_targets, list)
+        and set(report_targets) == legacy_target_set
+        and len(report_targets) == len(legacy_target_set)
+    ):
+        configured_targets = {
+            target: limits
+            for target, limits in all_configured_targets.items()
+            if target in legacy_target_set
+        }
+    else:
+        configured_targets = all_configured_targets
+    required_targets = list(configured_targets)
     if not isinstance(report_targets, list):
         reasons.extend(
             f"{target}:train_report_target_inventory_missing"

@@ -24,6 +24,7 @@ REGRESSION_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 if REGRESSION_ROOT not in sys.path:
     sys.path.insert(0, REGRESSION_ROOT)
 from model_targets import (  # noqa: E402 - direct-script path is installed above
+    BODY_TEMPERATURE_TARGETS,
     SURROGATE_CAPACITANCE_TARGETS,
     SURROGATE_TEMPERATURE_TARGETS,
     SURROGATE_WINDING_COMPONENT_LOSS_TARGETS,
@@ -100,6 +101,15 @@ TARGETS = {
     },
 }
 
+# Additive G0-only outputs.  Keeping these outside TARGETS preserves the
+# default 21-target generation for legacy callers; the goal CLI passes all 25
+# targets explicitly.
+OPTIONAL_TARGETS = {
+    target: {"transform": "t50", "metric_focus": "rmse"}
+    for target in BODY_TEMPERATURE_TARGETS
+}
+TRAINABLE_TARGETS = {**TARGETS, **OPTIONAL_TARGETS}
+
 # 특징량: 입력 파라미터 + 파생 물리량 (결과/메타 컬럼 제외)
 def filter_valid_training_rows(df, target, profile=None):
     """Return strict-full rows satisfying the target-specific contract.
@@ -144,7 +154,10 @@ def filter_valid_training_rows(df, target, profile=None):
                     else pd.Series(False, index=df.index)
                 )
                 keep &= ~recovery_required | recovered
-        if target.startswith("Tprobe"):
+        if target in {
+            *SURROGATE_TEMPERATURE_TARGETS,
+            *BODY_TEMPERATURE_TARGETS,
+        }:
             keep &= values.gt(MIN_TRUSTED_TEMPERATURE_C) & values.lt(
                 MAX_TRUSTED_TEMPERATURE_C
             )

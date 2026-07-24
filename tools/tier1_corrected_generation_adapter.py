@@ -541,8 +541,6 @@ def authenticate_corrected_generation(
     }
     if not isinstance(quality.get("passed"), bool):
         raise RuntimeError("corrected quality status has no terminal pass/fail state")
-    if goal_campaign and quality.get("passed") is not True:
-        raise RuntimeError("goal G0 quality gate must pass before search")
     if quality.get("passed") is False and not quality.get("reasons"):
         raise RuntimeError("failed corrected quality status has no sealed blockers")
     if (

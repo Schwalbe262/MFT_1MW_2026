@@ -3638,7 +3638,10 @@ def _terminal_inference_binding_contract(
         or not isinstance(threads, int)
         or not 1 <= threads <= PRODUCTION_INFERENCE_THREADS
         or isinstance(target_count, bool)
-        or target_count != len(CURRENT_REQUIRED_MODEL_TARGETS)
+        or target_count not in {
+            len(CURRENT_REQUIRED_MODEL_TARGETS),
+            len(GOAL_REQUIRED_MODEL_TARGETS),
+        }
         or isinstance(model_count, bool)
         or not isinstance(model_count, int)
         or model_count < target_count
@@ -4973,7 +4976,7 @@ def attest_semlock_free_repeated_predict(
         "repeats": repeats,
         "sample_rows": 1,
         "target_count": len(required_targets),
-        "predict_call_count": repeats * len(CURRENT_REQUIRED_MODEL_TARGETS),
+        "predict_call_count": repeats * len(required_targets),
         "covered_sklearn_forest_count": forest_count,
         "joblib_thread_pool_construction_attempt_count": 0,
         "multiprocessing_semlock_construction_attempt_count": 0,
@@ -5406,16 +5409,35 @@ def build_relocated_authenticated_runner(
     """Load one relocated generation once and construct one fixed-N1 runner."""
 
     modules = load_current7_modules(code_root)
-    adapter_evidence = validate_adapter_manifest(
-        receipt.get("adapter_manifest"), source_paths_required=False
+    normalized_stage_spec = validate_stage_spec(stage_spec)
+    goal_campaign = is_goal_stage_spec(normalized_stage_spec)
+    expected_required_targets = (
+        GOAL_REQUIRED_MODEL_TARGETS
+        if goal_campaign
+        else CURRENT_REQUIRED_MODEL_TARGETS
     )
+    adapter_evidence = dict(receipt.get("adapter_manifest") or {})
+    if goal_campaign:
+        if (
+            adapter_evidence.get("schema_version")
+            != "mft-goal-20260726-g0-generation-adapter-v1"
+            or adapter_evidence.get("generation_targets")
+            != list(GOAL_G0_MODEL_TARGETS)
+            or adapter_evidence.get("required_model_targets")
+            != list(expected_required_targets)
+        ):
+            raise RuntimeError("relocated goal G0 adapter manifest mismatch")
+    else:
+        adapter_evidence = validate_adapter_manifest(
+            adapter_evidence, source_paths_required=False
+        )
     cache = process_model_cache(
         authenticated,
         train_models_module=modules.train_models,
         predictor_class=modules.predictor.EnsemblePredictor,
     )
     models = cache.load()
-    if tuple(models) != CURRENT_REQUIRED_MODEL_TARGETS or not cache.loaded_once:
+    if tuple(models) != expected_required_targets or not cache.loaded_once:
         raise RuntimeError("relocated models were not authenticated exactly once")
     inference_binding = bind_surrogate_inference(
         models, modules.run_nsga2, threads=inference_threads
@@ -5434,7 +5456,7 @@ def build_relocated_authenticated_runner(
     )
     problem = problem_class(
         models,
-        spec=stage_spec,
+        spec=normalized_stage_spec,
         density_gate=density_gate,
         fixed_primary_turns=fixed_primary_turns,
     )
@@ -6160,9 +6182,17 @@ def _candidate_records(
             fixed_identity = attest_fixed_identity(identity_values)
             goal_identity = {
                 "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+                "hard_spec": copy.deepcopy(runner.problem.stage_spec),
+                "hard_spec_sha256": runner.problem.stage_spec_sha256,
                 "stage_spec_sha256": runner.problem.stage_spec_sha256,
                 "temperature_contract_sha256": (
                     runner.problem.temperature_contract_sha256
+                ),
+                "hard_constraint_contract_sha256": (
+                    runner.problem.hard_constraint_contract_sha256
+                ),
+                "constraint_version": (
+                    runner.problem.hard_constraint_contract["stage"]
                 ),
                 "fixed_operating_cooling_identity": (
                     fixed_identity["observed"]
@@ -6483,6 +6513,7 @@ def _terminal_physical_candidate_frame(
     physical_constraints: Any,
     frame: Any,
     decoder_valid: Any,
+    surrogate_physical_valid: Any,
     source_identity: Mapping[str, Any] | None,
 ) -> Any:
     """Build one provenance-complete row for every terminal individual."""
@@ -6495,6 +6526,9 @@ def _terminal_physical_candidate_frame(
     optimizer_g = np.asarray(optimizer_constraints, dtype=float)
     physical_g = np.asarray(physical_constraints, dtype=float)
     valid = np.asarray(decoder_valid, dtype=bool).reshape(-1)
+    surrogate_valid = np.asarray(
+        surrogate_physical_valid, dtype=bool
+    ).reshape(-1)
     count = len(x)
     expected_g = (count, len(runner.problem.constraint_names))
     if (
@@ -6503,6 +6537,7 @@ def _terminal_physical_candidate_frame(
         or optimizer_g.shape != expected_g
         or physical_g.shape != expected_g
         or valid.shape != (count,)
+        or surrogate_valid.shape != (count,)
         or len(frame) != count
         or not np.isfinite(x).all()
         or not np.isfinite(f).all()
@@ -6517,8 +6552,10 @@ def _terminal_physical_candidate_frame(
         "seed",
         "task_id",
         "bundle_id",
+        "island_id",
         "dataset_sha256",
         "model_artifacts_sha256",
+        "model_generation_sha256",
         "evaluation_spec_sha256",
         "temperature_contract_sha256",
         "hard_constraint_contract_sha256",
@@ -6535,6 +6572,13 @@ def _terminal_physical_candidate_frame(
         if required_source - set(source):
             raise RuntimeError(
                 "goal terminal physical candidate table source identity is incomplete"
+            )
+        if any(
+            source.get(name) in (None, "")
+            for name in required_source
+        ):
+            raise RuntimeError(
+                "goal terminal physical candidate table source identity is null"
             )
         if (
             source["evaluation_spec_sha256"]
@@ -6570,17 +6614,27 @@ def _terminal_physical_candidate_frame(
             name: float(optimizer_g[index, position])
             for position, name in enumerate(runner.problem.constraint_names)
         }
+        physical_constraint_feasible = bool(
+            valid[index]
+            and all(value <= 0.0 for value in physical_values.values())
+        )
+        physical_feasible = bool(
+            physical_constraint_feasible and surrogate_valid[index]
+        )
         row = {
             "terminal_population_index": index,
             "decoder_valid": bool(valid[index]),
+            "surrogate_physical_valid": bool(surrogate_valid[index]),
+            "surrogate_physicality_passed": bool(
+                surrogate_valid[index]
+            ),
             "physical_geometry_sha256": geometry_sha,
             "canonical_physical_params_sha256": physical_params_sha,
             "candidate_physics_sha": candidate_physics_sha,
             "objective_volume_L": float(f[index, 0]),
             "objective_total_loss_W": float(f[index, 1]),
-            "physical_constraint_feasible": bool(
-                valid[index] and all(value <= 0.0 for value in physical_values.values())
-            ),
+            "physical_constraint_feasible": physical_constraint_feasible,
+            "physical_feasible": physical_feasible,
             "physical_G_json": json.dumps(
                 physical_values,
                 sort_keys=True,
@@ -6814,6 +6868,7 @@ def persist_search_outputs(
         physical_constraints=physical_g,
         frame=frame,
         decoder_valid=decoder_valid,
+        surrogate_physical_valid=surrogate_physical_valid,
         source_identity=source_identity,
     )
     paths = {
@@ -6874,6 +6929,11 @@ def persist_search_outputs(
         "columns": list(terminal_physical_candidates.columns),
         "required_identity_columns": [
             "terminal_population_index",
+            "decoder_valid",
+            "surrogate_physical_valid",
+            "surrogate_physicality_passed",
+            "physical_constraint_feasible",
+            "physical_feasible",
             "physical_geometry_sha256",
             "canonical_physical_params_sha256",
             "candidate_physics_sha",
@@ -6884,12 +6944,14 @@ def persist_search_outputs(
             "source_seed",
             "source_task_id",
             "source_bundle_id",
+            "source_island_id",
             "dataset_sha256",
             "evaluation_model_sha256",
             "constraint_spec_sha256",
             "cooling_contract_sha256",
             "operating_point_sha256",
             "evaluation_model_artifacts_sha256",
+            "evaluation_model_generation_sha256",
             "evaluation_spec_sha256",
             "evaluation_temperature_contract_sha256",
             "evaluation_hard_constraint_contract_sha256",

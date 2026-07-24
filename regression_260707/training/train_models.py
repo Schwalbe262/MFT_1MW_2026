@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - exercised by deployed script mode
 from checkpoint_train import (  # noqa: E402
     MAPE_ZERO_ABS_TOLERANCE,
     TARGETS,
+    TRAINABLE_TARGETS,
     feature_columns,
     filter_valid_training_rows,
     inverse_y,
@@ -969,7 +970,7 @@ def _build_candidate(args, frame, features, strict_count, targets, family_params
                 frame,
                 features,
                 target,
-                TARGETS[target],
+                TRAINABLE_TARGETS[target],
                 family_params_for(target),
                 args.weight_col,
                 min_rows=args.min_rows,
@@ -1204,6 +1205,9 @@ def main():
         return family_params_for_target(target, tuned, args.model_threads)
 
     targets = args.targets or list(TARGETS)
+    unknown = [target for target in targets if target not in TRAINABLE_TARGETS]
+    if unknown:
+        raise SystemExit(f"unknown training targets: {unknown}")
     omitted = [target for target in TARGETS if target not in targets]
     if omitted:
         raise SystemExit(

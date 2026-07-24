@@ -6,6 +6,7 @@ from pathlib import Path
 import types
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from module import input_parameter_260706 as current_input
@@ -14,6 +15,7 @@ from regression_260707.verify import finalize
 from tools import tier1_corrected_generation_adapter as adapter
 from tools import tier1_corrected_generation_preflight as preflight
 from tools import tier1_final1000_multiseed_consumer as consumer
+from tools import mft_goal_20260726_launch as launch
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -255,6 +257,214 @@ def test_goal_g0_has_25_targets_and_exact_body_quality_thresholds():
     for target in ("T_max_Tx", "T_max_Rx_main", "T_max_Rx_side", "T_max_core"):
         assert thresholds["targets"][target] == expected
 
+    from regression_260707.training import checkpoint_train
+
+    for target in goal.BODY_WINDING_TEMPERATURE_TARGETS + (
+        *goal.BODY_CORE_TEMPERATURE_TARGETS,
+    ):
+        assert target not in checkpoint_train.TARGETS
+        assert checkpoint_train.OPTIONAL_TARGETS[target] == {
+            "transform": "t50",
+            "metric_focus": "rmse",
+        }
+        outlier = pd.DataFrame(
+            {
+                "_strict_valid_full": [True],
+                target: [5000.0],
+                "physics_data_revision": ["goal-g0"],
+            }
+        )
+        assert checkpoint_train.filter_valid_training_rows(
+            outlier, target
+        ).empty
+    assert len(checkpoint_train.TARGETS) == 21
+    assert set(checkpoint_train.TRAINABLE_TARGETS) == set(
+        goal.GOAL_G0_MODEL_TARGETS
+    )
+
+
+def test_goal_24_model_inference_binding_is_accepted():
+    binding = {
+        "threads_per_model": 8,
+        "target_count": len(adapter.GOAL_REQUIRED_MODEL_TARGETS),
+        "model_count": len(adapter.GOAL_REQUIRED_MODEL_TARGETS),
+        "families": ["extratrees"],
+        "family_threads": {"extratrees": 1},
+        "semaphore_free_families": ["extratrees"],
+        "semaphore_free_sklearn_forest": True,
+        "policy": preflight.FAMILY_SPECIFIC_INFERENCE_POLICY,
+    }
+    assert preflight._terminal_inference_binding_contract(binding) == (True, 8)
+
+
+def test_goal_launcher_builds_isolated_32_seed_canary_rolling_payloads(
+    tmp_path,
+):
+    assignments = launch.seed_assignments(
+        mode="rolling32", seed_start=2607261000
+    )
+    assert len(assignments) == 32
+    assert [item["fixed_primary_turns"] for item in assignments[:4]] == [
+        5,
+        6,
+        7,
+        8,
+    ]
+    assert [item["phase"] for item in assignments[:4]] == ["canary"] * 4
+    assert {
+        turns: sum(
+            item["fixed_primary_turns"] == turns for item in assignments
+        )
+        for turns in goal.GOAL_PRIMARY_TURN_STRATA
+    } == {5: 8, 6: 8, 7: 8, 8: 8}
+    local_preflight = launch._seal(
+        {
+            "schema_version": launch.LOCAL_PREFLIGHT_SCHEMA,
+            "hard_constraint_contract_sha256": "d" * 64,
+            "dataset_sha256": "a" * 64,
+            "evaluation_model_sha256": "b" * 64,
+            "train_report_sha256": "e" * 64,
+            "candidate_sha256": "f" * 64,
+            "quality_status_sha256": "1" * 64,
+            "code": {"revision": "c" * 40},
+            "search_only_proposal": False,
+        }
+    )
+    source = {
+        "generation": "G0",
+        "candidate": "candidate.json",
+        "quality_status": "quality.json",
+        "code_root": "repo",
+        "expected_code_revision": "c" * 40,
+    }
+    bundle, tasks, scheduler = launch.build_bundle_values(
+        local_preflight=local_preflight,
+        assignments=assignments,
+        output_root=tmp_path,
+        source=source,
+    )
+    assert bundle["schema_version"] == launch.BUNDLE_SCHEMA
+    assert bundle["task_count"] == 32
+    assert bundle["legacy_current7_bundle_or_release_identity_reused"] is False
+    assert bundle["relocation_contract"]["schema_version"] == (
+        launch.RELOCATION_SCHEMA
+    )
+    assert bundle["relocation_contract"][
+        "source_absolute_paths_are_not_worker_authority"
+    ] is True
+    assert scheduler["maximum_parallel_tasks"] == 32
+    assert scheduler["canary_seed_count"] == 4
+    assert scheduler["scheduler_submission_performed"] is False
+    assert all(launch.validate_task_payload(task) is task for task in tasks)
+    assert all(task["population"] == 320 for task in tasks)
+    assert all(task["generations"] == 300 for task in tasks)
+    assert all(
+        task["temperature_contract_sha256"]
+        == goal.GOAL_TEMPERATURE_CONTRACT_SHA256
+        for task in tasks
+    )
+
+
+def test_goal_launcher_task_rejects_legacy_scalar_temperature():
+    assignment = launch.seed_assignments(
+        mode="single", seed_start=2607260001, fixed_primary_turns=8
+    )
+    local_preflight = launch._seal(
+        {
+            "schema_version": launch.LOCAL_PREFLIGHT_SCHEMA,
+            "hard_constraint_contract_sha256": "d" * 64,
+            "dataset_sha256": "a" * 64,
+            "evaluation_model_sha256": "b" * 64,
+            "train_report_sha256": "e" * 64,
+            "candidate_sha256": "f" * 64,
+            "quality_status_sha256": "1" * 64,
+            "code": {"revision": "c" * 40},
+            "search_only_proposal": True,
+        }
+    )
+    _bundle, tasks, _scheduler = launch.build_bundle_values(
+        local_preflight=local_preflight,
+        assignments=assignment,
+        output_root=Path("."),
+        source={
+            "generation": "G0",
+            "candidate": "candidate.json",
+            "quality_status": "quality.json",
+            "code_root": "repo",
+            "expected_code_revision": "c" * 40,
+        },
+    )
+    forged = copy.deepcopy(tasks[0])
+    forged.pop("payload_sha256")
+    forged["stage_spec"]["T_limit_C"] = 100.0
+    forged = launch._seal(forged)
+    with pytest.raises(goal.GoalContractError, match="legacy fields"):
+        launch.validate_task_payload(forged)
+
+
+def test_goal_launcher_scales_to_authenticated_512_seed_rollout():
+    assignments = launch.seed_assignments(
+        mode="rolling",
+        seed_start=2607262000,
+        seed_count=512,
+        wave_size=32,
+    )
+    assert len(assignments) == 512
+    assert sum(item["phase"] == "canary" for item in assignments) == 4
+    assert len({item["seed"] for item in assignments}) == 512
+    assert {
+        turns: sum(
+            item["fixed_primary_turns"] == turns for item in assignments
+        )
+        for turns in goal.GOAL_PRIMARY_TURN_STRATA
+    } == {5: 128, 6: 128, 7: 128, 8: 128}
+    assert max(item["wave"] for item in assignments) == 16
+
+
+def test_failed_g0_quality_is_sealed_as_search_only_without_lowering_thresholds():
+    thresholds_path = (
+        REPO
+        / "regression_260707"
+        / "training"
+        / "model_quality_thresholds.json"
+    )
+    thresholds = json.loads(thresholds_path.read_text(encoding="utf-8"))
+    metrics = {
+        "r2": 0.80,
+        "rmse": 5.5,
+        "p90_ape_pct": 11.0,
+        "interval_p90_width": 11.0,
+    }
+    quality = {
+        "passed": False,
+        "reasons": ["T_max_Tx:metric_below_minimum:r2"],
+        "thresholds_sha256": goal.canonical_sha256(thresholds),
+        "targets": {
+                target: {
+                    "passed": False,
+                    "blocking": True,
+                    "reasons": [
+                        "metric_below_minimum:r2",
+                        "metric_above_maximum:rmse",
+                        "metric_above_maximum:p90_ape_pct",
+                        "metric_above_maximum:interval_p90_width",
+                    ],
+                "metrics": metrics,
+            }
+            for target in goal.GOAL_TEMPERATURE_TARGETS
+        },
+    }
+    contract = launch._quality_contract(quality=quality, code_root=REPO)
+    assert contract["quality_passed"] is False
+    assert contract["search_only_proposal"] is True
+    assert contract["thresholds_lowered_or_bypassed"] is False
+    assert contract["temperature_target_count"] == 11
+    assert set(contract["temperature_status"]) == set(
+        goal.GOAL_TEMPERATURE_TARGETS
+    )
+    assert contract["production_eligible"] is False
+    assert contract["automatic_promotion_allowed"] is False
+
 
 def _valid_goal_fea_result():
     problem = _goal_problem(5)
@@ -353,6 +563,8 @@ def test_terminal_320_table_contains_physical_dedupe_and_provenance():
     )
     physical_g = np.full((count, problem.n_ieq_constr), -1.0)
     normalized_g = np.full((count, problem.n_ieq_constr), -0.5)
+    surrogate_valid = np.ones(count, dtype=bool)
+    surrogate_valid[7] = False
     source = {
         "seed": 42,
         "task_id": "87052",
@@ -377,6 +589,7 @@ def test_terminal_320_table_contains_physical_dedupe_and_provenance():
         physical_constraints=physical_g,
         frame=frame,
         decoder_valid=valid,
+        surrogate_physical_valid=surrogate_valid,
         source_identity=source,
     )
     assert len(table) == 320
@@ -389,6 +602,11 @@ def test_terminal_320_table_contains_physical_dedupe_and_provenance():
     assert table["source_seed"].unique().tolist() == [42]
     assert table["source_task_id"].unique().tolist() == ["87052"]
     assert table["source_bundle_id"].unique().tolist() == ["goal-bundle"]
+    assert table["surrogate_physical_valid"].sum() == 319
+    assert table["surrogate_physicality_passed"].sum() == 319
+    assert table["physical_constraint_feasible"].all()
+    assert table["physical_feasible"].sum() == 319
+    assert table.loc[7, "physical_feasible"] == False
     assert table["evaluation_model_artifacts_sha256"].unique().tolist() == [
         "a" * 64
     ]
@@ -417,5 +635,197 @@ def test_terminal_320_table_contains_physical_dedupe_and_provenance():
             physical_constraints=physical_g[:-1],
             frame=frame.iloc[:-1],
             decoder_valid=valid[:-1],
+            surrogate_physical_valid=surrogate_valid[:-1],
             source_identity=source,
         )
+
+
+def _write_synthetic_goal_seed_result(root: Path, *, seed: int) -> Path:
+    root.mkdir()
+    constraints = list(preflight.GOAL_CONSTRAINT_NAMES)
+    task_sha = goal.canonical_sha256({"synthetic_task_seed": seed})
+    rows = []
+    for index in range(launch.POPULATION):
+        if index == 0:
+            volume, loss = (
+                (100.0, 200.0) if seed == 101 else (110.0, 190.0)
+            )
+        elif seed == 101 and index == 1:
+            # Physical G alone passes, but a negative objective must remain
+            # quarantined by the canonical surrogate-physicality evidence.
+            volume, loss = -100.0, -100.0
+        else:
+            volume, loss = 1000.0 + index, 1000.0 + index
+        surrogate_valid = not (seed == 101 and index == 1)
+        geometry_sha = goal.canonical_sha256(
+            {"seed": seed, "terminal_population_index": index}
+        )
+        row = {
+            "terminal_population_index": index,
+            "decoder_valid": True,
+            "surrogate_physical_valid": surrogate_valid,
+            "surrogate_physicality_passed": surrogate_valid,
+            "physical_constraint_feasible": True,
+            "physical_feasible": surrogate_valid,
+            "physical_geometry_sha256": geometry_sha,
+            "canonical_physical_params_sha256": geometry_sha,
+            "candidate_physics_sha": geometry_sha,
+            "objective_volume_L": volume,
+            "objective_total_loss_W": loss,
+            "physical_G_json": "{}",
+            "normalized_G_json": "{}",
+            "coordinate_unit_json": "[]",
+            "decoded_physical_params_json": "{}",
+            "source_seed": seed,
+            "source_task_id": f"task-{seed}",
+            "source_bundle_id": task_sha,
+            "source_island_id": f"n1-{5 + (seed % 2)}",
+            "dataset_sha256": "a" * 64,
+            "evaluation_model_sha256": "b" * 64,
+            "constraint_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
+            "cooling_contract_sha256": (
+                goal.FIXED_COOLING_IDENTITY_SHA256
+            ),
+            "operating_point_sha256": (
+                goal.FIXED_OPERATING_IDENTITY_SHA256
+            ),
+            "evaluation_model_artifacts_sha256": "b" * 64,
+            "evaluation_model_generation_sha256": "c" * 64,
+            "evaluation_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
+            "evaluation_temperature_contract_sha256": (
+                goal.GOAL_TEMPERATURE_CONTRACT_SHA256
+            ),
+            "evaluation_hard_constraint_contract_sha256": "d" * 64,
+        }
+        row.update({f"physical_G:{name}": -1.0 for name in constraints})
+        row.update({f"normalized_G:{name}": -0.5 for name in constraints})
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    table_path = root / "terminal_physical_candidates.csv"
+    table.to_csv(table_path, index=False)
+    manifest = launch._seal(
+        {
+            "schema_version": preflight.GOAL_TERMINAL_TABLE_SCHEMA,
+            "goal_contract_required": True,
+            "row_count": launch.POPULATION,
+            "terminal_population_index_min": 0,
+            "terminal_population_index_max": launch.POPULATION - 1,
+            "columns": list(table.columns),
+            "required_identity_columns": list(table.columns),
+            "csv": {
+                "path": table_path.name,
+                "sha256": adapter.sha256_file(table_path),
+                "size_bytes": table_path.stat().st_size,
+            },
+            "source_identity": {"seed": seed},
+            "stage_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
+            "temperature_contract_sha256": (
+                goal.GOAL_TEMPERATURE_CONTRACT_SHA256
+            ),
+            "hard_constraint_contract_sha256": "d" * 64,
+            "one_row_per_terminal_individual": True,
+            "physical_deduplication_key": "physical_geometry_sha256",
+            "global_pareto_provenance_ready": True,
+        }
+    )
+    manifest_path = root / "terminal_physical_candidates.manifest.json"
+    launch._atomic_json(manifest_path, manifest)
+    inventory = {
+        "terminal_physical_candidates": {
+            "path": table_path.name,
+            "sha256": adapter.sha256_file(table_path),
+            "size_bytes": table_path.stat().st_size,
+        },
+        "terminal_physical_candidates_manifest": {
+            "path": manifest_path.name,
+            "sha256": adapter.sha256_file(manifest_path),
+            "size_bytes": manifest_path.stat().st_size,
+        },
+    }
+    result = launch._seal(
+        {
+            "schema_version": launch.SEARCH_RESULT_SCHEMA,
+            "campaign_id": "mft-goal-20260726",
+            "goal_contract_schema": goal.GOAL_CONTRACT_SCHEMA,
+            "task_payload_sha256": task_sha,
+            "seed": seed,
+            "fixed_primary_turns": 5 + (seed % 2),
+            "population": launch.POPULATION,
+            "generations": launch.GENERATIONS,
+            "evaluated_generations": launch.GENERATIONS,
+            "completed_generations": launch.GENERATIONS,
+            "stage_spec": copy.deepcopy(goal.GOAL_STAGE_SPEC),
+            "hard_spec": copy.deepcopy(goal.GOAL_STAGE_SPEC),
+            "hard_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
+            "stage_spec_sha256": goal.GOAL_STAGE_SPEC_SHA256,
+            "constraint_version": "mft-goal-20260726",
+            "temperature_contract_sha256": (
+                goal.GOAL_TEMPERATURE_CONTRACT_SHA256
+            ),
+            "hard_constraint_contract_sha256": "d" * 64,
+            "dataset_sha256": "a" * 64,
+            "evaluation_model_sha256": "b" * 64,
+            "operating_point_sha256": (
+                goal.FIXED_OPERATING_IDENTITY_SHA256
+            ),
+            "cooling_contract_sha256": (
+                goal.FIXED_COOLING_IDENTITY_SHA256
+            ),
+            "constraint_names": constraints,
+            "temperature_targets": list(goal.GOAL_TEMPERATURE_TARGETS),
+            "terminal_population_count": launch.POPULATION,
+            "physical_feasible_count": (
+                launch.POPULATION - (1 if seed == 101 else 0)
+            ),
+            "feasible_pareto_count": 1,
+            "artifact_inventory": inventory,
+            "artifact_inventory_sha256": goal.canonical_sha256(inventory),
+            "terminal_physical_candidates_manifest": manifest,
+            "legacy_current7_stage_or_release_identity_reused": False,
+            "search_only_proposal": False,
+            "production_eligible": False,
+            "fea_submission_performed": False,
+            "automatic_promotion_allowed": False,
+        }
+    )
+    result_path = root / "result.json"
+    launch._atomic_json(result_path, result)
+    return result_path
+
+
+def test_global_pareto_recomputes_from_all_terminal_rows_and_physicality(
+    tmp_path,
+):
+    results = [
+        _write_synthetic_goal_seed_result(tmp_path / "seed-101", seed=101),
+        _write_synthetic_goal_seed_result(tmp_path / "seed-102", seed=102),
+    ]
+    manifest_path = launch.aggregate_results(
+        result_paths=results,
+        output=tmp_path / "global",
+        minimum_seeds=2,
+    )
+    manifest = launch._validate_seal(
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+        schema=launch.GLOBAL_PARETO_SCHEMA,
+    )
+    assert manifest["input_terminal_row_count"] == 640
+    assert manifest["physical_feasible_count"] == 639
+    assert manifest["global_pareto_count"] == 2
+    assert manifest["seed_local_pareto_merge_used"] is False
+    pareto = pd.read_csv(tmp_path / "global" / "global_pareto_front.csv")
+    assert sorted(
+        zip(
+            pareto["objective_volume_L"],
+            pareto["objective_total_loss_W"],
+        )
+    ) == [(100.0, 200.0), (110.0, 190.0)]
+    merged = pd.read_csv(
+        tmp_path / "global" / "global_terminal_candidates.csv"
+    )
+    quarantined = merged.loc[
+        (merged["source_seed"] == 101)
+        & (merged["terminal_population_index"] == 1)
+    ].iloc[0]
+    assert bool(quarantined["physical_feasible"]) is False
+    assert quarantined["global_non_dominated_rank"] == -1
