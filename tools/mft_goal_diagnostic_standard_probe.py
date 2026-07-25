@@ -200,7 +200,6 @@ MESH_QUALITY_CANARY_EVIDENCE_SCHEMA = (
 )
 MESH_QUALITY_CANARY_LOGICAL_TASK_ID = 96225
 MESH_QUALITY_CANARY_FAILED_TASK_ID = 96264
-MESH_QUALITY_CANARY_RECEIPT_RECOVERY_TASK_ID = 96300
 MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS = frozenset(
     {96269, 96271, 96272}
 )
@@ -4666,8 +4665,14 @@ def _mesh_quality_canary_submitted_payload_readback(
     remote_dir = str(snapshot.get("remote_dir") or "").strip()
     direct_id = snapshot.get("id")
     direct_task_id = snapshot.get("task_id")
+    logical_task_id, source_task_id = _mesh_quality_canary_source_ids(
+        plan
+    )
     if (
-        task_id != MESH_QUALITY_CANARY_RECEIPT_RECOVERY_TASK_ID
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or task_id in {logical_task_id, source_task_id}
         or direct_id != task_id
         or direct_task_id != task_id
         or submitted_payload != expected_payload
@@ -4799,7 +4804,7 @@ def _mesh_quality_canary_receipt_recovery_contract(
         "inventory_before": copy.deepcopy(inventory_before),
         "inventory_after": copy.deepcopy(inventory_after),
         "api_methods_used": [
-            "GET /api/tasks/96300",
+            f"GET /api/tasks/{task_id}",
             "GET /api/tasks?project=MFT_1MW_2026v1&name_prefix="
             + plan["stage"]["task_name"],
         ],
@@ -4853,8 +4858,9 @@ def _validate_mesh_quality_canary_receipt_recovery(
             "post_created_task_durable_but_immediate_inventory_readback_"
             "missed_receipt"
         )
-        or value.get("task_id")
-        != MESH_QUALITY_CANARY_RECEIPT_RECOVERY_TASK_ID
+        or isinstance(value.get("task_id"), bool)
+        or not isinstance(value.get("task_id"), int)
+        or value["task_id"] <= 0
         or value.get("task_id") != submission.get("task_id")
         or value.get("plan_payload_sha256") != plan["payload_sha256"]
         or value.get("scheduler_get_count") != 4
@@ -4900,7 +4906,7 @@ def _validate_mesh_quality_canary_receipt_recovery(
         "submitted_payload",
     )
     expected_api_methods = [
-        "GET /api/tasks/96300",
+        f"GET /api/tasks/{int(value['task_id'])}",
         "GET /api/tasks?project=MFT_1MW_2026v1&name_prefix="
         + plan["stage"]["task_name"],
     ]
@@ -7725,26 +7731,24 @@ def reconcile_mesh_quality_canary_submission(
     expected_account_name: str,
     expected_node_name: str,
 ) -> Path:
-    """Recover the receipt for existing task 96300 using bounded GETs only."""
+    """Recover one exact-plan canary receipt using bounded GETs only."""
 
     plan, _params, selected = _load_plan(plan_path)
-    if (
-        _plan_retry_kind(plan) != "mesh_quality_canary"
-        or task_id != MESH_QUALITY_CANARY_RECEIPT_RECOVERY_TASK_ID
-    ):
+    if _plan_retry_kind(plan) != "mesh_quality_canary":
         raise HandoffContractError(
-            "receipt recovery is restricted to exact mesh canary task 96300"
+            "receipt recovery requires an exact mesh-quality canary plan"
         )
-    recovery_logical_task_id, recovery_source_task_id = (
+    logical_task_id, source_task_id = (
         _mesh_quality_canary_source_ids(plan)
     )
     if (
-        recovery_logical_task_id != MESH_QUALITY_CANARY_LOGICAL_TASK_ID
-        or recovery_source_task_id
-        != MESH_QUALITY_CANARY_FAILED_TASK_ID
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or task_id in {logical_task_id, source_task_id}
     ):
         raise HandoffContractError(
-            "receipt recovery is restricted to exact task 96300 ancestry"
+            "receipt recovery task ID conflicts with exact source lineage"
         )
     strict_node_contract = _plan_strict_node_contract(plan)
     strict_node_pin = _strict_node_scheduler_pin(
@@ -7789,11 +7793,11 @@ def reconcile_mesh_quality_canary_submission(
         live_execution = _mesh_quality_failure_evidence(
             reader(
                 scheduler_url=stage["scheduler_url"],
-                task_id=recovery_source_task_id,
+                task_id=source_task_id,
             ),
             read_stdout(
                 scheduler_url=stage["scheduler_url"],
-                task_id=recovery_source_task_id,
+                task_id=source_task_id,
             ),
             submission=original_submission,
         )

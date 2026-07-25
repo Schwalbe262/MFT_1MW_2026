@@ -2870,6 +2870,98 @@ def test_mesh_quality_canary_receipt_recovery_is_get_only_and_state_safe():
     assert recovery["scheduler_submit_call_performed"] is False
     assert recovery["scheduler_cancel_call_performed"] is False
     assert recovery["historical_post_provenance_claimed"] is False
+    generic_name = (
+        "mft-goal-diag-standard-mesh-canary-r1-"
+        "l96220-05580bda40b2"
+    )
+    generic_dedupe = (
+        "mft-al:mft-goal-diag-standard-mesh-canary-r1-"
+        "l96220-05580bda40b2:"
+        + "f" * 40
+        + ":"
+        + "e" * 40
+        + ":c36b4ee4a75f4162"
+    )
+    generic_plan = {
+        **plan,
+        "retry_of_mesh_quality_canary": {
+            "logical_authority_task_id": 96220,
+            "retry_of_task_id": 96262,
+        },
+        "stage": {
+            **plan["stage"],
+            "task_name": generic_name,
+            "retained_aedt_bundle": {"dedupe_key": generic_dedupe},
+        },
+    }
+    generic_running = {
+        **running,
+        "task_id": 96301,
+        "id": 96301,
+        "name": generic_name,
+        "dedupe_key": generic_dedupe,
+        "remote_dir": "slurm_scheduler/runs/2026-07-25/task-96301",
+    }
+    generic_completed = {
+        **generic_running,
+        "status": "completed",
+        "state": "succeeded",
+        "finished_at": "2026-07-25 12:47:07",
+    }
+    generic_before = probe._mesh_quality_canary_sibling_snapshot(
+        [generic_running], plan=generic_plan
+    )
+    generic_after = probe._mesh_quality_canary_sibling_snapshot(
+        [generic_completed], plan=generic_plan
+    )
+    generic_recovery = (
+        probe._mesh_quality_canary_receipt_recovery_contract(
+            plan=generic_plan,
+            task_id=96301,
+            task_before=generic_running,
+            task_after=generic_completed,
+            inventory_before=generic_before,
+            inventory_after=generic_after,
+        )
+    )
+    probe._validate_mesh_quality_canary_receipt_recovery(
+        generic_recovery,
+        plan=generic_plan,
+        submission={"task_id": 96301},
+    )
+    assert generic_recovery["api_methods_used"][0] == (
+        "GET /api/tasks/96301"
+    )
+    assert generic_recovery["scheduler_mutation_count"] == 0
+    with pytest.raises(
+        production.HandoffContractError,
+        match="strict-node Scheduler identity drifted",
+    ):
+        probe._mesh_quality_canary_receipt_recovery_contract(
+            plan=generic_plan,
+            task_id=96302,
+            task_before=generic_running,
+            task_after=generic_completed,
+            inventory_before=generic_before,
+            inventory_after=generic_after,
+        )
+    source_identity = {
+        **generic_running,
+        "task_id": 96262,
+        "id": 96262,
+    }
+    with pytest.raises(
+        production.HandoffContractError,
+        match="recovered submitted payload drifted",
+    ):
+        probe._mesh_quality_canary_receipt_recovery_contract(
+            plan=generic_plan,
+            task_id=96262,
+            task_before=source_identity,
+            task_after=source_identity,
+            inventory_before=generic_before,
+            inventory_after=generic_after,
+        )
     malformed = copy.deepcopy(recovery)
     malformed["task_get_after"]["submitted_payload"] = []
     with pytest.raises(
