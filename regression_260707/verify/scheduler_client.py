@@ -709,6 +709,13 @@ def retained_aedt_identity(
                     "goal_diagnostic_standard_timeout12h_retry.json"
                 ),
                 (
+                    "mft-goal-diagnostic-standard-g3dmesher-"
+                    "high-memory-profile-v1"
+                ): (
+                    "goal_diagnostic_standard_g3dmesher_"
+                    "high_memory_retry.json"
+                ),
+                (
                     "mft-goal-diagnostic-standard-mesh-quality-"
                     "canary-profile-v1"
                 ): (
