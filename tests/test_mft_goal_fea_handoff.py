@@ -1085,6 +1085,87 @@ def test_retained_export_script_writes_scheduler_marker_receipt_and_chunks(
     ]
 
 
+def test_project_only_retained_export_hard_cap_fails_before_outputs(
+    tmp_path,
+):
+    profile, _record = handoff._profile_content("full")
+    retained = scheduler_client.retained_aedt_identity(
+        "provisional-full-hard-cap-test",
+        {"x": 1},
+        profile,
+        "2" * 40,
+        "3" * 40,
+        retained_aedt_max_bytes=4096,
+    )
+    assert retained["source_size_hard_cap_bytes"] == 4096
+    assert retained["source_size_hard_cap_contract"] == (
+        "pre-gpfs-destination-create-v1"
+    )
+    command = scheduler_client._retained_aedt_export_command(retained)
+    tokens = shlex.split(command)
+    index = tokens.index("-c")
+    script = tokens[index + 1]
+    marker_contract_json = tokens[index + 7]
+    receipt_context_json = tokens[index + 8]
+    receipt_context = json.loads(receipt_context_json)
+    assert receipt_context["source_size_hard_cap_bytes"] == 4096
+    assert receipt_context[
+        "source_size_hard_cap_enforced_before_destination_create"
+    ] is True
+
+    source = tmp_path / "oversized-project.aedt"
+    source.write_bytes(b"x" * 4097)
+    destination = tmp_path / retained["artifact_path"]
+    receipt = tmp_path / retained["receipt_path"]
+    marker = tmp_path / retained["marker_path"]
+    chunk_dir = tmp_path / retained["transport"]["chunk_directory"]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(source),
+            str(destination),
+            str(receipt),
+            str(marker),
+            str(chunk_dir),
+            marker_contract_json,
+            receipt_context_json,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "outside transport bounds" in completed.stderr
+    assert not destination.parent.parent.exists()
+    assert not destination.exists()
+    assert not receipt.exists()
+    assert not marker.exists()
+    assert not chunk_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        0,
+        scheduler_client.RETAINED_AEDT_MAX_BYTES + 1,
+    ],
+)
+def test_retained_export_hard_cap_rejects_invalid_values(value):
+    profile, _record = handoff._profile_content("full")
+    with pytest.raises(ValueError, match="max bytes"):
+        scheduler_client.retained_aedt_identity(
+            "provisional-full-invalid-hard-cap",
+            {"x": 1},
+            profile,
+            "2" * 40,
+            "3" * 40,
+            retained_aedt_max_bytes=value,
+        )
+
+
 def test_runtime_license_snapshot_is_compute_start_bound(
     tmp_path, monkeypatch
 ):

@@ -619,7 +619,8 @@ def verification_submission_identity(
 
 
 def retained_aedt_identity(
-        name, params, profile, solver_revision, library_revision):
+        name, params, profile, solver_revision, library_revision,
+        retained_aedt_max_bytes=None):
     """Return the exact opt-in remote AEDT retention identity.
 
     Generic AL profiles have no ``artifact_retention`` object and preserve the
@@ -629,7 +630,22 @@ def retained_aedt_identity(
     """
     retention = profile.get("artifact_retention")
     if retention is None:
+        if retained_aedt_max_bytes is not None:
+            raise ValueError(
+                "retained AEDT max bytes requires artifact retention"
+            )
         return None
+    if (
+        retained_aedt_max_bytes is not None
+        and (
+            isinstance(retained_aedt_max_bytes, bool)
+            or not isinstance(retained_aedt_max_bytes, int)
+            or not 0 < retained_aedt_max_bytes <= RETAINED_AEDT_MAX_BYTES
+        )
+    ):
+        raise ValueError(
+            "retained AEDT max bytes must be a positive transport-bounded integer"
+        )
     required = {
         "schema_version",
         "stage",
@@ -654,6 +670,10 @@ def retained_aedt_identity(
         RETAINED_AEDT_BUNDLE_SCHEMA,
         RETAINED_AEDT_TRUTH_FULL_BUNDLE_SCHEMA,
     }
+    if bundle_retention and retained_aedt_max_bytes is not None:
+        raise ValueError(
+            "retained AEDT max bytes is project-only retention"
+        )
     stage = str(retention.get("stage") or "")
     artifact = str(retention.get("artifact_filename") or "")
     receipt = str(retention.get("receipt_filename") or "")
@@ -849,6 +869,15 @@ def retained_aedt_identity(
         "retention_required": True,
         "prune_protection_required": True,
     }
+    if retained_aedt_max_bytes is not None:
+        retained.update(
+            {
+                "source_size_hard_cap_bytes": retained_aedt_max_bytes,
+                "source_size_hard_cap_contract": (
+                    "pre-gpfs-destination-create-v1"
+                ),
+            }
+        )
     if bundle_retention:
         retained.update(
             {
@@ -876,7 +905,20 @@ def _retained_aedt_export_command(retained):
         RETAINED_AEDT_BUNDLE_SCHEMA,
         RETAINED_AEDT_TRUTH_FULL_BUNDLE_SCHEMA,
     }:
+        if "source_size_hard_cap_bytes" in retained:
+            raise ValueError(
+                "retained AEDT max bytes is project-only retention"
+            )
         return _retained_aedt_bundle_export_command(retained)
+    source_size_hard_cap_bytes = retained.get(
+        "source_size_hard_cap_bytes", RETAINED_AEDT_MAX_BYTES
+    )
+    if (
+        isinstance(source_size_hard_cap_bytes, bool)
+        or not isinstance(source_size_hard_cap_bytes, int)
+        or not 0 < source_size_hard_cap_bytes <= RETAINED_AEDT_MAX_BYTES
+    ):
+        raise ValueError("retained AEDT source-size hard cap is invalid")
     marker_contract_json = json.dumps(
         retained["marker_contract"],
         sort_keys=True,
@@ -905,6 +947,23 @@ def _retained_aedt_export_command(retained):
         "prune_protection_required": True,
         "scheduler_cleanup_exclusion_required": True,
     }
+    if "source_size_hard_cap_bytes" in retained:
+        if (
+            retained.get("source_size_hard_cap_contract")
+            != "pre-gpfs-destination-create-v1"
+        ):
+            raise ValueError(
+                "retained AEDT source-size hard-cap contract is invalid"
+            )
+        receipt_context.update(
+            {
+                "source_size_hard_cap_bytes": source_size_hard_cap_bytes,
+                "source_size_hard_cap_contract": (
+                    "pre-gpfs-destination-create-v1"
+                ),
+                "source_size_hard_cap_enforced_before_destination_create": True,
+            }
+        )
     receipt_context_json = json.dumps(
         receipt_context,
         sort_keys=True,
@@ -923,7 +982,7 @@ def _retained_aedt_export_command(retained):
         "separators=(',',':'))+'\\n').encode('utf-8');"
         "context=json.loads(sys.argv[7]);"
         f"source_size=src.stat().st_size;"
-        f"\nif not 0<source_size<={RETAINED_AEDT_MAX_BYTES}:"
+        f"\nif not 0<source_size<={source_size_hard_cap_bytes}:"
         " raise RuntimeError('retained AEDT size is outside transport bounds')\n"
         "dst.parent.parent.mkdir(parents=True,exist_ok=True);"
         "dst.parent.mkdir(exist_ok=False);"
@@ -1286,6 +1345,7 @@ def submit_verification(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
+        retained_aedt_max_bytes=None,
         same_node_as_task_id=0, node_name_policy="",
         submission_env_after_workdir=False, required_workdir_prefix="",
         return_submission_evidence=False, pre_submit_guard=None,
@@ -1305,6 +1365,10 @@ def submit_verification(
         submission_options["submission_env"] = submission_env
     if required_hard_cap is not None:
         submission_options["required_hard_cap"] = required_hard_cap
+    if retained_aedt_max_bytes is not None:
+        submission_options["retained_aedt_max_bytes"] = (
+            retained_aedt_max_bytes
+        )
     if same_node_as_task_id:
         submission_options["same_node_as_task_id"] = same_node_as_task_id
     if node_name_policy not in (None, ""):
@@ -1358,6 +1422,7 @@ def _submit_verification_locked(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
+        retained_aedt_max_bytes=None,
         same_node_as_task_id=0, node_name_policy="",
         submission_env_after_workdir=False, required_workdir_prefix="",
         return_submission_evidence=False, pre_submit_guard=None,
@@ -1405,6 +1470,17 @@ def _submit_verification_locked(
         )
     if not isinstance(return_submission_evidence, bool):
         raise TypeError("return_submission_evidence must be a bool")
+    if (
+        retained_aedt_max_bytes is not None
+        and (
+            isinstance(retained_aedt_max_bytes, bool)
+            or not isinstance(retained_aedt_max_bytes, int)
+            or not 0 < retained_aedt_max_bytes <= RETAINED_AEDT_MAX_BYTES
+        )
+    ):
+        raise ValueError(
+            "retained AEDT max bytes must be a positive transport-bounded integer"
+        )
     if pre_submit_guard is not None and not callable(pre_submit_guard):
         raise TypeError("pre_submit_guard must be callable")
     if not isinstance(submission_env_after_workdir, bool):
@@ -1431,7 +1507,12 @@ def _submit_verification_locked(
     identity = verification_submission_identity(
         name, params, profile, solver_revision, library_revision)
     retained = retained_aedt_identity(
-        name, params, profile, solver_revision, library_revision
+        name,
+        params,
+        profile,
+        solver_revision,
+        library_revision,
+        retained_aedt_max_bytes=retained_aedt_max_bytes,
     )
     solver_revision = identity["solver_revision"]
     library_revision = identity["library_revision"]

@@ -126,6 +126,40 @@ def test_exact_capacity_fails_closed_without_r1_n114(
         )
 
 
+def test_exact_capacity_uses_alternate_account_and_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = {
+        "allocations": [
+            {
+                "account_name": "dhj02",
+                "node_name": "n116",
+                "free_cpus": 64,
+                "free_memory_mb": 818562,
+                "slurm_job_id": "829952",
+            }
+        ]
+    }
+    observed: dict[str, Any] = {}
+
+    def capacity(**kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return response
+
+    monkeypatch.setattr(provisional.fastlane, "_require_account_capacity", capacity)
+    result = provisional._exact_capacity(
+        live_reader=lambda **_kwargs: {},
+        scheduler_url="scheduler",
+        selected_account_name="dhj02",
+        requested_node_name="n116",
+    )
+    assert observed["account_name"] == "dhj02"
+    assert result["selected_account_name"] == "dhj02"
+    assert result["requested_node_name"] == "n116"
+    assert result["selected_allocation"]["slurm_job_id"] == "829952"
+    assert "account_name=dhj02" in result["capacity_endpoint"]
+
+
 def test_parallel_active_standard_bounds_are_reserved_and_unknown_fea_fails() -> None:
     plan = {
         "active_standard_storage_authorities": [
@@ -164,6 +198,152 @@ def test_parallel_active_standard_bounds_are_reserved_and_unknown_fea_fails() ->
         )
 
 
+def test_alternate_quota_ignores_r1_standards_but_blocks_unbounded_selected_fea() -> (
+    None
+):
+    plan = {
+        "selected_account_name": "dhj02",
+        "active_standard_storage_authorities": [
+            {
+                "logical_authority_task_id": 96230,
+                "task_name": "standard-b7",
+                "dedupe_key": "dedupe-b7",
+                "account_name": provisional.SOURCE_ACCOUNT_NAME,
+                "fresh_grid_output_bytes": 20 * 1024**3,
+                "fresh_grid_output_gib": 20.0,
+                "bound_source": "authenticated_timeout_native_premesh_grid_bytes",
+            }
+        ],
+    }
+    r1_standard = {
+        "task_id": 96304,
+        "id": 96304,
+        "name": "standard-b7",
+        "dedupe_key": "dedupe-b7",
+        "account_name": provisional.SOURCE_ACCOUNT_NAME,
+        "requested_account_name": provisional.SOURCE_ACCOUNT_NAME,
+        "aedt_backend": "standalone",
+    }
+    result = provisional._active_storage_reservation(plan, [r1_standard])
+    assert result["selected_account_name"] == "dhj02"
+    assert result["active_bounded_task_count"] == 0
+    assert result["active_storage_bound_bytes"] == 0
+    assert result["nonselected_account_fea_tasks"] == [
+        {"task_id": 96304, "account_name": provisional.SOURCE_ACCOUNT_NAME}
+    ]
+    with pytest.raises(
+        provisional.HandoffContractError,
+        match="active dhj02 MFT FEA task lacks authenticated",
+    ):
+        provisional._active_storage_reservation(
+            plan,
+            [
+                r1_standard,
+                {
+                    **r1_standard,
+                    "task_id": 97001,
+                    "id": 97001,
+                    "name": "unrelated-full",
+                    "dedupe_key": "unbounded",
+                    "account_name": "dhj02",
+                    "requested_account_name": "dhj02",
+                },
+            ],
+        )
+
+
+def test_alternate_gpfs_uses_only_selected_user_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fresh_storage(value: dict[str, Any]) -> dict[str, Any]:
+        captured.update(value)
+        return {
+            "schema_version": "mft-goal-safe-refill-gpfs-probe-v1",
+            "account_name": "dhj02",
+            "limiting_quota": {"effective_free_gb": 67.5},
+        }
+
+    monkeypatch.setattr(provisional.safe_refill, "_fresh_storage", fresh_storage)
+    plan = {
+        "selected_account_name": "dhj02",
+        "ssh_storage_authority": {
+            "username": "dhj02",
+            "gpfs_path": "slurm_scheduler",
+        },
+        "active_standard_storage_authorities": [],
+        "retention_storage_bound": provisional._retention_storage_bound(1024**3),
+    }
+    active_r1 = [
+        {
+            "task_id": 96304,
+            "id": 96304,
+            "name": "standard-b7",
+            "dedupe_key": "dedupe-b7",
+            "account_name": "r1jae262",
+            "requested_account_name": "r1jae262",
+            "aedt_backend": "standalone",
+        }
+    ]
+    result = provisional._fresh_gpfs(plan, active_tasks=active_r1)
+    assert captured["ssh_storage_authority"]["username"] == "dhj02"
+    assert result["account_name"] == "dhj02"
+    assert result["active_storage_bound_bytes"] == 0
+    assert result["nonselected_account_fea_task_count"] == 1
+
+
+def test_alternate_enroot_probe_is_bound_to_selected_account_and_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, str] = {}
+
+    class Channel:
+        @staticmethod
+        def recv_exit_status() -> int:
+            return 0
+
+    class Stream:
+        channel = Channel()
+
+        def __init__(self, value: bytes) -> None:
+            self.value = value
+
+        def read(self) -> bytes:
+            return self.value
+
+    class Client:
+        def exec_command(self, command: str, timeout: int) -> tuple[Any, Any, Any]:
+            observed["command"] = command
+            assert timeout == 60
+            return (
+                None,
+                Stream(b"__NODE__:n116\n__FS__:xfs\n__FREE_KIB__:419430400\n"),
+                Stream(b""),
+            )
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    monkeypatch.setattr(provisional, "_ssh_client", lambda authority: Client())
+    plan = {
+        "selected_account_name": "dhj02",
+        "requested_node_name": "n116",
+        "stage": {
+            "requested_account_name": "dhj02",
+            "requested_node_name": "n116",
+            "node_name_policy": "strict",
+        },
+        "ssh_storage_authority": {"username": "dhj02"},
+    }
+    result = provisional._fresh_enroot(plan, allocation={"slurm_job_id": "829952"})
+    assert "--jobid=829952" in observed["command"]
+    assert "--nodelist=n116" in observed["command"]
+    assert result["selected_account_name"] == "dhj02"
+    assert result["node_name"] == "n116"
+
+
 def test_cutoff_blocks_before_live_scheduler_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -197,6 +377,9 @@ def test_cutoff_blocks_before_live_scheduler_reads(
 
 def _submission_fixture(
     tmp_path: Path,
+    *,
+    selected_account_name: str = provisional.ACCOUNT_NAME,
+    requested_node_name: str = provisional.NODE_NAME,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     claim_root = tmp_path / "claims"
     authority = atomic_claim.initialize_claim_root(
@@ -229,11 +412,16 @@ def _submission_fixture(
             "stage": {
                 "task_name": "mft-goal-provisional-full-test",
                 "workdir": "mft_goal_provisional_full_test",
+                "requested_account_name": selected_account_name,
+                "requested_node_name": requested_node_name,
+                "node_name_policy": "strict",
                 "retained_aedt": retained,
             },
             "retention_storage_bound": provisional._retention_storage_bound(1024**3),
             "scheduler_url": provisional.SCHEDULER_URL,
             "scheduler_project": provisional.SCHEDULER_PROJECT,
+            "selected_account_name": selected_account_name,
+            "requested_node_name": requested_node_name,
             "claim_root_authority": authority,
             "claim_reference": reference,
             **provisional._flags(),
@@ -254,11 +442,11 @@ def _submission_fixture(
         "memory_mb": 98304,
         "timeout_seconds": 43200,
         "aedt_backend": "standalone",
-        "account_name": provisional.ACCOUNT_NAME,
-        "requested_account_name": provisional.ACCOUNT_NAME,
+        "account_name": selected_account_name,
+        "requested_account_name": selected_account_name,
         "actual_node_name": None,
         "allocation_node_name": None,
-        "requested_node_name": provisional.NODE_NAME,
+        "requested_node_name": requested_node_name,
         "node_name_policy": "strict",
         "requested_node_name_policy": "strict",
         "same_node_as_task_id": 0,
@@ -266,10 +454,103 @@ def _submission_fixture(
     return path, plan, task
 
 
-def test_submit_defers_all_scratch_env_and_posts_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_global_claim_slot_blocks_a_second_route_before_scheduler_post(
+    tmp_path: Path,
 ) -> None:
-    plan_path, plan, task = _submission_fixture(tmp_path)
+    r1_root = tmp_path / "r1"
+    r1_root.mkdir()
+    r1_path, r1_plan, _task = _submission_fixture(r1_root)
+    alternate_root = tmp_path / "alternate"
+    alternate_root.mkdir()
+    unsigned = {key: value for key, value in r1_plan.items() if key != "payload_sha256"}
+    unsigned["output_root"] = str(alternate_root.resolve())
+    unsigned["selected_account_name"] = "dhj02"
+    unsigned["requested_node_name"] = "n116"
+    unsigned["stage"] = {
+        **unsigned["stage"],
+        "requested_account_name": "dhj02",
+        "requested_node_name": "n116",
+    }
+    alternate_plan = production._seal(unsigned)
+    alternate_path = production._write_immutable_json(
+        alternate_root / "provisional_full_precompute_plan.json",
+        alternate_plan,
+    )
+    authority = r1_plan["claim_root_authority"]
+    reference = r1_plan["claim_reference"]
+    first = atomic_claim.acquire_claim(
+        Path(authority["resolved_root"]),
+        reference,
+        provisional._claim_winner(r1_path, r1_plan),
+    )
+    assert first["status"] == "fresh_pending"
+    with pytest.raises(
+        atomic_claim.ClaimContractError,
+        match="different ancestry",
+    ):
+        atomic_claim.acquire_claim(
+            Path(authority["resolved_root"]),
+            reference,
+            provisional._claim_winner(alternate_path, alternate_plan),
+        )
+    assert r1_plan["stage"]["task_name"] == alternate_plan["stage"]["task_name"]
+    assert (
+        r1_plan["stage"]["retained_aedt"]["dedupe_key"]
+        == alternate_plan["stage"]["retained_aedt"]["dedupe_key"]
+    )
+
+
+def test_sibling_identity_rejects_the_other_route() -> None:
+    retained = {"dedupe_key": "global-dedupe"}
+    plan = {
+        "selected_account_name": "dhj02",
+        "requested_node_name": "n116",
+        "stage": {
+            "task_name": "global-provisional-full",
+            "requested_account_name": "dhj02",
+            "requested_node_name": "n116",
+            "node_name_policy": "strict",
+            "retained_aedt": retained,
+        },
+    }
+    other_route = {
+        "task_id": 97000,
+        "id": 97000,
+        "name": "global-provisional-full",
+        "project": provisional.SCHEDULER_PROJECT,
+        "dedupe_key": "global-dedupe",
+        "cpus": 16,
+        "memory_mb": 98304,
+        "timeout_seconds": 43200,
+        "aedt_backend": "standalone",
+        "account_name": "r1jae262",
+        "requested_account_name": "r1jae262",
+        "requested_node_name": "n114",
+        "requested_node_name_policy": "strict",
+        "same_node_as_task_id": 0,
+    }
+    with pytest.raises(
+        provisional.HandoffContractError,
+        match="sibling identity collision",
+    ):
+        provisional._sibling_inventory([other_route], plan=plan)
+
+
+@pytest.mark.parametrize(
+    ("selected_account_name", "requested_node_name"),
+    [("r1jae262", "n114"), ("dhj02", "n116")],
+)
+def test_submit_defers_all_scratch_env_and_posts_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selected_account_name: str,
+    requested_node_name: str,
+) -> None:
+    plan_path, plan, task = _submission_fixture(
+        tmp_path,
+        selected_account_name=selected_account_name,
+        requested_node_name=requested_node_name,
+    )
     monkeypatch.setattr(
         provisional, "load_plan", lambda _path: (plan, {"w1": 1}, {"cpus": 16})
     )
@@ -338,9 +619,17 @@ def test_submit_defers_all_scratch_env_and_posts_once(
     for key in ("ANS_TEMP_PATH", "TMPDIR", "TMP", "TEMP"):
         assert options["submission_env"][key] == "$MFT_WORKDIR"
     assert "ANS_MW_INHERIT_TMP" not in options["submission_env"]
-    assert options["account_name"] == "r1jae262"
-    assert options["node_name"] == "n114"
+    assert options["account_name"] == selected_account_name
+    assert options["node_name"] == requested_node_name
+    assert options["retained_aedt_max_bytes"] == 1024**3
     assert receipt["scheduler_post_count_this_run"] == 1
+    assert receipt["selected_account_name"] == selected_account_name
+    assert receipt["requested_node_name"] == requested_node_name
+    assert receipt["retained_aedt_max_bytes"] == 1024**3
+    assert (
+        receipt["retained_aedt_source_size_hard_cap_contract"]
+        == "pre-gpfs-destination-create-v1"
+    )
     assert receipt["provisional"] is True
     assert receipt["production_eligible"] is False
     assert (tmp_path / "post_intent.json").is_file()

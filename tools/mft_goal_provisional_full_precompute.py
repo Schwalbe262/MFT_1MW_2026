@@ -50,8 +50,11 @@ CLAIM_GENERATION = "provisional-full-precompute-v1"
 CAMPAIGN_ID = "mft-goal-20260726"
 SCHEDULER_URL = "http://127.0.0.1:8002"
 SCHEDULER_PROJECT = scheduler_client.MFT_PROJECT
-ACCOUNT_NAME = "r1jae262"
-NODE_NAME = "n114"
+SOURCE_ACCOUNT_NAME = "r1jae262"
+SOURCE_NODE_NAME = "n114"
+# Backwards-compatible defaults for the original single-route contract.
+ACCOUNT_NAME = SOURCE_ACCOUNT_NAME
+NODE_NAME = SOURCE_NODE_NAME
 LOGICAL_AUTHORITY_TASK_ID = 96230
 SOURCE_STANDARD_TASK_ID = 96304
 SCHEDULER_CUTOVER_SHA256 = (
@@ -111,6 +114,36 @@ def _positive_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise HandoffContractError(f"{label} is invalid")
     return value
+
+
+def _placement_token(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value) is None
+    ):
+        raise HandoffContractError(f"{label} is unsafe or empty")
+    return value
+
+
+def _selected_placement(plan: Mapping[str, Any]) -> tuple[str, str]:
+    stage = plan.get("stage")
+    if not isinstance(stage, Mapping):
+        raise HandoffContractError("provisional Full stage is absent")
+    account = _placement_token(
+        plan.get("selected_account_name", stage.get("requested_account_name")),
+        "selected account name",
+    )
+    node = _placement_token(
+        plan.get("requested_node_name", stage.get("requested_node_name")),
+        "requested node name",
+    )
+    if (
+        stage.get("requested_account_name") != account
+        or stage.get("requested_node_name") != node
+        or stage.get("node_name_policy") != "strict"
+    ):
+        raise HandoffContractError("provisional Full placement identity drifted")
+    return account, node
 
 
 def _task_id(value: Mapping[str, Any]) -> int:
@@ -301,10 +334,54 @@ def _selection_rationale(
 
 
 def _task_identity() -> tuple[str, str]:
+    # Deliberately global across execution routes: Scheduler name/dedupe and the
+    # shared atomic-claim slot prevent r1/n114 and alternate-account plans from
+    # each issuing a lifetime POST for the same candidate.
     stem = TARGET_CANDIDATE_SHA256[:12]
     return (
         f"mft-goal-provisional-full-l{LOGICAL_AUTHORITY_TASK_ID}-{stem}-v1",
         f"mft_goal_provisional_full_l{LOGICAL_AUTHORITY_TASK_ID}_{stem}_v1",
+    )
+
+
+def _global_exact_once_scope(
+    task_name: str, retained: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "scope": "candidate_across_all_execution_accounts_and_nodes",
+        "candidate_physics_sha256": TARGET_CANDIDATE_SHA256,
+        "logical_authority_task_id": LOGICAL_AUTHORITY_TASK_ID,
+        "claim_generation": CLAIM_GENERATION,
+        "task_name": task_name,
+        "dedupe_key": retained["dedupe_key"],
+        "selected_placement_is_not_part_of_identity": True,
+        "maximum_scheduler_posts_lifetime_global": 1,
+    }
+
+
+def _claim_authority_sha256(
+    *,
+    profile: Mapping[str, Any],
+    task_name: str,
+    retained: Mapping[str, Any],
+    storage_bound: Mapping[str, Any],
+) -> str:
+    # Route-independent by design. Every account/node variant must converge on
+    # the same physical claim root and claim reference.
+    return canonical_sha256(
+        {
+            "campaign_id": CAMPAIGN_ID,
+            "candidate_physics_sha256": TARGET_CANDIDATE_SHA256,
+            "logical_authority_task_id": LOGICAL_AUTHORITY_TASK_ID,
+            "claim_generation": CLAIM_GENERATION,
+            "profile_sha256": production.canonical_sha256(profile),
+            "resources": RESOURCES,
+            "task_name": task_name,
+            "retained_dedupe_key": retained["dedupe_key"],
+            "storage_bound": storage_bound,
+            "flags": _flags(),
+            "maximum_scheduler_posts": 1,
+        }
     )
 
 
@@ -328,7 +405,7 @@ def _active_standard_storage_authorities(
             or isinstance(grid_bytes, bool)
             or not isinstance(grid_bytes, int)
             or grid_bytes <= 0
-            or item.get("account_name") != ACCOUNT_NAME
+            or item.get("account_name") != SOURCE_ACCOUNT_NAME
         ):
             raise HandoffContractError("parallel Standard storage authority drifted")
         authorities.append(
@@ -337,7 +414,7 @@ def _active_standard_storage_authorities(
                 "candidate_physics_sha256": item["candidate_physics_sha256"],
                 "task_name": item["task_name"],
                 "dedupe_key": item["dedupe_key"],
-                "account_name": ACCOUNT_NAME,
+                "account_name": SOURCE_ACCOUNT_NAME,
                 "fresh_grid_output_bytes": grid_bytes,
                 "fresh_grid_output_gib": grid_bytes / (1024**3),
                 "bound_source": ("authenticated_timeout_native_premesh_grid_bytes"),
@@ -376,7 +453,7 @@ def _active_standard_storage_authorities(
             "candidate_physics_sha256": COMPARISON_CANDIDATE_SHA256,
             "task_name": stage["task_name"],
             "dedupe_key": stage["retained_aedt_bundle"]["dedupe_key"],
-            "account_name": ACCOUNT_NAME,
+            "account_name": SOURCE_ACCOUNT_NAME,
             "fresh_grid_output_bytes": startup_bytes,
             "fresh_grid_output_gib": startup_bytes / (1024**3),
             "bound_source": ("authenticated_startup_successor_source_grid_bytes"),
@@ -410,15 +487,20 @@ def initialize_plan(
     ssh_private_key: Path,
     ssh_known_hosts: Path,
     ssh_gpfs_path: str,
+    selected_account_name: str = ACCOUNT_NAME,
+    requested_node_name: str = NODE_NAME,
 ) -> Path:
+    selected_account = _placement_token(selected_account_name, "selected account name")
+    requested_node = _placement_token(requested_node_name, "requested node name")
     root = output_root.resolve()
     path = root / "provisional_full_precompute_plan.json"
     if path.exists():
         existing, _params, _profile = load_plan(path)
+        existing_account, existing_node = _selected_placement(existing)
         requested_ssh = {
             "host": str(ssh_host).strip(),
             "port": _positive_int(ssh_port, "SSH port"),
-            "username": ACCOUNT_NAME,
+            "username": selected_account,
             "gpfs_path": str(ssh_gpfs_path).strip(),
             "private_key": production._file_record(ssh_private_key),
             "known_hosts": production._file_record(ssh_known_hosts),
@@ -438,6 +520,8 @@ def initialize_plan(
             or existing["retention_storage_bound"]
             != _retention_storage_bound(expected_full_aedt_bytes)
             or existing["ssh_storage_authority"] != requested_ssh
+            or existing_account != selected_account
+            or existing_node != requested_node
             or Path(existing["claim_root_authority"]["resolved_root"]).resolve(
                 strict=True
             )
@@ -462,21 +546,30 @@ def initialize_plan(
     )
     profile, profile_record = production._profile_content("full")
     name, workdir = _task_identity()
+    storage_bound = _retention_storage_bound(expected_full_aedt_bytes)
     retained = scheduler_client.retained_aedt_identity(
-        name, params, profile, SOLVER_REVISION, LIBRARY_REVISION
+        name,
+        params,
+        profile,
+        SOLVER_REVISION,
+        LIBRARY_REVISION,
+        retained_aedt_max_bytes=storage_bound["expected_full_aedt_bytes"],
     )
     if (
         not isinstance(retained, Mapping)
         or retained.get("schema_version") != scheduler_client.RETAINED_AEDT_SCHEMA
         or retained.get("stage") != "full"
         or retained.get("artifact_path", "").endswith("/full.aedt") is not True
+        or retained.get("source_size_hard_cap_bytes")
+        != storage_bound["expected_full_aedt_bytes"]
+        or retained.get("source_size_hard_cap_contract")
+        != "pre-gpfs-destination-create-v1"
         or "results_path" in retained
         or "results_manifest_path" in retained
     ):
         raise HandoffContractError(
             "reviewed Full profile is not project-only retained AEDT"
         )
-    storage_bound = _retention_storage_bound(expected_full_aedt_bytes)
     cutover_record = production._file_record(scheduler_cutover_receipt)
     if cutover_record["sha256"] != SCHEDULER_CUTOVER_SHA256:
         raise HandoffContractError("reviewed Scheduler cutover receipt drifted")
@@ -488,27 +581,18 @@ def initialize_plan(
     ssh_authority = {
         "host": str(ssh_host).strip(),
         "port": _positive_int(ssh_port, "SSH port"),
-        "username": ACCOUNT_NAME,
+        "username": selected_account,
         "gpfs_path": str(ssh_gpfs_path).strip(),
         "private_key": production._file_record(ssh_private_key),
         "known_hosts": production._file_record(ssh_known_hosts),
     }
     if not ssh_authority["host"] or not ssh_authority["gpfs_path"]:
         raise HandoffContractError("SSH storage authority is incomplete")
-    claim_authority_sha = canonical_sha256(
-        {
-            "campaign_id": CAMPAIGN_ID,
-            "candidate_physics_sha256": TARGET_CANDIDATE_SHA256,
-            "logical_authority_task_id": LOGICAL_AUTHORITY_TASK_ID,
-            "claim_generation": CLAIM_GENERATION,
-            "profile_sha256": production.canonical_sha256(profile),
-            "resources": RESOURCES,
-            "task_name": name,
-            "retained_dedupe_key": retained["dedupe_key"],
-            "storage_bound": storage_bound,
-            "flags": _flags(),
-            "maximum_scheduler_posts": 1,
-        }
+    claim_authority_sha = _claim_authority_sha256(
+        profile=profile,
+        task_name=name,
+        retained=retained,
+        storage_bound=storage_bound,
     )
     authority = atomic_claim.initialize_claim_root(
         claim_root,
@@ -541,6 +625,14 @@ def initialize_plan(
             "candidate_physics_sha256": TARGET_CANDIDATE_SHA256,
             "logical_authority_task_id": LOGICAL_AUTHORITY_TASK_ID,
             "source_actual_standard_task_id": SOURCE_STANDARD_TASK_ID,
+            "source_standard_execution_authority": {
+                "account_name": SOURCE_ACCOUNT_NAME,
+                "node_name": SOURCE_NODE_NAME,
+                "task_id": SOURCE_STANDARD_TASK_ID,
+                "node_name_policy": "strict",
+            },
+            "selected_account_name": selected_account,
+            "requested_node_name": requested_node,
             "selection_rationale": rationale,
             "solver_revision": SOLVER_REVISION,
             "library_revision": LIBRARY_REVISION,
@@ -558,8 +650,8 @@ def initialize_plan(
                 "full_model": 1,
                 "thermal_symmetry": "full",
                 "aedt_backend": "standalone",
-                "requested_account_name": ACCOUNT_NAME,
-                "requested_node_name": NODE_NAME,
+                "requested_account_name": selected_account,
+                "requested_node_name": requested_node,
                 "node_name_policy": "strict",
                 "retained_aedt": copy.deepcopy(dict(retained)),
             },
@@ -598,7 +690,7 @@ def initialize_plan(
             "cutoff_safety_margin_seconds": 1800,
             "fresh_admission_required": [
                 "active_tasks",
-                "capacity_16cpu_98304mb_r1_n114",
+                (f"capacity_16cpu_98304mb_{selected_account}_{requested_node}"),
                 "license_16core",
                 "gpfs_project_only_retention",
                 "enroot_xfs_200gib",
@@ -608,6 +700,7 @@ def initialize_plan(
             "canonical_promotion_requires_authenticated_standard_and_full": True,
             "claim_root_authority": authority,
             "claim_reference": reference,
+            "global_exact_once_scope": _global_exact_once_scope(name, retained),
             "ssh_storage_authority": ssh_authority,
             "created_at_utc": _stamp(),
             **_flags(),
@@ -647,6 +740,7 @@ def load_plan(
         or any(plan.get(key) is not value for key, value in _flags().items())
     ):
         raise HandoffContractError("provisional Full plan contract drifted")
+    selected_account, requested_node = _selected_placement(plan)
     (
         target,
         params,
@@ -692,8 +786,18 @@ def load_plan(
         raise HandoffContractError("parallel Standard storage authority bytes drifted")
     profile, record = production._profile_content("full")
     name, workdir = _task_identity()
+    bound = plan.get("retention_storage_bound")
+    if not isinstance(bound, Mapping) or dict(bound) != _retention_storage_bound(
+        bound.get("expected_full_aedt_bytes")
+    ):
+        raise HandoffContractError("project-only storage bound drifted")
     retained = scheduler_client.retained_aedt_identity(
-        name, params, profile, SOLVER_REVISION, LIBRARY_REVISION
+        name,
+        params,
+        profile,
+        SOLVER_REVISION,
+        LIBRARY_REVISION,
+        retained_aedt_max_bytes=bound["expected_full_aedt_bytes"],
     )
     stage = plan.get("stage")
     if (
@@ -708,25 +812,65 @@ def load_plan(
         or stage.get("resources") != RESOURCES
         or stage.get("full_model") != 1
         or stage.get("thermal_symmetry") != "full"
+        or stage.get("aedt_backend") != "standalone"
+        or stage.get("requested_account_name") != selected_account
+        or stage.get("requested_node_name") != requested_node
+        or stage.get("node_name_policy") != "strict"
         or stage.get("retained_aedt") != retained
         or retained.get("schema_version") != scheduler_client.RETAINED_AEDT_SCHEMA
+        or retained.get("source_size_hard_cap_bytes")
+        != bound["expected_full_aedt_bytes"]
+        or retained.get("source_size_hard_cap_contract")
+        != "pre-gpfs-destination-create-v1"
         or "results_path" in retained
     ):
         raise HandoffContractError("provisional Full execution identity drifted")
-    bound = plan.get("retention_storage_bound")
-    if not isinstance(bound, Mapping) or dict(bound) != _retention_storage_bound(
-        bound.get("expected_full_aedt_bytes")
+    global_scope = plan.get("global_exact_once_scope")
+    if (
+        plan.get("selected_account_name") != selected_account
+        or plan.get("requested_node_name") != requested_node
+        or plan.get("source_standard_execution_authority")
+        != {
+            "account_name": SOURCE_ACCOUNT_NAME,
+            "node_name": SOURCE_NODE_NAME,
+            "task_id": SOURCE_STANDARD_TASK_ID,
+            "node_name_policy": "strict",
+        }
+        or global_scope != _global_exact_once_scope(name, retained)
     ):
-        raise HandoffContractError("project-only storage bound drifted")
+        raise HandoffContractError("cross-account provisional Full route drifted")
+    ssh_authority = plan.get("ssh_storage_authority")
+    if (
+        not isinstance(ssh_authority, Mapping)
+        or ssh_authority.get("username") != selected_account
+    ):
+        raise HandoffContractError("selected-account SSH authority drifted")
     for name in ("private_key", "known_hosts"):
-        ssh_record = plan["ssh_storage_authority"][name]
+        ssh_record = ssh_authority[name]
         if production._file_record(Path(ssh_record["path"])) != ssh_record:
             raise HandoffContractError(f"SSH {name} bytes drifted")
     authority = atomic_claim.load_claim_root(
         Path(plan["claim_root_authority"]["resolved_root"]),
         expected_authority=plan["claim_root_authority"],
     )
-    atomic_claim.validate_claim_reference(plan["claim_reference"], authority)
+    if authority.get("campaign_authority_sha256") != _claim_authority_sha256(
+        profile=profile,
+        task_name=stage["task_name"],
+        retained=retained,
+        storage_bound=bound,
+    ):
+        raise HandoffContractError("global provisional Full claim authority drifted")
+    expected_reference = atomic_claim.build_claim_reference(
+        authority,
+        candidate_physics_sha256=TARGET_CANDIDATE_SHA256,
+        logical_authority_task_id=LOGICAL_AUTHORITY_TASK_ID,
+        retry_generation=CLAIM_GENERATION,
+    )
+    if (
+        atomic_claim.validate_claim_reference(plan["claim_reference"], authority)
+        != expected_reference
+    ):
+        raise HandoffContractError("global provisional Full claim reference drifted")
     return plan, params, profile
 
 
@@ -776,26 +920,32 @@ def _source_standard_evidence(
         or row["memory_mb"] != 32768
         or row["timeout_seconds"] != 43200
         or row["aedt_backend"] != "standalone"
-        or row["requested_account_name"] != ACCOUNT_NAME
-        or row["requested_node_name"] != NODE_NAME
+        or row["requested_account_name"] != SOURCE_ACCOUNT_NAME
+        or row["requested_node_name"] != SOURCE_NODE_NAME
         or row["requested_node_name_policy"] != "strict"
     ):
         raise HandoffContractError("actual Standard source task 96304 drifted")
     return row
 
 
-def _capacity_endpoint() -> str:
-    return fastlane._capacity_endpoint(ACCOUNT_NAME)
+def _capacity_endpoint(account_name: str = ACCOUNT_NAME) -> str:
+    return fastlane._capacity_endpoint(
+        _placement_token(account_name, "selected account name")
+    )
 
 
 def _exact_capacity(
     *,
     live_reader: Callable[..., Any],
     scheduler_url: str,
+    selected_account_name: str = ACCOUNT_NAME,
+    requested_node_name: str = NODE_NAME,
 ) -> dict[str, Any]:
+    selected_account = _placement_token(selected_account_name, "selected account name")
+    requested_node = _placement_token(requested_node_name, "requested node name")
     value = fastlane._require_account_capacity(
         scheduler_url=scheduler_url,
-        account_name=ACCOUNT_NAME,
+        account_name=selected_account,
         live_reader=live_reader,
     )
     allocations = value.get("allocations")
@@ -803,11 +953,11 @@ def _exact_capacity(
         dict(item)
         for item in allocations
         if isinstance(item, Mapping)
-        and item.get("account_name") == ACCOUNT_NAME
+        and item.get("account_name") == selected_account
         and (
-            item.get("node_name") == NODE_NAME
-            or item.get("actual_node_name") == NODE_NAME
-            or item.get("allocation_node_name") == NODE_NAME
+            item.get("node_name") == requested_node
+            or item.get("actual_node_name") == requested_node
+            or item.get("allocation_node_name") == requested_node
         )
         and isinstance(item.get("free_cpus"), int)
         and item["free_cpus"] >= RESOURCES["cpus"]
@@ -816,14 +966,22 @@ def _exact_capacity(
         and re.fullmatch(r"[0-9]+", str(item.get("slurm_job_id") or ""))
     ]
     if not exact:
+        label = (
+            "r1/n114"
+            if (selected_account, requested_node)
+            == (SOURCE_ACCOUNT_NAME, SOURCE_NODE_NAME)
+            else f"{selected_account}/{requested_node}"
+        )
         raise HandoffContractError(
-            "fresh capacity has no exact ready r1/n114 allocation"
+            f"fresh capacity has no exact ready {label} allocation"
         )
     exact.sort(key=lambda item: int(str(item["slurm_job_id"])))
     return {
         "response": value,
         "selected_allocation": exact[0],
-        "capacity_endpoint": _capacity_endpoint(),
+        "capacity_endpoint": _capacity_endpoint(selected_account),
+        "selected_account_name": selected_account,
+        "requested_node_name": requested_node,
     }
 
 
@@ -848,10 +1006,15 @@ def _ssh_client(authority: Mapping[str, Any]) -> paramiko.SSHClient:
 def _fresh_enroot(
     plan: Mapping[str, Any], *, allocation: Mapping[str, Any]
 ) -> dict[str, Any]:
+    selected_account, requested_node = _selected_placement(plan)
     authority = plan["ssh_storage_authority"]
+    if authority.get("username") != selected_account:
+        raise HandoffContractError("selected-account SSH authority drifted")
     job_id = str(allocation.get("slurm_job_id") or "")
     if re.fullmatch(r"[0-9]+", job_id) is None:
-        raise HandoffContractError("n114 capacity has no Slurm allocation ID")
+        raise HandoffContractError(
+            f"{requested_node} capacity has no Slurm allocation ID"
+        )
     probe = (
         "set -eu; "
         "node=$(hostname -s); fs=$(findmnt -n -o FSTYPE -T /enroot); "
@@ -861,7 +1024,7 @@ def _fresh_enroot(
     )
     command = (
         f"srun --jobid={job_id} --overlap --nodes=1 --ntasks=1 "
-        f"--cpus-per-task=1 --nodelist={NODE_NAME} --unbuffered "
+        f"--cpus-per-task=1 --nodelist={requested_node} --unbuffered "
         f"bash -lc {shlex.quote(probe)}"
     )
     client = _ssh_client(authority)
@@ -871,12 +1034,14 @@ def _fresh_enroot(
         error = stderr.read().decode("utf-8", "replace")
         exit_code = stdout.channel.recv_exit_status()
     except Exception as exc:
-        raise HandoffContractError("fresh n114 /enroot probe failed") from exc
+        raise HandoffContractError(
+            f"fresh {requested_node} /enroot probe failed"
+        ) from exc
     finally:
         client.close()
     if exit_code != 0:
         raise HandoffContractError(
-            f"fresh n114 /enroot probe exit={exit_code}: {error[:200]}"
+            f"fresh {requested_node} /enroot probe exit={exit_code}: {error[:200]}"
         )
     parsed = {}
     for line in output.splitlines():
@@ -888,14 +1053,17 @@ def _fresh_enroot(
     except (KeyError, ValueError) as exc:
         raise HandoffContractError("fresh /enroot free-space value is absent") from exc
     if (
-        parsed.get("__NODE__") != NODE_NAME
+        parsed.get("__NODE__") != requested_node
         or parsed.get("__FS__") != "xfs"
         or free_kib < ENROOT_MINIMUM_FREE_KIB
     ):
-        raise HandoffContractError("fresh n114 /enroot XFS 200GiB gate failed")
+        raise HandoffContractError(
+            f"fresh {requested_node} /enroot XFS 200GiB gate failed"
+        )
     return {
         "observed_at_utc": _stamp(),
-        "node_name": NODE_NAME,
+        "selected_account_name": selected_account,
+        "node_name": requested_node,
         "slurm_job_id": job_id,
         "path": ENROOT_PATH,
         "filesystem_type": "xfs",
@@ -909,20 +1077,46 @@ def _fresh_enroot(
 def _active_storage_reservation(
     plan: Mapping[str, Any], active_tasks: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
+    selected_account = _placement_token(
+        plan.get("selected_account_name", ACCOUNT_NAME),
+        "selected account name",
+    )
     known = plan.get("active_standard_storage_authorities")
     if not isinstance(known, list):
         raise HandoffContractError("active Standard storage authorities are absent")
     reservations = []
     conflicts = []
+    nonselected = []
     for raw in active_tasks:
         if not isinstance(raw, Mapping):
-            continue
-        if raw.get("account_name") != ACCOUNT_NAME:
             continue
         is_fea = raw.get("aedt_backend") in {"standalone", "pooled"} or str(
             raw.get("required_capability") or ""
         ).startswith("conda:pyaedt")
         if not is_fea:
+            continue
+        account_values = [
+            value
+            for value in (
+                raw.get("account_name"),
+                raw.get("requested_account_name"),
+            )
+            if isinstance(value, str) and value
+        ]
+        if not account_values or any(
+            value != account_values[0] for value in account_values
+        ):
+            raise HandoffContractError(
+                "active MFT FEA task has ambiguous quota account"
+            )
+        task_account = account_values[0]
+        if task_account != selected_account:
+            nonselected.append(
+                {
+                    "task_id": _task_id(raw),
+                    "account_name": task_account,
+                }
+            )
             continue
         match = next(
             (
@@ -930,6 +1124,7 @@ def _active_storage_reservation(
                 for item in known
                 if raw.get("name") == item["task_name"]
                 and raw.get("dedupe_key") == item["dedupe_key"]
+                and item.get("account_name", SOURCE_ACCOUNT_NAME) == selected_account
             ),
             None,
         )
@@ -942,6 +1137,7 @@ def _active_storage_reservation(
                 "task_name": raw["name"],
                 "dedupe_key": raw["dedupe_key"],
                 "logical_authority_task_id": match["logical_authority_task_id"],
+                "account_name": selected_account,
                 "storage_bound_bytes": match["fresh_grid_output_bytes"],
                 "storage_bound_gib": match["fresh_grid_output_gib"],
                 "bound_source": match["bound_source"],
@@ -949,16 +1145,20 @@ def _active_storage_reservation(
         )
     if conflicts:
         raise HandoffContractError(
-            "active r1 standalone task lacks authenticated storage bound"
+            f"active {selected_account} MFT FEA task lacks authenticated storage bound"
         )
     reservations.sort(key=lambda item: item["task_id"])
+    nonselected.sort(key=lambda item: item["task_id"])
     total = sum(item["storage_bound_bytes"] for item in reservations)
     return {
+        "selected_account_name": selected_account,
         "active_bounded_task_count": len(reservations),
         "active_task_storage_reservations": reservations,
         "active_storage_bound_bytes": total,
         "active_storage_bound_gib": total / (1024**3),
         "active_unbounded_storage_conflict_count": 0,
+        "nonselected_account_fea_task_count": len(nonselected),
+        "nonselected_account_fea_tasks": nonselected,
     }
 
 
@@ -967,6 +1167,12 @@ def _fresh_gpfs(
     *,
     active_tasks: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    selected_account = _placement_token(
+        plan.get("selected_account_name", ACCOUNT_NAME),
+        "selected account name",
+    )
+    if plan["ssh_storage_authority"].get("username") != selected_account:
+        raise HandoffContractError("selected-account GPFS authority drifted")
     compatibility_plan = {
         "ssh_storage_authority": {
             **copy.deepcopy(plan["ssh_storage_authority"]),
@@ -974,6 +1180,8 @@ def _fresh_gpfs(
         }
     }
     evidence = safe_refill._fresh_storage(compatibility_plan)
+    if evidence.get("account_name") != selected_account:
+        raise HandoffContractError("fresh GPFS quota account drifted")
     bound = plan["retention_storage_bound"]
     active = _active_storage_reservation(plan, active_tasks)
     available = float(evidence["limiting_quota"]["effective_free_gb"])
@@ -1029,13 +1237,17 @@ def fresh_gates(
         TARGET_FINISH_KST - timedelta(seconds=1800)
     ):
         raise HandoffContractError("12-hour Full cannot retain the safety margin")
+    selected_account, requested_node = _selected_placement(plan)
     target_plan = timeout12h._load_plan(Path(plan["target_source_plan"]["path"]))[0]
     if validate_cutover:
         diagnostic._validate_scheduler_cutover_receipt(
             Path(plan["scheduler_cutover_receipt"]["path"]),
             verify_live_launcher=True,
             require_strict_node=True,
-            strict_node_contract=target_plan["scheduler_strict_node_contract"],
+            # Authenticate the live global strict-node launcher, then bind this
+            # provisional route independently through exact account/node
+            # capacity, /enroot, sibling, claim, POST, and readback checks.
+            strict_node_contract=None,
             require_active_strict=True,
         )
     admission = diagnostic._live_scheduler_admission_snapshot(
@@ -1052,7 +1264,10 @@ def fresh_gates(
         target_plan=target_plan,
     )
     capacity = _exact_capacity(
-        live_reader=live_reader, scheduler_url=plan["scheduler_url"]
+        live_reader=live_reader,
+        scheduler_url=plan["scheduler_url"],
+        selected_account_name=selected_account,
+        requested_node_name=requested_node,
     )
     license_path = license_snapshot_path.resolve(strict=True)
     _snapshot, license_sha = production._validate_license_snapshot(
@@ -1072,6 +1287,8 @@ def fresh_gates(
             "active_project_tasks": copy.deepcopy(active),
             "active_project_task_inventory_sha256": canonical_sha256(active),
             "source_actual_standard_task": source,
+            "selected_account_name": selected_account,
+            "requested_node_name": requested_node,
             "capacity": capacity,
             "license_snapshot": production._file_record(license_path),
             "license_snapshot_sha256": license_sha,
@@ -1094,6 +1311,7 @@ def _sibling_inventory(rows: Any, *, plan: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
         raise HandoffContractError("provisional Full sibling inventory is absent")
     stage = plan["stage"]
+    selected_account, requested_node = _selected_placement(plan)
     matches = []
     for raw in rows:
         if not isinstance(raw, Mapping):
@@ -1112,7 +1330,9 @@ def _sibling_inventory(rows: Any, *, plan: Mapping[str, Any]) -> dict[str, Any]:
             or row["memory_mb"] != RESOURCES["memory_mb"]
             or row["timeout_seconds"] != RESOURCES["timeout_seconds"]
             or row["aedt_backend"] != "standalone"
-            or row["requested_node_name"] != NODE_NAME
+            or row["account_name"] != selected_account
+            or row["requested_account_name"] != selected_account
+            or row["requested_node_name"] != requested_node
             or row["requested_node_name_policy"] != "strict"
             or row["same_node_as_task_id"] != 0
         ):
@@ -1123,6 +1343,8 @@ def _sibling_inventory(rows: Any, *, plan: Mapping[str, Any]) -> dict[str, Any]:
         raise HandoffContractError("more than one provisional Full sibling exists")
     unsigned = {
         "candidate_physics_sha256": TARGET_CANDIDATE_SHA256,
+        "selected_account_name": selected_account,
+        "requested_node_name": requested_node,
         "task_name": stage["task_name"],
         "dedupe_key": stage["retained_aedt"]["dedupe_key"],
         "matching_task_count": len(matches),
@@ -1156,8 +1378,14 @@ def _claim_winner(plan_path: Path, plan: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _claim_task_evidence(
-    task: Mapping[str, Any], pending: Mapping[str, Any]
+    task: Mapping[str, Any],
+    pending: Mapping[str, Any],
+    *,
+    selected_account_name: str = ACCOUNT_NAME,
+    requested_node_name: str = NODE_NAME,
 ) -> dict[str, Any]:
+    selected_account = _placement_token(selected_account_name, "selected account name")
+    requested_node = _placement_token(requested_node_name, "requested node name")
     row = _normalize_task(task)
     winner = pending.get("winner")
     if (
@@ -1169,8 +1397,9 @@ def _claim_task_evidence(
         or row["memory_mb"] != RESOURCES["memory_mb"]
         or row["timeout_seconds"] != RESOURCES["timeout_seconds"]
         or row["aedt_backend"] != "standalone"
-        or row["requested_account_name"] != ACCOUNT_NAME
-        or row["requested_node_name"] != NODE_NAME
+        or row["account_name"] != selected_account
+        or row["requested_account_name"] != selected_account
+        or row["requested_node_name"] != requested_node
         or row["requested_node_name_policy"] != "strict"
     ):
         raise atomic_claim.ClaimContractError(
@@ -1188,6 +1417,7 @@ def _post_intent(
     gates: Mapping[str, Any],
     pending: Mapping[str, Any],
 ) -> dict[str, Any]:
+    selected_account, requested_node = _selected_placement(plan)
     return production._seal(
         {
             "schema_version": POST_INTENT_SCHEMA,
@@ -1198,8 +1428,12 @@ def _post_intent(
             "initial_fresh_admission": production._file_record(initial_admission_path),
             "locked_fresh_admission": production._file_record(locked_admission_path),
             "fresh_admission_payload_sha256": gates["payload_sha256"],
-            "selected_account_name": ACCOUNT_NAME,
-            "requested_node_name": NODE_NAME,
+            "selected_account_name": selected_account,
+            "requested_node_name": requested_node,
+            "global_exact_once_scope": _global_exact_once_scope(
+                plan["stage"]["task_name"],
+                plan["stage"]["retained_aedt"],
+            ),
             "retention_storage_bound": copy.deepcopy(plan["retention_storage_bound"]),
             "maximum_scheduler_posts_lifetime": 1,
             "scheduler_post_may_follow": True,
@@ -1234,6 +1468,7 @@ def _load_post_intent(
     initial_admission_path: Path,
     locked_admission_path: Path,
 ) -> dict[str, Any]:
+    selected_account, requested_node = _selected_placement(plan)
     value = production._validate_seal(
         production._read_json(path.resolve(strict=True)), POST_INTENT_SCHEMA
     )
@@ -1253,6 +1488,13 @@ def _load_post_intent(
         or value.get("locked_fresh_admission")
         != production._file_record(locked_admission_path)
         or value.get("fresh_admission_payload_sha256") != locked["payload_sha256"]
+        or value.get("selected_account_name") != selected_account
+        or value.get("requested_node_name") != requested_node
+        or value.get("global_exact_once_scope")
+        != _global_exact_once_scope(
+            plan["stage"]["task_name"],
+            plan["stage"]["retained_aedt"],
+        )
         or value.get("maximum_scheduler_posts_lifetime") != 1
         or value.get("scheduler_post_may_follow") is not True
         or value.get("scheduler_cancel_allowed") is not False
@@ -1279,6 +1521,7 @@ def submit(
             f"provisional Full submission receipt exists: {target}"
         )
     plan, params, profile = load_plan(plan_path)
+    selected_account, requested_node = _selected_placement(plan)
     root = Path(plan["output_root"])
     intent_path = root / "post_intent.json"
     initial_admission_path = root / "initial_admission.json"
@@ -1320,6 +1563,17 @@ def submit(
         plan["claim_reference"], authority
     )
     winner = _claim_winner(plan_path, plan)
+
+    def claim_task_evidence(
+        task: Mapping[str, Any], pending_claim: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return _claim_task_evidence(
+            task,
+            pending_claim,
+            selected_account_name=selected_account,
+            requested_node_name=requested_node,
+        )
+
     try:
         acquisition = atomic_claim.acquire_claim(
             Path(authority["resolved_root"]), reference, winner
@@ -1358,7 +1612,7 @@ def submit(
                     acquisition["claim"],
                     matching_tasks=own,
                     sibling_snapshot=before,
-                    evidence_validator=_claim_task_evidence,
+                    evidence_validator=claim_task_evidence,
                 )
             else:
                 finalized = atomic_claim.validate_finalized_claim(
@@ -1367,7 +1621,7 @@ def submit(
                     claim=acquisition["claim"],
                     expected_winner=winner,
                 )
-                _claim_task_evidence(own[0], finalized["pending_claim"])
+                claim_task_evidence(own[0], finalized["pending_claim"])
         except atomic_claim.ClaimContractError as exc:
             raise HandoffContractError(
                 "provisional Full claim recovery failed"
@@ -1461,9 +1715,12 @@ def submit(
             max_project_active_tasks=diagnostic.GOAL_FEA_PROJECT_CAP,
             scheduler_url=plan["scheduler_url"],
             pre_submit_guard=locked_guard,
-            account_name=ACCOUNT_NAME,
-            node_name=NODE_NAME,
+            account_name=selected_account,
+            node_name=requested_node,
             node_name_policy="strict",
+            retained_aedt_max_bytes=plan["retention_storage_bound"][
+                "expected_full_aedt_bytes"
+            ],
             return_submission_evidence=True,
         )
         if guard_calls != 1 or locked_gates is None:
@@ -1480,6 +1737,12 @@ def submit(
                 {
                     "schema_version": POST_RESULT_SCHEMA,
                     "task_id": task_id,
+                    "retained_aedt_max_bytes": plan["retention_storage_bound"][
+                        "expected_full_aedt_bytes"
+                    ],
+                    "retained_aedt_source_size_hard_cap_contract": (
+                        "pre-gpfs-destination-create-v1"
+                    ),
                     "scheduler_post_count": 1,
                     "scheduler_submission_performed": True,
                     "created_at_utc": _stamp(),
@@ -1508,7 +1771,7 @@ def submit(
                 task_id=task_id,
                 task_readback=after["matching_tasks"][0],
                 sibling_snapshot=after,
-                evidence_validator=_claim_task_evidence,
+                evidence_validator=claim_task_evidence,
             )
         except atomic_claim.ClaimContractError as exc:
             raise HandoffContractError(
@@ -1530,6 +1793,12 @@ def submit(
             "candidate_physics_sha256": TARGET_CANDIDATE_SHA256,
             "logical_authority_task_id": LOGICAL_AUTHORITY_TASK_ID,
             "source_actual_standard_task_id": SOURCE_STANDARD_TASK_ID,
+            "selected_account_name": selected_account,
+            "requested_node_name": requested_node,
+            "global_exact_once_scope": _global_exact_once_scope(
+                plan["stage"]["task_name"],
+                plan["stage"]["retained_aedt"],
+            ),
             "task_id": task_id,
             "task_name": plan["stage"]["task_name"],
             "dedupe_key": plan["stage"]["retained_aedt"]["dedupe_key"],
@@ -1538,6 +1807,12 @@ def submit(
             "thermal_symmetry": "full",
             "profile": copy.deepcopy(plan["profile"]),
             "retained_aedt": copy.deepcopy(plan["stage"]["retained_aedt"]),
+            "retained_aedt_max_bytes": plan["retention_storage_bound"][
+                "expected_full_aedt_bytes"
+            ],
+            "retained_aedt_source_size_hard_cap_contract": (
+                "pre-gpfs-destination-create-v1"
+            ),
             "retention_storage_bound": copy.deepcopy(plan["retention_storage_bound"]),
             "initial_fresh_admission": initial_gates,
             "locked_fresh_admission": locked_gates,
@@ -1578,6 +1853,8 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--ssh-private-key", type=Path, required=True)
     init.add_argument("--ssh-known-hosts", type=Path, required=True)
     init.add_argument("--ssh-gpfs-path", default="slurm_scheduler")
+    init.add_argument("--selected-account-name", default=ACCOUNT_NAME)
+    init.add_argument("--requested-node-name", default=NODE_NAME)
     dry = commands.add_parser("dry-run")
     dry.add_argument("--plan", type=Path, required=True)
     dry.add_argument("--license-snapshot", type=Path, required=True)
@@ -1607,6 +1884,8 @@ def main(argv: list[str] | None = None) -> int:
             ssh_private_key=args.ssh_private_key,
             ssh_known_hosts=args.ssh_known_hosts,
             ssh_gpfs_path=args.ssh_gpfs_path,
+            selected_account_name=args.selected_account_name,
+            requested_node_name=args.requested_node_name,
         )
         print(path)
         return 0
