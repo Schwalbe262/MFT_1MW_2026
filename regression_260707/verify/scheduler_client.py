@@ -703,6 +703,12 @@ def retained_aedt_identity(
                     "goal_diagnostic_standard_timeout_retry.json"
                 ),
                 (
+                    "mft-goal-diagnostic-standard-timeout12h-"
+                    "retry-profile-v1"
+                ): (
+                    "goal_diagnostic_standard_timeout12h_retry.json"
+                ),
+                (
                     "mft-goal-diagnostic-standard-mesh-quality-"
                     "canary-profile-v1"
                 ): (

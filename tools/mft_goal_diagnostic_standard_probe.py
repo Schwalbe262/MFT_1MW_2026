@@ -5880,8 +5880,15 @@ def _load_plan(
     path: Path,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     resolved = path.resolve(strict=True)
+    raw_plan = production._read_json(resolved)
+    if raw_plan.get("schema_version") == (
+        "mft-goal-diagnostic-standard-timeout12h-plan-v1"
+    ):
+        from tools import mft_goal_timeout12h_retry
+
+        return mft_goal_timeout12h_retry.load_plan_for_probe(resolved)
     plan = production._validate_seal(
-        production._read_json(resolved), PLAN_SCHEMA
+        raw_plan, PLAN_SCHEMA
     )
     retry_kind = _plan_retry_kind(plan)
     timeout_retry = retry_kind == "timeout"
@@ -8004,8 +8011,17 @@ def submit_operational_pressure_retry(
 def _load_submission(
     path: Path, *, plan: Mapping[str, Any]
 ) -> dict[str, Any]:
+    raw_submission = production._read_json(path.resolve(strict=True))
+    if raw_submission.get("schema_version") == (
+        "mft-goal-diagnostic-standard-timeout12h-submission-v1"
+    ):
+        from tools import mft_goal_timeout12h_retry
+
+        return mft_goal_timeout12h_retry.load_submission_for_probe(
+            path, plan=plan
+        )
     receipt = production._validate_seal(
-        production._read_json(path.resolve(strict=True)), SUBMISSION_SCHEMA
+        raw_submission, SUBMISSION_SCHEMA
     )
     receipt_plan_record = receipt.get("plan")
     if not isinstance(receipt_plan_record, Mapping):
@@ -8871,6 +8887,21 @@ def _task_execution_evidence(
             raise HandoffContractError(
                 "diagnostic terminal strict-node evidence drifted"
             )
+        for name in (
+            "node_name",
+            "requested_node_name",
+            "node_name_policy",
+            "requested_node_name_policy",
+            "strict_node_placement",
+            "placement_contract_satisfied",
+            "assigned_allocation",
+            "allocation_node_name",
+            "requested_account_name",
+            "same_node_as_task_id",
+            "scheduling_profile",
+            "started_at",
+        ):
+            evidence[name] = strict_terminal[name]
     return evidence
 
 
