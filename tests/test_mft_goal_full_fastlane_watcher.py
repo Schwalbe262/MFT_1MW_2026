@@ -266,6 +266,53 @@ def test_gpfs_audit_blocks_active_task_without_storage_authority() -> None:
     assert audit["arithmetic_passed"] is False
 
 
+def test_gpfs_audit_isolates_missing_bound_to_its_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = _task(96294, account="dhj02")
+    bounded = _task(96298, account="r1jae262")
+    authorities = _mock_active_bounds(
+        tmp_path, monkeypatch, [bounded], bound_gib=[29]
+    )
+    observed = datetime(2026, 7, 25, 15, 0, tzinfo=timezone.utc)
+    audit = fastlane.build_gpfs_audit(
+        observed_at_utc=observed.isoformat(),
+        account_observations=[
+            _gpfs("dhj02"),
+            {
+                **_gpfs("r1jae262"),
+                "block_used_gb": 100.0,
+                "block_limit_gb": 200.0,
+            },
+        ],
+        rows=[blocked, bounded],
+        active_task_storage_authority_paths=authorities,
+    )
+    accounts = {
+        item["account_name"]: item
+        for item in audit["account_observations"]
+    }
+    assert accounts["dhj02"]["active_only_arithmetic_passed"] is False
+    assert (
+        accounts["dhj02"]["active_unbounded_storage_conflict_count"]
+        == 1
+    )
+    assert accounts["r1jae262"]["active_only_arithmetic_passed"] is True
+    assert (
+        accounts["r1jae262"]["active_unbounded_storage_conflict_count"]
+        == 0
+    )
+    assert audit["admissible_account_names"] == ["r1jae262"]
+    assert audit["blocked_account_names"] == ["dhj02"]
+    assert audit["active_unbounded_storage_conflict_count"] == 1
+    assert audit["arithmetic_passed"] is True
+    path = tmp_path / "account-isolated-audit.json"
+    fastlane.production._write_immutable_json(path, audit)
+    assert fastlane._load_gpfs_audit(
+        path, require_fresh=True, now=observed + timedelta(seconds=30)
+    ) == audit
+
+
 def test_gpfs_audit_is_fresh_and_fails_closed_when_stale(
     tmp_path: Path,
 ) -> None:
@@ -438,6 +485,112 @@ def test_successful_standard_stream_grid_is_actual_premesh_not_retained() -> Non
     assert evidence["fresh_grid_output_bytes"] == 19 * 1024**3
     assert evidence["solver_transient_root"] == "/enroot"
     assert "retained" not in evidence
+
+
+def test_dependency_predecessor_grid_authority_uses_stable_get_streams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "dependency-plan.json"
+    source.write_text("{}\n", encoding="utf-8")
+    dependency = fastlane.diagnostic._dependency_retry_module()
+    predecessor = dependency._normalized_task_snapshot(
+        {
+            **_task(96279, account="jji0930", status="failed"),
+            "exit_code": None,
+            "failure_message": "same_node_as task 96262 is failed",
+            "finished_at": "2026-07-25 07:08:46",
+            "same_node_as_task_id": 96262,
+        }
+    )
+    candidate = "a" * 64
+    immediate = {
+        "task_id": 96279,
+        "payload_sha256": "1" * 64,
+        "plan_payload_sha256": "2" * 64,
+        "candidate_physics_sha256": candidate,
+    }
+    plan = {
+        "payload_sha256": "3" * 64,
+        "candidate_physics_sha256": candidate,
+        "stage": {
+            "name": "standard",
+            "scheduler_url": "http://127.0.0.1:8002",
+            "full_model": 0,
+            "thermal_symmetry": "eighth",
+        },
+        "retry_of_dependency_failure": {
+            "retry_of_task_id": 96279,
+            "original_plan": {"path": "parent.json"},
+            "original_plan_payload_sha256": "2" * 64,
+            "original_submission": {"path": "submission.json"},
+            "original_submission_payload_sha256": "1" * 64,
+            "dependency_failure_evidence": {"task": predecessor},
+        },
+    }
+    artifacts = [
+        {
+            "directory": "/enroot/mft_campaign-test/results",
+            "name": f"Mesh{index}.sd",
+            "grid_output_size": size,
+            "grid_output_sha256_sample": f"{index + 1:x}" * 64,
+        }
+        for index, size in enumerate((11 * 1024**3, 17 * 1024**3))
+    ]
+    preflight = {
+        "schema": "thermal-mesh-preflight-v2",
+        "passed": True,
+        "status": "passed_standalone_native_premesh",
+        "mesh_mapping_coverage_passed": True,
+        "mesh_artifact_readback_passed": True,
+        "native_operation_readback_passed": True,
+        "standalone_idle_barrier_passed": True,
+        "postflight_error": "",
+        "native_errors": [],
+        "fresh_mesh_artifact_count": len(artifacts),
+        "fresh_mesh_artifacts": artifacts,
+    }
+    stdout = b"dependency predecessor ran without final result\n"
+    stderr = (
+        "[thermal] native mesh preflight: "
+        + fastlane.json.dumps(preflight, sort_keys=True)
+        + "\n"
+    ).encode()
+    monkeypatch.setattr(
+        fastlane,
+        "_dependency_predecessor_context",
+        lambda _path: (plan, immediate, predecessor),
+    )
+    task_reads = 0
+    stream_reads = {"stdout": 0, "stderr": 0}
+
+    def task_reader(**_kwargs: Any) -> dict[str, Any]:
+        nonlocal task_reads
+        task_reads += 1
+        return dict(predecessor)
+
+    def stream_reader(*, stream: str, **_kwargs: Any) -> bytes:
+        stream_reads[stream] += 1
+        return stdout if stream == "stdout" else stderr
+
+    output = tmp_path / "predecessor-grid.json"
+    fastlane.create_dependency_predecessor_grid_authority(
+        source_plan_path=source,
+        output=output,
+        task_reader=task_reader,
+        stream_reader=stream_reader,
+    )
+    authority = fastlane._load_dependency_predecessor_grid_authority(
+        output
+    )
+    assert task_reads == 2
+    assert stream_reads == {"stdout": 2, "stderr": 2}
+    assert authority["predecessor_task_id"] == 96279
+    assert authority["fresh_grid_output_bytes"] == 28 * 1024**3
+    assert authority["scheduler_methods_used"] == ["GET"]
+    assert authority["scheduler_stream_reads_per_stream"] == 2
+    assert authority["scheduler_mutation_performed"] is False
+    assert authority["retained_bytes_used"] is False
+    assert authority["generic_reservation_used"] is False
 
 
 def test_full_storage_bound_is_eight_sector_source_grid_envelope(

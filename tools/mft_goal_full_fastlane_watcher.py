@@ -59,6 +59,10 @@ STANDARD_STORAGE_BOUND_SCHEMA = (
 SUCCESS_GRID_AUTHORITY_SCHEMA = (
     "mft-goal-first-truth-full-fast-lane-success-grid-authority-v1"
 )
+DEPENDENCY_PREDECESSOR_GRID_AUTHORITY_SCHEMA = (
+    "mft-goal-first-truth-full-fast-lane-dependency-predecessor-grid-"
+    "authority-v1"
+)
 FULL_STORAGE_AUTHORITY_SCHEMA = (
     "mft-goal-first-truth-full-fast-lane-full-storage-authority-v1"
 )
@@ -1245,10 +1249,384 @@ def _load_successful_standard_grid_authority(
     return value
 
 
+def _dependency_predecessor_context(
+    source_plan_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Authenticate the exact failed predecessor named by a dependency retry."""
+    resolved = source_plan_path.resolve(strict=True)
+    dependency = diagnostic._dependency_retry_module()
+    raw = _read_json(resolved)
+    if raw.get("schema_version") != dependency.PLAN_SCHEMA:
+        raise HandoffContractError(
+            "dependency predecessor grid authority requires an R1 plan"
+        )
+    (
+        plan,
+        _params,
+        _selected,
+        immediate_submission,
+        _expected_anchor,
+    ) = dependency._load_plan(resolved)
+    retry = plan.get("retry_of_dependency_failure")
+    failure = (
+        retry.get("dependency_failure_evidence")
+        if isinstance(retry, Mapping)
+        else None
+    )
+    predecessor = failure.get("task") if isinstance(failure, Mapping) else None
+    if (
+        not isinstance(retry, Mapping)
+        or not isinstance(predecessor, Mapping)
+        or retry.get("retry_of_task_id") != immediate_submission.get("task_id")
+        or retry.get("retry_of_task_id") != predecessor.get("task_id")
+        or retry.get("original_plan_payload_sha256")
+        != immediate_submission.get("plan_payload_sha256")
+        or retry.get("original_submission_payload_sha256")
+        != immediate_submission.get("payload_sha256")
+        or retry.get("dependency_failure_evidence_sha256")
+        != canonical_sha256(failure)
+        or predecessor.get("status") != "failed"
+        or predecessor.get("state") != "failed"
+        or predecessor.get("exit_code") is not None
+        or not str(predecessor.get("started_at") or "").strip()
+        or not str(predecessor.get("finished_at") or "").strip()
+        or predecessor.get("project") != scheduler_client.MFT_PROJECT
+        or predecessor.get("aedt_backend") != "standalone"
+        or predecessor.get("cpus") != 8
+        or predecessor.get("memory_mb") != 32768
+        or plan.get("candidate_physics_sha256")
+        != immediate_submission.get("candidate_physics_sha256")
+    ):
+        raise HandoffContractError(
+            "dependency predecessor execution lineage drifted"
+        )
+    return plan, immediate_submission, copy.deepcopy(dict(predecessor))
+
+
+def _dependency_predecessor_grid_stream_evidence(
+    *,
+    stdout: bytes,
+    stderr: bytes,
+    source_plan: Mapping[str, Any],
+    immediate_submission: Mapping[str, Any],
+    predecessor_task: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate native premesh bytes from the exact failed predecessor."""
+    limit = diagnostic.OPERATIONAL_ATTESTATION_MAX_STREAM_BYTES
+    if (
+        not isinstance(stdout, bytes)
+        or not isinstance(stderr, bytes)
+        or not stdout
+        or not stderr
+        or len(stdout) > limit
+        or len(stderr) > limit
+    ):
+        raise HandoffContractError(
+            "dependency predecessor terminal streams are absent or oversized"
+        )
+    try:
+        out_text = stdout.decode("utf-8")
+        err_text = stderr.decode("utf-8")
+    except UnicodeError as exc:
+        raise HandoffContractError(
+            "dependency predecessor terminal streams are not UTF-8"
+        ) from exc
+    if any(line.startswith("RESULT_JSON ") for line in out_text.splitlines()):
+        raise HandoffContractError(
+            "dependency predecessor unexpectedly contains RESULT_JSON"
+        )
+    marker = "[thermal] native mesh preflight: "
+    preflight_lines = [
+        line for line in err_text.splitlines() if marker in line
+    ]
+    if len(preflight_lines) != 1:
+        raise HandoffContractError(
+            "dependency predecessor native premesh evidence is ambiguous"
+        )
+    try:
+        preflight = json.loads(preflight_lines[0].split(marker, 1)[1])
+    except json.JSONDecodeError as exc:
+        raise HandoffContractError(
+            "dependency predecessor native premesh JSON is invalid"
+        ) from exc
+    artifacts = preflight.get("fresh_mesh_artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise HandoffContractError(
+            "dependency predecessor fresh mesh inventory is absent"
+        )
+    grid_bytes = 0
+    normalized_artifacts = []
+    for raw in artifacts:
+        if not isinstance(raw, Mapping):
+            raise HandoffContractError(
+                "dependency predecessor fresh mesh artifact is malformed"
+            )
+        size = _positive_int(
+            raw.get("grid_output_size"),
+            "dependency predecessor grid output size",
+        )
+        directory = str(raw.get("directory") or "")
+        name = str(raw.get("name") or "")
+        if (
+            not directory.startswith(f"{SOLVER_TRANSIENT_ROOT}/")
+            or not name
+            or "/" in name
+            or "\\" in name
+            or production._require_sha(
+                raw.get("grid_output_sha256_sample"),
+                "dependency predecessor grid output sample SHA",
+            )
+            != raw.get("grid_output_sha256_sample")
+        ):
+            raise HandoffContractError(
+                "dependency predecessor grid artifact identity drifted"
+            )
+        grid_bytes += size
+        normalized_artifacts.append(copy.deepcopy(dict(raw)))
+    dependency = diagnostic._dependency_retry_module()
+    normalized_task = dependency._normalized_task_snapshot(predecessor_task)
+    retry = source_plan.get("retry_of_dependency_failure")
+    expected_task = (
+        retry.get("dependency_failure_evidence", {}).get("task")
+        if isinstance(retry, Mapping)
+        else None
+    )
+    stage = source_plan.get("stage")
+    if (
+        normalized_task != expected_task
+        or not isinstance(stage, Mapping)
+        or stage.get("name") != "standard"
+        or stage.get("full_model") != 0
+        or stage.get("thermal_symmetry") != "eighth"
+        or retry.get("retry_of_task_id") != immediate_submission.get("task_id")
+        or retry.get("retry_of_task_id") != normalized_task.get("task_id")
+        or source_plan.get("candidate_physics_sha256")
+        != immediate_submission.get("candidate_physics_sha256")
+        or preflight.get("schema") != "thermal-mesh-preflight-v2"
+        or preflight.get("passed") is not True
+        or preflight.get("status")
+        != "passed_standalone_native_premesh"
+        or preflight.get("mesh_mapping_coverage_passed") is not True
+        or preflight.get("mesh_artifact_readback_passed") is not True
+        or preflight.get("native_operation_readback_passed") is not True
+        or preflight.get("standalone_idle_barrier_passed") is not True
+        or preflight.get("postflight_error") != ""
+        or preflight.get("native_errors") != []
+        or preflight.get("fresh_mesh_artifact_count")
+        != len(normalized_artifacts)
+        or grid_bytes <= 0
+    ):
+        raise HandoffContractError(
+            "dependency predecessor fresh-grid stream authority drifted"
+        )
+    return {
+        "schema_version": (
+            "mft-goal-dependency-predecessor-grid-stream-evidence-v1"
+        ),
+        "task_id": normalized_task["task_id"],
+        "stdout_sha256": production._sha256_bytes(stdout),
+        "stdout_size_bytes": len(stdout),
+        "stderr_sha256": production._sha256_bytes(stderr),
+        "stderr_size_bytes": len(stderr),
+        "native_premesh_sha256": canonical_sha256(preflight),
+        "native_premesh_schema": "thermal-mesh-preflight-v2",
+        "fresh_mesh_artifact_count": len(normalized_artifacts),
+        "fresh_grid_output_bytes": grid_bytes,
+        "solver_transient_root": SOLVER_TRANSIENT_ROOT,
+        "source_full_model": 0,
+        "source_thermal_symmetry": "eighth",
+        "predecessor_terminal_state": "failed_dependency",
+        "result_json_required": False,
+    }
+
+
+def _dependency_predecessor_grid_authority_payload(
+    *,
+    source_plan_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    predecessor_task: Mapping[str, Any],
+) -> dict[str, Any]:
+    resolved = source_plan_path.resolve(strict=True)
+    plan, immediate_submission, sealed_predecessor = (
+        _dependency_predecessor_context(resolved)
+    )
+    stdout_path = stdout_path.resolve(strict=True)
+    stderr_path = stderr_path.resolve(strict=True)
+    normalized_task = diagnostic._dependency_retry_module()._normalized_task_snapshot(
+        predecessor_task
+    )
+    if normalized_task != sealed_predecessor:
+        raise HandoffContractError(
+            "dependency predecessor Scheduler GET snapshot drifted"
+        )
+    evidence = _dependency_predecessor_grid_stream_evidence(
+        stdout=stdout_path.read_bytes(),
+        stderr=stderr_path.read_bytes(),
+        source_plan=plan,
+        immediate_submission=immediate_submission,
+        predecessor_task=normalized_task,
+    )
+    retry = plan["retry_of_dependency_failure"]
+    return {
+        "schema_version": DEPENDENCY_PREDECESSOR_GRID_AUTHORITY_SCHEMA,
+        "campaign_id": CAMPAIGN_ID,
+        "source_standard_plan": production._file_record(resolved),
+        "source_standard_plan_payload_sha256": plan["payload_sha256"],
+        "source_standard_submission": copy.deepcopy(
+            retry["original_submission"]
+        ),
+        "source_standard_submission_payload_sha256": retry[
+            "original_submission_payload_sha256"
+        ],
+        "predecessor_standard_plan": copy.deepcopy(retry["original_plan"]),
+        "predecessor_standard_plan_payload_sha256": retry[
+            "original_plan_payload_sha256"
+        ],
+        "predecessor_task_id": sealed_predecessor["task_id"],
+        "candidate_physics_sha256": plan["candidate_physics_sha256"],
+        "predecessor_task_snapshot": sealed_predecessor,
+        "predecessor_task_snapshot_sha256": canonical_sha256(
+            sealed_predecessor
+        ),
+        "stdout": production._file_record(stdout_path),
+        "stderr": production._file_record(stderr_path),
+        "stream_evidence": evidence,
+        "stream_evidence_sha256": canonical_sha256(evidence),
+        "fresh_grid_output_bytes": evidence["fresh_grid_output_bytes"],
+        "source": (
+            "dependency_predecessor_scheduler_GET_native_premesh_streams"
+        ),
+        "scheduler_methods_used": ["GET"],
+        "scheduler_stream_reads_per_stream": 2,
+        "scheduler_task_snapshot_reads": 2,
+        "scheduler_submission_performed": False,
+        "scheduler_cancel_performed": False,
+        "scheduler_mutation_performed": False,
+        "retained_bytes_used": False,
+        "generic_reservation_used": False,
+    }
+
+
+def create_dependency_predecessor_grid_authority(
+    *,
+    source_plan_path: Path,
+    output: Path,
+    task_reader: Any = diagnostic._scheduler_task_snapshot,
+    stream_reader: Any = diagnostic._scheduler_operational_stream,
+) -> Path:
+    plan, immediate_submission, _sealed_predecessor = (
+        _dependency_predecessor_context(source_plan_path)
+    )
+    scheduler_url = plan["stage"]["scheduler_url"]
+    task_id = _positive_int(
+        immediate_submission.get("task_id"),
+        "dependency predecessor task ID",
+    )
+    first_task = task_reader(scheduler_url=scheduler_url, task_id=task_id)
+    first_stdout = stream_reader(
+        scheduler_url=scheduler_url, task_id=task_id, stream="stdout"
+    )
+    first_stderr = stream_reader(
+        scheduler_url=scheduler_url, task_id=task_id, stream="stderr"
+    )
+    second_task = task_reader(scheduler_url=scheduler_url, task_id=task_id)
+    second_stdout = stream_reader(
+        scheduler_url=scheduler_url, task_id=task_id, stream="stdout"
+    )
+    second_stderr = stream_reader(
+        scheduler_url=scheduler_url, task_id=task_id, stream="stderr"
+    )
+    if (
+        first_task != second_task
+        or first_stdout != second_stdout
+        or first_stderr != second_stderr
+        or not isinstance(first_task, Mapping)
+        or not isinstance(first_stdout, bytes)
+        or not isinstance(first_stderr, bytes)
+    ):
+        raise HandoffContractError(
+            "dependency predecessor GET evidence changed during capture"
+        )
+    path = output.resolve()
+    stdout_path = path.with_suffix(".stdout.log")
+    stderr_path = path.with_suffix(".stderr.log")
+    _write_immutable_bytes(stdout_path, first_stdout)
+    _write_immutable_bytes(stderr_path, first_stderr)
+    value = _sealed(
+        {
+            **_dependency_predecessor_grid_authority_payload(
+                source_plan_path=source_plan_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                predecessor_task=first_task,
+            ),
+            "created_at_utc": _now(),
+        }
+    )
+    if path.exists():
+        observed = _load_dependency_predecessor_grid_authority(path)
+        comparable = {
+            key: item
+            for key, item in observed.items()
+            if key not in {"payload_sha256", "created_at_utc"}
+        }
+        expected = {
+            key: item
+            for key, item in value.items()
+            if key not in {"payload_sha256", "created_at_utc"}
+        }
+        if comparable != expected:
+            raise HandoffContractError(
+                "existing dependency predecessor grid authority differs"
+            )
+        return path
+    return _write_immutable(path, value)
+
+
+def _load_dependency_predecessor_grid_authority(
+    path: Path,
+) -> dict[str, Any]:
+    value = _validate_seal(
+        _read_json(path.resolve(strict=True)),
+        DEPENDENCY_PREDECESSOR_GRID_AUTHORITY_SCHEMA,
+        label="dependency predecessor grid authority",
+    )
+    for name in ("source_standard_plan", "stdout", "stderr"):
+        record = value.get(name)
+        if (
+            not isinstance(record, Mapping)
+            or production._file_record(
+                Path(str(record.get("path") or ""))
+            )
+            != record
+        ):
+            raise HandoffContractError(
+                f"dependency predecessor grid {name} bytes drifted"
+            )
+    predecessor = value.get("predecessor_task_snapshot")
+    if not isinstance(predecessor, Mapping):
+        raise HandoffContractError(
+            "dependency predecessor task snapshot is absent"
+        )
+    expected = _dependency_predecessor_grid_authority_payload(
+        source_plan_path=Path(value["source_standard_plan"]["path"]),
+        stdout_path=Path(value["stdout"]["path"]),
+        stderr_path=Path(value["stderr"]["path"]),
+        predecessor_task=predecessor,
+    )
+    if any(value.get(key) != item for key, item in expected.items()):
+        raise HandoffContractError(
+            "dependency predecessor grid authority drifted"
+        )
+    return value
+
+
 def _authenticated_standard_grid_evidence(
     source_plan_path: Path,
     *,
     successful_grid_authority_path: Path | None = None,
+    dependency_predecessor_grid_authority_path: Path | None = None,
 ) -> dict[str, Any]:
     """Reauthenticate an actual fresh Standard grid, never retained bytes."""
     resolved = source_plan_path.resolve(strict=True)
@@ -1261,14 +1639,35 @@ def _authenticated_standard_grid_evidence(
         retained = stage.get("retained_aedt_bundle") if isinstance(
             stage, Mapping
         ) else None
-        if successful_grid_authority_path is None:
+        if (
+            successful_grid_authority_path is not None
+            and dependency_predecessor_grid_authority_path is not None
+        ):
+            raise HandoffContractError(
+                "source Standard successor has ambiguous grid authorities"
+            )
+        if (
+            successful_grid_authority_path is None
+            and dependency_predecessor_grid_authority_path is None
+        ):
             raise HandoffContractError(
                 "source Standard successor has no embedded fresh-grid "
                 "evidence and no terminal-success stream authority"
             )
-        authority = _load_successful_standard_grid_authority(
-            successful_grid_authority_path
-        )
+        if successful_grid_authority_path is not None:
+            authority = _load_successful_standard_grid_authority(
+                successful_grid_authority_path
+            )
+            authority_kind = "terminal_success_native_premesh_stream"
+            authority_task_key = "standard_task_id"
+        else:
+            authority = _load_dependency_predecessor_grid_authority(
+                dependency_predecessor_grid_authority_path
+            )
+            authority_kind = (
+                "dependency_predecessor_native_premesh_stream"
+            )
+            authority_task_key = "predecessor_task_id"
         try:
             logical_id = terminal._logical_authority_id(source_plan)
         except Exception as exc:
@@ -1287,11 +1686,11 @@ def _authenticated_standard_grid_evidence(
             != source_plan["payload_sha256"]
             or authority.get("candidate_physics_sha256")
             != source_plan["candidate_physics_sha256"]
-            or authority.get("standard_task_id")
+            or authority.get(authority_task_key)
             != authority.get("stream_evidence", {}).get("task_id")
         ):
             raise HandoffContractError(
-                "source Standard terminal-success grid lineage drifted"
+                "source Standard successor grid lineage drifted"
             )
         grid_bytes = _positive_int(
             authority.get("fresh_grid_output_bytes"),
@@ -1315,9 +1714,12 @@ def _authenticated_standard_grid_evidence(
             ],
             "storage_audit_sha256": None,
             "fresh_grid_provenance": {
-                "kind": "terminal_success_native_premesh_stream",
+                "kind": authority_kind,
                 "authority": production._file_record(
-                    successful_grid_authority_path.resolve(strict=True)
+                    (
+                        successful_grid_authority_path
+                        or dependency_predecessor_grid_authority_path
+                    ).resolve(strict=True)
                 ),
                 "authority_payload_sha256": authority["payload_sha256"],
                 "scheduler_methods_used": ["GET"],
@@ -1407,7 +1809,27 @@ def create_standard_storage_bound_authority(
 ) -> Path:
     """Seal a live Standard task bound from its authenticated source grid."""
     task_id = _positive_int(task_id, "active Standard task ID")
-    evidence = _authenticated_standard_grid_evidence(source_plan_path)
+    dependency_authority_path = None
+    dependency = diagnostic._dependency_retry_module()
+    if (
+        _read_json(source_plan_path.resolve(strict=True)).get(
+            "schema_version"
+        )
+        == dependency.PLAN_SCHEMA
+    ):
+        dependency_authority_path = output.resolve().with_suffix(
+            ".dependency-predecessor-grid.json"
+        )
+        create_dependency_predecessor_grid_authority(
+            source_plan_path=source_plan_path,
+            output=dependency_authority_path,
+        )
+    evidence = _authenticated_standard_grid_evidence(
+        source_plan_path,
+        dependency_predecessor_grid_authority_path=(
+            dependency_authority_path
+        ),
+    )
     value = _sealed(
         {
             "schema_version": STANDARD_STORAGE_BOUND_SCHEMA,
@@ -1464,8 +1886,32 @@ def _load_standard_storage_bound(
         raise HandoffContractError(
             "Standard active storage source plan is absent"
         )
+    provenance = value.get("fresh_grid_provenance")
+    dependency_authority_path = None
+    if (
+        isinstance(provenance, Mapping)
+        and provenance.get("kind")
+        == "dependency_predecessor_native_premesh_stream"
+    ):
+        authority_record = provenance.get("authority")
+        if not isinstance(authority_record, Mapping):
+            raise HandoffContractError(
+                "Standard active dependency grid authority is absent"
+            )
+        dependency_authority_path = Path(
+            str(authority_record.get("path") or "")
+        )
+        if production._file_record(
+            dependency_authority_path.resolve(strict=True)
+        ) != authority_record:
+            raise HandoffContractError(
+                "Standard active dependency grid authority bytes drifted"
+            )
     evidence = _authenticated_standard_grid_evidence(
-        Path(str(source_record.get("path") or ""))
+        Path(str(source_record.get("path") or "")),
+        dependency_predecessor_grid_authority_path=(
+            dependency_authority_path
+        ),
     )
     if (
         value.get("campaign_id") != CAMPAIGN_ID
@@ -1850,6 +2296,11 @@ def build_gpfs_audit(
                 "authority_payload_sha256": authority["payload_sha256"],
             }
         )
+    unscoped_conflicts = [
+        copy.deepcopy(item)
+        for item in conflicts
+        if item.get("task", {}).get("account_name") not in observations
+    ]
     accounts = []
     for account, observation in sorted(observations.items()):
         active_bytes = reservations[account]
@@ -1863,6 +2314,11 @@ def build_gpfs_audit(
         bounded_count = sum(
             1 for item in bounded if item["account_name"] == account
         )
+        account_conflicts = [
+            copy.deepcopy(item)
+            for item in conflicts
+            if item.get("task", {}).get("account_name") == account
+        ]
         accounts.append(
             {
                 **observation,
@@ -1872,15 +2328,28 @@ def build_gpfs_audit(
                 "active_storage_bound_gib": active_gib,
                 "free_after_active_gb": free_after_active,
                 "minimum_free_floor_gb": MINIMUM_GPFS_FREE_GB,
+                "active_unbounded_storage_conflicts": account_conflicts,
+                "active_unbounded_storage_conflict_count": len(
+                    account_conflicts
+                ),
                 "active_only_arithmetic_passed": (
-                    free_after_active >= MINIMUM_GPFS_FREE_GB
+                    not account_conflicts
+                    and not unscoped_conflicts
+                    and free_after_active >= MINIMUM_GPFS_FREE_GB
                 ),
             }
         )
-    passed = (
-        not conflicts
-        and any(item["active_only_arithmetic_passed"] for item in accounts)
-    )
+    admissible_accounts = [
+        item["account_name"]
+        for item in accounts
+        if item["active_only_arithmetic_passed"]
+    ]
+    blocked_accounts = [
+        item["account_name"]
+        for item in accounts
+        if not item["active_only_arithmetic_passed"]
+    ]
+    passed = not unscoped_conflicts and bool(admissible_accounts)
     return _sealed(
         {
             "schema_version": GPFS_AUDIT_SCHEMA,
@@ -1905,6 +2374,13 @@ def build_gpfs_audit(
             ],
             "active_unbounded_storage_conflicts": conflicts,
             "active_unbounded_storage_conflict_count": len(conflicts),
+            "unscoped_active_storage_conflicts": unscoped_conflicts,
+            "unscoped_active_storage_conflict_count": len(
+                unscoped_conflicts
+            ),
+            "active_unbounded_conflicts_isolated_by_account": True,
+            "admissible_account_names": admissible_accounts,
+            "blocked_account_names": blocked_accounts,
             "active_storage_bound_source": (
                 "per-task_authenticated_fresh_grid_output_bytes"
             ),
@@ -1964,10 +2440,12 @@ def _load_gpfs_audit(
         raise HandoffContractError("Full fast-lane GPFS audit drifted")
     if (
         audit.get("arithmetic_passed") is not True
-        or audit.get("active_unbounded_storage_conflict_count") != 0
+        or audit.get("active_unbounded_conflicts_isolated_by_account")
+        is not True
+        or not audit.get("admissible_account_names")
     ):
         raise HandoffContractError(
-            "Full fast-lane GPFS audit has an unbounded storage conflict"
+            "Full fast-lane GPFS audit has no admissible account"
         )
     if require_fresh:
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
