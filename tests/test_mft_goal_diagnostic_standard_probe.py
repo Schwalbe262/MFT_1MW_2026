@@ -2600,6 +2600,147 @@ def test_scheduler_client_strict_opt_in_sends_policy_and_returns_post_evidence(
     ] == "strict"
 
 
+def test_mesh_quality_canary_authenticates_nested_preflight_and_ignores_supplementals():
+    submission = {
+        "task_id": probe.MESH_QUALITY_CANARY_FAILED_TASK_ID,
+        "task_name": "source-timeout",
+        "dedupe_key": "source-dedupe",
+    }
+    snapshot = {
+        "task_id": probe.MESH_QUALITY_CANARY_FAILED_TASK_ID,
+        "name": submission["task_name"],
+        "status": "failed",
+        "state": "failed",
+        "exit_code": 1,
+        "failure_message": probe.MESH_QUALITY_CANARY_FAILURE_MESSAGE,
+        "slurm_job_id": "826839",
+        "allocation_id": 14619,
+        "account_name": "jji0930",
+        "actual_node_name": "n108",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 28800,
+        "aedt_backend": "standalone",
+        "project": scheduler_client.MFT_PROJECT,
+        "dedupe_key": submission["dedupe_key"],
+        "remote_cwd": "runs",
+        "remote_dir": "task-96264",
+        "finished_at": "2026-07-25T06:22:41Z",
+    }
+    result = {
+        "thermal_iterations": 0,
+        "thermal_convergence_reason": "native_terminal_error",
+        "thermal_dispatch_forensic_json": json.dumps({
+            "attempts": [{
+                "mesh_preflight": {
+                    "nested_readback": {"operation_count": 35},
+                    "passed": True,
+                }
+            }]
+        }),
+    }
+    stdout = (
+        probe.MESH_QUALITY_CANARY_NATIVE_MESSAGE
+        + "\nrx_side_block_mesh_level_ABC123_L_5\n"
+        + "RESULT_JSON "
+        + json.dumps(result)
+    )
+    evidence = probe._mesh_quality_failure_evidence(
+        snapshot, stdout, submission=submission
+    )
+    assert evidence["passed_native_premesh_marker_count"] == 1
+    assert evidence["zero_iteration_convergence_marker_count"] == 1
+
+    plan = {
+        "stage": {
+            "task_name": "mft-goal-diag-standard-mesh-canary-r1-"
+            "l96225-7a6ccac265d3",
+            "retained_aedt_bundle": {"dedupe_key": "canary-dedupe"},
+        }
+    }
+    supplementals = [
+        {"task_id": task_id, "name": f"supplemental-{task_id}"}
+        for task_id in (96269, 96271, 96272)
+    ]
+    guard = probe._mesh_quality_canary_sibling_snapshot(
+        supplementals, plan=plan
+    )
+    probe._validate_mesh_quality_canary_sibling_snapshot(
+        guard, plan=plan, expected_count=0
+    )
+    assert guard["rejected_supplemental_task_ids_present"] == [
+        96269,
+        96271,
+        96272,
+    ]
+
+
+def test_mesh_quality_canary_retains_bundle_after_failed_simulation(
+    monkeypatch,
+):
+    captured = {}
+
+    class _Response:
+        status_code = 201
+
+        @staticmethod
+        def json():
+            return {"id": 73002}
+
+    monkeypatch.setattr(
+        scheduler_client,
+        "retained_aedt_identity",
+        lambda *_args, **_kwargs: {"schema_version": "canary"},
+    )
+    monkeypatch.setattr(
+        scheduler_client,
+        "_retained_aedt_export_command",
+        lambda _retained: "MFT_CANARY_EXPORT=1; ",
+    )
+    monkeypatch.setattr(
+        scheduler_client,
+        "_runtime_license_refresh_command",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        scheduler_client,
+        "reconcile_task_id",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        scheduler_client,
+        "live_project_submission_snapshot",
+        lambda *_args, **_kwargs: {"project_submission_slots": 1},
+    )
+
+    def post(_url, *, json, timeout):
+        captured["payload"] = json
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(scheduler_client.requests, "post", post)
+    task_id = scheduler_client.submit_verification(
+        "mesh-canary-retention-test",
+        "mesh_canary_retention_test",
+        {"N1": 6},
+        {
+            "schema_version": probe.MESH_QUALITY_CANARY_PROFILE_SCHEMA,
+            "timeout_seconds": 60,
+            "cli_flags": "",
+        },
+        solver_revision="a" * 40,
+        library_revision="b" * 40,
+        required_project_cap=500,
+        max_project_active_tasks=500,
+        scheduler_url=probe.DIAGNOSTIC_SCHEDULER_URL,
+    )
+    assert task_id == 73002
+    command = captured["payload"]["command"]
+    assert "simulation_rc=$?" in command
+    assert "MFT_CANARY_EXPORT=1" in command
+    assert 'if [ "$simulation_rc" -eq 0 ]' not in command
+
+
 def test_timeout_retry_parser_exposes_complete_same_allocation_contract():
     claim_init = probe._parser().parse_args(
         ["init-operational-pressure-claim-root"]

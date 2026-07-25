@@ -703,6 +703,12 @@ def retained_aedt_identity(
                     "goal_diagnostic_standard_timeout_retry.json"
                 ),
                 (
+                    "mft-goal-diagnostic-standard-mesh-quality-"
+                    "canary-profile-v1"
+                ): (
+                    "goal_diagnostic_standard_mesh_quality_canary.json"
+                ),
+                (
                     "mft-goal-diagnostic-standard-"
                     "operational-pressure-retry-profile-v1"
                 ): (
@@ -1475,6 +1481,13 @@ def _submit_verification_locked(
                   f"[ -d {quoted_library}/src ] && "
                   f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n' && ")
     retained_export = _retained_aedt_export_command(retained)
+    retain_failed_mesh_canary = (
+        profile.get("schema_version")
+        == (
+            "mft-goal-diagnostic-standard-mesh-quality-"
+            "canary-profile-v1"
+        )
+    )
     runtime_license_refresh = _runtime_license_refresh_command(
         retained, normalized_env, solver_revision
     )
@@ -1495,8 +1508,15 @@ def _submit_verification_locked(
         + "simulation_rc=$?; "
         + f"printf 'MFT_LIBRARY_GIT_HASH {library_revision}\\n'; "
         + (
-            f"if [ \"$simulation_rc\" -eq 0 ]; then {retained_export}"
-            "else exit \"$simulation_rc\"; fi; "
+            (
+                retained_export
+                if retain_failed_mesh_canary
+                else (
+                    f"if [ \"$simulation_rc\" -eq 0 ]; then "
+                    f"{retained_export}"
+                    "else exit \"$simulation_rc\"; fi; "
+                )
+            )
             if retained is not None
             else ""
         )

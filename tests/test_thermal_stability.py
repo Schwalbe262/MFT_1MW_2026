@@ -6,7 +6,7 @@ import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -660,7 +660,9 @@ class ThermalStabilityTest(unittest.TestCase):
             AreThereSimulationsRunning=Mock(side_effect=list(running))
         )
         if desktop_attestor is None:
-            desktop_attestor = lambda target: target
+            def desktop_attestor(target):
+                return target
+
         with patch.object(
                 aedt_pool_adapter, "pooled_backend_enabled",
                 return_value=False), patch.object(
@@ -3766,6 +3768,70 @@ class ThermalStabilityTest(unittest.TestCase):
                 )
 
         self.assertFalse(sim.solver_may_be_running)
+
+    def test_mesh_stats_export_seals_native_quality_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def export_mesh_stats(setup_name, output_file=None):
+                self.assertEqual(setup_name, "ThermalSetup")
+                target = Path(output_file)
+                target.write_text(
+                    "Skewness\nElement Volume\nFace Alignment\n",
+                    encoding="utf-8",
+                )
+                return str(target)
+
+            evidence = thermal._export_thermal_mesh_stats(
+                SimpleNamespace(
+                    results_directory=str(root),
+                    export_mesh_stats=export_mesh_stats,
+                ),
+                "ThermalSetup",
+            )
+
+        self.assertTrue(evidence["exported"])
+        self.assertEqual(
+            evidence["quality_metrics_reported"],
+            ["element_volume", "face_alignment", "skewness"],
+        )
+        self.assertFalse(evidence["mesh_quality_checks_modified"])
+        self.assertFalse(
+            evidence["mesh_quality_check_disable_requested"]
+        )
+
+    def test_setup_control_readback_fails_on_native_drift(self):
+        props = {
+            "Flow Regime": "Turbulent",
+            "Convergence Criteria - Max Iterations": 250,
+            "Convergence Criteria - Flow": "0.001",
+            "Convergence Criteria - Energy": "1e-7",
+            "Solution Initialization - Use Model Based Flow Initialization": False,
+            "Under-relaxation - Pressure": "0.7",
+            "Sequential Solve of Flow and Energy Equations": False,
+            "Include Gravity": False,
+        }
+        setup = SimpleNamespace(props=props)
+        native = SimpleNamespace(
+            GetPropNames=lambda: list(props),
+            GetPropValue=lambda name: props[name],
+        )
+        evidence = thermal._thermal_setup_control_readback(setup, native)
+        self.assertTrue(evidence["wrapper_passed"])
+        self.assertTrue(evidence["native_complete"])
+
+        drifted = dict(props)
+        drifted["Under-relaxation - Pressure"] = "0.6"
+        with self.assertRaisesRegex(
+            RuntimeError, "native ThermalSetup control drifted"
+        ):
+            thermal._thermal_setup_control_readback(
+                setup,
+                SimpleNamespace(
+                    GetPropNames=lambda: list(drifted),
+                    GetPropValue=lambda name: drifted[name],
+                ),
+            )
 
     def test_converged_analyze_rejects_fresh_unmeshed_warning_no_retry(self):
         from module import aedt_pool_adapter

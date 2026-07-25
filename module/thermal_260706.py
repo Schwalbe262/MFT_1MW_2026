@@ -85,6 +85,15 @@ _RX_INSULATION_KEYS = (
 THERMAL_MESH_POLICY = "b3-rxmain-l5-wcp-pad-padded-regions-v1"
 THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v4"
 THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION = "thermal-mesh-preflight-v2"
+THERMAL_MESH_STATS_CONTRACT_VERSION = "thermal-native-mesh-stats-v1"
+THERMAL_SETUP_CONTROL_READBACK_CONTRACT_VERSION = (
+    "thermal-native-setup-control-readback-v1"
+)
+THERMAL_MESH_STATS_FILENAME = "icepak_thermal_mesh_quality.ms"
+THERMAL_MESH_STATS_MAX_BYTES = 64 * 1024 * 1024
+WCP_PAD_MESH_REGION_CONTRACT_VERSION = (
+    "wcp-pad-per-object-anisotropic-region-v1"
+)
 WCP_PAD_MESH_REGION_PADDING_TYPE = "Absolute Offset"
 WCP_PAD_MESH_REGION_PADDING_MM = 2.0
 _WCP_PAD_MESH_REGION_DIRECTIONS = (
@@ -2372,6 +2381,7 @@ def _prepare_thermal_dispatch(
         raise RuntimeError("ThermalSetup is disabled or has no Enabled readback")
     enabled_source = "wrapper"
     native_enabled = None
+    setup_child = None
     try:
         analysis_child = native_design.GetChildObject("Analysis")
         setup_child = analysis_child.GetChildObject(setup_name)
@@ -2387,6 +2397,10 @@ def _prepare_thermal_dispatch(
             raise RuntimeError("native ThermalSetup Enabled readback is false")
         enabled_source = "native+wrapper"
 
+    setup_control_readback = _thermal_setup_control_readback(
+        setup, setup_child
+    )
+
     if not pooled_backend:
         running = _thermal_running_state(sim, ipk)
         if running is not False:
@@ -2401,8 +2415,120 @@ def _prepare_thermal_dispatch(
         "wrapper_setups": list(wrapper_setups),
         "enabled": True,
         "enabled_source": enabled_source,
+        "setup_control_readback": setup_control_readback,
         "native_ipk": native_ipk,
         "native_design": native_design,
+    }
+
+
+def _thermal_setup_control_readback(setup, native_setup_child=None):
+    """Attest the unchanged Icepak controls from wrapper and native OO state."""
+
+    props = getattr(setup, "props", None)
+    if not hasattr(props, "get"):
+        raise RuntimeError("ThermalSetup control wrapper readback is absent")
+    try:
+        max_iterations = int(
+            props.get("Convergence Criteria - Max Iterations")
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "ThermalSetup maximum-iteration readback is invalid"
+        ) from exc
+    if max_iterations <= 0:
+        raise RuntimeError(
+            "ThermalSetup maximum-iteration readback is not positive"
+        )
+    expected = {
+        "Flow Regime": "Turbulent",
+        "Convergence Criteria - Max Iterations": max_iterations,
+        "Convergence Criteria - Flow": 0.001,
+        "Convergence Criteria - Energy": 1e-7,
+        "Solution Initialization - Use Model Based Flow Initialization": False,
+        "Under-relaxation - Pressure": 0.7,
+        "Sequential Solve of Flow and Energy Equations": False,
+        "Include Gravity": False,
+    }
+    def normalize(name, value):
+        wanted = expected[name]
+        if isinstance(wanted, bool):
+            return _thermal_bool(value)
+        if isinstance(wanted, str):
+            return str(value or "").strip()
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"ThermalSetup control {name!r} is nonnumeric: {value!r}"
+            ) from exc
+        if not math.isfinite(number):
+            raise RuntimeError(
+                f"ThermalSetup control {name!r} is nonfinite"
+            )
+        return int(number) if isinstance(wanted, int) else number
+
+    wrapper = {}
+    for name, wanted in expected.items():
+        observed = normalize(name, props.get(name))
+        if observed != wanted:
+            raise RuntimeError(
+                "ThermalSetup wrapper control drifted: "
+                f"{name}={observed!r}, expected={wanted!r}"
+            )
+        wrapper[name] = observed
+
+    native = {}
+    native_missing = []
+    get_value = getattr(native_setup_child, "GetPropValue", None)
+    get_names = getattr(native_setup_child, "GetPropNames", None)
+    native_property_names = set()
+    native_property_inventory_available = False
+    if callable(get_names):
+        try:
+            native_property_names = {
+                str(name) for name in (get_names() or [])
+            }
+            native_property_inventory_available = True
+        except Exception:
+            native_property_names = set()
+    for name, wanted in expected.items():
+        if (
+            not callable(get_value)
+            or not native_property_inventory_available
+            or name not in native_property_names
+        ):
+            native_missing.append(name)
+            continue
+        try:
+            raw_value = get_value(name)
+            if raw_value is None or (
+                isinstance(raw_value, str) and not raw_value.strip()
+            ):
+                native_missing.append(name)
+                continue
+            observed = normalize(name, raw_value)
+        except Exception:
+            native_missing.append(name)
+            continue
+        if observed != wanted:
+            raise RuntimeError(
+                "native ThermalSetup control drifted: "
+                f"{name}={observed!r}, expected={wanted!r}"
+            )
+        native[name] = observed
+    return {
+        "schema": THERMAL_SETUP_CONTROL_READBACK_CONTRACT_VERSION,
+        "expected": expected,
+        "wrapper": wrapper,
+        "native": native,
+        "native_missing": native_missing,
+        "native_property_inventory_available": (
+            native_property_inventory_available
+        ),
+        "wrapper_passed": True,
+        "native_complete": not native_missing,
+        "mesh_quality_checks_modified": False,
+        "mesh_quality_check_disable_requested": False,
     }
 
 
@@ -3426,6 +3552,102 @@ def _wait_for_standalone_mesh_idle(
         ))
 
 
+def _mesh_quality_canary_requested(mesh_plan):
+    """Return true only for the reviewed level-4 Rx-side numerical canary."""
+
+    operations = mesh_plan.get("operations", [])
+    side_operations = [
+        operation
+        for operation in operations
+        if isinstance(operation, dict)
+        and operation.get("category")
+        in {"Rx_side_blocks", "Rx_side2_blocks"}
+        and operation.get("objects")
+    ]
+    return bool(side_operations) and all(
+        operation.get("operation_type") == "object_level"
+        and int(operation.get("level", -1)) == 4
+        for operation in side_operations
+    )
+
+
+def _export_thermal_mesh_stats(native_ipk, setup_name):
+    """Export and seal native mesh statistics without changing mesh checks."""
+
+    results_directory = str(
+        getattr(native_ipk, "results_directory", "") or ""
+    ).strip()
+    if not results_directory:
+        raise RuntimeError(
+            "native mesh statistics require an AEDT results directory"
+        )
+    root = Path(results_directory).resolve(strict=True)
+    if not root.is_dir() or root.is_symlink():
+        raise RuntimeError(
+            "native mesh statistics results directory is unsafe"
+        )
+    target = root / THERMAL_MESH_STATS_FILENAME
+    if target.exists():
+        raise RuntimeError("native mesh statistics target already exists")
+    exporter = getattr(native_ipk, "export_mesh_stats", None)
+    if not callable(exporter):
+        raise RuntimeError(
+            "native Icepak ExportMeshStats API is unavailable"
+        )
+    returned = exporter(setup_name, output_file=str(target))
+    try:
+        returned_path = Path(str(returned)).resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "native ExportMeshStats returned no durable file"
+        ) from exc
+    if returned_path != target.resolve(strict=True):
+        raise RuntimeError(
+            "native ExportMeshStats returned an unexpected path"
+        )
+    if not returned_path.is_file() or returned_path.is_symlink():
+        raise RuntimeError(
+            "native mesh statistics artifact is not a regular file"
+        )
+    size = returned_path.stat().st_size
+    if not 0 < size <= THERMAL_MESH_STATS_MAX_BYTES:
+        raise RuntimeError(
+            f"native mesh statistics size is invalid: {size}"
+        )
+    raw = returned_path.read_bytes()
+    if len(raw) != size:
+        raise RuntimeError(
+            "native mesh statistics changed during authentication"
+        )
+    text = raw.decode("utf-8", errors="replace")
+    patterns = {
+        "skewness": r"\bskew(?:ness)?\b",
+        "element_volume": r"\b(?:element|cell\s+)?volume\b",
+        "face_alignment": r"\bface\s+alignment\b",
+    }
+    occurrences = {
+        name: len(re.findall(pattern, text, flags=re.IGNORECASE))
+        for name, pattern in patterns.items()
+    }
+    return {
+        "schema": THERMAL_MESH_STATS_CONTRACT_VERSION,
+        "export_api": "Icepak.export_mesh_stats/oDesign.ExportMeshStats",
+        "setup_name": setup_name,
+        "path": returned_path.name,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size_bytes": size,
+        "line_count": len(text.splitlines()),
+        "quality_metric_occurrences": occurrences,
+        "quality_metrics_reported": sorted(
+            name for name, count in occurrences.items() if count > 0
+        ),
+        "quality_metric_availability_recorded": True,
+        "mesh_quality_checks_modified": False,
+        "mesh_quality_check_disable_requested": False,
+        "exported": True,
+    }
+
+
 def _generate_and_attest_thermal_mesh(
     sim,
     ipk,
@@ -3620,6 +3842,37 @@ def _generate_and_attest_thermal_mesh(
                 f"{type(exc).__name__}: {str(exc)[:512]}"
             )
 
+    mesh_quality_canary = _mesh_quality_canary_requested(mesh_plan)
+    setup_control_readback = preflight.get(
+        "setup_control_readback", {}
+    )
+    mesh_stats = {
+        "schema": THERMAL_MESH_STATS_CONTRACT_VERSION,
+        "exported": False,
+        "not_requested": True,
+        "mesh_quality_checks_modified": False,
+        "mesh_quality_check_disable_requested": False,
+    }
+    if mesh_quality_canary:
+        if (
+            not isinstance(setup_control_readback, dict)
+            or setup_control_readback.get("schema")
+            != THERMAL_SETUP_CONTROL_READBACK_CONTRACT_VERSION
+            or setup_control_readback.get("wrapper_passed") is not True
+            or setup_control_readback.get("native_complete") is not True
+            or setup_control_readback.get(
+                "mesh_quality_check_disable_requested"
+            )
+            is not False
+        ):
+            raise RuntimeError(
+                "mesh-quality canary lacks complete native setup-control "
+                "readback"
+            )
+        mesh_stats = _export_thermal_mesh_stats(
+            native_ipk, _THERMAL_SETUP_NAME
+        )
+
     message_payload = {
         "messages": list(new_messages),
         "errors": list(new_errors),
@@ -3650,6 +3903,10 @@ def _generate_and_attest_thermal_mesh(
             "required_thin_objects_missing"
         ]
         and idle_barrier.get("passed") is True
+        and (
+            not mesh_quality_canary
+            or mesh_stats.get("exported") is True
+        )
     )
     evidence = {
         "schema": THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION,
@@ -3682,6 +3939,9 @@ def _generate_and_attest_thermal_mesh(
         "fresh_mesh_artifacts": fresh_artifacts,
         "postflight_identity_passed": postflight_passed,
         "postflight_error": postflight_error,
+        "mesh_quality_canary_requested": mesh_quality_canary,
+        "setup_control_readback": setup_control_readback,
+        "native_mesh_stats": mesh_stats,
         "analysis_dispatched_after_premesh": False,
         "mesh_policy": THERMAL_MESH_POLICY,
         "mesh_plan_sha256": mesh_plan["plan_sha256"],
@@ -3769,6 +4029,17 @@ def _pooled_thermal_mesh_preflight_not_applicable(mesh_plan):
         },
         "native_operation_readback_passed": False,
         "postflight_identity_passed": False,
+        "mesh_quality_canary_requested": (
+            _mesh_quality_canary_requested(mesh_plan)
+        ),
+        "setup_control_readback": {},
+        "native_mesh_stats": {
+            "schema": THERMAL_MESH_STATS_CONTRACT_VERSION,
+            "exported": False,
+            "not_requested": True,
+            "mesh_quality_checks_modified": False,
+            "mesh_quality_check_disable_requested": False,
+        },
         "mesh_policy": THERMAL_MESH_POLICY,
         "mesh_plan_sha256": mesh_plan["plan_sha256"],
         "mesh_operation_count": mesh_plan["operation_count"],
@@ -3825,6 +4096,10 @@ def _thermal_mesh_result_metadata(mesh_plan, preflight):
             "thermal mesh result metadata requires a passed pre-solve "
             "attestation and a later Analyze dispatch"
         )
+    mesh_stats = preflight.get("native_mesh_stats", {})
+    setup_control_readback = preflight.get(
+        "setup_control_readback", {}
+    )
     return {
         "thermal_mesh_policy": [THERMAL_MESH_POLICY],
         "thermal_mesh_plan_contract_version": [
@@ -3875,6 +4150,50 @@ def _thermal_mesh_result_metadata(mesh_plan, preflight):
         ],
         "thermal_mesh_unmeshed_object_count": [0],
         "thermal_mesh_unmeshed_objects_json": ["[]"],
+        "thermal_mesh_quality_canary_requested": [
+            1
+            if preflight.get("mesh_quality_canary_requested") is True
+            else 0
+        ],
+        "thermal_mesh_stats_exported": [
+            1 if mesh_stats.get("exported") is True else 0
+        ],
+        "thermal_mesh_stats_contract_version": [
+            str(mesh_stats.get("schema") or "")
+        ],
+        "thermal_mesh_stats_path": [
+            str(mesh_stats.get("path") or "")
+        ],
+        "thermal_mesh_stats_sha256": [
+            str(mesh_stats.get("sha256") or "")
+        ],
+        "thermal_mesh_stats_size_bytes": [
+            int(mesh_stats.get("size_bytes") or 0)
+        ],
+        "thermal_mesh_quality_metrics_reported_json": [
+            json.dumps(
+                mesh_stats.get("quality_metrics_reported", []),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ],
+        "thermal_mesh_quality_metric_occurrences_json": [
+            json.dumps(
+                mesh_stats.get("quality_metric_occurrences", {}),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ],
+        "thermal_setup_control_readback_json": [
+            json.dumps(
+                setup_control_readback,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ],
         "thermal_mesh_preflight_json": [
             json.dumps(
                 preflight,
@@ -4472,9 +4791,11 @@ def _solve_exact_thermal_setup(
             raise RuntimeError(
                 "standalone post-Analyze Desktop attestation is unavailable"
             )
-        desktop_attestor = lambda desktop: attest_cached_desktop(
-            desktop, require_endpoint_identity=True
-        )
+        def desktop_attestor(desktop):
+            return attest_cached_desktop(
+                desktop, require_endpoint_identity=True
+            )
+
         message_cursor = capture_scoped_message_cursor(
             native_desktop, preflight["project"], preflight["design"]
         )

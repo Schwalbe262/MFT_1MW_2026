@@ -151,6 +151,13 @@ TIMEOUT_RETRY_PROFILE_PATH = (
     / "profiles"
     / "goal_diagnostic_standard_timeout_retry.json"
 )
+MESH_QUALITY_CANARY_PROFILE_PATH = (
+    REPOSITORY_ROOT
+    / "regression_260707"
+    / "verify"
+    / "profiles"
+    / "goal_diagnostic_standard_mesh_quality_canary.json"
+)
 OPERATIONAL_PRESSURE_RETRY_PROFILE_PATH = (
     REPOSITORY_ROOT
     / "regression_260707"
@@ -167,6 +174,10 @@ OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_PATH = (
 )
 STANDARD_RESOURCES = {"cpus": 8, "timeout_seconds": 4 * 3600}
 TIMEOUT_RETRY_RESOURCES = {"cpus": 8, "timeout_seconds": 8 * 3600}
+MESH_QUALITY_CANARY_RESOURCES = {
+    "cpus": 8,
+    "timeout_seconds": 8 * 3600,
+}
 OPERATIONAL_PRESSURE_RETRY_RESOURCES = {
     "cpus": 8,
     "timeout_seconds": 4 * 3600,
@@ -181,6 +192,41 @@ TIMEOUT_RETRY_PROFILE_SCHEMA = (
 TIMEOUT_RETRY_EVIDENCE_SCHEMA = (
     "mft-goal-diagnostic-standard-timeout-retry-evidence-v1"
 )
+MESH_QUALITY_CANARY_PROFILE_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quality-canary-profile-v1"
+)
+MESH_QUALITY_CANARY_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quality-canary-evidence-v1"
+)
+MESH_QUALITY_CANARY_LOGICAL_TASK_ID = 96225
+MESH_QUALITY_CANARY_FAILED_TASK_ID = 96264
+MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS = frozenset(
+    {96269, 96271, 96272}
+)
+MESH_QUALITY_CANARY_CANDIDATE_PHYSICS_SHA256 = (
+    "7a6ccac265d3b0d4ecc585837fe04173dab226d93d15d61ade677e3dd6828f3a"
+)
+MESH_QUALITY_CANARY_ORIGINAL_SOLVER_REVISION = (
+    "a1e4f70cefa1af04673c73a6131bf490c0cc14b5"
+)
+MESH_QUALITY_CANARY_LIBRARY_REVISION = (
+    "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+)
+MESH_QUALITY_CANARY_FAILURE_MESSAGE = (
+    "RESULT_JSON: thermal_extraction_failure_reason="
+    "solve_not_converged:native_terminal_error"
+)
+MESH_QUALITY_CANARY_NATIVE_MESSAGE = (
+    "Solver failed because of poor mesh quality. "
+    "Try adjusting the mesh settings."
+)
+MESH_QUALITY_CANARY_SOURCE_LEVEL = 5
+MESH_QUALITY_CANARY_TARGET_LEVEL = 4
+MESH_QUALITY_CANARY_STDOUT_MAX_BYTES = 64 * 1024 * 1024
+MESH_QUALITY_CANARY_STRICT_NODE_NAME = "n114"
+MESH_QUALITY_CANARY_EXPECTED_ALLOCATION_ID = 14492
+MESH_QUALITY_CANARY_EXPECTED_SLURM_JOB_ID = "824575"
+MESH_QUALITY_CANARY_EXPECTED_ACCOUNT_NAME = "r1jae262"
 OPERATIONAL_PRESSURE_RETRY_PROFILE_SCHEMA = (
     "mft-goal-diagnostic-standard-operational-pressure-retry-profile-v1"
 )
@@ -231,6 +277,9 @@ OPERATIONAL_PRESSURE_FAILURE_MESSAGE = (
 OPERATIONAL_PRESSURE_ATTEMPT_COUNT = 3
 TIMEOUT_STRICT_TASK_IDENTITY_GENERATION = (
     "timeout-strict-r2-node-bound"
+)
+MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION = (
+    "mesh-quality-canary-r1-node-bound"
 )
 OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION = (
     "operational-pressure-r1-placement-invariant"
@@ -1070,6 +1119,7 @@ def _artifact(
 def _profile_content(
     *,
     timeout_retry: bool = False,
+    mesh_quality_canary: bool = False,
     operational_pressure_retry: bool = False,
     operational_pressure_after_timeout_retry: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1077,6 +1127,7 @@ def _profile_content(
         bool(value)
         for value in (
             timeout_retry,
+            mesh_quality_canary,
             operational_pressure_retry,
             operational_pressure_after_timeout_retry,
         )
@@ -1085,15 +1136,19 @@ def _profile_content(
             "diagnostic Standard retry profile semantics are mixed"
         )
     path = (
-        TIMEOUT_RETRY_PROFILE_PATH
-        if timeout_retry
+        MESH_QUALITY_CANARY_PROFILE_PATH
+        if mesh_quality_canary
         else (
-            OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_PATH
-            if operational_pressure_after_timeout_retry
+            TIMEOUT_RETRY_PROFILE_PATH
+            if timeout_retry
             else (
-                OPERATIONAL_PRESSURE_RETRY_PROFILE_PATH
-                if operational_pressure_retry
-                else PROFILE_PATH
+                OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_PATH
+                if operational_pressure_after_timeout_retry
+                else (
+                    OPERATIONAL_PRESSURE_RETRY_PROFILE_PATH
+                    if operational_pressure_retry
+                    else PROFILE_PATH
+                )
             )
         )
     ).resolve(strict=True)
@@ -1101,6 +1156,7 @@ def _profile_content(
     _validate_profile(
         profile,
         timeout_retry=timeout_retry,
+        mesh_quality_canary=mesh_quality_canary,
         operational_pressure_retry=operational_pressure_retry,
         operational_pressure_after_timeout_retry=(
             operational_pressure_after_timeout_retry
@@ -1113,6 +1169,7 @@ def _validate_profile(
     profile: Mapping[str, Any],
     *,
     timeout_retry: bool = False,
+    mesh_quality_canary: bool = False,
     operational_pressure_retry: bool = False,
     operational_pressure_after_timeout_retry: bool = False,
 ) -> None:
@@ -1120,6 +1177,7 @@ def _validate_profile(
         bool(value)
         for value in (
             timeout_retry,
+            mesh_quality_canary,
             operational_pressure_retry,
             operational_pressure_after_timeout_retry,
         )
@@ -1129,50 +1187,71 @@ def _validate_profile(
         )
     production_profile, _source = production._profile_content("standard")
     expected_schema = (
-        TIMEOUT_RETRY_PROFILE_SCHEMA
-        if timeout_retry
+        MESH_QUALITY_CANARY_PROFILE_SCHEMA
+        if mesh_quality_canary
         else (
-            OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_SCHEMA
-            if operational_pressure_after_timeout_retry
+            TIMEOUT_RETRY_PROFILE_SCHEMA
+            if timeout_retry
             else (
-                OPERATIONAL_PRESSURE_RETRY_PROFILE_SCHEMA
-                if operational_pressure_retry
-                else "mft-goal-diagnostic-standard-profile-v1"
+                OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_SCHEMA
+                if operational_pressure_after_timeout_retry
+                else (
+                    OPERATIONAL_PRESSURE_RETRY_PROFILE_SCHEMA
+                    if operational_pressure_retry
+                    else "mft-goal-diagnostic-standard-profile-v1"
+                )
             )
         )
     )
     expected_resources = (
-        TIMEOUT_RETRY_RESOURCES
-        if timeout_retry
+        MESH_QUALITY_CANARY_RESOURCES
+        if mesh_quality_canary
         else (
-            OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_RESOURCES
-            if operational_pressure_after_timeout_retry
+            TIMEOUT_RETRY_RESOURCES
+            if timeout_retry
             else (
-                OPERATIONAL_PRESSURE_RETRY_RESOURCES
-                if operational_pressure_retry
-                else STANDARD_RESOURCES
+                OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_RESOURCES
+                if operational_pressure_after_timeout_retry
+                else (
+                    OPERATIONAL_PRESSURE_RETRY_RESOURCES
+                    if operational_pressure_retry
+                    else STANDARD_RESOURCES
+                )
             )
         )
     )
     expected_comment = (
-        "Diagnostic-only eighth-symmetry Standard FEA timeout retry with "
-        "retained AEDT project and AEDT results"
-        if timeout_retry
+        "Diagnostic-only exact-slot 96264 numerical mesh-quality canary "
+        "with Rx side blocks at the reviewed level-4 setting and retained "
+        "AEDT project, AEDT results, and native mesh statistics"
+        if mesh_quality_canary
         else (
-            "Diagnostic-only eighth-symmetry Standard FEA Scheduler "
-            "operational-pressure retry after one authenticated timeout "
-            "retry with retained AEDT project and AEDT results"
-            if operational_pressure_after_timeout_retry
+            "Diagnostic-only eighth-symmetry Standard FEA timeout retry with "
+            "retained AEDT project and AEDT results"
+            if timeout_retry
             else (
                 "Diagnostic-only eighth-symmetry Standard FEA Scheduler "
-                "operational-pressure retry with retained AEDT project and "
-                "AEDT results"
-                if operational_pressure_retry
-                else "Diagnostic-only eighth-symmetry Standard FEA with "
-                "retained AEDT project and AEDT results"
+                "operational-pressure retry after one authenticated timeout "
+                "retry with retained AEDT project and AEDT results"
+                if operational_pressure_after_timeout_retry
+                else (
+                    "Diagnostic-only eighth-symmetry Standard FEA Scheduler "
+                    "operational-pressure retry with retained AEDT project and "
+                    "AEDT results"
+                    if operational_pressure_retry
+                    else "Diagnostic-only eighth-symmetry Standard FEA with "
+                    "retained AEDT project and AEDT results"
+                )
             )
         )
     )
+    expected_param_overrides = copy.deepcopy(
+        production_profile["param_overrides"]
+    )
+    if mesh_quality_canary:
+        expected_param_overrides[
+            "thermal_rx_side_block_mesh_level"
+        ] = MESH_QUALITY_CANARY_TARGET_LEVEL
     if (
         set(profile)
         != {
@@ -1196,8 +1275,7 @@ def _validate_profile(
         != production.PROFILE_REVIEWED_PATH["standard"]
         or profile.get("cli_flags")
         != production.PROFILE_CLI_FLAGS["standard"]
-        or profile.get("param_overrides")
-        != production_profile["param_overrides"]
+        or profile.get("param_overrides") != expected_param_overrides
         or profile.get("fixed_boundary_contract")
         != production_profile["fixed_boundary_contract"]
         or profile.get("mem_mb") != 32768
@@ -2657,6 +2735,7 @@ def _plan_is_operational_pressure_retry(
 def _plan_retry_kind(plan: Mapping[str, Any]) -> str | None:
     fields = {
         "timeout": "retry_of_timeout",
+        "mesh_quality_canary": "retry_of_mesh_quality_canary",
         "operational_pressure": "retry_of_operational_pressure",
     }
     present = [
@@ -2696,6 +2775,7 @@ def _strict_node_plan_contract(
 ) -> dict[str, Any]:
     if task_identity_generation not in {
         TIMEOUT_STRICT_TASK_IDENTITY_GENERATION,
+        MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION,
         OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION,
     }:
         raise HandoffContractError(
@@ -2739,6 +2819,7 @@ def _strict_node_scheduler_pin(
     generation = value.get("task_identity_generation")
     if generation not in {
         TIMEOUT_STRICT_TASK_IDENTITY_GENERATION,
+        MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION,
         OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION,
     }:
         raise HandoffContractError(
@@ -2779,12 +2860,44 @@ def _plan_strict_node_contract(
         return None
     if _plan_retry_kind(plan) not in {
         "timeout",
+        "mesh_quality_canary",
         "operational_pressure",
     }:
         raise HandoffContractError(
             "strict node placement is restricted to diagnostic retries"
         )
     return _validate_strict_node_plan_contract(value)
+
+
+def _mesh_quality_canary_strict_runtime_contract() -> dict[str, Any]:
+    return {
+        "schema_version": (
+            "mft-goal-diagnostic-mesh-quality-canary-strict-runtime-v1"
+        ),
+        "same_node_as_task_id": 0,
+        "expected_allocation_id": (
+            MESH_QUALITY_CANARY_EXPECTED_ALLOCATION_ID
+        ),
+        "expected_slurm_job_id": (
+            MESH_QUALITY_CANARY_EXPECTED_SLURM_JOB_ID
+        ),
+        "expected_account_name": (
+            MESH_QUALITY_CANARY_EXPECTED_ACCOUNT_NAME
+        ),
+        "expected_node_name": MESH_QUALITY_CANARY_STRICT_NODE_NAME,
+        "fallback_allocation_allowed": False,
+    }
+
+
+def _validate_mesh_quality_canary_strict_runtime_contract(
+    value: Any,
+) -> dict[str, Any]:
+    expected = _mesh_quality_canary_strict_runtime_contract()
+    if value != expected:
+        raise HandoffContractError(
+            "mesh-quality canary strict runtime identity drifted"
+        )
+    return expected
 
 
 def _operational_pressure_immediate_retry_kind(
@@ -2885,6 +2998,8 @@ def _plan_resources(plan: Mapping[str, Any]) -> dict[str, int]:
     kind = _plan_retry_kind(plan)
     if kind == "timeout":
         return TIMEOUT_RETRY_RESOURCES
+    if kind == "mesh_quality_canary":
+        return MESH_QUALITY_CANARY_RESOURCES
     if kind == "operational_pressure":
         if _operational_pressure_immediate_retry_kind(plan) == "timeout":
             return OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_RESOURCES
@@ -3990,6 +4105,556 @@ def _validate_timeout_retry_record(
     return original_plan, original_submission, execution
 
 
+def _mesh_quality_failure_evidence(
+    snapshot: Mapping[str, Any],
+    stdout: bytes | str,
+    *,
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate the one terminal poor-mesh execution at task 96264."""
+
+    if isinstance(stdout, str):
+        raw = stdout.encode("utf-8")
+    elif isinstance(stdout, bytes):
+        raw = stdout
+    else:
+        raise HandoffContractError(
+            "mesh-quality canary stdout is not bytes or text"
+        )
+    if not 0 < len(raw) <= MESH_QUALITY_CANARY_STDOUT_MAX_BYTES:
+        raise HandoffContractError(
+            "mesh-quality canary stdout size is invalid"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise HandoffContractError(
+            "mesh-quality canary stdout is not UTF-8"
+        ) from exc
+    task_id = snapshot.get("task_id", snapshot.get("id"))
+    allocation_id = snapshot.get(
+        "allocation_id", snapshot.get("assigned_allocation")
+    )
+    facts = {
+        "task_id": task_id,
+        "name": snapshot.get("name"),
+        "status": snapshot.get("status"),
+        "state": snapshot.get("state"),
+        "exit_code": snapshot.get("exit_code"),
+        "failure_message": snapshot.get("failure_message"),
+        "slurm_job_id": str(snapshot.get("slurm_job_id") or ""),
+        "allocation_id": allocation_id,
+        "account_name": snapshot.get("account_name"),
+        "actual_node_name": snapshot.get("actual_node_name"),
+        "cpus": snapshot.get("cpus"),
+        "memory_mb": snapshot.get("memory_mb"),
+        "timeout_seconds": snapshot.get("timeout_seconds"),
+        "aedt_backend": snapshot.get("aedt_backend"),
+        "project": snapshot.get("project"),
+        "dedupe_key": snapshot.get("dedupe_key"),
+        "remote_cwd": snapshot.get("remote_cwd"),
+        "remote_dir": snapshot.get("remote_dir"),
+        "finished_at": snapshot.get("finished_at"),
+    }
+    poor_mesh_count = text.count(MESH_QUALITY_CANARY_NATIVE_MESSAGE)
+    result_objects = []
+    for line in text.splitlines():
+        if not line.startswith("RESULT_JSON "):
+            continue
+        try:
+            parsed = json.loads(line[len("RESULT_JSON ") :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            result_objects.append(parsed)
+    result = result_objects[0] if len(result_objects) == 1 else {}
+    iteration_zero_count = int(result.get("thermal_iterations") == 0)
+    native_terminal_count = int(
+        result.get("thermal_convergence_reason")
+        == "native_terminal_error"
+    )
+    level_five_native_readback_count = len(re.findall(
+        r'rx_side(?:2)?_block_mesh_level_[A-Za-z0-9]+_L_5',
+        text,
+    ))
+    preflight_pass_count = 0
+    forensic_raw = result.get("thermal_dispatch_forensic_json")
+    if isinstance(forensic_raw, str):
+        try:
+            forensic = json.loads(forensic_raw)
+        except json.JSONDecodeError:
+            forensic = {}
+        attempts = (
+            forensic.get("attempts")
+            if isinstance(forensic, dict)
+            else None
+        )
+        if isinstance(attempts, list):
+            preflight_pass_count = sum(
+                isinstance(attempt, dict)
+                and isinstance(attempt.get("mesh_preflight"), dict)
+                and attempt["mesh_preflight"].get("passed") is True
+                for attempt in attempts
+            )
+    if (
+        task_id != MESH_QUALITY_CANARY_FAILED_TASK_ID
+        or task_id != submission.get("task_id")
+        or facts["name"] != submission.get("task_name")
+        or facts["status"] != "failed"
+        or facts["state"] != "failed"
+        or facts["exit_code"] != 1
+        or facts["failure_message"]
+        != MESH_QUALITY_CANARY_FAILURE_MESSAGE
+        or not facts["slurm_job_id"].isdigit()
+        or isinstance(allocation_id, bool)
+        or not isinstance(allocation_id, int)
+        or allocation_id <= 0
+        or not str(facts["account_name"] or "").strip()
+        or not str(facts["actual_node_name"] or "").strip()
+        or facts["cpus"] != 8
+        or facts["memory_mb"] != 32768
+        or facts["timeout_seconds"]
+        != MESH_QUALITY_CANARY_RESOURCES["timeout_seconds"]
+        or facts["aedt_backend"] != "standalone"
+        or facts["project"] != scheduler_client.MFT_PROJECT
+        or facts["dedupe_key"] != submission.get("dedupe_key")
+        or not str(facts["remote_cwd"] or "").strip()
+        or not str(facts["remote_dir"] or "").strip()
+        or not str(facts["finished_at"] or "").strip()
+        or poor_mesh_count < 1
+        or iteration_zero_count < 1
+        or native_terminal_count < 1
+        or level_five_native_readback_count < 1
+        or preflight_pass_count < 1
+    ):
+        raise HandoffContractError(
+            "exact task 96264 poor-mesh terminal evidence drifted"
+        )
+    return {
+        "schema_version": (
+            "mft-goal-diagnostic-mesh-quality-terminal-evidence-v1"
+        ),
+        "task_execution": facts,
+        "stdout_sha256": production._sha256_bytes(raw),
+        "stdout_size_bytes": len(raw),
+        "poor_mesh_quality_message": (
+            MESH_QUALITY_CANARY_NATIVE_MESSAGE
+        ),
+        "poor_mesh_quality_message_count": poor_mesh_count,
+        "zero_iteration_convergence_marker_count": (
+            iteration_zero_count
+        ),
+        "native_terminal_reason_marker_count": native_terminal_count,
+        "level_five_rx_side_native_readback_marker_count": (
+            level_five_native_readback_count
+        ),
+        "passed_native_premesh_marker_count": preflight_pass_count,
+    }
+
+
+def _validate_mesh_quality_terminal_evidence(
+    evidence: Any,
+    *,
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "task_execution",
+        "stdout_sha256",
+        "stdout_size_bytes",
+        "poor_mesh_quality_message",
+        "poor_mesh_quality_message_count",
+        "zero_iteration_convergence_marker_count",
+        "native_terminal_reason_marker_count",
+        "level_five_rx_side_native_readback_marker_count",
+        "passed_native_premesh_marker_count",
+    }
+    execution = (
+        evidence.get("task_execution")
+        if isinstance(evidence, Mapping)
+        else None
+    )
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != expected_fields
+        or evidence.get("schema_version")
+        != "mft-goal-diagnostic-mesh-quality-terminal-evidence-v1"
+        or not isinstance(execution, dict)
+        or execution.get("task_id")
+        != MESH_QUALITY_CANARY_FAILED_TASK_ID
+        or execution.get("task_id") != submission.get("task_id")
+        or execution.get("name") != submission.get("task_name")
+        or execution.get("dedupe_key") != submission.get("dedupe_key")
+        or execution.get("status") != "failed"
+        or execution.get("state") != "failed"
+        or execution.get("exit_code") != 1
+        or execution.get("failure_message")
+        != MESH_QUALITY_CANARY_FAILURE_MESSAGE
+        or production._require_sha(
+            evidence.get("stdout_sha256"),
+            "mesh-quality canary stdout SHA",
+        )
+        != evidence.get("stdout_sha256")
+        or isinstance(evidence.get("stdout_size_bytes"), bool)
+        or not isinstance(evidence.get("stdout_size_bytes"), int)
+        or not 0
+        < evidence["stdout_size_bytes"]
+        <= MESH_QUALITY_CANARY_STDOUT_MAX_BYTES
+        or evidence.get("poor_mesh_quality_message")
+        != MESH_QUALITY_CANARY_NATIVE_MESSAGE
+        or any(
+            isinstance(evidence.get(name), bool)
+            or not isinstance(evidence.get(name), int)
+            or evidence[name] < 1
+            for name in (
+                "poor_mesh_quality_message_count",
+                "zero_iteration_convergence_marker_count",
+                "native_terminal_reason_marker_count",
+                "level_five_rx_side_native_readback_marker_count",
+                "passed_native_premesh_marker_count",
+            )
+        )
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary terminal evidence is malformed"
+        )
+    return dict(evidence)
+
+
+def _mesh_quality_canary_intervention() -> dict[str, Any]:
+    return {
+        "classification": "numerical_mesh_control_only",
+        "parameter": "thermal_rx_side_block_mesh_level",
+        "source_value": MESH_QUALITY_CANARY_SOURCE_LEVEL,
+        "target_value": MESH_QUALITY_CANARY_TARGET_LEVEL,
+        "causal_scope": "multi-turn_rx_side_blocks_only",
+        "existing_reviewed_solver_capability": True,
+        "physics_changed": False,
+        "geometry_changed": False,
+        "heat_source_changed": False,
+        "boundary_changed": False,
+        "fan_velocity_changed": False,
+        "tim_or_pad_changed": False,
+        "solver_iteration_controls_changed": False,
+        "mesh_quality_checks_modified": False,
+        "mesh_quality_checks_disabled": False,
+        "native_mesh_stats_required": True,
+        "residual_and_energy_convergence_required": True,
+    }
+
+
+def _mesh_quality_canary_task_identity(
+    candidate_physics_sha256: str,
+) -> tuple[str, str]:
+    digest = production._require_sha(
+        candidate_physics_sha256,
+        "mesh-quality canary candidate physics SHA",
+    )
+    if digest != MESH_QUALITY_CANARY_CANDIDATE_PHYSICS_SHA256:
+        raise HandoffContractError(
+            "mesh-quality canary candidate is not exact slot 96264"
+        )
+    stem = digest[:12]
+    return (
+        "mft-goal-diag-standard-mesh-canary-r1-"
+        f"l{MESH_QUALITY_CANARY_LOGICAL_TASK_ID}-{stem}",
+        "mft_goal_diag_standard_mesh_canary_r1_"
+        f"l{MESH_QUALITY_CANARY_LOGICAL_TASK_ID}_{stem}",
+    )
+
+
+def _mesh_quality_canary_sibling_snapshot(
+    rows: Any,
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        not isinstance(rows, Sequence)
+        or isinstance(rows, (str, bytes, bytearray))
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary Scheduler inventory is absent"
+        )
+    stage = plan["stage"]
+    expected_name = stage["task_name"]
+    expected_dedupe = stage["retained_aedt_bundle"]["dedupe_key"]
+    prefix = (
+        "mft-goal-diag-standard-mesh-canary-r1-"
+        f"l{MESH_QUALITY_CANARY_LOGICAL_TASK_ID}-"
+    )
+    matches = []
+    rejected_supplemental = set()
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        task_id = raw.get("task_id", raw.get("id"))
+        if task_id in MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS:
+            rejected_supplemental.add(task_id)
+        name = str(raw.get("name") or "")
+        dedupe = str(raw.get("dedupe_key") or "")
+        if (
+            name == expected_name
+            or dedupe == expected_dedupe
+            or name.startswith(prefix)
+        ):
+            matches.append({
+                "task_id": task_id,
+                "name": name,
+                "dedupe_key": dedupe,
+                "status": raw.get("status"),
+                "state": raw.get("state"),
+            })
+    matches.sort(key=lambda row: str(row["task_id"]))
+    return {
+        "schema_version": (
+            "mft-goal-diagnostic-mesh-quality-canary-sibling-guard-v1"
+        ),
+        "scheduler_project": scheduler_client.MFT_PROJECT,
+        "task_name": expected_name,
+        "dedupe_key": expected_dedupe,
+        "logical_authority_task_id": (
+            MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        ),
+        "failed_source_task_id": MESH_QUALITY_CANARY_FAILED_TASK_ID,
+        "rejected_supplemental_task_ids_present": sorted(
+            rejected_supplemental
+        ),
+        "matching_task_count": len(matches),
+        "matching_tasks": matches,
+    }
+
+
+def _validate_mesh_quality_canary_sibling_snapshot(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    expected_count: int,
+    expected_task_id: int = 0,
+) -> dict[str, Any]:
+    expected_identity = _mesh_quality_canary_sibling_snapshot(
+        [], plan=plan
+    )
+    if (
+        not isinstance(value, dict)
+        or set(value) != set(expected_identity)
+        or any(
+            value.get(name) != expected_identity[name]
+            for name in (
+                "schema_version",
+                "scheduler_project",
+                "task_name",
+                "dedupe_key",
+                "logical_authority_task_id",
+                "failed_source_task_id",
+            )
+        )
+        or value.get("matching_task_count") != expected_count
+        or not isinstance(value.get("matching_tasks"), list)
+        or len(value["matching_tasks"]) != expected_count
+        or not isinstance(
+            value.get("rejected_supplemental_task_ids_present"), list
+        )
+        or any(
+            task_id
+            not in MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS
+            for task_id in value[
+                "rejected_supplemental_task_ids_present"
+            ]
+        )
+        or value["rejected_supplemental_task_ids_present"]
+        != sorted(set(value["rejected_supplemental_task_ids_present"]))
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary Scheduler sibling snapshot drifted"
+        )
+    if expected_count == 1:
+        match = value["matching_tasks"][0]
+        if (
+            not isinstance(match, dict)
+            or set(match)
+            != {"task_id", "name", "dedupe_key", "status", "state"}
+            or match.get("task_id") != expected_task_id
+            or match.get("name") != plan["stage"]["task_name"]
+            or match.get("dedupe_key")
+            != plan["stage"]["retained_aedt_bundle"]["dedupe_key"]
+        ):
+            raise HandoffContractError(
+                "mesh-quality canary exact sibling identity drifted"
+            )
+    return dict(value)
+
+
+def _validate_mesh_quality_canary_submission_guard(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    task_id: int,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "before",
+            "after",
+            "task_id",
+            "exactly_one_guarded_post",
+        }
+        or value.get("schema_version")
+        != (
+            "mft-goal-diagnostic-mesh-quality-canary-"
+            "submission-guard-v1"
+        )
+        or value.get("task_id") != task_id
+        or value.get("exactly_one_guarded_post") is not True
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary submission guard drifted"
+        )
+    _validate_mesh_quality_canary_sibling_snapshot(
+        value.get("before"),
+        plan=plan,
+        expected_count=0,
+    )
+    _validate_mesh_quality_canary_sibling_snapshot(
+        value.get("after"),
+        plan=plan,
+        expected_count=1,
+        expected_task_id=task_id,
+    )
+    return dict(value)
+
+
+def _validate_mesh_quality_canary_record(
+    plan: Mapping[str, Any],
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    record = plan.get("retry_of_mesh_quality_canary")
+    expected_fields = {
+        "schema_version",
+        "retry_of_task_id",
+        "logical_authority_task_id",
+        "timeout_parent_ancestry_sha256",
+        "original_plan",
+        "original_plan_payload_sha256",
+        "original_submission",
+        "original_submission_payload_sha256",
+        "original_task_execution",
+        "original_task_execution_sha256",
+        "scheduler_url",
+        "failure_class",
+        "intervention",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != expected_fields
+        or record.get("schema_version")
+        != MESH_QUALITY_CANARY_EVIDENCE_SCHEMA
+        or record.get("retry_of_task_id")
+        != MESH_QUALITY_CANARY_FAILED_TASK_ID
+        or record.get("logical_authority_task_id")
+        != MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        or record.get("scheduler_url") != DIAGNOSTIC_SCHEDULER_URL
+        or record.get("failure_class")
+        != "native_icepak_poor_mesh_quality_at_iteration_zero"
+        or record.get("intervention")
+        != _mesh_quality_canary_intervention()
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary ancestry record drifted"
+        )
+    original_plan_path = _recorded_external_file(
+        record["original_plan"],
+        "mesh-quality canary source timeout plan",
+    )
+    original_plan, params, _selected = _load_plan(original_plan_path)
+    if _plan_retry_kind(original_plan) != "timeout":
+        raise HandoffContractError(
+            "mesh-quality canary source is not the exact timeout retry"
+        )
+    original_submission_path = _recorded_external_file(
+        record["original_submission"],
+        "mesh-quality canary source timeout submission",
+    )
+    original_submission = _load_submission(
+        original_submission_path, plan=original_plan
+    )
+    (
+        logical_plan,
+        logical_submission,
+        _timeout_execution,
+    ) = _validate_timeout_retry_record(original_plan)
+    terminal = _validate_mesh_quality_terminal_evidence(
+        record.get("original_task_execution"),
+        submission=original_submission,
+    )
+    original_profile = production._read_json(
+        original_plan_path.parent / original_plan["profile"]["path"]
+    )
+    original_effective = production._effective_params(
+        params, original_profile
+    )
+    if (
+        original_submission["task_id"]
+        != MESH_QUALITY_CANARY_FAILED_TASK_ID
+        or logical_submission["task_id"]
+        != MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        or original_plan["candidate_physics_sha256"]
+        != MESH_QUALITY_CANARY_CANDIDATE_PHYSICS_SHA256
+        or original_plan["solver_revision"]
+        != MESH_QUALITY_CANARY_ORIGINAL_SOLVER_REVISION
+        or original_plan["library_revision"]
+        != MESH_QUALITY_CANARY_LIBRARY_REVISION
+        or original_effective.get(
+            "thermal_rx_side_block_mesh_level"
+        )
+        != MESH_QUALITY_CANARY_SOURCE_LEVEL
+        or record.get("timeout_parent_ancestry_sha256")
+        != canonical_sha256(original_plan["retry_of_timeout"])
+        or record.get("original_plan_payload_sha256")
+        != original_plan["payload_sha256"]
+        or record.get("original_submission_payload_sha256")
+        != original_submission["payload_sha256"]
+        or record.get("original_task_execution_sha256")
+        != canonical_sha256(terminal)
+        or plan.get("solver_revision")
+        == original_plan["solver_revision"]
+        or plan.get("library_revision")
+        != original_plan["library_revision"]
+        or any(
+            plan.get(name) != authority.get(name)
+            for authority in (original_plan, logical_plan)
+            for name in (
+                "campaign_id",
+                "goal_contract_schema",
+                "hard_spec",
+                "hard_spec_sha256",
+                "temperature_contract_sha256",
+                "candidate_physics_sha256",
+                "search_authority_sha256",
+                "fea_params_sha256",
+            )
+        )
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary exact-slot lineage drifted"
+        )
+    production._require_revision(
+        plan.get("solver_revision"),
+        "mesh-quality canary solver revision",
+    )
+    return (
+        logical_plan,
+        logical_submission,
+        original_submission,
+        terminal,
+    )
+
+
 def _validate_operational_pressure_retry_record(
     plan: Mapping[str, Any],
 ) -> tuple[
@@ -4304,6 +4969,260 @@ def create_timeout_retry_plan(
     return destination / plan_path.name
 
 
+def create_mesh_quality_canary_plan(
+    *,
+    original_plan_path: Path,
+    original_submission_path: Path,
+    solver_revision: str,
+    strict_node_name: str,
+    output: Path,
+    scheduler_url: str = DIAGNOSTIC_SCHEDULER_URL,
+    task_reader: Any = None,
+    stdout_reader: Any = None,
+    task_list_reader: Any = None,
+) -> Path:
+    """Plan the sole 96264 poor-mesh numerical canary without submitting it."""
+
+    original_plan, params, selected = _load_plan(original_plan_path)
+    if _plan_retry_kind(original_plan) != "timeout":
+        raise HandoffContractError(
+            "mesh-quality canary requires the exact 96264 timeout-retry plan"
+        )
+    original_submission = _load_submission(
+        original_submission_path, plan=original_plan
+    )
+    (
+        _logical_plan,
+        logical_submission,
+        _timeout_execution,
+    ) = _validate_timeout_retry_record(original_plan)
+    normalized_scheduler_url = scheduler_url.rstrip("/")
+    next_solver_revision = production._require_revision(
+        solver_revision, "mesh-quality canary solver revision"
+    )
+    if _strict_node_name(strict_node_name) != MESH_QUALITY_CANARY_STRICT_NODE_NAME:
+        raise HandoffContractError(
+            "mesh-quality canary is restricted to strict node n114"
+        )
+    strict_contract = _strict_node_plan_contract(
+        strict_node_name,
+        task_identity_generation=(
+            MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION
+        ),
+    )
+    if (
+        normalized_scheduler_url
+        != original_submission["scheduler_url"]
+        or original_submission["task_id"]
+        != MESH_QUALITY_CANARY_FAILED_TASK_ID
+        or logical_submission["task_id"]
+        != MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        or original_plan["candidate_physics_sha256"]
+        != MESH_QUALITY_CANARY_CANDIDATE_PHYSICS_SHA256
+        or original_plan["solver_revision"]
+        != MESH_QUALITY_CANARY_ORIGINAL_SOLVER_REVISION
+        or original_plan["library_revision"]
+        != MESH_QUALITY_CANARY_LIBRARY_REVISION
+        or next_solver_revision == original_plan["solver_revision"]
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary is not bound to exact logical slot 96264"
+        )
+    read_task = task_reader or _scheduler_task_snapshot
+    read_stdout = stdout_reader or _scheduler_task_stdout
+    execution = _mesh_quality_failure_evidence(
+        read_task(
+            scheduler_url=normalized_scheduler_url,
+            task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+        ),
+        read_stdout(
+            scheduler_url=normalized_scheduler_url,
+            task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+        ),
+        submission=original_submission,
+    )
+    original_profile = production._read_json(
+        original_plan_path.resolve(strict=True).parent
+        / original_plan["profile"]["path"]
+    )
+    profile, profile_source = _profile_content(
+        mesh_quality_canary=True
+    )
+    original_effective = production._effective_params(
+        params, original_profile
+    )
+    canary_effective = production._effective_params(params, profile)
+    changed = {
+        name: {
+            "before": original_effective.get(name),
+            "after": canary_effective.get(name),
+        }
+        for name in sorted(set(original_effective) | set(canary_effective))
+        if original_effective.get(name) != canary_effective.get(name)
+    }
+    if (
+        changed
+        != {
+            "thermal_rx_side_block_mesh_level": {
+                "before": MESH_QUALITY_CANARY_SOURCE_LEVEL,
+                "after": MESH_QUALITY_CANARY_TARGET_LEVEL,
+            }
+        }
+        or profile["fixed_boundary_contract"]
+        != original_profile["fixed_boundary_contract"]
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary changes more than the reviewed numerical "
+            "mesh control"
+        )
+    task_name, workdir = _mesh_quality_canary_task_identity(
+        original_plan["candidate_physics_sha256"]
+    )
+    retained = scheduler_client.retained_aedt_identity(
+        task_name,
+        params,
+        profile,
+        next_solver_revision,
+        original_plan["library_revision"],
+    )
+    if retained is None:
+        raise HandoffContractError(
+            "mesh-quality canary retained identity is unavailable"
+        )
+    retry_record = {
+        "schema_version": MESH_QUALITY_CANARY_EVIDENCE_SCHEMA,
+        "retry_of_task_id": MESH_QUALITY_CANARY_FAILED_TASK_ID,
+        "logical_authority_task_id": (
+            MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        ),
+        "timeout_parent_ancestry_sha256": canonical_sha256(
+            original_plan["retry_of_timeout"]
+        ),
+        "original_plan": production._file_record(
+            original_plan_path.resolve(strict=True)
+        ),
+        "original_plan_payload_sha256": original_plan["payload_sha256"],
+        "original_submission": production._file_record(
+            original_submission_path.resolve(strict=True)
+        ),
+        "original_submission_payload_sha256": original_submission[
+            "payload_sha256"
+        ],
+        "original_task_execution": execution,
+        "original_task_execution_sha256": canonical_sha256(execution),
+        "scheduler_url": normalized_scheduler_url,
+        "failure_class": (
+            "native_icepak_poor_mesh_quality_at_iteration_zero"
+        ),
+        "intervention": _mesh_quality_canary_intervention(),
+    }
+    provisional_plan = {
+        "stage": {
+            "task_name": task_name,
+            "retained_aedt_bundle": retained,
+        }
+    }
+    read_task_list = task_list_reader or _scheduler_project_tasks
+    sibling_guard = _mesh_quality_canary_sibling_snapshot(
+        read_task_list(
+            scheduler_url=normalized_scheduler_url,
+            project=scheduler_client.MFT_PROJECT,
+            task_name=task_name,
+        ),
+        plan=provisional_plan,
+    )
+    if sibling_guard["matching_task_count"] != 0:
+        raise HandoffContractError(
+            "mesh-quality canary exact-once Scheduler slot is already used"
+        )
+    destination = output.resolve()
+    if destination.exists():
+        raise HandoffContractError(
+            "mesh-quality canary plan output already exists: "
+            f"{destination}"
+        )
+    staging = destination.with_name(
+        f".{destination.name}.{os.getpid()}."
+        f"{next(tempfile._get_candidate_names())}.tmp"
+    )
+    staging.mkdir(parents=True)
+    try:
+        selected_path = production._write_immutable_json(
+            staging / "selected_candidate.json", selected
+        )
+        params_path = production._write_immutable_json(
+            staging / "fea_params.json", params
+        )
+        profile_path = production._write_immutable_json(
+            staging / "diagnostic_standard_mesh_quality_canary_profile.json",
+            profile,
+        )
+        unsigned_plan = copy.deepcopy(original_plan)
+        unsigned_plan.pop("payload_sha256", None)
+        for name in (
+            "retry_of_timeout",
+            "retry_of_operational_pressure",
+            "scheduler_strict_node_contract",
+            "operational_pressure_atomic_claim_reference",
+        ):
+            unsigned_plan.pop(name, None)
+        unsigned_plan.update(
+            {
+                "solver_revision": next_solver_revision,
+                "selected_candidate": {
+                    "path": selected_path.name,
+                    "sha256": production._sha256_file(selected_path),
+                },
+                "fea_params": {
+                    "path": params_path.name,
+                    "sha256": production._sha256_file(params_path),
+                },
+                "profile": {
+                    "path": profile_path.name,
+                    "sha256": production._sha256_file(profile_path),
+                    "canonical_sha256": canonical_sha256(profile),
+                    "source": profile_source,
+                },
+                "stage": {
+                    **copy.deepcopy(original_plan["stage"]),
+                    "task_name": task_name,
+                    "workdir": workdir,
+                    "profile_sha256": canonical_sha256(profile),
+                    "effective_params_sha256": canonical_sha256(
+                        canary_effective
+                    ),
+                    "resources": copy.deepcopy(
+                        MESH_QUALITY_CANARY_RESOURCES
+                    ),
+                    "retained_aedt_bundle": retained,
+                    "retention_run_root": _retention_run_root_evidence(
+                        retained
+                    ),
+                },
+                "available_submission_commands": [
+                    "submit-mesh-quality-canary"
+                ],
+                "retry_of_mesh_quality_canary": retry_record,
+                "mesh_quality_canary_preplan_sibling_guard": (
+                    sibling_guard
+                ),
+                "scheduler_strict_node_contract": strict_contract,
+                "mesh_quality_canary_strict_runtime_contract": (
+                    _mesh_quality_canary_strict_runtime_contract()
+                ),
+            }
+        )
+        plan_path = production._write_immutable_json(
+            staging / "diagnostic_mesh_quality_canary_plan.json",
+            production._seal(unsigned_plan),
+        )
+        os.replace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return destination / plan_path.name
+
+
 def create_operational_pressure_retry_plan(
     *,
     original_plan_path: Path,
@@ -4555,6 +5474,7 @@ def _load_plan(
     )
     retry_kind = _plan_retry_kind(plan)
     timeout_retry = retry_kind == "timeout"
+    mesh_quality_canary = retry_kind == "mesh_quality_canary"
     operational_pressure_retry = retry_kind == "operational_pressure"
     operational_pressure_after_timeout_retry = (
         operational_pressure_retry
@@ -4563,6 +5483,9 @@ def _load_plan(
     expected_commands = {
         None: ["submit-standard"],
         "timeout": ["submit-timeout-retry"],
+        "mesh_quality_canary": [
+            "submit-mesh-quality-canary"
+        ],
         "operational_pressure": [
             "submit-operational-pressure-retry"
         ],
@@ -4630,6 +5553,7 @@ def _load_plan(
     _validate_profile(
         profile,
         timeout_retry=timeout_retry,
+        mesh_quality_canary=mesh_quality_canary,
         operational_pressure_retry=(
             operational_pressure_retry
             and not operational_pressure_after_timeout_retry
@@ -4701,6 +5625,38 @@ def _load_plan(
                 raise HandoffContractError(
                     "strict timeout retry r2 identity drifted"
                 )
+    elif mesh_quality_canary:
+        _validate_mesh_quality_canary_record(plan)
+        strict_contract = _plan_strict_node_contract(plan)
+        strict_runtime = (
+            _validate_mesh_quality_canary_strict_runtime_contract(
+                plan.get(
+                    "mesh_quality_canary_strict_runtime_contract"
+                )
+            )
+        )
+        expected_task_name, expected_workdir = (
+            _mesh_quality_canary_task_identity(
+                plan["candidate_physics_sha256"]
+            )
+        )
+        _validate_mesh_quality_canary_sibling_snapshot(
+            plan.get("mesh_quality_canary_preplan_sibling_guard"),
+            plan=plan,
+            expected_count=0,
+        )
+        if (
+            stage.get("task_name") != expected_task_name
+            or stage.get("workdir") != expected_workdir
+            or strict_contract.get("task_identity_generation")
+            != MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION
+            or strict_contract.get("requested_node_name")
+            != strict_runtime["expected_node_name"]
+            or "operational_pressure_atomic_claim_reference" in plan
+        ):
+            raise HandoffContractError(
+                "mesh-quality canary immutable identity drifted"
+            )
     elif operational_pressure_retry:
         _validate_operational_pressure_retry_record(plan)
         _validate_operational_pressure_claim_reference(plan)
@@ -5313,7 +6269,18 @@ def _validate_strict_node_submission_contract(
             "diagnostic strict-node submission contract drifted"
         )
     placement = submission.get("scheduler_placement_contract")
-    if placement is None:
+    mesh_runtime = submission.get(
+        "mesh_quality_canary_strict_runtime_contract"
+    )
+    if mesh_runtime is not None:
+        runtime = _validate_mesh_quality_canary_strict_runtime_contract(
+            mesh_runtime
+        )
+        same_node_id = runtime["same_node_as_task_id"]
+        expected_allocation_id = runtime["expected_allocation_id"]
+        expected_slurm_job_id = runtime["expected_slurm_job_id"]
+        expected_account_name = runtime["expected_account_name"]
+    elif placement is None:
         same_node_id = 0
         expected_allocation_id = 0
         expected_slurm_job_id = ""
@@ -5335,7 +6302,10 @@ def _validate_strict_node_submission_contract(
         "expected_timeout_seconds": (
             submission["resources"]["timeout_seconds"]
             if plan_contract.get("task_identity_generation")
-            == OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION
+            in {
+                MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION,
+                OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION,
+            }
             else None
         ),
     }
@@ -5413,12 +6383,14 @@ def _submit_standard_plan(
     scheduler_cutover_receipt_path: Path,
     output: Path,
     expected_timeout_retry: bool,
+    expected_mesh_quality_canary: bool = False,
     expected_operational_pressure_retry: bool = False,
     priority: int = 0,
     scheduler: Any = scheduler_client,
     predictor: Any | None = None,
     live_reader: Any = _default_scheduler_live_reader,
     task_reader: Any = None,
+    stdout_reader: Any = None,
     event_reader: Any = None,
     task_list_reader: Any = None,
     same_node_as_task_id: int = 0,
@@ -5430,8 +6402,16 @@ def _submit_standard_plan(
     plan, params, selected = _load_plan(plan_path)
     retry_kind = _plan_retry_kind(plan)
     timeout_retry = retry_kind == "timeout"
+    mesh_quality_canary = retry_kind == "mesh_quality_canary"
     operational_pressure_retry = retry_kind == "operational_pressure"
     strict_node_contract = _plan_strict_node_contract(plan)
+    mesh_strict_runtime = (
+        _validate_mesh_quality_canary_strict_runtime_contract(
+            plan.get("mesh_quality_canary_strict_runtime_contract")
+        )
+        if mesh_quality_canary
+        else None
+    )
     strict_node_pin = (
         _strict_node_scheduler_pin(
             strict_node_contract, require_active=True
@@ -5440,15 +6420,25 @@ def _submit_standard_plan(
         else None
     )
     if (
-        expected_timeout_retry and expected_operational_pressure_retry
+        sum(bool(value) for value in (
+            expected_timeout_retry,
+            expected_mesh_quality_canary,
+            expected_operational_pressure_retry,
+        ))
+        > 1
     ) or (
         timeout_retry is not expected_timeout_retry
+        or mesh_quality_canary
+        is not expected_mesh_quality_canary
         or operational_pressure_retry
         is not expected_operational_pressure_retry
     ):
         command = {
             None: "submit-standard",
             "timeout": "submit-timeout-retry",
+            "mesh_quality_canary": (
+                "submit-mesh-quality-canary"
+            ),
             "operational_pressure": (
                 "submit-operational-pressure-retry"
             ),
@@ -5456,13 +6446,34 @@ def _submit_standard_plan(
         raise HandoffContractError(
             f"diagnostic plan requires {command}"
         )
-    placement_requested = (
+    placement_identity_provided = (
         same_node_as_task_id != 0
         or expected_allocation_id != 0
         or bool(str(expected_slurm_job_id).strip())
         or bool(str(expected_account_name).strip())
         or bool(str(expected_node_name).strip())
     )
+    placement_requested = (
+        placement_identity_provided and not mesh_quality_canary
+    )
+    if mesh_quality_canary and (
+        strict_node_contract is None
+        or mesh_strict_runtime is None
+        or same_node_as_task_id
+        != mesh_strict_runtime["same_node_as_task_id"]
+        or expected_allocation_id
+        != mesh_strict_runtime["expected_allocation_id"]
+        or str(expected_slurm_job_id)
+        != mesh_strict_runtime["expected_slurm_job_id"]
+        or str(expected_account_name)
+        != mesh_strict_runtime["expected_account_name"]
+        or str(expected_node_name)
+        != mesh_strict_runtime["expected_node_name"]
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary requires the sealed n114 strict runtime "
+            "identity"
+        )
     if placement_requested and (
         retry_kind not in {"timeout", "operational_pressure"}
         or isinstance(same_node_as_task_id, bool)
@@ -5526,6 +6537,9 @@ def _submit_standard_plan(
     anchor_before = None
     sibling_before = None
     pressure_pre_submit_guard = None
+    mesh_pre_submit_guard = None
+    mesh_pre_submit_guard_count = 0
+    mesh_sibling_before = None
     pressure_locked_guard_count = 0
     if timeout_retry:
         (
@@ -5561,6 +6575,51 @@ def _submit_standard_plan(
                     "timeout_seconds"
                 ],
             )
+    elif mesh_quality_canary:
+        (
+            _logical_plan,
+            _logical_submission,
+            original_submission,
+            stored_execution,
+        ) = _validate_mesh_quality_canary_record(plan)
+        retry_record = copy.deepcopy(
+            plan["retry_of_mesh_quality_canary"]
+        )
+        read_stdout = stdout_reader or _scheduler_task_stdout
+
+        def mesh_pre_submit_guard() -> None:
+            nonlocal mesh_pre_submit_guard_count, mesh_sibling_before
+            live_execution = _mesh_quality_failure_evidence(
+                reader(
+                    scheduler_url=stage["scheduler_url"],
+                    task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+                ),
+                read_stdout(
+                    scheduler_url=stage["scheduler_url"],
+                    task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+                ),
+                submission=original_submission,
+            )
+            if live_execution != stored_execution:
+                raise HandoffContractError(
+                    "mesh-quality terminal evidence changed immediately "
+                    "before canary submission"
+                )
+            mesh_sibling_before = (
+                _mesh_quality_canary_sibling_snapshot(
+                    read_task_list(
+                        scheduler_url=stage["scheduler_url"],
+                        project=scheduler_client.MFT_PROJECT,
+                        task_name=stage["task_name"],
+                    ),
+                    plan=plan,
+                )
+            )
+            if mesh_sibling_before["matching_task_count"] != 0:
+                raise HandoffContractError(
+                    "mesh-quality canary same-profile rerun is forbidden"
+                )
+            mesh_pre_submit_guard_count += 1
     elif operational_pressure_retry:
         (
             _logical_plan,
@@ -5683,6 +6742,10 @@ def _submit_standard_plan(
                 "return_submission_evidence": True,
             }
         )
+    if mesh_strict_runtime is not None:
+        placement_submission_options["account_name"] = (
+            mesh_strict_runtime["expected_account_name"]
+        )
     claim_status = (
         pressure_claim_acquisition["status"]
         if pressure_claim_acquisition is not None
@@ -5783,11 +6846,15 @@ def _submit_standard_plan(
             **(
                 {"pre_submit_guard": pressure_pre_submit_guard}
                 if pressure_pre_submit_guard is not None
-                else {}
+                else (
+                    {"pre_submit_guard": mesh_pre_submit_guard}
+                    if mesh_pre_submit_guard is not None
+                    else {}
+                )
             ),
             **placement_submission_options,
         )
-    if strict_node_contract is not None:
+    if strict_node_contract is not None or mesh_quality_canary:
         if (
             not isinstance(submission_result, dict)
             or set(submission_result)
@@ -5800,7 +6867,7 @@ def _submit_standard_plan(
             }
         ):
             raise HandoffContractError(
-                "strict-node Scheduler submission returned no API evidence"
+                "diagnostic Scheduler submission returned no API evidence"
             )
         task_id = submission_result.get("task_id")
     else:
@@ -5818,6 +6885,46 @@ def _submit_standard_plan(
         raise HandoffContractError(
             "diagnostic retry resolved to the original task ID"
         )
+    mesh_sibling_contract = None
+    if mesh_quality_canary:
+        if (
+            mesh_pre_submit_guard_count != 1
+            or mesh_sibling_before is None
+            or submission_result["submission_source"] != "post_created"
+            or submission_result["scheduler_mutation_performed"] is not True
+            or task_id
+            in MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS
+        ):
+            raise HandoffContractError(
+                "mesh-quality canary was not one fresh guarded POST"
+            )
+        mesh_sibling_after = _mesh_quality_canary_sibling_snapshot(
+            read_task_list(
+                scheduler_url=stage["scheduler_url"],
+                project=scheduler_client.MFT_PROJECT,
+                task_name=stage["task_name"],
+            ),
+            plan=plan,
+        )
+        if (
+            mesh_sibling_after["matching_task_count"] != 1
+            or mesh_sibling_after["matching_tasks"][0]["task_id"]
+            != task_id
+        ):
+            raise HandoffContractError(
+                "mesh-quality canary durable Scheduler identity is absent "
+                "or duplicated after POST"
+            )
+        mesh_sibling_contract = {
+            "schema_version": (
+                "mft-goal-diagnostic-mesh-quality-canary-"
+                "submission-guard-v1"
+            ),
+            "before": mesh_sibling_before,
+            "after": mesh_sibling_after,
+            "task_id": task_id,
+            "exactly_one_guarded_post": True,
+        }
     sibling_contract = None
     if operational_pressure_retry:
         if sibling_before is None:
@@ -5922,13 +7029,19 @@ def _submit_standard_plan(
             )
         same_node_id = same_node_as_task_id if placement_requested else 0
         expected_allocation = (
-            expected_allocation_id if placement_requested else 0
+            expected_allocation_id
+            if placement_requested or mesh_quality_canary
+            else 0
         )
         expected_job = (
-            str(expected_slurm_job_id) if placement_requested else ""
+            str(expected_slurm_job_id)
+            if placement_requested or mesh_quality_canary
+            else ""
         )
         expected_account = (
-            str(expected_account_name) if placement_requested else ""
+            str(expected_account_name)
+            if placement_requested or mesh_quality_canary
+            else ""
         )
         evidence_options = {
             "task_id": task_id,
@@ -6026,6 +7139,11 @@ def _submit_standard_plan(
                 else {}
             ),
             **(
+                {"retry_of_mesh_quality_canary": retry_record}
+                if mesh_quality_canary
+                else {}
+            ),
+            **(
                 {"retry_of_operational_pressure": retry_record}
                 if operational_pressure_retry
                 else {}
@@ -6037,6 +7155,24 @@ def _submit_standard_plan(
                     )
                 }
                 if operational_pressure_retry
+                else {}
+            ),
+            **(
+                {
+                    "mesh_quality_canary_sibling_guard": (
+                        mesh_sibling_contract
+                    )
+                }
+                if mesh_quality_canary
+                else {}
+            ),
+            **(
+                {
+                    "mesh_quality_canary_strict_runtime_contract": (
+                        mesh_strict_runtime
+                    )
+                }
+                if mesh_quality_canary
                 else {}
             ),
             **(
@@ -6127,6 +7263,45 @@ def submit_timeout_retry(
     )
 
 
+def submit_mesh_quality_canary(
+    *,
+    plan_path: Path,
+    scheduler_cutover_receipt_path: Path,
+    output: Path,
+    priority: int = 0,
+    scheduler: Any = scheduler_client,
+    predictor: Any | None = None,
+    live_reader: Any = _default_scheduler_live_reader,
+    task_reader: Any = None,
+    stdout_reader: Any = None,
+    task_list_reader: Any = None,
+    same_node_as_task_id: int,
+    expected_allocation_id: int,
+    expected_slurm_job_id: str,
+    expected_account_name: str,
+    expected_node_name: str,
+) -> Path:
+    return _submit_standard_plan(
+        plan_path=plan_path,
+        scheduler_cutover_receipt_path=scheduler_cutover_receipt_path,
+        output=output,
+        expected_timeout_retry=False,
+        expected_mesh_quality_canary=True,
+        priority=priority,
+        scheduler=scheduler,
+        predictor=predictor,
+        live_reader=live_reader,
+        task_reader=task_reader,
+        stdout_reader=stdout_reader,
+        task_list_reader=task_list_reader,
+        same_node_as_task_id=same_node_as_task_id,
+        expected_allocation_id=expected_allocation_id,
+        expected_slurm_job_id=expected_slurm_job_id,
+        expected_account_name=expected_account_name,
+        expected_node_name=expected_node_name,
+    )
+
+
 def submit_operational_pressure_retry(
     *,
     plan_path: Path,
@@ -6187,8 +7362,16 @@ def _load_submission(
     stage = plan["stage"]
     retry_kind = _plan_retry_kind(plan)
     timeout_retry = retry_kind == "timeout"
+    mesh_quality_canary = retry_kind == "mesh_quality_canary"
     operational_pressure_retry = retry_kind == "operational_pressure"
     strict_node_contract = _plan_strict_node_contract(plan)
+    mesh_strict_runtime = (
+        _validate_mesh_quality_canary_strict_runtime_contract(
+            plan.get("mesh_quality_canary_strict_runtime_contract")
+        )
+        if mesh_quality_canary
+        else None
+    )
     strict_node_pin = (
         _strict_node_scheduler_pin(strict_node_contract)
         if strict_node_contract is not None
@@ -6311,6 +7494,15 @@ def _load_submission(
             and "retry_of_timeout" in receipt
         )
         or (
+            mesh_quality_canary
+            and receipt.get("retry_of_mesh_quality_canary")
+            != plan.get("retry_of_mesh_quality_canary")
+        )
+        or (
+            not mesh_quality_canary
+            and "retry_of_mesh_quality_canary" in receipt
+        )
+        or (
             operational_pressure_retry
             and receipt.get("retry_of_operational_pressure")
             != plan.get("retry_of_operational_pressure")
@@ -6326,6 +7518,25 @@ def _load_submission(
         or (
             not operational_pressure_retry
             and "operational_pressure_sibling_guard" in receipt
+        )
+        or (
+            mesh_quality_canary
+            and "mesh_quality_canary_sibling_guard" not in receipt
+        )
+        or (
+            not mesh_quality_canary
+            and "mesh_quality_canary_sibling_guard" in receipt
+        )
+        or (
+            mesh_quality_canary
+            and receipt.get(
+                "mesh_quality_canary_strict_runtime_contract"
+            )
+            != mesh_strict_runtime
+        )
+        or (
+            not mesh_quality_canary
+            and "mesh_quality_canary_strict_runtime_contract" in receipt
         )
         or (
             operational_pressure_retry
@@ -6360,6 +7571,13 @@ def _load_submission(
         _validate_same_allocation_placement_contract(
             receipt.get("scheduler_placement_contract"),
             submission=receipt,
+        )
+    if mesh_quality_canary:
+        _validate_mesh_quality_canary_record(plan)
+        _validate_mesh_quality_canary_submission_guard(
+            receipt.get("mesh_quality_canary_sibling_guard"),
+            plan=plan,
+            task_id=int(receipt["task_id"]),
         )
     if operational_pressure_retry:
         _validate_operational_pressure_sibling_contract(
@@ -6764,6 +7982,40 @@ def _scheduler_task_snapshot(
             "diagnostic Scheduler task snapshot is not an object"
         )
     return value
+
+
+def _scheduler_task_stdout(
+    *, scheduler_url: str, task_id: int
+) -> bytes:
+    if (
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary Scheduler task ID is invalid"
+        )
+    request = production.urllib.request.Request(
+        f"{scheduler_url.rstrip('/')}/api/tasks/{task_id}/stdout",
+        headers={"Accept": "text/plain"},
+        method="GET",
+    )
+    try:
+        with production.urllib.request.urlopen(
+            request, timeout=60.0
+        ) as response:
+            raw = response.read(
+                MESH_QUALITY_CANARY_STDOUT_MAX_BYTES + 1
+            )
+    except (OSError, production.urllib.error.URLError) as exc:
+        raise HandoffContractError(
+            "mesh-quality canary Scheduler stdout fetch failed"
+        ) from exc
+    if len(raw) > MESH_QUALITY_CANARY_STDOUT_MAX_BYTES:
+        raise HandoffContractError(
+            "mesh-quality canary Scheduler stdout exceeds byte bound"
+        )
+    return raw
 
 
 def _task_execution_evidence(
@@ -7383,6 +8635,28 @@ def _parser() -> argparse.ArgumentParser:
     )
     retry_plan.add_argument("--output", type=Path, required=True)
 
+    mesh_canary_plan = commands.add_parser(
+        "plan-mesh-quality-canary"
+    )
+    mesh_canary_plan.add_argument(
+        "--original-plan", type=Path, required=True
+    )
+    mesh_canary_plan.add_argument(
+        "--original-submission", type=Path, required=True
+    )
+    mesh_canary_plan.add_argument(
+        "--solver-revision", required=True
+    )
+    mesh_canary_plan.add_argument(
+        "--scheduler-url", default=DIAGNOSTIC_SCHEDULER_URL
+    )
+    mesh_canary_plan.add_argument(
+        "--strict-node-name",
+        required=True,
+        help="required fail-closed node; the reviewed canary accepts n114 only",
+    )
+    mesh_canary_plan.add_argument("--output", type=Path, required=True)
+
     pressure_retry_plan = commands.add_parser(
         "plan-operational-pressure-retry"
     )
@@ -7433,6 +8707,33 @@ def _parser() -> argparse.ArgumentParser:
     retry_submit.add_argument("--expected-account-name", default="")
     retry_submit.add_argument("--expected-node-name", default="")
     retry_submit.add_argument("--output", type=Path, required=True)
+
+    mesh_canary_submit = commands.add_parser(
+        "submit-mesh-quality-canary"
+    )
+    mesh_canary_submit.add_argument("--plan", type=Path, required=True)
+    mesh_canary_submit.add_argument(
+        "--scheduler-cutover-receipt",
+        type=Path,
+        required=True,
+    )
+    mesh_canary_submit.add_argument("--priority", type=int, default=0)
+    mesh_canary_submit.add_argument(
+        "--same-node-as-task-id", type=int, required=True
+    )
+    mesh_canary_submit.add_argument(
+        "--expected-allocation-id", type=int, required=True
+    )
+    mesh_canary_submit.add_argument(
+        "--expected-slurm-job-id", required=True
+    )
+    mesh_canary_submit.add_argument(
+        "--expected-account-name", required=True
+    )
+    mesh_canary_submit.add_argument(
+        "--expected-node-name", required=True
+    )
+    mesh_canary_submit.add_argument("--output", type=Path, required=True)
 
     pressure_retry_submit = commands.add_parser(
         "submit-operational-pressure-retry"
@@ -7516,6 +8817,15 @@ def main(argv: list[str] | None = None) -> int:
             strict_node_name=args.strict_node_name,
             output=args.output,
         )
+    elif args.command == "plan-mesh-quality-canary":
+        result = create_mesh_quality_canary_plan(
+            original_plan_path=args.original_plan,
+            original_submission_path=args.original_submission,
+            solver_revision=args.solver_revision,
+            scheduler_url=args.scheduler_url,
+            strict_node_name=args.strict_node_name,
+            output=args.output,
+        )
     elif args.command == "plan-operational-pressure-retry":
         result = create_operational_pressure_retry_plan(
             original_plan_path=args.original_plan,
@@ -7535,6 +8845,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "submit-timeout-retry":
         result = submit_timeout_retry(
+            plan_path=args.plan,
+            scheduler_cutover_receipt_path=(
+                args.scheduler_cutover_receipt
+            ),
+            priority=args.priority,
+            same_node_as_task_id=args.same_node_as_task_id,
+            expected_allocation_id=args.expected_allocation_id,
+            expected_slurm_job_id=args.expected_slurm_job_id,
+            expected_account_name=args.expected_account_name,
+            expected_node_name=args.expected_node_name,
+            output=args.output,
+        )
+    elif args.command == "submit-mesh-quality-canary":
+        result = submit_mesh_quality_canary(
             plan_path=args.plan,
             scheduler_cutover_receipt_path=(
                 args.scheduler_cutover_receipt
