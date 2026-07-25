@@ -200,6 +200,7 @@ MESH_QUALITY_CANARY_EVIDENCE_SCHEMA = (
 )
 MESH_QUALITY_CANARY_LOGICAL_TASK_ID = 96225
 MESH_QUALITY_CANARY_FAILED_TASK_ID = 96264
+MESH_QUALITY_CANARY_RECEIPT_RECOVERY_TASK_ID = 96300
 MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS = frozenset(
     {96269, 96271, 96272}
 )
@@ -223,10 +224,14 @@ MESH_QUALITY_CANARY_NATIVE_MESSAGE = (
 MESH_QUALITY_CANARY_SOURCE_LEVEL = 5
 MESH_QUALITY_CANARY_TARGET_LEVEL = 4
 MESH_QUALITY_CANARY_STDOUT_MAX_BYTES = 64 * 1024 * 1024
+SCHEDULER_TASK_INVENTORY_MAX_BYTES = 16 * 1024 * 1024
 MESH_QUALITY_CANARY_STRICT_NODE_NAME = "n114"
 MESH_QUALITY_CANARY_EXPECTED_ALLOCATION_ID = 14492
 MESH_QUALITY_CANARY_EXPECTED_SLURM_JOB_ID = "824575"
 MESH_QUALITY_CANARY_EXPECTED_ACCOUNT_NAME = "r1jae262"
+MESH_QUALITY_CANARY_RECEIPT_RECOVERY_SCHEMA = (
+    "mft-goal-diagnostic-mesh-quality-canary-receipt-recovery-v1"
+)
 OPERATIONAL_PRESSURE_RETRY_PROFILE_SCHEMA = (
     "mft-goal-diagnostic-standard-operational-pressure-retry-profile-v1"
 )
@@ -3581,7 +3586,7 @@ def _scheduler_project_tasks(
         with production.urllib.request.urlopen(
             request, timeout=20
         ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read(SCHEDULER_TASK_INVENTORY_MAX_BYTES + 1)
     except (
         OSError,
         UnicodeError,
@@ -3589,6 +3594,16 @@ def _scheduler_project_tasks(
     ) as exc:
         raise HandoffContractError(
             "Scheduler project task inventory is unavailable"
+        ) from exc
+    if len(raw) > SCHEDULER_TASK_INVENTORY_MAX_BYTES:
+        raise HandoffContractError(
+            "Scheduler project task inventory exceeds byte bound"
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HandoffContractError(
+            "Scheduler project task inventory is invalid JSON"
         ) from exc
     if not isinstance(payload, list):
         raise HandoffContractError(
@@ -4522,6 +4537,322 @@ def _validate_mesh_quality_canary_submission_guard(
         expected_count=1,
         expected_task_id=task_id,
     )
+    return dict(value)
+
+
+def _mesh_quality_canary_submitted_payload_readback(
+    snapshot: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    task_id: int,
+) -> dict[str, Any]:
+    """Authenticate the immutable submitted payload using Scheduler GET only."""
+
+    runtime = _validate_mesh_quality_canary_strict_runtime_contract(
+        plan.get("mesh_quality_canary_strict_runtime_contract")
+    )
+    stage = plan["stage"]
+    strict = _strict_node_task_evidence(
+        snapshot,
+        task_id=task_id,
+        task_name=stage["task_name"],
+        dedupe_key=stage["retained_aedt_bundle"]["dedupe_key"],
+        node_name=runtime["expected_node_name"],
+        same_node_as_task_id=runtime["same_node_as_task_id"],
+        expected_allocation_id=runtime["expected_allocation_id"],
+        expected_slurm_job_id=runtime["expected_slurm_job_id"],
+        expected_account_name=runtime["expected_account_name"],
+        expected_timeout_seconds=stage["resources"]["timeout_seconds"],
+    )
+    submitted_payload = {
+        "name": snapshot.get("name"),
+        "project": snapshot.get("project"),
+        "remote_cwd": snapshot.get("remote_cwd"),
+        "required_capability": snapshot.get("required_capability"),
+        "env_profile": snapshot.get("env_profile"),
+        "scheduling_profile": snapshot.get("scheduling_profile"),
+        "aedt_backend": snapshot.get("aedt_backend"),
+        "cpus": snapshot.get("cpus"),
+        "memory_mb": snapshot.get("memory_mb"),
+        "gpus": snapshot.get("gpus"),
+        "gpu_model": snapshot.get("gpu_model"),
+        "account_name": snapshot.get("requested_account_name"),
+        "node_name": snapshot.get("requested_node_name"),
+        "node_name_policy": snapshot.get("requested_node_name_policy"),
+        "same_node_as_task_id": snapshot.get("same_node_as_task_id", 0),
+        "priority": snapshot.get("priority"),
+        "timeout_seconds": snapshot.get("timeout_seconds"),
+        "dedupe_key": snapshot.get("dedupe_key"),
+    }
+    expected_payload = {
+        "name": stage["task_name"],
+        "project": scheduler_client.MFT_PROJECT,
+        "remote_cwd": scheduler_client.GPFS_RUNS_REMOTE_CWD,
+        "required_capability": "conda:pyaedt2026v1",
+        "env_profile": "pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": stage["resources"]["cpus"],
+        "memory_mb": 32768,
+        "gpus": 0,
+        "gpu_model": "",
+        "account_name": runtime["expected_account_name"],
+        "node_name": runtime["expected_node_name"],
+        "node_name_policy": "strict",
+        "same_node_as_task_id": runtime["same_node_as_task_id"],
+        "priority": 100,
+        "timeout_seconds": stage["resources"]["timeout_seconds"],
+        "dedupe_key": stage["retained_aedt_bundle"]["dedupe_key"],
+    }
+    created_at = str(snapshot.get("created_at") or "").strip()
+    remote_dir = str(snapshot.get("remote_dir") or "").strip()
+    direct_id = snapshot.get("id")
+    direct_task_id = snapshot.get("task_id")
+    if (
+        task_id != MESH_QUALITY_CANARY_RECEIPT_RECOVERY_TASK_ID
+        or direct_id != task_id
+        or direct_task_id != task_id
+        or submitted_payload != expected_payload
+        or not created_at
+        or not remote_dir
+        or not remote_dir.startswith("slurm_scheduler/runs/")
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary recovered submitted payload drifted"
+        )
+    return {
+        "schema_version": (
+            "mft-goal-diagnostic-mesh-quality-canary-"
+            "submitted-payload-readback-v1"
+        ),
+        "task_id": task_id,
+        "created_at": created_at,
+        "remote_dir": remote_dir,
+        "submitted_payload": submitted_payload,
+        "strict_placement_readback": strict,
+    }
+
+
+def _validate_mesh_quality_canary_submitted_payload_readback(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    task_id: int,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "task_id",
+            "created_at",
+            "remote_dir",
+            "submitted_payload",
+            "strict_placement_readback",
+        }
+        or value.get("schema_version")
+        != (
+            "mft-goal-diagnostic-mesh-quality-canary-"
+            "submitted-payload-readback-v1"
+        )
+        or value.get("task_id") != task_id
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary submitted payload readback is malformed"
+        )
+    submitted_payload = value["submitted_payload"]
+    strict_placement_readback = value["strict_placement_readback"]
+    if not isinstance(submitted_payload, dict) or not isinstance(
+        strict_placement_readback, dict
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary submitted payload readback is malformed"
+        )
+    raw = dict(submitted_payload)
+    raw.update(strict_placement_readback)
+    raw["id"] = task_id
+    raw["task_id"] = task_id
+    raw["created_at"] = value["created_at"]
+    raw["remote_dir"] = value["remote_dir"]
+    normalized = _mesh_quality_canary_submitted_payload_readback(
+        raw, plan=plan, task_id=task_id
+    )
+    if normalized != value:
+        raise HandoffContractError(
+            "mesh-quality canary submitted payload readback drifted"
+        )
+    return dict(value)
+
+
+def _mesh_quality_canary_receipt_recovery_contract(
+    *,
+    plan: Mapping[str, Any],
+    task_id: int,
+    task_before: Mapping[str, Any],
+    task_after: Mapping[str, Any],
+    inventory_before: Mapping[str, Any],
+    inventory_after: Mapping[str, Any],
+) -> dict[str, Any]:
+    before = _mesh_quality_canary_submitted_payload_readback(
+        task_before, plan=plan, task_id=task_id
+    )
+    after = _mesh_quality_canary_submitted_payload_readback(
+        task_after, plan=plan, task_id=task_id
+    )
+    _validate_mesh_quality_canary_sibling_snapshot(
+        inventory_before,
+        plan=plan,
+        expected_count=1,
+        expected_task_id=task_id,
+    )
+    _validate_mesh_quality_canary_sibling_snapshot(
+        inventory_after,
+        plan=plan,
+        expected_count=1,
+        expected_task_id=task_id,
+    )
+    immutable_before = {
+        name: before[name]
+        for name in (
+            "task_id",
+            "created_at",
+            "remote_dir",
+            "submitted_payload",
+        )
+    }
+    immutable_after = {
+        name: after[name]
+        for name in immutable_before
+    }
+    if immutable_before != immutable_after:
+        raise HandoffContractError(
+            "mesh-quality canary GET payload changed during receipt recovery"
+        )
+    return {
+        "schema_version": MESH_QUALITY_CANARY_RECEIPT_RECOVERY_SCHEMA,
+        "reason": (
+            "post_created_task_durable_but_immediate_inventory_readback_"
+            "missed_receipt"
+        ),
+        "task_id": task_id,
+        "plan_payload_sha256": plan["payload_sha256"],
+        "task_get_before": before,
+        "task_get_after": after,
+        "inventory_before": copy.deepcopy(inventory_before),
+        "inventory_after": copy.deepcopy(inventory_after),
+        "api_methods_used": [
+            "GET /api/tasks/96300",
+            "GET /api/tasks?project=MFT_1MW_2026v1&name_prefix="
+            + plan["stage"]["task_name"],
+        ],
+        "scheduler_http_methods_used": ["GET"],
+        "scheduler_get_count": 4,
+        "scheduler_mutation_count": 0,
+        "scheduler_submit_call_performed": False,
+        "scheduler_cancel_call_performed": False,
+        "scheduler_priority_mutation_performed": False,
+        "existing_task_recovered": True,
+        "historical_post_provenance_claimed": False,
+        "task_count_before": 1,
+        "task_count_after": 1,
+    }
+
+
+def _validate_mesh_quality_canary_receipt_recovery(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "reason",
+        "task_id",
+        "plan_payload_sha256",
+        "task_get_before",
+        "task_get_after",
+        "inventory_before",
+        "inventory_after",
+        "api_methods_used",
+        "scheduler_http_methods_used",
+        "scheduler_get_count",
+        "scheduler_mutation_count",
+        "scheduler_submit_call_performed",
+        "scheduler_cancel_call_performed",
+        "scheduler_priority_mutation_performed",
+        "existing_task_recovered",
+        "historical_post_provenance_claimed",
+        "task_count_before",
+        "task_count_after",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_fields
+        or value.get("schema_version")
+        != MESH_QUALITY_CANARY_RECEIPT_RECOVERY_SCHEMA
+        or value.get("reason")
+        != (
+            "post_created_task_durable_but_immediate_inventory_readback_"
+            "missed_receipt"
+        )
+        or value.get("task_id")
+        != MESH_QUALITY_CANARY_RECEIPT_RECOVERY_TASK_ID
+        or value.get("task_id") != submission.get("task_id")
+        or value.get("plan_payload_sha256") != plan["payload_sha256"]
+        or value.get("scheduler_get_count") != 4
+        or value.get("scheduler_mutation_count") != 0
+        or value.get("scheduler_http_methods_used") != ["GET"]
+        or value.get("scheduler_submit_call_performed") is not False
+        or value.get("scheduler_cancel_call_performed") is not False
+        or value.get("scheduler_priority_mutation_performed") is not False
+        or value.get("existing_task_recovered") is not True
+        or value.get("historical_post_provenance_claimed") is not False
+        or value.get("task_count_before") != 1
+        or value.get("task_count_after") != 1
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary receipt recovery contract drifted"
+        )
+    before = _validate_mesh_quality_canary_submitted_payload_readback(
+        value["task_get_before"],
+        plan=plan,
+        task_id=int(value["task_id"]),
+    )
+    after = _validate_mesh_quality_canary_submitted_payload_readback(
+        value["task_get_after"],
+        plan=plan,
+        task_id=int(value["task_id"]),
+    )
+    _validate_mesh_quality_canary_sibling_snapshot(
+        value["inventory_before"],
+        plan=plan,
+        expected_count=1,
+        expected_task_id=int(value["task_id"]),
+    )
+    _validate_mesh_quality_canary_sibling_snapshot(
+        value["inventory_after"],
+        plan=plan,
+        expected_count=1,
+        expected_task_id=int(value["task_id"]),
+    )
+    immutable_fields = (
+        "task_id",
+        "created_at",
+        "remote_dir",
+        "submitted_payload",
+    )
+    expected_api_methods = [
+        "GET /api/tasks/96300",
+        "GET /api/tasks?project=MFT_1MW_2026v1&name_prefix="
+        + plan["stage"]["task_name"],
+    ]
+    if (
+        any(before[name] != after[name] for name in immutable_fields)
+        or value.get("api_methods_used") != expected_api_methods
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary receipt recovery evidence drifted"
+        )
     return dict(value)
 
 
@@ -7302,6 +7633,237 @@ def submit_mesh_quality_canary(
     )
 
 
+def reconcile_mesh_quality_canary_submission(
+    *,
+    plan_path: Path,
+    scheduler_cutover_receipt_path: Path,
+    task_id: int,
+    output: Path,
+    predictor: Any | None = None,
+    live_reader: Any = _default_scheduler_live_reader,
+    task_reader: Any = None,
+    stdout_reader: Any = None,
+    task_list_reader: Any = None,
+    same_node_as_task_id: int,
+    expected_allocation_id: int,
+    expected_slurm_job_id: str,
+    expected_account_name: str,
+    expected_node_name: str,
+) -> Path:
+    """Recover the receipt for existing task 96300 using bounded GETs only."""
+
+    plan, _params, selected = _load_plan(plan_path)
+    if (
+        _plan_retry_kind(plan) != "mesh_quality_canary"
+        or task_id != MESH_QUALITY_CANARY_RECEIPT_RECOVERY_TASK_ID
+    ):
+        raise HandoffContractError(
+            "receipt recovery is restricted to exact mesh canary task 96300"
+        )
+    strict_node_contract = _plan_strict_node_contract(plan)
+    strict_node_pin = _strict_node_scheduler_pin(
+        strict_node_contract, require_active=True
+    )
+    runtime = _validate_mesh_quality_canary_strict_runtime_contract(
+        plan.get("mesh_quality_canary_strict_runtime_contract")
+    )
+    if (
+        isinstance(same_node_as_task_id, bool)
+        or same_node_as_task_id != runtime["same_node_as_task_id"]
+        or expected_allocation_id != runtime["expected_allocation_id"]
+        or str(expected_slurm_job_id)
+        != runtime["expected_slurm_job_id"]
+        or str(expected_account_name)
+        != runtime["expected_account_name"]
+        or str(expected_node_name) != runtime["expected_node_name"]
+    ):
+        raise HandoffContractError(
+            "mesh-quality receipt recovery runtime identity drifted"
+        )
+    target = output.resolve()
+    if target.exists():
+        raise HandoffContractError(
+            f"diagnostic submission receipt already exists: {target}"
+        )
+    stage = plan["stage"]
+    reader = task_reader or _scheduler_task_snapshot
+    read_stdout = stdout_reader or _scheduler_task_stdout
+    read_task_list = task_list_reader or _scheduler_project_tasks
+    with scheduler_client.campaign_mutation_lock():
+        if target.exists():
+            raise HandoffContractError(
+                f"diagnostic submission receipt already exists: {target}"
+            )
+        (
+            _logical_plan,
+            _logical_submission,
+            original_submission,
+            stored_execution,
+        ) = _validate_mesh_quality_canary_record(plan)
+        live_execution = _mesh_quality_failure_evidence(
+            reader(
+                scheduler_url=stage["scheduler_url"],
+                task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+            ),
+            read_stdout(
+                scheduler_url=stage["scheduler_url"],
+                task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+            ),
+            submission=original_submission,
+        )
+        if live_execution != stored_execution:
+            raise HandoffContractError(
+                "mesh-quality source failure changed before receipt recovery"
+            )
+        reauthentication = _fresh_selection_reauthentication(
+            plan=plan, selected=selected, predictor=predictor
+        )
+        cutover, launcher_before = _validate_scheduler_cutover_receipt(
+            scheduler_cutover_receipt_path,
+            verify_live_launcher=True,
+            require_strict_node=True,
+            strict_node_contract=strict_node_contract,
+            require_active_strict=True,
+        )
+        if cutover["scheduler_url"] != stage["scheduler_url"]:
+            raise HandoffContractError(
+                "Scheduler cutover endpoint differs from canary plan"
+            )
+        admission = _live_scheduler_admission_snapshot(
+            scheduler_url=stage["scheduler_url"],
+            reader=live_reader,
+        )
+        launcher_after = _live_launcher_identity(
+            cutover,
+            expected_sha256=strict_node_pin["launcher_sha256"],
+        )
+        if launcher_after != launcher_before:
+            raise HandoffContractError(
+                "Scheduler live launcher changed during receipt recovery"
+            )
+        _environment, core_evidence = production._submission_environment(
+            stage="standard",
+            solver_revision=plan["solver_revision"],
+            license_snapshot_path=None,
+        )
+        inventory_before = _mesh_quality_canary_sibling_snapshot(
+            read_task_list(
+                scheduler_url=stage["scheduler_url"],
+                project=scheduler_client.MFT_PROJECT,
+                task_name=stage["task_name"],
+            ),
+            plan=plan,
+        )
+        task_before = reader(
+            scheduler_url=stage["scheduler_url"], task_id=task_id
+        )
+        inventory_after = _mesh_quality_canary_sibling_snapshot(
+            read_task_list(
+                scheduler_url=stage["scheduler_url"],
+                project=scheduler_client.MFT_PROJECT,
+                task_name=stage["task_name"],
+            ),
+            plan=plan,
+        )
+        task_after = reader(
+            scheduler_url=stage["scheduler_url"], task_id=task_id
+        )
+        recovery = _mesh_quality_canary_receipt_recovery_contract(
+            plan=plan,
+            task_id=task_id,
+            task_before=task_before,
+            task_after=task_after,
+            inventory_before=inventory_before,
+            inventory_after=inventory_after,
+        )
+        evidence_options = {
+            "task_id": task_id,
+            "task_name": stage["task_name"],
+            "dedupe_key": stage["retained_aedt_bundle"]["dedupe_key"],
+            "node_name": runtime["expected_node_name"],
+            "same_node_as_task_id": runtime["same_node_as_task_id"],
+            "expected_allocation_id": runtime["expected_allocation_id"],
+            "expected_slurm_job_id": runtime["expected_slurm_job_id"],
+            "expected_account_name": runtime["expected_account_name"],
+            "expected_timeout_seconds": stage["resources"][
+                "timeout_seconds"
+            ],
+        }
+        normalized_trace = {
+            "submission_source": "pre_submission_reconciliation",
+            "scheduler_mutation_performed": False,
+            "api_pre_submission_readback": (
+                _strict_node_task_evidence(
+                    task_before, **evidence_options
+                )
+            ),
+            "api_post_submission_response": None,
+        }
+        strict_submission_contract = _strict_node_submission_contract(
+            plan_contract=strict_node_contract,
+            submission_trace=normalized_trace,
+            durable_readback=_strict_node_task_evidence(
+                task_after, **evidence_options
+            ),
+        )
+        receipt = production._seal(
+            {
+                "schema_version": SUBMISSION_SCHEMA,
+                "stage": "standard",
+                "plan": production._file_record(plan_path),
+                "plan_payload_sha256": plan["payload_sha256"],
+                "candidate_physics_sha256": plan[
+                    "candidate_physics_sha256"
+                ],
+                "search_authority_reauthentication": reauthentication,
+                "task_id": task_id,
+                "task_name": stage["task_name"],
+                "workdir": stage["workdir"],
+                "dedupe_key": stage[
+                    "retained_aedt_bundle"
+                ]["dedupe_key"],
+                "solver_revision": plan["solver_revision"],
+                "library_revision": plan["library_revision"],
+                "profile_sha256": stage["profile_sha256"],
+                "effective_params_sha256": stage[
+                    "effective_params_sha256"
+                ],
+                "resources": stage["resources"],
+                "aedt_backend": "standalone",
+                "core_policy": core_evidence,
+                "retained_aedt_bundle": stage["retained_aedt_bundle"],
+                "retention_run_root": stage["retention_run_root"],
+                "scheduler_cutover_receipt": production._file_record(
+                    scheduler_cutover_receipt_path.resolve(strict=True)
+                ),
+                "scheduler_cutover_payload_sha256": cutover[
+                    "payload_sha256"
+                ],
+                "scheduler_live_launcher_identity": launcher_after,
+                "scheduler_admission_snapshot": admission,
+                "scheduler_url": stage["scheduler_url"],
+                "scheduler_project": scheduler_client.MFT_PROJECT,
+                "scheduler_project_mutation_performed": False,
+                "scheduler_repository_modified": False,
+                "scheduler_submission_performed": True,
+                "scheduler_submission_performed_by_reconciliation": False,
+                "scheduler_task_mutation_performed_by_reconciliation": False,
+                "retention_required": True,
+                "prune_protection_required": True,
+                "retry_of_mesh_quality_canary": copy.deepcopy(
+                    plan["retry_of_mesh_quality_canary"]
+                ),
+                "mesh_quality_canary_receipt_recovery": recovery,
+                "mesh_quality_canary_strict_runtime_contract": runtime,
+                "scheduler_strict_node_contract": (
+                    strict_submission_contract
+                ),
+                **_diagnostic_flags(),
+            }
+        )
+        return production._write_immutable_json(target, receipt)
+
+
 def submit_operational_pressure_retry(
     *,
     plan_path: Path,
@@ -7372,6 +7934,13 @@ def _load_submission(
         if mesh_quality_canary
         else None
     )
+    mesh_receipt_recovery = receipt.get(
+        "mesh_quality_canary_receipt_recovery"
+    )
+    has_mesh_submission_guard = (
+        "mesh_quality_canary_sibling_guard" in receipt
+    )
+    has_mesh_receipt_recovery = mesh_receipt_recovery is not None
     strict_node_pin = (
         _strict_node_scheduler_pin(strict_node_contract)
         if strict_node_contract is not None
@@ -7521,11 +8090,39 @@ def _load_submission(
         )
         or (
             mesh_quality_canary
-            and "mesh_quality_canary_sibling_guard" not in receipt
+            and (
+                has_mesh_submission_guard
+                == has_mesh_receipt_recovery
+            )
         )
         or (
             not mesh_quality_canary
-            and "mesh_quality_canary_sibling_guard" in receipt
+            and (
+                has_mesh_submission_guard
+                or has_mesh_receipt_recovery
+            )
+        )
+        or (
+            has_mesh_receipt_recovery
+            and (
+                receipt.get(
+                    "scheduler_submission_performed_by_reconciliation"
+                )
+                is not False
+                or receipt.get(
+                    "scheduler_task_mutation_performed_by_reconciliation"
+                )
+                is not False
+            )
+        )
+        or (
+            not has_mesh_receipt_recovery
+            and (
+                "scheduler_submission_performed_by_reconciliation"
+                in receipt
+                or "scheduler_task_mutation_performed_by_reconciliation"
+                in receipt
+            )
         )
         or (
             mesh_quality_canary
@@ -7574,11 +8171,18 @@ def _load_submission(
         )
     if mesh_quality_canary:
         _validate_mesh_quality_canary_record(plan)
-        _validate_mesh_quality_canary_submission_guard(
-            receipt.get("mesh_quality_canary_sibling_guard"),
-            plan=plan,
-            task_id=int(receipt["task_id"]),
-        )
+        if has_mesh_receipt_recovery:
+            _validate_mesh_quality_canary_receipt_recovery(
+                mesh_receipt_recovery,
+                plan=plan,
+                submission=receipt,
+            )
+        else:
+            _validate_mesh_quality_canary_submission_guard(
+                receipt.get("mesh_quality_canary_sibling_guard"),
+                plan=plan,
+                task_id=int(receipt["task_id"]),
+            )
     if operational_pressure_retry:
         _validate_operational_pressure_sibling_contract(
             receipt.get("operational_pressure_sibling_guard"),
@@ -8735,6 +9339,35 @@ def _parser() -> argparse.ArgumentParser:
     )
     mesh_canary_submit.add_argument("--output", type=Path, required=True)
 
+    mesh_canary_reconcile = commands.add_parser(
+        "reconcile-mesh-quality-canary-submission"
+    )
+    mesh_canary_reconcile.add_argument("--plan", type=Path, required=True)
+    mesh_canary_reconcile.add_argument(
+        "--scheduler-cutover-receipt",
+        type=Path,
+        required=True,
+    )
+    mesh_canary_reconcile.add_argument("--task-id", type=int, required=True)
+    mesh_canary_reconcile.add_argument(
+        "--same-node-as-task-id", type=int, required=True
+    )
+    mesh_canary_reconcile.add_argument(
+        "--expected-allocation-id", type=int, required=True
+    )
+    mesh_canary_reconcile.add_argument(
+        "--expected-slurm-job-id", required=True
+    )
+    mesh_canary_reconcile.add_argument(
+        "--expected-account-name", required=True
+    )
+    mesh_canary_reconcile.add_argument(
+        "--expected-node-name", required=True
+    )
+    mesh_canary_reconcile.add_argument(
+        "--output", type=Path, required=True
+    )
+
     pressure_retry_submit = commands.add_parser(
         "submit-operational-pressure-retry"
     )
@@ -8864,6 +9497,20 @@ def main(argv: list[str] | None = None) -> int:
                 args.scheduler_cutover_receipt
             ),
             priority=args.priority,
+            same_node_as_task_id=args.same_node_as_task_id,
+            expected_allocation_id=args.expected_allocation_id,
+            expected_slurm_job_id=args.expected_slurm_job_id,
+            expected_account_name=args.expected_account_name,
+            expected_node_name=args.expected_node_name,
+            output=args.output,
+        )
+    elif args.command == "reconcile-mesh-quality-canary-submission":
+        result = reconcile_mesh_quality_canary_submission(
+            plan_path=args.plan,
+            scheduler_cutover_receipt_path=(
+                args.scheduler_cutover_receipt
+            ),
+            task_id=args.task_id,
             same_node_as_task_id=args.same_node_as_task_id,
             expected_allocation_id=args.expected_allocation_id,
             expected_slurm_job_id=args.expected_slurm_job_id,

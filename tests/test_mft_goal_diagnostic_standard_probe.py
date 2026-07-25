@@ -2741,6 +2741,124 @@ def test_mesh_quality_canary_retains_bundle_after_failed_simulation(
     assert 'if [ "$simulation_rc" -eq 0 ]' not in command
 
 
+def test_mesh_quality_canary_receipt_recovery_is_get_only_and_state_safe():
+    task_name = (
+        "mft-goal-diag-standard-mesh-canary-r1-"
+        "l96225-7a6ccac265d3"
+    )
+    dedupe_key = (
+        "mft-al:mft-goal-diag-standard-mesh-canary-r1-"
+        "l96225-7a6ccac265d3:"
+        + "f" * 40
+        + ":"
+        + "e" * 40
+        + ":8b0b9947f7e93c8a"
+    )
+    plan = {
+        "payload_sha256": "a" * 64,
+        "mesh_quality_canary_strict_runtime_contract": (
+            probe._mesh_quality_canary_strict_runtime_contract()
+        ),
+        "stage": {
+            "task_name": task_name,
+            "retained_aedt_bundle": {"dedupe_key": dedupe_key},
+            "resources": {"cpus": 8, "timeout_seconds": 28800},
+        },
+    }
+    running = {
+        "task_id": 96300,
+        "id": 96300,
+        "name": task_name,
+        "status": "running",
+        "state": "running",
+        "dedupe_key": dedupe_key,
+        "project": scheduler_client.MFT_PROJECT,
+        "remote_cwd": scheduler_client.GPFS_RUNS_REMOTE_CWD,
+        "remote_dir": "slurm_scheduler/runs/2026-07-25/task-96300",
+        "required_capability": "conda:pyaedt2026v1",
+        "env_profile": "pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "gpus": 0,
+        "gpu_model": "",
+        "priority": 100,
+        "timeout_seconds": 28800,
+        "node_name": "n114",
+        "requested_node_name": "n114",
+        "node_name_policy": "strict",
+        "requested_node_name_policy": "strict",
+        "strict_node_placement": True,
+        "placement_contract_satisfied": True,
+        "allocation_id": 14492,
+        "assigned_allocation": 14492,
+        "allocation_node_name": "n114",
+        "actual_node_name": "n114",
+        "slurm_job_id": "824575",
+        "account_name": "r1jae262",
+        "requested_account_name": "r1jae262",
+        "same_node_as_task_id": 0,
+        "created_at": "2026-07-25 07:46:38",
+        "started_at": "2026-07-25 07:47:07",
+        "finished_at": None,
+    }
+    completed = {
+        **running,
+        "status": "completed",
+        "state": "succeeded",
+        "finished_at": "2026-07-25 11:47:07",
+    }
+    before = probe._mesh_quality_canary_sibling_snapshot(
+        [running], plan=plan
+    )
+    after = probe._mesh_quality_canary_sibling_snapshot(
+        [completed], plan=plan
+    )
+    recovery = probe._mesh_quality_canary_receipt_recovery_contract(
+        plan=plan,
+        task_id=96300,
+        task_before=running,
+        task_after=completed,
+        inventory_before=before,
+        inventory_after=after,
+    )
+    probe._validate_mesh_quality_canary_receipt_recovery(
+        recovery,
+        plan=plan,
+        submission={"task_id": 96300},
+    )
+    assert recovery["scheduler_http_methods_used"] == ["GET"]
+    assert recovery["scheduler_get_count"] == 4
+    assert recovery["scheduler_mutation_count"] == 0
+    assert recovery["scheduler_submit_call_performed"] is False
+    assert recovery["scheduler_cancel_call_performed"] is False
+    assert recovery["historical_post_provenance_claimed"] is False
+    malformed = copy.deepcopy(recovery)
+    malformed["task_get_after"]["submitted_payload"] = []
+    with pytest.raises(
+        production.HandoffContractError,
+        match="submitted payload readback is malformed",
+    ):
+        probe._validate_mesh_quality_canary_receipt_recovery(
+            malformed,
+            plan=plan,
+            submission={"task_id": 96300},
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="strict-node Scheduler identity drifted",
+    ):
+        probe._mesh_quality_canary_receipt_recovery_contract(
+            plan=plan,
+            task_id=96300,
+            task_before=running,
+            task_after={**completed, "requested_node_name": "n110"},
+            inventory_before=before,
+            inventory_after=after,
+        )
+
+
 def test_timeout_retry_parser_exposes_complete_same_allocation_contract():
     claim_init = probe._parser().parse_args(
         ["init-operational-pressure-claim-root"]
