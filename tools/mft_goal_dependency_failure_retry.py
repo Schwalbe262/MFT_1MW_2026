@@ -2,13 +2,14 @@
 
 This is deliberately an MFT-project tool.  It does not import, modify, or
 write the separate Scheduler repository.  The one allowed Scheduler mutation
-is the guarded task POST performed by ``submit-dependency-failure-retry``.
+is the guarded task POST performed by the generation-specific submit command.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -85,9 +86,137 @@ CLAIM_AUTHORITY_SHA256 = canonical_sha256(
         "retry_generation": RETRY_GENERATION,
     }
 )
+R2_PLAN_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quota-dependency-plan-v1"
+)
+R2_SUBMISSION_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quota-dependency-submission-v1"
+)
+R2_RETRY_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quota-dependency-evidence-v1"
+)
+R2_FAILURE_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quota-dependency-task-failure-v1"
+)
+R2_ANCHOR_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quota-anchor-failure-v1"
+)
+R2_SIBLING_GUARD_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quota-dependency-sibling-guard-v1"
+)
+R2_CLAIM_RECEIPT_SCHEMA = (
+    "mft-goal-mesh-quota-dependency-atomic-claim-receipt-v1"
+)
+R2_PROFILE_SCHEMA = (
+    "mft-goal-diagnostic-standard-mesh-quota-dependency-retry-profile-v1"
+)
+R2_RETRY_GENERATION = "mesh-quota-dependency-r2"
+R2_FAILURE_CLASS = (
+    "scheduler_same_node_dependency_failed_after_mesh_quota_anchor"
+)
+R2_ANCHOR_FAILURE_CLASS = (
+    "native_mesh_core_plate_pad_coverage_and_dw16_quota_persistence"
+)
+R2_ANCHOR_FAILURE_PREFIX = (
+    "RESULT_JSON: thermal_error_message="
+    "native thermal mesh preflight failed: "
+)
+R2_PROFILE_PATH = (
+    probe.REPOSITORY_ROOT
+    / "regression_260707"
+    / "verify"
+    / "profiles"
+    / "goal_diagnostic_standard_mesh_quota_dependency_retry.json"
+)
+R2_CLAIM_ROOT = Path(
+    "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
+    "mesh_quota_dependency_claims"
+)
+R2_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
+    {
+        "campaign_id": "mft-goal-20260726",
+        "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+        "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+        "temperature_contract_sha256": (
+            GOAL_TEMPERATURE_CONTRACT_SHA256
+        ),
+        "retry_generation": R2_RETRY_GENERATION,
+    }
+)
+R2_FULL_PREFLIGHT_LOG_PREFIX = "[thermal] native mesh preflight: "
+R2_QUOTA_MESSAGE = "[Errno 122] Disk quota exceeded"
+R2_CORE_PLATE_PAD_OBJECTS = (
+    "core_plate_pad_4_a_center",
+    "core_plate_pad_4_a_side_left",
+    "core_plate_pad_4_b_center",
+    "core_plate_pad_4_b_side_left",
+    "core_plate_pad_5_a_center",
+    "core_plate_pad_5_a_side_left",
+    "core_plate_pad_5_b_center",
+    "core_plate_pad_5_b_side_left",
+    "core_plate_pad_6_a_center",
+    "core_plate_pad_6_a_side_left",
+    "core_plate_pad_6_b_center",
+    "core_plate_pad_6_b_side_left",
+)
 MAX_POST_RECONCILIATION_READS = 8
 POST_RECONCILIATION_INTERVAL_SECONDS = 0.25
 HandoffContractError = production.HandoffContractError
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    plan_schema: str
+    submission_schema: str
+    retry_evidence_schema: str
+    failure_evidence_schema: str
+    anchor_evidence_schema: str
+    sibling_guard_schema: str
+    claim_receipt_schema: str
+    profile_schema: str
+    retry_generation: str
+    failure_class: str
+    anchor_failure_class: str
+    identity_generation: str
+    plan_command: str
+    submit_command: str
+    anchor_mode: str
+
+
+R1_POLICY = RetryPolicy(
+    plan_schema=PLAN_SCHEMA,
+    submission_schema=SUBMISSION_SCHEMA,
+    retry_evidence_schema=RETRY_EVIDENCE_SCHEMA,
+    failure_evidence_schema=FAILURE_EVIDENCE_SCHEMA,
+    anchor_evidence_schema=ANCHOR_EVIDENCE_SCHEMA,
+    sibling_guard_schema=SIBLING_GUARD_SCHEMA,
+    claim_receipt_schema=CLAIM_RECEIPT_SCHEMA,
+    profile_schema=PROFILE_SCHEMA,
+    retry_generation=RETRY_GENERATION,
+    failure_class=FAILURE_CLASS,
+    anchor_failure_class=ANCHOR_FAILURE_CLASS,
+    identity_generation="r1",
+    plan_command="plan-dependency-failure-retry",
+    submit_command="submit-dependency-failure-retry",
+    anchor_mode="native_nonconvergence",
+)
+R2_POLICY = RetryPolicy(
+    plan_schema=R2_PLAN_SCHEMA,
+    submission_schema=R2_SUBMISSION_SCHEMA,
+    retry_evidence_schema=R2_RETRY_EVIDENCE_SCHEMA,
+    failure_evidence_schema=R2_FAILURE_EVIDENCE_SCHEMA,
+    anchor_evidence_schema=R2_ANCHOR_EVIDENCE_SCHEMA,
+    sibling_guard_schema=R2_SIBLING_GUARD_SCHEMA,
+    claim_receipt_schema=R2_CLAIM_RECEIPT_SCHEMA,
+    profile_schema=R2_PROFILE_SCHEMA,
+    retry_generation=R2_RETRY_GENERATION,
+    failure_class=R2_FAILURE_CLASS,
+    anchor_failure_class=R2_ANCHOR_FAILURE_CLASS,
+    identity_generation="r2",
+    plan_command="plan-mesh-quota-dependency-retry",
+    submit_command="submit-mesh-quota-dependency-retry",
+    anchor_mode="mesh_mapping_and_dw16_quota",
+)
 
 
 def _flags() -> dict[str, bool]:
@@ -143,6 +272,35 @@ SUBMISSION_FIELDS = frozenset(
 )
 
 
+def _policy_for_schema(schema: Any) -> RetryPolicy:
+    for policy in (R1_POLICY, R2_POLICY):
+        if schema == policy.plan_schema:
+            return policy
+    raise HandoffContractError(
+        "dependency-failure retry generation is unsupported"
+    )
+
+
+def _policy_for_plan(plan: Mapping[str, Any]) -> RetryPolicy:
+    return _policy_for_schema(plan.get("schema_version"))
+
+
+def _profile_path(policy: RetryPolicy) -> Path:
+    return PROFILE_PATH if policy is R1_POLICY else R2_PROFILE_PATH
+
+
+def _claim_root(policy: RetryPolicy) -> Path:
+    return CLAIM_ROOT if policy is R1_POLICY else R2_CLAIM_ROOT
+
+
+def _claim_authority_sha256(policy: RetryPolicy) -> str:
+    return (
+        CLAIM_AUTHORITY_SHA256
+        if policy is R1_POLICY
+        else R2_CLAIM_AUTHORITY_SHA256
+    )
+
+
 def _positive_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise HandoffContractError(f"{label} is invalid")
@@ -153,22 +311,33 @@ def _task_id(snapshot: Mapping[str, Any]) -> Any:
     return snapshot.get("task_id", snapshot.get("id"))
 
 
-def _profile_content() -> tuple[dict[str, Any], dict[str, Any]]:
-    path = PROFILE_PATH.resolve(strict=True)
+def _profile_content(
+    policy: RetryPolicy = R1_POLICY,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    path = _profile_path(policy).resolve(strict=True)
     profile = production._read_json(path)
-    _validate_profile(profile)
+    _validate_profile(profile, policy=policy)
     return profile, production._file_record(path)
 
 
-def _validate_profile(profile: Mapping[str, Any]) -> None:
+def _validate_profile(
+    profile: Mapping[str, Any],
+    *,
+    policy: RetryPolicy = R1_POLICY,
+) -> None:
     timeout_profile = production._read_json(
         probe.TIMEOUT_RETRY_PROFILE_PATH.resolve(strict=True)
     )
     expected = copy.deepcopy(timeout_profile)
-    expected["schema_version"] = PROFILE_SCHEMA
+    expected["schema_version"] = policy.profile_schema
     expected["comment"] = (
-        "Diagnostic-only eighth-symmetry Standard FEA dependency-failure "
-        "retry with retained AEDT project and AEDT results"
+        "Diagnostic-only eighth-symmetry Standard FEA "
+        + (
+            "dependency-failure retry"
+            if policy is R1_POLICY
+            else "mesh/quota dependency-failure retry"
+        )
+        + " with retained AEDT project and AEDT results"
     )
     if profile != expected:
         raise HandoffContractError(
@@ -179,13 +348,17 @@ def _validate_profile(profile: Mapping[str, Any]) -> None:
     attest_fixed_identity(effective_identity)
 
 
-def initialize_claim_root(root: Path | None = None) -> dict[str, Any]:
-    target = CLAIM_ROOT if root is None else Path(root)
+def initialize_claim_root(
+    root: Path | None = None,
+    *,
+    policy: RetryPolicy = R1_POLICY,
+) -> dict[str, Any]:
+    target = _claim_root(policy) if root is None else Path(root)
     try:
         return atomic_claim.initialize_claim_root(
             target,
             campaign_id="mft-goal-20260726",
-            campaign_authority_sha256=CLAIM_AUTHORITY_SHA256,
+            campaign_authority_sha256=_claim_authority_sha256(policy),
         )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
@@ -193,9 +366,11 @@ def initialize_claim_root(root: Path | None = None) -> dict[str, Any]:
         ) from exc
 
 
-def _claim_authority() -> dict[str, Any]:
+def _claim_authority(
+    policy: RetryPolicy = R1_POLICY,
+) -> dict[str, Any]:
     try:
-        authority = atomic_claim.load_claim_root(CLAIM_ROOT)
+        authority = atomic_claim.load_claim_root(_claim_root(policy))
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
             "dependency-failure atomic claim root is unavailable"
@@ -203,7 +378,7 @@ def _claim_authority() -> dict[str, Any]:
     if (
         authority.get("campaign_id") != "mft-goal-20260726"
         or authority.get("campaign_authority_sha256")
-        != CLAIM_AUTHORITY_SHA256
+        != _claim_authority_sha256(policy)
     ):
         raise HandoffContractError(
             "dependency-failure atomic claim authority drifted"
@@ -215,16 +390,17 @@ def _claim_reference(
     *,
     candidate_physics_sha256: str,
     logical_authority_task_id: int,
+    policy: RetryPolicy = R1_POLICY,
 ) -> dict[str, Any]:
     try:
         return atomic_claim.build_claim_reference(
-            _claim_authority(),
+            _claim_authority(policy),
             candidate_physics_sha256=production._require_sha(
                 candidate_physics_sha256,
                 "dependency-failure candidate physics SHA",
             ),
             logical_authority_task_id=logical_authority_task_id,
-            retry_generation=RETRY_GENERATION,
+            retry_generation=policy.retry_generation,
         )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
@@ -233,6 +409,7 @@ def _claim_reference(
 
 
 def _validate_claim_reference(plan: Mapping[str, Any]) -> dict[str, Any]:
+    policy = _policy_for_plan(plan)
     reference = plan.get("dependency_failure_atomic_claim_reference")
     record = plan.get("retry_of_dependency_failure")
     if not isinstance(reference, Mapping) or not isinstance(record, Mapping):
@@ -241,7 +418,7 @@ def _validate_claim_reference(plan: Mapping[str, Any]) -> dict[str, Any]:
         )
     try:
         normalized = atomic_claim.validate_claim_reference(
-            reference, _claim_authority()
+            reference, _claim_authority(policy)
         )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
@@ -252,7 +429,8 @@ def _validate_claim_reference(plan: Mapping[str, Any]) -> dict[str, Any]:
         != plan.get("candidate_physics_sha256")
         or normalized.get("logical_authority_task_id")
         != record.get("logical_authority_task_id")
-        or normalized.get("retry_generation") != RETRY_GENERATION
+        or normalized.get("retry_generation")
+        != policy.retry_generation
     ):
         raise HandoffContractError(
             "dependency-failure atomic claim plan binding drifted"
@@ -264,6 +442,7 @@ def _task_identity(
     *,
     logical_authority_task_id: int,
     candidate_physics_sha256: str,
+    policy: RetryPolicy = R1_POLICY,
 ) -> tuple[str, str]:
     logical_id = _positive_int(
         logical_authority_task_id, "logical authority task ID"
@@ -273,18 +452,24 @@ def _task_identity(
         "dependency-failure candidate physics SHA",
     )[:12]
     return (
-        f"mft-goal-diag-standard-dependency-r1-l{logical_id}-{stem}",
-        f"mft_goal_diag_standard_dependency_r1_l{logical_id}_{stem}",
+        "mft-goal-diag-standard-dependency-"
+        f"{policy.identity_generation}-l{logical_id}-{stem}",
+        "mft_goal_diag_standard_dependency_"
+        f"{policy.identity_generation}_l{logical_id}_{stem}",
     )
 
 
 def _sibling_name_prefix(plan: Mapping[str, Any]) -> str:
+    policy = _policy_for_plan(plan)
     record = plan["retry_of_dependency_failure"]
     logical_id = _positive_int(
         record.get("logical_authority_task_id"),
         "dependency-failure logical authority task ID",
     )
-    return f"mft-goal-diag-standard-dependency-r1-l{logical_id}-"
+    return (
+        "mft-goal-diag-standard-dependency-"
+        f"{policy.identity_generation}-l{logical_id}-"
+    )
 
 
 def _normalized_task_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -331,6 +516,240 @@ def _normalized_task_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "task_id": _task_id(snapshot),
         **{field: copy.deepcopy(snapshot.get(field)) for field in fields},
     }
+
+
+def _scheduler_task_log(
+    *,
+    scheduler_url: str,
+    task_id: int,
+    stream: str,
+) -> bytes:
+    if stream not in {"stdout", "stderr"}:
+        raise HandoffContractError(
+            "dependency anchor log stream is unsupported"
+        )
+    task_id = _positive_int(task_id, "dependency anchor log task ID")
+    request = production.urllib.request.Request(
+        f"{scheduler_url.rstrip('/')}/api/tasks/{task_id}/{stream}",
+        headers={"Accept": "text/plain"},
+    )
+    try:
+        with production.urllib.request.urlopen(
+            request, timeout=30
+        ) as response:
+            payload = response.read()
+    except OSError as exc:
+        raise HandoffContractError(
+            f"dependency anchor {stream} is unavailable"
+        ) from exc
+    if not isinstance(payload, bytes):
+        raise HandoffContractError(
+            f"dependency anchor {stream} is malformed"
+        )
+    return payload
+
+
+def _log_bytes(
+    value: Any,
+    *,
+    stream: str,
+) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    raise HandoffContractError(
+        f"dependency anchor {stream} bytes are malformed"
+    )
+
+
+def _r2_anchor_log_evidence(
+    *,
+    stdout: bytes,
+    stderr: bytes,
+) -> dict[str, Any]:
+    try:
+        stdout_text = stdout.decode("utf-8")
+        stderr_text = stderr.decode("utf-8")
+    except UnicodeError as exc:
+        raise HandoffContractError(
+            "mesh/quota dependency anchor logs are not UTF-8"
+        ) from exc
+    preflight_payloads = []
+    for line in stderr_text.splitlines():
+        if R2_FULL_PREFLIGHT_LOG_PREFIX not in line:
+            continue
+        raw = line.split(R2_FULL_PREFLIGHT_LOG_PREFIX, 1)[1]
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HandoffContractError(
+                "mesh/quota anchor full preflight JSON is malformed"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise HandoffContractError(
+                "mesh/quota anchor preflight payload is malformed"
+            )
+        preflight_payloads.append(payload)
+    if len(preflight_payloads) != 1:
+        raise HandoffContractError(
+            "mesh/quota anchor requires exactly one full preflight payload"
+        )
+    preflight = preflight_payloads[0]
+    coverage = preflight.get("mesh_mapping_coverage")
+    if (
+        not isinstance(coverage, Mapping)
+        or preflight.get("analysis_dispatched_after_premesh") is not False
+        or preflight.get("mesh_artifact_readback_passed") is not True
+        or preflight.get("mesh_mapping_coverage_passed") is not False
+        or preflight.get("static_contract_passed") is not True
+        or preflight.get("status")
+        != "failed_standalone_native_premesh"
+        or coverage.get("schema")
+        != "thermal-grid-mapping-coverage-v1"
+        or coverage.get("passed") is not False
+        or coverage.get("required_object_count") != 16
+        or coverage.get("mapped_required_object_count") != 4
+        or tuple(coverage.get("required_objects_missing") or ())
+        != R2_CORE_PLATE_PAD_OBJECTS
+        or coverage.get("parse_errors") != []
+        or coverage.get("missing_local_regions") != []
+        or coverage.get("local_regions_without_mesh") != []
+    ):
+        raise HandoffContractError(
+            "core-plate-pad mesh mapping coverage evidence drifted"
+        )
+    quota_count = stderr_text.count(R2_QUOTA_MESSAGE)
+    persistence_count = stderr_text.count(
+        "result persistence failed: " + R2_QUOTA_MESSAGE
+    )
+    csv_count = stderr_text.count(
+        "Error saving results to CSV: " + R2_QUOTA_MESSAGE
+    )
+    oserror_count = stderr_text.count("OSError: " + R2_QUOTA_MESSAGE)
+    if (
+        quota_count < 3
+        or persistence_count < 2
+        or csv_count < 1
+        or oserror_count < 2
+        or R2_QUOTA_MESSAGE in stdout_text
+    ):
+        raise HandoffContractError(
+            "dw16 disk-quota persistence evidence drifted"
+        )
+    return {
+        "schema_version": (
+            "mft-goal-mesh-quota-anchor-log-evidence-v1"
+        ),
+        "stdout": {
+            "endpoint": "stdout",
+            "size_bytes": len(stdout),
+            "sha256": production._sha256_bytes(stdout),
+        },
+        "stderr": {
+            "endpoint": "stderr",
+            "size_bytes": len(stderr),
+            "sha256": production._sha256_bytes(stderr),
+        },
+        "preflight_payload_sha256": canonical_sha256(preflight),
+        "preflight_summary": {
+            "analysis_dispatched_after_premesh": False,
+            "mesh_artifact_readback_passed": True,
+            "mesh_mapping_coverage_passed": False,
+            "status": "failed_standalone_native_premesh",
+            "coverage_schema": "thermal-grid-mapping-coverage-v1",
+            "required_object_count": 16,
+            "mapped_required_object_count": 4,
+            "required_objects_missing": list(
+                R2_CORE_PLATE_PAD_OBJECTS
+            ),
+        },
+        "dw16_quota_persistence": {
+            "message": R2_QUOTA_MESSAGE,
+            "total_occurrence_count": quota_count,
+            "result_persistence_failure_count": persistence_count,
+            "csv_save_failure_count": csv_count,
+            "oserror_count": oserror_count,
+            "stdout_occurrence_count": 0,
+        },
+    }
+
+
+def _validate_r2_anchor_log_evidence(
+    value: Any,
+) -> dict[str, Any]:
+    expected_summary = {
+        "analysis_dispatched_after_premesh": False,
+        "mesh_artifact_readback_passed": True,
+        "mesh_mapping_coverage_passed": False,
+        "status": "failed_standalone_native_premesh",
+        "coverage_schema": "thermal-grid-mapping-coverage-v1",
+        "required_object_count": 16,
+        "mapped_required_object_count": 4,
+        "required_objects_missing": list(R2_CORE_PLATE_PAD_OBJECTS),
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value)
+        != {
+            "schema_version",
+            "stdout",
+            "stderr",
+            "preflight_payload_sha256",
+            "preflight_summary",
+            "dw16_quota_persistence",
+        }
+        or value.get("schema_version")
+        != "mft-goal-mesh-quota-anchor-log-evidence-v1"
+        or value.get("preflight_summary") != expected_summary
+    ):
+        raise HandoffContractError(
+            "mesh/quota dependency anchor log evidence drifted"
+        )
+    for stream in ("stdout", "stderr"):
+        record = value.get(stream)
+        if (
+            not isinstance(record, Mapping)
+            or set(record) != {"endpoint", "size_bytes", "sha256"}
+            or record.get("endpoint") != stream
+            or isinstance(record.get("size_bytes"), bool)
+            or not isinstance(record.get("size_bytes"), int)
+            or record["size_bytes"] <= 0
+        ):
+            raise HandoffContractError(
+                "mesh/quota dependency anchor log identity drifted"
+            )
+        production._require_sha(
+            record.get("sha256"),
+            f"mesh/quota dependency anchor {stream} SHA",
+        )
+    production._require_sha(
+        value.get("preflight_payload_sha256"),
+        "mesh/quota dependency preflight SHA",
+    )
+    quota = value.get("dw16_quota_persistence")
+    if (
+        not isinstance(quota, Mapping)
+        or set(quota)
+        != {
+            "message",
+            "total_occurrence_count",
+            "result_persistence_failure_count",
+            "csv_save_failure_count",
+            "oserror_count",
+            "stdout_occurrence_count",
+        }
+        or quota.get("message") != R2_QUOTA_MESSAGE
+        or quota.get("total_occurrence_count", 0) < 3
+        or quota.get("result_persistence_failure_count", 0) < 2
+        or quota.get("csv_save_failure_count", 0) < 1
+        or quota.get("oserror_count", 0) < 2
+        or quota.get("stdout_occurrence_count") != 0
+    ):
+        raise HandoffContractError(
+            "dw16 disk-quota persistence evidence drifted"
+        )
+    return copy.deepcopy(dict(value))
 
 
 def _placement_anchor_identity(
@@ -385,6 +804,7 @@ def _dependency_failure_evidence(
     *,
     immediate_submission: Mapping[str, Any],
     anchor_task_id: int,
+    policy: RetryPolicy = R1_POLICY,
 ) -> dict[str, Any]:
     evidence = _normalized_task_snapshot(snapshot)
     expected_message = DEPENDENCY_FAILURE_TEMPLATE.format(
@@ -418,8 +838,8 @@ def _dependency_failure_evidence(
             "dependency-failed task terminal evidence drifted"
         )
     return {
-        "schema_version": FAILURE_EVIDENCE_SCHEMA,
-        "failure_class": FAILURE_CLASS,
+        "schema_version": policy.failure_evidence_schema,
+        "failure_class": policy.failure_class,
         "failure_message": expected_message,
         "task": evidence,
     }
@@ -429,30 +849,60 @@ def _anchor_failure_evidence(
     snapshot: Mapping[str, Any],
     *,
     expected_identity: Mapping[str, Any],
+    policy: RetryPolicy = R1_POLICY,
+    stdout: bytes | None = None,
+    stderr: bytes | None = None,
+    authenticated_logs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence = _normalized_task_snapshot(snapshot)
     static = {
         key: evidence.get(key)
         for key in expected_identity
     }
-    if (
+    common_invalid = (
         static != dict(expected_identity)
         or evidence["status"] != "failed"
         or evidence["state"] != "failed"
         or evidence["exit_code"] != 1
-        or evidence["failure_message"] != ANCHOR_FAILURE_MESSAGE
         or not str(evidence["started_at"] or "").strip()
         or not str(evidence["finished_at"] or "").strip()
-    ):
+    )
+    if policy is R1_POLICY:
+        failure_message_valid = (
+            evidence["failure_message"] == ANCHOR_FAILURE_MESSAGE
+        )
+        log_evidence = None
+        recorded_failure_message = ANCHOR_FAILURE_MESSAGE
+    else:
+        failure_message_valid = str(
+            evidence["failure_message"] or ""
+        ).startswith(R2_ANCHOR_FAILURE_PREFIX)
+        if stdout is not None and stderr is not None:
+            log_evidence = _r2_anchor_log_evidence(
+                stdout=stdout, stderr=stderr
+            )
+        elif authenticated_logs is not None:
+            log_evidence = _validate_r2_anchor_log_evidence(
+                authenticated_logs
+            )
+        else:
+            raise HandoffContractError(
+                "mesh/quota dependency anchor logs are absent"
+            )
+        recorded_failure_message = evidence["failure_message"]
+    if common_invalid or not failure_message_valid:
         raise HandoffContractError(
             "dependency anchor native failure evidence drifted"
         )
-    return {
-        "schema_version": ANCHOR_EVIDENCE_SCHEMA,
-        "failure_class": ANCHOR_FAILURE_CLASS,
-        "failure_message": ANCHOR_FAILURE_MESSAGE,
+    result = {
+        "schema_version": policy.anchor_evidence_schema,
+        "failure_class": policy.anchor_failure_class,
+        "failure_message": recorded_failure_message,
         "task": evidence,
     }
+    if log_evidence is not None:
+        result["authenticated_logs"] = log_evidence
+    return result
 
 
 def _failure_bundle(
@@ -461,15 +911,25 @@ def _failure_bundle(
     anchor_snapshot: Mapping[str, Any],
     immediate_submission: Mapping[str, Any],
     expected_anchor: Mapping[str, Any],
+    policy: RetryPolicy = R1_POLICY,
+    anchor_stdout: bytes | None = None,
+    anchor_stderr: bytes | None = None,
+    authenticated_anchor_logs: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     anchor_id = int(expected_anchor["task_id"])
     dependency = _dependency_failure_evidence(
         immediate_snapshot,
         immediate_submission=immediate_submission,
         anchor_task_id=anchor_id,
+        policy=policy,
     )
     anchor = _anchor_failure_evidence(
-        anchor_snapshot, expected_identity=expected_anchor
+        anchor_snapshot,
+        expected_identity=expected_anchor,
+        policy=policy,
+        stdout=anchor_stdout,
+        stderr=anchor_stderr,
+        authenticated_logs=authenticated_anchor_logs,
     )
     dependency_finished = probe._scheduler_timestamp(
         dependency["task"]["finished_at"],
@@ -492,7 +952,30 @@ def _read_failure_bundle(
     immediate_submission: Mapping[str, Any],
     expected_anchor: Mapping[str, Any],
     task_reader: Any,
+    policy: RetryPolicy = R1_POLICY,
+    log_reader: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    anchor_id = int(expected_anchor["task_id"])
+    read_log = log_reader or _scheduler_task_log
+    anchor_stdout = None
+    anchor_stderr = None
+    if policy is R2_POLICY:
+        anchor_stdout = _log_bytes(
+            read_log(
+                scheduler_url=scheduler_url,
+                task_id=anchor_id,
+                stream="stdout",
+            ),
+            stream="stdout",
+        )
+        anchor_stderr = _log_bytes(
+            read_log(
+                scheduler_url=scheduler_url,
+                task_id=anchor_id,
+                stream="stderr",
+            ),
+            stream="stderr",
+        )
     return _failure_bundle(
         immediate_snapshot=task_reader(
             scheduler_url=scheduler_url,
@@ -500,10 +983,13 @@ def _read_failure_bundle(
         ),
         anchor_snapshot=task_reader(
             scheduler_url=scheduler_url,
-            task_id=int(expected_anchor["task_id"]),
+            task_id=anchor_id,
         ),
         immediate_submission=immediate_submission,
         expected_anchor=expected_anchor,
+        policy=policy,
+        anchor_stdout=anchor_stdout,
+        anchor_stderr=anchor_stderr,
     )
 
 
@@ -518,10 +1004,11 @@ def _retry_record(
     anchor_evidence: Mapping[str, Any],
     anchor_task_id: int,
     scheduler_url: str,
+    policy: RetryPolicy = R1_POLICY,
 ) -> dict[str, Any]:
     return {
-        "schema_version": RETRY_EVIDENCE_SCHEMA,
-        "retry_generation": RETRY_GENERATION,
+        "schema_version": policy.retry_evidence_schema,
+        "retry_generation": policy.retry_generation,
         "retry_of_task_id": immediate_submission["task_id"],
         "logical_authority_task_id": logical_submission["task_id"],
         "immediate_retry_kind": "timeout",
@@ -548,7 +1035,7 @@ def _retry_record(
             anchor_evidence
         ),
         "scheduler_url": scheduler_url,
-        "failure_class": FAILURE_CLASS,
+        "failure_class": policy.failure_class,
         "failure_message": DEPENDENCY_FAILURE_TEMPLATE.format(
             anchor_task_id=anchor_task_id
         ),
@@ -564,6 +1051,8 @@ def create_plan(
     output: Path,
     scheduler_url: str = probe.DIAGNOSTIC_SCHEDULER_URL,
     task_reader: Any = None,
+    log_reader: Any = None,
+    policy: RetryPolicy = R1_POLICY,
 ) -> Path:
     immediate_plan, params, selected = probe._load_plan(original_plan_path)
     if probe._plan_retry_kind(immediate_plan) != "timeout":
@@ -606,12 +1095,14 @@ def create_plan(
         immediate_submission=immediate_submission,
         expected_anchor=expected_anchor,
         task_reader=reader,
+        policy=policy,
+        log_reader=log_reader,
     )
     original_profile = production._read_json(
         original_plan_path.resolve(strict=True).parent
         / immediate_plan["profile"]["path"]
     )
-    profile, profile_source = _profile_content()
+    profile, profile_source = _profile_content(policy)
     if (
         profile["param_overrides"]
         != original_profile["param_overrides"]
@@ -628,11 +1119,14 @@ def create_plan(
         candidate_physics_sha256=str(
             immediate_plan["candidate_physics_sha256"]
         ),
+        policy=policy,
     )
     strict_contract = probe._strict_node_plan_contract(
         strict_node_name,
         task_identity_generation=(
             probe.DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION
+            if policy is R1_POLICY
+            else probe.MESH_QUOTA_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION
         ),
     )
     retained = scheduler_client.retained_aedt_identity(
@@ -668,12 +1162,14 @@ def create_plan(
         anchor_evidence=anchor_evidence,
         anchor_task_id=anchor_id,
         scheduler_url=normalized_url,
+        policy=policy,
     )
     reference = _claim_reference(
         candidate_physics_sha256=str(
             immediate_plan["candidate_physics_sha256"]
         ),
         logical_authority_task_id=int(logical_submission["task_id"]),
+        policy=policy,
     )
     destination = output.resolve()
     if destination.exists():
@@ -702,7 +1198,7 @@ def create_plan(
         unsigned.pop("scheduler_strict_node_contract", None)
         unsigned.update(
             {
-                "schema_version": PLAN_SCHEMA,
+                "schema_version": policy.plan_schema,
                 "selected_candidate": {
                     "path": selected_path.name,
                     "sha256": production._sha256_file(selected_path),
@@ -729,7 +1225,7 @@ def create_plan(
                     ),
                 },
                 "available_submission_commands": [
-                    "submit-dependency-failure-retry"
+                    policy.submit_command
                 ],
                 "retry_of_dependency_failure": record,
                 "dependency_failure_atomic_claim_reference": reference,
@@ -771,9 +1267,9 @@ def _load_plan(
     dict[str, Any],
 ]:
     resolved = path.resolve(strict=True)
-    plan = production._validate_seal(
-        production._read_json(resolved), PLAN_SCHEMA
-    )
+    raw_plan = production._read_json(resolved)
+    policy = _policy_for_schema(raw_plan.get("schema_version"))
+    plan = production._validate_seal(raw_plan, policy.plan_schema)
     flags = _flags()
     if (
         plan.get("campaign_id") != "mft-goal-20260726"
@@ -784,7 +1280,7 @@ def _load_plan(
         != GOAL_TEMPERATURE_CONTRACT_SHA256
         or any(plan.get(name) is not value for name, value in flags.items())
         or plan.get("available_submission_commands")
-        != ["submit-dependency-failure-retry"]
+        != [policy.submit_command]
         or plan.get("physics_override_allowed") is not False
         or plan.get("scheduler_repository_modified") is not False
         or plan.get("scheduler_project_mutation_performed") is not False
@@ -819,12 +1315,14 @@ def _load_plan(
     if (
         not isinstance(record, Mapping)
         or set(record) != expected_record_fields
-        or record.get("schema_version") != RETRY_EVIDENCE_SCHEMA
-        or record.get("retry_generation") != RETRY_GENERATION
+        or record.get("schema_version")
+        != policy.retry_evidence_schema
+        or record.get("retry_generation")
+        != policy.retry_generation
         or record.get("immediate_retry_kind") != "timeout"
         or record.get("scheduler_url")
         != probe.DIAGNOSTIC_SCHEDULER_URL
-        or record.get("failure_class") != FAILURE_CLASS
+        or record.get("failure_class") != policy.failure_class
     ):
         raise HandoffContractError(
             "dependency-failure retry ancestry record drifted"
@@ -901,6 +1399,12 @@ def _load_plan(
         anchor_snapshot=anchor_evidence.get("task") or {},
         immediate_submission=immediate_submission,
         expected_anchor=expected_anchor,
+        policy=policy,
+        authenticated_anchor_logs=(
+            anchor_evidence.get("authenticated_logs")
+            if policy is R2_POLICY
+            else None
+        ),
     )
     if (
         normalized_dependency != dependency_evidence
@@ -932,7 +1436,7 @@ def _load_plan(
     profile = production._read_json(
         _plan_artifact(root, profile_record, "dependency retry profile")
     )
-    _validate_profile(profile)
+    _validate_profile(profile, policy=policy)
     effective = production._effective_params(params, profile)
     stage = plan.get("stage")
     if not isinstance(stage, Mapping):
@@ -942,6 +1446,7 @@ def _load_plan(
     expected_task_name, expected_workdir = _task_identity(
         logical_authority_task_id=int(logical_submission["task_id"]),
         candidate_physics_sha256=str(plan["candidate_physics_sha256"]),
+        policy=policy,
     )
     retained = scheduler_client.retained_aedt_identity(
         expected_task_name,
@@ -957,7 +1462,11 @@ def _load_plan(
         != REQUIRED_STRICT_NODE_NAME
         or strict_contract.get("node_name_policy") != "strict"
         or strict_contract.get("task_identity_generation")
-        != probe.DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION
+        != (
+            probe.DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION
+            if policy is R1_POLICY
+            else probe.MESH_QUOTA_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION
+        )
         or profile_record.get("canonical_sha256")
         != canonical_sha256(profile)
         or stage.get("name") != "standard"
@@ -993,6 +1502,7 @@ def _load_plan(
 def _sibling_snapshot(
     rows: Any, *, plan: Mapping[str, Any]
 ) -> dict[str, Any]:
+    policy = _policy_for_plan(plan)
     if (
         not isinstance(rows, Sequence)
         or isinstance(rows, (str, bytes, bytearray))
@@ -1063,7 +1573,7 @@ def _sibling_snapshot(
             "more than one dependency-failure retry sibling exists"
         )
     snapshot = {
-        "schema_version": SIBLING_GUARD_SCHEMA,
+        "schema_version": policy.sibling_guard_schema,
         "identity": {
             "logical_authority_task_id": plan[
                 "retry_of_dependency_failure"
@@ -1074,7 +1584,7 @@ def _sibling_snapshot(
             "dependency_anchor_task_id": plan[
                 "retry_of_dependency_failure"
             ]["dependency_anchor_task_id"],
-            "retry_generation": RETRY_GENERATION,
+            "retry_generation": policy.retry_generation,
             "name_prefix": prefix,
             "candidate_physics_sha256": plan[
                 "candidate_physics_sha256"
@@ -1115,7 +1625,7 @@ def _sibling_contract(
             "dependency-failure sibling identity changed during submission"
         )
     return {
-        "schema_version": SIBLING_GUARD_SCHEMA,
+        "schema_version": before["schema_version"],
         "before_submission": copy.deepcopy(before),
         "after_submission": copy.deepcopy(after),
         "exactly_one_sibling_after_submission": True,
@@ -1197,6 +1707,7 @@ def _claim_receipt(
     *,
     acquisition_status: str,
     finalized_claim: Mapping[str, Any],
+    policy: RetryPolicy = R1_POLICY,
 ) -> dict[str, Any]:
     if acquisition_status not in {
         "fresh_pending",
@@ -1207,7 +1718,7 @@ def _claim_receipt(
             "dependency-failure claim acquisition status drifted"
         )
     return {
-        "schema_version": CLAIM_RECEIPT_SCHEMA,
+        "schema_version": policy.claim_receipt_schema,
         "acquisition_status": acquisition_status,
         "fresh_claim_authorized_scheduler_submit_call": (
             acquisition_status == "fresh_pending"
@@ -1257,6 +1768,8 @@ def submit(
     task_reader: Any = None,
     task_list_reader: Any = None,
     reconciliation_waiter: Any = None,
+    log_reader: Any = None,
+    expected_policy: RetryPolicy | None = None,
 ) -> Path:
     target = output.resolve()
     if target.exists():
@@ -1270,6 +1783,11 @@ def submit(
         immediate_submission,
         expected_anchor,
     ) = _load_plan(plan_path)
+    policy = _policy_for_plan(plan)
+    if expected_policy is not None and policy is not expected_policy:
+        raise HandoffContractError(
+            "dependency-failure submit command does not match plan generation"
+        )
     strict_contract = plan["scheduler_strict_node_contract"]
     strict_pin = probe._strict_node_scheduler_pin(
         strict_contract, require_active=True
@@ -1309,8 +1827,10 @@ def submit(
         dependency, anchor = _read_failure_bundle(
             scheduler_url=stage["scheduler_url"],
             immediate_submission=immediate_submission,
-            expected_anchor=expected_anchor,
-            task_reader=reader,
+                expected_anchor=expected_anchor,
+                task_reader=reader,
+                policy=policy,
+                log_reader=log_reader,
         )
         if dependency != stored_dependency or anchor != stored_anchor:
             raise HandoffContractError(
@@ -1330,7 +1850,7 @@ def submit(
     winner = _claim_winner(plan_path, plan)
     try:
         acquisition = atomic_claim.acquire_claim(
-            CLAIM_ROOT, reference, winner
+            _claim_root(policy), reference, winner
         )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
@@ -1368,7 +1888,7 @@ def submit(
         try:
             if claim_status == "existing_pending":
                 finalized_claim = atomic_claim.recover_pending_claim(
-                    CLAIM_ROOT,
+                    _claim_root(policy),
                     reference,
                     acquisition["claim"],
                     matching_tasks=[recovered],
@@ -1377,7 +1897,7 @@ def submit(
                 )
             elif claim_status == "existing_finalized":
                 finalized_claim = atomic_claim.validate_finalized_claim(
-                    CLAIM_ROOT,
+                    _claim_root(policy),
                     reference,
                     claim=acquisition["claim"],
                     expected_winner=winner,
@@ -1486,7 +2006,7 @@ def submit(
     if claim_status == "fresh_pending":
         try:
             finalized_claim = atomic_claim.finalize_claim(
-                CLAIM_ROOT,
+                _claim_root(policy),
                 reference,
                 acquisition["claim"],
                 task_id=new_task_id,
@@ -1547,7 +2067,7 @@ def submit(
         )
     receipt = production._seal(
         {
-            "schema_version": SUBMISSION_SCHEMA,
+            "schema_version": policy.submission_schema,
             "stage": "standard",
             "plan": production._file_record(plan_path.resolve(strict=True)),
             "plan_payload_sha256": plan["payload_sha256"],
@@ -1575,6 +2095,7 @@ def submit(
             "dependency_failure_atomic_claim": _claim_receipt(
                 acquisition_status=claim_status,
                 finalized_claim=finalized_claim,
+                policy=policy,
             ),
             "scheduler_strict_node_contract": {
                 "plan_contract": copy.deepcopy(strict_contract),
@@ -2041,6 +2562,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init-dependency-failure-claim-root")
+    commands.add_parser("init-mesh-quota-dependency-claim-root")
     plan = commands.add_parser("plan-dependency-failure-retry")
     plan.add_argument("--original-plan", type=Path, required=True)
     plan.add_argument("--original-submission", type=Path, required=True)
@@ -2052,6 +2574,21 @@ def _parser() -> argparse.ArgumentParser:
         "--scheduler-url", default=probe.DIAGNOSTIC_SCHEDULER_URL
     )
     plan.add_argument("--output", type=Path, required=True)
+    r2_plan = commands.add_parser(
+        "plan-mesh-quota-dependency-retry"
+    )
+    r2_plan.add_argument("--original-plan", type=Path, required=True)
+    r2_plan.add_argument(
+        "--original-submission", type=Path, required=True
+    )
+    r2_plan.add_argument(
+        "--dependency-anchor-task-id", type=int, required=True
+    )
+    r2_plan.add_argument("--strict-node-name", required=True)
+    r2_plan.add_argument(
+        "--scheduler-url", default=probe.DIAGNOSTIC_SCHEDULER_URL
+    )
+    r2_plan.add_argument("--output", type=Path, required=True)
     submit_parser = commands.add_parser(
         "submit-dependency-failure-retry"
     )
@@ -2061,15 +2598,40 @@ def _parser() -> argparse.ArgumentParser:
     )
     submit_parser.add_argument("--priority", type=int, default=100)
     submit_parser.add_argument("--output", type=Path, required=True)
+    r2_submit = commands.add_parser(
+        "submit-mesh-quota-dependency-retry"
+    )
+    r2_submit.add_argument("--plan", type=Path, required=True)
+    r2_submit.add_argument(
+        "--scheduler-cutover-receipt", type=Path, required=True
+    )
+    r2_submit.add_argument("--priority", type=int, default=100)
+    r2_submit.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command == "init-dependency-failure-claim-root":
-        authority = initialize_claim_root()
+    if args.command in {
+        "init-dependency-failure-claim-root",
+        "init-mesh-quota-dependency-claim-root",
+    }:
+        policy = (
+            R1_POLICY
+            if args.command == "init-dependency-failure-claim-root"
+            else R2_POLICY
+        )
+        authority = initialize_claim_root(policy=policy)
         result = Path(authority["resolved_root"])
-    elif args.command == "plan-dependency-failure-retry":
+    elif args.command in {
+        "plan-dependency-failure-retry",
+        "plan-mesh-quota-dependency-retry",
+    }:
+        policy = (
+            R1_POLICY
+            if args.command == "plan-dependency-failure-retry"
+            else R2_POLICY
+        )
         result = create_plan(
             original_plan_path=args.original_plan,
             original_submission_path=args.original_submission,
@@ -2077,8 +2639,14 @@ def main(argv: list[str] | None = None) -> int:
             strict_node_name=args.strict_node_name,
             scheduler_url=args.scheduler_url,
             output=args.output,
+            policy=policy,
         )
     else:
+        expected_policy = (
+            R1_POLICY
+            if args.command == "submit-dependency-failure-retry"
+            else R2_POLICY
+        )
         result = submit(
             plan_path=args.plan,
             scheduler_cutover_receipt_path=(
@@ -2086,6 +2654,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             priority=args.priority,
             output=args.output,
+            expected_policy=expected_policy,
         )
     print(json.dumps({"status": "ok", "path": str(result)}, sort_keys=True))
     return 0

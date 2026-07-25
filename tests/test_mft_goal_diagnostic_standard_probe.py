@@ -3964,3 +3964,357 @@ def test_dependency_failure_retry_is_direct_strict_and_exact_once(
     strict_truth = strict_al.authenticate_collection(collection_path)
     assert strict_truth.adapter_kind == "diagnostic"
     assert strict_truth.collection["task_id"] == 71003
+
+
+def _mesh_quota_dependency_parent(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    base_plan_path = _make_plan(tmp_path, fixture)
+    strict_cutover = _strict_scheduler_cutover(tmp_path, monkeypatch)
+    base_submission_path = probe.submit_standard(
+        plan_path=base_plan_path,
+        scheduler_cutover_receipt_path=_scheduler_cutover(
+            tmp_path, monkeypatch
+        ),
+        output=tmp_path / "mesh-quota-base-submission.json",
+        scheduler=_FakeScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    base_plan = probe._load_plan(base_plan_path)[0]
+    base_submission = probe._load_submission(
+        base_submission_path, plan=base_plan
+    )
+    timeout_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=base_plan_path,
+        original_submission_path=base_submission_path,
+        strict_node_name="n113",
+        output=tmp_path / "mesh-quota-timeout-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            base_submission
+        ),
+    )
+    timeout_plan = probe._load_plan(timeout_plan_path)[0]
+    timeout_post = _strict_submitted_snapshot(
+        {
+            "task_id": 71012,
+            "task_name": timeout_plan["stage"]["task_name"],
+            "dedupe_key": timeout_plan["stage"]["retained_aedt_bundle"][
+                "dedupe_key"
+            ],
+        },
+        task_id=71012,
+        node_name="n113",
+        requested_node_name="n113",
+        actual_node_name="n113",
+        allocation_node_name="n113",
+        same_node_as_task_id=72010,
+        timeout_seconds=28800,
+    )
+    anchor_running = _same_allocation_anchor_snapshot(
+        task_id=72010,
+        actual_node_name="n113",
+    )
+
+    class _ParentScheduler:
+        def submit_verification(self, *args, **kwargs):
+            guard = kwargs.get("pre_submit_guard")
+            if guard is not None:
+                guard()
+            return {
+                "task_id": 71012,
+                "submission_source": "post_created",
+                "scheduler_mutation_performed": True,
+                "api_pre_submission_readback": None,
+                "api_post_submission_response": timeout_post,
+            }
+
+    def parent_task_reader(**kwargs):
+        if kwargs["task_id"] == base_submission["task_id"]:
+            return _timeout_task_snapshot(base_submission)
+        if kwargs["task_id"] == 72010:
+            return anchor_running
+        if kwargs["task_id"] == 71012:
+            return timeout_post
+        raise AssertionError(kwargs)
+
+    timeout_submission_path = probe.submit_timeout_retry(
+        plan_path=timeout_plan_path,
+        scheduler_cutover_receipt_path=strict_cutover,
+        output=tmp_path / "mesh-quota-timeout-submission.json",
+        scheduler=_ParentScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=parent_task_reader,
+        same_node_as_task_id=72010,
+        expected_allocation_id=9002,
+        expected_slurm_job_id="81300",
+        expected_account_name="anchor-account",
+        expected_node_name="n113",
+    )
+    timeout_submission = probe._load_submission(
+        timeout_submission_path, plan=timeout_plan
+    )
+    return {
+        "base_submission": base_submission,
+        "timeout_plan_path": timeout_plan_path,
+        "timeout_submission_path": timeout_submission_path,
+        "timeout_submission": timeout_submission,
+        "timeout_post": timeout_post,
+        "anchor_running": anchor_running,
+        "strict_cutover": strict_cutover,
+    }
+
+
+def _mesh_quota_anchor_logs():
+    coverage = {
+        "schema": "thermal-grid-mapping-coverage-v1",
+        "passed": False,
+        "required_object_count": 16,
+        "mapped_required_object_count": 4,
+        "required_objects_missing": list(
+            dependency_retry.R2_CORE_PLATE_PAD_OBJECTS
+        ),
+        "parse_errors": [],
+        "missing_local_regions": [],
+        "local_regions_without_mesh": [],
+    }
+    preflight = {
+        "analysis_dispatched_after_premesh": False,
+        "mesh_artifact_readback_passed": True,
+        "mesh_mapping_coverage_passed": False,
+        "static_contract_passed": True,
+        "status": "failed_standalone_native_premesh",
+        "mesh_mapping_coverage": coverage,
+    }
+    quota = dependency_retry.R2_QUOTA_MESSAGE
+    stderr = "\n".join(
+        [
+            "WARNING:root:"
+            + dependency_retry.R2_FULL_PREFLIGHT_LOG_PREFIX
+            + json.dumps(
+                preflight, sort_keys=True, separators=(",", ":")
+            ),
+            f"ERROR:root:result persistence failed: {quota}",
+            f"RuntimeError: result persistence failed: {quota}",
+            f"ERROR:root:Error saving results to CSV: {quota}",
+            f"OSError: {quota}",
+            f"OSError: {quota}",
+        ]
+    ).encode()
+    return b"mesh completed before preflight refusal\n", stderr
+
+
+def test_mesh_quota_dependency_r2_has_distinct_claim_and_exact_once(
+    tmp_path, monkeypatch
+):
+    parent = _mesh_quota_dependency_parent(tmp_path, monkeypatch)
+    timeout_submission = parent["timeout_submission"]
+    dependency_failed = {
+        **parent["timeout_post"],
+        "status": "failed",
+        "state": "failed",
+        "exit_code": None,
+        "failure_message": "same_node_as task 72010 is failed",
+        "finished_at": "2026-07-25 08:15:51",
+    }
+    anchor_failed = {
+        **parent["anchor_running"],
+        "status": "failed",
+        "state": "failed",
+        "exit_code": 1,
+        "failure_message": (
+            dependency_retry.R2_ANCHOR_FAILURE_PREFIX
+            + '{"api_value":"truncated"}'
+        ),
+        "finished_at": "2026-07-25 08:15:20",
+    }
+    stdout, stderr = _mesh_quota_anchor_logs()
+
+    def failed_task_reader(**kwargs):
+        if kwargs["task_id"] == timeout_submission["task_id"]:
+            return dependency_failed
+        if kwargs["task_id"] == 72010:
+            return anchor_failed
+        if kwargs["task_id"] == 71013:
+            return dependency_post
+        raise AssertionError(kwargs)
+
+    def log_reader(**kwargs):
+        assert kwargs["task_id"] == 72010
+        return stdout if kwargs["stream"] == "stdout" else stderr
+
+    claim_root = (tmp_path / "mesh-quota-r2-claims").resolve()
+    monkeypatch.setattr(
+        dependency_retry, "R2_CLAIM_ROOT", claim_root
+    )
+    dependency_retry.initialize_claim_root(
+        claim_root, policy=dependency_retry.R2_POLICY
+    )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="disk-quota persistence evidence drifted",
+    ):
+        dependency_retry.create_plan(
+            original_plan_path=parent["timeout_plan_path"],
+            original_submission_path=parent[
+                "timeout_submission_path"
+            ],
+            dependency_anchor_task_id=72010,
+            strict_node_name="n114",
+            output=tmp_path / "mesh-quota-r2-bad-plan",
+            task_reader=failed_task_reader,
+            log_reader=lambda **kwargs: (
+                stdout
+                if kwargs["stream"] == "stdout"
+                else stderr.replace(
+                    dependency_retry.R2_QUOTA_MESSAGE.encode(),
+                    b"quota evidence removed",
+                )
+            ),
+            policy=dependency_retry.R2_POLICY,
+        )
+    plan_path = dependency_retry.create_plan(
+        original_plan_path=parent["timeout_plan_path"],
+        original_submission_path=parent["timeout_submission_path"],
+        dependency_anchor_task_id=72010,
+        strict_node_name="n114",
+        output=tmp_path / "mesh-quota-r2-plan",
+        task_reader=failed_task_reader,
+        log_reader=log_reader,
+        policy=dependency_retry.R2_POLICY,
+    )
+    plan = dependency_retry._load_plan(plan_path)[0]
+    record = plan["retry_of_dependency_failure"]
+    assert record["retry_generation"] == (
+        dependency_retry.R2_RETRY_GENERATION
+    )
+    assert record["failure_class"] == (
+        dependency_retry.R2_FAILURE_CLASS
+    )
+    assert record["logical_authority_task_id"] == parent[
+        "base_submission"
+    ]["task_id"]
+    assert record["retry_of_task_id"] == timeout_submission["task_id"]
+    assert record["dependency_anchor_task_id"] == 72010
+    assert plan["stage"]["task_name"].startswith(
+        "mft-goal-diag-standard-dependency-r2-"
+    )
+    assert plan["dependency_failure_atomic_claim_reference"][
+        "retry_generation"
+    ] == dependency_retry.R2_RETRY_GENERATION
+    assert record["anchor_failure_evidence"]["authenticated_logs"][
+        "preflight_summary"
+    ]["required_objects_missing"] == list(
+        dependency_retry.R2_CORE_PLATE_PAD_OBJECTS
+    )
+    profile = production._read_json(
+        plan_path.parent / plan["profile"]["path"]
+    )
+    assert profile["param_overrides"]["fan_velocity"] == 1.5
+    assert profile["param_overrides"]["core_plate_pad_t"] == 2.0
+    assert profile["param_overrides"]["wcp_pad_t"] == 2.0
+    with pytest.raises(
+        production.HandoffContractError,
+        match="submit command does not match plan generation",
+    ):
+        dependency_retry.submit(
+            plan_path=plan_path,
+            scheduler_cutover_receipt_path=parent["strict_cutover"],
+            output=tmp_path / "mesh-quota-r2-wrong-command.json",
+            expected_policy=dependency_retry.R1_POLICY,
+        )
+    dependency_post = {
+        "task_id": 71013,
+        "name": plan["stage"]["task_name"],
+        "status": "queued",
+        "state": "queued",
+        "dedupe_key": plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+        "project": scheduler_client.MFT_PROJECT,
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 28800,
+        "node_name": "n114",
+        "requested_node_name": "n114",
+        "node_name_policy": "strict",
+        "requested_node_name_policy": "strict",
+        "strict_node_placement": True,
+        "placement_contract_satisfied": False,
+        "allocation_id": None,
+        "assigned_allocation": None,
+        "allocation_node_name": "",
+        "actual_node_name": "",
+        "slurm_job_id": "",
+        "account_name": None,
+        "requested_account_name": "",
+        "same_node_as_task_id": 0,
+        "started_at": None,
+        "finished_at": None,
+    }
+
+    class _R2Scheduler:
+        def __init__(self):
+            self.calls = []
+
+        def submit_verification(self, *args, **kwargs):
+            kwargs["pre_submit_guard"]()
+            self.calls.append((args, kwargs))
+            return {
+                "task_id": 71013,
+                "submission_source": "post_created",
+                "scheduler_mutation_performed": True,
+                "api_pre_submission_readback": None,
+                "api_post_submission_response": dependency_post,
+            }
+
+    scheduler = _R2Scheduler()
+    sibling_rows = iter(([], [], [dependency_post]))
+    submission_path = dependency_retry.submit(
+        plan_path=plan_path,
+        scheduler_cutover_receipt_path=parent["strict_cutover"],
+        output=tmp_path / "mesh-quota-r2-submission.json",
+        scheduler=scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=failed_task_reader,
+        task_list_reader=lambda **_kwargs: next(sibling_rows),
+        reconciliation_waiter=lambda: None,
+        log_reader=log_reader,
+    )
+    submission = production._validate_seal(
+        production._read_json(submission_path),
+        dependency_retry.R2_SUBMISSION_SCHEMA,
+    )
+    assert len(scheduler.calls) == 1
+    assert scheduler.calls[0][1]["node_name"] == "n114"
+    assert "same_node_as_task_id" not in scheduler.calls[0][1]
+    assert submission["scheduler_strict_node_contract"][
+        "same_node_as_task_id"
+    ] == 0
+
+    class _NoPost:
+        def submit_verification(self, *_args, **_kwargs):
+            raise AssertionError("r2 finalized claim must never re-POST")
+
+    recovered_path = dependency_retry.submit(
+        plan_path=plan_path,
+        scheduler_cutover_receipt_path=parent["strict_cutover"],
+        output=tmp_path / "mesh-quota-r2-recovered.json",
+        scheduler=_NoPost(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=failed_task_reader,
+        task_list_reader=lambda **_kwargs: [dependency_post],
+        reconciliation_waiter=lambda: None,
+        log_reader=log_reader,
+    )
+    recovered = production._validate_seal(
+        production._read_json(recovered_path),
+        dependency_retry.R2_SUBMISSION_SCHEMA,
+    )
+    assert recovered["dependency_failure_atomic_claim"][
+        "acquisition_status"
+    ] == "existing_finalized"

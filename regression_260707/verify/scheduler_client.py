@@ -735,6 +735,13 @@ def retained_aedt_identity(
                     "goal_diagnostic_standard_"
                     "dependency_failure_retry.json"
                 ),
+                (
+                    "mft-goal-diagnostic-standard-mesh-quota-dependency-"
+                    "retry-profile-v1"
+                ): (
+                    "goal_diagnostic_standard_"
+                    "mesh_quota_dependency_retry.json"
+                ),
             }.get(str(profile.get("schema_version") or ""))
             if expected_profile_name is None:
                 raise ValueError(
