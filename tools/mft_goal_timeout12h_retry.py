@@ -6,9 +6,9 @@ Scheduler mutation available here is the atomically guarded task POST in
 ``submit-timeout12h-retry``.
 
 The original r1 authority remains byte-compatible for tasks 96256/96263.
-Late task-96258 and task-96289 terminals are isolated under supplemental
-r2/r3 claim roots so expanding a reviewed mapping cannot silently widen an
-older frozen root.
+Late task-96258, task-96289, and task-96265 terminals are isolated under
+supplemental r2/r3/r4 claim roots so expanding a reviewed mapping cannot
+silently widen an older frozen root.
 """
 
 from __future__ import annotations
@@ -66,12 +66,14 @@ PROFILE_SCHEMA = (
 RETRY_GENERATION = "timeout12h-r1"
 SUPPLEMENTAL_RETRY_GENERATION = "timeout12h-r2"
 LATE_ANCHOR_RETRY_GENERATION = "timeout12h-r3"
+LATE_BOUNDARY_RETRY_GENERATION = "timeout12h-r4"
 RESOURCES = {"cpus": 8, "timeout_seconds": 12 * 3600}
 MEMORY_MB = 32768
 STRICT_NODE_NAME = "n114"
 EXACT_LOGICAL_TO_FAILED_TASK = {96218: 96256, 96226: 96263}
 SUPPLEMENTAL_EXACT_LOGICAL_TO_FAILED_TASK = {96224: 96258}
 LATE_ANCHOR_EXACT_LOGICAL_TO_FAILED_TASK = {96223: 96289}
+LATE_BOUNDARY_EXACT_LOGICAL_TO_FAILED_TASK = {96230: 96265}
 PROFILE_PATH = (
     probe.REPOSITORY_ROOT
     / "regression_260707"
@@ -90,6 +92,10 @@ SUPPLEMENTAL_CLAIM_ROOT = Path(
 LATE_ANCHOR_CLAIM_ROOT = Path(
     "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
     "timeout12h_claims_r3"
+)
+LATE_BOUNDARY_CLAIM_ROOT = Path(
+    "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
+    "timeout12h_claims_r4"
 )
 CLAIM_AUTHORITY_SHA256 = canonical_sha256(
     {
@@ -122,6 +128,18 @@ LATE_ANCHOR_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
         "retry_generation": LATE_ANCHOR_RETRY_GENERATION,
         "exact_logical_to_failed_task": (
             LATE_ANCHOR_EXACT_LOGICAL_TO_FAILED_TASK
+        ),
+    }
+)
+LATE_BOUNDARY_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
+    {
+        "campaign_id": "mft-goal-20260726",
+        "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+        "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+        "temperature_contract_sha256": GOAL_TEMPERATURE_CONTRACT_SHA256,
+        "retry_generation": LATE_BOUNDARY_RETRY_GENERATION,
+        "exact_logical_to_failed_task": (
+            LATE_BOUNDARY_EXACT_LOGICAL_TO_FAILED_TASK
         ),
     }
 )
@@ -212,6 +230,17 @@ def _retry_authority(retry_generation: str) -> dict[str, Any]:
                 LATE_ANCHOR_EXACT_LOGICAL_TO_FAILED_TASK
             ),
         }
+    if retry_generation == LATE_BOUNDARY_RETRY_GENERATION:
+        return {
+            "retry_generation": LATE_BOUNDARY_RETRY_GENERATION,
+            "claim_root": LATE_BOUNDARY_CLAIM_ROOT,
+            "claim_authority_sha256": (
+                LATE_BOUNDARY_CLAIM_AUTHORITY_SHA256
+            ),
+            "exact_logical_to_failed_task": (
+                LATE_BOUNDARY_EXACT_LOGICAL_TO_FAILED_TASK
+            ),
+        }
     raise HandoffContractError("timeout12h retry generation is unsupported")
 
 
@@ -224,6 +253,7 @@ def _retry_authority_for_pair(
             RETRY_GENERATION,
             SUPPLEMENTAL_RETRY_GENERATION,
             LATE_ANCHOR_RETRY_GENERATION,
+            LATE_BOUNDARY_RETRY_GENERATION,
         )
         if _retry_authority(generation)[
             "exact_logical_to_failed_task"
@@ -2284,6 +2314,7 @@ def _parser() -> argparse.ArgumentParser:
             RETRY_GENERATION,
             SUPPLEMENTAL_RETRY_GENERATION,
             LATE_ANCHOR_RETRY_GENERATION,
+            LATE_BOUNDARY_RETRY_GENERATION,
         ),
         default=RETRY_GENERATION,
     )

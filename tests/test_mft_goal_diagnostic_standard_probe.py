@@ -4317,6 +4317,79 @@ def _mesh_quota_dependency_parent(tmp_path, monkeypatch):
     }
 
 
+def test_timeout_anchor_dependency_r3_is_exact_and_direct(
+    tmp_path, monkeypatch
+):
+    parent = _mesh_quota_dependency_parent(tmp_path, monkeypatch)
+    timeout_submission = parent["timeout_submission"]
+    logical_task_id = parent["base_submission"]["task_id"]
+    immediate_task_id = timeout_submission["task_id"]
+    anchor_task_id = 72010
+    dependency_failed = {
+        **parent["timeout_post"],
+        "status": "failed",
+        "state": "failed",
+        "exit_code": None,
+        "failure_message": f"same_node_as task {anchor_task_id} is failed",
+        "finished_at": "2026-07-25 08:15:51",
+    }
+    anchor_failed = {
+        **parent["anchor_running"],
+        "status": "failed",
+        "state": "failed",
+        "exit_code": 124,
+        "failure_message": dependency_retry.R3_ANCHOR_FAILURE_MESSAGE,
+        "finished_at": "2026-07-25 08:15:20",
+    }
+
+    def failed_task_reader(**kwargs):
+        if kwargs["task_id"] == immediate_task_id:
+            return dependency_failed
+        if kwargs["task_id"] == anchor_task_id:
+            return anchor_failed
+        raise AssertionError(kwargs)
+
+    monkeypatch.setattr(
+        dependency_retry, "R3_EXACT_ANCHOR_TASK_ID", anchor_task_id
+    )
+    monkeypatch.setattr(
+        dependency_retry,
+        "R3_EXACT_DEPENDENCY_TASK_TO_LOGICAL",
+        {immediate_task_id: logical_task_id},
+    )
+    claim_root = (tmp_path / "timeout-anchor-r3-claims").resolve()
+    monkeypatch.setattr(dependency_retry, "R3_CLAIM_ROOT", claim_root)
+    dependency_retry.initialize_claim_root(
+        claim_root, policy=dependency_retry.R3_POLICY
+    )
+    plan_path = dependency_retry.create_plan(
+        original_plan_path=parent["timeout_plan_path"],
+        original_submission_path=parent["timeout_submission_path"],
+        dependency_anchor_task_id=anchor_task_id,
+        strict_node_name="n114",
+        output=tmp_path / "timeout-anchor-r3-plan",
+        task_reader=failed_task_reader,
+        policy=dependency_retry.R3_POLICY,
+    )
+    plan = dependency_retry._load_plan(plan_path)[0]
+    record = plan["retry_of_dependency_failure"]
+    assert record["retry_generation"] == dependency_retry.R3_RETRY_GENERATION
+    assert record["failure_class"] == dependency_retry.R3_FAILURE_CLASS
+    assert record["logical_authority_task_id"] == logical_task_id
+    assert record["retry_of_task_id"] == immediate_task_id
+    assert record["dependency_anchor_task_id"] == anchor_task_id
+    assert plan["stage"]["task_name"].startswith(
+        "mft-goal-diag-standard-dependency-r3-"
+    )
+    assert plan["scheduler_strict_node_contract"][
+        "task_identity_generation"
+    ] == probe.TIMEOUT_ANCHOR_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION
+    assert plan["stage"]["resources"] == {
+        "cpus": 8,
+        "timeout_seconds": 28800,
+    }
+
+
 def _mesh_quota_anchor_logs():
     coverage = {
         "schema": "thermal-grid-mapping-coverage-v1",

@@ -23,7 +23,7 @@ def _helpers():
     return module
 
 
-def _stream_bundle():
+def _stream_bundle(*, elapsed_s=18_500.0):
     preflight = {
         "passed": True,
         "status": "passed_standalone_native_premesh",
@@ -32,7 +32,7 @@ def _stream_bundle():
         "standalone_idle_barrier_passed": True,
         "postflight_error": "",
         "native_errors": [],
-        "elapsed_s": 18_500.0,
+        "elapsed_s": elapsed_s,
         "fresh_mesh_artifact_count": 1,
         "fresh_mesh_artifacts": [
             {"name": "mesh.sd", "grid_output_size": 28 * 1024**3}
@@ -326,6 +326,51 @@ def test_timeout12h_supplemental_authority_isolated_from_frozen_r1(
         "retry_generation"
     ] == timeout12h.SUPPLEMENTAL_RETRY_GENERATION
     assert supplemental_root.exists()
+
+
+def test_timeout12h_late_anchor_r3_isolated_and_accepts_two_hour_premesh():
+    authority = timeout12h._retry_authority(
+        timeout12h.LATE_ANCHOR_RETRY_GENERATION
+    )
+    assert authority["claim_root"] == timeout12h.LATE_ANCHOR_CLAIM_ROOT
+    assert authority["exact_logical_to_failed_task"] == {96223: 96289}
+    stdout, stderr = _stream_bundle(elapsed_s=10_171.31)
+    with pytest.raises(
+        production.HandoffContractError,
+        match="successful premesh",
+    ):
+        timeout12h._stream_evidence(
+            stdout,
+            stderr,
+            task_id=96289,
+            retry_generation=timeout12h.SUPPLEMENTAL_RETRY_GENERATION,
+        )
+    evidence = timeout12h._stream_evidence(
+        stdout,
+        stderr,
+        task_id=96289,
+        retry_generation=timeout12h.LATE_ANCHOR_RETRY_GENERATION,
+    )
+    assert evidence["native_premesh_elapsed_seconds"] == 10_171.31
+    assert evidence["minimum_native_premesh_elapsed_seconds"] == 7200
+    assert evidence["thermal_solve_dispatched"] is True
+
+
+def test_timeout12h_late_boundary_r4_has_single_exact_authority():
+    authority = timeout12h._retry_authority(
+        timeout12h.LATE_BOUNDARY_RETRY_GENERATION
+    )
+    assert authority["claim_root"] == (
+        timeout12h.LATE_BOUNDARY_CLAIM_ROOT
+    )
+    assert authority["exact_logical_to_failed_task"] == {96230: 96265}
+    selected = timeout12h._retry_authority_for_pair(
+        logical_authority_task_id=96230,
+        failed_task_id=96265,
+    )
+    assert selected["retry_generation"] == (
+        timeout12h.LATE_BOUNDARY_RETRY_GENERATION
+    )
 
 
 def test_timeout12h_atomic_submit_and_submission_dispatch(
