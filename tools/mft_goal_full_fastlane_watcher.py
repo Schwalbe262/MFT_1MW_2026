@@ -56,6 +56,9 @@ GPFS_AUDIT_SCHEMA = "mft-goal-first-truth-full-fast-lane-gpfs-audit-v1"
 STANDARD_STORAGE_BOUND_SCHEMA = (
     "mft-goal-first-truth-full-fast-lane-standard-storage-bound-v1"
 )
+SUCCESS_GRID_AUTHORITY_SCHEMA = (
+    "mft-goal-first-truth-full-fast-lane-success-grid-authority-v1"
+)
 FULL_STORAGE_AUTHORITY_SCHEMA = (
     "mft-goal-first-truth-full-fast-lane-full-storage-authority-v1"
 )
@@ -82,6 +85,8 @@ MINIMUM_GPFS_FREE_GB = 10.0
 # is admissible storage authority.
 FULL_SYMMETRY_EXPANSION_FACTOR = 8
 STANDARD_SYMMETRY_DENOMINATOR = 8
+SOLVER_TRANSIENT_ROOT = "/enroot"
+SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB = 200.0
 MAX_GPFS_AUDIT_AGE_SECONDS = 120
 MIN_POLL_SECONDS = 10
 MAX_POLL_SECONDS = 60
@@ -138,6 +143,10 @@ CLAIM_AUTHORITY_SHA256 = canonical_sha256(
         "full_symmetry_expansion_factor": FULL_SYMMETRY_EXPANSION_FACTOR,
         "standard_symmetry_denominator": STANDARD_SYMMETRY_DENOMINATOR,
         "storage_bound_source": "authenticated_fresh_grid_output_bytes",
+        "solver_transient_root": SOLVER_TRANSIENT_ROOT,
+        "solver_transient_route_minimum_gib": (
+            SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB
+        ),
         "retained_bytes_are_storage_authority": False,
         "generic_per_task_storage_reservation_allowed": False,
         "maximum_scheduler_posts": 1,
@@ -221,6 +230,30 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_immutable(path: Path, value: Mapping[str, Any]) -> Path:
     return production._write_immutable_json(path.resolve(), dict(value))
+
+
+def _write_immutable_bytes(path: Path, value: bytes) -> Path:
+    if not isinstance(value, bytes) or not value:
+        raise HandoffContractError("immutable stream bytes are absent")
+    target = path.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if target.read_bytes() != value:
+            raise HandoffContractError(
+                f"existing immutable stream bytes differ: {target}"
+            )
+        return target
+    try:
+        with target.open("xb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        if target.read_bytes() != value:
+            raise HandoffContractError(
+                f"raced immutable stream bytes differ: {target}"
+            )
+    return target
 
 
 def _write_atomic(path: Path, value: Mapping[str, Any]) -> Path:
@@ -407,6 +440,10 @@ def initialize_watch_plan(
             "storage_bound_source": (
                 "authenticated_fresh_grid_output_bytes"
             ),
+            "solver_transient_root": SOLVER_TRANSIENT_ROOT,
+            "solver_transient_route_minimum_gib": (
+                SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB
+            ),
             "retained_bytes_are_storage_authority": False,
             "generic_per_task_storage_reservation_allowed": False,
             "maximum_scheduler_posts": 1,
@@ -450,6 +487,8 @@ WATCH_PLAN_FIELDS = frozenset(
         "full_symmetry_expansion_factor",
         "standard_symmetry_denominator",
         "storage_bound_source",
+        "solver_transient_root",
+        "solver_transient_route_minimum_gib",
         "retained_bytes_are_storage_authority",
         "generic_per_task_storage_reservation_allowed",
         "maximum_scheduler_posts",
@@ -481,6 +520,9 @@ def _load_watch_plan(path: Path) -> dict[str, Any]:
         or plan.get("scheduler_project") != scheduler_client.MFT_PROJECT
         or plan.get("scheduler_revision")
         != diagnostic.SCHEDULER_STRICT_NODE_REVISION
+        or scheduler_client.LOCAL_SCRATCH_ROOT != SOLVER_TRANSIENT_ROOT
+        or scheduler_client.LOCAL_SCRATCH_MIN_FREE_KB
+        != int(SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB * 1024 * 1024)
         or not full_storage_root.is_dir()
         or plan.get("full_resources") != FULL_RESOURCES
         or Path(str(plan.get("priority_fence_path") or "")).resolve()
@@ -503,6 +545,9 @@ def _load_watch_plan(path: Path) -> dict[str, Any]:
         != STANDARD_SYMMETRY_DENOMINATOR
         or plan.get("storage_bound_source")
         != "authenticated_fresh_grid_output_bytes"
+        or plan.get("solver_transient_root") != SOLVER_TRANSIENT_ROOT
+        or plan.get("solver_transient_route_minimum_gib")
+        != SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB
         or plan.get("retained_bytes_are_storage_authority") is not False
         or plan.get("generic_per_task_storage_reservation_allowed")
         is not False
@@ -892,16 +937,395 @@ def _bytes_to_gib(value: int) -> float:
     return value / float(1024**3)
 
 
+def _successful_standard_grid_stream_evidence(
+    *,
+    stdout: bytes,
+    stderr: bytes,
+    collection: Mapping[str, Any],
+) -> dict[str, Any]:
+    limit = diagnostic.OPERATIONAL_ATTESTATION_MAX_STREAM_BYTES
+    if (
+        not isinstance(stdout, bytes)
+        or not isinstance(stderr, bytes)
+        or not stdout
+        or not stderr
+        or len(stdout) > limit
+        or len(stderr) > limit
+    ):
+        raise HandoffContractError(
+            "successful Standard terminal streams are absent or oversized"
+        )
+    try:
+        out_text = stdout.decode("utf-8")
+        err_text = stderr.decode("utf-8")
+    except UnicodeError as exc:
+        raise HandoffContractError(
+            "successful Standard terminal streams are not UTF-8"
+        ) from exc
+    result_lines = [
+        line
+        for line in out_text.splitlines()
+        if line.startswith("RESULT_JSON ")
+    ]
+    if len(result_lines) != 1:
+        raise HandoffContractError(
+            "successful Standard RESULT_JSON stream evidence is ambiguous"
+        )
+    try:
+        result = json.loads(result_lines[0][len("RESULT_JSON ") :])
+    except json.JSONDecodeError as exc:
+        raise HandoffContractError(
+            "successful Standard RESULT_JSON stream evidence is invalid"
+        ) from exc
+    marker = "[thermal] native mesh preflight: "
+    preflight_lines = [
+        line for line in err_text.splitlines() if marker in line
+    ]
+    if len(preflight_lines) != 1:
+        raise HandoffContractError(
+            "successful Standard native premesh evidence is ambiguous"
+        )
+    try:
+        preflight = json.loads(preflight_lines[0].split(marker, 1)[1])
+    except json.JSONDecodeError as exc:
+        raise HandoffContractError(
+            "successful Standard native premesh JSON is invalid"
+        ) from exc
+    artifacts = preflight.get("fresh_mesh_artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise HandoffContractError(
+            "successful Standard fresh mesh inventory is absent"
+        )
+    grid_bytes = 0
+    normalized = []
+    for raw in artifacts:
+        if not isinstance(raw, Mapping):
+            raise HandoffContractError(
+                "successful Standard fresh mesh artifact is malformed"
+            )
+        size = _positive_int(
+            raw.get("grid_output_size"),
+            "successful Standard grid output size",
+        )
+        directory = str(raw.get("directory") or "")
+        name = str(raw.get("name") or "")
+        if (
+            not directory.startswith(f"{SOLVER_TRANSIENT_ROOT}/")
+            or not name
+            or "/" in name
+            or "\\" in name
+            or production._require_sha(
+                raw.get("grid_output_sha256_sample"),
+                "successful Standard grid output sample SHA",
+            )
+            != raw.get("grid_output_sha256_sample")
+        ):
+            raise HandoffContractError(
+                "successful Standard grid artifact identity drifted"
+            )
+        grid_bytes += size
+        normalized.append(copy.deepcopy(dict(raw)))
+    task_id = _positive_int(
+        collection.get("task_id"), "successful Standard task ID"
+    )
+    if (
+        collection.get("scheduler_status") != "completed"
+        or collection.get("scheduler_task_execution", {}).get("state")
+        != "succeeded"
+        or collection.get("scheduler_task_execution", {}).get("exit_code")
+        != 0
+        or result != collection.get("result")
+        or canonical_sha256(result) != collection.get("result_sha256")
+        or preflight.get("schema") != "thermal-mesh-preflight-v2"
+        or preflight.get("passed") is not True
+        or preflight.get("status")
+        != "passed_standalone_native_premesh"
+        or preflight.get("mesh_mapping_coverage_passed") is not True
+        or preflight.get("mesh_artifact_readback_passed") is not True
+        or preflight.get("native_operation_readback_passed") is not True
+        or preflight.get("standalone_idle_barrier_passed") is not True
+        or preflight.get("postflight_error") != ""
+        or preflight.get("native_errors") != []
+        or preflight.get("fresh_mesh_artifact_count") != len(normalized)
+        or grid_bytes <= 0
+        or str(result.get("solver_core_scheduler_task_id_readback") or "")
+        != str(task_id)
+        or result.get("solver_num_cores_requested") != 8
+        or result.get("solver_num_cores_effective") != 8
+        or result.get("full_model") != 0
+        or result.get("thermal_symmetry") != "eighth"
+    ):
+        raise HandoffContractError(
+            "successful Standard fresh-grid stream authority drifted"
+        )
+    return {
+        "schema_version": (
+            "mft-goal-successful-standard-grid-stream-evidence-v1"
+        ),
+        "task_id": task_id,
+        "stdout_sha256": production._sha256_bytes(stdout),
+        "stdout_size_bytes": len(stdout),
+        "stderr_sha256": production._sha256_bytes(stderr),
+        "stderr_size_bytes": len(stderr),
+        "result_sha256": collection["result_sha256"],
+        "native_premesh_sha256": canonical_sha256(preflight),
+        "native_premesh_schema": "thermal-mesh-preflight-v2",
+        "fresh_mesh_artifact_count": len(normalized),
+        "fresh_grid_output_bytes": grid_bytes,
+        "solver_transient_root": SOLVER_TRANSIENT_ROOT,
+        "source_full_model": 0,
+        "source_thermal_symmetry": "eighth",
+    }
+
+
+def _successful_grid_authority_payload(
+    *,
+    collection_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict[str, Any]:
+    resolved_collection = collection_path.resolve(strict=True)
+    authenticated = diagnostic.authenticate_collection(
+        resolved_collection
+    )
+    collection = authenticated["collection"]
+    plan = authenticated["plan"]
+    submission = authenticated["submission"]
+    stdout_path = stdout_path.resolve(strict=True)
+    stderr_path = stderr_path.resolve(strict=True)
+    evidence = _successful_standard_grid_stream_evidence(
+        stdout=stdout_path.read_bytes(),
+        stderr=stderr_path.read_bytes(),
+        collection=collection,
+    )
+    if (
+        collection.get("plan") != production._file_record(
+            Path(collection["plan"]["path"])
+        )
+        or collection.get("submission") != production._file_record(
+            Path(collection["submission"]["path"])
+        )
+        or collection.get("task_id") != submission["task_id"]
+        or collection.get("candidate_physics_sha256")
+        != plan["candidate_physics_sha256"]
+    ):
+        raise HandoffContractError(
+            "successful Standard grid collection lineage drifted"
+        )
+    return {
+        "schema_version": SUCCESS_GRID_AUTHORITY_SCHEMA,
+        "campaign_id": CAMPAIGN_ID,
+        "standard_collection": production._file_record(
+            resolved_collection
+        ),
+        "standard_collection_payload_sha256": collection["payload_sha256"],
+        "source_standard_plan": copy.deepcopy(collection["plan"]),
+        "source_standard_plan_payload_sha256": plan["payload_sha256"],
+        "source_standard_submission": copy.deepcopy(
+            collection["submission"]
+        ),
+        "source_standard_submission_payload_sha256": submission[
+            "payload_sha256"
+        ],
+        "standard_task_id": collection["task_id"],
+        "candidate_physics_sha256": plan["candidate_physics_sha256"],
+        "stdout": production._file_record(stdout_path),
+        "stderr": production._file_record(stderr_path),
+        "stream_evidence": evidence,
+        "stream_evidence_sha256": canonical_sha256(evidence),
+        "fresh_grid_output_bytes": evidence["fresh_grid_output_bytes"],
+        "source": "terminal_success_scheduler_GET_native_premesh_streams",
+        "scheduler_methods_used": ["GET"],
+        "scheduler_submission_performed": False,
+        "scheduler_cancel_performed": False,
+        "scheduler_mutation_performed": False,
+        "retained_bytes_used": False,
+    }
+
+
+def create_successful_standard_grid_authority(
+    *,
+    collection_path: Path,
+    output: Path,
+    stream_reader: Any = diagnostic._scheduler_operational_stream,
+) -> Path:
+    authenticated = diagnostic.authenticate_collection(
+        collection_path.resolve(strict=True)
+    )
+    collection = authenticated["collection"]
+    task_id = _positive_int(
+        collection.get("task_id"), "successful Standard task ID"
+    )
+    scheduler_url = str(collection.get("scheduler_url") or "")
+    first_stdout = stream_reader(
+        scheduler_url=scheduler_url, task_id=task_id, stream="stdout"
+    )
+    first_stderr = stream_reader(
+        scheduler_url=scheduler_url, task_id=task_id, stream="stderr"
+    )
+    second_stdout = stream_reader(
+        scheduler_url=scheduler_url, task_id=task_id, stream="stdout"
+    )
+    second_stderr = stream_reader(
+        scheduler_url=scheduler_url, task_id=task_id, stream="stderr"
+    )
+    if (
+        first_stdout != second_stdout
+        or first_stderr != second_stderr
+        or not isinstance(first_stdout, bytes)
+        or not isinstance(first_stderr, bytes)
+    ):
+        raise HandoffContractError(
+            "successful Standard terminal streams changed during GET capture"
+        )
+    path = output.resolve()
+    stdout_path = path.with_suffix(".stdout.log")
+    stderr_path = path.with_suffix(".stderr.log")
+    _write_immutable_bytes(stdout_path, first_stdout)
+    _write_immutable_bytes(stderr_path, first_stderr)
+    value = _sealed(
+        {
+            **_successful_grid_authority_payload(
+                collection_path=collection_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            ),
+            "created_at_utc": _now(),
+        }
+    )
+    if path.exists():
+        observed = _load_successful_standard_grid_authority(path)
+        comparable = {
+            key: item
+            for key, item in observed.items()
+            if key not in {"payload_sha256", "created_at_utc"}
+        }
+        expected = {
+            key: item
+            for key, item in value.items()
+            if key not in {"payload_sha256", "created_at_utc"}
+        }
+        if comparable != expected:
+            raise HandoffContractError(
+                "existing successful Standard grid authority differs"
+            )
+        return path
+    return _write_immutable(path, value)
+
+
+def _load_successful_standard_grid_authority(
+    path: Path,
+) -> dict[str, Any]:
+    value = _validate_seal(
+        _read_json(path.resolve(strict=True)),
+        SUCCESS_GRID_AUTHORITY_SCHEMA,
+        label="successful Standard grid authority",
+    )
+    for name in ("standard_collection", "stdout", "stderr"):
+        record = value.get(name)
+        if not isinstance(record, Mapping):
+            raise HandoffContractError(
+                f"successful Standard grid {name} record is absent"
+            )
+        if production._file_record(
+            Path(str(record.get("path") or ""))
+        ) != record:
+            raise HandoffContractError(
+                f"successful Standard grid {name} bytes drifted"
+            )
+    expected = _successful_grid_authority_payload(
+        collection_path=Path(value["standard_collection"]["path"]),
+        stdout_path=Path(value["stdout"]["path"]),
+        stderr_path=Path(value["stderr"]["path"]),
+    )
+    if any(value.get(key) != item for key, item in expected.items()):
+        raise HandoffContractError(
+            "successful Standard grid authority drifted"
+        )
+    return value
+
+
 def _authenticated_standard_grid_evidence(
     source_plan_path: Path,
+    *,
+    successful_grid_authority_path: Path | None = None,
 ) -> dict[str, Any]:
     """Reauthenticate an actual fresh Standard grid, never retained bytes."""
     resolved = source_plan_path.resolve(strict=True)
     raw = _read_json(resolved)
     if raw.get("schema_version") != timeout12h.PLAN_SCHEMA:
-        raise HandoffContractError(
-            "source Standard plan has no authenticated fresh-grid authority"
+        source_plan, _params, _selected = (
+            diagnostic._load_collectible_plan(resolved)
         )
+        stage = source_plan.get("stage")
+        retained = stage.get("retained_aedt_bundle") if isinstance(
+            stage, Mapping
+        ) else None
+        if successful_grid_authority_path is None:
+            raise HandoffContractError(
+                "source Standard successor has no embedded fresh-grid "
+                "evidence and no terminal-success stream authority"
+            )
+        authority = _load_successful_standard_grid_authority(
+            successful_grid_authority_path
+        )
+        try:
+            logical_id = terminal._logical_authority_id(source_plan)
+        except Exception as exc:
+            raise HandoffContractError(
+                "source Standard successor logical lineage is unsupported"
+            ) from exc
+        if (
+            not isinstance(stage, Mapping)
+            or stage.get("name") != "standard"
+            or stage.get("full_model") != 0
+            or stage.get("thermal_symmetry") != "eighth"
+            or not isinstance(retained, Mapping)
+            or authority.get("source_standard_plan")
+            != production._file_record(resolved)
+            or authority.get("source_standard_plan_payload_sha256")
+            != source_plan["payload_sha256"]
+            or authority.get("candidate_physics_sha256")
+            != source_plan["candidate_physics_sha256"]
+            or authority.get("standard_task_id")
+            != authority.get("stream_evidence", {}).get("task_id")
+        ):
+            raise HandoffContractError(
+                "source Standard terminal-success grid lineage drifted"
+            )
+        grid_bytes = _positive_int(
+            authority.get("fresh_grid_output_bytes"),
+            "successful Standard fresh grid bytes",
+        )
+        return {
+            "source_standard_plan": production._file_record(resolved),
+            "source_standard_plan_payload_sha256": source_plan[
+                "payload_sha256"
+            ],
+            "candidate_physics_sha256": source_plan[
+                "candidate_physics_sha256"
+            ],
+            "logical_authority_task_id": logical_id,
+            "task_name": stage["task_name"],
+            "dedupe_key": retained["dedupe_key"],
+            "fresh_grid_output_bytes": grid_bytes,
+            "fresh_grid_output_gib": _bytes_to_gib(grid_bytes),
+            "stream_evidence_sha256": authority[
+                "stream_evidence_sha256"
+            ],
+            "storage_audit_sha256": None,
+            "fresh_grid_provenance": {
+                "kind": "terminal_success_native_premesh_stream",
+                "authority": production._file_record(
+                    successful_grid_authority_path.resolve(strict=True)
+                ),
+                "authority_payload_sha256": authority["payload_sha256"],
+                "scheduler_methods_used": ["GET"],
+                "retained_bytes_used": False,
+            },
+            "source_stage_full_model": 0,
+            "source_stage_thermal_symmetry": "eighth",
+        }
     source_plan, _params, _selected, _parent = timeout12h._load_plan(resolved)
     retry = source_plan.get("retry_of_timeout12h")
     stage = source_plan.get("stage")
@@ -961,6 +1385,15 @@ def _authenticated_standard_grid_evidence(
         "fresh_grid_output_gib": _bytes_to_gib(grid_bytes),
         "stream_evidence_sha256": retry["stream_evidence_sha256"],
         "storage_audit_sha256": retry["storage_audit_sha256"],
+        "fresh_grid_provenance": {
+            "kind": "timeout12h_embedded_native_premesh_stream",
+            "source_plan": production._file_record(resolved),
+            "stream_evidence_sha256": retry[
+                "stream_evidence_sha256"
+            ],
+            "storage_audit_sha256": retry["storage_audit_sha256"],
+            "retained_bytes_used": False,
+        },
         "source_stage_full_model": 0,
         "source_stage_thermal_symmetry": "eighth",
     }
@@ -1065,6 +1498,7 @@ def _full_storage_authority_payload(
     *,
     selection_path: Path,
     selection: Mapping[str, Any],
+    successful_grid_authority_path: Path | None = None,
 ) -> dict[str, Any]:
     authenticated_selection = _load_selection(selection_path)
     if (
@@ -1093,7 +1527,10 @@ def _full_storage_authority_payload(
             "Full storage source Standard plan is absent"
         )
     source_plan_path = Path(str(source_plan_record.get("path") or ""))
-    evidence = _authenticated_standard_grid_evidence(source_plan_path)
+    evidence = _authenticated_standard_grid_evidence(
+        source_plan_path,
+        successful_grid_authority_path=successful_grid_authority_path,
+    )
     source_bytes = evidence["fresh_grid_output_bytes"]
     full_bound_bytes = source_bytes * FULL_SYMMETRY_EXPANSION_FACTOR
     if (
@@ -1135,6 +1572,17 @@ def _full_storage_authority_payload(
             full_bound_bytes
         ),
         "minimum_post_reservation_free_floor_gib": MINIMUM_GPFS_FREE_GB,
+        "solver_transient_root": SOLVER_TRANSIENT_ROOT,
+        "solver_transient_route_minimum_gib": (
+            SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB
+        ),
+        "full_bound_plus_working_floor_gib": (
+            _bytes_to_gib(full_bound_bytes) + MINIMUM_GPFS_FREE_GB
+        ),
+        "static_transient_route_bound_passed": (
+            _bytes_to_gib(full_bound_bytes) + MINIMUM_GPFS_FREE_GB
+            <= SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB
+        ),
         "bound_method": (
             "authenticated_standard_fresh_grid_bytes_times_"
             "full_symmetry_expansion_factor"
@@ -1145,15 +1593,45 @@ def _full_storage_authority_payload(
 
 
 def create_full_storage_authority(
-    *, selection_path: Path, output: Path
+    *,
+    selection_path: Path,
+    output: Path,
+    stream_reader: Any = diagnostic._scheduler_operational_stream,
 ) -> Path:
     selection_path = selection_path.resolve(strict=True)
     selection = _load_selection(selection_path)
+    successful_grid_path: Path | None = None
+    try:
+        payload = _full_storage_authority_payload(
+            selection_path=selection_path, selection=selection
+        )
+    except HandoffContractError:
+        full_plan_path = _selection_plan_path(selection)
+        full_plan = promotion._load_full_plan(full_plan_path)[0]
+        collection_path = Path(full_plan["standard_collection"]["path"])
+        successful_grid_path = output.resolve().with_name(
+            f"{output.resolve().stem}.successful-standard-grid.json"
+        )
+        try:
+            create_successful_standard_grid_authority(
+                collection_path=collection_path,
+                output=successful_grid_path,
+                stream_reader=stream_reader,
+            )
+            payload = _full_storage_authority_payload(
+                selection_path=selection_path,
+                selection=selection,
+                successful_grid_authority_path=successful_grid_path,
+            )
+        except Exception as stream_error:
+            raise HandoffContractError(
+                "Full storage source has neither authenticated embedded "
+                "fresh-grid evidence nor a valid terminal-success native "
+                "premesh stream authority"
+            ) from stream_error
     value = _sealed(
         {
-            **_full_storage_authority_payload(
-                selection_path=selection_path, selection=selection
-            ),
+            **payload,
             "created_at_utc": _now(),
         }
     )
@@ -1194,9 +1672,25 @@ def _load_full_storage_authority(
             "Full prospective-storage selection is absent"
         )
     selection_path = Path(str(selection_record.get("path") or ""))
+    provenance = value.get("fresh_grid_provenance")
+    successful_grid_path = None
+    if (
+        isinstance(provenance, Mapping)
+        and provenance.get("kind")
+        == "terminal_success_native_premesh_stream"
+    ):
+        authority_record = provenance.get("authority")
+        if not isinstance(authority_record, Mapping):
+            raise HandoffContractError(
+                "Full prospective-storage stream authority is absent"
+            )
+        successful_grid_path = Path(
+            str(authority_record.get("path") or "")
+        )
     expected = _full_storage_authority_payload(
         selection_path=selection_path,
         selection=selection,
+        successful_grid_authority_path=successful_grid_path,
     )
     if (
         value.get("selection_payload_sha256")
@@ -1675,6 +2169,17 @@ def _storage_admission_accounts(
         != STANDARD_SYMMETRY_DENOMINATOR
         or full_storage.get("minimum_post_reservation_free_floor_gib")
         != MINIMUM_GPFS_FREE_GB
+        or full_storage.get("solver_transient_root")
+        != SOLVER_TRANSIENT_ROOT
+        or full_storage.get("solver_transient_route_minimum_gib")
+        != SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB
+        or full_storage.get("full_bound_plus_working_floor_gib")
+        != full_bound_gib + MINIMUM_GPFS_FREE_GB
+        or full_storage.get("static_transient_route_bound_passed")
+        is not (
+            full_bound_gib + MINIMUM_GPFS_FREE_GB
+            <= SOLVER_TRANSIENT_ROUTE_MINIMUM_GIB
+        )
         or full_bound_bytes
         != source_bytes * FULL_SYMMETRY_EXPANSION_FACTOR
         or not math.isclose(
@@ -1708,6 +2213,10 @@ def _storage_admission_accounts(
                 "free_after_active_and_full_gib": free_after_full,
                 "full_arithmetic_passed": (
                     item.get("active_only_arithmetic_passed") is True
+                    and full_storage[
+                        "static_transient_route_bound_passed"
+                    ]
+                    is True
                     and free_after_full >= MINIMUM_GPFS_FREE_GB
                 ),
             }

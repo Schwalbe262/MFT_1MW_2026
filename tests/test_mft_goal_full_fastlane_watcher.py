@@ -328,6 +328,118 @@ def test_source_grid_provenance_is_reauthenticated_from_timeout_plan(
     assert evidence["candidate_physics_sha256"] == "2" * 64
 
 
+@pytest.mark.parametrize(
+    ("execution_task_id", "schema", "candidate"),
+    [
+        (96294, fastlane.diagnostic.PLAN_SCHEMA, "692c1a03e5fd"),
+        (96295, fastlane.diagnostic.PLAN_SCHEMA, "c3195a79f5b2"),
+        (96296, fastlane.diagnostic.PLAN_SCHEMA, "628c9fcfec1e"),
+        (
+            96298,
+            fastlane.diagnostic._dependency_retry_module().PLAN_SCHEMA,
+            "ab33ef0ba3ef",
+        ),
+    ],
+)
+def test_current_successor_without_terminal_stream_authority_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    execution_task_id: int,
+    schema: str,
+    candidate: str,
+) -> None:
+    source = tmp_path / f"task-{execution_task_id}-plan.json"
+    source.write_text(
+        fastlane.json.dumps({"schema_version": schema}),
+        encoding="utf-8",
+    )
+    plan = {
+        "schema_version": schema,
+        "payload_sha256": "1" * 64,
+        "candidate_physics_sha256": candidate.ljust(64, "0"),
+        "stage": {
+            "name": "standard",
+            "full_model": 0,
+            "thermal_symmetry": "eighth",
+            "retained_aedt_bundle": {"dedupe_key": "mft:test"},
+        },
+    }
+    monkeypatch.setattr(
+        fastlane.diagnostic,
+        "_load_collectible_plan",
+        lambda _path: (plan, {}, {}),
+    )
+    with pytest.raises(
+        fastlane.HandoffContractError,
+        match="no terminal-success stream authority",
+    ):
+        fastlane._authenticated_standard_grid_evidence(source)
+
+
+def test_successful_standard_stream_grid_is_actual_premesh_not_retained() -> None:
+    task_id = 96294
+    result = {
+        "solver_core_scheduler_task_id_readback": str(task_id),
+        "solver_num_cores_requested": 8,
+        "solver_num_cores_effective": 8,
+        "full_model": 0,
+        "thermal_symmetry": "eighth",
+    }
+    artifacts = [
+        {
+            "directory": "/enroot/mft_campaign-test/results",
+            "name": "Mesh0.sd",
+            "grid_output_size": 11 * 1024**3,
+            "grid_output_sha256_sample": "a" * 64,
+        },
+        {
+            "directory": "/enroot/mft_campaign-test/results",
+            "name": "Mesh1.sd",
+            "grid_output_size": 8 * 1024**3,
+            "grid_output_sha256_sample": "b" * 64,
+        },
+    ]
+    preflight = {
+        "schema": "thermal-mesh-preflight-v2",
+        "passed": True,
+        "status": "passed_standalone_native_premesh",
+        "mesh_mapping_coverage_passed": True,
+        "mesh_artifact_readback_passed": True,
+        "native_operation_readback_passed": True,
+        "standalone_idle_barrier_passed": True,
+        "postflight_error": "",
+        "native_errors": [],
+        "fresh_mesh_artifact_count": 2,
+        "fresh_mesh_artifacts": artifacts,
+    }
+    stdout = (
+        "RESULT_JSON "
+        + fastlane.json.dumps(result, sort_keys=True)
+        + "\n"
+    ).encode()
+    stderr = (
+        "[thermal] native mesh preflight: "
+        + fastlane.json.dumps(preflight, sort_keys=True)
+        + "\n"
+    ).encode()
+    collection = {
+        "task_id": task_id,
+        "scheduler_status": "completed",
+        "scheduler_task_execution": {
+            "state": "succeeded",
+            "exit_code": 0,
+        },
+        "result": result,
+        "result_sha256": fastlane.canonical_sha256(result),
+    }
+    evidence = fastlane._successful_standard_grid_stream_evidence(
+        stdout=stdout, stderr=stderr, collection=collection
+    )
+    assert evidence["fresh_grid_output_bytes"] == 19 * 1024**3
+    assert evidence["solver_transient_root"] == "/enroot"
+    assert "retained" not in evidence
+
+
 def test_full_storage_bound_is_eight_sector_source_grid_envelope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -401,7 +513,7 @@ def test_full_storage_bound_is_eight_sector_source_grid_envelope(
     monkeypatch.setattr(
         fastlane,
         "_authenticated_standard_grid_evidence",
-        lambda _path: evidence,
+        lambda *_args, **_kwargs: evidence,
     )
     payload = fastlane._full_storage_authority_payload(
         selection_path=selection_path, selection=selection
@@ -410,6 +522,9 @@ def test_full_storage_bound_is_eight_sector_source_grid_envelope(
     assert payload["full_prospective_storage_bound_bytes"] == 216 * 1024**3
     assert payload["full_prospective_storage_bound_gib"] == 216.0
     assert payload["minimum_post_reservation_free_floor_gib"] == 10.0
+    assert payload["solver_transient_root"] == "/enroot"
+    assert payload["solver_transient_route_minimum_gib"] == 200.0
+    assert payload["static_transient_route_bound_passed"] is False
     assert payload["retained_bytes_used"] is False
     assert payload["generic_reservation_used"] is False
 
@@ -474,6 +589,10 @@ def test_full_storage_gate_rejects_insufficient_quota() -> None:
         "full_prospective_storage_bound_bytes": source_bytes * 8,
         "full_prospective_storage_bound_gib": 96.0,
         "minimum_post_reservation_free_floor_gib": 10.0,
+        "solver_transient_root": "/enroot",
+        "solver_transient_route_minimum_gib": 200.0,
+        "full_bound_plus_working_floor_gib": 106.0,
+        "static_transient_route_bound_passed": True,
         "retained_bytes_used": False,
         "generic_reservation_used": False,
     }
@@ -481,6 +600,39 @@ def test_full_storage_gate_rejects_insufficient_quota() -> None:
         audit=audit, full_storage=full
     )
     assert evaluated[0]["free_after_active_and_full_gib"] == 4.0
+    assert evaluated[0]["full_arithmetic_passed"] is False
+    assert safe == []
+
+
+def test_full_storage_gate_rejects_bound_above_static_enroot_route() -> None:
+    audit = {
+        "account_observations": [
+            {
+                "account_name": "large",
+                "free_after_active_gb": 500.0,
+                "active_only_arithmetic_passed": True,
+            }
+        ]
+    }
+    source_bytes = 27 * 1024**3
+    full = {
+        "fresh_grid_output_bytes": source_bytes,
+        "full_symmetry_expansion_factor": 8,
+        "standard_symmetry_denominator": 8,
+        "full_prospective_storage_bound_bytes": source_bytes * 8,
+        "full_prospective_storage_bound_gib": 216.0,
+        "minimum_post_reservation_free_floor_gib": 10.0,
+        "solver_transient_root": "/enroot",
+        "solver_transient_route_minimum_gib": 200.0,
+        "full_bound_plus_working_floor_gib": 226.0,
+        "static_transient_route_bound_passed": False,
+        "retained_bytes_used": False,
+        "generic_reservation_used": False,
+    }
+    evaluated, safe = fastlane._storage_admission_accounts(
+        audit=audit, full_storage=full
+    )
+    assert evaluated[0]["free_after_active_and_full_gib"] == 284.0
     assert evaluated[0]["full_arithmetic_passed"] is False
     assert safe == []
 
