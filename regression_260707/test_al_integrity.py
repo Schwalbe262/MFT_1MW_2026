@@ -578,6 +578,170 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertEqual(payload["max_workers_per_node"], 1)
         self.assertFalse(payload.get("exclusive_node", False))
 
+    def test_submit_omits_node_policy_and_preserves_integer_return_by_default(
+            self):
+        submitted = Mock(status_code=201)
+        submitted.json.return_value = {"id": 405}
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), patch.object(
+                    scheduler_client.requests, "post",
+                    return_value=submitted) as post:
+            task_id = scheduler_client.submit_verification(
+                "candidate-default-node-policy",
+                "candidate_workdir",
+                {"x": 1},
+                {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+                node_name="node-101",
+            )
+
+        self.assertEqual(task_id, 405)
+        self.assertIsInstance(task_id, int)
+        self.assertNotIn(
+            "node_name_policy", post.call_args.kwargs["json"])
+
+    def test_submit_strict_node_policy_returns_authenticated_post_surface(
+            self):
+        post_task = {
+            "id": 406,
+            "name": "candidate-strict-node-policy",
+            "node_name": "node-101",
+            "requested_node_name": "node-101",
+            "node_name_policy": "strict",
+            "requested_node_name_policy": "strict",
+            "strict_node_placement": True,
+            "placement_contract_satisfied": False,
+        }
+        submitted = Mock(status_code=201)
+        submitted.json.return_value = post_task
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), patch.object(
+                    scheduler_client.requests, "post",
+                    return_value=submitted) as post:
+            evidence = scheduler_client.submit_verification(
+                "candidate-strict-node-policy",
+                "candidate_workdir",
+                {"x": 1},
+                {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+                node_name="node-101",
+                node_name_policy="strict",
+                return_submission_evidence=True,
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["node_name"], "node-101")
+        self.assertEqual(payload["node_name_policy"], "strict")
+        self.assertEqual(evidence, {
+            "task_id": 406,
+            "submission_source": "post_created",
+            "scheduler_mutation_performed": True,
+            "api_pre_submission_readback": None,
+            "api_post_submission_response": post_task,
+        })
+
+    def test_submit_rejects_invalid_explicit_node_policy(self):
+        for policy in (True, False, "relaxed", "strict-ish", 1):
+            with self.subTest(policy=policy), patch.object(
+                    scheduler_client.requests, "get") as get, patch.object(
+                    scheduler_client.requests, "post") as post:
+                with self.assertRaisesRegex(
+                        ValueError, "node_name_policy"):
+                    scheduler_client.submit_verification(
+                        "candidate-invalid-node-policy",
+                        "candidate_workdir",
+                        {"x": 1},
+                        {},
+                        solver_revision=TEST_REVISION,
+                        library_revision=TEST_LIBRARY_REVISION,
+                        node_name="node-101",
+                        node_name_policy=policy,
+                    )
+            get.assert_not_called()
+            post.assert_not_called()
+
+    def test_submit_rejects_strict_node_policy_without_node(self):
+        with patch.object(
+                scheduler_client.requests, "get") as get, patch.object(
+                scheduler_client.requests, "post") as post:
+            with self.assertRaisesRegex(
+                    ValueError, "strict node_name_policy requires node_name"):
+                scheduler_client.submit_verification(
+                    "candidate-strict-without-node",
+                    "candidate_workdir",
+                    {"x": 1},
+                    {},
+                    solver_revision=TEST_REVISION,
+                    library_revision=TEST_LIBRARY_REVISION,
+                    node_name_policy="strict",
+                )
+        get.assert_not_called()
+        post.assert_not_called()
+
+    def test_preexisting_strict_mismatch_is_exposed_for_fail_closed_caller(
+            self):
+        name = "candidate-preexisting-node-policy"
+        params = {"x": 1}
+        profile = {}
+        dedupe_key = scheduler_client.verification_dedupe_key(
+            name,
+            params,
+            profile,
+            TEST_REVISION,
+            TEST_LIBRARY_REVISION,
+        )
+        preexisting = {
+            "id": 407,
+            "name": name,
+            "dedupe_key": dedupe_key,
+            "project": scheduler_client.MFT_PROJECT,
+            "status": "queued",
+            "node_name": "node-102",
+            "requested_node_name": "node-102",
+            "node_name_policy": "preferred",
+            "requested_node_name_policy": "preferred",
+            "strict_node_placement": False,
+        }
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([preexisting])), \
+                patch.object(scheduler_client.requests, "post") as post:
+            evidence = scheduler_client.submit_verification(
+                name,
+                "candidate_workdir",
+                params,
+                profile,
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+                node_name="node-101",
+                node_name_policy="strict",
+                return_submission_evidence=True,
+            )
+
+        post.assert_not_called()
+        self.assertEqual(
+            evidence["submission_source"],
+            "pre_submission_reconciliation",
+        )
+        self.assertFalse(evidence["scheduler_mutation_performed"])
+        readback = evidence["api_pre_submission_readback"]
+        self.assertEqual(readback["node_name_policy"], "preferred")
+        self.assertNotEqual(readback["node_name"], "node-101")
+        with self.assertRaisesRegex(
+                scheduler_client.ProjectContractError,
+                "strict node readback mismatch"):
+            if (
+                readback.get("node_name_policy") != "strict"
+                or readback.get("node_name") != "node-101"
+            ):
+                raise scheduler_client.ProjectContractError(
+                    "strict node readback mismatch"
+                )
+
     def test_submit_forwards_same_node_allocation_binding(self):
         submitted = Mock(status_code=201)
         submitted.json.return_value = {"id": 403}

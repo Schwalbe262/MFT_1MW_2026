@@ -324,6 +324,65 @@ def _scheduler_cutover(tmp_path: Path, monkeypatch):
     return path
 
 
+def _strict_scheduler_cutover(tmp_path: Path, monkeypatch):
+    backup = tmp_path / "strict-scheduler-backup.db"
+    backup.write_bytes(b"strict-db-backup")
+    pre = tmp_path / "strict-pre.json"
+    post = tmp_path / "strict-post.json"
+    pre.write_text('{"active_count":21}', encoding="utf-8")
+    post.write_text('{"active_count":21}', encoding="utf-8")
+    launcher = tmp_path / "strict-live-launcher.cmd"
+    launcher.write_bytes(b"strict-reviewed-launcher")
+    rollback = tmp_path / "strict-rollback-launcher.cmd"
+    rollback.write_bytes(b"legacy-reviewed-launcher")
+    launcher_sha = adapter.sha256_file(launcher)
+    monkeypatch.setattr(
+        probe, "SCHEDULER_STRICT_NODE_LIVE_LAUNCHER", launcher
+    )
+    monkeypatch.setattr(
+        probe, "SCHEDULER_STRICT_NODE_LAUNCHER_SHA256", launcher_sha
+    )
+    rollback_sha = adapter.sha256_file(rollback)
+    monkeypatch.setattr(
+        probe,
+        "SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256",
+        rollback_sha,
+    )
+    receipt = {
+        "schema_version": probe.SCHEDULER_STRICT_NODE_CUTOVER_SCHEMA,
+        "cutover_at": "2026-07-25T11:06:05+09:00",
+        "from_commit": probe.SCHEDULER_STRICT_NODE_FROM_REVISION,
+        "to_commit": probe.SCHEDULER_STRICT_NODE_REVISION,
+        "tree": probe.SCHEDULER_STRICT_NODE_TREE,
+        "launcher_sha256": launcher_sha,
+        "database_backup": str(backup.resolve()),
+        "database_backup_sha256": adapter.sha256_file(backup),
+        "pre_snapshot": str(pre.resolve()),
+        "post_snapshot": str(post.resolve()),
+        "cohort_tasks_preserved": 30,
+        "active_tasks_pre": 21,
+        "active_tasks_post": 21,
+        "allowed_terminal_transitions": "running->completed/0|failed/124",
+        "scheduler_ok": True,
+        "scheduler_thread_alive": True,
+        "pressure_episode_migration_smoke": "pass",
+        "database_quick_check": "ok",
+        "rollback_launcher": str(rollback.resolve()),
+        "rollback_launcher_sha256": rollback_sha,
+    }
+    path = tmp_path / "strict-cutover.json"
+    path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8-sig",
+    )
+    monkeypatch.setattr(
+        probe,
+        "SCHEDULER_STRICT_NODE_CUTOVER_SHA256",
+        adapter.sha256_file(path),
+    )
+    return path
+
+
 def _live_scheduler_reader(**kwargs):
     if kwargs["endpoint"] == "/api/health":
         return {
@@ -542,6 +601,24 @@ def _same_allocation_submitted_snapshot(submission, **overrides):
         "same_node_as_task_id": 72000,
         "requested_allocation_id": 0,
         "finished_at": None,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def _strict_submitted_snapshot(submission, **overrides):
+    snapshot = {
+        **_same_allocation_submitted_snapshot(submission),
+        "node_name": "n110",
+        "requested_node_name": "n110",
+        "node_name_policy": "strict",
+        "requested_node_name_policy": "strict",
+        "strict_node_placement": True,
+        "placement_contract_satisfied": True,
+        "assigned_allocation": 9002,
+        "allocation_node_name": "n110",
+        "requested_account_name": "anchor-account",
+        "started_at": "2026-07-25 00:06:00",
     }
     snapshot.update(overrides)
     return snapshot
@@ -1077,7 +1154,255 @@ def test_same_allocation_retry_fails_closed_on_anchor_or_task_drift(
     assert not (tmp_path / "unbound-existing-submission.json").exists()
 
 
+def test_timeout_retry_strict_r2_authenticates_post_get_and_terminal_binding(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    legacy_cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=legacy_cutover_path,
+        output=tmp_path / "original-submission.json",
+        scheduler=_FakeScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan = probe._load_plan(original_plan_path)[0]
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+    strict_cutover_path = _strict_scheduler_cutover(tmp_path, monkeypatch)
+    retry_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "strict-retry-plan",
+        strict_node_name="n110",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            original_submission
+        ),
+    )
+    retry_plan = probe._load_plan(retry_plan_path)[0]
+    assert "timeout-strict-r2-n110-" in retry_plan["stage"]["task_name"]
+    assert retry_plan["scheduler_strict_node_contract"][
+        "fallback_allocation_allowed"
+    ] is False
+    expected_submission = {
+        "task_id": 71002,
+        "task_name": retry_plan["stage"]["task_name"],
+        "dedupe_key": retry_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+    }
+    post_readback = _strict_submitted_snapshot(expected_submission)
+
+    class _StrictScheduler(_FakeScheduler):
+        def submit_verification(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {
+                "task_id": 71002,
+                "submission_source": "post_created",
+                "scheduler_mutation_performed": True,
+                "api_pre_submission_readback": None,
+                "api_post_submission_response": post_readback,
+            }
+
+    def task_reader(**kwargs):
+        task_id = kwargs["task_id"]
+        if task_id == original_submission["task_id"]:
+            return _timeout_task_snapshot(original_submission)
+        if task_id == 72000:
+            return _same_allocation_anchor_snapshot()
+        if task_id == 71002:
+            return post_readback
+        raise AssertionError(task_id)
+
+    strict_scheduler = _StrictScheduler()
+    retry_submission_path = probe.submit_timeout_retry(
+        plan_path=retry_plan_path,
+        scheduler_cutover_receipt_path=strict_cutover_path,
+        output=tmp_path / "strict-retry-submission.json",
+        scheduler=strict_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=task_reader,
+        same_node_as_task_id=72000,
+        expected_allocation_id=9002,
+        expected_slurm_job_id="81300",
+        expected_account_name="anchor-account",
+        expected_node_name="n110",
+    )
+    retry_submission = probe._load_submission(
+        retry_submission_path, plan=retry_plan
+    )
+    kwargs = strict_scheduler.calls[0][1]
+    assert kwargs["node_name"] == "n110"
+    assert kwargs["node_name_policy"] == "strict"
+    assert kwargs["return_submission_evidence"] is True
+    assert kwargs["same_node_as_task_id"] == 72000
+    strict_receipt = retry_submission["scheduler_strict_node_contract"]
+    assert strict_receipt["submission_source"] == "post_created"
+    assert strict_receipt["api_post_submission_response"][
+        "placement_contract_satisfied"
+    ] is True
+    assert strict_receipt["api_durable_get_readback"][
+        "allocation_node_name"
+    ] == "n110"
+    terminal = _strict_submitted_snapshot(
+        expected_submission,
+        status="completed",
+        state="succeeded",
+        exit_code=0,
+        failure_message="",
+        remote_cwd="/gpfs/test",
+        remote_dir="runs/task-71002",
+        finished_at="2026-07-25 08:06:00",
+    )
+    assert probe._task_execution_evidence(
+        terminal, submission=retry_submission
+    )["actual_node_name"] == "n110"
+    with pytest.raises(
+        production.HandoffContractError,
+        match=(
+            "strict-node Scheduler identity drifted|fell back|"
+            "escaped its sealed same-allocation"
+        ),
+    ):
+        probe._task_execution_evidence(
+            {
+                **terminal,
+                "allocation_node_name": "n109",
+                "actual_node_name": "n109",
+            },
+            submission=retry_submission,
+        )
+
+
+def test_strict_retry_rejects_unsafe_node_name_before_plan_write(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "original-submission.json",
+        scheduler=_FakeScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan = probe._load_plan(original_plan_path)[0]
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+    with pytest.raises(
+        production.HandoffContractError, match="unsafe or empty"
+    ):
+        probe.create_timeout_retry_plan(
+            original_plan_path=original_plan_path,
+            original_submission_path=original_submission_path,
+            output=tmp_path / "unsafe-strict-plan",
+            strict_node_name="n110; echo unsafe",
+            task_reader=lambda **_kwargs: _timeout_task_snapshot(
+                original_submission
+            ),
+        )
+    assert not (tmp_path / "unsafe-strict-plan").exists()
+
+
+def test_live_strict_cutover_receipt_with_bom_is_pinned_when_present():
+    path = Path(
+        "C:/Users/peets/slurm_scheduler_runtime/deployment_candidates/"
+        "e542c8a6350d-pressure-episode-gate-20260725/"
+        "cutover_receipt.json"
+    )
+    if not path.is_file():
+        pytest.skip("live strict-node cutover receipt is host-local")
+    receipt, launcher = probe._validate_scheduler_cutover_receipt(
+        path,
+        verify_live_launcher=True,
+        require_strict_node=True,
+    )
+    assert receipt["candidate_revision"] == (
+        probe.SCHEDULER_STRICT_NODE_REVISION
+    )
+    assert launcher["sha256"] == (
+        probe.SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
+    )
+
+
+def test_scheduler_client_strict_opt_in_sends_policy_and_returns_post_evidence(
+    monkeypatch,
+):
+    captured = {}
+
+    class _Response:
+        status_code = 201
+
+        @staticmethod
+        def json():
+            return {
+                "id": 73001,
+                "node_name": "n110",
+                "node_name_policy": "strict",
+            }
+
+    monkeypatch.setattr(
+        scheduler_client,
+        "reconcile_task_record",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        scheduler_client,
+        "live_project_submission_snapshot",
+        lambda *_args, **_kwargs: {"project_submission_slots": 1},
+    )
+
+    def post(_url, *, json, timeout):
+        captured["payload"] = json
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(scheduler_client.requests, "post", post)
+    result = scheduler_client.submit_verification(
+        "strict-client-test",
+        "strict_client_test",
+        {"N1": 6},
+        {"timeout_seconds": 60, "cli_flags": ""},
+        solver_revision="a" * 40,
+        library_revision="b" * 40,
+        required_project_cap=500,
+        max_project_active_tasks=500,
+        node_name="n110",
+        node_name_policy="strict",
+        return_submission_evidence=True,
+        scheduler_url=probe.DIAGNOSTIC_SCHEDULER_URL,
+    )
+    assert captured["payload"]["node_name"] == "n110"
+    assert captured["payload"]["node_name_policy"] == "strict"
+    assert result["task_id"] == 73001
+    assert result["submission_source"] == "post_created"
+    assert result["api_post_submission_response"][
+        "node_name_policy"
+    ] == "strict"
+
+
 def test_timeout_retry_parser_exposes_complete_same_allocation_contract():
+    plan_args = probe._parser().parse_args(
+        [
+            "plan-timeout-retry",
+            "--original-plan",
+            "original-plan.json",
+            "--original-submission",
+            "original-submission.json",
+            "--strict-node-name",
+            "n110",
+            "--output",
+            "strict-plan",
+        ]
+    )
+    assert plan_args.strict_node_name == "n110"
     args = probe._parser().parse_args(
         [
             "submit-timeout-retry",

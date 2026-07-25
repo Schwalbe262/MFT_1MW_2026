@@ -505,10 +505,10 @@ def live_project_submission_snapshot(
     )
 
 
-def reconcile_task_id(
+def reconcile_task_record(
         name, dedupe_key, attempts=3, retry_delay=1, *,
         scheduler_url=None):
-    """Find the newest exact task identity, including projectless legacy rows."""
+    """Find the newest exact task record, including projectless legacy rows."""
     base_url = str(scheduler_url or SCHEDULER).rstrip("/")
     last_error = None
     for attempt in range(1, attempts + 1):
@@ -552,7 +552,7 @@ def reconcile_task_id(
             ]
             if not matches:
                 return None
-            return max(int(task["id"]) for task in matches)
+            return dict(max(matches, key=lambda task: int(task["id"])))
         except Exception as exc:
             last_error = exc
             if attempt < attempts:
@@ -560,6 +560,20 @@ def reconcile_task_id(
     raise TaskLookupError(
         f"failed to reconcile task {name!r} after {attempts} attempts: {last_error}"
     ) from last_error
+
+
+def reconcile_task_id(
+        name, dedupe_key, attempts=3, retry_delay=1, *,
+        scheduler_url=None):
+    """Find the newest exact task identity, including projectless legacy rows."""
+    task = reconcile_task_record(
+        name,
+        dedupe_key,
+        attempts=attempts,
+        retry_delay=retry_delay,
+        scheduler_url=scheduler_url,
+    )
+    return None if task is None else int(task["id"])
 
 
 def effective_verification_params(params, profile):
@@ -1217,7 +1231,8 @@ def submit_verification(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
-        same_node_as_task_id=0,
+        same_node_as_task_id=0, node_name_policy="",
+        return_submission_evidence=False,
         max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
         scheduler_url=None):
     """Submit one MFT task under the shared cross-process mutation lock."""
@@ -1236,6 +1251,10 @@ def submit_verification(
         submission_options["required_hard_cap"] = required_hard_cap
     if same_node_as_task_id:
         submission_options["same_node_as_task_id"] = same_node_as_task_id
+    if node_name_policy not in (None, ""):
+        submission_options["node_name_policy"] = node_name_policy
+    if return_submission_evidence:
+        submission_options["return_submission_evidence"] = True
     if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
         submission_options["max_project_active_tasks"] = (
             max_project_active_tasks)
@@ -1273,7 +1292,8 @@ def _submit_verification_locked(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
-        same_node_as_task_id=0,
+        same_node_as_task_id=0, node_name_policy="",
+        return_submission_evidence=False,
         max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
         scheduler_url=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
@@ -1291,8 +1311,33 @@ def _submit_verification_locked(
     endpoint_options = (
         {"scheduler_url": base_url} if scheduler_url is not None else {}
     )
+
+    def reconcile_submission():
+        if return_submission_evidence:
+            return reconcile_task_record(
+                name, dedupe_key, **endpoint_options
+            )
+        return reconcile_task_id(name, dedupe_key, **endpoint_options)
+
     account_name = str(account_name or "").strip()
     node_name = str(node_name or "").strip()
+    if node_name_policy is None:
+        node_name_policy = ""
+    elif not isinstance(node_name_policy, str):
+        raise ValueError(
+            "verification node_name_policy must be preferred or strict"
+        )
+    node_name_policy = node_name_policy.strip().lower()
+    if node_name_policy not in {"", "preferred", "strict"}:
+        raise ValueError(
+            "verification node_name_policy must be preferred or strict"
+        )
+    if node_name_policy == "strict" and not node_name:
+        raise ValueError(
+            "verification strict node_name_policy requires node_name"
+        )
+    if not isinstance(return_submission_evidence, bool):
+        raise TypeError("return_submission_evidence must be a bool")
     if (isinstance(max_workers_per_node, bool)
             or not isinstance(max_workers_per_node, int)
             or max_workers_per_node < 0):
@@ -1462,6 +1507,8 @@ def _submit_verification_locked(
         # every terminal path, including cancellation and allocation loss.
         "cleanup_globs": scratch_leaf,
     }
+    if node_name_policy:
+        payload["node_name_policy"] = node_name_policy
     if aedt_backend == "pooled":
         # Persist the exact literal contract separately from the command so
         # scheduler admission can validate it without interpreting shell.
@@ -1470,9 +1517,17 @@ def _submit_verification_locked(
         payload["aedt_backend"] = aedt_backend
     if same_node_as_task_id:
         payload["same_node_as_task_id"] = same_node_as_task_id
-    existing = reconcile_task_id(name, dedupe_key, **endpoint_options)
+    existing = reconcile_submission()
     if existing is not None:
-        return existing
+        if return_submission_evidence:
+            return {
+                "task_id": int(existing["id"]),
+                "submission_source": "pre_submission_reconciliation",
+                "scheduler_mutation_performed": False,
+                "api_pre_submission_readback": existing,
+                "api_post_submission_response": None,
+            }
+        return int(existing)
     max_project_active_tasks = _validated_project_cap_ceiling(
         max_project_active_tasks)
     if required_project_cap is None:
@@ -1518,33 +1573,63 @@ def _submit_verification_locked(
         r = requests.post(f"{base_url}/api/tasks", json=payload, timeout=20)
     except Exception as post_error:
         try:
-            recovered = reconcile_task_id(
-                name, dedupe_key, **endpoint_options)
+            recovered = reconcile_submission()
         except TaskLookupError as lookup_error:
             raise TaskSubmissionUncertain(
                 f"POST response and reconciliation were both unavailable for {name!r}"
             ) from lookup_error
         if recovered is not None:
-            return recovered
+            if return_submission_evidence:
+                raise TaskSubmissionUncertain(
+                    f"POST response was lost for {name!r}; durable task "
+                    "exists but mutation provenance is uncertain"
+                ) from post_error
+            return int(recovered)
         raise TaskSubmissionUncertain(
             f"POST response was lost and no durable task is visible yet for {name!r}"
         ) from post_error
     if r.status_code not in (200, 201):
-        recovered = reconcile_task_id(
-            name, dedupe_key, **endpoint_options)
+        recovered = reconcile_submission()
         if recovered is not None:
-            return recovered
+            if return_submission_evidence:
+                return {
+                    "task_id": int(recovered["id"]),
+                    "submission_source": "post_rejection_reconciliation",
+                    "scheduler_mutation_performed": False,
+                    "api_pre_submission_readback": None,
+                    "api_post_submission_response": recovered,
+                }
+            return int(recovered)
         return None
     try:
         response_payload = r.json()
         task_id = response_payload.get("task_id") or response_payload.get("id")
         if task_id is not None:
-            return int(task_id)
+            task_id = int(task_id)
+            if return_submission_evidence:
+                return {
+                    "task_id": task_id,
+                    "submission_source": (
+                        "post_created" if r.status_code == 201 else "post_deduped"
+                    ),
+                    "scheduler_mutation_performed": r.status_code == 201,
+                    "api_pre_submission_readback": None,
+                    "api_post_submission_response": response_payload,
+                }
+            return task_id
     except Exception:
         pass
-    recovered = reconcile_task_id(name, dedupe_key, **endpoint_options)
+    recovered = reconcile_submission()
     if recovered is not None:
-        return recovered
+        if return_submission_evidence:
+            return {
+                "task_id": int(recovered["id"]),
+                "submission_source": "post_response_reconciliation",
+                "scheduler_mutation_performed": r.status_code == 201,
+                "api_pre_submission_readback": None,
+                "api_post_submission_response": recovered,
+            }
+        return int(recovered)
     raise TaskSubmissionUncertain(
         f"scheduler accepted {name!r} without returning or exposing its task ID"
     )

@@ -20,6 +20,7 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import sys
 import tempfile
@@ -84,6 +85,30 @@ SCHEDULER_RELEASE_MANIFEST_SHA256 = (
 SCHEDULER_LIVE_LAUNCHER_SHA256 = (
     "e26c3eeb0453cd5f049e9f3280213b46e9c194d149e139b34dc5d9947c137c3d"
 )
+SCHEDULER_STRICT_NODE_REVISION = (
+    "e542c8a6350d0b7101aa786e61f79df88958f40d"
+)
+SCHEDULER_STRICT_NODE_TREE = (
+    "2ff7b60477cb8ad1d09470740bf504226c676224"
+)
+SCHEDULER_STRICT_NODE_FROM_REVISION = (
+    "22f6fb93d71f9e703b7169bb2ac2c460ca80ec99"
+)
+SCHEDULER_STRICT_NODE_LAUNCHER_SHA256 = (
+    "e1c327bd986ca2f86dfa5e02fbb9a9c40bb7e3347bfafcd6aea2acc182da325a"
+)
+SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256 = (
+    "3cea73b022b8bfda1bdfc935751a3874c508498c8e1de463dfe554433d3425e5"
+)
+SCHEDULER_STRICT_NODE_CUTOVER_SHA256 = (
+    "28fc55c60281cb9690eb84a442f149aed57dfb79623a83672f930f17f8c68348"
+)
+SCHEDULER_STRICT_NODE_LIVE_LAUNCHER = Path(
+    "Y:/runtime/slurm_scheduler/start_web_y.cmd"
+)
+SCHEDULER_STRICT_NODE_CUTOVER_SCHEMA = (
+    "slurm-scheduler-cutover-receipt-v2"
+)
 RESULTS_MANIFEST_SCHEMA = (
     scheduler_client.RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA
 )
@@ -111,6 +136,12 @@ TIMEOUT_RETRY_EVIDENCE_SCHEMA = (
 )
 SAME_ALLOCATION_PLACEMENT_SCHEMA = (
     "mft-goal-diagnostic-same-allocation-placement-v1"
+)
+STRICT_NODE_PLACEMENT_SCHEMA = (
+    "mft-goal-diagnostic-strict-node-placement-v1"
+)
+STRICT_NODE_SUBMISSION_SCHEMA = (
+    "mft-goal-diagnostic-strict-node-submission-v1"
 )
 LLT_UNCERTAINTY_CONSTRAINTS = frozenset(
     {"Llt_robust_band", "Llt_ensemble_disagreement"}
@@ -196,6 +227,30 @@ SCHEDULER_CUTOVER_FIELDS = frozenset(
         "payload_sha256",
     }
 )
+SCHEDULER_STRICT_NODE_CUTOVER_FIELDS = frozenset(
+    {
+        "schema_version",
+        "cutover_at",
+        "from_commit",
+        "to_commit",
+        "tree",
+        "launcher_sha256",
+        "database_backup",
+        "database_backup_sha256",
+        "pre_snapshot",
+        "post_snapshot",
+        "cohort_tasks_preserved",
+        "active_tasks_pre",
+        "active_tasks_post",
+        "allowed_terminal_transitions",
+        "scheduler_ok",
+        "scheduler_thread_alive",
+        "pressure_episode_migration_smoke",
+        "database_quick_check",
+        "rollback_launcher",
+        "rollback_launcher_sha256",
+    }
+)
 
 
 def _aware_timestamp(value: Any, label: str) -> datetime:
@@ -259,15 +314,21 @@ def _same_absolute_regular_file_identity(left: Any, right: Any) -> bool:
     )
 
 
-def _live_launcher_identity(receipt: Mapping[str, Any]) -> dict[str, Any]:
+def _live_launcher_identity(
+    receipt: Mapping[str, Any],
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    if expected_sha256 is None:
+        expected_sha256 = SCHEDULER_LIVE_LAUNCHER_SHA256
     launcher = _absolute_regular_file(
         receipt.get("live_launcher_path"),
         "Scheduler live launcher",
     )
     digest = production._sha256_file(launcher)
-    if digest != SCHEDULER_LIVE_LAUNCHER_SHA256:
+    if digest != expected_sha256:
         raise HandoffContractError(
-            "Scheduler live launcher is not the reviewed marker-aware cutover"
+            "Scheduler live launcher is not the reviewed cutover"
         )
     return {
         "path": str(launcher),
@@ -276,11 +337,112 @@ def _live_launcher_identity(receipt: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_scheduler_cutover_receipt(
+def _validate_strict_scheduler_cutover_receipt(
     path: Path,
     *,
     verify_live_launcher: bool,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    resolved = path.resolve(strict=True)
+    try:
+        raw = json.loads(resolved.read_text(encoding="utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HandoffContractError(
+            "Scheduler strict-node cutover receipt is invalid JSON"
+        ) from exc
+    if (
+        production._sha256_file(resolved)
+        != SCHEDULER_STRICT_NODE_CUTOVER_SHA256
+        or not isinstance(raw, dict)
+        or set(raw) != SCHEDULER_STRICT_NODE_CUTOVER_FIELDS
+        or raw.get("schema_version")
+        != SCHEDULER_STRICT_NODE_CUTOVER_SCHEMA
+        or raw.get("from_commit") != SCHEDULER_STRICT_NODE_FROM_REVISION
+        or raw.get("to_commit") != SCHEDULER_STRICT_NODE_REVISION
+        or raw.get("tree") != SCHEDULER_STRICT_NODE_TREE
+        or raw.get("launcher_sha256")
+        != SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
+        or raw.get("cohort_tasks_preserved") != 30
+        or isinstance(raw.get("active_tasks_pre"), bool)
+        or not isinstance(raw.get("active_tasks_pre"), int)
+        or raw.get("active_tasks_pre") < 0
+        or raw.get("active_tasks_pre") > 30
+        or raw.get("active_tasks_post") != raw.get("active_tasks_pre")
+        or raw.get("allowed_terminal_transitions")
+        != "running->completed/0|failed/124"
+        or raw.get("scheduler_ok") is not True
+        or raw.get("scheduler_thread_alive") is not True
+        or raw.get("pressure_episode_migration_smoke") != "pass"
+        or raw.get("database_quick_check") != "ok"
+        or raw.get("rollback_launcher_sha256")
+        != SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256
+    ):
+        raise HandoffContractError(
+            "Scheduler strict-node cutover identity drifted"
+        )
+    _aware_timestamp(raw.get("cutover_at"), "Scheduler cutover timestamp")
+    backup = _absolute_regular_file(
+        raw.get("database_backup"), "Scheduler cutover database backup"
+    )
+    if (
+        production._sha256_file(backup)
+        != production._require_sha(
+            raw.get("database_backup_sha256"),
+            "Scheduler database backup SHA",
+        )
+    ):
+        raise HandoffContractError(
+            "Scheduler cutover database backup bytes drifted"
+        )
+    _absolute_regular_file(
+        raw.get("pre_snapshot"), "Scheduler pre-cutover snapshot"
+    )
+    _absolute_regular_file(
+        raw.get("post_snapshot"), "Scheduler post-cutover snapshot"
+    )
+    rollback_launcher = _absolute_regular_file(
+        raw.get("rollback_launcher"), "Scheduler rollback launcher"
+    )
+    if (
+        production._sha256_file(rollback_launcher)
+        != SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256
+    ):
+        raise HandoffContractError(
+            "Scheduler rollback launcher bytes drifted"
+        )
+    launcher = _absolute_regular_file(
+        SCHEDULER_STRICT_NODE_LIVE_LAUNCHER,
+        "Scheduler strict-node live launcher",
+    )
+    normalized = {
+        **copy.deepcopy(raw),
+        "scheduler_url": DIAGNOSTIC_SCHEDULER_URL,
+        "candidate_revision": SCHEDULER_STRICT_NODE_REVISION,
+        "candidate_tree": SCHEDULER_STRICT_NODE_TREE,
+        "live_launcher_path": str(launcher),
+        "payload_sha256": canonical_sha256(raw),
+        "cutover_receipt_file_sha256": production._sha256_file(resolved),
+    }
+    launcher_identity = (
+        _live_launcher_identity(
+            normalized,
+            expected_sha256=SCHEDULER_STRICT_NODE_LAUNCHER_SHA256,
+        )
+        if verify_live_launcher
+        else None
+    )
+    return normalized, launcher_identity
+
+
+def _validate_scheduler_cutover_receipt(
+    path: Path,
+    *,
+    verify_live_launcher: bool,
+    require_strict_node: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if require_strict_node:
+        return _validate_strict_scheduler_cutover_receipt(
+            path, verify_live_launcher=verify_live_launcher
+        )
     resolved = path.resolve(strict=True)
     receipt = production._validate_seal(
         production._read_json(resolved), SCHEDULER_CUTOVER_SCHEMA
@@ -2117,6 +2279,73 @@ def _plan_is_timeout_retry(plan: Mapping[str, Any]) -> bool:
     return "retry_of_timeout" in plan
 
 
+def _strict_node_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise HandoffContractError(
+            "strict timeout retry node name is unsafe or empty"
+        )
+    node_name = str(value or "").strip()
+    if (
+        not node_name
+        or len(node_name) > 64
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", node_name) is None
+    ):
+        raise HandoffContractError(
+            "strict timeout retry node name is unsafe or empty"
+        )
+    return node_name
+
+
+def _strict_node_plan_contract(node_name: str) -> dict[str, Any]:
+    return {
+        "schema_version": STRICT_NODE_PLACEMENT_SCHEMA,
+        "requested_node_name": _strict_node_name(node_name),
+        "node_name_policy": "strict",
+        "scheduler_revision": SCHEDULER_STRICT_NODE_REVISION,
+        "scheduler_tree": SCHEDULER_STRICT_NODE_TREE,
+        "scheduler_launcher_sha256": (
+            SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
+        ),
+        "scheduler_cutover_receipt_schema": (
+            SCHEDULER_STRICT_NODE_CUTOVER_SCHEMA
+        ),
+        "scheduler_cutover_receipt_sha256": (
+            SCHEDULER_STRICT_NODE_CUTOVER_SHA256
+        ),
+        "task_identity_generation": "timeout-strict-r2-node-bound",
+        "fallback_allocation_allowed": False,
+        "api_submission_readback_required": True,
+        "durable_get_readback_required": True,
+        "terminal_readback_required": True,
+    }
+
+
+def _validate_strict_node_plan_contract(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise HandoffContractError(
+            "strict timeout retry placement contract is absent"
+        )
+    expected = _strict_node_plan_contract(value.get("requested_node_name"))
+    if value != expected:
+        raise HandoffContractError(
+            "strict timeout retry placement contract drifted"
+        )
+    return expected
+
+
+def _plan_strict_node_contract(
+    plan: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    value = plan.get("scheduler_strict_node_contract")
+    if value is None:
+        return None
+    if not _plan_is_timeout_retry(plan):
+        raise HandoffContractError(
+            "strict node placement is restricted to timeout retries"
+        )
+    return _validate_strict_node_plan_contract(value)
+
+
 def _plan_resources(plan: Mapping[str, Any]) -> dict[str, int]:
     return (
         TIMEOUT_RETRY_RESOURCES
@@ -2291,6 +2520,7 @@ def create_timeout_retry_plan(
     output: Path,
     scheduler_url: str = DIAGNOSTIC_SCHEDULER_URL,
     task_reader: Any = None,
+    strict_node_name: str = "",
 ) -> Path:
     original_plan, params, selected = _load_plan(original_plan_path)
     if _plan_is_timeout_retry(original_plan):
@@ -2332,8 +2562,25 @@ def create_timeout_retry_plan(
             "timeout retry profile changes fixed physics"
         )
     stem = str(original_plan["candidate_physics_sha256"])[:12]
-    task_name = f"mft-goal-diag-standard-timeout-r1-{stem}"
-    workdir = f"mft_goal_diag_standard_timeout_r1_{stem}"
+    strict_contract = None
+    if strict_node_name not in (None, ""):
+        strict_contract = _strict_node_plan_contract(strict_node_name)
+        node_slug = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            strict_contract["requested_node_name"],
+        )[:16]
+        task_name = (
+            f"mft-goal-diag-standard-timeout-strict-r2-"
+            f"{node_slug}-{stem}"
+        )
+        workdir = (
+            f"mft_goal_diag_standard_timeout_strict_r2_"
+            f"{node_slug}_{stem}"
+        )
+    else:
+        task_name = f"mft-goal-diag-standard-timeout-r1-{stem}"
+        workdir = f"mft_goal_diag_standard_timeout_r1_{stem}"
     retained = scheduler_client.retained_aedt_identity(
         task_name,
         params,
@@ -2428,6 +2675,11 @@ def create_timeout_retry_plan(
                     "submit-timeout-retry"
                 ],
                 "retry_of_timeout": retry_record,
+                **(
+                    {"scheduler_strict_node_contract": strict_contract}
+                    if strict_contract is not None
+                    else {}
+                ),
             }
         )
         plan_path = production._write_immutable_json(
@@ -2562,6 +2814,33 @@ def _load_plan(
         )
     if timeout_retry:
         _validate_timeout_retry_record(plan)
+        strict_contract = _plan_strict_node_contract(plan)
+        if strict_contract is not None:
+            node_slug = re.sub(
+                r"[^A-Za-z0-9_-]+",
+                "_",
+                strict_contract["requested_node_name"],
+            )[:16]
+            stem = str(plan["candidate_physics_sha256"])[:12]
+            if (
+                stage.get("task_name")
+                != (
+                    "mft-goal-diag-standard-timeout-strict-r2-"
+                    f"{node_slug}-{stem}"
+                )
+                or stage.get("workdir")
+                != (
+                    "mft_goal_diag_standard_timeout_strict_r2_"
+                    f"{node_slug}_{stem}"
+                )
+            ):
+                raise HandoffContractError(
+                    "strict timeout retry r2 identity drifted"
+                )
+    elif "scheduler_strict_node_contract" in plan:
+        raise HandoffContractError(
+            "strict node placement is restricted to timeout retries"
+        )
     return plan, params, selected
 
 
@@ -2883,6 +3162,306 @@ def _validate_same_allocation_placement_contract(
     return normalized
 
 
+def _strict_node_task_evidence(
+    snapshot: Mapping[str, Any],
+    *,
+    task_id: int,
+    task_name: str,
+    dedupe_key: str,
+    node_name: str,
+    same_node_as_task_id: int = 0,
+    expected_allocation_id: int = 0,
+    expected_slurm_job_id: str = "",
+    expected_account_name: str = "",
+) -> dict[str, Any]:
+    requested_node = _strict_node_name(node_name)
+    evidence = {
+        "task_id": snapshot.get("task_id", snapshot.get("id")),
+        "name": snapshot.get("name"),
+        "status": snapshot.get("status"),
+        "state": snapshot.get("state"),
+        "dedupe_key": snapshot.get("dedupe_key"),
+        "project": snapshot.get("project"),
+        "scheduling_profile": snapshot.get("scheduling_profile"),
+        "aedt_backend": snapshot.get("aedt_backend"),
+        "cpus": snapshot.get("cpus"),
+        "memory_mb": snapshot.get("memory_mb"),
+        "node_name": snapshot.get("node_name"),
+        "requested_node_name": snapshot.get("requested_node_name"),
+        "node_name_policy": snapshot.get("node_name_policy"),
+        "requested_node_name_policy": snapshot.get(
+            "requested_node_name_policy"
+        ),
+        "strict_node_placement": snapshot.get("strict_node_placement"),
+        "placement_contract_satisfied": snapshot.get(
+            "placement_contract_satisfied"
+        ),
+        "allocation_id": snapshot.get(
+            "allocation_id", snapshot.get("assigned_allocation")
+        ),
+        "assigned_allocation": snapshot.get(
+            "assigned_allocation", snapshot.get("allocation_id")
+        ),
+        "allocation_node_name": snapshot.get("allocation_node_name"),
+        "actual_node_name": snapshot.get("actual_node_name"),
+        "slurm_job_id": str(snapshot.get("slurm_job_id") or ""),
+        "account_name": snapshot.get("account_name"),
+        "requested_account_name": snapshot.get("requested_account_name"),
+        "same_node_as_task_id": snapshot.get("same_node_as_task_id", 0),
+        "started_at": snapshot.get("started_at"),
+        "finished_at": snapshot.get("finished_at"),
+    }
+    if (
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or evidence["task_id"] != task_id
+        or evidence["name"] != task_name
+        or evidence["dedupe_key"] != dedupe_key
+        or evidence["project"] != scheduler_client.MFT_PROJECT
+        or evidence["scheduling_profile"] != "fea_bursty"
+        or evidence["aedt_backend"] != "standalone"
+        or evidence["cpus"] != TIMEOUT_RETRY_RESOURCES["cpus"]
+        or evidence["memory_mb"] != 32768
+        or evidence["node_name"] != requested_node
+        or evidence["requested_node_name"] != requested_node
+        or evidence["node_name_policy"] != "strict"
+        or evidence["requested_node_name_policy"] != "strict"
+        or evidence["strict_node_placement"] is not True
+        or evidence["same_node_as_task_id"] != same_node_as_task_id
+    ):
+        raise HandoffContractError(
+            "diagnostic strict-node Scheduler identity drifted"
+        )
+    status = evidence["status"]
+    state = evidence["state"]
+    allocation_id = evidence["allocation_id"]
+    assigned_allocation = evidence["assigned_allocation"]
+    if status == "queued" and state == "queued":
+        valid_state = (
+            allocation_id in (None, 0)
+            and assigned_allocation in (None, 0)
+            and evidence["slurm_job_id"] == ""
+            and not str(evidence["allocation_node_name"] or "").strip()
+            and not str(evidence["actual_node_name"] or "").strip()
+            and evidence["placement_contract_satisfied"] is False
+            and not str(evidence["started_at"] or "").strip()
+            and evidence["finished_at"] in (None, "")
+        )
+    elif status == "attaching" and state == "attaching":
+        valid_state = (
+            isinstance(allocation_id, int)
+            and not isinstance(allocation_id, bool)
+            and allocation_id > 0
+            and assigned_allocation == allocation_id
+            and evidence["allocation_node_name"] == requested_node
+            and evidence["actual_node_name"] == requested_node
+            and evidence["slurm_job_id"].isdigit()
+            and str(evidence["account_name"] or "").strip() != ""
+            and evidence["placement_contract_satisfied"] is False
+            and not str(evidence["started_at"] or "").strip()
+            and evidence["finished_at"] in (None, "")
+        )
+    elif (
+        (status == "running" and state == "running")
+        or (status == "completed" and state == "succeeded")
+    ):
+        valid_state = (
+            isinstance(allocation_id, int)
+            and not isinstance(allocation_id, bool)
+            and allocation_id > 0
+            and assigned_allocation == allocation_id
+            and evidence["allocation_node_name"] == requested_node
+            and evidence["actual_node_name"] == requested_node
+            and evidence["slurm_job_id"].isdigit()
+            and str(evidence["account_name"] or "").strip() != ""
+            and evidence["placement_contract_satisfied"] is True
+            and str(evidence["started_at"] or "").strip() != ""
+            and (
+                evidence["finished_at"] in (None, "")
+                if status == "running"
+                else str(evidence["finished_at"] or "").strip() != ""
+            )
+        )
+    else:
+        valid_state = False
+    if not valid_state:
+        raise HandoffContractError(
+            "diagnostic strict-node Scheduler placement readback drifted"
+        )
+    if expected_allocation_id and allocation_id not in (
+        None,
+        0,
+        expected_allocation_id,
+    ):
+        raise HandoffContractError(
+            "diagnostic strict-node allocation fell back or drifted"
+        )
+    if expected_slurm_job_id and evidence["slurm_job_id"] not in (
+        "",
+        str(expected_slurm_job_id),
+    ):
+        raise HandoffContractError(
+            "diagnostic strict-node Slurm job drifted"
+        )
+    if expected_account_name:
+        requested_account = str(
+            evidence["requested_account_name"] or ""
+        ).strip()
+        actual_account = str(evidence["account_name"] or "").strip()
+        if requested_account != expected_account_name or actual_account not in (
+            "",
+            expected_account_name,
+        ):
+            raise HandoffContractError(
+                "diagnostic strict-node account drifted"
+            )
+    return evidence
+
+
+def _strict_node_submission_contract(
+    *,
+    plan_contract: Mapping[str, Any],
+    submission_trace: Mapping[str, Any],
+    durable_readback: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": STRICT_NODE_SUBMISSION_SCHEMA,
+        "plan_contract": copy.deepcopy(plan_contract),
+        "submission_source": submission_trace["submission_source"],
+        "scheduler_mutation_performed": submission_trace[
+            "scheduler_mutation_performed"
+        ],
+        "api_pre_submission_readback": copy.deepcopy(
+            submission_trace.get("api_pre_submission_readback")
+        ),
+        "api_post_submission_response": copy.deepcopy(
+            submission_trace.get("api_post_submission_response")
+        ),
+        "api_durable_get_readback": copy.deepcopy(durable_readback),
+        "fallback_allocation_observed": False,
+        "strict_policy_authenticated": True,
+    }
+
+
+def _validate_strict_node_submission_contract(
+    value: Any,
+    *,
+    submission: Mapping[str, Any],
+    plan_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "plan_contract",
+        "submission_source",
+        "scheduler_mutation_performed",
+        "api_pre_submission_readback",
+        "api_post_submission_response",
+        "api_durable_get_readback",
+        "fallback_allocation_observed",
+        "strict_policy_authenticated",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_fields
+        or value.get("schema_version") != STRICT_NODE_SUBMISSION_SCHEMA
+        or value.get("plan_contract") != plan_contract
+        or value.get("fallback_allocation_observed") is not False
+        or value.get("strict_policy_authenticated") is not True
+        or not isinstance(value.get("scheduler_mutation_performed"), bool)
+    ):
+        raise HandoffContractError(
+            "diagnostic strict-node submission contract drifted"
+        )
+    placement = submission.get("scheduler_placement_contract")
+    if placement is None:
+        same_node_id = 0
+        expected_allocation_id = 0
+        expected_slurm_job_id = ""
+        expected_account_name = ""
+    else:
+        same_node_id = placement.get("same_node_as_task_id")
+        expected_allocation_id = placement.get("expected_allocation_id")
+        expected_slurm_job_id = placement.get("expected_slurm_job_id")
+        expected_account_name = placement.get("expected_account_name")
+    evidence_options = {
+        "task_id": submission.get("task_id"),
+        "task_name": str(submission.get("task_name") or ""),
+        "dedupe_key": str(submission.get("dedupe_key") or ""),
+        "node_name": plan_contract["requested_node_name"],
+        "same_node_as_task_id": same_node_id,
+        "expected_allocation_id": expected_allocation_id,
+        "expected_slurm_job_id": expected_slurm_job_id,
+        "expected_account_name": expected_account_name,
+    }
+    pre_raw = value.get("api_pre_submission_readback")
+    post_raw = value.get("api_post_submission_response")
+    durable_raw = value.get("api_durable_get_readback")
+    pre = (
+        _strict_node_task_evidence(pre_raw, **evidence_options)
+        if isinstance(pre_raw, dict)
+        else None
+    )
+    post = (
+        _strict_node_task_evidence(post_raw, **evidence_options)
+        if isinstance(post_raw, dict)
+        else None
+    )
+    if pre is None and post is None:
+        raise HandoffContractError(
+            "diagnostic strict-node submission has no API submission readback"
+        )
+    durable = _strict_node_task_evidence(
+        durable_raw or {}, **evidence_options
+    )
+    source = value.get("submission_source")
+    if (
+        source
+        not in {
+            "post_created",
+            "post_deduped",
+            "pre_submission_reconciliation",
+            "post_rejection_reconciliation",
+            "post_response_reconciliation",
+        }
+        or (
+            source == "post_created"
+            and (
+                value["scheduler_mutation_performed"] is not True
+                or post is None
+            )
+        )
+        or (
+            source == "pre_submission_reconciliation"
+            and (
+                value["scheduler_mutation_performed"] is not False
+                or pre is None
+            )
+        )
+    ):
+        raise HandoffContractError(
+            "diagnostic strict-node submission source drifted"
+        )
+    normalized_trace = {
+        "submission_source": source,
+        "scheduler_mutation_performed": value[
+            "scheduler_mutation_performed"
+        ],
+        "api_pre_submission_readback": pre,
+        "api_post_submission_response": post,
+    }
+    normalized = _strict_node_submission_contract(
+        plan_contract=plan_contract,
+        submission_trace=normalized_trace,
+        durable_readback=durable,
+    )
+    if normalized != value:
+        raise HandoffContractError(
+            "diagnostic strict-node API readback evidence drifted"
+        )
+    return normalized
+
+
 def _submit_standard_plan(
     *,
     plan_path: Path,
@@ -2902,6 +3481,7 @@ def _submit_standard_plan(
 ) -> Path:
     plan, params, selected = _load_plan(plan_path)
     timeout_retry = _plan_is_timeout_retry(plan)
+    strict_node_contract = _plan_strict_node_contract(plan)
     if timeout_retry is not expected_timeout_retry:
         command = (
             "submit-timeout-retry"
@@ -2934,12 +3514,22 @@ def _submit_standard_plan(
             "same-allocation placement requires a timeout retry and the "
             "complete positive anchor identity"
         )
+    if (
+        strict_node_contract is not None
+        and placement_requested
+        and strict_node_contract["requested_node_name"]
+        != str(expected_node_name).strip()
+    ):
+        raise HandoffContractError(
+            "strict-node plan and same-allocation node differ"
+        )
     reauthentication = _fresh_selection_reauthentication(
         plan=plan, selected=selected, predictor=predictor
     )
     cutover, launcher_before = _validate_scheduler_cutover_receipt(
         scheduler_cutover_receipt_path,
         verify_live_launcher=True,
+        require_strict_node=strict_node_contract is not None,
     )
     stage = plan["stage"]
     if cutover["scheduler_url"] != stage["scheduler_url"]:
@@ -2950,7 +3540,14 @@ def _submit_standard_plan(
         scheduler_url=stage["scheduler_url"],
         reader=live_reader,
     )
-    launcher_after = _live_launcher_identity(cutover)
+    launcher_after = _live_launcher_identity(
+        cutover,
+        expected_sha256=(
+            SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
+            if strict_node_contract is not None
+            else SCHEDULER_LIVE_LAUNCHER_SHA256
+        ),
+    )
     if launcher_after != launcher_before:
         raise HandoffContractError(
             "Scheduler live launcher changed during admission checks"
@@ -3011,7 +3608,17 @@ def _submit_standard_plan(
         if placement_requested
         else {}
     )
-    task_id = scheduler.submit_verification(
+    if strict_node_contract is not None:
+        placement_submission_options.update(
+            {
+                "node_name": strict_node_contract[
+                    "requested_node_name"
+                ],
+                "node_name_policy": "strict",
+                "return_submission_evidence": True,
+            }
+        )
+    submission_result = scheduler.submit_verification(
         stage["task_name"],
         stage["workdir"],
         params,
@@ -3028,6 +3635,24 @@ def _submit_standard_plan(
         scheduler_url=stage["scheduler_url"],
         **placement_submission_options,
     )
+    if strict_node_contract is not None:
+        if (
+            not isinstance(submission_result, dict)
+            or set(submission_result)
+            != {
+                "task_id",
+                "submission_source",
+                "scheduler_mutation_performed",
+                "api_pre_submission_readback",
+                "api_post_submission_response",
+            }
+        ):
+            raise HandoffContractError(
+                "strict-node Scheduler submission returned no API evidence"
+            )
+        task_id = submission_result.get("task_id")
+    else:
+        task_id = submission_result
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
         raise HandoffContractError(
             "diagnostic Scheduler submission returned no durable task ID"
@@ -3040,6 +3665,7 @@ def _submit_standard_plan(
             "diagnostic timeout retry resolved to the original task ID"
         )
     placement_contract = None
+    submitted_task_snapshot = None
     if placement_requested:
         anchor_after = _same_allocation_anchor_evidence(
             reader(
@@ -3052,11 +3678,12 @@ def _submit_standard_plan(
             account_name=str(expected_account_name),
             node_name=str(expected_node_name),
         )
+        submitted_task_snapshot = reader(
+            scheduler_url=stage["scheduler_url"],
+            task_id=task_id,
+        )
         submitted_task = _same_allocation_submitted_task_evidence(
-            reader(
-                scheduler_url=stage["scheduler_url"],
-                task_id=task_id,
-            ),
+            submitted_task_snapshot,
             task_id=task_id,
             task_name=stage["task_name"],
             dedupe_key=stage["retained_aedt_bundle"]["dedupe_key"],
@@ -3075,6 +3702,70 @@ def _submit_standard_plan(
             slurm_job_id=str(expected_slurm_job_id),
             account_name=str(expected_account_name),
             node_name=str(expected_node_name),
+        )
+    strict_submission_contract = None
+    if strict_node_contract is not None:
+        if submitted_task_snapshot is None:
+            submitted_task_snapshot = reader(
+                scheduler_url=stage["scheduler_url"],
+                task_id=task_id,
+            )
+        same_node_id = same_node_as_task_id if placement_requested else 0
+        expected_allocation = (
+            expected_allocation_id if placement_requested else 0
+        )
+        expected_job = (
+            str(expected_slurm_job_id) if placement_requested else ""
+        )
+        expected_account = (
+            str(expected_account_name) if placement_requested else ""
+        )
+        evidence_options = {
+            "task_id": task_id,
+            "task_name": stage["task_name"],
+            "dedupe_key": stage["retained_aedt_bundle"]["dedupe_key"],
+            "node_name": strict_node_contract["requested_node_name"],
+            "same_node_as_task_id": same_node_id,
+            "expected_allocation_id": expected_allocation,
+            "expected_slurm_job_id": expected_job,
+            "expected_account_name": expected_account,
+        }
+        raw_pre = submission_result.get("api_pre_submission_readback")
+        raw_post = submission_result.get("api_post_submission_response")
+        normalized_trace = {
+            "submission_source": submission_result["submission_source"],
+            "scheduler_mutation_performed": submission_result[
+                "scheduler_mutation_performed"
+            ],
+            "api_pre_submission_readback": (
+                _strict_node_task_evidence(
+                    raw_pre, **evidence_options
+                )
+                if isinstance(raw_pre, dict)
+                else None
+            ),
+            "api_post_submission_response": (
+                _strict_node_task_evidence(
+                    raw_post, **evidence_options
+                )
+                if isinstance(raw_post, dict)
+                else None
+            ),
+        }
+        if (
+            normalized_trace["api_pre_submission_readback"] is None
+            and normalized_trace["api_post_submission_response"] is None
+        ):
+            raise HandoffContractError(
+                "strict-node Scheduler submission has no API readback"
+            )
+        durable_readback = _strict_node_task_evidence(
+            submitted_task_snapshot, **evidence_options
+        )
+        strict_submission_contract = _strict_node_submission_contract(
+            plan_contract=strict_node_contract,
+            submission_trace=normalized_trace,
+            durable_readback=durable_readback,
         )
     receipt = production._seal(
         {
@@ -3124,6 +3815,15 @@ def _submit_standard_plan(
             **(
                 {"scheduler_placement_contract": placement_contract}
                 if placement_contract is not None
+                else {}
+            ),
+            **(
+                {
+                    "scheduler_strict_node_contract": (
+                        strict_submission_contract
+                    )
+                }
+                if strict_submission_contract is not None
                 else {}
             ),
             **_diagnostic_flags(),
@@ -3196,6 +3896,7 @@ def _load_submission(
     )
     stage = plan["stage"]
     timeout_retry = _plan_is_timeout_retry(plan)
+    strict_node_contract = _plan_strict_node_contract(plan)
     cutover_record = receipt.get("scheduler_cutover_receipt")
     if not isinstance(cutover_record, dict):
         raise HandoffContractError(
@@ -3208,7 +3909,9 @@ def _load_submission(
         )
     cutover, _unused_live_launcher = (
         _validate_scheduler_cutover_receipt(
-            cutover_path, verify_live_launcher=False
+            cutover_path,
+            verify_live_launcher=False,
+            require_strict_node=strict_node_contract is not None,
         )
     )
     admission = _validate_recorded_admission_snapshot(
@@ -3221,7 +3924,12 @@ def _load_submission(
         or not _same_absolute_regular_file_identity(
             launcher.get("path"), cutover["live_launcher_path"]
         )
-        or launcher.get("sha256") != SCHEDULER_LIVE_LAUNCHER_SHA256
+        or launcher.get("sha256")
+        != (
+            SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
+            if strict_node_contract is not None
+            else SCHEDULER_LIVE_LAUNCHER_SHA256
+        )
         or isinstance(launcher.get("size_bytes"), bool)
         or not isinstance(launcher.get("size_bytes"), int)
         or launcher.get("size_bytes") <= 0
@@ -3304,6 +4012,14 @@ def _load_submission(
             not timeout_retry
             and "retry_of_timeout" in receipt
         )
+        or (
+            strict_node_contract is not None
+            and "scheduler_strict_node_contract" not in receipt
+        )
+        or (
+            strict_node_contract is None
+            and "scheduler_strict_node_contract" in receipt
+        )
         or any(
             receipt.get(name) is not value
             for name, value in _diagnostic_flags().items()
@@ -3320,6 +4036,12 @@ def _load_submission(
         _validate_same_allocation_placement_contract(
             receipt.get("scheduler_placement_contract"),
             submission=receipt,
+        )
+    if strict_node_contract is not None:
+        _validate_strict_node_submission_contract(
+            receipt.get("scheduler_strict_node_contract"),
+            submission=receipt,
+            plan_contract=strict_node_contract,
         )
     if receipt.get("core_policy") != {
         "contract": production.STANDARD_CORE_CONTRACT,
@@ -3777,6 +4499,45 @@ def _task_execution_evidence(
             raise HandoffContractError(
                 "diagnostic terminal execution escaped its sealed "
                 "same-allocation placement"
+            )
+    strict = submission.get("scheduler_strict_node_contract")
+    if strict is not None:
+        plan_contract = strict.get("plan_contract")
+        if not isinstance(plan_contract, dict):
+            raise HandoffContractError(
+                "diagnostic strict-node terminal plan contract is absent"
+            )
+        same_node_id = (
+            placement.get("same_node_as_task_id") if placement else 0
+        )
+        expected_allocation_id = (
+            placement.get("expected_allocation_id") if placement else 0
+        )
+        expected_slurm_job_id = (
+            placement.get("expected_slurm_job_id") if placement else ""
+        )
+        expected_account_name = (
+            placement.get("expected_account_name") if placement else ""
+        )
+        strict_terminal = _strict_node_task_evidence(
+            snapshot,
+            task_id=submission["task_id"],
+            task_name=submission["task_name"],
+            dedupe_key=submission["dedupe_key"],
+            node_name=plan_contract["requested_node_name"],
+            same_node_as_task_id=same_node_id,
+            expected_allocation_id=expected_allocation_id,
+            expected_slurm_job_id=expected_slurm_job_id,
+            expected_account_name=expected_account_name,
+        )
+        if (
+            strict_terminal["allocation_id"] != evidence["allocation_id"]
+            or strict_terminal["actual_node_name"]
+            != evidence["actual_node_name"]
+            or strict_terminal["slurm_job_id"] != evidence["slurm_job_id"]
+        ):
+            raise HandoffContractError(
+                "diagnostic terminal strict-node evidence drifted"
             )
     return evidence
 
@@ -4262,6 +5023,14 @@ def _parser() -> argparse.ArgumentParser:
     retry_plan.add_argument(
         "--scheduler-url", default=DIAGNOSTIC_SCHEDULER_URL
     )
+    retry_plan.add_argument(
+        "--strict-node-name",
+        default="",
+        help=(
+            "opt into Scheduler fail-closed exact-node placement and a "
+            "distinct timeout-strict-r2 identity"
+        ),
+    )
     retry_plan.add_argument("--output", type=Path, required=True)
 
     submit = commands.add_parser("submit-standard")
@@ -4330,6 +5099,7 @@ def main(argv: list[str] | None = None) -> int:
             original_plan_path=args.original_plan,
             original_submission_path=args.original_submission,
             scheduler_url=args.scheduler_url,
+            strict_node_name=args.strict_node_name,
             output=args.output,
         )
     elif args.command == "submit-standard":
