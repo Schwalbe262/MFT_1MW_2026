@@ -1287,6 +1287,7 @@ def submit_verification(
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
         same_node_as_task_id=0, node_name_policy="",
+        submission_env_after_workdir=False, required_workdir_prefix="",
         return_submission_evidence=False, pre_submit_guard=None,
         max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
         scheduler_url=None):
@@ -1308,6 +1309,12 @@ def submit_verification(
         submission_options["same_node_as_task_id"] = same_node_as_task_id
     if node_name_policy not in (None, ""):
         submission_options["node_name_policy"] = node_name_policy
+    if submission_env_after_workdir:
+        submission_options["submission_env_after_workdir"] = True
+    if required_workdir_prefix:
+        submission_options["required_workdir_prefix"] = (
+            required_workdir_prefix
+        )
     if return_submission_evidence:
         submission_options["return_submission_evidence"] = True
     if pre_submit_guard is not None:
@@ -1352,6 +1359,7 @@ def _submit_verification_locked(
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
         same_node_as_task_id=0, node_name_policy="",
+        submission_env_after_workdir=False, required_workdir_prefix="",
         return_submission_evidence=False, pre_submit_guard=None,
         max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
         scheduler_url=None):
@@ -1399,6 +1407,21 @@ def _submit_verification_locked(
         raise TypeError("return_submission_evidence must be a bool")
     if pre_submit_guard is not None and not callable(pre_submit_guard):
         raise TypeError("pre_submit_guard must be callable")
+    if not isinstance(submission_env_after_workdir, bool):
+        raise TypeError("submission_env_after_workdir must be a bool")
+    if not isinstance(required_workdir_prefix, str):
+        raise TypeError("required_workdir_prefix must be a string")
+    if required_workdir_prefix and (
+        not submission_env_after_workdir
+        or not required_workdir_prefix.startswith("/")
+        or not required_workdir_prefix.endswith("/")
+        or re.fullmatch(r"/[A-Za-z0-9._/-]+/", required_workdir_prefix)
+        is None
+    ):
+        raise ValueError(
+            "required_workdir_prefix requires deferred environment and an "
+            "absolute literal directory prefix"
+        )
     if (isinstance(max_workers_per_node, bool)
             or not isinstance(max_workers_per_node, int)
             or max_workers_per_node < 0):
@@ -1421,10 +1444,20 @@ def _submit_verification_locked(
     dedupe_key = identity["dedupe_key"]
     if aedt_backend is not None and aedt_backend not in {"standalone", "pooled"}:
         raise ValueError("aedt_backend must be standalone or pooled")
+    if submission_env_after_workdir and aedt_backend != "standalone":
+        raise ValueError(
+            "deferred submission environment is standalone-only"
+        )
     normalized_env = _normalized_submission_env(submission_env)
-    env_exports = "".join(
+    normalized_env_exports = "".join(
         f"export {key}={_shell_double_quote_expandable(value)}; "
         for key, value in sorted(normalized_env.items())
+    )
+    env_exports = (
+        "" if submission_env_after_workdir else normalized_env_exports
+    )
+    post_workdir_env_exports = (
+        normalized_env_exports if submission_env_after_workdir else ""
     )
     pooled_env_setup = "\n".join(
         f"export {key}={_shell_double_quote_expandable(value)}"
@@ -1501,6 +1534,14 @@ def _submit_verification_locked(
             "else MFT_WORKDIR=$MFT_GPFS_WORKDIR; fi; "
             "printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; "
         )
+    workdir_assertion = ""
+    if required_workdir_prefix:
+        workdir_assertion = (
+            'case "$MFT_WORKDIR" in '
+            f"{required_workdir_prefix}*) ;; "
+            "*) printf 'MFT_WORKDIR_ASSERTION_FAILED %s\\n' "
+            '"$MFT_WORKDIR" >&2; exit 86;; esac; '
+        )
     lib_clone = (f"([ -d {quoted_library}/.git ] || {{ [ ! -e {quoted_library} ] && "
                  "git clone -q --depth 1 "
                  f"https://github.com/Schwalbe262/pyaedt_library.git {quoted_library}.tmp.$$ "
@@ -1562,7 +1603,9 @@ def _submit_verification_locked(
     task_root_setup = "MFT_TASK_ROOT=$PWD; " if retained is not None else ""
     cmd = (
         BASE
-        + f"( {task_root_setup}{select_workdir}cleanup() {{ rm -rf -- {cleanup_workdirs} 2>/dev/null; }}; "
+        + f"( {task_root_setup}{select_workdir}{workdir_assertion}"
+        + f"{post_workdir_env_exports}"
+        + f"cleanup() {{ rm -rf -- {cleanup_workdirs} 2>/dev/null; }}; "
         + "trap cleanup EXIT; trap 'exit 143' TERM INT; "
         + run_group
         + " )"

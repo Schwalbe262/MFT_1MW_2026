@@ -1206,6 +1206,14 @@ def _load_plan(
     plan = production._validate_seal(
         production._read_json(resolved), PLAN_SCHEMA
     )
+    startup_successor = isinstance(
+        plan.get("startup_successor"), Mapping
+    )
+    expected_commands = (
+        ["submit-startup-retry"]
+        if startup_successor
+        else ["submit-timeout12h-retry"]
+    )
     if (
         plan.get("campaign_id") != "mft-goal-20260726"
         or plan.get("goal_contract_schema") != GOAL_CONTRACT_SCHEMA
@@ -1213,8 +1221,7 @@ def _load_plan(
         or plan.get("hard_spec_sha256") != GOAL_STAGE_SPEC_SHA256
         or plan.get("temperature_contract_sha256")
         != GOAL_TEMPERATURE_CONTRACT_SHA256
-        or plan.get("available_submission_commands")
-        != ["submit-timeout12h-retry"]
+        or plan.get("available_submission_commands") != expected_commands
         or plan.get("physics_override_allowed") is not False
         or plan.get("scheduler_repository_modified") is not False
         or plan.get("scheduler_project_mutation_performed") is not False
@@ -1275,15 +1282,24 @@ def _load_plan(
     strict_contract = probe._validate_strict_node_plan_contract(
         plan.get("scheduler_strict_node_contract")
     )
-    expected_task_name, expected_workdir = _task_identity(
-        logical_authority_task_id=plan["retry_of_timeout12h"][
-            "logical_authority_task_id"
-        ],
-        candidate_physics_sha256=plan["candidate_physics_sha256"],
-        retry_generation=plan["retry_of_timeout12h"][
-            "retry_generation"
-        ],
-    )
+    if startup_successor:
+        from tools import mft_goal_startup_retry
+
+        expected_task_name, expected_workdir = (
+            mft_goal_startup_retry._task_identity(
+                plan["candidate_physics_sha256"]
+            )
+        )
+    else:
+        expected_task_name, expected_workdir = _task_identity(
+            logical_authority_task_id=plan["retry_of_timeout12h"][
+                "logical_authority_task_id"
+            ],
+            candidate_physics_sha256=plan["candidate_physics_sha256"],
+            retry_generation=plan["retry_of_timeout12h"][
+                "retry_generation"
+            ],
+        )
     retained = scheduler_client.retained_aedt_identity(
         expected_task_name,
         params,
@@ -1339,6 +1355,14 @@ def _load_plan(
     ):
         raise HandoffContractError(
             "timeout12h fixed physics changed"
+        )
+    if startup_successor:
+        mft_goal_startup_retry.validate_plan_overlay(
+            plan_path=resolved,
+            plan=plan,
+            params=params,
+            selected=selected,
+            profile=profile,
         )
     return plan, params, selected, immediate_submission
 
@@ -2143,6 +2167,12 @@ def _validate_claim_receipt(
 def _load_submission(
     path: Path, *, plan: Mapping[str, Any]
 ) -> dict[str, Any]:
+    if isinstance(plan.get("startup_successor"), Mapping):
+        from tools import mft_goal_startup_retry
+
+        return mft_goal_startup_retry.load_submission_for_probe(
+            path, plan=plan
+        )
     resolved = path.resolve(strict=True)
     receipt = production._validate_seal(
         production._read_json(resolved), SUBMISSION_SCHEMA

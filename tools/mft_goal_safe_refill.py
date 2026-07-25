@@ -836,7 +836,19 @@ def _extension_receipt(
 def authenticate_watcher_extension_receipt(
     path: Path, *, authority: Mapping[str, Any]
 ) -> dict[str, Any]:
-    value = _validate_seal(_read_json(path), EXTENSION_RECEIPT_SCHEMA)
+    raw = _read_json(path)
+    if raw.get("schema_version") == (
+        "mft-goal-watcher-authorized-replacement-v1"
+    ):
+        from tools import mft_goal_startup_retry
+
+        return (
+            mft_goal_startup_retry
+            .authenticate_watcher_replacement_receipt(
+                path, authority=authority
+            )
+        )
+    value = _validate_seal(raw, EXTENSION_RECEIPT_SCHEMA)
     authority_path = Path(value["extension_authority"]["path"])
     if (
         production._file_record(authority_path)
