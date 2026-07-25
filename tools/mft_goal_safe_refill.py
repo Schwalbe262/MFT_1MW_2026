@@ -928,6 +928,7 @@ def _cycle_locked(
     storage_reader: Callable[[Mapping[str, Any]], dict[str, Any]] = _fresh_storage,
     submitter: Callable[..., Path] = timeout12h.submit,
     validate_cutover: bool = True,
+    gate_evaluator: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     plan = load_plan(refill_plan_path)
     authenticate_extension_authority(
@@ -959,7 +960,8 @@ def _cycle_locked(
                 pending_recovery.append((candidate, paths))
     if len(pending_recovery) > 1:
         raise SafeRefillError("more than one refill recovery is pending")
-    evaluation = _evaluate(
+    evaluator = gate_evaluator or _evaluate
+    evaluation = evaluator(
         plan,
         task_reader=task_reader,
         capacity_reader=capacity_reader,
@@ -1038,7 +1040,7 @@ def _cycle_locked(
             )
         action = "claim_recovered_and_watcher_extended"
     elif authorize_submit and selected_id is not None:
-        fresh = _evaluate(
+        fresh = evaluator(
             plan,
             task_reader=task_reader,
             capacity_reader=capacity_reader,
@@ -1072,7 +1074,7 @@ def _cycle_locked(
             _write_immutable(paths["intent"], intent)
 
         def final_guard() -> None:
-            guarded = _evaluate(
+            guarded = evaluator(
                 plan,
                 task_reader=task_reader,
                 capacity_reader=capacity_reader,
@@ -1175,6 +1177,7 @@ def cycle(
     storage_reader: Callable[[Mapping[str, Any]], dict[str, Any]] = _fresh_storage,
     submitter: Callable[..., Path] = timeout12h.submit,
     validate_cutover: bool = True,
+    gate_evaluator: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     plan = load_plan(refill_plan_path)
     lock_path = Path(plan["output_root"]) / "safe_refill.lock"
@@ -1188,6 +1191,7 @@ def cycle(
             storage_reader=storage_reader,
             submitter=submitter,
             validate_cutover=validate_cutover,
+            gate_evaluator=gate_evaluator,
         )
 
 
