@@ -66,6 +66,9 @@ COLLECTION_SCHEMA = "mft-goal-diagnostic-standard-collection-v1"
 AUTHENTICATED_COLLECTION_SCHEMA = (
     "mft-goal-diagnostic-standard-authenticated-collection-v1"
 )
+DEPENDENCY_FAILURE_COLLECTION_LINEAGE_SCHEMA = (
+    "mft-goal-diagnostic-standard-dependency-failure-lineage-v1"
+)
 SCHEDULER_CUTOVER_SCHEMA = (
     "slurm-scheduler-prune-protection-cutover-receipt-v1"
 )
@@ -8745,6 +8748,41 @@ def _task_execution_evidence(
         "remote_dir": snapshot.get("remote_dir"),
         "finished_at": snapshot.get("finished_at"),
     }
+    if submission.get("scheduler_strict_node_contract") is not None:
+        evidence.update(
+            {
+                "scheduling_profile": snapshot.get(
+                    "scheduling_profile"
+                ),
+                "node_name": snapshot.get("node_name"),
+                "requested_node_name": snapshot.get(
+                    "requested_node_name"
+                ),
+                "node_name_policy": snapshot.get("node_name_policy"),
+                "requested_node_name_policy": snapshot.get(
+                    "requested_node_name_policy"
+                ),
+                "strict_node_placement": snapshot.get(
+                    "strict_node_placement"
+                ),
+                "placement_contract_satisfied": snapshot.get(
+                    "placement_contract_satisfied"
+                ),
+                "assigned_allocation": snapshot.get(
+                    "assigned_allocation", snapshot.get("allocation_id")
+                ),
+                "allocation_node_name": snapshot.get(
+                    "allocation_node_name"
+                ),
+                "requested_account_name": snapshot.get(
+                    "requested_account_name"
+                ),
+                "same_node_as_task_id": snapshot.get(
+                    "same_node_as_task_id", 0
+                ),
+                "started_at": snapshot.get("started_at"),
+            }
+        )
     allocation_id = evidence["allocation_id"]
     if (
         evidence["task_id"] != submission["task_id"]
@@ -8857,6 +8895,145 @@ def _selected_candidate_identity(
     }
 
 
+def _dependency_retry_module() -> Any:
+    # Imported lazily because the dependency retry tool uses this module's
+    # original/timeout validators to prove its ancestry.
+    from tools import mft_goal_dependency_failure_retry
+
+    return mft_goal_dependency_failure_retry
+
+
+def _load_collectible_plan(
+    path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    resolved = path.resolve(strict=True)
+    raw = production._read_json(resolved)
+    schema = raw.get("schema_version")
+    if schema == PLAN_SCHEMA:
+        return _load_plan(resolved)
+    dependency = _dependency_retry_module()
+    if schema == dependency.PLAN_SCHEMA:
+        plan, params, selected, _parent, _anchor = dependency._load_plan(
+            resolved
+        )
+        return plan, params, selected
+    raise HandoffContractError(
+        "diagnostic collection plan schema is unsupported"
+    )
+
+
+def _load_collectible_submission(
+    path: Path,
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    resolved = path.resolve(strict=True)
+    raw = production._read_json(resolved)
+    plan_schema = plan.get("schema_version")
+    submission_schema = raw.get("schema_version")
+    if (
+        plan_schema == PLAN_SCHEMA
+        and submission_schema == SUBMISSION_SCHEMA
+    ):
+        return _load_submission(resolved, plan=plan)
+    dependency = _dependency_retry_module()
+    if (
+        plan_schema == dependency.PLAN_SCHEMA
+        and submission_schema == dependency.SUBMISSION_SCHEMA
+    ):
+        return dependency._load_submission(resolved, plan=plan)
+    raise HandoffContractError(
+        "diagnostic collection plan/submission schemas are mixed"
+    )
+
+
+def _dependency_collection_lineage(
+    plan: Mapping[str, Any],
+    submission: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    dependency = _dependency_retry_module()
+    if plan.get("schema_version") != dependency.PLAN_SCHEMA:
+        return None
+    if submission.get("schema_version") != dependency.SUBMISSION_SCHEMA:
+        raise HandoffContractError(
+            "dependency-failure collection submission schema drifted"
+        )
+    record = plan.get("retry_of_dependency_failure")
+    claim_receipt = submission.get("dependency_failure_atomic_claim")
+    strict_receipt = submission.get("scheduler_strict_node_contract")
+    if (
+        not isinstance(record, Mapping)
+        or not isinstance(claim_receipt, Mapping)
+        or not isinstance(strict_receipt, Mapping)
+        or not isinstance(claim_receipt.get("finalized_claim"), Mapping)
+    ):
+        raise HandoffContractError(
+            "dependency-failure collection lineage is absent"
+        )
+    finalized = claim_receipt["finalized_claim"]
+    timeout_plan_path = _recorded_external_file(
+        record["original_plan"],
+        "dependency-failure timeout-parent plan",
+    )
+    timeout_plan = production._validate_seal(
+        production._read_json(timeout_plan_path), PLAN_SCHEMA
+    )
+    timeout_record = timeout_plan.get("retry_of_timeout")
+    if not isinstance(timeout_record, Mapping):
+        raise HandoffContractError(
+            "dependency-failure logical original lineage is absent"
+        )
+    lineage = {
+        "schema_version": (
+            DEPENDENCY_FAILURE_COLLECTION_LINEAGE_SCHEMA
+        ),
+        "retry_generation": dependency.RETRY_GENERATION,
+        "logical_authority_task_id": record[
+            "logical_authority_task_id"
+        ],
+        "timeout_parent_task_id": record["retry_of_task_id"],
+        "dependency_anchor_task_id": record[
+            "dependency_anchor_task_id"
+        ],
+        "scheduler_task_id": submission["task_id"],
+        "immediate_parent_ancestry_sha256": record[
+            "immediate_parent_ancestry_sha256"
+        ],
+        "timeout_plan_payload_sha256": record[
+            "original_plan_payload_sha256"
+        ],
+        "timeout_submission_payload_sha256": record[
+            "original_submission_payload_sha256"
+        ],
+        "logical_original_plan_payload_sha256": timeout_record[
+            "original_plan_payload_sha256"
+        ],
+        "logical_original_submission_payload_sha256": timeout_record[
+            "original_submission_payload_sha256"
+        ],
+        "atomic_claim_payload_sha256": finalized["payload_sha256"],
+        "strict_node_name": dependency.REQUIRED_STRICT_NODE_NAME,
+        "same_node_as_task_id": strict_receipt["same_node_as_task_id"],
+        "exact_original_timeout_dependency_lineage_authenticated": True,
+        "finalized_atomic_claim_authenticated": True,
+        "direct_strict_node_placement_authenticated": True,
+    }
+    if (
+        lineage["logical_authority_task_id"]
+        == lineage["timeout_parent_task_id"]
+        or lineage["logical_authority_task_id"]
+        == lineage["scheduler_task_id"]
+        or lineage["timeout_parent_task_id"]
+        == lineage["scheduler_task_id"]
+        or lineage["same_node_as_task_id"] != 0
+        or lineage["strict_node_name"] != "n114"
+    ):
+        raise HandoffContractError(
+            "dependency-failure collection lineage task IDs drifted"
+        )
+    return lineage
+
+
 def _truth_evidence(
     *,
     result: Mapping[str, Any],
@@ -8892,7 +9069,7 @@ def _truth_evidence(
         for name in GOAL_TEMPERATURE_TARGETS
         if name in result and not pd.isna(result.get(name))
     }
-    return {
+    truth = {
         "candidate_physics_sha256": plan["candidate_physics_sha256"],
         "canonical_physical_params_sha256": selected["row_contract"][
             "canonical_physical_params_sha256"
@@ -8950,6 +9127,10 @@ def _truth_evidence(
         },
         **_diagnostic_flags(),
     }
+    dependency_lineage = _dependency_collection_lineage(plan, submission)
+    if dependency_lineage is not None:
+        truth["retry_lineage"] = dependency_lineage
+    return truth
 
 
 def collect_standard(
@@ -8963,8 +9144,10 @@ def collect_standard(
     manifest_reader: Any = _remote_manifest_bytes,
     task_reader: Any = _scheduler_task_snapshot,
 ) -> Path:
-    plan, params, selected = _load_plan(plan_path)
-    submission = _load_submission(submission_path, plan=plan)
+    plan, params, selected = _load_collectible_plan(plan_path)
+    submission = _load_collectible_submission(
+        submission_path, plan=plan
+    )
     normalized_scheduler_url = scheduler_url.rstrip("/")
     if normalized_scheduler_url != submission["scheduler_url"]:
         raise HandoffContractError(
@@ -9141,8 +9324,10 @@ def _load_collection(
         raise HandoffContractError(
             "diagnostic collection reference bytes drifted"
         )
-    plan, params, selected = _load_plan(plan_path)
-    submission = _load_submission(submission_path, plan=plan)
+    plan, params, selected = _load_collectible_plan(plan_path)
+    submission = _load_collectible_submission(
+        submission_path, plan=plan
+    )
     refreshed = _fresh_selection_reauthentication(
         plan=plan, selected=selected, predictor=predictor
     )

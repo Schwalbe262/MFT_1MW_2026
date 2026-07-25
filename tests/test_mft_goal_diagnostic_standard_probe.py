@@ -236,7 +236,7 @@ class _FakeScheduler:
 
 
 def _result(plan_path: Path, submission):
-    plan, params, selected = probe._load_plan(plan_path)
+    plan, params, selected = probe._load_collectible_plan(plan_path)
     profile = production._read_json(
         plan_path.parent / plan["profile"]["path"]
     )
@@ -3843,3 +3843,124 @@ def test_dependency_failure_retry_is_direct_strict_and_exact_once(
     assert recovered["dependency_failure_atomic_claim"][
         "recovered_without_scheduler_submit_call"
     ] is True
+    loaded_recovered = dependency_retry._load_submission(
+        recovered_path, plan=dependency_plan
+    )
+    assert loaded_recovered["scheduler_strict_node_contract"][
+        "submission_source"
+    ] == "pre_submission_reconciliation"
+
+    loaded_submission = dependency_retry._load_submission(
+        submission_path, plan=dependency_plan
+    )
+    assert loaded_submission["task_id"] == 71003
+    assert loaded_submission["scheduler_strict_node_contract"][
+        "same_node_as_task_id"
+    ] == 0
+
+    tampered_submission = copy.deepcopy(loaded_submission)
+    tampered_submission.pop("payload_sha256")
+    tampered_submission["dependency_failure_atomic_claim"][
+        "finalized_claim"
+    ]["task_id"] = 71999
+    tampered_path = production._write_immutable_json(
+        tmp_path / "tampered-dependency-submission.json",
+        production._seal(tampered_submission),
+    )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="finalized atomic claim drifted",
+    ):
+        dependency_retry._load_submission(
+            tampered_path, plan=dependency_plan
+        )
+
+    terminal = {
+        **dependency_post,
+        "status": "completed",
+        "state": "succeeded",
+        "exit_code": 0,
+        "failure_message": "",
+        "allocation_id": 9004,
+        "assigned_allocation": 9004,
+        "allocation_node_name": "n114",
+        "actual_node_name": "n114",
+        "slurm_job_id": "81314",
+        "account_name": "r1jae262",
+        "placement_contract_satisfied": True,
+        "started_at": "2026-07-25 07:36:00",
+        "finished_at": "2026-07-25 08:01:00",
+        "remote_cwd": "/gpfs/r1jae262/slurm_scheduler/runs",
+        "remote_dir": "mft_goal_diag_dependency_71003",
+    }
+    collection_scheduler = _FakeScheduler()
+    collection_scheduler.result = _result(
+        dependency_plan_path, loaded_submission
+    )
+    metadata_reader, manifest_reader = _remote_evidence(
+        loaded_submission, collection_scheduler.result
+    )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="strict-node Scheduler identity drifted",
+    ):
+        probe.collect_standard(
+            plan_path=dependency_plan_path,
+            submission_path=submission_path,
+            output=tmp_path / "wrong-node-dependency-collection.json",
+            scheduler=collection_scheduler,
+            remote_reader=metadata_reader,
+            manifest_reader=manifest_reader,
+            task_reader=lambda **_kwargs: {
+                **terminal,
+                "node_name": "n113",
+            },
+        )
+    collection_path = probe.collect_standard(
+        plan_path=dependency_plan_path,
+        submission_path=submission_path,
+        output=tmp_path / "dependency-collection.json",
+        scheduler=collection_scheduler,
+        remote_reader=metadata_reader,
+        manifest_reader=manifest_reader,
+        task_reader=lambda **_kwargs: terminal,
+    )
+    view = probe.authenticate_collection(
+        collection_path, predictor=_Predictor()
+    )
+    lineage = view["collection"]["truth_evidence"]["retry_lineage"]
+    assert lineage["logical_authority_task_id"] == 71001
+    assert lineage["timeout_parent_task_id"] == 71002
+    assert lineage["dependency_anchor_task_id"] == 72000
+    assert lineage["scheduler_task_id"] == 71003
+    assert lineage["timeout_plan_payload_sha256"] == (
+        timeout_plan["payload_sha256"]
+    )
+    assert lineage["logical_original_plan_payload_sha256"] == (
+        base_plan["payload_sha256"]
+    )
+    assert lineage[
+        "logical_original_submission_payload_sha256"
+    ] == base_submission["payload_sha256"]
+    assert lineage["strict_node_name"] == "n114"
+    assert lineage["same_node_as_task_id"] == 0
+    assert lineage[
+        "exact_original_timeout_dependency_lineage_authenticated"
+    ] is True
+    assert lineage["finalized_atomic_claim_authenticated"] is True
+    assert view["collection"]["scheduler_task_execution"]["state"] == (
+        "succeeded"
+    )
+    assert view["collection"]["scheduler_task_execution"]["exit_code"] == 0
+    assert view["params"]["fan_velocity"] == 1.5
+    assert view["params"]["wcp_pad_t"] == 2.0
+    assert view["params"]["core_plate_pad_t"] == 2.0
+
+    monkeypatch.setattr(
+        probe,
+        "_load_llt_predictor",
+        lambda _identity: _Predictor(),
+    )
+    strict_truth = strict_al.authenticate_collection(collection_path)
+    assert strict_truth.adapter_kind == "diagnostic"
+    assert strict_truth.collection["task_id"] == 71003

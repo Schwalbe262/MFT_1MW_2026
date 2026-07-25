@@ -54,6 +54,7 @@ PROFILE_SCHEMA = (
     "mft-goal-diagnostic-standard-dependency-failure-retry-profile-v1"
 )
 RETRY_GENERATION = "dependency-failure-r1"
+REQUIRED_STRICT_NODE_NAME = "n114"
 FAILURE_CLASS = "scheduler_same_node_dependency_failed"
 DEPENDENCY_FAILURE_TEMPLATE = "same_node_as task {anchor_task_id} is failed"
 ANCHOR_FAILURE_CLASS = "native_thermal_nonconvergence"
@@ -98,6 +99,48 @@ def _flags() -> dict[str, bool]:
         "full_submission_allowed": False,
         "production_package_allowed": False,
     }
+
+
+SUBMISSION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "payload_sha256",
+        "stage",
+        "plan",
+        "plan_payload_sha256",
+        "candidate_physics_sha256",
+        "search_authority_reauthentication",
+        "task_id",
+        "task_name",
+        "workdir",
+        "dedupe_key",
+        "solver_revision",
+        "library_revision",
+        "profile_sha256",
+        "effective_params_sha256",
+        "resources",
+        "aedt_backend",
+        "core_policy",
+        "retained_aedt_bundle",
+        "retention_run_root",
+        "retry_of_dependency_failure",
+        "dependency_failure_sibling_guard",
+        "dependency_failure_atomic_claim",
+        "scheduler_strict_node_contract",
+        "scheduler_cutover_receipt",
+        "scheduler_cutover_payload_sha256",
+        "scheduler_live_launcher_identity",
+        "scheduler_admission_snapshot",
+        "scheduler_url",
+        "scheduler_project",
+        "scheduler_project_mutation_performed",
+        "scheduler_repository_modified",
+        "scheduler_submission_performed",
+        "retention_required",
+        "prune_protection_required",
+        *_flags(),
+    }
+)
 
 
 def _positive_int(value: Any, label: str) -> int:
@@ -543,9 +586,11 @@ def create_plan(
     if (
         normalized_url != probe.DIAGNOSTIC_SCHEDULER_URL
         or normalized_url != immediate_submission["scheduler_url"]
+        or strict_node_name != REQUIRED_STRICT_NODE_NAME
     ):
         raise HandoffContractError(
-            "dependency-failure Scheduler origin drifted"
+            "dependency-failure Scheduler origin or required n114 "
+            "placement drifted"
         )
     expected_anchor = _placement_anchor_identity(immediate_submission)
     anchor_id = _positive_int(
@@ -908,7 +953,10 @@ def _load_plan(
     strict_contract = plan.get("scheduler_strict_node_contract")
     probe._strict_node_scheduler_pin(strict_contract)
     if (
-        strict_contract.get("task_identity_generation")
+        strict_contract.get("requested_node_name")
+        != REQUIRED_STRICT_NODE_NAME
+        or strict_contract.get("node_name_policy") != "strict"
+        or strict_contract.get("task_identity_generation")
         != probe.DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION
         or profile_record.get("canonical_sha256")
         != canonical_sha256(profile)
@@ -1551,6 +1599,440 @@ def submit(
         }
     )
     return production._write_immutable_json(target, receipt)
+
+
+def _validate_submission_reauthentication(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    selected: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "search_authority_sha256",
+        "selection_manifest_sha256",
+        "source_result_sha256",
+        "task_payload_sha256",
+        "fresh_candidate_reauthenticated",
+        *_flags(),
+    }
+    source = selected.get("selection_source")
+    selection_record = (
+        source.get("selection_manifest")
+        if isinstance(source, Mapping)
+        else None
+    )
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected_fields
+        or not isinstance(selection_record, Mapping)
+        or value.get("schema_version")
+        != "mft-goal-diagnostic-standard-submit-reauth-v1"
+        or value.get("search_authority_sha256")
+        != plan.get("search_authority_sha256")
+        or value.get("selection_manifest_sha256")
+        != selection_record.get("sha256")
+        or value.get("source_result_sha256")
+        != selected.get("source_result", {}).get("sha256")
+        or value.get("task_payload_sha256")
+        != selected.get("task_payload", {}).get("sha256")
+        or value.get("fresh_candidate_reauthenticated") is not True
+        or any(
+            value.get(name) is not expected
+            for name, expected in _flags().items()
+        )
+    ):
+        raise HandoffContractError(
+            "dependency-failure submission source "
+            "reauthentication drifted"
+        )
+    return copy.deepcopy(dict(value))
+
+
+def _validate_submission_sibling_guard(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    task_id: int,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value)
+        != {
+            "schema_version",
+            "before_submission",
+            "after_submission",
+            "exactly_one_sibling_after_submission",
+        }
+        or value.get("schema_version") != SIBLING_GUARD_SCHEMA
+        or value.get("exactly_one_sibling_after_submission") is not True
+    ):
+        raise HandoffContractError(
+            "dependency-failure submission sibling guard is malformed"
+        )
+    before = value.get("before_submission")
+    after = value.get("after_submission")
+    if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+        raise HandoffContractError(
+            "dependency-failure sibling snapshots are absent"
+        )
+    normalized_before = _sibling_snapshot(
+        before.get("matching_tasks"), plan=plan
+    )
+    normalized_after = _sibling_snapshot(
+        after.get("matching_tasks"), plan=plan
+    )
+    normalized = _sibling_contract(
+        before=normalized_before,
+        after=normalized_after,
+        task_id=task_id,
+    )
+    if (
+        normalized_before != before
+        or normalized_after != after
+        or normalized != value
+    ):
+        raise HandoffContractError(
+            "dependency-failure sibling guard evidence drifted"
+        )
+    return normalized
+
+
+def _validate_submission_claim(
+    value: Any,
+    *,
+    plan_path: Path,
+    plan: Mapping[str, Any],
+    task_id: int,
+    sibling_guard: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "acquisition_status",
+        "fresh_claim_authorized_scheduler_submit_call",
+        "recovered_without_scheduler_submit_call",
+        "finalized_claim",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise HandoffContractError(
+            "dependency-failure atomic claim receipt is malformed"
+        )
+    status = value.get("acquisition_status")
+    fresh = status == "fresh_pending"
+    if (
+        value.get("schema_version") != CLAIM_RECEIPT_SCHEMA
+        or status
+        not in {
+            "fresh_pending",
+            "existing_pending",
+            "existing_finalized",
+        }
+        or value.get("fresh_claim_authorized_scheduler_submit_call")
+        is not fresh
+        or value.get("recovered_without_scheduler_submit_call")
+        is not (not fresh)
+    ):
+        raise HandoffContractError(
+            "dependency-failure atomic claim receipt semantics drifted"
+        )
+    reference = _validate_claim_reference(plan)
+    winner = _claim_winner(plan_path, plan)
+    finalized_claim = value.get("finalized_claim")
+    try:
+        finalized = atomic_claim.validate_finalized_claim(
+            CLAIM_ROOT,
+            reference,
+            claim=finalized_claim,
+            expected_winner=winner,
+        )
+        normalized_task = _claim_task_evidence(
+            finalized["task_readback"],
+            finalized["pending_claim"],
+        )
+    except atomic_claim.ClaimContractError as exc:
+        raise HandoffContractError(
+            "dependency-failure finalized atomic claim drifted"
+        ) from exc
+    if (
+        finalized != finalized_claim
+        or finalized["task_id"] != task_id
+        or normalized_task != finalized["task_readback"]
+        or finalized["sibling_snapshot"]
+        != sibling_guard["after_submission"]
+    ):
+        raise HandoffContractError(
+            "dependency-failure finalized claim lineage drifted"
+        )
+    return copy.deepcopy(dict(value))
+
+
+def _validate_submission_strict_node(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    finalized_claim: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_fields = {
+        "plan_contract",
+        "submission_source",
+        "scheduler_mutation_performed",
+        "api_pre_submission_readback",
+        "api_post_submission_response",
+        "api_durable_get_readback",
+        "direct_strict_node_policy_authenticated",
+        "same_node_as_task_id",
+    }
+    plan_contract = plan["scheduler_strict_node_contract"]
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected_fields
+        or value.get("plan_contract") != plan_contract
+        or value.get("direct_strict_node_policy_authenticated") is not True
+        or value.get("same_node_as_task_id") != 0
+        or not isinstance(value.get("scheduler_mutation_performed"), bool)
+    ):
+        raise HandoffContractError(
+            "dependency-failure direct strict-node receipt drifted"
+        )
+    pending = finalized_claim.get("pending_claim")
+    if not isinstance(pending, Mapping):
+        raise HandoffContractError(
+            "dependency-failure finalized pending claim is absent"
+        )
+
+    def validate_readback(raw: Any) -> dict[str, Any] | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise HandoffContractError(
+                "dependency-failure strict-node readback is malformed"
+            )
+        try:
+            normalized_claim = _claim_task_evidence(raw, pending)
+        except atomic_claim.ClaimContractError as exc:
+            raise HandoffContractError(
+                "dependency-failure strict-node claim identity drifted"
+            ) from exc
+        probe._strict_node_task_evidence(
+            raw,
+            task_id=int(submission["task_id"]),
+            task_name=str(submission["task_name"]),
+            dedupe_key=str(submission["dedupe_key"]),
+            node_name=REQUIRED_STRICT_NODE_NAME,
+            same_node_as_task_id=0,
+            expected_timeout_seconds=RESOURCES["timeout_seconds"],
+        )
+        if normalized_claim != raw:
+            raise HandoffContractError(
+                "dependency-failure strict-node readback normalization "
+                "drifted"
+            )
+        return copy.deepcopy(dict(raw))
+
+    pre = validate_readback(value.get("api_pre_submission_readback"))
+    post = validate_readback(value.get("api_post_submission_response"))
+    durable = validate_readback(value.get("api_durable_get_readback"))
+    source = value.get("submission_source")
+    mutation = value["scheduler_mutation_performed"]
+    if (
+        durable is None
+        or (pre is None and post is None)
+        or source
+        not in {
+            "post_created",
+            "post_deduped",
+            "pre_submission_reconciliation",
+            "post_rejection_reconciliation",
+            "post_response_reconciliation",
+        }
+        or (source == "post_created" and (mutation is not True or post is None))
+        or (
+            source == "pre_submission_reconciliation"
+            and (mutation is not False or pre is None)
+        )
+    ):
+        raise HandoffContractError(
+            "dependency-failure strict-node submission source drifted"
+        )
+    return copy.deepcopy(dict(value))
+
+
+def _load_submission(
+    path: Path,
+    *,
+    plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    resolved = path.resolve(strict=True)
+    receipt = production._validate_seal(
+        production._read_json(resolved), SUBMISSION_SCHEMA
+    )
+    if set(receipt) != SUBMISSION_FIELDS:
+        raise HandoffContractError(
+            "dependency-failure submission fields drifted"
+        )
+    plan_record = receipt.get("plan")
+    if not isinstance(plan_record, Mapping):
+        raise HandoffContractError(
+            "dependency-failure submission plan record is absent"
+        )
+    receipt_plan_path = Path(
+        str(plan_record.get("path") or "")
+    ).resolve(strict=True)
+    if production._file_record(receipt_plan_path) != plan_record:
+        raise HandoffContractError(
+            "dependency-failure submission plan bytes drifted"
+        )
+    (
+        loaded_plan,
+        _params,
+        selected,
+        _immediate_submission,
+        _expected_anchor,
+    ) = _load_plan(receipt_plan_path)
+    if plan is not None and loaded_plan != plan:
+        raise HandoffContractError(
+            "dependency-failure submission references a different plan"
+        )
+    plan = loaded_plan
+    stage = plan["stage"]
+    strict_contract = plan["scheduler_strict_node_contract"]
+    strict_pin = probe._strict_node_scheduler_pin(strict_contract)
+    cutover_record = receipt.get("scheduler_cutover_receipt")
+    if not isinstance(cutover_record, Mapping):
+        raise HandoffContractError(
+            "dependency-failure Scheduler cutover record is absent"
+        )
+    cutover_path = Path(str(cutover_record.get("path") or ""))
+    if production._file_record(cutover_path) != cutover_record:
+        raise HandoffContractError(
+            "dependency-failure Scheduler cutover bytes drifted"
+        )
+    cutover, _unused_launcher = probe._validate_scheduler_cutover_receipt(
+        cutover_path,
+        verify_live_launcher=False,
+        require_strict_node=True,
+        strict_node_contract=strict_contract,
+    )
+    admission = probe._validate_recorded_admission_snapshot(
+        receipt.get("scheduler_admission_snapshot")
+    )
+    launcher = receipt.get("scheduler_live_launcher_identity")
+    if (
+        not isinstance(launcher, Mapping)
+        or set(launcher) != {"path", "sha256", "size_bytes"}
+        or not probe._same_absolute_regular_file_identity(
+            launcher.get("path"), cutover["live_launcher_path"]
+        )
+        or launcher.get("sha256") != strict_pin["launcher_sha256"]
+        or isinstance(launcher.get("size_bytes"), bool)
+        or not isinstance(launcher.get("size_bytes"), int)
+        or launcher.get("size_bytes") <= 0
+    ):
+        raise HandoffContractError(
+            "dependency-failure live Scheduler launcher evidence drifted"
+        )
+    _validate_submission_reauthentication(
+        receipt.get("search_authority_reauthentication"),
+        plan=plan,
+        selected=selected,
+    )
+    task_id = _positive_int(
+        receipt.get("task_id"),
+        "dependency-failure submission task ID",
+    )
+    sibling_guard = _validate_submission_sibling_guard(
+        receipt.get("dependency_failure_sibling_guard"),
+        plan=plan,
+        task_id=task_id,
+    )
+    claim_receipt = _validate_submission_claim(
+        receipt.get("dependency_failure_atomic_claim"),
+        plan_path=receipt_plan_path,
+        plan=plan,
+        task_id=task_id,
+        sibling_guard=sibling_guard,
+    )
+    finalized_claim = claim_receipt["finalized_claim"]
+    strict_receipt = _validate_submission_strict_node(
+        receipt.get("scheduler_strict_node_contract"),
+        plan=plan,
+        submission=receipt,
+        finalized_claim=finalized_claim,
+    )
+    fresh_claim = (
+        claim_receipt["acquisition_status"] == "fresh_pending"
+    )
+    if (
+        (
+            fresh_claim
+            and strict_receipt["submission_source"]
+            == "pre_submission_reconciliation"
+        )
+        or (
+            not fresh_claim
+            and (
+                strict_receipt["submission_source"]
+                != "pre_submission_reconciliation"
+                or strict_receipt["scheduler_mutation_performed"]
+                is not False
+            )
+        )
+    ):
+        raise HandoffContractError(
+            "dependency-failure claim/submission trace semantics drifted"
+        )
+    if (
+        receipt.get("stage") != "standard"
+        or receipt.get("plan_payload_sha256") != plan["payload_sha256"]
+        or receipt.get("candidate_physics_sha256")
+        != plan["candidate_physics_sha256"]
+        or receipt.get("task_name") != stage["task_name"]
+        or receipt.get("workdir") != stage["workdir"]
+        or receipt.get("dedupe_key")
+        != stage["retained_aedt_bundle"]["dedupe_key"]
+        or receipt.get("solver_revision") != plan["solver_revision"]
+        or receipt.get("library_revision") != plan["library_revision"]
+        or receipt.get("profile_sha256") != stage["profile_sha256"]
+        or receipt.get("effective_params_sha256")
+        != stage["effective_params_sha256"]
+        or receipt.get("resources") != RESOURCES
+        or receipt.get("aedt_backend") != "standalone"
+        or receipt.get("retained_aedt_bundle")
+        != stage["retained_aedt_bundle"]
+        or receipt.get("retention_run_root")
+        != stage["retention_run_root"]
+        or receipt.get("retry_of_dependency_failure")
+        != plan["retry_of_dependency_failure"]
+        or receipt.get("scheduler_cutover_payload_sha256")
+        != cutover["payload_sha256"]
+        or admission.get("scheduler_url") != stage["scheduler_url"]
+        or receipt.get("scheduler_url") != stage["scheduler_url"]
+        or receipt.get("scheduler_project") != scheduler_client.MFT_PROJECT
+        or receipt.get("scheduler_project_mutation_performed") is not False
+        or receipt.get("scheduler_repository_modified") is not False
+        or receipt.get("scheduler_submission_performed") is not True
+        or receipt.get("retention_required") is not True
+        or receipt.get("prune_protection_required") is not True
+        or any(
+            receipt.get(name) is not expected
+            for name, expected in _flags().items()
+        )
+    ):
+        raise HandoffContractError(
+            "dependency-failure submission identity drifted"
+        )
+    if receipt.get("core_policy") != {
+        "contract": production.STANDARD_CORE_CONTRACT,
+        "requested_num_cores": 8,
+        "auth_sha256": production._core_auth(
+            plan["solver_revision"], 8
+        ),
+    }:
+        raise HandoffContractError(
+            "dependency-failure submission core policy drifted"
+        )
+    return receipt
 
 
 def _parser() -> argparse.ArgumentParser:
