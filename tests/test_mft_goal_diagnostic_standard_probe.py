@@ -2650,6 +2650,18 @@ def test_mesh_quality_canary_authenticates_nested_preflight_and_ignores_suppleme
     )
     assert evidence["passed_native_premesh_marker_count"] == 1
     assert evidence["zero_iteration_convergence_marker_count"] == 1
+    second_submission = {**submission, "task_id": 96262}
+    second_snapshot = {
+        **snapshot,
+        "task_id": 96262,
+        "remote_dir": "task-96262",
+    }
+    second_evidence = probe._mesh_quality_failure_evidence(
+        second_snapshot,
+        stdout,
+        submission=second_submission,
+    )
+    assert second_evidence["task_execution"]["task_id"] == 96262
 
     plan = {
         "stage": {
@@ -2673,6 +2685,30 @@ def test_mesh_quality_canary_authenticates_nested_preflight_and_ignores_suppleme
         96271,
         96272,
     ]
+    generic_plan = {
+        "retry_of_mesh_quality_canary": {
+            "logical_authority_task_id": 96220,
+            "retry_of_task_id": 96262,
+        },
+        "stage": {
+            "task_name": (
+                "mft-goal-diag-standard-mesh-canary-r1-"
+                "l96220-05580bda40b2"
+            ),
+            "retained_aedt_bundle": {"dedupe_key": "generic-dedupe"},
+        },
+    }
+    generic_guard = probe._mesh_quality_canary_sibling_snapshot(
+        supplementals, plan=generic_plan
+    )
+    probe._validate_mesh_quality_canary_sibling_snapshot(
+        generic_guard,
+        plan=generic_plan,
+        expected_count=0,
+    )
+    assert generic_guard["logical_authority_task_id"] == 96220
+    assert generic_guard["failed_source_task_id"] == 96262
+    assert generic_guard["rejected_supplemental_task_ids_present"] == []
 
 
 def test_mesh_quality_canary_retains_bundle_after_failed_simulation(

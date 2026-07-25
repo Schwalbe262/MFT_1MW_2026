@@ -4126,7 +4126,7 @@ def _mesh_quality_failure_evidence(
     *,
     submission: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Authenticate the one terminal poor-mesh execution at task 96264."""
+    """Authenticate one exact terminal poor-mesh timeout-retry execution."""
 
     if isinstance(stdout, str):
         raw = stdout.encode("utf-8")
@@ -4211,9 +4211,12 @@ def _mesh_quality_failure_evidence(
                 and attempt["mesh_preflight"].get("passed") is True
                 for attempt in attempts
             )
+    source_task_id = submission.get("task_id")
     if (
-        task_id != MESH_QUALITY_CANARY_FAILED_TASK_ID
-        or task_id != submission.get("task_id")
+        isinstance(source_task_id, bool)
+        or not isinstance(source_task_id, int)
+        or source_task_id <= 0
+        or task_id != source_task_id
         or facts["name"] != submission.get("task_name")
         or facts["status"] != "failed"
         or facts["state"] != "failed"
@@ -4243,7 +4246,7 @@ def _mesh_quality_failure_evidence(
         or preflight_pass_count < 1
     ):
         raise HandoffContractError(
-            "exact task 96264 poor-mesh terminal evidence drifted"
+            "exact source task poor-mesh terminal evidence drifted"
         )
     return {
         "schema_version": (
@@ -4295,8 +4298,6 @@ def _validate_mesh_quality_terminal_evidence(
         or evidence.get("schema_version")
         != "mft-goal-diagnostic-mesh-quality-terminal-evidence-v1"
         or not isinstance(execution, dict)
-        or execution.get("task_id")
-        != MESH_QUALITY_CANARY_FAILED_TASK_ID
         or execution.get("task_id") != submission.get("task_id")
         or execution.get("name") != submission.get("task_name")
         or execution.get("dedupe_key") != submission.get("dedupe_key")
@@ -4358,23 +4359,73 @@ def _mesh_quality_canary_intervention() -> dict[str, Any]:
     }
 
 
+def _mesh_quality_canary_source_ids(
+    plan: Mapping[str, Any],
+) -> tuple[int, int]:
+    record = plan.get("retry_of_mesh_quality_canary")
+    if record is None:
+        # Backward-compatible identity for isolated legacy unit fixtures.
+        return (
+            MESH_QUALITY_CANARY_LOGICAL_TASK_ID,
+            MESH_QUALITY_CANARY_FAILED_TASK_ID,
+        )
+    if not isinstance(record, Mapping):
+        raise HandoffContractError(
+            "mesh-quality canary exact source authority is absent"
+        )
+    logical_task_id = record.get("logical_authority_task_id")
+    source_task_id = record.get("retry_of_task_id")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        for value in (logical_task_id, source_task_id)
+    ):
+        raise HandoffContractError(
+            "mesh-quality canary exact source task identity is invalid"
+        )
+    return int(logical_task_id), int(source_task_id)
+
+
+def _mesh_quality_canary_rejected_source_task_ids(
+    plan: Mapping[str, Any],
+) -> frozenset[int]:
+    logical_task_id, source_task_id = _mesh_quality_canary_source_ids(
+        plan
+    )
+    if (
+        logical_task_id == MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        and source_task_id == MESH_QUALITY_CANARY_FAILED_TASK_ID
+    ):
+        return MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS
+    return frozenset()
+
+
 def _mesh_quality_canary_task_identity(
     candidate_physics_sha256: str,
+    *,
+    logical_authority_task_id: int = (
+        MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+    ),
 ) -> tuple[str, str]:
     digest = production._require_sha(
         candidate_physics_sha256,
         "mesh-quality canary candidate physics SHA",
     )
-    if digest != MESH_QUALITY_CANARY_CANDIDATE_PHYSICS_SHA256:
+    if (
+        isinstance(logical_authority_task_id, bool)
+        or not isinstance(logical_authority_task_id, int)
+        or logical_authority_task_id <= 0
+    ):
         raise HandoffContractError(
-            "mesh-quality canary candidate is not exact slot 96264"
+            "mesh-quality canary logical authority task ID is invalid"
         )
     stem = digest[:12]
     return (
         "mft-goal-diag-standard-mesh-canary-r1-"
-        f"l{MESH_QUALITY_CANARY_LOGICAL_TASK_ID}-{stem}",
+        f"l{logical_authority_task_id}-{stem}",
         "mft_goal_diag_standard_mesh_canary_r1_"
-        f"l{MESH_QUALITY_CANARY_LOGICAL_TASK_ID}_{stem}",
+        f"l{logical_authority_task_id}_{stem}",
     )
 
 
@@ -4393,9 +4444,15 @@ def _mesh_quality_canary_sibling_snapshot(
     stage = plan["stage"]
     expected_name = stage["task_name"]
     expected_dedupe = stage["retained_aedt_bundle"]["dedupe_key"]
+    logical_task_id, source_task_id = _mesh_quality_canary_source_ids(
+        plan
+    )
+    rejected_task_ids = _mesh_quality_canary_rejected_source_task_ids(
+        plan
+    )
     prefix = (
         "mft-goal-diag-standard-mesh-canary-r1-"
-        f"l{MESH_QUALITY_CANARY_LOGICAL_TASK_ID}-"
+        f"l{logical_task_id}-"
     )
     matches = []
     rejected_supplemental = set()
@@ -4403,7 +4460,7 @@ def _mesh_quality_canary_sibling_snapshot(
         if not isinstance(raw, Mapping):
             continue
         task_id = raw.get("task_id", raw.get("id"))
-        if task_id in MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS:
+        if task_id in rejected_task_ids:
             rejected_supplemental.add(task_id)
         name = str(raw.get("name") or "")
         dedupe = str(raw.get("dedupe_key") or "")
@@ -4427,10 +4484,8 @@ def _mesh_quality_canary_sibling_snapshot(
         "scheduler_project": scheduler_client.MFT_PROJECT,
         "task_name": expected_name,
         "dedupe_key": expected_dedupe,
-        "logical_authority_task_id": (
-            MESH_QUALITY_CANARY_LOGICAL_TASK_ID
-        ),
-        "failed_source_task_id": MESH_QUALITY_CANARY_FAILED_TASK_ID,
+        "logical_authority_task_id": logical_task_id,
+        "failed_source_task_id": source_task_id,
         "rejected_supplemental_task_ids_present": sorted(
             rejected_supplemental
         ),
@@ -4448,6 +4503,9 @@ def _validate_mesh_quality_canary_sibling_snapshot(
 ) -> dict[str, Any]:
     expected_identity = _mesh_quality_canary_sibling_snapshot(
         [], plan=plan
+    )
+    rejected_task_ids = _mesh_quality_canary_rejected_source_task_ids(
+        plan
     )
     if (
         not isinstance(value, dict)
@@ -4471,7 +4529,7 @@ def _validate_mesh_quality_canary_sibling_snapshot(
         )
         or any(
             task_id
-            not in MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS
+            not in rejected_task_ids
             for task_id in value[
                 "rejected_supplemental_task_ids_present"
             ]
@@ -4880,15 +4938,27 @@ def _validate_mesh_quality_canary_record(
         "failure_class",
         "intervention",
     }
+    retry_of_task_id = (
+        record.get("retry_of_task_id")
+        if isinstance(record, Mapping)
+        else None
+    )
+    logical_authority_task_id = (
+        record.get("logical_authority_task_id")
+        if isinstance(record, Mapping)
+        else None
+    )
     if (
         not isinstance(record, dict)
         or set(record) != expected_fields
         or record.get("schema_version")
         != MESH_QUALITY_CANARY_EVIDENCE_SCHEMA
-        or record.get("retry_of_task_id")
-        != MESH_QUALITY_CANARY_FAILED_TASK_ID
-        or record.get("logical_authority_task_id")
-        != MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        or isinstance(retry_of_task_id, bool)
+        or not isinstance(retry_of_task_id, int)
+        or retry_of_task_id <= 0
+        or isinstance(logical_authority_task_id, bool)
+        or not isinstance(logical_authority_task_id, int)
+        or logical_authority_task_id <= 0
         or record.get("scheduler_url") != DIAGNOSTIC_SCHEDULER_URL
         or record.get("failure_class")
         != "native_icepak_poor_mesh_quality_at_iteration_zero"
@@ -4931,15 +5001,13 @@ def _validate_mesh_quality_canary_record(
     )
     if (
         original_submission["task_id"]
-        != MESH_QUALITY_CANARY_FAILED_TASK_ID
+        != retry_of_task_id
         or logical_submission["task_id"]
-        != MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        != logical_authority_task_id
         or original_plan["candidate_physics_sha256"]
-        != MESH_QUALITY_CANARY_CANDIDATE_PHYSICS_SHA256
-        or original_plan["solver_revision"]
-        != MESH_QUALITY_CANARY_ORIGINAL_SOLVER_REVISION
+        != plan.get("candidate_physics_sha256")
         or original_plan["library_revision"]
-        != MESH_QUALITY_CANARY_LIBRARY_REVISION
+        != plan.get("library_revision")
         or original_effective.get(
             "thermal_rx_side_block_mesh_level"
         )
@@ -5312,7 +5380,7 @@ def create_mesh_quality_canary_plan(
     stdout_reader: Any = None,
     task_list_reader: Any = None,
 ) -> Path:
-    """Plan the sole 96264 poor-mesh numerical canary without submitting it."""
+    """Plan one exact-source poor-mesh numerical canary without submitting."""
 
     original_plan, params, selected = _load_plan(original_plan_path)
     if _plan_retry_kind(original_plan) != "timeout":
@@ -5327,6 +5395,8 @@ def create_mesh_quality_canary_plan(
         logical_submission,
         _timeout_execution,
     ) = _validate_timeout_retry_record(original_plan)
+    source_task_id = original_submission["task_id"]
+    logical_authority_task_id = logical_submission["task_id"]
     normalized_scheduler_url = scheduler_url.rstrip("/")
     next_solver_revision = production._require_revision(
         solver_revision, "mesh-quality canary solver revision"
@@ -5344,31 +5414,27 @@ def create_mesh_quality_canary_plan(
     if (
         normalized_scheduler_url
         != original_submission["scheduler_url"]
-        or original_submission["task_id"]
-        != MESH_QUALITY_CANARY_FAILED_TASK_ID
-        or logical_submission["task_id"]
-        != MESH_QUALITY_CANARY_LOGICAL_TASK_ID
-        or original_plan["candidate_physics_sha256"]
-        != MESH_QUALITY_CANARY_CANDIDATE_PHYSICS_SHA256
-        or original_plan["solver_revision"]
-        != MESH_QUALITY_CANARY_ORIGINAL_SOLVER_REVISION
-        or original_plan["library_revision"]
-        != MESH_QUALITY_CANARY_LIBRARY_REVISION
+        or isinstance(source_task_id, bool)
+        or not isinstance(source_task_id, int)
+        or source_task_id <= 0
+        or isinstance(logical_authority_task_id, bool)
+        or not isinstance(logical_authority_task_id, int)
+        or logical_authority_task_id <= 0
         or next_solver_revision == original_plan["solver_revision"]
     ):
         raise HandoffContractError(
-            "mesh-quality canary is not bound to exact logical slot 96264"
+            "mesh-quality canary exact timeout-retry source is invalid"
         )
     read_task = task_reader or _scheduler_task_snapshot
     read_stdout = stdout_reader or _scheduler_task_stdout
     execution = _mesh_quality_failure_evidence(
         read_task(
             scheduler_url=normalized_scheduler_url,
-            task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+            task_id=source_task_id,
         ),
         read_stdout(
             scheduler_url=normalized_scheduler_url,
-            task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+            task_id=source_task_id,
         ),
         submission=original_submission,
     )
@@ -5407,7 +5473,8 @@ def create_mesh_quality_canary_plan(
             "mesh control"
         )
     task_name, workdir = _mesh_quality_canary_task_identity(
-        original_plan["candidate_physics_sha256"]
+        original_plan["candidate_physics_sha256"],
+        logical_authority_task_id=logical_authority_task_id,
     )
     retained = scheduler_client.retained_aedt_identity(
         task_name,
@@ -5422,10 +5489,8 @@ def create_mesh_quality_canary_plan(
         )
     retry_record = {
         "schema_version": MESH_QUALITY_CANARY_EVIDENCE_SCHEMA,
-        "retry_of_task_id": MESH_QUALITY_CANARY_FAILED_TASK_ID,
-        "logical_authority_task_id": (
-            MESH_QUALITY_CANARY_LOGICAL_TASK_ID
-        ),
+        "retry_of_task_id": source_task_id,
+        "logical_authority_task_id": logical_authority_task_id,
         "timeout_parent_ancestry_sha256": canonical_sha256(
             original_plan["retry_of_timeout"]
         ),
@@ -5448,6 +5513,7 @@ def create_mesh_quality_canary_plan(
         "intervention": _mesh_quality_canary_intervention(),
     }
     provisional_plan = {
+        "retry_of_mesh_quality_canary": retry_record,
         "stage": {
             "task_name": task_name,
             "retained_aedt_bundle": retained,
@@ -5966,9 +6032,15 @@ def _load_plan(
                 )
             )
         )
+        logical_authority_task_id, _source_task_id = (
+            _mesh_quality_canary_source_ids(plan)
+        )
         expected_task_name, expected_workdir = (
             _mesh_quality_canary_task_identity(
-                plan["candidate_physics_sha256"]
+                plan["candidate_physics_sha256"],
+                logical_authority_task_id=(
+                    logical_authority_task_id
+                ),
             )
         )
         _validate_mesh_quality_canary_sibling_snapshot(
@@ -6916,6 +6988,9 @@ def _submit_standard_plan(
         retry_record = copy.deepcopy(
             plan["retry_of_mesh_quality_canary"]
         )
+        _logical_task_id, mesh_source_task_id = (
+            _mesh_quality_canary_source_ids(plan)
+        )
         read_stdout = stdout_reader or _scheduler_task_stdout
 
         def mesh_pre_submit_guard() -> None:
@@ -6923,11 +6998,11 @@ def _submit_standard_plan(
             live_execution = _mesh_quality_failure_evidence(
                 reader(
                     scheduler_url=stage["scheduler_url"],
-                    task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+                    task_id=mesh_source_task_id,
                 ),
                 read_stdout(
                     scheduler_url=stage["scheduler_url"],
-                    task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+                    task_id=mesh_source_task_id,
                 ),
                 submission=original_submission,
             )
@@ -7224,7 +7299,7 @@ def _submit_standard_plan(
             or submission_result["submission_source"] != "post_created"
             or submission_result["scheduler_mutation_performed"] is not True
             or task_id
-            in MESH_QUALITY_CANARY_REJECTED_SUPPLEMENTAL_TASK_IDS
+            in _mesh_quality_canary_rejected_source_task_ids(plan)
         ):
             raise HandoffContractError(
                 "mesh-quality canary was not one fresh guarded POST"
@@ -7660,6 +7735,17 @@ def reconcile_mesh_quality_canary_submission(
         raise HandoffContractError(
             "receipt recovery is restricted to exact mesh canary task 96300"
         )
+    recovery_logical_task_id, recovery_source_task_id = (
+        _mesh_quality_canary_source_ids(plan)
+    )
+    if (
+        recovery_logical_task_id != MESH_QUALITY_CANARY_LOGICAL_TASK_ID
+        or recovery_source_task_id
+        != MESH_QUALITY_CANARY_FAILED_TASK_ID
+    ):
+        raise HandoffContractError(
+            "receipt recovery is restricted to exact task 96300 ancestry"
+        )
     strict_node_contract = _plan_strict_node_contract(plan)
     strict_node_pin = _strict_node_scheduler_pin(
         strict_node_contract, require_active=True
@@ -7703,11 +7789,11 @@ def reconcile_mesh_quality_canary_submission(
         live_execution = _mesh_quality_failure_evidence(
             reader(
                 scheduler_url=stage["scheduler_url"],
-                task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+                task_id=recovery_source_task_id,
             ),
             read_stdout(
                 scheduler_url=stage["scheduler_url"],
-                task_id=MESH_QUALITY_CANARY_FAILED_TASK_ID,
+                task_id=recovery_source_task_id,
             ),
             submission=original_submission,
         )
