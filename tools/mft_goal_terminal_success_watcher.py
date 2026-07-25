@@ -465,6 +465,7 @@ def _authenticate_slot_collection(
     strict = strict_al.authenticate_collection(collection_path)
     collection = view["collection"]
     plan = view["plan"]
+    selected = view["selected"]
     if (
         collection.get("task_id") != slot["execution_task_id"]
         or collection.get("plan") != slot["plan"]
@@ -482,14 +483,42 @@ def _authenticate_slot_collection(
             view, collection_path=collection_path
         ) != truth:
             raise WatcherContractError("strict feasible truth recomputation drifted")
-    actual_fixed = truth.get("actual_fixed_identity_attestation")
-    selected_fixed = truth.get("selected_fixed_identity_attestation")
+    collection_truth = collection.get("truth_evidence")
+    row_contract = selected.get("row_contract")
+    fixed_chain = (
+        (
+            collection_truth.get("actual_fixed_identity_attestation")
+            if isinstance(collection_truth, Mapping)
+            else None
+        ),
+        (
+            collection_truth.get("selected_fixed_identity_attestation")
+            if isinstance(collection_truth, Mapping)
+            else None
+        ),
+        (
+            row_contract.get("fixed_identity_attestation")
+            if isinstance(row_contract, Mapping)
+            else None
+        ),
+        truth.get("fixed_identity_attestation"),
+    )
+    canonical_fixed = []
+    for fixed in fixed_chain:
+        if not isinstance(fixed, Mapping):
+            raise WatcherContractError(
+                "authenticated fan/TIM/pad identity drifted"
+            )
+        unsigned = dict(fixed)
+        observed_sha256 = unsigned.pop("sha256", None)
+        if observed_sha256 != canonical_sha256(unsigned):
+            raise WatcherContractError(
+                "authenticated fan/TIM/pad identity drifted"
+            )
+        canonical_fixed.append(dict(fixed))
     if (
-        not isinstance(actual_fixed, Mapping)
-        or not isinstance(selected_fixed, Mapping)
-        or actual_fixed.get("sha256")
-        != slot["fixed_identity_attestation_sha256"]
-        or selected_fixed.get("sha256")
+        any(fixed != canonical_fixed[0] for fixed in canonical_fixed[1:])
+        or canonical_fixed[0]["sha256"]
         != slot["fixed_identity_attestation_sha256"]
     ):
         raise WatcherContractError("authenticated fan/TIM/pad identity drifted")

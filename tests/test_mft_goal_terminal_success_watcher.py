@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from module.mft_goal_20260726_contract import (
+    attest_fixed_identity,
+    canonical_sha256,
+    fixed_identity_expectations,
+)
 from tools import mft_goal_fea_handoff as production
 from tools import mft_goal_terminal_success_watcher as watcher
 from tools import mft_goal_truth_promotion as promotion
@@ -184,6 +191,125 @@ def test_restart_recovers_collection_before_scheduler_get(
     )
     assert state["slots"][0]["recovered_after_restart"] is True
     assert paths["receipt"].is_file()
+
+
+def _patch_authenticated_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    collection_path = production._write_immutable_json(
+        tmp_path / "collection.json", {"authenticated": True}
+    )
+    fixed = attest_fixed_identity(fixed_identity_expectations())
+    slot = _slot()
+    slot["fixed_identity_attestation_sha256"] = fixed["sha256"]
+    truth = {"fixed_identity_attestation": copy.deepcopy(fixed)}
+    view = {
+        "collection": {
+            "task_id": slot["execution_task_id"],
+            "plan": slot["plan"],
+            "submission": slot["submission"],
+            "truth_evidence": {
+                "actual_fixed_identity_attestation": copy.deepcopy(fixed),
+                "selected_fixed_identity_attestation": copy.deepcopy(fixed),
+            },
+        },
+        "plan": {
+            "retry_of_timeout12h": {
+                "logical_authority_task_id": slot[
+                    "logical_authority_task_id"
+                ]
+            }
+        },
+        "selected": {
+            "row_contract": {
+                "fixed_identity_attestation": copy.deepcopy(fixed)
+            }
+        },
+    }
+    strict = SimpleNamespace(
+        adapter_kind="diagnostic",
+        collection_file_sha256=production._sha256_file(collection_path),
+        solver_revision="1" * 40,
+        library_revision="2" * 40,
+        source_task_payload_sha256="3" * 64,
+        source_seed=2607262000,
+        source_fixed_primary_turns=6,
+    )
+    monkeypatch.setattr(
+        watcher.diagnostic, "authenticate_collection", lambda _path: view
+    )
+    monkeypatch.setattr(
+        watcher.strict_al, "authenticate_collection", lambda _path: strict
+    )
+    monkeypatch.setattr(
+        watcher.promotion,
+        "_actual_standard_observation",
+        lambda _view, *, collection_path: (
+            truth,
+            {"actual_truth_feasible": True},
+        ),
+    )
+    monkeypatch.setattr(
+        watcher.promotion,
+        "_actual_standard_truth",
+        lambda _view, *, collection_path: truth,
+    )
+    return collection_path, slot, view, truth
+
+
+def test_slot_authentication_accepts_identical_canonical_fixed_identity_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collection_path, slot, _view, truth = _patch_authenticated_slot(
+        tmp_path, monkeypatch
+    )
+
+    authenticated, status, strict = watcher._authenticate_slot_collection(
+        collection_path, slot
+    )
+
+    assert authenticated == truth
+    assert status["actual_truth_feasible"] is True
+    assert strict["adapter_kind"] == "diagnostic"
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["collection_actual", "collection_selected", "plan", "actual_truth"],
+)
+def test_slot_authentication_rejects_fixed_identity_chain_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    collection_path, slot, view, truth = _patch_authenticated_slot(
+        tmp_path, monkeypatch
+    )
+    drifted = copy.deepcopy(truth["fixed_identity_attestation"])
+    drifted["observed"]["freq"] = 999.0
+    unsigned = dict(drifted)
+    unsigned.pop("sha256")
+    drifted["sha256"] = canonical_sha256(unsigned)
+    targets = {
+        "collection_actual": view["collection"]["truth_evidence"],
+        "collection_selected": view["collection"]["truth_evidence"],
+        "plan": view["selected"]["row_contract"],
+        "actual_truth": truth,
+    }
+    keys = {
+        "collection_actual": "actual_fixed_identity_attestation",
+        "collection_selected": "selected_fixed_identity_attestation",
+        "plan": "fixed_identity_attestation",
+        "actual_truth": "fixed_identity_attestation",
+    }
+    targets[source][keys[source]] = drifted
+
+    with pytest.raises(
+        watcher.WatcherContractError,
+        match="authenticated fan/TIM/pad identity drifted",
+    ):
+        watcher._authenticate_slot_collection(collection_path, slot)
 
 
 def test_single_instance_lock_rejects_second_holder(tmp_path: Path) -> None:
