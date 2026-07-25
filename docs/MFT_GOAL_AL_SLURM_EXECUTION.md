@@ -31,6 +31,51 @@ revision used to plan and execute training. Build the dataset only after the
 AL Slurm wrapper and relocation support are present in the clean integration
 checkout.
 
+## 0. Reauthenticate watcher truth without starting retraining
+
+Run the read-only readiness bridge before selecting collection paths by hand.
+It reauthenticates the immutable watch plan, authorized extension receipts,
+mutable state seal, every terminal success receipt and Standard collection.
+If any goal-feasible Standard result exists, it also requires the exact
+global-NDS receipt and truth Pareto manifest. All successful strict Standard
+rows are considered for training, including physically valid rows that miss a
+goal constraint; only goal-feasible rows enter the truth Pareto manifest.
+
+```powershell
+$Py = 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe'
+$CodeRoot = 'C:\w\mft-goal-20260726'
+$WatcherRoot = 'C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\terminal_success_watcher_c276213_260725'
+$ExtensionAuthority = 'C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\safe_refill_4fac_735fef5_260726_snapshot_v1\watcher_extension_authority.json'
+$Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+$ALRoot = "C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\al-g1-$Stamp"
+$CodeRevision = (git -C $CodeRoot rev-parse HEAD).Trim()
+
+& $Py -m tools.mft_goal_surrogate_retrain_readiness `
+  --watch-plan "$WatcherRoot\watch_plan.json" `
+  --state "$WatcherRoot\state.json" `
+  --extension-authority $ExtensionAuthority `
+  --code-root $CodeRoot `
+  --expected-code-revision $CodeRevision `
+  --derived-dataset-output "$ALRoot\dataset" `
+  --training-plan-root "$ALRoot\training-offload" `
+  --output-json "$ALRoot\readiness.json"
+if ($LASTEXITCODE -ne 0) { throw 'surrogate readiness audit failed' }
+
+$Readiness = Get-Content -Raw -LiteralPath "$ALRoot\readiness.json" |
+  ConvertFrom-Json
+if (-not $Readiness.commands.emitted) {
+  throw 'strict truth gate is closed; do not build, train, or submit'
+}
+```
+
+The readiness command never builds a dataset, trains a model, creates a
+campaign, or contacts Scheduler. When the strict 8-row / 8-geometry /
+4-source-task gate is closed, both `dataset_build_argv` and
+`training_plan_argv` are null. When it opens, the two argv arrays bind the
+exact reauthenticated collection inventory; neither contains `--apply`.
+Training stage/apply and the single Scheduler POST remain separately
+authorized operations.
+
 ## 1. Authenticate and build the isolated dataset
 
 Run only after at least eight collection files exist. The allow-list below
