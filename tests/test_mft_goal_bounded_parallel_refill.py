@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -313,3 +315,18 @@ def test_reclaim_file_byte_drift_is_rejected(
         parallel._phase_transition_evidence(
             plan, reclaim_evidence_path=reclaim_path
         )
+
+
+def test_direct_script_entrypoint_bootstraps_repository_root(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(Path(parallel.__file__).resolve()), "--help"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "Bounded parallel exact MFT SAFE REFILL extension" in completed.stdout

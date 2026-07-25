@@ -15,12 +15,18 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 from typing import Any, Callable, Mapping, Sequence
 
-from module.mft_goal_20260726_contract import canonical_sha256
-from tools import mft_goal_diagnostic_standard_probe as diagnostic
-from tools import mft_goal_fea_handoff as production
-from tools import mft_goal_safe_refill as refill
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from module.mft_goal_20260726_contract import canonical_sha256  # noqa: E402
+from tools import mft_goal_diagnostic_standard_probe as diagnostic  # noqa: E402
+from tools import mft_goal_fea_handoff as production  # noqa: E402
+from tools import mft_goal_safe_refill as refill  # noqa: E402
 
 
 EVALUATION_SCHEMA = "mft-goal-bounded-parallel-refill-evaluation-v1"
