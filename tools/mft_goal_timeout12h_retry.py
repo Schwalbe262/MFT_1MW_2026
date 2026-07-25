@@ -1,9 +1,13 @@
-"""Exact-once 12-hour recovery for two authenticated 8-hour MFT timeouts.
+"""Exact-once 12-hour recovery for authenticated 8-hour MFT timeouts.
 
 This module belongs to the MFT project.  It never edits the separate
 Scheduler repository.  Planning and collection are GET-only; the only
 Scheduler mutation available here is the atomically guarded task POST in
 ``submit-timeout12h-retry``.
+
+The original r1 authority remains byte-compatible for tasks 96256/96263.
+The late task-96258 terminal is isolated under a supplemental r2 claim root
+so expanding the reviewed mapping cannot silently widen the frozen r1 root.
 """
 
 from __future__ import annotations
@@ -59,10 +63,12 @@ PROFILE_SCHEMA = (
     "mft-goal-diagnostic-standard-timeout12h-retry-profile-v1"
 )
 RETRY_GENERATION = "timeout12h-r1"
+SUPPLEMENTAL_RETRY_GENERATION = "timeout12h-r2"
 RESOURCES = {"cpus": 8, "timeout_seconds": 12 * 3600}
 MEMORY_MB = 32768
 STRICT_NODE_NAME = "n114"
 EXACT_LOGICAL_TO_FAILED_TASK = {96218: 96256, 96226: 96263}
+SUPPLEMENTAL_EXACT_LOGICAL_TO_FAILED_TASK = {96224: 96258}
 PROFILE_PATH = (
     probe.REPOSITORY_ROOT
     / "regression_260707"
@@ -74,6 +80,10 @@ CLAIM_ROOT = Path(
     "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
     "timeout12h_claims"
 )
+SUPPLEMENTAL_CLAIM_ROOT = Path(
+    "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
+    "timeout12h_claims_r2"
+)
 CLAIM_AUTHORITY_SHA256 = canonical_sha256(
     {
         "campaign_id": "mft-goal-20260726",
@@ -82,6 +92,18 @@ CLAIM_AUTHORITY_SHA256 = canonical_sha256(
         "temperature_contract_sha256": GOAL_TEMPERATURE_CONTRACT_SHA256,
         "retry_generation": RETRY_GENERATION,
         "exact_logical_to_failed_task": EXACT_LOGICAL_TO_FAILED_TASK,
+    }
+)
+SUPPLEMENTAL_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
+    {
+        "campaign_id": "mft-goal-20260726",
+        "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+        "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+        "temperature_contract_sha256": GOAL_TEMPERATURE_CONTRACT_SHA256,
+        "retry_generation": SUPPLEMENTAL_RETRY_GENERATION,
+        "exact_logical_to_failed_task": (
+            SUPPLEMENTAL_EXACT_LOGICAL_TO_FAILED_TASK
+        ),
     }
 )
 MAX_STREAM_BYTES = 64 * 1024 * 1024
@@ -141,13 +163,65 @@ def _validate_profile(profile: Mapping[str, Any]) -> None:
     attest_fixed_identity(fixed)
 
 
-def initialize_claim_root(root: Path | None = None) -> dict[str, Any]:
-    target = CLAIM_ROOT if root is None else Path(root)
+def _retry_authority(retry_generation: str) -> dict[str, Any]:
+    if retry_generation == RETRY_GENERATION:
+        return {
+            "retry_generation": RETRY_GENERATION,
+            "claim_root": CLAIM_ROOT,
+            "claim_authority_sha256": CLAIM_AUTHORITY_SHA256,
+            "exact_logical_to_failed_task": EXACT_LOGICAL_TO_FAILED_TASK,
+        }
+    if retry_generation == SUPPLEMENTAL_RETRY_GENERATION:
+        return {
+            "retry_generation": SUPPLEMENTAL_RETRY_GENERATION,
+            "claim_root": SUPPLEMENTAL_CLAIM_ROOT,
+            "claim_authority_sha256": (
+                SUPPLEMENTAL_CLAIM_AUTHORITY_SHA256
+            ),
+            "exact_logical_to_failed_task": (
+                SUPPLEMENTAL_EXACT_LOGICAL_TO_FAILED_TASK
+            ),
+        }
+    raise HandoffContractError("timeout12h retry generation is unsupported")
+
+
+def _retry_authority_for_pair(
+    *, logical_authority_task_id: int, failed_task_id: int
+) -> dict[str, Any]:
+    matches = [
+        _retry_authority(generation)
+        for generation in (
+            RETRY_GENERATION,
+            SUPPLEMENTAL_RETRY_GENERATION,
+        )
+        if _retry_authority(generation)[
+            "exact_logical_to_failed_task"
+        ].get(logical_authority_task_id)
+        == failed_task_id
+    ]
+    if len(matches) != 1:
+        raise HandoffContractError(
+            "timeout12h exact logical/failed task authority is absent"
+        )
+    return matches[0]
+
+
+def initialize_claim_root(
+    root: Path | None = None,
+    *,
+    retry_generation: str = RETRY_GENERATION,
+) -> dict[str, Any]:
+    retry_authority = _retry_authority(retry_generation)
+    target = (
+        retry_authority["claim_root"] if root is None else Path(root)
+    )
     try:
         return atomic_claim.initialize_claim_root(
             target,
             campaign_id="mft-goal-20260726",
-            campaign_authority_sha256=CLAIM_AUTHORITY_SHA256,
+            campaign_authority_sha256=retry_authority[
+                "claim_authority_sha256"
+            ],
         )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
@@ -155,9 +229,12 @@ def initialize_claim_root(root: Path | None = None) -> dict[str, Any]:
         ) from exc
 
 
-def _claim_authority() -> dict[str, Any]:
+def _claim_authority(retry_generation: str) -> dict[str, Any]:
+    retry_authority = _retry_authority(retry_generation)
     try:
-        authority = atomic_claim.load_claim_root(CLAIM_ROOT)
+        authority = atomic_claim.load_claim_root(
+            retry_authority["claim_root"]
+        )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
             "timeout12h atomic claim root is unavailable"
@@ -165,24 +242,27 @@ def _claim_authority() -> dict[str, Any]:
     if (
         authority.get("campaign_id") != "mft-goal-20260726"
         or authority.get("campaign_authority_sha256")
-        != CLAIM_AUTHORITY_SHA256
+        != retry_authority["claim_authority_sha256"]
     ):
         raise HandoffContractError("timeout12h claim authority drifted")
     return authority
 
 
 def _claim_reference(
-    *, candidate_physics_sha256: str, logical_authority_task_id: int
+    *,
+    candidate_physics_sha256: str,
+    logical_authority_task_id: int,
+    retry_generation: str,
 ) -> dict[str, Any]:
     try:
         return atomic_claim.build_claim_reference(
-            _claim_authority(),
+            _claim_authority(retry_generation),
             candidate_physics_sha256=production._require_sha(
                 candidate_physics_sha256,
                 "timeout12h candidate physics SHA",
             ),
             logical_authority_task_id=logical_authority_task_id,
-            retry_generation=RETRY_GENERATION,
+            retry_generation=retry_generation,
         )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
@@ -197,9 +277,10 @@ def _validate_claim_reference(plan: Mapping[str, Any]) -> dict[str, Any]:
         raise HandoffContractError(
             "timeout12h atomic claim reference is absent"
         )
+    retry_generation = str(record.get("retry_generation") or "")
     try:
         normalized = atomic_claim.validate_claim_reference(
-            reference, _claim_authority()
+            reference, _claim_authority(retry_generation)
         )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
@@ -210,7 +291,7 @@ def _validate_claim_reference(plan: Mapping[str, Any]) -> dict[str, Any]:
         != plan.get("candidate_physics_sha256")
         or normalized.get("logical_authority_task_id")
         != record.get("logical_authority_task_id")
-        or normalized.get("retry_generation") != RETRY_GENERATION
+        or normalized.get("retry_generation") != retry_generation
     ):
         raise HandoffContractError(
             "timeout12h atomic claim plan binding drifted"
@@ -219,17 +300,24 @@ def _validate_claim_reference(plan: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _task_identity(
-    *, logical_authority_task_id: int, candidate_physics_sha256: str
+    *,
+    logical_authority_task_id: int,
+    candidate_physics_sha256: str,
+    retry_generation: str = RETRY_GENERATION,
 ) -> tuple[str, str]:
+    _retry_authority(retry_generation)
     logical_id = _positive_int(
         logical_authority_task_id, "timeout12h logical task ID"
     )
     stem = production._require_sha(
         candidate_physics_sha256, "timeout12h candidate physics SHA"
     )[:12]
+    generation_slug = retry_generation.removeprefix("timeout12h-")
     return (
-        f"mft-goal-diag-standard-timeout12h-r1-l{logical_id}-{stem}",
-        f"mft_goal_diag_standard_timeout12h_r1_l{logical_id}_{stem}",
+        "mft-goal-diag-standard-timeout12h-"
+        f"{generation_slug}-l{logical_id}-{stem}",
+        "mft_goal_diag_standard_timeout12h_"
+        f"{generation_slug}_l{logical_id}_{stem}",
     )
 
 
@@ -305,6 +393,7 @@ def _timeout_failure_evidence(
     *,
     immediate_submission: Mapping[str, Any],
     logical_authority_task_id: int,
+    retry_generation: str,
 ) -> dict[str, Any]:
     evidence = {
         "schema_version": FAILURE_EVIDENCE_SCHEMA,
@@ -332,9 +421,10 @@ def _timeout_failure_evidence(
         "started_at": snapshot.get("started_at"),
         "finished_at": snapshot.get("finished_at"),
     }
-    expected_task = EXACT_LOGICAL_TO_FAILED_TASK.get(
-        logical_authority_task_id
-    )
+    retry_authority = _retry_authority(retry_generation)
+    expected_task = retry_authority[
+        "exact_logical_to_failed_task"
+    ].get(logical_authority_task_id)
     allocation_id = evidence["allocation_id"]
     if (
         expected_task is None
@@ -364,7 +454,7 @@ def _timeout_failure_evidence(
     ):
         raise HandoffContractError(
             "timeout12h recovery requires exact failed/124/28800s task "
-            "96256 or 96263"
+            "authorized by its immutable retry generation"
         )
     return evidence
 
@@ -632,10 +722,17 @@ def create_plan(
     logical_id = _positive_int(
         logical_submission["task_id"], "timeout12h logical authority task"
     )
+    immediate_task_id = _positive_int(
+        immediate_submission["task_id"],
+        "timeout12h immediate failed task",
+    )
+    retry_authority = _retry_authority_for_pair(
+        logical_authority_task_id=logical_id,
+        failed_task_id=immediate_task_id,
+    )
+    retry_generation = str(retry_authority["retry_generation"])
     if (
-        EXACT_LOGICAL_TO_FAILED_TASK.get(logical_id)
-        != immediate_submission["task_id"]
-        or scheduler_url.rstrip("/")
+        scheduler_url.rstrip("/")
         != immediate_submission["scheduler_url"]
         or strict_node_name != STRICT_NODE_NAME
     ):
@@ -657,6 +754,7 @@ def create_plan(
         ),
         immediate_submission=immediate_submission,
         logical_authority_task_id=logical_id,
+        retry_generation=retry_generation,
     )
     stream = _stream_evidence(
         read_stdout(
@@ -710,6 +808,7 @@ def create_plan(
         candidate_physics_sha256=immediate_plan[
             "candidate_physics_sha256"
         ],
+        retry_generation=retry_generation,
     )
     strict_contract = probe._strict_node_plan_contract(strict_node_name)
     retained = scheduler_client.retained_aedt_identity(
@@ -731,7 +830,7 @@ def create_plan(
         )
     record = {
         "schema_version": RETRY_EVIDENCE_SCHEMA,
-        "retry_generation": RETRY_GENERATION,
+        "retry_generation": retry_generation,
         "logical_authority_task_id": logical_id,
         "retry_of_task_id": immediate_submission["task_id"],
         "immediate_parent_kind": "timeout8h",
@@ -774,6 +873,7 @@ def create_plan(
             "candidate_physics_sha256"
         ],
         logical_authority_task_id=logical_id,
+        retry_generation=retry_generation,
     )
     destination = output.resolve()
     if destination.exists():
@@ -900,10 +1000,11 @@ def _validate_retry_record(
         "collector_lineage_parent_plan_payload_sha256",
         "collector_lineage_parent_submission_payload_sha256",
     }
+    retry_generation = str(record.get("retry_generation") or "")
+    retry_authority = _retry_authority(retry_generation)
     if (
         set(record) != required
         or record.get("schema_version") != RETRY_EVIDENCE_SCHEMA
-        or record.get("retry_generation") != RETRY_GENERATION
         or record.get("immediate_parent_kind") != "timeout8h"
         or record.get("timeout_change_only") is not True
         or record.get("fixed_physics_unchanged") is not True
@@ -952,7 +1053,7 @@ def _validate_retry_record(
     if (
         record.get("retry_of_task_id")
         != immediate_submission["task_id"]
-        or EXACT_LOGICAL_TO_FAILED_TASK.get(logical_id)
+        or retry_authority["exact_logical_to_failed_task"].get(logical_id)
         != immediate_submission["task_id"]
         or logical_submission["task_id"] != logical_id
         or record.get("immediate_plan_payload_sha256")
@@ -1107,6 +1208,9 @@ def _load_plan(
             "logical_authority_task_id"
         ],
         candidate_physics_sha256=plan["candidate_physics_sha256"],
+        retry_generation=plan["retry_of_timeout12h"][
+            "retry_generation"
+        ],
     )
     retained = scheduler_client.retained_aedt_identity(
         expected_task_name,
@@ -1175,10 +1279,13 @@ def load_plan_for_probe(
 
 
 def _sibling_prefix(plan: Mapping[str, Any]) -> str:
-    logical_id = plan["retry_of_timeout12h"][
-        "logical_authority_task_id"
-    ]
-    return f"mft-goal-diag-standard-timeout12h-r1-l{logical_id}-"
+    record = plan["retry_of_timeout12h"]
+    task_name, _workdir = _task_identity(
+        logical_authority_task_id=record["logical_authority_task_id"],
+        candidate_physics_sha256=plan["candidate_physics_sha256"],
+        retry_generation=record["retry_generation"],
+    )
+    return task_name.rsplit("-", 1)[0] + "-"
 
 
 def _normalized_task(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -1292,7 +1399,9 @@ def _sibling_snapshot(
             "immediate_task_id": plan["retry_of_timeout12h"][
                 "retry_of_task_id"
             ],
-            "retry_generation": RETRY_GENERATION,
+            "retry_generation": plan["retry_of_timeout12h"][
+                "retry_generation"
+            ],
             "name_prefix": prefix,
             "candidate_physics_sha256": plan[
                 "candidate_physics_sha256"
@@ -1519,6 +1628,7 @@ def submit(
             logical_authority_task_id=int(
                 stored["logical_authority_task_id"]
             ),
+            retry_generation=str(stored["retry_generation"]),
         )
         latest_stream = _stream_evidence(
             read_stdout(
@@ -1561,9 +1671,12 @@ def submit(
     )
     reference = _validate_claim_reference(plan)
     winner = _claim_winner(plan_path, plan)
+    claim_root = _retry_authority(
+        str(stored["retry_generation"])
+    )["claim_root"]
     try:
         acquisition = atomic_claim.acquire_claim(
-            CLAIM_ROOT, reference, winner
+            claim_root, reference, winner
         )
     except atomic_claim.ClaimContractError as exc:
         raise HandoffContractError(
@@ -1600,7 +1713,7 @@ def submit(
         try:
             if claim_status == "existing_pending":
                 finalized_claim = atomic_claim.recover_pending_claim(
-                    CLAIM_ROOT,
+                    claim_root,
                     reference,
                     acquisition["claim"],
                     matching_tasks=[recovered],
@@ -1609,7 +1722,7 @@ def submit(
                 )
             elif claim_status == "existing_finalized":
                 finalized_claim = atomic_claim.validate_finalized_claim(
-                    CLAIM_ROOT,
+                    claim_root,
                     reference,
                     claim=acquisition["claim"],
                     expected_winner=winner,
@@ -1722,7 +1835,7 @@ def submit(
     if claim_status == "fresh_pending":
         try:
             finalized_claim = atomic_claim.finalize_claim(
-                CLAIM_ROOT,
+                claim_root,
                 reference,
                 acquisition["claim"],
                 task_id=new_task_id,
@@ -1920,9 +2033,12 @@ def _validate_claim_receipt(
     winner = _claim_winner(
         Path(plan["_resolved_plan_path"]), plan
     )
+    claim_root = _retry_authority(
+        str(plan["retry_of_timeout12h"]["retry_generation"])
+    )["claim_root"]
     try:
         finalized = atomic_claim.validate_finalized_claim(
-            CLAIM_ROOT,
+            claim_root,
             reference,
             claim=value.get("finalized_claim"),
             expected_winner=winner,
@@ -2118,7 +2234,12 @@ def _parser() -> argparse.ArgumentParser:
         description="Exact-once bounded MFT timeout12h recovery"
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("init-timeout12h-claim-root")
+    claim_init = commands.add_parser("init-timeout12h-claim-root")
+    claim_init.add_argument(
+        "--retry-generation",
+        choices=(RETRY_GENERATION, SUPPLEMENTAL_RETRY_GENERATION),
+        default=RETRY_GENERATION,
+    )
     plan = commands.add_parser("plan-timeout12h-retry")
     plan.add_argument("--immediate-plan", type=Path, required=True)
     plan.add_argument("--immediate-submission", type=Path, required=True)
@@ -2158,7 +2279,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "init-timeout12h-claim-root":
-        authority = initialize_claim_root()
+        authority = initialize_claim_root(
+            retry_generation=args.retry_generation
+        )
         result = Path(authority["resolved_root"])
     elif args.command == "plan-timeout12h-retry":
         result = create_plan(

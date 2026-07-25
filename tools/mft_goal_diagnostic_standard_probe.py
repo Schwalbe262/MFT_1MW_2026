@@ -282,6 +282,25 @@ OPERATIONAL_PRESSURE_FAILURE_MESSAGE = (
     "memory pressure hard limit after 3 attempts"
 )
 OPERATIONAL_PRESSURE_ATTEMPT_COUNT = 3
+OPERATIONAL_ATTESTATION_FAILURE_CLASS = (
+    "standalone_desktop_idle_process_attestation_barrier_timeout"
+)
+OPERATIONAL_ATTESTATION_FAILURE_MESSAGE = (
+    "standalone thermal completion barrier did not prove exact Desktop idle"
+)
+OPERATIONAL_ATTESTATION_FAILURE_MESSAGE_PREFIX = (
+    "RESULT_JSON: thermal_error_message="
+    + OPERATIONAL_ATTESTATION_FAILURE_MESSAGE
+    + ": "
+)
+OPERATIONAL_ATTESTATION_ATTEMPT_COUNT = 1
+OPERATIONAL_ATTESTATION_EXECUTION_SCHEMA = (
+    "mft-goal-diagnostic-standard-operational-attestation-evidence-v1"
+)
+OPERATIONAL_ATTESTATION_STREAM_SCHEMA = (
+    "mft-goal-diagnostic-standard-operational-attestation-stream-v1"
+)
+OPERATIONAL_ATTESTATION_MAX_STREAM_BYTES = 64 * 1024 * 1024
 TIMEOUT_STRICT_TASK_IDENTITY_GENERATION = (
     "timeout-strict-r2-node-bound"
 )
@@ -4052,6 +4071,394 @@ def _read_operational_pressure_failure(
     return before
 
 
+def _scheduler_operational_stream(
+    *,
+    scheduler_url: str,
+    task_id: int,
+    stream: str,
+) -> bytes:
+    if (
+        stream not in {"stdout", "stderr"}
+        or isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+    ):
+        raise HandoffContractError(
+            "operational-attestation Scheduler stream request is invalid"
+        )
+    request = production.urllib.request.Request(
+        f"{scheduler_url.rstrip('/')}/api/tasks/{task_id}/{stream}",
+        headers={"Accept": "text/plain"},
+        method="GET",
+    )
+    try:
+        with production.urllib.request.urlopen(
+            request, timeout=120.0
+        ) as response:
+            raw = response.read(OPERATIONAL_ATTESTATION_MAX_STREAM_BYTES + 1)
+    except (OSError, production.urllib.error.URLError) as exc:
+        raise HandoffContractError(
+            f"operational-attestation Scheduler {stream} is unavailable"
+        ) from exc
+    if not raw or len(raw) > OPERATIONAL_ATTESTATION_MAX_STREAM_BYTES:
+        raise HandoffContractError(
+            f"operational-attestation Scheduler {stream} byte bound failed"
+        )
+    return raw
+
+
+def _operational_attestation_task_evidence(
+    snapshot: Mapping[str, Any],
+    *,
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = {
+        "schema_version": OPERATIONAL_ATTESTATION_EXECUTION_SCHEMA,
+        "task_id": snapshot.get("task_id", snapshot.get("id")),
+        "name": snapshot.get("name"),
+        "status": snapshot.get("status"),
+        "state": snapshot.get("state"),
+        "exit_code": snapshot.get("exit_code"),
+        "failure_message": snapshot.get("failure_message"),
+        "timeout_seconds": snapshot.get("timeout_seconds"),
+        "slurm_job_id": str(snapshot.get("slurm_job_id") or ""),
+        "allocation_id": snapshot.get(
+            "allocation_id", snapshot.get("assigned_allocation")
+        ),
+        "account_name": snapshot.get("account_name"),
+        "actual_node_name": snapshot.get("actual_node_name"),
+        "cpus": snapshot.get("cpus"),
+        "memory_mb": snapshot.get("memory_mb"),
+        "aedt_backend": snapshot.get("aedt_backend"),
+        "project": snapshot.get("project"),
+        "dedupe_key": snapshot.get("dedupe_key"),
+        "remote_cwd": snapshot.get("remote_cwd"),
+        "remote_dir": snapshot.get("remote_dir"),
+        "created_at": snapshot.get("created_at"),
+        "started_at": snapshot.get("started_at"),
+        "finished_at": snapshot.get("finished_at"),
+    }
+    message = str(evidence["failure_message"] or "")
+    allocation_id = evidence["allocation_id"]
+    if (
+        evidence["task_id"] != submission["task_id"]
+        or evidence["name"] != submission["task_name"]
+        or evidence["status"] != "failed"
+        or evidence["state"] != "failed"
+        or evidence["exit_code"] != 70
+        or not message.startswith(
+            OPERATIONAL_ATTESTATION_FAILURE_MESSAGE_PREFIX
+        )
+        or "NativeIcepakParallelAttestationError" not in message
+        or "cached native Desktop PID mismatch" not in message
+        or "standalone Icepak process attestation observed no Fluent -t command"
+        not in message
+        or '"mesh_mapping_coverage_passed":true' not in message
+        or '"mesh_artifact_readback_passed":true' not in message
+        or '"analysis_dispatched_after_premesh":true' not in message
+        or '"monitor_reason":"parallel_process_attestation_failed"'
+        not in message
+        or "solve_not_converged" in message
+        or "native_terminal_error" in message
+        or evidence["timeout_seconds"]
+        != submission["resources"]["timeout_seconds"]
+        or evidence["cpus"] != 8
+        or evidence["memory_mb"] != 32768
+        or evidence["aedt_backend"] != "standalone"
+        or evidence["project"] != scheduler_client.MFT_PROJECT
+        or evidence["dedupe_key"] != submission["dedupe_key"]
+        or not evidence["slurm_job_id"].isdigit()
+        or isinstance(allocation_id, bool)
+        or not isinstance(allocation_id, int)
+        or allocation_id <= 0
+        or not str(evidence["account_name"] or "").strip()
+        or not str(evidence["actual_node_name"] or "").strip()
+        or not str(evidence["remote_cwd"] or "").strip()
+        or not str(evidence["remote_dir"] or "").strip()
+        or not str(evidence["created_at"] or "").strip()
+        or not str(evidence["started_at"] or "").strip()
+        or not str(evidence["finished_at"] or "").strip()
+    ):
+        raise HandoffContractError(
+            "diagnostic operational-attestation retry requires the exact "
+            "terminal failed/70 Desktop-idle/process-attestation barrier"
+        )
+    return evidence
+
+
+def _operational_attestation_stream_evidence(
+    stdout: bytes | str,
+    stderr: bytes | str,
+    *,
+    task_id: int,
+) -> dict[str, Any]:
+    raw_out = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+    raw_err = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
+    if (
+        not isinstance(raw_out, bytes)
+        or not isinstance(raw_err, bytes)
+        or not raw_out
+        or not raw_err
+        or len(raw_out) > OPERATIONAL_ATTESTATION_MAX_STREAM_BYTES
+        or len(raw_err) > OPERATIONAL_ATTESTATION_MAX_STREAM_BYTES
+    ):
+        raise HandoffContractError(
+            "operational-attestation stream evidence is invalid"
+        )
+    try:
+        out_text = raw_out.decode("utf-8")
+        err_text = raw_err.decode("utf-8")
+    except UnicodeError as exc:
+        raise HandoffContractError(
+            "operational-attestation stream evidence is not UTF-8"
+        ) from exc
+    result_lines = [
+        line
+        for line in out_text.splitlines()
+        if line.startswith("RESULT_JSON ")
+    ]
+    if len(result_lines) != 1:
+        raise HandoffContractError(
+            "operational-attestation RESULT_JSON evidence is ambiguous"
+        )
+    try:
+        result = json.loads(result_lines[0][len("RESULT_JSON ") :])
+    except json.JSONDecodeError as exc:
+        raise HandoffContractError(
+            "operational-attestation RESULT_JSON is invalid"
+        ) from exc
+    marker = "[thermal] native mesh preflight: "
+    preflight_lines = [
+        line for line in err_text.splitlines() if marker in line
+    ]
+    if len(preflight_lines) != 1:
+        raise HandoffContractError(
+            "operational-attestation native premesh evidence is ambiguous"
+        )
+    try:
+        preflight = json.loads(preflight_lines[0].split(marker, 1)[1])
+    except json.JSONDecodeError as exc:
+        raise HandoffContractError(
+            "operational-attestation native premesh JSON is invalid"
+        ) from exc
+    artifacts = preflight.get("fresh_mesh_artifacts")
+    if not isinstance(artifacts, list):
+        raise HandoffContractError(
+            "operational-attestation fresh mesh inventory is absent"
+        )
+    grid_bytes = sum(
+        int(row.get("grid_output_size") or 0)
+        for row in artifacts
+        if isinstance(row, Mapping)
+    )
+    error_message = str(result.get("thermal_error_message") or "")
+    fixed_boundary = {
+        "contract_schema": result.get("fixed_boundary_contract_schema"),
+        "contract_sha256": result.get("fixed_boundary_contract_sha256"),
+        "authoritative_attested": result.get(
+            "fixed_boundary_authoritative_attested"
+        ),
+        "fan_velocity_m_s": result.get(
+            "fixed_boundary_fan_velocity_m_s"
+        ),
+        "core_plate_pad_t_mm": result.get(
+            "fixed_boundary_core_plate_pad_t_mm"
+        ),
+        "wcp_pad_t_mm": result.get("fixed_boundary_wcp_pad_t_mm"),
+        "thermal_pad_conductivity_W_mK": result.get(
+            "fixed_boundary_thermal_pad_conductivity_W_mK"
+        ),
+        "mismatches_json": result.get(
+            "fixed_boundary_mismatches_json"
+        ),
+    }
+    if (
+        preflight.get("schema") != "thermal-mesh-preflight-v2"
+        or preflight.get("passed") is not True
+        or preflight.get("status") != "passed_standalone_native_premesh"
+        or preflight.get("mesh_mapping_coverage_passed") is not True
+        or preflight.get("mesh_artifact_readback_passed") is not True
+        or preflight.get("native_operation_readback_passed") is not True
+        or preflight.get("standalone_idle_barrier_passed") is not True
+        or preflight.get("postflight_error") != ""
+        or preflight.get("native_errors") != []
+        or preflight.get("fresh_mesh_artifact_count") != len(artifacts)
+        or not artifacts
+        or grid_bytes <= 0
+        or result.get("result_valid_em") != 1
+        or result.get("result_valid_thermal") != 0
+        or result.get("thermal_solved") != 0
+        or result.get("thermal_convergence_available") != 0
+        or result.get("thermal_converged") != 0
+        or result.get("thermal_extraction_complete") != 0
+        or result.get("thermal_error_type") != "RuntimeError"
+        or not error_message.startswith(
+            OPERATIONAL_ATTESTATION_FAILURE_MESSAGE
+        )
+        or "cached native Desktop PID mismatch" not in error_message
+        or "NativeIcepakParallelAttestationError" not in error_message
+        or "standalone Icepak process attestation observed no Fluent -t command"
+        not in error_message
+        or "parallel_process_attestation_failed" not in error_message
+        or "solve_not_converged" in out_text
+        or "native_terminal_error" in out_text
+        or "solve_not_converged" in err_text
+        or "native_terminal_error" in err_text
+        or "UncertainStandaloneSolverExit" not in err_text
+        or "FATAL_CONTAINMENT standalone native solver remains uncertain"
+        not in err_text
+        or "Exited with exit code 70" not in err_text
+        or fixed_boundary["contract_schema"]
+        != "mft-fixed-thermal-boundary-v1"
+        or production._require_sha(
+            fixed_boundary["contract_sha256"],
+            "operational-attestation fixed-boundary contract SHA",
+        )
+        != fixed_boundary["contract_sha256"]
+        or fixed_boundary["authoritative_attested"] != 1
+        or fixed_boundary["fan_velocity_m_s"] != 1.5
+        or fixed_boundary["core_plate_pad_t_mm"] != 2.0
+        or fixed_boundary["wcp_pad_t_mm"] != 2.0
+        or fixed_boundary["thermal_pad_conductivity_W_mK"] != 0.2
+        or fixed_boundary["mismatches_json"] != "[]"
+        or str(result.get("solver_core_scheduler_task_id_readback") or "")
+        != str(task_id)
+        or result.get("solver_num_cores_requested") != 8
+        or result.get("solver_num_cores_effective") != 8
+    ):
+        raise HandoffContractError(
+            "operational-attestation evidence is not a nonphysical "
+            "Desktop-idle/process-attestation barrier failure"
+        )
+    return {
+        "schema_version": OPERATIONAL_ATTESTATION_STREAM_SCHEMA,
+        "task_id": task_id,
+        "stdout_sha256": production._sha256_bytes(raw_out),
+        "stdout_size_bytes": len(raw_out),
+        "stderr_sha256": production._sha256_bytes(raw_err),
+        "stderr_size_bytes": len(raw_err),
+        "native_premesh_passed": True,
+        "mesh_mapping_coverage_passed": True,
+        "mesh_artifact_readback_passed": True,
+        "fresh_mesh_artifact_count": len(artifacts),
+        "fresh_grid_output_bytes": grid_bytes,
+        "thermal_analysis_dispatched": True,
+        "desktop_idle_attestation_failed": True,
+        "fluent_process_attestation_failed": True,
+        "completion_barrier_timed_out": True,
+        "native_physical_nonconvergence_absent": True,
+        "result_valid_em": 1,
+        "result_valid_thermal": 0,
+        "fixed_boundary": fixed_boundary,
+    }
+
+
+def _operational_attestation_failure_evidence(
+    snapshot: Mapping[str, Any],
+    stdout: bytes | str,
+    stderr: bytes | str,
+    *,
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    task = _operational_attestation_task_evidence(
+        snapshot, submission=submission
+    )
+    stream = _operational_attestation_stream_evidence(
+        stdout, stderr, task_id=int(submission["task_id"])
+    )
+    return {
+        **task,
+        "stream_evidence": stream,
+        "stream_evidence_sha256": canonical_sha256(stream),
+    }
+
+
+def _validate_operational_attestation_execution(
+    execution: Any,
+    *,
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(execution, Mapping):
+        raise HandoffContractError(
+            "diagnostic operational-attestation evidence is absent"
+        )
+    stream = execution.get("stream_evidence")
+    task = {
+        name: copy.deepcopy(value)
+        for name, value in execution.items()
+        if name not in {"stream_evidence", "stream_evidence_sha256"}
+    }
+    normalized_task = _operational_attestation_task_evidence(
+        task, submission=submission
+    )
+    if (
+        task != normalized_task
+        or not isinstance(stream, Mapping)
+        or stream.get("schema_version")
+        != OPERATIONAL_ATTESTATION_STREAM_SCHEMA
+        or stream.get("task_id") != submission["task_id"]
+        or stream.get("native_premesh_passed") is not True
+        or stream.get("thermal_analysis_dispatched") is not True
+        or stream.get("desktop_idle_attestation_failed") is not True
+        or stream.get("fluent_process_attestation_failed") is not True
+        or stream.get("completion_barrier_timed_out") is not True
+        or stream.get("native_physical_nonconvergence_absent") is not True
+        or stream.get("result_valid_thermal") != 0
+        or stream.get("fixed_boundary", {}).get("fan_velocity_m_s") != 1.5
+        or stream.get("fixed_boundary", {}).get(
+            "thermal_pad_conductivity_W_mK"
+        )
+        != 0.2
+        or execution.get("stream_evidence_sha256")
+        != canonical_sha256(stream)
+    ):
+        raise HandoffContractError(
+            "diagnostic operational-attestation evidence drifted"
+        )
+    return copy.deepcopy(dict(execution))
+
+
+def _read_operational_attestation_failure(
+    *,
+    scheduler_url: str,
+    submission: Mapping[str, Any],
+    task_reader: Any,
+    stdout_reader: Any,
+    stderr_reader: Any,
+) -> dict[str, Any]:
+    task_id = int(submission["task_id"])
+    task_before = task_reader(
+        scheduler_url=scheduler_url, task_id=task_id
+    )
+    stdout = stdout_reader(
+        scheduler_url=scheduler_url, task_id=task_id
+    )
+    stderr = stderr_reader(
+        scheduler_url=scheduler_url, task_id=task_id
+    )
+    task_after = task_reader(
+        scheduler_url=scheduler_url, task_id=task_id
+    )
+    before = _operational_attestation_failure_evidence(
+        task_before,
+        stdout,
+        stderr,
+        submission=submission,
+    )
+    after = _operational_attestation_failure_evidence(
+        task_after,
+        stdout,
+        stderr,
+        submission=submission,
+    )
+    if before != after:
+        raise HandoffContractError(
+            "Scheduler operational-attestation task changed during "
+            "GET-only evidence capture"
+        )
+    return before
+
+
 def _validate_timeout_retry_record(
     plan: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -5073,6 +5480,26 @@ def _validate_mesh_quality_canary_record(
     )
 
 
+def _operational_retry_failure_contract(
+    failure_class: Any,
+) -> dict[str, Any]:
+    if failure_class == OPERATIONAL_PRESSURE_FAILURE_CLASS:
+        return {
+            "failure_class": OPERATIONAL_PRESSURE_FAILURE_CLASS,
+            "failure_message": OPERATIONAL_PRESSURE_FAILURE_MESSAGE,
+            "attempt_count": OPERATIONAL_PRESSURE_ATTEMPT_COUNT,
+        }
+    if failure_class == OPERATIONAL_ATTESTATION_FAILURE_CLASS:
+        return {
+            "failure_class": OPERATIONAL_ATTESTATION_FAILURE_CLASS,
+            "failure_message": OPERATIONAL_ATTESTATION_FAILURE_MESSAGE,
+            "attempt_count": OPERATIONAL_ATTESTATION_ATTEMPT_COUNT,
+        }
+    raise HandoffContractError(
+        "diagnostic operational retry failure class is unsupported"
+    )
+
+
 def _validate_operational_pressure_retry_record(
     plan: Mapping[str, Any],
 ) -> tuple[
@@ -5099,18 +5526,22 @@ def _validate_operational_pressure_retry_record(
         "failure_message",
         "attempt_count",
     }
+    if not isinstance(record, dict):
+        raise HandoffContractError(
+            "diagnostic Standard operational-pressure retry record drifted"
+        )
+    failure_contract = _operational_retry_failure_contract(
+        record.get("failure_class")
+    )
     if (
-        not isinstance(record, dict)
-        or set(record) != expected_fields
+        set(record) != expected_fields
         or record.get("schema_version")
         != OPERATIONAL_PRESSURE_RETRY_EVIDENCE_SCHEMA
         or record.get("scheduler_url") != DIAGNOSTIC_SCHEDULER_URL
-        or record.get("failure_class")
-        != OPERATIONAL_PRESSURE_FAILURE_CLASS
-        or record.get("failure_message")
-        != OPERATIONAL_PRESSURE_FAILURE_MESSAGE
-        or record.get("attempt_count")
-        != OPERATIONAL_PRESSURE_ATTEMPT_COUNT
+        or any(
+            record.get(name) != value
+            for name, value in failure_contract.items()
+        )
     ):
         raise HandoffContractError(
             "diagnostic Standard operational-pressure retry record drifted"
@@ -5150,10 +5581,16 @@ def _validate_operational_pressure_retry_record(
         logical_plan = original_plan
         logical_submission = original_submission
         expected_parent_ancestry_sha256 = None
-    execution = _validate_operational_pressure_execution(
-        record.get("original_task_execution"),
-        submission=original_submission,
-    )
+    if record["failure_class"] == OPERATIONAL_PRESSURE_FAILURE_CLASS:
+        execution = _validate_operational_pressure_execution(
+            record.get("original_task_execution"),
+            submission=original_submission,
+        )
+    else:
+        execution = _validate_operational_attestation_execution(
+            record.get("original_task_execution"),
+            submission=original_submission,
+        )
     if (
         record.get("retry_of_task_id") != original_submission["task_id"]
         or record.get("logical_authority_task_id")
@@ -5647,7 +6084,10 @@ def create_operational_pressure_retry_plan(
     scheduler_url: str = DIAGNOSTIC_SCHEDULER_URL,
     task_reader: Any = None,
     event_reader: Any = None,
+    stdout_reader: Any = None,
+    stderr_reader: Any = None,
     strict_node_name: str = "",
+    failure_class: str = OPERATIONAL_PRESSURE_FAILURE_CLASS,
 ) -> Path:
     original_plan, params, selected = _load_plan(original_plan_path)
     immediate_retry_kind = _plan_retry_kind(original_plan)
@@ -5680,13 +6120,33 @@ def create_operational_pressure_retry_plan(
             "original submission"
         )
     read_task = task_reader or _scheduler_task_snapshot
-    read_events = event_reader or _scheduler_task_events
-    execution = _read_operational_pressure_failure(
-        scheduler_url=normalized_scheduler_url,
-        submission=original_submission,
-        task_reader=read_task,
-        event_reader=read_events,
-    )
+    failure_contract = _operational_retry_failure_contract(failure_class)
+    if failure_class == OPERATIONAL_PRESSURE_FAILURE_CLASS:
+        read_events = event_reader or _scheduler_task_events
+        execution = _read_operational_pressure_failure(
+            scheduler_url=normalized_scheduler_url,
+            submission=original_submission,
+            task_reader=read_task,
+            event_reader=read_events,
+        )
+    else:
+        read_stdout = stdout_reader or (
+            lambda **kwargs: _scheduler_operational_stream(
+                stream="stdout", **kwargs
+            )
+        )
+        read_stderr = stderr_reader or (
+            lambda **kwargs: _scheduler_operational_stream(
+                stream="stderr", **kwargs
+            )
+        )
+        execution = _read_operational_attestation_failure(
+            scheduler_url=normalized_scheduler_url,
+            submission=original_submission,
+            task_reader=read_task,
+            stdout_reader=read_stdout,
+            stderr_reader=read_stderr,
+        )
     original_profile = production._read_json(
         original_plan_path.resolve(strict=True).parent
         / original_plan["profile"]["path"]
@@ -5771,9 +6231,7 @@ def create_operational_pressure_retry_plan(
         "original_task_execution": execution,
         "original_task_execution_sha256": canonical_sha256(execution),
         "scheduler_url": normalized_scheduler_url,
-        "failure_class": OPERATIONAL_PRESSURE_FAILURE_CLASS,
-        "failure_message": OPERATIONAL_PRESSURE_FAILURE_MESSAGE,
-        "attempt_count": OPERATIONAL_PRESSURE_ATTEMPT_COUNT,
+        **failure_contract,
     }
     destination = output.resolve()
     if destination.exists():
@@ -6820,6 +7278,7 @@ def _submit_standard_plan(
     live_reader: Any = _default_scheduler_live_reader,
     task_reader: Any = None,
     stdout_reader: Any = None,
+    stderr_reader: Any = None,
     event_reader: Any = None,
     task_list_reader: Any = None,
     same_node_as_task_id: int = 0,
@@ -6962,6 +7421,16 @@ def _submit_standard_plan(
     retry_record = None
     reader = task_reader or _scheduler_task_snapshot
     read_events = event_reader or _scheduler_task_events
+    read_operational_stdout = stdout_reader or (
+        lambda **kwargs: _scheduler_operational_stream(
+            stream="stdout", **kwargs
+        )
+    )
+    read_operational_stderr = stderr_reader or (
+        lambda **kwargs: _scheduler_operational_stream(
+            stream="stderr", **kwargs
+        )
+    )
     read_task_list = task_list_reader or _scheduler_project_tasks
     anchor_before = None
     sibling_before = None
@@ -7065,12 +7534,24 @@ def _submit_standard_plan(
 
         def pressure_pre_submit_guard() -> None:
             nonlocal sibling_before, pressure_locked_guard_count
-            live_execution = _read_operational_pressure_failure(
-                scheduler_url=stage["scheduler_url"],
-                submission=original_submission,
-                task_reader=reader,
-                event_reader=read_events,
-            )
+            if (
+                retry_record["failure_class"]
+                == OPERATIONAL_PRESSURE_FAILURE_CLASS
+            ):
+                live_execution = _read_operational_pressure_failure(
+                    scheduler_url=stage["scheduler_url"],
+                    submission=original_submission,
+                    task_reader=reader,
+                    event_reader=read_events,
+                )
+            else:
+                live_execution = _read_operational_attestation_failure(
+                    scheduler_url=stage["scheduler_url"],
+                    submission=original_submission,
+                    task_reader=reader,
+                    stdout_reader=read_operational_stdout,
+                    stderr_reader=read_operational_stderr,
+                )
             if live_execution != stored_execution:
                 raise HandoffContractError(
                     "diagnostic operational-pressure failure evidence "
@@ -7984,6 +8465,8 @@ def submit_operational_pressure_retry(
     predictor: Any | None = None,
     live_reader: Any = _default_scheduler_live_reader,
     task_reader: Any = None,
+    stdout_reader: Any = None,
+    stderr_reader: Any = None,
     event_reader: Any = None,
     task_list_reader: Any = None,
     same_node_as_task_id: int = 0,
@@ -8003,6 +8486,8 @@ def submit_operational_pressure_retry(
         predictor=predictor,
         live_reader=live_reader,
         task_reader=task_reader,
+        stdout_reader=stdout_reader,
+        stderr_reader=stderr_reader,
         event_reader=event_reader,
         task_list_reader=task_list_reader,
         same_node_as_task_id=same_node_as_task_id,
@@ -9619,6 +10104,19 @@ def _parser() -> argparse.ArgumentParser:
             "operational-pressure-strict-r1 identity"
         ),
     )
+    pressure_retry_plan.add_argument(
+        "--failure-class",
+        choices=(
+            OPERATIONAL_PRESSURE_FAILURE_CLASS,
+            OPERATIONAL_ATTESTATION_FAILURE_CLASS,
+        ),
+        default=OPERATIONAL_PRESSURE_FAILURE_CLASS,
+        help=(
+            "authenticate either the Scheduler three-attempt memory-pressure "
+            "terminal or the bounded standalone Desktop/process-attestation "
+            "barrier terminal"
+        ),
+    )
     pressure_retry_plan.add_argument("--output", type=Path, required=True)
 
     submit = commands.add_parser("submit-standard")
@@ -9803,6 +10301,7 @@ def main(argv: list[str] | None = None) -> int:
             original_submission_path=args.original_submission,
             scheduler_url=args.scheduler_url,
             strict_node_name=args.strict_node_name,
+            failure_class=args.failure_class,
             output=args.output,
         )
     elif args.command == "submit-standard":

@@ -661,6 +661,99 @@ def _operational_pressure_events(submission):
     ]))
 
 
+def _operational_attestation_task_snapshot(submission, **overrides):
+    forensic = (
+        '{"exception_type":"NativeIcepakParallelAttestationError",'
+        '"desktop_error":"cached native Desktop PID mismatch",'
+        '"process_error":"standalone Icepak process attestation observed no '
+        'Fluent -t command","mesh_mapping_coverage_passed":true,'
+        '"mesh_artifact_readback_passed":true,'
+        '"analysis_dispatched_after_premesh":true,'
+        '"monitor_reason":"parallel_process_attestation_failed"}'
+    )
+    snapshot = {
+        **_task_snapshot(submission),
+        "status": "failed",
+        "state": "failed",
+        "exit_code": 70,
+        "failure_message": (
+            probe.OPERATIONAL_ATTESTATION_FAILURE_MESSAGE_PREFIX
+            + forensic
+        ),
+        "timeout_seconds": submission["resources"]["timeout_seconds"],
+        "allocation_id": 14620,
+        "account_name": "dw16",
+        "actual_node_name": "n113",
+        "slurm_job_id": "829579",
+        "created_at": "2026-07-25 05:09:00",
+        "started_at": "2026-07-25 05:09:29",
+        "finished_at": "2026-07-25 11:13:57",
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def _operational_attestation_streams(task_id):
+    error_message = (
+        probe.OPERATIONAL_ATTESTATION_FAILURE_MESSAGE
+        + ': {"exception_type":"NativeIcepakParallelAttestationError",'
+        '"desktop_error":"cached native Desktop PID mismatch",'
+        '"process_error":"standalone Icepak process attestation observed no '
+        'Fluent -t command","monitor_reason":'
+        '"parallel_process_attestation_failed"}'
+    )
+    result = {
+        "result_valid_em": 1,
+        "result_valid_thermal": 0,
+        "thermal_solved": 0,
+        "thermal_convergence_available": 0,
+        "thermal_converged": 0,
+        "thermal_extraction_complete": 0,
+        "thermal_error_type": "RuntimeError",
+        "thermal_error_message": error_message,
+        "fixed_boundary_contract_schema": "mft-fixed-thermal-boundary-v1",
+        "fixed_boundary_contract_sha256": "a" * 64,
+        "fixed_boundary_authoritative_attested": 1,
+        "fixed_boundary_fan_velocity_m_s": 1.5,
+        "fixed_boundary_core_plate_pad_t_mm": 2.0,
+        "fixed_boundary_wcp_pad_t_mm": 2.0,
+        "fixed_boundary_thermal_pad_conductivity_W_mK": 0.2,
+        "fixed_boundary_mismatches_json": "[]",
+        "solver_core_scheduler_task_id_readback": str(task_id),
+        "solver_num_cores_requested": 8,
+        "solver_num_cores_effective": 8,
+    }
+    preflight = {
+        "schema": "thermal-mesh-preflight-v2",
+        "passed": True,
+        "status": "passed_standalone_native_premesh",
+        "mesh_mapping_coverage_passed": True,
+        "mesh_artifact_readback_passed": True,
+        "native_operation_readback_passed": True,
+        "standalone_idle_barrier_passed": True,
+        "postflight_error": "",
+        "native_errors": [],
+        "fresh_mesh_artifact_count": 1,
+        "fresh_mesh_artifacts": [
+            {"name": "mesh.sd", "grid_output_size": 28 * 1024**3}
+        ],
+    }
+    stdout = (
+        "RESULT_JSON "
+        + json.dumps(result, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode()
+    stderr = (
+        "[thermal] native mesh preflight: "
+        + json.dumps(preflight, sort_keys=True, separators=(",", ":"))
+        + "\nNativeIcepakParallelAttestationError\n"
+        + "UncertainStandaloneSolverExit\n"
+        + "FATAL_CONTAINMENT standalone native solver remains uncertain\n"
+        + "srun: error: n113: task 0: Exited with exit code 70\n"
+    ).encode()
+    return stdout, stderr
+
+
 def _same_allocation_anchor_snapshot(**overrides):
     snapshot = {
         "task_id": 72000,
@@ -2171,6 +2264,104 @@ def test_operational_pressure_after_timeout_is_bounded_and_eight_hours(
             event_reader=lambda **_kwargs: (
                 _operational_pressure_events(compound_submission)
             ),
+        )
+
+
+def test_operational_attestation_after_timeout_is_bounded_and_nonphysical(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    base_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    base_submission_path = probe.submit_standard(
+        plan_path=base_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "attestation-base-submission.json",
+        scheduler=_FakeScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    base_plan = probe._load_plan(base_plan_path)[0]
+    base_submission = probe._load_submission(
+        base_submission_path, plan=base_plan
+    )
+    timeout_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=base_plan_path,
+        original_submission_path=base_submission_path,
+        output=tmp_path / "attestation-timeout-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            base_submission
+        ),
+    )
+
+    class _TimeoutScheduler(_FakeScheduler):
+        def submit_verification(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return 71002
+
+    timeout_submission_path = probe.submit_timeout_retry(
+        plan_path=timeout_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "attestation-timeout-submission.json",
+        scheduler=_TimeoutScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            base_submission
+        ),
+    )
+    timeout_plan = probe._load_plan(timeout_plan_path)[0]
+    timeout_submission = probe._load_submission(
+        timeout_submission_path, plan=timeout_plan
+    )
+    stdout, stderr = _operational_attestation_streams(
+        timeout_submission["task_id"]
+    )
+    retry_plan_path = probe.create_operational_pressure_retry_plan(
+        original_plan_path=timeout_plan_path,
+        original_submission_path=timeout_submission_path,
+        output=tmp_path / "attestation-retry-plan",
+        failure_class=probe.OPERATIONAL_ATTESTATION_FAILURE_CLASS,
+        task_reader=lambda **_kwargs: (
+            _operational_attestation_task_snapshot(timeout_submission)
+        ),
+        stdout_reader=lambda **_kwargs: stdout,
+        stderr_reader=lambda **_kwargs: stderr,
+        event_reader=lambda **_kwargs: pytest.fail(
+            "attestation retry must not use memory-pressure events"
+        ),
+    )
+    retry_plan = probe._load_plan(retry_plan_path)[0]
+    record = retry_plan["retry_of_operational_pressure"]
+    assert record["logical_authority_task_id"] == 71001
+    assert record["retry_of_task_id"] == 71002
+    assert record["immediate_retry_kind"] == "timeout"
+    assert (
+        record["failure_class"]
+        == probe.OPERATIONAL_ATTESTATION_FAILURE_CLASS
+    )
+    assert record["attempt_count"] == 1
+    assert retry_plan["stage"]["resources"] == timeout_plan["stage"][
+        "resources"
+    ]
+    assert retry_plan["stage"]["resources"]["timeout_seconds"] == 28800
+    evidence = record["original_task_execution"]["stream_evidence"]
+    assert evidence["native_premesh_passed"] is True
+    assert evidence["thermal_analysis_dispatched"] is True
+    assert evidence["native_physical_nonconvergence_absent"] is True
+    assert evidence["fixed_boundary"]["fan_velocity_m_s"] == 1.5
+    assert (
+        evidence["fixed_boundary"]["thermal_pad_conductivity_W_mK"]
+        == 0.2
+    )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="nonphysical Desktop-idle/process-attestation",
+    ):
+        probe._operational_attestation_stream_evidence(
+            stdout,
+            stderr + b"native_terminal_error\n",
+            task_id=timeout_submission["task_id"],
         )
 
 

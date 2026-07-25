@@ -264,6 +264,70 @@ def test_timeout12h_plan_is_exact_timeout_only_and_probe_loadable(
     ] is False
 
 
+def test_timeout12h_supplemental_authority_isolated_from_frozen_r1(
+    tmp_path, monkeypatch
+):
+    helpers = _helpers()
+    immediate_plan, immediate_submission, _receipt = (
+        _setup_immediate_timeout(tmp_path, monkeypatch, helpers)
+    )
+    supplemental_root = (tmp_path / "timeout12h-claims-r2").resolve()
+    monkeypatch.setattr(timeout12h, "EXACT_LOGICAL_TO_FAILED_TASK", {})
+    monkeypatch.setattr(
+        timeout12h,
+        "SUPPLEMENTAL_EXACT_LOGICAL_TO_FAILED_TASK",
+        {96218: 96256},
+    )
+    monkeypatch.setattr(
+        timeout12h, "SUPPLEMENTAL_CLAIM_ROOT", supplemental_root
+    )
+    atomic_claim.initialize_claim_root(
+        supplemental_root,
+        campaign_id="mft-goal-20260726",
+        campaign_authority_sha256=(
+            timeout12h.SUPPLEMENTAL_CLAIM_AUTHORITY_SHA256
+        ),
+        root_id="9" * 32,
+        now="2026-07-25T13:00:00Z",
+    )
+    stdout, stderr = _stream_bundle()
+    plan_path = timeout12h.create_plan(
+        immediate_plan_path=immediate_plan,
+        immediate_submission_path=immediate_submission,
+        strict_node_name="n114",
+        storage_observed_at_kst="2026-07-25T22:00:00+09:00",
+        storage_used_gb=100.2698,
+        storage_in_doubt_gb=5.2039,
+        storage_limit_gb=200.0,
+        storage_observed_free_gb=94.5263,
+        output=tmp_path / "timeout12h-r2-plan",
+        task_reader=lambda **_kwargs: _timeout8h_snapshot(
+            probe._load_submission(
+                immediate_submission,
+                plan=probe._load_plan(immediate_plan)[0],
+            )
+        ),
+        stdout_reader=lambda **_kwargs: stdout,
+        stderr_reader=lambda **_kwargs: stderr,
+        remote_files_reader=lambda **kwargs: {
+            "base": "remote_cwd",
+            "glob": kwargs["glob"],
+            "files": [],
+        },
+    )
+    plan = probe._load_plan(plan_path)[0]
+    record = plan["retry_of_timeout12h"]
+    assert (
+        record["retry_generation"]
+        == timeout12h.SUPPLEMENTAL_RETRY_GENERATION
+    )
+    assert "-timeout12h-r2-l96218-" in plan["stage"]["task_name"]
+    assert plan["timeout12h_atomic_claim_reference"][
+        "retry_generation"
+    ] == timeout12h.SUPPLEMENTAL_RETRY_GENERATION
+    assert supplemental_root.exists()
+
+
 def test_timeout12h_atomic_submit_and_submission_dispatch(
     tmp_path, monkeypatch
 ):
