@@ -812,6 +812,17 @@ def test_capacity_must_be_ready_on_exact_audited_account() -> None:
         )
 
 
+def test_capacity_probe_uses_the_actual_full_submission_profile() -> None:
+    endpoint = fastlane._capacity_endpoint("dhj02")
+    query = fastlane.urllib.parse.parse_qs(
+        fastlane.urllib.parse.urlparse(endpoint).query
+    )
+    assert query["scheduling_profile"] == [
+        fastlane.scheduler_client.FEA_SCHEDULING_PROFILE
+    ]
+    assert query["scheduling_profile"] == ["fea_bursty"]
+
+
 def test_capacity_zero_fails_closed() -> None:
     with pytest.raises(
         fastlane.HandoffContractError,

@@ -2537,7 +2537,7 @@ def _capacity_endpoint(account_name: str) -> str:
         {
             "cpus": FULL_RESOURCES["cpus"],
             "memory_mb": FULL_RESOURCES["memory_mb"],
-            "scheduling_profile": "standard",
+            "scheduling_profile": scheduler_client.FEA_SCHEDULING_PROFILE,
             "aedt_backend": "standalone",
             "project": scheduler_client.MFT_PROJECT,
             "account_name": account_name,

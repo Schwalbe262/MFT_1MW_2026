@@ -43,6 +43,7 @@ POOLED_OPTIONAL_SURFACE_CALCOP_REASON = (
     "center_leg_surface_flux_uses_equivalent_faraday_evidence"
 )
 MFT_PROJECT = "MFT_1MW_2026v1"
+FEA_SCHEDULING_PROFILE = "fea_bursty"
 # Default operator/controller ceiling.  The pooled feeder may explicitly use
 # the scheduler's higher project ceiling without changing legacy callers.
 MFT_PROJECT_MAX_ACTIVE_TASKS = 300
@@ -1570,7 +1571,7 @@ def _submit_verification_locked(
         "name": name, "project": MFT_PROJECT,
         "remote_cwd": GPFS_RUNS_REMOTE_CWD,
         "command": cmd, "required_capability": "conda:pyaedt2026v1", "env_profile": "pyaedt2026v1",
-        "scheduling_profile": "fea_bursty", "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
+        "scheduling_profile": FEA_SCHEDULING_PROFILE, "cpus": cpus, "memory_mb": mem_mb, "gpus": 0,
         "account_name": account_name,
         "node_name": node_name,
         "max_workers_per_node": max_workers_per_node,
