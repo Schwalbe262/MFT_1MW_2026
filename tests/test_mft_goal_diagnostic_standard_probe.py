@@ -328,9 +328,11 @@ def _strict_scheduler_cutover(tmp_path: Path, monkeypatch):
     backup = tmp_path / "strict-scheduler-backup.db"
     backup.write_bytes(b"strict-db-backup")
     pre = tmp_path / "strict-pre.json"
-    post = tmp_path / "strict-post.json"
+    immediate = tmp_path / "strict-immediate.json"
+    final = tmp_path / "strict-final.json"
     pre.write_text('{"active_count":21}', encoding="utf-8")
-    post.write_text('{"active_count":21}', encoding="utf-8")
+    immediate.write_text('{"active_count":21}', encoding="utf-8")
+    final.write_text('{"active_count":21}', encoding="utf-8")
     launcher = tmp_path / "strict-live-launcher.cmd"
     launcher.write_bytes(b"strict-reviewed-launcher")
     rollback = tmp_path / "strict-rollback-launcher.cmd"
@@ -354,19 +356,38 @@ def _strict_scheduler_cutover(tmp_path: Path, monkeypatch):
         "from_commit": probe.SCHEDULER_STRICT_NODE_FROM_REVISION,
         "to_commit": probe.SCHEDULER_STRICT_NODE_REVISION,
         "tree": probe.SCHEDULER_STRICT_NODE_TREE,
+        "archive_sha256": "a" * 64,
         "launcher_sha256": launcher_sha,
+        "cutover_guard_sha256": "b" * 64,
+        "database_migration": "none",
+        "configuration_change": "none",
         "database_backup": str(backup.resolve()),
         "database_backup_sha256": adapter.sha256_file(backup),
         "pre_snapshot": str(pre.resolve()),
-        "post_snapshot": str(post.resolve()),
-        "cohort_tasks_preserved": 30,
-        "active_tasks_pre": 21,
-        "active_tasks_post": 21,
-        "allowed_terminal_transitions": "running->completed/0|failed/124",
+        "pre_snapshot_sha256": adapter.sha256_file(pre),
+        "immediate_snapshot": str(immediate.resolve()),
+        "final_snapshot": str(final.resolve()),
+        "dynamic_campaign_selection": (
+            "every existing task id in inclusive range 96208..96280"
+        ),
+        "campaign_tasks_preserved": 73,
+        "active_tasks_pre": 26,
+        "active_tasks_final": 26,
+        "allowed_transitions": (
+            "running->completed/0|failed/124; "
+            "attaching->running|terminal; queued->attaching|running"
+        ),
+        "protected_cancelled_tasks": [96260, 96276, 96277],
+        "allocation_14616_immediate_requested_owned": "64/64",
+        "allocation_14619_immediate_requested_owned": "64/64",
+        "extra_attach_to_14616_or_14619": False,
+        "strict_same_node_cpu_gate": "pass",
+        "final_fea_storage_admission_gate": "pass",
+        "pressure_episode_preservation": "pass",
+        "n114_pressure_episode_preserved": True,
+        "database_quick_check": "ok",
         "scheduler_ok": True,
         "scheduler_thread_alive": True,
-        "pressure_episode_migration_smoke": "pass",
-        "database_quick_check": "ok",
         "rollback_launcher": str(rollback.resolve()),
         "rollback_launcher_sha256": rollback_sha,
     }
@@ -1187,6 +1208,12 @@ def test_timeout_retry_strict_r2_authenticates_post_get_and_terminal_binding(
     assert retry_plan["scheduler_strict_node_contract"][
         "fallback_allocation_allowed"
     ] is False
+    assert retry_plan["scheduler_strict_node_contract"][
+        "scheduler_revision"
+    ] == probe.SCHEDULER_STRICT_NODE_REVISION
+    assert retry_plan["scheduler_strict_node_contract"][
+        "scheduler_cutover_receipt_schema"
+    ] == "slurm-scheduler-cutover-receipt-v3"
     expected_submission = {
         "task_id": 71002,
         "task_name": retry_plan["stage"]["task_name"],
@@ -1311,14 +1338,14 @@ def test_strict_retry_rejects_unsafe_node_name_before_plan_write(
     assert not (tmp_path / "unsafe-strict-plan").exists()
 
 
-def test_live_strict_cutover_receipt_with_bom_is_pinned_when_present():
+def test_live_active_strict_cutover_receipt_is_pinned_when_present():
     path = Path(
         "C:/Users/peets/slurm_scheduler_runtime/deployment_candidates/"
-        "e542c8a6350d-pressure-episode-gate-20260725/"
+        "41b3b9393684-strict-cpu-storage-admission-20260725/"
         "cutover_receipt.json"
     )
     if not path.is_file():
-        pytest.skip("live strict-node cutover receipt is host-local")
+        pytest.skip("live active strict-node cutover receipt is host-local")
     receipt, launcher = probe._validate_scheduler_cutover_receipt(
         path,
         verify_live_launcher=True,
@@ -1330,6 +1357,145 @@ def test_live_strict_cutover_receipt_with_bom_is_pinned_when_present():
     assert launcher["sha256"] == (
         probe.SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
     )
+    assert receipt["pin_generation"] == "scheduler-strict-node-41b-v3"
+
+
+def test_live_legacy_e542_receipt_remains_collectable_when_present():
+    path = Path(
+        "C:/Users/peets/slurm_scheduler_runtime/deployment_candidates/"
+        "e542c8a6350d-pressure-episode-gate-20260725/"
+        "cutover_receipt.json"
+    )
+    if not path.is_file():
+        pytest.skip("live legacy strict-node cutover receipt is host-local")
+    legacy_pin = probe._legacy_e542_strict_node_scheduler_pin()
+    legacy_contract = probe._strict_node_plan_contract(
+        "n110", scheduler_pin=legacy_pin
+    )
+    receipt, launcher = probe._validate_scheduler_cutover_receipt(
+        path,
+        verify_live_launcher=False,
+        require_strict_node=True,
+        strict_node_contract=legacy_contract,
+    )
+    assert receipt["candidate_revision"] == (
+        probe.SCHEDULER_STRICT_NODE_LEGACY_E542_REVISION
+    )
+    assert receipt["pin_generation"] == "scheduler-strict-node-e542-v2"
+    assert launcher is None
+
+
+def test_strict_generation_registry_is_legacy_read_active_write():
+    active_contract = probe._strict_node_plan_contract("n110")
+    legacy_pin = probe._legacy_e542_strict_node_scheduler_pin()
+    legacy_contract = probe._strict_node_plan_contract(
+        "n110", scheduler_pin=legacy_pin
+    )
+    assert probe._strict_node_scheduler_pin(
+        active_contract, require_active=True
+    )["pin_generation"] == "scheduler-strict-node-41b-v3"
+    assert probe._strict_node_scheduler_pin(legacy_contract)[
+        "pin_generation"
+    ] == "scheduler-strict-node-e542-v2"
+    with pytest.raises(
+        production.HandoffContractError,
+        match="historical strict-node generation cannot submit",
+    ):
+        probe._strict_node_scheduler_pin(
+            legacy_contract, require_active=True
+        )
+    mixed = {
+        **active_contract,
+        "scheduler_cutover_receipt_sha256": legacy_contract[
+            "scheduler_cutover_receipt_sha256"
+        ],
+    }
+    with pytest.raises(
+        production.HandoffContractError,
+        match="placement contract drifted",
+    ):
+        probe._validate_strict_node_plan_contract(mixed)
+
+
+def test_live_cross_generation_cutover_substitution_is_rejected_when_present():
+    active_path = Path(
+        "C:/Users/peets/slurm_scheduler_runtime/deployment_candidates/"
+        "41b3b9393684-strict-cpu-storage-admission-20260725/"
+        "cutover_receipt.json"
+    )
+    legacy_path = Path(
+        "C:/Users/peets/slurm_scheduler_runtime/deployment_candidates/"
+        "e542c8a6350d-pressure-episode-gate-20260725/"
+        "cutover_receipt.json"
+    )
+    if not active_path.is_file() or not legacy_path.is_file():
+        pytest.skip("live strict-node cutover receipts are host-local")
+    active_contract = probe._strict_node_plan_contract("n110")
+    legacy_contract = probe._strict_node_plan_contract(
+        "n110",
+        scheduler_pin=probe._legacy_e542_strict_node_scheduler_pin(),
+    )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="cutover identity drifted",
+    ):
+        probe._validate_scheduler_cutover_receipt(
+            legacy_path,
+            verify_live_launcher=False,
+            require_strict_node=True,
+            strict_node_contract=active_contract,
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="cutover identity drifted",
+    ):
+        probe._validate_scheduler_cutover_receipt(
+            active_path,
+            verify_live_launcher=False,
+            require_strict_node=True,
+            strict_node_contract=legacy_contract,
+        )
+
+
+def test_live_legacy_e542_submission_loads_but_cannot_resubmit_after_successor(
+    tmp_path,
+):
+    root = Path(
+        "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
+        "standard_timeout_retries_strict_r2_e542_n110_260725/"
+        "t96213_a4ae16f8a0c3"
+    )
+    plan_path = root / "plan" / "diagnostic_timeout_retry_plan.json"
+    submission_path = root / "diagnostic_timeout_retry_submission.json"
+    if not plan_path.is_file() or not submission_path.is_file():
+        pytest.skip("live historical e542 submission is host-local")
+    plan = probe._load_plan(plan_path)[0]
+    submission = probe._load_submission(submission_path, plan=plan)
+    assert plan["scheduler_strict_node_contract"][
+        "scheduler_revision"
+    ] == probe.SCHEDULER_STRICT_NODE_LEGACY_E542_REVISION
+    assert submission["task_id"] == 96274
+    assert submission["scheduler_live_launcher_identity"]["sha256"] == (
+        probe.SCHEDULER_STRICT_NODE_LEGACY_E542_LAUNCHER_SHA256
+    )
+    scheduler = _FakeScheduler()
+    with pytest.raises(
+        production.HandoffContractError,
+        match="historical strict-node generation cannot submit",
+    ):
+        probe.submit_timeout_retry(
+            plan_path=plan_path,
+            scheduler_cutover_receipt_path=Path(
+                "C:/Users/peets/slurm_scheduler_runtime/"
+                "deployment_candidates/"
+                "41b3b9393684-strict-cpu-storage-admission-20260725/"
+                "cutover_receipt.json"
+            ),
+            output=tmp_path / "forbidden-legacy-resubmission.json",
+            scheduler=scheduler,
+        )
+    assert scheduler.calls == []
+    assert not (tmp_path / "forbidden-legacy-resubmission.json").exists()
 
 
 def test_scheduler_client_strict_opt_in_sends_policy_and_returns_post_evidence(

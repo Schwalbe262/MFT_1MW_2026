@@ -85,29 +85,53 @@ SCHEDULER_RELEASE_MANIFEST_SHA256 = (
 SCHEDULER_LIVE_LAUNCHER_SHA256 = (
     "e26c3eeb0453cd5f049e9f3280213b46e9c194d149e139b34dc5d9947c137c3d"
 )
-SCHEDULER_STRICT_NODE_REVISION = (
+SCHEDULER_STRICT_NODE_LEGACY_E542_REVISION = (
     "e542c8a6350d0b7101aa786e61f79df88958f40d"
 )
-SCHEDULER_STRICT_NODE_TREE = (
+SCHEDULER_STRICT_NODE_LEGACY_E542_TREE = (
     "2ff7b60477cb8ad1d09470740bf504226c676224"
 )
-SCHEDULER_STRICT_NODE_FROM_REVISION = (
+SCHEDULER_STRICT_NODE_LEGACY_E542_FROM_REVISION = (
     "22f6fb93d71f9e703b7169bb2ac2c460ca80ec99"
 )
-SCHEDULER_STRICT_NODE_LAUNCHER_SHA256 = (
+SCHEDULER_STRICT_NODE_LEGACY_E542_LAUNCHER_SHA256 = (
     "e1c327bd986ca2f86dfa5e02fbb9a9c40bb7e3347bfafcd6aea2acc182da325a"
 )
-SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256 = (
+SCHEDULER_STRICT_NODE_LEGACY_E542_ROLLBACK_LAUNCHER_SHA256 = (
     "3cea73b022b8bfda1bdfc935751a3874c508498c8e1de463dfe554433d3425e5"
 )
-SCHEDULER_STRICT_NODE_CUTOVER_SHA256 = (
+SCHEDULER_STRICT_NODE_LEGACY_E542_CUTOVER_SHA256 = (
     "28fc55c60281cb9690eb84a442f149aed57dfb79623a83672f930f17f8c68348"
+)
+SCHEDULER_STRICT_NODE_LEGACY_E542_CUTOVER_SCHEMA = (
+    "slurm-scheduler-cutover-receipt-v2"
+)
+# Only this generation may be used to create or submit a new strict retry.
+# The e542 generation above remains accepted solely for authenticating
+# historical plans, submissions, and terminal collections.
+SCHEDULER_STRICT_NODE_REVISION = (
+    "41b3b939368423f0fa586dbe06328c5e37add179"
+)
+SCHEDULER_STRICT_NODE_TREE = (
+    "80427698045d24addaac363c9bd138ce032b44af"
+)
+SCHEDULER_STRICT_NODE_FROM_REVISION = (
+    SCHEDULER_STRICT_NODE_LEGACY_E542_REVISION
+)
+SCHEDULER_STRICT_NODE_LAUNCHER_SHA256 = (
+    "f6ee9de8ab4434c54bba65f8fe696de23266b99e2fcc6d06faf169a5648bf472"
+)
+SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256 = (
+    SCHEDULER_STRICT_NODE_LEGACY_E542_LAUNCHER_SHA256
+)
+SCHEDULER_STRICT_NODE_CUTOVER_SHA256 = (
+    "e3b795526bb7a7eddd4888467c8551dd27785988c29d76783c0bce5db36e14bc"
 )
 SCHEDULER_STRICT_NODE_LIVE_LAUNCHER = Path(
     "Y:/runtime/slurm_scheduler/start_web_y.cmd"
 )
 SCHEDULER_STRICT_NODE_CUTOVER_SCHEMA = (
-    "slurm-scheduler-cutover-receipt-v2"
+    "slurm-scheduler-cutover-receipt-v3"
 )
 RESULTS_MANIFEST_SCHEMA = (
     scheduler_client.RETAINED_AEDT_RESULTS_MANIFEST_SCHEMA
@@ -227,7 +251,7 @@ SCHEDULER_CUTOVER_FIELDS = frozenset(
         "payload_sha256",
     }
 )
-SCHEDULER_STRICT_NODE_CUTOVER_FIELDS = frozenset(
+SCHEDULER_STRICT_NODE_LEGACY_E542_CUTOVER_FIELDS = frozenset(
     {
         "schema_version",
         "cutover_at",
@@ -247,6 +271,44 @@ SCHEDULER_STRICT_NODE_CUTOVER_FIELDS = frozenset(
         "scheduler_thread_alive",
         "pressure_episode_migration_smoke",
         "database_quick_check",
+        "rollback_launcher",
+        "rollback_launcher_sha256",
+    }
+)
+SCHEDULER_STRICT_NODE_CUTOVER_FIELDS = frozenset(
+    {
+        "schema_version",
+        "cutover_at",
+        "from_commit",
+        "to_commit",
+        "tree",
+        "archive_sha256",
+        "launcher_sha256",
+        "cutover_guard_sha256",
+        "database_migration",
+        "configuration_change",
+        "database_backup",
+        "database_backup_sha256",
+        "pre_snapshot",
+        "pre_snapshot_sha256",
+        "immediate_snapshot",
+        "final_snapshot",
+        "dynamic_campaign_selection",
+        "campaign_tasks_preserved",
+        "active_tasks_pre",
+        "active_tasks_final",
+        "allowed_transitions",
+        "protected_cancelled_tasks",
+        "allocation_14616_immediate_requested_owned",
+        "allocation_14619_immediate_requested_owned",
+        "extra_attach_to_14616_or_14619",
+        "strict_same_node_cpu_gate",
+        "final_fea_storage_admission_gate",
+        "pressure_episode_preservation",
+        "n114_pressure_episode_preserved",
+        "database_quick_check",
+        "scheduler_ok",
+        "scheduler_thread_alive",
         "rollback_launcher",
         "rollback_launcher_sha256",
     }
@@ -337,11 +399,74 @@ def _live_launcher_identity(
     }
 
 
+def _legacy_e542_strict_node_scheduler_pin() -> dict[str, Any]:
+    return {
+        "pin_generation": "scheduler-strict-node-e542-v2",
+        "revision": SCHEDULER_STRICT_NODE_LEGACY_E542_REVISION,
+        "tree": SCHEDULER_STRICT_NODE_LEGACY_E542_TREE,
+        "from_revision": (
+            SCHEDULER_STRICT_NODE_LEGACY_E542_FROM_REVISION
+        ),
+        "launcher_sha256": (
+            SCHEDULER_STRICT_NODE_LEGACY_E542_LAUNCHER_SHA256
+        ),
+        "rollback_launcher_sha256": (
+            SCHEDULER_STRICT_NODE_LEGACY_E542_ROLLBACK_LAUNCHER_SHA256
+        ),
+        "cutover_receipt_sha256": (
+            SCHEDULER_STRICT_NODE_LEGACY_E542_CUTOVER_SHA256
+        ),
+        "cutover_receipt_schema": (
+            SCHEDULER_STRICT_NODE_LEGACY_E542_CUTOVER_SCHEMA
+        ),
+        "cutover_fields": (
+            SCHEDULER_STRICT_NODE_LEGACY_E542_CUTOVER_FIELDS
+        ),
+    }
+
+
+def _active_strict_node_scheduler_pin() -> dict[str, Any]:
+    return {
+        "pin_generation": "scheduler-strict-node-41b-v3",
+        "revision": SCHEDULER_STRICT_NODE_REVISION,
+        "tree": SCHEDULER_STRICT_NODE_TREE,
+        "from_revision": SCHEDULER_STRICT_NODE_FROM_REVISION,
+        "launcher_sha256": SCHEDULER_STRICT_NODE_LAUNCHER_SHA256,
+        "rollback_launcher_sha256": (
+            SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256
+        ),
+        "cutover_receipt_sha256": (
+            SCHEDULER_STRICT_NODE_CUTOVER_SHA256
+        ),
+        "cutover_receipt_schema": (
+            SCHEDULER_STRICT_NODE_CUTOVER_SCHEMA
+        ),
+        "cutover_fields": SCHEDULER_STRICT_NODE_CUTOVER_FIELDS,
+    }
+
+
+def _accepted_strict_node_scheduler_pins() -> tuple[dict[str, Any], ...]:
+    legacy = _legacy_e542_strict_node_scheduler_pin()
+    active = _active_strict_node_scheduler_pin()
+    if legacy["revision"] == active["revision"]:
+        return (active,)
+    return (legacy, active)
+
+
 def _validate_strict_scheduler_cutover_receipt(
     path: Path,
     *,
     verify_live_launcher: bool,
+    strict_node_contract: Mapping[str, Any] | None = None,
+    require_active: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    pin = (
+        _active_strict_node_scheduler_pin()
+        if strict_node_contract is None
+        else _strict_node_scheduler_pin(
+            strict_node_contract, require_active=require_active
+        )
+    )
     resolved = path.resolve(strict=True)
     try:
         raw = json.loads(resolved.read_text(encoding="utf-8-sig"))
@@ -351,33 +476,86 @@ def _validate_strict_scheduler_cutover_receipt(
         ) from exc
     if (
         production._sha256_file(resolved)
-        != SCHEDULER_STRICT_NODE_CUTOVER_SHA256
+        != pin["cutover_receipt_sha256"]
         or not isinstance(raw, dict)
-        or set(raw) != SCHEDULER_STRICT_NODE_CUTOVER_FIELDS
+        or set(raw) != pin["cutover_fields"]
         or raw.get("schema_version")
-        != SCHEDULER_STRICT_NODE_CUTOVER_SCHEMA
-        or raw.get("from_commit") != SCHEDULER_STRICT_NODE_FROM_REVISION
-        or raw.get("to_commit") != SCHEDULER_STRICT_NODE_REVISION
-        or raw.get("tree") != SCHEDULER_STRICT_NODE_TREE
+        != pin["cutover_receipt_schema"]
+        or raw.get("from_commit") != pin["from_revision"]
+        or raw.get("to_commit") != pin["revision"]
+        or raw.get("tree") != pin["tree"]
         or raw.get("launcher_sha256")
-        != SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
-        or raw.get("cohort_tasks_preserved") != 30
-        or isinstance(raw.get("active_tasks_pre"), bool)
-        or not isinstance(raw.get("active_tasks_pre"), int)
-        or raw.get("active_tasks_pre") < 0
-        or raw.get("active_tasks_pre") > 30
-        or raw.get("active_tasks_post") != raw.get("active_tasks_pre")
-        or raw.get("allowed_terminal_transitions")
-        != "running->completed/0|failed/124"
-        or raw.get("scheduler_ok") is not True
-        or raw.get("scheduler_thread_alive") is not True
-        or raw.get("pressure_episode_migration_smoke") != "pass"
-        or raw.get("database_quick_check") != "ok"
+        != pin["launcher_sha256"]
         or raw.get("rollback_launcher_sha256")
-        != SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256
+        != pin["rollback_launcher_sha256"]
     ):
         raise HandoffContractError(
             "Scheduler strict-node cutover identity drifted"
+        )
+    if pin["pin_generation"] == "scheduler-strict-node-e542-v2":
+        if (
+            raw.get("cohort_tasks_preserved") != 30
+            or isinstance(raw.get("active_tasks_pre"), bool)
+            or not isinstance(raw.get("active_tasks_pre"), int)
+            or raw.get("active_tasks_pre") < 0
+            or raw.get("active_tasks_pre") > 30
+            or raw.get("active_tasks_post") != raw.get("active_tasks_pre")
+            or raw.get("allowed_terminal_transitions")
+            != "running->completed/0|failed/124"
+            or raw.get("scheduler_ok") is not True
+            or raw.get("scheduler_thread_alive") is not True
+            or raw.get("pressure_episode_migration_smoke") != "pass"
+            or raw.get("database_quick_check") != "ok"
+        ):
+            raise HandoffContractError(
+                "Scheduler strict-node e542 cutover evidence drifted"
+            )
+    elif pin["pin_generation"] == "scheduler-strict-node-41b-v3":
+        if (
+            production._require_sha(
+                raw.get("archive_sha256"),
+                "Scheduler cutover archive SHA",
+            )
+            != raw.get("archive_sha256")
+            or production._require_sha(
+                raw.get("cutover_guard_sha256"),
+                "Scheduler cutover guard SHA",
+            )
+            != raw.get("cutover_guard_sha256")
+            or raw.get("database_migration") != "none"
+            or raw.get("configuration_change") != "none"
+            or raw.get("dynamic_campaign_selection")
+            != "every existing task id in inclusive range 96208..96280"
+            or raw.get("campaign_tasks_preserved") != 73
+            or raw.get("active_tasks_pre") != 26
+            or raw.get("active_tasks_final") != 26
+            or raw.get("allowed_transitions")
+            != (
+                "running->completed/0|failed/124; "
+                "attaching->running|terminal; "
+                "queued->attaching|running"
+            )
+            or raw.get("protected_cancelled_tasks")
+            != [96260, 96276, 96277]
+            or raw.get("allocation_14616_immediate_requested_owned")
+            != "64/64"
+            or raw.get("allocation_14619_immediate_requested_owned")
+            != "64/64"
+            or raw.get("extra_attach_to_14616_or_14619") is not False
+            or raw.get("strict_same_node_cpu_gate") != "pass"
+            or raw.get("final_fea_storage_admission_gate") != "pass"
+            or raw.get("pressure_episode_preservation") != "pass"
+            or raw.get("n114_pressure_episode_preserved") is not True
+            or raw.get("database_quick_check") != "ok"
+            or raw.get("scheduler_ok") is not True
+            or raw.get("scheduler_thread_alive") is not True
+        ):
+            raise HandoffContractError(
+                "Scheduler strict-node 41b cutover evidence drifted"
+            )
+    else:
+        raise HandoffContractError(
+            "Scheduler strict-node cutover generation is unsupported"
         )
     _aware_timestamp(raw.get("cutover_at"), "Scheduler cutover timestamp")
     backup = _absolute_regular_file(
@@ -393,18 +571,37 @@ def _validate_strict_scheduler_cutover_receipt(
         raise HandoffContractError(
             "Scheduler cutover database backup bytes drifted"
         )
-    _absolute_regular_file(
+    pre_snapshot = _absolute_regular_file(
         raw.get("pre_snapshot"), "Scheduler pre-cutover snapshot"
     )
-    _absolute_regular_file(
-        raw.get("post_snapshot"), "Scheduler post-cutover snapshot"
-    )
+    if pin["pin_generation"] == "scheduler-strict-node-e542-v2":
+        _absolute_regular_file(
+            raw.get("post_snapshot"), "Scheduler post-cutover snapshot"
+        )
+    else:
+        if (
+            production._sha256_file(pre_snapshot)
+            != production._require_sha(
+                raw.get("pre_snapshot_sha256"),
+                "Scheduler pre-cutover snapshot SHA",
+            )
+        ):
+            raise HandoffContractError(
+                "Scheduler pre-cutover snapshot bytes drifted"
+            )
+        _absolute_regular_file(
+            raw.get("immediate_snapshot"),
+            "Scheduler immediate cutover snapshot",
+        )
+        _absolute_regular_file(
+            raw.get("final_snapshot"), "Scheduler final cutover snapshot"
+        )
     rollback_launcher = _absolute_regular_file(
         raw.get("rollback_launcher"), "Scheduler rollback launcher"
     )
     if (
         production._sha256_file(rollback_launcher)
-        != SCHEDULER_STRICT_NODE_ROLLBACK_LAUNCHER_SHA256
+        != pin["rollback_launcher_sha256"]
     ):
         raise HandoffContractError(
             "Scheduler rollback launcher bytes drifted"
@@ -416,8 +613,9 @@ def _validate_strict_scheduler_cutover_receipt(
     normalized = {
         **copy.deepcopy(raw),
         "scheduler_url": DIAGNOSTIC_SCHEDULER_URL,
-        "candidate_revision": SCHEDULER_STRICT_NODE_REVISION,
-        "candidate_tree": SCHEDULER_STRICT_NODE_TREE,
+        "candidate_revision": pin["revision"],
+        "candidate_tree": pin["tree"],
+        "pin_generation": pin["pin_generation"],
         "live_launcher_path": str(launcher),
         "payload_sha256": canonical_sha256(raw),
         "cutover_receipt_file_sha256": production._sha256_file(resolved),
@@ -425,7 +623,7 @@ def _validate_strict_scheduler_cutover_receipt(
     launcher_identity = (
         _live_launcher_identity(
             normalized,
-            expected_sha256=SCHEDULER_STRICT_NODE_LAUNCHER_SHA256,
+            expected_sha256=pin["launcher_sha256"],
         )
         if verify_live_launcher
         else None
@@ -438,10 +636,15 @@ def _validate_scheduler_cutover_receipt(
     *,
     verify_live_launcher: bool,
     require_strict_node: bool = False,
+    strict_node_contract: Mapping[str, Any] | None = None,
+    require_active_strict: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     if require_strict_node:
         return _validate_strict_scheduler_cutover_receipt(
-            path, verify_live_launcher=verify_live_launcher
+            path,
+            verify_live_launcher=verify_live_launcher,
+            strict_node_contract=strict_node_contract,
+            require_active=require_active_strict,
         )
     resolved = path.resolve(strict=True)
     receipt = production._validate_seal(
@@ -2296,22 +2499,29 @@ def _strict_node_name(value: Any) -> str:
     return node_name
 
 
-def _strict_node_plan_contract(node_name: str) -> dict[str, Any]:
+def _strict_node_plan_contract(
+    node_name: str,
+    *,
+    scheduler_pin: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    pin = (
+        _active_strict_node_scheduler_pin()
+        if scheduler_pin is None
+        else scheduler_pin
+    )
     return {
         "schema_version": STRICT_NODE_PLACEMENT_SCHEMA,
         "requested_node_name": _strict_node_name(node_name),
         "node_name_policy": "strict",
-        "scheduler_revision": SCHEDULER_STRICT_NODE_REVISION,
-        "scheduler_tree": SCHEDULER_STRICT_NODE_TREE,
-        "scheduler_launcher_sha256": (
-            SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
-        ),
-        "scheduler_cutover_receipt_schema": (
-            SCHEDULER_STRICT_NODE_CUTOVER_SCHEMA
-        ),
-        "scheduler_cutover_receipt_sha256": (
-            SCHEDULER_STRICT_NODE_CUTOVER_SHA256
-        ),
+        "scheduler_revision": pin["revision"],
+        "scheduler_tree": pin["tree"],
+        "scheduler_launcher_sha256": pin["launcher_sha256"],
+        "scheduler_cutover_receipt_schema": pin[
+            "cutover_receipt_schema"
+        ],
+        "scheduler_cutover_receipt_sha256": pin[
+            "cutover_receipt_sha256"
+        ],
         "task_identity_generation": "timeout-strict-r2-node-bound",
         "fallback_allocation_allowed": False,
         "api_submission_readback_required": True,
@@ -2320,17 +2530,36 @@ def _strict_node_plan_contract(node_name: str) -> dict[str, Any]:
     }
 
 
-def _validate_strict_node_plan_contract(value: Any) -> dict[str, Any]:
+def _strict_node_scheduler_pin(
+    value: Mapping[str, Any],
+    *,
+    require_active: bool = False,
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise HandoffContractError(
             "strict timeout retry placement contract is absent"
         )
-    expected = _strict_node_plan_contract(value.get("requested_node_name"))
-    if value != expected:
-        raise HandoffContractError(
-            "strict timeout retry placement contract drifted"
+    for pin in _accepted_strict_node_scheduler_pins():
+        expected = _strict_node_plan_contract(
+            value.get("requested_node_name"), scheduler_pin=pin
         )
-    return expected
+        if value == expected:
+            active = _active_strict_node_scheduler_pin()
+            if require_active and pin["revision"] != active["revision"]:
+                raise HandoffContractError(
+                    "historical strict-node generation cannot submit"
+                )
+            return pin
+    raise HandoffContractError(
+        "strict timeout retry placement contract drifted"
+    )
+
+
+def _validate_strict_node_plan_contract(value: Any) -> dict[str, Any]:
+    pin = _strict_node_scheduler_pin(value)
+    return _strict_node_plan_contract(
+        value.get("requested_node_name"), scheduler_pin=pin
+    )
 
 
 def _plan_strict_node_contract(
@@ -3482,6 +3711,13 @@ def _submit_standard_plan(
     plan, params, selected = _load_plan(plan_path)
     timeout_retry = _plan_is_timeout_retry(plan)
     strict_node_contract = _plan_strict_node_contract(plan)
+    strict_node_pin = (
+        _strict_node_scheduler_pin(
+            strict_node_contract, require_active=True
+        )
+        if strict_node_contract is not None
+        else None
+    )
     if timeout_retry is not expected_timeout_retry:
         command = (
             "submit-timeout-retry"
@@ -3530,6 +3766,8 @@ def _submit_standard_plan(
         scheduler_cutover_receipt_path,
         verify_live_launcher=True,
         require_strict_node=strict_node_contract is not None,
+        strict_node_contract=strict_node_contract,
+        require_active_strict=strict_node_contract is not None,
     )
     stage = plan["stage"]
     if cutover["scheduler_url"] != stage["scheduler_url"]:
@@ -3543,8 +3781,8 @@ def _submit_standard_plan(
     launcher_after = _live_launcher_identity(
         cutover,
         expected_sha256=(
-            SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
-            if strict_node_contract is not None
+            strict_node_pin["launcher_sha256"]
+            if strict_node_pin is not None
             else SCHEDULER_LIVE_LAUNCHER_SHA256
         ),
     )
@@ -3897,6 +4135,11 @@ def _load_submission(
     stage = plan["stage"]
     timeout_retry = _plan_is_timeout_retry(plan)
     strict_node_contract = _plan_strict_node_contract(plan)
+    strict_node_pin = (
+        _strict_node_scheduler_pin(strict_node_contract)
+        if strict_node_contract is not None
+        else None
+    )
     cutover_record = receipt.get("scheduler_cutover_receipt")
     if not isinstance(cutover_record, dict):
         raise HandoffContractError(
@@ -3912,6 +4155,7 @@ def _load_submission(
             cutover_path,
             verify_live_launcher=False,
             require_strict_node=strict_node_contract is not None,
+            strict_node_contract=strict_node_contract,
         )
     )
     admission = _validate_recorded_admission_snapshot(
@@ -3926,8 +4170,8 @@ def _load_submission(
         )
         or launcher.get("sha256")
         != (
-            SCHEDULER_STRICT_NODE_LAUNCHER_SHA256
-            if strict_node_contract is not None
+            strict_node_pin["launcher_sha256"]
+            if strict_node_pin is not None
             else SCHEDULER_LIVE_LAUNCHER_SHA256
         )
         or isinstance(launcher.get("size_bytes"), bool)
