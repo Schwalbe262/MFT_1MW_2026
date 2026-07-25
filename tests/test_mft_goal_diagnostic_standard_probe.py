@@ -4318,3 +4318,24 @@ def test_mesh_quota_dependency_r2_has_distinct_claim_and_exact_once(
     assert recovered["dependency_failure_atomic_claim"][
         "acquisition_status"
     ] == "existing_finalized"
+    loaded = dependency_retry._load_submission(
+        submission_path, plan=plan
+    )
+    collectible_plan, collectible_params, collectible_selected = (
+        probe._load_collectible_plan(plan_path)
+    )
+    assert collectible_plan == plan
+    assert collectible_params == dependency_retry._load_plan(plan_path)[1]
+    assert collectible_selected == dependency_retry._load_plan(plan_path)[2]
+    collectible_submission = probe._load_collectible_submission(
+        submission_path, plan=collectible_plan
+    )
+    assert collectible_submission == loaded
+    lineage = probe._dependency_collection_lineage(
+        collectible_plan, collectible_submission
+    )
+    assert lineage is not None
+    assert lineage["retry_generation"] == (
+        dependency_retry.R2_RETRY_GENERATION
+    )
+    assert lineage["scheduler_task_id"] == 71013

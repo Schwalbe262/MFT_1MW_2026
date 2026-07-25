@@ -281,6 +281,15 @@ def _policy_for_schema(schema: Any) -> RetryPolicy:
     )
 
 
+def _policy_for_submission_schema(schema: Any) -> RetryPolicy:
+    for policy in (R1_POLICY, R2_POLICY):
+        if schema == policy.submission_schema:
+            return policy
+    raise HandoffContractError(
+        "dependency-failure submission generation is unsupported"
+    )
+
+
 def _policy_for_plan(plan: Mapping[str, Any]) -> RetryPolicy:
     return _policy_for_schema(plan.get("schema_version"))
 
@@ -2176,6 +2185,7 @@ def _validate_submission_sibling_guard(
     plan: Mapping[str, Any],
     task_id: int,
 ) -> dict[str, Any]:
+    policy = _policy_for_plan(plan)
     if (
         not isinstance(value, Mapping)
         or set(value)
@@ -2185,7 +2195,7 @@ def _validate_submission_sibling_guard(
             "after_submission",
             "exactly_one_sibling_after_submission",
         }
-        or value.get("schema_version") != SIBLING_GUARD_SCHEMA
+        or value.get("schema_version") != policy.sibling_guard_schema
         or value.get("exactly_one_sibling_after_submission") is not True
     ):
         raise HandoffContractError(
@@ -2227,6 +2237,7 @@ def _validate_submission_claim(
     task_id: int,
     sibling_guard: Mapping[str, Any],
 ) -> dict[str, Any]:
+    policy = _policy_for_plan(plan)
     expected_fields = {
         "schema_version",
         "acquisition_status",
@@ -2241,7 +2252,7 @@ def _validate_submission_claim(
     status = value.get("acquisition_status")
     fresh = status == "fresh_pending"
     if (
-        value.get("schema_version") != CLAIM_RECEIPT_SCHEMA
+        value.get("schema_version") != policy.claim_receipt_schema
         or status
         not in {
             "fresh_pending",
@@ -2261,7 +2272,7 @@ def _validate_submission_claim(
     finalized_claim = value.get("finalized_claim")
     try:
         finalized = atomic_claim.validate_finalized_claim(
-            CLAIM_ROOT,
+            _claim_root(policy),
             reference,
             claim=finalized_claim,
             expected_winner=winner,
@@ -2385,8 +2396,12 @@ def _load_submission(
     plan: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved = path.resolve(strict=True)
+    raw_receipt = production._read_json(resolved)
+    policy = _policy_for_submission_schema(
+        raw_receipt.get("schema_version")
+    )
     receipt = production._validate_seal(
-        production._read_json(resolved), SUBMISSION_SCHEMA
+        raw_receipt, policy.submission_schema
     )
     if set(receipt) != SUBMISSION_FIELDS:
         raise HandoffContractError(
@@ -2411,6 +2426,10 @@ def _load_submission(
         _immediate_submission,
         _expected_anchor,
     ) = _load_plan(receipt_plan_path)
+    if _policy_for_plan(loaded_plan) is not policy:
+        raise HandoffContractError(
+            "dependency-failure plan/submission generations are mixed"
+        )
     if plan is not None and loaded_plan != plan:
         raise HandoffContractError(
             "dependency-failure submission references a different plan"

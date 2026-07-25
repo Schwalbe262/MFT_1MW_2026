@@ -8951,7 +8951,10 @@ def _load_collectible_plan(
     }:
         return _load_plan(resolved)
     dependency = _dependency_retry_module()
-    if schema == dependency.PLAN_SCHEMA:
+    if schema in {
+        dependency.PLAN_SCHEMA,
+        dependency.R2_PLAN_SCHEMA,
+    }:
         plan, params, selected, _parent, _anchor = dependency._load_plan(
             resolved
         )
@@ -8983,10 +8986,15 @@ def _load_collectible_submission(
     ):
         return _load_submission(resolved, plan=plan)
     dependency = _dependency_retry_module()
-    if (
-        plan_schema == dependency.PLAN_SCHEMA
-        and submission_schema == dependency.SUBMISSION_SCHEMA
-    ):
+    if plan_schema in {
+        dependency.PLAN_SCHEMA,
+        dependency.R2_PLAN_SCHEMA,
+    }:
+        policy = dependency._policy_for_plan(plan)
+        if submission_schema != policy.submission_schema:
+            raise HandoffContractError(
+                "diagnostic collection dependency generations are mixed"
+            )
         return dependency._load_submission(resolved, plan=plan)
     raise HandoffContractError(
         "diagnostic collection plan/submission schemas are mixed"
@@ -8998,9 +9006,13 @@ def _dependency_collection_lineage(
     submission: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     dependency = _dependency_retry_module()
-    if plan.get("schema_version") != dependency.PLAN_SCHEMA:
+    if plan.get("schema_version") not in {
+        dependency.PLAN_SCHEMA,
+        dependency.R2_PLAN_SCHEMA,
+    }:
         return None
-    if submission.get("schema_version") != dependency.SUBMISSION_SCHEMA:
+    policy = dependency._policy_for_plan(plan)
+    if submission.get("schema_version") != policy.submission_schema:
         raise HandoffContractError(
             "dependency-failure collection submission schema drifted"
         )
@@ -9033,7 +9045,7 @@ def _dependency_collection_lineage(
         "schema_version": (
             DEPENDENCY_FAILURE_COLLECTION_LINEAGE_SCHEMA
         ),
-        "retry_generation": dependency.RETRY_GENERATION,
+        "retry_generation": policy.retry_generation,
         "logical_authority_task_id": record[
             "logical_authority_task_id"
         ],
