@@ -143,6 +143,68 @@ R2_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
         "retry_generation": R2_RETRY_GENERATION,
     }
 )
+R3_PLAN_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-anchor-dependency-plan-v1"
+)
+R3_SUBMISSION_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-anchor-dependency-submission-v1"
+)
+R3_RETRY_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-anchor-dependency-evidence-v1"
+)
+R3_FAILURE_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-anchor-dependency-task-failure-v1"
+)
+R3_ANCHOR_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-anchor-failure-v1"
+)
+R3_SIBLING_GUARD_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-anchor-dependency-sibling-guard-v1"
+)
+R3_CLAIM_RECEIPT_SCHEMA = (
+    "mft-goal-timeout-anchor-dependency-atomic-claim-receipt-v1"
+)
+R3_PROFILE_SCHEMA = (
+    "mft-goal-diagnostic-standard-timeout-anchor-dependency-retry-profile-v1"
+)
+R3_RETRY_GENERATION = "timeout-anchor-dependency-r3"
+R3_FAILURE_CLASS = (
+    "scheduler_same_node_dependency_failed_after_timeout_anchor"
+)
+R3_ANCHOR_FAILURE_CLASS = "scheduler_timeout_8h"
+R3_ANCHOR_FAILURE_MESSAGE = "task timed out after 28800s"
+R3_EXACT_ANCHOR_TASK_ID = 96289
+R3_EXACT_DEPENDENCY_TASK_TO_LOGICAL = {
+    96291: 96214,
+    96292: 96208,
+    96293: 96212,
+}
+R3_PROFILE_PATH = (
+    probe.REPOSITORY_ROOT
+    / "regression_260707"
+    / "verify"
+    / "profiles"
+    / "goal_diagnostic_standard_timeout_anchor_dependency_retry.json"
+)
+R3_CLAIM_ROOT = Path(
+    "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
+    "timeout_anchor_dependency_claims_r3"
+)
+R3_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
+    {
+        "campaign_id": "mft-goal-20260726",
+        "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+        "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+        "temperature_contract_sha256": (
+            GOAL_TEMPERATURE_CONTRACT_SHA256
+        ),
+        "retry_generation": R3_RETRY_GENERATION,
+        "exact_anchor_task_id": R3_EXACT_ANCHOR_TASK_ID,
+        "exact_dependency_task_to_logical": (
+            R3_EXACT_DEPENDENCY_TASK_TO_LOGICAL
+        ),
+    }
+)
 R2_FULL_PREFLIGHT_LOG_PREFIX = "[thermal] native mesh preflight: "
 R2_QUOTA_MESSAGE = "[Errno 122] Disk quota exceeded"
 R2_CORE_PLATE_PAD_OBJECTS = (
@@ -217,6 +279,23 @@ R2_POLICY = RetryPolicy(
     submit_command="submit-mesh-quota-dependency-retry",
     anchor_mode="mesh_mapping_and_dw16_quota",
 )
+R3_POLICY = RetryPolicy(
+    plan_schema=R3_PLAN_SCHEMA,
+    submission_schema=R3_SUBMISSION_SCHEMA,
+    retry_evidence_schema=R3_RETRY_EVIDENCE_SCHEMA,
+    failure_evidence_schema=R3_FAILURE_EVIDENCE_SCHEMA,
+    anchor_evidence_schema=R3_ANCHOR_EVIDENCE_SCHEMA,
+    sibling_guard_schema=R3_SIBLING_GUARD_SCHEMA,
+    claim_receipt_schema=R3_CLAIM_RECEIPT_SCHEMA,
+    profile_schema=R3_PROFILE_SCHEMA,
+    retry_generation=R3_RETRY_GENERATION,
+    failure_class=R3_FAILURE_CLASS,
+    anchor_failure_class=R3_ANCHOR_FAILURE_CLASS,
+    identity_generation="r3",
+    plan_command="plan-timeout-anchor-dependency-retry",
+    submit_command="submit-timeout-anchor-dependency-retry",
+    anchor_mode="timeout8h",
+)
 
 
 def _flags() -> dict[str, bool]:
@@ -273,7 +352,7 @@ SUBMISSION_FIELDS = frozenset(
 
 
 def _policy_for_schema(schema: Any) -> RetryPolicy:
-    for policy in (R1_POLICY, R2_POLICY):
+    for policy in (R1_POLICY, R2_POLICY, R3_POLICY):
         if schema == policy.plan_schema:
             return policy
     raise HandoffContractError(
@@ -294,20 +373,51 @@ def _policy_for_plan(plan: Mapping[str, Any]) -> RetryPolicy:
     return _policy_for_schema(plan.get("schema_version"))
 
 
+def _policy_for_submission_schema(schema: Any) -> RetryPolicy:
+    for policy in (R1_POLICY, R2_POLICY, R3_POLICY):
+        if schema == policy.submission_schema:
+            return policy
+    raise HandoffContractError(
+        "dependency-failure submission generation is unsupported"
+    )
+
+
 def _profile_path(policy: RetryPolicy) -> Path:
-    return PROFILE_PATH if policy is R1_POLICY else R2_PROFILE_PATH
+    return {
+        R1_POLICY: PROFILE_PATH,
+        R2_POLICY: R2_PROFILE_PATH,
+        R3_POLICY: R3_PROFILE_PATH,
+    }[policy]
 
 
 def _claim_root(policy: RetryPolicy) -> Path:
-    return CLAIM_ROOT if policy is R1_POLICY else R2_CLAIM_ROOT
+    return {
+        R1_POLICY: CLAIM_ROOT,
+        R2_POLICY: R2_CLAIM_ROOT,
+        R3_POLICY: R3_CLAIM_ROOT,
+    }[policy]
 
 
 def _claim_authority_sha256(policy: RetryPolicy) -> str:
-    return (
-        CLAIM_AUTHORITY_SHA256
-        if policy is R1_POLICY
-        else R2_CLAIM_AUTHORITY_SHA256
-    )
+    return {
+        R1_POLICY: CLAIM_AUTHORITY_SHA256,
+        R2_POLICY: R2_CLAIM_AUTHORITY_SHA256,
+        R3_POLICY: R3_CLAIM_AUTHORITY_SHA256,
+    }[policy]
+
+
+def _strict_identity_generation(policy: RetryPolicy) -> str:
+    return {
+        R1_POLICY: (
+            probe.DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION
+        ),
+        R2_POLICY: (
+            probe.MESH_QUOTA_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION
+        ),
+        R3_POLICY: (
+            probe.TIMEOUT_ANCHOR_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION
+        ),
+    }[policy]
 
 
 def _positive_int(value: Any, label: str) -> int:
@@ -339,13 +449,14 @@ def _validate_profile(
     )
     expected = copy.deepcopy(timeout_profile)
     expected["schema_version"] = policy.profile_schema
+    retry_label = {
+        R1_POLICY: "dependency-failure retry",
+        R2_POLICY: "mesh/quota dependency-failure retry",
+        R3_POLICY: "timeout-anchor dependency-failure retry",
+    }[policy]
     expected["comment"] = (
         "Diagnostic-only eighth-symmetry Standard FEA "
-        + (
-            "dependency-failure retry"
-            if policy is R1_POLICY
-            else "mesh/quota dependency-failure retry"
-        )
+        + retry_label
         + " with retained AEDT project and AEDT results"
     )
     if profile != expected:
@@ -872,7 +983,9 @@ def _anchor_failure_evidence(
         static != dict(expected_identity)
         or evidence["status"] != "failed"
         or evidence["state"] != "failed"
-        or evidence["exit_code"] != 1
+        or evidence["exit_code"] != (
+            124 if policy is R3_POLICY else 1
+        )
         or not str(evidence["started_at"] or "").strip()
         or not str(evidence["finished_at"] or "").strip()
     )
@@ -882,7 +995,7 @@ def _anchor_failure_evidence(
         )
         log_evidence = None
         recorded_failure_message = ANCHOR_FAILURE_MESSAGE
-    else:
+    elif policy is R2_POLICY:
         failure_message_valid = str(
             evidence["failure_message"] or ""
         ).startswith(R2_ANCHOR_FAILURE_PREFIX)
@@ -899,6 +1012,14 @@ def _anchor_failure_evidence(
                 "mesh/quota dependency anchor logs are absent"
             )
         recorded_failure_message = evidence["failure_message"]
+    else:
+        failure_message_valid = (
+            evidence["task_id"] == R3_EXACT_ANCHOR_TASK_ID
+            and evidence["failure_message"] == R3_ANCHOR_FAILURE_MESSAGE
+            and evidence["timeout_seconds"] == 8 * 3600
+        )
+        log_evidence = None
+        recorded_failure_message = R3_ANCHOR_FAILURE_MESSAGE
     if common_invalid or not failure_message_valid:
         raise HandoffContractError(
             "dependency anchor native failure evidence drifted"
@@ -1098,6 +1219,16 @@ def create_plan(
         raise HandoffContractError(
             "requested dependency anchor differs from sealed ancestry"
         )
+    if policy is R3_POLICY and (
+        anchor_id != R3_EXACT_ANCHOR_TASK_ID
+        or R3_EXACT_DEPENDENCY_TASK_TO_LOGICAL.get(
+            int(immediate_submission["task_id"])
+        )
+        != int(logical_submission["task_id"])
+    ):
+        raise HandoffContractError(
+            "timeout-anchor dependency exact task authority is absent"
+        )
     reader = task_reader or probe._scheduler_task_snapshot
     dependency_evidence, anchor_evidence = _read_failure_bundle(
         scheduler_url=normalized_url,
@@ -1132,11 +1263,7 @@ def create_plan(
     )
     strict_contract = probe._strict_node_plan_contract(
         strict_node_name,
-        task_identity_generation=(
-            probe.DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION
-            if policy is R1_POLICY
-            else probe.MESH_QUOTA_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION
-        ),
+        task_identity_generation=_strict_identity_generation(policy),
     )
     retained = scheduler_client.retained_aedt_identity(
         task_name,
@@ -1358,6 +1485,16 @@ def _load_plan(
         _timeout_evidence,
     ) = probe._validate_timeout_retry_record(immediate_plan)
     expected_anchor = _placement_anchor_identity(immediate_submission)
+    if policy is R3_POLICY and (
+        expected_anchor["task_id"] != R3_EXACT_ANCHOR_TASK_ID
+        or R3_EXACT_DEPENDENCY_TASK_TO_LOGICAL.get(
+            int(immediate_submission["task_id"])
+        )
+        != int(logical_submission["task_id"])
+    ):
+        raise HandoffContractError(
+            "timeout-anchor dependency exact task authority is absent"
+        )
     dependency_evidence = record.get("dependency_failure_evidence")
     anchor_evidence = record.get("anchor_failure_evidence")
     if (
@@ -1471,11 +1608,7 @@ def _load_plan(
         != REQUIRED_STRICT_NODE_NAME
         or strict_contract.get("node_name_policy") != "strict"
         or strict_contract.get("task_identity_generation")
-        != (
-            probe.DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION
-            if policy is R1_POLICY
-            else probe.MESH_QUOTA_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION
-        )
+        != _strict_identity_generation(policy)
         or profile_record.get("canonical_sha256")
         != canonical_sha256(profile)
         or stage.get("name") != "standard"
@@ -2582,6 +2715,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init-dependency-failure-claim-root")
     commands.add_parser("init-mesh-quota-dependency-claim-root")
+    commands.add_parser("init-timeout-anchor-dependency-claim-root")
     plan = commands.add_parser("plan-dependency-failure-retry")
     plan.add_argument("--original-plan", type=Path, required=True)
     plan.add_argument("--original-submission", type=Path, required=True)
@@ -2608,6 +2742,21 @@ def _parser() -> argparse.ArgumentParser:
         "--scheduler-url", default=probe.DIAGNOSTIC_SCHEDULER_URL
     )
     r2_plan.add_argument("--output", type=Path, required=True)
+    r3_plan = commands.add_parser(
+        "plan-timeout-anchor-dependency-retry"
+    )
+    r3_plan.add_argument("--original-plan", type=Path, required=True)
+    r3_plan.add_argument(
+        "--original-submission", type=Path, required=True
+    )
+    r3_plan.add_argument(
+        "--dependency-anchor-task-id", type=int, required=True
+    )
+    r3_plan.add_argument("--strict-node-name", required=True)
+    r3_plan.add_argument(
+        "--scheduler-url", default=probe.DIAGNOSTIC_SCHEDULER_URL
+    )
+    r3_plan.add_argument("--output", type=Path, required=True)
     submit_parser = commands.add_parser(
         "submit-dependency-failure-retry"
     )
@@ -2626,6 +2775,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     r2_submit.add_argument("--priority", type=int, default=100)
     r2_submit.add_argument("--output", type=Path, required=True)
+    r3_submit = commands.add_parser(
+        "submit-timeout-anchor-dependency-retry"
+    )
+    r3_submit.add_argument("--plan", type=Path, required=True)
+    r3_submit.add_argument(
+        "--scheduler-cutover-receipt", type=Path, required=True
+    )
+    r3_submit.add_argument("--priority", type=int, default=100)
+    r3_submit.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -2634,23 +2792,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in {
         "init-dependency-failure-claim-root",
         "init-mesh-quota-dependency-claim-root",
+        "init-timeout-anchor-dependency-claim-root",
     }:
-        policy = (
-            R1_POLICY
-            if args.command == "init-dependency-failure-claim-root"
-            else R2_POLICY
-        )
+        policy = {
+            "init-dependency-failure-claim-root": R1_POLICY,
+            "init-mesh-quota-dependency-claim-root": R2_POLICY,
+            "init-timeout-anchor-dependency-claim-root": R3_POLICY,
+        }[args.command]
         authority = initialize_claim_root(policy=policy)
         result = Path(authority["resolved_root"])
     elif args.command in {
         "plan-dependency-failure-retry",
         "plan-mesh-quota-dependency-retry",
+        "plan-timeout-anchor-dependency-retry",
     }:
-        policy = (
-            R1_POLICY
-            if args.command == "plan-dependency-failure-retry"
-            else R2_POLICY
-        )
+        policy = {
+            "plan-dependency-failure-retry": R1_POLICY,
+            "plan-mesh-quota-dependency-retry": R2_POLICY,
+            "plan-timeout-anchor-dependency-retry": R3_POLICY,
+        }[args.command]
         result = create_plan(
             original_plan_path=args.original_plan,
             original_submission_path=args.original_submission,
@@ -2661,11 +2821,11 @@ def main(argv: list[str] | None = None) -> int:
             policy=policy,
         )
     else:
-        expected_policy = (
-            R1_POLICY
-            if args.command == "submit-dependency-failure-retry"
-            else R2_POLICY
-        )
+        expected_policy = {
+            "submit-dependency-failure-retry": R1_POLICY,
+            "submit-mesh-quota-dependency-retry": R2_POLICY,
+            "submit-timeout-anchor-dependency-retry": R3_POLICY,
+        }[args.command]
         result = submit(
             plan_path=args.plan,
             scheduler_cutover_receipt_path=(

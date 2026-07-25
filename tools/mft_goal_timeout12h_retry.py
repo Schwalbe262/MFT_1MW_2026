@@ -6,8 +6,9 @@ Scheduler mutation available here is the atomically guarded task POST in
 ``submit-timeout12h-retry``.
 
 The original r1 authority remains byte-compatible for tasks 96256/96263.
-The late task-96258 terminal is isolated under a supplemental r2 claim root
-so expanding the reviewed mapping cannot silently widen the frozen r1 root.
+Late task-96258 and task-96289 terminals are isolated under supplemental
+r2/r3 claim roots so expanding a reviewed mapping cannot silently widen an
+older frozen root.
 """
 
 from __future__ import annotations
@@ -64,11 +65,13 @@ PROFILE_SCHEMA = (
 )
 RETRY_GENERATION = "timeout12h-r1"
 SUPPLEMENTAL_RETRY_GENERATION = "timeout12h-r2"
+LATE_ANCHOR_RETRY_GENERATION = "timeout12h-r3"
 RESOURCES = {"cpus": 8, "timeout_seconds": 12 * 3600}
 MEMORY_MB = 32768
 STRICT_NODE_NAME = "n114"
 EXACT_LOGICAL_TO_FAILED_TASK = {96218: 96256, 96226: 96263}
 SUPPLEMENTAL_EXACT_LOGICAL_TO_FAILED_TASK = {96224: 96258}
+LATE_ANCHOR_EXACT_LOGICAL_TO_FAILED_TASK = {96223: 96289}
 PROFILE_PATH = (
     probe.REPOSITORY_ROOT
     / "regression_260707"
@@ -83,6 +86,10 @@ CLAIM_ROOT = Path(
 SUPPLEMENTAL_CLAIM_ROOT = Path(
     "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
     "timeout12h_claims_r2"
+)
+LATE_ANCHOR_CLAIM_ROOT = Path(
+    "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
+    "timeout12h_claims_r3"
 )
 CLAIM_AUTHORITY_SHA256 = canonical_sha256(
     {
@@ -103,6 +110,18 @@ SUPPLEMENTAL_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
         "retry_generation": SUPPLEMENTAL_RETRY_GENERATION,
         "exact_logical_to_failed_task": (
             SUPPLEMENTAL_EXACT_LOGICAL_TO_FAILED_TASK
+        ),
+    }
+)
+LATE_ANCHOR_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
+    {
+        "campaign_id": "mft-goal-20260726",
+        "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+        "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+        "temperature_contract_sha256": GOAL_TEMPERATURE_CONTRACT_SHA256,
+        "retry_generation": LATE_ANCHOR_RETRY_GENERATION,
+        "exact_logical_to_failed_task": (
+            LATE_ANCHOR_EXACT_LOGICAL_TO_FAILED_TASK
         ),
     }
 )
@@ -182,6 +201,17 @@ def _retry_authority(retry_generation: str) -> dict[str, Any]:
                 SUPPLEMENTAL_EXACT_LOGICAL_TO_FAILED_TASK
             ),
         }
+    if retry_generation == LATE_ANCHOR_RETRY_GENERATION:
+        return {
+            "retry_generation": LATE_ANCHOR_RETRY_GENERATION,
+            "claim_root": LATE_ANCHOR_CLAIM_ROOT,
+            "claim_authority_sha256": (
+                LATE_ANCHOR_CLAIM_AUTHORITY_SHA256
+            ),
+            "exact_logical_to_failed_task": (
+                LATE_ANCHOR_EXACT_LOGICAL_TO_FAILED_TASK
+            ),
+        }
     raise HandoffContractError("timeout12h retry generation is unsupported")
 
 
@@ -193,6 +223,7 @@ def _retry_authority_for_pair(
         for generation in (
             RETRY_GENERATION,
             SUPPLEMENTAL_RETRY_GENERATION,
+            LATE_ANCHOR_RETRY_GENERATION,
         )
         if _retry_authority(generation)[
             "exact_logical_to_failed_task"
@@ -464,7 +495,9 @@ def _stream_evidence(
     stderr: bytes | str,
     *,
     task_id: int,
+    retry_generation: str,
 ) -> dict[str, Any]:
+    _retry_authority(retry_generation)
     raw_out = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
     raw_err = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
     if (
@@ -525,6 +558,11 @@ def _stream_evidence(
         if isinstance(row, Mapping)
     )
     elapsed = preflight.get("elapsed_s")
+    minimum_elapsed_seconds = (
+        2 * 3600
+        if retry_generation == LATE_ANCHOR_RETRY_GENERATION
+        else 4 * 3600
+    )
     solve_marker = "Solving design setup ThermalSetup"
     if (
         preflight.get("passed") is not True
@@ -537,7 +575,7 @@ def _stream_evidence(
         or side_levels != [5]
         or isinstance(elapsed, bool)
         or not isinstance(elapsed, (int, float))
-        or not 4 * 3600 < float(elapsed) < 8 * 3600
+        or not minimum_elapsed_seconds < float(elapsed) < 8 * 3600
         or preflight.get("fresh_mesh_artifact_count") != len(artifacts)
         or len(artifacts) <= 0
         or grid_bytes <= 0
@@ -560,6 +598,9 @@ def _stream_evidence(
         "stderr_sha256": production._sha256_bytes(raw_err),
         "stderr_size_bytes": len(raw_err),
         "native_premesh_elapsed_seconds": float(elapsed),
+        "minimum_native_premesh_elapsed_seconds": (
+            minimum_elapsed_seconds
+        ),
         "native_premesh_passed": True,
         "thermal_solve_dispatched": True,
         "scheduler_forced_termination_observed": True,
@@ -766,6 +807,7 @@ def create_plan(
             task_id=int(immediate_submission["task_id"]),
         ),
         task_id=int(immediate_submission["task_id"]),
+        retry_generation=retry_generation,
     )
     source_retained = immediate_submission["retained_aedt_bundle"]
     retention = _retention_audit(
@@ -1640,6 +1682,7 @@ def submit(
                 task_id=int(immediate_submission["task_id"]),
             ),
             task_id=int(immediate_submission["task_id"]),
+            retry_generation=str(stored["retry_generation"]),
         )
         source_retained = immediate_submission["retained_aedt_bundle"]
         latest_retention = _retention_audit(
@@ -2237,7 +2280,11 @@ def _parser() -> argparse.ArgumentParser:
     claim_init = commands.add_parser("init-timeout12h-claim-root")
     claim_init.add_argument(
         "--retry-generation",
-        choices=(RETRY_GENERATION, SUPPLEMENTAL_RETRY_GENERATION),
+        choices=(
+            RETRY_GENERATION,
+            SUPPLEMENTAL_RETRY_GENERATION,
+            LATE_ANCHOR_RETRY_GENERATION,
+        ),
         default=RETRY_GENERATION,
     )
     plan = commands.add_parser("plan-timeout12h-retry")
