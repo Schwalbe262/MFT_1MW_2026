@@ -77,6 +77,40 @@ def _capacity(account: str = "dhj02") -> dict[str, Any]:
     }
 
 
+def _mock_active_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tasks: list[dict[str, Any]],
+    *,
+    bound_gib: list[int],
+) -> list[Path]:
+    values: dict[Path, dict[str, Any]] = {}
+    for task, gib in zip(tasks, bound_gib, strict=True):
+        path = (tmp_path / f"bound-{task['task_id']}.json").resolve()
+        path.write_text("{}\n", encoding="utf-8")
+        values[path] = {
+            "payload_sha256": f"{task['task_id']:064x}",
+            "task_id": task["task_id"],
+            "task_name": task["name"],
+            "dedupe_key": task["dedupe_key"],
+            "standard_storage_bound_bytes": gib * 1024**3,
+            "standard_storage_bound_gib": float(gib),
+        }
+
+    def load(path: Path, *, task: dict[str, Any] | None = None):
+        value = values[Path(path).resolve()]
+        if task is not None and (
+            value["task_id"] != task["task_id"]
+            or value["task_name"] != task["name"]
+            or value["dedupe_key"] != task["dedupe_key"]
+        ):
+            raise fastlane.HandoffContractError("bound mismatch")
+        return value
+
+    monkeypatch.setattr(fastlane, "_load_standard_storage_bound", load)
+    return list(values)
+
+
 def test_full_profile_keeps_reviewed_physics_and_resources() -> None:
     profile, _record = fastlane.promotion._full_profile()
     assert profile["mem_mb"] == 98304
@@ -177,18 +211,27 @@ def test_terminal_authority_rejects_mutating_promotion_receipt(
         )
 
 
-def test_gpfs_audit_reserves_active_tasks_and_candidate() -> None:
+def test_gpfs_audit_uses_per_task_authenticated_bounds_without_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = [_task(1), _task(2)]
+    authorities = _mock_active_bounds(
+        tmp_path, monkeypatch, tasks, bound_gib=[19, 23]
+    )
     audit = fastlane.build_gpfs_audit(
         observed_at_utc="2026-07-25T23:00:00+09:00",
         account_observations=[_gpfs()],
-        rows=[_task(1), _task(2)],
+        rows=tasks,
+        active_task_storage_authority_paths=authorities,
     )
     account = audit["account_observations"][0]
     assert account["active_bounded_task_count"] == 2
-    assert account["active_task_reservation_gb"] == 8.0
-    assert account["candidate_reservation_gb"] == 4.0
-    assert account["free_after_active_and_candidate_gb"] == 58.0
+    assert account["active_storage_bound_gib"] == 42.0
+    assert account["free_after_active_gb"] == 28.0
     assert account["minimum_free_floor_gb"] == 10.0
+    assert audit["candidate_storage_bound_included"] is False
+    assert audit["generic_per_task_storage_reservation_used"] is False
+    assert audit["retained_bytes_used"] is False
     assert audit["active_unbounded_storage_conflict_count"] == 0
     assert audit["arithmetic_passed"] is True
 
@@ -206,6 +249,20 @@ def test_gpfs_audit_blocks_unbounded_or_unaudited_active_work(
         rows=[_task(1, account=account, timeout=timeout)],
     )
     assert audit["active_unbounded_storage_conflict_count"] == 1
+    assert audit["arithmetic_passed"] is False
+
+
+def test_gpfs_audit_blocks_active_task_without_storage_authority() -> None:
+    audit = fastlane.build_gpfs_audit(
+        observed_at_utc="2026-07-25T23:00:00+09:00",
+        account_observations=[_gpfs()],
+        rows=[_task(1)],
+    )
+    assert audit["active_unbounded_storage_conflict_count"] == 1
+    assert (
+        audit["active_unbounded_storage_conflicts"][0]["reason"]
+        == "active_task_storage_authority_missing"
+    )
     assert audit["arithmetic_passed"] is False
 
 
@@ -227,6 +284,205 @@ def test_gpfs_audit_is_fresh_and_fails_closed_when_stale(
         fastlane._load_gpfs_audit(
             path, require_fresh=True, now=observed + timedelta(seconds=121)
         )
+
+
+def test_source_grid_provenance_is_reauthenticated_from_timeout_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "diagnostic_timeout12h_retry_plan.json"
+    source.write_text(
+        fastlane.json.dumps(
+            {"schema_version": fastlane.timeout12h.PLAN_SCHEMA}
+        ),
+        encoding="utf-8",
+    )
+    grid_bytes = 27 * 1024**3
+    stream = {"fresh_grid_output_bytes": grid_bytes}
+    storage = {"prospective_grid_gb": 27.0}
+    plan = {
+        "payload_sha256": "1" * 64,
+        "candidate_physics_sha256": "2" * 64,
+        "retry_of_timeout12h": {
+            "logical_authority_task_id": 96218,
+            "stream_evidence": stream,
+            "stream_evidence_sha256": fastlane.canonical_sha256(stream),
+            "storage_audit": storage,
+            "storage_audit_sha256": fastlane.canonical_sha256(storage),
+        },
+        "stage": {
+            "name": "standard",
+            "task_name": "mft-goal-diag-timeout12h-r1",
+            "full_model": 0,
+            "thermal_symmetry": "eighth",
+            "retained_aedt_bundle": {"dedupe_key": "mft:test"},
+        },
+    }
+    monkeypatch.setattr(
+        fastlane.timeout12h,
+        "_load_plan",
+        lambda _path: (plan, {}, {}, {}),
+    )
+    evidence = fastlane._authenticated_standard_grid_evidence(source)
+    assert evidence["fresh_grid_output_bytes"] == grid_bytes
+    assert evidence["source_stage_thermal_symmetry"] == "eighth"
+    assert evidence["candidate_physics_sha256"] == "2" * 64
+
+
+def test_full_storage_bound_is_eight_sector_source_grid_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selection_path = tmp_path / "selection.json"
+    full_plan_path = tmp_path / "full_plan.json"
+    collection_path = tmp_path / "collection.json"
+    source_plan_path = tmp_path / "source_plan.json"
+    for path in (
+        selection_path,
+        full_plan_path,
+        collection_path,
+        source_plan_path,
+    ):
+        path.write_text("{}\n", encoding="utf-8")
+    candidate = "3" * 64
+    selection = {
+        "payload_sha256": "4" * 64,
+        "candidate_physics_sha256": candidate,
+        "full_plan": fastlane.production._file_record(full_plan_path),
+    }
+    collection_record = fastlane.production._file_record(collection_path)
+    source_record = fastlane.production._file_record(source_plan_path)
+    full_plan = {
+        "payload_sha256": "5" * 64,
+        "candidate_physics_sha256": candidate,
+        "standard_collection": collection_record,
+        "standard_collection_payload_sha256": "6" * 64,
+        "standard_task_id": 96300,
+    }
+    grid_bytes = 27 * 1024**3
+    evidence = {
+        "source_standard_plan": source_record,
+        "source_standard_plan_payload_sha256": "7" * 64,
+        "candidate_physics_sha256": candidate,
+        "logical_authority_task_id": 96218,
+        "task_name": "standard",
+        "dedupe_key": "mft:standard",
+        "fresh_grid_output_bytes": grid_bytes,
+        "fresh_grid_output_gib": 27.0,
+        "stream_evidence_sha256": "8" * 64,
+        "storage_audit_sha256": "9" * 64,
+        "source_stage_full_model": 0,
+        "source_stage_thermal_symmetry": "eighth",
+    }
+    monkeypatch.setattr(
+        fastlane, "_load_selection", lambda _path: selection
+    )
+    monkeypatch.setattr(
+        fastlane, "_selection_plan_path", lambda _selection: full_plan_path
+    )
+    monkeypatch.setattr(
+        fastlane.promotion,
+        "_load_full_plan",
+        lambda _path: (full_plan, {}, {}, {}, {}),
+    )
+    monkeypatch.setattr(
+        fastlane.diagnostic,
+        "authenticate_collection",
+        lambda _path: {
+            "collection": {
+                "task_id": 96300,
+                "payload_sha256": "6" * 64,
+                "plan": source_record,
+            },
+            "plan": {
+                "payload_sha256": "7" * 64,
+                "candidate_physics_sha256": candidate,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        fastlane,
+        "_authenticated_standard_grid_evidence",
+        lambda _path: evidence,
+    )
+    payload = fastlane._full_storage_authority_payload(
+        selection_path=selection_path, selection=selection
+    )
+    assert payload["full_symmetry_expansion_factor"] == 8
+    assert payload["full_prospective_storage_bound_bytes"] == 216 * 1024**3
+    assert payload["full_prospective_storage_bound_gib"] == 216.0
+    assert payload["minimum_post_reservation_free_floor_gib"] == 10.0
+    assert payload["retained_bytes_used"] is False
+    assert payload["generic_reservation_used"] is False
+
+
+def test_full_storage_authority_missing_or_mismatched_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selection = {"payload_sha256": "1" * 64}
+    with pytest.raises(
+        fastlane.HandoffContractError,
+        match="exactly one matching Full prospective-storage authority",
+    ):
+        fastlane._latest_full_storage_authority(
+            tmp_path, selection=selection
+        )
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text("{}\n", encoding="utf-8")
+    expected = {
+        "schema_version": fastlane.FULL_STORAGE_AUTHORITY_SCHEMA,
+        "selection": fastlane.production._file_record(selection_path),
+        "selection_payload_sha256": "1" * 64,
+        "candidate_physics_sha256": "2" * 64,
+    }
+    monkeypatch.setattr(
+        fastlane,
+        "_full_storage_authority_payload",
+        lambda **_kwargs: expected,
+    )
+    bad = fastlane._sealed(
+        {
+            **expected,
+            "candidate_physics_sha256": "3" * 64,
+            "created_at_utc": "2026-07-25T14:00:00+00:00",
+        }
+    )
+    bad_path = tmp_path / "bad.json"
+    fastlane.production._write_immutable_json(bad_path, bad)
+    with pytest.raises(
+        fastlane.HandoffContractError,
+        match="prospective-storage authority drifted",
+    ):
+        fastlane._load_full_storage_authority(
+            bad_path, selection=selection
+        )
+
+
+def test_full_storage_gate_rejects_insufficient_quota() -> None:
+    audit = {
+        "account_observations": [
+            {
+                "account_name": "dhj02",
+                "free_after_active_gb": 100.0,
+                "active_only_arithmetic_passed": True,
+            }
+        ]
+    }
+    source_bytes = 12 * 1024**3
+    full = {
+        "fresh_grid_output_bytes": source_bytes,
+        "full_symmetry_expansion_factor": 8,
+        "standard_symmetry_denominator": 8,
+        "full_prospective_storage_bound_bytes": source_bytes * 8,
+        "full_prospective_storage_bound_gib": 96.0,
+        "minimum_post_reservation_free_floor_gib": 10.0,
+        "retained_bytes_used": False,
+        "generic_reservation_used": False,
+    }
+    evaluated, safe = fastlane._storage_admission_accounts(
+        audit=audit, full_storage=full
+    )
+    assert evaluated[0]["free_after_active_and_full_gib"] == 4.0
+    assert evaluated[0]["full_arithmetic_passed"] is False
+    assert safe == []
 
 
 def test_capacity_must_be_ready_on_exact_audited_account() -> None:
@@ -373,6 +629,11 @@ def test_without_activation_cycle_cannot_reach_submit(
     gates = {"selected_account_name": "dhj02"}
     monkeypatch.setattr(fastlane, "_load_watch_plan", lambda _path: plan)
     monkeypatch.setattr(fastlane, "_prepare_selection", lambda _plan: selection)
+    monkeypatch.setattr(
+        fastlane,
+        "_ensure_full_storage_authority",
+        lambda *_args, **_kwargs: tmp_path / "full-storage.json",
+    )
     monkeypatch.setattr(fastlane, "_fresh_gates", lambda *_args, **_kwargs: gates)
 
     def forbidden(**_kwargs):

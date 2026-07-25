@@ -45,6 +45,7 @@ from tools import mft_campaign_atomic_claim as atomic_claim  # noqa: E402
 from tools import mft_goal_diagnostic_standard_probe as diagnostic  # noqa: E402
 from tools import mft_goal_fea_handoff as production  # noqa: E402
 from tools import mft_goal_terminal_success_watcher as terminal  # noqa: E402
+from tools import mft_goal_timeout12h_retry as timeout12h  # noqa: E402
 from tools import mft_goal_truth_promotion as promotion  # noqa: E402
 
 
@@ -52,6 +53,12 @@ WATCH_PLAN_SCHEMA = "mft-goal-first-truth-full-fast-lane-watch-plan-v1"
 ACTIVATION_SCHEMA = "mft-goal-first-truth-full-fast-lane-activation-v1"
 SELECTION_SCHEMA = "mft-goal-first-truth-full-fast-lane-selection-v1"
 GPFS_AUDIT_SCHEMA = "mft-goal-first-truth-full-fast-lane-gpfs-audit-v1"
+STANDARD_STORAGE_BOUND_SCHEMA = (
+    "mft-goal-first-truth-full-fast-lane-standard-storage-bound-v1"
+)
+FULL_STORAGE_AUTHORITY_SCHEMA = (
+    "mft-goal-first-truth-full-fast-lane-full-storage-authority-v1"
+)
 POST_INTENT_SCHEMA = "mft-goal-first-truth-full-fast-lane-post-intent-v1"
 POST_RESULT_SCHEMA = "mft-goal-first-truth-full-fast-lane-post-result-v1"
 RECEIPT_SCHEMA = "mft-goal-first-truth-full-fast-lane-receipt-v1"
@@ -68,7 +75,13 @@ FULL_RESOURCES = {
     "timeout_seconds": 43200,
 }
 MINIMUM_GPFS_FREE_GB = 10.0
-PROJECT_RESERVATION_GB = 4.0
+# Standard is an authenticated one-eighth thermal model.  The Full envelope
+# reserves all eight physical sectors of the exact successful Standard grid.
+# The established 10 GiB post-reservation floor remains the non-grid working
+# allowance.  Neither retained-result bytes nor a generic per-task estimate
+# is admissible storage authority.
+FULL_SYMMETRY_EXPANSION_FACTOR = 8
+STANDARD_SYMMETRY_DENOMINATOR = 8
 MAX_GPFS_AUDIT_AGE_SECONDS = 120
 MIN_POLL_SECONDS = 10
 MAX_POLL_SECONDS = 60
@@ -122,6 +135,11 @@ CLAIM_AUTHORITY_SHA256 = canonical_sha256(
         "core_plate_pad_t_mm": 2.0,
         "wcp_pad_t_mm": 2.0,
         "minimum_gpfs_free_gb": MINIMUM_GPFS_FREE_GB,
+        "full_symmetry_expansion_factor": FULL_SYMMETRY_EXPANSION_FACTOR,
+        "standard_symmetry_denominator": STANDARD_SYMMETRY_DENOMINATOR,
+        "storage_bound_source": "authenticated_fresh_grid_output_bytes",
+        "retained_bytes_are_storage_authority": False,
+        "generic_per_task_storage_reservation_allowed": False,
         "maximum_scheduler_posts": 1,
         "safe_refill_priority_fence_path": str(DEFAULT_PRIORITY_FENCE_PATH),
     }
@@ -155,6 +173,15 @@ def _nonnegative_float(value: Any, label: str) -> float:
         raise HandoffContractError(f"{label} is invalid")
     result = float(value)
     if not math.isfinite(result) or result < 0:
+        raise HandoffContractError(f"{label} is invalid")
+    return result
+
+
+def _finite_float(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise HandoffContractError(f"{label} is invalid")
+    result = float(value)
+    if not math.isfinite(result):
         raise HandoffContractError(f"{label} is invalid")
     return result
 
@@ -224,7 +251,13 @@ def _write_atomic(path: Path, value: Mapping[str, Any]) -> Path:
 
 def _git_revision() -> str:
     completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        [
+            "git",
+            "-c",
+            f"safe.directory={REPOSITORY_ROOT.as_posix()}",
+            "rev-parse",
+            "HEAD",
+        ],
         cwd=REPOSITORY_ROOT,
         text=True,
         capture_output=True,
@@ -264,6 +297,7 @@ def initialize_watch_plan(
     license_snapshot_directory: Path,
     gpfs_audit_directory: Path,
     output_root: Path,
+    full_storage_authority_directory: Path | None = None,
     claim_root: Path = DEFAULT_CLAIM_ROOT,
     priority_fence_path: Path = DEFAULT_PRIORITY_FENCE_PATH,
     poll_seconds: int = DEFAULT_POLL_SECONDS,
@@ -279,8 +313,14 @@ def initialize_watch_plan(
         raise HandoffContractError("terminal watcher state parent is unavailable")
     license_root = license_snapshot_directory.resolve()
     gpfs_root = gpfs_audit_directory.resolve()
+    full_storage_root = (
+        full_storage_authority_directory.resolve()
+        if full_storage_authority_directory is not None
+        else (gpfs_root / "full_authorities").resolve()
+    )
     license_root.mkdir(parents=True, exist_ok=True)
     gpfs_root.mkdir(parents=True, exist_ok=True)
+    full_storage_root.mkdir(parents=True, exist_ok=True)
     destination = output_root.resolve()
     destination.mkdir(parents=True, exist_ok=True)
     fence_path = priority_fence_path.resolve()
@@ -300,6 +340,8 @@ def initialize_watch_plan(
             or existing["license_snapshot_directory"]
             != str(license_root)
             or existing["gpfs_audit_directory"] != str(gpfs_root)
+            or existing["full_storage_authority_directory"]
+            != str(full_storage_root)
             or existing["priority_fence_path"] != str(fence_path)
             or Path(
                 existing["claim_root_authority"]["resolved_root"]
@@ -339,6 +381,7 @@ def initialize_watch_plan(
             "scheduler_revision": diagnostic.SCHEDULER_STRICT_NODE_REVISION,
             "license_snapshot_directory": str(license_root),
             "gpfs_audit_directory": str(gpfs_root),
+            "full_storage_authority_directory": str(full_storage_root),
             "output_root": str(destination),
             "priority_fence_path": str(fence_path),
             "claim_root_authority": authority,
@@ -355,7 +398,17 @@ def initialize_watch_plan(
                 "wcp_pad_t_mm": 2.0,
             },
             "minimum_gpfs_free_gb": MINIMUM_GPFS_FREE_GB,
-            "project_reservation_gb": PROJECT_RESERVATION_GB,
+            "full_symmetry_expansion_factor": (
+                FULL_SYMMETRY_EXPANSION_FACTOR
+            ),
+            "standard_symmetry_denominator": (
+                STANDARD_SYMMETRY_DENOMINATOR
+            ),
+            "storage_bound_source": (
+                "authenticated_fresh_grid_output_bytes"
+            ),
+            "retained_bytes_are_storage_authority": False,
+            "generic_per_task_storage_reservation_allowed": False,
             "maximum_scheduler_posts": 1,
             "poll_seconds": poll_seconds,
             "activation_receipt_required": True,
@@ -383,6 +436,7 @@ WATCH_PLAN_FIELDS = frozenset(
         "scheduler_revision",
         "license_snapshot_directory",
         "gpfs_audit_directory",
+        "full_storage_authority_directory",
         "output_root",
         "priority_fence_path",
         "claim_root_authority",
@@ -393,7 +447,11 @@ WATCH_PLAN_FIELDS = frozenset(
         "thermal_symmetry",
         "fixed_boundary",
         "minimum_gpfs_free_gb",
-        "project_reservation_gb",
+        "full_symmetry_expansion_factor",
+        "standard_symmetry_denominator",
+        "storage_bound_source",
+        "retained_bytes_are_storage_authority",
+        "generic_per_task_storage_reservation_allowed",
         "maximum_scheduler_posts",
         "poll_seconds",
         "activation_receipt_required",
@@ -412,6 +470,9 @@ def _load_watch_plan(path: Path) -> dict[str, Any]:
         _read_json(resolved), WATCH_PLAN_SCHEMA, label="Full fast-lane watch plan"
     )
     root = Path(str(plan.get("output_root") or "")).resolve()
+    full_storage_root = Path(
+        str(plan.get("full_storage_authority_directory") or "")
+    ).resolve()
     if (
         set(plan) != WATCH_PLAN_FIELDS
         or plan.get("campaign_id") != CAMPAIGN_ID
@@ -420,6 +481,7 @@ def _load_watch_plan(path: Path) -> dict[str, Any]:
         or plan.get("scheduler_project") != scheduler_client.MFT_PROJECT
         or plan.get("scheduler_revision")
         != diagnostic.SCHEDULER_STRICT_NODE_REVISION
+        or not full_storage_root.is_dir()
         or plan.get("full_resources") != FULL_RESOURCES
         or Path(str(plan.get("priority_fence_path") or "")).resolve()
         != DEFAULT_PRIORITY_FENCE_PATH.resolve()
@@ -435,7 +497,15 @@ def _load_watch_plan(path: Path) -> dict[str, Any]:
             "wcp_pad_t_mm": 2.0,
         }
         or plan.get("minimum_gpfs_free_gb") != MINIMUM_GPFS_FREE_GB
-        or plan.get("project_reservation_gb") != PROJECT_RESERVATION_GB
+        or plan.get("full_symmetry_expansion_factor")
+        != FULL_SYMMETRY_EXPANSION_FACTOR
+        or plan.get("standard_symmetry_denominator")
+        != STANDARD_SYMMETRY_DENOMINATOR
+        or plan.get("storage_bound_source")
+        != "authenticated_fresh_grid_output_bytes"
+        or plan.get("retained_bytes_are_storage_authority") is not False
+        or plan.get("generic_per_task_storage_reservation_allowed")
+        is not False
         or plan.get("maximum_scheduler_posts") != 1
         or plan.get("activation_receipt_required") is not True
         or plan.get("live_post_default_enabled") is not False
@@ -818,11 +888,368 @@ def _active_project_tasks(rows: Any) -> list[dict[str, Any]]:
     return active
 
 
+def _bytes_to_gib(value: int) -> float:
+    return value / float(1024**3)
+
+
+def _authenticated_standard_grid_evidence(
+    source_plan_path: Path,
+) -> dict[str, Any]:
+    """Reauthenticate an actual fresh Standard grid, never retained bytes."""
+    resolved = source_plan_path.resolve(strict=True)
+    raw = _read_json(resolved)
+    if raw.get("schema_version") != timeout12h.PLAN_SCHEMA:
+        raise HandoffContractError(
+            "source Standard plan has no authenticated fresh-grid authority"
+        )
+    source_plan, _params, _selected, _parent = timeout12h._load_plan(resolved)
+    retry = source_plan.get("retry_of_timeout12h")
+    stage = source_plan.get("stage")
+    if not isinstance(retry, Mapping) or not isinstance(stage, Mapping):
+        raise HandoffContractError(
+            "source Standard fresh-grid lineage is absent"
+        )
+    stream = retry.get("stream_evidence")
+    storage = retry.get("storage_audit")
+    if not isinstance(stream, Mapping) or not isinstance(storage, Mapping):
+        raise HandoffContractError(
+            "source Standard fresh-grid/storage evidence is absent"
+        )
+    grid_bytes = _positive_int(
+        stream.get("fresh_grid_output_bytes"),
+        "source Standard fresh grid bytes",
+    )
+    prospective = _nonnegative_float(
+        storage.get("prospective_grid_gb"),
+        "source Standard prospective grid",
+    )
+    retained = stage.get("retained_aedt_bundle")
+    logical_id = retry.get("logical_authority_task_id")
+    if (
+        stage.get("name") != "standard"
+        or stage.get("full_model") != 0
+        or stage.get("thermal_symmetry") != "eighth"
+        or not isinstance(retained, Mapping)
+        or not str(retained.get("dedupe_key") or "")
+        or isinstance(logical_id, bool)
+        or not isinstance(logical_id, int)
+        or logical_id <= 0
+        or retry.get("stream_evidence_sha256")
+        != canonical_sha256(stream)
+        or retry.get("storage_audit_sha256")
+        != canonical_sha256(storage)
+        or not math.isclose(
+            prospective,
+            _bytes_to_gib(grid_bytes),
+            rel_tol=0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise HandoffContractError(
+            "source Standard fresh-grid authority drifted"
+        )
+    return {
+        "source_standard_plan": production._file_record(resolved),
+        "source_standard_plan_payload_sha256": source_plan["payload_sha256"],
+        "candidate_physics_sha256": source_plan[
+            "candidate_physics_sha256"
+        ],
+        "logical_authority_task_id": logical_id,
+        "task_name": stage["task_name"],
+        "dedupe_key": retained["dedupe_key"],
+        "fresh_grid_output_bytes": grid_bytes,
+        "fresh_grid_output_gib": _bytes_to_gib(grid_bytes),
+        "stream_evidence_sha256": retry["stream_evidence_sha256"],
+        "storage_audit_sha256": retry["storage_audit_sha256"],
+        "source_stage_full_model": 0,
+        "source_stage_thermal_symmetry": "eighth",
+    }
+
+
+def create_standard_storage_bound_authority(
+    *,
+    source_plan_path: Path,
+    task_id: int,
+    output: Path,
+) -> Path:
+    """Seal a live Standard task bound from its authenticated source grid."""
+    task_id = _positive_int(task_id, "active Standard task ID")
+    evidence = _authenticated_standard_grid_evidence(source_plan_path)
+    value = _sealed(
+        {
+            "schema_version": STANDARD_STORAGE_BOUND_SCHEMA,
+            "campaign_id": CAMPAIGN_ID,
+            "task_id": task_id,
+            **evidence,
+            "standard_storage_bound_bytes": evidence[
+                "fresh_grid_output_bytes"
+            ],
+            "standard_storage_bound_gib": evidence[
+                "fresh_grid_output_gib"
+            ],
+            "bound_method": (
+                "authenticated_same-geometry_standard_fresh_grid_bytes"
+            ),
+            "retained_bytes_used": False,
+            "generic_reservation_used": False,
+            "created_at_utc": _now(),
+        }
+    )
+    path = output.resolve()
+    if path.exists():
+        observed = _load_standard_storage_bound(path)
+        comparable = {
+            key: item
+            for key, item in observed.items()
+            if key not in {"payload_sha256", "created_at_utc"}
+        }
+        expected = {
+            key: item
+            for key, item in value.items()
+            if key not in {"payload_sha256", "created_at_utc"}
+        }
+        if comparable != expected:
+            raise HandoffContractError(
+                "existing Standard storage-bound authority differs"
+            )
+        return path
+    return _write_immutable(path, value)
+
+
+def _load_standard_storage_bound(
+    path: Path,
+    *,
+    task: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    value = _validate_seal(
+        _read_json(path.resolve(strict=True)),
+        STANDARD_STORAGE_BOUND_SCHEMA,
+        label="Standard active storage-bound authority",
+    )
+    source_record = value.get("source_standard_plan")
+    if not isinstance(source_record, Mapping):
+        raise HandoffContractError(
+            "Standard active storage source plan is absent"
+        )
+    evidence = _authenticated_standard_grid_evidence(
+        Path(str(source_record.get("path") or ""))
+    )
+    if (
+        value.get("campaign_id") != CAMPAIGN_ID
+        or any(value.get(key) != item for key, item in evidence.items())
+        or value.get("standard_storage_bound_bytes")
+        != evidence["fresh_grid_output_bytes"]
+        or value.get("standard_storage_bound_gib")
+        != evidence["fresh_grid_output_gib"]
+        or value.get("bound_method")
+        != "authenticated_same-geometry_standard_fresh_grid_bytes"
+        or value.get("retained_bytes_used") is not False
+        or value.get("generic_reservation_used") is not False
+    ):
+        raise HandoffContractError(
+            "Standard active storage-bound authority drifted"
+        )
+    task_id = _positive_int(value.get("task_id"), "active Standard task ID")
+    if task is not None and (
+        task_id != task.get("task_id")
+        or value.get("task_name") != task.get("name")
+        or value.get("dedupe_key") != task.get("dedupe_key")
+    ):
+        raise HandoffContractError(
+            "Standard storage bound does not match the active task"
+        )
+    return value
+
+
+def _full_storage_authority_payload(
+    *,
+    selection_path: Path,
+    selection: Mapping[str, Any],
+) -> dict[str, Any]:
+    authenticated_selection = _load_selection(selection_path)
+    if (
+        authenticated_selection.get("payload_sha256")
+        != selection.get("payload_sha256")
+    ):
+        raise HandoffContractError(
+            "Full storage authority selection bytes drifted"
+        )
+    full_plan_path = _selection_plan_path(selection)
+    full_plan, _params, _profile, _view, _truth = (
+        promotion._load_full_plan(full_plan_path)
+    )
+    collection_record = full_plan["standard_collection"]
+    collection_path = Path(str(collection_record.get("path") or ""))
+    if production._file_record(collection_path) != collection_record:
+        raise HandoffContractError(
+            "Full storage source collection bytes drifted"
+        )
+    authenticated = diagnostic.authenticate_collection(collection_path)
+    collection = authenticated["collection"]
+    source_plan = authenticated["plan"]
+    source_plan_record = collection.get("plan")
+    if not isinstance(source_plan_record, Mapping):
+        raise HandoffContractError(
+            "Full storage source Standard plan is absent"
+        )
+    source_plan_path = Path(str(source_plan_record.get("path") or ""))
+    evidence = _authenticated_standard_grid_evidence(source_plan_path)
+    source_bytes = evidence["fresh_grid_output_bytes"]
+    full_bound_bytes = source_bytes * FULL_SYMMETRY_EXPANSION_FACTOR
+    if (
+        collection.get("task_id") != full_plan["standard_task_id"]
+        or collection.get("payload_sha256")
+        != full_plan["standard_collection_payload_sha256"]
+        or collection.get("plan") != evidence["source_standard_plan"]
+        or source_plan.get("payload_sha256")
+        != evidence["source_standard_plan_payload_sha256"]
+        or source_plan.get("candidate_physics_sha256")
+        != full_plan["candidate_physics_sha256"]
+        or evidence["candidate_physics_sha256"]
+        != selection["candidate_physics_sha256"]
+    ):
+        raise HandoffContractError(
+            "Full storage authority escaped selected Standard lineage"
+        )
+    return {
+        "schema_version": FULL_STORAGE_AUTHORITY_SCHEMA,
+        "campaign_id": CAMPAIGN_ID,
+        "selection": production._file_record(
+            selection_path.resolve(strict=True)
+        ),
+        "selection_payload_sha256": selection["payload_sha256"],
+        "full_plan": production._file_record(full_plan_path),
+        "full_plan_payload_sha256": full_plan["payload_sha256"],
+        "standard_collection": production._file_record(collection_path),
+        "standard_collection_payload_sha256": full_plan[
+            "standard_collection_payload_sha256"
+        ],
+        "standard_task_id": full_plan["standard_task_id"],
+        **evidence,
+        "full_symmetry_expansion_factor": (
+            FULL_SYMMETRY_EXPANSION_FACTOR
+        ),
+        "standard_symmetry_denominator": STANDARD_SYMMETRY_DENOMINATOR,
+        "full_prospective_storage_bound_bytes": full_bound_bytes,
+        "full_prospective_storage_bound_gib": _bytes_to_gib(
+            full_bound_bytes
+        ),
+        "minimum_post_reservation_free_floor_gib": MINIMUM_GPFS_FREE_GB,
+        "bound_method": (
+            "authenticated_standard_fresh_grid_bytes_times_"
+            "full_symmetry_expansion_factor"
+        ),
+        "retained_bytes_used": False,
+        "generic_reservation_used": False,
+    }
+
+
+def create_full_storage_authority(
+    *, selection_path: Path, output: Path
+) -> Path:
+    selection_path = selection_path.resolve(strict=True)
+    selection = _load_selection(selection_path)
+    value = _sealed(
+        {
+            **_full_storage_authority_payload(
+                selection_path=selection_path, selection=selection
+            ),
+            "created_at_utc": _now(),
+        }
+    )
+    path = output.resolve()
+    if path.exists():
+        observed = _load_full_storage_authority(
+            path, selection=selection
+        )
+        comparable = {
+            key: item
+            for key, item in observed.items()
+            if key not in {"payload_sha256", "created_at_utc"}
+        }
+        expected = {
+            key: item
+            for key, item in value.items()
+            if key not in {"payload_sha256", "created_at_utc"}
+        }
+        if comparable != expected:
+            raise HandoffContractError(
+                "existing Full storage authority differs"
+            )
+        return path
+    return _write_immutable(path, value)
+
+
+def _load_full_storage_authority(
+    path: Path, *, selection: Mapping[str, Any]
+) -> dict[str, Any]:
+    value = _validate_seal(
+        _read_json(path.resolve(strict=True)),
+        FULL_STORAGE_AUTHORITY_SCHEMA,
+        label="Full prospective-storage authority",
+    )
+    selection_record = value.get("selection")
+    if not isinstance(selection_record, Mapping):
+        raise HandoffContractError(
+            "Full prospective-storage selection is absent"
+        )
+    selection_path = Path(str(selection_record.get("path") or ""))
+    expected = _full_storage_authority_payload(
+        selection_path=selection_path,
+        selection=selection,
+    )
+    if (
+        value.get("selection_payload_sha256")
+        != selection["payload_sha256"]
+        or any(value.get(key) != item for key, item in expected.items())
+    ):
+        raise HandoffContractError(
+            "Full prospective-storage authority drifted"
+        )
+    return value
+
+
+def _latest_full_storage_authority(
+    directory: Path, *, selection: Mapping[str, Any]
+) -> tuple[Path, dict[str, Any]]:
+    candidates: list[tuple[Path, dict[str, Any]]] = []
+    for path in directory.resolve(strict=True).rglob("*.json"):
+        try:
+            value = _load_full_storage_authority(path, selection=selection)
+        except HandoffContractError:
+            continue
+        candidates.append((path.resolve(strict=True), value))
+    if len(candidates) != 1:
+        raise HandoffContractError(
+            "exactly one matching Full prospective-storage authority "
+            "is required"
+        )
+    return candidates[0]
+
+
+def _ensure_full_storage_authority(
+    plan: Mapping[str, Any], selection: Mapping[str, Any]
+) -> Path:
+    directory = Path(plan["full_storage_authority_directory"]).resolve(
+        strict=True
+    )
+    path = directory / (
+        "full-"
+        f"{selection['candidate_physics_sha256'][:12]}-"
+        f"{selection['payload_sha256'][:16]}.json"
+    )
+    return create_full_storage_authority(
+        selection_path=Path(plan["output_root"]) / "selection.json",
+        output=path,
+    )
+
+
 def build_gpfs_audit(
     *,
     observed_at_utc: str,
     account_observations: Sequence[Mapping[str, Any]],
     rows: Any,
+    active_task_storage_authority_paths: Sequence[Path] = (),
 ) -> dict[str, Any]:
     _aware(observed_at_utc, "GPFS audit")
     if not account_observations:
@@ -859,7 +1286,25 @@ def build_gpfs_audit(
             "block_limit_gb": limit,
         }
     active = _active_project_tasks(rows)
+    authority_by_task: dict[int, tuple[Path, dict[str, Any]]] = {}
+    for raw_path in active_task_storage_authority_paths:
+        path = Path(raw_path).resolve(strict=True)
+        authority = _load_standard_storage_bound(path)
+        task_id = _positive_int(
+            authority.get("task_id"), "active Standard bound task ID"
+        )
+        if task_id in authority_by_task:
+            raise HandoffContractError(
+                "duplicate active Standard storage-bound authority"
+            )
+        authority_by_task[task_id] = (path, authority)
+    active_ids = {item["task_id"] for item in active}
+    if set(authority_by_task) - active_ids:
+        raise HandoffContractError(
+            "active Standard storage-bound authority has no live task"
+        )
     conflicts = []
+    bounded = []
     reservations = {account: 0 for account in observations}
     for task in active:
         account = task["account_name"]
@@ -871,32 +1316,76 @@ def build_gpfs_audit(
             or not isinstance(timeout, int)
             or timeout <= 0
         ):
-            conflicts.append(copy.deepcopy(task))
+            conflicts.append(
+                {
+                    "reason": "active_task_account_or_timeout_unbounded",
+                    "task": copy.deepcopy(task),
+                }
+            )
             continue
-        reservations[account] += 1
+        authority_item = authority_by_task.get(task["task_id"])
+        if authority_item is None:
+            conflicts.append(
+                {
+                    "reason": "active_task_storage_authority_missing",
+                    "task": copy.deepcopy(task),
+                }
+            )
+            continue
+        authority_path, authority = authority_item
+        try:
+            _load_standard_storage_bound(authority_path, task=task)
+        except HandoffContractError:
+            conflicts.append(
+                {
+                    "reason": "active_task_storage_authority_mismatch",
+                    "task": copy.deepcopy(task),
+                    "authority": production._file_record(authority_path),
+                }
+            )
+            continue
+        bound_bytes = authority["standard_storage_bound_bytes"]
+        reservations[account] += bound_bytes
+        bounded.append(
+            {
+                "task_id": task["task_id"],
+                "account_name": account,
+                "storage_bound_bytes": bound_bytes,
+                "storage_bound_gib": _bytes_to_gib(bound_bytes),
+                "authority": production._file_record(authority_path),
+                "authority_payload_sha256": authority["payload_sha256"],
+            }
+        )
     accounts = []
     for account, observation in sorted(observations.items()):
-        active_gb = reservations[account] * PROJECT_RESERVATION_GB
+        active_bytes = reservations[account]
+        active_gib = _bytes_to_gib(active_bytes)
         observed_free = (
             observation["block_limit_gb"]
             - observation["block_used_gb"]
             - observation["block_in_doubt_gb"]
         )
-        free_after = observed_free - active_gb - PROJECT_RESERVATION_GB
+        free_after_active = observed_free - active_gib
+        bounded_count = sum(
+            1 for item in bounded if item["account_name"] == account
+        )
         accounts.append(
             {
                 **observation,
                 "observed_free_gb": observed_free,
-                "active_bounded_task_count": reservations[account],
-                "active_task_reservation_gb": active_gb,
-                "candidate_reservation_gb": PROJECT_RESERVATION_GB,
-                "free_after_active_and_candidate_gb": free_after,
+                "active_bounded_task_count": bounded_count,
+                "active_storage_bound_bytes": active_bytes,
+                "active_storage_bound_gib": active_gib,
+                "free_after_active_gb": free_after_active,
                 "minimum_free_floor_gb": MINIMUM_GPFS_FREE_GB,
-                "arithmetic_passed": free_after >= MINIMUM_GPFS_FREE_GB,
+                "active_only_arithmetic_passed": (
+                    free_after_active >= MINIMUM_GPFS_FREE_GB
+                ),
             }
         )
     passed = (
-        not conflicts and any(item["arithmetic_passed"] for item in accounts)
+        not conflicts
+        and any(item["active_only_arithmetic_passed"] for item in accounts)
     )
     return _sealed(
         {
@@ -907,10 +1396,27 @@ def build_gpfs_audit(
             "account_observations": accounts,
             "active_project_tasks": active,
             "active_project_task_count": len(active),
+            "active_task_storage_bounds": bounded,
+            "active_task_storage_authorities": [
+                {
+                    "task_id": task_id,
+                    "authority": production._file_record(path),
+                    "authority_payload_sha256": authority[
+                        "payload_sha256"
+                    ],
+                }
+                for task_id, (path, authority) in sorted(
+                    authority_by_task.items()
+                )
+            ],
             "active_unbounded_storage_conflicts": conflicts,
             "active_unbounded_storage_conflict_count": len(conflicts),
-            "reservation_per_active_task_gb": PROJECT_RESERVATION_GB,
-            "candidate_reservation_gb": PROJECT_RESERVATION_GB,
+            "active_storage_bound_source": (
+                "per-task_authenticated_fresh_grid_output_bytes"
+            ),
+            "candidate_storage_bound_included": False,
+            "generic_per_task_storage_reservation_used": False,
+            "retained_bytes_used": False,
             "minimum_free_floor_gb": MINIMUM_GPFS_FREE_GB,
             "arithmetic_passed": passed,
             "scheduler_mutation_performed": False,
@@ -953,6 +1459,12 @@ def _load_gpfs_audit(
         observed_at_utc=str(audit.get("observed_at_utc") or ""),
         account_observations=raw_observations,
         rows=audit.get("active_project_tasks"),
+        active_task_storage_authority_paths=[
+            Path(str(item["authority"]["path"]))
+            for item in audit.get("active_task_storage_authorities") or []
+            if isinstance(item, Mapping)
+            and isinstance(item.get("authority"), Mapping)
+        ],
     )
     if rebuilt != audit:
         raise HandoffContractError("Full fast-lane GPFS audit drifted")
@@ -1138,11 +1650,93 @@ def _active_safe_refill_tasks(
     return matches
 
 
+def _storage_admission_accounts(
+    *,
+    audit: Mapping[str, Any],
+    full_storage: Mapping[str, Any],
+    required_account: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    full_bound_bytes = _positive_int(
+        full_storage.get("full_prospective_storage_bound_bytes"),
+        "Full prospective storage bound",
+    )
+    full_bound_gib = _nonnegative_float(
+        full_storage.get("full_prospective_storage_bound_gib"),
+        "Full prospective storage bound",
+    )
+    source_bytes = _positive_int(
+        full_storage.get("fresh_grid_output_bytes"),
+        "source Standard fresh grid bytes",
+    )
+    if (
+        full_storage.get("full_symmetry_expansion_factor")
+        != FULL_SYMMETRY_EXPANSION_FACTOR
+        or full_storage.get("standard_symmetry_denominator")
+        != STANDARD_SYMMETRY_DENOMINATOR
+        or full_storage.get("minimum_post_reservation_free_floor_gib")
+        != MINIMUM_GPFS_FREE_GB
+        or full_bound_bytes
+        != source_bytes * FULL_SYMMETRY_EXPANSION_FACTOR
+        or not math.isclose(
+            full_bound_gib,
+            _bytes_to_gib(full_bound_bytes),
+            rel_tol=0,
+            abs_tol=1e-12,
+        )
+        or full_storage.get("retained_bytes_used") is not False
+        or full_storage.get("generic_reservation_used") is not False
+    ):
+        raise HandoffContractError(
+            "Full prospective-storage arithmetic drifted"
+        )
+    accounts = audit.get("account_observations")
+    if not isinstance(accounts, list):
+        raise HandoffContractError("GPFS admission accounts are absent")
+    evaluated = []
+    for item in accounts:
+        if not isinstance(item, Mapping):
+            raise HandoffContractError("GPFS admission account is malformed")
+        free_after_active = _finite_float(
+            item.get("free_after_active_gb"),
+            "GPFS free space after active bounds",
+        )
+        free_after_full = free_after_active - full_bound_gib
+        evaluated.append(
+            {
+                **copy.deepcopy(dict(item)),
+                "full_prospective_storage_bound_gib": full_bound_gib,
+                "free_after_active_and_full_gib": free_after_full,
+                "full_arithmetic_passed": (
+                    item.get("active_only_arithmetic_passed") is True
+                    and free_after_full >= MINIMUM_GPFS_FREE_GB
+                ),
+            }
+        )
+    safe = [
+        item
+        for item in evaluated
+        if item["full_arithmetic_passed"] is True
+        and (
+            required_account is None
+            or item["account_name"] == required_account
+        )
+    ]
+    safe.sort(
+        key=lambda item: (
+            -item["free_after_active_and_full_gib"],
+            item["account_name"],
+        )
+    )
+    return evaluated, safe
+
+
 def _fresh_gates(
     plan: Mapping[str, Any],
     *,
+    selection: Mapping[str, Any],
     required_account: str | None = None,
     required_gpfs_audit_path: Path | None = None,
+    required_full_storage_authority_path: Path | None = None,
     required_license_snapshot_path: Path | None = None,
     live_reader: Any = _default_live_reader,
     task_list_reader: Any = _default_task_list_reader,
@@ -1173,6 +1767,20 @@ def _fresh_gates(
     else:
         audit_path = required_gpfs_audit_path.resolve(strict=True)
         audit = _load_gpfs_audit(audit_path, require_fresh=True, now=now)
+    if required_full_storage_authority_path is None:
+        full_storage_path, full_storage = (
+            _latest_full_storage_authority(
+                Path(plan["full_storage_authority_directory"]),
+                selection=selection,
+            )
+        )
+    else:
+        full_storage_path = (
+            required_full_storage_authority_path.resolve(strict=True)
+        )
+        full_storage = _load_full_storage_authority(
+            full_storage_path, selection=selection
+        )
     rows = task_list_reader(scheduler_url=plan["scheduler_url"])
     active = _assert_audit_matches_live(audit, rows)
     active_refill = _active_safe_refill_tasks(active)
@@ -1180,18 +1788,14 @@ def _fresh_gates(
         raise HandoffContractError(
             "active safe-refill work must yield before the priority Full POST"
         )
-    safe_accounts = [
-        item
-        for item in audit["account_observations"]
-        if item["arithmetic_passed"] is True
-        and (required_account is None or item["account_name"] == required_account)
-    ]
-    safe_accounts.sort(
-        key=lambda item: (
-            -item["free_after_active_and_candidate_gb"],
-            item["account_name"],
+    storage_admission_accounts, safe_accounts = (
+        _storage_admission_accounts(
+            audit=audit,
+            full_storage=full_storage,
+            required_account=required_account,
         )
     )
+    full_bound_gib = full_storage["full_prospective_storage_bound_gib"]
     selected = None
     capacity = None
     errors = []
@@ -1230,6 +1834,23 @@ def _fresh_gates(
         "license_snapshot": production._file_record(license_path),
         "gpfs_audit": production._file_record(audit_path),
         "gpfs_audit_payload_sha256": audit["payload_sha256"],
+        "full_storage_authority": production._file_record(
+            full_storage_path
+        ),
+        "full_storage_authority_payload_sha256": full_storage[
+            "payload_sha256"
+        ],
+        "source_standard_fresh_grid_output_bytes": full_storage[
+            "fresh_grid_output_bytes"
+        ],
+        "full_symmetry_expansion_factor": (
+            FULL_SYMMETRY_EXPANSION_FACTOR
+        ),
+        "full_prospective_storage_bound_bytes": full_storage[
+            "full_prospective_storage_bound_bytes"
+        ],
+        "full_prospective_storage_bound_gib": full_bound_gib,
+        "storage_admission_accounts": storage_admission_accounts,
         "active_project_tasks": active,
         "active_safe_refill_task_count": 0,
         "active_safe_refill_tasks": [],
@@ -1397,6 +2018,10 @@ def _write_post_intent(
             "activation_payload_sha256": activation["payload_sha256"],
             "selected_account_name": gates["selected_account_name"],
             "gpfs_audit": gates["gpfs_audit"],
+            "full_storage_authority": gates["full_storage_authority"],
+            "full_prospective_storage_bound_bytes": gates[
+                "full_prospective_storage_bound_bytes"
+            ],
             "license_snapshot": gates["license_snapshot"],
             "pending_claim_payload_sha256": pending["payload_sha256"],
             "maximum_scheduler_posts": 1,
@@ -1418,6 +2043,19 @@ def _load_post_intent(
         POST_INTENT_SCHEMA,
         label="Full fast-lane POST intent",
     )
+    storage_record = value.get("full_storage_authority")
+    if not isinstance(storage_record, Mapping):
+        raise HandoffContractError(
+            "Full fast-lane POST intent storage authority is absent"
+        )
+    storage_path = Path(str(storage_record.get("path") or ""))
+    if production._file_record(storage_path) != storage_record:
+        raise HandoffContractError(
+            "Full fast-lane POST intent storage bytes drifted"
+        )
+    storage = _load_full_storage_authority(
+        storage_path, selection=selection
+    )
     if (
         value.get("selection_payload_sha256") != selection["payload_sha256"]
         or value.get("candidate_physics_sha256")
@@ -1426,6 +2064,8 @@ def _load_post_intent(
         != activation["payload_sha256"]
         or value.get("maximum_scheduler_posts") != 1
         or value.get("scheduler_post_may_follow") is not True
+        or value.get("full_prospective_storage_bound_bytes")
+        != storage["full_prospective_storage_bound_bytes"]
     ):
         raise HandoffContractError("Full fast-lane POST intent drifted")
     return value
@@ -1465,6 +2105,36 @@ def _load_fast_lane_receipt(
         or value.get("scheduler_repository_modified") is not False
     ):
         raise HandoffContractError("Full fast-lane receipt contract drifted")
+    for gate_name in ("initial_fresh_gates", "locked_fresh_gates"):
+        gate = value.get(gate_name)
+        if not isinstance(gate, Mapping):
+            raise HandoffContractError(
+                f"Full fast-lane receipt {gate_name} is absent"
+            )
+        storage_record = gate.get("full_storage_authority")
+        if not isinstance(storage_record, Mapping):
+            raise HandoffContractError(
+                "Full fast-lane receipt storage authority is absent"
+            )
+        storage_path = Path(str(storage_record.get("path") or ""))
+        if production._file_record(storage_path) != storage_record:
+            raise HandoffContractError(
+                "Full fast-lane receipt storage bytes drifted"
+            )
+        storage = _load_full_storage_authority(
+            storage_path, selection=selection
+        )
+        if (
+            gate.get("full_storage_authority_payload_sha256")
+            != storage["payload_sha256"]
+            or gate.get("full_prospective_storage_bound_bytes")
+            != storage["full_prospective_storage_bound_bytes"]
+            or gate.get("full_symmetry_expansion_factor")
+            != FULL_SYMMETRY_EXPANSION_FACTOR
+        ):
+            raise HandoffContractError(
+                "Full fast-lane receipt storage gate drifted"
+            )
     activation_record = value.get("activation_receipt")
     submission_record = value.get("full_submission")
     if not isinstance(activation_record, Mapping) or not isinstance(
@@ -1618,9 +2288,13 @@ def _execute_submission(
             )
         latest_gates = _fresh_gates(
             plan,
+            selection=selection,
             required_account=initial_gates["selected_account_name"],
             required_gpfs_audit_path=Path(
                 initial_gates["gpfs_audit"]["path"]
+            ),
+            required_full_storage_authority_path=Path(
+                initial_gates["full_storage_authority"]["path"]
             ),
             required_license_snapshot_path=Path(
                 initial_gates["license_snapshot"]["path"]
@@ -1857,8 +2531,10 @@ def process_cycle(
                 activation_present=True,
             )
         else:
+            _ensure_full_storage_authority(plan, selection)
             gates = _fresh_gates(
                 plan,
+                selection=selection,
                 live_reader=live_reader,
                 task_list_reader=task_list_reader,
                 now=now,
@@ -1960,12 +2636,22 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--scheduler-cutover-receipt", type=Path, required=True)
     init.add_argument("--license-snapshot-directory", type=Path, required=True)
     init.add_argument("--gpfs-audit-directory", type=Path, required=True)
+    init.add_argument("--full-storage-authority-directory", type=Path)
     init.add_argument("--output-root", type=Path, required=True)
     init.add_argument("--claim-root", type=Path, default=DEFAULT_CLAIM_ROOT)
     init.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS)
     audit = commands.add_parser("capture-gpfs-audit")
     audit.add_argument("--observations", type=Path, required=True)
     audit.add_argument("--output", type=Path, required=True)
+    standard_bound = commands.add_parser(
+        "create-standard-storage-bound"
+    )
+    standard_bound.add_argument("--source-plan", type=Path, required=True)
+    standard_bound.add_argument("--task-id", type=int, required=True)
+    standard_bound.add_argument("--output", type=Path, required=True)
+    full_bound = commands.add_parser("create-full-storage-authority")
+    full_bound.add_argument("--selection", type=Path, required=True)
+    full_bound.add_argument("--output", type=Path, required=True)
     activate = commands.add_parser("activate")
     activate.add_argument("--watch-plan", type=Path, required=True)
     activate.add_argument("--reviewer", required=True)
@@ -1986,6 +2672,9 @@ def main(argv: list[str] | None = None) -> int:
             license_snapshot_directory=args.license_snapshot_directory,
             gpfs_audit_directory=args.gpfs_audit_directory,
             output_root=args.output_root,
+            full_storage_authority_directory=(
+                args.full_storage_authority_directory
+            ),
             claim_root=args.claim_root,
             poll_seconds=args.poll_seconds,
         )
@@ -1998,8 +2687,26 @@ def main(argv: list[str] | None = None) -> int:
             observed_at_utc=str(observations.get("observed_at_utc") or ""),
             account_observations=observations.get("accounts") or [],
             rows=rows,
+            active_task_storage_authority_paths=[
+                Path(str(item))
+                for item in (
+                    observations.get("active_task_storage_authorities")
+                    or []
+                )
+            ],
         )
         result = _write_immutable(args.output, audit)
+    elif args.command == "create-standard-storage-bound":
+        result = create_standard_storage_bound_authority(
+            source_plan_path=args.source_plan,
+            task_id=args.task_id,
+            output=args.output,
+        )
+    elif args.command == "create-full-storage-authority":
+        result = create_full_storage_authority(
+            selection_path=args.selection,
+            output=args.output,
+        )
     elif args.command == "activate":
         result = create_activation_receipt(
             watch_plan_path=args.watch_plan,
