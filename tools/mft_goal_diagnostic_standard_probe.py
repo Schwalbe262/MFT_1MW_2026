@@ -288,6 +288,9 @@ MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION = (
 OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION = (
     "operational-pressure-r1-placement-invariant"
 )
+DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION = (
+    "dependency-failure-r1-direct-node"
+)
 SAME_ALLOCATION_PLACEMENT_SCHEMA = (
     "mft-goal-diagnostic-same-allocation-placement-v1"
 )
@@ -2781,6 +2784,7 @@ def _strict_node_plan_contract(
         TIMEOUT_STRICT_TASK_IDENTITY_GENERATION,
         MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION,
         OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION,
+        DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION,
     }:
         raise HandoffContractError(
             "strict retry task identity generation is unsupported"
@@ -2825,6 +2829,7 @@ def _strict_node_scheduler_pin(
         TIMEOUT_STRICT_TASK_IDENTITY_GENERATION,
         MESH_QUALITY_CANARY_STRICT_TASK_IDENTITY_GENERATION,
         OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION,
+        DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION,
     }:
         raise HandoffContractError(
             "strict diagnostic retry placement contract drifted"

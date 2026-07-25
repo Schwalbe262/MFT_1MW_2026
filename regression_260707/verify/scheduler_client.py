@@ -722,6 +722,13 @@ def retained_aedt_identity(
                     "goal_diagnostic_standard_operational_pressure_"
                     "after_timeout_retry.json"
                 ),
+                (
+                    "mft-goal-diagnostic-standard-dependency-failure-"
+                    "retry-profile-v1"
+                ): (
+                    "goal_diagnostic_standard_"
+                    "dependency_failure_retry.json"
+                ),
             }.get(str(profile.get("schema_version") or ""))
             if expected_profile_name is None:
                 raise ValueError(

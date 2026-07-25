@@ -20,6 +20,7 @@ from module.mft_goal_20260726_contract import (
 from regression_260707.verify import scheduler_client
 from tools import mft_campaign_atomic_claim as atomic_claim
 from tools import mft_goal_20260726_launch as launch
+from tools import mft_goal_dependency_failure_retry as dependency_retry
 from tools import mft_goal_diagnostic_standard_probe as probe
 from tools import mft_goal_fea_handoff as production
 from tools import mft_goal_strict_al_ingest as strict_al
@@ -3568,3 +3569,277 @@ def test_generation_identity_authenticates_only_pinned_llt_artifacts(tmp_path):
         production.HandoffContractError, match="artifacts drifted"
     ):
         probe._generation_identity(generation, [task])
+
+
+def test_dependency_failure_retry_is_direct_strict_and_exact_once(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    base_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _strict_scheduler_cutover(tmp_path, monkeypatch)
+    base_submission_path = probe.submit_standard(
+        plan_path=base_plan_path,
+        scheduler_cutover_receipt_path=_scheduler_cutover(
+            tmp_path, monkeypatch
+        ),
+        output=tmp_path / "dependency-base-submission.json",
+        scheduler=_FakeScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    base_plan = probe._load_plan(base_plan_path)[0]
+    base_submission = probe._load_submission(
+        base_submission_path, plan=base_plan
+    )
+    timeout_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=base_plan_path,
+        original_submission_path=base_submission_path,
+        strict_node_name="n108",
+        output=tmp_path / "dependency-timeout-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            base_submission
+        ),
+    )
+    timeout_plan = probe._load_plan(timeout_plan_path)[0]
+    timeout_post = _strict_submitted_snapshot(
+        {
+            "task_id": 71002,
+            "task_name": timeout_plan["stage"]["task_name"],
+            "dedupe_key": timeout_plan["stage"]["retained_aedt_bundle"][
+                "dedupe_key"
+            ],
+        },
+        task_id=71002,
+        node_name="n108",
+        requested_node_name="n108",
+        actual_node_name="n108",
+        allocation_node_name="n108",
+        same_node_as_task_id=72000,
+        timeout_seconds=28800,
+    )
+
+    class _TimeoutEvidenceScheduler:
+        def __init__(self):
+            self.calls = []
+
+        def submit_verification(self, *args, **kwargs):
+            guard = kwargs.get("pre_submit_guard")
+            if guard is not None:
+                guard()
+            self.calls.append((args, kwargs))
+            return {
+                "task_id": 71002,
+                "submission_source": "post_created",
+                "scheduler_mutation_performed": True,
+                "api_pre_submission_readback": None,
+                "api_post_submission_response": timeout_post,
+            }
+
+    anchor_running = _same_allocation_anchor_snapshot(
+        actual_node_name="n108"
+    )
+
+    def timeout_task_reader(**kwargs):
+        if kwargs["task_id"] == base_submission["task_id"]:
+            return _timeout_task_snapshot(base_submission)
+        if kwargs["task_id"] == 72000:
+            return anchor_running
+        if kwargs["task_id"] == 71002:
+            return timeout_post
+        raise AssertionError(kwargs)
+
+    timeout_submission_path = probe.submit_timeout_retry(
+        plan_path=timeout_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "dependency-timeout-submission.json",
+        scheduler=_TimeoutEvidenceScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=timeout_task_reader,
+        same_node_as_task_id=72000,
+        expected_allocation_id=9002,
+        expected_slurm_job_id="81300",
+        expected_account_name="anchor-account",
+        expected_node_name="n108",
+    )
+    timeout_submission = probe._load_submission(
+        timeout_submission_path, plan=timeout_plan
+    )
+    dependency_failed = {
+        **timeout_post,
+        "status": "failed",
+        "state": "failed",
+        "exit_code": None,
+        "failure_message": "same_node_as task 72000 is failed",
+        "finished_at": "2026-07-25 07:08:46",
+    }
+    anchor_failed = {
+        **anchor_running,
+        "status": "failed",
+        "state": "failed",
+        "exit_code": 1,
+        "failure_message": dependency_retry.ANCHOR_FAILURE_MESSAGE,
+        "finished_at": "2026-07-25 07:08:16",
+    }
+
+    def failed_task_reader(**kwargs):
+        if kwargs["task_id"] == timeout_submission["task_id"]:
+            return dependency_failed
+        if kwargs["task_id"] == 72000:
+            return anchor_failed
+        if kwargs["task_id"] == 71003:
+            return dependency_post
+        raise AssertionError(kwargs)
+
+    with pytest.raises(
+        production.HandoffContractError,
+        match="anchor native failure evidence drifted",
+    ):
+        dependency_retry.create_plan(
+            original_plan_path=timeout_plan_path,
+            original_submission_path=timeout_submission_path,
+            dependency_anchor_task_id=72000,
+            strict_node_name="n114",
+            output=tmp_path / "dependency-drift-plan",
+            task_reader=lambda **kwargs: (
+                {
+                    **anchor_failed,
+                    "failure_message": "different native failure",
+                }
+                if kwargs["task_id"] == 72000
+                else dependency_failed
+            ),
+        )
+    claim_root = (tmp_path / "dependency-claims").resolve()
+    monkeypatch.setattr(dependency_retry, "CLAIM_ROOT", claim_root)
+    dependency_retry.initialize_claim_root(claim_root)
+    dependency_plan_path = dependency_retry.create_plan(
+        original_plan_path=timeout_plan_path,
+        original_submission_path=timeout_submission_path,
+        dependency_anchor_task_id=72000,
+        strict_node_name="n114",
+        output=tmp_path / "dependency-plan",
+        task_reader=failed_task_reader,
+    )
+    dependency_plan = dependency_retry._load_plan(
+        dependency_plan_path
+    )[0]
+    assert dependency_plan["retry_of_dependency_failure"][
+        "logical_authority_task_id"
+    ] == base_submission["task_id"]
+    assert dependency_plan["retry_of_dependency_failure"][
+        "retry_of_task_id"
+    ] == timeout_submission["task_id"]
+    assert dependency_plan["scheduler_strict_node_contract"][
+        "requested_node_name"
+    ] == "n114"
+    dependency_post = {
+        "task_id": 71003,
+        "name": dependency_plan["stage"]["task_name"],
+        "status": "queued",
+        "state": "queued",
+        "dedupe_key": dependency_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+        "project": scheduler_client.MFT_PROJECT,
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 28800,
+        "node_name": "n114",
+        "requested_node_name": "n114",
+        "node_name_policy": "strict",
+        "requested_node_name_policy": "strict",
+        "strict_node_placement": True,
+        "placement_contract_satisfied": False,
+        "allocation_id": None,
+        "assigned_allocation": None,
+        "allocation_node_name": "",
+        "actual_node_name": "",
+        "slurm_job_id": "",
+        "account_name": None,
+        "requested_account_name": "",
+        "same_node_as_task_id": 0,
+        "started_at": None,
+        "finished_at": None,
+    }
+
+    class _DependencyScheduler:
+        def __init__(self):
+            self.calls = []
+
+        def submit_verification(self, *args, **kwargs):
+            guard = kwargs["pre_submit_guard"]
+            guard()
+            self.calls.append((args, kwargs))
+            return {
+                "task_id": 71003,
+                "submission_source": "post_created",
+                "scheduler_mutation_performed": True,
+                "api_pre_submission_readback": None,
+                "api_post_submission_response": dependency_post,
+            }
+
+    scheduler = _DependencyScheduler()
+    sibling_rows = iter(([], [], [dependency_post]))
+    submission_path = dependency_retry.submit(
+        plan_path=dependency_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "dependency-submission.json",
+        scheduler=scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=failed_task_reader,
+        task_list_reader=lambda **_kwargs: next(sibling_rows),
+        reconciliation_waiter=lambda: None,
+    )
+    submission = production._validate_seal(
+        production._read_json(submission_path),
+        dependency_retry.SUBMISSION_SCHEMA,
+    )
+    assert submission["task_id"] == 71003
+    assert submission["dependency_failure_atomic_claim"][
+        "acquisition_status"
+    ] == "fresh_pending"
+    assert len(scheduler.calls) == 1
+    submit_options = scheduler.calls[0][1]
+    assert submit_options["node_name"] == "n114"
+    assert submit_options["node_name_policy"] == "strict"
+    assert "same_node_as_task_id" not in submit_options
+    assert submission["scheduler_strict_node_contract"][
+        "same_node_as_task_id"
+    ] == 0
+
+    class _NoPostScheduler:
+        def __init__(self):
+            self.calls = []
+
+        def submit_verification(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise AssertionError("exact-once recovery must not POST")
+
+    no_post = _NoPostScheduler()
+    recovered_path = dependency_retry.submit(
+        plan_path=dependency_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "dependency-recovered-submission.json",
+        scheduler=no_post,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=failed_task_reader,
+        task_list_reader=lambda **_kwargs: [dependency_post],
+        reconciliation_waiter=lambda: None,
+    )
+    recovered = production._validate_seal(
+        production._read_json(recovered_path),
+        dependency_retry.SUBMISSION_SCHEMA,
+    )
+    assert no_post.calls == []
+    assert recovered["task_id"] == 71003
+    assert recovered["dependency_failure_atomic_claim"][
+        "acquisition_status"
+    ] == "existing_finalized"
+    assert recovered["dependency_failure_atomic_claim"][
+        "recovered_without_scheduler_submit_call"
+    ] is True
