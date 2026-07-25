@@ -810,10 +810,11 @@ def _cohort_authority_task_id(
 ) -> int:
     """Resolve one execution onto its immutable original cohort slot.
 
-    A normal Standard execution is its own cohort authority.  A reviewed
-    timeout retry may stand in for the original task only when the retry's
-    sealed ancestry reauthenticates the exact original plan, submission, and
-    task already frozen in the cohort inventory.
+    A normal Standard execution is its own cohort authority. A reviewed
+    timeout or Scheduler operational-pressure retry may stand in for the
+    original task only when the retry's sealed ancestry reauthenticates the
+    exact original plan, submission, and task already frozen in the cohort
+    inventory.
     """
     collection = view.get("collection")
     plan = view.get("plan")
@@ -836,31 +837,105 @@ def _cohort_authority_task_id(
         raise HandoffContractError(
             "truth promotion v2 execution task ID is invalid"
         )
-    if not diagnostic._plan_is_timeout_retry(plan):
+    retry_kind = diagnostic._plan_retry_kind(plan)
+    if retry_kind is None:
         return execution_task_id
 
-    retry_record = plan.get("retry_of_timeout")
+    if retry_kind not in {"timeout", "operational_pressure"}:
+        raise HandoffContractError(
+            "truth promotion v2 retry ancestry kind is unsupported"
+        )
+    retry_field = (
+        "retry_of_timeout"
+        if retry_kind == "timeout"
+        else "retry_of_operational_pressure"
+    )
+    retry_record = plan.get(retry_field)
     if not isinstance(retry_record, Mapping):
         raise HandoffContractError(
-            "truth promotion v2 timeout retry ancestry is absent"
+            "truth promotion v2 retry ancestry is absent"
         )
-    authority_task_id = retry_record.get("retry_of_task_id")
+    if retry_kind == "timeout":
+        (
+            original_plan,
+            original_submission,
+            _execution,
+        ) = diagnostic._validate_timeout_retry_record(plan)
+        authority_task_id = retry_record.get("retry_of_task_id")
+        cohort_plan_record = retry_record.get("original_plan")
+        cohort_plan_payload_sha256 = retry_record.get(
+            "original_plan_payload_sha256"
+        )
+        cohort_submission_record = retry_record.get(
+            "original_submission"
+        )
+        cohort_submission_payload_sha256 = retry_record.get(
+            "original_submission_payload_sha256"
+        )
+        immediate_task_id = authority_task_id
+    else:
+        (
+            original_plan,
+            original_submission,
+            immediate_submission,
+            _execution,
+        ) = diagnostic._validate_operational_pressure_retry_record(plan)
+        authority_task_id = retry_record.get(
+            "logical_authority_task_id"
+        )
+        immediate_task_id = retry_record.get("retry_of_task_id")
+        if retry_record.get("immediate_retry_kind") == "timeout":
+            immediate_plan_path = diagnostic._recorded_external_file(
+                retry_record.get("original_plan"),
+                "operational-pressure immediate timeout plan",
+            )
+            immediate_plan = diagnostic._load_plan(
+                immediate_plan_path
+            )[0]
+            timeout_ancestry = immediate_plan.get("retry_of_timeout")
+            if not isinstance(timeout_ancestry, Mapping):
+                raise HandoffContractError(
+                    "truth promotion v2 compound timeout ancestry is absent"
+                )
+            cohort_plan_record = timeout_ancestry.get("original_plan")
+            cohort_plan_payload_sha256 = timeout_ancestry.get(
+                "original_plan_payload_sha256"
+            )
+            cohort_submission_record = timeout_ancestry.get(
+                "original_submission"
+            )
+            cohort_submission_payload_sha256 = timeout_ancestry.get(
+                "original_submission_payload_sha256"
+            )
+            if immediate_submission.get("task_id") != immediate_task_id:
+                raise HandoffContractError(
+                    "truth promotion v2 compound immediate task drifted"
+                )
+        else:
+            cohort_plan_record = retry_record.get("original_plan")
+            cohort_plan_payload_sha256 = retry_record.get(
+                "original_plan_payload_sha256"
+            )
+            cohort_submission_record = retry_record.get(
+                "original_submission"
+            )
+            cohort_submission_payload_sha256 = retry_record.get(
+                "original_submission_payload_sha256"
+            )
     entry = expected_by_task.get(authority_task_id)
     if entry is None:
         raise HandoffContractError(
-            "truth promotion v2 timeout retry is outside the exact cohort"
+            "truth promotion v2 retry is outside the exact cohort"
         )
-    original_plan, original_submission, _execution = (
-        diagnostic._validate_timeout_retry_record(plan)
-    )
     if (
         execution_task_id == authority_task_id
+        or execution_task_id == immediate_task_id
         or submission.get("task_id") != execution_task_id
-        or retry_record.get("original_plan") != entry["plan"]
-        or retry_record.get("original_plan_payload_sha256")
+        or cohort_plan_record != entry["plan"]
+        or cohort_plan_payload_sha256
         != entry["plan_payload_sha256"]
-        or retry_record.get("original_submission") != entry["submission"]
-        or retry_record.get("original_submission_payload_sha256")
+        or cohort_submission_record != entry["submission"]
+        or cohort_submission_payload_sha256
         != entry["submission_payload_sha256"]
         or original_plan.get("payload_sha256")
         != entry["plan_payload_sha256"]
@@ -877,7 +952,7 @@ def _cohort_authority_task_id(
         != entry["search_authority_sha256"]
     ):
         raise HandoffContractError(
-            "truth promotion v2 timeout retry/cohort ancestry drifted"
+            "truth promotion v2 retry/cohort ancestry drifted"
         )
     return int(authority_task_id)
 
@@ -940,7 +1015,7 @@ def _authenticate_cohort_inputs(
                 "the exact cohort"
             )
         entry = expected_by_task[authority_task_id]
-        timeout_retry = diagnostic._plan_is_timeout_retry(view["plan"])
+        retry_kind = diagnostic._plan_retry_kind(view["plan"])
         truth, status = _actual_standard_observation(
             view, collection_path=path
         )
@@ -969,7 +1044,7 @@ def _authenticate_cohort_inputs(
             or truth["fea_params_sha256"]
             != entry["fea_params_sha256"]
             or (
-                not timeout_retry
+                retry_kind is None
                 and (
                     collection.get("plan") != entry["plan"]
                     or collection.get("plan_payload_sha256")

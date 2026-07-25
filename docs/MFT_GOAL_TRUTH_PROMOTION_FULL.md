@@ -15,6 +15,20 @@ recomputed from the actual diagnostic result. One missing, duplicate,
 unexpected, tampered, or mixed-provenance collection aborts the whole
 promotion.
 
+A collection from a reviewed timeout retry or Scheduler
+operational-pressure retry may replace its exact original logical slot. The
+v2 loader follows the retry's sealed plan/submission/task ancestry back to
+the inventory entry and accepts exactly one execution for that slot. It
+rejects original plus retry, timeout plus pressure retry, duplicate retries,
+mixed ancestry fields, and retries outside the frozen cohort.
+
+Operational-pressure lineage additionally authenticates the plan's frozen
+campaign claim-root reference and the submission's durable finalized claim.
+The claim's logical authority task ID must route to the same cohort entry,
+and its task ID must equal the collected execution. A copied/reparsed claim
+root, a different immediate timeout ancestry, or a second direct/compound
+winner for the same logical slot fails before truth classification.
+
 Only the reauthenticated feasible observations enter the combined
 non-dominated sort. The v2 manifest still seals a 24-row classification
 ledger for both included and excluded observations. A surrogate prediction

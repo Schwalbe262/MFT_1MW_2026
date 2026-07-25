@@ -478,6 +478,39 @@ def _require_sha256(value: Any, label: str) -> str:
     return digest
 
 
+def _logical_authority_task_id(
+    plan: Mapping[str, Any],
+    *,
+    execution_task_id: int,
+) -> int:
+    """Return the sealed cohort slot represented by one execution."""
+
+    pressure = plan.get("retry_of_operational_pressure")
+    timeout = plan.get("retry_of_timeout")
+    if pressure is not None and timeout is not None:
+        raise StrictALIngestError(
+            "authenticated retry ancestry semantics are mixed"
+        )
+    value = execution_task_id
+    if pressure is not None:
+        if not isinstance(pressure, Mapping):
+            raise StrictALIngestError(
+                "operational-pressure retry ancestry is malformed"
+            )
+        value = pressure.get("logical_authority_task_id")
+    elif timeout is not None:
+        if not isinstance(timeout, Mapping):
+            raise StrictALIngestError(
+                "timeout retry ancestry is malformed"
+            )
+        value = timeout.get("retry_of_task_id")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise StrictALIngestError(
+            "logical authority task ID is invalid"
+        )
+    return value
+
+
 def _validate_truth_row(
     truth: AuthenticatedTruth,
     *,
@@ -611,6 +644,10 @@ def _validate_truth_row(
             truth.source_fixed_primary_turns
         ),
         "task_id": int(task_id),
+        "logical_authority_task_id": _logical_authority_task_id(
+            truth.plan,
+            execution_task_id=int(task_id),
+        ),
         "result_sha256": _require_sha256(
             truth.collection.get("result_sha256"),
             "result SHA",
@@ -824,6 +861,32 @@ def _admission(
     }
 
 
+def _validate_new_collection_identities(
+    facts: Sequence[Mapping[str, Any]],
+) -> None:
+    identity_fields = {
+        "collection_payload_sha256": [
+            str(fact["collection_payload_sha256"]) for fact in facts
+        ],
+        "candidate_physics_sha256": [
+            str(fact["candidate_physics_sha256"]) for fact in facts
+        ],
+        "task_id": [str(fact["task_id"]) for fact in facts],
+        "logical_authority_task_id": [
+            str(fact["logical_authority_task_id"]) for fact in facts
+        ],
+        "project_name/saved_at": [
+            f"{fact['project_name']}\0{fact['saved_at']}"
+            for fact in facts
+        ],
+    }
+    for label, values in identity_fields.items():
+        if len(values) != len(set(values)):
+            raise StrictALIngestError(
+                f"new collection {label} identity is duplicated"
+            )
+
+
 def prepare_ingest(
     *,
     base_dataset: Path,
@@ -857,23 +920,7 @@ def prepare_ingest(
     rows = [item[0] for item in rows_and_facts]
     facts = [item[1] for item in rows_and_facts]
 
-    identity_fields = {
-        "collection_payload_sha256": [
-            str(fact["collection_payload_sha256"]) for fact in facts
-        ],
-        "candidate_physics_sha256": [
-            str(fact["candidate_physics_sha256"]) for fact in facts
-        ],
-        "task_id": [str(fact["task_id"]) for fact in facts],
-        "project_name/saved_at": [
-            f"{fact['project_name']}\0{fact['saved_at']}" for fact in facts
-        ],
-    }
-    for label, values in identity_fields.items():
-        if len(values) != len(set(values)):
-            raise StrictALIngestError(
-                f"new collection {label} identity is duplicated"
-            )
+    _validate_new_collection_identities(facts)
 
     base_tasks = set(base["task_id"].map(_task_token))
     base_pairs = set(
@@ -881,6 +928,21 @@ def prepare_ingest(
         + "\0"
         + base["saved_at"].astype(str)
     )
+    base_logical_authorities = set()
+    if "goal_al_logical_authority_task_id" in base:
+        base_logical_authorities = {
+            _task_token(value)
+            for value in base["goal_al_logical_authority_task_id"]
+            if _task_token(value)
+        }
+    base_candidate_physics = set()
+    if "goal_al_candidate_physics_sha256" in base:
+        base_candidate_physics = {
+            str(value).strip().lower()
+            for value in base["goal_al_candidate_physics_sha256"]
+            if str(value).strip().lower()
+            not in {"", "nan", "none", "<na>"}
+        }
     if any(str(fact["task_id"]) in base_tasks for fact in facts):
         raise StrictALIngestError("new task_id already exists in the base")
     if any(
@@ -889,6 +951,22 @@ def prepare_ingest(
     ):
         raise StrictALIngestError(
             "new project_name/saved_at already exists in the base"
+        )
+    if any(
+        str(fact["logical_authority_task_id"])
+        in base_logical_authorities
+        for fact in facts
+    ):
+        raise StrictALIngestError(
+            "new logical authority task ID already exists in the base"
+        )
+    if any(
+        str(fact["candidate_physics_sha256"])
+        in base_candidate_physics
+        for fact in facts
+    ):
+        raise StrictALIngestError(
+            "new candidate physics SHA already exists in the base"
         )
 
     aligned_rows = []
@@ -909,6 +987,9 @@ def prepare_ingest(
             "goal_al_result_sha256": fact["result_sha256"],
             "goal_al_candidate_physics_sha256": fact[
                 "candidate_physics_sha256"
+            ],
+            "goal_al_logical_authority_task_id": fact[
+                "logical_authority_task_id"
             ],
             "goal_al_source_task_payload_sha256": fact[
                 "source_task_payload_sha256"

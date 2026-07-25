@@ -18,6 +18,7 @@ from module.mft_goal_20260726_contract import (
     GOAL_TEMPERATURE_TARGETS,
 )
 from regression_260707.verify import scheduler_client
+from tools import mft_campaign_atomic_claim as atomic_claim
 from tools import mft_goal_20260726_launch as launch
 from tools import mft_goal_diagnostic_standard_probe as probe
 from tools import mft_goal_fea_handoff as production
@@ -123,6 +124,19 @@ def _convert_to_near_feasible(result_path: Path):
 
 
 def _fixture(tmp_path: Path, monkeypatch):
+    claim_root = (tmp_path / "operational-pressure-claims").resolve()
+    monkeypatch.setattr(
+        probe, "OPERATIONAL_PRESSURE_CLAIM_ROOT", claim_root
+    )
+    atomic_claim.initialize_claim_root(
+        claim_root,
+        campaign_id="mft-goal-20260726",
+        campaign_authority_sha256=(
+            probe.OPERATIONAL_PRESSURE_CLAIM_AUTHORITY_SHA256
+        ),
+        root_id="1" * 32,
+        now="2026-07-25T00:00:00Z",
+    )
     helpers = _production_test_helpers()
     bundle, bundle_path, tasks, _task_paths = helpers._bundle(tmp_path)
     result_paths = []
@@ -202,6 +216,9 @@ class _FakeScheduler:
 
     def submit_verification(self, *args, **kwargs):
         self.calls.append((args, kwargs))
+        guard = kwargs.get("pre_submit_guard")
+        if guard is not None:
+            guard()
         return 71001
 
     def get_status(self, _task_id, **_kwargs):
@@ -554,11 +571,13 @@ def _task_snapshot(submission):
         "actual_node_name": "n101",
         "cpus": 8,
         "memory_mb": 32768,
+        "timeout_seconds": submission["resources"]["timeout_seconds"],
         "aedt_backend": "standalone",
         "project": scheduler_client.MFT_PROJECT,
         "dedupe_key": submission["dedupe_key"],
         "remote_cwd": "/gpfs/test",
         "remote_dir": "runs/task-71001",
+        "created_at": "2026-07-24 18:23:00",
         "finished_at": "2026-07-25 00:00:00",
     }
 
@@ -576,6 +595,69 @@ def _timeout_task_snapshot(submission, **overrides):
     }
     snapshot.update(overrides)
     return snapshot
+
+
+def _operational_pressure_task_snapshot(submission, **overrides):
+    snapshot = {
+        **_task_snapshot(submission),
+        "status": "failed",
+        "state": "failed",
+        "exit_code": None,
+        "failure_message": probe.OPERATIONAL_PRESSURE_FAILURE_MESSAGE,
+        "timeout_seconds": 14400,
+        "allocation_id": 14618,
+        "account_name": "harry261",
+        "actual_node_name": "n109",
+        "slurm_job_id": "826817",
+        "created_at": "2026-07-24 18:23:00",
+        "started_at": "2026-07-25 01:37:27",
+        "finished_at": "2026-07-25 04:29:52",
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def _operational_pressure_events(submission):
+    name = submission["task_name"]
+    task_id = str(submission["task_id"])
+    return list(reversed([
+        {
+            "id": 127190,
+            "created_at": "2026-07-24 22:00:35",
+            "kind": "task_requeued",
+            "entity_type": "task",
+            "entity_id": task_id,
+            "account_name": "r1jae262",
+            "message": (
+                f"task {name} requeued after memory-pressure kill "
+                "(attempt 1/3)"
+            ),
+        },
+        {
+            "id": 127238,
+            "created_at": "2026-07-25 01:36:48",
+            "kind": "task_requeued",
+            "entity_type": "task",
+            "entity_id": task_id,
+            "account_name": "jji0930",
+            "message": (
+                f"task {name} requeued after memory-pressure kill "
+                "(attempt 2/3)"
+            ),
+        },
+        {
+            "id": 127279,
+            "created_at": "2026-07-25 04:29:53",
+            "kind": "task_cleanup",
+            "entity_type": "task",
+            "entity_id": task_id,
+            "account_name": "harry261",
+            "message": (
+                "cleaned mft_campaign-test in slurm_scheduler/runs after "
+                f"task {name} ended (failed)"
+            ),
+        },
+    ]))
 
 
 def _same_allocation_anchor_snapshot(**overrides):
@@ -643,6 +725,159 @@ def _strict_submitted_snapshot(submission, **overrides):
     }
     snapshot.update(overrides)
     return snapshot
+
+
+def test_operational_pressure_event_window_proves_complete_lifetime():
+    submission = {
+        "task_id": 71001,
+        "task_name": "mft-goal-diag-standard-pressure",
+    }
+    lifecycle = _operational_pressure_events(submission)
+    generic = [
+        {
+            "id": 127189 - offset,
+            "created_at": "2026-07-24 10:11:14",
+            "kind": "allocation_observed",
+            "entity_type": "allocation",
+            "entity_id": str(offset + 1),
+            "account_name": "",
+            "message": "allocation observed",
+        }
+        for offset in range(997)
+    ]
+    full_window = [*lifecycle, *generic]
+    evidence = probe._operational_pressure_events(
+        full_window,
+        task_id=71001,
+        task_name=submission["task_name"],
+        task_created_at="2026-07-24 18:23:00",
+        task_account_name="harry261",
+    )
+    window = evidence["event_window"]
+    assert window["response_count"] == 1000
+    assert window["coverage_method"] == (
+        "oldest_event_not_after_task_created_at"
+    )
+    assert len(window["full_window_sha256"]) == 64
+    with pytest.raises(
+        production.HandoffContractError,
+        match="does not cover the task lifetime",
+    ):
+        probe._operational_pressure_events(
+            [
+                *lifecycle,
+                *[
+                    {
+                        **event,
+                        "created_at": "2026-07-24 19:00:00",
+                    }
+                    for event in generic
+                ],
+            ],
+            task_id=71001,
+            task_name=submission["task_name"],
+            task_created_at="2026-07-24 18:23:00",
+            task_account_name="harry261",
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="window ordering drifted",
+    ):
+        probe._operational_pressure_events(
+            [
+                full_window[0],
+                {**full_window[1], "id": full_window[0]["id"]},
+                *full_window[2:],
+            ],
+            task_id=71001,
+            task_name=submission["task_name"],
+            task_created_at="2026-07-24 18:23:00",
+            task_account_name="harry261",
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="chronology/account binding drifted",
+    ):
+        probe._operational_pressure_events(
+            [
+                {
+                    **event,
+                    "created_at": (
+                        "2026-07-24 18:22:59"
+                        if "(attempt 1/3)" in event["message"]
+                        else event["created_at"]
+                    ),
+                }
+                for event in lifecycle
+            ],
+            task_id=71001,
+            task_name=submission["task_name"],
+            task_created_at="2026-07-24 18:23:00",
+            task_account_name="harry261",
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="timestamp",
+    ):
+        probe._operational_pressure_events(
+            [
+                {
+                    **event,
+                    "created_at": (
+                        "not-a-timestamp"
+                        if "(attempt 1/3)" in event["message"]
+                        else event["created_at"]
+                    ),
+                }
+                for event in lifecycle
+            ],
+            task_id=71001,
+            task_name=submission["task_name"],
+            task_created_at="2026-07-24 18:23:00",
+            task_account_name="harry261",
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="attempt evidence 1/3",
+    ):
+        probe._operational_pressure_events(
+            [
+                {
+                    **event,
+                    "entity_id": (
+                        "99999"
+                        if "(attempt 1/3)" in event["message"]
+                        else event["entity_id"]
+                    ),
+                }
+                for event in lifecycle
+            ],
+            task_id=71001,
+            task_name=submission["task_name"],
+            task_created_at="2026-07-24 18:23:00",
+            task_account_name="harry261",
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="chronology/account binding drifted",
+    ):
+        probe._operational_pressure_events(
+            [
+                {
+                    **event,
+                    "account_name": (
+                        ""
+                        if "(attempt 1/3)" in event["message"]
+                        else event["account_name"]
+                    ),
+                }
+                for event in lifecycle
+            ],
+            task_id=71001,
+            task_name=submission["task_name"],
+            task_created_at="2026-07-24 18:23:00",
+            task_account_name="harry261",
+        )
 
 
 def test_same_allocation_submitted_node_canonicalization_is_state_safe():
@@ -1294,6 +1529,9 @@ def test_timeout_retry_strict_r2_authenticates_post_get_and_terminal_binding(
     class _StrictScheduler(_FakeScheduler):
         def submit_verification(self, *args, **kwargs):
             self.calls.append((args, kwargs))
+            guard = kwargs.get("pre_submit_guard")
+            if guard is not None:
+                guard()
             return {
                 "task_id": 71002,
                 "submission_source": "post_created",
@@ -1374,6 +1612,705 @@ def test_timeout_retry_strict_r2_authenticates_post_get_and_terminal_binding(
             },
             submission=retry_submission,
         )
+
+
+def test_operational_pressure_retry_is_exact_once_strict_and_revalidates(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    legacy_cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=legacy_cutover_path,
+        output=tmp_path / "pressure-original-submission.json",
+        scheduler=_FakeScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan = probe._load_plan(original_plan_path)[0]
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+    def task_reader(**_kwargs):
+        return _operational_pressure_task_snapshot(
+            original_submission
+        )
+
+    def event_reader(**_kwargs):
+        return _operational_pressure_events(original_submission)
+    strict_cutover_path = _strict_scheduler_cutover(
+        tmp_path, monkeypatch
+    )
+
+    with pytest.raises(
+        production.HandoffContractError,
+        match="2/3",
+    ):
+        probe.create_operational_pressure_retry_plan(
+            original_plan_path=original_plan_path,
+            original_submission_path=original_submission_path,
+            output=tmp_path / "forbidden-pressure-attempt2",
+            strict_node_name="n116",
+            task_reader=task_reader,
+            event_reader=lambda **_kwargs: (
+                _operational_pressure_events(original_submission)[:1]
+                + _operational_pressure_events(original_submission)[2:]
+            ),
+        )
+    assert not (tmp_path / "forbidden-pressure-attempt2").exists()
+
+    retry_plan_path = probe.create_operational_pressure_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "pressure-retry-plan",
+        strict_node_name="n116",
+        task_reader=task_reader,
+        event_reader=event_reader,
+    )
+    retry_plan, retry_params, _selected = probe._load_plan(
+        retry_plan_path
+    )
+    alternate_plans = []
+    alternate_plan_paths = []
+    for suffix, node_name in (
+        ("unplaced", ""),
+        ("n108", "n108"),
+        ("n110", "n110"),
+    ):
+        alternate_path = probe.create_operational_pressure_retry_plan(
+            original_plan_path=original_plan_path,
+            original_submission_path=original_submission_path,
+            output=tmp_path / f"pressure-retry-plan-{suffix}",
+            strict_node_name=node_name,
+            task_reader=task_reader,
+            event_reader=event_reader,
+        )
+        alternate_plan_paths.append(alternate_path)
+        alternate_plans.append(probe._load_plan(alternate_path)[0])
+    for alternate in alternate_plans:
+        assert alternate["stage"]["task_name"] == retry_plan["stage"][
+            "task_name"
+        ]
+        assert alternate["stage"]["workdir"] == retry_plan["stage"][
+            "workdir"
+        ]
+        assert alternate["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ] == retry_plan["stage"]["retained_aedt_bundle"]["dedupe_key"]
+    retry_profile = production._read_json(
+        retry_plan_path.parent / retry_plan["profile"]["path"]
+    )
+    assert retry_plan["available_submission_commands"] == [
+        "submit-operational-pressure-retry"
+    ]
+    assert (
+        retry_plan["retry_of_operational_pressure"][
+            "retry_of_task_id"
+        ]
+        == original_submission["task_id"]
+    )
+    assert (
+        retry_plan["retry_of_operational_pressure"][
+            "original_task_execution"
+        ]["attempt_evidence"]["attempt_count"]
+        == 3
+    )
+    assert len(
+        retry_plan["retry_of_operational_pressure"][
+            "original_task_execution"
+        ]["attempt_evidence"]["task_api_sha256"]
+    ) == 64
+    assert retry_plan["stage"]["resources"] == {
+        "cpus": 8,
+        "timeout_seconds": 14400,
+    }
+    assert (
+        f"pressure-r1-t{original_submission['task_id']}-"
+        in retry_plan["stage"]["task_name"]
+    )
+    assert (
+        retry_plan["scheduler_strict_node_contract"][
+            "task_identity_generation"
+        ]
+        == probe.OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION
+    )
+    assert retry_plan["stage"]["retained_aedt_bundle"]["dedupe_key"] != (
+        original_plan["stage"]["retained_aedt_bundle"]["dedupe_key"]
+    )
+    assert retry_profile["param_overrides"]["fan_velocity"] == 1.5
+    assert retry_profile["param_overrides"]["core_plate_pad_t"] == 2.0
+    assert retry_profile["param_overrides"]["wcp_pad_t"] == 2.0
+    assert retry_profile["param_overrides"]["k_ins"] == 0.2
+    assert retry_params["fan_velocity"] == 1.5
+    with pytest.raises(
+        production.HandoffContractError,
+        match="lifecycle event set drifted",
+    ):
+        probe.create_operational_pressure_retry_plan(
+            original_plan_path=original_plan_path,
+            original_submission_path=original_submission_path,
+            output=tmp_path / "forbidden-pressure-extra-event",
+            task_reader=task_reader,
+            event_reader=lambda **_kwargs: [
+                {
+                    **_operational_pressure_events(
+                        original_submission
+                    )[0],
+                    "id": 127300,
+                    "created_at": "2026-07-25 04:29:54",
+                    "message": (
+                        f"task {original_submission['task_name']} "
+                        "requeued after memory-pressure kill "
+                        "(attempt 3/3)"
+                    ),
+                },
+                *_operational_pressure_events(original_submission),
+            ],
+        )
+    with pytest.raises(
+        production.HandoffContractError, match="semantics are mixed"
+    ):
+        probe._plan_retry_kind(
+            {
+                "retry_of_timeout": {},
+                "retry_of_operational_pressure": {},
+            }
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="bounded direct-or-timeout chain",
+    ):
+        probe.create_operational_pressure_retry_plan(
+            original_plan_path=retry_plan_path,
+            original_submission_path=original_submission_path,
+            output=tmp_path / "forbidden-pressure-chain",
+            task_reader=task_reader,
+            event_reader=event_reader,
+        )
+
+    expected_submission = {
+        "task_id": 71003,
+        "task_name": retry_plan["stage"]["task_name"],
+        "dedupe_key": retry_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+    }
+    post_readback = {
+        "task_id": 71003,
+        "name": expected_submission["task_name"],
+        "status": "queued",
+        "state": "queued",
+        "dedupe_key": expected_submission["dedupe_key"],
+        "project": scheduler_client.MFT_PROJECT,
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 14400,
+        "node_name": "n116",
+        "requested_node_name": "n116",
+        "node_name_policy": "strict",
+        "requested_node_name_policy": "strict",
+        "strict_node_placement": True,
+        "placement_contract_satisfied": False,
+        "allocation_id": None,
+        "assigned_allocation": None,
+        "allocation_node_name": "",
+        "actual_node_name": "",
+        "slurm_job_id": "",
+        "account_name": None,
+        "requested_account_name": "anchor-account",
+        "same_node_as_task_id": 72000,
+        "requested_allocation_id": 0,
+        "started_at": None,
+        "finished_at": None,
+    }
+
+    class _PressureScheduler(_FakeScheduler):
+        def submit_verification(self, *args, **kwargs):
+            guard = kwargs.get("pre_submit_guard")
+            if guard is not None:
+                guard()
+            self.calls.append((args, kwargs))
+            return {
+                "task_id": 71003,
+                "submission_source": "post_created",
+                "scheduler_mutation_performed": True,
+                "api_pre_submission_readback": None,
+                "api_post_submission_response": post_readback,
+            }
+
+    def retry_task_reader(**kwargs):
+        if kwargs["task_id"] == original_submission["task_id"]:
+            return _operational_pressure_task_snapshot(
+                original_submission
+            )
+        if kwargs["task_id"] == 72000:
+            return _same_allocation_anchor_snapshot(
+                actual_node_name="n116",
+                timeout_seconds=14400,
+            )
+        if kwargs["task_id"] == 71003:
+            return post_readback
+        raise AssertionError(kwargs["task_id"])
+
+    collision_scheduler = _PressureScheduler()
+    with pytest.raises(
+        production.HandoffContractError,
+        match="more than one operational-pressure retry sibling",
+    ):
+        probe.submit_operational_pressure_retry(
+            plan_path=retry_plan_path,
+            scheduler_cutover_receipt_path=strict_cutover_path,
+            output=tmp_path / "forbidden-pressure-siblings.json",
+            scheduler=collision_scheduler,
+            predictor=_Predictor(),
+            live_reader=_live_scheduler_reader,
+            task_reader=retry_task_reader,
+            event_reader=event_reader,
+            task_list_reader=lambda **_kwargs: [
+                post_readback,
+                {**post_readback, "task_id": 71004},
+            ],
+        )
+    assert collision_scheduler.calls == []
+
+    blocked_scheduler = _PressureScheduler()
+    with pytest.raises(
+        production.HandoffContractError,
+        match="2/3",
+    ):
+        probe.submit_operational_pressure_retry(
+            plan_path=retry_plan_path,
+            scheduler_cutover_receipt_path=strict_cutover_path,
+            output=tmp_path / "forbidden-pressure-submission.json",
+            scheduler=blocked_scheduler,
+            predictor=_Predictor(),
+            live_reader=_live_scheduler_reader,
+            task_reader=retry_task_reader,
+            event_reader=lambda **_kwargs: (
+                _operational_pressure_events(original_submission)[:1]
+                + _operational_pressure_events(original_submission)[2:]
+            ),
+        )
+    assert blocked_scheduler.calls == []
+
+    scheduler = _PressureScheduler()
+    sibling_rows = iter(([], [], [post_readback]))
+    submission_path = probe.submit_operational_pressure_retry(
+        plan_path=retry_plan_path,
+        scheduler_cutover_receipt_path=strict_cutover_path,
+        output=tmp_path / "pressure-retry-submission.json",
+        scheduler=scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=retry_task_reader,
+        event_reader=event_reader,
+        task_list_reader=lambda **_kwargs: next(sibling_rows),
+        same_node_as_task_id=72000,
+        expected_allocation_id=9002,
+        expected_slurm_job_id="81300",
+        expected_account_name="anchor-account",
+        expected_node_name="n116",
+    )
+    submission = probe._load_submission(
+        submission_path, plan=retry_plan
+    )
+    assert submission["task_id"] == 71003
+    assert submission["task_id"] != original_submission["task_id"]
+    claim_receipt = submission["operational_pressure_atomic_claim"]
+    assert claim_receipt["acquisition_status"] == "fresh_pending"
+    assert (
+        claim_receipt["fresh_claim_authorized_scheduler_submit_call"]
+        is True
+    )
+    assert claim_receipt["finalized_claim"]["task_id"] == 71003
+    assert submission["retry_of_operational_pressure"] == retry_plan[
+        "retry_of_operational_pressure"
+    ]
+    assert "retry_of_timeout" not in submission
+    assert scheduler.calls[0][1]["node_name"] == "n116"
+    assert scheduler.calls[0][1]["node_name_policy"] == "strict"
+    assert scheduler.calls[0][1]["same_node_as_task_id"] == 72000
+    assert scheduler.calls[0][1]["account_name"] == "anchor-account"
+    assert submission["scheduler_placement_contract"][
+        "expected_node_name"
+    ] == "n116"
+    for index, alternate_path in enumerate(alternate_plan_paths):
+        losing_scheduler = _PressureScheduler()
+        with pytest.raises(
+            production.HandoffContractError,
+            match="atomic claim acquisition failed",
+        ):
+            probe.submit_operational_pressure_retry(
+                plan_path=alternate_path,
+                scheduler_cutover_receipt_path=(
+                    strict_cutover_path
+                    if index
+                    else legacy_cutover_path
+                ),
+                output=tmp_path
+                / f"forbidden-pressure-placement-{index}.json",
+                scheduler=losing_scheduler,
+                predictor=_Predictor(),
+                live_reader=_live_scheduler_reader,
+                task_reader=retry_task_reader,
+                event_reader=event_reader,
+                task_list_reader=lambda **_kwargs: [post_readback],
+            )
+        assert losing_scheduler.calls == []
+    terminal = {
+        **post_readback,
+        "status": "completed",
+        "state": "succeeded",
+        "exit_code": 0,
+        "failure_message": "",
+        "allocation_id": 9002,
+        "assigned_allocation": 9002,
+        "allocation_node_name": "n116",
+        "actual_node_name": "n116",
+        "slurm_job_id": "81300",
+        "account_name": "anchor-account",
+        "placement_contract_satisfied": True,
+        "started_at": "2026-07-25 05:00:00",
+        "finished_at": "2026-07-25 06:00:00",
+        "remote_cwd": "/gpfs/test",
+        "remote_dir": "runs/task-71003",
+    }
+    assert probe._task_execution_evidence(
+        terminal, submission=submission
+    )["actual_node_name"] == "n116"
+    with pytest.raises(
+        production.HandoffContractError,
+        match="terminal execution evidence drifted",
+    ):
+        probe._task_execution_evidence(
+            {**terminal, "timeout_seconds": 28800},
+            submission=submission,
+        )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="fell back|escaped|identity drifted",
+    ):
+        probe._task_execution_evidence(
+            {
+                **terminal,
+                "allocation_node_name": "n109",
+                "actual_node_name": "n109",
+            },
+            submission=submission,
+        )
+
+
+def test_operational_pressure_after_timeout_is_bounded_and_eight_hours(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    base_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    base_submission_path = probe.submit_standard(
+        plan_path=base_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "compound-base-submission.json",
+        scheduler=_FakeScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    base_plan = probe._load_plan(base_plan_path)[0]
+    base_submission = probe._load_submission(
+        base_submission_path, plan=base_plan
+    )
+    timeout_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=base_plan_path,
+        original_submission_path=base_submission_path,
+        output=tmp_path / "compound-timeout-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            base_submission
+        ),
+    )
+
+    class _TaskIdScheduler(_FakeScheduler):
+        def __init__(self, task_id):
+            super().__init__()
+            self.task_id = task_id
+
+        def submit_verification(self, *args, **kwargs):
+            guard = kwargs.get("pre_submit_guard")
+            if guard is not None:
+                guard()
+            self.calls.append((args, kwargs))
+            return self.task_id
+
+    timeout_submission_path = probe.submit_timeout_retry(
+        plan_path=timeout_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "compound-timeout-submission.json",
+        scheduler=_TaskIdScheduler(71002),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            base_submission
+        ),
+    )
+    timeout_plan = probe._load_plan(timeout_plan_path)[0]
+    timeout_submission = probe._load_submission(
+        timeout_submission_path, plan=timeout_plan
+    )
+
+    def pressure_snapshot(submission):
+        return _operational_pressure_task_snapshot(
+            submission,
+            timeout_seconds=28800,
+            created_at="2026-07-24 18:23:00",
+        )
+
+    compound_plan_path = probe.create_operational_pressure_retry_plan(
+        original_plan_path=timeout_plan_path,
+        original_submission_path=timeout_submission_path,
+        output=tmp_path / "compound-pressure-plan",
+        task_reader=lambda **_kwargs: pressure_snapshot(
+            timeout_submission
+        ),
+        event_reader=lambda **_kwargs: _operational_pressure_events(
+            timeout_submission
+        ),
+    )
+    compound_plan = probe._load_plan(compound_plan_path)[0]
+    compound_record = compound_plan["retry_of_operational_pressure"]
+    assert compound_record["immediate_retry_kind"] == "timeout"
+    assert compound_record["retry_of_task_id"] == 71002
+    assert compound_record["logical_authority_task_id"] == 71001
+    assert compound_plan["stage"]["resources"] == {
+        "cpus": 8,
+        "timeout_seconds": 28800,
+    }
+    assert "pressure-after-timeout-r1-l71001-" in compound_plan[
+        "stage"
+    ]["task_name"]
+    assert "-i71002-" not in compound_plan["stage"]["task_name"]
+
+    alternate_compound_path = (
+        probe.create_operational_pressure_retry_plan(
+            original_plan_path=timeout_plan_path,
+            original_submission_path=timeout_submission_path,
+            output=tmp_path / "compound-pressure-plan-strict",
+            strict_node_name="n108",
+            task_reader=lambda **_kwargs: pressure_snapshot(
+                timeout_submission
+            ),
+            event_reader=lambda **_kwargs: (
+                _operational_pressure_events(timeout_submission)
+            ),
+        )
+    )
+    alternate_compound = probe._load_plan(
+        alternate_compound_path
+    )[0]
+    assert alternate_compound["stage"]["task_name"] == compound_plan[
+        "stage"
+    ]["task_name"]
+    assert alternate_compound["stage"]["retained_aedt_bundle"][
+        "dedupe_key"
+    ] == compound_plan["stage"]["retained_aedt_bundle"]["dedupe_key"]
+
+    sibling = {
+        "task_id": 71003,
+        "name": compound_plan["stage"]["task_name"],
+        "dedupe_key": compound_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+        "status": "queued",
+        "state": "queued",
+        "project": scheduler_client.MFT_PROJECT,
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 28800,
+        "aedt_backend": "standalone",
+        "requested_node_name": "",
+        "requested_node_name_policy": "",
+        "same_node_as_task_id": 0,
+    }
+    sibling_rows = iter(([], [], [sibling]))
+    compound_scheduler = _TaskIdScheduler(71003)
+    compound_submission_path = (
+        probe.submit_operational_pressure_retry(
+            plan_path=compound_plan_path,
+            scheduler_cutover_receipt_path=cutover_path,
+            output=tmp_path / "compound-pressure-submission.json",
+            scheduler=compound_scheduler,
+            predictor=_Predictor(),
+            live_reader=_live_scheduler_reader,
+            task_reader=lambda **_kwargs: pressure_snapshot(
+                timeout_submission
+            ),
+            event_reader=lambda **_kwargs: (
+                _operational_pressure_events(timeout_submission)
+            ),
+            task_list_reader=lambda **_kwargs: next(sibling_rows),
+        )
+    )
+    compound_submission = probe._load_submission(
+        compound_submission_path, plan=compound_plan
+    )
+    assert compound_submission["task_id"] == 71003
+    assert compound_submission["resources"]["timeout_seconds"] == 28800
+    assert len(compound_scheduler.calls) == 1
+    with pytest.raises(
+        production.HandoffContractError,
+        match="bounded direct-or-timeout chain",
+    ):
+        probe.create_operational_pressure_retry_plan(
+            original_plan_path=compound_plan_path,
+            original_submission_path=compound_submission_path,
+            output=tmp_path / "forbidden-compound-depth",
+            task_reader=lambda **_kwargs: pressure_snapshot(
+                compound_submission
+            ),
+            event_reader=lambda **_kwargs: (
+                _operational_pressure_events(compound_submission)
+            ),
+        )
+
+
+def test_operational_pressure_pending_claim_recovers_without_repost(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "pending-original-submission.json",
+        scheduler=_FakeScheduler(),
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan = probe._load_plan(original_plan_path)[0]
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+    retry_plan_path = probe.create_operational_pressure_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "pending-pressure-plan",
+        task_reader=lambda **_kwargs: (
+            _operational_pressure_task_snapshot(original_submission)
+        ),
+        event_reader=lambda **_kwargs: (
+            _operational_pressure_events(original_submission)
+        ),
+    )
+    retry_plan = probe._load_plan(retry_plan_path)[0]
+    reference = retry_plan[
+        "operational_pressure_atomic_claim_reference"
+    ]
+    winner = probe._operational_pressure_claim_winner(
+        retry_plan_path, retry_plan
+    )
+    sibling = {
+        "task_id": 71005,
+        "name": retry_plan["stage"]["task_name"],
+        "status": "queued",
+        "state": "queued",
+        "dedupe_key": retry_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+        "project": scheduler_client.MFT_PROJECT,
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 14400,
+        "requested_node_name": None,
+        "requested_node_name_policy": None,
+        "same_node_as_task_id": 0,
+    }
+    class _IgnoringGuardScheduler(_FakeScheduler):
+        def submit_verification(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return 71005
+
+    ignored_guard_scheduler = _IgnoringGuardScheduler()
+    ignored_guard_rows = iter(([], [sibling]))
+    with pytest.raises(
+        production.HandoffContractError,
+        match="locked post-claim pre-POST guard",
+    ):
+        probe.submit_operational_pressure_retry(
+            plan_path=retry_plan_path,
+            scheduler_cutover_receipt_path=cutover_path,
+            output=tmp_path / "ignored-guard-submission.json",
+            scheduler=ignored_guard_scheduler,
+            predictor=_Predictor(),
+            live_reader=_live_scheduler_reader,
+            task_reader=lambda **_kwargs: (
+                _operational_pressure_task_snapshot(
+                    original_submission
+                )
+            ),
+            event_reader=lambda **_kwargs: (
+                _operational_pressure_events(original_submission)
+            ),
+            task_list_reader=lambda **_kwargs: next(
+                ignored_guard_rows
+            ),
+        )
+    assert len(ignored_guard_scheduler.calls) == 1
+    atomic_claim.validate_pending_claim(
+        probe.OPERATIONAL_PRESSURE_CLAIM_ROOT,
+        reference,
+        expected_winner=winner,
+    )
+    no_repost_scheduler = _FakeScheduler()
+    with pytest.raises(
+        production.HandoffContractError,
+        match="exactly one matching API task and never re-posts",
+    ):
+        probe.submit_operational_pressure_retry(
+            plan_path=retry_plan_path,
+            scheduler_cutover_receipt_path=cutover_path,
+            output=tmp_path / "pending-zero-sibling.json",
+            scheduler=no_repost_scheduler,
+            predictor=_Predictor(),
+            live_reader=_live_scheduler_reader,
+            task_reader=lambda **_kwargs: (
+                _operational_pressure_task_snapshot(
+                    original_submission
+                )
+            ),
+            event_reader=lambda **_kwargs: (
+                _operational_pressure_events(original_submission)
+            ),
+            task_list_reader=lambda **_kwargs: [],
+        )
+    assert no_repost_scheduler.calls == []
+    recovered_path = probe.submit_operational_pressure_retry(
+        plan_path=retry_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "pending-recovered-submission.json",
+        scheduler=no_repost_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=lambda **_kwargs: (
+            _operational_pressure_task_snapshot(original_submission)
+        ),
+        event_reader=lambda **_kwargs: (
+            _operational_pressure_events(original_submission)
+        ),
+        task_list_reader=lambda **_kwargs: [sibling],
+    )
+    assert no_repost_scheduler.calls == []
+    recovered = probe._load_submission(
+        recovered_path, plan=retry_plan
+    )
+    claim = recovered["operational_pressure_atomic_claim"]
+    assert recovered["task_id"] == 71005
+    assert claim["acquisition_status"] == "existing_pending"
+    assert claim["fresh_claim_authorized_scheduler_submit_call"] is False
+    assert claim["recovered_without_scheduler_submit_call"] is True
+    assert claim["finalized_claim"]["task_id"] == 71005
 
 
 def test_strict_retry_rejects_unsafe_node_name_before_plan_write(
@@ -1630,6 +2567,7 @@ def test_scheduler_client_strict_opt_in_sends_policy_and_returns_post_evidence(
     )
 
     def post(_url, *, json, timeout):
+        assert captured.get("guard_count") == 1
         captured["payload"] = json
         captured["timeout"] = timeout
         return _Response()
@@ -1647,8 +2585,12 @@ def test_scheduler_client_strict_opt_in_sends_policy_and_returns_post_evidence(
         node_name="n110",
         node_name_policy="strict",
         return_submission_evidence=True,
+        pre_submit_guard=lambda: captured.update(
+            guard_count=captured.get("guard_count", 0) + 1
+        ),
         scheduler_url=probe.DIAGNOSTIC_SCHEDULER_URL,
     )
+    assert captured["guard_count"] == 1
     assert captured["payload"]["node_name"] == "n110"
     assert captured["payload"]["node_name_policy"] == "strict"
     assert result["task_id"] == 73001
@@ -1659,6 +2601,12 @@ def test_scheduler_client_strict_opt_in_sends_policy_and_returns_post_evidence(
 
 
 def test_timeout_retry_parser_exposes_complete_same_allocation_contract():
+    claim_init = probe._parser().parse_args(
+        ["init-operational-pressure-claim-root"]
+    )
+    assert claim_init.command == (
+        "init-operational-pressure-claim-root"
+    )
     plan_args = probe._parser().parse_args(
         [
             "plan-timeout-retry",
@@ -1699,6 +2647,58 @@ def test_timeout_retry_parser_exposes_complete_same_allocation_contract():
     assert args.expected_slurm_job_id == "826363"
     assert args.expected_account_name == "dhj02"
     assert args.expected_node_name == "n110"
+    pressure = probe._parser().parse_args(
+        [
+            "submit-operational-pressure-retry",
+            "--plan",
+            "pressure-plan.json",
+            "--scheduler-cutover-receipt",
+            "cutover.json",
+            "--same-node-as-task-id",
+            "96301",
+            "--expected-allocation-id",
+            "14630",
+            "--expected-slurm-job-id",
+            "826999",
+            "--expected-account-name",
+            "r1jae262",
+            "--expected-node-name",
+            "n116",
+            "--output",
+            "pressure-submission.json",
+        ]
+    )
+    assert pressure.same_node_as_task_id == 96301
+    assert pressure.expected_allocation_id == 14630
+    assert pressure.expected_slurm_job_id == "826999"
+    assert pressure.expected_account_name == "r1jae262"
+    assert pressure.expected_node_name == "n116"
+
+
+def test_operational_pressure_claim_root_cli_is_idempotent_and_local_only(
+    tmp_path, monkeypatch, capsys
+):
+    claim_root = (tmp_path / "cli-pressure-claims").resolve()
+    monkeypatch.setattr(
+        probe, "OPERATIONAL_PRESSURE_CLAIM_ROOT", claim_root
+    )
+    scheduler_calls = []
+    monkeypatch.setattr(
+        scheduler_client,
+        "submit_verification",
+        lambda *args, **kwargs: scheduler_calls.append((args, kwargs)),
+    )
+    command = ["init-operational-pressure-claim-root"]
+    assert probe.main(command) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert probe.main(command) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert first == second
+    assert first["path"] == str(claim_root)
+    assert first["claim_root_authority"]["campaign_id"] == (
+        "mft-goal-20260726"
+    )
+    assert scheduler_calls == []
 
 
 def test_timeout_retry_collection_is_accepted_by_strict_al(
@@ -1784,6 +2784,123 @@ def test_timeout_retry_collection_is_accepted_by_strict_al(
     assert retry_params["fan_velocity"] == 1.5
     assert retry_params["wcp_pad_t"] == 2.0
     assert retry_params["core_plate_pad_t"] == 2.0
+
+    pressure_plan_path = probe.create_operational_pressure_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "strict-al-pressure-plan",
+        task_reader=lambda **_kwargs: (
+            _operational_pressure_task_snapshot(original_submission)
+        ),
+        event_reader=lambda **_kwargs: _operational_pressure_events(
+            original_submission
+        ),
+    )
+    pressure_plan = probe._load_plan(pressure_plan_path)[0]
+    pressure_sibling = {
+        "task_id": 71003,
+        "name": pressure_plan["stage"]["task_name"],
+        "dedupe_key": pressure_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+        "status": "queued",
+        "state": "queued",
+        "project": scheduler_client.MFT_PROJECT,
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 14400,
+        "aedt_backend": "standalone",
+        "requested_node_name": "",
+        "requested_node_name_policy": "",
+        "same_node_as_task_id": 0,
+    }
+    pressure_sibling_rows = iter(([], [], [pressure_sibling]))
+    pressure_scheduler = _RetryScheduler()
+    pressure_scheduler.submit_verification = (
+        lambda *args, **kwargs: (
+            kwargs["pre_submit_guard"](),
+            pressure_scheduler.calls.append((args, kwargs)),
+            71003,
+        )[-1]
+    )
+    pressure_submission_path = probe.submit_operational_pressure_retry(
+        plan_path=pressure_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "strict-al-pressure-submission.json",
+        scheduler=pressure_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=lambda **_kwargs: (
+            _operational_pressure_task_snapshot(original_submission)
+        ),
+        event_reader=lambda **_kwargs: _operational_pressure_events(
+            original_submission
+        ),
+        task_list_reader=lambda **_kwargs: next(
+            pressure_sibling_rows
+        ),
+    )
+    pressure_submission = probe._load_submission(
+        pressure_submission_path, plan=pressure_plan
+    )
+    pressure_scheduler.result = _result(
+        pressure_plan_path, pressure_submission
+    )
+    pressure_metadata, pressure_manifest = _remote_evidence(
+        pressure_submission, pressure_scheduler.result
+    )
+    pressure_collection_path = probe.collect_standard(
+        plan_path=pressure_plan_path,
+        submission_path=pressure_submission_path,
+        output=tmp_path / "strict-al-pressure-collection.json",
+        scheduler=pressure_scheduler,
+        remote_reader=pressure_metadata,
+        manifest_reader=pressure_manifest,
+        task_reader=lambda **_kwargs: _task_snapshot(
+            pressure_submission
+        ),
+    )
+    pressure_truth = strict_al.authenticate_collection(
+        pressure_collection_path
+    )
+    assert pressure_truth.adapter_kind == "diagnostic"
+    assert pressure_truth.collection["task_id"] == 71003
+    with pytest.raises(
+        strict_al.StrictALIngestError,
+        match="candidate_physics_sha256 identity is duplicated",
+    ):
+        strict_al._validate_new_collection_identities(
+            [
+                {
+                    "collection_payload_sha256": truth.collection[
+                        "payload_sha256"
+                    ],
+                    "candidate_physics_sha256": truth.plan[
+                        "candidate_physics_sha256"
+                    ],
+                    "task_id": truth.collection["task_id"],
+                    "logical_authority_task_id": (
+                        original_submission["task_id"]
+                    ),
+                    "project_name": "original",
+                    "saved_at": "2026-07-25T00:00:00Z",
+                },
+                {
+                    "collection_payload_sha256": (
+                        pressure_truth.collection["payload_sha256"]
+                    ),
+                    "candidate_physics_sha256": pressure_truth.plan[
+                        "candidate_physics_sha256"
+                    ],
+                    "task_id": pressure_truth.collection["task_id"],
+                    "logical_authority_task_id": (
+                        original_submission["task_id"]
+                    ),
+                    "project_name": "retry",
+                    "saved_at": "2026-07-25T01:00:00Z",
+                },
+            ]
+        )
 
 
 def test_submit_and_collect_remain_diagnostic_after_actual_pass(

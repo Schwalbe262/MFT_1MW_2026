@@ -34,8 +34,9 @@ checkout.
 ## 1. Authenticate and build the isolated dataset
 
 Run only after at least eight collection files exist. The allow-list below
-prevents unrelated JSON files from entering the command. Eleven timeout
-retries replace, rather than augment, their failed original logical slots.
+prevents unrelated JSON files from entering the command. A sealed timeout or
+Scheduler operational-pressure retry replaces, rather than augments, its
+failed original logical slot.
 
 ```powershell
 $Py = 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe'
@@ -121,6 +122,41 @@ $TimeoutRetryAllowList = @(
     RetryTaskId = 96266; Directory = 't96229_b4075d84aeee'
   }
 )
+$OperationalPressureRetryRoot = 'C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\standard_operational_pressure_retries_r1_260725'
+$OperationalPressureRetryAllowList = @(
+  # Populate RetryTaskId/Directory only after each exact sealed submission.
+  # The three currently eligible original slots are:
+  # 692c1a03e5fd / 96209, c3195a79f5b2 / 96210,
+  # 628c9fcfec1e / 96211.
+)
+$RetryAllowList = @(
+  foreach ($Spec in $TimeoutRetryAllowList) {
+    [pscustomobject]@{
+      Kind = 'timeout'
+      Root = $TimeoutRetryRoot
+      PlanFile = 'diagnostic_timeout_retry_plan.json'
+      AncestryField = 'retry_of_timeout'
+      EvidenceSchema = 'mft-goal-diagnostic-standard-timeout-retry-evidence-v1'
+      Stem = $Spec.Stem
+      OriginalTaskId = $Spec.OriginalTaskId
+      RetryTaskId = $Spec.RetryTaskId
+      Directory = $Spec.Directory
+    }
+  }
+  foreach ($Spec in $OperationalPressureRetryAllowList) {
+    [pscustomobject]@{
+      Kind = 'operational-pressure'
+      Root = $OperationalPressureRetryRoot
+      PlanFile = 'diagnostic_operational_pressure_retry_plan.json'
+      AncestryField = 'retry_of_operational_pressure'
+      EvidenceSchema = 'mft-goal-diagnostic-standard-operational-pressure-retry-evidence-v2'
+      Stem = $Spec.Stem
+      OriginalTaskId = $Spec.OriginalTaskId
+      RetryTaskId = $Spec.RetryTaskId
+      Directory = $Spec.Directory
+    }
+  }
+)
 
 $Dirty = git -C $CodeRoot status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0 -or $Dirty) {
@@ -130,9 +166,9 @@ $CodeRevision = (git -C $CodeRoot rev-parse HEAD).Trim()
 if ($CodeRevision.Length -ne 40) { throw 'invalid code revision' }
 
 $RetryByStem = @{}
-foreach ($Spec in $TimeoutRetryAllowList) {
+foreach ($Spec in $RetryAllowList) {
   if ($RetryByStem.ContainsKey($Spec.Stem)) {
-    throw "duplicate timeout-retry logical slot: $($Spec.Stem)"
+    throw "duplicate retry logical slot across retry kinds: $($Spec.Stem)"
   }
   $RetryByStem.Add($Spec.Stem, $Spec)
 }
@@ -161,7 +197,7 @@ $Collections = @(
       if ($RetryByStem.ContainsKey($Stem)) {
         $Spec = $RetryByStem[$Stem]
         if ([int]$Receipt.task_id -ne [int]$Spec.OriginalTaskId) {
-          throw "timeout-retry original task identity drifted: $Submission"
+          throw "retry original task identity drifted: $Submission"
         }
       } else {
         $Path = Join-Path $Group.Root "collections\$Stem.json"
@@ -171,35 +207,61 @@ $Collections = @(
       }
     }
   }
-  foreach ($Spec in $TimeoutRetryAllowList) {
-    $Root = Join-Path $TimeoutRetryRoot $Spec.Directory
+  foreach ($Spec in $RetryAllowList) {
+    $Root = Join-Path $Spec.Root $Spec.Directory
     $Submission = Join-Path $Root 'submission.json'
-    $Plan = Join-Path $Root 'plan\diagnostic_timeout_retry_plan.json'
+    $Plan = Join-Path (Join-Path $Root 'plan') $Spec.PlanFile
     $OriginalSubmission = $OriginalSubmissionByStem[$Spec.Stem]
     if (
       -not $OriginalSubmission -or
       -not (Test-Path -LiteralPath $Submission -PathType Leaf) -or
       -not (Test-Path -LiteralPath $Plan -PathType Leaf)
     ) {
-      throw "allow-listed timeout-retry ancestry is absent: $Root"
+      throw "allow-listed retry ancestry is absent: $Root"
     }
     $Receipt = Get-Content -Raw -LiteralPath $Submission | ConvertFrom-Json
-    $Retry = $Receipt.retry_of_timeout
+    $TimeoutProperty = $Receipt.PSObject.Properties['retry_of_timeout']
+    $PressureProperty = $Receipt.PSObject.Properties['retry_of_operational_pressure']
+    $AncestryCount = @($TimeoutProperty, $PressureProperty).Where({
+      $null -ne $_
+    }).Count
+    $RetryProperty = $Receipt.PSObject.Properties[$Spec.AncestryField]
+    $Retry = if ($RetryProperty) { $RetryProperty.Value } else { $null }
+    $Execution = $Retry.original_task_execution
+    $FailureEvidenceOK = if ($Spec.Kind -eq 'timeout') {
+      [int]$Execution.exit_code -eq 124 -and
+      [string]$Execution.failure_message -eq 'task timed out after 14400s'
+    } else {
+      $Window = $Execution.attempt_evidence.api_event_window
+      $Claim = $Receipt.operational_pressure_atomic_claim
+      $null -eq $Execution.exit_code -and
+      [string]$Execution.failure_message -eq 'memory pressure hard limit after 3 attempts' -and
+      [int]$Retry.attempt_count -eq 3 -and
+      [int]$Execution.attempt_evidence.attempt_count -eq 3 -and
+      [int]$Window.requested_limit -eq 1000 -and
+      [int]$Window.response_count -eq @($Window.events).Count -and
+      [string]$Window.full_window_sha256 -match '^[0-9a-f]{64}$' -and
+      @('response_below_api_limit','oldest_event_not_after_task_created_at') -contains [string]$Window.coverage_method -and
+      [int]$Claim.finalized_claim.task_id -eq [int]$Receipt.task_id -and
+      $Claim.finalized_claim.state -eq 'finalized'
+    }
     if (
+      $AncestryCount -ne 1 -or
+      -not $RetryProperty -or
       $Receipt.schema_version -ne 'mft-goal-diagnostic-standard-submission-v1' -or
       $Receipt.stage -ne 'standard' -or
       $Receipt.scheduler_submission_performed -ne $true -or
       [int]$Receipt.task_id -ne [int]$Spec.RetryTaskId -or
       -not ([string]$Receipt.candidate_physics_sha256).StartsWith($Spec.Stem) -or
       [string]$Receipt.plan.path -ne $Plan -or
-      $Retry.schema_version -ne 'mft-goal-diagnostic-standard-timeout-retry-evidence-v1' -or
+      $Retry.schema_version -ne $Spec.EvidenceSchema -or
       [int]$Retry.retry_of_task_id -ne [int]$Spec.OriginalTaskId -or
       [string]$Retry.original_submission.path -ne $OriginalSubmission -or
       [int]$Retry.original_task_execution.task_id -ne [int]$Spec.OriginalTaskId -or
       [string]$Retry.original_task_execution.status -ne 'failed' -or
-      [int]$Retry.original_task_execution.exit_code -ne 124
+      -not $FailureEvidenceOK
     ) {
-      throw "allow-listed timeout-retry identity drifted: $Submission"
+      throw "allow-listed retry identity/ancestry drifted: $Submission"
     }
     $Path = Join-Path $Root 'collection.json'
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
@@ -248,9 +310,16 @@ if ($LASTEXITCODE -ne 0) { throw 'strict AL build failed' }
 writes the base dataset or contacts Scheduler. A superseded failed original
 collection path is never passed to ingestion. For a retry, the diagnostic
 collection authenticator follows the sealed plan back to the exact original
-plan, submission, and failed/124 Scheduler evidence, and verifies that the
-effective physics is unchanged. Strict ingestion also rejects duplicate
-candidate geometries, so an original and its retry cannot be counted twice.
+plan and submission. It then requires either failed/124 timeout evidence or
+the exact failed/null-exit memory-pressure record plus the sealed complete
+`/api/events?limit=1000` window (ordered IDs/timestamps, coverage bound,
+full-window SHA, exact two requeues and cleanup). It never opens Scheduler
+SQLite. The finalized campaign claim is reauthenticated, and effective
+physics must remain unchanged. Routing requires exactly one ancestry kind and
+one retry per logical slot. Strict ingestion stores the sealed logical
+authority task ID and rejects duplicate logical slots both within one batch
+and against any prior strict-AL output used as the next base;
+candidate-geometry duplicates are also rejected.
 
 ## 2. Plan, stage, and submit one 8-CPU training task
 

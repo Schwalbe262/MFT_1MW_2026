@@ -15,6 +15,7 @@ from module.mft_goal_20260726_contract import (
 )
 from regression_260707.optimization import geometry_metrics
 from regression_260707.verify import scheduler_client
+from tools import mft_campaign_atomic_claim as atomic_claim
 from tools import mft_goal_diagnostic_standard_probe as diagnostic
 from tools import mft_goal_fea_handoff as production
 from tools import mft_goal_truth_promotion as promotion
@@ -53,6 +54,9 @@ class _Scheduler:
         self.next_task_id = first_task_id
 
     def submit_verification(self, *args, **kwargs):
+        guard = kwargs.get("pre_submit_guard")
+        if guard is not None:
+            guard()
         self.calls.append((args, kwargs))
         task_id = self.next_task_id
         self.next_task_id += 1
@@ -80,6 +84,19 @@ def _standard_collections(
     turns=(5, 6, 7),
     result_mutator=None,
 ):
+    claim_root = (tmp_path / "operational-pressure-claims").resolve()
+    monkeypatch.setattr(
+        diagnostic, "OPERATIONAL_PRESSURE_CLAIM_ROOT", claim_root
+    )
+    atomic_claim.initialize_claim_root(
+        claim_root,
+        campaign_id="mft-goal-20260726",
+        campaign_authority_sha256=(
+            diagnostic.OPERATIONAL_PRESSURE_CLAIM_AUTHORITY_SHA256
+        ),
+        root_id="3" * 32,
+        now="2026-07-25T00:00:00Z",
+    )
     helpers = _diagnostic_helpers()
     production_helpers = _production_helpers()
     bundle, bundle_path, tasks, _task_paths = production_helpers._bundle(
@@ -977,6 +994,305 @@ def test_truth_v2_exact_24_classifies_every_collection_and_blocks_zero(
             ],
             cohort_inventory_path=built["inventory_path"],
             output=tmp_path / "forbidden-duplicate-timeout-retry-v2",
+            predictor=predictor,
+        )
+
+    pressure_plan_path = (
+        diagnostic.create_operational_pressure_retry_plan(
+            original_plan_path=retry_base["plan_path"],
+            original_submission_path=retry_base["submission_path"],
+            output=tmp_path / "cohort-pressure-retry-plan",
+            task_reader=lambda **_kwargs: (
+                helpers._operational_pressure_task_snapshot(
+                    retry_base["submission"]
+                )
+            ),
+            event_reader=lambda **_kwargs: (
+                helpers._operational_pressure_events(
+                    retry_base["submission"]
+                )
+            ),
+        )
+    )
+    pressure_plan = diagnostic._load_plan(pressure_plan_path)[0]
+    pressure_scheduler = _Scheduler(
+        first_task_id=max(
+            entry["submission"]["task_id"] for entry in built["entries"]
+        )
+        + 200
+    )
+    pressure_task_id = pressure_scheduler.next_task_id
+    pressure_sibling = {
+        "task_id": pressure_task_id,
+        "name": pressure_plan["stage"]["task_name"],
+        "dedupe_key": pressure_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+        "status": "queued",
+        "state": "queued",
+        "project": scheduler_client.MFT_PROJECT,
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 14400,
+        "aedt_backend": "standalone",
+        "requested_node_name": "",
+        "requested_node_name_policy": "",
+        "same_node_as_task_id": 0,
+    }
+    pressure_sibling_rows = iter(([], [], [pressure_sibling]))
+    pressure_submission_path = (
+        diagnostic.submit_operational_pressure_retry(
+            plan_path=pressure_plan_path,
+            scheduler_cutover_receipt_path=built["cutover_path"],
+            output=tmp_path / "cohort-pressure-retry-submission.json",
+            scheduler=pressure_scheduler,
+            predictor=predictor,
+            live_reader=helpers._live_scheduler_reader,
+            task_reader=lambda **_kwargs: (
+                helpers._operational_pressure_task_snapshot(
+                    retry_base["submission"]
+                )
+            ),
+            event_reader=lambda **_kwargs: (
+                helpers._operational_pressure_events(
+                    retry_base["submission"]
+                )
+            ),
+            task_list_reader=lambda **_kwargs: next(
+                pressure_sibling_rows
+            ),
+        )
+    )
+    pressure_submission = diagnostic._load_submission(
+        pressure_submission_path, plan=pressure_plan
+    )
+    pressure_result = copy.deepcopy(retry_base["result"])
+    pressure_result["solver_core_scheduler_task_id_readback"] = str(
+        pressure_submission["task_id"]
+    )
+    pressure_scheduler.result = pressure_result
+    pressure_metadata_reader, pressure_manifest_reader = (
+        helpers._remote_evidence(pressure_submission, pressure_result)
+    )
+    pressure_collection_path = diagnostic.collect_standard(
+        plan_path=pressure_plan_path,
+        submission_path=pressure_submission_path,
+        output=tmp_path / "cohort-pressure-retry-collection.json",
+        scheduler=pressure_scheduler,
+        remote_reader=pressure_metadata_reader,
+        manifest_reader=pressure_manifest_reader,
+        task_reader=lambda **_kwargs: helpers._task_snapshot(
+            pressure_submission
+        ),
+    )
+    pressure_manifest_path = promotion.create_truth_promotion(
+        standard_collection_paths=[
+            *collection_paths[:-1],
+            pressure_collection_path,
+        ],
+        cohort_inventory_path=built["inventory_path"],
+        output=tmp_path / "truth-promotion-v2-pressure-retry",
+        predictor=predictor,
+    )
+    _pressure_manifest, pressure_ranked, _pressure_by_candidate = (
+        promotion._load_truth_manifest(
+            pressure_manifest_path, predictor=predictor
+        )
+    )
+    assert [
+        (
+            row["candidate_physics_sha256"],
+            row["truth_non_dominated_rank"],
+            row["actual_volume_L"],
+            row["actual_total_loss_W"],
+        )
+        for row in pressure_ranked
+    ] == [
+        (
+            row["candidate_physics_sha256"],
+            row["truth_non_dominated_rank"],
+            row["actual_volume_L"],
+            row["actual_total_loss_W"],
+        )
+        for row in ranked
+    ]
+    with pytest.raises(
+        production.HandoffContractError,
+        match="outside or duplicates",
+    ):
+        promotion.create_truth_promotion(
+            standard_collection_paths=[
+                retry_collection_path,
+                pressure_collection_path,
+                *collection_paths[2:],
+            ],
+            cohort_inventory_path=built["inventory_path"],
+            output=tmp_path / "forbidden-mixed-retries-v2",
+            predictor=predictor,
+        )
+
+    # Direct and compound operational-pressure retries intentionally share
+    # one logical claim slot and cannot both win in a campaign.  Exercise
+    # compound truth routing under an isolated campaign-root authority.
+    compound_claim_root = (
+        tmp_path / "compound-operational-pressure-claims"
+    ).resolve()
+    monkeypatch.setattr(
+        diagnostic,
+        "OPERATIONAL_PRESSURE_CLAIM_ROOT",
+        compound_claim_root,
+    )
+    atomic_claim.initialize_claim_root(
+        compound_claim_root,
+        campaign_id="mft-goal-20260726",
+        campaign_authority_sha256=(
+            diagnostic.OPERATIONAL_PRESSURE_CLAIM_AUTHORITY_SHA256
+        ),
+        root_id="4" * 32,
+        now="2026-07-25T00:00:00Z",
+    )
+    compound_plan_path = (
+        diagnostic.create_operational_pressure_retry_plan(
+            original_plan_path=retry_plan_path,
+            original_submission_path=retry_submission_path,
+            output=tmp_path / "cohort-compound-pressure-plan",
+            task_reader=lambda **_kwargs: (
+                helpers._operational_pressure_task_snapshot(
+                    retry_submission,
+                    timeout_seconds=28800,
+                )
+            ),
+            event_reader=lambda **_kwargs: (
+                helpers._operational_pressure_events(retry_submission)
+            ),
+        )
+    )
+    compound_plan = diagnostic._load_plan(compound_plan_path)[0]
+    assert compound_plan["retry_of_operational_pressure"][
+        "logical_authority_task_id"
+    ] == retry_base["submission"]["task_id"]
+    assert compound_plan["retry_of_operational_pressure"][
+        "retry_of_task_id"
+    ] == retry_submission["task_id"]
+    assert compound_plan["stage"]["resources"]["timeout_seconds"] == 28800
+    compound_scheduler = _Scheduler(
+        first_task_id=max(
+            entry["submission"]["task_id"] for entry in built["entries"]
+        )
+        + 300
+    )
+    compound_task_id = compound_scheduler.next_task_id
+    compound_sibling = {
+        "task_id": compound_task_id,
+        "name": compound_plan["stage"]["task_name"],
+        "dedupe_key": compound_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+        "status": "queued",
+        "state": "queued",
+        "project": scheduler_client.MFT_PROJECT,
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 28800,
+        "aedt_backend": "standalone",
+        "requested_node_name": "",
+        "requested_node_name_policy": "",
+        "same_node_as_task_id": 0,
+    }
+    compound_sibling_rows = iter(([], [], [compound_sibling]))
+    compound_submission_path = (
+        diagnostic.submit_operational_pressure_retry(
+            plan_path=compound_plan_path,
+            scheduler_cutover_receipt_path=built["cutover_path"],
+            output=tmp_path / "cohort-compound-pressure-submission.json",
+            scheduler=compound_scheduler,
+            predictor=predictor,
+            live_reader=helpers._live_scheduler_reader,
+            task_reader=lambda **_kwargs: (
+                helpers._operational_pressure_task_snapshot(
+                    retry_submission,
+                    timeout_seconds=28800,
+                )
+            ),
+            event_reader=lambda **_kwargs: (
+                helpers._operational_pressure_events(retry_submission)
+            ),
+            task_list_reader=lambda **_kwargs: next(
+                compound_sibling_rows
+            ),
+        )
+    )
+    compound_submission = diagnostic._load_submission(
+        compound_submission_path, plan=compound_plan
+    )
+    compound_result = copy.deepcopy(retry_base["result"])
+    compound_result["solver_core_scheduler_task_id_readback"] = str(
+        compound_submission["task_id"]
+    )
+    compound_scheduler.result = compound_result
+    compound_metadata, compound_results_manifest = (
+        helpers._remote_evidence(compound_submission, compound_result)
+    )
+    compound_collection_path = diagnostic.collect_standard(
+        plan_path=compound_plan_path,
+        submission_path=compound_submission_path,
+        output=tmp_path / "cohort-compound-pressure-collection.json",
+        scheduler=compound_scheduler,
+        remote_reader=compound_metadata,
+        manifest_reader=compound_results_manifest,
+        task_reader=lambda **_kwargs: helpers._task_snapshot(
+            compound_submission
+        ),
+    )
+    compound_truth_path = promotion.create_truth_promotion(
+        standard_collection_paths=[
+            *collection_paths[:-1],
+            compound_collection_path,
+        ],
+        cohort_inventory_path=built["inventory_path"],
+        output=tmp_path / "truth-promotion-v2-compound-pressure",
+        predictor=predictor,
+    )
+    compound_manifest, compound_ranked, _compound_by_candidate = (
+        promotion._load_truth_manifest(
+            compound_truth_path, predictor=predictor
+        )
+    )
+    compound_classification = next(
+        row
+        for row in compound_manifest["classification_rows"]
+        if row["cohort_entry_sha256"] == retry_entry["entry_sha256"]
+    )
+    assert compound_classification["task_id"] == compound_task_id
+    assert [
+        (
+            row["candidate_physics_sha256"],
+            row["truth_non_dominated_rank"],
+            row["actual_volume_L"],
+            row["actual_total_loss_W"],
+        )
+        for row in compound_ranked
+    ] == [
+        (
+            row["candidate_physics_sha256"],
+            row["truth_non_dominated_rank"],
+            row["actual_volume_L"],
+            row["actual_total_loss_W"],
+        )
+        for row in ranked
+    ]
+    with pytest.raises(
+        production.HandoffContractError,
+        match="outside or duplicates",
+    ):
+        promotion.create_truth_promotion(
+            standard_collection_paths=[
+                retry_collection_path,
+                compound_collection_path,
+                *collection_paths[2:],
+            ],
+            cohort_inventory_path=built["inventory_path"],
+            output=tmp_path / "forbidden-compound-duplicate-v2",
             predictor=predictor,
         )
 

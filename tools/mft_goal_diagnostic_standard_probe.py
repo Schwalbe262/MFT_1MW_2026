@@ -53,6 +53,7 @@ from module.mft_goal_20260726_contract import (  # noqa: E402
 from regression_260707.optimization import geometry_metrics  # noqa: E402
 from regression_260707.verify import scheduler_client  # noqa: E402
 from tools import mft_goal_20260726_launch as launch  # noqa: E402
+from tools import mft_campaign_atomic_claim as atomic_claim  # noqa: E402
 from tools import mft_goal_fea_handoff as production  # noqa: E402
 from tools import tier1_corrected_generation_preflight as preflight  # noqa: E402
 
@@ -150,13 +151,89 @@ TIMEOUT_RETRY_PROFILE_PATH = (
     / "profiles"
     / "goal_diagnostic_standard_timeout_retry.json"
 )
+OPERATIONAL_PRESSURE_RETRY_PROFILE_PATH = (
+    REPOSITORY_ROOT
+    / "regression_260707"
+    / "verify"
+    / "profiles"
+    / "goal_diagnostic_standard_operational_pressure_retry.json"
+)
+OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_PATH = (
+    REPOSITORY_ROOT
+    / "regression_260707"
+    / "verify"
+    / "profiles"
+    / "goal_diagnostic_standard_operational_pressure_after_timeout_retry.json"
+)
 STANDARD_RESOURCES = {"cpus": 8, "timeout_seconds": 4 * 3600}
 TIMEOUT_RETRY_RESOURCES = {"cpus": 8, "timeout_seconds": 8 * 3600}
+OPERATIONAL_PRESSURE_RETRY_RESOURCES = {
+    "cpus": 8,
+    "timeout_seconds": 4 * 3600,
+}
+OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_RESOURCES = {
+    "cpus": 8,
+    "timeout_seconds": 8 * 3600,
+}
 TIMEOUT_RETRY_PROFILE_SCHEMA = (
     "mft-goal-diagnostic-standard-timeout-retry-profile-v1"
 )
 TIMEOUT_RETRY_EVIDENCE_SCHEMA = (
     "mft-goal-diagnostic-standard-timeout-retry-evidence-v1"
+)
+OPERATIONAL_PRESSURE_RETRY_PROFILE_SCHEMA = (
+    "mft-goal-diagnostic-standard-operational-pressure-retry-profile-v1"
+)
+OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_SCHEMA = (
+    "mft-goal-diagnostic-standard-operational-pressure-after-timeout-"
+    "retry-profile-v1"
+)
+OPERATIONAL_PRESSURE_RETRY_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-operational-pressure-retry-evidence-v2"
+)
+OPERATIONAL_PRESSURE_ATTEMPT_EVIDENCE_SCHEMA = (
+    "mft-goal-diagnostic-standard-operational-pressure-attempt-evidence-v1"
+)
+OPERATIONAL_PRESSURE_EVENT_WINDOW_SCHEMA = (
+    "mft-goal-diagnostic-standard-operational-pressure-event-window-v1"
+)
+OPERATIONAL_PRESSURE_EVENT_WINDOW_LIMIT = 1000
+OPERATIONAL_PRESSURE_CLAIM_RETRY_GENERATION = "operational-pressure-r1"
+OPERATIONAL_PRESSURE_CLAIM_ROOT = Path(
+    "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
+    "operational_pressure_claims"
+)
+OPERATIONAL_PRESSURE_CLAIM_AUTHORITY_SHA256 = canonical_sha256(
+    {
+        "campaign_id": "mft-goal-20260726",
+        "goal_contract_schema": GOAL_CONTRACT_SCHEMA,
+        "hard_spec_sha256": GOAL_STAGE_SPEC_SHA256,
+        "temperature_contract_sha256": (
+            GOAL_TEMPERATURE_CONTRACT_SHA256
+        ),
+        "retry_generation": (
+            OPERATIONAL_PRESSURE_CLAIM_RETRY_GENERATION
+        ),
+    }
+)
+OPERATIONAL_PRESSURE_CLAIM_RECEIPT_SCHEMA = (
+    "mft-goal-operational-pressure-atomic-claim-receipt-v1"
+)
+OPERATIONAL_PRESSURE_SIBLING_GUARD_SCHEMA = (
+    "mft-goal-diagnostic-standard-operational-pressure-sibling-guard-v1"
+)
+OPERATIONAL_PRESSURE_FAILURE_CLASS = (
+    "scheduler_memory_pressure_hard_limit"
+)
+OPERATIONAL_PRESSURE_FAILURE_MESSAGE = (
+    "memory pressure hard limit after 3 attempts"
+)
+OPERATIONAL_PRESSURE_ATTEMPT_COUNT = 3
+TIMEOUT_STRICT_TASK_IDENTITY_GENERATION = (
+    "timeout-strict-r2-node-bound"
+)
+OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION = (
+    "operational-pressure-r1-placement-invariant"
 )
 SAME_ALLOCATION_PLACEMENT_SCHEMA = (
     "mft-goal-diagnostic-same-allocation-placement-v1"
@@ -323,6 +400,19 @@ def _aware_timestamp(value: Any, label: str) -> datetime:
         raise HandoffContractError(f"{label} is not ISO-8601") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise HandoffContractError(f"{label} lacks a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _scheduler_timestamp(value: Any, label: str) -> datetime:
+    text = str(value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HandoffContractError(
+            f"{label} is not a Scheduler timestamp"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
 
@@ -978,34 +1068,110 @@ def _artifact(
 
 
 def _profile_content(
-    *, timeout_retry: bool = False
+    *,
+    timeout_retry: bool = False,
+    operational_pressure_retry: bool = False,
+    operational_pressure_after_timeout_retry: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if sum(
+        bool(value)
+        for value in (
+            timeout_retry,
+            operational_pressure_retry,
+            operational_pressure_after_timeout_retry,
+        )
+    ) > 1:
+        raise HandoffContractError(
+            "diagnostic Standard retry profile semantics are mixed"
+        )
     path = (
-        TIMEOUT_RETRY_PROFILE_PATH if timeout_retry else PROFILE_PATH
+        TIMEOUT_RETRY_PROFILE_PATH
+        if timeout_retry
+        else (
+            OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_PATH
+            if operational_pressure_after_timeout_retry
+            else (
+                OPERATIONAL_PRESSURE_RETRY_PROFILE_PATH
+                if operational_pressure_retry
+                else PROFILE_PATH
+            )
+        )
     ).resolve(strict=True)
     profile = production._read_json(path)
-    _validate_profile(profile, timeout_retry=timeout_retry)
+    _validate_profile(
+        profile,
+        timeout_retry=timeout_retry,
+        operational_pressure_retry=operational_pressure_retry,
+        operational_pressure_after_timeout_retry=(
+            operational_pressure_after_timeout_retry
+        ),
+    )
     return profile, production._file_record(path)
 
 
 def _validate_profile(
-    profile: Mapping[str, Any], *, timeout_retry: bool = False
+    profile: Mapping[str, Any],
+    *,
+    timeout_retry: bool = False,
+    operational_pressure_retry: bool = False,
+    operational_pressure_after_timeout_retry: bool = False,
 ) -> None:
+    if sum(
+        bool(value)
+        for value in (
+            timeout_retry,
+            operational_pressure_retry,
+            operational_pressure_after_timeout_retry,
+        )
+    ) > 1:
+        raise HandoffContractError(
+            "diagnostic Standard retry profile semantics are mixed"
+        )
     production_profile, _source = production._profile_content("standard")
     expected_schema = (
         TIMEOUT_RETRY_PROFILE_SCHEMA
         if timeout_retry
-        else "mft-goal-diagnostic-standard-profile-v1"
+        else (
+            OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_PROFILE_SCHEMA
+            if operational_pressure_after_timeout_retry
+            else (
+                OPERATIONAL_PRESSURE_RETRY_PROFILE_SCHEMA
+                if operational_pressure_retry
+                else "mft-goal-diagnostic-standard-profile-v1"
+            )
+        )
     )
     expected_resources = (
-        TIMEOUT_RETRY_RESOURCES if timeout_retry else STANDARD_RESOURCES
+        TIMEOUT_RETRY_RESOURCES
+        if timeout_retry
+        else (
+            OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_RESOURCES
+            if operational_pressure_after_timeout_retry
+            else (
+                OPERATIONAL_PRESSURE_RETRY_RESOURCES
+                if operational_pressure_retry
+                else STANDARD_RESOURCES
+            )
+        )
     )
     expected_comment = (
         "Diagnostic-only eighth-symmetry Standard FEA timeout retry with "
         "retained AEDT project and AEDT results"
         if timeout_retry
-        else "Diagnostic-only eighth-symmetry Standard FEA with retained "
-        "AEDT project and AEDT results"
+        else (
+            "Diagnostic-only eighth-symmetry Standard FEA Scheduler "
+            "operational-pressure retry after one authenticated timeout "
+            "retry with retained AEDT project and AEDT results"
+            if operational_pressure_after_timeout_retry
+            else (
+                "Diagnostic-only eighth-symmetry Standard FEA Scheduler "
+                "operational-pressure retry with retained AEDT project and "
+                "AEDT results"
+                if operational_pressure_retry
+                else "Diagnostic-only eighth-symmetry Standard FEA with "
+                "retained AEDT project and AEDT results"
+            )
+        )
     )
     if (
         set(profile)
@@ -2479,13 +2645,34 @@ def create_plan(
 
 
 def _plan_is_timeout_retry(plan: Mapping[str, Any]) -> bool:
-    return "retry_of_timeout" in plan
+    return _plan_retry_kind(plan) == "timeout"
+
+
+def _plan_is_operational_pressure_retry(
+    plan: Mapping[str, Any],
+) -> bool:
+    return _plan_retry_kind(plan) == "operational_pressure"
+
+
+def _plan_retry_kind(plan: Mapping[str, Any]) -> str | None:
+    fields = {
+        "timeout": "retry_of_timeout",
+        "operational_pressure": "retry_of_operational_pressure",
+    }
+    present = [
+        kind for kind, field in fields.items() if field in plan
+    ]
+    if len(present) > 1:
+        raise HandoffContractError(
+            "diagnostic Standard retry ancestry semantics are mixed"
+        )
+    return present[0] if present else None
 
 
 def _strict_node_name(value: Any) -> str:
     if not isinstance(value, str):
         raise HandoffContractError(
-            "strict timeout retry node name is unsafe or empty"
+            "strict diagnostic retry node name is unsafe or empty"
         )
     node_name = str(value or "").strip()
     if (
@@ -2494,7 +2681,7 @@ def _strict_node_name(value: Any) -> str:
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", node_name) is None
     ):
         raise HandoffContractError(
-            "strict timeout retry node name is unsafe or empty"
+            "strict diagnostic retry node name is unsafe or empty"
         )
     return node_name
 
@@ -2503,7 +2690,17 @@ def _strict_node_plan_contract(
     node_name: str,
     *,
     scheduler_pin: Mapping[str, Any] | None = None,
+    task_identity_generation: str = (
+        TIMEOUT_STRICT_TASK_IDENTITY_GENERATION
+    ),
 ) -> dict[str, Any]:
+    if task_identity_generation not in {
+        TIMEOUT_STRICT_TASK_IDENTITY_GENERATION,
+        OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION,
+    }:
+        raise HandoffContractError(
+            "strict retry task identity generation is unsupported"
+        )
     pin = (
         _active_strict_node_scheduler_pin()
         if scheduler_pin is None
@@ -2522,7 +2719,7 @@ def _strict_node_plan_contract(
         "scheduler_cutover_receipt_sha256": pin[
             "cutover_receipt_sha256"
         ],
-        "task_identity_generation": "timeout-strict-r2-node-bound",
+        "task_identity_generation": task_identity_generation,
         "fallback_allocation_allowed": False,
         "api_submission_readback_required": True,
         "durable_get_readback_required": True,
@@ -2537,11 +2734,21 @@ def _strict_node_scheduler_pin(
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise HandoffContractError(
-            "strict timeout retry placement contract is absent"
+            "strict diagnostic retry placement contract is absent"
+        )
+    generation = value.get("task_identity_generation")
+    if generation not in {
+        TIMEOUT_STRICT_TASK_IDENTITY_GENERATION,
+        OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION,
+    }:
+        raise HandoffContractError(
+            "strict diagnostic retry placement contract drifted"
         )
     for pin in _accepted_strict_node_scheduler_pins():
         expected = _strict_node_plan_contract(
-            value.get("requested_node_name"), scheduler_pin=pin
+            value.get("requested_node_name"),
+            scheduler_pin=pin,
+            task_identity_generation=generation,
         )
         if value == expected:
             active = _active_strict_node_scheduler_pin()
@@ -2551,14 +2758,16 @@ def _strict_node_scheduler_pin(
                 )
             return pin
     raise HandoffContractError(
-        "strict timeout retry placement contract drifted"
+        "strict diagnostic retry placement contract drifted"
     )
 
 
 def _validate_strict_node_plan_contract(value: Any) -> dict[str, Any]:
     pin = _strict_node_scheduler_pin(value)
     return _strict_node_plan_contract(
-        value.get("requested_node_name"), scheduler_pin=pin
+        value.get("requested_node_name"),
+        scheduler_pin=pin,
+        task_identity_generation=value.get("task_identity_generation"),
     )
 
 
@@ -2568,19 +2777,357 @@ def _plan_strict_node_contract(
     value = plan.get("scheduler_strict_node_contract")
     if value is None:
         return None
-    if not _plan_is_timeout_retry(plan):
+    if _plan_retry_kind(plan) not in {
+        "timeout",
+        "operational_pressure",
+    }:
         raise HandoffContractError(
-            "strict node placement is restricted to timeout retries"
+            "strict node placement is restricted to diagnostic retries"
         )
     return _validate_strict_node_plan_contract(value)
 
 
-def _plan_resources(plan: Mapping[str, Any]) -> dict[str, int]:
-    return (
-        TIMEOUT_RETRY_RESOURCES
-        if _plan_is_timeout_retry(plan)
-        else STANDARD_RESOURCES
+def _operational_pressure_immediate_retry_kind(
+    plan: Mapping[str, Any],
+) -> str:
+    record = plan.get("retry_of_operational_pressure")
+    if not isinstance(record, Mapping):
+        raise HandoffContractError(
+            "diagnostic operational-pressure retry record is absent"
+        )
+    kind = record.get("immediate_retry_kind")
+    if kind not in {"none", "timeout"}:
+        raise HandoffContractError(
+            "operational-pressure immediate retry kind drifted"
+        )
+    return str(kind)
+
+
+def _operational_pressure_task_identity(
+    *,
+    logical_authority_task_id: int,
+    immediate_task_id: int,
+    candidate_physics_sha256: str,
+    immediate_retry_kind: str,
+) -> tuple[str, str]:
+    for value, label in (
+        (logical_authority_task_id, "logical authority task ID"),
+        (immediate_task_id, "immediate task ID"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise HandoffContractError(
+                f"operational-pressure {label} is invalid"
+            )
+    stem = production._require_sha(
+        candidate_physics_sha256,
+        "operational-pressure candidate physics SHA",
+    )[:12]
+    if immediate_retry_kind == "none":
+        if immediate_task_id != logical_authority_task_id:
+            raise HandoffContractError(
+                "direct operational-pressure authority task IDs differ"
+            )
+        return (
+            "mft-goal-diag-standard-pressure-r1-"
+            f"t{logical_authority_task_id}-{stem}",
+            "mft_goal_diag_standard_pressure_r1_"
+            f"t{logical_authority_task_id}_{stem}",
+        )
+    if immediate_retry_kind == "timeout":
+        if immediate_task_id == logical_authority_task_id:
+            raise HandoffContractError(
+                "compound operational-pressure ancestry collapsed"
+            )
+        return (
+            "mft-goal-diag-standard-pressure-after-timeout-r1-"
+            f"l{logical_authority_task_id}-{stem}",
+            "mft_goal_diag_standard_pressure_after_timeout_r1_"
+            f"l{logical_authority_task_id}_{stem}",
+        )
+    raise HandoffContractError(
+        "operational-pressure immediate retry kind drifted"
     )
+
+
+def _operational_pressure_sibling_name_prefix(
+    plan: Mapping[str, Any],
+) -> str:
+    record = plan.get("retry_of_operational_pressure")
+    if not isinstance(record, Mapping):
+        raise HandoffContractError(
+            "diagnostic operational-pressure retry record is absent"
+        )
+    logical_task_id = record.get("logical_authority_task_id")
+    if (
+        isinstance(logical_task_id, bool)
+        or not isinstance(logical_task_id, int)
+        or logical_task_id <= 0
+    ):
+        raise HandoffContractError(
+            "operational-pressure logical authority task ID is invalid"
+        )
+    if record.get("immediate_retry_kind") == "none":
+        return (
+            "mft-goal-diag-standard-pressure-r1-"
+            f"t{logical_task_id}-"
+        )
+    if record.get("immediate_retry_kind") == "timeout":
+        return (
+            "mft-goal-diag-standard-pressure-after-timeout-r1-"
+            f"l{logical_task_id}-"
+        )
+    raise HandoffContractError(
+        "operational-pressure immediate retry kind drifted"
+    )
+
+
+def _plan_resources(plan: Mapping[str, Any]) -> dict[str, int]:
+    kind = _plan_retry_kind(plan)
+    if kind == "timeout":
+        return TIMEOUT_RETRY_RESOURCES
+    if kind == "operational_pressure":
+        if _operational_pressure_immediate_retry_kind(plan) == "timeout":
+            return OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_RESOURCES
+        return OPERATIONAL_PRESSURE_RETRY_RESOURCES
+    return STANDARD_RESOURCES
+
+
+def initialize_operational_pressure_claim_root(
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Initialize or reauthenticate the one frozen campaign claim root."""
+
+    target = (
+        OPERATIONAL_PRESSURE_CLAIM_ROOT
+        if root is None
+        else Path(root)
+    )
+    try:
+        return atomic_claim.initialize_claim_root(
+            target,
+            campaign_id="mft-goal-20260726",
+            campaign_authority_sha256=(
+                OPERATIONAL_PRESSURE_CLAIM_AUTHORITY_SHA256
+            ),
+        )
+    except atomic_claim.ClaimContractError as exc:
+        raise HandoffContractError(
+            "operational-pressure atomic claim root is unavailable"
+        ) from exc
+
+
+def _load_operational_pressure_claim_authority() -> dict[str, Any]:
+    try:
+        authority = atomic_claim.load_claim_root(
+            OPERATIONAL_PRESSURE_CLAIM_ROOT
+        )
+    except atomic_claim.ClaimContractError as exc:
+        raise HandoffContractError(
+            "operational-pressure atomic claim root is unavailable"
+        ) from exc
+    if (
+        authority.get("campaign_id") != "mft-goal-20260726"
+        or authority.get("campaign_authority_sha256")
+        != OPERATIONAL_PRESSURE_CLAIM_AUTHORITY_SHA256
+    ):
+        raise HandoffContractError(
+            "operational-pressure atomic claim authority drifted"
+        )
+    return authority
+
+
+def _operational_pressure_claim_reference(
+    *,
+    candidate_physics_sha256: str,
+    logical_authority_task_id: int,
+) -> dict[str, Any]:
+    authority = _load_operational_pressure_claim_authority()
+    try:
+        return atomic_claim.build_claim_reference(
+            authority,
+            candidate_physics_sha256=production._require_sha(
+                candidate_physics_sha256,
+                "operational-pressure candidate physics SHA",
+            ),
+            logical_authority_task_id=logical_authority_task_id,
+            retry_generation=(
+                OPERATIONAL_PRESSURE_CLAIM_RETRY_GENERATION
+            ),
+        )
+    except atomic_claim.ClaimContractError as exc:
+        raise HandoffContractError(
+            "operational-pressure atomic claim reference is invalid"
+        ) from exc
+
+
+def _validate_operational_pressure_claim_reference(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    record = plan.get("retry_of_operational_pressure")
+    reference = plan.get("operational_pressure_atomic_claim_reference")
+    if not isinstance(record, Mapping) or not isinstance(
+        reference, Mapping
+    ):
+        raise HandoffContractError(
+            "operational-pressure atomic claim reference is absent"
+        )
+    authority = _load_operational_pressure_claim_authority()
+    try:
+        normalized = atomic_claim.validate_claim_reference(
+            reference, authority
+        )
+    except atomic_claim.ClaimContractError as exc:
+        raise HandoffContractError(
+            "operational-pressure atomic claim reference drifted"
+        ) from exc
+    if (
+        normalized.get("candidate_physics_sha256")
+        != plan.get("candidate_physics_sha256")
+        or normalized.get("logical_authority_task_id")
+        != record.get("logical_authority_task_id")
+        or normalized.get("retry_generation")
+        != OPERATIONAL_PRESSURE_CLAIM_RETRY_GENERATION
+    ):
+        raise HandoffContractError(
+            "operational-pressure atomic claim plan binding drifted"
+        )
+    return normalized
+
+
+def _operational_pressure_claim_winner(
+    plan_path: Path,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    record = plan["retry_of_operational_pressure"]
+    stage = plan["stage"]
+    return {
+        "immediate_task_id": record["retry_of_task_id"],
+        "immediate_retry_kind": record["immediate_retry_kind"],
+        "plan_payload_sha256": plan["payload_sha256"],
+        "plan_file_sha256": production._sha256_file(
+            plan_path.resolve(strict=True)
+        ),
+        "profile_sha256": stage["profile_sha256"],
+        "resources": {
+            **copy.deepcopy(_plan_resources(plan)),
+            "memory_mb": 32768,
+        },
+        "task_name": stage["task_name"],
+        "dedupe_key": stage["retained_aedt_bundle"]["dedupe_key"],
+    }
+
+
+def _operational_pressure_claim_task_evidence(
+    task: Mapping[str, Any],
+    pending: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the full canonical Scheduler API identity used by a claim."""
+
+    if not isinstance(task, Mapping) or not isinstance(pending, Mapping):
+        raise atomic_claim.ClaimContractError(
+            "operational-pressure claim task evidence is absent"
+        )
+    normalized = copy.deepcopy(dict(task))
+    winner = pending.get("winner")
+    task_id = normalized.get("task_id", normalized.get("id"))
+    status = normalized.get("status")
+    state = normalized.get("state")
+    if (
+        not isinstance(winner, Mapping)
+        or isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or normalized.get("name") != winner.get("task_name")
+        or normalized.get("dedupe_key") != winner.get("dedupe_key")
+        or normalized.get("project") != scheduler_client.MFT_PROJECT
+        or normalized.get("cpus") != winner["resources"]["cpus"]
+        or normalized.get("memory_mb")
+        != winner["resources"]["memory_mb"]
+        or normalized.get("timeout_seconds")
+        != winner["resources"]["timeout_seconds"]
+        or normalized.get("aedt_backend") != "standalone"
+        or not isinstance(status, str)
+        or not status.strip()
+        or not isinstance(state, str)
+        or not state.strip()
+    ):
+        raise atomic_claim.ClaimContractError(
+            "operational-pressure claim task identity drifted"
+        )
+    return normalized
+
+
+def _operational_pressure_claim_receipt(
+    *,
+    acquisition_status: str,
+    finalized_claim: Mapping[str, Any],
+) -> dict[str, Any]:
+    if acquisition_status not in {
+        "fresh_pending",
+        "existing_pending",
+        "existing_finalized",
+    }:
+        raise HandoffContractError(
+            "operational-pressure claim acquisition status drifted"
+        )
+    return {
+        "schema_version": OPERATIONAL_PRESSURE_CLAIM_RECEIPT_SCHEMA,
+        "acquisition_status": acquisition_status,
+        "fresh_claim_authorized_scheduler_submit_call": (
+            acquisition_status == "fresh_pending"
+        ),
+        "recovered_without_scheduler_submit_call": (
+            acquisition_status != "fresh_pending"
+        ),
+        "finalized_claim": copy.deepcopy(dict(finalized_claim)),
+    }
+
+
+def _validate_operational_pressure_claim_receipt(
+    value: Any,
+    *,
+    plan_path: Path,
+    plan: Mapping[str, Any],
+    task_id: int,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "acquisition_status",
+        "fresh_claim_authorized_scheduler_submit_call",
+        "recovered_without_scheduler_submit_call",
+        "finalized_claim",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected_fields
+        or value.get("schema_version")
+        != OPERATIONAL_PRESSURE_CLAIM_RECEIPT_SCHEMA
+    ):
+        raise HandoffContractError(
+            "operational-pressure atomic claim receipt is malformed"
+        )
+    reference = _validate_operational_pressure_claim_reference(plan)
+    winner = _operational_pressure_claim_winner(plan_path, plan)
+    try:
+        finalized = atomic_claim.validate_finalized_claim(
+            OPERATIONAL_PRESSURE_CLAIM_ROOT,
+            reference,
+            claim=value.get("finalized_claim"),
+            expected_winner=winner,
+        )
+    except atomic_claim.ClaimContractError as exc:
+        raise HandoffContractError(
+            "operational-pressure finalized claim authentication failed"
+        ) from exc
+    normalized = _operational_pressure_claim_receipt(
+        acquisition_status=str(value.get("acquisition_status") or ""),
+        finalized_claim=finalized,
+    )
+    if normalized != value or finalized.get("task_id") != task_id:
+        raise HandoffContractError(
+            "operational-pressure atomic claim receipt drifted"
+        )
+    return normalized
 
 
 def _recorded_external_file(record: Any, label: str) -> Path:
@@ -2662,6 +3209,707 @@ def _timeout_failure_evidence(
     return evidence
 
 
+def _operational_pressure_events(
+    events: Any,
+    *,
+    task_id: int,
+    task_name: str,
+    task_created_at: str,
+    task_account_name: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(events, Sequence)
+        or isinstance(events, (str, bytes, bytearray))
+        or not events
+        or len(events) > OPERATIONAL_PRESSURE_EVENT_WINDOW_LIMIT
+    ):
+        raise HandoffContractError(
+            "Scheduler operational-pressure event evidence is absent"
+        )
+    task_created = _scheduler_timestamp(
+        task_created_at,
+        "operational-pressure task created_at",
+    )
+    normalized = []
+    for raw in events:
+        if not isinstance(raw, Mapping):
+            raise HandoffContractError(
+                "Scheduler operational-pressure event window is malformed"
+            )
+        event = {
+            "id": raw.get("id"),
+            "created_at": raw.get("created_at"),
+            "kind": raw.get("kind"),
+            "entity_type": raw.get("entity_type"),
+            "entity_id": str(raw.get("entity_id") or ""),
+            "account_name": raw.get("account_name"),
+            "message": raw.get("message"),
+        }
+        if (
+            isinstance(event["id"], bool)
+            or not isinstance(event["id"], int)
+            or event["id"] <= 0
+            or not str(event["created_at"] or "").strip()
+            or not str(event["kind"] or "").strip()
+            or not isinstance(event["entity_type"], str)
+            or not isinstance(event["message"], str)
+        ):
+            raise HandoffContractError(
+                "Scheduler operational-pressure event identity drifted"
+            )
+        _scheduler_timestamp(
+            event["created_at"],
+            "operational-pressure event created_at",
+        )
+        normalized.append(event)
+    ids = [event["id"] for event in normalized]
+    timestamps = [
+        _scheduler_timestamp(
+            event["created_at"],
+            "operational-pressure event created_at",
+        )
+        for event in normalized
+    ]
+    if (
+        len(set(ids)) != len(ids)
+        or any(left <= right for left, right in zip(ids, ids[1:]))
+        or any(
+            left < right
+            for left, right in zip(timestamps, timestamps[1:])
+        )
+    ):
+        raise HandoffContractError(
+            "Scheduler operational-pressure event window ordering drifted"
+        )
+    oldest_timestamp = timestamps[-1]
+    if (
+        len(normalized) == OPERATIONAL_PRESSURE_EVENT_WINDOW_LIMIT
+        and oldest_timestamp > task_created
+    ):
+        raise HandoffContractError(
+            "Scheduler operational-pressure event window does not cover the "
+            "task lifetime"
+        )
+    coverage_method = (
+        "response_below_api_limit"
+        if len(normalized) < OPERATIONAL_PRESSURE_EVENT_WINDOW_LIMIT
+        else "oldest_event_not_after_task_created_at"
+    )
+    event_window = {
+        "schema_version": OPERATIONAL_PRESSURE_EVENT_WINDOW_SCHEMA,
+        "requested_limit": OPERATIONAL_PRESSURE_EVENT_WINDOW_LIMIT,
+        "response_count": len(normalized),
+        "newest_event_id": normalized[0]["id"],
+        "newest_event_created_at": normalized[0]["created_at"],
+        "oldest_event_id": normalized[-1]["id"],
+        "oldest_event_created_at": normalized[-1]["created_at"],
+        "task_created_at": task_created_at,
+        "coverage_method": coverage_method,
+        "strict_unique_descending_event_ids": True,
+        "nonincreasing_event_timestamps": True,
+        "full_window_sha256": canonical_sha256(normalized),
+        "events": normalized,
+    }
+    task_events = [
+        event
+        for event in normalized
+        if event["entity_type"] == "task"
+        and event["entity_id"] == str(task_id)
+    ]
+    expected_requeue_messages = {
+        attempt: (
+            f"task {task_name} requeued after memory-pressure kill "
+            f"(attempt {attempt}/{OPERATIONAL_PRESSURE_ATTEMPT_COUNT})"
+        )
+        for attempt in (1, 2)
+    }
+    requeues = []
+    for attempt, message in expected_requeue_messages.items():
+        matches = [
+            event
+            for event in task_events
+            if event["kind"] == "task_requeued"
+            and event["message"] == message
+        ]
+        if len(matches) != 1:
+            raise HandoffContractError(
+                "Scheduler operational-pressure requeue attempt evidence "
+                f"{attempt}/3 is absent or ambiguous"
+            )
+        requeues.append(matches[0])
+    cleanup_pattern = re.compile(
+        r"^cleaned [A-Za-z0-9_.-]+ in slurm_scheduler/runs after task "
+        + re.escape(task_name)
+        + r" ended \(failed\)$"
+    )
+    cleanups = [
+        event
+        for event in task_events
+        if event["kind"] == "task_cleanup"
+        and isinstance(event["message"], str)
+        and cleanup_pattern.fullmatch(event["message"]) is not None
+    ]
+    if len(cleanups) != 1:
+        raise HandoffContractError(
+            "Scheduler operational-pressure terminal cleanup evidence is "
+            "absent or ambiguous"
+        )
+    lifecycle_events = [
+        event
+        for event in task_events
+        if event["kind"] in {"task_requeued", "task_cleanup"}
+    ]
+    accepted_event_ids = {
+        event["id"] for event in [*requeues, cleanups[0]]
+    }
+    if (
+        len(accepted_event_ids) != 3
+        or len(lifecycle_events) != 3
+        or {event["id"] for event in lifecycle_events}
+        != accepted_event_ids
+    ):
+        raise HandoffContractError(
+            "Scheduler operational-pressure lifecycle event set drifted"
+        )
+    if (
+        any(
+            not str(event["account_name"] or "").strip()
+            for event in requeues
+        )
+        or cleanups[0]["account_name"] != task_account_name
+        or not (
+            task_created
+            <= _scheduler_timestamp(
+                requeues[0]["created_at"],
+                "operational-pressure requeue 1 created_at",
+            )
+            and
+            _scheduler_timestamp(
+                requeues[0]["created_at"],
+                "operational-pressure requeue 1 created_at",
+            )
+            < _scheduler_timestamp(
+                requeues[1]["created_at"],
+                "operational-pressure requeue 2 created_at",
+            )
+            < _scheduler_timestamp(
+                cleanups[0]["created_at"],
+                "operational-pressure cleanup created_at",
+            )
+        )
+    ):
+        raise HandoffContractError(
+            "Scheduler operational-pressure attempt chronology/account "
+            "binding drifted"
+        )
+    return {
+        "requeue_events": requeues,
+        "terminal_cleanup_event": cleanups[0],
+        "event_window": event_window,
+    }
+
+
+def _scheduler_task_events(
+    *,
+    scheduler_url: str,
+    task_id: int,
+) -> list[dict[str, Any]]:
+    url = (
+        f"{scheduler_url.rstrip('/')}/api/events?"
+        f"limit={OPERATIONAL_PRESSURE_EVENT_WINDOW_LIMIT}"
+    )
+    request = production.urllib.request.Request(
+        url, headers={"Accept": "application/json"}
+    )
+    try:
+        with production.urllib.request.urlopen(
+            request, timeout=20
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise HandoffContractError(
+            "Scheduler operational-pressure events are unavailable"
+        ) from exc
+    if not isinstance(payload, list):
+        raise HandoffContractError(
+            "Scheduler operational-pressure event response is malformed"
+        )
+    return [dict(event) for event in payload]
+
+
+def _scheduler_project_tasks(
+    *,
+    scheduler_url: str,
+    project: str,
+    task_name: str,
+) -> list[dict[str, Any]]:
+    if project != scheduler_client.MFT_PROJECT:
+        raise HandoffContractError(
+            "operational-pressure sibling guard project drifted"
+        )
+    query = production.urllib.parse.urlencode(
+        {
+            "project": project,
+            "name_prefix": task_name,
+            "limit": 10000,
+        }
+    )
+    url = f"{scheduler_url.rstrip('/')}/api/tasks?{query}"
+    request = production.urllib.request.Request(
+        url, headers={"Accept": "application/json"}
+    )
+    try:
+        with production.urllib.request.urlopen(
+            request, timeout=20
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise HandoffContractError(
+            "Scheduler project task inventory is unavailable"
+        ) from exc
+    if not isinstance(payload, list):
+        raise HandoffContractError(
+            "Scheduler project task inventory is malformed"
+        )
+    if len(payload) >= 10000:
+        raise HandoffContractError(
+            "Scheduler sibling inventory may be truncated"
+        )
+    return [
+        dict(row) for row in payload if isinstance(row, Mapping)
+    ]
+
+
+def _operational_pressure_sibling_snapshot(
+    rows: Any,
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        not isinstance(rows, Sequence)
+        or isinstance(rows, (str, bytes, bytearray))
+    ):
+        raise HandoffContractError(
+            "operational-pressure sibling task inventory is absent"
+        )
+    stage = plan["stage"]
+    expected_name = stage["task_name"]
+    expected_dedupe = stage["retained_aedt_bundle"]["dedupe_key"]
+    record = plan["retry_of_operational_pressure"]
+    expected_resources = _plan_resources(plan)
+    sibling_name_prefix = _operational_pressure_sibling_name_prefix(
+        plan
+    )
+    normalized = []
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        name = str(raw.get("name") or "")
+        dedupe = str(raw.get("dedupe_key") or "")
+        same_candidate_retry = name.startswith(sibling_name_prefix)
+        if not (
+            name == expected_name
+            or dedupe == expected_dedupe
+            or same_candidate_retry
+        ):
+            continue
+        # Preserve the full public API row in the durable snapshot.  The
+        # normalized aliases below make its canonical submission identity
+        # explicit without discarding Scheduler evidence needed for crash
+        # recovery or strict-placement authentication.
+        row = copy.deepcopy(dict(raw))
+        row.update(
+            {
+                "task_id": raw.get("task_id", raw.get("id")),
+                "name": name,
+                "dedupe_key": dedupe,
+                "status": raw.get("status"),
+                "state": raw.get("state"),
+                "project": raw.get("project"),
+                "cpus": raw.get("cpus"),
+                "memory_mb": raw.get("memory_mb"),
+                "timeout_seconds": raw.get("timeout_seconds"),
+                "aedt_backend": raw.get("aedt_backend"),
+                "requested_node_name": raw.get(
+                    "requested_node_name", raw.get("node_name")
+                ),
+                "requested_node_name_policy": raw.get(
+                    "requested_node_name_policy",
+                    raw.get("node_name_policy"),
+                ),
+                "same_node_as_task_id": raw.get(
+                    "same_node_as_task_id", 0
+                ),
+            }
+        )
+        if (
+            isinstance(row["task_id"], bool)
+            or not isinstance(row["task_id"], int)
+            or row["task_id"] <= 0
+            or row["name"] != expected_name
+            or row["dedupe_key"] != expected_dedupe
+            or row["project"] != scheduler_client.MFT_PROJECT
+            or row["cpus"]
+            != expected_resources["cpus"]
+            or row["memory_mb"] != 32768
+            or row["timeout_seconds"]
+            != expected_resources["timeout_seconds"]
+            or row["aedt_backend"] != "standalone"
+        ):
+            raise HandoffContractError(
+                "operational-pressure sibling identity collision detected"
+            )
+        normalized.append(row)
+    normalized.sort(key=lambda row: row["task_id"])
+    if len(normalized) > 1:
+        raise HandoffContractError(
+            "more than one operational-pressure retry sibling exists"
+        )
+    identity = {
+        "logical_authority_task_id": record[
+            "logical_authority_task_id"
+        ],
+        "immediate_task_id": record["retry_of_task_id"],
+        "immediate_retry_kind": record["immediate_retry_kind"],
+        "name_prefix": sibling_name_prefix,
+        "candidate_physics_sha256": plan[
+            "candidate_physics_sha256"
+        ],
+        "task_name": expected_name,
+        "workdir": stage["workdir"],
+        "dedupe_key": expected_dedupe,
+        "resources": copy.deepcopy(expected_resources),
+    }
+    snapshot = {
+        "schema_version": OPERATIONAL_PRESSURE_SIBLING_GUARD_SCHEMA,
+        "identity": identity,
+        "matching_task_count": len(normalized),
+        "matching_tasks": normalized,
+    }
+    snapshot["snapshot_sha256"] = canonical_sha256(snapshot)
+    return snapshot
+
+
+def _operational_pressure_sibling_contract(
+    *,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    task_id: int,
+) -> dict[str, Any]:
+    if (
+        before.get("identity") != after.get("identity")
+        or before.get("matching_task_count") not in {0, 1}
+        or after.get("matching_task_count") != 1
+        or after.get("matching_tasks", [{}])[0].get("task_id")
+        != task_id
+        or (
+            before.get("matching_task_count") == 1
+            and before.get("matching_tasks", [{}])[0].get("task_id")
+            != task_id
+        )
+    ):
+        raise HandoffContractError(
+            "operational-pressure sibling identity changed during "
+            "submission"
+        )
+    return {
+        "schema_version": OPERATIONAL_PRESSURE_SIBLING_GUARD_SCHEMA,
+        "before_submission": copy.deepcopy(before),
+        "after_submission": copy.deepcopy(after),
+        "exactly_one_sibling_after_submission": True,
+    }
+
+
+def _validate_operational_pressure_sibling_contract(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value)
+        != {
+            "schema_version",
+            "before_submission",
+            "after_submission",
+            "exactly_one_sibling_after_submission",
+        }
+        or value.get("schema_version")
+        != OPERATIONAL_PRESSURE_SIBLING_GUARD_SCHEMA
+        or value.get("exactly_one_sibling_after_submission") is not True
+    ):
+        raise HandoffContractError(
+            "operational-pressure sibling guard receipt drifted"
+        )
+    before = value.get("before_submission")
+    after = value.get("after_submission")
+    if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+        raise HandoffContractError(
+            "operational-pressure sibling snapshots are absent"
+        )
+    for snapshot in (before, after):
+        unsigned = dict(snapshot)
+        digest = unsigned.pop("snapshot_sha256", None)
+        if (
+            snapshot.get("schema_version")
+            != OPERATIONAL_PRESSURE_SIBLING_GUARD_SCHEMA
+            or canonical_sha256(unsigned) != digest
+        ):
+            raise HandoffContractError(
+                "operational-pressure sibling snapshot drifted"
+            )
+    normalized = _operational_pressure_sibling_contract(
+        before=before,
+        after=after,
+        task_id=int(submission["task_id"]),
+    )
+    if normalized != value:
+        raise HandoffContractError(
+            "operational-pressure sibling guard receipt drifted"
+        )
+    expected_identity = {
+        "logical_authority_task_id": plan[
+            "retry_of_operational_pressure"
+        ]["logical_authority_task_id"],
+        "immediate_task_id": plan[
+            "retry_of_operational_pressure"
+        ]["retry_of_task_id"],
+        "immediate_retry_kind": plan[
+            "retry_of_operational_pressure"
+        ]["immediate_retry_kind"],
+        "name_prefix": _operational_pressure_sibling_name_prefix(plan),
+        "candidate_physics_sha256": plan[
+            "candidate_physics_sha256"
+        ],
+        "task_name": plan["stage"]["task_name"],
+        "workdir": plan["stage"]["workdir"],
+        "dedupe_key": plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+        "resources": copy.deepcopy(_plan_resources(plan)),
+    }
+    if before.get("identity") != expected_identity:
+        raise HandoffContractError(
+            "operational-pressure sibling guard plan identity drifted"
+        )
+    return normalized
+
+
+def _operational_pressure_failure_evidence(
+    snapshot: Mapping[str, Any],
+    *,
+    submission: Mapping[str, Any],
+    events: Any,
+) -> dict[str, Any]:
+    task_api_evidence = {
+        "schema_version": OPERATIONAL_PRESSURE_RETRY_EVIDENCE_SCHEMA,
+        "task_id": snapshot.get("task_id", snapshot.get("id")),
+        "name": snapshot.get("name"),
+        "status": snapshot.get("status"),
+        "state": snapshot.get("state"),
+        "exit_code": snapshot.get("exit_code"),
+        "failure_message": snapshot.get("failure_message"),
+        "timeout_seconds": snapshot.get("timeout_seconds"),
+        "slurm_job_id": str(snapshot.get("slurm_job_id") or ""),
+        "allocation_id": snapshot.get(
+            "allocation_id", snapshot.get("assigned_allocation")
+        ),
+        "account_name": snapshot.get("account_name"),
+        "actual_node_name": snapshot.get("actual_node_name"),
+        "cpus": snapshot.get("cpus"),
+        "memory_mb": snapshot.get("memory_mb"),
+        "aedt_backend": snapshot.get("aedt_backend"),
+        "project": snapshot.get("project"),
+        "dedupe_key": snapshot.get("dedupe_key"),
+        "remote_cwd": snapshot.get("remote_cwd"),
+        "remote_dir": snapshot.get("remote_dir"),
+        "created_at": snapshot.get("created_at"),
+        "started_at": snapshot.get("started_at"),
+        "finished_at": snapshot.get("finished_at"),
+    }
+    api_events = _operational_pressure_events(
+        events,
+        task_id=int(submission["task_id"]),
+        task_name=str(submission["task_name"]),
+        task_created_at=str(task_api_evidence["created_at"] or ""),
+        task_account_name=str(task_api_evidence["account_name"] or ""),
+    )
+    evidence = {
+        **task_api_evidence,
+        "attempt_evidence": {
+            "schema_version": (
+                OPERATIONAL_PRESSURE_ATTEMPT_EVIDENCE_SCHEMA
+            ),
+            "attempt_count": OPERATIONAL_PRESSURE_ATTEMPT_COUNT,
+            "task_api_sha256": canonical_sha256(task_api_evidence),
+            "api_requeue_events": api_events["requeue_events"],
+            "api_terminal_cleanup_event": api_events[
+                "terminal_cleanup_event"
+            ],
+            "api_event_window": api_events["event_window"],
+            "events_api_sha256": canonical_sha256(api_events),
+        },
+    }
+    attempt_evidence = evidence["attempt_evidence"]
+    if (
+        evidence["task_id"] != submission["task_id"]
+        or evidence["name"] != submission["task_name"]
+        or evidence["status"] != "failed"
+        or evidence["state"] != "failed"
+        or evidence["exit_code"] is not None
+        or evidence["failure_message"]
+        != OPERATIONAL_PRESSURE_FAILURE_MESSAGE
+        or not evidence["slurm_job_id"].isdigit()
+        or isinstance(evidence["allocation_id"], bool)
+        or not isinstance(evidence["allocation_id"], int)
+        or evidence["allocation_id"] <= 0
+        or not str(evidence["account_name"] or "").strip()
+        or not str(evidence["actual_node_name"] or "").strip()
+        or evidence["cpus"] != STANDARD_RESOURCES["cpus"]
+        or evidence["memory_mb"] != 32768
+        or evidence["timeout_seconds"]
+        != submission["resources"]["timeout_seconds"]
+        or evidence["aedt_backend"] != "standalone"
+        or evidence["project"] != scheduler_client.MFT_PROJECT
+        or evidence["dedupe_key"] != submission["dedupe_key"]
+        or not str(evidence["remote_cwd"] or "").strip()
+        or not str(evidence["remote_dir"] or "").strip()
+        or not str(evidence["created_at"] or "").strip()
+        or not str(evidence["started_at"] or "").strip()
+        or not str(evidence["finished_at"] or "").strip()
+        or attempt_evidence["task_api_sha256"]
+        != canonical_sha256(task_api_evidence)
+        or attempt_evidence["events_api_sha256"]
+        != canonical_sha256(api_events)
+        or not (
+            _scheduler_timestamp(
+                evidence["created_at"],
+                "operational-pressure task created_at",
+            )
+            <= _scheduler_timestamp(
+                attempt_evidence["api_requeue_events"][0]["created_at"],
+                "operational-pressure requeue 1 created_at",
+            )
+            < _scheduler_timestamp(
+                attempt_evidence["api_requeue_events"][1]["created_at"],
+                "operational-pressure requeue 2 created_at",
+            )
+            < _scheduler_timestamp(
+                evidence["started_at"],
+                "operational-pressure task started_at",
+            )
+            <= _scheduler_timestamp(
+                evidence["finished_at"],
+                "operational-pressure task finished_at",
+            )
+            < _scheduler_timestamp(
+                attempt_evidence["api_terminal_cleanup_event"][
+                    "created_at"
+                ],
+                "operational-pressure cleanup created_at",
+            )
+        )
+    ):
+        raise HandoffContractError(
+            "diagnostic Standard operational-pressure retry requires the "
+            "exact failed Scheduler task and complete 3-attempt API evidence"
+        )
+    return evidence
+
+
+def _validate_operational_pressure_execution(
+    execution: Any,
+    *,
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(execution, Mapping):
+        raise HandoffContractError(
+            "diagnostic operational-pressure execution evidence is absent"
+        )
+    attempt = execution.get("attempt_evidence")
+    if (
+        not isinstance(attempt, Mapping)
+        or set(attempt)
+        != {
+            "schema_version",
+            "attempt_count",
+            "task_api_sha256",
+            "api_requeue_events",
+            "api_terminal_cleanup_event",
+            "api_event_window",
+            "events_api_sha256",
+        }
+        or attempt.get("schema_version")
+        != OPERATIONAL_PRESSURE_ATTEMPT_EVIDENCE_SCHEMA
+        or attempt.get("attempt_count")
+        != OPERATIONAL_PRESSURE_ATTEMPT_COUNT
+    ):
+        raise HandoffContractError(
+            "diagnostic operational-pressure attempt evidence drifted"
+        )
+    normalized = _operational_pressure_failure_evidence(
+        execution,
+        submission=submission,
+        events=(
+            attempt.get("api_event_window", {}).get("events", [])
+            if isinstance(attempt.get("api_event_window"), Mapping)
+            else []
+        ),
+    )
+    if normalized != execution:
+        raise HandoffContractError(
+            "diagnostic operational-pressure execution evidence drifted"
+        )
+    return normalized
+
+
+def _read_operational_pressure_failure(
+    *,
+    scheduler_url: str,
+    submission: Mapping[str, Any],
+    task_reader: Any,
+    event_reader: Any,
+) -> dict[str, Any]:
+    task_id = int(submission["task_id"])
+    task_before = task_reader(
+        scheduler_url=scheduler_url,
+        task_id=task_id,
+    )
+    event_window = event_reader(
+        scheduler_url=scheduler_url,
+        task_id=task_id,
+    )
+    task_after = task_reader(
+        scheduler_url=scheduler_url,
+        task_id=task_id,
+    )
+    before = _operational_pressure_failure_evidence(
+        task_before,
+        submission=submission,
+        events=event_window,
+    )
+    after = _operational_pressure_failure_evidence(
+        task_after,
+        submission=submission,
+        events=event_window,
+    )
+    if before != after:
+        raise HandoffContractError(
+            "Scheduler operational-pressure task changed during API "
+            "evidence capture"
+        )
+    return before
+
+
 def _validate_timeout_retry_record(
     plan: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -2696,9 +3944,9 @@ def _validate_timeout_retry_record(
     original_plan, original_params, original_selected = _load_plan(
         original_plan_path
     )
-    if _plan_is_timeout_retry(original_plan):
+    if _plan_retry_kind(original_plan) is not None:
         raise HandoffContractError(
-            "a timeout retry cannot be based on another timeout retry"
+            "a timeout retry cannot be based on another diagnostic retry"
         )
     original_submission_path = _recorded_external_file(
         record["original_submission"], "original diagnostic submission"
@@ -2742,6 +3990,140 @@ def _validate_timeout_retry_record(
     return original_plan, original_submission, execution
 
 
+def _validate_operational_pressure_retry_record(
+    plan: Mapping[str, Any],
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    record = plan.get("retry_of_operational_pressure")
+    expected_fields = {
+        "schema_version",
+        "retry_of_task_id",
+        "logical_authority_task_id",
+        "immediate_retry_kind",
+        "immediate_parent_ancestry_sha256",
+        "original_plan",
+        "original_plan_payload_sha256",
+        "original_submission",
+        "original_submission_payload_sha256",
+        "original_task_execution",
+        "original_task_execution_sha256",
+        "scheduler_url",
+        "failure_class",
+        "failure_message",
+        "attempt_count",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != expected_fields
+        or record.get("schema_version")
+        != OPERATIONAL_PRESSURE_RETRY_EVIDENCE_SCHEMA
+        or record.get("scheduler_url") != DIAGNOSTIC_SCHEDULER_URL
+        or record.get("failure_class")
+        != OPERATIONAL_PRESSURE_FAILURE_CLASS
+        or record.get("failure_message")
+        != OPERATIONAL_PRESSURE_FAILURE_MESSAGE
+        or record.get("attempt_count")
+        != OPERATIONAL_PRESSURE_ATTEMPT_COUNT
+    ):
+        raise HandoffContractError(
+            "diagnostic Standard operational-pressure retry record drifted"
+        )
+    original_plan_path = _recorded_external_file(
+        record["original_plan"], "original diagnostic plan"
+    )
+    original_plan, _original_params, _original_selected = _load_plan(
+        original_plan_path
+    )
+    immediate_retry_kind = _plan_retry_kind(original_plan)
+    recorded_immediate_kind = record.get("immediate_retry_kind")
+    if immediate_retry_kind not in {None, "timeout"} or (
+        recorded_immediate_kind
+        != ("timeout" if immediate_retry_kind == "timeout" else "none")
+    ):
+        raise HandoffContractError(
+            "operational-pressure retry ancestry exceeds the bounded "
+            "direct-or-timeout chain"
+        )
+    original_submission_path = _recorded_external_file(
+        record["original_submission"], "original diagnostic submission"
+    )
+    original_submission = _load_submission(
+        original_submission_path, plan=original_plan
+    )
+    if immediate_retry_kind == "timeout":
+        (
+            logical_plan,
+            logical_submission,
+            _timeout_execution,
+        ) = _validate_timeout_retry_record(original_plan)
+        expected_parent_ancestry_sha256 = canonical_sha256(
+            original_plan["retry_of_timeout"]
+        )
+    else:
+        logical_plan = original_plan
+        logical_submission = original_submission
+        expected_parent_ancestry_sha256 = None
+    execution = _validate_operational_pressure_execution(
+        record.get("original_task_execution"),
+        submission=original_submission,
+    )
+    if (
+        record.get("retry_of_task_id") != original_submission["task_id"]
+        or record.get("logical_authority_task_id")
+        != logical_submission["task_id"]
+        or record.get("immediate_parent_ancestry_sha256")
+        != expected_parent_ancestry_sha256
+        or record.get("original_plan_payload_sha256")
+        != original_plan["payload_sha256"]
+        or record.get("original_submission_payload_sha256")
+        != original_submission["payload_sha256"]
+        or canonical_sha256(execution)
+        != record.get("original_task_execution_sha256")
+        or (
+            immediate_retry_kind == "timeout"
+            and original_submission["task_id"]
+            == logical_submission["task_id"]
+        )
+        or any(
+            plan.get(name) != authority_plan.get(name)
+            for authority_plan in (original_plan, logical_plan)
+            for name in (
+                "campaign_id",
+                "goal_contract_schema",
+                "hard_spec",
+                "hard_spec_sha256",
+                "temperature_contract_sha256",
+                "solver_revision",
+                "library_revision",
+                "candidate_physics_sha256",
+                "search_authority_sha256",
+                "fea_params_sha256",
+            )
+        )
+    ):
+        raise HandoffContractError(
+            "diagnostic Standard operational-pressure retry ancestry drifted"
+        )
+    _operational_pressure_task_identity(
+        logical_authority_task_id=int(logical_submission["task_id"]),
+        immediate_task_id=int(original_submission["task_id"]),
+        candidate_physics_sha256=str(
+            plan["candidate_physics_sha256"]
+        ),
+        immediate_retry_kind=str(recorded_immediate_kind),
+    )
+    return (
+        logical_plan,
+        logical_submission,
+        original_submission,
+        execution,
+    )
+
+
 def create_timeout_retry_plan(
     *,
     original_plan_path: Path,
@@ -2752,9 +4134,9 @@ def create_timeout_retry_plan(
     strict_node_name: str = "",
 ) -> Path:
     original_plan, params, selected = _load_plan(original_plan_path)
-    if _plan_is_timeout_retry(original_plan):
+    if _plan_retry_kind(original_plan) is not None:
         raise HandoffContractError(
-            "a timeout retry cannot be based on another timeout retry"
+            "a timeout retry cannot be based on another diagnostic retry"
         )
     original_submission = _load_submission(
         original_submission_path, plan=original_plan
@@ -2922,6 +4304,234 @@ def create_timeout_retry_plan(
     return destination / plan_path.name
 
 
+def create_operational_pressure_retry_plan(
+    *,
+    original_plan_path: Path,
+    original_submission_path: Path,
+    output: Path,
+    scheduler_url: str = DIAGNOSTIC_SCHEDULER_URL,
+    task_reader: Any = None,
+    event_reader: Any = None,
+    strict_node_name: str = "",
+) -> Path:
+    original_plan, params, selected = _load_plan(original_plan_path)
+    immediate_retry_kind = _plan_retry_kind(original_plan)
+    if immediate_retry_kind not in {None, "timeout"}:
+        raise HandoffContractError(
+            "operational-pressure retry ancestry exceeds the bounded "
+            "direct-or-timeout chain"
+        )
+    original_submission = _load_submission(
+        original_submission_path, plan=original_plan
+    )
+    if immediate_retry_kind == "timeout":
+        (
+            _logical_plan,
+            logical_submission,
+            _timeout_execution,
+        ) = _validate_timeout_retry_record(original_plan)
+        recorded_immediate_kind = "timeout"
+        immediate_parent_ancestry_sha256 = canonical_sha256(
+            original_plan["retry_of_timeout"]
+        )
+    else:
+        logical_submission = original_submission
+        recorded_immediate_kind = "none"
+        immediate_parent_ancestry_sha256 = None
+    normalized_scheduler_url = scheduler_url.rstrip("/")
+    if normalized_scheduler_url != original_submission["scheduler_url"]:
+        raise HandoffContractError(
+            "operational-pressure retry Scheduler origin differs from "
+            "original submission"
+        )
+    read_task = task_reader or _scheduler_task_snapshot
+    read_events = event_reader or _scheduler_task_events
+    execution = _read_operational_pressure_failure(
+        scheduler_url=normalized_scheduler_url,
+        submission=original_submission,
+        task_reader=read_task,
+        event_reader=read_events,
+    )
+    original_profile = production._read_json(
+        original_plan_path.resolve(strict=True).parent
+        / original_plan["profile"]["path"]
+    )
+    retry_profile, retry_profile_source = _profile_content(
+        operational_pressure_retry=immediate_retry_kind is None,
+        operational_pressure_after_timeout_retry=(
+            immediate_retry_kind == "timeout"
+        ),
+    )
+    if (
+        retry_profile["param_overrides"]
+        != original_profile["param_overrides"]
+        or retry_profile["fixed_boundary_contract"]
+        != original_profile["fixed_boundary_contract"]
+        or production._effective_params(params, retry_profile)
+        != production._effective_params(params, original_profile)
+    ):
+        raise HandoffContractError(
+            "operational-pressure retry profile changes fixed physics"
+    )
+    task_name, workdir = _operational_pressure_task_identity(
+        logical_authority_task_id=int(logical_submission["task_id"]),
+        immediate_task_id=int(original_submission["task_id"]),
+        candidate_physics_sha256=str(
+            original_plan["candidate_physics_sha256"]
+        ),
+        immediate_retry_kind=recorded_immediate_kind,
+    )
+    claim_reference = _operational_pressure_claim_reference(
+        candidate_physics_sha256=str(
+            original_plan["candidate_physics_sha256"]
+        ),
+        logical_authority_task_id=int(logical_submission["task_id"]),
+    )
+    strict_contract = None
+    if strict_node_name not in (None, ""):
+        strict_contract = _strict_node_plan_contract(
+            strict_node_name,
+            task_identity_generation=(
+                OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION
+            ),
+        )
+    retained = scheduler_client.retained_aedt_identity(
+        task_name,
+        params,
+        retry_profile,
+        original_plan["solver_revision"],
+        original_plan["library_revision"],
+    )
+    original_retained = original_plan["stage"]["retained_aedt_bundle"]
+    if (
+        retained is None
+        or retained["dedupe_key"] == original_retained["dedupe_key"]
+        or retained["relative_directory"]
+        == original_retained["relative_directory"]
+        or retained["profile_sha256"]
+        == original_retained["profile_sha256"]
+    ):
+        raise HandoffContractError(
+            "operational-pressure retry did not derive a distinct "
+            "immutable identity"
+        )
+    retry_record = {
+        "schema_version": OPERATIONAL_PRESSURE_RETRY_EVIDENCE_SCHEMA,
+        "retry_of_task_id": original_submission["task_id"],
+        "logical_authority_task_id": logical_submission["task_id"],
+        "immediate_retry_kind": recorded_immediate_kind,
+        "immediate_parent_ancestry_sha256": (
+            immediate_parent_ancestry_sha256
+        ),
+        "original_plan": production._file_record(
+            original_plan_path.resolve(strict=True)
+        ),
+        "original_plan_payload_sha256": original_plan["payload_sha256"],
+        "original_submission": production._file_record(
+            original_submission_path.resolve(strict=True)
+        ),
+        "original_submission_payload_sha256": original_submission[
+            "payload_sha256"
+        ],
+        "original_task_execution": execution,
+        "original_task_execution_sha256": canonical_sha256(execution),
+        "scheduler_url": normalized_scheduler_url,
+        "failure_class": OPERATIONAL_PRESSURE_FAILURE_CLASS,
+        "failure_message": OPERATIONAL_PRESSURE_FAILURE_MESSAGE,
+        "attempt_count": OPERATIONAL_PRESSURE_ATTEMPT_COUNT,
+    }
+    destination = output.resolve()
+    if destination.exists():
+        raise HandoffContractError(
+            "diagnostic operational-pressure retry plan output already "
+            f"exists: {destination}"
+        )
+    staging = destination.with_name(
+        f".{destination.name}.{os.getpid()}."
+        f"{next(tempfile._get_candidate_names())}.tmp"
+    )
+    staging.mkdir(parents=True)
+    try:
+        selected_path = production._write_immutable_json(
+            staging / "selected_candidate.json", selected
+        )
+        params_path = production._write_immutable_json(
+            staging / "fea_params.json", params
+        )
+        profile_path = production._write_immutable_json(
+            staging
+            / (
+                "diagnostic_standard_operational_pressure_after_timeout_"
+                "retry_profile.json"
+                if immediate_retry_kind == "timeout"
+                else (
+                    "diagnostic_standard_operational_pressure_retry_"
+                    "profile.json"
+                )
+            ),
+            retry_profile,
+        )
+        unsigned_plan = copy.deepcopy(original_plan)
+        unsigned_plan.pop("payload_sha256", None)
+        unsigned_plan.pop("retry_of_timeout", None)
+        unsigned_plan.pop("retry_of_operational_pressure", None)
+        unsigned_plan.pop("scheduler_strict_node_contract", None)
+        unsigned_plan.update(
+            {
+                "selected_candidate": {
+                    "path": selected_path.name,
+                    "sha256": production._sha256_file(selected_path),
+                },
+                "fea_params": {
+                    "path": params_path.name,
+                    "sha256": production._sha256_file(params_path),
+                },
+                "profile": {
+                    "path": profile_path.name,
+                    "sha256": production._sha256_file(profile_path),
+                    "canonical_sha256": canonical_sha256(retry_profile),
+                    "source": retry_profile_source,
+                },
+                "stage": {
+                    **copy.deepcopy(original_plan["stage"]),
+                    "task_name": task_name,
+                    "workdir": workdir,
+                    "profile_sha256": canonical_sha256(retry_profile),
+                    "resources": copy.deepcopy(
+                        OPERATIONAL_PRESSURE_AFTER_TIMEOUT_RETRY_RESOURCES
+                        if immediate_retry_kind == "timeout"
+                        else OPERATIONAL_PRESSURE_RETRY_RESOURCES
+                    ),
+                    "retained_aedt_bundle": retained,
+                    "retention_run_root": _retention_run_root_evidence(
+                        retained
+                    ),
+                },
+                "available_submission_commands": [
+                    "submit-operational-pressure-retry"
+                ],
+                "retry_of_operational_pressure": retry_record,
+                "operational_pressure_atomic_claim_reference": (
+                    claim_reference
+                ),
+                **(
+                    {"scheduler_strict_node_contract": strict_contract}
+                    if strict_contract is not None
+                    else {}
+                ),
+            }
+        )
+        plan_path = production._write_immutable_json(
+            staging / "diagnostic_operational_pressure_retry_plan.json",
+            production._seal(unsigned_plan),
+        )
+        os.replace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return destination / plan_path.name
+
+
 def _plan_artifact(root: Path, record: Any, label: str) -> Path:
     if (
         not isinstance(record, dict)
@@ -2943,12 +4553,20 @@ def _load_plan(
     plan = production._validate_seal(
         production._read_json(resolved), PLAN_SCHEMA
     )
-    timeout_retry = _plan_is_timeout_retry(plan)
-    expected_commands = (
-        ["submit-timeout-retry"]
-        if timeout_retry
-        else ["submit-standard"]
+    retry_kind = _plan_retry_kind(plan)
+    timeout_retry = retry_kind == "timeout"
+    operational_pressure_retry = retry_kind == "operational_pressure"
+    operational_pressure_after_timeout_retry = (
+        operational_pressure_retry
+        and _operational_pressure_immediate_retry_kind(plan) == "timeout"
     )
+    expected_commands = {
+        None: ["submit-standard"],
+        "timeout": ["submit-timeout-retry"],
+        "operational_pressure": [
+            "submit-operational-pressure-retry"
+        ],
+    }[retry_kind]
     flags = _diagnostic_flags()
     if (
         plan.get("campaign_id") != "mft-goal-20260726"
@@ -3009,7 +4627,17 @@ def _load_plan(
         root, profile_record, "diagnostic Standard profile"
     )
     profile = production._read_json(profile_path)
-    _validate_profile(profile, timeout_retry=timeout_retry)
+    _validate_profile(
+        profile,
+        timeout_retry=timeout_retry,
+        operational_pressure_retry=(
+            operational_pressure_retry
+            and not operational_pressure_after_timeout_retry
+        ),
+        operational_pressure_after_timeout_retry=(
+            operational_pressure_after_timeout_retry
+        ),
+    )
     effective = production._effective_params(params, profile)
     stage = plan.get("stage")
     if not isinstance(stage, dict):
@@ -3045,6 +4673,13 @@ def _load_plan(
         _validate_timeout_retry_record(plan)
         strict_contract = _plan_strict_node_contract(plan)
         if strict_contract is not None:
+            if (
+                strict_contract.get("task_identity_generation")
+                != TIMEOUT_STRICT_TASK_IDENTITY_GENERATION
+            ):
+                raise HandoffContractError(
+                    "strict timeout retry generation drifted"
+                )
             node_slug = re.sub(
                 r"[^A-Za-z0-9_-]+",
                 "_",
@@ -3066,9 +4701,57 @@ def _load_plan(
                 raise HandoffContractError(
                     "strict timeout retry r2 identity drifted"
                 )
-    elif "scheduler_strict_node_contract" in plan:
+    elif operational_pressure_retry:
+        _validate_operational_pressure_retry_record(plan)
+        _validate_operational_pressure_claim_reference(plan)
+        strict_contract = _plan_strict_node_contract(plan)
+        record = plan["retry_of_operational_pressure"]
+        expected_task_name, expected_workdir = (
+            _operational_pressure_task_identity(
+                logical_authority_task_id=int(
+                    record["logical_authority_task_id"]
+                ),
+                immediate_task_id=int(record["retry_of_task_id"]),
+                candidate_physics_sha256=str(
+                    plan["candidate_physics_sha256"]
+                ),
+                immediate_retry_kind=str(
+                    record["immediate_retry_kind"]
+                ),
+            )
+        )
+        if strict_contract is not None:
+            if (
+                strict_contract.get("task_identity_generation")
+                != OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION
+            ):
+                raise HandoffContractError(
+                    "strict operational-pressure retry generation drifted"
+                )
+        if (
+            stage.get("task_name") != expected_task_name
+            or stage.get("workdir") != expected_workdir
+        ):
+            raise HandoffContractError(
+                "operational-pressure retry identity drifted"
+            )
+    else:
+        if "scheduler_strict_node_contract" in plan:
+            raise HandoffContractError(
+                "strict node placement is restricted to diagnostic retries"
+            )
+        if "operational_pressure_atomic_claim_reference" in plan:
+            raise HandoffContractError(
+                "atomic claim reference is restricted to "
+                "operational-pressure retries"
+            )
+    if (
+        not operational_pressure_retry
+        and "operational_pressure_atomic_claim_reference" in plan
+    ):
         raise HandoffContractError(
-            "strict node placement is restricted to timeout retries"
+            "atomic claim reference is restricted to "
+            "operational-pressure retries"
         )
     return plan, params, selected
 
@@ -3141,6 +4824,9 @@ def _same_allocation_anchor_evidence(
     slurm_job_id: str,
     account_name: str,
     node_name: str,
+    expected_timeout_seconds: int = TIMEOUT_RETRY_RESOURCES[
+        "timeout_seconds"
+    ],
 ) -> dict[str, Any]:
     evidence = {
         "task_id": snapshot.get("task_id", snapshot.get("id")),
@@ -3190,7 +4876,7 @@ def _same_allocation_anchor_evidence(
         or evidence["cpus"] != TIMEOUT_RETRY_RESOURCES["cpus"]
         or evidence["memory_mb"] != 32768
         or evidence["timeout_seconds"]
-        != TIMEOUT_RETRY_RESOURCES["timeout_seconds"]
+        != expected_timeout_seconds
         or not str(evidence["dedupe_key"] or "").strip()
         or not str(evidence["started_at"] or "").strip()
         or evidence["finished_at"] not in (None, "")
@@ -3212,6 +4898,9 @@ def _same_allocation_submitted_task_evidence(
     slurm_job_id: str,
     account_name: str,
     node_name: str,
+    expected_timeout_seconds: int = TIMEOUT_RETRY_RESOURCES[
+        "timeout_seconds"
+    ],
 ) -> dict[str, Any]:
     evidence = {
         "task_id": snapshot.get("task_id", snapshot.get("id")),
@@ -3274,7 +4963,7 @@ def _same_allocation_submitted_task_evidence(
         or evidence["cpus"] != TIMEOUT_RETRY_RESOURCES["cpus"]
         or evidence["memory_mb"] != 32768
         or evidence["timeout_seconds"]
-        != TIMEOUT_RETRY_RESOURCES["timeout_seconds"]
+        != expected_timeout_seconds
         or evidence["finished_at"] not in (None, "")
         or not (assigned_identity_valid or queued_identity_valid)
     ):
@@ -3339,11 +5028,20 @@ def _validate_same_allocation_placement_contract(
     slurm_job_id = value.get("expected_slurm_job_id")
     account_name = value.get("expected_account_name")
     node_name = value.get("expected_node_name")
+    resources = submission.get("resources")
+    expected_timeout_seconds = (
+        resources.get("timeout_seconds")
+        if isinstance(resources, Mapping)
+        else None
+    )
     if (
         value.get("schema_version") != SAME_ALLOCATION_PLACEMENT_SCHEMA
         or value.get("same_node_reference_allocation_enforced") is not True
         or value.get("fallback_allocation_allowed") is not False
         or value.get("requested_allocation_id_used") is not False
+        or isinstance(expected_timeout_seconds, bool)
+        or not isinstance(expected_timeout_seconds, int)
+        or expected_timeout_seconds <= 0
     ):
         raise HandoffContractError(
             "diagnostic same-allocation placement policy drifted"
@@ -3355,6 +5053,7 @@ def _validate_same_allocation_placement_contract(
         slurm_job_id=slurm_job_id,
         account_name=account_name,
         node_name=node_name,
+        expected_timeout_seconds=expected_timeout_seconds,
     )
     after = _same_allocation_anchor_evidence(
         value.get("anchor_after_submission") or {},
@@ -3363,6 +5062,7 @@ def _validate_same_allocation_placement_contract(
         slurm_job_id=slurm_job_id,
         account_name=account_name,
         node_name=node_name,
+        expected_timeout_seconds=expected_timeout_seconds,
     )
     submitted = _same_allocation_submitted_task_evidence(
         value.get("submitted_task_after_submission") or {},
@@ -3374,6 +5074,7 @@ def _validate_same_allocation_placement_contract(
         slurm_job_id=slurm_job_id,
         account_name=account_name,
         node_name=node_name,
+        expected_timeout_seconds=expected_timeout_seconds,
     )
     normalized = _same_allocation_placement_contract(
         anchor_before=before,
@@ -3403,6 +5104,7 @@ def _strict_node_task_evidence(
     expected_allocation_id: int = 0,
     expected_slurm_job_id: str = "",
     expected_account_name: str = "",
+    expected_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     requested_node = _strict_node_name(node_name)
     evidence = {
@@ -3441,6 +5143,8 @@ def _strict_node_task_evidence(
         "started_at": snapshot.get("started_at"),
         "finished_at": snapshot.get("finished_at"),
     }
+    if "timeout_seconds" in snapshot:
+        evidence["timeout_seconds"] = snapshot.get("timeout_seconds")
     if (
         isinstance(task_id, bool)
         or not isinstance(task_id, int)
@@ -3453,6 +5157,11 @@ def _strict_node_task_evidence(
         or evidence["aedt_backend"] != "standalone"
         or evidence["cpus"] != TIMEOUT_RETRY_RESOURCES["cpus"]
         or evidence["memory_mb"] != 32768
+        or (
+            expected_timeout_seconds is not None
+            and evidence.get("timeout_seconds")
+            != expected_timeout_seconds
+        )
         or evidence["node_name"] != requested_node
         or evidence["requested_node_name"] != requested_node
         or evidence["node_name_policy"] != "strict"
@@ -3623,6 +5332,12 @@ def _validate_strict_node_submission_contract(
         "expected_allocation_id": expected_allocation_id,
         "expected_slurm_job_id": expected_slurm_job_id,
         "expected_account_name": expected_account_name,
+        "expected_timeout_seconds": (
+            submission["resources"]["timeout_seconds"]
+            if plan_contract.get("task_identity_generation")
+            == OPERATIONAL_PRESSURE_STRICT_TASK_IDENTITY_GENERATION
+            else None
+        ),
     }
     pre_raw = value.get("api_pre_submission_readback")
     post_raw = value.get("api_post_submission_response")
@@ -3698,11 +5413,14 @@ def _submit_standard_plan(
     scheduler_cutover_receipt_path: Path,
     output: Path,
     expected_timeout_retry: bool,
+    expected_operational_pressure_retry: bool = False,
     priority: int = 0,
     scheduler: Any = scheduler_client,
     predictor: Any | None = None,
     live_reader: Any = _default_scheduler_live_reader,
     task_reader: Any = None,
+    event_reader: Any = None,
+    task_list_reader: Any = None,
     same_node_as_task_id: int = 0,
     expected_allocation_id: int = 0,
     expected_slurm_job_id: str = "",
@@ -3710,7 +5428,9 @@ def _submit_standard_plan(
     expected_node_name: str = "",
 ) -> Path:
     plan, params, selected = _load_plan(plan_path)
-    timeout_retry = _plan_is_timeout_retry(plan)
+    retry_kind = _plan_retry_kind(plan)
+    timeout_retry = retry_kind == "timeout"
+    operational_pressure_retry = retry_kind == "operational_pressure"
     strict_node_contract = _plan_strict_node_contract(plan)
     strict_node_pin = (
         _strict_node_scheduler_pin(
@@ -3719,12 +5439,20 @@ def _submit_standard_plan(
         if strict_node_contract is not None
         else None
     )
-    if timeout_retry is not expected_timeout_retry:
-        command = (
-            "submit-timeout-retry"
-            if timeout_retry
-            else "submit-standard"
-        )
+    if (
+        expected_timeout_retry and expected_operational_pressure_retry
+    ) or (
+        timeout_retry is not expected_timeout_retry
+        or operational_pressure_retry
+        is not expected_operational_pressure_retry
+    ):
+        command = {
+            None: "submit-standard",
+            "timeout": "submit-timeout-retry",
+            "operational_pressure": (
+                "submit-operational-pressure-retry"
+            ),
+        }[retry_kind]
         raise HandoffContractError(
             f"diagnostic plan requires {command}"
         )
@@ -3736,7 +5464,7 @@ def _submit_standard_plan(
         or bool(str(expected_node_name).strip())
     )
     if placement_requested and (
-        not timeout_retry
+        retry_kind not in {"timeout", "operational_pressure"}
         or isinstance(same_node_as_task_id, bool)
         or not isinstance(same_node_as_task_id, int)
         or same_node_as_task_id <= 0
@@ -3748,7 +5476,7 @@ def _submit_standard_plan(
         or not str(expected_node_name).strip()
     ):
         raise HandoffContractError(
-            "same-allocation placement requires a timeout retry and the "
+            "same-allocation placement requires a diagnostic retry and the "
             "complete positive anchor identity"
         )
     if (
@@ -3793,7 +5521,12 @@ def _submit_standard_plan(
         )
     retry_record = None
     reader = task_reader or _scheduler_task_snapshot
+    read_events = event_reader or _scheduler_task_events
+    read_task_list = task_list_reader or _scheduler_project_tasks
     anchor_before = None
+    sibling_before = None
+    pressure_pre_submit_guard = None
+    pressure_locked_guard_count = 0
     if timeout_retry:
         (
             _original_plan,
@@ -3824,12 +5557,105 @@ def _submit_standard_plan(
                 slurm_job_id=str(expected_slurm_job_id),
                 account_name=str(expected_account_name),
                 node_name=str(expected_node_name),
+                expected_timeout_seconds=stage["resources"][
+                    "timeout_seconds"
+                ],
+            )
+    elif operational_pressure_retry:
+        (
+            _logical_plan,
+            _logical_submission,
+            original_submission,
+            stored_execution,
+        ) = _validate_operational_pressure_retry_record(plan)
+        retry_record = copy.deepcopy(
+            plan["retry_of_operational_pressure"]
+        )
+
+        def pressure_pre_submit_guard() -> None:
+            nonlocal sibling_before, pressure_locked_guard_count
+            live_execution = _read_operational_pressure_failure(
+                scheduler_url=stage["scheduler_url"],
+                submission=original_submission,
+                task_reader=reader,
+                event_reader=read_events,
+            )
+            if live_execution != stored_execution:
+                raise HandoffContractError(
+                    "diagnostic operational-pressure failure evidence "
+                    "changed immediately before retry submission"
+                )
+            sibling_before = _operational_pressure_sibling_snapshot(
+                read_task_list(
+                    scheduler_url=stage["scheduler_url"],
+                    project=scheduler_client.MFT_PROJECT,
+                    task_name=(
+                        _operational_pressure_sibling_name_prefix(plan)
+                    ),
+                ),
+                plan=plan,
+            )
+            if (
+                pressure_claim_acquisition is not None
+                and pressure_claim_acquisition.get("status")
+                == "fresh_pending"
+            ):
+                if sibling_before.get("matching_task_count") != 0:
+                    raise HandoffContractError(
+                        "fresh operational-pressure claim requires an "
+                        "empty Scheduler sibling slot before POST"
+                    )
+                pressure_locked_guard_count += 1
+
+        if placement_requested:
+            anchor_before = _same_allocation_anchor_evidence(
+                reader(
+                    scheduler_url=stage["scheduler_url"],
+                    task_id=same_node_as_task_id,
+                ),
+                task_id=same_node_as_task_id,
+                allocation_id=expected_allocation_id,
+                slurm_job_id=str(expected_slurm_job_id),
+                account_name=str(expected_account_name),
+                node_name=str(expected_node_name),
+                expected_timeout_seconds=stage["resources"][
+                    "timeout_seconds"
+                ],
             )
     target = output.resolve()
     if target.exists():
         raise HandoffContractError(
             f"diagnostic submission receipt already exists: {target}"
         )
+    pressure_claim_reference = None
+    pressure_claim_winner = None
+    pressure_claim_acquisition = None
+    pressure_finalized_claim = None
+    if operational_pressure_retry:
+        # Reject stale pressure evidence and ambiguous Scheduler inventory
+        # before consuming the irreversible claim slot.  A fresh winner is
+        # checked again inside the submit lock immediately before POST.
+        if pressure_pre_submit_guard is None:
+            raise HandoffContractError(
+                "operational-pressure pre-claim guard is absent"
+            )
+        pressure_pre_submit_guard()
+        pressure_claim_reference = (
+            _validate_operational_pressure_claim_reference(plan)
+        )
+        pressure_claim_winner = _operational_pressure_claim_winner(
+            plan_path, plan
+        )
+        try:
+            pressure_claim_acquisition = atomic_claim.acquire_claim(
+                OPERATIONAL_PRESSURE_CLAIM_ROOT,
+                pressure_claim_reference,
+                pressure_claim_winner,
+            )
+        except atomic_claim.ClaimContractError as exc:
+            raise HandoffContractError(
+                "operational-pressure atomic claim acquisition failed"
+            ) from exc
     profile = production._read_json(
         plan_path.resolve(strict=True).parent / plan["profile"]["path"]
     )
@@ -3857,23 +5683,110 @@ def _submit_standard_plan(
                 "return_submission_evidence": True,
             }
         )
-    submission_result = scheduler.submit_verification(
-        stage["task_name"],
-        stage["workdir"],
-        params,
-        profile,
-        mem_mb=int(profile["mem_mb"]),
-        cpus=int(profile["cpus"]),
-        solver_revision=plan["solver_revision"],
-        library_revision=plan["library_revision"],
-        priority=priority,
-        aedt_backend="standalone",
-        submission_env=environment,
-        required_project_cap=GOAL_FEA_PROJECT_CAP,
-        max_project_active_tasks=GOAL_FEA_PROJECT_CAP,
-        scheduler_url=stage["scheduler_url"],
-        **placement_submission_options,
+    claim_status = (
+        pressure_claim_acquisition["status"]
+        if pressure_claim_acquisition is not None
+        else None
     )
+    recovered_task_snapshot = None
+    if operational_pressure_retry and claim_status != "fresh_pending":
+        # A durable claim already exists.  Reauthenticate the original
+        # pressure failure and the one public-API sibling, but never call the
+        # Scheduler submission method from this path.
+        if pressure_pre_submit_guard is None:
+            raise HandoffContractError(
+                "operational-pressure recovery guard is absent"
+            )
+        if (
+            sibling_before is None
+            or sibling_before.get("matching_task_count") != 1
+        ):
+            raise HandoffContractError(
+                "operational-pressure claim recovery requires exactly one "
+                "matching API task and never re-posts"
+            )
+        recovered_task_snapshot = copy.deepcopy(
+            sibling_before["matching_tasks"][0]
+        )
+        try:
+            if claim_status == "existing_pending":
+                pressure_finalized_claim = (
+                    atomic_claim.recover_pending_claim(
+                        OPERATIONAL_PRESSURE_CLAIM_ROOT,
+                        pressure_claim_reference,
+                        pressure_claim_acquisition["claim"],
+                        matching_tasks=[recovered_task_snapshot],
+                        sibling_snapshot=sibling_before,
+                        evidence_validator=(
+                            _operational_pressure_claim_task_evidence
+                        ),
+                    )
+                )
+            elif claim_status == "existing_finalized":
+                pressure_finalized_claim = (
+                    atomic_claim.validate_finalized_claim(
+                        OPERATIONAL_PRESSURE_CLAIM_ROOT,
+                        pressure_claim_reference,
+                        claim=pressure_claim_acquisition["claim"],
+                        expected_winner=pressure_claim_winner,
+                    )
+                )
+                _operational_pressure_claim_task_evidence(
+                    recovered_task_snapshot,
+                    pressure_finalized_claim["pending_claim"],
+                )
+                if (
+                    recovered_task_snapshot["task_id"]
+                    != pressure_finalized_claim["task_id"]
+                ):
+                    raise atomic_claim.ClaimContractError(
+                        "finalized claim task differs from live API sibling"
+                    )
+            else:
+                raise atomic_claim.ClaimContractError(
+                    "campaign claim acquisition status is unsupported"
+                )
+        except atomic_claim.ClaimContractError as exc:
+            raise HandoffContractError(
+                "operational-pressure atomic claim recovery failed closed"
+            ) from exc
+        recovered_task_id = pressure_finalized_claim["task_id"]
+        submission_result = (
+            {
+                "task_id": recovered_task_id,
+                "submission_source": "pre_submission_reconciliation",
+                "scheduler_mutation_performed": False,
+                "api_pre_submission_readback": (
+                    recovered_task_snapshot
+                ),
+                "api_post_submission_response": None,
+            }
+            if strict_node_contract is not None
+            else recovered_task_id
+        )
+    else:
+        submission_result = scheduler.submit_verification(
+            stage["task_name"],
+            stage["workdir"],
+            params,
+            profile,
+            mem_mb=int(profile["mem_mb"]),
+            cpus=int(profile["cpus"]),
+            solver_revision=plan["solver_revision"],
+            library_revision=plan["library_revision"],
+            priority=priority,
+            aedt_backend="standalone",
+            submission_env=environment,
+            required_project_cap=GOAL_FEA_PROJECT_CAP,
+            max_project_active_tasks=GOAL_FEA_PROJECT_CAP,
+            scheduler_url=stage["scheduler_url"],
+            **(
+                {"pre_submit_guard": pressure_pre_submit_guard}
+                if pressure_pre_submit_guard is not None
+                else {}
+            ),
+            **placement_submission_options,
+        )
     if strict_node_contract is not None:
         if (
             not isinstance(submission_result, dict)
@@ -3896,13 +5809,65 @@ def _submit_standard_plan(
         raise HandoffContractError(
             "diagnostic Scheduler submission returned no durable task ID"
         )
-    if (
-        timeout_retry
-        and task_id == int(plan["retry_of_timeout"]["retry_of_task_id"])
-    ):
+    retry_of_task_id = (
+        int(retry_record["retry_of_task_id"])
+        if retry_record is not None
+        else 0
+    )
+    if retry_record is not None and task_id == retry_of_task_id:
         raise HandoffContractError(
-            "diagnostic timeout retry resolved to the original task ID"
+            "diagnostic retry resolved to the original task ID"
         )
+    sibling_contract = None
+    if operational_pressure_retry:
+        if sibling_before is None:
+            raise HandoffContractError(
+                "operational-pressure atomic pre-submit guard did not run"
+            )
+        sibling_after = (
+            copy.deepcopy(sibling_before)
+            if claim_status != "fresh_pending"
+            else _operational_pressure_sibling_snapshot(
+                read_task_list(
+                    scheduler_url=stage["scheduler_url"],
+                    project=scheduler_client.MFT_PROJECT,
+                    task_name=_operational_pressure_sibling_name_prefix(
+                        plan
+                    ),
+                ),
+                plan=plan,
+            )
+        )
+        sibling_contract = _operational_pressure_sibling_contract(
+            before=sibling_before,
+            after=sibling_after,
+            task_id=task_id,
+        )
+        if claim_status == "fresh_pending":
+            if (
+                pressure_locked_guard_count != 1
+                or sibling_before.get("matching_task_count") != 0
+            ):
+                raise HandoffContractError(
+                    "fresh operational-pressure submission lacks exactly "
+                    "one locked post-claim pre-POST guard execution"
+                )
+            try:
+                pressure_finalized_claim = atomic_claim.finalize_claim(
+                    OPERATIONAL_PRESSURE_CLAIM_ROOT,
+                    pressure_claim_reference,
+                    pressure_claim_acquisition["claim"],
+                    task_id=task_id,
+                    task_readback=sibling_after["matching_tasks"][0],
+                    sibling_snapshot=sibling_after,
+                    evidence_validator=(
+                        _operational_pressure_claim_task_evidence
+                    ),
+                )
+            except atomic_claim.ClaimContractError as exc:
+                raise HandoffContractError(
+                    "operational-pressure atomic claim finalization failed"
+                ) from exc
     placement_contract = None
     submitted_task_snapshot = None
     if placement_requested:
@@ -3916,6 +5881,9 @@ def _submit_standard_plan(
             slurm_job_id=str(expected_slurm_job_id),
             account_name=str(expected_account_name),
             node_name=str(expected_node_name),
+            expected_timeout_seconds=stage["resources"][
+                "timeout_seconds"
+            ],
         )
         submitted_task_snapshot = reader(
             scheduler_url=stage["scheduler_url"],
@@ -3931,6 +5899,9 @@ def _submit_standard_plan(
             slurm_job_id=str(expected_slurm_job_id),
             account_name=str(expected_account_name),
             node_name=str(expected_node_name),
+            expected_timeout_seconds=stage["resources"][
+                "timeout_seconds"
+            ],
         )
         placement_contract = _same_allocation_placement_contract(
             anchor_before=anchor_before,
@@ -3968,6 +5939,9 @@ def _submit_standard_plan(
             "expected_allocation_id": expected_allocation,
             "expected_slurm_job_id": expected_job,
             "expected_account_name": expected_account,
+            "expected_timeout_seconds": stage["resources"][
+                "timeout_seconds"
+            ],
         }
         raw_pre = submission_result.get("api_pre_submission_readback")
         raw_post = submission_result.get("api_post_submission_response")
@@ -4052,6 +6026,32 @@ def _submit_standard_plan(
                 else {}
             ),
             **(
+                {"retry_of_operational_pressure": retry_record}
+                if operational_pressure_retry
+                else {}
+            ),
+            **(
+                {
+                    "operational_pressure_sibling_guard": (
+                        sibling_contract
+                    )
+                }
+                if operational_pressure_retry
+                else {}
+            ),
+            **(
+                {
+                    "operational_pressure_atomic_claim": (
+                        _operational_pressure_claim_receipt(
+                            acquisition_status=claim_status,
+                            finalized_claim=pressure_finalized_claim,
+                        )
+                    )
+                }
+                if operational_pressure_retry
+                else {}
+            ),
+            **(
                 {"scheduler_placement_contract": placement_contract}
                 if placement_contract is not None
                 else {}
@@ -4127,14 +6127,67 @@ def submit_timeout_retry(
     )
 
 
+def submit_operational_pressure_retry(
+    *,
+    plan_path: Path,
+    scheduler_cutover_receipt_path: Path,
+    output: Path,
+    priority: int = 0,
+    scheduler: Any = scheduler_client,
+    predictor: Any | None = None,
+    live_reader: Any = _default_scheduler_live_reader,
+    task_reader: Any = None,
+    event_reader: Any = None,
+    task_list_reader: Any = None,
+    same_node_as_task_id: int = 0,
+    expected_allocation_id: int = 0,
+    expected_slurm_job_id: str = "",
+    expected_account_name: str = "",
+    expected_node_name: str = "",
+) -> Path:
+    return _submit_standard_plan(
+        plan_path=plan_path,
+        scheduler_cutover_receipt_path=scheduler_cutover_receipt_path,
+        output=output,
+        expected_timeout_retry=False,
+        expected_operational_pressure_retry=True,
+        priority=priority,
+        scheduler=scheduler,
+        predictor=predictor,
+        live_reader=live_reader,
+        task_reader=task_reader,
+        event_reader=event_reader,
+        task_list_reader=task_list_reader,
+        same_node_as_task_id=same_node_as_task_id,
+        expected_allocation_id=expected_allocation_id,
+        expected_slurm_job_id=expected_slurm_job_id,
+        expected_account_name=expected_account_name,
+        expected_node_name=expected_node_name,
+    )
+
+
 def _load_submission(
     path: Path, *, plan: Mapping[str, Any]
 ) -> dict[str, Any]:
     receipt = production._validate_seal(
         production._read_json(path.resolve(strict=True)), SUBMISSION_SCHEMA
     )
+    receipt_plan_record = receipt.get("plan")
+    if not isinstance(receipt_plan_record, Mapping):
+        raise HandoffContractError(
+            "diagnostic submission plan record is absent"
+        )
+    receipt_plan_path = Path(
+        str(receipt_plan_record.get("path") or "")
+    ).resolve(strict=True)
+    if production._file_record(receipt_plan_path) != receipt_plan_record:
+        raise HandoffContractError(
+            "diagnostic submission plan bytes drifted"
+        )
     stage = plan["stage"]
-    timeout_retry = _plan_is_timeout_retry(plan)
+    retry_kind = _plan_retry_kind(plan)
+    timeout_retry = retry_kind == "timeout"
+    operational_pressure_retry = retry_kind == "operational_pressure"
     strict_node_contract = _plan_strict_node_contract(plan)
     strict_node_pin = (
         _strict_node_scheduler_pin(strict_node_contract)
@@ -4258,6 +6311,31 @@ def _load_submission(
             and "retry_of_timeout" in receipt
         )
         or (
+            operational_pressure_retry
+            and receipt.get("retry_of_operational_pressure")
+            != plan.get("retry_of_operational_pressure")
+        )
+        or (
+            not operational_pressure_retry
+            and "retry_of_operational_pressure" in receipt
+        )
+        or (
+            operational_pressure_retry
+            and "operational_pressure_sibling_guard" not in receipt
+        )
+        or (
+            not operational_pressure_retry
+            and "operational_pressure_sibling_guard" in receipt
+        )
+        or (
+            operational_pressure_retry
+            and "operational_pressure_atomic_claim" not in receipt
+        )
+        or (
+            not operational_pressure_retry
+            and "operational_pressure_atomic_claim" in receipt
+        )
+        or (
             strict_node_contract is not None
             and "scheduler_strict_node_contract" not in receipt
         )
@@ -4274,12 +6352,19 @@ def _load_submission(
             "diagnostic Standard submission identity drifted"
         )
     if "scheduler_placement_contract" in receipt:
-        if not timeout_retry:
+        if retry_kind not in {"timeout", "operational_pressure"}:
             raise HandoffContractError(
-                "same-allocation placement is restricted to timeout retries"
+                "same-allocation placement is restricted to diagnostic "
+                "retries"
             )
         _validate_same_allocation_placement_contract(
             receipt.get("scheduler_placement_contract"),
+            submission=receipt,
+        )
+    if operational_pressure_retry:
+        _validate_operational_pressure_sibling_contract(
+            receipt.get("operational_pressure_sibling_guard"),
+            plan=plan,
             submission=receipt,
         )
     if strict_node_contract is not None:
@@ -4302,6 +6387,13 @@ def _load_submission(
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
         raise HandoffContractError(
             "diagnostic submission task ID is invalid"
+        )
+    if operational_pressure_retry:
+        _validate_operational_pressure_claim_receipt(
+            receipt.get("operational_pressure_atomic_claim"),
+            plan_path=receipt_plan_path,
+            plan=plan,
+            task_id=task_id,
         )
     return receipt
 
@@ -4694,6 +6786,7 @@ def _task_execution_evidence(
         "actual_node_name": snapshot.get("actual_node_name"),
         "cpus": snapshot.get("cpus"),
         "memory_mb": snapshot.get("memory_mb"),
+        "timeout_seconds": snapshot.get("timeout_seconds"),
         "aedt_backend": snapshot.get("aedt_backend"),
         "project": snapshot.get("project"),
         "dedupe_key": snapshot.get("dedupe_key"),
@@ -4715,6 +6808,8 @@ def _task_execution_evidence(
         or allocation_id <= 0
         or evidence["cpus"] != 8
         or evidence["memory_mb"] != 32768
+        or evidence["timeout_seconds"]
+        != submission["resources"]["timeout_seconds"]
         or evidence["aedt_backend"] != "standalone"
         or evidence["project"] != scheduler_client.MFT_PROJECT
         or evidence["dedupe_key"] != submission["dedupe_key"]
@@ -4774,6 +6869,9 @@ def _task_execution_evidence(
             expected_allocation_id=expected_allocation_id,
             expected_slurm_job_id=expected_slurm_job_id,
             expected_account_name=expected_account_name,
+            expected_timeout_seconds=submission["resources"][
+                "timeout_seconds"
+            ],
         )
         if (
             strict_terminal["allocation_id"] != evidence["allocation_id"]
@@ -5229,6 +7327,13 @@ def _parser() -> argparse.ArgumentParser:
         )
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser(
+        "init-operational-pressure-claim-root",
+        help=(
+            "initialize or reauthenticate the frozen campaign claim root; "
+            "this never calls or mutates the Scheduler"
+        ),
+    )
     select = commands.add_parser("select")
     select.add_argument("--bundle-manifest", type=Path, required=True)
     select.add_argument("--generation", type=Path, required=True)
@@ -5278,6 +7383,28 @@ def _parser() -> argparse.ArgumentParser:
     )
     retry_plan.add_argument("--output", type=Path, required=True)
 
+    pressure_retry_plan = commands.add_parser(
+        "plan-operational-pressure-retry"
+    )
+    pressure_retry_plan.add_argument(
+        "--original-plan", type=Path, required=True
+    )
+    pressure_retry_plan.add_argument(
+        "--original-submission", type=Path, required=True
+    )
+    pressure_retry_plan.add_argument(
+        "--scheduler-url", default=DIAGNOSTIC_SCHEDULER_URL
+    )
+    pressure_retry_plan.add_argument(
+        "--strict-node-name",
+        default="",
+        help=(
+            "opt into fail-closed exact-node placement and a distinct "
+            "operational-pressure-strict-r1 identity"
+        ),
+    )
+    pressure_retry_plan.add_argument("--output", type=Path, required=True)
+
     submit = commands.add_parser("submit-standard")
     submit.add_argument("--plan", type=Path, required=True)
     submit.add_argument(
@@ -5307,6 +7434,35 @@ def _parser() -> argparse.ArgumentParser:
     retry_submit.add_argument("--expected-node-name", default="")
     retry_submit.add_argument("--output", type=Path, required=True)
 
+    pressure_retry_submit = commands.add_parser(
+        "submit-operational-pressure-retry"
+    )
+    pressure_retry_submit.add_argument("--plan", type=Path, required=True)
+    pressure_retry_submit.add_argument(
+        "--scheduler-cutover-receipt",
+        type=Path,
+        required=True,
+    )
+    pressure_retry_submit.add_argument("--priority", type=int, default=0)
+    pressure_retry_submit.add_argument(
+        "--same-node-as-task-id", type=int, default=0
+    )
+    pressure_retry_submit.add_argument(
+        "--expected-allocation-id", type=int, default=0
+    )
+    pressure_retry_submit.add_argument(
+        "--expected-slurm-job-id", default=""
+    )
+    pressure_retry_submit.add_argument(
+        "--expected-account-name", default=""
+    )
+    pressure_retry_submit.add_argument(
+        "--expected-node-name", default=""
+    )
+    pressure_retry_submit.add_argument(
+        "--output", type=Path, required=True
+    )
+
     collect = commands.add_parser("collect")
     collect.add_argument("--plan", type=Path, required=True)
     collect.add_argument("--submission", type=Path, required=True)
@@ -5322,6 +7478,19 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "init-operational-pressure-claim-root":
+        authority = initialize_operational_pressure_claim_root()
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "path": authority["resolved_root"],
+                    "claim_root_authority": authority,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.command == "select":
         result = create_selection(
             bundle_manifest_path=args.bundle_manifest,
@@ -5347,6 +7516,14 @@ def main(argv: list[str] | None = None) -> int:
             strict_node_name=args.strict_node_name,
             output=args.output,
         )
+    elif args.command == "plan-operational-pressure-retry":
+        result = create_operational_pressure_retry_plan(
+            original_plan_path=args.original_plan,
+            original_submission_path=args.original_submission,
+            scheduler_url=args.scheduler_url,
+            strict_node_name=args.strict_node_name,
+            output=args.output,
+        )
     elif args.command == "submit-standard":
         result = submit_standard(
             plan_path=args.plan,
@@ -5358,6 +7535,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "submit-timeout-retry":
         result = submit_timeout_retry(
+            plan_path=args.plan,
+            scheduler_cutover_receipt_path=(
+                args.scheduler_cutover_receipt
+            ),
+            priority=args.priority,
+            same_node_as_task_id=args.same_node_as_task_id,
+            expected_allocation_id=args.expected_allocation_id,
+            expected_slurm_job_id=args.expected_slurm_job_id,
+            expected_account_name=args.expected_account_name,
+            expected_node_name=args.expected_node_name,
+            output=args.output,
+        )
+    elif args.command == "submit-operational-pressure-retry":
+        result = submit_operational_pressure_retry(
             plan_path=args.plan,
             scheduler_cutover_receipt_path=(
                 args.scheduler_cutover_receipt

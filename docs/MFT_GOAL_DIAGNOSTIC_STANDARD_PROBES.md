@@ -137,8 +137,86 @@ required receipt:
   --output "$Root\diagnostic-standard\submissions\<geometry-prefix>.json"
 ```
 
-Plans are independent and may be submitted in parallel up to the Scheduler's
-live project and license admission limits. Collection is GET-only:
+### Exact Scheduler operational-pressure retry
+
+`plan-operational-pressure-retry` is separate from timeout retry semantics. It
+accepts an original only when all of the following agree:
+
+- task API: terminal `failed/failed`, null exit code, exact message
+  `memory pressure hard limit after 3 attempts`, original 8 CPU/32 GiB/4 h
+  resources, task/name/dedupe/project/allocation/job/account/node identity;
+- public event API only: task GET before, the complete
+  `/api/events?limit=1000` response, and task GET after. The two task
+  readbacks must be identical. Event IDs must be unique and strictly
+  descending, timestamps nonincreasing, and a full 1000-row window must
+  reach the task's `created_at` (a shorter response is complete by API
+  exhaustion). The complete normalized window, bounds, count, and SHA-256
+  are sealed;
+- within that full window, exactly one same-task/name/message `attempt 1/3`
+  requeue, one `attempt 2/3` requeue, and one matching terminal failed
+  cleanup are required, with
+  `task.created_at <= attempt1 < attempt2 < final start <= finish < cleanup`.
+  Requeue accounts must be nonempty. They are deliberately not required to
+  equal the terminal account because a requeue may migrate allocations
+  (the preserved live episode used three accounts); cleanup must equal the
+  terminal task account. Any extra same-task `task_requeued` or
+  `task_cleanup` event is rejected.
+
+Missing attempt evidence, mixed timeout/pressure ancestry, a retry based on
+another retry, or any change at the immediate pre-POST re-read blocks
+submission. The retry retains identical fan 1.5 m/s, TIM/pads, operating
+point, symmetry, and solver physics, but uses a distinct reviewed profile,
+task/workdir, retained bundle and dedupe. A direct retry of the original
+Standard task is 8 CPUs, 32 GiB, and 4 h. The one bounded compound form
+`original failed/124 -> timeout retry failed by exact pressure evidence ->
+pressure retry` is 8 CPUs, 32 GiB, and 8 h. No deeper chain is accepted.
+
+Before any pressure plan is created, initialize the frozen campaign claim
+root exactly once. This creates only local campaign authority files; it does
+not call or mutate Scheduler and does not touch the separate Scheduler
+project:
+
+```powershell
+$Python = 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe'
+$StrictCutover = 'C:\Users\peets\slurm_scheduler_runtime\deployment_candidates\41b3b9393684-strict-cpu-storage-admission-20260725\cutover_receipt.json'
+
+& $Python -m tools.mft_goal_diagnostic_standard_probe `
+  init-operational-pressure-claim-root
+if ($LASTEXITCODE -ne 0) { throw 'claim-root initialization failed' }
+
+& $Python -m tools.mft_goal_diagnostic_standard_probe `
+  plan-operational-pressure-retry `
+  --original-plan '<original diagnostic_plan.json>' `
+  --original-submission '<original submission.json>' `
+  --strict-node-name n116 `
+  --output '<new pressure retry plan directory>'
+
+& $Python -m tools.mft_goal_diagnostic_standard_probe `
+  submit-operational-pressure-retry `
+  --plan '<new plan directory>\diagnostic_operational_pressure_retry_plan.json' `
+  --scheduler-cutover-receipt $StrictCutover `
+  --priority 100 `
+  --output '<new pressure retry submission.json>'
+```
+
+The plan seals a placement-invariant claim reference keyed by campaign,
+candidate physics, logical authority task ID, and retry generation. An atomic
+filesystem `mkdir` claim is acquired before Scheduler mutation. Only
+`fresh_pending` authorizes the one submit call, and a distinct counter proves
+the Scheduler client executed the post-claim guard exactly once immediately
+before POST. `existing_pending` may recover only from exactly one matching
+full public-API task; zero or multiple tasks fail closed and never re-POST.
+`existing_finalized` also reauthenticates the one live sibling and never
+re-POSTs. Direct/compound or strict/unplaced sibling plans for the same
+logical slot collide at the same claim and cannot both win.
+
+For multiple independent logical slots, create and submit one at a time.
+After each receipt, GET the new task and live n116 capacity before proceeding.
+Do not launch these commands in parallel: sequential admission preserves the
+three currently available 8-CPU slots and gives every claim a durable API
+readback. Optional same-allocation anchoring still requires all five
+`--same-node-as-task-id` and `--expected-*` fields; partial/stale identity is
+rejected. Collection is GET-only:
 
 ```powershell
 & $Python tools\mft_goal_diagnostic_standard_probe.py collect `

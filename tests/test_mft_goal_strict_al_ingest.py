@@ -370,6 +370,44 @@ def test_prepare_rejects_original_and_retry_for_same_candidate(
         )
 
 
+def test_prepare_rejects_retry_slot_already_ingested_in_prior_base(
+    tmp_path, monkeypatch
+):
+    base = _base_dataset(tmp_path)
+    original = _truth(tmp_path, task_id=5004, n1=6)
+    retry = _truth(tmp_path, task_id=5005, n1=6)
+    retry.plan["retry_of_timeout"] = {"retry_of_task_id": 5004}
+    truths = {
+        original.collection_path.resolve(): original,
+        retry.collection_path.resolve(): retry,
+    }
+    monkeypatch.setattr(
+        ingest,
+        "authenticate_collection",
+        lambda path: truths[path.resolve()],
+    )
+    first = ingest.prepare_ingest(
+        base_dataset=base,
+        expected_base_sha256=ingest._sha256_file(base),
+        expected_base_rows=8,
+        collection_paths=[original.collection_path],
+    )
+    sequential_base = tmp_path / "sequential-base.parquet"
+    first.frame.to_parquet(sequential_base, index=False)
+    with pytest.raises(
+        ingest.StrictALIngestError,
+        match="logical authority task ID already exists in the base",
+    ):
+        ingest.prepare_ingest(
+            base_dataset=sequential_base,
+            expected_base_sha256=ingest._sha256_file(
+                sequential_base
+            ),
+            expected_base_rows=9,
+            collection_paths=[retry.collection_path],
+        )
+
+
 def test_truth_row_rejects_non_n1_6_even_when_source_matches(tmp_path):
     truth = _truth(tmp_path, task_id=5001, n1=5)
 

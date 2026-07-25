@@ -702,6 +702,20 @@ def retained_aedt_identity(
                 "mft-goal-diagnostic-standard-timeout-retry-profile-v1": (
                     "goal_diagnostic_standard_timeout_retry.json"
                 ),
+                (
+                    "mft-goal-diagnostic-standard-"
+                    "operational-pressure-retry-profile-v1"
+                ): (
+                    "goal_diagnostic_standard_"
+                    "operational_pressure_retry.json"
+                ),
+                (
+                    "mft-goal-diagnostic-standard-operational-pressure-"
+                    "after-timeout-retry-profile-v1"
+                ): (
+                    "goal_diagnostic_standard_operational_pressure_"
+                    "after_timeout_retry.json"
+                ),
             }.get(str(profile.get("schema_version") or ""))
             if expected_profile_name is None:
                 raise ValueError(
@@ -1232,7 +1246,7 @@ def submit_verification(
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
         same_node_as_task_id=0, node_name_policy="",
-        return_submission_evidence=False,
+        return_submission_evidence=False, pre_submit_guard=None,
         max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
         scheduler_url=None):
     """Submit one MFT task under the shared cross-process mutation lock."""
@@ -1255,6 +1269,10 @@ def submit_verification(
         submission_options["node_name_policy"] = node_name_policy
     if return_submission_evidence:
         submission_options["return_submission_evidence"] = True
+    if pre_submit_guard is not None:
+        if not callable(pre_submit_guard):
+            raise TypeError("pre_submit_guard must be callable")
+        submission_options["pre_submit_guard"] = pre_submit_guard
     if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
         submission_options["max_project_active_tasks"] = (
             max_project_active_tasks)
@@ -1293,7 +1311,7 @@ def _submit_verification_locked(
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
         same_node_as_task_id=0, node_name_policy="",
-        return_submission_evidence=False,
+        return_submission_evidence=False, pre_submit_guard=None,
         max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
         scheduler_url=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
@@ -1338,6 +1356,8 @@ def _submit_verification_locked(
         )
     if not isinstance(return_submission_evidence, bool):
         raise TypeError("return_submission_evidence must be a bool")
+    if pre_submit_guard is not None and not callable(pre_submit_guard):
+        raise TypeError("pre_submit_guard must be callable")
     if (isinstance(max_workers_per_node, bool)
             or not isinstance(max_workers_per_node, int)
             or max_workers_per_node < 0):
@@ -1517,6 +1537,8 @@ def _submit_verification_locked(
         payload["aedt_backend"] = aedt_backend
     if same_node_as_task_id:
         payload["same_node_as_task_id"] = same_node_as_task_id
+    if pre_submit_guard is not None:
+        pre_submit_guard()
     existing = reconcile_submission()
     if existing is not None:
         if return_submission_evidence:
