@@ -1,0 +1,405 @@
+{
+  "schema_version": "mft-goal-old-g0-parallel-capacity-audit-v1",
+  "campaign_id": "mft-goal-20260726",
+  "observed_at_utc": "2026-07-25T14:25:40.129Z",
+  "observed_at_kst": "2026-07-25T23:25:40.129+09:00",
+  "deadline_utc": "2026-07-26T09:00:00Z",
+  "deadline_kst": "2026-07-26T18:00:00+09:00",
+  "remaining_seconds": 66859.871,
+  "remaining_hours": 18.572186388888888,
+  "source_revision": "e8c38b4954396030378de9db2234568366cebc5b",
+  "decision": {
+    "action": "do_not_submit_additional_old_g0_nsga",
+    "allowed": false,
+    "scientific_benefit_clear": false,
+    "operational_non_interference_proven": false,
+    "additional_seed_range": null,
+    "new_bundle_prepared": false,
+    "new_aggregate_prepared": false,
+    "scheduler_http_methods_used": [
+      "GET"
+    ],
+    "scheduler_get_calls_performed": true,
+    "scheduler_get_call_count_claimed": false,
+    "scheduler_post_calls": 0,
+    "scheduler_patch_calls": 0,
+    "scheduler_delete_calls": 0,
+    "scheduler_cancel_calls": 0,
+    "reason_codes": [
+      "existing_512_seed_search_has_zero_hard_feasible",
+      "old_g0_quality_gate_failed_15_of_25_targets",
+      "all_12_near_feasible_standard_candidates_share_two_llt_blockers",
+      "old_g0_is_search_only_and_cannot_auto_promote",
+      "standard_8cpu_64gib_ready_fit_slots_zero",
+      "full_16cpu_96gib_ready_fit_slots_zero",
+      "active_pools_are_draining_for_fea_or_high_cpu",
+      "full_fast_lane_deadline_capacity_must_be_preserved",
+      "hypothetical_bundle_remote_transient_gpfs_envelope_not_sealed"
+    ]
+  },
+  "seed_and_generation_isolation": {
+    "existing_old_g0_seed_interval": {
+      "start": 2607262000,
+      "end": 2607262511,
+      "count": 512
+    },
+    "reserved_active_learning_seed_interval": {
+      "start": 2607263000,
+      "end": 2607263511,
+      "count": 512,
+      "used_by_this_audit": false,
+      "reservation_preserved": true
+    },
+    "new_old_g0_seed_interval": null,
+    "old_g0_and_new_generation_results_mixed": false,
+    "existing_old_g0_aggregate_modified": false
+  },
+  "fixed_contract": {
+    "size_limits_mm": {
+      "W": 1200.0,
+      "L": 1000.0,
+      "H": 750.0
+    },
+    "resonance_minimum_hz": 15000.0,
+    "temperature_limits_c": {
+      "winding": 100.0,
+      "core": 120.0
+    },
+    "fan_velocity_m_s": 1.5,
+    "fan_config": "dual",
+    "tim_and_insulation_conductivity_w_mk": 0.2,
+    "wcp_pad_thickness_mm": 2.0,
+    "core_plate_pad_thickness_mm": 2.0,
+    "physics_modified_by_this_audit": false,
+    "scheduler_project_modified_by_this_audit": false
+  },
+  "old_g0_science": {
+    "quality_gate_passed": false,
+    "quality_target_count": 25,
+    "quality_failed_target_count": 15,
+    "quality_failed_targets": [
+      "B_max_core",
+      "Llt_phys",
+      "P_Rx_main_group",
+      "P_Tx_main_group",
+      "T_max_core",
+      "T_max_Rx_main",
+      "T_max_Rx_side",
+      "T_max_Tx",
+      "Tprobe_Rx_main_leeward_max",
+      "Tprobe_Rx_side_leeward_max",
+      "Tprobe_Tx_leeward_max",
+      "Tprobe_core_center_leg_max",
+      "Tprobe_core_center_max",
+      "Tprobe_core_side_leg_max",
+      "Tprobe_core_top_yoke_max"
+    ],
+    "search_only_proposal": true,
+    "production_eligible": false,
+    "automatic_promotion_allowed": false,
+    "seed_count": 512,
+    "terminal_row_count": 163840,
+    "deduplicated_physical_geometry_count": 133563,
+    "hard_feasible_count": 0,
+    "production_pareto_count": 0,
+    "audit_objective_front_count": 22,
+    "standard_candidate_count": 12,
+    "standard_candidate_n1_counts": {
+      "5": 0,
+      "6": 12,
+      "7": 0,
+      "8": 0
+    },
+    "standard_candidate_positive_constraint_frequency": {
+      "Llt_robust_band": 12,
+      "Llt_ensemble_disagreement": 12,
+      "temperature_robust_limit:T_max_Tx": 4
+    },
+    "standard_candidate_llt_robust_band_range": {
+      "minimum": 0.525574470043418,
+      "maximum": 0.817819570846283
+    },
+    "standard_candidate_llt_ensemble_disagreement_range": {
+      "minimum": 0.639344669502866,
+      "maximum": 0.894348590762019
+    }
+  },
+  "statistical_context": {
+    "model": "one_sided_exact_zero_success_binomial_bound_under_stationary_independent_seed_assumption",
+    "confidence": 0.95,
+    "observed_seed_successes": 0,
+    "observed_seed_trials": 512,
+    "seed_success_probability_upper_bound": 0.00583395560055633,
+    "candidate_success_probability_upper_bound_if_iid": 1.82843315795767e-05,
+    "warning": "NSGA terminal candidates and seeds share one model and are correlated; these are optimistic context bounds, not submission authority",
+    "additional_seed_scenarios": [
+      {
+        "seed_count": 4,
+        "requested_cpu_count_if_concurrent": 32,
+        "requested_memory_gib_if_concurrent": 256,
+        "projected_requested_cpu_hours_at_historical_mean": 20.59,
+        "projected_retained_harvest_gib": 0.0201,
+        "upper_95_probability_of_any_success_under_assumption": 0.023132
+      },
+      {
+        "seed_count": 32,
+        "requested_cpu_count_if_concurrent": 256,
+        "requested_memory_gib_if_concurrent": 2048,
+        "projected_requested_cpu_hours_at_historical_mean": 164.69,
+        "projected_retained_harvest_gib": 0.1609,
+        "upper_95_probability_of_any_success_under_assumption": 0.17075
+      },
+      {
+        "seed_count": 128,
+        "requested_cpu_count_if_concurrent": 1024,
+        "requested_memory_gib_if_concurrent": 8192,
+        "projected_requested_cpu_hours_at_historical_mean": 658.74,
+        "projected_retained_harvest_gib": 0.6436,
+        "upper_95_probability_of_any_success_under_assumption": 0.527129
+      },
+      {
+        "seed_count": 512,
+        "requested_cpu_count_if_concurrent": 4096,
+        "requested_memory_gib_if_concurrent": 32768,
+        "projected_requested_cpu_hours_at_historical_mean": 2634.98,
+        "projected_retained_harvest_gib": 2.5744,
+        "upper_95_probability_of_any_success_under_assumption": 0.95
+      }
+    ]
+  },
+  "historical_runtime_and_storage": {
+    "resources_per_task": {
+      "cpus": 8,
+      "memory_gib": 64,
+      "optimizer_processes": 1,
+      "timeout_seconds": 14400
+    },
+    "task_count": 512,
+    "completed_task_count": 512,
+    "runtime_seconds": {
+      "minimum": 1919,
+      "p50": 2064,
+      "p90": 3569,
+      "maximum": 5017,
+      "mean": 2315.900390625,
+      "sum": 1185741
+    },
+    "requested_cpu_hours": 2634.98,
+    "campaign_first_created": "2026-07-24 14:14:31",
+    "campaign_last_finished": "2026-07-24 16:51:39",
+    "campaign_elapsed_seconds": 9428,
+    "account_task_counts": {
+      "dhj02": 104,
+      "harry261": 122,
+      "jji0930": 148,
+      "r1jae262": 138
+    },
+    "retained_harvest": {
+      "task_directory_count": 512,
+      "total_bytes": 2764205485,
+      "total_gib": 2.5743669690564275,
+      "mean_bytes_per_task": 5398838.837890625,
+      "minimum_bytes_per_task": 4432688,
+      "p50_bytes_per_task": 5531096,
+      "p90_bytes_per_task": 5557058,
+      "maximum_bytes_per_task": 5734570,
+      "remote_transient_gpfs_upper_bound_available": false,
+      "retained_bytes_are_not_a_remote_transient_upper_bound": true
+    }
+  },
+  "live_scheduler_snapshot": {
+    "scheduler_url": "http://127.0.0.1:8002",
+    "health": {
+      "scheduler_thread_alive": true,
+      "scheduler_stalled": false,
+      "last_tick_completed_at": "2026-07-25T14:25:15.235356+00:00"
+    },
+    "active_task_count": 4,
+    "active_standard_fea_task_count": 4,
+    "active_standard_fea_requested_cpus": 32,
+    "active_standard_fea_requested_memory_mib": 131072,
+    "active_standard_fea_task_ids": [
+      96294,
+      96295,
+      96296,
+      96298
+    ],
+    "active_allocation_count": 4,
+    "active_allocations": [
+      {
+        "allocation_id": 14621,
+        "account_name": "dhj02",
+        "node_name": "n116",
+        "slurm_job_id": "829952",
+        "total_cpus": 64,
+        "node_cpu_used": 168,
+        "node_cpu_total": 256,
+        "node_memory_used_gb": 509,
+        "node_memory_total_gb": 1007,
+        "node_memory_used_percent": 50.5,
+        "node_fea_requested_cpus": 24,
+        "drain_reason": "queued FEA CPU demand"
+      },
+      {
+        "allocation_id": 14620,
+        "account_name": "dw16",
+        "node_name": "n113",
+        "slurm_job_id": "829579",
+        "total_cpus": 64,
+        "node_cpu_used": 96,
+        "node_cpu_total": 256,
+        "node_memory_used_gb": 279,
+        "node_memory_total_gb": 1007,
+        "node_memory_used_percent": 27.7,
+        "node_fea_requested_cpus": 0,
+        "drain_reason": "queued FEA CPU demand"
+      },
+      {
+        "allocation_id": 14619,
+        "account_name": "jji0930",
+        "node_name": "n108",
+        "slurm_job_id": "826839",
+        "total_cpus": 64,
+        "node_cpu_used": 96,
+        "node_cpu_total": 256,
+        "node_memory_used_gb": 773,
+        "node_memory_total_gb": 1007,
+        "node_memory_used_percent": 76.7,
+        "node_fea_requested_cpus": 0,
+        "drain_reason": "queued FEA CPU demand"
+      },
+      {
+        "allocation_id": 14492,
+        "account_name": "r1jae262",
+        "node_name": "n114",
+        "slurm_job_id": "824575",
+        "total_cpus": 64,
+        "node_cpu_used": 64,
+        "node_cpu_total": 256,
+        "node_memory_used_gb": 554,
+        "node_memory_total_gb": 1007,
+        "node_memory_used_percent": 55.0,
+        "node_fea_requested_cpus": 8,
+        "drain_reason": "high CPU utilization"
+      }
+    ],
+    "account_job_slots": {
+      "total_max_jobs": 110,
+      "running_jobs": 23,
+      "pending_jobs": 1,
+      "nominal_total_headroom": 86,
+      "maxjobs_is_primary_blocker": false
+    },
+    "old_g0_standard_capacity": {
+      "request": {
+        "cpus": 8,
+        "memory_mib": 65536,
+        "scheduling_profile": "standard",
+        "partition": "cpu2"
+      },
+      "fit_slots": 0,
+      "ready_fit_slots": 0,
+      "pending_fit_slots": 0,
+      "inflight_fit_slots": 0,
+      "queue_state": "opening",
+      "queue_reason": "no single ready pool has 8 free CPUs; opening demand pools"
+    },
+    "full_fast_lane_capacity": {
+      "request": {
+        "cpus": 16,
+        "memory_mib": 98304,
+        "timeout_seconds": 43200,
+        "scheduling_profile": "fea",
+        "aedt_backend": "standalone",
+        "priority": 100,
+        "full_model": 1,
+        "thermal_symmetry": "full"
+      },
+      "fit_slots": 0,
+      "ready_fit_slots": 0,
+      "pending_fit_slots": 0,
+      "inflight_fit_slots": 0,
+      "queue_state": "opening",
+      "queue_reason": "no single ready pool has 16 free CPUs; opening demand pools"
+    }
+  },
+  "gpfs_context": {
+    "r1jae262": {
+      "observed_at_utc": "2026-07-25T14:25:33.320293+00:00",
+      "used_gb": 100.24229431152344,
+      "in_doubt_gb": 5.203857421875,
+      "limit_gb": 200.0,
+      "effective_free_gb": 94.55384826660156
+    },
+    "dhj02": {
+      "observed_at_kst": "2026-07-25T22:58:53+09:00",
+      "used_gb": 42.55409240722656,
+      "in_doubt_gb": 0.015655517578125,
+      "limit_gb": 110.0,
+      "observed_free_gb": 67.43025207519531,
+      "running_fea_reservation_gb": 12.0
+    },
+    "assessment": "retained NSGA artifacts are modest, but no hypothetical new old-G0 bundle has an authenticated remote transient envelope; storage does not establish submission safety"
+  },
+  "critical_path_interference": {
+    "standard_fea_truth_collection_is_active": true,
+    "full_fast_lane_is_pending_truth_promotion": true,
+    "old_g0_has_lower_decision_value_than_new_authenticated_truth": true,
+    "additional_old_g0_may_open_demand_pools": true,
+    "additional_old_g0_must_not_delay_full_fast_lane": true
+  },
+  "reconsideration_requires_all": [
+    "at_least_8_new_complete_unique_authenticated_rows_from_at_least_4_source_tasks",
+    "one_new_25_target_generation_with_unchanged_quality_gate",
+    "generation_specific_bundle_and_aggregate_with_no_old_new_result_mixing",
+    "ready_capacity_separate_from_standard_fea_and_full_fast_lane",
+    "authenticated_remote_transient_gpfs_envelope",
+    "reserved_active_learning_seed_interval_used_only_by_the_admitted_new_generation"
+  ],
+  "source_evidence": [
+    {
+      "path": "C:\\Users\\peets\\slurm_scheduler_runtime\\mft_goal_20260726\\campaign_rolling512_a0977dd\\bundle_manifest.json",
+      "size_bytes": 57587,
+      "sha256": "29839d8acb053dd49383151998ce40129507219629ace6ff5e3a5dc4e97af6ff"
+    },
+    {
+      "path": "C:\\Users\\peets\\slurm_scheduler_runtime\\mft_goal_20260726\\campaign_rolling512_a0977dd\\scheduler_manifest.json",
+      "size_bytes": 8954,
+      "sha256": "874e641ba689f4194320718403300fa9e24ceb60c6fee7506aa5d316a00d3de7"
+    },
+    {
+      "path": "C:\\Users\\peets\\slurm_scheduler_runtime\\mft_goal_20260726\\aggregate_rolling512_d4e4d60\\aggregate_manifest.json",
+      "size_bytes": 139552,
+      "sha256": "0ea4feb43f9eb37c8b057e7f06720f0c23590b463111443f99d8ffa6d08c4a63"
+    },
+    {
+      "path": "C:\\Users\\peets\\slurm_scheduler_runtime\\mft_goal_20260726\\aggregate_rolling512_d4e4d60\\standard_candidates.csv",
+      "size_bytes": 134599,
+      "sha256": "f99ee4b7fba62a83e5b958d24c31260a5ba48c6fa77e6d25f2f189896df3ff6d"
+    },
+    {
+      "path": "C:\\Users\\peets\\slurm_scheduler_runtime\\mft_goal_20260726\\g0b_25target_6151\\quality_status.json",
+      "size_bytes": 26917,
+      "sha256": "f4aaf32bef9a608dd43dea18625c91330a22327fd2340b6ccc8594a10a90db74"
+    },
+    {
+      "path": "docs\\MFT_GOAL_20260726_RUNBOOK.md",
+      "size_bytes": 7838,
+      "sha256": "c124aa06ccf019a992b2180f27de98af04b79c434452395283809f4033d2719e"
+    },
+    {
+      "path": "docs\\MFT_GOAL_ACTIVE_LEARNING_CONTINGENCY_20260726.md",
+      "size_bytes": 10284,
+      "sha256": "efd2c27ea0a9ca93687eb20ba318c824650b22fdf7e947126001a61be7c57942"
+    },
+    {
+      "path": "C:\\Users\\peets\\slurm_scheduler_runtime\\mft_goal_20260726\\safe_refill_4fac_c276_260725\\state.json",
+      "sha256": "2e59f754e7a3a7c43a89c87803bce1d6a6a2bdb64f574a105b61ae6dc8415e93"
+    },
+    {
+      "path": "C:\\Users\\peets\\slurm_scheduler_runtime\\mft_goal_20260726\\n116_operational_successor_r4_1b7d912_4fac_260725\\storage\\dhj02_gpfs_audit_20260725T225853.json",
+      "sha256": "4ed93e09b58ba210cb13bbf60ed7bff7011b84313813040fa4e5be427585c840"
+    }
+  ],
+  "payload_sha256": "a6c6f7307a5033b152dd212382137ba98198a9fcb30a3f7f8fd42f4c99f477de"
+}
