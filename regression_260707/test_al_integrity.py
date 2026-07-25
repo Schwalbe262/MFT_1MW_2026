@@ -578,6 +578,48 @@ class SchedulerClientIntegrityTests(unittest.TestCase):
         self.assertEqual(payload["max_workers_per_node"], 1)
         self.assertFalse(payload.get("exclusive_node", False))
 
+    def test_submit_forwards_same_node_allocation_binding(self):
+        submitted = Mock(status_code=201)
+        submitted.json.return_value = {"id": 403}
+        with patch.object(
+                scheduler_client.requests, "get",
+                return_value=task_inventory_response([])), patch.object(
+                    scheduler_client.requests, "post",
+                    return_value=submitted) as post:
+            task_id = scheduler_client.submit_verification(
+                "candidate-same-allocation", "candidate_workdir",
+                {"x": 1}, {},
+                solver_revision=TEST_REVISION,
+                library_revision=TEST_LIBRARY_REVISION,
+                account_name="account-a",
+                node_name="node-101",
+                same_node_as_task_id=402,
+            )
+
+        self.assertEqual(task_id, 403)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["account_name"], "account-a")
+        self.assertEqual(payload["node_name"], "node-101")
+        self.assertEqual(payload["same_node_as_task_id"], 402)
+        self.assertNotIn("requested_allocation_id", payload)
+
+    def test_submit_rejects_invalid_same_node_binding(self):
+        for task_id in (True, -1, 1.0, "1", None):
+            with self.subTest(task_id=task_id), patch.object(
+                    scheduler_client.requests, "post") as post:
+                with self.assertRaisesRegex(
+                        ValueError, "same_node_as_task_id"):
+                    scheduler_client.submit_verification(
+                        "candidate-invalid-same-node",
+                        "candidate_workdir",
+                        {"x": 1},
+                        {},
+                        solver_revision=TEST_REVISION,
+                        library_revision=TEST_LIBRARY_REVISION,
+                        same_node_as_task_id=task_id,
+                    )
+            post.assert_not_called()
+
     def test_submit_rejects_non_integer_priority(self):
         for priority in (True, 10.0, "10", None):
             with self.subTest(priority=priority), patch.object(

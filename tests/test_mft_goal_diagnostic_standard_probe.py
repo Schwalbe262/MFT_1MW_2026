@@ -498,6 +498,55 @@ def _timeout_task_snapshot(submission, **overrides):
     return snapshot
 
 
+def _same_allocation_anchor_snapshot(**overrides):
+    snapshot = {
+        "task_id": 72000,
+        "name": "mft-goal-diag-standard-timeout-r1-anchor",
+        "status": "running",
+        "state": "running",
+        "allocation_id": 9002,
+        "slurm_job_id": "81300",
+        "account_name": "anchor-account",
+        "actual_node_name": "n110",
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "project": scheduler_client.MFT_PROJECT,
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 28800,
+        "dedupe_key": "anchor-dedupe",
+        "started_at": "2026-07-25 00:05:31",
+        "finished_at": None,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def _same_allocation_submitted_snapshot(submission, **overrides):
+    snapshot = {
+        "task_id": submission["task_id"],
+        "name": submission["task_name"],
+        "status": "running",
+        "state": "running",
+        "allocation_id": 9002,
+        "slurm_job_id": "81300",
+        "account_name": "anchor-account",
+        "actual_node_name": "n110",
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "project": scheduler_client.MFT_PROJECT,
+        "cpus": 8,
+        "memory_mb": 32768,
+        "timeout_seconds": 28800,
+        "dedupe_key": submission["dedupe_key"],
+        "same_node_as_task_id": 72000,
+        "requested_allocation_id": 0,
+        "finished_at": None,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
 def test_selection_is_deterministic_diverse_and_mean_band_bound(
     tmp_path, monkeypatch
 ):
@@ -791,6 +840,270 @@ def test_timeout_retry_reauthenticates_failure_before_single_submission(
     assert submitted_profile["timeout_seconds"] == 28800
     assert submitted_profile["cpus"] == 8
     assert submitted_profile["mem_mb"] == 32768
+
+
+def test_timeout_retry_can_seal_exact_same_allocation_binding(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_scheduler = _FakeScheduler()
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "original-submission.json",
+        scheduler=original_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan = probe._load_plan(original_plan_path)[0]
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+    retry_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "retry-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            original_submission
+        ),
+    )
+    retry_plan = probe._load_plan(retry_plan_path)[0]
+    expected_submission = {
+        "task_id": 71002,
+        "task_name": retry_plan["stage"]["task_name"],
+        "dedupe_key": retry_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+    }
+
+    class _RetryScheduler(_FakeScheduler):
+        def submit_verification(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return 71002
+
+    def task_reader(**kwargs):
+        task_id = kwargs["task_id"]
+        if task_id == original_submission["task_id"]:
+            return _timeout_task_snapshot(original_submission)
+        if task_id == 72000:
+            return _same_allocation_anchor_snapshot()
+        if task_id == 71002:
+            return _same_allocation_submitted_snapshot(
+                expected_submission
+            )
+        raise AssertionError(task_id)
+
+    retry_scheduler = _RetryScheduler()
+    retry_submission_path = probe.submit_timeout_retry(
+        plan_path=retry_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "retry-submission.json",
+        scheduler=retry_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+        task_reader=task_reader,
+        same_node_as_task_id=72000,
+        expected_allocation_id=9002,
+        expected_slurm_job_id="81300",
+        expected_account_name="anchor-account",
+        expected_node_name="n110",
+    )
+    retry_submission = probe._load_submission(
+        retry_submission_path, plan=retry_plan
+    )
+    kwargs = retry_scheduler.calls[0][1]
+    assert kwargs["same_node_as_task_id"] == 72000
+    assert kwargs["account_name"] == "anchor-account"
+    assert kwargs["node_name"] == "n110"
+    placement = retry_submission["scheduler_placement_contract"]
+    assert placement["schema_version"] == (
+        probe.SAME_ALLOCATION_PLACEMENT_SCHEMA
+    )
+    assert placement["expected_allocation_id"] == 9002
+    assert placement["expected_slurm_job_id"] == "81300"
+    assert placement["fallback_allocation_allowed"] is False
+    assert placement["requested_allocation_id_used"] is False
+    assert placement["submitted_task_after_submission"][
+        "same_node_as_task_id"
+    ] == 72000
+
+    terminal = {
+        **_task_snapshot(retry_submission),
+        "allocation_id": 9002,
+        "slurm_job_id": "81300",
+        "account_name": "anchor-account",
+        "actual_node_name": "n110",
+    }
+    assert probe._task_execution_evidence(
+        terminal, submission=retry_submission
+    )["allocation_id"] == 9002
+    with pytest.raises(
+        production.HandoffContractError,
+        match="escaped its sealed same-allocation",
+    ):
+        probe._task_execution_evidence(
+            {**terminal, "allocation_id": 9003},
+            submission=retry_submission,
+        )
+
+    unsigned = production._read_json(retry_submission_path)
+    unsigned.pop("payload_sha256")
+    unsigned["scheduler_placement_contract"][
+        "expected_node_name"
+    ] = "n109"
+    drifted_path = tmp_path / "drifted-retry-submission.json"
+    drifted_path.write_text(
+        json.dumps(
+            production._seal(unsigned),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        production.HandoffContractError,
+        match="anchor drifted",
+    ):
+        probe._load_submission(drifted_path, plan=retry_plan)
+
+
+def test_same_allocation_retry_fails_closed_on_anchor_or_task_drift(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original_plan_path = _make_plan(tmp_path, fixture)
+    cutover_path = _scheduler_cutover(tmp_path, monkeypatch)
+    original_scheduler = _FakeScheduler()
+    original_submission_path = probe.submit_standard(
+        plan_path=original_plan_path,
+        scheduler_cutover_receipt_path=cutover_path,
+        output=tmp_path / "original-submission.json",
+        scheduler=original_scheduler,
+        predictor=_Predictor(),
+        live_reader=_live_scheduler_reader,
+    )
+    original_plan = probe._load_plan(original_plan_path)[0]
+    original_submission = probe._load_submission(
+        original_submission_path, plan=original_plan
+    )
+    retry_plan_path = probe.create_timeout_retry_plan(
+        original_plan_path=original_plan_path,
+        original_submission_path=original_submission_path,
+        output=tmp_path / "retry-plan",
+        task_reader=lambda **_kwargs: _timeout_task_snapshot(
+            original_submission
+        ),
+    )
+    retry_plan = probe._load_plan(retry_plan_path)[0]
+    expected_submission = {
+        "task_id": 71002,
+        "task_name": retry_plan["stage"]["task_name"],
+        "dedupe_key": retry_plan["stage"]["retained_aedt_bundle"][
+            "dedupe_key"
+        ],
+    }
+
+    class _RetryScheduler(_FakeScheduler):
+        def submit_verification(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return 71002
+
+    blocked_scheduler = _RetryScheduler()
+
+    def failed_anchor_reader(**kwargs):
+        if kwargs["task_id"] == original_submission["task_id"]:
+            return _timeout_task_snapshot(original_submission)
+        return _same_allocation_anchor_snapshot(
+            status="failed",
+            state="failed",
+            finished_at="2026-07-25 01:00:00",
+        )
+
+    with pytest.raises(
+        production.HandoffContractError,
+        match="anchor drifted",
+    ):
+        probe.submit_timeout_retry(
+            plan_path=retry_plan_path,
+            scheduler_cutover_receipt_path=cutover_path,
+            output=tmp_path / "failed-anchor-submission.json",
+            scheduler=blocked_scheduler,
+            predictor=_Predictor(),
+            live_reader=_live_scheduler_reader,
+            task_reader=failed_anchor_reader,
+            same_node_as_task_id=72000,
+            expected_allocation_id=9002,
+            expected_slurm_job_id="81300",
+            expected_account_name="anchor-account",
+            expected_node_name="n110",
+        )
+    assert blocked_scheduler.calls == []
+
+    def unbound_existing_task_reader(**kwargs):
+        task_id = kwargs["task_id"]
+        if task_id == original_submission["task_id"]:
+            return _timeout_task_snapshot(original_submission)
+        if task_id == 72000:
+            return _same_allocation_anchor_snapshot()
+        if task_id == 71002:
+            return _same_allocation_submitted_snapshot(
+                expected_submission,
+                same_node_as_task_id=0,
+            )
+        raise AssertionError(task_id)
+
+    duplicate_scheduler = _RetryScheduler()
+    with pytest.raises(
+        production.HandoffContractError,
+        match="task binding drifted",
+    ):
+        probe.submit_timeout_retry(
+            plan_path=retry_plan_path,
+            scheduler_cutover_receipt_path=cutover_path,
+            output=tmp_path / "unbound-existing-submission.json",
+            scheduler=duplicate_scheduler,
+            predictor=_Predictor(),
+            live_reader=_live_scheduler_reader,
+            task_reader=unbound_existing_task_reader,
+            same_node_as_task_id=72000,
+            expected_allocation_id=9002,
+            expected_slurm_job_id="81300",
+            expected_account_name="anchor-account",
+            expected_node_name="n110",
+        )
+    assert len(duplicate_scheduler.calls) == 1
+    assert not (tmp_path / "unbound-existing-submission.json").exists()
+
+
+def test_timeout_retry_parser_exposes_complete_same_allocation_contract():
+    args = probe._parser().parse_args(
+        [
+            "submit-timeout-retry",
+            "--plan",
+            "plan.json",
+            "--scheduler-cutover-receipt",
+            "cutover.json",
+            "--same-node-as-task-id",
+            "96270",
+            "--expected-allocation-id",
+            "14616",
+            "--expected-slurm-job-id",
+            "826363",
+            "--expected-account-name",
+            "dhj02",
+            "--expected-node-name",
+            "n110",
+            "--output",
+            "submission.json",
+        ]
+    )
+    assert args.same_node_as_task_id == 96270
+    assert args.expected_allocation_id == 14616
+    assert args.expected_slurm_job_id == "826363"
+    assert args.expected_account_name == "dhj02"
+    assert args.expected_node_name == "n110"
 
 
 def test_timeout_retry_collection_is_accepted_by_strict_al(

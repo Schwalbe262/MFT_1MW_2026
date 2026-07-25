@@ -109,6 +109,9 @@ TIMEOUT_RETRY_PROFILE_SCHEMA = (
 TIMEOUT_RETRY_EVIDENCE_SCHEMA = (
     "mft-goal-diagnostic-standard-timeout-retry-evidence-v1"
 )
+SAME_ALLOCATION_PLACEMENT_SCHEMA = (
+    "mft-goal-diagnostic-same-allocation-placement-v1"
+)
 LLT_UNCERTAINTY_CONSTRAINTS = frozenset(
     {"Llt_robust_band", "Llt_ensemble_disagreement"}
 )
@@ -2622,6 +2625,264 @@ def _fresh_selection_reauthentication(
     }
 
 
+def _same_allocation_anchor_evidence(
+    snapshot: Mapping[str, Any],
+    *,
+    task_id: int,
+    allocation_id: int,
+    slurm_job_id: str,
+    account_name: str,
+    node_name: str,
+) -> dict[str, Any]:
+    evidence = {
+        "task_id": snapshot.get("task_id", snapshot.get("id")),
+        "name": snapshot.get("name"),
+        "status": snapshot.get("status"),
+        "state": snapshot.get("state"),
+        "allocation_id": snapshot.get(
+            "allocation_id", snapshot.get("assigned_allocation")
+        ),
+        "slurm_job_id": str(snapshot.get("slurm_job_id") or ""),
+        "account_name": snapshot.get("account_name"),
+        "actual_node_name": (
+            snapshot.get("actual_node_name")
+            or snapshot.get("allocation_node_name")
+        ),
+        "scheduling_profile": snapshot.get("scheduling_profile"),
+        "aedt_backend": snapshot.get("aedt_backend"),
+        "project": snapshot.get("project"),
+        "cpus": snapshot.get("cpus"),
+        "memory_mb": snapshot.get("memory_mb"),
+        "timeout_seconds": snapshot.get("timeout_seconds"),
+        "dedupe_key": snapshot.get("dedupe_key"),
+        "started_at": snapshot.get("started_at"),
+        "finished_at": snapshot.get("finished_at"),
+    }
+    if (
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or isinstance(allocation_id, bool)
+        or not isinstance(allocation_id, int)
+        or allocation_id <= 0
+        or not str(slurm_job_id).isdigit()
+        or not str(account_name).strip()
+        or not str(node_name).strip()
+        or evidence["task_id"] != task_id
+        or not str(evidence["name"] or "").strip()
+        or evidence["status"] != "running"
+        or evidence["state"] != "running"
+        or evidence["allocation_id"] != allocation_id
+        or evidence["slurm_job_id"] != str(slurm_job_id)
+        or evidence["account_name"] != account_name
+        or evidence["actual_node_name"] != node_name
+        or evidence["scheduling_profile"] != "fea_bursty"
+        or evidence["aedt_backend"] != "standalone"
+        or evidence["project"] != scheduler_client.MFT_PROJECT
+        or evidence["cpus"] != TIMEOUT_RETRY_RESOURCES["cpus"]
+        or evidence["memory_mb"] != 32768
+        or evidence["timeout_seconds"]
+        != TIMEOUT_RETRY_RESOURCES["timeout_seconds"]
+        or not str(evidence["dedupe_key"] or "").strip()
+        or not str(evidence["started_at"] or "").strip()
+        or evidence["finished_at"] not in (None, "")
+    ):
+        raise HandoffContractError(
+            "diagnostic timeout retry same-allocation anchor drifted"
+        )
+    return evidence
+
+
+def _same_allocation_submitted_task_evidence(
+    snapshot: Mapping[str, Any],
+    *,
+    task_id: int,
+    task_name: str,
+    dedupe_key: str,
+    anchor_task_id: int,
+    allocation_id: int,
+    slurm_job_id: str,
+    account_name: str,
+    node_name: str,
+) -> dict[str, Any]:
+    evidence = {
+        "task_id": snapshot.get("task_id", snapshot.get("id")),
+        "name": snapshot.get("name"),
+        "status": snapshot.get("status"),
+        "state": snapshot.get("state"),
+        "allocation_id": snapshot.get(
+            "allocation_id", snapshot.get("assigned_allocation")
+        ),
+        "slurm_job_id": str(snapshot.get("slurm_job_id") or ""),
+        "account_name": snapshot.get("account_name"),
+        "actual_node_name": (
+            snapshot.get("actual_node_name")
+            or snapshot.get("allocation_node_name")
+        ),
+        "scheduling_profile": snapshot.get("scheduling_profile"),
+        "aedt_backend": snapshot.get("aedt_backend"),
+        "project": snapshot.get("project"),
+        "cpus": snapshot.get("cpus"),
+        "memory_mb": snapshot.get("memory_mb"),
+        "timeout_seconds": snapshot.get("timeout_seconds"),
+        "dedupe_key": snapshot.get("dedupe_key"),
+        "same_node_as_task_id": snapshot.get("same_node_as_task_id"),
+        "requested_allocation_id": snapshot.get(
+            "requested_allocation_id", 0
+        ),
+        "finished_at": snapshot.get("finished_at"),
+    }
+    status = evidence["status"]
+    state = evidence["state"]
+    assigned = evidence["allocation_id"] not in (None, 0)
+    assigned_identity_valid = (
+        evidence["allocation_id"] == allocation_id
+        and evidence["slurm_job_id"] == str(slurm_job_id)
+        and evidence["account_name"] == account_name
+        and evidence["actual_node_name"] == node_name
+        and status in ("attaching", "running")
+        and state in ("attaching", "running")
+    )
+    queued_identity_valid = (
+        not assigned
+        and status == "queued"
+        and state == "queued"
+        and evidence["slurm_job_id"] == ""
+        and not str(evidence["actual_node_name"] or "").strip()
+    )
+    if (
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or evidence["task_id"] != task_id
+        or evidence["name"] != task_name
+        or evidence["dedupe_key"] != dedupe_key
+        or evidence["same_node_as_task_id"] != anchor_task_id
+        or evidence["requested_allocation_id"] not in (None, 0)
+        or evidence["scheduling_profile"] != "fea_bursty"
+        or evidence["aedt_backend"] != "standalone"
+        or evidence["project"] != scheduler_client.MFT_PROJECT
+        or evidence["cpus"] != TIMEOUT_RETRY_RESOURCES["cpus"]
+        or evidence["memory_mb"] != 32768
+        or evidence["timeout_seconds"]
+        != TIMEOUT_RETRY_RESOURCES["timeout_seconds"]
+        or evidence["finished_at"] not in (None, "")
+        or not (assigned_identity_valid or queued_identity_valid)
+    ):
+        raise HandoffContractError(
+            "diagnostic timeout retry same-allocation task binding drifted"
+        )
+    return evidence
+
+
+def _same_allocation_placement_contract(
+    *,
+    anchor_before: Mapping[str, Any],
+    anchor_after: Mapping[str, Any],
+    submitted_task: Mapping[str, Any],
+    anchor_task_id: int,
+    allocation_id: int,
+    slurm_job_id: str,
+    account_name: str,
+    node_name: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SAME_ALLOCATION_PLACEMENT_SCHEMA,
+        "same_node_as_task_id": anchor_task_id,
+        "expected_allocation_id": allocation_id,
+        "expected_slurm_job_id": str(slurm_job_id),
+        "expected_account_name": account_name,
+        "expected_node_name": node_name,
+        "anchor_before_submission": copy.deepcopy(anchor_before),
+        "anchor_after_submission": copy.deepcopy(anchor_after),
+        "submitted_task_after_submission": copy.deepcopy(submitted_task),
+        "same_node_reference_allocation_enforced": True,
+        "fallback_allocation_allowed": False,
+        "requested_allocation_id_used": False,
+    }
+
+
+def _validate_same_allocation_placement_contract(
+    value: Any,
+    *,
+    submission: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "same_node_as_task_id",
+        "expected_allocation_id",
+        "expected_slurm_job_id",
+        "expected_account_name",
+        "expected_node_name",
+        "anchor_before_submission",
+        "anchor_after_submission",
+        "submitted_task_after_submission",
+        "same_node_reference_allocation_enforced",
+        "fallback_allocation_allowed",
+        "requested_allocation_id_used",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise HandoffContractError(
+            "diagnostic same-allocation placement contract is malformed"
+        )
+    anchor_task_id = value.get("same_node_as_task_id")
+    allocation_id = value.get("expected_allocation_id")
+    slurm_job_id = value.get("expected_slurm_job_id")
+    account_name = value.get("expected_account_name")
+    node_name = value.get("expected_node_name")
+    if (
+        value.get("schema_version") != SAME_ALLOCATION_PLACEMENT_SCHEMA
+        or value.get("same_node_reference_allocation_enforced") is not True
+        or value.get("fallback_allocation_allowed") is not False
+        or value.get("requested_allocation_id_used") is not False
+    ):
+        raise HandoffContractError(
+            "diagnostic same-allocation placement policy drifted"
+        )
+    before = _same_allocation_anchor_evidence(
+        value.get("anchor_before_submission") or {},
+        task_id=anchor_task_id,
+        allocation_id=allocation_id,
+        slurm_job_id=slurm_job_id,
+        account_name=account_name,
+        node_name=node_name,
+    )
+    after = _same_allocation_anchor_evidence(
+        value.get("anchor_after_submission") or {},
+        task_id=anchor_task_id,
+        allocation_id=allocation_id,
+        slurm_job_id=slurm_job_id,
+        account_name=account_name,
+        node_name=node_name,
+    )
+    submitted = _same_allocation_submitted_task_evidence(
+        value.get("submitted_task_after_submission") or {},
+        task_id=submission.get("task_id"),
+        task_name=str(submission.get("task_name") or ""),
+        dedupe_key=str(submission.get("dedupe_key") or ""),
+        anchor_task_id=anchor_task_id,
+        allocation_id=allocation_id,
+        slurm_job_id=slurm_job_id,
+        account_name=account_name,
+        node_name=node_name,
+    )
+    normalized = _same_allocation_placement_contract(
+        anchor_before=before,
+        anchor_after=after,
+        submitted_task=submitted,
+        anchor_task_id=anchor_task_id,
+        allocation_id=allocation_id,
+        slurm_job_id=slurm_job_id,
+        account_name=account_name,
+        node_name=node_name,
+    )
+    if normalized != value:
+        raise HandoffContractError(
+            "diagnostic same-allocation placement evidence drifted"
+        )
+    return normalized
+
+
 def _submit_standard_plan(
     *,
     plan_path: Path,
@@ -2633,6 +2894,11 @@ def _submit_standard_plan(
     predictor: Any | None = None,
     live_reader: Any = _default_scheduler_live_reader,
     task_reader: Any = None,
+    same_node_as_task_id: int = 0,
+    expected_allocation_id: int = 0,
+    expected_slurm_job_id: str = "",
+    expected_account_name: str = "",
+    expected_node_name: str = "",
 ) -> Path:
     plan, params, selected = _load_plan(plan_path)
     timeout_retry = _plan_is_timeout_retry(plan)
@@ -2644,6 +2910,29 @@ def _submit_standard_plan(
         )
         raise HandoffContractError(
             f"diagnostic plan requires {command}"
+        )
+    placement_requested = (
+        same_node_as_task_id != 0
+        or expected_allocation_id != 0
+        or bool(str(expected_slurm_job_id).strip())
+        or bool(str(expected_account_name).strip())
+        or bool(str(expected_node_name).strip())
+    )
+    if placement_requested and (
+        not timeout_retry
+        or isinstance(same_node_as_task_id, bool)
+        or not isinstance(same_node_as_task_id, int)
+        or same_node_as_task_id <= 0
+        or isinstance(expected_allocation_id, bool)
+        or not isinstance(expected_allocation_id, int)
+        or expected_allocation_id <= 0
+        or not str(expected_slurm_job_id).isdigit()
+        or not str(expected_account_name).strip()
+        or not str(expected_node_name).strip()
+    ):
+        raise HandoffContractError(
+            "same-allocation placement requires a timeout retry and the "
+            "complete positive anchor identity"
         )
     reauthentication = _fresh_selection_reauthentication(
         plan=plan, selected=selected, predictor=predictor
@@ -2667,13 +2956,14 @@ def _submit_standard_plan(
             "Scheduler live launcher changed during admission checks"
         )
     retry_record = None
+    reader = task_reader or _scheduler_task_snapshot
+    anchor_before = None
     if timeout_retry:
         (
             _original_plan,
             original_submission,
             stored_execution,
         ) = _validate_timeout_retry_record(plan)
-        reader = task_reader or _scheduler_task_snapshot
         live_execution = _timeout_failure_evidence(
             reader(
                 scheduler_url=stage["scheduler_url"],
@@ -2687,6 +2977,18 @@ def _submit_standard_plan(
                 "submission"
             )
         retry_record = copy.deepcopy(plan["retry_of_timeout"])
+        if placement_requested:
+            anchor_before = _same_allocation_anchor_evidence(
+                reader(
+                    scheduler_url=stage["scheduler_url"],
+                    task_id=same_node_as_task_id,
+                ),
+                task_id=same_node_as_task_id,
+                allocation_id=expected_allocation_id,
+                slurm_job_id=str(expected_slurm_job_id),
+                account_name=str(expected_account_name),
+                node_name=str(expected_node_name),
+            )
     target = output.resolve()
     if target.exists():
         raise HandoffContractError(
@@ -2699,6 +3001,15 @@ def _submit_standard_plan(
         stage="standard",
         solver_revision=plan["solver_revision"],
         license_snapshot_path=None,
+    )
+    placement_submission_options = (
+        {
+            "account_name": str(expected_account_name),
+            "node_name": str(expected_node_name),
+            "same_node_as_task_id": same_node_as_task_id,
+        }
+        if placement_requested
+        else {}
     )
     task_id = scheduler.submit_verification(
         stage["task_name"],
@@ -2715,6 +3026,7 @@ def _submit_standard_plan(
         required_project_cap=GOAL_FEA_PROJECT_CAP,
         max_project_active_tasks=GOAL_FEA_PROJECT_CAP,
         scheduler_url=stage["scheduler_url"],
+        **placement_submission_options,
     )
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
         raise HandoffContractError(
@@ -2726,6 +3038,43 @@ def _submit_standard_plan(
     ):
         raise HandoffContractError(
             "diagnostic timeout retry resolved to the original task ID"
+        )
+    placement_contract = None
+    if placement_requested:
+        anchor_after = _same_allocation_anchor_evidence(
+            reader(
+                scheduler_url=stage["scheduler_url"],
+                task_id=same_node_as_task_id,
+            ),
+            task_id=same_node_as_task_id,
+            allocation_id=expected_allocation_id,
+            slurm_job_id=str(expected_slurm_job_id),
+            account_name=str(expected_account_name),
+            node_name=str(expected_node_name),
+        )
+        submitted_task = _same_allocation_submitted_task_evidence(
+            reader(
+                scheduler_url=stage["scheduler_url"],
+                task_id=task_id,
+            ),
+            task_id=task_id,
+            task_name=stage["task_name"],
+            dedupe_key=stage["retained_aedt_bundle"]["dedupe_key"],
+            anchor_task_id=same_node_as_task_id,
+            allocation_id=expected_allocation_id,
+            slurm_job_id=str(expected_slurm_job_id),
+            account_name=str(expected_account_name),
+            node_name=str(expected_node_name),
+        )
+        placement_contract = _same_allocation_placement_contract(
+            anchor_before=anchor_before,
+            anchor_after=anchor_after,
+            submitted_task=submitted_task,
+            anchor_task_id=same_node_as_task_id,
+            allocation_id=expected_allocation_id,
+            slurm_job_id=str(expected_slurm_job_id),
+            account_name=str(expected_account_name),
+            node_name=str(expected_node_name),
         )
     receipt = production._seal(
         {
@@ -2772,6 +3121,11 @@ def _submit_standard_plan(
                 if timeout_retry
                 else {}
             ),
+            **(
+                {"scheduler_placement_contract": placement_contract}
+                if placement_contract is not None
+                else {}
+            ),
             **_diagnostic_flags(),
         }
     )
@@ -2810,6 +3164,11 @@ def submit_timeout_retry(
     predictor: Any | None = None,
     live_reader: Any = _default_scheduler_live_reader,
     task_reader: Any = None,
+    same_node_as_task_id: int = 0,
+    expected_allocation_id: int = 0,
+    expected_slurm_job_id: str = "",
+    expected_account_name: str = "",
+    expected_node_name: str = "",
 ) -> Path:
     return _submit_standard_plan(
         plan_path=plan_path,
@@ -2821,6 +3180,11 @@ def submit_timeout_retry(
         predictor=predictor,
         live_reader=live_reader,
         task_reader=task_reader,
+        same_node_as_task_id=same_node_as_task_id,
+        expected_allocation_id=expected_allocation_id,
+        expected_slurm_job_id=expected_slurm_job_id,
+        expected_account_name=expected_account_name,
+        expected_node_name=expected_node_name,
     )
 
 
@@ -2947,6 +3311,15 @@ def _load_submission(
     ):
         raise HandoffContractError(
             "diagnostic Standard submission identity drifted"
+        )
+    if "scheduler_placement_contract" in receipt:
+        if not timeout_retry:
+            raise HandoffContractError(
+                "same-allocation placement is restricted to timeout retries"
+            )
+        _validate_same_allocation_placement_contract(
+            receipt.get("scheduler_placement_contract"),
+            submission=receipt,
         )
     if receipt.get("core_policy") != {
         "contract": production.STANDARD_CORE_CONTRACT,
@@ -3386,6 +3759,25 @@ def _task_execution_evidence(
         raise HandoffContractError(
             "diagnostic Scheduler terminal execution evidence drifted"
         )
+    placement = submission.get("scheduler_placement_contract")
+    if placement is not None:
+        validated = _validate_same_allocation_placement_contract(
+            placement, submission=submission
+        )
+        if (
+            evidence["allocation_id"]
+            != validated["expected_allocation_id"]
+            or evidence["slurm_job_id"]
+            != validated["expected_slurm_job_id"]
+            or evidence["account_name"]
+            != validated["expected_account_name"]
+            or evidence["actual_node_name"]
+            != validated["expected_node_name"]
+        ):
+            raise HandoffContractError(
+                "diagnostic terminal execution escaped its sealed "
+                "same-allocation placement"
+            )
     return evidence
 
 
@@ -3890,6 +4282,15 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
     retry_submit.add_argument("--priority", type=int, default=0)
+    retry_submit.add_argument(
+        "--same-node-as-task-id", type=int, default=0
+    )
+    retry_submit.add_argument(
+        "--expected-allocation-id", type=int, default=0
+    )
+    retry_submit.add_argument("--expected-slurm-job-id", default="")
+    retry_submit.add_argument("--expected-account-name", default="")
+    retry_submit.add_argument("--expected-node-name", default="")
     retry_submit.add_argument("--output", type=Path, required=True)
 
     collect = commands.add_parser("collect")
@@ -3947,6 +4348,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.scheduler_cutover_receipt
             ),
             priority=args.priority,
+            same_node_as_task_id=args.same_node_as_task_id,
+            expected_allocation_id=args.expected_allocation_id,
+            expected_slurm_job_id=args.expected_slurm_job_id,
+            expected_account_name=args.expected_account_name,
+            expected_node_name=args.expected_node_name,
             output=args.output,
         )
     elif args.command == "collect":

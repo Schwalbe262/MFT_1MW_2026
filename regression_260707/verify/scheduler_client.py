@@ -1217,9 +1217,16 @@ def submit_verification(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
+        same_node_as_task_id=0,
         max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
         scheduler_url=None):
     """Submit one MFT task under the shared cross-process mutation lock."""
+    if (isinstance(same_node_as_task_id, bool)
+            or not isinstance(same_node_as_task_id, int)
+            or same_node_as_task_id < 0):
+        raise ValueError(
+            "verification same_node_as_task_id must be a non-negative integer"
+        )
     submission_options = {}
     if aedt_backend is not None:
         submission_options["aedt_backend"] = aedt_backend
@@ -1227,6 +1234,8 @@ def submit_verification(
         submission_options["submission_env"] = submission_env
     if required_hard_cap is not None:
         submission_options["required_hard_cap"] = required_hard_cap
+    if same_node_as_task_id:
+        submission_options["same_node_as_task_id"] = same_node_as_task_id
     if max_project_active_tasks != MFT_PROJECT_MAX_ACTIVE_TASKS:
         submission_options["max_project_active_tasks"] = (
             max_project_active_tasks)
@@ -1264,6 +1273,7 @@ def _submit_verification_locked(
         required_project_cap=None, priority=0, account_name="",
         node_name="", max_workers_per_node=0, *, aedt_backend=None,
         submission_env=None, required_hard_cap=None,
+        same_node_as_task_id=0,
         max_project_active_tasks=MFT_PROJECT_MAX_ACTIVE_TASKS,
         scheduler_url=None):
     """후보 파라미터를 인라인 JSON으로 실어 fixed 모드 검증 태스크 제출. 반환: task_id 또는 None"""
@@ -1271,6 +1281,12 @@ def _submit_verification_locked(
         raise RuntimeError("MFT task mutation requires the campaign mutation lock")
     if isinstance(priority, bool) or not isinstance(priority, int):
         raise ValueError("verification priority must be an integer")
+    if (isinstance(same_node_as_task_id, bool)
+            or not isinstance(same_node_as_task_id, int)
+            or same_node_as_task_id < 0):
+        raise ValueError(
+            "verification same_node_as_task_id must be a non-negative integer"
+        )
     base_url = str(scheduler_url or SCHEDULER).rstrip("/")
     endpoint_options = (
         {"scheduler_url": base_url} if scheduler_url is not None else {}
@@ -1452,6 +1468,8 @@ def _submit_verification_locked(
         payload["env_setup"] = pooled_env_setup
     if aedt_backend is not None:
         payload["aedt_backend"] = aedt_backend
+    if same_node_as_task_id:
+        payload["same_node_as_task_id"] = same_node_as_task_id
     existing = reconcile_task_id(name, dedupe_key, **endpoint_options)
     if existing is not None:
         return existing
