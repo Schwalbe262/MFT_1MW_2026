@@ -181,6 +181,56 @@ def test_root_authority_is_frozen_and_rejects_alternate_paths(tmp_path, monkeypa
         claims.load_claim_root(root)
 
 
+def test_root_authority_accepts_only_windows_legacy_full_device_alias(
+    tmp_path,
+    monkeypatch,
+):
+    root, authority, _reference = _authority_and_reference(tmp_path)
+    recorded = authority["storage_identity"]
+    recorded_device = recorded["device"]
+    if recorded_device <= claims._UINT32_MAX:
+        alternate_device = (0x12345678 << 32) | recorded_device
+    else:
+        alternate_device = recorded_device & claims._UINT32_MAX
+    observed = {
+        "device": alternate_device,
+        "inode": recorded["inode"],
+    }
+    monkeypatch.setattr(claims, "_storage_identity", lambda _path: dict(observed))
+
+    monkeypatch.setattr(claims, "_WINDOWS_RUNTIME", True)
+    assert claims.load_claim_root(root, expected_authority=authority) == authority
+
+    monkeypatch.setattr(claims, "_WINDOWS_RUNTIME", False)
+    with pytest.raises(claims.ClaimContractError, match="physical identity drifted"):
+        claims.load_claim_root(root, expected_authority=authority)
+
+    monkeypatch.setattr(claims, "_WINDOWS_RUNTIME", True)
+    observed["inode"] += 1
+    with pytest.raises(claims.ClaimContractError, match="physical identity drifted"):
+        claims.load_claim_root(root, expected_authority=authority)
+
+
+def test_windows_device_alias_rejects_two_distinct_full_width_ids():
+    legacy_device = 880368444
+    inode = 9570149209623055
+    first_full_device = (0x40347961 << 32) | legacy_device
+    second_full_device = (0x50347961 << 32) | legacy_device
+
+    assert claims._storage_identity_matches(
+        {"device": legacy_device, "inode": inode},
+        {"device": first_full_device, "inode": inode},
+    )
+    assert claims._storage_identity_matches(
+        {"device": first_full_device, "inode": inode},
+        {"device": legacy_device, "inode": inode},
+    )
+    assert not claims._storage_identity_matches(
+        {"device": first_full_device, "inode": inode},
+        {"device": second_full_device, "inode": inode},
+    )
+
+
 def test_atomic_process_claim_has_one_winner_and_one_logical_identity(
     tmp_path,
 ):

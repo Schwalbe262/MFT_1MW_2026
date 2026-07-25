@@ -43,6 +43,9 @@ _ROOT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _GENERATION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+_WINDOWS_RUNTIME = os.name == "nt"
+_UINT32_MAX = (1 << 32) - 1
+_UINT64_MAX = (1 << 64) - 1
 
 __all__ = [
     "CLAIM_REFERENCE_SCHEMA",
@@ -310,6 +313,36 @@ def _storage_identity(path: Path) -> dict[str, int]:
     }
 
 
+def _storage_identity_matches(
+    recorded: Mapping[str, int],
+    observed: Mapping[str, int],
+) -> bool:
+    if recorded == observed:
+        return True
+    if (
+        not _WINDOWS_RUNTIME
+        or set(recorded) != {"device", "inode"}
+        or set(observed) != {"device", "inode"}
+        or recorded["inode"] != observed["inode"]
+    ):
+        return False
+    recorded_device = recorded["device"]
+    observed_device = observed["device"]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (recorded_device, observed_device)
+    ):
+        return False
+    # CPython 3.11 exposed the Windows volume serial in the low 32 bits,
+    # whereas 3.12+ may expose the full 64-bit device ID.  Require exactly one
+    # value in each representation; two different full IDs remain different.
+    legacy_device, full_device = sorted((recorded_device, observed_device))
+    return (
+        legacy_device <= _UINT32_MAX < full_device <= _UINT64_MAX
+        and full_device & _UINT32_MAX == legacy_device
+    )
+
+
 def _validate_root_authority_payload(value: Any) -> dict[str, Any]:
     authority = _validate_seal(
         value,
@@ -455,7 +488,10 @@ def load_claim_root(
     if (
         _normalized_path_text(Path(authority["resolved_root"]))
         != _normalized_path_text(resolved)
-        or authority["storage_identity"] != _storage_identity(resolved)
+        or not _storage_identity_matches(
+            authority["storage_identity"],
+            _storage_identity(resolved),
+        )
         or claims_directory.parent != resolved
     ):
         raise ClaimContractError("campaign claim-root physical identity drifted")
