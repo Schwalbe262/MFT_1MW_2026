@@ -340,6 +340,9 @@ MESH_QUOTA_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION = (
 TIMEOUT_ANCHOR_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION = (
     "timeout-anchor-dependency-r3-direct-node"
 )
+N116_OPERATIONAL_SUCCESSOR_STRICT_TASK_IDENTITY_GENERATION = (
+    "n116-operational-successor-r4-direct-node"
+)
 SAME_ALLOCATION_PLACEMENT_SCHEMA = (
     "mft-goal-diagnostic-same-allocation-placement-v1"
 )
@@ -3011,6 +3014,7 @@ def _strict_node_plan_contract(
         DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION,
         MESH_QUOTA_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION,
         TIMEOUT_ANCHOR_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION,
+        N116_OPERATIONAL_SUCCESSOR_STRICT_TASK_IDENTITY_GENERATION,
     }:
         raise HandoffContractError(
             "strict retry task identity generation is unsupported"
@@ -3058,6 +3062,7 @@ def _strict_node_scheduler_pin(
         DEPENDENCY_FAILURE_STRICT_TASK_IDENTITY_GENERATION,
         MESH_QUOTA_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION,
         TIMEOUT_ANCHOR_DEPENDENCY_STRICT_TASK_IDENTITY_GENERATION,
+        N116_OPERATIONAL_SUCCESSOR_STRICT_TASK_IDENTITY_GENERATION,
     }:
         raise HandoffContractError(
             "strict diagnostic retry placement contract drifted"
