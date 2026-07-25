@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +14,8 @@ from module.mft_goal_20260726_contract import (
     fixed_identity_expectations,
 )
 from tools import mft_goal_fea_handoff as production
+from tools import mft_goal_safe_refill as refill
+from tools import mft_goal_startup_retry as startup
 from tools import mft_goal_terminal_success_watcher as watcher
 from tools import mft_goal_truth_promotion as promotion
 
@@ -94,6 +97,83 @@ def test_terminal_kind_requires_exact_success_triple() -> None:
     assert watcher._terminal_kind({"status": "running", "state": "running"}) == (
         "active"
     )
+
+
+def test_dynamic_replacement_extension_is_read_as_active_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extension_directory = tmp_path / "watcher_extensions"
+    extension_directory.mkdir()
+    authority_path = tmp_path / "watcher_extension_authority.json"
+    authority_path.write_text("{}", encoding="utf-8")
+    replacement_path = extension_directory / "l96223.json"
+    replacement_path.write_text(
+        json.dumps({"schema_version": startup.REPLACEMENT_SCHEMA}),
+        encoding="utf-8",
+    )
+    authority = {"extension_directory": str(extension_directory)}
+    successor = _slot()
+    successor.update(
+        {
+            "logical_authority_task_id": 96223,
+            "execution_task_id": 96306,
+            "task_name": "startup-successor",
+            "dedupe_key": "startup-successor-dedupe",
+        }
+    )
+    authenticated: list[tuple[Path, dict[str, Any]]] = []
+
+    monkeypatch.setattr(
+        refill,
+        "authenticate_extension_authority",
+        lambda _path, *, watch_plan_path: authority,
+    )
+
+    def authenticate_replacement(
+        path: Path, *, authority: dict[str, Any]
+    ) -> dict[str, Any]:
+        authenticated.append((path, authority))
+        return successor
+
+    monkeypatch.setattr(
+        startup,
+        "authenticate_watcher_replacement_receipt",
+        authenticate_replacement,
+    )
+    base = _plan(tmp_path)
+    base["slots"] = []
+    effective = watcher._plan_with_authorized_extensions(
+        base,
+        watch_plan_path=tmp_path / "watch_plan.json",
+        extension_authority_path=authority_path,
+    )
+
+    def read_successor(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["task_id"] == 96306
+        return {
+            "task_id": 96306,
+            "name": "startup-successor",
+            "project": watcher.DEFAULT_PROJECT,
+            "dedupe_key": "startup-successor-dedupe",
+            "status": "running",
+            "state": "running",
+        }
+
+    state = watcher.process_cycle(effective, task_reader=read_successor)
+
+    assert authenticated == [(replacement_path, authority)]
+    assert effective["authorized_extension_count"] == 1
+    assert [
+        (
+            item["logical_authority_task_id"],
+            item["execution_task_id"],
+            item["state"],
+        )
+        for item in state["slots"]
+    ] == [(96223, 96306, "active")]
+    assert state["counts"] == {"active": 1}
+    assert state["scheduler_methods_used"] == ["GET"]
+    assert state["scheduler_mutation_performed"] is False
 
 
 def test_failure_creates_ledger_only(tmp_path: Path) -> None:
