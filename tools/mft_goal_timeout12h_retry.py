@@ -1643,11 +1643,19 @@ def submit(
     remote_files_reader: Any = None,
     task_list_reader: Any = None,
     reconciliation_waiter: Any = None,
+    additional_pre_submit_guard: Any = None,
 ) -> Path:
     target = output.resolve()
     if target.exists():
         raise HandoffContractError(
             f"timeout12h submission receipt exists: {target}"
+        )
+    if (
+        additional_pre_submit_guard is not None
+        and not callable(additional_pre_submit_guard)
+    ):
+        raise HandoffContractError(
+            "timeout12h additional pre-submit guard is not callable"
         )
     plan, params, selected, immediate_submission = _load_plan(plan_path)
     strict_contract = plan["scheduler_strict_node_contract"]
@@ -1773,6 +1781,8 @@ def submit(
             raise HandoffContractError(
                 "fresh timeout12h claim requires an empty sibling slot"
             )
+        if additional_pre_submit_guard is not None:
+            additional_pre_submit_guard()
         locked_guard_count += 1
 
     finalized_claim = None
@@ -1858,6 +1868,9 @@ def submit(
             max_project_active_tasks=probe.GOAL_FEA_PROJECT_CAP,
             scheduler_url=stage["scheduler_url"],
             pre_submit_guard=locked_pre_submit_guard,
+            account_name=str(
+                stored["storage_audit"]["account_name"]
+            ),
             node_name=STRICT_NODE_NAME,
             node_name_policy="strict",
             return_submission_evidence=True,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 from datetime import datetime, timezone
+import importlib
 import json
 import os
 from pathlib import Path
@@ -376,6 +377,51 @@ def _load_watch_plan(path: Path) -> dict[str, Any]:
     ):
         raise WatcherContractError("watch plan logical slots are not unique")
     return value
+
+
+def _plan_with_authorized_extensions(
+    base: Mapping[str, Any],
+    *,
+    watch_plan_path: Path,
+    extension_authority_path: Path | None,
+) -> dict[str, Any]:
+    """Reauthenticate and merge locally authorized refill receipts."""
+    merged = copy.deepcopy(dict(base))
+    merged["authorized_extension_count"] = 0
+    if extension_authority_path is None:
+        return merged
+    refill = importlib.import_module("tools.mft_goal_safe_refill")
+    authority = refill.authenticate_extension_authority(
+        extension_authority_path,
+        watch_plan_path=watch_plan_path,
+    )
+    directory = Path(authority["extension_directory"]).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    extensions = []
+    for receipt_path in sorted(directory.glob("*.json")):
+        extensions.append(
+            refill.authenticate_watcher_extension_receipt(
+                receipt_path, authority=authority
+            )
+        )
+    all_slots = [*merged["slots"], *extensions]
+    logical = [slot["logical_authority_task_id"] for slot in all_slots]
+    execution = [slot["execution_task_id"] for slot in all_slots]
+    if len(set(logical)) != len(logical) or len(set(execution)) != len(
+        execution
+    ):
+        raise WatcherContractError(
+            "authorized watcher extensions duplicate an exact slot"
+        )
+    merged["slots"] = sorted(
+        all_slots, key=lambda item: item["logical_authority_task_id"]
+    )
+    merged["exact_logical_slot_count"] = len(all_slots)
+    merged["authorized_extension_count"] = len(extensions)
+    merged["extension_authority"] = production._file_record(
+        extension_authority_path
+    )
+    return merged
 
 
 def _validate_snapshot(
@@ -764,7 +810,12 @@ def process_cycle(
     return state_value
 
 
-def run_watcher(path: Path, *, once: bool = False) -> None:
+def run_watcher(
+    path: Path,
+    *,
+    once: bool = False,
+    extension_authority_path: Path | None = None,
+) -> None:
     plan = _load_watch_plan(path)
     root = Path(plan["output_root"])
     with SingleInstanceLock(root / "watcher.lock"):
@@ -775,6 +826,11 @@ def run_watcher(path: Path, *, once: bool = False) -> None:
                     "schema_version": PID_SCHEMA,
                     "pid": os.getpid(),
                     "watch_plan": production._file_record(path),
+                    "extension_authority": (
+                        production._file_record(extension_authority_path)
+                        if extension_authority_path is not None
+                        else None
+                    ),
                     "started_at_utc": _now(),
                     "scheduler_methods_allowed": ["GET"],
                     "scheduler_mutation_performed": False,
@@ -788,7 +844,12 @@ def run_watcher(path: Path, *, once: bool = False) -> None:
             slot_count=len(plan["slots"]),
         )
         while True:
-            process_cycle(plan)
+            effective = _plan_with_authorized_extensions(
+                plan,
+                watch_plan_path=path,
+                extension_authority_path=extension_authority_path,
+            )
+            process_cycle(effective)
             if once:
                 return
             time.sleep(plan["poll_seconds"])
@@ -832,8 +893,10 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--code-revision", default="")
     run = commands.add_parser("run")
     run.add_argument("--watch-plan", type=Path, required=True)
+    run.add_argument("--extension-authority", type=Path)
     once = commands.add_parser("once")
     once.add_argument("--watch-plan", type=Path, required=True)
+    once.add_argument("--extension-authority", type=Path)
     return parser
 
 
@@ -850,7 +913,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(path)
         return 0
-    run_watcher(args.watch_plan, once=args.command == "once")
+    run_watcher(
+        args.watch_plan,
+        once=args.command == "once",
+        extension_authority_path=args.extension_authority,
+    )
     return 0
 
 
