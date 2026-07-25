@@ -3226,6 +3226,7 @@ def _same_allocation_submitted_task_evidence(
         "actual_node_name": (
             snapshot.get("actual_node_name")
             or snapshot.get("allocation_node_name")
+            or ""
         ),
         "scheduling_profile": snapshot.get("scheduling_profile"),
         "aedt_backend": snapshot.get("aedt_backend"),
@@ -3256,7 +3257,7 @@ def _same_allocation_submitted_task_evidence(
         and status == "queued"
         and state == "queued"
         and evidence["slurm_job_id"] == ""
-        and not str(evidence["actual_node_name"] or "").strip()
+        and evidence["actual_node_name"] == ""
     )
     if (
         isinstance(task_id, bool)

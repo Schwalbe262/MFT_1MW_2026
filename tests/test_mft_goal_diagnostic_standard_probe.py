@@ -645,6 +645,63 @@ def _strict_submitted_snapshot(submission, **overrides):
     return snapshot
 
 
+def test_same_allocation_submitted_node_canonicalization_is_state_safe():
+    submission = {
+        "task_id": 71002,
+        "task_name": "strict-retry",
+        "dedupe_key": "strict-dedupe",
+    }
+    options = {
+        "task_id": 71002,
+        "task_name": "strict-retry",
+        "dedupe_key": "strict-dedupe",
+        "anchor_task_id": 72000,
+        "allocation_id": 9002,
+        "slurm_job_id": "81300",
+        "account_name": "anchor-account",
+        "node_name": "n110",
+    }
+    queued = _same_allocation_submitted_snapshot(
+        submission,
+        status="queued",
+        state="queued",
+        allocation_id=None,
+        slurm_job_id="",
+        actual_node_name="",
+    )
+    queued.pop("allocation_node_name", None)
+    canonical_queued = probe._same_allocation_submitted_task_evidence(
+        queued, **options
+    )
+    assert canonical_queued["actual_node_name"] == ""
+    assert (
+        probe._same_allocation_submitted_task_evidence(
+            canonical_queued, **options
+        )
+        == canonical_queued
+    )
+    assigned = _same_allocation_submitted_snapshot(
+        submission,
+        actual_node_name="",
+        allocation_node_name="n110",
+    )
+    canonical_assigned = probe._same_allocation_submitted_task_evidence(
+        assigned, **options
+    )
+    assert canonical_assigned["actual_node_name"] == "n110"
+    with pytest.raises(
+        production.HandoffContractError,
+        match="same-allocation task binding drifted",
+    ):
+        probe._same_allocation_submitted_task_evidence(
+            {
+                **assigned,
+                "allocation_node_name": "n109",
+            },
+            **options,
+        )
+
+
 def test_selection_is_deterministic_diverse_and_mean_band_bound(
     tmp_path, monkeypatch
 ):
@@ -1221,7 +1278,18 @@ def test_timeout_retry_strict_r2_authenticates_post_get_and_terminal_binding(
             "dedupe_key"
         ],
     }
-    post_readback = _strict_submitted_snapshot(expected_submission)
+    post_readback = _strict_submitted_snapshot(
+        expected_submission,
+        status="queued",
+        state="queued",
+        allocation_id=None,
+        assigned_allocation=None,
+        slurm_job_id="",
+        actual_node_name="",
+        allocation_node_name="",
+        placement_contract_satisfied=False,
+        started_at=None,
+    )
 
     class _StrictScheduler(_FakeScheduler):
         def submit_verification(self, *args, **kwargs):
@@ -1271,10 +1339,13 @@ def test_timeout_retry_strict_r2_authenticates_post_get_and_terminal_binding(
     assert strict_receipt["submission_source"] == "post_created"
     assert strict_receipt["api_post_submission_response"][
         "placement_contract_satisfied"
-    ] is True
+    ] is False
     assert strict_receipt["api_durable_get_readback"][
         "allocation_node_name"
-    ] == "n110"
+    ] == ""
+    assert retry_submission["scheduler_placement_contract"][
+        "submitted_task_after_submission"
+    ]["actual_node_name"] == ""
     terminal = _strict_submitted_snapshot(
         expected_submission,
         status="completed",
@@ -1496,6 +1567,39 @@ def test_live_legacy_e542_submission_loads_but_cannot_resubmit_after_successor(
         )
     assert scheduler.calls == []
     assert not (tmp_path / "forbidden-legacy-resubmission.json").exists()
+
+
+def test_live_queued_41b_same_allocation_submissions_round_trip_when_present():
+    root = Path(
+        "C:/Users/peets/slurm_scheduler_runtime/mft_goal_20260726/"
+        "standard_timeout_retries_strict_r3_41b_260725"
+    )
+    expected = {
+        "t96231_n108_efffb6518d4e": 96281,
+        "t96227_n108_7ce2bf976d48": 96282,
+        "t96228_n110_90598193e992": 96283,
+        "t96223_n110_2a1bb6f2be79": 96284,
+    }
+    if not all((root / child).is_dir() for child in expected):
+        pytest.skip("live queued 41b submissions are host-local")
+    for child, task_id in expected.items():
+        artifact_root = root / child
+        plan = probe._load_plan(
+            artifact_root
+            / "plan"
+            / "diagnostic_timeout_retry_plan.json"
+        )[0]
+        submission = probe._load_submission(
+            artifact_root / "diagnostic_timeout_retry_submission.json",
+            plan=plan,
+        )
+        submitted = submission["scheduler_placement_contract"][
+            "submitted_task_after_submission"
+        ]
+        assert submission["task_id"] == task_id
+        assert submitted["status"] == "queued"
+        assert submitted["state"] == "queued"
+        assert submitted["actual_node_name"] == ""
 
 
 def test_scheduler_client_strict_opt_in_sends_policy_and_returns_post_evidence(
