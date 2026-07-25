@@ -8940,7 +8940,10 @@ def _load_collectible_plan(
     resolved = path.resolve(strict=True)
     raw = production._read_json(resolved)
     schema = raw.get("schema_version")
-    if schema == PLAN_SCHEMA:
+    if schema in {
+        PLAN_SCHEMA,
+        "mft-goal-diagnostic-standard-timeout12h-plan-v1",
+    }:
         return _load_plan(resolved)
     dependency = _dependency_retry_module()
     if schema == dependency.PLAN_SCHEMA:
@@ -8965,6 +8968,13 @@ def _load_collectible_submission(
     if (
         plan_schema == PLAN_SCHEMA
         and submission_schema == SUBMISSION_SCHEMA
+    ):
+        return _load_submission(resolved, plan=plan)
+    if (
+        plan_schema
+        == "mft-goal-diagnostic-standard-timeout12h-plan-v1"
+        and submission_schema
+        == "mft-goal-diagnostic-standard-timeout12h-submission-v1"
     ):
         return _load_submission(resolved, plan=plan)
     dependency = _dependency_retry_module()
