@@ -54,6 +54,10 @@ from module.mft_goal_20260726_contract import (  # noqa: E402
 
 
 WINNER_AUTHORITY_SCHEMA = "mft-goal-final-artifact-winner-authority-v1"
+GRADED_CAP_PROVENANCE_SCHEMA = (
+    "mft-goal-final-graded-capacitance-provenance-v1"
+)
+TURN_GRADED_CAP_SCHEMA = "mft-turn-graded-energy-capacitance-v2"
 PIPELINE_SCHEMA = "mft-goal-final-artifact-pipeline-v1"
 
 REFERENCE_ROOT = Path(
@@ -313,6 +317,169 @@ def _validate_fixed_params(params: Mapping[str, Any]) -> dict[str, Any]:
     return boundary
 
 
+def _validate_graded_capacitance_provenance(
+    provenance: Any,
+    *,
+    source: Mapping[str, Any],
+    params: Mapping[str, Any],
+    verification: Mapping[str, Any],
+    authority_directory: Path,
+) -> dict[str, Any]:
+    """Require actual turn-graded Tx and Rx truth for final resonance.
+
+    The legacy two-equipotential CapTx/CapRx matrix is useful as a screen but
+    is not the physical terminal capacitance of a multi-turn winding.  Final
+    authority therefore needs authenticated turn-graded result evidence for
+    both windings on the exact winner geometry and physical air gap.
+    """
+
+    if not isinstance(provenance, Mapping):
+        raise FinalArtifactPipelineError(
+            "actual turn-graded capacitance provenance is absent"
+        )
+    if (
+        provenance.get("schema_version") != GRADED_CAP_PROVENANCE_SCHEMA
+        or provenance.get("provenance_authenticated") is not True
+        or provenance.get("geometry_and_gap_exact_match") is not True
+        or provenance.get("actual_connection_topology_attested") is not True
+        or provenance.get("legacy_two_net_result_used") is not False
+        or provenance.get("candidate_physics_sha256")
+        != source["candidate_physics_sha256"]
+    ):
+        raise FinalArtifactPipelineError(
+            "turn-graded capacitance provenance contract drifted"
+        )
+    source_kind = provenance.get("source_kind")
+    if source_kind not in {
+        "same_full_chain_graded_cap_result",
+        "authenticated_same_geometry_tx_rx_pair",
+    }:
+        raise FinalArtifactPipelineError(
+            "turn-graded capacitance source kind is unsupported"
+        )
+    physical_gap = _finite(
+        params.get("core_center_gap_mm"), "winner physical center gap"
+    )
+    if _finite(
+        provenance.get("core_center_gap_mm"),
+        "turn-graded provenance center gap",
+    ) != physical_gap:
+        raise FinalArtifactPipelineError(
+            "turn-graded capacitance physical air gap drifted"
+        )
+    topology_path, topology_record = _resolve_record(
+        provenance.get("actual_connection_topology_receipt"),
+        base=authority_directory,
+        label="turn-graded actual-connection topology receipt",
+    )
+
+    rows: dict[str, dict[str, Any]] = {}
+    for key, active in (("tx", "Tx"), ("rx", "Rx")):
+        row = provenance.get(key)
+        if not isinstance(row, Mapping):
+            raise FinalArtifactPipelineError(
+                f"turn-graded {active} result provenance is absent"
+            )
+        task_id = row.get("task_id")
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id <= 0
+            or row.get("active_winding") != active
+            or row.get("cap_turn_graded_schema_version")
+            != TURN_GRADED_CAP_SCHEMA
+            or row.get("candidate_physics_sha256")
+            != source["candidate_physics_sha256"]
+            or _finite(
+                row.get("core_center_gap_mm"),
+                f"turn-graded {active} center gap",
+            )
+            != physical_gap
+            or not isinstance(row.get("solver_revision"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", row["solver_revision"])
+            or not isinstance(row.get("library_revision"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", row["library_revision"])
+            or not isinstance(row.get("result_sha256"), str)
+            or not HEX64.fullmatch(row["result_sha256"])
+        ):
+            raise FinalArtifactPipelineError(
+                f"turn-graded {active} execution identity drifted"
+            )
+        capacitance = _finite(
+            row.get("terminal_capacitance_F"),
+            f"turn-graded {active} terminal capacitance",
+        )
+        inductance = _finite(
+            row.get("self_inductance_H"),
+            f"turn-graded {active} self inductance",
+        )
+        resonance = _finite(
+            row.get("resonance_Hz"),
+            f"turn-graded {active} resonance",
+        )
+        if capacitance <= 0.0 or inductance <= 0.0 or resonance < 15_000.0:
+            raise FinalArtifactPipelineError(
+                f"turn-graded {active} measured resonance contract failed"
+            )
+        receipt_path, receipt_record = _resolve_record(
+            row.get("authenticated_result_receipt"),
+            base=authority_directory,
+            label=f"turn-graded {active} result receipt",
+        )
+        rows[key] = {
+            "task_id": task_id,
+            "terminal_capacitance_F": capacitance,
+            "self_inductance_H": inductance,
+            "resonance_Hz": resonance,
+            "authenticated_result_receipt": receipt_record,
+            "authenticated_result_receipt_path": str(receipt_path),
+        }
+
+    same_full_chain = (
+        rows["tx"]["task_id"] == source["task_id"]
+        and rows["rx"]["task_id"] == source["task_id"]
+    )
+    if (
+        source_kind == "same_full_chain_graded_cap_result"
+        and not same_full_chain
+    ):
+        raise FinalArtifactPipelineError(
+            "same-full-chain graded-cap task identity drifted"
+        )
+    if (
+        source_kind == "authenticated_same_geometry_tx_rx_pair"
+        and same_full_chain
+    ):
+        raise FinalArtifactPipelineError(
+            "separate graded-cap pair is mislabeled as same full-chain"
+        )
+    minimum = min(rows["tx"]["resonance_Hz"], rows["rx"]["resonance_Hz"])
+    if (
+        _finite(
+            provenance.get("minimum_resonance_Hz"),
+            "turn-graded minimum resonance",
+        )
+        != minimum
+        or _finite(
+            verification.get("actual_resonance_Hz"),
+            "actual final resonance",
+        )
+        != minimum
+    ):
+        raise FinalArtifactPipelineError(
+            "final resonance is not the authenticated turn-graded minimum"
+        )
+    return {
+        "source_kind": source_kind,
+        "same_full_chain_task": same_full_chain,
+        "minimum_resonance_Hz": minimum,
+        "actual_connection_topology_receipt": topology_record,
+        "actual_connection_topology_receipt_path": str(topology_path),
+        "tx": rows["tx"],
+        "rx": rows["rx"],
+    }
+
+
 def validate_winner_authority(
     authority: Mapping[str, Any], *, authority_directory: Path
 ) -> dict[str, Any]:
@@ -384,10 +551,12 @@ def validate_winner_authority(
         "round_corner": 0,
         "matrix_solved": True,
         "capacitance_solved": True,
+        "graded_capacitance_solved": True,
         "loss_solved": True,
         "thermal_solved": True,
         "measured_hard_constraints_passed": True,
         "rounded_fea_used": False,
+        "legacy_two_net_capacitance_used_for_final_resonance": False,
     }
     for key, expected in required_model_contract.items():
         _exact(
@@ -432,6 +601,13 @@ def validate_winner_authority(
         raise FinalArtifactPipelineError(
             "actual primary-referred Lm is outside 2 mH tolerance"
         )
+    graded_capacitance = _validate_graded_capacitance_provenance(
+        verification.get("graded_capacitance_provenance"),
+        source=source,
+        params=params,
+        verification=verification,
+        authority_directory=authority_directory,
+    )
     fixed_boundary = verification.get("fixed_boundary")
     if not isinstance(fixed_boundary, Mapping):
         raise FinalArtifactPipelineError(
@@ -493,6 +669,7 @@ def validate_winner_authority(
         },
         "params": copy.deepcopy(dict(params)),
         "verification": copy.deepcopy(dict(verification)),
+        "graded_capacitance_provenance": graded_capacitance,
         "fixed_boundary_attestation": boundary_attestation,
         "turns": {"N1": n1, "N2": n2},
     }

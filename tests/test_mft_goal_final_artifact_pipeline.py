@@ -46,16 +46,26 @@ def _params():
 
 def _authority(tmp_path: Path, *, params=None):
     params = copy.deepcopy(params if params is not None else _params())
+    candidate_sha256 = "a" * 64
     symmetric = tmp_path / "symmetric.aedt"
     symmetric.write_bytes(b"synthetic-aedt")
     upstream = tmp_path / "selected-receipt.json"
     upstream.write_text('{"selected":true}\n', encoding="utf-8")
+    tx_cap_receipt = tmp_path / "tx-graded-cap-receipt.json"
+    tx_cap_receipt.write_text('{"authenticated":"Tx"}\n', encoding="utf-8")
+    rx_cap_receipt = tmp_path / "rx-graded-cap-receipt.json"
+    rx_cap_receipt.write_text('{"authenticated":"Rx"}\n', encoding="utf-8")
+    topology_receipt = tmp_path / "graded-cap-topology-receipt.json"
+    topology_receipt.write_text(
+        '{"actual_connection_topology_attested":true}\n',
+        encoding="utf-8",
+    )
     return pipeline.seal(
         {
             "schema_version": pipeline.WINNER_AUTHORITY_SCHEMA,
             "source": {
                 "task_id": 12345,
-                "candidate_physics_sha256": "a" * 64,
+                "candidate_physics_sha256": candidate_sha256,
                 "selection_performed_upstream": True,
                 "candidate_promotion_performed_by_pipeline": False,
                 "selected_symmetric_hard_pass": True,
@@ -84,10 +94,12 @@ def _authority(tmp_path: Path, *, params=None):
                 "round_corner": 0,
                 "matrix_solved": True,
                 "capacitance_solved": True,
+                "graded_capacitance_solved": True,
                 "loss_solved": True,
                 "thermal_solved": True,
                 "measured_hard_constraints_passed": True,
                 "rounded_fea_used": False,
+                "legacy_two_net_capacitance_used_for_final_resonance": False,
                 "actual_dimensions_mm": {
                     "W": 1190.0,
                     "L": 900.0,
@@ -95,6 +107,58 @@ def _authority(tmp_path: Path, *, params=None):
                 },
                 "actual_resonance_Hz": 15_100.0,
                 "actual_Lm_primary_referred_H": 0.00199,
+                "graded_capacitance_provenance": {
+                    "schema_version": pipeline.GRADED_CAP_PROVENANCE_SCHEMA,
+                    "provenance_authenticated": True,
+                    "source_kind": (
+                        "authenticated_same_geometry_tx_rx_pair"
+                    ),
+                    "geometry_and_gap_exact_match": True,
+                    "actual_connection_topology_attested": True,
+                    "actual_connection_topology_receipt": (
+                        pipeline.file_record(topology_receipt)
+                    ),
+                    "legacy_two_net_result_used": False,
+                    "candidate_physics_sha256": candidate_sha256,
+                    "core_center_gap_mm": params["core_center_gap_mm"],
+                    "minimum_resonance_Hz": 15_100.0,
+                    "tx": {
+                        "task_id": 2001,
+                        "active_winding": "Tx",
+                        "cap_turn_graded_schema_version": (
+                            pipeline.TURN_GRADED_CAP_SCHEMA
+                        ),
+                        "candidate_physics_sha256": candidate_sha256,
+                        "core_center_gap_mm": params["core_center_gap_mm"],
+                        "solver_revision": "b" * 40,
+                        "library_revision": "c" * 40,
+                        "result_sha256": "d" * 64,
+                        "terminal_capacitance_F": 1e-9,
+                        "self_inductance_H": 0.002,
+                        "resonance_Hz": 16_000.0,
+                        "authenticated_result_receipt": (
+                            pipeline.file_record(tx_cap_receipt)
+                        ),
+                    },
+                    "rx": {
+                        "task_id": 2002,
+                        "active_winding": "Rx",
+                        "cap_turn_graded_schema_version": (
+                            pipeline.TURN_GRADED_CAP_SCHEMA
+                        ),
+                        "candidate_physics_sha256": candidate_sha256,
+                        "core_center_gap_mm": params["core_center_gap_mm"],
+                        "solver_revision": "b" * 40,
+                        "library_revision": "c" * 40,
+                        "result_sha256": "e" * 64,
+                        "terminal_capacitance_F": 1e-9,
+                        "self_inductance_H": 0.02,
+                        "resonance_Hz": 15_100.0,
+                        "authenticated_result_receipt": (
+                            pipeline.file_record(rx_cap_receipt)
+                        ),
+                    },
+                },
                 "actual_temperature_family_max_C": {
                     "primary_winding": 99.0,
                     "secondary_winding": 119.0,
@@ -169,6 +233,56 @@ def test_winner_authority_rejects_turn_ratio_drift(tmp_path):
     ):
         pipeline.validate_winner_authority(
             authority, authority_directory=tmp_path
+        )
+
+
+def test_winner_authority_rejects_legacy_two_net_capacitance(
+    tmp_path,
+):
+    authority = _authority(tmp_path)
+    body = copy.deepcopy(authority)
+    body.pop("payload_sha256")
+    body["symmetric_verification"][
+        "legacy_two_net_capacitance_used_for_final_resonance"
+    ] = True
+    with pytest.raises(
+        pipeline.FinalArtifactPipelineError,
+        match="legacy_two_net_capacitance_used_for_final_resonance drifted",
+    ):
+        pipeline.validate_winner_authority(
+            pipeline.seal(body), authority_directory=tmp_path
+        )
+
+
+def test_winner_authority_requires_actual_graded_tx_rx_provenance(
+    tmp_path,
+):
+    authority = _authority(tmp_path)
+    body = copy.deepcopy(authority)
+    body.pop("payload_sha256")
+    del body["symmetric_verification"]["graded_capacitance_provenance"]
+    with pytest.raises(
+        pipeline.FinalArtifactPipelineError,
+        match="actual turn-graded capacitance provenance is absent",
+    ):
+        pipeline.validate_winner_authority(
+            pipeline.seal(body), authority_directory=tmp_path
+        )
+
+
+def test_final_resonance_must_equal_authenticated_graded_minimum(
+    tmp_path,
+):
+    authority = _authority(tmp_path)
+    body = copy.deepcopy(authority)
+    body.pop("payload_sha256")
+    body["symmetric_verification"]["actual_resonance_Hz"] = 15_200.0
+    with pytest.raises(
+        pipeline.FinalArtifactPipelineError,
+        match="not the authenticated turn-graded minimum",
+    ):
+        pipeline.validate_winner_authority(
+            pipeline.seal(body), authority_directory=tmp_path
         )
 
 

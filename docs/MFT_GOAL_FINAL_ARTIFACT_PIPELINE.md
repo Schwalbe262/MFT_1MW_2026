@@ -42,7 +42,7 @@ The Scheduler remains the separate `MFT_1MW_2026v1` project. This pipeline
 contains no Scheduler source, POST, cancellation, project configuration
 change, or branch creation.
 
-## Current collection blocker
+## Task 96743 recovery collection
 
 The active tuned symmetric retry is task 96743:
 
@@ -59,14 +59,21 @@ The active tuned symmetric retry is task 96743:
 - prune marker:
   `goal-fea-retained/3c262e829b18d3a2/.slurm-scheduler-preserve.json`.
 
-There is currently no task-96743-specific sealed local submission plan and
-receipt. The older files in
+The task-specific GET-only recovery collector is
+`tools/mft_goal_task96743_recovery_collector.py`. Its default immutable
+workspace is:
+
+```text
+C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726\
+  task96743_recovery_collection_v1
+```
+
+The older files in
 `rank1_neighborhood_2b213_physical_gap_tuning_v1` bind cancelled task 96483,
 the old solver revision, the name without `-r1`, and retained token
 `dd4d9287dd679b2a`; they cannot authorize task 96743.
 
-Before task 96743 can feed this pipeline, a GET-only recovery collector must
-seal all of the following:
+The recovery collector seals all of the following:
 
 1. exact task-96743 GET identity and terminal state;
 2. exact Scheduler stdout and latest well-formed `RESULT_JSON`;
@@ -81,10 +88,36 @@ seal all of the following:
 8. remote AEDT receipt and prune marker;
 9. every contiguous base64 chunk, its hash and size;
 10. reconstructed AEDT hash and size equal to the remote receipt;
-11. measured matrix/cap/loss/thermal gates and the split temperature limits.
+11. measured Matrix/Loss/Thermal gates and the split temperature limits;
+12. a capacitance truth-boundary record that classifies task 96743's
+    CapTx/CapRx two-equipotential result as a legacy screen, not final
+    turn-graded terminal capacitance.
 
 The raw remote AEDT or reconstructed chunks alone are not winner authority.
 Operational failure also is not scientific infeasibility.
+
+Task 96743 did not submit an actual per-turn graded-voltage capacitance
+solve. Therefore its `f_res_min_tx_rx_only_Hz` value must never be promoted
+to the final resonance, even if it exceeds 15 kHz. The collector can seal
+its authenticated Matrix/Loss/Thermal result and retained AEDT, but it
+always blocks `winner_authority.json` for missing actual-connection
+turn-graded Tx and Rx provenance. Results from tasks 96744--96753 are not
+silently merged into task 96743 or relabeled as same-task measurements.
+
+Run one read-only observation or the retry-safe watcher with:
+
+```powershell
+& 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe' `
+  tools\mft_goal_task96743_recovery_collector.py --once
+
+& 'C:\Users\peets\anaconda3\envs\pyaedt2026v1\python.exe' `
+  tools\mft_goal_task96743_recovery_collector.py `
+  --watch --interval 20
+```
+
+The watcher exposes only Scheduler GET operations. HTTP 429 and other
+transient read failures remain retryable and cannot trigger Scheduler
+mutation, cancellation, resubmission, or project changes.
 
 ## Winner authority input
 
@@ -114,19 +147,45 @@ params
 symmetric_verification
   full_model = 0
   round_corner = 0
-  matrix_solved/capacitance_solved/loss_solved/thermal_solved = true
+  matrix_solved/capacitance_solved/graded_capacitance_solved = true
+  loss_solved/thermal_solved = true
   measured_hard_constraints_passed = true
   rounded_fea_used = false
+  legacy_two_net_capacitance_used_for_final_resonance = false
   actual_dimensions_mm = {W, L, H}
   actual_resonance_Hz
   actual_Lm_primary_referred_H
   actual_temperature_family_max_C
+  graded_capacitance_provenance
+    schema_version = mft-goal-final-graded-capacitance-provenance-v1
+    source_kind =
+      same_full_chain_graded_cap_result OR
+      authenticated_same_geometry_tx_rx_pair
+    provenance_authenticated = true
+    geometry_and_gap_exact_match = true
+    actual_connection_topology_attested = true
+    actual_connection_topology_receipt = {path, sha256, size_bytes}
+    legacy_two_net_result_used = false
+    candidate_physics_sha256
+    core_center_gap_mm
+    minimum_resonance_Hz
+    tx/rx
+      task_id
+      active_winding
+      cap_turn_graded_schema_version
+      candidate_physics_sha256
+      core_center_gap_mm
+      solver_revision/library_revision/result_sha256
+      terminal_capacitance_F/self_inductance_H/resonance_Hz
+      authenticated_result_receipt = {path, sha256, size_bytes}
   fixed_boundary
 payload_sha256
 ```
 
 All file records and the canonical payload seal are revalidated before any
-derived files are written.
+derived files are written. The final `actual_resonance_Hz` must equal the
+minimum authenticated turn-graded Tx/Rx frequency. A legacy CapTx/CapRx
+frequency, a transfer estimate, or an unbound sweep row fails closed.
 
 ## Preparation command
 
