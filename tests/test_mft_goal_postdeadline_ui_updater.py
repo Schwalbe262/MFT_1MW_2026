@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from tools import mft_goal_postdeadline_ui_updater as updater
+from tools import mft_goal_local_symmetric_selection_watch as local_watch
 
 
 OBSERVED = "2026-07-26T18:20:00+09:00"
@@ -267,6 +268,62 @@ def _continuation_state(
             "scheduler_post_attempts_consumed": 1 if submitted else 0,
             "scheduler_project_mutation_performed": False,
             "scheduler_repository_modified": False,
+        }
+    )
+
+
+def _local_selection_state(
+    *,
+    status: str = "partial_measured_waiting",
+    authenticated: int = 2,
+    pending: int = 4,
+    failures: int = 1,
+    selected: dict[str, Any] | None = None,
+    prepared: int = 0,
+) -> dict[str, Any]:
+    return updater._sealed(
+        {
+            "schema_version": (
+                updater.LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA
+            ),
+            "diagnostic_only": True,
+            "search_only": True,
+            "canonical": False,
+            "production_eligible": False,
+            "original_deadline_missed": True,
+            "symmetric_model_primary": True,
+            "prepare_only": True,
+            "scheduler_methods_used": [],
+            "scheduler_mutation_performed": False,
+            "scheduler_submission_performed": False,
+            "scheduler_cancel_performed": False,
+            "scheduler_restart_performed": False,
+            "automatic_full_trigger": False,
+            "automatic_full_continuation": False,
+            "status": status,
+            "watch_complete": status
+            in {
+                "selected_symmetric_hard_pass",
+                "local_prepare_only_batch_ready",
+                "terminal_no_passing_or_small_local_correction",
+            },
+            "expected_task_ids": list(
+                updater.STANDARD_SELECTION_TASK_IDS
+            ),
+            "authenticated_observation_count": authenticated,
+            "pending_count": pending,
+            "terminal_failure_count": failures,
+            "selected_symmetric_result": selected,
+            "finite_local_budget": {
+                "current_round": 0,
+                "max_rounds": 2,
+                "max_candidates_per_round": 3,
+                "max_candidates_total": 6,
+                "candidate_count_this_round": prepared,
+            },
+            "terminal_failures_are_physics_observations": False,
+            "pending_allows_local_candidate_generation": False,
+            "full_model_started_by_watcher": False,
         }
     )
 
@@ -692,6 +749,169 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
         )
 
 
+def test_local_symmetric_selection_card_shows_sealed_selection_and_budget(
+    tmp_path: Path,
+) -> None:
+    selected = {
+        "task_id": 96331,
+        "candidate_physics_sha256": "c" * 64,
+        "minimum_normalized_actual_margin": 0.0125,
+        "actual_total_loss_W": 5319.5,
+        "actual_volume_L": 803.2,
+    }
+    state = _local_selection_state(
+        status="selected_symmetric_hard_pass",
+        authenticated=2,
+        pending=5,
+        failures=0,
+        selected=selected,
+    )
+    path = tmp_path / "local-selection-state.json"
+    path.write_text(
+        json.dumps(state, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    merged = updater.merge_status(
+        _status(),
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+        local_symmetric_selection_state_file=path,
+    )
+    card = next(
+        item
+        for item in merged["current"]
+        if item["id"] == updater.LOCAL_SYMMETRIC_SELECTION_CARD_ID
+    )
+
+    assert "SELECTED task96331" in card["title"]
+    assert "AUTH 2/7" in card["title"]
+    assert "AUTO FULL OFF" in card["title"]
+    assert any(
+        "authenticated=2/7 / pending=5 / terminal failures=0"
+        in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "selected symmetric result=task96331 cccccccccccc"
+        in item
+        and "loss=5319.500W" in item
+        and "volume=803.200L" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "local bounded budget=round 1/2 / prepared 0/3 / total cap 6"
+        in item
+        for item in card["evidence"]
+    )
+    assert any(
+        item == "AUTO FULL OFF / Scheduler mutation=false / methods=[]"
+        for item in card["evidence"]
+    )
+    assert merged["current"][-1]["id"] == "parallel-workstreams"
+    updater.validate_status_sync(merged)
+
+
+def test_local_symmetric_selection_card_shows_bounded_local_batch(
+    tmp_path: Path,
+) -> None:
+    state = _local_selection_state(
+        status="local_prepare_only_batch_ready",
+        authenticated=6,
+        pending=0,
+        failures=1,
+        prepared=3,
+    )
+    path = tmp_path / "local-selection-state.json"
+    path.write_text(
+        json.dumps(state, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    card = updater._local_symmetric_selection_card(path, OBSERVED)
+
+    assert "LOCAL BATCH 3/3 READY" in card["title"]
+    assert "AUTH 6/7" in card["title"]
+    assert any(
+        "authenticated=6/7 / pending=0 / terminal failures=1"
+        in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "prepared 3/3" in item and "prepare-only" in item
+        for item in card["evidence"]
+    )
+
+
+def test_local_symmetric_selection_missing_and_tamper_are_fail_safe(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing-local-selection-state.json"
+    missing_card = updater._local_symmetric_selection_card(
+        missing, OBSERVED
+    )
+    assert "STATE MISSING" in missing_card["title"]
+    assert "AUTO FULL OFF" in missing_card["title"]
+    assert any(
+        item == "selected symmetric result=none claimed"
+        for item in missing_card["evidence"]
+    )
+    assert any(
+        item == "AUTO FULL OFF / Scheduler mutation=false"
+        for item in missing_card["evidence"]
+    )
+
+    path = tmp_path / "tampered-local-selection-state.json"
+    state = _local_selection_state()
+    state["selected_symmetric_result"] = {
+        "task_id": 99999,
+        "candidate_physics_sha256": "forged",
+    }
+    path.write_text(
+        json.dumps(state, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    merged = updater.merge_status(
+        _status(),
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+        local_symmetric_selection_state_file=path,
+    )
+    card = next(
+        item
+        for item in merged["current"]
+        if item["id"] == updater.LOCAL_SYMMETRIC_SELECTION_CARD_ID
+    )
+    assert "STATE INVALID" in card["title"]
+    assert not any("99999" in item for item in card["evidence"])
+    updater.validate_status_sync(merged)
+
+
+def test_local_symmetric_selection_accepts_producer_sealed_state(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "local-watch-output"
+    produced = local_watch.process_cycle(
+        source_state_path=tmp_path / "missing-source-state.json",
+        aggregate_manifest=tmp_path / "missing-aggregate.json",
+        output_root=output,
+    )
+    assert produced["status"] == "blocked_fail_closed"
+
+    card = updater._local_symmetric_selection_card(
+        output / "state.json", OBSERVED
+    )
+
+    assert "FAIL-CLOSED" in card["title"]
+    assert "STATE INVALID" not in card["title"]
+    assert "AUTO FULL OFF" in card["title"]
+    assert any(
+        item == "AUTO FULL OFF / Scheduler mutation=false / methods=[]"
+        for item in card["evidence"]
+    )
+
+
 def test_thermal_bridge_state_absence_and_tamper_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -875,18 +1095,28 @@ def test_run_once_writes_sealed_pid_and_log(tmp_path: Path) -> None:
 
 def test_cli_modes_and_default_interval() -> None:
     parser = updater._parser()
-    assert parser.parse_args(["--once"]).interval_seconds == 60
+    defaults = parser.parse_args(["--once"])
+    assert defaults.interval_seconds == 60
+    assert (
+        defaults.local_symmetric_selection_state_file
+        == updater.DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE
+    )
     parsed = parser.parse_args(
         [
             "--watch",
             "--thermal-bridge-state-file",
             "thermal.json",
+            "--local-symmetric-selection-state-file",
+            "local-selection.json",
             "--standard-full-continuation-state-file",
             "continuation.json",
         ]
     )
     assert parsed.watch is True
     assert parsed.thermal_bridge_state_file == Path("thermal.json")
+    assert parsed.local_symmetric_selection_state_file == Path(
+        "local-selection.json"
+    )
     assert parsed.standard_full_continuation_state_file == Path(
         "continuation.json"
     )

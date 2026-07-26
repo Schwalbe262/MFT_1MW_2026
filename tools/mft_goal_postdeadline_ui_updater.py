@@ -12,6 +12,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -31,6 +32,10 @@ DEFAULT_STATUS_FILE = Path(
     r"C:\Users\peets\slurm_scheduler_runtime"
     r"\mft_goal_20260726\ui\codex-work-status.json"
 )
+DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\local_symmetric_selection_watch_v1\state.json"
+)
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
 CAMPAIGN_SUBMITTED_FLOOR = 126
@@ -47,6 +52,9 @@ THERMAL_BRIDGE_STATE_SCHEMA = (
 )
 STANDARD_FULL_CONTINUATION_STATE_SCHEMA = (
     "mft-goal-standard-full-continuation-state-v1"
+)
+LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA = (
+    "mft-goal-local-symmetric-selection-watch-state-v1"
 )
 FINAL_GATE_PENDING_SCHEMA = "mft-goal-final-solver-package-pending-v1"
 FINAL_GATE_SEAL_SCHEMA = "mft-goal-final-solver-package-seal-v1"
@@ -313,6 +321,7 @@ STANDARD_SELECTION_TASK_IDS = (
 )
 FULL_REFERENCE_TASK_ID = 96326
 SELECTION_POLICY_CARD_ID = "codex-symmetric-primary-selection-policy"
+LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 
 RUNNING_STATES = {"running"}
@@ -866,6 +875,7 @@ def _read_sealed_local_json(
     *,
     schema: str,
     schema_field: str = "schema_version",
+    canonical_ensure_ascii: bool = False,
 ) -> dict[str, Any]:
     resolved = path.resolve(strict=True)
     if resolved.is_symlink() or resolved.stat().st_size > MAX_RESPONSE_BYTES:
@@ -878,7 +888,20 @@ def _read_sealed_local_json(
         raise UpdaterError(f"automation state is not an object: {resolved}")
     unsigned = copy.deepcopy(value)
     observed = unsigned.pop("payload_sha256", None)
-    if value.get(schema_field) != schema or observed != canonical_sha256(unsigned):
+    expected = (
+        hashlib.sha256(
+            json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if canonical_ensure_ascii
+        else canonical_sha256(unsigned)
+    )
+    if value.get(schema_field) != schema or observed != expected:
         raise UpdaterError(f"automation state seal drifted: {resolved}")
     return value
 
@@ -1041,6 +1064,274 @@ def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
             f"state SHA256 {_file_sha256(path.resolve())}",
         ],
     }
+
+
+def _local_selection_fail_safe_card(
+    path: Path,
+    observed_at: str,
+    *,
+    condition: str,
+) -> dict[str, Any]:
+    label = {
+        "missing": "STATE MISSING",
+        "unavailable": "STATE UNAVAILABLE",
+        "invalid": "STATE INVALID",
+    }[condition]
+    return {
+        "id": LOCAL_SYMMETRIC_SELECTION_CARD_ID,
+        "title": (
+            "CODEX · SYMMETRIC FEA SELECT · "
+            f"{label} · AUTO FULL OFF"
+        ),
+        "detail": (
+            "The optional sealed local-selection state is not trusted yet. "
+            "No candidate selection, local-batch, or Full continuation claim "
+            "is inferred from missing or invalid bytes."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 20,
+        "evidence": [
+            f"state={condition}_fail_safe",
+            "authenticated=unavailable / pending=unavailable / terminal=unavailable",
+            "selected symmetric result=none claimed",
+            "local bounded budget=max3/round × 2 rounds / prepare-only",
+            "AUTO FULL OFF / Scheduler mutation=false",
+            f"optional state path={path.resolve()}",
+        ],
+    }
+
+
+def _selection_count(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise UpdaterError(f"local symmetric selection {label} drifted")
+    return value
+
+
+def _selection_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise UpdaterError(f"local symmetric selection {label} drifted")
+    number = float(value)
+    if not math.isfinite(number):
+        raise UpdaterError(f"local symmetric selection {label} drifted")
+    return number
+
+
+def _strict_local_symmetric_selection_card(
+    path: Path,
+    observed_at: str,
+) -> dict[str, Any]:
+    try:
+        value = _read_sealed_local_json(
+            path,
+            schema=LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA,
+            canonical_ensure_ascii=True,
+        )
+    except FileNotFoundError:
+        return _local_selection_fail_safe_card(
+            path, observed_at, condition="missing"
+        )
+    except OSError:
+        return _local_selection_fail_safe_card(
+            path, observed_at, condition="unavailable"
+        )
+    except UpdaterError:
+        return _local_selection_fail_safe_card(
+            path, observed_at, condition="invalid"
+        )
+
+    allowed_statuses = {
+        "awaiting_symmetric_results",
+        "partial_measured_waiting",
+        "selected_symmetric_hard_pass",
+        "local_prepare_only_batch_ready",
+        "terminal_no_passing_or_small_local_correction",
+        "blocked_fail_closed",
+    }
+    status = str(value.get("status") or "")
+    authenticated = _selection_count(
+        value.get("authenticated_observation_count"),
+        "authenticated observation count",
+    )
+    pending = _selection_count(
+        value.get("pending_count"), "pending count"
+    )
+    failures = _selection_count(
+        value.get("terminal_failure_count"),
+        "terminal failure count",
+    )
+    task_ids = value.get("expected_task_ids")
+    budget = value.get("finite_local_budget")
+    if (
+        status not in allowed_statuses
+        or not isinstance(task_ids, list)
+        or len(task_ids) != len(STANDARD_SELECTION_TASK_IDS)
+        or len(set(task_ids)) != len(task_ids)
+        or set(task_ids) != set(STANDARD_SELECTION_TASK_IDS)
+        or authenticated + pending + failures
+        != len(STANDARD_SELECTION_TASK_IDS)
+        or value.get("diagnostic_only") is not True
+        or value.get("production_eligible") is not False
+        or value.get("symmetric_model_primary") is not True
+        or value.get("prepare_only") is not True
+        or value.get("scheduler_methods_used") != []
+        or value.get("scheduler_mutation_performed") is not False
+        or value.get("scheduler_submission_performed") is not False
+        or value.get("scheduler_cancel_performed") is not False
+        or value.get("scheduler_restart_performed") is not False
+        or value.get("automatic_full_trigger") is not False
+        or value.get("automatic_full_continuation") is not False
+        or value.get("full_model_started_by_watcher") is not False
+        or value.get("terminal_failures_are_physics_observations")
+        is not False
+        or value.get("pending_allows_local_candidate_generation")
+        is not False
+        or not isinstance(value.get("watch_complete"), bool)
+        or not isinstance(budget, Mapping)
+    ):
+        return _local_selection_fail_safe_card(
+            path, observed_at, condition="invalid"
+        )
+
+    current_round = _selection_count(
+        budget.get("current_round"), "current local round"
+    )
+    max_rounds = _selection_count(
+        budget.get("max_rounds"), "maximum local rounds"
+    )
+    max_per_round = _selection_count(
+        budget.get("max_candidates_per_round"),
+        "maximum candidates per round",
+    )
+    max_total = _selection_count(
+        budget.get("max_candidates_total"),
+        "maximum total candidates",
+    )
+    prepared = _selection_count(
+        budget.get("candidate_count_this_round"),
+        "candidate count this round",
+    )
+    if (
+        current_round not in {0, 1}
+        or max_rounds != 2
+        or max_per_round != 3
+        or max_total != 6
+        or prepared > max_per_round
+        or (pending and prepared)
+    ):
+        return _local_selection_fail_safe_card(
+            path, observed_at, condition="invalid"
+        )
+
+    selected = value.get("selected_symmetric_result")
+    selected_text = "none"
+    if status == "selected_symmetric_hard_pass":
+        if not isinstance(selected, Mapping):
+            return _local_selection_fail_safe_card(
+                path, observed_at, condition="invalid"
+            )
+        task_id = selected.get("task_id")
+        candidate_sha = selected.get("candidate_physics_sha256")
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id not in STANDARD_SELECTION_TASK_IDS
+            or not isinstance(candidate_sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", candidate_sha)
+        ):
+            return _local_selection_fail_safe_card(
+                path, observed_at, condition="invalid"
+            )
+        margin = _selection_number(
+            selected.get("minimum_normalized_actual_margin"),
+            "selected margin",
+        )
+        loss = _selection_number(
+            selected.get("actual_total_loss_W"),
+            "selected loss",
+        )
+        volume = _selection_number(
+            selected.get("actual_volume_L"),
+            "selected volume",
+        )
+        selected_text = (
+            f"task{task_id} {candidate_sha[:12]} / margin={margin:.6g} / "
+            f"loss={loss:.3f}W / volume={volume:.3f}L"
+        )
+        label = f"SELECTED task{task_id}"
+    elif selected is not None:
+        return _local_selection_fail_safe_card(
+            path, observed_at, condition="invalid"
+        )
+    else:
+        label = {
+            "awaiting_symmetric_results": "WAITING",
+            "partial_measured_waiting": "MEASURED, WAITING",
+            "local_prepare_only_batch_ready": (
+                f"LOCAL BATCH {prepared}/3 READY"
+            ),
+            "terminal_no_passing_or_small_local_correction": (
+                "NO ELIGIBLE LOCAL STEP"
+            ),
+            "blocked_fail_closed": "FAIL-CLOSED",
+        }[status]
+
+    progress = {
+        "awaiting_symmetric_results": 35,
+        "partial_measured_waiting": min(85, 40 + authenticated * 6),
+        "selected_symmetric_hard_pass": 100,
+        "local_prepare_only_batch_ready": 90,
+        "terminal_no_passing_or_small_local_correction": 100,
+        "blocked_fail_closed": 25,
+    }[status]
+    return {
+        "id": LOCAL_SYMMETRIC_SELECTION_CARD_ID,
+        "title": (
+            "CODEX · SYMMETRIC FEA SELECT · "
+            f"{label} · AUTH {authenticated}/7 · AUTO FULL OFF"
+        ),
+        "detail": (
+            "Authenticated symmetric FEA is the primary selection gate. "
+            "A passing result stops selection immediately; otherwise only a "
+            "finite prepare-only local batch can be emitted after all current "
+            "lanes are terminal."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": [
+            f"status={status}",
+            (
+                f"authenticated={authenticated}/7 / pending={pending} / "
+                f"terminal failures={failures}"
+            ),
+            f"selected symmetric result={selected_text}",
+            (
+                f"local bounded budget=round {current_round + 1}/"
+                f"{max_rounds} / prepared {prepared}/{max_per_round} / "
+                f"total cap {max_total} / prepare-only"
+            ),
+            "AUTO FULL OFF / Scheduler mutation=false / methods=[]",
+            f"state SHA256 {_file_sha256(path.resolve())}",
+        ],
+    }
+
+
+def _local_symmetric_selection_card(
+    path: Path,
+    observed_at: str,
+) -> dict[str, Any]:
+    try:
+        return _strict_local_symmetric_selection_card(path, observed_at)
+    except FileNotFoundError:
+        condition = "missing"
+    except OSError:
+        condition = "unavailable"
+    except UpdaterError:
+        condition = "invalid"
+    return _local_selection_fail_safe_card(
+        path, observed_at, condition=condition
+    )
 
 
 def _thermal_bridge_card(path: Path, observed_at: str) -> dict[str, Any]:
@@ -1450,6 +1741,9 @@ def merge_status(
     observed_at: str,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
+    local_symmetric_selection_state_file: Path | None = (
+        DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE
+    ),
     standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
@@ -1478,6 +1772,18 @@ def merge_status(
         _upsert_current_card(
             result,
             _thermal_bridge_card(thermal_bridge_state_file, observed_at),
+        )
+    if local_symmetric_selection_state_file is not None:
+        _upsert_current_card(
+            result,
+            _local_symmetric_selection_card(
+                local_symmetric_selection_state_file,
+                observed_at,
+            ),
+        )
+    else:
+        _remove_current_card(
+            result, LOCAL_SYMMETRIC_SELECTION_CARD_ID
         )
     if standard_full_continuation_state_file is not None:
         _upsert_current_card(
@@ -1634,6 +1940,9 @@ def synchronize_once(
     observed_at: str | None = None,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
+    local_symmetric_selection_state_file: Path | None = (
+        DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE
+    ),
     standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
@@ -1652,6 +1961,9 @@ def synchronize_once(
         observed_at=observed_at or _timestamp(),
         postsuccess_state_file=postsuccess_state_file,
         thermal_bridge_state_file=thermal_bridge_state_file,
+        local_symmetric_selection_state_file=(
+            local_symmetric_selection_state_file
+        ),
         standard_full_continuation_state_file=(
             standard_full_continuation_state_file
         ),
@@ -1701,6 +2013,9 @@ def run_updater(
     sleeper: Callable[[float], None] = time.sleep,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
+    local_symmetric_selection_state_file: Path | None = (
+        DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE
+    ),
     standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any] | None:
@@ -1739,6 +2054,9 @@ def run_updater(
                     task_reader=task_reader,
                     postsuccess_state_file=postsuccess_state_file,
                     thermal_bridge_state_file=thermal_bridge_state_file,
+                    local_symmetric_selection_state_file=(
+                        local_symmetric_selection_state_file
+                    ),
                     standard_full_continuation_state_file=(
                         standard_full_continuation_state_file
                     ),
@@ -1787,6 +2105,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-file", type=Path)
     parser.add_argument("--postsuccess-state-file", type=Path)
     parser.add_argument("--thermal-bridge-state-file", type=Path)
+    parser.add_argument(
+        "--local-symmetric-selection-state-file",
+        type=Path,
+        default=DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE,
+    )
     parser.add_argument("--standard-full-continuation-state-file", type=Path)
     parser.add_argument("--final-gate-root", type=Path)
     return parser
@@ -1805,6 +2128,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         lock_file=args.lock_file or ui_root / "postdeadline-ui-updater.lock",
         postsuccess_state_file=args.postsuccess_state_file,
         thermal_bridge_state_file=args.thermal_bridge_state_file,
+        local_symmetric_selection_state_file=(
+            args.local_symmetric_selection_state_file
+        ),
         standard_full_continuation_state_file=(
             args.standard_full_continuation_state_file
         ),
