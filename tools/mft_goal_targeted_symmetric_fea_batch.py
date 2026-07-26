@@ -1212,7 +1212,6 @@ def _generate_n1_6_cooler_neighborhood(
     production cold plates are enlarged together to target the 100 C Tx gate.
     """
 
-    import numpy as np
     import pandas as pd
 
     from module.input_parameter_260706 import (
