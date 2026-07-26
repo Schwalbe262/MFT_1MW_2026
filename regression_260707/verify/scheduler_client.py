@@ -730,6 +730,12 @@ def retained_aedt_identity(
                     "goal_diagnostic_standard_timeout12h_retry.json"
                 ),
                 (
+                    "mft-goal-diagnostic-standard-rounded-final-"
+                    "profile-v1"
+                ): (
+                    "goal_diagnostic_standard_rounded_final.json"
+                ),
+                (
                     "mft-goal-diagnostic-standard-g3dmesher-"
                     "high-memory-profile-v1"
                 ): (
