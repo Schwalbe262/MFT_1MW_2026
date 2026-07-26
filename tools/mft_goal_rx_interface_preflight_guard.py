@@ -25,6 +25,12 @@ EXPECTED_MESH_POLICY = (
 EXPECTED_MESH_PLAN_CONTRACT = "thermal-mesh-plan-v7"
 EXPECTED_RX_MAIN_OBJECTS = ["Rx_main_block_xn", "Rx_main_block_yp"]
 EXPECTED_FIXED_COOLING_SCHEMA = "mft-fixed-thermal-boundary-v1"
+EXPECTED_PROJECT = "MFT_1MW_2026v1"
+EXPECTED_CPUS = 8
+EXPECTED_MEMORY_MB = 65_536
+EXPECTED_BACKEND = "standalone"
+EXPECTED_PRIORITY = 100
+EXPECTED_TIMEOUT_SECONDS = 43_200
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -176,6 +182,22 @@ def _validate_marker(marker: Mapping[str, Any]) -> list[str]:
     return reasons
 
 
+def _validate_task_readback(task: Mapping[str, Any]) -> list[str]:
+    expected = {
+        "project": EXPECTED_PROJECT,
+        "cpus": EXPECTED_CPUS,
+        "memory_mb": EXPECTED_MEMORY_MB,
+        "aedt_backend": EXPECTED_BACKEND,
+        "priority": EXPECTED_PRIORITY,
+        "timeout_seconds": EXPECTED_TIMEOUT_SECONDS,
+    }
+    return [
+        f"task_readback_{name}_mismatch"
+        for name, value in expected.items()
+        if task.get(name) != value
+    ]
+
+
 def inspect_task(
     *,
     scheduler_url: str,
@@ -199,7 +221,7 @@ def inspect_task(
         _scheduler_json(f"{origin}/api/tasks/{task_id}/stdout")
     )
     marker = _extract_marker(stdout)
-    reasons = _validate_marker(marker)
+    reasons = _validate_task_readback(task) + _validate_marker(marker)
     return {
         "schema": "mft-goal-rx-interface-preflight-guard-v1",
         "task_id": task_id,
