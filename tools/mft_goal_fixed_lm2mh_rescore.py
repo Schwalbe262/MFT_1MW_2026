@@ -30,7 +30,7 @@ INPUT_ROOT = Path(
 )
 OUTPUT_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_primary_5t_gap1_1p6_axis_nsga_v6_fixed_lm2mh_rescore"
+    r"\fixed_primary_5t_gap1_1p6_axis_w1200_l1000_fixed_lm2mh_rescore"
 )
 GENERATION = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
@@ -47,7 +47,7 @@ EXPECTED_DATASET_SHA256 = (
 EXPECTED_EVALUATION_MODEL_SHA256 = (
     "b9a2714079317e4b31a5372311991bb91e024d64678618cbc32ab1ed18964dfc"
 )
-EXPECTED_HARD_SPEC_SHA256 = (
+SOURCE_HARD_SPEC_SHA256 = (
     "bb05c758dab06a802627681c0c19be8e7062f423dda54089c0a539e61b0f7d5c"
 )
 TARGETS = ("Llt_phys", "C_tx_tx_F", "C_rx_rx_F", "C_tx_rx_F")
@@ -57,6 +57,26 @@ LM_PRIMARY_REFERRED_H = 0.002
 RESONANCE_MIN_HZ = 15_000.0
 RESONANCE_NORMALIZATION_HZ = 150.0
 PRIMARY_CONTROL_ABS_TOL_MM = 1e-12
+EFFECTIVE_HARD_SPEC = {
+    "schema_version": "mft-goal-fixed-primary-5t-axis-w1200-l1000-lm2mh-v1",
+    "primary_conductor_thickness_mm": 5.0,
+    "primary_interturn_gap_mm": 1.6,
+    "primary_controls_are_hard_fixed": True,
+    "size_limits_mm": {"W": 1200.0, "L": 1000.0, "H": 750.0},
+    "axis_contract": {
+        "W": "drawing_x_original_973mm_direction",
+        "L": "drawing_y_perpendicular_direction",
+        "rotation_or_axis_swap_allowed": False,
+    },
+    "magnetizing_inductance_H": LM_PRIMARY_REFERRED_H,
+    "magnetizing_inductance_basis": "full-physical-primary-referred",
+    "magnetizing_inductance_tuning": "explicit-air-gap",
+    "self_resonance_min_Hz": RESONANCE_MIN_HZ,
+    "winding_temperature_max_C": 100.0,
+    "core_temperature_max_C": 120.0,
+    "fan_velocity_m_s": 1.5,
+    "cooling_and_TIM_mutation_allowed": False,
+}
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -71,6 +91,9 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _sha(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+EFFECTIVE_HARD_SPEC_SHA256 = _sha(EFFECTIVE_HARD_SPEC)
 
 
 def _sha_file(path: Path) -> str:
@@ -134,7 +157,9 @@ def _truth(value: Any) -> bool:
 def _resonance_contract() -> dict[str, Any]:
     contract = {
         "schema_version": "mft-goal-fixed-lm2mh-resonance-contract-v1",
-        "hard_spec_sha256": EXPECTED_HARD_SPEC_SHA256,
+        "source_hard_spec_sha256": SOURCE_HARD_SPEC_SHA256,
+        "effective_hard_spec": EFFECTIVE_HARD_SPEC,
+        "effective_hard_spec_sha256": EFFECTIVE_HARD_SPEC_SHA256,
         "magnetizing_inductance": {
             "symbol": "Lm",
             "value": LM_PRIMARY_REFERRED_H,
@@ -185,10 +210,20 @@ def _resonance_contract() -> dict[str, Any]:
         "replacement_constraint": NEW_RESONANCE_CONSTRAINT,
         "all_non_resonance_physical_constraints_preserved": True,
         "axis_contract": {
-            "W_max_mm": 1000.0,
-            "L_max_mm": 1200.0,
+            "W_max_mm": 1200.0,
+            "L_max_mm": 1000.0,
             "H_max_mm": 750.0,
             "rotation_or_axis_swap_allowed": False,
+            "source_dimension_recovery": {
+                "actual_W_mm": (
+                    "1000 + source physical_G.exterior_width_limit"
+                ),
+                "actual_L_mm": (
+                    "1200 + source physical_G.exterior_length_limit"
+                ),
+                "new_width_G_mm": "actual_W_mm - 1200",
+                "new_length_G_mm": "actual_L_mm - 1000",
+            },
         },
         "fixed_primary_controls": {"cw1_mm": 5.0, "gap1_mm": 1.6},
         "cooling_contract": {
@@ -260,7 +295,7 @@ def _load_terminal_rows(input_root: Path) -> Any:
     if (
         status.get("terminal_success_seed_count") != 16
         or status.get("global_nds_final") is not True
-        or status.get("hard_spec_sha256") != EXPECTED_HARD_SPEC_SHA256
+        or status.get("hard_spec_sha256") != SOURCE_HARD_SPEC_SHA256
     ):
         raise RuntimeError("the authenticated 16-seed collector is not final")
     collections = status.get("collections")
@@ -448,16 +483,32 @@ def run(*, input_root: Path, output: Path, generation: Path) -> dict[str, Any]:
         "Tprobe_core_top_yoke_max",
     )
     for index, row in terminal.iterrows():
-        physical_g = {
+        source_physical_g = {
             name: float(value)
             for name, value in json.loads(row["physical_G_json"]).items()
             if name != OLD_RESONANCE_CONSTRAINT
         }
-        normalized_g = {
+        source_normalized_g = {
             name: float(value)
             for name, value in json.loads(row["normalized_G_json"]).items()
             if name != OLD_RESONANCE_CONSTRAINT
         }
+        actual_width_mm = (
+            1000.0 + source_physical_g["exterior_width_limit"]
+        )
+        actual_length_mm = (
+            1200.0 + source_physical_g["exterior_length_limit"]
+        )
+        physical_g = dict(source_physical_g)
+        normalized_g = dict(source_normalized_g)
+        physical_g["exterior_width_limit"] = actual_width_mm - 1200.0
+        physical_g["exterior_length_limit"] = actual_length_mm - 1000.0
+        normalized_g["exterior_width_limit"] = (
+            physical_g["exterior_width_limit"]
+        )
+        normalized_g["exterior_length_limit"] = (
+            physical_g["exterior_length_limit"]
+        )
         resonance_g = (
             float(new_resonance_g[index]) if positive[index] else 1.0e12
         )
@@ -497,10 +548,10 @@ def run(*, input_root: Path, output: Path, generation: Path) -> dict[str, Any]:
             )
         )
         derived["exterior_W_mm_fixed_lm2mh"].append(
-            1000.0 + physical_g["exterior_width_limit"]
+            1200.0 + physical_g["exterior_width_limit"]
         )
         derived["exterior_L_mm_fixed_lm2mh"].append(
-            1200.0 + physical_g["exterior_length_limit"]
+            1000.0 + physical_g["exterior_length_limit"]
         )
         derived["exterior_H_mm_fixed_lm2mh"].append(
             750.0 + physical_g["exterior_height_limit"]
@@ -614,7 +665,8 @@ def run(*, input_root: Path, output: Path, generation: Path) -> dict[str, Any]:
         "model_identity": model_identity,
         "source": {
             "collector_status": str(input_root / "collector_status.json"),
-            "hard_spec_sha256": EXPECTED_HARD_SPEC_SHA256,
+            "source_hard_spec_sha256": SOURCE_HARD_SPEC_SHA256,
+            "effective_hard_spec_sha256": EFFECTIVE_HARD_SPEC_SHA256,
             "scheduler_task_ids": list(EXPECTED_TASK_IDS),
         },
         "counts": {
