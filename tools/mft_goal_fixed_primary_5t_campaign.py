@@ -28,13 +28,16 @@ import zlib
 SCHEMA = "mft-goal-fixed-primary-5t-nsga-task-v1"
 RESULT_SCHEMA = "mft-goal-fixed-primary-5t-nsga-result-v1"
 CAMPAIGN_SCHEMA = "mft-goal-fixed-primary-5t-nsga-submission-v1"
-CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-20260727-v2"
+CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-20260727-v3"
+HEDGE_CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-variable-20260727-v1"
 PRIMARY_CONDUCTOR_MM = 5.0
 PRIMARY_GAP_MM = 1.6
 POPULATION = 320
 GENERATIONS = 80
-SEED_START = 2_707_275_100
+SEED_START = 2_707_275_300
 SEED_COUNT = 16
+HEDGE_SEED_START = 2_707_275_400
+HEDGE_SEED_COUNT = 8
 CPUS = 8
 MEMORY_MB = 65_536
 TIMEOUT_SECONDS = 7_200
@@ -54,7 +57,7 @@ GLOBAL_TERMINAL_CSV = Path(
 )
 DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_primary_5t_gap1_1p6_nsga_v2"
+    r"\fixed_primary_5t_gap1_1p6_nsga_v3"
 )
 BASE_TASKS = {
     5: "artifacts/campaign/tasks/seed-2607262000-n1-5.json",
@@ -85,6 +88,25 @@ HARD_SPEC = {
         "rounded_FEA_allowed": False,
         "rounded_use": "drawing_and_final-shape-visualization-only",
     },
+}
+HEDGE_HARD_SPEC = {
+    **{
+        key: copy.deepcopy(value)
+        for key, value in HARD_SPEC.items()
+        if key
+        not in {
+            "primary_interturn_gap_mm",
+            "primary_controls_are_hard_fixed",
+        }
+    },
+    "schema_version": "mft-goal-fixed-primary-5t-gap-variable-v1",
+    "primary_conductor_is_hard_fixed": True,
+    "primary_interturn_gap_search_mm": {
+        "minimum": 0.3,
+        "maximum": 5.0,
+    },
+    "hedge_only": True,
+    "strict_1p6_lane_has_selection_priority": True,
 }
 
 
@@ -244,8 +266,11 @@ def _task_payload(
     turns: int,
     source_bytes: bytes,
     warm_bytes: bytes,
+    campaign_id: str,
+    lane: str,
+    hard_spec: Mapping[str, Any],
 ) -> dict[str, Any]:
-    hard_spec_sha = _sha(HARD_SPEC)
+    hard_spec_sha = _sha(hard_spec)
     runner_sha = hashlib.sha256(source_bytes).hexdigest()
     warm_sha = hashlib.sha256(warm_bytes).hexdigest()
     base_task_local = (
@@ -269,7 +294,8 @@ def _task_payload(
     return _seal(
         {
             "schema_version": SCHEMA,
-            "campaign_id": CAMPAIGN_ID,
+            "campaign_id": campaign_id,
+            "lane": lane,
             "created_at": _now(),
             "seed": int(seed),
             "fixed_primary_turns": int(turns),
@@ -279,7 +305,7 @@ def _task_payload(
             "base_relocation_relative_path": BASE_RELOCATIONS[turns],
             "base_task_payload_sha256": base_task["payload_sha256"],
             "base_source_identity": base_task["source_identity"],
-            "hard_spec": copy.deepcopy(HARD_SPEC),
+            "hard_spec": copy.deepcopy(dict(hard_spec)),
             "hard_spec_sha256": hard_spec_sha,
             "physics_sha256": _sha(physics),
             "runner_source_sha256": runner_sha,
@@ -299,7 +325,7 @@ def _scheduler_payload(task: Mapping[str, Any], *, priority: int) -> dict[str, A
     command = "\n".join(
         [
             "set -euo pipefail",
-            'export PYTHONPATH="$PWD/artifacts/code'
+            'export PYTHONPATH="$PWD/artifacts/python-site'
             '${PYTHONPATH:+:$PYTHONPATH}"',
             'payload_path="${SLURM_SCHEDULER_PAYLOAD_PATH:'
             '?scheduler payload path is missing}"',
@@ -321,9 +347,10 @@ def _scheduler_payload(task: Mapping[str, Any], *, priority: int) -> dict[str, A
             '${SLURM_SCHED_TASK_ID:?missing task id}"',
         ]
     )
+    lane = str(task["lane"])
     dedupe = _sha(
         {
-            "campaign_id": CAMPAIGN_ID,
+            "campaign_id": task["campaign_id"],
             "physics_sha256": task["physics_sha256"],
             "task_payload_sha256": task["payload_sha256"],
             "cpus": CPUS,
@@ -331,7 +358,10 @@ def _scheduler_payload(task: Mapping[str, Any], *, priority: int) -> dict[str, A
         }
     )
     return {
-        "name": f"mft-5t-g1p6-s{seed}-n1-{turns}",
+        "name": (
+            f"mft-5t-{'g1p6' if lane == 'strict' else 'gapvar'}-"
+            f"s{seed}-n1-{turns}"
+        ),
         "remote_cwd": REMOTE_BUNDLE,
         "command": command,
         "payload_json": dict(task),
@@ -344,27 +374,47 @@ def _scheduler_payload(task: Mapping[str, Any], *, priority: int) -> dict[str, A
         "gpus": 0,
         "priority": int(priority),
         "timeout_seconds": TIMEOUT_SECONDS,
-        "dedupe_key": f"mft-goal-fixed-primary-5t:{dedupe}",
+        "dedupe_key": f"mft-goal-fixed-primary-5t-{lane}:{dedupe}",
         "max_workers_per_node": MAX_WORKERS_PER_NODE,
     }
 
 
 def submit(
-    *, output: Path, scheduler_url: str, priority: int, apply: bool
+    *,
+    output: Path,
+    scheduler_url: str,
+    priority: int,
+    apply: bool,
+    lane: str,
 ) -> dict[str, Any]:
     if output.exists():
         raise RuntimeError(f"campaign output already exists: {output}")
     output.mkdir(parents=True)
     source = _source_bytes()
     warm = _warm_coordinates_by_turns(GLOBAL_TERMINAL_CSV)
+    if lane == "strict":
+        campaign_id = CAMPAIGN_ID
+        hard_spec = HARD_SPEC
+        seed_start = SEED_START
+        seed_count = SEED_COUNT
+    elif lane == "gap-variable":
+        campaign_id = HEDGE_CAMPAIGN_ID
+        hard_spec = HEDGE_HARD_SPEC
+        seed_start = HEDGE_SEED_START
+        seed_count = HEDGE_SEED_COUNT
+    else:
+        raise RuntimeError(f"unsupported lane: {lane}")
     tasks = []
-    for index in range(SEED_COUNT):
+    for index in range(seed_count):
         turns = 5 + index % 4
         task = _task_payload(
-            seed=SEED_START + index,
+            seed=seed_start + index,
             turns=turns,
             source_bytes=source,
             warm_bytes=warm[turns],
+            campaign_id=campaign_id,
+            lane=lane,
+            hard_spec=hard_spec,
         )
         _atomic_json(output / "tasks" / f"seed-{task['seed']}.json", task)
         tasks.append(task)
@@ -400,17 +450,18 @@ def submit(
     manifest = _seal(
         {
             "schema_version": CAMPAIGN_SCHEMA,
-            "campaign_id": CAMPAIGN_ID,
+            "campaign_id": campaign_id,
+            "lane": lane,
             "created_at": _now(),
             "apply": bool(apply),
             "scheduler_url": scheduler_url.rstrip("/"),
-            "hard_spec": copy.deepcopy(HARD_SPEC),
-            "hard_spec_sha256": _sha(HARD_SPEC),
+            "hard_spec": copy.deepcopy(hard_spec),
+            "hard_spec_sha256": _sha(hard_spec),
             "runner_source_sha256": hashlib.sha256(source).hexdigest(),
             "population": POPULATION,
             "generations": GENERATIONS,
-            "seed_count": SEED_COUNT,
-            "seed_start": SEED_START,
+            "seed_count": seed_count,
+            "seed_start": seed_start,
             "turn_strata": [5, 6, 7, 8],
             "scheduler_resources_per_task": {
                 "cpus": CPUS,
@@ -474,10 +525,18 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
     import pandas as pd
 
     task = _validate_seal(_read_json(payload_path.resolve(strict=True)), SCHEMA)
+    lane = str(task.get("lane") or "")
+    expected_campaign = (
+        CAMPAIGN_ID if lane == "strict" else HEDGE_CAMPAIGN_ID
+    )
+    expected_hard_spec = (
+        HARD_SPEC if lane == "strict" else HEDGE_HARD_SPEC
+    )
     if (
-        task["campaign_id"] != CAMPAIGN_ID
-        or task["hard_spec"] != HARD_SPEC
-        or task["hard_spec_sha256"] != _sha(HARD_SPEC)
+        lane not in {"strict", "gap-variable"}
+        or task["campaign_id"] != expected_campaign
+        or task["hard_spec"] != expected_hard_spec
+        or task["hard_spec_sha256"] != _sha(expected_hard_spec)
         or task["runner_source_sha256"]
         != hashlib.sha256(_source_bytes()).hexdigest()
         or int(task["population"]) != POPULATION
@@ -557,8 +616,9 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
     )
     problem.xl[cw_index] = cw_unit
     problem.xu[cw_index] = cw_unit
-    problem.xl[gap_index] = gap_unit
-    problem.xu[gap_index] = gap_unit
+    if lane == "strict":
+        problem.xl[gap_index] = gap_unit
+        problem.xu[gap_index] = gap_unit
 
     physical_evaluate, scaling = preflight.install_optimizer_scaling(
         problem,
@@ -590,12 +650,15 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
             rtol=0.0,
             atol=1e-12,
         ).all()
-        or not np.isclose(
-            decoded["gap1"].to_numpy(dtype=float),
-            PRIMARY_GAP_MM,
-            rtol=0.0,
-            atol=1e-12,
-        ).all()
+        or (
+            lane == "strict"
+            and not np.isclose(
+                decoded["gap1"].to_numpy(dtype=float),
+                PRIMARY_GAP_MM,
+                rtol=0.0,
+                atol=1e-12,
+            ).all()
+        )
     ):
         raise RuntimeError("fixed primary controls escaped projected smoke")
 
@@ -616,11 +679,20 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
                             "unit": cw_unit,
                             "physical_mm": PRIMARY_CONDUCTOR_MM,
                         },
-                        "gap1": {
-                            "coordinate_index": gap_index,
-                            "unit": gap_unit,
-                            "physical_mm": PRIMARY_GAP_MM,
-                        },
+                        "gap1": (
+                            {
+                                "coordinate_index": gap_index,
+                                "unit": gap_unit,
+                                "physical_mm": PRIMARY_GAP_MM,
+                                "hard_fixed": True,
+                            }
+                            if lane == "strict"
+                            else {
+                                "coordinate_index": gap_index,
+                                "hard_fixed": False,
+                                "search_mm": [0.3, 5.0],
+                            }
+                        ),
                     },
                     "warm_source_sha256": warm_sha,
                     "projected_warm_sha256": projected_sha,
@@ -676,7 +748,10 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
         params = json.loads(raw)
         if (
             float(params["cw1"]) != PRIMARY_CONDUCTOR_MM
-            or float(params["gap1"]) != PRIMARY_GAP_MM
+            or (
+                lane == "strict"
+                and float(params["gap1"]) != PRIMARY_GAP_MM
+            )
         ):
             escaped.append(index)
     if escaped:
@@ -701,11 +776,12 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
     value = _seal(
         {
             "schema_version": RESULT_SCHEMA,
-            "campaign_id": CAMPAIGN_ID,
+            "campaign_id": task["campaign_id"],
+            "lane": lane,
             "completed_at": _now(),
             "task_payload_sha256": task["payload_sha256"],
             "physics_sha256": task["physics_sha256"],
-            "hard_spec": copy.deepcopy(HARD_SPEC),
+            "hard_spec": copy.deepcopy(task["hard_spec"]),
             "hard_spec_sha256": task["hard_spec_sha256"],
             "seed": int(task["seed"]),
             "fixed_primary_turns": int(task["fixed_primary_turns"]),
@@ -724,6 +800,7 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
             ],
             "feasible_pareto_count": artifacts["feasible_pareto_count"],
             "terminal_primary_controls_attested": True,
+            "terminal_gap1_hard_fixed": lane == "strict",
             "terminal_primary_control_escape_count": 0,
             "global_nds_ready": True,
             "artifact_inventory": inventory,
@@ -747,6 +824,11 @@ def _parser() -> argparse.ArgumentParser:
     launch.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     launch.add_argument("--scheduler-url", default=SCHEDULER_URL)
     launch.add_argument("--priority", type=int, default=40)
+    launch.add_argument(
+        "--lane",
+        choices=("strict", "gap-variable"),
+        default="strict",
+    )
     launch.add_argument("--apply", action="store_true")
     execute = commands.add_parser("worker")
     execute.add_argument("--payload", type=Path, required=True)
@@ -762,6 +844,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             scheduler_url=args.scheduler_url,
             priority=args.priority,
             apply=args.apply,
+            lane=args.lane,
         )
     else:
         value = worker(
