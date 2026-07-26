@@ -48,6 +48,7 @@ DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE = Path(
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_LOCAL_SEALED_STATE_BYTES = 8 * 1024 * 1024
 CAMPAIGN_SUBMITTED_FLOOR = 130
 SYNC_KEY = "postdeadline_task_sync"
 SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
@@ -1590,7 +1591,10 @@ def _read_sealed_local_json(
     canonical_ensure_ascii: bool = False,
 ) -> dict[str, Any]:
     resolved = path.resolve(strict=True)
-    if resolved.is_symlink() or resolved.stat().st_size > MAX_RESPONSE_BYTES:
+    if (
+        resolved.is_symlink()
+        or resolved.stat().st_size > MAX_LOCAL_SEALED_STATE_BYTES
+    ):
         raise UpdaterError(f"automation state is unsafe: {resolved}")
     try:
         value = json.loads(resolved.read_text(encoding="utf-8"))
