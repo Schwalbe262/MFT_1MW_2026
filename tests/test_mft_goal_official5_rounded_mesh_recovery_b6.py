@@ -317,7 +317,8 @@ def test_payload_uses_preflight_executor_and_has_no_direct_analyze(
             f"git checkout {revision}; "
             f'export {recovery.rounded.direct.DIRECT_ENV_NAME}='
             f'"{recovery.rounded.direct.DIRECT_ENV_TOKEN}"; '
-            "timeout 10800s python run_simulation_260706.py "
+            "timeout --signal=TERM --kill-after=300s 43200s "
+            "python run_simulation_260706.py "
             "--fixed --thermal --headless "
             "--symmetry-thermal-direct-analyze --params cand.json"
         )
@@ -360,6 +361,10 @@ def test_payload_uses_preflight_executor_and_has_no_direct_analyze(
     )
     assert "python run_simulation_260706.py" not in command
     assert "--symmetry-thermal-direct-analyze" not in command
+    assert (
+        "timeout --signal=TERM --kill-after=300s 10800s " in command
+    )
+    assert "timeout --signal=TERM --kill-after=300s 43200s " not in command
     assert recovery.rounded.direct.DIRECT_ENV_NAME not in environment
     assert environment[executor.OPT_IN_ENV] == executor.OPT_IN_TOKEN
     assert environment[executor.PADDING_ENV] == "1.0"

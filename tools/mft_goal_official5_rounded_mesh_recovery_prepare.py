@@ -423,10 +423,20 @@ def _without_direct_analyze(command: str) -> str:
         f'export {rounded.direct.DIRECT_ENV_NAME}='
         f'"{rounded.direct.DIRECT_ENV_TOKEN}"; '
     )
-    if command.count(direct_flag) != 1 or command.count(direct_export) != 1:
+    source_timeout = "timeout --signal=TERM --kill-after=300s 43200s "
+    target_timeout = (
+        "timeout --signal=TERM --kill-after=300s "
+        f"{SOLVER_SECONDS}s "
+    )
+    if (
+        command.count(direct_flag) != 1
+        or command.count(direct_export) != 1
+        or command.count(source_timeout) != 1
+    ):
         raise ContractError("rounded direct-Analyze command shape drifted")
     command = command.replace(direct_flag, "", 1)
     command = command.replace(direct_export, "", 1)
+    command = command.replace(source_timeout, target_timeout, 1)
     return command
 
 
@@ -508,6 +518,12 @@ def validate_recovery_payload(
         or "python run_simulation_260706.py" in command
         or "--symmetry-thermal-direct-analyze" in command
         or "--full" in command
+        or command.count(
+            "timeout --signal=TERM --kill-after=300s "
+            f"{SOLVER_SECONDS}s "
+        )
+        != 1
+        or "timeout --signal=TERM --kill-after=300s 43200s " in command
         or solver_revision not in command
         or rounded.direct.DIRECT_ENV_NAME in environment
         or environment.get(executor.OPT_IN_ENV) != executor.OPT_IN_TOKEN
