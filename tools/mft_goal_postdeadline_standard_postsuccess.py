@@ -60,10 +60,10 @@ AUTHENTICATED_COLLECTION_SCHEMA = (
     "mft-goal-postdeadline-standard-authenticated-collection-v1"
 )
 OBSERVATION_SCHEMA = (
-    "mft-goal-postdeadline-standard-measured-observation-v1"
+    "mft-goal-postdeadline-standard-measured-observation-v2"
 )
-RERANK_INPUT_SCHEMA = "mft-goal-postdeadline-standard-rerank-input-v1"
-SNAPSHOT_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-snapshot-v1"
+RERANK_INPUT_SCHEMA = "mft-goal-postdeadline-standard-rerank-input-v2"
+SNAPSHOT_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-snapshot-v2"
 STATE_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-state-v1"
 PID_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-pid-v1"
 OFFICIAL5_DIRECT_COLLECTION_SCHEMA = (
@@ -106,6 +106,29 @@ SAFETY_FLAGS = {
     "production_eligible": False,
     "original_deadline_missed": True,
 }
+
+TEMPERATURE_FAMILY_GATE_SCHEMA = (
+    "mft-goal-postdeadline-standard-split-temperature-family-gate-v2"
+)
+TEMPERATURE_FAMILY_ACTUAL_FIELDS = {
+    "primary_winding": "actual_primary_winding_max_C",
+    "secondary_winding": "actual_secondary_winding_max_C",
+    "core": "actual_core_max_C",
+}
+TEMPERATURE_FAMILY_EVIDENCE_FIELDS = {
+    "primary_winding": "primary_winding_max_C",
+    "secondary_winding": "secondary_winding_max_C",
+    "core": "core_max_C",
+}
+HARD_CONSTRAINT_EVIDENCE_KEYS = frozenset(
+    {
+        "width_mm",
+        "length_mm",
+        "height_mm",
+        "resonance_Hz",
+        *TEMPERATURE_FAMILY_EVIDENCE_FIELDS.values(),
+    }
+)
 
 COLLECTION_RECEIPT_FIELDS = frozenset(
     {
@@ -190,6 +213,8 @@ OBSERVATION_COLUMNS = (
     "actual_length_mm",
     "actual_height_mm",
     "actual_resonance_Hz",
+    "actual_primary_winding_max_C",
+    "actual_secondary_winding_max_C",
     "actual_winding_max_C",
     "actual_core_max_C",
     "measured_hard_constraints_passed",
@@ -350,6 +375,109 @@ def _resolve_record(
 
 def _classification_valid(value: Mapping[str, Any]) -> bool:
     return all(value.get(key) is expected for key, expected in SAFETY_FLAGS.items())
+
+
+def _temperature_family_gate_contract() -> dict[str, Any]:
+    """Return the exact split-family evidence schema used by this bridge."""
+
+    return {
+        "schema_version": TEMPERATURE_FAMILY_GATE_SCHEMA,
+        "goal_temperature_contract_sha256": (
+            GOAL_TEMPERATURE_CONTRACT_SHA256
+        ),
+        "family_limits_C": dict(TEMPERATURE_FAMILY_LIMITS_C),
+        "family_actual_fields": dict(TEMPERATURE_FAMILY_ACTUAL_FIELDS),
+        "family_hard_evidence_fields": dict(
+            TEMPERATURE_FAMILY_EVIDENCE_FIELDS
+        ),
+        "aggregate_winding_alias": {
+            "field": "actual_winding_max_C",
+            "formula": (
+                "max(actual_primary_winding_max_C,"
+                "actual_secondary_winding_max_C)"
+            ),
+            "audit_only": True,
+            "hard_gate": False,
+        },
+    }
+
+
+def _temperature_family_evidence_valid(value: Mapping[str, Any]) -> bool:
+    """Validate family maxima without treating the aggregate alias as a gate."""
+
+    if (
+        value.get("temperature_family_gate_contract")
+        != _temperature_family_gate_contract()
+    ):
+        return False
+    maxima = value.get("actual_temperature_family_max_C")
+    evidence = value.get("hard_constraint_evidence")
+    if (
+        not isinstance(maxima, Mapping)
+        or set(maxima) != set(TEMPERATURE_FAMILY_ACTUAL_FIELDS)
+        or not isinstance(evidence, Mapping)
+        or set(evidence) != HARD_CONSTRAINT_EVIDENCE_KEYS
+    ):
+        return False
+    try:
+        actuals = {
+            family: _finite(maxima[family], f"actual {family} maximum")
+            for family in TEMPERATURE_FAMILY_ACTUAL_FIELDS
+        }
+        flat_actuals = {
+            family: _finite(
+                value[TEMPERATURE_FAMILY_ACTUAL_FIELDS[family]],
+                f"flat actual {family} maximum",
+            )
+            for family in TEMPERATURE_FAMILY_ACTUAL_FIELDS
+        }
+        aggregate = _finite(
+            value["actual_winding_max_C"],
+            "aggregate winding maximum audit alias",
+        )
+    except (KeyError, PostSuccessContractError):
+        return False
+    if actuals != flat_actuals or aggregate != max(
+        actuals["primary_winding"],
+        actuals["secondary_winding"],
+    ):
+        return False
+    for family, evidence_name in TEMPERATURE_FAMILY_EVIDENCE_FIELDS.items():
+        item = evidence.get(evidence_name)
+        limit = float(TEMPERATURE_FAMILY_LIMITS_C[family])
+        actual = actuals[family]
+        if (
+            not isinstance(item, Mapping)
+            or item.get("actual") != actual
+            or item.get("limit") != limit
+            or item.get("relation") != "<="
+            or item.get("margin") != limit - actual
+            or item.get("passed") is not (actual <= limit)
+        ):
+            return False
+    return True
+
+
+def _temperature_family_flat_actuals_valid(value: Mapping[str, Any]) -> bool:
+    """Validate the three family fields and the audit-only aggregate alias."""
+
+    try:
+        primary = _finite(
+            value["actual_primary_winding_max_C"],
+            "actual primary winding maximum",
+        )
+        secondary = _finite(
+            value["actual_secondary_winding_max_C"],
+            "actual secondary winding maximum",
+        )
+        _finite(value["actual_core_max_C"], "actual core maximum")
+        aggregate = _finite(
+            value["actual_winding_max_C"],
+            "aggregate winding maximum audit alias",
+        )
+    except (KeyError, PostSuccessContractError):
+        return False
+    return aggregate == max(primary, secondary)
 
 
 def _load_collection_envelope(
@@ -950,40 +1078,56 @@ def _measured_classification(view: Mapping[str, Any]) -> dict[str, Any]:
         raise PostSuccessContractError(
             "measured hard-constraint evidence is incomplete"
         ) from exc
-    family_values: dict[str, list[float]] = {"winding": [], "core": []}
+    family_values: dict[str, list[float]] = {
+        family: [] for family in TEMPERATURE_FAMILY_ACTUAL_FIELDS
+    }
     for target in active:
-        family = TEMPERATURE_TARGET_FAMILIES[target]
+        family = TEMPERATURE_TARGET_FAMILIES.get(target)
+        if family not in family_values:
+            raise PostSuccessContractError(
+                f"unknown measured temperature family for {target}"
+            )
         family_values[family].append(
             _finite(temperatures[target]["actual_C"], f"actual {target}")
         )
-    if not family_values["winding"] or not family_values["core"]:
+    if any(not values for values in family_values.values()):
         raise PostSuccessContractError(
             "measured temperature family evidence is incomplete"
         )
-    winding_max = max(family_values["winding"])
-    core_max = max(family_values["core"])
+    family_maxima = {
+        family: max(values) for family, values in family_values.items()
+    }
+    primary_winding_max = family_maxima["primary_winding"]
+    secondary_winding_max = family_maxima["secondary_winding"]
+    winding_max_audit = max(primary_winding_max, secondary_winding_max)
+    core_max = family_maxima["core"]
     limits = {
         "width_mm": float(GOAL_SIZE_LIMITS_MM["W"]),
         "length_mm": float(GOAL_SIZE_LIMITS_MM["L"]),
         "height_mm": float(GOAL_SIZE_LIMITS_MM["H"]),
         "resonance_Hz": float(GOAL_STAGE_SPEC["resonance_min_Hz"]),
-        "winding_max_C": float(TEMPERATURE_FAMILY_LIMITS_C["winding"]),
-        "core_max_C": float(TEMPERATURE_FAMILY_LIMITS_C["core"]),
+        **{
+            TEMPERATURE_FAMILY_EVIDENCE_FIELDS[family]: float(limit)
+            for family, limit in TEMPERATURE_FAMILY_LIMITS_C.items()
+        },
     }
     actuals = {
         "width_mm": width,
         "length_mm": length,
         "height_mm": height,
         "resonance_Hz": resonance,
-        "winding_max_C": winding_max,
-        "core_max_C": core_max,
+        **{
+            TEMPERATURE_FAMILY_EVIDENCE_FIELDS[family]: family_maxima[
+                family
+            ]
+            for family in TEMPERATURE_FAMILY_EVIDENCE_FIELDS
+        },
     }
     upper_bound = {
         "width_mm",
         "length_mm",
         "height_mm",
-        "winding_max_C",
-        "core_max_C",
+        *TEMPERATURE_FAMILY_EVIDENCE_FIELDS.values(),
     }
     evidence = {}
     for name, actual in actuals.items():
@@ -1002,11 +1146,12 @@ def _measured_classification(view: Mapping[str, Any]) -> dict[str, Any]:
             "margin": margin,
             "passed": passed,
         }
-    if temperature_gate is not (
-        evidence["winding_max_C"]["passed"]
-        and evidence["core_max_C"]["passed"]
-        and all(item["passed"] for item in temperatures.values())
-    ):
+    family_gate = all(
+        evidence[evidence_name]["passed"]
+        for evidence_name in TEMPERATURE_FAMILY_EVIDENCE_FIELDS.values()
+    )
+    target_gate = all(item["passed"] for item in temperatures.values())
+    if bool(temperature_gate) != (family_gate and target_gate):
         raise PostSuccessContractError(
             "temperature family and target gates disagree"
         )
@@ -1040,8 +1185,14 @@ def _measured_classification(view: Mapping[str, Any]) -> dict[str, Any]:
         "actual_loss_components_W": losses,
         "actual_dimensions_mm": {"W": width, "L": length, "H": height},
         "actual_resonance_Hz": resonance,
-        "actual_winding_max_C": winding_max,
+        "actual_primary_winding_max_C": primary_winding_max,
+        "actual_secondary_winding_max_C": secondary_winding_max,
+        "actual_winding_max_C": winding_max_audit,
         "actual_core_max_C": core_max,
+        "actual_temperature_family_max_C": family_maxima,
+        "temperature_family_gate_contract": (
+            _temperature_family_gate_contract()
+        ),
         "active_temperature_targets": list(active),
         "actual_temperature_targets": copy.deepcopy(temperatures),
         "fixed_identity_attestation": fixed,
@@ -1134,6 +1285,7 @@ def _load_observation(path: Path) -> dict[str, Any]:
         value.get("scientific_pass_claimed") is not False
         or value.get("production_claimed") is not False
         or not _classification_valid(value)
+        or not _temperature_family_evidence_valid(value)
     ):
         raise PostSuccessContractError(
             "measured observation safety flags drifted"
@@ -1494,6 +1646,12 @@ def _snapshot_rows(
                 "actual_resonance_Hz": float(
                     observation["actual_resonance_Hz"]
                 ),
+                "actual_primary_winding_max_C": float(
+                    observation["actual_primary_winding_max_C"]
+                ),
+                "actual_secondary_winding_max_C": float(
+                    observation["actual_secondary_winding_max_C"]
+                ),
                 "actual_winding_max_C": float(
                     observation["actual_winding_max_C"]
                 ),
@@ -1539,6 +1697,14 @@ def _load_snapshot(path: Path, *, expected_snapshot_id: str) -> dict[str, Any]:
         or value.get("measured_actual_nds_performed") is not True
         or value.get("scheduler_mutation_performed") is not False
         or value.get("orchestrator_scheduler_methods_used") != []
+        or value.get("temperature_family_gate_contract")
+        != _temperature_family_gate_contract()
+        or not isinstance(value.get("ranked_rows"), list)
+        or not all(
+            isinstance(row, Mapping)
+            and _temperature_family_flat_actuals_valid(row)
+            for row in value.get("ranked_rows", [])
+        )
     ):
         raise PostSuccessContractError(
             "existing post-success snapshot safety contract drifted"
@@ -1584,6 +1750,16 @@ def _load_snapshot(path: Path, *, expected_snapshot_id: str) -> dict[str, Any]:
         or rerank.get("scheduler_mutation_performed") is not False
         or rerank.get("surrogate_and_measured_rows_directly_unioned")
         is not False
+        or rerank.get("temperature_family_gate_contract")
+        != _temperature_family_gate_contract()
+        or not isinstance(
+            rerank.get("measured_standard_observations"), list
+        )
+        or not all(
+            isinstance(row, Mapping)
+            and _temperature_family_flat_actuals_valid(row)
+            for row in rerank.get("measured_standard_observations", [])
+        )
     ):
         raise PostSuccessContractError(
             "existing global rerank input safety contract drifted"
@@ -1666,6 +1842,9 @@ def _build_snapshot(
                 "scientific_pass_claimed": False,
                 "production_claimed": False,
                 "production_pareto_emitted": False,
+                "temperature_family_gate_contract": (
+                    _temperature_family_gate_contract()
+                ),
                 "source_512_seed_surrogate_aggregate": aggregate,
                 "measured_standard_observations": [
                     {
@@ -1688,6 +1867,16 @@ def _build_snapshot(
                         "actual_total_loss_W": item[
                             "actual_total_loss_W"
                         ],
+                        "actual_primary_winding_max_C": item[
+                            "actual_primary_winding_max_C"
+                        ],
+                        "actual_secondary_winding_max_C": item[
+                            "actual_secondary_winding_max_C"
+                        ],
+                        "actual_winding_max_C": item[
+                            "actual_winding_max_C"
+                        ],
+                        "actual_core_max_C": item["actual_core_max_C"],
                     }
                     for item in observations
                 ],
@@ -1725,6 +1914,9 @@ def _build_snapshot(
                 "production_claimed": False,
                 "production_pareto_emitted": False,
                 "snapshot_id": snapshot_id,
+                "temperature_family_gate_contract": (
+                    _temperature_family_gate_contract()
+                ),
                 "expected_lane_count": expected_lane_count,
                 "authenticated_observation_count": len(observations),
                 "all_expected_postdeadline_lanes_collected": all_expected,

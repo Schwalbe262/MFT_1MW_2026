@@ -66,7 +66,9 @@ def _row(
         "actual_length_mm": 900.0,
         "actual_height_mm": 700.0,
         "actual_resonance_Hz": 16000.0,
-        "actual_winding_max_C": 90.0,
+        "actual_primary_winding_max_C": 90.0,
+        "actual_secondary_winding_max_C": 110.0,
+        "actual_winding_max_C": 110.0,
         "actual_core_max_C": 110.0,
         "measured_hard_constraints_passed": passed,
         "strict_al_row_eligible": True,
@@ -122,9 +124,16 @@ def _measured() -> dict[str, Any]:
             "margin": 1000.0,
             "passed": True,
         },
-        "winding_max_C": {
+        "primary_winding_max_C": {
             "actual": 90.0,
             "limit": 100.0,
+            "relation": "<=",
+            "margin": 10.0,
+            "passed": True,
+        },
+        "secondary_winding_max_C": {
+            "actual": 110.0,
+            "limit": 120.0,
             "relation": "<=",
             "margin": 10.0,
             "passed": True,
@@ -155,8 +164,18 @@ def _measured() -> dict[str, Any]:
         },
         "actual_dimensions_mm": {"W": 1100.0, "L": 900.0, "H": 700.0},
         "actual_resonance_Hz": 16000.0,
-        "actual_winding_max_C": 90.0,
+        "actual_primary_winding_max_C": 90.0,
+        "actual_secondary_winding_max_C": 110.0,
+        "actual_winding_max_C": 110.0,
         "actual_core_max_C": 110.0,
+        "actual_temperature_family_max_C": {
+            "primary_winding": 90.0,
+            "secondary_winding": 110.0,
+            "core": 110.0,
+        },
+        "temperature_family_gate_contract": (
+            continuation.postsuccess._temperature_family_gate_contract()
+        ),
         "active_temperature_targets": [
             "T_max_Tx",
             "T_max_Rx_main",
@@ -416,11 +435,47 @@ def test_prepare_seals_same_candidate_full_payload_without_claim(
     assert plan["scheduler_payload"]["memory_mb"] == 98304
     assert plan["scheduler_payload"]["timeout_seconds"] == 86400
     assert plan["measured_standard_hard_constraints_passed"] is True
+    assert plan["schema_version"].endswith("-v2")
+    assert plan["temperature_family_actuals_C"] == {
+        "primary_winding": 90.0,
+        "secondary_winding": 110.0,
+        "core": 110.0,
+    }
+    assert plan["aggregate_winding_temperature_audit_alias"] == {
+        "field": "actual_winding_max_C",
+        "actual_C": 110.0,
+        "audit_only": True,
+        "hard_gate": False,
+    }
     assert plan["fixed_cooling_unchanged"] is True
     assert plan["full_result_available"] is False
     assert plan["scientific_pass_claimed"] is False
     assert plan["promotion_completed"] is False
     assert not (tmp_path / "output" / "scheduler_post_attempt.json").exists()
+
+
+def test_resealed_plan_with_temperature_contract_drift_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = _authority_fixture(tmp_path)
+    _patch_prepare(monkeypatch, tmp_path, authority)
+    _status, plan_path, plan = continuation.prepare(
+        state_path=tmp_path / "upstream.json",
+        output_root=tmp_path / "output",
+        strict_lanes=[TARGET_LANE],
+        license_snapshot_directory=tmp_path / "licenses",
+        payload_builder=_payload,
+    )
+    assert plan_path is not None
+    tampered = json.loads(json.dumps(plan))
+    tampered.pop("payload_sha256")
+    tampered["temperature_family_gate_contract"]["family_limits_C"][
+        "primary_winding"
+    ] = 120.0
+    _json(plan_path, continuation._sealed(tampered))
+
+    with pytest.raises(continuation.ContinuationError, match="safety"):
+        continuation.load_plan(plan_path)
 
 
 def test_one_shot_submit_writes_attempt_before_post_and_never_reposts(

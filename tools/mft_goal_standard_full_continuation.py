@@ -8,8 +8,8 @@ collectors:
 * reauthenticate the immutable post-success snapshot and source collection;
 * choose only measured hard-feasible rank-0 truth, using the established
   ``(volume, loss, candidate)`` front order;
-* recheck dimensions, resonance, winding/core temperatures, and the fixed
-  cooling identity from the retained solver result;
+* recheck dimensions, resonance, primary/secondary/core temperatures, and
+  the fixed cooling identity from the retained solver result;
 * require a fresh 16-core license snapshot and a different, FEA-empty strict
   node lane; and
 * consume one immutable attempt ledger before the only possible Scheduler
@@ -74,7 +74,7 @@ MAX_INTERVAL_SECONDS = 300
 DEFAULT_INTERVAL_SECONDS = 30
 AUTHORIZATION_TOKEN = "measured-standard-pass-to-full-v1"
 
-PLAN_SCHEMA = "mft-goal-standard-full-continuation-plan-v1"
+PLAN_SCHEMA = "mft-goal-standard-full-continuation-plan-v2"
 ATTEMPT_SCHEMA = "mft-goal-standard-full-continuation-attempt-v1"
 RECEIPT_SCHEMA = "mft-goal-standard-full-continuation-receipt-v1"
 STATE_SCHEMA = "mft-goal-standard-full-continuation-state-v1"
@@ -374,6 +374,12 @@ def _source_collection(
         "actual_volume_L": row["actual_volume_L"],
         "actual_total_loss_W": row["actual_total_loss_W"],
         "actual_resonance_Hz": row["actual_resonance_Hz"],
+        "actual_primary_winding_max_C": row[
+            "actual_primary_winding_max_C"
+        ],
+        "actual_secondary_winding_max_C": row[
+            "actual_secondary_winding_max_C"
+        ],
         "actual_winding_max_C": row["actual_winding_max_C"],
         "actual_core_max_C": row["actual_core_max_C"],
         "measured_hard_constraints_passed": True,
@@ -383,6 +389,12 @@ def _source_collection(
         "actual_volume_L": measured["actual_volume_L"],
         "actual_total_loss_W": measured["actual_total_loss_W"],
         "actual_resonance_Hz": measured["actual_resonance_Hz"],
+        "actual_primary_winding_max_C": measured[
+            "actual_primary_winding_max_C"
+        ],
+        "actual_secondary_winding_max_C": measured[
+            "actual_secondary_winding_max_C"
+        ],
         "actual_winding_max_C": measured["actual_winding_max_C"],
         "actual_core_max_C": measured["actual_core_max_C"],
         "measured_hard_constraints_passed": measured[
@@ -394,15 +406,10 @@ def _source_collection(
     evidence = measured.get("hard_constraint_evidence")
     if (
         not isinstance(evidence, Mapping)
-        or set(evidence)
-        != {
-            "width_mm",
-            "length_mm",
-            "height_mm",
-            "resonance_Hz",
-            "winding_max_C",
-            "core_max_C",
-        }
+        or set(evidence) != postsuccess.HARD_CONSTRAINT_EVIDENCE_KEYS
+        or not postsuccess._temperature_family_evidence_valid(  # noqa: SLF001
+            measured
+        )
         or not all(
             isinstance(item, Mapping) and item.get("passed") is True
             for item in evidence.values()
@@ -412,10 +419,17 @@ def _source_collection(
         or measured["actual_dimensions_mm"]["H"] > GOAL_SIZE_LIMITS_MM["H"]
         or measured["actual_resonance_Hz"]
         < GOAL_STAGE_SPEC["resonance_min_Hz"]
-        or measured["actual_winding_max_C"]
-        > TEMPERATURE_FAMILY_LIMITS_C["winding"]
+        or measured["actual_primary_winding_max_C"]
+        > TEMPERATURE_FAMILY_LIMITS_C["primary_winding"]
+        or measured["actual_secondary_winding_max_C"]
+        > TEMPERATURE_FAMILY_LIMITS_C["secondary_winding"]
         or measured["actual_core_max_C"]
         > TEMPERATURE_FAMILY_LIMITS_C["core"]
+        or measured["actual_winding_max_C"]
+        != max(
+            measured["actual_primary_winding_max_C"],
+            measured["actual_secondary_winding_max_C"],
+        )
     ):
         raise ContinuationError("selected Standard actual constraints are not all passed")
     fixed = measured.get("fixed_identity_attestation")
@@ -953,6 +967,24 @@ def prepare(
                 "standard_source_node": source_node,
                 "measured_standard_evidence": measured,
                 "measured_standard_hard_constraints_passed": True,
+                "temperature_family_gate_contract": (
+                    postsuccess._temperature_family_gate_contract()  # noqa: SLF001
+                ),
+                "temperature_family_actuals_C": {
+                    "primary_winding": measured[
+                        "actual_primary_winding_max_C"
+                    ],
+                    "secondary_winding": measured[
+                        "actual_secondary_winding_max_C"
+                    ],
+                    "core": measured["actual_core_max_C"],
+                },
+                "aggregate_winding_temperature_audit_alias": {
+                    "field": "actual_winding_max_C",
+                    "actual_C": measured["actual_winding_max_C"],
+                    "audit_only": True,
+                    "hard_gate": False,
+                },
                 "fixed_cooling_unchanged": True,
                 "full_params": {
                     "path": "full_params.json",
@@ -1034,11 +1066,39 @@ def load_plan(path: Path) -> dict[str, Any]:
     plan = _validate_seal(
         _read_json(resolved, "continuation plan"), PLAN_SCHEMA, "continuation plan"
     )
+    measured = plan.get("measured_standard_evidence")
+    temperature_actuals = plan.get("temperature_family_actuals_C")
+    aggregate_alias = plan.get(
+        "aggregate_winding_temperature_audit_alias"
+    )
     if (
         any(plan.get(key) is not expected for key, expected in SAFETY_FLAGS.items())
         or plan.get("campaign_id") != CAMPAIGN_ID
         or plan.get("all_expected_standard_lanes_terminal") is not True
         or plan.get("measured_standard_hard_constraints_passed") is not True
+        or plan.get("temperature_family_gate_contract")
+        != postsuccess._temperature_family_gate_contract()  # noqa: SLF001
+        or not isinstance(measured, Mapping)
+        or not postsuccess._temperature_family_evidence_valid(  # noqa: SLF001
+            measured
+        )
+        or temperature_actuals
+        != {
+            "primary_winding": measured.get(
+                "actual_primary_winding_max_C"
+            ),
+            "secondary_winding": measured.get(
+                "actual_secondary_winding_max_C"
+            ),
+            "core": measured.get("actual_core_max_C"),
+        }
+        or aggregate_alias
+        != {
+            "field": "actual_winding_max_C",
+            "actual_C": measured.get("actual_winding_max_C"),
+            "audit_only": True,
+            "hard_gate": False,
+        }
         or plan.get("fixed_cooling_unchanged") is not True
         or plan.get("maximum_scheduler_posts") != 1
         or plan.get("scheduler_post_attempts_consumed") != 0

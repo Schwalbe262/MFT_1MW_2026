@@ -28,7 +28,8 @@ def _result(
     length_mm: float,
     height_mm: float,
     resonance_hz: float,
-    winding_c: float,
+    primary_winding_c: float,
+    secondary_winding_c: float,
     core_c: float,
     loss_w: float,
 ) -> dict:
@@ -51,6 +52,7 @@ def _result(
         "P_core_plate_total": 0.0,
         "P_wcp_total": 0.0,
         "physics_data_revision": "physics-v1",
+        "core_center_gap_mm": 0.0,
     }
     for target in GOAL_TEMPERATURE_TARGETS:
         if target in {
@@ -58,11 +60,12 @@ def _result(
             "Tprobe_Rx_side_leeward_max",
         }:
             continue
-        result[target] = (
-            winding_c
-            if TEMPERATURE_TARGET_FAMILIES[target] == "winding"
-            else core_c
-        )
+        family = TEMPERATURE_TARGET_FAMILIES[target]
+        result[target] = {
+            "primary_winding": primary_winding_c,
+            "secondary_winding": secondary_winding_c,
+            "core": core_c,
+        }[family]
     return result
 
 
@@ -182,15 +185,33 @@ def test_measured_constraints_use_requested_limits(tmp_path: Path) -> None:
             length_mm=1000,
             height_mm=750,
             resonance_hz=15000,
-            winding_c=100,
+            primary_winding_c=100,
+            secondary_winding_c=120,
             core_c=120,
             loss_w=100,
         ),
     )
     classified = postsuccess._measured_classification(passing)
     assert classified["measured_hard_constraints_passed"] is True
-    assert classified["actual_winding_max_C"] == 100
+    assert classified["actual_primary_winding_max_C"] == 100
+    assert classified["actual_secondary_winding_max_C"] == 120
+    assert classified["actual_winding_max_C"] == 120
     assert classified["actual_core_max_C"] == 120
+    assert (
+        classified["hard_constraint_evidence"][
+            "primary_winding_max_C"
+        ]["limit"]
+        == 100
+    )
+    assert (
+        classified["hard_constraint_evidence"][
+            "secondary_winding_max_C"
+        ]["limit"]
+        == 120
+    )
+    assert classified["temperature_family_gate_contract"][
+        "aggregate_winding_alias"
+    ]["hard_gate"] is False
 
     failing = dict(passing)
     failing["collection"] = dict(passing["collection"])
@@ -199,7 +220,8 @@ def test_measured_constraints_use_requested_limits(tmp_path: Path) -> None:
         length_mm=1000,
         height_mm=750,
         resonance_hz=14999.99,
-        winding_c=100.01,
+        primary_winding_c=100.01,
+        secondary_winding_c=120.01,
         core_c=120.01,
         loss_w=100,
     )
@@ -211,12 +233,61 @@ def test_measured_constraints_use_requested_limits(tmp_path: Path) -> None:
         is False
     )
     assert (
-        classified["hard_constraint_evidence"]["winding_max_C"]["passed"]
+        classified["hard_constraint_evidence"][
+            "primary_winding_max_C"
+        ]["passed"]
+        is False
+    )
+    assert (
+        classified["hard_constraint_evidence"][
+            "secondary_winding_max_C"
+        ]["passed"]
         is False
     )
     assert (
         classified["hard_constraint_evidence"]["core_max_C"]["passed"]
         is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("primary_c", "secondary_c", "failed_family"),
+    [
+        (100.01, 119.0, "primary_winding_max_C"),
+        (99.0, 120.01, "secondary_winding_max_C"),
+    ],
+)
+def test_primary_and_secondary_temperature_gates_are_independent(
+    tmp_path: Path,
+    primary_c: float,
+    secondary_c: float,
+    failed_family: str,
+) -> None:
+    view, _receipt, _seal = _fake_view(
+        tmp_path,
+        task_id=96325,
+        candidate="a" * 64,
+        result=_result(
+            width_mm=1100,
+            length_mm=900,
+            height_mm=700,
+            resonance_hz=16000,
+            primary_winding_c=primary_c,
+            secondary_winding_c=secondary_c,
+            core_c=119,
+            loss_w=100,
+        ),
+    )
+
+    classified = postsuccess._measured_classification(view)
+
+    assert classified["measured_hard_constraints_passed"] is False
+    assert classified["hard_constraint_evidence"][failed_family][
+        "passed"
+    ] is False
+    assert "winding_max_C" not in classified["hard_constraint_evidence"]
+    assert classified["actual_winding_max_C"] == max(
+        primary_c, secondary_c
     )
 
 
@@ -233,7 +304,8 @@ def test_successes_are_ranked_and_forwarded_without_production_claim(
             length_mm=900,
             height_mm=700,
             resonance_hz=16000,
-            winding_c=90,
+            primary_winding_c=90,
+            secondary_winding_c=110,
             core_c=110,
             loss_w=100,
         ),
@@ -247,7 +319,8 @@ def test_successes_are_ranked_and_forwarded_without_production_claim(
             length_mm=900,
             height_mm=700,
             resonance_hz=14000,
-            winding_c=90,
+            primary_winding_c=90,
+            secondary_winding_c=110,
             core_c=110,
             loss_w=90,
         ),
@@ -303,6 +376,26 @@ def test_successes_are_ranked_and_forwarded_without_production_claim(
     assert snapshot["measured_actual_nds_performed"] is True
     assert snapshot["measured_hard_feasible_count"] == 1
     assert snapshot["diagnostic_actual_rank0_count"] == 1
+    assert snapshot["schema_version"].endswith("-v2")
+    assert snapshot["temperature_family_gate_contract"][
+        "family_limits_C"
+    ] == {
+        "primary_winding": 100.0,
+        "secondary_winding": 120.0,
+        "core": 120.0,
+    }
+    assert {
+        "actual_primary_winding_max_C",
+        "actual_secondary_winding_max_C",
+        "actual_winding_max_C",
+        "actual_core_max_C",
+    }.issubset(
+        snapshot["measured_actual_observations_csv"]["columns"]
+    )
+    assert snapshot["ranked_rows"][0]["actual_winding_max_C"] == max(
+        snapshot["ranked_rows"][0]["actual_primary_winding_max_C"],
+        snapshot["ranked_rows"][0]["actual_secondary_winding_max_C"],
+    )
     assert {row["audit_non_dominated_rank"] for row in snapshot["ranked_rows"]} == {
         0
     }
@@ -319,6 +412,13 @@ def test_successes_are_ranked_and_forwarded_without_production_claim(
     assert rerank["surrogate_and_measured_rows_directly_unioned"] is False
     assert rerank["handoff_to_next_surrogate_generation_allowed"] is False
     assert rerank["scheduler_mutation_performed"] is False
+    assert rerank["schema_version"].endswith("-v2")
+    assert rerank["temperature_family_gate_contract"][
+        "aggregate_winding_alias"
+    ]["audit_only"] is True
+    assert rerank["measured_standard_observations"][0][
+        "actual_secondary_winding_max_C"
+    ] == 110
 
     replay = postsuccess.process_cycle(
         lanes=[
@@ -345,7 +445,8 @@ def test_superseded_lifecycle_lane_is_authenticated_but_excluded_from_nds(
             length_mm=900,
             height_mm=700,
             resonance_hz=16_000,
-            winding_c=90,
+            primary_winding_c=90,
+            secondary_winding_c=110,
             core_c=110,
             loss_w=80,
         ),
@@ -359,7 +460,8 @@ def test_superseded_lifecycle_lane_is_authenticated_but_excluded_from_nds(
             length_mm=900,
             height_mm=700,
             resonance_hz=16_000,
-            winding_c=90,
+            primary_winding_c=90,
+            secondary_winding_c=110,
             core_c=110,
             loss_w=100,
         ),
@@ -482,6 +584,7 @@ def test_official5_direct_collection_uses_named_lossless_adapter(
         "thermal_symmetry": "eighth",
         "full_model": 0,
         "N1_main": 6,
+        "core_center_gap_mm": 0.0,
     }
     task_name = "official5-direct-task96338"
     dedupe = "official5-direct-dedupe-96338"
