@@ -230,7 +230,11 @@ def _raw_aedt_material_props(materials, material_name):
 
 def _core_group_index(object_name):
     """Extract the depth-group index from legacy or segmented core names."""
-    match = re.fullmatch(r"core_(\d+)(?:_(?:leg_(?:left|center|right)|yoke_(?:top|bottom)))?", str(object_name))
+    match = re.fullmatch(
+        r"core_(\d+)(?:_(?:leg_(?:left|right|center_bottom|center_top|center)"
+        r"|yoke_(?:top|bottom)))?",
+        str(object_name),
+    )
     if not match:
         raise RuntimeError(f"unrecognized core object name: {object_name!r}")
     return int(match.group(1))
@@ -243,14 +247,23 @@ _NATIVE_CORE_REGION_ORDER = (
     "yoke_bottom",
     "yoke_top",
 )
+_NATIVE_GAPPED_CORE_REGION_ORDER = (
+    "leg_left",
+    "leg_center_bottom",
+    "leg_center_top",
+    "leg_right",
+    "yoke_bottom",
+    "yoke_top",
+)
 
 
 def _native_core_report_plan(
         core_groups, sym_cut_counter, *, require_complete_groups=False):
     """Validate native core coverage and topology by symmetry-cut count.
 
-    Full models require all five canonical pieces; symmetry models cover the
-    exact surviving subset after the geometry split.  The returned batches are
+    Full models require the complete canonical topology (five continuous-core
+    pieces or six physical-gap pieces); symmetry models cover the exact
+    surviving subset after the geometry split. The returned batches are
     retained for diagnostic provenance only; production loss validation uses
     the independent Python Faraday/POWERLITE/mass reference.
     """
@@ -267,9 +280,18 @@ def _native_core_report_plan(
                 )
             by_name[name] = piece
 
+        split_center_names = {
+            f"core_{group_index}_leg_center_bottom",
+            f"core_{group_index}_leg_center_top",
+        }
+        region_order = (
+            _NATIVE_GAPPED_CORE_REGION_ORDER
+            if set(by_name) & split_center_names
+            else _NATIVE_CORE_REGION_ORDER
+        )
         expected_names = tuple(
             f"core_{group_index}_{region}"
-            for region in _NATIVE_CORE_REGION_ORDER
+            for region in region_order
         )
         unexpected = sorted(set(by_name) - set(expected_names))
         missing = sorted(set(expected_names) - set(by_name))
@@ -3180,6 +3202,9 @@ class Simulation():
         n_group = int(self.df_plus["n_core_group"].iloc[0])
         plate_on = int(self.df_plus["core_plate_on"].iloc[0]) != 0
         pad_on = float(self.df_plus["core_plate_pad_t"].iloc[0]) > 0
+        center_gap_mm = float(
+            self.df_plus["core_center_gap_mm"].iloc[0]
+        )
 
         core_objs, plate_objs, pad_objs = create_core(
             design=self.design1,
@@ -3195,17 +3220,25 @@ class Simulation():
             segmented_lamination=native_stacking,
             core_material_leg=leg_name,
             core_material_yoke=yoke_name,
+            core_center_gap_mm=center_gap_mm,
         )
         if native_stacking:
-            expected_regions = {
-                "leg_left", "leg_center", "leg_right",
-                "yoke_bottom", "yoke_top",
-            }
+            if center_gap_mm > 0.0:
+                expected_regions = set(_NATIVE_GAPPED_CORE_REGION_ORDER)
+                expected_piece_count = 6 * n_group
+            else:
+                expected_regions = set(_NATIVE_CORE_REGION_ORDER)
+                expected_piece_count = 5 * n_group
             by_group = {index: set() for index in range(1, n_group + 1)}
+            objects_by_group = {
+                index: {} for index in range(1, n_group + 1)
+            }
             for obj in core_objs:
                 index = _core_group_index(obj.name)
                 prefix = f"core_{index}_"
-                by_group.setdefault(index, set()).add(obj.name[len(prefix):])
+                region = obj.name[len(prefix):]
+                by_group.setdefault(index, set()).add(region)
+                objects_by_group.setdefault(index, {})[region] = obj
                 expected_material = (
                     leg_name if "_leg_" in obj.name else yoke_name
                 ).casefold()
@@ -3228,13 +3261,13 @@ class Simulation():
                 for index, regions in by_group.items()
                 if regions != expected_regions
             }
-            if drift or len(core_objs) != 5 * n_group:
+            if drift or len(core_objs) != expected_piece_count:
                 raise RuntimeError(
                     "segmented core topology mismatch: "
                     f"count={len(core_objs)}, groups={drift or by_group}"
                 )
             expected_total_mm3 = float(
-                self.df_plus["core_vol_gross_m3"].iloc[0]
+                self.df_plus["core_vol_gapped_geometry_m3"].iloc[0]
             ) * 1e9
             actual_total_mm3 = sum(abs(float(obj.volume)) for obj in core_objs)
             volume_rel_error = abs(
@@ -3242,15 +3275,18 @@ class Simulation():
             ) / max(abs(expected_total_mm3), 1e-12)
             if not math.isfinite(volume_rel_error) or volume_rel_error > 1e-9:
                 raise RuntimeError(
-                    "segmented core gross-volume preservation failed: "
+                    "segmented core gapped-volume preservation failed: "
                     f"actual={actual_total_mm3:.12g}mm3, "
                     f"expected={expected_total_mm3:.12g}mm3, "
                     f"relative_error={volume_rel_error:.6g}"
                 )
             center_area_mm2 = sum(
                 abs(float(obj.volume))
-                for obj in core_objs if obj.name.endswith("_leg_center")
-            ) / float(self.df_plus["h1"].iloc[0])
+                for obj in core_objs
+                if "_leg_center" in obj.name
+            ) / (
+                float(self.df_plus["h1"].iloc[0]) - center_gap_mm
+            )
             expected_center_area_mm2 = float(
                 self.df_plus["Ae_gross_m2"].iloc[0]
             ) * 1e6
@@ -3266,7 +3302,7 @@ class Simulation():
             density = float(self.df_plus["core_mass_density_kg_m3"].iloc[0])
             actual_mass_kg = actual_total_mm3 * 1e-9 * density
             expected_mass_kg = float(
-                self.df_plus["core_mass_gross_kg"].iloc[0]
+                self.df_plus["core_mass_gapped_geometry_kg"].iloc[0]
             )
             mass_rel_error = abs(actual_mass_kg - expected_mass_kg) / max(
                 abs(expected_mass_kg), 1e-12
@@ -3277,10 +3313,106 @@ class Simulation():
                     f"actual={actual_mass_kg:.12g}kg, "
                     f"expected={expected_mass_kg:.12g}kg"
                 )
+
+            gross_total_mm3 = float(
+                self.df_plus["core_vol_gross_m3"].iloc[0]
+            ) * 1e9
+            expected_removed_mm3 = float(
+                self.df_plus[
+                    "core_center_gap_removed_volume_m3"
+                ].iloc[0]
+            ) * 1e9
+            removed_mm3 = gross_total_mm3 - actual_total_mm3
+            removed_rel_error = abs(
+                removed_mm3 - expected_removed_mm3
+            ) / max(
+                abs(expected_removed_mm3)
+                if center_gap_mm > 0.0 else abs(gross_total_mm3),
+                1.0,
+            )
+            if removed_rel_error > 1e-9:
+                raise RuntimeError(
+                    "center-gap removed-volume attestation failed: "
+                    f"actual={removed_mm3:.12g}mm3, "
+                    f"expected={expected_removed_mm3:.12g}mm3"
+                )
+
+            gap_readbacks = []
+            gap_center_offsets = []
+            if center_gap_mm > 0.0:
+                for index in range(1, n_group + 1):
+                    bottom = objects_by_group[index]["leg_center_bottom"]
+                    top = objects_by_group[index]["leg_center_top"]
+                    bottom_bbox = list(bottom.bounding_box)
+                    top_bbox = list(top.bounding_box)
+                    if len(bottom_bbox) != 6 or len(top_bbox) != 6:
+                        raise RuntimeError(
+                            "center-gap bounding-box readback is unavailable "
+                            f"for core group {index}"
+                        )
+                    bottom_z_max = float(bottom_bbox[5])
+                    top_z_min = float(top_bbox[2])
+                    if not all(math.isfinite(value) for value in (
+                        bottom_z_max, top_z_min
+                    )):
+                        raise RuntimeError(
+                            "center-gap bounding-box readback is non-finite "
+                            f"for core group {index}"
+                        )
+                    gap_readbacks.append(top_z_min - bottom_z_max)
+                    gap_center_offsets.append(
+                        (top_z_min + bottom_z_max) / 2.0
+                    )
+                gap_readback_mm = sum(gap_readbacks) / len(gap_readbacks)
+                gap_spread_mm = max(gap_readbacks) - min(gap_readbacks)
+                gap_center_offset_mm = max(
+                    abs(value) for value in gap_center_offsets
+                )
+                gap_readback_rel_error = abs(
+                    gap_readback_mm - center_gap_mm
+                ) / max(abs(center_gap_mm), 1e-12)
+                gap_tolerance_mm = max(1e-6, abs(center_gap_mm) * 1e-9)
+                if (
+                    gap_readback_rel_error > 1e-9
+                    or gap_spread_mm > gap_tolerance_mm
+                    or gap_center_offset_mm > gap_tolerance_mm
+                ):
+                    raise RuntimeError(
+                        "physical center-gap bounding-box attestation failed: "
+                        f"requested={center_gap_mm:.12g}mm, "
+                        f"readback={gap_readback_mm:.12g}mm, "
+                        f"spread={gap_spread_mm:.12g}mm, "
+                        f"center_offset={gap_center_offset_mm:.12g}mm"
+                    )
+                gap_topology = "center_leg_bottom_top_physical_air_interval"
+            else:
+                gap_readback_mm = 0.0
+                gap_spread_mm = 0.0
+                gap_center_offset_mm = 0.0
+                gap_readback_rel_error = 0.0
+                gap_topology = "legacy_continuous_center_leg"
+
             self.df_plus["core_segmented_piece_count"] = [len(core_objs)]
             self.df_plus["core_segmented_area_rel_error"] = [area_rel_error]
             self.df_plus["core_segmented_volume_rel_error"] = [volume_rel_error]
             self.df_plus["core_segmented_mass_rel_error"] = [mass_rel_error]
+            self.df_plus["core_center_gap_requested_mm"] = [center_gap_mm]
+            self.df_plus["core_center_gap_topology"] = [gap_topology]
+            self.df_plus["core_center_gap_readback_mm"] = [gap_readback_mm]
+            self.df_plus["core_center_gap_readback_rel_error"] = [
+                gap_readback_rel_error
+            ]
+            self.df_plus["core_center_gap_group_spread_mm"] = [gap_spread_mm]
+            self.df_plus["core_center_gap_center_offset_mm"] = [
+                gap_center_offset_mm
+            ]
+            self.df_plus["core_center_gap_removed_volume_readback_mm3"] = [
+                removed_mm3
+            ]
+            self.df_plus["core_center_gap_removed_volume_rel_error"] = [
+                removed_rel_error
+            ]
+            self.df_plus["core_center_gap_geometry_attested"] = [1]
 
         stack_expr = (
             "(core_plate_t + 2*core_plate_pad_t)" if pad_on
@@ -3564,6 +3696,54 @@ class Simulation():
         # (이후 eddy 설정/손실 계산이 존재하지 않는 오브젝트를 참조하지 않도록)
         existing = set(self.design1.modeler.object_names)
         self.design1.core_objs = [o for o in self.design1.core_objs if o.name in existing]
+        center_gap_mm = float(
+            self.df_plus["core_center_gap_mm"].iloc[0]
+        )
+        if center_gap_mm > 0.0:
+            retained_center = [
+                obj for obj in self.design1.core_objs
+                if "_leg_center" in obj.name
+            ]
+            unexpected_center = [
+                obj.name for obj in retained_center
+                if not obj.name.endswith("_leg_center_top")
+            ]
+            if not retained_center or unexpected_center:
+                raise RuntimeError(
+                    "center-gap symmetry retention mismatch: "
+                    f"retained={[obj.name for obj in retained_center]!r}, "
+                    f"unexpected={unexpected_center!r}"
+                )
+            expected_z_min = center_gap_mm / 2.0
+            z_min_errors = []
+            for obj in retained_center:
+                bbox = list(obj.bounding_box)
+                if len(bbox) != 6:
+                    raise RuntimeError(
+                        "center-gap symmetry bounding-box readback unavailable "
+                        f"for {obj.name}"
+                    )
+                z_min_errors.append(abs(float(bbox[2]) - expected_z_min))
+            max_z_min_error = max(z_min_errors)
+            if (
+                not math.isfinite(max_z_min_error)
+                or max_z_min_error > max(1e-6, center_gap_mm * 1e-9)
+            ):
+                raise RuntimeError(
+                    "center-gap symmetry half-gap readback failed: "
+                    f"expected_z_min={expected_z_min:.12g}mm, "
+                    f"max_error={max_z_min_error:.12g}mm"
+                )
+            self.df_plus[
+                "core_center_gap_symmetry_retained_center_piece_count"
+            ] = [len(retained_center)]
+            self.df_plus[
+                "core_center_gap_symmetry_half_gap_readback_mm"
+            ] = [2.0 * min(
+                float(list(obj.bounding_box)[2])
+                for obj in retained_center
+            )]
+            self.df_plus["core_center_gap_symmetry_geometry_attested"] = [1]
         self.design1.core_flux_sheets = [
             o for o in self.design1.core_flux_sheets if o.name in existing
         ]
@@ -4191,6 +4371,15 @@ class Simulation():
             raise RuntimeError(
                 f"capacitance geometry paste is incomplete: {missing_names!r}"
             )
+        if float(self.df_plus["core_center_gap_mm"].iloc[0]) > 0.0:
+            copied_core_names = set(core_names) & actual_names
+            if copied_core_names != set(core_names):
+                raise RuntimeError(
+                    "capacitance center-gap core copy attestation failed"
+                )
+            self.df_plus[
+                "core_center_gap_cap_geometry_copy_attested"
+            ] = [1]
 
         # Percentage padding is measured from the active model's bounding span.
         # An eighth model has half the full span on every cut axis, so 200% on
@@ -5621,7 +5810,11 @@ class Simulation():
             gross_area_m2=ae_gross_m2,
             lamination_factor=kf,
             effective_mass_kg=float(
-                self.df_plus["core_mass_effective_kg"].iloc[0]
+                self.df_plus[
+                    "core_mass_gapped_effective_kg"
+                    if "core_mass_gapped_effective_kg" in self.df_plus.columns
+                    else "core_mass_effective_kg"
+                ].iloc[0]
             ),
             loss_margin=loss_margin,
             coefficient=6.5,

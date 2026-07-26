@@ -81,6 +81,12 @@ THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS = (
 EFFICIENCY_EXPERIMENT_INPUT_KEYS = (
     "thermal_rx_side_block_mesh_level",
 )
+# Fixed-run-only geometry controls are not Sobol coordinates and therefore do
+# not alter the sealed candidate digest. They are append-only in the complete
+# input schema so pre-extension fixed payloads remain explicitly admissible.
+FIXED_GEOMETRY_INPUT_KEYS = (
+    "core_center_gap_mm",
+)
 # Optional electrostatic-stage controls are accepted and echoed by fixed runs,
 # but deliberately stay outside KEYS.  KEYS is the sealed campaign identity;
 # enabling an A/B diagnostic stage must not change the underlying candidate.
@@ -104,13 +110,17 @@ PRE_ELECTROSTATIC_INPUT_KEYS = PRE_ANISOTROPIC_CORE_K_INPUT_KEYS = [
     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
     *PHYSICS_METADATA_INPUT_KEYS,
 ]
-ALL_INPUT_KEYS = [
+PRE_CORE_CENTER_GAP_INPUT_KEYS = [
     *KEYS,
     *CORE_MATERIAL_INPUT_KEYS,
     *THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
     *ELECTROSTATIC_STAGE_INPUT_KEYS,
     *PHYSICS_METADATA_INPUT_KEYS,
+]
+ALL_INPUT_KEYS = [
+    *PRE_CORE_CENTER_GAP_INPUT_KEYS,
+    *FIXED_GEOMETRY_INPUT_KEYS,
 ]
 
 # Candidate authentication remains fail-closed: sealed fronts use KEYS, while
@@ -119,6 +129,7 @@ ALL_INPUT_KEYS = [
 SUPPORTED_CANDIDATE_INPUT_SCHEMAS = frozenset({
     frozenset(KEYS),
     frozenset(PRE_ANISOTROPIC_CORE_K_INPUT_KEYS),
+    frozenset(PRE_CORE_CENTER_GAP_INPUT_KEYS),
     frozenset(ALL_INPUT_KEYS),
 })
 
@@ -237,6 +248,9 @@ def get_drawing_default_params():
         # A/B-only Icepak control. Level 5 is the unchanged production default;
         # level 4 is the guarded multi-turn side-pack candidate.
         "thermal_rx_side_block_mesh_level": 5,
+        # Fixed-run-only physical center-leg air gap. Zero preserves the
+        # historical five-piece/group core geometry exactly.
+        "core_center_gap_mm": 0.0,
         # 권선 도체의 운전 온도 기준 [C]: EM 도전율을 이 온도의 구리로 설정
         # (20C 기준이면 실물(~80-100C) 권선손실 ~25% 과소평가 - 손실/온도 라벨 현실화)
         "conductor_temp_C": 80.0,
@@ -295,7 +309,8 @@ def create_input_parameter(param=None):
                     *THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
                     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
                     *ELECTROSTATIC_STAGE_INPUT_KEYS,
-                    *PHYSICS_METADATA_INPUT_KEYS):
+                    *PHYSICS_METADATA_INPUT_KEYS,
+                    *FIXED_GEOMETRY_INPUT_KEYS):
                 if key not in param.columns:
                     param[key] = defaults[key]
             missing = set(KEYS) - set(param.columns)
@@ -319,7 +334,8 @@ def create_input_parameter(param=None):
             *THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
             *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
             *ELECTROSTATIC_STAGE_INPUT_KEYS,
-            *PHYSICS_METADATA_INPUT_KEYS):
+            *PHYSICS_METADATA_INPUT_KEYS,
+            *FIXED_GEOMETRY_INPUT_KEYS):
         if key not in param_df.columns:
             param_df[key] = defaults[key]
 
@@ -603,6 +619,13 @@ def _add_derived_features(inp):
     Ae_gross_m2 = (2 * l1 * 1e-3) * (iron_depth * 1e-3)    # gross center-leg pack area
     face_mm2 = (4 * l1 + 2 * l2) * (h1 + 2 * l1) - 2 * l2 * h1
     core_vol_gross_m3 = face_mm2 * iron_depth * 1e-9
+    center_gap_mm = float(inp["core_center_gap_mm"].iloc[0])
+    core_center_gap_removed_volume_m3 = (
+        Ae_gross_m2 * center_gap_mm * 1e-3
+    )
+    core_vol_gapped_m3 = (
+        core_vol_gross_m3 - core_center_gap_removed_volume_m3
+    )
     kf = float(inp["core_lamination_factor"].iloc[0])
     basis = str(inp["core_geometry_material_basis"].iloc[0])
     Ae_effective_m2 = effective_area_m2(
@@ -619,6 +642,17 @@ def _add_derived_features(inp):
         density_kg_m3=float(inp["core_mass_density_kg_m3"].iloc[0]),
         area_basis=basis,
     )
+    (
+        core_vol_gapped_geometry_m3,
+        core_vol_gapped_effective_m3,
+        core_mass_gapped_geometry_kg,
+        core_mass_gapped_effective_kg,
+    ) = geometry_volume_and_masses(
+        core_vol_gapped_m3,
+        kf,
+        density_kg_m3=float(inp["core_mass_density_kg_m3"].iloc[0]),
+        area_basis=basis,
+    )
 
     # Backward-compatible aliases retain their historical gross-geometry
     # meaning. New consumers must use the explicit gross/effective columns.
@@ -631,6 +665,13 @@ def _add_derived_features(inp):
     inp["core_vol_effective_m3"] = [core_vol_effective_m3]
     inp["core_mass_gross_kg"] = [core_mass_gross_kg]
     inp["core_mass_effective_kg"] = [core_mass_effective_kg]
+    inp["core_center_gap_removed_volume_m3"] = [
+        core_center_gap_removed_volume_m3
+    ]
+    inp["core_vol_gapped_geometry_m3"] = [core_vol_gapped_geometry_m3]
+    inp["core_vol_gapped_effective_m3"] = [core_vol_gapped_effective_m3]
+    inp["core_mass_gapped_geometry_kg"] = [core_mass_gapped_geometry_kg]
+    inp["core_mass_gapped_effective_kg"] = [core_mass_gapped_effective_kg]
     inp["Ae_m2_basis"] = ["legacy_alias_gross_geometry"]
     inp["core_mass_kg_basis"] = [
         "legacy_alias_gross_geometry_bare_alloy_density"
@@ -713,6 +754,10 @@ def validation_check(input_df, strict=False, return_errors=False):
     l2 = float(inp["l2"].iloc[0])
     h1 = float(inp["h1"].iloc[0])
     w1 = float(inp["w1"].iloc[0])
+    try:
+        core_center_gap_mm = float(inp["core_center_gap_mm"].iloc[0])
+    except (TypeError, ValueError, OverflowError):
+        core_center_gap_mm = float("nan")
     cw1 = float(inp["cw1"].iloc[0])
     gap1 = float(inp["gap1"].iloc[0])
     cw2 = float(inp["cw2"].iloc[0])
@@ -825,6 +870,20 @@ def validation_check(input_df, strict=False, return_errors=False):
         errors.append(f"l2 <= 0 ({l2})")
     if h1 <= 0:
         errors.append(f"h1 <= 0 ({h1})")
+    if not math.isfinite(core_center_gap_mm):
+        errors.append(
+            "core_center_gap_mm must be finite "
+            f"({inp['core_center_gap_mm'].iloc[0]})"
+        )
+    elif core_center_gap_mm < 0:
+        errors.append(
+            f"core_center_gap_mm must be >= 0 ({core_center_gap_mm})"
+        )
+    elif core_center_gap_mm >= h1:
+        errors.append(
+            "core_center_gap_mm must be smaller than h1 "
+            f"({core_center_gap_mm} >= {h1})"
+        )
     if nwh1 > h1:
         errors.append(f"nwh1 ({nwh1}) > h1 ({h1})")
     if nwh2 > h1:

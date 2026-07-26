@@ -43,7 +43,9 @@ from module.input_parameter_260706 import (
     COLD_PLATE_MAX_T_MM,
     COLD_PLATE_MIN_T_MM,
     ELECTROSTATIC_STAGE_INPUT_KEYS,
+    FIXED_GEOMETRY_INPUT_KEYS,
     KEYS,
+    PRE_CORE_CENTER_GAP_INPUT_KEYS,
     PRE_ELECTROSTATIC_INPUT_KEYS,
     N1_MAX_TURNS,
     PRE_ANISOTROPIC_CORE_K_INPUT_KEYS,
@@ -210,6 +212,45 @@ class DesktopSessionRetryTests(unittest.TestCase):
             non_graphical=ANY,
         )
         sleep.assert_not_called()
+
+
+class FixedCoreCenterGapInputContractTests(unittest.TestCase):
+    def test_control_is_append_only_and_old_full_schema_defaults_to_zero(self):
+        self.assertEqual(FIXED_GEOMETRY_INPUT_KEYS, ("core_center_gap_mm",))
+        self.assertTrue(set(FIXED_GEOMETRY_INPUT_KEYS).isdisjoint(KEYS))
+        current = create_input_parameter({"core_center_gap_mm": 1.25})
+        self.assertEqual(float(current["core_center_gap_mm"].iloc[0]), 1.25)
+        legacy = create_input_parameter(
+            current[PRE_CORE_CENTER_GAP_INPUT_KEYS]
+        )
+        self.assertEqual(float(legacy["core_center_gap_mm"].iloc[0]), 0.0)
+        self.assertIn("core_center_gap_mm", get_design_var_columns(current))
+
+    def test_gap_derives_removed_volume_and_rejects_invalid_geometry(self):
+        params = get_drawing_default_params()
+        params["core_center_gap_mm"] = 2.0
+        ok, frame = validation_check(
+            create_input_parameter(params), strict=True
+        )
+        self.assertTrue(ok)
+        expected_removed = (
+            float(frame["Ae_gross_m2"].iloc[0]) * 2.0e-3
+        )
+        self.assertAlmostEqual(
+            float(frame["core_center_gap_removed_volume_m3"].iloc[0]),
+            expected_removed,
+        )
+        self.assertAlmostEqual(
+            float(frame["core_vol_gapped_geometry_m3"].iloc[0]),
+            float(frame["core_vol_gross_m3"].iloc[0]) - expected_removed,
+        )
+        for value in (-0.1, float("nan"), float(params["h1"])):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "core_center_gap_mm"):
+                invalid = dict(params, core_center_gap_mm=value)
+                validation_check(
+                    create_input_parameter(invalid), strict=True
+                )
 
 
 class ThermalCoreConductivityInputContractTests(unittest.TestCase):

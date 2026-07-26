@@ -52,6 +52,7 @@ from module.input_parameter_260706 import (
     ALL_INPUT_KEYS,
     KEYS,
     PRE_ANISOTROPIC_CORE_K_INPUT_KEYS,
+    PRE_CORE_CENTER_GAP_INPUT_KEYS,
     PRE_ELECTROSTATIC_INPUT_KEYS,
     create_input_parameter,
 )
@@ -1329,6 +1330,9 @@ class FineValidationTests(unittest.TestCase):
             core_k_interlayer=0.25,
         )
         pre_cap = {key: complete[key] for key in PRE_ELECTROSTATIC_INPUT_KEYS}
+        pre_center_gap = {
+            key: complete[key] for key in PRE_CORE_CENTER_GAP_INPUT_KEYS
+        }
         cap_diagnostic = dict(
             complete,
             cap_on=1,
@@ -1338,13 +1342,14 @@ class FineValidationTests(unittest.TestCase):
 
         self.assertEqual(len(KEYS), 71)
         self.assertEqual(len(PRE_ANISOTROPIC_CORE_K_INPUT_KEYS), 75)
-        self.assertEqual(len(ALL_INPUT_KEYS), 81)
+        self.assertEqual(len(PRE_CORE_CENTER_GAP_INPUT_KEYS), 81)
+        self.assertEqual(len(ALL_INPUT_KEYS), 82)
         self.assertEqual(
             {len(schema) for schema in ALLOWED_CANDIDATE_INPUT_SCHEMAS},
-            {71, 75, 81},
+            {71, 75, 81, 82},
         )
         for params in (
-            sealed, pre_anisotropic, pre_cap, complete,
+            sealed, pre_anisotropic, pre_cap, pre_center_gap, complete,
             legacy_thermal, cap_diagnostic,
         ):
             with self.subTest(schema_size=len(params)):

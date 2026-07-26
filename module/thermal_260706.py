@@ -5967,7 +5967,10 @@ def _core_thermal_conductivity_contract(df):
 def _core_thermal_material_for_piece(piece_name):
     """Map one segmented core name to its wound-ribbon material orientation."""
     name = str(piece_name)
-    if re.fullmatch(r"core_\d+_leg_(?:left|center|right)", name):
+    if re.fullmatch(
+        r"core_\d+_leg_(?:left|right|center(?:_(?:bottom|top))?)",
+        name,
+    ):
         return _CORE_THERMAL_MATERIAL_LEG
     if re.fullmatch(r"core_\d+_yoke_(?:top|bottom)", name):
         return _CORE_THERMAL_MATERIAL_YOKE
@@ -6372,8 +6375,19 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
     n_group = int(df["n_core_group"].iloc[0])
     plate_on = int(df["core_plate_on"].iloc[0]) != 0
     pad_on = float(df["core_plate_pad_t"].iloc[0]) > 0
+    center_gap_mm = float(df["core_center_gap_mm"].iloc[0])
     core_contract = _core_thermal_conductivity_contract(df)
-    if core_contract["anisotropic"]:
+    if core_contract["anisotropic"] or center_gap_mm > 0.0:
+        leg_material = (
+            _core_thermal_material_for_piece("core_1_leg_center")
+            if core_contract["anisotropic"]
+            else _CORE_THERMAL_MATERIAL_LEGACY
+        )
+        yoke_material = (
+            _core_thermal_material_for_piece("core_1_yoke_top")
+            if core_contract["anisotropic"]
+            else _CORE_THERMAL_MATERIAL_LEGACY
+        )
         core_objs, plate_objs, pad_objs = create_core(
             design=ipk, name="core",
             core_material=_CORE_THERMAL_MATERIAL_LEGACY,
@@ -6381,12 +6395,9 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
             pad_material="thermal_pad", plate_on=plate_on, pad_on=pad_on,
             plate_color=[144, 190, 144], pad_color=[200, 160, 200],
             segmented_lamination=True,
-            core_material_leg=_core_thermal_material_for_piece(
-                "core_1_leg_center"
-            ),
-            core_material_yoke=_core_thermal_material_for_piece(
-                "core_1_yoke_top"
-            ),
+            core_material_leg=leg_material,
+            core_material_yoke=yoke_material,
+            core_center_gap_mm=center_gap_mm,
         )
     else:
         core_objs, plate_objs, pad_objs = create_core(
@@ -6394,8 +6405,25 @@ def _build_geometry(ipk, sim, eighth=False, mode=None):
             core_material=_CORE_THERMAL_MATERIAL_LEGACY,
             n_group=n_group, plate_material="aluminum",
             pad_material="thermal_pad", plate_on=plate_on, pad_on=pad_on,
-            plate_color=[144, 190, 144], pad_color=[200, 160, 200]
+            plate_color=[144, 190, 144], pad_color=[200, 160, 200],
+            core_center_gap_mm=center_gap_mm,
         )
+    if center_gap_mm > 0.0:
+        expected_center_names = {
+            f"core_{index}_{suffix}"
+            for index in range(1, n_group + 1)
+            for suffix in ("leg_center_bottom", "leg_center_top")
+        }
+        actual_center_names = {
+            obj.name for obj in core_objs if "_leg_center" in obj.name
+        }
+        if actual_center_names != expected_center_names:
+            raise RuntimeError(
+                "thermal center-gap core topology mismatch: "
+                f"actual={sorted(actual_center_names)!r}, "
+                f"expected={sorted(expected_center_names)!r}"
+            )
+        sim.df_plus["core_center_gap_thermal_geometry_attested"] = [1]
     objs["core"] = core_objs
     objs["core_plates"] = plate_objs
     objs["core_pads"] = pad_objs

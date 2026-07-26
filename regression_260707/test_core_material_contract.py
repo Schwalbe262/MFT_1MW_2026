@@ -499,6 +499,49 @@ class CoreGeometrySegmentationTests(unittest.TestCase):
         segmented = 4*l1*h1 + 2*(4*l1 + 2*l2)*l1
         self.assertEqual(legacy, segmented)
 
+    def test_positive_center_gap_creates_two_disjoint_center_leg_solids(self):
+        modeler = _GeometryModeler()
+        design = SimpleNamespace(modeler=modeler)
+        cores, _, _ = create_core_geometry(
+            design,
+            n_group=2,
+            plate_on=False,
+            pad_on=False,
+            segmented_lamination=True,
+            core_material_leg="leg_v1",
+            core_material_yoke="yoke_v3",
+            core_center_gap_mm=1.25,
+        )
+
+        self.assertEqual(len(cores), 12)
+        for group in (1, 2):
+            pieces = {obj.name: obj for obj in cores}
+            bottom = pieces[f"core_{group}_leg_center_bottom"]
+            top = pieces[f"core_{group}_leg_center_top"]
+            self.assertEqual(bottom.origin[2], "-h1/2")
+            self.assertEqual(
+                bottom.sizes[2], "(h1-core_center_gap_mm)/2"
+            )
+            self.assertEqual(top.origin[2], "core_center_gap_mm/2")
+            self.assertEqual(top.sizes[2], "(h1-core_center_gap_mm)/2")
+            self.assertNotIn(f"core_{group}_leg_center", pieces)
+
+    def test_zero_center_gap_preserves_exact_legacy_piece_contract(self):
+        modeler = _GeometryModeler()
+        design = SimpleNamespace(modeler=modeler)
+        cores, _, _ = create_core_geometry(
+            design,
+            n_group=1,
+            plate_on=False,
+            pad_on=False,
+            segmented_lamination=True,
+            core_center_gap_mm=0.0,
+        )
+        center = next(obj for obj in cores if obj.name == "core_1_leg_center")
+        self.assertEqual(len(cores), 5)
+        self.assertEqual(center.origin[2], "-h1/2")
+        self.assertEqual(center.sizes[2], "h1")
+
 
 class NativeCoreReportPlanTests(unittest.TestCase):
     @staticmethod
@@ -568,6 +611,31 @@ class NativeCoreReportPlanTests(unittest.TestCase):
                 {1: self._group(1)},
                 lambda name: 3 if name.endswith("yoke_top") else 2,
             )
+
+    def test_gapped_full_and_symmetry_core_topologies_are_covered(self):
+        full = [
+            SimpleNamespace(name=f"core_1_{region}")
+            for region in (
+                "leg_left", "leg_center_bottom", "leg_center_top",
+                "leg_right", "yoke_bottom", "yoke_top",
+            )
+        ]
+        full_plan = _native_core_report_plan(
+            {1: full}, lambda _name: 2, require_complete_groups=True
+        )
+        self.assertEqual(len(full_plan["object_names"]), 6)
+
+        retained = [
+            piece for piece in full
+            if piece.name.endswith(("leg_left", "leg_center_top", "yoke_top"))
+        ]
+        symmetry_plan = _native_core_report_plan(
+            {1: retained}, lambda _name: 2
+        )
+        self.assertEqual(
+            set(symmetry_plan["object_names"]),
+            {piece.name for piece in retained},
+        )
 
     def test_native_batch_restoration_equals_legacy_group_math(self):
         for cut_count in (2, 3):

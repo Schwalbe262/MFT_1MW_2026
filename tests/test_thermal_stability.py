@@ -1657,7 +1657,8 @@ class ThermalStabilityTest(unittest.TestCase):
 
         for name in (
                 "core_1_leg_left", "core_2_leg_center",
-                "core_3_leg_right"):
+                "core_3_leg_right", "core_1_leg_center_bottom",
+                "core_1_leg_center_top"):
             self.assertEqual(
                 thermal._core_thermal_material_for_piece(name),
                 "core_amorphous_thermal_leg",
