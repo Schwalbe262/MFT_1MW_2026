@@ -28,12 +28,12 @@ import zlib
 SCHEMA = "mft-goal-fixed-primary-5t-nsga-task-v1"
 RESULT_SCHEMA = "mft-goal-fixed-primary-5t-nsga-result-v1"
 CAMPAIGN_SCHEMA = "mft-goal-fixed-primary-5t-nsga-submission-v1"
-CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-20260727"
+CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-20260727-v2"
 PRIMARY_CONDUCTOR_MM = 5.0
 PRIMARY_GAP_MM = 1.6
-POPULATION = 192
-GENERATIONS = 120
-SEED_START = 2_707_275_000
+POPULATION = 320
+GENERATIONS = 80
+SEED_START = 2_707_275_100
 SEED_COUNT = 16
 CPUS = 8
 MEMORY_MB = 65_536
@@ -54,7 +54,7 @@ GLOBAL_TERMINAL_CSV = Path(
 )
 DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_primary_5t_gap1_1p6_nsga_v1"
+    r"\fixed_primary_5t_gap1_1p6_nsga_v2"
 )
 BASE_TASKS = {
     5: "artifacts/campaign/tasks/seed-2607262000-n1-5.json",
@@ -657,11 +657,13 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
             "dataset_sha256": identity["dataset_sha256"],
             "model_artifacts_sha256": identity["evaluation_model_sha256"],
             "model_generation_sha256": identity["train_report_sha256"],
-            "evaluation_spec_sha256": task["hard_spec_sha256"],
-            "temperature_contract_sha256": base_task[
-                "temperature_contract_sha256"
-            ],
-            "hard_constraint_contract_sha256": task["physics_sha256"],
+            "evaluation_spec_sha256": problem.stage_spec_sha256,
+            "temperature_contract_sha256": (
+                problem.temperature_contract_sha256
+            ),
+            "hard_constraint_contract_sha256": (
+                problem.hard_constraint_contract_sha256
+            ),
         },
     )
     terminal_path = output / "terminal_physical_candidates.csv"
