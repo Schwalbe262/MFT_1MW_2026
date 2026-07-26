@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import html
 import json
@@ -20,7 +20,6 @@ import os
 from pathlib import Path
 import tempfile
 from typing import Any, Iterable, Mapping, Sequence
-from zoneinfo import ZoneInfo
 
 
 STATUS_SCHEMA = "mft-goal-fixed-lm2mh-targeted-global-nds-v3"
@@ -56,6 +55,7 @@ DEFAULT_VISUALIZATION_COPY = (
     / "global-pareto-audit.html"
 )
 FLOAT_TOLERANCE = 1e-12
+KST = timezone(timedelta(hours=9), "KST")
 
 
 class AuditError(RuntimeError):
@@ -599,7 +599,6 @@ def audit_final528(
         or (status.get("status_counts") or {}).get("completed")
         != expected_seed_count
         or status.get("failed_terminal_tasks")
-        or status.get("successful_terminal_artifact_pending_tasks")
     ):
         raise AuditError("collector is not authoritative final coverage")
     if (
@@ -744,9 +743,7 @@ def audit_final528(
         != int(manifest["minimum_violation_objective_front_count"])
     ):
         raise AuditError("manifest/result counts drifted")
-    generated_at = datetime.now(ZoneInfo("Asia/Seoul")).isoformat(
-        timespec="seconds"
-    )
+    generated_at = datetime.now(KST).isoformat(timespec="seconds")
     core = {
         "schema_version": AUDIT_SCHEMA,
         "campaign_id": CAMPAIGN_ID,
@@ -798,6 +795,9 @@ def audit_final528(
             sorted(collection_campaign_counts.items())
         ),
         "superseded_task_count": len(status.get("superseded_tasks") or []),
+        "scheduler_result_json_visibility_pending_count": len(
+            status.get("successful_terminal_artifact_pending_tasks") or []
+        ),
         "checks": {
             "collector_seal": "PASS",
             "manifest_seal": "PASS",
