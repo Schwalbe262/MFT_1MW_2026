@@ -52,7 +52,7 @@ SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME = "mft-goal-corrected-thermal-l96230-b7c30cb70b95-v1"
 ACCOUNT = "r1jae262"
 ACCOUNT_UID = 1455
-TARGET_NODE = "n113"
+TARGET_NODE = "n116"
 FORBIDDEN_NODE = "n114"
 SOURCE_LOGICAL_TASK_ID = 96230
 SOURCE_EXECUTION_TASK_ID = 96304
@@ -1676,28 +1676,35 @@ def validate_node_gate(
         and str(row.get("state") or "").lower() == "active"
     ]
     if not candidates:
-        raise CorrectedThermalError("n113 has no fresh active node telemetry")
+        raise CorrectedThermalError(
+            f"{TARGET_NODE} has no fresh active node telemetry"
+        )
     candidates.sort(
         key=lambda row: (
             _scheduler_timestamp(
                 row.get("node_metrics_observed_at"),
-                "n113 telemetry timestamp",
+                f"{TARGET_NODE} telemetry timestamp",
             ),
             int(row.get("id") or 0),
         )
     )
     node = candidates[-1]
     observed_at = _scheduler_timestamp(
-        node.get("node_metrics_observed_at"), "n113 telemetry timestamp"
+        node.get("node_metrics_observed_at"),
+        f"{TARGET_NODE} telemetry timestamp",
     )
     age_seconds = (_utc_now(now) - observed_at).total_seconds()
     state = str(node.get("node_pestat_state") or "").lower()
-    cpu_total = _positive_int(node.get("node_cpu_total"), "n113 CPU total")
+    cpu_total = _positive_int(
+        node.get("node_cpu_total"), f"{TARGET_NODE} CPU total"
+    )
     cpu_used = _positive_int(
-        node.get("node_cpu_used"), "n113 CPU used", allow_zero=True
+        node.get("node_cpu_used"),
+        f"{TARGET_NODE} CPU used",
+        allow_zero=True,
     )
     memory_free = _positive_int(
-        node.get("node_memory_free_mb"), "n113 free memory"
+        node.get("node_memory_free_mb"), f"{TARGET_NODE} free memory"
     )
     if (
         state not in {"idle", "mix"}
@@ -1716,7 +1723,9 @@ def validate_node_gate(
             )
         }
     ):
-        raise CorrectedThermalError("n113 node telemetry cannot admit the task")
+        raise CorrectedThermalError(
+            f"{TARGET_NODE} node telemetry cannot admit the task"
+        )
 
     cap = _mapping(capacity, "task capacity")
     ready = _positive_int(
@@ -1731,7 +1740,9 @@ def validate_node_gate(
         or (queue_state == "ready" and ready < 1)
         or not isinstance(capacity_allocations, list)
     ):
-        raise CorrectedThermalError("strict n113 task capacity is unsafe")
+        raise CorrectedThermalError(
+            f"strict {TARGET_NODE} task capacity is unsafe"
+        )
     for row in capacity_allocations:
         item = _mapping(row, "capacity allocation")
         observed_nodes = {
@@ -1746,7 +1757,9 @@ def validate_node_gate(
         if FORBIDDEN_NODE in observed_nodes or (
             observed_nodes - {""} and TARGET_NODE not in observed_nodes
         ):
-            raise CorrectedThermalError("capacity response relaxed away from n113")
+            raise CorrectedThermalError(
+                f"capacity response relaxed away from {TARGET_NODE}"
+            )
     return {
         "node": TARGET_NODE,
         "node_state": state,

@@ -220,7 +220,7 @@ def _license() -> dict:
     }
 
 
-def _allocation(node: str = "n113", state: str = "mix") -> dict:
+def _allocation(node: str = "n116", state: str = "mix") -> dict:
     return {
         "id": 1,
         "account_name": "dw16",
@@ -347,7 +347,7 @@ class FakeScheduler:
             "task_id": 100001,
             "status": "queued",
             "state": "queued",
-            "requested_node_name": "n113",
+            "requested_node_name": "n116",
             "requested_node_name_policy": "strict",
             "preferred_node_relaxed": False,
             "actual_node_name": "",
@@ -367,7 +367,7 @@ def test_plan_binds_fresh_executor_and_two_tier_storage(tmp_path: Path) -> None:
     assert plan["executor"]["revision"] == "b" * 40
     assert plan["submission_profile"]["cpus"] == 8
     assert plan["submission_profile"]["memory_mb"] == 294912
-    assert plan["submission_profile"]["node_name"] == "n113"
+    assert plan["submission_profile"]["node_name"] == "n116"
     assert plan["submission_profile"]["same_node_as_task_id"] == 0
     assert plan["submission_profile"]["timeout_seconds"] == 21600
     storage = plan["execution_contract"]["output_storage"]
@@ -376,7 +376,7 @@ def test_plan_binds_fresh_executor_and_two_tier_storage(tmp_path: Path) -> None:
     )
     assert storage["minimum_scratch_working_shadow_bytes"] == 256 * 1024**3
     assert storage["maximum_minimum_bundle_bytes"] == 4 * 1024**3
-    assert "test \"$host\" = 'n113'" in plan["canonical_command"]
+    assert "test \"$host\" = 'n116'" in plan["canonical_command"]
     assert "test \"$host\" != 'n114'" in plan["canonical_command"]
     assert "--execution-plan" in plan["canonical_command"]
 
@@ -423,7 +423,7 @@ def test_node_and_license_gates_reject_relaxation() -> None:
     assert accepted["queue_state"] == "opening"
     bad = _capacity()
     bad["allocations"] = [{"node_name": "n114"}]
-    with pytest.raises(submission.CorrectedThermalError, match="n113"):
+    with pytest.raises(submission.CorrectedThermalError, match="n116"):
         submission.validate_node_gate([_allocation()], bad, now=NOW)
     stale = _license()
     stale["admission"]["snapshot_age_seconds"] = 121
@@ -507,7 +507,7 @@ def _submitted_readback(plan: dict) -> tuple[dict, dict]:
         "task_id": 100001,
         "status": "queued",
         "state": "queued",
-        "requested_node_name": "n113",
+        "requested_node_name": "n116",
         "requested_node_name_policy": "strict",
         "preferred_node_relaxed": False,
         "actual_node_name": "",
