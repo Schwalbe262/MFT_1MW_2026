@@ -78,6 +78,7 @@ def _task(
         "cpus": spec.cpus,
         "memory_mb": spec.memory_mb,
         "timeout_seconds": spec.timeout_seconds,
+        "max_workers_per_node": spec.max_workers_per_node or 8,
         "same_node_as_task_id": 0,
         "requested_node_name": spec.requested_node,
         "node_name": spec.requested_node,
@@ -126,6 +127,10 @@ def _mixed_tasks() -> dict[int, dict[str, Any]]:
                 failure_message="task timed out",
             ),
         ),
+        specs[4].task_id: updater._validate_task(
+            specs[4],
+            _task(specs[4], allocation_id=105),
+        ),
     }
 
 
@@ -153,18 +158,24 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["completed"] == completed
     assert merged["attention"] == attention
     assert "18:20 KST" in merged["summary"]
-    assert "running1 · queued1 · terminal2" in merged["summary"]
+    assert "running2 · queued1 · terminal2" in merged["summary"]
     assert "physical feasible0" in merged["summary"]
     assert "scientific/production PASS가 아닙니다" in merged["summary"]
-    assert merged["current"][-1] == parallel
+    assert merged["current"][-1] != parallel
+    assert merged["current"][-1]["id"] == "parallel-workstreams"
+    assert (
+        "RUNNING 2 · QUEUED 1 · ALLOCATION JOBS 2"
+        in merged["current"][-1]["title"]
+    )
     assert merged["unknown_top_level"] == {"preserve": True}
-    assert sync["allocation_jobs_active"] == 1
-    assert sync["running"] == 1
+    assert sync["allocation_jobs_active"] == 2
+    assert sync["running"] == 2
     assert sync["queued"] == 1
-    assert sync["submitted_total"] == 120
+    assert sync["submitted_total"] == 121
     assert sync["collections_preserved"] == 0
     assert sync["scheduler_methods_used"] == ["GET"]
     assert sync["scientific_pass_generated"] is False
+    assert sync["managed_task_ids"] == [96324, 96325, 96326, 96327, 96328]
 
     success = next(
         item
@@ -183,11 +194,45 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert "task timed out" in failed["detail"]
     assert "과학적 infeasibility" in failed["detail"]
 
+    official = next(
+        item
+        for item in merged["current"]
+        if item["id"] == "postdeadline-standard-official6-96328"
+    )
+    assert "task96328 RUNNING" in official["title"]
+    assert any(
+        "42942394a873e40181f9074f2625807224239b291bcf2f4cf2ccacde50b11edc"
+        in value
+        for value in official["evidence"]
+    )
+
     handoff = next(item for item in merged["current"] if item["id"] == "fea-handoff")
     assert (
-        handoff["title"] == "SLURM · ALLOCATION JOBS 1 · SUBMITTED 120 · "
-        "RUNNING 1 · QUEUED 1 · COLLECTIONS 0"
+        handoff["title"] == "SLURM · ALLOCATION JOBS 2 · SUBMITTED 121 · "
+        "RUNNING 2 · QUEUED 1 · COLLECTIONS 0"
     )
+
+
+def test_merge_upserts_missing_official_task_card_before_parallel() -> None:
+    source = _status()
+    source["current"] = [
+        item
+        for item in source["current"]
+        if item["id"] != "postdeadline-standard-official6-96328"
+    ]
+
+    merged = updater.merge_status(
+        source,
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+    )
+    ids = [item["id"] for item in merged["current"]]
+
+    assert ids.count("postdeadline-standard-official6-96328") == 1
+    assert ids.index("postdeadline-standard-official6-96328") < ids.index(
+        "parallel-workstreams"
+    )
+    updater.validate_status_sync(merged)
 
 
 def test_synchronize_once_is_atomic_and_identity_failure_keeps_source(
@@ -338,6 +383,16 @@ def test_scheduler_reader_uses_bounded_get(monkeypatch: pytest.MonkeyPatch) -> N
         "url": f"http://127.0.0.1:8002/api/tasks/{spec.task_id}",
         "timeout": 3.0,
     }
+
+
+def test_official_task_max_workers_is_fail_closed() -> None:
+    spec = updater.TASK_SPECS[-1]
+    assert spec.task_id == 96328
+    task = _task(spec)
+    task["max_workers_per_node"] = 2
+
+    with pytest.raises(updater.UpdaterError, match="max_workers_per_node drifted"):
+        updater._validate_task(spec, task)
 
 
 def test_run_once_writes_sealed_pid_and_log(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-"""GET-only updater for the four post-deadline MFT task cards on port 8010.
+"""GET-only updater for the post-deadline MFT task cards on port 8010.
 
 The Scheduler remains a separate service.  This module only performs exact
 ``GET /api/tasks/{id}`` reads and atomically merges lifecycle state into the
@@ -33,7 +33,7 @@ DEFAULT_STATUS_FILE = Path(
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
-CAMPAIGN_SUBMITTED_FLOOR = 120
+CAMPAIGN_SUBMITTED_FLOOR = 121
 SYNC_KEY = "postdeadline_task_sync"
 SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
@@ -70,7 +70,10 @@ class TaskSpec:
     timeout_seconds: int
     inner_solver_seconds: int | None = None
     requested_account: str | None = None
+    max_workers_per_node: int | None = None
     search_only: bool = False
+    submission_receipt_sha256: str | None = None
+    final_seal_sha256: str | None = None
 
 
 TASK_SPECS = (
@@ -125,6 +128,30 @@ TASK_SPECS = (
         memory_mb=98304,
         timeout_seconds=45300,
         search_only=True,
+    ),
+    TaskSpec(
+        task_id=96328,
+        card_id="postdeadline-standard-official6-96328",
+        task_name=(
+            "mft-goal-diag-standard-postdeadline-official6-"
+            "s96185-2772aed82a8c-n113"
+        ),
+        model_label="STANDARD OFFICIAL #6",
+        candidate_label="official#6 2772aed82a8c",
+        requested_node="n113",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=45300,
+        inner_solver_seconds=43200,
+        requested_account="dw16",
+        max_workers_per_node=1,
+        search_only=True,
+        submission_receipt_sha256=(
+            "42942394a873e40181f9074f2625807224239b291bcf2f4cf2ccacde50b11edc"
+        ),
+        final_seal_sha256=(
+            "ff034d51e8da2ce97c4cd06f44767131e6d60c01f62d65d58ac0afc9bee4abe6"
+        ),
     ),
 )
 
@@ -343,6 +370,8 @@ def _validate_task(spec: TaskSpec, task: Mapping[str, Any]) -> dict[str, Any]:
         "timeout_seconds": spec.timeout_seconds,
         "same_node_as_task_id": 0,
     }
+    if spec.max_workers_per_node is not None:
+        expected["max_workers_per_node"] = spec.max_workers_per_node
     for key, value in expected.items():
         if task.get(key) != value:
             raise UpdaterError(f"task{spec.task_id} {key} drifted")
@@ -473,6 +502,12 @@ def _task_card(
     ]
     if spec.inner_solver_seconds is not None:
         evidence.insert(2, f"inner solver budget{spec.inner_solver_seconds}s")
+    if spec.submission_receipt_sha256 is not None:
+        evidence.append(
+            f"submission receipt SHA256 {spec.submission_receipt_sha256}"
+        )
+    if spec.final_seal_sha256 is not None:
+        evidence.append(f"final seal SHA256 {spec.final_seal_sha256}")
     if task["failure_message"]:
         evidence.append(f"failure_message={task['failure_message']}")
     return {
@@ -719,6 +754,65 @@ def _live_summary(
     )
 
 
+def _parallel_workstreams_card(
+    tasks: Mapping[int, Mapping[str, Any]],
+    categories: Mapping[int, str],
+    *,
+    observed_at: str,
+    allocation_jobs: int,
+    running: int,
+    queued: int,
+) -> dict[str, Any]:
+    terminal = len(TASK_SPECS) - running - queued
+    active_nodes = list(
+        dict.fromkeys(
+            str(tasks[spec.task_id]["actual_node_name"] or spec.requested_node)
+            for spec in TASK_SPECS
+            if categories[spec.task_id] in {"running", "queued"}
+        )
+    )
+    nodes = " + ".join(active_nodes) if active_nodes else "NO ACTIVE NODES"
+    evidence = [
+        (
+            f"active allocations{allocation_jobs} / running{running} / "
+            f"queued{queued} / terminal{terminal}"
+        )
+    ]
+    evidence.extend(
+        (
+            f"task{spec.task_id} {spec.model_label} "
+            f"{tasks[spec.task_id]['state']} / "
+            f"allocation{tasks[spec.task_id]['allocation_id'] or 'none'} / "
+            f"job{tasks[spec.task_id]['slurm_job_id'] or 'none'} / "
+            f"{tasks[spec.task_id]['actual_node_name'] or spec.requested_node}"
+        )
+        for spec in TASK_SPECS
+    )
+    evidence.extend(
+        [
+            "all managed post-deadline tasks are diagnostic/noncanonical",
+            "Scheduler methods used: GET only",
+            "scientific_pass_generated=false / canonical_promotion=false",
+        ]
+    )
+    return {
+        "id": "parallel-workstreams",
+        "title": (
+            f"PARALLEL TRACKS · RUNNING {running} · QUEUED {queued} · "
+            f"ALLOCATION JOBS {allocation_jobs} · {nodes}"
+        ),
+        "detail": (
+            f"Scheduler GET-authenticated lifecycle for {len(TASK_SPECS)} managed "
+            "post-deadline tracks. Each task stays separate from collection, "
+            "scientific PASS, canonical promotion, and production truth."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 95 if running or queued else 100,
+        "evidence": evidence,
+    }
+
+
 def merge_status(
     payload: Mapping[str, Any],
     tasks: Mapping[int, Mapping[str, Any]],
@@ -733,9 +827,10 @@ def merge_status(
     result.pop(SYNC_KEY, None)
     protected_before = _protected_hashes(result)
     for spec in TASK_SPECS:
-        target = _single_current(result, spec.card_id)
-        target.clear()
-        target.update(_task_card(spec, tasks[spec.task_id], observed_at))
+        _upsert_current_card(
+            result,
+            _task_card(spec, tasks[spec.task_id], observed_at),
+        )
     if postsuccess_state_file is not None:
         _upsert_current_card(
             result,
@@ -807,6 +902,17 @@ def merge_status(
                 "Scheduler project remains separate from MFT repository",
             ],
         }
+    )
+    _upsert_current_card(
+        result,
+        _parallel_workstreams_card(
+            tasks,
+            categories,
+            observed_at=observed_at,
+            allocation_jobs=allocation_jobs,
+            running=running,
+            queued=queued,
+        ),
     )
     result["generated_at"] = observed_at
     if _protected_hashes(result) != protected_before:
