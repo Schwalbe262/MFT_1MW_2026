@@ -505,9 +505,9 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
         updater.AXIS_V6_CARD_ID,
     ]
     target = merged["current"][1]
-    assert "AUTHORITATIVE W1200/L1000" in target["title"]
-    assert "FINAL528=OLD16+FRESH512" in target["title"]
-    assert "FRESH RUN 0 / QUEUE 512 / SUCCESS 0 / FAIL 0" in target["title"]
+    assert "W1200/L1000 NSGA-II" in target["title"]
+    assert "FINAL528" in target["title"]
+    assert "FRESH OK0 RUN0 Q512 FAIL0" in target["title"]
     assert "SYM96743 RUNNING" in target["title"]
     assert any(
         "fresh task ranges=96485-96740 + 96756-97011" in value
@@ -631,7 +631,7 @@ def test_final528_card_keeps_empty_production_front_separate_from_diagnostics(
         collector_status=collector,
     )
 
-    assert "GLOBAL NDS COMPLETE" in card["title"]
+    assert "NDS COMPLETE" in card["title"]
     assert "HARD-FEASIBLE 0" in card["title"]
     assert "PRODUCTION FRONT 0" in card["title"]
     assert "empty Front means no production candidate" in card["detail"]

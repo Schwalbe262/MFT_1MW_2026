@@ -3238,11 +3238,11 @@ def _target_axis_card(
     card = {
         "id": TARGET_AXIS_CARD_ID,
         "title": (
-            "AUTHORITATIVE W1200/L1000 NSGA-II | FINAL528=OLD16+FRESH512 | "
-            f"FRESH RUN {fresh_running} / QUEUE {fresh_queued} / "
-            f"SUCCESS {fresh_succeeded} / FAIL {fresh_failed} | "
-            f"SYM96743 {symmetric_retry_state} | GLOBAL NDS "
-            f"{'COMPLETE' if collector_final else 'PENDING'}"
+            "W1200/L1000 NSGA-II | FINAL528 | "
+            f"FRESH OK{fresh_succeeded} RUN{fresh_running} "
+            f"Q{fresh_queued} FAIL{fresh_failed} | "
+            f"NDS {'COMPLETE' if collector_final else 'PENDING'} | "
+            f"SYM96743 {symmetric_retry_state}"
         ),
         "detail": (
             "The current authoritative optimization scope is the original 16 "
@@ -3317,8 +3317,7 @@ def _target_axis_card(
         card.update(
             {
                 "title": (
-                    "AUTHORITATIVE W1200/L1000 TARGET NSGA-II | "
-                    "GLOBAL NDS COMPLETE | FINAL528 | SEEDS "
+                    "AUTHORITATIVE FINAL528 | GLOBAL NDS COMPLETE | SEEDS "
                     f"{collector_success}/528 | RAW {raw_rows} | "
                     f"UNIQUE {unique_rows} | "
                     f"HARD-FEASIBLE {feasible} | "
