@@ -54,6 +54,28 @@ DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\rank1_turn_graded_cap_sweep_v1"
 )
+ELECTROSTATIC_CAP_SOURCE = REPOSITORY_ROOT / "module" / "electrostatic_cap.py"
+INPUT_PARAMETER_SOURCE = (
+    REPOSITORY_ROOT / "module" / "input_parameter_260706.py"
+)
+RUN_SIMULATION_SOURCE = REPOSITORY_ROOT / "run_simulation_260706.py"
+EXPECTED_ACTUAL_TOPOLOGY_SOURCE_SHA256 = {
+    "module/electrostatic_cap.py": (
+        "8b383584cdc62310f98283afe6f12b1036fc46fdb8a00c4b4c8b9ab3f71454b1"
+    ),
+    "module/input_parameter_260706.py": (
+        "761861d51dd2f4f12219a6b9277c14c7574a1d03303b42ec453a30941ac11625"
+    ),
+    "run_simulation_260706.py": (
+        "b0dcc5fd38883ceec9cd754d9cae2a8750f98e1093695cd5227777e69bc2a631"
+    ),
+}
+ACTUAL_CONNECTION_VARIANT_IDS = {
+    "Tx": "tx-main-mid",
+    "Rx": "rx-main-side-mid",
+}
+OPPOSED_SIDE_SENSITIVITY_VARIANT_ID = "rx-main-side-mid-opposed-side"
+RESONANCE_MIN_HZ = 15_000.0
 CPUS = 8
 MEMORY_MB = 65_536
 TIMEOUT_SECONDS = 7_200
@@ -173,6 +195,127 @@ def _read(path: Path) -> dict[str, Any]:
 
 def _record(path: Path, *, relative_to: Path | None = None) -> dict[str, Any]:
     return gap_tuner._file_record(path, relative_to=relative_to)  # noqa: SLF001
+
+
+def _actual_connection_topology_evidence(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal the current solver's intended additive-series topology basis.
+
+    Maxwell coil-sheet polarity follows the selected sheet-face orientation,
+    so its Positive/Negative labels are not a separate electrical section
+    polarity.  The turn-graded terminal schedule therefore uses the explicit
+    electrical convention in ``linear_turn_voltage_schedule``: every section
+    defaults to +1 and the production input keeps both side sections at +1.
+    """
+
+    sources = {
+        "module/electrostatic_cap.py": ELECTROSTATIC_CAP_SOURCE,
+        "module/input_parameter_260706.py": INPUT_PARAMETER_SOURCE,
+        "run_simulation_260706.py": RUN_SIMULATION_SOURCE,
+    }
+    records = {
+        name: _record(path)
+        for name, path in sources.items()
+    }
+    for name, expected in EXPECTED_ACTUAL_TOPOLOGY_SOURCE_SHA256.items():
+        if records[name]["sha256"] != expected:
+            raise TurnGradedBatchError(
+                f"actual-connection topology source drifted: {name}"
+            )
+    electrostatic_text = ELECTROSTATIC_CAP_SOURCE.read_text(encoding="utf-8")
+    input_text = INPUT_PARAMETER_SOURCE.read_text(encoding="utf-8")
+    runner_text = RUN_SIMULATION_SOURCE.read_text(encoding="utf-8")
+    required_fragments = {
+        "electrostatic_default_all_requested_sections_additive": (
+            electrostatic_text,
+            "{section: 1 for section in requested_sections}",
+        ),
+        "input_default_retained_side_additive": (
+            input_text,
+            '"cap_turn_graded_side_polarity": 1',
+        ),
+        "input_default_mirrored_side2_additive": (
+            input_text,
+            '"cap_turn_graded_side2_polarity": 1',
+        ),
+        "runtime_main_schedule_additive": (
+            runner_text,
+            'section_polarities = {"main": 1}',
+        ),
+        "runtime_side_schedule_from_sealed_input": (
+            runner_text,
+            'section_polarities["side"] = int(',
+        ),
+        "matrix_main_and_side_share_one_rx_winding": (
+            runner_text,
+            'add_winding_coils(assignment="Rx_winding", '
+            "coils=[coil.name for coil in self.Rx_coil])",
+        ),
+        "retained_main_inward_face_positive": (
+            runner_text,
+            'polarity="Positive", name=f"Rx_center_coil_in_{idx}"',
+        ),
+        "retained_side_inward_face_positive": (
+            runner_text,
+            'polarity="Positive", name=f"Rx_side_coil_in_{idx}"',
+        ),
+    }
+    missing = [
+        name
+        for name, (text, fragment) in required_fragments.items()
+        if fragment not in text
+    ]
+    if missing:
+        raise TurnGradedBatchError(
+            "actual-connection topology code evidence is absent: "
+            + ",".join(missing)
+        )
+    selected_ids = set(plan.get("selected_variant_ids") or [])
+    required_variants = {
+        *ACTUAL_CONNECTION_VARIANT_IDS.values(),
+        OPPOSED_SIDE_SENSITIVITY_VARIANT_ID,
+    }
+    if not required_variants.issubset(selected_ids):
+        raise TurnGradedBatchError(
+            "actual/opposed topology variants are absent from the sweep"
+        )
+    return {
+        "sealed": True,
+        "basis": (
+            "current symmetric solver intended additive-series electrical "
+            "connection proxy; Maxwell sheet polarity labels compensate face "
+            "orientation and do not negate the section voltage schedule"
+        ),
+        "solver_revision_used_by_sweep": plan["solver_revision"],
+        "actual_connection_variant_ids": dict(
+            ACTUAL_CONNECTION_VARIANT_IDS
+        ),
+        "actual_Rx_section_schedule": {
+            "section_order": ["main", "side"],
+            "section_polarities": {"main": 1, "side": 1},
+            "reverse_sections": [],
+            "reverse_terminal_polarity": False,
+            "voltage_policy": "turn_midpoint",
+        },
+        "opposed_side_variant": {
+            "variant_id": OPPOSED_SIDE_SENSITIVITY_VARIANT_ID,
+            "section_polarities": {"main": 1, "side": -1},
+            "classification": "sensitivity-only-not-actual-design",
+        },
+        "source_files": records,
+        "code_assertions": {
+            name: fragment
+            for name, (_text, fragment) in required_fragments.items()
+        },
+        "full_model_series_interconnect_attested": False,
+        "limitation": (
+            "This seals the intended connection basis implemented by the "
+            "current symmetric solver; a retained symmetric electrostatic "
+            "model still does not independently attest the future full-model "
+            "physical terminal interconnect."
+        ),
+    }
 
 
 def _write(path: Path, value: Any) -> Path:
@@ -563,6 +706,25 @@ def collect(
         or submission.get("plan_payload_sha256") != plan["payload_sha256"]
     ):
         raise TurnGradedBatchError("submission contract drifted")
+    topology_required_variants = {
+        *ACTUAL_CONNECTION_VARIANT_IDS.values(),
+        OPPOSED_SIDE_SENSITIVITY_VARIANT_ID,
+    }
+    selected_variant_ids = set(plan.get("selected_variant_ids") or [])
+    topology_evidence = (
+        _actual_connection_topology_evidence(plan)
+        if topology_required_variants.issubset(selected_variant_ids)
+        else {
+            "sealed": False,
+            "reason": (
+                "bounded subset does not contain both actual-connection "
+                "proxies and the opposed-side sensitivity control"
+            ),
+            "selected_variant_ids": sorted(selected_variant_ids),
+            "required_variant_ids": sorted(topology_required_variants),
+            "full_model_series_interconnect_attested": False,
+        }
+    )
     lanes = {lane["lane_index"]: lane for lane in plan["lanes"]}
     rows = []
     terminal = {"completed", "failed", "cancelled", "timeout"}
@@ -570,6 +732,16 @@ def collect(
         lane = lanes[submitted["lane_index"]]
         task = _api_task(scheduler_url, int(submitted["task_id"]))
         result = _result(task)
+        variant_id = lane["variant"]["id"]
+        actual_connection_variant = (
+            ACTUAL_CONNECTION_VARIANT_IDS.get(
+                lane["variant"]["active"]
+            )
+            == variant_id
+        )
+        opposed_side_sensitivity = (
+            variant_id == OPPOSED_SIDE_SENSITIVITY_VARIANT_ID
+        )
         row: dict[str, Any] = {
             "lane_index": lane["lane_index"],
             "variant": lane["variant"],
@@ -578,6 +750,18 @@ def collect(
             "node": task.get("actual_node_name") or task.get("node_name"),
             "result_available": result is not None,
             "contract_valid": False,
+            "resonance_spec_pass_15kHz": False,
+            "actual_connection_design_applicable": (
+                actual_connection_variant
+            ),
+            "sensitivity_only": not actual_connection_variant,
+            "connection_topology_role": (
+                "actual-current-solver-connection-proxy"
+                if actual_connection_variant
+                else "opposed-polarity-sensitivity-only-not-actual-design"
+                if opposed_side_sensitivity
+                else "connection-or-voltage-convention-sensitivity-only"
+            ),
         }
         if result is not None:
             active = lane["variant"]["active"]
@@ -613,10 +797,59 @@ def collect(
                     and float(resonance) > 0.0
                     and row["even_potential_symmetry_assumed"] == 1
                 )
+                row["resonance_spec_pass_15kHz"] = bool(
+                    row["contract_valid"]
+                    and float(resonance) >= RESONANCE_MIN_HZ
+                )
             except (KeyError, TypeError, ValueError, OverflowError):
                 row["contract_valid"] = False
         rows.append(row)
     all_terminal = all(row["status"] in terminal for row in rows)
+    by_variant = {
+        row["variant"]["id"]: row
+        for row in rows
+    }
+    actual_connection_rows = {
+        winding: by_variant.get(variant_id)
+        for winding, variant_id in ACTUAL_CONNECTION_VARIANT_IDS.items()
+    }
+    actual_connection_spec_pass = all(
+        row is not None and row["resonance_spec_pass_15kHz"]
+        for row in actual_connection_rows.values()
+    )
+    actual_connection_results = {
+        winding: {
+            "variant_id": variant_id,
+            "task_id": row["task_id"] if row is not None else None,
+            "C_terminal_F": (
+                row.get("C_terminal_F") if row is not None else None
+            ),
+            "f_res_Hz": (
+                row.get("f_res_Hz") if row is not None else None
+            ),
+            "Lm_primary_referred_H": (
+                row.get("Lm_primary_referred_H")
+                if row is not None
+                else None
+            ),
+            "contract_valid": (
+                row["contract_valid"] if row is not None else False
+            ),
+            "resonance_spec_pass_15kHz": (
+                row["resonance_spec_pass_15kHz"]
+                if row is not None
+                else False
+            ),
+        }
+        for winding, variant_id in ACTUAL_CONNECTION_VARIANT_IDS.items()
+        for row in (actual_connection_rows[winding],)
+    }
+    actual_frequencies = [
+        float(row["f_res_Hz"])
+        for row in actual_connection_rows.values()
+        if row is not None and row.get("f_res_Hz") is not None
+    ]
+    opposed_row = by_variant.get(OPPOSED_SIDE_SENSITIVITY_VARIANT_ID)
     return _write(
         output,
         _seal(
@@ -629,6 +862,53 @@ def collect(
                 "valid_result_count": sum(
                     bool(row["contract_valid"]) for row in rows
                 ),
+                "resonance_spec_pass_count_all_variants": sum(
+                    bool(row["resonance_spec_pass_15kHz"])
+                    for row in rows
+                ),
+                "resonance_spec_fail_variant_ids": [
+                    row["variant"]["id"]
+                    for row in rows
+                    if row["contract_valid"]
+                    and not row["resonance_spec_pass_15kHz"]
+                ],
+                "actual_connection_topology_basis": topology_evidence,
+                "actual_connection_results": actual_connection_results,
+                "actual_connection_fmin_Hz": (
+                    min(actual_frequencies)
+                    if len(actual_frequencies)
+                    == len(ACTUAL_CONNECTION_VARIANT_IDS)
+                    else None
+                ),
+                "actual_connection_resonance_spec_pass": (
+                    actual_connection_spec_pass
+                ),
+                "opposed_side_sensitivity_result": {
+                    "variant_id": OPPOSED_SIDE_SENSITIVITY_VARIANT_ID,
+                    "task_id": (
+                        opposed_row["task_id"]
+                        if opposed_row is not None
+                        else None
+                    ),
+                    "C_terminal_F": (
+                        opposed_row.get("C_terminal_F")
+                        if opposed_row is not None
+                        else None
+                    ),
+                    "f_res_Hz": (
+                        opposed_row.get("f_res_Hz")
+                        if opposed_row is not None
+                        else None
+                    ),
+                    "resonance_spec_pass_15kHz": (
+                        opposed_row["resonance_spec_pass_15kHz"]
+                        if opposed_row is not None
+                        else False
+                    ),
+                    "classification": (
+                        "sensitivity-only-not-actual-design"
+                    ),
+                },
                 "scheduler_mutation_performed": False,
                 "full_model_series_interconnect_attested": False,
                 "final_design_pass_allowed": False,
