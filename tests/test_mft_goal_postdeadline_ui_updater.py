@@ -85,6 +85,7 @@ def _task(
         "timeout_seconds": spec.timeout_seconds,
         "max_workers_per_node": spec.max_workers_per_node or 8,
         "same_node_as_task_id": spec.expected_same_node_as_task_id,
+        "requested_allocation_id": 0,
         "requested_node_name": spec.requested_node,
         "node_name": spec.requested_node,
         "node_name_policy": "strict",
@@ -171,6 +172,20 @@ def _current_fast_lane_tasks() -> dict[int, dict[str, Any]]:
             failed_spec,
             state="failed",
             failure_message="standalone core opt-in authentication digest mismatch",
+        ),
+    )
+    hedge_spec = next(
+        spec
+        for spec in updater.TASK_SPECS
+        if spec.task_id == updater.ROUNDED_TIMEOUT_HEDGE_TASK_ID
+    )
+    tasks[updater.ROUNDED_TIMEOUT_HEDGE_TASK_ID] = updater._validate_task(
+        hedge_spec,
+        _task(
+            hedge_spec,
+            state="queued",
+            allocation_id=None,
+            slurm_job_id="",
         ),
     )
     return tasks
@@ -289,6 +304,7 @@ def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> 
     )
 
     assert "THERMAL RUNNING" in card["title"]
+    assert "HEDGE QUEUED" in card["title"]
     assert "DRAWING DRAFT READY (20/20 QA)" in card["title"]
     assert "FULL GATE SEPARATE" in card["title"]
     assert any(
@@ -341,6 +357,84 @@ def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> 
     assert any(
         "actual scientific PASS=0" in value
         and "actual production PASS=0" in value
+        for value in card["evidence"]
+    )
+
+
+def test_single_rounded_timeout_hedge_is_operational_only() -> None:
+    spec = next(
+        spec
+        for spec in updater.TASK_SPECS
+        if spec.task_id == updater.ROUNDED_TIMEOUT_HEDGE_TASK_ID
+    )
+    task = updater._validate_task(
+        spec,
+        _task(
+            spec,
+            state="queued",
+            allocation_id=None,
+            slurm_job_id="",
+        ),
+    )
+
+    card = updater._task_card(spec, task, OBSERVED)
+
+    assert "TIMEOUT HEDGE QUEUED · NO ALLOCATION YET" in card["title"]
+    assert "task96342 QUEUED" in card["title"]
+    assert "exact same rounded B5 candidate and physics" in card["detail"]
+    assert "not a new design" in card["detail"]
+    assert updater.ROUNDED_TIMEOUT_HEDGE_POST_AT_KST in card["detail"]
+    assert "Task96340 remains untouched and authoritative" in card["detail"]
+    assert any(
+        "Scheduler GET task96342 QUEUED" in value
+        and "allocationnone" in value
+        and "Slurmnone" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "source task96340 untouched=true" in value
+        and "tracked independently=true" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        updater.ROUNDED_TIMEOUT_HEDGE_CANDIDATE_SHA256 in value
+        and "same rounded B5 candidate=true" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        updater.ROUNDED_TIMEOUT_HEDGE_PHYSICS_SHA256 in value
+        and "same physics contract as task96340=true" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "single Scheduler POST=1" in value
+        and "HTTP201" in value
+        and updater.ROUNDED_TIMEOUT_HEDGE_POST_AT_KST in value
+        and "repeat POST=false" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "account=harry261" in value
+        and "requested node=n107" in value
+        and "max_workers_per_node=1" in value
+        and "new allocation required=true" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "authenticated GET-only collector=active" in value
+        and "Scheduler methods=GET" in value
+        and "collector POST calls=0" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "classification=operational timeout hedge" in value
+        and "new design=false" in value
+        and "scientific candidate count unchanged=true" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "actual scientific PASS=0" in value
+        and "collection_authenticated=false" in value
         for value in card["evidence"]
     )
 
@@ -557,13 +651,16 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["completed"] == completed
     assert merged["attention"] == attention
     assert "18:20 KST" in merged["summary"]
-    assert "running2 · queued9 · terminal2" in merged["summary"]
+    assert "running2 · queued10 · terminal2" in merged["summary"]
     assert "physical feasible0" in merged["summary"]
     assert "actual scientific PASS=0" in merged["summary"]
     assert "scientific/production PASS가 아닙니다" in merged["summary"]
     assert merged["current"][-1] != parallel
     assert merged["current"][-1]["id"] == "parallel-workstreams"
-    assert "RUNNING 2 · QUEUED 9 · ALLOCATION JOBS 3" in merged["current"][-1]["title"]
+    assert (
+        "RUNNING 2 · QUEUED 10 · ALLOCATION JOBS 3"
+        in merged["current"][-1]["title"]
+    )
     assert (
         "RISK task96328/allocation14620 FORCE 07-27 04:07:51 KST"
         in merged["current"][-1]["title"]
@@ -696,8 +793,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 3
     assert sync["running"] == 2
-    assert sync["queued"] == 9
-    assert sync["submitted_total"] == 129
+    assert sync["queued"] == 10
+    assert sync["submitted_total"] == 130
     assert sync["collections_preserved"] == 0
     assert sync["scheduler_methods_used"] == ["GET"]
     assert sync["scientific_pass_generated"] is False
@@ -715,6 +812,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         96337,
         96338,
         96340,
+        96342,
     ]
     assert sync["operational_history"]["task96341"] == {
         "state": "cancelled",
@@ -723,6 +821,20 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         "slurm_job_id": "",
         "solver_contact": False,
         "scientific_failure": False,
+        "included_in_scientific_effective_counts": False,
+    }
+    assert sync["operational_history"]["task96342"] == {
+        "state": "queued",
+        "allocation_id": None,
+        "slurm_job_id": "",
+        "source_task_id": 96340,
+        "same_candidate_and_physics": True,
+        "scheduler_post_calls": 1,
+        "collector_methods": ["GET"],
+        "collector_scheduler_mutation": False,
+        "operational_timeout_hedge": True,
+        "new_design": False,
+        "scientific_pass": False,
         "included_in_scientific_effective_counts": False,
     }
 
@@ -830,6 +942,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == updater.ROUNDED_FINAL_PIPELINE_CARD_ID
     )
     assert "STANDARD QUEUED" in pipeline["title"]
+    assert "HEDGE QUEUED" in pipeline["title"]
     assert "DRAWING DRAFT READY (20/20 QA)" in pipeline["title"]
     assert "FULL GATE SEPARATE" in pipeline["title"]
     assert any(
@@ -903,8 +1016,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
 
     handoff = next(item for item in merged["current"] if item["id"] == "fea-handoff")
     assert (
-        handoff["title"] == "SLURM · ALLOCATION JOBS 3 · SUBMITTED 129 · "
-        "RUNNING 2 · QUEUED 9 · COLLECTIONS 0"
+        handoff["title"] == "SLURM · ALLOCATION JOBS 3 · SUBMITTED 130 · "
+        "RUNNING 2 · QUEUED 10 · COLLECTIONS 0"
     )
     for item in merged["current"]:
         assert len(item["title"]) <= 160
@@ -1589,7 +1702,7 @@ def test_scheduler_reader_uses_bounded_get(monkeypatch: pytest.MonkeyPatch) -> N
 def test_official_task_max_workers_is_fail_closed(
     spec: updater.TaskSpec,
 ) -> None:
-    assert spec.task_id in {96328, 96329, 96330, 96331, 96332, 96333}
+    assert spec.task_id in {96328, 96329, 96330, 96331, 96332, 96333, 96342}
     task = _task(spec)
     task["max_workers_per_node"] = 2
 
@@ -1605,6 +1718,22 @@ def test_corrected_allocation_force_risk_identity_is_fail_closed() -> None:
     with pytest.raises(
         updater.UpdaterError,
         match="corrected allocation identity drifted",
+    ):
+        updater._validate_task(spec, task)
+
+
+def test_timeout_hedge_new_allocation_requirement_is_fail_closed() -> None:
+    spec = next(
+        item
+        for item in updater.TASK_SPECS
+        if item.task_id == updater.ROUNDED_TIMEOUT_HEDGE_TASK_ID
+    )
+    task = _task(spec, state="queued", allocation_id=None, slurm_job_id="")
+    task["requested_allocation_id"] = 14620
+
+    with pytest.raises(
+        updater.UpdaterError,
+        match="new-allocation requirement drifted",
     ):
         updater._validate_task(spec, task)
 

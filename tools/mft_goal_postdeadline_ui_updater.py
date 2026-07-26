@@ -38,7 +38,7 @@ DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE = Path(
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
-CAMPAIGN_SUBMITTED_FLOOR = 129
+CAMPAIGN_SUBMITTED_FLOOR = 130
 SYNC_KEY = "postdeadline_task_sync"
 SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
@@ -91,6 +91,7 @@ class TaskSpec:
     terminal_failure_override: str | None = None
     selection_superseded_by_task_id: int | None = None
     selection_failover_for_task_id: int | None = None
+    new_allocation_required: bool = False
 
 
 TASK_SPECS = (
@@ -384,6 +385,31 @@ TASK_SPECS = (
         expected_allocation_id=14620,
         expected_slurm_job_id="829579",
     ),
+    TaskSpec(
+        task_id=96342,
+        card_id="final-rounded-standard-symmetric-timeout-hedge-96342",
+        task_name=(
+            "mft-goal-final-standard-official5-rounded-r10-s4-hedge1-v1-"
+            "909d249ebe45-n107"
+        ),
+        model_label="FINAL ROUNDED SYMMETRIC TIMEOUT HEDGE",
+        candidate_label="same official#5 909d249ebe45 rounded R10/S4",
+        requested_node="n107",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=12900,
+        inner_solver_seconds=10800,
+        requested_account="harry261",
+        max_workers_per_node=1,
+        search_only=True,
+        submission_receipt_sha256=(
+            "0f6f62e34ba1760aa4c223dafccb3cf42f05f619fa145f7fb61ecaa4a3d30585"
+        ),
+        final_seal_sha256=(
+            "8e5db1f9e96b957f0c81cfc8b395e82be466ff5d962046fc7bc039ecfe2a2c0c"
+        ),
+        new_allocation_required=True,
+    ),
 )
 
 LEGACY_STANDARD_SELECTION_TASK_IDS = (
@@ -417,6 +443,7 @@ LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
 ROUNDED_FINAL_TASK_ID = 96340
+ROUNDED_TIMEOUT_HEDGE_TASK_ID = 96342
 ROUNDED_FINAL_PIPELINE_CARD_ID = "codex-rounded-final-delivery-pipeline"
 ROUNDED_SNAPSHOT_SHA256 = (
     "c71a94a8b23a9cf8fd4ab9a98083df45f350cf7586b2f1e449deca30380cd426"
@@ -454,6 +481,13 @@ ROUNDED_DRAWING_DRAFT_SLIDES = 9
 ROUNDED_FULL_PREPARE_COMMIT = "b4ab0dc"
 ROUNDED_PACKAGE_GATE_COMMIT = "3b43d95"
 ROUNDED_BOUNDED_CORRECTION_COMMIT = "441a29d"
+ROUNDED_TIMEOUT_HEDGE_CANDIDATE_SHA256 = (
+    "909d249ebe455d6f60b42d094e7916c8b3e8538e8d188e48a3906d82665ebc42"
+)
+ROUNDED_TIMEOUT_HEDGE_PHYSICS_SHA256 = (
+    "14c4cce44e0184e0a365d561fb6166a1a30da91c6796b6363cbed51cdbb1e9a0"
+)
+ROUNDED_TIMEOUT_HEDGE_POST_AT_KST = "2026-07-27 02:17:03 KST"
 DRAWING_REFERENCE_PDF_SHA256 = (
     "574d9aab033529cf3655d63542e27871c2e240b669b67e54dbfd2495a564437f"
 )
@@ -693,6 +727,14 @@ def _validate_task(spec: TaskSpec, task: Mapping[str, Any]) -> dict[str, Any]:
         }
         if spec.requested_account not in accounts:
             raise UpdaterError(f"task{spec.task_id} account drifted")
+    if spec.new_allocation_required and task.get("requested_allocation_id") not in (
+        None,
+        "",
+        0,
+    ):
+        raise UpdaterError(
+            f"task{spec.task_id} new-allocation requirement drifted"
+        )
     state = _task_state(task)
     if (
         spec.expected_allocation_id is not None
@@ -969,6 +1011,104 @@ def _rounded_final_task_card(
     }
 
 
+def _rounded_timeout_hedge_task_card(
+    spec: TaskSpec,
+    task: Mapping[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    """Render the one operational timeout hedge without duplicating design truth."""
+    category = _category(str(task["state"]))
+    node = task["actual_node_name"] or spec.requested_node
+    allocation = task["allocation_id"] or "none"
+    job = task["slurm_job_id"] or "none"
+    if category == "queued":
+        stage = "TIMEOUT HEDGE QUEUED · NO ALLOCATION YET"
+        progress = 5
+    elif category == "running":
+        stage = "TIMEOUT HEDGE RUNNING"
+        progress = 20
+    elif category == "succeeded":
+        stage = "TIMEOUT HEDGE SOLVER DONE · AUTH PENDING"
+        progress = 100
+    else:
+        stage = "TIMEOUT HEDGE OPERATIONAL TERMINAL"
+        progress = 100
+    return {
+        "id": spec.card_id,
+        "title": (
+            f"CODEX | ROUNDED B5 {stage} | task{spec.task_id} "
+            f"{str(task['state']).upper()} | {node}"
+        ),
+        "detail": (
+            "This is the single bounded operational timeout hedge for task96340: "
+            "the exact same rounded B5 candidate and physics, not a new design or "
+            "an additional scientific candidate. It was submitted exactly once at "
+            f"{ROUNDED_TIMEOUT_HEDGE_POST_AT_KST} to harry261 with strict n107, "
+            "max_workers_per_node=1, and a new-allocation requirement. "
+            f"Scheduler GET lifecycle={task['state']}, allocation={allocation}, "
+            f"Slurm job={job}. Task96340 remains untouched and authoritative; "
+            "neither lifecycle creates a scientific PASS before authenticated "
+            "solver collection."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": [
+            (
+                f"Scheduler GET task{spec.task_id} "
+                f"{str(task['state']).upper()} / allocation{allocation} / "
+                f"Slurm{job} / requested node n107 strict"
+            ),
+            (
+                "source task96340 untouched=true / primary rounded validation "
+                "tracked independently=true"
+            ),
+            (
+                "same rounded B5 candidate=true / candidate physics SHA256 "
+                f"{ROUNDED_TIMEOUT_HEDGE_CANDIDATE_SHA256}"
+            ),
+            (
+                "same physics contract as task96340=true / SHA256 "
+                f"{ROUNDED_TIMEOUT_HEDGE_PHYSICS_SHA256}"
+            ),
+            (
+                f"single Scheduler POST=1 / HTTP201 / submitted at "
+                f"{ROUNDED_TIMEOUT_HEDGE_POST_AT_KST} / repeat POST=false"
+            ),
+            (
+                f"submission receipt SHA256 {spec.submission_receipt_sha256} / "
+                f"final seal SHA256 {spec.final_seal_sha256}"
+            ),
+            (
+                "account=harry261 / requested node=n107 / node policy=strict / "
+                "max_workers_per_node=1 / new allocation required=true / "
+                "existing allocation attach=false"
+            ),
+            (
+                f"resources=cpus{spec.cpus} / memory{spec.memory_mb}MB / "
+                f"scheduler timeout{spec.timeout_seconds}s / "
+                f"inner solver budget{spec.inner_solver_seconds}s"
+            ),
+            (
+                "authenticated GET-only collector=active / Scheduler methods=GET / "
+                "collector POST calls=0"
+            ),
+            (
+                "classification=operational timeout hedge / new design=false / "
+                "scientific candidate count unchanged=true"
+            ),
+            (
+                "actual scientific PASS=0 / collection_authenticated=false / "
+                "production claim=false / canonical promotion=false"
+            ),
+            (
+                "fixed boundary unchanged=round_corner R10/S4 / fan1.5m/s / "
+                "TIM k0.2W/mK / WCP pad2mm / core pad2mm"
+            ),
+        ],
+    }
+
+
 def _task_card(
     spec: TaskSpec,
     task: Mapping[str, Any],
@@ -976,6 +1116,8 @@ def _task_card(
 ) -> dict[str, Any]:
     if spec.task_id == ROUNDED_FINAL_TASK_ID:
         return _rounded_final_task_card(spec, task, observed_at)
+    if spec.task_id == ROUNDED_TIMEOUT_HEDGE_TASK_ID:
+        return _rounded_timeout_hedge_task_card(spec, task, observed_at)
     category = _category(str(task["state"]))
     node = task["actual_node_name"] or spec.requested_node
     if category == "succeeded":
@@ -2129,13 +2271,21 @@ def _rounded_final_pipeline_card(
     observed_at: str,
 ) -> dict[str, Any]:
     task = tasks[ROUNDED_FINAL_TASK_ID]
+    hedge = tasks[ROUNDED_TIMEOUT_HEDGE_TASK_ID]
     category = _category(str(task["state"]))
+    hedge_category = _category(str(hedge["state"]))
     task_stage = {
         "running": "THERMAL RUNNING",
         "queued": "STANDARD QUEUED",
         "succeeded": "STANDARD SOLVER DONE · AUTH PENDING",
         "failed": "STANDARD OPERATIONAL TERMINAL",
     }[category]
+    hedge_stage = {
+        "running": "HEDGE RUNNING",
+        "queued": "HEDGE QUEUED",
+        "succeeded": "HEDGE SOLVER DONE · AUTH PENDING",
+        "failed": "HEDGE OPERATIONAL TERMINAL",
+    }[hedge_category]
     thermal_stage = (
         "ThermalSetup RUNNING"
         if category == "running"
@@ -2145,11 +2295,15 @@ def _rounded_final_pipeline_card(
         "id": ROUNDED_FINAL_PIPELINE_CARD_ID,
         "title": (
             f"CODEX | ROUNDED FINAL PIPELINE | {task_stage} | "
-            "DRAWING DRAFT READY (20/20 QA) | FULL GATE SEPARATE"
+            f"{hedge_stage} | DRAWING DRAFT READY (20/20 QA) | "
+            "FULL GATE SEPARATE"
         ),
         "detail": (
             "Task96340 remains the active rounded 1/8 symmetric scientific "
-            "verification lane. A corrected nine-slide DRAFT PPTX and nine-page "
+            "verification lane. Task96342 is its single same-candidate operational "
+            "timeout hedge, not a new design or scientific candidate; its live "
+            "state is read by GET and its collector is GET-only. A corrected "
+            "nine-slide DRAFT PPTX and nine-page "
             "DRAFT PDF are prepared and passed all 20 readiness/visual QA checks, "
             "but they remain unpublished and explicitly non-final until the "
             "task96340 result is authenticated. The symmetric drawing release "
@@ -2663,6 +2817,24 @@ def merge_status(
                     "slurm_job_id": "",
                     "solver_contact": False,
                     "scientific_failure": False,
+                    "included_in_scientific_effective_counts": False,
+                },
+                "task96342": {
+                    "state": tasks[ROUNDED_TIMEOUT_HEDGE_TASK_ID]["state"],
+                    "allocation_id": tasks[ROUNDED_TIMEOUT_HEDGE_TASK_ID][
+                        "allocation_id"
+                    ],
+                    "slurm_job_id": tasks[ROUNDED_TIMEOUT_HEDGE_TASK_ID][
+                        "slurm_job_id"
+                    ],
+                    "source_task_id": ROUNDED_FINAL_TASK_ID,
+                    "same_candidate_and_physics": True,
+                    "scheduler_post_calls": 1,
+                    "collector_methods": ["GET"],
+                    "collector_scheduler_mutation": False,
+                    "operational_timeout_hedge": True,
+                    "new_design": False,
+                    "scientific_pass": False,
                     "included_in_scientific_effective_counts": False,
                 }
             },
