@@ -522,6 +522,49 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         "actual scientific PASS=0" in value and "actual production PASS=0" in value
         for value in policy["evidence"]
     )
+    drawing = next(
+        item
+        for item in merged["current"]
+        if item["id"] == updater.FINAL_DRAWING_CARD_ID
+    )
+    assert drawing["title"] == (
+        "CODEX | FINAL DRAWING | TEMPLATE AUDIT COMPLETE | MODEL PENDING"
+    )
+    assert drawing["state"] == "in_progress"
+    assert drawing["progress_pct"] == 40
+    assert any(
+        "설계도면260706.pdf pages=9" in value
+        and "설계도면260706.pptx slides=9" in value
+        and "960x540pt / 16:9" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        updater.DRAWING_REFERENCE_PDF_SHA256 in value
+        and "source unchanged=true" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        updater.DRAWING_REFERENCE_PPTX_SHA256 in value
+        and "source unchanged=true" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        "round_corner=True=rounded-rectangle racetrack" in value
+        and "straight spans + concentric corner arcs" in value
+        and "circular coil=false" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        value
+        == "pending: selected final model / view manifest / dimension manifest"
+        for value in drawing["evidence"]
+    )
+    assert any(
+        "final PPTX claimed=false" in value
+        and "final PDF claimed=false" in value
+        and "final deliverable claimed=false" in value
+        for value in drawing["evidence"]
+    )
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 3
     assert sync["running"] == 2
@@ -682,6 +725,26 @@ def test_merge_upserts_missing_official_task_card_before_parallel() -> None:
         "parallel-workstreams"
     )
     updater.validate_status_sync(merged)
+
+
+def test_final_drawing_card_is_unique_and_before_parallel() -> None:
+    merged = updater.merge_status(
+        _status(),
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+    )
+    merged_again = updater.merge_status(
+        merged,
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+    )
+    ids = [item["id"] for item in merged_again["current"]]
+
+    assert ids.count(updater.FINAL_DRAWING_CARD_ID) == 1
+    assert ids.index(updater.FINAL_DRAWING_CARD_ID) < ids.index(
+        "parallel-workstreams"
+    )
+    updater.validate_status_sync(merged_again)
 
 
 def test_merge_removes_stale_automatic_continuation_card_when_disarmed() -> None:

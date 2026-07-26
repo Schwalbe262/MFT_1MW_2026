@@ -392,6 +392,13 @@ FULL_REFERENCE_TASK_ID = 96326
 SELECTION_POLICY_CARD_ID = "codex-symmetric-primary-selection-policy"
 LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
+FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
+DRAWING_REFERENCE_PDF_SHA256 = (
+    "574d9aab033529cf3655d63542e27871c2e240b669b67e54dbfd2495a564437f"
+)
+DRAWING_REFERENCE_PPTX_SHA256 = (
+    "b8069cc99cf1af3c8e5c5cbe6bd4a2896730620f570c29555ff492713d4af33d"
+)
 
 RUNNING_STATES = {"running"}
 QUEUED_STATES = {
@@ -1913,6 +1920,54 @@ def _final_gate_card(root: Path, observed_at: str) -> dict[str, Any]:
     }
 
 
+def _final_drawing_card(observed_at: str) -> dict[str, Any]:
+    return {
+        "id": FINAL_DRAWING_CARD_ID,
+        "title": (
+            "CODEX | FINAL DRAWING | TEMPLATE AUDIT COMPLETE | MODEL PENDING"
+        ),
+        "detail": (
+            "The nine-frame PDF/PPTX drawing template audit is complete and "
+            "source integrity is preserved. The final selected model, exact "
+            "view/dimension manifest, and authored PPTX/PDF remain pending; "
+            "the audit is not a final-deliverable claim."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 40,
+        "evidence": [
+            (
+                "template audit=complete / 설계도면260706.pdf pages=9 / "
+                "설계도면260706.pptx slides=9 / 960x540pt / 16:9"
+            ),
+            (
+                f"source PDF SHA256 {DRAWING_REFERENCE_PDF_SHA256} / "
+                "source unchanged=true (before-after audit)"
+            ),
+            (
+                f"source PPTX SHA256 {DRAWING_REFERENCE_PPTX_SHA256} / "
+                "source unchanged=true (before-after audit)"
+            ),
+            (
+                "round_corner=True=rounded-rectangle racetrack / "
+                "straight spans + concentric corner arcs / circular coil=false"
+            ),
+            (
+                "pending: selected final model / view manifest / "
+                "dimension manifest"
+            ),
+            (
+                "final PPTX claimed=false / final PDF claimed=false / "
+                "final deliverable claimed=false"
+            ),
+            (
+                "audit root=C:\\Users\\peets\\slurm_scheduler_runtime\\"
+                "mft_goal_20260726\\drawing_reference_audit_v1"
+            ),
+        ],
+    }
+
+
 def _counter(pattern: re.Pattern[str], title: str, label: str) -> int:
     values = {int(value) for value in pattern.findall(title)}
     if len(values) != 1:
@@ -2123,6 +2178,7 @@ def merge_status(
             result,
             _final_gate_card(final_gate_root, observed_at),
         )
+    _upsert_current_card(result, _final_drawing_card(observed_at))
 
     handoff = _single_current(result, "fea-handoff")
     previous_title = str(handoff.get("title") or "")
