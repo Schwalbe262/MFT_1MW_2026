@@ -1635,29 +1635,131 @@ def _grid_artifact_inventory(
 
 
 def generate_and_attest_repaired_mesh(
+    sim: Any,
     ipk: Any,
     results_path: Path,
 ) -> dict[str, Any]:
-    """Require one fresh native mesh after the symmetry-envelope mutation."""
+    """Require one completed, fresh native mesh after the envelope mutation."""
 
-    before = _grid_artifact_inventory(results_path, allow_empty=True)
+    from module.thermal_260706 import (
+        _attest_standalone_mesh_desktop,
+        _snapshot_thermal_mesh_artifacts,
+        _thermal_desktop_handle,
+        _thermal_monitor_roots,
+        _wait_for_standalone_mesh_idle,
+    )
+
+    results_root = results_path.resolve(strict=True)
+    native_results_value = str(
+        getattr(ipk, "results_directory", "") or ""
+    ).strip()
+    if not native_results_value:
+        raise ContinuationError(
+            "native Icepak results directory is unavailable"
+        )
+    native_results_root = Path(native_results_value).resolve(strict=True)
+    if native_results_root != results_root:
+        raise ContinuationError(
+            "native Icepak results directory drifted from the cloned project: "
+            f"{native_results_root} != {results_root}"
+        )
+    observed_roots = tuple(
+        Path(value).resolve(strict=False)
+        for value in _thermal_monitor_roots(sim, ipk)
+    )
+    if results_root not in observed_roots:
+        raise ContinuationError(
+            "cloned Icepak results directory is absent from native artifact "
+            f"roots: {observed_roots!r}"
+        )
+
+    before = _snapshot_thermal_mesh_artifacts(sim, ipk)
+    desktop = _thermal_desktop_handle(sim, ipk)
+    if _attest_standalone_mesh_desktop(sim, ipk, desktop) is not False:
+        raise ContinuationError(
+            "native Icepak Desktop was not idle before repaired-mesh dispatch"
+        )
     generator = getattr(getattr(ipk, "mesh", None), "generate_mesh", None)
     if not callable(generator):
         raise ContinuationError(
             "native Icepak repaired-mesh generation API is unavailable"
         )
     started = time.monotonic()
-    returned = generator(THERMAL_SETUP)
+    returned = None
+    generation_error = ""
+    sim.solver_may_be_running = True
+    try:
+        returned = generator(THERMAL_SETUP)
+    except Exception as exc:
+        generation_error = f"{type(exc).__name__}: {str(exc)[:512]}"
+    idle_barrier = _wait_for_standalone_mesh_idle(
+        sim,
+        ipk,
+        desktop,
+        before,
+        require_fresh_artifact=(
+            returned is True and not generation_error
+        ),
+    )
+    if (
+        idle_barrier.get("schema") != "thermal-mesh-idle-barrier-v1"
+        or idle_barrier.get("passed") is not True
+    ):
+        raise ContinuationError(
+            "native repaired-mesh completion remains uncertain: "
+            + json.dumps(
+                idle_barrier,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )[:4000]
+        )
+    sim.solver_may_be_running = False
     elapsed = time.monotonic() - started
+    if generation_error:
+        raise ContinuationError(
+            "native repaired-mesh generation raised after safe idle: "
+            + generation_error
+        )
     if returned is not True:
         raise ContinuationError(
             "native repaired-mesh generation did not return exact True"
         )
+
+    fresh_pairs = list(idle_barrier.get("fresh_mesh_artifacts", ()))
+    if not fresh_pairs:
+        raise ContinuationError(
+            "native repaired mesh completion had no fresh artifact pair"
+        )
     after = _grid_artifact_inventory(results_path)
-    fresh = [
-        path for path, identity in after.items()
-        if before.get(path) != identity
-    ]
+    fresh_directories = set()
+    for item in fresh_pairs:
+        if not isinstance(item, Mapping):
+            raise ContinuationError(
+                "native repaired mesh barrier returned malformed artifacts"
+            )
+        directory = Path(str(item.get("directory") or "")).resolve(
+            strict=True
+        )
+        try:
+            relative = directory.relative_to(results_root).as_posix()
+        except ValueError as exc:
+            raise ContinuationError(
+                "fresh repaired mesh artifact escaped cloned results root"
+            ) from exc
+        fresh_directories.add(relative)
+    fresh = []
+    for directory in sorted(fresh_directories):
+        pair = (
+            f"{directory}/grid_mapping",
+            f"{directory}/grid_output",
+        )
+        if any(path not in after for path in pair):
+            raise ContinuationError(
+                "native repaired mesh barrier artifact pair vanished before "
+                f"exact inventory: {directory}"
+            )
+        fresh.extend(pair)
     fresh_mapping = [
         path for path in fresh if path.endswith("/grid_mapping")
     ]
@@ -1669,19 +1771,23 @@ def generate_and_attest_repaired_mesh(
             "native repaired mesh produced no fresh mapping/output pair"
         )
     return {
-        "schema": "mft-corrected-thermal-repaired-native-mesh-v1",
+        "schema": "mft-corrected-thermal-repaired-native-mesh-v2",
         "passed": True,
         "setup": THERMAL_SETUP,
         "generate_mesh_returned_exact_true": True,
         "elapsed_seconds": elapsed,
-        "before_artifact_count": len(before),
+        "before_complete_pair_count": len(before),
         "after_artifact_count": len(after),
         "fresh_artifact_count": len(fresh),
+        "fresh_complete_pair_count": len(fresh_pairs),
         "fresh_grid_mapping_paths": fresh_mapping,
         "fresh_grid_output_paths": fresh_output,
         "fresh_artifacts": {
             path: after[path] for path in fresh
         },
+        "native_results_root": str(native_results_root),
+        "artifact_roots": [str(value) for value in observed_roots],
+        "standalone_idle_barrier": idle_barrier,
         "saved_premesh_reused": False,
     }
 
@@ -2979,7 +3085,7 @@ def execute_checkpoint(
                 "source checkpoint changed after native symmetry repair"
             )
         repaired_mesh = generate_and_attest_repaired_mesh(
-            ipk, Path(clone["results_path"])
+            sim, ipk, Path(clone["results_path"])
         )
         receipt["repaired_mesh_preflight"] = repaired_mesh
         sim.thermal_mesh_preflight = {
@@ -3166,7 +3272,10 @@ def execute_checkpoint(
         _atomic_json(receipt_path, receipt)
         raise
     finally:
-        if desktop is not None:
+        if (
+            desktop is not None
+            and not bool(getattr(sim, "solver_may_be_running", False))
+        ):
             try:
                 desktop.release_desktop(
                     close_projects=True, close_on_exit=True

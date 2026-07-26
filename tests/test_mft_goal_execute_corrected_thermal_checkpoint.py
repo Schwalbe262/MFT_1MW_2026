@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -56,6 +56,153 @@ def _wcp_aedt_bytes() -> bytes:
             )
         )
     return ("\n".join(blocks) + "\n").encode("ascii")
+
+
+def _install_fake_mesh_barrier_module(
+    monkeypatch: pytest.MonkeyPatch,
+    **values,
+) -> ModuleType:
+    thermal = ModuleType("module.thermal_260706")
+    for name, value in values.items():
+        setattr(thermal, name, value)
+    monkeypatch.setitem(sys.modules, "module.thermal_260706", thermal)
+    return thermal
+
+
+def test_repaired_mesh_waits_for_existing_native_idle_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = tmp_path / "simulation.aedtresults"
+    results.mkdir()
+    calls = []
+    desktop = object()
+    sim = SimpleNamespace(solver_may_be_running=False)
+
+    def generate_mesh(name):
+        calls.append(("generate", name, sim.solver_may_be_running))
+        return True
+
+    ipk = SimpleNamespace(
+        results_directory=str(results),
+        mesh=SimpleNamespace(generate_mesh=generate_mesh),
+    )
+
+    def wait_for_idle(
+        actual_sim,
+        actual_ipk,
+        actual_desktop,
+        snapshot,
+        *,
+        require_fresh_artifact,
+    ):
+        calls.append(
+            (
+                "wait",
+                actual_sim is sim,
+                actual_ipk is ipk,
+                actual_desktop is desktop,
+                snapshot,
+                require_fresh_artifact,
+                sim.solver_may_be_running,
+            )
+        )
+        mesh_dir = (
+            results
+            / "icepak_thermal.results"
+            / "DV274_Meshes0_V1.sd"
+        )
+        mesh_dir.mkdir(parents=True)
+        (mesh_dir / "grid_mapping").write_bytes(b"mapping")
+        (mesh_dir / "grid_output").write_bytes(b"output")
+        return {
+            "schema": "thermal-mesh-idle-barrier-v1",
+            "passed": True,
+            "fresh_mesh_artifacts": [
+                {"directory": str(mesh_dir), "name": mesh_dir.name}
+            ],
+        }
+
+    _install_fake_mesh_barrier_module(
+        monkeypatch,
+        _attest_standalone_mesh_desktop=lambda *args: False,
+        _snapshot_thermal_mesh_artifacts=lambda *args: {},
+        _thermal_desktop_handle=lambda *args: desktop,
+        _thermal_monitor_roots=lambda *args: [results],
+        _wait_for_standalone_mesh_idle=wait_for_idle,
+    )
+
+    evidence = executor.generate_and_attest_repaired_mesh(
+        sim, ipk, results
+    )
+
+    assert calls[0] == ("generate", executor.THERMAL_SETUP, True)
+    assert calls[1] == (
+        "wait",
+        True,
+        True,
+        True,
+        {},
+        True,
+        True,
+    )
+    assert sim.solver_may_be_running is False
+    assert evidence["schema"] == (
+        "mft-corrected-thermal-repaired-native-mesh-v2"
+    )
+    assert evidence["fresh_complete_pair_count"] == 1
+    assert evidence["fresh_artifact_count"] == 2
+    assert len(evidence["fresh_grid_mapping_paths"]) == 1
+    assert len(evidence["fresh_grid_output_paths"]) == 1
+    assert evidence["standalone_idle_barrier"]["passed"] is True
+
+
+def test_repaired_mesh_fails_closed_when_idle_barrier_is_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = tmp_path / "simulation.aedtresults"
+    results.mkdir()
+    sim = SimpleNamespace(solver_may_be_running=False)
+    ipk = SimpleNamespace(
+        results_directory=str(results),
+        mesh=SimpleNamespace(generate_mesh=lambda _name: True),
+    )
+    _install_fake_mesh_barrier_module(
+        monkeypatch,
+        _attest_standalone_mesh_desktop=lambda *args: False,
+        _snapshot_thermal_mesh_artifacts=lambda *args: {},
+        _thermal_desktop_handle=lambda *args: object(),
+        _thermal_monitor_roots=lambda *args: [results],
+        _wait_for_standalone_mesh_idle=lambda *args, **kwargs: {
+            "schema": "thermal-mesh-idle-barrier-v1",
+            "passed": False,
+            "fresh_mesh_artifacts": [],
+        },
+    )
+    monkeypatch.setattr(
+        executor,
+        "_grid_artifact_inventory",
+        lambda *args, **kwargs: pytest.fail(
+            "post-mesh inventory ran before the idle barrier passed"
+        ),
+    )
+
+    with pytest.raises(
+        executor.ContinuationError,
+        match="completion remains uncertain",
+    ):
+        executor.generate_and_attest_repaired_mesh(sim, ipk, results)
+
+    assert sim.solver_may_be_running is True
+
+
+def test_executor_finally_preserves_uncertain_native_mesh_containment() -> None:
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert (
+        'not bool(getattr(sim, "solver_may_be_running", False))'
+        in source
+    )
 
 
 def _file_entry(root: Path, path: Path) -> dict:
