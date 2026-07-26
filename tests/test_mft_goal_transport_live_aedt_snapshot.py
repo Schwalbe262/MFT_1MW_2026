@@ -100,14 +100,15 @@ def test_transport_round_trips_and_is_idempotent(tmp_path: Path) -> None:
 
     assert first["status"] == "published"
     assert second["status"] == "existing_authenticated"
+    transport_root = root.parent / f"{root.name}-transport-v1"
     receipt = json.loads(
-        (root / "transport" / "transport_receipt.json").read_text(
+        (transport_root / "transport_receipt.json").read_text(
             encoding="utf-8"
         )
     )
     rebuilt = b"".join(
         base64.b64decode(
-            (root / "transport" / row["filename"]).read_bytes(),
+            (transport_root / row["filename"]).read_bytes(),
             validate=True,
         )
         for row in receipt["chunks"]

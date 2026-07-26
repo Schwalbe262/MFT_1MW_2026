@@ -217,6 +217,22 @@ def _validate_existing(
     }
 
 
+def _transport_destination(
+    snapshot_directory: Path,
+    *,
+    expected_uid: int,
+) -> Path:
+    parent = snapshot_directory.parent
+    metadata = parent.lstat()
+    if (
+        parent.is_symlink()
+        or not parent.is_dir()
+        or metadata.st_uid != expected_uid
+    ):
+        raise TransportError("snapshot transport parent metadata is unsafe")
+    return parent / f"{snapshot_directory.name}-transport-v1"
+
+
 def transport_snapshot(
     *,
     snapshot_relative_directory: str,
@@ -270,7 +286,10 @@ def transport_snapshot(
         artifact_size_bytes=size,
         expected_uid=uid,
     )
-    transport = directory / "transport"
+    transport = _transport_destination(
+        directory,
+        expected_uid=uid,
+    )
     expected = {
         "diagnostic_only": True,
         "canonical": False,
@@ -291,7 +310,7 @@ def transport_snapshot(
             transport, expected=expected, expected_uid=uid
         )
 
-    staging = directory / f".transport.tmp-t{task_id}"
+    staging = transport.parent / f".{transport.name}.tmp-t{task_id}"
     staging.mkdir(mode=0o700)
     rows: list[dict[str, Any]] = []
     digest = hashlib.sha256()
@@ -349,7 +368,7 @@ def transport_snapshot(
         os.chmod(staging, 0o500)
         os.replace(staging, transport)
         if os.name == "posix":
-            handle = os.open(directory, os.O_RDONLY)
+            handle = os.open(transport.parent, os.O_RDONLY)
             try:
                 os.fsync(handle)
             finally:
