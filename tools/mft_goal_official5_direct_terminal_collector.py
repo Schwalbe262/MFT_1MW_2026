@@ -30,7 +30,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from module.mft_goal_20260726_contract import (  # noqa: E402
-    CORE_TEMPERATURE_TARGETS,
     GOAL_RESONANCE_MIN_HZ,
     GOAL_SIZE_LIMITS_MM,
     GOAL_STAGE_SPEC_SHA256,
@@ -38,7 +37,6 @@ from module.mft_goal_20260726_contract import (  # noqa: E402
     TEMPERATURE_FAMILY_LIMITS_C,
     TEMPERATURE_TARGET_FAMILIES,
     TEMPERATURE_TARGET_LIMITS_C,
-    WINDING_TEMPERATURE_TARGETS,
     attest_fixed_identity,
 )
 from tools import mft_goal_postdeadline_standard_collector as base  # noqa: E402
