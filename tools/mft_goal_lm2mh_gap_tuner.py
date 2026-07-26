@@ -57,6 +57,9 @@ NEIGHBORHOOD_CAMPAIGN_ID = (
     "mft-goal-rank1-neighborhood-2b213-physical-gap-tuning-v1"
 )
 TARGETED_BATCH_SCHEMA = "mft-goal-targeted-symmetric-fea-batch-plan-v1"
+TARGETED_COLLECTION_SCHEMA = (
+    "mft-goal-targeted-symmetric-fea-collection-v1"
+)
 EXPECTED_NEIGHBORHOOD_GEOMETRY_SHA256 = (
     "2b2138a99445c4ed7d50db5b07f7617789a6ff7af735a85fd7038fd1ab266d60"
 )
@@ -795,6 +798,147 @@ def prepare_neighborhood(
         source_classification=(
             "current_rank1_neighborhood_leader_physical_gap_tuning"
         ),
+    )
+
+
+def prepare_authenticated_thermal_pass(
+    *,
+    batch_plan_path: Path,
+    collection_path: Path,
+    source_rank: int,
+    output: Path,
+    scheduler_priority: int = 100,
+) -> Path:
+    """Prepare exact gap tuning from one authenticated partial-batch PASS."""
+    # Import lazily to avoid coupling the original rank-1 tuning path to the
+    # targeted collector during normal use.
+    from tools import mft_goal_targeted_symmetric_fea_batch as targeted
+
+    plan, batch_root, _profile = targeted._load_plan(  # noqa: SLF001
+        batch_plan_path
+    )
+    collection = targeted._validate_seal(  # noqa: SLF001
+        targeted._read_json(collection_path.resolve(strict=True)),  # noqa: SLF001
+        TARGETED_COLLECTION_SCHEMA,
+    )
+    if (
+        collection.get("plan_payload_sha256") != plan["payload_sha256"]
+        or collection.get("rounded_FEA_used") is not False
+        or collection.get("physical_air_gap_attestation_pending") is not True
+        or collection.get("final_design_pass_count") != 0
+    ):
+        raise GapTuningError(
+            "targeted thermal collection authority drifted"
+        )
+    if (
+        isinstance(source_rank, bool)
+        or not isinstance(source_rank, int)
+        or source_rank <= 0
+    ):
+        raise GapTuningError("source rank must be a positive integer")
+    lanes = {
+        int(lane["rank"]): lane for lane in plan.get("lanes") or []
+    }
+    rows = {
+        int(row["rank"]): row for row in collection.get("rows") or []
+    }
+    lane = lanes.get(source_rank)
+    row = rows.get(source_rank)
+    if lane is None or row is None:
+        raise GapTuningError("source rank is absent from plan or collection")
+    if (
+        row.get("result_available") is not True
+        or row.get("result_contract_valid") is not True
+        or row.get("thermal_pass") is not True
+        or row.get("size_pass") is not True
+        or row.get("final_design_pass") is not False
+        or int(row.get("task_id") or 0) <= 0
+        or row.get("physical_geometry_sha256")
+        != lane["candidate"]["physical_geometry_sha256"]
+    ):
+        raise GapTuningError(
+            "exact authenticated split-temperature PASS is required"
+        )
+    temperatures = {
+        "primary_winding_max_C": _finite(
+            row.get("measured_primary_winding_max_C"),
+            "primary winding maximum",
+        ),
+        "secondary_winding_max_C": _finite(
+            row.get("measured_secondary_winding_max_C"),
+            "secondary winding maximum",
+        ),
+        "core_max_C": _finite(row.get("measured_core_max_C"), "core maximum"),
+    }
+    if (
+        temperatures["primary_winding_max_C"] > 100.0
+        or temperatures["secondary_winding_max_C"] > 120.0
+        or temperatures["core_max_C"] > 120.0
+    ):
+        raise GapTuningError("split-temperature limits are not satisfied")
+    params_path = (
+        batch_root / lane["params"]["path"]
+    ).resolve(strict=True)
+    params = targeted._read_json(params_path)  # noqa: SLF001
+    if (
+        targeted._sha(params) != lane["params_sha256"]  # noqa: SLF001
+        or float(params["fan_velocity"]) != 1.5
+        or str(params["fan_config"]) != "dual"
+        or float(params["core_plate_pad_t"]) != 2.0
+        or float(params["wcp_pad_t"]) != 2.0
+        or float(params["k_ins"]) != 0.2
+        or int(params["full_model"]) != 0
+        or int(params["round_corner"]) != 0
+        or float(params["cw1"]) != 5.0
+        or float(params["gap1"]) != 1.6
+    ):
+        raise GapTuningError(
+            "candidate geometry/cooling/TIM contract drifted"
+        )
+    n1 = int(params["N1_main"]) + int(params.get("N1_side") or 0)
+    n2 = int(params["N2_main"]) + int(params.get("N2_side") or 0)
+    candidate = {
+        "source_kind": (
+            "authenticated_n1_6_targeted_symmetric_split_temperature_pass"
+        ),
+        "source_batch_rank": source_rank,
+        "source_scheduler_task_id": int(row["task_id"]),
+        "physical_geometry_sha256": lane["candidate"][
+            "physical_geometry_sha256"
+        ],
+        "raw_row_sha256": lane["candidate"].get("raw_row_sha256"),
+        "selection_role": lane.get("selection_role"),
+        "turns": {"N1": n1, "N2": n2},
+        "dimensions_mm": copy.deepcopy(row["dimensions_mm"]),
+        "authenticated_temperatures_C": temperatures,
+        "authenticated_result_sha256": row["result_sha256"],
+        "legacy_cap_fixed_lm2mh_replay": copy.deepcopy(
+            row.get("measured_fixed_lm2mh")
+        ),
+        "corrected_transfer_fixed_lm2mh_replay": copy.deepcopy(
+            row.get("corrected_transfer_fixed_lm2mh_replay")
+        ),
+        "base_params": params,
+        "base_params_sha256": _sha(params),
+        "authority": {
+            "batch_plan": _file_record(batch_plan_path),
+            "batch_plan_payload_sha256": plan["payload_sha256"],
+            "collection": _file_record(collection_path),
+            "collection_payload_sha256": collection["payload_sha256"],
+            "params": _file_record(params_path),
+        },
+    }
+    return _prepare_candidate(
+        candidate=candidate,
+        output=output,
+        solver_revision=plan["solver_revision"],
+        library_revision=plan["library_revision"],
+        campaign_id=NEIGHBORHOOD_CAMPAIGN_ID,
+        source_classification=(
+            "authenticated_partial_batch_split_temperature_PASS; "
+            "physical_gap_and_actual_turn_graded_cap_pending"
+        ),
+        scheduler_priority=scheduler_priority,
     )
 
 
@@ -1691,6 +1835,17 @@ def _parser() -> argparse.ArgumentParser:
     neighborhood_cmd.add_argument("--solver-revision", required=True)
     neighborhood_cmd.add_argument("--library-revision", required=True)
 
+    thermal_pass_cmd = commands.add_parser("prepare-thermal-pass")
+    thermal_pass_cmd.add_argument(
+        "--batch-plan", type=Path, required=True
+    )
+    thermal_pass_cmd.add_argument(
+        "--collection", type=Path, required=True
+    )
+    thermal_pass_cmd.add_argument("--source-rank", type=int, required=True)
+    thermal_pass_cmd.add_argument("--output", type=Path, required=True)
+    thermal_pass_cmd.add_argument("--priority", type=int, default=100)
+
     submit_cmd = commands.add_parser("submit")
     submit_cmd.add_argument("--campaign", type=Path, required=True)
     submit_cmd.add_argument("--round", dest="round_path", type=Path, required=True)
@@ -1734,6 +1889,14 @@ def main() -> int:
             solver_revision=args.solver_revision,
             library_revision=args.library_revision,
             expected_geometry_sha256=args.expected_geometry_sha256,
+        )
+    elif args.command == "prepare-thermal-pass":
+        result = prepare_authenticated_thermal_pass(
+            batch_plan_path=args.batch_plan,
+            collection_path=args.collection,
+            source_rank=args.source_rank,
+            output=args.output,
+            scheduler_priority=args.priority,
         )
     elif args.command == "submit":
         result = submit(
