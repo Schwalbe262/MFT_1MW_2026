@@ -672,6 +672,64 @@ def test_exact_n1_6_gui_fea_card_preserves_truth_boundary(
     )
 
 
+def test_lastmile_card_reports_parallel_submission_without_production_pass(
+) -> None:
+    tasks = {}
+    for spec in updater.LASTMILE_TASK_SPECS:
+        attaching = spec.rank <= 6
+        raw = {
+            "id": spec.task_id,
+            "task_id": spec.task_id,
+            "name": spec.task_name,
+            "dedupe_key": spec.dedupe_key,
+            "project": "MFT_1MW_2026v1",
+            "priority": updater.LASTMILE_PRIORITY,
+            "cpus": updater.LASTMILE_CPUS,
+            "memory_mb": updater.LASTMILE_MEMORY_MB,
+            "timeout_seconds": updater.LASTMILE_TIMEOUT_SECONDS,
+            "max_workers_per_node": 1,
+            "aedt_backend": "standalone",
+            "scheduling_profile": "fea_bursty",
+            "state": "attaching" if attaching else "queued",
+            "status": "attaching" if attaching else "queued",
+            "allocation_id": 14710 if attaching else None,
+            "slurm_job_id": "843930" if attaching else "",
+            "actual_node_name": "n107" if attaching else "",
+            "placement_contract_satisfied": False,
+            "created_at": "2026-07-26 22:23:00",
+            "started_at": None,
+            "finished_at": None,
+            "exit_code": None,
+            "failure_message": "",
+        }
+        tasks[spec.task_id] = updater._validate_lastmile_task(spec, raw)
+
+    card = updater._lastmile_acquisition_card(
+        tasks,
+        {"receipt": {"payload_sha256": updater.LASTMILE_RECEIPT_PAYLOAD_SHA256}},
+        OBSERVED,
+    )
+
+    assert card["id"] == updater.LASTMILE_ACQUISITION_CARD_ID
+    assert len(card["title"]) <= 160
+    assert "8/8 SUBMITTED" in card["title"]
+    assert "RUN0 ATTACH6 QUEUE2 OK0 FAIL0" in card["title"]
+    assert "ACQUISITION-ONLY" in card["title"]
+    assert any(
+        "tasks=97033-97040" in value
+        and "total=64CPU+512GiB" in value
+        and "active nodes=n107" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "automatic_submission_recommended=false" in value
+        and "production_eligible=false" in value
+        and "actual scientific PASS=false" in value
+        and "actual production PASS=false" in value
+        for value in card["evidence"]
+    )
+
+
 def test_final528_card_keeps_empty_production_front_separate_from_diagnostics(
 ) -> None:
     collector = {

@@ -130,6 +130,15 @@ class AuxiliaryTaskSpec:
     primary_turns: int | None = None
 
 
+@dataclass(frozen=True)
+class LastmileTaskSpec:
+    task_id: int
+    rank: int
+    task_name: str
+    dedupe_key: str
+    physical_geometry_sha256: str
+
+
 TASK_SPECS = (
     TaskSpec(
         task_id=96324,
@@ -569,6 +578,120 @@ AUTHORITATIVE_AUXILIARY_TASK_SPECS = (
     *FRESH_SPLITTEMP_TASK_SPECS,
     FINAL_SYMMETRIC_RETRY_TASK_SPEC,
 )
+LASTMILE_TASK_SPECS = (
+    LastmileTaskSpec(
+        task_id=97_033,
+        rank=1,
+        task_name="mft-goal-txlast-r01-d03866b78823",
+        dedupe_key=(
+            "mft-al:mft-goal-txlast-r01-d03866b78823:"
+            "fdd2f268fa64ce39494f8d647f4162e4009a58e1:"
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+            "fe4f474407b07bcc"
+        ),
+        physical_geometry_sha256=(
+            "d03866b788234d060b504a94e7a5956958956636cc789ef853b1e6ebdfd75db8"
+        ),
+    ),
+    LastmileTaskSpec(
+        task_id=97_034,
+        rank=2,
+        task_name="mft-goal-txlast-r02-0fbcc8e73970",
+        dedupe_key=(
+            "mft-al:mft-goal-txlast-r02-0fbcc8e73970:"
+            "fdd2f268fa64ce39494f8d647f4162e4009a58e1:"
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+            "d0692e4c171ee82b"
+        ),
+        physical_geometry_sha256=(
+            "0fbcc8e739704a24a311ccb35a28934de56a10d3e6cac04ded2ef7fa8dba63ab"
+        ),
+    ),
+    LastmileTaskSpec(
+        task_id=97_035,
+        rank=3,
+        task_name="mft-goal-txlast-r03-690ef78d4c97",
+        dedupe_key=(
+            "mft-al:mft-goal-txlast-r03-690ef78d4c97:"
+            "fdd2f268fa64ce39494f8d647f4162e4009a58e1:"
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+            "292c76c4b94d17e4"
+        ),
+        physical_geometry_sha256=(
+            "690ef78d4c97efed43dd1214d5627055e1d45f0545a4c03eff0800ec22ebe925"
+        ),
+    ),
+    LastmileTaskSpec(
+        task_id=97_036,
+        rank=4,
+        task_name="mft-goal-txlast-r04-26033d7b5cf9",
+        dedupe_key=(
+            "mft-al:mft-goal-txlast-r04-26033d7b5cf9:"
+            "fdd2f268fa64ce39494f8d647f4162e4009a58e1:"
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+            "a3a9d677359b69f3"
+        ),
+        physical_geometry_sha256=(
+            "26033d7b5cf9743d1ff2f2bb35617c3f18df3060422a33780e2072ed859db9de"
+        ),
+    ),
+    LastmileTaskSpec(
+        task_id=97_037,
+        rank=5,
+        task_name="mft-goal-txlast-r05-b31c08a13f3a",
+        dedupe_key=(
+            "mft-al:mft-goal-txlast-r05-b31c08a13f3a:"
+            "fdd2f268fa64ce39494f8d647f4162e4009a58e1:"
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+            "3eb61f32a4553e4e"
+        ),
+        physical_geometry_sha256=(
+            "b31c08a13f3a4812af0b3839292e9363e706423cebdf888ecd228f520e570bd8"
+        ),
+    ),
+    LastmileTaskSpec(
+        task_id=97_038,
+        rank=6,
+        task_name="mft-goal-txlast-r06-db7c5d4e8be2",
+        dedupe_key=(
+            "mft-al:mft-goal-txlast-r06-db7c5d4e8be2:"
+            "fdd2f268fa64ce39494f8d647f4162e4009a58e1:"
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+            "65957b93c69a92f0"
+        ),
+        physical_geometry_sha256=(
+            "db7c5d4e8be2a3aa33b7bee4ebcdccd712e26027cc614e6172cf92a7ed679863"
+        ),
+    ),
+    LastmileTaskSpec(
+        task_id=97_039,
+        rank=7,
+        task_name="mft-goal-txlast-r07-936854df051b",
+        dedupe_key=(
+            "mft-al:mft-goal-txlast-r07-936854df051b:"
+            "fdd2f268fa64ce39494f8d647f4162e4009a58e1:"
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+            "44ac16b5943efe72"
+        ),
+        physical_geometry_sha256=(
+            "936854df051b72b6023cf63f45f83aa225fb7fb501f6bb4c3a66248d8cc93c6b"
+        ),
+    ),
+    LastmileTaskSpec(
+        task_id=97_040,
+        rank=8,
+        task_name="mft-goal-txlast-r08-5e64db5d7be5",
+        dedupe_key=(
+            "mft-al:mft-goal-txlast-r08-5e64db5d7be5:"
+            "fdd2f268fa64ce39494f8d647f4162e4009a58e1:"
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+            "ed9c138f8eb4a09c"
+        ),
+        physical_geometry_sha256=(
+            "5e64db5d7be5249051e733f96cf436f9e7b7685f85f0d62ef13e0b5ca2d329d5"
+        ),
+    ),
+)
 
 LEGACY_STANDARD_SELECTION_TASK_IDS = (
     96325,
@@ -605,6 +728,29 @@ AXIS_V6_CARD_ID = "codex-axis-v6-fixed-5t-nsga"
 TARGET_AXIS_CARD_ID = "codex-target-axis-1200x1000-nsga"
 REFERENCE_BASELINE_CARD_ID = "codex-reference-drawing-baseline"
 EXACT_N1_6_GUI_FEA_CARD_ID = "codex-exact-n1-6-gui-fea"
+LASTMILE_ACQUISITION_CARD_ID = "codex-primary-temperature-lastmile-p90"
+LASTMILE_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\n1_6_primary_temperature_lastmile_v2"
+)
+LASTMILE_PLAN_SCHEMA = "mft-goal-targeted-symmetric-fea-batch-plan-v1"
+LASTMILE_RECEIPT_SCHEMA = "mft-goal-targeted-symmetric-fea-submission-v1"
+LASTMILE_PLAN_FILE_SHA256 = (
+    "b5864f7fa96a3e4c8d3b0663332c5e8e1f3bdd0c49d6399e885a91055595407b"
+)
+LASTMILE_PLAN_PAYLOAD_SHA256 = (
+    "25a71a6f5ef49c43acd3c0031485f1a6ac61f2f7f413f7754f15789747ad943a"
+)
+LASTMILE_RECEIPT_FILE_SHA256 = (
+    "8cdce0f5f63fb1b600d488bad3aa1b1ca0d0e42ae1484d0c9a653cc4bc90318f"
+)
+LASTMILE_RECEIPT_PAYLOAD_SHA256 = (
+    "a3338c7b3e62a59a1e43861be3755a4d59bba3c2f4e29ad95c01baa8cb6b4d82"
+)
+LASTMILE_PRIORITY = 90
+LASTMILE_CPUS = 8
+LASTMILE_MEMORY_MB = 65_536
+LASTMILE_TIMEOUT_SECONDS = 14_400
 EXACT_N1_6_GUI_SEED = 2_707_277_137
 EXACT_N1_6_GUI_GEOMETRY_SHA256 = (
     "e5b4c3b73869c5af75b254fb0486acae121bb27d1e905fd5a0fb3d146332c2be"
@@ -1088,6 +1234,89 @@ def fetch_authoritative_auxiliary_tasks(
     return {
         spec.task_id: _validate_auxiliary_task(spec, raw[spec.task_id])
         for spec in AUTHORITATIVE_AUXILIARY_TASK_SPECS
+    }
+
+
+def _validate_lastmile_task(
+    spec: LastmileTaskSpec,
+    task: Mapping[str, Any],
+) -> dict[str, Any]:
+    identifiers = {
+        int(value)
+        for key in ("id", "task_id")
+        if (value := task.get(key)) not in (None, "")
+    }
+    if identifiers != {spec.task_id}:
+        raise UpdaterError(f"lastmile task{spec.task_id} identity drifted")
+    expected = {
+        "name": spec.task_name,
+        "dedupe_key": spec.dedupe_key,
+        "project": "MFT_1MW_2026v1",
+        "priority": LASTMILE_PRIORITY,
+        "cpus": LASTMILE_CPUS,
+        "memory_mb": LASTMILE_MEMORY_MB,
+        "timeout_seconds": LASTMILE_TIMEOUT_SECONDS,
+        "max_workers_per_node": 1,
+        "aedt_backend": "standalone",
+        "scheduling_profile": "fea_bursty",
+    }
+    for key, value in expected.items():
+        if task.get(key) != value:
+            raise UpdaterError(
+                f"lastmile task{spec.task_id} {key} drifted"
+            )
+    state = _task_state(task)
+    actual_node = str(
+        task.get("actual_node_name") or task.get("allocation_node_name") or ""
+    )
+    if state in RUNNING_STATES and (
+        not actual_node or task.get("placement_contract_satisfied") is not True
+    ):
+        raise UpdaterError(
+            f"lastmile task{spec.task_id} running placement is not satisfied"
+        )
+    return {
+        "task_id": spec.task_id,
+        "rank": spec.rank,
+        "name": spec.task_name,
+        "dedupe_key": spec.dedupe_key,
+        "physical_geometry_sha256": spec.physical_geometry_sha256,
+        "state": state,
+        "allocation_id": _positive_or_none(
+            task.get("allocation_id"), "allocation_id"
+        ),
+        "slurm_job_id": str(task.get("slurm_job_id") or ""),
+        "actual_node_name": actual_node,
+        "placement_contract_satisfied": task.get(
+            "placement_contract_satisfied"
+        ),
+        "created_at": task.get("created_at"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "exit_code": task.get("exit_code"),
+        "failure_message": str(task.get("failure_message") or "")[:350],
+        "priority": LASTMILE_PRIORITY,
+        "cpus": LASTMILE_CPUS,
+        "memory_mb": LASTMILE_MEMORY_MB,
+        "timeout_seconds": LASTMILE_TIMEOUT_SECONDS,
+    }
+
+
+def fetch_lastmile_tasks(
+    scheduler_url: str,
+    *,
+    task_reader: TaskReader | None = None,
+) -> dict[int, dict[str, Any]]:
+    reader = task_reader or _get_scheduler_task
+    with ThreadPoolExecutor(max_workers=len(LASTMILE_TASK_SPECS)) as executor:
+        futures = {
+            spec.task_id: executor.submit(reader, scheduler_url, spec.task_id)
+            for spec in LASTMILE_TASK_SPECS
+        }
+        raw = {task_id: future.result() for task_id, future in futures.items()}
+    return {
+        spec.task_id: _validate_lastmile_task(spec, raw[spec.task_id])
+        for spec in LASTMILE_TASK_SPECS
     }
 
 
@@ -1633,6 +1862,111 @@ def _read_sealed_local_json(
     if value.get(schema_field) != schema or observed != expected:
         raise UpdaterError(f"automation state seal drifted: {resolved}")
     return value
+
+
+def _lastmile_submission_state(
+    root: Path = LASTMILE_ROOT,
+) -> dict[str, Any] | None:
+    resolved = root.resolve()
+    plan_path = resolved / "batch_plan.json"
+    receipt_path = resolved / "submission_receipt.json"
+    if not plan_path.is_file() and not receipt_path.is_file():
+        return None
+    if not plan_path.is_file() or not receipt_path.is_file():
+        raise UpdaterError("lastmile submission artifacts are incomplete")
+    if (
+        _file_sha256(plan_path) != LASTMILE_PLAN_FILE_SHA256
+        or _file_sha256(receipt_path) != LASTMILE_RECEIPT_FILE_SHA256
+    ):
+        raise UpdaterError("lastmile submission artifact bytes drifted")
+    plan = _read_sealed_local_json(plan_path, schema=LASTMILE_PLAN_SCHEMA)
+    receipt = _read_sealed_local_json(
+        receipt_path, schema=LASTMILE_RECEIPT_SCHEMA
+    )
+    if (
+        plan.get("payload_sha256") != LASTMILE_PLAN_PAYLOAD_SHA256
+        or plan.get("scheduler_priority") != LASTMILE_PRIORITY
+        or plan.get("submission_ready") is not True
+        or plan.get("explicit_apply_required") is not True
+        or plan.get("automatic_submission_enabled") is not False
+        or plan.get("production_eligible") is not False
+        or receipt.get("payload_sha256") != LASTMILE_RECEIPT_PAYLOAD_SHA256
+        or receipt.get("plan_payload_sha256")
+        != LASTMILE_PLAN_PAYLOAD_SHA256
+        or receipt.get("scheduler_url") != DEFAULT_SCHEDULER_URL
+        or receipt.get("requested_candidate_count") != len(LASTMILE_TASK_SPECS)
+        or receipt.get("submitted_candidate_count") != len(
+            LASTMILE_TASK_SPECS
+        )
+        or receipt.get("complete") is not True
+        or receipt.get("all_tasks_are_independent") is not True
+        or receipt.get("parallel_execution_requested") is not True
+        or receipt.get("scheduler_repository_modified") is not False
+    ):
+        raise UpdaterError("lastmile submission truth boundary drifted")
+    lanes = plan.get("lanes")
+    submissions = receipt.get("submissions")
+    if (
+        not isinstance(lanes, list)
+        or not isinstance(submissions, list)
+        or len(lanes) != len(LASTMILE_TASK_SPECS)
+        or len(submissions) != len(LASTMILE_TASK_SPECS)
+    ):
+        raise UpdaterError("lastmile submission lane count drifted")
+    for spec, lane, submission in zip(
+        LASTMILE_TASK_SPECS, lanes, submissions, strict=True
+    ):
+        scheduler = lane.get("scheduler") if isinstance(lane, dict) else None
+        candidate = lane.get("candidate") if isinstance(lane, dict) else None
+        readback = (
+            submission.get("readback")
+            if isinstance(submission, dict)
+            else None
+        )
+        evidence = (
+            submission.get("submission_evidence")
+            if isinstance(submission, dict)
+            else None
+        )
+        if (
+            not isinstance(scheduler, dict)
+            or not isinstance(candidate, dict)
+            or not isinstance(readback, dict)
+            or not isinstance(evidence, dict)
+            or lane.get("rank") != spec.rank
+            or scheduler.get("name") != spec.task_name
+            or scheduler.get("dedupe_key") != spec.dedupe_key
+            or scheduler.get("priority") != LASTMILE_PRIORITY
+            or scheduler.get("cpus") != LASTMILE_CPUS
+            or scheduler.get("memory_mb") != LASTMILE_MEMORY_MB
+            or scheduler.get("timeout_seconds") != LASTMILE_TIMEOUT_SECONDS
+            or candidate.get("physical_geometry_sha256")
+            != spec.physical_geometry_sha256
+            or submission.get("rank") != spec.rank
+            or submission.get("task_id") != spec.task_id
+            or submission.get("name") != spec.task_name
+            or submission.get("dedupe_key") != spec.dedupe_key
+            or submission.get("physical_geometry_sha256")
+            != spec.physical_geometry_sha256
+            or readback.get("name") != spec.task_name
+            or readback.get("dedupe_key") != spec.dedupe_key
+            or readback.get("priority") != LASTMILE_PRIORITY
+            or readback.get("cpus") != LASTMILE_CPUS
+            or readback.get("memory_mb") != LASTMILE_MEMORY_MB
+            or readback.get("timeout_seconds") != LASTMILE_TIMEOUT_SECONDS
+            or evidence.get("task_id") != spec.task_id
+            or evidence.get("submission_source") != "post_created"
+            or evidence.get("scheduler_mutation_performed") is not True
+        ):
+            raise UpdaterError(
+                f"lastmile submission rank{spec.rank} receipt drifted"
+            )
+    return {
+        "plan": plan,
+        "receipt": receipt,
+        "plan_path": plan_path,
+        "receipt_path": receipt_path,
+    }
 
 
 def _target_axis_collector_state(
@@ -2947,6 +3281,110 @@ def _exact_n1_6_gui_fea_card(observed_at: str) -> dict[str, Any]:
     }
 
 
+def _lastmile_acquisition_card(
+    tasks: Mapping[int, Mapping[str, Any]],
+    submission_state: Mapping[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    if set(tasks) != {spec.task_id for spec in LASTMILE_TASK_SPECS}:
+        raise UpdaterError("lastmile task set drifted")
+    states = [str(tasks[spec.task_id]["state"]) for spec in LASTMILE_TASK_SPECS]
+    running = states.count("running")
+    attaching_states = {"attaching", "attached", "assigned", "launching", "starting"}
+    attaching = sum(state in attaching_states for state in states)
+    queued = sum(state in {"queued", "pending"} for state in states)
+    succeeded = sum(_category(state) == "succeeded" for state in states)
+    failed = sum(_category(state) == "failed" for state in states)
+    active_nodes = sorted(
+        {
+            str(tasks[spec.task_id]["actual_node_name"])
+            for spec in LASTMILE_TASK_SPECS
+            if str(tasks[spec.task_id]["actual_node_name"])
+        }
+    )
+    receipt = submission_state.get("receipt")
+    if not isinstance(receipt, Mapping):
+        raise UpdaterError("lastmile receipt is absent")
+    task_evidence = [
+        (
+            f"task{spec.task_id}/r{spec.rank}/{spec.physical_geometry_sha256[:12]} "
+            f"{str(tasks[spec.task_id]['state']).upper()} "
+            f"{tasks[spec.task_id]['actual_node_name'] or 'pending'}/"
+            f"a{tasks[spec.task_id]['allocation_id'] or 'none'}/"
+            f"j{tasks[spec.task_id]['slurm_job_id'] or 'none'}"
+        )
+        for spec in LASTMILE_TASK_SPECS
+    ]
+    return {
+        "id": LASTMILE_ACQUISITION_CARD_ID,
+        "title": (
+            "PRIMARY-TEMP LASTMILE P90 | 8/8 SUBMITTED | "
+            f"RUN{running} ATTACH{attaching} QUEUE{queued} "
+            f"OK{succeeded} FAIL{failed} | ACQUISITION-ONLY"
+        ),
+        "detail": (
+            "Eight independent priority-90 symmetric/unrounded neighborhood "
+            "FEA tasks were submitted from the authenticated sealed plan. "
+            "They retain 5.0mm primary foil, 1.6mm primary interturn spacing, "
+            "1.5m/s cooling and the fixed TIM contract. This manual parallel "
+            "hedge overrides automatic_submission_recommended=false only for "
+            "data acquisition; it cannot create a scientific or production "
+            "PASS because physical air-gap/Lm validation is absent."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": min(
+            95,
+            35 + 5 * running + 7 * succeeded + 2 * attaching,
+        ),
+        "evidence": [
+            (
+                "tasks=97033-97040 / priority=90 / each=8CPU+65536MB / "
+                "timeout=14400s / total=64CPU+512GiB / "
+                f"active nodes={','.join(active_nodes) or 'pending'}"
+            ),
+            (
+                f"sealed plan file SHA256={LASTMILE_PLAN_FILE_SHA256} / "
+                f"payload={LASTMILE_PLAN_PAYLOAD_SHA256}"
+            ),
+            (
+                f"sealed receipt file SHA256={LASTMILE_RECEIPT_FILE_SHA256} / "
+                f"payload={LASTMILE_RECEIPT_PAYLOAD_SHA256} / "
+                "readback identity/resources=8/8 verified"
+            ),
+            (
+                "existing source batch task97014-97029 remained running "
+                "16/16 at submission readback / source priority=95 / "
+                "lastmile geometry intersection=0"
+            ),
+            (
+                "surrogate primary robust range=102.100-102.852C / "
+                "secondary<=120C 8/8 / core<=120C 4/8 / "
+                "margin-preserving=1/8 / FEA correction required"
+            ),
+            (
+                "topology=eighth symmetric / winding=unrounded / cw1=5.0mm / "
+                "gap1=1.6mm / fan=1.5m/s / TIM thickness=2.0mm / "
+                "TIM k=0.2W/mK"
+            ),
+            (
+                "core_center_gap_mm=0 pre-gap acquisition / fixed-Lm2mH "
+                "resonance replay=screening-only / physical gapped Lm "
+                "validation pending"
+            ),
+            (
+                "automatic_submission_recommended=false / manual explicit "
+                "acquisition override=true / production_eligible=false / "
+                "actual scientific PASS=false / actual production PASS=false"
+            ),
+            *[
+                " | ".join(task_evidence[index : index + 2])
+                for index in range(0, len(task_evidence), 2)
+            ],
+        ],
+    }
+
+
 def _reference_thermal_terminal_marker(root: Path) -> dict[str, Any] | None:
     """Read the local thermal terminal marker before using process heuristics."""
 
@@ -4109,6 +4547,8 @@ def merge_status(
     *,
     observed_at: str,
     auxiliary_tasks: Mapping[int, Mapping[str, Any]] | None = None,
+    lastmile_tasks: Mapping[int, Mapping[str, Any]] | None = None,
+    lastmile_submission_state: Mapping[str, Any] | None = None,
     reference_gui_root: Path | None = None,
     target_axis_collector_state_file: Path | None = None,
     postsuccess_state_file: Path | None = None,
@@ -4171,6 +4611,17 @@ def merge_status(
         result,
         _exact_n1_6_gui_fea_card(observed_at),
     )
+    if lastmile_tasks is not None and lastmile_submission_state is not None:
+        _upsert_priority_current_card(
+            result,
+            _lastmile_acquisition_card(
+                lastmile_tasks,
+                lastmile_submission_state,
+                observed_at,
+            ),
+        )
+    else:
+        _remove_current_card(result, LASTMILE_ACQUISITION_CARD_ID)
     _upsert_priority_current_card(
         result,
         _primary_5t_recovery_card(observed_at),
@@ -4714,6 +5165,16 @@ def synchronize_once(
         if task_reader is None or auxiliary_task_reader is not None
         else None
     )
+    lastmile_submission_state = (
+        _lastmile_submission_state()
+        if task_reader is None
+        else None
+    )
+    lastmile_tasks = (
+        fetch_lastmile_tasks(scheduler_url)
+        if lastmile_submission_state is not None
+        else None
+    )
     source = status_file.resolve().read_bytes()
     source_sha256 = hashlib.sha256(source).hexdigest()
     try:
@@ -4727,6 +5188,8 @@ def synchronize_once(
         tasks,
         observed_at=observed_at or _timestamp(),
         auxiliary_tasks=auxiliary_tasks,
+        lastmile_tasks=lastmile_tasks,
+        lastmile_submission_state=lastmile_submission_state,
         reference_gui_root=(
             reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT
         ),
