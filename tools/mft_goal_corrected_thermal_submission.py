@@ -53,7 +53,7 @@ CAMPAIGN_ID = "mft-goal-20260726"
 PROJECT = "MFT_1MW_2026v1"
 SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME = (
-    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-infra-r1"
+    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-core8-r2"
 )
 ACCOUNT = "r1jae262"
 ACCOUNT_UID = 1455
@@ -95,6 +95,11 @@ NODE_TELEMETRY_FUTURE_TOLERANCE_SECONDS = 5.0
 RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS = 1_800
 RUNTIME_QUOTA_DRIFT_RESERVE_BYTES = 16 * 1024**3
 RUNTIME_QUOTA_DRIFT_RESERVE_INODES = 4_096
+CORE_POLICY_SCHEMA = "mft-corrected-thermal-core-policy-v1"
+CORE_CONTRACT_VERSION = "mft-standalone-core-optin-v1"
+CORE_CONTRACT_ENV = "MFT_STANDALONE_CORE_CONTRACT"
+CORE_COUNT_ENV = "MFT_STANDALONE_CORE_COUNT"
+CORE_AUTH_ENV = "MFT_STANDALONE_CORE_AUTH_SHA256"
 MAX_TIMEOUT_SECONDS = 21_600
 MIN_RUNTIME_SECONDS = 10_800
 PACKAGE_RESERVE_SECONDS = 1_800
@@ -115,34 +120,42 @@ CHECKPOINT_ROOT = PurePosixPath(
 )
 RETAINED_ROOT = (
     "/gpfs/home1/r1jae262/slurm_scheduler/mft_goal_20260726/"
-    "corrected_thermal_minimum_infra_r1"
+    "corrected_thermal_minimum_core8_r2"
 )
-RETRY_GENERATION = "corrected-thermal-infra-r1"
+RETRY_GENERATION = "corrected-thermal-core8-r2"
 INFRASTRUCTURE_RETRY_SOURCE = {
-    "task_id": 96308,
-    "task_name": "mft-goal-corrected-thermal-l96230-b7c30cb70b95-v1",
-    "dedupe_key": (
-        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-v1:"
-        "a64b8ced44af225269e39ae8e9209760d9189119:"
-        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:cf1fed66de1ec262"
+    "task_id": 96309,
+    "task_name": (
+        "mft-goal-corrected-thermal-l96230-b7c30cb70b95-infra-r1"
     ),
-    "executor_revision": "a64b8ced44af225269e39ae8e9209760d9189119",
+    "dedupe_key": (
+        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-infra-r1:"
+        "9cee6b7251f717a11d77fbf07c867c44c0519e60:"
+        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:0458035f6fe1c5f3"
+    ),
+    "executor_revision": "9cee6b7251f717a11d77fbf07c867c44c0519e60",
     "plan_payload_sha256": (
-        "b9f94a38639a702d930b9f2e3979f1ab8dca352cb79ee38d8e15d7b924ed031b"
+        "5efc8418573d3bab026d4cda27187bf7574dd235fc8b628c1c3a3aa2c75ec9ab"
     ),
     "plan_file_sha256": (
-        "ff4dd2175cdca69abbdd0c4178a203dff7876af325ed2b4e3f425240e1efe888"
+        "43766d945129ba635660eb2715f7e6b03e489366b0c61aecfe3723ddfa791a84"
     ),
     "submission_receipt_payload_sha256": (
-        "95da9f164dbb995e0ad382a8541e3f5f76c80da82697ec55861842cb124d6b29"
+        "5ae8a6d179a9e6967df80a58ee0c63d2a9d3843cfcfc26a27e0a4d293b6704ea"
     ),
     "submission_receipt_file_sha256": (
-        "9e4fc32e8d290fddaf3426f1d34b283062ea6f427ceea0876456def7327e16b7"
+        "2046e3b9f57050df73690f58af0bda90093391503d76c9441db4304e955eb62e"
     ),
-    "requested_node": "n111",
-    "allocation_id": 14636,
-    "slurm_job_id": "837823",
-    "failure_class": "compute_node_mmlsquota_daemon_unavailable_before_solver",
+    "stdout_sha256": (
+        "9df965dcd748d19b1d2b42c96d9204ea4142a7d1cc1f37622a3f0e004572649c"
+    ),
+    "stderr_sha256": (
+        "b9f23cea8fa4c3e8688ced30ec7a54ca36a38716bc04b56b45450c902f81fa58"
+    ),
+    "requested_node": "n109",
+    "allocation_id": 14637,
+    "slurm_job_id": "837992",
+    "failure_class": "missing_authenticated_mft_8x1_core_opt_in_before_solver",
     "retry_kind": "infrastructure",
 }
 REMOTE_CWD = "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs"
@@ -237,6 +250,53 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def core_contract_auth_sha256(solver_revision: Any) -> str:
+    revision = _sha1(solver_revision, "core-policy solver revision")
+    payload = {
+        "backend": "standalone",
+        "contract_version": CORE_CONTRACT_VERSION,
+        "requested_num_cores": CPUS,
+        "required_slurm_cpus_per_task": CPUS,
+        "solver_revision": revision,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _core_policy(solver_revision: Any) -> dict[str, Any]:
+    revision = _sha1(solver_revision, "core-policy solver revision")
+    auth = core_contract_auth_sha256(revision)
+    return {
+        "schema": CORE_POLICY_SCHEMA,
+        "backend": "standalone",
+        "contract_version": CORE_CONTRACT_VERSION,
+        "requested_num_cores": CPUS,
+        "num_tasks": 1,
+        "required_slurm_cpus_per_task": CPUS,
+        "solver_revision": revision,
+        "auth_sha256": auth,
+        "environment": {
+            CORE_CONTRACT_ENV: CORE_CONTRACT_VERSION,
+            CORE_COUNT_ENV: str(CPUS),
+            CORE_AUTH_ENV: auth,
+        },
+    }
+
+
+def validate_core_policy(value: Mapping[str, Any], solver_revision: Any) -> dict:
+    policy = _mapping(value, "solver core policy")
+    expected = _core_policy(solver_revision)
+    if policy != expected:
+        raise CorrectedThermalError("solver core policy drifted")
+    return expected
 
 
 def sha256_file(path: Path) -> str:
@@ -812,6 +872,7 @@ def _execution_contract(
     dedupe_key: str,
     retention: Mapping[str, Any],
     runtime_quota_authority: Mapping[str, Any],
+    core_policy: Mapping[str, Any],
 ) -> dict[str, Any]:
     value = {
         "schema": EXECUTION_PLAN_SCHEMA,
@@ -835,6 +896,7 @@ def _execution_contract(
             "tasks": 1,
             "use_auto_settings": False,
         },
+        "core_policy": copy.deepcopy(dict(core_policy)),
         "runtime_quota_authority": copy.deepcopy(
             dict(runtime_quota_authority)
         ),
@@ -873,6 +935,10 @@ def validate_execution_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     )
     _sha256(
         plan.get("submission_contract_sha256"), "execution submission contract"
+    )
+    validate_core_policy(
+        _mapping(plan.get("core_policy"), "execution core policy"),
+        plan["executor_revision"],
     )
     retention = _mapping(plan.get("output_storage"), "output storage")
     if (
@@ -913,6 +979,10 @@ def _build_command(
     submission_hash = executor["entrypoints"][SUBMISSION_ENTRYPOINT][
         "payload_sha256"
     ]
+    core_policy = validate_core_policy(
+        _mapping(execution_contract.get("core_policy"), "execution core policy"),
+        revision,
+    )
     output_root = str(retention["scratch_root"])
     scratch = str(PurePosixPath(output_root).parent)
     minimum_scratch_kib = math.ceil(
@@ -1007,6 +1077,18 @@ def _build_command(
         f"remaining={MAX_TIMEOUT_SECONDS}; fi",
         f'test "$scratch/output" = {_shell_quote(output_root)}',
         'mkdir -m 700 -- "$scratch/output"',
+        (
+            f"export {CORE_CONTRACT_ENV}="
+            f"{_shell_quote(core_policy['environment'][CORE_CONTRACT_ENV])}"
+        ),
+        (
+            f"export {CORE_COUNT_ENV}="
+            f"{_shell_quote(core_policy['environment'][CORE_COUNT_ENV])}"
+        ),
+        (
+            f"export {CORE_AUTH_ENV}="
+            f"{_shell_quote(core_policy['environment'][CORE_AUTH_ENV])}"
+        ),
         "set +e",
         (
             'timeout --signal=TERM --kill-after=300s "${remaining}s" '
@@ -1086,6 +1168,7 @@ def build_plan(
         retention=retention,
         now=observed_now,
     )
+    core_policy = _core_policy(revision)
     contract = {
         "checkpoint": {
             key: checkpoint[key]
@@ -1113,6 +1196,7 @@ def build_plan(
         },
         "library_revision": LIBRARY_REVISION,
         "dispatch": {"cpus": CPUS, "tasks": 1, "use_auto_settings": False},
+        "core_policy": core_policy,
         "retention": retention,
         "runtime_quota_authority": runtime_quota_authority,
         "retry_of_infrastructure": copy.deepcopy(
@@ -1132,6 +1216,7 @@ def build_plan(
         dedupe_key=dedupe,
         retention=retention,
         runtime_quota_authority=runtime_quota_authority,
+        core_policy=core_policy,
     )
     command = _build_command(
         checkpoint=checkpoint,
@@ -1197,6 +1282,7 @@ def build_plan(
         "executor": executor,
         "execution_contract": execution,
         "retention": retention,
+        "core_policy": core_policy,
         "runtime_quota_authority": runtime_quota_authority,
         "retry_of_infrastructure": copy.deepcopy(
             INFRASTRUCTURE_RETRY_SOURCE
@@ -1297,6 +1383,12 @@ def load_plan(
         )
     executor = _mapping(plan.get("executor"), "plan executor")
     revision = _sha1(executor.get("revision"), "plan executor revision")
+    core_policy = validate_core_policy(
+        _mapping(plan.get("core_policy"), "plan core policy"),
+        revision,
+    )
+    if contract.get("core_policy") != core_policy:
+        raise CorrectedThermalError("core policy contract binding drifted")
     if executor.get("required_ancestor") != EXECUTOR_REQUIRED_ANCESTOR:
         raise CorrectedThermalError("plan executor ancestor drifted")
     if (
@@ -1359,6 +1451,17 @@ def load_plan(
         or f'test "$host" != {_shell_quote(FORBIDDEN_NODE)}' not in command
         or "--execution-plan" not in command
         or "timeout --signal=TERM" not in command
+        or (
+            f"export {CORE_CONTRACT_ENV}="
+            f"{_shell_quote(CORE_CONTRACT_VERSION)}"
+        )
+        not in command
+        or f"export {CORE_COUNT_ENV}={_shell_quote(str(CPUS))}" not in command
+        or (
+            f"export {CORE_AUTH_ENV}="
+            f"{_shell_quote(core_policy['auth_sha256'])}"
+        )
+        not in command
     ):
         raise CorrectedThermalError("canonical command drifted")
     execution = validate_execution_contract(plan.get("execution_contract") or {})
@@ -1369,6 +1472,7 @@ def load_plan(
         or execution.get("task_name") != TASK_NAME
         or execution.get("dedupe_key") != expected_dedupe
         or execution.get("output_storage") != plan.get("retention")
+        or execution.get("core_policy") != core_policy
         or execution.get("runtime_quota_authority")
         != runtime_quota_authority
     ):
@@ -2176,6 +2280,32 @@ def validate_infrastructure_retry_source(
     source = INFRASTRUCTURE_RETRY_SOURCE
     status = str(value.get("status") or value.get("state") or "").lower()
     failure = str(value.get("failure_message") or "")
+    marker_prefix = "SOLVER_CORE_CONTRACT_JSON "
+    marker_rows = [
+        line[len(marker_prefix):]
+        for line in stdout.splitlines()
+        if line.startswith(marker_prefix)
+    ]
+    try:
+        core_readback = (
+            json.loads(marker_rows[0]) if len(marker_rows) == 1 else None
+        )
+    except json.JSONDecodeError:
+        core_readback = None
+    expected_core_readback = {
+        "contract_version": "default-four-core-cap-v1",
+        "opt_in": False,
+        "backend": "standalone",
+        "requested_num_cores": 4,
+        "effective_num_cores": 4,
+        "num_tasks": 1,
+        "slurm_cpus_per_task_readback": "8",
+        "scheduler_task_id_readback": str(source["task_id"]),
+        "slurm_job_id_readback": source["slurm_job_id"],
+        "auth_sha256": "",
+        "solver_revision": source["executor_revision"],
+        "solver_dirty": 0,
+    }
     if (
         _task_id(value) != source["task_id"]
         or value.get("name") != source["task_name"]
@@ -2191,14 +2321,22 @@ def validate_infrastructure_retry_source(
         or value.get("placement_contract_satisfied") is not True
         or value.get("allocation_id") != source["allocation_id"]
         or str(value.get("slurm_job_id") or "") != source["slurm_job_id"]
-        or "mmlsquota failed rc=50" not in failure
-        or "Failed to connect to file system daemon" not in failure
-        or "GPFS is down on this node" not in stderr
+        or failure
+        != (
+            "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
+            "authenticated Slurm core policy is not 8x1: 4x1"
+        )
+        or "authenticated Slurm core policy is not 8x1: 4x1" not in stderr
+        or not isinstance(core_readback, Mapping)
+        or any(
+            core_readback.get(key) != expected
+            for key, expected in expected_core_readback.items()
+        )
         or "CORRECTED_THERMAL_JSON " in stdout
     ):
         raise CorrectedThermalError(
             "infrastructure retry source is not the exact pre-solver "
-            "mmlsquota failure"
+            "missing authenticated 8x1 core-policy failure"
         )
     return {
         "task_id": source["task_id"],

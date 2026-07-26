@@ -61,6 +61,11 @@ RUNTIME_QUOTA_AUTHORITY_MAX_AGE_SECONDS = 1_800
 RUNTIME_QUOTA_FUTURE_TOLERANCE_SECONDS = 5.0
 RUNTIME_QUOTA_DRIFT_RESERVE_BYTES = 16 * 1024**3
 RUNTIME_QUOTA_DRIFT_RESERVE_INODES = 4_096
+CORE_POLICY_SCHEMA = "mft-corrected-thermal-core-policy-v1"
+CORE_CONTRACT_VERSION = "mft-standalone-core-optin-v1"
+CORE_CONTRACT_ENV = "MFT_STANDALONE_CORE_CONTRACT"
+CORE_COUNT_ENV = "MFT_STANDALONE_CORE_COUNT"
+CORE_AUTH_ENV = "MFT_STANDALONE_CORE_AUTH_SHA256"
 FAN_VELOCITY_M_S = 1.5
 TIM_CONDUCTIVITY_W_MK = 0.2
 PAD_THICKNESS_MM = 2.0
@@ -704,6 +709,92 @@ _RUNTIME_QUOTA_FIELDS = {
 }
 
 
+def core_contract_auth_sha256(solver_revision: Any) -> str:
+    revision = _exact_hex(
+        solver_revision, 40, "core-policy solver revision"
+    )
+    payload = {
+        "backend": "standalone",
+        "contract_version": CORE_CONTRACT_VERSION,
+        "requested_num_cores": CORES,
+        "required_slurm_cpus_per_task": CORES,
+        "solver_revision": revision,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _authenticate_core_policy(
+    value: Any, *, executor_revision: str
+) -> dict[str, Any]:
+    revision = _exact_hex(
+        executor_revision, 40, "core-policy executor revision"
+    )
+    auth = core_contract_auth_sha256(revision)
+    expected = {
+        "schema": CORE_POLICY_SCHEMA,
+        "backend": "standalone",
+        "contract_version": CORE_CONTRACT_VERSION,
+        "requested_num_cores": CORES,
+        "num_tasks": TASKS,
+        "required_slurm_cpus_per_task": CORES,
+        "solver_revision": revision,
+        "auth_sha256": auth,
+        "environment": {
+            CORE_CONTRACT_ENV: CORE_CONTRACT_VERSION,
+            CORE_COUNT_ENV: str(CORES),
+            CORE_AUTH_ENV: auth,
+        },
+    }
+    policy = dict(
+        _required_mapping(value, "solver core policy", set(expected))
+    )
+    if policy != expected:
+        raise ContinuationError("solver core policy mismatch")
+    return expected
+
+
+def authenticate_core_environment(
+    policy: Mapping[str, Any],
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    env = os.environ if environ is None else environ
+    expected = _required_mapping(
+        policy.get("environment"),
+        "solver core environment",
+        {CORE_CONTRACT_ENV, CORE_COUNT_ENV, CORE_AUTH_ENV},
+    )
+    actual = {
+        name: str(env.get(name, "") or "").strip()
+        for name in (CORE_CONTRACT_ENV, CORE_COUNT_ENV, CORE_AUTH_ENV)
+    }
+    if actual != dict(expected):
+        raise ContinuationError(
+            f"authenticated solver core environment mismatch: {actual}"
+        )
+    if str(env.get("SLURM_CPUS_PER_TASK", "") or "").strip() != str(CORES):
+        raise ContinuationError("SLURM_CPUS_PER_TASK is not authenticated 8")
+    for name in ("SLURM_SCHED_TASK_ID", "SLURM_JOB_ID"):
+        raw = str(env.get(name, "") or "").strip()
+        if not raw.isascii() or not raw.isdigit() or int(raw) <= 0:
+            raise ContinuationError(f"{name} is not a positive decimal")
+    return {
+        "policy": dict(policy),
+        "environment": actual,
+        "slurm_cpus_per_task": CORES,
+        "scheduler_task_id": int(str(env["SLURM_SCHED_TASK_ID"])),
+        "slurm_job_id": int(str(env["SLURM_JOB_ID"])),
+        "passed": True,
+    }
+
+
 def _authenticate_runtime_quota_authority(
     value: Any,
     *,
@@ -956,6 +1047,10 @@ def authenticate_execution_plan(
             raise ContinuationError(
                 f"execution plan dispatch drifted: {name}={dispatch[name]!r}"
             )
+    core_policy = _authenticate_core_policy(
+        plan.get("core_policy"),
+        executor_revision=executor_revision,
+    )
     storage = _required_mapping(
         plan.get("output_storage"),
         "execution plan output storage",
@@ -1021,6 +1116,7 @@ def authenticate_execution_plan(
         "required_executor_ancestor": required_ancestor,
         "tool_payload_sha256": tool_hash,
         "dispatch": expected_dispatch,
+        "core_policy": core_policy,
         "output_storage": storage_contract,
         "runtime_quota_authority": runtime_quota_authority,
         "plan_payload_sha256": payload_hash,
@@ -2286,6 +2382,9 @@ def execute_checkpoint(
     execution_plan = authenticate_execution_plan(
         execution_plan_path, authentication
     )
+    core_environment = authenticate_core_environment(
+        execution_plan["core_policy"]
+    )
     runtime = _runtime_identity(library_root, execution_plan)
     storage_admission = admit_retained_output_storage(
         authentication, execution_plan, output_root
@@ -2313,6 +2412,7 @@ def execute_checkpoint(
             ],
         },
         "fixed_physics": authentication["physics_boundary"],
+        "solver_core_contract": core_environment,
         "retained_output_admission": storage_admission,
         "clone": {
             **{key: str(value) if isinstance(value, Path) else value

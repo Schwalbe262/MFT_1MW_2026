@@ -227,6 +227,23 @@ def _execution_plan(
     authority["payload_sha256"] = executor.hashlib.sha256(
         executor.canonical_json_bytes(authority)
     ).hexdigest()
+    revision = executor.EXECUTOR_REQUIRED_ANCESTOR
+    core_auth = executor.core_contract_auth_sha256(revision)
+    core_policy = {
+        "schema": executor.CORE_POLICY_SCHEMA,
+        "backend": "standalone",
+        "contract_version": executor.CORE_CONTRACT_VERSION,
+        "requested_num_cores": executor.CORES,
+        "num_tasks": executor.TASKS,
+        "required_slurm_cpus_per_task": executor.CORES,
+        "solver_revision": revision,
+        "auth_sha256": core_auth,
+        "environment": {
+            executor.CORE_CONTRACT_ENV: executor.CORE_CONTRACT_VERSION,
+            executor.CORE_COUNT_ENV: str(executor.CORES),
+            executor.CORE_AUTH_ENV: core_auth,
+        },
+    }
     plan = {
         "schema": executor.EXECUTION_PLAN_SCHEMA,
         "diagnostic_only": True,
@@ -234,7 +251,7 @@ def _execution_plan(
         "checkpoint_manifest_sha256": checkpoint_authentication[
             "manifest_sha256"
         ],
-        "executor_revision": executor.EXECUTOR_REQUIRED_ANCESTOR,
+        "executor_revision": revision,
         "required_executor_ancestor": executor.EXECUTOR_REQUIRED_ANCESTOR,
         "tool_payload_sha256": executor.sha256_file(MODULE_PATH),
         "dispatch": {
@@ -242,6 +259,7 @@ def _execution_plan(
             "tasks": 1,
             "use_auto_settings": False,
         },
+        "core_policy": core_policy,
         "runtime_quota_authority": authority,
         "output_storage": storage,
     }
@@ -562,6 +580,72 @@ def test_submission_and_executor_runtime_quota_contract_match() -> None:
     assert authenticated["age_seconds_at_execution"] == pytest.approx(
         0.0, abs=1e-5
     )
+
+
+def test_authenticated_core_policy_reaches_executor_as_exact_8x1() -> None:
+    revision = executor.EXECUTOR_REQUIRED_ANCESTOR
+    auth = executor.core_contract_auth_sha256(revision)
+    policy = executor._authenticate_core_policy(
+        {
+            "schema": executor.CORE_POLICY_SCHEMA,
+            "backend": "standalone",
+            "contract_version": executor.CORE_CONTRACT_VERSION,
+            "requested_num_cores": 8,
+            "num_tasks": 1,
+            "required_slurm_cpus_per_task": 8,
+            "solver_revision": revision,
+            "auth_sha256": auth,
+            "environment": {
+                executor.CORE_CONTRACT_ENV: executor.CORE_CONTRACT_VERSION,
+                executor.CORE_COUNT_ENV: "8",
+                executor.CORE_AUTH_ENV: auth,
+            },
+        },
+        executor_revision=revision,
+    )
+    result = executor.authenticate_core_environment(
+        policy,
+        environ={
+            **policy["environment"],
+            "SLURM_CPUS_PER_TASK": "8",
+            "SLURM_SCHED_TASK_ID": "96310",
+            "SLURM_JOB_ID": "838000",
+        },
+    )
+    assert result["passed"] is True
+    assert result["slurm_cpus_per_task"] == 8
+
+
+def test_core_environment_rejects_default_four_core_fallback() -> None:
+    revision = executor.EXECUTOR_REQUIRED_ANCESTOR
+    auth = executor.core_contract_auth_sha256(revision)
+    policy = executor._authenticate_core_policy(
+        {
+            "schema": executor.CORE_POLICY_SCHEMA,
+            "backend": "standalone",
+            "contract_version": executor.CORE_CONTRACT_VERSION,
+            "requested_num_cores": 8,
+            "num_tasks": 1,
+            "required_slurm_cpus_per_task": 8,
+            "solver_revision": revision,
+            "auth_sha256": auth,
+            "environment": {
+                executor.CORE_CONTRACT_ENV: executor.CORE_CONTRACT_VERSION,
+                executor.CORE_COUNT_ENV: "8",
+                executor.CORE_AUTH_ENV: auth,
+            },
+        },
+        executor_revision=revision,
+    )
+    with pytest.raises(executor.ContinuationError, match="environment mismatch"):
+        executor.authenticate_core_environment(
+            policy,
+            environ={
+                "SLURM_CPUS_PER_TASK": "8",
+                "SLURM_SCHED_TASK_ID": "96310",
+                "SLURM_JOB_ID": "838000",
+            },
+        )
 
 
 def test_minimum_retention_keeps_evidence_without_duplicate_premesh(

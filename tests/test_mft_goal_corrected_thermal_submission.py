@@ -272,13 +272,32 @@ class FakeScheduler:
         self.post_calls = 0
         self.response_loss = False
         source_id = submission.INFRASTRUCTURE_RETRY_SOURCE["task_id"]
+        source = submission.INFRASTRUCTURE_RETRY_SOURCE
+        core_readback = {
+            "contract_version": "default-four-core-cap-v1",
+            "opt_in": False,
+            "backend": "standalone",
+            "requested_num_cores": 4,
+            "effective_num_cores": 4,
+            "num_tasks": 1,
+            "slurm_cpus_per_task_readback": "8",
+            "scheduler_task_id_readback": str(source_id),
+            "slurm_job_id_readback": source["slurm_job_id"],
+            "auth_sha256": "",
+            "solver_revision": source["executor_revision"],
+            "solver_dirty": 0,
+        }
         self.stdout: dict[int, str] = {
-            source_id: "executor tools authenticated\n"
+            source_id: (
+                "executor tools authenticated\nSOLVER_CORE_CONTRACT_JSON "
+                + json.dumps(core_readback, sort_keys=True)
+                + "\n"
+            )
         }
         self.stderr: dict[int, str] = {
             source_id: (
-                "Failed to connect to file system daemon: No such process\n"
-                "mmlsquota: GPFS is down on this node.\n"
+                "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
+                "authenticated Slurm core policy is not 8x1: 4x1\n"
             )
         }
 
@@ -302,8 +321,7 @@ class FakeScheduler:
             "slurm_job_id": source["slurm_job_id"],
             "failure_message": (
                 "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
-                "mmlsquota failed rc=50: Failed to connect to file system "
-                "daemon: No such process"
+                "authenticated Slurm core policy is not 8x1: 4x1"
             ),
         }
 
@@ -428,6 +446,20 @@ def test_plan_binds_fresh_executor_and_two_tier_storage(tmp_path: Path) -> None:
     )
     assert plan["runtime_quota_authority"]["source"] == (
         "submission-login:mmlsquota-Y"
+    )
+    core = plan["core_policy"]
+    expected_auth = submission.core_contract_auth_sha256("b" * 40)
+    assert core["auth_sha256"] == expected_auth
+    assert core["requested_num_cores"] == 8
+    assert core["num_tasks"] == 1
+    assert (
+        "export MFT_STANDALONE_CORE_CONTRACT="
+        "'mft-standalone-core-optin-v1'"
+    ) in plan["canonical_command"]
+    assert "export MFT_STANDALONE_CORE_COUNT='8'" in plan["canonical_command"]
+    assert (
+        f"export MFT_STANDALONE_CORE_AUTH_SHA256='{expected_auth}'"
+        in plan["canonical_command"]
     )
     assert "test \"$host\" != 'n114'" in plan["canonical_command"]
     assert "--execution-plan" in plan["canonical_command"]
