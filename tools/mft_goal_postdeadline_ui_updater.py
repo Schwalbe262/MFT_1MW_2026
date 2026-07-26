@@ -633,10 +633,10 @@ def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
             f"COLLECTIONS {collection_count} · PENDING {pending_count}"
         ),
         "detail": (
-            "task96325/96327 collector 결과를 기다리면서 인증, hard-constraint "
-            "판정, strict-AL admission 및 measured global NDS 입력을 자동 "
-            "처리합니다. 결과가 없으면 scientific/production claim을 만들지 "
-            "않습니다."
+            "task96325/96327/96328/96329 collector 결과를 기다리면서 인증, "
+            "hard-constraint 판정, strict-AL admission 및 measured global "
+            "NDS 입력을 자동 처리합니다. 결과가 없으면 "
+            "scientific/production claim을 만들지 않습니다."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
@@ -1111,7 +1111,7 @@ def merge_status(
                 f"QUEUED {queued} · COLLECTIONS {collections}"
             ),
             "detail": (
-                "Scheduler exact GET lifecycle 집계입니다. 네 작업의 terminal "
+                "Scheduler exact GET lifecycle 집계입니다. 각 작업의 terminal "
                 "success도 별도 collector/artifact 인증 전에는 collection 또는 "
                 "scientific PASS가 아닙니다. completed/attention/Pareto truth는 "
                 "이 updater가 수정하지 않습니다."
