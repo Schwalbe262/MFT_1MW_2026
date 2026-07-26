@@ -24,6 +24,12 @@ from collections.abc import Mapping
 
 CAPACITANCE_EXPORT_SCHEMA_VERSION = "maxwell-capacitance-export-v1"
 CAPACITANCE_PAYLOAD_SCHEMA_VERSION = "mft-electrostatic-capacitance-v1"
+TURN_GRADED_CAPACITANCE_SCHEMA_VERSION = (
+    "mft-turn-graded-energy-capacitance-v2"
+)
+TURN_GRADED_VOLTAGE_SCHEDULE_SCHEMA_VERSION = (
+    "mft-linear-turn-voltage-schedule-v2"
+)
 CAPACITANCE_TIMING_PAYLOAD_FIELDS = frozenset({
     "time_cap",
     "cap_solve_time_s",
@@ -83,6 +89,10 @@ _UNIT_HEADER_RE = re.compile(
 _CAPACITANCE_TITLE_RE = re.compile(r"^\s*Capacitance\s*$", re.IGNORECASE)
 _COUPLING_TITLE_RE = re.compile(
     r"^\s*Capacitive\s+Coupling\s+Coefficient\s*$", re.IGNORECASE
+)
+_TURN_OBJECT_RE = re.compile(
+    r"^(?P<winding>Tx|Rx)_(?P<section>main|side|side2)_"
+    r"(?P<radial>\d+)_(?P<axial>\d+)$"
 )
 
 
@@ -506,3 +516,375 @@ def build_capacitance_payload(
         "f_res_rx_self_Hz": lc_resonance_hz(lrx_h, c_rx_rx_f),
         "f_res_interwinding_Hz": lc_resonance_hz(llt_h, c_tx_rx_f),
     }
+
+
+def linear_turn_voltage_schedule(
+    object_names,
+    *,
+    winding,
+    section_order=("main", "side", "side2"),
+    reverse_sections=(),
+    reverse_terminal_polarity=False,
+    voltage_policy="turn_midpoint",
+    section_turn_weights=None,
+    section_polarities=None,
+    full_model=None,
+):
+    """Return an auditable series-turn voltage schedule.
+
+    The production winding builder names every physical turn
+    ``Tx|Rx_<section>_<radial>_<axial>``.  Its radial index increases from the
+    innermost to the outermost turn.  This helper validates that identity,
+    constructs one deterministic series order, and assigns a normalized
+    terminal-voltage fraction to every individual conductor.
+
+    The three-leg magnetic topology does *not* give every physical loop the
+    same terminal-voltage increment.  A center-leg (``main``) turn links the
+    full center flux, while each mirrored side-leg turn links approximately
+    half of it.  The default per-turn voltage weights are therefore
+    ``main=1, side=0.5, side2=0.5``.  In a full model this makes
+    ``N_main + 2*N_side`` physical solids represent the sealed electrical
+    contract ``N_main + N_side``.  Explicit section polarities allow bounded
+    connection-sensitivity studies without silently changing that weighting.
+
+    ``turn_midpoint`` assigns ``(i + 0.5) / N`` and is the preferred
+    electroquasistatic energy approximation because each solid represents the
+    mean potential of one complete turn.  ``terminal_endpoints`` assigns
+    ``i / (N - 1)`` and exists only as a sensitivity bound.
+    """
+    winding = str(winding)
+    if winding not in {"Tx", "Rx"}:
+        raise ValueError("winding must be Tx or Rx")
+    names = [str(name) for name in object_names]
+    if not names or len(names) != len(set(names)):
+        raise ValueError("turn object names must be non-empty and unique")
+    requested_sections = tuple(str(item) for item in section_order)
+    if (
+        not requested_sections
+        or len(requested_sections) != len(set(requested_sections))
+        or any(item not in {"main", "side", "side2"} for item in requested_sections)
+    ):
+        raise ValueError("section_order is invalid")
+    reverse_sections = frozenset(str(item) for item in reverse_sections)
+    if not reverse_sections.issubset(requested_sections):
+        raise ValueError("reverse_sections contains an unknown section")
+    default_weights = {"main": 1.0, "side": 0.5, "side2": 0.5}
+    raw_weights = (
+        {
+            section: default_weights[section]
+            for section in requested_sections
+        }
+        if section_turn_weights is None
+        else dict(section_turn_weights)
+    )
+    if set(raw_weights) != set(requested_sections):
+        raise ValueError(
+            "section_turn_weights must define exactly every requested section"
+        )
+    weights = {}
+    for section in requested_sections:
+        try:
+            value = float(raw_weights[section])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"section_turn_weights[{section!r}] is invalid"
+            ) from error
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"section_turn_weights[{section!r}] must be positive"
+            )
+        weights[section] = value
+    raw_polarities = (
+        {section: 1 for section in requested_sections}
+        if section_polarities is None
+        else dict(section_polarities)
+    )
+    if set(raw_polarities) != set(requested_sections):
+        raise ValueError(
+            "section_polarities must define exactly every requested section"
+        )
+    polarities = {}
+    for section in requested_sections:
+        value = raw_polarities[section]
+        if isinstance(value, bool):
+            raise ValueError(
+                f"section_polarities[{section!r}] must be +1 or -1"
+            )
+        try:
+            value = int(value)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"section_polarities[{section!r}] is invalid"
+            ) from error
+        if value not in {-1, 1}:
+            raise ValueError(
+                f"section_polarities[{section!r}] must be +1 or -1"
+            )
+        polarities[section] = value
+    if full_model is not None and not isinstance(full_model, bool):
+        raise TypeError("full_model must be bool or None")
+
+    by_section = {section: [] for section in requested_sections}
+    for name in names:
+        match = _TURN_OBJECT_RE.fullmatch(name)
+        if match is None or match.group("winding") != winding:
+            raise ValueError(f"invalid {winding} turn object name: {name!r}")
+        section = match.group("section")
+        if section not in by_section:
+            raise ValueError(
+                f"{winding} turn section {section!r} is absent from section_order"
+            )
+        radial = int(match.group("radial"))
+        axial = int(match.group("axial"))
+        by_section[section].append((radial, axial, name))
+
+    ordered = []
+    section_counts = {}
+    for section in requested_sections:
+        entries = sorted(by_section[section])
+        section_counts[section] = len(entries)
+        if not entries:
+            continue
+        radial_indices = [entry[0] for entry in entries]
+        axial_indices = {entry[1] for entry in entries}
+        if axial_indices != {0} or radial_indices != list(range(len(entries))):
+            raise ValueError(
+                f"{winding} {section} turn indices are not contiguous radial "
+                "indices with axial index zero"
+            )
+        if section in reverse_sections:
+            entries.reverse()
+        ordered.extend(
+            (entry[2], section)
+            for entry in entries
+        )
+    if len(ordered) != len(names):
+        raise ValueError("turn ordering did not consume every object")
+    side_count = int(section_counts.get("side", 0))
+    side2_count = int(section_counts.get("side2", 0))
+    if full_model is False and side2_count:
+        raise ValueError("an eighth model must not contain side2 turn objects")
+    if full_model is True and side_count != side2_count:
+        raise ValueError(
+            "a full model must contain equal side and side2 turn counts"
+        )
+
+    signed_increments = [
+        weights[section] * polarities[section]
+        for _, section in ordered
+    ]
+    signed_effective_turn_count = sum(signed_increments)
+    if (
+        not math.isfinite(signed_effective_turn_count)
+        or abs(signed_effective_turn_count) <= 1e-15
+    ):
+        raise ValueError(
+            "section polarities cancel the terminal effective turn count"
+        )
+    weighted_midpoints = []
+    cumulative = 0.0
+    for increment in signed_increments:
+        weighted_midpoints.append(cumulative + 0.5 * increment)
+        cumulative += increment
+
+    count = len(ordered)
+    if voltage_policy == "turn_midpoint":
+        fractions = [
+            position / signed_effective_turn_count
+            for position in weighted_midpoints
+        ]
+        normalization_basis = "retained_geometry_effective_turn_count"
+    elif voltage_policy == "terminal_endpoints":
+        if count < 2:
+            raise ValueError(
+                "terminal_endpoints requires at least two physical turns"
+            )
+        endpoint_span = weighted_midpoints[-1] - weighted_midpoints[0]
+        if abs(endpoint_span) <= 1e-15:
+            raise ValueError(
+                "terminal_endpoints has zero weighted endpoint span"
+            )
+        fractions = [
+            (position - weighted_midpoints[0]) / endpoint_span
+            for position in weighted_midpoints
+        ]
+        normalization_basis = "first_to_last_turn_weighted_midpoint"
+    else:
+        raise ValueError("unsupported turn voltage policy")
+    if reverse_terminal_polarity:
+        fractions = [1.0 - fraction for fraction in fractions]
+
+    full_topology_effective_turn_count = signed_effective_turn_count
+    mirrored_side2_effective_turn_count = 0.0
+    if full_model is False and side_count and not side2_count:
+        mirrored_side2_effective_turn_count = (
+            side_count
+            * weights.get("side", 0.0)
+            * polarities.get("side", 1)
+        )
+        full_topology_effective_turn_count += (
+            mirrored_side2_effective_turn_count
+        )
+    even_potential_assumption = full_model is False
+    return {
+        "schema_version": TURN_GRADED_VOLTAGE_SCHEDULE_SCHEMA_VERSION,
+        "winding": winding,
+        "voltage_policy": voltage_policy,
+        "terminal_voltage_V": 1.0,
+        "section_order": list(requested_sections),
+        "reverse_sections": sorted(reverse_sections),
+        "reverse_terminal_polarity": bool(reverse_terminal_polarity),
+        "section_turn_counts": section_counts,
+        "section_turn_voltage_weights": weights,
+        "section_polarities": polarities,
+        "turn_count": count,
+        "physical_turn_count": count,
+        "signed_effective_turn_count_geometry": signed_effective_turn_count,
+        "mirrored_side2_effective_turn_count": (
+            mirrored_side2_effective_turn_count
+        ),
+        "full_topology_effective_turn_count": (
+            full_topology_effective_turn_count
+        ),
+        "voltage_normalization_basis": normalization_basis,
+        "model_basis": (
+            "full"
+            if full_model is True
+            else "eighth"
+            if full_model is False
+            else "unspecified"
+        ),
+        "side2_present": bool(side2_count),
+        "symmetric_side2_absence_attested": bool(
+            full_model is False and side2_count == 0
+        ),
+        "electrostatic_even_potential_symmetry_assumed": (
+            even_potential_assumption
+        ),
+        "symmetric_connection_limitation": (
+            "retained side turn potentials are mirrored onto the absent side2 "
+            "geometry; this is an even-potential approximation, not an "
+            "attestation of the unknown full series interconnect"
+            if even_potential_assumption
+            else "none"
+        ),
+        "turns": [
+            {
+                "series_index": index,
+                "object_name": name,
+                "section": section,
+                "turn_voltage_weight": weights[section],
+                "section_polarity": polarities[section],
+                "signed_turn_voltage_increment": signed_increments[index],
+                "weighted_midpoint_position": weighted_midpoints[index],
+                "voltage_fraction": fraction,
+                "voltage_V": fraction,
+            }
+            for index, ((name, section), fraction)
+            in enumerate(zip(ordered, fractions))
+        ],
+    }
+
+
+def build_turn_graded_energy_payload(
+    *,
+    active_winding,
+    electrostatic_energy_J,
+    voltage_schedule,
+    full_model=False,
+    self_inductance_H=None,
+):
+    """Convert one graded-voltage electrostatic field energy to terminal C.
+
+    Maxwell solves the physical per-turn voltages in one field solution.  For
+    a 1 V terminal difference, ``Ceq = 2U``.  An eighth model stores one eighth
+    of the full transformer's energy, so its capacitance restoration factor is
+    eight, exactly as for the existing two-net screen.
+    """
+    active_winding = str(active_winding)
+    if active_winding not in {"Tx", "Rx"}:
+        raise ValueError("active_winding must be Tx or Rx")
+    if not isinstance(voltage_schedule, Mapping):
+        raise TypeError("voltage_schedule must be a mapping")
+    if (
+        voltage_schedule.get("winding") != active_winding
+        or voltage_schedule.get("schema_version")
+        != TURN_GRADED_VOLTAGE_SCHEDULE_SCHEMA_VERSION
+        or int(voltage_schedule.get("turn_count") or 0) < 1
+    ):
+        raise ValueError("voltage schedule identity is inconsistent")
+    energy_J = _positive_finite(
+        electrostatic_energy_J, "electrostatic_energy_J"
+    )
+    full_model = _normalize_full_model(full_model)
+    restoration = (
+        1.0 if full_model else EIGHTH_CAPACITANCE_RESTORATION_FACTOR
+    )
+    terminal_voltage_V = _positive_finite(
+        voltage_schedule.get("terminal_voltage_V"), "terminal_voltage_V"
+    )
+    raw_capacitance_F = (
+        2.0 * energy_J / (terminal_voltage_V * terminal_voltage_V)
+    )
+    capacitance_F = raw_capacitance_F * restoration
+    payload = {
+        "cap_turn_graded_schema_version": (
+            TURN_GRADED_CAPACITANCE_SCHEMA_VERSION
+        ),
+        "active_winding": active_winding,
+        "method": "single-field-solve_integral_0p5_E_dot_D",
+        "voltage_distribution": voltage_schedule["voltage_policy"],
+        "other_winding_policy": "grounded_0V",
+        "core_plate_and_remote_region_policy": "grounded_0V",
+        "model_basis": "full" if full_model else "eighth",
+        "output_basis": "full_physical",
+        "electrostatic_energy_raw_J": energy_J,
+        "terminal_voltage_V": terminal_voltage_V,
+        "capacitance_restoration_factor": restoration,
+        "C_eq_raw_F": raw_capacitance_F,
+        "C_eq_full_F": capacitance_F,
+        "turn_count": int(voltage_schedule["turn_count"]),
+        "schedule_schema_version": voltage_schedule["schema_version"],
+        "section_order": json.dumps(
+            voltage_schedule["section_order"], separators=(",", ":")
+        ),
+        "section_turn_voltage_weights": json.dumps(
+            voltage_schedule["section_turn_voltage_weights"],
+            sort_keys=True, separators=(",", ":"),
+        ),
+        "section_polarities": json.dumps(
+            voltage_schedule["section_polarities"],
+            sort_keys=True, separators=(",", ":"),
+        ),
+        "signed_effective_turn_count_geometry": float(
+            voltage_schedule["signed_effective_turn_count_geometry"]
+        ),
+        "full_topology_effective_turn_count": float(
+            voltage_schedule["full_topology_effective_turn_count"]
+        ),
+        "voltage_normalization_basis": voltage_schedule[
+            "voltage_normalization_basis"
+        ],
+        "symmetric_side2_absence_attested": int(bool(
+            voltage_schedule["symmetric_side2_absence_attested"]
+        )),
+        "electrostatic_even_potential_symmetry_assumed": int(bool(
+            voltage_schedule[
+                "electrostatic_even_potential_symmetry_assumed"
+            ]
+        )),
+        "symmetric_connection_limitation": voltage_schedule[
+            "symmetric_connection_limitation"
+        ],
+        "schedule": dict(voltage_schedule),
+        "resonance_formula": "1/(2*pi*sqrt(L_H*C_eq_full_F))",
+    }
+    if self_inductance_H is not None:
+        inductance_H = _positive_finite(
+            self_inductance_H, "self_inductance_H"
+        )
+        payload["self_inductance_H"] = inductance_H
+        payload["f_res_self_Hz"] = lc_resonance_hz(
+            inductance_H, capacitance_F
+        )
+    return payload

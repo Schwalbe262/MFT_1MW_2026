@@ -95,6 +95,18 @@ ELECTROSTATIC_STAGE_INPUT_KEYS = (
     "cap_max_passes",
     "cap_percent_error",
 )
+# Fixed-run-only terminal-capacitance diagnostic.  One task solves exactly one
+# active winding so connection/order/polarity variants can be submitted in
+# parallel without multiplying the wall time of a single AEDT process.
+TURN_GRADED_ELECTROSTATIC_INPUT_KEYS = (
+    "cap_turn_graded_active_winding",
+    "cap_turn_graded_voltage_policy",
+    "cap_turn_graded_section_order",
+    "cap_turn_graded_reverse_sections",
+    "cap_turn_graded_reverse_terminal_polarity",
+    "cap_turn_graded_side_polarity",
+    "cap_turn_graded_side2_polarity",
+)
 # Solver-contract metadata is accepted and echoed by fixed runs, but is not a
 # Sobol coordinate or an AEDT numeric design variable.
 PHYSICS_METADATA_INPUT_KEYS = (
@@ -118,9 +130,13 @@ PRE_CORE_CENTER_GAP_INPUT_KEYS = [
     *ELECTROSTATIC_STAGE_INPUT_KEYS,
     *PHYSICS_METADATA_INPUT_KEYS,
 ]
-ALL_INPUT_KEYS = [
+PRE_TURN_GRADED_INPUT_KEYS = [
     *PRE_CORE_CENTER_GAP_INPUT_KEYS,
     *FIXED_GEOMETRY_INPUT_KEYS,
+]
+ALL_INPUT_KEYS = [
+    *PRE_TURN_GRADED_INPUT_KEYS,
+    *TURN_GRADED_ELECTROSTATIC_INPUT_KEYS,
 ]
 
 # Candidate authentication remains fail-closed: sealed fronts use KEYS, while
@@ -130,8 +146,35 @@ SUPPORTED_CANDIDATE_INPUT_SCHEMAS = frozenset({
     frozenset(KEYS),
     frozenset(PRE_ANISOTROPIC_CORE_K_INPUT_KEYS),
     frozenset(PRE_CORE_CENTER_GAP_INPUT_KEYS),
+    frozenset(PRE_TURN_GRADED_INPUT_KEYS),
     frozenset(ALL_INPUT_KEYS),
 })
+
+
+def parse_turn_graded_section_spec(value, *, allow_auto=False, allow_none=False):
+    """Parse one deterministic comma-separated winding-section control."""
+    raw = str(value).strip()
+    lowered = raw.lower()
+    if allow_auto and lowered == "auto":
+        return "auto"
+    if allow_none and lowered in {"", "none"}:
+        return ()
+    parts = tuple(part.strip().lower() for part in raw.split(","))
+    if (
+        not parts
+        or any(not part for part in parts)
+        or len(parts) != len(set(parts))
+        or any(part not in {"main", "side", "side2"} for part in parts)
+    ):
+        allowed = "main,side,side2"
+        if allow_auto:
+            allowed += " or auto"
+        if allow_none:
+            allowed += " or none"
+        raise ValueError(
+            f"invalid turn-graded section spec {value!r}; expected {allowed}"
+        )
+    return parts
 
 
 def get_drawing_default_params():
@@ -211,6 +254,15 @@ def get_drawing_default_params():
         "cap_on": 1,
         "cap_max_passes": 10,
         "cap_percent_error": 1.0,
+        # Turn-graded terminal-C correction is opt-in and deliberately
+        # independent of the legacy two-equipotential-net ``cap_on`` screen.
+        "cap_turn_graded_active_winding": "off",
+        "cap_turn_graded_voltage_policy": "turn_midpoint",
+        "cap_turn_graded_section_order": "auto",
+        "cap_turn_graded_reverse_sections": "none",
+        "cap_turn_graded_reverse_terminal_polarity": 0,
+        "cap_turn_graded_side_polarity": 1,
+        "cap_turn_graded_side2_polarity": 1,
         # 열해석 조건
         "plate_temp": 50.0,      # 콜드플레이트 고정온도 [cel]
         "air_temp": 50.0,        # 팬 흡입공기/주변 온도 [cel]
@@ -309,6 +361,7 @@ def create_input_parameter(param=None):
                     *THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
                     *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
                     *ELECTROSTATIC_STAGE_INPUT_KEYS,
+                    *TURN_GRADED_ELECTROSTATIC_INPUT_KEYS,
                     *PHYSICS_METADATA_INPUT_KEYS,
                     *FIXED_GEOMETRY_INPUT_KEYS):
                 if key not in param.columns:
@@ -334,6 +387,7 @@ def create_input_parameter(param=None):
             *THERMAL_CORE_CONDUCTIVITY_INPUT_KEYS,
             *EFFICIENCY_EXPERIMENT_INPUT_KEYS,
             *ELECTROSTATIC_STAGE_INPUT_KEYS,
+            *TURN_GRADED_ELECTROSTATIC_INPUT_KEYS,
             *PHYSICS_METADATA_INPUT_KEYS,
             *FIXED_GEOMETRY_INPUT_KEYS):
         if key not in param_df.columns:
@@ -1030,6 +1084,72 @@ def validation_check(input_df, strict=False, return_errors=False):
             "cap_percent_error must be finite and > 0 "
             f"({inp['cap_percent_error'].iloc[0]})"
         )
+    graded_active = str(
+        inp["cap_turn_graded_active_winding"].iloc[0]
+    ).strip()
+    if graded_active not in {"off", "Tx", "Rx"}:
+        errors.append(
+            "cap_turn_graded_active_winding must be off, Tx, or Rx "
+            f"({graded_active})"
+        )
+    if graded_active != "off" and int(inp["matrix_on"].iloc[0]) == 0:
+        errors.append(
+            "turn-graded capacitance requires matrix_on=1 "
+            "(inductance and exact geometry are required)"
+        )
+    graded_policy = str(
+        inp["cap_turn_graded_voltage_policy"].iloc[0]
+    ).strip()
+    if graded_policy not in {"turn_midpoint", "terminal_endpoints"}:
+        errors.append(
+            "cap_turn_graded_voltage_policy must be turn_midpoint or "
+            f"terminal_endpoints ({graded_policy})"
+        )
+    try:
+        graded_order = parse_turn_graded_section_spec(
+            inp["cap_turn_graded_section_order"].iloc[0],
+            allow_auto=True,
+        )
+    except ValueError as error:
+        errors.append(str(error))
+        graded_order = "auto"
+    try:
+        graded_reverse = parse_turn_graded_section_spec(
+            inp["cap_turn_graded_reverse_sections"].iloc[0],
+            allow_none=True,
+        )
+    except ValueError as error:
+        errors.append(str(error))
+        graded_reverse = ()
+    if graded_order != "auto" and not set(graded_reverse).issubset(
+            set(graded_order)):
+        errors.append(
+            "cap_turn_graded_reverse_sections must be a subset of "
+            "cap_turn_graded_section_order"
+        )
+    for key in (
+            "cap_turn_graded_reverse_terminal_polarity",
+            "cap_turn_graded_side_polarity",
+            "cap_turn_graded_side2_polarity"):
+        value = inp[key].iloc[0]
+        try:
+            numeric = float(value)
+            parsed = (
+                int(numeric)
+                if math.isfinite(numeric) and numeric.is_integer()
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            parsed = None
+        allowed = (
+            {0, 1}
+            if key == "cap_turn_graded_reverse_terminal_polarity"
+            else {-1, 1}
+        )
+        if isinstance(value, bool) or parsed not in allowed:
+            errors.append(
+                f"{key} must be one of {sorted(allowed)} ({value})"
+            )
 
     n_exp = int(inp["n_explicit_turns"].iloc[0])
     if int(inp["thermal_on"].iloc[0]) != 0 and n_exp < -1:
@@ -1103,6 +1223,13 @@ NON_DESIGN_VAR_KEYS = {
     "core_cm", "core_x", "core_y",
     "matrix_on", "loss_on", "thermal_on",
     "cap_on", "cap_max_passes", "cap_percent_error",
+    "cap_turn_graded_active_winding",
+    "cap_turn_graded_voltage_policy",
+    "cap_turn_graded_section_order",
+    "cap_turn_graded_reverse_sections",
+    "cap_turn_graded_reverse_terminal_polarity",
+    "cap_turn_graded_side_polarity",
+    "cap_turn_graded_side2_polarity",
     "plate_temp", "air_temp", "fan_velocity",
     "k_ins", "core_k_thermal", "core_k_anisotropic", "core_k_alloy",
     "core_k_interlayer", "n_explicit_turns",

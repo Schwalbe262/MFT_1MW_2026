@@ -110,6 +110,7 @@ from module.input_parameter_260706 import (
     validation_check,
     get_tx_y_gaps,
     get_drawing_default_params,
+    parse_turn_graded_section_spec,
     sym_cut_count,
 )
 from module.modeling_260706 import (
@@ -142,6 +143,8 @@ from module.thermal_probe_contract import (
 from module.electrostatic_cap import (
     build_capacitance_payload,
     build_capacitance_timing_payload,
+    build_turn_graded_energy_payload,
+    linear_turn_voltage_schedule,
     parse_maxwell_capacitance_export,
 )
 from module.aedt_pool_adapter import (
@@ -4314,7 +4317,8 @@ class Simulation():
         self.design1.assign_symmetry(assignment=self.air_region.bottom_face_y, symmetry_name="Symmetry3", is_odd=True)
         self.design1.assign_radiation(assignment=[self.air_region.top_face_z, self.air_region.bottom_face_x, self.air_region.top_face_y], radiation="Radiation")
 
-    def create_capacitance_design(self, name="maxwell_cap"):
+    def create_capacitance_design(
+            self, name="maxwell_cap", graded_voltage=None):
         """Copy the solved matrix geometry into a Maxwell Electrostatic design.
 
         Only physical 3D bodies are copied; magnetic coil-terminal/flux sheets,
@@ -4324,6 +4328,12 @@ class Simulation():
         core and cooling plates are tied to the finite enclosure ground.  This
         is intentionally a first-order two-net screening model, not a
         turn-by-turn winding network.
+
+        When ``graded_voltage`` is supplied, each turn in its active winding is
+        assigned an individual linear series voltage and the other winding is
+        grounded.  That mode performs one physical field solve and obtains an
+        energy-equivalent terminal capacitance; it deliberately does not build
+        the legacy two-source capacitance matrix.
         """
         source = getattr(self, "design_matrix", None)
         if source is None:
@@ -4438,12 +4448,77 @@ class Simulation():
             if cap_even_symmetry is None or cap_even_symmetry is False:
                 raise RuntimeError("assigning electrostatic even symmetry failed")
 
-        tx_voltage = cap_design.assign_voltage(
-            assignment=tx_names, amplitude="1V", name="CapTx"
-        )
-        rx_voltage = cap_design.assign_voltage(
-            assignment=rx_names, amplitude="0V", name="CapRx"
-        )
+        graded_schedule = None
+        signal_boundaries = []
+        matrix = None
+        if graded_voltage is None:
+            tx_voltage = cap_design.assign_voltage(
+                assignment=tx_names, amplitude="1V", name="CapTx"
+            )
+            rx_voltage = cap_design.assign_voltage(
+                assignment=rx_names, amplitude="0V", name="CapRx"
+            )
+            signal_boundaries.extend([
+                ("Tx", tx_voltage),
+                ("Rx", rx_voltage),
+            ])
+        else:
+            if not isinstance(graded_voltage, dict):
+                raise TypeError("graded_voltage must be a dict")
+            active_winding = str(
+                graded_voltage.get("active_winding") or ""
+            )
+            if active_winding not in {"Tx", "Rx"}:
+                raise ValueError(
+                    "graded_voltage active_winding must be Tx or Rx"
+                )
+            active_names = tx_names if active_winding == "Tx" else rx_names
+            grounded_names = rx_names if active_winding == "Tx" else tx_names
+            graded_schedule = linear_turn_voltage_schedule(
+                active_names,
+                winding=active_winding,
+                section_order=tuple(
+                    graded_voltage.get(
+                        "section_order", ("main", "side", "side2")
+                    )
+                ),
+                reverse_sections=tuple(
+                    graded_voltage.get("reverse_sections", ())
+                ),
+                reverse_terminal_polarity=bool(
+                    graded_voltage.get("reverse_terminal_polarity", False)
+                ),
+                voltage_policy=str(
+                    graded_voltage.get(
+                        "voltage_policy", "turn_midpoint"
+                    )
+                ),
+                section_turn_weights=graded_voltage.get(
+                    "section_turn_weights"
+                ),
+                section_polarities=graded_voltage.get(
+                    "section_polarities"
+                ),
+                full_model=bool(self.full_model),
+            )
+            inactive = cap_design.assign_voltage(
+                assignment=grounded_names,
+                amplitude="0V",
+                name=f"Cap{active_winding}OtherWindingGround",
+            )
+            signal_boundaries.append(("other winding", inactive))
+            for turn in graded_schedule["turns"]:
+                boundary = cap_design.assign_voltage(
+                    assignment=[turn["object_name"]],
+                    amplitude=f"{turn['voltage_V']:.17g}V",
+                    name=(
+                        f"Cap{active_winding}Turn"
+                        f"{turn['series_index']:03d}"
+                    ),
+                )
+                signal_boundaries.append(
+                    (f"{active_winding} turn {turn['series_index']}", boundary)
+                )
         # One shared 0-V source spans every grounded body.  In particular, the
         # touching segmented core boxes are not declared as independent nets.
         ground_solids_voltage = cap_design.assign_voltage(
@@ -4455,7 +4530,7 @@ class Simulation():
             amplitude="0V", name="CapGroundRegion",
         )
         for label, boundary in (
-                ("Tx", tx_voltage), ("Rx", rx_voltage),
+                *signal_boundaries,
                 ("ground solids", ground_solids_voltage),
                 ("ground region", ground_region_voltage)):
             if boundary is None or boundary is False:
@@ -4463,15 +4538,16 @@ class Simulation():
                     f"capacitance {label} voltage assignment failed"
                 )
 
-        matrix = cap_design.assign_matrix(
-            # Ground is an explicit 0-V boundary, not a matrix source.  Maxwell
-            # solves the two independent unit-voltage source patterns and emits
-            # the requested native 2x2 Maxwell capacitance matrix.
-            assignment=[tx_voltage.name, rx_voltage.name],
-            matrix_name="CapMatrix",
-        )
-        if matrix is None or matrix is False:
-            raise RuntimeError("native capacitance matrix assignment failed")
+        if graded_schedule is None:
+            matrix = cap_design.assign_matrix(
+                # Ground is an explicit 0-V boundary, not a matrix source.
+                # Maxwell solves the two independent unit-voltage source
+                # patterns and emits the requested native 2x2 matrix.
+                assignment=[tx_voltage.name, rx_voltage.name],
+                matrix_name="CapMatrix",
+            )
+            if matrix is None or matrix is False:
+                raise RuntimeError("native capacitance matrix assignment failed")
 
         setup = cap_design.create_setup(
             name="Setup1",
@@ -4480,8 +4556,8 @@ class Simulation():
             MinimumPasses=1,
             MinimumConvergedPasses=1,
             PercentError=float(self.df_plus["cap_percent_error"].iloc[0]),
-            SolveFieldOnly=False,
-            SolveMatrixAtLast=True,
+            SolveFieldOnly=graded_schedule is not None,
+            SolveMatrixAtLast=graded_schedule is None,
         )
         if setup is None or setup is False:
             raise RuntimeError("creating the electrostatic Setup1 failed")
@@ -4496,6 +4572,7 @@ class Simulation():
         )
         cap_design.cap_even_symmetry = cap_even_symmetry
         cap_design.cap_matrix = matrix
+        cap_design.cap_turn_voltage_schedule = graded_schedule
         self.cap_geometry_copy_count = len(geometry_names)
         self.cap_region_created_count = 1
         self.cap_region_remote_padding_percent = (
@@ -5236,6 +5313,130 @@ class Simulation():
             "[cap] capacitance extraction failed after "
             f"{max(1, int(max_attempts))} attempts: {last_error}"
         ) from last_error
+
+    def get_turn_graded_capacitance_parameter(self):
+        """Extract one energy-equivalent, turn-voltage-graded terminal C.
+
+        The active electrostatic design must have been built with
+        ``graded_voltage``.  AEDT solves the prescribed per-turn voltages in a
+        single field solution.  Integrating ``0.5 * E dot D`` over the remote
+        region and explicit dielectric pads gives its stored electric energy;
+        :func:`build_turn_graded_energy_payload` converts that energy to the
+        full-transformer terminal capacitance.
+        """
+        design = self.design1
+        schedule = getattr(design, "cap_turn_voltage_schedule", None)
+        if not isinstance(schedule, dict):
+            raise RuntimeError(
+                "turn-graded capacitance extraction requires a graded design"
+            )
+        expression = {
+            "name": "CapTurnGradedEnergyDensity",
+            "description": "Electrostatic energy density 0.5*E dot D",
+            "design_type": ["Maxwell 3D"],
+            "fields_type": ["Fields"],
+            "solution_type": "",
+            "primary_sweep": "Freq",
+            "assignment": "",
+            "assignment_type": ["Solid"],
+            "operations": [
+                "NameOfExpression('<Ex,Ey,Ez>')",
+                "NameOfExpression('<Dx,Dy,Dz>')",
+                "Operation('Dot')",
+                "Scalar_Constant(0.5)",
+                "Operation('*')",
+            ],
+            "dependent_expressions": [],
+            "report": ["Data Table", "Rectangular Plot"],
+        }
+        expression_name = design.post.fields_calculator.add_expression(
+            expression,
+            assignment=None,
+            name="CapTurnGradedEnergyDensity",
+        )
+        if not expression_name:
+            raise RuntimeError(
+                "creating turn-graded electrostatic energy expression failed"
+            )
+        region = getattr(design, "cap_region", None)
+        region_name = str(getattr(region, "name", "") or "")
+        dielectric_names = list(
+            getattr(design, "cap_dielectric_names", None) or []
+        )
+        if not region_name:
+            raise RuntimeError(
+                "turn-graded capacitance design has no attested region"
+            )
+        integration_objects = [region_name, *dielectric_names]
+        active = schedule["winding"]
+        prefix = "tx" if active == "Tx" else "rx"
+        extraction_key = f"cap_turn_graded_{prefix}"
+        self.extraction_attempts[extraction_key] = (
+            self.extraction_attempts.get(extraction_key, 0) + 1
+        )
+        energy_J = design.post.get_scalar_field_value(
+            expression_name,
+            scalar_function="Integrate",
+            solution="Setup1 : LastAdaptive",
+            object_name=integration_objects,
+            object_type="volume",
+        )
+        try:
+            energy_J = float(energy_J)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError(
+                "turn-graded electrostatic energy is non-numeric"
+            ) from error
+        if not math.isfinite(energy_J) or energy_J <= 0.0:
+            raise RuntimeError(
+                f"turn-graded electrostatic energy is invalid: {energy_J!r}"
+            )
+        inductance_column = "Ltx" if active == "Tx" else "Lrx"
+        if not hasattr(self, "df1") or inductance_column not in self.df1.columns:
+            raise RuntimeError(
+                "turn-graded resonance extraction requires solved matrix "
+                f"column {inductance_column}"
+            )
+        raw_inductance_uH = float(self.df1[inductance_column].iloc[0])
+        inductance_restoration = 1.0 if self.full_model else 2.0
+        self_inductance_H = (
+            raw_inductance_uH * inductance_restoration * 1e-6
+        )
+        payload = build_turn_graded_energy_payload(
+            active_winding=active,
+            electrostatic_energy_J=energy_J,
+            voltage_schedule=schedule,
+            full_model=self.full_model,
+            self_inductance_H=self_inductance_H,
+        )
+        payload[f"C_{prefix}_{prefix}_turn_graded_F"] = payload[
+            "C_eq_full_F"
+        ]
+        payload[f"f_res_{prefix}_turn_graded_Hz"] = payload[
+            "f_res_self_Hz"
+        ]
+        payload["cap_turn_graded_inductance_source"] = (
+            f"matrix_stage:{inductance_column}"
+        )
+        payload["cap_turn_graded_inductance_raw_uH"] = raw_inductance_uH
+        payload["cap_turn_graded_inductance_restoration_factor"] = (
+            inductance_restoration
+        )
+        payload["cap_turn_graded_schedule_json"] = json.dumps(
+            payload.pop("schedule"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        payload["cap_turn_graded_energy_integration_objects"] = (
+            json.dumps(integration_objects, separators=(",", ":"))
+        )
+        self.df_cap_turn_graded = pd.DataFrame([payload])
+        self.extraction_backends[
+            extraction_key
+        ] = "field_calculator_integral_0p5_E_dot_D"
+        self.extraction_units[extraction_key] = "F"
+        return self.df_cap_turn_graded
 
     def _export_field_report(
             self, report_name, Y_components, extraction_key="loss"):
@@ -6321,6 +6522,8 @@ class Simulation():
             tolerance_columns = {
                 "matrix": "matrix_percent_error",
                 "cap": "cap_percent_error",
+                "cap_turn_graded_tx": "cap_percent_error",
+                "cap_turn_graded_rx": "cap_percent_error",
                 "loss": "percent_error",
             }
             tolerance_column = tolerance_columns.get(label)
@@ -7133,6 +7336,8 @@ class Simulation():
         tolerance_columns = {
             "matrix": "matrix_percent_error",
             "cap": "cap_percent_error",
+            "cap_turn_graded_tx": "cap_percent_error",
+            "cap_turn_graded_rx": "cap_percent_error",
             "loss": "percent_error",
         }
         try:
@@ -7175,6 +7380,8 @@ class Simulation():
             "matrix": ("Maxwell 3D", "AC Magnetic"),
             "loss": ("Maxwell 3D", "AC Magnetic"),
             "cap": ("Maxwell 3D", "Electrostatic"),
+            "cap_turn_graded_tx": ("Maxwell 3D", "Electrostatic"),
+            "cap_turn_graded_rx": ("Maxwell 3D", "Electrostatic"),
         }
         try:
             return contracts[label]
@@ -7509,7 +7716,9 @@ class Simulation():
     def get_execution_telemetry(self):
         """Return solve/extraction provenance alongside each training row."""
         row = {}
-        for label in ("matrix", "cap", "loss"):
+        for label in (
+                "matrix", "cap", "cap_turn_graded_tx",
+                "cap_turn_graded_rx", "loss"):
             row[f"{label}_solve_attempts"] = int(self.solve_attempts.get(label, 0))
             row[f"{label}_solution_queries"] = int(self.extraction_attempts.get(label, 0))
             row[f"{label}_extraction_backend"] = self.extraction_backends.get(label, "not_run")
@@ -8070,6 +8279,103 @@ def _create_simulation_session(max_attempts=3, retry_delay_s=30):
     ) from last_error
 
 
+def _turn_graded_runtime_config(frame, *, full_model):
+    """Resolve one sealed fixed-input row into an explicit voltage schedule."""
+    active_winding = str(
+        frame["cap_turn_graded_active_winding"].iloc[0]
+    ).strip()
+    if active_winding == "off":
+        return None
+    if active_winding not in {"Tx", "Rx"}:
+        raise ValueError(
+            "cap_turn_graded_active_winding must be off, Tx, or Rx"
+        )
+    side_count_key = "N1_side" if active_winding == "Tx" else "N2_side"
+    side_count = int(frame[side_count_key].iloc[0])
+    expected_sections = ["main"]
+    if side_count > 0:
+        expected_sections.append("side")
+        if bool(full_model):
+            expected_sections.append("side2")
+
+    configured_order = parse_turn_graded_section_spec(
+        frame["cap_turn_graded_section_order"].iloc[0],
+        allow_auto=True,
+    )
+    section_order = (
+        tuple(expected_sections)
+        if configured_order == "auto"
+        else tuple(configured_order)
+    )
+    if (
+        len(section_order) != len(expected_sections)
+        or set(section_order) != set(expected_sections)
+    ):
+        raise ValueError(
+            "turn-graded section order must contain exactly the physical "
+            f"sections {expected_sections!r}; got {list(section_order)!r}"
+        )
+    reverse_sections = tuple(parse_turn_graded_section_spec(
+        frame["cap_turn_graded_reverse_sections"].iloc[0],
+        allow_none=True,
+    ))
+    if not set(reverse_sections).issubset(set(section_order)):
+        raise ValueError(
+            "turn-graded reverse sections are absent from the physical model"
+        )
+
+    section_turn_weights = {
+        section: 1.0 if section == "main" else 0.5
+        for section in section_order
+    }
+    section_polarities = {"main": 1}
+    if "side" in section_order:
+        section_polarities["side"] = int(
+            frame["cap_turn_graded_side_polarity"].iloc[0]
+        )
+    if "side2" in section_order:
+        section_polarities["side2"] = int(
+            frame["cap_turn_graded_side2_polarity"].iloc[0]
+        )
+    return {
+        "active_winding": active_winding,
+        "voltage_policy": str(
+            frame["cap_turn_graded_voltage_policy"].iloc[0]
+        ).strip(),
+        "section_order": section_order,
+        "reverse_sections": reverse_sections,
+        "reverse_terminal_polarity": bool(int(
+            frame[
+                "cap_turn_graded_reverse_terminal_polarity"
+            ].iloc[0]
+        )),
+        "section_turn_weights": section_turn_weights,
+        "section_polarities": section_polarities,
+    }
+
+
+def _preserve_standalone_hold_after_failure(
+        *, hold, backend, desktop, sim, held):
+    """Best-effort save and detach without closing a failed HOLD project."""
+    if (
+            not hold
+            or backend == "pooled"
+            or desktop is None
+            or sim is None):
+        return False
+    try:
+        sim.save_project()
+    except Exception as save_error:
+        # The original run failure remains authoritative.  A failed save must
+        # not cause the finalizer to close the only inspectable AEDT state.
+        logging.exception(
+            "HOLD failure preservation save also failed: %s", save_error
+        )
+    finally:
+        held[0] = True
+    return True
+
+
 def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrides=None):
     """
     param 이 None  -> 랜덤 파라미터 1회 (검증 실패 시 재추첨), 완료 후 프로젝트 삭제
@@ -8161,6 +8467,9 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         sim.full_model = int(sim.df_plus["full_model"].iloc[0]) != 0
         matrix_on = int(sim.df_plus["matrix_on"].iloc[0]) != 0
         cap_on = int(sim.df_plus["cap_on"].iloc[0]) != 0
+        cap_turn_graded_config = _turn_graded_runtime_config(
+            sim.df_plus, full_model=sim.full_model
+        )
         loss_on = int(sim.df_plus["loss_on"].iloc[0]) != 0
         thermal_on = int(sim.df_plus["thermal_on"].iloc[0]) != 0
 
@@ -8453,6 +8762,47 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         # loss_sym_on=1 (캠페인 기본): 대칭 1/8 + 전류 여자 (Tx = 부하+자화 페이저 합)
         #   -> 추출 시 오브젝트별 상수 보정으로 실물(_phys) 기록. 시간 ~4x 단축.
         # loss_sym_on=0 (최종 검증): 풀모델 + Tx 전압원 (검증된 물리 기준 경로)
+        # Corrected terminal-C diagnostic: one graded active winding per task.
+        if cap_turn_graded_config is not None:
+            if not matrix_on:
+                raise RuntimeError(
+                    "turn-graded capacitance requires matrix_on=1"
+                )
+            matrix_design = sim.design_matrix
+            active = cap_turn_graded_config["active_winding"]
+            prefix = "tx" if active == "Tx" else "rx"
+            label = f"cap_turn_graded_{prefix}"
+            graded_stage_started = time.monotonic()
+            graded_model_started = time.monotonic()
+            try:
+                with sim.aedt_automation_transaction():
+                    sim.create_capacitance_design(
+                        name=f"maxwell_{label}",
+                        graded_voltage=cap_turn_graded_config,
+                    )
+            finally:
+                sim.stage_timings[f"stage_time_{label}_model_s"] = (
+                    time.monotonic() - graded_model_started
+                )
+            sim.design_cap_turn_graded = sim.design1
+            try:
+                if not model_only:
+                    t_graded = sim.analyze_and_extract(
+                        label, sim.get_turn_graded_capacitance_parameter
+                    )
+                    total_time += t_graded
+                    result_parts.append(sim.df_cap_turn_graded.copy())
+                    result_parts.append(sim.get_convergence_info(label))
+                    result_parts.append(pd.DataFrame({
+                        f"time_{label}": [t_graded]
+                    }))
+                sim.stage_timings[f"stage_time_{label}_total_s"] = (
+                    time.monotonic() - graded_stage_started
+                )
+            finally:
+                # Every downstream stage remains anchored to maxwell_matrix.
+                sim.design1 = matrix_design
+
         if loss_on:
             loss_prepare_started = time.monotonic()
             loss_sym = int(sim.df_plus["loss_sym_on"].iloc[0]) != 0 and not sim.full_model
@@ -8730,6 +9080,13 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         logging.exception(f"run_one_loop failed: {e}")
         if sim is not None and getattr(sim, "input_df", None) is not None:
             log_failed_sample(sim.input_df, f"runtime: {e}")
+        _preserve_standalone_hold_after_failure(
+            hold=hold,
+            backend=backend,
+            desktop=desktop,
+            sim=sim,
+            held=held,
+        )
         if (
                 backend == "pooled"
                 and sim is not None
@@ -8769,7 +9126,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
                 "standalone native solver remains uncertain after run "
                 f"failure: {type(e).__name__}: {e}"
             ) from e
-        if fixed_mode:
+        if fixed_mode or hold:
             # fixed 모드에서는 실패를 조용히 넘기지 않는다
             if (
                     pooled_settlement_error[0] is not None
