@@ -5367,6 +5367,14 @@ class Simulation():
             raise RuntimeError(
                 "turn-graded capacitance design has no attested region"
             )
+        # AEDT 2026 R1 can terminate the field-calculator script when
+        # ``EnterVol`` receives a heterogeneous multi-object selection (the
+        # air Region plus dielectric pad solids).  This happened after a
+        # successful field solve and PyAEDT then returned the sentinel 0.0,
+        # which is not a physical zero-energy result.  Integrate each volume
+        # independently and sum the stored energy instead.  Besides avoiding
+        # the native selection bug, the component values provide a useful
+        # fail-closed attestation that every requested volume was evaluated.
         integration_objects = [region_name, *dielectric_names]
         active = schedule["winding"]
         prefix = "tx" if active == "Tx" else "rx"
@@ -5374,22 +5382,32 @@ class Simulation():
         self.extraction_attempts[extraction_key] = (
             self.extraction_attempts.get(extraction_key, 0) + 1
         )
-        energy_J = design.post.get_scalar_field_value(
-            expression_name,
-            scalar_function="Integrate",
-            solution="Setup1 : LastAdaptive",
-            object_name=integration_objects,
-            object_type="volume",
-        )
-        try:
-            energy_J = float(energy_J)
-        except (TypeError, ValueError, OverflowError) as error:
-            raise RuntimeError(
-                "turn-graded electrostatic energy is non-numeric"
-            ) from error
+        energy_components_J = {}
+        for object_name in integration_objects:
+            try:
+                component_J = float(design.post.get_scalar_field_value(
+                    expression_name,
+                    scalar_function="Integrate",
+                    solution="Setup1 : LastAdaptive",
+                    object_name=object_name,
+                    object_type="volume",
+                ))
+            except (TypeError, ValueError, OverflowError) as error:
+                raise RuntimeError(
+                    "turn-graded electrostatic energy is non-numeric for "
+                    f"volume {object_name!r}"
+                ) from error
+            if not math.isfinite(component_J) or component_J < 0.0:
+                raise RuntimeError(
+                    "turn-graded electrostatic energy is invalid for volume "
+                    f"{object_name!r}: {component_J!r}"
+                )
+            energy_components_J[object_name] = component_J
+        energy_J = math.fsum(energy_components_J.values())
         if not math.isfinite(energy_J) or energy_J <= 0.0:
             raise RuntimeError(
-                f"turn-graded electrostatic energy is invalid: {energy_J!r}"
+                "turn-graded electrostatic summed energy is invalid: "
+                f"{energy_J!r}; components={energy_components_J!r}"
             )
         inductance_column = "Ltx" if active == "Tx" else "Lrx"
         if not hasattr(self, "df1") or inductance_column not in self.df1.columns:
@@ -5415,6 +5433,20 @@ class Simulation():
         payload[f"f_res_{prefix}_turn_graded_Hz"] = payload[
             "f_res_self_Hz"
         ]
+        payload["cap_turn_graded_energy_integration_mode"] = (
+            "sum_individual_region_and_dielectric_volumes"
+        )
+        payload["cap_turn_graded_energy_component_count"] = len(
+            energy_components_J
+        )
+        payload["cap_turn_graded_energy_components_J_json"] = (
+            json.dumps(
+                energy_components_J,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        )
         payload["cap_turn_graded_inductance_source"] = (
             f"matrix_stage:{inductance_column}"
         )
