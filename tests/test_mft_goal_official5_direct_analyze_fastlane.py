@@ -89,7 +89,11 @@ def _source_package() -> dict[str, Any]:
 
 
 def _command(*, direct: bool, revision: str = SOLVER_REVISION) -> str:
-    prefix = f"git checkout {revision}; "
+    core_auth = fast.standalone_core_auth_sha256(revision)
+    prefix = (
+        f"git checkout {revision}; "
+        f'export MFT_STANDALONE_CORE_AUTH_SHA256="{core_auth}"; '
+    )
     if direct:
         return (
             prefix
@@ -131,7 +135,16 @@ def _direct_bundle(
         "dedupe_key": dedupe,
         "command": _command(direct=True, revision=revision),
     }
-    environment = {fast.DIRECT_ENV_NAME: fast.DIRECT_ENV_TOKEN}
+    environment = {
+        fast.DIRECT_ENV_NAME: fast.DIRECT_ENV_TOKEN,
+        "MFT_STANDALONE_CORE_CONTRACT": (
+            fast.STANDALONE_CORE_CONTRACT
+        ),
+        "MFT_STANDALONE_CORE_COUNT": str(fast.CPUS),
+        "MFT_STANDALONE_CORE_AUTH_SHA256": (
+            fast.standalone_core_auth_sha256(revision)
+        ),
+    }
     retained = {
         "dedupe_key": dedupe,
         "solver_revision": revision,
@@ -577,6 +590,11 @@ def test_prepare_seals_diagnostic_standard_plan_without_post(
         "env_value_sha256": fast.DIRECT_ENV_TOKEN_SHA256,
         "cli_flag": "--symmetry-thermal-direct-analyze",
         "exact_opt_in_required": True,
+        "standalone_core_contract": fast.STANDALONE_CORE_CONTRACT,
+        "standalone_core_count": fast.CPUS,
+        "standalone_core_auth_sha256": (
+            fast.standalone_core_auth_sha256(SOLVER_REVISION)
+        ),
     }
     assert plan["single_attempt_contract"]["post_call_budget"] == 1
     assert plan["single_attempt_contract"][

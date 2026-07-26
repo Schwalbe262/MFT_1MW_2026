@@ -141,11 +141,11 @@ STORAGE_AUDIT_DEDUPE_KEY = (
 )
 MAX_STORAGE_AUDIT_AGE_SECONDS = 4 * 60 * 60
 TASK_NAME = (
-    "mft-goal-diag-standard-official5-direct-analyze-samenode-v1-"
+    "mft-goal-diag-standard-official5-direct-analyze-samenode-r1-v2-"
     f"{SOURCE_SPEC.short_sha}-{NODE_NAME}"
 )
 WORKDIR = (
-    "mft_goal_diag_standard_official5_direct_analyze_samenode_v1_"
+    "mft_goal_diag_standard_official5_direct_analyze_samenode_r1_v2_"
     f"{SOURCE_SPEC.short_sha}_{NODE_NAME}"
 )
 DIRECT_ENV_NAME = "MFT_SYMMETRY_THERMAL_DIRECT_ANALYZE"
@@ -153,13 +153,37 @@ DIRECT_ENV_TOKEN = "standard-eighth-direct-analyze-v1"
 DIRECT_ENV_TOKEN_SHA256 = hashlib.sha256(
     DIRECT_ENV_TOKEN.encode("utf-8")
 ).hexdigest()
+STANDALONE_CORE_CONTRACT = "mft-standalone-core-optin-v1"
+
+
+def standalone_core_auth_sha256(solver_revision: str) -> str:
+    """Bind the 8-core opt-in to the exact committed solver revision."""
+
+    payload = {
+        "backend": "standalone",
+        "contract_version": STANDALONE_CORE_CONTRACT,
+        "requested_num_cores": CPUS,
+        "required_slurm_cpus_per_task": CPUS,
+        "solver_revision": solver_revision,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 POST_AUTHORIZATION = (
-    "authorize-official5-direct-analyze-samenode-96332-one-post-v1"
+    "authorize-official5-direct-analyze-samenode-r1-96332-one-post-v2"
 )
 
 OUTPUT_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\postdeadline_standard_official5_direct_analyze_samenode_v1"
+    r"\postdeadline_standard_official5_direct_analyze_samenode_r1_v2"
 )
 PLAN_NAME = "direct_analyze_plan.json"
 PREPARE_RECEIPT_NAME = "prepare_receipt.json"
@@ -510,6 +534,9 @@ def _payload_contract(solver_revision: str) -> Any:
         "SCHEDULER_SECONDS": SCHEDULER_SECONDS,
         "MAX_WORKERS_PER_NODE": MAX_WORKERS_PER_NODE,
         "PRIORITY": PRIORITY,
+        "CORE_AUTH_SHA256": standalone_core_auth_sha256(
+            solver_revision
+        ),
     }
     previous = {name: getattr(reviewed, name) for name in replacements}
     try:
@@ -621,9 +648,19 @@ def validate_direct_payload(
         "thermal_symmetry": params.get("thermal_symmetry"),
         "full_model": params.get("full_model"),
     }
+    core_auth = standalone_core_auth_sha256(solver_revision)
     if (
         drift
         or environment.get(DIRECT_ENV_NAME) != DIRECT_ENV_TOKEN
+        or environment.get("MFT_STANDALONE_CORE_CONTRACT")
+        != STANDALONE_CORE_CONTRACT
+        or environment.get("MFT_STANDALONE_CORE_COUNT") != str(CPUS)
+        or environment.get("MFT_STANDALONE_CORE_AUTH_SHA256")
+        != core_auth
+        or command.count(
+            f'export MFT_STANDALONE_CORE_AUTH_SHA256="{core_auth}"'
+        )
+        != 1
         or command.count(
             f'export {DIRECT_ENV_NAME}="{DIRECT_ENV_TOKEN}";'
         )
@@ -1286,6 +1323,13 @@ def prepare(
                     "env_value_sha256": DIRECT_ENV_TOKEN_SHA256,
                     "cli_flag": "--symmetry-thermal-direct-analyze",
                     "exact_opt_in_required": True,
+                    "standalone_core_contract": (
+                        STANDALONE_CORE_CONTRACT
+                    ),
+                    "standalone_core_count": CPUS,
+                    "standalone_core_auth_sha256": (
+                        standalone_core_auth_sha256(solver_revision)
+                    ),
                 },
                 "scheduler_url": SCHEDULER_URL,
                 "scheduler_project": PROJECT,
@@ -1414,6 +1458,13 @@ def load_plan(
         or direct.get("env_value") != DIRECT_ENV_TOKEN
         or direct.get("env_value_sha256") != DIRECT_ENV_TOKEN_SHA256
         or direct.get("exact_opt_in_required") is not True
+        or direct.get("standalone_core_contract")
+        != STANDALONE_CORE_CONTRACT
+        or direct.get("standalone_core_count") != CPUS
+        or direct.get("standalone_core_auth_sha256")
+        != standalone_core_auth_sha256(
+            str(plan.get("solver_revision") or "")
+        )
         or not isinstance(single, Mapping)
         or single.get("schema_version") != SINGLE_ATTEMPT_SCHEMA
         or Path(str(single.get("attempt_ledger_path") or "")).resolve()
