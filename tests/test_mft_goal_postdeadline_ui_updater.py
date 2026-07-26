@@ -48,7 +48,7 @@ def _status() -> dict[str, Any]:
         "generated_at": "2026-07-26T18:00:00+09:00",
         "deadline_at": "2026-07-26T18:00:00+09:00",
         "original_deadline_missed": True,
-        "summary": "must remain byte-for-byte as a JSON value",
+        "summary": "stale lifecycle summary that must be refreshed",
         "current": current,
         "completed": [_item("completed-static", "completed")],
         "attention": [
@@ -140,7 +140,6 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     source = _status()
     completed = copy.deepcopy(source["completed"])
     attention = copy.deepcopy(source["attention"])
-    summary = source["summary"]
     parallel = copy.deepcopy(source["current"][-1])
 
     merged = updater.merge_status(
@@ -153,7 +152,10 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["generated_at"] == OBSERVED
     assert merged["completed"] == completed
     assert merged["attention"] == attention
-    assert merged["summary"] == summary
+    assert "18:20 KST" in merged["summary"]
+    assert "running1 · queued1 · terminal2" in merged["summary"]
+    assert "physical feasible0" in merged["summary"]
+    assert "scientific/production PASS가 아닙니다" in merged["summary"]
     assert merged["current"][-1] == parallel
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 1

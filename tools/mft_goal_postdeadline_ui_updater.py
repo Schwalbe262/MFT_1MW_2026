@@ -516,6 +516,37 @@ def _protected_hashes(payload: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _live_summary(
+    *,
+    observed_at: str,
+    allocation_jobs: int,
+    submitted: int,
+    running: int,
+    queued: int,
+    collections: int,
+) -> str:
+    try:
+        observed = datetime.fromisoformat(observed_at)
+    except ValueError as exc:
+        raise UpdaterError("observed_at is not ISO-8601") from exc
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        raise UpdaterError("observed_at must include a UTC offset")
+    terminal = len(TASK_SPECS) - running - queued
+    if terminal < 0:
+        raise UpdaterError("live task counters are inconsistent")
+    return (
+        f"{observed:%H:%M} KST · original_deadline_missed=true. "
+        "인증된 scientific PASS는 없습니다. "
+        f"post-deadline diagnostic 작업: running{running} · queued{queued} · "
+        f"terminal{terminal}. Slurm allocation jobs{allocation_jobs} · "
+        f"submitted{submitted} · collections{collections}. "
+        "공식 512-seed aggregate는 physical feasible0 · production Pareto "
+        "front0 · audit-only objective front22입니다. Scheduler terminal "
+        "success도 collector와 artifact 인증 전에는 scientific/production "
+        "PASS가 아닙니다."
+    )
+
+
 def merge_status(
     payload: Mapping[str, Any],
     tasks: Mapping[int, Mapping[str, Any]],
@@ -551,6 +582,14 @@ def merge_status(
         and task["allocation_id"] is not None
     }
     allocation_jobs = len(active_allocations)
+    result["summary"] = _live_summary(
+        observed_at=observed_at,
+        allocation_jobs=allocation_jobs,
+        submitted=submitted,
+        running=running,
+        queued=queued,
+        collections=collections,
+    )
     handoff.update(
         {
             "title": (
