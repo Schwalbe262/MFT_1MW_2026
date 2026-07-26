@@ -331,6 +331,7 @@ def _local_selection_state(
     authenticated: int = 2,
     pending: int = 4,
     failures: int = 1,
+    failure_task_ids: tuple[int, ...] | None = None,
     selected: dict[str, Any] | None = None,
     prepared: int = 0,
     layout: str = "v6",
@@ -391,11 +392,25 @@ def _local_selection_state(
         )
         for task_id in authenticated_ids[:authenticated]:
             effective_statuses[task_id] = "collection_ready"
-        failed_ids = [
-            task_id
-            for task_id in reversed(expected_task_ids)
-            if effective_statuses[task_id] == "pending"
-        ][:failures]
+        failed_ids = (
+            list(failure_task_ids)
+            if failure_task_ids is not None
+            else [
+                task_id
+                for task_id in reversed(expected_task_ids)
+                if effective_statuses[task_id] == "pending"
+            ][:failures]
+        )
+        if (
+            len(failed_ids) != failures
+            or len(set(failed_ids)) != failures
+            or any(
+                task_id not in expected_task_ids
+                or effective_statuses[task_id] != "pending"
+                for task_id in failed_ids
+            )
+        ):
+            raise ValueError("invalid effective failure task ids")
         for task_id in failed_ids:
             effective_statuses[task_id] = "terminal_failure"
         lanes = []
@@ -809,7 +824,17 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
 
     by_id = {item["id"]: item for item in merged["current"]}
     postsuccess_card = by_id["codex-standard-postsuccess-pipeline"]
-    assert "AUTH 0 | PENDING 8 | ACTUAL PASS 0" in postsuccess_card["title"]
+    assert "AUTH 0 | PENDING 7 | ACTUAL PASS 0" in postsuccess_card["title"]
+    assert any(
+        "selection-effective authenticated=0/7 / pending=7 / "
+        "operational terminal failures=0" in item
+        for item in postsuccess_card["evidence"]
+    )
+    assert any(
+        "lifecycle attempts=9 / authenticated=0/9 / pending=8 / "
+        "operational terminal failures=1" in item
+        for item in postsuccess_card["evidence"]
+    )
     assert any(
         "lifecycle mode=v6-sealed-effective-plus-live-GET-lifecycle" in item
         for item in postsuccess_card["evidence"]
@@ -901,11 +926,17 @@ def test_local_symmetric_selection_card_shows_sealed_selection_and_budget(
 
     assert "SELECTED task96331" in card["title"]
     assert "AUTH 2/7" in card["title"]
-    assert "PENDING 6" in card["title"]
+    assert "PENDING 5" in card["title"]
     assert "ACTUAL PASS 0" in card["title"]
     assert "AUTO FULL OFF" in card["title"]
     assert any(
-        "authenticated=2/7 / pending=6 / operational terminal failures=1" in item
+        "selection-effective authenticated=2/7 / pending=5 / "
+        "operational terminal failures=0" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "lifecycle attempts=9 / authenticated=2/9 / pending=6 / "
+        "operational terminal failures=1" in item
         for item in card["evidence"]
     )
     assert any(
@@ -928,6 +959,102 @@ def test_local_symmetric_selection_card_shows_sealed_selection_and_budget(
     )
     assert merged["current"][-1]["id"] == "parallel-workstreams"
     updater.validate_status_sync(merged)
+
+
+def test_effective_and_lifecycle_failures_are_reported_separately(
+    tmp_path: Path,
+) -> None:
+    local_state = _local_selection_state(
+        status="partial_measured_waiting",
+        authenticated=0,
+        pending=6,
+        failures=1,
+        failure_task_ids=(96328,),
+    )
+    local_path = tmp_path / "local-selection-state.json"
+    local_path.write_text(
+        json.dumps(local_state, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tasks = _current_fast_lane_tasks()
+
+    local_card = updater._local_symmetric_selection_card(
+        local_path,
+        OBSERVED,
+        tasks,
+    )
+
+    assert "PENDING 6" in local_card["title"]
+    assert any(
+        "selection-effective authenticated=0/7 / pending=6 / "
+        "operational terminal failures=1" in item
+        for item in local_card["evidence"]
+    )
+    assert any(
+        "lifecycle attempts=9 / authenticated=0/9 / pending=7 / "
+        "operational terminal failures=2" in item
+        for item in local_card["evidence"]
+    )
+
+    postsuccess = updater._sealed(
+        {
+            "schema_version": updater.POSTSUCCESS_STATE_SCHEMA,
+            "status": "pending_standard_collections",
+            "collection_count": 0,
+            "pending_count": 6,
+            "terminal_failure_count": 1,
+            "expected_lane_count": 7,
+            "lifecycle_lane_count": 9,
+            "effective_task_ids": list(updater.STANDARD_SELECTION_TASK_IDS),
+            "lifecycle_task_ids": list(
+                updater.STANDARD_SELECTION_LIFECYCLE_TASK_IDS
+            ),
+            "selection_superseded_task_ids": list(
+                updater.STANDARD_SELECTION_SUPERSEDED_TASK_IDS
+            ),
+            "lifecycle_collection_count": 0,
+            "lifecycle_pending_count": 7,
+            "lifecycle_terminal_failure_count": 2,
+            "lanes": [
+                {
+                    "task_id": lane["task_id"],
+                    "selection_effective": lane["selection_effective"],
+                    "status": lane["effective_status"],
+                }
+                for lane in local_state["lanes"]
+            ],
+            "diagnostic_only": True,
+            "production_eligible": False,
+            "scheduler_mutation_performed": False,
+            "scientific_pass_claimed": False,
+            "production_claimed": False,
+            "surrogate_retraining_performed": False,
+            "production_pareto_emitted": False,
+        }
+    )
+    postsuccess_path = tmp_path / "postsuccess-state.json"
+    postsuccess_path.write_text(
+        json.dumps(postsuccess, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    pipeline_card = updater._postsuccess_card(
+        postsuccess_path,
+        OBSERVED,
+        tasks,
+    )
+
+    assert "PENDING 6" in pipeline_card["title"]
+    assert any(
+        "selection-effective authenticated=0/7 / pending=6 / "
+        "operational terminal failures=1" in item
+        for item in pipeline_card["evidence"]
+    )
+    assert any(
+        "lifecycle attempts=9 / authenticated=0/9 / pending=7 / "
+        "operational terminal failures=2" in item
+        for item in pipeline_card["evidence"]
+    )
 
 
 def test_local_symmetric_selection_v5_fallback_overlays_new_lifecycle_once(
@@ -958,9 +1085,15 @@ def test_local_symmetric_selection_v5_fallback_overlays_new_lifecycle_once(
     card = updater._local_symmetric_selection_card(path, OBSERVED, tasks)
 
     assert "AUTH 0/7" in card["title"]
-    assert "PENDING 8" in card["title"]
+    assert "PENDING 7" in card["title"]
     assert any(
-        "authenticated=0/7 / pending=8 / operational terminal failures=1" in item
+        "selection-effective authenticated=0/7 / pending=7 / "
+        "operational terminal failures=0" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "lifecycle attempts=9 / authenticated=0/9 / pending=8 / "
+        "operational terminal failures=1" in item
         for item in card["evidence"]
     )
     assert any(
@@ -988,8 +1121,15 @@ def test_local_symmetric_selection_card_shows_bounded_local_batch(
 
     assert "LOCAL BATCH 3/3 READY" in card["title"]
     assert "AUTH 6/7" in card["title"]
+    assert "PENDING 0" in card["title"]
     assert any(
-        "authenticated=6/7 / pending=1 / operational terminal failures=2" in item
+        "selection-effective authenticated=6/7 / pending=0 / "
+        "operational terminal failures=1" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "lifecycle attempts=9 / authenticated=6/9 / pending=1 / "
+        "operational terminal failures=2" in item
         for item in card["evidence"]
     )
     assert any(

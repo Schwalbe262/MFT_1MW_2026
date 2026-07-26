@@ -1188,6 +1188,7 @@ def _postsuccess_card(
         lifecycle_failures = failure_count + overlay_failures
         lifecycle_mode = "v5-overlay-fallback"
         watcher_snapshot = "watcher snapshot=v5 effective-only"
+    lifecycle_authenticated = 9 - lifecycle_pending - lifecycle_failures
     if (
         state.get("diagnostic_only") is not True
         or state.get("production_eligible") is not False
@@ -1235,7 +1236,7 @@ def _postsuccess_card(
     }
     card["title"] = (
         "CODEX AUTO | STANDARD RESULT PIPELINE | "
-        f"AUTH {collection_count} | PENDING {lifecycle_pending} | ACTUAL PASS 0"
+        f"AUTH {collection_count} | PENDING {pending_count} | ACTUAL PASS 0"
     )
     card["detail"] = (
         "Nine lifecycle attempts currently feed seven effective "
@@ -1245,8 +1246,14 @@ def _postsuccess_card(
         "scientific or production claim."
     )
     card["evidence"][1] = (
-        f"authenticated={collection_count}/7 / pending={lifecycle_pending} / "
-        f"operational terminal failures={lifecycle_failures}"
+        f"selection-effective authenticated={collection_count}/7 / "
+        f"pending={pending_count} / operational terminal failures={failure_count}"
+    )
+    card["evidence"].insert(
+        2,
+        f"lifecycle attempts=9 / authenticated={lifecycle_authenticated}/9 / "
+        f"pending={lifecycle_pending} / "
+        f"operational terminal failures={lifecycle_failures}",
     )
     card["evidence"].insert(
         -2,
@@ -1510,6 +1517,9 @@ def _strict_local_symmetric_selection_card(
         lifecycle_count = 9
         lifecycle_mode = "v5-overlay-fallback"
         watcher_snapshot = "watcher snapshot=v5 effective-only"
+    lifecycle_authenticated = (
+        lifecycle_count - lifecycle_pending - lifecycle_failures
+    )
 
     current_round = _selection_count(budget.get("current_round"), "current local round")
     max_rounds = _selection_count(budget.get("max_rounds"), "maximum local rounds")
@@ -1623,14 +1633,21 @@ def _strict_local_symmetric_selection_card(
     }
     card["title"] = (
         f"CODEX | SYMMETRIC FEA SELECT | {label} | AUTH {authenticated}/7 | "
-        f"PENDING {lifecycle_pending} | ACTUAL PASS 0 | AUTO FULL OFF"
+        f"PENDING {pending} | ACTUAL PASS 0 | AUTO FULL OFF"
     )
     card["evidence"][1] = (
-        f"authenticated={authenticated}/7 / pending={lifecycle_pending} / "
-        f"operational terminal failures={lifecycle_failures}"
+        f"selection-effective authenticated={authenticated}/7 / "
+        f"pending={pending} / operational terminal failures={failures}"
     )
     card["evidence"].insert(
         2,
+        f"lifecycle attempts={lifecycle_count} / "
+        f"authenticated={lifecycle_authenticated}/{lifecycle_count} / "
+        f"pending={lifecycle_pending} / "
+        f"operational terminal failures={lifecycle_failures}",
+    )
+    card["evidence"].insert(
+        3,
         f"lifecycle mode={lifecycle_mode} / observations={lifecycle_count} / "
         "selection-effective=7 / "
         "task96332 superseded by task96338 / "
