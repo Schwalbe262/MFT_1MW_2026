@@ -4485,6 +4485,14 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
             "thermal_residual_z_velocity": [4e-4],
             "thermal_residual_energy": [4e-9],
             "thermal_rx_model": ["homogenized_blocks"],
+            "thermal_rx_block_interface_contract_version": [
+                "thermal-rx-block-interface-coverage-v1"
+            ],
+            "thermal_rx_main_interface_coverage_passed": [True],
+            "thermal_rx_main_unpaired_interfaces": [[]],
+            "thermal_temperature_limiter_triggered": [False],
+            "thermal_temperature_limiter_max_K": [356.15],
+            "thermal_result_scientific_valid": [True],
             "thermal_rx_power_balance_ok": [1],
             "thermal_rx_power_balance_group_count": [2],
             "thermal_rx_power_balance_max_abs_w": [0.0],
@@ -4555,6 +4563,14 @@ class ThermalCompletionPolicyTests(unittest.TestCase):
             "thermal_residual_z_velocity": [4e-4],
             "thermal_residual_energy": [4e-9],
             "thermal_rx_model": ["homogenized_blocks"],
+            "thermal_rx_block_interface_contract_version": [
+                "thermal-rx-block-interface-coverage-v1"
+            ],
+            "thermal_rx_main_interface_coverage_passed": [True],
+            "thermal_rx_main_unpaired_interfaces": [[]],
+            "thermal_temperature_limiter_triggered": [False],
+            "thermal_temperature_limiter_max_K": [356.15],
+            "thermal_result_scientific_valid": [True],
             "thermal_rx_power_balance_ok": [1],
             "thermal_rx_power_balance_group_count": [2],
             "thermal_rx_power_balance_max_abs_w": [0.0],

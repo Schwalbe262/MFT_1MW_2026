@@ -1174,6 +1174,37 @@ def _thermal_result_is_valid(frame, physics_data_revision=None):
             return False
         if int(frame["thermal_rx_power_balance_ok"].iloc[0]) != 1:
             return False
+        if (
+            str(
+                frame[
+                    "thermal_rx_block_interface_contract_version"
+                ].iloc[0]
+            )
+            != "thermal-rx-block-interface-coverage-v1"
+            or bool(
+                frame[
+                    "thermal_rx_main_interface_coverage_passed"
+                ].iloc[0]
+            )
+            is not True
+            or bool(
+                frame["thermal_temperature_limiter_triggered"].iloc[0]
+            )
+            is not False
+            or bool(
+                frame["thermal_result_scientific_valid"].iloc[0]
+            )
+            is not True
+        ):
+            return False
+        limiter_max_k = float(
+            frame["thermal_temperature_limiter_max_K"].iloc[0]
+        )
+        if (
+            not math.isfinite(limiter_max_k)
+            or limiter_max_k >= 4990.0
+        ):
+            return False
         if float(frame["thermal_rx_power_balance_group_count"].iloc[0]) < 1:
             return False
         rx_expected = float(frame["thermal_rx_expected_power_w"].iloc[0])
@@ -1283,6 +1314,14 @@ def _thermal_failure_frame(error, core_conductivity=None):
     core_conductivity = core_conductivity or {}
     return pd.DataFrame({
         "thermal_solved": [0],
+        "thermal_rx_block_interface_contract_version": [
+            "thermal-rx-block-interface-coverage-v1"
+        ],
+        "thermal_rx_main_interface_coverage_passed": [False],
+        "thermal_rx_main_unpaired_interfaces": [[]],
+        "thermal_temperature_limiter_triggered": [False],
+        "thermal_temperature_limiter_max_K": [float("nan")],
+        "thermal_result_scientific_valid": [False],
         "thermal_convergence_available": [0],
         "thermal_converged": [0],
         "thermal_extraction_complete": [0],
@@ -9048,6 +9087,10 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         result["result_valid_thermal"] = (
             int(thermal_result_valid) if thermal_on else float("nan")
         )
+        if thermal_on:
+            result["thermal_result_scientific_valid"] = bool(
+                thermal_result_valid
+            )
         if not em_result_valid:
             logging.error(f"EM result rejected: {em_validity_reason}")
             log_failed_sample(sim.input_df, f"em_validation: {em_validity_reason}")

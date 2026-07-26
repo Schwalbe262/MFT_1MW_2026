@@ -86,10 +86,16 @@ _RX_INSULATION_KEYS = (
     "Rx_side2_insulation",
 )
 THERMAL_MESH_POLICY = (
-    "b5-rxmain-l5-wcp-pad-symmetry-contact-clipped-regions-v1"
+    "b6-rx-block-shared-region-wcp-pad-symmetry-contact-clipped-v1"
 )
-THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v6"
-THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION = "thermal-mesh-preflight-v2"
+THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v7"
+THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION = "thermal-mesh-preflight-v3"
+THERMAL_RX_BLOCK_INTERFACE_CONTRACT_VERSION = (
+    "thermal-rx-block-interface-coverage-v1"
+)
+THERMAL_TEMPERATURE_LIMITER_K = 5000.0
+THERMAL_TEMPERATURE_LIMITER_DETECTION_K = 4990.0
+THERMAL_INTERFACE_CASE_PREFIX_BYTES = 8 * 1024 * 1024
 THERMAL_MESH_STATS_CONTRACT_VERSION = "thermal-native-mesh-stats-v1"
 SYMMETRY_THERMAL_DIRECT_ANALYZE_ENV = (
     "MFT_SYMMETRY_THERMAL_DIRECT_ANALYZE"
@@ -1381,7 +1387,9 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5, mode="full"):
     assigned = {}
     wcp_padding_by_direction_mm = _wcp_pad_mesh_region_padding_mm(mode)
 
-    def _assign_levels(levels, name, category):
+    def _assign_levels(
+        levels, name, category, *, separate_objects=True
+    ):
         if not levels:
             return
         normalized = {
@@ -1411,10 +1419,8 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5, mode="full"):
             actual_operation_names.append(
                 str(getattr(operation, "name", "") or item)
             )
-            # C3 proved that one shared assembly region can retain the OO
-            # assignment while creating zero cells for a subset of its thin
-            # solids. Resolve the same bounded assembly operation per object;
-            # the later native message scan still rejects any zero-cell solid.
+            # Thin solids need per-object resolution, while adjacent
+            # homogenized Rx blocks must retain one conformal pack region.
             operation.auto_update = False
             # PyAEDT 0.22 exposes AEDT's read-only command metadata in the mesh
             # operation property bag.  Sending it back through ``update`` emits
@@ -1424,13 +1430,20 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5, mode="full"):
             for key in tuple(operation.props):
                 if str(key).strip().casefold() == "command":
                     del operation.props[key]
-            operation.props["Mesh Object(s) Separately Enabled"] = True
+            operation.props[
+                "Mesh Object(s) Separately Enabled"
+            ] = bool(separate_objects)
             if not update():
                 raise RuntimeError(f"{name} mesh operation update failed: {item}")
-            if operation.props.get("Mesh Object(s) Separately Enabled") is not True:
+            if (
+                operation.props.get(
+                    "Mesh Object(s) Separately Enabled"
+                )
+                is not bool(separate_objects)
+            ):
                 raise RuntimeError(
-                    f"{name} separate-object mesh setting was not retained: "
-                    f"{item}"
+                    f"{name} object-separation mesh setting was not "
+                    f"retained: {item}; expected={bool(separate_objects)!r}"
                 )
             readback_objects = operation.props.get("Objects", [])
             if isinstance(readback_objects, str):
@@ -1457,8 +1470,8 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5, mode="full"):
             "operation_type": "object_level",
             "level": next(iter(set(normalized.values()))),
             "objects": sorted(normalized),
-            "shared_region": False,
-            "separate_objects": True,
+            "shared_region": not bool(separate_objects),
+            "separate_objects": bool(separate_objects),
             "actual_operation_names": actual_operation_names,
         })
 
@@ -1678,13 +1691,21 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5, mode="full"):
         ("Rx_side_blocks", "rx_side_block_mesh_level", side_block_level),
         ("Rx_side2_blocks", "rx_side2_block_mesh_level", side_block_level),
     )
+    rx_block_shared_packs = []
     for key, operation_name, level in rx_block_specs:
         names = list(dict.fromkeys(obj.name for obj in objs.get(key, [])))
         _assign_levels(
             {name: level for name in names},
             operation_name,
             key,
+            separate_objects=False,
         )
+        if names:
+            rx_block_shared_packs.append({
+                "category": key,
+                "operation_name": operation_name,
+                "objects": sorted(map(str, names)),
+            })
 
     # C4 separate-object meshing reduced zero-cell solids from 35 to ten, but
     # both retained Rx_main turns still disappeared at level 3.  Keep all three
@@ -1773,7 +1794,21 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5, mode="full"):
             for operation in plan
         ),
         "rx_retained_pack_count": retained_pack_count,
-        "shared_operation_count": 0,
+        "rx_block_shared_pack_count": len(rx_block_shared_packs),
+        "rx_block_shared_packs": rx_block_shared_packs,
+        "rx_main_block_objects": sorted(
+            map(
+                str,
+                (
+                    obj.name
+                    for obj in objs.get("Rx_main_blocks", [])
+                ),
+            )
+        ),
+        "shared_operation_count": sum(
+            operation["separate_objects"] is False
+            for operation in plan
+        ),
         "object_level_operation_count": sum(
             operation["operation_type"] == "object_level"
             for operation in plan
@@ -2283,6 +2318,268 @@ def _thermal_mesh_mapping_coverage(mesh_plan, fresh_artifacts):
         "local_region_objects_missing": region_objects_missing,
         "readbacks": readbacks,
     }
+
+
+def _thermal_rx_interface_case_candidates(sim, ipk):
+    """Return native Fluent post-mesh cases without recursive traversal."""
+    design_name = str(
+        getattr(ipk, "design_name", "") or _THERMAL_DESIGN_NAME
+    )
+    candidates = {}
+
+    def _add(path):
+        path = Path(path)
+        try:
+            if path.is_symlink() or not path.is_file():
+                return False
+            signature = _thermal_monitor_signature(path)
+            key = str(path.resolve(strict=False)).casefold()
+        except OSError:
+            return False
+        candidates[key] = (path, signature)
+        return True
+
+    for root in _thermal_monitor_roots(sim, ipk):
+        design_results = root / f"{design_name}.results"
+        search_root = design_results if design_results.is_dir() else root
+        if not search_root.is_dir() or search_root.is_symlink():
+            continue
+        for restart_dir in search_root.glob("*.restart"):
+            if not restart_dir.is_symlink():
+                _add(restart_dir / "current.nc_cas")
+
+    native_ipk = _native_solver(ipk)
+    scoped_discovery_roots = [
+        getattr(native_ipk, "working_directory", None),
+        getattr(sim, "project_path", None),
+        getattr(sim, "workdir", None),
+        os.environ.get("MFT_WORKDIR"),
+        os.environ.get("ANS_TEMP_PATH"),
+    ]
+    seen_roots = set()
+    scoped_case_found = False
+
+    def _discover_one_level(raw_root):
+        nonlocal scoped_case_found
+        if not raw_root:
+            return
+        root = Path(str(raw_root))
+        key = str(root.resolve(strict=False)).casefold()
+        if key in seen_roots:
+            return
+        seen_roots.add(key)
+        if not root.is_dir() or root.is_symlink():
+            return
+        scoped_case_found = (
+            _add(root / f"{_THERMAL_SETUP_NAME}.nc_cas")
+            or scoped_case_found
+        )
+        for project_dir in root.glob("*.pjt"):
+            if project_dir.is_dir() and not project_dir.is_symlink():
+                scoped_case_found = (
+                    _add(
+                        project_dir
+                        / f"{_THERMAL_SETUP_NAME}.nc_cas"
+                    )
+                    or scoped_case_found
+                )
+
+    for raw_root in scoped_discovery_roots:
+        _discover_one_level(raw_root)
+    if not scoped_case_found:
+        for raw_root in (
+            os.environ.get("TEMP"),
+            os.environ.get("TMP"),
+        ):
+            _discover_one_level(raw_root)
+    return candidates
+
+
+def _snapshot_thermal_rx_interface_cases(sim, ipk):
+    return {
+        key: signature
+        for key, (_path, signature) in (
+            _thermal_rx_interface_case_candidates(sim, ipk).items()
+        )
+    }
+
+
+def _parse_thermal_rx_block_interface_case(path, expected_objects):
+    """Attest Rx-main CHT and block adjacency from Fluent mesh topology."""
+    candidate = Path(path)
+    if candidate.is_symlink():
+        raise RuntimeError(
+            f"native thermal interface case is a symlink: {candidate}"
+        )
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_file():
+        raise RuntimeError(
+            f"native thermal interface case is not a file: {resolved}"
+        )
+    size = resolved.stat().st_size
+    if size <= 0:
+        raise RuntimeError(
+            "native thermal interface case has invalid bounded size: "
+            f"{resolved}; bytes={size}"
+        )
+    try:
+        with resolved.open("rb") as stream:
+            prefix = stream.read(THERMAL_INTERFACE_CASE_PREFIX_BYTES)
+    except OSError as exc:
+        raise RuntimeError(
+            f"native thermal interface case is unreadable: {resolved}"
+        ) from exc
+    text = prefix.decode("utf-8", errors="replace")
+    lines = [
+        line
+        for line in text.splitlines()
+        if line.startswith("(cfd-post-mesh-info ")
+    ]
+    if len(lines) != 1:
+        raise RuntimeError(
+            "native Fluent case requires exactly one cfd-post-mesh-info "
+            f"record: {resolved}; count={len(lines)}"
+        )
+    record = lines[0]
+    if not record.rstrip().endswith(")))"):
+        raise RuntimeError(
+            "native Fluent cfd-post-mesh-info exceeds bounded prefix or is "
+            f"incomplete: {resolved}; prefix_bytes={len(prefix)}"
+        )
+    solid_match = re.match(
+        r"^\(cfd-post-mesh-info \(\(0 0 "
+        r"\((?P<solids>[^()]*)\)",
+        record,
+    )
+    if not solid_match:
+        raise RuntimeError(
+            f"native Fluent case has malformed solid inventory: {resolved}"
+        )
+    solids = {
+        token.casefold()
+        for token in solid_match.group("solids").split()
+    }
+    expected_names = sorted(set(map(str, expected_objects)))
+    expected_solids = {
+        name: f"{name}_solid".casefold() for name in expected_names
+    }
+    face_records = []
+    for match in re.finditer(
+        r"\((?P<name>[^()\s]+)\s+wall\s+"
+        r"(?P<regions>[^()]*)\)",
+        record,
+    ):
+        regions = tuple(
+            token.casefold()
+            for token in match.group("regions").split()
+        )
+        face_records.append({
+            "name": match.group("name"),
+            "regions": regions,
+        })
+
+    missing_solids = sorted(
+        name
+        for name, solid in expected_solids.items()
+        if solid not in solids
+    )
+    missing_fluid_coupling = []
+    adjacency = {solid: set() for solid in expected_solids.values()}
+    unpaired_interfaces = set()
+    expected_solid_set = set(expected_solids.values())
+    for name, solid in expected_solids.items():
+        relevant = [
+            item for item in face_records if solid in item["regions"]
+        ]
+        if not any(
+            "region_fluid" in item["regions"]
+            and len(item["regions"]) >= 2
+            for item in relevant
+        ):
+            missing_fluid_coupling.append(name)
+        for item in relevant:
+            other_solids = (
+                expected_solid_set.intersection(item["regions"]) - {solid}
+            )
+            if len(item["regions"]) >= 2:
+                adjacency[solid].update(other_solids)
+            if (
+                len(item["regions"]) < 2
+                and re.fullmatch(
+                    r"interf(?:ace)?[-_]?\d+",
+                    item["name"],
+                    re.IGNORECASE,
+                )
+            ):
+                unpaired_interfaces.add(item["name"])
+
+    components = []
+    unseen = set(expected_solid_set)
+    while unseen:
+        start = min(unseen)
+        stack = [start]
+        component = set()
+        while stack:
+            current = stack.pop()
+            if current in component:
+                continue
+            component.add(current)
+            stack.extend(adjacency[current] - component)
+        unseen -= component
+        components.append(sorted(component))
+    adjacency_passed = (
+        len(expected_solid_set) <= 1 or len(components) == 1
+    )
+    passed = (
+        bool(expected_names)
+        and not missing_solids
+        and not missing_fluid_coupling
+        and adjacency_passed
+        and not unpaired_interfaces
+    )
+    return {
+        "schema": THERMAL_RX_BLOCK_INTERFACE_CONTRACT_VERSION,
+        "passed": passed,
+        "expected_rx_main_object_count": len(expected_names),
+        "expected_rx_main_objects": expected_names,
+        "missing_rx_main_solids": missing_solids,
+        "missing_fluid_coupling": sorted(missing_fluid_coupling),
+        "rx_main_adjacency_component_count": len(components),
+        "rx_main_adjacency_components": components,
+        "rx_main_adjacency_passed": adjacency_passed,
+        "unpaired_interfaces": sorted(
+            unpaired_interfaces, key=str.casefold
+        ),
+        "native_wall_record_count": len(face_records),
+    }
+
+
+def _thermal_rx_block_interface_coverage(
+    sim, ipk, mesh_plan, snapshot
+):
+    """Require a fresh native Fluent topology for the current solve."""
+    fresh = []
+    for key, (path, signature) in (
+        _thermal_rx_interface_case_candidates(sim, ipk).items()
+    ):
+        if snapshot.get(key) != signature:
+            fresh.append((path, signature))
+    fresh.sort(key=lambda item: (item[1][1], str(item[0])))
+    if not fresh:
+        raise RuntimeError(
+            "no fresh native Fluent case for Rx-main interface coverage"
+        )
+    path, signature = fresh[-1]
+    coverage = _parse_thermal_rx_block_interface_case(
+        path, mesh_plan.get("rx_main_block_objects", [])
+    )
+    coverage.update({
+        "native_case_path": str(path.resolve(strict=True)),
+        "native_case_size_bytes": signature[0],
+        "native_case_sha256_sample": signature[2],
+        "fresh_native_case_count": len(fresh),
+    })
+    return coverage
 
 
 def _unmeshed_objects_from_messages(messages):
@@ -4048,10 +4345,12 @@ def _symmetry_thermal_direct_analyze_preflight(
         and mesh_plan.get("policy") == THERMAL_MESH_POLICY
         and not required_objects_missing
         and operation_count > 0
-        and int(mesh_plan.get("shared_operation_count", -1)) == 0
+        and int(mesh_plan.get("shared_operation_count", -1))
+        == int(mesh_plan.get("rx_block_shared_pack_count", -2))
         and object_level_operation_count + mesh_region_operation_count
         == operation_count
         and int(mesh_plan.get("separate_object_operation_count", -1))
+        + int(mesh_plan.get("shared_operation_count", -1))
         == object_level_operation_count
         and mesh_region_operation_count
         == int(mesh_plan.get("wcp_pad_mesh_region_count", -1))
@@ -4269,10 +4568,12 @@ def _generate_and_attest_thermal_mesh(
         and mesh_plan.get("policy") == THERMAL_MESH_POLICY
         and not required_objects_missing
         and operation_count > 0
-        and int(mesh_plan.get("shared_operation_count", -1)) == 0
+        and int(mesh_plan.get("shared_operation_count", -1))
+        == int(mesh_plan.get("rx_block_shared_pack_count", -2))
         and object_level_operation_count + mesh_region_operation_count
         == operation_count
         and int(mesh_plan.get("separate_object_operation_count", -1))
+        + int(mesh_plan.get("shared_operation_count", -1))
         == object_level_operation_count
         and mesh_region_operation_count
         == int(mesh_plan.get("wcp_pad_mesh_region_count", -1))
@@ -4583,10 +4884,12 @@ def _pooled_thermal_mesh_preflight_not_applicable(mesh_plan):
         and mesh_plan.get("policy") == THERMAL_MESH_POLICY
         and mesh_plan.get("required_objects_missing") == []
         and operation_count > 0
-        and int(mesh_plan.get("shared_operation_count", -1)) == 0
+        and int(mesh_plan.get("shared_operation_count", -1))
+        == int(mesh_plan.get("rx_block_shared_pack_count", -2))
         and object_level_operation_count + mesh_region_operation_count
         == operation_count
         and int(mesh_plan.get("separate_object_operation_count", -1))
+        + int(mesh_plan.get("shared_operation_count", -1))
         == object_level_operation_count
         and mesh_region_operation_count
         == int(mesh_plan.get("wcp_pad_mesh_region_count", -1))
@@ -4743,7 +5046,27 @@ def _thermal_mesh_result_metadata(mesh_plan, preflight):
     setup_control_readback = preflight.get(
         "setup_control_readback", {}
     )
+    rx_interface_coverage = preflight.get(
+        "rx_main_interface_coverage", {}
+    )
     return {
+        "thermal_rx_block_interface_contract_version": [
+            THERMAL_RX_BLOCK_INTERFACE_CONTRACT_VERSION
+        ],
+        "thermal_rx_main_interface_coverage_passed": [
+            rx_interface_coverage.get("passed") is True
+        ],
+        "thermal_rx_main_unpaired_interfaces": [
+            list(rx_interface_coverage.get("unpaired_interfaces", []))
+        ],
+        "thermal_rx_main_interface_coverage_json": [
+            json.dumps(
+                rx_interface_coverage,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ],
         "thermal_mesh_policy": [THERMAL_MESH_POLICY],
         "thermal_mesh_plan_contract_version": [
             THERMAL_MESH_PLAN_CONTRACT_VERSION
@@ -4859,6 +5182,156 @@ def _thermal_mesh_result_metadata(mesh_plan, preflight):
             )
         ],
     }
+
+
+def _thermal_rx_interface_predispatch_receipt(
+    mesh_plan, preflight, df, thermal_pad_readback
+):
+    """Seal the shared-Rx intent/readback immediately before Analyze."""
+    rx_main_objects = sorted(set(map(
+        str, mesh_plan.get("rx_main_block_objects", [])
+    )))
+    main_operations = [
+        operation
+        for operation in mesh_plan.get("operations", [])
+        if operation.get("category") == "Rx_main_blocks"
+    ]
+    native_readback = preflight.get("native_operation_readback", {})
+    operation_readbacks = {
+        str(item.get("name", "")): item
+        for item in native_readback.get("operation_readbacks", [])
+    }
+    operation_evidence = []
+    for operation in main_operations:
+        actual_names = list(
+            map(str, operation.get("actual_operation_names", []))
+        )
+        native = (
+            operation_readbacks.get(actual_names[0], {})
+            if len(actual_names) == 1
+            else {}
+        )
+        operation_evidence.append({
+            "plan_name": str(operation.get("name", "")),
+            "actual_operation_names": actual_names,
+            "objects": sorted(map(str, operation.get("objects", []))),
+            "shared_region": operation.get("shared_region") is True,
+            "separate_objects": operation.get("separate_objects"),
+            "native_separate_objects": native.get("separate_objects"),
+        })
+    shared_intent_passed = (
+        bool(rx_main_objects)
+        and len(main_operations) == 1
+        and int(mesh_plan.get("rx_block_shared_pack_count", -1)) >= 1
+        and operation_evidence[0]["objects"] == rx_main_objects
+        and operation_evidence[0]["shared_region"] is True
+        and operation_evidence[0]["separate_objects"] is False
+        and operation_evidence[0]["native_separate_objects"] is False
+    )
+    cooling_identity = {
+        "schema": FIXED_BOUNDARY_CONTRACT_SCHEMA,
+        "contract_sha256": FIXED_BOUNDARY_CONTRACT_SHA256,
+        "fan_config": str(df["fan_config"].iloc[0]),
+        "fan_velocity_m_s": float(df["fan_velocity"].iloc[0]),
+        "core_plate_pad_t_mm": float(
+            df["core_plate_pad_t"].iloc[0]
+        ),
+        "wcp_pad_t_mm": float(df["wcp_pad_t"].iloc[0]),
+        "thermal_pad_conductivity_W_mK": float(
+            thermal_pad_readback["thermal_conductivity_W_mK"]
+        ),
+        "cooling_boundary_modified": False,
+    }
+    native_readback_passed = (
+        preflight.get("native_operation_readback_passed") is True
+        and native_readback.get("missing_operation_names", []) == []
+        and native_readback.get(
+            "required_thin_objects_missing", []
+        )
+        == []
+    )
+    receipt = {
+        "schema": "thermal-rx-interface-predispatch-v1",
+        "thermal_rx_block_interface_contract_version": (
+            THERMAL_RX_BLOCK_INTERFACE_CONTRACT_VERSION
+        ),
+        "mesh_policy": THERMAL_MESH_POLICY,
+        "mesh_plan_contract_version": (
+            THERMAL_MESH_PLAN_CONTRACT_VERSION
+        ),
+        "mesh_plan_sha256": mesh_plan["plan_sha256"],
+        "rx_main_objects": rx_main_objects,
+        "rx_block_shared_pack_count": int(
+            mesh_plan.get("rx_block_shared_pack_count", -1)
+        ),
+        "rx_main_shared_operations": operation_evidence,
+        "shared_intent_and_native_readback_passed": (
+            shared_intent_passed
+        ),
+        "native_operation_readback_passed": native_readback_passed,
+        "premesh_status": str(preflight.get("status", "")),
+        "premesh_passed": preflight.get("passed") is True,
+        "generate_mesh_returned": (
+            preflight.get("generate_mesh_returned") is True
+        ),
+        "direct_analyze_gate_passed": (
+            preflight.get("direct_analyze_gate_passed") is True
+        ),
+        "fixed_cooling_identity": cooling_identity,
+        "terminal_interface_coverage_pending": True,
+        "thermal_rx_main_interface_coverage_passed": False,
+        "thermal_result_scientific_valid": False,
+    }
+    receipt["passed"] = (
+        shared_intent_passed
+        and native_readback_passed
+        and (
+            receipt["generate_mesh_returned"]
+            or receipt["direct_analyze_gate_passed"]
+        )
+        and math.isclose(
+            cooling_identity["fan_velocity_m_s"],
+            1.5,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and cooling_identity["fan_config"].strip().casefold()
+        == "dual"
+        and math.isclose(
+            cooling_identity["core_plate_pad_t_mm"],
+            2.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            cooling_identity["wcp_pad_t_mm"],
+            2.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            cooling_identity[
+                "thermal_pad_conductivity_W_mK"
+            ],
+            THERMAL_PAD_CONDUCTIVITY_W_MK,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    )
+    return receipt
+
+
+def _emit_thermal_rx_interface_predispatch_receipt(receipt):
+    canonical = json.dumps(
+        receipt,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    print(
+        "THERMAL_RX_INTERFACE_PREFLIGHT_JSON=" + canonical,
+        flush=True,
+    )
 
 
 def _thermal_mesh_postsolve_probe_object_names(objs):
@@ -7272,7 +7745,39 @@ def run_thermal_analysis(sim):
     # The exact evidence belongs to the same solver transaction and is copied
     # into every attempt's forensic record.  Keep the pre-dispatch value false;
     # it is promoted only after the native Analyze call is actually made.
+    if (
+        not pooled_backend
+        and thermal_mesh_plan.get("rx_main_block_objects")
+    ):
+        rx_predispatch_receipt = (
+            _thermal_rx_interface_predispatch_receipt(
+                thermal_mesh_plan,
+                thermal_mesh_preflight,
+                df,
+                thermal_pad_readback,
+            )
+        )
+        if rx_predispatch_receipt.get("passed") is not True:
+            raise RuntimeError(
+                "thermal Rx interface pre-dispatch contract failed: "
+                + json.dumps(
+                    rx_predispatch_receipt,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )[:8000]
+            )
+        thermal_mesh_preflight = dict(thermal_mesh_preflight)
+        thermal_mesh_preflight[
+            "rx_interface_predispatch_receipt"
+        ] = rx_predispatch_receipt
+        _emit_thermal_rx_interface_predispatch_receipt(
+            rx_predispatch_receipt
+        )
     sim.thermal_mesh_preflight = dict(thermal_mesh_preflight)
+    rx_interface_snapshot = _snapshot_thermal_rx_interface_cases(
+        sim, ipk
+    )
 
     # Dispatch the one exact setup. Convergence evidence is independent of PyAEDT's
     # return value because the wrapper can report False after native work completed.
@@ -7303,6 +7808,26 @@ def run_thermal_analysis(sim):
         thermal_mesh_preflight[
             "analysis_dispatched_after_premesh"
         ] = True
+    try:
+        rx_interface_coverage = _thermal_rx_block_interface_coverage(
+            sim,
+            ipk,
+            thermal_mesh_plan,
+            rx_interface_snapshot,
+        )
+    except Exception as exc:
+        rx_interface_coverage = {
+            "schema": THERMAL_RX_BLOCK_INTERFACE_CONTRACT_VERSION,
+            "passed": False,
+            "unpaired_interfaces": [],
+            "error": f"{type(exc).__name__}: {str(exc)[:2000]}",
+        }
+    thermal_mesh_preflight[
+        "rx_main_interface_coverage_passed"
+    ] = rx_interface_coverage.get("passed") is True
+    thermal_mesh_preflight[
+        "rx_main_interface_coverage"
+    ] = rx_interface_coverage
     sim.thermal_mesh_preflight = dict(thermal_mesh_preflight)
     thermal_mesh_metadata = _thermal_mesh_result_metadata(
         thermal_mesh_plan, thermal_mesh_preflight
@@ -7459,6 +7984,9 @@ def run_thermal_analysis(sim):
         thermal_extraction_s = time.monotonic() - extraction_started
         summary = {
             "thermal_solved": [0],
+            "thermal_temperature_limiter_triggered": [False],
+            "thermal_temperature_limiter_max_K": [float("nan")],
+            "thermal_result_scientific_valid": [False],
             "thermal_extraction_complete": [0],
             "thermal_missing_count": [len(expected_cols)],
             "thermal_required_missing_count": [required_group_count],
@@ -7823,9 +8351,43 @@ def run_thermal_analysis(sim):
         "field_summary+scalar_field_calculator"
         if calc_attempts else "field_summary"
     )
+    finite_temperature_k = [
+        float(value) + 273.15
+        for value in temps.values()
+        if math.isfinite(float(value))
+    ]
+    temperature_limiter_max_k = (
+        max(finite_temperature_k)
+        if finite_temperature_k
+        else float("nan")
+    )
+    temperature_limiter_triggered = (
+        math.isfinite(temperature_limiter_max_k)
+        and temperature_limiter_max_k
+        >= THERMAL_TEMPERATURE_LIMITER_DETECTION_K
+    )
+    rx_interface_passed = (
+        thermal_mesh_preflight.get(
+            "rx_main_interface_coverage_passed"
+        )
+        is True
+    )
+    scientific_valid = (
+        solved
+        and not required_missing_cols
+        and rx_interface_passed
+        and not temperature_limiter_triggered
+    )
 
     summary = {
         "thermal_solved": [1 if solved else 0],
+        "thermal_temperature_limiter_triggered": [
+            temperature_limiter_triggered
+        ],
+        "thermal_temperature_limiter_max_K": [
+            temperature_limiter_max_k
+        ],
+        "thermal_result_scientific_valid": [scientific_valid],
         "thermal_extraction_complete": [1 if not required_missing_cols else 0],
         "thermal_missing_count": [len(missing_cols)],
         "thermal_required_missing_count": [required_missing_count],

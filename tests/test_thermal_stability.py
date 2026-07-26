@@ -1526,6 +1526,9 @@ class ThermalStabilityTest(unittest.TestCase):
                 "core_plate_assembly_count": 0,
                 "wcp_assembly_count": 0,
                 "rx_retained_pack_count": 0,
+                "rx_block_shared_pack_count": 0,
+                "rx_block_shared_packs": [],
+                "rx_main_block_objects": [],
                 "shared_operation_count": 0,
                 "object_level_operation_count": 1,
                 "mesh_region_operation_count": 0,
@@ -1557,6 +1560,22 @@ class ThermalStabilityTest(unittest.TestCase):
                     "standalone_idle_barrier_passed": True,
                     "postflight_identity_passed": True,
                     "mesh_plan_sha256": "a" * 64,
+                },
+            ))
+            stack.enter_context(patch.object(
+                thermal,
+                "_snapshot_thermal_rx_interface_cases",
+                return_value={},
+            ))
+            stack.enter_context(patch.object(
+                thermal,
+                "_thermal_rx_block_interface_coverage",
+                return_value={
+                    "schema": (
+                        thermal.THERMAL_RX_BLOCK_INTERFACE_CONTRACT_VERSION
+                    ),
+                    "passed": True,
+                    "unpaired_interfaces": [],
                 },
             ))
             if isinstance(convergence, (list, tuple)):
@@ -3216,12 +3235,25 @@ class ThermalStabilityTest(unittest.TestCase):
         self.assertEqual(plan["assigned_object_count"], 93)
         self.assertEqual(plan["required_thin_object_count"], 56)
         self.assertEqual(plan["required_objects_missing"], [])
-        self.assertEqual(plan["shared_operation_count"], 0)
-        self.assertEqual(plan["separate_object_operation_count"], 29)
+        self.assertEqual(plan["shared_operation_count"], 3)
+        self.assertEqual(plan["rx_block_shared_pack_count"], 3)
+        self.assertEqual(plan["separate_object_operation_count"], 26)
         self.assertEqual(plan["object_level_operation_count"], 29)
         self.assertEqual(plan["mesh_region_operation_count"], 8)
         self.assertEqual(plan["wcp_pad_mesh_region_count"], 8)
         by_name = {item["name"]: item for item in plan["operations"]}
+        self.assertIs(
+            by_name["rx_main_block_mesh_level"]["separate_objects"],
+            False,
+        )
+        self.assertIs(
+            by_name["rx_side_block_mesh_level"]["separate_objects"],
+            False,
+        )
+        self.assertIs(
+            by_name["rx_side2_block_mesh_level"]["separate_objects"],
+            False,
+        )
         self.assertNotIn("pad_mesh_level", by_name)
         self.assertNotIn("rx_mesh_level", by_name)
         self.assertEqual(
@@ -3262,8 +3294,14 @@ class ThermalStabilityTest(unittest.TestCase):
         for operation in operations:
             operation.update.assert_called_once_with()
             self.assertNotIn("Command", operation.props)
+            expected_separate = operation.name not in {
+                "rx_main_block_mesh_level",
+                "rx_side_block_mesh_level",
+                "rx_side2_block_mesh_level",
+            }
             self.assertIs(
-                operation.props["Mesh Object(s) Separately Enabled"], True
+                operation.props["Mesh Object(s) Separately Enabled"],
+                expected_separate,
             )
         self.assertEqual(len(mesh_regions), 8)
         for region in mesh_regions:
@@ -3386,6 +3424,9 @@ class ThermalStabilityTest(unittest.TestCase):
             "wcp_assembly_count": 1,
             "wcp_pad_mesh_region_count": 0,
             "rx_retained_pack_count": 0,
+            "rx_block_shared_pack_count": 0,
+            "rx_block_shared_packs": [],
+            "rx_main_block_objects": [],
             "shared_operation_count": 0,
             "object_level_operation_count": 1,
             "mesh_region_operation_count": 0,
@@ -3471,6 +3512,9 @@ class ThermalStabilityTest(unittest.TestCase):
             "wcp_assembly_count": 1,
             "wcp_pad_mesh_region_count": 1,
             "rx_retained_pack_count": 0,
+            "rx_block_shared_pack_count": 0,
+            "rx_block_shared_packs": [],
+            "rx_main_block_objects": [],
             "shared_operation_count": 0,
             "object_level_operation_count": 0,
             "mesh_region_operation_count": 1,
