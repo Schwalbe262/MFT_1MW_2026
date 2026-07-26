@@ -912,6 +912,54 @@ def test_failed_standalone_hold_saves_and_detaches_without_closing(
     }]
 
 
+def test_failed_standalone_fixed_skips_blocking_desktop_release(
+        monkeypatch):
+    import run_simulation_260706 as runner
+
+    release_calls = []
+    cleanup_calls = []
+    desktop = SimpleNamespace(
+        release_desktop=lambda **kwargs: release_calls.append(kwargs)
+    )
+    simulation = SimpleNamespace(
+        stage_timings={},
+        solver_may_be_running=False,
+        input_df=pd.DataFrame([{}]),
+        spawned_descendants={},
+        create_simulation_name=lambda: (_ for _ in ()).throw(
+            RuntimeError("desktop unstable")
+        ),
+    )
+    monkeypatch.setattr(runner, "aedt_backend", lambda: "standalone")
+    monkeypatch.setattr(
+        runner, "_load_fixed_input_parameter",
+        lambda _param: (pd.DataFrame([{}]), "physics-revision"),
+    )
+    monkeypatch.setattr(
+        runner, "_create_simulation_session",
+        lambda: (desktop, simulation),
+    )
+    monkeypatch.setattr(runner, "_snapshot_descendants", lambda: {})
+    monkeypatch.setattr(
+        runner,
+        "_finalize_run_cleanup",
+        lambda *_args, **kwargs: cleanup_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        runner, "log_failed_sample", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(RuntimeError, match="desktop unstable"):
+        runner.run_one_loop(param={})
+
+    assert release_calls == []
+    assert cleanup_calls == [{
+        "sim": simulation,
+        "held": False,
+        "delete_project": False,
+    }]
+
+
 def _uncertain_cli_args(*, fixed):
     return SimpleNamespace(
         require_consecutive=False,

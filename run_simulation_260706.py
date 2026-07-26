@@ -8428,6 +8428,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
     sim = None
     desktop = None
     held = [False]  # hold 성공 시 finally에서 desktop을 닫지 않기 위한 플래그
+    standalone_failure = [False]
     pooled_release_suppressed = [False]
     pooled_settlement_error = [None]
     pooled_lifecycle_phase = "admission_or_attach"
@@ -9109,6 +9110,7 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
         # --thermal --count N advances only on thermally valid rows.
         return bool(em_result_valid and thermal_result_valid)
     except Exception as e:
+        standalone_failure[0] = backend != "pooled" and not hold
         logging.exception(f"run_one_loop failed: {e}")
         if sim is not None and getattr(sim, "input_df", None) is not None:
             log_failed_sample(sim.input_df, f"runtime: {e}")
@@ -9217,6 +9219,16 @@ def run_one_loop(param=None, model_only=False, hold=False, golden=False, overrid
             logging.error(
                 "skipping standalone AEDT Desktop release because native "
                 "solver completion is still uncertain"
+            )
+        elif desktop is not None and standalone_failure[0]:
+            # A failed gRPC/design-creation call can leave AEDT's release RPC
+            # permanently blocked.  The descendant cleanup below is the
+            # bounded containment boundary; skipping the second gRPC call lets
+            # fixed-mode retries start a fresh Desktop and lets Scheduler
+            # failures terminalize instead of holding a node indefinitely.
+            logging.error(
+                "skipping standalone AEDT Desktop release after run failure; "
+                "using descendant cleanup containment"
             )
         elif desktop is not None:
             try:
