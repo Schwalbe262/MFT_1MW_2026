@@ -4391,7 +4391,15 @@ class ThermalMeshPolicyTests(unittest.TestCase):
         for operation in mesh.meshoperations:
             self.assertFalse(operation.auto_update)
             self.assertNotIn("Command", operation.props)
-            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], True)
+            expected_separate = not operation.name.startswith((
+                "rx_main_block_mesh_level",
+                "rx_side_block_mesh_level",
+                "rx_side2_block_mesh_level",
+            ))
+            self.assertIs(
+                operation.props["Mesh Object(s) Separately Enabled"],
+                expected_separate,
+            )
             self.assertEqual(operation.update_calls, 1)
         for region in mesh.meshregions:
             region.update.assert_called_once_with()
@@ -4400,7 +4408,10 @@ class ThermalMeshPolicyTests(unittest.TestCase):
                 region.assignment.padding_types,
                 ["Absolute Offset"] * 6,
             )
-            self.assertEqual(region.assignment.padding_values, ["2mm"] * 6)
+            self.assertEqual(
+                region.assignment.padding_values,
+                ["2mm", "2mm", "0mm", "0mm", "2mm", "2mm"],
+            )
 
     def test_efficiency_ab_can_relax_only_multi_turn_side_blocks(self):
         mesh = self._Mesh()
@@ -4451,7 +4462,13 @@ class ThermalMeshPolicyTests(unittest.TestCase):
             ({"Rx_side_0_0": 5}, "rx_side_retained_pack_mesh_level"),
         ])
         for operation in mesh.meshoperations:
-            self.assertIs(operation.props["Mesh Object(s) Separately Enabled"], True)
+            expected_separate = not operation.name.startswith(
+                "rx_main_block_mesh_level"
+            )
+            self.assertIs(
+                operation.props["Mesh Object(s) Separately Enabled"],
+                expected_separate,
+            )
 
 
 class FailureLogTests(unittest.TestCase):
