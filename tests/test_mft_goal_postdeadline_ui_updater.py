@@ -276,6 +276,30 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         "RISK task96328 allocation14620" in value
         for value in merged["current"][-1]["evidence"]
     )
+    policy = next(
+        item
+        for item in merged["current"]
+        if item["id"] == updater.SELECTION_POLICY_CARD_ID
+    )
+    assert (
+        policy["title"]
+        == "DESIGN SELECTION | SYMMETRY/STANDARD PRIMARY | "
+        "TERMINAL 1/7 | AUTO FULL OFF"
+    )
+    assert any(
+        "primary candidate-selection gate=authenticated symmetric/Standard FEA"
+        in value
+        for value in policy["evidence"]
+    )
+    assert any(
+        "task96326 lifecycle=SUCCEEDED / role=diagnostic reference only"
+        in value
+        for value in policy["evidence"]
+    )
+    assert any(
+        "final explicit Full validation candidate cap=1" in value
+        for value in policy["evidence"]
+    )
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 2
     assert sync["running"] == 2
@@ -409,6 +433,28 @@ def test_merge_upserts_missing_official_task_card_before_parallel() -> None:
     updater.validate_status_sync(merged)
 
 
+def test_merge_removes_stale_automatic_continuation_card_when_disarmed() -> None:
+    source = _status()
+    source["current"].insert(
+        -1,
+        _item(updater.LEGACY_CONTINUATION_CARD_ID, "in_progress"),
+    )
+
+    merged = updater.merge_status(
+        source,
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+    )
+    ids = [item["id"] for item in merged["current"]]
+
+    assert updater.LEGACY_CONTINUATION_CARD_ID not in ids
+    assert ids.count(updater.SELECTION_POLICY_CARD_ID) == 1
+    assert ids.index(updater.SELECTION_POLICY_CARD_ID) < ids.index(
+        "parallel-workstreams"
+    )
+    updater.validate_status_sync(merged)
+
+
 def test_synchronize_once_is_atomic_and_identity_failure_keeps_source(
     tmp_path: Path,
 ) -> None:
@@ -535,6 +581,18 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
     assert any(
         "scientific PASS=false" in item
         for item in continuation["evidence"]
+    )
+    policy = by_id[updater.SELECTION_POLICY_CARD_ID]
+    assert "AUTO FULL OFF" in policy["title"]
+    assert any(
+        "automatic Standard-to-Full per candidate=false" in item
+        for item in policy["evidence"]
+    )
+    postsuccess_card = by_id["codex-standard-postsuccess-pipeline"]
+    assert any(
+        "Standard selection lanes=7" in item
+        and "task96332" in item
+        for item in postsuccess_card["evidence"]
     )
     assert any(
         "full AEDT promoted=false" in item

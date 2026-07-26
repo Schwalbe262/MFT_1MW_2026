@@ -267,6 +267,19 @@ TASK_SPECS = (
     ),
 )
 
+STANDARD_SELECTION_TASK_IDS = (
+    96325,
+    96327,
+    96328,
+    96329,
+    96330,
+    96331,
+    96332,
+)
+FULL_REFERENCE_TASK_ID = 96326
+SELECTION_POLICY_CARD_ID = "codex-symmetric-primary-selection-policy"
+LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
+
 RUNNING_STATES = {"running"}
 QUEUED_STATES = {
     "queued",
@@ -824,6 +837,77 @@ def _upsert_current_card(payload: dict[str, Any], card: Mapping[str, Any]) -> No
     current.insert(insertion, copy.deepcopy(dict(card)))
 
 
+def _remove_current_card(payload: dict[str, Any], card_id: str) -> None:
+    current = payload.get("current")
+    if not isinstance(current, list):
+        raise UpdaterError("status current group is missing")
+    matches = [
+        index
+        for index, item in enumerate(current)
+        if isinstance(item, dict) and item.get("id") == card_id
+    ]
+    if len(matches) > 1:
+        raise UpdaterError(f"automation card {card_id} is duplicated")
+    if matches:
+        current.pop(matches[0])
+
+
+def _symmetric_primary_policy_card(
+    tasks: Mapping[int, Mapping[str, Any]],
+    observed_at: str,
+) -> dict[str, Any]:
+    lane_categories = {
+        task_id: _category(str(tasks[task_id]["state"]))
+        for task_id in STANDARD_SELECTION_TASK_IDS
+    }
+    terminal_count = sum(
+        category in {"succeeded", "failed"}
+        for category in lane_categories.values()
+    )
+    full_category = _category(str(tasks[FULL_REFERENCE_TASK_ID]["state"]))
+    lane_ids = ",".join(
+        f"task{task_id}" for task_id in STANDARD_SELECTION_TASK_IDS
+    )
+    lane_lifecycle = " / ".join(
+        f"task{task_id}:{lane_categories[task_id].upper()}"
+        for task_id in STANDARD_SELECTION_TASK_IDS
+    )
+    return {
+        "id": SELECTION_POLICY_CARD_ID,
+        "title": (
+            "DESIGN SELECTION | SYMMETRY/STANDARD PRIMARY | "
+            f"TERMINAL {terminal_count}/7 | AUTO FULL OFF"
+        ),
+        "detail": (
+            "현재 NSGA-II search solution의 후보 선택은 인증된 "
+            "symmetry/Standard FEA 결과를 우선 기준으로 합니다. 후보별 "
+            "Standard-to-Full 자동 연쇄는 중지되어 있습니다. 기존 Full "
+            "task96326은 diagnostic reference로만 계속되며 설계 선택이나 "
+            "승격 근거가 아닙니다. symmetry 결과로 한 후보를 명시적으로 "
+            "선택한 뒤 최대 한 후보만 최종 Full 검증할 수 있습니다. 인증된 "
+            "actual 결과 전에는 scientific/production PASS를 주장하지 않습니다."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 50 + (terminal_count * 35 // 7),
+        "evidence": [
+            "primary candidate-selection gate=authenticated symmetric/Standard FEA",
+            f"Standard selection lanes=7 / {lane_ids}",
+            f"lane lifecycle={lane_lifecycle}",
+            "automatic Standard-to-Full per candidate=false",
+            (
+                f"task96326 lifecycle={full_category.upper()} / "
+                "role=diagnostic reference only"
+            ),
+            "final explicit Full validation candidate cap=1",
+            (
+                "policy card is not result evidence / scientific PASS=false / "
+                "canonical promotion=false / production truth=false"
+            ),
+        ],
+    }
+
+
 def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
     state = _read_sealed_local_json(
         path,
@@ -847,10 +931,10 @@ def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
             f"COLLECTIONS {collection_count} · PENDING {pending_count}"
         ),
         "detail": (
-            "task96325/96327/96328/96329 collector 결과를 기다리면서 인증, "
-            "hard-constraint 판정, strict-AL admission 및 measured global "
-            "NDS 입력을 자동 처리합니다. 결과가 없으면 "
-            "scientific/production claim을 만들지 않습니다."
+            "Seven symmetry/Standard collectors authenticate terminal artifacts, "
+            "apply hard constraints and strict-AL admission, then prepare measured "
+            "global NDS inputs. Missing measured results never create a "
+            "scientific or production claim."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
@@ -868,6 +952,13 @@ def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
             (
                 "production Pareto emitted="
                 f"{str(bool(state.get('production_pareto_emitted'))).lower()}"
+            ),
+            (
+                "Standard selection lanes=7 / "
+                + ",".join(
+                    f"task{task_id}"
+                    for task_id in STANDARD_SELECTION_TASK_IDS
+                )
             ),
             "Scheduler mutation=false / scientific claim=false",
             f"state SHA256 {_file_sha256(path.resolve())}",
@@ -1035,7 +1126,7 @@ def _standard_full_continuation_card(
         "fail_closed_retrying_get_gates": 35,
     }[status]
     return {
-        "id": "codex-standard-full-continuation",
+        "id": LEGACY_CONTINUATION_CARD_ID,
         "title": (
             "CODEX AUTO · STANDARD→FULL CONTINUATION · "
             f"{status.upper()}"
@@ -1292,11 +1383,17 @@ def merge_status(
     result = copy.deepcopy(dict(payload))
     result.pop(SYNC_KEY, None)
     protected_before = _protected_hashes(result)
+    if standard_full_continuation_state_file is None:
+        _remove_current_card(result, LEGACY_CONTINUATION_CARD_ID)
     for spec in TASK_SPECS:
         _upsert_current_card(
             result,
             _task_card(spec, tasks[spec.task_id], observed_at),
         )
+    _upsert_current_card(
+        result,
+        _symmetric_primary_policy_card(tasks, observed_at),
+    )
     if postsuccess_state_file is not None:
         _upsert_current_card(
             result,
