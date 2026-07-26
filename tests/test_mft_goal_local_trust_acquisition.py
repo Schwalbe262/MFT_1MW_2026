@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -125,6 +126,75 @@ def test_authenticated_large_residual_stops_for_model_mismatch() -> None:
     assert decision.eligible_for_local_acquisition is False
     assert decision.max_scaled_residual > 1.0
     assert decision.reasons
+
+
+def test_resonance_residual_preserves_hz_constraint_units(
+    tmp_path: Path,
+) -> None:
+    """Regression: physical_G is Hz even though display metrics are kHz."""
+
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps({"Llt": 13.75}), encoding="utf-8")
+    physical_residual_hz = -78.45761081833734
+    anchor = local.AnchorEvidence(
+        selection_order=5,
+        role="backup",
+        candidate_physics_sha256=ANCHOR_SHA256,
+        row={
+            "objective_volume_L": 811.8317909240001,
+            "objective_total_loss_W": 5461.276475877185,
+        },
+        coordinate_unit=tuple(ANCHOR_UNIT),
+        physical_constraints={
+            "half_magnetizing_resonance_minimum": physical_residual_hz,
+            "temperature_robust_limit:T_max_Tx": -0.3601202328676294,
+            "temperature_robust_limit:T_max_core": -0.603995273604923,
+        },
+        normalized_constraints={
+            "half_magnetizing_resonance_minimum": (
+                physical_residual_hz
+                / local.RESONANCE_CONSTRAINT_SCALE_HZ
+            ),
+            "temperature_robust_limit:T_max_Tx": -0.03601202328676294,
+            "temperature_robust_limit:T_max_core": -0.0603995273604923,
+            "Llt_robust_band": 0.0,
+        },
+    )
+    actual_resonance_hz = 15_075.0
+    observation = {
+        "actual_resonance_Hz": actual_resonance_hz,
+        "actual_temperature_targets": {
+            "T_max_Tx": {"actual_C": 99.0},
+            "T_max_core": {"actual_C": 119.0},
+        },
+        "actual_dimensions_mm": {
+            "W": 1194.38,
+            "L": 961.4,
+            "H": 707.0,
+        },
+        "source_result_json": local._file_record(result_path),  # noqa: SLF001
+        "actual_volume_L": 811.8317909240001,
+        "actual_total_loss_W": 5461.276475877185,
+        "actual_winding_max_C": 99.0,
+        "actual_core_max_C": 119.0,
+    }
+
+    measurement = local._observation_to_measurement(  # noqa: SLF001
+        observation, anchor
+    )
+
+    assert measurement["predicted"]["metrics"][
+        "resonance_frequency_kHz"
+    ] == pytest.approx(15.078457610818337)
+    assert measurement["actual"]["metrics"][
+        "resonance_frequency_kHz"
+    ] == pytest.approx(15.075)
+    assert measurement["actual"]["normalized_constraints"][
+        "half_magnetizing_resonance_minimum"
+    ] == pytest.approx(
+        (15_000.0 - actual_resonance_hz)
+        / local.RESONANCE_CONSTRAINT_SCALE_HZ
+    )
 
 
 @pytest.mark.parametrize(

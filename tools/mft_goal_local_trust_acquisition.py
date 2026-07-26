@@ -49,6 +49,7 @@ from module.input_parameter_260706 import (
 )
 from module.mft_goal_20260726_contract import (
     FIXED_COOLING_IDENTITY,
+    GOAL_RESONANCE_MIN_HZ,
     GOAL_SIZE_LIMITS_MM,
     TEMPERATURE_FAMILY_LIMITS_C,
     TEMPERATURE_TARGET_FAMILIES,
@@ -70,6 +71,7 @@ MAX_NEIGHBOR_POOL = 64
 DEFAULT_MAX_BATCH = 3
 DEFAULT_MAX_ROUNDS = 2
 EXISTING_FULL_REFERENCE_TASK_ID = 96326
+RESONANCE_CONSTRAINT_SCALE_HZ = 150.0
 
 # This compact projection is used in plans and tests.  The complete fixed
 # identity, including k_ins/core_k_thermal and on/off switches, is emitted
@@ -1113,14 +1115,14 @@ def _observation_to_measurement(
 
     predicted_constraints = copy.deepcopy(anchor.normalized_constraints)
     actual_constraints = copy.deepcopy(predicted_constraints)
-    resonance_actual_khz = (
-        _finite(observation.get("actual_resonance_Hz"), "actual resonance")
-        / 1000.0
+    resonance_actual_hz = _finite(
+        observation.get("actual_resonance_Hz"), "actual resonance"
     )
+    resonance_actual_khz = resonance_actual_hz / 1000.0
     resonance_name = "half_magnetizing_resonance_minimum"
     actual_constraints[resonance_name] = (
-        15.0 - resonance_actual_khz
-    ) / 150.0
+        GOAL_RESONANCE_MIN_HZ - resonance_actual_hz
+    ) / RESONANCE_CONSTRAINT_SCALE_HZ
 
     actual_targets = observation.get("actual_temperature_targets")
     if not isinstance(actual_targets, Mapping):
@@ -1174,9 +1176,10 @@ def _observation_to_measurement(
         abs(actual_physical_llt - 27.5) - 0.55
     ) / 0.55
 
-    resonance_predicted_khz = 15.0 - float(
-        anchor.physical_constraints[resonance_name]
-    )
+    resonance_predicted_khz = (
+        GOAL_RESONANCE_MIN_HZ
+        - float(anchor.physical_constraints[resonance_name])
+    ) / 1000.0
     return {
         "terminal_authenticated": True,
         "artifact_authenticated": True,

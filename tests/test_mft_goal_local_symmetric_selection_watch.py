@@ -79,6 +79,32 @@ def _observation(
     return acquisition.seal(value)
 
 
+def test_selection_keeps_authoritative_resonance_in_hz() -> None:
+    residual_hz = 78.45761081833734
+    observation = _observation(
+        96338,
+        candidate_sha=LOCAL_SHA_BY_TASK[96338],
+        passed=True,
+        normalized_margin=0.1,
+    )
+    observation["actual_resonance_Hz"] = 15_000.0 + residual_hz
+    observation["hard_constraint_evidence"]["resonance_Hz"][
+        "margin"
+    ] = residual_hz
+
+    selected = watch._select_passing(  # noqa: SLF001
+        [(Path("authenticated-observation.json"), observation)]
+    )
+
+    assert selected is not None
+    assert selected["actual_resonance_Hz"] == pytest.approx(
+        15_078.457610818337
+    )
+    assert selected["minimum_normalized_actual_margin"] == pytest.approx(
+        residual_hz / 15_000.0
+    )
+
+
 def _source_state(
     tmp_path: Path,
     statuses: dict[int, str],
