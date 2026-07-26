@@ -100,7 +100,7 @@ _WCP_PAD_MESH_REGION_DIRECTIONS = (
     "+X", "-X", "+Y", "-Y", "+Z", "-Z",
 )
 THERMAL_FLUENT_PROCESS_CONTRACT_VERSION = (
-    "thermal-fluent-total-processes-v1"
+    "thermal-fluent-total-processes-v2"
 )
 _THERMAL_UNMESHED_OBJECT = re.compile(
     r"'(?P<object>[^']+)'\s*:\s*Object\s+does\s+not\s+have\s+mesh\b",
@@ -112,10 +112,11 @@ def _standalone_thermal_parallel_policy(sim):
     """Map one standalone CPU allocation to total Fluent worker processes.
 
     Maxwell interprets ``NumCores`` as the requested core count and keeps
-    ``NumEngines=1``.  Icepak 2025.2 instead forwards ``NumEngines`` to
-    Fluent's ``-t``/``nprocs_string`` value and does not use ``NumCores`` as a
-    multiplier.  Keep the runner's one-task Maxwell contract unchanged while
-    requesting the same total count in both PyAEDT arguments for Icepak.
+    ``NumEngines=1``.  Icepak/Fluent uses the same local-engine contract:
+    ``NumCores`` is the total local process count while ``NumEngines`` remains
+    one.  Setting both values to the allocated CPU count makes AEDT divide the
+    cores across engines and can degrade a local launch to ``-t1``.  Preserve
+    one engine and request the allocation through ``NumCores`` only.
     """
 
     try:
@@ -177,10 +178,13 @@ def _standalone_thermal_parallel_policy(sim):
         "allocated_cpus": total_processes,
         "maxwell_num_engines_unchanged": maxwell_tasks,
         "pyaedt_cores_argument": total_processes,
-        "pyaedt_tasks_argument": total_processes,
+        "pyaedt_tasks_argument": maxwell_tasks,
         "pyaedt_use_auto_settings_argument": False,
         "expected_fluent_processes": total_processes,
-        "icepak_num_engines_semantics": "total_fluent_processes_not_multiplier",
+        "expected_num_engines": maxwell_tasks,
+        "icepak_num_engines_semantics": (
+            "single_local_engine_with_num_cores_as_total_fluent_processes"
+        ),
     }
     sim.thermal_parallel_policy = dict(policy)
     return policy
@@ -231,11 +235,12 @@ def _validated_thermal_hpc_acf(native_ipk, policy, before):
         )
     text = current_path.read_text(encoding="utf-8", errors="strict")
     total = int(policy["expected_fluent_processes"])
+    engines = int(policy.get("expected_num_engines", 1))
     expected = {
         "ConfigName": "'pyaedt_config'",
         "DesignType": "'Icepak'",
         "MachineName": "'localhost'",
-        "NumEngines": str(total),
+        "NumEngines": str(engines),
         "NumCores": str(total),
         "NumGPUs": "0",
         "UseAutoSettings": "False",
@@ -278,7 +283,7 @@ def _validated_thermal_hpc_acf(native_ipk, policy, before):
         "passed": True,
         "path": str(current_path),
         "num_cores_readback": total,
-        "num_engines_readback": total,
+        "num_engines_readback": engines,
         "num_gpus_readback": 0,
         "use_auto_settings_readback": False,
         "acf_sha256": current_identity["sha256"],

@@ -353,9 +353,10 @@ class ThermalStabilityTest(unittest.TestCase):
         policy = thermal._standalone_thermal_parallel_policy(sim)
 
         self.assertEqual(policy["pyaedt_cores_argument"], 16)
-        self.assertEqual(policy["pyaedt_tasks_argument"], 16)
+        self.assertEqual(policy["pyaedt_tasks_argument"], 1)
         self.assertFalse(policy["pyaedt_use_auto_settings_argument"])
         self.assertEqual(policy["expected_fluent_processes"], 16)
+        self.assertEqual(policy["expected_num_engines"], 1)
         self.assertEqual(policy["maxwell_num_engines_unchanged"], 1)
         self.assertEqual(sim.NUM_TASK, 1)
 
@@ -389,7 +390,7 @@ class ThermalStabilityTest(unittest.TestCase):
             {"thread_counts": [], "nprocs_counts": [16]},
         )
 
-    def test_exact_icepak_acf_readback_requires_sixteen_total_engines(self):
+    def test_exact_icepak_acf_readback_requires_one_engine_sixteen_cores(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root, "pyaedt_config.acf")
             before = {"path": str(path), "exists": False}
@@ -399,7 +400,7 @@ class ThermalStabilityTest(unittest.TestCase):
                     "ConfigName='pyaedt_config'",
                     "DesignType='Icepak'",
                     "MachineName='localhost'",
-                    "NumEngines=16",
+                    "NumEngines=1",
                     "NumCores=16",
                     "NumGPUs=0",
                     "UseAutoSettings=False",
@@ -411,6 +412,7 @@ class ThermalStabilityTest(unittest.TestCase):
             native_ipk = SimpleNamespace(working_directory=root)
             policy = {
                 "expected_fluent_processes": 16,
+                "expected_num_engines": 1,
             }
 
             evidence = thermal._validated_thermal_hpc_acf(
@@ -418,12 +420,12 @@ class ThermalStabilityTest(unittest.TestCase):
             )
 
             self.assertTrue(evidence["passed"])
-            self.assertEqual(evidence["num_engines_readback"], 16)
+            self.assertEqual(evidence["num_engines_readback"], 1)
             self.assertEqual(evidence["num_cores_readback"], 16)
 
             path.write_text(
                 path.read_text(encoding="utf-8").replace(
-                    "NumEngines=16", "NumEngines=1"
+                    "NumEngines=1", "NumEngines=16"
                 ),
                 encoding="utf-8",
             )
@@ -489,7 +491,7 @@ class ThermalStabilityTest(unittest.TestCase):
             "schema": "thermal-icepak-hpc-acf-readback-v1",
             "passed": True,
             "num_cores_readback": 16,
-            "num_engines_readback": 16,
+            "num_engines_readback": 1,
         }
         attestor = Mock()
         attestor.start.return_value = attestor
@@ -527,7 +529,7 @@ class ThermalStabilityTest(unittest.TestCase):
             setup="ThermalSetup",
             blocking=True,
             cores=16,
-            tasks=16,
+            tasks=1,
             gpus=0,
             use_auto_settings=False,
         )
