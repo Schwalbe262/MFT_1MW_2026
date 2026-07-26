@@ -105,6 +105,70 @@ def _task(
     }
 
 
+def _aux_task(
+    spec: updater.AuxiliaryTaskSpec,
+    *,
+    state: str = "running",
+    allocation_id: int | None = 14655,
+    slurm_job_id: str = "842568",
+    node: str = "n107",
+    account: str = "harry261",
+    failure_message: str = "",
+) -> dict[str, Any]:
+    actual_node = node if allocation_id else ""
+    return {
+        "id": spec.task_id,
+        "task_id": spec.task_id,
+        "name": spec.task_name,
+        "state": state,
+        "status": state,
+        "queue_state": state,
+        "cpus": spec.cpus,
+        "memory_mb": spec.memory_mb,
+        "timeout_seconds": spec.timeout_seconds,
+        "max_workers_per_node": spec.max_workers_per_node,
+        "actual_node_name": actual_node,
+        "allocation_node_name": actual_node,
+        "placement_contract_satisfied": bool(actual_node),
+        "allocation_id": allocation_id,
+        "slurm_job_id": slurm_job_id,
+        "account_name": account if allocation_id else "",
+        "created_at": "2026-07-26 18:00:00",
+        "started_at": "2026-07-26 18:01:00" if allocation_id else None,
+        "finished_at": None,
+        "exit_code": None,
+        "failure_message": failure_message,
+    }
+
+
+def _mixed_auxiliary_tasks() -> dict[int, dict[str, Any]]:
+    result: dict[int, dict[str, Any]] = {}
+    for spec in updater.AUTHORITATIVE_AUXILIARY_TASK_SPECS:
+        values: dict[str, Any] = {}
+        if spec.task_id == 96395:
+            values = {
+                "state": "failed",
+                "failure_message": (
+                    "RuntimeError: authenticated standard warm role has no "
+                    "hard-feasible design"
+                ),
+            }
+        elif spec.task_id == 96396:
+            values = {
+                "node": "n111",
+                "account": "r1jae262",
+                "allocation_id": 14651,
+                "slurm_job_id": "840787",
+            }
+        elif spec.task_id == 96397:
+            values = {"state": "succeeded"}
+        result[spec.task_id] = updater._validate_auxiliary_task(
+            spec,
+            _aux_task(spec, **values),
+        )
+    return result
+
+
 def _mixed_tasks() -> dict[int, dict[str, Any]]:
     specs = updater.TASK_SPECS
     tasks = {
@@ -313,9 +377,9 @@ def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> 
 
     assert "THERMAL RUNNING" in card["title"]
     assert "HEDGE QUEUED" in card["title"]
-    assert "CANDIDATE #5 FEA SUPERSEDED" in card["title"]
-    assert "DRAWING DRAFT INVALID" in card["title"]
-    assert "RESELECTION/REOPTIMIZATION IN PROGRESS" in card["title"]
+    assert "ARCHIVED INVALID CANDIDATE #5" in card["title"]
+    assert "task96340/96342 CANCELLED" in card["title"]
+    assert "NOT IN AXIS-v6" in card["title"]
     assert any(
         "task96341 CANCELLED" in value
         and "attach=false" in value
@@ -368,6 +432,120 @@ def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> 
     assert any(
         "actual scientific PASS=0" in value
         and "actual production PASS=0" in value
+        for value in card["evidence"]
+    )
+
+
+def test_authoritative_axis_v6_and_reference_baseline_are_separate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui_root = tmp_path / "reference-gui"
+    run_root = gui_root / "simulation" / "simulation1"
+    run_root.mkdir(parents=True)
+    (run_root / "simulation1.aedt").write_bytes(b"aedt")
+    (run_root / "convergence_matrix.txt").write_text("matrix", encoding="utf-8")
+    (run_root / "convergence_cap.txt").write_text("cap", encoding="utf-8")
+    (gui_root / "local_gui_stdout.log").write_text(
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"loss"}\n',
+        encoding="utf-8",
+    )
+    (gui_root / "local_gui_stderr.log").write_text(
+        "[loss] native Analyze completed but DSO restore failed\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(updater, "_pid_exists", lambda pid: pid == 47256)
+
+    merged = updater.merge_status(
+        _status(),
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+        auxiliary_tasks=_mixed_auxiliary_tasks(),
+        reference_gui_root=gui_root,
+    )
+    sync = updater.validate_status_sync(merged)
+    ids = [item["id"] for item in merged["current"]]
+
+    assert ids[:3] == [
+        updater.PRIMARY_5T_RECOVERY_CARD_ID,
+        updater.AXIS_V6_CARD_ID,
+        updater.REFERENCE_BASELINE_CARD_ID,
+    ]
+    axis = merged["current"][1]
+    assert "RUNNING 15" in axis["title"]
+    assert "SUCCEEDED 1" in axis["title"]
+    assert any(
+        "task96397 exit0" in value
+        and "terminal rows=320" in value
+        and "physical feasible=0" in value
+        and "single-seed provisional only" in value
+        for value in axis["evidence"]
+    )
+    assert any(
+        "requested total=128CPU + 1TiB" in value
+        and "population=320" in value
+        and "generations=80" in value
+        for value in axis["evidence"]
+    )
+    reference = merged["current"][2]
+    assert "M/C SOLVED" in reference["title"]
+    assert "Lm2mH f_lim 12.788k<15k" in reference["title"]
+    assert "Slurm96396 RUNNING n111/j840787" in reference["title"]
+    assert "LOCAL PID15444 EXITED" in reference["title"]
+    assert any(
+        "Lm=7.682399mH" in value
+        and "k=0.995902386" in value
+        and "Llk=63.348112uH" in value
+        for value in reference["evidence"]
+    )
+    assert any(
+        "f_rx=6.525010kHz LIMITING" in value
+        and "raw Lm=7.682399mH" in value
+        and "raw historical only" in value
+        for value in reference["evidence"]
+    )
+    assert any(
+        "Lm=2.000mH by air gap" in value
+        and "limiting resonance=12.788kHz" in value
+        and "15kHz pass=false" in value
+        for value in reference["evidence"]
+    )
+    assert any(
+        "loss DSO restore failed=true" in value
+        and "thermal dispatched=false" in value
+        for value in reference["evidence"]
+    )
+    assert sync["authoritative_task_ids"] == list(range(96395, 96413))
+    assert sync["axis_v6"]["running"] == 15
+    assert sync["axis_v6"]["succeeded"] == 1
+    assert sync["axis_v6"]["scientific_pass_generated"] is False
+    assert sync["axis_v6"]["global_nds_generated"] is False
+    assert sync["axis_v6"]["fixed_lm_global_nds_generated"] is False
+    assert sync["axis_v6"]["resonance_screening_contract"]["lm_mH"] == 2.0
+
+
+def test_axis_v6_raw_completion_waits_for_fixed_lm_global_nds() -> None:
+    tasks = _mixed_auxiliary_tasks()
+    for spec in updater.AXIS_V6_TASK_SPECS:
+        tasks[spec.task_id] = updater._validate_auxiliary_task(
+            spec,
+            _aux_task(spec, state="succeeded"),
+        )
+
+    card = updater._axis_v6_card(tasks, OBSERVED)
+
+    assert "RAW LIFECYCLE 16/16 SUCCEEDED" in card["title"]
+    assert "Lm=2mH RESCREEN + GLOBAL NDS REBUILD PENDING" in card["title"]
+    assert card["progress_pct"] == 65
+    assert "prior geometry-predicted resonance is not final" in card["detail"]
+    assert any(
+        "Lm=2.000mH tuned by air gap" in value
+        and "min(fTx,fRx)>=15kHz" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "fixed-Lm2mH combined global NDS pending" in value
+        and "scientific PASS=0" in value
         for value in card["evidence"]
     )
 
@@ -820,17 +998,24 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     )
     recovery = merged["current"][0]
     assert recovery["id"] == updater.PRIMARY_5T_RECOVERY_CARD_ID
-    assert "1차 5T 불일치" in recovery["title"]
-    assert "기존 후보·FEA·도면 무효" in recovery["title"]
-    assert recovery["progress_pct"] == 10
+    assert "W=x≤1000" in recovery["title"]
+    assert "L=y≤1200" in recovery["title"]
+    assert "회전·축교환 금지" in recovery["title"]
+    assert recovery["progress_pct"] == 25
     assert any(
         "verification lane=standard/unrounded symmetric" in value
         and "rounded verification=false" in value
         for value in recovery["evidence"]
     )
     assert any(
-        "corrected candidate target ETA=1-2h" in value
-        and "queue and solver completion risk tracked separately" in value
+        "new optimization=axis-v6 tasks96397-96412" in value
+        and "16 cold-random seeds" in value
+        for value in recovery["evidence"]
+    )
+    assert any(
+        "air-gap tuned Lm=2.000mH" in value
+        and "Ltx=Lm+Llt_phys" in value
+        and "Lrx=Ltx*(N2/N1)^2" in value
         for value in recovery["evidence"]
     )
     assert merged["unknown_top_level"] == {"preserve": True}
@@ -986,8 +1171,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     )
     assert "STANDARD QUEUED" in pipeline["title"]
     assert "HEDGE QUEUED" in pipeline["title"]
-    assert "CANDIDATE #5 FEA SUPERSEDED" in pipeline["title"]
-    assert "DRAWING DRAFT INVALID" in pipeline["title"]
+    assert "ARCHIVED INVALID CANDIDATE #5" in pipeline["title"]
+    assert "task96340/96342 CANCELLED" in pipeline["title"]
     assert any(
         "task96341 CANCELLED" in value
         and "scientific_failure=false" in value

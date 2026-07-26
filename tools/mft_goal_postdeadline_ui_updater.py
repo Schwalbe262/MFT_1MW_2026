@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
 import hashlib
 import json
 import math
@@ -35,6 +36,10 @@ DEFAULT_STATUS_FILE = Path(
 DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\local_symmetric_selection_watch_v1\state.json"
+)
+DEFAULT_REFERENCE_BASELINE_GUI_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\local_reference_drawing260706_symmetric_gui_v1"
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -92,6 +97,19 @@ class TaskSpec:
     selection_superseded_by_task_id: int | None = None
     selection_failover_for_task_id: int | None = None
     new_allocation_required: bool = False
+
+
+@dataclass(frozen=True)
+class AuxiliaryTaskSpec:
+    task_id: int
+    task_name: str
+    role: str
+    cpus: int
+    memory_mb: int
+    timeout_seconds: int
+    max_workers_per_node: int
+    seed: int | None = None
+    primary_turns: int | None = None
 
 
 TASK_SPECS = (
@@ -412,6 +430,49 @@ TASK_SPECS = (
     ),
 )
 
+AXIS_V6_TASK_SPECS = tuple(
+    AuxiliaryTaskSpec(
+        task_id=96397 + index,
+        task_name=(
+            f"mft-5t-g1p6-s{2707275700 + index}-n1-"
+            f"{(5, 6, 7, 8)[index % 4]}"
+        ),
+        role="axis-v6 strict 5T/1.6 NSGA-II",
+        cpus=8,
+        memory_mb=65_536,
+        timeout_seconds=7_200,
+        max_workers_per_node=8,
+        seed=2707275700 + index,
+        primary_turns=(5, 6, 7, 8)[index % 4],
+    )
+    for index in range(16)
+)
+REFERENCE_BASELINE_TASK_SPEC = AuxiliaryTaskSpec(
+    task_id=96396,
+    task_name="mft-goal-reference-drawing260706-standard-symmetric-v1",
+    role="reference drawing baseline symmetric/unrounded FEA",
+    cpus=8,
+    memory_mb=98_304,
+    timeout_seconds=43_200,
+    max_workers_per_node=1,
+)
+SUPERSEDED_WARM_TASK_SPEC = AuxiliaryTaskSpec(
+    task_id=96395,
+    task_name="mft-5t-g1p6-s2707275600-n1-5",
+    role="superseded axis-v5 warm-start canary",
+    cpus=8,
+    memory_mb=65_536,
+    timeout_seconds=7_200,
+    max_workers_per_node=8,
+    seed=2707275600,
+    primary_turns=5,
+)
+AUTHORITATIVE_AUXILIARY_TASK_SPECS = (
+    SUPERSEDED_WARM_TASK_SPEC,
+    REFERENCE_BASELINE_TASK_SPEC,
+    *AXIS_V6_TASK_SPECS,
+)
+
 LEGACY_STANDARD_SELECTION_TASK_IDS = (
     96325,
     96327,
@@ -443,6 +504,8 @@ LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
 PRIMARY_5T_RECOVERY_CARD_ID = "codex-primary-5t-constraint-recovery"
+AXIS_V6_CARD_ID = "codex-axis-v6-fixed-5t-nsga"
+REFERENCE_BASELINE_CARD_ID = "codex-reference-drawing-baseline"
 ROUNDED_FINAL_TASK_ID = 96340
 ROUNDED_TIMEOUT_HEDGE_TASK_ID = 96342
 ROUNDED_FINAL_PIPELINE_CARD_ID = "codex-rounded-final-delivery-pipeline"
@@ -742,21 +805,21 @@ def _validate_task(spec: TaskSpec, task: Mapping[str, Any]) -> dict[str, Any]:
             f"task{spec.task_id} new-allocation requirement drifted"
         )
     state = _task_state(task)
-    rounded_superseded_queue_reset = (
+    rounded_superseded_identity_retired = (
         spec.task_id == ROUNDED_FINAL_TASK_ID
-        and state in QUEUED_STATES
+        and state in (QUEUED_STATES | FAILURE_STATES)
         and task.get("allocation_id") in (None, "", 0)
         and str(task.get("slurm_job_id") or "") == ""
     )
     if (
         spec.expected_allocation_id is not None
-        and not rounded_superseded_queue_reset
+        and not rounded_superseded_identity_retired
         and task.get("allocation_id") != spec.expected_allocation_id
     ):
         raise UpdaterError(f"task{spec.task_id} corrected allocation identity drifted")
     if (
         spec.expected_slurm_job_id is not None
-        and not rounded_superseded_queue_reset
+        and not rounded_superseded_identity_retired
         and str(task.get("slurm_job_id") or "") != spec.expected_slurm_job_id
     ):
         raise UpdaterError(f"task{spec.task_id} corrected Slurm job identity drifted")
@@ -797,6 +860,79 @@ def fetch_tasks(
         raw = {task_id: future.result() for task_id, future in futures.items()}
     return {
         spec.task_id: _validate_task(spec, raw[spec.task_id]) for spec in TASK_SPECS
+    }
+
+
+def _validate_auxiliary_task(
+    spec: AuxiliaryTaskSpec,
+    task: Mapping[str, Any],
+) -> dict[str, Any]:
+    identifiers = {
+        int(value)
+        for key in ("id", "task_id")
+        if (value := task.get(key)) not in (None, "")
+    }
+    if identifiers != {spec.task_id}:
+        raise UpdaterError(f"auxiliary task{spec.task_id} identity drifted")
+    if task.get("name") != spec.task_name:
+        raise UpdaterError(f"auxiliary task{spec.task_id} name drifted")
+    expected = {
+        "cpus": spec.cpus,
+        "memory_mb": spec.memory_mb,
+        "timeout_seconds": spec.timeout_seconds,
+        "max_workers_per_node": spec.max_workers_per_node,
+    }
+    for key, value in expected.items():
+        if task.get(key) != value:
+            raise UpdaterError(f"auxiliary task{spec.task_id} {key} drifted")
+    state = _task_state(task)
+    actual_node = str(
+        task.get("actual_node_name") or task.get("allocation_node_name") or ""
+    )
+    if state in RUNNING_STATES and (
+        not actual_node or task.get("placement_contract_satisfied") is not True
+    ):
+        raise UpdaterError(
+            f"auxiliary task{spec.task_id} running placement is not satisfied"
+        )
+    return {
+        "task_id": spec.task_id,
+        "name": spec.task_name,
+        "role": spec.role,
+        "state": state,
+        "allocation_id": _positive_or_none(task.get("allocation_id"), "allocation_id"),
+        "slurm_job_id": str(task.get("slurm_job_id") or ""),
+        "account_name": str(task.get("account_name") or ""),
+        "actual_node_name": actual_node,
+        "created_at": task.get("created_at"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "exit_code": task.get("exit_code"),
+        "failure_message": str(task.get("failure_message") or "")[:350],
+        "seed": spec.seed,
+        "primary_turns": spec.primary_turns,
+        "cpus": spec.cpus,
+        "memory_mb": spec.memory_mb,
+    }
+
+
+def fetch_authoritative_auxiliary_tasks(
+    scheduler_url: str,
+    *,
+    task_reader: TaskReader | None = None,
+) -> dict[int, dict[str, Any]]:
+    reader = task_reader or _get_scheduler_task
+    with ThreadPoolExecutor(
+        max_workers=len(AUTHORITATIVE_AUXILIARY_TASK_SPECS)
+    ) as executor:
+        futures = {
+            spec.task_id: executor.submit(reader, scheduler_url, spec.task_id)
+            for spec in AUTHORITATIVE_AUXILIARY_TASK_SPECS
+        }
+        raw = {task_id: future.result() for task_id, future in futures.items()}
+    return {
+        spec.task_id: _validate_auxiliary_task(spec, raw[spec.task_id])
+        for spec in AUTHORITATIVE_AUXILIARY_TASK_SPECS
     }
 
 
@@ -2319,23 +2455,26 @@ def _primary_5t_recovery_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": PRIMARY_5T_RECOVERY_CARD_ID,
         "title": (
-            "긴급 설계 정정 | 1차 5T 불일치 | 기존 후보·FEA·도면 무효 | "
-            "5T 제약 재선정/재최적화 진행"
+            "권선/축 계약 확정 | W=x≤1000 · L=y≤1200 · H≤750 | "
+            "5T/1.6 | 회전·축교환 금지"
         ),
         "detail": (
-            "기준 도면 slide 9의 1차 도체 두께/간격은 5.0/1.6 mm입니다. "
-            "기존 NSGA-II candidate #5는 1.13/4.6 mm이므로 최종 설계 조건을 "
-            "충족하지 않습니다. 현재 후보의 FEA task96340/task96342, 열린 GUI "
-            "모델, 도면 DRAFT는 이 조건에 대해 모두 superseded/non-final입니다. "
-            "기존 512-seed 결과에서 5T 제약 후보를 먼저 재선정하고, 충분한 후보가 "
-            "없을 때만 5T 고정 NSGA-II를 병렬 재실행합니다. 새 검증은 "
-            "standard/unrounded symmetric 모델로 수행하고 rounded 형상은 "
-            "도면과 Full 모델 시각화에만 사용합니다."
+            "현재 도면 축을 그대로 고정합니다: W는 도면 x/기존 973 mm "
+            "측·2차측 방향으로 1000 mm 이하, L은 도면 y/수직 방향으로 "
+            "1200 mm 이하, H는 750 mm 이하이며 회전이나 축 교환은 허용하지 "
+            "않습니다. 1차 권선은 5.0 mm/간격 1.6 mm로 고정됩니다. "
+            "reference baseline FEA와 axis-v6 신규 최적화는 별도 트랙이며 "
+            "어느 쪽도 아직 scientific PASS를 만들지 않았습니다."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 10,
+        "progress_pct": 25,
         "evidence": [
+            (
+                "authoritative axis A: W=drawing x/current 973mm-side-secondary "
+                "direction <=1000mm / L=drawing y/perpendicular direction "
+                "<=1200mm / H<=750mm / rotation=false / axis swap=false"
+            ),
             (
                 "authoritative reference=설계도면260706 slide9 / "
                 f"primary cw1={REFERENCE_PRIMARY_CW1_MM:.1f}mm / "
@@ -2354,23 +2493,21 @@ def _primary_5t_recovery_card(observed_at: str) -> dict[str, Any]:
                 "small numerical correction=false"
             ),
             (
-                "task96340/task96342 lifecycle may remain visible / "
-                "5T scientific input eligible=false / selection eligible=false / "
+                "old candidate task96340=CANCELLED / task96342=CANCELLED / "
+                "invalid=true / selection eligible=false / "
                 "production promotion eligible=false"
             ),
             (
-                "current AEDT GUI=diagnosis/model-only / simulation invoked=false / "
-                "final full model claim=false"
+                "reference baseline=task96396 + local AEDT GUI / "
+                "role=baseline only, not an optimized candidate"
             ),
             (
-                "existing PPTX/PDF=layout QA historical only / "
-                "specification-valid drawing=false / publication=false / "
-                "final deliverable=false"
+                "new optimization=axis-v6 tasks96397-96412 / "
+                "16 cold-random seeds / pop320 x gen80 / fixed 5T/1.6"
             ),
             (
-                "recovery order=existing 512-seed constrained audit -> "
-                "5T constrained reselection -> parallel constrained NSGA-II "
-                "only if required"
+                "prior warm canary task96395=FAILED / reason=no hard-feasible "
+                "warm design under corrected axis / superseded by cold axis-v6"
             ),
             (
                 "verification lane=standard/unrounded symmetric / "
@@ -2378,12 +2515,267 @@ def _primary_5t_recovery_card(observed_at: str) -> dict[str, Any]:
                 "rounded verification=false"
             ),
             (
-                "corrected candidate target ETA=1-2h / "
-                "scheduler queue and solver completion risk tracked separately"
+                "resonance screening contract=full physical primary-referred / "
+                "air-gap tuned Lm=2.000mH / Ltx=Lm+Llt_phys / "
+                "Lrx=Ltx*(N2/N1)^2 / min(fTx,fRx)>=15kHz"
+            ),
+            (
+                "prior geometry-predicted resonance final=false / "
+                "axis-v6 raw lifecycle complete does not finalize feasibility / "
+                "fixed-Lm2mH global NDS rebuild pending"
             ),
             (
                 "actual scientific PASS=0 / actual production PASS=0 / "
-                "canonical promotion=false"
+                "Pareto result pending / canonical promotion=false"
+            ),
+        ],
+    }
+
+
+def _pid_exists(pid: int) -> bool:
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+        return True
+    try:
+        os.kill(pid, 0)
+    except (OSError, SystemError, ValueError):
+        return False
+    return True
+
+
+def _reference_local_stage(root: Path) -> dict[str, Any]:
+    resolved = root.resolve()
+    run_root = resolved / "simulation" / "simulation1"
+    stdout_path = resolved / "local_gui_stdout.log"
+    stderr_path = resolved / "local_gui_stderr.log"
+    try:
+        stdout_bytes = stdout_path.read_bytes()
+    except OSError:
+        stdout_bytes = b""
+    try:
+        stderr_bytes = stderr_path.read_bytes()
+    except OSError:
+        stderr_bytes = b""
+    stdout_tail = stdout_bytes[-1024 * 1024 :].decode("utf-8", errors="replace")
+    stderr_tail = stderr_bytes[-1024 * 1024 :].decode("utf-8", errors="replace")
+    project_path = run_root / "simulation1.aedt"
+    result_csv = resolved / "simulation_results_260706.csv"
+    result_parts = resolved / "results_parts_260706"
+    return {
+        "root": resolved,
+        "project_path": project_path,
+        "project_exists": project_path.is_file(),
+        "aedt_pid": 15444,
+        "aedt_pid_active": _pid_exists(15444),
+        "python_pid": 47256,
+        "python_pid_active": _pid_exists(47256),
+        "matrix_solved": (run_root / "convergence_matrix.txt").is_file(),
+        "cap_solved": (run_root / "convergence_cap.txt").is_file(),
+        "loss_dispatched": '"stage":"loss"' in stdout_tail,
+        "loss_restore_failed": (
+            "[loss] native Analyze completed but DSO restore failed" in stderr_tail
+        ),
+        "thermal_dispatched": '"stage":"thermal"' in stdout_tail,
+        "result_csv_present": result_csv.is_file(),
+        "result_parts_present": (
+            result_parts.is_dir() and any(result_parts.glob("*.parquet"))
+        ),
+    }
+
+
+def _axis_v6_card(
+    auxiliary_tasks: Mapping[int, Mapping[str, Any]],
+    observed_at: str,
+) -> dict[str, Any]:
+    tasks = [auxiliary_tasks[spec.task_id] for spec in AXIS_V6_TASK_SPECS]
+    categories = [_category(str(task["state"])) for task in tasks]
+    running = categories.count("running")
+    queued = categories.count("queued")
+    succeeded = categories.count("succeeded")
+    failed = categories.count("failed")
+    warm = auxiliary_tasks[SUPERSEDED_WARM_TASK_SPEC.task_id]
+    first_seed = auxiliary_tasks[AXIS_V6_TASK_SPECS[0].task_id]
+    first_seed_outcome = (
+        "task96397 exit0 / terminal rows=320 / fixed controls attested / "
+        "raw/pre-fixedLm physical feasible=0 / single-seed provisional only"
+        if _category(str(first_seed["state"])) == "succeeded"
+        else f"task96397 lifecycle={str(first_seed['state']).upper()}"
+    )
+    task_evidence = []
+    for index in range(0, len(tasks), 2):
+        pair = tasks[index : index + 2]
+        task_evidence.append(
+            " | ".join(
+                (
+                    f"task{task['task_id']} seed{task['seed']} N1="
+                    f"{task['primary_turns']} {str(task['state']).upper()} "
+                    f"node={task['actual_node_name'] or 'pending'} "
+                    f"allocation={task['allocation_id'] or 'none'} "
+                    f"job={task['slurm_job_id'] or 'none'}"
+                )
+                for task in pair
+            )
+        )
+    all_raw_succeeded = succeeded == 16
+    return {
+        "id": AXIS_V6_CARD_ID,
+        "title": (
+            (
+                "AXIS-v6 RAW LIFECYCLE 16/16 SUCCEEDED | "
+                "Lm=2mH RESCREEN + GLOBAL NDS REBUILD PENDING"
+            )
+            if all_raw_succeeded
+            else (
+                "AXIS-v6 5T/1.6 NSGA-II | "
+                f"RUNNING {running} · QUEUED {queued} · "
+                f"SUCCEEDED {succeeded} · FAILED {failed} | 16 SEEDS"
+            )
+        ),
+        "detail": (
+            "This is the new optimization track under the fixed drawing-axis "
+            "contract, not the reference-drawing baseline. Sixteen cold-random "
+            "seeds run population 320 x 80 generations with N1 strata 5/6/7/8. "
+            "Each task requests 8 CPU and 64 GiB; campaign totals are 128 CPU "
+            "and 1 TiB. Raw task lifecycle is complete, but prior "
+            "geometry-predicted resonance is not final. The collector must "
+            "re-screen all rows with air-gap-tuned full physical primary-referred "
+            "Lm=2.000 mH and rebuild combined non-dominated sorting."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 65 if all_raw_succeeded else 20 + (succeeded * 40 // 16),
+        "evidence": [
+            (
+                "axis A hard limits=W/drawing-x<=1000mm / "
+                "L/drawing-y<=1200mm / H<=750mm / rotation=false / "
+                "axis swap=false / primary=5.0mm gap1=1.6mm / "
+                "Lm=2.000mH tuned by air gap / Ltx=Lm+Llt_phys / "
+                "Lrx=Ltx*(N2/N1)^2 / min(fTx,fRx)>=15kHz"
+            ),
+            (
+                "campaign=axis-v6 strict / seeds=16 / population=320 / "
+                "generations=80 / requested total=128CPU + 1TiB / "
+                "per task=8CPU + 65536MB"
+            ),
+            (
+                f"prior task96395={str(warm['state']).upper()} / "
+                f"reason={warm['failure_message'] or 'none'} / "
+                "warm-start lane superseded=true / axis-v6 cold-start=true / "
+                f"{first_seed_outcome}"
+            ),
+            *task_evidence,
+            (
+                "scientific PASS=0 / production PASS=0 / "
+                "prior geometry-predicted resonance final=false / "
+                "fixed-Lm2mH combined global NDS pending / "
+                "Pareto Front pending / automatic promotion=false"
+            ),
+        ],
+    }
+
+
+def _reference_baseline_card(
+    auxiliary_tasks: Mapping[int, Mapping[str, Any]],
+    observed_at: str,
+    gui_root: Path,
+) -> dict[str, Any]:
+    task = auxiliary_tasks[REFERENCE_BASELINE_TASK_SPEC.task_id]
+    local = _reference_local_stage(gui_root)
+    local_gui = "ACTIVE" if local["aedt_pid_active"] else "PID15444 EXITED"
+    result_present = local["result_csv_present"] or local["result_parts_present"]
+    stage = (
+        "LOCAL LOSS RESTORE FAILED"
+        if local["loss_restore_failed"]
+        else "MATRIX/CAP SOLVED · LOSS/THERMAL PENDING"
+        if local["matrix_solved"] and local["cap_solved"]
+        else "MATRIX/CAP BUILD OR SOLVE IN PROGRESS"
+    )
+    return {
+        "id": REFERENCE_BASELINE_CARD_ID,
+        "title": (
+            "REFERENCE BASELINE | M/C SOLVED · Lm2mH f_lim 12.788k<15k | "
+            f"Slurm96396 {str(task['state']).upper()} "
+            f"{task['actual_node_name'] or 'pending'}/j"
+            f"{task['slurm_job_id'] or 'none'} | LOCAL {local_gui}"
+        ),
+        "detail": (
+            "This track evaluates the literal 설계도면260706 baseline with "
+            "primary 5.0/1.6 mm using standard symmetric, unrounded FEA. It is a "
+            "reference baseline only and is not one of the axis-v6 optimized "
+            "candidates. The exact raw Matrix/Cap result gives 6.525010 kHz with "
+            "raw Lm=7.682399 mH. Under the new final screen with air-gap-tuned "
+            "Lm=2.000 mH and unchanged capacitance, the limiting resonance is "
+            "12.788 kHz, still below 15 kHz. The local loss Analyze completed but "
+            "DSO restoration failed after PID15444 exited; Slurm remains live."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 55 if local["loss_dispatched"] else 30,
+        "evidence": [
+            (
+                f"Slurm task96396={str(task['state']).upper()} / "
+                f"node={task['actual_node_name'] or 'pending'} / "
+                f"allocation={task['allocation_id'] or 'none'} / "
+                f"job={task['slurm_job_id'] or 'none'} / "
+                f"account={task['account_name'] or 'pending'}"
+            ),
+            (
+                "baseline geometry=symmetric eighth / winding=unrounded / "
+                "round_corner=0 / cw1=5.0mm / gap1=1.6mm / "
+                "not an axis-v6 candidate"
+            ),
+            (
+                f"local AEDT PID15444 active="
+                f"{str(local['aedt_pid_active']).lower()} / "
+                f"python PID47256 active={str(local['python_pid_active']).lower()} / "
+                f"local stage={stage}"
+            ),
+            f"local project={local['project_path']}",
+            (
+                f"matrix solved={str(local['matrix_solved']).lower()} / "
+                f"cap solved={str(local['cap_solved']).lower()} / "
+                f"loss dispatched={str(local['loss_dispatched']).lower()} / "
+                f"loss DSO restore failed="
+                f"{str(local['loss_restore_failed']).lower()} / "
+                f"thermal dispatched={str(local['thermal_dispatched']).lower()}"
+            ),
+            (
+                "full-restored exact matrix: Lm=7.682399mH / "
+                "k=0.995902386 / Llk=63.348112uH"
+            ),
+            (
+                "full exact capacitance: Ctx=7.774728nF / Crx=769.620674pF / "
+                "Ctr=276.391572pF"
+            ),
+            (
+                "exact resonance: f_tx=20.509065kHz / "
+                "f_rx=6.525010kHz LIMITING / f_inter=1.202793MHz / "
+                "raw Lm=7.682399mH / raw historical only"
+            ),
+            (
+                "final screening hypothetical: Lm=2.000mH by air gap / "
+                "capacitance unchanged / limiting resonance=12.788kHz / "
+                "15kHz pass=false / not an NSGA candidate"
+            ),
+            (
+                f"result CSV present={str(local['result_csv_present']).lower()} / "
+                "result parquet present="
+                f"{str(local['result_parts_present']).lower()} / "
+                f"Results reports pending={str(not result_present).lower()} / "
+                "local loss/thermal authenticated=false"
+            ),
+            (
+                "historical reference resonance_pass=false / "
+                "axis-v6 candidate=false / scientific PASS=0 / "
+                "production PASS=0 / Slurm loss/thermal Results pending"
             ),
         ],
     }
@@ -2444,22 +2836,20 @@ def _rounded_final_pipeline_card(
     return {
         "id": ROUNDED_FINAL_PIPELINE_CARD_ID,
         "title": (
-            "CODEX | 5T RECOVERY | CANDIDATE #5 FEA SUPERSEDED | "
-            "DRAWING DRAFT INVALID | RESELECTION/REOPTIMIZATION IN PROGRESS | "
+            "ARCHIVED INVALID CANDIDATE #5 | cw1=1.13 | "
+            "task96340/96342 CANCELLED | NOT IN AXIS-v6 | "
             f"LIFECYCLE {task_stage}/{hedge_stage}"
         ),
         "detail": (
-            "Task96340 and task96342 are lifecycle-visible only: both use "
+            "Task96340 and task96342 are cancelled lifecycle history only: both use "
             "candidate #5 primary cw1=1.13 mm/gap1=4.6 mm and are superseded by "
             "the authoritative 5.0 mm/1.6 mm primary constraint. Their results "
             "cannot create a scientific PASS, select the corrected design, or "
             "release drawings. The nine-slide/nine-page DRAFT passed layout QA "
-            "only and is specification-invalid. Recovery is auditing the existing "
-            "512-seed population before deciding whether a constrained NSGA-II "
-            "rerun is required. Corrected verification uses standard/unrounded "
-            "symmetric FEA; rounded geometry is for drawing/Full visualization "
-            "only. Candidate selection target ETA is 1-2h, with queue/solver "
-            "completion risk reported separately."
+            "only and is specification-invalid. The replacement is the separate "
+            "axis-v6 tasks96397-96412 optimization. Corrected verification uses "
+            "standard/unrounded symmetric FEA; rounded geometry is for "
+            "drawing/Full visualization only."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
@@ -2673,6 +3063,7 @@ def _live_summary(
     running: int,
     queued: int,
     collections: int,
+    auxiliary_tasks: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> str:
     try:
         observed = datetime.fromisoformat(observed_at)
@@ -2683,11 +3074,36 @@ def _live_summary(
     terminal = len(TASK_SPECS) - running - queued
     if terminal < 0:
         raise UpdaterError("live task counters are inconsistent")
+    authoritative = ""
+    if auxiliary_tasks is not None:
+        axis_categories = [
+            _category(str(auxiliary_tasks[spec.task_id]["state"]))
+            for spec in AXIS_V6_TASK_SPECS
+        ]
+        reference = auxiliary_tasks[REFERENCE_BASELINE_TASK_SPEC.task_id]
+        warm = auxiliary_tasks[SUPERSEDED_WARM_TASK_SPEC.task_id]
+        authoritative = (
+            "axis-v6 5T/1.6 NSGA-II "
+            f"running{axis_categories.count('running')} · "
+            f"queued{axis_categories.count('queued')} · "
+            f"succeeded{axis_categories.count('succeeded')} · "
+            f"failed{axis_categories.count('failed')} (16 seeds, "
+            "pop320x80, 128CPU/1TiB requested). "
+            f"reference baseline task96396={str(reference['state']).upper()} "
+            f"{reference['actual_node_name'] or 'pending'}/"
+            f"job{reference['slurm_job_id'] or 'none'}; Matrix/Cap solved, "
+            "Lm2mH hypothetical f_lim=12.788kHz<15kHz, historical resonance "
+            "fail, loss/thermal Results pending. "
+            f"old warm task96395={str(warm['state']).upper()} superseded. "
+        )
     summary = (
-        f"{observed:%H:%M} KST · 긴급 설계 정정: 기준 1차 5T/1.6mm, "
-        "candidate #5 1.13T/4.6mm 불일치. 기존 후보·FEA·도면은 "
-        "superseded/non-final이며 5T 제약 재선정/재최적화 진행 중입니다. "
-        "corrected candidate target ETA=1-2h; queue/solver risk 별도. "
+        f"{observed:%H:%M} KST · 축 계약: W=도면x≤1000, L=도면y≤1200, "
+        "H≤750, 회전/축교환 금지, 1차=5T/1.6mm. "
+        f"{authoritative}"
+        "candidate #5/cw1=1.13 및 task96340/96342는 CANCELLED·invalid. "
+        "공진 최종 screen은 air-gap tuned full physical primary-referred "
+        "Lm=2.000mH, Ltx=Lm+Llt_phys, Lrx=Ltx*(N2/N1)^2이며 axis-v6 "
+        "fixed-Lm global NDS 재구축 전입니다. "
         "verification=standard/unrounded symmetric; rounded=도면/Full 형상 "
         "시각화 전용. original_deadline_missed=true. "
         "인증된 scientific PASS는 없습니다. "
@@ -2796,6 +3212,8 @@ def merge_status(
     tasks: Mapping[int, Mapping[str, Any]],
     *,
     observed_at: str,
+    auxiliary_tasks: Mapping[int, Mapping[str, Any]] | None = None,
+    reference_gui_root: Path | None = None,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
     local_symmetric_selection_state_file: Path | None = (
@@ -2811,6 +3229,27 @@ def merge_status(
     protected_before = _protected_hashes(result)
     if standard_full_continuation_state_file is None:
         _remove_current_card(result, LEGACY_CONTINUATION_CARD_ID)
+    if auxiliary_tasks is not None:
+        expected_auxiliary_ids = {
+            spec.task_id for spec in AUTHORITATIVE_AUXILIARY_TASK_SPECS
+        }
+        if set(auxiliary_tasks) != expected_auxiliary_ids:
+            raise UpdaterError("authoritative auxiliary task set drifted")
+        _upsert_priority_current_card(
+            result,
+            _reference_baseline_card(
+                auxiliary_tasks,
+                observed_at,
+                reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT,
+            ),
+        )
+        _upsert_priority_current_card(
+            result,
+            _axis_v6_card(auxiliary_tasks, observed_at),
+        )
+    else:
+        _remove_current_card(result, AXIS_V6_CARD_ID)
+        _remove_current_card(result, REFERENCE_BASELINE_CARD_ID)
     _upsert_priority_current_card(
         result,
         _primary_5t_recovery_card(observed_at),
@@ -2890,6 +3329,7 @@ def merge_status(
         running=running,
         queued=queued,
         collections=collections,
+        auxiliary_tasks=auxiliary_tasks,
     )
     handoff_task_evidence = [
         (
@@ -2962,6 +3402,33 @@ def merge_status(
         }
         for spec in TASK_SPECS
     ]
+    auxiliary_snapshot = (
+        [
+            {
+                "task_id": spec.task_id,
+                "role": auxiliary_tasks[spec.task_id]["role"],
+                "state": auxiliary_tasks[spec.task_id]["state"],
+                "allocation_id": auxiliary_tasks[spec.task_id]["allocation_id"],
+                "slurm_job_id": auxiliary_tasks[spec.task_id]["slurm_job_id"],
+                "node_name": auxiliary_tasks[spec.task_id]["actual_node_name"],
+                "exit_code": auxiliary_tasks[spec.task_id]["exit_code"],
+                "failure_message": auxiliary_tasks[spec.task_id]["failure_message"],
+                "seed": auxiliary_tasks[spec.task_id]["seed"],
+                "primary_turns": auxiliary_tasks[spec.task_id]["primary_turns"],
+            }
+            for spec in AUTHORITATIVE_AUXILIARY_TASK_SPECS
+        ]
+        if auxiliary_tasks is not None
+        else []
+    )
+    axis_categories = (
+        [
+            _category(str(auxiliary_tasks[spec.task_id]["state"]))
+            for spec in AXIS_V6_TASK_SPECS
+        ]
+        if auxiliary_tasks is not None
+        else []
+    )
     result[SYNC_KEY] = _sealed(
         {
             "schema_version": SYNC_SCHEMA,
@@ -2970,6 +3437,36 @@ def merge_status(
             "scheduler_methods_used": ["GET"],
             "scheduler_mutation_performed": False,
             "managed_task_ids": [spec.task_id for spec in TASK_SPECS],
+            "authoritative_task_ids": [
+                spec.task_id for spec in AUTHORITATIVE_AUXILIARY_TASK_SPECS
+            ]
+            if auxiliary_tasks is not None
+            else [],
+            "axis_v6": {
+                "task_ids": [spec.task_id for spec in AXIS_V6_TASK_SPECS],
+                "running": axis_categories.count("running"),
+                "queued": axis_categories.count("queued"),
+                "succeeded": axis_categories.count("succeeded"),
+                "failed": axis_categories.count("failed"),
+                "requested_total_cpus": 128,
+                "requested_total_memory_mb": 1_048_576,
+                "raw_lifecycle_complete": (
+                    axis_categories.count("succeeded") == 16
+                ),
+                "resonance_screening_contract": {
+                    "primary_referred_full_physical": True,
+                    "lm_mH": 2.0,
+                    "lm_tuned_by_air_gap": True,
+                    "ltx_formula": "Lm+Llt_phys",
+                    "lrx_formula": "Ltx*(N2/N1)^2",
+                    "minimum_resonance_Hz": 15_000.0,
+                },
+                "scientific_pass_generated": False,
+                "global_nds_generated": False,
+                "fixed_lm_global_nds_generated": False,
+            }
+            if auxiliary_tasks is not None
+            else None,
             "submitted_total": submitted,
             "allocation_jobs_active": allocation_jobs,
             "running": running,
@@ -3012,6 +3509,7 @@ def merge_status(
             "protected": protected_before,
             "status_without_sync_sha256": status_payload_sha256,
             "tasks": task_snapshot,
+            "authoritative_tasks": auxiliary_snapshot,
         }
     )
     return result
@@ -3037,7 +3535,9 @@ def synchronize_once(
     status_file: Path,
     scheduler_url: str = DEFAULT_SCHEDULER_URL,
     task_reader: TaskReader | None = None,
+    auxiliary_task_reader: TaskReader | None = None,
     observed_at: str | None = None,
+    reference_gui_root: Path | None = None,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
     local_symmetric_selection_state_file: Path | None = (
@@ -3047,6 +3547,14 @@ def synchronize_once(
     final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
     tasks = fetch_tasks(scheduler_url, task_reader=task_reader)
+    auxiliary_tasks = (
+        fetch_authoritative_auxiliary_tasks(
+            scheduler_url,
+            task_reader=auxiliary_task_reader,
+        )
+        if task_reader is None or auxiliary_task_reader is not None
+        else None
+    )
     source = status_file.resolve().read_bytes()
     source_sha256 = hashlib.sha256(source).hexdigest()
     try:
@@ -3059,6 +3567,10 @@ def synchronize_once(
         payload,
         tasks,
         observed_at=observed_at or _timestamp(),
+        auxiliary_tasks=auxiliary_tasks,
+        reference_gui_root=(
+            reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT
+        ),
         postsuccess_state_file=postsuccess_state_file,
         thermal_bridge_state_file=thermal_bridge_state_file,
         local_symmetric_selection_state_file=(local_symmetric_selection_state_file),
@@ -3105,6 +3617,7 @@ def run_updater(
     log_file: Path,
     lock_file: Path,
     task_reader: TaskReader | None = None,
+    auxiliary_task_reader: TaskReader | None = None,
     max_cycles: int | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     postsuccess_state_file: Path | None = None,
@@ -3114,6 +3627,7 @@ def run_updater(
     ),
     standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
+    reference_gui_root: Path = DEFAULT_REFERENCE_BASELINE_GUI_ROOT,
 ) -> dict[str, Any] | None:
     if interval_seconds < 1:
         raise UpdaterError("interval-seconds must be positive")
@@ -3148,6 +3662,8 @@ def run_updater(
                     status_file=status_file,
                     scheduler_url=scheduler_url,
                     task_reader=task_reader,
+                    auxiliary_task_reader=auxiliary_task_reader,
+                    reference_gui_root=reference_gui_root,
                     postsuccess_state_file=postsuccess_state_file,
                     thermal_bridge_state_file=thermal_bridge_state_file,
                     local_symmetric_selection_state_file=(
@@ -3208,6 +3724,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--standard-full-continuation-state-file", type=Path)
     parser.add_argument("--final-gate-root", type=Path)
+    parser.add_argument(
+        "--reference-gui-root",
+        type=Path,
+        default=DEFAULT_REFERENCE_BASELINE_GUI_ROOT,
+    )
     return parser
 
 
@@ -3231,6 +3752,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.standard_full_continuation_state_file
         ),
         final_gate_root=args.final_gate_root,
+        reference_gui_root=args.reference_gui_root,
     )
     if args.once:
         print(json.dumps(result, sort_keys=True, ensure_ascii=False))
