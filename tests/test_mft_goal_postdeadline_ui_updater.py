@@ -250,6 +250,38 @@ def test_corrected_official5_fast_lane_replaces_failed_pre_em_attempt() -> None:
     )
 
 
+def test_rounded_final_running_card_separates_operational_submission_history() -> None:
+    spec = next(
+        spec for spec in updater.TASK_SPECS if spec.task_id == updater.ROUNDED_FINAL_TASK_ID
+    )
+    task = updater._validate_task(spec, _task(spec, state="running"))
+
+    card = updater._task_card(spec, task, OBSERVED)
+
+    assert "최종 rounded Standard 대칭 FEA 실행 중" in card["title"]
+    assert "task96340 RUNNING" in card["title"]
+    assert "scientific PASS가 없습니다" in card["detail"]
+    assert any(
+        "active final rounded verification lane=task96340 RUNNING" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "v1 operational submission only=HTTP422" in value
+        and "task not created" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "v2 operational submission only=task96339 FAILED pre-solver" in value
+        and "scientific failure count unchanged" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "collection_authenticated=false" in value
+        and "scientific_pass_generated=false" in value
+        for value in card["evidence"]
+    )
+
+
 def _thermal_state(*, watcher_state: str = "running") -> dict[str, Any]:
     return updater._sealed(
         {
@@ -462,13 +494,13 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["completed"] == completed
     assert merged["attention"] == attention
     assert "18:20 KST" in merged["summary"]
-    assert "running2 · queued8 · terminal2" in merged["summary"]
+    assert "running2 · queued9 · terminal2" in merged["summary"]
     assert "physical feasible0" in merged["summary"]
     assert "actual scientific PASS=0" in merged["summary"]
     assert "scientific/production PASS가 아닙니다" in merged["summary"]
     assert merged["current"][-1] != parallel
     assert merged["current"][-1]["id"] == "parallel-workstreams"
-    assert "RUNNING 2 · QUEUED 8 · ALLOCATION JOBS 3" in merged["current"][-1]["title"]
+    assert "RUNNING 2 · QUEUED 9 · ALLOCATION JOBS 3" in merged["current"][-1]["title"]
     assert (
         "RISK task96328/allocation14620 FORCE 07-27 04:07:51 KST"
         in merged["current"][-1]["title"]
@@ -568,8 +600,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 3
     assert sync["running"] == 2
-    assert sync["queued"] == 8
-    assert sync["submitted_total"] == 126
+    assert sync["queued"] == 9
+    assert sync["submitted_total"] == 128
     assert sync["collections_preserved"] == 0
     assert sync["scheduler_methods_used"] == ["GET"]
     assert sync["scientific_pass_generated"] is False
@@ -586,6 +618,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         96333,
         96337,
         96338,
+        96340,
     ]
 
     success = next(
@@ -663,6 +696,29 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         "8990b3f339ce36f66d4ecf5fdbbd111889d55b25d860d00e3d98e6508101180c" in value
         for value in failover["evidence"]
     )
+    rounded = next(
+        item
+        for item in merged["current"]
+        if item["id"] == "final-rounded-standard-symmetric-96340"
+    )
+    assert "최종 rounded Standard 대칭 FEA 대기 중" in rounded["title"]
+    assert "task96340 QUEUED" in rounded["title"]
+    assert "v1/v2 제출 실패는 solver 이전 운영 이력" in rounded["detail"]
+    assert any(
+        "v1 operational submission only=HTTP422" in value
+        and "scientific failure count unchanged" in value
+        for value in rounded["evidence"]
+    )
+    assert any(
+        "v2 operational submission only=task96339 FAILED pre-solver" in value
+        and "no AEDT solve" in value
+        for value in rounded["evidence"]
+    )
+    assert any(
+        "v3 effective compute=task96340" in value
+        and "not competing scientific candidates" in value
+        for value in rounded["evidence"]
+    )
     for task_id, order, node, receipt_sha in (
         (
             96330,
@@ -695,8 +751,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
 
     handoff = next(item for item in merged["current"] if item["id"] == "fea-handoff")
     assert (
-        handoff["title"] == "SLURM · ALLOCATION JOBS 3 · SUBMITTED 126 · "
-        "RUNNING 2 · QUEUED 8 · COLLECTIONS 0"
+        handoff["title"] == "SLURM · ALLOCATION JOBS 3 · SUBMITTED 128 · "
+        "RUNNING 2 · QUEUED 9 · COLLECTIONS 0"
     )
     for item in merged["current"]:
         assert len(item["title"]) <= 160

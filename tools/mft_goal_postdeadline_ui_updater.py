@@ -38,7 +38,7 @@ DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE = Path(
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
-CAMPAIGN_SUBMITTED_FLOOR = 126
+CAMPAIGN_SUBMITTED_FLOOR = 128
 SYNC_KEY = "postdeadline_task_sync"
 SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
@@ -361,6 +361,29 @@ TASK_SPECS = (
         expected_slurm_job_id="840582",
         selection_failover_for_task_id=96332,
     ),
+    TaskSpec(
+        task_id=96340,
+        card_id="final-rounded-standard-symmetric-96340",
+        task_name=(
+            "mft-goal-final-standard-official5-rounded-r10-s4-v3-"
+            "909d249ebe45-n113"
+        ),
+        model_label="FINAL ROUNDED STANDARD SYMMETRIC FEA",
+        candidate_label="official#5 909d249ebe45 rounded R10/S4",
+        requested_node="n113",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=12900,
+        inner_solver_seconds=10800,
+        requested_account="dw16",
+        max_workers_per_node=2,
+        search_only=True,
+        submission_receipt_sha256=(
+            "9b3ce37c8e28258554538469087c78b542ba2585e37e54b3fbde83031167f266"
+        ),
+        expected_allocation_id=14620,
+        expected_slurm_job_id="829579",
+    ),
 )
 
 LEGACY_STANDARD_SELECTION_TASK_IDS = (
@@ -393,6 +416,7 @@ SELECTION_POLICY_CARD_ID = "codex-symmetric-primary-selection-policy"
 LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
+ROUNDED_FINAL_TASK_ID = 96340
 DRAWING_REFERENCE_PDF_SHA256 = (
     "574d9aab033529cf3655d63542e27871c2e240b669b67e54dbfd2495a564437f"
 )
@@ -767,11 +791,147 @@ def _force_cancel_risk(
     }
 
 
+def _rounded_final_task_card(
+    spec: TaskSpec,
+    task: Mapping[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    """Render task96340 without mixing submission failures with FEA truth."""
+    category = _category(str(task["state"]))
+    node = task["actual_node_name"] or spec.requested_node
+    if category == "succeeded":
+        stage = "최종 rounded Standard 대칭 FEA solver 완료 · 수집/인증 대기"
+        progress = 100
+    elif category == "failed":
+        stage = "최종 rounded Standard 대칭 FEA 운영 실패 · 과학 판정 없음"
+        progress = 100
+    elif category == "running":
+        stage = "최종 rounded Standard 대칭 FEA 실행 중"
+        progress = 15
+    else:
+        stage = "최종 rounded Standard 대칭 FEA 대기 중"
+        progress = 5
+
+    allocation = task["allocation_id"] or "none"
+    job = task["slurm_job_id"] or "none"
+    force_risk = _force_cancel_risk(
+        spec,
+        category=category,
+        observed_at=observed_at,
+    )
+    if category == "succeeded":
+        outcome = (
+            "Scheduler terminal success만 확인된 상태이며 collector의 artifact "
+            "인증 전에는 scientific/production PASS가 아닙니다."
+        )
+    elif category == "failed":
+        outcome = (
+            "운영 lifecycle 실패이며 authenticated solver artifact 검토 전에는 "
+            "설계 infeasibility 또는 scientific failure로 세지 않습니다."
+        )
+    else:
+        outcome = (
+            "아직 인증된 공진·권선 온도·코어 온도 결과와 scientific PASS가 "
+            "없습니다."
+        )
+
+    evidence = [
+        (
+            f"active final rounded verification lane=task{spec.task_id} "
+            f"{str(task['state']).upper()} / allocation{allocation} / "
+            f"Slurm{job} / node{node}"
+        ),
+        (
+            "scientific/effective role=official#5 final rounded Standard "
+            "symmetric validation / scheduler lifecycle only until collector"
+        ),
+        (
+            "geometry=round_corner true / corner radius=10mm / "
+            "corner segments=4 per quarter / thermal symmetry=eighth"
+        ),
+        (
+            "fixed thermal boundary=fan 1.5m/s / TIM k=0.2W/mK / "
+            "WCP pad 2mm / core pad 2mm"
+        ),
+        (
+            f"resources=cpus{spec.cpus} / memory{spec.memory_mb}MB / "
+            f"scheduler timeout{spec.timeout_seconds}s / "
+            f"inner solver budget{spec.inner_solver_seconds}s"
+        ),
+        (
+            "v1 operational submission only=HTTP422 "
+            "'requested_allocation_id is not accepted for new tasks' / "
+            "task not created / FEA not started / scientific failure count unchanged"
+        ),
+        (
+            "v2 operational submission only=task96339 FAILED pre-solver because "
+            "same_node_as task96328 was terminal failed / no AEDT solve / "
+            "scientific failure count unchanged"
+        ),
+        (
+            "v3 effective compute=task96340 / v1-v2 are operational history, "
+            "not competing scientific candidates or invalid solutions"
+        ),
+        (
+            "parallel baseline=task96338 direct-Analyze / automatic Full off / "
+            "no duplicate scientific PASS claim"
+        ),
+        (
+            "task timeout boundary=2026-07-27 03:55:07 KST / "
+            "allocation force boundary=2026-07-27 04:07:00 KST / "
+            "planned residual=0h11m53s"
+        ),
+        (
+            "collection_authenticated=false / scientific_pass_generated=false / "
+            "production_claim_generated=false / canonical_promotion=false"
+        ),
+        (
+            "submission evidence SHA256: "
+            "v1=2f2926315e5a02efdc9f42254268e5fa33eebf701b802fd4659477a77d234c19 / "
+            "v2=981d439b4a46cf0c0703a60121dc54c2473f851f82e1afa17873a21790216560 / "
+            f"v3={spec.submission_receipt_sha256}"
+        ),
+    ]
+    if force_risk is not None:
+        evidence.append(
+            (
+                f"allocation{force_risk['allocation_id']} force boundary "
+                f"{force_risk['force_at']:%Y-%m-%d %H:%M:%S KST} / "
+                f"task timeout boundary "
+                f"{force_risk['timeout_at']:%Y-%m-%d %H:%M:%S KST} / "
+                f"planned residual {_duration_text(force_risk['lead_seconds'])}"
+            )
+        )
+    if task["failure_message"]:
+        evidence[-1] += f" / task96340 failure_message={task['failure_message']}"
+
+    return {
+        "id": spec.card_id,
+        "title": (
+            f"CODEX | {stage} | task{spec.task_id} "
+            f"{str(task['state']).upper()} | {node}"
+        ),
+        "detail": (
+            "공식 NSGA-II candidate #5의 round-corner 최종 형상을 검증하는 "
+            f"1/8 Standard 대칭 FEA lane입니다. Scheduler GET lifecycle="
+            f"{task['state']}, allocation={allocation}, Slurm job={job}, "
+            f"node={node}. {outcome} v1/v2 제출 실패는 solver 이전 운영 이력으로 "
+            "분리되어 task96340의 과학 상태를 오염시키지 않습니다."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": evidence,
+    }
+
+
 def _task_card(
     spec: TaskSpec,
     task: Mapping[str, Any],
     observed_at: str,
 ) -> dict[str, Any]:
+    if spec.task_id == ROUNDED_FINAL_TASK_ID:
+        return _rounded_final_task_card(spec, task, observed_at)
     category = _category(str(task["state"]))
     node = task["actual_node_name"] or spec.requested_node
     if category == "succeeded":
