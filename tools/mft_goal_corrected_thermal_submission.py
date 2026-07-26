@@ -57,7 +57,7 @@ CAMPAIGN_ID = "mft-goal-20260726"
 PROJECT = "MFT_1MW_2026v1"
 SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME = (
-    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r4-n111"
+    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r5-n111"
 )
 ACCOUNT = "r1jae262"
 ACCOUNT_UID = 1455
@@ -106,7 +106,7 @@ CORE_CONTRACT_ENV = "MFT_STANDALONE_CORE_CONTRACT"
 CORE_COUNT_ENV = "MFT_STANDALONE_CORE_COUNT"
 CORE_AUTH_ENV = "MFT_STANDALONE_CORE_AUTH_SHA256"
 MAX_TIMEOUT_SECONDS = 21_600
-MIN_RUNTIME_SECONDS = 7_200
+MIN_RUNTIME_SECONDS = 6_300
 PACKAGE_RESERVE_SECONDS = 1_800
 TIMEOUT_QUANTUM_SECONDS = 300
 MINIMUM_SCRATCH_WORKING_SHADOW_BYTES = 256 * 1024**3
@@ -138,9 +138,9 @@ CHECKPOINT_ROOT = PurePosixPath(
 )
 RETAINED_ROOT = (
     "/gpfs/home1/r1jae262/slurm_scheduler/mft_goal_20260726/"
-    "corrected_thermal_minimum_native_r4_n111"
+    "corrected_thermal_minimum_native_r5_n111"
 )
-RETRY_GENERATION = "corrected-thermal-native-r4-n111"
+RETRY_GENERATION = "corrected-thermal-native-r5-n111"
 WCP_SYMMETRY_REGION_NAMES = (
     "wcp_pad_mesh_region_1_in_p_SubRegion",
     "wcp_pad_mesh_region_1_out_p_SubRegion",
@@ -149,39 +149,39 @@ WCP_SYMMETRY_REGION_NAMES = (
 )
 WCP_PADDING_DIRECTIONS = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
 INFRASTRUCTURE_RETRY_SOURCE = {
-    "task_id": 96311,
+    "task_id": 96312,
     "task_name": (
-        "mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r3"
+        "mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r4-n111"
     ),
     "dedupe_key": (
-        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r3:"
-        "a4a6637bf6e37f5660a01352fbbc583daa15d4f0:"
-        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:bc46a4657863fd39"
+        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r4-n111:"
+        "f8ea670f47095800ce3dd4760913ff982679944c:"
+        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:c77085d1b50c23de"
     ),
-    "executor_revision": "a4a6637bf6e37f5660a01352fbbc583daa15d4f0",
+    "executor_revision": "f8ea670f47095800ce3dd4760913ff982679944c",
     "plan_payload_sha256": (
-        "3a57a24ebe526963709d5a4273ac8deceb550f1686282387fe2e78fe9548c0d5"
+        "2b0abf67fbface0f18723a5a27d8e4cb6717e322b2da3279d1eaa8fa002bc5b2"
     ),
     "plan_file_sha256": (
-        "6efb89b3afd8e4b9cb31f95575721b70ebd7c98420856e96b43730413bbe47b2"
+        "2309e3356059d29cf7942d85aafeea070d729498d1071f0abcc22936df03252a"
     ),
     "submission_receipt_payload_sha256": (
-        "56b501b7b086e8262cda916661f89f548f84a9ccc51fbad3866548b12e95efe6"
+        "a680ed6a2584dd4c9c2247eda01df5c0a868a9dd3cd499a9418272546e89fc8f"
     ),
     "submission_receipt_file_sha256": (
-        "01ebdcbd94e90b1674b0c4280ccf93227aca8b9003d0fbaf12bf602b01f0d344"
+        "3e6541c7eb2d5933c8d8032a3d0ed48104a357604274377c5a37da9f00f992d8"
     ),
     "stdout_sha256": (
-        "faebbd20c18e437f311b403789a8fc7b70c0228bc29176bf2c7b2d7f9a97aef5"
+        "d34ad867adc0704dc80c70cfc6fd11208488f4bb3b88adaa93c78fe56d87b655"
     ),
     "stderr_sha256": (
-        "a63309174c77f4afb59814e2597c31ff8651631c20c476e7460802d8ffc7575c"
+        "4b836eaeb2893ff0fa8fec7ebd42f90a588caeae870a57b0c7cef8e18b7123ca"
     ),
-    "requested_node": "n109",
-    "allocation_id": 14639,
-    "slurm_job_id": "838192",
+    "requested_node": "n111",
+    "allocation_id": 14640,
+    "slurm_job_id": "838658",
     "failure_class": (
-        "native_icepak_solver_execution_error_with_process_scanner_false_negative"
+        "expected_stale_premesh_invalidation_rejected_by_verifier"
     ),
     "retry_kind": "infrastructure",
 }
@@ -2395,14 +2395,17 @@ def validate_infrastructure_retry_source(
         or failure
         != (
             "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
-            "standalone thermal parallel evidence failed"
+            "Icepak grid artifact inventory is unsafe: 0"
         )
-        or "refusing solver retry after exact native terminal evidence" not in stderr
-        or "Failed to run solver" not in stderr
-        or "Simulation completed with execution error on server: n109" not in stderr
         or (
-            "standalone Icepak process attestation observed no Fluent -t command"
+            "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
+            "Icepak grid artifact inventory is unsafe: 0"
             not in stderr
+        )
+        or "mft-corrected-thermal-failure-retention-result-v1" not in stdout
+        or (
+            "2d3986a874741393b99874d6e52593436b877a6c450fa9204fce72d73a03e02d"
+            not in stdout
         )
         or not isinstance(core_readback, Mapping)
         or any(
@@ -2412,8 +2415,8 @@ def validate_infrastructure_retry_source(
         or "CORRECTED_THERMAL_JSON " in stdout
     ):
         raise CorrectedThermalError(
-            "infrastructure retry source is not the exact native Icepak "
-            "execution failure with process-scanner false negative"
+            "infrastructure retry source is not the exact expected stale-"
+            "premesh invalidation rejected by the verifier"
         )
     return {
         "task_id": source["task_id"],

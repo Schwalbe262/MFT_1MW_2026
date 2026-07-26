@@ -1605,7 +1605,11 @@ def attest_saved_premesh(
     }
 
 
-def _grid_artifact_inventory(results_path: Path) -> dict[str, dict[str, Any]]:
+def _grid_artifact_inventory(
+    results_path: Path,
+    *,
+    allow_empty: bool = False,
+) -> dict[str, dict[str, Any]]:
     root = results_path.resolve(strict=True)
     rows: dict[str, dict[str, Any]] = {}
     for path in sorted(root.rglob("*")):
@@ -1620,7 +1624,10 @@ def _grid_artifact_inventory(results_path: Path) -> dict[str, dict[str, Any]]:
             "mtime_ns": int(value.st_mtime_ns),
             "sha256": sha256_file(path),
         }
-    if len(rows) < 2 or len(rows) > 128:
+    if (
+        (not allow_empty and len(rows) < 2)
+        or len(rows) > 128
+    ):
         raise ContinuationError(
             f"Icepak grid artifact inventory is unsafe: {len(rows)}"
         )
@@ -1633,7 +1640,7 @@ def generate_and_attest_repaired_mesh(
 ) -> dict[str, Any]:
     """Require one fresh native mesh after the symmetry-envelope mutation."""
 
-    before = _grid_artifact_inventory(results_path)
+    before = _grid_artifact_inventory(results_path, allow_empty=True)
     generator = getattr(getattr(ipk, "mesh", None), "generate_mesh", None)
     if not callable(generator):
         raise ContinuationError(

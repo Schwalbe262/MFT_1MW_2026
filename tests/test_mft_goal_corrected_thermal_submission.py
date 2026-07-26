@@ -294,16 +294,17 @@ class FakeScheduler:
                 "executor tools authenticated\nSOLVER_CORE_CONTRACT_JSON "
                 + json.dumps(core_readback, sort_keys=True)
                 + "\n"
+                + '"schema": '
+                + '"mft-corrected-thermal-failure-retention-result-v1"\n'
+                + '"manifest_sha256": '
+                + '"2d3986a874741393b99874d6e52593436b877a6c450fa9204fce72d73a03e02d"\n'
             )
         }
         self.stderr: dict[int, str] = {
             source_id: (
-                "[thermal] refusing solver retry after exact native terminal "
-                "evidence\n"
-                "Failed to run solver\n"
-                "Simulation completed with execution error on server: n109\n"
-                "standalone Icepak process attestation observed no Fluent -t "
-                "command\n"
+                "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
+                "Icepak grid artifact inventory is unsafe: 0\n"
+                "srun: error: n111: task 0: Exited with exit code 2\n"
             )
         }
 
@@ -327,7 +328,7 @@ class FakeScheduler:
             "slurm_job_id": source["slurm_job_id"],
             "failure_message": (
                 "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
-                "standalone thermal parallel evidence failed"
+                "Icepak grid artifact inventory is unsafe: 0"
             ),
         }
 
@@ -478,7 +479,7 @@ def test_deadline_relative_timeout_fails_closed() -> None:
     assert submission.calculate_timeout(NOW) == 21600
     with pytest.raises(submission.CorrectedThermalError, match="minimum"):
         submission.calculate_timeout(
-            datetime.fromisoformat("2026-07-26T15:30:01+09:00")
+            datetime.fromisoformat("2026-07-26T15:45:01+09:00")
         )
 
 
@@ -634,7 +635,7 @@ def test_runtime_quota_authority_and_infrastructure_source_fail_closed(
     )
     with pytest.raises(
         submission.CorrectedThermalError,
-        match="exact native Icepak",
+        match="expected stale-premesh",
     ):
         submission.validate_infrastructure_retry_source(
             source,
