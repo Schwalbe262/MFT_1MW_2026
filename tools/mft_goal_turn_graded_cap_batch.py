@@ -519,7 +519,7 @@ def submit(
 def _api_task(base: str, task_id: int) -> dict[str, Any]:
     url = (
         f"{base.rstrip('/')}/api/tasks/{task_id}"
-        "?include_output=true&output_limit=30000"
+        "?include_output=true&output_limit=100000"
     )
     with urllib.request.urlopen(url, timeout=60) as response:
         value = json.loads(response.read().decode("utf-8"))
