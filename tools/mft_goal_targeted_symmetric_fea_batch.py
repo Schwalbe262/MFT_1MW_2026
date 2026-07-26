@@ -80,6 +80,30 @@ DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\targeted_symmetric_fea_neighborhood_v1"
 )
+TURN_GRADED_CAP_CANARY_ROOT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\rank1_turn_graded_cap_canary_v3"
+)
+TURN_GRADED_CAP_CALIBRATION_PLAN = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\targeted_symmetric_fea_neighborhood_v2\batch_plan.json"
+)
+TURN_GRADED_CAP_COLLECTION_SCHEMA = (
+    "mft-goal-turn-graded-cap-collection-v1"
+)
+TURN_GRADED_CAP_PLAN_SCHEMA = "mft-goal-turn-graded-cap-batch-plan-v1"
+EXPECTED_TURN_GRADED_CAP_COLLECTION_PAYLOAD_SHA256 = (
+    "b56e6381489d051be9fde63e141b7ff8e35d2557f49421f0485645bcecb8deda"
+)
+EXPECTED_TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256 = (
+    "adf169f90a0842be540363ec1f4ccfc62db94fed49f690829a1f1e4ef9eb9bdd"
+)
+EXPECTED_TURN_GRADED_CAP_CALIBRATION_PLAN_PAYLOAD_SHA256 = (
+    "87541e4d0fbcebed6451682ee03e4bce2dab358824d218833c756d9e21613bf9"
+)
+TURN_GRADED_CAP_CALIBRATION_GEOMETRY_SHA256 = (
+    "2b2138a99445c4ed7d50db5b07f7617789a6ff7af735a85fd7038fd1ab266d60"
+)
 SCHEDULER_URL = "http://127.0.0.1:8002"
 LM_TARGET_H = 0.002
 RESONANCE_MIN_HZ = 15_000.0
@@ -108,6 +132,33 @@ SECONDARY_WINDING_TEMPERATURES = (
     "Tprobe_Rx_side_leeward_max",
 )
 CORE_TEMPERATURES = (
+    "T_max_core",
+    "Tprobe_core_center_max",
+    "Tprobe_core_center_leg_max",
+    "Tprobe_core_side_leg_max",
+    "Tprobe_core_top_yoke_max",
+)
+N1_6_COOLER_ANCHOR_PREFIXES = (
+    "7fae822212dfea8a",
+    "45e20fbd810f9d24",
+    "a12e33b8d064b244",
+)
+N1_6_COOLER_MODEL_TARGETS = (
+    "Llt_phys",
+    "C_tx_tx_F",
+    "C_rx_rx_F",
+    "C_tx_rx_F",
+    "P_winding_total",
+    "P_Tx_main_group",
+    "P_Rx_main_group",
+    "P_Rx_side_total",
+    "P_core_total",
+    "T_max_Tx",
+    "Tprobe_Tx_leeward_max",
+    "T_max_Rx_main",
+    "T_max_Rx_side",
+    "Tprobe_Rx_main_leeward_max",
+    "Tprobe_Rx_side_leeward_max",
     "T_max_core",
     "Tprobe_core_center_max",
     "Tprobe_core_center_leg_max",
@@ -479,7 +530,6 @@ def _candidate(
     if (
         len(coordinate) != 25
         or any(value < 0.0 or value > 1.0 for value in coordinate)
-        or any(key not in decoded for key in ALL_INPUT_KEYS)
         or any(
             key not in decoded
             for key in preflight.DECODED_GEOMETRY_IDENTITY_COLUMNS
@@ -577,7 +627,20 @@ def _candidate(
         replay["fmin_Hz"] < RESONANCE_MIN_HZ or not conditional
     ):
         return None
-    params = {key: _builtin(decoded[key]) for key in sorted(ALL_INPUT_KEYS)}
+    # The authenticated search predates additive fixed-input controls such as
+    # ``core_center_gap_mm`` and the opt-in turn-graded electrostatic switches.
+    # They are non-geometry defaults.  Normalize through the current input
+    # schema rather than rejecting an otherwise identical historical geometry.
+    from module.input_parameter_260706 import create_input_parameter
+
+    normalized = create_input_parameter(
+        {
+            key: _builtin(decoded[key])
+            for key in ALL_INPUT_KEYS
+            if key in decoded
+        }
+    ).iloc[0].to_dict()
+    params = {key: _builtin(normalized[key]) for key in sorted(ALL_INPUT_KEYS)}
     profile = _profile()
     effective = scheduler_client.effective_verification_params(params, profile)
     if (
@@ -955,6 +1018,704 @@ def _generate_neighborhood(
     return selected
 
 
+def _n1_6_cooler_predictions(
+    frame: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Predict sequentially from the authenticated surrogate generation.
+
+    Each ensemble is released before the next target is loaded.  The complete
+    generation is large enough that retaining all target ensembles at once can
+    consume tens of gigabytes without improving inference correctness.
+    """
+
+    import gc
+    import numpy as np
+    from tools import mft_goal_fixed_lm2mh_rescore as rescore
+    from predictor import EnsemblePredictor
+
+    generation = rescore.GENERATION.resolve(strict=True)
+    report = rescore._read_json(generation / "train_report.json")
+    artifact_hashes = report.get("artifacts")
+    if (
+        report.get("dataset_sha256") != rescore.EXPECTED_DATASET_SHA256
+        or not isinstance(artifact_hashes, dict)
+        or not set(N1_6_COOLER_MODEL_TARGETS).issubset(
+            set(report.get("targets") or [])
+        )
+    ):
+        raise BatchContractError("N1=6 cooler surrogate generation drifted")
+    active = {"generation": str(generation), "report": report}
+    means: dict[str, Any] = {}
+    upper: dict[str, Any] = {}
+    evidence: dict[str, Any] = {}
+    for target in N1_6_COOLER_MODEL_TARGETS:
+        records = {}
+        for name in ("models.pkl", "meta.json"):
+            relative = f"{target}/{name}"
+            path = (generation / relative).resolve(strict=True)
+            observed = _sha_file(path)
+            if artifact_hashes.get(relative) != observed:
+                raise BatchContractError(
+                    f"N1=6 cooler model artifact drifted: {relative}"
+                )
+            records[name] = {"path": str(path), "sha256": observed}
+        model = EnsemblePredictor._load_record(target, active)
+        binding = model.configure_inference_threads(threads=8)
+        mean, half_width = model.predict_mu_sigma(frame, conformal=True)
+        mean = np.asarray(mean, dtype=float).reshape(-1)
+        half_width = np.asarray(half_width, dtype=float).reshape(-1)
+        if (
+            mean.shape != (len(frame),)
+            or half_width.shape != (len(frame),)
+            or not np.isfinite(mean).all()
+            or not np.isfinite(half_width).all()
+            or np.any(half_width < 0.0)
+        ):
+            raise BatchContractError(
+                f"N1=6 cooler surrogate output is invalid: {target}"
+            )
+        means[target] = mean
+        upper[target] = mean + half_width
+        evidence[target] = {
+            "artifacts": records,
+            "features_sha256": _sha(list(model.features)),
+            "inference_binding": binding,
+        }
+        del model
+        gc.collect()
+    return means, upper, {
+        "generation": str(generation),
+        "train_report_sha256": rescore.EXPECTED_TRAIN_REPORT_SHA256,
+        "dataset_sha256": rescore.EXPECTED_DATASET_SHA256,
+        "evaluation_model_sha256": rescore.EXPECTED_EVALUATION_MODEL_SHA256,
+        "targets": evidence,
+    }
+
+
+def _turn_graded_crx_calibration() -> tuple[float, dict[str, Any]]:
+    """Authenticate the first corrected turn-graded Rx truth calibration.
+
+    The legacy surrogate was trained against a lumped terminal-voltage
+    electrostatic setup.  The reviewed production setup grades each turn by
+    its physical series voltage.  Until enough corrected samples exist for a
+    retrain, the single measured ratio is used only to rank acquisition FEA
+    candidates.  Every submitted lane still runs the corrected Cap stage and
+    cannot become a final PASS from this transfer estimate.
+    """
+
+    source_plan = _validate_seal(
+        _read_json(TURN_GRADED_CAP_CALIBRATION_PLAN),
+        BATCH_PLAN_SCHEMA,
+    )
+    if (
+        source_plan.get("payload_sha256")
+        != EXPECTED_TURN_GRADED_CAP_CALIBRATION_PLAN_PAYLOAD_SHA256
+    ):
+        raise BatchContractError("turn-graded calibration source plan drifted")
+    source_candidates = [
+        lane["candidate"]
+        for lane in source_plan.get("lanes") or []
+        if (lane.get("candidate") or {}).get("physical_geometry_sha256")
+        == TURN_GRADED_CAP_CALIBRATION_GEOMETRY_SHA256
+    ]
+    if len(source_candidates) != 1:
+        raise BatchContractError(
+            "turn-graded calibration source geometry is not unique"
+        )
+    legacy_replay = source_candidates[0].get("fixed_lm2mh_screen") or {}
+    legacy_lrx_H = _finite(
+        legacy_replay.get("Lrx_H"), "turn_graded_calibration.Lrx_H"
+    )
+    legacy_frx_Hz = _finite(
+        legacy_replay.get("fRx_Hz"), "turn_graded_calibration.fRx_Hz"
+    )
+    legacy_crx_F = 1.0 / (
+        4.0 * math.pi * math.pi * legacy_lrx_H * legacy_frx_Hz**2
+    )
+
+    canary_plan_path = TURN_GRADED_CAP_CANARY_ROOT / "batch_plan.json"
+    canary_plan = _validate_seal(
+        _read_json(canary_plan_path),
+        TURN_GRADED_CAP_PLAN_SCHEMA,
+    )
+    if (
+        canary_plan.get("payload_sha256")
+        != EXPECTED_TURN_GRADED_CAP_PLAN_PAYLOAD_SHA256
+        or (canary_plan.get("source") or {}).get("physical_geometry_sha256")
+        != TURN_GRADED_CAP_CALIBRATION_GEOMETRY_SHA256
+        or canary_plan.get("selected_variant_ids") != ["rx-main-side-mid"]
+        or canary_plan.get("symmetric_nonrounded") is not True
+    ):
+        raise BatchContractError("turn-graded calibration canary plan drifted")
+
+    collection_path = (
+        TURN_GRADED_CAP_CANARY_ROOT / "collection_completed_v2.json"
+    )
+    collection = _validate_seal(
+        _read_json(collection_path),
+        TURN_GRADED_CAP_COLLECTION_SCHEMA,
+    )
+    rows = collection.get("rows") or []
+    if (
+        collection.get("payload_sha256")
+        != EXPECTED_TURN_GRADED_CAP_COLLECTION_PAYLOAD_SHA256
+        or collection.get("plan_payload_sha256")
+        != canary_plan["payload_sha256"]
+        or collection.get("all_terminal") is not True
+        or collection.get("valid_result_count") != 1
+        or len(rows) != 1
+        or rows[0].get("contract_valid") is not True
+        or (rows[0].get("variant") or {}).get("id")
+        != "rx-main-side-mid"
+    ):
+        raise BatchContractError(
+            "turn-graded calibration collection is not valid"
+        )
+    corrected_crx_F = _finite(
+        rows[0].get("C_terminal_F"),
+        "turn_graded_calibration.C_terminal_F",
+    )
+    ratio = corrected_crx_F / legacy_crx_F
+    if (
+        not 0.70 <= ratio <= 0.85
+        or not math.isclose(corrected_crx_F, 4.14885e-10, abs_tol=5e-16)
+    ):
+        raise BatchContractError("turn-graded Crx calibration ratio drifted")
+    return ratio, {
+        "status": "single_truth_acquisition_transfer_not_final_validation",
+        "application": (
+            "multiply legacy C_rx_rx_F mean only; preserve legacy Ctx/Cinter; "
+            "fresh corrected Cap FEA required on every selected lane"
+        ),
+        "calibration_geometry_sha256": (
+            TURN_GRADED_CAP_CALIBRATION_GEOMETRY_SHA256
+        ),
+        "legacy_Crx_F": legacy_crx_F,
+        "corrected_turn_graded_Crx_F": corrected_crx_F,
+        "corrected_to_legacy_ratio": ratio,
+        "source_plan": _file_record(TURN_GRADED_CAP_CALIBRATION_PLAN),
+        "canary_plan": _file_record(canary_plan_path),
+        "canary_collection": _file_record(collection_path),
+        "canary_task_id": int(rows[0]["task_id"]),
+    }
+
+
+def _generate_n1_6_cooler_neighborhood(
+    anchors: Sequence[dict[str, Any]], count: int
+) -> list[tuple[str, dict[str, Any]]]:
+    """Build a deterministic N1=6/N2=60 capacitance/thermal hedge.
+
+    The secondary foil pitch stays close to each authenticated anchor while
+    copper thickness is exchanged for insulation gap and shorter axial foil
+    height.  The available Rx temperature margin is therefore spent directly
+    on reducing terminal capacitance.  Primary foil height and the unchanged
+    production cold plates are enlarged together to target the 100 C Tx gate.
+    """
+
+    import numpy as np
+    import pandas as pd
+
+    from module.input_parameter_260706 import (
+        create_input_parameter,
+        validation_check,
+    )
+
+    if not MIN_BATCH <= count <= MAX_BATCH:
+        raise BatchContractError("N1=6 cooler batch count must be within 8..16")
+    exact = []
+    by_prefix = {
+        item["physical_geometry_sha256"][:16]: item for item in anchors
+    }
+    for prefix in N1_6_COOLER_ANCHOR_PREFIXES:
+        anchor = by_prefix.get(prefix)
+        if anchor is None:
+            raise BatchContractError(
+                f"N1=6 cooler anchor is absent: {prefix}"
+            )
+        if (
+            int(anchor["source"]["fixed_primary_turns_stratum"]) != 6
+            or (
+                int(anchor["params"]["N1_main"])
+                + 2 * int(anchor["params"]["N1_side"])
+            )
+            != 6
+            or (
+                int(anchor["params"]["N2_main"])
+                + int(anchor["params"]["N2_side"])
+            )
+            != 60
+        ):
+            raise BatchContractError("N1=6 cooler anchor topology drifted")
+        exact.append(anchor)
+
+    raw: list[dict[str, Any]] = []
+    seen_params: set[str] = set()
+    secondary_cw_mm = (0.74, 0.78, 0.82, 0.86, 0.90)
+    secondary_height_mm = (225.0, 245.0, 265.0)
+    vertical_extension_mm = (25.0, 50.0, 60.0)
+    l2_reduction_mm = (0.0, 4.0, 8.0)
+    cooling_level_specs = (
+        (0.0, 0.78, 1.0),
+        (4.0, 0.79, 2.0),
+        (8.0, 0.795, 3.0),
+        (12.0, 0.80, 4.0),
+    )
+    for anchor in exact:
+        base = anchor["params"]
+        base_pitch = float(base["cw2"]) + float(base["gap2"])
+        for cw2 in secondary_cw_mm:
+            gap2 = round(min(2.0, base_pitch - cw2), 3)
+            if gap2 < 1.75:
+                continue
+            nwl2_main = (
+                int(base["N2_main"]) * cw2
+                + (int(base["N2_main"]) - 1) * gap2
+            )
+            wcp_reference_x = (
+                2.0 * float(base["l1"])
+                + 2.0 * float(base["cc_w2c_space_x"])
+                + 2.0 * nwl2_main
+                + 2.0 * float(base["w2c_w1c_space_x"])
+            )
+            cooling_levels = tuple(
+                {
+                    "wcp_t": round(
+                        float(base["wcp_t"]) + wcp_t_delta, 1
+                    ),
+                    "wcp_len_x": round(
+                        wcp_reference_x * wcp_length_fraction, 1
+                    ),
+                    "core_plate_t": round(
+                        float(base["core_plate_t"]) + core_plate_delta,
+                        1,
+                    ),
+                }
+                for (
+                    wcp_t_delta,
+                    wcp_length_fraction,
+                    core_plate_delta,
+                ) in cooling_level_specs
+            )
+            for nwh2 in secondary_height_mm:
+                for vertical_delta in vertical_extension_mm:
+                    for l2_delta in l2_reduction_mm:
+                        for cooling in cooling_levels:
+                            params = dict(base)
+                            params.update(cooling)
+                            params.update(
+                                {
+                                    "cw1": PRIMARY_CONDUCTOR_MM,
+                                    "gap1": PRIMARY_GAP_MM,
+                                    "cw2": cw2,
+                                    "gap2": gap2,
+                                    "nwh2": nwh2,
+                                    "h1": round(
+                                        float(base["h1"]) + vertical_delta, 1
+                                    ),
+                                    "nwh1": round(
+                                        float(base["nwh1"]) + vertical_delta, 1
+                                    ),
+                                    "l2": round(
+                                        float(base["l2"]) - l2_delta, 1
+                                    ),
+                                }
+                            )
+                            try:
+                                valid, decoded_frame = validation_check(
+                                    create_input_parameter(params),
+                                    strict=False,
+                                )
+                            except (
+                                KeyError,
+                                TypeError,
+                                ValueError,
+                                OverflowError,
+                            ):
+                                continue
+                            if not valid:
+                                continue
+                            decoded = {
+                                key: _builtin(value)
+                                for key, value in decoded_frame.iloc[
+                                    0
+                                ].to_dict().items()
+                            }
+                            if (
+                                int(decoded["N1"]) != 6
+                                or int(decoded["N2"]) != 60
+                                or float(decoded["cw1"])
+                                != PRIMARY_CONDUCTOR_MM
+                                or float(decoded["gap1"]) != PRIMARY_GAP_MM
+                            ):
+                                raise BatchContractError(
+                                    "N1=6 cooler topology/fixed controls escaped"
+                                )
+                            volume, dimensions = (
+                                geometry_metrics.bounding_box_lit(decoded)
+                            )
+                            if any(
+                                float(value)
+                                > SIZE_LIMITS_MM[axis] + 1e-9
+                                for axis, value in zip(
+                                    ("W", "L", "H"), dimensions
+                                )
+                            ):
+                                continue
+                            projected = {
+                                key: _builtin(decoded[key])
+                                for key in sorted(ALL_INPUT_KEYS)
+                            }
+                            params_sha = _sha(projected)
+                            if params_sha in seen_params:
+                                continue
+                            seen_params.add(params_sha)
+                            raw.append(
+                                {
+                                    "decoded": decoded,
+                                    "params": projected,
+                                    "params_sha256": params_sha,
+                                    "geometry_sha256": _geometry_sha(decoded),
+                                    "dimensions": [
+                                        float(value) for value in dimensions
+                                    ],
+                                    "volume_L": float(volume),
+                                    "anchor": anchor,
+                                    "mutations": {
+                                        "cw2_mm": cw2,
+                                        "gap2_mm": gap2,
+                                        "secondary_pitch_mm": cw2 + gap2,
+                                        "nwh2_mm": nwh2,
+                                        "h1_and_nwh1_extension_mm": (
+                                            vertical_delta
+                                        ),
+                                        "l2_reduction_mm": l2_delta,
+                                        **cooling,
+                                    },
+                                }
+                            )
+    if len(raw) < count:
+        raise BatchContractError("N1=6 cooler decoded pool is too small")
+
+    frame = pd.DataFrame([item["decoded"] for item in raw])
+    means, upper, model_identity = _n1_6_cooler_predictions(frame)
+    crx_calibration_ratio, crx_calibration = (
+        _turn_graded_crx_calibration()
+    )
+
+    profile = _profile()
+    eligible: list[dict[str, Any]] = []
+    screened: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        decoded = item["decoded"]
+        legacy_c_rx_F = float(means["C_rx_rx_F"][index])
+        corrected_crx_estimate_F = (
+            legacy_c_rx_F * crx_calibration_ratio
+        )
+        legacy_replay = _fixed_lm_resonance(
+            llt_uH=float(means["Llt_phys"][index]),
+            c_tx_F=float(means["C_tx_tx_F"][index]),
+            c_rx_F=legacy_c_rx_F,
+            c_inter_F=float(means["C_tx_rx_F"][index]),
+            n1=6,
+            n2=60,
+        )
+        replay = _fixed_lm_resonance(
+            llt_uH=float(means["Llt_phys"][index]),
+            c_tx_F=float(means["C_tx_tx_F"][index]),
+            c_rx_F=corrected_crx_estimate_F,
+            c_inter_F=float(means["C_tx_rx_F"][index]),
+            n1=6,
+            n2=60,
+        )
+        primary_C = max(
+            float(upper[target][index])
+            for target in PRIMARY_WINDING_TEMPERATURES
+        )
+        secondary_C = max(
+            float(upper[target][index])
+            for target in SECONDARY_WINDING_TEMPERATURES
+        )
+        core_C = max(
+            float(upper[target][index]) for target in CORE_TEMPERATURES
+        )
+        screened.append(
+            {
+                "fmin_Hz": float(replay["fmin_Hz"]),
+                "corrected_Crx_estimate_F": corrected_crx_estimate_F,
+                "legacy_Crx_surrogate_F": legacy_c_rx_F,
+                "legacy_fmin_Hz": float(legacy_replay["fmin_Hz"]),
+                "mutations": item["mutations"],
+                "dimensions": item["dimensions"],
+            }
+        )
+        if (
+            replay["fmin_Hz"] < RESONANCE_MIN_HZ
+            or corrected_crx_estimate_F > 0.55e-9
+        ):
+            continue
+        effective = scheduler_client.effective_verification_params(
+            item["params"], profile
+        )
+        if (
+            effective.get("full_model") != 0
+            or effective.get("round_corner") != 0
+            or effective.get("thermal_symmetry") != "eighth"
+            or effective.get("loss_from_copy") != 0
+            or effective.get("fan_velocity") != 1.5
+            or effective.get("fan_config") != "dual"
+            or effective.get("core_plate_pad_t") != 2.0
+            or effective.get("wcp_pad_t") != 2.0
+        ):
+            raise BatchContractError("N1=6 cooler effective profile drifted")
+        loss = (
+            float(means["P_winding_total"][index])
+            + float(means["P_core_total"][index])
+        )
+        violation = math.sqrt(
+            max(0.0, (primary_C - 100.0) / 10.0) ** 2
+            + max(0.0, (secondary_C - 120.0) / 10.0) ** 2
+            + max(0.0, (core_C - 120.0) / 10.0) ** 2
+            + max(
+                0.0,
+                (corrected_crx_estimate_F - 0.55e-9) / 0.05e-9,
+            )
+            ** 2
+        )
+        screen = {
+            **replay,
+            "C_tx_tx_F": float(means["C_tx_tx_F"][index]),
+            "C_rx_rx_F": corrected_crx_estimate_F,
+            "C_rx_rx_corrected_turn_graded_transfer_estimate_F": (
+                corrected_crx_estimate_F
+            ),
+            "C_rx_rx_legacy_surrogate_F": legacy_c_rx_F,
+            "C_tx_rx_F": float(means["C_tx_rx_F"][index]),
+            "legacy_fixed_lm2mh_screen": legacy_replay,
+            "primary_winding_robust_max_C": primary_C,
+            "secondary_winding_robust_max_C": secondary_C,
+            "core_robust_max_C": core_C,
+            "P_Tx_main_group_W": float(
+                means["P_Tx_main_group"][index]
+            ),
+            "P_Rx_main_group_W": float(
+                means["P_Rx_main_group"][index]
+            ),
+            "P_Rx_side_total_W": float(
+                means["P_Rx_side_total"][index]
+            ),
+            "P_winding_total_W": float(
+                means["P_winding_total"][index]
+            ),
+            "P_core_total_W": float(means["P_core_total"][index]),
+            "P_total_screen_W": loss,
+            "Crx_target_F": 0.55e-9,
+            "Crx_selection_ceiling_F": 0.55e-9,
+            "Crx_selection_basis": (
+                "authenticated_single_truth_corrected_turn_graded_transfer"
+            ),
+        }
+        vector = [
+            float(decoded[name])
+            for name in (
+                "cw2",
+                "gap2",
+                "nwh2",
+                "h1",
+                "nwh1",
+                "l2",
+                "wcp_t",
+                "wcp_len_x",
+                "core_plate_t",
+            )
+        ]
+        eligible.append(
+            {
+                "physical_geometry_sha256": item["geometry_sha256"],
+                "params": item["params"],
+                "params_sha256": item["params_sha256"],
+                "effective_params_sha256": _sha(effective),
+                "source": {
+                    **item["anchor"]["source"],
+                    "anchor_physical_geometry_sha256": item["anchor"][
+                        "physical_geometry_sha256"
+                    ],
+                    "anchor_acquisition_rank": item["anchor"][
+                        "acquisition_rank"
+                    ],
+                },
+                "dimensions_mm": {
+                    "W_drawing_x": item["dimensions"][0],
+                    "L_perpendicular_y": item["dimensions"][1],
+                    "H": item["dimensions"][2],
+                },
+                "objective_volume_L": item["volume_L"],
+                "objective_total_loss_W": loss,
+                "normalized_constraint_violation_l2": violation,
+                "fixed_lm2mh_screen": replay,
+                "surrogate_screen": screen,
+                "turn_graded_Crx_calibration": crx_calibration,
+                "screening_primary_winding_max_C": primary_C,
+                "screening_secondary_winding_max_C": secondary_C,
+                "screening_winding_max_C": max(primary_C, secondary_C),
+                "screening_core_max_C": core_C,
+                "neighborhood_mutations": item["mutations"],
+                "raw_row_sha256": _sha(
+                    {
+                        "anchor": item["anchor"]["raw_row_sha256"],
+                        "params": item["params_sha256"],
+                        "screen": screen,
+                    }
+                ),
+                "_vector": vector,
+            }
+        )
+    if len(eligible) < count:
+        minimum_crx = min(
+            screened,
+            key=lambda row: (
+                row["corrected_Crx_estimate_F"],
+                -row["fmin_Hz"],
+            ),
+        )
+        maximum_fmin = max(
+            screened,
+            key=lambda row: (
+                row["fmin_Hz"],
+                -row["C_rx_rx_F"],
+            ),
+        )
+        raise BatchContractError(
+            "only "
+            f"{len(eligible)} N1=6 cooler candidates pass "
+            "calibrated corrected-turn-graded Crx<=0.55nF and "
+            "fixed-Lm fmin>=15kHz; "
+            f"minimum_Crx={minimum_crx!r}; maximum_fmin={maximum_fmin!r}"
+        )
+
+    vector_width = len(eligible[0]["_vector"])
+    minima = [
+        min(row["_vector"][index] for row in eligible)
+        for index in range(vector_width)
+    ]
+    spans = [
+        max(row["_vector"][index] for row in eligible) - minima[index]
+        for index in range(vector_width)
+    ]
+    for row in eligible:
+        row["coordinate"] = [
+            0.0
+            if spans[index] <= 0.0
+            else (row["_vector"][index] - minima[index]) / spans[index]
+            for index in range(vector_width)
+        ]
+
+    selected: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    def add(role: str, row: dict[str, Any]) -> None:
+        identity = row["physical_geometry_sha256"]
+        if identity not in seen and len(selected) < count:
+            selected.append((role, row))
+            seen.add(identity)
+
+    ordered = sorted(
+        eligible,
+        key=lambda row: (
+            row["normalized_constraint_violation_l2"],
+            row["screening_primary_winding_max_C"],
+            row["objective_total_loss_W"],
+            row["physical_geometry_sha256"],
+        ),
+    )
+    add("minimum_split_temperature_violation", ordered[0])
+    add(
+        "minimum_predicted_Tx",
+        min(eligible, key=lambda row: row["screening_primary_winding_max_C"]),
+    )
+    add(
+        "minimum_predicted_Crx",
+        min(
+            eligible,
+            key=lambda row: row["surrogate_screen"][
+                "C_rx_rx_corrected_turn_graded_transfer_estimate_F"
+            ],
+        ),
+    )
+    add(
+        "minimum_predicted_total_loss",
+        min(eligible, key=lambda row: row["objective_total_loss_W"]),
+    )
+    add(
+        "minimum_volume",
+        min(eligible, key=lambda row: row["objective_volume_L"]),
+    )
+    high_wcp = [
+        row
+        for row in eligible
+        if float(row["neighborhood_mutations"]["wcp_t"]) >= 24.0
+    ]
+    if high_wcp:
+        add(
+            "minimum_violation_high_wcp_ge24mm",
+            min(
+                high_wcp,
+                key=lambda row: (
+                    row["normalized_constraint_violation_l2"],
+                    row["screening_primary_winding_max_C"],
+                    row["physical_geometry_sha256"],
+                ),
+            ),
+        )
+    maximum_wcp_t = max(
+        float(row["neighborhood_mutations"]["wcp_t"])
+        for row in eligible
+    )
+    add(
+        "maximum_wcp_thickness_minimum_violation",
+        min(
+            (
+                row
+                for row in eligible
+                if float(row["neighborhood_mutations"]["wcp_t"])
+                == maximum_wcp_t
+            ),
+            key=lambda row: (
+                row["normalized_constraint_violation_l2"],
+                row["screening_primary_winding_max_C"],
+                row["physical_geometry_sha256"],
+            ),
+        ),
+    )
+    top = ordered[: max(96, count * 8)]
+    while len(selected) < count:
+        remaining = [
+            row
+            for row in top
+            if row["physical_geometry_sha256"] not in seen
+        ]
+        if not remaining:
+            remaining = [
+                row
+                for row in eligible
+                if row["physical_geometry_sha256"] not in seen
+            ]
+        choice = max(
+            remaining,
+            key=lambda row: (
+                min(
+                    math.dist(row["coordinate"], prior["coordinate"])
+                    for _, prior in selected
+                ),
+                -row["normalized_constraint_violation_l2"],
+            ),
+        )
+        add("N1_6_cooler_max_min_diversity", choice)
+    for _role, row in selected:
+        row.pop("_vector", None)
+        row["surrogate_model_identity"] = model_identity
+    return selected
+
+
 def _dominates(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     keys = ("objective_volume_L", "objective_total_loss_W")
     pairs = [(float(left[key]), float(right[key])) for key in keys]
@@ -1108,6 +1869,7 @@ def prepare(
     count: int,
     solver_revision: str,
     library_revision: str,
+    n1_6_cooler_hedge: bool = False,
 ) -> Path:
     solver = str(solver_revision).lower()
     library = str(library_revision).lower()
@@ -1131,7 +1893,11 @@ def prepare(
                 raise BatchContractError("global candidate CSV is not deduplicated")
             anchors.append(candidate)
             seen.add(identity)
-    selected = _generate_neighborhood(anchors, count)
+    selected = (
+        _generate_n1_6_cooler_neighborhood(anchors, count)
+        if n1_6_cooler_hedge
+        else _generate_neighborhood(anchors, count)
+    )
     profile = _profile()
     destination = output.resolve()
     if destination.exists():
@@ -1253,10 +2019,62 @@ def prepare(
                     "maximum_count": MAX_BATCH,
                     "fixed_Lm_fmin_gate_applied": True,
                     "nonthermal_gate_applied": True,
+                    "N1_6_cooler_hedge": bool(n1_6_cooler_hedge),
+                    "N1_6_cooler_anchor_prefixes": (
+                        list(N1_6_COOLER_ANCHOR_PREFIXES)
+                        if n1_6_cooler_hedge
+                        else []
+                    ),
+                    "N1_6_N2_60_topology_hard_fixed": bool(
+                        n1_6_cooler_hedge
+                    ),
+                    "Crx_target_F": (
+                        0.55e-9 if n1_6_cooler_hedge else None
+                    ),
+                    "N1_6_Crx_selection_basis": (
+                        "authenticated single corrected-turn-graded truth "
+                        "transfer for acquisition ranking only; fresh Cap FEA "
+                        "is authoritative"
+                        if n1_6_cooler_hedge
+                        else None
+                    ),
+                    "N1_6_final_classification_requires_raw_FEA": bool(
+                        n1_6_cooler_hedge
+                    ),
+                    "N1_6_required_raw_FEA_evidence": (
+                        [
+                            "corrected turn-graded terminal capacitance",
+                            "fixed-Lm=2mH resonance replay",
+                            "primary split temperature <=100C",
+                            "secondary split temperature <=120C",
+                            "core split temperature <=120C",
+                        ]
+                        if n1_6_cooler_hedge
+                        else []
+                    ),
+                    "split_temperature_limits_C": {
+                        "primary_winding": 100.0,
+                        "secondary_winding": 120.0,
+                        "core": 120.0,
+                    },
                     "diversity_method": (
-                        "authenticated NSGA acquisition anchors -> deterministic "
-                        "secondary-capacitance-reduction stencil -> fixed-Lm "
-                        "fmin>=15kHz -> greedy max-min physical diversity"
+                        (
+                            "exact authenticated N1=6 cooler anchors -> "
+                            "deterministic secondary copper-for-gap and "
+                            "cold-plate/primary-height stencil -> authenticated "
+                            "cap/loss/split-temperature surrogate rescore -> "
+                            "single-truth corrected-turn-graded Crx transfer "
+                            "for acquisition ranking -> estimated Crx<=0.55nF "
+                            "and fixed-Lm fmin>=15kHz -> "
+                            "minimum-violation plus max-min diversity"
+                        )
+                        if n1_6_cooler_hedge
+                        else (
+                            "authenticated NSGA acquisition anchors -> "
+                            "deterministic secondary-capacitance-reduction "
+                            "stencil -> fixed-Lm fmin>=15kHz -> greedy "
+                            "max-min physical diversity"
+                        )
                     ),
                 },
                 "solver_revision": solver,
@@ -1756,6 +2574,7 @@ def watch_prepare(
     solver_revision: str,
     library_revision: str,
     poll_seconds: float,
+    n1_6_cooler_hedge: bool = False,
 ) -> Path:
     if poll_seconds < 10.0 or poll_seconds > 300.0:
         raise BatchContractError("poll interval must be within 10..300 seconds")
@@ -1767,6 +2586,7 @@ def watch_prepare(
                 count=count,
                 solver_revision=solver_revision,
                 library_revision=library_revision,
+                n1_6_cooler_hedge=n1_6_cooler_hedge,
             )
         except (FileNotFoundError, BatchContractError) as exc:
             status_path = authority_root / "collector_status.json"
@@ -1803,6 +2623,14 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--count", type=int, default=DEFAULT_BATCH)
         command.add_argument("--solver-revision", required=True)
         command.add_argument("--library-revision", required=True)
+        command.add_argument(
+            "--n1-6-cooler-hedge",
+            action="store_true",
+            help=(
+                "Use only the three authenticated N1=6 cooler anchors and "
+                "target Crx/Tx with split 100/120/120 C limits."
+            ),
+        )
         if name == "watch-prepare":
             command.add_argument("--poll-seconds", type=float, default=30.0)
     submit_command = commands.add_parser("submit")
@@ -1827,6 +2655,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             count=args.count,
             solver_revision=args.solver_revision,
             library_revision=args.library_revision,
+            n1_6_cooler_hedge=args.n1_6_cooler_hedge,
         )
     elif args.command == "watch-prepare":
         result = watch_prepare(
@@ -1836,6 +2665,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             solver_revision=args.solver_revision,
             library_revision=args.library_revision,
             poll_seconds=args.poll_seconds,
+            n1_6_cooler_hedge=args.n1_6_cooler_hedge,
         )
     elif args.command == "submit":
         result = submit(
