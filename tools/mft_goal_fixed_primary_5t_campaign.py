@@ -28,13 +28,13 @@ import zlib
 SCHEMA = "mft-goal-fixed-primary-5t-nsga-task-v1"
 RESULT_SCHEMA = "mft-goal-fixed-primary-5t-nsga-result-v1"
 CAMPAIGN_SCHEMA = "mft-goal-fixed-primary-5t-nsga-submission-v1"
-CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-axis-v5"
+CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-axis-v6"
 HEDGE_CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-variable-20260727-v1"
 PRIMARY_CONDUCTOR_MM = 5.0
 PRIMARY_GAP_MM = 1.6
 POPULATION = 320
 GENERATIONS = 80
-SEED_START = 2_707_275_600
+SEED_START = 2_707_275_700
 SEED_COUNT = 16
 HEDGE_SEED_START = 2_707_275_400
 HEDGE_SEED_COUNT = 8
@@ -57,7 +57,7 @@ GLOBAL_TERMINAL_CSV = Path(
 )
 DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_primary_5t_gap1_1p6_axis_nsga_v5"
+    r"\fixed_primary_5t_gap1_1p6_axis_nsga_v6"
 )
 BASE_TASKS = {
     5: "artifacts/campaign/tasks/seed-2607262000-n1-5.json",
@@ -270,14 +270,12 @@ def _task_payload(
     seed: int,
     turns: int,
     source_bytes: bytes,
-    warm_bytes: bytes,
     campaign_id: str,
     lane: str,
     hard_spec: Mapping[str, Any],
 ) -> dict[str, Any]:
     hard_spec_sha = _sha(hard_spec)
     runner_sha = hashlib.sha256(source_bytes).hexdigest()
-    warm_sha = hashlib.sha256(warm_bytes).hexdigest()
     base_task_local = (
         LOCAL_GOAL_BUNDLE
         / "tasks"
@@ -293,6 +291,7 @@ def _task_payload(
         ],
         "hard_spec_sha256": hard_spec_sha,
         "runner_source_sha256": runner_sha,
+        "initialization": "cold-random-axis-contract-v1",
         "population": POPULATION,
         "generations": GENERATIONS,
     }
@@ -315,8 +314,7 @@ def _task_payload(
             "physics_sha256": _sha(physics),
             "runner_source_sha256": runner_sha,
             "runner_source_b64": base64.b64encode(source_bytes).decode("ascii"),
-            "warm_start_sha256": warm_sha,
-            "warm_start_b64": base64.b64encode(warm_bytes).decode("ascii"),
+            "initialization": "cold-random-axis-contract-v1",
             "global_nds_artifact_required": True,
             "production_eligible": False,
             "automatic_promotion_allowed": False,
@@ -398,7 +396,6 @@ def submit(
         raise RuntimeError(f"campaign output already exists: {output}")
     output.mkdir(parents=True)
     source = _source_bytes()
-    warm = _warm_coordinates_by_turns(GLOBAL_TERMINAL_CSV)
     if lane == "strict":
         campaign_id = CAMPAIGN_ID
         hard_spec = HARD_SPEC
@@ -427,7 +424,6 @@ def submit(
             seed=seed_start + index,
             turns=turns,
             source_bytes=source,
-            warm_bytes=warm[turns],
             campaign_id=campaign_id,
             lane=lane,
             hard_spec=hard_spec,
@@ -490,10 +486,12 @@ def submit(
             "scheduler_project_modified": False,
             "scheduler_project_code_included": False,
             "existing_surrogate_reused": True,
-            "warm_source": {
-                "path": str(GLOBAL_TERMINAL_CSV),
-                "sha256": _sha_file(GLOBAL_TERMINAL_CSV),
-                "projected_to_fixed_primary_controls_on_worker": True,
+            "initialization": {
+                "mode": "cold-random-axis-contract-v1",
+                "reason": (
+                    "old-axis warm pool has no hard-feasible W<=1000 design"
+                ),
+                "old_objectives_or_constraints_inherited": False,
             },
             "task_payload_sha256": [
                 task["payload_sha256"] for task in tasks
@@ -559,6 +557,7 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
         != hashlib.sha256(_source_bytes()).hexdigest()
         or int(task["population"]) != POPULATION
         or int(task["generations"]) != GENERATIONS
+        or task.get("initialization") != "cold-random-axis-contract-v1"
     ):
         raise RuntimeError("fixed-primary worker contract mismatch")
     if output.exists():
@@ -676,14 +675,12 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
             int(task["fixed_primary_turns"])
         )
     )
-    warm_path, warm_sha = _write_warm(task, output)
-    warm_values = np.load(warm_path, allow_pickle=False)
+    raw_smoke = np.random.default_rng(
+        int(task["seed"]) ^ 0x5A17
+    ).random((8, int(problem.n_var)))
     projected, projection_audit = runner.repair_coordinates(
-        warm_values, stage="fixed_primary_warm_projection"
+        raw_smoke, stage="fixed_primary_cold_smoke_projection"
     )
-    projected_path = output / "projected_warm_start.npy"
-    np.save(projected_path, projected, allow_pickle=False)
-    projected_sha = _sha_file(projected_path)
     smoke = runner.evaluate_coordinates(projected[:8], physical=True)
     decoded = smoke["frame"]
     if (
@@ -738,6 +735,21 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
                 )
 
     def pre_optimization(value: Mapping[str, Any]) -> None:
+        initialization = (
+            (value.get("initial_population") or {}).get(
+                "current_run_nsga2"
+            )
+            or {}
+        )
+        if (
+            value.get("authenticated_warm_start") is not None
+            or initialization.get("population") != POPULATION
+            or initialization.get("authenticated_warm_injected_count") != 0
+            or initialization.get("fresh_random_count") != POPULATION
+        ):
+            raise RuntimeError(
+                "axis-v6 optimizer did not preserve cold random initialization"
+            )
         _atomic_json(
             output / "pre_optimization.json",
             _seal(
@@ -778,9 +790,8 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
                             }
                         ),
                     },
-                    "warm_source_sha256": warm_sha,
-                    "projected_warm_sha256": projected_sha,
-                    "warm_projection_audit": projection_audit,
+                    "initialization": "cold-random-axis-contract-v1",
+                    "cold_smoke_projection_audit": projection_audit,
                     "optimizer_repair_installation": repair,
                     "base_optimizer_evidence": copy.deepcopy(dict(value)),
                 }
@@ -791,8 +802,6 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
         seed=int(task["seed"]),
         population=POPULATION,
         max_generations=GENERATIONS,
-        warm_start_path=projected_path,
-        warm_start_sha256=projected_sha,
         optimizer_termination_strategy=(
             preflight.FIXED_GENERATION_TERMINATION_STRATEGY
         ),
