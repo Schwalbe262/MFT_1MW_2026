@@ -42,6 +42,9 @@ STATUS_SCHEMA = "mft-codex-work-status-v1"
 POSTSUCCESS_STATE_SCHEMA = (
     "mft-goal-postdeadline-standard-postsuccess-state-v1"
 )
+THERMAL_BRIDGE_STATE_SCHEMA = (
+    "mft-corrected-thermal-terminal-transport-watch-state-v1"
+)
 FINAL_GATE_PENDING_SCHEMA = "mft-goal-final-solver-package-pending-v1"
 FINAL_GATE_SEAL_SCHEMA = "mft-goal-final-solver-package-seal-v1"
 FINAL_PACKAGE_NAME = "final_solver_package_v1"
@@ -631,6 +634,85 @@ def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
     }
 
 
+def _thermal_bridge_card(path: Path, observed_at: str) -> dict[str, Any]:
+    value = _read_sealed_local_json(
+        path,
+        schema=THERMAL_BRIDGE_STATE_SCHEMA,
+        schema_field="schema",
+    )
+    state = str(value.get("watcher_state") or "").lower()
+    allowed = {"armed", "running", "collected", "failed"}
+    if state not in allowed:
+        raise UpdaterError("thermal bridge watcher state drifted")
+    pid = _positive_or_none(value.get("watcher_pid"), "thermal bridge watcher PID")
+    post_count = value.get("scheduler_post_calls_total")
+    if isinstance(post_count, bool) or post_count not in {0, 1}:
+        raise UpdaterError("thermal bridge POST count drifted")
+    tool_sha = str(value.get("tool_sha256") or "")
+    source_state = str(value.get("source_task_state") or "")
+    stage = str(value.get("stage") or "")
+    if (
+        value.get("source_task_id") != 96324
+        or value.get("source_task_name") != TASK_SPECS[0].task_name
+        or value.get("heartbeat_interval_seconds") != 60
+        or not re.fullmatch(r"[0-9a-f]{64}", tool_sha)
+        or not source_state
+        or not stage
+        or value.get("diagnostic_only") is not True
+        or value.get("canonical") is not False
+        or value.get("production_truth_eligible") is not False
+        or value.get("scheduler_mutation_performed") is not False
+        or value.get("scientific_pass_claimed") is not False
+        or value.get("production_claimed") is not False
+        or value.get("artifact_collected") is not (state == "collected")
+        or (state == "failed") != bool(value.get("failure"))
+    ):
+        raise UpdaterError("thermal bridge safety boundary drifted")
+    updated = str(value.get("updated_at_utc") or "")
+    try:
+        parsed = datetime.fromisoformat(updated)
+    except ValueError as exc:
+        raise UpdaterError("thermal bridge heartbeat timestamp drifted") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise UpdaterError("thermal bridge heartbeat timestamp lacks timezone")
+    progress = {
+        "armed": 25,
+        "running": 55,
+        "collected": 100,
+        "failed": 100,
+    }[state]
+    return {
+        "id": "codex-thermal-artifact-handoff",
+        "title": (
+            "CODEX AUTO · THERMAL ARTIFACT HANDOFF · "
+            f"{state.upper()}"
+        ),
+        "detail": (
+            "Corrected-thermal task96324의 terminal-success artifact를 "
+            "인증·전송·수집하는 자동화 상태입니다. 이 lifecycle 표시는 "
+            "온도 제약이나 scientific/production PASS를 주장하지 않습니다."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": [
+            f"source task96324 state={source_state} / stage={stage}",
+            (
+                f"Scheduler POST count={post_count} / "
+                "heartbeat mutation=false"
+            ),
+            (
+                f"artifact collected="
+                f"{str(bool(value.get('artifact_collected'))).lower()}"
+            ),
+            "scientific claim=false / production claim=false",
+            f"watcher PID={pid} / tool SHA256 {tool_sha}",
+            f"heartbeat updated={updated}",
+            f"state SHA256 {_file_sha256(path.resolve())}",
+        ],
+    }
+
+
 def _final_gate_card(root: Path, observed_at: str) -> dict[str, Any]:
     resolved_root = root.resolve()
     seal_path = resolved_root / FINAL_PACKAGE_NAME / "package_seal.json"
@@ -819,6 +901,7 @@ def merge_status(
     *,
     observed_at: str,
     postsuccess_state_file: Path | None = None,
+    thermal_bridge_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
     if payload.get("schema_version") != STATUS_SCHEMA:
@@ -835,6 +918,11 @@ def merge_status(
         _upsert_current_card(
             result,
             _postsuccess_card(postsuccess_state_file, observed_at),
+        )
+    if thermal_bridge_state_file is not None:
+        _upsert_current_card(
+            result,
+            _thermal_bridge_card(thermal_bridge_state_file, observed_at),
         )
     if final_gate_root is not None:
         _upsert_current_card(
@@ -977,6 +1065,7 @@ def synchronize_once(
     task_reader: TaskReader | None = None,
     observed_at: str | None = None,
     postsuccess_state_file: Path | None = None,
+    thermal_bridge_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
     tasks = fetch_tasks(scheduler_url, task_reader=task_reader)
@@ -993,6 +1082,7 @@ def synchronize_once(
         tasks,
         observed_at=observed_at or _timestamp(),
         postsuccess_state_file=postsuccess_state_file,
+        thermal_bridge_state_file=thermal_bridge_state_file,
         final_gate_root=final_gate_root,
     )
     validate_status_sync(updated)
@@ -1038,6 +1128,7 @@ def run_updater(
     max_cycles: int | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     postsuccess_state_file: Path | None = None,
+    thermal_bridge_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any] | None:
     if interval_seconds < 1:
@@ -1074,6 +1165,7 @@ def run_updater(
                     scheduler_url=scheduler_url,
                     task_reader=task_reader,
                     postsuccess_state_file=postsuccess_state_file,
+                    thermal_bridge_state_file=thermal_bridge_state_file,
                     final_gate_root=final_gate_root,
                 )
                 _append_log(
@@ -1118,6 +1210,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-file", type=Path)
     parser.add_argument("--lock-file", type=Path)
     parser.add_argument("--postsuccess-state-file", type=Path)
+    parser.add_argument("--thermal-bridge-state-file", type=Path)
     parser.add_argument("--final-gate-root", type=Path)
     return parser
 
@@ -1134,6 +1227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log_file=args.log_file or ui_root / "postdeadline-ui-updater.jsonl",
         lock_file=args.lock_file or ui_root / "postdeadline-ui-updater.lock",
         postsuccess_state_file=args.postsuccess_state_file,
+        thermal_bridge_state_file=args.thermal_bridge_state_file,
         final_gate_root=args.final_gate_root,
     )
     if args.once:

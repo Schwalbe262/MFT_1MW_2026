@@ -47,12 +47,15 @@ SUBMISSION_RECEIPT_SCHEMA = (
 SUBMISSION_SEAL_SCHEMA = "mft-corrected-thermal-terminal-transport-submission-seal-v1"
 COLLECTION_SEAL_SCHEMA = "mft-corrected-thermal-terminal-transport-collection-seal-v1"
 SOURCE_FAILURE_SCHEMA = "mft-corrected-thermal-terminal-transport-source-failure-v1"
+WATCH_STATE_SCHEMA = "mft-corrected-thermal-terminal-transport-watch-state-v1"
 
 POST_AUTHORIZATION_TOKEN = "AUTHORIZE_MFT_THERMAL_TRANSPORT_T96324_J839461_SINGLE_POST"
 DEFAULT_ORCHESTRATION_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\postdeadline_thermal_transport_bridge_v1"
 )
+WATCH_STATE_FILENAME = "postdeadline_thermal_transport_bridge_watch_state_v1.json"
+DEFAULT_WATCH_STATE_FILE = DEFAULT_ORCHESTRATION_ROOT.parent / WATCH_STATE_FILENAME
 WATCH_INTERVAL_SECONDS = 60
 
 SOURCE_TASK_ID = 96324
@@ -331,6 +334,80 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> Path:
         os.fsync(stream.fileno())
     os.replace(temporary, path)
     return path
+
+
+def _watch_state_path_for_root(root: Path) -> Path:
+    return root.absolute().parent / WATCH_STATE_FILENAME
+
+
+def _validate_watch_state_path(path: Path, *, required_root: Path) -> Path:
+    target = path.absolute()
+    expected = _watch_state_path_for_root(required_root)
+    if target != expected:
+        raise BridgeError("watch state file is not the campaign-fixed sibling path")
+    if target.exists() and (target.is_symlink() or not target.is_file()):
+        raise BridgeError("watch state file is unsafe")
+    return target
+
+
+def _write_watch_state(
+    path: Path,
+    *,
+    required_root: Path,
+    watcher_state: str,
+    stage: str,
+    source_task_state: str,
+    scheduler_get_calls_total: int,
+    scheduler_post_calls_total: int,
+    bridge_task_id: int | None = None,
+    artifact_collected: bool = False,
+    failure: str | None = None,
+) -> dict[str, Any]:
+    """Atomically publish display-only watcher truth outside the plan root."""
+    target = _validate_watch_state_path(path, required_root=required_root)
+    if watcher_state not in {"armed", "running", "collected", "failed"}:
+        raise BridgeError("watcher state is unsupported")
+    if scheduler_get_calls_total < 0 or scheduler_post_calls_total not in {0, 1}:
+        raise BridgeError("watcher Scheduler call counters are invalid")
+    if artifact_collected != (watcher_state == "collected"):
+        raise BridgeError("watcher collection state is inconsistent")
+    if (watcher_state == "failed") != (failure is not None):
+        raise BridgeError("watcher failure state is inconsistent")
+    root = required_root.absolute()
+    value = sealed(
+        {
+            "schema": WATCH_STATE_SCHEMA,
+            **CLASSIFICATION,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "heartbeat_interval_seconds": WATCH_INTERVAL_SECONDS,
+            "watcher_pid": os.getpid(),
+            "tool_path": str(Path(__file__).resolve()),
+            "tool_sha256": sha256_file(Path(__file__).resolve()),
+            "source_task_id": SOURCE_TASK_ID,
+            "source_task_name": SOURCE_TASK_NAME,
+            "source_task_state": source_task_state,
+            "watcher_state": watcher_state,
+            "stage": stage,
+            "bridge_task_id": bridge_task_id,
+            "artifact_collected": artifact_collected,
+            "orchestration_root": str(root),
+            "orchestration_root_exists": root.exists(),
+            "orchestration_plan_exists": (
+                root / "transport_submission_plan.json"
+            ).is_file(),
+            "scheduler_get_calls_total": scheduler_get_calls_total,
+            "scheduler_post_calls_total": scheduler_post_calls_total,
+            # This assertion is scoped to heartbeat publication.  Any sole
+            # authorized bridge POST remains visible in the counter above.
+            "scheduler_mutation_performed": False,
+            "scientific_pass_claimed": False,
+            "production_claimed": False,
+            "failure": failure,
+        }
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_json(target, value)
+    return value
 
 
 def _exclusive_json(path: Path, value: Mapping[str, Any]) -> Path:
@@ -2795,6 +2872,8 @@ def watch_collect_materialize(
     interval_seconds: int = WATCH_INTERVAL_SECONDS,
     sleep_fn: Callable[[float], None] = time.sleep,
     required_root: Path = DEFAULT_ORCHESTRATION_ROOT,
+    watch_state_file: Path | None = None,
+    scheduler_post_calls_total: int = 1,
 ) -> dict[str, Any]:
     if interval_seconds != WATCH_INTERVAL_SECONDS:
         raise BridgeError("bridge watcher interval must be exactly 60 seconds")
@@ -2804,6 +2883,30 @@ def watch_collect_materialize(
             output_root=output_root,
             required_root=required_root,
         )
+        if result.get("status") == "bridge_task_pending":
+            if watch_state_file is not None:
+                _write_watch_state(
+                    watch_state_file,
+                    required_root=required_root,
+                    watcher_state="running",
+                    stage="waiting_bridge_task_terminal",
+                    source_task_state="succeeded",
+                    scheduler_get_calls_total=client.get_count,
+                    scheduler_post_calls_total=scheduler_post_calls_total,
+                    bridge_task_id=int(result["bridge_task_id"]),
+                )
+        elif watch_state_file is not None:
+            _write_watch_state(
+                watch_state_file,
+                required_root=required_root,
+                watcher_state="collected",
+                stage="thermal_artifact_materialized",
+                source_task_state="succeeded",
+                scheduler_get_calls_total=client.get_count,
+                scheduler_post_calls_total=scheduler_post_calls_total,
+                bridge_task_id=int(result["task_id"]),
+                artifact_collected=True,
+            )
         if result.get("status") != "bridge_task_pending" or not watch:
             return result
         sleep_fn(float(interval_seconds))
@@ -2849,6 +2952,7 @@ def watch_submit_orchestrator(
     sleep_fn: Callable[[float], None] = time.sleep,
     lock_factory: Callable[[], Any] = scheduler_campaign_lock,
     required_root: Path = DEFAULT_ORCHESTRATION_ROOT,
+    watch_state_file: Path | None = None,
 ) -> dict[str, Any]:
     """Poll source success, submit once, then GET-collect without intervention."""
     root = output_root.absolute()
@@ -2858,6 +2962,16 @@ def watch_submit_orchestrator(
         raise BridgeError("explicit bridge Scheduler POST authorization is absent")
     if interval_seconds != WATCH_INTERVAL_SECONDS:
         raise BridgeError("bridge watcher interval must be exactly 60 seconds")
+    if watch_state_file is not None:
+        _write_watch_state(
+            watch_state_file,
+            required_root=required_root,
+            watcher_state="armed",
+            stage="watcher_started",
+            source_task_state="unknown",
+            scheduler_get_calls_total=client.get_count,
+            scheduler_post_calls_total=0,
+        )
     while True:
         plan_path = root / "transport_submission_plan.json"
         if not plan_path.exists():
@@ -2868,6 +2982,17 @@ def watch_submit_orchestrator(
                         _read_json(failure_path, "source failure"),
                         schema=SOURCE_FAILURE_SCHEMA,
                     )
+                    if watch_state_file is not None:
+                        _write_watch_state(
+                            watch_state_file,
+                            required_root=required_root,
+                            watcher_state="failed",
+                            stage="source_terminal_failure",
+                            source_task_state="failed",
+                            scheduler_get_calls_total=client.get_count,
+                            scheduler_post_calls_total=0,
+                            failure=str(failure.get("reason") or "source failed"),
+                        )
                     return {
                         **failure,
                         "status": "source_terminal_failure",
@@ -2888,6 +3013,19 @@ def watch_submit_orchestrator(
                 root.mkdir(parents=True, exist_ok=False)
                 failure_path = root / "source_terminal_failure.json"
                 _exclusive_json(failure_path, prepared)
+                if watch_state_file is not None:
+                    _write_watch_state(
+                        watch_state_file,
+                        required_root=required_root,
+                        watcher_state="failed",
+                        stage="source_terminal_failure",
+                        source_task_state=str(
+                            prepared.get("source_task", {}).get("state") or "failed"
+                        ),
+                        scheduler_get_calls_total=client.get_count,
+                        scheduler_post_calls_total=0,
+                        failure=str(prepared.get("reason") or "source failed"),
+                    )
                 return {
                     **prepared,
                     "status": "source_terminal_failure",
@@ -2895,6 +3033,18 @@ def watch_submit_orchestrator(
                     "scheduler_post_calls": 0,
                 }
             if prepared.get("transport_authorized") is not True:
+                if watch_state_file is not None:
+                    _write_watch_state(
+                        watch_state_file,
+                        required_root=required_root,
+                        watcher_state="running",
+                        stage="waiting_source_terminal",
+                        source_task_state=str(
+                            prepared.get("observed_state") or "unknown"
+                        ),
+                        scheduler_get_calls_total=client.get_count,
+                        scheduler_post_calls_total=0,
+                    )
                 if not watch:
                     return _watch_pending(
                         reason=prepared.get("reason", "source task pending"),
@@ -2903,6 +3053,16 @@ def watch_submit_orchestrator(
                 sleep_fn(float(interval_seconds))
                 continue
             _write_ready_outputs(root, prepared)
+            if watch_state_file is not None:
+                _write_watch_state(
+                    watch_state_file,
+                    required_root=required_root,
+                    watcher_state="armed",
+                    stage="transport_plan_authenticated",
+                    source_task_state="succeeded",
+                    scheduler_get_calls_total=client.get_count,
+                    scheduler_post_calls_total=0,
+                )
         try:
             submission = submit_ready_plan_once(
                 client=client,
@@ -2913,10 +3073,33 @@ def watch_submit_orchestrator(
                 required_root=required_root,
             )
         except SubmissionNotReady as exc:
+            if watch_state_file is not None:
+                _write_watch_state(
+                    watch_state_file,
+                    required_root=required_root,
+                    watcher_state="armed",
+                    stage="waiting_safe_submission_capacity",
+                    source_task_state="succeeded",
+                    scheduler_get_calls_total=client.get_count,
+                    scheduler_post_calls_total=0,
+                )
             if not watch:
                 return _watch_pending(reason=str(exc), client=client)
             sleep_fn(float(interval_seconds))
             continue
+        if watch_state_file is not None:
+            _write_watch_state(
+                watch_state_file,
+                required_root=required_root,
+                watcher_state="running",
+                stage="waiting_bridge_task_terminal",
+                source_task_state="succeeded",
+                scheduler_get_calls_total=client.get_count,
+                scheduler_post_calls_total=int(
+                    submission["scheduler_post_calls_total"]
+                ),
+                bridge_task_id=int(submission["task_id"]),
+            )
         if not continue_collection:
             return submission
         collection = watch_collect_materialize(
@@ -2926,6 +3109,10 @@ def watch_submit_orchestrator(
             interval_seconds=interval_seconds,
             sleep_fn=sleep_fn,
             required_root=required_root,
+            watch_state_file=watch_state_file,
+            scheduler_post_calls_total=int(
+                submission["scheduler_post_calls_total"]
+            ),
         )
         return {
             "schema": (
@@ -2992,6 +3179,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch_submit_parser.add_argument("--once", action="store_true")
     watch_submit_parser.add_argument("--submit-only", action="store_true")
+    watch_submit_parser.add_argument("--watch-state-file", type=Path)
 
     watch_collect_parser = subparsers.add_parser("watch-collect-materialize")
     watch_collect_parser.add_argument("--api-url", default="http://127.0.0.1:8002")
@@ -3006,6 +3194,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=WATCH_INTERVAL_SECONDS,
     )
     watch_collect_parser.add_argument("--once", action="store_true")
+    watch_collect_parser.add_argument("--watch-state-file", type=Path)
     return parser
 
 
@@ -3079,6 +3268,7 @@ def main(argv: list[str] | None = None) -> int:
                 watch=not args.once,
                 continue_collection=not args.submit_only,
                 interval_seconds=args.interval_seconds,
+                watch_state_file=args.watch_state_file,
             )
             if result.get("status") in {
                 "pending",
@@ -3093,11 +3283,37 @@ def main(argv: list[str] | None = None) -> int:
                 output_root=args.output_root,
                 watch=not args.once,
                 interval_seconds=args.interval_seconds,
+                watch_state_file=args.watch_state_file,
             )
             if result.get("status") == "bridge_task_pending":
                 print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                 return 3
     except (OSError, BridgeError) as exc:
+        if (
+            args.command in {"watch-submit", "watch-collect-materialize"}
+            and args.watch_state_file is not None
+        ):
+            root = args.output_root.absolute()
+            post_calls = int((root / "bridge_post_attempt.json").is_file())
+            try:
+                _write_watch_state(
+                    args.watch_state_file,
+                    required_root=DEFAULT_ORCHESTRATION_ROOT,
+                    watcher_state="failed",
+                    stage="watcher_terminal_error",
+                    source_task_state=(
+                        "succeeded"
+                        if (root / "transport_submission_plan.json").is_file()
+                        else "unknown"
+                    ),
+                    scheduler_get_calls_total=int(
+                        getattr(locals().get("client"), "get_count", 0)
+                    ),
+                    scheduler_post_calls_total=post_calls,
+                    failure=f"{type(exc).__name__}: {exc}",
+                )
+            except (OSError, BridgeError):
+                pass
         print(
             f"CORRECTED_THERMAL_TRANSPORT_ERROR: {type(exc).__name__}: {exc}",
             file=sys.stderr,

@@ -817,6 +817,66 @@ def test_running_and_terminal_failure_watch_paths_never_post(
     assert (failed_root / "source_terminal_failure.json").is_file()
 
 
+def test_pending_watch_heartbeat_is_sealed_sibling_and_does_not_create_plan_root(
+    tmp_path: Path,
+):
+    calls = 0
+
+    def forbidden_post(
+        _endpoint: str, _payload: dict[str, Any]
+    ) -> tuple[None, None, str]:
+        nonlocal calls
+        calls += 1
+        return None, None, "forbidden"
+
+    root = tmp_path / "orchestration"
+    state_path = tmp_path / bridge.WATCH_STATE_FILENAME
+    result = bridge.watch_submit_orchestrator(
+        client=_PendingClient(),  # type: ignore[arg-type]
+        poster=forbidden_post,  # type: ignore[arg-type]
+        output_root=root,
+        source_plan_path=tmp_path / "not-read-plan.json",
+        source_submission_path=tmp_path / "not-read-submission.json",
+        executor_revision="a" * 40,
+        publisher_sha256="b" * 64,
+        authorize_post=bridge.POST_AUTHORIZATION_TOKEN,
+        watch=False,
+        required_root=root,
+        watch_state_file=state_path,
+    )
+    state = bridge._verify_seal(
+        json.loads(state_path.read_text(encoding="utf-8")),
+        schema=bridge.WATCH_STATE_SCHEMA,
+    )
+
+    assert result["status"] == "pending"
+    assert calls == 0
+    assert not root.exists()
+    assert state["watcher_state"] == "running"
+    assert state["stage"] == "waiting_source_terminal"
+    assert state["source_task_id"] == bridge.SOURCE_TASK_ID
+    assert state["source_task_state"] == "running"
+    assert state["heartbeat_interval_seconds"] == 60
+    assert state["scheduler_post_calls_total"] == 0
+    assert state["scheduler_mutation_performed"] is False
+    assert state["scientific_pass_claimed"] is False
+    assert state["orchestration_root_exists"] is False
+    assert state["orchestration_plan_exists"] is False
+
+
+def test_watch_heartbeat_rejects_nonfixed_path(tmp_path: Path) -> None:
+    with pytest.raises(bridge.BridgeError, match="campaign-fixed sibling"):
+        bridge._write_watch_state(
+            tmp_path / "wrong.json",
+            required_root=tmp_path / "orchestration",
+            watcher_state="armed",
+            stage="watcher_started",
+            source_task_state="unknown",
+            scheduler_get_calls_total=0,
+            scheduler_post_calls_total=0,
+        )
+
+
 def test_watch_collection_materializes_and_seals_latest_idempotently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -864,3 +924,45 @@ def test_watch_collection_materializes_and_seals_latest_idempotently(
         (root / "collected" / "latest.json").resolve()
     )
     assert seal["final_package_gate_compatible"] is True
+
+
+def test_watch_collection_writes_collected_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _ready_fixture(tmp_path, monkeypatch)
+    root = fixture["root"]
+    submit_client = _SubmissionClient(plan=fixture["bridge_plan"], root=root)
+    bridge.submit_ready_plan_once(
+        client=submit_client,  # type: ignore[arg-type]
+        poster=submit_client.post,  # type: ignore[arg-type]
+        output_root=root,
+        authorize_post=bridge.POST_AUTHORIZATION_TOKEN,
+        lock_factory=submit_client.lock,
+        required_root=root,
+    )
+    collect_client = _BridgeGetClient(
+        plan=fixture["bridge_plan"],
+        transport=fixture["transport"],
+        bridge_task_id=97001,
+    )
+    state_path = root.parent / bridge.WATCH_STATE_FILENAME
+
+    result = bridge.watch_collect_materialize(
+        client=collect_client,  # type: ignore[arg-type]
+        output_root=root,
+        watch=False,
+        required_root=root,
+        watch_state_file=state_path,
+    )
+    state = bridge._verify_seal(
+        json.loads(state_path.read_text(encoding="utf-8")),
+        schema=bridge.WATCH_STATE_SCHEMA,
+    )
+
+    assert result["status"] == "collected_and_materialized"
+    assert state["watcher_state"] == "collected"
+    assert state["artifact_collected"] is True
+    assert state["bridge_task_id"] == 97001
+    assert state["scheduler_post_calls_total"] == 1
+    assert state["scheduler_mutation_performed"] is False
+    assert state["scientific_pass_claimed"] is False

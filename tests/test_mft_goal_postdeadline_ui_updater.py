@@ -141,6 +141,50 @@ def _reader_from(tasks: dict[int, dict[str, Any]]):
     return reader
 
 
+def _thermal_state(*, watcher_state: str = "running") -> dict[str, Any]:
+    return updater._sealed(
+        {
+            "schema": updater.THERMAL_BRIDGE_STATE_SCHEMA,
+            "diagnostic_only": True,
+            "canonical": False,
+            "production_truth_eligible": False,
+            "updated_at_utc": "2026-07-26T10:20:00+00:00",
+            "heartbeat_interval_seconds": 60,
+            "watcher_pid": 40984,
+            "tool_path": (
+                r"C:\w\mft-goal-20260726"
+                r"\tools\mft_goal_corrected_thermal_transport_bridge.py"
+            ),
+            "tool_sha256": "a" * 64,
+            "source_task_id": 96324,
+            "source_task_name": updater.TASK_SPECS[0].task_name,
+            "source_task_state": (
+                "succeeded" if watcher_state == "collected" else "running"
+            ),
+            "watcher_state": watcher_state,
+            "stage": (
+                "thermal_artifact_materialized"
+                if watcher_state == "collected"
+                else "waiting_source_terminal"
+            ),
+            "bridge_task_id": 97001 if watcher_state == "collected" else None,
+            "artifact_collected": watcher_state == "collected",
+            "orchestration_root": (
+                r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+                r"\postdeadline_thermal_transport_bridge_v1"
+            ),
+            "orchestration_root_exists": watcher_state == "collected",
+            "orchestration_plan_exists": watcher_state == "collected",
+            "scheduler_get_calls_total": 17,
+            "scheduler_post_calls_total": 1 if watcher_state == "collected" else 0,
+            "scheduler_mutation_performed": False,
+            "scientific_pass_claimed": False,
+            "production_claimed": False,
+            "failure": None,
+        }
+    )
+
+
 def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     source = _status()
     completed = copy.deepcopy(source["completed"])
@@ -291,6 +335,11 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
         json.dumps(postsuccess, ensure_ascii=False),
         encoding="utf-8",
     )
+    thermal_path = tmp_path / "thermal-watch-state.json"
+    thermal_path.write_text(
+        json.dumps(_thermal_state(), ensure_ascii=False),
+        encoding="utf-8",
+    )
     gate_root = tmp_path / "gate"
     gate_root.mkdir()
     pending = updater._sealed(
@@ -316,6 +365,7 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
         _mixed_tasks(),
         observed_at=OBSERVED,
         postsuccess_state_file=postsuccess_path,
+        thermal_bridge_state_file=thermal_path,
         final_gate_root=gate_root,
     )
 
@@ -325,6 +375,20 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
     ]["title"]
     assert by_id["codex-final-aedt-package-gate"]["title"].endswith(
         "PENDING"
+    )
+    thermal = by_id["codex-thermal-artifact-handoff"]
+    assert thermal["title"] == (
+        "CODEX AUTO · THERMAL ARTIFACT HANDOFF · RUNNING"
+    )
+    assert any(
+        "source task96324 state=running" in item
+        for item in thermal["evidence"]
+    )
+    assert any(
+        "Scheduler POST count=0" in item for item in thermal["evidence"]
+    )
+    assert any(
+        "scientific claim=false" in item for item in thermal["evidence"]
     )
     assert any(
         "full AEDT promoted=false" in item
@@ -344,8 +408,50 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
             _mixed_tasks(),
             observed_at=OBSERVED,
             postsuccess_state_file=postsuccess_path,
+            thermal_bridge_state_file=thermal_path,
             final_gate_root=gate_root,
         )
+
+
+def test_thermal_bridge_state_absence_and_tamper_fail_closed(
+    tmp_path: Path,
+) -> None:
+    status_file = tmp_path / "codex-work-status.json"
+    status_file.write_text(
+        json.dumps(_status(), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tasks = {
+        spec.task_id: _task(spec, allocation_id=200 + index)
+        for index, spec in enumerate(updater.TASK_SPECS)
+    }
+    missing = tmp_path / "missing-thermal-state.json"
+    before = status_file.read_bytes()
+
+    with pytest.raises(FileNotFoundError):
+        updater.synchronize_once(
+            status_file=status_file,
+            task_reader=_reader_from(tasks),
+            observed_at=OBSERVED,
+            thermal_bridge_state_file=missing,
+        )
+    assert status_file.read_bytes() == before
+
+    thermal_path = tmp_path / "thermal-state.json"
+    state = _thermal_state()
+    state["scheduler_post_calls_total"] = 1
+    thermal_path.write_text(
+        json.dumps(state, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(updater.UpdaterError, match="seal drifted"):
+        updater.synchronize_once(
+            status_file=status_file,
+            task_reader=_reader_from(tasks),
+            observed_at=OBSERVED,
+            thermal_bridge_state_file=thermal_path,
+        )
+    assert status_file.read_bytes() == before
 
 
 class _Response(io.BytesIO):
@@ -439,7 +545,11 @@ def test_run_once_writes_sealed_pid_and_log(tmp_path: Path) -> None:
 def test_cli_modes_and_default_interval() -> None:
     parser = updater._parser()
     assert parser.parse_args(["--once"]).interval_seconds == 60
-    assert parser.parse_args(["--watch"]).watch is True
+    parsed = parser.parse_args(
+        ["--watch", "--thermal-bridge-state-file", "thermal.json"]
+    )
+    assert parsed.watch is True
+    assert parsed.thermal_bridge_state_file == Path("thermal.json")
     with pytest.raises(SystemExit):
         parser.parse_args([])
     with pytest.raises(SystemExit):
