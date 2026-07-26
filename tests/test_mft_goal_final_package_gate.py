@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import pytest
 
 from module import mft_goal_20260726_contract as goal
+from tools import mft_goal_execute_corrected_thermal_checkpoint as thermal_executor
 from tools import mft_goal_final_package_gate as gate
 from tools import mft_goal_terminal_collector as terminal
 
@@ -308,9 +310,9 @@ def _fixture(
     }
     manifest = {
         **manifest_unsigned,
-        "payload_sha256": terminal._sha256(
-            gate._canonical_bytes(manifest_unsigned, newline=True)
-        ),
+        "payload_sha256": hashlib.sha256(
+            thermal_executor.canonical_json_bytes(manifest_unsigned)
+        ).hexdigest(),
     }
     thermal_event = _event(
         {
@@ -357,6 +359,44 @@ def _run(paths: dict[str, Path]) -> dict[str, Any]:
         full_retry_plan_path=FULL_RETRY_PLAN,
         output_root=paths["output"],
     )
+
+
+def test_thermal_manifest_accepts_exact_producer_newline_seal():
+    unsigned = {
+        "schema": "mft-corrected-thermal-minimum-retained-package-v1",
+        "diagnostic_only": True,
+        "canonical": False,
+        "candidate_sha256": gate.LOGICAL_CANDIDATE_SHA256,
+        "source_solver_revision": gate.SOURCE_SOLVER_REVISION,
+        "executor_solver_revision": gate.THERMAL_EXECUTOR_REVISION,
+        "files": [
+            {
+                "path": "symmetric.aedt",
+                "size_bytes": 123,
+                "sha256": "a" * 64,
+            }
+        ],
+    }
+    producer_sealed = {
+        **unsigned,
+        "payload_sha256": hashlib.sha256(
+            thermal_executor.canonical_json_bytes(unsigned)
+        ).hexdigest(),
+    }
+
+    assert gate._thermal_manifest_rows(producer_sealed) == {
+        "symmetric.aedt": producer_sealed["files"][0]
+    }
+
+    no_newline = {
+        **unsigned,
+        "payload_sha256": goal.canonical_sha256(unsigned),
+    }
+    with pytest.raises(
+        gate.FinalPackageGateError,
+        match="manifest seal drifted",
+    ):
+        gate._thermal_manifest_rows(no_newline)
 
 
 def test_running_collectors_create_only_one_pending_manifest(tmp_path: Path):
