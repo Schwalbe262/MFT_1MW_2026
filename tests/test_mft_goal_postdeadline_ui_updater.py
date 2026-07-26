@@ -258,7 +258,7 @@ def test_rounded_final_running_card_separates_operational_submission_history() -
 
     card = updater._task_card(spec, task, OBSERVED)
 
-    assert "최종 rounded Standard 대칭 FEA 실행 중" in card["title"]
+    assert "최종 rounded Standard 대칭 FEA ThermalSetup 실행 중" in card["title"]
     assert "task96340 RUNNING" in card["title"]
     assert "scientific PASS가 없습니다" in card["detail"]
     assert any(
@@ -278,6 +278,38 @@ def test_rounded_final_running_card_separates_operational_submission_history() -
     assert any(
         "collection_authenticated=false" in value
         and "scientific_pass_generated=false" in value
+        for value in card["evidence"]
+    )
+
+
+def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> None:
+    card = updater._rounded_final_pipeline_card(
+        _current_fast_lane_tasks(),
+        OBSERVED,
+    )
+
+    assert "THERMAL RUNNING" in card["title"]
+    assert "FULL/GATE PREPARED" in card["title"]
+    assert any(
+        "task96341 CANCELLED" in value
+        and "attach=false" in value
+        and "solver_contact=false" in value
+        and "scientific_failure=false" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        f"{updater.ROUNDED_SNAPSHOT_SIZE_BYTES:,}B" in value
+        and updater.ROUNDED_SNAPSHOT_SHA256 in value
+        for value in card["evidence"]
+    )
+    assert any(
+        f"commit={updater.ROUNDED_FULL_PREPARE_COMMIT}" in value
+        and "POST0" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        f"commit={updater.ROUNDED_PACKAGE_GATE_COMMIT}" in value
+        and "package publish=false" in value
         for value in card["evidence"]
     )
 
@@ -560,10 +592,11 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == updater.FINAL_DRAWING_CARD_ID
     )
     assert drawing["title"] == (
-        "CODEX | FINAL DRAWING | TEMPLATE AUDIT COMPLETE | MODEL PENDING"
+        "CODEX | FINAL DRAWING | TEMPLATE AUDIT COMPLETE | "
+        "VIEWS EXPORTED | AUTHORING PENDING"
     )
     assert drawing["state"] == "in_progress"
-    assert drawing["progress_pct"] == 40
+    assert drawing["progress_pct"] == 65
     assert any(
         "설계도면260706.pdf pages=9" in value
         and "설계도면260706.pptx slides=9" in value
@@ -587,8 +620,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         for value in drawing["evidence"]
     )
     assert any(
-        value
-        == "pending: selected final model / view manifest / dimension manifest"
+        f"drawing views exported={updater.ROUNDED_DRAWING_VIEW_COUNT} PNG" in value
+        and updater.ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256 in value
         for value in drawing["evidence"]
     )
     assert any(
@@ -601,7 +634,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert sync["allocation_jobs_active"] == 3
     assert sync["running"] == 2
     assert sync["queued"] == 9
-    assert sync["submitted_total"] == 128
+    assert sync["submitted_total"] == 129
     assert sync["collections_preserved"] == 0
     assert sync["scheduler_methods_used"] == ["GET"]
     assert sync["scientific_pass_generated"] is False
@@ -620,6 +653,15 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         96338,
         96340,
     ]
+    assert sync["operational_history"]["task96341"] == {
+        "state": "cancelled",
+        "attached": False,
+        "started": False,
+        "slurm_job_id": "",
+        "solver_contact": False,
+        "scientific_failure": False,
+        "included_in_scientific_effective_counts": False,
+    }
 
     success = next(
         item
@@ -719,6 +761,40 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         and "not competing scientific candidates" in value
         for value in rounded["evidence"]
     )
+    pipeline = next(
+        item
+        for item in merged["current"]
+        if item["id"] == updater.ROUNDED_FINAL_PIPELINE_CARD_ID
+    )
+    assert "STANDARD QUEUED" in pipeline["title"]
+    assert "FULL/GATE PREPARED" in pipeline["title"]
+    assert "DRAWING VIEWS EXPORTED" in pipeline["title"]
+    assert any(
+        "task96341 CANCELLED" in value
+        and "scientific_failure=false" in value
+        and "excluded from scientific/effective counts" in value
+        for value in pipeline["evidence"]
+    )
+    assert any(
+        updater.ROUNDED_SNAPSHOT_SHA256 in value
+        and f"{updater.ROUNDED_SNAPSHOT_SIZE_BYTES:,}B" in value
+        for value in pipeline["evidence"]
+    )
+    assert any(
+        "one-shot gate + pre-solve geometry/setup checkpoint prepared" in value
+        and "Scheduler GET0 POST0" in value
+        for value in pipeline["evidence"]
+    )
+    assert any(
+        "package publish=false" in value
+        and "scientific package allowed=false" in value
+        for value in pipeline["evidence"]
+    )
+    assert any(
+        f"drawing views exported={updater.ROUNDED_DRAWING_VIEW_COUNT} PNG" in value
+        and "source project save=false" in value
+        for value in pipeline["evidence"]
+    )
     for task_id, order, node, receipt_sha in (
         (
             96330,
@@ -751,7 +827,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
 
     handoff = next(item for item in merged["current"] if item["id"] == "fea-handoff")
     assert (
-        handoff["title"] == "SLURM · ALLOCATION JOBS 3 · SUBMITTED 128 · "
+        handoff["title"] == "SLURM · ALLOCATION JOBS 3 · SUBMITTED 129 · "
         "RUNNING 2 · QUEUED 9 · COLLECTIONS 0"
     )
     for item in merged["current"]:

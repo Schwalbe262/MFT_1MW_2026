@@ -38,7 +38,7 @@ DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE = Path(
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
-CAMPAIGN_SUBMITTED_FLOOR = 128
+CAMPAIGN_SUBMITTED_FLOOR = 129
 SYNC_KEY = "postdeadline_task_sync"
 SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
@@ -417,6 +417,23 @@ LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
 ROUNDED_FINAL_TASK_ID = 96340
+ROUNDED_FINAL_PIPELINE_CARD_ID = "codex-rounded-final-delivery-pipeline"
+ROUNDED_SNAPSHOT_SHA256 = (
+    "c71a94a8b23a9cf8fd4ab9a98083df45f350cf7586b2f1e449deca30380cd426"
+)
+ROUNDED_SNAPSHOT_SIZE_BYTES = 33_204_563
+ROUNDED_SNAPSHOT_MANIFEST_SHA256 = (
+    "09bb2b714843ff7bff25ec1c6ae73849f307beab8dab01d95704cfde91fdeb82"
+)
+ROUNDED_TASK96341_CANCELLATION_SHA256 = (
+    "e3f7cd6327444cb957aacc66cb707213fd021c86b7708f9dec68dce31ea553f9"
+)
+ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256 = (
+    "80a53b2e8ad1f3e642585b37a05a7806ea4e412f33110f2aaf935402e613108e"
+)
+ROUNDED_DRAWING_VIEW_COUNT = 5
+ROUNDED_FULL_PREPARE_COMMIT = "b4ab0dc"
+ROUNDED_PACKAGE_GATE_COMMIT = "3b43d95"
 DRAWING_REFERENCE_PDF_SHA256 = (
     "574d9aab033529cf3655d63542e27871c2e240b669b67e54dbfd2495a564437f"
 )
@@ -806,11 +823,22 @@ def _rounded_final_task_card(
         stage = "최종 rounded Standard 대칭 FEA 운영 실패 · 과학 판정 없음"
         progress = 100
     elif category == "running":
-        stage = "최종 rounded Standard 대칭 FEA 실행 중"
-        progress = 15
+        stage = "최종 rounded Standard 대칭 FEA ThermalSetup 실행 중"
+        progress = 70
     else:
         stage = "최종 rounded Standard 대칭 FEA 대기 중"
         progress = 5
+    solver_stage = (
+        "ThermalSetup RUNNING / native Analyze dispatched / "
+        "terminal result not available"
+        if category == "running"
+        else f"no active ThermalSetup claim / lifecycle={category}"
+    )
+    solver_detail = (
+        "현재 ThermalSetup이 실행 중입니다. "
+        if category == "running"
+        else ""
+    )
 
     allocation = task["allocation_id"] or "none"
     job = task["slurm_job_id"] or "none"
@@ -839,7 +867,7 @@ def _rounded_final_task_card(
         (
             f"active final rounded verification lane=task{spec.task_id} "
             f"{str(task['state']).upper()} / allocation{allocation} / "
-            f"Slurm{job} / node{node}"
+            f"Slurm{job} / node{node} / solver stage={solver_stage}"
         ),
         (
             "scientific/effective role=official#5 final rounded Standard "
@@ -885,12 +913,7 @@ def _rounded_final_task_card(
             "collection_authenticated=false / scientific_pass_generated=false / "
             "production_claim_generated=false / canonical_promotion=false"
         ),
-        (
-            "submission evidence SHA256: "
-            "v1=2f2926315e5a02efdc9f42254268e5fa33eebf701b802fd4659477a77d234c19 / "
-            "v2=981d439b4a46cf0c0703a60121dc54c2473f851f82e1afa17873a21790216560 / "
-            f"v3={spec.submission_receipt_sha256}"
-        ),
+        f"v3 submission receipt SHA256 {spec.submission_receipt_sha256}",
     ]
     if force_risk is not None:
         evidence.append(
@@ -915,7 +938,8 @@ def _rounded_final_task_card(
             "공식 NSGA-II candidate #5의 round-corner 최종 형상을 검증하는 "
             f"1/8 Standard 대칭 FEA lane입니다. Scheduler GET lifecycle="
             f"{task['state']}, allocation={allocation}, Slurm job={job}, "
-            f"node={node}. {outcome} v1/v2 제출 실패는 solver 이전 운영 이력으로 "
+            f"node={node}. {solver_detail}{outcome} "
+            "v1/v2 제출 실패는 solver 이전 운영 이력으로 "
             "분리되어 task96340의 과학 상태를 오염시키지 않습니다."
         ),
         "state": "in_progress",
@@ -2080,21 +2104,123 @@ def _final_gate_card(root: Path, observed_at: str) -> dict[str, Any]:
     }
 
 
+def _rounded_final_pipeline_card(
+    tasks: Mapping[int, Mapping[str, Any]],
+    observed_at: str,
+) -> dict[str, Any]:
+    task = tasks[ROUNDED_FINAL_TASK_ID]
+    category = _category(str(task["state"]))
+    task_stage = {
+        "running": "THERMAL RUNNING",
+        "queued": "STANDARD QUEUED",
+        "succeeded": "STANDARD SOLVER DONE · AUTH PENDING",
+        "failed": "STANDARD OPERATIONAL TERMINAL",
+    }[category]
+    thermal_stage = (
+        "ThermalSetup RUNNING"
+        if category == "running"
+        else "no active ThermalSetup claim"
+    )
+    return {
+        "id": ROUNDED_FINAL_PIPELINE_CARD_ID,
+        "title": (
+            f"CODEX | ROUNDED FINAL PIPELINE | {task_stage} | "
+            "FULL/GATE PREPARED | DRAWING VIEWS EXPORTED"
+        ),
+        "detail": (
+            "task96340의 rounded 1/8 Standard ThermalSetup을 active 과학 검증 "
+            "lane으로 유지합니다. 실행 중 저장된 GPFS AEDT는 read-only local "
+            "snapshot으로 보존됐지만 file fallback일 뿐 과학 결과가 아닙니다. "
+            "task96341은 잘못된 /enroot helper를 solver 접촉 전에 취소한 운영 "
+            "이력이며 scientific failure 집계에서 제외됩니다. rounded Full "
+            "one-shot/pre-solve checkpoint와 최종 package gate는 준비만 완료했고 "
+            "POST·publish는 0입니다. drawing view export는 5개 PNG와 manifest "
+            "생성을 완료했으며 PPTX/PDF authoring은 아직 대기 중입니다."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 75 if category == "running" else 65,
+        "evidence": [
+            (
+                f"task96340 lifecycle={str(task['state']).upper()} / "
+                f"allocation{task['allocation_id'] or 'none'} / "
+                f"Slurm{task['slurm_job_id'] or 'none'} / "
+                f"{thermal_stage}"
+            ),
+            (
+                f"read-only GPFS snapshot={ROUNDED_SNAPSHOT_SIZE_BYTES:,}B / "
+                f"SHA256 {ROUNDED_SNAPSHOT_SHA256} / "
+                "source before-after identity equal=true"
+            ),
+            (
+                "snapshot classification=file fallback only / "
+                "solver_result_truth_included=false / scientific_pass=false / "
+                "production_truth_eligible=false"
+            ),
+            (
+                "task96341 CANCELLED / attach=false / start=false / Slurm job=none / "
+                "solver_contact=false / scientific_failure=false / "
+                "excluded from scientific/effective counts"
+            ),
+            (
+                "task96341 reason=helper targeted /enroot while authenticated "
+                "source MFT_WORKDIR was GPFS; source task96340 remained running"
+            ),
+            (
+                f"rounded Full lane commit={ROUNDED_FULL_PREPARE_COMMIT} / "
+                "one-shot gate + pre-solve geometry/setup checkpoint prepared / "
+                "Scheduler GET0 POST0 / submit=false"
+            ),
+            (
+                "Full checkpoint diagnostic_only=true / scientific_pass=false / "
+                "thermal_pass=false / production_promotion_eligible=false"
+            ),
+            (
+                f"rounded final package gate commit={ROUNDED_PACKAGE_GATE_COMMIT} / "
+                "prepare+validate only / package publish=false / "
+                "scientific package allowed=false until authenticated results"
+            ),
+            (
+                f"drawing views exported={ROUNDED_DRAWING_VIEW_COUNT} PNG / "
+                "read-only inspection copy / source project save=false / "
+                "solver invoked=false / final PPTX=false / final PDF=false"
+            ),
+            (
+                "fixed boundary unchanged=round_corner R10/S4 / fan1.5m/s / "
+                "TIM k0.2W/mK / WCP pad2mm / core pad2mm"
+            ),
+            (
+                f"snapshot manifest SHA256 {ROUNDED_SNAPSHOT_MANIFEST_SHA256} / "
+                "task96341 cancellation receipt SHA256 "
+                f"{ROUNDED_TASK96341_CANCELLATION_SHA256} / drawing views "
+                f"manifest SHA256 {ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256}"
+            ),
+            (
+                "actual scientific PASS=0 / actual production PASS=0 / "
+                "automatic Full off / canonical promotion=false"
+            ),
+        ],
+    }
+
+
 def _final_drawing_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": FINAL_DRAWING_CARD_ID,
         "title": (
-            "CODEX | FINAL DRAWING | TEMPLATE AUDIT COMPLETE | MODEL PENDING"
+            "CODEX | FINAL DRAWING | TEMPLATE AUDIT COMPLETE | "
+            "VIEWS EXPORTED | AUTHORING PENDING"
         ),
         "detail": (
             "The nine-frame PDF/PPTX drawing template audit is complete and "
-            "source integrity is preserved. The final selected model, exact "
-            "view/dimension manifest, and authored PPTX/PDF remain pending; "
-            "the audit is not a final-deliverable claim."
+            "source integrity is preserved. A read-only rounded AEDT snapshot "
+            "is available as a file fallback and drawing-view inspection/export "
+            "produced five PNG views without saving the source project or invoking "
+            "a solver. The authenticated final selected model and authored "
+            "PPTX/PDF remain pending."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 40,
+        "progress_pct": 65,
         "evidence": [
             (
                 "template audit=complete / 설계도면260706.pdf pages=9 / "
@@ -2113,8 +2239,16 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
                 "straight spans + concentric corner arcs / circular coil=false"
             ),
             (
-                "pending: selected final model / view manifest / "
-                "dimension manifest"
+                f"rounded AEDT file fallback={ROUNDED_SNAPSHOT_SIZE_BYTES:,}B / "
+                f"SHA256 {ROUNDED_SNAPSHOT_SHA256} / scientific model=false"
+            ),
+            (
+                f"drawing views exported={ROUNDED_DRAWING_VIEW_COUNT} PNG / "
+                f"manifest SHA256 {ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256}"
+            ),
+            (
+                "source project save=false / solver invoked=false / "
+                "PPTX authoring=pending / PDF authoring=pending"
             ),
             (
                 "final PPTX claimed=false / final PDF claimed=false / "
@@ -2302,6 +2436,10 @@ def merge_status(
         )
     _upsert_current_card(
         result,
+        _rounded_final_pipeline_card(tasks, observed_at),
+    )
+    _upsert_current_card(
+        result,
         _symmetric_primary_policy_card(tasks, observed_at),
     )
     if postsuccess_state_file is not None:
@@ -2454,6 +2592,17 @@ def merge_status(
             "scientific_pass_generated": False,
             "actual_scientific_pass_count": 0,
             "actual_production_pass_count": 0,
+            "operational_history": {
+                "task96341": {
+                    "state": "cancelled",
+                    "attached": False,
+                    "started": False,
+                    "slurm_job_id": "",
+                    "solver_contact": False,
+                    "scientific_failure": False,
+                    "included_in_scientific_effective_counts": False,
+                }
+            },
             "collection_generated": False,
             "canonical_promotion_generated": False,
             "protected": protected_before,
