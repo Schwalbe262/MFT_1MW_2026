@@ -50,6 +50,22 @@ def test_accepts_exact_corrected_predispatch_marker() -> None:
     assert guard._validate_marker(_marker()) == []
 
 
+def test_accepts_exact_canary_scheduler_readback() -> None:
+    task = {
+        "project": "MFT_1MW_2026v1",
+        "cpus": 8,
+        "memory_mb": 65_536,
+        "aedt_backend": "standalone",
+        "priority": 100,
+        "timeout_seconds": 43_200,
+    }
+    assert guard._validate_task_readback(task) == []
+    task["timeout_seconds"] = 14_400
+    assert guard._validate_task_readback(task) == [
+        "task_readback_timeout_seconds_mismatch"
+    ]
+
+
 def test_rejects_old_separate_objects_topology() -> None:
     value = copy.deepcopy(_marker())
     value["rx_main_shared_operations"][0]["separate_objects"] = True

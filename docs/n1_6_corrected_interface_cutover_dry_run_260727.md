@@ -13,6 +13,9 @@ this document.
   2 mm TIM pads, and TIM conductivity 0.2 W/(m*K).
 - A corrected result must emit all six explicit Rx-interface/limiter fields and
   pass the acquisition collector's scientific truth gate.
+- Corrected canary and replacement tasks use `timeout_seconds=43200` (12 h).
+  The old 14400-second lanes are expected to time out before native thermal
+  convergence and remain forensic-only.
 - Replacement tasks are accepted by Scheduler before any old task is
   cancelled. This prevents an empty compute interval.
 
@@ -65,6 +68,7 @@ The exact old-task cancellation set is:
 1. Corrected canary is Scheduler-accepted and attached to a real allocation.
    Its task readback must match the corrected solver/library revisions,
    project, dedupe key, 8 CPU, 65536 MiB, and standalone AEDT backend.
+   It must also read back priority 100 and timeout 43200 seconds.
 2. Canary stdout must show the corrected Rx-interface implementation identity
    and no unpaired-interface-to-wall or 5000 K limiter marker. Prefer a
    terminal six-field scientific-valid result; a pre-solve deterministic
@@ -86,7 +90,8 @@ repair the replacement plan first.
 2. Submit all 24 corrected N1=6 replacements in parallel. Keep the cooler
    campaign at priority 95 and the last-mile campaign at priority 90 unless the
    root operator explicitly seals a different priority. The corrected canary
-   remains priority 100.
+   remains priority 100. All 24 replacements and the canary use a sealed
+   43200-second timeout.
 3. Authenticate the replacement task-ID set, geometry set, revisions, fixed
    boundaries, and accepted/attached statuses.
 4. Immediately issue one conditional bulk cancellation against only the exact
@@ -97,6 +102,8 @@ repair the replacement plan first.
 5. Re-read all old and new tasks. A status-race old task that became terminal is
    collected as forensic evidence and remains scientific-invalid. Never blind
    cancel a terminal task.
+   Timeout terminals from the old 14400-second plans are also
+   scientific-invalid and are never admitted to surrogate training.
 6. Verify remote wrappers of cancelled tasks are being reclaimed and the 24
    corrected tasks remain queued/attaching/running. Do not edit Scheduler
    configuration to force placement.
