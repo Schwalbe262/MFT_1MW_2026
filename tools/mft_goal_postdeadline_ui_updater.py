@@ -3288,10 +3288,6 @@ def _live_summary(
         raise UpdaterError("live task counters are inconsistent")
     authoritative = ""
     if auxiliary_tasks is not None:
-        axis_categories = [
-            _category(str(auxiliary_tasks[spec.task_id]["state"]))
-            for spec in AXIS_V6_TASK_SPECS
-        ]
         reference_original = auxiliary_tasks[REFERENCE_BASELINE_TASK_SPEC.task_id]
         reference_hedge = auxiliary_tasks[REFERENCE_THERMAL_HEDGE_TASK_SPEC.task_id]
         reference = auxiliary_tasks[REFERENCE_DIRECT_TASK_SPEC.task_id]
@@ -3301,48 +3297,35 @@ def _live_summary(
             for spec in TARGET_AXIS_TASK_SPECS
         ]
         authoritative = (
-            "superseded W1000/L1200 axis-v6 "
-            f"running{axis_categories.count('running')} · "
-            f"queued{axis_categories.count('queued')} · "
-            f"succeeded{axis_categories.count('succeeded')} · "
-            f"failed{axis_categories.count('failed')} (16 seeds, "
-            "raw5120/unique4683); corrected-axis projection geometry "
-            "raw217/unique210, all mean-resonance pass, combined thermal "
-            "feasible0/PF0, compact surrogate extrapolation invalid "
-            "(reported min302.67C). Authoritative W1200/L1000 targeted "
-            f"campaign tasks96416-96431 running{target_categories.count('running')} "
-            f"queued{target_categories.count('queued')} "
-            f"succeeded{target_categories.count('succeeded')} "
-            f"failed{target_categories.count('failed')}. "
-            f"reference direct task96415={str(reference['state']).upper()} "
+            "target tasks96416-96431 "
+            f"run{target_categories.count('running')}/"
+            f"queue{target_categories.count('queued')}/"
+            f"success{target_categories.count('succeeded')}/"
+            f"fail{target_categories.count('failed')}. "
+            "Old W1000/L1200 axis-v6 is superseded: raw5120/unique4683, "
+            "new-axis geometry217/210, thermal feasible0/PF0; compact "
+            "surrogate extrapolation invalid(min302.67C). "
+            f"reference local thermal mesh running; remote96415="
+            f"{str(reference['state']).upper()} "
             f"{reference['actual_node_name'] or 'pending'}/"
-            f"job{reference['slurm_job_id'] or 'none'}; "
+            f"j{reference['slurm_job_id'] or 'none'}; "
             f"task96396={str(reference_original['state']).upper()} and "
-            f"task96414={str(reference_hedge['state']).upper()} superseded; "
-            "local retry-v2 Matrix/Cap/loss complete and thermal mesh running. "
-            f"old warm task96395={str(warm['state']).upper()} superseded. "
+            f"96414={str(reference_hedge['state']).upper()}; "
+            f"warm96395={str(warm['state']).upper()}. "
         )
     summary = (
         f"{observed:%H:%M} KST · 권위 축 계약: W=도면x≤1200, L=수직y≤1000, "
         "H≤750, 회전/축교환 금지, 1차=5T/1.6mm. "
         f"{authoritative}"
-        "candidate #5/cw1=1.13 및 task96340/96342는 CANCELLED·invalid. "
-        "공진 최종 screen은 air-gap tuned full physical primary-referred "
-        "Lm=2.000mH, Ltx=Lm+Llt_phys, Lrx=Ltx*(N2/N1)^2입니다. "
-        "기존 fixed-Lm rescore/NDS는 thermal screening-only이며 production "
-        "eligible이 아닙니다. "
-        "verification=standard/unrounded symmetric; rounded=도면/Full 형상 "
-        "시각화 전용. original_deadline_missed=true. "
-        "인증된 scientific PASS는 없습니다. "
+        "기존 fixed-Lm rescore/NDS는 screening-only입니다. "
         f"post-deadline diagnostic 작업: running{running} · queued{queued} · "
         f"terminal{terminal}. Slurm allocation jobs{allocation_jobs} · "
         f"submitted{submitted} · collections{collections}. "
         "공식 512-seed aggregate는 physical feasible0 · production Pareto "
-        "front0 · audit-only objective front22입니다. Scheduler terminal "
-        "success도 collector와 artifact 인증 전에는 scientific/production "
-        "PASS가 아닙니다."
+        "front0 · audit-only objective front22. Scheduler success도 artifact "
+        "인증 전에는 scientific/production PASS가 아닙니다. "
     )
-    return summary + " actual scientific PASS=0 / actual production PASS=0."
+    return summary + "actual scientific PASS=0 / actual production PASS=0."
 
 
 def _parallel_workstreams_card(
