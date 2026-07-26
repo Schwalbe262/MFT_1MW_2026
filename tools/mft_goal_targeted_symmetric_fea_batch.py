@@ -138,6 +138,23 @@ CORE_TEMPERATURES = (
     "Tprobe_core_side_leg_max",
     "Tprobe_core_top_yoke_max",
 )
+THERMAL_RX_INTERFACE_CONTRACT_FIELDS = (
+    "thermal_rx_block_interface_contract_version",
+    "thermal_rx_main_interface_coverage_passed",
+    "thermal_rx_main_unpaired_interfaces",
+    "thermal_temperature_limiter_triggered",
+    "thermal_temperature_limiter_max_K",
+    "thermal_result_scientific_valid",
+)
+THERMAL_INVALID_LOG_MARKERS = (
+    "temperature limited to 5.000000e+03",
+    "set unpaired interface zone",
+)
+# Fluent's emergency temperature limiter is 5000 K.  Keep a small margin so
+# formatting/rounding cannot turn a limiter-clamped result into acquisition
+# truth.
+THERMAL_LIMITER_FAIL_CLOSE_K = 4_990.0
+THERMAL_LIMITER_FAIL_CLOSE_C = THERMAL_LIMITER_FAIL_CLOSE_K - 273.15
 N1_6_COOLER_ANCHOR_PREFIXES = (
     "7fae822212dfea8a",
     "45e20fbd810f9d24",
@@ -1212,7 +1229,6 @@ def _generate_n1_6_cooler_neighborhood(
     production cold plates are enlarged together to target the 100 C Tx gate.
     """
 
-    import numpy as np
     import pandas as pd
 
     from module.input_parameter_260706 import (
@@ -2392,12 +2408,123 @@ def _available_numeric(
     return values
 
 
+def _thermal_scientific_truth_contract(
+    result: Mapping[str, Any],
+    *,
+    observed_temperatures_C: Mapping[str, float],
+    task_log_text: str,
+) -> dict[str, Any]:
+    """Fail-close legacy or interface-isolated thermal acquisition results."""
+
+    reasons: list[str] = []
+    missing = [
+        name
+        for name in THERMAL_RX_INTERFACE_CONTRACT_FIELDS
+        if name not in result
+    ]
+    reasons.extend(
+        f"scientific_contract_field_missing:{name}" for name in missing
+    )
+
+    version = result.get("thermal_rx_block_interface_contract_version")
+    if version is not None and (
+        not isinstance(version, str) or not version.strip()
+    ):
+        reasons.append(
+            "scientific_contract_invalid:"
+            "thermal_rx_block_interface_contract_version"
+        )
+
+    coverage = result.get("thermal_rx_main_interface_coverage_passed")
+    if coverage is not None and coverage is not True:
+        reasons.append(
+            "scientific_contract_invalid:"
+            "thermal_rx_main_interface_coverage_passed"
+        )
+
+    unpaired = result.get("thermal_rx_main_unpaired_interfaces")
+    if unpaired is not None:
+        if not isinstance(unpaired, list):
+            reasons.append(
+                "scientific_contract_invalid:"
+                "thermal_rx_main_unpaired_interfaces_type"
+            )
+        elif unpaired:
+            reasons.append(
+                "scientific_invalid:"
+                "thermal_rx_main_unpaired_interfaces_present"
+            )
+
+    limiter_triggered = result.get("thermal_temperature_limiter_triggered")
+    if limiter_triggered is not None and limiter_triggered is not False:
+        reasons.append(
+            "scientific_invalid:thermal_temperature_limiter_triggered"
+        )
+
+    limiter_max_K = _optional_finite(
+        result.get("thermal_temperature_limiter_max_K")
+    )
+    if (
+        "thermal_temperature_limiter_max_K" in result
+        and limiter_max_K is None
+    ):
+        reasons.append(
+            "scientific_contract_invalid:thermal_temperature_limiter_max_K"
+        )
+    elif (
+        limiter_max_K is not None
+        and limiter_max_K >= THERMAL_LIMITER_FAIL_CLOSE_K
+    ):
+        reasons.append(
+            "scientific_invalid:thermal_temperature_limiter_near_5000K"
+        )
+
+    result_scientific_valid = result.get(
+        "thermal_result_scientific_valid"
+    )
+    if (
+        result_scientific_valid is not None
+        and result_scientific_valid is not True
+    ):
+        reasons.append(
+            "scientific_invalid:thermal_result_scientific_valid_false"
+        )
+
+    if any(
+        value >= THERMAL_LIMITER_FAIL_CLOSE_C
+        for value in observed_temperatures_C.values()
+    ):
+        reasons.append(
+            "scientific_invalid:observed_temperature_near_5000K_limiter"
+        )
+
+    normalized_log = task_log_text.lower()
+    for marker in THERMAL_INVALID_LOG_MARKERS:
+        if marker in normalized_log:
+            reasons.append(
+                "scientific_invalid:task_log_marker:"
+                + marker.replace(" ", "_")
+            )
+
+    return {
+        "valid": not reasons,
+        "reasons": sorted(set(reasons)),
+        "contract_fields": {
+            name: copy.deepcopy(result.get(name))
+            for name in THERMAL_RX_INTERFACE_CONTRACT_FIELDS
+        },
+        "contract_version_allowlist_pending": True,
+        "log_markers_scanned": list(THERMAL_INVALID_LOG_MARKERS),
+    }
+
+
 def _measured_result(
     result: Mapping[str, Any],
     lane: Mapping[str, Any],
     *,
     plan: Mapping[str, Any],
     profile: Mapping[str, Any],
+    task_log_text: str = "",
 ) -> dict[str, Any]:
     identity_reasons = []
 
@@ -2535,6 +2662,16 @@ def _measured_result(
         max(secondary_winding.values()) if secondary_winding else math.nan
     )
     core_max = max(core.values()) if core else math.nan
+    scientific_truth = _thermal_scientific_truth_contract(
+        result,
+        observed_temperatures_C={
+            **primary_winding,
+            **secondary_winding,
+            **core,
+        },
+        task_log_text=task_log_text,
+    )
+    identity_reasons.extend(scientific_truth["reasons"])
     if primary_winding and primary_winding_max > 100.0:
         temperature_reasons.append(
             "primary_winding_temperature_above_100C"
@@ -2664,6 +2801,9 @@ def _measured_result(
         "reasons": acquisition_reasons,
         "result_contract_valid": result_contract_valid,
         "result_contract_reasons": identity_reasons,
+        "thermal_result_scientific_valid": scientific_truth["valid"],
+        "thermal_result_scientific_reasons": scientific_truth["reasons"],
+        "thermal_rx_interface_contract": scientific_truth,
         "strict_solver_result_valid": strict_solver_result_valid,
         "exact_effective_params_echo_valid": exact_params_echo_valid,
         "thermal_pass": thermal_pass,
@@ -2798,6 +2938,7 @@ def collect(
             "result_available": False,
             "contract_valid": False,
             "result_contract_valid": False,
+            "thermal_result_scientific_valid": False,
             "thermal_pass": False,
             "legacy_cap_fixed_lm2mh_resonance_pass": False,
             "provisional_corrected_transfer_resonance_pass": False,
@@ -2820,20 +2961,36 @@ def collect(
             terminal += 1
         if status == "completed" and int(task.get("exit_code") or 0) == 0:
             result = _result_json(task)
+            task_log_parts: list[str] = []
+            log_query = urllib.parse.urlencode(
+                {"tail_lines": "100000", "max_bytes": "5000000"}
+            )
+            for stream in ("stdout", "stderr"):
+                try:
+                    log_payload = getter(
+                        f"{origin}/api/tasks/{task_id}/{stream}?{log_query}"
+                    )
+                except (BatchContractError, OSError, ValueError):
+                    continue
+                task_log_parts.append(
+                    str(
+                        log_payload.get(stream)
+                        or log_payload.get("stdout")
+                        or log_payload.get("output")
+                        or ""
+                    )
+                )
             if result is None:
-                tail_query = urllib.parse.urlencode(
-                    {"tail_lines": "24", "max_bytes": "5000000"}
+                result = _result_json(
+                    {"stdout": "\n".join(task_log_parts)}
                 )
-                tail = getter(
-                    f"{origin}/api/tasks/{task_id}/stdout?{tail_query}"
-                )
-                result = _result_json(tail)
             if result is not None:
                 measured = _measured_result(
                     result,
                     lane,
                     plan=plan,
                     profile=profile_value,
+                    task_log_text="\n".join(task_log_parts),
                 )
                 item.update(measured)
                 item["result_available"] = True
