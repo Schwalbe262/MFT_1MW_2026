@@ -2362,15 +2362,38 @@ def _result_json(task: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _optional_finite(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _available_numeric(
+    result: Mapping[str, Any],
+    names: Iterable[str],
+) -> dict[str, float]:
+    values = {}
+    for name in names:
+        value = _optional_finite(result.get(name))
+        if value is not None:
+            values[name] = value
+    return values
+
+
 def _measured_result(
     result: Mapping[str, Any],
     lane: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    profile: Mapping[str, Any],
 ) -> dict[str, Any]:
-    reasons = []
+    identity_reasons = []
 
     def equal(name: str, expected: Any) -> None:
         if result.get(name) != expected:
-            reasons.append(f"result_identity_mismatch:{name}")
+            identity_reasons.append(f"result_identity_mismatch:{name}")
 
     equal("full_model", 0)
     equal("round_corner", 0)
@@ -2382,7 +2405,7 @@ def _measured_result(
         rel_tol=0.0,
         abs_tol=1e-12,
     ):
-        reasons.append("fixed_boundary_mismatch:fan_velocity")
+        identity_reasons.append("fixed_boundary_mismatch:fan_velocity")
     for name in ("core_plate_pad_t", "wcp_pad_t"):
         if not math.isclose(
             _finite(result.get(name), f"result {name}"),
@@ -2390,74 +2413,296 @@ def _measured_result(
             rel_tol=0.0,
             abs_tol=1e-12,
         ):
-            reasons.append(f"fixed_boundary_mismatch:{name}")
+            identity_reasons.append(f"fixed_boundary_mismatch:{name}")
     if result.get("fan_config") != "dual":
-        reasons.append("fixed_boundary_mismatch:fan_config")
+        identity_reasons.append("fixed_boundary_mismatch:fan_config")
+
+    params = _read_json(Path(lane["_plan_root"]) / lane["params"]["path"])
+    effective_params = scheduler_client.effective_verification_params(
+        params, dict(profile)
+    )
+    strict_solver_result_valid = scheduler_client.is_valid_result(
+        dict(result),
+        expected_revision=plan["solver_revision"],
+        expected_library_revision=plan["library_revision"],
+        expected_profile=dict(profile.get("param_overrides") or {}),
+    )
+    exact_params_echo_valid = scheduler_client.result_matches_params(
+        dict(result), effective_params
+    )
+    if not strict_solver_result_valid:
+        identity_reasons.append("strict_solver_result_contract_invalid")
+    if not exact_params_echo_valid:
+        identity_reasons.append("effective_params_echo_mismatch")
+
     llt = result.get("Llt_phys")
     if llt is None:
         llt = 2.0 * _finite(result.get("Llt"), "result symmetric Llt")
-    replay = _fixed_lm_resonance(
-        llt_uH=_finite(llt, "result Llt_phys"),
-        c_tx_F=_finite(result.get("C_tx_tx_F"), "result C_tx_tx_F"),
-        c_rx_F=_finite(result.get("C_rx_rx_F"), "result C_rx_rx_F"),
-        c_inter_F=_finite(result.get("C_tx_rx_F"), "result C_tx_rx_F"),
-        n1=int(lane["candidate"]["source"]["fixed_primary_turns_stratum"]),
-        n2=int(
-            _read_json(
-                Path(lane["_plan_root"]) / lane["params"]["path"]
-            )["N2_main"]
-        )
-        + int(
-            _read_json(
-                Path(lane["_plan_root"]) / lane["params"]["path"]
-            )["N2_side"]
-        ),
+    n1 = int(effective_params["N1_main"]) + int(
+        effective_params.get("N1_side") or 0
     )
-    if replay["fmin_Hz"] < RESONANCE_MIN_HZ:
-        reasons.append("measured_fixed_Lm_resonance_below_15kHz")
-    primary_winding = []
+    n2 = int(effective_params["N2_main"]) + int(
+        effective_params.get("N2_side") or 0
+    )
+    legacy_capacitance = {
+        "C_tx_tx_F": _finite(
+            result.get("C_tx_tx_F"), "result C_tx_tx_F"
+        ),
+        "C_rx_rx_F": _finite(
+            result.get("C_rx_rx_F"), "result C_rx_rx_F"
+        ),
+        "C_tx_rx_F": _finite(
+            result.get("C_tx_rx_F"), "result C_tx_rx_F"
+        ),
+    }
+    legacy_replay = _fixed_lm_resonance(
+        llt_uH=_finite(llt, "result Llt_phys"),
+        c_tx_F=legacy_capacitance["C_tx_tx_F"],
+        c_rx_F=legacy_capacitance["C_rx_rx_F"],
+        c_inter_F=legacy_capacitance["C_tx_rx_F"],
+        n1=n1,
+        n2=n2,
+    )
+    calibration = lane["candidate"].get("turn_graded_Crx_calibration") or {}
+    transfer_ratio = _optional_finite(
+        calibration.get("corrected_to_legacy_ratio")
+    )
+    corrected_transfer_replay = None
+    corrected_transfer_capacitance = None
+    if transfer_ratio is not None and 0.0 < transfer_ratio < 1.0:
+        corrected_transfer_capacitance = {
+            "C_tx_tx_F": legacy_capacitance["C_tx_tx_F"],
+            "C_rx_rx_F": (
+                legacy_capacitance["C_rx_rx_F"] * transfer_ratio
+            ),
+            "C_tx_rx_F": legacy_capacitance["C_tx_rx_F"],
+            "C_rx_rx_corrected_to_legacy_ratio": transfer_ratio,
+            "classification": (
+                "single-canary transfer estimate; not actual corrected "
+                "turn-graded FEA"
+            ),
+        }
+        corrected_transfer_replay = _fixed_lm_resonance(
+            llt_uH=_finite(llt, "result Llt_phys"),
+            c_tx_F=corrected_transfer_capacitance["C_tx_tx_F"],
+            c_rx_F=corrected_transfer_capacitance["C_rx_rx_F"],
+            c_inter_F=corrected_transfer_capacitance["C_tx_rx_F"],
+            n1=n1,
+            n2=n2,
+        )
+
+    temperature_reasons = []
+    primary_winding = {}
     for name in PRIMARY_WINDING_TEMPERATURES:
         try:
-            primary_winding.append(
-                _finite(result.get(name), f"result {name}")
+            primary_winding[name] = _finite(
+                result.get(name), f"result {name}"
             )
         except BatchContractError:
-            reasons.append(f"temperature_missing:{name}")
-    secondary_winding = []
+            temperature_reasons.append(f"temperature_missing:{name}")
+    secondary_winding = {}
     for name in SECONDARY_WINDING_TEMPERATURES:
         if name in {"T_max_Rx_side", "Tprobe_Rx_side_leeward_max"} and int(
             result.get("N2_side") or 0
         ) <= 0:
             continue
         try:
-            secondary_winding.append(
-                _finite(result.get(name), f"result {name}")
+            secondary_winding[name] = _finite(
+                result.get(name), f"result {name}"
             )
         except BatchContractError:
-            reasons.append(f"temperature_missing:{name}")
-    core = []
+            temperature_reasons.append(f"temperature_missing:{name}")
+    core = {}
     for name in CORE_TEMPERATURES:
         try:
-            core.append(_finite(result.get(name), f"result {name}"))
+            core[name] = _finite(result.get(name), f"result {name}")
         except BatchContractError:
-            reasons.append(f"temperature_missing:{name}")
+            temperature_reasons.append(f"temperature_missing:{name}")
     primary_winding_max = (
-        max(primary_winding) if primary_winding else math.nan
+        max(primary_winding.values()) if primary_winding else math.nan
     )
     secondary_winding_max = (
-        max(secondary_winding) if secondary_winding else math.nan
+        max(secondary_winding.values()) if secondary_winding else math.nan
     )
-    core_max = max(core) if core else math.nan
+    core_max = max(core.values()) if core else math.nan
     if primary_winding and primary_winding_max > 100.0:
-        reasons.append("primary_winding_temperature_above_100C")
+        temperature_reasons.append(
+            "primary_winding_temperature_above_100C"
+        )
     if secondary_winding and secondary_winding_max > 120.0:
-        reasons.append("secondary_winding_temperature_above_120C")
+        temperature_reasons.append(
+            "secondary_winding_temperature_above_120C"
+        )
     if core and core_max > 120.0:
-        reasons.append("core_temperature_above_120C")
+        temperature_reasons.append("core_temperature_above_120C")
+
+    volume_litres, recomputed_dimensions = geometry_metrics.bounding_box_lit(
+        effective_params
+    )
+    dimensions = {
+        "W_drawing_x": float(recomputed_dimensions[0]),
+        "L_perpendicular_y": float(recomputed_dimensions[1]),
+        "H": float(recomputed_dimensions[2]),
+    }
+    size_reasons = [
+        f"size_above_limit:{axis}"
+        for axis, limit in SIZE_LIMITS_MM.items()
+        if dimensions[
+            {
+                "W": "W_drawing_x",
+                "L": "L_perpendicular_y",
+                "H": "H",
+            }[axis]
+        ]
+        > limit + 1e-9
+    ]
+
+    symmetric_inductance_uH = _available_numeric(
+        result, ("Ltx", "Lrx", "M", "k", "Lmt", "Lmr", "Llt", "Llr")
+    )
+    full_physical_inductance_uH = {
+        name: 2.0 * value
+        for name, value in symmetric_inductance_uH.items()
+        if name != "k"
+    }
+    if "k" in symmetric_inductance_uH:
+        full_physical_inductance_uH["k"] = symmetric_inductance_uH["k"]
+    measured_ungapped_primary_self_H = (
+        2.0 * symmetric_inductance_uH["Ltx"] * 1e-6
+        if "Ltx" in symmetric_inductance_uH
+        else None
+    )
+    measured_ungapped_primary_magnetizing_H = (
+        2.0 * symmetric_inductance_uH["Lmt"] * 1e-6
+        if "Lmt" in symmetric_inductance_uH
+        else None
+    )
+    losses_W = _available_numeric(
+        result,
+        (
+            "P_Tx_main_group",
+            "P_Rx_main_group",
+            "P_Rx_side_total",
+            "P_winding_total",
+            "P_core_total",
+            "P_core_plate_total",
+            "P_wcp_total",
+        ),
+    )
+    losses_W["P_total_thermal_input"] = sum(
+        losses_W.get(name, 0.0)
+        for name in (
+            "P_winding_total",
+            "P_core_total",
+            "P_core_plate_total",
+            "P_wcp_total",
+        )
+    )
+    convergence = _available_numeric(
+        result,
+        (
+            "conv_passes_matrix",
+            "conv_consecutive_matrix",
+            "conv_error_pct_matrix",
+            "conv_delta_pct_matrix",
+            "conv_passes_loss",
+            "conv_consecutive_loss",
+            "conv_error_pct_loss",
+            "conv_delta_pct_loss",
+            "thermal_iterations",
+            "thermal_residual_continuity",
+            "thermal_residual_x_velocity",
+            "thermal_residual_y_velocity",
+            "thermal_residual_z_velocity",
+            "thermal_residual_energy",
+        ),
+    )
+    timing = {}
+    for key, raw_value in result.items():
+        normalized_key = str(key).lower()
+        if (
+            "elapsed" not in normalized_key
+            and not normalized_key.endswith("_seconds")
+        ):
+            continue
+        parsed_value = _optional_finite(raw_value)
+        if parsed_value is not None:
+            timing[str(key)] = parsed_value
+
+    result_contract_valid = not identity_reasons
+    thermal_pass = not temperature_reasons
+    size_pass = not size_reasons
+    legacy_resonance_pass = (
+        legacy_replay["fmin_Hz"] >= RESONANCE_MIN_HZ
+    )
+    provisional_corrected_transfer_pass = (
+        corrected_transfer_replay is not None
+        and corrected_transfer_replay["fmin_Hz"] >= RESONANCE_MIN_HZ
+    )
+    acquisition_reasons = (
+        identity_reasons
+        + temperature_reasons
+        + size_reasons
+        + (
+            []
+            if legacy_resonance_pass
+            else ["legacy_cap_fixed_Lm_resonance_below_15kHz"]
+        )
+    )
     return {
-        "contract_valid": not reasons,
-        "reasons": reasons,
-        "measured_fixed_lm2mh": replay,
+        "contract_valid": not acquisition_reasons,
+        "reasons": acquisition_reasons,
+        "result_contract_valid": result_contract_valid,
+        "result_contract_reasons": identity_reasons,
+        "strict_solver_result_valid": strict_solver_result_valid,
+        "exact_effective_params_echo_valid": exact_params_echo_valid,
+        "thermal_pass": thermal_pass,
+        "thermal_reasons": temperature_reasons,
+        "size_pass": size_pass,
+        "size_reasons": size_reasons,
+        "dimensions_mm": dimensions,
+        "volume_L": float(volume_litres),
+        "measured_fixed_lm2mh": legacy_replay,
+        "legacy_equipotential_capacitance_F": legacy_capacitance,
+        "legacy_cap_fixed_lm2mh_resonance_pass": legacy_resonance_pass,
+        "corrected_turn_graded_capacitance_available": False,
+        "corrected_turn_graded_capacitance_blocker": (
+            "current goal_standard run uses legacy equipotential Cap; "
+            "separate turn-graded terminal solves are required"
+        ),
+        "corrected_turn_graded_transfer_estimate_F": (
+            corrected_transfer_capacitance
+        ),
+        "corrected_transfer_fixed_lm2mh_replay": (
+            corrected_transfer_replay
+        ),
+        "provisional_corrected_transfer_resonance_pass": (
+            provisional_corrected_transfer_pass
+        ),
+        "inductance_basis": {
+            "physical_core_center_gap_mm": 0.0,
+            "classification": (
+                "measured ungapped symmetric one-eighth matrix with "
+                "full-physical restoration factor 2"
+            ),
+            "symmetric_native_uH": symmetric_inductance_uH,
+            "full_physical_restored_uH": full_physical_inductance_uH,
+            "measured_ungapped_primary_self_H": (
+                measured_ungapped_primary_self_H
+            ),
+            "measured_ungapped_primary_magnetizing_H": (
+                measured_ungapped_primary_magnetizing_H
+            ),
+            "fixed_2mH_replay_is_not_measured_gapped_Lm": True,
+        },
+        "losses_W": losses_W,
+        "temperatures_C": {
+            "primary_winding": primary_winding,
+            "secondary_winding": secondary_winding,
+            "core": core,
+        },
+        "convergence": convergence,
+        "timing_seconds": timing,
         "measured_primary_winding_max_C": primary_winding_max,
         "measured_secondary_winding_max_C": secondary_winding_max,
         "measured_core_max_C": core_max,
@@ -2466,9 +2711,23 @@ def _measured_result(
             "secondary_winding_max_C": 120.0,
             "core_max_C": 120.0,
         },
+        "artifact_contract": {
+            "retention_requested": (
+                lane["scheduler"].get("retained_aedt") is not None
+            ),
+            "retained_aedt_required": bool(
+                lane["scheduler"].get("retained_aedt_required")
+            ),
+            "retained_aedt_expected": False,
+            "status": (
+                "not_requested_by_goal_standard_profile; RESULT_JSON is "
+                "the required acquisition artifact"
+            ),
+        },
         "final_design_pass": False,
         "final_design_pass_blocker": (
-            "physical air-gap geometry and gapped Lm=2mH FEA not attested"
+            "physical air-gap/gapped Lm and actual corrected turn-graded "
+            "capacitance are not attested"
         ),
     }
 
@@ -2481,7 +2740,7 @@ def collect(
     scheduler_url: str | None = None,
     getter: Callable[[str], dict[str, Any]] = _api_json,
 ) -> dict[str, Any]:
-    plan, root, _profile_value = _load_plan(plan_path)
+    plan, root, profile_value = _load_plan(plan_path)
     submission = _validate_seal(
         _read_json(submission_path.resolve(strict=True)), SUBMISSION_SCHEMA
     )
@@ -2499,15 +2758,17 @@ def collect(
     rows = []
     terminal = 0
     valid = 0
+    thermal_pass_count = 0
+    legacy_replay_pass_count = 0
+    provisional_transfer_pass_count = 0
     for lane_source in plan["lanes"]:
         lane = copy.deepcopy(lane_source)
         lane["_plan_root"] = str(root)
         receipt = receipt_by_rank[lane["rank"]]
         task_id = int(receipt["task_id"])
-        query = urllib.parse.urlencode(
-            {"include_output": "true", "output_limit": "100000"}
-        )
-        task = getter(f"{origin}/api/tasks/{task_id}?{query}")
+        task = getter(f"{origin}/api/tasks/{task_id}")
+        if isinstance(task.get("task"), dict):
+            task = dict(task["task"])
         if (
             int(task.get("id", task.get("task_id", -1))) != task_id
             or task.get("name") != lane["scheduler"]["name"]
@@ -2526,20 +2787,176 @@ def collect(
             "node": task.get("actual_node_name"),
             "result_available": False,
             "contract_valid": False,
+            "result_contract_valid": False,
+            "thermal_pass": False,
+            "legacy_cap_fixed_lm2mh_resonance_pass": False,
+            "provisional_corrected_transfer_resonance_pass": False,
             "final_design_pass": False,
+            "dimensions_mm": copy.deepcopy(
+                lane["candidate"]["dimensions_mm"]
+            ),
+            "volume_L": lane["candidate"]["objective_volume_L"],
+            "artifact_contract": {
+                "retention_requested": False,
+                "retained_aedt_required": False,
+                "retained_aedt_expected": False,
+                "status": (
+                    "not_requested_by_goal_standard_profile; no AEDT "
+                    "artifact is missing from this acquisition lane"
+                ),
+            },
         }
         if status in {"completed", "failed", "cancelled"}:
             terminal += 1
         if status == "completed" and int(task.get("exit_code") or 0) == 0:
             result = _result_json(task)
+            if result is None:
+                tail_query = urllib.parse.urlencode(
+                    {"tail_lines": "24", "max_bytes": "5000000"}
+                )
+                tail = getter(
+                    f"{origin}/api/tasks/{task_id}/stdout?{tail_query}"
+                )
+                result = _result_json(tail)
             if result is not None:
-                measured = _measured_result(result, lane)
+                measured = _measured_result(
+                    result,
+                    lane,
+                    plan=plan,
+                    profile=profile_value,
+                )
                 item.update(measured)
                 item["result_available"] = True
                 item["result_sha256"] = _sha(result)
-                if measured["contract_valid"]:
+                if measured["result_contract_valid"]:
                     valid += 1
+                if (
+                    measured["result_contract_valid"]
+                    and measured["thermal_pass"]
+                ):
+                    thermal_pass_count += 1
+                if (
+                    measured["result_contract_valid"]
+                    and measured[
+                        "legacy_cap_fixed_lm2mh_resonance_pass"
+                    ]
+                ):
+                    legacy_replay_pass_count += 1
+                if (
+                    measured["result_contract_valid"]
+                    and measured["thermal_pass"]
+                    and measured[
+                        "provisional_corrected_transfer_resonance_pass"
+                    ]
+                ):
+                    provisional_transfer_pass_count += 1
         rows.append(item)
+
+    def violation(item: Mapping[str, Any]) -> float:
+        if not item.get("result_contract_valid"):
+            return math.inf
+        primary = _optional_finite(
+            item.get("measured_primary_winding_max_C")
+        )
+        secondary = _optional_finite(
+            item.get("measured_secondary_winding_max_C")
+        )
+        core = _optional_finite(item.get("measured_core_max_C"))
+        replay = item.get("corrected_transfer_fixed_lm2mh_replay") or {}
+        fmin = _optional_finite(replay.get("fmin_Hz"))
+        values = (
+            (primary, 100.0),
+            (secondary, 120.0),
+            (core, 120.0),
+        )
+        score = sum(
+            max(0.0, (value - limit) / limit)
+            if value is not None
+            else 1.0
+            for value, limit in values
+        )
+        score += (
+            max(0.0, (RESONANCE_MIN_HZ - fmin) / RESONANCE_MIN_HZ)
+            if fmin is not None
+            else 1.0
+        )
+        return score
+
+    ranked_rows = sorted(
+        (item for item in rows if item.get("result_available")),
+        key=lambda item: (
+            violation(item),
+            _optional_finite(
+                item.get("measured_primary_winding_max_C")
+            )
+            or math.inf,
+            _optional_finite(item.get("measured_core_max_C")) or math.inf,
+            _optional_finite(
+                (item.get("losses_W") or {}).get(
+                    "P_total_thermal_input"
+                )
+            )
+            or math.inf,
+            _optional_finite(item.get("volume_L")) or math.inf,
+            int(item["rank"]),
+        ),
+    )
+    for acquisition_rank, item in enumerate(ranked_rows, start=1):
+        item["authenticated_acquisition_rank"] = acquisition_rank
+        item["normalized_constraint_violation_sum"] = violation(item)
+
+    def ranked_identity(item: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "authenticated_acquisition_rank": item.get(
+                "authenticated_acquisition_rank"
+            ),
+            "source_rank": item["rank"],
+            "task_id": item["task_id"],
+            "physical_geometry_sha256": item[
+                "physical_geometry_sha256"
+            ],
+            "normalized_constraint_violation_sum": item.get(
+                "normalized_constraint_violation_sum"
+            ),
+            "primary_winding_max_C": item.get(
+                "measured_primary_winding_max_C"
+            ),
+            "secondary_winding_max_C": item.get(
+                "measured_secondary_winding_max_C"
+            ),
+            "core_max_C": item.get("measured_core_max_C"),
+            "corrected_transfer_fmin_Hz": (
+                item.get("corrected_transfer_fixed_lm2mh_replay") or {}
+            ).get("fmin_Hz"),
+            "classification": (
+                "authenticated legacy FEA plus single-canary corrected-Crx "
+                "transfer estimate; not final corrected-cap validation"
+            ),
+        }
+
+    rankings = {
+        "authenticated_result_contract": [
+            ranked_identity(item)
+            for item in ranked_rows
+            if item.get("result_contract_valid")
+        ],
+        "authenticated_split_temperature_pass": [
+            ranked_identity(item)
+            for item in ranked_rows
+            if item.get("result_contract_valid")
+            and item.get("thermal_pass")
+        ],
+        "provisional_corrected_transfer_plus_thermal_pass": [
+            ranked_identity(item)
+            for item in ranked_rows
+            if item.get("result_contract_valid")
+            and item.get("thermal_pass")
+            and item.get(
+                "provisional_corrected_transfer_resonance_pass"
+            )
+        ],
+        "actual_corrected_turn_graded_final_pass": [],
+    }
     value = _seal(
         {
             "schema_version": COLLECTION_SCHEMA,
@@ -2552,10 +2969,21 @@ def collect(
             "candidate_count": len(rows),
             "terminal_count": terminal,
             "valid_symmetric_acquisition_count": valid,
+            "authenticated_split_temperature_pass_count": (
+                thermal_pass_count
+            ),
+            "legacy_cap_resonance_pass_count": legacy_replay_pass_count,
+            "provisional_corrected_transfer_plus_thermal_pass_count": (
+                provisional_transfer_pass_count
+            ),
             "all_terminal": terminal == len(rows),
             "rows": rows,
+            "rankings": rankings,
             "final_design_pass_count": 0,
             "physical_air_gap_attestation_pending": True,
+            "actual_corrected_turn_graded_capacitance_pending": True,
+            "legacy_capacitance_is_not_final_truth": True,
+            "corrected_transfer_estimate_is_not_final_truth": True,
             "rounded_FEA_used": False,
             "scheduler_mutation_performed": False,
             "classification": "GET-only-symmetric-acquisition-collection",
