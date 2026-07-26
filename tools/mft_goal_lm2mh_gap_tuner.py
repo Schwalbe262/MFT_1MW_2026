@@ -53,6 +53,13 @@ FINAL_SCHEMA = "mft-goal-lm2mh-physical-gap-tuning-final-v1"
 DRIVE_STATUS_SCHEMA = "mft-goal-lm2mh-physical-gap-tuning-drive-status-v1"
 PROFILE_SCHEMA = "mft-goal-lm2mh-matrix-only-profile-v1"
 CAMPAIGN_ID = "mft-goal-rank1-lm2mh-physical-center-gap-v1"
+NEIGHBORHOOD_CAMPAIGN_ID = (
+    "mft-goal-rank1-neighborhood-2b213-physical-gap-tuning-v1"
+)
+TARGETED_BATCH_SCHEMA = "mft-goal-targeted-symmetric-fea-batch-plan-v1"
+EXPECTED_NEIGHBORHOOD_GEOMETRY_SHA256 = (
+    "2b2138a99445c4ed7d50db5b07f7617789a6ff7af735a85fd7038fd1ab266d60"
+)
 
 DEFAULT_AUTHORITY_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
@@ -61,6 +68,15 @@ DEFAULT_AUTHORITY_ROOT = Path(
 DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\rank1_physical_gap_tuning_v1"
+)
+DEFAULT_NEIGHBORHOOD_SOURCE_PARAMS = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\targeted_symmetric_fea_neighborhood_v2"
+    r"\params\rank-01-2b2138a99445.json"
+)
+DEFAULT_NEIGHBORHOOD_OUTPUT = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\rank1_neighborhood_2b213_physical_gap_tuning_v1"
 )
 SCHEDULER_URL = "http://127.0.0.1:8002"
 
@@ -385,6 +401,147 @@ def _authority_rank1(authority_root: Path) -> tuple[dict[str, Any], Path]:
     }, candidate_path
 
 
+def _authority_neighborhood_rank1(
+    source_params: Path,
+    *,
+    expected_geometry_sha256: str = EXPECTED_NEIGHBORHOOD_GEOMETRY_SHA256,
+) -> tuple[dict[str, Any], Path]:
+    """Authenticate the current neighborhood rank-1 lane and its exact params."""
+
+    expected_geometry = str(expected_geometry_sha256).lower()
+    if not HEX64.fullmatch(expected_geometry):
+        raise GapTuningError("expected neighborhood geometry SHA is invalid")
+    params_path = source_params.resolve(strict=True)
+    if not params_path.is_file() or params_path.is_symlink():
+        raise GapTuningError("neighborhood source params must be a regular file")
+    batch_root = params_path.parent.parent
+    batch_path = batch_root / "batch_plan.json"
+    batch = _validate_seal(
+        _read_json(batch_path), TARGETED_BATCH_SCHEMA
+    )
+    selected = [
+        lane
+        for lane in batch.get("lanes", [])
+        if int(_finite(lane.get("rank"), "neighborhood rank")) == 1
+    ]
+    if len(selected) != 1:
+        raise GapTuningError(
+            f"exactly one neighborhood rank-1 lane required, got {len(selected)}"
+        )
+    lane = selected[0]
+    candidate = lane.get("candidate")
+    record = lane.get("params")
+    if not isinstance(candidate, dict) or not isinstance(record, dict):
+        raise GapTuningError("neighborhood rank-1 authority is incomplete")
+    geometry_sha = str(candidate.get("physical_geometry_sha256") or "").lower()
+    if geometry_sha != expected_geometry:
+        raise GapTuningError(
+            "neighborhood rank-1 physical geometry SHA is not the expected leader"
+        )
+    authority_params_path = (
+        batch_root / str(record.get("path") or "")
+    ).resolve(strict=True)
+    if (
+        authority_params_path != params_path
+        or int(record.get("size_bytes") or -1) != params_path.stat().st_size
+        or str(record.get("sha256") or "") != _sha_file(params_path)
+    ):
+        raise GapTuningError("neighborhood rank-1 params file record drifted")
+    source = _read_json(params_path)
+    if _sha(source) != str(lane.get("params_sha256") or ""):
+        raise GapTuningError("neighborhood rank-1 params payload drifted")
+
+    defaults = get_drawing_default_params()
+    params = {
+        key: _builtin(source[key] if key in source else defaults[key])
+        for key in ALL_INPUT_KEYS
+    }
+    params.update(_profile()["param_overrides"])
+    params["core_center_gap_mm"] = 0.0
+    ok, validated = validation_check(
+        create_input_parameter(params), strict=True
+    )
+    if not ok:
+        raise GapTuningError("neighborhood rank-1 parameters failed validation")
+
+    n1 = int(
+        _finite(params.get("N1_main"), "N1_main")
+        + _finite(params.get("N1_side"), "N1_side")
+    )
+    n2 = int(
+        _finite(params.get("N2_main"), "N2_main")
+        + _finite(params.get("N2_side"), "N2_side")
+    )
+    screen = candidate.get("fixed_lm2mh_screen")
+    dimensions = candidate.get("dimensions_mm")
+    if not isinstance(screen, dict) or not isinstance(dimensions, dict):
+        raise GapTuningError("neighborhood rank-1 geometry evidence is absent")
+    observed_dimensions = {
+        key: _finite(dimensions.get(key), f"neighborhood {key}")
+        for key in ("W_drawing_x", "L_perpendicular_y", "H")
+    }
+    if (
+        n1 != 8
+        or n2 != 80
+        or not math.isclose(
+            _finite(validated["cw1"].iloc[0], "neighborhood cw1"),
+            5.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            _finite(validated["gap1"].iloc[0], "neighborhood gap1"),
+            1.6,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or observed_dimensions["W_drawing_x"] > 1200.0
+        or observed_dimensions["L_perpendicular_y"] > 1000.0
+        or observed_dimensions["H"] > 750.0
+        or _finite(screen.get("fmin_Hz"), "neighborhood fmin") < 15_000.0
+    ):
+        raise GapTuningError("neighborhood rank-1 leader contract drifted")
+
+    source_metadata = candidate.get("source")
+    if not isinstance(source_metadata, dict):
+        source_metadata = {}
+    return {
+        "source_kind": "sealed_targeted_symmetric_neighborhood_batch_rank1",
+        "source_batch_campaign_id": str(batch.get("campaign_id") or ""),
+        "source_batch_rank": 1,
+        "physical_geometry_sha256": geometry_sha,
+        "raw_row_sha256": str(candidate.get("raw_row_sha256") or ""),
+        "selection_role": str(lane.get("selection_role") or ""),
+        "source_scheduler_task_id": int(
+            _finite(
+                source_metadata.get("scheduler_task_id"),
+                "neighborhood source scheduler task",
+            )
+        ),
+        "source_seed": int(
+            _finite(source_metadata.get("seed"), "neighborhood source seed")
+        ),
+        "turns": {"N1": n1, "N2": n2},
+        "dimensions_mm": observed_dimensions,
+        "fixed_lm2mh_screen": {
+            "fmin_Hz": _finite(screen.get("fmin_Hz"), "neighborhood fmin"),
+            "fTx_Hz": _finite(screen.get("fTx_Hz"), "neighborhood fTx"),
+            "fRx_Hz": _finite(screen.get("fRx_Hz"), "neighborhood fRx"),
+            "Lm_primary_referred_H": _finite(
+                screen.get("Lm_primary_referred_H"), "neighborhood Lm"
+            ),
+        },
+        "base_params": params,
+        "base_params_sha256": _sha(params),
+        "authority": {
+            "batch_plan": _file_record(batch_path),
+            "batch_plan_payload_sha256": batch["payload_sha256"],
+            "source_params": _file_record(params_path),
+            "source_params_payload_sha256": _sha(source),
+        },
+    }, batch_path
+
+
 def _gap_token(gap_mm: float) -> str:
     return f"{int(round(float(gap_mm) * 1_000_000)):08d}"
 
@@ -483,7 +640,7 @@ def _write_round(
     value = _seal(
         {
             "schema_version": ROUND_SCHEMA,
-            "campaign_id": CAMPAIGN_ID,
+            "campaign_id": campaign["campaign_id"],
             "created_at_utc": _now(),
             "campaign_payload_sha256": campaign["payload_sha256"],
             "round_index": round_index,
@@ -519,6 +676,33 @@ def prepare(
     if not HEX40.fullmatch(solver) or not HEX40.fullmatch(library):
         raise GapTuningError("full 40-character solver/library revisions required")
     candidate, _candidate_path = _authority_rank1(authority_root)
+    return _prepare_candidate(
+        candidate=candidate,
+        output=output,
+        solver_revision=solver,
+        library_revision=library,
+        campaign_id=CAMPAIGN_ID,
+        source_classification=(
+            "diagnostic_old_acquisition_rank1_not_current_neighborhood_leader"
+        ),
+    )
+
+
+def _prepare_candidate(
+    *,
+    candidate: dict[str, Any],
+    output: Path,
+    solver_revision: str,
+    library_revision: str,
+    campaign_id: str,
+    source_classification: str,
+) -> Path:
+    solver = str(solver_revision).lower()
+    library = str(library_revision).lower()
+    if not HEX40.fullmatch(solver) or not HEX40.fullmatch(library):
+        raise GapTuningError("full 40-character solver/library revisions required")
+    if campaign_id not in {CAMPAIGN_ID, NEIGHBORHOOD_CAMPAIGN_ID}:
+        raise GapTuningError("unsupported physical-gap tuning campaign id")
     destination = output.resolve()
     if destination.exists():
         raise GapTuningError(f"campaign output already exists: {destination}")
@@ -530,11 +714,12 @@ def prepare(
     campaign = _seal(
         {
             "schema_version": CAMPAIGN_SCHEMA,
-            "campaign_id": CAMPAIGN_ID,
+            "campaign_id": campaign_id,
             "created_at_utc": _now(),
             "solver_revision": solver,
             "library_revision": library,
             "candidate": candidate,
+            "source_classification": source_classification,
             "base_params": _file_record(
                 base_params_path, relative_to=destination
             ),
@@ -577,12 +762,37 @@ def prepare(
     return campaign_path
 
 
+def prepare_neighborhood(
+    *,
+    source_params: Path,
+    output: Path,
+    solver_revision: str,
+    library_revision: str,
+    expected_geometry_sha256: str = EXPECTED_NEIGHBORHOOD_GEOMETRY_SHA256,
+) -> Path:
+    candidate, _batch_path = _authority_neighborhood_rank1(
+        source_params,
+        expected_geometry_sha256=expected_geometry_sha256,
+    )
+    return _prepare_candidate(
+        candidate=candidate,
+        output=output,
+        solver_revision=solver_revision,
+        library_revision=library_revision,
+        campaign_id=NEIGHBORHOOD_CAMPAIGN_ID,
+        source_classification=(
+            "current_rank1_neighborhood_leader_physical_gap_tuning"
+        ),
+    )
+
+
 def _load_campaign(path: Path) -> tuple[dict[str, Any], Path]:
     campaign_path = path.resolve(strict=True)
     root = campaign_path.parent
     campaign = _validate_seal(_read_json(campaign_path), CAMPAIGN_SCHEMA)
     if (
-        campaign.get("campaign_id") != CAMPAIGN_ID
+        campaign.get("campaign_id")
+        not in {CAMPAIGN_ID, NEIGHBORHOOD_CAMPAIGN_ID}
         or campaign.get("pre_gap_16_candidate_lane_modified") is not False
         or campaign.get("scheduler_repository_modified") is not False
     ):
@@ -608,7 +818,7 @@ def _load_round(
     round_root = path.parent
     value = _validate_seal(_read_json(path), ROUND_SCHEMA)
     if (
-        value.get("campaign_id") != CAMPAIGN_ID
+        value.get("campaign_id") != campaign.get("campaign_id")
         or value.get("campaign_payload_sha256")
         != campaign["payload_sha256"]
         or value.get("matrix_only") is not True
@@ -1294,7 +1504,7 @@ def finalize_or_refine(
         final = _seal(
             {
                 "schema_version": FINAL_SCHEMA,
-                "campaign_id": CAMPAIGN_ID,
+                "campaign_id": campaign["campaign_id"],
                 "created_at_utc": _now(),
                 "campaign_payload_sha256": campaign["payload_sha256"],
                 "source_candidate": copy.deepcopy(campaign["candidate"]),
@@ -1447,6 +1657,22 @@ def _parser() -> argparse.ArgumentParser:
     prepare_cmd.add_argument("--solver-revision", required=True)
     prepare_cmd.add_argument("--library-revision", required=True)
 
+    neighborhood_cmd = commands.add_parser("prepare-neighborhood")
+    neighborhood_cmd.add_argument(
+        "--source-params",
+        type=Path,
+        default=DEFAULT_NEIGHBORHOOD_SOURCE_PARAMS,
+    )
+    neighborhood_cmd.add_argument(
+        "--expected-geometry-sha256",
+        default=EXPECTED_NEIGHBORHOOD_GEOMETRY_SHA256,
+    )
+    neighborhood_cmd.add_argument(
+        "--output", type=Path, default=DEFAULT_NEIGHBORHOOD_OUTPUT
+    )
+    neighborhood_cmd.add_argument("--solver-revision", required=True)
+    neighborhood_cmd.add_argument("--library-revision", required=True)
+
     submit_cmd = commands.add_parser("submit")
     submit_cmd.add_argument("--campaign", type=Path, required=True)
     submit_cmd.add_argument("--round", dest="round_path", type=Path, required=True)
@@ -1482,6 +1708,14 @@ def main() -> int:
             output=args.output,
             solver_revision=args.solver_revision,
             library_revision=args.library_revision,
+        )
+    elif args.command == "prepare-neighborhood":
+        result = prepare_neighborhood(
+            source_params=args.source_params,
+            output=args.output,
+            solver_revision=args.solver_revision,
+            library_revision=args.library_revision,
+            expected_geometry_sha256=args.expected_geometry_sha256,
         )
     elif args.command == "submit":
         result = submit(
