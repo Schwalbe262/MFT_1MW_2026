@@ -760,6 +760,25 @@ EXACT_N1_6_GUI_CONTROLLER_PID = 3_224
 EXACT_N1_6_GUI_AEDT_PID = 48_360
 EXACT_N1_6_GUI_INITIAL_GAP_MM = 0.65
 EXACT_N1_6_GUI_THERMAL_MESH_SECONDS = 1_075.99
+EXACT_N1_6_CORRECTED_CANARY_TASK_ID = 97_041
+EXACT_N1_6_CORRECTED_CANARY_TASK_NAME = (
+    "mft-goal-rx-shared-interface-canary-v1"
+)
+EXACT_N1_6_CORRECTED_CANARY_DEDUPE_KEY = (
+    "mft-al:mft-goal-rx-shared-interface-canary-v1:"
+    "c6a016c3a880acd632b12e52b02099cfe7b90fc5:"
+    "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:"
+    "4619b92fe62b262e"
+)
+EXACT_N1_6_CORRECTED_CANARY_PAYLOAD_SHA256 = (
+    "4a7c2df2957558abc98811924ab20b18c6702c76070780996309ba94dcffc718"
+)
+EXACT_N1_6_CORRECTED_CANARY_PARAMS_SHA256 = (
+    "4619b92fe62b262ef4d632d79720fcd200d845e58c58cc017dd086cc588b7b8e"
+)
+EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256 = (
+    "f7f6f2890be76943230e82d4e50992fac602537df17b5cf3a8556b04207e75b5"
+)
 HISTORICAL_AXIS_RAW_TERMINAL = 5_120
 HISTORICAL_AXIS_UNIQUE_GEOMETRY = 4_683
 NEW_AXIS_GEOMETRY_PASS_RAW = 217
@@ -1317,6 +1336,70 @@ def fetch_lastmile_tasks(
     return {
         spec.task_id: _validate_lastmile_task(spec, raw[spec.task_id])
         for spec in LASTMILE_TASK_SPECS
+    }
+
+
+def _validate_corrected_canary_task(
+    task: Mapping[str, Any],
+) -> dict[str, Any]:
+    identifiers = {
+        int(value)
+        for key in ("id", "task_id")
+        if (value := task.get(key)) not in (None, "")
+    }
+    if identifiers != {EXACT_N1_6_CORRECTED_CANARY_TASK_ID}:
+        raise UpdaterError("corrected canary task97041 identity drifted")
+    expected = {
+        "name": EXACT_N1_6_CORRECTED_CANARY_TASK_NAME,
+        "dedupe_key": EXACT_N1_6_CORRECTED_CANARY_DEDUPE_KEY,
+        "project": "MFT_1MW_2026v1",
+        "required_capability": "conda:pyaedt2026v1",
+        "env_profile": "pyaedt2026v1",
+        "scheduling_profile": "fea_bursty",
+        "aedt_backend": "standalone",
+        "cpus": 8,
+        "memory_mb": 65_536,
+        "gpus": 0,
+        "priority": 100,
+        "timeout_seconds": 43_200,
+        "max_workers_per_node": 1,
+    }
+    for key, expected_value in expected.items():
+        if task.get(key) != expected_value:
+            raise UpdaterError(
+                f"corrected canary task97041 {key} drifted"
+            )
+    state = _task_state(task)
+    actual_node = str(
+        task.get("actual_node_name") or task.get("allocation_node_name") or ""
+    )
+    if state in RUNNING_STATES and (
+        not actual_node or task.get("placement_contract_satisfied") is not True
+    ):
+        raise UpdaterError(
+            "corrected canary task97041 running placement is not satisfied"
+        )
+    return {
+        "task_id": EXACT_N1_6_CORRECTED_CANARY_TASK_ID,
+        "name": EXACT_N1_6_CORRECTED_CANARY_TASK_NAME,
+        "state": state,
+        "allocation_id": _positive_or_none(
+            task.get("allocation_id"), "allocation_id"
+        ),
+        "slurm_job_id": str(task.get("slurm_job_id") or ""),
+        "actual_node_name": actual_node,
+        "placement_contract_satisfied": task.get(
+            "placement_contract_satisfied"
+        ),
+        "created_at": task.get("created_at"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "exit_code": task.get("exit_code"),
+        "failure_message": str(task.get("failure_message") or "")[:350],
+        "cpus": 8,
+        "memory_mb": 65_536,
+        "priority": 100,
+        "timeout_seconds": 43_200,
     }
 
 
@@ -3190,8 +3273,11 @@ def _descendant_processes(
     )
 
 
-def _exact_n1_6_gui_fea_card(observed_at: str) -> dict[str, Any]:
-    """Expose the exact 6/60 GUI diagnostic without promoting it as a result."""
+def _exact_n1_6_gui_fea_card(
+    observed_at: str,
+    corrected_canary_task: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Expose invalid local thermal truth and its corrected canary separately."""
 
     snapshot = _windows_process_snapshot()
     controller = snapshot.get(EXACT_N1_6_GUI_CONTROLLER_PID)
@@ -3207,75 +3293,97 @@ def _exact_n1_6_gui_fea_card(observed_at: str) -> dict[str, Any]:
         and aedt[0] == EXACT_N1_6_GUI_CONTROLLER_PID
         and aedt[1].lower() == "ansysedt.exe"
     )
-    if aedt_active:
-        runtime_label = (
-            f"AEDT PID{EXACT_N1_6_GUI_AEDT_PID} OPEN/RESPONDING | "
-            "THERMAL PENDING/RUNNING"
-        )
+    if corrected_canary_task is None:
+        canary_state = "submitted"
+        canary_node = "pending"
+        canary_job = "pending"
+        canary_allocation = "pending"
     else:
-        runtime_label = (
-            f"AEDT PID{EXACT_N1_6_GUI_AEDT_PID} NOT ACTIVE | "
-            "RESULTS UNAUTHENTICATED"
+        canary_state = str(corrected_canary_task["state"])
+        canary_node = (
+            str(corrected_canary_task["actual_node_name"]) or "pending"
+        )
+        canary_job = (
+            str(corrected_canary_task["slurm_job_id"]) or "pending"
+        )
+        canary_allocation = (
+            str(corrected_canary_task["allocation_id"]) or "pending"
         )
     return {
         "id": EXACT_N1_6_GUI_FEA_CARD_ID,
         "title": (
-            "EXACT 6/60 GUI FEA | seed2707277137/e5b4 | "
-            f"SYM 1/8 NONROUNDED | {runtime_label}"
+            "DIAGNOSTIC THERMAL INVALID | EXACT 6/60 | "
+            "interf153/150 WALL + 5000K | "
+            f"CANARY97041 {canary_state.upper()} {canary_node}/j{canary_job}"
         ),
         "detail": (
-            "The exact N1/N2=6/60 local GUI diagnostic is a symmetric eighth, "
-            "unrounded model. Matrix, legacy capacitance, loss, and the "
-            f"ThermalSetup mesh ({EXACT_N1_6_GUI_THERMAL_MESH_SECONDS:.2f}s) "
-            "are complete. The native thermal solver remains pending/running "
-            "while the authenticated Results terminal is absent. The initial "
-            f"{EXACT_N1_6_GUI_INITIAL_GAP_MM:.2f}mm core-center air gap and "
-            "legacy capacitance are diagnostic inputs, not final resonance or "
-            "design authority."
+            "The exact 6/60 symmetric local thermal result is invalid because "
+            "Rx_main auto-pair failures left interf153/interf150 as walls and "
+            "the affected zones reached the 5000 K emergency limiter. This is "
+            "a thermal mesh/interface setup failure, not evidence that the "
+            "physical design violates its temperature limits. It is not "
+            "scientific or production truth. Corrected shared-region canary "
+            f"task97041 is {canary_state.upper()} on {canary_node}; terminal "
+            "native interface coverage and limiter-free temperatures remain "
+            "pending."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 90,
+        "progress_pct": 92,
         "evidence": [
             (
-                f"source seed={EXACT_N1_6_GUI_SEED} / geometry SHA256="
-                f"{EXACT_N1_6_GUI_GEOMETRY_SHA256} / "
-                f"source scheduler task={EXACT_N1_6_GUI_SOURCE_TASK_ID}"
+                f"local label=seed{EXACT_N1_6_GUI_SEED}/e5b4 / historical "
+                f"geometry label={EXACT_N1_6_GUI_GEOMETRY_SHA256} / "
+                f"source task={EXACT_N1_6_GUI_SOURCE_TASK_ID}"
+            ),
+            (
+                "local diagnostic status=DIAGNOSTIC THERMAL INVALID / "
+                "production_eligible=false / scientific_valid=false"
+            ),
+            (
+                "Rx_main unpaired interfaces=interf153,interf150 / "
+                "missing fluid coupling=Rx_main_block_xn,Rx_main_block_yp"
+            ),
+            (
+                "native auto-pair reset interfaces to wall / "
+                "temperature limiter triggered=true / limiter=5000 K"
+            ),
+            (
+                "classification=thermal mesh/interface setup invalid / "
+                "not a design-temperature failure / no candidate rejection"
             ),
             (
                 "topology=symmetric eighth / full_model=0 / "
-                "round_corner=0 / rounded=false / N1/N2=6/60"
+                "round_corner=0 / N1/N2=6/60 / cw1=5.0mm / gap1=1.6mm"
             ),
             (
-                f"initial core-center gap="
-                f"{EXACT_N1_6_GUI_INITIAL_GAP_MM:.2f}mm diagnostic only / "
-                "fan velocity=1.5m/s unchanged / TIM and cooling contract "
-                "unchanged"
-            ),
-            "Matrix=complete / legacy capacitance=complete / loss=complete",
-            (
-                "ThermalSetup mesh=complete / elapsed="
-                f"{EXACT_N1_6_GUI_THERMAL_MESH_SECONDS:.2f}s / "
-                "thermal solver=pending/running"
-            ),
-            (
-                f"controller PID{EXACT_N1_6_GUI_CONTROLLER_PID} "
+                f"local controller PID{EXACT_N1_6_GUI_CONTROLLER_PID} "
                 f"active={str(controller_active).lower()} / "
                 f"AEDT PID{EXACT_N1_6_GUI_AEDT_PID} "
-                f"active={str(aedt_active).lower()} / "
-                "last direct observation responding=true"
+                f"active={str(aedt_active).lower()} / no process mutation"
             ),
             (
-                "Results terminal=false / temperature results available=false "
-                "/ resonance result final=false"
+                f"corrected canary task97041={canary_state.upper()} / "
+                f"node={canary_node} / allocation={canary_allocation} / "
+                f"Slurm job={canary_job}"
             ),
             (
-                "actual scientific PASS=false / actual production PASS=false "
-                "/ canonical promotion=false"
+                "canary resources=8CPU+65536MB / priority=100 / "
+                "timeout=43200s / standalone effective cores=8"
             ),
             (
-                "legacy capacitance is not corrected turn-graded final "
-                "capacitance / final resonance authority=false"
+                "canary params SHA256="
+                f"{EXACT_N1_6_CORRECTED_CANARY_PARAMS_SHA256} / "
+                "canonical geometry SHA256="
+                f"{EXACT_N1_6_CORRECTED_CANARY_GEOMETRY_SHA256}"
+            ),
+            (
+                "fixed cooling unchanged: dual fan 1.5m/s / "
+                "core+winding TIM 2.0mm / k=0.2W/mK"
+            ),
+            (
+                "corrected canary terminal pending: paired native interfaces "
+                "+ no 4990K limiter + scientific_valid=true are all required"
             ),
         ],
     }
@@ -4549,6 +4657,7 @@ def merge_status(
     auxiliary_tasks: Mapping[int, Mapping[str, Any]] | None = None,
     lastmile_tasks: Mapping[int, Mapping[str, Any]] | None = None,
     lastmile_submission_state: Mapping[str, Any] | None = None,
+    corrected_canary_task: Mapping[str, Any] | None = None,
     reference_gui_root: Path | None = None,
     target_axis_collector_state_file: Path | None = None,
     postsuccess_state_file: Path | None = None,
@@ -4609,7 +4718,10 @@ def merge_status(
         _remove_current_card(result, REFERENCE_BASELINE_CARD_ID)
     _upsert_priority_current_card(
         result,
-        _exact_n1_6_gui_fea_card(observed_at),
+        _exact_n1_6_gui_fea_card(
+            observed_at,
+            corrected_canary_task=corrected_canary_task,
+        ),
     )
     if lastmile_tasks is not None and lastmile_submission_state is not None:
         _upsert_priority_current_card(
@@ -5175,6 +5287,16 @@ def synchronize_once(
         if lastmile_submission_state is not None
         else None
     )
+    corrected_canary_task = (
+        _validate_corrected_canary_task(
+            _get_scheduler_task(
+                scheduler_url,
+                EXACT_N1_6_CORRECTED_CANARY_TASK_ID,
+            )
+        )
+        if task_reader is None
+        else None
+    )
     source = status_file.resolve().read_bytes()
     source_sha256 = hashlib.sha256(source).hexdigest()
     try:
@@ -5190,6 +5312,7 @@ def synchronize_once(
         auxiliary_tasks=auxiliary_tasks,
         lastmile_tasks=lastmile_tasks,
         lastmile_submission_state=lastmile_submission_state,
+        corrected_canary_task=corrected_canary_task,
         reference_gui_root=(
             reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT
         ),

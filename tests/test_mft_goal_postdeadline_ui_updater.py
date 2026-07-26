@@ -633,41 +633,47 @@ def test_exact_n1_6_gui_fea_card_preserves_truth_boundary(
         },
     )
 
-    card = updater._exact_n1_6_gui_fea_card(OBSERVED)
+    card = updater._exact_n1_6_gui_fea_card(
+        OBSERVED,
+        corrected_canary_task={
+            "state": "running",
+            "actual_node_name": "n114",
+            "slurm_job_id": "844341",
+            "allocation_id": 14713,
+        },
+    )
 
     assert card["id"] == updater.EXACT_N1_6_GUI_FEA_CARD_ID
     assert len(card["title"]) <= 160
-    assert "seed2707277137/e5b4" in card["title"]
-    assert "SYM 1/8 NONROUNDED" in card["title"]
-    assert "AEDT PID48360 OPEN/RESPONDING" in card["title"]
-    assert "THERMAL PENDING/RUNNING" in card["title"]
+    assert "DIAGNOSTIC THERMAL INVALID" in card["title"]
+    assert "EXACT 6/60" in card["title"]
+    assert "interf153/150 WALL + 5000K" in card["title"]
+    assert "CANARY97041 RUNNING n114/j844341" in card["title"]
     assert card["state"] == "in_progress"
     assert any(
         updater.EXACT_N1_6_GUI_GEOMETRY_SHA256 in value
-        and "source scheduler task=96622" in value
+        and "source task=96622" in value
         for value in card["evidence"]
     )
     assert any(
-        "Matrix=complete" in value
-        and "legacy capacitance=complete" in value
-        and "loss=complete" in value
+        "production_eligible=false" in value
+        and "scientific_valid=false" in value
         for value in card["evidence"]
     )
     assert any(
-        "ThermalSetup mesh=complete" in value
-        and "elapsed=1075.99s" in value
-        and "thermal solver=pending/running" in value
+        "unpaired interfaces=interf153,interf150" in value
+        and "Rx_main_block_xn,Rx_main_block_yp" in value
         for value in card["evidence"]
     )
     assert any(
-        "Results terminal=false" in value
-        and "temperature results available=false" in value
+        "limiter triggered=true" in value
+        and "limiter=5000 K" in value
         for value in card["evidence"]
     )
     assert any(
-        "actual scientific PASS=false" in value
-        and "actual production PASS=false" in value
-        and "canonical promotion=false" in value
+        "task97041=RUNNING" in value
+        and "node=n114" in value
+        and "Slurm job=844341" in value
         for value in card["evidence"]
     )
 
