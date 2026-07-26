@@ -83,6 +83,56 @@ def _actual_variant(active: str) -> dict[str, Any]:
     return matches[0]
 
 
+def _validate_actual_cap_gate(
+    *,
+    tuned: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    cap_plan: Mapping[str, Any],
+    cap_collection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fail closed unless actual Tx/Rx graded Cap matches gap and geometry."""
+    actual = cap_collection.get("actual_connection_results") or {}
+    source = cap_plan.get("source") or {}
+    geometry = (campaign.get("candidate") or {}).get(
+        "physical_geometry_sha256"
+    )
+    gap = _finite(tuned.get("tuned_core_center_gap_mm"), "tuned gap")
+    if (
+        cap_collection.get("plan_payload_sha256")
+        != cap_plan.get("payload_sha256")
+        or cap_collection.get("all_terminal") is not True
+        or cap_collection.get("actual_connection_resonance_spec_pass")
+        is not True
+        or not {
+            graded_cap.ACTUAL_CONNECTION_VARIANT_IDS["Tx"],
+            graded_cap.ACTUAL_CONNECTION_VARIANT_IDS["Rx"],
+        }.issubset(set(cap_plan.get("selected_variant_ids") or []))
+        or source.get("physical_geometry_sha256") != geometry
+        or not math.isclose(
+            _finite(source.get("core_center_gap_mm"), "Cap source gap"),
+            gap,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        raise FinalTruthError(
+            "actual turn-graded Cap evidence does not match the tuned candidate"
+        )
+    for active in ("Tx", "Rx"):
+        row = actual.get(active) or {}
+        if (
+            row.get("variant_id")
+            != graded_cap.ACTUAL_CONNECTION_VARIANT_IDS[active]
+            or row.get("contract_valid") is not True
+            or row.get("resonance_spec_pass_15kHz") is not True
+            or _finite(row.get("C_terminal_F"), f"{active} Cap") <= 0.0
+            or _finite(row.get("f_res_Hz"), f"{active} resonance")
+            < graded_cap.RESONANCE_MIN_HZ
+        ):
+            raise FinalTruthError(f"actual turn-graded {active} gate failed")
+    return dict(actual)
+
+
 def _source_batch(
     campaign: Mapping[str, Any],
 ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
@@ -179,44 +229,12 @@ def _load_upstream(
         _read(cap_collection_path),
         graded_cap.COLLECTION_SCHEMA,
     )
-    actual = cap_collection.get("actual_connection_results") or {}
-    source = cap_plan.get("source") or {}
-    geometry = (campaign.get("candidate") or {}).get(
-        "physical_geometry_sha256"
+    actual = _validate_actual_cap_gate(
+        tuned=tuned,
+        campaign=campaign,
+        cap_plan=cap_plan,
+        cap_collection=cap_collection,
     )
-    if (
-        cap_collection.get("plan_payload_sha256")
-        != cap_plan["payload_sha256"]
-        or cap_collection.get("all_terminal") is not True
-        or cap_collection.get("actual_connection_resonance_spec_pass")
-        is not True
-        or not {
-            graded_cap.ACTUAL_CONNECTION_VARIANT_IDS["Tx"],
-            graded_cap.ACTUAL_CONNECTION_VARIANT_IDS["Rx"],
-        }.issubset(set(cap_plan.get("selected_variant_ids") or []))
-        or source.get("physical_geometry_sha256") != geometry
-        or not math.isclose(
-            _finite(source.get("core_center_gap_mm"), "Cap source gap"),
-            gap,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        )
-    ):
-        raise FinalTruthError(
-            "actual turn-graded Cap evidence does not match the tuned candidate"
-        )
-    for active in ("Tx", "Rx"):
-        row = actual.get(active) or {}
-        if (
-            row.get("variant_id")
-            != graded_cap.ACTUAL_CONNECTION_VARIANT_IDS[active]
-            or row.get("contract_valid") is not True
-            or row.get("resonance_spec_pass_15kHz") is not True
-            or _finite(row.get("C_terminal_F"), f"{active} Cap") <= 0.0
-            or _finite(row.get("f_res_Hz"), f"{active} resonance")
-            < graded_cap.RESONANCE_MIN_HZ
-        ):
-            raise FinalTruthError(f"actual turn-graded {active} gate failed")
     return (
         tuned,
         gap_root,
@@ -354,6 +372,10 @@ def prepare(
     final_params_path = gap_tuner._atomic_json(  # noqa: SLF001
         destination / "params.json", params
     )
+    # Scheduler parameter digests are order-sensitive.  Replay the exact
+    # persisted, canonically sorted JSON objects before deriving identity.
+    profile = _read(profile_path)
+    params = _read(final_params_path)
     geometry = campaign["candidate"]["physical_geometry_sha256"]
     name = f"mft-final-symtruth-{geometry[:12]}"
     identity = scheduler_client.verification_submission_identity(
