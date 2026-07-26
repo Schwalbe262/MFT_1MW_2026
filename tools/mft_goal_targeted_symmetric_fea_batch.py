@@ -2081,6 +2081,7 @@ def prepare(
                 "library_revision": library,
                 "profile": _file_record(profile_copy, relative_to=destination),
                 "profile_canonical_sha256": _sha(profile),
+                "scheduler_priority": PRIORITY,
                 "lanes": lanes,
                 "submission_ready": True,
                 "explicit_apply_required": True,
@@ -2107,6 +2108,7 @@ def _load_plan(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     plan_path = path.resolve(strict=True)
     root = plan_path.parent
     plan = _validate_seal(_read_json(plan_path), BATCH_PLAN_SCHEMA)
+    scheduler_priority = plan.get("scheduler_priority", PRIORITY)
     if (
         plan.get("campaign_id") != BATCH_CAMPAIGN_ID
         or plan.get("submission_ready") is not True
@@ -2124,6 +2126,9 @@ def _load_plan(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
         )
         or plan.get("production_eligible") is not False
         or not MIN_BATCH <= len(plan.get("lanes") or []) <= MAX_BATCH
+        or isinstance(scheduler_priority, bool)
+        or not isinstance(scheduler_priority, int)
+        or not 0 <= scheduler_priority <= 100
     ):
         raise BatchContractError("batch plan contract drifted")
     profile_record = plan.get("profile") or {}
@@ -2177,7 +2182,7 @@ def _load_plan(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
             or scheduler["memory_mb"] != MEMORY_MB
             or scheduler["timeout_seconds"] != TIMEOUT_SECONDS
             or scheduler["max_workers_per_node"] != MAX_WORKERS_PER_NODE
-            or scheduler["priority"] != PRIORITY
+            or scheduler["priority"] != scheduler_priority
             or scheduler["environment"]
             != _core_environment(plan["solver_revision"])
             or scheduler["name"] in identities
@@ -2337,6 +2342,11 @@ def submit(
 def _api_json(url: str) -> dict[str, Any]:
     with urllib.request.urlopen(url, timeout=60) as response:
         value = json.loads(response.read().decode("utf-8"))
+    # The dedicated stdout endpoint returns a JSON string, while task
+    # metadata endpoints return an object.  Normalize both so collection can
+    # parse the final RESULT_JSON without requesting a truncated task body.
+    if isinstance(value, str):
+        return {"stdout": value}
     if not isinstance(value, dict):
         raise BatchContractError("Scheduler returned a non-object")
     return value
