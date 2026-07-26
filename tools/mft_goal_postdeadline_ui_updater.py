@@ -39,6 +39,12 @@ SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
 LOG_SCHEMA = "mft-goal-postdeadline-ui-updater-event-v1"
 STATUS_SCHEMA = "mft-codex-work-status-v1"
+POSTSUCCESS_STATE_SCHEMA = (
+    "mft-goal-postdeadline-standard-postsuccess-state-v1"
+)
+FINAL_GATE_PENDING_SCHEMA = "mft-goal-final-solver-package-pending-v1"
+FINAL_GATE_SEAL_SCHEMA = "mft-goal-final-solver-package-seal-v1"
+FINAL_PACKAGE_NAME = "final_solver_package_v1"
 SUBMITTED_PATTERN = re.compile(r"\bSUBMITTED\s+(\d+)(?!\d)", re.IGNORECASE)
 COLLECTIONS_PATTERN = re.compile(r"\bCOLLECTIONS?\s+(\d+)(?!\d)", re.IGNORECASE)
 
@@ -490,6 +496,172 @@ def _single_current(payload: Mapping[str, Any], item_id: str) -> dict[str, Any]:
     return matches[0]
 
 
+def _read_sealed_local_json(
+    path: Path,
+    *,
+    schema: str,
+    schema_field: str = "schema_version",
+) -> dict[str, Any]:
+    resolved = path.resolve(strict=True)
+    if resolved.is_symlink() or resolved.stat().st_size > MAX_RESPONSE_BYTES:
+        raise UpdaterError(f"automation state is unsafe: {resolved}")
+    try:
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(f"automation state is invalid: {resolved}") from exc
+    if not isinstance(value, dict):
+        raise UpdaterError(f"automation state is not an object: {resolved}")
+    unsigned = copy.deepcopy(value)
+    observed = unsigned.pop("payload_sha256", None)
+    if value.get(schema_field) != schema or observed != canonical_sha256(unsigned):
+        raise UpdaterError(f"automation state seal drifted: {resolved}")
+    return value
+
+
+def _upsert_current_card(payload: dict[str, Any], card: Mapping[str, Any]) -> None:
+    current = payload.get("current")
+    if not isinstance(current, list):
+        raise UpdaterError("status current group is missing")
+    card_id = card.get("id")
+    matches = [
+        index
+        for index, item in enumerate(current)
+        if isinstance(item, dict) and item.get("id") == card_id
+    ]
+    if len(matches) > 1:
+        raise UpdaterError(f"automation card {card_id} is duplicated")
+    if matches:
+        current[matches[0]] = copy.deepcopy(dict(card))
+        return
+    insertion = next(
+        (
+            index
+            for index, item in enumerate(current)
+            if isinstance(item, dict)
+            and item.get("id") == "parallel-workstreams"
+        ),
+        len(current),
+    )
+    current.insert(insertion, copy.deepcopy(dict(card)))
+
+
+def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
+    state = _read_sealed_local_json(
+        path,
+        schema=POSTSUCCESS_STATE_SCHEMA,
+    )
+    collection_count = int(state.get("collection_count") or 0)
+    pending_count = int(state.get("pending_count") or 0)
+    failure_count = int(state.get("terminal_failure_count") or 0)
+    if (
+        state.get("diagnostic_only") is not True
+        or state.get("production_eligible") is not False
+        or state.get("scheduler_mutation_performed") is not False
+        or state.get("scientific_pass_claimed") is not False
+        or state.get("production_claimed") is not False
+    ):
+        raise UpdaterError("post-success automation safety boundary drifted")
+    return {
+        "id": "codex-standard-postsuccess-pipeline",
+        "title": (
+            "CODEX AUTO · STANDARD RESULT PIPELINE · "
+            f"COLLECTIONS {collection_count} · PENDING {pending_count}"
+        ),
+        "detail": (
+            "task96325/96327 collector 결과를 기다리면서 인증, hard-constraint "
+            "판정, strict-AL admission 및 measured global NDS 입력을 자동 "
+            "처리합니다. 결과가 없으면 scientific/production claim을 만들지 "
+            "않습니다."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 70 if collection_count else 40,
+        "evidence": [
+            f"state={state.get('status')}",
+            (
+                f"collections{collection_count} / pending{pending_count} / "
+                f"terminal failures{failure_count}"
+            ),
+            (
+                "surrogate retraining="
+                f"{str(bool(state.get('surrogate_retraining_performed'))).lower()}"
+            ),
+            (
+                "production Pareto emitted="
+                f"{str(bool(state.get('production_pareto_emitted'))).lower()}"
+            ),
+            "Scheduler mutation=false / scientific claim=false",
+            f"state SHA256 {_file_sha256(path.resolve())}",
+        ],
+    }
+
+
+def _final_gate_card(root: Path, observed_at: str) -> dict[str, Any]:
+    resolved_root = root.resolve()
+    seal_path = resolved_root / FINAL_PACKAGE_NAME / "package_seal.json"
+    pending_path = resolved_root / "pending_manifest.json"
+    if seal_path.is_file():
+        value = _read_sealed_local_json(
+            seal_path,
+            schema=FINAL_GATE_SEAL_SCHEMA,
+            schema_field="schema",
+        )
+        if (
+            value.get("all_explicit_goal_constraints_actual_pass") is not True
+            or value.get("solver_result_truth_included") is not True
+        ):
+            raise UpdaterError("published final package truth boundary drifted")
+        title = "CODEX AUTO · FINAL AEDT PACKAGE GATE · PUBLISHED"
+        detail = (
+            "인증된 actual solver 결과와 고정 제약을 모두 통과해 Full 및 "
+            "symmetric AEDT 패키지가 봉인됐습니다."
+        )
+        progress = 100
+        evidence = [
+            "full AEDT promoted=true / symmetric AEDT promoted=true",
+            "actual solver result truth=true",
+            "all explicit goal constraints actual pass=true",
+            f"package seal SHA256 {_file_sha256(seal_path)}",
+        ]
+    elif pending_path.is_file():
+        value = _read_sealed_local_json(
+            pending_path,
+            schema=FINAL_GATE_PENDING_SCHEMA,
+            schema_field="schema",
+        )
+        reasons = value.get("pending_reasons")
+        if (
+            not isinstance(reasons, list)
+            or value.get("final_package_created") is not False
+            or value.get("full_aedt_promoted") is not False
+            or value.get("symmetric_aedt_promoted") is not False
+        ):
+            raise UpdaterError("pending final package truth boundary drifted")
+        title = "CODEX AUTO · FINAL AEDT PACKAGE GATE · PENDING"
+        detail = (
+            "actual Full/thermal 결과와 solver-produced AEDT가 모두 인증될 "
+            "때까지 fail-closed 상태를 유지합니다."
+        )
+        progress = 60
+        evidence = [
+            *[f"pending: {reason}" for reason in reasons[:4]],
+            "full AEDT promoted=false / symmetric AEDT promoted=false",
+            "open-only fallback promotion=false",
+            f"pending manifest SHA256 {_file_sha256(pending_path)}",
+        ]
+    else:
+        raise UpdaterError("final package gate state is absent")
+    return {
+        "id": "codex-final-aedt-package-gate",
+        "title": title,
+        "detail": detail,
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": evidence,
+    }
+
+
 def _counter(pattern: re.Pattern[str], title: str, label: str) -> int:
     values = {int(value) for value in pattern.findall(title)}
     if len(values) != 1:
@@ -552,6 +724,8 @@ def merge_status(
     tasks: Mapping[int, Mapping[str, Any]],
     *,
     observed_at: str,
+    postsuccess_state_file: Path | None = None,
+    final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
     if payload.get("schema_version") != STATUS_SCHEMA:
         raise UpdaterError("Codex status schema drifted")
@@ -562,6 +736,16 @@ def merge_status(
         target = _single_current(result, spec.card_id)
         target.clear()
         target.update(_task_card(spec, tasks[spec.task_id], observed_at))
+    if postsuccess_state_file is not None:
+        _upsert_current_card(
+            result,
+            _postsuccess_card(postsuccess_state_file, observed_at),
+        )
+    if final_gate_root is not None:
+        _upsert_current_card(
+            result,
+            _final_gate_card(final_gate_root, observed_at),
+        )
 
     handoff = _single_current(result, "fea-handoff")
     previous_title = str(handoff.get("title") or "")
@@ -686,6 +870,8 @@ def synchronize_once(
     scheduler_url: str = DEFAULT_SCHEDULER_URL,
     task_reader: TaskReader | None = None,
     observed_at: str | None = None,
+    postsuccess_state_file: Path | None = None,
+    final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
     tasks = fetch_tasks(scheduler_url, task_reader=task_reader)
     source = status_file.resolve().read_bytes()
@@ -700,6 +886,8 @@ def synchronize_once(
         payload,
         tasks,
         observed_at=observed_at or _timestamp(),
+        postsuccess_state_file=postsuccess_state_file,
+        final_gate_root=final_gate_root,
     )
     validate_status_sync(updated)
     if len(_json_bytes(updated)) > 256 * 1024:
@@ -743,6 +931,8 @@ def run_updater(
     task_reader: TaskReader | None = None,
     max_cycles: int | None = None,
     sleeper: Callable[[float], None] = time.sleep,
+    postsuccess_state_file: Path | None = None,
+    final_gate_root: Path | None = None,
 ) -> dict[str, Any] | None:
     if interval_seconds < 1:
         raise UpdaterError("interval-seconds must be positive")
@@ -777,6 +967,8 @@ def run_updater(
                     status_file=status_file,
                     scheduler_url=scheduler_url,
                     task_reader=task_reader,
+                    postsuccess_state_file=postsuccess_state_file,
+                    final_gate_root=final_gate_root,
                 )
                 _append_log(
                     log_file,
@@ -819,6 +1011,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--log-file", type=Path)
     parser.add_argument("--lock-file", type=Path)
+    parser.add_argument("--postsuccess-state-file", type=Path)
+    parser.add_argument("--final-gate-root", type=Path)
     return parser
 
 
@@ -833,6 +1027,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         pid_file=args.pid_file or ui_root / "postdeadline-ui-updater.pid.json",
         log_file=args.log_file or ui_root / "postdeadline-ui-updater.jsonl",
         lock_file=args.lock_file or ui_root / "postdeadline-ui-updater.lock",
+        postsuccess_state_file=args.postsuccess_state_file,
+        final_gate_root=args.final_gate_root,
     )
     if args.once:
         print(json.dumps(result, sort_keys=True, ensure_ascii=False))

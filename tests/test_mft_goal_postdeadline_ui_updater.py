@@ -224,6 +224,85 @@ def test_synchronize_once_is_atomic_and_identity_failure_keeps_source(
     assert path.read_bytes() == before
 
 
+def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None:
+    postsuccess = updater._sealed(
+        {
+            "schema_version": updater.POSTSUCCESS_STATE_SCHEMA,
+            "status": "pending_standard_collections",
+            "collection_count": 0,
+            "pending_count": 2,
+            "terminal_failure_count": 0,
+            "diagnostic_only": True,
+            "production_eligible": False,
+            "scheduler_mutation_performed": False,
+            "scientific_pass_claimed": False,
+            "production_claimed": False,
+            "surrogate_retraining_performed": False,
+            "production_pareto_emitted": False,
+        }
+    )
+    postsuccess_path = tmp_path / "postsuccess-state.json"
+    postsuccess_path.write_text(
+        json.dumps(postsuccess, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    gate_root = tmp_path / "gate"
+    gate_root.mkdir()
+    pending = updater._sealed(
+        {
+            "schema": updater.FINAL_GATE_PENDING_SCHEMA,
+            "status": "pending",
+            "pending_reasons": [
+                "full collector state is watching",
+                "thermal collector state is watching",
+            ],
+            "final_package_created": False,
+            "full_aedt_promoted": False,
+            "symmetric_aedt_promoted": False,
+        }
+    )
+    (gate_root / "pending_manifest.json").write_text(
+        json.dumps(pending, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    merged = updater.merge_status(
+        _status(),
+        _mixed_tasks(),
+        observed_at=OBSERVED,
+        postsuccess_state_file=postsuccess_path,
+        final_gate_root=gate_root,
+    )
+
+    by_id = {item["id"]: item for item in merged["current"]}
+    assert "COLLECTIONS 0 · PENDING 2" in by_id[
+        "codex-standard-postsuccess-pipeline"
+    ]["title"]
+    assert by_id["codex-final-aedt-package-gate"]["title"].endswith(
+        "PENDING"
+    )
+    assert any(
+        "full AEDT promoted=false" in item
+        for item in by_id["codex-final-aedt-package-gate"]["evidence"]
+    )
+    assert merged["current"][-1]["id"] == "parallel-workstreams"
+    updater.validate_status_sync(merged)
+
+    postsuccess["pending_count"] = 1
+    postsuccess_path.write_text(
+        json.dumps(postsuccess, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(updater.UpdaterError, match="seal drifted"):
+        updater.merge_status(
+            _status(),
+            _mixed_tasks(),
+            observed_at=OBSERVED,
+            postsuccess_state_file=postsuccess_path,
+            final_gate_root=gate_root,
+        )
+
+
 class _Response(io.BytesIO):
     def __init__(self, payload: bytes):
         super().__init__(payload)
