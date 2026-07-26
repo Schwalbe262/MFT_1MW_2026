@@ -67,6 +67,10 @@ def _task(
     slurm_job_id: str = "200",
     failure_message: str = "",
 ) -> dict[str, Any]:
+    if spec.expected_allocation_id is not None:
+        allocation_id = spec.expected_allocation_id
+    if spec.expected_slurm_job_id is not None:
+        slurm_job_id = spec.expected_slurm_job_id
     actual_node = spec.requested_node if allocation_id else ""
     return {
         "id": spec.task_id,
@@ -101,7 +105,7 @@ def _task(
 
 def _mixed_tasks() -> dict[int, dict[str, Any]]:
     specs = updater.TASK_SPECS
-    return {
+    tasks = {
         specs[0].task_id: updater._validate_task(
             specs[0], _task(specs[0], allocation_id=101)
         ),
@@ -141,6 +145,17 @@ def _mixed_tasks() -> dict[int, dict[str, Any]]:
             ),
         ),
     }
+    for spec in specs[6:]:
+        tasks[spec.task_id] = updater._validate_task(
+            spec,
+            _task(
+                spec,
+                state="queued",
+                allocation_id=None,
+                slurm_job_id="",
+            ),
+        )
+    return tasks
 
 
 def _reader_from(tasks: dict[int, dict[str, Any]]):
@@ -244,20 +259,28 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["completed"] == completed
     assert merged["attention"] == attention
     assert "18:20 KST" in merged["summary"]
-    assert "running2 · queued2 · terminal2" in merged["summary"]
+    assert "running2 · queued5 · terminal2" in merged["summary"]
     assert "physical feasible0" in merged["summary"]
     assert "scientific/production PASS가 아닙니다" in merged["summary"]
     assert merged["current"][-1] != parallel
     assert merged["current"][-1]["id"] == "parallel-workstreams"
     assert (
-        "RUNNING 2 · QUEUED 2 · ALLOCATION JOBS 2"
+        "RUNNING 2 · QUEUED 5 · ALLOCATION JOBS 2"
         in merged["current"][-1]["title"]
+    )
+    assert (
+        "RISK task96328/allocation14620 FORCE 07-27 04:07:51 KST"
+        in merged["current"][-1]["title"]
+    )
+    assert any(
+        "RISK task96328 allocation14620" in value
+        for value in merged["current"][-1]["evidence"]
     )
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 2
     assert sync["running"] == 2
-    assert sync["queued"] == 2
-    assert sync["submitted_total"] == 122
+    assert sync["queued"] == 5
+    assert sync["submitted_total"] == 125
     assert sync["collections_preserved"] == 0
     assert sync["scheduler_methods_used"] == ["GET"]
     assert sync["scientific_pass_generated"] is False
@@ -268,6 +291,9 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         96327,
         96328,
         96329,
+        96330,
+        96331,
+        96332,
     ]
 
     success = next(
@@ -293,6 +319,15 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == "postdeadline-standard-official6-96328"
     )
     assert "task96328 RUNNING" in official["title"]
+    assert "FORCE-CANCEL RISK 07-27 04:07:51 KST" in official["title"]
+    assert any(
+        "force boundary leads by 4h01m56s" in value
+        for value in official["evidence"]
+    )
+    assert any(
+        "hard residual guarantee=false" in value
+        for value in official["evidence"]
+    )
     assert any(
         "42942394a873e40181f9074f2625807224239b291bcf2f4cf2ccacde50b11edc"
         in value
@@ -309,12 +344,47 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         in value
         for value in official8["evidence"]
     )
+    for task_id, order, node, receipt_sha in (
+        (
+            96330,
+            1,
+            "n110",
+            "d71987f49b062132fdf90a358bcc819a2cf9fd2e74c76fecad04e22ea9329233",
+        ),
+        (
+            96331,
+            12,
+            "n112",
+            "2e207daa33165e8921816e56beb2458d1dcd8515d6cb0b8d5a25cb0cf3cde532",
+        ),
+        (
+            96332,
+            5,
+            "n115",
+            "4275d9e8e004f3f9f57d9483ca9e7b8a48d410778f39a80848c95c396ed2171c",
+        ),
+    ):
+        card = next(
+            item
+            for item in merged["current"]
+            if item["id"]
+            == f"postdeadline-standard-official{order}-{task_id}"
+        )
+        assert f"task{task_id} QUEUED" in card["title"]
+        assert node in card["title"]
+        assert any("search_only=true" in value for value in card["evidence"])
+        assert any(receipt_sha in value for value in card["evidence"])
 
     handoff = next(item for item in merged["current"] if item["id"] == "fea-handoff")
     assert (
-        handoff["title"] == "SLURM · ALLOCATION JOBS 2 · SUBMITTED 122 · "
-        "RUNNING 2 · QUEUED 2 · COLLECTIONS 0"
+        handoff["title"] == "SLURM · ALLOCATION JOBS 2 · SUBMITTED 125 · "
+        "RUNNING 2 · QUEUED 5 · COLLECTIONS 0"
     )
+    for item in merged["current"]:
+        assert len(item["title"]) <= 160
+        assert len(item["detail"]) <= 1_200
+        assert len(item["evidence"]) <= 12
+        assert all(len(value) <= 500 for value in item["evidence"])
 
 
 def test_merge_upserts_missing_official_task_card_before_parallel() -> None:
@@ -599,15 +669,34 @@ def test_scheduler_reader_uses_bounded_get(monkeypatch: pytest.MonkeyPatch) -> N
     }
 
 
-@pytest.mark.parametrize("spec", updater.TASK_SPECS[-2:])
+@pytest.mark.parametrize(
+    "spec",
+    tuple(
+        spec
+        for spec in updater.TASK_SPECS
+        if spec.max_workers_per_node == 1
+    ),
+)
 def test_official_task_max_workers_is_fail_closed(
     spec: updater.TaskSpec,
 ) -> None:
-    assert spec.task_id in {96328, 96329}
+    assert spec.task_id in {96328, 96329, 96330, 96331, 96332}
     task = _task(spec)
     task["max_workers_per_node"] = 2
 
     with pytest.raises(updater.UpdaterError, match="max_workers_per_node drifted"):
+        updater._validate_task(spec, task)
+
+
+def test_corrected_allocation_force_risk_identity_is_fail_closed() -> None:
+    spec = next(item for item in updater.TASK_SPECS if item.task_id == 96328)
+    task = _task(spec)
+    task["allocation_id"] = 14621
+
+    with pytest.raises(
+        updater.UpdaterError,
+        match="corrected allocation identity drifted",
+    ):
         updater._validate_task(spec, task)
 
 

@@ -33,7 +33,7 @@ DEFAULT_STATUS_FILE = Path(
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
-CAMPAIGN_SUBMITTED_FLOOR = 122
+CAMPAIGN_SUBMITTED_FLOOR = 125
 SYNC_KEY = "postdeadline_task_sync"
 SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
@@ -80,6 +80,11 @@ class TaskSpec:
     search_only: bool = False
     submission_receipt_sha256: str | None = None
     final_seal_sha256: str | None = None
+    expected_allocation_id: int | None = None
+    expected_slurm_job_id: str | None = None
+    allocation_force_cancel_at_kst: str | None = None
+    task_timeout_at_kst: str | None = None
+    force_cancel_lead_seconds: int | None = None
 
 
 TASK_SPECS = (
@@ -158,6 +163,11 @@ TASK_SPECS = (
         final_seal_sha256=(
             "ff034d51e8da2ce97c4cd06f44767131e6d60c01f62d65d58ac0afc9bee4abe6"
         ),
+        expected_allocation_id=14620,
+        expected_slurm_job_id="829579",
+        allocation_force_cancel_at_kst="2026-07-27T04:07:51+09:00",
+        task_timeout_at_kst="2026-07-27T08:09:47+09:00",
+        force_cancel_lead_seconds=14516,
     ),
     TaskSpec(
         task_id=96329,
@@ -181,6 +191,78 @@ TASK_SPECS = (
         ),
         final_seal_sha256=(
             "5319a8a4dceb27082b91fc6badd540221298eeb9f324e2fa30e76e529313d3ec"
+        ),
+    ),
+    TaskSpec(
+        task_id=96330,
+        card_id="postdeadline-standard-official1-96330",
+        task_name=(
+            "mft-goal-diag-standard-postdeadline-official1-"
+            "s96009-896084a59793-n110"
+        ),
+        model_label="STANDARD OFFICIAL #1",
+        candidate_label="official#1 896084a59793",
+        requested_node="n110",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=45300,
+        inner_solver_seconds=43200,
+        requested_account="dhj02",
+        max_workers_per_node=1,
+        search_only=True,
+        submission_receipt_sha256=(
+            "d71987f49b062132fdf90a358bcc819a2cf9fd2e74c76fecad04e22ea9329233"
+        ),
+        final_seal_sha256=(
+            "1c511227687977cbf001a0e4a77c5060d41fcd397b74756062bc6e9feb0f9332"
+        ),
+    ),
+    TaskSpec(
+        task_id=96331,
+        card_id="postdeadline-standard-official12-96331",
+        task_name=(
+            "mft-goal-diag-standard-postdeadline-official12-"
+            "s96185-828cb282cf4f-n112"
+        ),
+        model_label="STANDARD OFFICIAL #12",
+        candidate_label="official#12 828cb282cf4f",
+        requested_node="n112",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=45300,
+        inner_solver_seconds=43200,
+        requested_account="r1jae262",
+        max_workers_per_node=1,
+        search_only=True,
+        submission_receipt_sha256=(
+            "2e207daa33165e8921816e56beb2458d1dcd8515d6cb0b8d5a25cb0cf3cde532"
+        ),
+        final_seal_sha256=(
+            "a743046a7a878030a538988e1c5e9270de1ef56a8e541e0130c5b55cc764937a"
+        ),
+    ),
+    TaskSpec(
+        task_id=96332,
+        card_id="postdeadline-standard-official5-96332",
+        task_name=(
+            "mft-goal-diag-standard-postdeadline-official5-"
+            "s95913-909d249ebe45-n115"
+        ),
+        model_label="STANDARD OFFICIAL #5",
+        candidate_label="official#5 909d249ebe45",
+        requested_node="n115",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=45300,
+        inner_solver_seconds=43200,
+        requested_account="jji0930",
+        max_workers_per_node=1,
+        search_only=True,
+        submission_receipt_sha256=(
+            "4275d9e8e004f3f9f57d9483ca9e7b8a48d410778f39a80848c95c396ed2171c"
+        ),
+        final_seal_sha256=(
+            "ed28dd4d0c4ec904d2910323bc63bee2e13afddb59cd8e4d7f1a9d3d11487477"
         ),
     ),
 )
@@ -418,6 +500,21 @@ def _validate_task(spec: TaskSpec, task: Mapping[str, Any]) -> dict[str, Any]:
         if spec.requested_account not in accounts:
             raise UpdaterError(f"task{spec.task_id} account drifted")
     state = _task_state(task)
+    if (
+        spec.expected_allocation_id is not None
+        and task.get("allocation_id") != spec.expected_allocation_id
+    ):
+        raise UpdaterError(
+            f"task{spec.task_id} corrected allocation identity drifted"
+        )
+    if (
+        spec.expected_slurm_job_id is not None
+        and str(task.get("slurm_job_id") or "")
+        != spec.expected_slurm_job_id
+    ):
+        raise UpdaterError(
+            f"task{spec.task_id} corrected Slurm job identity drifted"
+        )
     actual_node = str(
         task.get("actual_node_name") or task.get("allocation_node_name") or ""
     )
@@ -470,6 +567,80 @@ def _category(state: str) -> str:
     raise UpdaterError(f"unsupported normalized state: {state}")
 
 
+def _aware_timestamp(value: str, label: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise UpdaterError(f"{label} is not ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise UpdaterError(f"{label} must include a UTC offset")
+    return parsed
+
+
+def _duration_text(seconds: int) -> str:
+    value = max(0, int(seconds))
+    hours, remainder = divmod(value, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}h{minutes:02d}m{secs:02d}s"
+
+
+def _force_cancel_risk(
+    spec: TaskSpec,
+    *,
+    category: str,
+    observed_at: str,
+) -> dict[str, Any] | None:
+    fields = (
+        spec.allocation_force_cancel_at_kst,
+        spec.task_timeout_at_kst,
+        spec.force_cancel_lead_seconds,
+    )
+    if fields == (None, None, None):
+        return None
+    if any(value is None for value in fields):
+        raise UpdaterError(
+            f"task{spec.task_id} force-cancel risk contract is incomplete"
+        )
+    force_at = _aware_timestamp(
+        str(spec.allocation_force_cancel_at_kst),
+        f"task{spec.task_id} allocation force boundary",
+    )
+    timeout_at = _aware_timestamp(
+        str(spec.task_timeout_at_kst),
+        f"task{spec.task_id} timeout boundary",
+    )
+    observed = _aware_timestamp(observed_at, "observed_at")
+    lead_seconds = int((timeout_at - force_at).total_seconds())
+    if (
+        lead_seconds != spec.force_cancel_lead_seconds
+        or lead_seconds <= 0
+        or spec.expected_allocation_id is None
+    ):
+        raise UpdaterError(
+            f"task{spec.task_id} force-cancel risk timing drifted"
+        )
+    remaining_seconds = int((force_at - observed).total_seconds())
+    if category in {"running", "queued"}:
+        lifecycle_note = (
+            f"{_duration_text(remaining_seconds)} remaining"
+            if remaining_seconds > 0
+            else "boundary passed; live Scheduler state remains authoritative"
+        )
+        active = True
+    else:
+        lifecycle_note = "terminal lifecycle; historical operational risk"
+        active = False
+    return {
+        "allocation_id": spec.expected_allocation_id,
+        "force_at": force_at,
+        "timeout_at": timeout_at,
+        "lead_seconds": lead_seconds,
+        "remaining_seconds": remaining_seconds,
+        "lifecycle_note": lifecycle_note,
+        "active": active,
+    }
+
+
 def _task_card(
     spec: TaskSpec,
     task: Mapping[str, Any],
@@ -489,7 +660,21 @@ def _task_card(
     else:
         stage = "QUEUED"
         progress = 0
-    title = f"POST-DEADLINE {spec.model_label} · task{spec.task_id} {stage} · {node}"
+    force_risk = _force_cancel_risk(
+        spec,
+        category=category,
+        observed_at=observed_at,
+    )
+    risk_title = ""
+    if force_risk is not None and force_risk["active"]:
+        risk_title = (
+            " · FORCE-CANCEL RISK "
+            f"{force_risk['force_at']:%m-%d %H:%M:%S KST}"
+        )
+    title = (
+        f"POST-DEADLINE {spec.model_label} · task{spec.task_id} {stage} · "
+        f"{node}{risk_title}"
+    )
     allocation = task["allocation_id"] or "none"
     job = task["slurm_job_id"] or "none"
     lifecycle = (
@@ -513,6 +698,17 @@ def _task_card(
         f"{spec.candidate_label} post-deadline diagnostic/noncanonical 작업. "
         f"{lifecycle} {outcome}"
     )
+    if force_risk is not None:
+        detail += (
+            f" allocation{force_risk['allocation_id']}의 source-derived "
+            f"force-cancel 경계는 "
+            f"{force_risk['force_at']:%Y-%m-%d %H:%M:%S KST}이며 "
+            f"task timeout "
+            f"{force_risk['timeout_at']:%Y-%m-%d %H:%M:%S KST}보다 "
+            f"{_duration_text(force_risk['lead_seconds'])} 빠릅니다. "
+            f"{force_risk['lifecycle_note']}; 이는 operational risk이며 "
+            "scientific infeasibility 판정이 아닙니다."
+        )
     evidence = [
         (
             f"Scheduler GET task{spec.task_id} {str(task['state']).upper()} / "
@@ -538,6 +734,24 @@ def _task_card(
         )
     if spec.final_seal_sha256 is not None:
         evidence.append(f"final seal SHA256 {spec.final_seal_sha256}")
+    if force_risk is not None:
+        evidence.extend(
+            [
+                (
+                    f"allocation{force_risk['allocation_id']} source-derived "
+                    f"force-cancel boundary "
+                    f"{force_risk['force_at']:%Y-%m-%d %H:%M:%S KST}"
+                ),
+                (
+                    f"task timeout boundary "
+                    f"{force_risk['timeout_at']:%Y-%m-%d %H:%M:%S KST} / "
+                    f"force boundary leads by "
+                    f"{_duration_text(force_risk['lead_seconds'])} / "
+                    "hard residual guarantee=false / operational risk only / "
+                    "scientific infeasibility=false"
+                ),
+            ]
+        )
     if task["failure_message"]:
         evidence.append(f"failure_message={task['failure_message']}")
     return {
@@ -983,6 +1197,18 @@ def _parallel_workstreams_card(
     queued: int,
 ) -> dict[str, Any]:
     terminal = len(TASK_SPECS) - running - queued
+    operational_risks = [
+        (spec, risk)
+        for spec in TASK_SPECS
+        if (
+            risk := _force_cancel_risk(
+                spec,
+                category=categories[spec.task_id],
+                observed_at=observed_at,
+            )
+        )
+        is not None
+    ]
     active_nodes = list(
         dict.fromkeys(
             str(tasks[spec.task_id]["actual_node_name"] or spec.requested_node)
@@ -990,7 +1216,11 @@ def _parallel_workstreams_card(
             if categories[spec.task_id] in {"running", "queued"}
         )
     )
-    nodes = " + ".join(active_nodes) if active_nodes else "NO ACTIVE NODES"
+    nodes = (
+        f"ACTIVE NODES {len(active_nodes)}"
+        if active_nodes
+        else "NO ACTIVE NODES"
+    )
     evidence = [
         (
             f"active allocations{allocation_jobs} / running{running} / "
@@ -1008,17 +1238,32 @@ def _parallel_workstreams_card(
         for spec in TASK_SPECS
     )
     evidence.extend(
-        [
-            "all managed post-deadline tasks are diagnostic/noncanonical",
-            "Scheduler methods used: GET only",
-            "scientific_pass_generated=false / canonical_promotion=false",
-        ]
+        (
+            f"RISK task{spec.task_id} allocation{risk['allocation_id']} "
+            f"force-cancel {risk['force_at']:%Y-%m-%d %H:%M:%S KST} / "
+            f"task timeout {risk['timeout_at']:%Y-%m-%d %H:%M:%S KST} / "
+            f"lead {_duration_text(risk['lead_seconds'])} / "
+            "hard guarantee=false"
+        )
+        for spec, risk in operational_risks
+    )
+    evidence.append(
+        "all managed tasks diagnostic/noncanonical / Scheduler GET only / "
+        "scientific_pass_generated=false / canonical_promotion=false"
+    )
+    active_risk_title = "".join(
+        (
+            f" · RISK task{spec.task_id}/allocation{risk['allocation_id']} "
+            f"FORCE {risk['force_at']:%m-%d %H:%M:%S KST}"
+        )
+        for spec, risk in operational_risks
+        if risk["active"]
     )
     return {
         "id": "parallel-workstreams",
         "title": (
             f"PARALLEL TRACKS · RUNNING {running} · QUEUED {queued} · "
-            f"ALLOCATION JOBS {allocation_jobs} · {nodes}"
+            f"ALLOCATION JOBS {allocation_jobs} · {nodes}{active_risk_title}"
         ),
         "detail": (
             f"Scheduler GET-authenticated lifecycle for {len(TASK_SPECS)} managed "
@@ -1131,9 +1376,11 @@ def merge_status(
             + [
                 f"active allocation jobs{allocation_jobs} / running{running} / queued{queued}",
                 f"submitted{submitted} / collections{collections} preserved",
-                "Scheduler methods used: GET only",
-                "scientific_pass_generated=false / canonical_promotion=false",
-                "Scheduler project remains separate from MFT repository",
+                (
+                    "Scheduler GET only / scientific_pass_generated=false / "
+                    "canonical_promotion=false / Scheduler project remains separate "
+                    "from MFT repository"
+                ),
             ],
         }
     )
