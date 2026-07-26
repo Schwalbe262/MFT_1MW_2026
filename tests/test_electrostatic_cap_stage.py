@@ -468,7 +468,9 @@ class ElectrostaticStageMockTests(unittest.TestCase):
         )
         post = SimpleNamespace(
             fields_calculator=fields_calculator,
-            get_scalar_field_value=Mock(return_value=1e-12),
+            get_scalar_field_value=Mock(
+                side_effect=[1e-12, 2e-12, 3e-12]
+            ),
         )
         simulation = Simulation.__new__(Simulation)
         simulation.design1 = SimpleNamespace(
@@ -490,7 +492,7 @@ class ElectrostaticStageMockTests(unittest.TestCase):
         result = simulation.get_turn_graded_capacitance_parameter()
 
         self.assertAlmostEqual(
-            result["C_rx_rx_turn_graded_F"].iloc[0], 16e-12
+            result["C_rx_rx_turn_graded_F"].iloc[0], 96e-12
         )
         self.assertAlmostEqual(
             result["self_inductance_H"].iloc[0], 800e-6
@@ -508,12 +510,38 @@ class ElectrostaticStageMockTests(unittest.TestCase):
             '"section_turn_voltage_weights":{"main":1.0,"side":0.5}',
             result["cap_turn_graded_schedule_json"].iloc[0],
         )
-        post.get_scalar_field_value.assert_called_once_with(
-            "CapTurnGradedEnergyDensity",
-            scalar_function="Integrate",
-            solution="Setup1 : LastAdaptive",
-            object_name=["Region", "CorePad_0", "WcpPad_0"],
-            object_type="volume",
+        self.assertEqual(
+            post.get_scalar_field_value.call_args_list,
+            [
+                call(
+                    "CapTurnGradedEnergyDensity",
+                    scalar_function="Integrate",
+                    solution="Setup1 : LastAdaptive",
+                    object_name="Region",
+                    object_type="volume",
+                ),
+                call(
+                    "CapTurnGradedEnergyDensity",
+                    scalar_function="Integrate",
+                    solution="Setup1 : LastAdaptive",
+                    object_name="CorePad_0",
+                    object_type="volume",
+                ),
+                call(
+                    "CapTurnGradedEnergyDensity",
+                    scalar_function="Integrate",
+                    solution="Setup1 : LastAdaptive",
+                    object_name="WcpPad_0",
+                    object_type="volume",
+                ),
+            ],
+        )
+        self.assertEqual(
+            result["cap_turn_graded_energy_component_count"].iloc[0], 3
+        )
+        self.assertEqual(
+            result["cap_turn_graded_energy_integration_mode"].iloc[0],
+            "sum_individual_region_and_dielectric_volumes",
         )
         self.assertEqual(
             simulation.extraction_attempts["cap_turn_graded_rx"], 1
