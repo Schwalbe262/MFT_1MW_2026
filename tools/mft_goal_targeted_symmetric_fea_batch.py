@@ -146,6 +146,9 @@ THERMAL_RX_INTERFACE_CONTRACT_FIELDS = (
     "thermal_temperature_limiter_max_K",
     "thermal_result_scientific_valid",
 )
+THERMAL_RX_INTERFACE_CONTRACT_VERSIONS = frozenset(
+    {"thermal-rx-block-interface-coverage-v1"}
+)
 THERMAL_INVALID_LOG_MARKERS = (
     "temperature limited to 5.000000e+03",
     "set unpaired interface zone",
@@ -2427,8 +2430,8 @@ def _thermal_scientific_truth_contract(
     )
 
     version = result.get("thermal_rx_block_interface_contract_version")
-    if version is not None and (
-        not isinstance(version, str) or not version.strip()
+    if version is not None and version not in (
+        THERMAL_RX_INTERFACE_CONTRACT_VERSIONS
     ):
         reasons.append(
             "scientific_contract_invalid:"
@@ -2513,7 +2516,9 @@ def _thermal_scientific_truth_contract(
             name: copy.deepcopy(result.get(name))
             for name in THERMAL_RX_INTERFACE_CONTRACT_FIELDS
         },
-        "contract_version_allowlist_pending": True,
+        "accepted_contract_versions": sorted(
+            THERMAL_RX_INTERFACE_CONTRACT_VERSIONS
+        ),
         "log_markers_scanned": list(THERMAL_INVALID_LOG_MARKERS),
     }
 
