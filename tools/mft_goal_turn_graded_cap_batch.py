@@ -379,11 +379,20 @@ def prepare(
     solver_revision: str,
     library_revision: str,
     variant_ids: tuple[str, ...] | None = None,
+    scheduler_priority: int = 98,
 ) -> Path:
     solver = str(solver_revision).lower()
     library = str(library_revision).lower()
     if not HEX40.fullmatch(solver) or not HEX40.fullmatch(library):
         raise TurnGradedBatchError("full solver/library revisions required")
+    if (
+        isinstance(scheduler_priority, bool)
+        or not isinstance(scheduler_priority, int)
+        or not 0 <= scheduler_priority <= 100
+    ):
+        raise TurnGradedBatchError(
+            "scheduler priority must be an integer in 0..100"
+        )
     campaign, campaign_root = gap_tuner._load_campaign(  # noqa: SLF001
         campaign_path
     )
@@ -463,7 +472,7 @@ def prepare(
                     "cpus": CPUS,
                     "memory_mb": MEMORY_MB,
                     "timeout_seconds": TIMEOUT_SECONDS,
-                    "priority": 98,
+                    "priority": scheduler_priority,
                     "max_workers_per_node": 1,
                     "environment": _core_environment(solver),
                 },
@@ -494,6 +503,7 @@ def prepare(
             "lanes": lanes,
             "lane_count": len(lanes),
             "selected_variant_ids": list(requested_ids),
+            "scheduler_priority": scheduler_priority,
             "parallel_execution_requested": True,
             "symmetric_nonrounded": True,
             "full_model_series_interconnect_attested": False,
@@ -513,6 +523,7 @@ def _load_plan(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     profile = _read(profile_path)
     variant_by_id = {variant["id"]: variant for variant in VARIANTS}
     selected_ids = plan.get("selected_variant_ids")
+    scheduler_priority = plan.get("scheduler_priority", 98)
     selected_variants = (
         [variant_by_id.get(str(item)) for item in selected_ids]
         if isinstance(selected_ids, list)
@@ -524,6 +535,9 @@ def _load_plan(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
         or len(selected_ids) != len(set(selected_ids))
         or plan.get("lane_count") != len(selected_variants)
         or len(plan.get("lanes") or []) != len(selected_variants)
+        or isinstance(scheduler_priority, bool)
+        or not isinstance(scheduler_priority, int)
+        or not 0 <= scheduler_priority <= 100
         or [
             lane.get("variant") for lane in plan.get("lanes") or []
         ] != selected_variants
@@ -554,6 +568,7 @@ def _load_plan(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
             or identity["parameter_digest"] != scheduler["parameter_digest"]
             or _sha(identity["merged"])
             != scheduler["effective_params_sha256"]
+            or scheduler.get("priority") != scheduler_priority
             or scheduler["dedupe_key"] in identities
         ):
             raise TurnGradedBatchError("lane identity drifted")
@@ -926,6 +941,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare_cmd.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     prepare_cmd.add_argument("--solver-revision", required=True)
     prepare_cmd.add_argument("--library-revision", required=True)
+    prepare_cmd.add_argument("--priority", type=int, default=98)
     prepare_cmd.add_argument(
         "--variant-ids",
         nargs="+",
@@ -956,6 +972,7 @@ def main() -> int:
             variant_ids=(
                 tuple(args.variant_ids) if args.variant_ids is not None else None
             ),
+            scheduler_priority=args.priority,
         )
     elif args.command == "submit":
         path = submit(
