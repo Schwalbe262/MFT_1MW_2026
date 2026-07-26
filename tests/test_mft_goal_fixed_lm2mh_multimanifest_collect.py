@@ -88,6 +88,37 @@ def test_highest_successful_retry_wins_after_newer_retry_fails():
     assert [entry["task_id"] for entry in selected] == [96_741]
 
 
+def test_multi_seed_retry_manifest_is_an_exact_replacement_source(
+    tmp_path, monkeypatch
+):
+    directory = (
+        tmp_path / "fixed_lm2mh_splittemp_v3_retry_seeds0237_0238"
+    )
+    directory.mkdir()
+    path = directory / "submission_manifest.json"
+    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(collector, "RETRY_SEARCH_ROOTS", (tmp_path,))
+    seeds = (2_707_277_237, 2_707_277_238)
+    task_ids = (97_030, 97_031)
+    manifest = {
+        "campaign_id": collector.ROLLING_CAMPAIGN_ID,
+        "hard_spec_sha256": collector.SPLITTEMP_HARD_SPEC_SHA256,
+        "runner_source_sha256": "a" * 64,
+        "payload_sha256": "b" * 64,
+        "campaign_total_seed_count": 512,
+        "submissions": [
+            {"seed": seed, "task_id": task_id}
+            for seed, task_id in zip(seeds, task_ids)
+        ],
+    }
+
+    spec = collector._source_spec(path, manifest)
+
+    assert spec["replacement"] is True
+    assert spec["seeds"] == seeds
+    assert spec["task_ids"] == task_ids
+
+
 def test_splittemp_rows_are_not_relaxed_a_second_time():
     physical = {
         "temperature_robust_limit:T_max_Tx": 5.0,

@@ -373,14 +373,22 @@ def _source_spec(
         if root.exists()
     )
     match = re.fullmatch(
-        r"fixed_lm2mh_splittemp_v[23]_retry_seed(\d{4})",
+        r"fixed_lm2mh_splittemp_v[23]_retry_seed(s?)"
+        r"(\d{4}(?:_\d{4})*)",
         resolved.parent.name,
     )
     entries = list(manifest.get("submissions") or [])
+    declared_offsets = (
+        tuple(int(value) for value in match.group(2).split("_"))
+        if match is not None
+        else ()
+    )
     if (
         not allowed_root
         or match is None
-        or len(entries) != 1
+        or not entries
+        or len(entries) != len(declared_offsets)
+        or (len(entries) == 1) != (match.group(1) == "")
         or manifest.get("campaign_id")
         not in {SPLITTEMP_CAMPAIGN_ID, ROLLING_CAMPAIGN_ID}
         or manifest.get("hard_spec_sha256")
@@ -389,26 +397,37 @@ def _source_spec(
         raise RuntimeError(
             f"manifest is not an exact aggregate source: {resolved}"
         )
-    seed = int(entries[0]["seed"])
-    task_id = int(entries[0]["task_id"])
-    offset = seed - FRESH_SEEDS[0]
+    seeds = tuple(sorted(int(entry["seed"]) for entry in entries))
+    task_ids = tuple(sorted(int(entry["task_id"]) for entry in entries))
+    offsets = tuple(sorted(seed - FRESH_SEEDS[0] for seed in seeds))
     runner = str(manifest.get("runner_source_sha256") or "").lower()
     if (
-        seed not in set(FRESH_SEEDS)
-        or int(match.group(1)) != offset
-        or task_id <= BASE_TASK_BY_SEED[seed]
+        len(set(seeds)) != len(seeds)
+        or len(set(task_ids)) != len(task_ids)
+        or any(seed not in set(FRESH_SEEDS) for seed in seeds)
+        or tuple(sorted(declared_offsets)) != offsets
+        or any(
+            int(entry["task_id"])
+            <= BASE_TASK_BY_SEED[int(entry["seed"])]
+            for entry in entries
+        )
         or not re.fullmatch(r"[0-9a-f]{64}", runner)
     ):
         raise RuntimeError(f"replacement manifest identity drifted: {resolved}")
     return {
-        "label": f"replacement-seed{offset:04d}-task{task_id}",
+        "label": (
+            "replacement-"
+            + "-".join(f"seed{offset:04d}" for offset in offsets)
+            + "-"
+            + "-".join(f"task{task_id}" for task_id in task_ids)
+        ),
         "path": resolved,
         "payload_sha256": manifest["payload_sha256"],
         "campaign_id": manifest["campaign_id"],
         "hard_spec_sha256": SPLITTEMP_HARD_SPEC_SHA256,
         "runner_source_sha256": runner,
-        "seeds": (seed,),
-        "task_ids": (task_id,),
+        "seeds": seeds,
+        "task_ids": task_ids,
         "campaign_total_seed_count": int(
             manifest["campaign_total_seed_count"]
         ),
