@@ -131,6 +131,15 @@ def _mixed_tasks() -> dict[int, dict[str, Any]]:
             specs[4],
             _task(specs[4], allocation_id=105),
         ),
+        specs[5].task_id: updater._validate_task(
+            specs[5],
+            _task(
+                specs[5],
+                state="queued",
+                allocation_id=None,
+                slurm_job_id="",
+            ),
+        ),
     }
 
 
@@ -185,6 +194,39 @@ def _thermal_state(*, watcher_state: str = "running") -> dict[str, Any]:
     )
 
 
+def _continuation_state(
+    *,
+    status: str = "pending_standard_collections",
+) -> dict[str, Any]:
+    submitted = status == "full_submitted_pending_actual_result"
+    return updater._sealed(
+        {
+            "schema_version": updater.STANDARD_FULL_CONTINUATION_STATE_SCHEMA,
+            "observed_at_utc": "2026-07-26T10:21:00+00:00",
+            "original_deadline_missed": True,
+            "postdeadline": True,
+            "canonical": False,
+            "production_eligible": False,
+            "scientific_pass_claimed": False,
+            "full_result_available": False,
+            "full_actual_constraints_passed": False,
+            "promotion_completed": False,
+            "status": status,
+            "source_postsuccess_state": "postsuccess-state.json",
+            "plan": {"path": "plan.json"} if submitted else None,
+            "attempt_ledger": {"path": "attempt.json"} if submitted else None,
+            "submission_receipt": (
+                {"path": "receipt.json"} if submitted else None
+            ),
+            "full_task_id": 97001 if submitted else None,
+            "maximum_scheduler_posts": 1,
+            "scheduler_post_attempts_consumed": 1 if submitted else 0,
+            "scheduler_project_mutation_performed": False,
+            "scheduler_repository_modified": False,
+        }
+    )
+
+
 def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     source = _status()
     completed = copy.deepcopy(source["completed"])
@@ -202,24 +244,31 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["completed"] == completed
     assert merged["attention"] == attention
     assert "18:20 KST" in merged["summary"]
-    assert "running2 · queued1 · terminal2" in merged["summary"]
+    assert "running2 · queued2 · terminal2" in merged["summary"]
     assert "physical feasible0" in merged["summary"]
     assert "scientific/production PASS가 아닙니다" in merged["summary"]
     assert merged["current"][-1] != parallel
     assert merged["current"][-1]["id"] == "parallel-workstreams"
     assert (
-        "RUNNING 2 · QUEUED 1 · ALLOCATION JOBS 2"
+        "RUNNING 2 · QUEUED 2 · ALLOCATION JOBS 2"
         in merged["current"][-1]["title"]
     )
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 2
     assert sync["running"] == 2
-    assert sync["queued"] == 1
-    assert sync["submitted_total"] == 121
+    assert sync["queued"] == 2
+    assert sync["submitted_total"] == 122
     assert sync["collections_preserved"] == 0
     assert sync["scheduler_methods_used"] == ["GET"]
     assert sync["scientific_pass_generated"] is False
-    assert sync["managed_task_ids"] == [96324, 96325, 96326, 96327, 96328]
+    assert sync["managed_task_ids"] == [
+        96324,
+        96325,
+        96326,
+        96327,
+        96328,
+        96329,
+    ]
 
     success = next(
         item
@@ -249,11 +298,22 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         in value
         for value in official["evidence"]
     )
+    official8 = next(
+        item
+        for item in merged["current"]
+        if item["id"] == "postdeadline-standard-official8-96329"
+    )
+    assert "task96329 QUEUED" in official8["title"]
+    assert any(
+        "5319a8a4dceb27082b91fc6badd540221298eeb9f324e2fa30e76e529313d3ec"
+        in value
+        for value in official8["evidence"]
+    )
 
     handoff = next(item for item in merged["current"] if item["id"] == "fea-handoff")
     assert (
-        handoff["title"] == "SLURM · ALLOCATION JOBS 2 · SUBMITTED 121 · "
-        "RUNNING 2 · QUEUED 1 · COLLECTIONS 0"
+        handoff["title"] == "SLURM · ALLOCATION JOBS 2 · SUBMITTED 122 · "
+        "RUNNING 2 · QUEUED 2 · COLLECTIONS 0"
     )
 
 
@@ -340,6 +400,11 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
         json.dumps(_thermal_state(), ensure_ascii=False),
         encoding="utf-8",
     )
+    continuation_path = tmp_path / "standard-full-continuation-state.json"
+    continuation_path.write_text(
+        json.dumps(_continuation_state(), ensure_ascii=False),
+        encoding="utf-8",
+    )
     gate_root = tmp_path / "gate"
     gate_root.mkdir()
     pending = updater._sealed(
@@ -366,6 +431,7 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
         observed_at=OBSERVED,
         postsuccess_state_file=postsuccess_path,
         thermal_bridge_state_file=thermal_path,
+        standard_full_continuation_state_file=continuation_path,
         final_gate_root=gate_root,
     )
 
@@ -390,6 +456,16 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
     assert any(
         "scientific claim=false" in item for item in thermal["evidence"]
     )
+    continuation = by_id["codex-standard-full-continuation"]
+    assert continuation["title"].endswith("PENDING_STANDARD_COLLECTIONS")
+    assert any(
+        "Scheduler POST attempts consumed=0/1" in item
+        for item in continuation["evidence"]
+    )
+    assert any(
+        "scientific PASS=false" in item
+        for item in continuation["evidence"]
+    )
     assert any(
         "full AEDT promoted=false" in item
         for item in by_id["codex-final-aedt-package-gate"]["evidence"]
@@ -409,6 +485,7 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
             observed_at=OBSERVED,
             postsuccess_state_file=postsuccess_path,
             thermal_bridge_state_file=thermal_path,
+            standard_full_continuation_state_file=continuation_path,
             final_gate_root=gate_root,
         )
 
@@ -454,6 +531,37 @@ def test_thermal_bridge_state_absence_and_tamper_fail_closed(
     assert status_file.read_bytes() == before
 
 
+def test_standard_full_continuation_state_tamper_fails_closed(
+    tmp_path: Path,
+) -> None:
+    status_file = tmp_path / "codex-work-status.json"
+    status_file.write_text(
+        json.dumps(_status(), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tasks = {
+        spec.task_id: _task(spec, allocation_id=200 + index)
+        for index, spec in enumerate(updater.TASK_SPECS)
+    }
+    continuation_path = tmp_path / "continuation-state.json"
+    state = _continuation_state()
+    state["scientific_pass_claimed"] = True
+    continuation_path.write_text(
+        json.dumps(state, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    before = status_file.read_bytes()
+
+    with pytest.raises(updater.UpdaterError, match="seal drifted"):
+        updater.synchronize_once(
+            status_file=status_file,
+            task_reader=_reader_from(tasks),
+            observed_at=OBSERVED,
+            standard_full_continuation_state_file=continuation_path,
+        )
+    assert status_file.read_bytes() == before
+
+
 class _Response(io.BytesIO):
     def __init__(self, payload: bytes):
         super().__init__(payload)
@@ -491,9 +599,11 @@ def test_scheduler_reader_uses_bounded_get(monkeypatch: pytest.MonkeyPatch) -> N
     }
 
 
-def test_official_task_max_workers_is_fail_closed() -> None:
-    spec = updater.TASK_SPECS[-1]
-    assert spec.task_id == 96328
+@pytest.mark.parametrize("spec", updater.TASK_SPECS[-2:])
+def test_official_task_max_workers_is_fail_closed(
+    spec: updater.TaskSpec,
+) -> None:
+    assert spec.task_id in {96328, 96329}
     task = _task(spec)
     task["max_workers_per_node"] = 2
 
@@ -546,10 +656,19 @@ def test_cli_modes_and_default_interval() -> None:
     parser = updater._parser()
     assert parser.parse_args(["--once"]).interval_seconds == 60
     parsed = parser.parse_args(
-        ["--watch", "--thermal-bridge-state-file", "thermal.json"]
+        [
+            "--watch",
+            "--thermal-bridge-state-file",
+            "thermal.json",
+            "--standard-full-continuation-state-file",
+            "continuation.json",
+        ]
     )
     assert parsed.watch is True
     assert parsed.thermal_bridge_state_file == Path("thermal.json")
+    assert parsed.standard_full_continuation_state_file == Path(
+        "continuation.json"
+    )
     with pytest.raises(SystemExit):
         parser.parse_args([])
     with pytest.raises(SystemExit):

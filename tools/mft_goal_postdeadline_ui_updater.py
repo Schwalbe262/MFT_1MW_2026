@@ -33,7 +33,7 @@ DEFAULT_STATUS_FILE = Path(
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
-CAMPAIGN_SUBMITTED_FLOOR = 121
+CAMPAIGN_SUBMITTED_FLOOR = 122
 SYNC_KEY = "postdeadline_task_sync"
 SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
@@ -44,6 +44,9 @@ POSTSUCCESS_STATE_SCHEMA = (
 )
 THERMAL_BRIDGE_STATE_SCHEMA = (
     "mft-corrected-thermal-terminal-transport-watch-state-v1"
+)
+STANDARD_FULL_CONTINUATION_STATE_SCHEMA = (
+    "mft-goal-standard-full-continuation-state-v1"
 )
 FINAL_GATE_PENDING_SCHEMA = "mft-goal-final-solver-package-pending-v1"
 FINAL_GATE_SEAL_SCHEMA = "mft-goal-final-solver-package-seal-v1"
@@ -154,6 +157,30 @@ TASK_SPECS = (
         ),
         final_seal_sha256=(
             "ff034d51e8da2ce97c4cd06f44767131e6d60c01f62d65d58ac0afc9bee4abe6"
+        ),
+    ),
+    TaskSpec(
+        task_id=96329,
+        card_id="postdeadline-standard-official8-96329",
+        task_name=(
+            "mft-goal-diag-standard-postdeadline-official8-"
+            "s96141-622097dde126-n114"
+        ),
+        model_label="STANDARD OFFICIAL #8",
+        candidate_label="official#8 622097dde126",
+        requested_node="n114",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=45300,
+        inner_solver_seconds=43200,
+        requested_account="jji0930",
+        max_workers_per_node=1,
+        search_only=True,
+        submission_receipt_sha256=(
+            "8d7e59fe51523f22e3692ef87ee529d619b4a18b5e0a5353664bef9a73500ff5"
+        ),
+        final_seal_sha256=(
+            "5319a8a4dceb27082b91fc6badd540221298eeb9f324e2fa30e76e529313d3ec"
         ),
     ),
 )
@@ -713,6 +740,116 @@ def _thermal_bridge_card(path: Path, observed_at: str) -> dict[str, Any]:
     }
 
 
+def _standard_full_continuation_card(
+    path: Path,
+    observed_at: str,
+) -> dict[str, Any]:
+    value = _read_sealed_local_json(
+        path,
+        schema=STANDARD_FULL_CONTINUATION_STATE_SCHEMA,
+        schema_field="schema_version",
+    )
+    status = str(value.get("status") or "")
+    allowed = {
+        "pending_standard_collections",
+        "terminal_no_measured_pass",
+        "measured_pass_waiting_for_strict_full_lane",
+        "prepared_waiting_for_post_authorization",
+        "full_submitted_pending_actual_result",
+        "submission_outcome_uncertain_no_repost",
+        "fail_closed_retrying_get_gates",
+    }
+    if status not in allowed:
+        raise UpdaterError("Standard-to-Full continuation status drifted")
+    attempts = value.get("scheduler_post_attempts_consumed")
+    if isinstance(attempts, bool) or attempts not in {0, 1}:
+        raise UpdaterError("Standard-to-Full POST counter drifted")
+    full_task_id = _positive_or_none(
+        value.get("full_task_id"),
+        "Standard-to-Full task ID",
+    )
+    attempt = value.get("attempt_ledger")
+    receipt = value.get("submission_receipt")
+    plan = value.get("plan")
+    if (
+        value.get("original_deadline_missed") is not True
+        or value.get("postdeadline") is not True
+        or value.get("canonical") is not False
+        or value.get("production_eligible") is not False
+        or value.get("scientific_pass_claimed") is not False
+        or value.get("full_result_available") is not False
+        or value.get("full_actual_constraints_passed") is not False
+        or value.get("promotion_completed") is not False
+        or value.get("maximum_scheduler_posts") != 1
+        or value.get("scheduler_project_mutation_performed") is not False
+        or value.get("scheduler_repository_modified") is not False
+        or (attempts == 0 and attempt is not None)
+        or (attempts == 1 and not isinstance(attempt, Mapping))
+        or (
+            status == "full_submitted_pending_actual_result"
+            and (
+                full_task_id is None
+                or not isinstance(plan, Mapping)
+                or not isinstance(attempt, Mapping)
+                or not isinstance(receipt, Mapping)
+            )
+        )
+        or (
+            status != "full_submitted_pending_actual_result"
+            and receipt is not None
+        )
+    ):
+        raise UpdaterError("Standard-to-Full safety boundary drifted")
+    updated = str(value.get("observed_at_utc") or "")
+    try:
+        parsed = datetime.fromisoformat(updated)
+    except ValueError as exc:
+        raise UpdaterError(
+            "Standard-to-Full heartbeat timestamp drifted"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise UpdaterError(
+            "Standard-to-Full heartbeat timestamp lacks timezone"
+        )
+    progress = {
+        "pending_standard_collections": 25,
+        "terminal_no_measured_pass": 100,
+        "measured_pass_waiting_for_strict_full_lane": 50,
+        "prepared_waiting_for_post_authorization": 65,
+        "full_submitted_pending_actual_result": 80,
+        "submission_outcome_uncertain_no_repost": 100,
+        "fail_closed_retrying_get_gates": 35,
+    }[status]
+    return {
+        "id": "codex-standard-full-continuation",
+        "title": (
+            "CODEX AUTO · STANDARD→FULL CONTINUATION · "
+            f"{status.upper()}"
+        ),
+        "detail": (
+            "인증된 Standard 실측 hard-feasible rank-0 후보가 생길 때만 "
+            "동일 후보의 Full 계산을 별도 strict-node lane에 최대 한 번 "
+            "연결합니다. Full terminal result 전에는 scientific PASS나 "
+            "promotion을 주장하지 않습니다."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": progress,
+        "evidence": [
+            f"state={status} / Full task={full_task_id or 'none'}",
+            f"Scheduler POST attempts consumed={attempts}/1",
+            (
+                f"plan={str(isinstance(plan, Mapping)).lower()} / "
+                f"receipt={str(isinstance(receipt, Mapping)).lower()}"
+            ),
+            "scientific PASS=false / promotion=false / canonical=false",
+            "Scheduler project mutation=false / repository mixing=false",
+            f"heartbeat updated={updated}",
+            f"state SHA256 {_file_sha256(path.resolve())}",
+        ],
+    }
+
+
 def _final_gate_card(root: Path, observed_at: str) -> dict[str, Any]:
     resolved_root = root.resolve()
     seal_path = resolved_root / FINAL_PACKAGE_NAME / "package_seal.json"
@@ -902,6 +1039,7 @@ def merge_status(
     observed_at: str,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
+    standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
     if payload.get("schema_version") != STATUS_SCHEMA:
@@ -923,6 +1061,14 @@ def merge_status(
         _upsert_current_card(
             result,
             _thermal_bridge_card(thermal_bridge_state_file, observed_at),
+        )
+    if standard_full_continuation_state_file is not None:
+        _upsert_current_card(
+            result,
+            _standard_full_continuation_card(
+                standard_full_continuation_state_file,
+                observed_at,
+            ),
         )
     if final_gate_root is not None:
         _upsert_current_card(
@@ -1066,6 +1212,7 @@ def synchronize_once(
     observed_at: str | None = None,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
+    standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any]:
     tasks = fetch_tasks(scheduler_url, task_reader=task_reader)
@@ -1083,6 +1230,9 @@ def synchronize_once(
         observed_at=observed_at or _timestamp(),
         postsuccess_state_file=postsuccess_state_file,
         thermal_bridge_state_file=thermal_bridge_state_file,
+        standard_full_continuation_state_file=(
+            standard_full_continuation_state_file
+        ),
         final_gate_root=final_gate_root,
     )
     validate_status_sync(updated)
@@ -1129,6 +1279,7 @@ def run_updater(
     sleeper: Callable[[float], None] = time.sleep,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
+    standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
 ) -> dict[str, Any] | None:
     if interval_seconds < 1:
@@ -1166,6 +1317,9 @@ def run_updater(
                     task_reader=task_reader,
                     postsuccess_state_file=postsuccess_state_file,
                     thermal_bridge_state_file=thermal_bridge_state_file,
+                    standard_full_continuation_state_file=(
+                        standard_full_continuation_state_file
+                    ),
                     final_gate_root=final_gate_root,
                 )
                 _append_log(
@@ -1211,6 +1365,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-file", type=Path)
     parser.add_argument("--postsuccess-state-file", type=Path)
     parser.add_argument("--thermal-bridge-state-file", type=Path)
+    parser.add_argument("--standard-full-continuation-state-file", type=Path)
     parser.add_argument("--final-gate-root", type=Path)
     return parser
 
@@ -1228,6 +1383,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         lock_file=args.lock_file or ui_root / "postdeadline-ui-updater.lock",
         postsuccess_state_file=args.postsuccess_state_file,
         thermal_bridge_state_file=args.thermal_bridge_state_file,
+        standard_full_continuation_state_file=(
+            args.standard_full_continuation_state_file
+        ),
         final_gate_root=args.final_gate_root,
     )
     if args.once:
