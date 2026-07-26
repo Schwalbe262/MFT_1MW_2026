@@ -789,7 +789,21 @@ def retained_aedt_identity(
                     "retained Standard profile schema is not reviewed"
                 )
         else:
-            expected_profile_name = "goal_truth_promotion_full.json"
+            expected_profile_name = {
+                "mft-goal-truth-promotion-full-profile-v1": (
+                    "goal_truth_promotion_full.json"
+                ),
+                (
+                    "mft-goal-truth-promotion-full-rounded-final-"
+                    "profile-v1"
+                ): (
+                    "goal_truth_promotion_full_rounded_final.json"
+                ),
+            }.get(str(profile.get("schema_version") or ""))
+            if expected_profile_name is None:
+                raise ValueError(
+                    "retained Full profile schema is not reviewed"
+                )
     else:
         if set(retention) != required:
             raise ValueError("retained AEDT v1 profile contract is invalid")
