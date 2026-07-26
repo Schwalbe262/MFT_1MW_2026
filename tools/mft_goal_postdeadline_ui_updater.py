@@ -431,9 +431,29 @@ ROUNDED_TASK96341_CANCELLATION_SHA256 = (
 ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256 = (
     "80a53b2e8ad1f3e642585b37a05a7806ea4e412f33110f2aaf935402e613108e"
 )
-ROUNDED_DRAWING_VIEW_COUNT = 5
+ROUNDED_DRAWING_SUPPLEMENTAL_MANIFEST_SHA256 = (
+    "279a1aaf7fb1eed66f3897fc33b031491bc87ead4ae5b548379c8c16aeb636a1"
+)
+ROUNDED_DRAWING_VIEW_COUNT = 7
+ROUNDED_DRAWING_READINESS_MANIFEST_SHA256 = (
+    "7e2e37a701dcce423eecf6fb4fd86835448250772d3ba462823901875345aee7"
+)
+ROUNDED_DRAWING_QA_SHA256 = (
+    "229133ffd88aa7a72eecc0561f2246775b7da60a83b2bebe454e5444dd02e528"
+)
+ROUNDED_DRAWING_QA_PASSED = 20
+ROUNDED_DRAWING_DRAFT_PPTX_SHA256 = (
+    "28ddf2ac301f0e0f66a428790766a6340165fdd9b70f98e7703babd6aa801287"
+)
+ROUNDED_DRAWING_DRAFT_PDF_SHA256 = (
+    "1710a2da57392f971a0984cd98187197c4db3008369c01d46805906cd0943b85"
+)
+ROUNDED_DRAWING_DRAFT_PPTX_BYTES = 2_931_000
+ROUNDED_DRAWING_DRAFT_PDF_BYTES = 1_988_478
+ROUNDED_DRAWING_DRAFT_SLIDES = 9
 ROUNDED_FULL_PREPARE_COMMIT = "b4ab0dc"
 ROUNDED_PACKAGE_GATE_COMMIT = "3b43d95"
+ROUNDED_BOUNDED_CORRECTION_COMMIT = "441a29d"
 DRAWING_REFERENCE_PDF_SHA256 = (
     "574d9aab033529cf3655d63542e27871c2e240b669b67e54dbfd2495a564437f"
 )
@@ -2125,17 +2145,17 @@ def _rounded_final_pipeline_card(
         "id": ROUNDED_FINAL_PIPELINE_CARD_ID,
         "title": (
             f"CODEX | ROUNDED FINAL PIPELINE | {task_stage} | "
-            "FULL/GATE PREPARED | DRAWING VIEWS EXPORTED"
+            "DRAWING DRAFT READY (20/20 QA) | FULL GATE SEPARATE"
         ),
         "detail": (
-            "task96340의 rounded 1/8 Standard ThermalSetup을 active 과학 검증 "
-            "lane으로 유지합니다. 실행 중 저장된 GPFS AEDT는 read-only local "
-            "snapshot으로 보존됐지만 file fallback일 뿐 과학 결과가 아닙니다. "
-            "task96341은 잘못된 /enroot helper를 solver 접촉 전에 취소한 운영 "
-            "이력이며 scientific failure 집계에서 제외됩니다. rounded Full "
-            "one-shot/pre-solve checkpoint와 최종 package gate는 준비만 완료했고 "
-            "POST·publish는 0입니다. drawing view export는 5개 PNG와 manifest "
-            "생성을 완료했으며 PPTX/PDF authoring은 아직 대기 중입니다."
+            "Task96340 remains the active rounded 1/8 symmetric scientific "
+            "verification lane. A corrected nine-slide DRAFT PPTX and nine-page "
+            "DRAFT PDF are prepared and passed all 20 readiness/visual QA checks, "
+            "but they remain unpublished and explicitly non-final until the "
+            "task96340 result is authenticated. The symmetric drawing release "
+            "does not require the later Full-model package gate. The bounded "
+            "same-design correction contingency is prepared only and has not "
+            "been submitted."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
@@ -2150,9 +2170,7 @@ def _rounded_final_pipeline_card(
             (
                 f"read-only GPFS snapshot={ROUNDED_SNAPSHOT_SIZE_BYTES:,}B / "
                 f"SHA256 {ROUNDED_SNAPSHOT_SHA256} / "
-                "source before-after identity equal=true"
-            ),
-            (
+                "source before-after identity equal=true / "
                 "snapshot classification=file fallback only / "
                 "solver_result_truth_included=false / scientific_pass=false / "
                 "production_truth_eligible=false"
@@ -2160,18 +2178,14 @@ def _rounded_final_pipeline_card(
             (
                 "task96341 CANCELLED / attach=false / start=false / Slurm job=none / "
                 "solver_contact=false / scientific_failure=false / "
-                "excluded from scientific/effective counts"
-            ),
-            (
+                "excluded from scientific/effective counts / "
                 "task96341 reason=helper targeted /enroot while authenticated "
                 "source MFT_WORKDIR was GPFS; source task96340 remained running"
             ),
             (
                 f"rounded Full lane commit={ROUNDED_FULL_PREPARE_COMMIT} / "
                 "one-shot gate + pre-solve geometry/setup checkpoint prepared / "
-                "Scheduler GET0 POST0 / submit=false"
-            ),
-            (
+                "Scheduler GET0 POST0 / submit=false / "
                 "Full checkpoint diagnostic_only=true / scientific_pass=false / "
                 "thermal_pass=false / production_promotion_eligible=false"
             ),
@@ -2183,7 +2197,23 @@ def _rounded_final_pipeline_card(
             (
                 f"drawing views exported={ROUNDED_DRAWING_VIEW_COUNT} PNG / "
                 "read-only inspection copy / source project save=false / "
-                "solver invoked=false / final PPTX=false / final PDF=false"
+                "solver invoked=false / "
+                f"corrected drawing draft={ROUNDED_DRAWING_DRAFT_SLIDES}-slide "
+                f"PPTX {ROUNDED_DRAWING_DRAFT_PPTX_BYTES:,}B / "
+                f"{ROUNDED_DRAWING_DRAFT_SLIDES}-page PDF "
+                f"{ROUNDED_DRAWING_DRAFT_PDF_BYTES:,}B / "
+                f"QA={ROUNDED_DRAWING_QA_PASSED}/{ROUNDED_DRAWING_QA_PASSED} PASS"
+            ),
+            (
+                "drawing publication=false / final deliverable=false / "
+                "blocked only by authenticated task96340 symmetric FEA result / "
+                "symmetric drawing release gate independent of Full package "
+                "gate=true / full model required for drawing release=false"
+            ),
+            (
+                f"bounded correction contingency commit="
+                f"{ROUNDED_BOUNDED_CORRECTION_COMMIT} / prepare-only / "
+                "Scheduler POST0 / submit=false"
             ),
             (
                 "fixed boundary unchanged=round_corner R10/S4 / fan1.5m/s / "
@@ -2193,7 +2223,16 @@ def _rounded_final_pipeline_card(
                 f"snapshot manifest SHA256 {ROUNDED_SNAPSHOT_MANIFEST_SHA256} / "
                 "task96341 cancellation receipt SHA256 "
                 f"{ROUNDED_TASK96341_CANCELLATION_SHA256} / drawing views "
-                f"manifest SHA256 {ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256}"
+                f"manifest SHA256 {ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256} / "
+                "supplemental manifest SHA256 "
+                f"{ROUNDED_DRAWING_SUPPLEMENTAL_MANIFEST_SHA256}"
+            ),
+            (
+                f"drawing readiness SHA256 "
+                f"{ROUNDED_DRAWING_READINESS_MANIFEST_SHA256} / QA SHA256 "
+                f"{ROUNDED_DRAWING_QA_SHA256} / "
+                f"draft PPTX SHA256 {ROUNDED_DRAWING_DRAFT_PPTX_SHA256} / "
+                f"draft PDF SHA256 {ROUNDED_DRAWING_DRAFT_PDF_SHA256}"
             ),
             (
                 "actual scientific PASS=0 / actual production PASS=0 / "
@@ -2207,20 +2246,21 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": FINAL_DRAWING_CARD_ID,
         "title": (
-            "CODEX | FINAL DRAWING | TEMPLATE AUDIT COMPLETE | "
-            "VIEWS EXPORTED | AUTHORING PENDING"
+            "CODEX | FINAL DRAWING | CORRECTED DRAFT PPTX/PDF READY | "
+            "QA 20/20 PASS | AUTH PENDING"
         ),
         "detail": (
-            "The nine-frame PDF/PPTX drawing template audit is complete and "
-            "source integrity is preserved. A read-only rounded AEDT snapshot "
-            "is available as a file fallback and drawing-view inspection/export "
-            "produced five PNG views without saving the source project or invoking "
-            "a solver. The authenticated final selected model and authored "
-            "PPTX/PDF remain pending."
+            "The corrected nine-slide DRAFT PPTX and nine-page DRAFT PDF are "
+            "prepared from the rounded symmetric inspection model. All 20 "
+            "automated and visual readiness checks pass. The files remain "
+            "unpublished and explicitly non-final pending the authenticated "
+            "task96340 symmetric FEA result. Full-model verification is a "
+            "separate overall-package gate and does not block the symmetric "
+            "drawing release."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 65,
+        "progress_pct": 90,
         "evidence": [
             (
                 "template audit=complete / 설계도면260706.pdf pages=9 / "
@@ -2228,9 +2268,7 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             ),
             (
                 f"source PDF SHA256 {DRAWING_REFERENCE_PDF_SHA256} / "
-                "source unchanged=true (before-after audit)"
-            ),
-            (
+                "source unchanged=true (before-after audit) / "
                 f"source PPTX SHA256 {DRAWING_REFERENCE_PPTX_SHA256} / "
                 "source unchanged=true (before-after audit)"
             ),
@@ -2244,15 +2282,40 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             ),
             (
                 f"drawing views exported={ROUNDED_DRAWING_VIEW_COUNT} PNG / "
-                f"manifest SHA256 {ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256}"
+                f"primary manifest SHA256 {ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256} / "
+                "supplemental manifest SHA256 "
+                f"{ROUNDED_DRAWING_SUPPLEMENTAL_MANIFEST_SHA256}"
             ),
             (
                 "source project save=false / solver invoked=false / "
-                "PPTX authoring=pending / PDF authoring=pending"
+                f"corrected DRAFT PPTX slides={ROUNDED_DRAWING_DRAFT_SLIDES} / "
+                f"corrected DRAFT PDF pages={ROUNDED_DRAWING_DRAFT_SLIDES}"
             ),
             (
-                "final PPTX claimed=false / final PDF claimed=false / "
-                "final deliverable claimed=false"
+                f"drawing readiness QA={ROUNDED_DRAWING_QA_PASSED}/"
+                f"{ROUNDED_DRAWING_QA_PASSED} PASS / "
+                f"manifest SHA256 {ROUNDED_DRAWING_READINESS_MANIFEST_SHA256} / "
+                f"QA SHA256 {ROUNDED_DRAWING_QA_SHA256}"
+            ),
+            (
+                f"draft PPTX={ROUNDED_DRAWING_DRAFT_PPTX_BYTES:,}B / "
+                f"SHA256 {ROUNDED_DRAWING_DRAFT_PPTX_SHA256} / "
+                f"draft PDF={ROUNDED_DRAWING_DRAFT_PDF_BYTES:,}B / "
+                f"SHA256 {ROUNDED_DRAWING_DRAFT_PDF_SHA256}"
+            ),
+            (
+                "Z: publication=false / final PPTX claimed=false / "
+                "final PDF claimed=false / final deliverable claimed=false"
+            ),
+            (
+                "symmetric drawing gate waits only for authenticated task96340 / "
+                "Full package gate is separate=true / "
+                "full model required for drawing release=false"
+            ),
+            (
+                f"bounded correction contingency commit="
+                f"{ROUNDED_BOUNDED_CORRECTION_COMMIT} / prepared=true / "
+                "Scheduler POST0 / submitted=false"
             ),
             (
                 "audit root=C:\\Users\\peets\\slurm_scheduler_runtime\\"

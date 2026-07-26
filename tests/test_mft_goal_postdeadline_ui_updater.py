@@ -289,7 +289,8 @@ def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> 
     )
 
     assert "THERMAL RUNNING" in card["title"]
-    assert "FULL/GATE PREPARED" in card["title"]
+    assert "DRAWING DRAFT READY (20/20 QA)" in card["title"]
+    assert "FULL GATE SEPARATE" in card["title"]
     assert any(
         "task96341 CANCELLED" in value
         and "attach=false" in value
@@ -310,6 +311,36 @@ def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> 
     assert any(
         f"commit={updater.ROUNDED_PACKAGE_GATE_COMMIT}" in value
         and "package publish=false" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        f"QA={updater.ROUNDED_DRAWING_QA_PASSED}/"
+        f"{updater.ROUNDED_DRAWING_QA_PASSED} PASS" in value
+        and f"{updater.ROUNDED_DRAWING_DRAFT_SLIDES}-slide PPTX" in value
+        and f"{updater.ROUNDED_DRAWING_DRAFT_SLIDES}-page PDF" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "drawing publication=false" in value
+        and "blocked only by authenticated task96340" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "symmetric drawing release gate independent of Full package gate=true"
+        in value
+        and "full model required for drawing release=false" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        f"commit={updater.ROUNDED_BOUNDED_CORRECTION_COMMIT}" in value
+        and "prepare-only" in value
+        and "Scheduler POST0" in value
+        and "submit=false" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "actual scientific PASS=0" in value
+        and "actual production PASS=0" in value
         for value in card["evidence"]
     )
 
@@ -592,11 +623,11 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == updater.FINAL_DRAWING_CARD_ID
     )
     assert drawing["title"] == (
-        "CODEX | FINAL DRAWING | TEMPLATE AUDIT COMPLETE | "
-        "VIEWS EXPORTED | AUTHORING PENDING"
+        "CODEX | FINAL DRAWING | CORRECTED DRAFT PPTX/PDF READY | "
+        "QA 20/20 PASS | AUTH PENDING"
     )
     assert drawing["state"] == "in_progress"
-    assert drawing["progress_pct"] == 65
+    assert drawing["progress_pct"] == 90
     assert any(
         "설계도면260706.pdf pages=9" in value
         and "설계도면260706.pptx slides=9" in value
@@ -622,12 +653,44 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert any(
         f"drawing views exported={updater.ROUNDED_DRAWING_VIEW_COUNT} PNG" in value
         and updater.ROUNDED_DRAWING_VIEWS_MANIFEST_SHA256 in value
+        and updater.ROUNDED_DRAWING_SUPPLEMENTAL_MANIFEST_SHA256 in value
         for value in drawing["evidence"]
     )
     assert any(
-        "final PPTX claimed=false" in value
+        f"drawing readiness QA={updater.ROUNDED_DRAWING_QA_PASSED}/"
+        f"{updater.ROUNDED_DRAWING_QA_PASSED} PASS" in value
+        and updater.ROUNDED_DRAWING_READINESS_MANIFEST_SHA256 in value
+        and updater.ROUNDED_DRAWING_QA_SHA256 in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        updater.ROUNDED_DRAWING_DRAFT_PPTX_SHA256 in value
+        and f"{updater.ROUNDED_DRAWING_DRAFT_PPTX_BYTES:,}B" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        updater.ROUNDED_DRAWING_DRAFT_PDF_SHA256 in value
+        and f"{updater.ROUNDED_DRAWING_DRAFT_PDF_BYTES:,}B" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        "Z: publication=false" in value
+        and "final PPTX claimed=false" in value
         and "final PDF claimed=false" in value
         and "final deliverable claimed=false" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        "symmetric drawing gate waits only for authenticated task96340" in value
+        and "Full package gate is separate=true" in value
+        and "full model required for drawing release=false" in value
+        for value in drawing["evidence"]
+    )
+    assert any(
+        f"commit={updater.ROUNDED_BOUNDED_CORRECTION_COMMIT}" in value
+        and "prepared=true" in value
+        and "Scheduler POST0" in value
+        and "submitted=false" in value
         for value in drawing["evidence"]
     )
     assert merged["unknown_top_level"] == {"preserve": True}
@@ -767,8 +830,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == updater.ROUNDED_FINAL_PIPELINE_CARD_ID
     )
     assert "STANDARD QUEUED" in pipeline["title"]
-    assert "FULL/GATE PREPARED" in pipeline["title"]
-    assert "DRAWING VIEWS EXPORTED" in pipeline["title"]
+    assert "DRAWING DRAFT READY (20/20 QA)" in pipeline["title"]
+    assert "FULL GATE SEPARATE" in pipeline["title"]
     assert any(
         "task96341 CANCELLED" in value
         and "scientific_failure=false" in value
@@ -793,6 +856,19 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert any(
         f"drawing views exported={updater.ROUNDED_DRAWING_VIEW_COUNT} PNG" in value
         and "source project save=false" in value
+        for value in pipeline["evidence"]
+    )
+    assert any(
+        f"QA={updater.ROUNDED_DRAWING_QA_PASSED}/"
+        f"{updater.ROUNDED_DRAWING_QA_PASSED} PASS" in value
+        and f"{updater.ROUNDED_DRAWING_DRAFT_SLIDES}-slide PPTX" in value
+        and f"{updater.ROUNDED_DRAWING_DRAFT_SLIDES}-page PDF" in value
+        for value in pipeline["evidence"]
+    )
+    assert any(
+        f"commit={updater.ROUNDED_BOUNDED_CORRECTION_COMMIT}" in value
+        and "Scheduler POST0" in value
+        and "submit=false" in value
         for value in pipeline["evidence"]
     )
     for task_id, order, node, receipt_sha in (
