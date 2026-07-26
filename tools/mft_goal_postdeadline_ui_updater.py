@@ -64,6 +64,9 @@ LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA = (
 TARGET_AXIS_COLLECTOR_STATE_SCHEMA = (
     "mft-goal-fixed-lm2mh-targeted-global-nds-v3"
 )
+TARGET_AXIS_PARETO_MANIFEST_SCHEMA = (
+    "mft-goal-fixed-lm2mh-targeted-pareto-manifest-v3"
+)
 REFERENCE_THERMAL_TERMINAL_SCHEMA = (
     "mft-reference-gui-thermal-terminal-state-v1"
 )
@@ -1656,6 +1659,42 @@ def _target_axis_collector_state(
         != TARGET_AXIS_EXPECTED_SEED_COUNT
     ):
         raise UpdaterError("target-axis final collector coverage drifted")
+    if value.get("global_nds_final") is True:
+        manifest_path = path.resolve().parent / "global_pareto_manifest.json"
+        manifest = _read_sealed_local_json(
+            manifest_path,
+            schema=TARGET_AXIS_PARETO_MANIFEST_SCHEMA,
+        )
+        if (
+            value.get("pareto_manifest_payload_sha256")
+            != manifest.get("payload_sha256")
+            or manifest.get("campaign_id") != TARGET_AXIS_CAMPAIGN
+            or manifest.get("aggregate_hard_spec_sha256")
+            != TARGET_AXIS_HARD_SHA256
+            or manifest.get("source_seed_count")
+            != TARGET_AXIS_EXPECTED_SEED_COUNT
+            or manifest.get("source_raw_terminal_row_count")
+            != TARGET_AXIS_EXPECTED_RAW_ROWS
+            or manifest.get("global_non_dominated_sorting_complete")
+            is not True
+            or manifest.get("screening_only") is not True
+            or manifest.get("production_eligible") is not False
+            or manifest.get("geometry_deduplicated_candidate_count")
+            != value.get("geometry_deduplicated_candidate_count")
+            or manifest.get("global_screening_feasible_count")
+            != value.get("global_screening_feasible_count")
+            or manifest.get("global_pareto_count")
+            != value.get("partial_screening_pareto_count")
+            or manifest.get("conditional_nonthermal_pareto_count")
+            != value.get("partial_conditional_nonthermal_pareto_count")
+            or manifest.get("minimum_violation_objective_front_count")
+            != value.get(
+                "partial_minimum_violation_objective_front_count"
+            )
+            or manifest.get("fea_acquisition_candidate_count")
+            != value.get("fea_acquisition_candidate_count")
+        ):
+            raise UpdaterError("target-axis final Pareto manifest drifted")
     return value
 
 
@@ -3282,15 +3321,20 @@ def _target_axis_card(
                     "GLOBAL NDS COMPLETE | FINAL528 | SEEDS "
                     f"{collector_success}/528 | RAW {raw_rows} | "
                     f"UNIQUE {unique_rows} | "
-                    f"FEASIBLE {feasible} | PARETO {pareto_count} | "
+                    f"HARD-FEASIBLE {feasible} | "
+                    f"PRODUCTION FRONT {pareto_count} | "
                     f"FEA {acquisition_count} | SYM96743 "
                     f"{symmetric_retry_state}"
                 ),
                 "detail": (
                     "All 16 legacy and 512 fresh split-temperature NSGA-II "
                     "logical seeds completed, and the authenticated 168,960-row "
-                    "cross-seed global non-dominated sorting is final. Its "
-                    "thermal values remain screening-only; production promotion "
+                    "cross-seed global non-dominated sorting is final. The "
+                    "production Front contains hard-feasible rows only; an "
+                    "empty Front means no production candidate was found. "
+                    "Minimum-violation and conditional Fronts are diagnostic "
+                    "only and must never be shown as feasible or production. "
+                    "Thermal values remain screening-only; production promotion "
                     "still requires the standard/unrounded symmetric FEA gate."
                 ),
                 "progress_pct": 100,
@@ -3302,10 +3346,12 @@ def _target_axis_card(
                         f"unique geometry={unique_rows}"
                     ),
                     (
-                        f"screening feasible={feasible} / global Pareto="
-                        f"{pareto_count} / strict nonthermal conditional="
-                        f"{conditional_count} / least-violation objective "
-                        f"front={least_violation_count}"
+                        f"hard-feasible screening rows={feasible} / production "
+                        f"hard-feasible volume-loss Pareto={pareto_count} / "
+                        f"conditional nonthermal diagnostic Front="
+                        f"{conditional_count} / minimum-violation 3-objective "
+                        f"diagnostic Front={least_violation_count} / "
+                        "diagnostic Fronts are never feasible/production"
                     ),
                     (
                         "symmetric-unrounded FEA acquisition candidates="
@@ -3315,7 +3361,9 @@ def _target_axis_card(
                     (
                         f"collector={DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE} / "
                         "collector payload sha256="
-                        f"{collector_status['payload_sha256']}"
+                        f"{collector_status['payload_sha256']} / Pareto "
+                        "manifest payload sha256="
+                        f"{collector_status['pareto_manifest_payload_sha256']}"
                     ),
                     *card["evidence"][:6],
                     card["evidence"][6],

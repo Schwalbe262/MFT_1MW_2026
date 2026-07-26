@@ -608,6 +608,114 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     ) < 256 * 1024
 
 
+def test_final528_card_keeps_empty_production_front_separate_from_diagnostics(
+) -> None:
+    collector = {
+        "global_nds_final": True,
+        "final_files_written": True,
+        "successful_terminal_seed_count": 528,
+        "raw_terminal_row_count": 168_960,
+        "geometry_deduplicated_candidate_count": 2_800,
+        "global_screening_feasible_count": 0,
+        "partial_screening_pareto_count": 0,
+        "partial_conditional_nonthermal_pareto_count": 0,
+        "partial_minimum_violation_objective_front_count": 73,
+        "fea_acquisition_candidate_count": 12,
+        "payload_sha256": "a" * 64,
+        "pareto_manifest_payload_sha256": "b" * 64,
+    }
+
+    card = updater._target_axis_card(
+        _mixed_auxiliary_tasks(),
+        observed_at=OBSERVED,
+        collector_status=collector,
+    )
+
+    assert "GLOBAL NDS COMPLETE" in card["title"]
+    assert "HARD-FEASIBLE 0" in card["title"]
+    assert "PRODUCTION FRONT 0" in card["title"]
+    assert "empty Front means no production candidate" in card["detail"]
+    assert "diagnostic only" in card["detail"]
+    assert any(
+        "production hard-feasible volume-loss Pareto=0" in value
+        and "minimum-violation 3-objective diagnostic Front=73" in value
+        and "never feasible/production" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "collector payload sha256=" + "a" * 64 in value
+        and "Pareto manifest payload sha256=" + "b" * 64 in value
+        for value in card["evidence"]
+    )
+
+
+def test_final_collector_loader_requires_matching_sealed_pareto_manifest(
+    tmp_path: Path,
+) -> None:
+    status_path = tmp_path / "collector_status.json"
+    manifest_path = tmp_path / "global_pareto_manifest.json"
+    manifest = {
+        "schema_version": updater.TARGET_AXIS_PARETO_MANIFEST_SCHEMA,
+        "campaign_id": updater.TARGET_AXIS_CAMPAIGN,
+        "aggregate_hard_spec_sha256": updater.TARGET_AXIS_HARD_SHA256,
+        "source_seed_count": 528,
+        "source_raw_terminal_row_count": 168_960,
+        "geometry_deduplicated_candidate_count": 2_800,
+        "global_screening_feasible_count": 0,
+        "global_pareto_count": 0,
+        "conditional_nonthermal_pareto_count": 0,
+        "minimum_violation_objective_front_count": 73,
+        "fea_acquisition_candidate_count": 12,
+        "global_non_dominated_sorting_complete": True,
+        "screening_only": True,
+        "production_eligible": False,
+    }
+    manifest["payload_sha256"] = updater.canonical_sha256(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+    status = {
+        "schema_version": updater.TARGET_AXIS_COLLECTOR_STATE_SCHEMA,
+        "campaign_id": updater.TARGET_AXIS_CAMPAIGN,
+        "aggregate_hard_spec_sha256": updater.TARGET_AXIS_HARD_SHA256,
+        "expected_seed_count": 528,
+        "expected_legacy_seed_count": 16,
+        "expected_fresh_seed_count": 512,
+        "expected_raw_terminal_row_count": 168_960,
+        "classification": "screening-only",
+        "production_eligible": False,
+        "global_nds_final": True,
+        "final_files_written": True,
+        "successful_terminal_seed_count": 528,
+        "raw_terminal_row_count": 168_960,
+        "geometry_deduplicated_candidate_count": 2_800,
+        "global_screening_feasible_count": 0,
+        "partial_screening_pareto_count": 0,
+        "partial_conditional_nonthermal_pareto_count": 0,
+        "partial_minimum_violation_objective_front_count": 73,
+        "fea_acquisition_candidate_count": 12,
+        "status_counts": {"completed": 528},
+        "pareto_manifest_payload_sha256": manifest["payload_sha256"],
+    }
+    status["payload_sha256"] = updater.canonical_sha256(status)
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False), encoding="utf-8"
+    )
+
+    observed = updater._target_axis_collector_state(status_path)
+
+    assert observed is not None
+    assert observed["global_nds_final"] is True
+    manifest["minimum_violation_objective_front_count"] = 74
+    manifest.pop("payload_sha256")
+    manifest["payload_sha256"] = updater.canonical_sha256(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+    with pytest.raises(updater.UpdaterError, match="Pareto manifest drifted"):
+        updater._target_axis_collector_state(status_path)
+
+
 def test_fresh_splittemp_task_topology_and_turn_strata_are_exact() -> None:
     specs = updater.FRESH_SPLITTEMP_TASK_SPECS
 
