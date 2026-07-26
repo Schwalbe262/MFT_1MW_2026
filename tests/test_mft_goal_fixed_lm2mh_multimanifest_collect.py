@@ -119,6 +119,15 @@ def test_multi_seed_retry_manifest_is_an_exact_replacement_source(
     assert spec["task_ids"] == task_ids
 
 
+def test_collector_parser_can_keep_watching_for_late_retry_manifests():
+    args = collector._parser().parse_args(
+        ["--watch", "--continue-after-failure"]
+    )
+
+    assert args.watch is True
+    assert args.continue_after_failure is True
+
+
 def test_splittemp_rows_are_not_relaxed_a_second_time():
     physical = {
         "temperature_robust_limit:T_max_Tx": 5.0,

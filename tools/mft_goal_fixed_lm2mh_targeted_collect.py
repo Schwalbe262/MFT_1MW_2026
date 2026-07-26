@@ -2118,6 +2118,14 @@ def _parser() -> argparse.ArgumentParser:
         "--scheduler-source", type=Path, default=DEFAULT_SCHEDULER_SOURCE
     )
     parser.add_argument("--watch", action="store_true")
+    parser.add_argument(
+        "--continue-after-failure",
+        action="store_true",
+        help=(
+            "keep watching selected failures so a later exact retry manifest "
+            "can replace them without restarting the collector"
+        ),
+    )
     parser.add_argument("--poll-seconds", type=float, default=20.0)
     return parser
 
@@ -2142,7 +2150,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         if (
             not args.watch
             or result["global_nds_final"]
-            or result["failed_terminal_tasks"]
+            or (
+                result["failed_terminal_tasks"]
+                and not args.continue_after_failure
+            )
         ):
             return (
                 0
