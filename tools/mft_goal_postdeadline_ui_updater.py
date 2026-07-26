@@ -41,6 +41,11 @@ DEFAULT_REFERENCE_BASELINE_GUI_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\local_reference_drawing260706_symmetric_gui_thermal_retry_v2"
 )
+DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\fixed_lm2mh_targeted_w1200_l1000_v1_global_nds"
+    r"\collector_status.json"
+)
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
 CAMPAIGN_SUBMITTED_FLOOR = 130
@@ -54,6 +59,9 @@ THERMAL_BRIDGE_STATE_SCHEMA = "mft-corrected-thermal-terminal-transport-watch-st
 STANDARD_FULL_CONTINUATION_STATE_SCHEMA = "mft-goal-standard-full-continuation-state-v1"
 LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA = (
     "mft-goal-local-symmetric-selection-watch-state-v1"
+)
+TARGET_AXIS_COLLECTOR_STATE_SCHEMA = (
+    "mft-goal-fixed-lm2mh-targeted-global-nds-v1"
 )
 FINAL_GATE_PENDING_SCHEMA = "mft-goal-final-solver-package-pending-v1"
 FINAL_GATE_SEAL_SCHEMA = "mft-goal-final-solver-package-seal-v1"
@@ -1533,6 +1541,34 @@ def _read_sealed_local_json(
     return value
 
 
+def _target_axis_collector_state(
+    path: Path | None,
+) -> dict[str, Any] | None:
+    if path is None or not path.is_file():
+        return None
+    value = _read_sealed_local_json(
+        path,
+        schema=TARGET_AXIS_COLLECTOR_STATE_SCHEMA,
+    )
+    if (
+        value.get("campaign_id") != TARGET_AXIS_CAMPAIGN
+        or value.get("hard_spec_sha256") != TARGET_AXIS_HARD_SHA256
+        or value.get("expected_seed_count") != 16
+        or value.get("expected_raw_terminal_row_count") != 5_120
+        or value.get("classification") != "screening-only"
+        or value.get("production_eligible") is not False
+    ):
+        raise UpdaterError("target-axis collector identity drifted")
+    if value.get("global_nds_final") is True and (
+        value.get("successful_terminal_seed_count") != 16
+        or value.get("raw_terminal_row_count") != 5_120
+        or value.get("final_files_written") is not True
+        or (value.get("status_counts") or {}).get("completed") != 16
+    ):
+        raise UpdaterError("target-axis final collector coverage drifted")
+    return value
+
+
 def _upsert_current_card(payload: dict[str, Any], card: Mapping[str, Any]) -> None:
     current = payload.get("current")
     if not isinstance(current, list):
@@ -2608,6 +2644,79 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
+def _windows_process_snapshot() -> dict[int, tuple[int, str]]:
+    """Return PID -> (parent PID, executable name) without shelling out."""
+
+    if os.name != "nt":
+        return {}
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_ulong),
+            ("cntUsage", ctypes.c_ulong),
+            ("th32ProcessID", ctypes.c_ulong),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", ctypes.c_ulong),
+            ("cntThreads", ctypes.c_ulong),
+            ("th32ParentProcessID", ctypes.c_ulong),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_ulong),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    create_snapshot = kernel32.CreateToolhelp32Snapshot
+    create_snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
+    create_snapshot.restype = ctypes.c_void_p
+    process_first = kernel32.Process32FirstW
+    process_first.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    process_first.restype = ctypes.c_int
+    process_next = kernel32.Process32NextW
+    process_next.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    process_next.restype = ctypes.c_int
+    snapshot = create_snapshot(0x00000002, 0)
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        return {}
+    result: dict[int, tuple[int, str]] = {}
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+        if not process_first(snapshot, ctypes.byref(entry)):
+            return {}
+        while True:
+            result[int(entry.th32ProcessID)] = (
+                int(entry.th32ParentProcessID),
+                str(entry.szExeFile),
+            )
+            entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+            if not process_next(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return result
+
+
+def _descendant_processes(
+    root_pid: int,
+    snapshot: Mapping[int, tuple[int, str]] | None = None,
+) -> list[tuple[int, str]]:
+    observed = dict(snapshot or _windows_process_snapshot())
+    descendants: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent_pid, _name) in observed.items():
+            if pid in descendants:
+                continue
+            if parent_pid == root_pid or parent_pid in descendants:
+                descendants.add(pid)
+                changed = True
+    return sorted(
+        ((pid, observed[pid][1]) for pid in descendants),
+        key=lambda item: item[0],
+    )
+
+
 def _reference_local_stage(root: Path) -> dict[str, Any]:
     resolved = root.resolve()
     run_root = resolved / "simulation" / "simulation1"
@@ -2638,6 +2747,17 @@ def _reference_local_stage(root: Path) -> dict[str, Any]:
     )
     aedt_pid_active = _pid_exists(44520)
     python_pid_active = _pid_exists(34080)
+    descendants = (
+        _descendant_processes(44520)
+        if aedt_pid_active
+        and "Solving design setup ThermalSetup" in stdout_tail
+        else []
+    )
+    fluent_pids = [
+        pid
+        for pid, name in descendants
+        if name.casefold() == "fluent.exe"
+    ]
     return {
         "root": resolved,
         "project_path": project_path,
@@ -2665,6 +2785,11 @@ def _reference_local_stage(root: Path) -> dict[str, Any]:
         "thermal_running": (
             thermal_dispatched and aedt_pid_active and python_pid_active
         ),
+        "fluent_running": bool(fluent_pids),
+        "fluent_pids": fluent_pids,
+        "thermal_process_chain": [
+            {"pid": pid, "name": name} for pid, name in descendants
+        ],
         "result_csv_present": result_csv.is_file(),
         "result_parts_present": (
             result_parts.is_dir() and any(result_parts.glob("*.parquet"))
@@ -2783,6 +2908,7 @@ def _axis_v6_card(
 def _target_axis_card(
     auxiliary_tasks: Mapping[int, Mapping[str, Any]],
     observed_at: str,
+    collector_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     tasks = [auxiliary_tasks[spec.task_id] for spec in TARGET_AXIS_TASK_SPECS]
     categories = [_category(str(task["state"])) for task in tasks]
@@ -2790,6 +2916,44 @@ def _target_axis_card(
     queued = categories.count("queued")
     succeeded = categories.count("succeeded")
     failed = categories.count("failed")
+    collector_final = bool(
+        collector_status
+        and collector_status.get("global_nds_final") is True
+        and collector_status.get("final_files_written") is True
+    )
+    raw_rows = int(
+        (collector_status or {}).get("raw_terminal_row_count") or 0
+    )
+    unique_rows = int(
+        (collector_status or {}).get(
+            "geometry_deduplicated_candidate_count"
+        )
+        or 0
+    )
+    feasible = int(
+        (collector_status or {}).get("global_screening_feasible_count")
+        or 0
+    )
+    pareto_count = int(
+        (collector_status or {}).get("partial_screening_pareto_count")
+        or 0
+    )
+    conditional_count = int(
+        (collector_status or {}).get(
+            "partial_conditional_nonthermal_pareto_count"
+        )
+        or 0
+    )
+    least_violation_count = int(
+        (collector_status or {}).get(
+            "partial_minimum_violation_objective_front_count"
+        )
+        or 0
+    )
+    acquisition_count = int(
+        (collector_status or {}).get("fea_acquisition_candidate_count")
+        or 0
+    )
     task_evidence = []
     for index in range(0, len(tasks), 4):
         group = tasks[index : index + 4]
@@ -2804,7 +2968,7 @@ def _target_axis_card(
                 for task in group
             )
         )
-    return {
+    card = {
         "id": TARGET_AXIS_CARD_ID,
         "title": (
             "AUTHORITATIVE W1200/L1000 TARGET NSGA-II | SUBMITTED 16 | "
@@ -2860,21 +3024,72 @@ def _target_axis_card(
             *task_evidence,
         ],
     }
+    if collector_final:
+        card.update(
+            {
+                "title": (
+                    "AUTHORITATIVE W1200/L1000 TARGET NSGA-II | "
+                    "GLOBAL NDS COMPLETE | SEEDS "
+                    f"{succeeded}/16 | RAW {raw_rows} | UNIQUE {unique_rows} | "
+                    f"FEASIBLE {feasible} | PARETO {pareto_count} | "
+                    f"FEA {acquisition_count}"
+                ),
+                "detail": (
+                    "All 16 targeted fixed-5T/fixed-gap/fixed-Lm2mH NSGA-II "
+                    "seeds completed and the authenticated 5,120-row cross-seed "
+                    "global non-dominated sorting is final. No candidate passed "
+                    "every screening constraint, so the production Pareto Front "
+                    "is empty. The least-violation and symmetric-unrounded FEA "
+                    "acquisition artifacts are complete; surrogate temperatures "
+                    "remain screening-only."
+                ),
+                "progress_pct": 100,
+                "evidence": [
+                    (
+                        "authenticated global collector=FINAL / successful "
+                        f"seeds={int(collector_status['successful_terminal_seed_count'])}"
+                        f"/16 / raw terminal rows={raw_rows}/5120 / "
+                        f"unique geometry={unique_rows}"
+                    ),
+                    (
+                        f"screening feasible={feasible} / global Pareto="
+                        f"{pareto_count} / strict nonthermal conditional="
+                        f"{conditional_count} / least-violation objective "
+                        f"front={least_violation_count}"
+                    ),
+                    (
+                        "symmetric-unrounded FEA acquisition candidates="
+                        f"{acquisition_count} / thermal classification="
+                        "screening-only / production eligible=false"
+                    ),
+                    (
+                        f"collector={DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE} / "
+                        "collector payload sha256="
+                        f"{collector_status['payload_sha256']}"
+                    ),
+                    *card["evidence"],
+                ],
+            }
+        )
+    return card
 
 
 def _reference_baseline_card(
     auxiliary_tasks: Mapping[int, Mapping[str, Any]],
     observed_at: str,
     gui_root: Path,
+    local_stage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     original = auxiliary_tasks[REFERENCE_BASELINE_TASK_SPEC.task_id]
     hedge = auxiliary_tasks[REFERENCE_THERMAL_HEDGE_TASK_SPEC.task_id]
     task = auxiliary_tasks[REFERENCE_DIRECT_TASK_SPEC.task_id]
-    local = _reference_local_stage(gui_root)
+    local = dict(local_stage or _reference_local_stage(gui_root))
     local_gui = "PID44520 ACTIVE" if local["aedt_pid_active"] else "PID44520 EXITED"
     result_present = local["result_csv_present"] or local["result_parts_present"]
     stage = (
-        "THERMAL MESH RUNNING"
+        "FLUENT THERMAL SOLVE RUNNING"
+        if local["fluent_running"]
+        else "THERMAL MESH RUNNING"
         if local["thermal_running"]
         else "MATRIX/CAP COMPLETE · LOSS RUNNING"
         if local["loss_running"]
@@ -2886,8 +3101,13 @@ def _reference_baseline_card(
     )
     local_detail = (
         "Local retry-v2 has completed Matrix (10 passes), Capacitance "
-        "(3 passes), and loss, and PID44520 is now executing the Icepak "
-        "ThermalSetup mesh under controller PID34080."
+        "(3 passes), and loss. AEDT PID44520 has launched the native Fluent "
+        f"thermal solve (Fluent PIDs {local['fluent_pids']}) under controller "
+        "PID34080."
+        if local["fluent_running"]
+        else "Local retry-v2 has completed Matrix (10 passes), Capacitance "
+        "(3 passes), and loss, and PID44520 is executing the Icepak "
+        "ThermalSetup under controller PID34080."
         if local["thermal_running"]
         else "Local retry-v2 has actually completed Matrix (10 passes) and "
         "Capacitance (3 passes), and PID44520 is solving maxwell_loss under "
@@ -2913,7 +3133,9 @@ def _reference_baseline_card(
         "state": "in_progress",
         "updated_at": observed_at,
         "progress_pct": (
-            75
+            85
+            if local["fluent_running"]
+            else 75
             if local["thermal_running"]
             else 65
             if local["loss_running"]
@@ -2941,7 +3163,9 @@ def _reference_baseline_card(
                 f"local AEDT PID44520 active="
                 f"{str(local['aedt_pid_active']).lower()} / "
                 f"python PID34080 active={str(local['python_pid_active']).lower()} / "
-                f"local stage={stage}"
+                f"local stage={stage} / Fluent active="
+                f"{str(local['fluent_running']).lower()} / "
+                f"Fluent PIDs={local['fluent_pids']}"
             ),
             f"local project={local['project_path']}",
             (
@@ -3276,6 +3500,7 @@ def _live_summary(
     queued: int,
     collections: int,
     auxiliary_tasks: Mapping[int, Mapping[str, Any]] | None = None,
+    reference_local: Mapping[str, Any] | None = None,
 ) -> str:
     try:
         observed = datetime.fromisoformat(observed_at)
@@ -3296,6 +3521,13 @@ def _live_summary(
             _category(str(auxiliary_tasks[spec.task_id]["state"]))
             for spec in TARGET_AXIS_TASK_SPECS
         ]
+        reference_phase = (
+            "Fluent thermal solve running"
+            if reference_local and reference_local.get("fluent_running")
+            else "ThermalSetup running"
+            if reference_local and reference_local.get("thermal_running")
+            else "local thermal pending"
+        )
         authoritative = (
             "target tasks96416-96431 "
             f"run{target_categories.count('running')}/"
@@ -3305,7 +3537,7 @@ def _live_summary(
             "Old W1000/L1200 axis-v6 is superseded: raw5120/unique4683, "
             "new-axis geometry217/210, thermal feasible0/PF0; compact "
             "surrogate extrapolation invalid(min302.67C). "
-            f"reference local thermal mesh running; remote96415="
+            f"reference local {reference_phase}; remote96415="
             f"{str(reference['state']).upper()} "
             f"{reference['actual_node_name'] or 'pending'}/"
             f"j{reference['slurm_job_id'] or 'none'}; "
@@ -3424,6 +3656,7 @@ def merge_status(
     observed_at: str,
     auxiliary_tasks: Mapping[int, Mapping[str, Any]] | None = None,
     reference_gui_root: Path | None = None,
+    target_axis_collector_state_file: Path | None = None,
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
     local_symmetric_selection_state_file: Path | None = (
@@ -3437,6 +3670,16 @@ def merge_status(
     result = copy.deepcopy(dict(payload))
     result.pop(SYNC_KEY, None)
     protected_before = _protected_hashes(result)
+    target_axis_collector = _target_axis_collector_state(
+        target_axis_collector_state_file
+    )
+    reference_local = (
+        _reference_local_stage(
+            reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT
+        )
+        if auxiliary_tasks is not None
+        else None
+    )
     if standard_full_continuation_state_file is None:
         _remove_current_card(result, LEGACY_CONTINUATION_CARD_ID)
     if auxiliary_tasks is not None:
@@ -3455,11 +3698,16 @@ def merge_status(
                 auxiliary_tasks,
                 observed_at,
                 reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT,
+                local_stage=reference_local,
             ),
         )
         _upsert_priority_current_card(
             result,
-            _target_axis_card(auxiliary_tasks, observed_at),
+            _target_axis_card(
+                auxiliary_tasks,
+                observed_at,
+                collector_status=target_axis_collector,
+            ),
         )
     else:
         _remove_current_card(result, AXIS_V6_CARD_ID)
@@ -3545,6 +3793,7 @@ def merge_status(
         queued=queued,
         collections=collections,
         auxiliary_tasks=auxiliary_tasks,
+        reference_local=reference_local,
     )
     handoff_task_evidence = [
         (
@@ -3738,6 +3987,54 @@ def merge_status(
                 "generations": 80,
                 "scientific_pass_generated": False,
                 "production_pareto_count": 0,
+                "global_nds_final": bool(
+                    target_axis_collector
+                    and target_axis_collector.get("global_nds_final")
+                    is True
+                ),
+                "collector_status_file": (
+                    str(target_axis_collector_state_file)
+                    if target_axis_collector_state_file is not None
+                    else None
+                ),
+                "collector_payload_sha256": (
+                    target_axis_collector.get("payload_sha256")
+                    if target_axis_collector
+                    else None
+                ),
+                "raw_terminal_rows": (
+                    target_axis_collector.get("raw_terminal_row_count")
+                    if target_axis_collector
+                    else 0
+                ),
+                "unique_geometry": (
+                    target_axis_collector.get(
+                        "geometry_deduplicated_candidate_count"
+                    )
+                    if target_axis_collector
+                    else 0
+                ),
+                "screening_feasible": (
+                    target_axis_collector.get(
+                        "global_screening_feasible_count"
+                    )
+                    if target_axis_collector
+                    else 0
+                ),
+                "least_violation_objective_front": (
+                    target_axis_collector.get(
+                        "partial_minimum_violation_objective_front_count"
+                    )
+                    if target_axis_collector
+                    else 0
+                ),
+                "fea_acquisition_candidates": (
+                    target_axis_collector.get(
+                        "fea_acquisition_candidate_count"
+                    )
+                    if target_axis_collector
+                    else 0
+                ),
             }
             if auxiliary_tasks is not None
             else None,
@@ -3812,6 +4109,9 @@ def synchronize_once(
     auxiliary_task_reader: TaskReader | None = None,
     observed_at: str | None = None,
     reference_gui_root: Path | None = None,
+    target_axis_collector_state_file: Path | None = (
+        DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE
+    ),
     postsuccess_state_file: Path | None = None,
     thermal_bridge_state_file: Path | None = None,
     local_symmetric_selection_state_file: Path | None = (
@@ -3845,6 +4145,7 @@ def synchronize_once(
         reference_gui_root=(
             reference_gui_root or DEFAULT_REFERENCE_BASELINE_GUI_ROOT
         ),
+        target_axis_collector_state_file=target_axis_collector_state_file,
         postsuccess_state_file=postsuccess_state_file,
         thermal_bridge_state_file=thermal_bridge_state_file,
         local_symmetric_selection_state_file=(local_symmetric_selection_state_file),
@@ -3902,6 +4203,9 @@ def run_updater(
     standard_full_continuation_state_file: Path | None = None,
     final_gate_root: Path | None = None,
     reference_gui_root: Path = DEFAULT_REFERENCE_BASELINE_GUI_ROOT,
+    target_axis_collector_state_file: Path | None = (
+        DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE
+    ),
 ) -> dict[str, Any] | None:
     if interval_seconds < 1:
         raise UpdaterError("interval-seconds must be positive")
@@ -3938,6 +4242,9 @@ def run_updater(
                     task_reader=task_reader,
                     auxiliary_task_reader=auxiliary_task_reader,
                     reference_gui_root=reference_gui_root,
+                    target_axis_collector_state_file=(
+                        target_axis_collector_state_file
+                    ),
                     postsuccess_state_file=postsuccess_state_file,
                     thermal_bridge_state_file=thermal_bridge_state_file,
                     local_symmetric_selection_state_file=(
@@ -4003,6 +4310,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_REFERENCE_BASELINE_GUI_ROOT,
     )
+    parser.add_argument(
+        "--target-axis-collector-state-file",
+        type=Path,
+        default=DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE,
+    )
     return parser
 
 
@@ -4027,6 +4339,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         final_gate_root=args.final_gate_root,
         reference_gui_root=args.reference_gui_root,
+        target_axis_collector_state_file=(
+            args.target_axis_collector_state_file
+        ),
     )
     if args.once:
         print(json.dumps(result, sort_keys=True, ensure_ascii=False))
