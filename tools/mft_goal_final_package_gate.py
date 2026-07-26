@@ -24,6 +24,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import time
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -1187,20 +1188,47 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-authority-plan", type=Path, required=True)
     parser.add_argument("--full-retry-plan", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--interval-seconds", type=int, default=60)
+    parser.add_argument("--max-cycles", type=int)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    result = evaluate_and_publish(
-        full_event_path=args.full_event.resolve(strict=True),
-        thermal_event_path=args.thermal_event.resolve(strict=True),
-        authority_plan_path=args.candidate_authority_plan.resolve(strict=True),
-        full_retry_plan_path=args.full_retry_plan.resolve(strict=True),
-        output_root=args.output_root,
-    )
-    print(json.dumps(result, ensure_ascii=True, sort_keys=True))
-    return 0 if result["status"] in {"published", "already_published"} else 2
+    if args.interval_seconds < 1:
+        raise FinalPackageGateError("interval-seconds must be positive")
+    if args.max_cycles is not None and args.max_cycles < 1:
+        raise FinalPackageGateError("max-cycles must be positive")
+    inputs = {
+        "full_event_path": args.full_event.resolve(strict=True),
+        "thermal_event_path": args.thermal_event.resolve(strict=True),
+        "authority_plan_path": args.candidate_authority_plan.resolve(
+            strict=True
+        ),
+        "full_retry_plan_path": args.full_retry_plan.resolve(strict=True),
+        "output_root": args.output_root,
+    }
+    cycles = 0
+    while True:
+        result = evaluate_and_publish(**inputs)
+        print(
+            json.dumps(result, ensure_ascii=True, sort_keys=True),
+            flush=True,
+        )
+        cycles += 1
+        if result["status"] in {"published", "already_published"}:
+            return 0
+        if (
+            not args.watch
+            or result["status"] == "actual_constraints_failed"
+            or (
+                args.max_cycles is not None
+                and cycles >= args.max_cycles
+            )
+        ):
+            return 2
+        time.sleep(args.interval_seconds)
 
 
 if __name__ == "__main__":

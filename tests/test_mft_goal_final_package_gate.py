@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from module import mft_goal_20260726_contract as goal
 from tools import mft_goal_final_package_gate as gate
 from tools import mft_goal_terminal_collector as terminal
@@ -426,3 +428,48 @@ def test_actual_pass_publishes_authenticated_models_and_truth_idempotently(
     assert truth["constraints"]["resonance"]["actual_hz"] == 15_200.0
     assert truth["constraints"]["winding_temperature"]["actual_maximum_c"] == 96.0
     assert truth["open_only_diagnostic_snapshot_promoted"] is False
+
+
+def test_watch_rechecks_mutating_latest_events_without_busy_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    inputs = {
+        name: tmp_path / f"{name}.json"
+        for name in ("full", "thermal", "authority", "retry")
+    }
+    for path in inputs.values():
+        path.write_text("{}\n", encoding="utf-8")
+    calls: list[dict[str, Any]] = []
+    sleeps: list[float] = []
+
+    def evaluate(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"status": "pending"}
+
+    monkeypatch.setattr(gate, "evaluate_and_publish", evaluate)
+    monkeypatch.setattr(gate.time, "sleep", sleeps.append)
+
+    status = gate.main(
+        [
+            "--full-event",
+            str(inputs["full"]),
+            "--thermal-event",
+            str(inputs["thermal"]),
+            "--candidate-authority-plan",
+            str(inputs["authority"]),
+            "--full-retry-plan",
+            str(inputs["retry"]),
+            "--output-root",
+            str(tmp_path / "output"),
+            "--watch",
+            "--interval-seconds",
+            "7",
+            "--max-cycles",
+            "2",
+        ]
+    )
+
+    assert status == 2
+    assert len(calls) == 2
+    assert sleeps == [7]
