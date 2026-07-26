@@ -214,6 +214,19 @@ def _apply_targeted_split_temperature_constraints(
     return physical_g
 
 
+def _physically_decoded_smoke_indices(decoder_valid: Iterable[Any]) -> tuple[int, ...]:
+    """Return only valid rows for physical geometry/G identity checks."""
+
+    indices = tuple(
+        index for index, valid in enumerate(decoder_valid) if bool(valid)
+    )
+    if not indices:
+        raise RuntimeError(
+            "axis-specific smoke produced no physically decoded rows"
+        )
+    return indices
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -1119,7 +1132,9 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
     )
     if expected_limits != required_limits:
         raise RuntimeError("axis-specific size contract drifted")
-    for row_index in range(len(decoded)):
+    for row_index in _physically_decoded_smoke_indices(
+        smoke["decoder_valid"]
+    ):
         _volume, observed_dimensions = (
             runner.modules.geometry_metrics.bounding_box_lit(
                 decoded.iloc[row_index]

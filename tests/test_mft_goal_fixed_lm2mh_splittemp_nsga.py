@@ -49,3 +49,14 @@ def test_split_temperature_transform_changes_only_secondary_constraints():
         [10.0, -5.0, -45.0, -6.0, -44.0, -2.0],
     )
     np.testing.assert_allclose(observed[1], physical_g[1])
+
+
+def test_axis_mapping_smoke_ignores_invalid_decoder_rows():
+    assert campaign._physically_decoded_smoke_indices(
+        [False, True, False, True]
+    ) == (1, 3)
+
+    with np.testing.assert_raises_regex(
+        RuntimeError, "no physically decoded rows"
+    ):
+        campaign._physically_decoded_smoke_indices([False, False])
