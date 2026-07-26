@@ -44,15 +44,9 @@ SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
 LOG_SCHEMA = "mft-goal-postdeadline-ui-updater-event-v1"
 STATUS_SCHEMA = "mft-codex-work-status-v1"
-POSTSUCCESS_STATE_SCHEMA = (
-    "mft-goal-postdeadline-standard-postsuccess-state-v1"
-)
-THERMAL_BRIDGE_STATE_SCHEMA = (
-    "mft-corrected-thermal-terminal-transport-watch-state-v1"
-)
-STANDARD_FULL_CONTINUATION_STATE_SCHEMA = (
-    "mft-goal-standard-full-continuation-state-v1"
-)
+POSTSUCCESS_STATE_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-state-v1"
+THERMAL_BRIDGE_STATE_SCHEMA = "mft-corrected-thermal-terminal-transport-watch-state-v1"
+STANDARD_FULL_CONTINUATION_STATE_SCHEMA = "mft-goal-standard-full-continuation-state-v1"
 LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA = (
     "mft-goal-local-symmetric-selection-watch-state-v1"
 )
@@ -85,6 +79,7 @@ class TaskSpec:
     inner_solver_seconds: int | None = None
     requested_account: str | None = None
     max_workers_per_node: int | None = None
+    expected_same_node_as_task_id: int = 0
     search_only: bool = False
     submission_receipt_sha256: str | None = None
     final_seal_sha256: str | None = None
@@ -161,8 +156,7 @@ TASK_SPECS = (
         task_id=96328,
         card_id="postdeadline-standard-official6-96328",
         task_name=(
-            "mft-goal-diag-standard-postdeadline-official6-"
-            "s96185-2772aed82a8c-n113"
+            "mft-goal-diag-standard-postdeadline-official6-s96185-2772aed82a8c-n113"
         ),
         model_label="STANDARD OFFICIAL #6",
         candidate_label="official#6 2772aed82a8c",
@@ -190,8 +184,7 @@ TASK_SPECS = (
         task_id=96329,
         card_id="postdeadline-standard-official8-96329",
         task_name=(
-            "mft-goal-diag-standard-postdeadline-official8-"
-            "s96141-622097dde126-n114"
+            "mft-goal-diag-standard-postdeadline-official8-s96141-622097dde126-n114"
         ),
         model_label="STANDARD OFFICIAL #8",
         candidate_label="official#8 622097dde126",
@@ -215,8 +208,7 @@ TASK_SPECS = (
         task_id=96330,
         card_id="postdeadline-standard-official1-96330",
         task_name=(
-            "mft-goal-diag-standard-postdeadline-official1-"
-            "s96009-896084a59793-n110"
+            "mft-goal-diag-standard-postdeadline-official1-s96009-896084a59793-n110"
         ),
         model_label="STANDARD OFFICIAL #1",
         candidate_label="official#1 896084a59793",
@@ -239,8 +231,7 @@ TASK_SPECS = (
         task_id=96331,
         card_id="postdeadline-standard-official12-96331",
         task_name=(
-            "mft-goal-diag-standard-postdeadline-official12-"
-            "s96185-828cb282cf4f-n112"
+            "mft-goal-diag-standard-postdeadline-official12-s96185-828cb282cf4f-n112"
         ),
         model_label="STANDARD OFFICIAL #12",
         candidate_label="official#12 828cb282cf4f",
@@ -263,8 +254,7 @@ TASK_SPECS = (
         task_id=96332,
         card_id="postdeadline-standard-official5-96332",
         task_name=(
-            "mft-goal-diag-standard-postdeadline-official5-"
-            "s95913-909d249ebe45-n115"
+            "mft-goal-diag-standard-postdeadline-official5-s95913-909d249ebe45-n115"
         ),
         model_label="STANDARD OFFICIAL #5",
         candidate_label="official#5 909d249ebe45",
@@ -282,6 +272,7 @@ TASK_SPECS = (
         final_seal_sha256=(
             "ed28dd4d0c4ec904d2910323bc63bee2e13afddb59cd8e4d7f1a9d3d11487477"
         ),
+        selection_superseded_by_task_id=96338,
     ),
     TaskSpec(
         task_id=96333,
@@ -308,8 +299,79 @@ TASK_SPECS = (
         ),
         selection_failover_for_task_id=96329,
     ),
+    TaskSpec(
+        task_id=96337,
+        card_id="postdeadline-standard-official5-direct-analyze-96337",
+        task_name=(
+            "mft-goal-diag-standard-official5-direct-analyze-samenode-v1-"
+            "909d249ebe45-n115"
+        ),
+        model_label="STANDARD OFFICIAL #5 DIRECT ANALYZE ATTEMPT",
+        candidate_label="official#5 909d249ebe45 same-node direct Analyze attempt",
+        requested_node="n115",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=45300,
+        inner_solver_seconds=43200,
+        requested_account="jji0930",
+        max_workers_per_node=2,
+        expected_same_node_as_task_id=96332,
+        search_only=True,
+        submission_receipt_sha256=(
+            "c14d491f558308d14c1a151a0a9e63c91997921a09960e858cc495b66652bea4"
+        ),
+        final_seal_sha256=(
+            "fb417009a6af6ce6a734f41ffe7855f4b3d9294454d93e2066c8f06b619448a3"
+        ),
+        expected_allocation_id=14650,
+        expected_slurm_job_id="840582",
+        terminal_failure_override=(
+            "Pre-EM AEDT startup failed because the standalone-core opt-in "
+            "authentication digest did not match. No electromagnetic or thermal "
+            "solve result was produced; this is an operational failure, not a "
+            "physics infeasibility."
+        ),
+        selection_superseded_by_task_id=96338,
+    ),
+    TaskSpec(
+        task_id=96338,
+        card_id="postdeadline-standard-official5-direct-analyze-r1-96338",
+        task_name=(
+            "mft-goal-diag-standard-official5-direct-analyze-samenode-r1-v2-"
+            "909d249ebe45-n115"
+        ),
+        model_label="STANDARD OFFICIAL #5 DIRECT ANALYZE CORRECTED",
+        candidate_label="official#5 909d249ebe45 corrected same-node direct Analyze",
+        requested_node="n115",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=45300,
+        inner_solver_seconds=43200,
+        requested_account="jji0930",
+        max_workers_per_node=2,
+        expected_same_node_as_task_id=96332,
+        search_only=True,
+        submission_receipt_sha256=(
+            "0731cf22e3f78f93da943cc9102b7d96a2719bfbe1ca65e782789b2d98bc30dd"
+        ),
+        final_seal_sha256=(
+            "4e2802cd321727114926da7af8631d8f267fab37fa801d966966fdb54b75946e"
+        ),
+        expected_allocation_id=14650,
+        expected_slurm_job_id="840582",
+        selection_failover_for_task_id=96332,
+    ),
 )
 
+LEGACY_STANDARD_SELECTION_TASK_IDS = (
+    96325,
+    96327,
+    96328,
+    96330,
+    96331,
+    96332,
+    96333,
+)
 STANDARD_SELECTION_TASK_IDS = (
     96325,
     96327,
@@ -317,8 +379,15 @@ STANDARD_SELECTION_TASK_IDS = (
     96333,
     96330,
     96331,
-    96332,
+    96338,
 )
+STANDARD_SELECTION_LIFECYCLE_TASK_IDS = (
+    *LEGACY_STANDARD_SELECTION_TASK_IDS,
+    96337,
+    96338,
+)
+STANDARD_SELECTION_OVERLAY_TASK_IDS = (96337, 96338)
+STANDARD_SELECTION_SUPERSEDED_TASK_IDS = (96332, 96337)
 FULL_REFERENCE_TASK_ID = 96326
 SELECTION_POLICY_CARD_ID = "codex-symmetric-primary-selection-policy"
 LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
@@ -537,7 +606,7 @@ def _validate_task(spec: TaskSpec, task: Mapping[str, Any]) -> dict[str, Any]:
         "cpus": spec.cpus,
         "memory_mb": spec.memory_mb,
         "timeout_seconds": spec.timeout_seconds,
-        "same_node_as_task_id": 0,
+        "same_node_as_task_id": spec.expected_same_node_as_task_id,
     }
     if spec.max_workers_per_node is not None:
         expected["max_workers_per_node"] = spec.max_workers_per_node
@@ -561,17 +630,12 @@ def _validate_task(spec: TaskSpec, task: Mapping[str, Any]) -> dict[str, Any]:
         spec.expected_allocation_id is not None
         and task.get("allocation_id") != spec.expected_allocation_id
     ):
-        raise UpdaterError(
-            f"task{spec.task_id} corrected allocation identity drifted"
-        )
+        raise UpdaterError(f"task{spec.task_id} corrected allocation identity drifted")
     if (
         spec.expected_slurm_job_id is not None
-        and str(task.get("slurm_job_id") or "")
-        != spec.expected_slurm_job_id
+        and str(task.get("slurm_job_id") or "") != spec.expected_slurm_job_id
     ):
-        raise UpdaterError(
-            f"task{spec.task_id} corrected Slurm job identity drifted"
-        )
+        raise UpdaterError(f"task{spec.task_id} corrected Slurm job identity drifted")
     actual_node = str(
         task.get("actual_node_name") or task.get("allocation_node_name") or ""
     )
@@ -673,9 +737,7 @@ def _force_cancel_risk(
         or lead_seconds <= 0
         or spec.expected_allocation_id is None
     ):
-        raise UpdaterError(
-            f"task{spec.task_id} force-cancel risk timing drifted"
-        )
+        raise UpdaterError(f"task{spec.task_id} force-cancel risk timing drifted")
     remaining_seconds = int((force_at - observed).total_seconds())
     if category in {"running", "queued"}:
         lifecycle_note = (
@@ -724,10 +786,7 @@ def _task_card(
     )
     risk_title = ""
     if force_risk is not None and force_risk["active"]:
-        risk_title = (
-            " · FORCE-CANCEL RISK "
-            f"{force_risk['force_at']:%m-%d %H:%M:%S KST}"
-        )
+        risk_title = f" · FORCE-CANCEL RISK {force_risk['force_at']:%m-%d %H:%M:%S KST}"
     title = (
         f"POST-DEADLINE {spec.model_label} · task{spec.task_id} {stage} · "
         f"{node}{risk_title}"
@@ -792,7 +851,10 @@ def _task_card(
             f"cpus{spec.cpus} / memory{spec.memory_mb}MB / "
             f"scheduler timeout{spec.timeout_seconds}s"
         ),
-        "strict node placement contract / same_node_as_task_id=0",
+        (
+            "strict node placement contract / same_node_as_task_id="
+            f"{spec.expected_same_node_as_task_id}"
+        ),
         (
             "postdeadline=true / diagnostic_only=true / noncanonical=true"
             + (" / search_only=true" if spec.search_only else "")
@@ -803,9 +865,7 @@ def _task_card(
     if spec.inner_solver_seconds is not None:
         evidence.insert(2, f"inner solver budget{spec.inner_solver_seconds}s")
     if spec.submission_receipt_sha256 is not None:
-        evidence.append(
-            f"submission receipt SHA256 {spec.submission_receipt_sha256}"
-        )
+        evidence.append(f"submission receipt SHA256 {spec.submission_receipt_sha256}")
     if spec.final_seal_sha256 is not None:
         evidence.append(f"final seal SHA256 {spec.final_seal_sha256}")
     if spec.requested_account is not None:
@@ -823,7 +883,7 @@ def _task_card(
         evidence.append(
             "selection_lane_effective=true / "
             f"failover_for_task{spec.selection_failover_for_task_id}=true / "
-            "official#8_unique_lane=true"
+            "unique_effective_lane=true"
         )
     if force_risk is not None:
         evidence.extend(
@@ -925,8 +985,7 @@ def _upsert_current_card(payload: dict[str, Any], card: Mapping[str, Any]) -> No
         (
             index
             for index, item in enumerate(current)
-            if isinstance(item, dict)
-            and item.get("id") == "parallel-workstreams"
+            if isinstance(item, dict) and item.get("id") == "parallel-workstreams"
         ),
         len(current),
     )
@@ -948,6 +1007,26 @@ def _remove_current_card(payload: dict[str, Any], card_id: str) -> None:
         current.pop(matches[0])
 
 
+def _selection_lifecycle_overlay(
+    tasks: Mapping[int, Mapping[str, Any]] | None,
+) -> tuple[int, int]:
+    """Return uncollected-pending and operational-failure overlay counts."""
+    if tasks is None:
+        return 0, 0
+    pending = 0
+    failures = 0
+    for task_id in STANDARD_SELECTION_OVERLAY_TASK_IDS:
+        if task_id not in tasks:
+            raise UpdaterError(f"selection lifecycle task{task_id} is missing")
+        category = _category(str(tasks[task_id]["state"]))
+        if category == "failed":
+            failures += 1
+        else:
+            # The sealed source collector does not yet authenticate overlay lanes.
+            pending += 1
+    return pending, failures
+
+
 def _symmetric_primary_policy_card(
     tasks: Mapping[int, Mapping[str, Any]],
     observed_at: str,
@@ -957,16 +1036,17 @@ def _symmetric_primary_policy_card(
         for task_id in STANDARD_SELECTION_TASK_IDS
     }
     terminal_count = sum(
-        category in {"succeeded", "failed"}
-        for category in lane_categories.values()
+        category in {"succeeded", "failed"} for category in lane_categories.values()
     )
     full_category = _category(str(tasks[FULL_REFERENCE_TASK_ID]["state"]))
-    lane_ids = ",".join(
-        f"task{task_id}" for task_id in STANDARD_SELECTION_TASK_IDS
-    )
+    lane_ids = ",".join(f"task{task_id}" for task_id in STANDARD_SELECTION_TASK_IDS)
     lane_lifecycle = " / ".join(
         f"task{task_id}:{lane_categories[task_id].upper()}"
         for task_id in STANDARD_SELECTION_TASK_IDS
+    )
+    lifecycle = " / ".join(
+        f"task{task_id}:{_category(str(tasks[task_id]['state'])).upper()}"
+        for task_id in STANDARD_SELECTION_LIFECYCLE_TASK_IDS
     )
     return {
         "id": SELECTION_POLICY_CARD_ID,
@@ -990,10 +1070,16 @@ def _symmetric_primary_policy_card(
             "primary candidate-selection gate=authenticated symmetric/Standard FEA",
             f"Standard selection lanes=7 / {lane_ids}",
             f"lane lifecycle={lane_lifecycle}",
+            f"selection lifecycle observations=9 / {lifecycle}",
             "automatic Standard-to-Full per candidate=false",
             (
                 "effective official#8 selection lane=task96333 / "
                 "task96329 superseded but lifecycle-visible"
+            ),
+            (
+                "effective official#5 selection lane=task96338 / "
+                "task96332 superseded but lifecycle-visible / "
+                "task96337 pre-EM operational failure only"
             ),
             (
                 f"task96326 lifecycle={full_category.upper()} / "
@@ -1001,14 +1087,19 @@ def _symmetric_primary_policy_card(
             ),
             "final explicit Full validation candidate cap=1",
             (
-                "policy card is not result evidence / scientific PASS=false / "
-                "canonical promotion=false / production truth=false"
+                "policy card is not result evidence / actual scientific PASS=0 / "
+                "actual production PASS=0 / canonical promotion=false / "
+                "production truth=false"
             ),
         ],
     }
 
 
-def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
+def _postsuccess_card(
+    path: Path,
+    observed_at: str,
+    tasks: Mapping[int, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     state = _read_sealed_local_json(
         path,
         schema=POSTSUCCESS_STATE_SCHEMA,
@@ -1016,6 +1107,85 @@ def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
     collection_count = int(state.get("collection_count") or 0)
     pending_count = int(state.get("pending_count") or 0)
     failure_count = int(state.get("terminal_failure_count") or 0)
+    authoritative_lifecycle = "lifecycle_task_ids" in state
+    if authoritative_lifecycle:
+        lifecycle_ids = state.get("lifecycle_task_ids")
+        effective_ids = state.get("effective_task_ids")
+        superseded_ids = state.get("selection_superseded_task_ids")
+        lanes = state.get("lanes")
+        lifecycle_collection_count = int(state.get("lifecycle_collection_count") or 0)
+        watcher_pending = int(state.get("lifecycle_pending_count") or 0)
+        watcher_failures = int(state.get("lifecycle_terminal_failure_count") or 0)
+        if (
+            not isinstance(lifecycle_ids, list)
+            or not isinstance(effective_ids, list)
+            or not isinstance(superseded_ids, list)
+            or len(lifecycle_ids) != 9
+            or len(set(lifecycle_ids)) != 9
+            or set(lifecycle_ids) != set(STANDARD_SELECTION_LIFECYCLE_TASK_IDS)
+            or len(effective_ids) != 7
+            or len(set(effective_ids)) != 7
+            or set(effective_ids) != set(STANDARD_SELECTION_TASK_IDS)
+            or set(superseded_ids) != set(STANDARD_SELECTION_SUPERSEDED_TASK_IDS)
+            or not isinstance(lanes, list)
+            or len(lanes) != 9
+            or collection_count + pending_count + failure_count != 7
+            or lifecycle_collection_count + watcher_pending + watcher_failures != 9
+        ):
+            raise UpdaterError("post-success lifecycle contract drifted")
+        lane_status: dict[int, str] = {}
+        for lane in lanes:
+            if not isinstance(lane, Mapping):
+                raise UpdaterError("post-success lifecycle lane drifted")
+            task_id = lane.get("task_id")
+            status = str(lane.get("status") or "")
+            if (
+                isinstance(task_id, bool)
+                or not isinstance(task_id, int)
+                or task_id not in STANDARD_SELECTION_LIFECYCLE_TASK_IDS
+                or task_id in lane_status
+                or status not in {"pending", "collection_ready", "terminal_failure"}
+            ):
+                raise UpdaterError("post-success lifecycle lane drifted")
+            lane_status[task_id] = status
+        if (
+            sum(status == "collection_ready" for status in lane_status.values())
+            != lifecycle_collection_count
+            or sum(status == "pending" for status in lane_status.values())
+            != watcher_pending
+            or sum(status == "terminal_failure" for status in lane_status.values())
+            != watcher_failures
+        ):
+            raise UpdaterError("post-success lifecycle lane counts drifted")
+        current_failure_ids = {
+            task_id
+            for task_id, status in lane_status.items()
+            if status == "terminal_failure"
+        }
+        if tasks is not None:
+            current_failure_ids.update(
+                task_id
+                for task_id in STANDARD_SELECTION_LIFECYCLE_TASK_IDS
+                if _category(str(tasks[task_id]["state"])) == "failed"
+            )
+        current_collection_ids = {
+            task_id
+            for task_id, status in lane_status.items()
+            if status == "collection_ready"
+        } - current_failure_ids
+        lifecycle_failures = len(current_failure_ids)
+        lifecycle_pending = 9 - len(current_collection_ids) - lifecycle_failures
+        lifecycle_mode = "v6-sealed-effective-plus-live-GET-lifecycle"
+        watcher_snapshot = (
+            f"watcher snapshot pending={watcher_pending} / "
+            f"operational terminal failures={watcher_failures}"
+        )
+    else:
+        overlay_pending, overlay_failures = _selection_lifecycle_overlay(tasks)
+        lifecycle_pending = pending_count + overlay_pending
+        lifecycle_failures = failure_count + overlay_failures
+        lifecycle_mode = "v5-overlay-fallback"
+        watcher_snapshot = "watcher snapshot=v5 effective-only"
     if (
         state.get("diagnostic_only") is not True
         or state.get("production_eligible") is not False
@@ -1024,7 +1194,7 @@ def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
         or state.get("production_claimed") is not False
     ):
         raise UpdaterError("post-success automation safety boundary drifted")
-    return {
+    card = {
         "id": "codex-standard-postsuccess-pipeline",
         "title": (
             "CODEX AUTO · STANDARD RESULT PIPELINE · "
@@ -1055,15 +1225,35 @@ def _postsuccess_card(path: Path, observed_at: str) -> dict[str, Any]:
             ),
             (
                 "Standard selection lanes=7 / "
-                + ",".join(
-                    f"task{task_id}"
-                    for task_id in STANDARD_SELECTION_TASK_IDS
-                )
+                + ",".join(f"task{task_id}" for task_id in STANDARD_SELECTION_TASK_IDS)
             ),
             "Scheduler mutation=false / scientific claim=false",
             f"state SHA256 {_file_sha256(path.resolve())}",
         ],
     }
+    card["title"] = (
+        "CODEX AUTO | STANDARD RESULT PIPELINE | "
+        f"AUTH {collection_count} | PENDING {lifecycle_pending} | ACTUAL PASS 0"
+    )
+    card["detail"] = (
+        "Nine lifecycle attempts currently feed seven effective "
+        "symmetry/Standard selection lanes. Collectors authenticate terminal "
+        "artifacts, apply hard constraints and strict-AL admission, then prepare "
+        "measured global NDS inputs. Missing measured results never create a "
+        "scientific or production claim."
+    )
+    card["evidence"][1] = (
+        f"authenticated={collection_count}/7 / pending={lifecycle_pending} / "
+        f"operational terminal failures={lifecycle_failures}"
+    )
+    card["evidence"].insert(
+        -2,
+        f"lifecycle mode={lifecycle_mode} / attempts=9 / selection-effective=7 / "
+        "task96337 failed pre-EM operationally / task96338 current",
+    )
+    card["evidence"].insert(-2, watcher_snapshot)
+    card["evidence"].insert(-2, "actual scientific PASS=0 / actual production PASS=0")
+    return card
 
 
 def _local_selection_fail_safe_card(
@@ -1079,10 +1269,7 @@ def _local_selection_fail_safe_card(
     }[condition]
     return {
         "id": LOCAL_SYMMETRIC_SELECTION_CARD_ID,
-        "title": (
-            "CODEX · SYMMETRIC FEA SELECT · "
-            f"{label} · AUTO FULL OFF"
-        ),
+        "title": (f"CODEX · SYMMETRIC FEA SELECT · {label} · AUTO FULL OFF"),
         "detail": (
             "The optional sealed local-selection state is not trusted yet. "
             "No candidate selection, local-batch, or Full continuation claim "
@@ -1117,9 +1304,96 @@ def _selection_number(value: Any, label: str) -> float:
     return number
 
 
+def _v6_local_selection_lifecycle_counts(
+    value: Mapping[str, Any],
+    *,
+    authenticated: int,
+    pending: int,
+    failures: int,
+    tasks: Mapping[int, Mapping[str, Any]] | None,
+) -> tuple[int, int, int, int]:
+    lifecycle_ids = value.get("lifecycle_task_ids")
+    superseded_ids = value.get("selection_superseded_task_ids")
+    lanes = value.get("lanes")
+    if (
+        not isinstance(lifecycle_ids, list)
+        or len(lifecycle_ids) != 9
+        or len(set(lifecycle_ids)) != 9
+        or set(lifecycle_ids) != set(STANDARD_SELECTION_LIFECYCLE_TASK_IDS)
+        or not isinstance(superseded_ids, list)
+        or set(superseded_ids) != set(STANDARD_SELECTION_SUPERSEDED_TASK_IDS)
+        or value.get("effective_lane_count") != 7
+        or value.get("lifecycle_lane_count") != 9
+        or not isinstance(lanes, list)
+        or len(lanes) != 9
+    ):
+        raise UpdaterError("local symmetric selection v6 lifecycle drifted")
+    lifecycle_statuses: list[str] = []
+    effective_statuses: list[str] = []
+    observed_ids: list[int] = []
+    status_by_task: dict[int, str] = {}
+    for lane in lanes:
+        if not isinstance(lane, Mapping):
+            raise UpdaterError("local symmetric selection v6 lane drifted")
+        task_id = lane.get("task_id")
+        status = str(lane.get("effective_status") or "")
+        selection_effective = lane.get("selection_effective")
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id not in STANDARD_SELECTION_LIFECYCLE_TASK_IDS
+            or status not in {"pending", "collection_ready", "terminal_failure"}
+            or not isinstance(selection_effective, bool)
+            or selection_effective != (task_id in STANDARD_SELECTION_TASK_IDS)
+        ):
+            raise UpdaterError("local symmetric selection v6 lane drifted")
+        observed_ids.append(task_id)
+        status_by_task[task_id] = status
+        lifecycle_statuses.append(status)
+        if selection_effective:
+            effective_statuses.append(status)
+    if len(set(observed_ids)) != 9:
+        raise UpdaterError("local symmetric selection v6 lanes are duplicated")
+    effective_counts = {
+        status: effective_statuses.count(status)
+        for status in {"pending", "collection_ready", "terminal_failure"}
+    }
+    if (
+        effective_counts["collection_ready"] != authenticated
+        or effective_counts["pending"] != pending
+        or effective_counts["terminal_failure"] != failures
+    ):
+        raise UpdaterError("local symmetric selection v6 counts drifted")
+    watcher_pending = lifecycle_statuses.count("pending")
+    watcher_failures = lifecycle_statuses.count("terminal_failure")
+    current_failure_ids = {
+        task_id
+        for task_id, lane_status in status_by_task.items()
+        if lane_status == "terminal_failure"
+    }
+    if tasks is not None:
+        current_failure_ids.update(
+            task_id
+            for task_id in STANDARD_SELECTION_LIFECYCLE_TASK_IDS
+            if _category(str(tasks[task_id]["state"])) == "failed"
+        )
+    current_collection_ids = {
+        task_id
+        for task_id, lane_status in status_by_task.items()
+        if lane_status == "collection_ready"
+    } - current_failure_ids
+    return (
+        9 - len(current_collection_ids) - len(current_failure_ids),
+        len(current_failure_ids),
+        watcher_pending,
+        watcher_failures,
+    )
+
+
 def _strict_local_symmetric_selection_card(
     path: Path,
     observed_at: str,
+    tasks: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     try:
         value = _read_sealed_local_json(
@@ -1128,17 +1402,13 @@ def _strict_local_symmetric_selection_card(
             canonical_ensure_ascii=True,
         )
     except FileNotFoundError:
-        return _local_selection_fail_safe_card(
-            path, observed_at, condition="missing"
-        )
+        return _local_selection_fail_safe_card(path, observed_at, condition="missing")
     except OSError:
         return _local_selection_fail_safe_card(
             path, observed_at, condition="unavailable"
         )
     except UpdaterError:
-        return _local_selection_fail_safe_card(
-            path, observed_at, condition="invalid"
-        )
+        return _local_selection_fail_safe_card(path, observed_at, condition="invalid")
 
     allowed_statuses = {
         "awaiting_symmetric_results",
@@ -1153,23 +1423,34 @@ def _strict_local_symmetric_selection_card(
         value.get("authenticated_observation_count"),
         "authenticated observation count",
     )
-    pending = _selection_count(
-        value.get("pending_count"), "pending count"
-    )
+    pending = _selection_count(value.get("pending_count"), "pending count")
     failures = _selection_count(
         value.get("terminal_failure_count"),
         "terminal failure count",
     )
     task_ids = value.get("expected_task_ids")
     budget = value.get("finite_local_budget")
+    task_ids_valid = (
+        isinstance(task_ids, list)
+        and len(task_ids) == 7
+        and all(
+            isinstance(task_id, int) and not isinstance(task_id, bool)
+            for task_id in task_ids
+        )
+        and len(set(task_ids)) == 7
+    )
+    authoritative_layout = task_ids_valid and set(task_ids) == set(
+        STANDARD_SELECTION_TASK_IDS
+    )
+    legacy_layout = (
+        task_ids_valid
+        and set(task_ids) == set(LEGACY_STANDARD_SELECTION_TASK_IDS)
+        and "lifecycle_task_ids" not in value
+    )
     if (
         status not in allowed_statuses
-        or not isinstance(task_ids, list)
-        or len(task_ids) != len(STANDARD_SELECTION_TASK_IDS)
-        or len(set(task_ids)) != len(task_ids)
-        or set(task_ids) != set(STANDARD_SELECTION_TASK_IDS)
-        or authenticated + pending + failures
-        != len(STANDARD_SELECTION_TASK_IDS)
+        or not (authoritative_layout or legacy_layout)
+        or authenticated + pending + failures != 7
         or value.get("diagnostic_only") is not True
         or value.get("production_eligible") is not False
         or value.get("symmetric_model_primary") is not True
@@ -1182,23 +1463,54 @@ def _strict_local_symmetric_selection_card(
         or value.get("automatic_full_trigger") is not False
         or value.get("automatic_full_continuation") is not False
         or value.get("full_model_started_by_watcher") is not False
-        or value.get("terminal_failures_are_physics_observations")
-        is not False
-        or value.get("pending_allows_local_candidate_generation")
-        is not False
+        or value.get("terminal_failures_are_physics_observations") is not False
+        or value.get("pending_allows_local_candidate_generation") is not False
         or not isinstance(value.get("watch_complete"), bool)
         or not isinstance(budget, Mapping)
     ):
-        return _local_selection_fail_safe_card(
-            path, observed_at, condition="invalid"
-        )
+        return _local_selection_fail_safe_card(path, observed_at, condition="invalid")
 
-    current_round = _selection_count(
-        budget.get("current_round"), "current local round"
-    )
-    max_rounds = _selection_count(
-        budget.get("max_rounds"), "maximum local rounds"
-    )
+    if authoritative_layout:
+        if status == "blocked_fail_closed" and "lifecycle_task_ids" not in value:
+            lifecycle_pending = pending
+            lifecycle_failures = failures
+            lifecycle_count = 7
+            lifecycle_mode = "blocked-fail-closed-effective-only"
+            watcher_snapshot = "watcher snapshot=blocked effective-only"
+        else:
+            try:
+                (
+                    lifecycle_pending,
+                    lifecycle_failures,
+                    watcher_pending,
+                    watcher_failures,
+                ) = _v6_local_selection_lifecycle_counts(
+                    value,
+                    authenticated=authenticated,
+                    pending=pending,
+                    failures=failures,
+                    tasks=tasks,
+                )
+            except UpdaterError:
+                return _local_selection_fail_safe_card(
+                    path, observed_at, condition="invalid"
+                )
+            lifecycle_count = 9
+            lifecycle_mode = "v6-sealed-effective-plus-live-GET-lifecycle"
+            watcher_snapshot = (
+                f"watcher snapshot pending={watcher_pending} / "
+                f"operational terminal failures={watcher_failures}"
+            )
+    else:
+        overlay_pending, overlay_failures = _selection_lifecycle_overlay(tasks)
+        lifecycle_pending = pending + overlay_pending
+        lifecycle_failures = failures + overlay_failures
+        lifecycle_count = 9
+        lifecycle_mode = "v5-overlay-fallback"
+        watcher_snapshot = "watcher snapshot=v5 effective-only"
+
+    current_round = _selection_count(budget.get("current_round"), "current local round")
+    max_rounds = _selection_count(budget.get("max_rounds"), "maximum local rounds")
     max_per_round = _selection_count(
         budget.get("max_candidates_per_round"),
         "maximum candidates per round",
@@ -1219,9 +1531,7 @@ def _strict_local_symmetric_selection_card(
         or prepared > max_per_round
         or (pending and prepared)
     ):
-        return _local_selection_fail_safe_card(
-            path, observed_at, condition="invalid"
-        )
+        return _local_selection_fail_safe_card(path, observed_at, condition="invalid")
 
     selected = value.get("selected_symmetric_result")
     selected_text = "none"
@@ -1235,7 +1545,7 @@ def _strict_local_symmetric_selection_card(
         if (
             isinstance(task_id, bool)
             or not isinstance(task_id, int)
-            or task_id not in STANDARD_SELECTION_TASK_IDS
+            or task_id not in set(task_ids)
             or not isinstance(candidate_sha, str)
             or not re.fullmatch(r"[0-9a-f]{64}", candidate_sha)
         ):
@@ -1260,19 +1570,13 @@ def _strict_local_symmetric_selection_card(
         )
         label = f"SELECTED task{task_id}"
     elif selected is not None:
-        return _local_selection_fail_safe_card(
-            path, observed_at, condition="invalid"
-        )
+        return _local_selection_fail_safe_card(path, observed_at, condition="invalid")
     else:
         label = {
             "awaiting_symmetric_results": "WAITING",
             "partial_measured_waiting": "MEASURED, WAITING",
-            "local_prepare_only_batch_ready": (
-                f"LOCAL BATCH {prepared}/3 READY"
-            ),
-            "terminal_no_passing_or_small_local_correction": (
-                "NO ELIGIBLE LOCAL STEP"
-            ),
+            "local_prepare_only_batch_ready": (f"LOCAL BATCH {prepared}/3 READY"),
+            "terminal_no_passing_or_small_local_correction": ("NO ELIGIBLE LOCAL STEP"),
             "blocked_fail_closed": "FAIL-CLOSED",
         }[status]
 
@@ -1284,7 +1588,7 @@ def _strict_local_symmetric_selection_card(
         "terminal_no_passing_or_small_local_correction": 100,
         "blocked_fail_closed": 25,
     }[status]
-    return {
+    card = {
         "id": LOCAL_SYMMETRIC_SELECTION_CARD_ID,
         "title": (
             "CODEX · SYMMETRIC FEA SELECT · "
@@ -1315,23 +1619,40 @@ def _strict_local_symmetric_selection_card(
             f"state SHA256 {_file_sha256(path.resolve())}",
         ],
     }
+    card["title"] = (
+        f"CODEX | SYMMETRIC FEA SELECT | {label} | AUTH {authenticated}/7 | "
+        f"PENDING {lifecycle_pending} | ACTUAL PASS 0 | AUTO FULL OFF"
+    )
+    card["evidence"][1] = (
+        f"authenticated={authenticated}/7 / pending={lifecycle_pending} / "
+        f"operational terminal failures={lifecycle_failures}"
+    )
+    card["evidence"].insert(
+        2,
+        f"lifecycle mode={lifecycle_mode} / observations={lifecycle_count} / "
+        "selection-effective=7 / "
+        "task96332 superseded by task96338 / "
+        "task96337 pre-EM failure is operational only",
+    )
+    card["evidence"].insert(3, watcher_snapshot)
+    card["evidence"].insert(-1, "actual scientific PASS=0 / actual production PASS=0")
+    return card
 
 
 def _local_symmetric_selection_card(
     path: Path,
     observed_at: str,
+    tasks: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     try:
-        return _strict_local_symmetric_selection_card(path, observed_at)
+        return _strict_local_symmetric_selection_card(path, observed_at, tasks)
     except FileNotFoundError:
         condition = "missing"
     except OSError:
         condition = "unavailable"
     except UpdaterError:
         condition = "invalid"
-    return _local_selection_fail_safe_card(
-        path, observed_at, condition=condition
-    )
+    return _local_selection_fail_safe_card(path, observed_at, condition=condition)
 
 
 def _thermal_bridge_card(path: Path, observed_at: str) -> dict[str, Any]:
@@ -1383,10 +1704,7 @@ def _thermal_bridge_card(path: Path, observed_at: str) -> dict[str, Any]:
     }[state]
     return {
         "id": "codex-thermal-artifact-handoff",
-        "title": (
-            "CODEX AUTO · THERMAL ARTIFACT HANDOFF · "
-            f"{state.upper()}"
-        ),
+        "title": (f"CODEX AUTO · THERMAL ARTIFACT HANDOFF · {state.upper()}"),
         "detail": (
             "Corrected-thermal task96324의 terminal-success artifact를 "
             "인증·전송·수집하는 자동화 상태입니다. 이 lifecycle 표시는 "
@@ -1397,10 +1715,7 @@ def _thermal_bridge_card(path: Path, observed_at: str) -> dict[str, Any]:
         "progress_pct": progress,
         "evidence": [
             f"source task96324 state={source_state} / stage={stage}",
-            (
-                f"Scheduler POST count={post_count} / "
-                "heartbeat mutation=false"
-            ),
+            (f"Scheduler POST count={post_count} / heartbeat mutation=false"),
             (
                 f"artifact collected="
                 f"{str(bool(value.get('artifact_collected'))).lower()}"
@@ -1467,23 +1782,16 @@ def _standard_full_continuation_card(
                 or not isinstance(receipt, Mapping)
             )
         )
-        or (
-            status != "full_submitted_pending_actual_result"
-            and receipt is not None
-        )
+        or (status != "full_submitted_pending_actual_result" and receipt is not None)
     ):
         raise UpdaterError("Standard-to-Full safety boundary drifted")
     updated = str(value.get("observed_at_utc") or "")
     try:
         parsed = datetime.fromisoformat(updated)
     except ValueError as exc:
-        raise UpdaterError(
-            "Standard-to-Full heartbeat timestamp drifted"
-        ) from exc
+        raise UpdaterError("Standard-to-Full heartbeat timestamp drifted") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise UpdaterError(
-            "Standard-to-Full heartbeat timestamp lacks timezone"
-        )
+        raise UpdaterError("Standard-to-Full heartbeat timestamp lacks timezone")
     progress = {
         "pending_standard_collections": 25,
         "terminal_no_measured_pass": 100,
@@ -1495,10 +1803,7 @@ def _standard_full_continuation_card(
     }[status]
     return {
         "id": LEGACY_CONTINUATION_CARD_ID,
-        "title": (
-            "CODEX AUTO · STANDARD→FULL CONTINUATION · "
-            f"{status.upper()}"
-        ),
+        "title": (f"CODEX AUTO · STANDARD→FULL CONTINUATION · {status.upper()}"),
         "detail": (
             "인증된 Standard 실측 hard-feasible rank-0 후보가 생길 때만 "
             "동일 후보의 Full 계산을 별도 strict-node lane에 최대 한 번 "
@@ -1633,7 +1938,7 @@ def _live_summary(
     terminal = len(TASK_SPECS) - running - queued
     if terminal < 0:
         raise UpdaterError("live task counters are inconsistent")
-    return (
+    summary = (
         f"{observed:%H:%M} KST · original_deadline_missed=true. "
         "인증된 scientific PASS는 없습니다. "
         f"post-deadline diagnostic 작업: running{running} · queued{queued} · "
@@ -1644,6 +1949,7 @@ def _live_summary(
         "success도 collector와 artifact 인증 전에는 scientific/production "
         "PASS가 아닙니다."
     )
+    return summary + " actual scientific PASS=0 / actual production PASS=0."
 
 
 def _parallel_workstreams_card(
@@ -1675,17 +1981,14 @@ def _parallel_workstreams_card(
             if categories[spec.task_id] in {"running", "queued"}
         )
     )
-    nodes = (
-        f"ACTIVE NODES {len(active_nodes)}"
-        if active_nodes
-        else "NO ACTIVE NODES"
-    )
+    nodes = f"ACTIVE NODES {len(active_nodes)}" if active_nodes else "NO ACTIVE NODES"
     evidence = [
         (
             f"active allocations{allocation_jobs} / running{running} / "
             f"queued{queued} / terminal{terminal} / all managed tasks "
             "diagnostic/noncanonical / Scheduler GET only / "
-            "scientific_pass_generated=false / canonical_promotion=false"
+            "scientific_pass_generated=false / actual_scientific_pass_count=0 / "
+            "actual_production_pass_count=0 / canonical_promotion=false"
         )
     ]
     evidence.extend(
@@ -1766,7 +2069,7 @@ def merge_status(
     if postsuccess_state_file is not None:
         _upsert_current_card(
             result,
-            _postsuccess_card(postsuccess_state_file, observed_at),
+            _postsuccess_card(postsuccess_state_file, observed_at, tasks),
         )
     if thermal_bridge_state_file is not None:
         _upsert_current_card(
@@ -1779,12 +2082,11 @@ def merge_status(
             _local_symmetric_selection_card(
                 local_symmetric_selection_state_file,
                 observed_at,
+                tasks,
             ),
         )
     else:
-        _remove_current_card(
-            result, LOCAL_SYMMETRIC_SELECTION_CARD_ID
-        )
+        _remove_current_card(result, LOCAL_SYMMETRIC_SELECTION_CARD_ID)
     if standard_full_continuation_state_file is not None:
         _upsert_current_card(
             result,
@@ -1907,6 +2209,8 @@ def merge_status(
             "queued": queued,
             "collections_preserved": collections,
             "scientific_pass_generated": False,
+            "actual_scientific_pass_count": 0,
+            "actual_production_pass_count": 0,
             "collection_generated": False,
             "canonical_promotion_generated": False,
             "protected": protected_before,
@@ -1961,12 +2265,8 @@ def synchronize_once(
         observed_at=observed_at or _timestamp(),
         postsuccess_state_file=postsuccess_state_file,
         thermal_bridge_state_file=thermal_bridge_state_file,
-        local_symmetric_selection_state_file=(
-            local_symmetric_selection_state_file
-        ),
-        standard_full_continuation_state_file=(
-            standard_full_continuation_state_file
-        ),
+        local_symmetric_selection_state_file=(local_symmetric_selection_state_file),
+        standard_full_continuation_state_file=(standard_full_continuation_state_file),
         final_gate_root=final_gate_root,
     )
     validate_status_sync(updated)

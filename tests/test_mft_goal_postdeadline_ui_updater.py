@@ -84,7 +84,7 @@ def _task(
         "memory_mb": spec.memory_mb,
         "timeout_seconds": spec.timeout_seconds,
         "max_workers_per_node": spec.max_workers_per_node or 8,
-        "same_node_as_task_id": 0,
+        "same_node_as_task_id": spec.expected_same_node_as_task_id,
         "requested_node_name": spec.requested_node,
         "node_name": spec.requested_node,
         "node_name_policy": "strict",
@@ -159,6 +159,23 @@ def _mixed_tasks() -> dict[int, dict[str, Any]]:
     return tasks
 
 
+def _current_fast_lane_tasks() -> dict[int, dict[str, Any]]:
+    tasks = {
+        spec.task_id: updater._validate_task(spec, _task(spec))
+        for spec in updater.TASK_SPECS
+    }
+    failed_spec = next(spec for spec in updater.TASK_SPECS if spec.task_id == 96337)
+    tasks[96337] = updater._validate_task(
+        failed_spec,
+        _task(
+            failed_spec,
+            state="failed",
+            failure_message="standalone core opt-in authentication digest mismatch",
+        ),
+    )
+    return tasks
+
+
 def _reader_from(tasks: dict[int, dict[str, Any]]):
     def reader(_scheduler_url: str, task_id: int) -> dict[str, Any]:
         return copy.deepcopy(tasks[task_id])
@@ -186,12 +203,50 @@ def test_task96324_card_reports_primary_solver_failure_before_receipt_error() ->
     assert "Icepak native ThermalSetup execution error" in card["detail"]
     assert "no Fluent process or temperature result" in card["detail"]
     assert any(
-        value.startswith("failure_message=ValueError:")
-        for value in card["evidence"]
+        value.startswith("failure_message=ValueError:") for value in card["evidence"]
     )
     assert any(
         value.startswith("authenticated terminal root cause=Icepak native")
         for value in card["evidence"]
+    )
+
+
+def test_corrected_official5_fast_lane_replaces_failed_pre_em_attempt() -> None:
+    failed_spec = next(spec for spec in updater.TASK_SPECS if spec.task_id == 96337)
+    current_spec = next(spec for spec in updater.TASK_SPECS if spec.task_id == 96338)
+    failed = updater._validate_task(
+        failed_spec,
+        _task(
+            failed_spec,
+            state="failed",
+            failure_message="standalone core opt-in authentication digest mismatch",
+        ),
+    )
+    current = updater._validate_task(current_spec, _task(current_spec))
+
+    failed_card = updater._task_card(failed_spec, failed, OBSERVED)
+    current_card = updater._task_card(current_spec, current, OBSERVED)
+
+    assert "task96337 TERMINAL FAILED" in failed_card["title"]
+    assert "Pre-EM AEDT startup failed" in failed_card["detail"]
+    assert any(
+        "selection_lane_effective=false" in value
+        and "superseded_by_task96338=true" in value
+        for value in failed_card["evidence"]
+    )
+    assert "task96338 RUNNING" in current_card["title"]
+    assert any(
+        value == "strict node placement contract / same_node_as_task_id=96332"
+        for value in current_card["evidence"]
+    )
+    assert any(
+        "selection_lane_effective=true" in value
+        and "failover_for_task96332=true" in value
+        for value in current_card["evidence"]
+    )
+    assert any(
+        "0731cf22e3f78f93da943cc9102b7d96a2719bfbe1ca65e782789b2d98bc30dd" in value
+        for value in current_card["evidence"]
     )
 
 
@@ -260,9 +315,7 @@ def _continuation_state(
             "source_postsuccess_state": "postsuccess-state.json",
             "plan": {"path": "plan.json"} if submitted else None,
             "attempt_ledger": {"path": "attempt.json"} if submitted else None,
-            "submission_receipt": (
-                {"path": "receipt.json"} if submitted else None
-            ),
+            "submission_receipt": ({"path": "receipt.json"} if submitted else None),
             "full_task_id": 97001 if submitted else None,
             "maximum_scheduler_posts": 1,
             "scheduler_post_attempts_consumed": 1 if submitted else 0,
@@ -280,52 +333,101 @@ def _local_selection_state(
     failures: int = 1,
     selected: dict[str, Any] | None = None,
     prepared: int = 0,
+    layout: str = "v6",
 ) -> dict[str, Any]:
-    return updater._sealed(
-        {
-            "schema_version": (
-                updater.LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA
-            ),
-            "diagnostic_only": True,
-            "search_only": True,
-            "canonical": False,
-            "production_eligible": False,
-            "original_deadline_missed": True,
-            "symmetric_model_primary": True,
-            "prepare_only": True,
-            "scheduler_methods_used": [],
-            "scheduler_mutation_performed": False,
-            "scheduler_submission_performed": False,
-            "scheduler_cancel_performed": False,
-            "scheduler_restart_performed": False,
-            "automatic_full_trigger": False,
-            "automatic_full_continuation": False,
-            "status": status,
-            "watch_complete": status
-            in {
-                "selected_symmetric_hard_pass",
-                "local_prepare_only_batch_ready",
-                "terminal_no_passing_or_small_local_correction",
-            },
-            "expected_task_ids": list(
-                updater.STANDARD_SELECTION_TASK_IDS
-            ),
-            "authenticated_observation_count": authenticated,
-            "pending_count": pending,
-            "terminal_failure_count": failures,
-            "selected_symmetric_result": selected,
-            "finite_local_budget": {
-                "current_round": 0,
-                "max_rounds": 2,
-                "max_candidates_per_round": 3,
-                "max_candidates_total": 6,
-                "candidate_count_this_round": prepared,
-            },
-            "terminal_failures_are_physics_observations": False,
-            "pending_allows_local_candidate_generation": False,
-            "full_model_started_by_watcher": False,
-        }
+    if layout not in {"v5", "v6"}:
+        raise ValueError("unsupported test layout")
+    expected_task_ids = list(
+        updater.STANDARD_SELECTION_TASK_IDS
+        if layout == "v6"
+        else updater.LEGACY_STANDARD_SELECTION_TASK_IDS
     )
+    payload: dict[str, Any] = {
+        "schema_version": (updater.LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA),
+        "diagnostic_only": True,
+        "search_only": True,
+        "canonical": False,
+        "production_eligible": False,
+        "original_deadline_missed": True,
+        "symmetric_model_primary": True,
+        "prepare_only": True,
+        "scheduler_methods_used": [],
+        "scheduler_mutation_performed": False,
+        "scheduler_submission_performed": False,
+        "scheduler_cancel_performed": False,
+        "scheduler_restart_performed": False,
+        "automatic_full_trigger": False,
+        "automatic_full_continuation": False,
+        "status": status,
+        "watch_complete": status
+        in {
+            "selected_symmetric_hard_pass",
+            "local_prepare_only_batch_ready",
+            "terminal_no_passing_or_small_local_correction",
+        },
+        "expected_task_ids": expected_task_ids,
+        "authenticated_observation_count": authenticated,
+        "pending_count": pending,
+        "terminal_failure_count": failures,
+        "selected_symmetric_result": selected,
+        "finite_local_budget": {
+            "current_round": 0,
+            "max_rounds": 2,
+            "max_candidates_per_round": 3,
+            "max_candidates_total": 6,
+            "candidate_count_this_round": prepared,
+        },
+        "terminal_failures_are_physics_observations": False,
+        "pending_allows_local_candidate_generation": False,
+        "full_model_started_by_watcher": False,
+    }
+    if layout == "v6":
+        effective_statuses = {task_id: "pending" for task_id in expected_task_ids}
+        authenticated_ids: list[int] = []
+        if selected is not None:
+            authenticated_ids.append(int(selected["task_id"]))
+        authenticated_ids.extend(
+            task_id for task_id in expected_task_ids if task_id not in authenticated_ids
+        )
+        for task_id in authenticated_ids[:authenticated]:
+            effective_statuses[task_id] = "collection_ready"
+        failed_ids = [
+            task_id
+            for task_id in reversed(expected_task_ids)
+            if effective_statuses[task_id] == "pending"
+        ][:failures]
+        for task_id in failed_ids:
+            effective_statuses[task_id] = "terminal_failure"
+        lanes = []
+        for task_id in updater.STANDARD_SELECTION_LIFECYCLE_TASK_IDS:
+            selection_effective = task_id in updater.STANDARD_SELECTION_TASK_IDS
+            if task_id == 96332:
+                lane_status = "pending"
+            elif task_id == 96337:
+                lane_status = "terminal_failure"
+            else:
+                lane_status = effective_statuses[task_id]
+            lanes.append(
+                {
+                    "task_id": task_id,
+                    "effective_status": lane_status,
+                    "selection_effective": selection_effective,
+                }
+            )
+        payload.update(
+            {
+                "lifecycle_task_ids": list(
+                    updater.STANDARD_SELECTION_LIFECYCLE_TASK_IDS
+                ),
+                "selection_superseded_task_ids": list(
+                    updater.STANDARD_SELECTION_SUPERSEDED_TASK_IDS
+                ),
+                "effective_lane_count": 7,
+                "lifecycle_lane_count": 9,
+                "lanes": lanes,
+            }
+        )
+    return updater._sealed(payload)
 
 
 def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
@@ -345,15 +447,13 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["completed"] == completed
     assert merged["attention"] == attention
     assert "18:20 KST" in merged["summary"]
-    assert "running2 · queued6 · terminal2" in merged["summary"]
+    assert "running2 · queued8 · terminal2" in merged["summary"]
     assert "physical feasible0" in merged["summary"]
+    assert "actual scientific PASS=0" in merged["summary"]
     assert "scientific/production PASS가 아닙니다" in merged["summary"]
     assert merged["current"][-1] != parallel
     assert merged["current"][-1]["id"] == "parallel-workstreams"
-    assert (
-        "RUNNING 2 · QUEUED 6 · ALLOCATION JOBS 2"
-        in merged["current"][-1]["title"]
-    )
+    assert "RUNNING 2 · QUEUED 8 · ALLOCATION JOBS 3" in merged["current"][-1]["title"]
     assert (
         "RISK task96328/allocation14620 FORCE 07-27 04:07:51 KST"
         in merged["current"][-1]["title"]
@@ -368,18 +468,15 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == updater.SELECTION_POLICY_CARD_ID
     )
     assert (
-        policy["title"]
-        == "DESIGN SELECTION | SYMMETRY/STANDARD PRIMARY | "
+        policy["title"] == "DESIGN SELECTION | SYMMETRY/STANDARD PRIMARY | "
         "TERMINAL 1/7 | AUTO FULL OFF"
     )
     assert any(
-        "primary candidate-selection gate=authenticated symmetric/Standard FEA"
-        in value
+        "primary candidate-selection gate=authenticated symmetric/Standard FEA" in value
         for value in policy["evidence"]
     )
     assert any(
-        "task96326 lifecycle=SUCCEEDED / role=diagnostic reference only"
-        in value
+        "task96326 lifecycle=SUCCEEDED / role=diagnostic reference only" in value
         for value in policy["evidence"]
     )
     assert any(
@@ -393,15 +490,27 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     )
     assert "task96333" in lane_evidence
     assert "task96329" not in lane_evidence
+    assert "task96338" in lane_evidence
+    assert "task96332" not in lane_evidence
     assert any(
         "effective official#8 selection lane=task96333" in value
         and "task96329 superseded but lifecycle-visible" in value
         for value in policy["evidence"]
     )
+    assert any(
+        "effective official#5 selection lane=task96338" in value
+        and "task96332 superseded but lifecycle-visible" in value
+        and "task96337 pre-EM operational failure only" in value
+        for value in policy["evidence"]
+    )
+    assert any(
+        "actual scientific PASS=0" in value and "actual production PASS=0" in value
+        for value in policy["evidence"]
+    )
     assert merged["unknown_top_level"] == {"preserve": True}
-    assert sync["allocation_jobs_active"] == 2
+    assert sync["allocation_jobs_active"] == 3
     assert sync["running"] == 2
-    assert sync["queued"] == 6
+    assert sync["queued"] == 8
     assert sync["submitted_total"] == 126
     assert sync["collections_preserved"] == 0
     assert sync["scheduler_methods_used"] == ["GET"]
@@ -417,6 +526,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         96331,
         96332,
         96333,
+        96337,
+        96338,
     ]
 
     success = next(
@@ -444,16 +555,13 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert "task96328 RUNNING" in official["title"]
     assert "FORCE-CANCEL RISK 07-27 04:07:51 KST" in official["title"]
     assert any(
-        "force boundary leads by 4h01m56s" in value
-        for value in official["evidence"]
+        "force boundary leads by 4h01m56s" in value for value in official["evidence"]
     )
     assert any(
-        "hard residual guarantee=false" in value
-        for value in official["evidence"]
+        "hard residual guarantee=false" in value for value in official["evidence"]
     )
     assert any(
-        "42942394a873e40181f9074f2625807224239b291bcf2f4cf2ccacde50b11edc"
-        in value
+        "42942394a873e40181f9074f2625807224239b291bcf2f4cf2ccacde50b11edc" in value
         for value in official["evidence"]
     )
     official8 = next(
@@ -463,8 +571,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     )
     assert "task96329 QUEUED" in official8["title"]
     assert any(
-        "5319a8a4dceb27082b91fc6badd540221298eeb9f324e2fa30e76e529313d3ec"
-        in value
+        "5319a8a4dceb27082b91fc6badd540221298eeb9f324e2fa30e76e529313d3ec" in value
         for value in official8["evidence"]
     )
     assert any(
@@ -495,8 +602,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         for value in failover["evidence"]
     )
     assert any(
-        "8990b3f339ce36f66d4ecf5fdbbd111889d55b25d860d00e3d98e6508101180c"
-        in value
+        "8990b3f339ce36f66d4ecf5fdbbd111889d55b25d860d00e3d98e6508101180c" in value
         for value in failover["evidence"]
     )
     for task_id, order, node, receipt_sha in (
@@ -522,8 +628,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         card = next(
             item
             for item in merged["current"]
-            if item["id"]
-            == f"postdeadline-standard-official{order}-{task_id}"
+            if item["id"] == f"postdeadline-standard-official{order}-{task_id}"
         )
         assert f"task{task_id} QUEUED" in card["title"]
         assert node in card["title"]
@@ -532,13 +637,13 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
 
     handoff = next(item for item in merged["current"] if item["id"] == "fea-handoff")
     assert (
-        handoff["title"] == "SLURM · ALLOCATION JOBS 2 · SUBMITTED 126 · "
-        "RUNNING 2 · QUEUED 6 · COLLECTIONS 0"
+        handoff["title"] == "SLURM · ALLOCATION JOBS 3 · SUBMITTED 126 · "
+        "RUNNING 2 · QUEUED 8 · COLLECTIONS 0"
     )
     for item in merged["current"]:
         assert len(item["title"]) <= 160
         assert len(item["detail"]) <= 1_200
-        assert len(item["evidence"]) <= 12
+        assert len(item["evidence"]) <= 16
         assert all(len(value) <= 500 for value in item["evidence"])
 
 
@@ -626,8 +731,28 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
             "schema_version": updater.POSTSUCCESS_STATE_SCHEMA,
             "status": "pending_standard_collections",
             "collection_count": 0,
-            "pending_count": 2,
+            "pending_count": 7,
             "terminal_failure_count": 0,
+            "expected_lane_count": 7,
+            "lifecycle_lane_count": 9,
+            "effective_task_ids": list(updater.STANDARD_SELECTION_TASK_IDS),
+            "lifecycle_task_ids": list(updater.STANDARD_SELECTION_LIFECYCLE_TASK_IDS),
+            "selection_superseded_task_ids": list(
+                updater.STANDARD_SELECTION_SUPERSEDED_TASK_IDS
+            ),
+            "lifecycle_collection_count": 0,
+            "lifecycle_pending_count": 8,
+            "lifecycle_terminal_failure_count": 1,
+            "lanes": [
+                {
+                    "task_id": task_id,
+                    "selection_effective": (
+                        task_id in updater.STANDARD_SELECTION_TASK_IDS
+                    ),
+                    "status": ("terminal_failure" if task_id == 96337 else "pending"),
+                }
+                for task_id in updater.STANDARD_SELECTION_LIFECYCLE_TASK_IDS
+            ],
             "diagnostic_only": True,
             "production_eligible": False,
             "scheduler_mutation_performed": False,
@@ -674,7 +799,7 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
 
     merged = updater.merge_status(
         _status(),
-        _mixed_tasks(),
+        _current_fast_lane_tasks(),
         observed_at=OBSERVED,
         postsuccess_state_file=postsuccess_path,
         thermal_bridge_state_file=thermal_path,
@@ -683,36 +808,25 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
     )
 
     by_id = {item["id"]: item for item in merged["current"]}
-    assert "COLLECTIONS 0 · PENDING 2" in by_id[
-        "codex-standard-postsuccess-pipeline"
-    ]["title"]
-    assert by_id["codex-final-aedt-package-gate"]["title"].endswith(
-        "PENDING"
+    postsuccess_card = by_id["codex-standard-postsuccess-pipeline"]
+    assert "AUTH 0 | PENDING 8 | ACTUAL PASS 0" in postsuccess_card["title"]
+    assert any(
+        "lifecycle mode=v6-sealed-effective-plus-live-GET-lifecycle" in item
+        for item in postsuccess_card["evidence"]
     )
+    assert by_id["codex-final-aedt-package-gate"]["title"].endswith("PENDING")
     thermal = by_id["codex-thermal-artifact-handoff"]
-    assert thermal["title"] == (
-        "CODEX AUTO · THERMAL ARTIFACT HANDOFF · RUNNING"
-    )
-    assert any(
-        "source task96324 state=running" in item
-        for item in thermal["evidence"]
-    )
-    assert any(
-        "Scheduler POST count=0" in item for item in thermal["evidence"]
-    )
-    assert any(
-        "scientific claim=false" in item for item in thermal["evidence"]
-    )
+    assert thermal["title"] == ("CODEX AUTO · THERMAL ARTIFACT HANDOFF · RUNNING")
+    assert any("source task96324 state=running" in item for item in thermal["evidence"])
+    assert any("Scheduler POST count=0" in item for item in thermal["evidence"])
+    assert any("scientific claim=false" in item for item in thermal["evidence"])
     continuation = by_id["codex-standard-full-continuation"]
     assert continuation["title"].endswith("PENDING_STANDARD_COLLECTIONS")
     assert any(
         "Scheduler POST attempts consumed=0/1" in item
         for item in continuation["evidence"]
     )
-    assert any(
-        "scientific PASS=false" in item
-        for item in continuation["evidence"]
-    )
+    assert any("scientific PASS=false" in item for item in continuation["evidence"])
     policy = by_id[updater.SELECTION_POLICY_CARD_ID]
     assert "AUTO FULL OFF" in policy["title"]
     assert any(
@@ -722,7 +836,8 @@ def test_merge_adds_authenticated_codex_automation_cards(tmp_path: Path) -> None
     postsuccess_card = by_id["codex-standard-postsuccess-pipeline"]
     assert any(
         "Standard selection lanes=7" in item
-        and "task96332" in item
+        and "task96338" in item
+        and "task96332" not in item
         for item in postsuccess_card["evidence"]
     )
     assert any(
@@ -774,7 +889,7 @@ def test_local_symmetric_selection_card_shows_sealed_selection_and_budget(
 
     merged = updater.merge_status(
         _status(),
-        _mixed_tasks(),
+        _current_fast_lane_tasks(),
         observed_at=OBSERVED,
         local_symmetric_selection_state_file=path,
     )
@@ -786,22 +901,25 @@ def test_local_symmetric_selection_card_shows_sealed_selection_and_budget(
 
     assert "SELECTED task96331" in card["title"]
     assert "AUTH 2/7" in card["title"]
+    assert "PENDING 6" in card["title"]
+    assert "ACTUAL PASS 0" in card["title"]
     assert "AUTO FULL OFF" in card["title"]
     assert any(
-        "authenticated=2/7 / pending=5 / terminal failures=0"
-        in item
+        "authenticated=2/7 / pending=6 / operational terminal failures=1" in item
         for item in card["evidence"]
     )
     assert any(
-        "selected symmetric result=task96331 cccccccccccc"
-        in item
+        "lifecycle mode=v6-sealed-effective-plus-live-GET-lifecycle" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "selected symmetric result=task96331 cccccccccccc" in item
         and "loss=5319.500W" in item
         and "volume=803.200L" in item
         for item in card["evidence"]
     )
     assert any(
-        "local bounded budget=round 1/2 / prepared 0/3 / total cap 6"
-        in item
+        "local bounded budget=round 1/2 / prepared 0/3 / total cap 6" in item
         for item in card["evidence"]
     )
     assert any(
@@ -810,6 +928,44 @@ def test_local_symmetric_selection_card_shows_sealed_selection_and_budget(
     )
     assert merged["current"][-1]["id"] == "parallel-workstreams"
     updater.validate_status_sync(merged)
+
+
+def test_local_symmetric_selection_v5_fallback_overlays_new_lifecycle_once(
+    tmp_path: Path,
+) -> None:
+    state = _local_selection_state(
+        status="awaiting_symmetric_results",
+        authenticated=0,
+        pending=7,
+        failures=0,
+        layout="v5",
+    )
+    path = tmp_path / "legacy-local-selection-state.json"
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    tasks = _mixed_tasks()
+    failed_spec = next(spec for spec in updater.TASK_SPECS if spec.task_id == 96337)
+    current_spec = next(spec for spec in updater.TASK_SPECS if spec.task_id == 96338)
+    tasks[96337] = updater._validate_task(
+        failed_spec,
+        _task(
+            failed_spec,
+            state="failed",
+            failure_message="standalone core opt-in authentication digest mismatch",
+        ),
+    )
+    tasks[96338] = updater._validate_task(current_spec, _task(current_spec))
+
+    card = updater._local_symmetric_selection_card(path, OBSERVED, tasks)
+
+    assert "AUTH 0/7" in card["title"]
+    assert "PENDING 8" in card["title"]
+    assert any(
+        "authenticated=0/7 / pending=8 / operational terminal failures=1" in item
+        for item in card["evidence"]
+    )
+    assert any(
+        "lifecycle mode=v5-overlay-fallback" in item for item in card["evidence"]
+    )
 
 
 def test_local_symmetric_selection_card_shows_bounded_local_batch(
@@ -833,13 +989,11 @@ def test_local_symmetric_selection_card_shows_bounded_local_batch(
     assert "LOCAL BATCH 3/3 READY" in card["title"]
     assert "AUTH 6/7" in card["title"]
     assert any(
-        "authenticated=6/7 / pending=0 / terminal failures=1"
-        in item
+        "authenticated=6/7 / pending=1 / operational terminal failures=2" in item
         for item in card["evidence"]
     )
     assert any(
-        "prepared 3/3" in item and "prepare-only" in item
-        for item in card["evidence"]
+        "prepared 3/3" in item and "prepare-only" in item for item in card["evidence"]
     )
 
 
@@ -847,9 +1001,7 @@ def test_local_symmetric_selection_missing_and_tamper_are_fail_safe(
     tmp_path: Path,
 ) -> None:
     missing = tmp_path / "missing-local-selection-state.json"
-    missing_card = updater._local_symmetric_selection_card(
-        missing, OBSERVED
-    )
+    missing_card = updater._local_symmetric_selection_card(missing, OBSERVED)
     assert "STATE MISSING" in missing_card["title"]
     assert "AUTO FULL OFF" in missing_card["title"]
     assert any(
@@ -899,9 +1051,7 @@ def test_local_symmetric_selection_accepts_producer_sealed_state(
     )
     assert produced["status"] == "blocked_fail_closed"
 
-    card = updater._local_symmetric_selection_card(
-        output / "state.json", OBSERVED
-    )
+    card = updater._local_symmetric_selection_card(output / "state.json", OBSERVED)
 
     assert "FAIL-CLOSED" in card["title"]
     assert "STATE INVALID" not in card["title"]
@@ -1023,11 +1173,7 @@ def test_scheduler_reader_uses_bounded_get(monkeypatch: pytest.MonkeyPatch) -> N
 
 @pytest.mark.parametrize(
     "spec",
-    tuple(
-        spec
-        for spec in updater.TASK_SPECS
-        if spec.max_workers_per_node == 1
-    ),
+    tuple(spec for spec in updater.TASK_SPECS if spec.max_workers_per_node == 1),
 )
 def test_official_task_max_workers_is_fail_closed(
     spec: updater.TaskSpec,
@@ -1114,12 +1260,8 @@ def test_cli_modes_and_default_interval() -> None:
     )
     assert parsed.watch is True
     assert parsed.thermal_bridge_state_file == Path("thermal.json")
-    assert parsed.local_symmetric_selection_state_file == Path(
-        "local-selection.json"
-    )
-    assert parsed.standard_full_continuation_state_file == Path(
-        "continuation.json"
-    )
+    assert parsed.local_symmetric_selection_state_file == Path("local-selection.json")
+    assert parsed.standard_full_continuation_state_file == Path("continuation.json")
     with pytest.raises(SystemExit):
         parser.parse_args([])
     with pytest.raises(SystemExit):
