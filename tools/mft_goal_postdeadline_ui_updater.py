@@ -39,7 +39,7 @@ DEFAULT_LOCAL_SYMMETRIC_SELECTION_STATE_FILE = Path(
 )
 DEFAULT_REFERENCE_BASELINE_GUI_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\local_reference_drawing260706_symmetric_gui_v1"
+    r"\local_reference_drawing260706_symmetric_gui_thermal_retry_v2"
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -456,6 +456,41 @@ REFERENCE_BASELINE_TASK_SPEC = AuxiliaryTaskSpec(
     timeout_seconds=43_200,
     max_workers_per_node=1,
 )
+REFERENCE_THERMAL_HEDGE_TASK_SPEC = AuxiliaryTaskSpec(
+    task_id=96414,
+    task_name="mft-goal-reference-drawing260706-standard-symmetric-thermalfix-v3",
+    role="superseded reference baseline thermal-fix hedge",
+    cpus=8,
+    memory_mb=98_304,
+    timeout_seconds=43_200,
+    max_workers_per_node=1,
+)
+REFERENCE_DIRECT_TASK_SPEC = AuxiliaryTaskSpec(
+    task_id=96415,
+    task_name="mft-goal-reference-drawing260706-standard-symmetric-direct-v4",
+    role="active reference baseline exact direct-analyze replacement",
+    cpus=8,
+    memory_mb=98_304,
+    timeout_seconds=43_200,
+    max_workers_per_node=1,
+)
+TARGET_AXIS_TASK_SPECS = tuple(
+    AuxiliaryTaskSpec(
+        task_id=96416 + index,
+        task_name=(
+            f"mft-5t-lm2-s{2707276100 + index}-n1-"
+            f"{(5, 6, 7, 8)[index % 4]}"
+        ),
+        role="authoritative W1200/L1000 fixed-Lm2mH targeted NSGA-II",
+        cpus=8,
+        memory_mb=65_536,
+        timeout_seconds=7_200,
+        max_workers_per_node=8,
+        seed=2707276100 + index,
+        primary_turns=(5, 6, 7, 8)[index % 4],
+    )
+    for index in range(16)
+)
 SUPERSEDED_WARM_TASK_SPEC = AuxiliaryTaskSpec(
     task_id=96395,
     task_name="mft-5t-g1p6-s2707275600-n1-5",
@@ -471,6 +506,9 @@ AUTHORITATIVE_AUXILIARY_TASK_SPECS = (
     SUPERSEDED_WARM_TASK_SPEC,
     REFERENCE_BASELINE_TASK_SPEC,
     *AXIS_V6_TASK_SPECS,
+    REFERENCE_THERMAL_HEDGE_TASK_SPEC,
+    REFERENCE_DIRECT_TASK_SPEC,
+    *TARGET_AXIS_TASK_SPECS,
 )
 
 LEGACY_STANDARD_SELECTION_TASK_IDS = (
@@ -505,7 +543,25 @@ LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
 PRIMARY_5T_RECOVERY_CARD_ID = "codex-primary-5t-constraint-recovery"
 AXIS_V6_CARD_ID = "codex-axis-v6-fixed-5t-nsga"
+TARGET_AXIS_CARD_ID = "codex-target-axis-1200x1000-nsga"
 REFERENCE_BASELINE_CARD_ID = "codex-reference-drawing-baseline"
+HISTORICAL_AXIS_RAW_TERMINAL = 5_120
+HISTORICAL_AXIS_UNIQUE_GEOMETRY = 4_683
+NEW_AXIS_GEOMETRY_PASS_RAW = 217
+NEW_AXIS_GEOMETRY_PASS_UNIQUE = 210
+NEW_AXIS_THERMAL_FEASIBLE = 0
+NEW_AXIS_PRODUCTION_PARETO = 0
+NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C = 302.67
+TARGET_AXIS_CAMPAIGN = (
+    "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-targeted-v1"
+)
+TARGET_AXIS_HARD_SHA256 = (
+    "227cdc0db3b8dae490275d549e8aea93b295a75ee97ea98cdaa601bb96591298"
+)
+TARGET_AXIS_SUBMISSION_MANIFEST = Path(
+    r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+    r"\fixed_lm2mh_targeted_w1200_l1000_v1\submission_manifest.json"
+)
 ROUNDED_FINAL_TASK_ID = 96340
 ROUNDED_TIMEOUT_HEDGE_TASK_ID = 96342
 ROUNDED_FINAL_PIPELINE_CARD_ID = "codex-rounded-final-delivery-pipeline"
@@ -2455,16 +2511,17 @@ def _primary_5t_recovery_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": PRIMARY_5T_RECOVERY_CARD_ID,
         "title": (
-            "권선/축 계약 확정 | W=x≤1000 · L=y≤1200 · H≤750 | "
+            "권선/축 계약 확정 | W=x≤1200 · L=y≤1000 · H≤750 | "
             "5T/1.6 | 회전·축교환 금지"
         ),
         "detail": (
             "현재 도면 축을 그대로 고정합니다: W는 도면 x/기존 973 mm "
-            "측·2차측 방향으로 1000 mm 이하, L은 도면 y/수직 방향으로 "
-            "1200 mm 이하, H는 750 mm 이하이며 회전이나 축 교환은 허용하지 "
+            "측·2차측 방향으로 1200 mm 이하, L은 도면 y/수직 방향으로 "
+            "1000 mm 이하, H는 750 mm 이하이며 회전이나 축 교환은 허용하지 "
             "않습니다. 1차 권선은 5.0 mm/간격 1.6 mm로 고정됩니다. "
-            "reference baseline FEA와 axis-v6 신규 최적화는 별도 트랙이며 "
-            "어느 쪽도 아직 scientific PASS를 만들지 않았습니다."
+            "기존 axis-v6 W1000/L1200 결과는 잘못된 축 계약의 과거 자료이고, "
+            "W1200/L1000 타깃 탐색 및 reference baseline FEA와 분리됩니다. "
+            "현재 인증된 scientific/production PASS는 0입니다."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
@@ -2472,8 +2529,8 @@ def _primary_5t_recovery_card(observed_at: str) -> dict[str, Any]:
         "evidence": [
             (
                 "authoritative axis A: W=drawing x/current 973mm-side-secondary "
-                "direction <=1000mm / L=drawing y/perpendicular direction "
-                "<=1200mm / H<=750mm / rotation=false / axis swap=false"
+                "direction <=1200mm / L=drawing y/perpendicular direction "
+                "<=1000mm / H<=750mm / rotation=false / axis swap=false"
             ),
             (
                 "authoritative reference=설계도면260706 slide9 / "
@@ -2502,12 +2559,12 @@ def _primary_5t_recovery_card(observed_at: str) -> dict[str, Any]:
                 "role=baseline only, not an optimized candidate"
             ),
             (
-                "new optimization=axis-v6 tasks96397-96412 / "
-                "16 cold-random seeds / pop320 x gen80 / fixed 5T/1.6"
+                "superseded optimization=axis-v6 tasks96397-96412 / "
+                "wrong W<=1000,L<=1200 axis / historical screening only"
             ),
             (
-                "prior warm canary task96395=FAILED / reason=no hard-feasible "
-                "warm design under corrected axis / superseded by cold axis-v6"
+                "current target optimization=W<=1200,L<=1000,H<=750 / "
+                "fixed 5T/1.6 / no rotation or axis swap / submission pending"
             ),
             (
                 "verification lane=standard/unrounded symmetric / "
@@ -2521,8 +2578,8 @@ def _primary_5t_recovery_card(observed_at: str) -> dict[str, Any]:
             ),
             (
                 "prior geometry-predicted resonance final=false / "
-                "axis-v6 raw lifecycle complete does not finalize feasibility / "
-                "fixed-Lm2mH global NDS rebuild pending"
+                "historical fixed-Lm2mH rescore=screening-only / "
+                "thermal surrogate extrapolation invalid"
             ),
             (
                 "actual scientific PASS=0 / actual production PASS=0 / "
@@ -2554,8 +2611,12 @@ def _pid_exists(pid: int) -> bool:
 def _reference_local_stage(root: Path) -> dict[str, Any]:
     resolved = root.resolve()
     run_root = resolved / "simulation" / "simulation1"
-    stdout_path = resolved / "local_gui_stdout.log"
-    stderr_path = resolved / "local_gui_stderr.log"
+    stdout_path = resolved / "local_thermal_retry_stdout.log"
+    stderr_path = resolved / "local_thermal_retry_stderr.log"
+    if not stdout_path.is_file():
+        stdout_path = resolved / "local_gui_stdout.log"
+    if not stderr_path.is_file():
+        stderr_path = resolved / "local_gui_stderr.log"
     try:
         stdout_bytes = stdout_path.read_bytes()
     except OSError:
@@ -2569,21 +2630,41 @@ def _reference_local_stage(root: Path) -> dict[str, Any]:
     project_path = run_root / "simulation1.aedt"
     result_csv = resolved / "simulation_results_260706.csv"
     result_parts = resolved / "results_parts_260706"
+    loss_result_root = run_root / "simulation1.aedtresults" / "maxwell_loss"
+    loss_dispatched = '"stage":"loss"' in stdout_tail
+    thermal_dispatched = (
+        '"stage":"thermal"' in stdout_tail
+        or "Solving design setup ThermalSetup" in stdout_tail
+    )
+    aedt_pid_active = _pid_exists(44520)
+    python_pid_active = _pid_exists(34080)
     return {
         "root": resolved,
         "project_path": project_path,
         "project_exists": project_path.is_file(),
-        "aedt_pid": 15444,
-        "aedt_pid_active": _pid_exists(15444),
-        "python_pid": 47256,
-        "python_pid_active": _pid_exists(47256),
+        "stdout_path": stdout_path,
+        "stderr_path": stderr_path,
+        "aedt_pid": 44520,
+        "aedt_pid_active": aedt_pid_active,
+        "python_pid": 34080,
+        "python_pid_active": python_pid_active,
         "matrix_solved": (run_root / "convergence_matrix.txt").is_file(),
         "cap_solved": (run_root / "convergence_cap.txt").is_file(),
-        "loss_dispatched": '"stage":"loss"' in stdout_tail,
+        "loss_dispatched": loss_dispatched,
+        "loss_running": (
+            loss_dispatched
+            and not thermal_dispatched
+            and aedt_pid_active
+            and python_pid_active
+        ),
+        "loss_result_root_present": loss_result_root.is_dir(),
         "loss_restore_failed": (
             "[loss] native Analyze completed but DSO restore failed" in stderr_tail
         ),
-        "thermal_dispatched": '"stage":"thermal"' in stdout_tail,
+        "thermal_dispatched": thermal_dispatched,
+        "thermal_running": (
+            thermal_dispatched and aedt_pid_active and python_pid_active
+        ),
         "result_csv_present": result_csv.is_file(),
         "result_parts_present": (
             result_parts.is_dir() and any(result_parts.glob("*.parquet"))
@@ -2610,18 +2691,17 @@ def _axis_v6_card(
         else f"task96397 lifecycle={str(first_seed['state']).upper()}"
     )
     task_evidence = []
-    for index in range(0, len(tasks), 2):
-        pair = tasks[index : index + 2]
+    for index in range(0, len(tasks), 4):
+        group = tasks[index : index + 4]
         task_evidence.append(
             " | ".join(
                 (
-                    f"task{task['task_id']} seed{task['seed']} N1="
+                    f"t{task['task_id']} s{task['seed']} N1="
                     f"{task['primary_turns']} {str(task['state']).upper()} "
-                    f"node={task['actual_node_name'] or 'pending'} "
-                    f"allocation={task['allocation_id'] or 'none'} "
-                    f"job={task['slurm_job_id'] or 'none'}"
+                    f"{task['actual_node_name'] or 'pending'}/"
+                    f"j{task['slurm_job_id'] or 'none'}"
                 )
-                for task in pair
+                for task in group
             )
         )
     all_raw_succeeded = succeeded == 16
@@ -2629,36 +2709,36 @@ def _axis_v6_card(
         "id": AXIS_V6_CARD_ID,
         "title": (
             (
-                "AXIS-v6 RAW LIFECYCLE 16/16 SUCCEEDED | "
-                "Lm=2mH RESCREEN + GLOBAL NDS REBUILD PENDING"
+                "SUPERSEDED HISTORICAL WRONG AXIS | AXIS-v6 16/16 SUCCEEDED | "
+                "NEW-AXIS FEASIBLE 0 · PF 0"
             )
             if all_raw_succeeded
             else (
-                "AXIS-v6 5T/1.6 NSGA-II | "
+                "SUPERSEDED HISTORICAL WRONG AXIS | AXIS-v6 | "
                 f"RUNNING {running} · QUEUED {queued} · "
                 f"SUCCEEDED {succeeded} · FAILED {failed} | 16 SEEDS"
             )
         ),
         "detail": (
-            "This is the new optimization track under the fixed drawing-axis "
-            "contract, not the reference-drawing baseline. Sixteen cold-random "
-            "seeds run population 320 x 80 generations with N1 strata 5/6/7/8. "
-            "Each task requests 8 CPU and 64 GiB; campaign totals are 128 CPU "
-            "and 1 TiB. Raw task lifecycle is complete, but prior "
-            "geometry-predicted resonance is not final. The collector must "
-            "re-screen all rows with air-gap-tuned full physical primary-referred "
-            "Lm=2.000 mH and rebuild combined non-dominated sorting."
+            "Tasks 96397-96412 used the now-superseded W≤1000/L≤1200 axis "
+            "contract and are retained only as historical search evidence. The "
+            "5,120 terminal rows collapse to 4,683 unique geometries. Projection "
+            "onto the authoritative W≤1200/L≤1000 contract leaves 217 raw/210 "
+            "unique geometry-pass rows; all pass mean fixed-Lm resonance, but "
+            "none passes the combined thermal screen. The compact thermal "
+            "surrogate is extrapolative here (reported minimum 302.67°C), so its "
+            "temperature values cannot certify invalidity or feasibility. The "
+            "fixed-Lm rescore and non-dominated sorting are screening-only and "
+            "not production eligible."
         ),
-        "state": "in_progress",
+        "state": "blocked",
         "updated_at": observed_at,
-        "progress_pct": 65 if all_raw_succeeded else 20 + (succeeded * 40 // 16),
+        "progress_pct": 100 if all_raw_succeeded else 20 + (succeeded * 70 // 16),
         "evidence": [
             (
-                "axis A hard limits=W/drawing-x<=1000mm / "
-                "L/drawing-y<=1200mm / H<=750mm / rotation=false / "
-                "axis swap=false / primary=5.0mm gap1=1.6mm / "
-                "Lm=2.000mH tuned by air gap / Ltx=Lm+Llt_phys / "
-                "Lrx=Ltx*(N2/N1)^2 / min(fTx,fRx)>=15kHz"
+                "superseded historical axis=W/drawing-x<=1000mm / "
+                "L/perpendicular-y<=1200mm / H<=750mm / rotation=false / "
+                "axis swap=false / authoritative axis=false"
             ),
             (
                 "campaign=axis-v6 strict / seeds=16 / population=320 / "
@@ -2666,18 +2746,118 @@ def _axis_v6_card(
                 "per task=8CPU + 65536MB"
             ),
             (
-                f"prior task96395={str(warm['state']).upper()} / "
-                f"reason={warm['failure_message'] or 'none'} / "
-                "warm-start lane superseded=true / axis-v6 cold-start=true / "
+                f"raw terminal={HISTORICAL_AXIS_RAW_TERMINAL} / "
+                f"unique geometry={HISTORICAL_AXIS_UNIQUE_GEOMETRY} / "
+                "raw lifecycle complete=true / combined seed NDS generated=true"
+            ),
+            (
+                f"authoritative-axis projection geometry pass raw="
+                f"{NEW_AXIS_GEOMETRY_PASS_RAW} / unique="
+                f"{NEW_AXIS_GEOMETRY_PASS_UNIQUE} / all geometry-pass rows "
+                "mean resonance pass=true"
+            ),
+            (
+                f"geometry+resonance+thermal feasible={NEW_AXIS_THERMAL_FEASIBLE} / "
+                f"production Pareto Front={NEW_AXIS_PRODUCTION_PARETO} / "
+                "scientific PASS=0 / production PASS=0"
+            ),
+            (
+                "compact thermal surrogate extrapolation invalid=true / "
+                f"reported minimum={NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C:.2f}C / "
+                "temperature certification=false / retraining or FEA required"
+            ),
+            (
+                "fixed-Lm2mH classification=screening-only / "
+                "production eligible=false / automatic promotion=false / "
+                "historical result cannot answer whether NSGA-II must be rerun"
+            ),
+            (
+                f"prior task96395={str(warm['state']).upper()} superseded / "
                 f"{first_seed_outcome}"
             ),
             *task_evidence,
+        ],
+    }
+
+
+def _target_axis_card(
+    auxiliary_tasks: Mapping[int, Mapping[str, Any]],
+    observed_at: str,
+) -> dict[str, Any]:
+    tasks = [auxiliary_tasks[spec.task_id] for spec in TARGET_AXIS_TASK_SPECS]
+    categories = [_category(str(task["state"])) for task in tasks]
+    running = categories.count("running")
+    queued = categories.count("queued")
+    succeeded = categories.count("succeeded")
+    failed = categories.count("failed")
+    task_evidence = []
+    for index in range(0, len(tasks), 4):
+        group = tasks[index : index + 4]
+        task_evidence.append(
+            " | ".join(
+                (
+                    f"t{task['task_id']} s{task['seed']} N1="
+                    f"{task['primary_turns']} {str(task['state']).upper()} "
+                    f"{task['actual_node_name'] or 'pending'}/"
+                    f"j{task['slurm_job_id'] or 'none'}"
+                )
+                for task in group
+            )
+        )
+    return {
+        "id": TARGET_AXIS_CARD_ID,
+        "title": (
+            "AUTHORITATIVE W1200/L1000 TARGET NSGA-II | SUBMITTED 16 | "
+            f"RUNNING {running} · QUEUED {queued} · "
+            f"SUCCEEDED {succeeded} · FAILED {failed} | PASS 0"
+        ),
+        "detail": (
+            "This is the only optimization lane eligible to answer the current "
+            "design question: W follows the drawing-x/original 973 mm direction "
+            "and is limited to 1200 mm; L is perpendicular-y and is limited to "
+            "1000 mm; H is limited to 750 mm. Rotation and axis swapping are "
+            "forbidden, and primary winding thickness/gap remain fixed at "
+            "5.0/1.6 mm. Tasks 96416-96431 are now submitted as sixteen cold "
+            "random seeds, population 320 x 80 generations, requesting 128 CPU "
+            "and 1 TiB in aggregate. Fixed-Lm2mH screening and combined "
+            "non-dominated sorting remain pending; Scheduler success alone will "
+            "not be counted as scientific or production PASS."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 10 + (succeeded * 45 // 16),
+        "evidence": [
+            (
+                "authoritative contract=W/drawing-x/original-973-direction "
+                "<=1200mm / L/perpendicular-y<=1000mm / H<=750mm / "
+                "rotation=false / axis swap=false"
+            ),
+            (
+                "fixed winding controls=primary cw1 5.0mm / gap1 1.6mm / "
+                "cooling boundary=1.5m/s and TIM unchanged"
+            ),
+            (
+                f"campaign={TARGET_AXIS_CAMPAIGN} / tasks=96416-96431 / "
+                "seeds=16 / population=320 / generations=80"
+            ),
+            (
+                "requested total=128CPU + 1048576MiB / "
+                "per task=8CPU + 65536MiB / timeout=7200s / "
+                "max_workers_per_node=8"
+            ),
+            (
+                f"hard contract sha256={TARGET_AXIS_HARD_SHA256} / "
+                f"submission manifest={TARGET_AXIS_SUBMISSION_MANIFEST}"
+            ),
+            (
+                "historical W1000/L1200 axis-v6 eligible=false / "
+                "reference drawing baseline is not an optimized candidate"
+            ),
             (
                 "scientific PASS=0 / production PASS=0 / "
-                "prior geometry-predicted resonance final=false / "
-                "fixed-Lm2mH combined global NDS pending / "
-                "Pareto Front pending / automatic promotion=false"
+                "production Pareto Front=0 / canonical promotion=false"
             ),
+            *task_evidence,
         ],
     }
 
@@ -2687,45 +2867,70 @@ def _reference_baseline_card(
     observed_at: str,
     gui_root: Path,
 ) -> dict[str, Any]:
-    task = auxiliary_tasks[REFERENCE_BASELINE_TASK_SPEC.task_id]
+    original = auxiliary_tasks[REFERENCE_BASELINE_TASK_SPEC.task_id]
+    hedge = auxiliary_tasks[REFERENCE_THERMAL_HEDGE_TASK_SPEC.task_id]
+    task = auxiliary_tasks[REFERENCE_DIRECT_TASK_SPEC.task_id]
     local = _reference_local_stage(gui_root)
-    local_gui = "ACTIVE" if local["aedt_pid_active"] else "PID15444 EXITED"
+    local_gui = "PID44520 ACTIVE" if local["aedt_pid_active"] else "PID44520 EXITED"
     result_present = local["result_csv_present"] or local["result_parts_present"]
     stage = (
-        "LOCAL LOSS RESTORE FAILED"
+        "THERMAL MESH RUNNING"
+        if local["thermal_running"]
+        else "MATRIX/CAP COMPLETE · LOSS RUNNING"
+        if local["loss_running"]
+        else "LOCAL LOSS RESTORE FAILED"
         if local["loss_restore_failed"]
-        else "MATRIX/CAP SOLVED · LOSS/THERMAL PENDING"
+        else "MATRIX/CAP COMPLETE · LOSS/THERMAL PENDING"
         if local["matrix_solved"] and local["cap_solved"]
         else "MATRIX/CAP BUILD OR SOLVE IN PROGRESS"
+    )
+    local_detail = (
+        "Local retry-v2 has completed Matrix (10 passes), Capacitance "
+        "(3 passes), and loss, and PID44520 is now executing the Icepak "
+        "ThermalSetup mesh under controller PID34080."
+        if local["thermal_running"]
+        else "Local retry-v2 has actually completed Matrix (10 passes) and "
+        "Capacitance (3 passes), and PID44520 is solving maxwell_loss under "
+        "controller PID34080. Thermal has not been dispatched."
     )
     return {
         "id": REFERENCE_BASELINE_CARD_ID,
         "title": (
-            "REFERENCE BASELINE | M/C SOLVED · Lm2mH f_lim 12.788k<15k | "
-            f"Slurm96396 {str(task['state']).upper()} "
+            f"REFERENCE BASELINE | LOCAL {stage} · {local_gui} | "
+            f"REMOTE96415 DIRECT {str(task['state']).upper()} "
             f"{task['actual_node_name'] or 'pending'}/j"
-            f"{task['slurm_job_id'] or 'none'} | LOCAL {local_gui}"
+            f"{task['slurm_job_id'] or 'none'}"
         ),
         "detail": (
             "This track evaluates the literal 설계도면260706 baseline with "
             "primary 5.0/1.6 mm using standard symmetric, unrounded FEA. It is a "
-            "reference baseline only and is not one of the axis-v6 optimized "
-            "candidates. The exact raw Matrix/Cap result gives 6.525010 kHz with "
-            "raw Lm=7.682399 mH. Under the new final screen with air-gap-tuned "
-            "Lm=2.000 mH and unchanged capacitance, the limiting resonance is "
-            "12.788 kHz, still below 15 kHz. The local loss Analyze completed but "
-            "DSO restoration failed after PID15444 exited; Slurm remains live."
+            "reference baseline only and is not an optimized candidate. Local "
+            f"status: {local_detail} Remote task96396 and the task96414 hedge "
+            "were cancelled after stalling before thermal dispatch. Exact "
+            "direct-analyze replacement task96415 is the active remote reference "
+            "lane and remains separate from local result authority."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 55 if local["loss_dispatched"] else 30,
+        "progress_pct": (
+            75
+            if local["thermal_running"]
+            else 65
+            if local["loss_running"]
+            else 55
+            if local["loss_dispatched"]
+            else 30
+        ),
         "evidence": [
             (
-                f"Slurm task96396={str(task['state']).upper()} / "
+                f"active Slurm task96415={str(task['state']).upper()} / "
                 f"node={task['actual_node_name'] or 'pending'} / "
                 f"allocation={task['allocation_id'] or 'none'} / "
                 f"job={task['slurm_job_id'] or 'none'} / "
-                f"account={task['account_name'] or 'pending'}"
+                f"account={task['account_name'] or 'pending'} / "
+                "exact direct-analyze replacement=true / "
+                f"superseded task96396={str(original['state']).upper()} / "
+                f"task96414={str(hedge['state']).upper()}"
             ),
             (
                 "baseline geometry=symmetric eighth / winding=unrounded / "
@@ -2733,9 +2938,9 @@ def _reference_baseline_card(
                 "not an axis-v6 candidate"
             ),
             (
-                f"local AEDT PID15444 active="
+                f"local AEDT PID44520 active="
                 f"{str(local['aedt_pid_active']).lower()} / "
-                f"python PID47256 active={str(local['python_pid_active']).lower()} / "
+                f"python PID34080 active={str(local['python_pid_active']).lower()} / "
                 f"local stage={stage}"
             ),
             f"local project={local['project_path']}",
@@ -2743,9 +2948,16 @@ def _reference_baseline_card(
                 f"matrix solved={str(local['matrix_solved']).lower()} / "
                 f"cap solved={str(local['cap_solved']).lower()} / "
                 f"loss dispatched={str(local['loss_dispatched']).lower()} / "
-                f"loss DSO restore failed="
-                f"{str(local['loss_restore_failed']).lower()} / "
-                f"thermal dispatched={str(local['thermal_dispatched']).lower()}"
+                f"loss running={str(local['loss_running']).lower()} / "
+                f"loss result root present="
+                f"{str(local['loss_result_root_present']).lower()} / "
+                f"thermal dispatched={str(local['thermal_dispatched']).lower()} / "
+                f"thermal running={str(local['thermal_running']).lower()}"
+            ),
+            (
+                "actual convergence=Matrix 10/20 passes, current energy "
+                "error 1.0127%, delta 0.051887% / Cap 3/10 passes, "
+                "energy error 0.83451%, delta 0.92544%"
             ),
             (
                 "full-restored exact matrix: Lm=7.682399mH / "
@@ -2770,12 +2982,12 @@ def _reference_baseline_card(
                 "result parquet present="
                 f"{str(local['result_parts_present']).lower()} / "
                 f"Results reports pending={str(not result_present).lower()} / "
-                "local loss/thermal authenticated=false"
+                "local loss result pending / thermal authenticated=false"
             ),
             (
                 "historical reference resonance_pass=false / "
-                "axis-v6 candidate=false / scientific PASS=0 / "
-                "production PASS=0 / Slurm loss/thermal Results pending"
+                "optimized candidate=false / scientific PASS=0 / "
+                "production PASS=0 / local loss + thermal Results pending"
             ),
         ],
     }
@@ -3080,30 +3292,45 @@ def _live_summary(
             _category(str(auxiliary_tasks[spec.task_id]["state"]))
             for spec in AXIS_V6_TASK_SPECS
         ]
-        reference = auxiliary_tasks[REFERENCE_BASELINE_TASK_SPEC.task_id]
+        reference_original = auxiliary_tasks[REFERENCE_BASELINE_TASK_SPEC.task_id]
+        reference_hedge = auxiliary_tasks[REFERENCE_THERMAL_HEDGE_TASK_SPEC.task_id]
+        reference = auxiliary_tasks[REFERENCE_DIRECT_TASK_SPEC.task_id]
         warm = auxiliary_tasks[SUPERSEDED_WARM_TASK_SPEC.task_id]
+        target_categories = [
+            _category(str(auxiliary_tasks[spec.task_id]["state"]))
+            for spec in TARGET_AXIS_TASK_SPECS
+        ]
         authoritative = (
-            "axis-v6 5T/1.6 NSGA-II "
+            "superseded W1000/L1200 axis-v6 "
             f"running{axis_categories.count('running')} · "
             f"queued{axis_categories.count('queued')} · "
             f"succeeded{axis_categories.count('succeeded')} · "
             f"failed{axis_categories.count('failed')} (16 seeds, "
-            "pop320x80, 128CPU/1TiB requested). "
-            f"reference baseline task96396={str(reference['state']).upper()} "
+            "raw5120/unique4683); corrected-axis projection geometry "
+            "raw217/unique210, all mean-resonance pass, combined thermal "
+            "feasible0/PF0, compact surrogate extrapolation invalid "
+            "(reported min302.67C). Authoritative W1200/L1000 targeted "
+            f"campaign tasks96416-96431 running{target_categories.count('running')} "
+            f"queued{target_categories.count('queued')} "
+            f"succeeded{target_categories.count('succeeded')} "
+            f"failed{target_categories.count('failed')}. "
+            f"reference direct task96415={str(reference['state']).upper()} "
             f"{reference['actual_node_name'] or 'pending'}/"
-            f"job{reference['slurm_job_id'] or 'none'}; Matrix/Cap solved, "
-            "Lm2mH hypothetical f_lim=12.788kHz<15kHz, historical resonance "
-            "fail, loss/thermal Results pending. "
+            f"job{reference['slurm_job_id'] or 'none'}; "
+            f"task96396={str(reference_original['state']).upper()} and "
+            f"task96414={str(reference_hedge['state']).upper()} superseded; "
+            "local retry-v2 Matrix/Cap/loss complete and thermal mesh running. "
             f"old warm task96395={str(warm['state']).upper()} superseded. "
         )
     summary = (
-        f"{observed:%H:%M} KST · 축 계약: W=도면x≤1000, L=도면y≤1200, "
+        f"{observed:%H:%M} KST · 권위 축 계약: W=도면x≤1200, L=수직y≤1000, "
         "H≤750, 회전/축교환 금지, 1차=5T/1.6mm. "
         f"{authoritative}"
         "candidate #5/cw1=1.13 및 task96340/96342는 CANCELLED·invalid. "
         "공진 최종 screen은 air-gap tuned full physical primary-referred "
-        "Lm=2.000mH, Ltx=Lm+Llt_phys, Lrx=Ltx*(N2/N1)^2이며 axis-v6 "
-        "fixed-Lm global NDS 재구축 전입니다. "
+        "Lm=2.000mH, Ltx=Lm+Llt_phys, Lrx=Ltx*(N2/N1)^2입니다. "
+        "기존 fixed-Lm rescore/NDS는 thermal screening-only이며 production "
+        "eligible이 아닙니다. "
         "verification=standard/unrounded symmetric; rounded=도면/Full 형상 "
         "시각화 전용. original_deadline_missed=true. "
         "인증된 scientific PASS는 없습니다. "
@@ -3237,6 +3464,10 @@ def merge_status(
             raise UpdaterError("authoritative auxiliary task set drifted")
         _upsert_priority_current_card(
             result,
+            _axis_v6_card(auxiliary_tasks, observed_at),
+        )
+        _upsert_priority_current_card(
+            result,
             _reference_baseline_card(
                 auxiliary_tasks,
                 observed_at,
@@ -3245,10 +3476,11 @@ def merge_status(
         )
         _upsert_priority_current_card(
             result,
-            _axis_v6_card(auxiliary_tasks, observed_at),
+            _target_axis_card(auxiliary_tasks, observed_at),
         )
     else:
         _remove_current_card(result, AXIS_V6_CARD_ID)
+        _remove_current_card(result, TARGET_AXIS_CARD_ID)
         _remove_current_card(result, REFERENCE_BASELINE_CARD_ID)
     _upsert_priority_current_card(
         result,
@@ -3429,6 +3661,14 @@ def merge_status(
         if auxiliary_tasks is not None
         else []
     )
+    target_axis_categories = (
+        [
+            _category(str(auxiliary_tasks[spec.task_id]["state"]))
+            for spec in TARGET_AXIS_TASK_SPECS
+        ]
+        if auxiliary_tasks is not None
+        else []
+    )
     result[SYNC_KEY] = _sealed(
         {
             "schema_version": SYNC_SCHEMA,
@@ -3444,6 +3684,15 @@ def merge_status(
             else [],
             "axis_v6": {
                 "task_ids": [spec.task_id for spec in AXIS_V6_TASK_SPECS],
+                "superseded_historical": True,
+                "production_eligible": False,
+                "historical_axis_contract": {
+                    "width_drawing_x_max_mm": 1_000.0,
+                    "length_perpendicular_y_max_mm": 1_200.0,
+                    "height_max_mm": 750.0,
+                    "rotation_allowed": False,
+                    "axis_swap_allowed": False,
+                },
                 "running": axis_categories.count("running"),
                 "queued": axis_categories.count("queued"),
                 "succeeded": axis_categories.count("succeeded"),
@@ -3453,6 +3702,22 @@ def merge_status(
                 "raw_lifecycle_complete": (
                     axis_categories.count("succeeded") == 16
                 ),
+                "raw_terminal": HISTORICAL_AXIS_RAW_TERMINAL,
+                "unique_geometry": HISTORICAL_AXIS_UNIQUE_GEOMETRY,
+                "authoritative_axis_projection": {
+                    "geometry_pass_raw": NEW_AXIS_GEOMETRY_PASS_RAW,
+                    "geometry_pass_unique": NEW_AXIS_GEOMETRY_PASS_UNIQUE,
+                    "all_geometry_pass_mean_resonance_pass": True,
+                    "thermal_feasible": NEW_AXIS_THERMAL_FEASIBLE,
+                    "production_pareto_count": NEW_AXIS_PRODUCTION_PARETO,
+                },
+                "thermal_screening": {
+                    "surrogate_extrapolation_invalid": True,
+                    "reported_minimum_C": (
+                        NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C
+                    ),
+                    "classification": "screening-only",
+                },
                 "resonance_screening_contract": {
                     "primary_referred_full_physical": True,
                     "lm_mH": 2.0,
@@ -3462,8 +3727,34 @@ def merge_status(
                     "minimum_resonance_Hz": 15_000.0,
                 },
                 "scientific_pass_generated": False,
-                "global_nds_generated": False,
-                "fixed_lm_global_nds_generated": False,
+                "global_nds_generated": True,
+                "fixed_lm_global_nds_generated": True,
+            }
+            if auxiliary_tasks is not None
+            else None,
+            "target_axis": {
+                "width_drawing_x_max_mm": 1_200.0,
+                "length_perpendicular_y_max_mm": 1_000.0,
+                "height_max_mm": 750.0,
+                "rotation_allowed": False,
+                "axis_swap_allowed": False,
+                "primary_winding_thickness_mm": 5.0,
+                "primary_winding_gap_mm": 1.6,
+                "submission_state": "submitted",
+                "campaign": TARGET_AXIS_CAMPAIGN,
+                "hard_contract_sha256": TARGET_AXIS_HARD_SHA256,
+                "submission_manifest": str(TARGET_AXIS_SUBMISSION_MANIFEST),
+                "task_ids": [spec.task_id for spec in TARGET_AXIS_TASK_SPECS],
+                "running": target_axis_categories.count("running"),
+                "queued": target_axis_categories.count("queued"),
+                "succeeded": target_axis_categories.count("succeeded"),
+                "failed": target_axis_categories.count("failed"),
+                "requested_total_cpus": 128,
+                "requested_total_memory_mb": 1_048_576,
+                "population": 320,
+                "generations": 80,
+                "scientific_pass_generated": False,
+                "production_pareto_count": 0,
             }
             if auxiliary_tasks is not None
             else None,

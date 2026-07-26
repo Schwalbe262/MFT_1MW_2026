@@ -155,6 +155,7 @@ def _mixed_auxiliary_tasks() -> dict[int, dict[str, Any]]:
             }
         elif spec.task_id == 96396:
             values = {
+                "state": "cancelled",
                 "node": "n111",
                 "account": "r1jae262",
                 "allocation_id": 14651,
@@ -162,6 +163,29 @@ def _mixed_auxiliary_tasks() -> dict[int, dict[str, Any]]:
             }
         elif spec.task_id == 96397:
             values = {"state": "succeeded"}
+        elif spec.task_id == 96414:
+            values = {
+                "state": "cancelled",
+                "node": "n112",
+                "account": "r1jae262",
+                "allocation_id": 14649,
+                "slurm_job_id": "840584",
+            }
+        elif spec.task_id == 96415:
+            values = {
+                "node": "n111",
+                "account": "r1jae262",
+                "allocation_id": 14651,
+                "slurm_job_id": "840787",
+            }
+        elif spec in updater.TARGET_AXIS_TASK_SPECS:
+            values = {
+                "state": "queued",
+                "allocation_id": None,
+                "slurm_job_id": "",
+                "node": "",
+                "account": "",
+            }
         result[spec.task_id] = updater._validate_auxiliary_task(
             spec,
             _aux_task(spec, **values),
@@ -446,15 +470,13 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     (run_root / "simulation1.aedt").write_bytes(b"aedt")
     (run_root / "convergence_matrix.txt").write_text("matrix", encoding="utf-8")
     (run_root / "convergence_cap.txt").write_text("cap", encoding="utf-8")
-    (gui_root / "local_gui_stdout.log").write_text(
-        'SOLVER_CORE_DISPATCH_JSON {"stage":"loss"}\n',
+    (gui_root / "local_thermal_retry_stdout.log").write_text(
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"loss"}\n'
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"thermal"}\n',
         encoding="utf-8",
     )
-    (gui_root / "local_gui_stderr.log").write_text(
-        "[loss] native Analyze completed but DSO restore failed\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(updater, "_pid_exists", lambda pid: pid == 47256)
+    (gui_root / "local_thermal_retry_stderr.log").write_text("", encoding="utf-8")
+    monkeypatch.setattr(updater, "_pid_exists", lambda pid: pid in {34080, 44520})
 
     merged = updater.merge_status(
         _status(),
@@ -466,12 +488,18 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     sync = updater.validate_status_sync(merged)
     ids = [item["id"] for item in merged["current"]]
 
-    assert ids[:3] == [
+    assert ids[:4] == [
         updater.PRIMARY_5T_RECOVERY_CARD_ID,
-        updater.AXIS_V6_CARD_ID,
+        updater.TARGET_AXIS_CARD_ID,
         updater.REFERENCE_BASELINE_CARD_ID,
+        updater.AXIS_V6_CARD_ID,
     ]
-    axis = merged["current"][1]
+    target = merged["current"][1]
+    assert "AUTHORITATIVE W1200/L1000" in target["title"]
+    assert "SUBMITTED 16" in target["title"]
+    assert "QUEUED 16" in target["title"]
+    axis = merged["current"][3]
+    assert "SUPERSEDED HISTORICAL WRONG AXIS" in axis["title"]
     assert "RUNNING 15" in axis["title"]
     assert "SUCCEEDED 1" in axis["title"]
     assert any(
@@ -488,10 +516,10 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
         for value in axis["evidence"]
     )
     reference = merged["current"][2]
-    assert "M/C SOLVED" in reference["title"]
-    assert "Lm2mH f_lim 12.788k<15k" in reference["title"]
-    assert "Slurm96396 RUNNING n111/j840787" in reference["title"]
-    assert "LOCAL PID15444 EXITED" in reference["title"]
+    assert "THERMAL MESH RUNNING" in reference["title"]
+    assert "REMOTE96415 DIRECT RUNNING n111/j840787" in reference["title"]
+    assert "LOCAL" in reference["title"]
+    assert "PID44520 ACTIVE" in reference["title"]
     assert any(
         "Lm=7.682399mH" in value
         and "k=0.995902386" in value
@@ -511,20 +539,29 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
         for value in reference["evidence"]
     )
     assert any(
-        "loss DSO restore failed=true" in value
-        and "thermal dispatched=false" in value
+        "loss running=false" in value
+        and "thermal dispatched=true" in value
+        and "thermal running=true" in value
         for value in reference["evidence"]
     )
-    assert sync["authoritative_task_ids"] == list(range(96395, 96413))
+    assert sync["authoritative_task_ids"] == [
+        spec.task_id for spec in updater.AUTHORITATIVE_AUXILIARY_TASK_SPECS
+    ]
     assert sync["axis_v6"]["running"] == 15
     assert sync["axis_v6"]["succeeded"] == 1
+    assert sync["axis_v6"]["superseded_historical"] is True
     assert sync["axis_v6"]["scientific_pass_generated"] is False
-    assert sync["axis_v6"]["global_nds_generated"] is False
-    assert sync["axis_v6"]["fixed_lm_global_nds_generated"] is False
+    assert sync["axis_v6"]["global_nds_generated"] is True
+    assert sync["axis_v6"]["fixed_lm_global_nds_generated"] is True
     assert sync["axis_v6"]["resonance_screening_contract"]["lm_mH"] == 2.0
+    assert sync["target_axis"]["width_drawing_x_max_mm"] == 1_200.0
+    assert sync["target_axis"]["length_perpendicular_y_max_mm"] == 1_000.0
+    assert sync["target_axis"]["submission_state"] == "submitted"
+    assert sync["target_axis"]["queued"] == 16
+    assert sync["target_axis"]["task_ids"] == list(range(96416, 96432))
 
 
-def test_axis_v6_raw_completion_waits_for_fixed_lm_global_nds() -> None:
+def test_axis_v6_raw_completion_is_historical_screening_only() -> None:
     tasks = _mixed_auxiliary_tasks()
     for spec in updater.AXIS_V6_TASK_SPECS:
         tasks[spec.task_id] = updater._validate_auxiliary_task(
@@ -534,18 +571,26 @@ def test_axis_v6_raw_completion_waits_for_fixed_lm_global_nds() -> None:
 
     card = updater._axis_v6_card(tasks, OBSERVED)
 
-    assert "RAW LIFECYCLE 16/16 SUCCEEDED" in card["title"]
-    assert "Lm=2mH RESCREEN + GLOBAL NDS REBUILD PENDING" in card["title"]
-    assert card["progress_pct"] == 65
-    assert "prior geometry-predicted resonance is not final" in card["detail"]
+    assert "SUPERSEDED HISTORICAL WRONG AXIS" in card["title"]
+    assert "AXIS-v6 16/16 SUCCEEDED" in card["title"]
+    assert "NEW-AXIS FEASIBLE 0 · PF 0" in card["title"]
+    assert card["progress_pct"] == 100
+    assert "5,120 terminal rows" in card["detail"]
+    assert "4,683 unique geometries" in card["detail"]
     assert any(
-        "Lm=2.000mH tuned by air gap" in value
-        and "min(fTx,fRx)>=15kHz" in value
+        "geometry pass raw=217" in value
+        and "unique=210" in value
+        and "mean resonance pass=true" in value
         for value in card["evidence"]
     )
     assert any(
-        "fixed-Lm2mH combined global NDS pending" in value
-        and "scientific PASS=0" in value
+        "compact thermal surrogate extrapolation invalid=true" in value
+        and "reported minimum=302.67C" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "fixed-Lm2mH classification=screening-only" in value
+        and "production eligible=false" in value
         for value in card["evidence"]
     )
 
@@ -998,8 +1043,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     )
     recovery = merged["current"][0]
     assert recovery["id"] == updater.PRIMARY_5T_RECOVERY_CARD_ID
-    assert "W=x≤1000" in recovery["title"]
-    assert "L=y≤1200" in recovery["title"]
+    assert "W=x≤1200" in recovery["title"]
+    assert "L=y≤1000" in recovery["title"]
     assert "회전·축교환 금지" in recovery["title"]
     assert recovery["progress_pct"] == 25
     assert any(
@@ -1008,8 +1053,13 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         for value in recovery["evidence"]
     )
     assert any(
-        "new optimization=axis-v6 tasks96397-96412" in value
-        and "16 cold-random seeds" in value
+        "superseded optimization=axis-v6 tasks96397-96412" in value
+        and "wrong W<=1000,L<=1200 axis" in value
+        for value in recovery["evidence"]
+    )
+    assert any(
+        "current target optimization=W<=1200,L<=1000,H<=750" in value
+        and "submission pending" in value
         for value in recovery["evidence"]
     )
     assert any(
