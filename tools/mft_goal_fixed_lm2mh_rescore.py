@@ -30,7 +30,7 @@ INPUT_ROOT = Path(
 )
 OUTPUT_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_primary_5t_gap1_1p6_axis_w1200_l1000_fixed_lm2mh_rescore"
+    r"\fixed_primary_5t_gap1_1p6_axis_w1200_l1000_fixed_lm2mh_splittemp_v2"
 )
 GENERATION = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
@@ -58,7 +58,7 @@ RESONANCE_MIN_HZ = 15_000.0
 RESONANCE_NORMALIZATION_HZ = 150.0
 PRIMARY_CONTROL_ABS_TOL_MM = 1e-12
 EFFECTIVE_HARD_SPEC = {
-    "schema_version": "mft-goal-fixed-primary-5t-axis-w1200-l1000-lm2mh-v1",
+    "schema_version": "mft-goal-fixed-primary-5t-axis-w1200-l1000-lm2mh-v2",
     "primary_conductor_thickness_mm": 5.0,
     "primary_interturn_gap_mm": 1.6,
     "primary_controls_are_hard_fixed": True,
@@ -72,7 +72,8 @@ EFFECTIVE_HARD_SPEC = {
     "magnetizing_inductance_basis": "full-physical-primary-referred",
     "magnetizing_inductance_tuning": "explicit-air-gap",
     "self_resonance_min_Hz": RESONANCE_MIN_HZ,
-    "winding_temperature_max_C": 100.0,
+    "primary_winding_temperature_max_C": 100.0,
+    "secondary_winding_temperature_max_C": 120.0,
     "core_temperature_max_C": 120.0,
     "fan_velocity_m_s": 1.5,
     "cooling_and_TIM_mutation_allowed": False,
@@ -464,14 +465,18 @@ def run(*, input_root: Path, output: Path, generation: Path) -> dict[str, Any]:
         "exterior_W_mm_fixed_lm2mh": [],
         "exterior_L_mm_fixed_lm2mh": [],
         "exterior_H_mm_fixed_lm2mh": [],
+        "primary_winding_robust_max_C_fixed_lm2mh": [],
+        "secondary_winding_robust_max_C_fixed_lm2mh": [],
         "winding_robust_max_C_fixed_lm2mh": [],
         "core_robust_max_C_fixed_lm2mh": [],
     }
-    winding_targets = (
+    primary_winding_targets = (
         "T_max_Tx",
+        "Tprobe_Tx_leeward_max",
+    )
+    secondary_winding_targets = (
         "T_max_Rx_main",
         "T_max_Rx_side",
-        "Tprobe_Tx_leeward_max",
         "Tprobe_Rx_main_leeward_max",
         "Tprobe_Rx_side_leeward_max",
     )
@@ -493,6 +498,15 @@ def run(*, input_root: Path, output: Path, generation: Path) -> dict[str, Any]:
             for name, value in json.loads(row["normalized_G_json"]).items()
             if name != OLD_RESONANCE_CONSTRAINT
         }
+        # The source campaign used a single 100 C winding limit.  Reclassify
+        # its raw robust secondary-temperature constraints against the
+        # user-authoritative 120 C secondary limit without changing any
+        # surrogate prediction.  The campaign thermal normalization is 10 C.
+        for target in secondary_winding_targets:
+            name = f"temperature_robust_limit:{target}"
+            if name in source_physical_g:
+                source_physical_g[name] -= 20.0
+                source_normalized_g[name] = source_physical_g[name] / 10.0
         actual_width_mm = (
             1000.0 + source_physical_g["exterior_width_limit"]
         )
@@ -556,12 +570,24 @@ def run(*, input_root: Path, output: Path, generation: Path) -> dict[str, Any]:
         derived["exterior_H_mm_fixed_lm2mh"].append(
             750.0 + physical_g["exterior_height_limit"]
         )
+        primary_winding_max = max(
+            100.0 + physical_g[f"temperature_robust_limit:{target}"]
+            for target in primary_winding_targets
+            if f"temperature_robust_limit:{target}" in physical_g
+        )
+        secondary_winding_max = max(
+            120.0 + physical_g[f"temperature_robust_limit:{target}"]
+            for target in secondary_winding_targets
+            if f"temperature_robust_limit:{target}" in physical_g
+        )
+        derived["primary_winding_robust_max_C_fixed_lm2mh"].append(
+            primary_winding_max
+        )
+        derived["secondary_winding_robust_max_C_fixed_lm2mh"].append(
+            secondary_winding_max
+        )
         derived["winding_robust_max_C_fixed_lm2mh"].append(
-            max(
-                100.0 + physical_g[f"temperature_robust_limit:{target}"]
-                for target in winding_targets
-                if f"temperature_robust_limit:{target}" in physical_g
-            )
+            max(primary_winding_max, secondary_winding_max)
         )
         derived["core_robust_max_C_fixed_lm2mh"].append(
             max(
@@ -651,7 +677,7 @@ def run(*, input_root: Path, output: Path, generation: Path) -> dict[str, Any]:
     )
     selections = [_selection_record(row) for _, row in selection_pool.iterrows()]
     status = {
-        "schema_version": "mft-goal-fixed-lm2mh-rescore-v1",
+        "schema_version": "mft-goal-fixed-lm2mh-rescore-v2",
         "classification": "screening-only",
         "production_eligible": False,
         "thermal_surrogate_retrained_for_explicit_gap_or_Lm2mH_current": False,

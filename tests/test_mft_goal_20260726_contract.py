@@ -326,8 +326,23 @@ def test_goal_contract_is_exact_and_forbids_legacy_scalar_fields():
         "H": 750.0,
     }
     assert goal.TEMPERATURE_FAMILY_LIMITS_C == {
-        "winding": 100.0,
+        "primary_winding": 100.0,
+        "secondary_winding": 120.0,
         "core": 120.0,
+    }
+    assert {
+        target: goal.temperature_limit_for_target(target)
+        for target in goal.PRIMARY_WINDING_TEMPERATURE_TARGETS
+    } == {
+        target: 100.0
+        for target in goal.PRIMARY_WINDING_TEMPERATURE_TARGETS
+    }
+    assert {
+        target: goal.temperature_limit_for_target(target)
+        for target in goal.SECONDARY_WINDING_TEMPERATURE_TARGETS
+    } == {
+        target: 120.0
+        for target in goal.SECONDARY_WINDING_TEMPERATURE_TARGETS
     }
     assert goal.GOAL_RESONANCE_MIN_HZ == 15_000.0
     assert "resonance_max_Hz" not in goal.GOAL_STAGE_SPEC
@@ -398,11 +413,15 @@ def test_goal_problem_uses_split_temperature_and_generalized_budget(
     body_winding_index = problem.constraint_names.index(
         "temperature_robust_limit:T_max_Tx"
     )
+    secondary_winding_index = problem.constraint_names.index(
+        "temperature_robust_limit:T_max_Rx_main"
+    )
     core_index = problem.constraint_names.index(
         "temperature_robust_limit:Tprobe_core_center_max"
     )
     assert output["G"][0, winding_index] == pytest.approx(0.25)
     assert output["G"][0, body_winding_index] == pytest.approx(0.25)
+    assert output["G"][0, secondary_winding_index] == pytest.approx(-19.75)
     assert output["G"][0, core_index] == pytest.approx(-0.75)
     assert "core_group_dynamic_validity" in problem.constraint_names
     assert "core_group_manufacturability_limit" not in (
@@ -729,7 +748,7 @@ def _valid_goal_fea_result():
             "full_model": 1,
             "B_max_core": 1.0,
             "T_max_Tx": 100.0,
-            "T_max_Rx_main": 100.0,
+            "T_max_Rx_main": 120.0,
             "T_max_core": 120.0,
             "P_winding_total": 3.0,
             "P_Tx_main_group": 1.0,
@@ -742,7 +761,11 @@ def _valid_goal_fea_result():
             "thermal_pad_conductivity_W_mK": 0.2,
             **{
                 target: 99.0
-                for target in goal.PROBE_WINDING_TEMPERATURE_TARGETS
+                for target in goal.PROBE_PRIMARY_WINDING_TEMPERATURE_TARGETS
+            },
+            **{
+                target: 119.0
+                for target in goal.PROBE_SECONDARY_WINDING_TEMPERATURE_TARGETS
             },
             **{
                 target: 119.0
@@ -768,6 +791,12 @@ def test_final_gate_uses_split_temperature_box_resonance_and_identity():
     hot_probe = dict(valid, Tprobe_Tx_leeward_max=100.01)
     assert "temperature_out_of_spec:Tprobe_Tx_leeward_max" in (
         finalize.physical_spec_reasons(hot_probe)
+    )
+    secondary_at_limit = dict(valid, T_max_Rx_main=120.0)
+    assert finalize.physical_spec_reasons(secondary_at_limit) == []
+    secondary_hot = dict(valid, T_max_Rx_main=120.01)
+    assert "temperature_out_of_spec:T_max_Rx_main" in (
+        finalize.physical_spec_reasons(secondary_hot)
     )
     scalar = dict(valid, T_limit_C=100.0)
     assert "goal_legacy_scalar_temperature_forbidden" in (

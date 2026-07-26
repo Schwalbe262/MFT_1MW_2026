@@ -17,18 +17,24 @@ from typing import Any, Mapping
 
 
 GOAL_CAMPAIGN_ID = "mft-goal-20260726"
-GOAL_CONTRACT_SCHEMA = "mft-goal-20260726-hard-contract-v1"
+GOAL_CONTRACT_SCHEMA = "mft-goal-20260726-hard-contract-v2"
 GOAL_TEMPERATURE_CONTRACT_SCHEMA = (
-    "mft-goal-20260726-split-temperature-contract-v1"
+    "mft-goal-20260726-split-temperature-contract-v2"
 )
 GOAL_TERMINAL_TABLE_SCHEMA = (
     "mft-goal-20260726-terminal-physical-candidates-v1"
 )
 
-PROBE_WINDING_TEMPERATURE_TARGETS = (
+PROBE_PRIMARY_WINDING_TEMPERATURE_TARGETS = (
     "Tprobe_Tx_leeward_max",
+)
+PROBE_SECONDARY_WINDING_TEMPERATURE_TARGETS = (
     "Tprobe_Rx_main_leeward_max",
     "Tprobe_Rx_side_leeward_max",
+)
+PROBE_WINDING_TEMPERATURE_TARGETS = (
+    *PROBE_PRIMARY_WINDING_TEMPERATURE_TARGETS,
+    *PROBE_SECONDARY_WINDING_TEMPERATURE_TARGETS,
 )
 PROBE_CORE_TEMPERATURE_TARGETS = (
     "Tprobe_core_center_max",
@@ -40,15 +46,27 @@ PROBE_TEMPERATURE_TARGETS = (
     *PROBE_WINDING_TEMPERATURE_TARGETS,
     *PROBE_CORE_TEMPERATURE_TARGETS,
 )
-BODY_WINDING_TEMPERATURE_TARGETS = (
-    "T_max_Tx",
+BODY_PRIMARY_WINDING_TEMPERATURE_TARGETS = ("T_max_Tx",)
+BODY_SECONDARY_WINDING_TEMPERATURE_TARGETS = (
     "T_max_Rx_main",
     "T_max_Rx_side",
+)
+BODY_WINDING_TEMPERATURE_TARGETS = (
+    *BODY_PRIMARY_WINDING_TEMPERATURE_TARGETS,
+    *BODY_SECONDARY_WINDING_TEMPERATURE_TARGETS,
 )
 BODY_CORE_TEMPERATURE_TARGETS = ("T_max_core",)
 WINDING_TEMPERATURE_TARGETS = (
     *BODY_WINDING_TEMPERATURE_TARGETS,
     *PROBE_WINDING_TEMPERATURE_TARGETS,
+)
+PRIMARY_WINDING_TEMPERATURE_TARGETS = (
+    *BODY_PRIMARY_WINDING_TEMPERATURE_TARGETS,
+    *PROBE_PRIMARY_WINDING_TEMPERATURE_TARGETS,
+)
+SECONDARY_WINDING_TEMPERATURE_TARGETS = (
+    *BODY_SECONDARY_WINDING_TEMPERATURE_TARGETS,
+    *PROBE_SECONDARY_WINDING_TEMPERATURE_TARGETS,
 )
 CORE_TEMPERATURE_TARGETS = (
     *BODY_CORE_TEMPERATURE_TARGETS,
@@ -80,11 +98,19 @@ GOAL_G0_MODEL_TARGETS = (
 if len(GOAL_G0_MODEL_TARGETS) != 25:
     raise RuntimeError("goal G0 must contain exactly 25 model targets")
 TEMPERATURE_FAMILY_LIMITS_C = {
-    "winding": 100.0,
+    "primary_winding": 100.0,
+    "secondary_winding": 120.0,
     "core": 120.0,
 }
 TEMPERATURE_TARGET_FAMILIES = {
-    **{target: "winding" for target in WINDING_TEMPERATURE_TARGETS},
+    **{
+        target: "primary_winding"
+        for target in PRIMARY_WINDING_TEMPERATURE_TARGETS
+    },
+    **{
+        target: "secondary_winding"
+        for target in SECONDARY_WINDING_TEMPERATURE_TARGETS
+    },
     **{target: "core" for target in CORE_TEMPERATURE_TARGETS},
 }
 TEMPERATURE_TARGET_LIMITS_C = {
@@ -156,11 +182,17 @@ LEGACY_GOAL_FORBIDDEN_KEYS = frozenset(
 
 GOAL_TEMPERATURE_CONTRACT = {
     "schema_version": GOAL_TEMPERATURE_CONTRACT_SCHEMA,
-    "semantic_version": "split-winding100-core120-q90-half-width-v1",
+    "semantic_version": (
+        "split-primary100-secondary120-core120-q90-half-width-v2"
+    ),
     "families": {
-        "winding": {
+        "primary_winding": {
             "robust_upper_bound_C": 100.0,
-            "targets": list(WINDING_TEMPERATURE_TARGETS),
+            "targets": list(PRIMARY_WINDING_TEMPERATURE_TARGETS),
+        },
+        "secondary_winding": {
+            "robust_upper_bound_C": 120.0,
+            "targets": list(SECONDARY_WINDING_TEMPERATURE_TARGETS),
         },
         "core": {
             "robust_upper_bound_C": 120.0,

@@ -39,8 +39,8 @@ from tools.mft_goal_fixed_primary_5t_collect import (
 )
 
 
-SCHEMA = "mft-goal-fixed-lm2mh-targeted-global-nds-v1"
-PARETO_SCHEMA = "mft-goal-fixed-lm2mh-targeted-pareto-manifest-v1"
+SCHEMA = "mft-goal-fixed-lm2mh-targeted-global-nds-v2"
+PARETO_SCHEMA = "mft-goal-fixed-lm2mh-targeted-pareto-manifest-v2"
 SMOKE_SCHEMA = "mft-goal-fixed-lm2mh-official5-projected-smoke-v1"
 FIRST_TERMINAL_SMOKE_SCHEMA = (
     "mft-goal-fixed-lm2mh-first-terminal-smoke-v1"
@@ -75,7 +75,7 @@ DEFAULT_MANIFEST = Path(
 )
 DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_lm2mh_targeted_w1200_l1000_v1_global_nds"
+    r"\fixed_lm2mh_targeted_w1200_l1000_v1_global_nds_splittemp_v2"
 )
 DEFAULT_ACCOUNTS = Path(r"Y:\runtime\slurm_scheduler\config\accounts.yaml")
 DEFAULT_SCHEDULER_SOURCE = Path(r"C:\Users\peets\NEC\slurm_scheduler")
@@ -515,12 +515,43 @@ def _official5_smoke(
     return result
 
 
+PRIMARY_WINDING_TARGETS = (
+    "T_max_Tx",
+    "Tprobe_Tx_leeward_max",
+)
+SECONDARY_WINDING_TARGETS = tuple(
+    name for name in WINDING_TARGETS if name not in PRIMARY_WINDING_TARGETS
+)
+
+
+def _reclassify_secondary_temperature_constraints(
+    physical_g: Mapping[str, Any],
+    normalized_g: Mapping[str, Any],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Convert source 100 C winding constraints to the split 100/120 C gate."""
+
+    physical = {name: float(value) for name, value in physical_g.items()}
+    normalized = {name: float(value) for name, value in normalized_g.items()}
+    for target in SECONDARY_WINDING_TARGETS:
+        name = f"temperature_robust_limit:{target}"
+        if name in physical:
+            physical[name] -= 20.0
+            # Every source targeted task used the sealed 10 C thermal scale.
+            normalized[name] = physical[name] / 10.0
+    return physical, normalized
+
+
 def _temperatures(
     physical_g: Mapping[str, Any],
-) -> tuple[float, float]:
-    winding = [
+) -> tuple[float, float, float]:
+    primary = [
         100.0 + float(physical_g[f"temperature_robust_limit:{name}"])
-        for name in WINDING_TARGETS
+        for name in PRIMARY_WINDING_TARGETS
+        if f"temperature_robust_limit:{name}" in physical_g
+    ]
+    secondary = [
+        120.0 + float(physical_g[f"temperature_robust_limit:{name}"])
+        for name in SECONDARY_WINDING_TARGETS
         if f"temperature_robust_limit:{name}" in physical_g
     ]
     core = [
@@ -528,9 +559,9 @@ def _temperatures(
         for name in CORE_TARGETS
         if f"temperature_robust_limit:{name}" in physical_g
     ]
-    if not winding or not core:
+    if not primary or not secondary or not core:
         raise RuntimeError("terminal thermal constraints are incomplete")
-    return max(winding), max(core)
+    return max(primary), max(secondary), max(core)
 
 
 def _load_rows(
@@ -569,20 +600,23 @@ def _load_rows(
             for csv_row_index, row in enumerate(reader, start=2):
                 task_rows += 1
                 params = json.loads(row["decoded_physical_params_json"])
-                physical_g = json.loads(
+                source_physical_g = json.loads(
                     row["physical_G_fixed_lm2mh_json"]
                 )
-                normalized_g = json.loads(row["normalized_G_json"])
+                source_normalized_g = json.loads(row["normalized_G_json"])
                 f_tx = float(row["fTx_Hz_fixed_lm2mh"])
                 f_rx = float(row["fRx_Hz_fixed_lm2mh"])
                 f_inter = float(
                     row["fInter_Hz_fixed_lm2mh_diagnostic"]
                 )
                 f_min = float(row["resonance_min_Hz_fixed_lm2mh"])
-                expected_feasible = (
+                source_expected_feasible = (
                     _truth(row["decoder_valid"])
                     and _truth(row["surrogate_physical_valid"])
-                    and all(float(value) <= 0.0 for value in physical_g.values())
+                    and all(
+                        float(value) <= 0.0
+                        for value in source_physical_g.values()
+                    )
                 )
                 if (
                     int(params["N1"]) != expected_turns
@@ -602,7 +636,7 @@ def _load_rows(
                     )
                     or not math.isclose(
                         float(
-                            physical_g[
+                            source_physical_g[
                                 "fixed_Lm2mH_self_resonance_minimum"
                             ]
                         ),
@@ -613,7 +647,7 @@ def _load_rows(
                     or _truth(
                         row["screening_feasible_fixed_lm2mh"]
                     )
-                    != expected_feasible
+                    != source_expected_feasible
                     or not _truth(row["screening_only_fixed_lm2mh"])
                     or _truth(row["production_eligible_fixed_lm2mh"])
                 ):
@@ -621,7 +655,23 @@ def _load_rows(
                         "fixed-Lm terminal row contract drifted: "
                         f"task={task_id} csv_row={csv_row_index}"
                     )
-                winding_max, core_max = _temperatures(physical_g)
+                physical_g, normalized_g = (
+                    _reclassify_secondary_temperature_constraints(
+                        source_physical_g,
+                        source_normalized_g,
+                    )
+                )
+                expected_feasible = (
+                    _truth(row["decoder_valid"])
+                    and _truth(row["surrogate_physical_valid"])
+                    and all(
+                        float(value) <= 0.0
+                        for value in physical_g.values()
+                    )
+                )
+                primary_max, secondary_max, core_max = _temperatures(
+                    physical_g
+                )
                 violation = math.sqrt(
                     sum(
                         max(float(value), 0.0) ** 2
@@ -654,8 +704,26 @@ def _load_rows(
                     + float(physical_g["exterior_length_limit"]),
                     "exterior_H_mm": 750.0
                     + float(physical_g["exterior_height_limit"]),
-                    "winding_robust_max_C_screening": winding_max,
+                    "primary_winding_robust_max_C_screening": primary_max,
+                    "secondary_winding_robust_max_C_screening": secondary_max,
+                    "winding_robust_max_C_screening": max(
+                        primary_max, secondary_max
+                    ),
                     "core_robust_max_C_screening": core_max,
+                    "physical_G_splittemp_v2_json": json.dumps(
+                        physical_g,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ),
+                    "normalized_G_splittemp_v2_json": json.dumps(
+                        normalized_g,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ),
                     "normalized_constraint_violation_l2": violation,
                     "normalized_nonthermal_violation_l2": (
                         conditional_violation
@@ -672,7 +740,8 @@ def _load_rows(
                         "exterior_W_drawing_x_mm",
                         "exterior_L_perpendicular_y_mm",
                         "exterior_H_mm",
-                        "winding_robust_max_C_screening",
+                        "primary_winding_robust_max_C_screening",
+                        "secondary_winding_robust_max_C_screening",
                         "core_robust_max_C_screening",
                         "normalized_constraint_violation_l2",
                     )
@@ -827,8 +896,12 @@ def _acquisition_candidates(
         ("pred_C_rx_rx_F_fixed_lm2mh", "minimum_predicted_C_rx_rx"),
         ("pred_C_tx_rx_F_fixed_lm2mh", "minimum_predicted_C_tx_rx"),
         (
-            "winding_robust_max_C_screening",
-            "minimum_screened_winding_temperature",
+            "primary_winding_robust_max_C_screening",
+            "minimum_screened_primary_winding_temperature",
+        ),
+        (
+            "secondary_winding_robust_max_C_screening",
+            "minimum_screened_secondary_winding_temperature",
         ),
         (
             "core_robust_max_C_screening",
@@ -1111,7 +1184,8 @@ def _write_final(
         "pareto_definition": (
             "cross-seed geometry-deduplicated non-dominated sorting on "
             "(objective_volume_L, objective_total_loss_W) after every fixed-"
-            "Lm2mH physical screening constraint is <=0"
+            "Lm2mH physical screening constraint is <=0, with primary "
+            "winding <=100 C, secondary winding <=120 C, and core <=120 C"
         ),
         "conditional_front_definition": (
             "diagnostic-only non-dominated sorting after excluding thermal "
@@ -1127,6 +1201,11 @@ def _write_final(
             EXPECTED_RESONANCE_CONTRACT_SHA256
         ),
         "thermal_surrogate_retrained_for_Lm2mH_magnetizing_current": False,
+        "temperature_limits_C": {
+            "primary_winding": 100.0,
+            "secondary_winding": 120.0,
+            "core": 120.0,
+        },
         "screening_only": True,
         "production_eligible": False,
         "files": {
