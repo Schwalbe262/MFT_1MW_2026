@@ -99,7 +99,7 @@ PHYSICAL_FREE_RESERVE_BYTES = 50 * 1024**3
 MAX_RESPONSE_BYTES = 128 * 1024**2
 INVENTORY_PAGE_SIZE = 10_000
 MAX_INVENTORY_PAGES = 100
-ACTIVE_STATUSES = {"queued", "attaching", "running"}
+ACTIVE_STATUSES = {"attaching", "running"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 CHECKPOINT_ROOT = PurePosixPath(
     "/gpfs/home1/r1jae262/slurm_scheduler/mft_goal_20260726/"

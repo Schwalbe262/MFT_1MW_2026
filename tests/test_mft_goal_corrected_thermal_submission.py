@@ -416,6 +416,26 @@ def test_complete_paged_inventory_finds_dedupe_only_late_collision(
         )
 
 
+def test_project_logical_active_excludes_queued_rows(tmp_path: Path) -> None:
+    plan, _path = _plan(tmp_path)
+    rows = [
+        {
+            "id": 1,
+            "project": submission.PROJECT,
+            "status": "running",
+        },
+        {
+            "id": 2,
+            "project": submission.PROJECT,
+            "status": "queued",
+        },
+    ]
+    scheduler = FakeScheduler(plan, rows)
+    accepted = submission.validate_project_gate(scheduler._project(), rows)
+    assert accepted["active"] == 1
+    assert accepted["open_slots"] == 499
+
+
 def test_node_and_license_gates_reject_relaxation() -> None:
     accepted = submission.validate_node_gate(
         [_allocation()], _capacity(), now=NOW
