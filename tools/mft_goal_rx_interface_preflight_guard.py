@@ -136,6 +136,10 @@ def _validate_marker(marker: Mapping[str, Any]) -> list[str]:
             pad_conductivity = float(
                 cooling.get("thermal_pad_conductivity_W_mK")
             )
+            core_plate_pad_t_mm = float(
+                cooling.get("core_plate_pad_t_mm")
+            )
+            wcp_pad_t_mm = float(cooling.get("wcp_pad_t_mm"))
         except (TypeError, ValueError, OverflowError):
             reasons.append("fixed_cooling_identity_numeric_invalid")
         else:
@@ -149,6 +153,20 @@ def _validate_marker(marker: Mapping[str, Any]) -> list[str]:
                 reasons.append(
                     "fixed_cooling_identity_pad_conductivity_mismatch"
                 )
+            if not math.isclose(
+                core_plate_pad_t_mm, 2.0, rel_tol=0.0, abs_tol=1e-12
+            ):
+                reasons.append(
+                    "fixed_cooling_identity_core_plate_pad_t_mismatch"
+                )
+            if not math.isclose(
+                wcp_pad_t_mm, 2.0, rel_tol=0.0, abs_tol=1e-12
+            ):
+                reasons.append(
+                    "fixed_cooling_identity_wcp_pad_t_mismatch"
+                )
+        if cooling.get("fan_config") != "dual":
+            reasons.append("fixed_cooling_identity_fan_config_mismatch")
         if cooling.get("cooling_boundary_modified") is not False:
             reasons.append("fixed_cooling_identity_boundary_modified")
 

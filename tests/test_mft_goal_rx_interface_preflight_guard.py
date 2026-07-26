@@ -33,7 +33,10 @@ def _marker() -> dict:
         "fixed_cooling_identity": {
             "schema": "mft-fixed-thermal-boundary-v1",
             "contract_sha256": "a" * 64,
+            "fan_config": "dual",
             "fan_velocity_m_s": 1.5,
+            "core_plate_pad_t_mm": 2.0,
+            "wcp_pad_t_mm": 2.0,
             "thermal_pad_conductivity_W_mK": 0.2,
             "cooling_boundary_modified": False,
         },
@@ -58,6 +61,20 @@ def test_rejects_old_separate_objects_topology() -> None:
         "rx_main_shared_operation_native_separate_objects_mismatch" in reasons
     )
     assert "shared_intent_and_native_readback_passed_mismatch" in reasons
+
+
+def test_rejects_fixed_cooling_identity_drift() -> None:
+    value = copy.deepcopy(_marker())
+    cooling = value["fixed_cooling_identity"]
+    cooling["fan_config"] = "single"
+    cooling["core_plate_pad_t_mm"] = 1.5
+    cooling["wcp_pad_t_mm"] = 3.0
+    reasons = guard._validate_marker(value)
+    assert "fixed_cooling_identity_fan_config_mismatch" in reasons
+    assert (
+        "fixed_cooling_identity_core_plate_pad_t_mismatch" in reasons
+    )
+    assert "fixed_cooling_identity_wcp_pad_t_mismatch" in reasons
 
 
 def test_extracts_last_exact_marker() -> None:
