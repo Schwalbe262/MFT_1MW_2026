@@ -275,9 +275,17 @@ def test_rounded_final_running_card_separates_operational_submission_history() -
 
     assert "최종 rounded Standard 대칭 FEA ThermalSetup 실행 중" in card["title"]
     assert "task96340 RUNNING" in card["title"]
+    assert card["title"].startswith(
+        "CODEX | SUPERSEDED/NON-FINAL: PRIMARY 5T MISMATCH"
+    )
+    assert card["progress_pct"] == 0
     assert "scientific PASS가 없습니다" in card["detail"]
     assert any(
-        "active final rounded verification lane=task96340 RUNNING" in value
+        "superseded rounded lifecycle=task96340 RUNNING" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "current selection/scientific eligibility=false" in value
         for value in card["evidence"]
     )
     assert any(
@@ -305,8 +313,9 @@ def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> 
 
     assert "THERMAL RUNNING" in card["title"]
     assert "HEDGE QUEUED" in card["title"]
-    assert "DRAWING DRAFT READY (20/20 QA)" in card["title"]
-    assert "FULL GATE SEPARATE" in card["title"]
+    assert "CANDIDATE #5 FEA SUPERSEDED" in card["title"]
+    assert "DRAWING DRAFT INVALID" in card["title"]
+    assert "RESELECTION/REOPTIMIZATION IN PROGRESS" in card["title"]
     assert any(
         "task96341 CANCELLED" in value
         and "attach=false" in value
@@ -330,21 +339,23 @@ def test_rounded_pipeline_keeps_cancelled_helper_outside_scientific_counts() -> 
         for value in card["evidence"]
     )
     assert any(
-        f"QA={updater.ROUNDED_DRAWING_QA_PASSED}/"
+        f"layout QA={updater.ROUNDED_DRAWING_QA_PASSED}/"
         f"{updater.ROUNDED_DRAWING_QA_PASSED} PASS" in value
+        and "specification validity=false" in value
         and f"{updater.ROUNDED_DRAWING_DRAFT_SLIDES}-slide PPTX" in value
         and f"{updater.ROUNDED_DRAWING_DRAFT_SLIDES}-page PDF" in value
         for value in card["evidence"]
     )
     assert any(
         "drawing publication=false" in value
-        and "blocked only by authenticated task96340" in value
+        and "blocked by primary 5T mismatch" in value
+        and "task96340 result cannot release drawing" in value
         for value in card["evidence"]
     )
     assert any(
-        "symmetric drawing release gate independent of Full package gate=true"
-        in value
-        and "full model required for drawing release=false" in value
+        "corrected verification=standard/unrounded symmetric" in value
+        and "rounded verification=false" in value
+        and "candidate target ETA=1-2h" in value
         for value in card["evidence"]
     )
     assert any(
@@ -381,10 +392,18 @@ def test_single_rounded_timeout_hedge_is_operational_only() -> None:
 
     assert "TIMEOUT HEDGE QUEUED · NO ALLOCATION YET" in card["title"]
     assert "task96342 QUEUED" in card["title"]
+    assert "SUPERSEDED/NON-FINAL: PRIMARY 5T MISMATCH" in card["title"]
     assert "exact same rounded B5 candidate and physics" in card["detail"]
     assert "not a new design" in card["detail"]
     assert updater.ROUNDED_TIMEOUT_HEDGE_POST_AT_KST in card["detail"]
-    assert "Task96340 remains untouched and authoritative" in card["detail"]
+    assert "Task96340 remains lifecycle-visible" in card["detail"]
+    assert "no longer authoritative for the corrected design" in card["detail"]
+    assert card["progress_pct"] == 0
+    assert any(
+        "superseded_by_primary_5T_constraint=true" in value
+        and "scientific_pass_eligible=false" in value
+        for value in card["evidence"]
+    )
     assert any(
         "Scheduler GET task96342 QUEUED" in value
         and "allocationnone" in value
@@ -392,8 +411,9 @@ def test_single_rounded_timeout_hedge_is_operational_only() -> None:
         for value in card["evidence"]
     )
     assert any(
-        "source task96340 untouched=true" in value
-        and "tracked independently=true" in value
+        "source task96340 lifecycle retained=true" in value
+        and "corrected rounded validation lane=false" in value
+        and "standard/unrounded symmetric" in value
         for value in card["evidence"]
     )
     assert any(
@@ -720,11 +740,17 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         if item["id"] == updater.FINAL_DRAWING_CARD_ID
     )
     assert drawing["title"] == (
-        "CODEX | FINAL DRAWING | CORRECTED DRAFT PPTX/PDF READY | "
-        "QA 20/20 PASS | AUTH PENDING"
+        "CODEX | DRAWING INVALID | PRIMARY 5T MISMATCH | "
+        "DRAFT SUPERSEDED | FINAL RELEASE OFF"
     )
     assert drawing["state"] == "in_progress"
-    assert drawing["progress_pct"] == 90
+    assert drawing["progress_pct"] == 0
+    assert any(
+        "drawing validity=false" in value
+        and "primary reference=5.0/1.6mm" in value
+        and "draft model=1.13/4.6mm" in value
+        for value in drawing["evidence"]
+    )
     assert any(
         "설계도면260706.pdf pages=9" in value
         and "설계도면260706.pptx slides=9" in value
@@ -755,7 +781,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     )
     assert any(
         f"drawing readiness QA={updater.ROUNDED_DRAWING_QA_PASSED}/"
-        f"{updater.ROUNDED_DRAWING_QA_PASSED} PASS" in value
+        f"{updater.ROUNDED_DRAWING_QA_PASSED} layout-only PASS" in value
+        and "specification validity=false" in value
         and updater.ROUNDED_DRAWING_READINESS_MANIFEST_SHA256 in value
         and updater.ROUNDED_DRAWING_QA_SHA256 in value
         for value in drawing["evidence"]
@@ -778,9 +805,9 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         for value in drawing["evidence"]
     )
     assert any(
-        "symmetric drawing gate waits only for authenticated task96340" in value
-        and "Full package gate is separate=true" in value
-        and "full model required for drawing release=false" in value
+        "task96340 input superseded=true" in value
+        and "task96340 result cannot release drawing" in value
+        and "corrected 5T design selection and verification required" in value
         for value in drawing["evidence"]
     )
     assert any(
@@ -788,7 +815,23 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         and "prepared=true" in value
         and "Scheduler POST0" in value
         and "submitted=false" in value
+        and "5T eligible=false" in value
         for value in drawing["evidence"]
+    )
+    recovery = merged["current"][0]
+    assert recovery["id"] == updater.PRIMARY_5T_RECOVERY_CARD_ID
+    assert "1차 5T 불일치" in recovery["title"]
+    assert "기존 후보·FEA·도면 무효" in recovery["title"]
+    assert recovery["progress_pct"] == 10
+    assert any(
+        "verification lane=standard/unrounded symmetric" in value
+        and "rounded verification=false" in value
+        for value in recovery["evidence"]
+    )
+    assert any(
+        "corrected candidate target ETA=1-2h" in value
+        and "queue and solver completion risk tracked separately" in value
+        for value in recovery["evidence"]
     )
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 3
@@ -943,8 +986,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     )
     assert "STANDARD QUEUED" in pipeline["title"]
     assert "HEDGE QUEUED" in pipeline["title"]
-    assert "DRAWING DRAFT READY (20/20 QA)" in pipeline["title"]
-    assert "FULL GATE SEPARATE" in pipeline["title"]
+    assert "CANDIDATE #5 FEA SUPERSEDED" in pipeline["title"]
+    assert "DRAWING DRAFT INVALID" in pipeline["title"]
     assert any(
         "task96341 CANCELLED" in value
         and "scientific_failure=false" in value
@@ -972,8 +1015,9 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         for value in pipeline["evidence"]
     )
     assert any(
-        f"QA={updater.ROUNDED_DRAWING_QA_PASSED}/"
+        f"layout QA={updater.ROUNDED_DRAWING_QA_PASSED}/"
         f"{updater.ROUNDED_DRAWING_QA_PASSED} PASS" in value
+        and "specification validity=false" in value
         and f"{updater.ROUNDED_DRAWING_DRAFT_SLIDES}-slide PPTX" in value
         and f"{updater.ROUNDED_DRAWING_DRAFT_SLIDES}-page PDF" in value
         for value in pipeline["evidence"]
@@ -1720,6 +1764,23 @@ def test_corrected_allocation_force_risk_identity_is_fail_closed() -> None:
         match="corrected allocation identity drifted",
     ):
         updater._validate_task(spec, task)
+
+
+def test_superseded_rounded_lane_accepts_scheduler_queue_reset() -> None:
+    spec = next(
+        item
+        for item in updater.TASK_SPECS
+        if item.task_id == updater.ROUNDED_FINAL_TASK_ID
+    )
+    task = _task(spec, state="queued", allocation_id=None, slurm_job_id="")
+    task["allocation_id"] = None
+    task["slurm_job_id"] = ""
+
+    result = updater._validate_task(spec, task)
+
+    assert result["state"] == "queued"
+    assert result["allocation_id"] is None
+    assert result["slurm_job_id"] == ""
 
 
 def test_timeout_hedge_new_allocation_requirement_is_fail_closed() -> None:

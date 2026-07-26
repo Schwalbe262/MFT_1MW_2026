@@ -442,9 +442,15 @@ SELECTION_POLICY_CARD_ID = "codex-symmetric-primary-selection-policy"
 LOCAL_SYMMETRIC_SELECTION_CARD_ID = "codex-local-symmetric-selection"
 LEGACY_CONTINUATION_CARD_ID = "codex-standard-full-continuation"
 FINAL_DRAWING_CARD_ID = "codex-final-drawing-readiness"
+PRIMARY_5T_RECOVERY_CARD_ID = "codex-primary-5t-constraint-recovery"
 ROUNDED_FINAL_TASK_ID = 96340
 ROUNDED_TIMEOUT_HEDGE_TASK_ID = 96342
 ROUNDED_FINAL_PIPELINE_CARD_ID = "codex-rounded-final-delivery-pipeline"
+REFERENCE_PRIMARY_CW1_MM = 5.0
+REFERENCE_PRIMARY_GAP1_MM = 1.6
+SUPERSEDED_CANDIDATE_CW1_MM = 1.13
+SUPERSEDED_CANDIDATE_GAP1_MM = 4.6
+PRIMARY_TURN_COUNT = 6
 ROUNDED_SNAPSHOT_SHA256 = (
     "c71a94a8b23a9cf8fd4ab9a98083df45f350cf7586b2f1e449deca30380cd426"
 )
@@ -736,13 +742,21 @@ def _validate_task(spec: TaskSpec, task: Mapping[str, Any]) -> dict[str, Any]:
             f"task{spec.task_id} new-allocation requirement drifted"
         )
     state = _task_state(task)
+    rounded_superseded_queue_reset = (
+        spec.task_id == ROUNDED_FINAL_TASK_ID
+        and state in QUEUED_STATES
+        and task.get("allocation_id") in (None, "", 0)
+        and str(task.get("slurm_job_id") or "") == ""
+    )
     if (
         spec.expected_allocation_id is not None
+        and not rounded_superseded_queue_reset
         and task.get("allocation_id") != spec.expected_allocation_id
     ):
         raise UpdaterError(f"task{spec.task_id} corrected allocation identity drifted")
     if (
         spec.expected_slurm_job_id is not None
+        and not rounded_superseded_queue_reset
         and str(task.get("slurm_job_id") or "") != spec.expected_slurm_job_id
     ):
         raise UpdaterError(f"task{spec.task_id} corrected Slurm job identity drifted")
@@ -927,13 +941,13 @@ def _rounded_final_task_card(
 
     evidence = [
         (
-            f"active final rounded verification lane=task{spec.task_id} "
+            f"superseded rounded lifecycle=task{spec.task_id} "
             f"{str(task['state']).upper()} / allocation{allocation} / "
             f"Slurm{job} / node{node} / solver stage={solver_stage}"
         ),
         (
-            "scientific/effective role=official#5 final rounded Standard "
-            "symmetric validation / scheduler lifecycle only until collector"
+            "historical role=official#5 rounded Standard symmetric attempt / "
+            "current selection/scientific eligibility=false due primary 5T mismatch"
         ),
         (
             "geometry=round_corner true / corner radius=10mm / "
@@ -1046,7 +1060,8 @@ def _rounded_timeout_hedge_task_card(
             f"{ROUNDED_TIMEOUT_HEDGE_POST_AT_KST} to harry261 with strict n107, "
             "max_workers_per_node=1, and a new-allocation requirement. "
             f"Scheduler GET lifecycle={task['state']}, allocation={allocation}, "
-            f"Slurm job={job}. Task96340 remains untouched and authoritative; "
+            f"Slurm job={job}. Task96340 remains lifecycle-visible but is no "
+            "longer authoritative for the corrected design; "
             "neither lifecycle creates a scientific PASS before authenticated "
             "solver collection."
         ),
@@ -1060,8 +1075,9 @@ def _rounded_timeout_hedge_task_card(
                 f"Slurm{job} / requested node n107 strict"
             ),
             (
-                "source task96340 untouched=true / primary rounded validation "
-                "tracked independently=true"
+                "source task96340 lifecycle retained=true / corrected rounded "
+                "validation lane=false / corrected verification uses "
+                "standard/unrounded symmetric"
             ),
             (
                 "same rounded B5 candidate=true / candidate physics SHA256 "
@@ -1115,9 +1131,13 @@ def _task_card(
     observed_at: str,
 ) -> dict[str, Any]:
     if spec.task_id == ROUNDED_FINAL_TASK_ID:
-        return _rounded_final_task_card(spec, task, observed_at)
+        return _supersede_rounded_candidate_card(
+            _rounded_final_task_card(spec, task, observed_at)
+        )
     if spec.task_id == ROUNDED_TIMEOUT_HEDGE_TASK_ID:
-        return _rounded_timeout_hedge_task_card(spec, task, observed_at)
+        return _supersede_rounded_candidate_card(
+            _rounded_timeout_hedge_task_card(spec, task, observed_at)
+        )
     category = _category(str(task["state"]))
     node = task["actual_node_name"] or spec.requested_node
     if category == "succeeded":
@@ -1345,6 +1365,27 @@ def _upsert_current_card(payload: dict[str, Any], card: Mapping[str, Any]) -> No
         len(current),
     )
     current.insert(insertion, copy.deepcopy(dict(card)))
+
+
+def _upsert_priority_current_card(
+    payload: dict[str, Any],
+    card: Mapping[str, Any],
+) -> None:
+    """Upsert a truth-boundary card as the first visible current item."""
+    current = payload.get("current")
+    if not isinstance(current, list):
+        raise UpdaterError("status current group is missing")
+    card_id = card.get("id")
+    matches = [
+        index
+        for index, item in enumerate(current)
+        if isinstance(item, dict) and item.get("id") == card_id
+    ]
+    if len(matches) > 1:
+        raise UpdaterError(f"automation card {card_id} is duplicated")
+    if matches:
+        current.pop(matches[0])
+    current.insert(0, copy.deepcopy(dict(card)))
 
 
 def _remove_current_card(payload: dict[str, Any], card_id: str) -> None:
@@ -2266,6 +2307,115 @@ def _final_gate_card(root: Path, observed_at: str) -> dict[str, Any]:
     }
 
 
+def _primary_5t_recovery_card(observed_at: str) -> dict[str, Any]:
+    superseded_stack = (
+        PRIMARY_TURN_COUNT * SUPERSEDED_CANDIDATE_CW1_MM
+        + (PRIMARY_TURN_COUNT - 1) * SUPERSEDED_CANDIDATE_GAP1_MM
+    )
+    reference_stack = (
+        PRIMARY_TURN_COUNT * REFERENCE_PRIMARY_CW1_MM
+        + (PRIMARY_TURN_COUNT - 1) * REFERENCE_PRIMARY_GAP1_MM
+    )
+    return {
+        "id": PRIMARY_5T_RECOVERY_CARD_ID,
+        "title": (
+            "긴급 설계 정정 | 1차 5T 불일치 | 기존 후보·FEA·도면 무효 | "
+            "5T 제약 재선정/재최적화 진행"
+        ),
+        "detail": (
+            "기준 도면 slide 9의 1차 도체 두께/간격은 5.0/1.6 mm입니다. "
+            "기존 NSGA-II candidate #5는 1.13/4.6 mm이므로 최종 설계 조건을 "
+            "충족하지 않습니다. 현재 후보의 FEA task96340/task96342, 열린 GUI "
+            "모델, 도면 DRAFT는 이 조건에 대해 모두 superseded/non-final입니다. "
+            "기존 512-seed 결과에서 5T 제약 후보를 먼저 재선정하고, 충분한 후보가 "
+            "없을 때만 5T 고정 NSGA-II를 병렬 재실행합니다. 새 검증은 "
+            "standard/unrounded symmetric 모델로 수행하고 rounded 형상은 "
+            "도면과 Full 모델 시각화에만 사용합니다."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 10,
+        "evidence": [
+            (
+                "authoritative reference=설계도면260706 slide9 / "
+                f"primary cw1={REFERENCE_PRIMARY_CW1_MM:.1f}mm / "
+                f"gap1={REFERENCE_PRIMARY_GAP1_MM:.1f}mm"
+            ),
+            (
+                "superseded candidate=official#5 / "
+                f"cw1={SUPERSEDED_CANDIDATE_CW1_MM:.2f}mm / "
+                f"gap1={SUPERSEDED_CANDIDATE_GAP1_MM:.1f}mm / "
+                "final design eligible=false"
+            ),
+            (
+                f"6-turn primary stack={superseded_stack:.2f}mm -> "
+                f"{reference_stack:.2f}mm / geometry delta="
+                f"{reference_stack - superseded_stack:.2f}mm / "
+                "small numerical correction=false"
+            ),
+            (
+                "task96340/task96342 lifecycle may remain visible / "
+                "5T scientific input eligible=false / selection eligible=false / "
+                "production promotion eligible=false"
+            ),
+            (
+                "current AEDT GUI=diagnosis/model-only / simulation invoked=false / "
+                "final full model claim=false"
+            ),
+            (
+                "existing PPTX/PDF=layout QA historical only / "
+                "specification-valid drawing=false / publication=false / "
+                "final deliverable=false"
+            ),
+            (
+                "recovery order=existing 512-seed constrained audit -> "
+                "5T constrained reselection -> parallel constrained NSGA-II "
+                "only if required"
+            ),
+            (
+                "verification lane=standard/unrounded symmetric / "
+                "rounded role=drawing and Full-geometry visualization only / "
+                "rounded verification=false"
+            ),
+            (
+                "corrected candidate target ETA=1-2h / "
+                "scheduler queue and solver completion risk tracked separately"
+            ),
+            (
+                "actual scientific PASS=0 / actual production PASS=0 / "
+                "canonical promotion=false"
+            ),
+        ],
+    }
+
+
+def _supersede_rounded_candidate_card(card: dict[str, Any]) -> dict[str, Any]:
+    card["title"] = (
+        "CODEX | SUPERSEDED/NON-FINAL: PRIMARY 5T MISMATCH | HISTORICAL "
+        + str(card["title"])
+    )
+    card["detail"] = (
+        "NON-FINAL/SUPERSEDED: this lifecycle belongs to candidate #5 with "
+        "primary cw1=1.13 mm and gap1=4.6 mm, while the authoritative drawing "
+        "requires 5.0 mm and 1.6 mm. Any solver result remains operational "
+        "history and is ineligible for corrected design selection or release. "
+        + str(card["detail"])
+    )
+    evidence = card.get("evidence")
+    if not isinstance(evidence, list):
+        raise UpdaterError("rounded candidate card evidence drifted")
+    if not evidence:
+        raise UpdaterError("rounded candidate card evidence is empty")
+    evidence[0] = (
+        "superseded_by_primary_5T_constraint=true / non_final=true / "
+        "selection_eligible=false / scientific_pass_eligible=false / "
+        "drawing_release_eligible=false / historical_lifecycle: "
+        + str(evidence[0])
+    )
+    card["progress_pct"] = 0
+    return card
+
+
 def _rounded_final_pipeline_card(
     tasks: Mapping[int, Mapping[str, Any]],
     observed_at: str,
@@ -2294,27 +2444,38 @@ def _rounded_final_pipeline_card(
     return {
         "id": ROUNDED_FINAL_PIPELINE_CARD_ID,
         "title": (
-            f"CODEX | ROUNDED FINAL PIPELINE | {task_stage} | "
-            f"{hedge_stage} | DRAWING DRAFT READY (20/20 QA) | "
-            "FULL GATE SEPARATE"
+            "CODEX | 5T RECOVERY | CANDIDATE #5 FEA SUPERSEDED | "
+            "DRAWING DRAFT INVALID | RESELECTION/REOPTIMIZATION IN PROGRESS | "
+            f"LIFECYCLE {task_stage}/{hedge_stage}"
         ),
         "detail": (
-            "Task96340 remains the active rounded 1/8 symmetric scientific "
-            "verification lane. Task96342 is its single same-candidate operational "
-            "timeout hedge, not a new design or scientific candidate; its live "
-            "state is read by GET and its collector is GET-only. A corrected "
-            "nine-slide DRAFT PPTX and nine-page "
-            "DRAFT PDF are prepared and passed all 20 readiness/visual QA checks, "
-            "but they remain unpublished and explicitly non-final until the "
-            "task96340 result is authenticated. The symmetric drawing release "
-            "does not require the later Full-model package gate. The bounded "
-            "same-design correction contingency is prepared only and has not "
-            "been submitted."
+            "Task96340 and task96342 are lifecycle-visible only: both use "
+            "candidate #5 primary cw1=1.13 mm/gap1=4.6 mm and are superseded by "
+            "the authoritative 5.0 mm/1.6 mm primary constraint. Their results "
+            "cannot create a scientific PASS, select the corrected design, or "
+            "release drawings. The nine-slide/nine-page DRAFT passed layout QA "
+            "only and is specification-invalid. Recovery is auditing the existing "
+            "512-seed population before deciding whether a constrained NSGA-II "
+            "rerun is required. Corrected verification uses standard/unrounded "
+            "symmetric FEA; rounded geometry is for drawing/Full visualization "
+            "only. Candidate selection target ETA is 1-2h, with queue/solver "
+            "completion risk reported separately."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 75 if category == "running" else 65,
+        "progress_pct": 10,
         "evidence": [
+            (
+                "primary constraint mismatch=true / reference cw1=5.0mm "
+                "gap1=1.6mm / candidate cw1=1.13mm gap1=4.6mm / "
+                "candidate #5 final status=superseded/non-final / "
+                "task96340 selection eligible=false / "
+                "task96342 selection eligible=false / "
+                "corrected verification=standard/unrounded symmetric / "
+                "rounded verification=false / "
+                "rounded role=drawing and Full-geometry visualization only / "
+                "candidate target ETA=1-2h / queue risk separate"
+            ),
             (
                 f"task96340 lifecycle={str(task['state']).upper()} / "
                 f"allocation{task['allocation_id'] or 'none'} / "
@@ -2352,26 +2513,24 @@ def _rounded_final_pipeline_card(
                 f"drawing views exported={ROUNDED_DRAWING_VIEW_COUNT} PNG / "
                 "read-only inspection copy / source project save=false / "
                 "solver invoked=false / "
-                f"corrected drawing draft={ROUNDED_DRAWING_DRAFT_SLIDES}-slide "
+                f"superseded drawing draft={ROUNDED_DRAWING_DRAFT_SLIDES}-slide "
                 f"PPTX {ROUNDED_DRAWING_DRAFT_PPTX_BYTES:,}B / "
                 f"{ROUNDED_DRAWING_DRAFT_SLIDES}-page PDF "
                 f"{ROUNDED_DRAWING_DRAFT_PDF_BYTES:,}B / "
-                f"QA={ROUNDED_DRAWING_QA_PASSED}/{ROUNDED_DRAWING_QA_PASSED} PASS"
+                f"layout QA={ROUNDED_DRAWING_QA_PASSED}/"
+                f"{ROUNDED_DRAWING_QA_PASSED} PASS / "
+                "specification validity=false"
             ),
             (
                 "drawing publication=false / final deliverable=false / "
-                "blocked only by authenticated task96340 symmetric FEA result / "
-                "symmetric drawing release gate independent of Full package "
-                "gate=true / full model required for drawing release=false"
+                "blocked by primary 5T mismatch / task96340 result cannot release "
+                "drawing / corrected design selection pending"
             ),
             (
                 f"bounded correction contingency commit="
                 f"{ROUNDED_BOUNDED_CORRECTION_COMMIT} / prepare-only / "
-                "Scheduler POST0 / submit=false"
-            ),
-            (
-                "fixed boundary unchanged=round_corner R10/S4 / fan1.5m/s / "
-                "TIM k0.2W/mK / WCP pad2mm / core pad2mm"
+                "Scheduler POST0 / submit=false / "
+                "ineligible for 5T recovery=true"
             ),
             (
                 f"snapshot manifest SHA256 {ROUNDED_SNAPSHOT_MANIFEST_SHA256} / "
@@ -2400,23 +2559,24 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
     return {
         "id": FINAL_DRAWING_CARD_ID,
         "title": (
-            "CODEX | FINAL DRAWING | CORRECTED DRAFT PPTX/PDF READY | "
-            "QA 20/20 PASS | AUTH PENDING"
+            "CODEX | DRAWING INVALID | PRIMARY 5T MISMATCH | "
+            "DRAFT SUPERSEDED | FINAL RELEASE OFF"
         ),
         "detail": (
-            "The corrected nine-slide DRAFT PPTX and nine-page DRAFT PDF are "
-            "prepared from the rounded symmetric inspection model. All 20 "
-            "automated and visual readiness checks pass. The files remain "
-            "unpublished and explicitly non-final pending the authenticated "
-            "task96340 symmetric FEA result. Full-model verification is a "
-            "separate overall-package gate and does not block the symmetric "
-            "drawing release."
+            "The existing nine-slide DRAFT PPTX and nine-page DRAFT PDF were "
+            "generated from candidate #5 with primary cw1=1.13 mm/gap1=4.6 mm. "
+            "The authoritative reference requires 5.0 mm/1.6 mm, so the files "
+            "are superseded and specification-invalid despite passing 20 layout "
+            "checks. Publication and final release are disabled until a corrected "
+            "5T design is selected, modeled, and verified."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 90,
+        "progress_pct": 0,
         "evidence": [
             (
+                "drawing validity=false / superseded=true / "
+                "primary reference=5.0/1.6mm / draft model=1.13/4.6mm / "
                 "template audit=complete / 설계도면260706.pdf pages=9 / "
                 "설계도면260706.pptx slides=9 / 960x540pt / 16:9"
             ),
@@ -2447,7 +2607,8 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
             ),
             (
                 f"drawing readiness QA={ROUNDED_DRAWING_QA_PASSED}/"
-                f"{ROUNDED_DRAWING_QA_PASSED} PASS / "
+                f"{ROUNDED_DRAWING_QA_PASSED} layout-only PASS / "
+                "specification validity=false / "
                 f"manifest SHA256 {ROUNDED_DRAWING_READINESS_MANIFEST_SHA256} / "
                 f"QA SHA256 {ROUNDED_DRAWING_QA_SHA256}"
             ),
@@ -2462,14 +2623,13 @@ def _final_drawing_card(observed_at: str) -> dict[str, Any]:
                 "final PDF claimed=false / final deliverable claimed=false"
             ),
             (
-                "symmetric drawing gate waits only for authenticated task96340 / "
-                "Full package gate is separate=true / "
-                "full model required for drawing release=false"
+                "task96340 input superseded=true / task96340 result cannot release "
+                "drawing / corrected 5T design selection and verification required"
             ),
             (
                 f"bounded correction contingency commit="
                 f"{ROUNDED_BOUNDED_CORRECTION_COMMIT} / prepared=true / "
-                "Scheduler POST0 / submitted=false"
+                "Scheduler POST0 / submitted=false / 5T eligible=false"
             ),
             (
                 "audit root=C:\\Users\\peets\\slurm_scheduler_runtime\\"
@@ -2524,7 +2684,12 @@ def _live_summary(
     if terminal < 0:
         raise UpdaterError("live task counters are inconsistent")
     summary = (
-        f"{observed:%H:%M} KST · original_deadline_missed=true. "
+        f"{observed:%H:%M} KST · 긴급 설계 정정: 기준 1차 5T/1.6mm, "
+        "candidate #5 1.13T/4.6mm 불일치. 기존 후보·FEA·도면은 "
+        "superseded/non-final이며 5T 제약 재선정/재최적화 진행 중입니다. "
+        "corrected candidate target ETA=1-2h; queue/solver risk 별도. "
+        "verification=standard/unrounded symmetric; rounded=도면/Full 형상 "
+        "시각화 전용. original_deadline_missed=true. "
         "인증된 scientific PASS는 없습니다. "
         f"post-deadline diagnostic 작업: running{running} · queued{queued} · "
         f"terminal{terminal}. Slurm allocation jobs{allocation_jobs} · "
@@ -2646,6 +2811,10 @@ def merge_status(
     protected_before = _protected_hashes(result)
     if standard_full_continuation_state_file is None:
         _remove_current_card(result, LEGACY_CONTINUATION_CARD_ID)
+    _upsert_priority_current_card(
+        result,
+        _primary_5t_recovery_card(observed_at),
+    )
     for spec in TASK_SPECS:
         _upsert_current_card(
             result,
