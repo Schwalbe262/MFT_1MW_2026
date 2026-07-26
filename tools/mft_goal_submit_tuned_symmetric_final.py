@@ -183,8 +183,13 @@ def _load_inputs(
     return campaign, final, params, profile
 
 
-def prepare(*, campaign_root: Path) -> Path:
+def prepare(*, campaign_root: Path, solver_revision: str) -> Path:
     root = campaign_root.resolve(strict=True)
+    solver = str(solver_revision).lower()
+    if not tuner.HEX40.fullmatch(solver):
+        raise tuner.GapTuningError(
+            "full 40-character final solver revision required"
+        )
     output = root / "final_symmetric_submission_plan.json"
     if output.exists():
         return output
@@ -198,14 +203,14 @@ def prepare(*, campaign_root: Path) -> Path:
         name,
         params,
         profile,
-        campaign["solver_revision"],
+        solver,
         campaign["library_revision"],
     )
     retained = scheduler_client.retained_aedt_identity(
         name,
         params,
         profile,
-        campaign["solver_revision"],
+        solver,
         campaign["library_revision"],
     )
     value = tuner._seal(
@@ -251,7 +256,8 @@ def prepare(*, campaign_root: Path) -> Path:
                 "core_max_C": 120.0,
                 "resonance_min_Hz": 15_000.0,
             },
-            "solver_revision": campaign["solver_revision"],
+            "tuning_solver_revision": campaign["solver_revision"],
+            "solver_revision": solver,
             "library_revision": campaign["library_revision"],
             "scheduler": {
                 "project": scheduler_client.MFT_PROJECT,
@@ -267,7 +273,7 @@ def prepare(*, campaign_root: Path) -> Path:
                 "priority": PRIORITY,
                 "aedt_backend": "standalone",
                 "environment": tuner._core_environment(
-                    campaign["solver_revision"]
+                    solver
                 ),
                 "retained_aedt": retained,
             },
@@ -284,9 +290,12 @@ def submit(
     campaign_root: Path,
     scheduler_url: str,
     apply: bool,
+    solver_revision: str,
 ) -> Path:
     root = campaign_root.resolve(strict=True)
-    plan_path = prepare(campaign_root=root)
+    plan_path = prepare(
+        campaign_root=root, solver_revision=solver_revision
+    )
     plan = tuner._validate_seal(tuner._read_json(plan_path), PLAN_SCHEMA)
     output = root / "final_symmetric_submission_receipt.json"
     if output.exists():
@@ -315,7 +324,7 @@ def submit(
         profile,
         mem_mb=scheduler["memory_mb"],
         cpus=scheduler["cpus"],
-        solver_revision=campaign["solver_revision"],
+        solver_revision=plan["solver_revision"],
         library_revision=campaign["library_revision"],
         priority=scheduler["priority"],
         max_workers_per_node=scheduler["max_workers_per_node"],
@@ -384,6 +393,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign-root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--scheduler-url", default=SCHEDULER_URL)
+    parser.add_argument("--solver-revision", required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=10.0)
@@ -400,6 +410,7 @@ def main() -> int:
         campaign_root=args.campaign_root,
         scheduler_url=args.scheduler_url,
         apply=args.apply,
+        solver_revision=args.solver_revision,
     )
     print(json.dumps(str(result), ensure_ascii=False))
     return 0
