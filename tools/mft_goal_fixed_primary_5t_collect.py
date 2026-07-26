@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from typing import Any, Iterable, Mapping
 import urllib.request
 
@@ -552,6 +553,11 @@ def collect(
         "global_pareto_count": len(feasible_front),
         "global_objective_front_count": len(objective_front),
         "global_nds_final": len(collections) == 16,
+        "all_scheduler_tasks_terminal": sum(
+            status_counts.get(name, 0)
+            for name in ("completed", "failed", "cancelled")
+        )
+        == 16,
         "files": {
             name: {
                 "path": str(output / name),
@@ -593,20 +599,31 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scheduler-source", type=Path, default=DEFAULT_SCHEDULER_SOURCE
     )
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--poll-seconds", type=float, default=45.0)
     return parser
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    result = collect(
-        manifests=args.manifests or DEFAULT_MANIFESTS,
-        output=args.output.resolve(),
-        scheduler_url=args.scheduler_url,
-        accounts=args.accounts,
-        scheduler_source=args.scheduler_source,
-    )
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
+    if args.poll_seconds < 10.0 or args.poll_seconds > 300.0:
+        raise RuntimeError("poll-seconds must be within 10..300")
+    while True:
+        result = collect(
+            manifests=args.manifests or DEFAULT_MANIFESTS,
+            output=args.output.resolve(),
+            scheduler_url=args.scheduler_url,
+            accounts=args.accounts,
+            scheduler_source=args.scheduler_source,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
+        if (
+            not args.watch
+            or result["global_nds_final"]
+            or result["all_scheduler_tasks_terminal"]
+        ):
+            return 0 if result["global_nds_final"] or not args.watch else 2
+        time.sleep(args.poll_seconds)
 
 
 if __name__ == "__main__":
