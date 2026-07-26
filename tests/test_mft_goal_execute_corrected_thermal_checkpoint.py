@@ -825,26 +825,39 @@ class _Editor:
         "Tx_main_0_0": [-500.0, -400.0, -300.0, -450.0, 400.0, 300.0],
         "Rx_main_block_xn": [-450.0, -300.0, -200.0, 450.0, 300.0, 200.0],
         "core_2": [-400.0, -350.0, -250.0, 400.0, 350.0, 250.0],
-        "wcp_pad_1": [450.0, -100.0, -100.0, 500.0, 100.0, 100.0],
+        "Tx_main_wcp_pad_1": [450.0, -1.0, -100.0, 500.0, 1.0, 100.0],
+        "core_plate_pad_1": [-300.0, -1.0, -220.0, 300.0, 1.0, -200.0],
+        "mesh_pad_subregion_air": [-550.0, -450.0, -350.0, 550.0, 450.0, 350.0],
         "Region": [-600.0, -500.0, -400.0, 600.0, 500.0, 400.0],
+    }
+    _materials = {
+        "Tx_main_wcp_pad_1": '"thermal_pad"',
+        "core_plate_pad_1": '"thermal_pad"',
+        "mesh_pad_subregion_air": '"air"',
     }
 
     def GetObjectsInGroup(self, group):
+        if group == "Non Model":
+            return ["mesh_pad_subregion_air"]
         assert group == "Solids"
         return list(self._boxes)
 
     def GetObjectBoundingBox(self, name):
         return self._boxes[name]
 
-    def GetPropertyValue(self, _tab, _name, _property):
-        return '"thermal_pad"'
+    def GetPropertyValue(self, _tab, name, _property):
+        return self._materials.get(name, '"copper"')
 
 
 def test_native_readbacks_attest_fixed_fan_loss_geometry_and_pad_material() -> None:
     boundaries = [
         _Boundary(
             "fan_inlet",
-            {"Velocity": ["0m_per_sec", "-1.5m_per_sec", "0m_per_sec"]},
+            {
+                "X Velocity": "0m_per_sec",
+                "Y Velocity": "-1.5m_per_sec",
+                "Z Velocity": "0m_per_sec",
+            },
         ),
         _Boundary(
             "loss_tx",
@@ -881,7 +894,9 @@ def test_native_readbacks_attest_fixed_fan_loss_geometry_and_pad_material() -> N
                 "Tx_main_0_0",
                 "Rx_main_block_xn",
                 "core_2",
-                "wcp_pad_1",
+                "Tx_main_wcp_pad_1",
+                "core_plate_pad_1",
+                "mesh_pad_subregion_air",
             ],
         ),
     )
@@ -901,6 +916,51 @@ def test_native_readbacks_attest_fixed_fan_loss_geometry_and_pad_material() -> N
         "length_y": 800.0,
         "height_z": 600.0,
     }
+    assert set(geometry["physical_pad_solids"]) == {
+        "Tx_main_wcp_pad_1",
+        "core_plate_pad_1",
+    }
+    assert all(
+        row["y_thickness_mm"] == 2.0
+        for row in geometry["physical_pad_solids"].values()
+    )
+    assert "mesh_pad_subregion_air" not in geometry["physical_pad_solids"]
+
+
+def test_native_fan_and_physical_pad_readback_fail_closed() -> None:
+    bad_fan = executor._native_boundary_inventory(
+        SimpleNamespace(
+            boundaries=[
+                _Boundary(
+                    "fan_inlet",
+                    {
+                        "X Velocity": "0m_per_sec",
+                        "Y Velocity": "1.5m_per_sec",
+                        "Z Velocity": "0m_per_sec",
+                    },
+                )
+            ]
+        )
+    )
+    with pytest.raises(executor.ContinuationError, match="vector drifted"):
+        executor._attest_fan(bad_fan)
+
+    editor = _Editor()
+    editor._boxes = dict(_Editor._boxes)
+    editor._boxes["Tx_main_wcp_pad_1"] = [
+        450.0,
+        -1.5,
+        -100.0,
+        500.0,
+        1.5,
+        100.0,
+    ]
+    ipk = SimpleNamespace(
+        oeditor=editor,
+        modeler=SimpleNamespace(oeditor=editor, model_units="mm"),
+    )
+    with pytest.raises(executor.ContinuationError, match="Y thickness drifted"):
+        executor._native_geometry(ipk)
 
 
 def test_parallel_evidence_requires_acf_one_by_eight_and_fluent_t8_mpi8() -> None:

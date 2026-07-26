@@ -1490,13 +1490,6 @@ def _quantity(value: Any, expected_unit: str, label: str) -> float:
     return number
 
 
-def _native_design_variable(native_design: Any, name: str, unit: str) -> float:
-    getter = getattr(native_design, "GetVariableValue", None)
-    if not callable(getter):
-        raise ContinuationError("native design variable readback is unavailable")
-    return _quantity(getter(name), unit, name)
-
-
 def _native_boundary_inventory(ipk: Any) -> list[dict[str, Any]]:
     inventory = []
     for boundary in list(getattr(ipk, "boundaries", ()) or ()):
@@ -1545,39 +1538,39 @@ def _attest_fan(boundaries: list[dict[str, Any]]) -> dict[str, Any]:
     fan = [
         item
         for item in boundaries
-        if str(item["name"]).startswith("fan_inlet")
+        if str(item["name"]) == "fan_inlet"
     ]
-    if not fan:
-        raise ContinuationError("native fan inlet boundary is missing")
-    velocity_values = []
-    for item in fan:
-        for name, value in item["properties"].items():
-            if "velocity" not in name.casefold():
-                continue
-            for text in _flatten_strings(value):
-                for number in re.findall(
-                    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?",
-                    text,
-                ):
-                    velocity_values.append(abs(float(number)))
-    if not velocity_values or not any(
-        math.isclose(
-            value, FAN_VELOCITY_M_S, rel_tol=0.0, abs_tol=1e-12
-        )
-        for value in velocity_values
-    ):
+    if len(fan) != 1:
         raise ContinuationError(
-            f"native fan boundary has no {FAN_VELOCITY_M_S}m/s readback"
+            f"native fan inlet boundary count is not one: {len(fan)}"
         )
+    props = fan[0]["properties"]
+    axes = {
+        "X": "X Velocity",
+        "Y": "Y Velocity",
+        "Z": "Z Velocity",
+    }
+    if not all(property_name in props for property_name in axes.values()):
+        raise ContinuationError("native fan vector properties are incomplete")
+    vector = {
+        axis: _quantity(
+            props[property_name],
+            "m_per_sec",
+            f"fan_inlet.{property_name}",
+        )
+        for axis, property_name in axes.items()
+    }
+    expected = {"X": 0.0, "Y": -FAN_VELOCITY_M_S, "Z": 0.0}
     if any(
-        value not in {0.0, FAN_VELOCITY_M_S} for value in velocity_values
+        not math.isclose(vector[axis], value, rel_tol=0.0, abs_tol=1e-12)
+        for axis, value in expected.items()
     ):
         raise ContinuationError(
-            f"native fan boundary velocity drifted: {velocity_values}"
+            f"native fan boundary vector drifted: {vector} != {expected}"
         )
     return {
-        "names": [item["name"] for item in fan],
-        "velocity_magnitudes_m_per_s": velocity_values,
+        "name": fan[0]["name"],
+        "velocity_vector_m_per_s": vector,
         "passed": True,
     }
 
@@ -1687,10 +1680,15 @@ def _native_geometry(ipk: Any) -> dict[str, Any]:
         raise ContinuationError(
             "native per-solid bounding-box readback is unavailable"
         )
+    non_model_names = {
+        str(name)
+        for name in (get_group("Non Model") or ())
+    }
     solid_names = sorted(
         str(name)
         for name in (get_group("Solids") or ())
         if str(name).casefold() != "region"
+        and str(name) not in non_model_names
     )
     if not solid_names:
         raise ContinuationError("native physical-solid inventory is empty")
@@ -1744,27 +1742,63 @@ def _native_geometry(ipk: Any) -> dict[str, Any]:
         )
 
     object_names = solid_names
-    pad_names = [
-        name for name in object_names if "pad" in name.casefold()
-    ]
-    if not pad_names:
-        raise ContinuationError("native thermal pad object inventory is empty")
+    pad_patterns = {
+        "core_plate": re.compile(r"^core_plate_pad_", re.IGNORECASE),
+        "wcp": re.compile(r"^(?:Tx|Rx)_.*_wcp_pad_", re.IGNORECASE),
+    }
+    pad_families = {
+        family: [
+            name for name in object_names if pattern.match(name) is not None
+        ]
+        for family, pattern in pad_patterns.items()
+    }
+    if any(not names for names in pad_families.values()):
+        raise ContinuationError(
+            f"native physical thermal pad families are incomplete: "
+            f"{pad_families}"
+        )
+    pad_names = sorted(
+        name for names in pad_families.values() for name in names
+    )
     get_property = getattr(editor, "GetPropertyValue", None)
     if not callable(get_property):
         raise ContinuationError("native object material readback is unavailable")
-    pad_materials = {}
+    pad_solids = {}
     for name in pad_names:
         material = str(
             get_property("Geometry3DAttributeTab", name, "Material") or ""
         ).strip().strip('"')
-        pad_materials[name] = material
         if material.casefold() != "thermal_pad":
             raise ContinuationError(
                 f"native pad material drifted: {name}={material!r}"
             )
+        box = solid_boxes[name]
+        thickness_y = abs(float(box[4]) - float(box[1]))
+        if not math.isclose(
+            thickness_y,
+            PAD_THICKNESS_MM,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ContinuationError(
+                f"native pad Y thickness drifted: "
+                f"{name}={thickness_y}mm"
+            )
+        family = next(
+            key for key, pattern in pad_patterns.items() if pattern.match(name)
+        )
+        pad_solids[name] = {
+            "family": family,
+            "bounding_box_mm": box,
+            "y_thickness_mm": thickness_y,
+            "material": material,
+        }
     return {
         "bounding_box_mm": values,
-        "bounding_box_scope": "native_solids_excluding_air_region",
+        "bounding_box_scope": (
+            "native_model_solids_excluding_region_and_non_model"
+        ),
+        "excluded_non_model_objects": sorted(non_model_names),
         "dimensions_mm": {
             "width_x": dimensions[0],
             "length_y": dimensions[1],
@@ -1776,41 +1810,25 @@ def _native_geometry(ipk: Any) -> dict[str, Any]:
             "height_z": SIZE_LIMITS_MM[2],
         },
         "object_count": len(object_names),
-        "pad_materials": pad_materials,
+        "physical_pad_families": {
+            family: sorted(names)
+            for family, names in pad_families.items()
+        },
+        "physical_pad_solids": pad_solids,
+        "pad_selection": (
+            "native solids matching core_plate_pad_* or "
+            "(Tx|Rx)_*_wcp_pad_*; mesh subregions and air excluded"
+        ),
         "passed": True,
     }
 
 
 def attest_native_fixed_model(
-    native_design: Any, ipk: Any
+    _native_design: Any, ipk: Any
 ) -> dict[str, Any]:
     """Read, but never edit, the fixed geometry/physics/loss contracts."""
     from module.thermal_260706 import _thermal_pad_native_readback
 
-    variables = {
-        "fan_velocity": _native_design_variable(
-            native_design, "fan_velocity", "m_per_sec"
-        ),
-        "wcp_pad_t": _native_design_variable(
-            native_design, "wcp_pad_t", "mm"
-        ),
-        "core_plate_pad_t": _native_design_variable(
-            native_design, "core_plate_pad_t", "mm"
-        ),
-    }
-    expected = {
-        "fan_velocity": FAN_VELOCITY_M_S,
-        "wcp_pad_t": PAD_THICKNESS_MM,
-        "core_plate_pad_t": PAD_THICKNESS_MM,
-    }
-    for name, wanted in expected.items():
-        if not math.isclose(
-            variables[name], wanted, rel_tol=0.0, abs_tol=1e-12
-        ):
-            raise ContinuationError(
-                f"native fixed design variable drifted: "
-                f"{name}={variables[name]} != {wanted}"
-            )
     tim = _thermal_pad_native_readback(ipk.materials)
     if not math.isclose(
         float(tim["thermal_conductivity_W_mK"]),
@@ -1824,8 +1842,7 @@ def attest_native_fixed_model(
         ipk.modeler, "oeditor", None
     )
     return {
-        "schema": "mft-corrected-thermal-native-fixed-readback-v1",
-        "design_variables": variables,
+        "schema": "mft-corrected-thermal-native-fixed-readback-v2",
         "tim_material": tim,
         "fan_boundary": _attest_fan(boundaries),
         "loss_assignments": _native_loss_assignments(

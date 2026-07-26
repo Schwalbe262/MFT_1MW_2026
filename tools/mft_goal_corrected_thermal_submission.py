@@ -53,7 +53,7 @@ CAMPAIGN_ID = "mft-goal-20260726"
 PROJECT = "MFT_1MW_2026v1"
 SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME = (
-    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-core8-r2"
+    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r3"
 )
 ACCOUNT = "r1jae262"
 ACCOUNT_UID = 1455
@@ -120,42 +120,42 @@ CHECKPOINT_ROOT = PurePosixPath(
 )
 RETAINED_ROOT = (
     "/gpfs/home1/r1jae262/slurm_scheduler/mft_goal_20260726/"
-    "corrected_thermal_minimum_core8_r2"
+    "corrected_thermal_minimum_native_r3"
 )
-RETRY_GENERATION = "corrected-thermal-core8-r2"
+RETRY_GENERATION = "corrected-thermal-native-r3"
 INFRASTRUCTURE_RETRY_SOURCE = {
-    "task_id": 96309,
+    "task_id": 96310,
     "task_name": (
-        "mft-goal-corrected-thermal-l96230-b7c30cb70b95-infra-r1"
+        "mft-goal-corrected-thermal-l96230-b7c30cb70b95-core8-r2"
     ),
     "dedupe_key": (
-        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-infra-r1:"
-        "9cee6b7251f717a11d77fbf07c867c44c0519e60:"
-        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:0458035f6fe1c5f3"
+        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-core8-r2:"
+        "abf407d1bd6174674f4e8b2a231973bb40e05e98:"
+        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:b19bdee88bf422bf"
     ),
-    "executor_revision": "9cee6b7251f717a11d77fbf07c867c44c0519e60",
+    "executor_revision": "abf407d1bd6174674f4e8b2a231973bb40e05e98",
     "plan_payload_sha256": (
-        "5efc8418573d3bab026d4cda27187bf7574dd235fc8b628c1c3a3aa2c75ec9ab"
+        "e90d5bc1dfe25d5027401b4b1f4dda8987f21a6c6987fd506f9ca1ab797d8016"
     ),
     "plan_file_sha256": (
-        "43766d945129ba635660eb2715f7e6b03e489366b0c61aecfe3723ddfa791a84"
+        "efe0202c763bed871d23c7909922e3ed0ad3e1c8b35f6ce88e460eccfce610d6"
     ),
     "submission_receipt_payload_sha256": (
-        "5ae8a6d179a9e6967df80a58ee0c63d2a9d3843cfcfc26a27e0a4d293b6704ea"
+        "ae3d05f1c9a79756df8660b3ce790c76e9460b91b83dd480f4f9f14834c3e6dd"
     ),
     "submission_receipt_file_sha256": (
-        "2046e3b9f57050df73690f58af0bda90093391503d76c9441db4304e955eb62e"
+        "d01c67b675ae81d1c80cfc2eba60d8f15c3e92d01d155aa70474d70b0a0e3f6b"
     ),
     "stdout_sha256": (
-        "9df965dcd748d19b1d2b42c96d9204ea4142a7d1cc1f37622a3f0e004572649c"
+        "f8b8dc9b2f5fcac059bcca67a7104b233c3ec8837ba6d39deb2f9959f42ffd6b"
     ),
     "stderr_sha256": (
-        "b9f23cea8fa4c3e8688ced30ec7a54ca36a38716bc04b56b45450c902f81fa58"
+        "5980b82d7e2cbbefec05c8952d475d0f0c77a424f13b675672fd674c187f989a"
     ),
     "requested_node": "n109",
-    "allocation_id": 14637,
-    "slurm_job_id": "837992",
-    "failure_class": "missing_authenticated_mft_8x1_core_opt_in_before_solver",
+    "allocation_id": 14638,
+    "slurm_job_id": "838099",
+    "failure_class": "missing_native_fan_design_variable_before_solver",
     "retry_kind": "infrastructure",
 }
 REMOTE_CWD = "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs"
@@ -2293,16 +2293,18 @@ def validate_infrastructure_retry_source(
     except json.JSONDecodeError:
         core_readback = None
     expected_core_readback = {
-        "contract_version": "default-four-core-cap-v1",
-        "opt_in": False,
+        "contract_version": CORE_CONTRACT_VERSION,
+        "opt_in": True,
         "backend": "standalone",
-        "requested_num_cores": 4,
-        "effective_num_cores": 4,
+        "requested_num_cores": 8,
+        "effective_num_cores": 8,
         "num_tasks": 1,
-        "slurm_cpus_per_task_readback": "8",
-        "scheduler_task_id_readback": str(source["task_id"]),
-        "slurm_job_id_readback": source["slurm_job_id"],
-        "auth_sha256": "",
+        "slurm_cpus_per_task_readback": 8,
+        "scheduler_task_id_readback": source["task_id"],
+        "slurm_job_id_readback": int(source["slurm_job_id"]),
+        "auth_sha256": core_contract_auth_sha256(
+            source["executor_revision"]
+        ),
         "solver_revision": source["executor_revision"],
         "solver_dirty": 0,
     }
@@ -2314,7 +2316,7 @@ def validate_infrastructure_retry_source(
         or value.get("account_name") != ACCOUNT
         or status != "failed"
         or isinstance(value.get("exit_code"), bool)
-        or value.get("exit_code") != 2
+        or value.get("exit_code") != 1
         or value.get("requested_node_name") != source["requested_node"]
         or value.get("actual_node_name") != source["requested_node"]
         or value.get("allocation_node_name") != source["requested_node"]
@@ -2323,10 +2325,12 @@ def validate_infrastructure_retry_source(
         or str(value.get("slurm_job_id") or "") != source["slurm_job_id"]
         or failure
         != (
-            "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
-            "authenticated Slurm core policy is not 8x1: 4x1"
+            "ansys.aedt.core.internal.errors.GrpcApiError: "
+            "Failed to execute gRPC AEDT command: GetVariableValue"
         )
-        or "authenticated Slurm core policy is not 8x1: 4x1" not in stderr
+        or "attest_native_fixed_model" not in stderr
+        or '"fan_velocity": _native_design_variable' not in stderr
+        or "Failed to execute gRPC AEDT command: GetVariableValue" not in stderr
         or not isinstance(core_readback, Mapping)
         or any(
             core_readback.get(key) != expected
@@ -2336,12 +2340,12 @@ def validate_infrastructure_retry_source(
     ):
         raise CorrectedThermalError(
             "infrastructure retry source is not the exact pre-solver "
-            "missing authenticated 8x1 core-policy failure"
+            "missing native fan design-variable failure"
         )
     return {
         "task_id": source["task_id"],
         "status": "failed",
-        "exit_code": 2,
+        "exit_code": 1,
         "failure_class": source["failure_class"],
         "node": source["requested_node"],
         "allocation_id": source["allocation_id"],

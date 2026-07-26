@@ -274,16 +274,18 @@ class FakeScheduler:
         source_id = submission.INFRASTRUCTURE_RETRY_SOURCE["task_id"]
         source = submission.INFRASTRUCTURE_RETRY_SOURCE
         core_readback = {
-            "contract_version": "default-four-core-cap-v1",
-            "opt_in": False,
+            "contract_version": submission.CORE_CONTRACT_VERSION,
+            "opt_in": True,
             "backend": "standalone",
-            "requested_num_cores": 4,
-            "effective_num_cores": 4,
+            "requested_num_cores": 8,
+            "effective_num_cores": 8,
             "num_tasks": 1,
-            "slurm_cpus_per_task_readback": "8",
-            "scheduler_task_id_readback": str(source_id),
-            "slurm_job_id_readback": source["slurm_job_id"],
-            "auth_sha256": "",
+            "slurm_cpus_per_task_readback": 8,
+            "scheduler_task_id_readback": source_id,
+            "slurm_job_id_readback": int(source["slurm_job_id"]),
+            "auth_sha256": submission.core_contract_auth_sha256(
+                source["executor_revision"]
+            ),
             "solver_revision": source["executor_revision"],
             "solver_dirty": 0,
         }
@@ -296,8 +298,10 @@ class FakeScheduler:
         }
         self.stderr: dict[int, str] = {
             source_id: (
-                "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
-                "authenticated Slurm core policy is not 8x1: 4x1\n"
+                '  "fan_velocity": _native_design_variable(\n'
+                "  File executor.py, in attest_native_fixed_model\n"
+                "ansys.aedt.core.internal.errors.GrpcApiError: "
+                "Failed to execute gRPC AEDT command: GetVariableValue\n"
             )
         }
 
@@ -312,7 +316,7 @@ class FakeScheduler:
             "account_name": submission.ACCOUNT,
             "status": "failed",
             "state": "failed",
-            "exit_code": 2,
+            "exit_code": 1,
             "requested_node_name": source["requested_node"],
             "actual_node_name": source["requested_node"],
             "allocation_node_name": source["requested_node"],
@@ -320,8 +324,8 @@ class FakeScheduler:
             "allocation_id": source["allocation_id"],
             "slurm_job_id": source["slurm_job_id"],
             "failure_message": (
-                "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
-                "authenticated Slurm core policy is not 8x1: 4x1"
+                "ansys.aedt.core.internal.errors.GrpcApiError: "
+                "Failed to execute gRPC AEDT command: GetVariableValue"
             ),
         }
 
