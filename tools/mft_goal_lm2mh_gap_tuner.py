@@ -556,6 +556,7 @@ def _lane(
     gap_mm: float,
     solver_revision: str,
     library_revision: str,
+    scheduler_priority: int = PRIORITY,
 ) -> dict[str, Any]:
     gap = _finite(gap_mm, "center gap")
     h1 = _finite(candidate["base_params"]["h1"], "h1")
@@ -599,7 +600,7 @@ def _lane(
             "memory_mb": MEMORY_MB,
             "timeout_seconds": TIMEOUT_SECONDS,
             "max_workers_per_node": MAX_WORKERS_PER_NODE,
-            "priority": PRIORITY,
+            "priority": scheduler_priority,
             "aedt_backend": "standalone",
             "environment": _core_environment(solver_revision),
         },
@@ -634,6 +635,9 @@ def _write_round(
             gap_mm=gap,
             solver_revision=campaign["solver_revision"],
             library_revision=campaign["library_revision"],
+            scheduler_priority=int(
+                campaign.get("scheduler_priority", PRIORITY)
+            ),
         )
         for index, gap in enumerate(gaps_mm, start=1)
     ]
@@ -696,6 +700,7 @@ def _prepare_candidate(
     library_revision: str,
     campaign_id: str,
     source_classification: str,
+    scheduler_priority: int = PRIORITY,
 ) -> Path:
     solver = str(solver_revision).lower()
     library = str(library_revision).lower()
@@ -703,6 +708,12 @@ def _prepare_candidate(
         raise GapTuningError("full 40-character solver/library revisions required")
     if campaign_id not in {CAMPAIGN_ID, NEIGHBORHOOD_CAMPAIGN_ID}:
         raise GapTuningError("unsupported physical-gap tuning campaign id")
+    if (
+        isinstance(scheduler_priority, bool)
+        or not isinstance(scheduler_priority, int)
+        or not 0 <= scheduler_priority <= 100
+    ):
+        raise GapTuningError("scheduler priority must be an integer in 0..100")
     destination = output.resolve()
     if destination.exists():
         raise GapTuningError(f"campaign output already exists: {destination}")
@@ -720,6 +731,7 @@ def _prepare_candidate(
             "library_revision": library,
             "candidate": candidate,
             "source_classification": source_classification,
+            "scheduler_priority": scheduler_priority,
             "base_params": _file_record(
                 base_params_path, relative_to=destination
             ),
@@ -790,11 +802,15 @@ def _load_campaign(path: Path) -> tuple[dict[str, Any], Path]:
     campaign_path = path.resolve(strict=True)
     root = campaign_path.parent
     campaign = _validate_seal(_read_json(campaign_path), CAMPAIGN_SCHEMA)
+    scheduler_priority = campaign.get("scheduler_priority", PRIORITY)
     if (
         campaign.get("campaign_id")
         not in {CAMPAIGN_ID, NEIGHBORHOOD_CAMPAIGN_ID}
         or campaign.get("pre_gap_16_candidate_lane_modified") is not False
         or campaign.get("scheduler_repository_modified") is not False
+        or isinstance(scheduler_priority, bool)
+        or not isinstance(scheduler_priority, int)
+        or not 0 <= scheduler_priority <= 100
     ):
         raise GapTuningError("campaign contract drifted")
     profile_path = (root / campaign["profile"]["path"]).resolve(strict=True)
@@ -844,6 +860,8 @@ def _load_round(
             or identity["dedupe_key"] != scheduler["dedupe_key"]
             or identity["parameter_digest"] != scheduler["parameter_digest"]
             or _sha(identity["merged"]) != scheduler["effective_params_sha256"]
+            or scheduler.get("priority")
+            != int(campaign.get("scheduler_priority", PRIORITY))
             or scheduler["name"] in identities
             or scheduler["dedupe_key"] in identities
         ):
