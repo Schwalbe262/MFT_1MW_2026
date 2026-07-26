@@ -28,13 +28,13 @@ import zlib
 SCHEMA = "mft-goal-fixed-primary-5t-nsga-task-v1"
 RESULT_SCHEMA = "mft-goal-fixed-primary-5t-nsga-result-v1"
 CAMPAIGN_SCHEMA = "mft-goal-fixed-primary-5t-nsga-submission-v1"
-CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-20260727-v3"
+CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-axis-v4"
 HEDGE_CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-variable-20260727-v1"
 PRIMARY_CONDUCTOR_MM = 5.0
 PRIMARY_GAP_MM = 1.6
 POPULATION = 320
 GENERATIONS = 80
-SEED_START = 2_707_275_300
+SEED_START = 2_707_275_500
 SEED_COUNT = 16
 HEDGE_SEED_START = 2_707_275_400
 HEDGE_SEED_COUNT = 8
@@ -57,7 +57,7 @@ GLOBAL_TERMINAL_CSV = Path(
 )
 DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_primary_5t_gap1_1p6_nsga_v3"
+    r"\fixed_primary_5t_gap1_1p6_axis_nsga_v4"
 )
 BASE_TASKS = {
     5: "artifacts/campaign/tasks/seed-2607262000-n1-5.json",
@@ -76,7 +76,12 @@ HARD_SPEC = {
     "primary_conductor_thickness_mm": PRIMARY_CONDUCTOR_MM,
     "primary_interturn_gap_mm": PRIMARY_GAP_MM,
     "primary_controls_are_hard_fixed": True,
-    "size_limits_mm": {"W": 1200.0, "L": 1000.0, "H": 750.0},
+    "size_limits_mm": {"W": 1000.0, "L": 1200.0, "H": 750.0},
+    "axis_contract": {
+        "W": "drawing_x_original_973mm_side-secondary-direction",
+        "L": "drawing_y_perpendicular-direction",
+        "rotation_or_axis_swap_allowed": False,
+    },
     "self_resonance_min_Hz": 15_000.0,
     "winding_temperature_max_C": 100.0,
     "core_temperature_max_C": 120.0,
@@ -386,6 +391,8 @@ def submit(
     priority: int,
     apply: bool,
     lane: str,
+    seed_offset: int = 0,
+    seed_count_override: int | None = None,
 ) -> dict[str, Any]:
     if output.exists():
         raise RuntimeError(f"campaign output already exists: {output}")
@@ -404,8 +411,17 @@ def submit(
         seed_count = HEDGE_SEED_COUNT
     else:
         raise RuntimeError(f"unsupported lane: {lane}")
+    if seed_offset < 0 or seed_offset >= seed_count:
+        raise RuntimeError("seed offset is outside the bounded campaign")
+    requested_count = (
+        seed_count - seed_offset
+        if seed_count_override is None
+        else int(seed_count_override)
+    )
+    if requested_count < 1 or seed_offset + requested_count > seed_count:
+        raise RuntimeError("requested seed slice is outside the campaign")
     tasks = []
-    for index in range(seed_count):
+    for index in range(seed_offset, seed_offset + requested_count):
         turns = 5 + index % 4
         task = _task_payload(
             seed=seed_start + index,
@@ -460,8 +476,10 @@ def submit(
             "runner_source_sha256": hashlib.sha256(source).hexdigest(),
             "population": POPULATION,
             "generations": GENERATIONS,
-            "seed_count": seed_count,
-            "seed_start": seed_start,
+            "seed_count": requested_count,
+            "seed_start": seed_start + seed_offset,
+            "campaign_total_seed_count": seed_count,
+            "campaign_seed_offset": seed_offset,
             "turn_strata": [5, 6, 7, 8],
             "scheduler_resources_per_task": {
                 "cpus": CPUS,
@@ -608,6 +626,31 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
         raise RuntimeError("authenticated surrogate source changed")
 
     problem = runner.problem
+    axis_stage_spec = copy.deepcopy(problem.stage_spec)
+    axis_stage_spec["size_limits_mm"] = copy.deepcopy(
+        task["hard_spec"]["size_limits_mm"]
+    )
+    problem.spec = copy.deepcopy(problem.spec)
+    problem.spec["size_limits_mm"] = copy.deepcopy(
+        task["hard_spec"]["size_limits_mm"]
+    )
+    problem.stage_spec = axis_stage_spec
+    problem.stage_spec_sha256 = _sha(axis_stage_spec)
+    axis_hard_contract = copy.deepcopy(problem.hard_constraint_contract)
+    axis_hard_contract["stage"] = (
+        "mft-goal-fixed-primary-5t-axis-specific-v1"
+    )
+    axis_hard_contract["stage_spec_sha256"] = (
+        problem.stage_spec_sha256
+    )
+    axis_hard_contract["size_limits_mm"] = copy.deepcopy(
+        task["hard_spec"]["size_limits_mm"]
+    )
+    axis_hard_contract["axis_contract"] = copy.deepcopy(
+        task["hard_spec"]["axis_contract"]
+    )
+    problem.hard_constraint_contract = axis_hard_contract
+    problem.hard_constraint_contract_sha256 = _sha(axis_hard_contract)
     cw_index = int(problem.cw1_coordinate_index)
     gap_index = problem.sobol_dimension_names.index("gap1")
     cw_unit = float(cw1_unit_coordinate(PRIMARY_CONDUCTOR_MM))
@@ -641,7 +684,7 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
     projected_path = output / "projected_warm_start.npy"
     np.save(projected_path, projected, allow_pickle=False)
     projected_sha = _sha_file(projected_path)
-    smoke = runner.evaluate_coordinates(projected[:8])
+    smoke = runner.evaluate_coordinates(projected[:8], physical=True)
     decoded = smoke["frame"]
     if (
         not np.isclose(
@@ -661,6 +704,36 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
         )
     ):
         raise RuntimeError("fixed primary controls escaped projected smoke")
+    expected_limits = (
+        float(task["hard_spec"]["size_limits_mm"]["W"]),
+        float(task["hard_spec"]["size_limits_mm"]["L"]),
+        float(task["hard_spec"]["size_limits_mm"]["H"]),
+    )
+    if expected_limits != (1000.0, 1200.0, 750.0):
+        raise RuntimeError("axis-specific size contract drifted")
+    for row_index in range(len(decoded)):
+        _volume, observed_dimensions = preflight.bounding_box_lit(
+            decoded.iloc[row_index]
+        )
+        for constraint_name, observed, limit in zip(
+            (
+                "exterior_width_limit",
+                "exterior_length_limit",
+                "exterior_height_limit",
+            ),
+            observed_dimensions,
+            expected_limits,
+        ):
+            constraint_index = problem.constraint_index[constraint_name]
+            if not np.isclose(
+                float(smoke["G"][row_index, constraint_index]),
+                float(observed) - limit,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise RuntimeError(
+                    "axis-specific physical size constraint mapping escaped"
+                )
 
     def pre_optimization(value: Mapping[str, Any]) -> None:
         _atomic_json(
@@ -673,6 +746,15 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
                     "task_payload_sha256": task["payload_sha256"],
                     "hard_spec_sha256": task["hard_spec_sha256"],
                     "physics_sha256": task["physics_sha256"],
+                    "effective_stage_spec_sha256": (
+                        problem.stage_spec_sha256
+                    ),
+                    "effective_hard_constraint_contract_sha256": (
+                        problem.hard_constraint_contract_sha256
+                    ),
+                    "axis_contract": copy.deepcopy(
+                        task["hard_spec"]["axis_contract"]
+                    ),
                     "bounds": {
                         "cw1": {
                             "coordinate_index": cw_index,
@@ -829,6 +911,8 @@ def _parser() -> argparse.ArgumentParser:
         choices=("strict", "gap-variable"),
         default="strict",
     )
+    launch.add_argument("--seed-offset", type=int, default=0)
+    launch.add_argument("--seed-count", type=int)
     launch.add_argument("--apply", action="store_true")
     execute = commands.add_parser("worker")
     execute.add_argument("--payload", type=Path, required=True)
@@ -845,6 +929,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             priority=args.priority,
             apply=args.apply,
             lane=args.lane,
+            seed_offset=args.seed_offset,
+            seed_count_override=args.seed_count,
         )
     else:
         value = worker(
