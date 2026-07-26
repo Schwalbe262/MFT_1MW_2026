@@ -441,6 +441,161 @@ def test_superseded_lifecycle_lane_is_authenticated_but_excluded_from_nds(
     ] == [96338]
 
 
+def test_official5_direct_collection_uses_named_lossless_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "direct-collection"
+    receipt_path = _write_json(
+        root / "collection_receipt.json",
+        postsuccess._sealed(
+            {
+                "schema_version": (
+                    postsuccess.OFFICIAL5_DIRECT_COLLECTION_SCHEMA
+                ),
+                "task_id": 96338,
+            }
+        ),
+    )
+    seal_path = _write_json(
+        root / "collection_seal.json",
+        postsuccess._sealed(
+            {
+                "schema_version": (
+                    postsuccess.OFFICIAL5_DIRECT_COLLECTION_SEAL_SCHEMA
+                ),
+                "task_id": 96338,
+            }
+        ),
+    )
+    result = {"result": "authenticated"}
+    result_path = _write_json(root / "result.json", result)
+    retained = root / "symmetric.aedt"
+    retained.write_bytes(b"test-aedt")
+    receipt = postsuccess._read_json(receipt_path, "test receipt")
+    seal = postsuccess._read_json(seal_path, "test seal")
+    params = {
+        "fan_velocity": 1.5,
+        "k_ins": 0.2,
+        "core_plate_pad_t": 2.0,
+        "wcp_pad_t": 2.0,
+        "thermal_symmetry": "eighth",
+        "full_model": 0,
+        "N1_main": 6,
+    }
+    task_name = "official5-direct-task96338"
+    dedupe = "official5-direct-dedupe-96338"
+    collection = postsuccess._sealed(
+        {
+            "schema_version": (
+                postsuccess.OFFICIAL5_DIRECT_AUTHENTICATED_COLLECTION_SCHEMA
+            ),
+            **postsuccess.SAFETY_FLAGS,
+            "scheduler_get_only_collection": True,
+            "scheduler_mutation_performed": False,
+            "scientific_pass_claimed": False,
+            "production_claimed": False,
+            "strict_al_adapter_authorized": True,
+            "direct_analyze_authentication_passed": True,
+            "solver_core_authentication_passed": True,
+            "thermal_truth_authentication_passed": True,
+            "scientific_gate_evidence": {"authenticated": True},
+            "task_id": 96338,
+            "task_name": task_name,
+            "dedupe_key": dedupe,
+            "candidate_physics_sha256": (
+                postsuccess.OFFICIAL5_CANDIDATE_SHA256
+            ),
+            "same_node_as_task_id": 96332,
+            "same_node_as_allocation_id": 14650,
+            "slurm_job_id": "840582",
+            "source_collection_receipt": postsuccess._file_record(
+                receipt_path
+            ),
+            "source_collection_receipt_payload_sha256": receipt[
+                "payload_sha256"
+            ],
+            "source_collection_seal": postsuccess._file_record(seal_path),
+            "source_collection_seal_payload_sha256": seal[
+                "payload_sha256"
+            ],
+            "result": result,
+            "result_sha256": collector.payload_sha256(result),
+            "result_json": postsuccess._file_record(result_path),
+            "retained_symmetric_aedt": postsuccess._file_record(retained),
+            "goal_physical_spec_reasons": [],
+            "goal_physical_spec_passed": True,
+            "fixed_identity_attestation": {"authenticated": True},
+        }
+    )
+    view = {
+        "schema_version": (
+            postsuccess.OFFICIAL5_DIRECT_AUTHENTICATED_COLLECTION_SCHEMA
+        ),
+        "collection": collection,
+        "plan": {
+            "candidate_physics_sha256": (
+                postsuccess.OFFICIAL5_CANDIDATE_SHA256
+            ),
+            "standard_only": True,
+            "symmetric_model": True,
+            "full_model": False,
+            "thermal_symmetry": "eighth",
+            "fixed_physics_unchanged": True,
+            "placement": {
+                "same_node_as_task_id": 96332,
+                "same_node_as_allocation_id": 14650,
+                "same_node_as_slurm_job_id": "840582",
+            },
+        },
+        "params": params,
+        "selected": {
+            "task_identity": {
+                "seed": 2_607_260_005,
+                "fixed_primary_turns": 6,
+            },
+            "row_contract": {
+                "fea_params_sha256": collector.payload_sha256(params)
+            },
+        },
+        "submission": {
+            "task_id": 96338,
+            "task_name": task_name,
+            "dedupe_key": dedupe,
+            "candidate_physics_sha256": (
+                postsuccess.OFFICIAL5_CANDIDATE_SHA256
+            ),
+            "same_node_as_task_id": 96332,
+        },
+    }
+    authenticated = (
+        postsuccess._authenticate_official5_direct_collection(
+            receipt_path,
+            authenticator=lambda path: (
+                view
+                if path == receipt_path.resolve()
+                else pytest.fail("direct receipt path drifted")
+            ),
+        )
+    )
+    assert authenticated == view
+    assert authenticated["collection"][
+        "thermal_truth_authentication_passed"
+    ] is True
+
+    sentinel = {"dispatched": True}
+    monkeypatch.setattr(
+        postsuccess,
+        "_authenticate_official5_direct_collection",
+        lambda path: (
+            sentinel
+            if path == receipt_path.resolve()
+            else pytest.fail("direct dispatch path drifted")
+        ),
+    )
+    assert postsuccess.authenticate_collection(receipt_path) is sentinel
+
+
 def test_strict_al_dispatches_only_through_named_custom_adapter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

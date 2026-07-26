@@ -28,7 +28,7 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import pandas as pd
 
@@ -66,6 +66,22 @@ RERANK_INPUT_SCHEMA = "mft-goal-postdeadline-standard-rerank-input-v1"
 SNAPSHOT_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-snapshot-v1"
 STATE_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-state-v1"
 PID_SCHEMA = "mft-goal-postdeadline-standard-postsuccess-pid-v1"
+OFFICIAL5_DIRECT_COLLECTION_SCHEMA = (
+    "mft-goal-official5-direct-terminal-collection-v1"
+)
+OFFICIAL5_DIRECT_COLLECTION_SEAL_SCHEMA = (
+    "mft-goal-official5-direct-terminal-collection-seal-v1"
+)
+OFFICIAL5_DIRECT_AUTHENTICATED_COLLECTION_SCHEMA = (
+    "mft-goal-official5-direct-authenticated-collection-v1"
+)
+OFFICIAL5_DIRECT_TASK_ID = 96_338
+OFFICIAL5_SOURCE_TASK_ID = 96_332
+OFFICIAL5_SOURCE_ALLOCATION_ID = 14_650
+OFFICIAL5_SOURCE_SLURM_JOB_ID = "840582"
+OFFICIAL5_CANDIDATE_SHA256 = (
+    "909d249ebe455d6f60b42d094e7916c8b3e8538e8d188e48a3906d82665ebc42"
+)
 CAMPAIGN_ID = "mft-goal-20260726"
 DEFAULT_AGGREGATE_MANIFEST = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
@@ -622,9 +638,234 @@ def _load_collection_envelope(
     )
 
 
+DirectAuthenticator = Callable[[Path], Mapping[str, Any]]
+
+
+def _authenticate_official5_direct_collection(
+    collection_path: Path,
+    *,
+    authenticator: DirectAuthenticator | None = None,
+) -> dict[str, Any]:
+    """Validate the named official5 direct collector's lossless view."""
+
+    receipt_path = collection_path.resolve(strict=True)
+    if receipt_path.is_dir():
+        receipt_path = (
+            receipt_path / "collection_receipt.json"
+        ).resolve(strict=True)
+    if receipt_path.name != "collection_receipt.json":
+        raise PostSuccessContractError(
+            "official5 direct adapter requires collection_receipt.json"
+        )
+    receipt = _validate_seal(
+        _read_json(receipt_path, "official5 direct collection receipt"),
+        OFFICIAL5_DIRECT_COLLECTION_SCHEMA,
+        "official5 direct collection receipt",
+    )
+    if authenticator is None:
+        try:
+            from tools import (  # noqa: PLC0415
+                mft_goal_official5_direct_terminal_collector as direct,
+            )
+        except ImportError as exc:
+            raise PostSuccessContractError(
+                "official5 direct terminal collector adapter is unavailable"
+            ) from exc
+        authenticator = direct.authenticate_collection
+    try:
+        raw_view = authenticator(receipt_path)
+    except Exception as exc:
+        raise PostSuccessContractError(
+            "official5 direct collection authentication failed"
+        ) from exc
+    if not isinstance(raw_view, Mapping):
+        raise PostSuccessContractError(
+            "official5 direct authenticated view is malformed"
+        )
+    view = copy.deepcopy(dict(raw_view))
+    required_view_fields = {
+        "schema_version",
+        "collection",
+        "plan",
+        "params",
+        "selected",
+        "submission",
+    }
+    if (
+        set(view) != required_view_fields
+        or view.get("schema_version")
+        != OFFICIAL5_DIRECT_AUTHENTICATED_COLLECTION_SCHEMA
+        or not all(
+            isinstance(view.get(name), Mapping)
+            for name in (
+                "collection",
+                "plan",
+                "params",
+                "selected",
+                "submission",
+            )
+        )
+    ):
+        raise PostSuccessContractError(
+            "official5 direct authenticated view contract drifted"
+        )
+    collection = _validate_seal(
+        view["collection"],
+        OFFICIAL5_DIRECT_AUTHENTICATED_COLLECTION_SCHEMA,
+        "official5 direct authenticated collection",
+    )
+    view["collection"] = collection
+    plan = view["plan"]
+    params = view["params"]
+    selected = view["selected"]
+    submission = view["submission"]
+    placement = plan.get("placement")
+    task_identity = selected.get("task_identity")
+    row_contract = selected.get("row_contract")
+    result = collection.get("result")
+    fixed_params = {
+        "fan_velocity": 1.5,
+        "k_ins": 0.2,
+        "core_plate_pad_t": 2.0,
+        "wcp_pad_t": 2.0,
+        "thermal_symmetry": "eighth",
+        "full_model": 0,
+    }
+    if (
+        not _classification_valid(collection)
+        or any(
+            collection.get(key) is not expected
+            for key, expected in {
+                "scheduler_get_only_collection": True,
+                "scheduler_mutation_performed": False,
+                "scientific_pass_claimed": False,
+                "production_claimed": False,
+                "strict_al_adapter_authorized": True,
+                "direct_analyze_authentication_passed": True,
+                "solver_core_authentication_passed": True,
+                "thermal_truth_authentication_passed": True,
+            }.items()
+        )
+        or collection.get("task_id") != OFFICIAL5_DIRECT_TASK_ID
+        or collection.get("candidate_physics_sha256")
+        != OFFICIAL5_CANDIDATE_SHA256
+        or collection.get("same_node_as_task_id")
+        != OFFICIAL5_SOURCE_TASK_ID
+        or collection.get("same_node_as_allocation_id")
+        != OFFICIAL5_SOURCE_ALLOCATION_ID
+        or str(collection.get("slurm_job_id") or "")
+        != OFFICIAL5_SOURCE_SLURM_JOB_ID
+        or not isinstance(
+            collection.get("scientific_gate_evidence"), Mapping
+        )
+        or not isinstance(result, Mapping)
+        or collection.get("result_sha256")
+        != collector.payload_sha256(result)
+        or plan.get("candidate_physics_sha256")
+        != OFFICIAL5_CANDIDATE_SHA256
+        or plan.get("standard_only") is not True
+        or plan.get("symmetric_model") is not True
+        or plan.get("full_model") is not False
+        or plan.get("thermal_symmetry") != "eighth"
+        or plan.get("fixed_physics_unchanged") is not True
+        or not isinstance(placement, Mapping)
+        or placement.get("same_node_as_task_id")
+        != OFFICIAL5_SOURCE_TASK_ID
+        or placement.get("same_node_as_allocation_id")
+        != OFFICIAL5_SOURCE_ALLOCATION_ID
+        or str(placement.get("same_node_as_slurm_job_id") or "")
+        != OFFICIAL5_SOURCE_SLURM_JOB_ID
+        or submission.get("task_id") != OFFICIAL5_DIRECT_TASK_ID
+        or submission.get("task_name") != collection.get("task_name")
+        or submission.get("dedupe_key") != collection.get("dedupe_key")
+        or submission.get("candidate_physics_sha256")
+        != OFFICIAL5_CANDIDATE_SHA256
+        or submission.get("same_node_as_task_id")
+        != OFFICIAL5_SOURCE_TASK_ID
+        or any(params.get(key) != value for key, value in fixed_params.items())
+        or not isinstance(task_identity, Mapping)
+        or isinstance(task_identity.get("seed"), bool)
+        or not isinstance(task_identity.get("seed"), int)
+        or int(task_identity["seed"]) <= 0
+        or task_identity.get("fixed_primary_turns")
+        != params.get("N1_main")
+        or not isinstance(row_contract, Mapping)
+        or row_contract.get("fea_params_sha256")
+        != collector.payload_sha256(params)
+    ):
+        raise PostSuccessContractError(
+            "official5 direct physics/placement adapter drifted"
+        )
+    record_names = (
+        "source_collection_receipt",
+        "source_collection_seal",
+        "result_json",
+        "retained_symmetric_aedt",
+    )
+    resolved_records: dict[str, Path] = {}
+    for name in record_names:
+        record = collection.get(name)
+        if not isinstance(record, Mapping):
+            raise PostSuccessContractError(
+                f"official5 direct {name} record is absent"
+            )
+        try:
+            target = Path(str(record.get("path") or "")).resolve(
+                strict=True
+            )
+        except OSError as exc:
+            raise PostSuccessContractError(
+                f"official5 direct {name} file is unavailable"
+            ) from exc
+        if _file_record(target) != record:
+            raise PostSuccessContractError(
+                f"official5 direct {name} bytes drifted"
+            )
+        resolved_records[name] = target
+    if resolved_records["source_collection_receipt"] != receipt_path:
+        raise PostSuccessContractError(
+            "official5 direct receipt path binding drifted"
+        )
+    seal = _validate_seal(
+        _read_json(
+            resolved_records["source_collection_seal"],
+            "official5 direct collection seal",
+        ),
+        OFFICIAL5_DIRECT_COLLECTION_SEAL_SCHEMA,
+        "official5 direct collection seal",
+    )
+    collected_result = _read_json(
+        resolved_records["result_json"],
+        "official5 direct collected result",
+    )
+    if (
+        collection.get("source_collection_receipt_payload_sha256")
+        != receipt["payload_sha256"]
+        or collection.get("source_collection_seal_payload_sha256")
+        != seal["payload_sha256"]
+        or collected_result != result
+    ):
+        raise PostSuccessContractError(
+            "official5 direct collection source binding drifted"
+        )
+    return view
+
+
 def authenticate_collection(collection_path: Path) -> dict[str, Any]:
     """Return the stable custom-schema adapter consumed by strict AL."""
 
+    source = collection_path.resolve(strict=True)
+    receipt_path = (
+        (source / "collection_receipt.json").resolve(strict=True)
+        if source.is_dir()
+        else source
+    )
+    raw = _read_json(receipt_path, "collection receipt")
+    if (
+        raw.get("schema_version")
+        == OFFICIAL5_DIRECT_COLLECTION_SCHEMA
+    ):
+        return _authenticate_official5_direct_collection(receipt_path)
     (
         receipt,
         seal,
