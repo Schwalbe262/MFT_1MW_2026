@@ -288,13 +288,13 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     assert merged["completed"] == completed
     assert merged["attention"] == attention
     assert "18:20 KST" in merged["summary"]
-    assert "running2 · queued5 · terminal2" in merged["summary"]
+    assert "running2 · queued6 · terminal2" in merged["summary"]
     assert "physical feasible0" in merged["summary"]
     assert "scientific/production PASS가 아닙니다" in merged["summary"]
     assert merged["current"][-1] != parallel
     assert merged["current"][-1]["id"] == "parallel-workstreams"
     assert (
-        "RUNNING 2 · QUEUED 5 · ALLOCATION JOBS 2"
+        "RUNNING 2 · QUEUED 6 · ALLOCATION JOBS 2"
         in merged["current"][-1]["title"]
     )
     assert (
@@ -329,11 +329,23 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         "final explicit Full validation candidate cap=1" in value
         for value in policy["evidence"]
     )
+    lane_evidence = next(
+        value
+        for value in policy["evidence"]
+        if value.startswith("Standard selection lanes=7")
+    )
+    assert "task96333" in lane_evidence
+    assert "task96329" not in lane_evidence
+    assert any(
+        "effective official#8 selection lane=task96333" in value
+        and "task96329 superseded but lifecycle-visible" in value
+        for value in policy["evidence"]
+    )
     assert merged["unknown_top_level"] == {"preserve": True}
     assert sync["allocation_jobs_active"] == 2
     assert sync["running"] == 2
-    assert sync["queued"] == 5
-    assert sync["submitted_total"] == 125
+    assert sync["queued"] == 6
+    assert sync["submitted_total"] == 126
     assert sync["collections_preserved"] == 0
     assert sync["scheduler_methods_used"] == ["GET"]
     assert sync["scientific_pass_generated"] is False
@@ -347,6 +359,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         96330,
         96331,
         96332,
+        96333,
     ]
 
     success = next(
@@ -397,6 +410,38 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
         in value
         for value in official8["evidence"]
     )
+    assert any(
+        "selection_lane_effective=false" in value
+        and "superseded_by_task96333=true" in value
+        for value in official8["evidence"]
+    )
+    failover = next(
+        item
+        for item in merged["current"]
+        if item["id"] == "postdeadline-standard-official8-failover-96333"
+    )
+    assert "task96333 QUEUED" in failover["title"]
+    assert "n111" in failover["title"]
+    assert any(
+        "requested account=r1jae262" in value
+        and "requested node=n111" in value
+        and "node policy=strict" in value
+        for value in failover["evidence"]
+    )
+    assert any(
+        "cpus8 / memory98304MB / scheduler timeout45300s" in value
+        for value in failover["evidence"]
+    )
+    assert any(
+        "selection_lane_effective=true" in value
+        and "failover_for_task96329=true" in value
+        for value in failover["evidence"]
+    )
+    assert any(
+        "8990b3f339ce36f66d4ecf5fdbbd111889d55b25d860d00e3d98e6508101180c"
+        in value
+        for value in failover["evidence"]
+    )
     for task_id, order, node, receipt_sha in (
         (
             96330,
@@ -430,8 +475,8 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
 
     handoff = next(item for item in merged["current"] if item["id"] == "fea-handoff")
     assert (
-        handoff["title"] == "SLURM · ALLOCATION JOBS 2 · SUBMITTED 125 · "
-        "RUNNING 2 · QUEUED 5 · COLLECTIONS 0"
+        handoff["title"] == "SLURM · ALLOCATION JOBS 2 · SUBMITTED 126 · "
+        "RUNNING 2 · QUEUED 6 · COLLECTIONS 0"
     )
     for item in merged["current"]:
         assert len(item["title"]) <= 160
@@ -767,7 +812,7 @@ def test_scheduler_reader_uses_bounded_get(monkeypatch: pytest.MonkeyPatch) -> N
 def test_official_task_max_workers_is_fail_closed(
     spec: updater.TaskSpec,
 ) -> None:
-    assert spec.task_id in {96328, 96329, 96330, 96331, 96332}
+    assert spec.task_id in {96328, 96329, 96330, 96331, 96332, 96333}
     task = _task(spec)
     task["max_workers_per_node"] = 2
 

@@ -33,7 +33,7 @@ DEFAULT_STATUS_FILE = Path(
 )
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_RESPONSE_BYTES = 1024 * 1024
-CAMPAIGN_SUBMITTED_FLOOR = 125
+CAMPAIGN_SUBMITTED_FLOOR = 126
 SYNC_KEY = "postdeadline_task_sync"
 SYNC_SCHEMA = "mft-goal-postdeadline-ui-sync-v1"
 PID_SCHEMA = "mft-goal-postdeadline-ui-updater-pid-v1"
@@ -86,6 +86,8 @@ class TaskSpec:
     task_timeout_at_kst: str | None = None
     force_cancel_lead_seconds: int | None = None
     terminal_failure_override: str | None = None
+    selection_superseded_by_task_id: int | None = None
+    selection_failover_for_task_id: int | None = None
 
 
 TASK_SPECS = (
@@ -199,6 +201,7 @@ TASK_SPECS = (
         final_seal_sha256=(
             "5319a8a4dceb27082b91fc6badd540221298eeb9f324e2fa30e76e529313d3ec"
         ),
+        selection_superseded_by_task_id=96333,
     ),
     TaskSpec(
         task_id=96330,
@@ -272,13 +275,38 @@ TASK_SPECS = (
             "ed28dd4d0c4ec904d2910323bc63bee2e13afddb59cd8e4d7f1a9d3d11487477"
         ),
     ),
+    TaskSpec(
+        task_id=96333,
+        card_id="postdeadline-standard-official8-failover-96333",
+        task_name=(
+            "mft-goal-diag-standard-postdeadline-official8-failover-"
+            "s96141-622097dde126-n111"
+        ),
+        model_label="STANDARD OFFICIAL #8 FAILOVER",
+        candidate_label="official#8 622097dde126 n111 failover",
+        requested_node="n111",
+        cpus=8,
+        memory_mb=98304,
+        timeout_seconds=45300,
+        inner_solver_seconds=43200,
+        requested_account="r1jae262",
+        max_workers_per_node=1,
+        search_only=True,
+        submission_receipt_sha256=(
+            "8990b3f339ce36f66d4ecf5fdbbd111889d55b25d860d00e3d98e6508101180c"
+        ),
+        final_seal_sha256=(
+            "d70eef5add63daa0148ad05af809dd231d1400a11794995a0fb81a3a6fedd45f"
+        ),
+        selection_failover_for_task_id=96329,
+    ),
 )
 
 STANDARD_SELECTION_TASK_IDS = (
     96325,
     96327,
     96328,
-    96329,
+    96333,
     96330,
     96331,
     96332,
@@ -722,6 +750,19 @@ def _task_card(
         f"{spec.candidate_label} post-deadline diagnostic/noncanonical 작업. "
         f"{lifecycle} {outcome}"
     )
+    if spec.selection_superseded_by_task_id is not None:
+        detail += (
+            " Effective selection lane=false: "
+            f"task{spec.selection_superseded_by_task_id} supersedes this queued "
+            "attempt for candidate selection; this task remains visible for "
+            "authenticated Scheduler lifecycle only."
+        )
+    if spec.selection_failover_for_task_id is not None:
+        detail += (
+            " Effective selection lane=true: this strict-node failover "
+            f"supersedes task{spec.selection_failover_for_task_id} for "
+            "candidate selection; the superseded task remains lifecycle-visible."
+        )
     if force_risk is not None:
         detail += (
             f" allocation{force_risk['allocation_id']}의 source-derived "
@@ -758,6 +799,23 @@ def _task_card(
         )
     if spec.final_seal_sha256 is not None:
         evidence.append(f"final seal SHA256 {spec.final_seal_sha256}")
+    if spec.requested_account is not None:
+        evidence.append(
+            f"requested account={spec.requested_account} / "
+            f"requested node={spec.requested_node} / node policy=strict"
+        )
+    if spec.selection_superseded_by_task_id is not None:
+        evidence.append(
+            "selection_lane_effective=false / "
+            f"superseded_by_task{spec.selection_superseded_by_task_id}=true / "
+            "lifecycle_visibility_preserved=true"
+        )
+    if spec.selection_failover_for_task_id is not None:
+        evidence.append(
+            "selection_lane_effective=true / "
+            f"failover_for_task{spec.selection_failover_for_task_id}=true / "
+            "official#8_unique_lane=true"
+        )
     if force_risk is not None:
         evidence.extend(
             [
@@ -910,6 +968,10 @@ def _symmetric_primary_policy_card(
             f"Standard selection lanes=7 / {lane_ids}",
             f"lane lifecycle={lane_lifecycle}",
             "automatic Standard-to-Full per candidate=false",
+            (
+                "effective official#8 selection lane=task96333 / "
+                "task96329 superseded but lifecycle-visible"
+            ),
             (
                 f"task96326 lifecycle={full_category.upper()} / "
                 "role=diagnostic reference only"
@@ -1330,7 +1392,9 @@ def _parallel_workstreams_card(
     evidence = [
         (
             f"active allocations{allocation_jobs} / running{running} / "
-            f"queued{queued} / terminal{terminal}"
+            f"queued{queued} / terminal{terminal} / all managed tasks "
+            "diagnostic/noncanonical / Scheduler GET only / "
+            "scientific_pass_generated=false / canonical_promotion=false"
         )
     ]
     evidence.extend(
@@ -1352,10 +1416,6 @@ def _parallel_workstreams_card(
             "hard guarantee=false"
         )
         for spec, risk in operational_risks
-    )
-    evidence.append(
-        "all managed tasks diagnostic/noncanonical / Scheduler GET only / "
-        "scientific_pass_generated=false / canonical_promotion=false"
     )
     active_risk_title = "".join(
         (
@@ -1486,8 +1546,11 @@ def merge_status(
                 for spec in TASK_SPECS
             ]
             + [
-                f"active allocation jobs{allocation_jobs} / running{running} / queued{queued}",
-                f"submitted{submitted} / collections{collections} preserved",
+                (
+                    f"active allocation jobs{allocation_jobs} / running{running} / "
+                    f"queued{queued} / submitted{submitted} / "
+                    f"collections{collections} preserved"
+                ),
                 (
                     "Scheduler GET only / scientific_pass_generated=false / "
                     "canonical_promotion=false / Scheduler project remains separate "
