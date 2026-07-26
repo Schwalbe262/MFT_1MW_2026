@@ -178,7 +178,17 @@ def _mixed_auxiliary_tasks() -> dict[int, dict[str, Any]]:
                 "allocation_id": 14651,
                 "slurm_job_id": "840787",
             }
-        elif spec in updater.TARGET_AXIS_TASK_SPECS:
+        elif spec.task_id == 96743:
+            values = {
+                "node": "n110",
+                "account": "dhj02",
+                "allocation_id": 14648,
+                "slurm_job_id": "840585",
+            }
+        elif (
+            spec in updater.TARGET_AXIS_TASK_SPECS
+            or spec in updater.FRESH_SPLITTEMP_TASK_SPECS
+        ):
             values = {
                 "state": "queued",
                 "allocation_id": None,
@@ -496,8 +506,24 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     ]
     target = merged["current"][1]
     assert "AUTHORITATIVE W1200/L1000" in target["title"]
-    assert "SUBMITTED 16" in target["title"]
-    assert "QUEUED 16" in target["title"]
+    assert "FINAL528=OLD16+FRESH512" in target["title"]
+    assert "FRESH RUN 0 / QUEUE 512 / SUCCESS 0 / FAIL 0" in target["title"]
+    assert "SYM96743 RUNNING" in target["title"]
+    assert any(
+        "fresh task ranges=96485-96740 + 96756-97011" in value
+        and "seeds=16+512=528" in value
+        for value in target["evidence"]
+    )
+    assert any(
+        "primary winding<=100C" in value
+        and "secondary winding<=120C" in value
+        and "core<=120C" in value
+        for value in target["evidence"]
+    )
+    assert sum(
+        value.startswith("fresh N1=") and "seeds=128" in value
+        for value in target["evidence"]
+    ) == 4
     axis = merged["current"][3]
     assert "SUPERSEDED HISTORICAL WRONG AXIS" in axis["title"]
     assert "RUNNING 15" in axis["title"]
@@ -557,8 +583,158 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     assert sync["target_axis"]["width_drawing_x_max_mm"] == 1_200.0
     assert sync["target_axis"]["length_perpendicular_y_max_mm"] == 1_000.0
     assert sync["target_axis"]["submission_state"] == "submitted"
-    assert sync["target_axis"]["queued"] == 16
-    assert sync["target_axis"]["task_ids"] == list(range(96416, 96432))
+    assert sync["target_axis"]["queued"] == 528
+    assert sync["target_axis"]["fresh_queued"] == 512
+    assert sync["target_axis"]["expected_seed_count"] == 528
+    assert sync["target_axis"]["expected_raw_terminal_rows"] == 168_960
+    assert sync["target_axis"]["fresh_task_ranges"] == [
+        [96485, 96740],
+        [96756, 97011],
+    ]
+    assert sync["target_axis"]["task_ids"] == [
+        *range(96416, 96432),
+        *range(96485, 96741),
+        *range(96756, 97012),
+    ]
+    assert sync["target_axis"]["temperature_gate_C"] == {
+        "primary_winding_max": 100.0,
+        "secondary_winding_max": 120.0,
+        "core_max": 120.0,
+    }
+    assert sync["target_axis"]["final_symmetric_retry"]["task_id"] == 96743
+    assert sync["target_axis"]["final_symmetric_retry"]["state"] == "running"
+    assert len(
+        json.dumps(merged, ensure_ascii=False).encode("utf-8")
+    ) < 256 * 1024
+
+
+def test_fresh_splittemp_task_topology_and_turn_strata_are_exact() -> None:
+    specs = updater.FRESH_SPLITTEMP_TASK_SPECS
+
+    assert len(specs) == 512
+    assert [spec.task_id for spec in specs] == [
+        *range(96485, 96741),
+        *range(96756, 97012),
+    ]
+    assert [spec.seed for spec in specs] == list(
+        range(2707277000, 2707277512)
+    )
+    assert 96743 not in {spec.task_id for spec in specs}
+    assert {
+        turns: sum(spec.primary_turns == turns for spec in specs)
+        for turns in (5, 6, 7, 8)
+    } == {5: 128, 6: 128, 7: 128, 8: 128}
+    assert updater.FINAL_SYMMETRIC_RETRY_TASK_SPEC.task_name == (
+        "mft-final-sym-gap-2b2138a99445-g00860423-r1"
+    )
+
+
+def test_reference_terminal_marker_overrides_live_process_heuristic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui_root = tmp_path / "reference-gui"
+    run_root = gui_root / "simulation" / "simulation1"
+    run_root.mkdir(parents=True)
+    (run_root / "simulation1.aedt").write_bytes(b"aedt")
+    (run_root / "convergence_matrix.txt").write_text("matrix", encoding="utf-8")
+    (run_root / "convergence_cap.txt").write_text("cap", encoding="utf-8")
+    (gui_root / "local_thermal_retry_stdout.log").write_text(
+        'SOLVER_CORE_DISPATCH_JSON {"stage":"thermal"}\n'
+        "Solving design setup ThermalSetup\n",
+        encoding="utf-8",
+    )
+    (gui_root / "local_thermal_retry_stderr.log").write_text("", encoding="utf-8")
+    (gui_root / "thermal_failure.json").write_text(
+        json.dumps(
+            {
+                "schema": updater.REFERENCE_THERMAL_TERMINAL_SCHEMA,
+                "sealed": True,
+                "terminal": True,
+                "status": "failed",
+                "state": "failed",
+                "stage": "thermal_fluent_case_read",
+                "thermal_solved": False,
+                "temperature_results_available": False,
+                "failure_class": "native_fluent_case_read_journal_interrupt",
+                "failure_message": "no valid temperature fields",
+                "retry": {
+                    "status": "prepared",
+                    "parameter": "thermal_rx_side_block_mesh_level",
+                    "target_value": 4,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(updater, "_pid_exists", lambda pid: pid in {34080, 44520})
+    monkeypatch.setattr(
+        updater,
+        "_descendant_processes",
+        lambda _pid: [(50000, "fluent.exe")],
+    )
+
+    local = updater._reference_local_stage(gui_root)
+    card = updater._reference_baseline_card(
+        _mixed_auxiliary_tasks(),
+        OBSERVED,
+        gui_root,
+        local_stage=local,
+    )
+
+    assert local["thermal_failed"] is True
+    assert local["thermal_running"] is False
+    assert local["fluent_running"] is False
+    assert local["fluent_pids"] == []
+    assert "THERMAL FAILED" in card["title"]
+    assert "RETRY PREPARED" in card["title"]
+    assert "PID44520 ACTIVE" in card["title"]
+    assert any(
+        "terminal marker priority=true" in value
+        and "native_fluent_case_read_journal_interrupt" in value
+        and "thermal_rx_side_block_mesh_level->4" in value
+        for value in card["evidence"]
+    )
+
+    (gui_root / "thermal_mesh_l4_retry_failure.json").write_text(
+        json.dumps(
+            {
+                "schema": updater.REFERENCE_THERMAL_RETRY_TERMINAL_SCHEMA,
+                "sealed": True,
+                "terminal": True,
+                "status": "failed",
+                "state": "failed",
+                "task_id": 96432,
+                "result_valid_thermal": False,
+                "temperature_results_available": False,
+                "failure_class": (
+                    "direct_analyze_mesh_quality_canary_"
+                    "control_flow_incompatibility"
+                ),
+                "failure_message": (
+                    "symmetry direct-analyze cannot bypass a requested "
+                    "mesh-quality canary"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    retry_failed_local = updater._reference_local_stage(gui_root)
+    retry_failed_card = updater._reference_baseline_card(
+        _mixed_auxiliary_tasks(),
+        OBSERVED,
+        gui_root,
+        local_stage=retry_failed_local,
+    )
+
+    assert retry_failed_local["thermal_retry_failed"] is True
+    assert "L4 RETRY CONTROL-FLOW FAILED" in retry_failed_card["title"]
+    assert any(
+        "retry task96432="
+        "direct_analyze_mesh_quality_canary_control_flow_incompatibility"
+        in value
+        for value in retry_failed_card["evidence"]
+    )
 
 
 def test_axis_v6_raw_completion_is_historical_screening_only() -> None:

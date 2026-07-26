@@ -43,7 +43,7 @@ DEFAULT_REFERENCE_BASELINE_GUI_ROOT = Path(
 )
 DEFAULT_TARGET_AXIS_COLLECTOR_STATE_FILE = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_lm2mh_targeted_w1200_l1000_v1_global_nds"
+    r"\fixed_lm2mh_old16_plus_splittemp512_global_nds_v3"
     r"\collector_status.json"
 )
 DEFAULT_INTERVAL_SECONDS = 60
@@ -61,7 +61,13 @@ LOCAL_SYMMETRIC_SELECTION_STATE_SCHEMA = (
     "mft-goal-local-symmetric-selection-watch-state-v1"
 )
 TARGET_AXIS_COLLECTOR_STATE_SCHEMA = (
-    "mft-goal-fixed-lm2mh-targeted-global-nds-v1"
+    "mft-goal-fixed-lm2mh-targeted-global-nds-v3"
+)
+REFERENCE_THERMAL_TERMINAL_SCHEMA = (
+    "mft-reference-gui-thermal-terminal-state-v1"
+)
+REFERENCE_THERMAL_RETRY_TERMINAL_SCHEMA = (
+    "mft-reference-gui-thermal-retry-terminal-state-v1"
 )
 FINAL_GATE_PENDING_SCHEMA = "mft-goal-final-solver-package-pending-v1"
 FINAL_GATE_SEAL_SCHEMA = "mft-goal-final-solver-package-seal-v1"
@@ -499,6 +505,42 @@ TARGET_AXIS_TASK_SPECS = tuple(
     )
     for index in range(16)
 )
+FRESH_SPLITTEMP_TASK_RANGES = ((96_485, 96_740), (96_756, 97_011))
+FRESH_SPLITTEMP_TASK_SPECS = tuple(
+    AuxiliaryTaskSpec(
+        task_id=(
+            96_485 + index
+            if index < 256
+            else 96_756 + index - 256
+        ),
+        task_name=(
+            f"mft-5t-lm2-s{2_707_277_000 + index}-n1-"
+            f"{(5, 6, 7, 8)[index % 4]}"
+        ),
+        role=(
+            "authoritative W1200/L1000 fixed-Lm2mH split-temperature "
+            "NSGA-II"
+        ),
+        cpus=8,
+        memory_mb=65_536,
+        timeout_seconds=7_200,
+        max_workers_per_node=8,
+        seed=2_707_277_000 + index,
+        primary_turns=(5, 6, 7, 8)[index % 4],
+    )
+    for index in range(512)
+)
+FINAL_SYMMETRIC_RETRY_TASK_SPEC = AuxiliaryTaskSpec(
+    task_id=96_743,
+    task_name="mft-final-sym-gap-2b2138a99445-g00860423-r1",
+    role=(
+        "final standard/unrounded symmetric tuned-gap FEA verification retry"
+    ),
+    cpus=8,
+    memory_mb=65_536,
+    timeout_seconds=14_400,
+    max_workers_per_node=1,
+)
 SUPERSEDED_WARM_TASK_SPEC = AuxiliaryTaskSpec(
     task_id=96395,
     task_name="mft-5t-g1p6-s2707275600-n1-5",
@@ -510,13 +552,18 @@ SUPERSEDED_WARM_TASK_SPEC = AuxiliaryTaskSpec(
     seed=2707275600,
     primary_turns=5,
 )
-AUTHORITATIVE_AUXILIARY_TASK_SPECS = (
+LEGACY_AUXILIARY_TASK_SPECS = (
     SUPERSEDED_WARM_TASK_SPEC,
     REFERENCE_BASELINE_TASK_SPEC,
     *AXIS_V6_TASK_SPECS,
     REFERENCE_THERMAL_HEDGE_TASK_SPEC,
     REFERENCE_DIRECT_TASK_SPEC,
     *TARGET_AXIS_TASK_SPECS,
+)
+AUTHORITATIVE_AUXILIARY_TASK_SPECS = (
+    *LEGACY_AUXILIARY_TASK_SPECS,
+    *FRESH_SPLITTEMP_TASK_SPECS,
+    FINAL_SYMMETRIC_RETRY_TASK_SPEC,
 )
 
 LEGACY_STANDARD_SELECTION_TASK_IDS = (
@@ -561,15 +608,45 @@ NEW_AXIS_THERMAL_FEASIBLE = 0
 NEW_AXIS_PRODUCTION_PARETO = 0
 NEW_AXIS_COMPACT_SURROGATE_MIN_WINDING_C = 302.67
 TARGET_AXIS_CAMPAIGN = (
-    "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-targeted-v1"
+    "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-"
+    "old16-plus-splittemp512-global-v3"
 )
 TARGET_AXIS_HARD_SHA256 = (
+    "486418c731af63007915c9dd2034df1c65df80a5543546915aa25334c89d164f"
+)
+TARGET_AXIS_LEGACY_HARD_SHA256 = (
     "227cdc0db3b8dae490275d549e8aea93b295a75ee97ea98cdaa601bb96591298"
 )
 TARGET_AXIS_SUBMISSION_MANIFEST = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\fixed_lm2mh_targeted_w1200_l1000_v1\submission_manifest.json"
 )
+TARGET_AXIS_SUBMISSION_MANIFESTS = (
+    TARGET_AXIS_SUBMISSION_MANIFEST,
+    *(
+        Path(
+            r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
+        )
+        / name
+        / "submission_manifest.json"
+        for name in (
+            "fixed_lm2mh_splittemp_v2_fresh64",
+            "fixed_lm2mh_splittemp_v2_seeds0064_0127",
+            "fixed_lm2mh_splittemp_v2_seeds0128_0191",
+            "fixed_lm2mh_splittemp_v2_seeds0192_0255",
+            "fixed_lm2mh_splittemp_v3_seeds0256_0319",
+            "fixed_lm2mh_splittemp_v3_seeds0320_0383",
+            "fixed_lm2mh_splittemp_v3_seeds0384_0447",
+            "fixed_lm2mh_splittemp_v3_seeds0448_0511",
+        )
+    ),
+)
+TARGET_AXIS_EXPECTED_SEED_COUNT = 528
+TARGET_AXIS_EXPECTED_FRESH_SEED_COUNT = 512
+TARGET_AXIS_EXPECTED_RAW_ROWS = 168_960
+TARGET_AXIS_PRIMARY_TEMPERATURE_LIMIT_C = 100.0
+TARGET_AXIS_SECONDARY_TEMPERATURE_LIMIT_C = 120.0
+TARGET_AXIS_CORE_TEMPERATURE_LIMIT_C = 120.0
 ROUNDED_FINAL_TASK_ID = 96340
 ROUNDED_TIMEOUT_HEDGE_TASK_ID = 96342
 ROUNDED_FINAL_PIPELINE_CARD_ID = "codex-rounded-final-delivery-pipeline"
@@ -987,7 +1064,7 @@ def fetch_authoritative_auxiliary_tasks(
 ) -> dict[int, dict[str, Any]]:
     reader = task_reader or _get_scheduler_task
     with ThreadPoolExecutor(
-        max_workers=len(AUTHORITATIVE_AUXILIARY_TASK_SPECS)
+        max_workers=min(64, len(AUTHORITATIVE_AUXILIARY_TASK_SPECS))
     ) as executor:
         futures = {
             spec.task_id: executor.submit(reader, scheduler_url, spec.task_id)
@@ -1552,18 +1629,27 @@ def _target_axis_collector_state(
     )
     if (
         value.get("campaign_id") != TARGET_AXIS_CAMPAIGN
-        or value.get("hard_spec_sha256") != TARGET_AXIS_HARD_SHA256
-        or value.get("expected_seed_count") != 16
-        or value.get("expected_raw_terminal_row_count") != 5_120
+        or value.get("aggregate_hard_spec_sha256")
+        != TARGET_AXIS_HARD_SHA256
+        or value.get("expected_seed_count")
+        != TARGET_AXIS_EXPECTED_SEED_COUNT
+        or value.get("expected_legacy_seed_count") != 16
+        or value.get("expected_fresh_seed_count")
+        != TARGET_AXIS_EXPECTED_FRESH_SEED_COUNT
+        or value.get("expected_raw_terminal_row_count")
+        != TARGET_AXIS_EXPECTED_RAW_ROWS
         or value.get("classification") != "screening-only"
         or value.get("production_eligible") is not False
     ):
         raise UpdaterError("target-axis collector identity drifted")
     if value.get("global_nds_final") is True and (
-        value.get("successful_terminal_seed_count") != 16
-        or value.get("raw_terminal_row_count") != 5_120
+        value.get("successful_terminal_seed_count")
+        != TARGET_AXIS_EXPECTED_SEED_COUNT
+        or value.get("raw_terminal_row_count")
+        != TARGET_AXIS_EXPECTED_RAW_ROWS
         or value.get("final_files_written") is not True
-        or (value.get("status_counts") or {}).get("completed") != 16
+        or (value.get("status_counts") or {}).get("completed")
+        != TARGET_AXIS_EXPECTED_SEED_COUNT
     ):
         raise UpdaterError("target-axis final collector coverage drifted")
     return value
@@ -2717,6 +2803,64 @@ def _descendant_processes(
     )
 
 
+def _reference_thermal_terminal_marker(root: Path) -> dict[str, Any] | None:
+    """Read the local thermal terminal marker before using process heuristics."""
+
+    path = root.resolve() / "thermal_failure.json"
+    try:
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or path.stat().st_size > MAX_RESPONSE_BYTES
+        ):
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != REFERENCE_THERMAL_TERMINAL_SCHEMA
+        or value.get("sealed") is not True
+        or value.get("terminal") is not True
+        or str(value.get("status") or "").lower() != "failed"
+        or str(value.get("state") or "").lower() != "failed"
+        or value.get("thermal_solved") is not False
+        or value.get("temperature_results_available") is not False
+    ):
+        return None
+    value["marker_path"] = path
+    return value
+
+
+def _reference_thermal_retry_terminal_marker(
+    root: Path,
+) -> dict[str, Any] | None:
+    path = root.resolve() / "thermal_mesh_l4_retry_failure.json"
+    try:
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or path.stat().st_size > MAX_RESPONSE_BYTES
+        ):
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != REFERENCE_THERMAL_RETRY_TERMINAL_SCHEMA
+        or value.get("sealed") is not True
+        or value.get("terminal") is not True
+        or value.get("task_id") != 96432
+        or str(value.get("status") or "").lower() != "failed"
+        or value.get("result_valid_thermal") is not False
+        or value.get("temperature_results_available") is not False
+    ):
+        return None
+    value["marker_path"] = path
+    return value
+
+
 def _reference_local_stage(root: Path) -> dict[str, Any]:
     resolved = root.resolve()
     run_root = resolved / "simulation" / "simulation1"
@@ -2745,11 +2889,16 @@ def _reference_local_stage(root: Path) -> dict[str, Any]:
         '"stage":"thermal"' in stdout_tail
         or "Solving design setup ThermalSetup" in stdout_tail
     )
+    terminal_marker = _reference_thermal_terminal_marker(resolved)
+    thermal_failed = terminal_marker is not None
+    retry_terminal_marker = _reference_thermal_retry_terminal_marker(resolved)
+    thermal_retry_failed = retry_terminal_marker is not None
     aedt_pid_active = _pid_exists(44520)
     python_pid_active = _pid_exists(34080)
     descendants = (
         _descendant_processes(44520)
         if aedt_pid_active
+        and not thermal_failed
         and "Solving design setup ThermalSetup" in stdout_tail
         else []
     )
@@ -2758,6 +2907,12 @@ def _reference_local_stage(root: Path) -> dict[str, Any]:
         for pid, name in descendants
         if name.casefold() == "fluent.exe"
     ]
+    retry = (
+        terminal_marker.get("retry")
+        if isinstance(terminal_marker, Mapping)
+        and isinstance(terminal_marker.get("retry"), Mapping)
+        else {}
+    )
     return {
         "root": resolved,
         "project_path": project_path,
@@ -2783,9 +2938,12 @@ def _reference_local_stage(root: Path) -> dict[str, Any]:
         ),
         "thermal_dispatched": thermal_dispatched,
         "thermal_running": (
-            thermal_dispatched and aedt_pid_active and python_pid_active
+            thermal_dispatched
+            and not thermal_failed
+            and aedt_pid_active
+            and python_pid_active
         ),
-        "fluent_running": bool(fluent_pids),
+        "fluent_running": bool(fluent_pids) and not thermal_failed,
         "fluent_pids": fluent_pids,
         "thermal_process_chain": [
             {"pid": pid, "name": name} for pid, name in descendants
@@ -2793,6 +2951,47 @@ def _reference_local_stage(root: Path) -> dict[str, Any]:
         "result_csv_present": result_csv.is_file(),
         "result_parts_present": (
             result_parts.is_dir() and any(result_parts.glob("*.parquet"))
+        ),
+        "thermal_terminal_marker_present": thermal_failed,
+        "thermal_failed": thermal_failed,
+        "thermal_failure_stage": (
+            str(terminal_marker.get("stage") or "")
+            if terminal_marker is not None
+            else ""
+        ),
+        "thermal_failure_class": (
+            str(terminal_marker.get("failure_class") or "")
+            if terminal_marker is not None
+            else ""
+        ),
+        "thermal_failure_message": (
+            str(terminal_marker.get("failure_message") or "")
+            if terminal_marker is not None
+            else ""
+        ),
+        "thermal_failure_marker_path": (
+            terminal_marker.get("marker_path")
+            if terminal_marker is not None
+            else None
+        ),
+        "thermal_retry_status": str(retry.get("status") or ""),
+        "thermal_retry_parameter": str(retry.get("parameter") or ""),
+        "thermal_retry_target_value": retry.get("target_value"),
+        "thermal_retry_failed": thermal_retry_failed,
+        "thermal_retry_task_id": (
+            retry_terminal_marker.get("task_id")
+            if retry_terminal_marker is not None
+            else None
+        ),
+        "thermal_retry_failure_class": (
+            str(retry_terminal_marker.get("failure_class") or "")
+            if retry_terminal_marker is not None
+            else ""
+        ),
+        "thermal_retry_failure_message": (
+            str(retry_terminal_marker.get("failure_message") or "")
+            if retry_terminal_marker is not None
+            else ""
         ),
     }
 
@@ -2910,12 +3109,29 @@ def _target_axis_card(
     observed_at: str,
     collector_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    tasks = [auxiliary_tasks[spec.task_id] for spec in TARGET_AXIS_TASK_SPECS]
-    categories = [_category(str(task["state"])) for task in tasks]
-    running = categories.count("running")
-    queued = categories.count("queued")
-    succeeded = categories.count("succeeded")
-    failed = categories.count("failed")
+    legacy_tasks = [
+        auxiliary_tasks[spec.task_id] for spec in TARGET_AXIS_TASK_SPECS
+    ]
+    fresh_tasks = [
+        auxiliary_tasks[spec.task_id] for spec in FRESH_SPLITTEMP_TASK_SPECS
+    ]
+    all_seed_tasks = [*legacy_tasks, *fresh_tasks]
+    fresh_categories = [
+        _category(str(task["state"])) for task in fresh_tasks
+    ]
+    all_seed_categories = [
+        _category(str(task["state"])) for task in all_seed_tasks
+    ]
+    fresh_running = fresh_categories.count("running")
+    fresh_queued = fresh_categories.count("queued")
+    fresh_succeeded = fresh_categories.count("succeeded")
+    fresh_failed = fresh_categories.count("failed")
+    all_succeeded = all_seed_categories.count("succeeded")
+    all_failed = all_seed_categories.count("failed")
+    symmetric_retry = auxiliary_tasks[
+        FINAL_SYMMETRIC_RETRY_TASK_SPEC.task_id
+    ]
+    symmetric_retry_state = str(symmetric_retry["state"]).upper()
     collector_final = bool(
         collector_status
         and collector_status.get("global_nds_final") is True
@@ -2954,42 +3170,56 @@ def _target_axis_card(
         (collector_status or {}).get("fea_acquisition_candidate_count")
         or 0
     )
-    task_evidence = []
-    for index in range(0, len(tasks), 4):
-        group = tasks[index : index + 4]
-        task_evidence.append(
-            " | ".join(
-                (
-                    f"t{task['task_id']} s{task['seed']} N1="
-                    f"{task['primary_turns']} {str(task['state']).upper()} "
-                    f"{task['actual_node_name'] or 'pending'}/"
-                    f"j{task['slurm_job_id'] or 'none'}"
-                )
-                for task in group
+    collector_success = int(
+        (collector_status or {}).get("successful_terminal_seed_count") or 0
+    )
+    turn_evidence = []
+    for turns in (5, 6, 7, 8):
+        turn_tasks = [
+            auxiliary_tasks[spec.task_id]
+            for spec in FRESH_SPLITTEMP_TASK_SPECS
+            if spec.primary_turns == turns
+        ]
+        turn_categories = [
+            _category(str(task["state"])) for task in turn_tasks
+        ]
+        turn_evidence.append(
+            (
+                f"fresh N1={turns}: seeds=128 / "
+                f"RUNNING {turn_categories.count('running')} / "
+                f"QUEUED {turn_categories.count('queued')} / "
+                f"SUCCEEDED {turn_categories.count('succeeded')} / "
+                f"FAILED {turn_categories.count('failed')}"
             )
         )
     card = {
         "id": TARGET_AXIS_CARD_ID,
         "title": (
-            "AUTHORITATIVE W1200/L1000 TARGET NSGA-II | SUBMITTED 16 | "
-            f"RUNNING {running} · QUEUED {queued} · "
-            f"SUCCEEDED {succeeded} · FAILED {failed} | PASS 0"
+            "AUTHORITATIVE W1200/L1000 NSGA-II | FINAL528=OLD16+FRESH512 | "
+            f"FRESH RUN {fresh_running} / QUEUE {fresh_queued} / "
+            f"SUCCESS {fresh_succeeded} / FAIL {fresh_failed} | "
+            f"SYM96743 {symmetric_retry_state} | GLOBAL NDS "
+            f"{'COMPLETE' if collector_final else 'PENDING'}"
         ),
         "detail": (
-            "This is the only optimization lane eligible to answer the current "
-            "design question: W follows the drawing-x/original 973 mm direction "
-            "and is limited to 1200 mm; L is perpendicular-y and is limited to "
-            "1000 mm; H is limited to 750 mm. Rotation and axis swapping are "
-            "forbidden, and primary winding thickness/gap remain fixed at "
-            "5.0/1.6 mm. Tasks 96416-96431 are now submitted as sixteen cold "
-            "random seeds, population 320 x 80 generations, requesting 128 CPU "
-            "and 1 TiB in aggregate. Fixed-Lm2mH screening and combined "
-            "non-dominated sorting remain pending; Scheduler success alone will "
-            "not be counted as scientific or production PASS."
+            "The current authoritative optimization scope is the original 16 "
+            "fixed-Lm2mH seeds plus 512 fresh split-temperature seeds. Each seed "
+            "has 320 terminal candidates, so the final authenticated global "
+            "non-dominated sort requires 528 seeds and 168,960 raw rows. The "
+            "fresh base tasks occupy 96485-96740 and 96756-97011; IDs between "
+            "those ranges are separate FEA/retry work. Task96743 is the final "
+            "standard/unrounded symmetric tuned-gap retry. Scheduler lifecycle "
+            "success alone is not scientific or production PASS."
         ),
         "state": "in_progress",
         "updated_at": observed_at,
-        "progress_pct": 10 + (succeeded * 45 // 16),
+        "progress_pct": min(
+            90,
+            10
+            + all_succeeded
+            * 75
+            // TARGET_AXIS_EXPECTED_SEED_COUNT,
+        ),
         "evidence": [
             (
                 "authoritative contract=W/drawing-x/original-973-direction "
@@ -2998,30 +3228,50 @@ def _target_axis_card(
             ),
             (
                 "fixed winding controls=primary cw1 5.0mm / gap1 1.6mm / "
-                "cooling boundary=1.5m/s and TIM unchanged"
+                "cooling boundary=1.5m/s and TIM unchanged / "
+                "rounded winding excluded from verification"
             ),
             (
-                f"campaign={TARGET_AXIS_CAMPAIGN} / tasks=96416-96431 / "
-                "seeds=16 / population=320 / generations=80"
+                "split-temperature final gate=primary winding<=100C / "
+                "secondary winding<=120C / core<=120C"
             ),
             (
-                "requested total=128CPU + 1048576MiB / "
+                f"campaign={TARGET_AXIS_CAMPAIGN} / old tasks=96416-96431 / "
+                "fresh task ranges=96485-96740 + 96756-97011 / "
+                "seeds=16+512=528"
+            ),
+            (
+                "fresh requested total=4096CPU + 33554432MiB / "
                 "per task=8CPU + 65536MiB / timeout=7200s / "
                 "max_workers_per_node=8"
             ),
             (
-                f"hard contract sha256={TARGET_AXIS_HARD_SHA256} / "
-                f"submission manifest={TARGET_AXIS_SUBMISSION_MANIFEST}"
+                f"splittemp hard contract sha256={TARGET_AXIS_HARD_SHA256} / "
+                f"legacy hard contract sha256={TARGET_AXIS_LEGACY_HARD_SHA256} / "
+                f"sealed base manifests={len(TARGET_AXIS_SUBMISSION_MANIFESTS)}"
             ),
             (
-                "historical W1000/L1200 axis-v6 eligible=false / "
-                "reference drawing baseline is not an optimized candidate"
+                "final aggregate target=528 successful logical seeds / "
+                "168960 raw terminal rows / one cross-seed global NDS / "
+                f"collector successful now={collector_success}"
             ),
             (
-                "scientific PASS=0 / production PASS=0 / "
-                "production Pareto Front=0 / canonical promotion=false"
+                f"all base lifecycle success={all_succeeded}/528 / "
+                f"failed originals={all_failed} / exact-seed replacements are "
+                "resolved by the authenticated collector before final NDS"
             ),
-            *task_evidence,
+            (
+                f"task96743 final symmetric tuned-gap retry="
+                f"{symmetric_retry_state} / "
+                f"{symmetric_retry['actual_node_name'] or 'pending'}/"
+                f"j{symmetric_retry['slurm_job_id'] or 'none'} / "
+                "last reported solver stage=loss"
+            ),
+            *turn_evidence,
+            (
+                "scientific PASS=0 / production PASS=0 / canonical "
+                "promotion=false until symmetric FEA and final gate pass"
+            ),
         ],
     }
     if collector_final:
@@ -3029,26 +3279,26 @@ def _target_axis_card(
             {
                 "title": (
                     "AUTHORITATIVE W1200/L1000 TARGET NSGA-II | "
-                    "GLOBAL NDS COMPLETE | SEEDS "
-                    f"{succeeded}/16 | RAW {raw_rows} | UNIQUE {unique_rows} | "
+                    "GLOBAL NDS COMPLETE | FINAL528 | SEEDS "
+                    f"{collector_success}/528 | RAW {raw_rows} | "
+                    f"UNIQUE {unique_rows} | "
                     f"FEASIBLE {feasible} | PARETO {pareto_count} | "
-                    f"FEA {acquisition_count}"
+                    f"FEA {acquisition_count} | SYM96743 "
+                    f"{symmetric_retry_state}"
                 ),
                 "detail": (
-                    "All 16 targeted fixed-5T/fixed-gap/fixed-Lm2mH NSGA-II "
-                    "seeds completed and the authenticated 5,120-row cross-seed "
-                    "global non-dominated sorting is final. No candidate passed "
-                    "every screening constraint, so the production Pareto Front "
-                    "is empty. The least-violation and symmetric-unrounded FEA "
-                    "acquisition artifacts are complete; surrogate temperatures "
-                    "remain screening-only."
+                    "All 16 legacy and 512 fresh split-temperature NSGA-II "
+                    "logical seeds completed, and the authenticated 168,960-row "
+                    "cross-seed global non-dominated sorting is final. Its "
+                    "thermal values remain screening-only; production promotion "
+                    "still requires the standard/unrounded symmetric FEA gate."
                 ),
                 "progress_pct": 100,
                 "evidence": [
                     (
                         "authenticated global collector=FINAL / successful "
-                        f"seeds={int(collector_status['successful_terminal_seed_count'])}"
-                        f"/16 / raw terminal rows={raw_rows}/5120 / "
+                        f"seeds={collector_success}/528 / raw terminal rows="
+                        f"{raw_rows}/168960 / "
                         f"unique geometry={unique_rows}"
                     ),
                     (
@@ -3067,7 +3317,7 @@ def _target_axis_card(
                         "collector payload sha256="
                         f"{collector_status['payload_sha256']}"
                     ),
-                    *card["evidence"][:8],
+                    *card["evidence"],
                 ],
             }
         )
@@ -3086,8 +3336,20 @@ def _reference_baseline_card(
     local = dict(local_stage or _reference_local_stage(gui_root))
     local_gui = "PID44520 ACTIVE" if local["aedt_pid_active"] else "PID44520 EXITED"
     result_present = local["result_csv_present"] or local["result_parts_present"]
+    retry_state = (
+        f"retry task{local['thermal_retry_task_id']}="
+        f"{local['thermal_retry_failure_class']}"
+        if local["thermal_retry_failed"]
+        else f"retry={local['thermal_retry_status'] or 'none'} "
+        f"{local['thermal_retry_parameter'] or 'none'}->"
+        f"{local['thermal_retry_target_value']}"
+    )
     stage = (
-        "FLUENT THERMAL SOLVE RUNNING"
+        "THERMAL FAILED | L4 RETRY CONTROL-FLOW FAILED"
+        if local["thermal_retry_failed"]
+        else "THERMAL FAILED | RETRY PREPARED"
+        if local["thermal_failed"]
+        else "FLUENT THERMAL SOLVE RUNNING"
         if local["fluent_running"]
         else "THERMAL MESH RUNNING"
         if local["thermal_running"]
@@ -3100,6 +3362,19 @@ def _reference_baseline_card(
         else "MATRIX/CAP BUILD OR SOLVE IN PROGRESS"
     )
     local_detail = (
+        "Local retry-v2 produced no valid temperature field, and Slurm "
+        "mesh-only retry task96432 terminated before thermal dispatch because "
+        "the L4 mesh-quality canary is incompatible with the explicit "
+        "direct-analyze control path. This is a control-flow failure, not a "
+        "thermal-physics result; remote exact-L5 task96415 remains active."
+        if local["thermal_retry_failed"]
+        else
+        "Local retry-v2 terminal marker overrides the retained AEDT/Python "
+        "processes: native Fluent interrupted while reading/building the case, "
+        "so no valid temperature field exists. AEDT remains open for GUI "
+        "inspection only; the guarded Rx side-block mesh L4 retry is prepared."
+        if local["thermal_failed"]
+        else
         "Local retry-v2 has completed Matrix (10 passes), Capacitance "
         "(3 passes), and loss. AEDT PID44520 has launched the native Fluent "
         f"thermal solve (Fluent PIDs {local['fluent_pids']}) under controller "
@@ -3133,7 +3408,9 @@ def _reference_baseline_card(
         "state": "in_progress",
         "updated_at": observed_at,
         "progress_pct": (
-            85
+            70
+            if local["thermal_failed"]
+            else 85
             if local["fluent_running"]
             else 75
             if local["thermal_running"]
@@ -3160,6 +3437,11 @@ def _reference_baseline_card(
                 "not an axis-v6 candidate"
             ),
             (
+                "temperature gates: primary winding<=100C / "
+                "secondary winding<=120C / core<=120C / "
+                "three values must be reported separately"
+            ),
+            (
                 f"local AEDT PID44520 active="
                 f"{str(local['aedt_pid_active']).lower()} / "
                 f"python PID34080 active={str(local['python_pid_active']).lower()} / "
@@ -3167,7 +3449,6 @@ def _reference_baseline_card(
                 f"{str(local['fluent_running']).lower()} / "
                 f"Fluent PIDs={local['fluent_pids']}"
             ),
-            f"local project={local['project_path']}",
             (
                 f"matrix solved={str(local['matrix_solved']).lower()} / "
                 f"cap solved={str(local['cap_solved']).lower()} / "
@@ -3176,12 +3457,20 @@ def _reference_baseline_card(
                 f"loss result root present="
                 f"{str(local['loss_result_root_present']).lower()} / "
                 f"thermal dispatched={str(local['thermal_dispatched']).lower()} / "
-                f"thermal running={str(local['thermal_running']).lower()}"
+                f"thermal running={str(local['thermal_running']).lower()} / "
+                f"thermal failed={str(local['thermal_failed']).lower()}"
             ),
             (
-                "actual convergence=Matrix 10/20 passes, current energy "
-                "error 1.0127%, delta 0.051887% / Cap 3/10 passes, "
-                "energy error 0.83451%, delta 0.92544%"
+                "terminal marker priority="
+                f"{str(local['thermal_terminal_marker_present']).lower()} / "
+                f"failure stage={local['thermal_failure_stage'] or 'none'} / "
+                f"class={local['thermal_failure_class'] or 'none'} / "
+                f"{retry_state}"
+            ),
+            (
+                "full-equivalent actual loss: primary=2626.206W / "
+                "secondary=1089.438W / core=1659.728W / total=5375.372W / "
+                "eighth thermal injection=328.276/136.180/207.466W"
             ),
             (
                 "full-restored exact matrix: Lm=7.682399mH / "
@@ -3206,12 +3495,8 @@ def _reference_baseline_card(
                 "result parquet present="
                 f"{str(local['result_parts_present']).lower()} / "
                 f"Results reports pending={str(not result_present).lower()} / "
-                "local loss result pending / thermal authenticated=false"
-            ),
-            (
-                "historical reference resonance_pass=false / "
-                "optimized candidate=false / scientific PASS=0 / "
-                "production PASS=0 / local loss + thermal Results pending"
+                "local EM valid=true / loss values available=true / "
+                "thermal authenticated=false"
             ),
         ],
     }
@@ -3517,23 +3802,43 @@ def _live_summary(
         reference_hedge = auxiliary_tasks[REFERENCE_THERMAL_HEDGE_TASK_SPEC.task_id]
         reference = auxiliary_tasks[REFERENCE_DIRECT_TASK_SPEC.task_id]
         warm = auxiliary_tasks[SUPERSEDED_WARM_TASK_SPEC.task_id]
-        target_categories = [
+        legacy_target_categories = [
             _category(str(auxiliary_tasks[spec.task_id]["state"]))
             for spec in TARGET_AXIS_TASK_SPECS
         ]
+        fresh_target_categories = [
+            _category(str(auxiliary_tasks[spec.task_id]["state"]))
+            for spec in FRESH_SPLITTEMP_TASK_SPECS
+        ]
+        symmetric_retry = auxiliary_tasks[
+            FINAL_SYMMETRIC_RETRY_TASK_SPEC.task_id
+        ]
         reference_phase = (
-            "Fluent thermal solve running"
+            "local thermal failed; mesh-only retry96432 control-flow failed"
+            if reference_local and reference_local.get("thermal_retry_failed")
+            else "local thermal failed; mesh-only retry prepared"
+            if reference_local and reference_local.get("thermal_failed")
+            else "Fluent thermal solve running"
             if reference_local and reference_local.get("fluent_running")
             else "ThermalSetup running"
             if reference_local and reference_local.get("thermal_running")
             else "local thermal pending"
         )
         authoritative = (
-            "target tasks96416-96431 "
-            f"run{target_categories.count('running')}/"
-            f"queue{target_categories.count('queued')}/"
-            f"success{target_categories.count('succeeded')}/"
-            f"fail{target_categories.count('failed')}. "
+            "authoritative final528=old16+fresh512; fresh tasks "
+            "96485-96740 + 96756-97011 "
+            f"run{fresh_target_categories.count('running')}/"
+            f"queue{fresh_target_categories.count('queued')}/"
+            f"success{fresh_target_categories.count('succeeded')}/"
+            f"fail{fresh_target_categories.count('failed')}; old16 "
+            f"success{legacy_target_categories.count('succeeded')}/"
+            f"fail{legacy_target_categories.count('failed')}. "
+            "Final global NDS requires 528 seeds/168960 rows; split-temp "
+            "gate primary<=100C, secondary<=120C, core<=120C. "
+            f"Final symmetric retry task96743="
+            f"{str(symmetric_retry['state']).upper()} "
+            f"{symmetric_retry['actual_node_name'] or 'pending'}/"
+            f"j{symmetric_retry['slurm_job_id'] or 'none'}; "
             "Old W1000/L1200 axis-v6 is superseded: raw5120/unique4683, "
             "new-axis geometry217/210, thermal feasible0/PF0; compact "
             "surrogate extrapolation invalid(min302.67C). "
@@ -3553,9 +3858,10 @@ def _live_summary(
         f"post-deadline diagnostic 작업: running{running} · queued{queued} · "
         f"terminal{terminal}. Slurm allocation jobs{allocation_jobs} · "
         f"submitted{submitted} · collections{collections}. "
-        "공식 512-seed aggregate는 physical feasible0 · production Pareto "
-        "front0 · audit-only objective front22. Scheduler success도 artifact "
-        "인증 전에는 scientific/production PASS가 아닙니다. "
+        "현재 결과 범위는 old16+fresh512 final528 global NDS이며, Scheduler "
+        "success도 수집 artifact 인증 전에는 scientific/production PASS가 "
+        "아닙니다. 기존 screening physical feasible0은 생산 판정이 "
+        "아닙니다. "
     )
     return summary + "actual scientific PASS=0 / actual production PASS=0."
 
@@ -3880,7 +4186,10 @@ def merge_status(
                 "seed": auxiliary_tasks[spec.task_id]["seed"],
                 "primary_turns": auxiliary_tasks[spec.task_id]["primary_turns"],
             }
-            for spec in AUTHORITATIVE_AUXILIARY_TASK_SPECS
+            for spec in (
+                *LEGACY_AUXILIARY_TASK_SPECS,
+                FINAL_SYMMETRIC_RETRY_TASK_SPEC,
+            )
         ]
         if auxiliary_tasks is not None
         else []
@@ -3893,7 +4202,7 @@ def merge_status(
         if auxiliary_tasks is not None
         else []
     )
-    target_axis_categories = (
+    legacy_target_axis_categories = (
         [
             _category(str(auxiliary_tasks[spec.task_id]["state"]))
             for spec in TARGET_AXIS_TASK_SPECS
@@ -3901,6 +4210,18 @@ def merge_status(
         if auxiliary_tasks is not None
         else []
     )
+    fresh_target_axis_categories = (
+        [
+            _category(str(auxiliary_tasks[spec.task_id]["state"]))
+            for spec in FRESH_SPLITTEMP_TASK_SPECS
+        ]
+        if auxiliary_tasks is not None
+        else []
+    )
+    target_axis_categories = [
+        *legacy_target_axis_categories,
+        *fresh_target_axis_categories,
+    ]
     result[SYNC_KEY] = _sealed(
         {
             "schema_version": SYNC_SCHEMA,
@@ -3972,19 +4293,124 @@ def merge_status(
                 "axis_swap_allowed": False,
                 "primary_winding_thickness_mm": 5.0,
                 "primary_winding_gap_mm": 1.6,
+                "rounded_winding_verification_model": False,
+                "temperature_gate_C": {
+                    "primary_winding_max": (
+                        TARGET_AXIS_PRIMARY_TEMPERATURE_LIMIT_C
+                    ),
+                    "secondary_winding_max": (
+                        TARGET_AXIS_SECONDARY_TEMPERATURE_LIMIT_C
+                    ),
+                    "core_max": TARGET_AXIS_CORE_TEMPERATURE_LIMIT_C,
+                },
+                "cooling_air_speed_mps": 1.5,
+                "tim_changed": False,
                 "submission_state": "submitted",
                 "campaign": TARGET_AXIS_CAMPAIGN,
                 "hard_contract_sha256": TARGET_AXIS_HARD_SHA256,
-                "submission_manifest": str(TARGET_AXIS_SUBMISSION_MANIFEST),
-                "task_ids": [spec.task_id for spec in TARGET_AXIS_TASK_SPECS],
+                "legacy_hard_contract_sha256": (
+                    TARGET_AXIS_LEGACY_HARD_SHA256
+                ),
+                "submission_manifests": [
+                    str(path) for path in TARGET_AXIS_SUBMISSION_MANIFESTS
+                ],
+                "expected_seed_count": TARGET_AXIS_EXPECTED_SEED_COUNT,
+                "expected_fresh_seed_count": (
+                    TARGET_AXIS_EXPECTED_FRESH_SEED_COUNT
+                ),
+                "expected_raw_terminal_rows": TARGET_AXIS_EXPECTED_RAW_ROWS,
+                "legacy_task_ids": [
+                    spec.task_id for spec in TARGET_AXIS_TASK_SPECS
+                ],
+                "fresh_task_ranges": [
+                    list(task_range)
+                    for task_range in FRESH_SPLITTEMP_TASK_RANGES
+                ],
+                "task_ids": [
+                    *[spec.task_id for spec in TARGET_AXIS_TASK_SPECS],
+                    *[
+                        spec.task_id
+                        for spec in FRESH_SPLITTEMP_TASK_SPECS
+                    ],
+                ],
                 "running": target_axis_categories.count("running"),
                 "queued": target_axis_categories.count("queued"),
                 "succeeded": target_axis_categories.count("succeeded"),
                 "failed": target_axis_categories.count("failed"),
-                "requested_total_cpus": 128,
-                "requested_total_memory_mb": 1_048_576,
+                "fresh_running": fresh_target_axis_categories.count("running"),
+                "fresh_queued": fresh_target_axis_categories.count("queued"),
+                "fresh_succeeded": fresh_target_axis_categories.count(
+                    "succeeded"
+                ),
+                "fresh_failed": fresh_target_axis_categories.count("failed"),
+                "fresh_turn_strata": {
+                    str(turns): {
+                        "seed_count": 128,
+                        "running": sum(
+                            _category(
+                                str(
+                                    auxiliary_tasks[spec.task_id]["state"]
+                                )
+                            )
+                            == "running"
+                            for spec in FRESH_SPLITTEMP_TASK_SPECS
+                            if spec.primary_turns == turns
+                        ),
+                        "queued": sum(
+                            _category(
+                                str(
+                                    auxiliary_tasks[spec.task_id]["state"]
+                                )
+                            )
+                            == "queued"
+                            for spec in FRESH_SPLITTEMP_TASK_SPECS
+                            if spec.primary_turns == turns
+                        ),
+                        "succeeded": sum(
+                            _category(
+                                str(
+                                    auxiliary_tasks[spec.task_id]["state"]
+                                )
+                            )
+                            == "succeeded"
+                            for spec in FRESH_SPLITTEMP_TASK_SPECS
+                            if spec.primary_turns == turns
+                        ),
+                        "failed": sum(
+                            _category(
+                                str(
+                                    auxiliary_tasks[spec.task_id]["state"]
+                                )
+                            )
+                            == "failed"
+                            for spec in FRESH_SPLITTEMP_TASK_SPECS
+                            if spec.primary_turns == turns
+                        ),
+                    }
+                    for turns in (5, 6, 7, 8)
+                },
+                "requested_total_cpus": 4_224,
+                "requested_total_memory_mb": 34_603_008,
+                "fresh_requested_total_cpus": 4_096,
+                "fresh_requested_total_memory_mb": 33_554_432,
                 "population": 320,
                 "generations": 80,
+                "final_symmetric_retry": {
+                    "task_id": FINAL_SYMMETRIC_RETRY_TASK_SPEC.task_id,
+                    "candidate": "2b2138a99445",
+                    "gap_mm": 0.860423,
+                    "model": "standard/unrounded symmetric",
+                    "state": auxiliary_tasks[
+                        FINAL_SYMMETRIC_RETRY_TASK_SPEC.task_id
+                    ]["state"],
+                    "node_name": auxiliary_tasks[
+                        FINAL_SYMMETRIC_RETRY_TASK_SPEC.task_id
+                    ]["actual_node_name"],
+                    "slurm_job_id": auxiliary_tasks[
+                        FINAL_SYMMETRIC_RETRY_TASK_SPEC.task_id
+                    ]["slurm_job_id"],
+                    "last_reported_solver_stage": "loss",
+                },
                 "scientific_pass_generated": False,
                 "production_pareto_count": 0,
                 "global_nds_final": bool(
@@ -4004,6 +4430,13 @@ def merge_status(
                 ),
                 "raw_terminal_rows": (
                     target_axis_collector.get("raw_terminal_row_count")
+                    if target_axis_collector
+                    else 0
+                ),
+                "collector_successful_terminal_seeds": (
+                    target_axis_collector.get(
+                        "successful_terminal_seed_count"
+                    )
                     if target_axis_collector
                     else 0
                 ),
