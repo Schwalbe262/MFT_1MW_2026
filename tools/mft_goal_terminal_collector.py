@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -39,6 +40,7 @@ from urllib import error, parse, request
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:8002"
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_REMOTE_FILE_BYTES = 1_048_576
+MAX_TASK_OUTPUT_BYTES = 16 * 1024 * 1024
 FULL_CANDIDATE_SHA256 = (
     "62f2b846d05bbc5880165c6086fe9897e04d0588b0b8767fceb35102e4be9a44"
 )
@@ -279,10 +281,22 @@ class GetOnlyClient:
             _safe_relative(path)
         return sorted(files)
 
-    def task_output(self, task_id: int, stream: str) -> bytes:
+    def task_output(
+        self,
+        task_id: int,
+        stream: str,
+        *,
+        max_bytes: int = MAX_REMOTE_FILE_BYTES,
+    ) -> bytes:
         if stream not in {"stdout", "stderr"}:
             raise CollectorError(f"unknown task output stream: {stream}")
-        query = parse.urlencode({"max_bytes": MAX_REMOTE_FILE_BYTES})
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 0 < max_bytes <= MAX_TASK_OUTPUT_BYTES
+        ):
+            raise CollectorError("task output byte bound is invalid")
+        query = parse.urlencode({"max_bytes": max_bytes})
         return self.get_bytes(f"/api/tasks/{task_id}/{stream}?{query}")
 
 
@@ -598,7 +612,7 @@ def _extract_command(task_sh: bytes, contract: Contract) -> bytes:
     return command
 
 
-def _validate_full_candidate(command: bytes) -> None:
+def _validate_full_candidate(command: bytes) -> dict[str, Any]:
     matches = list(
         re.finditer(
             rb"printf '%s' '(\{\"I1_rated\".*?\})' > cand\.json",
@@ -630,6 +644,7 @@ def _validate_full_candidate(command: bytes) -> None:
     for key, expected in required.items():
         if value.get(key) != expected:
             raise CollectorError(f"Full fixed physics drifted for {key}")
+    return value
 
 
 def validate_live_task(
@@ -725,10 +740,191 @@ def _save_remote(
     return data
 
 
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise CollectorError(f"{label} must be numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CollectorError(f"{label} must be numeric") from exc
+    if not math.isfinite(number):
+        raise CollectorError(f"{label} must be finite")
+    return number
+
+
+def _exact_integer(value: Any, label: str) -> int:
+    number = _finite_number(value, label)
+    if not number.is_integer():
+        raise CollectorError(f"{label} must be an integer")
+    return int(number)
+
+
+def _full_result_from_stdout(
+    stdout: bytes,
+    *,
+    contract: Contract,
+    expected_slurm_job_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    candidate = _validate_full_candidate(contract.command)
+    library_marker: str | None = None
+    result: dict[str, Any] | None = None
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        if line.startswith("MFT_LIBRARY_GIT_HASH "):
+            observed = line[len("MFT_LIBRARY_GIT_HASH ") :].strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", observed):
+                library_marker = observed
+        if not line.startswith("RESULT_JSON "):
+            continue
+        try:
+            parsed = json.loads(line[len("RESULT_JSON ") :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            result = parsed
+    if result is None:
+        raise TransientGetError("Full terminal stdout has no RESULT_JSON")
+    solver_revision = "a1e4f70cefa1af04673c73a6131bf490c0cc14b5"
+    library_revision = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+    parameters_match = True
+    for key, expected in candidate.items():
+        if key not in result:
+            parameters_match = False
+            break
+        observed = result[key]
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+            try:
+                matched = math.isclose(
+                    float(observed),
+                    float(expected),
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                )
+            except (TypeError, ValueError, OverflowError):
+                matched = False
+        else:
+            matched = str(observed) == str(expected)
+        if not matched:
+            parameters_match = False
+            break
+    if (
+        library_marker != library_revision
+        or str(result.get("git_hash") or "").lower() != solver_revision
+        or str(result.get("pyaedt_library_git_hash") or "").lower()
+        != library_revision
+        or not parameters_match
+        or _exact_integer(result.get("full_model"), "Full model mode") != 1
+        or str(result.get("thermal_symmetry") or "").lower() != "full"
+    ):
+        raise CollectorError("Full RESULT_JSON identity drifted")
+    expected_job = str(expected_slurm_job_id or "")
+    if re.fullmatch(r"[1-9][0-9]*", expected_job) is None:
+        raise CollectorError("Full terminal Slurm job identity is invalid")
+    required_core = {
+        "solver_core_policy_schema": "mft-solver-core-policy-v1",
+        "solver_core_contract_version": "mft-standalone-core-16-optin-v1",
+        "solver_core_backend": "standalone",
+        "solver_core_license_contract": "mft-aedt-hpc-license-snapshot-v1",
+    }
+    if (
+        any(result.get(key) != value for key, value in required_core.items())
+        or _exact_integer(result.get("solver_core_opt_in"), "core opt-in") != 1
+        or _exact_integer(
+            result.get("solver_num_cores_requested"),
+            "requested core count",
+        )
+        != 16
+        or _exact_integer(
+            result.get("solver_num_cores_effective"),
+            "effective core count",
+        )
+        != 16
+        or _exact_integer(
+            result.get("solver_num_tasks_effective"),
+            "effective task count",
+        )
+        != 1
+        or _exact_integer(
+            result.get("solver_core_affinity_count_readback"),
+            "core affinity count",
+        )
+        < 16
+        or str(result.get("solver_core_slurm_cpus_per_task_readback") or "")
+        != "16"
+        or str(result.get("solver_core_scheduler_task_id_readback") or "")
+        != str(contract.task_id)
+        or str(result.get("solver_core_slurm_job_id_readback") or "")
+        != expected_job
+        or _exact_integer(
+            result.get("solver_matrix_hpc_num_cores_readback"),
+            "matrix core readback",
+        )
+        != 16
+        or _exact_integer(
+            result.get("solver_matrix_hpc_num_engines_readback"),
+            "matrix engine readback",
+        )
+        != 1
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(result.get("solver_matrix_hpc_acf_sha256") or ""),
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(result.get("solver_core_license_snapshot_sha256") or ""),
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(result.get("solver_core_auth_sha256") or ""),
+        )
+        is None
+    ):
+        raise CollectorError("Full RESULT_JSON core identity drifted")
+    scientific_flags = (
+        "result_valid_em",
+        "result_valid_thermal",
+        "thermal_solved",
+        "thermal_extraction_complete",
+        "thermal_convergence_available",
+        "thermal_converged",
+    )
+    if (
+        any(
+            _exact_integer(result.get(key), f"Full result {key}") != 1
+            for key in scientific_flags
+        )
+        or _exact_integer(
+            result.get("thermal_required_missing_count"),
+            "Full thermal missing count",
+        )
+        != 0
+        or not _finite_number(
+            result.get("f_res_min_tx_rx_only_Hz"),
+            "Full actual resonance",
+        )
+        > 0.0
+    ):
+        raise CollectorError("Full RESULT_JSON scientific structure drifted")
+    identity = {
+        "candidate_physics_sha256": FULL_CANDIDATE_SHA256,
+        "solver_revision": solver_revision,
+        "library_revision": library_revision,
+        "scheduler_task_id": contract.task_id,
+        "slurm_job_id": expected_job,
+        "full_model": 1,
+        "thermal_symmetry": "full",
+        "result_payload_sha256": _sha256(_canonical_bytes(result)),
+    }
+    return result, identity
+
+
 def _collect_full(
     client: GetOnlyClient,
     contract: Contract,
     output_root: Path,
+    *,
+    expected_slurm_job_id: str,
 ) -> dict[str, Any]:
     root = contract.retained_root
     inventory = client.remote_files(contract.task_id, f"{root}/**")
@@ -880,6 +1076,39 @@ def _collect_full(
             **CLASSIFICATION,
         },
     )
+    try:
+        stdout = client.task_output(
+            contract.task_id,
+            "stdout",
+            max_bytes=MAX_TASK_OUTPUT_BYTES,
+        )
+        stderr = client.task_output(
+            contract.task_id,
+            "stderr",
+            max_bytes=MAX_TASK_OUTPUT_BYTES,
+        )
+        result, result_identity = _full_result_from_stdout(
+            stdout,
+            contract=contract,
+            expected_slurm_job_id=expected_slurm_job_id,
+        )
+    except TransientGetError as exc:
+        pending.append(str(exc))
+        result = None
+        result_identity = None
+    else:
+        _atomic_write(collection / "stdout.log", stdout)
+        _atomic_write(collection / "stderr.log", stderr)
+        _atomic_json(collection / "full_result.json", result)
+    result_record = None
+    if result is not None and result_identity is not None:
+        result_path = collection / "full_result.json"
+        result_record = {
+            "path": str(result_path),
+            "size_bytes": result_path.stat().st_size,
+            "sha256": _sha256(result_path.read_bytes()),
+            "identity": result_identity,
+        }
     return {
         "state": (
             "success_collected_diagnostic"
@@ -896,6 +1125,7 @@ def _collect_full(
         },
         "retained_chunk_count": expected_count,
         "aedtresults_remote_paths": results_paths,
+        "full_result_truth": result_record,
         **CLASSIFICATION,
     }
 
@@ -1133,7 +1363,12 @@ def poll_once(
         )
     elif observed == "success":
         collection = (
-            _collect_full(client, contract, output_root)
+            _collect_full(
+                client,
+                contract,
+                output_root,
+                expected_slurm_job_id=str(task_value.get("slurm_job_id") or ""),
+            )
             if contract.kind == "full"
             else _collect_thermal(client, contract, output_root)
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -202,3 +203,55 @@ def test_scheduler_client_exposes_no_post_or_mutation_surface():
         "remote_files",
         "task_output",
     }
+
+
+def test_full_terminal_result_is_bound_to_candidate_solver_and_job():
+    contract = collector.load_contract("full96326", REPO_ROOT)
+    candidate = collector._validate_full_candidate(contract.command)
+    result = {
+        **candidate,
+        "git_hash": "a1e4f70cefa1af04673c73a6131bf490c0cc14b5",
+        "pyaedt_library_git_hash": (
+            "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
+        ),
+        "solver_core_policy_schema": "mft-solver-core-policy-v1",
+        "solver_core_contract_version": "mft-standalone-core-16-optin-v1",
+        "solver_core_backend": "standalone",
+        "solver_core_license_contract": "mft-aedt-hpc-license-snapshot-v1",
+        "solver_core_opt_in": 1,
+        "solver_num_cores_requested": 16,
+        "solver_num_cores_effective": 16,
+        "solver_num_tasks_effective": 1,
+        "solver_core_affinity_count_readback": 16,
+        "solver_core_slurm_cpus_per_task_readback": "16",
+        "solver_core_scheduler_task_id_readback": "96326",
+        "solver_core_slurm_job_id_readback": "839534",
+        "solver_matrix_hpc_num_cores_readback": 16,
+        "solver_matrix_hpc_num_engines_readback": 1,
+        "solver_matrix_hpc_acf_sha256": "a" * 64,
+        "solver_core_license_snapshot_sha256": "b" * 64,
+        "solver_core_auth_sha256": "c" * 64,
+        "result_valid_em": 1,
+        "result_valid_thermal": 1,
+        "thermal_solved": 1,
+        "thermal_extraction_complete": 1,
+        "thermal_convergence_available": 1,
+        "thermal_converged": 1,
+        "thermal_required_missing_count": 0,
+        "f_res_min_tx_rx_only_Hz": 15_200.0,
+    }
+    stdout = (
+        "MFT_LIBRARY_GIT_HASH "
+        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781\n"
+        f"RESULT_JSON {json.dumps(result, sort_keys=True)}\n"
+    ).encode()
+
+    observed, identity = collector._full_result_from_stdout(
+        stdout,
+        contract=contract,
+        expected_slurm_job_id="839534",
+    )
+
+    assert observed == result
+    assert identity["candidate_physics_sha256"] == collector.FULL_CANDIDATE_SHA256
+    assert identity["slurm_job_id"] == "839534"
