@@ -1,4 +1,5 @@
 import copy
+from unittest import mock
 
 from tools import mft_goal_rx_interface_preflight_guard as guard
 
@@ -99,3 +100,32 @@ def test_extracts_last_exact_marker() -> None:
         "noise\nTHERMAL_RX_INTERFACE_PREFLIGHT_JSON=" + encoded + "\n"
     )
     assert parsed == _marker()
+
+
+def test_scheduler_log_reader_accepts_empty_and_plain_text() -> None:
+    class Response:
+        def __init__(self, value: bytes):
+            self.value = value
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            return self.value
+
+    with mock.patch.object(
+        guard.urllib.request, "urlopen", return_value=Response(b"")
+    ):
+        assert guard._scheduler_json("http://scheduler/stdout") == ""
+    with mock.patch.object(
+        guard.urllib.request,
+        "urlopen",
+        return_value=Response(b"plain solver log"),
+    ):
+        assert (
+            guard._scheduler_json("http://scheduler/stdout")
+            == "plain solver log"
+        )

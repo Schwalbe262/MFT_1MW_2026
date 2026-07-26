@@ -40,7 +40,15 @@ class GuardError(RuntimeError):
 
 def _scheduler_json(url: str) -> Any:
     with urllib.request.urlopen(url, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
+        text = response.read().decode("utf-8")
+    if not text.strip():
+        return ""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Scheduler log endpoints may return either a JSON string or plain
+        # text, depending on whether the remote log has started streaming.
+        return text
 
 
 def _stdout_text(value: Any) -> str:
