@@ -308,7 +308,9 @@ def _fixture(
     }
     manifest = {
         **manifest_unsigned,
-        "payload_sha256": goal.canonical_sha256(manifest_unsigned),
+        "payload_sha256": terminal._sha256(
+            gate._canonical_bytes(manifest_unsigned, newline=True)
+        ),
     }
     thermal_event = _event(
         {

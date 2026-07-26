@@ -440,7 +440,10 @@ def _thermal_manifest_rows(manifest: Mapping[str, Any]) -> dict[str, dict[str, A
         manifest.get("schema")
         != "mft-corrected-thermal-minimum-retained-package-v1"
         or not isinstance(claimed, str)
-        or goal.canonical_sha256(unsigned) != claimed
+        or terminal_collector._sha256(
+            _canonical_bytes(unsigned, newline=True)
+        )
+        != claimed
     ):
         raise FinalPackageGateError("corrected thermal manifest seal drifted")
     files = manifest.get("files")
