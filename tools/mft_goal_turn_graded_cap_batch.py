@@ -235,6 +235,7 @@ def prepare(
     output: Path,
     solver_revision: str,
     library_revision: str,
+    variant_ids: tuple[str, ...] | None = None,
 ) -> Path:
     solver = str(solver_revision).lower()
     library = str(library_revision).lower()
@@ -263,8 +264,19 @@ def prepare(
         raise TurnGradedBatchError(f"output already exists: {destination}")
     destination.mkdir(parents=True)
     profile_path = _write(destination / "profile.json", profile)
+    variant_by_id = {variant["id"]: variant for variant in VARIANTS}
+    requested_ids = tuple(variant_ids or variant_by_id)
+    if (
+        not requested_ids
+        or len(requested_ids) != len(set(requested_ids))
+        or any(item not in variant_by_id for item in requested_ids)
+    ):
+        raise TurnGradedBatchError(
+            "variant_ids must be a non-empty unique subset of known variants"
+        )
+    selected_variants = tuple(variant_by_id[item] for item in requested_ids)
     lanes = []
-    for index, variant in enumerate(VARIANTS, start=1):
+    for index, variant in enumerate(selected_variants, start=1):
         params = {
             key: copy.deepcopy(base[key])
             for key in sorted(ALL_INPUT_KEYS)
@@ -338,6 +350,7 @@ def prepare(
             "profile_sha256": _sha(profile),
             "lanes": lanes,
             "lane_count": len(lanes),
+            "selected_variant_ids": list(requested_ids),
             "parallel_execution_requested": True,
             "symmetric_nonrounded": True,
             "full_model_series_interconnect_attested": False,
@@ -355,8 +368,22 @@ def _load_plan(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     )
     profile_path = (root / plan["profile"]["path"]).resolve(strict=True)
     profile = _read(profile_path)
+    variant_by_id = {variant["id"]: variant for variant in VARIANTS}
+    selected_ids = plan.get("selected_variant_ids")
+    selected_variants = (
+        [variant_by_id.get(str(item)) for item in selected_ids]
+        if isinstance(selected_ids, list)
+        else []
+    )
     if (
-        plan.get("lane_count") != len(VARIANTS)
+        not selected_variants
+        or any(variant is None for variant in selected_variants)
+        or len(selected_ids) != len(set(selected_ids))
+        or plan.get("lane_count") != len(selected_variants)
+        or len(plan.get("lanes") or []) != len(selected_variants)
+        or [
+            lane.get("variant") for lane in plan.get("lanes") or []
+        ] != selected_variants
         or plan.get("parallel_execution_requested") is not True
         or plan.get("symmetric_nonrounded") is not True
         or plan.get("final_design_pass_allowed") is not False
@@ -619,6 +646,12 @@ def _parser() -> argparse.ArgumentParser:
     prepare_cmd.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     prepare_cmd.add_argument("--solver-revision", required=True)
     prepare_cmd.add_argument("--library-revision", required=True)
+    prepare_cmd.add_argument(
+        "--variant-ids",
+        nargs="+",
+        choices=[variant["id"] for variant in VARIANTS],
+        help="Optional non-empty ordered subset; defaults to the full sweep.",
+    )
     submit_cmd = commands.add_parser("submit")
     submit_cmd.add_argument("--plan", type=Path, required=True)
     submit_cmd.add_argument("--output", type=Path, required=True)
@@ -640,6 +673,9 @@ def main() -> int:
             output=args.output,
             solver_revision=args.solver_revision,
             library_revision=args.library_revision,
+            variant_ids=(
+                tuple(args.variant_ids) if args.variant_ids is not None else None
+            ),
         )
     elif args.command == "submit":
         path = submit(
