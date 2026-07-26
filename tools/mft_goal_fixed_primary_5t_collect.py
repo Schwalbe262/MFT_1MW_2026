@@ -357,16 +357,24 @@ def _load_rows(collections: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]
             "r", encoding="utf-8", newline=""
         ) as stream:
             reader = csv.DictReader(stream)
-            for row in reader:
+            for csv_row_index, row in enumerate(reader, start=2):
                 metrics = _row_metrics(row)
                 if (
                     not _truth(row["decoder_valid"])
-                    or not _truth(row["surrogate_physical_valid"])
-                    or metrics["cw1_mm"] != 5.0
-                    or metrics["gap1_mm"] != 1.6
+                    or not math.isclose(
+                        metrics["cw1_mm"], 5.0, rel_tol=0.0, abs_tol=1e-12
+                    )
+                    or not math.isclose(
+                        metrics["gap1_mm"], 1.6, rel_tol=0.0, abs_tol=1e-12
+                    )
                 ):
                     raise RuntimeError(
-                        "collected terminal row violates fixed controls"
+                        "collected terminal row violates fixed controls: "
+                        f"task={collection['task_id']} csv_row={csv_row_index} "
+                        f"terminal_index={row.get('terminal_population_index')} "
+                        f"decoder_valid={row.get('decoder_valid')!r} "
+                        f"cw1_mm={metrics['cw1_mm']!r} "
+                        f"gap1_mm={metrics['gap1_mm']!r}"
                     )
                 enriched = {
                     **row,
@@ -526,6 +534,7 @@ def collect(
         physical_g = json.loads(row["physical_G_json"])
         if (
             _truth(row["physical_feasible"])
+            and _truth(row["surrogate_physical_valid"])
             and all(float(value) <= 1e-9 for value in physical_g.values())
         ):
             feasible.append(row)
