@@ -31,7 +31,7 @@ CAMPAIGN_SCHEMA = "mft-goal-fixed-primary-5t-nsga-submission-v1"
 CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-axis-v6"
 HEDGE_CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-variable-20260727-v1"
 TARGETED_CAMPAIGN_ID = (
-    "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-splittemp-v2"
+    "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-splittemp-v3-rolling512"
 )
 PRIMARY_CONDUCTOR_MM = 5.0
 PRIMARY_GAP_MM = 1.6
@@ -42,7 +42,7 @@ SEED_COUNT = 16
 HEDGE_SEED_START = 2_707_275_400
 HEDGE_SEED_COUNT = 8
 TARGETED_SEED_START = 2_707_277_000
-TARGETED_SEED_COUNT = 256
+TARGETED_SEED_COUNT = 512
 CPUS = 8
 MEMORY_MB = 65_536
 TIMEOUT_SECONDS = 7_200
