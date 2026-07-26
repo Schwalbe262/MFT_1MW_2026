@@ -165,6 +165,35 @@ def _reader_from(tasks: dict[int, dict[str, Any]]):
     return reader
 
 
+def test_task96324_card_reports_primary_solver_failure_before_receipt_error() -> None:
+    spec = updater.TASK_SPECS[0]
+    task = updater._validate_task(
+        spec,
+        _task(
+            spec,
+            state="failed",
+            allocation_id=14644,
+            slurm_job_id="839461",
+            failure_message=(
+                "ValueError: Out of range float values are not JSON compliant: nan"
+            ),
+        ),
+    )
+
+    card = updater._task_card(spec, task, OBSERVED)
+
+    assert "Icepak native ThermalSetup execution error" in card["detail"]
+    assert "no Fluent process or temperature result" in card["detail"]
+    assert any(
+        value.startswith("failure_message=ValueError:")
+        for value in card["evidence"]
+    )
+    assert any(
+        value.startswith("authenticated terminal root cause=Icepak native")
+        for value in card["evidence"]
+    )
+
+
 def _thermal_state(*, watcher_state: str = "running") -> dict[str, Any]:
     return updater._sealed(
         {

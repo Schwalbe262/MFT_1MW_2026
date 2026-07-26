@@ -85,6 +85,7 @@ class TaskSpec:
     allocation_force_cancel_at_kst: str | None = None
     task_timeout_at_kst: str | None = None
     force_cancel_lead_seconds: int | None = None
+    terminal_failure_override: str | None = None
 
 
 TASK_SPECS = (
@@ -102,6 +103,12 @@ TASK_SPECS = (
         timeout_seconds=45000,
         inner_solver_seconds=43200,
         requested_account="r1jae262",
+        terminal_failure_override=(
+            "Icepak native ThermalSetup execution error after an authenticated "
+            "mesh preflight; no Fluent process or temperature result was "
+            "produced. The later NaN JSON serialization error only affected "
+            "the failure receipt."
+        ),
     ),
     TaskSpec(
         task_id=96325,
@@ -700,7 +707,11 @@ def _task_card(
             "artifact 인증 전에는 collection·scientific PASS가 아닙니다."
         )
     elif category == "failed":
-        reason = task["failure_message"] or "Scheduler failure reason unavailable"
+        reason = (
+            spec.terminal_failure_override
+            or task["failure_message"]
+            or "Scheduler failure reason unavailable"
+        )
         outcome = (
             f"Terminal failure reason: {reason}. 운영 실패는 과학적 "
             "infeasibility 또는 production 판정이 아닙니다."
@@ -767,6 +778,10 @@ def _task_card(
         )
     if task["failure_message"]:
         evidence.append(f"failure_message={task['failure_message']}")
+    if category == "failed" and spec.terminal_failure_override:
+        evidence.append(
+            f"authenticated terminal root cause={spec.terminal_failure_override}"
+        )
     return {
         "id": spec.card_id,
         "title": title,
