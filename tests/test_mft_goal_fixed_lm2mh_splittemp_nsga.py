@@ -4,7 +4,7 @@ from tools import mft_goal_fixed_primary_5t_campaign as campaign
 
 
 def test_targeted_campaign_searches_all_four_turn_strata_with_fresh_seeds():
-    assert campaign.TARGETED_SEED_COUNT == 64
+    assert campaign.TARGETED_SEED_COUNT == 256
     assert campaign.TARGETED_SEED_COUNT % 4 == 0
     assert "splittemp-v2" in campaign.TARGETED_CAMPAIGN_ID
 
