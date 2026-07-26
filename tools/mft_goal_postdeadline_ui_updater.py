@@ -604,6 +604,16 @@ PRIMARY_5T_RECOVERY_CARD_ID = "codex-primary-5t-constraint-recovery"
 AXIS_V6_CARD_ID = "codex-axis-v6-fixed-5t-nsga"
 TARGET_AXIS_CARD_ID = "codex-target-axis-1200x1000-nsga"
 REFERENCE_BASELINE_CARD_ID = "codex-reference-drawing-baseline"
+EXACT_N1_6_GUI_FEA_CARD_ID = "codex-exact-n1-6-gui-fea"
+EXACT_N1_6_GUI_SEED = 2_707_277_137
+EXACT_N1_6_GUI_GEOMETRY_SHA256 = (
+    "e5b4c3b73869c5af75b254fb0486acae121bb27d1e905fd5a0fb3d146332c2be"
+)
+EXACT_N1_6_GUI_SOURCE_TASK_ID = 96_622
+EXACT_N1_6_GUI_CONTROLLER_PID = 3_224
+EXACT_N1_6_GUI_AEDT_PID = 48_360
+EXACT_N1_6_GUI_INITIAL_GAP_MM = 0.65
+EXACT_N1_6_GUI_THERMAL_MESH_SECONDS = 1_075.99
 HISTORICAL_AXIS_RAW_TERMINAL = 5_120
 HISTORICAL_AXIS_UNIQUE_GEOMETRY = 4_683
 NEW_AXIS_GEOMETRY_PASS_RAW = 217
@@ -2846,6 +2856,97 @@ def _descendant_processes(
     )
 
 
+def _exact_n1_6_gui_fea_card(observed_at: str) -> dict[str, Any]:
+    """Expose the exact 6/60 GUI diagnostic without promoting it as a result."""
+
+    snapshot = _windows_process_snapshot()
+    controller = snapshot.get(EXACT_N1_6_GUI_CONTROLLER_PID)
+    aedt = snapshot.get(EXACT_N1_6_GUI_AEDT_PID)
+    controller_active = (
+        _pid_exists(EXACT_N1_6_GUI_CONTROLLER_PID)
+        and controller is not None
+        and controller[1].lower() in {"python.exe", "pythonw.exe"}
+    )
+    aedt_active = (
+        _pid_exists(EXACT_N1_6_GUI_AEDT_PID)
+        and aedt is not None
+        and aedt[0] == EXACT_N1_6_GUI_CONTROLLER_PID
+        and aedt[1].lower() == "ansysedt.exe"
+    )
+    if aedt_active:
+        runtime_label = (
+            f"AEDT PID{EXACT_N1_6_GUI_AEDT_PID} OPEN/RESPONDING | "
+            "THERMAL PENDING/RUNNING"
+        )
+    else:
+        runtime_label = (
+            f"AEDT PID{EXACT_N1_6_GUI_AEDT_PID} NOT ACTIVE | "
+            "RESULTS UNAUTHENTICATED"
+        )
+    return {
+        "id": EXACT_N1_6_GUI_FEA_CARD_ID,
+        "title": (
+            "EXACT 6/60 GUI FEA | seed2707277137/e5b4 | "
+            f"SYM 1/8 NONROUNDED | {runtime_label}"
+        ),
+        "detail": (
+            "The exact N1/N2=6/60 local GUI diagnostic is a symmetric eighth, "
+            "unrounded model. Matrix, legacy capacitance, loss, and the "
+            f"ThermalSetup mesh ({EXACT_N1_6_GUI_THERMAL_MESH_SECONDS:.2f}s) "
+            "are complete. The native thermal solver remains pending/running "
+            "while the authenticated Results terminal is absent. The initial "
+            f"{EXACT_N1_6_GUI_INITIAL_GAP_MM:.2f}mm core-center air gap and "
+            "legacy capacitance are diagnostic inputs, not final resonance or "
+            "design authority."
+        ),
+        "state": "in_progress",
+        "updated_at": observed_at,
+        "progress_pct": 90,
+        "evidence": [
+            (
+                f"source seed={EXACT_N1_6_GUI_SEED} / geometry SHA256="
+                f"{EXACT_N1_6_GUI_GEOMETRY_SHA256} / "
+                f"source scheduler task={EXACT_N1_6_GUI_SOURCE_TASK_ID}"
+            ),
+            (
+                "topology=symmetric eighth / full_model=0 / "
+                "round_corner=0 / rounded=false / N1/N2=6/60"
+            ),
+            (
+                f"initial core-center gap="
+                f"{EXACT_N1_6_GUI_INITIAL_GAP_MM:.2f}mm diagnostic only / "
+                "fan velocity=1.5m/s unchanged / TIM and cooling contract "
+                "unchanged"
+            ),
+            "Matrix=complete / legacy capacitance=complete / loss=complete",
+            (
+                "ThermalSetup mesh=complete / elapsed="
+                f"{EXACT_N1_6_GUI_THERMAL_MESH_SECONDS:.2f}s / "
+                "thermal solver=pending/running"
+            ),
+            (
+                f"controller PID{EXACT_N1_6_GUI_CONTROLLER_PID} "
+                f"active={str(controller_active).lower()} / "
+                f"AEDT PID{EXACT_N1_6_GUI_AEDT_PID} "
+                f"active={str(aedt_active).lower()} / "
+                "last direct observation responding=true"
+            ),
+            (
+                "Results terminal=false / temperature results available=false "
+                "/ resonance result final=false"
+            ),
+            (
+                "actual scientific PASS=false / actual production PASS=false "
+                "/ canonical promotion=false"
+            ),
+            (
+                "legacy capacitance is not corrected turn-graded final "
+                "capacitance / final resonance authority=false"
+            ),
+        ],
+    }
+
+
 def _reference_thermal_terminal_marker(root: Path) -> dict[str, Any] | None:
     """Read the local thermal terminal marker before using process heuristics."""
 
@@ -4066,6 +4167,10 @@ def merge_status(
         _remove_current_card(result, AXIS_V6_CARD_ID)
         _remove_current_card(result, TARGET_AXIS_CARD_ID)
         _remove_current_card(result, REFERENCE_BASELINE_CARD_ID)
+    _upsert_priority_current_card(
+        result,
+        _exact_n1_6_gui_fea_card(observed_at),
+    )
     _upsert_priority_current_card(
         result,
         _primary_5t_recovery_card(observed_at),

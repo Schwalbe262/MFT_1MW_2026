@@ -498,13 +498,14 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     sync = updater.validate_status_sync(merged)
     ids = [item["id"] for item in merged["current"]]
 
-    assert ids[:4] == [
+    assert ids[:5] == [
         updater.PRIMARY_5T_RECOVERY_CARD_ID,
+        updater.EXACT_N1_6_GUI_FEA_CARD_ID,
         updater.TARGET_AXIS_CARD_ID,
         updater.REFERENCE_BASELINE_CARD_ID,
         updater.AXIS_V6_CARD_ID,
     ]
-    target = merged["current"][1]
+    target = merged["current"][2]
     assert "W1200/L1000 NSGA-II" in target["title"]
     assert "FINAL528" in target["title"]
     assert "FRESH OK0 RUN0 Q512 FAIL0" in target["title"]
@@ -524,7 +525,7 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
         value.startswith("fresh N1=") and "seeds=128" in value
         for value in target["evidence"]
     ) == 4
-    axis = merged["current"][3]
+    axis = merged["current"][4]
     assert "SUPERSEDED HISTORICAL WRONG AXIS" in axis["title"]
     assert "RUNNING 15" in axis["title"]
     assert "SUCCEEDED 1" in axis["title"]
@@ -541,7 +542,7 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
         and "generations=80" in value
         for value in axis["evidence"]
     )
-    reference = merged["current"][2]
+    reference = merged["current"][3]
     assert "THERMAL MESH RUNNING" in reference["title"]
     assert "REMOTE96415 DIRECT RUNNING n111/j840787" in reference["title"]
     assert "LOCAL" in reference["title"]
@@ -606,6 +607,69 @@ def test_authoritative_axis_v6_and_reference_baseline_are_separate(
     assert len(
         json.dumps(merged, ensure_ascii=False).encode("utf-8")
     ) < 256 * 1024
+
+
+def test_exact_n1_6_gui_fea_card_preserves_truth_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        updater,
+        "_windows_process_snapshot",
+        lambda: {
+            updater.EXACT_N1_6_GUI_CONTROLLER_PID: (1, "python.exe"),
+            updater.EXACT_N1_6_GUI_AEDT_PID: (
+                updater.EXACT_N1_6_GUI_CONTROLLER_PID,
+                "ansysedt.exe",
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        updater,
+        "_pid_exists",
+        lambda pid: pid
+        in {
+            updater.EXACT_N1_6_GUI_CONTROLLER_PID,
+            updater.EXACT_N1_6_GUI_AEDT_PID,
+        },
+    )
+
+    card = updater._exact_n1_6_gui_fea_card(OBSERVED)
+
+    assert card["id"] == updater.EXACT_N1_6_GUI_FEA_CARD_ID
+    assert len(card["title"]) <= 160
+    assert "seed2707277137/e5b4" in card["title"]
+    assert "SYM 1/8 NONROUNDED" in card["title"]
+    assert "AEDT PID48360 OPEN/RESPONDING" in card["title"]
+    assert "THERMAL PENDING/RUNNING" in card["title"]
+    assert card["state"] == "in_progress"
+    assert any(
+        updater.EXACT_N1_6_GUI_GEOMETRY_SHA256 in value
+        and "source scheduler task=96622" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "Matrix=complete" in value
+        and "legacy capacitance=complete" in value
+        and "loss=complete" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "ThermalSetup mesh=complete" in value
+        and "elapsed=1075.99s" in value
+        and "thermal solver=pending/running" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "Results terminal=false" in value
+        and "temperature results available=false" in value
+        for value in card["evidence"]
+    )
+    assert any(
+        "actual scientific PASS=false" in value
+        and "actual production PASS=false" in value
+        and "canonical promotion=false" in value
+        for value in card["evidence"]
+    )
 
 
 def test_final528_card_keeps_empty_production_front_separate_from_diagnostics(
