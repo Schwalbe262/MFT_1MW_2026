@@ -191,6 +191,9 @@ def test_failover_patch_is_exact_and_restored() -> None:
             failover.POST_AUTHORIZATION
         )
         assert failover.official8.live_preflight is failover.live_preflight
+        assert failover.official8._strict_readback_reader is (
+            failover._strict_readback_reader
+        )
         assert ("node_name", "n111") in failover.capacity_query()
     for name, value in before.items():
         assert getattr(failover.official8, name) == value
@@ -210,3 +213,39 @@ def test_authorization_rejected_before_post() -> None:
     ):
         failover.submit(authorize_post="wrong", poster=poster)
     assert posts == 0
+
+
+def test_strict_readback_allows_audited_preflight_tasks_only() -> None:
+    values = {
+        failover.ORIGINAL_OFFICIAL8_TASK_ID: {
+            "task_id": failover.ORIGINAL_OFFICIAL8_TASK_ID,
+            "requested_account_name": "jji0930",
+            "requested_node_name": "n114",
+            "requested_node_name_policy": "strict",
+            "preferred_node_relaxed": False,
+        },
+        97_000: {
+            "task_id": 97_000,
+            "requested_account_name": failover.ACCOUNT_NAME,
+            "requested_node_name": failover.NODE_NAME,
+            "requested_node_name_policy": "strict",
+            "preferred_node_relaxed": False,
+            "node_name": failover.NODE_NAME,
+            "node_name_policy": "strict",
+        },
+    }
+
+    def reader(path: str, _query: Any) -> Any:
+        return values[int(path.rsplit("/", 1)[1])]
+
+    strict = failover._strict_readback_reader(reader)
+    assert strict(
+        f"/api/tasks/{failover.ORIGINAL_OFFICIAL8_TASK_ID}", None
+    )["requested_node_name"] == "n114"
+    assert strict("/api/tasks/97000", None)["requested_node_name"] == "n111"
+    values[97_000]["requested_node_name"] = "n112"
+    with pytest.raises(
+        failover.PostdeadlineContractError,
+        match="strict n111 failover readback",
+    ):
+        strict("/api/tasks/97000", None)

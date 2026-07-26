@@ -118,6 +118,10 @@ COLLECTOR_MANIFEST_SCHEMA = (
 )
 COLLECTOR_INTENT_NAME = "collector_compatibility_intent.json"
 COLLECTOR_MANIFEST_NAME = "collector_compatibility_manifest.json"
+PREPOST_ABORT_SCHEMA = (
+    "mft-goal-official-standard8-n111-failover-prepost-abort-v1"
+)
+PREPOST_ABORT_NAME = "prepost_adapter_abort_evidence.json"
 
 OPENING_QUEUE_REASON = official8.OPENING_QUEUE_REASON
 FIXED_BOUNDARY = copy.deepcopy(official8.FIXED_BOUNDARY)
@@ -490,6 +494,50 @@ def live_preflight(
     }
 
 
+def _strict_readback_reader(reader: JsonReader) -> JsonReader:
+    """Permit audited preflight task GETs; fence every new task to n111."""
+
+    preflight_task_ids = {
+        SOURCE_TASK_ID,
+        ORIGINAL_OFFICIAL8_TASK_ID,
+        FREED_TASK_ID,
+    }
+
+    def strict(
+        path: str, query: Sequence[tuple[str, Any]] | None
+    ) -> Any:
+        value = reader(path, query)
+        prefix = "/api/tasks/"
+        suffix = path[len(prefix) :] if path.startswith(prefix) else ""
+        if suffix.isdigit() and int(suffix) not in preflight_task_ids:
+            if (
+                not isinstance(value, dict)
+                or value.get("requested_account_name") != ACCOUNT_NAME
+                or value.get("requested_node_name") != NODE_NAME
+                or value.get("requested_node_name_policy") != "strict"
+                or value.get("preferred_node_relaxed") is not False
+                or (
+                    value.get("node_name")
+                    and value.get("node_name") != NODE_NAME
+                )
+                or (
+                    value.get("actual_node_name")
+                    and value.get("actual_node_name") != NODE_NAME
+                )
+                or (
+                    value.get("allocation_node_name")
+                    and value.get("allocation_node_name") != NODE_NAME
+                )
+                or value.get("node_name_policy") not in {None, "strict"}
+            ):
+                raise PostdeadlineContractError(
+                    "durable strict n111 failover readback relaxed or drifted"
+                )
+        return value
+
+    return strict
+
+
 _PATCH = {
     "__file__": str(Path(__file__).resolve()),
     "SCHEDULER_URL": SCHEDULER_URL,
@@ -517,6 +565,7 @@ _PATCH = {
     "BOUNDARY_PROJECTION": BOUNDARY_PROJECTION,
     "capacity_query": capacity_query,
     "live_preflight": live_preflight,
+    "_strict_readback_reader": _strict_readback_reader,
 }
 
 
@@ -576,6 +625,99 @@ def prepare() -> Path:
         plan_path = official8.prepare()
     _collector_intent(plan_path)
     return plan_path
+
+
+def seal_prepost_adapter_abort(
+    *, reader: JsonReader = get_json
+) -> Path:
+    """Seal proof that the adapter failure happened before POST consumption."""
+
+    root = OUTPUT_ROOT.resolve(strict=True)
+    path = root / PREPOST_ABORT_NAME
+    if path.exists():
+        value = validate_seal(read_json(path), PREPOST_ABORT_SCHEMA)
+        if (
+            value.get("scheduler_post_calls_evidenced") != 0
+            or value.get("post_call_budget_consumed") is not False
+        ):
+            raise PostdeadlineContractError(
+                "existing pre-POST abort evidence drifted"
+            )
+        return path
+    plan_path = root / PLAN_NAME
+    plan = validate_seal(read_json(plan_path), PLAN_SCHEMA)
+    attempt_path = root / ATTEMPT_LEDGER_NAME
+    submission_path = root / SUBMISSION_DIRECTORY_NAME
+    if attempt_path.exists() or submission_path.exists():
+        raise PostdeadlineContractError(
+            "cannot seal pre-POST abort after attempt/output creation"
+        )
+    inventory = reader(
+        "/api/tasks",
+        [
+            ("limit", 10000),
+            ("project", PROJECT),
+            ("name_prefix", TASK_NAME),
+        ],
+    )
+    exact = [
+        row
+        for row in official8.reviewed._task_rows(inventory)
+        if row.get("name") == TASK_NAME
+        or row.get("dedupe_key") == plan["dedupe_key"]
+    ]
+    if exact:
+        raise PostdeadlineContractError(
+            "cannot prove zero POST because failover task exists"
+        )
+    original_task = reader(
+        f"/api/tasks/{ORIGINAL_OFFICIAL8_TASK_ID}", None
+    )
+    if (
+        not isinstance(original_task, dict)
+        or original_task.get("task_id") != ORIGINAL_OFFICIAL8_TASK_ID
+        or original_task.get("status") != "queued"
+        or original_task.get("dedupe_key")
+        != ORIGINAL_OFFICIAL8_DEDUPE_KEY
+    ):
+        raise PostdeadlineContractError(
+            "original official #8 task changed during pre-POST abort"
+        )
+    evidence = sealed(
+        {
+            "schema_version": PREPOST_ABORT_SCHEMA,
+            **SAFETY_FLAGS,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "plan": file_record(plan_path),
+            "plan_payload_sha256": plan["payload_sha256"],
+            "task_name": TASK_NAME,
+            "dedupe_key": plan["dedupe_key"],
+            "failed_adapter_stage": "initial_live_preflight_before_output",
+            "failure_class": "strict_readback_preflight_allowlist_bug",
+            "failure_message": (
+                "durable strict n114 readback relaxed or drifted"
+            ),
+            "attempt_ledger_path": str(attempt_path),
+            "attempt_ledger_exists": False,
+            "submission_output_path": str(submission_path),
+            "submission_output_exists": False,
+            "exact_scheduler_collision_count": 0,
+            "scheduler_post_calls_evidenced": 0,
+            "post_call_budget_consumed": False,
+            "remaining_lifetime_post_budget": 1,
+            "retry_only_after_adapter_fix_and_full_revalidation": True,
+            "original_task_96329_snapshot": original_task,
+            "original_task_96329_snapshot_sha256": payload_sha256(
+                original_task
+            ),
+            "original_task_cancelled_or_modified": False,
+            "scheduler_get_only": True,
+            "scheduler_mutation_performed": False,
+            "scheduler_repository_modified": False,
+            "scheduler_project_mutation_performed": False,
+        }
+    )
+    return write_immutable_json(path, evidence)
 
 
 def _collector_manifest(final_path: Path) -> Path:
@@ -704,6 +846,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")
     commands.add_parser("inspect")
+    commands.add_parser("seal-prepost-abort")
     submit_parser = commands.add_parser("submit")
     submit_parser.add_argument("--authorize-post", required=True)
     return parser
@@ -748,6 +891,22 @@ def main() -> int:
                 "active_n111_fea_count"
             ],
             "scheduler_post_calls": 0,
+        }
+    elif args.command == "seal-prepost-abort":
+        evidence_path = seal_prepost_adapter_abort()
+        evidence = validate_seal(
+            read_json(evidence_path), PREPOST_ABORT_SCHEMA
+        )
+        result = {
+            "event": "prepost_abort_sealed",
+            "evidence": str(evidence_path),
+            "evidence_sha256": sha256_file(evidence_path),
+            "scheduler_post_calls_evidenced": evidence[
+                "scheduler_post_calls_evidenced"
+            ],
+            "remaining_lifetime_post_budget": evidence[
+                "remaining_lifetime_post_budget"
+            ],
         }
     else:
         final_path = submit(authorize_post=args.authorize_post)
