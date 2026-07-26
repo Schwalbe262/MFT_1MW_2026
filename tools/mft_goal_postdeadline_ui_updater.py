@@ -3067,7 +3067,7 @@ def _target_axis_card(
                         "collector payload sha256="
                         f"{collector_status['payload_sha256']}"
                     ),
-                    *card["evidence"],
+                    *card["evidence"][:8],
                 ],
             }
         )
