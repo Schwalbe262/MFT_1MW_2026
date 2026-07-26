@@ -3,7 +3,9 @@ from tools import mft_goal_targeted_symmetric_fea_batch as targeted
 
 def _valid_contract() -> dict:
     return {
-        "thermal_rx_block_interface_contract_version": "test-v1",
+        "thermal_rx_block_interface_contract_version": (
+            "thermal-rx-block-interface-coverage-v1"
+        ),
         "thermal_rx_main_interface_coverage_passed": True,
         "thermal_rx_main_unpaired_interfaces": [],
         "thermal_temperature_limiter_triggered": False,
@@ -34,6 +36,17 @@ def test_truth_gate_rejects_legacy_result_with_missing_fields() -> None:
     assert gated["valid"] is False
     assert len(gated["reasons"]) == len(
         targeted.THERMAL_RX_INTERFACE_CONTRACT_FIELDS
+    )
+
+
+def test_truth_gate_rejects_unknown_interface_contract_version() -> None:
+    result = _valid_contract()
+    result["thermal_rx_block_interface_contract_version"] = "future-v2"
+    gated = _gate(result)
+    assert gated["valid"] is False
+    assert any(
+        "thermal_rx_block_interface_contract_version" in row
+        for row in gated["reasons"]
     )
 
 
