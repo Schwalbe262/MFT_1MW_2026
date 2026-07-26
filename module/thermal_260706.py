@@ -82,8 +82,10 @@ _RX_INSULATION_KEYS = (
     "Rx_side_insulation",
     "Rx_side2_insulation",
 )
-THERMAL_MESH_POLICY = "b3-rxmain-l5-wcp-pad-padded-regions-v1"
-THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v4"
+THERMAL_MESH_POLICY = (
+    "b4-rxmain-l5-wcp-pad-symmetry-clipped-regions-v1"
+)
+THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v5"
 THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION = "thermal-mesh-preflight-v2"
 THERMAL_MESH_STATS_CONTRACT_VERSION = "thermal-native-mesh-stats-v1"
 THERMAL_SETUP_CONTROL_READBACK_CONTRACT_VERSION = (
@@ -92,13 +94,36 @@ THERMAL_SETUP_CONTROL_READBACK_CONTRACT_VERSION = (
 THERMAL_MESH_STATS_FILENAME = "icepak_thermal_mesh_quality.ms"
 THERMAL_MESH_STATS_MAX_BYTES = 64 * 1024 * 1024
 WCP_PAD_MESH_REGION_CONTRACT_VERSION = (
-    "wcp-pad-per-object-anisotropic-region-v1"
+    "wcp-pad-per-object-symmetry-clipped-region-v2"
 )
 WCP_PAD_MESH_REGION_PADDING_TYPE = "Absolute Offset"
 WCP_PAD_MESH_REGION_PADDING_MM = 2.0
 _WCP_PAD_MESH_REGION_DIRECTIONS = (
     "+X", "-X", "+Y", "-Y", "+Z", "-Z",
 )
+
+
+def _wcp_pad_mesh_region_padding_mm(mode):
+    """Keep non-model WCP refinement envelopes inside symmetry planes."""
+
+    normalized = str(mode or "").strip().casefold()
+    blocked_directions = {
+        "full": frozenset(),
+        "quarter": frozenset({"+X"}),
+        "eighth": frozenset({"+X", "-Z"}),
+    }.get(normalized)
+    if blocked_directions is None:
+        raise ValueError(
+            f"unsupported thermal symmetry for WCP mesh padding: {mode!r}"
+        )
+    return {
+        direction: (
+            0.0
+            if direction in blocked_directions
+            else WCP_PAD_MESH_REGION_PADDING_MM
+        )
+        for direction in _WCP_PAD_MESH_REGION_DIRECTIONS
+    }
 THERMAL_FLUENT_PROCESS_CONTRACT_VERSION = (
     "thermal-fluent-total-processes-v2"
 )
@@ -321,8 +346,49 @@ def _is_fluent_runtime_command(commandline):
     ))
 
 
+def _read_process_cgroup(pid):
+    """Read one Linux process' kernel-owned cgroup membership."""
+
+    return Path("/proc", str(int(pid)), "cgroup").read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _slurm_step_cgroup_anchors(cgroup_text, job_id, step_id):
+    """Return exact cgroup prefixes through one Slurm job/step pair."""
+
+    job = str(job_id or "").strip()
+    step = str(step_id or "").strip()
+    if not re.fullmatch(r"[0-9]+", job):
+        return []
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", step):
+        return []
+
+    job_pattern = re.compile(rf"job[_-]{re.escape(job)}(?:\.scope)?")
+    step_pattern = re.compile(rf"step[_-]{re.escape(step)}(?:\.scope)?")
+    anchors = set()
+    for raw_line in str(cgroup_text or "").splitlines():
+        fields = raw_line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        segments = [
+            segment for segment in fields[2].strip().split("/")
+            if segment
+        ]
+        for job_index, segment in enumerate(segments):
+            if job_pattern.fullmatch(segment) is None:
+                continue
+            for step_index in range(job_index + 1, len(segments)):
+                if step_pattern.fullmatch(segments[step_index]) is None:
+                    continue
+                anchors.add("/" + "/".join(segments[:step_index + 1]))
+                break
+    return sorted(anchors)
+
+
 class _StandaloneThermalProcessAttestor:
-    """Observe only new descendants and attest Fluent's actual ``-t`` value."""
+    """Attest new Fluent commands in this exact Slurm step cgroup."""
 
     def __init__(self, expected_processes, root_pid=None, poll_s=0.1):
         self.expected_processes = int(expected_processes)
@@ -335,15 +401,74 @@ class _StandaloneThermalProcessAttestor:
         self._scan_count = 0
         self._successful_scan_count = 0
         self._scan_errors = []
+        self._scope = {}
 
-    @staticmethod
-    def _descendants(root_pid):
+    def _capture_scope(self):
+        job_id = str(os.environ.get("SLURM_JOB_ID") or "").strip()
+        step_id = str(
+            os.environ.get("SLURM_STEP_ID")
+            or os.environ.get("SLURM_STEPID")
+            or ""
+        ).strip()
+        if not job_id:
+            raise RuntimeError(
+                "standalone Icepak process attestation requires SLURM_JOB_ID"
+            )
+        if not step_id:
+            raise RuntimeError(
+                "standalone Icepak process attestation requires SLURM_STEP_ID"
+            )
+        geteuid = getattr(os, "geteuid", None)
+        if not callable(geteuid):
+            raise RuntimeError(
+                "standalone Icepak process attestation requires Linux eUID"
+            )
+        uid = int(geteuid())
+        root_cgroup = _read_process_cgroup(self.root_pid)
+        anchors = _slurm_step_cgroup_anchors(
+            root_cgroup,
+            job_id,
+            step_id,
+        )
+        if not anchors:
+            raise RuntimeError(
+                "standalone Icepak process attestation cannot prove the "
+                f"exact Slurm step cgroup for job={job_id} step={step_id}"
+            )
+        return {
+            "slurm_job_id": job_id,
+            "slurm_step_id": step_id,
+            "effective_uid": uid,
+            "cgroup_anchors": anchors,
+        }
+
+    def _scoped_processes(self):
         import psutil
 
-        root = psutil.Process(int(root_pid))
+        if not self._scope:
+            raise RuntimeError(
+                "standalone Icepak process attestation scope is unavailable"
+            )
+        uid = int(self._scope["effective_uid"])
+        job_id = self._scope["slurm_job_id"]
+        step_id = self._scope["slurm_step_id"]
+        root_anchors = set(self._scope["cgroup_anchors"])
         records = {}
-        for process in root.children(recursive=True):
+        for process in psutil.process_iter():
             try:
+                process_uids = process.uids()
+                if (
+                    int(process_uids.real) != uid
+                    or int(process_uids.effective) != uid
+                ):
+                    continue
+                process_anchors = set(_slurm_step_cgroup_anchors(
+                    _read_process_cgroup(process.pid),
+                    job_id,
+                    step_id,
+                ))
+                if not root_anchors.intersection(process_anchors):
+                    continue
                 argv = [str(value) for value in (process.cmdline() or [])]
                 commandline = " ".join(shlex.quote(value) for value in argv)
                 records[int(process.pid)] = {
@@ -369,9 +494,16 @@ class _StandaloneThermalProcessAttestor:
         return (int(record["pid"]), round(float(record["create_time"]), 3))
 
     def start(self):
+        self._scope = self._capture_scope()
+        current = self._scoped_processes()
+        if self.root_pid not in current:
+            raise RuntimeError(
+                "standalone Icepak process attestation cannot observe its "
+                "root process inside the exact Slurm step cgroup"
+            )
         self._baseline = {
             self._identity(record): record
-            for record in self._descendants(self.root_pid).values()
+            for record in current.values()
         }
         self._thread = threading.Thread(
             target=self._run,
@@ -381,46 +513,49 @@ class _StandaloneThermalProcessAttestor:
         self._thread.start()
         return self
 
+    def _scan_once(self):
+        self._scan_count += 1
+        try:
+            current = self._scoped_processes()
+            self._successful_scan_count += 1
+            for record in current.values():
+                identity = self._identity(record)
+                if identity in self._baseline:
+                    continue
+                commandline = record["commandline"]
+                if not _is_fluent_runtime_command(commandline):
+                    continue
+                counts = _fluent_process_counts(commandline)
+                key = (
+                    identity,
+                    commandline,
+                )
+                if key in self._records:
+                    continue
+                captured = {
+                    **record,
+                    **counts,
+                }
+                self._records[key] = captured
+                if counts["thread_counts"] or counts["nprocs_counts"]:
+                    logging.warning(
+                        "[thermal] Fluent process command observed: %s",
+                        json.dumps(
+                            captured,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                        ),
+                    )
+        except Exception as exc:
+            self._scan_errors.append(
+                f"{type(exc).__name__}: {str(exc)[:256]}"
+            )
+            self._scan_errors = self._scan_errors[-8:]
+
     def _run(self):
         while not self._stop.is_set():
-            self._scan_count += 1
-            try:
-                current = self._descendants(self.root_pid)
-                self._successful_scan_count += 1
-                for record in current.values():
-                    identity = self._identity(record)
-                    if identity in self._baseline:
-                        continue
-                    commandline = record["commandline"]
-                    if not _is_fluent_runtime_command(commandline):
-                        continue
-                    counts = _fluent_process_counts(commandline)
-                    key = (
-                        identity,
-                        commandline,
-                    )
-                    if key in self._records:
-                        continue
-                    captured = {
-                        **record,
-                        **counts,
-                    }
-                    self._records[key] = captured
-                    if counts["thread_counts"] or counts["nprocs_counts"]:
-                        logging.warning(
-                            "[thermal] Fluent process command observed: %s",
-                            json.dumps(
-                                captured,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                                ensure_ascii=True,
-                            ),
-                        )
-            except Exception as exc:
-                self._scan_errors.append(
-                    f"{type(exc).__name__}: {str(exc)[:256]}"
-                )
-                self._scan_errors = self._scan_errors[-8:]
+            self._scan_once()
             self._stop.wait(self.poll_s)
 
     def finish(self):
@@ -462,6 +597,9 @@ class _StandaloneThermalProcessAttestor:
             "scan_count": int(self._scan_count),
             "successful_scan_count": int(self._successful_scan_count),
             "scan_errors": list(self._scan_errors),
+            "scope": dict(self._scope),
+            "runtime_commands": records[:32],
+            "explicit_commands": explicit[:32],
             "commands": explicit[:32],
         }
         if self._successful_scan_count < 1:
@@ -1210,10 +1348,11 @@ def _thermal_mesh_length_mm(value, label):
     return number * scale
 
 
-def _assign_thermal_mesh(ipk, objs, side_block_level=5):
+def _assign_thermal_mesh(ipk, objs, side_block_level=5, mode="full"):
     """Install assembly-local refinements resolved per controlled solid."""
     plan = []
     assigned = {}
+    wcp_padding_by_direction_mm = _wcp_pad_mesh_region_padding_mm(mode)
 
     def _assign_levels(levels, name, category):
         if not levels:
@@ -1364,8 +1503,9 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
             WCP_PAD_MESH_REGION_PADDING_TYPE
         ] * len(_WCP_PAD_MESH_REGION_DIRECTIONS)
         expected_padding_values = [
-            f"{WCP_PAD_MESH_REGION_PADDING_MM:g}mm"
-        ] * len(_WCP_PAD_MESH_REGION_DIRECTIONS)
+            f"{wcp_padding_by_direction_mm[direction]:g}mm"
+            for direction in _WCP_PAD_MESH_REGION_DIRECTIONS
+        ]
         try:
             assignment.padding_types = list(expected_padding_types)
             assignment.padding_values = list(expected_padding_values)
@@ -1397,11 +1537,14 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
             or any(
                 not math.isclose(
                     value,
-                    WCP_PAD_MESH_REGION_PADDING_MM,
+                    wcp_padding_by_direction_mm[direction],
                     rel_tol=0.0,
                     abs_tol=1e-12,
                 )
-                for value in padding_values_mm
+                for direction, value in zip(
+                    _WCP_PAD_MESH_REGION_DIRECTIONS,
+                    padding_values_mm,
+                )
             )
         ):
             raise RuntimeError(
@@ -1433,6 +1576,9 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
             "native_region_object_name": region_object_name,
             "padding_types": expected_padding_types,
             "padding_values_mm": padding_values_mm,
+            "padding_by_direction_mm": dict(
+                wcp_padding_by_direction_mm
+            ),
         })
 
     assemblies = _cooling_plate_mesh_assemblies(objs)
@@ -1583,6 +1729,10 @@ def _assign_thermal_mesh(ipk, objs, side_block_level=5):
     plan_payload = {
         "schema": THERMAL_MESH_PLAN_CONTRACT_VERSION,
         "policy": THERMAL_MESH_POLICY,
+        "symmetry_mode": str(mode).strip().casefold(),
+        "wcp_pad_padding_by_direction_mm": dict(
+            wcp_padding_by_direction_mm
+        ),
         "operations": plan,
         "operation_count": len(plan),
         "assigned_object_count": len(assigned),
@@ -6502,6 +6652,7 @@ def run_thermal_analysis(sim):
     thermal_mesh_plan = _assign_thermal_mesh(
         ipk,
         objs,
+        mode=mode,
         side_block_level=int(
             df.get(
                 "thermal_rx_side_block_mesh_level", pd.Series([5])

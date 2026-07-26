@@ -139,7 +139,7 @@ def _checkpoint_manifest(path: Path) -> Path:
             ),
             "slurm_job_id": 824575,
             "allocation_id": 14492,
-            "node": submission.FORBIDDEN_NODE,
+            "node": submission.SOURCE_NODE,
             "source_project_sha256": _sha("1"),
             "source_static_metadata_sha256": _sha("4"),
         },
@@ -298,10 +298,12 @@ class FakeScheduler:
         }
         self.stderr: dict[int, str] = {
             source_id: (
-                '  "fan_velocity": _native_design_variable(\n'
-                "  File executor.py, in attest_native_fixed_model\n"
-                "ansys.aedt.core.internal.errors.GrpcApiError: "
-                "Failed to execute gRPC AEDT command: GetVariableValue\n"
+                "[thermal] refusing solver retry after exact native terminal "
+                "evidence\n"
+                "Failed to run solver\n"
+                "Simulation completed with execution error on server: n109\n"
+                "standalone Icepak process attestation observed no Fluent -t "
+                "command\n"
             )
         }
 
@@ -316,7 +318,7 @@ class FakeScheduler:
             "account_name": submission.ACCOUNT,
             "status": "failed",
             "state": "failed",
-            "exit_code": 1,
+            "exit_code": 2,
             "requested_node_name": source["requested_node"],
             "actual_node_name": source["requested_node"],
             "allocation_node_name": source["requested_node"],
@@ -324,8 +326,8 @@ class FakeScheduler:
             "allocation_id": source["allocation_id"],
             "slurm_job_id": source["slurm_job_id"],
             "failure_message": (
-                "ansys.aedt.core.internal.errors.GrpcApiError: "
-                "Failed to execute gRPC AEDT command: GetVariableValue"
+                "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
+                "standalone thermal parallel evidence failed"
             ),
         }
 
@@ -465,7 +467,10 @@ def test_plan_binds_fresh_executor_and_two_tier_storage(tmp_path: Path) -> None:
         f"export MFT_STANDALONE_CORE_AUTH_SHA256='{expected_auth}'"
         in plan["canonical_command"]
     )
-    assert "test \"$host\" != 'n114'" in plan["canonical_command"]
+    assert (
+        f"test \"$host\" != '{submission.FORBIDDEN_NODE}'"
+        in plan["canonical_command"]
+    )
     assert "--execution-plan" in plan["canonical_command"]
 
 
@@ -473,7 +478,7 @@ def test_deadline_relative_timeout_fails_closed() -> None:
     assert submission.calculate_timeout(NOW) == 21600
     with pytest.raises(submission.CorrectedThermalError, match="minimum"):
         submission.calculate_timeout(
-            datetime.fromisoformat("2026-07-26T15:00:01+09:00")
+            datetime.fromisoformat("2026-07-26T15:30:01+09:00")
         )
 
 
@@ -629,7 +634,7 @@ def test_runtime_quota_authority_and_infrastructure_source_fail_closed(
     )
     with pytest.raises(
         submission.CorrectedThermalError,
-        match="exact pre-solver",
+        match="exact native Icepak",
     ):
         submission.validate_infrastructure_retry_source(
             source,
@@ -1057,3 +1062,48 @@ def test_posix_retention_metadata_binds_owner_mode_and_file_link() -> None:
             submission._validate_retained_metadata(
                 bad, directory=False, label="file", posix=True
             )
+
+
+def test_failure_forensics_are_bounded_hashed_and_no_replace(
+    tmp_path: Path,
+) -> None:
+    execution_root = tmp_path / "scratch" / "output"
+    clone = execution_root / "clone"
+    clone.mkdir(parents=True)
+    receipt = clone / "corrected_thermal_diagnostic_receipt.json"
+    receipt.write_text('{"status":"diagnostic_failed"}', encoding="utf-8")
+    (clone / "native.log").write_bytes(b"CLIENT_SHUTDOWN\n")
+    (clone / "large.out").write_bytes(b"x" * 32)
+    execution_plan = tmp_path / "execution-plan.json"
+    execution_plan.write_text('{"sealed":true}', encoding="utf-8")
+    contract = {
+        "checkpoint_manifest_sha256": _sha("a"),
+        "executor_revision": "b" * 40,
+        "plan_payload_sha256": _sha("c"),
+        "output_storage": {"retained_root": str(tmp_path / "retained")},
+    }
+    original_limit = submission.FAILURE_FORENSIC_MAX_FILE_BYTES
+    submission.FAILURE_FORENSIC_MAX_FILE_BYTES = 16
+    try:
+        result = submission._retain_failure_forensics(
+            contract=contract,
+            execution_plan=execution_plan,
+            execution_root=execution_root,
+            execution_exit_code=2,
+        )
+    finally:
+        submission.FAILURE_FORENSIC_MAX_FILE_BYTES = original_limit
+
+    destination = Path(result["destination"])
+    manifest = json.loads((destination / "manifest.json").read_text())
+    assert result["passed"] is True
+    assert not (destination / ".incomplete").exists()
+    assert any(row["path"].endswith("native.log") for row in manifest["files"])
+    assert any(
+        row["reason"] == "bounded_cap"
+        and row["source"].endswith("large.out")
+        for row in manifest["omitted"]
+    )
+    for row in manifest["files"]:
+        path = destination.joinpath(*Path(row["path"]).parts)
+        assert submission.sha256_file(path) == row["sha256"]

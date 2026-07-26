@@ -26,6 +26,38 @@ sys.modules[SPEC.name] = executor
 SPEC.loader.exec_module(executor)
 
 
+def _wcp_aedt_bytes() -> bytes:
+    blocks = []
+    for name in executor.WCP_SYMMETRY_REGION_NAMES:
+        padding = "\n".join(
+            [
+                f"'{direction}PaddingType'='Absolute Offset'\n"
+                f"'{direction}Padding'='2mm'"
+                for direction in executor.WCP_PADDING_DIRECTIONS
+            ]
+        )
+        blocks.append(
+            "\n".join(
+                [
+                    "$begin 'GeometryPart'",
+                    "$begin 'Attributes'",
+                    f"Name='{name}'",
+                    "$end 'Attributes'",
+                    "$begin 'Operations'",
+                    "$begin 'Operation'",
+                    "OperationType='SubRegion'",
+                    "$begin 'SubRegionParameters'",
+                    padding,
+                    "$end 'SubRegionParameters'",
+                    "$end 'Operation'",
+                    "$end 'Operations'",
+                    "$end 'GeometryPart'",
+                ]
+            )
+        )
+    return ("\n".join(blocks) + "\n").encode("ascii")
+
+
 def _file_entry(root: Path, path: Path) -> dict:
     stat_result = path.stat()
     return {
@@ -49,7 +81,7 @@ def _checkpoint(root: Path) -> tuple[Path, dict]:
     )
     results.mkdir(parents=True)
     aedt = checkpoint / "simulation.aedt"
-    aedt.write_bytes(b"authenticated-existing-thermal-design")
+    aedt.write_bytes(_wcp_aedt_bytes())
     for family, suffix in (
         ("DV274_Meshes", "_V213.sd"),
         ("DV274_S271_Meshes", "_V0.sd"),
@@ -262,6 +294,18 @@ def _execution_plan(
         "core_policy": core_policy,
         "runtime_quota_authority": authority,
         "output_storage": storage,
+        "symmetry_mesh_region_repair": executor.symmetry_repair_contract(
+            checkpoint_authentication["files"][
+                next(
+                    index
+                    for index, row in enumerate(
+                        checkpoint_authentication["files"]
+                    )
+                    if row["path"]
+                    == checkpoint_authentication["aedt_relative_path"]
+                )
+            ]["sha256"]
+        ),
     }
     plan["plan_payload_sha256"] = executor.hashlib.sha256(
         executor.canonical_json_bytes(plan)
@@ -423,6 +467,74 @@ def test_clone_is_writable_complete_and_does_not_mutate_checkpoint(
     assert executor.attest_saved_premesh(
         authentication, clone_root
     )["passed"] is True
+
+
+def test_exact_symmetry_repair_changes_only_eight_cloned_padding_bytes(
+    tmp_path: Path,
+) -> None:
+    checkpoint, _manifest = _checkpoint(tmp_path)
+    authentication = executor.authenticate_checkpoint(checkpoint)
+    clone = executor.clone_checkpoint(
+        authentication, tmp_path / "continuations"
+    )
+    source = checkpoint / "simulation.aedt"
+    cloned = Path(clone["aedt_path"])
+    source_before = source.read_bytes()
+    clone_before = cloned.read_bytes()
+    contract = executor.symmetry_repair_contract(
+        executor.sha256_file(source)
+    )
+
+    evidence = executor.repair_cloned_aedt_symmetry_envelopes(
+        authentication=authentication,
+        clone=clone,
+        contract=contract,
+    )
+
+    clone_after = cloned.read_bytes()
+    changed = [
+        (before, after)
+        for before, after in zip(clone_before, clone_after)
+        if before != after
+    ]
+    assert changed == [(ord("2"), ord("0"))] * 8
+    assert evidence["changed_byte_count"] == 8
+    assert source.read_bytes() == source_before
+    assert clone_after.count(b"'+XPadding'='0mm'") == 4
+    assert clone_after.count(b"'-ZPadding'='0mm'") == 4
+    assert clone_after.count(b"'-XPadding'='2mm'") == 4
+    assert clone_after.count(b"'+ZPadding'='2mm'") == 4
+
+
+def test_symmetry_repair_rejects_nonexact_source_subregion(
+    tmp_path: Path,
+) -> None:
+    checkpoint, manifest = _checkpoint(tmp_path)
+    aedt = checkpoint / "simulation.aedt"
+    aedt.write_bytes(
+        aedt.read_bytes().replace(b"'+XPadding'='2mm'", b"'+XPadding'='1mm'", 1)
+    )
+    manifest["source_provenance"]["source_project_sha256"] = (
+        executor.sha256_file(aedt)
+    )
+    manifest["files"] = [
+        _file_entry(checkpoint, path)
+        for path in sorted(checkpoint.rglob("*"))
+        if path.is_file() and path.name != ".checkpoint_manifest.json"
+    ]
+    _reseal_checkpoint_manifest(checkpoint, manifest)
+    authentication = executor.authenticate_checkpoint(checkpoint)
+    clone = executor.clone_checkpoint(
+        authentication, tmp_path / "continuations"
+    )
+    with pytest.raises(executor.ContinuationError, match="padding drifted"):
+        executor.repair_cloned_aedt_symmetry_envelopes(
+            authentication=authentication,
+            clone=clone,
+            contract=executor.symmetry_repair_contract(
+                executor.sha256_file(aedt)
+            ),
+        )
 
 
 def test_clone_publish_race_never_clobbers_competing_destination(
@@ -997,7 +1109,7 @@ def test_parallel_evidence_requires_acf_one_by_eight_and_fluent_t8_mpi8() -> Non
         executor._attest_parallel_evidence(evidence)
 
 
-def test_executor_source_has_no_destructive_rebuild_or_scheduler_submission() -> None:
+def test_executor_source_allows_only_repaired_mesh_not_physics_rebuild() -> None:
     text = MODULE_PATH.read_text(encoding="utf-8")
     forbidden_calls = (
         ".cleanup_solution(",
@@ -1011,4 +1123,6 @@ def test_executor_source_has_no_destructive_rebuild_or_scheduler_submission() ->
     )
     assert all(token not in text for token in forbidden_calls)
     assert "_solve_exact_thermal_setup(sim, ipk, setup)" in text
-    assert '"mesh_generation": 0' in text
+    assert "generator(THERMAL_SETUP)" in text
+    assert '"fresh_native_mesh_generation": 1' in text
+    assert '"physical_geometry_create_or_edit": 0' in text

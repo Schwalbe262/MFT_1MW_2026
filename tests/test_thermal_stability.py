@@ -343,6 +343,35 @@ class ThermalStabilityTest(unittest.TestCase):
             "affinity_count_readback": total,
         }
 
+    @staticmethod
+    def _attestor_process(
+        pid,
+        *,
+        uid=1001,
+        ppid=1,
+        create_time=1.0,
+        argv=None,
+        name="python",
+    ):
+        process = Mock()
+        process.pid = pid
+        process.uids.return_value = SimpleNamespace(
+            real=uid,
+            effective=uid,
+        )
+        process.ppid.return_value = ppid
+        process.create_time.return_value = create_time
+        process.cmdline.return_value = list(argv or [name])
+        process.name.return_value = name
+        return process
+
+    @staticmethod
+    def _attestor_cgroup(job_id, step_id, leaf="task_0"):
+        return (
+            "0::/slurm/uid_1001/"
+            f"job_{job_id}/step_{step_id}/{leaf}\n"
+        )
+
     def test_standalone_icepak_maps_allocation_to_total_fluent_processes(self):
         sim = SimpleNamespace(
             NUM_CORE=16,
@@ -455,6 +484,144 @@ class ThermalStabilityTest(unittest.TestCase):
         with self.assertRaisesRegex(
                 RuntimeError, "process count mismatch"):
             attestor.finish()
+
+    def test_process_attestor_scope_fails_closed_without_exact_slurm_step(self):
+        attestor = thermal._StandaloneThermalProcessAttestor(
+            8,
+            root_pid=10,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SLURM_JOB_ID": "",
+                "SLURM_STEP_ID": "",
+                "SLURM_STEPID": "",
+            },
+            clear=False,
+        ), self.assertRaisesRegex(RuntimeError, "requires SLURM_JOB_ID"):
+            attestor.start()
+
+        with patch.dict(
+            os.environ,
+            {"SLURM_JOB_ID": "838192", "SLURM_STEP_ID": "0"},
+            clear=False,
+        ), patch.object(
+            thermal.os,
+            "geteuid",
+            return_value=1001,
+            create=True,
+        ), patch.object(
+            thermal,
+            "_read_process_cgroup",
+            return_value="0::/user.slice/session.scope\n",
+        ), self.assertRaisesRegex(RuntimeError, "exact Slurm step cgroup"):
+            attestor.start()
+
+    def test_process_attestor_includes_reparented_exact_step_only(self):
+        root = self._attestor_process(
+            10,
+            ppid=9,
+            create_time=10.0,
+        )
+        old_fluent = self._attestor_process(
+            20,
+            create_time=20.0,
+            argv=["fluent", "3ddp", "-t8"],
+            name="fluent",
+        )
+        reused_pid_fluent = self._attestor_process(
+            20,
+            create_time=21.0,
+            argv=["fluent", "3ddp", "-t8"],
+            name="fluent",
+        )
+        runtime_without_count = self._attestor_process(
+            21,
+            create_time=21.5,
+            argv=["cortex", "3ddp"],
+            name="cortex",
+        )
+        other_step = self._attestor_process(
+            22,
+            create_time=22.0,
+            argv=["fluent", "3ddp", "-t8"],
+            name="fluent",
+        )
+        other_job = self._attestor_process(
+            23,
+            create_time=23.0,
+            argv=["fluent", "3ddp", "-t8"],
+            name="fluent",
+        )
+        other_uid = self._attestor_process(
+            24,
+            uid=1002,
+            create_time=24.0,
+            argv=["fluent", "3ddp", "-t8"],
+            name="fluent",
+        )
+        cgroups = {
+            10: self._attestor_cgroup("838192", "0"),
+            20: self._attestor_cgroup("838192", "0", "task_1"),
+            21: self._attestor_cgroup("838192", "0", "task_1"),
+            22: self._attestor_cgroup("838192", "1"),
+            23: self._attestor_cgroup("838193", "0"),
+            24: self._attestor_cgroup("838192", "0"),
+        }
+        attestor = thermal._StandaloneThermalProcessAttestor(
+            8,
+            root_pid=10,
+        )
+        with patch.dict(
+            os.environ,
+            {"SLURM_JOB_ID": "838192", "SLURM_STEP_ID": "0"},
+            clear=False,
+        ), patch.object(
+            thermal.os,
+            "geteuid",
+            return_value=1001,
+            create=True,
+        ), patch.object(
+            thermal,
+            "_read_process_cgroup",
+            side_effect=lambda pid: cgroups[int(pid)],
+        ), patch(
+            "psutil.process_iter",
+            side_effect=[
+                [root, old_fluent],
+                [
+                    root,
+                    reused_pid_fluent,
+                    runtime_without_count,
+                    other_step,
+                    other_job,
+                    other_uid,
+                ],
+            ],
+        ):
+            attestor._scope = attestor._capture_scope()
+            baseline = attestor._scoped_processes()
+            attestor._baseline = {
+                attestor._identity(record): record
+                for record in baseline.values()
+            }
+            attestor._scan_once()
+            evidence = attestor.finish()
+
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(evidence["scope"]["slurm_job_id"], "838192")
+        self.assertEqual(evidence["scope"]["slurm_step_id"], "0")
+        self.assertEqual(
+            {record["pid"] for record in evidence["runtime_commands"]},
+            {20, 21},
+        )
+        self.assertEqual(
+            [record["pid"] for record in evidence["explicit_commands"]],
+            [20],
+        )
+        self.assertEqual(evidence["commands"], evidence["explicit_commands"])
+        self.assertEqual(evidence["thread_count_readbacks"], [8])
+        self.assertEqual(evidence["runtime_commands"][0]["ppid"], 1)
 
     def test_strict_standalone_dispatch_requests_and_attests_t16(self):
         from module import aedt_pool_adapter
@@ -2898,6 +3065,23 @@ class ThermalStabilityTest(unittest.TestCase):
             with self.subTest(keyword=keyword), self.assertRaisesRegex(RuntimeError, expected):
                 thermal._require_thermal_geometry(base, "eighth", 0, **{keyword: True})
 
+    def test_wcp_pad_mesh_region_padding_clips_symmetry_planes(self):
+        full = thermal._wcp_pad_mesh_region_padding_mm("full")
+        quarter = thermal._wcp_pad_mesh_region_padding_mm("quarter")
+        eighth = thermal._wcp_pad_mesh_region_padding_mm("eighth")
+
+        self.assertEqual(list(full.values()), [2.0] * 6)
+        self.assertEqual(
+            list(quarter.values()),
+            [0.0, 2.0, 2.0, 2.0, 2.0, 2.0],
+        )
+        self.assertEqual(
+            list(eighth.values()),
+            [0.0, 2.0, 2.0, 2.0, 2.0, 0.0],
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported thermal symmetry"):
+            thermal._wcp_pad_mesh_region_padding_mm("unknown")
+
     def test_candidate_thermal_mesh_is_local_object_separated_and_exactly_covered(self):
         operations = []
         mesh_regions = []
@@ -3011,6 +3195,7 @@ class ThermalStabilityTest(unittest.TestCase):
                 modeler=SimpleNamespace(model_units="mm"),
             ),
             objs,
+            mode="eighth",
         )
 
         self.assertEqual(plan["core_plate_assembly_count"], 15)
@@ -3082,8 +3267,13 @@ class ThermalStabilityTest(unittest.TestCase):
             )
             self.assertEqual(
                 region.assignment.padding_values,
-                ["2mm"] * 6,
+                ["0mm", "2mm", "2mm", "2mm", "2mm", "0mm"],
             )
+        self.assertEqual(plan["symmetry_mode"], "eighth")
+        self.assertEqual(
+            list(plan["wcp_pad_padding_by_direction_mm"].values()),
+            [0.0, 2.0, 2.0, 2.0, 2.0, 0.0],
+        )
 
     def test_explicit_insulation_requires_retained_copper(self):
         objs = {

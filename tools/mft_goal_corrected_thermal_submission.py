@@ -21,6 +21,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -40,6 +41,9 @@ from tools import mft_campaign_atomic_claim as atomic_claim  # noqa: E402
 
 PLAN_SCHEMA = "mft-corrected-thermal-submission-plan-v1"
 EXECUTION_PLAN_SCHEMA = "mft-corrected-thermal-execution-plan-v1"
+SYMMETRY_REPAIR_SCHEMA = (
+    "mft-corrected-thermal-eighth-wcp-padding-repair-v1"
+)
 CHECKPOINT_SCHEMA = "mft-corrected-thermal-static-checkpoint-v3"
 RETENTION_SCHEMA = "mft-corrected-thermal-retained-bundle-v1"
 RETENTION_MARKER_SCHEMA = "mft-corrected-thermal-retention-marker-v1"
@@ -53,12 +57,13 @@ CAMPAIGN_ID = "mft-goal-20260726"
 PROJECT = "MFT_1MW_2026v1"
 SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME = (
-    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r3"
+    "mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r4-n111"
 )
 ACCOUNT = "r1jae262"
 ACCOUNT_UID = 1455
-TARGET_NODE = "n109"
-FORBIDDEN_NODE = "n114"
+TARGET_NODE = "n111"
+FORBIDDEN_NODE = "n109"
+SOURCE_NODE = "n114"
 SOURCE_LOGICAL_TASK_ID = 96230
 SOURCE_EXECUTION_TASK_ID = 96304
 SOURCE_TASK_NAME = (
@@ -101,7 +106,7 @@ CORE_CONTRACT_ENV = "MFT_STANDALONE_CORE_CONTRACT"
 CORE_COUNT_ENV = "MFT_STANDALONE_CORE_COUNT"
 CORE_AUTH_ENV = "MFT_STANDALONE_CORE_AUTH_SHA256"
 MAX_TIMEOUT_SECONDS = 21_600
-MIN_RUNTIME_SECONDS = 10_800
+MIN_RUNTIME_SECONDS = 7_200
 PACKAGE_RESERVE_SECONDS = 1_800
 TIMEOUT_QUANTUM_SECONDS = 300
 MINIMUM_SCRATCH_WORKING_SHADOW_BYTES = 256 * 1024**3
@@ -109,6 +114,19 @@ MAXIMUM_MINIMUM_BUNDLE_BYTES = 4 * 1024**3
 MIN_STORAGE_HEADROOM_BYTES = 8 * 1024**3
 MIN_STORAGE_HEADROOM_INODES = 4096
 PHYSICAL_FREE_RESERVE_BYTES = 50 * 1024**3
+FAILURE_FORENSIC_MAX_FILE_BYTES = 32 * 1024**2
+FAILURE_FORENSIC_MAX_TOTAL_BYTES = 128 * 1024**2
+FAILURE_FORENSIC_MAX_FILES = 64
+FAILURE_FORENSIC_SUFFIXES = {
+    ".err",
+    ".jou",
+    ".json",
+    ".log",
+    ".out",
+    ".trn",
+    ".txt",
+    ".xml",
+}
 MAX_RESPONSE_BYTES = 128 * 1024**2
 INVENTORY_PAGE_SIZE = 10_000
 MAX_INVENTORY_PAGES = 100
@@ -120,42 +138,51 @@ CHECKPOINT_ROOT = PurePosixPath(
 )
 RETAINED_ROOT = (
     "/gpfs/home1/r1jae262/slurm_scheduler/mft_goal_20260726/"
-    "corrected_thermal_minimum_native_r3"
+    "corrected_thermal_minimum_native_r4_n111"
 )
-RETRY_GENERATION = "corrected-thermal-native-r3"
+RETRY_GENERATION = "corrected-thermal-native-r4-n111"
+WCP_SYMMETRY_REGION_NAMES = (
+    "wcp_pad_mesh_region_1_in_p_SubRegion",
+    "wcp_pad_mesh_region_1_out_p_SubRegion",
+    "wcp_pad_mesh_region_2_in_p_SubRegion",
+    "wcp_pad_mesh_region_2_out_p_SubRegion",
+)
+WCP_PADDING_DIRECTIONS = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
 INFRASTRUCTURE_RETRY_SOURCE = {
-    "task_id": 96310,
+    "task_id": 96311,
     "task_name": (
-        "mft-goal-corrected-thermal-l96230-b7c30cb70b95-core8-r2"
+        "mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r3"
     ),
     "dedupe_key": (
-        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-core8-r2:"
-        "abf407d1bd6174674f4e8b2a231973bb40e05e98:"
-        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:b19bdee88bf422bf"
+        "mft-al:mft-goal-corrected-thermal-l96230-b7c30cb70b95-native-r3:"
+        "a4a6637bf6e37f5660a01352fbbc583daa15d4f0:"
+        "e6b9b9d20a832ff5c3f7ca97218737a0b8650781:bc46a4657863fd39"
     ),
-    "executor_revision": "abf407d1bd6174674f4e8b2a231973bb40e05e98",
+    "executor_revision": "a4a6637bf6e37f5660a01352fbbc583daa15d4f0",
     "plan_payload_sha256": (
-        "e90d5bc1dfe25d5027401b4b1f4dda8987f21a6c6987fd506f9ca1ab797d8016"
+        "3a57a24ebe526963709d5a4273ac8deceb550f1686282387fe2e78fe9548c0d5"
     ),
     "plan_file_sha256": (
-        "efe0202c763bed871d23c7909922e3ed0ad3e1c8b35f6ce88e460eccfce610d6"
+        "6efb89b3afd8e4b9cb31f95575721b70ebd7c98420856e96b43730413bbe47b2"
     ),
     "submission_receipt_payload_sha256": (
-        "ae3d05f1c9a79756df8660b3ce790c76e9460b91b83dd480f4f9f14834c3e6dd"
+        "56b501b7b086e8262cda916661f89f548f84a9ccc51fbad3866548b12e95efe6"
     ),
     "submission_receipt_file_sha256": (
-        "d01c67b675ae81d1c80cfc2eba60d8f15c3e92d01d155aa70474d70b0a0e3f6b"
+        "01ebdcbd94e90b1674b0c4280ccf93227aca8b9003d0fbaf12bf602b01f0d344"
     ),
     "stdout_sha256": (
-        "f8b8dc9b2f5fcac059bcca67a7104b233c3ec8837ba6d39deb2f9959f42ffd6b"
+        "faebbd20c18e437f311b403789a8fc7b70c0228bc29176bf2c7b2d7f9a97aef5"
     ),
     "stderr_sha256": (
-        "5980b82d7e2cbbefec05c8952d475d0f0c77a424f13b675672fd674c187f989a"
+        "a63309174c77f4afb59814e2597c31ff8651631c20c476e7460802d8ffc7575c"
     ),
     "requested_node": "n109",
-    "allocation_id": 14638,
-    "slurm_job_id": "838099",
-    "failure_class": "missing_native_fan_design_variable_before_solver",
+    "allocation_id": 14639,
+    "slurm_job_id": "838192",
+    "failure_class": (
+        "native_icepak_solver_execution_error_with_process_scanner_false_negative"
+    ),
     "retry_kind": "infrastructure",
 }
 REMOTE_CWD = "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs"
@@ -587,7 +614,7 @@ def authenticate_checkpoint_manifest(path: Path) -> dict[str, Any]:
             )
     for field in ("slurm_job_id", "allocation_id"):
         _positive_int(source.get(field), f"source {field}")
-    if source.get("node") != FORBIDDEN_NODE:
+    if source.get("node") != SOURCE_NODE:
         raise CorrectedThermalError("checkpoint source node identity drifted")
     source_project_sha = _sha256(
         source.get("source_project_sha256"), "source project digest"
@@ -863,6 +890,29 @@ def _retention_contract(checkpoint: Mapping[str, Any], identity: str) -> dict:
     }
 
 
+def _symmetry_repair_contract(source_aedt_sha256: str) -> dict[str, Any]:
+    return {
+        "schema": SYMMETRY_REPAIR_SCHEMA,
+        "symmetry_mode": "eighth",
+        "scope": "nonmodel_wcp_mesh_refinement_envelopes_only",
+        "source_aedt_sha256": _sha256(
+            source_aedt_sha256, "symmetry repair source AEDT"
+        ),
+        "target_region_names": list(WCP_SYMMETRY_REGION_NAMES),
+        "direction_order": list(WCP_PADDING_DIRECTIONS),
+        "source_padding_values_mm": [2.0] * 6,
+        "repaired_padding_values_mm": [
+            0.0, 2.0, 2.0, 2.0, 2.0, 0.0
+        ],
+        "byte_patch_directions": ["+X", "-Z"],
+        "expected_byte_replacement_count": 8,
+        "source_checkpoint_mutation_allowed": False,
+        "physical_geometry_mutation_allowed": False,
+        "fixed_boundary_mutation_allowed": False,
+        "saved_premesh_reuse_after_repair_allowed": False,
+    }
+
+
 def _execution_contract(
     *,
     checkpoint: Mapping[str, Any],
@@ -901,6 +951,9 @@ def _execution_contract(
             dict(runtime_quota_authority)
         ),
         "output_storage": copy.deepcopy(dict(retention)),
+        "symmetry_mesh_region_repair": _symmetry_repair_contract(
+            checkpoint["source_project_sha256"]
+        ),
         "submission_contract_sha256": contract_digest,
         "task_name": task_name,
         "dedupe_key": dedupe_key,
@@ -940,6 +993,16 @@ def validate_execution_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         _mapping(plan.get("core_policy"), "execution core policy"),
         plan["executor_revision"],
     )
+    repair = _mapping(
+        plan.get("symmetry_mesh_region_repair"),
+        "execution symmetry mesh-region repair",
+    )
+    if repair != _symmetry_repair_contract(
+        repair.get("source_aedt_sha256")
+    ):
+        raise CorrectedThermalError(
+            "execution symmetry mesh-region repair drifted"
+        )
     retention = _mapping(plan.get("output_storage"), "output storage")
     if (
         retention.get("mode")
@@ -1100,8 +1163,6 @@ def _build_command(
             '--execution-plan "$scratch/execution-plan.json"'
         ),
         "solve_rc=$?",
-        "set -e",
-        'if [ "$solve_rc" -ne 0 ]; then exit "$solve_rc"; fi',
         (
             'python "$scratch/executor/'
             f'{SUBMISSION_ENTRYPOINT}" retain '
@@ -1109,6 +1170,14 @@ def _build_command(
             '--execution-root "$scratch/output" '
             '--execution-exit-code "$solve_rc"'
         ),
+        "retain_rc=$?",
+        "set -e",
+        (
+            'if [ "$retain_rc" -ne 0 ]; then '
+            'echo "CORRECTED_THERMAL_FAILURE_RETENTION_ERROR '
+            'solve_rc=$solve_rc retain_rc=$retain_rc" >&2; exit 86; fi'
+        ),
+        'if [ "$solve_rc" -ne 0 ]; then exit "$solve_rc"; fi',
         "exit 0",
     ]
     return "\n".join(lines)
@@ -2316,7 +2385,7 @@ def validate_infrastructure_retry_source(
         or value.get("account_name") != ACCOUNT
         or status != "failed"
         or isinstance(value.get("exit_code"), bool)
-        or value.get("exit_code") != 1
+        or value.get("exit_code") != 2
         or value.get("requested_node_name") != source["requested_node"]
         or value.get("actual_node_name") != source["requested_node"]
         or value.get("allocation_node_name") != source["requested_node"]
@@ -2325,12 +2394,16 @@ def validate_infrastructure_retry_source(
         or str(value.get("slurm_job_id") or "") != source["slurm_job_id"]
         or failure
         != (
-            "ansys.aedt.core.internal.errors.GrpcApiError: "
-            "Failed to execute gRPC AEDT command: GetVariableValue"
+            "CORRECTED_THERMAL_CONTINUATION_ERROR: ContinuationError: "
+            "standalone thermal parallel evidence failed"
         )
-        or "attest_native_fixed_model" not in stderr
-        or '"fan_velocity": _native_design_variable' not in stderr
-        or "Failed to execute gRPC AEDT command: GetVariableValue" not in stderr
+        or "refusing solver retry after exact native terminal evidence" not in stderr
+        or "Failed to run solver" not in stderr
+        or "Simulation completed with execution error on server: n109" not in stderr
+        or (
+            "standalone Icepak process attestation observed no Fluent -t command"
+            not in stderr
+        )
         or not isinstance(core_readback, Mapping)
         or any(
             core_readback.get(key) != expected
@@ -2339,13 +2412,13 @@ def validate_infrastructure_retry_source(
         or "CORRECTED_THERMAL_JSON " in stdout
     ):
         raise CorrectedThermalError(
-            "infrastructure retry source is not the exact pre-solver "
-            "missing native fan design-variable failure"
+            "infrastructure retry source is not the exact native Icepak "
+            "execution failure with process-scanner false negative"
         )
     return {
         "task_id": source["task_id"],
         "status": "failed",
-        "exit_code": 1,
+        "exit_code": 2,
         "failure_class": source["failure_class"],
         "node": source["requested_node"],
         "allocation_id": source["allocation_id"],
@@ -2920,6 +2993,151 @@ def _validate_retention_control_records(
     return optional
 
 
+def _retain_failure_forensics(
+    *,
+    contract: Mapping[str, Any],
+    execution_plan: Path,
+    execution_root: Path,
+    execution_exit_code: int,
+) -> dict[str, Any]:
+    """Publish a bounded, hash-inventoried failure bundle before scratch cleanup."""
+    if (
+        isinstance(execution_exit_code, bool)
+        or execution_exit_code <= 0
+        or execution_exit_code > 255
+    ):
+        raise CorrectedThermalError("failure forensic exit code is invalid")
+    retained_root = Path(contract["output_storage"]["retained_root"]).absolute()
+    retained_root.mkdir(mode=0o700, parents=False, exist_ok=True)
+    if retained_root.is_symlink() or not retained_root.is_dir():
+        raise CorrectedThermalError("failure forensic retained root is unsafe")
+    failure_root = retained_root / "failures"
+    failure_root.mkdir(mode=0o700, exist_ok=True)
+    if failure_root.is_symlink() or not failure_root.is_dir():
+        raise CorrectedThermalError("failure forensic root is unsafe")
+    job = str(os.environ.get("SLURM_JOB_ID", "noj")).strip()
+    task = str(os.environ.get("SLURM_SCHED_TASK_ID", "notask")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", job + task):
+        raise CorrectedThermalError("failure forensic Slurm identity is unsafe")
+    label = (
+        f"failure-{contract['checkpoint_manifest_sha256'][:12]}-"
+        f"{contract['executor_revision'][:12]}-j{job}-t{task}-"
+        f"{time.time_ns()}-{os.getpid()}"
+    )
+    destination = failure_root / label
+    destination.mkdir(mode=0o700, exist_ok=False)
+    incomplete = destination / ".incomplete"
+    incomplete.write_text("failure forensic publication incomplete\n", encoding="ascii")
+
+    candidates = [execution_plan.resolve(strict=True)]
+    for directory, dir_names, file_names in os.walk(
+        execution_root, followlinks=False
+    ):
+        base = Path(directory)
+        dir_names[:] = [
+            name for name in dir_names if not (base / name).is_symlink()
+        ]
+        for name in file_names:
+            path = base / name
+            if (
+                path.name == "corrected_thermal_diagnostic_receipt.json"
+                or path.suffix.casefold() in FAILURE_FORENSIC_SUFFIXES
+            ):
+                candidates.append(path)
+    candidates = sorted(set(candidates), key=lambda value: str(value))
+    rows: list[dict[str, Any]] = []
+    omitted: list[dict[str, Any]] = []
+    total = 0
+    for source in candidates:
+        metadata = source.lstat()
+        if source.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            omitted.append({"source": str(source), "reason": "not_regular"})
+            continue
+        size = int(metadata.st_size)
+        if (
+            size > FAILURE_FORENSIC_MAX_FILE_BYTES
+            or total + size > FAILURE_FORENSIC_MAX_TOTAL_BYTES
+            or len(rows) >= FAILURE_FORENSIC_MAX_FILES
+        ):
+            omitted.append(
+                {"source": str(source), "size_bytes": size, "reason": "bounded_cap"}
+            )
+            continue
+        if source == execution_plan.resolve(strict=True):
+            relative = "control/execution_plan.json"
+        else:
+            relative = (
+                "scratch/"
+                + source.resolve(strict=True).relative_to(execution_root).as_posix()
+            )
+        target = destination.joinpath(*PurePosixPath(relative).parts)
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        before = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+        shutil.copyfile(source, target)
+        after_metadata = source.lstat()
+        after = (
+            after_metadata.st_dev,
+            after_metadata.st_ino,
+            after_metadata.st_size,
+            after_metadata.st_mtime_ns,
+        )
+        source_sha = sha256_file(source)
+        target_sha = sha256_file(target)
+        if before != after or target.stat().st_size != size or target_sha != source_sha:
+            raise CorrectedThermalError("failure forensic source changed during copy")
+        rows.append({"path": relative, "size_bytes": size, "sha256": target_sha})
+        total += size
+    wrapper = {
+        "schema": "mft-corrected-thermal-failure-wrapper-receipt-v1",
+        "diagnostic_only": True,
+        "canonical": False,
+        "execution_exit_code": execution_exit_code,
+        "checkpoint_manifest_sha256": contract["checkpoint_manifest_sha256"],
+        "executor_revision": contract["executor_revision"],
+        "execution_plan_payload_sha256": contract["plan_payload_sha256"],
+        "slurm_job_id": job,
+        "slurm_scheduler_task_id": task,
+    }
+    wrapper_path = destination / "failure_wrapper_receipt.json"
+    _atomic_write_json(wrapper_path, wrapper)
+    rows.append(
+        {
+            "path": wrapper_path.name,
+            "size_bytes": wrapper_path.stat().st_size,
+            "sha256": sha256_file(wrapper_path),
+        }
+    )
+    manifest = sealed(
+        {
+            "schema": "mft-corrected-thermal-failure-forensics-v1",
+            "diagnostic_only": True,
+            "canonical": False,
+            "destination": str(destination),
+            "maximum_file_bytes": FAILURE_FORENSIC_MAX_FILE_BYTES,
+            "maximum_total_bytes": FAILURE_FORENSIC_MAX_TOTAL_BYTES,
+            "maximum_files": FAILURE_FORENSIC_MAX_FILES,
+            "retained_bytes": total + wrapper_path.stat().st_size,
+            "files": rows,
+            "omitted": omitted[:256],
+        },
+        digest_field="payload_sha256",
+    )
+    manifest_path = _atomic_write_json(destination / "manifest.json", manifest)
+    incomplete.unlink()
+    for directory, _dir_names, file_names in os.walk(destination, topdown=False):
+        for name in file_names:
+            os.chmod(Path(directory) / name, 0o400)
+        os.chmod(directory, 0o500)
+    return {
+        "schema": "mft-corrected-thermal-failure-retention-result-v1",
+        "destination": str(destination),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": sha256_file(manifest_path),
+        "execution_exit_code": execution_exit_code,
+        "passed": True,
+    }
+
+
 def retain_execution(
     *,
     execution_plan: Path,
@@ -2944,8 +3162,11 @@ def retain_execution(
     if str(source) != str(Path(storage["scratch_root"]).resolve(strict=True)):
         raise CorrectedThermalError("execution output differs from sealed scratch root")
     if execution_exit_code != 0:
-        raise CorrectedThermalError(
-            "failed corrected-thermal solve has no success retention marker"
+        return _retain_failure_forensics(
+            contract=contract,
+            execution_plan=execution_plan,
+            execution_root=source,
+            execution_exit_code=execution_exit_code,
         )
     retained_root = Path(storage["retained_root"]).resolve(strict=True)
     label = (

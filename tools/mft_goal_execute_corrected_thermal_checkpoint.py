@@ -3,10 +3,11 @@
 
 The input is the immutable static checkpoint produced by
 ``mft_goal_corrected_thermal_continuation.py``.  This consumer verifies every
-manifest-bound byte, clones the checkpoint to a unique writable directory, and
-attaches to the already-existing ``icepak_thermal/ThermalSetup``.  It does not
-build or edit Maxwell, geometry, materials, boundaries, setup controls, or
-mesh.  In particular, the saved premesh is consumed as-is.
+manifest-bound byte, clones the checkpoint to a unique writable directory,
+applies one plan-bound symmetry-envelope repair to the clone, and attaches to
+the already-existing ``icepak_thermal/ThermalSetup``.  It does not build or
+edit Maxwell, physical geometry, materials, boundaries, or setup controls.
+The source checkpoint and saved premesh remain immutable.
 
 The retained result is deliberately diagnostic-only.  Source solver
 provenance and continuation-executor provenance remain separate in the
@@ -44,6 +45,9 @@ EXECUTION_PLAN_SCHEMA = "mft-corrected-thermal-execution-plan-v1"
 RUNTIME_QUOTA_AUTHORITY_SCHEMA = (
     "mft-corrected-thermal-runtime-quota-authority-v1"
 )
+SYMMETRY_REPAIR_SCHEMA = (
+    "mft-corrected-thermal-eighth-wcp-padding-repair-v1"
+)
 SOURCE_SOLVER_REVISION = "a1e4f70cefa1af04673c73a6131bf490c0cc14b5"
 EXECUTOR_REQUIRED_ANCESTOR = "a927ef7ba7d4b5577e47a43377922dacd77b1993"
 PYAEDT_LIBRARY_REVISION = "e6b9b9d20a832ff5c3f7ca97218737a0b8650781"
@@ -78,6 +82,15 @@ MINIMUM_RETAINED_INODE_HEADROOM = 4096
 PHYSICAL_FREE_RESERVE_BYTES = 50 * 1024**3
 AT_FDCWD = -100
 RENAME_NOREPLACE = 1
+WCP_SYMMETRY_REGION_NAMES = (
+    "wcp_pad_mesh_region_1_in_p_SubRegion",
+    "wcp_pad_mesh_region_1_out_p_SubRegion",
+    "wcp_pad_mesh_region_2_in_p_SubRegion",
+    "wcp_pad_mesh_region_2_out_p_SubRegion",
+)
+WCP_PADDING_DIRECTIONS = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
+WCP_SOURCE_PADDING_VALUES_MM = (2.0, 2.0, 2.0, 2.0, 2.0, 2.0)
+WCP_REPAIRED_PADDING_VALUES_MM = (0.0, 2.0, 2.0, 2.0, 2.0, 0.0)
 
 
 class ContinuationError(RuntimeError):
@@ -978,6 +991,31 @@ def _authenticate_runtime_quota_authority(
     }
 
 
+def symmetry_repair_contract(source_aedt_sha256: str) -> dict[str, Any]:
+    """Return the only authorized cloned-AEDT symmetry-envelope mutation."""
+
+    return {
+        "schema": SYMMETRY_REPAIR_SCHEMA,
+        "symmetry_mode": "eighth",
+        "scope": "nonmodel_wcp_mesh_refinement_envelopes_only",
+        "source_aedt_sha256": _exact_hex(
+            source_aedt_sha256, 64, "symmetry repair source AEDT SHA-256"
+        ),
+        "target_region_names": list(WCP_SYMMETRY_REGION_NAMES),
+        "direction_order": list(WCP_PADDING_DIRECTIONS),
+        "source_padding_values_mm": list(WCP_SOURCE_PADDING_VALUES_MM),
+        "repaired_padding_values_mm": list(
+            WCP_REPAIRED_PADDING_VALUES_MM
+        ),
+        "byte_patch_directions": ["+X", "-Z"],
+        "expected_byte_replacement_count": 8,
+        "source_checkpoint_mutation_allowed": False,
+        "physical_geometry_mutation_allowed": False,
+        "fixed_boundary_mutation_allowed": False,
+        "saved_premesh_reuse_after_repair_allowed": False,
+    }
+
+
 def authenticate_execution_plan(
     plan_path: Path,
     checkpoint_authentication: Mapping[str, Any],
@@ -1108,6 +1146,26 @@ def authenticate_execution_plan(
         plan.get("runtime_quota_authority"),
         storage=storage_contract,
     )
+    aedt_rows = [
+        row
+        for row in checkpoint_authentication["files"]
+        if row["path"]
+        == checkpoint_authentication["aedt_relative_path"]
+    ]
+    if len(aedt_rows) != 1:
+        raise ContinuationError(
+            "authenticated checkpoint has no unique AEDT repair source"
+        )
+    repair_contract = _required_mapping(
+        plan.get("symmetry_mesh_region_repair"),
+        "execution plan symmetry mesh-region repair",
+        set(symmetry_repair_contract(aedt_rows[0]["sha256"])),
+    )
+    expected_repair = symmetry_repair_contract(aedt_rows[0]["sha256"])
+    if dict(repair_contract) != expected_repair:
+        raise ContinuationError(
+            "execution plan symmetry mesh-region repair drifted"
+        )
     return {
         "path": str(resolved),
         "sha256": sha256_file(resolved),
@@ -1119,6 +1177,7 @@ def authenticate_execution_plan(
         "core_policy": core_policy,
         "output_storage": storage_contract,
         "runtime_quota_authority": runtime_quota_authority,
+        "symmetry_mesh_region_repair": expected_repair,
         "plan_payload_sha256": payload_hash,
     }
 
@@ -1224,6 +1283,144 @@ def clone_checkpoint(
         if _lexists(partial):
             _quarantine_noreplace(partial, destination)
         raise
+
+
+def repair_cloned_aedt_symmetry_envelopes(
+    *,
+    authentication: Mapping[str, Any],
+    clone: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Patch exactly eight padding digits in the authenticated AEDT clone."""
+
+    expected = symmetry_repair_contract(
+        str(contract.get("source_aedt_sha256") or "")
+    )
+    if dict(contract) != expected:
+        raise ContinuationError("runtime symmetry repair contract drifted")
+    aedt = Path(clone["aedt_path"]).resolve(strict=True)
+    clone_root = Path(clone["clone_root"]).resolve(strict=True)
+    if clone_root not in aedt.parents:
+        raise ContinuationError("symmetry repair AEDT escaped clone root")
+    source_aedt = Path(authentication["root"]).joinpath(
+        *PurePosixPath(authentication["aedt_relative_path"]).parts
+    ).resolve(strict=True)
+    if (
+        sha256_file(source_aedt) != expected["source_aedt_sha256"]
+        or sha256_file(aedt) != expected["source_aedt_sha256"]
+    ):
+        raise ContinuationError(
+            "symmetry repair source or clone AEDT authentication failed"
+        )
+
+    original = aedt.read_bytes()
+    repaired = original
+    region_rows = []
+    for name in WCP_SYMMETRY_REGION_NAMES:
+        marker = f"Name='{name}'".encode("ascii")
+        if original.count(marker) != 1:
+            raise ContinuationError(
+                f"symmetry repair target count is not one: {name}"
+            )
+        marker_offset = original.index(marker)
+        start = original.rfind(b"$begin 'GeometryPart'", 0, marker_offset)
+        end_marker = b"$end 'GeometryPart'"
+        end = original.find(end_marker, marker_offset)
+        if start < 0 or end < 0:
+            raise ContinuationError(
+                f"symmetry repair target block is incomplete: {name}"
+            )
+        end += len(end_marker)
+        block = original[start:end]
+        if block.count(b"OperationType='SubRegion'") != 1:
+            raise ContinuationError(
+                f"symmetry repair target is not one SubRegion: {name}"
+            )
+        for direction in WCP_PADDING_DIRECTIONS:
+            padding_type = (
+                f"'{direction}PaddingType'='Absolute Offset'"
+            ).encode("ascii")
+            source_value = f"'{direction}Padding'='2mm'".encode("ascii")
+            if block.count(padding_type) != 1 or block.count(source_value) != 1:
+                raise ContinuationError(
+                    "symmetry repair source padding drifted: "
+                    f"{name} {direction}"
+                )
+
+        patched_block = block
+        for direction in ("+X", "-Z"):
+            before = f"'{direction}Padding'='2mm'".encode("ascii")
+            after = f"'{direction}Padding'='0mm'".encode("ascii")
+            patched_block = patched_block.replace(before, after, 1)
+        if len(patched_block) != len(block):
+            raise ContinuationError(
+                f"symmetry repair changed AEDT byte length: {name}"
+            )
+        repaired = repaired[:start] + patched_block + repaired[end:]
+        region_rows.append(
+            {
+                "name": name,
+                "source_padding_values_mm": list(
+                    WCP_SOURCE_PADDING_VALUES_MM
+                ),
+                "repaired_padding_values_mm": list(
+                    WCP_REPAIRED_PADDING_VALUES_MM
+                ),
+                "replacement_count": 2,
+            }
+        )
+
+    changed_offsets = [
+        index
+        for index, (before, after) in enumerate(zip(original, repaired))
+        if before != after
+    ]
+    if (
+        len(original) != len(repaired)
+        or len(changed_offsets)
+        != int(expected["expected_byte_replacement_count"])
+        or any(
+            original[index] != ord("2") or repaired[index] != ord("0")
+            for index in changed_offsets
+        )
+    ):
+        raise ContinuationError(
+            "symmetry repair was not the exact eight-byte 2-to-0 mutation"
+        )
+
+    temporary = aedt.with_name(f".{aedt.name}.repair.{os.getpid()}.tmp")
+    if _lexists(temporary):
+        raise ContinuationError("symmetry repair temporary path exists")
+    try:
+        with temporary.open("xb", buffering=0) as stream:
+            stream.write(repaired)
+            _fsync_and_protect_descriptor(
+                stream.fileno(), 0o600, protect=False
+            )
+        os.replace(temporary, aedt)
+        _fsync_directory(aedt.parent)
+    finally:
+        if _lexists(temporary):
+            temporary.unlink()
+    repaired_sha = sha256_file(aedt)
+    if repaired_sha == expected["source_aedt_sha256"]:
+        raise ContinuationError("symmetry repair did not change cloned AEDT")
+    if sha256_file(source_aedt) != expected["source_aedt_sha256"]:
+        raise ContinuationError(
+            "immutable source checkpoint changed during symmetry repair"
+        )
+    return {
+        "schema": SYMMETRY_REPAIR_SCHEMA,
+        "passed": True,
+        "source_checkpoint_unchanged": True,
+        "source_aedt_sha256": expected["source_aedt_sha256"],
+        "repaired_aedt_sha256": repaired_sha,
+        "aedt_size_bytes": len(repaired),
+        "changed_byte_count": len(changed_offsets),
+        "changed_byte_values": {"from_ascii": "2", "to_ascii": "0"},
+        "regions": region_rows,
+        "saved_premesh_reuse_after_repair_allowed": False,
+    }
 
 
 def admit_retained_output_storage(
@@ -1408,6 +1605,80 @@ def attest_saved_premesh(
     }
 
 
+def _grid_artifact_inventory(results_path: Path) -> dict[str, dict[str, Any]]:
+    root = results_path.resolve(strict=True)
+    rows: dict[str, dict[str, Any]] = {}
+    for path in sorted(root.rglob("*")):
+        if path.name not in {"grid_mapping", "grid_output"}:
+            continue
+        value = _regular_file(path, "Icepak grid artifact")
+        if int(value.st_size) <= 0:
+            raise ContinuationError(f"Icepak grid artifact is empty: {path}")
+        relative = path.relative_to(root).as_posix()
+        rows[relative] = {
+            "size_bytes": int(value.st_size),
+            "mtime_ns": int(value.st_mtime_ns),
+            "sha256": sha256_file(path),
+        }
+    if len(rows) < 2 or len(rows) > 128:
+        raise ContinuationError(
+            f"Icepak grid artifact inventory is unsafe: {len(rows)}"
+        )
+    return rows
+
+
+def generate_and_attest_repaired_mesh(
+    ipk: Any,
+    results_path: Path,
+) -> dict[str, Any]:
+    """Require one fresh native mesh after the symmetry-envelope mutation."""
+
+    before = _grid_artifact_inventory(results_path)
+    generator = getattr(getattr(ipk, "mesh", None), "generate_mesh", None)
+    if not callable(generator):
+        raise ContinuationError(
+            "native Icepak repaired-mesh generation API is unavailable"
+        )
+    started = time.monotonic()
+    returned = generator(THERMAL_SETUP)
+    elapsed = time.monotonic() - started
+    if returned is not True:
+        raise ContinuationError(
+            "native repaired-mesh generation did not return exact True"
+        )
+    after = _grid_artifact_inventory(results_path)
+    fresh = [
+        path for path, identity in after.items()
+        if before.get(path) != identity
+    ]
+    fresh_mapping = [
+        path for path in fresh if path.endswith("/grid_mapping")
+    ]
+    fresh_output = [
+        path for path in fresh if path.endswith("/grid_output")
+    ]
+    if not fresh_mapping or not fresh_output:
+        raise ContinuationError(
+            "native repaired mesh produced no fresh mapping/output pair"
+        )
+    return {
+        "schema": "mft-corrected-thermal-repaired-native-mesh-v1",
+        "passed": True,
+        "setup": THERMAL_SETUP,
+        "generate_mesh_returned_exact_true": True,
+        "elapsed_seconds": elapsed,
+        "before_artifact_count": len(before),
+        "after_artifact_count": len(after),
+        "fresh_artifact_count": len(fresh),
+        "fresh_grid_mapping_paths": fresh_mapping,
+        "fresh_grid_output_paths": fresh_output,
+        "fresh_artifacts": {
+            path: after[path] for path in fresh
+        },
+        "saved_premesh_reused": False,
+    }
+
+
 def snapshot_profiles(results_path: Path) -> dict[str, tuple[int, int, str]]:
     design_results = results_path / f"{THERMAL_DESIGN}.results"
     snapshot = {}
@@ -1488,6 +1759,117 @@ def _quantity(value: Any, expected_unit: str, label: str) -> float:
     if not math.isfinite(number):
         raise ContinuationError(f"native {label} is nonfinite")
     return number
+
+
+def attest_native_symmetry_envelope_repair(
+    ipk: Any,
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Force and verify the repaired SubRegion history in loaded AEDT."""
+
+    expected = symmetry_repair_contract(
+        str(contract.get("source_aedt_sha256") or "")
+    )
+    if dict(contract) != expected:
+        raise ContinuationError("native symmetry repair contract drifted")
+    objects = getattr(ipk.modeler, "objects_by_name", {})
+    rows = []
+    for name in WCP_SYMMETRY_REGION_NAMES:
+        region = objects.get(name)
+        if region is None:
+            raise ContinuationError(
+                f"native symmetry repair SubRegion is missing: {name}"
+            )
+        history = region.history()
+        if str(getattr(history, "command", "")).casefold() not in {
+            "createsubregion",
+            "create subregion",
+        }:
+            raise ContinuationError(
+                f"native symmetry repair history drifted: {name}"
+            )
+        properties = history.properties
+        readback_before = []
+        for direction, expected_value in zip(
+            WCP_PADDING_DIRECTIONS,
+            WCP_REPAIRED_PADDING_VALUES_MM,
+        ):
+            type_key = f"{direction} Padding Type"
+            data_key = f"{direction} Padding Data"
+            if str(properties.get(type_key, "")) != "Absolute Offset":
+                raise ContinuationError(
+                    f"native symmetry padding type drifted: {name} {direction}"
+                )
+            observed = _quantity(
+                properties.get(data_key),
+                "mm",
+                f"{name}.{data_key}",
+            )
+            if not math.isclose(
+                observed, expected_value, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ContinuationError(
+                    f"native symmetry padding value drifted: "
+                    f"{name} {direction}={observed}"
+                )
+            readback_before.append(observed)
+
+        # Reassert the two changed history properties through AEDT's native
+        # history API.  This regenerates the non-model SubRegion topology
+        # instead of trusting stale serialized OperationIdentity coordinates.
+        properties["+X Padding Data"] = "0mm"
+        properties["-Z Padding Data"] = "0mm"
+        readback_after = [
+            _quantity(
+                region.history().properties[
+                    f"{direction} Padding Data"
+                ],
+                "mm",
+                f"{name}.{direction} repaired padding",
+            )
+            for direction in WCP_PADDING_DIRECTIONS
+        ]
+        if any(
+            not math.isclose(
+                observed, expected_value, rel_tol=0.0, abs_tol=1e-12
+            )
+            for observed, expected_value in zip(
+                readback_after, WCP_REPAIRED_PADDING_VALUES_MM
+            )
+        ):
+            raise ContinuationError(
+                f"native symmetry padding repair was not retained: {name}"
+            )
+        bounds = [float(value) for value in region.bounding_box]
+        if (
+            len(bounds) != 6
+            or not all(math.isfinite(value) for value in bounds)
+            or bounds[3] > 1e-9
+            or bounds[2] < -1e-9
+        ):
+            raise ContinuationError(
+                f"native symmetry SubRegion crosses x=0 or z=0: "
+                f"{name} {bounds}"
+            )
+        rows.append(
+            {
+                "name": name,
+                "padding_values_mm": readback_after,
+                "bounds_mm": bounds,
+                "x_max_at_or_below_symmetry_plane": True,
+                "z_min_at_or_above_symmetry_plane": True,
+            }
+        )
+    return {
+        "schema": "mft-corrected-thermal-native-symmetry-readback-v1",
+        "passed": True,
+        "symmetry_mode": "eighth",
+        "region_count": len(rows),
+        "regions": rows,
+        "physical_geometry_unchanged": True,
+        "fixed_boundaries_unchanged": True,
+        "saved_premesh_invalidated_by_envelope_repair": True,
+    }
 
 
 def _native_boundary_inventory(ipk: Any) -> list[dict[str, Any]]:
@@ -2437,15 +2819,19 @@ def execute_checkpoint(
             "retained_on_success": True,
             "retained_on_failure": True,
         },
+        "authorized_clone_only_mutations": {
+            "nonmodel_wcp_symmetry_padding_value_edits": 8,
+            "fresh_native_mesh_generation": 1,
+            "source_checkpoint_mutations": 0,
+        },
         "forbidden_regeneration_calls": {
             "maxwell_analyze": 0,
             "maxwell_create_or_copy": 0,
-            "geometry_create_or_edit": 0,
+            "physical_geometry_create_or_edit": 0,
             "material_create_or_edit": 0,
             "boundary_create_or_edit": 0,
             "setup_create_or_edit": 0,
             "solution_cleanup": 0,
-            "mesh_generation": 0,
         },
         "started_epoch": started,
         "status": "starting",
@@ -2454,6 +2840,18 @@ def execute_checkpoint(
     sim = None
     failure_stage = "runtime_attach"
     try:
+        failure_stage = "saved_premesh_source_attestation"
+        receipt["saved_premesh_readback"] = attest_saved_premesh(
+            authentication, clone_root
+        )
+        failure_stage = "symmetry_mesh_region_byte_repair"
+        receipt["symmetry_mesh_region_byte_repair"] = (
+            repair_cloned_aedt_symmetry_envelopes(
+                authentication=authentication,
+                clone=clone,
+                contract=execution_plan["symmetry_mesh_region_repair"],
+            )
+        )
         os.environ["MFT_PYAEDT_LIBRARY_ROOT"] = str(
             library_root.resolve(strict=True)
         )
@@ -2526,19 +2924,74 @@ def execute_checkpoint(
         sim.design1 = thermal_wrapper
         sim.design_thermal = ipk
         sim.thermal_mesh_preflight = {
-            "schema": "mft-corrected-checkpoint-saved-premesh-v1",
+            "schema": (
+                "mft-corrected-checkpoint-symmetry-repaired-premesh-v1"
+            ),
+            "passed": False,
+            "status": "source_premesh_attested_but_invalidated",
+            "mesh_plan_sha256": authentication["source_provenance"][
+                "source_static_metadata_sha256"
+            ],
+            "mesh_artifact_readback_passed": False,
+            "mesh_mapping_coverage_passed": False,
+            "source_saved_premesh_attested": True,
+            "source_saved_premesh_reused": False,
+            "native_remesh_required": True,
+            "analysis_dispatched_after_premesh": False,
+        }
+        sim._remember_native_desktop_handle(desktop)
+        failure_stage = "native_symmetry_mesh_region_readback"
+        receipt["native_symmetry_mesh_region_readback"] = (
+            attest_native_symmetry_envelope_repair(
+                ipk,
+                execution_plan["symmetry_mesh_region_repair"],
+            )
+        )
+        failure_stage = "native_symmetry_mesh_generation"
+        sim.save_project()
+        receipt["symmetry_repaired_aedt"] = {
+            "path": str(aedt),
+            "sha256": sha256_file(aedt),
+            "source_checkpoint_unchanged": (
+                sha256_file(
+                    Path(authentication["root"]).joinpath(
+                        *PurePosixPath(
+                            authentication["aedt_relative_path"]
+                        ).parts
+                    )
+                )
+                == execution_plan["symmetry_mesh_region_repair"][
+                    "source_aedt_sha256"
+                ]
+            ),
+        }
+        if not receipt["symmetry_repaired_aedt"][
+            "source_checkpoint_unchanged"
+        ]:
+            raise ContinuationError(
+                "source checkpoint changed after native symmetry repair"
+            )
+        repaired_mesh = generate_and_attest_repaired_mesh(
+            ipk, Path(clone["results_path"])
+        )
+        receipt["repaired_mesh_preflight"] = repaired_mesh
+        sim.thermal_mesh_preflight = {
+            "schema": "mft-corrected-checkpoint-repaired-premesh-v1",
             "passed": True,
+            "status": "fresh_native_repaired_premesh",
             "mesh_plan_sha256": authentication["source_provenance"][
                 "source_static_metadata_sha256"
             ],
             "mesh_artifact_readback_passed": True,
             "mesh_mapping_coverage_passed": True,
+            "source_saved_premesh_attested": True,
+            "source_saved_premesh_reused": False,
+            "native_remesh_required": False,
+            "fresh_artifact_count": repaired_mesh[
+                "fresh_artifact_count"
+            ],
             "analysis_dispatched_after_premesh": False,
         }
-        sim._remember_native_desktop_handle(desktop)
-        receipt["saved_premesh_readback"] = attest_saved_premesh(
-            authentication, clone_root
-        )
 
         failure_stage = "native_fixed_readback"
         native_fixed = attest_native_fixed_model(native_design, ipk)
@@ -2549,17 +3002,22 @@ def execute_checkpoint(
         solve_started = time.monotonic()
         solve = _solve_exact_thermal_setup(sim, ipk, setup)
         solve_elapsed = time.monotonic() - solve_started
+        receipt["solve"] = {
+            **solve,
+            "elapsed_seconds": solve_elapsed,
+        }
+        receipt["parallel_evidence_raw"] = getattr(
+            sim, "thermal_parallel_evidence", None
+        )
         corrected_profile = fresh_corrected_profile(
             Path(clone["results_path"]), profile_snapshot
         )
         parallel = _attest_parallel_evidence(sim.thermal_parallel_evidence)
         receipt["parallel_attestation"] = parallel
-        receipt["solve"] = {
-            **solve,
-            "elapsed_seconds": solve_elapsed,
-            "corrected_profile_path": str(corrected_profile),
-            "corrected_profile_sha256": sha256_file(corrected_profile),
-        }
+        receipt["solve"]["corrected_profile_path"] = str(corrected_profile)
+        receipt["solve"]["corrected_profile_sha256"] = sha256_file(
+            corrected_profile
+        )
         convergence = solve["convergence"]
 
         failure_stage = "temperature_extraction"
