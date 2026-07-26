@@ -198,6 +198,7 @@ class Lane:
 
     task_id: int
     collection_root: Path
+    selection_effective: bool = True
 
 
 _FILE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
@@ -1558,6 +1559,7 @@ def _lane_state(lane: Lane) -> dict[str, Any]:
             )
         return {
             "task_id": lane.task_id,
+            "selection_effective": lane.selection_effective,
             "status": "collection_ready",
             "collection_receipt": str(receipt.resolve(strict=True)),
             "collection_seal": str(seal.resolve(strict=True)),
@@ -1570,11 +1572,13 @@ def _lane_state(lane: Lane) -> dict[str, Any]:
             )
         return {
             "task_id": lane.task_id,
+            "selection_effective": lane.selection_effective,
             "status": "terminal_failure",
             "failure_ledger": _file_record(failure),
         }
     return {
         "task_id": lane.task_id,
+        "selection_effective": lane.selection_effective,
         "status": "pending",
         "collection_root": str(root),
     }
@@ -1597,6 +1601,11 @@ def process_cycle(
         len(set(task_ids)) != len(task_ids)
         or len(set(roots)) != len(roots)
         or any(task_id <= 0 for task_id in task_ids)
+        or not any(lane.selection_effective for lane in lanes)
+        or any(
+            not isinstance(lane.selection_effective, bool)
+            for lane in lanes
+        )
     ):
         raise PostSuccessContractError(
             "post-success lane identities are duplicated or invalid"
@@ -1607,6 +1616,7 @@ def process_cycle(
     lane_states = [_lane_state(lane) for lane in lanes]
     observations = []
     collection_paths = []
+    lifecycle_observation_count = 0
     for lane, state in zip(lanes, lane_states, strict=True):
         if state["status"] != "collection_ready":
             continue
@@ -1622,22 +1632,44 @@ def process_cycle(
         state["measured_hard_constraints_passed"] = observation[
             "measured_hard_constraints_passed"
         ]
-        observations.append(observation)
-        collection_paths.append(collection_path)
+        lifecycle_observation_count += 1
+        if lane.selection_effective:
+            observations.append(observation)
+            collection_paths.append(collection_path)
+        else:
+            state["selection_exclusion_reason"] = (
+                "superseded_lifecycle_lane"
+            )
     snapshot = None
+    effective_lane_count = sum(
+        lane.selection_effective for lane in lanes
+    )
     if observations:
         snapshot = _build_snapshot(
             observations=observations,
             collection_paths=collection_paths,
             output_root=root,
-            expected_lane_count=len(lanes),
+            expected_lane_count=effective_lane_count,
             aggregate_manifest=aggregate_manifest,
             base_dataset=base_dataset,
             expected_base_sha256=expected_base_sha256,
             expected_base_rows=expected_base_rows,
         )
-    pending_count = sum(item["status"] == "pending" for item in lane_states)
+    effective_states = [
+        item
+        for item in lane_states
+        if item["selection_effective"] is True
+    ]
+    pending_count = sum(
+        item["status"] == "pending" for item in effective_states
+    )
     failure_count = sum(
+        item["status"] == "terminal_failure" for item in effective_states
+    )
+    lifecycle_pending_count = sum(
+        item["status"] == "pending" for item in lane_states
+    )
+    lifecycle_failure_count = sum(
         item["status"] == "terminal_failure" for item in lane_states
     )
     if not observations and pending_count:
@@ -1657,10 +1689,23 @@ def process_cycle(
             "scientific_pass_claimed": False,
             "production_claimed": False,
             "production_pareto_emitted": False,
-            "expected_lane_count": len(lanes),
+            "expected_lane_count": effective_lane_count,
+            "lifecycle_lane_count": len(lanes),
+            "effective_task_ids": [
+                lane.task_id for lane in lanes if lane.selection_effective
+            ],
+            "lifecycle_task_ids": task_ids,
+            "selection_superseded_task_ids": [
+                lane.task_id
+                for lane in lanes
+                if not lane.selection_effective
+            ],
             "collection_count": len(observations),
             "pending_count": pending_count,
             "terminal_failure_count": failure_count,
+            "lifecycle_collection_count": lifecycle_observation_count,
+            "lifecycle_pending_count": lifecycle_pending_count,
+            "lifecycle_terminal_failure_count": lifecycle_failure_count,
             "lanes": lane_states,
             "latest_snapshot": (
                 {
@@ -1714,6 +1759,11 @@ def run_watch(
         raise PostSuccessContractError("watch interval is invalid")
     root = output_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
+    effective_lanes = [lane for lane in lanes if lane.selection_effective]
+    if not effective_lanes:
+        raise PostSuccessContractError(
+            "at least one selection-effective lane is required"
+        )
     pid = _sealed(
         {
             "schema_version": PID_SCHEMA,
@@ -1721,6 +1771,14 @@ def run_watch(
             "pid": os.getpid(),
             "interval_seconds": interval_seconds,
             "task_ids": [lane.task_id for lane in lanes],
+            "effective_task_ids": [
+                lane.task_id for lane in effective_lanes
+            ],
+            "selection_superseded_task_ids": [
+                lane.task_id
+                for lane in lanes
+                if not lane.selection_effective
+            ],
             "scheduler_methods_used": [],
             "scheduler_mutation_performed": False,
         }
@@ -1746,13 +1804,31 @@ def run_watch(
                     "scientific_pass_claimed": False,
                     "production_claimed": False,
                     "production_pareto_emitted": False,
-                    "expected_lane_count": len(lanes),
+                    "expected_lane_count": len(effective_lanes),
+                    "lifecycle_lane_count": len(lanes),
+                    "effective_task_ids": [
+                        lane.task_id for lane in effective_lanes
+                    ],
+                    "lifecycle_task_ids": [
+                        lane.task_id for lane in lanes
+                    ],
+                    "selection_superseded_task_ids": [
+                        lane.task_id
+                        for lane in lanes
+                        if not lane.selection_effective
+                    ],
                     "collection_count": 0,
-                    "pending_count": len(lanes),
+                    "pending_count": len(effective_lanes),
                     "terminal_failure_count": 0,
+                    "lifecycle_collection_count": 0,
+                    "lifecycle_pending_count": len(lanes),
+                    "lifecycle_terminal_failure_count": 0,
                     "lanes": [
                         {
                             "task_id": lane.task_id,
+                            "selection_effective": (
+                                lane.selection_effective
+                            ),
                             "status": "authentication_error",
                             "collection_root": str(
                                 lane.collection_root.resolve()
@@ -1820,7 +1896,17 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         type=_parse_lane,
-        help="repeat TASK_ID=COLLECTION_ROOT",
+        help="repeat selection-effective TASK_ID=COLLECTION_ROOT",
+    )
+    parser.add_argument(
+        "--lifecycle-lane",
+        action="append",
+        default=[],
+        type=_parse_lane,
+        help=(
+            "repeat superseded TASK_ID=COLLECTION_ROOT; displayed and "
+            "authenticated but excluded from selection/NDS"
+        ),
     )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument(
@@ -1853,8 +1939,16 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    lifecycle_lanes = [
+        Lane(
+            task_id=lane.task_id,
+            collection_root=lane.collection_root,
+            selection_effective=False,
+        )
+        for lane in args.lifecycle_lane
+    ]
     kwargs = {
-        "lanes": args.lane,
+        "lanes": [*args.lane, *lifecycle_lanes],
         "output_root": args.output_root,
         "aggregate_manifest": args.aggregate_manifest,
         "base_dataset": args.base_dataset,

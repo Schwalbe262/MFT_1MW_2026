@@ -332,6 +332,115 @@ def test_successes_are_ranked_and_forwarded_without_production_claim(
     assert replay["latest_snapshot"]["snapshot_id"] == snapshot["snapshot_id"]
 
 
+def test_superseded_lifecycle_lane_is_authenticated_but_excluded_from_nds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_view, old_receipt, _old_seal = _fake_view(
+        tmp_path,
+        task_id=96332,
+        candidate="5" * 64,
+        result=_result(
+            width_mm=1000,
+            length_mm=900,
+            height_mm=700,
+            resonance_hz=16_000,
+            winding_c=90,
+            core_c=110,
+            loss_w=80,
+        ),
+    )
+    replacement_view, replacement_receipt, _replacement_seal = _fake_view(
+        tmp_path,
+        task_id=96338,
+        candidate="9" * 64,
+        result=_result(
+            width_mm=1050,
+            length_mm=900,
+            height_mm=700,
+            resonance_hz=16_000,
+            winding_c=90,
+            core_c=110,
+            loss_w=100,
+        ),
+    )
+    views = {
+        str(old_receipt): old_view,
+        str(replacement_receipt): replacement_view,
+    }
+    monkeypatch.setattr(
+        postsuccess,
+        "authenticate_collection",
+        lambda path: views[str(path.resolve(strict=True))],
+    )
+    monkeypatch.setattr(
+        postsuccess,
+        "authenticate_aggregate_reference",
+        lambda _path: _aggregate_reference(tmp_path),
+    )
+    monkeypatch.setattr(
+        postsuccess,
+        "_strict_readiness",
+        lambda paths, **_kwargs: (
+            {
+                "status": "rows_valid_admission_closed",
+                "retraining_admission": {
+                    "allowed": False,
+                    "reasons": ["strict_new_rows<8"],
+                },
+                "dataset_write_performed": False,
+                "surrogate_retraining_performed": False,
+            },
+            {96338: True},
+        ),
+    )
+
+    state = postsuccess.process_cycle(
+        lanes=[
+            postsuccess.Lane(
+                96332,
+                old_receipt.parent,
+                selection_effective=False,
+            ),
+            postsuccess.Lane(
+                96337,
+                tmp_path / "failed-retry-lifecycle",
+                selection_effective=False,
+            ),
+            postsuccess.Lane(96338, replacement_receipt.parent),
+        ],
+        output_root=tmp_path / "output",
+        aggregate_manifest=tmp_path / "unused-aggregate.json",
+        base_dataset=tmp_path / "unused.parquet",
+    )
+
+    assert state["expected_lane_count"] == 1
+    assert state["lifecycle_lane_count"] == 3
+    assert state["effective_task_ids"] == [96338]
+    assert state["selection_superseded_task_ids"] == [96332, 96337]
+    assert state["collection_count"] == 1
+    assert state["lifecycle_collection_count"] == 2
+    old_lane = next(
+        lane for lane in state["lanes"] if lane["task_id"] == 96332
+    )
+    assert old_lane["selection_effective"] is False
+    assert old_lane["selection_exclusion_reason"] == (
+        "superseded_lifecycle_lane"
+    )
+    snapshot_record = state["latest_snapshot"]["snapshot_manifest"]
+    snapshot = postsuccess._validate_seal(
+        postsuccess._read_json(
+            Path(snapshot_record["path"]), "snapshot"
+        ),
+        postsuccess.SNAPSHOT_SCHEMA,
+        "snapshot",
+    )
+    assert snapshot["expected_lane_count"] == 1
+    assert [
+        row["task_id"] for row in snapshot["ranked_rows"]
+    ] == [96338]
+
+
 def test_strict_al_dispatches_only_through_named_custom_adapter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

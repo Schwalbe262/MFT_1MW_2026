@@ -53,7 +53,7 @@ CAMPAIGN_ID = "mft-goal-20260726"
 DEFAULT_SOURCE_STATE = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\postdeadline_standard_postsuccess_96325_96327_96328_96330_"
-    r"96331_96332_96333_v5\state.json"
+    r"96331_96332_96333_96337_96338_v6\state.json"
 )
 DEFAULT_OUTPUT_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
@@ -63,7 +63,19 @@ DEFAULT_AGGREGATE_MANIFEST = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
     r"\aggregate_rolling512_d4e4d60\aggregate_manifest.json"
 )
-EXPECTED_TASK_IDS = (96325, 96327, 96328, 96330, 96331, 96332, 96333)
+EXPECTED_TASK_IDS = (96325, 96327, 96328, 96330, 96331, 96338, 96333)
+EXPECTED_LIFECYCLE_TASK_IDS = (
+    96325,
+    96327,
+    96328,
+    96330,
+    96331,
+    96332,
+    96333,
+    96337,
+    96338,
+)
+SELECTION_SUPERSEDED_TASK_IDS = (96332, 96337)
 ALLOWED_LANE_STATUSES = frozenset(
     ("pending", "collection_ready", "terminal_failure")
 )
@@ -307,6 +319,7 @@ def _load_effective_state(
     path: Path,
     *,
     expected_task_ids: Sequence[int] = EXPECTED_TASK_IDS,
+    expected_lifecycle_task_ids: Sequence[int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     raw, source_record = _read_json_snapshot(path)
     state = _validate_seal(
@@ -315,13 +328,36 @@ def _load_effective_state(
         label="effective post-success state",
     )
     expected = tuple(int(value) for value in expected_task_ids)
+    lifecycle_expected = tuple(
+        int(value)
+        for value in (
+            expected_lifecycle_task_ids
+            if expected_lifecycle_task_ids is not None
+            else (
+                EXPECTED_LIFECYCLE_TASK_IDS
+                if expected == EXPECTED_TASK_IDS
+                else expected
+            )
+        )
+    )
+    expected_set = set(expected)
+    lifecycle_set = set(lifecycle_expected)
+    superseded_set = lifecycle_set - expected_set
     lanes = state.get("lanes")
     if (
         not expected
         or len(set(expected)) != len(expected)
+        or not lifecycle_expected
+        or len(lifecycle_set) != len(lifecycle_expected)
+        or not expected_set.issubset(lifecycle_set)
         or not isinstance(lanes, list)
         or state.get("expected_lane_count") != len(expected)
-        or len(lanes) != len(expected)
+        or state.get("lifecycle_lane_count") != len(lifecycle_expected)
+        or len(lanes) != len(lifecycle_expected)
+        or set(state.get("effective_task_ids") or []) != expected_set
+        or set(state.get("lifecycle_task_ids") or []) != lifecycle_set
+        or set(state.get("selection_superseded_task_ids") or [])
+        != superseded_set
         or state.get("scheduler_mutation_performed") is not False
         or state.get("orchestrator_scheduler_methods_used") != []
     ):
@@ -339,10 +375,13 @@ def _load_effective_state(
                 "effective lane task identity is invalid"
             ) from exc
         status = raw_lane.get("status")
+        selection_effective = raw_lane.get("selection_effective")
+        expected_effective = task_id in expected_set
         if (
             task_id in by_task
-            or task_id not in expected
+            or task_id not in lifecycle_set
             or status not in ALLOWED_LANE_STATUSES
+            or selection_effective is not expected_effective
         ):
             raise SymmetricSelectionWatchError(
                 "effective lane identity/status drifted"
@@ -358,8 +397,21 @@ def _load_effective_state(
                 lane.get("failure_ledger"), task_id
             )
         by_task[task_id] = lane
-    ordered = [by_task[task_id] for task_id in expected]
+    ordered = [
+        by_task[task_id] for task_id in expected
+    ] + [
+        by_task[task_id]
+        for task_id in lifecycle_expected
+        if task_id not in expected_set
+    ]
+    effective_lanes = [
+        lane for lane in ordered if lane["selection_effective"] is True
+    ]
     counts = {
+        status: sum(lane["status"] == status for lane in effective_lanes)
+        for status in ALLOWED_LANE_STATUSES
+    }
+    lifecycle_counts = {
         status: sum(lane["status"] == status for lane in ordered)
         for status in ALLOWED_LANE_STATUSES
     }
@@ -368,6 +420,12 @@ def _load_effective_state(
         or counts["pending"] != state.get("pending_count")
         or counts["terminal_failure"]
         != state.get("terminal_failure_count")
+        or lifecycle_counts["collection_ready"]
+        != state.get("lifecycle_collection_count")
+        or lifecycle_counts["pending"]
+        != state.get("lifecycle_pending_count")
+        or lifecycle_counts["terminal_failure"]
+        != state.get("lifecycle_terminal_failure_count")
     ):
         raise SymmetricSelectionWatchError(
             "effective lane counts are inconsistent"
@@ -529,6 +587,7 @@ def _scientific_snapshot_id(
             {
                 "task_id": int(lane["task_id"]),
                 "status": lane["status"],
+                "selection_effective": lane["selection_effective"],
                 "observation_payload_sha256": (
                     observations[int(lane["task_id"])][
                         "payload_sha256"
@@ -724,11 +783,33 @@ def _strict_cycle(
     for lane in state["lanes"]:
         task_id = int(lane["task_id"])
         status = str(lane["status"])
+        selection_effective = lane["selection_effective"] is True
         summary: dict[str, Any] = {
             "task_id": task_id,
             "effective_status": status,
+            "selection_effective": selection_effective,
         }
-        if status == "collection_ready":
+        if not selection_effective:
+            summary.update(
+                {
+                    "selection_eligibility": (
+                        "superseded_lifecycle_only"
+                    ),
+                    "selection_exclusion_reason": (
+                        "explicit_effective_lane_replacement"
+                    ),
+                    "authenticated_for_selection": False,
+                    "included_in_exact_measured_nds": False,
+                    "observation": copy.deepcopy(
+                        lane.get("observation")
+                    ),
+                    "failure_ledger": copy.deepcopy(
+                        lane.get("failure_ledger")
+                    ),
+                    "full_model_continuation_allowed": False,
+                }
+            )
+        elif status == "collection_ready":
             path, observation = _authenticate_observation(
                 lane["observation"],
                 expected_task_id=task_id,
@@ -874,7 +955,16 @@ def _strict_cycle(
                 "payload_sha256"
             ],
             "expected_task_ids": list(expected_task_ids),
-            "effective_lane_count": len(state["lanes"]),
+            "lifecycle_task_ids": [
+                int(lane["task_id"]) for lane in state["lanes"]
+            ],
+            "selection_superseded_task_ids": [
+                int(lane["task_id"])
+                for lane in state["lanes"]
+                if lane["selection_effective"] is False
+            ],
+            "effective_lane_count": len(expected_task_ids),
+            "lifecycle_lane_count": len(state["lanes"]),
             "authenticated_observation_count": len(authenticated),
             "pending_count": len(pending),
             "terminal_failure_count": len(failed),

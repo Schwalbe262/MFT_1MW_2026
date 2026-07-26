@@ -12,11 +12,12 @@ from tools import mft_goal_local_trust_acquisition as acquisition
 
 
 TASK_IDS = watch.EXPECTED_TASK_IDS
+LIFECYCLE_TASK_IDS = watch.EXPECTED_LIFECYCLE_TASK_IDS
 LOCAL_SHA_BY_TASK = {
     96328: "6" * 64,
     96330: "1" * 64,
     96331: "c" * 64,
-    96332: "5" * 64,
+    96338: "5" * 64,
 }
 NONLOCAL_SHA_BY_TASK = {
     96325: "a" * 64,
@@ -84,9 +85,14 @@ def _source_state(
     observations: dict[int, dict[str, Any]],
 ) -> Path:
     lanes = []
-    for task_id in TASK_IDS:
+    for task_id in LIFECYCLE_TASK_IDS:
         status = statuses.get(task_id, "pending")
-        lane: dict[str, Any] = {"task_id": task_id, "status": status}
+        selection_effective = task_id in TASK_IDS
+        lane: dict[str, Any] = {
+            "task_id": task_id,
+            "selection_effective": selection_effective,
+            "status": status,
+        }
         if status == "collection_ready":
             observation_path = _write_json(
                 tmp_path / "observations" / f"task{task_id}.json",
@@ -111,7 +117,14 @@ def _source_state(
                 tmp_path / "pending" / str(task_id)
             )
         lanes.append(lane)
+    effective_lanes = [
+        item for item in lanes if item["selection_effective"]
+    ]
     counts = {
+        status: sum(item["status"] == status for item in effective_lanes)
+        for status in watch.ALLOWED_LANE_STATUSES
+    }
+    lifecycle_counts = {
         status: sum(item["status"] == status for item in lanes)
         for status in watch.ALLOWED_LANE_STATUSES
     }
@@ -119,9 +132,22 @@ def _source_state(
         {
             "schema_version": watch.SOURCE_STATE_SCHEMA,
             "expected_lane_count": len(TASK_IDS),
+            "lifecycle_lane_count": len(LIFECYCLE_TASK_IDS),
+            "effective_task_ids": list(TASK_IDS),
+            "lifecycle_task_ids": list(LIFECYCLE_TASK_IDS),
+            "selection_superseded_task_ids": list(
+                watch.SELECTION_SUPERSEDED_TASK_IDS
+            ),
             "collection_count": counts["collection_ready"],
             "pending_count": counts["pending"],
             "terminal_failure_count": counts["terminal_failure"],
+            "lifecycle_collection_count": lifecycle_counts[
+                "collection_ready"
+            ],
+            "lifecycle_pending_count": lifecycle_counts["pending"],
+            "lifecycle_terminal_failure_count": lifecycle_counts[
+                "terminal_failure"
+            ],
             "lanes": lanes,
             "scheduler_mutation_performed": False,
             "orchestrator_scheduler_methods_used": [],
@@ -328,6 +354,96 @@ def test_any_actual_pass_stops_immediately_and_uses_required_ranking(
     assert state["full_model_started_by_watcher"] is False
 
 
+def test_replacement_96338_is_selected_while_96332_and_96337_are_lifecycle_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = {
+        96332: _observation(
+            96332,
+            candidate_sha="2" * 64,
+            passed=True,
+            normalized_margin=0.50,
+            loss=100.0,
+        ),
+        96337: _observation(
+            96337,
+            candidate_sha="7" * 64,
+            passed=True,
+            normalized_margin=0.40,
+            loss=200.0,
+        ),
+        96338: _observation(
+            96338,
+            candidate_sha=LOCAL_SHA_BY_TASK[96338],
+            passed=True,
+            normalized_margin=0.01,
+            loss=5200.0,
+        ),
+    }
+    source = _source_state(
+        tmp_path,
+        {
+            96332: "collection_ready",
+            96337: "collection_ready",
+            96338: "collection_ready",
+        },
+        observations,
+    )
+    authenticated: list[int] = []
+
+    def authenticate_effective(
+        record: dict[str, Any],
+        *,
+        expected_task_id: int,
+    ) -> tuple[Path, dict[str, Any]]:
+        assert expected_task_id not in {96332, 96337}
+        authenticated.append(expected_task_id)
+        return (
+            watch._verify_file_record(record, "test observation"),
+            observations[expected_task_id],
+        )
+
+    monkeypatch.setattr(
+        watch, "_authenticate_observation", authenticate_effective
+    )
+    monkeypatch.setattr(
+        watch,
+        "_run_acquisition",
+        lambda **_kwargs: pytest.fail(
+            "replacement hard pass must stop without acquisition"
+        ),
+    )
+
+    state = watch.process_cycle(
+        source_state_path=source,
+        aggregate_manifest=tmp_path / "aggregate.json",
+        output_root=tmp_path / "output",
+    )
+
+    assert authenticated == [96338]
+    assert state["selected_symmetric_result"]["task_id"] == 96338
+    assert state["authenticated_observation_count"] == 1
+    assert state["exact_measured_nds"]["row_count"] == 1
+    assert state["effective_lane_count"] == 7
+    assert state["lifecycle_lane_count"] == 9
+    assert state["selection_superseded_task_ids"] == [96332, 96337]
+    lifecycle = {
+        lane["task_id"]: lane
+        for lane in state["lanes"]
+        if not lane["selection_effective"]
+    }
+    assert set(lifecycle) == {96332, 96337}
+    assert all(
+        lane["selection_eligibility"] == "superseded_lifecycle_only"
+        and lane["authenticated_for_selection"] is False
+        and lane["included_in_exact_measured_nds"] is False
+        for lane in lifecycle.values()
+    )
+    assert state["full_model_started_by_watcher"] is False
+    assert state["automatic_full_trigger"] is False
+
+
 def test_all_terminal_excludes_failure_and_caps_prepare_only_batch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -427,6 +543,35 @@ def test_tampered_source_state_publishes_sealed_fail_closed_heartbeat(
     assert heartbeat["state"]["payload_sha256"] == state["payload_sha256"]
     assert heartbeat["scheduler_methods_used"] == []
     assert heartbeat["automatic_full_trigger"] is False
+
+
+def test_effective_replacement_mapping_drift_fails_closed(
+    tmp_path: Path,
+) -> None:
+    source = _source_state(tmp_path, {}, {})
+    raw = json.loads(source.read_text("utf-8"))
+    raw.pop("payload_sha256")
+    for lane in raw["lanes"]:
+        if lane["task_id"] == 96337:
+            lane["selection_effective"] = True
+        elif lane["task_id"] == 96338:
+            lane["selection_effective"] = False
+    raw["effective_task_ids"] = [
+        96337 if task_id == 96338 else task_id
+        for task_id in raw["effective_task_ids"]
+    ]
+    raw["selection_superseded_task_ids"] = [96332, 96338]
+    _write_json(source, watch._seal(raw))
+
+    state = watch.process_cycle(
+        source_state_path=source,
+        aggregate_manifest=tmp_path / "aggregate.json",
+        output_root=tmp_path / "output",
+    )
+
+    assert state["status"] == "blocked_fail_closed"
+    assert "authority drifted" in state["fail_closed_error"]["message"]
+    assert state["automatic_full_trigger"] is False
 
 
 def test_exact_measured_nds_is_over_all_authenticated_observations(
