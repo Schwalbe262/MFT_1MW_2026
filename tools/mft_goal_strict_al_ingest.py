@@ -65,6 +65,12 @@ DIAGNOSTIC_COLLECTION_SCHEMA = (
 DIAGNOSTIC_AUTHENTICATED_COLLECTION_SCHEMA = (
     "mft-goal-diagnostic-standard-authenticated-collection-v1"
 )
+POSTDEADLINE_COLLECTION_SCHEMA = (
+    "mft-goal-postdeadline-standard-collection-v1"
+)
+POSTDEADLINE_AUTHENTICATED_COLLECTION_SCHEMA = (
+    "mft-goal-postdeadline-standard-authenticated-collection-v1"
+)
 GOAL_PROFILE_PATH = (
     REGRESSION_ROOT / "verify" / "profiles" / "goal_standard.json"
 )
@@ -364,6 +370,98 @@ def _authenticate_diagnostic_collection(path: Path) -> AuthenticatedTruth:
     )
 
 
+def _authenticate_postdeadline_collection(path: Path) -> AuthenticatedTruth:
+    """Adapt the custom post-deadline collector without accepting raw JSON."""
+
+    raw = _read_json(path)
+    if raw.get("schema_version") != POSTDEADLINE_COLLECTION_SCHEMA:
+        raise StrictALIngestError(
+            "post-deadline Standard collection schema mismatch"
+        )
+    try:
+        adapter = importlib.import_module(
+            "tools.mft_goal_postdeadline_standard_postsuccess"
+        )
+    except ImportError as exc:
+        raise StrictALIngestError(
+            "post-deadline Standard collection adapter is unavailable"
+        ) from exc
+    if getattr(adapter, "COLLECTION_SCHEMA", None) != (
+        POSTDEADLINE_COLLECTION_SCHEMA
+    ):
+        raise StrictALIngestError(
+            "post-deadline Standard adapter schema drifted"
+        )
+    authenticator = getattr(adapter, "authenticate_collection", None)
+    if not callable(authenticator):
+        raise StrictALIngestError(
+            "post-deadline Standard public authenticator is unavailable"
+        )
+    try:
+        view = authenticator(path)
+    except Exception as exc:
+        raise StrictALIngestError(
+            "post-deadline Standard collection authentication failed: "
+            f"{path}"
+        ) from exc
+    required_view_fields = {
+        "schema_version",
+        "collection",
+        "plan",
+        "params",
+        "selected",
+        "submission",
+    }
+    if (
+        not isinstance(view, Mapping)
+        or set(view) != required_view_fields
+        or view.get("schema_version")
+        != POSTDEADLINE_AUTHENTICATED_COLLECTION_SCHEMA
+    ):
+        raise StrictALIngestError(
+            "post-deadline authenticated collection view drifted"
+        )
+    collection = view.get("collection")
+    plan = view.get("plan")
+    selected = view.get("selected")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            collection,
+            plan,
+            view.get("params"),
+            selected,
+            view.get("submission"),
+        )
+    ):
+        raise StrictALIngestError(
+            "post-deadline authenticated collection objects are incomplete"
+        )
+    if (
+        collection.get("schema_version")
+        != POSTDEADLINE_AUTHENTICATED_COLLECTION_SCHEMA
+        or collection.get("diagnostic_only") is not True
+        or collection.get("search_only") is not True
+        or collection.get("canonical") is not False
+        or collection.get("production_eligible") is not False
+        or collection.get("original_deadline_missed") is not True
+        or collection.get("scheduler_get_only_collection") is not True
+        or collection.get("scheduler_mutation_performed") is not False
+        or collection.get("scientific_pass_claimed") is not False
+        or collection.get("production_claimed") is not False
+    ):
+        raise StrictALIngestError(
+            "post-deadline collection safety boundary drifted"
+        )
+    return _authenticated_truth(
+        "postdeadline_standard",
+        path,
+        collection=collection,
+        plan=plan,
+        selected=selected,
+    )
+
+
 def _authenticated_truth(
     adapter_kind: str,
     path: Path,
@@ -431,6 +529,8 @@ def authenticate_collection(path: Path) -> AuthenticatedTruth:
         return _authenticate_production_collection(resolved)
     if schema == DIAGNOSTIC_COLLECTION_SCHEMA:
         return _authenticate_diagnostic_collection(resolved)
+    if schema == POSTDEADLINE_COLLECTION_SCHEMA:
+        return _authenticate_postdeadline_collection(resolved)
     raise StrictALIngestError(
         "unsupported collection schema; raw JSON/CSV ingestion is forbidden: "
         f"{schema!r}"
