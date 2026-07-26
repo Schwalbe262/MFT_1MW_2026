@@ -1,0 +1,19 @@
+{
+  "automatic_retry_allowed": false,
+  "canonical": false,
+  "canonical_dataset_mutation_allowed": false,
+  "created_at_utc": "2026-07-26T09:08:43Z",
+  "dedupe_key": "mft-al:mft-goal-postdeadline-diagnostic-full-retry-t96307-v1:a1e4f70cefa1af04673c73a6131bf490c0cc14b5:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:62f2b846d05bbc58:postdeadline-v1",
+  "diagnostic_only": true,
+  "endpoint": "/api/tasks",
+  "maximum_post_attempts": 1,
+  "original_deadline_missed": true,
+  "plan_sha256": "3b39768fffea3e0c4527f588efd8702f347e9e0510d1196b813d97894d9d82df",
+  "post_attempt_consumed": true,
+  "post_deadline_retry": true,
+  "production": false,
+  "production_truth_eligible": false,
+  "repairs_original_deadline": false,
+  "schema_version": "mft-single-post-attempt-ledger-v1",
+  "task_name": "mft-goal-postdeadline-diagnostic-full-retry-t96307-v1"
+}

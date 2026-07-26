@@ -1,0 +1,217 @@
+{
+  "classification": {
+    "canonical": false,
+    "canonical_dataset_mutation_allowed": false,
+    "diagnostic_only": true,
+    "original_deadline_missed": true,
+    "post_deadline_retry": true,
+    "production": false,
+    "production_truth_eligible": false,
+    "repairs_original_deadline": false
+  },
+  "command_reuse": {
+    "full_solver_argv_preserved_byte_exact": true,
+    "non_allowlisted_bytes_preserved": true,
+    "physics_candidate": {
+      "byte_exact_unchanged": true,
+      "sha256": "62f2b846d05bbc5880165c6086fe9897e04d0588b0b8767fceb35102e4be9a44",
+      "size_bytes": 1532
+    },
+    "source_command_sha256": "87f34b089a2c3745e313a429dc885ba0c34e8f72fb0e87228a2a2997411bb1c1",
+    "source_command_size_bytes": 9909,
+    "substitution_allowlist": [
+      {
+        "name": "workdir_slug",
+        "new_sha256": "a139718e82d41e8c83fc182cbb3ddf8c287c35dcf1e4c06f6b4e04454fc6f418",
+        "new_size_bytes": 130,
+        "new_text": "mft_campaign-mft_goal_postdeadline_diagnostic_full_retry_t96307_v1-sa1e4f70cefa1-le6b9b9d20a83-p62f2b846d05bbc58-t7a7da2ab5daeb028",
+        "occurrences": 2,
+        "old_sha256": "fec9936bcbd91b655a92d59266260821006c608e68af218df89495cf8a84ba47",
+        "old_size_bytes": 125,
+        "old_text": "mft_campaign-mft_goal_provisional_full_l96230_b7c30cb70b95_v1-sa1e4f70cefa1-le6b9b9d20a83-p62f2b846d05bbc58-t03b90b61fa5f4e8a",
+        "reason": "isolate the retry work directory from source task 96307",
+        "sequence": 1
+      },
+      {
+        "name": "retention_dedupe_key",
+        "new_sha256": "a8f8ce4c859aab32cf7c6a49582bcc698f55a3ff0ded95a55f9cfaec5c3d5878",
+        "new_size_bytes": 175,
+        "new_text": "mft-al:mft-goal-postdeadline-diagnostic-full-retry-t96307-v1:a1e4f70cefa1af04673c73a6131bf490c0cc14b5:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:62f2b846d05bbc58:postdeadline-v1",
+        "occurrences": 2,
+        "old_sha256": "03b90b61fa5f4e8ad822479b494c369f5408690c7a57000bc73492c5e4d84562",
+        "old_size_bytes": 154,
+        "old_text": "mft-al:mft-goal-provisional-full-l96230-b7c30cb70b95-v1:a1e4f70cefa1af04673c73a6131bf490c0cc14b5:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:62f2b846d05bbc58",
+        "reason": "bind both retention contracts to the new diagnostic task",
+        "sequence": 2
+      },
+      {
+        "name": "retained_path_token",
+        "new_sha256": "0ccf8add62714a01aeee707ee557989b22d25150528ec37e627d0b05fc0eebde",
+        "new_size_bytes": 58,
+        "new_text": "postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028",
+        "occurrences": 7,
+        "old_sha256": "2435a66ca9d656d2dad7f8a0feeac2df299d8d089cfa70bb08c36f114ba99e4c",
+        "old_size_bytes": 16,
+        "old_text": "03b90b61fa5f4e8a",
+        "reason": "write success artifacts under a new non-canonical path",
+        "sequence": 3
+      },
+      {
+        "name": "retention_marker_contract_sha256",
+        "new_sha256": "a4c2749777ec08b6e51870858506ab9b35a00026070cd49c2d8c9071458f2a90",
+        "new_size_bytes": 64,
+        "new_text": "274fcc865868d5f61a1bf195b36abcb1e95964ee11575e4f43eb4ba45b0233b8",
+        "occurrences": 1,
+        "old_sha256": "5be1cafc55eef03f927a655db2971af1003f3e5fe71bc80646c024c55d97b3ef",
+        "old_size_bytes": 64,
+        "old_text": "8fb549b74eb3b0795084754c8300911aea921cc23443f0906e46fe77177d4d7d",
+        "reason": "update the hash implied solely by the new retention dedupe key",
+        "sequence": 4
+      },
+      {
+        "name": "solver_walltime_guard_prefix",
+        "new_sha256": "007fa683b567791cf2c3a783af3d791212f7bb51c8f295dfb750ddb0052cac24",
+        "new_size_bytes": 133,
+        "new_text": "timeout --signal=TERM --kill-after=300s 79200s python run_simulation_260706.py --fixed --thermal --headless --full --params cand.json",
+        "occurrences": 1,
+        "old_sha256": "7c607be09509306d7211c823b36dc35e25bc0ce606b275d72fd233b2f8b05dc8",
+        "old_size_bytes": 86,
+        "old_text": "python run_simulation_260706.py --fixed --thermal --headless --full --params cand.json",
+        "reason": "cap the solver inside the 24h Scheduler timeout and leave success-path AEDT preservation time",
+        "sequence": 5
+      }
+    ],
+    "substitution_allowlist_sha256": "01acb97462e9b70b28ba02a01f623e5c5b53ed6e845d2d4f0801ce845f6e551f",
+    "transformed_command_sha256": "979da42b7df65a1804892a783ed9756383863ea258cdda2cd1db20dfae792652",
+    "transformed_command_size_bytes": 10302
+  },
+  "created_at_utc": "2026-07-26T09:04:15Z",
+  "execution_budget": {
+    "nominal_post_solver_window_seconds": 7200,
+    "planned_minimum_success_retention_window_seconds": 3600,
+    "planned_pre_solver_overhead_allowance_seconds": 3600,
+    "retention_runs_only_after_solver_success": true,
+    "scheduler_timeout_seconds": 86400,
+    "solver_timeout_kill_grace_seconds": 300,
+    "solver_timeout_seconds": 79200
+  },
+  "original_deadline": {
+    "kst": "2026-07-26T18:00:00+09:00",
+    "missed": true,
+    "status": "missed_and_not_repairable_by_this_retry",
+    "utc": "2026-07-26T09:00:00Z"
+  },
+  "payload": {
+    "account_name": "dhj02",
+    "aedt_backend": "standalone",
+    "cleanup_globs": "mft_campaign-mft_goal_postdeadline_diagnostic_full_retry_t96307_v1-sa1e4f70cefa1-le6b9b9d20a83-p62f2b846d05bbc58-t7a7da2ab5daeb028",
+    "command": "source /etc/profile.d/lmod.sh 2>/dev/null || true; module load ansys-electronics/v252 || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64; export FLEXLM_TIMEOUT=3000000; export I_MPI_HYDRA_BOOTSTRAP=fork; export FLUENT_MPIRUN_FLAGS='-bootstrap fork'; sleep $((RANDOM % 300)); ( MFT_TASK_ROOT=$PWD; MFT_GPFS_ROOT=$PWD; MFT_GPFS_WORKDIR=\"$MFT_GPFS_ROOT/mft_campaign-mft_goal_postdeadline_diagnostic_full_retry_t96307_v1-sa1e4f70cefa1-le6b9b9d20a83-p62f2b846d05bbc58-t7a7da2ab5daeb028\"; MFT_NVME_WORKDIR=/enroot/mft_campaign-mft_goal_postdeadline_diagnostic_full_retry_t96307_v1-sa1e4f70cefa1-le6b9b9d20a83-p62f2b846d05bbc58-t7a7da2ab5daeb028; find \"$MFT_GPFS_ROOT\" -mindepth 1 -maxdepth 1 -type d -user \"$USER\" -name 'mft_campaign-*-t????????????????' -mmin +480 -exec rm -rf -- {} + 2>/dev/null || true; MFT_ENROOT_FREE_KB=$(df -Pk /enroot 2>/dev/null | awk 'NR==2 {print $4}'); if [ \"$(findmnt -n -o FSTYPE -T /enroot 2>/dev/null)\" = xfs ] && [ \"${MFT_ENROOT_FREE_KB:-0}\" -ge 209715200 ]; then MFT_WORKDIR=$MFT_NVME_WORKDIR; find /enroot -mindepth 1 -maxdepth 1 -type d -user \"$USER\" -name 'mft_*' -mmin +480 -exec rm -rf -- {} + 2>/dev/null || true; else MFT_WORKDIR=$MFT_GPFS_WORKDIR; fi; printf 'MFT_WORKDIR %s\\n' \"$MFT_WORKDIR\"; case \"$MFT_WORKDIR\" in /enroot/*) ;; *) printf 'MFT_WORKDIR_ASSERTION_FAILED %s\\n' \"$MFT_WORKDIR\" >&2; exit 86;; esac; export ANS_TEMP_PATH=\"$MFT_WORKDIR\"; export MFT_STANDALONE_CORE_CONTRACT=\"mft-standalone-core-16-optin-v1\"; export MFT_STANDALONE_CORE_COUNT=\"16\"; export MFT_STANDALONE_CORE_RUNTIME_LICENSE_REFRESH=\"1\"; export TEMP=\"$MFT_WORKDIR\"; export TMP=\"$MFT_WORKDIR\"; export TMPDIR=\"$MFT_WORKDIR\"; cleanup() { rm -rf -- \"${MFT_NVME_WORKDIR}\" \"${MFT_GPFS_WORKDIR}\" 2>/dev/null; }; trap cleanup EXIT; trap 'exit 143' TERM INT; mkdir -p \"${MFT_WORKDIR}\" && ([ -d \"${MFT_WORKDIR}/pyaedt_library\"/.git ] || { [ ! -e \"${MFT_WORKDIR}/pyaedt_library\" ] && git clone -q --depth 1 https://github.com/Schwalbe262/pyaedt_library.git \"${MFT_WORKDIR}/pyaedt_library\".tmp.$$ && { mv -T \"${MFT_WORKDIR}/pyaedt_library\".tmp.$$ \"${MFT_WORKDIR}/pyaedt_library\" 2>/dev/null || rm -rf \"${MFT_WORKDIR}/pyaedt_library\".tmp.$$; }; }) && git -C \"${MFT_WORKDIR}/pyaedt_library\" fetch -q origin e6b9b9d20a832ff5c3f7ca97218737a0b8650781 && git -C \"${MFT_WORKDIR}/pyaedt_library\" checkout -q --detach e6b9b9d20a832ff5c3f7ca97218737a0b8650781 && git -C \"${MFT_WORKDIR}/pyaedt_library\" diff --quiet HEAD -- && git -C \"${MFT_WORKDIR}/pyaedt_library\" clean -q -ffd && git -C \"${MFT_WORKDIR}/pyaedt_library\" clean -q -ffdX && test -z \"$(git -C \"${MFT_WORKDIR}/pyaedt_library\" status --porcelain --untracked-files=all)\" && test \"$(git -C \"${MFT_WORKDIR}/pyaedt_library\" rev-parse HEAD)\" = \"e6b9b9d20a832ff5c3f7ca97218737a0b8650781\" && [ -d \"${MFT_WORKDIR}/pyaedt_library\"/src ] && printf 'MFT_LIBRARY_GIT_HASH e6b9b9d20a832ff5c3f7ca97218737a0b8650781\\n' && ([ -d \"${MFT_WORKDIR}/repo\"/.git ] || git clone -q --depth 1 https://github.com/Schwalbe262/MFT_1MW_2026.git \"${MFT_WORKDIR}/repo\") && cd \"${MFT_WORKDIR}/repo\" && git fetch -q origin a1e4f70cefa1af04673c73a6131bf490c0cc14b5 && git checkout -q --detach a1e4f70cefa1af04673c73a6131bf490c0cc14b5 && git diff --quiet HEAD -- && git clean -q -ffd && git clean -q -ffdX && test -z \"$(git status --porcelain --untracked-files=all)\" && test \"$(git rev-parse HEAD)\" = \"a1e4f70cefa1af04673c73a6131bf490c0cc14b5\" && python tools/mft_runtime_license_snapshot.py --output-dir \"$MFT_WORKDIR/.goal-license-runtime\" --solver-revision a1e4f70cefa1af04673c73a6131bf490c0cc14b5 && export MFT_STANDALONE_CORE_LICENSE_CONTRACT=mft-aedt-hpc-license-snapshot-v1 && export MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_JSON=\"$(cat \"$MFT_WORKDIR/.goal-license-runtime\"/snapshot.json)\" && export MFT_STANDALONE_CORE_LICENSE_SNAPSHOT_SHA256=\"$(cat \"$MFT_WORKDIR/.goal-license-runtime\"/snapshot.sha256)\" && export MFT_STANDALONE_CORE_AUTH_SHA256=\"$(cat \"$MFT_WORKDIR/.goal-license-runtime\"/auth.sha256)\" && printf '%s' '{\"I1_rated\":1000.0,\"I2_phase_deg\":0.0,\"I2_rated\":100.0,\"N1_main\":6,\"N1_side\":0,\"N2_main\":37,\"N2_side\":23,\"P_target\":1000000.0,\"V1_rms\":1000.0,\"V2_rms\":10000.0,\"air_temp\":50.0,\"cap_max_passes\":10,\"cap_on\":1,\"cap_percent_error\":1.0,\"cc_w2c_space_x\":40.0,\"cc_w2c_space_y\":44.0,\"conductor_temp_C\":80.0,\"core_cm\":1.377,\"core_depth_max\":120.0,\"core_depth_min\":60.0,\"core_k_alloy\":9.0,\"core_k_anisotropic\":1,\"core_k_interlayer\":0.2,\"core_k_thermal\":2.0,\"core_lamination_factor\":0.85,\"core_loss_margin\":1.15,\"core_plate_on\":1,\"core_plate_pad_t\":2.0,\"core_plate_t\":10.0,\"core_x\":1.51,\"core_y\":1.74,\"corner_radius\":10.0,\"corner_segments\":4,\"cs_w1s_space_y\":48.8,\"cw1\":1.77,\"cw2\":1.155,\"fan_config\":\"dual\",\"fan_velocity\":1.5,\"freq\":1000.0,\"full_model\":1,\"gap1\":4.9,\"gap2\":1.596,\"h1\":564,\"k_ins\":0.2,\"keep_project\":1,\"l1\":67,\"l2\":357.5,\"loss_from_copy\":1,\"loss_on\":1,\"loss_sym_on\":0,\"matrix_max_passes\":24,\"matrix_min_converged\":2,\"matrix_on\":1,\"matrix_percent_error\":0.5,\"matrix_skin_mesh\":1,\"max_passes\":18,\"min_converged\":2,\"n_core_group\":5,\"n_explicit_turns\":2,\"nwh1\":522.7,\"nwh2\":282.7,\"percent_error\":0.5,\"physics_data_revision\":\"mft1mw-1k101-native-lamination-kf0p85-v3\",\"plate_temp\":50.0,\"round_corner\":0,\"rx_mesh_mode\":\"skin\",\"thermal_max_iterations\":250,\"thermal_on\":1,\"thermal_rx_side_block_mesh_level\":5,\"thermal_symmetry\":\"full\",\"w1\":479,\"w1c_w2s_space_x\":32.4,\"w1s_cs_space_x\":40.0,\"w1s_w2s_space_y\":0.0,\"w2c_w1c_space_x\":40.0,\"w2c_w1c_space_y\":40.0,\"w2s_w1s_space_x\":0.0,\"wcp_len_x\":190.3,\"wcp_on\":1,\"wcp_pad_t\":2.0,\"wcp_t\":14.2}' > cand.json && timeout --signal=TERM --kill-after=300s 79200s python run_simulation_260706.py --fixed --thermal --headless --full --params cand.json; simulation_rc=$?; printf 'MFT_LIBRARY_GIT_HASH e6b9b9d20a832ff5c3f7ca97218737a0b8650781\\n'; if [ \"$simulation_rc\" -eq 0 ]; then mapfile -d '' MFT_RETAINED_PROJECTS < <(find \"$MFT_WORKDIR\" -type f -name '*.aedt' -print0); [ \"${#MFT_RETAINED_PROJECTS[@]}\" -eq 1 ] || { printf 'retained AEDT project count mismatch: %s\\n' \"${#MFT_RETAINED_PROJECTS[@]}\" >&2; exit 91; }; python -c 'import base64,datetime,hashlib,json,os,pathlib,sys;src=pathlib.Path(sys.argv[1]);dst=pathlib.Path(sys.argv[2]);receipt=pathlib.Path(sys.argv[3]);marker=pathlib.Path(sys.argv[4]);chunk_dir=pathlib.Path(sys.argv[5]);marker_payload=json.loads(sys.argv[6]);marker_payload['\"'\"'created_at'\"'\"']=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='\"'\"'seconds'\"'\"').replace('\"'\"'+00:00'\"'\"','\"'\"'Z'\"'\"');marker_data=(json.dumps(marker_payload,sort_keys=True,separators=('\"'\"','\"'\"','\"'\"':'\"'\"'))+'\"'\"'\\n'\"'\"').encode('\"'\"'utf-8'\"'\"');context=json.loads(sys.argv[7]);source_size=src.stat().st_size;\nif not 0<source_size<=17179869184: raise RuntimeError('\"'\"'retained AEDT size is outside transport bounds'\"'\"')\ndst.parent.parent.mkdir(parents=True,exist_ok=True);dst.parent.mkdir(exist_ok=False);chunk_dir.mkdir(exist_ok=False);tmp=dst.with_name('\"'\"'.'\"'\"'+dst.name+'\"'\"'.tmp'\"'\"');h=hashlib.sha256();size=0;chunk_count=0;rf=src.open('\"'\"'rb'\"'\"');wf=tmp.open('\"'\"'xb'\"'\"');\nwhile True:\n chunk=rf.read(768000)\n if not chunk: break\n wf.write(chunk);h.update(chunk);size+=len(chunk)\n encoded=base64.b64encode(chunk)\n if len(encoded)>1024000: raise RuntimeError('\"'\"'encoded AEDT chunk exceeds transport limit'\"'\"')\n cp=chunk_dir/('\"'\"'%08d.b64'\"'\"'%chunk_count);cp.write_bytes(encoded);os.chmod(cp,0o444);chunk_count+=1\nwf.flush();os.fsync(wf.fileno());wf.close();rf.close();os.replace(tmp,dst);marker.write_bytes(marker_data);context.update({'\"'\"'artifact_sha256'\"'\"':h.hexdigest(),'\"'\"'artifact_size_bytes'\"'\"':size,'\"'\"'transport_chunk_count'\"'\"':chunk_count,'\"'\"'marker_sha256'\"'\"':hashlib.sha256(marker_data).hexdigest(),'\"'\"'source_project_filename'\"'\"':src.name,'\"'\"'source_project_name'\"'\"':src.stem});receipt.write_text(json.dumps(context,sort_keys=True,separators=('\"'\"','\"'\"','\"'\"':'\"'\"'))+'\"'\"'\\n'\"'\"',encoding='\"'\"'utf-8'\"'\"');os.chmod(dst,0o444);os.chmod(marker,0o444);os.chmod(receipt,0o444);os.chmod(chunk_dir,0o555);os.chmod(dst.parent,0o555)' \"${MFT_RETAINED_PROJECTS[0]}\" \"$MFT_TASK_ROOT/goal-fea-retained/postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028/full.aedt\" \"$MFT_TASK_ROOT/goal-fea-retained/postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028/full.aedt.receipt.json\" \"$MFT_TASK_ROOT/goal-fea-retained/postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028/.slurm-scheduler-preserve.json\" \"$MFT_TASK_ROOT/goal-fea-retained/postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028/full.aedt.chunks\" '{\"owner\":\"MFT_1MW_2026v1\",\"preserve\":true,\"reason\":\"Retain goal FEA AEDT until authenticated package collection; stage=full; dedupe_key=mft-al:mft-goal-postdeadline-diagnostic-full-retry-t96307-v1:a1e4f70cefa1af04673c73a6131bf490c0cc14b5:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:62f2b846d05bbc58:postdeadline-v1\",\"schema\":\"slurm-scheduler-prune-protection-v1\"}' '{\"artifact_path\":\"goal-fea-retained/postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028/full.aedt\",\"dedupe_key\":\"mft-al:mft-goal-postdeadline-diagnostic-full-retry-t96307-v1:a1e4f70cefa1af04673c73a6131bf490c0cc14b5:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:62f2b846d05bbc58:postdeadline-v1\",\"library_revision\":\"e6b9b9d20a832ff5c3f7ca97218737a0b8650781\",\"marker_contract_sha256\":\"274fcc865868d5f61a1bf195b36abcb1e95964ee11575e4f43eb4ba45b0233b8\",\"marker_path\":\"goal-fea-retained/postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028/.slurm-scheduler-preserve.json\",\"parameter_digest\":\"62f2b846d05bbc58\",\"profile_sha256\":\"975dcfff5ae5ffeea973cf0d7f4892e7809779e4f986c5a7b2a16deb8b682769\",\"prune_protection_required\":true,\"retention_required\":true,\"scheduler_cleanup_exclusion_required\":true,\"schema_version\":\"mft-goal-fea-remote-artifact-receipt-v1\",\"solver_revision\":\"a1e4f70cefa1af04673c73a6131bf490c0cc14b5\",\"source_size_hard_cap_bytes\":17179869184,\"source_size_hard_cap_contract\":\"pre-gpfs-destination-create-v1\",\"source_size_hard_cap_enforced_before_destination_create\":true,\"stage\":\"full\",\"transport_chunk_directory\":\"goal-fea-retained/postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028/full.aedt.chunks\",\"transport_encoding\":\"base64\",\"transport_max_encoded_chunk_bytes\":1024000,\"transport_raw_chunk_bytes\":768000,\"transport_schema_version\":\"mft-goal-fea-base64-chunks-v1\"}' || exit $?; else exit \"$simulation_rc\"; fi; exit $simulation_rc )",
+    "cpus": 16,
+    "dedupe_key": "mft-al:mft-goal-postdeadline-diagnostic-full-retry-t96307-v1:a1e4f70cefa1af04673c73a6131bf490c0cc14b5:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:62f2b846d05bbc58:postdeadline-v1",
+    "entrypoint": "",
+    "env_profile": "pyaedt2026v1",
+    "env_setup": "source /etc/profile.d/lmod.sh 2>/dev/null || true\nmodule load ansys-electronics/v252 2>/dev/null || export ANSYSEM_ROOT252=/opt/ohpc/pub/Electronics/v252/Linux64\nexport FLEXLM_TIMEOUT=3000000\nif [ -f \"$HOME/miniconda3/etc/profile.d/conda.sh\" ]; then source \"$HOME/miniconda3/etc/profile.d/conda.sh\"; elif [ -f \"$HOME/anaconda3/etc/profile.d/conda.sh\" ]; then source \"$HOME/anaconda3/etc/profile.d/conda.sh\"; elif [ -f \"/home1/$USER/miniconda3/etc/profile.d/conda.sh\" ]; then source \"/home1/$USER/miniconda3/etc/profile.d/conda.sh\"; elif [ -f \"/home1/$USER/anaconda3/etc/profile.d/conda.sh\" ]; then source \"/home1/$USER/anaconda3/etc/profile.d/conda.sh\"; fi",
+    "exclusive_node": false,
+    "gpu_model": "",
+    "gpus": 0,
+    "max_workers_per_node": 0,
+    "memory_mb": 98304,
+    "name": "mft-goal-postdeadline-diagnostic-full-retry-t96307-v1",
+    "node_name": "n116",
+    "node_name_policy": "strict",
+    "partition": "auto",
+    "payload_json": {
+      "canonical": false,
+      "canonical_dataset_mutation_allowed": false,
+      "diagnostic_only": true,
+      "original_deadline_kst": "2026-07-26T18:00:00+09:00",
+      "original_deadline_missed": true,
+      "original_deadline_utc": "2026-07-26T09:00:00Z",
+      "physics_candidate_sha256": "62f2b846d05bbc5880165c6086fe9897e04d0588b0b8767fceb35102e4be9a44",
+      "planned_minimum_success_retention_window_seconds": 3600,
+      "post_deadline_retry": true,
+      "production": false,
+      "production_truth_eligible": false,
+      "repairs_original_deadline": false,
+      "retained_artifact_path": "goal-fea-retained/postdeadline-diagnostic-full-retry-t96307-7a7da2ab5daeb028/full.aedt",
+      "scheduler_timeout_seconds": 86400,
+      "schema_version": "mft-postdeadline-diagnostic-full-retry-task-metadata-v1",
+      "solver_timeout_seconds": 79200,
+      "source_blob_sha256": {
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "task": "713cd9217d6718aa38bc7fb14e88464833b1eca606aade5451a7e46efa52b241",
+        "task.sh": "47bf1d479ad5e0d74dcec46ed05a71cfd6151253c34d06f7b32da9dc43b8b3bf"
+      },
+      "source_command_sha256": "87f34b089a2c3745e313a429dc885ba0c34e8f72fb0e87228a2a2997411bb1c1",
+      "source_task_exit_code": 124,
+      "source_task_id": 96307,
+      "source_task_name": "mft-goal-provisional-full-l96230-b7c30cb70b95-v1",
+      "source_task_status": "failed",
+      "substitution_allowlist_sha256": "01acb97462e9b70b28ba02a01f623e5c5b53ed6e845d2d4f0801ce845f6e551f",
+      "transformed_command_sha256": "979da42b7df65a1804892a783ed9756383863ea258cdda2cd1db20dfae792652"
+    },
+    "priority": 100,
+    "project": "MFT_1MW_2026v1",
+    "remote_cwd": "__SLURM_SCHEDULER_ACCOUNT_WORKSPACE__/runs",
+    "required_capability": "conda:pyaedt2026v1",
+    "same_node_as_task_id": 0,
+    "scheduling_profile": "fea_bursty",
+    "timeout_seconds": 86400
+  },
+  "schema_version": "mft-postdeadline-diagnostic-full-retry-plan-v1",
+  "seal": {
+    "algorithm": "sha256",
+    "canonicalization": "sorted-keys-compact-utf8-json-v1",
+    "sha256": "3b39768fffea3e0c4527f588efd8702f347e9e0510d1196b813d97894d9d82df"
+  },
+  "source": {
+    "blobs": {
+      "stderr": {
+        "endpoint": "/api/tasks/96307/remote-file?base=remote_dir&path=stderr&max_bytes=10485760",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "stdout": {
+        "endpoint": "/api/tasks/96307/remote-file?base=remote_dir&path=stdout&max_bytes=10485760",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "task": {
+        "endpoint": "/api/tasks/96307",
+        "sha256": "713cd9217d6718aa38bc7fb14e88464833b1eca606aade5451a7e46efa52b241",
+        "size_bytes": 1992
+      },
+      "task.sh": {
+        "endpoint": "/api/tasks/96307/remote-file?base=remote_dir&path=task.sh&max_bytes=1048576",
+        "sha256": "47bf1d479ad5e0d74dcec46ed05a71cfd6151253c34d06f7b32da9dc43b8b3bf",
+        "size_bytes": 11243
+      }
+    },
+    "environment_setup": {
+      "sha256": "e8c5a5fba4e1d95b8a2bf6866a66c8d882f691a3d9ea2d6d005f51b6d57e6f5a",
+      "size_bytes": 656
+    },
+    "extracted_command": {
+      "sha256": "87f34b089a2c3745e313a429dc885ba0c34e8f72fb0e87228a2a2997411bb1c1",
+      "size_bytes": 9909,
+      "task_sh_byte_offset": 1333
+    },
+    "read_only": true,
+    "task_exit_code": 124,
+    "task_failure_message": "task timed out after 43200s",
+    "task_id": 96307,
+    "task_name": "mft-goal-provisional-full-l96230-b7c30cb70b95-v1",
+    "task_status": "failed"
+  },
+  "submission_guard": {
+    "automatic_retry_allowed": false,
+    "endpoint": "/api/tasks",
+    "explicit_apply_required": true,
+    "http_method": "POST",
+    "immutable_attempt_ledger_required": true,
+    "maximum_post_attempts": 1,
+    "scheduler_dedupe_key": "mft-al:mft-goal-postdeadline-diagnostic-full-retry-t96307-v1:a1e4f70cefa1af04673c73a6131bf490c0cc14b5:e6b9b9d20a832ff5c3f7ca97218737a0b8650781:62f2b846d05bbc58:postdeadline-v1",
+    "source_revalidation_required_immediately_before_post": true
+  }
+}
