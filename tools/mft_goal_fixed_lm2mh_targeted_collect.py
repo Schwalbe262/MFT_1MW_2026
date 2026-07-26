@@ -1864,12 +1864,6 @@ def collect(
             and int(detail.get("exit_code") or 0) != 0
         )
     ]
-    account, ssh_session = transport._account(
-        accounts.resolve(strict=True),
-        scheduler_source.resolve(strict=True),
-        "harry261",
-    )
-    connection = transport._PersistentAccountConnection(account, ssh_session)
     collections = []
     official_entry = next(
         entry for entry in entries if int(entry["fixed_primary_turns"]) == 6
@@ -1878,6 +1872,27 @@ def collect(
         status
         for status in statuses
         if int(status["id"]) == int(official_entry["task_id"])
+    )
+    account_sessions = {}
+    for account_name in {
+        str(detail.get("account_name") or "").strip()
+        for detail in [official_status, *completed_details]
+    }:
+        if not account_name:
+            raise RuntimeError("terminal task account identity is absent")
+        account_sessions[account_name] = transport._account(
+            accounts.resolve(strict=True),
+            scheduler_source.resolve(strict=True),
+            account_name,
+        )
+    official_account_name = str(
+        official_status["account_name"]
+    ).strip()
+    official_account, official_ssh_session = account_sessions[
+        official_account_name
+    ]
+    connection = transport._PersistentAccountConnection(
+        official_account, official_ssh_session
     )
     try:
         official_smoke = _official5_smoke(
@@ -1890,6 +1905,8 @@ def collect(
         connection.close()
 
     def download_completed(detail: Mapping[str, Any]) -> dict[str, Any]:
+        account_name = str(detail.get("account_name") or "").strip()
+        account, ssh_session = account_sessions[account_name]
         worker_connection = transport._PersistentAccountConnection(
             account, ssh_session
         )
