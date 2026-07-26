@@ -2731,7 +2731,7 @@ def _axis_v6_card(
             "fixed-Lm rescore and non-dominated sorting are screening-only and "
             "not production eligible."
         ),
-        "state": "blocked",
+        "state": "in_progress",
         "updated_at": observed_at,
         "progress_pct": 100 if all_raw_succeeded else 20 + (succeeded * 70 // 16),
         "evidence": [
