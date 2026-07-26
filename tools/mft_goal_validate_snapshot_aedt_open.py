@@ -468,11 +468,15 @@ def validate_snapshot_aedt_open(
                         raise OpenValidationError(
                             "AEDT CloseProject returned False"
                         )
+                    if receipt is not None:
+                        receipt[
+                            "project_close_without_save_attested"
+                        ] = True
                 except BaseException as exc:
                     release_error = exc
             try:
                 released = desktop.release_desktop(
-                    close_projects=True,
+                    close_projects=False,
                     close_on_exit=True,
                 )
                 if released is False:

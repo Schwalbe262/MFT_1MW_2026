@@ -157,6 +157,7 @@ def test_validates_open_without_mutating_snapshot(tmp_path: Path) -> None:
     assert receipt["saved_project_open_passed"] is True
     assert receipt["source_unchanged"] is True
     assert receipt["scratch_copy_unchanged"] is True
+    assert receipt["project_close_without_save_attested"] is True
     assert receipt["automation_calls"]["analysis"] == 0
     assert receipt["automation_calls"]["project_save"] == 0
     assert [row["name"] for row in receipt["designs"]] == [
@@ -169,6 +170,10 @@ def test_validates_open_without_mutating_snapshot(tmp_path: Path) -> None:
         "close",
         "release",
     ]
+    assert _Desktop.calls[-1][1] == {
+        "close_projects": False,
+        "close_on_exit": True,
+    }
 
 
 def test_rejects_snapshot_manifest_drift(tmp_path: Path) -> None:
