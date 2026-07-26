@@ -86,9 +86,9 @@ _RX_INSULATION_KEYS = (
     "Rx_side2_insulation",
 )
 THERMAL_MESH_POLICY = (
-    "b4-rxmain-l5-wcp-pad-symmetry-clipped-regions-v1"
+    "b5-rxmain-l5-wcp-pad-symmetry-contact-clipped-regions-v1"
 )
-THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v5"
+THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v6"
 THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION = "thermal-mesh-preflight-v2"
 THERMAL_MESH_STATS_CONTRACT_VERSION = "thermal-native-mesh-stats-v1"
 SYMMETRY_THERMAL_DIRECT_ANALYZE_ENV = (
@@ -112,7 +112,7 @@ THERMAL_SETUP_CONTROL_READBACK_CONTRACT_VERSION = (
 THERMAL_MESH_STATS_FILENAME = "icepak_thermal_mesh_quality.ms"
 THERMAL_MESH_STATS_MAX_BYTES = 64 * 1024 * 1024
 WCP_PAD_MESH_REGION_CONTRACT_VERSION = (
-    "wcp-pad-per-object-symmetry-clipped-region-v2"
+    "wcp-pad-per-object-symmetry-contact-clipped-region-v3"
 )
 WCP_PAD_MESH_REGION_PADDING_TYPE = "Absolute Offset"
 WCP_PAD_MESH_REGION_PADDING_MM = 2.0
@@ -122,13 +122,22 @@ _WCP_PAD_MESH_REGION_DIRECTIONS = (
 
 
 def _wcp_pad_mesh_region_padding_mm(mode):
-    """Keep non-model WCP refinement envelopes inside symmetry planes."""
+    """Keep WCP refinement envelopes out of contacts and symmetry planes.
+
+    WCP TIMs are two-millimetre boxes whose thickness is aligned with Y.
+    Padding a pad MeshRegion in either Y direction makes that non-model
+    refinement envelope cut through the touching winding or aluminium plate.
+    Native Icepak reports those intersections before a possible poor-quality
+    mesh termination.  Keep the physical TIM and its level-5 control intact,
+    but clip the envelope at both contact faces.  Tangential X/Z padding still
+    gives every local region a parent/global mesh interface.
+    """
 
     normalized = str(mode or "").strip().casefold()
     blocked_directions = {
-        "full": frozenset(),
-        "quarter": frozenset({"+X"}),
-        "eighth": frozenset({"+X", "-Z"}),
+        "full": frozenset({"+Y", "-Y"}),
+        "quarter": frozenset({"+X", "+Y", "-Y"}),
+        "eighth": frozenset({"+X", "+Y", "-Y", "-Z"}),
     }.get(normalized)
     if blocked_directions is None:
         raise ValueError(

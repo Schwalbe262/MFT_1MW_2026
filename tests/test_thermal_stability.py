@@ -3065,20 +3065,30 @@ class ThermalStabilityTest(unittest.TestCase):
             with self.subTest(keyword=keyword), self.assertRaisesRegex(RuntimeError, expected):
                 thermal._require_thermal_geometry(base, "eighth", 0, **{keyword: True})
 
-    def test_wcp_pad_mesh_region_padding_clips_symmetry_planes(self):
+    def test_wcp_pad_mesh_region_padding_clips_contacts_and_symmetry_planes(self):
         full = thermal._wcp_pad_mesh_region_padding_mm("full")
         quarter = thermal._wcp_pad_mesh_region_padding_mm("quarter")
         eighth = thermal._wcp_pad_mesh_region_padding_mm("eighth")
 
-        self.assertEqual(list(full.values()), [2.0] * 6)
+        self.assertEqual(
+            list(full.values()),
+            [2.0, 2.0, 0.0, 0.0, 2.0, 2.0],
+        )
         self.assertEqual(
             list(quarter.values()),
-            [0.0, 2.0, 2.0, 2.0, 2.0, 2.0],
+            [0.0, 2.0, 0.0, 0.0, 2.0, 2.0],
         )
         self.assertEqual(
             list(eighth.values()),
-            [0.0, 2.0, 2.0, 2.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0, 2.0, 0.0],
         )
+        for padding in (full, quarter, eighth):
+            self.assertTrue(
+                any(
+                    padding[direction] > 0.0
+                    for direction in ("+X", "-X", "+Z", "-Z")
+                )
+            )
         with self.assertRaisesRegex(ValueError, "unsupported thermal symmetry"):
             thermal._wcp_pad_mesh_region_padding_mm("unknown")
 
@@ -3267,12 +3277,12 @@ class ThermalStabilityTest(unittest.TestCase):
             )
             self.assertEqual(
                 region.assignment.padding_values,
-                ["0mm", "2mm", "2mm", "2mm", "2mm", "0mm"],
+                ["0mm", "2mm", "0mm", "0mm", "2mm", "0mm"],
             )
         self.assertEqual(plan["symmetry_mode"], "eighth")
         self.assertEqual(
             list(plan["wcp_pad_padding_by_direction_mm"].values()),
-            [0.0, 2.0, 2.0, 2.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0, 2.0, 0.0],
         )
 
     def test_explicit_insulation_requires_retained_copper(self):
