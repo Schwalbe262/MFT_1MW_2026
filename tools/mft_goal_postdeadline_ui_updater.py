@@ -3243,9 +3243,7 @@ def _target_axis_card(
             (
                 "fresh requested total=4096CPU + 33554432MiB / "
                 "per task=8CPU + 65536MiB / timeout=7200s / "
-                "max_workers_per_node=8"
-            ),
-            (
+                "max_workers_per_node=8 / "
                 f"splittemp hard contract sha256={TARGET_AXIS_HARD_SHA256} / "
                 f"legacy hard contract sha256={TARGET_AXIS_LEGACY_HARD_SHA256} / "
                 f"sealed base manifests={len(TARGET_AXIS_SUBMISSION_MANIFESTS)}"
@@ -3253,9 +3251,7 @@ def _target_axis_card(
             (
                 "final aggregate target=528 successful logical seeds / "
                 "168960 raw terminal rows / one cross-seed global NDS / "
-                f"collector successful now={collector_success}"
-            ),
-            (
+                f"collector successful now={collector_success} / "
                 f"all base lifecycle success={all_succeeded}/528 / "
                 f"failed originals={all_failed} / exact-seed replacements are "
                 "resolved by the authenticated collector before final NDS"
@@ -3317,7 +3313,9 @@ def _target_axis_card(
                         "collector payload sha256="
                         f"{collector_status['payload_sha256']}"
                     ),
-                    *card["evidence"],
+                    *card["evidence"][:6],
+                    card["evidence"][6],
+                    card["evidence"][-1],
                 ],
             }
         )
