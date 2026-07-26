@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 
 import pytest
@@ -361,6 +362,26 @@ def _run(paths: dict[str, Path]) -> dict[str, Any]:
     )
 
 
+def _set_terminal_state(path: Path, state: str, *, collected: bool) -> None:
+    event = json.loads(path.read_text(encoding="utf-8"))
+    event.pop("event_sha256")
+    event["state"] = state
+    event["artifact_collection_attempted"] = collected
+    _json(path, _event(event))
+
+
+def _copy_thermal_collector(
+    source_event: Path,
+    preferred_event: Path,
+) -> None:
+    preferred_event.parent.mkdir(parents=True)
+    shutil.copytree(
+        source_event.parent / "collection",
+        preferred_event.parent / "collection",
+    )
+    shutil.copy2(source_event, preferred_event)
+
+
 def test_thermal_manifest_accepts_exact_producer_newline_seal():
     unsigned = {
         "schema": "mft-corrected-thermal-minimum-retained-package-v1",
@@ -409,6 +430,111 @@ def test_running_collectors_create_only_one_pending_manifest(tmp_path: Path):
         "pending_manifest.json"
     }
     assert result["final_package_created"] is False
+
+
+def test_preferred_thermal_event_handoff_is_absent_safe_then_sticky(
+    tmp_path: Path,
+):
+    paths = _fixture(tmp_path)
+    preferred_path = (
+        tmp_path / "bridge" / "collected" / "latest.json"
+    )
+    preferred = gate._PreferredThermalEvent(preferred_path)
+    success_event = json.loads(
+        paths["thermal_event"].read_text(encoding="utf-8")
+    )
+    _set_terminal_state(
+        paths["thermal_event"],
+        "watching",
+        collected=False,
+    )
+
+    first = gate.evaluate_and_publish(
+        full_event_path=paths["full_event"],
+        thermal_event_path=paths["thermal_event"],
+        authority_plan_path=paths["authority"],
+        full_retry_plan_path=FULL_RETRY_PLAN,
+        output_root=paths["output"],
+        preferred_thermal_event=preferred,
+    )
+
+    assert first["status"] == "pending"
+    assert preferred.activated is False
+    assert "thermal96324 collector state is watching" in first["pending_reasons"]
+
+    preferred_path.parent.mkdir(parents=True)
+    shutil.copytree(
+        paths["thermal_event"].parent / "collection",
+        preferred_path.parent / "collection",
+    )
+    _json(preferred_path, success_event)
+
+    second = gate.evaluate_and_publish(
+        full_event_path=paths["full_event"],
+        thermal_event_path=paths["thermal_event"],
+        authority_plan_path=paths["authority"],
+        full_retry_plan_path=FULL_RETRY_PLAN,
+        output_root=paths["output"],
+        preferred_thermal_event=preferred,
+    )
+
+    assert second["status"] == "published"
+    assert preferred.activated is True
+    evidence = (
+        paths["output"]
+        / gate.PACKAGE_NAME
+        / "evidence"
+        / "thermal_collector_event.json"
+    )
+    assert evidence.read_bytes() == preferred_path.read_bytes()
+
+
+def test_present_invalid_preferred_event_never_falls_back(tmp_path: Path):
+    paths = _fixture(tmp_path)
+    preferred_path = (
+        tmp_path / "bridge" / "collected" / "latest.json"
+    )
+    _json(preferred_path, {})
+    preferred = gate._PreferredThermalEvent(preferred_path)
+
+    result = gate.evaluate_and_publish(
+        full_event_path=paths["full_event"],
+        thermal_event_path=paths["thermal_event"],
+        authority_plan_path=paths["authority"],
+        full_retry_plan_path=FULL_RETRY_PLAN,
+        output_root=paths["output"],
+        preferred_thermal_event=preferred,
+    )
+
+    assert result["status"] == "authority_invalid"
+    assert preferred.activated is True
+    assert not (paths["output"] / gate.PACKAGE_NAME).exists()
+
+
+def test_activated_preferred_event_disappearance_fails_closed(tmp_path: Path):
+    paths = _fixture(tmp_path)
+    preferred_path = (
+        tmp_path / "bridge" / "collected" / "latest.json"
+    )
+    _copy_thermal_collector(paths["thermal_event"], preferred_path)
+    preferred = gate._PreferredThermalEvent(preferred_path)
+
+    assert preferred.select(paths["thermal_event"]) == preferred_path
+    preferred_path.unlink()
+
+    with pytest.raises(
+        gate.FinalPackageGateError,
+        match="activated preferred thermal event disappeared",
+    ):
+        preferred.select(paths["thermal_event"])
+
+
+def test_preferred_event_rejects_non_latest_file(tmp_path: Path):
+    with pytest.raises(
+        gate.FinalPackageGateError,
+        match="must be an exact latest.json path",
+    ):
+        gate._PreferredThermalEvent(tmp_path / "bridge" / "other.json")
 
 
 def test_open_only_aedt_without_full_result_truth_is_never_promoted(
@@ -498,6 +624,8 @@ def test_watch_rechecks_mutating_latest_events_without_busy_loop(
             str(inputs["full"]),
             "--thermal-event",
             str(inputs["thermal"]),
+            "--preferred-thermal-event",
+            str(tmp_path / "bridge" / "collected" / "latest.json"),
             "--candidate-authority-plan",
             str(inputs["authority"]),
             "--full-retry-plan",
@@ -514,4 +642,9 @@ def test_watch_rechecks_mutating_latest_events_without_busy_loop(
 
     assert status == 2
     assert len(calls) == 2
+    assert all(
+        isinstance(call["preferred_thermal_event"], gate._PreferredThermalEvent)
+        and call["preferred_thermal_event"].activated is False
+        for call in calls
+    )
     assert sleeps == [7]

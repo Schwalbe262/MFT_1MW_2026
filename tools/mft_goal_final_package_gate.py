@@ -78,6 +78,96 @@ class FinalPackageGateError(RuntimeError):
     """An authority or final-package invariant failed closed."""
 
 
+class _PreferredThermalEvent:
+    """A sticky, path-pinned handoff to one materialized thermal event."""
+
+    def __init__(self, requested_path: Path) -> None:
+        requested = Path(os.path.abspath(requested_path))
+        if requested.name != "latest.json":
+            raise FinalPackageGateError(
+                "preferred thermal event must be an exact latest.json path"
+            )
+        anchor_candidate = requested.parent
+        while not anchor_candidate.exists():
+            parent = anchor_candidate.parent
+            if parent == anchor_candidate:
+                raise FinalPackageGateError(
+                    "preferred thermal event has no existing directory anchor"
+                )
+            anchor_candidate = parent
+        try:
+            anchor = diagnostic_handoff._real_directory(
+                anchor_candidate,
+                label="preferred thermal event anchor",
+            )
+            relative = requested.relative_to(anchor)
+            metadata = anchor.stat()
+        except (
+            OSError,
+            ValueError,
+            diagnostic_handoff.HandoffError,
+        ) as exc:
+            raise FinalPackageGateError(
+                "preferred thermal event path is unsafe"
+            ) from exc
+        if (
+            len(relative.parts) < 1
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or any(part in {"", "."} for part in relative.parts)
+        ):
+            raise FinalPackageGateError(
+                "preferred thermal event path is not a pinned descendant"
+            )
+        self._anchor = anchor
+        self._anchor_identity = (metadata.st_dev, metadata.st_ino)
+        self._relative = relative
+        self._activated = False
+
+    @property
+    def activated(self) -> bool:
+        return self._activated
+
+    @property
+    def requested_path(self) -> Path:
+        return self._anchor / self._relative
+
+    def select(self, fallback: Path) -> Path:
+        try:
+            current_anchor = diagnostic_handoff._real_directory(
+                self._anchor,
+                label="preferred thermal event anchor",
+            )
+            metadata = current_anchor.stat()
+            if (metadata.st_dev, metadata.st_ino) != self._anchor_identity:
+                raise FinalPackageGateError(
+                    "preferred thermal event anchor identity drifted"
+                )
+            selected = diagnostic_handoff._contained_file(
+                current_anchor,
+                self._relative.as_posix(),
+            )
+        except FileNotFoundError as exc:
+            if self._activated:
+                raise FinalPackageGateError(
+                    "activated preferred thermal event disappeared"
+                ) from exc
+            return fallback
+        except FinalPackageGateError:
+            raise
+        except (OSError, diagnostic_handoff.HandoffError) as exc:
+            raise FinalPackageGateError(
+                "preferred thermal event path is unsafe"
+            ) from exc
+        resolved = selected.resolve(strict=True)
+        if resolved != self.requested_path:
+            raise FinalPackageGateError(
+                "preferred thermal event resolved outside its pinned path"
+            )
+        self._activated = True
+        return resolved
+
+
 def _now() -> str:
     return (
         datetime.now(timezone.utc)
@@ -242,6 +332,26 @@ def _validate_terminal_event(
     if event.get("failure_or_timeout") is True:
         pending.append(f"{target} task failed or timed out")
     return event, pending
+
+
+def _validate_stable_terminal_event(
+    path: Path,
+    *,
+    target: str,
+    task_id: int,
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    before = _file_record(path)
+    event, pending = _validate_terminal_event(
+        path,
+        target=target,
+        task_id=task_id,
+    )
+    after = _file_record(path)
+    if before != after:
+        raise FinalPackageGateError(
+            f"{target} collector event mutated during validation"
+        )
+    return event, pending, after
 
 
 def _validate_authority_plan(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1059,6 +1169,7 @@ def evaluate_and_publish(
     authority_plan_path: Path,
     full_retry_plan_path: Path,
     output_root: Path,
+    preferred_thermal_event: _PreferredThermalEvent | None = None,
 ) -> dict[str, Any]:
     root = _ensure_output_root(output_root)
     destination = root / PACKAGE_NAME
@@ -1067,12 +1178,12 @@ def evaluate_and_publish(
     input_records: dict[str, Any] = {}
     pending: list[str] = []
     try:
-        full_event, full_pending = _validate_terminal_event(
+        full_event, full_pending, full_record = _validate_stable_terminal_event(
             full_event_path,
             target="full96326",
             task_id=FULL_TASK_ID,
         )
-        input_records["full_collector_event"] = _file_record(full_event_path)
+        input_records["full_collector_event"] = full_record
         pending.extend(full_pending)
     except FinalPackageGateError as exc:
         return _write_pending(
@@ -1082,12 +1193,25 @@ def evaluate_and_publish(
             status="authority_invalid",
         )
     try:
-        thermal_event, thermal_pending = _validate_terminal_event(
-            thermal_event_path,
-            target="thermal96324",
-            task_id=THERMAL_TASK_ID,
+        selected_thermal_event = (
+            preferred_thermal_event.select(thermal_event_path)
+            if preferred_thermal_event is not None
+            else thermal_event_path
         )
-        input_records["thermal_collector_event"] = _file_record(thermal_event_path)
+        thermal_event, thermal_pending, thermal_record = (
+            _validate_stable_terminal_event(
+                selected_thermal_event,
+                target="thermal96324",
+                task_id=THERMAL_TASK_ID,
+            )
+        )
+        if preferred_thermal_event is not None:
+            confirmed = preferred_thermal_event.select(thermal_event_path)
+            if confirmed != selected_thermal_event:
+                raise FinalPackageGateError(
+                    "preferred thermal event selection drifted"
+                )
+        input_records["thermal_collector_event"] = thermal_record
         pending.extend(thermal_pending)
     except FinalPackageGateError as exc:
         return _write_pending(
@@ -1096,6 +1220,7 @@ def evaluate_and_publish(
             input_records=input_records,
             status="authority_invalid",
         )
+    thermal_event_path = selected_thermal_event
     try:
         authority_plan, authority_record = _validate_authority_plan(
             authority_plan_path
@@ -1188,6 +1313,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--full-event", type=Path, required=True)
     parser.add_argument("--thermal-event", type=Path, required=True)
+    parser.add_argument("--preferred-thermal-event", type=Path)
     parser.add_argument("--candidate-authority-plan", type=Path, required=True)
     parser.add_argument("--full-retry-plan", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
@@ -1203,6 +1329,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise FinalPackageGateError("interval-seconds must be positive")
     if args.max_cycles is not None and args.max_cycles < 1:
         raise FinalPackageGateError("max-cycles must be positive")
+    preferred_thermal_event = (
+        _PreferredThermalEvent(args.preferred_thermal_event)
+        if args.preferred_thermal_event is not None
+        else None
+    )
     inputs = {
         "full_event_path": args.full_event.resolve(strict=True),
         "thermal_event_path": args.thermal_event.resolve(strict=True),
@@ -1211,6 +1342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         "full_retry_plan_path": args.full_retry_plan.resolve(strict=True),
         "output_root": args.output_root,
+        "preferred_thermal_event": preferred_thermal_event,
     }
     cycles = 0
     while True:
