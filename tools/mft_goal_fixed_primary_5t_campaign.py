@@ -28,13 +28,13 @@ import zlib
 SCHEMA = "mft-goal-fixed-primary-5t-nsga-task-v1"
 RESULT_SCHEMA = "mft-goal-fixed-primary-5t-nsga-result-v1"
 CAMPAIGN_SCHEMA = "mft-goal-fixed-primary-5t-nsga-submission-v1"
-CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-axis-v4"
+CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-axis-v5"
 HEDGE_CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-variable-20260727-v1"
 PRIMARY_CONDUCTOR_MM = 5.0
 PRIMARY_GAP_MM = 1.6
 POPULATION = 320
 GENERATIONS = 80
-SEED_START = 2_707_275_500
+SEED_START = 2_707_275_600
 SEED_COUNT = 16
 HEDGE_SEED_START = 2_707_275_400
 HEDGE_SEED_COUNT = 8
@@ -57,7 +57,7 @@ GLOBAL_TERMINAL_CSV = Path(
 )
 DEFAULT_OUTPUT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\fixed_primary_5t_gap1_1p6_axis_nsga_v4"
+    r"\fixed_primary_5t_gap1_1p6_axis_nsga_v5"
 )
 BASE_TASKS = {
     5: "artifacts/campaign/tasks/seed-2607262000-n1-5.json",
@@ -712,8 +712,10 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
     if expected_limits != (1000.0, 1200.0, 750.0):
         raise RuntimeError("axis-specific size contract drifted")
     for row_index in range(len(decoded)):
-        _volume, observed_dimensions = preflight.bounding_box_lit(
-            decoded.iloc[row_index]
+        _volume, observed_dimensions = (
+            runner.modules.geometry_metrics.bounding_box_lit(
+                decoded.iloc[row_index]
+            )
         )
         for constraint_name, observed, limit in zip(
             (
