@@ -50,7 +50,10 @@ from module.aedt_terminal_attestation import (
     capture_scoped_message_cursor,
 )
 from module.fixed_boundary_contract import (
+    FIXED_BOUNDARY_CONTRACT_SHA256,
+    FIXED_BOUNDARY_CONTRACT_SCHEMA,
     FIXED_THERMAL_PAD_CONDUCTIVITY_W_MK,
+    attest_fixed_boundary,
 )
 
 
@@ -88,6 +91,21 @@ THERMAL_MESH_POLICY = (
 THERMAL_MESH_PLAN_CONTRACT_VERSION = "thermal-mesh-plan-v5"
 THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION = "thermal-mesh-preflight-v2"
 THERMAL_MESH_STATS_CONTRACT_VERSION = "thermal-native-mesh-stats-v1"
+SYMMETRY_THERMAL_DIRECT_ANALYZE_ENV = (
+    "MFT_SYMMETRY_THERMAL_DIRECT_ANALYZE"
+)
+SYMMETRY_THERMAL_DIRECT_ANALYZE_TOKEN = (
+    "standard-eighth-direct-analyze-v1"
+)
+SYMMETRY_THERMAL_DIRECT_ANALYZE_CONTRACT_VERSION = (
+    "mft-symmetry-thermal-direct-analyze-v1"
+)
+SYMMETRY_THERMAL_DIRECT_ANALYZE_STATUS = (
+    "explicit_opt_in_symmetry_direct_analyze"
+)
+SYMMETRY_THERMAL_DIRECT_ANALYZE_TOKEN_SHA256 = hashlib.sha256(
+    SYMMETRY_THERMAL_DIRECT_ANALYZE_TOKEN.encode("utf-8")
+).hexdigest()
 THERMAL_SETUP_CONTROL_READBACK_CONTRACT_VERSION = (
     "thermal-native-setup-control-readback-v1"
 )
@@ -3803,6 +3821,409 @@ def _export_thermal_mesh_stats(native_ipk, setup_name):
     }
 
 
+def _direct_analyze_contract_sha256(payload):
+    """Hash one immutable direct-analyze contract without permissive JSON."""
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _symmetry_thermal_direct_analyze_request(df):
+    """Return an exact opt-in receipt, or ``None`` for the unchanged default.
+
+    A nonempty value other than the one versioned token is an operator error,
+    not a false value.  The fast path is intentionally narrower than the
+    general eighth-model capability: it is available only to the authoritative
+    fixed-cooling Standard contract.
+    """
+    raw = os.environ.get(SYMMETRY_THERMAL_DIRECT_ANALYZE_ENV)
+    if raw is None or raw == "":
+        return None
+    if raw != SYMMETRY_THERMAL_DIRECT_ANALYZE_TOKEN:
+        raise RuntimeError(
+            f"{SYMMETRY_THERMAL_DIRECT_ANALYZE_ENV} has an invalid "
+            "versioned opt-in token"
+        )
+
+    columns = set(getattr(df, "columns", ()))
+
+    def value(name):
+        if name not in columns:
+            raise RuntimeError(
+                "symmetry direct-analyze contract is missing parameter "
+                f"{name!r}"
+            )
+        series = df[name]
+        if len(series) != 1:
+            raise RuntimeError(
+                "symmetry direct-analyze contract requires one parameter "
+                f"row ({name!r})"
+            )
+        return series.iloc[0]
+
+    mode = str(value("thermal_symmetry"))
+    fan_config = str(value("fan_config"))
+    numeric = {}
+    for name in (
+        "full_model",
+        "core_plate_on",
+        "wcp_on",
+        "fan_velocity",
+        "core_plate_pad_t",
+        "wcp_pad_t",
+        "k_ins",
+    ):
+        raw_value = value(name)
+        if isinstance(raw_value, bool):
+            raise RuntimeError(
+                "symmetry direct-analyze contract rejects boolean "
+                f"{name}={raw_value!r}"
+            )
+        try:
+            number = float(raw_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                "symmetry direct-analyze contract requires numeric "
+                f"{name}, got {raw_value!r}"
+            ) from exc
+        if not math.isfinite(number):
+            raise RuntimeError(
+                "symmetry direct-analyze contract requires finite "
+                f"{name}, got {raw_value!r}"
+            )
+        numeric[name] = number
+
+    mismatches = []
+    for name, actual, expected in (
+        ("thermal_symmetry", mode, "eighth"),
+        ("full_model", numeric["full_model"], 0.0),
+        ("fan_config", fan_config, "dual"),
+        ("core_plate_on", numeric["core_plate_on"], 1.0),
+        ("wcp_on", numeric["wcp_on"], 1.0),
+        ("k_ins", numeric["k_ins"], 0.2),
+    ):
+        if actual != expected:
+            mismatches.append(
+                f"{name}: expected={expected!r}, observed={actual!r}"
+            )
+    if mismatches:
+        raise RuntimeError(
+            "symmetry direct-analyze eligibility failed: "
+            + "; ".join(mismatches)
+        )
+
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    if pooled_backend_enabled():
+        raise RuntimeError(
+            "symmetry direct-analyze opt-in is standalone Standard-only"
+        )
+
+    fixed_boundary = attest_fixed_boundary(
+        {
+            "fan_velocity": numeric["fan_velocity"],
+            "core_plate_pad_t": numeric["core_plate_pad_t"],
+            "wcp_pad_t": numeric["wcp_pad_t"],
+        },
+        thermal_pad_conductivity_w_mk=(
+            THERMAL_PAD_CONDUCTIVITY_W_MK
+        ),
+    )
+    request = {
+        "schema": SYMMETRY_THERMAL_DIRECT_ANALYZE_CONTRACT_VERSION,
+        "explicit_opt_in": True,
+        "env_name": SYMMETRY_THERMAL_DIRECT_ANALYZE_ENV,
+        "token_sha256": (
+            SYMMETRY_THERMAL_DIRECT_ANALYZE_TOKEN_SHA256
+        ),
+        "eligibility": {
+            "fidelity": "standard",
+            "aedt_backend": "standalone",
+            "thermal_symmetry": mode,
+            "full_model": int(numeric["full_model"]),
+            "fan_config": fan_config,
+            "core_plate_on": int(numeric["core_plate_on"]),
+            "wcp_on": int(numeric["wcp_on"]),
+            "k_ins_W_mK": numeric["k_ins"],
+        },
+        "fixed_boundary": fixed_boundary,
+        "default_behavior_when_env_absent": (
+            "standalone_native_generate_mesh_preflight"
+        ),
+        "control_flow_reference": {
+            "task_id": 95103,
+            "source_revision": (
+                "8a8d90f68e8728669282f586f24304c7cc807029"
+            ),
+            "scheduler_state": "succeeded",
+            "exit_code": 0,
+            "evidence_scope": (
+                "standalone direct ThermalSetup Analyze control flow only"
+            ),
+            "fixed_boundary_compatible": False,
+        },
+        "blocking_preflight_reference_revision": (
+            "a1e4f70cefa1af04673c73a6131bf490c0cc14b5"
+        ),
+    }
+    request["request_sha256"] = _direct_analyze_contract_sha256(
+        request
+    )
+    return request
+
+
+def _symmetry_thermal_direct_analyze_preflight(
+    sim,
+    ipk,
+    setup,
+    mesh_plan,
+    request,
+    thermal_pad_readback,
+):
+    """Attest the unchanged model and dispatch contract without GenerateMesh."""
+    if not isinstance(request, dict):
+        raise RuntimeError(
+            "symmetry direct-analyze request receipt is missing"
+        )
+    request_payload = {
+        key: value
+        for key, value in request.items()
+        if key != "request_sha256"
+    }
+    if (
+        request.get("schema")
+        != SYMMETRY_THERMAL_DIRECT_ANALYZE_CONTRACT_VERSION
+        or request.get("explicit_opt_in") is not True
+        or request.get("token_sha256")
+        != SYMMETRY_THERMAL_DIRECT_ANALYZE_TOKEN_SHA256
+        or request.get("request_sha256")
+        != _direct_analyze_contract_sha256(request_payload)
+    ):
+        raise RuntimeError(
+            "symmetry direct-analyze request receipt failed integrity"
+        )
+    fixed_boundary = request.get("fixed_boundary", {})
+    if (
+        fixed_boundary.get("schema")
+        != FIXED_BOUNDARY_CONTRACT_SCHEMA
+        or fixed_boundary.get("contract_sha256")
+        != FIXED_BOUNDARY_CONTRACT_SHA256
+        or fixed_boundary.get(
+            "authoritative_fixed_boundary_attested"
+        )
+        is not True
+        or fixed_boundary.get("mismatches") != []
+    ):
+        raise RuntimeError(
+            "symmetry direct-analyze fixed-boundary receipt is invalid"
+        )
+
+    required_objects_missing = list(
+        mesh_plan.get("required_objects_missing", [])
+    )
+    operation_count = int(mesh_plan.get("operation_count", 0))
+    object_level_operation_count = int(
+        mesh_plan.get("object_level_operation_count", -1)
+    )
+    mesh_region_operation_count = int(
+        mesh_plan.get("mesh_region_operation_count", -1)
+    )
+    static_contract_passed = (
+        mesh_plan.get("schema") == THERMAL_MESH_PLAN_CONTRACT_VERSION
+        and mesh_plan.get("policy") == THERMAL_MESH_POLICY
+        and not required_objects_missing
+        and operation_count > 0
+        and int(mesh_plan.get("shared_operation_count", -1)) == 0
+        and object_level_operation_count + mesh_region_operation_count
+        == operation_count
+        and int(mesh_plan.get("separate_object_operation_count", -1))
+        == object_level_operation_count
+        and mesh_region_operation_count
+        == int(mesh_plan.get("wcp_pad_mesh_region_count", -1))
+        and len(mesh_plan.get("required_thin_objects", []))
+        == int(mesh_plan.get("required_thin_object_count", -1))
+    )
+    if not static_contract_passed:
+        raise RuntimeError(
+            "symmetry direct-analyze static mesh assignment contract failed"
+        )
+    if _mesh_quality_canary_requested(mesh_plan):
+        raise RuntimeError(
+            "symmetry direct-analyze cannot bypass a requested mesh-quality "
+            "canary"
+        )
+    if not isinstance(thermal_pad_readback, dict):
+        raise RuntimeError(
+            "symmetry direct-analyze native TIM readback is missing"
+        )
+    thermal_k = float(
+        thermal_pad_readback.get("thermal_conductivity_W_mK")
+    )
+    electrical_sigma = float(
+        thermal_pad_readback.get("electrical_conductivity_S_m")
+    )
+    if (
+        not math.isclose(
+            thermal_k,
+            THERMAL_PAD_CONDUCTIVITY_W_MK,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            electrical_sigma, 0.0, rel_tol=0.0, abs_tol=1e-12
+        )
+    ):
+        raise RuntimeError(
+            "symmetry direct-analyze native TIM readback drifted"
+        )
+
+    from module.aedt_pool_adapter import pooled_backend_enabled
+
+    if pooled_backend_enabled():
+        raise RuntimeError(
+            "symmetry direct-analyze preflight is standalone-only"
+        )
+    identity = _prepare_thermal_dispatch(
+        sim,
+        ipk,
+        setup,
+        design_name=_THERMAL_DESIGN_NAME,
+        setup_name=_THERMAL_SETUP_NAME,
+    )
+    native_ipk = identity["native_ipk"]
+    native_design = identity["native_design"]
+    native_operation_readback = (
+        _native_thermal_mesh_operation_readback(
+            native_design,
+            mesh_plan,
+            native_editor=getattr(
+                getattr(native_ipk, "modeler", None), "oeditor", None
+            ),
+        )
+    )
+    missing_operation_names = list(
+        native_operation_readback.get("missing_operation_names", [])
+    )
+    required_thin_missing = list(
+        native_operation_readback.get(
+            "required_thin_objects_missing", []
+        )
+    )
+    if missing_operation_names or required_thin_missing:
+        raise RuntimeError(
+            "symmetry direct-analyze native mesh assignment readback failed: "
+            f"missing_operations={missing_operation_names}, "
+            f"missing_thin_objects={required_thin_missing}"
+        )
+
+    immutable_contract = {
+        "schema": SYMMETRY_THERMAL_DIRECT_ANALYZE_CONTRACT_VERSION,
+        "request_sha256": request["request_sha256"],
+        "mesh_plan_sha256": mesh_plan["plan_sha256"],
+        "fixed_boundary_contract_sha256": (
+            FIXED_BOUNDARY_CONTRACT_SHA256
+        ),
+        "native_tim_attested": True,
+        "native_operation_readback_passed": True,
+        "setup_control_readback": identity.get(
+            "setup_control_readback", {}
+        ),
+        "generate_mesh_call_policy": "forbidden_before_analyze",
+        "generate_mesh_called": False,
+        "cooling_boundary_modified": False,
+        "geometry_modified_by_fast_path": False,
+        "thermal_setup_modified_by_fast_path": False,
+        "thermal_iteration_settings_modified_by_fast_path": False,
+        "solver_result_extraction_unchanged": True,
+        "scientific_truth_gates_unchanged": True,
+        "control_flow_reference": request[
+            "control_flow_reference"
+        ],
+    }
+    immutable_contract_sha256 = _direct_analyze_contract_sha256(
+        immutable_contract
+    )
+    evidence = {
+        "schema": THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION,
+        "status": SYMMETRY_THERMAL_DIRECT_ANALYZE_STATUS,
+        "passed": False,
+        "static_contract_passed": True,
+        "direct_analyze_gate_passed": True,
+        "direct_analyze_contract": immutable_contract,
+        "direct_analyze_contract_sha256": (
+            immutable_contract_sha256
+        ),
+        "direct_analyze_request": request,
+        "generate_mesh_called": False,
+        "generate_mesh_returned": False,
+        "message_scan_complete": False,
+        "analysis_dispatched_after_premesh": False,
+        "analysis_dispatched_after_mesh_policy_gate": False,
+        "required_objects_missing": [],
+        "unmeshed_objects": [],
+        "native_operation_readback_passed": True,
+        "native_operation_readback": native_operation_readback,
+        "standalone_idle_barrier_passed": False,
+        "mesh_artifact_readback_passed": False,
+        "mesh_mapping_coverage_passed": False,
+        "mesh_mapping_coverage": {
+            "schema": "thermal-grid-mapping-coverage-v1",
+            "passed": False,
+            "status": SYMMETRY_THERMAL_DIRECT_ANALYZE_STATUS,
+        },
+        "postflight_identity_passed": True,
+        "mesh_quality_canary_requested": False,
+        "setup_control_readback": identity.get(
+            "setup_control_readback", {}
+        ),
+        "native_mesh_stats": {
+            "schema": THERMAL_MESH_STATS_CONTRACT_VERSION,
+            "exported": False,
+            "not_requested": True,
+            "mesh_quality_checks_modified": False,
+            "mesh_quality_check_disable_requested": False,
+        },
+        "mesh_policy": THERMAL_MESH_POLICY,
+        "mesh_plan_sha256": mesh_plan["plan_sha256"],
+        "mesh_operation_count": mesh_plan["operation_count"],
+        "mesh_assigned_object_count": (
+            mesh_plan["assigned_object_count"]
+        ),
+        "object_level_operation_count": (
+            mesh_plan["object_level_operation_count"]
+        ),
+        "mesh_region_operation_count": (
+            mesh_plan["mesh_region_operation_count"]
+        ),
+        "wcp_pad_mesh_region_count": (
+            mesh_plan["wcp_pad_mesh_region_count"]
+        ),
+        "core_plate_assembly_count": (
+            mesh_plan["core_plate_assembly_count"]
+        ),
+        "wcp_assembly_count": mesh_plan["wcp_assembly_count"],
+        "rx_retained_pack_count": (
+            mesh_plan["rx_retained_pack_count"]
+        ),
+    }
+    logging.warning(
+        "[thermal] explicit symmetry direct-analyze gate: %s",
+        json.dumps(
+            evidence,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    return evidence
+
+
 def _generate_and_attest_thermal_mesh(
     sim,
     ipk,
@@ -4226,11 +4647,22 @@ def _thermal_mesh_result_metadata(mesh_plan, preflight):
         preflight.get("status")
         == "not_applicable_pooled_exact_analyze_protocol"
     )
+    direct_analyze = (
+        preflight.get("status")
+        == SYMMETRY_THERMAL_DIRECT_ANALYZE_STATUS
+    )
+    analysis_dispatch_attested = (
+        preflight.get("analysis_dispatched_after_premesh") is True
+        or preflight.get(
+            "analysis_dispatched_after_mesh_policy_gate"
+        )
+        is True
+    )
     common_valid = (
         preflight.get("schema")
         == THERMAL_MESH_PREFLIGHT_CONTRACT_VERSION
         and preflight.get("static_contract_passed") is True
-        and preflight.get("analysis_dispatched_after_premesh") is True
+        and analysis_dispatch_attested
         and preflight.get("required_objects_missing") == []
         and preflight.get("unmeshed_objects") == []
     )
@@ -4244,8 +4676,55 @@ def _thermal_mesh_result_metadata(mesh_plan, preflight):
         and preflight.get("standalone_idle_barrier_passed") is True
         and preflight.get("postflight_identity_passed") is True
     )
+    direct_contract = preflight.get(
+        "direct_analyze_contract", {}
+    )
+    direct_contract_sha256 = preflight.get(
+        "direct_analyze_contract_sha256", ""
+    )
+    direct_valid = (
+        direct_analyze
+        and preflight.get("direct_analyze_gate_passed") is True
+        and preflight.get("generate_mesh_called") is False
+        and preflight.get("generate_mesh_returned") is False
+        and preflight.get("analysis_dispatched_after_premesh") is False
+        and preflight.get(
+            "analysis_dispatched_after_mesh_policy_gate"
+        )
+        is True
+        and preflight.get("native_operation_readback_passed") is True
+        and isinstance(direct_contract, dict)
+        and direct_contract.get("schema")
+        == SYMMETRY_THERMAL_DIRECT_ANALYZE_CONTRACT_VERSION
+        and direct_contract.get("generate_mesh_called") is False
+        and direct_contract.get("cooling_boundary_modified") is False
+        and direct_contract.get(
+            "geometry_modified_by_fast_path"
+        )
+        is False
+        and direct_contract.get(
+            "thermal_setup_modified_by_fast_path"
+        )
+        is False
+        and direct_contract.get(
+            "thermal_iteration_settings_modified_by_fast_path"
+        )
+        is False
+        and direct_contract.get(
+            "solver_result_extraction_unchanged"
+        )
+        is True
+        and direct_contract.get(
+            "scientific_truth_gates_unchanged"
+        )
+        is True
+        and direct_contract_sha256
+        == _direct_analyze_contract_sha256(direct_contract)
+    )
     if not common_valid or (
-        not pooled_not_applicable and not standalone_valid
+        not pooled_not_applicable
+        and not standalone_valid
+        and not direct_valid
     ):
         raise RuntimeError(
             "thermal mesh result metadata requires a passed pre-solve "
@@ -4301,7 +4780,20 @@ def _thermal_mesh_result_metadata(mesh_plan, preflight):
             preflight.get("status", "passed_standalone_native_premesh")
         ],
         "thermal_mesh_native_generation_passed": [
-            0 if pooled_not_applicable else 1
+            0 if pooled_not_applicable or direct_analyze else 1
+        ],
+        "thermal_mesh_direct_analyze_opt_in": [
+            1 if direct_analyze else 0
+        ],
+        "thermal_mesh_direct_analyze_contract_version": [
+            (
+                SYMMETRY_THERMAL_DIRECT_ANALYZE_CONTRACT_VERSION
+                if direct_analyze
+                else ""
+            )
+        ],
+        "thermal_mesh_direct_analyze_contract_sha256": [
+            direct_contract_sha256 if direct_analyze else ""
         ],
         "thermal_mesh_unmeshed_object_count": [0],
         "thermal_mesh_unmeshed_objects_json": ["[]"],
@@ -5082,6 +5574,13 @@ def _solve_exact_thermal_setup(
             completion_poll.get("desktop_attested") is True
             and running is False
         )
+        mesh_preflight = getattr(
+            sim, "thermal_mesh_preflight", {}
+        )
+        direct_analyze_mesh_policy = (
+            mesh_preflight.get("status")
+            == SYMMETRY_THERMAL_DIRECT_ANALYZE_STATUS
+        )
         attempt_record = {
             "attempt": len(attempts) + 1,
             "dispatch_status": status,
@@ -5099,22 +5598,35 @@ def _solve_exact_thermal_setup(
             "aedt_messages": messages,
             "identity": preflight,
             "mesh_preflight": {
-                "schema": getattr(
-                    sim, "thermal_mesh_preflight", {}
-                ).get("schema", ""),
-                "passed": getattr(
-                    sim, "thermal_mesh_preflight", {}
-                ).get("passed", False),
-                "mesh_plan_sha256": getattr(
-                    sim, "thermal_mesh_preflight", {}
-                ).get("mesh_plan_sha256", ""),
-                "mesh_artifact_readback_passed": getattr(
-                    sim, "thermal_mesh_preflight", {}
-                ).get("mesh_artifact_readback_passed", False),
-                "mesh_mapping_coverage_passed": getattr(
-                    sim, "thermal_mesh_preflight", {}
-                ).get("mesh_mapping_coverage_passed", False),
-                "analysis_dispatched_after_premesh": True,
+                "schema": mesh_preflight.get("schema", ""),
+                "status": mesh_preflight.get("status", ""),
+                "passed": mesh_preflight.get("passed", False),
+                "mesh_plan_sha256": mesh_preflight.get(
+                    "mesh_plan_sha256", ""
+                ),
+                "mesh_artifact_readback_passed": (
+                    mesh_preflight.get(
+                        "mesh_artifact_readback_passed", False
+                    )
+                ),
+                "mesh_mapping_coverage_passed": (
+                    mesh_preflight.get(
+                        "mesh_mapping_coverage_passed", False
+                    )
+                ),
+                "direct_analyze_gate_passed": (
+                    mesh_preflight.get(
+                        "direct_analyze_gate_passed", False
+                    )
+                ),
+                "generate_mesh_called": mesh_preflight.get(
+                    "generate_mesh_called",
+                    not direct_analyze_mesh_policy,
+                ),
+                "analysis_dispatched_after_premesh": (
+                    not direct_analyze_mesh_policy
+                ),
+                "analysis_dispatched_after_mesh_policy_gate": True,
             },
             "parallel_policy": dict(standalone_parallel_policy),
             "parallel_attestation": {
@@ -6603,6 +7115,9 @@ def run_thermal_analysis(sim):
 
     mode = str(df["thermal_symmetry"].iloc[0])
     eighth = mode == "eighth"
+    direct_analyze_request = (
+        _symmetry_thermal_direct_analyze_request(df)
+    )
 
     # Copied Maxwell loss extraction can leave pyProject's cached gRPC proxy
     # stale even though the original Desktop session remains healthy. Rebind
@@ -6685,7 +7200,21 @@ def run_thermal_analysis(sim):
 
     from module.aedt_pool_adapter import pooled_backend_enabled
     pooled_backend = pooled_backend_enabled()
-    if pooled_backend:
+    if direct_analyze_request is not None:
+        # Preserve native setup/mesh-operation readback, fixed cooling, and
+        # every post-solve truth gate.  The sole omitted operation is the
+        # standalone GenerateMesh call that can block before Analyze.
+        thermal_mesh_preflight = (
+            _symmetry_thermal_direct_analyze_preflight(
+                sim,
+                ipk,
+                setup,
+                thermal_mesh_plan,
+                direct_analyze_request,
+                thermal_pad_readback,
+            )
+        )
+    elif pooled_backend:
         # A Desktop-wide idle state cannot identify one project in an attached
         # multi-project AEDT host.  Preserve the existing project-scoped
         # nonblocking Analyze protocol; standalone recovery alone opts into
@@ -6723,10 +7252,20 @@ def run_thermal_analysis(sim):
     convergence = solve_result["convergence"]
     if int(solve_attempts) < 1:
         raise RuntimeError(
-            "thermal Analyze was not dispatched after native mesh preflight"
+            "thermal Analyze was not dispatched after the mesh policy gate"
         )
     thermal_mesh_preflight = dict(thermal_mesh_preflight)
-    thermal_mesh_preflight["analysis_dispatched_after_premesh"] = True
+    direct_analyze = (
+        thermal_mesh_preflight.get("status")
+        == SYMMETRY_THERMAL_DIRECT_ANALYZE_STATUS
+    )
+    thermal_mesh_preflight[
+        "analysis_dispatched_after_mesh_policy_gate"
+    ] = True
+    if not direct_analyze:
+        thermal_mesh_preflight[
+            "analysis_dispatched_after_premesh"
+        ] = True
     sim.thermal_mesh_preflight = dict(thermal_mesh_preflight)
     thermal_mesh_metadata = _thermal_mesh_result_metadata(
         thermal_mesh_plan, thermal_mesh_preflight

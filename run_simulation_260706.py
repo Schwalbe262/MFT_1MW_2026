@@ -8687,6 +8687,15 @@ def parse_args():
                         help="design2(손실 원샷) 생략")
     parser.add_argument("--thermal", dest="thermal_on", action="store_true", default=None,
                         help="design3(Icepak 열해석)까지 수행")
+    parser.add_argument(
+        "--symmetry-thermal-direct-analyze",
+        action="store_true",
+        help=(
+            "explicitly opt into the versioned standalone Standard 1/8 "
+            "thermal path that dispatches ThermalSetup without a separate "
+            "native GenerateMesh preflight"
+        ),
+    )
     parser.add_argument("--hold", action="store_true",
                         help="해석 완료 후 AEDT/프로젝트를 닫지 않고 유지 (결과 직접 확인용, 1회 실행)")
     parser.add_argument("--golden", action="store_true",
@@ -8719,6 +8728,17 @@ def _main_impl():
 
     args = parse_args()
     require_consecutive = bool(getattr(args, "require_consecutive", False))
+    if bool(
+        getattr(args, "symmetry_thermal_direct_analyze", False)
+    ):
+        from module.thermal_260706 import (
+            SYMMETRY_THERMAL_DIRECT_ANALYZE_ENV,
+            SYMMETRY_THERMAL_DIRECT_ANALYZE_TOKEN,
+        )
+
+        os.environ[SYMMETRY_THERMAL_DIRECT_ANALYZE_ENV] = (
+            SYMMETRY_THERMAL_DIRECT_ANALYZE_TOKEN
+        )
 
     if require_consecutive and (args.count is None or args.count <= 0):
         raise ValueError("--require-consecutive requires a positive --count")
