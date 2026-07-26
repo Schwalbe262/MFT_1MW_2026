@@ -52,7 +52,7 @@ SCHEDULER_URL = "http://127.0.0.1:8002"
 TASK_NAME = "mft-goal-corrected-thermal-l96230-b7c30cb70b95-v1"
 ACCOUNT = "r1jae262"
 ACCOUNT_UID = 1455
-TARGET_NODE = "n116"
+TARGET_NODE = "n111"
 FORBIDDEN_NODE = "n114"
 SOURCE_LOGICAL_TASK_ID = 96230
 SOURCE_EXECUTION_TASK_ID = 96304
@@ -1673,11 +1673,11 @@ def validate_node_gate(
         for row in allocations
         if isinstance(row, Mapping)
         and row.get("node_name") == TARGET_NODE
-        and str(row.get("state") or "").lower() == "active"
+        and row.get("node_metrics_observed_at")
     ]
     if not candidates:
         raise CorrectedThermalError(
-            f"{TARGET_NODE} has no fresh active node telemetry"
+            f"{TARGET_NODE} has no fresh node telemetry"
         )
     candidates.sort(
         key=lambda row: (
@@ -1763,6 +1763,9 @@ def validate_node_gate(
     return {
         "node": TARGET_NODE,
         "node_state": state,
+        "telemetry_carrier_allocation_state": str(
+            node.get("state") or ""
+        ).lower(),
         "node_free_cpus": cpu_total - cpu_used,
         "node_free_memory_mb": memory_free,
         "node_metrics_observed_at": observed_at.isoformat(),
@@ -1808,6 +1811,18 @@ def parse_gpfs_quota(output: str) -> dict[str, Any]:
         raise CorrectedThermalError("GPFS quota row has invalid numbers") from exc
 
 
+def _gpfs_quota_command() -> str:
+    return (
+        "export LC_ALL=C; "
+        "q=/usr/lpp/mmfs/bin/mmlsquota; "
+        'test -x "$q"; '
+        'u="$(id -un)"; n="$(id -u)"; '
+        f'test "$u" = {_shell_quote(ACCOUNT)}; '
+        f'test "$n" = {_shell_quote(ACCOUNT_UID)}; '
+        '"$q" -u "$u" -Y gpfs'
+    )
+
+
 def probe_gpfs_quota(
     *,
     host: str,
@@ -1835,11 +1850,7 @@ def probe_gpfs_quota(
             auth_timeout=20,
             banner_timeout=20,
         )
-        command = (
-            "export LC_ALL=C; "
-            "q=/usr/lpp/mmfs/bin/mmlsquota; "
-            'test -x "$q"; "$q" -u "$(id -u)" -Y gpfs'
-        )
+        command = _gpfs_quota_command()
         _stdin, stdout, stderr = client.exec_command(command, timeout=60)
         raw = stdout.read(2 * 1024**2 + 1)
         error = stderr.read(64 * 1024 + 1)
