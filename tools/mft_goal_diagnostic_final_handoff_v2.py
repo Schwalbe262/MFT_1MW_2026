@@ -19,6 +19,8 @@ import shutil
 import stat
 import sys
 from typing import Any, Mapping
+import urllib.error
+import urllib.request
 import uuid
 
 
@@ -104,7 +106,7 @@ class HandoffError(RuntimeError):
     """Raised when an authority or publication gate is not satisfied."""
 
 
-def canonical_sha256(value: Mapping[str, Any]) -> str:
+def canonical_value_sha256(value: Any) -> str:
     payload = json.dumps(
         value,
         ensure_ascii=True,
@@ -112,6 +114,10 @@ def canonical_sha256(value: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def canonical_sha256(value: Mapping[str, Any]) -> str:
+    return canonical_value_sha256(value)
 
 
 def sha256_file(path: Path) -> str:
@@ -150,6 +156,48 @@ def _regular_file(path: Path, *, maximum_bytes: int | None = None) -> Path:
     ):
         raise HandoffError(f"unsafe regular file: {path}")
     return path
+
+
+def _contained_file(root: Path, relative: str) -> Path:
+    pure = Path(relative)
+    if (
+        not relative
+        or pure.is_absolute()
+        or ".." in pure.parts
+        or any(part in {"", "."} for part in pure.parts)
+    ):
+        raise HandoffError(f"unsafe relative authority path: {relative!r}")
+    root = _real_directory(root, label="authority root")
+    current = root
+    for part in pure.parts[:-1]:
+        current = current / part
+        metadata = current.lstat()
+        if (
+            current.is_symlink()
+            or _is_reparse(metadata)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise HandoffError(f"unsafe authority ancestor: {current}")
+    path = current / pure.parts[-1]
+    _regular_file(path)
+    resolved = path.resolve(strict=True)
+    if root not in resolved.parents:
+        raise HandoffError(f"authority file escaped its root: {relative}")
+    return path
+
+
+def _inventory_paths(root: Path) -> set[str]:
+    root = _real_directory(root, label="inventory root")
+    files: set[str] = set()
+    for path in root.rglob("*"):
+        metadata = path.lstat()
+        if path.is_symlink() or _is_reparse(metadata):
+            raise HandoffError(f"inventory contains a link/reparse point: {path}")
+        if stat.S_ISREG(metadata.st_mode):
+            files.add(path.relative_to(root).as_posix())
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise HandoffError(f"inventory contains a special file: {path}")
+    return files
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -193,7 +241,7 @@ def _record(path: Path, *, relative_to: Path | None = None) -> dict[str, Any]:
 
 
 def _require_file(base: Path, relative: str, expected_sha: str) -> dict[str, Any]:
-    path = base.joinpath(*relative.split("/"))
+    path = _contained_file(base, relative)
     record = _record(path, relative_to=base)
     if record["sha256"] != expected_sha:
         raise HandoffError(f"authority SHA drifted: {relative}")
@@ -321,19 +369,23 @@ def _validate_model_package(base: Path) -> dict[str, Any]:
         ):
             raise HandoffError("model sealed-file path is unsafe or duplicated")
         expected_paths.add(relative)
-        actual = _record(model_root / relative, relative_to=model_root)
+        actual = _record(
+            _contained_file(model_root, relative), relative_to=model_root
+        )
         if (
             actual["sha256"] != item.get("sha256")
             or actual["size_bytes"] != item.get("size_bytes")
         ):
             raise HandoffError(f"model sealed file drifted: {relative}")
-    actual_paths = {
-        path.relative_to(model_root).as_posix()
-        for path in model_root.rglob("*")
-        if path.is_file()
-    }
+    actual_paths = _inventory_paths(model_root)
     if actual_paths != expected_paths | {"package_seal.json"}:
         raise HandoffError("model package file set drifted")
+    if (
+        seal.get("sealed_file_count") != len(sealed_files)
+        or seal.get("sealed_file_inventory_sha256")
+        != canonical_value_sha256(sealed_files)
+    ):
+        raise HandoffError("model package inventory seal drifted")
     return {
         "root": str(model_root),
         "manifest": records["model_manifest"],
@@ -373,23 +425,44 @@ def _validate_open_collection(base: Path) -> dict[str, Any]:
     if not isinstance(lanes, dict) or set(lanes) != {"full", "symmetric"}:
         raise HandoffError("open collection lanes drifted")
     expected_paths = {"local_collection_receipt.json"}
+    expected_artifacts = {
+        "full": (
+            EXPECTED_FILES["full_aedt"][1],
+            9098949,
+        ),
+        "symmetric": (
+            EXPECTED_FILES["symmetric_aedt"][1],
+            12303745,
+        ),
+    }
     for lane in ("full", "symmetric"):
         item = lanes[lane]
         files = item.get("files") if isinstance(item, dict) else None
-        if not isinstance(files, dict):
+        artifact_sha, artifact_size = expected_artifacts[lane]
+        if (
+            not isinstance(files, dict)
+            or item.get("artifact_sha256") != artifact_sha
+            or item.get("artifact_size_bytes") != artifact_size
+        ):
             raise HandoffError(f"open collection {lane} files are absent")
         for name, digest in files.items():
             relative = f"{lane}/{name}"
             expected_paths.add(relative)
-            if _record(root / relative, relative_to=root)["sha256"] != digest:
+            if (
+                _record(
+                    _contained_file(root, relative), relative_to=root
+                )["sha256"]
+                != digest
+            ):
                 raise HandoffError(f"open collection file drifted: {relative}")
-        if not all(bool(value) for value in item.get("checks", {}).values()):
+        checks = item.get("checks")
+        if (
+            not isinstance(checks, dict)
+            or not checks
+            or not all(value is True for value in checks.values())
+        ):
             raise HandoffError(f"open collection {lane} check failed")
-    actual_paths = {
-        path.relative_to(root).as_posix()
-        for path in root.rglob("*")
-        if path.is_file()
-    }
+    actual_paths = _inventory_paths(root)
     if actual_paths != expected_paths:
         raise HandoffError("open collection file set drifted")
     return {
@@ -435,7 +508,58 @@ def _validate_full_failure(base: Path) -> dict[str, Any]:
     }
 
 
-def validate_terminal_evidence(path: Path, base: Path) -> dict[str, Any]:
+def _scheduler_authority(
+    scheduler_url: str,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    base = str(scheduler_url or "").rstrip("/")
+    if not base.startswith(("http://127.0.0.1:", "http://localhost:")):
+        raise HandoffError("Scheduler authority URL is not local")
+
+    def fetch(relative: str, *, maximum: int) -> bytes:
+        request = urllib.request.Request(
+            f"{base}{relative}",
+            method="GET",
+            headers={"Accept": "application/json, text/plain"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = response.read(maximum + 1)
+        except (OSError, urllib.error.URLError) as exc:
+            raise HandoffError(
+                f"Scheduler GET authority failed: {relative}"
+            ) from exc
+        if len(payload) > maximum:
+            raise HandoffError(
+                f"Scheduler GET authority exceeded bound: {relative}"
+            )
+        return payload
+
+    raw_task = fetch("/api/tasks/96313", maximum=2 * 1024 * 1024)
+    try:
+        task = json.loads(raw_task)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HandoffError("Scheduler task authority is invalid JSON") from exc
+    if not isinstance(task, dict):
+        raise HandoffError("Scheduler task authority is not an object")
+    streams = {
+        "stdout": fetch(
+            "/api/tasks/96313/stdout?max_bytes=16777216",
+            maximum=16 * 1024 * 1024,
+        ),
+        "stderr": fetch(
+            "/api/tasks/96313/stderr?max_bytes=16777216",
+            maximum=16 * 1024 * 1024,
+        ),
+    }
+    return task, streams
+
+
+def validate_terminal_evidence(
+    path: Path,
+    base: Path,
+    *,
+    scheduler_url: str,
+) -> dict[str, Any]:
     evidence = _validate_seal(
         path,
         schema_field="schema",
@@ -465,20 +589,59 @@ def validate_terminal_evidence(path: Path, base: Path) -> dict[str, Any]:
         or access.get("mutation_performed") is not False
     ):
         raise HandoffError("task96313 terminal evidence identity drifted")
-    state = str(task.get("state") or "")
-    status = str(task.get("status") or "")
+    state = task.get("state")
+    status = task.get("status")
     exit_code = task.get("exit_code")
-    if state == "succeeded":
-        if status != "completed" or exit_code != 0:
-            raise HandoffError("task96313 success union is invalid")
+    if (
+        state == "succeeded"
+        and status == "completed"
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code == 0
+    ):
         terminal_branch = "success"
-    elif state in {"failed", "cancelled"}:
-        if status not in {"failed", "cancelled"} or exit_code == 0:
-            raise HandoffError("task96313 failure union is invalid")
+    elif (
+        state == "failed"
+        and status == "failed"
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code != 0
+    ):
+        terminal_branch = "failure"
+    elif (
+        state == "cancelled"
+        and status == "cancelled"
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code != 0
+    ):
         terminal_branch = "failure"
     else:
         raise HandoffError(
-            "task96313 is pending/active/unknown; final publication refused"
+            "task96313 terminal union is invalid or active; publication refused"
+        )
+    if evidence.get("diagnostic_temperature_observation_available") is not False:
+        raise HandoffError(
+            "unbound diagnostic temperature observation is forbidden"
+        )
+    live_task, live_streams = _scheduler_authority(scheduler_url)
+    live_contract = {
+        "task_id": live_task.get("id"),
+        "name": live_task.get("name"),
+        "account_name": live_task.get("account_name"),
+        "actual_node_name": live_task.get("actual_node_name"),
+        "assigned_allocation": live_task.get("assigned_allocation"),
+        "slurm_job_id": str(live_task.get("slurm_job_id") or ""),
+        "cpus": live_task.get("cpus"),
+        "memory_mb": live_task.get("memory_mb"),
+        "timeout_seconds": live_task.get("timeout_seconds"),
+        "state": live_task.get("state"),
+        "status": live_task.get("status"),
+        "exit_code": live_task.get("exit_code"),
+    }
+    if live_contract != task:
+        raise HandoffError(
+            "terminal evidence does not match live Scheduler GET authority"
         )
     terminal_root = _real_directory(path.parent, label="terminal evidence root")
     root = base.resolve(strict=True)
@@ -487,20 +650,24 @@ def validate_terminal_evidence(path: Path, base: Path) -> dict[str, Any]:
     streams = evidence.get("streams")
     if not isinstance(streams, dict) or set(streams) != {"stdout", "stderr"}:
         raise HandoffError("terminal stream evidence is incomplete")
-    for stream in streams.values():
+    expected_stream_paths = {
+        "stdout": "stdout.log",
+        "stderr": "stderr.log",
+    }
+    for stream_name, stream in streams.items():
         if not isinstance(stream, dict):
             raise HandoffError("terminal stream record is invalid")
         relative = str(stream.get("path") or "")
+        if relative != expected_stream_paths[stream_name]:
+            raise HandoffError("terminal stream path contract drifted")
+        actual_path = _contained_file(terminal_root, relative)
+        actual = _record(actual_path, relative_to=terminal_root)
         if (
-            Path(relative).is_absolute()
-            or ".." in Path(relative).parts
-            or not relative
-        ):
-            raise HandoffError("terminal stream path is unsafe")
-        actual = _record(terminal_root / relative, relative_to=terminal_root)
-        if (
-            actual["sha256"] != stream.get("sha256")
+            actual["size_bytes"] > 16 * 1024 * 1024
+            or stream.get("size_bytes", 0) > 16 * 1024 * 1024
+            or actual["sha256"] != stream.get("sha256")
             or actual["size_bytes"] != stream.get("size_bytes")
+            or actual_path.read_bytes() != live_streams.get(stream_name)
         ):
             raise HandoffError("terminal stream evidence drifted")
     return {
@@ -509,11 +676,9 @@ def validate_terminal_evidence(path: Path, base: Path) -> dict[str, Any]:
         "evidence_payload_sha256": evidence["payload_sha256"],
         "terminal_branch": terminal_branch,
         "task": task,
-        "diagnostic_temperature_observation_available": bool(
-            evidence.get("diagnostic_temperature_observation_available")
-        )
-        if terminal_branch == "success"
-        else False,
+        "scheduler_task_get_sha256": canonical_sha256(live_task),
+        "scheduler_get_reauthenticated": True,
+        "diagnostic_temperature_observation_available": False,
     }
 
 
@@ -562,7 +727,9 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
             return
     if destination.exists():
         raise FileExistsError(destination)
-    os.rename(source, destination)
+    raise HandoffError(
+        "kernel no-replace directory rename is unavailable on this platform"
+    )
 
 
 def _validate_existing(
@@ -577,9 +744,15 @@ def _validate_existing(
     destination = _real_directory(
         destination, label="existing handoff package"
     )
-    actual_names = {
-        path.name for path in destination.iterdir() if path.is_file()
-    }
+    entries = list(destination.iterdir())
+    if any(
+        path.is_symlink()
+        or _is_reparse(path.lstat())
+        or not stat.S_ISREG(path.lstat().st_mode)
+        for path in entries
+    ):
+        raise HandoffError("existing handoff contains a non-regular entry")
+    actual_names = {path.name for path in entries}
     if actual_names != {
         "DIAGNOSTIC_ONLY_DO_NOT_PROMOTE.txt",
         "handoff_manifest.json",
@@ -596,7 +769,12 @@ def _validate_existing(
     )
     truth = manifest.get("truth_gates")
     if (
-        manifest.get("package_kind") != "diagnostic_reference_only"
+        manifest.get("campaign_id") != CAMPAIGN_ID
+        or manifest.get("package_name") != destination.name
+        or manifest.get("candidate_sha256") != CANDIDATE_SHA256
+        or manifest.get("fixed_physics_sha256") != FIXED_PHYSICS_SHA256
+        or manifest.get("external_authority_required") is not True
+        or manifest.get("package_kind") != "diagnostic_reference_only"
         or manifest.get("reference_only") is not True
         or manifest.get("self_contained") is not False
         or not isinstance(truth, dict)
@@ -618,14 +796,46 @@ def _validate_existing(
     if not isinstance(sealed_files, list) or len(sealed_files) != 2:
         raise HandoffError("existing handoff sealed inventory drifted")
     actual_sealed = []
+    sealed_names: list[str] = []
     for item in sealed_files:
         if not isinstance(item, dict):
             raise HandoffError("existing handoff sealed row is invalid")
         relative = str(item.get("path") or "")
-        actual = _record(destination / relative, relative_to=destination)
+        if (
+            relative not in {
+                "DIAGNOSTIC_ONLY_DO_NOT_PROMOTE.txt",
+                "handoff_manifest.json",
+            }
+            or relative in sealed_names
+        ):
+            raise HandoffError("existing handoff sealed path drifted")
+        sealed_names.append(relative)
+        actual = _record(
+            _contained_file(destination, relative), relative_to=destination
+        )
         if actual != item:
             raise HandoffError(f"existing handoff file drifted: {relative}")
         actual_sealed.append(actual)
+    internal = manifest.get("internal_inventory")
+    warning_record = next(
+        (
+            item
+            for item in actual_sealed
+            if item["path"] == "DIAGNOSTIC_ONLY_DO_NOT_PROMOTE.txt"
+        ),
+        None,
+    )
+    if (
+        set(sealed_names)
+        != {
+            "DIAGNOSTIC_ONLY_DO_NOT_PROMOTE.txt",
+            "handoff_manifest.json",
+        }
+        or internal != [warning_record]
+        or manifest.get("internal_tree_sha256")
+        != canonical_sha256({"files": [warning_record]})
+    ):
+        raise HandoffError("existing handoff internal tree drifted")
     if (
         seal.get("sealed_file_inventory_sha256")
         != canonical_sha256({"files": actual_sealed})
@@ -656,6 +866,7 @@ def publish_handoff(
     *,
     base_root: Path,
     terminal_evidence_path: Path,
+    scheduler_url: str,
     output_name: str = PACKAGE_NAME,
 ) -> dict[str, Any]:
     base = _real_directory(base_root, label="campaign root")
@@ -665,7 +876,9 @@ def publish_handoff(
         or output_name.startswith(".")
     ):
         raise HandoffError("output name is unsafe")
-    terminal = validate_terminal_evidence(terminal_evidence_path, base)
+    terminal = validate_terminal_evidence(
+        terminal_evidence_path, base, scheduler_url=scheduler_url
+    )
     pareto_before = _validate_pareto(base)
     model_before = _validate_model_package(base)
     open_before = _validate_open_collection(base)
@@ -687,8 +900,8 @@ def publish_handoff(
         claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400
     )
     os.close(claim_descriptor)
-    staging.mkdir(mode=0o700)
     try:
+        staging.mkdir(mode=0o700)
         warning_path = staging / "DIAGNOSTIC_ONLY_DO_NOT_PROMOTE.txt"
         warning = (
             "DIAGNOSTIC REFERENCE PACKAGE ONLY.\n"
@@ -818,7 +1031,11 @@ def publish_handoff(
             or _validate_model_package(base) != model_before
             or _validate_open_collection(base) != open_before
             or _validate_full_failure(base) != full_failure_before
-            or validate_terminal_evidence(terminal_evidence_path, base)
+            or validate_terminal_evidence(
+                terminal_evidence_path,
+                base,
+                scheduler_url=scheduler_url,
+            )
             != terminal
         ):
             raise HandoffError("external authority changed during staging")
@@ -857,6 +1074,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--terminal-evidence", required=True, type=Path)
     parser.add_argument("--output-name", default=PACKAGE_NAME)
     parser.add_argument(
+        "--scheduler-url", default="http://127.0.0.1:8002"
+    )
+    parser.add_argument(
         "--preflight-only",
         action="store_true",
         help="authenticate all authorities but do not publish",
@@ -872,7 +1092,9 @@ def main(argv: list[str] | None = None) -> int:
             result = {
                 "status": "preflight_passed",
                 "terminal": validate_terminal_evidence(
-                    args.terminal_evidence, base
+                    args.terminal_evidence,
+                    base,
+                    scheduler_url=args.scheduler_url,
                 ),
                 "pareto": _validate_pareto(base),
                 "models": _validate_model_package(base),
@@ -883,6 +1105,7 @@ def main(argv: list[str] | None = None) -> int:
             result = publish_handoff(
                 base_root=base,
                 terminal_evidence_path=args.terminal_evidence,
+                scheduler_url=args.scheduler_url,
                 output_name=args.output_name,
             )
     except (HandoffError, OSError, ValueError) as exc:

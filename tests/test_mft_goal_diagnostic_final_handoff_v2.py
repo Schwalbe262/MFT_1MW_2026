@@ -55,28 +55,112 @@ def _sealed_terminal(root: Path, *, state: str, status: str, exit_code):
     return path
 
 
-def test_pending_terminal_evidence_is_refused(tmp_path: Path) -> None:
+def _mock_scheduler(
+    monkeypatch: pytest.MonkeyPatch, terminal_path: Path
+) -> None:
+    value = json.loads(terminal_path.read_text(encoding="utf-8"))
+    task = dict(value["task"])
+    task["id"] = task.pop("task_id")
+    root = terminal_path.parent
+    streams = {
+        name: (root / record["path"]).read_bytes()
+        for name, record in value["streams"].items()
+    }
+    monkeypatch.setattr(
+        handoff,
+        "_scheduler_authority",
+        lambda _url: (task, streams),
+    )
+
+
+def test_pending_terminal_evidence_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "campaign" / "terminal"
     root.mkdir(parents=True)
     path = _sealed_terminal(
         root, state="running", status="running", exit_code=None
     )
+    _mock_scheduler(monkeypatch, path)
 
     with pytest.raises(handoff.HandoffError, match="publication refused"):
-        handoff.validate_terminal_evidence(path, tmp_path / "campaign")
+        handoff.validate_terminal_evidence(
+            path, tmp_path / "campaign", scheduler_url="http://127.0.0.1:8002"
+        )
 
 
-def test_terminal_evidence_detects_stream_drift(tmp_path: Path) -> None:
+def test_terminal_evidence_detects_stream_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     campaign = tmp_path / "campaign"
     root = campaign / "terminal"
     root.mkdir(parents=True)
     path = _sealed_terminal(
         root, state="failed", status="failed", exit_code=124
     )
+    _mock_scheduler(monkeypatch, path)
     (root / "stdout.log").write_text("drift\n", encoding="utf-8")
 
     with pytest.raises(handoff.HandoffError, match="stream evidence drifted"):
-        handoff.validate_terminal_evidence(path, campaign)
+        handoff.validate_terminal_evidence(
+            path, campaign, scheduler_url="http://127.0.0.1:8002"
+        )
+
+
+@pytest.mark.parametrize(
+    ("state", "status", "exit_code"),
+    [
+        ("succeeded", "completed", False),
+        ("succeeded", "failed", 0),
+        ("failed", "failed", None),
+        ("failed", "completed", 124),
+        ("cancelled", "failed", 1),
+    ],
+)
+def test_terminal_union_rejects_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    status: str,
+    exit_code,
+) -> None:
+    campaign = tmp_path / "campaign"
+    root = campaign / "terminal"
+    root.mkdir(parents=True)
+    path = _sealed_terminal(
+        root, state=state, status=status, exit_code=exit_code
+    )
+    _mock_scheduler(monkeypatch, path)
+
+    with pytest.raises(handoff.HandoffError, match="terminal union"):
+        handoff.validate_terminal_evidence(
+            path, campaign, scheduler_url="http://127.0.0.1:8002"
+        )
+
+
+def test_terminal_evidence_must_match_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = tmp_path / "campaign"
+    root = campaign / "terminal"
+    root.mkdir(parents=True)
+    path = _sealed_terminal(
+        root, state="failed", status="failed", exit_code=124
+    )
+    _mock_scheduler(monkeypatch, path)
+    original = handoff._scheduler_authority
+
+    def drifted(url: str):
+        task, streams = original(url)
+        task = dict(task)
+        task["exit_code"] = 1
+        return task, streams
+
+    monkeypatch.setattr(handoff, "_scheduler_authority", drifted)
+    with pytest.raises(handoff.HandoffError, match="live Scheduler GET"):
+        handoff.validate_terminal_evidence(
+            path, campaign, scheduler_url="http://127.0.0.1:8002"
+        )
 
 
 def test_no_replace_publish_and_existing_authentication(
@@ -88,7 +172,12 @@ def test_no_replace_publish_and_existing_authentication(
     terminal_path = _sealed_terminal(
         terminal_root, state="failed", status="failed", exit_code=124
     )
-    terminal = handoff.validate_terminal_evidence(terminal_path, campaign)
+    _mock_scheduler(monkeypatch, terminal_path)
+    terminal = handoff.validate_terminal_evidence(
+        terminal_path,
+        campaign,
+        scheduler_url="http://127.0.0.1:8002",
+    )
     reference = {
         "root": "authority",
         "sha256": "1" * 64,
@@ -111,11 +200,13 @@ def test_no_replace_publish_and_existing_authentication(
     first = handoff.publish_handoff(
         base_root=campaign,
         terminal_evidence_path=terminal_path,
+        scheduler_url="http://127.0.0.1:8002",
         output_name="handoff-v2",
     )
     second = handoff.publish_handoff(
         base_root=campaign,
         terminal_evidence_path=terminal_path,
+        scheduler_url="http://127.0.0.1:8002",
         output_name="handoff-v2",
     )
 
@@ -129,3 +220,11 @@ def test_no_replace_publish_and_existing_authentication(
         "handoff_manifest.json",
         "handoff_seal.json",
     ]
+    (campaign / "handoff-v2" / "extra").mkdir()
+    with pytest.raises(handoff.HandoffError, match="non-regular entry"):
+        handoff.publish_handoff(
+            base_root=campaign,
+            terminal_evidence_path=terminal_path,
+            scheduler_url="http://127.0.0.1:8002",
+            output_name="handoff-v2",
+        )
