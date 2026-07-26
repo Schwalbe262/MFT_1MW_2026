@@ -34,7 +34,7 @@ class GateReader:
             "scheduler_stalled": False,
         }
         self.anchor = {
-            "task_id": rounded.SAME_NODE_AS_TASK_ID,
+            "task_id": rounded.SOURCE_LINEAGE_TASK_ID,
             "name": submitter.SOURCE_ANCHOR_TASK_NAME,
             "dedupe_key": submitter.SOURCE_ANCHOR_DEDUPE_KEY,
             "project": rounded.PROJECT,
@@ -135,7 +135,7 @@ class GateReader:
     def reader(self, path: str, query: Any) -> Any:
         if path == "/api/health":
             return copy.deepcopy(self.health)
-        if path == f"/api/tasks/{rounded.SAME_NODE_AS_TASK_ID}":
+        if path == f"/api/tasks/{rounded.SOURCE_LINEAGE_TASK_ID}":
             return copy.deepcopy(self.anchor)
         if path == "/api/task-capacity":
             assert dict(query or []) == dict(submitter.capacity_query())
@@ -162,7 +162,6 @@ def _payload() -> dict[str, Any]:
         "account_name": rounded.ACCOUNT_NAME,
         "node_name": rounded.NODE_NAME,
         "node_name_policy": "strict",
-        "same_node_as_task_id": rounded.SAME_NODE_AS_TASK_ID,
         "cpus": rounded.CPUS,
         "memory_mb": rounded.MEMORY_MB,
         "max_workers_per_node": rounded.MAX_WORKERS_PER_NODE,
@@ -213,7 +212,8 @@ def test_live_gate_accepts_terminal_lineage_and_saturated_running_cap() -> None:
     )
     submitter.validate_seal(gate, submitter.LIVE_GATE_SCHEMA)
     assert gate["source_allocation_id"] == 14_620
-    assert gate["same_node_as_task_id"] == 96_328
+    assert gate["same_node_as_task_id"] == 0
+    assert gate["source_lineage_task_id"] == 96_328
     assert gate["active_target_node_fea_task_ids"] == []
     assert gate["account_gate"]["running_cap_saturated"] is True
     assert gate["account_gate"]["new_slurm_job_requested"] is False

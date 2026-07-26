@@ -126,7 +126,7 @@ def load_contract(
         or payload.get("dedupe_key") != receipt.get("dedupe_key")
         or payload.get("account_name") != ACCOUNT_NAME
         or payload.get("node_name") != NODE_NAME
-        or payload.get("same_node_as_task_id") != SAME_NODE_AS_TASK_ID
+        or "same_node_as_task_id" in payload
         or "requested_allocation_id" in payload
         or payload.get("timeout_seconds") != SCHEDULER_SECONDS
         or retained.get("dedupe_key") != payload.get("dedupe_key")

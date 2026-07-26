@@ -62,7 +62,8 @@ SOURCE_SELECTION_ORDER = 5
 # task and explicit allocation id so Scheduler cannot silently relax it.
 ACCOUNT_NAME = "dw16"
 NODE_NAME = "n113"
-SAME_NODE_AS_TASK_ID = 96328
+SOURCE_LINEAGE_TASK_ID = 96328
+SAME_NODE_AS_TASK_ID = 0
 SOURCE_ALLOCATION_ID = 14620
 SOURCE_SLURM_JOB_ID = "829579"
 CPUS = direct.CPUS
@@ -95,16 +96,16 @@ FIXED_BOUNDARY = {
 }
 
 TASK_NAME = (
-    "mft-goal-final-standard-official5-rounded-r10-s4-v2-"
+    "mft-goal-final-standard-official5-rounded-r10-s4-v3-"
     f"{SOURCE_CANDIDATE_SHA256[:12]}-{NODE_NAME}"
 )
 WORKDIR = (
-    "mft_goal_final_standard_official5_rounded_r10_s4_v2_"
+    "mft_goal_final_standard_official5_rounded_r10_s4_v3_"
     f"{SOURCE_CANDIDATE_SHA256[:12]}_{NODE_NAME}"
 )
 OUTPUT_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\final_standard_official5_rounded_r10_s4_prepare_v2"
+    r"\final_standard_official5_rounded_r10_s4_prepare_v3"
 )
 
 PLAN_NAME = "rounded_final_prepare_plan.json"
@@ -115,8 +116,8 @@ PROFILE_NAME = "rounded_execution_profile.json"
 DIMENSIONS_NAME = "drawing_dimensions.json"
 RECEIPT_NAME = "prepare_receipt.json"
 
-PLAN_SCHEMA = "mft-goal-official5-rounded-final-prepare-plan-v2"
-RECEIPT_SCHEMA = "mft-goal-official5-rounded-final-prepare-receipt-v2"
+PLAN_SCHEMA = "mft-goal-official5-rounded-final-prepare-plan-v3"
+RECEIPT_SCHEMA = "mft-goal-official5-rounded-final-prepare-receipt-v3"
 REVISION_SCHEMA = "mft-goal-rounded-final-solver-attestation-v1"
 DIMENSIONS_SCHEMA = "mft-goal-rounded-final-drawing-dimensions-v1"
 PROFILE_SCHEMA = "mft-goal-diagnostic-standard-rounded-final-profile-v1"
@@ -422,7 +423,6 @@ def derive_scheduler_payload(
     payload = copy.deepcopy(payload)
     environment = copy.deepcopy(environment)
     retained = copy.deepcopy(retained)
-    payload["same_node_as_task_id"] = SAME_NODE_AS_TASK_ID
     payload["command"] = direct._direct_command(
         str(payload.get("command") or "")
     )
@@ -459,7 +459,6 @@ def validate_rounded_payload(
         "account_name": ACCOUNT_NAME,
         "node_name": NODE_NAME,
         "node_name_policy": "strict",
-        "same_node_as_task_id": SAME_NODE_AS_TASK_ID,
         "cpus": CPUS,
         "memory_mb": MEMORY_MB,
         "max_workers_per_node": MAX_WORKERS_PER_NODE,
@@ -483,6 +482,8 @@ def validate_rounded_payload(
     )
     if (
         drift
+        or "same_node_as_task_id" in payload
+        or "requested_allocation_id" in payload
         or environment.get(direct.DIRECT_ENV_NAME)
         != direct.DIRECT_ENV_TOKEN
         or environment.get("MFT_STANDALONE_CORE_CONTRACT")
@@ -1018,6 +1019,7 @@ def prepare(
                     "node_name_policy": "strict",
                     "preferred_node_relaxed_allowed": False,
                     "same_node_as_task_id": SAME_NODE_AS_TASK_ID,
+                    "source_lineage_task_id": SOURCE_LINEAGE_TASK_ID,
                     "same_node_as_allocation_id": SOURCE_ALLOCATION_ID,
                     "same_node_as_slurm_job_id": SOURCE_SLURM_JOB_ID,
                     "requested_allocation_id_posted": False,
