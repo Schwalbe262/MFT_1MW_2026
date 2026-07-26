@@ -74,7 +74,7 @@ ALLOCATION_FORCE_END_UTC = datetime(
 )
 MIN_FORCE_END_BUFFER_SECONDS = 5 * 60
 
-POST_AUTHORIZATION = "authorize-official5-rounded-final-one-post-v1"
+POST_AUTHORIZATION = "authorize-official5-rounded-final-one-post-v2"
 SUBMISSION_DIRECTORY_NAME = "submission"
 INTENT_NAME = "scheduler_submission_intent.json"
 ATTEMPT_NAME = "scheduler_post_attempt.json"
@@ -82,12 +82,12 @@ RECEIPT_NAME = "scheduler_submission_receipt.json"
 FINAL_NAME = "rounded_submission_final.json"
 AMBIGUOUS_NAME = "scheduler_post_ambiguous.json"
 
-LIVE_GATE_SCHEMA = "mft-goal-rounded-final-live-gate-v1"
-INTENT_SCHEMA = "mft-goal-rounded-final-submit-intent-v1"
-ATTEMPT_SCHEMA = "mft-goal-rounded-final-submit-attempt-v1"
-RECEIPT_SCHEMA = "mft-goal-rounded-final-submit-receipt-v1"
-FINAL_SCHEMA = "mft-goal-rounded-final-submit-final-v1"
-AMBIGUOUS_SCHEMA = "mft-goal-rounded-final-submit-ambiguous-v1"
+LIVE_GATE_SCHEMA = "mft-goal-rounded-final-live-gate-v2"
+INTENT_SCHEMA = "mft-goal-rounded-final-submit-intent-v2"
+ATTEMPT_SCHEMA = "mft-goal-rounded-final-submit-attempt-v2"
+RECEIPT_SCHEMA = "mft-goal-rounded-final-submit-receipt-v2"
+FINAL_SCHEMA = "mft-goal-rounded-final-submit-final-v2"
+AMBIGUOUS_SCHEMA = "mft-goal-rounded-final-submit-ambiguous-v2"
 
 payload_sha256 = direct.payload_sha256
 sealed = direct.sealed
@@ -460,7 +460,7 @@ def _authenticated_readback(
         "requested_node_name_policy": "strict",
         "preferred_node_relaxed": False,
         "same_node_as_task_id": SAME_NODE_AS_TASK_ID,
-        "requested_allocation_id": SOURCE_ALLOCATION_ID,
+        "requested_allocation_id": 0,
         "cpus": CPUS,
         "memory_mb": MEMORY_MB,
         "timeout_seconds": SCHEDULER_SECONDS,

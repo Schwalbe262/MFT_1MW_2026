@@ -95,16 +95,16 @@ FIXED_BOUNDARY = {
 }
 
 TASK_NAME = (
-    "mft-goal-final-standard-official5-rounded-r10-s4-v1-"
+    "mft-goal-final-standard-official5-rounded-r10-s4-v2-"
     f"{SOURCE_CANDIDATE_SHA256[:12]}-{NODE_NAME}"
 )
 WORKDIR = (
-    "mft_goal_final_standard_official5_rounded_r10_s4_v1_"
+    "mft_goal_final_standard_official5_rounded_r10_s4_v2_"
     f"{SOURCE_CANDIDATE_SHA256[:12]}_{NODE_NAME}"
 )
 OUTPUT_ROOT = Path(
     r"C:\Users\peets\slurm_scheduler_runtime\mft_goal_20260726"
-    r"\final_standard_official5_rounded_r10_s4_prepare_v1"
+    r"\final_standard_official5_rounded_r10_s4_prepare_v2"
 )
 
 PLAN_NAME = "rounded_final_prepare_plan.json"
@@ -115,8 +115,8 @@ PROFILE_NAME = "rounded_execution_profile.json"
 DIMENSIONS_NAME = "drawing_dimensions.json"
 RECEIPT_NAME = "prepare_receipt.json"
 
-PLAN_SCHEMA = "mft-goal-official5-rounded-final-prepare-plan-v1"
-RECEIPT_SCHEMA = "mft-goal-official5-rounded-final-prepare-receipt-v1"
+PLAN_SCHEMA = "mft-goal-official5-rounded-final-prepare-plan-v2"
+RECEIPT_SCHEMA = "mft-goal-official5-rounded-final-prepare-receipt-v2"
 REVISION_SCHEMA = "mft-goal-rounded-final-solver-attestation-v1"
 DIMENSIONS_SCHEMA = "mft-goal-rounded-final-drawing-dimensions-v1"
 PROFILE_SCHEMA = "mft-goal-diagnostic-standard-rounded-final-profile-v1"
@@ -423,7 +423,6 @@ def derive_scheduler_payload(
     environment = copy.deepcopy(environment)
     retained = copy.deepcopy(retained)
     payload["same_node_as_task_id"] = SAME_NODE_AS_TASK_ID
-    payload["requested_allocation_id"] = SOURCE_ALLOCATION_ID
     payload["command"] = direct._direct_command(
         str(payload.get("command") or "")
     )
@@ -461,7 +460,6 @@ def validate_rounded_payload(
         "node_name": NODE_NAME,
         "node_name_policy": "strict",
         "same_node_as_task_id": SAME_NODE_AS_TASK_ID,
-        "requested_allocation_id": SOURCE_ALLOCATION_ID,
         "cpus": CPUS,
         "memory_mb": MEMORY_MB,
         "max_workers_per_node": MAX_WORKERS_PER_NODE,
@@ -1022,6 +1020,8 @@ def prepare(
                     "same_node_as_task_id": SAME_NODE_AS_TASK_ID,
                     "same_node_as_allocation_id": SOURCE_ALLOCATION_ID,
                     "same_node_as_slurm_job_id": SOURCE_SLURM_JOB_ID,
+                    "requested_allocation_id_posted": False,
+                    "allocation_selected_by_same_node_lineage": True,
                     "parallel_to_source_task96338": True,
                 },
                 "source_authority": _relative_record(

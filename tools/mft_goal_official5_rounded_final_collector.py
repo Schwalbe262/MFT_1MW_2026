@@ -127,7 +127,7 @@ def load_contract(
         or payload.get("account_name") != ACCOUNT_NAME
         or payload.get("node_name") != NODE_NAME
         or payload.get("same_node_as_task_id") != SAME_NODE_AS_TASK_ID
-        or payload.get("requested_allocation_id") != ALLOCATION_ID
+        or "requested_allocation_id" in payload
         or payload.get("timeout_seconds") != SCHEDULER_SECONDS
         or retained.get("dedupe_key") != payload.get("dedupe_key")
         or retained.get("artifact_path", "").split("/")[-1]
@@ -201,7 +201,7 @@ def get_task(
         "requested_node_name_policy": "strict",
         "preferred_node_relaxed": False,
         "same_node_as_task_id": SAME_NODE_AS_TASK_ID,
-        "requested_allocation_id": ALLOCATION_ID,
+        "requested_allocation_id": 0,
         "cpus": CPUS,
         "memory_mb": MEMORY_MB,
         "timeout_seconds": SCHEDULER_SECONDS,
