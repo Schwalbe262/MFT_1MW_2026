@@ -31,7 +31,7 @@ CAMPAIGN_SCHEMA = "mft-goal-fixed-primary-5t-nsga-submission-v1"
 CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-1p6-axis-v6"
 HEDGE_CAMPAIGN_ID = "mft-goal-fixed-primary-5t-gap1-variable-20260727-v1"
 TARGETED_CAMPAIGN_ID = (
-    "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-targeted-v1"
+    "mft-goal-fixed-primary-5t-lm2mh-axis-w1200-l1000-splittemp-v2"
 )
 PRIMARY_CONDUCTOR_MM = 5.0
 PRIMARY_GAP_MM = 1.6
@@ -41,8 +41,8 @@ SEED_START = 2_707_275_700
 SEED_COUNT = 16
 HEDGE_SEED_START = 2_707_275_400
 HEDGE_SEED_COUNT = 8
-TARGETED_SEED_START = 2_707_276_100
-TARGETED_SEED_COUNT = 16
+TARGETED_SEED_START = 2_707_277_000
+TARGETED_SEED_COUNT = 64
 CPUS = 8
 MEMORY_MB = 65_536
 TIMEOUT_SECONDS = 7_200
@@ -151,7 +151,11 @@ FIXED_LM2MH_RESONANCE_CONTRACT = {
     "classification": "screening-only",
 }
 TARGETED_HARD_SPEC = {
-    **copy.deepcopy(HARD_SPEC),
+    **{
+        key: copy.deepcopy(value)
+        for key, value in HARD_SPEC.items()
+        if key != "winding_temperature_max_C"
+    },
     "schema_version": "mft-goal-fixed-primary-5t-axis-w1200-l1000-lm2mh-v1",
     "size_limits_mm": {"W": 1200.0, "L": 1000.0, "H": 750.0},
     "axis_contract": {
@@ -162,6 +166,12 @@ TARGETED_HARD_SPEC = {
     "magnetizing_inductance_H": 0.002,
     "magnetizing_inductance_basis": "full-physical-primary-referred",
     "magnetizing_inductance_tuning": "explicit-air-gap",
+    "temperature_family_limits_C": {
+        "primary_winding": 100.0,
+        "secondary_winding": 120.0,
+        "core": 120.0,
+    },
+    "legacy_scalar_winding_temperature_limit_allowed": False,
     "resonance_contract": copy.deepcopy(FIXED_LM2MH_RESONANCE_CONTRACT),
     "search_strategy": {
         "diagnostic_recenter_expand": True,
@@ -170,6 +180,38 @@ TARGETED_HARD_SPEC = {
         "prior_objectives_or_constraints_inherited": False,
     },
 }
+SECONDARY_TEMPERATURE_CONSTRAINTS = (
+    "temperature_robust_limit:T_max_Rx_main",
+    "temperature_robust_limit:T_max_Rx_side",
+    "temperature_robust_limit:Tprobe_Rx_main_leeward_max",
+    "temperature_robust_limit:Tprobe_Rx_side_leeward_max",
+)
+SECONDARY_TEMPERATURE_ALLOWANCE_C = 20.0
+
+
+def _apply_targeted_split_temperature_constraints(
+    physical_g: Any,
+    *,
+    constraint_index: Mapping[str, int],
+    valid_indices: Any,
+) -> Any:
+    """Apply the authorized 120 C secondary limit inside NSGA evaluation.
+
+    The authenticated base problem expresses every winding constraint against
+    the historical 100 C scalar limit.  Primary constraints therefore remain
+    unchanged, while the four secondary constraints receive the exact 20 C
+    allowance before optimizer scaling and non-dominated selection.
+    """
+
+    for name in SECONDARY_TEMPERATURE_CONSTRAINTS:
+        if name not in constraint_index:
+            raise RuntimeError(
+                f"split-temperature constraint is missing from NSGA: {name}"
+            )
+        physical_g[valid_indices, int(constraint_index[name])] -= (
+            SECONDARY_TEMPERATURE_ALLOWANCE_C
+        )
+    return physical_g
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -1016,6 +1058,11 @@ def worker(*, payload_path: Path, output: Path) -> dict[str, Any]:
                 )
                 physical_g[indices, resonance_index] = (
                     15_000.0 - frequency
+                )
+                physical_g = _apply_targeted_split_temperature_constraints(
+                    physical_g,
+                    constraint_index=problem.constraint_index,
+                    valid_indices=indices,
                 )
             out["G"] = physical_g
 
