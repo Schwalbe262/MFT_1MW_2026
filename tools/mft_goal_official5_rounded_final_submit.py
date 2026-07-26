@@ -477,11 +477,11 @@ def _authenticated_readback(
         drift
         or value.get("status") not in {"queued", "attaching", "running"}
         or (
-            value.get("account_name") is not None
+            value.get("account_name")
             and value.get("account_name") != ACCOUNT_NAME
         )
         or (
-            value.get("node_name") is not None
+            value.get("node_name")
             and value.get("node_name") != NODE_NAME
         )
     ):

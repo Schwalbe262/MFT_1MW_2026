@@ -198,8 +198,8 @@ def _readback(payload: dict[str, Any], status: str = "queued") -> dict[str, Any]
         "max_workers_per_node": rounded.MAX_WORKERS_PER_NODE,
         "aedt_backend": "standalone",
         "status": status,
-        "account_name": None,
-        "node_name": None,
+        "account_name": "",
+        "node_name": "",
     }
 
 
