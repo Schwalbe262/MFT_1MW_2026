@@ -1868,15 +1868,13 @@ def collect(
     official_entry = next(
         entry for entry in entries if int(entry["fixed_primary_turns"]) == 6
     )
-    official_status = next(
-        status
-        for status in statuses
-        if int(status["id"]) == int(official_entry["task_id"])
-    )
+    official_detail = details.get(int(official_entry["task_id"]))
+    if official_detail is None:
+        raise RuntimeError("official projected-smoke task is not terminal")
     account_sessions = {}
     for account_name in {
         str(detail.get("account_name") or "").strip()
-        for detail in [official_status, *completed_details]
+        for detail in completed_details
     }:
         if not account_name:
             raise RuntimeError("terminal task account identity is absent")
@@ -1886,7 +1884,7 @@ def collect(
             account_name,
         )
     official_account_name = str(
-        official_status["account_name"]
+        official_detail["account_name"]
     ).strip()
     official_account, official_ssh_session = account_sessions[
         official_account_name
@@ -1898,7 +1896,7 @@ def collect(
         official_smoke = _official5_smoke(
             connection=connection,
             entry=official_entry,
-            status=official_status,
+            status=official_detail,
             output=output,
         )
     finally:
