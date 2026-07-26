@@ -643,7 +643,7 @@ def test_merge_preserves_protected_truth_and_seals_lifecycle_only() -> None:
     for item in merged["current"]:
         assert len(item["title"]) <= 160
         assert len(item["detail"]) <= 1_200
-        assert len(item["evidence"]) <= 16
+        assert len(item["evidence"]) <= 12
         assert all(len(value) <= 500 for value in item["evidence"])
 
 

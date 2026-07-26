@@ -859,8 +859,10 @@ def _task_card(
             "postdeadline=true / diagnostic_only=true / noncanonical=true"
             + (" / search_only=true" if spec.search_only else "")
         ),
-        "scheduler_lifecycle_only=true / collection_authenticated=false",
-        "scientific_pass_generated=false / production_claim_generated=false",
+        (
+            "scheduler_lifecycle_only=true / collection_authenticated=false / "
+            "scientific_pass_generated=false / production_claim_generated=false"
+        ),
     ]
     if spec.inner_solver_seconds is not None:
         evidence.insert(2, f"inner solver budget{spec.inner_solver_seconds}s")
@@ -1991,7 +1993,7 @@ def _parallel_workstreams_card(
             "actual_production_pass_count=0 / canonical_promotion=false"
         )
     ]
-    evidence.extend(
+    task_evidence = [
         (
             f"task{spec.task_id} {spec.model_label} "
             f"{tasks[spec.task_id]['state']} / "
@@ -2000,6 +2002,10 @@ def _parallel_workstreams_card(
             f"{tasks[spec.task_id]['actual_node_name'] or spec.requested_node}"
         )
         for spec in TASK_SPECS
+    ]
+    evidence.extend(
+        " | ".join(task_evidence[index : index + 2])
+        for index in range(0, len(task_evidence), 2)
     )
     evidence.extend(
         (
@@ -2128,6 +2134,15 @@ def merge_status(
         queued=queued,
         collections=collections,
     )
+    handoff_task_evidence = [
+        (
+            f"task{spec.task_id} {tasks[spec.task_id]['state']} / "
+            f"allocation{tasks[spec.task_id]['allocation_id'] or 'none'} / "
+            f"job{tasks[spec.task_id]['slurm_job_id'] or 'none'} / "
+            f"{tasks[spec.task_id]['actual_node_name'] or spec.requested_node}"
+        )
+        for spec in TASK_SPECS
+    ]
     handoff.update(
         {
             "title": (
@@ -2145,13 +2160,8 @@ def merge_status(
             "updated_at": observed_at,
             "progress_pct": 97,
             "evidence": [
-                (
-                    f"task{spec.task_id} {tasks[spec.task_id]['state']} / "
-                    f"allocation{tasks[spec.task_id]['allocation_id'] or 'none'} / "
-                    f"job{tasks[spec.task_id]['slurm_job_id'] or 'none'} / "
-                    f"{tasks[spec.task_id]['actual_node_name'] or spec.requested_node}"
-                )
-                for spec in TASK_SPECS
+                " | ".join(handoff_task_evidence[index : index + 2])
+                for index in range(0, len(handoff_task_evidence), 2)
             ]
             + [
                 (
